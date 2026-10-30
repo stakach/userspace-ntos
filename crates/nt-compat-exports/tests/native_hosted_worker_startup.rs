@@ -241,9 +241,10 @@ fn scheduler_settles_validated_startup_with_exact_protocol_and_current_reply() {
 }
 
 #[test]
-fn timer_demand_probes_exact_ingress_once_before_yielding_worker_startup() {
-    // A class worker can publish READY while a timer rearm remains pending. Yielding before
-    // entering the physical receive starves that Call even though its route and Reply are live.
+fn serviced_scheduler_yield_blocks_on_exact_worker_receive_despite_renewed_timer_demand() {
+    // The executive runs above its priority-100 workers. A nonblocking poll alone cannot let a
+    // worker execute READY while timer demand keeps the executive runnable. The first checkpoint
+    // may poll; after the scheduler has serviced that demand, the retained receive must block.
     let file = source("component_shared_pump.rs");
     let receive = function(&file, "receive").expect("shared component receive boundary");
     let loop_body = receive.block.stmts.iter().find_map(|statement| {
@@ -295,10 +296,14 @@ fn timer_demand_probes_exact_ingress_once_before_yielding_worker_startup() {
                         if path.path.is_ident("execution"))
                     && matches!(&call.args[1], Expr::Field(field)
                         if matches!(&field.member, syn::Member::Named(name) if name == "tcb"))
-                    && matches!(&call.args[2], Expr::Unary(unary)
-                        if matches!(&unary.op, syn::UnOp::Not(_))
-                            && matches!(&*unary.expr, Expr::Path(path)
-                                if path.path.is_ident("timer_checkpoint")));
+                    && matches!(&call.args[2], Expr::Binary(blocking)
+                        if matches!(&blocking.op, syn::BinOp::Or(_))
+                            && matches!(&*blocking.left, Expr::Path(path)
+                                if path.path.is_ident("serviced_scheduler_yield"))
+                            && matches!(&*blocking.right, Expr::Unary(unary)
+                                if matches!(&unary.op, syn::UnOp::Not(_))
+                                    && matches!(&*unary.expr, Expr::Path(path)
+                                        if path.path.is_ident("timer_checkpoint"))));
             }
             syn::visit::visit_expr_call(self, call);
         }
@@ -306,9 +311,29 @@ fn timer_demand_probes_exact_ingress_once_before_yielding_worker_startup() {
     let mut probe = PhysicalProbe(false);
     probe.visit_stmt(&loop_body.stmts[physical]);
     assert!(probe.0,
-        "timer demand must attempt one nonblocking physical receive through the exact ingress owner");
+        "initial timer demand may poll, but a serviced scheduler yield must block on the exact ingress owner despite renewed demand");
     let mut all = Observe::default();
     all.visit_block(loop_body);
     assert!(!all.calls.iter().any(|name| name == "reply" || name == "reply_seh"),
         "the fairness probe must not send or reuse the worker's retained Reply");
+
+    let scheduler = source("component_scheduler.rs");
+    let scheduler = function(&scheduler, "hosted_component_pump_inner").unwrap();
+    let mut scheduler_calls = Observe::default();
+    scheduler_calls.visit_block(&scheduler.block);
+    let serviced = scheduler_calls.calls.iter().position(|name| name == "service_irq_yield")
+        .expect("scheduler must service timer work before continuing the worker");
+    let continued = scheduler_calls.calls.iter().position(|name|
+        name == "component_pump_continue_receive_after_scheduler_service")
+        .expect("serviced scheduler yield must propagate to the retained receive");
+    assert!(serviced < continued);
+
+    let pump = source("spawn_hosts.rs");
+    let continuation = function(&pump, "component_pump_continue_receive_after_scheduler_service")
+        .expect("explicit receive-only continuation after a serviced scheduler yield");
+    let mut continuation_calls = Observe::default();
+    continuation_calls.visit_block(&continuation.block);
+    assert!(continuation_calls.calls.iter().any(|name| name == "component_pump_continue_receive_half")
+        && continuation_calls.fields.iter().any(|name| name == "scheduler_yielded"),
+        "the continuation must validate the retained yielded pump and avoid a second request/reply");
 }

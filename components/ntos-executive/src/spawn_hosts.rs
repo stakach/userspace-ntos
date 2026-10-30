@@ -1800,7 +1800,7 @@ impl PumpLoopOutcome {
 #[inline(never)]
 unsafe fn pump_recv(ch: &PumpChannel, _reply_cap: u64) -> PumpMessage {
     match shared_ingress::owner::runtime::channel_route(ch) {
-        Ok(Some(route)) => shared_pump::receive(ch, route, false),
+        Ok(Some(route)) => shared_pump::receive(ch, route, false, serviced_scheduler_yield),
         Err(_) | Ok(None) => {
             crate::print_str(b"[pump-ingress] channel route unavailable\n");
             PumpMessage::transport_wall()
@@ -1812,11 +1812,19 @@ unsafe fn pump_recv(ch: &PumpChannel, _reply_cap: u64) -> PumpMessage {
 /// Continue receiving on the exact route until that exchange reaches a restore or a fault wall.
 unsafe fn pump_recv_retained_seh(ch: &PumpChannel) -> PumpMessage {
     match shared_ingress::owner::runtime::channel_route(ch) {
-        Ok(Some(route)) => shared_pump::receive(ch, route, true),
+        Ok(Some(route)) => shared_pump::receive(ch, route, true, false),
         Err(_) | Ok(None) => {
             crate::print_str(b"[pump-ingress] retained SEH route unavailable\n");
             PumpMessage::transport_wall()
         }
+    pump_recv_with_scheduler_checkpoint(ch, false)
+}
+
+/// Scheduler work has already run for this retained receive half. A blocking receive gives
+/// lower-priority component workers a chance to publish READY even if timer demand renews.
+unsafe fn pump_recv_with_scheduler_checkpoint(
+    ch: &PumpChannel, serviced_scheduler_yield: bool,
+) -> PumpMessage {
     }
 }
 
@@ -2253,15 +2261,10 @@ pub(crate) unsafe fn component_pump_continue_receive(
     ch: &PumpChannel,
     previous: &PumpResult,
 ) -> Result<PumpResult, u32> {
-    if !previous.is_receive_yield()
-        || !(ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield
-            || previous.receive_yield.is_some_and(|yielded|
-                crate::win32k_glue::receive_continuation_is_current(ch, yielded)))
-        || (ch.caps.kernel_irq_yield && previous.reply_cap != ch.reply_cap)
-    {
+    if !receive_continuation_authorized(ch, previous) {
         return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
-    component_pump_continue_receive_half(ch, previous)
+    component_pump_continue_receive_half(ch, previous, false)
 }
 
 /// Resume only the receive half after the exact external service wait has been ACKed and
@@ -2285,7 +2288,27 @@ pub(crate) unsafe fn component_pump_continue_service_wait(
         }
         return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
-    component_pump_continue_receive_half(ch, previous)
+    component_pump_continue_receive_half(ch, previous, false)
+}
+
+/// Continue only the receive half after this invocation's scheduler has serviced IRQ/timer
+/// demand. The service pass retains the physical Call and Reply; no request is sent again.
+pub(crate) unsafe fn component_pump_continue_receive_after_scheduler_service(
+    ch: &PumpChannel,
+    previous: &PumpResult,
+) -> Result<PumpResult, u32> {
+    if !previous.scheduler_yielded || !receive_continuation_authorized(ch, previous) {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    component_pump_continue_receive_half(ch, previous, true)
+}
+
+unsafe fn receive_continuation_authorized(ch: &PumpChannel, previous: &PumpResult) -> bool {
+    previous.is_receive_yield()
+        && (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield
+            || previous.receive_yield.is_some_and(|yielded|
+                crate::win32k_glue::receive_continuation_is_current(ch, yielded)))
+        && (!ch.caps.kernel_irq_yield || previous.reply_cap == ch.reply_cap)
 }
 
 unsafe fn component_pump_continue_receive_half(
@@ -2309,8 +2332,9 @@ unsafe fn component_pump_continue_receive_half(
         crate::win32k_glue::trace_receive_phase(
             b"resume-before-recv", yielded.parent, yielded.child, yielded.owner,
         );
+    serviced_scheduler_yield: bool,
     }
-    let first = pump_recv(ch, reply_cap);
+    let first = pump_recv_with_scheduler_checkpoint(ch, serviced_scheduler_yield);
     if let Some(yielded) = previous.receive_yield {
         crate::win32k_glue::trace_receive_phase(
             b"resume-after-recv", yielded.parent, yielded.child, yielded.owner,

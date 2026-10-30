@@ -47,7 +47,8 @@ fn kernel_owned_ps_wait_restores_effective_client_before_each_physical_resume() 
         .unwrap();
     let restore = yields.find("restore_ps_retirement_window(caller, &receiving)")
         .expect("IRQ yield reselects the retained Ps target");
-    let resume = yields.find("component_pump_continue_receive(&receiving").unwrap();
+    let resume = yields.find("component_pump_continue_receive_after_scheduler_service(")
+        .expect("serviced scheduler yield continues the retained physical receive");
     assert!(restore < resume, "restore after IRQ work and before physical receive");
 
     let attach = include_str!("../../../components/ntos-executive/src/win32k_process_attach_root.rs");

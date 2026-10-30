@@ -177,7 +177,8 @@ unsafe fn hosted_component_pump_inner(
         if let Some(route) = route {
             channel.reply_cap = runtime::current_reply(route).expect("retained canonical Reply");
         }
-        result = crate::spawn_hosts::component_pump_continue_receive(channel, &result)
+        result = crate::spawn_hosts::component_pump_continue_receive_after_scheduler_service(
+            channel, &result)
             .expect("hosted IRQ yield must retain its exact receive continuation");
         trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 4, Some(&result));
         trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 4, Some(&result));

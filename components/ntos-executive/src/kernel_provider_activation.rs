@@ -496,7 +496,8 @@ unsafe fn receive_driver_entry_yields(
             .recipient(caller)?
             .execution_channel(caller)?;
         restore_ps_retirement_window(caller, &receiving)?;
-        result = spawn_hosts::component_pump_continue_receive(&receiving, &previous)?;
+        result = spawn_hosts::component_pump_continue_receive_after_scheduler_service(
+            &receiving, &previous)?;
         observe_driver_entry_pump(&receiving, &mut receive_attempt, &result)?;
     }
     Ok(result)

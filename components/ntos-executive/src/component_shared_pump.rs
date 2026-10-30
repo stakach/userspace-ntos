@@ -87,7 +87,9 @@ unsafe fn inline_irq_work_pending() -> bool {
         || crate::dispatcher_bootstrap::timer_work_pending()
 }
 
-pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: bool) -> PumpMessage {
+pub(super) unsafe fn receive(
+    ch: &PumpChannel, route: PeerRoute, retained_seh: bool, serviced_scheduler_yield: bool,
+) -> PumpMessage {
     let _census_scope = ReceiveCensusScope::enter(ch.caps.kind, retained_seh);
     // A retained exception walk and an ordinary syscall channel without kernel IRQ yield cannot
     // return a scheduler continuation. Give already-latched work one isolated pass here instead.
@@ -226,7 +228,8 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
                 return PumpMessage::transport_wall();
             }
         };
-        let arrival = runtime::receive(execution, ch.tcb, !timer_checkpoint);
+        let arrival = runtime::receive(execution, ch.tcb,
+            serviced_scheduler_yield || !timer_checkpoint);
         match arrival {
             Ok(runtime::Arrival::Hosted) => {}
             Ok(runtime::Arrival::Call { .. }) => {

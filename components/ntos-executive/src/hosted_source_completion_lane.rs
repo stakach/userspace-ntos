@@ -758,7 +758,8 @@ pub(super) unsafe fn poll(
         while pump.scheduler_yielded {
             scope.service_irq_yield(channel.shared_va);
             channel.reply_cap = runtime::current_reply(route).map_err(|_| ())?;
-            pump = crate::spawn_hosts::component_pump_continue_receive(&channel, &pump)
+            pump = crate::spawn_hosts::component_pump_continue_receive_after_scheduler_service(
+                &channel, &pump)
                 .map_err(|_| ())?;
         }
         if pump.completed {
