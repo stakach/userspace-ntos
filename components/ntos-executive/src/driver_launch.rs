@@ -70185,6 +70185,27 @@ pub(crate) fn print_active_driver_dispatch_for_deadman() {
 static PORT_CONNECT_PUMP_TRACE_IRP: AtomicU64 = AtomicU64::new(0);
 static PORT_CONNECT_PUMP_TRACE_TCB: AtomicU64 = AtomicU64::new(0);
 
+/// Classify the first messages from the exact port worker before its CONNECT handler entry.
+/// This only observes the active pump; it never changes ingress or Reply ownership.
+pub(crate) fn trace_port_connect_worker_message(
+    tcb: u64, reply: u64, info: u64, badge: u64, words: [u64; 5], seh_retained: bool,
+) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let irp = PORT_CONNECT_PUMP_TRACE_IRP.load(Ordering::Relaxed);
+    if irp == 0 || PORT_CONNECT_PUMP_TRACE_TCB.load(Ordering::Relaxed) != tcb {
+        return;
+    }
+    let sequence = COUNT.fetch_add(1, Ordering::Relaxed);
+    if sequence >= 16 { return; }
+    print_str(b"[port-connect-worker-message] seq/irp/tcb/reply/mi/label/badge/m0/m1/m2/m3/m4/seh=");
+    print_u64(sequence); print_str(b"/"); print_hex_u64(irp); print_str(b"/");
+    print_hex_u64(tcb); print_str(b"/"); print_hex_u64(reply); print_str(b"/");
+    print_hex_u64(info); print_str(b"/"); print_hex_u64(info >> 12); print_str(b"/");
+    print_hex_u64(badge); print_str(b"/");
+    for word in words { print_hex_u64(word); print_str(b"/"); }
+    print_u64(u64::from(seh_retained)); print_str(b"\n");
+}
+
 /// Bounded observation of the exact retained port CONNECT request across admission and Reply.
 /// The two atomics are diagnostic keys only; physical ingress ownership remains with the pump.
 pub(crate) unsafe fn trace_port_connect_pump_boundary(

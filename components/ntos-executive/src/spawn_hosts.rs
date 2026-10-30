@@ -2600,6 +2600,10 @@ unsafe fn component_pump_loop(
             break;
         }
         let label = msg.label();
+        crate::driver_launch::trace_port_connect_worker_message(
+            ch.tcb, *reply_cap, msg.mi, msg.badge,
+            [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4], seh.retained(),
+        );
         // The current PDO may have no port resource while a live sibling PDO
         // in the same driver instance owns the controller port. The decoder
         // and exact hosted grant selector decide whether this GP is I/O.
