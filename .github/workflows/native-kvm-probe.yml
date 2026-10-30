@@ -23,6 +23,7 @@ jobs:
           import os
           import platform
           import stat
+          import subprocess
 
           machine = platform.machine()
           print(f"host architecture: {machine}")
@@ -40,6 +41,12 @@ jobs:
           try:
               with open(path, "rb+", buffering=0) as device:
                   # Linux uapi/linux/kvm.h: KVM_GET_API_VERSION = _IO(KVMIO, 0x00).
+                  version = fcntl.ioctl(device, 0xAE00)
+          except PermissionError:
+              # The hosted runner user is not always a member of the KVM device group.
+              # Restrict the ephemeral device to this job's uid/gid, then retry the ioctl.
+              subprocess.run(["sudo", "-n", "chown", f"{os.getuid()}:{os.getgid()}", path], check=True)
+              with open(path, "rb+", buffering=0) as device:
                   version = fcntl.ioctl(device, 0xAE00)
           except OSError as error:
               raise SystemExit(f"cannot access hosted KVM: {error}")
