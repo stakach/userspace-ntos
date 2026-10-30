@@ -8,6 +8,9 @@ use nt_fs::{
 #[path = "hive_wal_native.rs"]
 mod native;
 pub(crate) use native::*;
+#[path = "hive_wal_boot.rs"]
+mod boot;
+pub(crate) use boot::*;
 
 struct LogBaseline {
     path: alloc::string::String,
@@ -55,6 +58,106 @@ fn block(status: u32) -> u32 {
 
 fn semantic_error(_: nt_hive_core::HiveLogReplayError) -> u32 {
     nt_fs::STATUS_DATA_ERROR
+}
+
+struct Baseline {
+    file_id: u64,
+    length: u64,
+    last_sequence: u64,
+    needs_checkpoint: bool,
+}
+
+fn clone_path(path: &str) -> Result<alloc::string::String, u32> {
+    let mut result = alloc::string::String::new();
+    result.try_reserve_exact(path.len()).map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
+    result.push_str(path);
+    Ok(result)
+}
+
+unsafe fn inspect_baseline(path: &str, record: &[u8]) -> Result<Baseline, u32> {
+    let fs = writable_fs()?;
+    if fs.existing_file_id(path).is_none() {
+        let created = fs.zw_create_file(path, nt_fs::FILE_WRITE_DATA | nt_fs::SYNCHRONIZE,
+            0, 0, nt_fs::FILE_OPEN_IF, nt_fs::FILE_NON_DIRECTORY_FILE);
+        if created.status != nt_fs::STATUS_SUCCESS { return Err(created.status); }
+        let close = fs.zw_close(created.handle);
+        if close != nt_fs::STATUS_SUCCESS { return Err(close); }
+        mark_snapshot_dirty();
+    }
+    let fs = writable_fs()?;
+    let file_id = fs.existing_file_id(path).ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    let length = fs.file_len(path).ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    let entry = baselines().iter().find(|entry| entry.path == path);
+    if let Some(entry) = entry {
+        if entry.has_wal_records && (entry.file_id != file_id || length < entry.expected_len) {
+            return Err(block(nt_fs::STATUS_DATA_ERROR));
+        }
+        if entry.has_wal_records && entry.file_id == file_id && entry.expected_len == length {
+            let (_, last_sequence) = nt_hive_core::complete_log_sequence_span_from(
+                record, entry.last_sequence).map_err(semantic_error)?;
+            return Ok(Baseline { file_id, length, last_sequence, needs_checkpoint: false });
+        }
+    }
+    // A new or externally changed stream needs an immutable snapshot before WAL writes.
+    mark_snapshot_dirty();
+    Ok(Baseline { file_id, length, last_sequence: 0, needs_checkpoint: true })
+}
+
+unsafe fn finish_baseline(path: &str, record: &[u8], baseline: &mut Baseline) -> Result<(), u32> {
+    if !baseline.needs_checkpoint { return Ok(()); }
+    let fs = writable_fs()?;
+    if fs.existing_file_id(path) != Some(baseline.file_id)
+        || fs.file_len(path) != Some(baseline.length) {
+        return Err(block(nt_fs::STATUS_DATA_ERROR));
+    }
+    baseline.last_sequence = validate_first_record(fs, path, baseline.length, record)?;
+    let (first, _) = nt_hive_core::complete_log_sequence_span(record)
+        .map_err(semantic_error)?;
+    if let Some(entry) = baselines().iter_mut().find(|entry| entry.path == path) {
+        entry.file_id = baseline.file_id;
+        entry.expected_len = baseline.length;
+        entry.last_sequence = first - 1;
+        entry.has_wal_records = false;
+    } else {
+        baselines().try_reserve(1).map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
+        baselines().push(LogBaseline { path: clone_path(path)?,
+            file_id: baseline.file_id, expected_len: baseline.length,
+            last_sequence: first - 1, has_wal_records: false });
+    }
+    baseline.needs_checkpoint = false;
+    Ok(())
+}
+
+enum ReplayMountError {
+    /// Boot setup reports the failed mount admission itself.
+    AsReported,
+    /// Preserve the Native journal's existing post-anchor invalid-handle status.
+    NativeInvalidHandle,
+}
+
+/// The physical WAL record and both paired anchors are already durable. Only then may the
+/// mounted sidecar and its live sequence baseline advance to the exact encoded append.
+unsafe fn replay_anchored_record(
+    path: &str, record: &[u8], baseline: &Baseline, new_log_len: u64,
+    mount_error: ReplayMountError,
+) -> Result<(), u32> {
+    let payload = HiveLogWalPayload { file_id: baseline.file_id,
+        expected_log_len: baseline.length, path, record };
+    let fs = writable_fs().map_err(|status| block(match mount_error {
+        ReplayMountError::AsReported => status,
+        ReplayMountError::NativeInvalidHandle => nt_fs::STATUS_INVALID_HANDLE,
+    }))?;
+    fs.replay_hive_log_wal_payload(payload).map_err(|error| block(match error {
+        nt_fs::HiveLogWalReplayError::OutOfMemory => nt_fs::STATUS_INSUFFICIENT_RESOURCES,
+        _ => nt_fs::STATUS_DATA_ERROR,
+    }))?;
+    let entry = baselines().iter_mut().find(|entry|
+        entry.path == path && entry.file_id == baseline.file_id)
+        .ok_or_else(|| block(nt_fs::STATUS_DATA_ERROR))?;
+    entry.expected_len = new_log_len;
+    entry.last_sequence = baseline.last_sequence;
+    entry.has_wal_records = true;
+    Ok(())
 }
 
 /// A core checkpoint carries its sequence. An installed REGF source (or an absent writable

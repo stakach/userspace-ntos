@@ -111,15 +111,15 @@ fn folded_hive_log_cache_requires_a_new_baseline_before_reuse() {
     let source = include_str!("../../../components/ntos-executive/src/writable_fs/hive_wal_native.rs");
     let cache = include_str!("../../../components/ntos-executive/src/writable_fs/hive_wal.rs");
     let fold = source_block(cache, "pub(super) unsafe fn note_volume_wal_folded(");
-    let baseline = source_block(source, "unsafe fn inspect_baseline(");
-    let finish = source_block(source, "unsafe fn finish_baseline(");
+    let baseline = source_block(cache, "unsafe fn inspect_baseline(");
+    let finish = source_block(cache, "unsafe fn finish_baseline(");
     assert!(fold.contains("baseline.has_wal_records = false"));
     assert!(baseline.contains(
         "entry.has_wal_records && entry.file_id == file_id && entry.expected_len == length"
     ), "a fold releases write protection, so file ID and length cannot authenticate cached bytes");
     assert!(baseline.contains("mark_snapshot_dirty()")
         && source.contains("native_checkpoint::checkpoint_dirty_native()")
-        && finish.contains("validate_first_record(fs, &journal.path"),
+        && finish.contains("validate_first_record(fs, path"),
         "the first append after a fold must checkpoint and verify a fresh durable baseline");
 }
 

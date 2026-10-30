@@ -116,6 +116,8 @@ mod virtual_memory_commit;
 #[path = "exec_thread_stack_exit.rs"]
 mod thread_stack_exit;
 
+#[path = "exec_profile_boot_wal.rs"]
+mod profile_boot_wal;
 #[path = "exec_registry_admission.rs"]
 pub(crate) mod registry_admission;
 #[path = "exec_registry_value_mutation.rs"]
@@ -4799,7 +4801,7 @@ impl ExecNtHandler {
     /// real user. Materialize the setup table into the mounted `.Default` hive so the later
     /// `RegCopyTreeW`/`UpdateUsersShellFolderSettings` path runs through ordinary registry syscalls.
     fn provision_default_user_shell_folders(&mut self) {
-        let (stats, changed, failed, last_status) = {
+        let (stats, changed, failed, last_status, complete) = {
             let mut target = ExecJournalNonSystemSetupSeedTarget::new(self);
             let stats = nt_hive_core::seed_reactos_user_profile_shell_folders_into_target(
                 &mut target,
@@ -4807,39 +4809,36 @@ impl ExecNtHandler {
                 crate::installed_layout::DOS_DEFAULT_PROFILE,
                 "%USERPROFILE%",
             );
-            (stats, target.changed(), target.failed, target.last_status)
+            let complete = nt_hive_core::reactos_user_profile_shell_folders_complete_in_target(
+                &target,
+                r"\Registry\User\.Default",
+                crate::installed_layout::DOS_DEFAULT_PROFILE,
+                "%USERPROFILE%",
+            );
+            (stats, target.changed(), target.failed, target.last_status, complete)
         };
         if !changed {
-            if self
-                .mutable_registry_value_by_path(
-                    r"\Registry\User\.Default\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
-                    "AppData",
-                )
-                .is_some()
-            {
+            if complete {
                 print_str(b"[profile-setup] default-user shell folders already present\n");
             } else {
                 print_str(b"[profile-setup] default-user shell folders not provisioned\n");
             }
-            if failed {
-                print_str(
-                    b"[profile-setup] default-user shell-folder journal incomplete status=0x",
-                );
-                print_hex(last_status);
-                print_str(b"\n");
-            }
-            return;
-        }
-        print_str(b"[profile-setup] HKU\\.DEFAULT shell folders provisioned: Shell Folders=");
-        print_u64(stats.shell_folder_values as u64);
-        print_str(b" User Shell Folders=");
-        print_u64(stats.user_shell_folder_values as u64);
-        print_str(b"\n");
-        if failed {
-            print_str(b"[profile-setup] default-user shell-folder journal incomplete status=0x");
-            print_hex(last_status);
+        } else {
+            print_str(b"[profile-setup] HKU\\.DEFAULT shell folders provisioned: Shell Folders=");
+            print_u64(stats.shell_folder_values as u64);
+            print_str(b" User Shell Folders=");
+            print_u64(stats.user_shell_folder_values as u64);
             print_str(b"\n");
         }
+        // The serialized ntuser.dat is the source for a later interactive user's hive.
+        // A partial seed must never become that durable source, including on legacy media.
+        if failed || !complete {
+            print_str(b"[profile-setup] default-user shell-folder journal incomplete status=0x");
+            print_hex(if failed { last_status } else { STATUS_UNSUCCESSFUL });
+            print_str(b"\n");
+            panic!("default-user shell-folder seed incomplete before ntuser.dat publication");
+        }
+
     }
 
     /// Serialize the setup-provisioned `.Default` hive into the profile source's `ntuser.dat`.
@@ -4863,16 +4862,6 @@ impl ExecNtHandler {
         print_str(b" heap-headroom=");
         print_u64(crate::allocator::remaining() as u64);
         print_str(b"\n");
-        if hive.dirty_count() == 0
-            && unsafe {
-                crate::writable_fs::hive_image_len_at(crate::writable_fs::DEFAULT_USER_NTUSER_DAT)
-            } != 0
-        {
-            print_str(
-                b"[profile-setup] Default User\\ntuser.dat already current on writable volume\n",
-            );
-            return;
-        }
         print_str(b"[profile-setup] ntuser image measure begin\n");
         match nt_hive_core::encoded_image_len(hive) {
             Ok(len) => {
@@ -5536,6 +5525,9 @@ impl ExecNtHandler {
         key: ResolvedHiveKey,
         descriptor: &[u8],
     ) -> Result<(), u32> {
+        if self.boot_v2_mutable_hive_journal() {
+            return self.boot_v2_set_mutable_key_security_descriptor(key, descriptor);
+        }
         let relative = self
             .mutable_key_relative_path(key)
             .ok_or(STATUS_INVALID_HANDLE)?;

@@ -799,6 +799,9 @@ impl ExecNtHandler {
         class: Option<&str>,
         descriptor: &[u8],
     ) -> Result<ResolvedHiveKey, u32> {
+        if self.boot_v2_mutable_hive_journal() {
+            return self.boot_v2_create_secured_mutable_subkey(parent, name, class, descriptor);
+        }
         let parent_path = self
             .mutable_key_relative_path(parent)
             .ok_or(STATUS_INVALID_HANDLE)?;

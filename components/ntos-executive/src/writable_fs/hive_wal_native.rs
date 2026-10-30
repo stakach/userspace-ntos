@@ -13,13 +13,6 @@ use nt_memory_manager::SectionMountId;
 type Wal = RegistryWal<OwnedBoundedBlockRange<snapshot_storage::Lease>>;
 type Anchor = AsyncWalSnapshotAnchorUpdate<snapshot_storage::Lease>;
 
-struct Baseline {
-    file_id: u64,
-    length: u64,
-    last_sequence: u64,
-    needs_checkpoint: bool,
-}
-
 enum Phase {
     Baseline { started: bool },
     Rechecking { recheck_id: u64 },
@@ -48,6 +41,10 @@ struct Journal {
 }
 
 static mut JOURNAL: Option<Journal> = None;
+
+pub(crate) unsafe fn has_retained_native_hive_journal() -> bool {
+    (&*core::ptr::addr_of!(JOURNAL)).is_some()
+}
 static mut NEXT_ID: u64 = 1;
 
 #[derive(Clone, Copy)]
@@ -73,13 +70,6 @@ fn clone_owned(bytes: &[u8]) -> Result<Vec<u8>, u32> {
     let mut result = Vec::new();
     result.try_reserve_exact(bytes.len()).map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
     result.extend_from_slice(bytes);
-    Ok(result)
-}
-
-fn clone_path(path: &str) -> Result<String, u32> {
-    let mut result = String::new();
-    result.try_reserve_exact(path.len()).map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
-    result.push_str(path);
     Ok(result)
 }
 
@@ -128,68 +118,20 @@ unsafe fn restore_unentered_recheck(
     (status, true)
 }
 
-unsafe fn inspect_baseline(path: &str, record: &[u8]) -> Result<Baseline, u32> {
-    let fs = writable_fs()?;
-    if fs.existing_file_id(path).is_none() {
-        let created = fs.zw_create_file(path, nt_fs::FILE_WRITE_DATA | nt_fs::SYNCHRONIZE,
-            0, 0, nt_fs::FILE_OPEN_IF, nt_fs::FILE_NON_DIRECTORY_FILE);
-        if created.status != nt_fs::STATUS_SUCCESS { return Err(created.status); }
-        let close = fs.zw_close(created.handle);
-        if close != nt_fs::STATUS_SUCCESS { return Err(close); }
-        mark_snapshot_dirty();
-    }
-    let fs = writable_fs()?;
-    let file_id = fs.existing_file_id(path).ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-    let length = fs.file_len(path).ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-    let entry = baselines().iter().find(|entry| entry.path == path);
-    if let Some(entry) = entry {
-        if entry.has_wal_records && (entry.file_id != file_id || length < entry.expected_len) {
-            return Err(block(nt_fs::STATUS_DATA_ERROR));
-        }
-        if entry.has_wal_records && entry.file_id == file_id && entry.expected_len == length {
-            let (_, last_sequence) = nt_hive_core::complete_log_sequence_span_from(
-                record, entry.last_sequence).map_err(semantic_error)?;
-            return Ok(Baseline { file_id, length, last_sequence, needs_checkpoint: false });
-        }
-    }
-    // A new or externally changed stream needs an immutable snapshot before WAL writes.
-    mark_snapshot_dirty();
-    Ok(Baseline { file_id, length, last_sequence: 0, needs_checkpoint: true })
-}
-
-unsafe fn finish_baseline(journal: &mut Journal) -> Result<(), u32> {
-    let baseline = &mut journal.baseline;
-    if !baseline.needs_checkpoint { return Ok(()); }
-    let fs = writable_fs()?;
-    if fs.existing_file_id(&journal.path) != Some(baseline.file_id)
-        || fs.file_len(&journal.path) != Some(baseline.length) {
-        return Err(block(nt_fs::STATUS_DATA_ERROR));
-    }
-    baseline.last_sequence = validate_first_record(fs, &journal.path,
-        baseline.length, &journal.record)?;
-    let (first, _) = nt_hive_core::complete_log_sequence_span(&journal.record)
-        .map_err(semantic_error)?;
-    if let Some(entry) = baselines().iter_mut().find(|entry| entry.path == journal.path) {
-        entry.file_id = baseline.file_id;
-        entry.expected_len = baseline.length;
-        entry.last_sequence = first - 1;
-        entry.has_wal_records = false;
-    } else {
-        baselines().try_reserve(1).map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
-        baselines().push(LogBaseline { path: clone_path(&journal.path)?,
-            file_id: baseline.file_id, expected_len: baseline.length,
-            last_sequence: first - 1, has_wal_records: false });
-    }
-    baseline.needs_checkpoint = false;
-    Ok(())
-}
-
 /// Admit one exact record. The caller retains its prepared CM mutation until the receipt is
 /// published; a BUSY result means this owner was not admitted and may be retried unchanged.
 pub(crate) unsafe fn begin_native_hive_journal(path: &str, record: &[u8]) -> Result<u64, u32> {
     let _durable = crate::allocator::enter_durable();
-    if (&*core::ptr::addr_of!(JOURNAL)).is_some() { return Err(snapshot_storage::BUSY); }
+    if (&*core::ptr::addr_of!(JOURNAL)).is_some()
+        || boot::has_retained_boot_hive_journal() {
+        return Err(snapshot_storage::BUSY);
+    }
     ensure_mounted()?;
+    let mount = crate::fs_loader::exec_fs_mount_identity()
+        .ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    if crate::fs_loader::exec_block_route_kind(mount) != Some(nt_fs::BlockSourceKind::Native) {
+        return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+    }
     if record.is_empty() || legacy_snapshot_writes_allowed()
         || WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
         return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
@@ -232,7 +174,8 @@ pub(crate) unsafe fn poll_native_hive_journal(id: u64)
             if journal.baseline.needs_checkpoint {
                 if !*started { *started = true; }
                 match super::native_checkpoint::checkpoint_dirty_native() {
-                    Ok(_) => finish_baseline(journal)?,
+                    Ok(_) => finish_baseline(&journal.path, &journal.record,
+                        &mut journal.baseline)?,
                     Err(status) if status == snapshot_storage::BUSY => return Ok(None),
                     Err(status) => return Err(status),
                 }
@@ -572,34 +515,12 @@ pub(crate) unsafe fn complete_native_hive_io(
                 Err(update) => { core::mem::forget(update);
                     return Err(block(nt_fs::STATUS_DATA_ERROR)); }
             };
-            let payload = HiveLogWalPayload { file_id: journal.baseline.file_id,
-                expected_log_len: journal.baseline.length,
-                path: &journal.path, record: &journal.record };
-            let live = match writable_fs() {
-                Ok(fs) => fs.replay_hive_log_wal_payload(payload),
-                Err(_) => {
-                    core::mem::forget(lease);
-                    core::mem::forget(anchored);
-                    return Err(block(nt_fs::STATUS_INVALID_HANDLE));
-                }
-            };
-            if let Err(error) = live {
+            if let Err(status) = replay_anchored_record(&journal.path, &journal.record,
+                &journal.baseline, journal.new_log_len, ReplayMountError::NativeInvalidHandle) {
                 core::mem::forget(lease);
                 core::mem::forget(anchored);
-                return Err(block(match error {
-                    nt_fs::HiveLogWalReplayError::OutOfMemory => nt_fs::STATUS_INSUFFICIENT_RESOURCES,
-                    _ => nt_fs::STATUS_DATA_ERROR,
-                }));
+                return Err(status);
             }
-            let Some(entry) = baselines().iter_mut().find(|entry|
-                entry.path == journal.path && entry.file_id == journal.baseline.file_id) else {
-                core::mem::forget(lease);
-                core::mem::forget(anchored);
-                return Err(block(nt_fs::STATUS_DATA_ERROR));
-            };
-            entry.expected_len = journal.new_log_len;
-            entry.last_sequence = journal.baseline.last_sequence;
-            entry.has_wal_records = true;
             journal.phase = Phase::Ready { lease, anchored: Some(anchored) };
             Ok(())
         }

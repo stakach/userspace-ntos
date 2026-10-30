@@ -35,6 +35,7 @@ pub use quiesce::{v2_hive_quiesce_decision, HiveJournalEvidence, HiveQuiesceDeci
 pub use reactos_registration::{
     collect_reactos_network_adapter_bindings, reactos_network_ipv4_defaults_for_interface,
     reactos_time_zone_index_for_language, reactos_time_zone_setup_from_mutable_hives,
+    reactos_user_profile_shell_folders_complete_in_target,
     seed_reactos_default_user_shell_folders_in_mutable_hives,
     seed_reactos_explorer_shell_com_classes,
     seed_reactos_explorer_shell_com_classes_in_mutable_hives,
