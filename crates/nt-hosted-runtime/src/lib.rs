@@ -22,6 +22,7 @@ mod contiguous_ram;
 mod provider_export_worker;
 mod gop_bar_projection;
 mod hosted_driver_thread_object;
+mod hosted_current_thread_kpcr;
 mod hosted_event_projection;
 mod win32k_bulk_stage;
 
@@ -71,6 +72,7 @@ pub use provider_export_worker::{HostedProviderExportCompletion, HostedProviderW
     select_hosted_cr8_bank, select_hosted_provider_export_worker};
 pub use gop_bar_projection::{GopBarProjection, GopLegacyVgaPortAuthority,
     GopPciBarAuthority};
+pub use hosted_current_thread_kpcr::HostedCurrentThreadKpcr;
 pub use hosted_driver_thread_object::{HostedDriverThreadObjectKey,
     HostedDriverThreadObjectRecord};
 pub use hosted_event_projection::{HostedEventProjectionKey, HostedEventProjectionLifetime,

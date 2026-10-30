@@ -17321,7 +17321,36 @@ extern "win64" fn s_current_process() -> u64 {
     current_ps_value(4)
 }
 
-extern "win64" fn s_current_thread() -> u64 { current_ps_value(3) }
+/// The current ETHREAD is a driver-visible value in the hosted KPCR. Root service calls still
+/// authenticate the retained physical route, dispatch, and actor independently of these writable
+/// bytes. Check stack geometry before touching GS because other component lanes use another layout.
+fn projected_current_thread_from_kpcr() -> Option<u64> {
+    let rsp: u64;
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, nomem, preserves_flags));
+    }
+    let layout = nt_hosted_runtime::HostedCurrentThreadKpcr::new(
+        FSD_STACK_VADDR, FSD_STACK_BYTES, FSD_KPCR_VA,
+        FSD_WORKER_VADDR, FSD_WORKER_STRIDE, FSD_WORKER_STACK_FRAMES * 0x1000,
+        FSD_WORKER_KPCR_OFFSET,
+    )?;
+    layout.read_projected_thread(rsp, |offset| {
+        let value: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {value}, qword ptr gs:[{offset}]",
+                value = out(reg) value,
+                offset = in(reg) offset,
+                options(nostack, preserves_flags, readonly),
+            );
+        }
+        value
+    })
+}
+
+extern "win64" fn s_current_thread() -> u64 {
+    projected_current_thread_from_kpcr().unwrap_or_else(|| current_ps_value(3))
+}
 
 extern "win64" fn s_io_thread_to_process(thread: u64) -> u64 {
     unsafe {
