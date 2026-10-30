@@ -49312,6 +49312,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
                 status,
                 information,
                 file_context,
+                ..
             } => {
                 let copied =
                     nt_io_manager::completion_output_transfer_len(information, out.len() as u64)
@@ -57182,6 +57183,7 @@ fn hosted_dma_status(error: DmaError) -> nt_status::NtStatus {
         }
         DmaError::AdapterConflict => nt_status::NtStatus::CONFLICTING_ADDRESSES,
         DmaError::AdapterBusy => nt_status::NtStatus::DEVICE_BUSY,
+        DmaError::Quarantined => nt_status::NtStatus::DEVICE_NOT_READY,
     }
 }
 
