@@ -237,6 +237,7 @@ version = "0.1.0"
 name = "nt-compat-exports"
 version = "0.1.0"
 dependencies = [
+ "nt-acpi",
  "nt-ahci",
  "nt-driver-runtime",
  "nt-exe-image",

@@ -13,6 +13,7 @@ undocumented_unsafe_blocks = "deny"
 [dev-dependencies]
 sha2 = "0.10"
 nt-ahci = { path = "../nt-ahci" }
+nt-acpi = { path = "../nt-acpi" }
 nt-fs = { path = "../nt-fs" }
 nt-printf = { path = "../nt-printf" }
 nt-io-manager = { path = "../nt-io-manager" }

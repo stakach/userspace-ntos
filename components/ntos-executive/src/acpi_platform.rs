@@ -639,6 +639,56 @@ unsafe fn prepare_memory_authority(
     })
 }
 
+fn project_static_io_ports(
+    ports: &mut Vec<AcpiPortAuthority>,
+    resources: &[nt_acpi::StaticIoResource],
+) -> Result<(), nt_status::NtStatus> {
+    let matching = resources
+        .iter()
+        .filter(|resource| resource.hardware_id == "PNP0A06");
+    let additional = matching.clone().count();
+    let total = ports
+        .len()
+        .checked_add(additional)
+        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    if total > driver_launch::SH_RESOURCE_KIND_CAPACITY as usize {
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    }
+    for resource in matching.clone() {
+        let start = resource.start as u32;
+        let end = start
+            .checked_add(resource.length as u32)
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+        if resource.length == 0 || end > 0x1_0000 {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        if ports.iter().any(|port| {
+            let prior_start = port.base;
+            let prior_end = prior_start.saturating_add(port.length as u64);
+            (start as u64) < prior_end && prior_start < end as u64
+        }) || resources.iter().any(|other| {
+            !core::ptr::eq(other, resource)
+                && other.hardware_id == "PNP0A06"
+                && start < (other.start as u32).saturating_add(other.length as u32)
+                && (other.start as u32) < end
+        }) {
+            return Err(nt_status::NtStatus::CONFLICTING_ADDRESSES);
+        }
+    }
+    ports
+        .try_reserve_exact(additional)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    for resource in matching {
+        ports.push(AcpiPortAuthority {
+            resource_index: ports.len() as u8,
+            base: resource.start as u64,
+            length: resource.length as u32,
+            platform_reset: false,
+        });
+    }
+    Ok(())
+}
+
 unsafe fn discover_acpi_platform_authority_inner(
     bi: &BootInfo,
     owner: &mut HostedPnpContextOwner,
@@ -780,6 +830,28 @@ unsafe fn discover_acpi_platform_authority_inner(
             _ => return Err(nt_status::NtStatus::INVALID_PARAMETER),
         }
     }
+    let fixed_port_count = ports.len();
+    project_static_io_ports(&mut ports, &discovery.static_io)?;
+    print_str(b"[acpi-platform] static SystemIO discovered/granted=");
+    print_u64(discovery.static_io.len() as u64);
+    print_str(b"/");
+    print_u64((ports.len() - fixed_port_count) as u64);
+    if let Some(resource) = discovery
+        .static_io
+        .iter()
+        .find(|resource| resource.hardware_id == "PNP0A06")
+    {
+        print_str(b" first PNP0A06 start/len/table/region=0x");
+        print_hex(resource.start as u32);
+        print_str(b"/");
+        print_u64(resource.length as u64);
+        print_str(b"/0x");
+        print_hex((resource.table_address >> 32) as u32);
+        print_hex(resource.table_address as u32);
+        print_str(b"/");
+        print_str(&resource.region_name);
+    }
+    print_str(b"\n");
     let writable_ranges = nt_acpi::normalize_physical_ranges(&writable_ranges)
         .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
     for range in &writable_ranges {
