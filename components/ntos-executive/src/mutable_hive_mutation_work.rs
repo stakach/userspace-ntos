@@ -4,52 +4,75 @@ use crate::*;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use nt_hive_core::{CellId, OwnedPreparedSetKeySecurity, OwnedPreparedSetValue,
+use nt_hive_core::{CellId, CreateChildError, OwnedPreparedCreateChild,
+    OwnedPreparedSetKeySecurity, OwnedPreparedSetValue,
     RegistryValueType, ResolvedHiveKey, SetKeySecurityError, SetValueError};
 use nt_process::native_handle::NativeThreadProcessReference;
 use nt_process::RegistryKeyHandlePublication;
 use nt_user_host::provider_logical_caller::ProviderLogicalCaller;
 use nt_thread_start::amd64_context::UserApcContinuation;
+use crate::exec_handler::registry_admission::HostedRegistryPublication;
 
 const STATUS_INVALID_HANDLE: u32 = nt_fs::STATUS_INVALID_HANDLE;
 
 enum Phase {
-    Prepare, Begin, Poll, Publish, Install, ReadyReply, ReplyEntered, ReplySent,
+    Prepare, Begin, Poll, Publish, Install, PublishChild, OpenExistingChild,
+    ReadyReply, ReplyEntered, ReplySent,
     RevokeReply, RetypeReply, ReconcileRuntime,
 }
 
 enum Pending {
     Value { key: CellId, path: String, name: String,
         value_type: RegistryValueType, data: Vec<u8> },
+    Child { parent: CellId, path: String, name: String,
+        class: Option<String>, descriptor: Vec<u8> },
     Security { key: CellId, path: String, information: u32, modification: Vec<u8> },
 }
 
 enum Prepared {
     Value(OwnedPreparedSetValue),
+    Child(OwnedPreparedCreateChild),
     Security(OwnedPreparedSetKeySecurity),
 }
 
 impl Prepared {
     fn record(&self) -> &[u8] {
         match self {
-            Self::Value(value) => value.record(), Self::Security(security) => security.record(),
+            Self::Value(value) => value.record(), Self::Child(child) => child.record(),
+            Self::Security(security) => security.record(),
         }
     }
 
     unsafe fn mark_entered(&mut self) {
         match self {
-            Self::Value(value) => value.mark_entered(), Self::Security(security) => security.mark_entered(),
+            Self::Value(value) => value.mark_entered(), Self::Child(child) => child.mark_entered(),
+            Self::Security(security) => security.mark_entered(),
         }
     }
 }
 
+enum Completion {
+    SetValue { key_owner: RegistryKeyHandlePublication },
+    Security { key_owner: RegistryKeyHandlePublication },
+    CreateChild {
+        publication: HostedRegistryPublication,
+        parent_owner: RegistryKeyHandlePublication,
+        parent_key: ResolvedHiveKey,
+        child: Option<CellId>,
+        grant: u32,
+        backup: bool,
+        published: bool,
+    },
+}
+
 struct HostedCaller {
+    pi: usize,
     tid: u64,
     badge: u64,
     reply: u64,
     logical: ProviderLogicalCaller,
     reference: NativeThreadProcessReference,
-    key_owner: Option<RegistryKeyHandlePublication>,
+    completion: Option<Completion>,
     _continuation: UserApcContinuation,
 }
 
@@ -84,6 +107,18 @@ fn prepare_error(error: SetValueError) -> u32 {
         SetValueError::KeyNotFound => STATUS_INVALID_HANDLE,
         SetValueError::InsufficientResources => 0xC000_009A,
         SetValueError::RetainedPublication => 0xC000_00A3,
+    }
+}
+
+fn create_error(error: CreateChildError) -> u32 {
+    match error {
+        CreateChildError::InvalidName => 0xC000_0033,
+        CreateChildError::ParentNotFound => STATUS_INVALID_HANDLE,
+        CreateChildError::NameCollision => 0xC000_0035,
+        CreateChildError::EmptySecurityDescriptor => 0xC000_0079,
+        CreateChildError::ChildMustBeVolatile => 0xC000_0181,
+        CreateChildError::InsufficientResources => 0xC000_009A,
+        CreateChildError::RetainedPublication => 0xC000_00A3,
     }
 }
 
@@ -135,11 +170,11 @@ unsafe fn submit_hosted_existing_edit(
 ) -> Result<(), u32> {
     let _durable = allocator::enter_durable();
     let path = handler.mutable_key_relative_path(key).ok_or(STATUS_INVALID_HANDLE)?;
-    let pending = match edit {
+    let (pending, value_edit) = match edit {
         ExistingEdit::SetValue { name, value_type, data } =>
-            Pending::Value { key: key.key, path, name, value_type, data },
+            (Pending::Value { key: key.key, path, name, value_type, data }, true),
         ExistingEdit::SetSecurity { information, modification } =>
-            Pending::Security { key: key.key, path, information, modification },
+            (Pending::Security { key: key.key, path, information, modification }, false),
     };
     let mut log_path = handler.mutable_hive_checkpoint_path_owned(key.hive)
         .ok_or(STATUS_INVALID_HANDLE)?;
@@ -198,8 +233,10 @@ unsafe fn submit_hosted_existing_edit(
         prepared: None, journal_id: None, receipt: None,
         installation: None,
         caller: HostedCaller {
+            pi: handler.pi,
             tid: handler.current_tid, badge: handler.current_badge, reply, logical,
-            reference, key_owner: Some(key_owner),
+            reference, completion: Some(if value_edit { Completion::SetValue { key_owner } }
+                else { Completion::Security { key_owner } }),
             _continuation: if handler.current_native_call_transport {
                 UserApcContinuation::NativeCall
             } else {
@@ -212,6 +249,99 @@ unsafe fn submit_hosted_existing_edit(
         },
         phase: Phase::Prepare, status: 0, cancelled: false,
     };
+    match index { Some(index) => rows[index] = Some(work), None => rows.push(Some(work)) }
+    park.commit();
+    PENDING.fetch_add(1, Ordering::Release);
+    NEXT.store(monotonic_time_100ns(), Ordering::Release);
+    assert!(!TRANSFERRED.swap(true, Ordering::AcqRel));
+    Ok(())
+}
+
+/// The caller's reserved output, exact parent reference, subject and Reply move together.
+/// Failure leaves both externally owned reservations untouched for admission cleanup.
+pub(crate) unsafe fn submit_hosted_create_child(
+    handler: &mut ExecNtHandler,
+    publication: HostedRegistryPublication,
+    parent_owner: RegistryKeyHandlePublication,
+    parent: KeyRef,
+    parent_key: ResolvedHiveKey,
+    leaf: String,
+    class: Option<String>,
+    descriptor: Vec<u8>,
+    grant: u32,
+    backup: bool,
+) -> Result<(), (u32, HostedRegistryPublication, RegistryKeyHandlePublication)> {
+    let _durable = allocator::enter_durable();
+    let admission = (|| {
+        let (parent_path, path_leaf) = publication.path.rsplit_once('\\')
+            .ok_or(0xC000_003Bu32)?;
+        if path_leaf != leaf || handler.registry_target_path(parent).as_deref() != Some(parent_path) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let relative = handler.mutable_key_relative_path(parent_key)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let mut log_path = handler.mutable_hive_checkpoint_path_owned(parent_key.hive)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        log_path.try_reserve(4).map_err(|_| 0xC000_009Au32)?;
+        log_path.push_str(".LOG");
+        let tcb = handler.hosted_thread_tcb(handler.current_tid)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let logical = handler.capture_provider_logical_caller(
+            handler.pi, handler.current_tid, handler.current_badge, tcb,
+        ).ok_or(STATUS_INVALID_HANDLE)?;
+        if logical.thread() != publication.subject.caller().original_thread() {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let park = root_reply_park::RootReplyPark::prepare().ok_or(0xC000_009Au32)?;
+        let rows = &mut *core::ptr::addr_of_mut!(WORK);
+        let index = rows.iter().enumerate().find_map(|(index, row)|
+            (row.is_none() && EXECUTING_INDEX.load(Ordering::Relaxed) != index as u64)
+                .then_some(index));
+        if index.is_none() { rows.try_reserve(1).map_err(|_| 0xC000_009Au32)?; }
+        let requestor = handler.pm.capture_native_handle_caller(
+            logical.thread(), nt_types::AccessMode::KernelMode)?;
+        let mut reference = handler.pm.reference_native_requestor(requestor)?;
+        let order = match reserve_order() {
+            Ok(order) => order,
+            Err(status) => {
+                reference.release(&mut handler.pm).expect("unsubmitted mutable create caller");
+                return Err(status);
+            }
+        };
+        Ok((park, index, logical, reference, order, relative, log_path))
+    })();
+    let (park, index, logical, reference, order, relative, log_path) = match admission {
+        Ok(admission) => admission,
+        Err(status) => return Err((status, publication, parent_owner)),
+    };
+    let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    assert_ne!(reply, 0);
+    let work = Work {
+        order, hive: parent_key.hive, log_path,
+        pending: Some(Pending::Child { parent: parent_key.key, path: relative,
+            name: leaf, class, descriptor }),
+        prepared: None,
+        journal_id: None, receipt: None, installation: None,
+        caller: HostedCaller {
+            pi: handler.pi,
+            tid: handler.current_tid, badge: handler.current_badge, reply, logical, reference,
+            completion: Some(Completion::CreateChild {
+                publication, parent_owner, parent_key, child: None, grant, backup,
+                published: false,
+            }),
+            _continuation: if handler.current_native_call_transport {
+                UserApcContinuation::NativeCall
+            } else {
+                UserApcContinuation::Fault {
+                    resume_ip: handler.current_resume_ip,
+                    resume_sp: handler.current_sp,
+                    resume_flags: handler.current_flags,
+                }
+            },
+        },
+        phase: Phase::Prepare, status: 0, cancelled: false,
+    };
+    let rows = &mut *core::ptr::addr_of_mut!(WORK);
     match index { Some(index) => rows[index] = Some(work), None => rows.push(Some(work)) }
     park.commit();
     PENDING.fetch_add(1, Ordering::Release);
@@ -257,6 +387,12 @@ unsafe fn release_pre_entry(handler: &mut ExecNtHandler, work: &mut Work, status
                     return Err(status);
                 }
             }
+            Prepared::Child(prepared) => {
+                if let Err((_, prepared)) = handler.mutable_hives.release_unentered_owned_create_child(prepared) {
+                    work.prepared = Some(Prepared::Child(prepared));
+                    return Err(status);
+                }
+            }
             Prepared::Security(prepared) => {
                 if let Err((_, prepared)) = handler.mutable_hives.release_unentered_owned_set_key_security(prepared) {
                     work.prepared = Some(Prepared::Security(prepared));
@@ -279,6 +415,19 @@ unsafe fn caller_cancelled(handler: &ExecNtHandler, caller: &HostedCaller) -> bo
         || !handler.validate_provider_logical_caller(caller.logical)
 }
 
+fn release_completion(handler: &mut ExecNtHandler, caller: &mut HostedCaller) {
+    match caller.completion.take().expect("retained mutable completion") {
+        Completion::SetValue { key_owner } | Completion::Security { key_owner } =>
+            release_key_owner(handler, key_owner),
+        Completion::CreateChild { mut publication, parent_owner, published, .. } => {
+            if !published {
+                handler.abort_hosted_registry_publication(&mut publication);
+            }
+            release_key_owner(handler, parent_owner);
+        }
+    }
+}
+
 unsafe fn advance(
     handler: &mut ExecNtHandler, queue: &mut nt_delay_execution::Queue, work: &mut Work,
     earlier_unpublished: bool,
@@ -298,6 +447,17 @@ unsafe fn advance(
                         handler.mutable_hives.prepare_owned_set_value(
                             work.hive, key, &path, &name, value_type, data,
                         ).map(Prepared::Value).map_err(prepare_error),
+                    Pending::Child { parent, path, name, class, descriptor } =>
+                        match handler.mutable_hives.prepare_owned_create_child(
+                            work.hive, parent, &path, &name, class.as_deref(), descriptor,
+                        ) {
+                            Ok(prepared) => Ok(Prepared::Child(prepared)),
+                            Err(CreateChildError::NameCollision) => {
+                                work.phase = Phase::OpenExistingChild;
+                                return Ok(false);
+                            }
+                            Err(error) => Err(create_error(error)),
+                        },
                     Pending::Security { key, path, information, modification } => (|| {
                         let current = handler.mutable_registry_key_security_descriptor(
                             ResolvedHiveKey { hive: work.hive, key },
@@ -340,14 +500,27 @@ unsafe fn advance(
         Phase::Publish => {
             let receipt = work.receipt.take().expect("anchored hive receipt");
             let prepared = work.prepared.take().expect("retained hive edit");
-            let (continuation, pair) = match prepared {
+            let (child, continuation, pair) = match prepared {
                 Prepared::Value(prepared) => match nt_fs::publish_anchored_hive_value(
                     &mut handler.mutable_hives, prepared, receipt.anchored,
                     receipt.file_id, receipt.expected_log_len, &receipt.log_path,
                 ) {
-                    Ok((_, continuation, pair)) => (continuation, pair),
+                    Ok((_, continuation, pair)) => (None, continuation, pair),
                     Err((_, prepared, anchored)) => {
                         work.prepared = Some(Prepared::Value(prepared));
+                        work.receipt = Some(writable_fs::hive_wal::NativeHiveJournalReceipt {
+                            anchored, ..receipt
+                        });
+                        return Err(0xC000_003Eu32);
+                    }
+                },
+                Prepared::Child(prepared) => match nt_fs::publish_anchored_hive_child(
+                    &mut handler.mutable_hives, prepared, receipt.anchored,
+                    receipt.file_id, receipt.expected_log_len, &receipt.log_path,
+                ) {
+                    Ok((child, continuation, pair)) => (Some(child), continuation, pair),
+                    Err((_, prepared, anchored)) => {
+                        work.prepared = Some(Prepared::Child(prepared));
                         work.receipt = Some(writable_fs::hive_wal::NativeHiveJournalReceipt {
                             anchored, ..receipt
                         });
@@ -358,7 +531,7 @@ unsafe fn advance(
                     &mut handler.mutable_hives, prepared, receipt.anchored,
                     receipt.file_id, receipt.expected_log_len, &receipt.log_path,
                 ) {
-                    Ok((continuation, pair)) => (continuation, pair),
+                    Ok((continuation, pair)) => (None, continuation, pair),
                     Err((_, prepared, anchored)) => {
                         work.prepared = Some(Prepared::Security(prepared));
                         work.receipt = Some(writable_fs::hive_wal::NativeHiveJournalReceipt {
@@ -368,6 +541,11 @@ unsafe fn advance(
                     }
                 },
             };
+            if let Some(child) = child {
+                let Some(Completion::CreateChild { child: destination, .. }) =
+                    work.caller.completion.as_mut() else { unreachable!("child completion") };
+                *destination = Some(child);
+            }
             work.installation = Some((continuation, pair));
             work.phase = Phase::Install;
         }
@@ -380,13 +558,57 @@ unsafe fn advance(
                 Ok(()) => {
                     handler.note_mutable_hive_journal_record(work.hive);
                     work.status = 0;
-                    work.phase = Phase::ReadyReply;
+                    work.phase = if matches!(&work.caller.completion, Some(Completion::CreateChild { .. })) {
+                        Phase::PublishChild
+                    } else {
+                        Phase::ReadyReply
+                    };
                 }
                 Err((status, continuation, pair)) => {
                     work.installation = Some((continuation, pair));
                     return Err(status);
                 }
             }
+        }
+        Phase::PublishChild => {
+            if !work.cancelled {
+                let Some(Completion::CreateChild { publication, parent_key, child,
+                    grant, published, .. }) = work.caller.completion.as_mut()
+                else { unreachable!("retained child completion") };
+                if !handler.validate_provider_logical_caller(work.caller.logical) {
+                    work.cancelled = true;
+                } else {
+                    let saved_pi = handler.pi;
+                    handler.pi = work.caller.pi;
+                    let result = handler.finish_anchored_mutable_child(
+                        publication, *parent_key, child.expect("anchored child"), *grant,
+                    );
+                    handler.pi = saved_pi;
+                    *published = result.is_ok();
+                    work.status = result.err().unwrap_or(0);
+                }
+            }
+            work.phase = Phase::ReadyReply;
+        }
+        Phase::OpenExistingChild => {
+            if !work.cancelled {
+                let Some(Completion::CreateChild { publication, parent_key, backup,
+                    published, .. }) = work.caller.completion.as_mut()
+                else { unreachable!("retained child completion") };
+                if !handler.validate_provider_logical_caller(work.caller.logical) {
+                    work.cancelled = true;
+                } else {
+                    let saved_pi = handler.pi;
+                    handler.pi = work.caller.pi;
+                    let result = handler.finish_existing_mutable_child(
+                        publication, *parent_key, *backup,
+                    );
+                    handler.pi = saved_pi;
+                    *published = result.is_ok();
+                    work.status = result.err().unwrap_or(0);
+                }
+            }
+            work.phase = Phase::ReadyReply;
         }
         Phase::ReadyReply => {
             if work.cancelled {
@@ -415,7 +637,7 @@ unsafe fn advance(
                 work.phase = Phase::ReconcileRuntime;
                 return Ok(false);
             }
-            if let Some(owner) = work.caller.key_owner.take() { release_key_owner(handler, owner); }
+            release_completion(handler, &mut work.caller);
             thread_wait_state_clear_badge_ready(handler, work.caller.badge);
             work.caller.reference.release(&mut handler.pm)
                 .expect("retained mutable caller reference");
@@ -435,7 +657,7 @@ unsafe fn advance(
             if !hosted_termination::reconcile(handler, queue, work.caller.logical) {
                 return Err(0xC000_00A3);
             }
-            if let Some(owner) = work.caller.key_owner.take() { release_key_owner(handler, owner); }
+            release_completion(handler, &mut work.caller);
             work.caller.reference.release(&mut handler.pm)
                 .expect("retired mutable caller reference");
             return Ok(true);
