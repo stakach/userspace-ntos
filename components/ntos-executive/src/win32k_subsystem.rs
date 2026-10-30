@@ -17730,7 +17730,20 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     } else if matches!(ssn, 0x1036 | 0x10AD) {
         dispatch_ssn_with_job_atom_namespace(process_index, ssn, a0, a1, a2, a3)
     } else {
-        dispatch_ssn(ssn, a0, a1, a2, a3)
+        if ssn == 0x10fa {
+            print_str(b"[process-connect-dispatch] enter dispatch=");
+            print_u64(header.dispatch_id);
+            print_str(b"\n");
+        }
+        let result = dispatch_ssn(ssn, a0, a1, a2, a3);
+        if ssn == 0x10fa {
+            print_str(b"[process-connect-dispatch] return dispatch=");
+            print_u64(header.dispatch_id);
+            print_str(b" result=0x");
+            print_hex(result as u32);
+            print_str(b"\n");
+        }
+        result
     };
     if ssn == SSN_NT_USER_LOAD_KEYBOARD_LAYOUT_EX && result != 0 {
         let _ = refresh_default_keyboard_layout();
@@ -18730,7 +18743,21 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         print_str(b"\n");
     }
+    if ssn == 0x10fa {
+        print_str(b"[process-connect-handler] enter dispatch=");
+        print_u64(dispatch_id);
+        print_str(b" pi=");
+        print_u64(request_client_pi);
+        print_str(b"\n");
+    }
     let ret = call(handler, args.as_ptr(), nargs);
+    if ssn == 0x10fa {
+        print_str(b"[process-connect-handler] return dispatch=");
+        print_u64(dispatch_id);
+        print_str(b" result=0x");
+        print_hex(ret as u32);
+        print_str(b"\n");
+    }
     if ssn == SSN_NT_USER_SWITCH_DESKTOP {
         let target = (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(a0);
         let info = if target != 0 { read_volatile((target + 8) as *const u64) } else { 0 };

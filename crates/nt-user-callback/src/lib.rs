@@ -1893,7 +1893,11 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         correlation: CallbackCorrelation,
     ) -> Result<ActiveCallbackFrame, ValidationError> {
         let index = self.correlated_index(&correlation)?;
-        if !self.frames[index].redirected {
+        let frame = &self.frames[index];
+        if !frame.redirected
+            || !frame.dispatch_context.lane.is_valid()
+            || frame.dispatch_context.dispatch_id != correlation.dispatch_id
+        {
             return Err(ValidationError::State);
         }
         Ok(self.remove(index))
@@ -3663,6 +3667,39 @@ mod tests {
     }
 
     #[test]
+    fn client_thread_startup_callback_cannot_retire_without_its_suspended_dispatch() {
+        let mut stack = ActiveCallbackStack::<1>::new();
+        let mut request = CallbackHeader::idle(86, 8, 100, 30);
+        request.state = CallbackState::Request as u32;
+        request.callback_id = 7;
+        request.api_index = USER32_CALLBACK_CLIENTTHREADSTARTUP;
+        let correlation = CallbackCorrelation::from_request(&request);
+        stack.push(request, 0xaaa0).unwrap();
+        let mut outer_context = [0u64; 20];
+        outer_context[USER_CONTEXT_RIP] = 0x1000;
+        stack.record_redirect(correlation, outer_context).unwrap();
+
+        // A completed user-mode callback still owns the original NtUserProcessConnect dispatch.
+        // An unbound frame must stay retained; otherwise the caller loses its only path to a
+        // service result and original syscall reply.
+        assert_eq!(stack.pop(correlation), Err(ValidationError::State));
+        assert_eq!(stack.len(), 1);
+
+        let original = DispatchContext {
+            lane: nt_component_suspension::LaneHandle { index: 8, generation: 3 },
+            dispatch_id: 86,
+            ssn: 0x10fa,
+            args: [u64::MAX, 0x4000, 576, 0x4000],
+            caller_sp: 0x7000,
+            output_stage: None,
+            paint_output: None,
+        };
+        stack.record_dispatch_context(correlation, original).unwrap();
+        let retired = stack.pop(correlation).unwrap();
+        assert_eq!(*retired.dispatch_context(), original);
+    }
+
+    #[test]
     fn callback_return_readiness_is_lifo_per_execution_lane() {
         let mut stack = ActiveCallbackStack::<2>::new();
         let mut outer = CallbackHeader::idle(10, 2, 6, 4);
@@ -3783,6 +3820,11 @@ mod tests {
         stack
             .record_redirect(outer_correlation, [0x11; 20])
             .unwrap();
+        stack.record_dispatch_context(outer_correlation, DispatchContext {
+            lane: nt_component_suspension::LaneHandle { index: 0, generation: 1 },
+            dispatch_id: outer_correlation.dispatch_id,
+            ..DispatchContext::EMPTY
+        }).unwrap();
         stack.push(inner, 0xbbb0).unwrap();
         stack
             .record_callback_window(
@@ -3793,6 +3835,11 @@ mod tests {
         stack
             .record_redirect(inner_correlation, [0x22; 20])
             .unwrap();
+        stack.record_dispatch_context(inner_correlation, DispatchContext {
+            lane: nt_component_suspension::LaneHandle { index: 0, generation: 1 },
+            dispatch_id: inner_correlation.dispatch_id,
+            ..DispatchContext::EMPTY
+        }).unwrap();
 
         let completed_inner = stack.pop(inner_correlation).unwrap();
         assert_eq!(completed_inner.saved_user_context(), &[0x22; 20]);
