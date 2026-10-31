@@ -1113,19 +1113,11 @@ fn mutate_local_irp_packet(
     argument: u64,
     flags: u64,
 ) -> (i32, u64, u64) {
-    if operation == 13 {
-        print_str(b"[source-irp-reuse] enter irp=0x");
-        print_hex64(irp);
-        print_str(b" status=0x");
-        print_hex64(argument);
-        print_str(b" apc=");
-        print_u64(flags);
-        print_str(b"\n");
-    }
+    let initialize = operation == hosted_irp_lifecycle_exports::INITIALIZE;
     if irp == 0 || irp & 15 != 0 {
         return (STATUS_INVALID_PARAMETER, 0, 0);
     }
-    let (stack_count, apc_environment) = if operation == 12 {
+    let (stack_count, apc_environment) = if initialize {
         if flags & !0xffff != 0 || argument > u16::MAX as u64 {
             return (STATUS_INVALID_PARAMETER, 0, 0);
         }
@@ -1149,16 +1141,14 @@ fn mutate_local_irp_packet(
     let Some(identity) = (unsafe {
         exact_pool_identity_unlocked(inst, irp, WDM_X64_IRP_SIZE as u64)
     }) else {
-        if operation == 13 { print_str(b"[source-irp-reuse] deny=pool-identity\n"); }
         return (STATUS_INVALID_PARAMETER, 0, 0);
     };
     let Some(header_exec) = (unsafe {
         hosted_pool_allocation_exec_va(inst.exec_pool_va, irp, WDM_X64_IRP_SIZE as u64)
     }) else {
-        if operation == 13 { print_str(b"[source-irp-reuse] deny=pool-exec\n"); }
         return (STATUS_INVALID_PARAMETER, 0, 0);
     };
-    let (packet_size, stack_count) = if operation == 12 {
+    let (packet_size, stack_count) = if initialize {
         (argument as u16, stack_count)
     } else {
         unsafe {
@@ -1166,20 +1156,6 @@ fn mutate_local_irp_packet(
                 read_unaligned((header_exec + WDM_X64_IRP_STACK_COUNT_OFFSET) as *const u8))
         }
     };
-    if operation == 13 {
-        let projection = caller_projections().iter().find(|row| {
-            row.allocation.domain == domain && row.allocation.component_address == irp
-        });
-        print_str(b"[source-irp-reuse] packet="); print_u64(packet_size as u64);
-        print_str(b" capacity="); print_u64(identity.capacity);
-        print_str(b" stacks="); print_u64(stack_count as u64);
-        print_str(b" projection="); print_u64(projection.is_some() as u64);
-        if let Some(row) = projection {
-            print_str(b" terminal-started="); print_u64(row.terminal_started as u64);
-            print_str(b" terminal-finished="); print_u64(row.terminal_finished as u64);
-        }
-        print_str(b"\n");
-    }
     if packet_size as usize > identity.capacity as usize
         || (packet_size as usize) < WDM_X64_IRP_SIZE
         || !(1..=32).contains(&stack_count)
@@ -1216,7 +1192,7 @@ fn mutate_local_irp_packet(
         return (STATUS_INVALID_PARAMETER, 0, 0);
     };
     let packet = unsafe { core::slice::from_raw_parts_mut(exec as *mut u8, usize::from(packet_size)) };
-    let result = if operation == 12 {
+    let result = if initialize {
         nt_io_manager::initialize_wdm_irp_packet(
             packet, irp, packet_size, stack_count, apc_environment,
         )
@@ -1227,10 +1203,7 @@ fn mutate_local_irp_packet(
     };
     match result {
         Ok(()) => (STATUS_SUCCESS, 0, 0),
-        Err(_) => {
-            if operation == 13 { print_str(b"[source-irp-reuse] deny=wdm-layout\n"); }
-            (STATUS_INVALID_PARAMETER, 0, 0)
-        },
+        Err(_) => (STATUS_INVALID_PARAMETER, 0, 0),
     }
 }
 
@@ -1342,9 +1315,10 @@ pub(super) fn service(
             }
             set_hard_error_or_verify_device(instance_index, inst, component_address, bytes)
         }
-        12 | 13 => mutate_local_irp_packet(
-            instance_index, inst, op, component_address, bytes, stack_count,
-        ),
+        hosted_irp_lifecycle_exports::INITIALIZE | hosted_irp_lifecycle_exports::REUSE =>
+            mutate_local_irp_packet(
+                instance_index, inst, op, component_address, bytes, stack_count,
+            ),
         1 => {
             let Some(stack_count) = u8::try_from(stack_count).ok() else {
                 return (STATUS_INVALID_PARAMETER, 0, 0);

@@ -5,8 +5,9 @@
 
 use super::*;
 
-const INITIALIZE: u64 = 12;
-const REUSE: u64 = 13;
+// Operations 12 and 13 belong to caller-projection terminal receipts and ACKs.
+pub(super) const INITIALIZE: u64 = 15;
+pub(super) const REUSE: u64 = 16;
 
 fn current_apc_environment() -> u8 {
     let thread = s_current_thread();
