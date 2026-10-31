@@ -7218,6 +7218,7 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
         &*core::ptr::addr_of!(EXPLORER_SSN_HIST)
     });
     print_str(b"\n");
+    driver_launch::print_mounted_native_block_census();
     print_shared_receive_census();
     if LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) != 0 {
         let tcb = LSA_LOGON_LAST_TCB.load(Ordering::Relaxed);

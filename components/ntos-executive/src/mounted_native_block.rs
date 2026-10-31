@@ -13,6 +13,61 @@ use nt_io_manager::{
     IoParameters, StackFlags,
 };
 
+// Native mounted SCSI traffic is distinct from the direct boot AHCI census. Completion is
+// counted only after the exact IRP terminal (and, for pending IRPs, acknowledgement).
+static NATIVE_FAT_CENSUS: nt_ahci::CommandCensus = nt_ahci::CommandCensus::new();
+static NATIVE_SNAPSHOT_CENSUS: nt_ahci::CommandCensus = nt_ahci::CommandCensus::new();
+// The census can run inside a nested completion pump, so it observes only atomics and never
+// borrows the mutable retained Pending owner.
+static NATIVE_PENDING_IRP: AtomicU64 = AtomicU64::new(0);
+static NATIVE_PENDING_STARTED: AtomicU64 = AtomicU64::new(0);
+static NATIVE_PENDING_BYTES: AtomicU64 = AtomicU64::new(0);
+static NATIVE_PENDING_SOURCE: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn print_census() {
+    for (source, census) in [
+        (b"fat".as_slice(), &NATIVE_FAT_CENSUS),
+        (b"snapshot".as_slice(), &NATIVE_SNAPSHOT_CENSUS),
+    ] {
+        print_str(b"[census] native-block source=");
+        print_str(source);
+        for (label, operation) in [
+            (b" read=".as_slice(), nt_ahci::IoOperation::Read),
+            (b" write=".as_slice(), nt_ahci::IoOperation::Write),
+            (b" flush=".as_slice(), nt_ahci::IoOperation::Barrier),
+        ] {
+            let sample = census.snapshot(operation);
+            print_str(label);
+            print_u64(sample.commands);
+            print_str(b"settled/");
+            print_u64(sample.sectors);
+            print_str(b"requested-sec/");
+            print_u64(sample.ticks / 1_000_000);
+            print_str(b"Mtick/");
+            print_u64(sample.failures);
+            print_str(b"fail");
+        }
+        print_str(b"\n");
+    }
+    let pending_irp = NATIVE_PENDING_IRP.load(Ordering::Acquire);
+    if pending_irp != 0 {
+        print_str(b"[census] native-block pending irp=");
+        print_u64(pending_irp);
+        print_str(b" source=");
+        print_str(if NATIVE_PENDING_SOURCE.load(Ordering::Relaxed) == 0 {
+            b"fat".as_slice()
+        } else {
+            b"snapshot".as_slice()
+        });
+        print_str(b" bytes=");
+        print_u64(NATIVE_PENDING_BYTES.load(Ordering::Relaxed));
+        print_str(b" outstanding-Mtick=");
+        print_u64(crate::disk_census_ticks().wrapping_sub(
+            NATIVE_PENDING_STARTED.load(Ordering::Relaxed)) / 1_000_000);
+        print_str(b"\n");
+    }
+}
+
 #[derive(Clone, Copy)]
 enum SectorClaim {
     Create(crate::mounted_volume_backend::mounted_create_lookup::CreateSectorClaim),
@@ -160,6 +215,7 @@ struct Pending {
     irp: IrpId,
     requestor_tid: u64,
     terminal: Option<Terminal>,
+    started_ticks: u64,
 }
 
 static mut PENDING: Option<Pending> = None;
@@ -217,6 +273,18 @@ fn terminal_data<'a>(
 
 fn settle(pending: Pending, terminal: Terminal) {
     let result = terminal_data(&pending.command, pending.route.scsi, pending.irp, &terminal);
+    let operation = match pending.command.kind() {
+        nt_io_manager::scsi_block_command::BlockCommandKind::Read => nt_ahci::IoOperation::Read,
+        nt_io_manager::scsi_block_command::BlockCommandKind::Write => nt_ahci::IoOperation::Write,
+        nt_io_manager::scsi_block_command::BlockCommandKind::Flush => nt_ahci::IoOperation::Barrier,
+        nt_io_manager::scsi_block_command::BlockCommandKind::Capacity => unreachable!("mounted block capacity request"),
+    };
+    let census = match pending.claim.source() {
+        nt_fs::BlockSource::Fat => &NATIVE_FAT_CENSUS,
+        nt_fs::BlockSource::Snapshot => &NATIVE_SNAPSHOT_CENSUS,
+    };
+    census.record(operation, pending.started_ticks, crate::disk_census_ticks(),
+        (pending.command.data_len() / 512) as u64, result.is_err());
     if result.is_ok() {
         crate::fs_loader::complete_exec_native_block(pending.ticket, pending.command.data_len() as u64)
             .expect("exact native block ticket lost");
@@ -261,6 +329,7 @@ unsafe fn poll_pending() -> usize {
         return 0;
     }
     let mut pending = slot.take().expect("acknowledged native sector owner disappeared");
+    NATIVE_PENDING_IRP.store(0, Ordering::Release);
     let terminal = pending.terminal.take().unwrap();
     settle(pending, terminal);
     1
@@ -358,6 +427,7 @@ pub(super) unsafe fn service() -> usize {
         stack_flags: StackFlags::empty(),
         initial_information: 0,
     };
+    let started_ticks = crate::disk_census_ticks();
     match hosted_file_owners::dispatch(
         caller, request, input, &output, ExternalFileIrpDispatchPolicy::ScsiAtDevice,
     ) {
@@ -367,16 +437,23 @@ pub(super) unsafe fn service() -> usize {
                 .expect("returned native block ticket lost");
             let (_, packet) = buffers.into_parts();
             settle(Pending { claim, ticket, route, command, irp: irp_id,
-                requestor_tid, terminal: None }, Terminal { status, packet });
+                requestor_tid, terminal: None, started_ticks }, Terminal { status, packet });
             1
         }
         Ok(hosted_file_owners::DispatchResult::Outstanding { irp_id }) => {
             claim.mark_entered();
             crate::fs_loader::mark_entered_exec_native_block(ticket)
                 .expect("pending native block ticket lost");
+            let source = claim.source();
+            let bytes = command.data_len();
             *core::ptr::addr_of_mut!(PENDING) = Some(Pending {
                 claim, ticket, route, command, irp: irp_id, requestor_tid, terminal: None,
+                started_ticks,
             });
+            NATIVE_PENDING_STARTED.store(started_ticks, Ordering::Relaxed);
+            NATIVE_PENDING_BYTES.store(bytes as u64, Ordering::Relaxed);
+            NATIVE_PENDING_SOURCE.store(u64::from(source == nt_fs::BlockSource::Snapshot), Ordering::Relaxed);
+            NATIVE_PENDING_IRP.store(irp_id.raw(), Ordering::Release);
             1
         }
         Err(status) => {
