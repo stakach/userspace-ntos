@@ -8,9 +8,14 @@ on:
         type: choice
         default: '180'
         options: ['180', '1200', '3600']
+      boot_runs:
+        description: Sequential bounded boots on the same generated disk
+        type: choice
+        default: '1'
+        options: ['1', '2']
   push:
     branches: [codex/libernt-userspace]
-    paths: [.github/workflows/native-kvm-smoke.yml, scripts/ci_kvm_smoke.py]
+    paths: [.github/workflows/native-kvm-smoke.yml, scripts/ci_kvm_smoke.py, scripts/tests/test_ci_kvm_smoke_process_group.py]
 
 permissions:
   contents: read
@@ -23,7 +28,7 @@ jobs:
   native-kvm-smoke:
     name: Build and boot pinned LiberNT image on KVM
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with:
@@ -95,6 +100,8 @@ jobs:
               raise SystemExit(f"unexpected KVM API version {version}")
           print("hosted KVM API version 12 available")
           PY
+      - name: Verify bounded QEMU cleanup contract
+        run: python3 -m unittest discover -s scripts/tests -p 'test_ci_kvm_smoke_process_group.py' -v
       - name: Build native image from verified pinned LiberNT release
         run: |
           set -o pipefail
@@ -108,7 +115,28 @@ jobs:
           GRAPHICS: '1'
           QEMU_MEMORY: 3072M
           QEMU_CPUS: '4'
-        run: python3 scripts/ci_kvm_smoke.py --seconds "${{ inputs.boot_seconds || '180' }}" --trace-interrupts
+        run: |
+          set -euo pipefail
+          boot_status=0
+          rm -f native-kvm-qemu-stopped
+          python3 scripts/ci_kvm_smoke.py --seconds "${{ inputs.boot_seconds || '180' }}" --trace-interrupts || boot_status=$?
+          if [ ! -f native-kvm-qemu-stopped ]; then echo 'QEMU cleanup unconfirmed; skipping disk hash' >&2; exit 1; fi
+          sha256sum rust-micro/.tmp/disk.img > native-kvm-image-after-boot1.sha256
+          if [ "$boot_status" -ne 0 ]; then exit "$boot_status"; fi
+          if [ "${{ inputs.boot_runs || '1' }}" = '2' ]; then
+            for path in native-kvm-smoke.log native-kvm-smoke.ppm native-kvm-qemu-int-tail.log native-kvm-stall-state.json native-kvm-cpu-samples.jsonl; do
+              if [ -f "$path" ]; then
+                cp "$path" "${path%.*}-boot1.${path##*.}"
+              fi
+            done
+            # The probe has stopped and reaped QEMU; no image rebuild occurs between boots.
+            boot_status=0
+            rm -f native-kvm-qemu-stopped
+            python3 scripts/ci_kvm_smoke.py --seconds "${{ inputs.boot_seconds || '180' }}" --trace-interrupts || boot_status=$?
+            if [ ! -f native-kvm-qemu-stopped ]; then echo 'QEMU cleanup unconfirmed; skipping disk hash' >&2; exit 1; fi
+            sha256sum rust-micro/.tmp/disk.img > native-kvm-image-after-boot2.sha256
+            if [ "$boot_status" -ne 0 ]; then exit "$boot_status"; fi
+          fi
       - name: Upload native build and startup evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -118,10 +146,18 @@ jobs:
             native-kvm-build.log
             native-kvm-smoke.log
             native-kvm-smoke.ppm
+            native-kvm-smoke-boot1.log
+            native-kvm-smoke-boot1.ppm
             native-kvm-qemu-int-tail.log
+            native-kvm-qemu-int-tail-boot1.log
             native-kvm-stall-state.json
+            native-kvm-stall-state-boot1.json
             native-kvm-cpu-samples.jsonl
+            native-kvm-cpu-samples-boot1.jsonl
             native-kvm-image.sha256
+            native-kvm-image-after-boot1.sha256
+            native-kvm-image-after-boot2.sha256
+            native-kvm-qemu-stopped
             native-kvm-libernt-manifest.txt
             rust-micro/target/mykernel-x86/release/mykernel-rust
           if-no-files-found: warn

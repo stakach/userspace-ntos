@@ -8,6 +8,7 @@ from pathlib import Path
 import signal
 import socket
 import subprocess
+import threading
 import time
 
 
@@ -20,6 +21,7 @@ INTERRUPT_TRACE = MICRO / "native-kvm-qemu-int.log"
 INTERRUPT_TRACE_TAIL = ROOT / "native-kvm-qemu-int-tail.log"
 STALL_STATE = ROOT / "native-kvm-stall-state.json"
 CPU_SAMPLES = ROOT / "native-kvm-cpu-samples.jsonl"
+STOPPED_MARKER = ROOT / "native-kvm-qemu-stopped"
 
 
 def qmp_reply(stream, command_id):
@@ -97,15 +99,39 @@ def capture_stall_state():
     STALL_STATE.write_text(json.dumps(read_cpu_state(), indent=2) + "\n")
 
 
-def stop_process_group(process):
-    if process.poll() is not None:
-        return
-    os.killpg(process.pid, signal.SIGTERM)
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait(timeout=10)
+def stop_process_group(process, deadline=None):
+    if deadline is None:
+        deadline = time.monotonic() + 10
+    def live_members():
+        # The launcher shell can exit before QEMU. A second boot or disk hash must wait for
+        # every non-zombie member of this private process group, not only the shell PID.
+        output = subprocess.check_output(["ps", "-eo", "pgid=,stat="], text=True)
+        return any(
+            int(fields[0]) == process.pid and not fields[1].startswith("Z")
+            for line in output.splitlines()
+            if len(fields := line.split()) >= 2
+        )
+
+    if live_members():
+        if time.monotonic() < deadline:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            term_deadline = min(time.monotonic() + 10, deadline)
+            while live_members() and time.monotonic() < term_deadline:
+                time.sleep(0.1)
+        if live_members():
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + 10
+            while live_members() and time.monotonic() < deadline:
+                time.sleep(0.1)
+        if live_members():
+            raise RuntimeError("QEMU process group still owns the boot disk")
+    process.wait(timeout=10)
 
 
 def main():
@@ -121,6 +147,7 @@ def main():
     INTERRUPT_TRACE_TAIL.unlink(missing_ok=True)
     STALL_STATE.unlink(missing_ok=True)
     CPU_SAMPLES.unlink(missing_ok=True)
+    STOPPED_MARKER.unlink(missing_ok=True)
     command = [
         "./scripts/run_specs.sh",
         "-qmp",
@@ -138,13 +165,31 @@ def main():
             start_new_session=True,
         )
         started = time.monotonic()
+        deadline = started + args.seconds
         next_capture = started + 10
         next_cpu_sample = started + 60
         captured = False
+        stall_captured = False
+        def signal_guest(sig):
+            try:
+                os.killpg(process.pid, sig)
+            except ProcessLookupError:
+                pass
+        soft_stop = threading.Timer(max(1, args.seconds - 15), signal_guest,
+                                    args=(signal.SIGTERM,))
+        # A separate hard stop bounds guest execution even if QMP or the main loop stalls.
+        hard_stop = threading.Timer(args.seconds, signal_guest,
+                                    args=(signal.SIGKILL,))
+        soft_stop.start()
+        hard_stop.start()
         try:
-            while time.monotonic() - started < args.seconds:
+            while time.monotonic() < deadline:
                 if process.poll() is not None:
                     break
+                if (not stall_captured and time.monotonic() >= deadline - 45
+                        and QMP_SOCKET.exists()):
+                    capture_stall_state()
+                    stall_captured = True
                 if time.monotonic() >= next_capture and QMP_SOCKET.exists():
                     try:
                         capture_framebuffer()
@@ -159,13 +204,16 @@ def main():
                     with CPU_SAMPLES.open("a") as samples:
                         samples.write(json.dumps(sample) + "\n")
                     next_cpu_sample = time.monotonic() + 60
-                time.sleep(1)
+                time.sleep(min(1, max(0, deadline - time.monotonic())))
         finally:
             try:
-                if process.poll() is None and time.monotonic() - started >= args.seconds:
-                    capture_stall_state()
+                soft_stop.cancel()
+                hard_stop.cancel()
+                soft_stop.join()
+                hard_stop.join()
+                stop_process_group(process, deadline)
+                STOPPED_MARKER.write_text("QEMU process group stopped and reaped\n")
             finally:
-                stop_process_group(process)
                 QMP_SOCKET.unlink(missing_ok=True)
             if args.trace_interrupts and INTERRUPT_TRACE.is_file():
                 with INTERRUPT_TRACE.open("rb") as trace:
