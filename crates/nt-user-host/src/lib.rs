@@ -30,6 +30,9 @@ mod profile;
 pub mod process_identity;
 pub mod initial_creation_progress;
 pub mod process_observation;
+pub mod native_io_attribution;
+#[cfg(test)]
+mod native_io_attribution_tests;
 pub mod desktop_launch;
 pub mod provider_alias_bank;
 pub mod provider_finalization;

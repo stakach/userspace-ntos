@@ -7257,6 +7257,9 @@ pub(crate) fn census_tick_static(now: u64) {
     print_periodic_census_heartbeat(n, now);
     service_sec_image::trace_csrss_post_resume_census(n);
     print_native_ssn_time();
+    if n.is_power_of_two() {
+        exec_handler::native_io_attribution::print_summary();
+    }
     print_add_device_rollback_census(b"periodic", false);
     print_hosted_file_owner_census(b"periodic", false);
 }

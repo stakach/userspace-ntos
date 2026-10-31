@@ -100,6 +100,8 @@ pub(crate) mod private_residency;
 mod registry_value_name;
 #[path = "exec_installer_progress.rs"]
 mod installer_progress;
+#[path = "exec_native_io_attribution.rs"]
+pub(crate) mod native_io_attribution;
 
 #[path = "exec_virtual_memory_protect.rs"]
 mod virtual_memory_protect;
@@ -31476,7 +31478,24 @@ impl NativeSyscallHandler for ExecNtHandler {
         let service_name = ctx.service.name();
         let _alloc_scope = crate::allocator::enter_scope(service_name.as_bytes());
         unsafe { self.retry_pending_section_view_rollbacks() };
+        let io_call = nt_user_host::native_io_attribution::NativeIoCall::capture(ctx.service, args);
+        let io_pi = self.pi;
+        let io_owner = io_call.and_then(|_| self.hosted_process_generation(io_pi));
+        // Capture the already-published typed File route before dispatch. Looking up a numeric
+        // handle after the call could observe a close or reuse rather than this operation's File.
+        let io_route = io_call.and_then(|call| {
+            (call.kind != nt_user_host::native_io_attribution::NativeIoKind::RemoveCompletion
+                && nt_process::Handle::try_from(call.handle).is_ok())
+                .then(|| self.hosted_file_route_for(call.handle)).flatten()
+        });
+        let io_started = io_call.map(|_| crate::disk_census_ticks());
         let status = self.handle_service(ctx, args, out);
+        if let (Some(call), Some(started)) = (io_call, io_started) {
+            native_io_attribution::record(
+                self, call, io_pi, io_owner, io_route, status,
+                crate::disk_census_ticks().wrapping_sub(started),
+            );
+        }
         self.sync_debug_object_signals();
         status
     }
