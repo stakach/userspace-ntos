@@ -3432,13 +3432,17 @@ fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
     let dynamic_status = if legacy {
         nt_handler.checkpoint_dirty_dynamic_mutable_hives()
     } else {
-        nt_handler.verify_clean_dynamic_hives_at_quiesce()
+        nt_fs::STATUS_SUCCESS
     };
     if dynamic_status != nt_fs::STATUS_SUCCESS {
         return dynamic_status;
     }
     if !unsafe { crate::writable_fs::writable_fs_mounted() } {
-        return nt_fs::STATUS_SUCCESS;
+        return if legacy {
+            nt_fs::STATUS_SUCCESS
+        } else {
+            nt_handler.verify_clean_dynamic_hives_at_quiesce()
+        };
     }
     let dirty_cells = nt_handler.boot_mutable_hive_dirty_cells();
     let pending_journal_records = nt_handler.mutable_hive_journal_pending_records;
@@ -3457,7 +3461,7 @@ fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
     let status = if legacy {
         nt_handler.checkpoint_dirty_boot_mutable_hives_preserving_headroom()
     } else {
-        nt_handler.verify_durable_v2_boot_mutable_hives()
+        nt_handler.verify_durable_v2_mutable_hives()
     };
     if status != nt_fs::STATUS_SUCCESS {
         print_str(b"[cm-flush] quiesce boot hive checkpoint failed status=0x");
