@@ -5896,10 +5896,14 @@ pub(crate) unsafe fn service_win32k_atom_request(
     }
     let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     if handler_ptr.is_null() {
-        return (STATUS_DEVICE_NOT_READY, 0);
+        // Before the runtime handler exists, only the exact root-issued kernel activation may
+        // mutate the bootstrap owner. A hosted or absent caller needs live generation checks.
+        if channel.kernel_caller.is_none() || channel.logical_caller.is_some() {
+            return (STATUS_DEVICE_NOT_READY, 0);
+        }
     }
-    let handler = &mut *handler_ptr;
     if channel.kernel_caller.is_none() {
+        let handler = &mut *handler_ptr;
         let Some(caller) = channel.logical_caller else {
             return (STATUS_DEVICE_NOT_READY, 0);
         };
@@ -5924,12 +5928,20 @@ pub(crate) unsafe fn service_win32k_atom_request(
         }
     }
 
+    let mut add_atom = |integer, name| {
+        if handler_ptr.is_null() {
+            crate::atom_bootstrap::add_kernel_atom(integer, name)
+        } else {
+            (&mut *handler_ptr).add_kernel_global_atom(integer, name)
+        }
+    };
+
     let result = match operation {
         crate::win32k_subsystem::W32_ATOM_OP_ADD_INTEGER => {
             if value > u16::MAX as u64 {
                 return (STATUS_INVALID_PARAMETER, 0);
             }
-            handler.add_kernel_global_atom(Some(value as u16), &[])
+            add_atom(Some(value as u16), &[])
         }
         crate::win32k_subsystem::W32_ATOM_OP_ADD_NAME => {
             let Ok(byte_length) = usize::try_from(value) else {
@@ -5944,7 +5956,7 @@ pub(crate) unsafe fn service_win32k_atom_request(
                     as *const u16,
                 byte_length / 2,
             );
-            handler.add_kernel_global_atom(None, name)
+            add_atom(None, name)
         }
         _ => return (STATUS_INVALID_PARAMETER, 0),
     };
@@ -9359,6 +9371,7 @@ pub(crate) unsafe fn service_sec_image(
     let delay_queue = (&mut *core::ptr::addr_of_mut!(SERVICE_DELAY_QUEUE_WORK))
         .as_mut()
         .expect("delay wait queue must be initialized before providers");
+    nt_handler.global_atoms = Some(crate::atom_bootstrap::take());
     register_service_delay_drain_context(&mut nt_handler, delay_queue);
     // Bootstrap may already have armed the PIT. Reconcile the transferred deadlines
     // with the runtime owner before receiving; failed handoff must not strand work.

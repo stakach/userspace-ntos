@@ -62,3 +62,27 @@ fn hosted_atom_mutation_requires_the_current_logical_dispatch() {
     let table = atom.find("add_kernel_global_atom(").unwrap();
     assert!(current < table && identity < table);
 }
+
+#[test]
+fn early_kernel_atoms_use_the_same_table_as_runtime_calls() {
+    let service = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
+    let atom = service
+        .split("pub(crate) unsafe fn service_win32k_atom_request(")
+        .nth(1).unwrap()
+        .split("\nunsafe fn delay_timer_rearm_after_park(").next().unwrap();
+    let authenticate = atom.find("provider_service_ingress::authenticate(").unwrap();
+    let physical = atom.find("provider_service_ingress::physical_win32k_provider(").unwrap();
+    let bootstrap = atom.find("atom_bootstrap::add_kernel_atom(")
+        .expect("root-issued win32k calls must use the early canonical atom table");
+    assert!(authenticate < physical && physical < bootstrap);
+    assert!(atom.contains("channel.kernel_caller.is_none()"),
+        "hosted callers must not access the bootstrap table");
+    let transfer = service.find("atom_bootstrap::take()")
+        .expect("the original atom allocation must move into the live handler");
+    let publish = service.find("register_service_delay_drain_context(&mut nt_handler, delay_queue)")
+        .expect("handler publication");
+    assert!(transfer < publish);
+    let executive = include_str!("../../../components/ntos-executive/src/main.rs");
+    assert!(executive.contains("atom_bootstrap::initialize()"),
+        "atom owner must exist before provider activation");
+}

@@ -4108,10 +4108,7 @@ impl ExecNtHandler {
             nt_kernel_exec::SemaphoreStore::with_capacity(192)
         );
         write_field!(mutants, nt_kernel_exec::MutantStore::with_capacity(192));
-        write_field!(
-            global_atoms,
-            nt_kernel_exec::rtl_atom::OwnedAtomTable::with_capacity(GLOBAL_ATOM_CAPACITY).unwrap()
-        );
+        write_field!(global_atoms, None);
         write_field!(io_completion_ports, ExecIoCompletionPorts::reset());
         write_field!(file_completion, ExecFileCompletion::reset());
         write_field!(directory_opens, ExecDirectoryOpens::reset());
@@ -25404,8 +25401,8 @@ impl ExecNtHandler {
         name: &[u16],
     ) -> Result<u16, u32> {
         match integer {
-            Some(atom) => self.global_atoms.add_integer(atom),
-            None => self.global_atoms.add_name(name),
+            Some(atom) => self.global_atoms.as_mut().expect("atom owner published").add_integer(atom),
+            None => self.global_atoms.as_mut().expect("atom owner published").add_name(name),
         }
     }
 
@@ -32925,16 +32922,16 @@ impl ExecNtHandler {
                 } else {
                     match (ctx.service, integer) {
                         (NativeService::NtAddAtom, Some(atom)) => {
-                            self.global_atoms.add_integer(atom)
+                            self.global_atoms.as_mut().expect("atom owner published").add_integer(atom)
                         }
                         (NativeService::NtFindAtom, Some(atom)) => {
-                            self.global_atoms.find_integer(atom)
+                            self.global_atoms.as_ref().expect("atom owner published").find_integer(atom)
                         }
                         (NativeService::NtAddAtom, None) => {
-                            self.global_atoms.add_name(&name[..byte_len as usize / 2])
+                            self.global_atoms.as_mut().expect("atom owner published").add_name(&name[..byte_len as usize / 2])
                         }
                         (NativeService::NtFindAtom, None) => {
-                            self.global_atoms.find_name(&name[..byte_len as usize / 2])
+                            self.global_atoms.as_ref().expect("atom owner published").find_name(&name[..byte_len as usize / 2])
                         }
                         _ => unreachable!(),
                     }
@@ -32958,7 +32955,7 @@ impl ExecNtHandler {
             },
             NativeService::NtDeleteAtom => match self.private_global_atom_job() {
                 Ok(Some(job)) => self.job_atom_delete(job, args[0] as u16),
-                Ok(None) => self.global_atoms.delete(args[0] as u16),
+                Ok(None) => self.global_atoms.as_mut().expect("atom owner published").delete(args[0] as u16),
                 Err(status) => status,
             },
             NativeService::NtQueryInformationAtom => unsafe {
@@ -33002,7 +32999,7 @@ impl ExecNtHandler {
                             let query = if let Some(job) = private_job {
                                 self.job_atom_query(job, atom, &mut name, name_capacity)
                             } else {
-                                self.global_atoms.query(atom, &mut name, name_capacity)
+                                self.global_atoms.as_ref().expect("atom owner published").query(atom, &mut name, name_capacity)
                             };
                             if query.status == nt_kernel_exec::rtl_atom::status::SUCCESS {
                                 let copied = query.name_length as usize;
@@ -33041,7 +33038,7 @@ impl ExecNtHandler {
                             let list = if let Some(job) = private_job {
                                 self.job_atom_list(job, &mut atoms[..slots])
                             } else {
-                                self.global_atoms.list(&mut atoms[..slots])
+                                self.global_atoms.as_ref().expect("atom owner published").list(&mut atoms[..slots])
                             };
                             let copied = list.count.min(slots);
                             let write_len = TABLE_HEADER + copied * 2;

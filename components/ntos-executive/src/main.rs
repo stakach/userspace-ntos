@@ -149,6 +149,7 @@ mod process_vm_retirement;
 mod image_range_retirement;
 use image_range_retirement::vm_unmap_shared_image_mapping_range;
 mod ps_bootstrap;
+mod atom_bootstrap;
 mod dispatcher_bootstrap;
 mod timer_deadline;
 mod provider_local_event;
@@ -896,8 +897,9 @@ pub const SSN_NT_ADD_ATOM: u64 = 8;
 pub const SSN_NT_DELETE_ATOM: u64 = 62;
 pub const SSN_NT_FIND_ATOM: u64 = 80;
 pub const SSN_NT_QUERY_INFORMATION_ATOM: u64 = 157;
-/// Fixed, allocation-free storage for the executive-lifetime global atom table.
-pub const GLOBAL_ATOM_CAPACITY: usize = 32;
+/// Fixed-capacity storage for the executive-lifetime global atom table. Win32k's first
+/// DriverEntry registers at least 47 distinct USER property names.
+pub const GLOBAL_ATOM_CAPACITY: usize = 256;
 /// ntdll's NtQuerySystemInformation SSN (RtlCreateHeap needs SystemBasicInformation).
 pub const SSN_NT_QUERY_SYSTEM_INFO: u64 = 0xb5;
 /// ntdll's NtQueryVirtualMemory SSN (LdrpInitialize queries the region at [TEB+0x10] early).
@@ -23272,8 +23274,8 @@ struct ExecNtHandler {
     /// Mutant state keyed by the same stable namespace indices.
     mutants: nt_kernel_exec::MutantStore,
     /// The session-global atom namespace backing NtAdd/Find/Delete/QueryInformationAtom. Its fixed
-    /// arena is allocated once in `new()` and shared across every hosted process (`pi`).
-    global_atoms: nt_kernel_exec::rtl_atom::OwnedAtomTable,
+    /// arena is allocated before provider startup, then moved here before handler publication.
+    global_atoms: Option<nt_kernel_exec::rtl_atom::OwnedAtomTable>,
     /// Fixed executive completion-port objects and packet queues. The backing table lives in BSS so
     /// `ExecNtHandler::initialize_in` does not materialize it on the early root task stack.
     io_completion_ports: ExecIoCompletionPorts,
@@ -28413,6 +28415,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     map_own_heap();
     ps_bootstrap::initialize(_start as *const () as u64, bootinfo as u64)
         .expect("initialize canonical Ps and token ownership before provider activation");
+    atom_bootstrap::initialize()
+        .expect("initialize canonical atom ownership before provider activation");
     dispatcher_bootstrap::initialize()
         .expect("initialize canonical dispatcher ownership before provider activation");
     register_boot_persistent_clock(bi);
