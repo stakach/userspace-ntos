@@ -3428,35 +3428,48 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
 }
 
 fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
-    let dynamic_status = nt_handler.checkpoint_dirty_dynamic_mutable_hives();
+    let legacy = crate::writable_fs::legacy_snapshot_writes_allowed();
+    let dynamic_status = if legacy {
+        nt_handler.checkpoint_dirty_dynamic_mutable_hives()
+    } else {
+        nt_handler.verify_clean_dynamic_hives_at_quiesce()
+    };
     if dynamic_status != nt_fs::STATUS_SUCCESS {
         return dynamic_status;
     }
     if !unsafe { crate::writable_fs::writable_fs_mounted() } {
         return nt_fs::STATUS_SUCCESS;
     }
-    if !crate::writable_fs::legacy_snapshot_writes_allowed() {
-        let fold = unsafe { crate::writable_fs::fold_system_wal_if_dirty() };
-        if let Err(status) = fold {
-            return status;
-        }
-    }
     let dirty_cells = nt_handler.boot_mutable_hive_dirty_cells();
     let pending_journal_records = nt_handler.mutable_hive_journal_pending_records;
-    if dirty_cells == 0 && pending_journal_records == 0
+    if legacy && dirty_cells == 0 && pending_journal_records == 0
         && !nt_handler.writable_fs_commit_required
     {
         return nt_fs::STATUS_SUCCESS;
     }
-    print_str(b"[cm-flush] quiesce boot hive checkpoint dirty-cells=");
+    if legacy {
+        print_str(b"[cm-flush] quiesce boot hive checkpoint dirty-cells=");
+    } else {
+        print_str(b"[cm-flush] quiesce v2 boot hive WAL proof dirty-cells=");
+    }
     print_u64(dirty_cells as u64);
     print_str(b"\n");
-    let status = nt_handler.checkpoint_dirty_boot_mutable_hives_preserving_headroom();
+    let status = if legacy {
+        nt_handler.checkpoint_dirty_boot_mutable_hives_preserving_headroom()
+    } else {
+        nt_handler.verify_durable_v2_boot_mutable_hives()
+    };
     if status != nt_fs::STATUS_SUCCESS {
         print_str(b"[cm-flush] quiesce boot hive checkpoint failed status=0x");
         print_hex(status);
         print_str(b"\n");
         return status;
+    }
+    if !legacy {
+        // The exact paired WAL and a clean snapshot were proven under the physical reserve.
+        // Folding a WAL or launching a native checkpoint here would require replies from the
+        // receive loop that has already terminated.
+        return nt_fs::STATUS_SUCCESS;
     }
     if pending_journal_records != 0 {
         print_str(b"[cm-flush] quiesce mutable hive journal snapshot records=");

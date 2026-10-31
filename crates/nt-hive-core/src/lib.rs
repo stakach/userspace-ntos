@@ -63,7 +63,8 @@ pub use codec::{
     decode_image, encode_image, encode_log_record, try_encode_log_record, encoded_image_len, image_len_if_valid,
     image_root_subkey_count_if_valid, image_value_len_if_valid, replay_log, try_encode_image,
     try_encode_subtree_image, try_replay_log, try_replay_log_complete,
-    complete_log_sequence_span, complete_log_sequence_span_from, validate_first_hive_wal_append,
+    complete_hive_log_end_sequence, complete_log_sequence_span, complete_log_sequence_span_from,
+    validate_first_hive_wal_append,
     HiveDecodeError, HiveEncodeError, HiveLogOp,
     HiveLogReplayError, HiveSubtreeEncodeError, HIVE_IMAGE_MAGIC,
 };

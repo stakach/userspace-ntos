@@ -6654,6 +6654,46 @@ impl ExecNtHandler {
         nt_fs::STATUS_SUCCESS
     }
 
+    /// A v2 primary image may lag edits already acknowledged in the paired sector WAL. Prove
+    /// each dirty boot hive's exact sidecar and live sequence before using the volume WAL fence;
+    /// full-image compaction remains a separate operation and is forbidden on the Native route.
+    pub(crate) fn verify_durable_v2_boot_mutable_hives(&self) -> u32 {
+        if crate::writable_fs::legacy_snapshot_writes_allowed() {
+            return nt_fs::STATUS_INVALID_DEVICE_REQUEST;
+        }
+        let proof = unsafe { crate::writable_fs::with_clean_v2_volume_at_quiesce(|| {
+            for hive_sel in [
+                HIVE_SEL_SOFTWARE,
+                HIVE_SEL_SECURITY,
+                HIVE_SEL_SAM,
+                HIVE_SEL_USER_DEFAULT,
+            ] {
+                let Some(hive) = self.mutable_hives.hive(hive_sel) else {
+                    continue;
+                };
+                if hive.retained_value_journal().is_some() {
+                    return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+                }
+                if hive.dirty_count() == 0 {
+                    continue;
+                }
+                let Some(image_path) = Self::boot_mutable_hive_checkpoint_path(hive_sel) else {
+                    return Err(nt_fs::STATUS_DATA_ERROR);
+                };
+                let mut log_path = alloc::string::String::from(image_path);
+                if log_path.try_reserve(4).is_err() {
+                    return Err(nt_fs::STATUS_INSUFFICIENT_RESOURCES);
+                }
+                log_path.push_str(".LOG");
+                crate::writable_fs::hive_wal::verify_published_hive_log_tail(
+                    &log_path, hive.sequence,
+                )?;
+            }
+            Ok(())
+        }) };
+        proof.err().unwrap_or(nt_fs::STATUS_SUCCESS)
+    }
+
     pub(crate) fn boot_mutable_hive_dirty_cells(&self) -> usize {
         let mut total_dirty = 0usize;
         for hive_sel in [
@@ -6682,6 +6722,21 @@ impl ExecNtHandler {
             let status = self.checkpoint_dynamic_mutable_hive(hive_sel, dirty);
             if status != nt_fs::STATUS_SUCCESS {
                 return status;
+            }
+        }
+        nt_fs::STATUS_SUCCESS
+    }
+
+    /// Native completions cannot arrive after the service receive loop ends. Dynamic hives
+    /// currently use full-image checkpointing, so terminal quiesce may only accept ones that
+    /// were already clean. A dirty or retained mount must remain owned for an earlier flush.
+    pub(crate) fn verify_clean_dynamic_hives_at_quiesce(&self) -> u32 {
+        for hive_sel in HIVE_SEL_DYNAMIC {
+            let Some(hive) = self.mutable_hives.hive(hive_sel) else {
+                continue;
+            };
+            if hive.retained_value_journal().is_some() || hive.dirty_count() != 0 {
+                return nt_fs::STATUS_DEVICE_NOT_READY;
             }
         }
         nt_fs::STATUS_SUCCESS

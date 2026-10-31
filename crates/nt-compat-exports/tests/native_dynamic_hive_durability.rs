@@ -62,3 +62,25 @@ fn shutdown_flushes_all_dynamic_hives_before_quiesce_teardown() {
     let teardown = service[call..].find("dump_all_hosted_thread_quiesce(").unwrap() + call;
     assert!(call < teardown, "shutdown flush precedes quiesce teardown");
 }
+
+#[test]
+fn native_quiesce_refuses_dirty_dynamic_hives_before_starting_async_io() {
+    let handler = source("exec_handler.rs");
+    let verify = handler.find("fn verify_clean_dynamic_hives_at_quiesce(")
+        .expect("terminal dynamic hive refusal");
+    let body = &handler[verify..];
+    assert!(body.contains("HIVE_SEL_DYNAMIC") && body.contains("dirty_count()")
+        && body.contains("retained_value_journal()")
+        && body.contains("STATUS_DEVICE_NOT_READY"));
+
+    let service = source("service_sec_image.rs");
+    let start = service.find("fn checkpoint_boot_hives_at_quiesce(").unwrap();
+    let end = service[start..].find("#[path = \"service_section_pagein.rs\"]").unwrap() + start;
+    let body = &service[start..end];
+    let legacy = body.find("if legacy {").expect("legacy-only flush branch");
+    let checkpoint = body.find("checkpoint_dirty_dynamic_mutable_hives()")
+        .expect("legacy dynamic checkpoint");
+    let native_refusal = body.find("verify_clean_dynamic_hives_at_quiesce()")
+        .expect("native no-I/O refusal");
+    assert!(legacy < checkpoint && checkpoint < native_refusal);
+}

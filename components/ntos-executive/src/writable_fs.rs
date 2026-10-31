@@ -796,6 +796,42 @@ pub(crate) unsafe fn verify_durable_system_wal() -> Result<(), u32> {
     })
 }
 
+/// Terminal quiesce may inspect durability but cannot start native snapshot I/O: its service
+/// receive loop has ended and would never deliver the provider completions. Hold the reserve
+/// while checking both the clean volume bit and the exact paired WAL publication.
+pub(crate) unsafe fn with_clean_v2_volume_at_quiesce<F>(verify_hives: F) -> Result<(), u32>
+where
+    F: FnOnce() -> Result<(), u32>,
+{
+    let native = crate::fs_loader::exec_fs_mount_identity()
+        .and_then(crate::fs_loader::exec_block_route_kind)
+        == Some(nt_fs::BlockSourceKind::Native);
+    if native {
+        if (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_none() {
+            return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+        }
+    } else {
+        ensure_mounted()?;
+    }
+    if legacy_snapshot_writes_allowed() || WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
+        return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let mut lease = snapshot_storage::acquire()?;
+    if WRITABLE_FS_SNAPSHOT_DIRTY.load(Ordering::Acquire) {
+        return Err(snapshot_storage::BUSY);
+    }
+    verify_hives()?;
+    let result = if native {
+        snapshot_storage::check_cached_wal_fence(&lease)
+    } else {
+        snapshot_storage::peek_wal_continuation(&mut lease).map(|_| ())
+    };
+    result.map_err(|status| {
+        WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+        status
+    })
+}
+
 /// A failed pre-write capture has no disk effect; put the exact paired proof and WAL token back
 /// under the same mount lease before another writer can acquire it.
 fn restore_unwritten_checkpoint_authority(

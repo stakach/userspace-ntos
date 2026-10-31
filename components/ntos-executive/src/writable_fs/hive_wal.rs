@@ -174,6 +174,34 @@ fn primary_sequence(fs: &nt_fs::FileSystem, log_path: &str) -> Result<u64, u32> 
     Err(nt_fs::STATUS_DATA_ERROR)
 }
 
+/// Match an acknowledged hive edit to the exact live sidecar before shutdown claims that the
+/// paired volume WAL covers it. The baseline advances only after the WAL marker and both anchor
+/// acknowledgements; the semantic scan rejects torn or skipped records even if the file length
+/// and live sequence happen to match.
+pub(crate) unsafe fn verify_published_hive_log_tail(
+    log_path: &str,
+    live_sequence: u64,
+) -> Result<(), u32> {
+    let fs = writable_fs()?;
+    let baseline = baselines().iter().find(|entry| entry.path == log_path)
+        .ok_or(nt_fs::STATUS_DATA_ERROR)?;
+    if baseline.last_sequence != live_sequence
+        || fs.existing_file_id(log_path) != Some(baseline.file_id)
+        || fs.file_len(log_path) != Some(baseline.expected_len)
+    {
+        return Err(nt_fs::STATUS_DATA_ERROR);
+    }
+    let primary = primary_sequence(fs, log_path)?;
+    let sidecar = fs.try_file_bytes_owned(log_path)?
+        .ok_or(nt_fs::STATUS_DATA_ERROR)?;
+    let end = nt_hive_core::complete_hive_log_end_sequence(primary, &sidecar)
+        .map_err(semantic_error)?;
+    if end != live_sequence {
+        return Err(nt_fs::STATUS_DATA_ERROR);
+    }
+    Ok(())
+}
+
 pub(super) fn validate_first_record(
     fs: &nt_fs::FileSystem,
     path: &str,
