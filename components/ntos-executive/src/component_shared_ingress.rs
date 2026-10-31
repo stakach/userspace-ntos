@@ -12,6 +12,16 @@ use nt_component_suspension::{
     ReservedReceiveError, ReservedReceivePhase,
 };
 use nt_component_suspension::{IngressReplyPool, ReplyPoolError};
+use nt_hosted_runtime::{SharedReceiveCensus, SharedReceiveOwner};
+
+// The executive alone owns this ingress and runs its root loop and nested pumps serially. No
+// borrow of the census crosses a receive syscall or a callback boundary.
+static mut SHARED_RECEIVE_CENSUS: SharedReceiveCensus = SharedReceiveCensus::new();
+
+pub(crate) fn receive_census_snapshot() -> SharedReceiveCensus {
+    // A value copy at a serialized executive event boundary; no reference escapes.
+    unsafe { *core::ptr::addr_of!(SHARED_RECEIVE_CENSUS) }
+}
 
 pub(crate) enum ReceiveError {
     StartupFault(nt_component_suspension::StartupFaultError<sel4_rt::reply_binding::Error>),
@@ -97,6 +107,7 @@ pub(crate) unsafe fn receive<C, R, T>(
     } else {
         crate::SYS_NB_RECV
     };
+    let recv_started = crate::disk_census_ticks();
     core::arch::asm!(
         "syscall",
         in("rdx") syscall as u64,
@@ -110,6 +121,15 @@ pub(crate) unsafe fn receive<C, R, T>(
         in("r13") 0u64,
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
+    );
+    let recv_finished = crate::disk_census_ticks();
+    let census_owner = match execution {
+        IngressExecutionOwner::Idle => SharedReceiveOwner::Idle,
+        IngressExecutionOwner::Dispatch(_) => SharedReceiveOwner::Dispatch,
+        IngressExecutionOwner::Startup(_) => SharedReceiveOwner::Startup,
+    };
+    (*core::ptr::addr_of_mut!(SHARED_RECEIVE_CENSUS)).observe(
+        census_owner, blocking, recv_started, recv_finished,
     );
     // Own the entire IPC bank before binding queries or notification processing reuse it.
     let message = crate::ipc_message::capture_received(badge, info, [m0, m1, m2, m3]);

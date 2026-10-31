@@ -148,6 +148,10 @@ pub enum HostedIrqServiceKind {
     ClassServiceRequest = 8,
     TimerCancel = 9,
     TimerSet = 10,
+    RemoveDpc = 11,
+    DmaFreeMapping = 12,
+    SetEvent = 13,
+    BeginLocalIrpCompletion = 14,
 }
 
 impl HostedIrqServiceKind {
@@ -163,6 +167,10 @@ impl HostedIrqServiceKind {
             8 => Some(Self::ClassServiceRequest),
             9 => Some(Self::TimerCancel),
             10 => Some(Self::TimerSet),
+            11 => Some(Self::RemoveDpc),
+            12 => Some(Self::DmaFreeMapping),
+            13 => Some(Self::SetEvent),
+            14 => Some(Self::BeginLocalIrpCompletion),
             _ => None,
         }
     }
@@ -494,11 +502,29 @@ impl HostedIrqServiceCommand {
                 HostedIrqServiceKind::QueueDpc => {
                     self.authority_cookie == 0 && self.argument_count == 4 && self.arguments[0] != 0
                 }
+                HostedIrqServiceKind::RemoveDpc => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 0
+                        && self.arguments.iter().all(|argument| *argument == 0)
+                }
                 HostedIrqServiceKind::Mdl => {
                     self.authority_cookie == 0
                         && self.argument_count == 4
                         && self.arguments[0] != 0
                         && self.arguments[1] != 0
+                }
+                HostedIrqServiceKind::DmaFreeMapping => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 4
+                        && self.arguments[..4].iter().all(|argument| *argument != 0)
+                        && self.arguments[4..].iter().all(|argument| *argument == 0)
+                }
+                HostedIrqServiceKind::SetEvent
+                | HostedIrqServiceKind::BeginLocalIrpCompletion => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 1
+                        && self.arguments[0] != 0
+                        && self.arguments[1..].iter().all(|argument| *argument == 0)
                 }
                 HostedIrqServiceKind::PoolRetirement => {
                     self.authority_cookie == 0
@@ -652,6 +678,19 @@ pub struct HostedIrqArenaControl {
     bugcheck_address: AtomicU64,
     bugcheck_parameters: [AtomicU64; 4],
     padding: [u8; 3792],
+}
+
+/// Read-only lane state sampled during contention; it never grants execution authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostedIrqContentionSnapshot {
+    pub active: Option<HostedIrqTransaction>,
+    pub active_raw: u64,
+    pub class_raw: u32,
+    pub current_irql: u32,
+    pub dispatch_mask: u32,
+    pub service_mask: u32,
+    pub dispatch_running_mask: u32,
+    pub service_running_mask: u32,
 }
 
 impl HostedIrqArenaControl {
@@ -918,9 +957,54 @@ impl HostedIrqArenaControl {
         Ok(active)
     }
 
+    /// Decode only a stable token/class pair; retain raw fields when a transition races sampling.
+    pub fn root_contention_snapshot(
+        &self,
+        identity: HostedIrqLaneIdentity,
+    ) -> Result<HostedIrqContentionSnapshot, HostedIrqArenaError> {
+        self.check_identity(identity)?;
+        let first = self.active_transaction.load(Ordering::Acquire);
+        let class_raw = self.active_transaction_class.load(Ordering::Acquire);
+        let last = self.active_transaction.load(Ordering::Acquire);
+        let active = (first == last && last != 0 && last != TRANSACTION_PUBLISHING)
+            .then(|| HostedIrqTransactionClass::from_raw(class_raw).map(|class| HostedIrqTransaction {
+                lane_generation: identity.lane_generation,
+                transaction: last,
+                class,
+            }))
+            .flatten();
+        Ok(HostedIrqContentionSnapshot {
+            active,
+            active_raw: last,
+            class_raw,
+            current_irql: self.current_irql.load(Ordering::Acquire),
+            dispatch_mask: self.dispatch_mask.load(Ordering::Acquire),
+            service_mask: self.service_mask.load(Ordering::Acquire),
+            dispatch_running_mask: self.dispatch_running_mask.load(Ordering::Acquire),
+            service_running_mask: self.service_running_mask.load(Ordering::Acquire),
+        })
+    }
+
     pub fn current_irql(&self, identity: HostedIrqLaneIdentity) -> Result<u8, HostedIrqArenaError> {
         self.check_identity(identity)?;
         Ok(self.current_irql.load(Ordering::Acquire) as u8)
+    }
+
+    /// Apply a stopped IRQ worker's decoded CR8 write to its active transaction. The
+    /// expected value comes from the same arena immediately before context projection.
+    pub fn worker_write_cr8(
+        &self,
+        identity: HostedIrqLaneIdentity,
+        transaction: HostedIrqTransaction,
+        expected: u8,
+        target: u8,
+    ) -> Result<(), HostedIrqArenaError> {
+        self.check_transaction(identity, transaction)?;
+        if target >= expected {
+            self.worker_raise_irql(identity, transaction, expected, target)
+        } else {
+            self.worker_lower_irql(identity, transaction, expected, target)
+        }
     }
 
     pub fn worker_raise_irql(
@@ -2468,7 +2552,8 @@ mod tests {
         assert_eq!(HostedIrqServiceKind::from_raw(8), Some(HostedIrqServiceKind::ClassServiceRequest));
         assert_eq!(HostedIrqServiceKind::from_raw(9), Some(HostedIrqServiceKind::TimerCancel));
         assert_eq!(HostedIrqServiceKind::from_raw(10), Some(HostedIrqServiceKind::TimerSet));
-        assert_eq!(HostedIrqServiceKind::from_raw(11), None);
+        assert_eq!(HostedIrqServiceKind::from_raw(11), Some(HostedIrqServiceKind::RemoveDpc));
+        assert_eq!(HostedIrqServiceKind::from_raw(15), None);
         assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
         assert!(HostedIrqServiceKind::ClassServiceRequest.may_request_nested_dispatch());
         assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
@@ -2500,6 +2585,15 @@ mod tests {
         queue_dpc.argument_count = 3;
         assert!(!queue_dpc.valid());
 
+        let mut remove_dpc = service();
+        remove_dpc.kind = HostedIrqServiceKind::RemoveDpc;
+        remove_dpc.authority_cookie = 0;
+        remove_dpc.argument_count = 0;
+        remove_dpc.arguments = [0; HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        assert!(remove_dpc.valid());
+        remove_dpc.arguments[0] = 1;
+        assert!(!remove_dpc.valid());
+
         let mut mdl = service();
         mdl.kind = HostedIrqServiceKind::Mdl;
         mdl.authority_cookie = 0;
@@ -2528,6 +2622,63 @@ mod tests {
         assert!(class.valid());
         class.arguments[4] = 1;
         assert!(!class.valid());
+    }
+
+    #[test]
+    fn irq_dma_mapping_release_carries_only_exact_lease_identity() {
+        assert_eq!(HostedIrqServiceKind::from_raw(12),
+            Some(HostedIrqServiceKind::DmaFreeMapping));
+        let mut free = service();
+        free.kind = HostedIrqServiceKind::DmaFreeMapping;
+        free.authority_cookie = 0;
+        free.argument_count = 4;
+        free.arguments = [17, 19, 0x108000, 2056, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(free.valid());
+        for index in 0..4 {
+            let saved = free.arguments[index];
+            free.arguments[index] = 0;
+            assert!(!free.valid());
+            free.arguments[index] = saved;
+        }
+        free.arguments[4] = 1;
+        assert!(!free.valid());
+        free.arguments[4] = 0;
+        free.authority_cookie = 1;
+        assert!(!free.valid());
+    }
+
+    #[test]
+    fn irq_event_signal_carries_only_one_owned_event() {
+        assert_eq!(HostedIrqServiceKind::from_raw(13),
+            Some(HostedIrqServiceKind::SetEvent));
+        let mut signal = service();
+        signal.kind = HostedIrqServiceKind::SetEvent;
+        signal.authority_cookie = 0;
+        signal.argument_count = 1;
+        signal.arguments = [0x18000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(signal.valid());
+        signal.arguments[0] = 0;
+        assert!(!signal.valid());
+        signal.arguments[0] = 0x18000;
+        signal.arguments[1] = 1;
+        assert!(!signal.valid());
+    }
+
+    #[test]
+    fn irq_local_irp_completion_begin_carries_one_source_pointer() {
+        assert_eq!(HostedIrqServiceKind::from_raw(14),
+            Some(HostedIrqServiceKind::BeginLocalIrpCompletion));
+        let mut begin = service();
+        begin.kind = HostedIrqServiceKind::BeginLocalIrpCompletion;
+        begin.authority_cookie = 0;
+        begin.argument_count = 1;
+        begin.arguments = [0x24000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(begin.valid());
+        begin.arguments[0] = 0;
+        assert!(!begin.valid());
+        begin.arguments[0] = 0x24000;
+        begin.arguments[1] = 1;
+        assert!(!begin.valid());
     }
 
     #[test]
@@ -3069,6 +3220,31 @@ mod tests {
     }
 
     #[test]
+    fn cr8_fault_write_requires_exact_active_irq_transaction_and_expected_irql() {
+        let control = active_control();
+        let transaction = control
+            .root_begin_transaction(identity(), HostedIrqTransactionClass::Interrupt)
+            .unwrap();
+        control.worker_raise_irql(identity(), transaction, 0, 2).unwrap();
+        assert_eq!(control.worker_write_cr8(identity(), transaction, 2, 2), Ok(()));
+        assert_eq!(control.worker_write_cr8(identity(), transaction, 0, 3),
+            Err(HostedIrqArenaError::InvalidIrql));
+        assert_eq!(control.worker_write_cr8(identity(), transaction, 2, 5), Ok(()));
+        assert_eq!(control.current_irql(identity()), Ok(5));
+        let stale = HostedIrqTransaction { transaction: transaction.transaction + 1, ..transaction };
+        assert_eq!(control.worker_write_cr8(identity(), stale, 5, 2),
+            Err(HostedIrqArenaError::StaleTransaction));
+        assert_eq!(control.worker_write_cr8(identity(), transaction, 5, 2), Ok(()));
+        assert_eq!(control.worker_write_cr8(identity(), transaction, 2, 16),
+            Err(HostedIrqArenaError::InvalidIrql));
+        assert_eq!(control.current_irql(identity()), Ok(2));
+        control.worker_lower_irql(identity(), transaction, 2, 0).unwrap();
+        control.root_finish_transaction(identity(), transaction).unwrap();
+        assert_eq!(control.worker_write_cr8(identity(), transaction, 0, 2),
+            Err(HostedIrqArenaError::StaleTransaction));
+    }
+
+    #[test]
     fn first_fault_is_sticky_and_poison_fences_new_work() {
         let control = active_control();
         let transaction = control
@@ -3138,6 +3314,26 @@ mod tests {
             control.root_begin_transaction(identity(), HostedIrqTransactionClass::Interrupt),
             Err(HostedIrqArenaError::Shutdown)
         );
+    }
+
+    #[test]
+    fn contention_snapshot_identifies_the_exact_active_transaction() {
+        let control = active_control();
+        assert_eq!(control.root_contention_snapshot(identity()).unwrap().active, None);
+        let callback = control
+            .root_begin_transaction(identity(), HostedIrqTransactionClass::Callback)
+            .unwrap();
+        assert_eq!(
+            control.root_begin_transaction(identity(), HostedIrqTransactionClass::Interrupt),
+            Err(HostedIrqArenaError::Busy)
+        );
+        let busy = control.root_contention_snapshot(identity()).unwrap();
+        assert_eq!(busy.active, Some(callback));
+        assert_eq!(busy.current_irql, 0);
+        assert_eq!(busy.dispatch_mask, 0);
+        assert_eq!(busy.service_mask, 0);
+        control.root_finish_transaction(identity(), callback).unwrap();
+        assert_eq!(control.root_contention_snapshot(identity()).unwrap().active, None);
     }
 
     #[test]

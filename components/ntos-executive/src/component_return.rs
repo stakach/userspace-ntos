@@ -71,19 +71,48 @@ unsafe fn invoke(effect: RetirementEffect, cap: u64) -> RetirementOutcome {
 pub(super) unsafe fn prepare_abandoned_replies(
     scope: nt_component_suspension::SuspensionScope,
 ) -> bool {
+    prepare_abandoned_matching(|owner, _| scope.matches(owner))
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum InitialSourceScope {
+    Thread(crate::exec_handler::initial_thread_creation::Binding),
+    Process { pi: usize, process: nt_user_host::process_identity::ProcessIdentity },
+}
+
+pub(super) unsafe fn prepare_abandoned_initial_source_replies(scope: InitialSourceScope) -> bool {
+    prepare_abandoned_matching(|_, continuation| {
+        let ComponentNativeContinuation::Hosted(hosted) = continuation else { return false; };
+        let HostedContinuationDestination::InitialThread(origin) = hosted.destination else {
+            return false;
+        };
+        let source = origin.source();
+        match scope {
+            InitialSourceScope::Thread(binding) => source == binding,
+            InitialSourceScope::Process { pi, process } =>
+                source.pi == pi && source.process == process,
+        }
+    })
+}
+
+unsafe fn prepare_abandoned_matching(
+    matches: impl Fn(nt_component_suspension::SuspensionOwner, ComponentNativeContinuation) -> bool + Copy,
+) -> bool {
     // Kernel activations own a different return recipient. Keep them visible to scope quiescence,
     // but never apply hosted Reply retirement or cancellation to their retained wait capture.
     if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
         .frames()
         .any(|(_, frame)| {
-            scope.matches(frame.owner)
+            matches(frame.owner, frame.continuation)
                 && matches!(frame.continuation, ComponentNativeContinuation::Kernel(_))
         })
     {
         return false;
     }
     // A terminal stage owns its reply through delivery ACK. It cannot be torn down here.
-    if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).has_terminal_in_scope(scope) {
+    if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+        .next_terminal_if(|_, terminal| matches(terminal.frame.owner, terminal.frame.continuation))
+        .is_some() {
         return false;
     }
     // Entered provider execution still uses its captured return target. Defer teardown until it
@@ -91,7 +120,7 @@ pub(super) unsafe fn prepare_abandoned_replies(
     if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
         .frames()
         .any(|(_, frame)| {
-            scope.matches(frame.owner)
+            matches(frame.owner, frame.continuation)
                 && matches!(
                     frame.phase,
                     nt_component_suspension::SuspensionPhase::Resuming { .. }
@@ -105,7 +134,7 @@ pub(super) unsafe fn prepare_abandoned_replies(
         let target = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
             .frames()
             .find(|(_, frame)| {
-                scope.matches(frame.owner)
+                matches(frame.owner, frame.continuation)
                     && frame
                         .continuation
                         .hosted()
@@ -129,7 +158,7 @@ pub(super) unsafe fn prepare_abandoned_replies(
         let target = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
             .frames()
             .find(|(_, frame)| {
-                scope.matches(frame.owner)
+                matches(frame.owner, frame.continuation)
                     && frame
                         .continuation
                         .hosted()

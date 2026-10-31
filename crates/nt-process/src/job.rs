@@ -299,6 +299,8 @@ pub struct JobCloseAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JobDestruction {
     pub id: JobId,
+    /// Published PEJOB body returned to the native owner for rundown.
+    pub kernel_job_object: Option<u64>,
     pub security_limits: u32,
     pub released_completion_port: Option<CompletionPortAssociation>,
 }
@@ -324,6 +326,7 @@ struct JobMember {
 #[derive(Debug)]
 struct Job {
     id: JobId,
+    kernel_job_object: Option<u64>,
     session_id: u32,
     handle_count: u32,
     wait_references: u32,
@@ -401,6 +404,54 @@ impl JobStore {
         self.get(id).is_some()
     }
 
+    /// Publish an exact live job's stable PEJOB body. Repeating the same publication is
+    /// idempotent; a body cannot be assigned to two live jobs.
+    pub fn publish_kernel_job_object(&mut self, id: JobId, body: u64) -> bool {
+        if body == 0
+            || self.jobs.iter().flatten().any(|job| {
+                job.id != id && job.kernel_job_object == Some(body)
+            })
+            || self
+                .destructions
+                .iter()
+                .flatten()
+                .any(|destruction| destruction.kernel_job_object == Some(body))
+        {
+            return false;
+        }
+        let Some(job) = self.get_mut(id) else {
+            return false;
+        };
+        if job.kernel_job_object.is_some_and(|existing| existing != body) {
+            return false;
+        }
+        job.kernel_job_object = Some(body);
+        true
+    }
+
+    pub fn kernel_job_object(&self, id: JobId) -> Option<u64> {
+        self.get(id)?.kernel_job_object
+    }
+
+    pub fn job_for_kernel_object(&self, body: u64) -> Option<JobId> {
+        if body == 0 {
+            return None;
+        }
+        self.jobs.iter().flatten().find_map(|job| {
+            (job.kernel_job_object == Some(body)).then_some(job.id)
+        })
+    }
+
+    /// Includes destruction records until ownership is taken by the native rundown path.
+    pub(crate) fn reserves_kernel_object(&self, body: u64) -> bool {
+        self.job_for_kernel_object(body).is_some()
+            || self
+                .destructions
+                .iter()
+                .flatten()
+                .any(|destruction| destruction.kernel_job_object == Some(body))
+    }
+
     pub fn queue_notifications(&mut self, notifications: JobNotifications) {
         self.pending_notifications.extend(notifications.iter());
     }
@@ -451,6 +502,7 @@ impl JobStore {
             let next = job.set_next;
             self.destructions[slot] = Some(JobDestruction {
                 id: job.id,
+                kernel_job_object: job.kernel_job_object,
                 security_limits: job.security_limits,
                 released_completion_port: job.completion_port,
             });
@@ -490,6 +542,7 @@ impl JobStore {
         let id = u32::try_from(slot + 1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         self.jobs[slot] = Some(Job {
             id,
+            kernel_job_object: None,
             session_id,
             handle_count: 0,
             wait_references: 0,
@@ -1728,10 +1781,44 @@ mod tests {
             jobs.take_destruction(),
             Some(JobDestruction {
                 id: job,
+                kernel_job_object: None,
                 security_limits: 0,
                 released_completion_port: Some(association),
             })
         );
+    }
+
+    #[test]
+    fn kernel_job_body_publication_requires_exact_live_job_and_retires_with_it() {
+        let mut jobs = JobStore::new();
+        let first = jobs.create(0).unwrap();
+        let second = jobs.create(0).unwrap();
+        let body = 0xFFFF_8000_0000_9000;
+
+        assert!(!jobs.publish_kernel_job_object(0, body));
+        assert!(!jobs.publish_kernel_job_object(first, 0));
+        assert_eq!(jobs.kernel_job_object(first), None);
+        assert!(jobs.publish_kernel_job_object(first, body));
+        assert!(jobs.publish_kernel_job_object(first, body));
+        assert_eq!(jobs.kernel_job_object(first), Some(body));
+        assert_eq!(jobs.job_for_kernel_object(body), Some(first));
+        assert!(!jobs.publish_kernel_job_object(second, body));
+        assert!(!jobs.publish_kernel_job_object(first, body + 8));
+        assert_eq!(jobs.kernel_job_object(second), None);
+        assert_eq!(jobs.job_for_kernel_object(body + 8), None);
+
+        jobs.retain_handle(first).unwrap();
+        assert!(!jobs.discard_unreferenced(first));
+        assert_eq!(jobs.job_for_kernel_object(body), Some(first));
+        assert!(jobs.release_handle(first).unwrap().destroyed);
+        assert_eq!(jobs.kernel_job_object(first), None);
+        assert_eq!(jobs.job_for_kernel_object(body), None);
+        let destruction = jobs.take_destruction().unwrap();
+        assert_eq!(destruction.id, first);
+        assert_eq!(destruction.kernel_job_object, Some(body));
+        assert!(!jobs.publish_kernel_job_object(first, body));
+        assert!(jobs.publish_kernel_job_object(second, body));
+        assert_eq!(jobs.job_for_kernel_object(body), Some(second));
     }
 
     #[test]

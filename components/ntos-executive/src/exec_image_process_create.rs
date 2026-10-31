@@ -11,7 +11,22 @@ pub(crate) struct ProcessImageOwner {
     target: nt_exe_image::SpawnTarget,
     pid: Option<nt_process::ProcessId>,
     view: ImageViewRef,
+    /// Captured from the retained Section source, independent of later handle or path changes.
+    pub(crate) source: nt_exe_image::ProcessImageSourceEvidence,
     mechanism_retired: bool,
+}
+
+impl ProcessImageOwner {
+    /// Give initial-thread admission only the Section File captured for this live process image.
+    /// A reused PI or PID cannot borrow an older owner's backing.
+    pub(crate) fn source_for_live_process(
+        &self,
+        target: nt_exe_image::SpawnTarget,
+        pid: nt_process::ProcessId,
+    ) -> Option<nt_exe_image::ProcessImageSourceEvidence> {
+        (self.target == target && self.pid == Some(pid) && !self.mechanism_retired
+            && self.source.matches_target(target)).then_some(self.source)
+    }
 }
 
 impl ExecNtHandler {
@@ -34,6 +49,7 @@ impl ExecNtHandler {
         if caller.mode() == nt_types::AccessMode::UserMode
             && handle.granted_access() & nt_memory_manager::section_view_access::SECTION_MAP_EXECUTE == 0
         { return Err(nt_process::STATUS_ACCESS_DENIED); }
+        let area = self.image_sections.area(id).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         let source = self.image_sections.source(id).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         if !source.has_readable_image() { return Err(STATUS_NOT_SUPPORTED); }
         let path = source.image_path.as_deref().ok_or(STATUS_NOT_SUPPORTED)?;
@@ -45,13 +61,15 @@ impl ExecNtHandler {
         let (path_len, root) = dynamic_hosted_nt_image_path(path, leaf, &mut image_path)
             .ok_or(STATUS_NOT_SUPPORTED)?;
         let _durable = crate::allocator::enter_durable();
-        let mut bytes = source.materialize_process_snapshot(self)?;
+        let mut bytes = source.materialize_process_snapshot(self, area)?;
         if bytes.len() as u64 != source.backing.file_extent { return Err(INVALID_IMAGE); }
         // Preserve the canonical preferred transfer address through main-image placement.
         let headers = source.layout.headers();
         if headers.machine != 0x8664 || !headers.is_executable() { return Err(INVALID_IMAGE); }
         let role = nt_exe_image::HostedProcessRole::for_image_subsystem(headers.subsystem)
             .ok_or(STATUS_NOT_SUPPORTED)?;
+        let section_file = source.backing.file.ok_or(INVALID_IMAGE)?;
+        let registered_file = source.registered_file;
         let observation_target = source.observation_target;
         let metadata = nt_exe_image::ImageMetadata {
             pool_va: bytes.as_mut_ptr() as u64, file_size: bytes.len() as u64,
@@ -79,6 +97,16 @@ impl ExecNtHandler {
         };
         let image = catalog.get_by_pi(pi).expect("new exact process image registration");
         let target = nt_exe_image::SpawnTarget::from_image(image);
+        let source = match nt_exe_image::ProcessImageSourceEvidence::capture_with_registered_file(
+            image, section_file, registered_file, observation_target,
+        ) {
+            Ok(source) => source,
+            Err(_) => {
+                catalog.retire_dynamic_target(target).expect("unpublished exact image registration");
+                self.image_sections.release_view(view).expect("unpublished process image view");
+                return Err(INVALID_IMAGE);
+            }
+        };
         if register_hosted_process_runtime_for_image(image).is_err() {
             catalog.retire_dynamic_target(target).expect("unpublished exact image registration");
             self.image_sections.release_view(view).expect("unpublished process image view");
@@ -90,7 +118,7 @@ impl ExecNtHandler {
             self.image_sections.release_view(view).expect("unpublished process image view");
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
-        self.process_image_owners.push(ProcessImageOwner { target, pid: None, view, mechanism_retired: false });
+        self.process_image_owners.push(ProcessImageOwner { target, pid: None, view, source, mechanism_retired: false });
         let request = match (&mut *ctx.exe_images).reserve_spawn_from_native_section(
             catalog, target, self.pi, create.section_handle, metadata, desired_access, output,
         ) {
@@ -136,7 +164,9 @@ impl ExecNtHandler {
     }
 
     pub(super) fn release_native_process_image(&mut self, pi: usize, pid: nt_process::ProcessId, generation: u64) {
-        let Some(index) = self.process_image_owners.iter().position(|row| row.target.pi == pi) else { return; };
+        let Some(index) = self.process_image_owners.iter().position(|row|
+            row.target.pi == pi && row.target.generation == generation && row.pid == Some(pid))
+        else { return; };
         let row = &self.process_image_owners[index];
         assert_eq!(row.target.generation, generation);
         assert_eq!(row.pid, Some(pid));

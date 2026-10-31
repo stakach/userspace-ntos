@@ -239,3 +239,75 @@ fn peer_lifecycle_pump_never_enters_backend_inline() {
     io.requeue_prepared_file_lifecycle(close).unwrap();
     assert_eq!(&*majors.borrow(), &[major::IRP_MJ_CREATE]);
 }
+#[test]
+fn repeated_final_handle_release_does_not_requeue_owned_cleanup() {
+    let (mut io, client, file, _, _, create) = external_file(false, true);
+    assert!(matches!(
+        create,
+        ExternalDispatchResult::Completed {
+            status: NtStatus::SUCCESS,
+            ..
+        }
+    ));
+
+    io.queue_external_file_release(client, file).unwrap();
+    let prepared = io
+        .prepare_queued_peer_file_lifecycle(file, 0x42)
+        .unwrap()
+        .unwrap();
+    assert_eq!(prepared.projection().major, major::IRP_MJ_CLEANUP);
+    assert!(!io.file(file).unwrap().close_retry_queued);
+
+    // The executive may redrive an NtClose waiter while the exact lifecycle owner is
+    // prepared but has not yet entered the driver. That waiter must not publish a
+    // second retry for the same generation-bearing File.
+    io.queue_external_file_release(client, file).unwrap();
+    assert!(!io.file(file).unwrap().close_retry_queued);
+    assert!(!io.queued_peer_file_lifecycle_ready(file).unwrap());
+
+    let invocation = io.begin_prepared_file_lifecycle(prepared).unwrap();
+    io.queue_external_file_release(client, file).unwrap();
+    assert!(!io.file(file).unwrap().close_retry_queued);
+    assert!(!io.queued_peer_file_lifecycle_ready(file).unwrap());
+
+    io.finish_file_lifecycle(invocation.returned(FileLifecycleOutcome::Returned {
+        status: NtStatus::SUCCESS,
+        information: 0,
+    }))
+    .unwrap();
+    assert_eq!(io.file(file).unwrap().state, FileState::CleanupComplete);
+    assert!(io.file(file).unwrap().close_retry_queued);
+}
+
+#[test]
+fn repeated_final_handle_release_restores_retry_after_prepared_cleanup_is_discarded() {
+    let (mut io, client, file, _, _, create) = external_file(false, true);
+    assert!(matches!(
+        create,
+        ExternalDispatchResult::Completed {
+            status: NtStatus::SUCCESS,
+            ..
+        }
+    ));
+
+    io.queue_external_file_release(client, file).unwrap();
+    let prepared = io
+        .prepare_queued_peer_file_lifecycle(file, 0x42)
+        .unwrap()
+        .unwrap();
+    assert!(!io.file(file).unwrap().close_retry_queued);
+    io.discard_prepared_file_lifecycle(prepared).unwrap();
+    assert_eq!(io.irp_count(), 0);
+    assert!(!io.file(file).unwrap().cleanup_dispatched);
+
+    // No driver effect occurred, and the exact prepared owner was discarded.
+    // A repeated final-handle redrive must make this File runnable again.
+    io.queue_external_file_release(client, file).unwrap();
+    assert!(io.queued_peer_file_lifecycle_ready(file).unwrap());
+    let retry = io
+        .prepare_queued_peer_file_lifecycle(file, 0x42)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.projection().major, major::IRP_MJ_CLEANUP);
+    io.discard_prepared_file_lifecycle(retry).unwrap();
+}

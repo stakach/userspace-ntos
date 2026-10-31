@@ -9,6 +9,7 @@ struct Storage {
     pinned: [u64; 2],
     bytes: [u32; 128],
     free: [u64; 3],
+    membership: [u64; 2],
     live_len: usize,
     pinned_len: usize,
     bytes_len: usize,
@@ -29,6 +30,7 @@ impl Storage {
             pinned: [0; 2],
             bytes,
             free: [65, 0, 0],
+            membership: [1 << 1, 0],
             live_len: 2,
             pinned_len: 2,
             bytes_len: 128,
@@ -51,6 +53,7 @@ impl Storage {
             pinned: &self.pinned[..self.pinned_len],
             retype_bytes: &mut self.bytes[..self.bytes_len],
             free: &mut self.free[..self.free_len],
+            free_membership: &mut self.membership,
             count: self.count,
             live_bytes: self.live_bytes,
             released_bytes: self.released_bytes,
@@ -192,11 +195,69 @@ fn full_and_corrupt_counts_do_not_discard_ownership_or_clamp_count() {
 fn only_active_prefix_participates_in_duplicate_detection() {
     let mut storage = Storage::new();
     storage.free[0] = 70;
+    storage.membership[0] = 1 << 6;
     storage.rejects_unchanged(70, RecycleError::AlreadyPublished);
     storage.free = [65, 70, 70];
+    storage.membership[0] = 1 << 1;
     storage.publish(70).unwrap();
     assert_eq!(storage.count, 2);
     assert_eq!(&storage.free[..2], &[65, 70]);
+}
+
+#[test]
+fn recycled_stack_membership_tracks_pop_swap_remove_and_republication() {
+    let mut free = [65, 70, 0];
+    let mut membership = [(1 << 1) | (1 << 6), 0];
+    let mut stack = RecycledSlotStack {
+        start: 64,
+        end: 192,
+        free: &mut free,
+        membership: &mut membership,
+        count: 2,
+    };
+    assert!(stack.contains(65).unwrap());
+    assert!(stack.contains(70).unwrap());
+    assert!(stack.remove(65).unwrap());
+    assert_eq!(stack.count, 1);
+    assert_eq!(&stack.free[..1], &[70]);
+    assert!(!stack.contains(65).unwrap());
+    assert!(stack.contains(70).unwrap());
+
+    assert_eq!(stack.pop(), Ok(Some(70)));
+    assert_eq!(stack.count, 0);
+    assert_eq!(stack.free[0], 70, "inactive cells may retain old slots");
+    assert!(!stack.contains(70).unwrap());
+    stack.push(70).unwrap();
+    assert_eq!(stack.count, 1);
+    assert_eq!(stack.push(70), Err(RecycledSlotError::AlreadyPublished));
+    assert!(stack.remove(70).unwrap());
+    assert_eq!(stack.count, 0);
+    assert_eq!(stack.remove(70), Ok(false));
+}
+
+#[test]
+fn recycled_stack_corruption_rejects_without_changing_ownership() {
+    let mut free = [65, 70, 0];
+    let mut membership = [1 << 1, 0];
+    let mut stack = RecycledSlotStack {
+        start: 64,
+        end: 192,
+        free: &mut free,
+        membership: &mut membership,
+        count: 2,
+    };
+    assert_eq!(stack.pop(), Err(RecycledSlotError::CorruptMembership));
+    assert_eq!(stack.remove(70), Err(RecycledSlotError::CorruptMembership));
+    assert_eq!(stack.count, 2);
+    assert_eq!(&stack.free[..2], &[65, 70]);
+    assert_eq!(stack.membership[0], 1 << 1);
+    stack.count = 4;
+    assert_eq!(stack.push(71), Err(RecycledSlotError::CorruptCount));
+    assert_eq!(stack.pop(), Err(RecycledSlotError::CorruptCount));
+    assert_eq!(stack.remove(65), Err(RecycledSlotError::CorruptCount));
+    assert_eq!(stack.count, 4);
+    assert_eq!(&stack.free[..2], &[65, 70]);
+    assert_eq!(stack.membership[0], 1 << 1);
 }
 
 #[test]
@@ -273,6 +334,7 @@ fn checked_publication_failure_retains_sc_phase_until_capacity_returns() {
         }
         // Model allocation popping the last free slot; its inactive cell intentionally stays set.
         backend.storage.count = 2;
+        backend.storage.membership[0] &= !(1 << 3);
         owner.retire(&mut backend).unwrap();
         owner.retire(&mut backend).unwrap();
         assert_eq!(owner.stage(), Stage::Retired);

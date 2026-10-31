@@ -25,8 +25,10 @@ fn cleanup_authenticates_physical_owner_before_canonical_retirement() {
     assert!(position("physical_win32k_provider") < position("registry_live_handler_pointer"));
     assert!(position("registry_live_handler_pointer") < position("dereference"));
     assert!(position("registry_live_handler_pointer") < position("unmap"));
+    assert!(position("bootstrap_section_table") < position("resolve"));
+    assert!(position("resolve") < position("bootstrap_caller_admitted"));
     assert!(!calls.0.iter().any(|call| matches!(call.as_str(),
-        "resolve" | "capture_native_handle_caller" | "registry_live_handler")),
+        "capture_native_handle_caller" | "registry_live_handler")),
         "retained cleanup neither acquires live handle authority nor holds a handler borrow across IPC");
 }
 

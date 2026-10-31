@@ -20,6 +20,10 @@ pub(crate) struct MutationOutcomeJournal {
 }
 
 impl MutationOutcomeJournal {
+    pub(crate) fn pending_receipt_generation(&self) -> Option<u64> {
+        self.pending.as_ref().map(|result| result.receipt_generation)
+    }
+
     pub(crate) fn is_pending(&self) -> bool {
         self.pending.is_some()
     }

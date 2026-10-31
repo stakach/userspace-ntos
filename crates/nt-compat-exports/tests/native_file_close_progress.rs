@@ -25,14 +25,18 @@ fn calls(source: &str, module: &str, function: &str) -> bool {
 #[test]
 fn accepted_file_close_is_ready_inside_its_parked_parent_pump() {
     let pump = include_str!("../../../components/ntos-executive/src/component_shared_pump.rs");
-    assert!(calls(pump, "hosted_routed_file_close_work", "nested_work_ready"),
+    let service = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
+    assert!(calls(pump, "service_sec_image", "nested_hosted_file_work_ready"));
+    assert!(calls(service, "hosted_routed_file_close_work", "nested_work_ready"),
         "a retained ZwClose cannot depend on the outer service loop while its parent dispatch is parked");
 }
 
 #[test]
 fn retained_section_metadata_is_ready_inside_its_parked_parent_pump() {
     let pump = include_str!("../../../components/ntos-executive/src/component_shared_pump.rs");
-    assert!(calls(pump, "provider_section_broker", "nested_work_ready"),
+    let service = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
+    assert!(calls(pump, "service_sec_image", "nested_hosted_file_work_ready"));
+    assert!(calls(service, "provider_section_broker", "nested_work_ready"),
         "MmCreateSection metadata must progress while its native caller is parked");
 }
 
@@ -108,7 +112,9 @@ fn borrowed_cleanup_bookkeeping_does_not_enter_hosted_drivers() {
 #[test]
 fn independent_file_lifecycle_remains_reachable_after_close_request_retirement() {
     let pump = include_str!("../../../components/ntos-executive/src/component_shared_pump.rs");
-    assert!(calls(pump, "driver_launch", "nested_hosted_file_lifecycle_work_ready"),
+    let service = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
+    assert!(calls(pump, "service_sec_image", "nested_hosted_file_work_ready"));
+    assert!(calls(service, "driver_launch", "nested_hosted_file_lifecycle_work_ready"),
         "canonical cleanup/close ownership must remain schedulable without its original close request");
 
     let parsed = syn::parse_file(include_str!(

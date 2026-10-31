@@ -108,6 +108,10 @@ impl ProcessManager {
             identity,
             references_held: true,
         });
+        // The designated image-less System process is the kernel's native process on every
+        // build host. Ordinary image-less processes retain unknown architecture.
+        self.processes.get_mut(&pid).unwrap().architecture_proof =
+            Some(crate::native_wow64_state::ProcessArchitectureProof::NativeKernel);
         Ok(identity)
     }
 

@@ -13,40 +13,55 @@ fn source(name: &str) -> String {
 #[test]
 fn v2_fold_owns_cm_checkpoint_and_exact_reserve_until_two_slots_and_rollover() {
     let fold = source("writable_fs/system_wal_fold.rs");
-    for contract in [
-        "PreparedSystemHiveCheckpoint",
-        "snapshot_storage::Lease",
-        "static mut FOLD_WORK",
-        "base_serial: manifest.high_water_serial",
-        "replace_boot_file(",
-        "CONFIG_SYSTEM_HIVE_PATH",
-        "WalSnapshotEpochRollover::admit(",
-        "publish_resetting()",
-        "finish()",
-    ] {
-        assert!(fold.contains(contract), "native fold lost {contract}");
-    }
-    let image = fold.find("replace_boot_file(").unwrap();
-    let capture = fold.find("export_volume_snapshot(").expect("one folded image capture");
-    let first = fold.find("commit_next_with_wal_manifest(").unwrap();
-    let second = fold[first + 1..].find("commit_next_with_wal_manifest(")
-        .expect("second folded snapshot slot") + first + 1;
-    let rollover = fold.find("WalSnapshotEpochRollover::admit(").unwrap();
-    let ack = fold.find("config_manager_acknowledge_system_hive_checkpoint(").unwrap();
-    assert!(image < capture && capture < first && first < second && second < rollover && rollover < ack,
-        "CM image fold, two slots, epoch rollover and CM ACK must retain one order");
-    assert!(!fold.contains("config_manager_abort_system_hive_checkpoint("),
-        "an uncertain physical fold cannot abandon its CM checkpoint");
+    let native = source("writable_fs/system_wal_fold/native.rs");
+    let entry = &fold[fold.find("pub(crate) unsafe fn fold_system_wal_if_dirty()").unwrap()..];
+    assert!(entry.find("BlockSourceKind::Native").unwrap()
+        < entry.find("ensure_mounted()?").unwrap(),
+        "native cutover must enter the retained fold before any synchronous mount I/O");
+    let stage = &native[native.find("unsafe fn advance_recheck()").unwrap()
+        ..native.find("pub(super) unsafe fn fold_system_wal_native()").unwrap()];
+    assert!(stage.contains("take_rechecked_wal_continuation(id)")
+        && stage.contains("FileSystem::from_volume_snapshot(baseline.as_slice())")
+        && stage.contains("stage_prepared_checkpoint(&mut staged, &prepared)")
+        && stage.contains("CapturedSnapshot::capture(&lease, &staged)")
+        && stage.contains("cursor: Some(Cursor::First(commit))"),
+        "the exact rechecked lease must retain a private prepared image for native writes");
+    assert!(!stage.contains("apply_prepared_checkpoint(fs,"),
+        "pending native effects must not expose the prepared SYSTEM image in the live overlay");
+    let complete = &native[native.find("pub(crate) unsafe fn complete(").unwrap()
+        ..native.find("fn stall(").unwrap()];
+    let first = complete.find("Cursor::First(commit) =>").unwrap();
+    let reused = complete[first..].find("finish_with_payload_and_paired_proof()").unwrap() + first;
+    let second = complete.find("Cursor::Second(commit) =>").unwrap();
+    let rollover = complete.find("AsyncWalEpochRollover::admit(").unwrap();
+    let ready = complete.find("Cursor::Rollover(cursor) =>").unwrap();
+    assert!(first < reused && reused < second && second < rollover && rollover < ready,
+        "both slots must use the same owned capture before optional rollover");
+    assert!(complete.contains("AsyncSnapshotCommit::new(active.lease.store(), image,")
+        && complete.contains("publish_ready(active, None, pair)")
+        && complete.contains("publish_ready(active, Some(next), pair)"),
+        "small and rollover folds must retain the exact pair until CM acknowledgement");
+    let acknowledge = &fold[fold.find("unsafe fn acknowledge_retained()").unwrap()..];
+    assert!(native.contains("phase: Phase::Acknowledging")
+        && acknowledge.contains("config_manager_acknowledge_system_hive_checkpoint(prepared)")
+        && acknowledge.contains("install_retained()"),
+        "the CM ACK follows native proof completion while FOLD_WORK owns the lease");
+    assert!(!native.contains("config_manager_abort_system_hive_checkpoint("),
+        "an uncertain native fold cannot abandon its CM checkpoint");
 }
 
 #[test]
 fn uncertain_fold_keeps_owner_and_dirty_state_for_boot_recovery() {
     let fold = source("writable_fs/system_wal_fold.rs");
+    let native = source("writable_fs/system_wal_fold/native.rs");
     assert!(fold.contains("WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED"));
     assert!(fold.contains("WRITABLE_FS_SNAPSHOT_DIRTY"));
     assert!(fold.contains("FOLD_WORK"));
     assert!(fold.contains("core::mem::forget") || fold.contains("Phase::Blocked"),
         "uncertain effects cannot drop the exact lease");
+    assert!(native.contains("Work::Stalled") && native.contains("active.failed = true")
+        && native.contains("mark_snapshot_dirty()"),
+        "native uncertainty must retain the exact lease and leave dirty work visible");
 
     let writable = source("writable_fs.rs");
     assert!(writable.contains("mod system_wal_fold;"));
@@ -59,7 +74,8 @@ fn lazy_writer_and_shutdown_fold_without_changing_explicit_flush_fence() {
     let service = source("service_sec_image.rs");
     assert!(service.contains("fold_system_wal_if_dirty()"),
         "the active service loop must schedule CM image folds independently of file dirty bits");
-    assert!(service.contains("SYSTEM_WAL_FOLD_INTERVAL_100NS")
+    assert!(service.contains("wal_fold_cadence::next_background_fold_deadline")
+        && service.contains("wal_fold_cadence::background_fold_due")
         && service.contains("monotonic_time_100ns()"),
         "background folds must coalesce mutations over a bounded interval");
     let timer = source("timer_deadline.rs");
@@ -94,14 +110,75 @@ fn pending_cm_ack_redrives_before_generic_snapshot_or_timer_gate() {
     assert!(pending < redrive && redrive < generic,
         "an ACK held under the reserve must redrive before generic snapshot acquisition");
     let early = &body[pending..generic];
-    assert!(early.contains("SYSTEM_WAL_LAST_FOLD_100NS.store(monotonic_time_100ns()")
+    assert!(early.contains("SYSTEM_WAL_FOLD_RETRY_100NS.store(")
+        && early.contains("monotonic_time_100ns().saturating_add(SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS)")
         && early.contains("rearm_registered_active_delay_timer()"),
         "a refused ACK must move its timer deadline forward instead of rearming a past deadline");
 }
 
 #[test]
+fn completed_native_fold_can_advance_inside_the_active_irp_pump() {
+    let pump = source("component_shared_pump.rs");
+    let start = pump.find("pub(super) unsafe fn receive(")
+        .expect("active component Receive pump");
+    let body = &pump[start..];
+    let loop_start = body.find("loop {").expect("retained Receive loop");
+    let mutation = body.find("crate::registry_mutation_work::redrive_provider()")
+        .expect("CM mutation redrive under held parent");
+    let next_message = body.find("runtime::next_message(route)")
+        .expect("blocking Receive frontier");
+    let progress = body.find("redrive_retained_system_wal_fold_after_native_completion()")
+        .expect("exact folded checkpoint continuation under held parent");
+    assert!(loop_start < progress && progress < mutation && mutation < next_message,
+        "the folded checkpoint must release CM's writer before a BUSY mutation retries or the active IRP pump waits");
+    let narrow = &body[loop_start..mutation];
+    assert!(narrow.contains("runtime::nested::park_current()")
+        && narrow.contains("runtime::nested::restore("),
+        "the exact fold continuation must preserve and restore its physical Receive parent");
+    assert!(!narrow.contains("finalize_service_loop_state("),
+        "the active IRP pump must not run the generic provider/filesystem finalizer");
+}
+
+#[test]
+fn overdue_wal_fold_progresses_at_nested_receive_boundary_without_timer_storm() {
+    let main = source("main.rs");
+    let timer = &main[main.find("unsafe fn delay_timer_drain_due_work(").unwrap()..];
+    let drain = &timer[..timer.find("pub(crate) unsafe fn delay_timer_drain_overdue_without_badge(").unwrap()];
+    assert!(drain.contains("record_due_system_wal_fold(now_100ns)"),
+        "timer delivery records fold demand before its caller rearms");
+
+    let pump = source("component_shared_pump.rs");
+    let body = &pump[pump.find("pub(super) unsafe fn receive(").unwrap()..];
+    let fold = body.find("service_due_system_wal_fold()")
+        .expect("nested receiver must service a due SYSTEM WAL fold");
+    let next_message = body.find("runtime::next_message(route)")
+        .expect("next blocking receive");
+    assert!(fold < next_message,
+        "a retained IRP pump must advance the fold before it blocks for another message");
+    let narrow = &body[..fold];
+    assert!(narrow.contains("runtime::nested::park_current()"),
+        "the fold must run with its physical Receive parent parked");
+
+    let service = source("service_sec_image.rs");
+    let deadline = &service[service.find("pub(crate) fn system_wal_fold_next_deadline()").unwrap()..];
+    assert!(deadline.find("SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire)").unwrap()
+        < deadline.find("wal_fold_cadence::next_background_fold_deadline").unwrap(),
+        "pending fold demand must replace the past deadline with a retry deadline");
+    let wake = &service[service.find("pub(crate) fn record_due_system_wal_fold(").unwrap()..];
+    assert!(wake.contains("now_100ns.saturating_add(SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS)")
+        && wake.contains("SYSTEM_WAL_FOLD_RETRY_100NS.store("),
+        "a busy CM must retain a bounded future retry without a minimum-shot IRQ storm");
+    let entry = &service[service.find("pub(crate) fn service_due_system_wal_fold()").unwrap()..];
+    assert!(entry.contains("maybe_fold_system_wal()")
+        && entry.contains("SYSTEM_WAL_FOLD_RUNNING.swap(true, Ordering::AcqRel)")
+        && entry.contains("system_wal_fold_blocked()"),
+        "nested progress must use the same fold and failure policy as the outer finalizer");
+}
+
+#[test]
 fn small_fold_keeps_anchored_epoch_and_reserves_rollover_for_capacity() {
     let fold = source("writable_fs/system_wal_fold.rs");
+    let native = source("writable_fs/system_wal_fold/native.rs");
     let first = fold.find("commit_next_with_wal_manifest(").unwrap();
     let second = fold[first + 1..].find("commit_next_with_wal_manifest(").unwrap() + first + 1;
     let decision = fold.find("if needs_epoch_rollover(manifest.high_water_end_lba, sectors)")
@@ -113,6 +190,10 @@ fn small_fold_keeps_anchored_epoch_and_reserves_rollover_for_capacity() {
     assert!(fold.contains("work.old_continuation.take()")
         && fold.contains("work.next_continuation.is_some()"),
         "no rollover reuses the exact anchored token after CM ACK");
+    assert!(native.contains("if needs_epoch_rollover(active.manifest.high_water_end_lba, sectors)")
+        && native.contains("publish_ready(active, None, pair)")
+        && native.contains("publish_ready(active, Some(next), pair)"),
+        "native small fold retains its anchored token and rolls only at the capacity gate");
 }
 
 #[test]

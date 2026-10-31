@@ -13,6 +13,49 @@ pub struct BusInformationValue {
     pub bus_number: u32,
 }
 
+/// The released and legacy ACPI PDOs report distinct, exact bus GUID/type pairs.
+pub fn is_acpi_child_bus_information(bus: &crate::PnpBusInformation) -> bool {
+    const LIBERNT_ACPI: [u8; 16] = [
+        0x95, 0x68, 0xb4, 0xd7, 0x1a, 0x00, 0x42, 0x49, 0x89, 0x1f, 0xa7, 0xd4, 0x66, 0x10,
+        0xa8, 0x43,
+    ];
+    const REACTOS_ACPI: [u8; 16] = [
+        0x8a, 0xa0, 0x91, 0xb0, 0x97, 0xba, 0xd0, 0x11, 0xbd, 0x14, 0x00, 0xaa, 0x00, 0xb7,
+        0xb3, 0x2a,
+    ];
+    (bus.bus_type_guid == LIBERNT_ACPI && bus.legacy_bus_type == 0)
+        || (bus.bus_type_guid == REACTOS_ACPI && bus.legacy_bus_type == 13)
+}
+
+#[cfg(test)]
+mod acpi_bus_identity_tests {
+    use super::*;
+
+    #[test]
+    fn released_and_legacy_acpi_child_bus_pairs_are_exact() {
+        let released = crate::PnpBusInformation {
+            bus_type_guid: [0x95, 0x68, 0xb4, 0xd7, 0x1a, 0x00, 0x42, 0x49,
+                0x89, 0x1f, 0xa7, 0xd4, 0x66, 0x10, 0xa8, 0x43],
+            legacy_bus_type: 0,
+            bus_number: 0,
+        };
+        let legacy = crate::PnpBusInformation {
+            bus_type_guid: [0x8a, 0xa0, 0x91, 0xb0, 0x97, 0xba, 0xd0, 0x11,
+                0xbd, 0x14, 0x00, 0xaa, 0x00, 0xb7, 0xb3, 0x2a],
+            legacy_bus_type: 13,
+            bus_number: 0,
+        };
+        assert!(is_acpi_child_bus_information(&released));
+        assert!(is_acpi_child_bus_information(&legacy));
+        assert!(!is_acpi_child_bus_information(&crate::PnpBusInformation {
+            legacy_bus_type: 13, ..released.clone()
+        }));
+        assert!(is_acpi_child_bus_information(&crate::PnpBusInformation {
+            bus_number: 1, ..legacy
+        }));
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BusPropertyCopyError {
     Truncated,
@@ -71,14 +114,55 @@ pub fn copy_pnp_required_device_text_x64(bytes: &[u8]) -> Result<Vec<u8>, BusPro
 
 /// An immutable bus-owned boot resource assignment that needs no HAL translation.
 ///
-/// A PCI root bridge reported by ACPI has one `CmResourceTypeBusNumber` boot descriptor and no
-/// resource requirements. NT preserves that descriptor byte-for-byte in both raw and translated
-/// START_DEVICE lists. Keeping this policy beside `PdoProperties` prevents a function driver from
-/// replacing the bus PDO's already-published resource authority.
+/// Some bus PDOs report one `CmResourceTypeBusNumber` boot descriptor and no resource
+/// requirements. NT preserves that descriptor byte-for-byte in both raw and translated
+/// START_DEVICE lists. PDOs with additional resources or present requirements use a separate
+/// checked assignment path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BusReportedBusNumberStart {
     pub raw_resources: Vec<u8>,
     pub translated_resources: Vec<u8>,
+}
+
+/// Exact bus-owned current resources and possible-resource requirements. The boot list is an
+/// assignment reported by the bus; the requirements still need checked admission before START.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BusReportedResourceSnapshot {
+    pub raw_resources: Vec<u8>,
+    pub resource_requirements: Vec<u8>,
+}
+
+/// A successful PCI bus query may report no descriptors at all. Require all three query
+/// results to agree; an unqueried or one-sided result cannot authorize an empty START.
+pub fn pci_bus_reports_no_resources(properties: &crate::PdoProperties) -> bool {
+    matches!(properties.boot_resources_raw, crate::PropertyBlobState::KnownNone)
+        && matches!(properties.boot_resources_translated, crate::PropertyBlobState::KnownNone)
+        && matches!(properties.resource_requirements, crate::PropertyBlobState::KnownNone)
+}
+
+/// Retain a complete resource pair from an accepted bus PDO without replacing it with a
+/// synthetic no-resource plan. One-sided and unqueried pairs cannot authorize START.
+pub fn prepare_bus_reported_resource_snapshot(
+    properties: &crate::PdoProperties,
+) -> Result<Option<BusReportedResourceSnapshot>, BusPropertyCopyError> {
+    use crate::PropertyBlobState::{KnownNone, Present, Unqueried};
+    match (
+        &properties.boot_resources_raw,
+        &properties.boot_resources_translated,
+        &properties.resource_requirements,
+    ) {
+        (Unqueried, _, _) | (_, Unqueried, _) | (_, _, Unqueried) => {
+            Err(BusPropertyCopyError::Malformed)
+        }
+        (KnownNone, KnownNone, KnownNone) | (Present(_), KnownNone, KnownNone) => Ok(None),
+        (Present(raw), KnownNone, Present(requirements)) => Ok(Some(
+            BusReportedResourceSnapshot {
+                raw_resources: copy_cm_resource_list(raw)?,
+                resource_requirements: copy_io_resource_requirements_list(requirements)?,
+            },
+        )),
+        _ => Err(BusPropertyCopyError::Malformed),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,6 +257,7 @@ pub fn copy_device_capabilities_x64(
     Ok(crate::PdoCapabilities {
         eject_supported: flags & (1 << 3) != 0,
         removable: flags & (1 << 4) != 0,
+        raw_device_ok: flags & (1 << 8) != 0,
         surprise_removal_ok: flags & (1 << 9) != 0,
         address: u32::from_le_bytes(
             prefix[DEVICE_CAPABILITIES_ADDRESS_OFFSET..DEVICE_CAPABILITIES_ADDRESS_OFFSET + 4]
@@ -299,7 +384,7 @@ mod tests {
         );
 
         let mut returned = initialized;
-        returned[4..8].copy_from_slice(&((1u32 << 3) | (1 << 4) | (1 << 9)).to_le_bytes());
+        returned[4..8].copy_from_slice(&((1u32 << 3) | (1 << 4) | (1 << 8) | (1 << 9)).to_le_bytes());
         returned[8..12].copy_from_slice(&7u32.to_le_bytes());
         assert_eq!(
             copy_device_capabilities_x64(&returned),
@@ -307,9 +392,12 @@ mod tests {
                 removable: true,
                 eject_supported: true,
                 surprise_removal_ok: true,
+                raw_device_ok: true,
                 address: 7,
             })
         );
+        returned[4..8].copy_from_slice(&((1u32 << 3) | (1 << 4) | (1 << 6) | (1 << 9)).to_le_bytes());
+        assert!(!copy_device_capabilities_x64(&returned).unwrap().raw_device_ok);
         assert_eq!(
             copy_device_capabilities_x64(&returned[..63]),
             Err(BusPropertyCopyError::Truncated)
@@ -319,6 +407,18 @@ mod tests {
             copy_device_capabilities_x64(&returned),
             Err(BusPropertyCopyError::Malformed)
         );
+    }
+
+    #[test]
+    fn native_raw_device_ok_is_distinct_from_unique_id() {
+        let mut returned = initialized_device_capabilities_x64();
+        returned[DEVICE_CAPABILITIES_FLAGS_OFFSET..DEVICE_CAPABILITIES_FLAGS_OFFSET + 4]
+            .copy_from_slice(&(1u32 << 8).to_le_bytes());
+        assert!(copy_device_capabilities_x64(&returned).unwrap().raw_device_ok);
+
+        returned[DEVICE_CAPABILITIES_FLAGS_OFFSET..DEVICE_CAPABILITIES_FLAGS_OFFSET + 4]
+            .copy_from_slice(&(1u32 << 6).to_le_bytes());
+        assert!(!copy_device_capabilities_x64(&returned).unwrap().raw_device_ok);
     }
 
     #[test]
@@ -458,6 +558,84 @@ mod tests {
             crate::PropertyBlobState::Present(vec![1]),
         );
         assert_eq!(prepare_bus_reported_bus_number_start(&arbitrated), Ok(None));
+    }
+
+    #[test]
+    fn pci_no_resource_report_requires_exact_completed_bus_queries() {
+        use crate::PropertyBlobState::{KnownNone, Present, Unqueried};
+
+        let no_resources = bus_properties(KnownNone, KnownNone, KnownNone);
+        assert!(pci_bus_reports_no_resources(&no_resources));
+        for (raw, translated, requirements) in [
+            (Unqueried, KnownNone, KnownNone),
+            (KnownNone, Unqueried, KnownNone),
+            (KnownNone, KnownNone, Unqueried),
+            (Present(Vec::new()), KnownNone, KnownNone),
+            (KnownNone, Present(Vec::new()), KnownNone),
+            (KnownNone, KnownNone, Present(Vec::new())),
+        ] {
+            assert!(!pci_bus_reports_no_resources(&bus_properties(
+                raw, translated, requirements,
+            )));
+        }
+    }
+
+    #[test]
+    fn bus_owned_multi_resource_snapshot_preserves_raw_and_requirements() {
+        let mut raw_storage = [0u8; 96];
+        let raw_len = build_memory_interrupt_list(
+            &mut raw_storage,
+            INTERFACE_TYPE_PCI_BUS,
+            0,
+            MemoryDescriptor {
+                start: 0x1000,
+                length: 0x1000,
+                flags: 0,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            },
+            InterruptDescriptor {
+                level: 5,
+                vector: 5,
+                affinity: 1,
+                flags: 0,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            },
+        )
+        .unwrap();
+        let requirement = [IoResourceRequirement::Memory(IoAddressRequirement {
+            option: IO_RESOURCE_REQUIRED,
+            share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            flags: 0,
+            length: 0x1000,
+            alignment: 0x1000,
+            minimum: 0x1000,
+            maximum: 0x1fff,
+        })];
+        let mut req_storage = [0u8; 96];
+        let req_len = build_io_resource_requirements_list(
+            &mut req_storage,
+            INTERFACE_TYPE_PCI_BUS,
+            0,
+            0,
+            &requirement,
+        )
+        .unwrap();
+        let raw = raw_storage[..raw_len].to_vec();
+        let requirements = req_storage[..req_len].to_vec();
+        let properties = bus_properties(
+            crate::PropertyBlobState::Present(raw.clone()),
+            crate::PropertyBlobState::KnownNone,
+            crate::PropertyBlobState::Present(requirements.clone()),
+        );
+
+        // This is an accepted bus PDO with real requirements. A no-resource plan would pass
+        // `None`/`None` to native property validation and reject both provider-owned blobs.
+        let snapshot = prepare_bus_reported_resource_snapshot(&properties)
+            .unwrap()
+            .expect("present bus-owned resources");
+        assert_eq!(snapshot.raw_resources, raw);
+        assert_eq!(snapshot.resource_requirements, requirements);
+        assert_eq!(prepare_bus_reported_bus_number_start(&properties), Ok(None));
     }
 
     #[test]

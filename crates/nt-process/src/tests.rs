@@ -3803,12 +3803,14 @@ fn process_delete_readiness_leaves_impersonation_to_the_delete_procedure() {
     let blockers = pm.process_object_delete_blockers(pid).unwrap();
     assert_eq!(blockers.thread_impersonations, 1);
     assert!(blockers.delete_ready());
+    assert!(!pm.process_execution_retirement_ready(pid));
     assert_eq!(pm.delete_process_object_if_unreferenced(pid), None);
 
     assert_eq!(
         pm.replace_thread_impersonation(tid, None),
         Ok(Some(context))
     );
+    assert!(pm.process_execution_retirement_ready(pid));
     assert!(pm.delete_process_object_if_unreferenced(pid).is_some());
 }
 
@@ -3847,6 +3849,35 @@ fn process_object_delete_blockers_report_exact_reference_owners() {
         .process_object_delete_blockers(target)
         .unwrap()
         .delete_ready());
+}
+
+#[test]
+fn terminated_execution_can_retire_while_external_object_references_remain() {
+    let mut pm = ProcessManager::new();
+    let owner = pm.create_process("owner.exe", None, None);
+    let target = pm.create_process("target.exe", None, None);
+    let tid = pm.create_thread(target, 0x1000, 0, false).unwrap();
+    let process_handle = pm
+        .insert_handle(owner, HandleObject::Process(target), PROCESS_ALL_ACCESS)
+        .unwrap();
+    let thread_handle = pm
+        .insert_handle(owner, HandleObject::Thread(tid), THREAD_ALL_ACCESS)
+        .unwrap();
+    pm.retain_process_wait_reference(target).unwrap();
+    pm.retain_thread_wait_reference(tid).unwrap();
+    assert!(!pm.process_execution_retirement_ready(target));
+    pm.terminate_process(target, 0x55).unwrap();
+
+    assert!(pm.process_execution_retirement_ready(target));
+    assert!(!pm.process_object_delete_ready(target));
+    assert_eq!(pm.process_object_delete_blockers(target).unwrap().external_process_handles, 1);
+    assert_eq!(pm.process_object_delete_blockers(target).unwrap().external_thread_handles, 1);
+
+    pm.release_process_wait_reference(target).unwrap();
+    pm.release_thread_wait_reference(tid).unwrap();
+    pm.close_handle(owner, process_handle).unwrap();
+    pm.close_handle(owner, thread_handle).unwrap();
+    assert!(pm.process_object_delete_ready(target));
 }
 
 #[test]

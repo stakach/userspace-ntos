@@ -179,6 +179,24 @@ pub enum WdmIoStackParameters {
         io_control_code: u32,
         type3_input_buffer: u64,
     },
+    /// `IRP_MJ_SCSI` aliases internal device control (0x0f), but its parameter union is a
+    /// single SRB pointer. Decode it only when the caller has authenticated a SCSI PDO route.
+    Scsi { srb: u64 },
+    Wmi {
+        provider_id: u64,
+        data_path: u64,
+        buffer_size: u32,
+        buffer: u64,
+    },
+    Power {
+        system_context: u32,
+        state_type: u32,
+        state: u32,
+        shutdown_type: u32,
+    },
+    WaitWake {
+        state: u32,
+    },
     PnpStartDevice {
         allocated_resources: u64,
         allocated_resources_translated: u64,
@@ -412,6 +430,75 @@ pub fn write_wdm_irp(bytes: &mut [u8], init: WdmIrpInit) -> Result<(), WdmLayout
     Ok(())
 }
 
+/// Initialize a caller-supplied x64 IRP packet as ReactOS `IoInitializeIrp` does.
+/// `irp_address` is its final provider virtual address, not the address of this slice.
+pub fn initialize_wdm_irp_packet(
+    bytes: &mut [u8],
+    irp_address: u64,
+    packet_size: u16,
+    stack_count: u8,
+    apc_environment: u8,
+) -> Result<(), WdmLayoutError> {
+    let size = usize::from(packet_size);
+    let minimum = WDM_X64_IRP_SIZE
+        .checked_add(usize::from(stack_count) * WDM_X64_IO_STACK_LOCATION_SIZE)
+        .ok_or(WdmLayoutError::InvalidField)?;
+    let stack_end = irp_address
+        .checked_add(minimum as u64)
+        .ok_or(WdmLayoutError::InvalidField)?;
+    irp_address.checked_add(size as u64)
+        .ok_or(WdmLayoutError::InvalidField)?;
+    let entry = irp_address
+        .checked_add(0x20)
+        .ok_or(WdmLayoutError::InvalidField)?;
+    if irp_address == 0 || stack_count == 0 || stack_count >= i8::MAX as u8
+        || size < minimum || apc_environment > 1
+    {
+        return Err(WdmLayoutError::InvalidField);
+    }
+    require(bytes, size)?;
+    bytes[..size].fill(0);
+    put_u16(bytes, 0, 6);
+    put_u16(bytes, 2, packet_size);
+    put_u64(bytes, 0x20, entry);
+    put_u64(bytes, 0x28, entry);
+    put_u8(bytes, 0x42, stack_count);
+    put_u8(bytes, 0x43, stack_count + 1);
+    put_u8(bytes, 0x46, apc_environment);
+    put_u64(bytes, 0xb8, stack_end);
+    Ok(())
+}
+
+/// Reuse an idle IRP while retaining its allocation provenance. `active_owner` must be
+/// determined by the canonical source/caller ownership ledger under its mutation lock.
+pub fn reuse_wdm_irp_packet(
+    bytes: &mut [u8],
+    irp_address: u64,
+    status: i32,
+    active_owner: bool,
+    apc_environment: u8,
+) -> Result<(), WdmLayoutError> {
+    require(bytes, WDM_X64_IRP_SIZE)?;
+    let packet_size = u16::from_le_bytes(bytes[2..4].try_into().unwrap());
+    let stack_count = bytes[0x42];
+    let allocation_flags = bytes[0x47];
+    let thread_entry = irp_address
+        .checked_add(0x20)
+        .ok_or(WdmLayoutError::InvalidField)?;
+    if active_owner
+        || u16::from_le_bytes(bytes[..2].try_into().unwrap()) != 6
+        || u64::from_le_bytes(bytes[0x20..0x28].try_into().unwrap()) != thread_entry
+        || u64::from_le_bytes(bytes[0x28..0x30].try_into().unwrap()) != thread_entry
+        || u64::from_le_bytes(bytes[0x68..0x70].try_into().unwrap()) != 0
+    {
+        return Err(WdmLayoutError::InvalidField);
+    }
+    initialize_wdm_irp_packet(bytes, irp_address, packet_size, stack_count, apc_environment)?;
+    bytes[0x30..0x34].copy_from_slice(&status.to_le_bytes());
+    bytes[0x47] = allocation_flags;
+    Ok(())
+}
+
 /// Complete IoInitializeIrp's self-linked ThreadListEntry once the packet has
 /// its final address. The requestor-thread queue is a separate ownership step.
 pub fn initialize_wdm_irp_thread_list(
@@ -570,6 +657,37 @@ pub fn write_wdm_io_stack_location(
             put_u32(bytes, 0x18, io_control_code);
             put_u64(bytes, 0x20, type3_input_buffer);
         }
+        WdmIoStackParameters::Scsi { srb } => {
+            if init.major != nt_io_abi::major::IRP_MJ_INTERNAL_DEVICE_CONTROL || srb == 0 {
+                return Err(WdmLayoutError::InvalidField);
+            }
+            put_u64(bytes, 0x08, srb);
+        }
+        WdmIoStackParameters::Wmi {
+            provider_id,
+            data_path,
+            buffer_size,
+            buffer,
+        } => {
+            if init.major != nt_io_abi::major::IRP_MJ_SYSTEM_CONTROL {
+                return Err(WdmLayoutError::InvalidField);
+            }
+            put_u64(bytes, 0x08, provider_id);
+            put_u64(bytes, 0x10, data_path);
+            put_u32(bytes, 0x18, buffer_size);
+            put_u64(bytes, 0x20, buffer);
+        }
+        WdmIoStackParameters::Power { system_context, state_type, state, shutdown_type } => {
+            put_u32(bytes, nt_power_types::PARAM_POWER_SYSTEM_CONTEXT_OFFSET as usize,
+                system_context);
+            put_u32(bytes, nt_power_types::PARAM_POWER_TYPE_OFFSET as usize, state_type);
+            put_u32(bytes, nt_power_types::PARAM_POWER_STATE_OFFSET as usize, state);
+            put_u32(bytes, nt_power_types::PARAM_POWER_SHUTDOWN_TYPE_OFFSET as usize,
+                shutdown_type);
+        }
+        WdmIoStackParameters::WaitWake { state } => {
+            put_u32(bytes, 0x08, state);
+        }
         WdmIoStackParameters::PnpStartDevice {
             allocated_resources,
             allocated_resources_translated,
@@ -598,6 +716,31 @@ pub fn write_wdm_io_stack_location(
         }
     }
     Ok(())
+}
+
+/// Decode the SCSI form of major 0x0f after the caller has authenticated the target as a
+/// storage PDO. The generic decoder must continue interpreting 0x0f as device control.
+pub fn decode_wdm_kernel_built_scsi_stack(
+    bytes: &[u8],
+) -> Result<WdmIoStackLocationInit, WdmLayoutError> {
+    require(bytes, WDM_X64_IO_STACK_LOCATION_SIZE)?;
+    if bytes[0] != nt_io_abi::major::IRP_MJ_INTERNAL_DEVICE_CONTROL || bytes[1] != 0 {
+        return Err(WdmLayoutError::InvalidField);
+    }
+    let pointer = |offset: usize| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    let srb = pointer(0x08);
+    if srb == 0 {
+        return Err(WdmLayoutError::InvalidField);
+    }
+    Ok(WdmIoStackLocationInit {
+        major: bytes[0],
+        minor: bytes[1],
+        flags: bytes[2],
+        control: bytes[3],
+        device_object: pointer(0x28),
+        file_object: pointer(0x30),
+        parameters: WdmIoStackParameters::Scsi { srb },
+    })
 }
 
 /// Decode the next stack location of a kernel-built IRP before it enters the I/O manager.

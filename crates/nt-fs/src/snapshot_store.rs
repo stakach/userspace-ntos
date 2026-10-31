@@ -12,6 +12,18 @@ use nt_config_store::codec::{crc32c, Crc32c};
 mod payload_writer;
 pub use payload_writer::PayloadSectorWriter;
 
+#[path = "snapshot_async_commit.rs"]
+mod async_commit;
+pub use async_commit::{AsyncSnapshotCommit, AsyncSnapshotCommitError, AsyncSnapshotIoKind, AsyncSnapshotRequest};
+
+#[path = "snapshot_async_header_recheck.rs"]
+mod async_header_recheck;
+pub use async_header_recheck::{AsyncSnapshotHeaderRecheck, RecheckedPairedWalSnapshot};
+
+#[path = "snapshot_async_wal_anchor.rs"]
+mod async_wal_anchor;
+pub use async_wal_anchor::{AnchoredWalPublication, AsyncWalSnapshotAnchorUpdate};
+
 #[path = "snapshot_wal_anchor.rs"]
 mod wal_anchor;
 pub use wal_anchor::WalSnapshotAnchorUpdate;
@@ -19,6 +31,11 @@ pub use wal_anchor::WalSnapshotAnchorUpdate;
 #[path = "snapshot_epoch_rollover.rs"]
 mod epoch_rollover;
 pub use epoch_rollover::WalSnapshotEpochRollover;
+
+#[path = "snapshot_async_epoch_rollover.rs"]
+mod async_epoch_rollover;
+pub use async_epoch_rollover::AsyncWalEpochRollover;
+
 
 #[cfg(test)]
 #[path = "snapshot_store_tests.rs"]
@@ -102,18 +119,20 @@ pub trait SnapshotPayloadReader {
     fn remaining(&self) -> usize;
 }
 
+const READ_BATCH_SECTORS: usize = 4;
+
 /// Sector-buffered payload reader for [`SnapshotBlockStore::read_latest_streaming`].
 pub struct PayloadSectorReader<'a, D: SnapshotBlockDevice> {
     dev: &'a mut D,
-    sector: Vec<u8>,
+    batch: Vec<u8>,
     sector_size: usize,
     slot_base: u64,
     payload_len: usize,
     payload_crc: u32,
     read: usize,
     sector_index: u64,
-    sector_offset: usize,
-    sector_valid: usize,
+    batch_offset: usize,
+    batch_valid: usize,
     crc: Crc32c,
 }
 
@@ -157,7 +176,7 @@ struct SlotSummary {
     resetting: bool,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct SlotReadPlan {
     slot: u32,
     generation: u64,
@@ -166,6 +185,33 @@ struct SlotReadPlan {
     payload_sectors: u32,
     wal: Option<WalSnapshotManifest>,
     resetting: bool,
+}
+
+/// In-process proof that both WAL snapshot payloads passed CRC validation on one exclusive
+/// reserve. It must travel with that reserve's physical owner; boot recovery must mint a fresh
+/// proof and an uncertain write must never return one to a new writer.
+#[must_use = "retain with the exact snapshot reserve until a settled update or recovery"]
+pub struct VerifiedPairedWalSnapshot {
+    store: SnapshotBlockStore,
+    plans: [SlotReadPlan; 2],
+    manifest: WalSnapshotManifest,
+}
+
+impl VerifiedPairedWalSnapshot {
+    /// In-memory durability fence for a pair retained from settled header/flush ACKs.
+    /// The caller must also hold the exact exclusive physical reserve lease.
+    pub fn matches_cached_fence(&self, store: SnapshotBlockStore, anchor: WalSnapshotAnchor) -> bool {
+        self.store == store && anchor.incarnation != 0
+            && self.manifest.anchor() == anchor
+    }
+
+    pub fn manifest(&self) -> WalSnapshotManifest {
+        self.manifest
+    }
+
+    pub fn anchor(&self) -> WalSnapshotAnchor {
+        self.manifest.anchor()
+    }
 }
 
 /// V2 snapshot-header metadata. End LBA is relative to the disjoint WAL view.
@@ -355,6 +401,8 @@ impl StoredSnapshotMetadata {
 }
 
 impl SnapshotBlockStore {
+    pub fn sector_count(&self) -> u64 { self.sector_count }
+
     pub fn new(start_lba: u64, sector_count: u64) -> Self {
         Self {
             start_lba,
@@ -568,14 +616,17 @@ impl SnapshotBlockStore {
     {
         let (sector_size, slot_sectors) = self.geometry(dev)?;
         let slot_base = self.slot_lba(slot_sectors, plan.slot)?;
-        let mut sector = Vec::new();
-        sector
-            .try_reserve_exact(sector_size)
+        let batch_size = sector_size
+            .checked_mul(READ_BATCH_SECTORS)
+            .ok_or(SnapshotBlockStoreError::InvalidGeometry)?;
+        let mut batch = Vec::new();
+        batch
+            .try_reserve_exact(batch_size)
             .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
-        sector.resize(sector_size, 0);
+        batch.resize(batch_size, 0);
         let generation = plan.generation;
         let payload_len = plan.payload_len;
-        let mut reader = PayloadSectorReader::new(dev, sector, sector_size, slot_base, plan);
+        let mut reader = PayloadSectorReader::new(dev, batch, sector_size, slot_base, plan);
         let result = read_payload(&mut reader)?;
         reader.finish()?;
         Ok((generation, payload_len, result))
@@ -651,13 +702,8 @@ impl SnapshotBlockStore {
         payload: &[u8],
         manifest: WalSnapshotManifest,
     ) -> Result<u64, SnapshotBlockStoreError> {
-        self.commit_next_streaming_with_wal_manifest(
-            dev,
-            payload.len(),
-            crc32c(payload),
-            manifest,
-            |writer| writer.write_all(payload),
-        )
+        AsyncSnapshotCommit::new(*self, payload, manifest, dev.sector_size(), dev.sector_count())?
+            .run_sync(dev)
     }
 
     /// Finish an interrupted v1-to-v2 baseline migration before any WAL record is admitted.
@@ -892,6 +938,43 @@ impl SnapshotBlockStore {
             .ok_or(SnapshotBlockStoreError::Corrupt)?;
         let second = self.read_valid_slot_plan(dev, 1)?
             .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        Self::paired_manifest([first, second])
+    }
+
+    /// Mint a move-only paired-slot proof after fully validating both payload CRCs. This is a
+    /// boot/recovery boundary; steady-state callers carry the resulting proof with the reserve.
+    pub fn verify_paired_wal_snapshot<D: SnapshotBlockDevice>(
+        &self,
+        dev: &mut D,
+    ) -> Result<VerifiedPairedWalSnapshot, SnapshotBlockStoreError> {
+        let first = self.read_valid_slot_plan(dev, 0)?
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        let second = self.read_valid_slot_plan(dev, 1)?
+            .ok_or(SnapshotBlockStoreError::Corrupt)?;
+        let plans = [first, second];
+        let manifest = Self::paired_manifest(plans)?;
+        Ok(VerifiedPairedWalSnapshot { store: *self, plans, manifest })
+    }
+
+    /// Check exact slot headers under the proof's original exclusive reserve. Payload bytes
+    /// remain certified only while no other writer can change that reserve; native callers bind
+    /// the proof to their physical mount and move it through every possible write owner.
+    pub fn recheck_verified_paired_wal_snapshot<D: SnapshotBlockDevice>(
+        &self,
+        dev: &mut D,
+        proof: &VerifiedPairedWalSnapshot,
+    ) -> Result<WalSnapshotManifest, SnapshotBlockStoreError> {
+        if proof.store != *self
+            || self.read_slot_plan(dev, 0)? != Some(proof.plans[0])
+            || self.read_slot_plan(dev, 1)? != Some(proof.plans[1])
+        {
+            return Err(SnapshotBlockStoreError::Corrupt);
+        }
+        Ok(proof.manifest)
+    }
+
+    fn paired_manifest(plans: [SlotReadPlan; 2]) -> Result<WalSnapshotManifest, SnapshotBlockStoreError> {
+        let [first, second] = plans;
         if first.resetting || second.resetting {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
@@ -905,9 +988,7 @@ impl SnapshotBlockStore {
         if !manifest.valid() || !other.valid() {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
-        same_anchor_wal_companion(
-            selected.generation, manifest, companion.generation, other,
-        )?;
+        same_anchor_wal_companion(selected.generation, manifest, companion.generation, other)?;
         Ok(manifest)
     }
 
@@ -1195,6 +1276,15 @@ impl SnapshotBlockStore {
             .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
         sector.resize(sector_size, 0);
         dev.read_sector(slot_base, &mut sector)?;
+        Self::slot_plan_from_sector(slot, sector_size, slot_sectors, &sector)
+    }
+
+    fn slot_plan_from_sector(
+        slot: u32,
+        sector_size: usize,
+        slot_sectors: u64,
+        sector: &[u8],
+    ) -> Result<Option<SlotReadPlan>, SnapshotBlockStoreError> {
         let Some(header) = decode_header(&sector)? else {
             return Ok(None);
         };
@@ -1238,14 +1328,13 @@ impl SnapshotBlockStore {
         dev: &mut D,
         plan: SlotReadPlan,
     ) -> Result<(), SnapshotBlockStoreError> {
-        const READ_BATCH_SECTORS: u32 = 4;
         let (sector_size, slot_sectors) = self.geometry(dev)?;
         if plan.payload_sectors as u64 > slot_sectors - 1 {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
         let slot_base = self.slot_lba(slot_sectors, plan.slot)?;
         let batch_size = sector_size
-            .checked_mul(READ_BATCH_SECTORS as usize)
+            .checked_mul(READ_BATCH_SECTORS)
             .ok_or(SnapshotBlockStoreError::InvalidGeometry)?;
         let mut batch = Vec::new();
         batch
@@ -1256,7 +1345,7 @@ impl SnapshotBlockStore {
         let mut crc = Crc32c::new();
         let mut index = 0;
         while index < plan.payload_sectors {
-            let sectors = (plan.payload_sectors - index).min(READ_BATCH_SECTORS);
+            let sectors = (plan.payload_sectors - index).min(READ_BATCH_SECTORS as u32);
             let bytes = sectors as usize * sector_size;
             let output = &mut batch[..bytes];
             output.fill(0);
@@ -1327,36 +1416,39 @@ impl SnapshotBlockStore {
 impl<'a, D: SnapshotBlockDevice> PayloadSectorReader<'a, D> {
     fn new(
         dev: &'a mut D,
-        sector: Vec<u8>,
+        batch: Vec<u8>,
         sector_size: usize,
         slot_base: u64,
         plan: SlotReadPlan,
     ) -> Self {
         Self {
             dev,
-            sector,
+            batch,
             sector_size,
             slot_base,
             payload_len: plan.payload_len,
             payload_crc: plan.payload_crc,
             read: 0,
             sector_index: 0,
-            sector_offset: 0,
-            sector_valid: 0,
+            batch_offset: 0,
+            batch_valid: 0,
             crc: Crc32c::new(),
         }
     }
 
-    fn fill_sector(&mut self) -> Result<(), SnapshotBlockStoreError> {
+    fn fill_batch(&mut self) -> Result<(), SnapshotBlockStoreError> {
         if self.read >= self.payload_len {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
-        self.sector.fill(0);
+        let remaining = self.payload_len - self.read;
+        let sectors = remaining.div_ceil(self.sector_size).min(READ_BATCH_SECTORS);
+        let bytes = sectors * self.sector_size;
+        self.batch[..bytes].fill(0);
         self.dev
-            .read_sector(self.slot_base + 1 + self.sector_index, &mut self.sector)?;
-        self.sector_index += 1;
-        self.sector_offset = 0;
-        self.sector_valid = (self.payload_len - self.read).min(self.sector_size);
+            .read_sectors(self.slot_base + 1 + self.sector_index, &mut self.batch[..bytes])?;
+        self.sector_index += sectors as u64;
+        self.batch_offset = 0;
+        self.batch_valid = remaining.min(bytes);
         Ok(())
     }
 
@@ -1374,14 +1466,14 @@ impl<D: SnapshotBlockDevice> SnapshotPayloadReader for PayloadSectorReader<'_, D
             return Err(SnapshotBlockStoreError::Corrupt);
         }
         while !out.is_empty() {
-            if self.sector_offset == self.sector_valid {
-                self.fill_sector()?;
+            if self.batch_offset == self.batch_valid {
+                self.fill_batch()?;
             }
-            let copy = out.len().min(self.sector_valid - self.sector_offset);
-            let bytes = &self.sector[self.sector_offset..self.sector_offset + copy];
+            let copy = out.len().min(self.batch_valid - self.batch_offset);
+            let bytes = &self.batch[self.batch_offset..self.batch_offset + copy];
             self.crc.update(bytes);
             out[..copy].copy_from_slice(bytes);
-            self.sector_offset += copy;
+            self.batch_offset += copy;
             self.read += copy;
             out = &mut out[copy..];
         }

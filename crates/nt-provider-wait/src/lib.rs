@@ -13,6 +13,7 @@ mod arbiter;
 mod domain;
 mod kernel_activation;
 mod local_event;
+mod local_sync;
 mod local_timer;
 mod stack_activation;
 mod stack_publication;
@@ -25,6 +26,7 @@ pub use arbiter::*;
 pub use domain::*;
 pub use kernel_activation::*;
 pub use local_event::*;
+pub use local_sync::*;
 pub use local_timer::*;
 pub use nt_component_suspension::{
     LaneHandle, SuspensionCaller, SuspensionHostedClient, SuspensionOwner as ProviderWaitOwner,

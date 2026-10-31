@@ -21,22 +21,44 @@ use nt_security::TokenId;
 
 pub mod dbgk;
 pub mod job;
+pub mod kernel_job_body;
 pub mod job_abi;
 mod initial_system;
 mod initial_thread_creation;
 mod fresh_hosted_thread;
+#[cfg(test)]
+mod kernel_process_exports_tests;
 pub use fresh_hosted_thread::FreshHostedThreadPreparation;
 #[cfg(test)]
 mod fresh_hosted_thread_tests;
 pub use initial_thread_creation::InitialThreadCreationPlan;
 pub mod native_handle;
+mod native_font_mitigation;
+mod native_object_handle_flags;
+mod native_peb_state;
+mod native_priority_class;
+mod native_priority_by_class;
+mod native_thread_priority;
+pub use native_priority_by_class::{ProcessPriorityByClassPlan, ProcessPriorityQuantumPolicy, ProcessSchedulingState, ThreadSchedulingState};
+pub use native_thread_priority::KernelThreadPriorityPlan;
+mod process_session;
+mod native_wow64_state;
+#[cfg(test)]
+mod native_font_mitigation_tests;
+#[cfg(test)]
+mod native_peb_state_tests;
+#[cfg(test)]
+mod native_wow64_state_tests;
 pub mod native_handle_search;
 mod native_section_file_source;
 mod native_section_handle;
+pub mod native_alpc_port;
 mod registry_key_handle;
 mod object_directory_handle;
 mod routed_file_handle;
 pub mod process_object_retirement;
+mod process_exit_notify;
+pub use process_exit_notify::{ProcessExitNotification, ProcessExitNotifyOwner};
 pub mod thread_suspend;
 mod thread_termination_port;
 pub use thread_termination_port::{ThreadTerminationPortPhase, ThreadTerminationPortSnapshot, ThreadTerminationPortTicket};
@@ -260,7 +282,7 @@ impl ThreadLifetime {
     }
 }
 
-/// Broker-owned reference to one exact LPC port object. This is deliberately distinct from a
+/// Broker-owned reference to one exact port object. This is deliberately distinct from a
 /// process-local user handle: it remains valid after that handle table entry is closed and must be
 /// returned to the broker during process teardown.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -679,9 +701,21 @@ pub struct NtProcess {
     /// Terminal Services session identity reported by
     /// `NtQueryInformationProcess(ProcessSessionInformation)`.
     pub session_id: u32,
+    /// MM session-space provenance. The numeric ProcessSessionInformation value alone cannot
+    /// distinguish an unattached process from a member of session zero.
+    session_space: Option<u32>,
+    /// The session manager's leader designation survives detachment of its session space.
+    session_leader: bool,
     pub image_file_name: String,
     pub address_space_id: AddressSpaceId,
+    /// Nonreused creation identity returned by PsGetProcessSequenceNumber.
+    creation_sequence: u64,
     pub image_section: Option<SectionId>,
+    /// Architecture proven by a parsed process image; absent for unadmitted image-less processes.
+    architecture_proof: Option<native_wow64_state::ProcessArchitectureProof>,
+    /// Creation-time ProcessFontDisablePolicy. No mutation is accepted until class 52 has an
+    /// exact captured input contract, so new processes retain the NT default (no restriction).
+    font_disable_policy_flags: u32,
     pub threads: ThreadIdSet,
     pub main_thread: Option<ThreadId>,
     initial_creation: initial_thread_creation::InitialThreadCreationState,
@@ -721,6 +755,10 @@ pub struct NtProcess {
     affinity_mask: u64,
     /// `KPROCESS.BasePriority`, surfaced through `ProcessBasicInformation`.
     base_priority: i32,
+    /// `KPROCESS.QuantumReset`; zero until an admitted scheduler policy sets it.
+    quantum_reset: u8,
+    /// `EPROCESS.Vm.Flags.MemoryPriority`; creation begins at background priority.
+    memory_priority: u8,
     /// `EPROCESS.PriorityClass`. ReactOS initializes new processes to NORMAL (2).
     priority_class: u8,
     /// Foreground/background priority mode carried by `PROCESS_PRIORITY_CLASS.Foreground` and
@@ -752,6 +790,36 @@ pub struct NtProcess {
     next_handle_reservation_generation: u64,
 }
 
+/// Ps-owned values needed by kernel exports for one exact process identity.
+/// Native adapters resolve and retain the EPROCESS body before looking up its PID; this view
+/// borrows the authoritative process state and never owns or fabricates native object pointers.
+#[derive(Debug, PartialEq, Eq)]
+pub struct KernelProcessExportState<'a> {
+    pub image_file_name: &'a str,
+    pub peb_base_address: u64,
+    pub session_id: u32,
+    pub priority_class: u8,
+    pub foreground: bool,
+    pub job: Option<job::JobId>,
+}
+
+impl KernelProcessExportState<'_> {
+    /// The stable, NUL-terminated `EPROCESS.ImageFileName[16]` value for an ASCII basename.
+    /// The native owner copies these bytes into its EPROCESS body. Non-ASCII names need the
+    /// active ANSI code page, which belongs to NLS rather than the Process Manager.
+    pub fn eprocess_image_file_name(&self) -> Option<[u8; 16]> {
+        let basename = self.image_file_name.rsplit('\\').next()?;
+        if !basename.is_ascii() {
+            return None;
+        }
+        let mut field = [0; 16];
+        let bytes = basename.as_bytes();
+        let len = bytes.len().min(field.len() - 1);
+        field[..len].copy_from_slice(&bytes[..len]);
+        Some(field)
+    }
+}
+
 /// References returned by the Process Manager's EPROCESS delete procedure. Their backing stores
 /// live outside this crate, so the executive releases them after the policy object is no longer
 /// reachable. Job membership is released internally because Ps owns both sides of that relation.
@@ -771,6 +839,8 @@ pub struct ProcessObjectDeletion {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProcessObjectDeleteBlockers {
     pub state: Option<ProcessState>,
+    /// Pending or in-flight kernel process-exit callbacks retain this EPROCESS.
+    pub process_exit_notifications: usize,
     pub process_wait_references: u32,
     pub process_kernel_pointer_references: u32,
     pub debug_port_present: bool,
@@ -789,18 +859,25 @@ pub struct ProcessObjectDeleteBlockers {
 }
 
 impl ProcessObjectDeleteBlockers {
-    pub const fn delete_ready(self) -> bool {
+    /// Terminated execution has no remaining process-owned activity. Object Manager references
+    /// may still keep the signaled EPROCESS and ETHREAD objects alive after this point.
+    pub const fn execution_retirement_ready(self) -> bool {
         matches!(self.state, Some(ProcessState::Terminated))
-            && self.process_wait_references == 0
-            && self.process_kernel_pointer_references == 0
+            && self.process_exit_notifications == 0
             && !self.debug_port_present
             && self.own_handle_slots == 0
-            && self.external_process_handles == 0
             && self.missing_threads == 0
             && self.live_threads == 0
+            && self.thread_termination_ports == 0
+    }
+
+    pub const fn delete_ready(self) -> bool {
+        self.execution_retirement_ready()
+            && self.process_wait_references == 0
+            && self.process_kernel_pointer_references == 0
+            && self.external_process_handles == 0
             && self.thread_wait_references == 0
             && self.thread_kernel_pointer_references == 0
-            && self.thread_termination_ports == 0
             && self.external_thread_handles == 0
     }
 }
@@ -873,6 +950,9 @@ pub enum HandleObject {
     RegistryKey(u32),
     /// Executive-owned object-directory identity; Ps owns only the typed handle reference.
     ObjectDirectory(u64),
+    /// A native dynamic object body registered with Object Manager. The generation prevents a
+    /// recycled pool address from inheriting an older handle's authority.
+    DynamicObject { body: u64, generation: u64 },
     /// A process primary access token. The id is the owning process id.
     Token(ProcessId),
     /// A stable, independently owned token object.
@@ -881,6 +961,15 @@ pub enum HandleObject {
     DebugObject(DebugObjectId),
     /// A Process Manager job object.
     Job(job::JobId),
+    /// A process-owned ALPC listen handle backed by the port service. The
+    /// invocation token and process incarnation remain attached to NtClose.
+    AlpcPort {
+        service_handle: u64,
+        kind: native_alpc_port::AlpcPortKind,
+        owner_generation: u64,
+        invocation_hi: u64,
+        invocation_lo: u64,
+    },
     /// An object the executive still models ad-hoc (port/event/file/token/key/…) during the
     /// process-hosting convergence — the handle-table entry is real (per-process, closable) even
     /// though the target isn't yet an `nt-process` object. The `u64` is the executive's opaque tag.
@@ -1031,6 +1120,14 @@ pub struct NtThread {
     priority: i32,
     /// `KTHREAD.BasePriority`.
     base_priority: i32,
+    /// `KTHREAD.QuantumReset`; inherited from the owning process on thread activation.
+    quantum_reset: u8,
+    /// Signed `KTHREAD.Quantum`, replenished from QuantumReset on a priority transition.
+    quantum: i8,
+    /// Signed dynamic boost still outstanding in `KTHREAD.PriorityDecrement`.
+    priority_decrement: i8,
+    /// Signed `KTHREAD.Saturation`: zero, positive ceiling, or negative floor.
+    saturation: i8,
     /// `KTHREAD.IdealProcessor`.
     ideal_processor: u64,
     /// `ThreadBreakOnTermination`, initially clear and not inherited from the process.
@@ -1121,6 +1218,8 @@ pub struct Win32Callouts {
 /// The Process Manager: processes, threads, and image sections (spec §5, §9-§13).
 #[derive(Default)]
 pub struct ProcessManager {
+    /// Move-stable owner identity for prepared process scheduler transitions.
+    priority_plan_manager_identity: u64,
     /// Lazily assigned, move-stable identity for suspend-control plans.
     suspend_manager_identity: u64,
     /// Move-stable owner identity for exact queued user-APC claims.
@@ -1133,6 +1232,8 @@ pub struct ProcessManager {
     routed_file_publication_identity: u64,
     /// Move-stable owner identity for staged Section handle publication.
     section_publication_identity: u64,
+    /// Move-stable owner identity for exact ALPC port handle publication.
+    alpc_publication_identity: u64,
     processes: IdTable<NtProcess>,
     threads: IdTable<NtThread>,
     /// Withdrawn Ps objects remain owned until their exact cleanup ticket is finished.
@@ -1140,12 +1241,15 @@ pub struct ProcessManager {
     sections: Vec<Option<ImageSection>>,
     next_cid: u32,
     next_asid: u32,
+    next_process_sequence: u64,
     /// win32k's registered callouts (`PsEstablishWin32Callouts`), once attached.
     win32_callouts: Option<Win32Callouts>,
     /// The live `DEBUG_OBJECT` table (the user-mode debugging plane). See [`dbgk`].
     dbgk: DebugObjectStore,
     /// Ps job objects and their exact process membership, accounting, and limit policy.
     jobs: job::JobStore,
+    /// Provider callbacks have independent image and EPROCESS lifetime ownership.
+    process_exit_notify: process_exit_notify::ProcessExitNotifyLedger,
     /// One-time bootstrap designation with counted process/thread reference ownership.
     initial_system: Option<initial_system::InitialSystemRoot>,
     /// The IMAGE views mapped into each process — the modelled `PEB->Ldr` module list. A `pid` of
@@ -1166,9 +1270,47 @@ impl ProcessManager {
         ProcessManager {
             next_cid: FIRST_CLIENT_ID, // cid 0 is reserved; allocation does not designate System.
             next_asid: 1,
+            next_process_sequence: 1,
             module_limit: DEFAULT_TRACKED_MODULES,
             ..Default::default()
         }
+    }
+
+    /// Whether any provider process-exit callback is currently registered.
+    pub fn has_process_exit_notify_registrations(&self) -> bool {
+        self.process_exit_notify.has_registrations()
+    }
+
+    /// Admit a process-exit callback after the host proves `callback` belongs to the exact loaded
+    /// provider image instance. Registration keeps that image instance live until removal.
+    pub fn register_process_exit_notify(
+        &mut self,
+        owner: ProcessExitNotifyOwner,
+        callback: u64,
+    ) -> Result<(), u32> {
+        self.process_exit_notify.register(owner, callback)
+    }
+
+    /// Remove a callback only after all pending and in-flight invocations have completed.
+    pub fn unregister_process_exit_notify(
+        &mut self,
+        owner: ProcessExitNotifyOwner,
+        callback: u64,
+    ) -> Result<(), u32> {
+        self.process_exit_notify.unregister(owner, callback)
+    }
+
+    /// Claim a process-exit callout once. The host calls it at PASSIVE_LEVEL with the retained
+    /// EPROCESS pointer, PID, and a null `CreateInfo`, then completes this exact ticket.
+    pub fn take_process_exit_notification(&mut self) -> Option<ProcessExitNotification> {
+        self.process_exit_notify.take()
+    }
+
+    pub fn complete_process_exit_notification(
+        &mut self,
+        notification: ProcessExitNotification,
+    ) -> Result<(), u32> {
+        self.process_exit_notify.complete(notification)
     }
 
     /// Pre-allocate the module-tracking table for `capacity` IMAGE views and cap it there, so a
@@ -1274,6 +1416,10 @@ impl ProcessManager {
         let pid = allocate_client_id(&mut self.next_cid);
         let asid = self.next_asid;
         self.next_asid += 1;
+        let creation_sequence = self.next_process_sequence;
+        self.next_process_sequence = creation_sequence
+            .checked_add(1)
+            .expect("nt-process creation sequence exhausted");
         let state = if image_section.is_some() {
             ProcessState::Ready // image already laid out
         } else {
@@ -1287,6 +1433,9 @@ impl ProcessManager {
             .and_then(|pid| self.processes.get(&pid))
             .map(|process| process.session_id)
             .unwrap_or(0);
+        let session_space = parent
+            .and_then(|pid| self.processes.get(&pid))
+            .and_then(|process| process.session_space);
         let affinity_mask = parent
             .and_then(|pid| self.processes.get(&pid))
             .map(|process| process.affinity_mask)
@@ -1299,6 +1448,9 @@ impl ProcessManager {
             .and_then(|pid| self.processes.get(&pid))
             .map(|process| process.priority_class)
             .unwrap_or(PROCESS_PRIORITY_CLASS_NORMAL);
+        let architecture_proof = image_section
+            .and_then(|section| self.image_section(section))
+            .map(|_| native_wow64_state::ProcessArchitectureProof::Amd64Image);
         let foreground = parent
             .and_then(|pid| self.processes.get(&pid))
             .map(|process| process.foreground)
@@ -1309,9 +1461,14 @@ impl ProcessManager {
                 process_id: pid,
                 parent,
                 session_id,
+                session_space,
+                session_leader: false,
                 image_file_name: image_file_name.into(),
                 address_space_id: asid,
+                creation_sequence,
                 image_section,
+                architecture_proof,
+                font_disable_policy_flags: 0,
                 threads: ThreadIdSet::new(),
                 main_thread: None,
                 initial_creation: initial_thread_creation::InitialThreadCreationState::Unclaimed,
@@ -1330,6 +1487,8 @@ impl ProcessManager {
                 peb_base_address: 0,
                 affinity_mask,
                 base_priority,
+                quantum_reset: 0,
+                memory_priority: 0,
                 priority_class,
                 foreground,
                 exception_port_endpoint: None,
@@ -1712,6 +1871,24 @@ impl ProcessManager {
     pub fn process(&self, pid: ProcessId) -> Option<&NtProcess> {
         self.processes.get(&pid)
     }
+
+    /// Project PsGetProcess* export values from the process manager's authoritative state.
+    /// Job membership lives in the job store, so callers must not infer it from EPROCESS bytes.
+    pub fn kernel_process_export_state(
+        &self,
+        pid: ProcessId,
+    ) -> Option<KernelProcessExportState<'_>> {
+        let process = self.process(pid)?;
+        Some(KernelProcessExportState {
+            image_file_name: &process.image_file_name,
+            peb_base_address: process.peb_base_address,
+            session_id: process.session_id,
+            priority_class: process.priority_class,
+            foreground: process.foreground,
+            job: self.jobs.job_for_process(pid),
+        })
+    }
+
     /// Return the initialized per-process pointer cookie, or zero before its first query.
     pub fn process_cookie(&self, pid: ProcessId) -> Option<u32> {
         self.processes
@@ -2105,11 +2282,14 @@ impl ProcessManager {
         }
         let affinity_mask = proc.affinity_mask;
         let base_priority = proc.base_priority;
+        let quantum_reset = proc.quantum_reset;
         let tid = self.next_cid;
-        let thread = NtThread::try_construct(
+        let mut thread = NtThread::try_construct(
             tid, pid, start_address, parameter, is_system_thread, state,
             affinity_mask, base_priority,
         )?;
+        thread.quantum_reset = quantum_reset;
+        thread.quantum = quantum_reset as i8;
         let allocated = allocate_client_id(&mut self.next_cid);
         debug_assert_eq!(allocated, tid);
         proc.threads.insert(tid);
@@ -2193,6 +2373,7 @@ impl ProcessManager {
     fn can_publish_process_kernel_object(&self, pid: ProcessId, eprocess: u64) -> bool {
         if eprocess == 0
             || self.retired_kernel_body_is_reserved(eprocess)
+            || self.jobs.reserves_kernel_object(eprocess)
             || self.processes.iter().any(|(&owner, process)| {
                 owner != pid && process.kernel_process_object == Some(eprocess)
             })
@@ -2222,6 +2403,18 @@ impl ProcessManager {
         self.processes.iter().find_map(|(&pid, process)| {
             (process.kernel_process_object == Some(eprocess)).then_some(pid)
         })
+    }
+
+    /// Return the creation identity of the exact live process owning this published EPROCESS.
+    /// A PID, retired body, or unpublished pointer cannot authorize the lookup.
+    pub fn process_sequence_for_kernel_process_object(&self, eprocess: u64) -> Result<u64, u32> {
+        let pid = self
+            .pid_for_kernel_process_object(eprocess)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        self.processes
+            .get(&pid)
+            .map(|process| process.creation_sequence)
+            .ok_or(STATUS_INVALID_HANDLE)
     }
 
     /// Resolve an `EPROCESS` projection back to the Process Manager's live state.
@@ -2334,6 +2527,7 @@ impl ProcessManager {
     fn can_publish_thread_kernel_object(&self, tid: ThreadId, ethread: u64) -> bool {
         if ethread == 0
             || self.retired_kernel_body_is_reserved(ethread)
+            || self.jobs.reserves_kernel_object(ethread)
             || self.threads.iter().any(|(&owner, thread)| {
                 owner != tid && thread.kernel_thread_object == Some(ethread)
             })
@@ -2977,7 +3171,7 @@ impl ProcessManager {
         let pid = if handle == u64::MAX {
             caller_pid
         } else {
-            let handle = handle as Handle;
+            let handle = Handle::try_from(handle).map_err(|_| STATUS_INVALID_HANDLE)?;
             let pid = match self.lookup_handle(caller_pid, handle) {
                 Some(HandleObject::Process(pid)) => pid,
                 _ => return Err(STATUS_INVALID_HANDLE),
@@ -3338,6 +3532,7 @@ impl ProcessManager {
         }
         let affinity_mask = process.affinity_mask;
         let base_priority = process.base_priority;
+        let quantum_reset = process.quantum_reset;
         let reusable = match current.state {
             ThreadState::Initialized => {
                 current.wait_references == 0
@@ -3394,6 +3589,10 @@ impl ProcessManager {
         thread.affinity_mask = affinity_mask;
         thread.priority = base_priority;
         thread.base_priority = base_priority;
+        thread.quantum_reset = quantum_reset;
+        thread.quantum = quantum_reset as i8;
+        thread.priority_decrement = 0;
+        thread.saturation = 0;
         thread.ideal_processor = 0;
         thread.security_descriptor.clear();
         thread
@@ -3537,16 +3736,20 @@ impl ProcessManager {
         }
         // The last user-thread exit cascades into process termination. Check that boundary before
         // publishing this thread's exit, so a retained control on a system peer cannot split it.
-        if !target.is_system_thread
+        let last_user_thread = !target.is_system_thread
             && !self.threads.values().any(|other| {
                 other.thread_id != tid && other.process_id == target.process_id
                     && !other.is_system_thread
                     && !matches!(other.state, ThreadState::Initialized | ThreadState::Terminated)
-            })
+            });
+        if last_user_thread
             && (self.has_process_suspend_control(target.process_id)
                 || self.has_initial_thread_creation_pending(target.process_id))
         {
             return Err(STATUS_DEVICE_BUSY);
+        }
+        if last_user_thread && target.state != ThreadState::Terminated {
+            self.preflight_process_exit_notify(target.process_id)?;
         }
         let (pid, was_system, transitioned) = {
             let t = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
@@ -3643,15 +3846,21 @@ impl ProcessManager {
         if self.has_process_suspend_control(pid) || self.has_initial_thread_creation_pending(pid) {
             return Err(STATUS_DEVICE_BUSY);
         }
-        let (thread_count, section) = {
-            let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        let (thread_count, section, sequence, process_object) = {
+            let proc = self.processes.get(&pid).ok_or(STATUS_INVALID_HANDLE)?;
             if proc.state == ProcessState::Terminated {
                 return Ok(());
             }
+            (proc.threads.len(), proc.image_section, proc.creation_sequence,
+             proc.kernel_process_object.unwrap_or(0))
+        };
+        self.preflight_process_exit_notify(pid)?;
+        {
+            let proc = self.processes.get_mut(&pid).expect("preflight preserves process identity");
             proc.state = ProcessState::Terminated;
             proc.exit_status = Some(exit_status);
-            (proc.threads.len(), proc.image_section)
-        };
+        }
+        self.process_exit_notify.queue_exit(pid, sequence, process_object, exit_status);
         for index in 0..thread_count {
             let Some(tid) = self
                 .processes
@@ -3692,6 +3901,14 @@ impl ProcessManager {
             .unwrap_or(0);
         let _ = self.report_debug_message(pid, main, DbgKmMessage::ExitProcess { exit_status });
         Ok(())
+    }
+
+    fn preflight_process_exit_notify(&mut self, pid: ProcessId) -> Result<(), u32> {
+        let process = self.processes.get(&pid).ok_or(STATUS_INVALID_HANDLE)?;
+        if self.process_exit_notify.has_registrations() && process.kernel_process_object.is_none() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.process_exit_notify.preflight_exit()
     }
 
     /// ReactOS/NT `NtTerminateProcess(NULL, status)` suicide phase: terminate every other thread in
@@ -3809,6 +4026,33 @@ impl ProcessManager {
 
     pub fn job_exists(&self, id: job::JobId) -> bool {
         self.jobs.contains(id)
+    }
+
+    /// Bind the native PEJOB body to one exact live job in the shared kernel-object
+    /// pointer namespace. A second kind of object cannot claim the same body.
+    pub fn publish_job_kernel_object(&mut self, id: job::JobId, body: u64) -> bool {
+        if body == 0
+            || self.retired_kernel_body_is_reserved(body)
+            || self
+                .processes
+                .values()
+                .any(|process| process.kernel_process_object == Some(body))
+            || self
+                .threads
+                .values()
+                .any(|thread| thread.kernel_thread_object == Some(body))
+        {
+            return false;
+        }
+        self.jobs.publish_kernel_job_object(id, body)
+    }
+
+    pub fn job_kernel_object(&self, id: job::JobId) -> Option<u64> {
+        self.jobs.kernel_job_object(id)
+    }
+
+    pub fn job_for_kernel_object(&self, body: u64) -> Option<job::JobId> {
+        self.jobs.job_for_kernel_object(body)
     }
 
     pub fn release_job_handle(&mut self, id: job::JobId) -> Result<job::JobCloseAction, u32> {
@@ -3952,6 +4196,19 @@ impl ProcessManager {
         })
     }
 
+    /// Whether stopped execution can release its VM and slot while Object Manager references
+    /// still keep the terminated process and thread objects available to handle holders.
+    /// Pending debug events, exit callbacks, and process-owned activity still block retirement.
+    pub fn process_execution_retirement_ready(&mut self, pid: ProcessId) -> bool {
+        if self.has_process_suspend_control(pid) || self.has_initial_thread_creation_pending(pid) {
+            return false;
+        }
+        let _ = self.clear_deleted_process_debug_object_if_unreferenced(pid);
+        self.process_object_delete_blockers(pid).is_some_and(|blockers| {
+            blockers.execution_retirement_ready() && blockers.thread_impersonations == 0
+        })
+    }
+
     /// Whether only Ps-owned token/port references remain before the process delete procedure can
     /// run. The debug port is detached here once its final event has been continued.
     pub fn process_object_delete_ready(&mut self, pid: ProcessId) -> bool {
@@ -3973,6 +4230,8 @@ impl ProcessManager {
         let process = self.processes.get(&pid)?;
         let mut blockers = ProcessObjectDeleteBlockers {
             state: Some(process.state),
+            process_exit_notifications: self.process_exit_notify
+                .pending_for_process(pid, process.creation_sequence),
             process_wait_references: process.wait_references,
             process_kernel_pointer_references: process.kernel_pointer_references,
             debug_port_present: process.debug_port.is_some(),
@@ -5042,7 +5301,7 @@ impl ProcessManager {
             .enumerate()
             .filter_map(|(slot, entry)| entry.entry().map(|entry| (slot, entry)))
         {
-            if entry.flags.inherit {
+            if entry.flags.inherit && !matches!(entry.object, HandleObject::AlpcPort { .. }) {
                 inherited.push(InheritedHandle {
                     handle: slot_to_handle(slot),
                     object: entry.object,
@@ -5063,6 +5322,7 @@ impl ProcessManager {
         inherited: InheritedHandle,
     ) -> Result<Handle, u32> {
         match inherited.object {
+            HandleObject::AlpcPort { .. } => return Err(STATUS_ACCESS_DENIED),
             HandleObject::Process(target) if !self.processes.contains_key(&target) => {
                 return Err(STATUS_INVALID_HANDLE);
             }
@@ -5143,6 +5403,9 @@ impl ProcessManager {
             .get_mut(slot)
             .and_then(HandleSlot::entry_mut)
             .ok_or(STATUS_INVALID_HANDLE)?;
+        if flags.inherit && matches!(entry.object, HandleObject::AlpcPort { .. }) {
+            return Err(STATUS_ACCESS_DENIED);
+        }
         entry.flags = flags;
         Ok(())
     }
@@ -5274,6 +5537,9 @@ impl ProcessManager {
                 .ok_or(STATUS_INVALID_HANDLE)?;
             (e.object, e.granted_access, e.flags)
         };
+        if matches!(object, HandleObject::AlpcPort { .. }) {
+            return Err(STATUS_ACCESS_DENIED);
+        }
         let new_handle = self.insert_handle(dst_pid, object, desired_access.unwrap_or(access))?;
         self.set_handle_flags(dst_pid, new_handle, flags)?;
         Ok(new_handle)
@@ -5339,6 +5605,8 @@ mod thread_lifetime_tests;
 
 #[cfg(test)]
 mod kernel_object_publication_tests;
+#[cfg(test)]
+mod kernel_job_body_tests;
 
 #[cfg(test)]
 mod initial_thread_runtime_tests;

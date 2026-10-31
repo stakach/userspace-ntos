@@ -14,6 +14,9 @@ static NEXT_RECORD_ID: AtomicU64 = AtomicU64::new(1);
 #[path = "client_frame_storage.rs"]
 mod storage;
 use storage::RecordStorage;
+#[path = "client_frame_index.rs"]
+mod index;
+use index::FrameKeyIndex;
 
 fn allocate_record_id(counter: &AtomicU64) -> Result<u64, ClientFrameInsertError> {
     counter
@@ -108,6 +111,7 @@ pub struct ClientFrameRegistryStats {
 
 pub struct ClientFrameRegistry {
     records: RecordStorage,
+    index: FrameKeyIndex,
     #[cfg(test)]
     lookup_steps: core::cell::Cell<usize>,
     reclaiming: usize,
@@ -128,6 +132,7 @@ impl ClientFrameRegistry {
     pub const fn new() -> Self {
         Self {
             records: RecordStorage::new(),
+            index: FrameKeyIndex::new(),
             #[cfg(test)]
             lookup_steps: core::cell::Cell::new(0),
             reclaiming: 0,
@@ -147,7 +152,16 @@ impl ClientFrameRegistry {
 
     /// Reserve bounded backing chunks. Refusal may retain empty chunks but never changes owners.
     pub fn reserve_initial(&mut self, records: usize) -> bool {
-        if self.records.try_reserve(records).is_err() {
+        let reserved = self
+            .records
+            .len()
+            .checked_add(records)
+            .ok_or(())
+            .and_then(|needed| {
+                self.records.try_reserve(records)?;
+                self.index.try_reserve(&self.records, needed)
+            });
+        if reserved.is_err() {
             self.allocation_failures = self.allocation_failures.saturating_add(1);
             false
         } else {
@@ -156,13 +170,12 @@ impl ClientFrameRegistry {
     }
 
     fn index_for(&self, pi: u64, page: u64) -> Option<usize> {
-        self.records
-            .iter()
-            .position(|record| {
-                #[cfg(test)]
-                self.lookup_steps.set(self.lookup_steps.get() + 1);
-                record.pi == pi && record.page == page
-            })
+        let (entry, probes) = self.index.find(&self.records, pi, page);
+        #[cfg(test)]
+        self.lookup_steps.set(self.lookup_steps.get() + probes);
+        #[cfg(not(test))]
+        let _ = probes;
+        entry.map(|(_, index)| index)
     }
 
     pub fn insert(
@@ -311,6 +324,14 @@ impl ClientFrameRegistry {
             self.allocation_failures = self.allocation_failures.saturating_add(1);
             return Err(ClientFrameInsertError::AllocationFailed);
         }
+        if self
+            .index
+            .try_reserve(&self.records, self.records.len() + 1)
+            .is_err()
+        {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
+            return Err(ClientFrameInsertError::AllocationFailed);
+        }
         let record_id = allocate_record_id(&NEXT_RECORD_ID).map_err(|error| {
             self.identity_exhaustions = self.identity_exhaustions.saturating_add(1);
             error
@@ -319,6 +340,7 @@ impl ClientFrameRegistry {
         if grew {
             self.growths = self.growths.saturating_add(1);
         }
+        let index = self.records.len();
         self.records.push(ClientFrameRecord {
             record_id,
             pi,
@@ -334,6 +356,7 @@ impl ClientFrameRegistry {
             cleanup: None,
             transfer_id: None,
         });
+        self.index.insert(pi, page, index);
         self.next_age = self.next_age.max(age.saturating_add(1));
         self.high_water = self.high_water.max(self.records.len());
         Ok(ClientFrameInsert::Inserted { grew })
@@ -375,7 +398,7 @@ impl ClientFrameRegistry {
         if self.records[index].is_reclaiming() {
             return None;
         }
-        Some(self.records.swap_remove(index))
+        Some(self.swap_remove_index(index))
     }
 
     pub fn take_for(
@@ -393,7 +416,7 @@ impl ClientFrameRegistry {
         if self.records[index] != expected || self.records[index].is_reclaiming() {
             return None;
         }
-        Some(self.records.swap_remove(index))
+        Some(self.swap_remove_index(index))
     }
 
     fn exact_mut(&mut self, expected: ClientFrameRecord) -> Option<&mut ClientFrameRecord> {
@@ -402,6 +425,11 @@ impl ClientFrameRegistry {
             return None;
         }
         Some(&mut self.records[index])
+    }
+
+    /// Keep the key index in sync with the dense row moved by swap removal.
+    fn swap_remove_index(&mut self, index: usize) -> ClientFrameRecord {
+        self.index.swap_remove(&mut self.records, index)
     }
 
     pub fn first_page_for_process(&self, pi: u64) -> Option<u64> {
@@ -600,6 +628,83 @@ mod tests {
         assert_eq!(registry.get(3, 0x2000).unwrap().frame, 0x44);
         assert_eq!(registry.next_page_after(2, 0x1000), Some(0x3000));
         assert_eq!(registry.first_page_for_process(3), Some(0x2000));
+    }
+
+    #[test]
+    fn exact_lookup_stays_bounded_after_growth_and_swap_removal() {
+        let mut registry = ClientFrameRegistry::new();
+        for n in 0..4096u64 {
+            insert(&mut registry, 7 + (n % 3), 0x1000 + n * 0x1000, 0x100 + n);
+        }
+        let last_page = 0x1000 + 4095 * 0x1000;
+        let before = registry.lookup_steps.get();
+        assert_eq!(registry.get(7, last_page + 0x1000), None);
+        assert_eq!(
+            registry.get(7, 0x1000 + 4092 * 0x1000).unwrap().frame,
+            0x100 + 4092
+        );
+        assert!(registry.lookup_steps.get() - before <= 32);
+
+        let removed = registry.take(7, 0x1000).unwrap();
+        assert_eq!(removed.frame, 0x100);
+        assert!(registry.get(7, 0x1000).is_none());
+        assert_eq!(registry.get(7, last_page).unwrap().frame, 0x100 + 4095);
+        insert(&mut registry, 7, 0x1000, 0x9000);
+        assert_eq!(registry.get(7, 0x1000).unwrap().frame, 0x9000);
+        assert_eq!(registry.take_exact(removed), None);
+    }
+
+    #[test]
+    fn exact_lookup_survives_chunk_crossing_churn_and_key_reuse() {
+        let mut registry = ClientFrameRegistry::new();
+        for n in 0..700u64 {
+            insert(&mut registry, 9 + n % 3, 0x1000 + n * 0x1000, 0x1000 + n);
+        }
+        let stale = registry.get(9, 0x1000).unwrap();
+
+        // Retire rows from the front while swap removal repeatedly moves rows across chunks.
+        for n in 0..600u64 {
+            let pi = 9 + n % 3;
+            let page = 0x1000 + n * 0x1000;
+            assert_eq!(registry.take(pi, page).unwrap().frame, 0x1000 + n);
+            assert_eq!(registry.get(pi, page), None);
+        }
+        for n in 700..1700u64 {
+            insert(&mut registry, 9 + n % 3, 0x1000 + n * 0x1000, 0x1000 + n);
+        }
+
+        // Reuse one key with identical public metadata. Its old record ID is still stale.
+        registry
+            .insert_at_age(
+                9,
+                MEMORY_PROCESS,
+                0x1000,
+                stale.frame,
+                0,
+                0,
+                0,
+                true,
+                stale.age,
+            )
+            .unwrap();
+        assert_eq!(registry.take_exact(stale), None);
+        for n in 1..600u64 {
+            insert(&mut registry, 9 + n % 3, 0x1000 + n * 0x1000, 0x9000 + n);
+        }
+
+        assert_eq!(registry.len(), 1700);
+        for n in 0..1700u64 {
+            let pi = 9 + n % 3;
+            let page = 0x1000 + n * 0x1000;
+            let expected = if n == 0 {
+                stale.frame
+            } else if n < 600 {
+                0x9000 + n
+            } else {
+                0x1000 + n
+            };
+            assert_eq!(registry.get(pi, page).unwrap().frame, expected);
+        }
     }
 
     #[test]

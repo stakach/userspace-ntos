@@ -4,6 +4,7 @@ use super::*;
 mod event_poll;
 
 const MESSAGE_INFO: u64 = (0x785 << 12) | 4;
+const WIN32K_ATOM_MESSAGE_INFO: u64 = (0x77e << 12) | 2;
 
 struct Fixture {
     pm: ProcessManager,
@@ -83,6 +84,44 @@ fn exact_envelope_requires_and_preserves_live_kernel_activation() {
         f.lanes.phase(f.caller.dispatch.lane()),
         Ok(LanePhase::Running)
     );
+}
+
+#[test]
+fn win32k_atom_call_requires_exact_running_kernel_activation_envelope() {
+    let mut f = Fixture::new();
+    let atom = KernelProviderServiceEnvelope {
+        message_info: WIN32K_ATOM_MESSAGE_INFO,
+        ..f.envelope()
+    };
+    let validate = |f: &Fixture, envelope| {
+        f.activations.validate_service_call(
+            f.caller,
+            &f.pm,
+            &f.catalog,
+            &f.lanes,
+            envelope,
+            WIN32K_ATOM_MESSAGE_INFO,
+        )
+    };
+    assert_eq!(validate(&f, atom), Ok(()));
+    for altered in [
+        KernelProviderServiceEnvelope { badge: 1, ..atom },
+        KernelProviderServiceEnvelope { reply_cap: atom.reply_cap + 1, ..atom },
+        KernelProviderServiceEnvelope { message_info: atom.message_info ^ 1, ..atom },
+    ] {
+        assert_eq!(validate(&f, altered), Err(STATUS_INVALID_PARAMETER));
+    }
+    let lane = f.caller.dispatch.lane();
+    let reply = f.caller.current_binding(&f.lanes).unwrap().reply_object;
+    f.lanes.suspend_running(lane, reply, 91).unwrap();
+    assert_eq!(validate(&f, atom), Err(STATUS_INVALID_HANDLE));
+    f.lanes.resume_external(lane, reply, 91).unwrap();
+    assert_eq!(validate(&f, atom), Ok(()));
+    let mut completed = Fixture::new();
+    completed.activations
+        .record_completion(completed.caller, &completed.pm, &completed.catalog, &mut completed.lanes, 0)
+        .unwrap();
+    assert_eq!(validate(&completed, atom), Err(STATUS_INVALID_HANDLE));
 }
 
 #[test]

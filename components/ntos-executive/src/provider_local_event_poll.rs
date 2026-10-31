@@ -22,6 +22,7 @@ impl LocalEventState<'_> {
             backing: NativeEventBacking {
                 objects: self.obj_ns,
                 file_completion: None,
+                pm: None,
             },
             access: Some(access),
         };

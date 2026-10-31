@@ -43,13 +43,13 @@ pub fn module_export_descriptor(module: &str, name: &str) -> Option<&'static Exp
     })
 }
 
-/// The 11 `ntoskrnl.exe` **data exports** win32k dereferences at init, in cell-index order.
+/// The declared `ntoskrnl.exe` **data exports** win32k dereferences, in cell-index order.
 /// Each resolves to a data *cell* (not a code trampoline): the IAT slot points at the cell, which
-/// holds the value (an object-type/Se/Nls placeholder pointer, or an architectural Mm boundary
-/// constant). The executive folds these into the [`Win32kExportRegistry`] by binding each name to
+/// holds the value (an object-type/Se/Nls pointer, mapped KUSER alias, or an architectural Mm
+/// boundary constant). The executive folds these into the [`Win32kExportRegistry`] by binding each name to
 /// its cell address; this list is the declared, host-tested contract of *which* names are data
-/// exports and their order. The six object-type cells (`Ps*Type`, `Ex*ObjectType`,
-/// `LpcPortObjectType`) now resolve to **real** `nt_object_manager::object_type` `OBJECT_TYPE`
+/// exports and their order. The object-type cells resolve to **real**
+/// `nt_object_manager::object_type` `OBJECT_TYPE`
 /// statics (implement-for-real backlog item 1, done). `SeExports` (a security-export struct, the
 /// Se->nt-security backlog item) and `NlsMbCodePageTag` (genuine Nls code-page data) remain
 /// placeholder cells and are NOT object types.
@@ -65,6 +65,9 @@ pub const WIN32K_DATA_EXPORTS: &[&str] = &[
     "MmSystemRangeStart",
     "MmUserProbeAddress",
     "MmHighestUserAddress",
+    "MmSectionObjectType",
+    "PsJobType",
+    "MmWriteableSharedUserData",
 ];
 
 #[cfg(test)]
@@ -218,7 +221,7 @@ mod tests {
 
     #[test]
     fn data_exports_are_declared_data_exports() {
-        assert_eq!(WIN32K_DATA_EXPORTS.len(), 11);
+        assert_eq!(WIN32K_DATA_EXPORTS.len(), 14);
         for name in WIN32K_DATA_EXPORTS {
             let d = export_descriptor(name)
                 .unwrap_or_else(|| panic!("data export {name} is not declared"));

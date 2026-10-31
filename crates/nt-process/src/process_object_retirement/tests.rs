@@ -23,6 +23,64 @@ fn terminate(pm: &mut ProcessManager, pid: ProcessId) {
 }
 
 #[test]
+fn provider_exit_callback_retains_throwaway_process_until_exact_delivery_completes() {
+    let (mut pm, pid, _) = fixture();
+    let owner = crate::ProcessExitNotifyOwner {
+        image_base: 0x1000_0000,
+        image_generation: 1,
+    };
+    pm.register_process_exit_notify(owner, 0x1000_1000).unwrap();
+    pm.terminate_process(pid, 0).unwrap();
+
+    assert_eq!(pm.process_object_delete_blockers(pid).unwrap().process_exit_notifications, 1);
+    assert!(!pm.process_object_delete_ready(pid));
+    assert_eq!(pm.withdraw_process_object_if_unreferenced(pid).unwrap_err(), STATUS_PENDING);
+
+    let delivery = pm.take_process_exit_notification().expect("provider receives exit event");
+    assert_eq!(delivery.process_id, pid);
+    assert_eq!(delivery.process_object, 0x3000);
+    assert_eq!(delivery.callback, 0x1000_1000);
+    assert_eq!(pm.withdraw_process_object_if_unreferenced(pid).unwrap_err(), STATUS_PENDING);
+    pm.complete_process_exit_notification(delivery).unwrap();
+
+    assert_eq!(pm.process_object_delete_blockers(pid).unwrap().process_exit_notifications, 0);
+    let ticket = pm.withdraw_process_object_if_unreferenced(pid).unwrap();
+    assert_eq!(ticket.pid(), pid);
+    pm.finish_process_object_retirement(ticket).unwrap();
+}
+
+#[test]
+fn failed_provider_exit_callback_keeps_its_ticket_in_flight_and_process_unretired() {
+    let (mut pm, pid, _) = fixture();
+    pm.register_process_exit_notify(
+        crate::ProcessExitNotifyOwner { image_base: 0x2000_0000, image_generation: 1 },
+        0x2000_1000,
+    ).unwrap();
+    pm.terminate_process(pid, 0).unwrap();
+
+    let attempted = pm.take_process_exit_notification().expect("one exact callback attempt");
+    // The host got an uncertain provider result. It cannot acknowledge, retry, or retire.
+    assert!(pm.take_process_exit_notification().is_none());
+    assert_eq!(pm.process_object_delete_blockers(pid).unwrap().process_exit_notifications, 1);
+    assert_eq!(pm.withdraw_process_object_if_unreferenced(pid).unwrap_err(), STATUS_PENDING);
+    assert_eq!(attempted.process_id, pid);
+}
+
+#[test]
+fn synthetic_fixture_can_observe_live_process_exit_callback_registration() {
+    let mut pm = ProcessManager::new();
+    let owner = crate::ProcessExitNotifyOwner {
+        image_base: 0x3000_0000,
+        image_generation: 1,
+    };
+    assert!(!pm.has_process_exit_notify_registrations());
+    pm.register_process_exit_notify(owner, 0x3000_1000).unwrap();
+    assert!(pm.has_process_exit_notify_registrations());
+    pm.unregister_process_exit_notify(owner, 0x3000_1000).unwrap();
+    assert!(!pm.has_process_exit_notify_registrations());
+}
+
+#[test]
 fn withdrawal_removes_all_public_identity_but_keeps_exact_metadata() {
     let (mut pm, pid, tid) = fixture();
     let lifetime = pm.thread_lifetime(tid).unwrap();

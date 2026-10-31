@@ -4,6 +4,10 @@ use super::*;
 use nt_io_manager::pending_irp_graph::captured::{CapturedGraph, GraphRoles, PreparedInventory};
 use nt_io_manager::pending_irp_graph::GraphReleaseKind;
 use nt_io_manager::retained_query_path_forward::SourceIrpTicket;
+use nt_io_manager::scsi_source_retention::{
+    ScsiSourceChildren, ScsiSourceRetentionLedger,
+};
+use nt_io_manager::scsi_srb_transport::{ScsiSrbRoute, WDM_X64_LEGACY_SRB_SIZE};
 use nt_io_manager::source_irp_auxiliary::{
     SourceIrpAuxiliary, SourceIrpAuxiliaryError, SourceIrpAuxiliaryLedger, SourceIrpAuxiliaryPhase,
     SourceIrpCompletionOwner, SourceMdlAllocationIdentity, SourceMemoryIdentity,
@@ -21,7 +25,20 @@ use nt_io_manager::start_io_native_owner::{
 static LOCK: AtomicU64 = AtomicU64::new(0);
 static mut LEDGER: SourceIrpLedger = SourceIrpLedger::new();
 static mut AUXILIARY: SourceIrpAuxiliaryLedger = SourceIrpAuxiliaryLedger::new();
+static mut SCSI_CHILDREN: ScsiSourceRetentionLedger = ScsiSourceRetentionLedger::new();
 static mut CALLER_PROJECTIONS: Option<Vec<CallerProjection>> = None;
+static mut CALLER_ACKS: Option<Vec<CallerTerminalAck>> = None;
+
+#[derive(Clone, Copy)]
+struct CallerTerminalAck {
+    ticket: SourceIrpTicket,
+    owner: SourceIrpOwner,
+}
+
+fn caller_acks() -> &'static mut Vec<CallerTerminalAck> {
+    let slot = unsafe { &mut *core::ptr::addr_of_mut!(CALLER_ACKS) };
+    slot.get_or_insert_with(Vec::new)
+}
 
 struct CallerProjection {
     ticket: SourceIrpTicket,
@@ -31,6 +48,7 @@ struct CallerProjection {
     canonical_irp_id: u64,
     graph: CapturedGraph,
     terminal_started: bool,
+    terminal_finished: bool,
     released_members: u16,
     replacement: Option<SourcePoolAllocationIdentity>,
     replacement_released: bool,
@@ -69,7 +87,201 @@ fn auxiliary() -> &'static mut SourceIrpAuxiliaryLedger {
     unsafe { &mut *core::ptr::addr_of_mut!(AUXILIARY) }
 }
 
-unsafe fn pool_range_identity_unlocked(
+fn scsi_children() -> &'static mut ScsiSourceRetentionLedger {
+    // Serialized by the source-IRP ownership lock, including free and MDL-release admission.
+    unsafe { &mut *core::ptr::addr_of_mut!(SCSI_CHILDREN) }
+}
+
+/// Capture every independently allocated source object and register its free guard under the
+/// same source/pool locks. There is no window in which a copied SRB can be freed and reused
+/// before retention becomes visible to ExFreePool/MmFreePagesFromMdl.
+pub(super) fn capture_scsi_children(
+    instance_index: usize,
+    source: SourceIrpAllocation,
+    ticket: SourceIrpTicket,
+    target_device: u64,
+    route: ScsiSrbRoute,
+) -> Option<(ScsiSourceChildren, Vec<u8>, Option<Vec<u8>>, Vec<u8>, Option<Vec<u8>>)> {
+    let _guard = lock();
+    let inst = instance(instance_index)?;
+    if source.domain != ticket.domain
+        || instance_domain_identity(inst) != Some(source.domain)
+        || !ledger().admits_forward(ticket, source)
+    { return None; }
+    let _pool_guard = unsafe { hosted_instance_pool_lock(inst.exec_pool_va)? };
+    let mut current = allocation_unlocked(instance_index, inst,
+        source.component_address, source.bytes, source.stack_count)?;
+    current.owner = source.owner;
+    if current != source { return None; }
+    let irp_exec = unsafe { hosted_pool_allocation_exec_va(
+        inst.exec_pool_va, source.component_address, source.bytes,
+    )? };
+    let irp = unsafe { read_unaligned(irp_exec as *const nt_kernel_abi::Irp) };
+    let stack_address = hosted_source_irp_stack::next_stack_address(source, &irp)?;
+    let stack_exec = irp_exec.checked_add(stack_address.checked_sub(source.component_address)?)?;
+    let stack_bytes = unsafe { core::slice::from_raw_parts(
+        stack_exec as *const u8, WDM_X64_IO_STACK_LOCATION_SIZE,
+    ) };
+    let stack = nt_io_manager::decode_wdm_kernel_built_scsi_stack(stack_bytes).ok()?;
+    let nt_io_manager::WdmIoStackParameters::Scsi { srb: srb_address } = stack.parameters
+    else { return None };
+    if stack.device_object != target_device || stack.file_object != 0
+        || irp.associated_irp_system_buffer.0 != 0 || irp.user_buffer.0 != 0
+    { return None; }
+    let srb_identity = unsafe { exact_pool_identity_unlocked(
+        inst, srb_address, WDM_X64_LEGACY_SRB_SIZE as u64,
+    )? };
+    let srb_exec = inst.exec_pool_va.checked_add(srb_address.checked_sub(FSD_POOL_VADDR)?)?;
+    let srb_slice = unsafe { core::slice::from_raw_parts(
+        srb_exec as *const u8, WDM_X64_LEGACY_SRB_SIZE,
+    ) };
+    if u16::from_le_bytes(srb_slice[..2].try_into().ok()?) as usize != WDM_X64_LEGACY_SRB_SIZE {
+        return None;
+    }
+    // A chained SRB requires a separately owned and bounded graph; the native lane only
+    // supports one legacy request block.
+    if u64::from_le_bytes(srb_slice[0x28..0x30].try_into().ok()?) != 0 { return None; }
+    let sense_length = srb_slice[0x0b];
+    let sense_address = u64::from_le_bytes(srb_slice[0x20..0x28].try_into().ok()?);
+    let (sense_identity, sense_bytes) = if sense_length == 0 {
+        (None, None)
+    } else {
+        let identity = unsafe { exact_pool_identity_unlocked(
+            inst, sense_address, u64::from(sense_length),
+        )? };
+        let sense_exec = inst.exec_pool_va.checked_add(sense_address.checked_sub(FSD_POOL_VADDR)?)?;
+        let sense_slice = unsafe { core::slice::from_raw_parts(
+            sense_exec as *const u8, usize::from(sense_length),
+        ) };
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(usize::from(sense_length)).ok()?;
+        bytes.extend_from_slice(sense_slice);
+        (Some(identity), Some(bytes))
+    };
+    let transfer_length = u32::from_le_bytes(srb_slice[0x10..0x14].try_into().ok()?);
+    let data_address = u64::from_le_bytes(srb_slice[0x18..0x20].try_into().ok()?);
+    let (mdl_identity, mdl_bytes, data_identity, data_bytes) = if transfer_length == 0 {
+        if irp.mdl_address.0 != 0 { return None; }
+        (None, None, None, Vec::new())
+    } else {
+        let mdl_address = irp.mdl_address.0;
+        if mdl_address == 0 || data_address == 0 { return None; }
+        let (mdl_identity, mapped_address) = unsafe {
+            mdl_identity_unlocked(inst, source.domain, mdl_address, transfer_length)?
+        };
+        if mapped_address != data_address { return None; }
+        let mdl_exec = inst.exec_pool_va.checked_add(mdl_address.checked_sub(FSD_POOL_VADDR)?)?;
+        let mdl_slice = unsafe { core::slice::from_raw_parts(
+            mdl_exec as *const u8, nt_mdl::MDL_SIZE,
+        ) };
+        let mdl_count = u32::from_le_bytes(
+            mdl_slice[nt_mdl::MDL_OFF_BYTE_COUNT as usize
+                ..nt_mdl::MDL_OFF_BYTE_COUNT as usize + 4].try_into().ok()?,
+        );
+        if mdl_count < transfer_length { return None; }
+        let data_allocation = unsafe { pool_range_identity_unlocked(
+            inst, data_address, u64::from(transfer_length),
+        )? };
+        let data_exec = inst.exec_pool_va.checked_add(data_address.checked_sub(FSD_POOL_VADDR)?)?;
+        let data_slice = unsafe { core::slice::from_raw_parts(data_exec as *const u8,
+            transfer_length as usize) };
+        let mut data = Vec::new();
+        data.try_reserve_exact(transfer_length as usize).ok()?;
+        data.extend_from_slice(data_slice);
+        let mut mdl = Vec::new();
+        mdl.try_reserve_exact(nt_mdl::MDL_SIZE).ok()?;
+        mdl.extend_from_slice(mdl_slice);
+        (Some(mdl_identity), Some(mdl), Some(SourceMemoryIdentity::Pool {
+            allocation: data_allocation,
+            component_address: data_address,
+            bytes: u64::from(transfer_length),
+        }), data)
+    };
+    let mut srb = Vec::new();
+    srb.try_reserve_exact(WDM_X64_LEGACY_SRB_SIZE).ok()?;
+    srb.extend_from_slice(srb_slice);
+    let children = ScsiSourceChildren {
+        source, ticket, route, srb: srb_identity, sense: sense_identity,
+        sense_length, mdl: mdl_identity,
+        data: data_identity, transfer_length,
+    };
+    scsi_children().retain(children).ok()?;
+    Some((children, srb, mdl_bytes, data_bytes, sense_bytes))
+}
+
+pub(super) fn scsi_children_match_current(
+    instance_index: usize, children: ScsiSourceChildren,
+) -> bool {
+    let _guard = lock();
+    if !scsi_children().contains_exact(children)
+        || !ledger().admits_forward(children.ticket, children.source)
+    { return false; }
+    let Some(inst) = instance(instance_index) else { return false; };
+    if instance_domain_identity(inst) != Some(children.source.domain) { return false; }
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        return false;
+    };
+    let mut observed = unsafe { allocation_unlocked(instance_index, inst,
+        children.source.component_address, children.source.bytes, children.source.stack_count) };
+    if let Some(source) = observed.as_mut() { source.owner = children.source.owner; }
+    observed == Some(children.source)
+        && unsafe { exact_pool_identity_unlocked(inst, children.srb.component_address, 0x58) }
+            == Some(children.srb)
+        && children.sense.is_none_or(|sense| unsafe {
+            exact_pool_identity_unlocked(inst, sense.component_address,
+                u64::from(children.sense_length)) == Some(sense)
+        })
+        && children.mdl.is_none_or(|mdl| unsafe {
+            mdl_identity_matches_unlocked(inst, children.source.domain, mdl)
+        })
+        && children.data.is_none_or(|data| unsafe {
+            memory_identity_matches_unlocked(instance_index, inst, data)
+        })
+}
+
+pub(super) fn abandon_scsi_children(children: ScsiSourceChildren) -> bool {
+    let _guard = lock();
+    scsi_children().abandon_prepared(children).is_ok()
+}
+
+pub(super) fn scsi_children_enter(children: ScsiSourceChildren, provider_irp: IrpId) -> bool {
+    let _guard = lock();
+    scsi_children().enter(children, provider_irp).is_ok()
+}
+
+pub(super) fn scsi_children_pending(children: ScsiSourceChildren, provider_irp: IrpId) -> bool {
+    let _guard = lock();
+    scsi_children().pending(children, provider_irp).is_ok()
+}
+
+pub(super) fn scsi_children_uncertain(children: ScsiSourceChildren, provider_irp: IrpId) -> bool {
+    let _guard = lock();
+    scsi_children().uncertain(children, provider_irp).is_ok()
+}
+
+pub(super) fn scsi_children_terminal(children: ScsiSourceChildren, provider_irp: IrpId) -> bool {
+    let _guard = lock();
+    scsi_children().terminal(children, provider_irp).is_ok()
+}
+
+pub(super) fn scsi_children_acknowledge(children: ScsiSourceChildren, provider_irp: IrpId) -> bool {
+    let _guard = lock();
+    scsi_children().acknowledge(children, provider_irp).is_ok()
+}
+
+pub(super) fn scsi_children_source_completed(
+    children: ScsiSourceChildren, provider_irp: IrpId,
+) -> bool {
+    let _guard = lock();
+    scsi_children().source_completed(children, provider_irp).is_ok()
+}
+
+pub(super) fn release_scsi_children(children: ScsiSourceChildren) -> bool {
+    let _guard = lock();
+    scsi_children().release(children).is_ok()
+}
+
+pub(super) unsafe fn pool_range_identity_unlocked(
     inst: DriverInstance,
     component_address: u64,
     bytes: u64,
@@ -106,7 +318,7 @@ unsafe fn pool_range_identity_unlocked(
     })
 }
 
-unsafe fn exact_pool_identity_unlocked(
+pub(super) unsafe fn exact_pool_identity_unlocked(
     inst: DriverInstance,
     component_address: u64,
     bytes: u64,
@@ -308,6 +520,7 @@ unsafe fn capture_auxiliary_unlocked(
     expected_thread: u64,
     ticket: SourceIrpTicket,
     source: SourceIrpAllocation,
+    wmi_registration: Option<nt_io_manager::HostedDevicePointerRegistration>,
 ) -> Option<SourceIrpAuxiliary> {
     let irp =
         hosted_pool_allocation_exec_va(inst.exec_pool_va, source.component_address, source.bytes)?;
@@ -330,6 +543,8 @@ unsafe fn capture_auxiliary_unlocked(
     }
     let stack = irp + source.bytes - WDM_X64_IO_STACK_LOCATION_SIZE as u64;
     let major = read_unaligned(stack as *const u8);
+    let minor = read_unaligned((stack + 1) as *const u8);
+    let wmi_reginfo = major == major::IRP_MJ_SYSTEM_CONTROL && minor == 8;
     if !matches!(
         major,
         major::IRP_MJ_READ
@@ -338,12 +553,13 @@ unsafe fn capture_auxiliary_unlocked(
             | major::IRP_MJ_SHUTDOWN
             | major::IRP_MJ_PNP
             | major::IRP_MJ_POWER
-    ) {
+    ) && !wmi_reginfo {
         return None;
     }
     let transfer = matches!(major, major::IRP_MJ_READ | major::IRP_MJ_WRITE);
-    let length = if transfer {
-        read_unaligned((stack + 0x08) as *const u32)
+    let length = if transfer || wmi_reginfo {
+        let length_offset = if wmi_reginfo { 0x18 } else { 0x08 };
+        read_unaligned((stack + length_offset) as *const u32)
     } else {
         0
     };
@@ -354,6 +570,24 @@ unsafe fn capture_auxiliary_unlocked(
     if system_address != 0 && mdl_address != 0 {
         return None;
     }
+    if wmi_reginfo {
+        let wmi_provider_id = read_unaligned((stack + 0x08) as *const u64);
+        let wmi_data_path = read_unaligned((stack + 0x10) as *const u64);
+        let wmi_buffer = read_unaligned((stack + 0x20) as *const u64);
+        let device_object = read_unaligned((stack + 0x28) as *const u64);
+        if length < 24 || flags != (IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER)
+            || mdl_address != 0 || user_buffer != 0
+            || system_address == 0 || wmi_buffer == 0
+            || wmi_buffer != system_address || wmi_provider_id != device_object
+            || wmi_data_path != 0
+            || !wmi_registration.is_some_and(|registration| {
+                registration.domain() == source.domain
+                    && registration.address() == device_object
+            })
+        {
+            return None;
+        }
+    }
 
     let system_buffer = if system_address != 0 {
         let expected = IRP_BUFFERED_IO
@@ -363,7 +597,7 @@ unsafe fn capture_auxiliary_unlocked(
             } else {
                 0
             };
-        if !transfer || length == 0 || flags != expected {
+        if length == 0 || (!wmi_reginfo && (!transfer || flags != expected)) {
             return None;
         }
         Some(exact_pool_identity_unlocked(
@@ -397,7 +631,9 @@ unsafe fn capture_auxiliary_unlocked(
     if transfer && length != 0 && transfer_address.is_none() {
         return None;
     }
-    if !transfer && (flags != 0 || system_address != 0 || mdl_address != 0 || user_buffer != 0) {
+    if !transfer && !wmi_reginfo
+        && (flags != 0 || system_address != 0 || mdl_address != 0 || user_buffer != 0)
+    {
         return None;
     }
     let transfer_buffer = transfer_address.and_then(|address| {
@@ -468,6 +704,28 @@ unsafe fn capture_auxiliary_unlocked(
             iosb,
         },
     })
+}
+
+/// A registered source IRP keeps its allocation live. This address is only a
+/// selector for the physical catalog, never authority: capture rechecks the
+/// stack under catalog and pool locks before admitting the source packet.
+unsafe fn wmi_device_selector(inst: DriverInstance, source: SourceIrpAllocation) -> u64 {
+    if source.bytes < WDM_X64_IO_STACK_LOCATION_SIZE as u64 {
+        return 0;
+    }
+    let Some(irp) = hosted_pool_allocation_exec_va(
+        inst.exec_pool_va, source.component_address, source.bytes,
+    ) else {
+        return 0;
+    };
+    let stack = irp + source.bytes - WDM_X64_IO_STACK_LOCATION_SIZE as u64;
+    if read_unaligned(stack as *const u8) == major::IRP_MJ_SYSTEM_CONTROL
+        && read_unaligned((stack + 1) as *const u8) == 8
+    {
+        read_unaligned((stack + 0x28) as *const u64)
+    } else {
+        0
+    }
 }
 
 unsafe fn auxiliary_matches_unlocked(
@@ -694,6 +952,12 @@ pub(super) fn retire_allocation(
     {
         return (STATUS_INVALID_HANDLE, 0, 0);
     }
+    if op == 3 && unsafe {
+        hosted_driver_dynamic_type::owns_type_allocation(instance_index, component_address)
+            || hosted_driver_dynamic_type::owns_object_allocation(instance_index, component_address)
+    } {
+        return (nt_status::NtStatus::DELETE_PENDING.raw(), 0, 0);
+    }
     let _guard = lock();
     let _projection_guard = match hosted_device_allocations::generic_free_admission(inst, component_address) {
         Ok(guard) => guard,
@@ -711,8 +975,19 @@ pub(super) fn retire_allocation(
             domain,
             component_address,
         )
+        || op == 3 && scsi_children().protects_pool(
+            SourceIrpOwner::HostedDriver(instance_index), domain, component_address,
+        )
     {
         return (nt_status::NtStatus::PENDING.raw(), 0, 0);
+    }
+    let mutex_pool = if op == 3 {
+        unsafe { exact_pool_identity_unlocked(inst, component_address, 1) }
+            .map(|identity| (identity.component_address, identity.pool_generation))
+    } else { None };
+    if mutex_pool.is_some_and(|pool| !hosted_driver_kmutex::pool_free_admission(domain, pool)
+        || !hosted_driver_guarded_mutex::pool_free_admission(domain, pool)) {
+        return (nt_status::NtStatus::DELETE_PENDING.raw(), 0, 0);
     }
     let owner = match ledger().pool_free_admission(instance_index, domain, component_address) {
         Ok(SourcePoolFreeAdmission::Unregistered) => {
@@ -721,6 +996,10 @@ pub(super) fn retire_allocation(
                     == Some(false)
                 && unsafe { hosted_instance_pool_free_unlocked(inst, component_address) }
             {
+                if let Some(pool) = mutex_pool {
+                    hosted_driver_kmutex::pool_freed(domain, pool);
+                    hosted_driver_guarded_mutex::pool_freed(domain, pool);
+                }
                 (STATUS_SUCCESS, 0, 0)
             } else {
                 (STATUS_INVALID_HANDLE, 0, 0)
@@ -740,6 +1019,10 @@ pub(super) fn retire_allocation(
         Ok(SourceIrpRetirement::Retired(ticket)) => {
             if !unsafe { hosted_instance_pool_free_unlocked(inst, component_address) } {
                 return (STATUS_INVALID_HANDLE, 0, 0);
+            }
+            if let Some(pool) = mutex_pool {
+                hosted_driver_kmutex::pool_freed(domain, pool);
+                hosted_driver_guarded_mutex::pool_freed(domain, pool);
             }
             if ledger().retire(ticket, owner).is_err() {
                 unsafe {
@@ -768,6 +1051,248 @@ pub(super) fn retire_allocation(
     }
 }
 
+fn begin_local_completion(
+    instance_index: usize,
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    component_address: u64,
+) -> (i32, u64, u64) {
+    let _guard = lock();
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    let Some((ticket, source)) = ledger().registered(
+        SourceIrpOwner::HostedDriver(instance_index),
+        domain,
+        component_address,
+    ) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    let Ok((owner, phase)) = auxiliary().snapshot(ticket, source) else {
+        return (nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw(), 0, 0);
+    };
+    if phase != SourceIrpAuxiliaryPhase::Protected
+        || !unsafe { auxiliary_matches_unlocked(instance_index, inst, owner, phase) }
+    {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    }
+    match auxiliary().begin_completion(ticket, source) {
+        Ok(owner) => (
+            STATUS_SUCCESS,
+            owner.transfer_buffer.map_or(0, memory_bytes),
+            ticket.generation.get(),
+        ),
+        Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
+    }
+}
+
+/// Called only after the arena broker authenticated the live IRQ lane and service grant.
+/// The same source ticket, allocation, and auxiliary phase checks govern ordinary callers.
+pub(super) fn begin_irq_local_completion(
+    instance_index: usize,
+    domain_id: u64,
+    domain_cookie: u64,
+    component_address: u64,
+) -> (i32, u64, u64) {
+    let Some(inst) = instance(instance_index) else { return (STATUS_INVALID_HANDLE, 0, 0); };
+    let Some(domain) = instance_domain_identity(inst) else { return (STATUS_INVALID_HANDLE, 0, 0); };
+    if domain.domain_id.raw() != domain_id || domain.cookie != domain_cookie {
+        return (STATUS_ACCESS_DENIED, 0, 0);
+    }
+    begin_local_completion(instance_index, inst, domain, component_address)
+}
+
+/// Commit `IoInitializeIrp`/`IoReuseIrp` in the provider's mapped pool while the
+/// physical allocation and every source owner are serialized. The caller's pointer
+/// selects storage only; exact allocation identity and ownership are rederived here.
+fn mutate_local_irp_packet(
+    instance_index: usize,
+    inst: DriverInstance,
+    operation: u64,
+    irp: u64,
+    argument: u64,
+    flags: u64,
+) -> (i32, u64, u64) {
+    let initialize = operation == hosted_irp_lifecycle_exports::INITIALIZE;
+    if irp == 0 || irp & 15 != 0 {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    }
+    let (stack_count, apc_environment) = if initialize {
+        if flags & !0xffff != 0 || argument > u16::MAX as u64 {
+            return (STATUS_INVALID_PARAMETER, 0, 0);
+        }
+        (flags as u8, (flags >> 8) as u8)
+    } else {
+        if flags > 1 || argument > u32::MAX as u64 {
+            return (STATUS_INVALID_PARAMETER, 0, 0);
+        }
+        (0, flags as u8)
+    };
+    if apc_environment > 1 {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    }
+    let Some(domain) = instance_domain_identity(inst) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    let _source_guard = lock();
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    let Some(identity) = (unsafe {
+        exact_pool_identity_unlocked(inst, irp, WDM_X64_IRP_SIZE as u64)
+    }) else {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    };
+    let Some(header_exec) = (unsafe {
+        hosted_pool_allocation_exec_va(inst.exec_pool_va, irp, WDM_X64_IRP_SIZE as u64)
+    }) else {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    };
+    let (packet_size, stack_count) = if initialize {
+        (argument as u16, stack_count)
+    } else {
+        unsafe {
+            (read_unaligned((header_exec + 2) as *const u16),
+                read_unaligned((header_exec + WDM_X64_IRP_STACK_COUNT_OFFSET) as *const u8))
+        }
+    };
+    if packet_size as usize > identity.capacity as usize
+        || (packet_size as usize) < WDM_X64_IRP_SIZE
+        || !(1..=32).contains(&stack_count)
+        || caller_projections().iter().any(|row| {
+            row.allocation.domain == domain
+                && row.allocation.component_address == irp
+        })
+    {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    }
+    match ledger().pool_free_admission(instance_index, domain, irp) {
+        Ok(SourcePoolFreeAdmission::Unregistered) => {},
+        Ok(SourcePoolFreeAdmission::DriverOwned(owner)) => {
+            let Some((ticket, registered)) = ledger().registered(
+                SourceIrpOwner::HostedDriver(instance_index), domain, irp,
+            ) else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            if registered != owner || owner.pool_generation != identity.pool_generation
+                || owner.bytes != packet_size as u64 || owner.stack_count != stack_count
+                || ledger().mutation_ready(ticket, owner).is_err()
+                || auxiliary().snapshot(ticket, owner).is_ok()
+            {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            }
+        }
+        Ok(SourcePoolFreeAdmission::Protected(_)) | Err(_) => {
+            return (STATUS_INVALID_HANDLE, 0, 0);
+        }
+    }
+    let Some(exec) = (unsafe {
+        hosted_pool_allocation_exec_va(inst.exec_pool_va, irp, u64::from(packet_size))
+    }) else {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    };
+    let packet = unsafe { core::slice::from_raw_parts_mut(exec as *mut u8, usize::from(packet_size)) };
+    let result = if initialize {
+        nt_io_manager::initialize_wdm_irp_packet(
+            packet, irp, packet_size, stack_count, apc_environment,
+        )
+    } else {
+        nt_io_manager::reuse_wdm_irp_packet(
+            packet, irp, argument as u32 as i32, false, apc_environment,
+        )
+    };
+    match result {
+        Ok(()) => (STATUS_SUCCESS, 0, 0),
+        Err(_) => (STATUS_INVALID_PARAMETER, 0, 0),
+    }
+}
+
+/// Perform the void export's effect under every owner that can retire or recycle
+/// its source packet and requestor ETHREAD. The address arguments select candidates
+/// only; the source ticket, physical pool generation, canonical PM, and device
+/// registry establish authority.
+fn set_hard_error_or_verify_device(
+    instance_index: usize,
+    inst: DriverInstance,
+    irp: u64,
+    device: u64,
+) -> (i32, u64, u64) {
+    let Some(domain) = instance_domain_identity(inst) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    let _source_guard = lock();
+    match hosted_device_allocations::with_live_verify_device_registration(
+        inst, domain, device,
+        |registration| set_hard_error_or_verify_device_locked(
+            instance_index, inst, domain, irp, device, registration,
+        ),
+    ) {
+        Ok(result) => result,
+        Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
+    }
+}
+
+// The source, allocation catalog, and pool locks remain held by the caller. A canonical
+// retirement cannot invalidate this exact registration before the ETHREAD write completes.
+fn set_hard_error_or_verify_device_locked(
+    instance_index: usize,
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    irp: u64,
+    device: u64,
+    registration: Option<nt_io_manager::HostedDevicePointerRegistration>,
+) -> (i32, u64, u64) {
+    let source_registration = [
+        SourceIrpOwner::HostedDriver(instance_index),
+        SourceIrpOwner::HostedCaller(instance_index),
+    ].into_iter().find_map(|owner| ledger().registered(owner, domain, irp));
+    let Some((ticket, allocation)) = source_registration else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    let Some(current) = allocation_unlocked(
+        instance_index, inst, irp, allocation.bytes, allocation.stack_count,
+    ) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    if current.pool_generation != allocation.pool_generation
+        || current.domain != domain
+        || !matches!(allocation.owner,
+            SourceIrpOwner::HostedDriver(_) | SourceIrpOwner::HostedCaller(_))
+    {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    }
+    let Some(source) = SourceIrpForwardIdentity::new(ticket, allocation) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    let Some(exec) = (unsafe {
+        hosted_pool_allocation_exec_va(inst.exec_pool_va, irp, WDM_X64_IRP_SIZE as u64)
+    }) else {
+        return (STATUS_INVALID_HANDLE, 0, 0);
+    };
+    // IRP.Tail.Overlay.Thread is at +0x98 in the hosted AMD64 WDM projection.
+    let irp_thread = unsafe { read_unaligned((exec + 0x98) as *const u64) };
+    let result = unsafe { crate::service_sec_image::with_provider_process_manager(|pm| {
+        let canonical_thread = pm.tid_for_kernel_thread_object(irp_thread)
+            .and_then(|tid| pm.thread_lifetime(tid).filter(|lifetime| {
+                pm.validate_thread_lifetime(*lifetime)
+                    && pm.thread_kernel_object(tid) == Some(irp_thread)
+            }))
+            .map(|_| irp_thread);
+        let write = nt_io_manager::hard_error_verify_device::plan_hard_error_verify_device(
+            ledger(), source, irp_thread, canonical_thread, device,
+            registration.map(|registration| registration.device_id()),
+        ).map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+        if let Some((thread, _)) = write {
+            crate::ps_object_backing::set_thread_device_to_verify(pm, thread, registration)?;
+        }
+        Ok(())
+    }) };
+    match result {
+        Ok(()) => (STATUS_SUCCESS, 0, 0),
+        Err(status) => (status as i32, 0, 0),
+    }
+}
+
 pub(super) fn service(
     ch: &crate::spawn_hosts::PumpChannel,
     op: u64,
@@ -784,6 +1309,16 @@ pub(super) fn service(
         return (STATUS_INVALID_HANDLE, 0, 0);
     }
     match op {
+        14 if stack_count == 0 => {
+            if hosted_driver_caller(instance_index, inst, caller_badge).is_none() {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            }
+            set_hard_error_or_verify_device(instance_index, inst, component_address, bytes)
+        }
+        hosted_irp_lifecycle_exports::INITIALIZE | hosted_irp_lifecycle_exports::REUSE =>
+            mutate_local_irp_packet(
+                instance_index, inst, op, component_address, bytes, stack_count,
+            ),
         1 => {
             let Some(stack_count) = u8::try_from(stack_count).ok() else {
                 return (STATUS_INVALID_PARAMETER, 0, 0);
@@ -819,10 +1354,6 @@ pub(super) fn service(
                 _ => return (STATUS_INVALID_HANDLE, 0, 0),
             };
             let _guard = lock();
-            let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) })
-            else {
-                return (STATUS_INVALID_HANDLE, 0, 0);
-            };
             let Some((ticket, source)) = ledger().registered(
                 SourceIrpOwner::HostedDriver(instance_index),
                 domain,
@@ -830,25 +1361,31 @@ pub(super) fn service(
             ) else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
-            let Some(owner) = (unsafe {
-                capture_auxiliary_unlocked(
-                    instance_index,
-                    inst,
-                    &caller,
-                    expected_thread,
-                    ticket,
-                    source,
-                )
-            }) else {
-                return (STATUS_INVALID_PARAMETER, 0, 0);
-            };
-            match auxiliary().register(owner) {
-                Ok(()) => (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get()),
-                Err(SourceIrpAuxiliaryError::NoCapacity) => (STATUS_INSUFFICIENT_RESOURCES, 0, 0),
-                Err(SourceIrpAuxiliaryError::AlreadyLive) => {
-                    (nt_status::NtStatus::OBJECT_NAME_COLLISION.raw(), 0, 0)
-                }
-                Err(_) => (STATUS_INVALID_PARAMETER, 0, 0),
+            let selector = unsafe { wmi_device_selector(inst, source) };
+            match hosted_device_allocations::with_live_verify_device_registration(
+                inst, domain, selector, |registration| {
+                    let Some(owner) = (unsafe {
+                        capture_auxiliary_unlocked(
+                            instance_index, inst, &caller, expected_thread, ticket, source,
+                            registration,
+                        )
+                    }) else {
+                        return (STATUS_INVALID_PARAMETER, 0, 0);
+                    };
+                    match auxiliary().register(owner) {
+                        Ok(()) => (STATUS_SUCCESS, ticket.id.get(), ticket.generation.get()),
+                        Err(SourceIrpAuxiliaryError::NoCapacity) => {
+                            (STATUS_INSUFFICIENT_RESOURCES, 0, 0)
+                        }
+                        Err(SourceIrpAuxiliaryError::AlreadyLive) => {
+                            (nt_status::NtStatus::OBJECT_NAME_COLLISION.raw(), 0, 0)
+                        }
+                        Err(_) => (STATUS_INVALID_PARAMETER, 0, 0),
+                    }
+                },
+            ) {
+                Ok(result) => result,
+                Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
             }
         }
         5 if bytes == 0 && stack_count == 0 => {
@@ -858,39 +1395,42 @@ pub(super) fn service(
             let Some(_caller) = hosted_driver_caller(instance_index, inst, caller_badge) else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
-            let _guard = lock();
-            let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) })
-            else {
-                return (STATUS_INVALID_HANDLE, 0, 0);
-            };
-            let Some((ticket, source)) = ledger().registered(
-                SourceIrpOwner::HostedDriver(instance_index),
-                domain,
-                component_address,
-            ) else {
-                return (STATUS_INVALID_HANDLE, 0, 0);
-            };
-            let Ok((owner, phase)) = auxiliary().snapshot(ticket, source) else {
-                return (nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw(), 0, 0);
-            };
-            if phase != SourceIrpAuxiliaryPhase::Protected
-                || !unsafe { auxiliary_matches_unlocked(instance_index, inst, owner, phase) }
-            {
-                return (STATUS_INVALID_HANDLE, 0, 0);
-            }
-            match auxiliary().begin_completion(ticket, source) {
-                Ok(owner) => (
-                    STATUS_SUCCESS,
-                    owner.transfer_buffer.map_or(0, memory_bytes),
-                    ticket.generation.get(),
-                ),
-                Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
-            }
+            begin_local_completion(instance_index, inst, domain, component_address)
         }
         2 | 3 if bytes == 0 && stack_count == 0 => {
             let Some(domain) = instance_domain_identity(inst) else {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
+            if op == 3 {
+                if let Some(status) = unsafe {
+                    hosted_dxg_registration::defer_allocation_cookie_free(
+                        ch, instance_index, inst, domain, component_address,
+                        caller_badge, active_reply_cap)
+                } {
+                    return (status, 0, 0);
+                }
+                if let Some(status) = unsafe {
+                    hosted_dxg_registration::defer_context_cookie_free(
+                        ch, instance_index, inst, domain, component_address,
+                        caller_badge, active_reply_cap)
+                } {
+                    return (status, 0, 0);
+                }
+                if let Some(status) = unsafe {
+                    hosted_dxg_registration::defer_device_cookie_free(
+                        ch, instance_index, inst, domain, component_address,
+                        caller_badge, active_reply_cap)
+                } {
+                    return (status, 0, 0);
+                }
+                if let Some(status) = unsafe {
+                    hosted_dxg_registration::defer_process_cookie_free(
+                        ch, instance_index, inst, domain, component_address,
+                        caller_badge, active_reply_cap)
+                } {
+                    return (status, 0, 0);
+                }
+            }
             retire_allocation(instance_index, inst, domain, op, component_address)
         }
         6 => {
@@ -951,6 +1491,7 @@ pub(super) fn service(
                 canonical_irp_id,
                 graph,
                 terminal_started: false,
+                terminal_finished: false,
                 released_members: 0,
                 replacement: None,
                 replacement_released: false,
@@ -999,6 +1540,64 @@ pub(super) fn service(
                 Ok(()) => (STATUS_SUCCESS, 0, 0),
                 Err(SourceIrpLedgerError::Pinned) => (STATUS_SUCCESS, 1, 0),
                 Err(_) => (STATUS_INVALID_HANDLE, 0, 0),
+            }
+        }
+        12 | 13 => {
+            let Some(domain) = instance_domain_identity(inst) else {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            };
+            let Some(ticket) = SourceIrpTicket::new(domain, component_address, bytes) else {
+                return (STATUS_INVALID_PARAMETER, 0, 0);
+            };
+            let _guard = lock();
+            let Some(index) = caller_projections().iter().position(|row| {
+                row.ticket == ticket
+                    && row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)
+                    && row.allocation.domain == domain
+            }) else {
+                // Only an exact consumed ticket authenticates a duplicate metadata ACK.
+                return if op == 13 && stack_count == 0 && caller_acks().iter().any(|ack|
+                    ack.ticket == ticket
+                        && ack.owner == SourceIrpOwner::HostedCaller(instance_index)) {
+                    (STATUS_SUCCESS, 0, 0)
+                } else {
+                    (STATUS_INVALID_HANDLE, 0, 0)
+                };
+            };
+            let row = &caller_projections()[index];
+            if op == 13 {
+                if stack_count != 0 || !row.terminal_finished {
+                    return (STATUS_INVALID_HANDLE, 0, 0);
+                }
+                let _durable = crate::allocator::enter_durable();
+                if caller_acks().try_reserve(1).is_err() {
+                    return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
+                }
+                caller_acks().push(CallerTerminalAck { ticket, owner: row.allocation.owner });
+                caller_projections().swap_remove(index);
+                return (STATUS_SUCCESS, 0, 0);
+            }
+            // Read-only receipt. Indices 0..10 address immutable initial members;
+            // 10 is the adopted replacement, 11 the terminal ledger effect, and 12 op7.
+            match stack_count {
+                0..=9 => {
+                    let Ok(member_index) = usize::try_from(stack_count) else {
+                        return (STATUS_INVALID_PARAMETER, 0, 0);
+                    };
+                    if member_index >= row.graph.initial_members().len() || !row.terminal_started {
+                        return (STATUS_INVALID_HANDLE, 0, 0);
+                    }
+                    (STATUS_SUCCESS, u64::from(row.released_members & (1u16 << member_index) != 0), 0)
+                }
+                10 if row.terminal_started && row.replacement.is_some() =>
+                    (STATUS_SUCCESS, u64::from(row.replacement_released), 0),
+                11 if row.terminal_started => (STATUS_SUCCESS, u64::from(row.terminal_finished), 0),
+                12 if row.terminal_started => (
+                    STATUS_SUCCESS,
+                    row.graph.initial_members().len() as u64,
+                    row.replacement.map_or(0, |identity| identity.component_address),
+                ),
+                _ => (STATUS_INVALID_HANDLE, 0, 0),
             }
         }
         7 | 8 | 9 | 10 => {
@@ -1187,10 +1786,11 @@ pub(super) fn service(
                 {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
-                row.released_members |= bit; // record ownership before the physical effect
                 if !unsafe { hosted_instance_pool_free_unlocked(inst, member_address) } {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
+                // A definite refusal leaves the captured member pending for exact retry.
+                row.released_members |= bit;
                 (STATUS_SUCCESS, 0, 0)
             } else if op == 10 {
                 let Some(row) = caller_projections().iter_mut().find(|candidate| {
@@ -1203,10 +1803,11 @@ pub(super) fn service(
                 {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
-                row.replacement_released = true; // terminal ownership before physical effect
                 if !unsafe { hosted_instance_pool_free_unlocked(inst, member_address) } {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
+                // The local free is synchronous under the source and pool locks.
+                row.replacement_released = true;
                 (STATUS_SUCCESS, 0, 0)
             } else {
                 let Some(row) = caller_projections().iter().find(|candidate| candidate.ticket == ticket)
@@ -1226,16 +1827,25 @@ pub(super) fn service(
                 {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
-                let index = caller_projections()
-                    .iter()
-                    .position(|candidate| candidate.ticket == ticket)
+                let row = caller_projections().iter_mut()
+                    .find(|candidate| candidate.ticket == ticket)
                     .expect("finished caller IRP lost its root-side projection receipt");
-                caller_projections().swap_remove(index);
+                row.terminal_finished = true;
                 (STATUS_SUCCESS, 0, 0)
             }
         }
         _ => (STATUS_INVALID_PARAMETER, 0, 0),
     }
+}
+
+pub(super) fn drain_caller_terminal_acks(instance_index: usize) -> Result<(), nt_status::NtStatus> {
+    let _guard = lock();
+    if caller_projections().iter().any(|row|
+        row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    caller_acks().retain(|ack| ack.owner != SourceIrpOwner::HostedCaller(instance_index));
+    Ok(())
 }
 
 /// Admit only an op6-published caller packet. This obtains real source and device pins, but it
@@ -1663,6 +2273,7 @@ pub(super) fn mdl_release_allowed(
 ) -> bool {
     let _guard = lock();
     !auxiliary().protected_pool_child(SourceIrpOwner::HostedDriver(instance_index), domain, mdl)
+        && !scsi_children().protects_mdl(SourceIrpOwner::HostedDriver(instance_index), domain, mdl)
 }
 
 pub(super) fn unpin(ticket: SourceIrpTicket) -> bool {

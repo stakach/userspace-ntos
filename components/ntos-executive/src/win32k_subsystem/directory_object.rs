@@ -96,9 +96,9 @@ unsafe fn capture_name(object_attributes: u64) -> Result<DirectoryName, i32> {
 
 /// The broker replies with exactly four words; unused words must be zero. A malformed reply may
 /// represent an uncertain native effect, so it cannot be converted to a retryable NTSTATUS.
-unsafe fn call(op: u64, first: u64, second: u64, third: u64, output: bool) -> (i32, u64) {
+unsafe fn call_with_label(label: u64, op: u64, first: u64, second: u64, third: u64, output: bool) -> (i32, u64) {
     let (info, raw, value, spare, reserved) =
-        crate::driver_launch::call_on4_raw((LABEL << 12) | 4, op, first, second, third);
+        crate::driver_launch::call_on4_raw((label << 12) | 4, op, first, second, third);
     let canonical_status = raw == raw as u32 as u64 || raw == raw as u32 as i32 as i64 as u64;
     if info != 4
         || !canonical_status
@@ -107,19 +107,24 @@ unsafe fn call(op: u64, first: u64, second: u64, third: u64, output: bool) -> (i
         || (!output && value != 0)
         || ((raw as u32 as i32) < 0 && value != 0)
     {
-        crate::provider_bugcheck::report(0xc4, [LABEL, op, info, raw]);
+        crate::provider_bugcheck::report(0xc4, [label, op, info, raw]);
     }
     (raw as u32 as i32, value)
 }
 
-unsafe fn abort(token: u64, handle: u64) {
-    let (status, _) = call(ABORT, token, handle, 0, false);
+unsafe fn call(op: u64, first: u64, second: u64, third: u64, output: bool) -> (i32, u64) {
+    call_with_label(LABEL, op, first, second, third, output)
+}
+
+unsafe fn abort_with_label(label: u64, token: u64, handle: u64) {
+    let (status, _) = call_with_label(label, ABORT, token, handle, 0, false);
     if status != 0 {
-        crate::provider_bugcheck::report(0xc4, [LABEL, ABORT, token, status as u32 as u64]);
+        crate::provider_bugcheck::report(0xc4, [label, ABORT, token, status as u32 as u64]);
     }
 }
 
 unsafe fn open_impl(
+    label: u64,
     handle_out: *mut u64,
     desired_access: u32,
     object_attributes: u64,
@@ -134,12 +139,12 @@ unsafe fn open_impl(
     };
     let operation = if create { BEGIN_CREATE } else { BEGIN_OPEN };
     let packed = (u64::from(name.attributes) << 32) | u64::from(desired_access);
-    let (status, token) = call(operation, name.root, packed, name.units as u64, true);
+    let (status, token) = call_with_label(label, operation, name.root, packed, name.units as u64, true);
     if status < 0 {
         return status;
     }
     if status != 0 || token == 0 {
-        crate::provider_bugcheck::report(0xc4, [LABEL, operation, token, status as u32 as u64]);
+        crate::provider_bugcheck::report(0xc4, [label, operation, token, status as u32 as u64]);
     }
 
     for offset in (0..name.units).step_by(4) {
@@ -149,32 +154,32 @@ unsafe fn open_impl(
             packed_units |= u64::from(name.text[offset + index]) << (index * 16);
         }
         let position = ((offset as u64) << 32) | count as u64;
-        let (status, _) = call(APPEND, token, position, packed_units, false);
+        let (status, _) = call_with_label(label, APPEND, token, position, packed_units, false);
         if status != 0 {
-            abort(token, 0);
+            abort_with_label(label, token, 0);
             return status;
         }
     }
 
-    let (commit_status, handle) = call(COMMIT, token, 0, 0, true);
+    let (commit_status, handle) = call_with_label(label, COMMIT, token, 0, 0, true);
     if commit_status < 0 {
-        abort(token, 0);
+        abort_with_label(label, token, 0);
         return commit_status;
     }
     if commit_status != 0 || handle == 0 {
-        abort(token, 0);
-        crate::provider_bugcheck::report(0xc4, [LABEL, COMMIT, token, commit_status as u32 as u64]);
+        abort_with_label(label, token, 0);
+        crate::provider_bugcheck::report(0xc4, [label, COMMIT, token, commit_status as u32 as u64]);
     }
     write_unaligned(handle_out, handle);
-    let (publish_status, _) = call(PUBLISH, token, handle, 0, false);
+    let (publish_status, _) = call_with_label(label, PUBLISH, token, handle, 0, false);
     if publish_status < 0 {
         write_unaligned(handle_out, 0);
-        abort(token, handle);
+        abort_with_label(label, token, handle);
         return publish_status;
     }
-    let (ack_status, _) = call(ACK, token, handle, 0, false);
+    let (ack_status, _) = call_with_label(label, ACK, token, handle, 0, false);
     if ack_status != 0 {
-        crate::provider_bugcheck::report(0xc4, [LABEL, ACK, token, ack_status as u32 as u64]);
+        crate::provider_bugcheck::report(0xc4, [label, ACK, token, ack_status as u32 as u64]);
     }
     publish_status
 }
@@ -184,7 +189,16 @@ pub(super) extern "win64" fn create(
     desired_access: u32,
     object_attributes: u64,
 ) -> i32 {
-    unsafe { open_impl(handle_out, desired_access, object_attributes, true) }
+    unsafe { open_impl(LABEL, handle_out, desired_access, object_attributes, true) }
+}
+
+pub(crate) fn create_with_label(
+    label: u64,
+    handle_out: *mut u64,
+    desired_access: u32,
+    object_attributes: u64,
+) -> i32 {
+    unsafe { open_impl(label, handle_out, desired_access, object_attributes, true) }
 }
 
 pub(super) extern "win64" fn open(
@@ -192,7 +206,7 @@ pub(super) extern "win64" fn open(
     desired_access: u32,
     object_attributes: u64,
 ) -> i32 {
-    unsafe { open_impl(handle_out, desired_access, object_attributes, false) }
+    unsafe { open_impl(LABEL, handle_out, desired_access, object_attributes, false) }
 }
 
 pub(super) unsafe fn close(handle: u64) -> i32 {

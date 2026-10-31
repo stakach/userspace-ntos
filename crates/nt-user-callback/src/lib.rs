@@ -1415,9 +1415,31 @@ impl ActiveCallbackClient {
     }
 }
 
+/// The callback's suspended dispatch owns these shared-page cells until its continuation
+/// finishes. A nested dispatch can overwrite the physical page while user code is running.
+pub const SHARED_CALLBACK_REQUEST_WORDS: usize = 38;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SharedCallbackPublication {
+    request: [u64; SHARED_CALLBACK_REQUEST_WORDS],
+    context: [u64; 6],
+}
+
+impl SharedCallbackPublication {
+    pub const fn new(request: [u64; SHARED_CALLBACK_REQUEST_WORDS], context: [u64; 6]) -> Self {
+        Self { request, context }
+    }
+
+    pub const fn request(&self) -> &[u64; SHARED_CALLBACK_REQUEST_WORDS] { &self.request }
+
+    pub const fn context(&self) -> &[u64; 6] { &self.context }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActiveCallbackFrame {
     request: CallbackHeader,
+    /// Root-owned lane transfer identity; the header's callback ID is local to a dispatch.
+    external_token: u64,
     client: ActiveCallbackClient,
     saved_user_context: [u64; 20],
     redirected: bool,
@@ -1425,6 +1447,7 @@ pub struct ActiveCallbackFrame {
     dispatch_context: DispatchContext,
     arg_snapshot_len: u32,
     arg_snapshot: [u8; DISPATCH_ARG_SNAPSHOT_BYTES],
+    shared_publication: Option<SharedCallbackPublication>,
     /// The executive-bridged `CLIENTINFO.CallbackWnd` triple published for THIS frame
     /// (`hWnd`, client `PWND`, `pActCtx`); `[0]  == 0` means nothing was bridged.
     bridged_window: [u64; 3],
@@ -1434,6 +1457,7 @@ impl ActiveCallbackFrame {
     const fn empty() -> Self {
         Self {
             request: CallbackHeader::idle(0, 0, 0, 0),
+            external_token: 0,
             client: ActiveCallbackClient::empty(),
             saved_user_context: [0; 20],
             redirected: false,
@@ -1441,6 +1465,7 @@ impl ActiveCallbackFrame {
             dispatch_context: DispatchContext::EMPTY,
             arg_snapshot_len: 0,
             arg_snapshot: [0; DISPATCH_ARG_SNAPSHOT_BYTES],
+            shared_publication: None,
             bridged_window: [0; 3],
         }
     }
@@ -1462,6 +1487,7 @@ impl ActiveCallbackFrame {
         self.request.dispatch_id = 0;
         self.request.client_tid = 0;
         self.request.client_badge = 0;
+        self.external_token = 0;
         self.client.clear();
         self.saved_user_context.fill(0);
         self.redirected = false;
@@ -1475,11 +1501,20 @@ impl ActiveCallbackFrame {
         self.dispatch_context.paint_output = None;
         self.arg_snapshot_len = 0;
         self.arg_snapshot.fill(0);
+        self.shared_publication = None;
         self.bridged_window.fill(0);
     }
 
     pub const fn request(&self) -> &CallbackHeader {
         &self.request
+    }
+
+    pub const fn external_token(&self) -> u64 {
+        self.external_token
+    }
+
+    pub const fn shared_publication(&self) -> Option<SharedCallbackPublication> {
+        self.shared_publication
     }
 
     pub const fn client_tcb(&self) -> u64 {
@@ -1713,6 +1748,28 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         request: CallbackHeader,
         client: ActiveCallbackClient,
     ) -> Result<(), ValidationError> {
+        self.push_with_token(request, client, 0)
+    }
+
+    /// Bind an independently minted lane transfer token to this exact callback frame.
+    pub fn push_with_active_client_metadata_and_token(
+        &mut self,
+        request: CallbackHeader,
+        client: ActiveCallbackClient,
+        token: u64,
+    ) -> Result<(), ValidationError> {
+        if token == 0 || self.frames[..self.len].iter().any(|frame| frame.external_token == token) {
+            return Err(ValidationError::Correlation);
+        }
+        self.push_with_token(request, client, token)
+    }
+
+    fn push_with_token(
+        &mut self,
+        request: CallbackHeader,
+        client: ActiveCallbackClient,
+        token: u64,
+    ) -> Result<(), ValidationError> {
         validate_request(&request)?;
         if client.client_tcb <= 1 {
             return Err(ValidationError::State);
@@ -1722,6 +1779,7 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         }
         self.frames[self.len] = ActiveCallbackFrame {
             request,
+            external_token: token,
             client,
             saved_user_context: [0; 20],
             redirected: false,
@@ -1729,6 +1787,7 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
             dispatch_context: DispatchContext::EMPTY,
             arg_snapshot_len: 0,
             arg_snapshot: [0; DISPATCH_ARG_SNAPSHOT_BYTES],
+            shared_publication: None,
             bridged_window: [0; 3],
         };
         self.len += 1;
@@ -1803,6 +1862,21 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         Ok(())
     }
 
+    /// Attach the suspended dispatch's full shared publication to its exact callback frame.
+    pub fn record_shared_publication(
+        &mut self,
+        correlation: CallbackCorrelation,
+        publication: SharedCallbackPublication,
+    ) -> Result<(), ValidationError> {
+        let index = self.correlated_index(&correlation)?;
+        let frame = &mut self.frames[index];
+        if frame.dispatch_context.dispatch_id != correlation.dispatch_id {
+            return Err(ValidationError::Correlation);
+        }
+        frame.shared_publication = Some(publication);
+        Ok(())
+    }
+
     /// Record the `CLIENTINFO.CallbackWnd` triple the executive bridged for this frame.
     pub fn record_bridged_window(
         &mut self,
@@ -1819,7 +1893,11 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         correlation: CallbackCorrelation,
     ) -> Result<ActiveCallbackFrame, ValidationError> {
         let index = self.correlated_index(&correlation)?;
-        if !self.frames[index].redirected {
+        let frame = &self.frames[index];
+        if !frame.redirected
+            || !frame.dispatch_context.lane.is_valid()
+            || frame.dispatch_context.dispatch_id != correlation.dispatch_id
+        {
             return Err(ValidationError::State);
         }
         Ok(self.remove(index))
@@ -3381,6 +3459,27 @@ mod tests {
     /// The interleaved ACTIVE stack: two threads redirected at once, each `NtCallbackReturn`
     /// resolving to its OWN frame and carrying its OWN suspended dispatch.
     #[test]
+    fn nested_dispatches_with_the_same_callback_id_keep_distinct_lane_tokens() {
+        let mut stack = ActiveCallbackStack::<3>::new();
+        let mut outer = CallbackHeader::idle(10, 8, 184, 30);
+        outer.state = CallbackState::Request as u32;
+        outer.callback_id = 1;
+        outer.api_index = USER32_CALLBACK_WINDOWPROC;
+        let mut inner = outer;
+        inner.dispatch_id = 11;
+        let client = ActiveCallbackClient::new(64, 0, 0, 0);
+
+        stack.push_with_active_client_metadata_and_token(outer, client, 41).unwrap();
+        stack.push_with_active_client_metadata_and_token(inner, client, 42).unwrap();
+        let identity = ClientThreadIdentity::new(8, 184, 30);
+        assert_eq!(stack.top_for(&identity).unwrap().external_token(), 42);
+        assert_eq!(stack.discard_top().unwrap().external_token(), 42);
+        assert_eq!(stack.top_for(&identity).unwrap().external_token(), 41);
+        assert_eq!(stack.push_with_active_client_metadata_and_token(inner, client, 41),
+            Err(ValidationError::Correlation));
+    }
+
+    #[test]
     fn active_callback_frames_of_two_threads_pop_by_identity() {
         let mut stack = ActiveCallbackStack::<4>::new();
         let mut a = CallbackHeader::idle(10, 2, 6, 4);
@@ -3518,6 +3617,89 @@ mod tests {
     }
 
     #[test]
+    fn callback_frame_retains_full_shared_publication_across_nested_dispatch() {
+        let mut stack = ActiveCallbackStack::<2>::new();
+        let mut outer = CallbackHeader::idle(10, 2, 6, 4);
+        outer.state = CallbackState::Request as u32;
+        outer.callback_id = 1;
+        outer.api_index = USER32_CALLBACK_WINDOWPROC;
+        let mut nested = outer;
+        nested.dispatch_id = 20;
+        nested.callback_id = 2;
+        nested.client_tid = 21;
+        nested.client_badge = 13;
+        let outer_key = CallbackCorrelation::from_request(&outer);
+        let nested_key = CallbackCorrelation::from_request(&nested);
+        stack.push(outer, 0xaaa0).unwrap();
+        let lane = nt_component_suspension::LaneHandle { index: 0, generation: 1 };
+        stack.record_dispatch_context(outer_key, DispatchContext {
+            lane, dispatch_id: 10, ssn: 0x1016, ..DispatchContext::EMPTY
+        }).unwrap();
+        let mut outer_request = [0u64; SHARED_CALLBACK_REQUEST_WORDS];
+        outer_request[0] = 0x1016;
+        outer_request[SHARED_CALLBACK_REQUEST_WORDS - 1] = 8;
+        outer_request[7] = 0xfeed;
+        let outer_context = [6, 7, 8, 9, 10, 11];
+        stack.record_shared_publication(
+            outer_key,
+            SharedCallbackPublication::new(outer_request, outer_context),
+        ).unwrap();
+        stack.record_redirect(outer_key, [7; 20]).unwrap();
+        stack.push(nested, 0xbbb0).unwrap();
+        stack.record_dispatch_context(nested_key, DispatchContext {
+            lane: nt_component_suspension::LaneHandle { index: 1, generation: 1 },
+            dispatch_id: 20, ssn: 0x1076, ..DispatchContext::EMPTY
+        }).unwrap();
+        let mut nested_request = [0u64; SHARED_CALLBACK_REQUEST_WORDS];
+        nested_request[0] = 0x1076;
+        nested_request[SHARED_CALLBACK_REQUEST_WORDS - 1] = 9;
+        stack.record_shared_publication(
+            nested_key,
+            SharedCallbackPublication::new(nested_request, [20; 6]),
+        ).unwrap();
+        stack.record_redirect(nested_key, [9; 20]).unwrap();
+
+        let restored = stack.pop(outer_key).unwrap().shared_publication().unwrap();
+        assert_eq!(restored.request(), &outer_request);
+        assert_eq!(restored.context(), &outer_context);
+        assert_eq!(stack.pop(nested_key).unwrap().shared_publication().unwrap().request(),
+            &nested_request);
+    }
+
+    #[test]
+    fn client_thread_startup_callback_cannot_retire_without_its_suspended_dispatch() {
+        let mut stack = ActiveCallbackStack::<1>::new();
+        let mut request = CallbackHeader::idle(86, 8, 100, 30);
+        request.state = CallbackState::Request as u32;
+        request.callback_id = 7;
+        request.api_index = USER32_CALLBACK_CLIENTTHREADSTARTUP;
+        let correlation = CallbackCorrelation::from_request(&request);
+        stack.push(request, 0xaaa0).unwrap();
+        let mut outer_context = [0u64; 20];
+        outer_context[USER_CONTEXT_RIP] = 0x1000;
+        stack.record_redirect(correlation, outer_context).unwrap();
+
+        // A completed user-mode callback still owns the original NtUserProcessConnect dispatch.
+        // An unbound frame must stay retained; otherwise the caller loses its only path to a
+        // service result and original syscall reply.
+        assert_eq!(stack.pop(correlation), Err(ValidationError::State));
+        assert_eq!(stack.len(), 1);
+
+        let original = DispatchContext {
+            lane: nt_component_suspension::LaneHandle { index: 8, generation: 3 },
+            dispatch_id: 86,
+            ssn: 0x10fa,
+            args: [u64::MAX, 0x4000, 576, 0x4000],
+            caller_sp: 0x7000,
+            output_stage: None,
+            paint_output: None,
+        };
+        stack.record_dispatch_context(correlation, original).unwrap();
+        let retired = stack.pop(correlation).unwrap();
+        assert_eq!(*retired.dispatch_context(), original);
+    }
+
+    #[test]
     fn callback_return_readiness_is_lifo_per_execution_lane() {
         let mut stack = ActiveCallbackStack::<2>::new();
         let mut outer = CallbackHeader::idle(10, 2, 6, 4);
@@ -3638,6 +3820,11 @@ mod tests {
         stack
             .record_redirect(outer_correlation, [0x11; 20])
             .unwrap();
+        stack.record_dispatch_context(outer_correlation, DispatchContext {
+            lane: nt_component_suspension::LaneHandle { index: 0, generation: 1 },
+            dispatch_id: outer_correlation.dispatch_id,
+            ..DispatchContext::EMPTY
+        }).unwrap();
         stack.push(inner, 0xbbb0).unwrap();
         stack
             .record_callback_window(
@@ -3648,6 +3835,11 @@ mod tests {
         stack
             .record_redirect(inner_correlation, [0x22; 20])
             .unwrap();
+        stack.record_dispatch_context(inner_correlation, DispatchContext {
+            lane: nt_component_suspension::LaneHandle { index: 0, generation: 1 },
+            dispatch_id: inner_correlation.dispatch_id,
+            ..DispatchContext::EMPTY
+        }).unwrap();
 
         let completed_inner = stack.pop(inner_correlation).unwrap();
         assert_eq!(completed_inner.saved_user_context(), &[0x22; 20]);

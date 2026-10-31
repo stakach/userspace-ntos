@@ -33,9 +33,8 @@ use nt_compat_exports::ssdt::{
     ServiceTable, ServiceTableRegistry, WIN32K_SERVICE_BASE, WIN32K_SERVICE_TABLE_INDEX,
 };
 
-/// PE metrics of the real ReactOS 0.4.17 `win32k.sys` (verified offline with `nt-pe-loader`
-/// against the on-disk `reactos/system32/win32k.sys`, staged by `fetch_reactos.sh`). Reported
-/// for the record; the isolated win32k-service component maps these into untyped-backed frames.
+/// PE metrics of the pinned LiberNT `win32k.sys` release. The isolated win32k component maps
+/// `SizeOfImage` into untyped-backed frames; the raw file is smaller than that virtual extent.
 pub struct Win32kPe {
     pub size: u64,
     // Documentation-of-record: the PE's preferred ImageBase, recorded from the offline PE parse. The
@@ -51,13 +50,13 @@ pub struct Win32kPe {
 }
 
 pub const WIN32K_PE: Win32kPe = Win32kPe {
-    size: 2_208_192,
+    size: 2_088_960,
     image_base: 0x10000,
-    size_of_image: 0x220000,
-    image_frames: 0x220, // 544
-    entry_rva: 0x2192b0,
-    sections: 8,
-    relocs: 1920,
+    size_of_image: 0x285000,
+    image_frames: 0x285, // 645
+    entry_rva: 0x247250,
+    sections: 9,
+    relocs: 2187,
     has_gs_cookie: false,
 };
 

@@ -45,8 +45,22 @@ unsafe fn eligible(
 ) -> bool {
     match continuation {
         ComponentNativeContinuation::Hosted(hosted) => {
-            hosted.return_target.can_resume()
-                && win32k_glue::win32k_client_context_is_admitted(hosted.pending.client())
+            let reply_ready = hosted.return_target.can_resume();
+            let client_ready = win32k_glue::win32k_client_context_is_admitted(hosted.pending.client());
+            if let HostedContinuationDestination::InitialThread(origin) = hosted.destination {
+                let binding = origin.target();
+                static INITIAL_RESUME_TRACE: AtomicU64 = AtomicU64::new(0);
+                let count = INITIAL_RESUME_TRACE.fetch_add(1, Ordering::Relaxed);
+                if count < 12 || count.is_power_of_two() {
+                    print_str(b"[initial-provider-wait] stage=eligible pi/tid/reply/client=");
+                    print_u64(binding.pi as u64);
+                    print_str(b"/"); print_u64(binding.tid);
+                    print_str(b"/"); print_u64(reply_ready as u64);
+                    print_str(b"/"); print_u64(client_ready as u64);
+                    print_str(b"\n");
+                }
+            }
+            reply_ready && client_ready
         }
         ComponentNativeContinuation::Kernel(capture) => {
             kernel_provider_activation::wait_resume_is_eligible(pm, capture)

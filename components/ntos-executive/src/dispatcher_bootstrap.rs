@@ -219,6 +219,7 @@ pub(crate) unsafe fn with_provider_objects<R>(
                     backing: crate::provider_dispatcher_backend::NativeEventBacking {
                         objects: &mut seed.obj_ns,
                         file_completion: None,
+                        pm: None,
                     },
                     access: None,
                 },

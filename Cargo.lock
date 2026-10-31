@@ -196,6 +196,8 @@ dependencies = [
  "nt-lpc-client",
  "nt-lpc-server",
  "nt-port-core",
+ "nt-security",
+ "nt-srm-message",
  "nt-status",
 ]
 
@@ -204,6 +206,23 @@ name = "nt-alpc-abi"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "nt-alpc-native-capture"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "nt-alpc-abi",
+ "nt-security",
+]
+
+[[package]]
+name = "nt-alpc-native-later"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "nt-alpc-abi",
 ]
 
 [[package]]
@@ -218,20 +237,24 @@ version = "0.1.0"
 name = "nt-compat-exports"
 version = "0.1.0"
 dependencies = [
+ "nt-acpi",
  "nt-ahci",
  "nt-driver-runtime",
  "nt-exe-image",
  "nt-fs",
+ "nt-hosted-runtime",
  "nt-io-manager",
  "nt-kernel-abi",
  "nt-kernel-exec",
  "nt-memory-manager",
+ "nt-object-manager",
  "nt-pe-loader",
  "nt-printf",
  "nt-process",
  "nt-status",
  "nt-types",
  "nt-user-host",
+ "sha2",
  "syn",
 ]
 
@@ -350,6 +373,9 @@ version = "0.1.0"
 [[package]]
 name = "nt-exe-image"
 version = "0.1.0"
+dependencies = [
+ "nt-memory-manager",
+]
 
 [[package]]
 name = "nt-fs"
@@ -388,6 +414,10 @@ dependencies = [
 [[package]]
 name = "nt-hosted-runtime"
 version = "0.1.0"
+dependencies = [
+ "nt-io-completion",
+ "nt-user-callback",
+]
 
 [[package]]
 name = "nt-interrupt-authority"
@@ -425,6 +455,7 @@ dependencies = [
  "bitflags",
  "nt-address-space",
  "nt-cm-resources",
+ "nt-config-manager",
  "nt-driver-runtime",
  "nt-fs",
  "nt-io-abi",
@@ -626,6 +657,7 @@ version = "0.1.0"
 name = "nt-pnp-manager"
 version = "0.1.0"
 dependencies = [
+ "nt-acpi",
  "nt-cm-resources",
  "nt-io-abi",
  "nt-io-manager",
@@ -728,6 +760,13 @@ name = "nt-sim-device"
 version = "0.1.0"
 dependencies = [
  "nt-register-access",
+]
+
+[[package]]
+name = "nt-srm-message"
+version = "0.1.0"
+dependencies = [
+ "nt-lpc-abi",
 ]
 
 [[package]]

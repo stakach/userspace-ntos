@@ -12,6 +12,8 @@ default = []
 std = []
 
 [dependencies]
+nt-user-callback.workspace = true
+nt-io-completion.workspace = true
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

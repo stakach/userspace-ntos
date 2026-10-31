@@ -23,6 +23,7 @@ pub struct GptHeader {
     pub backup_lba: u64,
     pub first_usable_lba: u64,
     pub last_usable_lba: u64,
+    pub disk_guid: [u8; 16],
     pub partition_entries_lba: u64,
     pub partition_entry_count: u32,
     pub partition_entry_size: u32,
@@ -35,7 +36,7 @@ impl GptHeader {
     }
 
     pub fn disk_sectors(self) -> Option<u64> {
-        self.backup_lba.checked_add(1)
+        self.current_lba.max(self.backup_lba).checked_add(1)
     }
 
     pub fn partition_entries_sectors(self) -> Option<u64> {
@@ -52,6 +53,7 @@ pub struct GptPartition {
     pub first_lba: u64,
     pub last_lba: u64,
     pub attributes: u64,
+    pub name: [u16; 36],
 }
 
 impl GptPartition {
@@ -138,7 +140,7 @@ pub fn parse_gpt_header(sector: &[u8], expected_lba: u64) -> Result<GptHeader, G
     }
     let revision = le_u32(sector, 8)?;
     let header_size = le_u32(sector, 12)? as usize;
-    if revision < 0x0001_0000 || !(92..=DISK_SECTOR_BYTES).contains(&header_size) {
+    if revision < 0x0001_0000 || !(92..=sector.len()).contains(&header_size) {
         return Err(GptError::InvalidHeader);
     }
     let stored_crc = le_u32(sector, 16)?;
@@ -150,30 +152,43 @@ pub fn parse_gpt_header(sector: &[u8], expected_lba: u64) -> Result<GptHeader, G
         return Err(GptError::HeaderChecksum);
     }
 
+    let mut disk_guid = [0; 16];
+    disk_guid.copy_from_slice(&sector[56..72]);
     let header = GptHeader {
         current_lba: le_u64(sector, 24)?,
         backup_lba: le_u64(sector, 32)?,
         first_usable_lba: le_u64(sector, 40)?,
         last_usable_lba: le_u64(sector, 48)?,
+        disk_guid,
         partition_entries_lba: le_u64(sector, 72)?,
         partition_entry_count: le_u32(sector, 80)?,
         partition_entry_size: le_u32(sector, 84)?,
         partition_entries_crc32: le_u32(sector, 88)?,
     };
+    let primary = header.current_lba < header.backup_lba;
+    let entry_end = header
+        .partition_entries_bytes()
+        .and_then(|bytes| bytes.checked_add(sector.len() as u64 - 1))
+        .map(|bytes| bytes / sector.len() as u64)
+        .and_then(|sectors| header.partition_entries_lba.checked_add(sectors));
+    let entry_array_in_role = if primary {
+        entry_end.is_some_and(|end| end <= header.first_usable_lba)
+    } else {
+        header.partition_entries_lba > header.last_usable_lba
+            && entry_end.is_some_and(|end| end <= header.current_lba)
+    };
     if header.current_lba != expected_lba
         || header.backup_lba == header.current_lba
         || header.first_usable_lba > header.last_usable_lba
-        || header.last_usable_lba >= header.backup_lba
+        || header.last_usable_lba >= header.current_lba.max(header.backup_lba)
+        || (!primary && header.first_usable_lba <= header.backup_lba)
         || header.partition_entries_lba == 0
         || header.partition_entry_count == 0
         || header.partition_entry_size < GPT_ENTRY_MIN_BYTES
-        || header.partition_entry_size as usize > DISK_SECTOR_BYTES
+        || header.partition_entry_size as usize > sector.len()
         || header.partition_entry_size % 8 != 0
         || header.partition_entries_bytes().is_none()
-        || header
-            .partition_entries_sectors()
-            .and_then(|sectors| header.partition_entries_lba.checked_add(sectors))
-            .is_none_or(|end| end > header.first_usable_lba)
+        || !entry_array_in_role
     {
         return Err(GptError::InvalidHeader);
     }
@@ -272,12 +287,17 @@ pub fn parse_gpt_partition_entry(
     type_guid.copy_from_slice(&bytes[..16]);
     let mut unique_guid = [0; 16];
     unique_guid.copy_from_slice(&bytes[16..32]);
+    let mut name = [0u16; 36];
+    for (index, character) in name.iter_mut().enumerate() {
+        *character = le_u16(bytes, 56 + index * 2)?;
+    }
     let partition = GptPartition {
         type_guid,
         unique_guid,
         first_lba: le_u64(bytes, 32)?,
         last_lba: le_u64(bytes, 40)?,
         attributes: le_u64(bytes, 48)?,
+        name,
     };
     if partition.unique_guid == [0; 16]
         || partition.first_lba < header.first_usable_lba
@@ -322,6 +342,18 @@ mod tests {
     }
 
     #[test]
+    fn four_kib_gpt_header_uses_physical_sector_geometry_for_entry_array_bounds() {
+        let mut sector = [0u8; 4096];
+        sector[..92].copy_from_slice(&header_sector()[..92]);
+        sector[40..48].copy_from_slice(&6u64.to_le_bytes());
+        sector[48..56].copy_from_slice(&4062u64.to_le_bytes());
+        sector[16..20].fill(0);
+        let crc = gpt_crc32(&sector[..92]);
+        sector[16..20].copy_from_slice(&crc.to_le_bytes());
+        assert!(parse_gpt_header(&sector, 1).is_ok());
+    }
+
+    #[test]
     fn validates_protective_mbr() {
         let mut sector = [0; DISK_SECTOR_BYTES];
         sector[446 + 4] = 0xee;
@@ -344,6 +376,58 @@ mod tests {
         let mut corrupt = sector;
         corrupt[40] ^= 1;
         assert_eq!(parse_gpt_header(&corrupt, 1), Err(GptError::HeaderChecksum));
+    }
+
+    #[test]
+    fn accepts_backup_header_at_last_disk_sector() {
+        // An intact backup table must recover a disk whose primary GPT header is damaged.
+        // Its entry array precedes this header, and AlternateLBA points back to LBA 1.
+        let mut sector = header_sector();
+        sector[24..32].copy_from_slice(&4095u64.to_le_bytes());
+        sector[32..40].copy_from_slice(&1u64.to_le_bytes());
+        sector[72..80].copy_from_slice(&4063u64.to_le_bytes());
+        sector[16..20].fill(0);
+        let crc = gpt_crc32(&sector[..92]);
+        sector[16..20].copy_from_slice(&crc.to_le_bytes());
+
+        let backup = parse_gpt_header(&sector, 4095).unwrap();
+        assert_eq!(backup.disk_sectors(), Some(4096));
+        assert_eq!(backup.partition_entries_sectors(), Some(32));
+
+        // The entry array must fit before the backup header, not beyond it.
+        sector[72..80].copy_from_slice(&4070u64.to_le_bytes());
+        sector[16..20].fill(0);
+        let crc = gpt_crc32(&sector[..92]);
+        sector[16..20].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(parse_gpt_header(&sector, 4095), Err(GptError::InvalidHeader));
+    }
+
+    #[test]
+    fn retains_disk_guid_and_partition_name_for_nt_layout() {
+        let disk_guid = [
+            0xd5, 0x9e, 0xcf, 0x5c, 0x8d, 0xe1, 0xc4, 0x42,
+            0x3a, 0x12, 0xb4, 0x0b, 0xd6, 0xa3, 0x18, 0x5b,
+        ];
+        let mut sector = header_sector();
+        sector[56..72].copy_from_slice(&disk_guid);
+        sector[16..20].fill(0);
+        let crc = gpt_crc32(&sector[..92]);
+        sector[16..20].copy_from_slice(&crc.to_le_bytes());
+        let header = parse_gpt_header(&sector, 1).unwrap();
+        assert_eq!(header.disk_guid, disk_guid);
+
+        let mut entry = [0; 128];
+        entry[..16].copy_from_slice(&EFI_SYSTEM_PARTITION_GUID);
+        entry[16..32].copy_from_slice(&[7; 16]);
+        entry[32..40].copy_from_slice(&2048u64.to_le_bytes());
+        entry[40..48].copy_from_slice(&3071u64.to_le_bytes());
+        entry[56..58].copy_from_slice(&(b'O' as u16).to_le_bytes());
+        entry[58..60].copy_from_slice(&(b'S' as u16).to_le_bytes());
+        let partition = parse_gpt_partition_entry(&entry, header).unwrap().unwrap();
+        let mut expected_name = [0u16; 36];
+        expected_name[0] = b'O' as u16;
+        expected_name[1] = b'S' as u16;
+        assert_eq!(partition.name, expected_name);
     }
 
     #[test]

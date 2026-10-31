@@ -542,11 +542,10 @@ impl DeviceAccess {
 
 /// Authenticate the actual physical channel and active dispatch before interpreting a device
 /// address. This common boundary accepts canonical FDOs and PDOs; operation policy comes later.
-pub(crate) unsafe fn authenticate(
+pub(crate) unsafe fn authenticate_channel(
     ch: &crate::spawn_hosts::PumpChannel,
     reply_cap: u64,
-    address: u64,
-) -> Result<DeviceAccess, i32> {
+) -> Result<(LaneDispatchIdentity, HostedDomainIdentity), i32> {
     let consumer = live_consumer()?;
     if ch.caps.kind != crate::spawn_hosts::ReqKind::Syscall
         || ch.pml4 != consumer.pml4
@@ -559,6 +558,16 @@ pub(crate) unsafe fn authenticate(
         .ok_or(STATUS_ACCESS_DENIED)?;
     let dispatch = crate::service_sec_image::component_execution_dispatch_identity(lane)
         .ok_or(STATUS_ACCESS_DENIED)?;
+    Ok((dispatch, consumer.domain))
+}
+
+pub(crate) unsafe fn authenticate(
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    address: u64,
+) -> Result<DeviceAccess, i32> {
+    let (dispatch, domain) = authenticate_channel(ch, reply_cap)?;
+    let consumer = live_consumer()?;
     let projection = consumer
         .projections
         .iter()
@@ -568,7 +577,7 @@ pub(crate) unsafe fn authenticate(
         catalog: consumer.catalog,
         provider: consumer.provider,
         dispatch,
-        domain: consumer.domain,
+        domain,
         address,
         device: projection.device,
         registration: projection
@@ -594,6 +603,7 @@ pub(crate) unsafe fn retire_quiescent_projections() -> Result<(), i32> {
         return Err(STATUS_DEVICE_NOT_READY);
     }
     super::win32k_device_properties::retire_quiescent_transfers(consumer.domain)?;
+    super::win32k_device_interfaces::retire_quiescent_transfers(consumer.domain)?;
     while let Some(row) = consumer.projections.last_mut() {
         if let Some(registration) = row.registration {
             io_manager_mut()

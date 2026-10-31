@@ -1,5 +1,23 @@
 //! `HwStartIO` reports VP_STATUS values, not NTSTATUS completion codes.
 
+use crate::{IOCTL_VIDEO_ENUM_MONITOR_PDO, IOCTL_VIDEO_INIT_WIN32K_CALLBACKS};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoPortControlOwner {
+    Port,
+    Miniport,
+}
+
+/// VideoPort handles these controls before building a miniport VIDEO_REQUEST_PACKET.
+pub const fn video_port_control_owner(code: u32) -> VideoPortControlOwner {
+    match code {
+        IOCTL_VIDEO_ENUM_MONITOR_PDO | IOCTL_VIDEO_INIT_WIN32K_CALLBACKS => {
+            VideoPortControlOwner::Port
+        }
+        _ => VideoPortControlOwner::Miniport,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VideoControlCompletion {
     pub nt_status: u32,
@@ -39,6 +57,26 @@ pub const fn classify_start_io_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        IOCTL_VIDEO_ENUM_MONITOR_PDO, IOCTL_VIDEO_INIT_WIN32K_CALLBACKS,
+        IOCTL_VIDEO_QUERY_CURRENT_MODE,
+    };
+
+    #[test]
+    fn monitor_enumeration_is_owned_by_video_port_before_miniport_dispatch() {
+        assert_eq!(
+            video_port_control_owner(IOCTL_VIDEO_ENUM_MONITOR_PDO),
+            VideoPortControlOwner::Port,
+        );
+        assert_eq!(
+            video_port_control_owner(IOCTL_VIDEO_INIT_WIN32K_CALLBACKS),
+            VideoPortControlOwner::Port,
+        );
+        assert_eq!(
+            video_port_control_owner(IOCTL_VIDEO_QUERY_CURRENT_MODE),
+            VideoPortControlOwner::Miniport,
+        );
+    }
 
     const INFORMATION: [u64; 6] = [
         0,

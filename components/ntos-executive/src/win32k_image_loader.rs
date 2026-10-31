@@ -74,6 +74,27 @@ unsafe fn loaded_name(name: &str, pml4: u64) -> Option<(u64, u32)> {
         .map(|module| (module.image().base, module.image().size))
 }
 
+/// Admit mutable static storage in an exact live helper image loaded for this provider.
+/// Provider pointer values are used only to locate the image; its retained mapping and
+/// per-page rights remain the storage authority.
+pub(crate) unsafe fn contains_loaded_writable_storage(body: u64, length: u64) -> bool {
+    let Some(provider) = crate::current_win32k_provider_domain() else { return false; };
+    let Some(end) = body.checked_add(length) else { return false; };
+    if length == 0 { return false; }
+    (&*core::ptr::addr_of!(LOADED)).iter().any(|module| {
+        let backing = module.backing();
+        let image = module.image();
+        if backing.provider != provider
+            || !crate::win32k_subsystem::provider_pool_packet_lease_live(backing.handle)
+            || body < image.base
+            || end > image.base + u64::from(image.size)
+        { return false; }
+        let first = ((body - image.base) / 0x1000) as usize;
+        let last = ((end - 1 - image.base) / 0x1000) as usize;
+        backing.rights.get(first..=last).is_some_and(|rights| rights.iter().all(|right| *right == RW_NX))
+    })
+}
+
 /// File discovery is shared FS policy, not a driver-name dispatch table.
 pub(crate) unsafe fn load_installed(name: &str, pml4: u64) -> Result<(u64, u32), LoadFailure> {
     let name = module_namespace::module_leaf(name).map_err(|_| LoadFailure::InvalidImage)?;
@@ -84,11 +105,11 @@ pub(crate) unsafe fn load_installed(name: &str, pml4: u64) -> Result<(u64, u32),
         return Err(LoadFailure::InvalidImage);
     }
     let fs = exec_fs().ok_or(LoadFailure::NativeFailure)?;
-    let mut path = b"reactos\\system32\\".to_vec();
+    let mut path = crate::installed_layout::SYSTEM32_PREFIX.to_vec();
     path.extend_from_slice(name.as_bytes());
     let location = fat_open_path(&fs, &path)
         .or_else(|| {
-            let mut driver_path = b"reactos\\system32\\drivers\\".to_vec();
+            let mut driver_path = crate::installed_layout::DRIVERS_PREFIX.to_vec();
             driver_path.extend_from_slice(name.as_bytes());
             fat_open_path(&fs, &driver_path)
         })

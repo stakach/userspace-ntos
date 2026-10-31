@@ -36,6 +36,8 @@ pub mod start_io_queued;
 pub mod start_io_selection;
 pub mod start_io_native_transaction;
 pub mod device_power;
+pub mod power_irp_request;
+pub mod power_forward_cancel;
 mod device_file_name;
 mod device_reference;
 mod device_control;
@@ -46,10 +48,12 @@ mod directory_control;
 mod dispatch;
 mod driver;
 pub mod driver_reinitialization;
+pub mod remove_lock;
 mod driver_host;
 mod driver_peer;
 mod ea;
 mod external_dispatch;
+mod detached_external_power;
 pub mod detached_file_irp;
 mod fault;
 mod file;
@@ -59,12 +63,14 @@ pub mod file_io_capture;
 pub mod file_object_name;
 mod file_information;
 mod hosted_domain;
+pub mod hosted_interface_registry;
 mod hosted_transport;
 pub use hosted_transport::HostedTransportIdentity;
 mod hosted_file;
 #[cfg(test)]
 mod hosted_file_lifetime_tests;
 mod hosted_device_pointer;
+pub mod hosted_provider_child_route;
 mod completion_ack;
 mod completion_retirement;
 mod projection_allocation;
@@ -73,9 +79,16 @@ mod hosted_safe_attach;
 mod hosted_bus_pdo_publication;
 mod hosted_file_system_registry;
 pub mod hosted_pool_range;
+pub mod video_monitor_array_projection;
 pub mod hosted_kernel_read_delivery;
 pub mod inline_file_retirement;
 mod irp;
+pub mod io_paging_priority;
+pub mod internal_block_io;
+pub mod scsi_srb_transport;
+pub mod scsi_block_command;
+pub mod scsi_srb_wire;
+pub mod scsi_source_retention;
 pub mod kernel_irp_builder;
 pub mod io_create_file;
 pub mod io_create_file_capture;
@@ -88,6 +101,7 @@ pub mod redir_query_path;
 pub mod retained_query_path_forward;
 pub mod retained_write_forward;
 pub mod retained_read_forward;
+pub mod internal_device_control_forward;
 pub mod retained_query_information_forward;
 pub mod retained_flush_forward;
 pub mod retained_connect_forward;
@@ -95,6 +109,8 @@ pub mod retained_file_lifecycle_forward;
 pub mod class_service_callback;
 pub mod reverse_class_alias_projection;
 pub mod source_irp_ledger;
+pub mod hard_error_verify_device;
+pub mod verify_device_retirement;
 pub mod source_irp_auxiliary;
 pub mod provider_source_irp;
 pub mod query_path_wire;
@@ -114,6 +130,7 @@ pub mod win32k_source_irp_ioctl_wire;
 pub mod win32k_source_pnp_wire;
 pub mod win32k_source_fsd_wire;
 pub mod source_terminal;
+pub mod source_completion_preparation;
 pub mod source_pending_armed;
 pub mod file_directory_query_wire;
 mod lock_control;
@@ -203,6 +220,10 @@ pub use external_dispatch::{
     PreparedExternalPnpIrp, PreparedExternalPnpRejection,
 };
 pub use completion_ack::CompletionAcknowledgement;
+pub use detached_external_power::{PreparedExternalPowerIrp, ExternalPowerRejection,
+    ExternalPowerInvocation, ExternalPowerReturn, RetainedExternalPower,
+    ExternalPowerFinishResult, ExternalPowerCompletionInvocation,
+    ExternalPowerCompletionReturn, ExternalPowerTerminalReceipt};
 pub use file::{CreateOptions, FileRecord, FileState, ShareAccess};
 pub use file_mode::FileModeState;
 pub use file_information::{
@@ -298,7 +319,9 @@ pub use volume_information::{
     SetVolumeInformationParameters, VolumeInformationContract,
 };
 pub use wdm_x64::{
-    decode_wdm_kernel_built_io_stack, initialize_wdm_irp_thread_list,
+    decode_wdm_kernel_built_io_stack, decode_wdm_kernel_built_scsi_stack,
+    initialize_wdm_irp_thread_list,
+    initialize_wdm_irp_packet, reuse_wdm_irp_packet,
     write_wdm_device_object, write_wdm_driver_object,
     write_wdm_file_object, write_wdm_io_stack_location, write_wdm_irp,
     write_wdm_irp_completion_targets,
@@ -790,6 +813,7 @@ impl<P> IoManager<P> {
                         location.flags = parameters.case_sensitive_stack_flags(major)
                     }
                     IoParameters::Pnp(parameters) => location.minor = parameters.minor,
+                    IoParameters::Power(parameters) => location.minor = parameters.minor(),
                     IoParameters::LockControl(parameters) => location.minor = parameters.minor,
                     IoParameters::NotifyDirectory(_) => {
                         location.minor = crate::IRP_MN_NOTIFY_CHANGE_DIRECTORY
@@ -833,6 +857,7 @@ impl<P> IoManager<P> {
                     location.flags = parameters.case_sensitive_stack_flags(major)
                 }
                 IoParameters::Pnp(parameters) => location.minor = parameters.minor,
+                IoParameters::Power(parameters) => location.minor = parameters.minor(),
                 IoParameters::LockControl(parameters) => location.minor = parameters.minor,
                 IoParameters::NotifyDirectory(_) => {
                     location.minor = crate::IRP_MN_NOTIFY_CHANGE_DIRECTORY
@@ -865,7 +890,7 @@ impl<P> IoManager<P> {
         let mut irp = IrpRecord::new(client, device, file, major);
         irp.origin_driver_id = driver;
         irp.origin_minor = stack[0].minor;
-        if major == nt_io_abi::major::IRP_MJ_PNP {
+        if matches!(major, nt_io_abi::major::IRP_MJ_PNP | nt_io_abi::major::IRP_MJ_POWER) {
             irp.status = NtStatus::NOT_SUPPORTED;
         }
         irp.stack = stack;
@@ -889,7 +914,7 @@ impl<P> IoManager<P> {
         let mut irp = IrpRecord::new(client, device, file, major);
         irp.origin_driver_id = driver;
         irp.origin_minor = stack[0].minor;
-        if major == nt_io_abi::major::IRP_MJ_PNP {
+        if matches!(major, nt_io_abi::major::IRP_MJ_PNP | nt_io_abi::major::IRP_MJ_POWER) {
             irp.status = NtStatus::NOT_SUPPORTED;
         }
         irp.stack = stack;
@@ -1541,6 +1566,7 @@ mod tests {
     mod exact_external_pnp;
     mod detached_external_pnp;
     mod detached_external_pnp_completion;
+    mod detached_external_power_tests;
 
     use super::*;
     use nt_io_abi::{ioctl, major};
@@ -3906,6 +3932,8 @@ mod tests {
                 status: warning,
                 information: 48,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             }
         );
         assert_eq!(&output[..3], b"hdr");
@@ -3964,6 +3992,8 @@ mod tests {
                 status: warning,
                 information: 0,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         assert_eq!(&output, header);
@@ -4017,6 +4047,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: pdo_driver,
+                completion_device_id: pdo,
             })
         );
         assert_eq!(pdo_seen.borrow().len(), 1);
@@ -4030,6 +4062,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: function_driver,
+                completion_device_id: function,
             })
         );
         assert_eq!(pdo_seen.borrow().len(), 1);
@@ -4062,6 +4096,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         let seen = seen.borrow();
@@ -4192,6 +4228,8 @@ mod tests {
                 status: warning,
                 information: 3,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             }
         );
         assert_eq!(&buf[..3], b"out");
@@ -4347,6 +4385,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: top_driver,
+                completion_device_id: top,
             })
         );
         assert_eq!(om.close(client, handle), Ok(()));
@@ -4562,6 +4602,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 4,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: DeviceId::NULL,
             }
         );
         assert_eq!(&buf, b"pong");
@@ -4633,6 +4675,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: Some(0xCCB0),
+                completion_driver_id: driver,
+                completion_device_id: device,
             }
         );
         assert_eq!(om.external_file_context(client, file_id), Ok(Some(0xCCB0)));
@@ -5027,6 +5071,10 @@ mod tests {
     }
 
     impl DriverDispatchBackend for KernelFileRouteBackend {
+        fn immutable_file_extent(&self, _file_id: FileId, file_context: u64) -> Option<u64> {
+            (file_context == 0xfeed).then_some(4)
+        }
+
         fn dispatch_irp(
             &mut self,
             ctx: DispatchContext<'_>,
@@ -5177,6 +5225,15 @@ mod tests {
         ));
         assert_eq!(om.file(file).unwrap().state, FileState::Open);
         assert_eq!(om.external_file_context(client, file), Ok(Some(0xfeed)));
+        assert_eq!(om.immutable_file_extent(client, file, device, 0xfeed), Ok(Some(4)));
+        assert_eq!(
+            om.immutable_file_extent(client, file, device, 0xbeef),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+        assert_eq!(
+            om.immutable_file_extent(client, file, DeviceId::NULL, 0xfeed),
+            Err(NtStatus::INVALID_HANDLE)
+        );
 
         let mut metadata = [0; 4];
         assert!(matches!(
@@ -5505,6 +5562,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: Some(0xCCB1),
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         assert_eq!(om.external_file_context(client, file_id), Ok(Some(0xCCB1)));
@@ -7221,6 +7280,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: om.device(device).unwrap().driver_id,
+                completion_device_id: device,
             })
         );
         assert!(om.file(target).unwrap().state.is_open());
@@ -7256,6 +7317,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: om.device(device).unwrap().driver_id,
+                completion_device_id: device,
             })
         );
         let request = control.last_request().unwrap();
@@ -7291,6 +7354,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: om.device(device).unwrap().driver_id,
+                completion_device_id: device,
             })
         );
         let request = control.last_request().unwrap();
@@ -7371,6 +7436,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         let request = control.last_request().unwrap();
@@ -7400,6 +7467,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         let request = control.last_request().unwrap();
@@ -7478,6 +7547,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         let request = control.last_request().unwrap();
@@ -7508,6 +7579,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         let request = control.last_request().unwrap();
@@ -7587,6 +7660,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         let request = control.last_request().unwrap();
@@ -7863,6 +7938,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         let request = control.last_request().unwrap();
@@ -7892,6 +7969,8 @@ mod tests {
                 status: NtStatus::SUCCESS,
                 information: 0,
                 file_context: None,
+                completion_driver_id: driver,
+                completion_device_id: device,
             })
         );
         let request = control.last_request().unwrap();

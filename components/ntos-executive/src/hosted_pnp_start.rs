@@ -169,6 +169,31 @@ pub(crate) enum OwnedHostedPnpStartProgress {
     OwnershipLost(HostedPnpStartBatchFailure),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostedPnpWaitStage {
+    BootstrapPredecessor,
+    Relations,
+    FilterAdmission,
+    FilterCompletion,
+    GrantAdmission,
+    StartCompletion,
+    DevnodeAdmission,
+}
+
+impl HostedPnpWaitStage {
+    pub(crate) const fn label(self) -> &'static [u8] {
+        match self {
+            Self::BootstrapPredecessor => b"bootstrap-predecessor",
+            Self::Relations => b"relations",
+            Self::FilterAdmission => b"filter-admission",
+            Self::FilterCompletion => b"filter-completion",
+            Self::GrantAdmission => b"grant-admission",
+            Self::StartCompletion => b"start-completion",
+            Self::DevnodeAdmission => b"devnode-admission",
+        }
+    }
+}
+
 pub(crate) struct OwnedHostedPnpStartBatch {
     spec: DriverServiceLaunchSpec,
     options: HostedPnpStartOptions,
@@ -177,6 +202,7 @@ pub(crate) struct OwnedHostedPnpStartBatch {
     pending_device_id: u64,
     pending_filter_admission: Option<PendingHostedFilterAdmission>,
     pending_filter: Option<PendingHostedPnpFilter>,
+    pending_grant_admission: Option<PendingHostedGrantAdmission>,
     pending_relations: Option<driver_launch::HostedPnpRelationRefresh>,
     pending_bus_relation_devnode: Option<usize>,
     bootstrap_required_bus_pdos: Vec<usize>,
@@ -210,6 +236,16 @@ struct PendingHostedFilterAdmission {
     devnode_index: usize,
     device_id: u64,
     resource_plan: PreparedHostedResourcePlan,
+}
+
+/// FILTER is terminal, but the accepted controller is not yet available for a physical grant.
+/// Keep the same FDO and checked requirements until the controller owner admits START.
+struct PendingHostedGrantAdmission {
+    devnode_index: usize,
+    device_id: u64,
+    resource_plan: PreparedHostedResourcePlan,
+    filtered_requirements: Vec<u8>,
+    blocked_status: Option<nt_status::NtStatus>,
 }
 
 impl OwnedHostedPnpStartBatch {
@@ -247,6 +283,7 @@ impl OwnedHostedPnpStartBatch {
             pending_device_id: 0,
             pending_filter_admission: None,
             pending_filter: None,
+            pending_grant_admission: None,
             pending_relations: None,
             pending_bus_relation_devnode: None,
             bootstrap_required_bus_pdos: Vec::new(),
@@ -264,6 +301,22 @@ impl OwnedHostedPnpStartBatch {
 
     pub(crate) fn service_name(&self) -> &str {
         &self.spec.service_name
+    }
+
+    pub(crate) fn wait_stage(&self) -> HostedPnpWaitStage {
+        if self.pending_relations.is_some() {
+            HostedPnpWaitStage::Relations
+        } else if self.pending_filter_admission.is_some() {
+            HostedPnpWaitStage::FilterAdmission
+        } else if self.pending_grant_admission.is_some() {
+            HostedPnpWaitStage::GrantAdmission
+        } else if self.pending_filter.is_some() {
+            HostedPnpWaitStage::FilterCompletion
+        } else if matches!(self.coordinator.phase(), nt_driver_start::BatchPhase::Awaiting { .. }) {
+            HostedPnpWaitStage::StartCompletion
+        } else {
+            HostedPnpWaitStage::DevnodeAdmission
+        }
     }
 
     /// A predecessor lost exact ownership before this batch entered native AddDevice/START.
@@ -297,6 +350,7 @@ impl OwnedHostedPnpStartBatch {
                 && [
                     self.pending_filter.as_ref().map(|pending| (pending.devnode_index, pending.device_id)),
                     self.pending_filter_admission.as_ref().map(|pending| (pending.devnode_index, pending.device_id)),
+                    self.pending_grant_admission.as_ref().map(|pending| (pending.devnode_index, pending.device_id)),
                 ].into_iter().flatten().all(|(pending_index, device_id)| {
                     pending_index != index
                         || driver_launch::hosted_function_device_id_for_instance(
@@ -404,6 +458,7 @@ impl OwnedHostedPnpStartBatch {
 
     pub(crate) fn needs_completion_redrive(&self) -> bool {
         self.pending_filter_admission.is_some()
+            || self.pending_grant_admission.as_ref().is_some_and(|pending| pending.blocked_status.is_none())
             || self.pending_filter
             .as_ref()
             .is_some_and(|pending| pending.ownership_lost.is_none())
@@ -447,8 +502,10 @@ impl OwnedHostedPnpStartBatch {
         progress: HostedPnpDevnodeProgress,
     ) -> Option<OwnedHostedPnpStartProgress> {
         match progress {
-            HostedPnpDevnodeProgress::BusRelationPending => {
-                self.pending_bus_relation_devnode = Some(devnode_index);
+            HostedPnpDevnodeProgress::BusRelationPending { require_accepted_bus_pdo } => {
+                if require_accepted_bus_pdo {
+                    self.pending_bus_relation_devnode = Some(devnode_index);
+                }
                 return Some(OwnedHostedPnpStartProgress::AwaitingCompletion);
             }
             HostedPnpDevnodeProgress::ResourceAdmissionPending => {
@@ -462,6 +519,34 @@ impl OwnedHostedPnpStartBatch {
                     resource_plan,
                 });
                 return Some(OwnedHostedPnpStartProgress::AwaitingCompletion);
+            }
+            HostedPnpDevnodeProgress::GrantAdmissionPending {
+                device_id, resource_plan, filtered_requirements,
+            } => {
+                assert!(self.pending_grant_admission.is_none());
+                self.pending_grant_admission = Some(PendingHostedGrantAdmission {
+                    devnode_index,
+                    device_id,
+                    resource_plan,
+                    filtered_requirements,
+                    blocked_status: None,
+                });
+                return Some(OwnedHostedPnpStartProgress::AwaitingCompletion);
+            }
+            HostedPnpDevnodeProgress::GrantAdmissionBlocked {
+                device_id, resource_plan, filtered_requirements, status,
+            } => {
+                assert!(self.pending_grant_admission.is_none());
+                self.pending_grant_admission = Some(PendingHostedGrantAdmission {
+                    devnode_index,
+                    device_id,
+                    resource_plan,
+                    filtered_requirements,
+                    blocked_status: Some(status),
+                });
+                return Some(OwnedHostedPnpStartProgress::OwnershipLost(
+                    HostedPnpStartBatchFailure { status, teardown_blocked: true },
+                ));
             }
             HostedPnpDevnodeProgress::FilterPending {
                 device_id,
@@ -562,10 +647,12 @@ impl OwnedHostedPnpStartBatch {
                     },
                 ))
             }
-            HostedPnpDevnodeProgress::BusRelationPending
+            HostedPnpDevnodeProgress::BusRelationPending { .. }
             | HostedPnpDevnodeProgress::FilterAdmissionPending { .. }
             | HostedPnpDevnodeProgress::FilterPending { .. }
             | HostedPnpDevnodeProgress::FilterOwnershipLost { .. }
+            | HostedPnpDevnodeProgress::GrantAdmissionPending { .. }
+            | HostedPnpDevnodeProgress::GrantAdmissionBlocked { .. }
             | HostedPnpDevnodeProgress::ResourceAdmissionPending => unreachable!(),
         }
     }
@@ -601,6 +688,73 @@ impl OwnedHostedPnpStartBatch {
                 let progress = filter_attached_devnode(
                     pending.device_id,
                     pending.resource_plan,
+                    &self.spec.service_name,
+                    &devnode.instance_id,
+                    self.options,
+                    &mut self.report,
+                );
+                if let Some(outcome) = self.apply_devnode_progress(devnode_index, progress) {
+                    return outcome;
+                }
+                continue;
+            }
+            if let Some(status) = self.pending_grant_admission.as_ref().and_then(|pending| pending.blocked_status) {
+                return OwnedHostedPnpStartProgress::OwnershipLost(
+                    HostedPnpStartBatchFailure { status, teardown_blocked: true },
+                );
+            }
+            if let Some(pending) = self.pending_grant_admission.take() {
+                let mut pending = pending;
+                if pending.resource_plan.is_boot_storage_controller() {
+                    let Some(receipt) = driver_launch::current_boot_driver_preload_receipt() else {
+                        pending.blocked_status = Some(nt_status::NtStatus::DEVICE_NOT_READY);
+                        self.pending_grant_admission = Some(pending);
+                        return OwnedHostedPnpStartProgress::OwnershipLost(
+                            HostedPnpStartBatchFailure {
+                                status: nt_status::NtStatus::DEVICE_NOT_READY,
+                                teardown_blocked: true,
+                            },
+                        );
+                    };
+                    let lease = match pending.resource_plan.prepare_boot_storage_controller_window() {
+                        Ok(Some(lease)) => lease,
+                        Ok(None) => {
+                            let status = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+                            pending.blocked_status = Some(status);
+                            self.pending_grant_admission = Some(pending);
+                            return OwnedHostedPnpStartProgress::OwnershipLost(
+                                HostedPnpStartBatchFailure { status, teardown_blocked: true },
+                            );
+                        }
+                        Err(status) => {
+                            pending.blocked_status = Some(status);
+                            self.pending_grant_admission = Some(pending);
+                            return OwnedHostedPnpStartProgress::OwnershipLost(
+                                HostedPnpStartBatchFailure { status, teardown_blocked: true },
+                            );
+                        }
+                    };
+                    match crate::boot_storage_dma_handoff::begin_native_start_after_preload(receipt, lease) {
+                        Ok(crate::boot_storage_dma_handoff::NativeStartAdmission::Ready) => {}
+                        Ok(crate::boot_storage_dma_handoff::NativeStartAdmission::Draining) => {
+                            self.pending_grant_admission = Some(pending);
+                            return OwnedHostedPnpStartProgress::AwaitingCompletion;
+                        }
+                        Err(status) => {
+                            pending.blocked_status = Some(status);
+                            self.pending_grant_admission = Some(pending);
+                            return OwnedHostedPnpStartProgress::OwnershipLost(
+                                HostedPnpStartBatchFailure { status, teardown_blocked: true },
+                            );
+                        }
+                    }
+                }
+                let devnode_index = pending.devnode_index;
+                let devnode = &self.spec.devnodes[devnode_index];
+                let progress = start_filtered_devnode(
+                    pending.device_id,
+                    pending.resource_plan,
+                    pending.filtered_requirements,
                     &self.spec.service_name,
                     &devnode.instance_id,
                     self.options,
@@ -1337,11 +1491,19 @@ pub(crate) enum PreparedHostedResourcePlan {
     BusReportedBusNumber {
         resources: nt_pnp_manager::BusReportedBusNumberStart,
     },
+    BusOwnedRoot {
+        resources: driver_launch::HostedBusOwnedRootResources,
+    },
     Pci {
         bus_resources: DevnodePciBusResources,
         accepted_properties: Option<(Vec<u8>, Vec<u8>)>,
         window: HostedPnpPciResourceDescriptor,
         lease: nt_pnp_context::ContextLease,
+    },
+    PciNoResources {
+        provider: nt_pnp_manager::AcceptedPdoProviderAuthority,
+        child: nt_pnp_manager::DevnodeIdentity,
+        device: nt_pnp::PciDevice,
     },
     Platform {
         grant: DevnodeRootResourceGrant,
@@ -1362,9 +1524,53 @@ pub(crate) enum PreparedHostedResourcePlan {
 }
 
 impl PreparedHostedResourcePlan {
+    fn is_boot_storage_controller(&self) -> bool {
+        matches!(self, Self::Pci { bus_resources, .. }
+            if crate::boot_storage_dma_handoff::is_boot_storage_controller(&bus_resources.device))
+    }
+
+    unsafe fn prepare_boot_storage_controller_window(
+        &mut self,
+    ) -> Result<Option<nt_pnp_context::ContextLeaseIdentity>, nt_status::NtStatus> {
+        match self {
+            Self::Pci { bus_resources, window, lease, .. }
+                if crate::boot_storage_dma_handoff::is_boot_storage_controller(&bus_resources.device) =>
+            {
+                let device = &bus_resources.device;
+                let mapped = crate::request_hosted_pnp_pci_dma_window(
+                    lease.identity(), device.bus, device.dev, device.func,
+                )?;
+                if !mapped.matches(device) || !mapped.dma_grant_valid() {
+                    return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                }
+                *window = mapped;
+                Ok(Some(lease.identity()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn grant_admission(&self) -> crate::boot_storage_dma_handoff::ControllerGrantAdmission {
+        match self {
+            Self::Pci { bus_resources, window, lease, .. } => {
+                crate::boot_storage_dma_handoff::admit_hosted_pci_controller_grant(
+                    lease.identity(), &bus_resources.device, window,
+                )
+            }
+            Self::BusReportedBusNumber { .. } | Self::BusOwnedRoot { .. }
+            | Self::PciNoResources { .. } | Self::Platform { .. }
+            | Self::AcpiChild { .. } | Self::AcpiChildNoResources { .. }
+            | Self::None => crate::boot_storage_dma_handoff::ControllerGrantAdmission::Current,
+        }
+    }
+
     fn native_property_blobs(&self) -> (Option<&[u8]>, Option<&[u8]>) {
         match self {
             Self::BusReportedBusNumber { resources } => (Some(&resources.raw_resources), None),
+            Self::BusOwnedRoot { resources } => (
+                Some(&resources.snapshot.raw_resources),
+                Some(&resources.snapshot.resource_requirements),
+            ),
             Self::Pci { bus_resources, accepted_properties, .. } => accepted_properties
                 .as_ref()
                 .map(|(raw, requirements)| (Some(raw.as_slice()), Some(requirements.as_slice())))
@@ -1380,7 +1586,7 @@ impl PreparedHostedResourcePlan {
                 Some(&resources.raw_resources),
                 Some(&resources.resource_requirements),
             ),
-            Self::AcpiChildNoResources { .. } | Self::None => (None, None),
+            Self::PciNoResources { .. } | Self::AcpiChildNoResources { .. } | Self::None => (None, None),
         }
     }
 
@@ -1388,7 +1594,8 @@ impl PreparedHostedResourcePlan {
         let lease = match self {
             Self::Pci { lease, .. } | Self::Platform { lease, .. }
             | Self::AcpiChild { lease, .. } => lease,
-            Self::BusReportedBusNumber { .. } | Self::AcpiChildNoResources { .. }
+            Self::BusReportedBusNumber { .. } | Self::BusOwnedRoot { .. }
+            | Self::PciNoResources { .. } | Self::AcpiChildNoResources { .. }
             | Self::None => return Ok(()),
         };
         release_hosted_pnp_context_lease(lease.into_identity())
@@ -1403,8 +1610,10 @@ impl PreparedHostedResourcePlan {
                     &bus_resources.device,
                 )
             }
-            Self::BusReportedBusNumber { .. } | Self::Platform { .. }
-            | Self::AcpiChild { .. } | Self::AcpiChildNoResources { .. }
+            Self::BusReportedBusNumber { .. } | Self::BusOwnedRoot { .. }
+            | Self::Platform { .. }
+            | Self::AcpiChild { .. } | Self::PciNoResources { .. }
+            | Self::AcpiChildNoResources { .. }
             | Self::None => {
                 crate::hosted_pci_topology::HostedPciInterruptRouteAdmission::Current
             }
@@ -1493,6 +1702,22 @@ where
 
     let lease = acquire_hosted_pnp_context_lease()?;
     if let Some(pdo) = bus_pdo {
+        match driver_launch::hosted_accepted_bus_owned_root_resources(instance_id, pdo) {
+            Ok(Some(resources)) => {
+                release_hosted_pnp_context_lease(lease.into_identity())?;
+                return Ok(PreparedHostedDevnode {
+                    pdo_description: None,
+                    resource_plan: PreparedHostedResourcePlan::BusOwnedRoot { resources },
+                });
+            }
+            Ok(None) => {}
+            Err(status) => {
+                driver_launch::trace_hosted_bus_resource_refusal(
+                    b"bus-owned-root", instance_id, pdo, status,
+                );
+                return Err(release_context_lease_after_error(lease, status));
+            }
+        }
         let accepted = match driver_launch::hosted_accepted_acpi_child_resources(instance_id, pdo) {
             Ok(accepted) => accepted,
             Err(status) => {
@@ -1556,14 +1781,60 @@ where
             return Err(release_context_lease_after_error(lease, status));
         }
     };
-    let pci_device = nt_pnp::find_pci_device_for_devnode(
-        &context.pci_devices,
-        instance_id,
-        hardware_ids,
-        compatible_ids,
-    );
+    let accepted_pci_pdo = bus_pdo.filter(|_| nt_pnp::parse_pci_id_pattern(instance_id).is_some());
+    let pci_device = if let Some(pdo) = accepted_pci_pdo {
+        let (bus_number, address) = match driver_launch::hosted_accepted_pci_location(instance_id, pdo) {
+            Ok(location) => location,
+            Err(status) => return Err(release_context_lease_after_error(lease, status)),
+        };
+        nt_pnp::find_pci_device_for_accepted_pdo(
+            &context.pci_devices,
+            instance_id,
+            hardware_ids,
+            bus_number,
+            address,
+        )
+    } else {
+        nt_pnp::find_pci_device_for_devnode(
+            &context.pci_devices,
+            instance_id,
+            hardware_ids,
+            compatible_ids,
+        )
+    };
+
+    if accepted_pci_pdo.is_some() && pci_device.is_none() {
+        return Err(release_context_lease_after_error(
+            lease,
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+    }
 
     if let Some(device) = pci_device {
+        let accepted_properties = match bus_pdo {
+            Some(pdo) => match driver_launch::hosted_accepted_pci_resource_properties(
+                instance_id, pdo, device,
+            ) {
+                Ok(driver_launch::AcceptedPciResourceProperties::NoResources { provider, child }) => {
+                    let device = device.clone();
+                    release_hosted_pnp_context_lease(lease.into_identity())?;
+                    return Ok(PreparedHostedDevnode {
+                        pdo_description: None,
+                        resource_plan: PreparedHostedResourcePlan::PciNoResources {
+                            provider, child, device,
+                        },
+                    });
+                }
+                Ok(driver_launch::AcceptedPciResourceProperties::Present { raw, requirements }) => {
+                    if let Err(status) = crate::boot_storage_dma_handoff::remember_boot_controller_pdo(pdo, device) {
+                        return Err(release_context_lease_after_error(lease, status));
+                    }
+                    Some((raw, requirements))
+                }
+                Err(status) => return Err(release_context_lease_after_error(lease, status)),
+            },
+            None => None,
+        };
         let window = context
             .pci_windows
             .iter()
@@ -1580,19 +1851,6 @@ where
                 lease,
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST,
             ));
-        };
-        let accepted_properties = match bus_pdo {
-            Some(pdo) => match driver_launch::hosted_accepted_pci_resource_properties(
-                instance_id,
-                pdo,
-                device,
-            ) {
-                Ok(properties) => Some(properties),
-                Err(status) => {
-                    return Err(release_context_lease_after_error(lease, status));
-                }
-            },
-            None => None,
         };
         let resource_publication = nt_root_bus::PdoResourcePublication {
             raw_boot_resources: nt_root_bus::BusResourceState::Present(
@@ -1613,6 +1871,7 @@ where
                     removable: false,
                     eject_supported: false,
                     surprise_removal_ok: false,
+                    raw_device_ok: false,
                     address: ((device.dev as u32) << 16) | device.func as u32,
                 },
                 resource_publication,
@@ -1690,6 +1949,7 @@ where
                     removable: false,
                     eject_supported: false,
                     surprise_removal_ok: false,
+                    raw_device_ok: false,
                     address: nt_pnp_manager::DEVICE_ADDRESS_UNAVAILABLE,
                 },
                 resource_publication,
@@ -1720,6 +1980,7 @@ where
                 removable: false,
                 eject_supported: false,
                 surprise_removal_ok: false,
+                raw_device_ok: false,
                 address: nt_pnp_manager::DEVICE_ADDRESS_UNAVAILABLE,
             },
             resource_publication: nt_root_bus::PdoResourcePublication::none(),
@@ -1730,11 +1991,22 @@ where
 }
 
 enum HostedPnpDevnodeProgress {
-    BusRelationPending,
+    BusRelationPending { require_accepted_bus_pdo: bool },
     ResourceAdmissionPending,
     FilterAdmissionPending {
         device_id: u64,
         resource_plan: PreparedHostedResourcePlan,
+    },
+    GrantAdmissionPending {
+        device_id: u64,
+        resource_plan: PreparedHostedResourcePlan,
+        filtered_requirements: Vec<u8>,
+    },
+    GrantAdmissionBlocked {
+        device_id: u64,
+        resource_plan: PreparedHostedResourcePlan,
+        filtered_requirements: Vec<u8>,
+        status: nt_status::NtStatus,
     },
     Terminal {
         device_id: u64,
@@ -1867,10 +2139,10 @@ where
     C: AsRef<str>,
 {
     let bus_pdo = driver_launch::hosted_bus_reported_device_id(devnode.instance_id);
-    let relation_pending = bus_pdo.is_none() && driver_launch::hosted_bus_relation_pending();
-
-    if bus_pdo.is_none() && relation_pending {
-        return HostedPnpDevnodeProgress::BusRelationPending;
+    let relation_pending = (bus_pdo.is_none() && driver_launch::hosted_bus_relation_pending())
+        || driver_launch::hosted_relation_cm_writer_pending();
+    if relation_pending {
+        return HostedPnpDevnodeProgress::BusRelationPending { require_accepted_bus_pdo };
     }
     let prepared = match prepare_current_hosted_devnode(
         bus_pdo,
@@ -2159,6 +2431,15 @@ unsafe fn filter_attached_devnode(
             );
         }
     }
+    if let PreparedHostedResourcePlan::PciNoResources { provider, child, device } = &resource_plan {
+        if let Err(status) = driver_launch::validate_hosted_accepted_pci_no_resources(
+            instance_id, device_id, *provider, *child, device,
+        ) {
+            return finish_filter_failure(
+                device_id, resource_plan, service_name, instance_id, options, status, report,
+            );
+        }
+    }
     let filter_outcome = match resource_plan.native_property_blobs().1 {
         Some(requirements) => driver_launch::filter_hosted_device_resource_requirements(
             device_id,
@@ -2258,6 +2539,24 @@ unsafe fn start_filtered_devnode(
     options: HostedPnpStartOptions,
     report: &mut HostedPnpStartReport,
 ) -> HostedPnpDevnodeProgress {
+    match resource_plan.grant_admission() {
+        crate::boot_storage_dma_handoff::ControllerGrantAdmission::Current => {}
+        crate::boot_storage_dma_handoff::ControllerGrantAdmission::Pending => {
+            return HostedPnpDevnodeProgress::GrantAdmissionPending {
+                device_id,
+                resource_plan,
+                filtered_requirements: filtered_resource_requirements,
+            };
+        }
+        crate::boot_storage_dma_handoff::ControllerGrantAdmission::Blocked(status) => {
+            return HostedPnpDevnodeProgress::GrantAdmissionBlocked {
+                device_id,
+                resource_plan,
+                filtered_requirements: filtered_resource_requirements,
+                status,
+            };
+        }
+    }
     let start_status = match grant_prepared_hosted_devnode_resources(
         device_id,
         resource_plan,

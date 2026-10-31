@@ -690,7 +690,9 @@ fn owned_file_query_dispatches_captured_route_and_grant_before_close_during_copy
         Ok(ExternalDispatchResult::Completed {
             status: NtStatus::SUCCESS,
             information: 40,
-            file_context: None
+            file_context: None,
+            completion_driver_id: f.io.device(capture.device_id()).unwrap().driver_id,
+            completion_device_id: capture.device_id(),
         })
     );
     let observed = calls.borrow().last().unwrap().clone();
@@ -1149,7 +1151,9 @@ fn owned_file_set_source_hands_canonical_reference_to_inline_or_pending_irp() {
                 ExternalDispatchResult::Completed {
                     status: NtStatus::SUCCESS,
                     information: 0,
-                    file_context: None
+                    file_context: None,
+                    completion_driver_id: f.io.device(request.device_id).unwrap().driver_id,
+                    completion_device_id: request.device_id,
                 }
             );
             assert!(f.io.pending_irps().is_empty());

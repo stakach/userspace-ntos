@@ -75,6 +75,11 @@ pub(super) unsafe fn retire_hosted_device_projection(
                     return Err(nt_status::NtStatus::INVALID_PARAMETER);
                 }
                 let next_device = read_unaligned((device_exec + 0x10) as *const u64);
+                // An unlinked PDO has no driver list owner. Its provider-writable
+                // NextDevice field cannot introduce a link after publication.
+                if driver_object == 0 && next_device != 0 {
+                    return Err(nt_status::NtStatus::INVALID_PARAMETER);
+                }
                 let mut target_link = None;
                 if driver_object != 0 {
                     let (driver_exec, driver_capacity) =
@@ -120,6 +125,13 @@ pub(super) unsafe fn retire_hosted_device_projection(
                 Ok((device_exec, next_device, target_link, rollback_pdo_exec))
             },
         )?;
+    // The physical registration and pool retirement receipt remain held here. Clear only
+    // ETHREAD fields recorded against this exact registration generation before reuse.
+    if let Some(registration) = physical_registration {
+        crate::service_sec_image::with_provider_process_manager(|pm| {
+            crate::ps_object_backing::clear_device_to_verify_for_registration(pm, registration)
+        }).map_err(|_| nt_status::NtStatus::INVALID_HANDLE)?;
+    }
     let attached_pdo = rollback_pdo_exec.and_then(|pdo_exec| {
         (read_unaligned((pdo_exec + 0x18) as *const u64) == device_object)
             .then(|| (pdo_exec, read_unaligned((device_exec + 0x4c) as *const u8)))

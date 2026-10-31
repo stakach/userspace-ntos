@@ -547,6 +547,13 @@ pub(crate) unsafe fn resume_suspended_receive_component(
         pending.yielded.child,
         pending.yielded.owner,
     );
+    if !select_win32k_client_window(pending.client)
+        || !restore_shared_resume_snapshot(pending.shared_resume, pending.dispatch, pending.client)
+    {
+        return ReceivePumpCompletion::Restored(ProviderWaitPumpCompletion::Failed(
+            nt_process::STATUS_INVALID_PARAMETER as i32,
+        ));
+    }
     let channel = pending.channel;
     let previous = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
     core::ptr::write(
@@ -578,6 +585,7 @@ pub(crate) unsafe fn resume_suspended_receive_component(
             pump,
             channel,
             callback_token: None,
+            shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
             ..pending
         });
     }
@@ -587,6 +595,7 @@ pub(crate) unsafe fn resume_suspended_receive_component(
             dispatch: pending.dispatch,
             client: pending.client,
             callback_token: None,
+            shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
             arg_snapshot_len: pending.arg_snapshot_len,
             arg_snapshot: pending.arg_snapshot,
         });
@@ -642,6 +651,23 @@ pub(crate) unsafe fn resume_suspended_receive_component(
 pub(crate) unsafe fn resume_suspended_service_wait_component(
     pending: PendingServiceWaitDispatch,
 ) -> ServiceWaitPumpCompletion {
+    let selected = select_win32k_client_window(pending.client);
+    let restored = selected
+        && restore_shared_resume_snapshot(pending.shared_resume, pending.dispatch, pending.client);
+    if !restored {
+        static SERVICE_RESTORE_FAILURES: AtomicU64 = AtomicU64::new(0);
+        if SERVICE_RESTORE_FAILURES.fetch_add(1, Ordering::Relaxed) < 8 {
+            print_str(b"[service-wait-resume] stage=restore selected/restored/pi/tid/dispatch=");
+            print_u64(selected as u64); print_str(b"/"); print_u64(restored as u64);
+            print_str(b"/"); print_u64(pending.client.pi as u64);
+            print_str(b"/"); print_u64(pending.client.tid);
+            print_str(b"/"); print_u64(pending.dispatch.dispatch_id);
+            print_str(b"\n");
+        }
+        return ServiceWaitPumpCompletion::Restored(ProviderWaitPumpCompletion::Failed(
+            nt_process::STATUS_INVALID_PARAMETER as i32,
+        ));
+    }
     let channel = pending.channel;
     let previous = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
     core::ptr::write(
@@ -658,6 +684,14 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
     let mut pump = match result {
         Ok(pump) => pump,
         Err(status) => {
+            static SERVICE_CONTINUE_FAILURES: AtomicU64 = AtomicU64::new(0);
+            if SERVICE_CONTINUE_FAILURES.fetch_add(1, Ordering::Relaxed) < 8 {
+                print_str(b"[service-wait-resume] stage=continue pi/tid/dispatch/status=");
+                print_u64(pending.client.pi as u64); print_str(b"/"); print_u64(pending.client.tid);
+                print_str(b"/"); print_u64(pending.dispatch.dispatch_id);
+                print_str(b"/0x"); print_hex(status);
+                print_str(b"\n");
+            }
             return ServiceWaitPumpCompletion::Restored(
                 ProviderWaitPumpCompletion::Failed(status as i32),
             );
@@ -665,7 +699,9 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
     };
     if let Some(yielded) = pump.service_wait_yield {
         return ServiceWaitPumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
-            yielded, pump, channel, callback_token: None, ..pending
+            yielded, pump, channel, callback_token: None,
+            shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
+            ..pending
         });
     }
     if let Some(yielded) = pump.receive_yield {
@@ -674,6 +710,7 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
             dispatch: pending.dispatch,
             client: pending.client,
             callback_token: None,
+            shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
             arg_snapshot_len: pending.arg_snapshot_len,
             arg_snapshot: pending.arg_snapshot,
         });

@@ -1,0 +1,127 @@
+name: Native x86 KVM smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      boot_seconds:
+        description: Bounded guest runtime in seconds
+        type: choice
+        default: '180'
+        options: ['180', '1200', '3600']
+  push:
+    branches: [codex/libernt-userspace]
+    paths: [.github/workflows/native-kvm-smoke.yml, scripts/ci_kvm_smoke.py]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-kvm-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-kvm-smoke:
+    name: Build and boot pinned LiberNT image on KVM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: true
+      - name: Fetch pinned ReactOS source inputs
+        uses: actions/checkout@v4
+        with:
+          repository: reactos/reactos
+          ref: 6d8a5fa0bbec06559af469cfab8c70815c9e442d
+          path: references/reactos
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /dll/win32/shell32/res/rgs/startmenu.rgs
+            /dll/win32/browseui/res/rebarbandsite.rgs
+            /dll/win32/comctl32/amd64_microsoft.windows.common-controls_6595b64144ccf1df_5.82.2600.2982_none_deadbeef.manifest
+            /dll/win32/comctl32/amd64_microsoft.windows.common-controls_6595b64144ccf1df_6.0.2600.2982_none_deadbeef.manifest
+            /win32ss/drivers/miniport/bochs/bochsmp.inf
+      - name: Install native build and QEMU tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang curl libarchive-tools ovmf qemu-system-x86 7zip
+          # Ubuntu's 7zip package exposes 7z; the project uses the equivalent 7zz CLI.
+          if ! command -v 7zz >/dev/null && command -v 7z >/dev/null; then
+            sudo ln -s "$(command -v 7z)" /usr/local/bin/7zz
+          fi
+          for tool in bsdtar 7zz qemu-system-x86_64 clang cc python3; do
+            command -v "$tool"
+          done
+      - name: Install native target-spec compatible nightly
+        run: |
+          # The custom NT target specs were verified with this nightly. The build
+          # scripts invoke +nightly, so link that name to the pinned toolchain.
+          rustup toolchain install nightly-2026-04-30 --profile minimal --component rust-src --target x86_64-pc-windows-gnullvm
+          # rustup reserves the channel name `nightly` for managed toolchains, so
+          # expose the verified dated installation at that conventional path.
+          pinned_sysroot="$(rustc +nightly-2026-04-30 --print sysroot)"
+          test ! -e "$HOME/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu"
+          ln -s "$pinned_sysroot" "$HOME/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu"
+          rustc +nightly --version
+      - name: Stage hive-generator INF input
+        run: |
+          mkdir -p rust-micro/.tmp/reactos/reactos/inf
+          cp references/reactos/win32ss/drivers/miniport/bochs/bochsmp.inf rust-micro/.tmp/reactos/reactos/inf/bochsmp.inf
+      - name: Verify hosted KVM access
+        run: |
+          python3 - <<'PY'
+          import fcntl
+          import os
+          import platform
+          import stat
+          import subprocess
+
+          if platform.machine() != "x86_64":
+              raise SystemExit("hosted runner must be x86_64")
+          path = "/dev/kvm"
+          metadata = os.stat(path)
+          if not stat.S_ISCHR(metadata.st_mode):
+              raise SystemExit(f"{path} is not a character device")
+          try:
+              device = open(path, "rb+", buffering=0)
+          except PermissionError:
+              subprocess.run(["sudo", "-n", "chown", f"{os.getuid()}:{os.getgid()}", path], check=True)
+              device = open(path, "rb+", buffering=0)
+          with device:
+              version = fcntl.ioctl(device, 0xAE00)
+          if version != 12:
+              raise SystemExit(f"unexpected KVM API version {version}")
+          print("hosted KVM API version 12 available")
+          PY
+      - name: Build native image from verified pinned LiberNT release
+        run: |
+          set -o pipefail
+          ./run.sh --build-only 2>&1 | tee native-kvm-build.log
+          sha256sum rust-micro/.tmp/disk.img > native-kvm-image.sha256
+          cp rust-micro/vendor/libernt/manifest.txt native-kvm-libernt-manifest.txt
+      - name: Run bounded KVM startup and capture QMP framebuffer
+        env:
+          QEMU_ACCEL: kvm
+          QEMU_DISPLAY: none
+          GRAPHICS: '1'
+          QEMU_MEMORY: 3072M
+          QEMU_CPUS: '4'
+        run: python3 scripts/ci_kvm_smoke.py --seconds "${{ inputs.boot_seconds || '180' }}" --trace-interrupts
+      - name: Upload native build and startup evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-kvm-smoke-evidence
+          path: |
+            native-kvm-build.log
+            native-kvm-smoke.log
+            native-kvm-smoke.ppm
+            native-kvm-qemu-int-tail.log
+            native-kvm-stall-state.json
+            native-kvm-cpu-samples.jsonl
+            native-kvm-image.sha256
+            native-kvm-libernt-manifest.txt
+            rust-micro/target/mykernel-x86/release/mykernel-rust
+          if-no-files-found: warn

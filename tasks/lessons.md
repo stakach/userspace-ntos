@@ -1,5 +1,34 @@
 # Lessons
 
+## Delegate Bounded Boot Monitoring
+- Assign a read-only agent to monitor each long graphical boot and report only new frontier or failure evidence with log lines and timing. Keep one owner for QEMU, builds, tests, and disk images.
+- Diagnostic code running inside an isolated provider pump may read only pump-owned state. A root-owned heap-backed lookup, even for logging, can page fault the provider; carry bounded metadata across the ownership boundary or correlate receipts offline.
+- A repeated installer INF scan is not by itself durable progress. Have the boot monitor correlate each helper with its exact device job, per-job success event, registry WAL publication, and the no-pending-install event. Do not stop merely because numeric section handles, addresses, or view sizes repeat: first verify backing file identity, view and section generations, and matching map/unmap results. A flat NtRead census does not imply a stalled helper when section maps or attribute probes continue; a capped trace's silence is not evidence of inactivity.
+- If a diagnostic filters concurrent installer helpers, it must verify each live worker through its own process generation and service-parent chain. The bounded grace policy intentionally remembers only the latest INF-probing worker, so using that single owner as a trace filter can silently miss another helper's section activity.
+- Verify a new diagnostic emits at the first known live event before waiting for a late boot frontier. If an existing trace already covers the operation, enrich that same observation without adding an unrelated ownership filter; record optional identities rather than suppressing the event when metadata is unavailable.
+- For a slow boot, keep one read-only monitoring agent on event and process transitions while the build owner investigates the next contract. Require a reproducible stationary state or failing result before altering behavior, and keep the run within its one-hour bound. Record and correct a disproved hypothesis in the issue rather than repeating a boot with another speculative filter.
+- Before a long boot comparison, record host memory pressure and competing VMs. During the run, compare guest milestones and QEMU swapped memory with the prior run; stop early when the projected one-hour cap cannot reach the specific comparison frontier. Do not attribute that shortened run to a guest regression.
+- Stop a boot once a failure makes its acceptance result unusable. Preserve its trace and disk tail, then require a focused regression or new diagnostic question before repeating the run.
+- Match guest object paths case-insensitively and inspect the actual operation receipt before reporting an absent event. The native trace normalizes `Global` names to lowercase; a case-sensitive monitor missed successful setup opens of the PnP completion event.
+- Distinguish a guest reboot API request from a machine reset. Require a second firmware, loader, and kernel-init sequence before claiming a reboot; a setup process can request reboot and exit while the current kernel continues running.
+
+## Check Census Bucket Semantics Before Naming an Owner
+- The final `hot-badge` slot aggregates every badge above the census limit. Read the bucket definition before attributing its time or event count to a process; use exact process samples and syscall traces to identify a hotspot.
+
+## Check The Pinned Storage Provider Before Encoding CDBs
+- ReactOS references can lag the pinned LiberNT release. ReactOS storahci lacks READ CAPACITY16, READ16/WRITE16, and SYNCHRONIZE CACHE, while LiberNT commit `8e478a22a1e8f8a22bab17131f3184a7b4548c3d` implements all of them plus an ATA FLUSH CACHE path. Inspect the exact release source before restricting or submitting a command.
+- A reusable SRB builder does not establish live provider support. Match its command set to the pinned driver source, then verify retained native completion and flush durability before mounting writable storage.
+
+## Keep The Kernel-Facing DLL When Changing Userspace Media
+- An installed distribution supplies the user-mode image and drivers, but this project's
+  source-built `ntdll.dll` is the interface to its NT kernel personality. Stage our DLL
+  in the generated image and leave the release archive and its `acpi.sys` untouched.
+- Compare the built DLL's named exports and ordinals with the distribution DLL before
+  booting. Gate on missing names; report ordinal differences separately when the pinned
+  installed binaries import by name. Scan the whole installed PE tree for ntdll ordinal
+  imports before accepting different ordinals; the pinned LiberNT tree has none. Generate
+  import fixups against the DLL actually staged, and fail on gaps.
+
 ## Stage The Whole Public Export Chain
 - Before committing a tested crate change, inspect `git diff --cached` for every module
   re-export between the new type and the crate root. Local tests can pass from uncommitted
@@ -657,6 +686,9 @@ diagnosis-free failure.
 ## Fix Upstream Source Instead Of Patching Vendor Binaries
 - When a pinned ReactOS binary has a source-level defect, prepare an upstream source pull request
   with the native reproduction and reference accounting. Do not alter the binary locally.
+- Treat load-time instruction rewrites as binary modification too. When hosted code executes a
+  privileged instruction, implement an exact fault/continuation contract in source instead of
+  assuming a fixed image RVA or patchable instruction length in a new release.
 - Keep strict acceptance failed until an official fixed build is integrated and the native fixture
   passes. Track the upstream dependency separately from already-proven desktop acceptance.
 
@@ -664,6 +696,8 @@ diagnosis-free failure.
 - When a user asks to continue with the next issue, check the current open issue list and explicit
   dependency status before choosing it. A failure already waiting on an upstream pull request is
   not a new implementation target unless the user names it.
+- If several independent issues remain and the user's ordering is unclear, ask which one they
+  mean before committing to a new implementation target.
 - If the user corrects that choice, record the excluded issue and continue the remaining requested
   issues without reopening the dependency as a local binary patch.
 
@@ -676,3 +710,60 @@ diagnosis-free failure.
 ## Verify Live Input Before Requesting Desktop Interaction
 - A visible Winlogon frame does not prove that keyboard input reaches i8042 and kbdclass. Send a bounded QMP key event and verify the IRQ and class callback before asking a person to type credentials.
 - When replaying a shorter accepted persistence tail into a larger reserve, clear the entire reserve first. Stale bytes in the unused half can change recovery and invalidate the boot comparison.
+
+## Keep The Kernel Interface In Our Ntdll
+- For a replacement userspace release, stage this project's source-built `ntdll.dll` as the kernel interface and retain the release's unrelated drivers, including `acpi.sys`.
+- Compare exported names against the pinned release `ntdll.dll` and check installed PE imports before boot. Export coverage is an admission gate; live calls and desktop behavior need separate proof.
+- Treat named export coverage as the DLL compatibility requirement when the installed binaries import by name. Audit ordinal imports separately; differing export ordinal numbers alone do not require replacing the source-built kernel interface.
+
+## Test Native Boundaries Through Their Domain Contracts
+- A source-string assertion that only repeats the intended implementation is not a useful regression. Prove filtering, generation, ownership, and selector behavior in the relevant domain or protocol tests, then verify native wiring with a build and boot.
+
+## Preserve The RED Checkpoint With A Sole Test Owner
+- When another agent is the sole build and test owner, save the reproducing regression and stop editing until that agent reports the RED result. Implementing immediately can turn the requested RED checkpoint into an unobserved test.
+
+## Complete Native Contracts Before Closing The Issue
+- Treat a successful callback entry or a boot that advances one frontier as a checkpoint. Close the issue only after its live acceptance criteria, reboot evidence, exact-head CI, and final review pass.
+- When projecting a native interface, validate every supported argument and preserve each handle, alias, and uncertain effect through exact retirement. Fence unsupported operations explicitly; a convenient success result creates hidden debt.
+
+## Restore Suspended Native Lane Metadata As One Owned Context
+- When a native lane's Ps thread is correct but a shared callback or request header names another dispatch, trace the suspension and resume owner before changing callback policy. Keep the cross-process guard.
+- Retain and restore the exact per-dispatch shared metadata at each yield boundary. A failed native hypothesis must be reverted before changing the next path; focused tests alone do not establish live ownership.
+
+## Validate Initialization Callbacks Without Inventing Published Objects
+- Win32k callouts may suspend before their Win32 objects are published. Retain the exact active callout phase, stack activation, generation, and Ps object pair across a permitted callback or wait; an ordinary dispatch still requires both published Win32 objects.
+- A callout may publish its object before returning. Revalidate the current real publication at each resume instead of assuming every callback in that phase sees zero. Treat later root ingress failures as separate ownership failures until the typed receive error is known.
+
+## Separate Initial Thread Targets From Their Creating Callers
+- An initial-thread Ps callout executes for the dormant target, while `NtCreateThread` holds the creating caller's Reply. Capture the target's authenticated provider context before publishing the creation guard, then retain both identities across a provider wait and finish creation only after exact completion.
+- A callback redirect cannot transfer the creating caller's Reply into the target TCB. Require an explicit dual-identity contract before supporting that path; fail closed rather than treating a callback yield as an ordinary wait.
+- A bounded boot that advances to the next process is still a checkpoint. Identify the specific wait object, selection and resume eligibility before changing wake behavior, and keep genuine Explorer and reboot evidence as closure gates.
+
+## Commit Verified Increments During Long Native Bring-Up
+- When the user asks for commits as work proceeds, isolate each proven contract and commit it after its focused tests and native integration evidence, before exploring the next boot frontier.
+- Review staged paths and diff before every commit. Keep diagnostic traces and unrelated edits out; push a changed submodule commit before recording its pointer in the parent.
+- A workspace test can pass against unstaged native source while the committed tree fails CI. Before pushing a partial commit, check each source file read by its regressions against the staged snapshot and include all native call sites needed by the contract.
+- For a selectively staged shared Rust file, parse the staged blob itself before commit. A valid working tree can hide a constant or binding spliced into the middle of another expression in the committed snapshot.
+
+## Keep Long Acceptance Runs Quiet When Requested
+- If the user asks for a completion-only update, continue the authorized validation and repair loop without routine progress messages. Report the full evidence after the issue is actually closed; surface a question only when work cannot continue without an answer.
+
+## Keep DMA Broker Allocations Authoritative
+- A missing native allocation record is not proof that a DMA buffer was freed. A driver can clear shared memory without completing the root Free operation. Reject `PutDmaAdapter` while the root manager still owns a buffer or mapping; do not silently revoke those rows to make retirement succeed.
+- Forward an exact, authenticated Free to the root while the native record is still live. If allocation and Free happen before the next replay, first register the exact bounded buffer with the root, then free it. Clear the local record only after a confirmed root receipt; an uncertain reply retains ownership and stops the provider.
+
+## Resolve The Active Worktree Before Editing
+- Print the Git worktree path before a multi-worktree task. Pass that exact path as `workdir` on every read, edit, and validation command; never rely on the chat's default checkout.
+
+## Keep Native Boot Loops Evidence Driven
+- Assign a read-only monitor to long boots so the build owner can investigate the next failure without repeatedly consuming the boot log. Record a specific failing observation and a focused regression before changing source, then compare the next bounded boot against that observation.
+- When boot progress feels slow, compare phase-specific guest time, disk commands, sectors, snapshot generations, and installer completion across two bounded runs before choosing a kernel change. An aggregate timer or disk count alone cannot identify the active bottleneck; measure the live route and preserve one serial validation owner.
+- When a released dependency fails import resolution, audit its complete pinned IAT against the resolver that actually loads that dependency before another boot. A separate registry or primary-image-only resolver is not proof of dependency coverage. Make one regression report the full missing set so validation does not discover one import per boot.
+- A newly visible warning is not necessarily the current blocker. Track whether the boot advances past it before redirecting implementation work.
+- For QEMU performance comparisons, clone and verify the entire writable disk image before the first run, then restore that full image before each variant. Restoring only a persistence tail leaves FAT32 writes behind and invalidates the comparison.
+- `./run.sh --build-only` recreates the disk from the release tree and resets its snapshot reserve. A native WAL experiment must stage the newly source-built boot payloads into a cloned, verified native-route disk and prove route publication before interpreting fold or latency data. A fresh image's fast MemFs setup is a different lane.
+- Once a controlled comparison has measured a change, resume the newest healthy full end disk for acceptance instead of repeatedly resetting to an older setup baseline. Preserve the baseline and its log for reproducibility, and require WAL replay and exact mount checks after a bounded stop before trusting continued setup progress.
+
+## Fold A Requested Pull Request Without Losing Its Contracts
+- When the user asks to merge one open PR into another, merge its committed branch into an isolated clean checkout of the destination. Preserve both parents and the original dirty worktrees; never treat closure alone as integration.
+- Resolve conflicts at the behavior boundary, then check auto-merged ownership paths as carefully as textual conflicts. Keep the source PR open until the combined head has focused tests, native validation, and exact-head CI; close it with a link to the destination only after its work is represented there.

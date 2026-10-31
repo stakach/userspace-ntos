@@ -5,6 +5,7 @@
 //! - `ntdll-dll-verify [path-to-dll]` (defaults to `.tmp/nt-ntdll.dll`)
 //! - `ntdll-dll-verify --wine-manifest [path-to-ntdll.spec]`
 //! - `ntdll-dll-verify --wine-report [path-to-dll]`
+//! - `ntdll-dll-verify --compare-exports <reference-dll> <built-dll>` (TSV evidence and import gate)
 //!
 //! If our own loader can read it — headers, export directory, relocations — then the executive can
 //! load it in-boot. Exits non-zero on any failure so the build script / CI can gate on it.
@@ -16,6 +17,7 @@ use nt_pe_loader::PeFile;
 use nt_syscall_abi::{NT_SYSCALLS, ZW_ALIASES};
 
 mod native_stub;
+mod export_compare;
 mod wine_spec;
 
 // IMAGE_FILE_CHARACTERISTICS.IMAGE_FILE_DLL
@@ -26,6 +28,27 @@ const PE32PLUS_MAGIC: u16 = 0x020b;
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let first = args.next();
+    if first.as_deref() == Some("--compare-exports") {
+        let Some(reference) = args.next() else {
+            eprintln!("!! --compare-exports requires a reference DLL and a built DLL");
+            return ExitCode::FAILURE;
+        };
+        let Some(built) = args.next() else {
+            eprintln!("!! --compare-exports requires a built DLL");
+            return ExitCode::FAILURE;
+        };
+        if let Some(extra) = args.next() {
+            eprintln!("!! unexpected argument {extra:?}");
+            return ExitCode::FAILURE;
+        }
+        return match export_compare::compare_exports(Path::new(&reference), Path::new(&built)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("!! {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if matches!(first.as_deref(), Some("--wine-manifest" | "--wine-report")) {
         let mode = first.as_deref().unwrap();
         let path = args.next().unwrap_or_else(|| match mode {
@@ -218,6 +241,19 @@ fn main() -> ExitCode {
         };
         let argc = nt_syscall_abi::exact_argc_of(syscall.name)
             .expect("every canonical syscall has an exact argument count");
+        if matches!(syscall.name, "NtInitializeNlsFiles" | "NtGetNlsSectionPtr") {
+            // These named Nt exports map installed NLS files inside ntdll. They retain the
+            // shared ABI name/arity but must never enter the native service table. Check the
+            // emitted PE, not just the Rust source.
+            check(
+                !image
+                    .bytes
+                    .get(export.rva as usize..)
+                    .is_some_and(|body| native_stub::matches(body, syscall.ssn, argc)),
+                &format!("{} native export is a user-mode file mapping", syscall.name),
+            );
+            continue;
+        }
         if !image
             .bytes
             .get(export.rva as usize..)

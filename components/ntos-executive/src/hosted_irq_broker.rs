@@ -653,7 +653,11 @@ impl HostedIrqRootSession {
             0,
             command.arguments,
             marshal_window_source,
-            |singleton, _provider_inst, _exec_code_va, arguments, _caller_rsp| {
+            |singleton, _provider_inst, _exec_code_va, arguments, _caller_rsp, reentrant| {
+                if reentrant.is_some() {
+                    dispatch_error = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                    return Err(STATUS_INVALID_DEVICE_REQUEST);
+                }
                 if singleton.instance != dependency.provider_instance
                     || singleton.owner_domain != dependency.provider_domain
                     || command.service_id >= singleton.image_len as u64
@@ -1372,6 +1376,39 @@ impl HostedIrqRootSession {
         result
     }
 
+    unsafe fn remove_dpc_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let Ok(lane) = self.lane(lane_index) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        if command.target_domain_id != lane.identity.domain_id
+            || command.target_domain_cookie != lane.identity.domain_cookie
+            || command.argument_count != 0
+        {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let root_dpc_grant = self
+            .dpc_grant
+            .is_some_and(|(identity, grant)| identity == lane.identity && grant == command.grant);
+        if !root_dpc_grant && !lane_has_service_grant(lane, command.grant) {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let Some(owner) = HostedDpcOwner::new(
+            lane.identity.domain_id,
+            lane.identity.domain_cookie,
+            lane.identity.lane_generation,
+        ) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        match remove_hosted_driver_dpc(lane.projection_instance, Some(owner), command.service_id) {
+            Ok(removed) => service_result(STATUS_SUCCESS, Some(removed as u64)),
+            Err(status) => fatal_service_result(status.raw()),
+        }
+    }
+
     unsafe fn mdl_service(
         &mut self,
         lane_index: usize,
@@ -1405,6 +1442,104 @@ impl HostedIrqRootSession {
             command.arguments[3],
         );
         service_result(status, None)
+    }
+
+    unsafe fn dma_free_mapping_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let Ok(lane) = self.lane(lane_index) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        if command.service_id != FSD_SERVICE_DMA_ADAPTER_LABEL
+            || command.target_domain_id != lane.identity.domain_id
+            || command.target_domain_cookie != lane.identity.domain_cookie
+            || command.authority_cookie != 0
+            || command.argument_count != 4
+            || command.arguments[..4].iter().any(|argument| *argument == 0)
+            || command.arguments[4..].iter().any(|argument| *argument != 0)
+            || (!self.has_dpc_dispatch_grant(lane, command.grant)
+                && !lane_has_service_grant(lane, command.grant))
+        {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        match service_hosted_irq_lane_dma_free_mapping(
+            lane.projection_instance,
+            lane.identity.domain_id,
+            lane.identity.domain_cookie,
+            command.arguments[0],
+            command.arguments[1],
+            command.arguments[2],
+            command.arguments[3],
+        ) {
+            Ok(()) => service_result(STATUS_SUCCESS, None),
+            Err(status) => fatal_service_result(status.raw()),
+        }
+    }
+
+    unsafe fn set_event_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let Ok(lane) = self.lane(lane_index) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        if command.service_id != FSD_SERVICE_KE_SET_EVENT_LABEL
+            || command.target_domain_id != lane.identity.domain_id
+            || command.target_domain_cookie != lane.identity.domain_cookie
+            || command.authority_cookie != 0
+            || command.argument_count != 1
+            || command.arguments[0] == 0
+            || command.arguments[1..].iter().any(|argument| *argument != 0)
+            || (!self.has_dpc_dispatch_grant(lane, command.grant)
+                && !lane_has_service_grant(lane, command.grant))
+        {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        match service_hosted_irq_lane_set_event(
+            lane.projection_instance,
+            lane.identity.domain_id,
+            lane.identity.domain_cookie,
+            command.arguments[0],
+        ) {
+            Ok(previous) => service_result(STATUS_SUCCESS, Some(previous as u32 as u64)),
+            Err(status) => fatal_service_result(status.raw()),
+        }
+    }
+
+    unsafe fn begin_local_irp_completion_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let Ok(lane) = self.lane(lane_index) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        if command.service_id != FSD_SERVICE_SOURCE_IRP_LABEL
+            || command.target_domain_id != lane.identity.domain_id
+            || command.target_domain_cookie != lane.identity.domain_cookie
+            || command.authority_cookie != 0
+            || command.argument_count != 1
+            || command.arguments[0] == 0
+            || command.arguments[1..].iter().any(|argument| *argument != 0)
+            || (!self.has_dpc_dispatch_grant(lane, command.grant)
+                && !lane_has_service_grant(lane, command.grant))
+        {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let (status, limit, _generation) = hosted_source_irp_ledger::begin_irq_local_completion(
+            lane.projection_instance,
+            lane.identity.domain_id,
+            lane.identity.domain_cookie,
+            command.arguments[0],
+        );
+        if status == STATUS_SUCCESS || status == nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw() {
+            service_result(status, Some(limit))
+        } else {
+            fatal_service_result(status)
+        }
     }
 
     unsafe fn timer_service(
@@ -1503,6 +1638,9 @@ impl HostedIrqRootSession {
             nt_hosted_runtime::HostedIrqServiceKind::QueueDpc => {
                 self.queue_dpc_service(lane_index, command)
             }
+            nt_hosted_runtime::HostedIrqServiceKind::RemoveDpc => {
+                self.remove_dpc_service(lane_index, command)
+            }
             nt_hosted_runtime::HostedIrqServiceKind::Mdl => self.mdl_service(lane_index, command),
             nt_hosted_runtime::HostedIrqServiceKind::TimerCancel
             | nt_hosted_runtime::HostedIrqServiceKind::TimerSet => {
@@ -1516,6 +1654,15 @@ impl HostedIrqRootSession {
             }
             nt_hosted_runtime::HostedIrqServiceKind::ProviderCallbackRequest => {
                 self.provider_callback_service(lane_index, service, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::DmaFreeMapping => {
+                self.dma_free_mapping_service(lane_index, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::SetEvent => {
+                self.set_event_service(lane_index, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::BeginLocalIrpCompletion => {
+                self.begin_local_irp_completion_service(lane_index, command)
             }
             nt_hosted_runtime::HostedIrqServiceKind::ClassServiceRequest => {
                 self.class_callback_service(lane_index, service, command)
@@ -1684,6 +1831,72 @@ impl HostedIrqRootSession {
     }
 }
 
+fn trace_irq_contention(
+    reason: &[u8],
+    connection: HostedIrqConnection,
+    lane: HostedIrqLaneView,
+    holder: Option<InterruptActualLockLease>,
+    arena: Option<nt_hosted_runtime::HostedIrqContentionSnapshot>,
+) {
+    static TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+    if TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 16 { return; }
+    print_str(b"[hosted-irq-contention] reason=");
+    print_str(reason);
+    print_str(b" interrupt/connection/vector=");
+    print_u64(connection.route.tokens.interrupt_id);
+    print_str(b"/");
+    print_u64(connection.rundown.identity().connection_id);
+    print_str(b"/");
+    print_u64(connection.route.tokens.vector as u64);
+    print_str(b" lane=");
+    print_u64(lane.identity.domain_id);
+    print_str(b"/");
+    print_u64(lane.identity.domain_cookie);
+    print_str(b"/");
+    print_u64(lane.identity.lane_generation);
+    print_str(b" lock=");
+    print_hex64(connection.actual_lock.lock_token);
+    print_str(b"/");
+    print_u64(connection.actual_lock.generation);
+    print_str(if reason == b"arena-transaction" {
+        b" attempt-lock="
+    } else {
+        b" held-lock="
+    });
+    if let Some(holder) = holder {
+        print_u64(holder.owner.owner_domain);
+        print_str(b"/");
+        print_u64(holder.owner.owner_cookie);
+        print_str(b"/");
+        print_u64(holder.owner.connection_id);
+        print_str(b"/");
+        print_u64(holder.owner.grant_generation);
+        print_str(b"/");
+        print_u64(holder.sequence);
+    } else {
+        print_str(b"none");
+    }
+    print_str(b" active-arena=");
+    if let Some(arena) = arena {
+        print_u64(arena.active_raw);
+        print_str(b"/");
+        print_u64(arena.class_raw as u64);
+        print_str(b"/");
+        print_u64(arena.current_irql as u64);
+        print_str(b" masks=");
+        print_hex(arena.dispatch_mask);
+        print_str(b"/");
+        print_hex(arena.service_mask);
+        print_str(b"/");
+        print_hex(arena.dispatch_running_mask);
+        print_str(b"/");
+        print_hex(arena.service_running_mask);
+    } else {
+        print_str(b"unavailable");
+    }
+    print_str(b"\n");
+}
+
 pub(super) unsafe fn dispatch_interrupt(
     connection: HostedIrqConnection,
 ) -> Result<HostedIrqRootDispatchOutcome, nt_status::NtStatus> {
@@ -1698,6 +1911,11 @@ pub(super) unsafe fn dispatch_interrupt(
     {
         Ok(lease) => lease,
         Err(InterruptActualLockError::Busy) => {
+            let holder = hosted_irq_actual_locks_mut()
+                .held_lease(connection.actual_lock).ok().flatten();
+            let arena = lane.arena().control
+                .root_contention_snapshot(lane.identity).ok();
+            trace_irq_contention(b"actual-lock", connection, lane, holder, arena);
             return Ok(HostedIrqRootDispatchOutcome::DeferredBusy)
         }
         Err(error) => return Err(hosted_irq_actual_lock_status(error)),
@@ -1709,7 +1927,11 @@ pub(super) unsafe fn dispatch_interrupt(
     ) {
         Ok(transaction) => transaction,
         Err(nt_hosted_runtime::HostedIrqArenaError::Busy) => {
+            // The lease is this attempt's lock, not the competing arena owner.
+            let holder = Some(outer_lock);
+            let snapshot = arena.control.root_contention_snapshot(lane.identity).ok();
             release_hosted_irq_actual_lock_lease(outer_lock)?;
+            trace_irq_contention(b"arena-transaction", connection, lane, holder, snapshot);
             return Ok(HostedIrqRootDispatchOutcome::DeferredBusy);
         }
         Err(error) => {

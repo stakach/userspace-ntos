@@ -5,7 +5,8 @@ use super::*;
 
 use nt_alpc_abi::{
     msg_attr_flag, msg_type, opcode as aop, port_flag, AlpcAcceptConnectRequest,
-    AlpcConnectPortRequest, AlpcContextAttr, AlpcCreatePortRequest, AlpcCreatePortSectionRequest,
+    AlpcCloseCreatedPortRequest, AlpcConnectPortRequest, AlpcContextAttr, AlpcCreatePortRequest,
+    AlpcCreatePortSectionRequest,
     AlpcCreateSectionViewRequest, AlpcDataViewAttr, AlpcHandleRequest, AlpcSendReceiveRequest,
     AlpcViewIoRequest, PortMessage,
 };
@@ -55,6 +56,1403 @@ fn enc_create_port(name: &[u16], flags: u32) -> Vec<u8> {
     let mut b = bytes(&req);
     push_utf16(&mut b, name);
     b
+}
+
+fn enc_checked_create_port(
+    name: &[u16],
+    owner: nt_port_core::ClientId,
+    token: (u64, u64),
+) -> Vec<u8> {
+    let hdr = size_of::<nt_alpc_abi::AlpcCreatePortCheckedRequest>() as u32;
+    let req = nt_alpc_abi::AlpcCreatePortCheckedRequest {
+        create: AlpcCreatePortRequest {
+            abi_size: hdr as u16,
+            max_message_length: 0x1000,
+            name_offset: hdr,
+            name_len_bytes: (name.len() * 2) as u32,
+            ..Default::default()
+        },
+        owner_process: owner.process,
+        owner_thread: owner.thread,
+        owner_generation: 1,
+        invocation_hi: token.0,
+        invocation_lo: token.1,
+    };
+    let mut b = bytes(&req);
+    push_utf16(&mut b, name);
+    b
+}
+
+#[test]
+fn checked_connect_cannot_queue_to_a_protected_port_without_an_access_decision() {
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId { process: 7, thread: 11 };
+    let client = nt_port_core::ClientId { process: 8, thread: 12 };
+    let name = utf16("\\SmApiPort");
+    let header_size = size_of::<nt_alpc_abi::AlpcCreatePortSecuredRequest>();
+    let descriptor = [1, 0, 4, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        20, 0, 0, 0, 2, 0, 8, 0, 0, 0, 0, 0];
+    let request = nt_alpc_abi::AlpcCreatePortSecuredRequest {
+        owned: nt_alpc_abi::AlpcCreatePortOwnedRequest {
+            checked: nt_alpc_abi::AlpcCreatePortCheckedRequest {
+                create: AlpcCreatePortRequest {
+                    abi_size: header_size as u16,
+                    max_message_length: 0x1000,
+                    name_offset: header_size as u32,
+                    name_len_bytes: (name.len() * 2) as u32,
+                    ..Default::default()
+                },
+                owner_process: owner.process,
+                owner_thread: owner.thread,
+                owner_generation: 1,
+                invocation_hi: 3,
+                invocation_lo: 90,
+            },
+            attributes: AlpcPortAttributes { max_message_length: 0x1000, ..Default::default() },
+        },
+        security_offset: (header_size + name.len() * 2) as u32,
+        security_len_bytes: descriptor.len() as u32,
+    };
+    let mut wire = bytes(&request);
+    push_utf16(&mut wire, &name);
+    wire.extend_from_slice(&descriptor);
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &wire, &mut []);
+    assert_eq!(created.status, SUCCESS);
+    let connect = enc_checked_connect(&name, client, (3, 91),
+        &port_message(msg_type::CONNECTION_REQUEST, b"hello"));
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT,
+        &connect, &mut []).status, nt_status::NtStatus::ACCESS_DENIED.0);
+    assert!(matches!(core.receive(created.detail0).unwrap(), ReceiveOutcome::WouldBlock));
+
+    let old_size = size_of::<nt_alpc_abi::AlpcConnectPortCheckedRequest>();
+    let new_size = size_of::<nt_alpc_abi::AlpcConnectPortAuthorizedRequest>();
+    let mut checked: nt_alpc_abi::AlpcConnectPortCheckedRequest =
+        bytemuck::pod_read_unaligned(&connect[..old_size]);
+    checked.connect.abi_size = new_size as u16;
+    checked.connect.name_offset += (new_size - old_size) as u32;
+    checked.connect.message_offset += (new_size - old_size) as u32;
+    let authorized = nt_alpc_abi::AlpcConnectPortAuthorizedRequest {
+        checked,
+        target_listen_handle: created.detail0,
+        access_granted: 1,
+        ..Default::default()
+    };
+    let mut granted_wire = bytes(&authorized);
+    granted_wire.extend_from_slice(&connect[old_size..]);
+    let pending = alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT,
+        &granted_wire, &mut []);
+    assert_eq!(pending.status, nt_status::NtStatus::PENDING.0);
+    assert!(matches!(core.receive(created.detail0).unwrap(),
+        ReceiveOutcome::ConnectionRequest { .. }));
+}
+
+fn enc_create_lookup(owner: nt_port_core::ClientId, token: (u64, u64)) -> Vec<u8> {
+    bytes(&nt_alpc_abi::AlpcLookupCreatePortRequest {
+        abi_size: size_of::<nt_alpc_abi::AlpcLookupCreatePortRequest>() as u16,
+        owner_process: owner.process,
+        owner_thread: owner.thread,
+        owner_generation: 1,
+        invocation_hi: token.0,
+        invocation_lo: token.1,
+        ..Default::default()
+    })
+}
+
+fn enc_checked_receive(
+    port: u64,
+    owner: nt_port_core::ClientId,
+    token: (u64, u64),
+) -> Vec<u8> {
+    bytes(&nt_alpc_abi::AlpcSendReceiveCheckedRequest {
+        send_receive: AlpcSendReceiveRequest {
+            abi_size: size_of::<nt_alpc_abi::AlpcSendReceiveCheckedRequest>() as u16,
+            port_handle: port,
+            ..Default::default()
+        },
+        invocation: nt_alpc_abi::AlpcCheckedInvocation {
+            owner_process: owner.process,
+            owner_thread: owner.thread,
+            owner_generation: 1,
+            invocation_hi: token.0,
+            invocation_lo: token.1,
+        },
+    })
+}
+
+fn enc_ack_receive(owner: nt_port_core::ClientId, token: (u64, u64)) -> Vec<u8> {
+    bytes(&nt_alpc_abi::AlpcAcknowledgeSendReceiveRequest {
+        abi_size: size_of::<nt_alpc_abi::AlpcAcknowledgeSendReceiveRequest>() as u16,
+        invocation: nt_alpc_abi::AlpcCheckedInvocation {
+            owner_process: owner.process,
+            owner_thread: owner.thread,
+            owner_generation: 1,
+            invocation_hi: token.0,
+            invocation_lo: token.1,
+        },
+        ..Default::default()
+    })
+}
+
+fn enc_checked_connect(name: &[u16], owner: nt_port_core::ClientId,
+    token: (u64, u64), message: &[u8]) -> Vec<u8> {
+    let base = size_of::<nt_alpc_abi::AlpcConnectPortCheckedRequest>();
+    let header = nt_alpc_abi::AlpcConnectPortCheckedRequest {
+        connect: AlpcConnectPortRequest {
+            abi_size: base as u16,
+            name_offset: base as u32,
+            name_len_bytes: (name.len() * 2) as u32,
+            message_offset: (base + name.len() * 2) as u32,
+            message_len_bytes: message.len() as u32,
+            ..Default::default()
+        },
+        invocation: nt_alpc_abi::AlpcCheckedInvocation {
+            owner_process: owner.process, owner_thread: owner.thread, owner_generation: 1,
+            invocation_hi: token.0, invocation_lo: token.1,
+        },
+        ..Default::default()
+    };
+    let mut wire = bytes(&header);
+    push_utf16(&mut wire, name);
+    wire.extend_from_slice(message);
+    wire
+}
+
+fn enc_checked_accept(listen: u64, connection_id: u64,
+    owner: nt_port_core::ClientId, token: (u64, u64)) -> Vec<u8> {
+    bytes(&nt_alpc_abi::AlpcAcceptConnectCheckedRequest {
+        accept: AlpcAcceptConnectRequest {
+            abi_size: size_of::<nt_alpc_abi::AlpcAcceptConnectCheckedRequest>() as u16,
+            accept: 1, connection_id, ..Default::default()
+        },
+        invocation: nt_alpc_abi::AlpcCheckedInvocation {
+            owner_process: owner.process, owner_thread: owner.thread, owner_generation: 1,
+            invocation_hi: token.0, invocation_lo: token.1,
+        },
+        listen_port: listen,
+        message_offset: 0,
+        message_len_bytes: 0,
+    })
+}
+
+#[test]
+fn checked_connect_copies_only_native_port_message_payload_and_never_reconnects_token() {
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let server = nt_port_core::ClientId { process: 7, thread: 11 };
+    let client = nt_port_core::ClientId { process: 8, thread: 12 };
+    let name = utf16("\\SmApiPort");
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, server, (3, 40)), &mut []);
+    assert_eq!(created.status, SUCCESS);
+    let wire = enc_checked_connect(&name, client, (3, 41),
+        &port_message(msg_type::CONNECTION_REQUEST, b"hello"));
+    let first = alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &wire, &mut []);
+    assert_eq!(first.status, nt_status::NtStatus::PENDING.0);
+    assert_ne!(first.detail1, 0);
+    assert_eq!(core.connection_info(first.detail1), Some(&b"hello"[..]));
+    assert_eq!(core.connection_client_id(first.detail1), Some(client));
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &wire, &mut []), first);
+    let mut changed = wire.clone();
+    *changed.last_mut().unwrap() = b'!';
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT,
+        &changed, &mut []).status, nt_status::NtStatus::INVALID_PARAMETER.0);
+    let mut output = [0u8; 128];
+    let received = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &enc_checked_receive(created.detail0, server, (3, 42)), &mut output);
+    assert_eq!(received.status, SUCCESS);
+    assert_eq!(&output[40..45], b"hello");
+}
+
+#[test]
+fn libernt_sync_connect_preserves_qos_through_pending_accept_and_exact_replay() {
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let server = nt_port_core::ClientId { process: 7, thread: 11 };
+    let client = nt_port_core::ClientId { process: 8, thread: 12 };
+    let name = utf16("\\SmApiPort");
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, server, (3, 85)), &mut []);
+    assert_eq!(created.status, SUCCESS);
+    let mut wire = enc_checked_connect(&name, client, (3, 86),
+        &port_message(msg_type::CONNECTION_REQUEST, b"SB!!"));
+    let mut header: nt_alpc_abi::AlpcConnectPortCheckedRequest =
+        bytemuck::pod_read_unaligned(&wire[..size_of::<nt_alpc_abi::AlpcConnectPortCheckedRequest>()]);
+    header.connect.connect_flags = 0x0002_0000;
+    header.has_port_attributes = 1;
+    header.port_attributes = nt_alpc_abi::AlpcPortAttributes {
+        max_message_length: 512,
+        security_qos: nt_alpc_abi::SecurityQualityOfService {
+            length: 12, impersonation_level: 1, context_tracking_mode: 1,
+            effective_only: 1, ..Default::default()
+        },
+        ..Default::default()
+    };
+    wire[..size_of::<nt_alpc_abi::AlpcConnectPortCheckedRequest>()]
+        .copy_from_slice(bytemuck::bytes_of(&header));
+    let pending = alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &wire, &mut []);
+    assert_eq!(pending.status, nt_status::NtStatus::PENDING.0);
+    assert_eq!(core.connection_security(pending.detail1), Some(nt_port_core::ConnectionSecurity {
+        impersonation_level: 1, dynamic_tracking: true, effective_only: true,
+    }));
+    assert_eq!(core.connection_limits(pending.detail1).unwrap().max_message, 512);
+    let mut altered = wire.clone();
+    let mut altered_header = header;
+    altered_header.port_attributes.security_qos.impersonation_level = 2;
+    altered[..size_of::<nt_alpc_abi::AlpcConnectPortCheckedRequest>()]
+        .copy_from_slice(bytemuck::bytes_of(&altered_header));
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &altered, &mut []).status,
+        nt_status::NtStatus::INVALID_PARAMETER.0);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &wire, &mut []), pending);
+    let mut received = [0u8; 128];
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &enc_checked_receive(created.detail0, server, (3, 87)), &mut received).status, SUCCESS);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACCEPT_CONNECT,
+        &enc_checked_accept(created.detail0, pending.detail1, server, (3, 88)),
+        &mut []).status, SUCCESS);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &wire, &mut []).status,
+        SUCCESS);
+}
+
+#[test]
+fn checked_accept_requires_a_matching_owned_receive_receipt_even_after_ack() {
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let server = nt_port_core::ClientId { process: 7, thread: 11 };
+    let other = nt_port_core::ClientId { process: 9, thread: 13 };
+    let client = nt_port_core::ClientId { process: 8, thread: 12 };
+    let name = utf16("\\SmApiPort");
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, server, (3, 50)), &mut []);
+    assert_eq!(created.status, SUCCESS);
+    let connection_id = match core.connect_with_client_id(&name, PortApi::Alpc, 0,
+        b"hello", client).unwrap() {
+        nt_port_core::ConnectOutcome::Pending { connection_id } => connection_id,
+        _ => panic!("manual accept requires a pending connection"),
+    };
+    let accept = enc_checked_accept(created.detail0, connection_id, server, (3, 53));
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACCEPT_CONNECT,
+        &accept, &mut []).status, nt_status::NtStatus::INVALID_PARAMETER.0);
+    let mut output = [0u8; 128];
+    let received = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &enc_checked_receive(created.detail0, server, (3, 51)), &mut output);
+    assert_eq!(received.status, SUCCESS);
+    assert_eq!(received.detail0, connection_id);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACK_SEND_RECEIVE,
+        &enc_ack_receive(server, (3, 51)), &mut []).status, SUCCESS);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACCEPT_CONNECT,
+        &enc_checked_accept(created.detail0, connection_id, other, (3, 52)),
+        &mut []).status, nt_status::NtStatus::ACCESS_DENIED.0);
+    let first = alpc.dispatch(&mut core, aop::ALPC_OP_ACCEPT_CONNECT, &accept, &mut []);
+    assert_eq!(first.status, SUCCESS);
+    assert_ne!(first.detail0, 0);
+    assert_ne!(first.detail1, 0);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACCEPT_CONNECT, &accept, &mut []), first);
+}
+
+#[test]
+fn pending_smss_listeners_receive_later_sync_connect_once_and_complete_it() {
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let name = utf16("\\SmApiPort");
+    let smss = nt_port_core::ClientId { process: 4, thread: 24 };
+    let first_worker = nt_port_core::ClientId { process: 4, thread: 44 };
+    let second_worker = nt_port_core::ClientId { process: 4, thread: 48 };
+    let csrss = nt_port_core::ClientId { process: 56, thread: 60 };
+    let listen = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, smss, (3, 100)), &mut []).detail0;
+    let first_receive = enc_checked_receive(listen, first_worker, (3, 101));
+    let second_receive = enc_checked_receive(listen, second_worker, (3, 102));
+    let mut first_output = [0u8; 512];
+    let mut second_output = [0u8; 512];
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &first_receive, &mut first_output).status, nt_status::NtStatus::PENDING.0);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &second_receive, &mut second_output).status, nt_status::NtStatus::PENDING.0);
+
+    let mut connect = enc_checked_connect(&name, csrss, (3, 103),
+        &port_message(msg_type::CONNECTION_REQUEST, b"SB!!"));
+    let mut header: nt_alpc_abi::AlpcConnectPortCheckedRequest =
+        bytemuck::pod_read_unaligned(&connect[..size_of::<nt_alpc_abi::AlpcConnectPortCheckedRequest>()]);
+    header.connect.connect_flags = nt_alpc_abi::connect_flag::SYNC_CONNECTION;
+    connect[..size_of::<nt_alpc_abi::AlpcConnectPortCheckedRequest>()]
+        .copy_from_slice(bytemuck::bytes_of(&header));
+    let pending = alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &connect, &mut []);
+    assert_eq!(pending.status, nt_status::NtStatus::PENDING.0);
+
+    let delivered = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &first_receive, &mut first_output);
+    assert_eq!(delivered.status, SUCCESS);
+    assert_eq!(delivered.detail0, pending.detail1);
+    assert_eq!(delivered.detail1, u64::from(msg_type::CONNECTION_REQUEST));
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &second_receive, &mut second_output).status, nt_status::NtStatus::PENDING.0);
+
+    let accepted = alpc.dispatch(&mut core, aop::ALPC_OP_ACCEPT_CONNECT,
+        &enc_checked_accept(listen, pending.detail1, first_worker, (3, 104)), &mut []);
+    assert_eq!(accepted.status, SUCCESS);
+    let completed = alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &connect, &mut []);
+    assert_eq!(completed.status, SUCCESS);
+    assert_eq!(completed.detail0, accepted.detail1);
+}
+
+#[test]
+fn checked_accept_commits_copied_response_and_connect_poll_returns_exact_bytes() {
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let server = nt_port_core::ClientId { process: 7, thread: 11 };
+    let client = nt_port_core::ClientId { process: 8, thread: 12 };
+    let name = utf16("\\SmApiPort");
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, server, (3, 60)), &mut []);
+    assert_eq!(created.status, SUCCESS);
+    let connect = enc_checked_connect(&name, client, (3, 61),
+        &port_message(msg_type::CONNECTION_REQUEST, b"hello"));
+    let pending = alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &connect, &mut []);
+    assert_eq!(pending.status, nt_status::NtStatus::PENDING.0);
+    let mut received_message = [0u8; 128];
+    let received = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &enc_checked_receive(created.detail0, server, (3, 62)), &mut received_message);
+    assert_eq!(received.status, SUCCESS);
+    assert_eq!(received.detail0, pending.detail1);
+    let mut response = received_message[..42].to_vec();
+    response[0..2].copy_from_slice(&2u16.to_le_bytes());
+    response[2..4].copy_from_slice(&42u16.to_le_bytes());
+    response[40..42].copy_from_slice(b"OK");
+    let mut accept = enc_checked_accept(created.detail0, pending.detail1, server, (3, 63));
+    let mut header: nt_alpc_abi::AlpcAcceptConnectCheckedRequest =
+        bytemuck::pod_read_unaligned(&accept);
+    header.message_offset = accept.len() as u32;
+    header.message_len_bytes = response.len() as u32;
+    accept.copy_from_slice(bytemuck::bytes_of(&header));
+    accept.extend_from_slice(&response);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACCEPT_CONNECT,
+        &accept, &mut []).status, SUCCESS);
+    let mut connector_output = [0u8; 128];
+    let connected = alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT,
+        &connect, &mut connector_output);
+    assert_eq!(connected.status, SUCCESS);
+    assert_eq!(connected.information, 2);
+    assert_eq!(&connector_output[..2], b"OK");
+    assert_eq!(core.connection_response_info(pending.detail1), Some(&b"OK"[..]));
+}
+
+#[test]
+fn checked_later_ports_close_by_exact_token_then_ack_without_replay() {
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let server = nt_port_core::ClientId { process: 7, thread: 11 };
+    let client = nt_port_core::ClientId { process: 8, thread: 12 };
+    let name = utf16("\\SmApiPort");
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, server, (3, 70)), &mut []);
+    let connect = enc_checked_connect(&name, client, (3, 71),
+        &port_message(msg_type::CONNECTION_REQUEST, b"hello"));
+    let pending = alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &connect, &mut []);
+    let mut received = [0u8; 128];
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &enc_checked_receive(created.detail0, server, (3, 72)), &mut received).status, SUCCESS);
+    let accept = enc_checked_accept(created.detail0, pending.detail1, server, (3, 73));
+    let accepted = alpc.dispatch(&mut core, aop::ALPC_OP_ACCEPT_CONNECT, &accept, &mut []);
+    assert_eq!(accepted.status, SUCCESS);
+    let connected = alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &connect, &mut []);
+    assert_eq!(connected.status, SUCCESS);
+    let close = |owner: nt_port_core::ClientId, token: (u64, u64), handle: u64| {
+        bytes(&AlpcCloseCreatedPortRequest {
+            abi_size: size_of::<AlpcCloseCreatedPortRequest>() as u16,
+            handle, owner_process: owner.process, owner_thread: owner.thread,
+            owner_generation: 1, invocation_hi: token.0, invocation_lo: token.1,
+            ..Default::default()
+        })
+    };
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_CLOSE_LATER_PORT,
+        &close(client, (3, 73), accepted.detail0), &mut []).status,
+        nt_status::NtStatus::OBJECT_NAME_COLLISION.0);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACK_ACCEPT_CONNECT,
+        &enc_ack_receive(server, (3, 73)), &mut []).status, SUCCESS);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACK_CONNECT_PORT,
+        &enc_ack_receive(client, (3, 71)), &mut []).status, SUCCESS);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_CLOSE_LATER_PORT,
+        &close(server, (3, 73), accepted.detail0), &mut []).status, SUCCESS);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_CLOSE_LATER_PORT,
+        &close(client, (3, 71), connected.detail0), &mut []).status, SUCCESS);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACCEPT_CONNECT,
+        &accept, &mut []).status, nt_status::NtStatus::OBJECT_NAME_COLLISION.0);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT,
+        &connect, &mut []).status, nt_status::NtStatus::OBJECT_NAME_COLLISION.0);
+}
+
+#[test]
+fn checked_receive_terminal_ack_retires_output_without_permitting_token_replay() {
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId { process: 7, thread: 11 };
+    let client = nt_port_core::ClientId { process: 8, thread: 12 };
+    let name = utf16("\\SmApiPort");
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, owner, (3, 20)), &mut []);
+    assert_eq!(created.status, SUCCESS);
+    let request = enc_checked_receive(created.detail0, owner, (3, 21));
+    let mut output = [0u8; 128];
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &request, &mut output).status, nt_status::NtStatus::PENDING.0);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACK_SEND_RECEIVE,
+        &enc_ack_receive(owner, (3, 21)), &mut []).status,
+        nt_status::NtStatus::INVALID_PARAMETER.0);
+    core.connect_with_client_id(&name, PortApi::Alpc, 0, b"hello", client).unwrap();
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &request, &mut output).status, SUCCESS);
+    let mut foreign = enc_ack_receive(client, (3, 21));
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACK_SEND_RECEIVE,
+        &foreign, &mut []).status, nt_status::NtStatus::OBJECT_NAME_COLLISION.0);
+    foreign = enc_ack_receive(owner, (3, 21));
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACK_SEND_RECEIVE,
+        &foreign, &mut []).status, SUCCESS);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &request, &mut output).status, nt_status::NtStatus::OBJECT_NAME_COLLISION.0);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &enc_checked_receive(created.detail0, owner, (3, 22)), &mut output).status,
+        nt_status::NtStatus::PENDING.0);
+}
+
+#[test]
+fn checked_receive_keeps_oversized_data_queued_for_a_larger_buffer() {
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId { process: 7, thread: 11 };
+    let client = nt_port_core::ClientId { process: 8, thread: 12 };
+    let name = utf16("\\SmApiPort");
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, owner, (3, 30)), &mut []);
+    assert_eq!(created.status, SUCCESS);
+    let connection_id = match core.connect_with_client_id(&name, PortApi::Alpc, 0,
+        &[], client).unwrap() {
+        nt_port_core::ConnectOutcome::Pending { connection_id } => connection_id,
+        _ => panic!("manual accept requires a pending connection"),
+    };
+    let server = core.accept(connection_id, true, 0).unwrap();
+    let (client_handle, _) = core.complete(connection_id).unwrap();
+    let message = port_message(msg_type::REQUEST, b"payload");
+    core.send_message(client_handle, &message, nt_port_core::MessageAttrs::default()).unwrap();
+
+    let mut short = [0u8; 40];
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &enc_checked_receive(server, owner, (3, 31)), &mut short).status,
+        nt_status::NtStatus::BUFFER_TOO_SMALL.0);
+    let mut full = [0u8; 128];
+    let received = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &enc_checked_receive(server, owner, (3, 32)), &mut full);
+    assert_eq!(received.status, SUCCESS);
+    assert_eq!(received.information as usize, message.len());
+    assert_eq!(&full[..message.len()], message);
+}
+
+#[test]
+fn checked_receive_on_owned_listen_port_parks_only_its_owner() {
+    let mut core = PortCore::new();
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId {
+        process: 7,
+        thread: 11,
+    };
+    let intruder = nt_port_core::ClientId {
+        process: 8,
+        thread: 12,
+    };
+    let name = utf16("\\SmApiPort");
+    let created = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, owner, (3, 9)),
+        &mut [],
+    );
+    assert_eq!(created.status, SUCCESS);
+
+    let owned = enc_checked_receive(created.detail0, owner, (3, 10));
+    let first = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &owned, &mut []);
+    assert_eq!(first.status, nt_status::NtStatus::PENDING.0);
+    assert_eq!(
+        alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &owned, &mut []),
+        first
+    );
+    let foreign = enc_checked_receive(created.detail0, intruder, (3, 11));
+    assert_eq!(
+        alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &foreign, &mut [])
+            .status,
+        nt_status::NtStatus::ACCESS_DENIED.0
+    );
+}
+
+#[test]
+fn checked_connection_receive_delivers_a_native_port_message_for_accept() {
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId { process: 7, thread: 11 };
+    let client = nt_port_core::ClientId { process: 8, thread: 12 };
+    let name = utf16("\\SmApiPort");
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, owner, (3, 12)), &mut []);
+    assert_eq!(created.status, SUCCESS);
+    let connection = core.connect_with_client_id(&name, PortApi::Alpc, 0,
+        b"hello", client).unwrap();
+    let connection_id = match connection {
+        nt_port_core::ConnectOutcome::Pending { connection_id } => connection_id,
+        _ => panic!("new connection must wait for acceptance"),
+    };
+    let mut output = [0u8; 128];
+    let received = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &enc_checked_receive(created.detail0, owner, (3, 13)), &mut output);
+    assert_eq!(received.status, SUCCESS);
+    assert_eq!(received.detail0, connection_id);
+    assert_eq!(received.information, 45);
+    let header: PortMessage = bytemuck::pod_read_unaligned(&output[..40]);
+    assert_eq!(header.msg_type, msg_type::CONNECTION_REQUEST);
+    assert_eq!(header.message_id, connection_id as u32);
+    assert_eq!(header.client_process, client.process);
+    assert_eq!(header.client_thread, client.thread);
+    assert_eq!(&output[40..45], b"hello");
+}
+
+#[test]
+fn checked_connection_receive_with_context_output_keeps_message_and_empty_valid_mask() {
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId { process: 7, thread: 11 };
+    let name = utf16("\\SmApiPortAttrs");
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, owner, (3, 20)), &mut []);
+    assert_eq!(created.status, SUCCESS);
+    assert!(matches!(core.connect_with_client_id(&name, PortApi::Alpc, 0,
+        b"hello", nt_port_core::ClientId { process: 8, thread: 12 }).unwrap(),
+        nt_port_core::ConnectOutcome::Pending { .. }));
+    let mut request = enc_checked_receive(created.detail0, owner, (3, 21));
+    request[4..8].copy_from_slice(&nt_alpc_abi::send_flag::RECV_ATTRIBUTES.to_le_bytes());
+    request[24..28].copy_from_slice(&nt_alpc_abi::msg_attr_flag::CONTEXT.to_le_bytes());
+    let mut output = [0u8; 128];
+    let received = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &request, &mut output);
+    assert_eq!(received.status, SUCCESS);
+    assert_eq!(received.information, 53);
+    assert_eq!(u32::from_le_bytes(output[0..4].try_into().unwrap()),
+        nt_alpc_abi::msg_attr_flag::CONTEXT);
+    assert_eq!(u32::from_le_bytes(output[4..8].try_into().unwrap()), 0);
+    let header: PortMessage = bytemuck::pod_read_unaligned(&output[8..48]);
+    assert_eq!(header.msg_type, msg_type::CONNECTION_REQUEST);
+    assert_eq!(&output[48..53], b"hello");
+}
+
+#[test]
+fn checked_smss_reply_and_receive_routes_exact_delivered_request_once() {
+    use nt_port_core::{ClientId, MessageAttrs, MessageIdentity};
+    let mut core = PortCore::new();
+    let mut alpc = AlpcServer::new();
+    let server = ClientId { process: 7, thread: 11 };
+    let identity = MessageIdentity {
+        client: ClientId { process: 8, thread: 12 }, message_id: 91,
+    };
+    let name = utf16("\\SmApiPortReply");
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, server, (3, 80)), &mut []);
+    assert_eq!(created.status, SUCCESS);
+    let listen = created.detail0;
+    let kernel = core.retain_connection_port(listen).unwrap();
+    let mut request = port_message(msg_type::REQUEST, b"hi");
+    request[8..16].copy_from_slice(&identity.client.process.to_le_bytes());
+    request[16..24].copy_from_slice(&identity.client.thread.to_le_bytes());
+    request[24..28].copy_from_slice(&identity.message_id.to_le_bytes());
+    core.send_kernel_request_message(kernel, &request, MessageAttrs::default(), identity).unwrap();
+    let mut received = [0u8; 128];
+    let first = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &enc_checked_receive(listen, server, (3, 81)), &mut received);
+    assert_eq!(first.status, SUCCESS);
+    assert_eq!(&received[..request.len()], &request);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACK_SEND_RECEIVE,
+        &enc_ack_receive(server, (3, 81)), &mut []).status, SUCCESS);
+
+    // SMSS keeps the received header and uses ALPC_MSGFLG_REPLY_MESSAGE.
+    let mut response = port_message(msg_type::REQUEST, b"OK");
+    response[8..16].copy_from_slice(&identity.client.process.to_le_bytes());
+    response[16..24].copy_from_slice(&identity.client.thread.to_le_bytes());
+    response[24..28].copy_from_slice(&identity.message_id.to_le_bytes());
+    let mut wire = enc_checked_receive(listen, server, (3, 82));
+    let mut header: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+        bytemuck::pod_read_unaligned(&wire);
+    header.send_receive.flags = nt_alpc_abi::send_flag::RECV_ATTRIBUTES
+        | nt_alpc_abi::send_flag::REPLY_MESSAGE;
+    header.send_receive.valid_attributes = msg_attr_flag::CONTEXT;
+    header.send_receive.message_offset = wire.len() as u32;
+    header.send_receive.message_len_bytes = response.len() as u32;
+    wire.copy_from_slice(bytemuck::bytes_of(&header));
+    wire.extend_from_slice(&response);
+    let mut output = [0u8; 128];
+    let pending = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &wire, &mut output);
+    assert_eq!(pending.status, nt_status::NtStatus::PENDING.0);
+    let delivered = core.receive_reply_message(kernel, identity).unwrap().unwrap().bytes;
+    assert_eq!(&delivered[8..], &response[8..], "identity and payload survive reply routing");
+    assert_eq!(u16::from_le_bytes(delivered[4..6].try_into().unwrap()), msg_type::REPLY,
+        "ALPC reply delivery must normalize the reused SMSS request header");
+    // A pending poll of the same token must not replay the already sent reply.
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &wire, &mut output).status,
+        nt_status::NtStatus::PENDING.0);
+    assert_eq!(core.receive_reply_message(kernel, identity).unwrap(), None);
+}
+
+#[test]
+fn reply_wait_on_server_comm_port_receives_next_connection_request() {
+    use nt_port_core::{ClientId, ConnectOutcome, MessageAttrs, MessageIdentity};
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let name = utf16("\\ApiPortReplyWait");
+    let server = ClientId { process: 7, thread: 11 };
+    let listen = core.create_port_with_owner(&name, PortApi::Alpc, server);
+    let first_client = ClientId { process: 8, thread: 12 };
+    let ConnectOutcome::Pending { connection_id: first_id } = core
+        .connect_with_client_id(&name, PortApi::Alpc, 0, b"first", first_client)
+        .unwrap() else { panic!("first connect must pend"); };
+    core.receive(listen).unwrap();
+    let server_comm = core.accept(first_id, true, 0).unwrap();
+    let client_comm = core.complete(first_id).unwrap().0;
+    let identity = MessageIdentity { client: first_client, message_id: 91 };
+    let mut request = port_message(msg_type::REQUEST, b"ping");
+    request[8..16].copy_from_slice(&first_client.process.to_le_bytes());
+    request[16..24].copy_from_slice(&first_client.thread.to_le_bytes());
+    request[24..28].copy_from_slice(&identity.message_id.to_le_bytes());
+    core.send_request_message(client_comm, &request, MessageAttrs::default(), identity)
+        .unwrap();
+    assert_eq!(core.receive_message(server_comm).unwrap().unwrap().bytes, request);
+
+    let second_client = ClientId { process: 9, thread: 13 };
+    let ConnectOutcome::Pending { connection_id: second_id } = core
+        .connect_with_client_id(&name, PortApi::Alpc, 0, b"second", second_client)
+        .unwrap() else { panic!("second connect must pend"); };
+    let mut reply_message = port_message(msg_type::REPLY, b"pong");
+    reply_message[8..16].copy_from_slice(&first_client.process.to_le_bytes());
+    reply_message[16..24].copy_from_slice(&first_client.thread.to_le_bytes());
+    reply_message[24..28].copy_from_slice(&identity.message_id.to_le_bytes());
+    let mut wire = enc_checked_receive(server_comm, server, (3, 101));
+    let mut header: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+        bytemuck::pod_read_unaligned(&wire);
+    header.send_receive.flags = nt_alpc_abi::send_flag::REPLY_MESSAGE;
+    header.send_receive.message_offset = wire.len() as u32;
+    header.send_receive.message_len_bytes = reply_message.len() as u32;
+    wire.copy_from_slice(bytemuck::bytes_of(&header));
+    wire.extend_from_slice(&reply_message);
+    let mut output = [0u8; 128];
+    let result = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &wire, &mut output);
+    assert_eq!(result.status, SUCCESS);
+    assert_eq!(result.detail0, second_id);
+    let connection: PortMessage = bytemuck::pod_read_unaligned(&output[..size_of::<PortMessage>()]);
+    assert_eq!(connection.msg_type, msg_type::CONNECTION_REQUEST);
+    assert_eq!(&output[size_of::<PortMessage>()..result.information as usize], b"second");
+    assert_eq!(core.receive_reply_message(client_comm, identity).unwrap().unwrap().bytes,
+        reply_message);
+    let accepted = alpc.dispatch(&mut core, aop::ALPC_OP_ACCEPT_CONNECT,
+        &enc_checked_accept(listen, second_id, server, (3, 102)), &mut []);
+    assert_eq!(accepted.status, SUCCESS,
+        "the receive receipt must name the parent listen port for checked accept");
+}
+
+#[test]
+fn reply_wait_on_server_comm_port_receives_another_clients_request() {
+    use nt_port_core::{ClientId, ConnectOutcome, MessageAttrs, MessageIdentity};
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let name = utf16("\\ApiPortCrossClient");
+    let server = ClientId { process: 7, thread: 11 };
+    let listen = core.create_port_with_owner(&name, PortApi::Alpc, server);
+    let mut comm = [(0, 0); 2];
+    let clients = [ClientId { process: 8, thread: 12 }, ClientId { process: 9, thread: 13 }];
+    for (index, client) in clients.into_iter().enumerate() {
+        let ConnectOutcome::Pending { connection_id } = core
+            .connect_with_client_id(&name, PortApi::Alpc, 0, b"connect", client).unwrap()
+        else { panic!("connection must pend"); };
+        core.receive(listen).unwrap();
+        comm[index] = (core.accept(connection_id, true, 0).unwrap(),
+            core.complete(connection_id).unwrap().0);
+    }
+    let first = MessageIdentity { client: clients[0], message_id: 91 };
+    let mut first_request = port_message(msg_type::REQUEST, b"first");
+    first_request[8..16].copy_from_slice(&first.client.process.to_le_bytes());
+    first_request[16..24].copy_from_slice(&first.client.thread.to_le_bytes());
+    first_request[24..28].copy_from_slice(&first.message_id.to_le_bytes());
+    core.send_request_message(comm[0].1, &first_request, MessageAttrs::default(), first).unwrap();
+    assert_eq!(core.receive_message(comm[0].0).unwrap().unwrap().bytes, first_request);
+
+    let second = MessageIdentity { client: clients[1], message_id: 92 };
+    let mut second_request = port_message(msg_type::REQUEST, b"second");
+    second_request[8..16].copy_from_slice(&second.client.process.to_le_bytes());
+    second_request[16..24].copy_from_slice(&second.client.thread.to_le_bytes());
+    second_request[24..28].copy_from_slice(&second.message_id.to_le_bytes());
+    core.send_request_message(comm[1].1, &second_request, MessageAttrs::default(), second).unwrap();
+
+    let mut reply = port_message(msg_type::REPLY, b"ack");
+    reply[8..16].copy_from_slice(&first.client.process.to_le_bytes());
+    reply[16..24].copy_from_slice(&first.client.thread.to_le_bytes());
+    reply[24..28].copy_from_slice(&first.message_id.to_le_bytes());
+    let mut wire = enc_checked_receive(comm[0].0, server, (3, 103));
+    let mut header: nt_alpc_abi::AlpcSendReceiveCheckedRequest = bytemuck::pod_read_unaligned(&wire);
+    header.send_receive.flags = nt_alpc_abi::send_flag::REPLY_MESSAGE;
+    header.send_receive.message_offset = wire.len() as u32;
+    header.send_receive.message_len_bytes = reply.len() as u32;
+    wire.copy_from_slice(bytemuck::bytes_of(&header));
+    wire.extend_from_slice(&reply);
+    let mut output = [0u8; 128];
+    let result = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &wire, &mut output);
+    assert_eq!(result.status, SUCCESS, "reply-and-wait must receive from the parent listen port");
+    assert_eq!(&output[..result.information as usize], &second_request);
+    assert_eq!(core.receive_reply_message(comm[0].1, first).unwrap().unwrap().bytes, reply);
+    assert_eq!(core.receive_reply_message(comm[1].1, second).unwrap(), None);
+}
+
+#[test]
+fn checked_alpc_connect_observes_lpc_server_completion_without_reconnect() {
+    use nt_port_core::ClientId;
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let name = utf16("\\KernelOwnedPort");
+    let listen = core.create_port_with_owner(&name, PortApi::Lpc, ClientId::default());
+    let client = ClientId { process: 8, thread: 12 };
+    let wire = enc_checked_connect(&name, client, (3, 201),
+        &port_message(msg_type::CONNECTION_REQUEST, b"input"));
+    let mut output = [0u8; 64];
+    let pending = alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &wire, &mut output);
+    assert_eq!(pending.status, nt_status::NtStatus::PENDING.0);
+    let connection_id = pending.detail1;
+    assert!(matches!(core.receive(listen).unwrap(),
+        ReceiveOutcome::ConnectionRequest { connection_id: id, .. } if id == connection_id));
+    assert_eq!(core.connection_info(connection_id), Some(&b"input"[..]));
+    let server_comm = core.accept_with_connection_info(connection_id, true, 0, b"out").unwrap();
+    let (client_comm, completed_id) = core.complete(server_comm).unwrap();
+    assert_eq!(completed_id, connection_id);
+    let completed = alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &wire, &mut output);
+    assert_eq!(completed.status, SUCCESS);
+    assert_eq!(completed.detail0, client_comm);
+    assert_eq!(completed.detail1, connection_id);
+    assert_eq!(&output[..completed.information as usize], b"out");
+    assert_eq!(core.connection_state(connection_id), Some(ConnState::Connected));
+}
+
+#[test]
+fn checked_sync_request_waits_for_its_exact_reply_without_replaying_send() {
+    use nt_port_core::{ClientId, ConnectOutcome, MessageAttrs, MessageIdentity};
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let server = ClientId { process: 7, thread: 11 };
+    let client = ClientId { process: 8, thread: 12 };
+    let name = utf16("\\SmSync");
+    let listen = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, server, (3, 90)), &mut []).detail0;
+    let ConnectOutcome::Pending { connection_id } = core.connect_with_client_id(
+        &name, PortApi::Alpc, 0, b"", client).unwrap() else { panic!("pending connect"); };
+    core.receive(listen).unwrap();
+    let server_port = core.accept(connection_id, true, 0xCAFE_BABE).unwrap();
+    let client_port = core.complete(connection_id).unwrap().0;
+    let mut listener = enc_checked_receive(listen, server, (3, 92));
+    let mut listener_header: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+        bytemuck::pod_read_unaligned(&listener);
+    listener_header.send_receive.flags = nt_alpc_abi::send_flag::RECV_ATTRIBUTES;
+    listener_header.send_receive.valid_attributes = msg_attr_flag::CONTEXT;
+    listener.copy_from_slice(bytemuck::bytes_of(&listener_header));
+    let mut listener_output = [0u8; 128];
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &listener, &mut listener_output).status, nt_status::NtStatus::PENDING.0);
+
+    // Native CSR initializes Type to zero; the ALPC kernel marks a synchronous
+    // client send as LPC_REQUEST before the server's receive loop sees it.
+    let request = port_message(0, b"exec");
+    let mut wire = enc_checked_receive(client_port, client, (3, 91));
+    let mut checked: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+        bytemuck::pod_read_unaligned(&wire);
+    checked.send_receive.flags = 0x0002_0000; // ALPC_MSGFLG_SYNC_REQUEST
+    checked.send_receive.message_offset = wire.len() as u32;
+    checked.send_receive.message_len_bytes = request.len() as u32;
+    checked.send_receive.valid_attributes = msg_attr_flag::CONTEXT;
+    checked.send_receive.attr_offset = (wire.len() + request.len()) as u32;
+    checked.send_receive.attr_len_bytes = size_of::<AlpcContextAttr>() as u32;
+    wire.copy_from_slice(bytemuck::bytes_of(&checked));
+    wire.extend_from_slice(&request);
+    wire.extend_from_slice(&enc_attrs_context(0xBAD_CAFE));
+    let mut output = [0u8; 128];
+    let pending = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &wire, &mut output);
+    assert_eq!(pending.status, nt_status::NtStatus::PENDING.0);
+    let listener_result = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &listener, &mut listener_output);
+    assert_eq!(listener_result.status, SUCCESS);
+    assert_eq!(u32::from_le_bytes(listener_output[4..8].try_into().unwrap()),
+        msg_attr_flag::CONTEXT, "accepted PortContext must be valid on a received request");
+    let context: AlpcContextAttr = bytemuck::pod_read_unaligned(&listener_output[8..40]);
+    assert_eq!(context.port_context, 0xCAFE_BABE);
+    let delivered = &listener_output[40..listener_result.information as usize];
+    let header: PortMessage = bytemuck::pod_read_unaligned(&delivered[..40]);
+    assert_eq!(header.msg_type, msg_type::REQUEST);
+    let identity = MessageIdentity { client, message_id: header.message_id };
+    assert_eq!(header.client_process, client.process);
+    assert_eq!(header.client_thread, client.thread);
+    assert_ne!(identity.message_id, 0);
+    assert_eq!(&delivered[40..], b"exec");
+
+    core.send_message(server_port, b"unrelated", MessageAttrs::default()).unwrap();
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &wire, &mut output).status,
+        nt_status::NtStatus::PENDING.0, "an unrelated datagram is not the reply");
+    let mut response = port_message(msg_type::REPLY, b"OK");
+    response[8..16].copy_from_slice(&client.process.to_le_bytes());
+    response[16..24].copy_from_slice(&client.thread.to_le_bytes());
+    response[24..28].copy_from_slice(&identity.message_id.to_le_bytes());
+    core.send_reply_message(server_port, &response, MessageAttrs::default(), identity).unwrap();
+    let completed = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE, &wire, &mut output);
+    assert_eq!(completed.status, SUCCESS);
+    assert_eq!(&output[..completed.information as usize], &response);
+    assert_eq!(core.receive_message(client_port).unwrap().unwrap().bytes, b"unrelated");
+    assert_eq!(core.receive_message(server_port).unwrap(), None, "redrive did not resend");
+}
+
+#[test]
+fn kernel_srm_endpoint_services_native_alpc_sync_request_through_broker() {
+    use nt_lpc_abi::{opcode as lop, LpcKernelAcceptConnectRequest};
+    use nt_security::{LogonSessionRegistry, Luid, TokenStore, STATUS_LOGON_SESSION_EXISTS};
+    use nt_srm_message::{decode_request, write_reply_fields, RM_CREATE_LOGON_SESSION};
+
+    let mut broker = Server::new();
+    broker.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let name = utf16("\\SeRmCommandPort");
+    let caller = nt_port_core::ClientId { process: 128, thread: 132 };
+    let sender = nt_port_core::ClientId { process: 128, thread: 140 };
+    let listen = {
+        let mut client = LpcClient::new(LpcDirect { server: &mut broker, out: [0; 512] });
+        client.create_port(&name, 4, 0x148, 0x2400).unwrap()
+    };
+    let connect = enc_checked_connect(&name, caller, (1, 20),
+        &port_message(msg_type::CONNECTION_REQUEST, &[]));
+    let pending = alpc.dispatch(broker.core_mut(), aop::ALPC_OP_CONNECT_PORT,
+        &connect, &mut []);
+    assert_eq!(pending.status, NtStatus::PENDING.raw());
+    let connection_id = pending.detail1;
+    let accept = LpcKernelAcceptConnectRequest {
+        abi_size: size_of::<LpcKernelAcceptConnectRequest>() as u16,
+        listen_port: listen, connection_id, client_process: caller.process,
+        client_thread: caller.thread, ..Default::default()
+    };
+    let accepted = broker.dispatch(lop::LPC_OP_KERNEL_ACCEPT_CONNECT,
+        bytemuck::bytes_of(&accept), &mut []);
+    assert_eq!(accepted.status, SUCCESS);
+    let client_port = accepted.detail0;
+    let kernel_server_port = accepted.detail1;
+    assert_ne!(kernel_server_port, 0);
+    assert_eq!(alpc.dispatch(broker.core_mut(), aop::ALPC_OP_CONNECT_PORT,
+        &connect, &mut []).status, SUCCESS);
+
+    let luid = Luid::new(0x4a2d);
+    let mut sessions = LogonSessionRegistry::new();
+    let tokens = TokenStore::new();
+    for (sequence, expected) in [(21, 0), (22, STATUS_LOGON_SESSION_EXISTS)] {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&RM_CREATE_LOGON_SESSION.to_le_bytes());
+        payload.extend_from_slice(&u64::from(luid.low).to_le_bytes());
+        let request = port_message(0, &payload);
+        let mut wire = enc_checked_receive(client_port, sender, (1, sequence));
+        let mut header: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+            bytemuck::pod_read_unaligned(&wire);
+        header.send_receive.flags = nt_alpc_abi::send_flag::SYNC_REQUEST;
+        header.send_receive.message_offset = wire.len() as u32;
+        header.send_receive.message_len_bytes = request.len() as u32;
+        wire.copy_from_slice(bytemuck::bytes_of(&header));
+        wire.extend_from_slice(&request);
+        let mut response = [0u8; 128];
+        assert_eq!(alpc.dispatch(broker.core_mut(), aop::ALPC_OP_SEND_RECEIVE,
+            &wire, &mut response).status, NtStatus::PENDING.raw());
+
+        let received = {
+            let mut kernel = LpcClient::new(LpcDirect { server: &mut broker, out: [0; 512] });
+            kernel.reply_wait_receive(kernel_server_port).unwrap()
+        };
+        assert_eq!(received.connection_id, connection_id);
+        assert_eq!(received.client_process, caller.process);
+        assert_eq!(received.client_thread, caller.thread,
+            "broker provenance records the connecting thread");
+        assert_eq!(received.msg_type, nt_lpc_abi::msg_type::LPC_REQUEST);
+        let delivered: PortMessage = bytemuck::pod_read_unaligned(&received.connection_info[..40]);
+        assert_ne!(delivered.message_id, 0);
+        assert_eq!(delivered.client_process, caller.process);
+        assert_eq!(delivered.client_thread, sender.thread,
+            "broker message identity records the sending thread");
+        let command = decode_request(&received.connection_info, 0x148).unwrap();
+        assert_eq!(command.api_number, RM_CREATE_LOGON_SESSION);
+        assert_eq!(command.luid, Some(u64::from(luid.low)));
+        let result_status = sessions.create(luid).err().unwrap_or(0);
+        assert_eq!(result_status, expected);
+        let mut reply = received.connection_info;
+        write_reply_fields(&mut reply,
+            nt_srm_message::RequestReply { result_status, ..command }).unwrap();
+        {
+            let mut kernel = LpcClient::new(LpcDirect { server: &mut broker, out: [0; 512] });
+            kernel.reply_port(kernel_server_port, &reply).unwrap();
+        }
+        let completed = alpc.dispatch(broker.core_mut(), aop::ALPC_OP_SEND_RECEIVE,
+            &wire, &mut response);
+        assert_eq!(completed.status, SUCCESS);
+        assert_eq!(&response[..completed.information as usize], reply);
+        assert_eq!(u32::from_le_bytes(response[44..48].try_into().unwrap()), expected);
+        assert_eq!(alpc.dispatch(broker.core_mut(), aop::ALPC_OP_ACK_SEND_RECEIVE,
+            &enc_ack_receive(sender, (1, sequence)), &mut []).status, SUCCESS);
+    }
+    assert!(sessions.contains(luid));
+    assert_eq!(broker.core_mut().receive_message(kernel_server_port).unwrap(), None);
+    assert_eq!(sessions.delete(luid, &tokens), Ok(()));
+}
+
+#[test]
+fn pending_reply_wait_delivers_sync_reply_before_next_request() {
+    use nt_port_core::{ClientId, ConnectOutcome, MessageAttrs, MessageIdentity};
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let server = ClientId { process: 7, thread: 11 };
+    let client = ClientId { process: 8, thread: 12 };
+    let name = utf16("\\ApiPortPendingReplyWait");
+    let listen = core.create_port_with_owner(&name, PortApi::Alpc, server);
+    let ConnectOutcome::Pending { connection_id } = core.connect_with_client_id(
+        &name, PortApi::Alpc, 0, b"", client).unwrap() else { panic!("pending connect"); };
+    core.receive(listen).unwrap();
+    let server_comm = core.accept(connection_id, true, 0xCAFE_BABE).unwrap();
+    let client_comm = core.complete(connection_id).unwrap().0;
+
+    let request = port_message(0, b"create-process");
+    let mut client_wire = enc_checked_receive(client_comm, client, (3, 91));
+    let mut client_header: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+        bytemuck::pod_read_unaligned(&client_wire);
+    client_header.send_receive.flags = nt_alpc_abi::send_flag::SYNC_REQUEST;
+    client_header.send_receive.message_offset = client_wire.len() as u32;
+    client_header.send_receive.message_len_bytes = request.len() as u32;
+    client_wire.copy_from_slice(bytemuck::bytes_of(&client_header));
+    client_wire.extend_from_slice(&request);
+    let mut client_output = [0u8; 128];
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &client_wire, &mut client_output).status, nt_status::NtStatus::PENDING.0);
+
+    let mut server_wire = enc_checked_receive(listen, server, (3, 92));
+    let mut server_header: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+        bytemuck::pod_read_unaligned(&server_wire);
+    server_header.send_receive.flags = nt_alpc_abi::send_flag::RECV_ATTRIBUTES;
+    server_header.send_receive.valid_attributes = msg_attr_flag::CONTEXT;
+    server_wire.copy_from_slice(bytemuck::bytes_of(&server_header));
+    let mut server_output = [0u8; 128];
+    let received = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &server_wire, &mut server_output);
+    assert_eq!(received.status, SUCCESS);
+    let delivered: PortMessage = bytemuck::pod_read_unaligned(&server_output[40..80]);
+    assert_eq!(delivered.msg_type, msg_type::REQUEST);
+    let identity = MessageIdentity { client, message_id: delivered.message_id };
+
+    let mut response = port_message(msg_type::REPLY, b"accepted");
+    response[8..16].copy_from_slice(&client.process.to_le_bytes());
+    response[16..24].copy_from_slice(&client.thread.to_le_bytes());
+    response[24..28].copy_from_slice(&identity.message_id.to_le_bytes());
+    let mut reply_wait = enc_checked_receive(server_comm, server, (3, 93));
+    let mut reply_header: nt_alpc_abi::AlpcSendReceiveCheckedRequest =
+        bytemuck::pod_read_unaligned(&reply_wait);
+    reply_header.send_receive.flags =
+        nt_alpc_abi::send_flag::REPLY_MESSAGE | nt_alpc_abi::send_flag::RECV_ATTRIBUTES;
+    reply_header.send_receive.valid_attributes = msg_attr_flag::CONTEXT;
+    reply_header.send_receive.message_offset = reply_wait.len() as u32;
+    reply_header.send_receive.message_len_bytes = response.len() as u32;
+    reply_wait.copy_from_slice(bytemuck::bytes_of(&reply_header));
+    reply_wait.extend_from_slice(&response);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &reply_wait, &mut server_output).status, nt_status::NtStatus::PENDING.0,
+        "server waits for its next request after sending the reply");
+    let completed = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &client_wire, &mut client_output);
+    assert_eq!(completed.status, SUCCESS, "client reply must not wait for the server's next request");
+    assert_eq!(&client_output[..completed.information as usize], &response);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &reply_wait, &mut server_output).status, nt_status::NtStatus::PENDING.0);
+
+    let next_identity = MessageIdentity { client, message_id: 94 };
+    let mut next_request = port_message(msg_type::REQUEST, b"next");
+    next_request[8..16].copy_from_slice(&client.process.to_le_bytes());
+    next_request[16..24].copy_from_slice(&client.thread.to_le_bytes());
+    next_request[24..28].copy_from_slice(&next_identity.message_id.to_le_bytes());
+    core.send_request_message(client_comm, &next_request, MessageAttrs::default(), next_identity)
+        .unwrap();
+    let next = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &reply_wait, &mut server_output);
+    assert_eq!(next.status, SUCCESS);
+    assert_eq!(&server_output[40..next.information as usize], &next_request);
+    assert_eq!(core.receive_reply_message(client_comm, identity).unwrap(), None,
+        "redrive must not send the first reply twice");
+    assert_eq!(core.receive_message(listen).unwrap(), None,
+        "later request was consumed exactly once");
+}
+
+fn enc_owned_create_port(
+    name: &[u16],
+    owner: nt_port_core::ClientId,
+    token: (u64, u64),
+    attributes: nt_alpc_abi::AlpcPortAttributes,
+) -> Vec<u8> {
+    let mut request = enc_checked_create_port(name, owner, token);
+    let name_bytes = request.split_off(size_of::<nt_alpc_abi::AlpcCreatePortCheckedRequest>());
+    let header = (size_of::<nt_alpc_abi::AlpcCreatePortCheckedRequest>()
+        + size_of::<nt_alpc_abi::AlpcPortAttributes>()) as u16;
+    request[0..2].copy_from_slice(&header.to_le_bytes());
+    request[12..16].copy_from_slice(&(header as u32).to_le_bytes());
+    request[8..12].copy_from_slice(&(attributes.max_message_length as u32).to_le_bytes());
+    request[4..8].copy_from_slice(&attributes.flags.to_le_bytes());
+    request.extend_from_slice(bytemuck::bytes_of(&attributes));
+    request.extend_from_slice(&name_bytes);
+    request
+}
+
+#[test]
+fn owned_create_carries_smss_pool_and_security_qos_without_losing_replay_identity() {
+    let mut core = PortCore::new();
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId {
+        process: 7,
+        thread: 11,
+    };
+    let name = utf16("\\SmApiPort");
+    let attributes = nt_alpc_abi::AlpcPortAttributes {
+        max_message_length: 512,
+        max_pool_usage: 8192,
+        security_qos: nt_alpc_abi::SecurityQualityOfService {
+            length: 12,
+            impersonation_level: 1,
+            context_tracking_mode: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let request = enc_owned_create_port(&name, owner, (7, 8), attributes);
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &request, &mut []);
+    assert_eq!(created.status, SUCCESS);
+    assert_eq!(
+        core.handle_info(created.detail0)
+            .unwrap()
+            .limits
+            .max_pool_usage,
+        8192
+    );
+    assert_eq!(
+        alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &request, &mut []),
+        created
+    );
+    let mut changed = attributes;
+    changed.max_pool_usage = 4096;
+    let changed_request = enc_owned_create_port(&name, owner, (7, 8), changed);
+    assert_eq!(
+        alpc.dispatch(
+            &mut core,
+            aop::ALPC_OP_CREATE_PORT,
+            &changed_request,
+            &mut []
+        )
+        .status,
+        nt_status::NtStatus::INVALID_PARAMETER.0
+    );
+    let mut changed_qos = attributes;
+    changed_qos.security_qos.impersonation_level = 2;
+    let changed_request = enc_owned_create_port(&name, owner, (7, 8), changed_qos);
+    assert_eq!(
+        alpc.dispatch(
+            &mut core,
+            aop::ALPC_OP_CREATE_PORT,
+            &changed_request,
+            &mut []
+        )
+        .status,
+        nt_status::NtStatus::INVALID_PARAMETER.0
+    );
+}
+
+#[test]
+fn checked_csrss_port_flags_allow_lpc_clients_only_when_requested() {
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId { process: 7, thread: 11 };
+    let client = nt_port_core::ClientId { process: 8, thread: 12 };
+    let flags = port_flag::ALLOW_LPC_REQUESTS | port_flag::ALLOW_IMPERSONATION;
+    let name = utf16("\\Windows\\ApiPort");
+    let attributes = nt_alpc_abi::AlpcPortAttributes {
+        flags,
+        max_message_length: 512,
+        max_pool_usage: 16 * 4096,
+        security_qos: nt_alpc_abi::SecurityQualityOfService {
+            length: 12,
+            impersonation_level: 2,
+            context_tracking_mode: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_owned_create_port(&name, owner, (7, 80), attributes), &mut []);
+    assert_eq!(created.status, SUCCESS);
+    assert!(matches!(core.connect_with_client_id(&name, PortApi::Lpc, 0,
+        b"csr-client", client), Ok(nt_port_core::ConnectOutcome::Pending { .. })));
+
+    let restricted_name = utf16("\\Windows\\AlpcOnly");
+    let restricted = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_owned_create_port(&restricted_name, owner, (7, 81),
+            nt_alpc_abi::AlpcPortAttributes {
+                flags: port_flag::ALLOW_IMPERSONATION,
+                max_message_length: 512,
+                ..Default::default()
+            }), &mut []);
+    assert_eq!(restricted.status, SUCCESS);
+    assert!(core.connect_with_client_id(&restricted_name, PortApi::Lpc, 0,
+        b"csr-client", client).is_err());
+}
+
+#[test]
+fn owned_create_rejects_unrepresented_limits_before_creating_a_port() {
+    let mut core = PortCore::new();
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId {
+        process: 7,
+        thread: 11,
+    };
+    let name = utf16("\\SmApiPort");
+    let attributes = nt_alpc_abi::AlpcPortAttributes {
+        max_message_length: 512,
+        max_pool_usage: u32::MAX as u64 + 1,
+        ..Default::default()
+    };
+    let request = enc_owned_create_port(&name, owner, (7, 9), attributes);
+    assert_eq!(
+        alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &request, &mut [])
+            .status,
+        nt_status::NtStatus::INVALID_PARAMETER.0
+    );
+    assert!(core.port_api(&name).is_none());
+}
+
+#[test]
+fn checked_create_reconciles_only_exact_owner_token_and_request() {
+    let mut core = PortCore::new();
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId {
+        process: 7,
+        thread: 11,
+    };
+    let intruder = nt_port_core::ClientId {
+        process: 8,
+        thread: 12,
+    };
+    let name = utf16("\\SmApiPort");
+    let request = enc_checked_create_port(&name, owner, (3, 9));
+    let first = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &request, &mut []);
+    assert_eq!(first.status, SUCCESS);
+    assert_eq!(core.handle_info(first.detail0).unwrap().server_id, owner);
+    let again = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &request, &mut []);
+    assert_eq!(again, first);
+    let found = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_LOOKUP_CREATE_PORT,
+        &enc_create_lookup(owner, (3, 9)),
+        &mut [],
+    );
+    assert_eq!(found, first);
+    let wrong_owner = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_LOOKUP_CREATE_PORT,
+        &enc_create_lookup(intruder, (3, 9)),
+        &mut [],
+    );
+    assert_eq!(
+        wrong_owner.status,
+        nt_status::NtStatus::OBJECT_NAME_COLLISION.0
+    );
+    let mut wrong_generation = enc_create_lookup(owner, (3, 9));
+    wrong_generation[24..32].copy_from_slice(&2u64.to_le_bytes());
+    let wrong_generation = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_LOOKUP_CREATE_PORT,
+        &wrong_generation,
+        &mut [],
+    );
+    assert_eq!(
+        wrong_generation.status,
+        nt_status::NtStatus::OBJECT_NAME_COLLISION.0
+    );
+    let changed_name = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&utf16("\\Other"), owner, (3, 9)),
+        &mut [],
+    );
+    assert_eq!(
+        changed_name.status,
+        nt_status::NtStatus::INVALID_PARAMETER.0
+    );
+    let different_owner = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, intruder, (3, 10)),
+        &mut [],
+    );
+    assert_eq!(
+        different_owner.status,
+        nt_status::NtStatus::OBJECT_NAME_COLLISION.0
+    );
+    let same_owner_new_token = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, owner, (3, 11)),
+        &mut [],
+    );
+    assert_eq!(
+        same_owner_new_token.status,
+        nt_status::NtStatus::OBJECT_NAME_COLLISION.0
+    );
+}
+
+#[test]
+fn checked_created_port_close_requires_exact_owner_token_and_handle() {
+    let mut core = PortCore::new();
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId { process: 7, thread: 11 };
+    let name = utf16("\\SmApiPortClose");
+    let create = enc_checked_create_port(&name, owner, (3, 9));
+    let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &create, &mut []);
+    assert_eq!(created.status, SUCCESS);
+    let exact = AlpcCloseCreatedPortRequest {
+        abi_size: size_of::<AlpcCloseCreatedPortRequest>() as u16,
+        handle: created.detail0,
+        owner_process: owner.process,
+        owner_thread: owner.thread,
+        owner_generation: 1,
+        invocation_hi: 3,
+        invocation_lo: 9,
+        ..Default::default()
+    };
+    for changed in [
+        AlpcCloseCreatedPortRequest { owner_process: 8, ..exact },
+        AlpcCloseCreatedPortRequest { owner_generation: 2, ..exact },
+        AlpcCloseCreatedPortRequest { invocation_lo: 10, ..exact },
+        AlpcCloseCreatedPortRequest { handle: created.detail0 + 1, ..exact },
+    ] {
+        assert_ne!(alpc.dispatch(&mut core, aop::ALPC_OP_CLOSE_CREATED_PORT,
+            &bytes(&changed), &mut []).status, SUCCESS);
+        assert!(core.handle_info(created.detail0).is_some());
+    }
+    // A process handle can be closed by a sibling thread. The creation token,
+    // process incarnation and exact service handle remain the authority.
+    let sibling = AlpcCloseCreatedPortRequest { owner_thread: 12, ..exact };
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_CLOSE_CREATED_PORT,
+        &bytes(&sibling), &mut []).status, SUCCESS);
+    assert!(core.handle_info(created.detail0).is_none());
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_CLOSE_CREATED_PORT,
+        &bytes(&exact), &mut []).status, SUCCESS);
+    // Closed state is authoritative for both reconciliation routes, even if
+    // a later service allocation were ever to reuse this numeric handle.
+    let lookup = alpc.dispatch(&mut core, aop::ALPC_OP_LOOKUP_CREATE_PORT,
+        &enc_create_lookup(owner, (3, 9)), &mut []);
+    assert_eq!(lookup.status, nt_status::NtStatus::INVALID_PORT_HANDLE.0);
+    assert_eq!(lookup.detail0, 0);
+    let replay = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &create, &mut []);
+    assert_eq!(replay.status, nt_status::NtStatus::INVALID_PORT_HANDLE.0);
+    assert_eq!(replay.detail0, 0);
+}
+
+#[test]
+fn closed_checked_create_records_are_bounded_without_token_replay() {
+    let mut core = PortCore::new();
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId { process: 7, thread: 11 };
+    let name = utf16("\\SmReopenPort");
+    let mut oldest = Vec::new();
+    for sequence in 1..=200u64 {
+        let wire = enc_checked_create_port(&name, owner, (3, sequence));
+        if sequence == 1 { oldest = wire.clone(); }
+        let created = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &wire, &mut []);
+        assert_eq!(created.status, SUCCESS);
+        let close = AlpcCloseCreatedPortRequest {
+            abi_size: size_of::<AlpcCloseCreatedPortRequest>() as u16,
+            handle: created.detail0,
+            owner_process: owner.process,
+            owner_thread: owner.thread,
+            owner_generation: 1,
+            invocation_hi: 3,
+            invocation_lo: sequence,
+            ..Default::default()
+        };
+        assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_CLOSE_CREATED_PORT,
+            &bytes(&close), &mut []).status, SUCCESS);
+    }
+    assert!(alpc.create_results.len() <= 128);
+    assert!(alpc.create_results.iter().all(|record| record.closed
+        && record.name.is_empty() && record.security_descriptor.is_none()));
+    assert_ne!(alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &oldest, &mut []).status,
+        SUCCESS);
+}
+
+#[test]
+fn checked_create_refuses_zero_token_and_does_not_recreate_closed_result() {
+    let mut core = PortCore::new();
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId {
+        process: 7,
+        thread: 11,
+    };
+    let name = utf16("\\SmApiPort");
+    let invalid = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_CREATE_PORT,
+        &enc_checked_create_port(&name, owner, (0, 0)),
+        &mut [],
+    );
+    assert_eq!(invalid.status, nt_status::NtStatus::INVALID_PARAMETER.0);
+    let mut truncated = enc_checked_create_port(&name, owner, (1, 2));
+    truncated.truncate(size_of::<AlpcCreatePortRequest>());
+    let invalid = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &truncated, &mut []);
+    assert_eq!(invalid.status, nt_status::NtStatus::INVALID_PARAMETER.0);
+    let mut zero_generation = enc_checked_create_port(&name, owner, (1, 2));
+    // generation sits after the 24-byte prefix and the two 64-bit IDs.
+    zero_generation[40..48].fill(0);
+    let invalid = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_CREATE_PORT,
+        &zero_generation,
+        &mut [],
+    );
+    assert_eq!(invalid.status, nt_status::NtStatus::INVALID_PARAMETER.0);
+    let request = enc_checked_create_port(&name, owner, (1, 2));
+    let first = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &request, &mut []);
+    assert_eq!(first.status, SUCCESS);
+    core.close_port_checked(first.detail0).unwrap();
+    let replay = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT, &request, &mut []);
+    assert_eq!(replay.status, nt_status::NtStatus::INVALID_HANDLE.0);
+    let found = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_LOOKUP_CREATE_PORT,
+        &enc_create_lookup(owner, (1, 2)),
+        &mut [],
+    );
+    assert_eq!(found.status, nt_status::NtStatus::INVALID_HANDLE.0);
+    let missing = alpc.dispatch(
+        &mut core,
+        aop::ALPC_OP_LOOKUP_CREATE_PORT,
+        &enc_create_lookup(owner, (1, 3)),
+        &mut [],
+    );
+    assert_eq!(missing.status, nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.0);
 }
 
 fn enc_connect(name: &[u16], subsystem: u32, msg: &[u8]) -> Vec<u8> {
@@ -167,6 +1565,42 @@ fn alpc_create_and_connect_auto_accept() {
     let r = alpc.dispatch(&mut core, aop::ALPC_OP_CONNECT_PORT, &cn, &mut []);
     assert_eq!(r.status, SUCCESS);
     assert_ne!(r.detail0, 0, "client comm-port handle");
+}
+
+#[test]
+fn unchecked_service_rejects_checked_later_requests_before_effects() {
+    let mut core = PortCore::new();
+    let mut alpc = AlpcServer::new();
+    let mut out = [0u8; 64];
+    let connect = nt_alpc_abi::AlpcConnectPortCheckedRequest {
+        connect: AlpcConnectPortRequest {
+            abi_size: size_of::<nt_alpc_abi::AlpcConnectPortCheckedRequest>() as u16,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let accept = nt_alpc_abi::AlpcAcceptConnectCheckedRequest {
+        accept: AlpcAcceptConnectRequest {
+            abi_size: size_of::<nt_alpc_abi::AlpcAcceptConnectCheckedRequest>() as u16,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let send = nt_alpc_abi::AlpcSendReceiveCheckedRequest {
+        send_receive: AlpcSendReceiveRequest {
+            abi_size: size_of::<nt_alpc_abi::AlpcSendReceiveCheckedRequest>() as u16,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for (opcode, request) in [
+        (aop::ALPC_OP_CONNECT_PORT, bytes(&connect)),
+        (aop::ALPC_OP_ACCEPT_CONNECT, bytes(&accept)),
+        (aop::ALPC_OP_SEND_RECEIVE, bytes(&send)),
+    ] {
+        let reply = alpc.dispatch(&mut core, opcode, &request, &mut out);
+        assert_eq!(reply.status, NtStatus::INVALID_PARAMETER.0);
+    }
 }
 
 #[test]
@@ -964,6 +2398,108 @@ fn bridge_lpc_client_to_alpc_host() {
         degrades_to_lpc(&got.attrs),
         "the VIEW attribute does not bridge → the message degrades crossing to LPC"
     );
+}
+
+#[test]
+fn retained_kernel_lpc_request_wakes_pending_checked_alpc_listener() {
+    let mut lpc = Server::new();
+    let mut alpc = AlpcServer::new();
+    let owner = nt_port_core::ClientId { process: 60, thread: 84 };
+    let requester = nt_port_core::ClientId { process: 76, thread: 80 };
+    let name = utf16("\\Windows\\ApiPort");
+    let created = alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_CREATE_PORT,
+        &enc_owned_create_port(&name, owner, (9, 1), nt_alpc_abi::AlpcPortAttributes {
+            flags: port_flag::ALLOW_LPC_REQUESTS | port_flag::ALLOW_IMPERSONATION,
+            max_message_length: 512,
+            ..Default::default()
+        }), &mut []);
+    assert_eq!(created.status, SUCCESS);
+    let listen = created.detail0;
+    let receive = enc_checked_receive(listen, owner, (9, 2));
+    let mut output = [0u8; 512];
+    assert_eq!(alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_SEND_RECEIVE,
+        &receive, &mut output).status, nt_status::NtStatus::PENDING.0);
+
+    let request = port_message(0, b"create-system-thread");
+    let message_id = {
+        let mut client = LpcClient::new(LpcDirect { server: &mut lpc, out: [0; 512] });
+        let retained = client.retain_port_object(listen).unwrap();
+        let pending = client.begin_retained_request_wait_reply(retained, &request,
+            requester.process, requester.thread).unwrap();
+        assert!(matches!(pending, nt_lpc_client::BeginRequestWaitReply::Pending { .. }));
+        pending.message_id()
+    };
+    let delivered = alpc.dispatch(lpc.core_mut(), aop::ALPC_OP_SEND_RECEIVE,
+        &receive, &mut output);
+    assert_eq!(delivered.status, SUCCESS,
+        "the checked ALPC listener must consume the kernel-retained LPC request");
+    assert_eq!(delivered.detail1, u64::from(msg_type::REQUEST));
+    let body = &output[..delivered.information as usize];
+    assert_eq!(&body[40..], b"create-system-thread");
+    assert_eq!(u32::from_le_bytes(body[24..28].try_into().unwrap()), message_id);
+}
+
+#[test]
+fn second_kernel_lpc_request_reaches_accepted_alpc_worker_after_first_reply() {
+    use nt_port_core::{ClientId, ConnectOutcome, MessageAttrs, MessageIdentity};
+    let mut core = PortCore::new();
+    core.set_accept_policy(AcceptPolicy::Manual);
+    let mut alpc = AlpcServer::new();
+    let server = ClientId { process: 60, thread: 84 };
+    let requester = ClientId { process: 76, thread: 80 };
+    let name = utf16("\\Windows\\ApiPortSecond");
+    let listen = alpc.dispatch(&mut core, aop::ALPC_OP_CREATE_PORT,
+        &enc_owned_create_port(&name, server, (9, 30), nt_alpc_abi::AlpcPortAttributes {
+            flags: port_flag::ALLOW_LPC_REQUESTS | port_flag::ALLOW_IMPERSONATION,
+            max_message_length: 512,
+            ..Default::default()
+        }), &mut []).detail0;
+    let ConnectOutcome::Pending { connection_id } = core.connect_with_client_id(
+        &name, PortApi::Alpc, 0, b"", requester).unwrap()
+    else { panic!("ALPC connection must wait for server acceptance"); };
+    core.receive(listen).unwrap();
+    let server_comm = core.accept(connection_id, true, 0).unwrap();
+    core.complete(connection_id).unwrap();
+    let kernel = core.retain_connection_port(listen).unwrap();
+
+    let first_identity = MessageIdentity { client: requester, message_id: 2 };
+    let mut first = port_message(msg_type::REQUEST, b"desktop-thread");
+    first[8..16].copy_from_slice(&requester.process.to_le_bytes());
+    first[16..24].copy_from_slice(&requester.thread.to_le_bytes());
+    first[24..28].copy_from_slice(&first_identity.message_id.to_le_bytes());
+    core.send_kernel_request_message(kernel, &first, MessageAttrs::default(), first_identity)
+        .unwrap();
+    let mut output = [0u8; 512];
+    let listen_receive = enc_checked_receive(listen, server, (9, 31));
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &listen_receive, &mut output).status, SUCCESS);
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_ACK_SEND_RECEIVE,
+        &enc_ack_receive(server, (9, 31)), &mut []).status, SUCCESS);
+    let mut response = port_message(msg_type::REPLY, b"OK");
+    response[8..16].copy_from_slice(&requester.process.to_le_bytes());
+    response[16..24].copy_from_slice(&requester.thread.to_le_bytes());
+    response[24..28].copy_from_slice(&first_identity.message_id.to_le_bytes());
+    core.send_reply_message(server_comm, &response, MessageAttrs::default(), first_identity)
+        .unwrap();
+    assert!(core.receive_reply_message(kernel, first_identity).unwrap().is_some());
+
+    let comm_receive = enc_checked_receive(server_comm, server, (9, 32));
+    assert_eq!(alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &comm_receive, &mut output).status, nt_status::NtStatus::PENDING.0);
+    let second_identity = MessageIdentity { client: requester, message_id: 3 };
+    let mut second = port_message(msg_type::REQUEST, b"input-thread");
+    second[8..16].copy_from_slice(&requester.process.to_le_bytes());
+    second[16..24].copy_from_slice(&requester.thread.to_le_bytes());
+    second[24..28].copy_from_slice(&second_identity.message_id.to_le_bytes());
+    core.send_kernel_request_message(kernel, &second, MessageAttrs::default(), second_identity)
+        .unwrap();
+    let delivered = alpc.dispatch(&mut core, aop::ALPC_OP_SEND_RECEIVE,
+        &comm_receive, &mut output);
+    assert_eq!(delivered.status, SUCCESS,
+        "the accepted ALPC worker must receive a later retained kernel request");
+    assert_eq!(&output[..delivered.information as usize], &second);
+    assert_eq!(core.receive_message(listen).unwrap(), None,
+        "the same request cannot also be delivered on the connection port");
 }
 
 /// Direction 2: an ALPC client connects to a classic-LPC host, over one shared

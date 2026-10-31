@@ -84,6 +84,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
         self.pump_with_report().progress
     }
 
+    /// Explicit outer-turn work pass; callers must not invoke this from nested dispatch/pumps.
+    pub fn service_pending_backends(&mut self) -> usize {
+        self.backends.iter_mut().map(|backend| backend.service_pending()).sum()
+    }
+
     /// Drain ready completions and report whether manager-owned queue storage grew.
     pub fn pump_with_report(&mut self) -> IoPumpReport {
         let storage_before = self.pump_storage_capacity();

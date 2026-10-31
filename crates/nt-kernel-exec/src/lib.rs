@@ -13,8 +13,8 @@
 extern crate alloc;
 
 mod completion;
+pub mod cache_invalidation;
 pub mod apc_state;
-pub mod cr8_getter_patch;
 mod cyclic_ids;
 pub mod dbg;
 mod dispatcher_wait;
@@ -25,21 +25,31 @@ mod event;
 mod event_deferred_signal;
 mod event_object;
 mod event_wait;
+mod ex_rundown;
+mod ex_cache_aware_rundown;
+mod ex_work_queue;
 pub mod executive_sync;
 pub mod gdi_bitmap;
 mod hosted_dpc;
+pub mod hosted_kmutex;
+pub mod hosted_process_exit_notify;
 mod interrupt;
 mod interrupt_lock;
 mod interrupt_rundown;
 mod irql;
 pub mod kevent;
 mod lookaside;
+pub mod luid;
 mod mutant;
 pub mod np_prefix;
 pub mod provider_pool;
+pub mod provider_kernel_alias;
 pub mod process_attach;
+pub mod processor_topology;
+pub mod ipi_broadcast;
 pub mod push_lock;
 pub mod provider_bugcheck;
+pub mod queued_spin_lock;
 pub mod rtl_atom;
 pub mod rtl_bitmap;
 pub mod rtl_time;
@@ -54,8 +64,11 @@ pub mod timezone;
 pub mod user_class;
 pub mod user_cursor;
 pub mod user_string;
+pub mod uuid_v1;
+pub mod win32k_lane_context;
 mod work_item;
 pub mod x86_io;
+pub mod x86_cr8;
 
 pub use completion::{CancelResult, CompleteResult, CompletionState, CompletionTracker};
 pub use cyclic_ids::{select_cyclic_ids, CyclicIdSelection};
@@ -82,6 +95,9 @@ pub use event_wait::{
     acquire_projected_provider_event_wait, acquire_provider_local_event_wait,
     consume_provider_event_wait, provider_event_wait_is_ready, ProviderEventWaitError,
 };
+pub use ex_rundown::{ExRundownRef, ExRundownRelease, ExRundownWaitBlock};
+pub use ex_cache_aware_rundown::ExCacheAwareRundownRef;
+pub use ex_work_queue::{ExQueuedWork, ExWorkQueue, ExWorkQueueError};
 pub use event_object::{
     EventLeaseId, EventLeaseKind, EventObjectError, EventObjectId, EventObjectOwner,
     EventObjectRegistry, EventObjectSnapshot, PendingEventSignal, ProviderEventProjectionCatalog,
@@ -90,8 +106,8 @@ pub use event_object::{
     SignalQueueResult,
 };
 pub use hosted_dpc::{
-    HostedDpcActivation, HostedDpcError, HostedDpcIdentity, HostedDpcOwner, HostedDpcQueueResult,
-    HostedDpcSnapshot, HostedDpcTable,
+    HostedDpcActivation, HostedDpcError, HostedDpcIdentity, HostedDpcImportance, HostedDpcOwner,
+    HostedDpcQueueResult, HostedDpcSnapshot, HostedDpcTable,
 };
 pub use interrupt::{
     InterruptConnectError, InterruptConnection, InterruptMode, InterruptScan,

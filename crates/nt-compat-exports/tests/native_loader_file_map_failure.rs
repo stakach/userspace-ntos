@@ -52,7 +52,7 @@ fn assert_failure_branch(stage: &str, syscall: &str) {
         if !negative.0 { continue; }
         let mut body_calls = Calls::default();
         body_calls.visit_block(&branch.then_branch);
-        assert_eq!(body_calls.0, ["report_file_map_failure"],
+        assert_eq!(body_calls.0, ["report_file_map_failure", "Err"],
             "a negative syscall result must report once, without extra NT calls or pointer reads");
         let mut report_index = None;
         let mut return_index = None;
@@ -69,8 +69,25 @@ fn assert_failure_branch(stage: &str, syscall: &str) {
                 }
             }
             if let syn::Stmt::Expr(syn::Expr::Return(value), _) = statement {
-                assert!(matches!(value.expr.as_deref(), Some(syn::Expr::Path(path))
-                    if named(&path.path, "st")), "failure must return the original syscall status");
+                let Some(syn::Expr::Call(error)) = value.expr.as_deref() else {
+                    panic!("failure must return its stage and original syscall status");
+                };
+                assert!(matches!(&*error.func, syn::Expr::Path(path)
+                    if named(&path.path, "Err")));
+                let Some(syn::Expr::Struct(error)) = error.args.first() else {
+                    panic!("failure must return a typed file-map error");
+                };
+                assert!(named(&error.path, "FileMapError"));
+                assert!(error.fields.iter().any(|field| {
+                    matches!(&field.member, syn::Member::Named(name) if name == "stage")
+                        && matches!(&field.expr, syn::Expr::Path(path)
+                            if named(&path.path, stage))
+                }));
+                assert!(error.fields.iter().any(|field| {
+                    matches!(&field.member, syn::Member::Named(name) if name == "status")
+                        && matches!(&field.expr, syn::Expr::Path(path)
+                            if named(&path.path, "st"))
+                }));
                 return_index = Some(index);
             }
         }

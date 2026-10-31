@@ -87,13 +87,16 @@ unsafe fn inline_irq_work_pending() -> bool {
         || crate::dispatcher_bootstrap::timer_work_pending()
 }
 
-pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: bool) -> PumpMessage {
+pub(super) unsafe fn receive(
+    ch: &PumpChannel, route: PeerRoute, retained_seh: bool, serviced_scheduler_yield: bool,
+) -> PumpMessage {
     let _census_scope = ReceiveCensusScope::enter(ch.caps.kind, retained_seh);
     // A retained exception walk and an ordinary syscall channel without kernel IRQ yield cannot
     // return a scheduler continuation. Give already-latched work one isolated pass here instead.
     let inline_irq_checkpoint =
         retained_seh || (ch.caps.kind == ReqKind::Syscall && !ch.caps.kernel_irq_yield);
     let mut irq_checkpoint = inline_irq_checkpoint && inline_irq_work_pending();
+    let mut timer_probe_consumed = false;
     loop {
         if !retained_seh {
             match crate::win32k_glue::prepare_receive_yield(ch) {
@@ -118,24 +121,46 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
                 Err(_) => panic!("service-wait yield lost its exact physical ownership"),
             }
         }
-        crate::registry_mutation_work::redrive_provider();
-        let connect_ready = crate::driver_launch::nested_hosted_connect_forward_ready();
-        if crate::driver_launch::nested_hosted_driver_create_ready()
-            || crate::driver_launch::nested_hosted_query_path_ready()
-            || crate::driver_launch::nested_hosted_write_ready()
-            || crate::driver_launch::nested_hosted_read_ready()
-            || crate::driver_launch::nested_hosted_flush_ready()
-            || crate::driver_launch::nested_hosted_query_information_ready()
-            || crate::driver_launch::nested_hosted_lower_pnp_ready()
-            || crate::driver_launch::nested_hosted_start_fdo_ready()
-            || connect_ready
-            || crate::driver_launch::nested_hosted_hook_forward_ready()
-            || crate::driver_launch::nested_hosted_kernel_file_read_query_ready()
-            || crate::driver_launch::nested_hosted_win32k_async_read_ready()
-            || crate::hosted_routed_file_close_work::nested_work_ready()
-            || crate::driver_launch::nested_hosted_file_lifecycle_work_ready()
-            || crate::driver_launch::nested_win32k_source_work_ready()
-            || crate::provider_section_broker::nested_work_ready() {
+        // A native SYSTEM fold may finish its second physical slot while this IRP Receive
+        // retains the parent Call. Release its exact CM checkpoint and reserve before a
+        // dependent registry writer retries; the generic outer finalizer cannot run here.
+        if crate::writable_fs::system_wal_fold_ack_pending() {
+            let mut parent = match runtime::nested::park_current() {
+                Ok(parent) => parent,
+                Err(_) => return PumpMessage::transport_wall(),
+            };
+            let progressed = crate::writable_fs::redrive_retained_system_wal_fold_after_native_completion();
+            if runtime::nested::restore(&mut parent).is_err() {
+                return PumpMessage::transport_wall();
+            }
+            if progressed { continue; }
+        }
+        // Timer delivery only records a due fold while the outer service loop is retained.
+        // Enter CM and native snapshot I/O here with the exact Receive parent parked; the
+        // cadence gate prevents a recursive CM call from admitting the same fold again.
+        if crate::service_sec_image::system_wal_fold_work_pending() {
+            let mut parent = match runtime::nested::park_current() {
+                Ok(parent) => parent,
+                Err(_) => return PumpMessage::transport_wall(),
+            };
+            let result = crate::service_sec_image::service_due_system_wal_fold();
+            if runtime::nested::restore(&mut parent).is_err() {
+                return PumpMessage::transport_wall();
+            }
+            match result {
+                Ok(true) => continue,
+                Ok(false) => {},
+                Err(_) => return PumpMessage::transport_wall(),
+            }
+        }
+        let progressed = crate::registry_mutation_work::redrive_provider();
+        // A retained CM mutation can use all sixteen steps and still have a local terminal
+        // phase to run. Take another fair, bounded pass before entering a blocking Receive.
+        // A stalled or ineligible owner returns false, so it cannot spin this pump.
+        if progressed && crate::registry_mutation_work::wake_due(crate::monotonic_time_100ns()) != 0 {
+            continue;
+        }
+        if crate::service_sec_image::nested_hosted_file_work_ready() {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             let mut parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,
@@ -194,11 +219,16 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
                 }
             }
         }
-        if !retained_seh && (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
-            && crate::dispatcher_bootstrap::timer_work_pending()
-        {
+        let timer_checkpoint = !retained_seh
+            && (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
+            && crate::dispatcher_bootstrap::timer_work_pending();
+        if timer_checkpoint && timer_probe_consumed {
             return PumpMessage::scheduler_yield();
         }
+        // A pending timer still gets its scheduler pass, but first give a newly arrived Call
+        // one nonblocking physical receive through the exact retained ingress owner. Otherwise
+        // continuously republished timer demand can starve a worker's READY Call forever.
+        timer_probe_consumed = timer_checkpoint;
         if inline_irq_checkpoint && irq_checkpoint {
             if service_inline_irq_checkpoint(ch, route).is_err() {
                 crate::print_str(b"[pump-ingress] inline IRQ checkpoint lost its route\n");
@@ -216,7 +246,8 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
                 return PumpMessage::transport_wall();
             }
         };
-        let arrival = runtime::receive(execution, ch.tcb, true);
+        let arrival = runtime::receive(execution, ch.tcb,
+            serviced_scheduler_yield || !timer_checkpoint);
         match arrival {
             Ok(runtime::Arrival::Hosted) => {}
             Ok(runtime::Arrival::Call { .. }) => {
@@ -224,6 +255,11 @@ pub(super) unsafe fn receive(ch: &PumpChannel, route: PeerRoute, retained_seh: b
                 // this invocation's stored arrival on the next pass.
             }
             Ok(runtime::Arrival::Notification(message)) => {
+                // The shared ingress has already proven NoCall with a free Reply. An empty
+                // nonblocking probe has no sender and must not count as watchdog progress.
+                if timer_checkpoint && message.badge() == 0 && message.info() == 0 {
+                    return PumpMessage::scheduler_yield();
+                }
                 crate::census_tick_static(crate::monotonic_time_100ns());
                 let (event, _, irq) = pump_handle_executive_event_badge(message.badge());
                 if irq {

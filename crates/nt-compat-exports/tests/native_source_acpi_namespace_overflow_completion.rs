@@ -24,6 +24,7 @@ fn pending_acpi_namespace_overflow_retains_exact_header() {
         "const IRP_MJ_PNP: u64 = 0x1b;\n\
          const IRP_MJ_DEVICE_CONTROL: u64 = 0x0e;\n\
          const STATUS_BUFFER_OVERFLOW: u32 = 0x80000005;\n\
+         const STATUS_BUFFER_TOO_SMALL: u32 = 0xc0000023;\n\
          const HOSTED_ACPI_NAMESPACE_HEADER_LEN: usize = 8;\n\
          mod ioctl {{ pub const METHOD_BUFFERED: u32 = 0; }}\n\
          mod nt_pnp_abi {{ pub const IRP_MN_QUERY_CAPABILITIES: u8 = 0x09; \
@@ -35,6 +36,8 @@ fn pending_acpi_namespace_overflow_retains_exact_header() {
          #[test] fn exact_acpi_probe_only() {{\n\
          assert_eq!(pending_irp_completion_output_len(IRP_MJ_DEVICE_CONTROL, 0, \
          nt_acpi::IOCTL_ACPI_ENUM_CHILDREN, 0, 8, STATUS_BUFFER_OVERFLOW, 0), 8);\n\
+         assert_eq!(pending_irp_completion_output_len(IRP_MJ_DEVICE_CONTROL, 0, \
+         nt_acpi::IOCTL_ACPI_ENUM_CHILDREN, 0, 8, STATUS_BUFFER_TOO_SMALL, 0), 8);\n\
          assert_eq!(pending_irp_completion_output_len(IRP_MJ_DEVICE_CONTROL, 0, \
          nt_acpi::IOCTL_ACPI_ENUM_CHILDREN, 0, 16, STATUS_BUFFER_OVERFLOW, 0), 0);\n\
          assert_eq!(pending_irp_completion_output_len(IRP_MJ_DEVICE_CONTROL, 0, \

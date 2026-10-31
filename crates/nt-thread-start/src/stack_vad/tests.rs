@@ -707,6 +707,152 @@ fn existing_stack_accepts_guard_at_its_own_reservation_base() {
 }
 
 #[test]
+fn existing_released_stack_accepts_three_guard_pages_below_initial_limit() {
+    let mut map = empty();
+    map.allocate(Some(BASE), TOP - BASE, MEM_RESERVE, PAGE_READWRITE)
+        .unwrap();
+    map.allocate(
+        Some(TOP - 4 * PAGE_SIZE),
+        4 * PAGE_SIZE,
+        MEM_COMMIT,
+        PAGE_READWRITE,
+    )
+    .unwrap();
+    map.protect(
+        TOP - 4 * PAGE_SIZE,
+        3 * PAGE_SIZE,
+        PAGE_READWRITE | PAGE_GUARD,
+    )
+    .unwrap();
+    let teb = crate::InitialTeb64 {
+        allocated_stack_base: BASE,
+        stack_base: TOP,
+        stack_limit: TOP - PAGE_SIZE,
+    };
+    let original = map;
+    assert!(validate_existing(&map, teb, TOP - 8).is_ok());
+    assert!(map == original);
+}
+
+#[test]
+fn released_precommitted_guards_grow_without_recharging_then_commit() {
+    let mut current = empty();
+    current
+        .allocate(Some(BASE), TOP - BASE, MEM_RESERVE, PAGE_READWRITE)
+        .unwrap();
+    current
+        .allocate(
+            Some(TOP - 4 * PAGE_SIZE),
+            4 * PAGE_SIZE,
+            MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+        .unwrap();
+    current
+        .protect(
+            TOP - 4 * PAGE_SIZE,
+            3 * PAGE_SIZE,
+            PAGE_READWRITE | PAGE_GUARD,
+        )
+        .unwrap();
+    let mut shape = StackGeometry {
+        allocation_base: BASE,
+        stack_base: TOP,
+        stack_limit: TOP - PAGE_SIZE,
+        guard_base: Some(TOP - 2 * PAGE_SIZE),
+    };
+    let committed = current.committed_bytes();
+    for expected_charge in [0, 0, PAGE_SIZE] {
+        let fault = shape.guard_base.unwrap();
+        let before = current;
+        let mut scratch = empty();
+        let plan = prepare_guard_growth_into(&before, &mut scratch, shape, fault + 8, RW, PAGE_SIZE)
+            .unwrap();
+        let changes = plan.changes();
+        assert_eq!(changes.outcome, StackVadOutcome::Grown);
+        assert_eq!(changes.commit_bytes, expected_charge);
+        assert_eq!(changes.geometry.stack_limit, fault);
+        assert_eq!(changes.new_guard, Some(fault - PAGE_SIZE));
+        assert_eq!(plan.candidate().protection_at(fault), Some(PAGE_READWRITE));
+        assert_eq!(
+            plan.candidate().protection_at(fault - PAGE_SIZE),
+            Some(PAGE_READWRITE | PAGE_GUARD)
+        );
+        plan.apply_exact(&mut current).unwrap();
+        shape = changes.geometry;
+    }
+    assert_eq!(current.committed_bytes(), committed + PAGE_SIZE);
+}
+
+#[test]
+fn precommitted_next_guard_needs_no_new_commit_budget() {
+    let mut current = empty();
+    current
+        .allocate(Some(BASE), TOP - BASE, MEM_RESERVE, PAGE_READWRITE)
+        .unwrap();
+    current
+        .allocate(Some(TOP - 3 * PAGE_SIZE), 3 * PAGE_SIZE, MEM_COMMIT, PAGE_READWRITE)
+        .unwrap();
+    current
+        .protect(TOP - 3 * PAGE_SIZE, 2 * PAGE_SIZE, PAGE_READWRITE | PAGE_GUARD)
+        .unwrap();
+    let shape = StackGeometry {
+        allocation_base: BASE,
+        stack_base: TOP,
+        stack_limit: TOP - PAGE_SIZE,
+        guard_base: Some(TOP - 2 * PAGE_SIZE),
+    };
+    let mut scratch = empty();
+    let plan = prepare_guard_growth_into(
+        &current,
+        &mut scratch,
+        shape,
+        shape.guard_base.unwrap(),
+        RW,
+        0,
+    )
+    .unwrap();
+    assert_eq!(plan.changes().outcome, StackVadOutcome::Grown);
+    assert_eq!(plan.changes().commit_bytes, 0);
+}
+
+#[test]
+fn existing_stack_rejects_unprotected_committed_page_below_guard() {
+    let mut map = empty();
+    map.allocate(Some(BASE), TOP - BASE, MEM_RESERVE, PAGE_READWRITE)
+        .unwrap();
+    map.allocate(
+        Some(TOP - 4 * PAGE_SIZE),
+        4 * PAGE_SIZE,
+        MEM_COMMIT,
+        PAGE_READWRITE,
+    )
+    .unwrap();
+    map.protect(
+        TOP - 2 * PAGE_SIZE,
+        PAGE_SIZE,
+        PAGE_READWRITE | PAGE_GUARD,
+    )
+    .unwrap();
+    let teb = crate::InitialTeb64 {
+        allocated_stack_base: BASE,
+        stack_base: TOP,
+        stack_limit: TOP - PAGE_SIZE,
+    };
+    assert_eq!(
+        validate_existing(&map, teb, TOP - 8),
+        Err(StackVadError::AllocationChanged)
+    );
+}
+
+#[test]
+fn existing_initial_context_accepts_one_past_writable_stack_top() {
+    let shape = geometry(11);
+    let map = initialized(shape, PAGE_READWRITE);
+    assert_eq!(validate_existing(&map, initial_teb(shape), TOP), Ok(shape));
+}
+
+#[test]
 fn existing_stack_rejects_rsp_outside_usable_suffix() {
     let shape = geometry(11);
     let map = initialized(shape, PAGE_READWRITE);
@@ -715,7 +861,7 @@ fn existing_stack_rejects_rsp_outside_usable_suffix() {
         BASE,
         shape.guard_base.unwrap(),
         shape.stack_limit - 1,
-        TOP,
+        TOP + 1,
         u64::MAX,
     ] {
         assert_eq!(
@@ -736,10 +882,12 @@ fn existing_stack_requires_writable_non_guard_rsp_page() {
         let mut map = initialized(shape, PAGE_READWRITE);
         map.protect(TOP - PAGE_SIZE, PAGE_SIZE, protection).unwrap();
         let original = map;
-        assert_eq!(
-            validate_existing(&map, initial_teb(shape), TOP - 8),
-            Err(StackVadError::InvalidStackPointer)
-        );
+        for rsp in [TOP - 8, TOP] {
+            assert_eq!(
+                validate_existing(&map, initial_teb(shape), rsp),
+                Err(StackVadError::InvalidStackPointer)
+            );
+        }
         assert!(map == original);
     }
 }

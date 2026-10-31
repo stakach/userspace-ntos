@@ -36,7 +36,44 @@ impl MountedVolumeBackend {
         }
         let file_id = irp.file_id.ok_or(NtStatus::INVALID_PARAMETER)?;
         let record = self.opens.get(context, file_id.raw()).map_err(status)?;
-        {
+        let physical_mount = unsafe { crate::fs_loader::exec_fs_mount_identity() }
+            .ok_or(NtStatus::DEVICE_NOT_READY)?;
+        let route_kind = crate::fs_loader::exec_block_route_kind(physical_mount)
+            .ok_or(NtStatus::DEVICE_NOT_READY)?;
+        if route_kind != nt_fs::BlockSourceKind::Boot {
+            if let Some(cluster) = binding.installed_directory_cluster {
+                let installed_path = match record.source {
+                    nt_fs::LayeredOpenSource::Installed { .. } => Some(self.directories
+                        .get(binding.directory_open.ok_or(NtStatus::INVALID_HANDLE)?)
+                        .map_err(status)?.volume_relative_path()),
+                    nt_fs::LayeredOpenSource::Overlay { .. } => None,
+                };
+                let source = directory_source::capture_directory_source(
+                    record.source, record.name, installed_path,
+                ).map_err(status)?;
+                let mut output = Vec::new();
+                output.try_reserve_exact(length).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+                output.resize(length, 0);
+                let geometry = nt_fs::FatPathGeometry {
+                    fat_start_sector: self.fs.fat_start,
+                    data_start_sector: self.fs.data_start,
+                    total_sectors: self.fs.total_sectors,
+                    sectors_per_cluster: self.fs.spc,
+                };
+                let lookup = nt_fs::FatDirectoryLookup::new(geometry, cluster)
+                    .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+                self.pending_directories.borrow_mut().capture(irp.irp_id.raw(),
+                    physical_mount.value(), CapturedDirectory {
+                        irp: irp.irp_id, file: file_id, context, relative: source.relative,
+                        overlay_file: source.overlay_file, parameters: parameters.clone(),
+                        return_single: irp.flags.contains(nt_io_manager::StackFlags::RETURN_SINGLE_ENTRY),
+                        restart_scan: irp.flags.contains(nt_io_manager::StackFlags::RESTART_SCAN),
+                        output,
+                    }, lookup).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+                return Ok(DispatchOutcome::Pending);
+            }
+        }
+        if route_kind == nt_fs::BlockSourceKind::Boot {
             // First use may restore and publish the persistent writable filesystem.
             let _durable = crate::allocator::enter_durable();
             unsafe { crate::writable_fs::ensure_mounted() }.map_err(status)?;
@@ -69,10 +106,13 @@ impl MountedVolumeBackend {
                     if !binding.overlay_open {
                         return Err(NtStatus::INVALID_HANDLE);
                     }
-                    Some(
-                        unsafe { crate::writable_fs::directory_entries_opened(file_id) }
-                            .map_err(status)?,
-                    )
+                    Some(unsafe {
+                        if route_kind == nt_fs::BlockSourceKind::Boot {
+                            crate::writable_fs::directory_entries_opened(file_id)
+                        } else {
+                            crate::writable_fs::directory_entries_opened_if_mounted(file_id)
+                        }
+                    }.map_err(status)?)
                 }
                 nt_fs::LayeredOpenSource::Installed { .. } => {
                     let open = self
@@ -80,9 +120,12 @@ impl MountedVolumeBackend {
                         .get(binding.directory_open.ok_or(NtStatus::INVALID_HANDLE)?)
                         .map_err(status)?;
                     unsafe {
-                        crate::writable_fs::directory_entries_relative(open.volume_relative_path())
-                    }
-                    .map_err(status)?
+                        if route_kind == nt_fs::BlockSourceKind::Boot {
+                            crate::writable_fs::directory_entries_relative(open.volume_relative_path())
+                        } else {
+                            crate::writable_fs::directory_entries_relative_if_mounted(open.volume_relative_path())
+                        }
+                    }.map_err(status)?
                 }
             };
             let entries = nt_fs::merge_layered_directory_entries(

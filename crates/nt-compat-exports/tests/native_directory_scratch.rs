@@ -108,10 +108,23 @@ fn lazy_volume_mount_uses_durable_scope_after_admission_before_scratch() {
     let prepared = method.block.stmts[..index]
         .iter()
         .position(|statement| {
-            let syn::Stmt::Expr(syn::Expr::Block(block), _) = statement else {
+            let syn::Stmt::Expr(syn::Expr::If(branch), _) = statement else {
                 return false;
             };
-            let observed = facts(&block.block);
+            // Boot may lazily restore the writable volume. Native queries use the
+            // already-mounted namespace and must not reenter boot storage here.
+            let syn::Expr::Binary(condition) = &*branch.cond else {
+                return false;
+            };
+            if !matches!(&condition.op, syn::BinOp::Eq(_))
+                || !matches!(&*condition.left, syn::Expr::Path(path)
+                    if path.path.is_ident("route_kind"))
+                || !matches!(&*condition.right, syn::Expr::Path(path)
+                    if path.path.segments.last().is_some_and(|segment| segment.ident == "Boot"))
+            {
+                return false;
+            }
+            let observed = facts(&branch.then_branch);
             let Some(durable) = observed
                 .calls
                 .iter()

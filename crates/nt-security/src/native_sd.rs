@@ -73,6 +73,7 @@ pub const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
 pub const GROUP_SECURITY_INFORMATION: u32 = 0x0000_0002;
 pub const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
 pub const SACL_SECURITY_INFORMATION: u32 = 0x0000_0008;
+pub const LABEL_SECURITY_INFORMATION: u32 = 0x0000_0010;
 pub const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
 pub const PROTECTED_SACL_SECURITY_INFORMATION: u32 = 0x4000_0000;
 pub const UNPROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x2000_0000;
@@ -81,7 +82,8 @@ pub const UNPROTECTED_SACL_SECURITY_INFORMATION: u32 = 0x1000_0000;
 const QUERY_SECURITY_INFORMATION_MASK: u32 = OWNER_SECURITY_INFORMATION
     | GROUP_SECURITY_INFORMATION
     | DACL_SECURITY_INFORMATION
-    | SACL_SECURITY_INFORMATION;
+    | SACL_SECURITY_INFORMATION
+    | LABEL_SECURITY_INFORMATION;
 const SET_SECURITY_INFORMATION_MASK: u32 = QUERY_SECURITY_INFORMATION_MASK
     | PROTECTED_DACL_SECURITY_INFORMATION
     | PROTECTED_SACL_SECURITY_INFORMATION
@@ -121,6 +123,7 @@ const ACCESS_DENIED_ACE_TYPE: u8 = 0x01;
 const SYSTEM_AUDIT_ACE_TYPE: u8 = 0x02;
 const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 0x05;
 const ACCESS_DENIED_OBJECT_ACE_TYPE: u8 = 0x06;
+const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
 const ACE_OBJECT_TYPE_PRESENT: u32 = 0x0000_0001;
 const ACE_INHERITED_OBJECT_TYPE_PRESENT: u32 = 0x0000_0002;
 
@@ -216,6 +219,75 @@ pub fn security_descriptor_bytes_for_access(bytes: &[u8]) -> Result<SecurityDesc
             .map(|acl| convert_native_acl_bytes(acl, true))
             .transpose()?,
     })
+}
+
+/// The mandatory label is separate from the ordinary access ACL. Its mask is
+/// integrity policy, not an object access mask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MandatoryLabel {
+    pub level: u32,
+    pub policy: u32,
+}
+
+/// Project ordinary discretionary access and the mandatory label separately. A label is not an
+/// access ACE; callers retain the original descriptor and apply the label to the object rights.
+fn descriptor_and_label_for_access(bytes: &[u8]) -> Result<(SecurityDescriptor, Option<MandatoryLabel>), u32> {
+    let parsed = parse_self_relative_descriptor(bytes)?;
+    let mut label = None;
+    if let Some(sacl) = parsed.sacl {
+        let sacl = NativeAcl::validated_prefix(sacl).map_err(|error| error.status())?;
+        let mut offset = 8usize;
+        for _ in 0..read_u16(sacl, 4) {
+            let size = read_u16(sacl, offset + 2) as usize;
+            let ace = &sacl[offset..offset + size];
+            match ace[0] {
+                SYSTEM_MANDATORY_LABEL_ACE_TYPE => {
+                    if label.is_some() || ace.len() != 20
+                        || ace[1] & !(0x10 | INHERIT_ONLY_ACE) != 0
+                        || ace[8..16] != [1, 1, 0, 0, 0, 0, 0, 16]
+                    {
+                        return Err(crate::STATUS_INVALID_ACL);
+                    }
+                    let policy = read_u32(ace, 4);
+                    if policy & !7 != 0 {
+                        return Err(crate::STATUS_INVALID_ACL);
+                    }
+                    // An inherit-only ACE does not label this object. The default object label
+                    // is Medium with NO_WRITE_UP; its inherited copy can label a child.
+                    label = Some(if ace[1] & INHERIT_ONLY_ACE != 0 {
+                        MandatoryLabel { level: 0x2000, policy: 1 }
+                    } else {
+                        MandatoryLabel { level: read_u32(ace, 16), policy }
+                    });
+                }
+                2 => {
+                    // Audit ACEs do not grant access; audit delivery belongs to the owner.
+                    crate::native_acl_inheritance::validate_known_native_ace(ace, sacl[0])?;
+                }
+                _ => return Err(0xc000_00bb), // STATUS_NOT_SUPPORTED
+            }
+            offset += size;
+        }
+    }
+    let descriptor = SecurityDescriptor {
+        owner: parsed.owner.map(Sid::from_native_bytes).transpose()?,
+        group: parsed.group.map(Sid::from_native_bytes).transpose()?,
+        dacl: parsed.dacl.map(|acl| convert_native_acl_bytes(acl, true)).transpose()?,
+        sacl: None,
+    };
+    Ok((descriptor, label))
+}
+
+pub(crate) fn port_descriptor_for_access(
+    bytes: &[u8],
+) -> Result<(SecurityDescriptor, Option<MandatoryLabel>), u32> {
+    descriptor_and_label_for_access(bytes)
+}
+
+pub(crate) fn directory_descriptor_for_access(
+    bytes: &[u8],
+) -> Result<(SecurityDescriptor, Option<MandatoryLabel>), u32> {
+    descriptor_and_label_for_access(bytes)
 }
 
 fn capture_descriptor(
@@ -395,6 +467,16 @@ pub fn query_security_descriptor_bytes(
         return Err(STATUS_INVALID_PARAMETER);
     }
     let current = parse_self_relative_descriptor(object_descriptor)?;
+    let label_sacl = if security_information & LABEL_SECURITY_INFORMATION != 0
+        && security_information & SACL_SECURITY_INFORMATION == 0
+        && current.sacl.is_some()
+    {
+        Some(merge_mandatory_label_sacl(None, current.sacl)?)
+    } else {
+        None
+    };
+    let query_sacl = security_information & SACL_SECURITY_INFORMATION != 0;
+    let query_label = security_information & LABEL_SECURITY_INFORMATION != 0;
     build_self_relative_descriptor(DescriptorBuild {
         owner: (security_information & OWNER_SECURITY_INFORMATION != 0)
             .then_some(current.owner)
@@ -402,10 +484,8 @@ pub fn query_security_descriptor_bytes(
         group: (security_information & GROUP_SECURITY_INFORMATION != 0)
             .then_some(current.group)
             .flatten(),
-        sacl_present: security_information & SACL_SECURITY_INFORMATION != 0 && current.sacl_present,
-        sacl: (security_information & SACL_SECURITY_INFORMATION != 0)
-            .then_some(current.sacl)
-            .flatten(),
+        sacl_present: (query_sacl || query_label) && current.sacl_present,
+        sacl: if query_sacl { current.sacl } else { label_sacl.as_deref() },
         dacl_present: security_information & DACL_SECURITY_INFORMATION != 0 && current.dacl_present,
         dacl: (security_information & DACL_SECURITY_INFORMATION != 0)
             .then_some(current.dacl)
@@ -442,10 +522,19 @@ pub fn set_security_descriptor_bytes(
     let use_owner = security_information & OWNER_SECURITY_INFORMATION != 0;
     let use_group = security_information & GROUP_SECURITY_INFORMATION != 0;
     let use_sacl = security_information & SACL_SECURITY_INFORMATION != 0;
+    let use_label = security_information & LABEL_SECURITY_INFORMATION != 0 && !use_sacl;
     let use_dacl = security_information & DACL_SECURITY_INFORMATION != 0;
+
+    let merged_label_sacl = if use_label {
+        Some(merge_mandatory_label_sacl(current.sacl, modification.sacl)?)
+    } else {
+        None
+    };
 
     let sacl_present = if use_sacl {
         modification.sacl_present
+    } else if use_label {
+        current.sacl_present || modification.sacl_present
     } else {
         current.sacl_present
     };
@@ -479,6 +568,8 @@ pub fn set_security_descriptor_bytes(
         sacl_present,
         sacl: if use_sacl {
             modification.sacl
+        } else if use_label {
+            if sacl_present { merged_label_sacl.as_deref() } else { None }
         } else {
             current.sacl
         },
@@ -489,6 +580,70 @@ pub fn set_security_descriptor_bytes(
             current.dacl
         },
         control,
+    })
+}
+
+/// Replace mandatory-label ACEs while retaining every other SACL ACE in its original order.
+/// The modification descriptor's audit ACEs are deliberately outside LABEL selection.
+fn merge_mandatory_label_sacl(
+    current: Option<&[u8]>,
+    modification: Option<&[u8]>,
+) -> Result<Vec<u8>, u32> {
+    let current = current.map(NativeAcl::validated_prefix).transpose().map_err(|error| error.status())?;
+    let modification = modification.map(NativeAcl::validated_prefix).transpose().map_err(|error| error.status())?;
+    let mut size = ACL_HEADER_SIZE;
+    let mut count = 0u16;
+    for (acl, include_label) in [(current, false), (modification, true)] {
+        if let Some(acl) = acl {
+            let mut labels = 0u8;
+            for ace in native_acl_aces(acl) {
+                if ace[0] == SYSTEM_MANDATORY_LABEL_ACE_TYPE {
+                    crate::native_acl_inheritance::validate_known_native_ace(ace, acl[0])?;
+                    if ace[1] & !0x1f != 0 {
+                        return Err(STATUS_INVALID_ACL);
+                    }
+                    labels = labels.checked_add(1).ok_or(STATUS_INVALID_ACL)?;
+                    if labels > 1 {
+                        return Err(STATUS_INVALID_ACL);
+                    }
+                }
+                if (ace[0] == SYSTEM_MANDATORY_LABEL_ACE_TYPE) != include_label {
+                    continue;
+                }
+                size = size.checked_add(ace.len()).ok_or(STATUS_INVALID_ACL)?;
+                count = count.checked_add(1).ok_or(STATUS_INVALID_ACL)?;
+            }
+        }
+    }
+    let size_u16 = u16::try_from(size).map_err(|_| STATUS_INVALID_ACL)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(size).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    out.resize(ACL_HEADER_SIZE, 0);
+    out[0] = core::cmp::max(
+        current.map(|acl| acl[0]).unwrap_or(2),
+        modification.map(|acl| acl[0]).unwrap_or(2),
+    );
+    out[2..4].copy_from_slice(&size_u16.to_le_bytes());
+    out[4..6].copy_from_slice(&count.to_le_bytes());
+    for (acl, include_label) in [(current, false), (modification, true)] {
+        if let Some(acl) = acl {
+            for ace in native_acl_aces(acl) {
+                if (ace[0] == SYSTEM_MANDATORY_LABEL_ACE_TYPE) == include_label {
+                    out.extend_from_slice(ace);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn native_acl_aces(acl: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut offset = ACL_HEADER_SIZE;
+    (0..read_u16(acl, 4)).map(move |_| {
+        let size = read_u16(acl, offset + 2) as usize;
+        let ace = &acl[offset..offset + size];
+        offset += size;
+        ace
     })
 }
 
@@ -534,6 +689,12 @@ fn convert_native_acl_bytes(bytes: &[u8], strict: bool) -> Result<Acl, u32> {
         }
 
         if strict {
+            // A mandatory label has meaning only in a SACL. Preserve the
+            // existing validation order for other known native ACEs so a
+            // malformed compound/object ACE reports its malformed payload.
+            if ace_type == 0x11 {
+                return Err(0xc000_00bb); // STATUS_NOT_SUPPORTED
+            }
             crate::native_acl_inheritance::validate_known_native_ace(
                 &bytes[offset..ace_end], bytes[0],
             )?;
@@ -772,7 +933,7 @@ fn selected_query_control(security_information: u32, control: u16) -> u16 {
                 | SE_DACL_AUTO_INHERITED
                 | SE_DACL_PROTECTED);
     }
-    if security_information & SACL_SECURITY_INFORMATION != 0 {
+    if security_information & (SACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION) != 0 {
         out |= control
             & (SE_SACL_PRESENT
                 | SE_SACL_DEFAULTED

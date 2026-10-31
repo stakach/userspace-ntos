@@ -104,6 +104,15 @@ fn physical_lba48_capacity_requires_valid_identify_capability_and_count() {
 }
 
 #[test]
+fn completed_read_accepts_ready_task_file_without_fault_bits() {
+    assert!(read_completion_ok(0x50)); // DRDY | DSC is the normal QEMU terminal status.
+    assert!(read_completion_ok(0));
+    for failed in [0xff, 0x80, 0x20, 0x08, 0x01] {
+        assert!(!read_completion_ok(failed));
+    }
+}
+
+#[test]
 fn flush_has_no_dma_payload_or_stale_task_file() {
     for (command, opcode) in [(FlushCommand::Cache, 0xe7), (FlushCommand::CacheExt, 0xea)] {
         let mut port = Port::new();

@@ -103,3 +103,23 @@ fn rejects_short_and_unsupported_stacks() {
         Err(WdmLayoutError::InvalidField)
     );
 }
+
+#[test]
+fn scsi_stack_uses_srb_pointer_not_device_control_union() {
+    let init = WdmIoStackLocationInit {
+        major: major::IRP_MJ_INTERNAL_DEVICE_CONTROL,
+        device_object: 0x5000,
+        parameters: WdmIoStackParameters::Scsi { srb: 0x1234_5678_9000 },
+        ..WdmIoStackLocationInit::default()
+    };
+    let mut bytes = [0u8; WDM_X64_IO_STACK_LOCATION_SIZE];
+    write_wdm_io_stack_location(&mut bytes, init).unwrap();
+    assert_eq!(&bytes[0x08..0x10], &0x1234_5678_9000u64.to_le_bytes());
+    assert_eq!(
+        nt_io_manager::decode_wdm_kernel_built_scsi_stack(&bytes),
+        Ok(init)
+    );
+    assert_ne!(decode_wdm_kernel_built_io_stack(&bytes), Ok(init));
+    bytes[0x08..0x10].fill(0);
+    assert_eq!(nt_io_manager::decode_wdm_kernel_built_scsi_stack(&bytes), Err(WdmLayoutError::InvalidField));
+}

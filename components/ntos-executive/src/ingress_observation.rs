@@ -16,4 +16,24 @@ pub(crate) fn print_hold_snapshot(now: u64) {
     } else {
         record.bytes()
     });
+    // Read-only scheduler/Reply snapshots every fifteenth hold, at most eight times.
+    static FONT_HOLD_SAMPLES: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    if logical.is_some_and(|dispatch| dispatch.ssn == 0x125a) {
+        let sample = FONT_HOLD_SAMPLES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if sample % 15 == 0 && sample < 120 {
+            if let Some(running) = snapshot.running {
+                if let Some(binding) = running.binding {
+                    unsafe { crate::win32k_glue::trace_hosted_tcb_debug_state(
+                        b"font-provider", binding.executor_id, binding.reply_object,
+                    ); }
+                }
+            }
+            if let Some(caller) = logical.and_then(|dispatch| dispatch.logical_caller) {
+                unsafe { crate::win32k_glue::trace_hosted_tcb_debug_state(
+                    b"font-caller", caller.tcb(), 0,
+                ); }
+            }
+        }
+    }
 }

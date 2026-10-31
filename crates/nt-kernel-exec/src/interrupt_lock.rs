@@ -245,6 +245,19 @@ impl InterruptActualLockTable {
         })
     }
 
+    /// Observe the exact lock holder for diagnostics without transferring authority.
+    pub fn held_lease(
+        &self,
+        identity: InterruptActualLockIdentity,
+    ) -> Result<Option<InterruptActualLockLease>, InterruptActualLockError> {
+        let record = &self.records[self.record_index(identity)?];
+        Ok(record.held.map(|(sequence, owner)| InterruptActualLockLease {
+            identity,
+            owner,
+            sequence,
+        }))
+    }
+
     pub fn release(
         &mut self,
         lease: InterruptActualLockLease,
@@ -324,11 +337,14 @@ mod tests {
         assert_eq!(table.snapshot(identity).unwrap().owner_count, 2);
 
         let lease = table.acquire(identity, first).unwrap();
+        assert_eq!(table.held_lease(identity), Ok(Some(lease)));
         assert_eq!(
             table.acquire(identity, second),
             Err(InterruptActualLockError::Busy)
         );
+        assert_eq!(table.held_lease(identity), Ok(Some(lease)));
         assert_eq!(table.release(lease), Ok(()));
+        assert_eq!(table.held_lease(identity), Ok(None));
         assert!(table.acquire(identity, second).is_ok());
     }
 

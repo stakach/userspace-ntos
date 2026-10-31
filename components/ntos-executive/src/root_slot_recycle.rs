@@ -22,6 +22,7 @@ unsafe fn publish(slot: u64, unretyped: bool) -> Result<(), RecycleError> {
         pinned: &*core::ptr::addr_of!(ROOT_SLOT_PINNED_BITS),
         retype_bytes: &mut *core::ptr::addr_of_mut!(ROOT_SLOT_RETYPE_BYTES),
         free: &mut *core::ptr::addr_of_mut!(ROOT_SLOT_RECYCLE),
+        free_membership: &mut *core::ptr::addr_of_mut!(ROOT_SLOT_RECYCLE_BITS),
         count: ROOT_SLOT_RECYCLE_N.load(Ordering::Relaxed),
         live_bytes: UT_RETYPE_LIVE_BYTES.load(Ordering::Relaxed),
         released_bytes: UT_RETYPE_RELEASED_BYTES.load(Ordering::Relaxed),

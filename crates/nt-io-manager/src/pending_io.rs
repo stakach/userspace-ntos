@@ -208,6 +208,12 @@ pub struct PendingFileIo {
 }
 
 impl PendingFileIo {
+    /// A live consumer needs its process mirrors for user delivery. A detached IRP retains
+    /// provider ownership only and must finish without entering the retired process VSpace.
+    pub const fn needs_consumer_context(&self) -> bool {
+        !self.consumer_abandoned
+    }
+
     fn reply_claim_in_flight(&self) -> bool {
         self.delivery_state & (IO_DELIVERY_REPLY_CLAIMED | IO_DELIVERY_REPLY_PUBLISHED)
             == IO_DELIVERY_REPLY_CLAIMED

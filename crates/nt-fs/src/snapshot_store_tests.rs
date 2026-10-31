@@ -13,6 +13,18 @@ mod wal_manifest;
 #[path = "snapshot_store_tests/wal_epoch_rollover.rs"]
 mod wal_epoch_rollover;
 
+#[path = "snapshot_store_tests/async_commit.rs"]
+mod async_commit;
+
+#[path = "snapshot_store_tests/async_header_recheck.rs"]
+mod async_header_recheck;
+
+#[path = "snapshot_store_tests/async_wal_anchor.rs"]
+mod async_wal_anchor;
+
+#[path = "snapshot_store_tests/hive_wal_publication.rs"]
+mod hive_wal_publication;
+
 fn two_generations() -> (SnapshotBlockStore, CachedDisk) {
     let store = SnapshotBlockStore::new(0, 16);
     let mut dev = CachedDisk::new();

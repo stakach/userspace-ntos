@@ -193,6 +193,17 @@ pub(super) unsafe fn active_port_connect_control(storage: usize, irp: IrpId, ope
         && owner.authorities.iter().all(|authority| authority.live())
 }
 
+/// Read-only trace discriminator for the exact retained CONNECT dispatch owner.
+pub(super) fn port_connect_dispatch_for_trace(irp: IrpId, device: nt_io_manager::DeviceId) -> bool {
+    let Some(id) = find(irp) else { return false; };
+    let owner = row(id);
+    owner.flight == Flight::Dispatch
+        && owner.irp_id == Some(irp)
+        && owner.primary_device == Some(device)
+        && owner.port_connect_control_storage.is_some()
+        && owner.authorities.iter().all(|authority| authority.live())
+}
+
 fn release_projection_owners(id: u64) -> Result<(), nt_status::NtStatus> {
     for owner in &mut row(id).projection_owners {
         if owner.is_held() {
@@ -388,12 +399,20 @@ fn capture_projection_registration(
         binding.device_object
     } else {
         if provider_hosted {
-            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            // A retained BusRelations query may authorize its exact child PDO before the
+            // accepted-provider catalog is committed. The pending query checks its parent,
+            // provider domain, physical pointer registration, and current invalidation owner;
+            // the allocation check below still pins that same provider object.
+            unsafe { hosted_provider_child_registration(device, physical.domain) }
+                .filter(|registration| registration.device_id() == device)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+                .address()
+        } else {
+            // Direct hosted devices use the canonical domain/address publication, not a guessed PDO.
+            io_manager_mut()
+                .hosted_device_address_by_identity(physical.domain, device)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
         }
-        // Direct hosted devices use the canonical domain/address publication, not a guessed PDO.
-        io_manager_mut()
-            .hosted_device_address_by_identity(physical.domain, device)
-            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
     };
     let registration = io_manager_mut()
         .hosted_device_pointer_registration(physical.domain, address)
@@ -455,6 +474,7 @@ fn discard(id: u64, prepared: PreparedExternalFileIrp) -> Result<(), nt_status::
 
 pub(super) enum DispatchResult {
     Returned {
+        irp_id: IrpId,
         status: nt_status::NtStatus,
         information: u64,
         file_context: Option<u64>,
@@ -489,6 +509,18 @@ pub(super) fn dispatch_port_connect(
     )
 }
 
+fn trace_port_connect_dispatch(stage: u64, irp: IrpId, device: nt_io_manager::DeviceId) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 16 { return; }
+    print_str(b"[port-connect-dispatch] stage/irp/device=");
+    print_u64(stage);
+    print_str(b"/");
+    print_hex_u64(irp.raw());
+    print_str(b"/");
+    print_hex_u64(device.raw());
+    print_str(b"\n");
+}
+
 fn dispatch_with_port_connect(
     caller: nt_process::native_handle::NativeHandleCaller,
     request: ExternalFileIrpRequest,
@@ -508,6 +540,9 @@ fn dispatch_with_port_connect(
     };
     let buffers = ExternalFileIrpBuffers::new(copy(input)?, copy(initial_output)?);
     let id = reserve(caller, policy.output_capture())?;
+    if let Some(device) = port_connect_device {
+        trace_port_connect_dispatch(0, IrpId(0), device);
+    }
     let preparation = policy.prepare(io_manager_mut(), request, buffers);
     let prepared = match preparation {
         Ok(prepared) => prepared,
@@ -521,6 +556,9 @@ fn dispatch_with_port_connect(
         return Err(status);
     }
     let irp_id = prepared.irp_id();
+    if let Some(device) = port_connect_device {
+        trace_port_connect_dispatch(1, irp_id, device);
+    }
     if let Some(device) = port_connect_device {
         if let Err(status) = mark_port_connect_control(irp_id, device) {
             discard(id, prepared)?;
@@ -536,8 +574,14 @@ fn dispatch_with_port_connect(
         }
     };
     row(id).flight = Flight::Dispatch;
+    if let Some(device) = port_connect_device {
+        trace_port_connect_dispatch(2, irp_id, device);
+    }
     let returned =
         hosted_file_dispatch::invoke(invocation, row(id).caller, policy.output_capture());
+    if let Some(device) = port_connect_device {
+        trace_port_connect_dispatch(3, irp_id, device);
+    }
     let result = match io_manager_mut().finish_external_file_irp(returned) {
         Ok(result) => result,
         Err(rejection) => {
@@ -565,6 +609,7 @@ fn dispatch_with_port_connect(
                         Err(_) => return Ok(DispatchResult::Outstanding { irp_id }),
                     };
                     Ok(DispatchResult::Returned {
+                        irp_id,
                         status: completion.status,
                         information: completion.information,
                         file_context: completion.file_context,

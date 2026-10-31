@@ -15,6 +15,7 @@ std = ["alloc", "nt-status/std", "nt-types/std"]
 object-manager = ["dep:nt-object-manager"]
 
 [dependencies]
+nt-config-manager = { workspace = true }
 nt-cm-resources = { workspace = true }
 nt-status = { workspace = true }
 nt-types = { workspace = true }

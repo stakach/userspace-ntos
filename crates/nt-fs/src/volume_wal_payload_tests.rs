@@ -33,6 +33,20 @@ fn mixed_system_and_hive_log_payloads_remain_distinct_in_wal_order() {
 }
 
 #[test]
+fn native_system_hive_log_record_is_routed_to_system_replay() {
+    let record = nt_hive_core::encode_log_record(
+        &nt_hive_core::HiveLogOp::CreateKey {
+            path: r"\Registry\Machine\System\ControlSet001\Services\Example",
+        },
+        1,
+    );
+    assert_eq!(
+        decode_volume_wal_payload(&record),
+        Ok(VolumeWalPayload::System(&record))
+    );
+}
+
+#[test]
 fn hive_log_payload_rejects_truncation_trailing_bytes_and_forged_lengths() {
     let bytes = encode_hive_log_wal_payload(hive_record()).unwrap();
     for end in [8, HIVE_LOG_HEADER_BYTES - 1, bytes.len() - 1] {
@@ -76,7 +90,7 @@ fn hive_log_payload_rejects_missing_identity_bad_path_and_offset_overflow() {
 #[test]
 fn unknown_or_empty_wal_payload_cannot_be_misrouted_as_system() {
     assert_eq!(decode_volume_wal_payload(b""), Err(VolumeWalPayloadError::Empty));
-    assert_eq!(decode_volume_wal_payload(b"HLR1"), Err(VolumeWalPayloadError::UnknownKind));
+    assert_eq!(decode_volume_wal_payload(b"HLR2"), Err(VolumeWalPayloadError::UnknownKind));
     assert_eq!(decode_volume_wal_payload(b"NTHLOG01"), Err(VolumeWalPayloadError::InvalidLength));
 }
 

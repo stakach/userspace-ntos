@@ -4,11 +4,12 @@ use super::*;
 use nt_io_manager::win32k_mm_section_wire::{self as wire, MmSectionCreateRequest};
 
 use wire::{OP_CREATE_OBJECT as CREATE, OP_REFERENCE as REFERENCE,
-    OP_DEREFERENCE as DEREFERENCE, OP_MAP as MAP, OP_UNMAP as UNMAP};
+    OP_DEREFERENCE as DEREFERENCE, OP_MAP as MAP, OP_UNMAP as UNMAP,
+    OP_MAP_CLIENT as MAP_CLIENT, OP_UNMAP_CLIENT as UNMAP_CLIENT};
 
-unsafe fn call(op: u64, first: u64, second: u64) -> (i32, u64, u64) {
+unsafe fn call_with_options(op: u64, first: u64, second: u64, options: u64) -> (i32, u64, u64) {
     let (words, raw, out1, out2, spare) = crate::driver_launch::call_on4_raw(
-        (W32_SECTION_CREATE_LABEL << 12) | 4, op, first, second, 0);
+        (W32_SECTION_CREATE_LABEL << 12) | 4, op, first, second, options);
     let canonical = raw == raw as u32 as u64 || raw == raw as u32 as i32 as i64 as u64;
     if words != 4 || !canonical || spare != 0
         || ((raw as u32 as i32) < 0 && (out1 != 0 || out2 != 0))
@@ -16,6 +17,10 @@ unsafe fn call(op: u64, first: u64, second: u64) -> (i32, u64, u64) {
         crate::provider_bugcheck::report(0xc4, [W32_SECTION_CREATE_LABEL, op, words, raw]);
     }
     (raw as u32 as i32, out1, out2)
+}
+
+unsafe fn call(op: u64, first: u64, second: u64) -> (i32, u64, u64) {
+    call_with_options(op, first, second, 0)
 }
 
 pub(super) unsafe fn create(
@@ -95,6 +100,28 @@ pub(super) unsafe fn unmap(base: u64) -> i32 {
     let (status, first, second) = call(UNMAP, base, 0);
     if status == 0 && (first != 0 || second != 0) {
         crate::provider_bugcheck::report(0xc4, [W32_SECTION_CREATE_LABEL, UNMAP, base, first]);
+    }
+    status
+}
+
+pub(super) unsafe fn map_client(
+    object: u64, process: u64, requested_size: u64, protection: u32,
+) -> Result<(u64, u64), i32> {
+    let options = requested_size.checked_shl(8)
+        .filter(|packed| *packed >> 8 == requested_size)
+        .ok_or(STATUS_INVALID_PARAMETER_I32)? | u64::from(protection);
+    let (status, base, size) = call_with_options(MAP_CLIENT, object, process, options);
+    if status != 0 { return Err(status); }
+    if base == 0 || size == 0 {
+        crate::provider_bugcheck::report(0xc4, [W32_SECTION_CREATE_LABEL, MAP_CLIENT, object, base]);
+    }
+    Ok((base, size))
+}
+
+pub(super) unsafe fn unmap_client(process: u64, base: u64) -> i32 {
+    let (status, first, second) = call(UNMAP_CLIENT, process, base);
+    if status == 0 && (first != 0 || second != 0) {
+        crate::provider_bugcheck::report(0xc4, [W32_SECTION_CREATE_LABEL, UNMAP_CLIENT, base, first]);
     }
     status
 }

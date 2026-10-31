@@ -2,6 +2,36 @@
 
 use super::*;
 
+static PNP_INSTALL_PIPE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn is_pnp_install_pipe_name(name: &[u16]) -> bool {
+    const NEEDLE: &[u8] = b"pnp_device_install_pipe_0.";
+    name.windows(NEEDLE.len()).any(|window| {
+        window.iter().zip(NEEDLE).all(|(&unit, &letter)| {
+            unit <= 0x7f && (unit as u8).eq_ignore_ascii_case(&letter)
+        })
+    })
+}
+
+fn trace_pnp_install_pipe(stage: &[u8], pi: usize, generation: Option<u64>, status: Option<u32>, name: &[u16]) {
+    if PNP_INSTALL_PIPE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 32 {
+        return;
+    }
+    print_str(b"[pnp-install-pipe] stage=");
+    print_str(stage);
+    print_str(b" pi=");
+    print_u64(pi as u64);
+    print_str(b" generation=");
+    print_u64(generation.unwrap_or(0));
+    if let Some(status) = status {
+        print_str(b" status=0x");
+        print_hex(status);
+    }
+    print_str(b" name=\"");
+    print_sanitized_utf16_ascii(name, 96);
+    print_str(b"\"\n");
+}
+
 impl ExecNtHandler {
     pub(super) unsafe fn nt_create_file_service(&mut self, args: &[u64]) -> u32 {
         let file_handle_out = args[0];
@@ -76,6 +106,13 @@ impl ExecNtHandler {
             Ok(resolved) => resolved,
             Err(status) => return status,
         };
+        let pnp_install_pipe = is_pnp_install_pipe_name(name16);
+        if pnp_install_pipe {
+            trace_pnp_install_pipe(
+                b"request", self.pi, self.hosted_process_generation(self.pi),
+                None, name16,
+            );
+        }
         if !NT_CREATE_FILE_FRONTIER_TRACED.swap(true, Ordering::Relaxed) {
             print_str(b"[nt-create-file-frontier] pi=");
             print_u64(self.pi as u64);
@@ -121,6 +158,22 @@ impl ExecNtHandler {
                         iosb,
                     );
                 }
+                if let Some(status) = self.create_registered_driver_peer_relative_file(
+                    device_id,
+                    file_id,
+                    name16,
+                    captured.attributes,
+                    desired_access,
+                    share_access,
+                    create_disposition,
+                    file_attributes,
+                    create_options,
+                    &ea,
+                    file_handle_out,
+                    iosb,
+                ) {
+                    return status;
+                }
                 if driver_launch::device_id_by_name("\\Device\\NamedPipe")
                     != Some(device_id)
                 {
@@ -163,9 +216,17 @@ impl ExecNtHandler {
                     }),
                 };
                 let Some(publication) = publication else {
+                    if pnp_install_pipe {
+                        trace_pnp_install_pipe(b"pending", self.pi,
+                            self.hosted_process_generation(self.pi), Some(STATUS_PENDING), name16);
+                    }
                     return STATUS_PENDING;
                 };
                 self.pipe_endpoint_progress |= publication.wake_server_fid != 0;
+                if pnp_install_pipe {
+                    trace_pnp_install_pipe(b"provider-result", self.pi,
+                        self.hosted_process_generation(self.pi), Some(publication.status), name16);
+                }
                 return match self.publish_file_create_result(
                     file_handle_out, iosb, publication.handle, publication.status, publication.information,
                 ) {
@@ -186,6 +247,22 @@ impl ExecNtHandler {
                 Ok(()) => status,
                 Err(status) => status,
             };
+        }
+        if !Self::is_named_pipe_root_path(name16) && !nt_fs::is_named_pipe_path(name16) {
+            if let Some(status) = self.create_registered_driver_peer_file(
+                name16,
+                captured.attributes,
+                desired_access,
+                share_access,
+                create_disposition,
+                file_attributes,
+                create_options,
+                &ea,
+                file_handle_out,
+                iosb,
+            ) {
+                return status;
+            }
         }
         if create_options & nt_fs::FILE_DIRECTORY_FILE != 0
             && !Self::is_named_pipe_root_path(name16)
@@ -486,7 +563,15 @@ impl ExecNtHandler {
             status = self.unserved_nt_create_file_namespace(name16);
         }
         if pending_pipe_create {
+            if pnp_install_pipe {
+                trace_pnp_install_pipe(b"pending", self.pi,
+                    self.hosted_process_generation(self.pi), Some(STATUS_PENDING), name16);
+            }
             return STATUS_PENDING;
+        }
+        if pnp_install_pipe {
+            trace_pnp_install_pipe(b"provider-result", self.pi,
+                self.hosted_process_generation(self.pi), Some(status), name16);
         }
         if let Err(status) = self.publish_file_create_result(file_handle_out, iosb, opened_handle, status, info) {
             return status;

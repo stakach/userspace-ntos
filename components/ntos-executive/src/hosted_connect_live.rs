@@ -428,6 +428,10 @@ pub(super) unsafe fn service(
 }
 
 pub(super) unsafe fn redrive() {
+    redrive_inner(false);
+}
+
+unsafe fn redrive_inner(nested_ready_only: bool) {
     let count = rows().len();
     for index in 0..count {
         // A parked i8042 dispatch can synchronously reenter the executive for HOOK. The boxed
@@ -437,7 +441,8 @@ pub(super) unsafe fn redrive() {
             Some(work) => work as *mut Work,
             None => continue,
         };
-        if (*work_ptr).port_acknowledged || (*work_ptr).blocked {
+        if (*work_ptr).port_acknowledged || (*work_ptr).blocked
+            || (nested_ready_only && !(*work_ptr).nested_ready()) {
             continue;
         }
         static REDRIVE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -585,7 +590,9 @@ pub(super) unsafe fn redrive() {
             trace_connect_live(10, work.source.source_irp_address(), u64::from(work.source_acknowledged), 0);
         }
         if work.source_acknowledged {
-            work.port_acknowledged = match work.port.phase() {
+            // A nested ACK can finish while this caller is parked in the provider ACK.
+            // Preserve the completed ownership transition across the older retry.
+            work.port_acknowledged |= match work.port.phase() {
                 hosted_input_connect_dispatch::PortConnectPhase::Prepared
                 | hosted_input_connect_dispatch::PortConnectPhase::Rejected(_) => true,
                 _ => work.port.acknowledge_after_source_completion(&work.source).is_ok(),
@@ -596,10 +603,7 @@ pub(super) unsafe fn redrive() {
 }
 
 pub(super) fn nested_work_ready() -> bool {
-    rows()
-        .iter()
-        .flatten()
-        .any(|work| !work.blocked && !work.port_acknowledged)
+    rows().iter().flatten().any(|work| work.nested_ready())
 }
 
 pub(super) unsafe fn redrive_nested_ready() -> bool {
@@ -612,11 +616,20 @@ pub(super) unsafe fn redrive_nested_ready() -> bool {
         })
     };
     let before = progress();
-    redrive();
+    redrive_inner(true);
     progress() != before
 }
 
 impl Work {
+    fn nested_ready(&self) -> bool {
+        let active = !self.blocked && !self.port_acknowledged;
+        let source_admissible = active && !self.provider_entered
+            && unsafe { self.source.nested_preparation_ready() };
+        nt_io_manager::source_completion_preparation::nested_connect_ready(
+            active, self.provider_entered, source_admissible,
+        )
+    }
+
     fn port_thunk(&self) -> hosted_class_callback_thunk::PublishedClassServiceThunk {
         self.port.thunk()
     }

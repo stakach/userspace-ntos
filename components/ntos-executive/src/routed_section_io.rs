@@ -173,3 +173,21 @@ pub(crate) fn read(file_id: u64, device_id: u64, offset: u64, output: &mut [u8])
         },
     }
 }
+
+/// Read through a Section-retained canonical File only while its original provider context
+/// remains attached. CLEANUP may have run; the retained pointer still owns the File and context.
+pub(crate) fn read_retained(
+    file_id: u64,
+    device_id: u64,
+    file_context: u64,
+    offset: u64,
+    output: &mut [u8],
+) -> (u32, usize) {
+    let Some(file) = driver_launch::io_manager_mut().file(FileId(file_id)) else {
+        return (nt_fs::STATUS_INVALID_HANDLE, 0);
+    };
+    if file.device_id.raw() != device_id || file.driver_context != Some(file_context) {
+        return (nt_fs::STATUS_INVALID_HANDLE, 0);
+    }
+    read(file_id, device_id, offset, output)
+}

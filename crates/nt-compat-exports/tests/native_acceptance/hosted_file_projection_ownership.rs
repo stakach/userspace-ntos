@@ -253,6 +253,28 @@ fn source_irp_rpc_cannot_reborrow_manager_for_projection_ownership() {
             "borrowed PnP/lifecycle pump forbids {forbidden} here"
         );
     }
+    assert!(has(&rpc.calls, "with_live_verify_device_registration"),
+        "hard-error writes must use the exact published physical registration under its retirement lock");
+}
+
+#[test]
+fn canonical_device_retirement_invalidates_the_source_registration_catalog() {
+    let catalog = include_str!("../../../../components/ntos-executive/src/hosted_device_allocations.rs");
+    assert!(catalog.contains("io.retire_hosted_device_pointer(registration)?;"));
+    assert!(catalog.contains("row.canonical_live = false;"));
+    assert!(catalog.contains("return if row.canonical_live { Ok(()) } else"),
+        "a retired registration cannot be republished as an idempotent no-op");
+    for source in [
+        include_str!("../../../../components/ntos-executive/src/driver_launch.rs"),
+        include_str!("../../../../components/ntos-executive/src/hosted_add_device_rollback.rs"),
+        include_str!("../../../../components/ntos-executive/src/hosted_upper_filter_projection.rs"),
+        include_str!("../../../../components/ntos-executive/src/hosted_dxg_registration.rs"),
+        include_str!("../../../../components/ntos-executive/src/hosted_consumer_device_objects.rs"),
+        include_str!("../../../../components/ntos-executive/src/hosted_reverse_class_projection.rs"),
+    ] {
+        assert!(!source.contains(".retire_hosted_device_pointer("),
+            "canonical pointer retirement must invalidate the source catalog atomically");
+    }
 }
 
 #[test]

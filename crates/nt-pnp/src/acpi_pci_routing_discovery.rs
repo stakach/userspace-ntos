@@ -338,11 +338,18 @@ impl PreparedAcpiPciRoutingTables {
                         },
                     )?;
                 let object_path = &candidates[candidate_index];
+                // A BusRelations child has its own PDO even when its namespace path is also
+                // visible through the PCI-root filter. METHOD_EX may only evaluate a method
+                // inside the receiving PDO's subtree; a sibling link cannot use the root PDO.
+                let endpoint = catalog
+                    .relation_link_candidates(routing_query.relation_owner)
+                    .find(|candidate| candidate.path == *object_path)
+                    .map_or(routing_query.endpoint, |candidate| candidate.endpoint);
                 let query_index = if let Some(index) =
                     link_queries
                         .iter()
                         .position(|query: &AcpiPciInterruptLinkMethodQuery| {
-                            query.endpoint == routing_query.endpoint
+                            query.endpoint == endpoint
                                 && query.object_path == *object_path
                         }) {
                     index
@@ -360,7 +367,7 @@ impl PreparedAcpiPciRoutingTables {
                                 _ => AcpiPciRoutingDiscoveryError::InvalidFilteredLinkMethod,
                             })?;
                     link_queries.push(AcpiPciInterruptLinkMethodQuery {
-                        endpoint: routing_query.endpoint,
+                        endpoint,
                         relation_owner: routing_query.relation_owner,
                         object_path: retained_object,
                         method_path,

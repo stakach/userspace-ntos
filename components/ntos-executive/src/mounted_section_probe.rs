@@ -15,7 +15,7 @@ use crate::{
 };
 
 static mut PROBE_SECTIONS: GenericSectionTable = GenericSectionTable::new();
-const FONT: &str = "reactos\\Fonts\\arial.ttf";
+const FONT: &str = crate::installed_layout::ARIAL_STR;
 const PAGE_SIZE: usize = 4096;
 
 pub(crate) unsafe fn probe_font_section_after_file_close(device_id: u64, scratch_base: u64) -> bool {

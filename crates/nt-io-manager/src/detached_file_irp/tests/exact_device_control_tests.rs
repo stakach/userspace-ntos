@@ -60,6 +60,54 @@ fn control_buffers() -> ExternalFileIrpBuffers {
 }
 
 #[test]
+fn scsi_srb_requires_pointer_free_exact_pdo_admission() {
+    use crate::scsi_srb_transport::{ScsiParameters, ScsiSrbRoute, WDM_X64_LEGACY_SRB_SIZE};
+    use crate::{HostedDomainId, HostedDomainIdentity};
+
+    let (mut f, _, _, _) = stack_fixture();
+    let route = ScsiSrbRoute {
+        pdo: f.device,
+        provider: HostedDomainIdentity {
+            domain_id: HostedDomainId::new(3, 2), cookie: 9,
+        },
+        relation_generation: 7,
+        provider_pdo: 0x9000,
+    };
+    let mut source = [0u8; WDM_X64_LEGACY_SRB_SIZE];
+    source[..2].copy_from_slice(&(WDM_X64_LEGACY_SRB_SIZE as u16).to_le_bytes());
+    source[0x0b] = 2;
+    source[0x10..0x14].copy_from_slice(&3u32.to_le_bytes());
+    source[0x18..0x20].copy_from_slice(&0x1111u64.to_le_bytes());
+    source[0x20..0x28].copy_from_slice(&0x2222u64.to_le_bytes());
+    let parameters = IoParameters::Scsi(
+        ScsiParameters::from_source(route, &source, 3, 2).unwrap(),
+    );
+    let mut ordinary = request(&f, 0, true);
+    ordinary.parameters = parameters.clone();
+    let buffers = || ExternalFileIrpBuffers::new(vec![1; 5], vec![0; 64 + 0x58 + 5]);
+    assert_eq!(f.io.prepare_external_file_irp_owned(ordinary, buffers()).err(),
+        Some(NtStatus::INVALID_PARAMETER));
+
+    let mut exact = request(&f, 0, true);
+    exact.parameters = parameters.clone();
+    let policy = ExternalFileIrpDispatchPolicy::ScsiAtDevice;
+    assert_eq!(policy.output_capture(), ExternalFileIrpOutputCapture::Scsi);
+    let prepared = policy.prepare(&mut f.io, exact, buffers()).unwrap();
+    assert_eq!(prepared.route().device_id(), f.device);
+    assert_eq!(prepared.projection().parameters, parameters);
+    assert_eq!(prepared.projection().major, major::IRP_MJ_INTERNAL_DEVICE_CONTROL);
+
+    let mut bad_route = route;
+    bad_route.pdo = DeviceId::new(8, 9);
+    let mut stale = request(&f, 0, true);
+    stale.parameters = IoParameters::Scsi(
+        ScsiParameters::from_source(bad_route, &source, 3, 2).unwrap(),
+    );
+    assert_eq!(f.io.prepare_external_scsi_irp_owned_at_device(stale, buffers()).err(),
+        Some(NtStatus::INVALID_PARAMETER));
+}
+
+#[test]
 fn method_neither_mutable_input_is_captured_before_ack_with_zero_output_length() {
     for len in [16usize, 40, 48] {
         let mut f = fixture();
@@ -363,6 +411,7 @@ fn explicit_policy_prepares_same_request_with_distinct_route_and_completion_capt
             | ExternalFileIrpDispatchPolicy::MutableMethodNeitherInputAtDevice => {
                 (f.driver, f.device)
             }
+            ExternalFileIrpDispatchPolicy::ScsiAtDevice => unreachable!("SCSI is not in this policy list"),
         };
         assert_eq!(
             (owner.route().driver_id(), owner.route().device_id()),

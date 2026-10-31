@@ -24,15 +24,11 @@ impl ExecNtHandler {
     ) -> Result<alloc::string::String, u32> {
         let mut header = [0u8; 16];
         self.process_memory_read_status(self.pi, address, &mut header)?;
-        let length = u16::from_le_bytes(header[..2].try_into().unwrap()) as usize;
-        let maximum = u16::from_le_bytes(header[2..4].try_into().unwrap()) as usize;
-        if length & 1 != 0 || length > maximum {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let pointer = u64::from_le_bytes(header[8..16].try_into().unwrap());
-        let mut bytes = alloc::vec![0u8; length];
-        if length != 0 {
-            self.process_memory_read_status(self.pi, pointer, &mut bytes)?;
+        let input = nt_kernel_exec::user_string::object_name_input(&header)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let mut bytes = alloc::vec![0u8; input.length];
+        if input.length != 0 {
+            self.process_memory_read_status(self.pi, input.buffer, &mut bytes)?;
         }
         let units: alloc::vec::Vec<u16> = bytes
             .chunks_exact(2)
@@ -398,7 +394,60 @@ impl ExecNtHandler {
         Ok(())
     }
 
+    /// Publish the exact child cell produced by the anchored mutable-hive WAL.
+    pub(crate) unsafe fn finish_anchored_mutable_child(
+        &mut self,
+        state: &mut HostedRegistryPublication,
+        parent: ResolvedHiveKey,
+        child: nt_hive_core::CellId,
+        grant: u32,
+    ) -> Result<(), u32> {
+        let expected = ResolvedHiveKey { hive: parent.hive, key: child };
+        if self.mutable_registry_key_by_path(&state.path) != Some(expected) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let target = self.install_mutable_registry_key_target(expected)?;
+        self.finish_hosted_registry_publication(state, target, grant, true)
+    }
+
+    /// An earlier queued create may have published this child before our own WAL preparation.
+    /// Reopen under the retained parent and authorize it as an existing key.
+    pub(crate) unsafe fn finish_existing_mutable_child(
+        &mut self,
+        state: &mut HostedRegistryPublication,
+        parent: ResolvedHiveKey,
+        backup: bool,
+    ) -> Result<(), u32> {
+        let (parent_path, leaf) = state.path.rsplit_once('\\').ok_or(STATUS_INVALID_HANDLE)?;
+        if leaf.is_empty() || self.mutable_key_path(parent).as_deref() != Some(parent_path) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let child = self.mutable_hives.hive(parent.hive)
+            .and_then(|hive| hive.open_subkey(parent.key, leaf))
+            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        let expected = ResolvedHiveKey { hive: parent.hive, key: child };
+        if self.mutable_registry_key_by_path(&state.path) != Some(expected) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let target = self.install_mutable_registry_key_target(expected)?;
+        self.bind_hosted_registry_target(state, target)?;
+        let granted = self.registry_open_grant(state, target, backup)?;
+        self.finish_hosted_registry_publication(state, target, granted, false)
+    }
+
     pub(super) unsafe fn nt_open_key_admitted(&mut self, args: &[u64]) -> u32 {
+        self.nt_open_key_with_options(args, false)
+    }
+
+    pub(super) unsafe fn nt_open_key_ex_admitted(&mut self, args: &[u64]) -> u32 {
+        let backup = match nt_config_manager::validate_key_open_options(nt_ulong_arg(args[3])) {
+            Ok(backup) => backup,
+            Err(status) => return status,
+        };
+        self.nt_open_key_with_options(args, backup)
+    }
+
+    unsafe fn nt_open_key_with_options(&mut self, args: &[u64], backup: bool) -> u32 {
         let _durable = allocator::enter_durable();
         let (mut state, _) = match self.capture_hosted_registry_publication(args, false) {
             Ok(state) => state,
@@ -407,7 +456,7 @@ impl ExecNtHandler {
         let result = (|| {
             let target = self.acquire_hosted_registry_target(&state)?;
             self.bind_hosted_registry_target(&mut state, target)?;
-            let granted = match self.registry_open_grant(&state, target, false) {
+            let granted = match self.registry_open_grant(&state, target, backup) {
                 Ok(granted) => granted,
                 Err(status) => return Err(status),
             };
@@ -418,6 +467,7 @@ impl ExecNtHandler {
             Err(status) => {
                 if status == STATUS_OBJECT_NAME_NOT_FOUND {
                     self.note_registry_open_miss(&state.path);
+                    self.note_completed_installer_inf_probe(&state.path, status);
                 }
                 crate::registry_security_audit::admission_error(
                     b"open", &state.path, status, self.pi, self.current_tid,
@@ -445,6 +495,7 @@ impl ExecNtHandler {
             };
         let mut parent_retention = None;
         let mut durable_create = None;
+        let mut mutable_create = None;
         let result = (|| {
             match self.acquire_hosted_registry_target(&state) {
                 Ok(target) => {
@@ -596,6 +647,20 @@ impl ExecNtHandler {
                 durable_create = Some((parent, parent_lease, alloc::string::String::from(leaf), class, prepared));
                 return Ok(());
             }
+            if !volatile {
+                if let Some(mutable) = self.mutable_key_handle(parent) {
+                    match crate::fs_loader::exec_fs_mount_identity()
+                        .and_then(crate::fs_loader::exec_block_route_kind) {
+                        Some(nt_fs::BlockSourceKind::Native) => {
+                            mutable_create = Some((parent, mutable, alloc::string::String::from(leaf),
+                                class, prepared));
+                            return Ok(());
+                        }
+                        Some(nt_fs::BlockSourceKind::Draining) => return Err(nt_fs::STATUS_DEVICE_NOT_READY),
+                        _ => {}
+                    }
+                }
+            }
             let (target, created) = self.create_secured_registry_child(
                 parent,
                 &state.path,
@@ -623,6 +688,22 @@ impl ExecNtHandler {
             match crate::registry_mutation_work::submit_hosted(
                 self, state, owner, parent, leaf.clone(), prepared.granted_access,
                 expected_generation, mutation,
+            ) {
+                Ok(()) => return 0x103,
+                Err((status, mut state, mut owner)) => {
+                    if let Some(target) = owner.abort(&mut self.pm).expect("unsubmitted parent") {
+                        self.release_registry_key_target(target);
+                    }
+                    self.abort_hosted_registry_publication(&mut state);
+                    return status;
+                }
+            }
+        }
+        if let Some((parent, mutable, leaf, class, prepared)) = mutable_create {
+            let owner = parent_retention.take().expect("mutable create parent reservation");
+            match crate::mutable_hive_mutation_work::submit_hosted_create_child(
+                self, state, owner, parent, mutable, leaf, class,
+                prepared.descriptor, prepared.granted_access, backup,
             ) {
                 Ok(()) => return 0x103,
                 Err((status, mut state, mut owner)) => {
@@ -711,13 +792,16 @@ impl ExecNtHandler {
         Ok((OVERLAY_KEY_TAG | index as u32, true))
     }
 
-    fn journal_create_secured_mutable_subkey(
+    pub(crate) fn journal_create_secured_mutable_subkey(
         &mut self,
         parent: ResolvedHiveKey,
         name: &str,
         class: Option<&str>,
         descriptor: &[u8],
     ) -> Result<ResolvedHiveKey, u32> {
+        if self.boot_v2_mutable_hive_journal() {
+            return self.boot_v2_create_secured_mutable_subkey(parent, name, class, descriptor);
+        }
         let parent_path = self
             .mutable_key_relative_path(parent)
             .ok_or(STATUS_INVALID_HANDLE)?;

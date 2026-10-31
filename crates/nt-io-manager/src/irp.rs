@@ -225,6 +225,7 @@ impl PnpParameters {
             minor,
             nt_pnp_abi::IRP_MN_QUERY_RESOURCES
                 | nt_pnp_abi::IRP_MN_QUERY_RESOURCE_REQUIREMENTS
+                | nt_pnp_abi::IRP_MN_QUERY_PNP_DEVICE_STATE
                 | nt_pnp_abi::IRP_MN_QUERY_BUS_INFORMATION
         ) {
             return Err(NtStatus::INVALID_PARAMETER);
@@ -267,6 +268,8 @@ impl PnpParameters {
         match self.kind {
             PnpParameterKind::Start(_) => self.minor == nt_pnp_abi::IRP_MN_START_DEVICE,
             PnpParameterKind::Lifecycle => Self::is_lifecycle_minor(self.minor),
+            PnpParameterKind::QueryInformation =>
+                self.minor == nt_pnp_abi::IRP_MN_QUERY_PNP_DEVICE_STATE,
             _ => false,
         }
     }
@@ -373,6 +376,7 @@ pub enum IoParameters {
     Write(ReadWriteParameters),
     DeviceControl(DeviceControlParameters),
     InternalDeviceControl(DeviceControlParameters),
+    Scsi(crate::scsi_srb_transport::ScsiParameters),
     FlushBuffers,
     QueryInformation(InformationParameters),
     SetInformation(SetInformationParameters),
@@ -386,7 +390,7 @@ pub enum IoParameters {
     NotifyDirectory(DirectoryNotifyParameters),
     LockControl(LockControlParameters),
     Pnp(PnpParameters),
-    Power,
+    Power(crate::power_irp_request::PowerParameters),
     #[default]
     Unsupported,
 }
@@ -401,6 +405,10 @@ impl IoParameters {
             IoParameters::Write(p) => (p.length.min(cap), 0),
             IoParameters::DeviceControl(p) | IoParameters::InternalDeviceControl(p) => {
                 (p.input_len.min(cap), p.output_len.min(cap))
+            }
+            IoParameters::Scsi(p) => {
+                let transfer = p.data_length.saturating_add(u32::from(p.sense_length));
+                (transfer.min(cap), transfer.saturating_add(64 + 0x58).min(cap))
             }
             IoParameters::QueryInformation(p) => (0, p.length.min(cap)),
             IoParameters::SetInformation(p) => (p.length.min(cap), 0),

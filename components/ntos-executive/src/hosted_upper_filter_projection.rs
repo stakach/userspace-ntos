@@ -614,7 +614,7 @@ pub(super) unsafe fn abort_prepared(owner_id: u64) -> Result<(), nt_status::NtSt
             owner(owner_id).unwrap().pdo_alias.unwrap()
         };
         let registration = alias.registration.unwrap();
-        if let Err(status) = io_manager_mut().retire_hosted_device_pointer(registration) {
+        if let Err(status) = hosted_device_allocations::retire_canonical_pointer(io_manager_mut(), registration) {
             owner(owner_id).unwrap().phase = Phase::Blocked;
             return Err(status);
         }

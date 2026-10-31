@@ -17,8 +17,11 @@ fn retained_seh_receive_services_irq_before_blocking_without_replaying_reply() {
     syn::parse_str::<syn::ItemFn>(receive).expect("parse the actual native receiver");
 
     let blocking = receive
-        .find("runtime::receive(execution, ch.tcb, true)")
-        .expect("blocking physical receive");
+        .find("runtime::receive(execution, ch.tcb,")
+        .expect("physical receive selected by timer checkpoint");
+    assert!(receive[blocking..].contains("serviced_scheduler_yield || !timer_checkpoint"));
+    assert!(receive[..blocking].contains("let timer_checkpoint = !retained_seh"),
+        "retained SEH must always use the blocking receive");
     assert!(
         receive[..blocking].contains("service_inline_irq_checkpoint(ch, route)"),
         "a retained SEH walk must service pending IRQ/timer work on its exact route before blocking"
@@ -41,7 +44,7 @@ fn retained_seh_receive_services_irq_before_blocking_without_replaying_reply() {
         .next()
         .unwrap();
     assert!(
-        retained.contains("shared_pump::receive(ch, route, true)"),
+        retained.contains("shared_pump::receive(ch, route, true, false)"),
         "the checkpoint must run in the retained receive path on the physical route"
     );
     let reply = pump
@@ -68,8 +71,11 @@ fn non_yielding_syscall_receive_services_latched_irq_before_blocking() {
         .next()
         .unwrap();
     let blocking = receive
-        .find("runtime::receive(execution, ch.tcb, true)")
-        .expect("blocking physical receive");
+        .find("runtime::receive(execution, ch.tcb,")
+        .expect("physical receive selected by timer checkpoint");
+    assert!(receive[blocking..].contains("serviced_scheduler_yield || !timer_checkpoint"));
+    assert!(receive[..blocking].contains("ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield"),
+        "non-yielding syscall channels must always use the blocking receive");
     assert!(
         receive[..blocking].contains("ReqKind::Syscall && !ch.caps.kernel_irq_yield"),
         "a syscall channel that cannot return a scheduler yield must checkpoint IRQ work inline"

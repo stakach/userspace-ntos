@@ -127,11 +127,27 @@ pub(super) fn prepare_boot_directory_security(
                 )
             } else if entry.name() == b"security" {
                 nt_security::assign_security_directory_security(&subject, &mut audit)
-            } else if matches!(entry.name(), b"objecttypes" | b"driver" | b"filesystem") {
+            } else if matches!(entry.name(), b"objecttypes" | b"driver" | b"filesystem" | b"windows") {
                 nt_security::assign_directory_security(
                     &subject,
                     None,
                     None,
+                    nt_security::ProcessorMode::KernelMode,
+                    &mut audit,
+                )
+            } else if entry.name() == b"windowstations" {
+                let parent = namespace.get(entry.parent).ok_or(0xC000_0008u32)?;
+                if parent.name() != b"windows" || parent.parent != 0 {
+                    return Err(0xC000_0008);
+                }
+                let inherited = records
+                    .iter()
+                    .find(|record: &&DirectorySecurityRecord| record.identity == parent.identity)
+                    .ok_or(0xC000_0008u32)?;
+                nt_security::assign_directory_security(
+                    &subject,
+                    None,
+                    Some(&inherited.descriptor),
                     nt_security::ProcessorMode::KernelMode,
                     &mut audit,
                 )
@@ -152,6 +168,55 @@ pub(super) fn prepare_boot_directory_security(
 }
 
 impl ExecNtHandler {
+    pub(super) fn query_directory_object_security(
+        &self,
+        caller: nt_process::native_handle::NativeHandleCaller,
+        handle: u64,
+        required_access: u32,
+        security_information: u32,
+    ) -> Result<Vec<u8>, u32> {
+        let identity = self
+            .pm
+            .lookup_native_object_directory_handle(caller, handle, required_access)?;
+        let index = self.directory_namespace_index_for_identity(identity)?;
+        nt_security::query_security_descriptor_bytes(
+            self.directory_security_descriptor(index)?,
+            security_information,
+        )
+    }
+
+    pub(super) fn set_directory_object_security(
+        &mut self,
+        caller: nt_process::native_handle::NativeHandleCaller,
+        handle: u64,
+        required_access: u32,
+        security_information: u32,
+        modification: &[u8],
+    ) -> Result<(), u32> {
+        let _durable = allocator::enter_durable();
+        let identity = self
+            .pm
+            .lookup_native_object_directory_handle(caller, handle, required_access)?;
+        let index = self.directory_namespace_index_for_identity(identity)?;
+        let updated = nt_security::set_security_descriptor_bytes(
+            self.directory_security_descriptor(index)?,
+            security_information,
+            modification,
+        )?;
+        // The namespace body and descriptor share the exact generation identity. Recheck it
+        // before replacing the descriptor, so a stale handle cannot write a later body.
+        if self.obj_ns.get(index).map(|entry| entry.identity) != Some(identity) {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        let record = self
+            .directory_security
+            .iter_mut()
+            .find(|record| record.identity == identity)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        record.descriptor = updated;
+        Ok(())
+    }
+
     pub(super) fn prepare_directory_object_security(
         &mut self,
         captured: &CapturedNamedObjectAttributes,

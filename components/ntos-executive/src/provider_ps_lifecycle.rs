@@ -1,6 +1,6 @@
 //! Canonical execution identity for provider lifecycle callouts, independent of THREADINFO.
 
-use nt_kernel_abi::ps_reactos_x64 as abi;
+use nt_kernel_abi::ps_hosted_x64 as abi;
 
 const INVALID_CID: u32 = 0xc000_000b;
 

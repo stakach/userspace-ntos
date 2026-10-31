@@ -227,6 +227,35 @@ pub fn plan_synchronous_fsd_request(
     Ok(plan)
 }
 
+/// Plan a kernel-owned `IRP_MJ_SYSTEM_CONTROL / IRP_MN_REGINFO` request.
+/// The materializer allocates `system_buffer_len`, inserts that exact pointer
+/// into the WMI stack parameter, and registers both allocations in the source
+/// ledger before a driver dispatch can observe the packet.
+pub fn plan_wmi_reginfo_request(
+    stack_size: u8,
+    device_object: u64,
+    buffer_capacity: u32,
+) -> Result<KernelBuiltIrpPlan, KernelIrpPlanError> {
+    if device_object == 0 || buffer_capacity == 0 {
+        return Err(KernelIrpPlanError::InvalidIrpHeader);
+    }
+    let mut plan = KernelBuiltIrpPlan::empty(
+        stack_size,
+        major::IRP_MJ_SYSTEM_CONTROL,
+        device_object,
+    )?;
+    plan.stack.minor = 8; // IRP_MN_REGINFO
+    plan.stack.parameters = WdmIoStackParameters::Wmi {
+        provider_id: device_object,
+        data_path: 0,
+        buffer_size: buffer_capacity,
+        buffer: 0,
+    };
+    plan.system_buffer_len = buffer_capacity;
+    plan.irp_flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER;
+    Ok(plan)
+}
+
 /// Plan IoBuildDeviceIoControlRequest. Complete allocation and pointer capture
 /// before registering the IRP or making it visible to IofCallDriver.
 pub fn plan_device_io_control_request(

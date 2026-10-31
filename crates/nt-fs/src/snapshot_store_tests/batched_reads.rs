@@ -83,6 +83,8 @@ struct CommandDisk {
     singles: Vec<u64>,
     batches: Vec<(u64, usize)>,
     partial_failure: Option<u64>,
+    fail_batch_number: Option<usize>,
+    corrupt_batch_number: Option<usize>,
     command_count: Rc<Cell<usize>>,
 }
 
@@ -93,6 +95,8 @@ impl CommandDisk {
             singles: Vec::new(),
             batches: Vec::new(),
             partial_failure: None,
+            fail_batch_number: None,
+            corrupt_batch_number: None,
             command_count: Rc::new(Cell::new(0)),
         }
     }
@@ -128,8 +132,15 @@ impl SnapshotBlockDevice for CommandDisk {
         }
         self.batches.push((lba, count));
         self.command_count.set(self.command_count.get() + 1);
+        if self.fail_batch_number == Some(self.batches.len()) {
+            self.copy_sector(lba, &mut out[..512])?;
+            return Err(SnapshotBlockStoreError::Io);
+        }
         for (index, sector) in out.chunks_exact_mut(512).enumerate() {
             self.copy_sector(lba + index as u64, sector)?;
+        }
+        if self.corrupt_batch_number == Some(self.batches.len()) {
+            out[0] ^= 0x55;
         }
         Ok(())
     }
@@ -151,6 +162,63 @@ fn populated(len: usize) -> (SnapshotBlockStore, CommandDisk, Vec<u8>) {
     assert_eq!(store.commit_next(&mut inner, &payload), Ok(2));
     inner.events.clear();
     (store, CommandDisk::new(inner), payload)
+}
+
+#[test]
+fn streaming_payload_batches_reads_across_fragmented_decoder_requests() {
+    for len in [511, 512, 513, 2047, 2048, 2049, 3584] {
+        let (store, mut disk, payload) = populated(len);
+        let restored = store.read_latest_streaming(&mut disk, |reader| {
+            let mut bytes = alloc::vec![0; reader.remaining()];
+            let mut offset = 0;
+            let chunks = [1, 510, 2, 713];
+            let mut next = 0;
+            while offset < bytes.len() {
+                let end = (offset + chunks[next % chunks.len()]).min(bytes.len());
+                reader.read_exact(&mut bytes[offset..end])?;
+                assert_eq!(reader.remaining(), bytes.len() - end);
+                offset = end;
+                next += 1;
+            }
+            Ok(bytes)
+        }).unwrap().unwrap();
+        assert_eq!(restored, (2, len, payload));
+        let sectors = len.div_ceil(512);
+        let latest_batches: Vec<_> = (0..sectors)
+            .step_by(4)
+            .map(|index| (9 + index as u64, (sectors - index).min(4)))
+            .collect();
+        let mut expected = alloc::vec![(1, 1)]; // Validate the older slot.
+        expected.extend_from_slice(&latest_batches); // Validate the selected slot.
+        expected.extend_from_slice(&latest_batches); // Decode the selected slot.
+        assert_eq!(disk.batches, expected, "payload length {len}");
+        assert_eq!(disk.singles, [0, 8], "only headers need primitive reads");
+    }
+}
+
+#[test]
+fn streaming_payload_rejects_partial_batch_failure_and_changed_crc() {
+    for failure_is_io in [true, false] {
+        let (store, mut disk, _) = populated(3584);
+        // Three CRC batches validate both slots. The fifth is the final decode batch.
+        if failure_is_io {
+            disk.fail_batch_number = Some(5);
+        } else {
+            disk.corrupt_batch_number = Some(5);
+        }
+        let result = store.read_latest_streaming(&mut disk, |reader| {
+            let mut bytes = alloc::vec![0; reader.remaining()];
+            reader.read_exact(&mut bytes)?;
+            Ok(bytes)
+        });
+        assert!(matches!(result, Err(error) if error == if failure_is_io {
+            SnapshotBlockStoreError::Io
+        } else {
+            SnapshotBlockStoreError::Corrupt
+        }));
+        assert_eq!(disk.batches.last(), Some(&(13, 3)));
+        assert!(disk.inner.events.is_empty(), "a read cannot publish a snapshot");
+    }
 }
 
 #[test]
