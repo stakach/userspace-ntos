@@ -757,6 +757,7 @@ diagnosis-free failure.
 
 ## Keep Native Boot Loops Evidence Driven
 - Assign a read-only monitor to long boots so the build owner can investigate the next failure without repeatedly consuming the boot log. Record a specific failing observation and a focused regression before changing source, then compare the next bounded boot against that observation.
+- When boot progress feels slow, compare phase-specific guest time, disk commands, sectors, snapshot generations, and installer completion across two bounded runs before choosing a kernel change. An aggregate timer or disk count alone cannot identify the active bottleneck; measure the live route and preserve one serial validation owner.
 - When a released dependency fails import resolution, audit its complete pinned IAT against the resolver that actually loads that dependency before another boot. A separate registry or primary-image-only resolver is not proof of dependency coverage. Make one regression report the full missing set so validation does not discover one import per boot.
 - A newly visible warning is not necessarily the current blocker. Track whether the boot advances past it before redirecting implementation work.
 - For QEMU performance comparisons, clone and verify the entire writable disk image before the first run, then restore that full image before each variant. Restoring only a persistence tail leaves FAT32 writes behind and invalidates the comparison.
