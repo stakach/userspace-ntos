@@ -7,6 +7,9 @@ mod batched_reads;
 #[path = "snapshot_store_tests/batched_writes.rs"]
 mod batched_writes;
 
+#[path = "snapshot_store_tests/wide_batches.rs"]
+mod wide_batches;
+
 #[path = "snapshot_store_tests/wal_manifest.rs"]
 mod wal_manifest;
 

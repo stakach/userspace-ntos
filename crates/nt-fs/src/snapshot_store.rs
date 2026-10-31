@@ -63,6 +63,11 @@ pub enum SnapshotBlockStoreError {
 pub trait SnapshotBlockDevice {
     fn sector_size(&self) -> usize;
     fn sector_count(&self) -> u64;
+    /// Maximum whole-sector transfer that this device can complete as one command. Snapshot
+    /// readers and writers never ask for more; adapters retain the old four-sector default.
+    fn max_transfer_sectors(&self) -> usize {
+        4
+    }
     fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError>;
 
     /// Read a whole-sector range. Success means every requested byte was read; an error may
@@ -119,7 +124,7 @@ pub trait SnapshotPayloadReader {
     fn remaining(&self) -> usize;
 }
 
-const READ_BATCH_SECTORS: usize = 4;
+const READ_BATCH_SECTORS: usize = 32;
 
 /// Sector-buffered payload reader for [`SnapshotBlockStore::read_latest_streaming`].
 pub struct PayloadSectorReader<'a, D: SnapshotBlockDevice> {
@@ -616,8 +621,12 @@ impl SnapshotBlockStore {
     {
         let (sector_size, slot_sectors) = self.geometry(dev)?;
         let slot_base = self.slot_lba(slot_sectors, plan.slot)?;
+        let transfer_sectors = dev.max_transfer_sectors().min(READ_BATCH_SECTORS);
+        if transfer_sectors == 0 {
+            return Err(SnapshotBlockStoreError::InvalidGeometry);
+        }
         let batch_size = sector_size
-            .checked_mul(READ_BATCH_SECTORS)
+            .checked_mul(transfer_sectors)
             .ok_or(SnapshotBlockStoreError::InvalidGeometry)?;
         let mut batch = Vec::new();
         batch
@@ -1059,8 +1068,12 @@ impl SnapshotBlockStore {
         F: FnOnce(&mut PayloadSectorWriter<'_, D>) -> Result<(), SnapshotBlockStoreError>,
     {
         let (sector_size, slot_sectors) = self.geometry(dev)?;
+        let transfer_sectors = dev.max_transfer_sectors().min(payload_writer::WRITE_BATCH_SECTORS);
+        if transfer_sectors == 0 {
+            return Err(SnapshotBlockStoreError::InvalidGeometry);
+        }
         let batch_size = sector_size
-            .checked_mul(payload_writer::WRITE_BATCH_SECTORS)
+            .checked_mul(transfer_sectors)
             .ok_or(SnapshotBlockStoreError::InvalidGeometry)?;
         let max_payload_len = usize::try_from(
             slot_sectors
@@ -1333,8 +1346,12 @@ impl SnapshotBlockStore {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
         let slot_base = self.slot_lba(slot_sectors, plan.slot)?;
+        let transfer_sectors = dev.max_transfer_sectors().min(READ_BATCH_SECTORS);
+        if transfer_sectors == 0 {
+            return Err(SnapshotBlockStoreError::InvalidGeometry);
+        }
         let batch_size = sector_size
-            .checked_mul(READ_BATCH_SECTORS)
+            .checked_mul(transfer_sectors)
             .ok_or(SnapshotBlockStoreError::InvalidGeometry)?;
         let mut batch = Vec::new();
         batch
@@ -1345,7 +1362,7 @@ impl SnapshotBlockStore {
         let mut crc = Crc32c::new();
         let mut index = 0;
         while index < plan.payload_sectors {
-            let sectors = (plan.payload_sectors - index).min(READ_BATCH_SECTORS as u32);
+            let sectors = (plan.payload_sectors - index).min(transfer_sectors as u32);
             let bytes = sectors as usize * sector_size;
             let output = &mut batch[..bytes];
             output.fill(0);
@@ -1441,7 +1458,7 @@ impl<'a, D: SnapshotBlockDevice> PayloadSectorReader<'a, D> {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
         let remaining = self.payload_len - self.read;
-        let sectors = remaining.div_ceil(self.sector_size).min(READ_BATCH_SECTORS);
+        let sectors = remaining.div_ceil(self.sector_size).min(self.batch.len() / self.sector_size);
         let bytes = sectors * self.sector_size;
         self.batch[..bytes].fill(0);
         self.dev

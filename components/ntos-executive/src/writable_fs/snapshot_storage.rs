@@ -248,6 +248,9 @@ impl AhciSnapshotDevice {
 }
 
 impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
+    fn max_transfer_sectors(&self) -> usize {
+        32
+    }
     fn flush(&mut self) -> Result<(), nt_fs::SnapshotBlockStoreError> {
         if !crate::fs_loader::admit_exec_mount_boot_io(nt_fs::BlockSource::Snapshot, nt_fs::BlockOperation::Flush) {
             return Err(nt_fs::SnapshotBlockStoreError::Io);

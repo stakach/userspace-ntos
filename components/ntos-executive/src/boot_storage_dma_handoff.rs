@@ -14,7 +14,7 @@ use nt_pnp_context::native_storage_handoff::{
 
 const BOOT_GENERATION: u64 = 1;
 pub(crate) const BOOT_DOMAIN: u64 = 2;
-pub(crate) const HOSTED_BOOT_AHCI_IOVA: u64 = AHCI_IOVA + 0x1000;
+pub(crate) const HOSTED_BOOT_AHCI_IOVA: u64 = AHCI_IOVA + AHCI_BOOT_DMA_PAGES * 0x1000;
 
 pub(crate) struct BootStorageDmaAuthority {
     controller: PciController,
@@ -24,7 +24,7 @@ pub(crate) struct BootStorageDmaAuthority {
     // Retain the complete boot-owned tree and frame aliases for the controller lifetime.
     _iopt_caps: [u64; 4],
     _dma_frame: u64,
-    _dma_frame_io: u64,
+    _dma_frame_io: [u64; AHCI_BOOT_DMA_PAGES as usize],
     ledger: PciDmaHandoff,
     ready: bool,
     native_lease: Option<nt_pnp_context::ContextLeaseIdentity>,
@@ -246,7 +246,7 @@ pub(crate) fn install_boot_storage_dma_authority(
     io_space_cap: u64,
     iopt_caps: [u64; 4],
     dma_frame: u64,
-    dma_frame_io: u64,
+    dma_frame_io: [u64; AHCI_BOOT_DMA_PAGES as usize],
     mapped: bool,
 ) -> bool {
     if authority().is_some() {
@@ -258,7 +258,7 @@ pub(crate) fn install_boot_storage_dma_authority(
     let mut ledger = PciDmaHandoff::new();
     let ready = mapped
         && ledger
-            .register(controller, io_space_cap, AHCI_IOVA, 1)
+            .register(controller, io_space_cap, AHCI_IOVA, AHCI_BOOT_DMA_PAGES)
             .is_ok();
     unsafe {
         BOOT_STORAGE_DMA = Some(BootStorageDmaAuthority {

@@ -1261,10 +1261,10 @@ pub const SYSTEM_POINTER_COOKIE: u32 = 0xA3B1_C2D3;
 pub const NTDLL_VA: u64 = 0x0000_0100_0059_0000;
 /// Executive virtual address reserved for the firmware-described HPET register block.
 pub const HPET_VADDR: u64 = 0x0000_0100_105E_0000;
-/// P2: the AHCI controller ABAR (BAR5) MMIO, and a DMA frame for its command structures +
-/// the sector data buffer in the storage cluster before IPCBUF.
+/// P2: the AHCI controller ABAR (BAR5) MMIO and a boot DMA page run in the storage cluster.
 pub const AHCI_VADDR: u64 = 0x0000_0100_105F_4000;
 pub const AHCI_DMA_VADDR: u64 = 0x0000_0100_105F_5000;
+pub(crate) const AHCI_BOOT_DMA_PAGES: u64 = 5;
 /// Shared word between the executive (broker) and the isolated storage host: the AHCI's
 /// device address (identity paddr, or a VT-d IOVA once confined) in @0 and verdict (u32) @8.
 pub const STORAGE_SHARED_VADDR: u64 = 0x0000_0100_1044_0000;
@@ -2052,10 +2052,11 @@ const _: () = assert!(SWHIVEBUF_FRAMES * 0x1000 <= 0x20_0000);
 pub const NLS_SMSS_ANSI_VA: u64 = 0x0000_0100_00E0_0000;
 pub const NLS_SMSS_OEM_VA: u64 = 0x0000_0100_00E2_0000;
 pub const NLS_SMSS_CASE_VA: u64 = 0x0000_0100_00E4_0000;
-/// The IOVA we grant the AHCI for its DMA frame. Once VT-d confinement is on, the HBA is
-/// programmed with this address; VT-d maps it to the DMA frame and NOTHING else.
+/// The IOVA we grant the AHCI for its boot DMA page run. Once VT-d confinement is on, the HBA
+/// sees only those pages and separately admitted native DMA windows.
 pub const AHCI_IOVA: u64 = 0x1000;
 pub const IPCBUF_VADDR: u64 = 0x0000_0100_105F_B000;
+const _: () = assert!(AHCI_DMA_VADDR + AHCI_BOOT_DMA_PAGES * 0x1000 <= IPCBUF_VADDR);
 const _: () =
     assert!(STORAGE_SHARED_END <= IPCBUF_VADDR || IPCBUF_VADDR + 0x1000 <= STORAGE_SHARED_VADDR);
 
@@ -27949,8 +27950,12 @@ pub(crate) fn disk_census_ticks() -> u64 {
 }
 
 pub(crate) const AHCI_DMA_DATA_OFFSET: u64 = 0x800;
-pub(crate) const AHCI_MAX_SECTORS_PER_READ: u32 = ((0x1000 - AHCI_DMA_DATA_OFFSET) / 512) as u32;
+pub(crate) const AHCI_MAX_SECTORS_PER_READ: u32 =
+    ((AHCI_BOOT_DMA_PAGES * 0x1000 - AHCI_DMA_DATA_OFFSET) / 512) as u32;
 pub(crate) const AHCI_MAX_SECTORS_PER_WRITE: u32 = AHCI_MAX_SECTORS_PER_READ;
+const _: () = assert!(AHCI_MAX_SECTORS_PER_READ == 36);
+const _: () = assert!(AHCI_MAX_SECTORS_PER_READ <= u16::MAX as u32);
+const _: () = assert!((AHCI_MAX_SECTORS_PER_READ as u64) * 512 <= 0x40_0000);
 
 /// Bring up AHCI port 0 and READ one 512-byte sector (`sector`) into the DMA frame's data
 /// window via ATA READ DMA EXT. READ ONLY.
@@ -27981,8 +27986,10 @@ unsafe fn ahci_read_sectors_isolated_storage_host(
 
 /// Bring up AHCI port 0 and READ `sector_count` 512-byte sectors into the DMA frame at
 /// `dma_vaddr + AHCI_DMA_DATA_OFFSET` (paddr `dma_paddr + AHCI_DMA_DATA_OFFSET`) via ATA READ DMA
-/// EXT. All AHCI DMA structures live in one 4 KiB frame: Command List @0 (1 KiB-aligned), FIS Rx
-/// @0x400 (256-aligned), Command Table @0x500 (128-aligned), data buffer @0x800. Returns the port
+/// EXT. AHCI command structures live in the first 4 KiB frame: Command List @0 (1 KiB-aligned),
+/// FIS Rx @0x400 (256-aligned), Command Table @0x500 (128-aligned). The one PRDT entry spans a
+/// contiguous IOVA window from @0x800 across the remaining mapped pages; the underlying frames
+/// need not be physically contiguous. Returns the port
 /// Task File Data low byte after completion (0 = success; 0xFF = timeout/invalid count).
 unsafe fn ahci_read_sectors(
     ahci_vaddr: u64,
@@ -29385,13 +29392,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     pages: 1,
                 },
             });
-            // The DMA frame: AHCI command list + FIS + command table + the data buffer.
-            let dma_frame = alloc_slot();
-            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, dma_frame);
+            // A cap run for the AHCI command structures and contiguous virtual/I/O data window.
+            // The frames may have unrelated physical addresses; VT-d joins their IOVAs.
+            let dma_frame = alloc_frame_run(AHCI_BOOT_DMA_PAGES);
             // ---- CONFINE the AHCI's DMA via the VT-d IOMMU. Mint an IO-space cap stamped
             // with the AHCI's PCI request-id (00:3.0 -> rid 0x18) + its own domain, build the
-            // 4-level IO page-table hierarchy toward AHCI_IOVA, and map the DMA frame there.
-            // The AHCI can then DMA to AHCI_IOVA only — VT-d faults anything else.
+            // 4-level IO page-table hierarchy toward AHCI_IOVA, and map the DMA run there.
+            // The AHCI can then DMA only to this run until separately owned windows are admitted.
             let ahci_rid =
                 ((storage_bus as u64) << 8) | ((storage_dev as u64) << 3) | (storage_func as u64);
             let ahci_io_badge = (boot_storage_dma_handoff::BOOT_DOMAIN << 16) | ahci_rid;
@@ -29428,12 +29435,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 iopt_err == 0,
                 &mut passed,
             );
-            let dma_frame_io = copy_cap(dma_frame);
-            let map_err = if iopt_err == 0 && io_space_mint_error == 0 {
-                map_io(dma_frame_io, ahci_io_space, 0x3, AHCI_IOVA)
-            } else {
-                1
-            };
+            let mut dma_frame_io = [0u64; AHCI_BOOT_DMA_PAGES as usize];
+            let mut map_err = if iopt_err == 0 && io_space_mint_error == 0 { 0 } else { 1 };
+            for page in 0..AHCI_BOOT_DMA_PAGES {
+                let frame_io = copy_cap(dma_frame + page);
+                dma_frame_io[page as usize] = frame_io;
+                if map_err == 0 {
+                    map_err = map_io(frame_io, ahci_io_space, 0x3, AHCI_IOVA + page * 0x1000);
+                }
+            }
             print_str(b"[ntos-exec] AHCI map_io err=");
             print_u64(map_err);
             print_str(b"\n");
@@ -29838,14 +29848,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
             // --- P7-A: EXECUTIVE-SIDE FS-BY-PATH — the one-shot storage host has retired, so the executive
             // drives the same (idle) AHCI HBA itself to resolve ANY \reactos path on demand. It
-            // already owns the AHCI BAR (mapped at AHCI_VADDR) + the DMA frame cap + the VT-d IO
-            // mapping (AHCI_IOVA); it only needs a CPU-side mapping of that DMA frame. Map it at
+            // already owns the AHCI BAR (mapped at AHCI_VADDR) + the DMA cap run + the VT-d IO
+            // mapping (AHCI_IOVA); it only needs CPU-side mappings of those pages. Map them at
             // AHCI_DMA_VADDR (same page table as AHCI_VADDR/STORAGE_SHARED — no new PT), mount the
             // FAT32 volume into a persistent handle (EXEC_FS), then PROVE the generic loader: read a
             // binary NOT in the staged set (version.dll) BY PATH into the pool and PE32+-parse it.
             // This is the P5 enabler — adding services.exe/lsass/explorer needs zero per-binary code.
-            let dma_exec = copy_cap(dma_frame);
-            let _ = page_map(dma_exec, AHCI_DMA_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
+            for page in 0..AHCI_BOOT_DMA_PAGES {
+                let dma_exec = copy_cap(dma_frame + page);
+                let _ = page_map(
+                    dma_exec,
+                    AHCI_DMA_VADDR + page * 0x1000,
+                    RW_NX,
+                    CAP_INIT_THREAD_VSPACE,
+                );
+            }
             let mut generic_loader_ok = false;
             if let Some(fs) = fat32_mount(AHCI_VADDR, AHCI_DMA_VADDR, AHCI_IOVA)
                 .and_then(|fs| publish_exec_fs(fs).ok().map(|()| fs)) {

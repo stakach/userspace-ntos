@@ -1059,7 +1059,7 @@ pub(crate) unsafe fn spawn_storage_host(
     regions[n] = Region {
         source: FrameSource::Alias(dma_frame),
         base_va: AHCI_DMA_VADDR,
-        count: 1,
+        count: AHCI_BOOT_DMA_PAGES,
         rights: Rights::Uniform(RW_NX),
         pts: 0,
     };

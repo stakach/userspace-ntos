@@ -588,6 +588,14 @@ mod tests {
     }
 
     #[test]
+    fn five_page_boot_window_reserves_exactly_its_iova_range() {
+        let mut ledger = PciDmaHandoff::new();
+        ledger.register(AHCI, 41, 0x1000, 5).unwrap();
+        assert_eq!(ledger.reserve_window(AHCI, 41, 0x5000, 1), Err(Error::Overlap));
+        assert!(ledger.reserve_window(AHCI, 41, 0x6000, 1).is_ok());
+    }
+
+    #[test]
     fn disjoint_windows_are_reserved_and_uncertain_effects_remain_quarantined() {
         let mut ledger = ledger();
         assert_eq!(
