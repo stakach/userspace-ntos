@@ -5868,27 +5868,56 @@ pub(crate) unsafe fn service_win32k_mm_secure_request(
 
 /// Service a bounded win32k global-atom request against the executive-lifetime native atom table.
 pub(crate) unsafe fn service_win32k_atom_request(
-    client_pi: u64,
-    client_generation: u64,
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
     operation: u64,
     value: u64,
 ) -> (i32, u64) {
     const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
     const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 
+    let (route, dispatch) = match crate::provider_service_ingress::authenticate(
+        channel, reply_cap, badge, mi,
+        (crate::win32k_subsystem::W32_ATOM_LABEL << 12) | 2,
+    ) {
+        Ok(owner) => owner,
+        Err(status) => return (status as i32, 0),
+    };
+    if let Err(status) = crate::provider_service_ingress::physical_win32k_provider(
+        channel, route, dispatch,
+    ) {
+        return (status as i32, 0);
+    }
     let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     if handler_ptr.is_null() {
         return (STATUS_DEVICE_NOT_READY, 0);
     }
     let handler = &mut *handler_ptr;
-    let Ok(pi) = usize::try_from(client_pi) else {
-        return (STATUS_DEVICE_NOT_READY, 0);
-    };
-    if client_generation == 0
-        || handler.pm_pid_for_pi(pi).is_none()
-        || handler.hosted_process_generation(pi) != Some(client_generation)
-    {
-        return (STATUS_DEVICE_NOT_READY, 0);
+    if channel.kernel_caller.is_none() {
+        let Some(caller) = channel.logical_caller else {
+            return (STATUS_DEVICE_NOT_READY, 0);
+        };
+        if caller.pi() as u64 != channel.client_pi
+            || caller.process().generation
+                != nt_user_host::process_identity::ProcessGeneration::Hosted(
+                    channel.client_generation,
+                )
+            || !crate::win32k_glue::registry_logical_caller_is_current(channel)
+            || !handler.validate_provider_logical_caller(caller)
+        {
+            return (STATUS_DEVICE_NOT_READY, 0);
+        }
+        let Ok(pi) = usize::try_from(channel.client_pi) else {
+            return (STATUS_DEVICE_NOT_READY, 0);
+        };
+        if channel.client_generation == 0
+            || handler.pm_pid_for_pi(pi).is_none()
+            || handler.hosted_process_generation(pi) != Some(channel.client_generation)
+        {
+            return (STATUS_DEVICE_NOT_READY, 0);
+        }
     }
 
     let result = match operation {

@@ -3444,8 +3444,10 @@ unsafe fn component_pump_loop(
         {
             let (status, atom) = unsafe {
                 crate::service_sec_image::service_win32k_atom_request(
-                    ch.client_pi,
-                    ch.client_generation,
+                    ch,
+                    *reply_cap,
+                    msg.badge,
+                    msg.mi,
                     msg.m0,
                     msg.m1,
                 )
