@@ -74,19 +74,20 @@ pub(crate) fn release_unentered_mounted_directory_sector(
     result
 }
 
-pub(crate) fn claim_mounted_read_sector() -> Option<crate::mounted_volume_backend::mounted_installed_read::ReadSectorClaim> {
+pub(crate) fn claim_mounted_read_sectors() -> Option<crate::mounted_volume_backend::mounted_installed_read::ReadSectorClaim> {
     let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_READ_QUEUE)).as_ref()?.clone() };
-    let claim = queue.borrow_mut().claim_next_bounded(1);
+    // The live native SCSI route already carries four-sector snapshot transfers.
+    let claim = queue.borrow_mut().claim_next_bounded(4);
     claim
 }
 
-pub(crate) fn complete_mounted_read_sector(
+pub(crate) fn complete_mounted_read_sectors(
     claim: crate::mounted_volume_backend::mounted_installed_read::ReadSectorClaim,
-    sector: Result<&[u8; 512], nt_fs::FatPathError>,
+    sectors: Result<&[u8], nt_fs::FatPathError>,
 ) -> Result<nt_fs::FatRangeProgress, crate::mounted_volume_backend::mounted_installed_read::ReadError> {
     let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_READ_QUEUE)).as_ref().cloned() }
         .ok_or(crate::mounted_volume_backend::mounted_installed_read::ReadError::Invalid)?;
-    let result = queue.borrow_mut().complete_sectors(claim, sector.map(|sector| &sector[..]));
+    let result = queue.borrow_mut().complete_sectors(claim, sectors);
     result
 }
 

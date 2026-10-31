@@ -4,7 +4,7 @@
 //! A borrowed dispatch buffer cannot survive native SCSI transport entry.
 
 use alloc::vec::Vec;
-use crate::{FatPathError, FatPathGeometry, FatRangeLookup, FatRangeProgress, FatRangeRequest, FatRangeRequestKind, FatVerifiedChain, STATUS_DATA_ERROR};
+use crate::{checked_partition_lba, BlockOperation, FatPathError, FatPathGeometry, FatRangeLookup, FatRangeProgress, FatRangeRequest, FatRangeRequestKind, FatVerifiedChain, STATUS_DATA_ERROR};
 
 // The installed layer is immutable for this mount generation. A larger file remains readable
 // when a bounded chain index stops growing; the cursor resumes from its longest proven prefix.
@@ -38,6 +38,20 @@ pub struct ReadSectorClaim {
 }
 
 impl ReadSectorClaim {
+    /// Translate the exact claimed range to a physical read. The route owner checks disk bounds
+    /// before entry; this also rejects relative-sector and LBA arithmetic overflow.
+    pub fn block_read_operation(self, partition_start: u64) -> Option<BlockOperation> {
+        if self.sectors == 0
+            || (self.sectors > 1 && self.request.kind != FatRangeRequestKind::Data)
+        {
+            return None;
+        }
+        let last = self.request.sector.checked_add(self.sectors.checked_sub(1)?)?;
+        let lba = checked_partition_lba(partition_start, self.request.sector)?;
+        checked_partition_lba(partition_start, last)?;
+        Some(BlockOperation::Read { lba, sectors: self.sectors })
+    }
+
     /// The installed layer is immutable for this mount generation. File data and multi-sector
     /// claims retain their own completion ownership and cannot share this metadata cache.
     pub const fn installed_fat_metadata_sector(self) -> Option<u32> {
@@ -473,6 +487,31 @@ mod tests {
         assert_eq!(&output[..1024], &[1; 1024]);
         assert_eq!(&output[1024..], &[2; 1024]);
         reads.ack(12).unwrap();
+    }
+
+    #[test]
+    fn native_block_read_uses_the_entire_verified_claim_and_exact_completion() {
+        let geometry = FatPathGeometry { fat_start_sector: 1, data_start_sector: 10,
+            total_sectors: 1000, sectors_per_cluster: 4 };
+        let mut reads = ReadCompletions::new();
+        reads.capture_range(21, 7, 9, geometry, 2, 0, 2048, None).unwrap();
+        let claim = reads.claim_next_bounded(4).unwrap();
+        assert_eq!(claim.block_read_operation(100), Some(BlockOperation::Read {
+            lba: 110, sectors: 4,
+        }));
+        assert_eq!(reads.complete_sectors(claim, Ok(&[7; 2048])),
+            Ok(FatRangeProgress::Complete));
+        assert_eq!(reads.next_completion(), Some((21, 0, 2048)));
+        let mut output = [0; 2048];
+        assert_eq!(reads.copy(21, 0, &mut output), Ok(2048));
+        assert_eq!(output, [7; 2048]);
+
+        assert_eq!(ReadSectorClaim { sectors: 2, request: FatRangeRequest {
+            sector: u32::MAX, kind: FatRangeRequestKind::Data,
+        }, ..claim }.block_read_operation(100), None);
+        assert_eq!(ReadSectorClaim { sectors: 2, request: FatRangeRequest {
+            sector: 1, kind: FatRangeRequestKind::Fat,
+        }, ..claim }.block_read_operation(100), None);
     }
 
     #[test]

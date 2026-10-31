@@ -48,17 +48,21 @@ impl SectorClaim {
         }
     }
 
-    fn complete(self, sector: Result<&[u8; 512], nt_fs::FatPathError>) {
+    fn complete(self, bytes: Result<&[u8], nt_fs::FatPathError>) {
         match self {
             Self::Create(c) => {
+                let sector = bytes.and_then(|bytes| <&[u8; 512]>::try_from(bytes)
+                    .map_err(|_| nt_fs::FatPathError::Corrupt));
                 crate::mounted_volume::complete_mounted_create_sector(c, sector)
                     .expect("entered CREATE sector claim lost");
             }
             Self::Read(c) => {
-                crate::mounted_volume::complete_mounted_read_sector(c, sector)
+                crate::mounted_volume::complete_mounted_read_sectors(c, bytes)
                     .expect("entered READ sector claim lost");
             }
             Self::Directory(c) => {
+                let sector = bytes.and_then(|bytes| <&[u8; 512]>::try_from(bytes)
+                    .map_err(|_| nt_fs::FatPathError::Corrupt));
                 crate::mounted_volume::complete_mounted_directory_sector(c, sector)
                     .expect("entered DIRECTORY sector claim lost");
             }
@@ -88,6 +92,10 @@ impl WorkClaim {
 
     fn operation(&self) -> Option<nt_fs::BlockOperation> {
         match self {
+            Self::Sector(SectorClaim::Read(claim)) => {
+                let fs = unsafe { crate::fs_loader::exec_fs()? };
+                claim.block_read_operation(fs.volume_start_lba)
+            }
             Self::Sector(claim) => {
                 let fs = unsafe { crate::fs_loader::exec_fs()? };
                 let lba = nt_fs::checked_partition_lba(fs.volume_start_lba, claim.sector())?;
@@ -124,11 +132,7 @@ impl WorkClaim {
 
     fn complete(self, result: Result<&[u8], nt_status::NtStatus>) {
         match self {
-            Self::Sector(claim) => {
-                let sector = result.ok().and_then(|bytes| <&[u8; 512]>::try_from(bytes).ok())
-                    .ok_or(nt_fs::FatPathError::Corrupt);
-                claim.complete(sector);
-            }
+            Self::Sector(claim) => claim.complete(result.map_err(|_| nt_fs::FatPathError::Corrupt)),
             Self::Snapshot(claim) => unsafe {
                 crate::writable_fs::native_snapshot_io::complete_native_snapshot_io(claim, result)
             }.expect("acknowledged snapshot claim lost"),
@@ -164,7 +168,7 @@ static mut SNAPSHOT_FIRST: bool = false;
 fn next_sector_claim() -> Option<WorkClaim> {
     crate::mounted_volume::claim_mounted_create_sector()
         .map(SectorClaim::Create)
-        .or_else(|| crate::mounted_volume::claim_mounted_read_sector().map(SectorClaim::Read))
+        .or_else(|| crate::mounted_volume::claim_mounted_read_sectors().map(SectorClaim::Read))
         .or_else(|| crate::mounted_volume::claim_mounted_directory_sector().map(SectorClaim::Directory))
         .map(WorkClaim::Sector)
 }
