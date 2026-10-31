@@ -15,7 +15,7 @@ on:
         options: ['1', '2']
   push:
     branches: [codex/libernt-userspace]
-    paths: [.github/workflows/native-kvm-smoke.yml, scripts/ci_kvm_smoke.py, scripts/tests/test_ci_kvm_smoke_process_group.py]
+    paths: [.github/workflows/native-kvm-smoke.yml, scripts/ci_kvm_smoke.py, scripts/tests/test_ci_kvm_smoke_process_group.py, scripts/tests/test_ci_kvm_smoke_host_state.py]
 
 permissions:
   contents: read
@@ -100,8 +100,8 @@ jobs:
               raise SystemExit(f"unexpected KVM API version {version}")
           print("hosted KVM API version 12 available")
           PY
-      - name: Verify bounded QEMU cleanup contract
-        run: python3 -m unittest discover -s scripts/tests -p 'test_ci_kvm_smoke_process_group.py' -v
+      - name: Verify bounded QEMU runner contracts
+        run: python3 -m unittest discover -s scripts/tests -p 'test_ci_kvm_smoke_*.py' -v
       - name: Build native image from verified pinned LiberNT release
         run: |
           set -o pipefail

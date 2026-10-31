@@ -94,6 +94,58 @@ def read_cpu_state():
     return state
 
 
+def parse_proc_stat(stat):
+    """Return process-group identity, CPU ticks, and RSS pages from /proc/PID/stat."""
+    # comm is parenthesized and may itself contain spaces or closing parentheses.
+    fields = stat.rpartition(") ")[2].split()
+    if len(fields) < 22:
+        raise ValueError("incomplete process stat")
+    return int(fields[2]), int(fields[11]) + int(fields[12]), int(fields[21])
+
+
+def read_host_state(process_group):
+    """Sample runner pressure and CPU consumed by the private QEMU process group."""
+    state = {"load_average": os.getloadavg()}
+    for resource in ("cpu", "io", "memory"):
+        try:
+            state[f"{resource}_pressure"] = (Path("/proc/pressure") / resource).read_text().strip()
+        except OSError:
+            state[f"{resource}_pressure"] = "unavailable"
+    for name, path in (
+        ("cgroup_cpu_stat", Path("/sys/fs/cgroup/cpu.stat")),
+        ("cgroup_memory_current", Path("/sys/fs/cgroup/memory.current")),
+        ("cgroup_swap_current", Path("/sys/fs/cgroup/memory.swap.current")),
+    ):
+        try:
+            state[name] = path.read_text().strip()
+        except OSError:
+            state[name] = "unavailable"
+    cpu_ticks = 0
+    rss_pages = 0
+    members = 0
+    try:
+        processes = subprocess.check_output(["ps", "-eo", "pid=,pgid=,stat="], text=True)
+        for line in processes.splitlines():
+            fields = line.split()
+            if len(fields) < 3 or int(fields[1]) != process_group or fields[2].startswith("Z"):
+                continue
+            try:
+                exact_group, ticks, pages = parse_proc_stat(Path(f"/proc/{fields[0]}/stat").read_text())
+            except (OSError, ValueError):
+                continue  # The process may exit between ps and /proc.
+            if exact_group != process_group:
+                continue  # A reused PID is not authority for the earlier ps snapshot.
+            members += 1
+            cpu_ticks += ticks
+            rss_pages += pages
+    except (OSError, subprocess.CalledProcessError, ValueError) as error:
+        state["process_error"] = str(error)
+    state["group_members"] = members
+    state["group_cpu_seconds"] = round(cpu_ticks / os.sysconf("SC_CLK_TCK"), 3)
+    state["group_rss_mib"] = round(rss_pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024), 1)
+    return state
+
+
 def capture_stall_state():
     """Keep per-CPU register evidence when the bounded boot window expires."""
     STALL_STATE.write_text(json.dumps(read_cpu_state(), indent=2) + "\n")
@@ -199,8 +251,17 @@ def main():
                         print(f"QMP framebuffer capture pending: {error}", flush=True)
                     next_capture = time.monotonic() + 30
                 if time.monotonic() >= next_cpu_sample and QMP_SOCKET.exists():
+                    try:
+                        host = read_host_state(process.pid)
+                    except (OSError, ValueError) as error:
+                        host = {"error": str(error)}
+                    try:
+                        serial_bytes = LOG.stat().st_size
+                    except OSError:
+                        serial_bytes = None
                     sample = {"elapsed_seconds": round(time.monotonic() - started, 3),
-                              "state": read_cpu_state()}
+                              "state": read_cpu_state(),
+                              "host": host, "serial_bytes": serial_bytes}
                     with CPU_SAMPLES.open("a") as samples:
                         samples.write(json.dumps(sample) + "\n")
                     next_cpu_sample = time.monotonic() + 60
