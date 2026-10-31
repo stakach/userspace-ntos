@@ -1113,6 +1113,15 @@ fn mutate_local_irp_packet(
     argument: u64,
     flags: u64,
 ) -> (i32, u64, u64) {
+    if operation == 13 {
+        print_str(b"[source-irp-reuse] enter irp=0x");
+        print_hex64(irp);
+        print_str(b" status=0x");
+        print_hex64(argument);
+        print_str(b" apc=");
+        print_u64(flags);
+        print_str(b"\n");
+    }
     if irp == 0 || irp & 15 != 0 {
         return (STATUS_INVALID_PARAMETER, 0, 0);
     }
@@ -1140,11 +1149,13 @@ fn mutate_local_irp_packet(
     let Some(identity) = (unsafe {
         exact_pool_identity_unlocked(inst, irp, WDM_X64_IRP_SIZE as u64)
     }) else {
+        if operation == 13 { print_str(b"[source-irp-reuse] deny=pool-identity\n"); }
         return (STATUS_INVALID_PARAMETER, 0, 0);
     };
     let Some(header_exec) = (unsafe {
         hosted_pool_allocation_exec_va(inst.exec_pool_va, irp, WDM_X64_IRP_SIZE as u64)
     }) else {
+        if operation == 13 { print_str(b"[source-irp-reuse] deny=pool-exec\n"); }
         return (STATUS_INVALID_PARAMETER, 0, 0);
     };
     let (packet_size, stack_count) = if operation == 12 {
@@ -1155,6 +1166,20 @@ fn mutate_local_irp_packet(
                 read_unaligned((header_exec + WDM_X64_IRP_STACK_COUNT_OFFSET) as *const u8))
         }
     };
+    if operation == 13 {
+        let projection = caller_projections().iter().find(|row| {
+            row.allocation.domain == domain && row.allocation.component_address == irp
+        });
+        print_str(b"[source-irp-reuse] packet="); print_u64(packet_size as u64);
+        print_str(b" capacity="); print_u64(identity.capacity);
+        print_str(b" stacks="); print_u64(stack_count as u64);
+        print_str(b" projection="); print_u64(projection.is_some() as u64);
+        if let Some(row) = projection {
+            print_str(b" terminal-started="); print_u64(row.terminal_started as u64);
+            print_str(b" terminal-finished="); print_u64(row.terminal_finished as u64);
+        }
+        print_str(b"\n");
+    }
     if packet_size as usize > identity.capacity as usize
         || (packet_size as usize) < WDM_X64_IRP_SIZE
         || !(1..=32).contains(&stack_count)
@@ -1202,7 +1227,10 @@ fn mutate_local_irp_packet(
     };
     match result {
         Ok(()) => (STATUS_SUCCESS, 0, 0),
-        Err(_) => (STATUS_INVALID_PARAMETER, 0, 0),
+        Err(_) => {
+            if operation == 13 { print_str(b"[source-irp-reuse] deny=wdm-layout\n"); }
+            (STATUS_INVALID_PARAMETER, 0, 0)
+        },
     }
 }
 
