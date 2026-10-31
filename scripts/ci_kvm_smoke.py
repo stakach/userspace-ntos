@@ -19,6 +19,7 @@ QMP_SOCKET = ROOT / "native-kvm-smoke-qmp.sock"
 INTERRUPT_TRACE = MICRO / "native-kvm-qemu-int.log"
 INTERRUPT_TRACE_TAIL = ROOT / "native-kvm-qemu-int-tail.log"
 STALL_STATE = ROOT / "native-kvm-stall-state.json"
+CPU_SAMPLES = ROOT / "native-kvm-cpu-samples.jsonl"
 
 
 def qmp_reply(stream, command_id):
@@ -55,8 +56,8 @@ def capture_framebuffer():
         raise RuntimeError("QMP did not write a framebuffer image")
 
 
-def capture_stall_state():
-    """Keep per-CPU register evidence when the bounded boot window expires."""
+def read_cpu_state():
+    """Read each vCPU's current registers without changing guest state."""
     state = {"cpus": []}
     try:
         with socket.socket(socket.AF_UNIX) as connection:
@@ -88,8 +89,12 @@ def capture_stall_state():
                         state.setdefault("register_errors", {})[str(index)] = str(error)
     except (OSError, RuntimeError, ValueError, KeyError) as error:
         state["error"] = str(error)
-    finally:
-        STALL_STATE.write_text(json.dumps(state, indent=2) + "\n")
+    return state
+
+
+def capture_stall_state():
+    """Keep per-CPU register evidence when the bounded boot window expires."""
+    STALL_STATE.write_text(json.dumps(read_cpu_state(), indent=2) + "\n")
 
 
 def stop_process_group(process):
@@ -115,6 +120,7 @@ def main():
     INTERRUPT_TRACE.unlink(missing_ok=True)
     INTERRUPT_TRACE_TAIL.unlink(missing_ok=True)
     STALL_STATE.unlink(missing_ok=True)
+    CPU_SAMPLES.unlink(missing_ok=True)
     command = [
         "./scripts/run_specs.sh",
         "-qmp",
@@ -133,6 +139,7 @@ def main():
         )
         started = time.monotonic()
         next_capture = started + 10
+        next_cpu_sample = started + 60
         captured = False
         try:
             while time.monotonic() - started < args.seconds:
@@ -146,6 +153,12 @@ def main():
                     except (OSError, RuntimeError, ValueError) as error:
                         print(f"QMP framebuffer capture pending: {error}", flush=True)
                     next_capture = time.monotonic() + 30
+                if time.monotonic() >= next_cpu_sample and QMP_SOCKET.exists():
+                    sample = {"elapsed_seconds": round(time.monotonic() - started, 3),
+                              "state": read_cpu_state()}
+                    with CPU_SAMPLES.open("a") as samples:
+                        samples.write(json.dumps(sample) + "\n")
+                    next_cpu_sample = time.monotonic() + 60
                 time.sleep(1)
         finally:
             try:

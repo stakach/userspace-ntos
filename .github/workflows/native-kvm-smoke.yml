@@ -120,6 +120,7 @@ jobs:
             native-kvm-smoke.ppm
             native-kvm-qemu-int-tail.log
             native-kvm-stall-state.json
+            native-kvm-cpu-samples.jsonl
             native-kvm-image.sha256
             native-kvm-libernt-manifest.txt
             rust-micro/target/mykernel-x86/release/mykernel-rust
