@@ -348,6 +348,7 @@ unsafe fn install_retained() -> Result<bool, u32> {
     hive_wal::note_volume_wal_folded();
     *core::ptr::addr_of_mut!(FOLD_WORK) = None;
     SYSTEM_WAL_FOLD_REQUIRED.store(false, Ordering::Release);
+    crate::service_sec_image::note_system_wal_fold_complete();
     WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(false, Ordering::Release);
     Ok(true)
 }

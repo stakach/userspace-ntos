@@ -76,6 +76,7 @@ mod ntoskrnl_classpnp_rtl;
 mod hosted_driver_nls_exports;
 mod server;
 mod service_sec_image;
+mod wal_fold_cadence;
 mod hosted_stack_growth;
 mod local_section_file;
 mod native_image_source_io;

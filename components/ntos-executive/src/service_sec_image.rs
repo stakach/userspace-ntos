@@ -3181,13 +3181,42 @@ fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
     status
 }
 
-const SYSTEM_WAL_FOLD_INTERVAL_100NS: u64 = 5 * 10_000_000;
-static SYSTEM_WAL_LAST_FOLD_100NS: AtomicU64 = AtomicU64::new(0);
+const SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS: u64 = 5 * 10_000_000;
+static SYSTEM_WAL_FIRST_DIRTY_100NS: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_WAL_USED_SECTORS: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_WAL_CAPACITY_SECTORS: AtomicU64 = AtomicU64::new(0);
 // A timer scan records demand without entering CM or native snapshot I/O while its delivery
 // gate and dispatcher borrows are live. The next safe service boundary owns the attempt.
 static SYSTEM_WAL_FOLD_DUE: AtomicBool = AtomicBool::new(false);
 static SYSTEM_WAL_FOLD_RUNNING: AtomicBool = AtomicBool::new(false);
 static SYSTEM_WAL_FOLD_RETRY_100NS: AtomicU64 = AtomicU64::new(0);
+
+/// Called only after the exact WAL continuation and both anchored snapshot headers are
+/// installed. All durable volume WAL users share this publication boundary.
+pub(crate) fn note_durable_system_wal_mutation(used_sectors: u64, capacity_sectors: u64) {
+    let now = monotonic_time_100ns().max(1);
+    let _ = SYSTEM_WAL_FIRST_DIRTY_100NS.compare_exchange(
+        0, now, Ordering::AcqRel, Ordering::Acquire,
+    );
+    SYSTEM_WAL_USED_SECTORS.store(used_sectors, Ordering::Release);
+    SYSTEM_WAL_CAPACITY_SECTORS.store(capacity_sectors, Ordering::Release);
+    let first_dirty = SYSTEM_WAL_FIRST_DIRTY_100NS.load(Ordering::Acquire);
+    if crate::wal_fold_cadence::background_fold_due(
+        first_dirty, now, used_sectors, capacity_sectors,
+    ) {
+        SYSTEM_WAL_FOLD_RETRY_100NS.store(
+            now.saturating_add(SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS), Ordering::Release,
+        );
+        SYSTEM_WAL_FOLD_DUE.store(true, Ordering::Release);
+    }
+    unsafe { rearm_registered_active_delay_timer() };
+}
+
+pub(crate) fn note_system_wal_fold_complete() {
+    SYSTEM_WAL_FIRST_DIRTY_100NS.store(0, Ordering::Release);
+    SYSTEM_WAL_USED_SECTORS.store(0, Ordering::Release);
+    SYSTEM_WAL_CAPACITY_SECTORS.store(0, Ordering::Release);
+}
 
 pub(crate) fn system_wal_fold_next_deadline() -> Option<u64> {
     if SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire) {
@@ -3198,8 +3227,12 @@ pub(crate) fn system_wal_fold_next_deadline() -> Option<u64> {
     {
         return None;
     }
-    let last = SYSTEM_WAL_LAST_FOLD_100NS.load(Ordering::Relaxed);
-    (last != 0).then(|| last.saturating_add(SYSTEM_WAL_FOLD_INTERVAL_100NS))
+    crate::wal_fold_cadence::next_background_fold_deadline(
+        match SYSTEM_WAL_FIRST_DIRTY_100NS.load(Ordering::Acquire) {
+            0 => None,
+            at => Some(at),
+        },
+    )
 }
 
 pub(crate) fn record_due_system_wal_fold(now_100ns: u64) -> u64 {
@@ -3209,7 +3242,7 @@ pub(crate) fn record_due_system_wal_fold(now_100ns: u64) -> u64 {
     // If CM is still busy, keep a fixed future retry rather than minimum-arming the same
     // overdue shot. The WAL remains durable; this is only the background image fold.
     SYSTEM_WAL_FOLD_RETRY_100NS.store(
-        now_100ns.saturating_add(SYSTEM_WAL_FOLD_INTERVAL_100NS), Ordering::Release,
+        now_100ns.saturating_add(SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS), Ordering::Release,
     );
     SYSTEM_WAL_FOLD_DUE.store(true, Ordering::Release);
     1
@@ -3246,21 +3279,24 @@ fn maybe_fold_system_wal() -> Result<(), u32> {
         return Ok(());
     }
     let now = monotonic_time_100ns();
-    let last = SYSTEM_WAL_LAST_FOLD_100NS.load(Ordering::Relaxed);
-    if last == 0 {
-        SYSTEM_WAL_LAST_FOLD_100NS.store(now, Ordering::Relaxed);
-        unsafe { rearm_registered_active_delay_timer() };
-        return Ok(());
-    }
-    if now.saturating_sub(last) < SYSTEM_WAL_FOLD_INTERVAL_100NS {
+    let first_dirty = SYSTEM_WAL_FIRST_DIRTY_100NS.load(Ordering::Acquire);
+    if first_dirty == 0 || !crate::wal_fold_cadence::background_fold_due(
+        first_dirty, now,
+        SYSTEM_WAL_USED_SECTORS.load(Ordering::Acquire),
+        SYSTEM_WAL_CAPACITY_SECTORS.load(Ordering::Acquire),
+    ) {
         return Ok(());
     }
     let _transient = allocator::enter_transient();
     let _alloc_ctx = allocator::enter_context(allocator::ALLOC_CTX_WRITABLE_SNAPSHOT);
     let result = unsafe { crate::writable_fs::fold_system_wal_if_dirty() };
-    SYSTEM_WAL_LAST_FOLD_100NS.store(now, Ordering::Relaxed);
-    if result.is_ok() || !crate::writable_fs::system_wal_fold_blocked() {
+    if result.is_ok() {
         SYSTEM_WAL_FOLD_DUE.store(false, Ordering::Release);
+    } else if !crate::writable_fs::system_wal_fold_blocked() {
+        SYSTEM_WAL_FOLD_RETRY_100NS.store(
+            now.saturating_add(SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS), Ordering::Release,
+        );
+        SYSTEM_WAL_FOLD_DUE.store(true, Ordering::Release);
     }
     unsafe { rearm_registered_active_delay_timer() };
     match result {
@@ -3285,7 +3321,11 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
             // The completed fold is durable, but the CM ACK result is uncertain. Keep its
             // physical reserve and token, and let the next timer wake retry this exact ACK.
             // An ordinary checkpoint cannot acquire the reserve until that proof arrives.
-            SYSTEM_WAL_LAST_FOLD_100NS.store(monotonic_time_100ns(), Ordering::Relaxed);
+            SYSTEM_WAL_FOLD_RETRY_100NS.store(
+                monotonic_time_100ns().saturating_add(SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS),
+                Ordering::Release,
+            );
+            SYSTEM_WAL_FOLD_DUE.store(true, Ordering::Release);
             unsafe { rearm_registered_active_delay_timer() };
             return nt_fs::STATUS_SUCCESS;
         }

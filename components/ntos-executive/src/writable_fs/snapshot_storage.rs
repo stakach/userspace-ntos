@@ -117,7 +117,13 @@ pub(crate) fn install_wal_continuation(
     if slot.is_some() || token.anchor().incarnation == 0 || token.anchor() != pair.anchor() {
         return Err((nt_fs::STATUS_INVALID_DEVICE_REQUEST, token, pair));
     }
+    let manifest = pair.manifest();
     *slot = Some(MountedWalContinuation { mount, token, pair });
+    if manifest.base_serial != manifest.high_water_serial {
+        crate::service_sec_image::note_durable_system_wal_mutation(
+            manifest.high_water_end_lba, WAL_SECTORS,
+        );
+    }
     Ok(())
 }
 

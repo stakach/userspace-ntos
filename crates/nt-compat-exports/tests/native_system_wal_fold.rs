@@ -74,7 +74,8 @@ fn lazy_writer_and_shutdown_fold_without_changing_explicit_flush_fence() {
     let service = source("service_sec_image.rs");
     assert!(service.contains("fold_system_wal_if_dirty()"),
         "the active service loop must schedule CM image folds independently of file dirty bits");
-    assert!(service.contains("SYSTEM_WAL_FOLD_INTERVAL_100NS")
+    assert!(service.contains("wal_fold_cadence::next_background_fold_deadline")
+        && service.contains("wal_fold_cadence::background_fold_due")
         && service.contains("monotonic_time_100ns()"),
         "background folds must coalesce mutations over a bounded interval");
     let timer = source("timer_deadline.rs");
@@ -109,7 +110,8 @@ fn pending_cm_ack_redrives_before_generic_snapshot_or_timer_gate() {
     assert!(pending < redrive && redrive < generic,
         "an ACK held under the reserve must redrive before generic snapshot acquisition");
     let early = &body[pending..generic];
-    assert!(early.contains("SYSTEM_WAL_LAST_FOLD_100NS.store(monotonic_time_100ns()")
+    assert!(early.contains("SYSTEM_WAL_FOLD_RETRY_100NS.store(")
+        && early.contains("monotonic_time_100ns().saturating_add(SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS)")
         && early.contains("rearm_registered_active_delay_timer()"),
         "a refused ACK must move its timer deadline forward instead of rearming a past deadline");
 }
@@ -160,10 +162,10 @@ fn overdue_wal_fold_progresses_at_nested_receive_boundary_without_timer_storm() 
     let service = source("service_sec_image.rs");
     let deadline = &service[service.find("pub(crate) fn system_wal_fold_next_deadline()").unwrap()..];
     assert!(deadline.find("SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire)").unwrap()
-        < deadline.find("last.saturating_add(SYSTEM_WAL_FOLD_INTERVAL_100NS)").unwrap(),
+        < deadline.find("wal_fold_cadence::next_background_fold_deadline").unwrap(),
         "pending fold demand must replace the past deadline with a retry deadline");
     let wake = &service[service.find("pub(crate) fn record_due_system_wal_fold(").unwrap()..];
-    assert!(wake.contains("now_100ns.saturating_add(SYSTEM_WAL_FOLD_INTERVAL_100NS)")
+    assert!(wake.contains("now_100ns.saturating_add(SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS)")
         && wake.contains("SYSTEM_WAL_FOLD_RETRY_100NS.store("),
         "a busy CM must retain a bounded future retry without a minimum-shot IRQ storm");
     let entry = &service[service.find("pub(crate) fn service_due_system_wal_fold()").unwrap()..];

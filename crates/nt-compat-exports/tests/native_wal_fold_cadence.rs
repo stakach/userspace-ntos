@@ -32,3 +32,15 @@ fn wal_capacity_pressure_overrides_the_background_age() {
     assert!(background_fold_due(first_dirty, now, 3072, 4096));
     assert_eq!(next_background_fold_deadline(None), None);
 }
+
+#[test]
+fn live_system_wal_fold_uses_durable_dirty_age_and_capacity_pressure() {
+    let service = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
+    let owner = include_str!("../../../components/ntos-executive/src/writable_fs/snapshot_storage.rs");
+    let fold = include_str!("../../../components/ntos-executive/src/writable_fs/system_wal_fold.rs");
+    assert!(service.contains("wal_fold_cadence::next_background_fold_deadline"));
+    assert!(service.contains("wal_fold_cadence::background_fold_due"));
+    assert!(!service.contains("SYSTEM_WAL_FOLD_INTERVAL_100NS"));
+    assert!(owner.contains("note_durable_system_wal_mutation"));
+    assert!(fold.contains("note_system_wal_fold_complete"));
+}
