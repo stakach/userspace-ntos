@@ -1575,10 +1575,25 @@ pub unsafe extern "C" fn LdrpInitialize(
             reset_process_heap_state_for_new_process();
             on_target::reset_process_runtime_state_for_new_process();
         }
-        // Retain the existing startup trace consumed by native validation.
-        let marker: [u8; 53] = *b"nt-ntdll: Step 4.B in-process loader drive (LdrpInit)";
+        // Retain the startup marker while identifying the actual process. Several service
+        // children can initialize concurrently, so adjacency to a spawn line is not ownership.
+        let process_id: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {}, gs:[0x40]",
+                out(reg) process_id,
+                options(nostack, preserves_flags, readonly)
+            );
+        }
+        let loader_start_tick = unsafe { core::arch::x86_64::_rdtsc() };
+        let mut marker = [0u8; 128];
+        let prefix = b"nt-ntdll: Step 4.B in-process loader drive (LdrpInit) pid=0x";
+        marker[..prefix.len()].copy_from_slice(prefix);
+        let mut marker_len = write_u64_hex(&mut marker, prefix.len(), process_id);
+        marker[marker_len..marker_len + 7].copy_from_slice(b" tsc=0x");
+        marker_len = write_u64_hex(&mut marker, marker_len + 7, loader_start_tick);
         // SAFETY: on-target, marker is a mapped stack buffer.
-        unsafe { dbg_print_bytes(marker.as_ptr(), marker.len()) };
+        unsafe { dbg_print_bytes(marker.as_ptr(), marker_len) };
 
         let ntdll = ntdll_base as u64;
         {
@@ -1604,9 +1619,9 @@ pub unsafe extern "C" fn LdrpInitialize(
 
             // (4) Report the snap result: "snap N/M spot=0x..." (built on the STACK). N=resolved,
             // M=resolved+missing, spot = the first written IAT value (proves it points into our ntdll).
-            let mut buf = [0u8; 64];
+            let mut buf = [0u8; 160];
             let mut n = 0usize;
-            let put = |buf: &mut [u8; 64], n: &mut usize, b: &[u8]| {
+            let put = |buf: &mut [u8; 160], n: &mut usize, b: &[u8]| {
                 for &c in b {
                     if *n < buf.len() {
                         buf[*n] = c;
@@ -1620,6 +1635,10 @@ pub unsafe extern "C" fn LdrpInitialize(
             n = write_u32_dec(&mut buf, n, res.missing);
             put(&mut buf, &mut n, b" spot=0x");
             n = write_u64_hex(&mut buf, n, res.spot_iat_value);
+            put(&mut buf, &mut n, b" pid=0x");
+            n = write_u64_hex(&mut buf, n, process_id);
+            put(&mut buf, &mut n, b" tsc=0x");
+            n = write_u64_hex(&mut buf, n, unsafe { core::arch::x86_64::_rdtsc() });
             // SAFETY: on-target, buf is a mapped stack buffer.
             unsafe { dbg_print_bytes(buf.as_ptr(), n) };
         }
@@ -1633,7 +1652,7 @@ pub unsafe extern "C" fn LdrpInitialize(
 
 /// Append `v` as decimal into `buf[n..]`; return the new length. Stack-only (no alloc).
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn write_u32_dec(buf: &mut [u8; 64], mut n: usize, v: u32) -> usize {
+pub(crate) fn write_u32_dec<const N: usize>(buf: &mut [u8; N], mut n: usize, v: u32) -> usize {
     if v == 0 {
         if n < buf.len() {
             buf[n] = b'0';
@@ -1661,7 +1680,7 @@ pub(crate) fn write_u32_dec(buf: &mut [u8; 64], mut n: usize, v: u32) -> usize {
 
 /// Append `v` as 16-hex-digit into `buf[n..]`; return the new length. Stack-only (no alloc).
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn write_u64_hex(buf: &mut [u8; 64], mut n: usize, v: u64) -> usize {
+pub(crate) fn write_u64_hex<const N: usize>(buf: &mut [u8; N], mut n: usize, v: u64) -> usize {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for i in (0..16).rev() {
         let nib = ((v >> (i * 4)) & 0xf) as usize;
