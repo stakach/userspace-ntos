@@ -138,6 +138,42 @@ fn completed_native_fold_can_advance_inside_the_active_irp_pump() {
 }
 
 #[test]
+fn overdue_wal_fold_progresses_at_nested_receive_boundary_without_timer_storm() {
+    let main = source("main.rs");
+    let timer = &main[main.find("unsafe fn delay_timer_drain_due_work(").unwrap()..];
+    let drain = &timer[..timer.find("pub(crate) unsafe fn delay_timer_drain_overdue_without_badge(").unwrap()];
+    assert!(drain.contains("record_due_system_wal_fold(now_100ns)"),
+        "timer delivery records fold demand before its caller rearms");
+
+    let pump = source("component_shared_pump.rs");
+    let body = &pump[pump.find("pub(super) unsafe fn receive(").unwrap()..];
+    let fold = body.find("service_due_system_wal_fold()")
+        .expect("nested receiver must service a due SYSTEM WAL fold");
+    let next_message = body.find("runtime::next_message(route)")
+        .expect("next blocking receive");
+    assert!(fold < next_message,
+        "a retained IRP pump must advance the fold before it blocks for another message");
+    let narrow = &body[..fold];
+    assert!(narrow.contains("runtime::nested::park_current()"),
+        "the fold must run with its physical Receive parent parked");
+
+    let service = source("service_sec_image.rs");
+    let deadline = &service[service.find("pub(crate) fn system_wal_fold_next_deadline()").unwrap()..];
+    assert!(deadline.find("SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire)").unwrap()
+        < deadline.find("last.saturating_add(SYSTEM_WAL_FOLD_INTERVAL_100NS)").unwrap(),
+        "pending fold demand must replace the past deadline with a retry deadline");
+    let wake = &service[service.find("pub(crate) fn record_due_system_wal_fold(").unwrap()..];
+    assert!(wake.contains("now_100ns.saturating_add(SYSTEM_WAL_FOLD_INTERVAL_100NS)")
+        && wake.contains("SYSTEM_WAL_FOLD_RETRY_100NS.store("),
+        "a busy CM must retain a bounded future retry without a minimum-shot IRQ storm");
+    let entry = &service[service.find("pub(crate) fn service_due_system_wal_fold()").unwrap()..];
+    assert!(entry.contains("maybe_fold_system_wal()")
+        && entry.contains("SYSTEM_WAL_FOLD_RUNNING.swap(true, Ordering::AcqRel)")
+        && entry.contains("system_wal_fold_blocked()"),
+        "nested progress must use the same fold and failure policy as the outer finalizer");
+}
+
+#[test]
 fn small_fold_keeps_anchored_epoch_and_reserves_rollover_for_capacity() {
     let fold = source("writable_fs/system_wal_fold.rs");
     let native = source("writable_fs/system_wal_fold/native.rs");

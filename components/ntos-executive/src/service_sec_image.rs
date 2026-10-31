@@ -3183,8 +3183,16 @@ fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
 
 const SYSTEM_WAL_FOLD_INTERVAL_100NS: u64 = 5 * 10_000_000;
 static SYSTEM_WAL_LAST_FOLD_100NS: AtomicU64 = AtomicU64::new(0);
+// A timer scan records demand without entering CM or native snapshot I/O while its delivery
+// gate and dispatcher borrows are live. The next safe service boundary owns the attempt.
+static SYSTEM_WAL_FOLD_DUE: AtomicBool = AtomicBool::new(false);
+static SYSTEM_WAL_FOLD_RUNNING: AtomicBool = AtomicBool::new(false);
+static SYSTEM_WAL_FOLD_RETRY_100NS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn system_wal_fold_next_deadline() -> Option<u64> {
+    if SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire) {
+        return Some(SYSTEM_WAL_FOLD_RETRY_100NS.load(Ordering::Acquire));
+    }
     if !unsafe { crate::writable_fs::writable_fs_mounted() }
         || crate::writable_fs::legacy_snapshot_writes_allowed()
     {
@@ -3192,6 +3200,40 @@ pub(crate) fn system_wal_fold_next_deadline() -> Option<u64> {
     }
     let last = SYSTEM_WAL_LAST_FOLD_100NS.load(Ordering::Relaxed);
     (last != 0).then(|| last.saturating_add(SYSTEM_WAL_FOLD_INTERVAL_100NS))
+}
+
+pub(crate) fn record_due_system_wal_fold(now_100ns: u64) -> u64 {
+    if !system_wal_fold_next_deadline().is_some_and(|deadline| deadline <= now_100ns) {
+        return 0;
+    }
+    // If CM is still busy, keep a fixed future retry rather than minimum-arming the same
+    // overdue shot. The WAL remains durable; this is only the background image fold.
+    SYSTEM_WAL_FOLD_RETRY_100NS.store(
+        now_100ns.saturating_add(SYSTEM_WAL_FOLD_INTERVAL_100NS), Ordering::Release,
+    );
+    SYSTEM_WAL_FOLD_DUE.store(true, Ordering::Release);
+    1
+}
+
+pub(crate) fn system_wal_fold_work_pending() -> bool {
+    SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire)
+        && !SYSTEM_WAL_FOLD_RUNNING.load(Ordering::Acquire)
+        && crate::config_manager_channel_idle()
+}
+
+/// Enter the same physical fold contract as the outer finalizer, but only after the nested
+/// receiver has parked its exact parent. A busy native fold retains its owner and async work.
+pub(crate) fn service_due_system_wal_fold() -> Result<bool, u32> {
+    if !SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire) || !crate::config_manager_channel_idle() {
+        return Ok(false);
+    }
+    if SYSTEM_WAL_FOLD_RUNNING.swap(true, Ordering::AcqRel) {
+        return Ok(false);
+    }
+    let result = maybe_fold_system_wal();
+    SYSTEM_WAL_FOLD_RUNNING.store(false, Ordering::Release);
+    result?;
+    Ok(true)
 }
 
 /// Coalesce CM-owned SYSTEM mutations independently of ordinary file snapshot dirtiness.
@@ -3217,6 +3259,9 @@ fn maybe_fold_system_wal() -> Result<(), u32> {
     let _alloc_ctx = allocator::enter_context(allocator::ALLOC_CTX_WRITABLE_SNAPSHOT);
     let result = unsafe { crate::writable_fs::fold_system_wal_if_dirty() };
     SYSTEM_WAL_LAST_FOLD_100NS.store(now, Ordering::Relaxed);
+    if result.is_ok() || !crate::writable_fs::system_wal_fold_blocked() {
+        SYSTEM_WAL_FOLD_DUE.store(false, Ordering::Release);
+    }
     unsafe { rearm_registered_active_delay_timer() };
     match result {
         Ok(_) => Ok(()),

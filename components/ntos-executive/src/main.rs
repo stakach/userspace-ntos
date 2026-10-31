@@ -17170,6 +17170,7 @@ unsafe fn delay_timer_drain_due_work(
 ) -> u64 {
     let now_100ns = now.monotonic_100ns;
     let watchdog_tick = subdrain!(8, watchdog_take_timer_work(now_100ns));
+    let wal_fold_due = service_sec_image::record_due_system_wal_fold(now_100ns);
     subdrain!(0, delay_wake_due(handler, queue, now))
         + subdrain!(1, wait_wake_due(handler, now))
         + subdrain!(2, keyed_wait_wake_due(handler, now))
@@ -17198,6 +17199,7 @@ unsafe fn delay_timer_drain_due_work(
         + service_sec_image::component_resume::wake_due(&handler.pm, now_100ns)
         + driver_launch::hosted_dpc_wake_due(now_100ns)
         + driver_launch::hosted_driver_pnp_notification_wake_due()
+        + wal_fold_due
         + watchdog_tick
 }
 

@@ -135,6 +135,24 @@ pub(super) unsafe fn receive(
             }
             if progressed { continue; }
         }
+        // Timer delivery only records a due fold while the outer service loop is retained.
+        // Enter CM and native snapshot I/O here with the exact Receive parent parked; the
+        // cadence gate prevents a recursive CM call from admitting the same fold again.
+        if crate::service_sec_image::system_wal_fold_work_pending() {
+            let mut parent = match runtime::nested::park_current() {
+                Ok(parent) => parent,
+                Err(_) => return PumpMessage::transport_wall(),
+            };
+            let result = crate::service_sec_image::service_due_system_wal_fold();
+            if runtime::nested::restore(&mut parent).is_err() {
+                return PumpMessage::transport_wall();
+            }
+            match result {
+                Ok(true) => continue,
+                Ok(false) => {},
+                Err(_) => return PumpMessage::transport_wall(),
+            }
+        }
         let progressed = crate::registry_mutation_work::redrive_provider();
         // A retained CM mutation can use all sixteen steps and still have a local terminal
         // phase to run. Take another fair, bounded pass before entering a blocking Receive.
