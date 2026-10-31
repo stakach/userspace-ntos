@@ -7261,6 +7261,7 @@ pub(crate) fn census_tick_static(now: u64) {
     if n.is_power_of_two() {
         exec_handler::native_io_attribution::print_summary();
     }
+    service_sec_image::pending_pipe_read_trace::print_summary();
     print_add_device_rollback_census(b"periodic", false);
     print_hosted_file_owner_census(b"periodic", false);
 }

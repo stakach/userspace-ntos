@@ -104,6 +104,9 @@ pub(super) unsafe fn before_post_action(
             // Publish Waiting before any reentrant completion can make this thread Ready.
             thread_wait_state_park_badge_waiting(nt_handler, pending.badge);
         }
+        super::pending_pipe_read_trace::parked(
+            nt_handler, identity, pending, wait_for_completion,
+        );
         Some(PublishedFileIo {
             identity,
             irp_id: pending.irp_id,

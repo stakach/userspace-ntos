@@ -44,6 +44,8 @@ mod pending_file_busy;
 mod pending_file_delivery;
 #[path = "file_dispatch_handoff.rs"]
 mod file_dispatch_handoff;
+#[path = "pending_pipe_read_trace.rs"]
+pub(crate) mod pending_pipe_read_trace;
 #[path = "inline_file_retirement.rs"]
 pub(crate) mod inline_file_retirement;
 #[path = "hosted_gui_client_info.rs"]
@@ -27015,6 +27017,7 @@ unsafe fn pending_file_io_redrive_pass(
             ) {
                 panic!("pending File completion identity mismatch");
             }
+            pending_pipe_read_trace::terminal_observed(identity, pending.irp_id, completed.status);
         }
         let is_pipe_transceive = !pending.is_local()
             && pending.major == nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL
@@ -27708,6 +27711,7 @@ unsafe fn pending_file_io_redrive_pass(
             (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                 .mark_reply_published_exact(slot, pending.irp_id)
                 .expect("pending File reply publication owner disappeared");
+            pending_pipe_read_trace::reply_delivered(identity, pending.irp_id);
             release_reply_pool_cap(cap);
             thread_wait_state_clear_badge_ready(nt_handler, pending.badge);
         }
@@ -27775,6 +27779,7 @@ unsafe fn pending_file_io_redrive_pass(
         let finished = table
             .finish_owner_exact(identity, pending.irp_id)
             .expect("completed pending File owner did not retire");
+        pending_pipe_read_trace::retired(identity, pending.irp_id);
         if let Some(file_id) = finished.route.hosted_file_id() {
             if matches!(finished.major, nt_io_abi::major::IRP_MJ_READ | nt_io_abi::major::IRP_MJ_WRITE) {
                 let fs_context = driver_launch::hosted_file_route(file_id)
