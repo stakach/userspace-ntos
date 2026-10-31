@@ -23,6 +23,15 @@ STALL_STATE = ROOT / "native-kvm-stall-state.json"
 CPU_SAMPLES = ROOT / "native-kvm-cpu-samples.jsonl"
 STOPPED_MARKER = ROOT / "native-kvm-qemu-stopped"
 
+# Fixed 60-second QMP samples repeatedly hit the same clock-publication RIP,
+# while the guest's own cycle counter showed that path used only a few seconds.
+# Vary the phase so a periodic guest path cannot masquerade as a CPU hotspot.
+CPU_SAMPLE_DELAYS = (17, 31, 43, 59)
+
+
+def cpu_sample_delay(sample_index):
+    return CPU_SAMPLE_DELAYS[sample_index % len(CPU_SAMPLE_DELAYS)]
+
 
 def qmp_reply(stream, command_id):
     while True:
@@ -219,7 +228,8 @@ def main():
         started = time.monotonic()
         deadline = started + args.seconds
         next_capture = started + 10
-        next_cpu_sample = started + 60
+        cpu_sample_index = 0
+        next_cpu_sample = started + cpu_sample_delay(cpu_sample_index)
         captured = False
         stall_captured = False
         def signal_guest(sig):
@@ -264,7 +274,8 @@ def main():
                               "host": host, "serial_bytes": serial_bytes}
                     with CPU_SAMPLES.open("a") as samples:
                         samples.write(json.dumps(sample) + "\n")
-                    next_cpu_sample = time.monotonic() + 60
+                    cpu_sample_index += 1
+                    next_cpu_sample = time.monotonic() + cpu_sample_delay(cpu_sample_index)
                 time.sleep(min(1, max(0, deadline - time.monotonic())))
         finally:
             try:

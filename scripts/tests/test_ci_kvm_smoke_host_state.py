@@ -4,10 +4,16 @@ import os
 import unittest
 from unittest.mock import patch
 
-from scripts.ci_kvm_smoke import parse_proc_stat, read_host_state
+from scripts.ci_kvm_smoke import cpu_sample_delay, parse_proc_stat, read_host_state
 
 
 class ProcStatCpuTests(unittest.TestCase):
+    def test_cpu_samples_move_across_periodic_guest_phases(self):
+        delays = [cpu_sample_delay(index) for index in range(8)]
+        self.assertEqual(delays[:4], delays[4:])
+        self.assertEqual(len(set(delays[:4])), 4)
+        self.assertTrue(all(0 < delay < 60 for delay in delays))
+
     @staticmethod
     def stat(group):
         fields = ["S"] + ["0"] * 21
