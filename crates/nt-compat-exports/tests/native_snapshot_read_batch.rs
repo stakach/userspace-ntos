@@ -11,8 +11,13 @@ fn boot_ahci_dma_window_covers_batched_snapshot_io_and_stays_disjoint_from_nativ
     assert!(host.contains("count: AHCI_BOOT_DMA_PAGES"));
     assert!(authority.contains("AHCI_IOVA + AHCI_BOOT_DMA_PAGES * 0x1000"));
     assert!(authority.contains(".register(controller, io_space_cap, AHCI_IOVA, AHCI_BOOT_DMA_PAGES)"));
-    let snapshot = include_str!("../../../components/ntos-executive/src/writable_fs/snapshot_storage.rs");
-    assert!(snapshot.contains("fn max_transfer_sectors(&self) -> usize { 32 }"));
+    let transfer = device_method("max_transfer_sectors");
+    assert!(matches!(
+        transfer.block.stmts.as_slice(),
+        [syn::Stmt::Expr(Expr::Lit(lit), None)]
+            if matches!(&lit.lit, syn::Lit::Int(value)
+                if value.base10_parse::<usize>().ok() == Some(32))
+    ));
 }
 
 fn source() -> syn::File {
