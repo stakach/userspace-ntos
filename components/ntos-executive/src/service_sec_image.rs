@@ -3216,6 +3216,10 @@ pub(crate) fn note_system_wal_fold_complete() {
     SYSTEM_WAL_FIRST_DIRTY_100NS.store(0, Ordering::Release);
     SYSTEM_WAL_USED_SECTORS.store(0, Ordering::Release);
     SYSTEM_WAL_CAPACITY_SECTORS.store(0, Ordering::Release);
+    // An explicit or asynchronously completed fold bypasses maybe_fold_system_wal's success
+    // branch. Its exact paired snapshot and CM ACK retire the pending timer demand as well.
+    SYSTEM_WAL_FOLD_DUE.store(false, Ordering::Release);
+    SYSTEM_WAL_FOLD_RETRY_100NS.store(0, Ordering::Release);
 }
 
 pub(crate) fn system_wal_fold_next_deadline() -> Option<u64> {

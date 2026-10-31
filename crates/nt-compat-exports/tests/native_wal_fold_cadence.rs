@@ -43,4 +43,8 @@ fn live_system_wal_fold_uses_durable_dirty_age_and_capacity_pressure() {
     assert!(!service.contains("SYSTEM_WAL_FOLD_INTERVAL_100NS"));
     assert!(owner.contains("note_durable_system_wal_mutation"));
     assert!(fold.contains("note_system_wal_fold_complete"));
+    let completed = &service[service.find("pub(crate) fn note_system_wal_fold_complete()").unwrap()
+        ..service.find("pub(crate) fn system_wal_fold_next_deadline()").unwrap()];
+    assert!(completed.contains("SYSTEM_WAL_FOLD_DUE.store(false"),
+        "an explicit fold must retire a pending timer demand with its exact ACK");
 }
