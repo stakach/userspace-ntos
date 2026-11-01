@@ -10,7 +10,7 @@ use nt_user_host::canonical_directory_backing::{
     CanonicalHandle, DirectoryPort, PortCreate, PortEffect, PortTerminal,
 };
 
-use crate::{ObChan, OBJECT_CLIENT_PTR};
+use crate::{allocator, ObChan, OBJECT_CLIENT_PTR};
 
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
@@ -79,6 +79,7 @@ impl DirectoryPort for CanonicalDirectoryPort {
 
     fn create(&mut self, path: &[u16], desired_access: u32, attributes: u32)
         -> PortCreate<Self::Handle, Self::Pending> {
+        let _durable = allocator::enter_durable();
         let name = match Self::name(path) {
             Ok(name) => name,
             Err(status) => return PortCreate::NoEffect(status),
@@ -93,6 +94,7 @@ impl DirectoryPort for CanonicalDirectoryPort {
 
     fn open(&mut self, path: &[u16], desired_access: u32, attributes: u32)
         -> PortCreate<Self::Handle, Self::Pending> {
+        let _durable = allocator::enter_durable();
         let name = match Self::name(path) {
             Ok(name) => name,
             Err(status) => return PortCreate::NoEffect(status),
@@ -107,6 +109,7 @@ impl DirectoryPort for CanonicalDirectoryPort {
 
     fn poll_create(&mut self, pending: &mut Self::Pending)
         -> Option<PortTerminal<CanonicalHandle<Self::Handle>>> {
+        let _durable = allocator::enter_durable();
         let NativeDirectoryPending::Directory(pending) = pending else {
             return Some(PortTerminal::Incoherent);
         };
@@ -122,6 +125,7 @@ impl DirectoryPort for CanonicalDirectoryPort {
     }
 
     fn make_temporary(&mut self, handle: Self::Handle) -> PortEffect<Self::Pending> {
+        let _durable = allocator::enter_durable();
         let Some(client) = self.client() else {
             return PortEffect::NoEffect(STATUS_DEVICE_NOT_READY);
         };
@@ -129,6 +133,7 @@ impl DirectoryPort for CanonicalDirectoryPort {
     }
 
     fn make_permanent(&mut self, handle: Self::Handle) -> PortEffect<Self::Pending> {
+        let _durable = allocator::enter_durable();
         let Some(client) = self.client() else {
             return PortEffect::NoEffect(STATUS_DEVICE_NOT_READY);
         };
@@ -136,6 +141,7 @@ impl DirectoryPort for CanonicalDirectoryPort {
     }
 
     fn close(&mut self, handle: Self::Handle) -> PortEffect<Self::Pending> {
+        let _durable = allocator::enter_durable();
         let Some(client) = self.client() else {
             return PortEffect::NoEffect(STATUS_DEVICE_NOT_READY);
         };
@@ -143,6 +149,7 @@ impl DirectoryPort for CanonicalDirectoryPort {
     }
 
     fn poll_effect(&mut self, pending: &mut Self::Pending) -> Option<PortTerminal<()>> {
+        let _durable = allocator::enter_durable();
         let NativeDirectoryPending::Mutation(pending) = pending else {
             return Some(PortTerminal::Incoherent);
         };

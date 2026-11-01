@@ -652,3 +652,19 @@ fn retained_directory_queues_allocate_in_durable_scope() {
             "{name} must enter durable scope before growing its retained Reply queue");
     }
 }
+
+#[test]
+fn canonical_directory_transport_retains_owned_requests_in_durable_scope() {
+    let port = syn::parse_file(include_str!(
+        "../../../../components/ntos-executive/src/canonical_directory_port.rs"
+    )).unwrap();
+    for name in ["create", "open", "poll_create", "make_temporary",
+        "make_permanent", "close", "poll_effect"] {
+        let mut calls = Calls::default();
+        calls.visit_block(&method(&port, name).block);
+        let durable = calls.0.iter().position(|call| call == "enter_durable");
+        let client = calls.0.iter().position(|call| call == "client");
+        assert!(matches!((durable, client), (Some(d), Some(c)) if d < c),
+            "{name} must enter durable scope before ObjectClient can retain request or CQE bytes");
+    }
+}
