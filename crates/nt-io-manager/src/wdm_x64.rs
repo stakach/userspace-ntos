@@ -23,6 +23,9 @@ pub const WDM_X64_IO_TYPE_DRIVER: i16 = 4;
 pub const WDM_X64_IO_TYPE_DEVICE: i16 = 3;
 pub const WDM_X64_IO_TYPE_FILE: i16 = 5;
 
+mod vpb;
+pub use vpb::{device_type_needs_vpb, write_wdm_vpb, WDM_X64_IO_TYPE_VPB, WDM_X64_VPB_SIZE};
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WdmLayoutError {
     BufferTooSmall,

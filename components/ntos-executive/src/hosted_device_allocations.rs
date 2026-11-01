@@ -214,6 +214,7 @@ struct Row {
     domain: HostedDomainIdentity,
     allocation: SourcePoolAllocationIdentity,
     staged_driver_object: Option<u64>,
+    owned_vpb: Option<SourcePoolAllocationIdentity>,
     accepted: Option<HostedDevicePointerRegistration>,
     accepted_driver_object: Option<u64>,
     registration: Option<HostedDevicePointerRegistration>,
@@ -819,8 +820,8 @@ pub(super) fn generic_free_admission(
         || interrupt_projection::protects(inst, address)
         || rows().iter().any(|row| {
             same_pool(row.instance, inst)
-                && address >= row.allocation.component_address
-                && address < row.allocation.component_address + row.allocation.capacity
+                && (contains_allocation(row.allocation, address)
+                    || row.owned_vpb.is_some_and(|vpb| contains_allocation(vpb, address)))
         })
         || file_rows()
             .iter()
@@ -1140,6 +1141,7 @@ pub(super) unsafe fn protect_allocation_exact(
         domain,
         allocation: current,
         staged_driver_object: None,
+        owned_vpb: None,
         accepted: None,
         accepted_driver_object: None,
         registration: None,
@@ -1187,19 +1189,20 @@ pub(super) enum DeviceListOwner {
     Unlinked,
 }
 
-pub(super) unsafe fn stage_driver_object(
-    inst: DriverInstance, address: u64, list_owner: DeviceListOwner,
+pub(super) unsafe fn stage_device_projection(
+    inst: DriverInstance, address: u64, list_owner: DeviceListOwner, expected_device_type: u32,
 ) -> Result<(), nt_status::NtStatus> {
     let _guard = lock();
     let _pool = hosted_instance_pool_lock(inst.exec_pool_va)
         .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
     let current = allocation(inst, address)?;
-    let row = rows()
-        .iter_mut()
-        .find(|row| same_arena(row.instance, inst)
+    let row_index = rows()
+        .iter()
+        .position(|row| same_arena(row.instance, inst)
             && row.allocation.component_address == address)
         .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
-    if row.retirement_pending || row.accepted.is_some() || row.allocation != current
+    if rows()[row_index].retirement_pending || rows()[row_index].accepted.is_some()
+        || rows()[row_index].allocation != current
         || current.capacity < WDM_X64_DEVICE_OBJECT_SIZE as u64 {
         return Err(nt_status::NtStatus::INVALID_HANDLE);
     }
@@ -1210,12 +1213,45 @@ pub(super) unsafe fn stage_driver_object(
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     let driver_object = read_unaligned(exec as *const u64);
     let next_device = read_unaligned((exec + 8) as *const u64);
+    let device_type = read_unaligned((exec + 0x40) as *const u32);
+    let vpb_address = read_unaligned((exec - 8 + 0x38) as *const u64);
+    if device_type != expected_device_type || vpb_address != 0 || rows()[row_index].owned_vpb.is_some() {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
     if (list_owner == DeviceListOwner::Linked && driver_object == 0)
         || (list_owner == DeviceListOwner::Unlinked
             && (driver_object != 0 || next_device != 0)) {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
-    row.staged_driver_object = Some(driver_object);
+    // The executive allocates the VPB while holding the authenticated provider pool lock.
+    // Provider-writable DEVICE_OBJECT.Vpb is a view, never free authority.
+    let owned_vpb = if nt_io_manager::device_type_needs_vpb(device_type) {
+        let vpb_address = hosted_instance_pool_alloc_unlocked(inst, nt_io_manager::WDM_X64_VPB_SIZE as u64)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        let vpb = match allocation(inst, vpb_address) {
+            Ok(vpb) => vpb,
+            Err(status) => {
+                assert!(hosted_instance_pool_free_unlocked(inst, vpb_address));
+                return Err(status);
+            }
+        };
+        if vpb.capacity < nt_io_manager::WDM_X64_VPB_SIZE as u64 {
+            assert!(hosted_instance_pool_free_unlocked(inst, vpb_address));
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        let vpb_exec = inst.exec_pool_va + (vpb_address - FSD_POOL_VADDR);
+        let bytes = core::slice::from_raw_parts_mut(vpb_exec as *mut u8, nt_io_manager::WDM_X64_VPB_SIZE);
+        if nt_io_manager::write_wdm_vpb(bytes, address).is_err() {
+            assert!(hosted_instance_pool_free_unlocked(inst, vpb_address));
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        Some(vpb)
+    } else { None };
+    rows()[row_index].staged_driver_object = Some(driver_object);
+    rows()[row_index].owned_vpb = owned_vpb;
+    if let Some(vpb) = owned_vpb {
+        write_unaligned((exec - 8 + 0x38) as *mut u64, vpb.component_address);
+    }
     Ok(())
 }
 
@@ -1259,11 +1295,21 @@ pub(super) struct LocalRetirement {
 pub(super) struct RetirementPreflight {
     domain: HostedDomainIdentity,
     accepted_driver_object: Option<u64>,
+    owned_vpb: Option<SourcePoolAllocationIdentity>,
 }
 
 impl RetirementPreflight {
     pub(super) fn accepted_driver_object(&self) -> Option<u64> {
         self.accepted_driver_object
+    }
+    pub(super) unsafe fn owned_vpb_for_retirement(
+        &self, inst: DriverInstance,
+    ) -> Result<Option<SourcePoolAllocationIdentity>, nt_status::NtStatus> {
+        let Some(vpb) = self.owned_vpb else { return Ok(None); };
+        if allocation(inst, vpb.component_address)? != vpb {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        Ok(Some(vpb))
     }
     pub(super) unsafe fn related_allocation_exec(
         &self,
@@ -1321,6 +1367,7 @@ pub(super) unsafe fn admit_retirement_checked<T>(
     let checked = check(&RetirementPreflight {
         domain,
         accepted_driver_object: rows()[index].accepted_driver_object,
+        owned_vpb: rows()[index].owned_vpb,
     })?;
     let row = &mut rows()[index];
     if row.registration.is_none() && registration.is_some() {

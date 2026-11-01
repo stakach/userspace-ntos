@@ -319,6 +319,7 @@ pub use volume_information::{
     SetVolumeInformationParameters, VolumeInformationContract,
 };
 pub use wdm_x64::{
+    device_type_needs_vpb, write_wdm_vpb, WDM_X64_IO_TYPE_VPB, WDM_X64_VPB_SIZE,
     decode_wdm_kernel_built_io_stack, decode_wdm_kernel_built_scsi_stack,
     initialize_wdm_irp_thread_list,
     initialize_wdm_irp_packet, reuse_wdm_irp_packet,

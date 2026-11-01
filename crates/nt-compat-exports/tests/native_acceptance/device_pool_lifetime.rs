@@ -87,10 +87,10 @@ fn ordinary_and_pdo_publication_capture_physical_owner_before_canonical_bind() {
     }
     let found = calls(function(&publication, "register_with_list_owner"));
     assert!(
-        position(&found, "protect_allocation") < position(&found, "stage_driver_object")
+        position(&found, "protect_allocation") < position(&found, "stage_device_projection")
     );
     assert!(
-        position(&found, "stage_driver_object") < position(&found, "bind_hosted_device_pointer")
+        position(&found, "stage_device_projection") < position(&found, "bind_hosted_device_pointer")
     );
     assert!(
         position(&found, "bind_hosted_device_pointer")

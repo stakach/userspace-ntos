@@ -45,7 +45,7 @@ pub(super) unsafe fn retire_hosted_device_projection(
     if physical_registration != registration {
         return Err(nt_status::NtStatus::INVALID_HANDLE);
     }
-    let (retirement, (device_exec, next_device, target_link, rollback_pdo_exec)) =
+    let (retirement, (device_exec, next_device, target_link, rollback_pdo_exec, owned_vpb)) =
         hosted_device_allocations::admit_retirement_checked(
             inst, device_object, physical_registration, |preflight| {
                 let (device_exec, capacity) =
@@ -67,6 +67,15 @@ pub(super) unsafe fn retire_hosted_device_projection(
                     Some(pdo) => Some(preflight.related_allocation_exec(pdo)?),
                     None => None,
                 };
+                let owned_vpb = preflight.owned_vpb_for_retirement(inst)?;
+                if let Some(vpb) = owned_vpb {
+                    if vpb.component_address == device_object
+                        || vpb.capacity < nt_io_manager::WDM_X64_VPB_SIZE as u64
+                        || hosted_instance_pool_allocation_is_free_unlocked(inst, vpb.component_address) != Some(false)
+                    {
+                        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+                    }
+                }
                 let driver_object = read_unaligned((device_exec + 0x08) as *const u64);
                 // The projected header is writable by the provider. It cannot erase or
                 // redirect the list owner captured when its canonical bind was accepted.
@@ -122,7 +131,7 @@ pub(super) unsafe fn retire_hosted_device_projection(
                         return Err(nt_status::NtStatus::INVALID_PARAMETER);
                     }
                 }
-                Ok((device_exec, next_device, target_link, rollback_pdo_exec))
+                Ok((device_exec, next_device, target_link, rollback_pdo_exec, owned_vpb))
             },
         )?;
     // The physical registration and pool retirement receipt remain held here. Clear only
@@ -157,6 +166,10 @@ pub(super) unsafe fn retire_hosted_device_projection(
             write_unaligned(target_link as *mut u64, device_object);
         }
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    if let Some(vpb) = owned_vpb {
+        assert!(hosted_instance_pool_free_unlocked(inst, vpb.component_address),
+            "preflighted exact VPB free failed after Device free");
     }
     hosted_device_allocations::finish_retirement(retirement)?;
     Ok(())

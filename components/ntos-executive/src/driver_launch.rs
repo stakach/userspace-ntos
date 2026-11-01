@@ -8227,7 +8227,7 @@ extern "win64" fn s_io_create_device(
         let dev = projection.device_object();
         let (status, canonical_device_id) = hosted_device_create(dev, drv, ext_size as u64);
         if status < 0 || canonical_device_id == 0 {
-            crate::hosted_driver_projection::delete_hosted_device_projection(dev, pool_free);
+            crate::hosted_driver_projection::delete_hosted_device_projection(projection, pool_free);
             clear_shared_path_len(SH_DEVICE_NAME_LEN);
             return if status < 0 {
                 status

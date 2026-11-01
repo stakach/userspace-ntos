@@ -112,7 +112,7 @@ impl Drop for ManagerScope {
 }
 
 mod hosted_device_allocations {
-    pub(super) use super::native::{protect_allocation, protects_allocation, stage_driver_object,
+    pub(super) use super::native::{protect_allocation, protects_allocation, stage_device_projection,
         DeviceListOwner,
         registration, accepted_registration, record_accepted_registration, admit_retirement,
         admit_retirement_checked, finish_retirement};
@@ -278,6 +278,7 @@ unsafe fn populate_device_driver_list(pool: &Pool) -> u64 {
     write_unaligned(device_exec as *mut i16, WDM_X64_IO_TYPE_DEVICE);
     write_unaligned((device_exec + 2) as *mut u16, WDM_X64_DEVICE_OBJECT_SIZE as u16);
     write_unaligned((device_exec + 8) as *mut u64, driver_address);
+    write_unaligned((device_exec + 0x48) as *mut u32, DeviceType::UNKNOWN.0);
     driver_address
 }
 
@@ -731,6 +732,119 @@ fn file_ack_tombstone_uses_durable_storage_before_reserve() {
 }
 
 #[test]
+fn disk_vpb_is_allocated_by_executive_and_retired_by_exact_owner() {
+    // Refused physical retirement intentionally retains a process-global catalog row. Run
+    // this scenario in its own test process so the retained row cannot affect other fixtures.
+    if std::env::var_os("NTOS_VPB_ISOLATED").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "disk_vpb_is_allocated_by_executive_and_retired_by_exact_owner"])
+            .env("NTOS_VPB_ISOLATED", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let _serial = TEST_LOCK.lock().unwrap();
+    let mut io = IoManager::new(MockObjectPort::new());
+    let driver = io.create_driver(
+        &NtPath::parse_str(r"\Driver\VpbOwner").unwrap(),
+        Box::new(MockDriverBackend::new()),
+    ).unwrap();
+    let device = io.create_device(driver, None, DeviceType::DISK,
+        DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
+    let domain = io.register_hosted_domain();
+    MANAGER.with(|manager| manager.set(&mut io));
+    let _manager_scope = ManagerScope;
+    let pool = Pool::new(domain, 97, 0xe000);
+    unsafe {
+        populate_device_driver_list(&pool);
+        let device_exec = pool.inst.exec_pool_va + PAYLOAD;
+        write_unaligned((device_exec + 0x48) as *mut u32, DeviceType::DISK.0);
+        native::protect_allocation(pool.inst, ADDRESS).unwrap();
+
+        // A provider-selected pool allocation with a plausible VPB header is not authority.
+        let forged = hosted_instance_pool_alloc_unlocked_for_test(pool.inst, 0x60);
+        let forged_identity = native::capture_allocation(pool.inst, forged).unwrap();
+        let forged_exec = pool.inst.exec_pool_va + (forged - FSD_POOL_VADDR);
+        nt_io_manager::write_wdm_vpb(
+            core::slice::from_raw_parts_mut(forged_exec as *mut u8, 0x60), ADDRESS,
+        ).unwrap();
+        write_unaligned((device_exec + 0x38) as *mut u64, forged);
+        assert_eq!(native::stage_device_projection(pool.inst, ADDRESS,
+            native::DeviceListOwner::Linked, DeviceType::DISK.0),
+            Err(nt_status::NtStatus::INVALID_PARAMETER));
+        write_unaligned((device_exec + 0x38) as *mut u64, 0);
+        assert!(hosted_instance_pool_free_for_test(pool.inst, forged));
+
+        native::stage_device_projection(pool.inst, ADDRESS,
+            native::DeviceListOwner::Linked, DeviceType::DISK.0).unwrap();
+        let vpb = read_unaligned((device_exec + 0x38) as *const u64);
+        assert_ne!(vpb, 0);
+        assert_ne!(native::capture_allocation(pool.inst, vpb).unwrap(), forged_identity,
+            "root may reuse the address but must capture its new generation");
+        let vpb_exec = pool.inst.exec_pool_va + (vpb - FSD_POOL_VADDR);
+        assert_eq!(read_unaligned(vpb_exec as *const i16), 10);
+        assert_eq!(read_unaligned((vpb_exec + 2) as *const u16), 0x60);
+        assert_eq!(read_unaligned((vpb_exec + 0x10) as *const u64), ADDRESS);
+        assert!(native::generic_free_admission(pool.inst, vpb).is_err());
+        let registration = io_manager_mut().bind_hosted_device_pointer(domain, ADDRESS, device).unwrap();
+        native::record_accepted_registration(pool.inst, registration).unwrap();
+        io_manager_mut().retire_hosted_device_pointer(registration).unwrap();
+        io_manager_mut().destroy_device(device).unwrap();
+
+        // Public WDM fields are writable; retirement follows the recorded allocation identity.
+        write_unaligned((device_exec + 0x38) as *mut u64, 0);
+        retirement::retire_hosted_device_projection(pool.inst, ADDRESS,
+            retirement::CanonicalRetirement::Retired { registration }, None).unwrap();
+        let _lock = hosted_instance_pool_lock(pool.inst.exec_pool_va).unwrap();
+        assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, vpb), Some(true));
+        assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, ADDRESS), Some(true));
+    }
+    assert!(native::instance_quiesced(pool.inst));
+
+    let refused_device = io_manager_mut().create_device(driver, None, DeviceType::DISK,
+        DeviceCharacteristics::empty(), DeviceFlags::empty(), 0).unwrap();
+    let refused_domain = io_manager_mut().register_hosted_domain();
+    let refused = Pool::new(refused_domain, 98, 0xe100);
+    unsafe {
+        populate_device_driver_list(&refused);
+        let device_exec = refused.inst.exec_pool_va + PAYLOAD;
+        write_unaligned((device_exec + 0x48) as *mut u32, DeviceType::DISK.0);
+        native::protect_allocation(refused.inst, ADDRESS).unwrap();
+        native::stage_device_projection(refused.inst, ADDRESS,
+            native::DeviceListOwner::Linked, DeviceType::DISK.0).unwrap();
+        let vpb = read_unaligned((device_exec + 0x38) as *const u64);
+        let registration = io_manager_mut().bind_hosted_device_pointer(refused_domain,
+            ADDRESS, refused_device).unwrap();
+        native::record_accepted_registration(refused.inst, registration).unwrap();
+        io_manager_mut().retire_hosted_device_pointer(registration).unwrap();
+        io_manager_mut().destroy_device(refused_device).unwrap();
+        REFUSE_DEVICE_FREE.with(|flag| flag.set(true));
+        let result = retirement::retire_hosted_device_projection(refused.inst, ADDRESS,
+            retirement::CanonicalRetirement::Retired { registration }, None);
+        REFUSE_DEVICE_FREE.with(|flag| flag.set(false));
+        assert_eq!(result, Err(nt_status::NtStatus::UNSUCCESSFUL));
+        let _lock = hosted_instance_pool_lock(refused.inst.exec_pool_va).unwrap();
+        assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(refused.inst, vpb), Some(false));
+        assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(refused.inst, ADDRESS), Some(false));
+        drop(_lock);
+        assert!(native::generic_free_admission(refused.inst, vpb).is_err());
+    }
+    // The refused effect retains exact pending ownership and therefore its backing pool.
+    std::mem::forget(refused);
+}
+
+unsafe fn hosted_instance_pool_alloc_unlocked_for_test(inst: DriverInstance, size: u64) -> u64 {
+    let _lock = hosted_instance_pool_lock(inst.exec_pool_va).unwrap();
+    hosted_instance_pool_alloc_unlocked(inst, size).unwrap()
+}
+
+unsafe fn hosted_instance_pool_free_for_test(inst: DriverInstance, address: u64) -> bool {
+    let _lock = hosted_instance_pool_lock(inst.exec_pool_va).unwrap();
+    hosted_instance_pool_free_unlocked(inst, address)
+}
+
+#[test]
 fn actual_adapter_protects_exact_allocations_and_retains_uncertain_retirement() {
     let _serial = TEST_LOCK.lock().unwrap();
     // One scenario owns the real adapter's process-global catalog and all backing pools.
@@ -765,7 +879,7 @@ fn actual_adapter_protects_exact_allocations_and_retains_uncertain_retirement() 
         assert!(native::generic_free_admission(pool.inst, ADDRESS).is_err());
         assert!(native::generic_free_admission(pool.inst, ADDRESS + CAPACITY - 1).is_err());
         populate_device_driver_list(&pool);
-        native::stage_driver_object(pool.inst, ADDRESS, native::DeviceListOwner::Linked).unwrap();
+        native::stage_device_projection(pool.inst, ADDRESS, native::DeviceListOwner::Linked, DeviceType::UNKNOWN.0).unwrap();
         native::record_accepted_registration(pool.inst, registration).unwrap();
         native::publish_registration(pool.inst, registration).unwrap();
         assert!(native::generic_free_admission(pool.inst, ADDRESS).is_err());
@@ -866,7 +980,7 @@ unsafe fn refused_free_keeps_device_list_and_pdo_attachment(driver: nt_io_manage
     write_unaligned((pdo_exec + 0x18) as *mut u64, ADDRESS);
     native::protect_allocation(pool.inst, ADDRESS).unwrap();
     native::protect_allocation(pool.inst, pdo_address).unwrap();
-    native::stage_driver_object(pool.inst, ADDRESS, native::DeviceListOwner::Linked).unwrap();
+    native::stage_device_projection(pool.inst, ADDRESS, native::DeviceListOwner::Linked, DeviceType::UNKNOWN.0).unwrap();
     let registration = io_manager_mut().bind_hosted_device_pointer(logical, ADDRESS, device).unwrap();
     native::record_accepted_registration(pool.inst, registration).unwrap();
     io_manager_mut().retire_hosted_device_pointer(registration).unwrap();
@@ -915,9 +1029,10 @@ unsafe fn unlinked_pdo_with_no_driver_list_can_retire(driver: nt_io_manager::Dri
     let device_exec = pool.inst.exec_pool_va + PAYLOAD;
     write_unaligned(device_exec as *mut i16, WDM_X64_IO_TYPE_DEVICE);
     write_unaligned((device_exec + 2) as *mut u16, WDM_X64_DEVICE_OBJECT_SIZE as u16);
+    write_unaligned((device_exec + 0x48) as *mut u32, DeviceType::UNKNOWN.0);
     native::protect_allocation(pool.inst, ADDRESS).unwrap();
-    native::stage_driver_object(pool.inst, ADDRESS,
-        native::DeviceListOwner::Unlinked).unwrap();
+    native::stage_device_projection(pool.inst, ADDRESS,
+        native::DeviceListOwner::Unlinked, DeviceType::UNKNOWN.0).unwrap();
     let registration = io_manager_mut().bind_hosted_device_pointer(domain, ADDRESS, device).unwrap();
     native::record_accepted_registration(pool.inst, registration).unwrap();
     io_manager_mut().retire_hosted_device_pointer(registration).unwrap();
@@ -959,10 +1074,10 @@ unsafe fn cleared_driver_pointer_cannot_leave_a_freed_device_in_the_driver_list(
     write_unaligned((device_exec + 8) as *mut u64, driver_address);
     native::protect_allocation(pool.inst, ADDRESS).unwrap();
     write_unaligned((device_exec + 8) as *mut u64, 0);
-    assert_eq!(native::stage_driver_object(pool.inst, ADDRESS, native::DeviceListOwner::Linked),
+    assert_eq!(native::stage_device_projection(pool.inst, ADDRESS, native::DeviceListOwner::Linked, 0),
         Err(nt_status::NtStatus::INVALID_PARAMETER));
     write_unaligned((device_exec + 8) as *mut u64, driver_address);
-    native::stage_driver_object(pool.inst, ADDRESS, native::DeviceListOwner::Linked).unwrap();
+    native::stage_device_projection(pool.inst, ADDRESS, native::DeviceListOwner::Linked, 0).unwrap();
     let registration = io_manager_mut().bind_hosted_device_pointer(domain, ADDRESS, device).unwrap();
     native::record_accepted_registration(pool.inst, registration).unwrap();
     io_manager_mut().retire_hosted_device_pointer(registration).unwrap();
@@ -1044,7 +1159,7 @@ unsafe fn late_rebind_refuses_actual_physical_retirement(driver: nt_io_manager::
     let original = io_manager_mut().bind_hosted_device_pointer(domain, ADDRESS, device).unwrap();
     // Model accepted bind followed by refused catalog publication: the physical owner still
     // records the exact accepted token before the later attach can fail.
-    native::stage_driver_object(pool.inst, ADDRESS, native::DeviceListOwner::Linked).unwrap();
+    native::stage_device_projection(pool.inst, ADDRESS, native::DeviceListOwner::Linked, DeviceType::UNKNOWN.0).unwrap();
     native::record_accepted_registration(pool.inst, original).unwrap();
     assert_eq!(native::registration(pool.inst, ADDRESS).unwrap(), None);
     assert_eq!(native::accepted_registration(pool.inst, ADDRESS).unwrap(), Some(original));
