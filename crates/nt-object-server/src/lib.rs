@@ -68,6 +68,11 @@ impl Server {
         self.om.register_client(kind, mode)
     }
 
+    /// The one root-owned SURT endpoint used by the executive to publish its admitted objects.
+    pub fn connect_executive(&mut self) -> ClientId {
+        self.connect(ClientKind::ExecutiveService, AccessMode::KernelMode)
+    }
+
     /// A client disconnected or faulted: close all its handles and retire its id.
     pub fn disconnect(&mut self, client: ClientId) -> Result<(), NtStatus> {
         self.references

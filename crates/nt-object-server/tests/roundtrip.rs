@@ -32,6 +32,31 @@ fn client(server: &mut Server, cid: ClientId) -> ObjectClient<Direct<'_>> {
 }
 
 #[test]
+fn executive_endpoint_publishes_smss_permanent_directory_and_opens_global_dos_directory() {
+    use nt_types::{ObjAttrFlags, UnicodeString};
+
+    let mut server = Server::new().unwrap();
+    let executive = server.connect_executive();
+    let mut c = client(&mut server, executive);
+    let attributes = ObjAttrFlags::CASE_INSENSITIVE | ObjAttrFlags::OPEN_IF | ObjAttrFlags::PERMANENT;
+    let rpc = c.create_directory_handle(None, &UnicodeString::from_str("\\RPC Control"),
+        AccessMask::from_bits_retain(0x000f_000f), attributes)
+        .expect("executive admitted SMSS permanent directory create");
+    assert!(rpc.created);
+    let dos = c.open_directory_handle(None, &UnicodeString::from_str("\\??"),
+        AccessMask::from_bits_retain(0x000f_000f), attributes)
+        .expect("executive admitted SMSS global DOS directory open");
+    c.close_handle(dos).unwrap();
+    c.close_handle(rpc.handle).unwrap();
+
+    let user = server.connect(ClientKind::NativeUser, AccessMode::UserMode);
+    let mut c = client(&mut server, user);
+    assert_eq!(c.create_directory_handle(None, &UnicodeString::from_str("\\UserPermanent"),
+        AccessMask::from_bits_retain(0x000f_000f), attributes).unwrap_err(),
+        NtStatus::ACCESS_DENIED);
+}
+
+#[test]
 fn native_directory_handle_publishes_device_parent_and_temporary_close_reaps_name() {
     use nt_types::{ObjAttrFlags, UnicodeString};
 
