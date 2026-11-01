@@ -900,31 +900,38 @@ pub(crate) unsafe fn redrive_nested_ready(handler: *mut ExecNtHandler) -> bool {
     if handler.is_null() || REDRIVE_ACTIVE.swap(true, Ordering::AcqRel) { return false; }
     trace_redrive_entry(b"nested");
     let progressed = redrive_one(&mut *handler) | redrive_effect_one(&mut *handler);
+    trace_redrive_entry(b"nested-return");
     NEXT_RETRY.store(crate::monotonic_time_100ns().saturating_add(RETRY_DELAY_100NS), Ordering::Release);
     REDRIVE_ACTIVE.store(false, Ordering::Release);
     progressed
 }
 
 fn trace_redrive_entry(source: &[u8]) {
+    static LAST_TOKEN: AtomicU64 = AtomicU64::new(0);
     static ENTRIES: AtomicU64 = AtomicU64::new(0);
-    let sequence = ENTRIES.fetch_add(1, Ordering::Relaxed) + 1;
-    if sequence > 32 && !sequence.is_power_of_two() { return; }
     let broker = unsafe { &*core::ptr::addr_of!(BROKER) };
-    let phase = broker.pending.iter().find_map(|entry| entry.publish.as_ref().map(|work| work.phase));
+    let Some((token, phase)) = broker.pending.iter().find_map(|entry|
+        entry.publish.as_ref().map(|work| (entry.owner.dispatch.1, work.phase))) else { return; };
+    if LAST_TOKEN.swap(token, Ordering::Relaxed) != token {
+        ENTRIES.store(0, Ordering::Relaxed);
+    }
+    let sequence = ENTRIES.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence > 16 && !sequence.is_power_of_two() { return; }
     crate::print_str(b"[directory-redrive] #");
     crate::print_u64(sequence);
+    crate::print_str(b" token=");
+    crate::print_u64(token);
     crate::print_str(b" source=");
     crate::print_str(source);
     crate::print_str(b" pending=");
     crate::print_u64(broker.pending.len() as u64);
     crate::print_str(b" phase=");
     crate::print_str(match phase {
-        Some(PublishPhase::Start) => b"start",
-        Some(PublishPhase::CanonicalPending) => b"canonical-pending",
-        Some(PublishPhase::CanonicalRollback) => b"canonical-rollback",
-        Some(PublishPhase::ReadyReply) => b"ready-reply",
-        Some(PublishPhase::ReplyEntered) => b"reply-entered",
-        None => b"none",
+        PublishPhase::Start => b"start",
+        PublishPhase::CanonicalPending => b"canonical-pending",
+        PublishPhase::CanonicalRollback => b"canonical-rollback",
+        PublishPhase::ReadyReply => b"ready-reply",
+        PublishPhase::ReplyEntered => b"reply-entered",
     });
     crate::print_str(b"\n");
 }

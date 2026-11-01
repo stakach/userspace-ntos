@@ -15270,6 +15270,9 @@ impl nt_object_client::OwnedBackend for ObChan<'_> {
     fn call_owned(&mut self, opcode: u16, in_buf: &[u8], _out_buf: &mut [u8])
         -> nt_object_client::OwnedCall
     {
+        print_str(b"[ob-owned-submit] opcode=");
+        print_u64(opcode as u64);
+        print_str(b"\n");
         match self.0.submit_owned(opcode, in_buf) {
             RingCallOutcome::NoEffect(status) =>
                 nt_object_client::OwnedCall::NoEffect(nt_status::NtStatus(status)),
@@ -15280,20 +15283,40 @@ impl nt_object_client::OwnedBackend for ObChan<'_> {
                     detail0,
                     detail1,
                 }),
-            RingCallOutcome::Indeterminate { request_id } =>
-                nt_object_client::OwnedCall::Indeterminate(request_id),
+            RingCallOutcome::Indeterminate { request_id } => {
+                print_str(b"[ob-owned-submit] pending id=");
+                print_u64(request_id);
+                print_str(b"\n");
+                nt_object_client::OwnedCall::Indeterminate(request_id)
+            }
         }
     }
 
     fn poll_owned(&mut self, request_id: u64, out_buf: &mut [u8]) -> Option<ObReply> {
-        self.0.poll_owned(request_id, out_buf).map(
+        static LAST_REQUEST: AtomicU64 = AtomicU64::new(0);
+        static POLLS: AtomicU64 = AtomicU64::new(0);
+        if LAST_REQUEST.swap(request_id, Ordering::Relaxed) != request_id {
+            POLLS.store(0, Ordering::Relaxed);
+        }
+        let sequence = POLLS.fetch_add(1, Ordering::Relaxed) + 1;
+        let result = self.0.poll_owned(request_id, out_buf).map(
             |(status, _, information, detail0, detail1)| ObReply {
                 status,
                 information: information as u32,
                 detail0,
                 detail1,
             },
-        )
+        );
+        if sequence <= 8 || sequence.is_power_of_two() || result.is_some() {
+            print_str(b"[ob-owned-poll] id=");
+            print_u64(request_id);
+            print_str(b" count=");
+            print_u64(sequence);
+            print_str(b" terminal=");
+            print_u64(u64::from(result.is_some()));
+            print_str(b"\n");
+        }
+        result
     }
 }
 
