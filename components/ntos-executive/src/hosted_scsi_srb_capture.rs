@@ -71,6 +71,7 @@ impl CapturedSourceScsi {
     pub(super) fn children(&self) -> ScsiSourceChildren {
         self.children
     }
+    pub(super) fn srb_function(&self) -> Option<u8> { self.srb.get(2).copied() }
     pub(super) fn wire_srb(&self) -> Result<[u8; WDM_X64_LEGACY_SRB_SIZE], CaptureError> {
         sanitized_legacy_srb(
             &self.srb,

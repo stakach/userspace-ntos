@@ -10,6 +10,19 @@ use nt_io_manager::scsi_srb_wire::{
     capture_scsi_completion_in_place, decode_scsi_request,
 };
 
+static CLAIM_COMPLETION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn trace_claim_completion(stage: u64, srb_status: u8, data_pointer: u64) {
+    if CLAIM_COMPLETION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 8 { return; }
+    print_str(b"[provider-scsi-claim] stage/srb-status/data-pointer=");
+    print_u64(stage);
+    print_str(b"/");
+    print_u64(srb_status as u64);
+    print_str(b"/");
+    print_u64(data_pointer);
+    print_str(b"\n");
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct ProviderScsiProjection {
     pub srb: u64,
@@ -96,6 +109,12 @@ pub(super) unsafe fn capture_completion(
     { return false; }
     let packet_slice = core::slice::from_raw_parts_mut(packet as *mut u8, packet_len as usize);
     let srb_slice = core::slice::from_raw_parts(srb as *const u8, WDM_X64_LEGACY_SRB_SIZE);
+    let claim = srb_slice[2] == 1;
+    if claim {
+        trace_claim_completion(
+            1, srb_slice[3], read_unaligned((srb + 0x18) as *const u64),
+        );
+    }
     let (data_pointer, data_capacity) = match decode_scsi_request(packet_slice, route, irp_id) {
         Ok(decoded) => (decoded.data.as_ptr() as u64, decoded.data.len() as u64),
         Err(_) => return false,
@@ -111,9 +130,20 @@ pub(super) unsafe fn capture_completion(
     } else if dma_receipt.is_some()
         || read_unaligned((srb + 0x18) as *const u64) != 0
     {
+        if claim {
+            trace_claim_completion(
+                2, srb_slice[3], read_unaligned((srb + 0x18) as *const u64),
+            );
+        }
         return false;
     }
     let captured = capture_scsi_completion_in_place(packet_slice, route, irp_id, srb_slice).is_ok();
+    if claim {
+        trace_claim_completion(
+            if captured { 3 } else { 4 }, srb_slice[3],
+            read_unaligned((srb + 0x18) as *const u64),
+        );
+    }
     static CAPACITY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
     if captured && packet_slice.len() >= 64 + WDM_X64_LEGACY_SRB_SIZE + 12
         && srb_slice[0x48] == 0x9e && srb_slice[0x49] == 0x10

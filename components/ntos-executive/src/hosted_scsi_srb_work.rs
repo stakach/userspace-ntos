@@ -58,6 +58,19 @@ struct RetainedAck {
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static mut EXECUTING: Vec<(usize, DriverInstance, SourceIrpForwardIdentity)> = Vec::new();
 static CURSOR: AtomicU64 = AtomicU64::new(0);
+static CLAIM_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static SCSI_CAPTURE_REFUSAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn trace_claim(stage: u64, status: i32, detail: u64) {
+    if CLAIM_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 16 { return; }
+    print_str(b"[scsi-claim] stage/status/detail=");
+    print_u64(stage);
+    print_str(b"/");
+    print_hex(status as u32);
+    print_str(b"/");
+    print_u64(detail);
+    print_str(b"\n");
+}
 
 fn capture_status(error: hosted_scsi_srb_capture::CaptureError) -> i32 {
     use hosted_scsi_srb_capture::CaptureError;
@@ -119,8 +132,23 @@ pub(super) unsafe fn submit(
     let Some(route) = runtime::channel_route(ch).ok().flatten() else {
         return Some(INVALID_HANDLE);
     };
+    let captured = hosted_scsi_srb_capture::capture(
+        ch, reply_cap, badge, source_irp, target_device,
+    );
+    if let Ok(source) = &captured {
+        if source.srb_function() == Some(1) { trace_claim(1, STATUS_SUCCESS, source_irp); }
+    } else if let Err(error) = &captured {
+        // Capture has not admitted an SRB yet, so the function byte is unavailable.
+        if SCSI_CAPTURE_REFUSAL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 4 {
+            print_str(b"[scsi-capture-refusal] status/irp=");
+            print_hex(capture_status(*error) as u32);
+            print_str(b"/");
+            print_u64(source_irp);
+            print_str(b"\n");
+        }
+    }
     let mut source =
-        match hosted_scsi_srb_capture::capture(ch, reply_cap, badge, source_irp, target_device) {
+        match captured {
             Ok(source) => source,
             Err(error) => return Some(capture_status(error)),
         };
@@ -333,6 +361,9 @@ impl Work {
                 buffers,
                 ..
             }) => {
+                if self.source.srb_function() == Some(1) {
+                    trace_claim(2, status.raw(), irp_id.raw());
+                }
                 self.source
                     .entered(irp_id)
                     .expect("SCSI returned exact entry");
@@ -348,6 +379,9 @@ impl Work {
                 self.canonical_irp = None;
             }
             Ok(hosted_file_owners::DispatchResult::Outstanding { irp_id }) => {
+                if self.source.srb_function() == Some(1) {
+                    trace_claim(3, STATUS_PENDING as i32, irp_id.raw());
+                }
                 self.source
                     .entered(irp_id)
                     .expect("SCSI pending exact entry");
@@ -360,12 +394,18 @@ impl Work {
             }
             Err(status) if status == nt_status::NtStatus::DEVICE_BUSY => {}
             Err(status) => {
+                if self.source.srb_function() == Some(1) {
+                    trace_claim(4, status.raw(), 0);
+                }
                 self.terminal_status = Some(status.raw());
             }
         }
     }
 
     unsafe fn observe_terminal(&mut self, status: i32, information: u64, output: &[u8]) {
+        if self.source.srb_function() == Some(1) {
+            trace_claim(5, status, output.len() as u64);
+        }
         let Some(irp) = self.canonical_irp else {
             return;
         };

@@ -68221,6 +68221,24 @@ struct AddDeviceDispatchResult {
     previous_device_head: u64,
 }
 
+fn trace_add_device_access_violation(pr: &crate::spawn_hosts::PumpResult) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if pr.status != STATUS_ACCESS_VIOLATION
+        || COUNT.fetch_add(1, Ordering::Relaxed) >= 4
+    { return; }
+    print_str(b"[add-device-av] rip/addr/exception/code/faults=");
+    print_hex_u64(pr.wall_ip);
+    print_str(b"/");
+    print_hex_u64(pr.wall_addr);
+    print_str(b"/");
+    print_hex_u64(pr.wall_exception);
+    print_str(b"/");
+    print_hex_u64(pr.wall_code);
+    print_str(b"/");
+    print_u64(pr.faults);
+    print_str(b"\n");
+}
+
 fn hosted_video_device_path(number: u32) -> Option<HostedAscii<HOSTED_EXPORT_NAME_MAX>> {
     let mut path = HostedAscii::<HOSTED_EXPORT_NAME_MAX>::empty();
     if path.push_str(r"\Device\Video") && hosted_ascii_push_decimal_u32(&mut path, number) {
@@ -68305,6 +68323,7 @@ unsafe fn dispatch_video_add_device_for_instance(
         },
     };
     let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
+    trace_add_device_access_violation(&pr);
     if !pr.completed {
         register_instance_ready(index, false);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
@@ -68382,6 +68401,7 @@ unsafe fn dispatch_provider_add_device_for_instance(
         },
     };
     let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
+    trace_add_device_access_violation(&pr);
     if !pr.completed {
         register_instance_ready(route.provider_instance, false);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
@@ -68466,6 +68486,7 @@ unsafe fn dispatch_add_device_for_instance(
         },
     };
     let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
+    trace_add_device_access_violation(&pr);
     if !pr.completed {
         register_instance_ready(index, false);
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
