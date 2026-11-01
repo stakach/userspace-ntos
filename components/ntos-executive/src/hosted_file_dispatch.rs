@@ -441,7 +441,8 @@ pub(super) fn execute(
             Err(status) => return HostedIrpTransportResult::NotDispatched { status },
         };
     let Some((route_instance, route_inst, device_object)) =
-        hosted_driver_device_route_by_device_id(projection.device_id.raw())
+        hosted_driver_device_route_by_device_id_for_irp(
+            projection.device_id.raw(), Some(projection.irp_id))
             .filter(|(index, _, _)| *index == instance_index)
     else {
         return HostedIrpTransportResult::NotDispatched {

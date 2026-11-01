@@ -203,6 +203,9 @@ fn temporary_precommit_child_route_requires_the_bound_proof_irp() {
         "generic device routing must never inherit the temporary proof authority");
     assert!(launch.contains("request.device_id, Some(IrpId(request.irp_id))"),
         "the canonical dispatched request must carry its own IRP identity");
+    let file_dispatch = include_str!("../../../components/ntos-executive/src/hosted_file_dispatch.rs");
+    assert!(file_dispatch.contains("projection.device_id.raw(), Some(projection.irp_id)"),
+        "native File dispatch must carry its prepared IRP identity into child route lookup");
     let owners = include_str!("../../../components/ntos-executive/src/hosted_file_owners.rs");
     assert!(owners.contains("hosted_provider_child_registration(device, physical.domain,"),
         "the retained File owner must use the scoped child resolver");
