@@ -267,3 +267,115 @@ fn malformed_late_open_success_is_quarantined() {
     ));
     assert_eq!(client.backend_mut().sent, 1);
 }
+
+struct LegacyMutationUncertain<'a> {
+    submitted: &'a Cell<bool>,
+    op: u16,
+}
+
+impl Backend for LegacyMutationUncertain<'_> {
+    fn call(&mut self, op: u16, _: &[u8], _: &mut [u8]) -> ObReply {
+        assert_eq!(op, self.op);
+        self.submitted.set(true);
+        ObReply { status: NtStatus::UNSUCCESSFUL.raw(), information: 0,
+            detail0: 0, detail1: 0 }
+    }
+}
+
+#[test]
+fn synchronous_cleanup_collapses_submitted_uncertainty_to_status() {
+    for op in [opcode::OB_OP_CLOSE_HANDLE, opcode::OB_OP_MAKE_TEMPORARY] {
+        let submitted = Cell::new(false);
+        let mut client = ObjectClient::new(LegacyMutationUncertain {
+            submitted: &submitted, op,
+        });
+        let result = if op == opcode::OB_OP_CLOSE_HANDLE {
+            client.close_handle(HandleValue(91))
+        } else {
+            client.make_temporary(HandleValue(91))
+        };
+        assert_eq!(result, Err(NtStatus::UNSUCCESSFUL));
+        assert!(submitted.get());
+        // Neither old result carries the request ID needed to settle its remote effect.
+    }
+}
+
+struct UncertainMutation {
+    expected_op: u16,
+    sent: usize,
+    pending: bool,
+    malformed: bool,
+}
+
+impl Backend for UncertainMutation {
+    fn call(&mut self, _: u16, _: &[u8], _: &mut [u8]) -> ObReply {
+        panic!("cleanup must use owned transport")
+    }
+}
+
+impl OwnedBackend for UncertainMutation {
+    fn call_owned(&mut self, op: u16, request: &[u8], _: &mut [u8]) -> OwnedCall {
+        assert_eq!(op, self.expected_op);
+        assert_eq!(request.len(), size_of::<ObCloseHandleRequest>());
+        self.sent += 1;
+        self.pending = true;
+        OwnedCall::Indeterminate(43)
+    }
+
+    fn poll_owned(&mut self, id: u64, _: &mut [u8]) -> Option<ObReply> {
+        assert_eq!(id, 43);
+        if self.pending {
+            self.pending = false;
+            None
+        } else {
+            Some(ObReply { status: NtStatus::SUCCESS.raw(), information: 0,
+                detail0: u64::from(self.malformed), detail1: 0 })
+        }
+    }
+}
+
+#[test]
+fn uncertain_cleanup_retains_exact_request_and_blocks_directory_publication() {
+    for op in [opcode::OB_OP_CLOSE_HANDLE, opcode::OB_OP_MAKE_TEMPORARY] {
+        let mut client = ObjectClient::new(UncertainMutation {
+            expected_op: op, sent: 0, pending: false, malformed: false,
+        });
+        let pending = match if op == opcode::OB_OP_CLOSE_HANDLE {
+            client.close_handle_owned(HandleValue(91))
+        } else {
+            client.make_temporary_owned(HandleValue(91))
+        } {
+            HandleMutationOutcome::Indeterminate(pending) => pending,
+            _ => panic!("cleanup request must retain ownership"),
+        };
+        let name = UnicodeString::from_str("\\Device\\OwnedCleanupPending");
+        assert!(matches!(client.create_directory_handle_owned(None, &name,
+            AccessMask::GENERIC_ALL, ObjAttrFlags::CASE_INSENSITIVE),
+            DirectoryOwnedOutcome::NoEffect(NtStatus::DEVICE_BUSY)));
+        assert!(matches!(client.close_handle_owned(HandleValue(91)),
+            HandleMutationOutcome::NoEffect(NtStatus::DEVICE_BUSY)));
+        assert!(client.poll_handle_mutation_owned(&pending).is_none());
+        assert!(matches!(client.poll_handle_mutation_owned(&pending),
+            Some(HandleMutationTerminal::Success)));
+        assert_eq!(client.backend_mut().sent, 1);
+        assert!(client.poll_handle_mutation_owned(&pending).is_none());
+    }
+}
+
+#[test]
+fn malformed_late_cleanup_success_quarantines_shared_gate() {
+    let mut client = ObjectClient::new(UncertainMutation {
+        expected_op: opcode::OB_OP_MAKE_TEMPORARY,
+        sent: 0, pending: false, malformed: true,
+    });
+    let pending = match client.make_temporary_owned(HandleValue(91)) {
+        HandleMutationOutcome::Indeterminate(pending) => pending,
+        _ => panic!("cleanup request must retain ownership"),
+    };
+    assert!(client.poll_handle_mutation_owned(&pending).is_none());
+    assert!(matches!(client.poll_handle_mutation_owned(&pending),
+        Some(HandleMutationTerminal::Incoherent(_))));
+    assert!(matches!(client.close_handle_owned(HandleValue(91)),
+        HandleMutationOutcome::NoEffect(NtStatus::DEVICE_BUSY)));
+    assert_eq!(client.backend_mut().sent, 1);
+}

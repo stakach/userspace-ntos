@@ -55,7 +55,7 @@ pub enum OwnedCall {
     Indeterminate(u64),
 }
 
-/// Owns the encoded request while a submitted directory create awaits its
+/// Owns the encoded request while a submitted directory create or open awaits its
 /// exact terminal response. Dropping it does not authorize replay.
 pub struct PendingDirectoryCall {
     client_id: u64,
@@ -78,14 +78,36 @@ pub enum DirectoryOwnedTerminal {
     Incoherent(ObReply),
 }
 
+/// Owns the exact cleanup request until the Object Manager replies. Dropping it
+/// does not make an uncertain close or permanence change safe to repeat.
+pub struct PendingHandleMutation {
+    client_id: u64,
+    request_id: u64,
+    _request: Vec<u8>,
+}
+
+pub enum HandleMutationOutcome {
+    NoEffect(NtStatus),
+    Completed(HandleMutationTerminal),
+    Indeterminate(PendingHandleMutation),
+}
+
+pub enum HandleMutationTerminal {
+    Success,
+    Failure(NtStatus),
+    /// The reply claims success but lacks the server's exact empty success shape.
+    /// Retain the owner's local resource and quarantine further publication.
+    Incoherent(ObReply),
+}
+
 /// The Object Manager client.
 pub struct ObjectClient<B> {
     backend: B,
     owned_client_id: u64,
-    owned_directory_state: DirectoryOwnedState,
+    owned_request_state: OwnedRequestState,
 }
 
-enum DirectoryOwnedState { Idle, Pending(u64), Quarantined }
+enum OwnedRequestState { Idle, Pending(u64), Quarantined }
 
 static NEXT_OWNED_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -151,6 +173,19 @@ fn decode_owned_directory_terminal(reply: ObReply, create: bool) -> DirectoryOwn
     match decode_directory_handle(reply, create) {
         Ok(result) => DirectoryOwnedTerminal::Success(result),
         Err(_) => DirectoryOwnedTerminal::Incoherent(reply),
+    }
+}
+
+fn decode_handle_mutation_terminal(reply: ObReply) -> HandleMutationTerminal {
+    let status = NtStatus(reply.status);
+    if !status.is_success() {
+        return HandleMutationTerminal::Failure(status);
+    }
+    if status == NtStatus::SUCCESS && reply.information == 0
+        && reply.detail0 == 0 && reply.detail1 == 0 {
+        HandleMutationTerminal::Success
+    } else {
+        HandleMutationTerminal::Incoherent(reply)
     }
 }
 
@@ -283,7 +318,7 @@ impl<B: Backend> ObjectClient<B> {
         let owned_client_id = NEXT_OWNED_CLIENT_ID.fetch_update(
             Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1),
         ).expect("object client identity exhausted");
-        Self { backend, owned_client_id, owned_directory_state: DirectoryOwnedState::Idle }
+        Self { backend, owned_client_id, owned_request_state: OwnedRequestState::Idle }
     }
 
     /// Access the backend (e.g. to reach the server in `DirectBackend`).
@@ -760,7 +795,7 @@ impl<B: OwnedBackend> ObjectClient<B> {
         name: &UnicodeString, access: AccessMask, attributes: ObjAttrFlags, create: bool)
         -> DirectoryOwnedOutcome
     {
-        if !matches!(self.owned_directory_state, DirectoryOwnedState::Idle) {
+        if !matches!(self.owned_request_state, OwnedRequestState::Idle) {
             return DirectoryOwnedOutcome::NoEffect(NtStatus::DEVICE_BUSY);
         }
         let request = match encode_directory_handle(root, name, access, attributes) {
@@ -774,12 +809,12 @@ impl<B: OwnedBackend> ObjectClient<B> {
             OwnedCall::Completed(reply) => {
                 let terminal = decode_owned_directory_terminal(reply, create);
                 if matches!(terminal, DirectoryOwnedTerminal::Incoherent(_)) {
-                    self.owned_directory_state = DirectoryOwnedState::Quarantined;
+                    self.owned_request_state = OwnedRequestState::Quarantined;
                 }
                 DirectoryOwnedOutcome::Completed(terminal)
             }
             OwnedCall::Indeterminate(request_id) => {
-                self.owned_directory_state = DirectoryOwnedState::Pending(request_id);
+                self.owned_request_state = OwnedRequestState::Pending(request_id);
                 DirectoryOwnedOutcome::Indeterminate(PendingDirectoryCall {
                     client_id: self.owned_client_id,
                     request_id, create, _request: request,
@@ -792,14 +827,75 @@ impl<B: OwnedBackend> ObjectClient<B> {
         -> Option<DirectoryOwnedTerminal>
     {
         if pending.client_id != self.owned_client_id
-            || !matches!(self.owned_directory_state,
-                DirectoryOwnedState::Pending(id) if id == pending.request_id) { return None; }
+            || !matches!(self.owned_request_state,
+                OwnedRequestState::Pending(id) if id == pending.request_id) { return None; }
         let reply = self.backend.poll_owned(pending.request_id, &mut [])?;
         let terminal = decode_owned_directory_terminal(reply, pending.create);
-        self.owned_directory_state = if matches!(terminal, DirectoryOwnedTerminal::Incoherent(_)) {
-            DirectoryOwnedState::Quarantined
+        self.owned_request_state = if matches!(terminal, DirectoryOwnedTerminal::Incoherent(_)) {
+            OwnedRequestState::Quarantined
         } else {
-            DirectoryOwnedState::Idle
+            OwnedRequestState::Idle
+        };
+        Some(terminal)
+    }
+
+    pub fn close_handle_owned(&mut self, handle: HandleValue) -> HandleMutationOutcome {
+        self.handle_mutation_owned(handle, opcode::OB_OP_CLOSE_HANDLE)
+    }
+
+    pub fn make_temporary_owned(&mut self, handle: HandleValue) -> HandleMutationOutcome {
+        self.handle_mutation_owned(handle, opcode::OB_OP_MAKE_TEMPORARY)
+    }
+
+    fn handle_mutation_owned(&mut self, handle: HandleValue, op: u16)
+        -> HandleMutationOutcome
+    {
+        if !matches!(self.owned_request_state, OwnedRequestState::Idle) {
+            return HandleMutationOutcome::NoEffect(NtStatus::DEVICE_BUSY);
+        }
+        let request = ObCloseHandleRequest {
+            abi_size: size_of::<ObCloseHandleRequest>() as u16,
+            _reserved: 0,
+            _reserved2: 0,
+            handle: handle.0,
+        };
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(size_of::<ObCloseHandleRequest>()).is_err() {
+            return HandleMutationOutcome::NoEffect(NtStatus::INSUFFICIENT_RESOURCES);
+        }
+        bytes.extend_from_slice(bytemuck::bytes_of(&request));
+        match self.backend.call_owned(op, &bytes, &mut []) {
+            OwnedCall::NoEffect(status) => HandleMutationOutcome::NoEffect(status),
+            OwnedCall::Completed(reply) => {
+                let terminal = decode_handle_mutation_terminal(reply);
+                if matches!(terminal, HandleMutationTerminal::Incoherent(_)) {
+                    self.owned_request_state = OwnedRequestState::Quarantined;
+                }
+                HandleMutationOutcome::Completed(terminal)
+            }
+            OwnedCall::Indeterminate(request_id) => {
+                self.owned_request_state = OwnedRequestState::Pending(request_id);
+                HandleMutationOutcome::Indeterminate(PendingHandleMutation {
+                    client_id: self.owned_client_id,
+                    request_id,
+                    _request: bytes,
+                })
+            }
+        }
+    }
+
+    pub fn poll_handle_mutation_owned(&mut self, pending: &PendingHandleMutation)
+        -> Option<HandleMutationTerminal>
+    {
+        if pending.client_id != self.owned_client_id
+            || !matches!(self.owned_request_state,
+                OwnedRequestState::Pending(id) if id == pending.request_id) { return None; }
+        let reply = self.backend.poll_owned(pending.request_id, &mut [])?;
+        let terminal = decode_handle_mutation_terminal(reply);
+        self.owned_request_state = if matches!(terminal, HandleMutationTerminal::Incoherent(_)) {
+            OwnedRequestState::Quarantined
+        } else {
+            OwnedRequestState::Idle
         };
         Some(terminal)
     }
