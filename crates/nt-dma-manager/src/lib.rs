@@ -1269,13 +1269,9 @@ impl DmaManager {
         for reservation in self.coherent_reservations.iter_mut().filter(|reservation| {
             reservation.owner == owner && reservation.state == CoherentReservationState::Active
         }) {
-            reservation.state = if self.coherent_aliases.iter().any(|alias| {
-                alias.active && alias.alias.reservation_id == reservation.id
-            }) {
-                CoherentReservationState::Quarantined
-            } else {
-                CoherentReservationState::Released
-            };
+            // The SG alias may have ended before the consumer's terminal acknowledgement.
+            // Revocation cannot infer that the retained data owner released this slice.
+            reservation.state = CoherentReservationState::Quarantined;
         }
         for window in self.coherent_windows.iter_mut().filter(|window| {
             window.owner == owner && window.state == CoherentReservationState::Active

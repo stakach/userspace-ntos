@@ -704,6 +704,43 @@ mod tests {
     }
 
     #[test]
+    fn owner_revocation_retains_completed_sg_reservation_until_consumer_ack() {
+        let mut dma = DmaManager::new();
+        let adapter = dma.register_adapter(owner(), true, 4096, true);
+        let window = CoherentWindowIdentity::new(21, 6);
+        let logical = 0x58_000;
+        let backing = 0xb0_000;
+        dma.register_coherent_window(owner(), window, logical, 0x1000, backing)
+            .unwrap();
+        let grant = dma
+            .register_coherent_reservation_at(owner(), window, logical, 128, backing)
+            .unwrap();
+        let alias = dma
+            .begin_coherent_reservation_alias(
+                owner(), adapter, grant.reservation_id, window, backing, 32,
+            )
+            .unwrap();
+
+        // PutSG ends the adapter's view, but the provider result still awaits the
+        // canonical consumer ACK. Revoking its owner cannot free the bytes or IOVA.
+        dma.end_coherent_reservation_alias(owner(), alias).unwrap();
+        assert_eq!(dma.revoke_owner(owner()), (0, 0));
+        assert_eq!(dma.decode_owner_logical(owner(), logical, 32), Ok(backing));
+        assert_eq!(
+            dma.release_coherent_reservation(owner(), window, grant.reservation_id),
+            Err(DmaError::Quarantined)
+        );
+        assert_eq!(
+            dma.register_coherent_reservation_at(owner(), window, logical, 128, backing),
+            Err(DmaError::Quarantined)
+        );
+        assert_eq!(
+            dma.register_coherent_window(owner(), window, logical, 0x1000, backing),
+            Err(DmaError::Quarantined)
+        );
+    }
+
+    #[test]
     fn software_completion_and_device_write_use_the_same_retained_coherent_bytes() {
         let mut dma = DmaManager::new();
         let storport = dma.register_adapter(owner(), true, 4096, true);
