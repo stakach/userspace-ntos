@@ -61,6 +61,18 @@ class SerialPanicDetectorTests(unittest.TestCase):
 
 
 class SerialTerminalDetectorTests(unittest.TestCase):
+    def test_provider_bugcheck_is_terminal_across_split_serial_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "serial.log"
+            log.write_bytes(b"[provider-bugcheck] code=0x0000001e\n[provider-bugcheck] term")
+            detector = terminal_detector(log)
+            self.assertIsNone(detector.poll())
+
+            with log.open("ab") as stream:
+                stream.write(b"inal\n")
+            self.assertEqual(detector.poll(), "provider-bugcheck")
+            self.assertIsNone(detector.poll())
+
     def test_quiesce_gate_is_terminal_across_split_serial_writes(self):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "serial.log"

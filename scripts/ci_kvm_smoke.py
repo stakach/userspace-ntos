@@ -35,6 +35,7 @@ TERMINAL_BOOT_STOP = re.compile(
     rb"(?:^|[\r\n])("
     rb"\[quiesce\] every live process parked/waiting \(no signaler left\) -> run gate"
     rb"|\[cm-flush\] shutdown hive durability refused status=0x[0-9a-fA-F]{8}"
+    rb"|\[provider-bugcheck\] terminal"
     rb")\r?\n"
 )
 
@@ -67,7 +68,7 @@ class SerialPanicDetector:
 
 
 class SerialTerminalDetector(SerialPanicDetector):
-    """Detect the guest's terminal quiesce or refused durability gate."""
+    """Detect fatal guest gates, including a hosted provider bugcheck."""
 
     def __init__(self, path):
         super().__init__(path, TERMINAL_BOOT_STOP)
@@ -76,7 +77,11 @@ class SerialTerminalDetector(SerialPanicDetector):
         record = super().poll()
         if record is None:
             return None
-        return "quiesce" if record.startswith("[quiesce]") else "durability-refused"
+        if record.startswith("[quiesce]"):
+            return "quiesce"
+        if record.startswith("[provider-bugcheck]"):
+            return "provider-bugcheck"
+        return "durability-refused"
 
 
 def cpu_sample_delay(sample_index):
