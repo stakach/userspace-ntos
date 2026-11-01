@@ -741,6 +741,47 @@ mod tests {
     }
 
     #[test]
+    fn transfer_mapping_and_coherent_alias_with_same_numeric_id_retire_independently() {
+        let mut dma = DmaManager::new();
+        let adapter = dma.register_adapter(owner(), true, 4096, true);
+        let window = CoherentWindowIdentity::new(22, 7);
+        dma.register_coherent_window(owner(), window, 0x70_000, 0x1000, 0xc0_000)
+            .unwrap();
+        let reservation = dma
+            .register_coherent_reservation_at(owner(), window, 0x70_000, 128, 0xc0_000)
+            .unwrap();
+        let alias = dma
+            .begin_coherent_reservation_alias(
+                owner(), adapter, reservation.reservation_id, window, 0xc0_000, 32,
+            )
+            .unwrap();
+        let transfer = dma
+            .register_mapping_at(owner(), adapter, 0x72_000, 0xd0_000, 32)
+            .unwrap();
+        assert_eq!(transfer.mapping_id, alias.alias_id());
+
+        // PutSG of the coherent alias must leave the ordinary transfer mapping live,
+        // even though their numeric IDs happen to match.
+        dma.end_coherent_reservation_alias(owner(), alias).unwrap();
+        assert!(dma.mapping_matches(
+            owner(), transfer.mapping_id, transfer.logical_base, 0xd0_000, 32,
+        ));
+        dma.release_coherent_reservation(owner(), window, reservation.reservation_id)
+            .unwrap();
+        assert_eq!(
+            dma.decode_owner_logical(owner(), transfer.logical_base, 32),
+            Ok(0xd0_000)
+        );
+
+        dma.free_mapping_for_owner(owner(), transfer.mapping_id).unwrap();
+        assert_eq!(
+            dma.decode_owner_logical(owner(), transfer.logical_base, 32),
+            Err(DmaError::LogicalViolation)
+        );
+        dma.release_coherent_window(owner(), window).unwrap();
+    }
+
+    #[test]
     fn software_completion_and_device_write_use_the_same_retained_coherent_bytes() {
         let mut dma = DmaManager::new();
         let storport = dma.register_adapter(owner(), true, 4096, true);
