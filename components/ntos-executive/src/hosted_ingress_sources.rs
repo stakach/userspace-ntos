@@ -296,11 +296,19 @@ pub(crate) unsafe fn enroll_system_thread(
     handle: u64,
     reply: u64,
 ) -> Result<PeerRoute, Error> {
-    enroll(
+    let route = enroll(
         instance_index,
         PhysicalSourceKind::SystemThread { handle },
         reply,
-    )
+    )?;
+    print_str(b"[system-thread-enroll] instance=");
+    print_u64(instance_index as u64);
+    print_str(b" handle=");
+    print_u64(handle);
+    print_str(b" route=");
+    print_u64(route.badge());
+    print_str(b"\n");
+    Ok(route)
 }
 
 /// A persistent initialized ordinary worker has its own startup/dispatch handshake.

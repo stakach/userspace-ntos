@@ -61810,6 +61810,17 @@ pub(crate) unsafe fn trace_hosted_system_thread_census() {
         print_u64(runtime.ingress_route.map_or(0, |route| route.badge()));
         print_str(b"\n");
         if let Some(route) = runtime.ingress_route {
+            print_str(b"[hosted-system-thread] physical-kind=");
+            match crate::spawn_hosts::shared_ingress::owner::runtime::physical_source(route) {
+                Ok(source) => print_str(match source.kind {
+                    crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalSourceKind::SystemThread { .. } => b"system-thread",
+                    crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalSourceKind::DispatchWorker { .. } => b"dispatch-worker",
+                    crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalSourceKind::Primary => b"primary",
+                    crate::spawn_hosts::shared_ingress::owner::runtime::PhysicalSourceKind::Interrupt(_) => b"interrupt",
+                }),
+                Err(_) => print_str(b"invalid"),
+            }
+            print_str(b"\n");
             print_str(b"[hosted-system-thread] pending-route=");
             match crate::spawn_hosts::shared_ingress::owner::runtime::pending_route_snapshot(route) {
                 Ok(Some((reply, info))) => {
