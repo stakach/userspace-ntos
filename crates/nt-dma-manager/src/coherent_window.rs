@@ -340,6 +340,16 @@ impl DmaManager {
         Ok(())
     }
 
+    /// Validate a retained alias receipt before accepting a provider-written SG projection.
+    pub fn coherent_reservation_alias_matches(
+        &self,
+        owner: DmaOwner,
+        alias: CoherentReservationAlias,
+    ) -> bool {
+        self.coherent_aliases.iter().any(|record| record.active
+            && record.owner == owner && record.alias == alias)
+    }
+
     /// A known terminal completion may release an exact reservation only after all SG aliases end.
     pub fn release_coherent_reservation(
         &mut self,
@@ -779,6 +789,86 @@ mod tests {
             Err(DmaError::LogicalViolation)
         );
         dma.release_coherent_window(owner(), window).unwrap();
+    }
+
+    #[test]
+    fn coherent_reservation_and_ordinary_dma_claims_exclude_each_other_in_both_orders() {
+        const WINDOW_LOGICAL: u64 = 0x80_000;
+        const WINDOW_BACKING: u64 = 0xe0_000;
+        const RESERVED_LOGICAL: u64 = WINDOW_LOGICAL + 0x80;
+        const RESERVED_BACKING: u64 = WINDOW_BACKING + 0x80;
+        const OVERLAP_LOGICAL: u64 = WINDOW_LOGICAL + 0xc0;
+        const OVERLAP_BACKING: u64 = WINDOW_BACKING + 0xc0;
+
+        // A SCSI request may reserve before a miniport asks for a common buffer
+        // or maps a different request. Neither later claim may reuse its IOVA.
+        let mut dma = DmaManager::new();
+        let adapter = dma.register_adapter(owner(), true, 4096, true);
+        let window = CoherentWindowIdentity::new(24, 8);
+        dma.register_coherent_window(owner(), window, WINDOW_LOGICAL, 0x1000, WINDOW_BACKING)
+            .unwrap();
+        let reservation = dma
+            .register_coherent_reservation_at(
+                owner(), window, RESERVED_LOGICAL, 128, RESERVED_BACKING,
+            )
+            .unwrap();
+        assert_eq!(
+            dma.register_common_buffer_at(
+                owner(), adapter, OVERLAP_LOGICAL, 128, OVERLAP_BACKING,
+            ),
+            Err(DmaError::LogicalViolation)
+        );
+        assert_eq!(
+            dma.register_mapping_at(owner(), adapter, OVERLAP_LOGICAL, OVERLAP_BACKING, 128),
+            Err(DmaError::LogicalViolation)
+        );
+        assert_eq!(
+            dma.decode_owner_logical(owner(), RESERVED_LOGICAL, 128),
+            Ok(RESERVED_BACKING)
+        );
+        dma.release_coherent_reservation(owner(), window, reservation.reservation_id)
+            .unwrap();
+        dma.release_coherent_window(owner(), window).unwrap();
+
+        // A preexisting common buffer must likewise block a later SCSI reservation.
+        let mut dma = DmaManager::new();
+        let adapter = dma.register_adapter(owner(), true, 4096, true);
+        let window = CoherentWindowIdentity::new(25, 9);
+        dma.register_coherent_window(owner(), window, WINDOW_LOGICAL, 0x1000, WINDOW_BACKING)
+            .unwrap();
+        dma.register_common_buffer_at(
+            owner(), adapter, OVERLAP_LOGICAL, 128, OVERLAP_BACKING,
+        )
+        .unwrap();
+        assert_eq!(
+            dma.register_coherent_reservation_at(
+                owner(), window, RESERVED_LOGICAL, 128, RESERVED_BACKING,
+            ),
+            Err(DmaError::LogicalViolation)
+        );
+        assert_eq!(
+            dma.decode_owner_logical(owner(), OVERLAP_LOGICAL, 128),
+            Ok(OVERLAP_BACKING)
+        );
+
+        // The same exclusion holds when an ordinary transfer mapping came first.
+        let mut dma = DmaManager::new();
+        let adapter = dma.register_adapter(owner(), true, 4096, true);
+        let window = CoherentWindowIdentity::new(26, 10);
+        dma.register_coherent_window(owner(), window, WINDOW_LOGICAL, 0x1000, WINDOW_BACKING)
+            .unwrap();
+        dma.register_mapping_at(owner(), adapter, OVERLAP_LOGICAL, OVERLAP_BACKING, 128)
+            .unwrap();
+        assert_eq!(
+            dma.register_coherent_reservation_at(
+                owner(), window, RESERVED_LOGICAL, 128, RESERVED_BACKING,
+            ),
+            Err(DmaError::LogicalViolation)
+        );
+        assert_eq!(
+            dma.decode_owner_logical(owner(), OVERLAP_LOGICAL, 128),
+            Ok(OVERLAP_BACKING)
+        );
     }
 
     #[test]
