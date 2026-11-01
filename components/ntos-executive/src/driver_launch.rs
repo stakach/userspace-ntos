@@ -53086,6 +53086,22 @@ unsafe fn release_unpublished_hosted_dma_adapter_lease(lease_id: u64) {
     }
 }
 
+/// Refuse resource retirement before changing any sibling lease when one still has a live
+/// provider allocation record. The per-lease retirement repeats this check to catch races.
+unsafe fn preflight_hosted_dma_adapter_leases(
+    binding: HostedDeviceBinding,
+) -> Result<(), nt_status::NtStatus> {
+    let owner = hosted_dma_owner(binding);
+    for lease in hosted_dma_adapter_leases_mut().iter().copied() {
+        if lease.owner == owner
+            && hosted_dma_adapter_has_live_records(lease.owner, lease.adapter_id)?
+        {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+    }
+    Ok(())
+}
+
 unsafe fn revoke_hosted_dma_adapter_leases(
     binding: HostedDeviceBinding,
 ) -> Result<(), nt_status::NtStatus> {
@@ -58137,9 +58153,22 @@ unsafe fn clear_hosted_resource_projection(
     {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
-    // Mask and retire the physical route before revoking the generation's resource assignment or
-    // component mappings. A live device must never target a stale ISR projection.
+    if hosted_scsi_dma_reservation::active_for_controller(binding.device_id) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    preflight_hosted_dma_adapter_leases(binding)?;
+    // Mask and drain ISR delivery before retiring an adapter it may still use. The read-only
+    // preflight above refuses a known busy owner before this first retirement effect.
     retire_hosted_irq_connections_for_binding(binding)?;
+    // Recheck after the IRQ drain: a concurrent provider could have claimed the grant before
+    // the mask took effect. DEVICE_BUSY here leaves the grant and PCI resources mapped, and
+    // retry may safely continue from the masked IRQ state.
+    if hosted_scsi_dma_reservation::active_for_controller(binding.device_id) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    preflight_hosted_dma_adapter_leases(binding)?;
+    revoke_hosted_dma_adapter_leases(binding)?;
+    let _ = hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
     let resource_state = hosted_device_resource_state_by_device_id(binding.device_id);
     if let Some(state) = resource_state {
         if state.interface_type == HOSTED_INTERFACE_TYPE_INTERNAL_POWER_BUS {
@@ -58224,8 +58253,6 @@ unsafe fn clear_hosted_resource_projection(
     }
     retire_hosted_device_port_caps(binding)?;
     let _ = hosted_resource_manager_mut().revoke_owner(hosted_resource_owner(binding));
-    revoke_hosted_dma_adapter_leases(binding)?;
-    let _ = hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
     clear_shared_address_resources(sh);
     write_volatile((sh + SH_RESOURCE_PDO_OBJECT) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *mut u32, 0);
@@ -63326,6 +63353,9 @@ pub(crate) fn service_hosted_driver_dma_adapter(
                 None => (STATUS_DEVICE_NOT_READY, 0, 0, 0),
             };
         }
+        if unsafe { hosted_dma_owner_is_quarantined(lease.owner) } {
+            return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+        }
         let (adapter, ops) = match unsafe {
             hosted_device_allocations::provision_dma_adapter_pair(inst, lease.lease_id)
         } {
@@ -63367,6 +63397,14 @@ pub(crate) fn service_hosted_driver_dma_adapter(
                 lease.pdo_registration.device_id().raw(), lease.pdo_generation) }
         {
             return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        }
+        if matches!(operation,
+            HOSTED_DMA_SERVICE_ALLOC_MAP | HOSTED_DMA_SERVICE_ALLOC_SG_GET
+                | HOSTED_DMA_SERVICE_ALLOC_SG_BUILD | HOSTED_DMA_SERVICE_MAP_TRANSFER
+                | HOSTED_DMA_SERVICE_REGISTER_COMMON_BUFFER)
+            && unsafe { hosted_dma_owner_is_quarantined(lease.owner) }
+        {
+            return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
         }
         let result = match operation {
             HOSTED_DMA_SERVICE_REGISTER_COMMON_BUFFER => {

@@ -60,6 +60,13 @@ pub(super) unsafe fn for_provider(
     })
 }
 
+/// A child reservation retains its controller's DMA grant through canonical completion ACK.
+/// Quarantined rows also remain here, so neither may permit controller resource teardown.
+pub(super) unsafe fn active_for_controller(controller_device_id: u64) -> bool {
+    controller_device_id != 0 && reservations().iter()
+        .any(|row| row.controller_device_id == controller_device_id)
+}
+
 pub(super) unsafe fn for_source(
     provider: HostedDomainIdentity,
     source_va: u64,
