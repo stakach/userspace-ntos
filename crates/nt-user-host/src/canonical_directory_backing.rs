@@ -131,6 +131,18 @@ impl<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P> CanonicalDirectoryBackings<O, 
         Ok(())
     }
 
+    /// Cancel a reservation only while no Object Manager request has been
+    /// submitted. Once publication starts, its exact terminal must be settled.
+    pub fn abort_before_effect(&mut self, owner: O) -> Result<(), BackingError> {
+        let index = self.rows.iter().position(|row| row.owner == owner)
+            .ok_or(BackingError::WrongOwner)?;
+        if !matches!(self.rows[index].phase, Phase::Reserved) {
+            return Err(BackingError::InvalidPhase);
+        }
+        self.rows.swap_remove(index);
+        Ok(())
+    }
+
     pub fn publish(&mut self, owner: O, port: &mut impl DirectoryPort<Handle=H, Pending=P>)
         -> Result<Publication, BackingError> {
         let row = self.rows.iter_mut().find(|row| row.owner == owner)

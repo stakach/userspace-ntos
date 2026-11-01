@@ -166,6 +166,26 @@ fn concurrent_case_variant_name_cannot_cross_an_unsettled_canonical_operation() 
 }
 
 #[test]
+fn abort_before_effect_frees_exact_reservation_but_never_submitted_request() {
+    let path: Vec<u16> = "\\Device\\AbortReservation".encode_utf16().collect();
+    let mut backing = CanonicalDirectoryBackings::<u64, u64, u64, u64>::new();
+    backing.reserve(21, DirectoryAction::Create, &path, 0, 0).unwrap();
+    assert_eq!(backing.reserve(22, DirectoryAction::Create, &path, 0, 0),
+        Err(BackingError::PathOccupied));
+    assert_eq!(backing.abort_before_effect(21), Ok(()));
+    assert_eq!(backing.abort_before_effect(21), Err(BackingError::WrongOwner));
+    backing.reserve(22, DirectoryAction::Create, &path, 0, 0).unwrap();
+
+    let mut port = DelayedPort { create_calls: 0, close_calls: 0,
+        create_ready: false, close_ready: false, incoherent: false };
+    assert_eq!(backing.publish(22, &mut port), Ok(Publication::Pending));
+    assert_eq!(backing.abort_before_effect(22), Err(BackingError::InvalidPhase));
+    assert_eq!(backing.reserve(23, DirectoryAction::Create, &path, 0, 0),
+        Err(BackingError::PathOccupied));
+    assert_eq!(port.create_calls, 1);
+}
+
+#[test]
 fn definite_native_commit_failure_rolls_back_permanent_canonical_name() {
     let mut server = Server::new().unwrap();
     let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
