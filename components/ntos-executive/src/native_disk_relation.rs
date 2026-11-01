@@ -93,6 +93,11 @@ pub(super) enum ProofProgress {
 }
 
 impl NativeDiskProof {
+    /// A physical request remains owned until its exact terminal output is acknowledged.
+    pub(super) fn entered_irp(&self) -> Option<IrpId> {
+        self.entered.as_ref().map(|entered| entered.irp)
+    }
+
     pub(super) fn new(
         handoff: NativeStorageHandoff,
         route: NativeStorageRoute,

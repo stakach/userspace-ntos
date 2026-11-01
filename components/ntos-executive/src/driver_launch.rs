@@ -53946,6 +53946,20 @@ pub(crate) unsafe fn enqueue_hosted_initial_bus_relations(
     })
 }
 
+/// A physical disk request can still complete by IRQ even when all user threads are parked.
+/// Observe only the exact IRP retained by the active relation publication.
+pub(crate) unsafe fn native_disk_proof_hardware_irp_pending() -> bool {
+    let Some(query) = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).as_ref() else {
+        return false;
+    };
+    let Some(publication) = query.publication.as_ref() else {
+        return false;
+    };
+    matches!(publication.phase, HostedRelationPublicationPhase::ProveNativeDisk)
+        && publication.native_disk_proof.as_ref()
+            .is_some_and(|proof| proof.entered_irp().is_some())
+}
+
 /// An uncommitted relation may still contribute the exact PDO for a registry devnode. The
 /// claimant is removed from the queue while its query is active, so both owners must be checked.
 pub(crate) unsafe fn hosted_bus_relation_pending() -> bool {

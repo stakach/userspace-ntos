@@ -21,6 +21,7 @@ QMP_SOCKET = ROOT / "native-kvm-smoke-qmp.sock"
 INTERRUPT_TRACE = MICRO / "native-kvm-qemu-int.log"
 INTERRUPT_TRACE_TAIL = ROOT / "native-kvm-qemu-int-tail.log"
 STALL_STATE = ROOT / "native-kvm-stall-state.json"
+VOLUME_DISPATCH_STATE = ROOT / "native-kvm-volume-dispatch-state.json"
 CPU_SAMPLES = ROOT / "native-kvm-cpu-samples.jsonl"
 STOPPED_MARKER = ROOT / "native-kvm-qemu-stopped"
 
@@ -203,9 +204,45 @@ def read_host_state(process_group):
     return state
 
 
-def capture_stall_state():
-    """Keep per-CPU register evidence when the bounded boot window expires."""
-    STALL_STATE.write_text(json.dumps(read_cpu_state(), indent=2) + "\n")
+def capture_stall_state(path=STALL_STATE):
+    """Keep per-CPU and AHCI register evidence at a proof frontier or stall."""
+    state = read_cpu_state()
+    # The AHCI controller's published PCI BAR is evidence of the actual hardware route.
+    # Read controller registers through QMP without changing the guest or its disk.
+    try:
+        serial = LOG.read_bytes()
+        matches = list(re.finditer(
+            rb"assigned PCI resources service=storahci[^\r\n]*mmio=0x(?:0x)?([0-9a-fA-F]+)",
+            serial,
+        ))
+        if matches:
+            abar = int(matches[-1].group(1), 16)
+            registers = {
+                "hba": (abar, 4),  # CAP, GHC, IS, PI
+                "port0_status": (abar + 0x110, 3),  # PxIS, PxIE, PxCMD
+                "port0_task": (abar + 0x120, 1),  # PxTFD
+                "port0_error": (abar + 0x130, 3),  # PxSERR, PxSACT, PxCI
+            }
+            with socket.socket(socket.AF_UNIX) as connection:
+                connection.settimeout(3)
+                connection.connect(str(QMP_SOCKET))
+                with connection.makefile("rwb", buffering=0) as stream:
+                    greeting = json.loads(stream.readline())
+                    if "QMP" not in greeting:
+                        raise RuntimeError("QMP greeting missing")
+                    stream.write(b'{"execute":"qmp_capabilities","id":"capabilities"}\n')
+                    qmp_reply(stream, "capabilities")
+                    state["ahci"] = {"abar": abar, "registers": {}}
+                    for name, (address, count) in registers.items():
+                        command_id = f"ahci-{name}"
+                        command = {"execute": "human-monitor-command", "arguments": {
+                            "command-line": f"xp /{count}wx 0x{address:x}"
+                        }, "id": command_id}
+                        stream.write((json.dumps(command) + "\n").encode())
+                        state["ahci"]["registers"][name] = qmp_reply(stream, command_id)["return"]
+    except (OSError, RuntimeError, ValueError, KeyError) as error:
+        state["ahci_error"] = str(error)
+    path.write_text(json.dumps(state, indent=2) + "\n")
 
 
 def stop_process_group(process, deadline=None):
@@ -255,6 +292,7 @@ def main():
     INTERRUPT_TRACE.unlink(missing_ok=True)
     INTERRUPT_TRACE_TAIL.unlink(missing_ok=True)
     STALL_STATE.unlink(missing_ok=True)
+    VOLUME_DISPATCH_STATE.unlink(missing_ok=True)
     CPU_SAMPLES.unlink(missing_ok=True)
     STOPPED_MARKER.unlink(missing_ok=True)
     command = [
@@ -280,6 +318,7 @@ def main():
         next_cpu_sample = started + cpu_sample_delay(cpu_sample_index)
         captured = False
         stall_captured = False
+        volume_dispatch_captured = False
         panic_detector = SerialPanicDetector(LOG)
         terminal_detector = SerialTerminalDetector(LOG)
         panic_site = None
@@ -313,6 +352,10 @@ def main():
         hard_stop.start()
         try:
             while time.monotonic() < deadline:
+                if not volume_dispatch_captured and QMP_SOCKET.exists() and LOG.exists():
+                    if b"step=volume-sector" in LOG.read_bytes():
+                        capture_stall_state(VOLUME_DISPATCH_STATE)
+                        volume_dispatch_captured = True
                 panic_site = panic_detector.poll()
                 if panic_site:
                     print(f"Executive panic at {panic_site}; stopping bounded boot", flush=True)
