@@ -43128,6 +43128,14 @@ unsafe fn set_hosted_relation_query_disposition(disposition: HostedDeviceRelatio
             });
             print_str(b" status=0x");
             print_hex(status.raw() as u32);
+            print_str(b" parent/owner-phase=");
+            print_u64(query.claim.pdo_device_id);
+            print_str(b"/");
+            if let Some(publication) = query.publication.as_ref() {
+                print_u64(publication.phase as u64);
+            } else {
+                print_str(b"none");
+            }
             print_str(b"\n");
             query.phase = HostedDeviceRelationQueryPhase::Barrier;
             query.barrier_status = Some(status);
@@ -53918,6 +53926,21 @@ pub(crate) unsafe fn print_hosted_pnp_enumeration_evidence() {
         Some(HostedDriverAllocationCopyError::ReleaseFailed) => b"release",
     });
     print_str(b"\n");
+    if let Some(publication) = query.publication.as_ref() {
+        print_str(b"[pnp-publication] parent/phase-id/native-required/candidate/published/refusal=");
+        print_u64(query.claim.pdo_device_id);
+        print_str(b"/");
+        print_u64(publication.phase as u64);
+        print_str(b"/");
+        print_u64(publication.native_disk_required as u64);
+        print_str(b"/");
+        print_u64(publication.native_disk_candidate as u64);
+        print_str(b"/");
+        print_u64(publication.native_disk_published as u64);
+        print_str(b"/0x");
+        print_hex(publication.refusal.raw() as u32);
+        print_str(b"\n");
+    }
 }
 
 unsafe fn hosted_bus_relations_mut() -> &'static mut nt_pnp_manager::BusRelationTable {

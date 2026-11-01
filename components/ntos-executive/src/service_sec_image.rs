@@ -9759,6 +9759,7 @@ pub(crate) unsafe fn service_sec_image(
                 && crate::section_pagein_work::next_deadline().is_none()
                 && crate::provider_section_broker::next_deadline().is_none()
             {
+                unsafe { driver_launch::print_hosted_pnp_enumeration_evidence(); }
                 print_str(
                     b"[quiesce] every live process parked/waiting (no signaler left) -> run gate\n",
                 );
