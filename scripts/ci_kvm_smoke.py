@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -27,6 +28,33 @@ STOPPED_MARKER = ROOT / "native-kvm-qemu-stopped"
 # while the guest's own cycle counter showed that path used only a few seconds.
 # Vary the phase so a periodic guest path cannot masquerade as a CPU hotspot.
 CPU_SAMPLE_DELAYS = (17, 31, 43, 59)
+EXECUTIVE_PANIC = re.compile(rb"!@(src/[A-Za-z0-9_./-]+\.rs:[1-9][0-9]*)\r?\n")
+
+
+class SerialPanicDetector:
+    """Read only new serial output, retaining split panic records across polls."""
+
+    def __init__(self, path):
+        self.path = path
+        self.offset = 0
+        self.tail = b""
+
+    def poll(self):
+        with self.path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            if size < self.offset:
+                self.offset = 0
+                self.tail = b""
+            stream.seek(self.offset)
+            while chunk := stream.read(65536):
+                self.offset += len(chunk)
+                candidate = self.tail + chunk
+                match = EXECUTIVE_PANIC.search(candidate)
+                self.tail = candidate[-4096:]
+                if match:
+                    return match.group(1).decode("ascii")
+        return None
 
 
 def cpu_sample_delay(sample_index):
@@ -232,6 +260,8 @@ def main():
         next_cpu_sample = started + cpu_sample_delay(cpu_sample_index)
         captured = False
         stall_captured = False
+        panic_detector = SerialPanicDetector(LOG)
+        panic_site = None
         def signal_guest(sig):
             try:
                 os.killpg(process.pid, sig)
@@ -246,6 +276,22 @@ def main():
         hard_stop.start()
         try:
             while time.monotonic() < deadline:
+                panic_site = panic_detector.poll()
+                if panic_site:
+                    print(f"Executive panic at {panic_site}; stopping bounded boot", flush=True)
+                    if QMP_SOCKET.exists():
+                        try:
+                            capture_stall_state()
+                            stall_captured = True
+                        except OSError as error:
+                            print(f"QMP panic state capture failed: {error}", flush=True)
+                        try:
+                            capture_framebuffer()
+                            captured = True
+                            print(f"QMP panic framebuffer captured: {SCREENSHOT.name}", flush=True)
+                        except (OSError, RuntimeError, ValueError) as error:
+                            print(f"QMP panic framebuffer capture failed: {error}", flush=True)
+                    break
                 if process.poll() is not None:
                     break
                 if (not stall_captured and time.monotonic() >= deadline - 45
@@ -295,6 +341,9 @@ def main():
                 INTERRUPT_TRACE.unlink()
 
     output = LOG.read_text(errors="replace")
+    panic_site = panic_site or panic_detector.poll()
+    if panic_site:
+        raise SystemExit(f"executive panic at {panic_site}; inspect native-kvm-smoke.log")
     if "boot: reading Simpleboot memory map" not in output:
         raise SystemExit("guest startup marker absent; inspect native-kvm-smoke.log")
     if not captured:
