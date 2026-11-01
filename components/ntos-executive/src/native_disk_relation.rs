@@ -41,6 +41,17 @@ fn trace_native_disk_proof(
     print_str(b"\n");
 }
 
+fn trace_capacity_geometry(data: &[u8], completed_srb: &[u8]) {
+    if data.len() < 12 || completed_srb.len() < 0x14 { return; }
+    print_str(b"[native-disk-capacity] last-lba/sector-bytes/reported-bytes=");
+    print_u64(u64::from_be_bytes(data[0..8].try_into().unwrap()));
+    print_str(b"/");
+    print_u64(u32::from_be_bytes(data[8..12].try_into().unwrap()) as u64);
+    print_str(b"/");
+    print_u64(u32::from_le_bytes(completed_srb[0x10..0x14].try_into().unwrap()) as u64);
+    print_str(b"\n");
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct NativeStorageRoute {
     pub mount: nt_memory_manager::SectionMountId,
@@ -116,14 +127,18 @@ impl NativeDiskProof {
                 .expect("retained native disk proof request lost");
             return ProofProgress::Refused;
         }
-        let data = decoded.unwrap().data;
+        let decoded = decoded.unwrap();
+        let data = decoded.data;
         let refusal = match entered.request.step {
             ProofStep::Capacity => match entered.command.parse_capacity(data) {
                 Ok((size, count)) => self.handoff.complete_capacity(entered.request, size, count)
                     .err().map(|error| if error == StorageProofError::GeometryMismatch {
                         b"geometry-mismatch".as_slice()
                     } else { b"capacity-contract".as_slice() }),
-                Err(_) => Some(b"capacity-payload".as_slice()),
+                Err(_) => {
+                    trace_capacity_geometry(data, decoded.srb);
+                    Some(b"capacity-payload".as_slice())
+                },
             },
             ProofStep::SectorZero | ProofStep::VolumeSector =>
                 self.handoff.complete_sector(entered.request, data).err().map(|error| {
