@@ -741,6 +741,14 @@ impl ProcessManager {
         if caller.mode != AccessMode::KernelMode {
             return Err(STATUS_ACCESS_DENIED);
         }
+        self.reference_original_native_requestor(caller)
+    }
+
+    fn reference_original_native_requestor(
+        &mut self,
+        caller: NativeHandleCaller,
+    ) -> Result<NativeThreadProcessReference, u32> {
+        self.validate_native_handle_caller(caller)?;
         let lifetime = caller.original_thread;
         let pid = lifetime.process_id();
         let tid = lifetime.thread_id();
@@ -796,6 +804,15 @@ impl ProcessManager {
             .unwrap()
             .kernel_pointer_references = thread_count;
         Ok(pair)
+    }
+
+    /// Retain the authenticated original thread and process for a native user syscall whose
+    /// Reply must outlive this dispatch. The syscall adapter performs access admission itself.
+    pub fn reference_native_syscall_requestor(
+        &mut self,
+        caller: NativeHandleCaller,
+    ) -> Result<NativeThreadProcessReference, u32> {
+        self.reference_original_native_requestor(caller)
     }
 
     /// Reference a Process/Thread handle, including native pseudo handles. All fallible admission,

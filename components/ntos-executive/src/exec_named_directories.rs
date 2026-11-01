@@ -34,7 +34,7 @@ impl ExecNtHandler {
         if self.pending_native_directory_open_transfer.is_some() {
             return nt_status::NtStatus::DEVICE_BUSY.raw() as u32;
         }
-        let mut reference = match self.pm.reference_native_requestor(caller) {
+        let mut reference = match self.pm.reference_native_syscall_requestor(caller) {
             Ok(reference) => reference,
             Err(status) => return status,
         };

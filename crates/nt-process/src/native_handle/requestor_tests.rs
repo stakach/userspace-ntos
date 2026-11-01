@@ -125,6 +125,24 @@ fn foreign_manager_and_user_mode_cannot_capture_or_release_pair() {
 }
 
 #[test]
+fn authenticated_user_syscall_retains_exact_requestor_without_kernel_authority() {
+    let (mut pm, kernel) = fixture();
+    let user = pm
+        .capture_native_handle_caller(kernel.original_thread(), AccessMode::UserMode)
+        .unwrap();
+    assert_eq!(pm.reference_native_requestor(user).unwrap_err(), STATUS_ACCESS_DENIED);
+    let (mut foreign, _) = fixture();
+    assert_eq!(foreign.reference_native_syscall_requestor(user).unwrap_err(), STATUS_INVALID_HANDLE);
+    let mut owner = pm.reference_native_syscall_requestor(user)
+        .expect("a user-mode directory syscall owns its original process and thread until reply");
+    assert_eq!(owner.thread_lifetime(), user.original_thread());
+    assert_eq!(counts(&pm, user), (1, 1));
+    assert_eq!(owner.validate(&pm), Ok(()));
+    owner.release(&mut pm).unwrap();
+    assert_eq!(counts(&pm, user), (0, 0));
+}
+
+#[test]
 fn release_validates_both_bodies_before_changing_either_count() {
     for changed_thread in [false, true] {
         let (mut pm, caller) = fixture();
