@@ -479,20 +479,33 @@ unsafe fn advance_hosted_relation_publication(
             Phase::Admit => {
                 let prepared = owner.prepared.as_ref().expect("retained relation preparation");
                 if let Err(status) = crate::cm_mutation_transport::validate_storage(prepared) {
+                    if status == nt_status::NtStatus::DEVICE_BUSY.raw() {
+                        return owner.pending();
+                    }
                     owner.refusal_origin = Some(owner.phase);
                     owner.refusal = nt_status::NtStatus(status);
                     owner.phase = Phase::Abort;
                     continue;
                 }
-                let mut bytes = Vec::new();
-                if bytes.try_reserve_exact(prepared.durable_journal().len()).is_err() {
-                    owner.refusal_origin = Some(owner.phase);
-                    owner.refusal = nt_status::NtStatus::INSUFFICIENT_RESOURCES;
-                    owner.phase = Phase::Abort;
-                    continue;
-                }
-                bytes.extend_from_slice(prepared.durable_journal());
+                let bytes = if owner.persistence.admitting() {
+                    // The first admission already retained the exact CM bytes with its WAL
+                    // continuation recheck. Retrying must consume that owner, not copy again.
+                    Vec::new()
+                } else {
+                    let mut bytes = Vec::new();
+                    if bytes.try_reserve_exact(prepared.durable_journal().len()).is_err() {
+                        owner.refusal_origin = Some(owner.phase);
+                        owner.refusal = nt_status::NtStatus::INSUFFICIENT_RESOURCES;
+                        owner.phase = Phase::Abort;
+                        continue;
+                    }
+                    bytes.extend_from_slice(prepared.durable_journal());
+                    bytes
+                };
                 if let Err(status) = owner.persistence.admit(prepared, bytes) {
+                    if status == nt_status::NtStatus::DEVICE_BUSY.raw() as u32 {
+                        return owner.pending();
+                    }
                     owner.refusal_origin = Some(owner.phase);
                     owner.refusal = nt_status::NtStatus(status as i32);
                     owner.phase = Phase::Abort;

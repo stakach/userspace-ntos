@@ -184,7 +184,9 @@ pub(crate) struct MutationPersistence {
 }
 
 impl MutationPersistence {
-    fn admitting(&self) -> bool { matches!(&self.owner, PersistenceOwner::Admitting { .. }) }
+    pub(crate) fn admitting(&self) -> bool {
+        matches!(&self.owner, PersistenceOwner::Admitting { .. })
+    }
 
     fn claim_native_wal_io(&mut self) -> Result<Option<(nt_fs::AsyncWalIoRequest, nt_fs::BlockOperation, Vec<u8>, nt_memory_manager::SectionMountId)>, u32> {
         let PersistenceOwner::Wal(wal) = &mut self.owner else { return Ok(None); };
@@ -1052,6 +1054,9 @@ unsafe fn advance(
             }
             let prepared = work.prepared.as_ref().unwrap();
             if let Err(status) = cm_mutation_transport::validate_storage(prepared) {
+                if status == nt_status::NtStatus::DEVICE_BUSY.raw() {
+                    return Err(status);
+                }
                 work.status = status as u32;
                 work.phase = Phase::Abort;
                 return Ok(false);
