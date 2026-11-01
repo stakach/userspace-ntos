@@ -46,6 +46,14 @@ impl ExecNtHandler {
         ) {
             Ok(reserved) => reserved,
             Err(status) => {
+                if self.pi == 0 {
+                    print_str(b"[native-directory-denied] stage=security path=");
+                    print_str(captured.path().unwrap_or(b""));
+                    print_str(b" access=0x"); print_hex(desired_access);
+                    print_str(b" create="); print_u64(u64::from(create));
+                    print_str(b" status=0x"); print_hex(status);
+                    print_str(b"\n");
+                }
                 reference.release(&mut self.pm)
                     .expect("unsubmitted directory requestor reference");
                 return status;

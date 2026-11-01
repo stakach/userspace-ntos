@@ -165,7 +165,13 @@ unsafe fn step(handler: &mut ExecNtHandler, work: &mut PendingNativeDirectoryOpe
             Phase::CanonicalPending => {
                 work.phase = match handler.canonical_poll_directory_object(&mut work.reserved) {
                     DirectoryPublishProgress::Pending => return false,
-                    DirectoryPublishProgress::Failed(status) => Phase::ReplyReady(status),
+                    DirectoryPublishProgress::Failed(status) => {
+                        if work.pi == 0 {
+                            print_str(b"[native-directory-denied] stage=abandoned-canonical-poll status=0x");
+                            print_hex(status); print_str(b"\n");
+                        }
+                        Phase::ReplyReady(status)
+                    },
                     DirectoryPublishProgress::Ready(_) => {
                         match handler.rollback_unpublished_directory_open(
                             &mut work.reserved, nt_process::STATUS_INVALID_HANDLE) {
@@ -181,7 +187,13 @@ unsafe fn step(handler: &mut ExecNtHandler, work: &mut PendingNativeDirectoryOpe
                 work.phase = match handler.rollback_unpublished_directory_open(
                     &mut work.reserved, nt_process::STATUS_INVALID_HANDLE) {
                     DirectoryPublishProgress::Pending => Phase::Rollback,
-                    DirectoryPublishProgress::Failed(status) => Phase::ReplyReady(status),
+                    DirectoryPublishProgress::Failed(status) => {
+                        if work.pi == 0 {
+                            print_str(b"[native-directory-denied] stage=canonical-submit status=0x");
+                            print_hex(status); print_str(b"\n");
+                        }
+                        Phase::ReplyReady(status)
+                    },
                     DirectoryPublishProgress::Ready(_) => Phase::Quarantined,
                 };
                 return true;
@@ -238,7 +250,13 @@ unsafe fn step(handler: &mut ExecNtHandler, work: &mut PendingNativeDirectoryOpe
             work.phase = match handler.canonical_poll_directory_object(&mut work.reserved) {
                 DirectoryPublishProgress::Ready(_) => Phase::LocalCommit,
                 DirectoryPublishProgress::Pending => return false,
-                DirectoryPublishProgress::Failed(status) => Phase::ReplyReady(status),
+                DirectoryPublishProgress::Failed(status) => {
+                    if work.pi == 0 {
+                        print_str(b"[native-directory-denied] stage=canonical-poll status=0x");
+                        print_hex(status); print_str(b"\n");
+                    }
+                    Phase::ReplyReady(status)
+                },
             };
             true
         }
