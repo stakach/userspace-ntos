@@ -2,6 +2,7 @@ use syn::{visit::Visit, Expr, ImplItem, Item};
 
 const SERVICE: &str = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
 const BROKER: &str = include_str!("../../../components/ntos-executive/src/provider_directory_broker.rs");
+const TIMER: &str = include_str!("../../../components/ntos-executive/src/timer_deadline.rs");
 
 fn calls_in(source: &str, function: &str) -> Vec<String> {
     struct Calls(Vec<String>);
@@ -61,6 +62,19 @@ fn deferred_directory_publication_is_admitted_to_the_nested_redrive() {
         "nested directory readiness must respect retry cadence");
     assert!(!readiness.iter().any(|call| call.ends_with("has_outstanding")),
         "uncertain or quarantined directory work must not hot-spin the pump");
+}
+
+#[test]
+fn deferred_directory_publication_arms_its_own_retry_without_other_ingress() {
+    let deadline = calls_in(TIMER, "next");
+    assert!(deadline.iter().any(|call| call.ends_with("provider_directory_broker::next_deadline")),
+        "a pending directory CQE needs a physical timer wake without another driver Call");
+    let dispatch = calls_in(BROKER, "dispatch");
+    assert!(dispatch.iter().any(|call| call.ends_with("rearm_registered_active_delay_timer_with_handler")),
+        "deferred publication and effects must arm the timer after releasing broker ownership");
+    let redrive = calls_in(BROKER, "redrive_nested_ready");
+    assert!(redrive.iter().any(|call| call.ends_with("rearm_registered_active_delay_timer_with_handler")),
+        "after an indeterminate CQE, the next retry must be armed before blocking receive");
 }
 
 #[test]

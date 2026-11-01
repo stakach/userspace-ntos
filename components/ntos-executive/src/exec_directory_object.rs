@@ -41,6 +41,11 @@ impl ReservedDirectoryObjectOpen {
     pub(crate) fn rollback_failure_status(&self) -> Option<u32> {
         self.rollback_failure
     }
+
+    /// An uncertain canonical effect retains ownership but has no safe retry or timer wake.
+    pub(crate) fn canonical_retryable(&self) -> bool {
+        !self.canonical_quarantined
+    }
 }
 
 fn backing_status(error: BackingError) -> u32 {

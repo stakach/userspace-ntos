@@ -93,6 +93,13 @@ enum PendingPhase {
     EffectUncertain,
 }
 
+fn publish_retryable(entry: &Pending) -> bool {
+    if entry.phase != PendingPhase::Publishing { return false; }
+    let Some(work) = entry.publish.as_ref() else { return false; };
+    !matches!(work.phase, PublishPhase::CanonicalPending | PublishPhase::CanonicalRollback)
+        || entry.staged.canonical_retryable()
+}
+
 struct Broker {
     uploads: DirectoryNameUploads<PeerRoute, (LaneDispatchIdentity, u64), NativeHandleCaller>,
     kinds: Vec<(PeerRoute, LaneDispatchIdentity, u64, bool)>,
@@ -609,8 +616,7 @@ unsafe fn redrive_one(handler: &mut ExecNtHandler) -> bool {
     if len == 0 { return false; }
     let start = (NEXT_SCAN.fetch_add(1, Ordering::Relaxed) as usize) % len;
     let Some(index) = (0..len).map(|offset| (start + offset) % len).find(|&index| {
-        broker.pending[index].phase == PendingPhase::Publishing
-            && broker.pending[index].publish.is_some()
+        publish_retryable(&broker.pending[index])
     }) else { return false; };
     let entry = &mut broker.pending[index];
     let work = entry.publish.as_mut().expect("publishing directory owns Reply");
@@ -903,6 +909,7 @@ pub(crate) unsafe fn redrive_nested_ready(handler: *mut ExecNtHandler) -> bool {
     trace_redrive_entry(b"nested-return");
     NEXT_RETRY.store(crate::monotonic_time_100ns().saturating_add(RETRY_DELAY_100NS), Ordering::Release);
     REDRIVE_ACTIVE.store(false, Ordering::Release);
+    crate::service_sec_image::rearm_registered_active_delay_timer_with_handler(&*handler);
     progressed
 }
 
@@ -937,8 +944,7 @@ fn trace_redrive_entry(source: &[u8]) {
 }
 
 pub(crate) fn next_deadline() -> Option<u64> {
-    (unsafe { (&*core::ptr::addr_of!(BROKER)).pending.iter().any(|entry|
-        entry.phase == PendingPhase::Publishing)
+    (unsafe { (&*core::ptr::addr_of!(BROKER)).pending.iter().any(publish_retryable)
         || (&*core::ptr::addr_of!(BROKER)).effects.iter().any(|effect|
             effect.phase != EffectPhase::Indeterminate) })
         .then(|| NEXT_RETRY.load(Ordering::Acquire))
@@ -1001,19 +1007,24 @@ pub(crate) unsafe fn dispatch(
     m3: u64,
 ) -> SubmitResult {
     let _durable = crate::allocator::enter_durable();
-    let broker = &mut *core::ptr::addr_of_mut!(BROKER);
-    if op == 5 {
-        return broker.submit_publish(handler, route, identity, caller,
-            reply_cap, m1, m2, m3);
+    let result = {
+        let broker = &mut *core::ptr::addr_of_mut!(BROKER);
+        match op {
+            5 => broker.submit_publish(handler, route, identity, caller,
+                reply_cap, m1, m2, m3),
+            7 | 15 => broker.submit_effect(handler, route, identity, caller,
+                reply_cap, op, m1, m2, m3),
+            _ => match broker.dispatch(handler, route, identity, caller, op, m1, m2, m3) {
+                Ok((status, out1, out2, out3)) =>
+                    SubmitResult::Ready((status as i32, out1, out2, out3)),
+                Err(status) => SubmitResult::Ready((status as i32, 0, 0, 0)),
+            },
+        }
+    };
+    if matches!(result, SubmitResult::Deferred) {
+        crate::service_sec_image::rearm_registered_active_delay_timer_with_handler(handler);
     }
-    if op == 7 || op == 15 {
-        return broker.submit_effect(handler, route, identity, caller,
-            reply_cap, op, m1, m2, m3);
-    }
-    match broker.dispatch(handler, route, identity, caller, op, m1, m2, m3) {
-        Ok((status, out1, out2, out3)) => SubmitResult::Ready((status as i32, out1, out2, out3)),
-        Err(status) => SubmitResult::Ready((status as i32, 0, 0, 0)),
-    }
+    result
 }
 
 pub(crate) unsafe fn retire_completed(

@@ -4384,15 +4384,23 @@ pub(crate) unsafe fn rearm_registered_delay_timer() -> nt_kernel_exec::TimerRear
 
 /// Scheduler completion may rearm the live owner, but cannot initialize a bootstrap timer.
 pub(crate) unsafe fn rearm_registered_active_delay_timer() {
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *const ExecNtHandler;
+    if !handler.is_null() {
+        rearm_registered_active_delay_timer_with_handler(&*handler);
+    }
+}
+
+/// Rearm from a native owner that already borrows the live handler. The broker must release
+/// its mutable state before deadline selection reads that same state.
+pub(crate) unsafe fn rearm_registered_active_delay_timer_with_handler(handler: &ExecNtHandler) {
     if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0
         || DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire) != DELAY_TIMER_IRQ_ACTIVE
     {
         return;
     }
-    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *const ExecNtHandler;
     let queue = SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) as *const nt_delay_execution::Queue;
-    if !handler.is_null() && !queue.is_null() {
-        delay_timer_rearm(&*queue, &*handler);
+    if !queue.is_null() {
+        delay_timer_rearm(&*queue, handler);
     }
 }
 
@@ -9383,11 +9391,13 @@ pub(crate) unsafe fn service_sec_image(
     nt_handler.seed_bootstrap_execution_role(primary_pi, primary_backing)
         .expect("primary execution root requires exact mounted File and live Ps identity");
     // Bootstrap and runtime retain one queue at the same address; registration cannot clear it.
+    // Keep only the stable owner address across nested driver dispatch. Direct queue loans below
+    // end at each call site; queue-taking helpers must return before the next nested rearm.
     let delay_queue = (&mut *core::ptr::addr_of_mut!(SERVICE_DELAY_QUEUE_WORK))
         .as_mut()
-        .expect("delay wait queue must be initialized before providers");
+        .expect("delay wait queue must be initialized before providers") as *mut nt_delay_execution::Queue;
     nt_handler.global_atoms = Some(crate::atom_bootstrap::take());
-    register_service_delay_drain_context(&mut nt_handler, delay_queue);
+    register_service_delay_drain_context(&mut nt_handler, &mut *delay_queue);
     // Bootstrap may already have armed the PIT. Reconcile the transferred deadlines
     // with the runtime owner before receiving; failed handoff must not strand work.
     let timer_handoff = rearm_registered_delay_timer();
@@ -9960,9 +9970,9 @@ pub(crate) unsafe fn service_sec_image(
             crate::native_srm_command_work::redrive(&mut nt_handler);
             alpc_reply_committed =
                 crate::native_alpc_send_receive_work::redrive(&mut nt_handler);
-            crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
-            crate::mutable_hive_mutation_work::redrive(&mut nt_handler, delay_queue);
-            crate::section_metadata_work::redrive(&mut nt_handler, delay_queue);
+            crate::registry_mutation_work::redrive(&mut nt_handler, &mut *delay_queue);
+            crate::mutable_hive_mutation_work::redrive(&mut nt_handler, &mut *delay_queue);
+            crate::section_metadata_work::redrive(&mut nt_handler, &mut *delay_queue);
             crate::section_pagein_work::redrive(&mut nt_handler);
             crate::provider_section_broker::redrive(nt_handler as *mut _);
             crate::provider_directory_broker::redrive(nt_handler as *mut _);
@@ -9988,9 +9998,9 @@ pub(crate) unsafe fn service_sec_image(
             crate::driver_launch::win32k_file_owners::redrive();
             crate::provider_file_wait::redrive(&mut nt_handler);
             crate::current_apc::redrive(&mut nt_handler);
-            crate::current_apc::redrive_terminated_runtimes(&mut nt_handler, delay_queue);
+            crate::current_apc::redrive_terminated_runtimes(&mut nt_handler, &mut *delay_queue);
             crate::object_wait_reply::redrive(&mut nt_handler);
-            crate::object_wait_reply::redrive_terminated_runtimes(&mut nt_handler, delay_queue);
+            crate::object_wait_reply::redrive_terminated_runtimes(&mut nt_handler, &mut *delay_queue);
             inline_file_retirement::redrive(&mut nt_handler);
         }
         if alpc_reply_committed.is_some() {
@@ -10072,7 +10082,7 @@ pub(crate) unsafe fn service_sec_image(
             let drained = if badge == DELAY_TIMER_BADGE {
                 0
             } else {
-                delay_timer_drain_overdue_without_badge(delay_queue, &mut nt_handler)
+                delay_timer_drain_overdue_without_badge(&mut *delay_queue, &mut nt_handler)
             };
             crate::LOOP_DRAIN_TICKS.fetch_add(
                 crate::disk_census_ticks().wrapping_sub(started),
@@ -10221,7 +10231,7 @@ pub(crate) unsafe fn service_sec_image(
                 || WINLOGON_DIALOG_FB_VERIFIED.load(Ordering::Relaxed) != 0
                 || WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0)
         {
-            crate::watchdog_arm(delay_queue, &nt_handler);
+            crate::watchdog_arm(&mut *delay_queue, &nt_handler);
         }
         // ★ DRAIN timer ticks a COMPONENT PUMP absorbed. The HPET notification is bound to the root
         // TCB, so it can cancel ANY blocking recv the executive makes — including `pump_recv`'s,
@@ -10232,20 +10242,20 @@ pub(crate) unsafe fn service_sec_image(
         let pump_ticks = DELAY_TIMER_TICKS_PENDING.swap(0, Ordering::Relaxed);
         if pump_ticks != 0 {
             PUMP_TIMER_TICKS_DRAINED.fetch_add(pump_ticks, Ordering::Relaxed);
-            delay_timer_interrupt(delay_queue, &mut nt_handler);
+            delay_timer_interrupt(&mut *delay_queue, &mut nt_handler);
             let _ = pump_hosted_io_and_redrive_driver_starts(
                 driver_launch::drain_hosted_driver_dpcs(),
                 &mut nt_handler,
             );
         }
         if badge == DELAY_TIMER_BADGE {
-            if delay_queue.len() != 0 && delay_queue.has_badge_other_than(badge) {
+            if (&*delay_queue).len() != 0 && (&*delay_queue).has_badge_other_than(badge) {
                 let progress = DELAY_OTHER_BADGE_PROGRESS.fetch_add(1, Ordering::Relaxed);
                 if progress < 8 {
                     print_str(
                         b"[delay] timer badge progressed while client waiter parked: queued=",
                     );
-                    print_u64(delay_queue.len() as u64);
+                    print_u64((&*delay_queue).len() as u64);
                     print_str(b"\n");
                 }
             }
@@ -10257,7 +10267,7 @@ pub(crate) unsafe fn service_sec_image(
                 print_hex_u64(m0);
                 print_str(b"\n");
             }
-            delay_timer_interrupt(delay_queue, &mut nt_handler);
+            delay_timer_interrupt(&mut *delay_queue, &mut nt_handler);
             let _ = pump_hosted_io_and_redrive_driver_starts(
                 driver_launch::drain_hosted_driver_dpcs(),
                 &mut nt_handler,
@@ -10295,13 +10305,13 @@ pub(crate) unsafe fn service_sec_image(
             m3 = received.5;
             continue;
         }
-        if delay_queue.len() != 0 && delay_queue.has_badge_other_than(badge) {
+        if (&*delay_queue).len() != 0 && (&*delay_queue).has_badge_other_than(badge) {
             let progress = DELAY_OTHER_BADGE_PROGRESS.fetch_add(1, Ordering::Relaxed);
             if progress < 8 {
                 print_str(b"[delay] unrelated badge progressed while waiter parked: badge=");
                 print_u64(badge);
                 print_str(b" queued=");
-                print_u64(delay_queue.len() as u64);
+                print_u64((&*delay_queue).len() as u64);
                 print_str(b"\n");
             }
         }
@@ -13492,7 +13502,7 @@ pub(crate) unsafe fn service_sec_image(
                         // The durable mutation owner already captured and rotated this Reply.
                         // STATUS_PENDING is internal state, never the syscall's terminal reply.
                         mark_wait_parked!(pi, resume_ip);
-                        crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
+                        crate::registry_mutation_work::redrive(&mut nt_handler, &mut *delay_queue);
                         let _ = finalize_service_loop_state(&mut nt_handler);
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
@@ -13506,7 +13516,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     if crate::mutable_hive_mutation_work::take_transferred() {
                         mark_wait_parked!(pi, resume_ip);
-                        crate::mutable_hive_mutation_work::redrive(&mut nt_handler, delay_queue);
+                        crate::mutable_hive_mutation_work::redrive(&mut nt_handler, &mut *delay_queue);
                         let _ = finalize_service_loop_state(&mut nt_handler);
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
@@ -13520,7 +13530,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     if crate::section_metadata_work::take_transferred() {
                         mark_wait_parked!(pi, resume_ip);
-                        crate::section_metadata_work::redrive(&mut nt_handler, delay_queue);
+                        crate::section_metadata_work::redrive(&mut nt_handler, &mut *delay_queue);
                         let _ = finalize_service_loop_state(&mut nt_handler);
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
@@ -13664,7 +13674,7 @@ pub(crate) unsafe fn service_sec_image(
                     job_terminations,
                     pi as u8,
                     post_action_process,
-                    delay_queue,
+                    &mut *delay_queue,
                     &mut nt_handler,
                 );
                 match post_action {
@@ -13729,7 +13739,7 @@ pub(crate) unsafe fn service_sec_image(
                         let reply_dropped = !apc_owned_terminating_reply
                             && drop_current_hosted_reply();
                         let mechanism_deleted =
-                            terminate_hosted_thread_mechanism(tid, delay_queue, &mut nt_handler);
+                            terminate_hosted_thread_mechanism(tid, &mut *delay_queue, &mut nt_handler);
                         if reply_dropped && mechanism_deleted {
                             PM_TERMINATE_THREAD_NO_REPLY.fetch_add(1, Ordering::Relaxed);
                         }
@@ -13764,7 +13774,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     ExecPostAction::TerminateRemoteThread { tid } => {
                         let _ =
-                            terminate_hosted_thread_mechanism(tid, delay_queue, &mut nt_handler);
+                            terminate_hosted_thread_mechanism(tid, &mut *delay_queue, &mut nt_handler);
                     }
                     ExecPostAction::TerminateProcess {
                         process_index,
@@ -13788,13 +13798,13 @@ pub(crate) unsafe fn service_sec_image(
                         let reclaimed = terminate_hosted_process_mechanisms(
                             process_index,
                             preserve_tid,
-                            delay_queue,
+                            &mut *delay_queue,
                             &mut nt_handler,
                         );
                         let current_deleted = if drop_reply && current_tid != 0 {
                             terminate_hosted_thread_mechanism(
                                 current_tid,
-                                delay_queue,
+                                &mut *delay_queue,
                                 &mut nt_handler,
                             )
                         } else {
@@ -14028,11 +14038,11 @@ pub(crate) unsafe fn service_sec_image(
                         &nt_handler.time_zone_information,
                         nt_system_time_100ns(),
                     );
-                    let _ = delay_timer_rearm_and_drain_overdue(delay_queue, &mut nt_handler);
+                    let _ = delay_timer_rearm_and_drain_overdue(&mut *delay_queue, &mut nt_handler);
                 } else if nt_handler.user_timer_rearm_requested
                     || nt_handler.job_time_rearm_requested
                 {
-                    delay_timer_rearm(delay_queue, &nt_handler);
+                    delay_timer_rearm(&*delay_queue, &nt_handler);
                 }
                 park_lpc_receive = nt_handler.lpc_receive_park.take();
                 park_lpc_connect = nt_handler.lpc_connect_park.take();
@@ -19030,7 +19040,7 @@ pub(crate) unsafe fn service_sec_image(
                     park_io_completion_iosb_out,
                     park_io_completion_deadline,
                 ) {
-                    delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
+                    delay_timer_rearm_after_park(&mut *delay_queue, &mut nt_handler, timed);
                     print_str(b"[io-completion] pi=");
                     print_u64(pi as u64);
                     print_str(b" port=");
@@ -19066,7 +19076,7 @@ pub(crate) unsafe fn service_sec_image(
                 let delay_tid = nt_handler.current_tid;
                 if delay_park(
                     &mut nt_handler,
-                    delay_queue,
+                    &mut *delay_queue,
                     deadline,
                     reply_main,
                     delay_tid,
@@ -19091,7 +19101,7 @@ pub(crate) unsafe fn service_sec_image(
                 if timed && !delay_timer_init() {
                     result = nt_fs::STATUS_INSUFFICIENT_RESOURCES as u64;
                 } else if thread_alert::park(&mut nt_handler, deadline, reply_main) {
-                    delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
+                    delay_timer_rearm_after_park(&mut *delay_queue, &mut nt_handler, timed);
                     thread_alert::redrive(&mut nt_handler);
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -19119,7 +19129,7 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.current_tid,
                     park_keyed_release_wait_deadline,
                 ) {
-                    delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
+                    delay_timer_rearm_after_park(&mut *delay_queue, &mut nt_handler, timed);
                     print_str(b"[keyed] NtReleaseKeyedEvent key=0x");
                     print_hex_u64(park_keyed_release_wait_key);
                     print_str(b" -> PARK releaser\n");
@@ -19161,7 +19171,7 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.current_tid,
                     park_keyed_wait_deadline,
                 ) {
-                    delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
+                    delay_timer_rearm_after_park(&mut *delay_queue, &mut nt_handler, timed);
                     print_str(b"[keyed] NtWaitForKeyedEvent key=0x");
                     print_hex_u64(park_keyed_wait_key);
                     print_str(b" -> PARK caller\n");
@@ -19237,7 +19247,7 @@ pub(crate) unsafe fn service_sec_image(
                 ) {
                     let current_tid = nt_handler.current_tid;
                     let wait_still_parked = wait_recheck_after_park(&mut nt_handler, current_tid);
-                    delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
+                    delay_timer_rearm_after_park(&mut *delay_queue, &mut nt_handler, timed);
                     if winlogon_worker_can_signal && wait_still_parked {
                         WINLOGON_MAIN_EVENT_WAIT_PARKED.store(1, Ordering::Relaxed);
                         print_str(b"[wl-main] parked on worker-ready event; runnable worker remains a signaler\n");
@@ -19284,7 +19294,7 @@ pub(crate) unsafe fn service_sec_image(
                 ) {
                     let current_tid = nt_handler.current_tid;
                     let wait_still_parked = wait_recheck_after_park(&mut nt_handler, current_tid);
-                    delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
+                    delay_timer_rearm_after_park(&mut *delay_queue, &mut nt_handler, timed);
                     if DEBUG_TRACE {
                         print_str(b"[wait] pi=");
                         print_u64(pi as u64);
@@ -21671,7 +21681,7 @@ pub(crate) unsafe fn service_sec_image(
 
         // The hosted receive loop is finished and has no delay waiter outstanding. Disable timer 0
         // and unbind its notification so a stale HPET signal cannot intercept later self-test recvs.
-        delay_timer_shutdown(delay_queue, &nt_handler);
+        delay_timer_shutdown(&mut *delay_queue, &nt_handler);
         clear_service_delay_drain_context();
 
         // === Dbgk TARGET-SIDE BLOCKING SELF-TEST (POST-LOOP) — the keystone deferred item ==========
@@ -22841,7 +22851,7 @@ pub(crate) unsafe fn service_sec_image(
                         crate::object_wait_reply::redrive(&mut nt_handler);
                         crate::object_wait_reply::redrive_terminated_runtimes(
                             &mut nt_handler,
-                            delay_queue,
+                            &mut *delay_queue,
                         );
                         debugger_resources_settled = !object_waiter_contains_tid(u64::from(tid));
                         if debugger_runtime_registered
