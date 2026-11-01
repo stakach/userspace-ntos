@@ -1870,7 +1870,7 @@ unsafe fn pump_reply_recv4(
     reply_r2: u64,
     reply_r3: u64,
 ) -> PumpMessage {
-    pump_reply_recv4_traced(ch, reply_cap, reply_msginfo, reply_r0, reply_r1, reply_r2, reply_r3, None)
+    pump_reply_recv4_traced(ch, reply_cap, reply_msginfo, reply_r0, reply_r1, reply_r2, reply_r3, None, false)
 }
 
 unsafe fn pump_reply_recv4_traced(
@@ -1882,12 +1882,27 @@ unsafe fn pump_reply_recv4_traced(
     reply_r2: u64,
     reply_r3: u64,
     power_report_badge: Option<u64>,
+    trace_system_thread_reply: bool,
 ) -> PumpMessage {
     if let Some(badge) = power_report_badge {
         crate::driver_launch::trace_report_rpc(b"reply-send", reply_cap, badge, reply_r0 as u32 as i32, reply_r1);
     }
     crate::driver_launch::trace_port_connect_pump_boundary(1, ch, reply_cap, reply_r0);
+    if trace_system_thread_reply {
+        crate::print_str(b"[driver-thread-reply] enter tcb=");
+        crate::print_u64(ch.tcb);
+        crate::print_str(b" reply=");
+        crate::print_u64(reply_cap);
+        crate::print_str(b" status=0x");
+        crate::print_hex(reply_r0 as u32);
+        crate::print_str(b"\n");
+    }
     let sent = shared_pump::reply(ch, reply_cap, reply_msginfo, [reply_r0, reply_r1, reply_r2, reply_r3]);
+    if trace_system_thread_reply {
+        crate::print_str(b"[driver-thread-reply] sent=");
+        crate::print_u64(u64::from(sent));
+        crate::print_str(b"\n");
+    }
     crate::driver_launch::trace_port_connect_pump_boundary(2, ch, reply_cap, u64::from(sent));
     if let Some(badge) = power_report_badge {
         crate::driver_launch::trace_report_rpc(
@@ -1911,6 +1926,9 @@ unsafe fn pump_reply_recv4_traced(
         && crate::dispatcher_bootstrap::timer_work_pending()
     {
         return PumpMessage::scheduler_yield();
+    }
+    if trace_system_thread_reply {
+        crate::print_str(b"[driver-thread-reply] receive-next\n");
     }
     pump_recv(ch, reply_cap)
 }
@@ -3547,7 +3565,9 @@ unsafe fn component_pump_loop(
                 crate::driver_launch::service_hosted_driver_ps_create_system_thread(
                     ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.m4, msg.badge, *reply_cap,
                 );
-            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, handle, 0, 0);
+            msg = pump_reply_recv4_traced(
+                ch, *reply_cap, 2, status as u32 as u64, handle, 0, 0, None, true,
+            );
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL
             && ch.caps.kind == ReqKind::Irp
@@ -4371,7 +4391,7 @@ unsafe fn component_pump_loop(
                 );
                 msg = pump_reply_recv4_traced(
                     ch, *reply_cap, 4, status as u32 as u64,
-                    required_len, transfer_token, chunk_len, Some(msg.badge),
+                    required_len, transfer_token, chunk_len, Some(msg.badge), false,
                 );
             } else {
                 pump_reply_recv4_into!(
