@@ -1,6 +1,7 @@
 # Lessons
 
 ## Delegate Bounded Boot Monitoring
+- One hour is an absolute safety ceiling, not a useful default run length. If a short probe shows unchanged substantive boot markers and no meaningful guest work, stop within minutes, capture the owner state, and investigate before another boot. Diagnostic serial output alone is not progress.
 - Treat an hour-long boot that is still in device installation as a performance defect even when counters and progress text move. Require measured throughput and a specific diagnostic question before another long run; use short bounded probes to localize the cost, then a RED regression and source fix before repeating full acceptance.
 - Assign a read-only agent to monitor each long graphical boot and report only new frontier or failure evidence with log lines and timing. Keep one owner for QEMU, builds, tests, and disk images.
 - Diagnostic code running inside an isolated provider pump may read only pump-owned state. A root-owned heap-backed lookup, even for logging, can page fault the provider; carry bounded metadata across the ownership boundary or correlate receipts offline.

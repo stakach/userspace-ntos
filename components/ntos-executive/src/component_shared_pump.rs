@@ -13,9 +13,32 @@ static IRQ_IRP_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static IRQ_SYSCALL_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static IRQ_RETAINED_SEH_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static PS_CREATE_RECEIVE_TRACE: AtomicU64 = AtomicU64::new(0);
+static PS_CREATE_RECEIVE_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn begin_ps_create_receive_trace() {
     PS_CREATE_RECEIVE_TRACE.store(1, Ordering::Relaxed);
+    PS_CREATE_RECEIVE_EVENTS.store(0, Ordering::Relaxed);
+}
+
+fn trace_ps_create_event(stage: &[u8], route: PeerRoute, reply: u64, info: u64) {
+    if PS_CREATE_RECEIVE_TRACE.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let sequence = PS_CREATE_RECEIVE_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence > 8 && !sequence.is_power_of_two() {
+        return;
+    }
+    crate::print_str(b"[ps-create-event] #");
+    crate::print_u64(sequence);
+    crate::print_str(b" stage=");
+    crate::print_str(stage);
+    crate::print_str(b" route=");
+    crate::print_u64(route.badge());
+    crate::print_str(b" reply=");
+    crate::print_u64(reply);
+    crate::print_str(b" label=");
+    crate::print_u64(info >> 12);
+    crate::print_str(b"\n");
 }
 
 fn trace_ps_create_receive(ch: &PumpChannel, stage: &[u8], route: Option<PeerRoute>) {
@@ -218,6 +241,7 @@ pub(super) unsafe fn receive(
             }
         };
         if let Some((reply, message)) = next {
+            trace_ps_create_event(b"parent-message", route, reply, message.info());
             let completion = message.info() >> 12 == ch.dispatch_label;
             if !completion && runtime::adopt(route, reply).is_err() {
                 crate::print_str(b"[pump-ingress] Call adoption failed\n");
@@ -235,6 +259,9 @@ pub(super) unsafe fn receive(
             trace_ps_create_receive(ch, b"autonomous-select", Some(route));
             match runtime::next_autonomous() {
                 Ok(Some(sender)) => {
+                    if let Ok(Some((reply, info))) = runtime::pending_route_snapshot(sender) {
+                        trace_ps_create_event(b"autonomous-message", sender, reply, info);
+                    }
                     trace_ps_create_receive(ch, b"autonomous-found", Some(sender));
                     service_autonomous(sender)
                         .expect("autonomous failure retains its own source and parent scope");
@@ -278,10 +305,12 @@ pub(super) unsafe fn receive(
         trace_ps_create_receive(ch, b"physical-receive", Some(route));
         let arrival = runtime::receive(execution, ch.tcb,
             serviced_scheduler_yield || !timer_checkpoint);
-        trace_ps_create_receive(ch, b"physical-return", Some(route));
         match arrival {
-            Ok(runtime::Arrival::Hosted) => {}
-            Ok(runtime::Arrival::Call { .. }) => {
+            Ok(runtime::Arrival::Hosted) => {
+                trace_ps_create_event(b"hosted-arrival", route, 0, 0);
+            }
+            Ok(runtime::Arrival::Call { route: sender, reply }) => {
+                trace_ps_create_event(b"call-arrival", sender, reply, 0);
                 // The coordinator retains unrelated Calls for their exact source. Inspect only
                 // this invocation's stored arrival on the next pass.
             }
