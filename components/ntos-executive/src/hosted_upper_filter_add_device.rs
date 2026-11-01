@@ -63,15 +63,9 @@ unsafe fn attach_one(
     instance_path: &str,
     claim: nt_pnp_manager::UpperFilterAttachmentClaim,
 ) -> Result<(), nt_status::NtStatus> {
-    hosted_upper_filter_projection::trace_filter_stage(0x01, 0);
     let projection = hosted_upper_filter_projection::prepare(instance_path, claim)?;
-    hosted_upper_filter_projection::trace_filter_stage(0x02, 0);
     let owner_id = projection.owner_id;
     let result = attach_prepared(owner_id, claim);
-    hosted_upper_filter_projection::trace_filter_stage(
-        0x03,
-        result.as_ref().err().map_or(0, |status| status.raw() as u32),
-    );
     if result.is_err() {
         hosted_upper_filter_projection::block_uncertain(owner_id);
     }
@@ -89,7 +83,6 @@ unsafe fn attach_prepared(
     let class_instance = route.map_or(index, |route| route.provider_instance);
     let class_inst = instance(class_instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     let prepared = hosted_upper_filter_projection::begin_local_chain(owner_id)?;
-    hosted_upper_filter_projection::trace_filter_stage(0x04, 0);
     if instance_domain_identity(class_inst) != Some(prepared.class_domain) {
         return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
     }
@@ -104,7 +97,6 @@ unsafe fn attach_prepared(
         caller,
     )?;
     hosted_upper_filter_projection::complete_local_chain(owner_id, observed_pdo)?;
-    hosted_upper_filter_projection::trace_filter_stage(0x05, 0);
     let mut rollback = Some(hosted_add_device_rollback::reserve(
         class_instance,
         prepared.class_domain,
@@ -121,7 +113,6 @@ unsafe fn attach_prepared(
     let result = (|| -> Result<(), nt_status::NtStatus> {
         hosted_add_device_rollback::begin_dispatch(rollback.as_ref().unwrap());
         hosted_upper_filter_projection::begin_add_device(owner_id)?;
-        hosted_upper_filter_projection::trace_filter_stage(0x06, 0);
         let dispatch =
             match dispatch_add_device_for_instance(index, inst, prepared.pdo_object, caller) {
                 Ok(dispatch) => dispatch,
@@ -130,72 +121,50 @@ unsafe fn attach_prepared(
                     return Err(status);
                 }
             };
-        hosted_upper_filter_projection::trace_filter_stage(0x07, dispatch.status.raw() as u32);
         hosted_add_device_rollback::completed_dispatch(rollback.as_ref().unwrap(), &dispatch);
         dispatch.status.to_result()?;
         if dispatch.pdo_object != prepared.pdo_object
             || dispatch.fdo_object != prepared.lower_object
         {
-            hosted_upper_filter_projection::trace_filter_stage(0x30, 1);
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
         let pdo = nt_io_manager::DeviceId(claim.key().child().pdo_object_id());
         let fdo = io_manager_mut()
             .top_of_device_stack(pdo)
-            .map_err(|_| {
-                hosted_upper_filter_projection::trace_filter_stage(0x31, 1);
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST
-            })?;
+            .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
         if fdo.raw() == claim.lower_device()
             || !io_manager_mut().device(fdo).is_some_and(|device| {
                 device.driver_id == DriverId(claim.driver_id())
                     && device.attached_to == Some(nt_io_manager::DeviceId(claim.lower_device()))
             })
         {
-            hosted_upper_filter_projection::trace_filter_stage(0x30, 2);
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
         let fdo_address = io_manager_mut()
             .hosted_device_address_by_identity(prepared.class_domain, fdo)
-            .ok_or_else(|| {
-                hosted_upper_filter_projection::trace_filter_stage(0x31, 2);
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST
-            })?;
-        let registration = hosted_device_pointer_registration(
-            prepared.class_domain,
-            fdo_address,
-            fdo,
-        )
-        .map_err(|status| {
-            hosted_upper_filter_projection::trace_filter_stage(0x31, 3);
-            status
-        })?;
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        let registration =
+            hosted_device_pointer_registration(prepared.class_domain, fdo_address, fdo)?;
         if !hosted_add_device_rollback::owns_created_registration(
             rollback.as_ref().unwrap(),
             registration,
         ) {
-            hosted_upper_filter_projection::trace_filter_stage(0x30, 4);
             return Err(nt_status::NtStatus::INVALID_HANDLE);
         }
-        validate_and_sync_hosted_device_projection(
+        validate_and_sync_hosted_upper_filter_device_projection(
             class_inst,
             prepared.class_domain,
             fdo_address,
             fdo,
             DriverId(claim.driver_id()),
             dispatch.driver_object,
-        )
-        .map_err(|status| {
-            hosted_upper_filter_projection::trace_filter_stage(0x31, 4);
-            status
-        })?;
-        hosted_upper_filter_projection::complete_add_device(owner_id, registration).map_err(
-            |status| {
-                hosted_upper_filter_projection::trace_filter_stage(0x31, 5);
-                status
+            HostedUpperFilterTypeProof {
+                source: registration,
+                pdo: prepared.pdo_registration,
+                lower: prepared.lower_registration,
             },
         )?;
-        hosted_upper_filter_projection::trace_filter_stage(0x08, 0);
+        hosted_upper_filter_projection::complete_add_device(owner_id, registration)?;
         transferred = true;
         ledger()
             .complete(

@@ -50503,6 +50503,13 @@ pub(crate) fn lookup_io_handle_file(
     Ok((file.raw(), device.raw(), object.0))
 }
 
+#[derive(Clone, Copy)]
+struct HostedUpperFilterTypeProof {
+    source: nt_io_manager::HostedDevicePointerRegistration,
+    pdo: nt_io_manager::HostedDevicePointerRegistration,
+    lower: nt_io_manager::HostedDevicePointerRegistration,
+}
+
 unsafe fn validate_and_sync_hosted_device_projection(
     inst: DriverInstance,
     domain: HostedDomainIdentity,
@@ -50510,6 +50517,35 @@ unsafe fn validate_and_sync_hosted_device_projection(
     device_id: nt_io_manager::DeviceId,
     expected_driver: DriverId,
     expected_driver_object: u64,
+) -> Result<(), nt_status::NtStatus> {
+    validate_and_sync_hosted_device_projection_with_type(
+        inst, domain, device_object, device_id, expected_driver, expected_driver_object, None,
+    )
+}
+
+unsafe fn validate_and_sync_hosted_upper_filter_device_projection(
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    device_object: u64,
+    device_id: nt_io_manager::DeviceId,
+    expected_driver: DriverId,
+    expected_driver_object: u64,
+    proof: HostedUpperFilterTypeProof,
+) -> Result<(), nt_status::NtStatus> {
+    validate_and_sync_hosted_device_projection_with_type(
+        inst, domain, device_object, device_id, expected_driver, expected_driver_object,
+        Some(proof),
+    )
+}
+
+unsafe fn validate_and_sync_hosted_device_projection_with_type(
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    device_object: u64,
+    device_id: nt_io_manager::DeviceId,
+    expected_driver: DriverId,
+    expected_driver_object: u64,
+    upper_filter: Option<HostedUpperFilterTypeProof>,
 ) -> Result<(), nt_status::NtStatus> {
     let (extension_size, device_type, characteristics, driver_id) = {
         let record = io_manager_mut()
@@ -50523,7 +50559,6 @@ unsafe fn validate_and_sync_hosted_device_projection(
         )
     };
     if driver_id != expected_driver {
-        hosted_upper_filter_projection::trace_filter_stage(0x32, 1);
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let _guard = hosted_instance_pool_lock(inst.exec_pool_va)
@@ -50548,26 +50583,37 @@ unsafe fn validate_and_sync_hosted_device_projection(
         || read_unaligned((device_exec + kernel_offset) as *const u16) != 13
         || read_unaligned((device_exec + kernel_offset + 2) as *const u16) != 0
         || read_unaligned((device_exec + kernel_offset + 8) as *const u64) != device_object
+        || (upper_filter.is_none()
+            && read_unaligned((device_exec + 0x48) as *const u32) != device_type.0)
+        || read_unaligned((device_exec + 0x34) as *const u32) != characteristics.bits()
     {
-        hosted_upper_filter_projection::trace_filter_stage(0x32, 2);
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-    }
-    if read_unaligned((device_exec + 0x48) as *const u32) != device_type.0 {
-        hosted_upper_filter_projection::trace_filter_stage(0x32, 3);
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-    }
-    if read_unaligned((device_exec + 0x34) as *const u32) != characteristics.bits() {
-        hosted_upper_filter_projection::trace_filter_stage(0x32, 4);
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     if io_manager_mut().hosted_device_by_identity(domain, device_object) != Some(device_id) {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
+    let observed_type = nt_io_manager::DeviceType(read_unaligned((device_exec + 0x48) as *const u32));
+    let admitted_type = if let Some(proof) = upper_filter {
+        if proof.source.domain() != domain
+            || proof.source.address() != device_object
+            || proof.source.device_id() != device_id
+        {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        io_manager_mut().admitted_hosted_upper_filter_device_type(
+            proof.source, proof.pdo, proof.lower, observed_type,
+        )?
+    } else {
+        if observed_type != device_type {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        device_type
+    };
     let flags = DeviceFlags::from_bits_retain(read_unaligned((device_exec + 0x30) as *const u32));
-    io_manager_mut()
-        .device_mut(device_id)
-        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?
-        .flags = flags;
+    let record = io_manager_mut().device_mut(device_id)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    record.device_type = admitted_type;
+    record.flags = flags;
     Ok(())
 }
 
