@@ -12878,7 +12878,28 @@ extern "win64" fn s_dma_get_scatter_gather_list(
             return status;
         }
 
+        let trace_capacity_data = length == 32 && write_to_device == 0
+            && current_va >= FSD_POOL_VADDR
+            && current_va.checked_add(12).is_some_and(|end| end <= component_pool_end());
+        if trace_capacity_data {
+            print_str(b"[provider-capacity-sg] before va/last-lba/sector-bytes=");
+            print_u64(current_va);
+            print_str(b"/");
+            print_u64(u64::from_be(read_unaligned(current_va as *const u64)));
+            print_str(b"/");
+            print_u64(u32::from_be(read_unaligned((current_va + 8) as *const u32)) as u64);
+            print_str(b"\n");
+        }
         call_hosted_pe(execution_routine, &[device_object, 0, sg_list, context]);
+        if trace_capacity_data {
+            print_str(b"[provider-capacity-sg] after va/last-lba/sector-bytes=");
+            print_u64(current_va);
+            print_str(b"/");
+            print_u64(u64::from_be(read_unaligned(current_va as *const u64)));
+            print_str(b"/");
+            print_u64(u32::from_be(read_unaligned((current_va + 8) as *const u32)) as u64);
+            print_str(b"\n");
+        }
         trace_hosted_dma_sg(
             b"get",
             b"routine-returned",
