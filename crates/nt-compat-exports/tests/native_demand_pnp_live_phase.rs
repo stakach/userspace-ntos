@@ -21,7 +21,7 @@ fn all_registry_pnp_launch_occurs_after_live_file_handler_registration() {
         "no registry PnP DriverEntry may run before the live handler");
 
     let live = SERVICE
-        .split("register_service_delay_drain_context(&mut nt_handler, delay_queue);")
+        .split("register_service_delay_drain_context(&mut nt_handler, &mut *delay_queue);")
         .nth(1)
         .expect("live handler registration");
     let demand = live.find("launch_live_pnp_plans(")

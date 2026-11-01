@@ -81,7 +81,7 @@ fn make_temporary_routes_driver_op15_through_retained_canonical_effect() {
         .find("pub(crate) unsafe fn dispatch(")
         .expect("provider directory dispatch")..];
     let op15 = dispatch
-        .find("if op == 7 || op == 15")
+        .find("7 | 15 => broker.submit_effect(")
         .expect("make-temporary and close enter retained effect dispatch");
     let ordinary = dispatch
         .find("match broker.dispatch(")

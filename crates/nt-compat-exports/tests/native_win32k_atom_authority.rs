@@ -79,7 +79,7 @@ fn early_kernel_atoms_use_the_same_table_as_runtime_calls() {
         "hosted callers must not access the bootstrap table");
     let transfer = service.find("atom_bootstrap::take()")
         .expect("the original atom allocation must move into the live handler");
-    let publish = service.find("register_service_delay_drain_context(&mut nt_handler, delay_queue)")
+    let publish = service.find("register_service_delay_drain_context(&mut nt_handler, &mut *delay_queue)")
         .expect("handler publication");
     assert!(transfer < publish);
     let executive = include_str!("../../../components/ntos-executive/src/main.rs");
