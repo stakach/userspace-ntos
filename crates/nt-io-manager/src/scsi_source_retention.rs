@@ -36,6 +36,21 @@ pub enum ScsiSrbSource {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScsiStackAccess {
+    RetainedThroughAck,
+    SourceCopyback,
+}
+
+/// The native adapter proves physical thread/stack identity separately. This rule decides
+/// whether that same physical stack must still be on its original retained Reply.
+pub fn scsi_stack_reply_admits(access: ScsiStackAccess, original_reply_current: bool) -> bool {
+    match access {
+        ScsiStackAccess::RetainedThroughAck => true,
+        ScsiStackAccess::SourceCopyback => original_reply_current,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScsiSourceRetentionError {
     Invalid,
     AlreadyOwned,
@@ -515,6 +530,19 @@ mod tests {
                 Err(ScsiSourceRetentionError::Invalid),
             );
         }
+    }
+
+    #[test]
+    fn stack_owner_survives_successor_ack_reply_but_copyback_requires_original_reply() {
+        assert!(scsi_stack_reply_admits(
+            ScsiStackAccess::RetainedThroughAck, false,
+        ));
+        assert!(!scsi_stack_reply_admits(
+            ScsiStackAccess::SourceCopyback, false,
+        ));
+        assert!(scsi_stack_reply_admits(
+            ScsiStackAccess::SourceCopyback, true,
+        ));
     }
 
     #[test]

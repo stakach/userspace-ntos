@@ -13,6 +13,7 @@ use nt_io_manager::retained_connect_forward::{
     ConnectForwardIdentity, ConnectForwardPhase, ConnectStackRange, RetainedConnectForward,
 };
 use nt_io_manager::source_irp_ledger::SourceIrpForwardIdentity;
+use nt_io_manager::scsi_source_retention::{scsi_stack_reply_admits, ScsiStackAccess};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SourceStackLeaseId(usize);
@@ -291,8 +292,11 @@ pub(crate) unsafe fn scsi_matches(
         && row.source == StackLeaseSource::Scsi(source)
         && row.range == range
         && checked_stack_range(range.base, range.bytes, pointer, 0x58).is_some()
-        && runtime::dispatch(row.route).ok() == Some(row.dispatch)
-        && runtime::current_reply(row.route).ok() == Some(row.reply)
+        && scsi_stack_reply_admits(
+            ScsiStackAccess::RetainedThroughAck,
+            runtime::dispatch(row.route).ok() == Some(row.dispatch)
+                && runtime::current_reply(row.route).ok() == Some(row.reply),
+        )
         && runtime::physical_source(row.route).ok().is_some_and(|physical| {
             physical.domain == PhysicalDomain::Hosted(range.domain)
                 && match row.owner {
@@ -312,7 +316,6 @@ pub(crate) unsafe fn scsi_matches(
                                 worker.construction == construction
                                     && worker.handle == range.thread
                                     && worker.ingress_route == Some(row.route)
-                                    && worker.reply_cap == row.reply
                                     && worker.tcb == physical.tcb
                                     && worker.pml4 == physical.pml4
                                     && hosted_thread_resources::stack_live(worker)
@@ -345,6 +348,11 @@ pub(crate) unsafe fn scsi_can_write(
 ) -> bool {
     if !scsi_matches(id, source, range, pointer) { return false; }
     let row = &mut (&mut *core::ptr::addr_of_mut!(LEASES))[id.0];
+    let original_reply_current = runtime::dispatch(row.route).ok() == Some(row.dispatch)
+        && runtime::current_reply(row.route).ok() == Some(row.reply);
+    if !scsi_stack_reply_admits(
+        ScsiStackAccess::SourceCopyback, original_reply_current,
+    ) { return false; }
     let unchanged = row.snapshot.iter().enumerate().all(|(index, original)| {
         core::ptr::read_volatile((row.exec_va + index as u64) as *const u8) == *original
     });
