@@ -567,9 +567,15 @@ fn write_existing_gpt<S: SectorIo>(
     let source_primary = primary.is_ok();
     let (source, source_sector, mut table) = match primary {
         Ok(copy) => copy,
-        Err(_) => match &backup {
+        Err(primary_error) => match &backup {
             Ok((header, sector, table)) => (*header, sector.clone(), table.clone()),
-            Err(_) => return Err(MutationError::InvalidLayout),
+            Err(_) => {
+                return Err(if matches!(&primary_error, MutationError::Io(_)) {
+                    primary_error
+                } else {
+                    backup.err().unwrap()
+                });
+            }
         },
     };
     if partitions.len() > source.partition_entry_count as usize {
@@ -1089,5 +1095,31 @@ mod tests {
         })
         .unwrap();
         assert_eq!(&reread[80..96], &[0x55; 16]);
+    }
+
+    #[test]
+    fn full_gpt_write_preserves_header_read_io_failure() {
+        struct FailedReads;
+        impl SectorIo for FailedReads {
+            type Error = u32;
+            fn read_sector(&mut self, _: u64, _: &mut [u8]) -> Result<(), Self::Error> {
+                Err(0xc000_0185)
+            }
+            fn write_sector(&mut self, _: u64, _: &[u8]) -> Result<(), Self::Error> {
+                panic!("metadata must not be written after failed header reads")
+            }
+        }
+        let mut layout = vec![0u8; 48 + 144];
+        layout[0..4].copy_from_slice(&1u32.to_le_bytes());
+        layout[4..8].copy_from_slice(&1u32.to_le_bytes());
+        layout[48..52].copy_from_slice(&1u32.to_le_bytes());
+        layout[56..64].copy_from_slice(&(40u64 * 512).to_le_bytes());
+        layout[64..72].copy_from_slice(&(16u64 * 512).to_le_bytes());
+        layout[80..96].fill(0x11);
+        layout[96..112].fill(0x22);
+        assert_eq!(
+            write_drive_layout_ex(&mut FailedReads, 512, 128, &layout),
+            Err(MutationError::Io(0xc000_0185)),
+        );
     }
 }
