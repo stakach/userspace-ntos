@@ -74,5 +74,22 @@ pub(super) unsafe fn capture_completion(
     { return false; }
     let packet_slice = core::slice::from_raw_parts_mut(packet as *mut u8, packet_len as usize);
     let srb_slice = core::slice::from_raw_parts(srb as *const u8, WDM_X64_LEGACY_SRB_SIZE);
-    capture_scsi_completion_in_place(packet_slice, route, irp_id, srb_slice).is_ok()
+    let captured = capture_scsi_completion_in_place(packet_slice, route, irp_id, srb_slice).is_ok();
+    static CAPACITY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+    if captured && packet_slice.len() >= 64 + WDM_X64_LEGACY_SRB_SIZE + 12
+        && srb_slice[0x48] == 0x9e && srb_slice[0x49] == 0x10
+        && CAPACITY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 4
+    {
+        let data = &packet_slice[64 + WDM_X64_LEGACY_SRB_SIZE..];
+        print_str(b"[provider-scsi-capacity] data-pointer/expected/last-lba/sector-bytes=");
+        print_u64(read_unaligned((srb + 0x18) as *const u64));
+        print_str(b"/");
+        print_u64(packet + (64 + WDM_X64_LEGACY_SRB_SIZE) as u64);
+        print_str(b"/");
+        print_u64(u64::from_be_bytes(data[0..8].try_into().unwrap()));
+        print_str(b"/");
+        print_u64(u32::from_be_bytes(data[8..12].try_into().unwrap()) as u64);
+        print_str(b"\n");
+    }
+    captured
 }
