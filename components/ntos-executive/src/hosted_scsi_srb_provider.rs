@@ -100,7 +100,7 @@ pub(super) unsafe fn prepare(
 /// published in the completion buffer, including on a failing SCSI status with sense bytes.
 pub(super) unsafe fn capture_completion(
     route: ScsiSrbRoute, irp_id: IrpId, packet: u64, packet_len: u64, srb: u64,
-    dma_receipt: Option<ScsiDmaReceipt>,
+    dma_receipt: Option<ScsiDmaReceipt>, status: u32,
 ) -> bool {
     if packet == 0 || srb == 0 || packet_len > usize::MAX as u64
         || component_pool_allocation_capacity(packet).is_none_or(|cap| cap < packet_len)
@@ -128,7 +128,6 @@ pub(super) unsafe fn capture_completion(
         core::ptr::copy_nonoverlapping(grant_va as *const u8,
             data_pointer as *mut u8, transferred as usize);
     } else if dma_receipt.is_some()
-        || read_unaligned((srb + 0x18) as *const u64) != 0
     {
         if claim {
             trace_claim_completion(
@@ -137,7 +136,9 @@ pub(super) unsafe fn capture_completion(
         }
         return false;
     }
-    let captured = capture_scsi_completion_in_place(packet_slice, route, irp_id, srb_slice).is_ok();
+    let captured = capture_scsi_completion_in_place(
+        packet_slice, route, irp_id, srb_slice, status as i32,
+    ).is_ok();
     if claim {
         trace_claim_completion(
             if captured { 3 } else { 4 }, srb_slice[3],

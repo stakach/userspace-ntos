@@ -9,7 +9,7 @@ use super::hosted_source_pool_memory::SourcePoolMemory;
 use nt_io_manager::{
     hosted_forward_target::HostedForwardTarget, retained_query_path_forward::SourceIrpTicket,
     scsi_source_retention::ScsiSourceChildren,
-    scsi_srb_transport::{merge_provider_legacy_srb, sanitized_legacy_srb, ScsiSrbRoute, WDM_X64_LEGACY_SRB_SIZE},
+    scsi_srb_transport::{merge_provider_legacy_srb, project_claim_source_alias, sanitized_legacy_srb, ScsiSrbRoute, WDM_X64_LEGACY_SRB_SIZE},
     source_irp_ledger::{SourceIrpAllocation, SourceIrpForwardIdentity}, HostedDomainIdentity,
 };
 use nt_pnp_manager::AcceptedPdoProviderAuthority;
@@ -26,6 +26,7 @@ pub(super) enum CaptureError {
 pub(super) struct CapturedSourceScsi {
     instance_index: usize,
     source: SourceIrpAllocation,
+    source_pdo_alias: u64,
     ticket: SourceIrpTicket,
     target: Option<HostedForwardTarget>,
     authority: AcceptedPdoProviderAuthority,
@@ -93,6 +94,7 @@ impl CapturedSourceScsi {
     /// pointer slots remain the captured source addresses, never provider addresses.
     pub(super) unsafe fn write_completion(
         &self, provider_srb: &[u8], data: &[u8], sense: &[u8],
+        claim_result: bool, status: i32,
     ) -> Result<(), CaptureError> {
         self.validate_retained()?;
         if data.len() != self.data.len()
@@ -100,10 +102,21 @@ impl CapturedSourceScsi {
         {
             return Err(CaptureError::InvalidSrb);
         }
-        let merged = merge_provider_legacy_srb(
+        if provider_srb.get(2).copied() != self.srb_function()
+            || (claim_result && status != STATUS_SUCCESS)
+        { return Err(CaptureError::InvalidSrb); }
+        if claim_result {
+            let target = self.target.as_ref().ok_or(CaptureError::InvalidTarget)?;
+            if target.validate(io_manager_mut()).ok() != Some(self.children.route.pdo)
+                || target.registration().address() != self.source_pdo_alias
+            { return Err(CaptureError::InvalidTarget); }
+        }
+        let mut merged = merge_provider_legacy_srb(
             &self.srb, provider_srb, data.len(), sense.len(),
         )
         .map_err(|_| CaptureError::InvalidSrb)?;
+        project_claim_source_alias(&mut merged, claim_result, self.source_pdo_alias)
+            .map_err(|_| CaptureError::InvalidSrb)?;
         let inst = instance(self.instance_index).ok_or(CaptureError::InvalidSource)?;
         let memory = SourcePoolMemory::new(inst).ok_or(CaptureError::InvalidSource)?;
         let data_address = match self.children.data {
@@ -342,6 +355,7 @@ pub(super) unsafe fn capture(
             Ok((authority, children, srb, mdl, data, sense, stack_lease)) => Ok(CapturedSourceScsi {
                 instance_index,
                 source,
+                source_pdo_alias: target_device_address,
                 ticket,
                 target: Some(target),
                 authority,

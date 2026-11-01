@@ -428,7 +428,10 @@ impl Work {
             Ok(packet)
                 if self
                     .source
-                    .write_completion(packet.srb, packet.data, packet.sense)
+                    .write_completion(
+                        packet.srb, packet.data, packet.sense,
+                        packet.claim_result, status,
+                    )
                     .is_ok() =>
             {
                 status

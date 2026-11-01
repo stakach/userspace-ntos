@@ -13905,7 +13905,7 @@ unsafe fn complete_hosted_irp_with_owner(irp: u64) -> HostedIrpCompletionReceipt
         let scsi_capture_valid = target.scsi_route.is_none_or(|route| {
             hosted_scsi_srb_provider::capture_completion(
                 route, IrpId(canonical_irp_id), target.data,
-                target.output_capacity, target.aux_data, target.scsi_dma_receipt,
+                target.output_capacity, target.aux_data, target.scsi_dma_receipt, status,
             )
         });
         let length = if target.scsi_route.is_some() {

@@ -9,10 +9,11 @@ use crate::scsi_srb_transport::{sanitized_legacy_srb, ScsiParameters, ScsiSrbRou
 use crate::IrpId;
 
 const MAGIC: u32 = u32::from_le_bytes(*b"SCSI");
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const HEADER_SIZE: usize = 64;
 const SRB_OFFSET: usize = HEADER_SIZE;
 const DATA_OFFSET: usize = SRB_OFFSET + WDM_X64_LEGACY_SRB_SIZE;
+const CLAIM_RESULT_BIT: u32 = 1 << 31;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScsiWireError {
@@ -26,6 +27,8 @@ pub struct DecodedScsiWireRequest<'a> {
     pub srb: &'a [u8],
     pub data: &'a [u8],
     pub sense: &'a [u8],
+    /// Provider proved a successful claim of the exact registered PDO; no pointer crosses.
+    pub claim_result: bool,
 }
 
 /// Encode only sanitized SRB bytes. No source-domain address is placed in this packet.
@@ -59,7 +62,7 @@ pub fn encode_scsi_wire_request(
     if !valid_wire_srb(&srb, data.len(), sense.len(), false) {
         return Err(ScsiWireError::InvalidPayload);
     }
-    encode_packet(route, irp, srb, data, sense)
+    encode_packet(route, irp, srb, data, sense, false)
 }
 
 /// Convert the canonical detached IRP transfer bytes into the provider's pointer-free packet.
@@ -83,7 +86,7 @@ pub fn encode_scsi_dispatch_input(
 
 fn encode_packet(
     route: ScsiSrbRoute, irp: IrpId, srb: [u8; WDM_X64_LEGACY_SRB_SIZE],
-    data: &[u8], sense: &[u8],
+    data: &[u8], sense: &[u8], claim_result: bool,
 ) -> Result<Vec<u8>, ScsiWireError> {
     if route.pdo.is_null() || route.provider.domain_id.is_null()
         || route.provider.cookie == 0 || route.relation_generation == 0
@@ -101,7 +104,7 @@ fn encode_packet(
         route.provider.cookie, route.relation_generation, route.provider_pdo,
     ] { bytes.extend_from_slice(&word.to_le_bytes()); }
     bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&(sense.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&((sense.len() as u32) | if claim_result { CLAIM_RESULT_BIT } else { 0 }).to_le_bytes());
     debug_assert_eq!(bytes.len(), HEADER_SIZE);
     bytes.extend_from_slice(&srb);
     bytes.extend_from_slice(data);
@@ -113,32 +116,37 @@ fn encode_packet(
 /// sense lengths in the SRB. Its local pointer values are cleared before publication.
 pub fn encode_scsi_completion(
     route: ScsiSrbRoute, irp: IrpId, provider_srb: &[u8],
-    data: &[u8], sense: &[u8],
+    data: &[u8], sense: &[u8], status: i32,
 ) -> Result<Vec<u8>, ScsiWireError> {
     if provider_srb.len() != WDM_X64_LEGACY_SRB_SIZE
         || provider_srb[0x28..0x30] != [0; 8] {
         return Err(ScsiWireError::InvalidPayload);
     }
+    let claim_result = claim_result_from_provider(route, provider_srb, data.len(), sense.len(), status)?;
     let mut srb = [0; WDM_X64_LEGACY_SRB_SIZE];
     srb.copy_from_slice(provider_srb);
     srb[0x18..0x40].fill(0);
     if !valid_wire_srb(&srb, data.len(), sense.len(), true) {
         return Err(ScsiWireError::InvalidPayload);
     }
-    encode_packet(route, irp, srb, data, sense)
+    encode_packet(route, irp, srb, data, sense, claim_result)
 }
 
 /// Capture a provider-local SRB in the retained packet allocation before publishing terminal
 /// completion. The packet keeps its exact route/IRP header and full data/sense capacities.
 pub fn capture_scsi_completion_in_place(
-    packet: &mut [u8], route: ScsiSrbRoute, irp: IrpId, provider_srb: &[u8],
+    packet: &mut [u8], route: ScsiSrbRoute, irp: IrpId, provider_srb: &[u8], status: i32,
 ) -> Result<(), ScsiWireError> {
     let current = decode_scsi_request(packet, route, irp)?;
     let data_len = current.data.len();
     let sense_len = current.sense.len();
     if provider_srb.len() != WDM_X64_LEGACY_SRB_SIZE
         || provider_srb[0x28..0x30] != [0; 8]
+        || provider_srb[2] != current.srb[2]
     { return Err(ScsiWireError::InvalidPayload); }
+    let claim_result = claim_result_from_provider(
+        route, provider_srb, data_len, sense_len, status,
+    )?;
     let mut completed = [0; WDM_X64_LEGACY_SRB_SIZE];
     completed.copy_from_slice(provider_srb);
     completed[0x18..0x40].fill(0);
@@ -146,7 +154,27 @@ pub fn capture_scsi_completion_in_place(
         return Err(ScsiWireError::InvalidPayload);
     }
     packet[SRB_OFFSET..DATA_OFFSET].copy_from_slice(&completed);
+    packet[60..64].copy_from_slice(&((sense_len as u32)
+        | if claim_result { CLAIM_RESULT_BIT } else { 0 }).to_le_bytes());
     Ok(())
+}
+
+fn claim_result_from_provider(
+    route: ScsiSrbRoute, srb: &[u8], data_len: usize, sense_len: usize,
+    status: i32,
+) -> Result<bool, ScsiWireError> {
+    let pointer = read_u64(srb, 0x18);
+    if data_len != 0 { return Ok(false); }
+    if srb[2] == 1 && status == 0 && srb[3] == 1 {
+        if sense_len != 0 || pointer != route.provider_pdo {
+            return Err(ScsiWireError::InvalidPayload);
+        }
+        Ok(true)
+    } else if pointer == 0 {
+        Ok(false)
+    } else {
+        Err(ScsiWireError::InvalidPayload)
+    }
 }
 
 /// `route` and `irp` are the independent live authority, never identities inferred from bytes.
@@ -179,9 +207,12 @@ fn decode_packet<'a>(
         return Err(ScsiWireError::InvalidRoute);
     }
     let data_len = read_u32(bytes, 56) as usize;
-    let sense_len = read_u32(bytes, 60) as usize;
+    let sense_word = read_u32(bytes, 60);
+    let claim_result = sense_word & CLAIM_RESULT_BIT != 0;
+    let sense_len = (sense_word & 0xff) as usize;
     let sense_offset = DATA_OFFSET.checked_add(data_len).ok_or(ScsiWireError::InvalidPayload)?;
-    if sense_len > u8::MAX as usize
+    if sense_word & !(CLAIM_RESULT_BIT | 0xff) != 0
+        || (claim_result && (!completion || sense_len != 0 || data_len != 0))
         || sense_offset.checked_add(sense_len) != Some(bytes.len())
     {
         return Err(ScsiWireError::InvalidPayload);
@@ -190,10 +221,14 @@ fn decode_packet<'a>(
     if !valid_wire_srb(srb, data_len, sense_len, completion) {
         return Err(ScsiWireError::InvalidPayload);
     }
+    if claim_result && (srb[2] != 1 || srb[3] != 1) {
+        return Err(ScsiWireError::InvalidPayload);
+    }
     Ok(DecodedScsiWireRequest {
         srb,
         data: &bytes[DATA_OFFSET..sense_offset],
         sense: &bytes[sense_offset..],
+        claim_result,
     })
 }
 
@@ -286,18 +321,66 @@ mod tests {
         let mut provider = source_srb();
         provider[0x0b] = 2;
         provider[0x10..0x14].copy_from_slice(&2u32.to_le_bytes());
-        let bytes = encode_scsi_completion(route(), irp, &provider, &[1, 2, 3], &[4; 4]).unwrap();
+        let bytes = encode_scsi_completion(route(), irp, &provider, &[1, 2, 3], &[4; 4], 0).unwrap();
         let completed = decode_scsi_completion(&bytes, route(), irp).unwrap();
         assert_eq!(&completed.srb[0x18..0x40], &[0; 0x28]);
         assert_eq!(completed.data, &[1, 2, 3]);
         assert_eq!(completed.sense, &[4; 4]);
         assert_eq!(decode_scsi_request(&bytes, route(), irp), Err(ScsiWireError::InvalidPayload));
         let mut retained = encode_scsi_request(route(), irp, &source_srb(), &[1, 2, 3], &[4; 4]).unwrap();
-        capture_scsi_completion_in_place(&mut retained, route(), irp, &provider).unwrap();
+        capture_scsi_completion_in_place(&mut retained, route(), irp, &provider, 0).unwrap();
         assert_eq!(retained, bytes);
 
         provider[0x10..0x14].copy_from_slice(&4u32.to_le_bytes());
-        assert_eq!(encode_scsi_completion(route(), irp, &provider, &[1, 2, 3], &[4; 4]),
+        assert_eq!(encode_scsi_completion(route(), irp, &provider, &[1, 2, 3], &[4; 4], 0),
             Err(ScsiWireError::InvalidPayload));
+    }
+
+    #[test]
+    fn claim_completion_refuses_unrelated_or_nonclaim_device_pointer() {
+        let irp = IrpId::new(6, 9);
+        let mut source = [0u8; WDM_X64_LEGACY_SRB_SIZE];
+        source[..2].copy_from_slice(&(WDM_X64_LEGACY_SRB_SIZE as u16).to_le_bytes());
+        source[2] = 1;
+        let mut packet = encode_scsi_request(route(), irp, &source, &[], &[]).unwrap();
+        let mut provider = source;
+        provider[3] = 1;
+        provider[0x18..0x20].copy_from_slice(&(route().provider_pdo + 8).to_le_bytes());
+        assert_eq!(
+            capture_scsi_completion_in_place(&mut packet, route(), irp, &provider, 0),
+            Err(ScsiWireError::InvalidPayload),
+        );
+        provider[2] = 0;
+        provider[0x18..0x20].copy_from_slice(&route().provider_pdo.to_le_bytes());
+        assert_eq!(
+            capture_scsi_completion_in_place(&mut packet, route(), irp, &provider, 0),
+            Err(ScsiWireError::InvalidPayload),
+        );
+    }
+
+    #[test]
+    fn successful_claim_carries_only_typed_marker_for_exact_provider_pdo() {
+        let irp = IrpId::new(6, 10);
+        let mut source = [0u8; WDM_X64_LEGACY_SRB_SIZE];
+        source[..2].copy_from_slice(&(WDM_X64_LEGACY_SRB_SIZE as u16).to_le_bytes());
+        source[2] = 1;
+        let mut packet = encode_scsi_request(route(), irp, &source, &[], &[]).unwrap();
+        let mut provider = source;
+        provider[3] = 1;
+        provider[0x18..0x20].copy_from_slice(&route().provider_pdo.to_le_bytes());
+        capture_scsi_completion_in_place(&mut packet, route(), irp, &provider, 0).unwrap();
+        let decoded = decode_scsi_completion(&packet, route(), irp).unwrap();
+        assert!(decoded.claim_result);
+        assert_eq!(&decoded.srb[0x18..0x40], &[0; 0x28]);
+        assert_eq!(decode_scsi_completion(&packet, route(), IrpId::new(6, 11)),
+            Err(ScsiWireError::InvalidRoute));
+        let mut forged = packet.clone();
+        forged[SRB_OFFSET + 2] = 2;
+        assert_eq!(decode_scsi_completion(&forged, route(), irp),
+            Err(ScsiWireError::InvalidPayload));
+        let mut rejected = encode_scsi_request(route(), irp, &source, &[], &[]).unwrap();
+        assert_eq!(capture_scsi_completion_in_place(
+            &mut rejected, route(), irp, &provider, 0xc000_0001u32 as i32,
+        ), Err(ScsiWireError::InvalidPayload));
     }
 }

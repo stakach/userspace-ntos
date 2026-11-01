@@ -87,6 +87,25 @@ pub fn merge_provider_legacy_srb(
     Ok(merged)
 }
 
+/// Apply an authenticated CLAIM_DEVICE result to the caller's own PDO alias. The provider's
+/// pointer never appears in the wire SRB, and the caller alias comes from a retained target.
+pub fn project_claim_source_alias(
+    merged: &mut [u8; WDM_X64_LEGACY_SRB_SIZE],
+    claim_result: bool,
+    source_pdo_alias: u64,
+) -> Result<(), ScsiSrbError> {
+    if !claim_result { return Ok(()); }
+    if merged[2] != 1
+        || merged[3] != 1
+        || source_pdo_alias == 0
+        || u32::from_le_bytes(merged[0x10..0x14].try_into().unwrap()) != 0
+        || u64::from_le_bytes(merged[SRB_DATA_BUFFER..SRB_DATA_BUFFER + 8].try_into().unwrap()) != 0
+    { return Err(ScsiSrbError::InvalidSrb); }
+    merged[SRB_DATA_BUFFER..SRB_DATA_BUFFER + 8]
+        .copy_from_slice(&source_pdo_alias.to_le_bytes());
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScsiSrbRoute {
     pub pdo: DeviceId,
@@ -693,5 +712,26 @@ mod tests {
             merge_provider_legacy_srb(&source, &provider, 8, 0x20),
             Err(ScsiSrbError::InvalidSrb)
         );
+    }
+
+    #[test]
+    fn claimed_provider_pdo_projects_only_the_retained_source_alias() {
+        let mut source = [0u8; WDM_X64_LEGACY_SRB_SIZE];
+        source[..2].copy_from_slice(&(WDM_X64_LEGACY_SRB_SIZE as u16).to_le_bytes());
+        source[2] = 1;
+        let mut completed = source;
+        completed[3] = 1;
+        project_claim_source_alias(&mut completed, true, 0x1234_5000).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(completed[SRB_DATA_BUFFER..SRB_DATA_BUFFER + 8].try_into().unwrap()),
+            0x1234_5000,
+        );
+        let mut nonclaim = source;
+        nonclaim[2] = 2;
+        nonclaim[3] = 1;
+        assert_eq!(project_claim_source_alias(&mut nonclaim, true, 0x1234_5000),
+            Err(ScsiSrbError::InvalidSrb));
+        assert_eq!(project_claim_source_alias(&mut source, true, 0),
+            Err(ScsiSrbError::InvalidSrb));
     }
 }
