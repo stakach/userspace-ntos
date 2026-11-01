@@ -75,16 +75,29 @@ pub(crate) fn admission_busy(status: u32) -> bool {
     status == snapshot_storage::BUSY
 }
 
+static mut RELATION_WAL_FIRST: bool = false;
+
 /// Claim at most one request from an owner already retained in the executive. No caller may
 /// create a physical command from a copied LBA or an unheld snapshot lease.
 pub(crate) unsafe fn claim_next_native_snapshot_io() -> Option<SnapshotClaim> {
-    snapshot_storage::claim_next_storage_io()
+    let generic = || snapshot_storage::claim_next_storage_io()
         .or_else(|| super::native_checkpoint::claim_next())
         .or_else(|| super::system_wal_fold::native::claim_next())
         .or_else(|| super::hive_wal::claim_next_native_hive_io().map(
             |(ticket, mount, operation, input)| SnapshotClaim::from_hive(
                 mount, operation, input, ticket)))
-        .or_else(|| crate::registry_mutation_work::claim_next_native_wal_io())
+        .or_else(|| crate::registry_mutation_work::claim_next_native_wal_io());
+    let relation = || claim_retained_relation_wal_io();
+    let claim = if *core::ptr::addr_of!(RELATION_WAL_FIRST) {
+        relation().or_else(generic)
+    } else {
+        generic().or_else(relation)
+    };
+    if claim.is_some() {
+        *core::ptr::addr_of_mut!(RELATION_WAL_FIRST) =
+            !*core::ptr::addr_of!(RELATION_WAL_FIRST);
+    }
+    claim
 }
 
 pub(crate) unsafe fn claim_relation_header_recheck(id: u64) -> Option<SnapshotClaim> {

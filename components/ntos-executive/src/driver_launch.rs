@@ -53988,8 +53988,7 @@ pub(crate) unsafe fn native_disk_proof_hardware_irp_pending() -> bool {
 /// while its proven route is unpublished or refreshing.
 unsafe fn retained_native_storage_relation_publication_mut() -> Option<&'static mut HostedRelationPublication> {
     let route = native_disk_relation::retained_native_storage_recheck_route()?;
-    let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY)).as_mut()?;
-    let publication = query.publication.as_mut()?;
+    let publication = active_relation_publication_mut()?;
     let exact_relation = if let Some((previous, next)) = publication.native_disk_refresh {
         previous == route
             && next.key.relation.generation == publication.parent_relation.relation().generation()
@@ -53999,8 +53998,19 @@ unsafe fn retained_native_storage_relation_publication_mut() -> Option<&'static 
             && route.key.relation.generation == publication.parent_relation.relation().generation()
     };
     if !exact_relation
-        || publication.claim != query.claim
-        || route.key.relation.bus_device != query.claim.pdo_device_id
+        || route.key.relation.bus_device != publication.claim.pdo_device_id
+    { return None; }
+    Some(publication)
+}
+
+/// Resolve only the currently claimed relation and its original devnode identity. The WAL
+/// callbacks keep this invalidation across nested dispatch and must never select a later query.
+unsafe fn active_relation_publication_mut() -> Option<&'static mut HostedRelationPublication> {
+    let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY)).as_mut()?;
+    let publication = query.publication.as_mut()?;
+    if publication.claim != query.claim
+        || hosted_pnp_manager_mut().devnode_identity_for_pdo(query.claim.pdo_device_id)
+            != Some(query.claim.parent)
     { return None; }
     Some(publication)
 }
@@ -54042,17 +54052,37 @@ pub(crate) unsafe fn native_storage_relation_recheck_id() -> Option<u64> {
         .then(|| publication.persistence.admission_recheck_id()).flatten()
 }
 
-pub(crate) unsafe fn native_storage_relation_wal_retained() -> bool {
-    retained_native_storage_relation_publication_mut()
-        .is_some_and(|publication| publication.persistence.admission_recheck_id().is_some()
-            || publication.persistence.has_native_wal())
+/// Published mounted I/O can serve any exact active relation; a hidden route can serve only
+/// the storage relation that owns that route. A WAL from another mount is never runnable here.
+unsafe fn relation_wal_publication_mut() -> Option<&'static mut HostedRelationPublication> {
+    let (route, publication) = if let Some(route) = native_disk_relation::native_storage_route() {
+        (route, active_relation_publication_mut()?)
+    } else {
+        (native_disk_relation::retained_native_storage_recheck_route()?,
+            retained_native_storage_relation_publication_mut()?)
+    };
+    if publication.persistence.native_wal_mut()?.mount() != route.mount { return None; }
+    Some(publication)
+}
+
+pub(crate) unsafe fn active_relation_wal_retained() -> bool {
+    let (route, publication) = if let Some(route) = native_disk_relation::native_storage_route() {
+        (route, active_relation_publication_mut())
+    } else {
+        let Some(route) = native_disk_relation::retained_native_storage_recheck_route() else {
+            return false;
+        };
+        (route, retained_native_storage_relation_publication_mut())
+    };
+    publication.is_some_and(|publication| publication.persistence.admission_recheck_id().is_some()
+        || publication.persistence.native_wal_mut()
+            .is_some_and(|wal| wal.mount() == route.mount))
 }
 
 pub(crate) unsafe fn claim_native_relation_wal_io()
     -> Option<crate::writable_fs::native_snapshot_io::SnapshotClaim>
 {
-    let publication = retained_native_storage_relation_publication_mut()?;
-    if !publication.persistence.has_native_wal() { return None; }
+    let publication = relation_wal_publication_mut()?;
     let (request, operation, input, mount) = publication.persistence.claim_native_wal_io().ok()??;
     Some(crate::writable_fs::native_snapshot_io::SnapshotClaim::from_relation_wal(
         mount, operation, input, publication.claim, request,
@@ -54062,7 +54092,7 @@ pub(crate) unsafe fn claim_native_relation_wal_io()
 unsafe fn relation_wal_for(
     claim: nt_pnp_manager::DeviceRelationInvalidation,
 ) -> Result<&'static mut crate::writable_fs::registry_wal::Journal, u32> {
-    let publication = retained_native_storage_relation_publication_mut()
+    let publication = relation_wal_publication_mut()
         .ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
     if publication.claim != claim { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); }
     publication.persistence.native_wal_mut().ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)
@@ -54084,7 +54114,7 @@ pub(crate) unsafe fn refuse_unentered_native_relation_wal(
     claim: nt_pnp_manager::DeviceRelationInvalidation, request: nt_fs::AsyncWalIoRequest,
     status: nt_status::NtStatus,
 ) -> Result<(), u32> {
-    let publication = retained_native_storage_relation_publication_mut()
+    let publication = relation_wal_publication_mut()
         .ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
     if publication.claim != claim { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); }
     let refusal = publication.persistence.native_wal_mut()
