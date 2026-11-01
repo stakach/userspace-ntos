@@ -28,6 +28,35 @@ fn fixture() -> (
 }
 
 #[test]
+fn retained_directory_close_rejects_reused_slot_even_for_same_object_identity() {
+    let (mut pm, user, _, pid, _) = fixture();
+    let handle = pm.insert_handle(pid, HandleObject::ObjectDirectory(0x55), 0x10000).unwrap();
+    let reservation = pm.reserve_native_directory_close(user, u64::from(handle)).unwrap();
+    assert_eq!(pm.take_handle(pid, handle), Ok(HandleObject::ObjectDirectory(0x55)));
+    let reused = pm.insert_handle(pid, HandleObject::ObjectDirectory(0x55), 0x10000).unwrap();
+    assert_eq!(reused, handle);
+    assert!(matches!(pm.close_reserved_native_directory(reservation),
+        Err(NativeCloseError::Status(STATUS_INVALID_HANDLE))));
+    assert_eq!(pm.lookup_handle(pid, reused), Some(HandleObject::ObjectDirectory(0x55)));
+}
+
+#[test]
+fn retained_directory_close_keeps_protect_close_contract() {
+    let (mut pm, user, kernel, pid, _) = fixture();
+    let handle = pm.insert_handle(pid, HandleObject::ObjectDirectory(0x56), 0x10000).unwrap();
+    pm.set_handle_flags(pid, handle, HandleFlags {
+        inherit: false, protect_from_close: true,
+    }).unwrap();
+    let user_close = pm.reserve_native_directory_close(user, u64::from(handle)).unwrap();
+    assert!(matches!(pm.close_reserved_native_directory(user_close),
+        Err(NativeCloseError::Status(crate::STATUS_HANDLE_NOT_CLOSABLE))));
+    let kernel_close = pm.reserve_native_directory_close(kernel, u64::from(handle)).unwrap();
+    assert!(matches!(pm.close_reserved_native_directory(kernel_close),
+        Err(NativeCloseError::BugCheck { code: INVALID_KERNEL_HANDLE_BUGCHECK, .. })));
+    assert_eq!(pm.lookup_handle(pid, handle), Some(HandleObject::ObjectDirectory(0x56)));
+}
+
+#[test]
 fn driver_created_event_and_directory_handles_close_only_in_their_exact_owner() {
     let (mut pm, _user, kernel, owner, _) = fixture();
     let foreign = pm.create_process("foreign", None, None);

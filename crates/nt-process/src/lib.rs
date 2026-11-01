@@ -1003,7 +1003,7 @@ enum HandleSlot {
     Free,
     Reserved(u64),
     Bound { generation: u64, entry: HandleEntry },
-    Occupied(HandleEntry),
+    Occupied { generation: u64, entry: HandleEntry },
 }
 
 impl HandleSlot {
@@ -1013,7 +1013,7 @@ impl HandleSlot {
 
     fn entry(&self) -> Option<&HandleEntry> {
         match self {
-            Self::Occupied(entry) => Some(entry),
+            Self::Occupied { entry, .. } => Some(entry),
             Self::Free | Self::Reserved(_) | Self::Bound { .. } => None,
         }
     }
@@ -1023,23 +1023,23 @@ impl HandleSlot {
     /// handle does.
     fn reference_entry(&self) -> Option<&HandleEntry> {
         match self {
-            Self::Bound { entry, .. } | Self::Occupied(entry) => Some(entry),
+            Self::Bound { entry, .. } | Self::Occupied { entry, .. } => Some(entry),
             Self::Free | Self::Reserved(_) => None,
         }
     }
 
     fn entry_mut(&mut self) -> Option<&mut HandleEntry> {
         match self {
-            Self::Occupied(entry) => Some(entry),
+            Self::Occupied { entry, .. } => Some(entry),
             Self::Free | Self::Reserved(_) | Self::Bound { .. } => None,
         }
     }
 
     fn take_entry(&mut self) -> Option<HandleEntry> {
-        if !matches!(self, Self::Occupied(_)) {
+        if !matches!(self, Self::Occupied { .. }) {
             return None;
         }
-        let Self::Occupied(entry) = core::mem::replace(self, Self::Free) else {
+        let Self::Occupied { entry, .. } = core::mem::replace(self, Self::Free) else {
             unreachable!();
         };
         Some(entry)
@@ -1782,7 +1782,7 @@ impl ProcessManager {
             HandleObject::DebugObject(object) => Some(object),
             _ => None,
         };
-        *entry = HandleSlot::Occupied(bound);
+        *entry = HandleSlot::Occupied { generation: reservation.generation, entry: bound };
         if let Some(object) = debug_object {
             if let Some(debug_object) = self.dbgk.get_mut(object) {
                 debug_object.add_handle();
@@ -5236,6 +5236,9 @@ impl ProcessManager {
         if !self.processes.contains_key(&pid) {
             return Err(STATUS_INVALID_HANDLE);
         }
+        let generation = self.processes.get(&pid).unwrap().next_handle_reservation_generation;
+        let next_generation = generation.checked_add(1).filter(|_| generation != 0)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         match object {
             HandleObject::Process(target) if !self.processes.contains_key(&target) => {
                 return Err(STATUS_INVALID_HANDLE);
@@ -5256,6 +5259,7 @@ impl ProcessManager {
                 .processes
                 .get_mut(&pid)
                 .expect("validated handle-table owner");
+            proc.next_handle_reservation_generation = next_generation;
             let entry = HandleEntry {
                 object,
                 granted_access,
@@ -5264,11 +5268,11 @@ impl ProcessManager {
             let free = proc.handles.iter().position(HandleSlot::is_free);
             match free {
                 Some(i) => {
-                    proc.handles[i] = HandleSlot::Occupied(entry);
+                    proc.handles[i] = HandleSlot::Occupied { generation, entry };
                     i
                 }
                 None => {
-                    proc.handles.push(HandleSlot::Occupied(entry));
+                    proc.handles.push(HandleSlot::Occupied { generation, entry });
                     proc.handles.len() - 1
                 }
             }
@@ -5348,17 +5352,20 @@ impl ProcessManager {
                 return Err(STATUS_INVALID_HANDLE);
             }
         }
+        let generation = self.processes.get(&pid).unwrap().next_handle_reservation_generation;
+        let next_generation = generation.checked_add(1).filter(|_| generation != 0)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         if let HandleObject::Job(job) = inherited.object {
             self.jobs.retain_handle(job)?;
         }
-        self.processes
-            .get_mut(&pid)
-            .expect("validated inherited handle-table owner")
-            .handles[slot] = HandleSlot::Occupied(HandleEntry {
+        let process = self.processes.get_mut(&pid)
+            .expect("validated inherited handle-table owner");
+        process.next_handle_reservation_generation = next_generation;
+        process.handles[slot] = HandleSlot::Occupied { generation, entry: HandleEntry {
             object: inherited.object,
             granted_access: inherited.granted_access,
             flags: inherited.flags,
-        });
+        } };
         if let HandleObject::DebugObject(object) = inherited.object {
             if let Some(debug_object) = self.dbgk.get_mut(object) {
                 debug_object.add_handle();

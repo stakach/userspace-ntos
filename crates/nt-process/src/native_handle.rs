@@ -124,6 +124,16 @@ pub struct ClosedNativeHandle {
     target: NativeCloseTarget,
 }
 
+/// A native directory close admitted before its Reply is parked. This preliminary
+/// reservation retains the table owner and directory identity across that wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeDirectoryCloseReservation {
+    caller: NativeHandleCaller,
+    value: u64,
+    target: NativeCloseTarget,
+    generation: u64,
+}
+
 impl ClosedNativeHandle {
     pub const fn table_owner(&self) -> ProcessId {
         self.target.table_owner
@@ -418,6 +428,41 @@ impl NativePsHandlePublication {
 }
 
 impl ProcessManager {
+    pub fn reserve_native_directory_close(
+        &self, caller: NativeHandleCaller, value: u64,
+    ) -> Result<NativeDirectoryCloseReservation, u32> {
+        let target = self.inspect_native_close_target(caller, value)?;
+        if !matches!(target.object, HandleObject::ObjectDirectory(_)) {
+            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        let slot = crate::handle_to_slot(target.handle).ok_or(STATUS_INVALID_HANDLE)?;
+        let Some(crate::HandleSlot::Occupied { generation, .. }) = self.process(target.table_owner)
+            .and_then(|process| process.handles.get(slot)) else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        Ok(NativeDirectoryCloseReservation { caller, value, target, generation: *generation })
+    }
+
+    pub fn close_reserved_native_directory(
+        &mut self, reservation: NativeDirectoryCloseReservation,
+    ) -> Result<ClosedNativeHandle, NativeCloseError> {
+        let current = self.inspect_native_close_target(reservation.caller, reservation.value)
+            .map_err(NativeCloseError::Status)?;
+        let slot = crate::handle_to_slot(current.handle)
+            .ok_or(NativeCloseError::Status(STATUS_INVALID_HANDLE))?;
+        let same_generation = matches!(self.process(current.table_owner)
+            .and_then(|process| process.handles.get(slot)),
+            Some(crate::HandleSlot::Occupied { generation, .. })
+                if *generation == reservation.generation);
+        if !same_generation {
+            return Err(NativeCloseError::Status(STATUS_INVALID_HANDLE));
+        }
+        if current != reservation.target {
+            return Err(NativeCloseError::Status(STATUS_INVALID_HANDLE));
+        }
+        self.close_native_handle(reservation.caller, reservation.value)
+    }
+
     /// Inspect one visible entry in the caller's canonical native table without changing it.
     /// The host may use this for resource preflight only within the same serialized dispatch as
     /// `close_native_handle`; it is not a retained reference across callbacks or IPC.
