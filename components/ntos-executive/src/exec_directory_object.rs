@@ -365,6 +365,7 @@ impl ExecNtHandler {
         &mut self,
         staged: &mut ReservedDirectoryObjectOpen,
     ) -> DirectoryPublishProgress {
+        let _durable = allocator::enter_durable();
         if staged.local_committed { return DirectoryPublishProgress::Ready(staged.local_status); }
         let result = (|| {
             self.pm.validate_native_handle_caller(staged.security.caller())?;

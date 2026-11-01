@@ -20668,6 +20668,7 @@ impl ExecNtHandler {
             }
             nt_process::HandleObject::ObjectDirectory(identity) => {
                 if self.canonical_directories.owner_for_local(identity).is_some() {
+                    let _durable = allocator::enter_durable();
                     self.directory_cleanup.reserve()
                         .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
                     match self.canonical_directories.acquire_existing(identity) {

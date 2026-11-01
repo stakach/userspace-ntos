@@ -615,3 +615,40 @@ fn provider_directory_reservation_retains_same_security_admission_through_public
     finish.visit_block(&method(&file, "finish_provider_directory_local").block);
     assert!(finish.0.iter().any(|name| name == "commit_directory_local"));
 }
+
+#[test]
+fn retained_directory_queues_allocate_in_durable_scope() {
+    let directory = source();
+    let handler = syn::parse_file(include_str!(
+        "../../../../components/ntos-executive/src/exec_handler.rs"
+    )).unwrap();
+    let open = syn::parse_file(include_str!(
+        "../../../../components/ntos-executive/src/native_directory_open_work.rs"
+    )).unwrap();
+    let effect = syn::parse_file(include_str!(
+        "../../../../components/ntos-executive/src/native_directory_effect_work.rs"
+    )).unwrap();
+    for (owner, name) in [
+        (&directory, "commit_directory_local"),
+        (&handler, "retain_external_handle_reference"),
+    ] {
+        let mut calls = Calls::default();
+        calls.visit_block(&method(owner, name).block);
+        let durable = calls.0.iter().position(|call| call == "enter_durable");
+        let reserve = calls.0.iter().position(|call| call == "reserve");
+        assert!(matches!((durable, reserve), (Some(d), Some(r)) if d < r),
+            "{name} must enter durable scope before reserving cleanup capacity");
+    }
+    for (owner, name) in [(&open, "park"), (&effect, "park")] {
+        let function = owner.items.iter().find_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == name => Some(function),
+            _ => None,
+        }).unwrap();
+        let mut calls = Calls::default();
+        calls.visit_block(&function.block);
+        let durable = calls.0.iter().position(|call| call == "enter_durable");
+        let reserve = calls.0.iter().position(|call| call == "try_reserve");
+        assert!(matches!((durable, reserve), (Some(d), Some(r)) if d < r),
+            "{name} must enter durable scope before growing its retained Reply queue");
+    }
+}

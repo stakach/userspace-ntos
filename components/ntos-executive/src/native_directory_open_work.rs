@@ -97,6 +97,7 @@ pub(crate) unsafe fn park(
     handler: &mut ExecNtHandler,
     mut work: PendingNativeDirectoryOpen,
 ) -> Result<(), u32> {
+    let _durable = allocator::enter_durable();
     let detached = usize::from(ACTIVE.load(Ordering::Acquire));
     let queue = &mut *core::ptr::addr_of_mut!(PENDING);
     if queue.len().saturating_add(detached) >= MAX_PENDING_NATIVE_DIRECTORY_OPEN

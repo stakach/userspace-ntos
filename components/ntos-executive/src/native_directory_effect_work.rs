@@ -271,6 +271,7 @@ pub(crate) unsafe fn redrive_detached(handler: &mut ExecNtHandler) -> bool {
 /// Queue admission and Reply rotation happen before any PM removal or Object Manager call.
 pub(crate) unsafe fn park(handler: &mut ExecNtHandler,
     mut work: PendingNativeDirectoryEffect) -> Result<(), u32> {
+    let _durable = allocator::enter_durable();
     let queue = &mut *core::ptr::addr_of_mut!(EFFECTS);
     if queue.try_reserve(1).is_err() {
         work.reference.take().unwrap().release(&mut handler.pm)
