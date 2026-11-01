@@ -95,7 +95,7 @@ fn irq_root_sg_services_use_lease_bound_private_graph() {
         ("DmaQuerySg", "dma_query_sg_service", "service_hosted_irq_lane_dma_query_sg",
             "dma_private_sg_members"),
         ("DmaPutSg", "dma_put_sg_service", "service_hosted_irq_lane_dma_put_sg",
-            "retire_dma_private_graph"),
+            "retire_dma_private_graph_typed"),
     ] {
         let broker = wiring(BROKER, broker_method);
         assert!(broker.calls.iter().any(|call| call == root_service),
