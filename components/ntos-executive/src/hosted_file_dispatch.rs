@@ -448,6 +448,20 @@ pub(super) fn execute(
             status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         };
     };
+    let scsi_data = match &projection.parameters {
+        IoParameters::Scsi(parameters) if parameters.data_length != 0 => {
+            if let Err(status) = unsafe {
+                hosted_scsi_dma_reservation::reserve_for_dispatch(
+                    &request, parameters.route.provider_pdo,
+                    u64::from(parameters.data_length),
+                )
+            } {
+                return HostedIrpTransportResult::NotDispatched { status };
+            }
+            true
+        }
+        _ => false,
+    };
     let result = unsafe {
         dispatch_irp_for_instance_exact(
             route_instance,
@@ -465,6 +479,20 @@ pub(super) fn execute(
             caller,
         )
     };
+    if scsi_data {
+        match result {
+            Some(HostedIrpTransportResult::NotDispatched { .. }) => {
+                if unsafe { hosted_scsi_dma_reservation::release_after_ack(projection.irp_id.raw()) }
+                    .is_err()
+                {
+                    unsafe { hosted_scsi_dma_reservation::quarantine(projection.irp_id.raw()) };
+                }
+            }
+            None | Some(HostedIrpTransportResult::Indeterminate { .. }) =>
+                unsafe { hosted_scsi_dma_reservation::quarantine(projection.irp_id.raw()) },
+            Some(HostedIrpTransportResult::Returned { .. }) => {}
+        }
+    }
     if result.is_none() {
         print_str(b"[hosted-file] exact dispatch unavailable instance/device/irp=");
         print_u64(instance_index as u64);

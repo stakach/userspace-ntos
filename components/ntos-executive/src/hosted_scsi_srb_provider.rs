@@ -44,7 +44,21 @@ pub(super) unsafe fn prepare(
     let packet_slice = core::slice::from_raw_parts(packet as *const u8, request.input_len as usize);
     let decoded = decode_scsi_request(packet_slice, route, IrpId(request.irp_id))
         .map_err(|_| STATUS_INVALID_PARAMETER)?;
-    let data_pointer = if decoded.data.is_empty() { 0 } else { decoded.data.as_ptr() as u64 };
+    let data_pointer = if decoded.data.is_empty() { 0 } else {
+        let (_label, status, grant_va, grant_len, reservation_id) = call_on5(
+            (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+            request.irp_id,
+            HOSTED_DMA_SERVICE_QUERY_SCSI_RESERVATION << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+            provider_pdo, 0, 0,
+        );
+        if status as u32 as i32 != STATUS_SUCCESS || grant_va == 0
+            || reservation_id == 0 || grant_len != decoded.data.len() as u64
+            || grant_va.checked_add(grant_len).is_none()
+        { return Err(STATUS_INVALID_DEVICE_REQUEST); }
+        core::ptr::copy_nonoverlapping(decoded.data.as_ptr(), grant_va as *mut u8,
+            decoded.data.len());
+        grant_va
+    };
     let sense_pointer = if decoded.sense.is_empty() { 0 } else { decoded.sense.as_ptr() as u64 };
     let srb = pool_alloc_zeroed(WDM_X64_LEGACY_SRB_SIZE as u64);
     if srb == 0 { return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw()); }
@@ -74,6 +88,26 @@ pub(super) unsafe fn capture_completion(
     { return false; }
     let packet_slice = core::slice::from_raw_parts_mut(packet as *mut u8, packet_len as usize);
     let srb_slice = core::slice::from_raw_parts(srb as *const u8, WDM_X64_LEGACY_SRB_SIZE);
+    let (data_pointer, data_capacity) = match decode_scsi_request(packet_slice, route, irp_id) {
+        Ok(decoded) => (decoded.data.as_ptr() as u64, decoded.data.len() as u64),
+        Err(_) => return false,
+    };
+    if data_capacity != 0 {
+        let (_label, status, grant_va, grant_len, reservation_id) = call_on5(
+            (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+            irp_id.raw(),
+            HOSTED_DMA_SERVICE_QUERY_SCSI_RESERVATION << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+            route.provider_pdo, 0, 0,
+        );
+        let transferred = read_unaligned((srb + 0x10) as *const u32) as u64;
+        if status as u32 as i32 != STATUS_SUCCESS || grant_va == 0
+            || reservation_id == 0 || grant_len != data_capacity
+            || transferred > data_capacity
+            || read_unaligned((srb + 0x18) as *const u64) != grant_va
+        { return false; }
+        core::ptr::copy_nonoverlapping(grant_va as *const u8,
+            data_pointer as *mut u8, transferred as usize);
+    }
     let captured = capture_scsi_completion_in_place(packet_slice, route, irp_id, srb_slice).is_ok();
     static CAPACITY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
     if captured && packet_slice.len() >= 64 + WDM_X64_LEGACY_SRB_SIZE + 12
