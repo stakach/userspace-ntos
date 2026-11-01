@@ -428,6 +428,27 @@ impl NativePsHandlePublication {
 }
 
 impl ProcessManager {
+    /// Validate a retained directory operation without consuming its handle. The
+    /// host may then submit one canonical effect while retaining this owner.
+    pub fn validate_reserved_native_directory(
+        &self, reservation: &NativeDirectoryCloseReservation, required_access: u32,
+    ) -> Result<u64, u32> {
+        let current = self.inspect_native_close_target(reservation.caller, reservation.value)?;
+        let slot = crate::handle_to_slot(current.handle).ok_or(STATUS_INVALID_HANDLE)?;
+        let same_generation = matches!(self.process(current.table_owner)
+            .and_then(|process| process.handles.get(slot)),
+            Some(crate::HandleSlot::Occupied { generation, .. })
+                if *generation == reservation.generation);
+        if !same_generation { return Err(STATUS_INVALID_HANDLE); }
+        if current != reservation.target { return Err(STATUS_INVALID_HANDLE); }
+        let granted = current.information.granted_access.ok_or(STATUS_INVALID_HANDLE)?;
+        if required_access & !granted != 0 { return Err(STATUS_ACCESS_DENIED); }
+        let HandleObject::ObjectDirectory(identity) = current.object else {
+            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+        };
+        Ok(identity)
+    }
+
     pub fn reserve_native_directory_close(
         &self, caller: NativeHandleCaller, value: u64,
     ) -> Result<NativeDirectoryCloseReservation, u32> {

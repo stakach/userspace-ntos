@@ -57,6 +57,18 @@ fn retained_directory_close_keeps_protect_close_contract() {
 }
 
 #[test]
+fn retained_directory_effect_rejects_reused_slot_before_nonconsuming_submit() {
+    let (mut pm, user, _, pid, _) = fixture();
+    let handle = pm.insert_handle(pid, HandleObject::ObjectDirectory(0x57), 0x10000).unwrap();
+    let reservation = pm.reserve_native_directory_close(user, u64::from(handle)).unwrap();
+    assert_eq!(pm.take_handle(pid, handle), Ok(HandleObject::ObjectDirectory(0x57)));
+    assert_eq!(pm.insert_handle(pid, HandleObject::ObjectDirectory(0x57), 0x10000), Ok(handle));
+    assert_eq!(pm.validate_reserved_native_directory(&reservation, 0x10000),
+        Err(STATUS_INVALID_HANDLE));
+    assert_eq!(pm.lookup_handle(pid, handle), Some(HandleObject::ObjectDirectory(0x57)));
+}
+
+#[test]
 fn driver_created_event_and_directory_handles_close_only_in_their_exact_owner() {
     let (mut pm, _user, kernel, owner, _) = fixture();
     let foreign = pm.create_process("foreign", None, None);

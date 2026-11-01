@@ -194,13 +194,13 @@ impl ProcessManager {
             .ok_or(NativeCloseError::Status(STATUS_INSUFFICIENT_RESOURCES))?;
         let entry = process.handles.get_mut(slot)
             .ok_or(NativeCloseError::Status(STATUS_INVALID_HANDLE))?;
-        let HandleSlot::Occupied(occupied) = entry else {
+        let HandleSlot::Occupied { entry: occupied, .. } = entry else {
             return Err(NativeCloseError::Status(STATUS_INVALID_HANDLE));
         };
         if occupied.object != target.object() || occupied.flags != flags {
             return Err(NativeCloseError::Status(STATUS_INVALID_HANDLE));
         }
-        let HandleSlot::Occupied(occupied) = core::mem::replace(entry, HandleSlot::Free)
+        let HandleSlot::Occupied { entry: occupied, .. } = core::mem::replace(entry, HandleSlot::Free)
         else { unreachable!("validated ALPC close target remains occupied") };
         *entry = HandleSlot::Bound { generation, entry: occupied };
         process.next_handle_reservation_generation = next;
