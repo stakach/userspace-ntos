@@ -4264,7 +4264,7 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
     if let Some(yielded) = pump.receive_yield {
         return ProviderWaitPumpCompletion::ReceiveReparked(PendingReceiveDispatch {
             yielded, pump, channel, dispatch: pending.dispatch, client: pending.client,
-            shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
+            shared_resume: yielded.shared_resume,
             callback_token: None,
             arg_snapshot_len: pending.arg_snapshot_len, arg_snapshot: pending.arg_snapshot,
         });
@@ -4496,7 +4496,7 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
     if let Some(yielded) = pump.receive_yield {
         return LpcWaitPumpCompletion::ReceiveReparked(PendingReceiveDispatch {
             yielded, pump, channel, dispatch: pending.dispatch, client: pending.client,
-            shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
+            shared_resume: yielded.shared_resume,
             callback_token: None,
             arg_snapshot_len: pending.arg_snapshot_len, arg_snapshot: pending.arg_snapshot,
         });
@@ -5332,7 +5332,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         let pending = PendingReceiveDispatch {
             yielded, pump: component, channel, dispatch: dispatch_context,
             client: completed_context, callback_token: Some(callback_token),
-            shared_resume: capture_shared_resume_snapshot(dispatch_context, completed_context),
+            shared_resume: yielded.shared_resume,
             arg_snapshot_len, arg_snapshot,
         };
         let Some(callback_context) = stage_returned_user_callback_context(
@@ -7006,9 +7006,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             yielded, pump: pr, channel: ch,
             dispatch: UserCallbackDispatchContext { lane, dispatch_id, ssn,
                 args: completion_args, caller_sp, output_stage, paint_output },
-            shared_resume: capture_shared_resume_snapshot(
-                UserCallbackDispatchContext { lane, dispatch_id, ssn,
-                    args: completion_args, caller_sp, output_stage, paint_output }, client),
+            shared_resume: yielded.shared_resume,
             client, callback_token: None, arg_snapshot_len, arg_snapshot,
         }));
     }

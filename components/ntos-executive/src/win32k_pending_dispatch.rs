@@ -11,6 +11,7 @@ pub(crate) struct ReceiveYield {
     pub child: nt_component_suspension::ExternalAdmissionKey,
     pub owner: nt_component_suspension::SuspensionOwner,
     pub replaces: Option<nt_component_suspension::SuspensionKey>,
+    pub shared_resume: SharedResumeSnapshot,
 }
 
 /// A dispatch worker's exact retained service wait while the win32k syscall pump yields its
@@ -163,6 +164,25 @@ pub(crate) unsafe fn capture_shared_resume_snapshot(
     let frame = (sh + win32k_subsystem::SH_USER_CALLBACK)
         as *const nt_user_callback::CallbackFrame;
     let header = core::ptr::read_volatile(core::ptr::addr_of!((*frame).header));
+    if !header.matches_dispatch_identity(dispatch.dispatch_id, client.pi, client.tid, client.badge) {
+        print_str(b"[win32k-shared-header-mismatch] expected dispatch/pi/tid/badge=");
+        print_u64(dispatch.dispatch_id); print_str(b"/"); print_u64(client.pi as u64);
+        print_str(b"/"); print_u64(client.tid); print_str(b"/"); print_u64(client.badge);
+        print_str(b" actual dispatch/pi/tid/badge/state=");
+        print_u64(header.dispatch_id); print_str(b"/"); print_u64(header.client_pi as u64);
+        print_str(b"/"); print_u64(header.client_tid); print_str(b"/");
+        print_u64(header.client_badge); print_str(b"/"); print_u64(header.state as u64);
+        print_str(b" magic/version/kind=0x"); print_hex_u64(header.magic as u64);
+        print_str(b"/"); print_u64(header.version as u64);
+        print_str(b"/"); print_u64(header.kind as u64);
+        print_str(b" request ssn/pi/tid=");
+        print_u64(core::ptr::read_volatile((sh + win32k_subsystem::SH_REQ_SSN) as *const u64));
+        print_str(b"/");
+        print_u64(core::ptr::read_volatile((sh + win32k_subsystem::SH_REQ_CLIENT_PI) as *const u64));
+        print_str(b"/");
+        print_u64(core::ptr::read_volatile((sh + win32k_subsystem::SH_REQ_THREAD_ID) as *const u64));
+        print_str(b"\n");
+    }
     assert!(header.matches_dispatch_identity(
         dispatch.dispatch_id, client.pi, client.tid, client.badge,
     ), "yielded win32k shared callback belongs to another dispatch");

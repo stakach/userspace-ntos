@@ -386,14 +386,14 @@ pub(crate) unsafe fn prepare_receive_yield(
         .map_err(|error| trace_receive_failure(b"channel-route", error, channel, None))?
         .ok_or_else(|| trace_receive_failure(b"missing-route", runtime::Error::PhysicalIdentity, channel, None))?;
     let active = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    let registered_client = (&*core::ptr::addr_of!(WIN32K_DISPATCH_CLIENT_REGISTRY))
+        .dispatch(active.dispatch_id);
     if active.lane != running.lane
         || binding.executor_id != channel.tcb
         || binding.receive_endpoint != channel.fault_ep
         || running.route != Some(route)
         || route.identity().lane != active.lane
-        || !(&*core::ptr::addr_of!(WIN32K_DISPATCH_CLIENT_REGISTRY))
-            .dispatch(active.dispatch_id)
-            .is_some_and(|client| {
+        || !registered_client.is_some_and(|client| {
                 client.logical_caller == Some(caller)
                     && client.tcb == caller.tcb()
                     && client.generation == generation
@@ -427,6 +427,12 @@ pub(crate) unsafe fn prepare_receive_yield(
     if u64::from(pi) != channel.client_pi || generation != channel.client_generation {
         return Err(trace_receive_failure(b"client-generation", runtime::Error::PhysicalIdentity, channel, Some(route)));
     }
+    // The physical shared page may be reused by another dispatch as soon as this parent parks.
+    // Retain the authenticated client's publication while this dispatch still owns the page.
+    let shared_resume = capture_shared_resume_snapshot(
+        active,
+        win32k_client_context_from_callback_client(registered_client.unwrap()),
+    );
     let owner = nt_component_suspension::SuspensionOwner {
         provider_domain: provider.domain,
         provider_generation: provider.generation,
@@ -479,6 +485,7 @@ pub(crate) unsafe fn prepare_receive_yield(
         child: child_key,
         owner,
         replaces,
+        shared_resume,
     }))
 }
 
@@ -585,7 +592,7 @@ pub(crate) unsafe fn resume_suspended_receive_component(
             pump,
             channel,
             callback_token: None,
-            shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
+            shared_resume: yielded.shared_resume,
             ..pending
         });
     }
@@ -710,7 +717,7 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
             dispatch: pending.dispatch,
             client: pending.client,
             callback_token: None,
-            shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
+            shared_resume: yielded.shared_resume,
             arg_snapshot_len: pending.arg_snapshot_len,
             arg_snapshot: pending.arg_snapshot,
         });

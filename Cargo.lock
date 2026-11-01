@@ -253,6 +253,7 @@ dependencies = [
  "nt-process",
  "nt-status",
  "nt-types",
+ "nt-user-callback",
  "nt-user-host",
  "sha2",
  "syn",
