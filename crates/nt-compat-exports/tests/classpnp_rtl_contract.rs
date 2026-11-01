@@ -2,6 +2,7 @@
 
 use nt_compat_exports::rtl::classpnp::{format_guid_utf16, write_version_info, GUID_STRING_UNITS};
 
+#[cfg(target_arch = "x86_64")]
 #[path = "../../../components/ntos-executive/src/ntoskrnl_classpnp_rtl.rs"]
 mod native;
 
@@ -50,6 +51,7 @@ fn version_writer_populates_only_declared_base_or_extended_layout() {
 }
 
 #[test]
+#[cfg(target_arch = "x86_64")]
 fn native_guid_string_is_owned_by_supplied_pool_and_releasable() {
     let guid = [
         0x44, 0x33, 0x22, 0x11, 0x66, 0x55, 0x88, 0x77, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
@@ -74,6 +76,7 @@ fn native_guid_string_is_owned_by_supplied_pool_and_releasable() {
 }
 
 #[test]
+#[cfg(target_arch = "x86_64")]
 fn native_version_guard_prevents_bad_size_overwrite() {
     let mut output = [0xa5u8; 0x11c];
     output[..4].copy_from_slice(&0x11du32.to_le_bytes());
