@@ -3130,7 +3130,7 @@ unsafe fn component_pump_loop(
                         )
                             && shared_ingress::owner::runtime::dispatch(route).is_ok()
                 );
-            let (status, out1, out2, out3) = if admitted {
+            let result = if admitted {
                 crate::service_sec_image::service_win32k_directory_request(
                     ch,
                     *reply_cap,
@@ -3142,18 +3142,23 @@ unsafe fn component_pump_loop(
                     msg.m3,
                 )
             } else {
-                (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0)
+                crate::provider_directory_broker::SubmitResult::Ready((
+                    nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0,
+                ))
             };
-            pump_reply_recv4_into!(
-                ch,
-                *reply_cap,
-                msg,
-                4,
-                status as u32 as u64,
-                out1,
-                out2,
-                out3
-            );
+            match result {
+                crate::provider_directory_broker::SubmitResult::Ready((status, out1, out2, out3)) => {
+                    pump_reply_recv4_into!(ch, *reply_cap, msg, 4,
+                        status as u32 as u64, out1, out2, out3);
+                }
+                crate::provider_directory_broker::SubmitResult::Deferred => {
+                    if shared_pump::service_wait_yields(ch) {
+                        outcome.provider_wait_suspended = true;
+                        break;
+                    }
+                    msg = pump_recv(ch, *reply_cap);
+                }
+            }
             continue;
         } else if label == crate::win32k_subsystem::W32_SECTION_CREATE_LABEL
             && ch.caps.kind == ReqKind::Syscall
@@ -3688,7 +3693,7 @@ unsafe fn component_pump_loop(
         } else if label == crate::driver_launch::FSD_SERVICE_DIRECTORY_OBJECT_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
-            let (status, out1, out2, out3) = if msg.mi
+            let result = if msg.mi
                 == ((crate::driver_launch::FSD_SERVICE_DIRECTORY_OBJECT_LABEL << 12) | 4)
                 && shared_pump::authenticated_badge(ch, msg.badge)
                 && *reply_cap == ch.reply_cap
@@ -3697,12 +3702,23 @@ unsafe fn component_pump_loop(
                     ch, *reply_cap, msg.m0, msg.m1, msg.m2, msg.m3,
                 )
             } else {
-                (STATUS_INVALID_PARAMETER_I32, 0, 0, 0)
+                crate::provider_directory_broker::SubmitResult::Ready((
+                    STATUS_INVALID_PARAMETER_I32, 0, 0, 0,
+                ))
             };
-            pump_reply_recv4_into!(
-                ch, *reply_cap, msg, 4,
-                status as u32 as u64, out1, out2, out3
-            );
+            match result {
+                crate::provider_directory_broker::SubmitResult::Ready((status, out1, out2, out3)) => {
+                    pump_reply_recv4_into!(ch, *reply_cap, msg, 4,
+                        status as u32 as u64, out1, out2, out3);
+                }
+                crate::provider_directory_broker::SubmitResult::Deferred => {
+                    if shared_pump::service_wait_yields(ch) {
+                        outcome.provider_wait_suspended = true;
+                        break;
+                    }
+                    msg = pump_recv(ch, *reply_cap);
+                }
+            }
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_CREATE_EVENT_LABEL
             && ch.caps.kind == ReqKind::Irp

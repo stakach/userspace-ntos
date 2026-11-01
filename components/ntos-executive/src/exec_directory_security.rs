@@ -33,6 +33,14 @@ impl DirectorySecurityAdmission {
     pub(super) fn caller(&self) -> nt_process::native_handle::NativeHandleCaller {
         self.subject.caller()
     }
+
+    pub(super) fn existing_identity(&self) -> Option<u64> {
+        self.existing.map(|(_, identity)| identity)
+    }
+
+    pub(super) fn parent_and_leaf(&self) -> (usize, &[u8]) {
+        (self.parent, &self.leaf)
+    }
 }
 
 static ACCESS_CHECKS: AtomicU64 = AtomicU64::new(0);

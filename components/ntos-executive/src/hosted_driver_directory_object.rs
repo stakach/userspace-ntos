@@ -32,29 +32,30 @@ pub(crate) fn service(
     m1: u64,
     m2: u64,
     m3: u64,
-) -> (i32, u64, u64, u64) {
+) -> crate::provider_directory_broker::SubmitResult {
     use crate::spawn_hosts::shared_ingress::owner::runtime;
+    use crate::provider_directory_broker::SubmitResult;
     let Some((_instance, _inst)) = instance_for_pump_channel(channel, active_reply_cap) else {
-        return (STATUS_INVALID_HANDLE, 0, 0, 0);
+        return SubmitResult::Ready((STATUS_INVALID_HANDLE, 0, 0, 0));
     };
     let route = match unsafe { runtime::channel_route(channel) } {
         Ok(Some(route)) => route,
-        _ => return (STATUS_INVALID_HANDLE, 0, 0, 0),
+        _ => return SubmitResult::Ready((STATUS_INVALID_HANDLE, 0, 0, 0)),
     };
     let dispatch = match unsafe { runtime::dispatch(route) } {
         Ok(dispatch) => dispatch,
-        Err(_) => return (STATUS_INVALID_HANDLE, 0, 0, 0),
+        Err(_) => return SubmitResult::Ready((STATUS_INVALID_HANDLE, 0, 0, 0)),
     };
     if !matches!(unsafe { runtime::current_reply(route) }, Ok(reply) if reply == active_reply_cap) {
-        return (STATUS_INVALID_HANDLE, 0, 0, 0);
+        return SubmitResult::Ready((STATUS_INVALID_HANDLE, 0, 0, 0));
     }
     let caller = match unsafe { crate::provider_registry_caller::resolve(channel) } {
         Ok(caller) => caller,
-        Err(status) => return (status as i32, 0, 0, 0),
+        Err(status) => return SubmitResult::Ready((status as i32, 0, 0, 0)),
     };
     let handler = match crate::service_sec_image::registry_live_handler_pointer() {
         Ok(handler) => handler,
-        Err(status) => return (status as i32, 0, 0, 0),
+        Err(status) => return SubmitResult::Ready((status as i32, 0, 0, 0)),
     };
     unsafe {
         crate::provider_directory_broker::dispatch(
@@ -62,6 +63,7 @@ pub(crate) fn service(
             route,
             dispatch,
             caller,
+            active_reply_cap,
             op,
             m1,
             m2,

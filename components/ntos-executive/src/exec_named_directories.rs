@@ -31,28 +31,32 @@ impl ExecNtHandler {
             Ok(caller) => caller,
             Err(status) => return status,
         };
-        let mut staged = match self.stage_native_directory_object_open(
+        if self.pending_native_directory_open_transfer.is_some() {
+            return nt_status::NtStatus::DEVICE_BUSY.raw() as u32;
+        }
+        let mut reference = match self.pm.reference_native_requestor(caller) {
+            Ok(reference) => reference,
+            Err(status) => return status,
+        };
+        let reserved = match self.reserve_native_directory_object_open(
             &captured,
             caller,
             desired_access,
             create,
         ) {
-            Ok(staged) => staged,
-            Err(status) => return status,
+            Ok(reserved) => reserved,
+            Err(status) => {
+                reference.release(&mut self.pm)
+                    .expect("unsubmitted directory requestor reference");
+                return status;
+            }
         };
-        if let Err(status) = staged.publication.publish(&mut self.pm) {
-            self.abort_staged_directory_object_open(&mut staged);
-            return status;
-        }
-        self.record_process_handle_insert(staged.publication.process_id(), staged.cap_before);
-        self.release_directory_object_security(&mut staged.security);
-        if let Err(failure) = self.process_memory_write_checked(
-            self.pi,
-            out,
-            &staged.publication.value().to_le_bytes(),
-        ) {
-            return failure.status();
-        }
-        staged.status
+        self.pending_native_directory_open_transfer = Some(
+            crate::native_directory_open_work::PendingNativeDirectoryOpen::new(
+                reserved, reference, caller, self.pi, self.current_tid,
+                self.current_badge, out,
+            ),
+        );
+        STATUS_PENDING
     }
 }

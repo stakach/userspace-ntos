@@ -72,6 +72,7 @@ enum ServiceCompletion {
         handle: u64,
         disposition: u64,
     },
+    Directory { status: i32 },
     SectionCreate {
         status: i32,
         token: u64,
@@ -96,6 +97,7 @@ impl ServiceCompletion {
                 handle,
                 disposition,
             } => (4, [status as u32 as u64, handle, disposition, 0]),
+            Self::Directory { status } => (4, [status as u32 as u64, 0, 0, 0]),
             Self::SectionCreate {
                 status,
                 token,
@@ -294,6 +296,22 @@ pub(crate) unsafe fn wake_section_create_service(
             token: if status == 0 { token } else { 0 },
             handle: if status == 0 { handle } else { 0 },
         },
+    )
+}
+
+pub(crate) unsafe fn wake_directory_service(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+    status: i32,
+) -> Result<(), Error> {
+    wake_with_completion(
+        route,
+        dispatch,
+        reply,
+        token,
+        ServiceCompletion::Directory { status },
     )
 }
 

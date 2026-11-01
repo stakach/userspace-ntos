@@ -57,6 +57,8 @@ mod registry_query_audit;
 mod provider_registry_caller;
 mod provider_directory_broker;
 mod canonical_directory_port;
+mod native_directory_open_work;
+mod native_directory_effect_work;
 mod provider_section_broker;
 mod provider_service_ingress;
 mod process_information_bridge;
@@ -6689,7 +6691,7 @@ pub(crate) static DRAIN_DUE_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SCHED_RUNTIME_READ_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to independently timed wake paths;
 /// one of them owns the whole boot, so they are timed individually.
-pub(crate) const SUBDRAIN_N: usize = 21;
+pub(crate) const SUBDRAIN_N: usize = 24;
 pub(crate) static SUBDRAIN_TICKS: [AtomicU64; SUBDRAIN_N] =
     [const { AtomicU64::new(0) }; SUBDRAIN_N];
 pub(crate) static SUBDRAIN_WOKEN: [AtomicU64; SUBDRAIN_N] =
@@ -17200,6 +17202,9 @@ unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
         + subdrain!(18, section_metadata_work::wake_due(now_100ns))
         + subdrain!(20, section_pagein_work::wake_due(now_100ns))
         + subdrain!(19, provider_section_broker::wake_due(now_100ns))
+        + subdrain!(21, provider_directory_broker::wake_due(now_100ns))
+        + subdrain!(22, native_directory_open_work::wake_due(now_100ns))
+        + subdrain!(23, native_directory_effect_work::wake_due(now_100ns))
 }
 
 /// May reply to driver waiters and establish DPC lanes; never use from ACK-only paths.
@@ -18163,6 +18168,9 @@ unsafe fn release_unpublished_sec_image_spawn(
 
 unsafe fn hosted_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
     let _ = power_manager::remove_thread_execution_state(tid);
+    native_directory_open_work::abandon_thread(tid);
+    native_directory_effect_work::abandon_thread(tid);
+    native_directory_effect_work::abandon_detached_thread(handler, tid);
     let _ = crate::service_sec_image::pending_driver_start_abandon_thread(handler, tid);
     let _ = crate::service_sec_image::lpc_receive_wait_abandon_thread(handler, tid);
     let _ = crate::service_sec_image::lpc_connect_wait_abandon_thread(handler, tid);
@@ -23278,6 +23286,20 @@ struct ExecNtHandler {
     /// vector grows beyond its boot reserve when required.
     obj_ns: alloc::vec::Vec<ObjEntry>,
     directory_security: alloc::vec::Vec<exec_handler::directory_security::DirectorySecurityRecord>,
+    /// Exact Object Manager backing for each native directory generation and its open leases.
+    canonical_directories: nt_user_host::canonical_directory_backing::CanonicalDirectoryBackings<
+        u64,
+        u64,
+        nt_types::HandleValue,
+        canonical_directory_port::NativeDirectoryPending,
+    >,
+    directory_next_owner: u64,
+    directory_cleanup: nt_user_host::canonical_directory_cleanup::DirectoryCleanupCredits<
+        native_directory_effect_work::DetachedClose,
+    >,
+    /// A native directory syscall reserved before its original Reply is parked.
+    pending_native_directory_open_transfer: Option<native_directory_open_work::PendingNativeDirectoryOpen>,
+    pending_native_directory_effect_transfer: Option<native_directory_effect_work::PendingNativeDirectoryEffect>,
     data_section_security: alloc::vec::Vec<exec_handler::named_data_sections::DataSectionSecurity>,
     data_section_names: alloc::vec::Vec<exec_handler::named_data_sections::DataSectionName>,
     /// Native image Section identities and their exact file-backed lifetime.

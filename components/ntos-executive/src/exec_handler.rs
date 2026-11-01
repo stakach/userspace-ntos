@@ -4091,6 +4091,13 @@ impl ExecNtHandler {
         );
         write_field!(obj_ns, obj_ns);
         write_field!(directory_security, directory_security);
+        write_field!(canonical_directories,
+            nt_user_host::canonical_directory_backing::CanonicalDirectoryBackings::new());
+        write_field!(directory_next_owner, 1);
+        write_field!(directory_cleanup,
+            nt_user_host::canonical_directory_cleanup::DirectoryCleanupCredits::new());
+        write_field!(pending_native_directory_open_transfer, None);
+        write_field!(pending_native_directory_effect_transfer, None);
         write_field!(data_section_security, Vec::new());
         write_field!(data_section_names, Vec::new());
         write_field!(image_sections, native_image_sections::NativeImageStore::new());
@@ -20659,6 +20666,21 @@ impl ExecNtHandler {
             nt_process::HandleObject::DiskFile { object_id, .. } => {
                 self.readonly_file_opens.retain(object_id)
             }
+            nt_process::HandleObject::ObjectDirectory(identity) => {
+                if self.canonical_directories.owner_for_local(identity).is_some() {
+                    self.directory_cleanup.reserve()
+                        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+                    match self.canonical_directories.acquire_existing(identity) {
+                        Ok(_) => Ok(()),
+                        Err(_) => {
+                            self.directory_cleanup.cancel();
+                            Err(nt_process::STATUS_INVALID_HANDLE)
+                        }
+                    }
+                } else {
+                    Ok(())
+                }
+            }
             nt_process::HandleObject::OverlayFile(file_id) => {
                 self.writable_fs_dirty = true;
                 unsafe { crate::writable_fs::retain(file_id) }
@@ -20691,6 +20713,15 @@ impl ExecNtHandler {
             }
             nt_process::HandleObject::DiskFile { object_id, .. } => {
                 let _ = self.readonly_file_opens.release(object_id);
+            }
+            nt_process::HandleObject::ObjectDirectory(identity) => {
+                if self.canonical_directories.owner_for_local(identity).is_some() {
+                    let mut port = crate::canonical_directory_port::CanonicalDirectoryPort::new();
+                    assert!(matches!(self.canonical_directories.release_local(identity, &mut port),
+                        Ok(nt_user_host::canonical_directory_backing::Publication::Ready)),
+                        "failed duplicate directory insertion retains its original lease");
+                    self.directory_cleanup.cancel();
+                }
             }
             nt_process::HandleObject::OverlayFile(file_id) => {
                 unsafe { crate::writable_fs::close(file_id) };
@@ -20819,7 +20850,7 @@ impl ExecNtHandler {
                 self.release_opaque_namespace_reference(tag);
             }
             nt_process::HandleObject::ObjectDirectory(identity) => {
-                self.release_directory_namespace_reference(identity);
+                self.release_directory_native_handle_lease(identity);
             }
             nt_process::HandleObject::RegistryKey(target) => {
                 self.release_registry_key_target(target);
@@ -25268,6 +25299,65 @@ impl ExecNtHandler {
         }
     }
 
+    fn release_directory_native_handle_lease(&mut self, identity: u64) {
+        if self.canonical_directories.owner_for_local(identity).is_some() {
+            self.directory_cleanup.detach(
+                crate::native_directory_effect_work::DetachedClose::new(identity));
+            crate::native_directory_effect_work::wake_now();
+            return;
+        }
+        self.release_directory_namespace_reference(identity);
+    }
+
+    pub(crate) fn finish_detached_directory_close(&mut self, identity: u64) {
+        let retired_backing = self.canonical_directories.owner_for_local(identity)
+            .filter(|_| self.canonical_directories.lease_count(identity) == Some(0));
+        self.release_directory_namespace_reference(identity);
+        if let Some(owner) = retired_backing {
+            self.canonical_directories.retire_terminal(owner)
+                .expect("closed native directory backing remains owned");
+        }
+    }
+
+    pub(crate) fn finish_native_directory_permanence(
+        &mut self, identity: u64, permanent: bool,
+    ) -> Result<(), u32> {
+        let index = self.directory_namespace_index_for_identity(identity)?;
+        let entry = self.obj_ns.get_mut(index).ok_or(STATUS_INVALID_HANDLE)?;
+        if !entry.is_live() || entry.kind != OBJ_KIND_DIRECTORY || entry.identity != identity {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        entry.permanent = permanent;
+        Ok(())
+    }
+
+    fn reserve_native_directory_effect(
+        &mut self, ctx: &NativeCallContext, handle: u64,
+        kind: crate::native_directory_effect_work::EffectKind,
+    ) -> Result<(), u32> {
+        if self.pending_native_directory_effect_transfer.is_some() {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        let caller = self.native_handle_caller(ctx.previous_mode)?;
+        let reservation = self.pm.reserve_native_directory_close(caller, handle)?;
+        let required = if kind == crate::native_directory_effect_work::EffectKind::Close {
+            0
+        } else { DELETE_ACCESS };
+        let identity = self.pm.validate_reserved_native_directory(&reservation, required)?;
+        self.directory_namespace_index_for_identity(identity)?;
+        if self.canonical_directories.owner_for_local(identity).is_none() {
+            return Err(0xC000_00BB); // no exact canonical backing
+        }
+        let reference = self.pm.reference_native_requestor(caller)?;
+        self.pending_native_directory_effect_transfer = Some(
+            crate::native_directory_effect_work::PendingNativeDirectoryEffect::new(
+                kind, reservation, reference, self.current_tid, self.current_badge, identity));
+        Ok(())
+    }
+
+
+    /// Release a namespace body/security pin. This is called by admission cleanup as well
+    /// as handle retirement, so it must never consume a canonical handle lease.
     fn release_directory_namespace_reference(&mut self, identity: u64) {
         let Ok(index) = self.directory_namespace_index_for_identity(identity) else {
             return;
@@ -26756,6 +26846,9 @@ impl ExecNtHandler {
         let Some(index) = self.query_object_namespace_index(object, direct_index) else {
             return STATUS_OBJECT_TYPE_MISMATCH;
         };
+        if self.obj_ns.get(index).is_some_and(|entry| entry.kind == OBJ_KIND_DIRECTORY) {
+            return 0xC000_00BB; // Directory effects require a retained native handle.
+        }
         let (was_permanent, kind, payload) = match self.obj_ns.get_mut(index) {
             Some(entry) if entry.is_live() => {
                 let state = (entry.permanent, entry.kind, entry.payload);
@@ -26786,10 +26879,13 @@ impl ExecNtHandler {
         {
             return STATUS_PRIVILEGE_NOT_HELD;
         }
-        let (object, _, direct_index) = match self.query_object_resolve(handle) {
+        let (object, granted_access, direct_index) = match self.query_object_resolve(handle) {
             Ok(resolved) => resolved,
             Err(status) => return status,
         };
+        if handle < OBJ_HANDLE_BASE && granted_access & DELETE_ACCESS != DELETE_ACCESS {
+            return 0xC000_0022;
+        }
         let Some(index) = self.query_object_namespace_index(object, direct_index) else {
             return STATUS_OBJECT_TYPE_MISMATCH;
         };
@@ -26799,6 +26895,9 @@ impl ExecNtHandler {
         };
         if was_permanent {
             return 0;
+        }
+        if kind == OBJ_KIND_DIRECTORY {
+            return 0xC000_00BB; // Directory effects require a retained native handle.
         }
         if kind == OBJ_KIND_IO_COMPLETION {
             if let Err(status) = self.io_completion_ports.retain(payload as u32) {
@@ -32625,6 +32724,15 @@ impl ExecNtHandler {
                         Ok(caller) => caller,
                         Err(status) => return status,
                     };
+                    if let Ok(target) = self.pm.inspect_native_close_target(caller, args[0]) {
+                        if let nt_process::HandleObject::ObjectDirectory(identity) = target.object() {
+                            if self.canonical_directories.owner_for_local(identity).is_some() {
+                                return self.reserve_native_directory_effect(ctx, args[0],
+                                    crate::native_directory_effect_work::EffectKind::Close)
+                                    .map_or_else(|status| status, |()| 0x103);
+                            }
+                        }
+                    }
                     match self.close_native_table_handle(caller, args[0]) {
                         Ok(closed) => closed,
                         Err(status) => return status,
@@ -36493,8 +36601,38 @@ impl ExecNtHandler {
             },
             // NtMakeTemporaryObject(ObjectHandle): reference the object with DELETE access, clear
             // OBJ_PERMANENT, and run the normal name-delete check.
-            NativeService::NtMakeTemporaryObject => self.nt_make_temporary_object(args[0]),
-            NativeService::NtMakePermanentObject => self.nt_make_permanent_object(ctx, args[0]),
+            NativeService::NtMakeTemporaryObject | NativeService::NtMakePermanentObject => {
+                let permanent = ctx.service == NativeService::NtMakePermanentObject;
+                if permanent && ctx.previous_mode != nt_syscall::ProcessorMode::KernelMode
+                    && !self.current_token_has_privilege(nt_security::SE_CREATE_PERMANENT) {
+                    return STATUS_PRIVILEGE_NOT_HELD;
+                }
+                let tagged_kernel = args[0] & nt_process::native_handle::KERNEL_HANDLE_TAG
+                    == nt_process::native_handle::KERNEL_HANDLE_TAG;
+                if tagged_kernel || args[0] < OBJ_HANDLE_BASE {
+                    if let Ok(caller) = self.native_handle_caller(ctx.previous_mode) {
+                        if let Ok(reservation) = self.pm.reserve_native_directory_close(caller, args[0]) {
+                            let identity = match self.pm.validate_reserved_native_directory(
+                                &reservation, DELETE_ACCESS) {
+                                Ok(identity) => identity,
+                                Err(status) => return status,
+                            };
+                            if self.canonical_directories.owner_for_local(identity).is_none() {
+                                return 0xC000_00BB;
+                            }
+                            let kind = if permanent {
+                                crate::native_directory_effect_work::EffectKind::Permanent
+                            } else {
+                                crate::native_directory_effect_work::EffectKind::Temporary
+                            };
+                            return self.reserve_native_directory_effect(ctx, args[0], kind)
+                                .map_or_else(|status| status, |()| 0x103);
+                        }
+                    }
+                }
+                if permanent { self.nt_make_permanent_object(ctx, args[0]) }
+                else { self.nt_make_temporary_object(args[0]) }
+            }
             // NtCreateKeyedEvent(*OutHandle, AccessMask, ObjectAttributes, Flags). ReactOS'
             // RtlpInitializeKeyedEvent ignores the returned status and later asserts that its
             // process-global keyed-event handle is non-NULL, so success must publish a real handle.

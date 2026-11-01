@@ -128,6 +128,13 @@ impl DirectoryPort for CanonicalDirectoryPort {
         Self::effect_outcome(client.make_temporary_owned(handle))
     }
 
+    fn make_permanent(&mut self, handle: Self::Handle) -> PortEffect<Self::Pending> {
+        let Some(client) = self.client() else {
+            return PortEffect::NoEffect(STATUS_DEVICE_NOT_READY);
+        };
+        Self::effect_outcome(client.make_permanent_owned(handle))
+    }
+
     fn close(&mut self, handle: Self::Handle) -> PortEffect<Self::Pending> {
         let Some(client) = self.client() else {
             return PortEffect::NoEffect(STATUS_DEVICE_NOT_READY);

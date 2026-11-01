@@ -3314,6 +3314,14 @@ fn maybe_fold_system_wal() -> Result<(), u32> {
 }
 
 fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
+    // A native directory caller owns its original Reply until the exact Object Manager
+    // request and local handle publication settle. Redrive before WAL early returns.
+    {
+        let _message = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
+        unsafe { crate::native_directory_open_work::redrive(nt_handler) };
+        unsafe { crate::native_directory_effect_work::redrive_effects(nt_handler) };
+        unsafe { crate::native_directory_effect_work::redrive_detached(nt_handler) };
+    }
     nt_handler.sweep_directory_security_bodies();
     nt_handler.sweep_data_section_security();
     // A hosted import can consume its last object reference while its primary Call still owns
@@ -5011,18 +5019,20 @@ pub(crate) unsafe fn service_win32k_directory_request(
     m1: u64,
     m2: u64,
     m3: u64,
-) -> (i32, u64, u64, u64) {
+) -> crate::provider_directory_broker::SubmitResult {
+    use crate::provider_directory_broker::SubmitResult;
     let (route, dispatch, caller) = match authenticate_win32k_service_request(
         channel, reply_cap, badge, mi, (crate::win32k_subsystem::W32_DIRECTORY_LABEL << 12) | 4,
     ) {
         Ok(owner) => owner,
-        Err(status) => return (status as i32, 0, 0, 0),
+        Err(status) => return SubmitResult::Ready((status as i32, 0, 0, 0)),
     };
     let pointer = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     if pointer.is_null() {
-        return (0xC000_00A3u32 as i32, 0, 0, 0);
+        return SubmitResult::Ready((0xC000_00A3u32 as i32, 0, 0, 0));
     }
-    crate::provider_directory_broker::dispatch(&mut *pointer, route, dispatch, caller, op, m1, m2, m3)
+    crate::provider_directory_broker::dispatch(
+        &mut *pointer, route, dispatch, caller, reply_cap, op, m1, m2, m3)
 }
 
 /// Create-only Section broker. The provider's packet is data, never caller authority.
@@ -6085,8 +6095,9 @@ pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {
         && crate::driver_launch::redrive_nested_win32k_source_work(handler);
     let section = crate::provider_section_broker::nested_work_ready()
         && crate::provider_section_broker::redrive_nested_ready(handler);
+    let directory = crate::provider_directory_broker::redrive_nested_ready(handler);
     crate::provider_mm_section_objects::redrive(handler);
-    create || query || internal_control || write || read || flush || query_information || lower_pnp || lower_file || input || kernel_file_query || win32k_async_read || lifecycle || close || source || section
+    create || query || internal_control || write || read || flush || query_information || lower_pnp || lower_file || input || kernel_file_query || win32k_async_read || lifecycle || close || source || section || directory
 }
 
 pub(crate) unsafe fn watchdog_defer_if_hosted_work_can_run(site: &[u8]) -> bool {
@@ -9624,6 +9635,9 @@ pub(crate) unsafe fn service_sec_image(
                 && !defer_quiesce_for_active_user_callbacks(b"all-live-parked")
                 && !crate::mounted_volume::mounted_read_outstanding()
                 && !driver_launch::mounted_native_physical_irp_pending()
+                && !crate::native_directory_open_work::occupied()
+                && !crate::native_directory_effect_work::has_outstanding(&nt_handler)
+                && !crate::provider_directory_broker::has_outstanding()
             {
                 print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
                 stop = $ip as u64;
@@ -9764,6 +9778,10 @@ pub(crate) unsafe fn service_sec_image(
                 && crate::section_metadata_work::next_deadline().is_none()
                 && crate::section_pagein_work::next_deadline().is_none()
                 && crate::provider_section_broker::next_deadline().is_none()
+                && !crate::native_directory_open_work::occupied()
+                && !crate::native_directory_effect_work::has_outstanding(&nt_handler)
+                && !crate::provider_directory_broker::has_outstanding()
+                && crate::provider_directory_broker::next_deadline().is_none()
             {
                 unsafe { driver_launch::print_hosted_pnp_enumeration_evidence(); }
                 driver_launch::print_mounted_native_block_quiesce_snapshot();
@@ -9945,6 +9963,7 @@ pub(crate) unsafe fn service_sec_image(
             crate::section_metadata_work::redrive(&mut nt_handler, delay_queue);
             crate::section_pagein_work::redrive(&mut nt_handler);
             crate::provider_section_broker::redrive(nt_handler as *mut _);
+            crate::provider_directory_broker::redrive(nt_handler as *mut _);
             crate::provider_mm_section_objects::redrive(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_driver_io_create_file(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_query_path_forward(nt_handler as *mut _);
@@ -11977,6 +11996,9 @@ pub(crate) unsafe fn service_sec_image(
                         && !driver_launch::active_relation_wal_retained()
                         && !crate::mounted_volume::mounted_read_outstanding()
                         && !driver_launch::mounted_native_physical_irp_pending()
+                        && !crate::native_directory_open_work::occupied()
+                        && !crate::native_directory_effect_work::has_outstanding(&nt_handler)
+                        && !crate::provider_directory_broker::has_outstanding()
                     {
                         driver_launch::print_mounted_native_block_quiesce_snapshot();
                         print_str(b"[quiesce] every live process parked/waiting (no signaler left) -> run gate\n");
@@ -12996,6 +13018,12 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_io_completion_deadline = nt_delay_execution::Deadline::Infinite;
             let mut published_file_io: Option<file_dispatch_handoff::PublishedFileIo> = None;
             let mut transfer_pending_driver_start: Option<PendingDriverStartTransfer> = None;
+            let mut transfer_native_directory_open: Option<
+                crate::native_directory_open_work::PendingNativeDirectoryOpen,
+            > = None;
+            let mut transfer_native_directory_effect: Option<
+                crate::native_directory_effect_work::PendingNativeDirectoryEffect,
+            > = None;
             let mut transfer_pending_pnp_operation: Option<PendingPnpOperationTransfer> = None;
             let mut transfer_file_irp_drain: Option<(
                 nt_io_manager::PendingFileIrpDrain,
@@ -13163,6 +13191,10 @@ pub(crate) unsafe fn service_sec_image(
                 );
                 assert!(nt_handler.pending_file_io_transfer.is_none(),
                     "previous syscall retained an accepted File transfer");
+                assert!(nt_handler.pending_native_directory_open_transfer.is_none(),
+                    "previous syscall retained a native directory Reply transfer");
+                assert!(nt_handler.pending_native_directory_effect_transfer.is_none(),
+                    "previous syscall retained a native directory effect Reply transfer");
                 nt_handler.pending_file_io_wait = false;
                 assert!(
                     nt_handler.pending_driver_start_transfer.is_none(),
@@ -13970,6 +14002,8 @@ pub(crate) unsafe fn service_sec_image(
                 if let Some(transfer) = nt_handler.pending_driver_start_transfer.take() {
                     transfer_pending_driver_start = Some(transfer);
                 }
+                transfer_native_directory_open = nt_handler.pending_native_directory_open_transfer.take();
+                transfer_native_directory_effect = nt_handler.pending_native_directory_effect_transfer.take();
                 if let Some(transfer) = nt_handler.pending_pnp_operation_transfer.take() {
                     transfer_pending_pnp_operation = Some(transfer);
                 }
@@ -19350,6 +19384,42 @@ pub(crate) unsafe fn service_sec_image(
                 m2 = nm2;
                 m3 = nm3;
                 continue;
+            }
+            if let Some(transfer) = transfer_native_directory_open.take() {
+                match unsafe { crate::native_directory_open_work::park(&mut nt_handler, transfer) } {
+                    Ok(()) => {
+                        mark_wait_parked!(pi, resume_ip);
+                        let _ = finalize_service_loop_state(&mut nt_handler);
+                        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                        let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                        badge = nb;
+                        mi = nmi;
+                        m0 = nm0;
+                        m1 = nm1;
+                        m2 = nm2;
+                        m3 = nm3;
+                        continue;
+                    }
+                    Err(status) => result = status as u64,
+                }
+            }
+            if let Some(transfer) = transfer_native_directory_effect.take() {
+                match unsafe { crate::native_directory_effect_work::park(&mut nt_handler, transfer) } {
+                    Ok(()) => {
+                        mark_wait_parked!(pi, resume_ip);
+                        let _ = finalize_service_loop_state(&mut nt_handler);
+                        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                        let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                        badge = nb;
+                        mi = nmi;
+                        m0 = nm0;
+                        m1 = nm1;
+                        m2 = nm2;
+                        m3 = nm3;
+                        continue;
+                    }
+                    Err(status) => result = status as u64,
+                }
             }
             // File ownership and reply attachment were committed before post-actions. Only
             // scheduling remains here; completion may already have retired the published owner.
