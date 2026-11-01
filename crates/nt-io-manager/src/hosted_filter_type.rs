@@ -8,9 +8,8 @@ use nt_status::NtStatus;
 
 impl<P> IoManager<P> {
     /// Check the reported type of an attached upper FDO against its exact live
-    /// class-domain projections and canonical stack. This first contract keeps
-    /// the preexisting strict type match; admitting lower-type inheritance is a
-    /// separate behavior change requiring a live regression.
+    /// class-domain projections and canonical stack. A filter may keep its
+    /// creation type or copy the type of the exact device it attached above.
     pub fn admitted_hosted_upper_filter_device_type(
         &self,
         source: HostedDevicePointerRegistration,
@@ -36,7 +35,7 @@ impl<P> IoManager<P> {
             || source_device.attached_to != Some(lower.device_id())
             || self.top_of_device_stack(pdo.device_id()) != Ok(source.device_id())
             || self.hosted_driver_address_by_identity(domain, source_device.driver_id).is_none()
-            || observed != source_device.device_type
+            || (observed != source_device.device_type && observed != lower_device.device_type)
         {
             return Err(NtStatus::INVALID_DEVICE_REQUEST);
         }
