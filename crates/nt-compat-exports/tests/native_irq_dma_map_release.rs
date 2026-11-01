@@ -133,7 +133,7 @@ fn irq_root_release_retires_the_exact_private_graph() {
         "root service must interpret the broker's four command words in the same order");
 
     let release = wiring(DRIVER, "service_hosted_irq_lane_dma_free_mapping");
-    assert!(release.calls.iter().any(|call| call == "retire_dma_private_graph"),
+    assert!(release.calls.iter().any(|call| call == "retire_dma_private_graph_typed"),
         "root must retire the captured map token and its lease, not replay a shared record");
     assert!(!release.calls.iter().any(|call| call == "free_hosted_dma_mapping_lease"
         || call == "ensure_mapping_at"),
