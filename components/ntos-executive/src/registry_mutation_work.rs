@@ -184,14 +184,16 @@ pub(crate) struct MutationPersistence {
 }
 
 impl MutationPersistence {
-    pub(crate) fn retained_native_work(&self) -> Option<nt_pnp_context::native_route_publication::RelationStorageWork> {
-        use nt_pnp_context::native_route_publication::RelationStorageWork;
+    pub(crate) fn admission_recheck_id(&self) -> Option<u64> {
         match &self.owner {
-            PersistenceOwner::Admitting { recheck_id, .. } =>
-                Some(RelationStorageWork::HeaderRecheck { id: *recheck_id }),
-            PersistenceOwner::Wal(_) => Some(RelationStorageWork::Wal),
+            PersistenceOwner::Admitting { recheck_id, .. } if *recheck_id != 0 =>
+                Some(*recheck_id),
             _ => None,
         }
+    }
+
+    pub(crate) fn has_native_wal(&self) -> bool {
+        matches!(&self.owner, PersistenceOwner::Wal(_))
     }
 
     pub(crate) fn admitting(&self) -> bool {

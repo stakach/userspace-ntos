@@ -482,6 +482,9 @@ unsafe fn advance_hosted_relation_publication(
                     if status == nt_status::NtStatus::DEVICE_BUSY.raw() {
                         return owner.pending();
                     }
+                    print_str(b"[relation-admit] validate-storage status=0x");
+                    print_hex(status as u32);
+                    print_str(b"\n");
                     owner.refusal_origin = Some(owner.phase);
                     owner.refusal = nt_status::NtStatus(status);
                     owner.phase = Phase::Abort;
@@ -506,6 +509,9 @@ unsafe fn advance_hosted_relation_publication(
                     if status == nt_status::NtStatus::DEVICE_BUSY.raw() as u32 {
                         return owner.pending();
                     }
+                    print_str(b"[relation-admit] persistence status=0x");
+                    print_hex(status);
+                    print_str(b"\n");
                     owner.refusal_origin = Some(owner.phase);
                     owner.refusal = nt_status::NtStatus(status as i32);
                     owner.phase = Phase::Abort;

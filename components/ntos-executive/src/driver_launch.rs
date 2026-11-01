@@ -53994,7 +53994,8 @@ unsafe fn retained_native_storage_relation_publication_mut() -> Option<&'static 
         previous == route
             && next.key.relation.generation == publication.parent_relation.relation().generation()
     } else {
-        publication.native_disk_proof.is_some()
+        publication.native_disk_proof.as_ref()
+            .is_some_and(|proof| proof.route() == route)
             && route.key.relation.generation == publication.parent_relation.relation().generation()
     };
     if !exact_relation
@@ -54004,23 +54005,54 @@ unsafe fn retained_native_storage_relation_publication_mut() -> Option<&'static 
     Some(publication)
 }
 
+/// Copy the retained initial child authority before nested File dispatch borrows the relation.
+/// A refresh has an accepted previous child and therefore uses the ordinary catalog route.
+/// The outer Option refuses an absent or mismatched publication; the inner Option distinguishes
+/// that accepted refresh from the unpublished initial child.
+unsafe fn retained_native_storage_wal_scsi_authority(
+    route: native_disk_relation::NativeStorageRoute,
+) -> Option<Option<PendingScsiProofAuthority>> {
+    let publication = retained_native_storage_relation_publication_mut()?;
+    if publication.claim.pdo_device_id != route.key.relation.bus_device { return None; }
+    if let Some(proof) = publication.native_disk_proof.as_ref() {
+        if native_disk_relation::initial_native_storage_route() != Some(route)
+            || proof.route() != route
+            || publication.parent_relation.relation().generation()
+                != route.key.relation.generation
+        { return None; }
+        let authority = proof.pending_authority()?;
+        if authority.relation != publication.parent_relation
+            || authority.child_pdo != route.scsi.pdo.raw()
+            || authority.provider.domain() != route.scsi.provider
+            || authority.provider.address() != route.scsi.provider_pdo
+        { return None; }
+        Some(Some(authority))
+    } else if let Some((previous, next)) = publication.native_disk_refresh {
+        (previous == route
+            && next.key.relation.generation
+                == publication.parent_relation.relation().generation()
+            && next.key.relation.bus_device == publication.claim.pdo_device_id)
+            .then_some(None)
+    } else { None }
+}
+
 pub(crate) unsafe fn native_storage_relation_recheck_id() -> Option<u64> {
     let publication = retained_native_storage_relation_publication_mut()?;
     matches!(publication.phase, HostedRelationPublicationPhase::Admit)
-        .then(|| publication.persistence.retained_native_work()?.header_recheck()).flatten()
+        .then(|| publication.persistence.admission_recheck_id()).flatten()
 }
 
 pub(crate) unsafe fn native_storage_relation_wal_retained() -> bool {
     retained_native_storage_relation_publication_mut()
-        .and_then(|publication| publication.persistence.retained_native_work())
-        .is_some_and(|work| work.needs_pump())
+        .is_some_and(|publication| publication.persistence.admission_recheck_id().is_some()
+            || publication.persistence.has_native_wal())
 }
 
 pub(crate) unsafe fn claim_native_relation_wal_io()
     -> Option<crate::writable_fs::native_snapshot_io::SnapshotClaim>
 {
     let publication = retained_native_storage_relation_publication_mut()?;
-    if !publication.persistence.retained_native_work()?.wal() { return None; }
+    if !publication.persistence.has_native_wal() { return None; }
     let (request, operation, input, mount) = publication.persistence.claim_native_wal_io().ok()??;
     Some(crate::writable_fs::native_snapshot_io::SnapshotClaim::from_relation_wal(
         mount, operation, input, publication.claim, request,

@@ -93,6 +93,14 @@ pub(super) enum ProofProgress {
 }
 
 impl NativeDiskProof {
+    pub(super) fn route(&self) -> NativeStorageRoute { self.route }
+
+    pub(super) fn pending_authority(&self) -> Option<PendingScsiProofAuthority> {
+        (self.handoff.phase() == HandoffPhase::NativeMounted
+            && self.entered.is_none() && self.reserved.is_none())
+            .then_some(self.pending_authority)
+    }
+
     /// A physical request remains owned until its exact terminal output is acknowledged.
     pub(super) fn entered_irp(&self) -> Option<IrpId> {
         self.entered.as_ref().map(|entered| entered.irp)
@@ -325,6 +333,15 @@ pub(crate) fn native_storage_route() -> Option<NativeStorageRoute> {
 /// Neither initial publication nor refresh exposes the route to ordinary mounted requests.
 pub(crate) fn retained_native_storage_recheck_route() -> Option<NativeStorageRoute> {
     unsafe { (*core::ptr::addr_of!(NATIVE_STORAGE_PUBLICATION)).retained_recheck_route() }
+}
+
+pub(crate) fn initial_native_storage_route() -> Option<NativeStorageRoute> {
+    unsafe {
+        match *core::ptr::addr_of!(NATIVE_STORAGE_PUBLICATION) {
+            Publication::Initial { route } => Some(route),
+            _ => None,
+        }
+    }
 }
 
 pub(super) fn begin_native_storage_refresh(

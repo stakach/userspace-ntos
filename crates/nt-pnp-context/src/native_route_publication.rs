@@ -53,26 +53,10 @@ impl<R: Copy + Eq> NativeRoutePublication<R> {
     }
 }
 
-/// Retained work in the active relation publication. The owner survives a callback and may
-/// advance only while the matching physical route is withheld from ordinary mounted I/O.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RelationStorageWork {
-    HeaderRecheck { id: u64 },
-    Wal,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RelationWalClaim<I, Q> {
     pub owner: I,
     pub request: Q,
-}
-
-impl RelationStorageWork {
-    pub const fn needs_pump(self) -> bool { true }
-    pub const fn header_recheck(self) -> Option<u64> {
-        match self { Self::HeaderRecheck { id } if id != 0 => Some(id), _ => None }
-    }
-    pub const fn wal(self) -> bool { matches!(self, Self::Wal) }
 }
 
 impl<I: Eq, Q: Eq> RelationWalClaim<I, Q> {
@@ -83,19 +67,10 @@ impl<I: Eq, Q: Eq> RelationWalClaim<I, Q> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeRoutePublication as Publication, RelationStorageWork, RelationWalClaim};
+    use super::{NativeRoutePublication as Publication, RelationWalClaim};
 
     #[test]
-    fn retained_relation_work_stays_pumpable_through_wal_and_abort() {
-        let header = RelationStorageWork::HeaderRecheck { id: 9 };
-        assert!(header.needs_pump());
-        assert_eq!(header.header_recheck(), Some(9));
-        assert!(!header.wal());
-        let wal = RelationStorageWork::Wal;
-        assert!(wal.needs_pump());
-        assert!(wal.wal());
-        assert_eq!(wal.header_recheck(), None);
-
+    fn retained_relation_claim_stays_bound_to_exact_owner_and_request() {
         let claimed = RelationWalClaim { owner: 41u64, request: 7u64 };
         assert!(claimed.matches(41, 7));
         assert!(!claimed.matches(42, 7));
