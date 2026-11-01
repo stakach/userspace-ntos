@@ -202,6 +202,44 @@ fn definite_native_commit_failure_rolls_back_permanent_canonical_name() {
     assert_eq!(backing.retire_terminal(11), Ok(()));
 }
 
+#[test]
+fn failed_native_handle_publication_reaps_created_permanent_directory() {
+    let mut server = Server::new().unwrap();
+    let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
+    let mut client = ObjectClient::new(Direct { server: &mut server, client: cid });
+    let path: Vec<u16> = "\\Device\\BoundRollback".encode_utf16().collect();
+    let mut backing = CanonicalDirectoryBackings::<u64, u64, HandleValue, ()>::new();
+    backing.reserve(30, DirectoryAction::Create, &path, AccessMask::GENERIC_READ.bits(),
+        (ObjAttrFlags::CASE_INSENSITIVE | ObjAttrFlags::PERMANENT).bits()).unwrap();
+    assert_eq!(backing.publish(30, &mut client), Ok(Publication::Ready));
+    backing.bind_local(30, 130).unwrap();
+    assert_eq!(backing.rollback_bound(130, &mut client), Ok(Publication::Ready));
+    assert_eq!(backing.owner_for_local(130), None);
+    assert!(client.lookup("\\Device\\BoundRollback", true).is_err());
+    assert_eq!(backing.retire_terminal(30), Ok(()));
+}
+
+#[test]
+fn failed_open_if_native_publication_preserves_existing_permanent_name() {
+    let mut server = Server::new().unwrap();
+    let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
+    let mut client = ObjectClient::new(Direct { server: &mut server, client: cid });
+    let name = UnicodeString::from_str("\\Device\\ExistingBoundRollback");
+    let existing = client.create_directory_handle(None, &name, AccessMask::DELETE,
+        ObjAttrFlags::CASE_INSENSITIVE | ObjAttrFlags::PERMANENT).unwrap();
+    let path: Vec<u16> = "\\Device\\ExistingBoundRollback".encode_utf16().collect();
+    let mut backing = CanonicalDirectoryBackings::<u64, u64, HandleValue, ()>::new();
+    backing.reserve(31, DirectoryAction::Create, &path, AccessMask::GENERIC_READ.bits(),
+        (ObjAttrFlags::CASE_INSENSITIVE | ObjAttrFlags::OPEN_IF
+            | ObjAttrFlags::PERMANENT).bits()).unwrap();
+    assert_eq!(backing.publish(31, &mut client), Ok(Publication::Ready));
+    backing.bind_local(31, 131).unwrap();
+    assert_eq!(backing.rollback_bound(131, &mut client), Ok(Publication::Ready));
+    client.close_handle(existing.handle).unwrap();
+    assert!(client.lookup("\\Device\\ExistingBoundRollback", true).is_ok());
+    assert_eq!(backing.retire_terminal(31), Ok(()));
+}
+
 struct DelayedPort { create_calls: u32, close_calls: u32, create_ready: bool, close_ready: bool,
     incoherent: bool }
 
@@ -262,6 +300,81 @@ fn uncertain_create_and_close_hold_exact_owner_without_replay() {
     assert_eq!(backing.poll_close(5, &mut port), Ok(Some(Publication::Ready)));
     assert_eq!(port.close_calls, 1);
     backing.retire_terminal(1).unwrap();
+}
+
+#[test]
+fn uncertain_bound_rollback_keeps_identity_until_exact_close_terminal() {
+    let mut port = DelayedPort { create_calls: 0, close_calls: 0,
+        create_ready: true, close_ready: false, incoherent: false };
+    let path: Vec<u16> = "\\Device\\PendingBoundRollback".encode_utf16().collect();
+    let mut backing = CanonicalDirectoryBackings::<u64, u64, u64, u64>::new();
+    backing.reserve(32, DirectoryAction::Create, &path, 0,
+        ObjAttrFlags::PERMANENT.bits()).unwrap();
+    assert_eq!(backing.publish(32, &mut port), Ok(Publication::Pending));
+    assert_eq!(backing.poll_publish(32, &mut port), Ok(Some(Publication::Ready)));
+    backing.bind_local(32, 132).unwrap();
+    assert_eq!(backing.rollback_bound(132, &mut port), Ok(Publication::Pending));
+    assert_eq!(backing.lease_count(132), Some(0));
+    assert_eq!(backing.owner_for_local(132), Some(32));
+    assert_eq!(backing.rollback_bound(132, &mut port), Err(BackingError::InvalidPhase));
+    assert_eq!(backing.poll_rollback(32, &mut port), Ok(None));
+    assert_eq!(port.close_calls, 1);
+    port.close_ready = true;
+    assert_eq!(backing.poll_rollback(32, &mut port), Ok(Some(Publication::Ready)));
+    assert_eq!(backing.owner_for_local(132), None);
+    assert_eq!(port.close_calls, 1);
+    backing.retire_terminal(32).unwrap();
+}
+
+struct DelayedTemporaryPort { temporary_calls: u32, close_calls: u32, ready: bool }
+
+impl DirectoryPort for DelayedTemporaryPort {
+    type Handle = u64;
+    type Pending = u64;
+    fn create(&mut self, _: &[u16], _: u32, _: u32) -> PortCreate<u64, u64> {
+        PortCreate::Completed(Ok(CanonicalHandle { handle: 88, created: true }))
+    }
+    fn open(&mut self, _: &[u16], _: u32, _: u32) -> PortCreate<u64, u64> {
+        unreachable!()
+    }
+    fn poll_create(&mut self, _: &mut u64) -> Option<PortTerminal<CanonicalHandle<u64>>> {
+        None
+    }
+    fn make_temporary(&mut self, handle: u64) -> PortEffect<u64> {
+        assert_eq!(handle, 88);
+        self.temporary_calls += 1;
+        PortEffect::Indeterminate(44)
+    }
+    fn make_permanent(&mut self, _: u64) -> PortEffect<u64> { unreachable!() }
+    fn close(&mut self, handle: u64) -> PortEffect<u64> {
+        assert_eq!(handle, 88);
+        self.close_calls += 1;
+        PortEffect::Completed(Ok(()))
+    }
+    fn poll_effect(&mut self, pending: &mut u64) -> Option<PortTerminal<()>> {
+        assert_eq!(*pending, 44);
+        self.ready.then_some(PortTerminal::Success(()))
+    }
+}
+
+#[test]
+fn uncertain_bound_rollback_make_temporary_settles_before_exact_close() {
+    let mut port = DelayedTemporaryPort { temporary_calls: 0, close_calls: 0, ready: false };
+    let path: Vec<u16> = "\\Device\\PendingTemporaryRollback".encode_utf16().collect();
+    let mut backing = CanonicalDirectoryBackings::<u64, u64, u64, u64>::new();
+    backing.reserve(33, DirectoryAction::Create, &path, 0,
+        ObjAttrFlags::PERMANENT.bits()).unwrap();
+    assert_eq!(backing.publish(33, &mut port), Ok(Publication::Ready));
+    backing.bind_local(33, 133).unwrap();
+    assert_eq!(backing.rollback_bound(133, &mut port), Ok(Publication::Pending));
+    assert_eq!(backing.owner_for_local(133), Some(33));
+    assert_eq!(backing.poll_rollback(33, &mut port), Ok(None));
+    assert_eq!((port.temporary_calls, port.close_calls), (1, 0));
+    port.ready = true;
+    assert_eq!(backing.poll_rollback(33, &mut port), Ok(Some(Publication::Ready)));
+    assert_eq!((port.temporary_calls, port.close_calls), (1, 1));
+    assert_eq!(backing.owner_for_local(133), None);
+    backing.retire_terminal(33).unwrap();
 }
 
 #[test]

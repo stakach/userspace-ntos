@@ -201,6 +201,7 @@ impl<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P> CanonicalDirectoryBackings<O, 
         let row = self.rows.iter_mut().find(|row| row.owner == owner)
             .ok_or(BackingError::WrongOwner)?;
         let Phase::Ready(handle) = row.phase else { return Err(BackingError::InvalidPhase); };
+        if row.local.is_some() { return Err(BackingError::InvalidPhase); }
         row.local = Some(local);
         row.leases = 1;
         row.phase = Phase::Bound(handle);
@@ -227,12 +228,28 @@ impl<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P> CanonicalDirectoryBackings<O, 
 
     /// Undo a canonical publication when the native mirror could not commit.
     /// A pending cleanup keeps the owner row and canonical handle reserved.
+    pub fn rollback_bound(&mut self, local: L,
+        port: &mut impl DirectoryPort<Handle=H, Pending=P>)
+        -> Result<Publication, BackingError> {
+        let row = self.rows.iter_mut().find(|row| row.local == Some(local))
+            .ok_or(BackingError::WrongOwner)?;
+        let Phase::Bound(handle) = row.phase else { return Err(BackingError::InvalidPhase); };
+        if row.leases != 1 { return Err(BackingError::InvalidPhase); }
+        // Only the unpublished local handle lease is gone. Keep its identity in
+        // the row until exact canonical cleanup settles, including uncertain
+        // make-temporary and close effects.
+        row.leases = 0;
+        row.phase = Phase::Ready(handle);
+        let owner = row.owner;
+        self.rollback_ready(owner, port)
+    }
+
     pub fn rollback_ready(&mut self, owner: O,
         port: &mut impl DirectoryPort<Handle=H, Pending=P>)
         -> Result<Publication, BackingError> {
         let row = self.rows.iter_mut().find(|row| row.owner == owner)
             .ok_or(BackingError::WrongOwner)?;
-        if row.local.is_some() { return Err(BackingError::InvalidPhase); }
+        if row.leases != 0 { return Err(BackingError::InvalidPhase); }
         let Phase::Ready(handle) = row.phase else { return Err(BackingError::InvalidPhase); };
         if handle.created && row.permanence == Permanence::Permanent {
             match port.make_temporary(handle.handle) {
@@ -258,6 +275,7 @@ impl<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P> CanonicalDirectoryBackings<O, 
         match port.close(handle.handle) {
             PortEffect::NoEffect(status) => Err(BackingError::NoEffect(status)),
             PortEffect::Completed(Ok(())) => {
+                row.local = None;
                 row.phase = Phase::Aborted;
                 Ok(Publication::Ready)
             }
@@ -278,7 +296,7 @@ impl<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P> CanonicalDirectoryBackings<O, 
         -> Result<Option<Publication>, BackingError> {
         let row = self.rows.iter_mut().find(|row| row.owner == owner)
             .ok_or(BackingError::WrongOwner)?;
-        if row.local.is_some() { return Err(BackingError::InvalidPhase); }
+        if row.leases != 0 { return Err(BackingError::InvalidPhase); }
         if let Phase::RollbackTemporary(handle, pending) = &mut row.phase {
             let handle = *handle;
             match port.poll_effect(pending) {
@@ -305,6 +323,7 @@ impl<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P> CanonicalDirectoryBackings<O, 
         match port.poll_effect(pending) {
             None => Ok(None),
             Some(PortTerminal::Success(())) => {
+                row.local = None;
                 row.phase = Phase::Aborted;
                 Ok(Some(Publication::Ready))
             }
