@@ -37,8 +37,25 @@ pub(super) fn invoke(
     if trace_connect {
         trace_port_connect_execute(0, projection.irp_id, projection.device_id);
     }
-    let (input, output) = invocation.buffers_mut().split();
-    let result = execute(instance_index, Some(caller), &projection, input, output);
+    let result = {
+        let (input, output) = invocation.buffers_mut().split();
+        if let IoParameters::Scsi(parameters) = &projection.parameters {
+            match nt_io_manager::scsi_srb_wire::encode_scsi_dispatch_input(
+                parameters, projection.irp_id, input,
+            ) {
+                Ok(packet) => execute(instance_index, Some(caller), &projection, &packet, output),
+                Err(error) => HostedIrpTransportResult::NotDispatched {
+                    status: match error {
+                        nt_io_manager::scsi_srb_wire::ScsiWireError::NoCapacity =>
+                            nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+                        _ => nt_status::NtStatus::INVALID_PARAMETER,
+                    },
+                },
+            }
+        } else {
+            execute(instance_index, Some(caller), &projection, input, output)
+        }
+    };
     if trace_connect {
         trace_port_connect_execute(1, projection.irp_id, projection.device_id);
     }

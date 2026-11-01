@@ -49089,13 +49089,8 @@ fn hosted_irp_explicit_transfer_dispatch(
         if input_len != transfer || output_len != 64 + 0x58 + transfer
             || ctx.system_buffer.len() < output_len
         { return Err(nt_status::NtStatus::INVALID_PARAMETER); }
-        let input = &ctx.system_buffer[..transfer];
-        let packet = nt_io_manager::scsi_srb_wire::encode_scsi_wire_request(
-            parameters.route,
-            irp.irp_id,
-            parameters.srb,
-            &input[..parameters.data_length as usize],
-            &input[parameters.data_length as usize..],
+        let packet = nt_io_manager::scsi_srb_wire::encode_scsi_dispatch_input(
+            parameters, irp.irp_id, &ctx.system_buffer[..transfer],
         ).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
         return Ok(hosted_file_dispatch::execute(
             instance,
