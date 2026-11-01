@@ -26,7 +26,7 @@ fn trace_ps_create_event(stage: &[u8], route: PeerRoute, reply: u64, info: u64) 
     if PS_CREATE_RECEIVE_TRACE.load(Ordering::Relaxed) == 0 {
         return;
     }
-    let counter = if stage == b"autonomous-message" {
+    let counter = if stage.starts_with(b"autonomous-") {
         &PS_CREATE_AUTONOMOUS_EVENTS
     } else {
         &PS_CREATE_RECEIVE_EVENTS
@@ -272,6 +272,7 @@ pub(super) unsafe fn receive(
                     trace_ps_create_receive(ch, b"autonomous-found", Some(sender));
                     service_autonomous(sender)
                         .expect("autonomous failure retains its own source and parent scope");
+                    trace_ps_create_event(b"autonomous-return", sender, 0, 0);
                     trace_ps_create_receive(ch, b"autonomous-return", Some(sender));
                     continue;
                 }
@@ -401,6 +402,7 @@ pub(super) unsafe fn service_autonomous(route: PeerRoute) -> Result<(), runtime:
             nt_user_host::component_pump::ComponentPumpAccounting::new(false),
             &mut seh.pump,
         );
+        trace_ps_create_event(b"autonomous-pump-exit", route, reply, 0);
         let suspended = outcome.callback_suspended
             || outcome.provider_wait_suspended
             || outcome.lpc_wait_suspended;
