@@ -20,6 +20,31 @@ fn disk_metadata_read_overrides_verify_volume_without_changing_source_buffers() 
 }
 
 #[test]
+fn disk_metadata_write_preserves_source_and_overrides_verify_volume() {
+    for flags in [DO_BUFFERED_IO, DO_DIRECT_IO, 0] {
+        let ordinary = plan_synchronous_fsd_request(
+            major::IRP_MJ_WRITE, 2, flags, 0x1000, 0x2000, 512, Some(1024),
+        ).unwrap();
+        let metadata = plan_disk_metadata_write(
+            2, flags, 0x1000, 0x2000, 512, 1024,
+        ).unwrap();
+        assert_eq!(ordinary.stack.flags & SL_OVERRIDE_VERIFY_VOLUME, 0);
+        assert_eq!(metadata.stack.flags & SL_OVERRIDE_VERIFY_VOLUME, SL_OVERRIDE_VERIFY_VOLUME);
+        assert_eq!(metadata.stack.parameters, ordinary.stack.parameters);
+        assert_eq!(metadata.mdl, ordinary.mdl);
+        assert_eq!(metadata.system_buffer_input, ordinary.system_buffer_input);
+        assert_eq!(metadata.system_buffer_input_len, ordinary.system_buffer_input_len);
+        assert_eq!(metadata.user_buffer, ordinary.user_buffer);
+    }
+    for (device, buffer, length) in [(0, 0x2000, 512), (0x1000, 0, 512), (0x1000, 0x2000, 0)] {
+        assert_eq!(
+            plan_disk_metadata_write(2, DO_DIRECT_IO, device, buffer, length, 0),
+            Err(KernelIrpPlanError::InvalidIrpHeader),
+        );
+    }
+}
+
+#[test]
 fn dispatch_cursor_stays_inside_the_exact_source_irp_stack() {
     let base = 0x1000_2000;
     let count = 2;

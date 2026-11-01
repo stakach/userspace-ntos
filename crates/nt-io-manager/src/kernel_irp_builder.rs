@@ -246,6 +246,30 @@ pub fn plan_disk_metadata_read(
     Ok(plan)
 }
 
+/// A partition-table write must carry the caller's exact sector bytes through
+/// the source IRP and bypass a stale volume-verification gate. The native
+/// materializer captures or pins that input before publishing the IRP.
+pub fn plan_disk_metadata_write(
+    stack_size: u8,
+    device_flags: u32,
+    device_object: u64,
+    buffer: u64,
+    length: u32,
+    byte_offset: u64,
+) -> Result<KernelBuiltIrpPlan, KernelIrpPlanError> {
+    if device_object == 0 || buffer == 0 || length == 0
+        || buffer.checked_add(u64::from(length)).is_none()
+    {
+        return Err(KernelIrpPlanError::InvalidIrpHeader);
+    }
+    let mut plan = plan_synchronous_fsd_request(
+        major::IRP_MJ_WRITE, stack_size, device_flags,
+        device_object, buffer, length, Some(byte_offset),
+    )?;
+    plan.stack.flags |= SL_OVERRIDE_VERIFY_VOLUME;
+    Ok(plan)
+}
+
 /// Plan a kernel-owned `IRP_MJ_SYSTEM_CONTROL / IRP_MN_REGINFO` request.
 /// The materializer allocates `system_buffer_len`, inserts that exact pointer
 /// into the WMI stack parameter, and registers both allocations in the source

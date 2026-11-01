@@ -6,7 +6,8 @@
 
 use super::*;
 use nt_io_manager::kernel_irp_builder::{
-    plan_device_io_control_request, plan_disk_metadata_read, plan_synchronous_fsd_request,
+    plan_device_io_control_request, plan_disk_metadata_read, plan_disk_metadata_write,
+    plan_synchronous_fsd_request,
     plan_wmi_reginfo_request,
     KernelBuiltIrpPlan, MdlAccess,
 };
@@ -201,6 +202,25 @@ pub(super) unsafe fn build_disk_metadata_read(
     }
     let Some((stack_count, device_flags)) = device_contract(device) else { return 0; };
     let Ok(plan) = plan_disk_metadata_read(
+        stack_count, device_flags, device, buffer, length, byte_offset,
+    ) else { return 0; };
+    materialize_fsd_plan(plan, event, iosb)
+}
+
+/// Build one retained sector write for a checked partition-table mutation.
+/// `materialize_fsd_plan` captures buffered input or pins direct input before
+/// source registration, and the caller keeps its buffer until terminal IOSB.
+pub(super) unsafe fn build_disk_metadata_write(
+    device: u64,
+    buffer: u64,
+    length: u32,
+    byte_offset: u64,
+    event: u64,
+    iosb: u64,
+) -> u64 {
+    if device == 0 || event == 0 || iosb == 0 { return 0; }
+    let Some((stack_count, device_flags)) = device_contract(device) else { return 0; };
+    let Ok(plan) = plan_disk_metadata_write(
         stack_count, device_flags, device, buffer, length, byte_offset,
     ) else { return 0; };
     materialize_fsd_plan(plan, event, iosb)
