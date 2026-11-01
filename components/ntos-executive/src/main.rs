@@ -21030,6 +21030,7 @@ fn hosted_pci_resource_bar_eligible(device: &nt_pnp::PciDevice) -> bool {
 
 unsafe fn claim_hosted_pci_memory_grants(
     bi: &BootInfo,
+    authority: &mut HostedPciBarClaimAuthority,
     device: &nt_pnp::PciDevice,
     boot_storage_bar: Option<BootStorageBarClaim>,
 ) -> Option<Vec<HostedPciMemoryGrant>> {
@@ -21060,9 +21061,14 @@ unsafe fn claim_hosted_pci_memory_grants(
                     base: existing.run.base,
                     pages: requested_pages,
                 })?
-        } else {
+        } else if let Some(framebuffer) =
             existing_boot_framebuffer_bar_cap_run(bar.base, requested_pages)
-                .or_else(|| claim_device_frame_caps(bi, bar.base, requested_pages))?
+        {
+            authority
+                .allows_framebuffer_borrow(device, bar)
+                .then_some(framebuffer)?
+        } else {
+            claim_hosted_pci_bar_frame_caps(bi, authority, device, bar, requested_pages)?
         };
         grants.push(HostedPciMemoryGrant {
             bar_index: bar.index,
@@ -21077,6 +21083,7 @@ unsafe fn claim_hosted_pci_memory_grants(
 
 unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
     bi: &BootInfo,
+    authority: &mut HostedPciBarClaimAuthority,
     pci_devices: &[nt_pnp::PciDevice],
     plans: &[&InlineDriverLaunchPlan],
     boot_storage_bar: Option<BootStorageBarClaim>,
@@ -21096,7 +21103,7 @@ unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
                     report.barless_devnodes += 1;
                     continue;
                 }
-                let Some(memory) = claim_hosted_pci_memory_grants(bi, device, boot_storage_bar) else {
+                let Some(memory) = claim_hosted_pci_memory_grants(bi, authority, device, boot_storage_bar) else {
                     report.claim_failures += 1;
                     continue;
                 };
@@ -27162,6 +27169,8 @@ pub(crate) static EXPLORER_GDI_MAPPED: AtomicU64 = AtomicU64::new(0);
 static FB_BAR_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
 static FB_BAR_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
 static FB_BAR_PADDR: AtomicU64 = AtomicU64::new(0);
+/// Retyping may have changed the source even when the framebuffer map did not publish.
+static FB_BAR_ATTEMPTED_PADDR: AtomicU64 = AtomicU64::new(0);
 /// Byte offset of the bootloader scanout view from `FB_BAR_PADDR`.
 static FB_SCANOUT_BAR_OFFSET: AtomicU64 = AtomicU64::new(0);
 static FB_WIDTH: AtomicU64 = AtomicU64::new(0);
@@ -27785,6 +27794,163 @@ struct DeviceFrameCapRun {
     pages: u64,
 }
 
+/// Boot-lifetime authority for fresh PCI BAR frame retypes. A claim is recorded before its
+/// first native effect and is never retried after a partial or uncertain retype. Published
+/// PnP context generations borrow these source caps; their retirement does not delete them.
+struct HostedPciBarClaim {
+    bus: u8,
+    dev: u8,
+    func: u8,
+    bar_index: u8,
+    phys: u64,
+    untyped: u64,
+    run: DeviceFrameCapRun,
+    attempted_pages: u64,
+    complete: bool,
+}
+
+#[derive(Clone, Copy)]
+struct HostedPciBarIdentity {
+    bus: u8,
+    dev: u8,
+    func: u8,
+    index: u8,
+    phys: u64,
+}
+
+impl HostedPciBarIdentity {
+    fn matches(self, device: &nt_pnp::PciDevice, bar: &nt_pnp::Bar) -> bool {
+        self.bus == device.bus
+            && self.dev == device.dev
+            && self.func == device.func
+            && self.index == bar.index
+            && self.phys == bar.base
+    }
+}
+
+#[derive(Default)]
+struct HostedPciBarClaimAuthority {
+    claims: Vec<HostedPciBarClaim>,
+    borrowed_storage_phys: Option<u64>,
+    borrowed_storage_source: Option<u64>,
+    borrowed_framebuffer_phys: Option<u64>,
+    borrowed_framebuffer_source: Option<u64>,
+    framebuffer_owner: Option<HostedPciBarIdentity>,
+}
+
+impl HostedPciBarClaimAuthority {
+    fn register_borrowed_sources(
+        &mut self,
+        bi: &BootInfo,
+        devices: &[nt_pnp::PciDevice],
+        storage_phys: Option<u64>,
+        framebuffer_phys: Option<u64>,
+    ) {
+        self.borrowed_storage_phys = storage_phys;
+        self.borrowed_framebuffer_phys = framebuffer_phys;
+        self.borrowed_storage_source = storage_phys.and_then(|phys| {
+            unique_device_untyped_containing(bi, phys, 0x1000).map(|region| region.cap)
+        });
+        self.borrowed_framebuffer_source = framebuffer_phys.and_then(|phys| {
+            unique_device_untyped_containing(bi, phys, 0x1000).map(|region| region.cap)
+        });
+        let Some(phys) = framebuffer_phys else {
+            return;
+        };
+        let mut owner = None;
+        for device in devices {
+            for bar in device.bars.iter().filter(|bar| bar.is_present() && !bar.is_io && bar.base == phys) {
+                if owner.is_some() {
+                    // A physical BAR shared by multiple PCI identities has no unique borrower.
+                    self.framebuffer_owner = None;
+                    return;
+                }
+                owner = Some(HostedPciBarIdentity {
+                    bus: device.bus,
+                    dev: device.dev,
+                    func: device.func,
+                    index: bar.index,
+                    phys,
+                });
+            }
+        }
+        self.framebuffer_owner = owner;
+    }
+
+    fn allows_framebuffer_borrow(&self, device: &nt_pnp::PciDevice, bar: &nt_pnp::Bar) -> bool {
+        self.framebuffer_owner
+            .is_some_and(|owner| owner.matches(device, bar))
+    }
+
+    fn existing(
+        &self,
+        device: &nt_pnp::PciDevice,
+        bar: &nt_pnp::Bar,
+    ) -> Option<DeviceFrameCapRun> {
+        self.claims
+            .iter()
+            .find(|claim| claim.complete && claim.matches(device, bar))
+            .map(|claim| claim.run)
+    }
+
+    fn has_source_conflict(&self, untyped: u64, phys: u64) -> bool {
+        self.borrowed_storage_phys == Some(phys)
+            || self.borrowed_framebuffer_phys == Some(phys)
+            || self.borrowed_storage_source == Some(untyped)
+            || self.borrowed_framebuffer_source == Some(untyped)
+            || self.claims.iter().any(|claim| claim.untyped == untyped)
+    }
+
+    fn reserve(&mut self) -> bool {
+        self.claims.try_reserve(1).is_ok()
+    }
+
+    fn record(
+        &mut self,
+        device: &nt_pnp::PciDevice,
+        bar: &nt_pnp::Bar,
+        untyped: u64,
+        run: DeviceFrameCapRun,
+    ) {
+        self.claims.push(HostedPciBarClaim {
+            bus: device.bus,
+            dev: device.dev,
+            func: device.func,
+            bar_index: bar.index,
+            phys: bar.base,
+            untyped,
+            run,
+            attempted_pages: 0,
+            complete: false,
+        });
+    }
+
+    fn record_attempt(&mut self, slot: u64) {
+        let claim = self.claims.last_mut().expect("PCI BAR retype has a claim");
+        assert!(!claim.complete);
+        assert_eq!(claim.run.base + claim.attempted_pages, slot);
+        assert!(claim.attempted_pages < claim.run.pages);
+        claim.attempted_pages += 1;
+    }
+
+    fn mark_complete(&mut self, device: &nt_pnp::PciDevice, bar: &nt_pnp::Bar) {
+        let claim = self.claims.last_mut().expect("PCI BAR retype has a claim");
+        assert!(claim.matches(device, bar));
+        assert_eq!(claim.attempted_pages, claim.run.pages);
+        claim.complete = true;
+    }
+}
+
+impl HostedPciBarClaim {
+    fn matches(&self, device: &nt_pnp::PciDevice, bar: &nt_pnp::Bar) -> bool {
+        self.bus == device.bus
+            && self.dev == device.dev
+            && self.func == device.func
+            && self.bar_index == bar.index
+            && self.phys == bar.base
+    }
+}
+
 #[derive(Clone, Copy)]
 struct BootStorageBarClaim {
     bus: u8,
@@ -27849,6 +28015,72 @@ fn unique_device_untyped_containing(
         }
     }
     result
+}
+
+/// Retype a PCI BAR from the exact device untyped descriptor and retain every attempted slot.
+/// A partial or uncertain native effect permanently consumes this source for this boot.
+unsafe fn claim_hosted_pci_bar_frame_caps(
+    bi: &BootInfo,
+    authority: &mut HostedPciBarClaimAuthority,
+    device: &nt_pnp::PciDevice,
+    bar: &nt_pnp::Bar,
+    n: u64,
+) -> Option<DeviceFrameCapRun> {
+    let bytes = n.checked_mul(0x1000)?;
+    if n == 0 || bar.base & 0xFFF != 0 || bytes > bar.size.div_ceil(0x1000).checked_mul(0x1000)? {
+        return None;
+    }
+    if let Some(run) = authority.existing(device, bar) {
+        return (run.pages >= n).then_some(DeviceFrameCapRun {
+            base: run.base,
+            pages: n,
+        });
+    }
+    let count = bi.untyped.end.checked_sub(bi.untyped.start)?;
+    let mut source = None;
+    for index in 0..count {
+        let descriptor = bi.untyped_list[index as usize];
+        if descriptor.is_device != 1 || descriptor.paddr != bar.base {
+            continue;
+        }
+        let size = 1u64.checked_shl(descriptor.size_bits as u32)?;
+        if size < bytes || source.is_some() {
+            return None;
+        }
+        source = Some(bi.untyped.start + index);
+    }
+    let untyped = source?;
+    if authority.has_source_conflict(untyped, bar.base) || !authority.reserve() {
+        return None;
+    }
+    let base = try_alloc_slot_run(n)?;
+    let run = DeviceFrameCapRun { base, pages: n };
+    authority.record(device, bar, untyped, run);
+    for page in 0..n {
+        let slot = base + page;
+        authority.record_attempt(slot);
+        let err = untyped_retype_from_r(untyped, OBJ_X86_4K_PAGE, PAGING_BITS, 1, slot);
+        if err != 0 {
+            // The failed call may have changed native state. Retain its slot and all prior
+            // successful caps; only slots never submitted to the kernel can be recycled.
+            for untouched in page + 1..n {
+                recycle_deleted_root_slot(base + untouched);
+            }
+            print_str(b"[driver-launch] PCI BAR frame cap claim failed paddr=0x");
+            print_hex((bar.base >> 32) as u32);
+            print_hex(bar.base as u32);
+            print_str(b" page=");
+            print_u64(page);
+            print_str(b"/");
+            print_u64(n);
+            print_str(b" err=");
+            print_u64(err);
+            print_str(b"\n");
+            return None;
+        }
+    }
+    authority.mark_complete(device, bar);
+    Some(run)
 }
 
 /// Claim BAR frame caps without mapping them into the executive. The hosted-driver resource broker
@@ -29204,6 +29436,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 pt_va += 0x20_0000;
             }
 
+            FB_BAR_ATTEMPTED_PADDR.store(region.paddr, Ordering::Release);
             let run = claim_device_frame_caps(bi, region.paddr, region.pages);
             if let Some(run) = run {
                 map_ok = true;
@@ -30219,8 +30452,24 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         &mut passed,
     );
     let mut hosted_pci_hardware_grants = Vec::new();
+    // BAR source caps outlive each published PnP context generation. Borrowed boot-storage
+    // and framebuffer caps retain their original owners; this ledger owns new retypes.
+    let mut hosted_pci_bar_claim_authority = HostedPciBarClaimAuthority::default();
+    let storage_attempted_phys = (found_storage && storage_bar5 & 0xFFFF_FFF0 != 0)
+        .then_some((storage_bar5 & 0xFFFF_FFF0) as u64);
+    let framebuffer_attempted_phys = match FB_BAR_ATTEMPTED_PADDR.load(Ordering::Acquire) {
+        0 => None,
+        phys => Some(phys),
+    };
+    hosted_pci_bar_claim_authority.register_borrowed_sources(
+        bi,
+        &pci_devices,
+        storage_attempted_phys,
+        framebuffer_attempted_phys,
+    );
     let hosted_pci_grant_discovery = discover_hosted_pci_hardware_grants_for_launch_plans(
         bi,
+        &mut hosted_pci_bar_claim_authority,
         &pci_devices,
         &[
             system_boot_driver_plan,
