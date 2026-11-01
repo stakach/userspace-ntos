@@ -5,147 +5,40 @@
 
 use alloc::{string::String, vec::Vec};
 use super::*;
+use nt_driver_start::preload_catalog::{Catalog, FileIdentity, PoolPin, Source};
+pub(crate) use nt_driver_start::preload_catalog::PreloadReceipt;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Source {
-    pub va: u64,
-    pub len: u32,
-    pub pin: PoolPin,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct PoolPin {
-    pub epoch: u64,
-    pub start: u64,
-    pub end: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct FileIdentity {
-    pub cluster: u32,
-    pub len: u32,
-    pub modified: u64,
-    pub file_id: u64,
-}
-
-struct Entry {
-    path: Vec<u8>,
-    file: FileIdentity,
-    source: Source,
-}
-
-pub(super) struct Catalog {
-    generation: u64,
-    pool_base: u64,
-    pool_epoch: u64,
-    capacity: u64,
-    bytes: u64,
-    entries: Vec<Entry>,
-    complete: bool,
-    receipt: Option<PreloadReceipt>,
-}
-
-impl Catalog {
-    pub fn new(generation: u64, pool_base: u64, pool_epoch: u64, capacity: u64) -> Option<Self> {
-        (generation != 0 && pool_base != 0 && pool_epoch != 0 && capacity != 0).then(|| Self {
-            generation,
-            pool_base,
-            pool_epoch,
-            capacity,
-            bytes: 0,
-            entries: Vec::new(),
-            complete: false,
-            receipt: None,
-        })
-    }
-
-    pub fn get(&self, generation: u64, path: &[u8], pool_epoch: u64, watermark: u64) -> Option<Source> {
-        if generation != self.generation || pool_epoch != self.pool_epoch {
-            return None;
-        }
-        self.entries.iter().find(|entry| entry.path.eq_ignore_ascii_case(path))
-            .and_then(|entry| {
-                let source = entry.source;
-                (source.pin.epoch == pool_epoch
-                    && source.pin.end <= watermark
-                    && source.pin.end <= self.capacity
-                    && source.va == self.pool_base.checked_add(source.pin.start)?
-                    && source.pin.end.checked_sub(source.pin.start)?
-                        == ((source.len as u64).checked_add(0xfff)? & !0xfff))
-                    .then_some(source)
-            })
-    }
-
-    /// Reserve all accounting before invoking a reader that may enter native AHCI.
-    pub fn stage(
-        &mut self,
-        generation: u64,
-        path: &[u8],
-        file: FileIdentity,
-        watermark: u64,
-        mut read: impl FnMut() -> Option<(Source, u64)>,
-    ) -> Option<Source> {
-        if generation != self.generation || path.is_empty() || file.len == 0 {
-            return None;
-        }
-        if let Some(entry) = self.entries.iter().find(|entry| entry.path.eq_ignore_ascii_case(path)) {
-            return (entry.file == file)
-                .then(|| self.get(generation, path, self.pool_epoch, watermark)).flatten();
-        }
-        let rounded = (file.len as u64).checked_add(0xfff)? & !0xfff;
-        let next = self.bytes.checked_add(rounded)?;
-        if rounded > self.capacity.checked_sub(watermark)? {
-            return None;
-        }
-        self.entries.try_reserve(1).ok()?;
-        let mut owned_path = Vec::new();
-        owned_path.try_reserve_exact(path.len()).ok()?;
-        owned_path.extend_from_slice(path);
-        let (source, after) = read()?;
-        if source.len != file.len
-            || source.pin.epoch != self.pool_epoch
-            || source.pin.end > self.capacity
-            || source.pin.end > after
-            || source.pin.start < watermark
-            || source.pin.end.checked_sub(source.pin.start) != Some(rounded)
-            || self.pool_base.checked_add(source.pin.start) != Some(source.va)
-        {
-            return None;
-        }
-        self.entries.push(Entry { path: owned_path, file, source });
-        self.bytes = next;
-        Some(source)
-    }
-
-    pub fn bytes(&self) -> u64 {
-        self.bytes
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PreloadReceipt {
-    pub(crate) generation: u64,
-    pub(crate) pool_epoch: u64,
-    pub(crate) watermark: u64,
-    pub(crate) services: usize,
-    pub(crate) bytes: u64,
-}
-
-pub(crate) unsafe fn receipt_is_current(receipt: PreloadReceipt) -> bool {
-    let Some(catalog) = (*core::ptr::addr_of!(SOURCES)).as_ref() else { return false; };
-    catalog.complete
-        && catalog.receipt == Some(receipt)
-        && catalog.generation == receipt.generation
-        && catalog.pool_epoch == receipt.pool_epoch
-        && catalog.bytes == receipt.bytes
-        && LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) == receipt.generation
+fn resident_catalog_receipt_is_valid(catalog: &Catalog, receipt: PreloadReceipt) -> bool {
+    catalog.complete()
+        && catalog.receipt() == Some(receipt)
+        && catalog.generation() == receipt.generation
+        && catalog.pool_epoch() == receipt.pool_epoch
+        && catalog.bytes() == receipt.bytes
         && crate::fs_loader::POOL_EPOCH.load(Ordering::Acquire) == receipt.pool_epoch
         && crate::fs_loader::POOL_NEXT.load(Ordering::Acquire) >= receipt.watermark
 }
 
+pub(crate) unsafe fn receipt_is_current(receipt: PreloadReceipt) -> bool {
+    let Some(catalog) = (*core::ptr::addr_of!(SOURCES)).as_ref() else { return false; };
+    resident_catalog_receipt_is_valid(catalog, receipt)
+        && LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) == receipt.generation
+}
+
 pub(crate) unsafe fn current_receipt() -> Option<PreloadReceipt> {
-    let receipt = (*core::ptr::addr_of!(SOURCES)).as_ref()?.receipt?;
-    receipt_is_current(receipt).then_some(receipt)
+    let receipt = {
+        let catalog = (*core::ptr::addr_of!(SOURCES)).as_ref()?;
+        let receipt = catalog.receipt()?;
+        resident_catalog_receipt_is_valid(catalog, receipt).then_some(receipt)?
+    };
+    if receipt_is_current(receipt) {
+        return Some(receipt);
+    }
+    let generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if generation == receipt.generation || !crate::boot_storage_dma_handoff::boot_disk_reads_admitted() {
+        return None;
+    }
+    let fs = crate::fs_loader::exec_fs()?;
+    stage_registry_boot_sources(&fs, generation)
 }
 
 static mut SOURCES: Option<Catalog> = None;
@@ -216,6 +109,8 @@ fn parse_filter_services(value_type: u32, data: &[u8]) -> Option<Vec<String>> {
 
 unsafe fn stage_file(
     fs: &Fat32,
+    catalog: &mut Catalog,
+    prior: Option<&Catalog>,
     generation: u64,
     path: &[u8],
 ) -> Option<Source> {
@@ -232,7 +127,7 @@ unsafe fn stage_file(
     };
     let before = crate::fs_loader::POOL_NEXT.load(Ordering::Acquire);
     let epoch = crate::fs_loader::POOL_EPOCH.load(Ordering::Acquire);
-    let source = (*core::ptr::addr_of_mut!(SOURCES)).as_mut()?.stage(generation, path, file, before, || {
+    let source = catalog.stage_from_prior(prior, generation, path, file, before, || {
         let (va, len) = preload_or_fail!(load_file_to_pool(fs, path), b"file-read", path);
         let again = preload_or_fail!(crate::fs_loader::fat_open_path_metadata(fs, path), b"file-recheck", path);
         if again != metadata {
@@ -252,6 +147,8 @@ unsafe fn stage_file(
 
 unsafe fn stage_pe_closure(
     fs: &Fat32,
+    catalog: &mut Catalog,
+    prior: Option<&Catalog>,
     generation: u64,
     path: &[u8],
     depth: usize,
@@ -262,8 +159,8 @@ unsafe fn stage_pe_closure(
     }
     let epoch = crate::fs_loader::POOL_EPOCH.load(Ordering::Acquire);
     let watermark = crate::fs_loader::POOL_NEXT.load(Ordering::Acquire);
-    let already = (*core::ptr::addr_of!(SOURCES)).as_ref()?.get(generation, path, epoch, watermark).is_some();
-    let source = stage_file(fs, generation, path)?;
+    let already = catalog.get(generation, path, epoch, watermark).is_some();
+    let source = stage_file(fs, catalog, prior, generation, path)?;
     if already {
         return Some(());
     }
@@ -282,13 +179,15 @@ unsafe fn stage_pe_closure(
         }
         let mut dep_path = [0; HOSTED_DEP_PATH_MAX];
         let len = preload_or_fail!(hosted_dependency_path(dependency.as_str(), &mut dep_path), b"pe-import-path", dependency.as_str().as_bytes());
-        stage_pe_closure(fs, generation, &dep_path[..len], depth + 1)?;
+        stage_pe_closure(fs, catalog, prior, generation, &dep_path[..len], depth + 1)?;
     }
     Some(())
 }
 
 unsafe fn stage_service(
     fs: &Fat32,
+    catalog: &mut Catalog,
+    prior: Option<&Catalog>,
     generation: u64,
     name: &str,
 ) -> Option<()> {
@@ -312,19 +211,20 @@ unsafe fn stage_service(
         return None;
     }
     let path = preload_or_fail!(crate::registry_ascii_path(&binding.image_path), b"service-path", name.as_bytes());
-    stage_pe_closure(fs, generation, &path, 0)
+    stage_pe_closure(fs, catalog, prior, generation, &path, 0)
 }
 
 /// Stage boot-start kernel services and setup-class filter services from one mounted CM
 /// generation. PnP still selects the actual service for each child when it starts.
 pub(super) unsafe fn stage_registry_boot_sources(fs: &Fat32, generation: u64) -> Option<PreloadReceipt> {
-    if generation == 0 || (*core::ptr::addr_of!(SOURCES)).is_some() {
+    let prior = (*core::ptr::addr_of!(SOURCES)).as_ref();
+    if generation == 0 || prior.is_some_and(|catalog| catalog.generation() >= generation) {
         preload_failure(b"entry-authority", b"boot-disk", generation);
         return None;
     }
     let capacity = preload_or_fail!(crate::fs_loader::POOL_PTS.checked_mul(0x20_0000), b"pool-capacity", b"pool");
     let epoch = crate::fs_loader::POOL_EPOCH.load(Ordering::Acquire);
-    SOURCES = Some(preload_or_fail!(Catalog::new(generation, crate::fs_loader::POOL_VADDR, epoch, capacity), b"catalog-create", b"pool"));
+    let mut candidate = preload_or_fail!(Catalog::new(generation, crate::fs_loader::POOL_VADDR, epoch, capacity), b"catalog-create", b"pool");
     let services_path = r"\Registry\Machine\System\CurrentControlSet\Services";
     let services = match crate::config_manager_query_system_hive_key(services_path) {
         Ok(services) => services,
@@ -352,7 +252,7 @@ pub(super) unsafe fn stage_registry_boot_sources(fs: &Fat32, generation: u64) ->
             return None;
         }
         if dword(&snapshot, "Start") == Some(0) && dword(&snapshot, "Type") == Some(1) {
-            stage_service(fs, generation, &service.name)?;
+            stage_service(fs, &mut candidate, prior, generation, &service.name)?;
             selected += 1;
         }
     }
@@ -383,42 +283,51 @@ pub(super) unsafe fn stage_registry_boot_sources(fs: &Fat32, generation: u64) ->
         }
         for value_name in ["UpperFilters", "LowerFilters"] {
             for service in preload_or_fail!(class_filters(&snapshot, value_name), b"class-filter-format", class.name.as_bytes()) {
-                stage_service(fs, generation, &service)?;
+                stage_service(fs, &mut candidate, prior, generation, &service)?;
                 selected += 1;
             }
         }
     }
-    stage_file(fs, generation, HOSTED_AUXILIARY_PE_PATH)?;
+    stage_file(fs, &mut candidate, prior, generation, HOSTED_AUXILIARY_PE_PATH)?;
     if LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) != generation {
         preload_failure(b"final-generation", b"system", LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire));
         return None;
     }
-    let catalog = (*core::ptr::addr_of_mut!(SOURCES)).as_mut()?;
-    catalog.complete = true;
+    if crate::fs_loader::POOL_EPOCH.load(Ordering::Acquire) != epoch {
+        preload_failure(b"final-pool-epoch", b"pool", epoch);
+        return None;
+    }
     let receipt = PreloadReceipt {
         generation,
         pool_epoch: epoch,
         watermark: crate::fs_loader::POOL_NEXT.load(Ordering::Acquire),
         services: selected,
-        bytes: catalog.bytes(),
+        bytes: candidate.bytes(),
     };
-    catalog.receipt = Some(receipt);
+    candidate.complete_with_receipt(receipt);
+    *core::ptr::addr_of_mut!(SOURCES) = Some(candidate);
     receipt_is_current(receipt).then_some(receipt)
 }
 
 /// The boot controller may not issue a late source read once it begins draining. Native block
 /// routing will replace this loader path after the real controller stack is active.
 pub(super) unsafe fn source_for_launch(fs: &Fat32, path: &[u8]) -> Option<(u64, u32)> {
-    let generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
     let canonical = crate::registry_ascii_path(core::str::from_utf8(path).ok()?)?;
     let epoch = crate::fs_loader::POOL_EPOCH.load(Ordering::Acquire);
     let watermark = crate::fs_loader::POOL_NEXT.load(Ordering::Acquire);
-    if let Some(source) = (*core::ptr::addr_of!(SOURCES)).as_ref()
-        .and_then(|catalog| catalog.get(generation, &canonical, epoch, watermark))
+    let boot_reads = crate::boot_storage_dma_handoff::boot_disk_reads_admitted();
+    // While the boot disk is still available, a new CM generation must first recheck the
+    // selected closure and every file identity. After drain, only already pinned bytes can serve.
+    let refreshed = !boot_reads || current_receipt().is_some();
+    if let Some(source) = refreshed.then(|| (*core::ptr::addr_of!(SOURCES)).as_ref()).flatten()
+        .filter(|catalog| catalog.receipt().is_some_and(|receipt| {
+            resident_catalog_receipt_is_valid(catalog, receipt)
+        }))
+        .and_then(|catalog| catalog.get_pinned(&canonical, epoch, watermark))
     {
         return Some((source.va, source.len));
     }
-    if !crate::boot_storage_dma_handoff::boot_disk_reads_admitted() {
+    if !boot_reads {
         return None;
     }
     load_file_to_pool(fs, &canonical)
