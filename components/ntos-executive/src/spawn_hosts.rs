@@ -3749,7 +3749,13 @@ unsafe fn component_pump_loop(
                 }
                 crate::provider_directory_broker::SubmitResult::Deferred => {
                     crate::print_str(b"[hosted-directory-result] deferred\n");
-                    if shared_pump::service_wait_yields(ch) {
+                    let yields = shared_pump::service_wait_yields(ch);
+                    crate::print_str(b"[hosted-directory-wait] yields=");
+                    crate::print_u64(u64::from(yields));
+                    crate::print_str(b" tcb=");
+                    crate::print_u64(ch.tcb);
+                    crate::print_str(b"\n");
+                    if yields {
                         outcome.provider_wait_suspended = true;
                         break;
                     }
