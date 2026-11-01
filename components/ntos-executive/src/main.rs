@@ -15002,9 +15002,8 @@ static SURT_CLIENT_WAIT_WAKES: AtomicU64 = AtomicU64::new(0);
 const SURT_STATUS_INVALID_BUFFER_SIZE: i32 = 0xC000_0206u32 as i32;
 
 impl RingChannel<'_> {
-    /// Submit through the existing synchronous transport while exposing its
-    /// exact completion identity. The caller must retain its Reply and input
-    /// request when this returns `Indeterminate`.
+    /// Retain the exact completion identity when the synchronous transport
+    /// yields without a terminal CQE.
     fn raw_owned(
         &mut self,
         opcode: u16,
@@ -15025,6 +15024,48 @@ impl RingChannel<'_> {
         } else {
             RingCallOutcome::Completed(status, flags, information, detail0, detail1)
         }
+    }
+
+    /// Submit one owned request and return its exact identity without waiting
+    /// on the completion notification inside a retained component pump.
+    fn submit_owned(
+        &mut self,
+        opcode: u16,
+        in_buf: &[u8],
+    ) -> RingCallOutcome {
+        if in_buf.len() > REP_DATA_LEN {
+            return RingCallOutcome::NoEffect(SURT_STATUS_INVALID_BUFFER_SIZE);
+        }
+        if self.completion_inbox.active_request().is_some() {
+            return RingCallOutcome::NoEffect(nt_status::NtStatus::DEVICE_BUSY.raw());
+        }
+        let request_id = self.next_id;
+        if !self.completion_inbox.begin(request_id) {
+            return RingCallOutcome::NoEffect(nt_status::NtStatus::DEVICE_BUSY.raw());
+        }
+        self.next_id = self.next_id.checked_add(1).expect("SURT request identity exhausted");
+        // The active request owns both shared frames until its exact CQE is polled.
+        unsafe {
+            let dst = self.req_vaddr as *mut u8;
+            for (index, byte) in in_buf.iter().enumerate() {
+                core::ptr::write_volatile(dst.add(index), *byte);
+            }
+        }
+        let sqe = SurtSqe {
+            opcode,
+            len: in_buf.len() as u32,
+            request_id,
+            offset: 0,
+            ..Default::default()
+        };
+        if self.sq.try_push(sqe).is_err() {
+            self.completion_inbox.finish(request_id);
+            return RingCallOutcome::NoEffect(nt_status::NtStatus::DEVICE_BUSY.raw());
+        }
+        // Once the SQE is visible, a failed or uncertain notification cannot
+        // make this request replayable; the owner must poll its exact receipt.
+        let _ = self.sq.notify_consumer(&self.signal);
+        RingCallOutcome::Indeterminate { request_id }
     }
 
     /// Retire only the exact in-flight request. A missing or unusable CQE keeps
@@ -15225,10 +15266,10 @@ impl nt_object_client::Backend for ObChan<'_> {
 }
 
 impl nt_object_client::OwnedBackend for ObChan<'_> {
-    fn call_owned(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8])
+    fn call_owned(&mut self, opcode: u16, in_buf: &[u8], _out_buf: &mut [u8])
         -> nt_object_client::OwnedCall
     {
-        match self.0.raw_owned(opcode, in_buf, out_buf) {
+        match self.0.submit_owned(opcode, in_buf) {
             RingCallOutcome::NoEffect(status) =>
                 nt_object_client::OwnedCall::NoEffect(nt_status::NtStatus(status)),
             RingCallOutcome::Completed(status, _, information, detail0, detail1) =>
