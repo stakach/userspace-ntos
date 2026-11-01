@@ -102,6 +102,18 @@ jobs:
           PY
       - name: Verify bounded QEMU runner contracts
         run: python3 -m unittest discover -s scripts/tests -p 'test_ci_kvm_smoke_*.py' -v
+      - name: Restore verified LiberNT archive cache
+        uses: actions/cache@v4
+        with:
+          path: rust-micro/.tmp/libernt/*.zip
+          key: libernt-amd64-archive-${{ hashFiles('rust-micro/vendor/libernt/manifest.txt') }}
+      - name: Restore native build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            components/ntos-executive/target
+            rust-micro/target
+          key: native-kvm-build-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'components/ntos-executive/Cargo.lock', 'components/ntos-executive/triplet.json', 'rust-micro/Cargo.lock', 'rust-micro/rust-toolchain') }}
       - name: Build native image from verified pinned LiberNT release
         run: |
           set -o pipefail
