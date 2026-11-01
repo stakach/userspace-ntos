@@ -32,7 +32,8 @@ fn trace_ps_create_event(stage: &[u8], route: PeerRoute, reply: u64, info: u64) 
         &PS_CREATE_RECEIVE_EVENTS
     };
     let sequence = counter.fetch_add(1, Ordering::Relaxed) + 1;
-    if sequence > 8 && !sequence.is_power_of_two() {
+    let initial = if stage.starts_with(b"autonomous-") { 32 } else { 8 };
+    if sequence > initial && !sequence.is_power_of_two() {
         return;
     }
     crate::print_str(b"[ps-create-event] #");
@@ -402,11 +403,13 @@ pub(super) unsafe fn service_autonomous(route: PeerRoute) -> Result<(), runtime:
             nt_user_host::component_pump::ComponentPumpAccounting::new(false),
             &mut seh.pump,
         );
-        trace_ps_create_event(b"autonomous-pump-exit", route, reply, 0);
         let suspended = outcome.callback_suspended
             || outcome.provider_wait_suspended
             || outcome.lpc_wait_suspended;
-        if !seh.finish(&channel, reply, suspended) {
+        trace_ps_create_event(b"autonomous-pump-exit", route, reply, u64::from(suspended) << 12);
+        let seh_finished = seh.finish(&channel, reply, suspended);
+        trace_ps_create_event(b"autonomous-seh-finish", route, reply, u64::from(seh_finished) << 12);
+        if !seh_finished {
             return Err(runtime::Error::PhysicalIdentity);
         }
         // An autonomous thread does not speak the dispatch-worker completion protocol. Only
@@ -421,6 +424,7 @@ pub(super) unsafe fn service_autonomous(route: PeerRoute) -> Result<(), runtime:
             Err(runtime::Error::Protocol)
         }
     })();
+    trace_ps_create_event(b"autonomous-serviced", route, 0, u64::from(serviced.is_ok()) << 12);
     if serviced.is_err() {
         autonomous_failure_diag(route, b"terminate/drain");
         if !crate::driver_launch::terminate_failed_autonomous_service(route) {
@@ -428,10 +432,12 @@ pub(super) unsafe fn service_autonomous(route: PeerRoute) -> Result<(), runtime:
             return Err(runtime::Error::Retirement);
         }
     }
+    trace_ps_create_event(b"autonomous-restore-enter", route, 0, 0);
     if let Err(error) = runtime::nested::restore(&mut parent) {
         autonomous_failure_diag(route, b"parent restoration retained");
         return Err(error);
     }
+    trace_ps_create_event(b"autonomous-restore-return", route, 0, 0);
     Ok(())
 }
 
