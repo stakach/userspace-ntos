@@ -28,9 +28,10 @@ pub use projection::{
     DeviceObjectProjection, DriverObjectProjection, FileObjectProjection, IoStackLocationProjection,
 };
 pub use scsi_dma_authority::{
-    validate_scsi_coherent_authority, ScsiCoherentAlias, ScsiCoherentAuthority,
-    ScsiCoherentProjection, SCSI_DMA_AUTHORITY_ALIASES, SCSI_DMA_AUTHORITY_BYTES,
-    SCSI_DMA_AUTHORITY_SLOTS, SCSI_COHERENT_RECORD_KIND,
+    select_scsi_coherent_controller, validate_scsi_coherent_authority,
+    ScsiCoherentAlias, ScsiCoherentAuthority, ScsiCoherentProjection,
+    ScsiControllerAuthority, ScsiControllerCandidate, SCSI_DMA_AUTHORITY_ALIASES,
+    SCSI_DMA_AUTHORITY_BYTES, SCSI_DMA_AUTHORITY_SLOTS, SCSI_COHERENT_RECORD_KIND,
 };
 pub use wire::{
     IoCancelRequest, IoDeviceControlRequest, IoFileRequest, IoOpenRequest, IoReadWriteRequest,

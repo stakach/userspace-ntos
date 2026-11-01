@@ -8,6 +8,74 @@ pub const SCSI_DMA_AUTHORITY_ALIASES: usize = 8;
 pub const SCSI_DMA_AUTHORITY_BYTES: usize = 4096;
 pub const SCSI_COHERENT_RECORD_KIND: u64 = 3;
 
+/// The accepted child relation and the started controller that owns its DMA window.
+/// These values must be read from the live PnP and hosted-domain registries by the root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScsiControllerAuthority {
+    pub child_pdo: u64,
+    pub relation_generation: u64,
+    pub parent_pdo: u64,
+    pub parent_generation: u64,
+    pub provider_domain_id: u64,
+    pub provider_cookie: u64,
+}
+
+/// One controller binding and one PnP-granted DMA window. Adapter leases are deliberately
+/// absent: several adapters may use this same window, while the child has one parent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScsiControllerCandidate {
+    pub controller_device_id: u64,
+    pub child_pdo: u64,
+    pub relation_generation: u64,
+    pub parent_pdo: u64,
+    pub parent_generation: u64,
+    pub provider_domain_id: u64,
+    pub provider_cookie: u64,
+    pub window_lease_id: u64,
+    pub window_generation: u64,
+    pub grant_va: u64,
+    /// Root-owned alias for the same PnP-granted physical frames.
+    pub broker_va: u64,
+    pub grant_length: u64,
+    pub grant_logical: u64,
+    pub live: bool,
+}
+
+/// Select only a unique, exact live controller for this accepted child. Duplicate candidates
+/// are ambiguous even when their numeric fields agree: a caller must reconcile duplicate
+/// publication before reserving a DMA slice.
+pub fn select_scsi_coherent_controller(
+    authority: ScsiControllerAuthority,
+    candidates: &[ScsiControllerCandidate],
+) -> Option<ScsiControllerCandidate> {
+    if authority.child_pdo == 0 || authority.relation_generation == 0
+        || authority.parent_pdo == 0 || authority.parent_generation == 0
+        || authority.provider_domain_id == 0 || authority.provider_cookie == 0
+    { return None; }
+    let mut selected = None;
+    for candidate in candidates {
+        if !candidate.live
+            || candidate.controller_device_id == 0
+            || candidate.child_pdo != authority.child_pdo
+            || candidate.relation_generation != authority.relation_generation
+            || candidate.parent_pdo != authority.parent_pdo
+            || candidate.parent_generation != authority.parent_generation
+            || candidate.provider_domain_id != authority.provider_domain_id
+            || candidate.provider_cookie != authority.provider_cookie
+            || candidate.window_lease_id == 0
+            || candidate.window_generation != authority.parent_generation
+            || candidate.grant_va == 0 || candidate.broker_va == 0
+            || candidate.grant_logical == 0
+            || candidate.grant_length == 0
+            || candidate.grant_va.checked_add(candidate.grant_length).is_none()
+            || candidate.broker_va.checked_add(candidate.grant_length).is_none()
+            || candidate.grant_logical.checked_add(candidate.grant_length).is_none()
+        { continue; }
+        if selected.replace(*candidate).is_some() { return None; }
+    }
+    selected
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct ScsiCoherentAlias {
