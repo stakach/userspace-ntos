@@ -43133,6 +43133,12 @@ unsafe fn set_hosted_relation_query_disposition(disposition: HostedDeviceRelatio
             print_str(b"/");
             if let Some(publication) = query.publication.as_ref() {
                 print_u64(publication.phase as u64);
+                print_str(b"/refusal-origin=");
+                if let Some(origin) = publication.refusal_origin {
+                    print_u64(origin as u64);
+                } else {
+                    print_str(b"none");
+                }
             } else {
                 print_str(b"none");
             }
@@ -45500,6 +45506,7 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
             commit_entered: false,
             preparation_refused: false,
             refusal: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            refusal_origin: None,
         };
         let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
             .as_mut().expect("relation query before first CM exchange");

@@ -89,6 +89,7 @@ struct HostedRelationPublication {
     commit_entered: bool,
     preparation_refused: bool,
     refusal: nt_status::NtStatus,
+    refusal_origin: Option<HostedRelationPublicationPhase>,
 }
 
 // The server's requester grant survives an acknowledged publication. Reuse that exact bank
@@ -231,6 +232,7 @@ unsafe fn advance_hosted_relation_publication(
                                 .then_some(*registration)
                         });
                         let Some(registration) = next else {
+                            owner.refusal_origin = Some(owner.phase);
                             owner.refusal = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
                             owner.phase = Phase::AbortProvider;
                             continue;
@@ -246,6 +248,7 @@ unsafe fn advance_hosted_relation_publication(
                                 .is_none_or(|device| device.delete_pending
                                     || device.driver_id != published.driver_id)
                         {
+                            owner.refusal_origin = Some(owner.phase);
                             owner.refusal = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
                             owner.phase = Phase::AbortProvider;
                             continue;
@@ -263,6 +266,7 @@ unsafe fn advance_hosted_relation_publication(
                 }
                 if owner.native_disk_proof.is_none() {
                     if owner.native_disk_candidate >= owner.reported_children.len() {
+                        owner.refusal_origin = Some(owner.phase);
                         owner.refusal = nt_status::NtStatus::DEVICE_NOT_READY;
                         owner.phase = Phase::AbortProvider;
                         continue;
@@ -271,17 +275,20 @@ unsafe fn advance_hosted_relation_publication(
                     let Some((_, registration)) = owner.providers.iter()
                         .find(|(device, _)| *device == pdo).copied()
                     else {
+                        owner.refusal_origin = Some(owner.phase);
                         owner.refusal = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
                         owner.phase = Phase::AbortProvider;
                         continue;
                     };
                     let Some(device) = io_manager_mut().device(nt_io_manager::DeviceId(pdo)) else {
+                        owner.refusal_origin = Some(owner.phase);
                         owner.refusal = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
                         owner.phase = Phase::AbortProvider;
                         continue;
                     };
                     let driver_id = device.driver_id;
                     if device.delete_pending || driver_id.is_null() {
+                        owner.refusal_origin = Some(owner.phase);
                         owner.refusal = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
                         owner.phase = Phase::AbortProvider;
                         continue;
@@ -357,6 +364,7 @@ unsafe fn advance_hosted_relation_publication(
                         Ok(failure) => failure,
                         Err(_) => return owner.pending(),
                     };
+                    owner.refusal_origin = Some(owner.phase);
                     owner.refusal = nt_status::NtStatus(status);
                     owner.attempt = None;
                     owner.phase = Phase::AbortProvider;
@@ -401,6 +409,7 @@ unsafe fn advance_hosted_relation_publication(
                 }
                 if preparation.phase() == P::Allocating && !owner.preparation_refused {
                     if let Err(status) = preparation.allocate_journal() {
+                        owner.refusal_origin = Some(owner.phase);
                         owner.refusal = nt_status::NtStatus(status);
                         owner.preparation_refused = true;
                     }
@@ -421,6 +430,7 @@ unsafe fn advance_hosted_relation_publication(
                 let response = crate::cm_mutation_transport::prepare(&exchange);
                 if let Err(status) = preparation.complete_exchange(&mut exchange, response) {
                     if !owner.preparation_refused {
+                        owner.refusal_origin = Some(owner.phase);
                         owner.refusal = nt_status::NtStatus(status);
                         owner.preparation_refused = true;
                     }
@@ -430,18 +440,21 @@ unsafe fn advance_hosted_relation_publication(
             Phase::Admit => {
                 let prepared = owner.prepared.as_ref().expect("retained relation preparation");
                 if let Err(status) = crate::cm_mutation_transport::validate_storage(prepared) {
+                    owner.refusal_origin = Some(owner.phase);
                     owner.refusal = nt_status::NtStatus(status);
                     owner.phase = Phase::Abort;
                     continue;
                 }
                 let mut bytes = Vec::new();
                 if bytes.try_reserve_exact(prepared.durable_journal().len()).is_err() {
+                    owner.refusal_origin = Some(owner.phase);
                     owner.refusal = nt_status::NtStatus::INSUFFICIENT_RESOURCES;
                     owner.phase = Phase::Abort;
                     continue;
                 }
                 bytes.extend_from_slice(prepared.durable_journal());
                 if let Err(status) = owner.persistence.admit(prepared, bytes) {
+                    owner.refusal_origin = Some(owner.phase);
                     owner.refusal = nt_status::NtStatus(status as i32);
                     owner.phase = Phase::Abort;
                     continue;
