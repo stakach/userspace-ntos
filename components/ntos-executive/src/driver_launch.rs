@@ -43066,9 +43066,32 @@ unsafe fn retain_hosted_relation_query_barrier(
 }
 
 unsafe fn set_hosted_relation_query_disposition(disposition: HostedDeviceRelationQueryDisposition) {
+    static TERMINAL_RELATION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
     let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
         .as_mut()
         .expect("hosted relation query disappeared while publishing its result");
+    if matches!(disposition, HostedDeviceRelationQueryDisposition::NoRelations
+        | HostedDeviceRelationQueryDisposition::Copied)
+        && TERMINAL_RELATION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 128
+    {
+        print_str(b"[pnp-relations-terminal] parent=");
+        print_u64(query.claim.pdo_device_id);
+        print_str(b" irp=");
+        print_u64(query.irp_id.raw());
+        print_str(b" disposition=");
+        print_str(if matches!(disposition, HostedDeviceRelationQueryDisposition::Copied) {
+            b"copied"
+        } else {
+            b"none"
+        });
+        print_str(b" status=0x");
+        print_hex(query.driver_status.unwrap_or(nt_status::NtStatus::SUCCESS).raw() as u32);
+        print_str(b" objects/children=");
+        print_u64(query.child_pdo_objects.len() as u64);
+        print_str(b"/");
+        print_u64(query.reported_children.len() as u64);
+        print_str(b"\n");
+    }
     match disposition {
         HostedDeviceRelationQueryDisposition::NoRelations => {
             query.phase = HostedDeviceRelationQueryPhase::NoRelations;
@@ -45214,13 +45237,34 @@ unsafe fn build_hosted_relation_mutations(
     Ok(mutations)
 }
 
+fn trace_hosted_relation_admission_failure(
+    stage: &[u8],
+    error: &HostedRelationPublishError,
+) {
+    static TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+    if TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 16 {
+        return;
+    }
+    print_str(b"[pnp-relations-admission] stage=");
+    print_str(stage);
+    match error {
+        HostedRelationPublishError::Retry => print_str(b" retry\n"),
+        HostedRelationPublishError::Barrier(status) => {
+            print_str(b" barrier=0x");
+            print_hex(status.raw() as u32);
+            print_str(b"\n");
+        }
+    }
+}
+
 unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishError> {
     if (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
         .as_ref().and_then(|query| query.publication.as_ref()).is_none()
     {
         // Classify the lazy mount before retaining provider resources or entering CM.
         crate::writable_fs::ensure_mounted()
-            .map_err(|status| hosted_relation_error_from_config(status as i32))?;
+            .map_err(|status| hosted_relation_error_from_config(status as i32))
+            .inspect_err(|error| trace_hosted_relation_admission_failure(b"writable-mount", error))?;
         let expected_generation = crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
         let mount_identity = crate::LIVE_CONFIG_MANAGER_SYSTEM_MOUNT
             .ok_or(HostedRelationPublishError::Retry)?
@@ -45274,10 +45318,11 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
             expected_generation,
             bus_object_id,
             &query.reported_children,
-        )?;
+        ).inspect_err(|error| trace_hosted_relation_admission_failure(b"cm-baseline", error))?;
         let prepared = hosted_bus_relations_mut()
             .prepare_bus_relations(bus_object_id, &query.reported_children)
-            .map_err(hosted_relation_error_from_pnp)?;
+            .map_err(hosted_relation_error_from_pnp)
+            .inspect_err(|error| trace_hosted_relation_admission_failure(b"pnp-prepare", error))?;
         let parent_relation = hosted_pnp_manager_mut()
             .claim_started_parent_relation(bus_object_id, prepared.relation_identity())
             .map_err(hosted_relation_error_from_devnode_pnp)?;
@@ -45306,14 +45351,15 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
                 if change.kind == nt_pnp_manager::BusRelationChangeKind::Removal {
                     None
                 } else {
-                    resolve_hosted_relation_policy(expected_generation, &change.child)?
+                    resolve_hosted_relation_policy(expected_generation, &change.child)
+                        .inspect_err(|error| trace_hosted_relation_admission_failure(b"cm-policy", error))?
                 },
             );
             existing.push(existing_hosted_relation_values(
                 expected_generation,
                 change,
                 &enum_path,
-            )?);
+            ).inspect_err(|error| trace_hosted_relation_admission_failure(b"cm-existing", error))?);
         }
 
         if crate::LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) != expected_generation {
@@ -45325,7 +45371,8 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
             .try_reserve_exact(query.reported_children.len())
             .map_err(|_| HostedRelationPublishError::Retry)?;
         for child in &query.reported_children {
-            if resolve_hosted_relation_policy(expected_generation, child)?
+            if resolve_hosted_relation_policy(expected_generation, child)
+                .inspect_err(|error| trace_hosted_relation_admission_failure(b"cm-critical", error))?
                 .as_ref()
                 .is_some_and(|policy| policy.service_name.is_some())
             {
