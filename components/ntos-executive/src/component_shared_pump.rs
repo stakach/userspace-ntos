@@ -14,17 +14,24 @@ static IRQ_SYSCALL_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static IRQ_RETAINED_SEH_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static PS_CREATE_RECEIVE_TRACE: AtomicU64 = AtomicU64::new(0);
 static PS_CREATE_RECEIVE_EVENTS: AtomicU64 = AtomicU64::new(0);
+static PS_CREATE_AUTONOMOUS_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn begin_ps_create_receive_trace() {
     PS_CREATE_RECEIVE_TRACE.store(1, Ordering::Relaxed);
     PS_CREATE_RECEIVE_EVENTS.store(0, Ordering::Relaxed);
+    PS_CREATE_AUTONOMOUS_EVENTS.store(0, Ordering::Relaxed);
 }
 
 fn trace_ps_create_event(stage: &[u8], route: PeerRoute, reply: u64, info: u64) {
     if PS_CREATE_RECEIVE_TRACE.load(Ordering::Relaxed) == 0 {
         return;
     }
-    let sequence = PS_CREATE_RECEIVE_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+    let counter = if stage == b"autonomous-message" {
+        &PS_CREATE_AUTONOMOUS_EVENTS
+    } else {
+        &PS_CREATE_RECEIVE_EVENTS
+    };
+    let sequence = counter.fetch_add(1, Ordering::Relaxed) + 1;
     if sequence > 8 && !sequence.is_power_of_two() {
         return;
     }
