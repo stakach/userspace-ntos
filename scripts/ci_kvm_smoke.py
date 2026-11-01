@@ -24,6 +24,7 @@ STALL_STATE = ROOT / "native-kvm-stall-state.json"
 VOLUME_DISPATCH_STATE = ROOT / "native-kvm-volume-dispatch-state.json"
 CPU_SAMPLES = ROOT / "native-kvm-cpu-samples.jsonl"
 STOPPED_MARKER = ROOT / "native-kvm-qemu-stopped"
+STATIONARY_MARKER = ROOT / "native-kvm-stationary.txt"
 
 # Fixed 60-second QMP samples repeatedly hit the same clock-publication RIP,
 # while the guest's own cycle counter showed that path used only a few seconds.
@@ -80,6 +81,40 @@ class SerialTerminalDetector(SerialPanicDetector):
 
 def cpu_sample_delay(sample_index):
     return CPU_SAMPLE_DELAYS[sample_index % len(CPU_SAMPLE_DELAYS)]
+
+
+def stationary_boot_pair(previous, current):
+    """Classify two QMP/serial samples without altering the guest."""
+    if not previous or not current:
+        return False
+    if (not previous.get("boot_marker") or not current.get("boot_marker")
+            or previous.get("desktop_ready") or current.get("desktop_ready")):
+        return False
+    serial = current.get("serial_bytes")
+    if not isinstance(serial, int) or serial <= 0 or serial != previous.get("serial_bytes"):
+        return False
+    before, after = previous.get("elapsed_seconds"), current.get("elapsed_seconds")
+    if not isinstance(before, (int, float)) or not isinstance(after, (int, float)) \
+            or after - before < 30:
+        return False
+
+    def halted(sample):
+        state = sample.get("state")
+        if not isinstance(state, dict) or state.get("error") or state.get("register_errors"):
+            return None
+        cpus, registers = state.get("cpus"), state.get("registers")
+        if not isinstance(cpus, list) or not cpus or not isinstance(registers, dict):
+            return None
+        indices = [cpu.get("cpu-index") for cpu in cpus if isinstance(cpu, dict)]
+        if len(indices) != len(cpus) or len(set(indices)) != len(cpus):
+            return None
+        if not all(isinstance(registers.get(str(index)), str)
+                   and re.search(r"\bHLT=1\b", registers[str(index)]) for index in indices):
+            return None
+        return set(indices)
+
+    before_cpus = halted(previous)
+    return before_cpus is not None and before_cpus == halted(current)
 
 
 def qmp_reply(stream, command_id):
@@ -304,6 +339,7 @@ def main():
     VOLUME_DISPATCH_STATE.unlink(missing_ok=True)
     CPU_SAMPLES.unlink(missing_ok=True)
     STOPPED_MARKER.unlink(missing_ok=True)
+    STATIONARY_MARKER.unlink(missing_ok=True)
     command = [
         "./scripts/run_specs.sh",
         "-qmp",
@@ -332,6 +368,8 @@ def main():
         terminal_detector = SerialTerminalDetector(LOG)
         panic_site = None
         terminal_reason = None
+        stationary_reason = None
+        previous_sample = None
         def capture_terminal_evidence(reason):
             nonlocal captured, stall_captured
             if not QMP_SOCKET.exists():
@@ -398,11 +436,23 @@ def main():
                         serial_bytes = LOG.stat().st_size
                     except OSError:
                         serial_bytes = None
+                    serial = LOG.read_bytes()
                     sample = {"elapsed_seconds": round(time.monotonic() - started, 3),
                               "state": read_cpu_state(),
-                              "host": host, "serial_bytes": serial_bytes}
+                              "host": host, "serial_bytes": serial_bytes,
+                              "boot_marker": b"boot: reading Simpleboot memory map" in serial,
+                              "desktop_ready": b"PASS exec_explorer_shell_chrome_painted" in serial}
                     with CPU_SAMPLES.open("a") as samples:
                         samples.write(json.dumps(sample) + "\n")
+                    if stationary_boot_pair(previous_sample, sample):
+                        stationary_reason = (f"serial unchanged and all vCPUs halted from "
+                                             f"{previous_sample['elapsed_seconds']}s to "
+                                             f"{sample['elapsed_seconds']}s")
+                        STATIONARY_MARKER.write_text(stationary_reason + "\n")
+                        print(f"Guest stationary: {stationary_reason}; stopping bounded boot", flush=True)
+                        capture_terminal_evidence("stationary")
+                        break
+                    previous_sample = sample
                     cpu_sample_index += 1
                     next_cpu_sample = time.monotonic() + cpu_sample_delay(cpu_sample_index)
                 time.sleep(min(1, max(0, deadline - time.monotonic())))
@@ -430,6 +480,8 @@ def main():
         raise SystemExit(f"executive panic at {panic_site}; inspect native-kvm-smoke.log")
     if terminal_reason:
         raise SystemExit(f"guest terminal {terminal_reason}; inspect native-kvm-smoke.log")
+    if stationary_reason:
+        raise SystemExit(f"guest stationary: {stationary_reason}; inspect native-kvm-stationary.txt")
     if "boot: reading Simpleboot memory map" not in output:
         raise SystemExit("guest startup marker absent; inspect native-kvm-smoke.log")
     if not captured:

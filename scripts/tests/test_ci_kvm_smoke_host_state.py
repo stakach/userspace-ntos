@@ -4,7 +4,40 @@ import os
 import unittest
 from unittest.mock import patch
 
-from scripts.ci_kvm_smoke import cpu_sample_delay, parse_proc_stat, read_host_state
+from scripts.ci_kvm_smoke import cpu_sample_delay, parse_proc_stat, read_host_state, stationary_boot_pair
+
+
+class StationaryBootTests(unittest.TestCase):
+    @staticmethod
+    def sample(elapsed, serial, halted=(True, True), boot_marker=True):
+        cpus = [{"cpu-index": index} for index in range(len(halted))]
+        registers = {str(index): f"RIP=deadbeef HLT={int(value)}" for index, value in enumerate(halted)}
+        return {"elapsed_seconds": elapsed, "serial_bytes": serial,
+                "boot_marker": boot_marker, "state": {"cpus": cpus, "registers": registers}}
+
+    def test_two_stationary_halted_samples_are_a_stall(self):
+        self.assertTrue(stationary_boot_pair(self.sample(48, 200000), self.sample(91, 200000)))
+
+    def test_new_serial_progress_clears_stall(self):
+        self.assertFalse(stationary_boot_pair(self.sample(48, 200000), self.sample(91, 200001)))
+
+    def test_running_cpu_or_short_interval_is_not_a_stall(self):
+        self.assertFalse(stationary_boot_pair(self.sample(48, 200000),
+                                              self.sample(91, 200000, (True, False))))
+        self.assertFalse(stationary_boot_pair(self.sample(48, 200000), self.sample(70, 200000)))
+
+    def test_missing_or_preboot_samples_cannot_stop_guest(self):
+        self.assertFalse(stationary_boot_pair(None, self.sample(91, 200000)))
+        self.assertFalse(stationary_boot_pair(self.sample(48, 200000, boot_marker=False),
+                                              self.sample(91, 200000)))
+        incomplete = self.sample(91, 200000)
+        incomplete["state"]["registers"].pop("1")
+        self.assertFalse(stationary_boot_pair(self.sample(48, 200000), incomplete))
+
+    def test_interactive_desktop_may_be_quiet_without_being_stalled(self):
+        desktop = self.sample(91, 200000)
+        desktop["desktop_ready"] = True
+        self.assertFalse(stationary_boot_pair(self.sample(48, 200000), desktop))
 
 
 class ProcStatCpuTests(unittest.TestCase):

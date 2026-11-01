@@ -124,7 +124,7 @@ jobs:
           sha256sum rust-micro/.tmp/disk.img > native-kvm-image-after-boot1.sha256
           if [ "$boot_status" -ne 0 ]; then exit "$boot_status"; fi
           if [ "${{ inputs.boot_runs || '1' }}" = '2' ]; then
-            for path in native-kvm-smoke.log native-kvm-smoke.ppm native-kvm-qemu-int-tail.log native-kvm-stall-state.json native-kvm-volume-dispatch-state.json native-kvm-cpu-samples.jsonl; do
+            for path in native-kvm-smoke.log native-kvm-smoke.ppm native-kvm-qemu-int-tail.log native-kvm-stall-state.json native-kvm-volume-dispatch-state.json native-kvm-cpu-samples.jsonl native-kvm-stationary.txt; do
               if [ -f "$path" ]; then
                 cp "$path" "${path%.*}-boot1.${path##*.}"
               fi
@@ -156,6 +156,8 @@ jobs:
             native-kvm-volume-dispatch-state-boot1.json
             native-kvm-cpu-samples.jsonl
             native-kvm-cpu-samples-boot1.jsonl
+            native-kvm-stationary.txt
+            native-kvm-stationary-boot1.txt
             native-kvm-image.sha256
             native-kvm-image-after-boot1.sha256
             native-kvm-image-after-boot2.sha256
