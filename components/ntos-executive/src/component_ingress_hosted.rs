@@ -86,6 +86,39 @@ pub(super) unsafe fn oldest_pending_snapshot() -> Option<PendingSnapshot> {
         registers: message.registers(),
     })
 }
+
+/// Read-only gate state for a retained hosted Call at a periodic boot census.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DeliveryGateSnapshot {
+    pub journal_owned: bool,
+    pub receive_child_pending: bool,
+    pub oldest_can_park: Option<bool>,
+    pub oldest_settlement_prepared: Option<bool>,
+    pub pending_calls: usize,
+}
+
+pub(crate) unsafe fn delivery_gate_snapshot() -> DeliveryGateSnapshot {
+    let rows = &*core::ptr::addr_of!(CALLS);
+    let oldest = oldest_pending_snapshot();
+    let oldest_row = oldest.and_then(|snapshot| {
+        rows.iter().flatten().find(|row| {
+            row.binding == snapshot.binding
+                && row.call.as_ref().is_some_and(|call| {
+                    call.reply() == snapshot.reply
+                        && call.admission_sequence() == snapshot.admission_sequence
+                })
+        })
+    });
+    DeliveryGateSnapshot {
+        journal_owned: crate::writable_fs::registry_journal::owns_volume(),
+        receive_child_pending: receive_child_pending(),
+        oldest_can_park: oldest_row.and_then(|row| row.call.as_ref().map(ExternalIngress::can_park)),
+        oldest_settlement_prepared: oldest_row.map(|row| row.receive_settlement.is_some()),
+        pending_calls: rows.iter().flatten().filter(|row| {
+            !row.delivered && !row.released && row.completion.is_none()
+        }).count(),
+    }
+}
 struct Cancellation {
     binding: Binding,
     reply: u64,

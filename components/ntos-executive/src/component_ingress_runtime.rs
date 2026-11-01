@@ -49,6 +49,7 @@ pub(crate) use hosted::{
     receive_child_delivery_allowed, with_bound_receive_scope,
 };
 pub(crate) use hosted::PendingSnapshot;
+pub(crate) use hosted::delivery_gate_snapshot;
 
 const RETAINED_CALL_CAPACITY: usize = 256;
 const PEER_CAPACITY: usize = 256;

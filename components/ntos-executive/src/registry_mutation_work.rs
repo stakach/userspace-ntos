@@ -492,6 +492,69 @@ pub(crate) fn pending_count() -> u64 {
     PENDING.load(Ordering::Acquire)
 }
 
+/// Copied census evidence. The work table is inspected only on the executive thread.
+#[derive(Debug)]
+pub(crate) struct CensusSnapshot {
+    pending: u64,
+    active: bool,
+    next_deadline: u64,
+    selected_index: u64,
+    hosted_rows: usize,
+    provider_rows: usize,
+    first_hosted: Option<(u64, &'static str, &'static str)>,
+}
+
+pub(crate) unsafe fn census_snapshot() -> CensusSnapshot {
+    let rows = &*core::ptr::addr_of!(WORK);
+    let mut hosted_rows = 0;
+    let mut provider_rows = 0;
+    let mut first_hosted = None;
+    for work in rows.iter().flatten() {
+        match &work.caller {
+            Caller::Hosted(_) => {
+                hosted_rows += 1;
+                if first_hosted.is_none() {
+                    let phase = match work.phase {
+                        Phase::ProviderAdmit => "provider-admit", Phase::Begin(_) => "begin",
+                        Phase::Prepare(_) => "prepare", Phase::Admit => "admit",
+                        Phase::Durable => "durable", Phase::Commit => "commit",
+                        Phase::CommitDurable => "commit-durable", Phase::Open => "open",
+                        Phase::Acknowledge => "acknowledge",
+                        Phase::ReleasePublication(_) => "release-publication",
+                        Phase::Abort => "abort", Phase::Rollback => "rollback",
+                        Phase::DurableAbort(_) => "durable-abort",
+                        Phase::AcknowledgeAbort(_) => "acknowledge-abort",
+                        Phase::ReleaseRollback(_) => "release-rollback",
+                        Phase::Complete => "complete", Phase::ReadyReply => "ready-reply",
+                        Phase::ReplyEntered => "reply-entered", Phase::ReplySent => "reply-sent",
+                        Phase::RevokeReply => "revoke-reply", Phase::RetypeReply => "retype-reply",
+                        Phase::ReconcileRuntime => "reconcile-runtime",
+                        Phase::ProviderReplyEntered => "provider-reply-entered",
+                    };
+                    let storage = match work.persistence.owner {
+                        PersistenceOwner::Unadmitted => "unadmitted",
+                        PersistenceOwner::NoStorage => "no-storage",
+                        PersistenceOwner::Admitting { .. } => "admitting",
+                        PersistenceOwner::Legacy(_) => "legacy",
+                        PersistenceOwner::Wal(_) => "wal",
+                    };
+                    first_hosted = Some((work.id, phase, storage));
+                }
+            }
+            Caller::Provider(_) => provider_rows += 1,
+        }
+    }
+    CensusSnapshot {
+        pending: PENDING.load(Ordering::Acquire),
+        active: ACTIVE.load(Ordering::Acquire),
+        next_deadline: NEXT.load(Ordering::Acquire),
+        selected_index: EXECUTING_INDEX.load(Ordering::Relaxed),
+        hosted_rows,
+        provider_rows,
+        first_hosted,
+    }
+}
+
 pub(crate) fn redrive_active() -> bool {
     ACTIVE.load(Ordering::Acquire)
 }

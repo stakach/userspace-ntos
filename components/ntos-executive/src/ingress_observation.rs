@@ -5,12 +5,18 @@ pub(crate) fn print_hold_snapshot(now: u64) {
     let snapshot = unsafe {
         crate::spawn_hosts::shared_ingress::owner::runtime::hold_snapshot()
     };
+    let gate = unsafe {
+        crate::spawn_hosts::shared_ingress::owner::runtime::delivery_gate_snapshot()
+    };
     let logical = snapshot.running.and_then(|running| unsafe {
         crate::win32k_glue::dispatch_observation_snapshot(running.lane)
     });
     let mut record = nt_printf::record::RecordBuffer::<4096>::new();
     let _ = writeln!(record, "[ingress-hold] t_ms={} running={:?} oldest={:?} logical={:?}",
         now / 10_000, snapshot.running, snapshot.oldest, logical);
+    let _ = writeln!(record, "[ingress-gate] t_ms={} {:?}", now / 10_000, gate);
+    let registry = unsafe { crate::registry_mutation_work::census_snapshot() };
+    let _ = writeln!(record, "[registry-work] t_ms={} {:?}", now / 10_000, registry);
     sel4_rt::print_record(if record.overflowed() {
         b"[ingress-hold] record-truncated\n"
     } else {
