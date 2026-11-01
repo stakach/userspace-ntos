@@ -38,6 +38,13 @@ TERMINAL_BOOT_STOP = re.compile(
     rb"|\[provider-bugcheck\] terminal"
     rb")\r?\n"
 )
+PS_CREATE_FOLD_EVENT = re.compile(
+    rb"\[ps-create-event\] #[0-9]+ stage=fold-(?:enter|service-return|restore-return) "
+    rb"route=([0-9]+) reply=0 label=0"
+)
+PS_CREATE_FOLD_LOOP = re.compile(
+    rb"\[ps-create-after-autonomous\] #[0-9]+ stage=loop tcb=([0-9]+) route=([0-9]+)"
+)
 
 
 class SerialPanicDetector:
@@ -120,6 +127,68 @@ def stationary_boot_pair(previous, current):
 
     before_cpus = halted(previous)
     return before_cpus is not None and before_cpus == halted(current)
+
+
+def ps_create_fold_stall_pair(previous, current, serial):
+    """Recognize the proven single-CPU PsCreate fold spin, not general serial activity."""
+    if not previous or not current or not isinstance(serial, bytes):
+        return False
+    if (not previous.get("boot_marker") or not current.get("boot_marker")
+            or previous.get("desktop_ready") or current.get("desktop_ready")):
+        return False
+    before, after = previous.get("elapsed_seconds"), current.get("elapsed_seconds")
+    start, end = previous.get("serial_bytes"), current.get("serial_bytes")
+    if (not isinstance(before, (int, float)) or not isinstance(after, (int, float))
+            or after - before < 30 or not isinstance(start, int) or not isinstance(end, int)
+            or start <= 0 or end <= start or end > len(serial) or end - start > 65536
+            or serial[start - 1] != 10 or serial[end - 1] != 10):
+        return False
+    previous_cpu = previous.get("host", {}).get("group_cpu_seconds")
+    current_cpu = current.get("host", {}).get("group_cpu_seconds")
+    if (not isinstance(previous_cpu, (int, float)) or not isinstance(current_cpu, (int, float))
+            or current_cpu - previous_cpu < (after - before) * 0.5):
+        return False
+
+    def cpu_locations(sample):
+        state = sample.get("state")
+        if not isinstance(state, dict) or state.get("error") or state.get("register_errors"):
+            return None
+        cpus, registers = state.get("cpus"), state.get("registers")
+        if not isinstance(cpus, list) or len(cpus) < 2 or not isinstance(registers, dict):
+            return None
+        indices = [cpu.get("cpu-index") for cpu in cpus if isinstance(cpu, dict)]
+        if len(indices) != len(cpus) or len(set(indices)) != len(cpus):
+            return None
+        active = []
+        for index in indices:
+            record = registers.get(str(index))
+            if not isinstance(record, str):
+                return None
+            halted = re.search(r"\bHLT=([01])\b", record)
+            rip = re.search(r"\bRIP=([0-9a-fA-F]+)\b", record)
+            cr3 = re.search(r"\bCR3=([0-9a-fA-F]+)\b", record)
+            if not halted or not rip or not cr3:
+                return None
+            if halted.group(1) == "0":
+                active.append((index, rip.group(1).lower(), cr3.group(1).lower()))
+        return active if len(active) == 1 else None
+
+    if cpu_locations(previous) is None or cpu_locations(previous) != cpu_locations(current):
+        return False
+
+    routes, threads = set(), set()
+    saw_fold = saw_loop = False
+    for line in serial[start:end].splitlines():
+        if match := PS_CREATE_FOLD_EVENT.fullmatch(line):
+            routes.add(match.group(1))
+            saw_fold = True
+        elif match := PS_CREATE_FOLD_LOOP.fullmatch(line):
+            threads.add(match.group(1))
+            routes.add(match.group(2))
+            saw_loop = True
+        else:
+            return False
+    return saw_fold and saw_loop and len(routes) == 1 and len(threads) == 1
 
 
 def qmp_reply(stream, command_id):
@@ -451,6 +520,14 @@ def main():
                         samples.write(json.dumps(sample) + "\n")
                     if stationary_boot_pair(previous_sample, sample):
                         stationary_reason = (f"serial unchanged and all vCPUs halted from "
+                                             f"{previous_sample['elapsed_seconds']}s to "
+                                             f"{sample['elapsed_seconds']}s")
+                        STATIONARY_MARKER.write_text(stationary_reason + "\n")
+                        print(f"Guest stationary: {stationary_reason}; stopping bounded boot", flush=True)
+                        capture_terminal_evidence("stationary")
+                        break
+                    if ps_create_fold_stall_pair(previous_sample, sample, serial):
+                        stationary_reason = (f"PsCreate fold loop with one unchanged running vCPU from "
                                              f"{previous_sample['elapsed_seconds']}s to "
                                              f"{sample['elapsed_seconds']}s")
                         STATIONARY_MARKER.write_text(stationary_reason + "\n")
