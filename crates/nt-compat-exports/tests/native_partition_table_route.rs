@@ -7,12 +7,13 @@ fn partition_table_export_uses_live_geometry_and_sector_irps_before_pool_publica
     let builder = include_str!("../../../components/ntos-executive/src/hosted_synchronous_fsd_request.rs");
     let plan = include_str!("../../nt-io-manager/src/kernel_irp_builder.rs");
     let parser = include_str!("../../nt-fs/src/partition_layout.rs");
+    let native_tokens: String = native.split_whitespace().collect();
 
     assert!(launch.contains("hosted_partition_table::bind(reg);"));
     assert!(native.contains("IOCTL_DISK_GET_DRIVE_GEOMETRY_EX"));
     assert!(native.contains("hosted_driver_object_reference::ob_reference_object_by_pointer("));
     assert!(native.contains("s_obf_dereference_object(self.0)"));
-    assert!(native.contains("build_control(\n            IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, device,"));
+    assert!(native_tokens.contains("build_control(IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,device,"));
     assert!(native.contains("hosted_synchronous_fsd_request::build_disk_metadata_read("));
     assert!(native.contains("s_iof_call_driver(device, irp)"));
     assert!(native.contains("s_ke_wait_for_single_object(self.event"));
