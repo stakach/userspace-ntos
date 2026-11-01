@@ -28,6 +28,7 @@ nt-kernel-abi = { path = "../nt-kernel-abi" }
 nt-kernel-exec = { path = "../nt-kernel-exec" }
 nt-process = { path = "../nt-process" }
 nt-driver-runtime = { path = "../nt-driver-runtime" }
+nt-dma-manager = { path = "../nt-dma-manager" }
 nt-hosted-runtime = { path = "../nt-hosted-runtime" }
 nt-user-callback = { path = "../nt-user-callback" }
 syn = { version = "2", features = ["full", "visit"] }
