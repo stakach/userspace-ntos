@@ -12,6 +12,7 @@ use nt_component_suspension::{peer_registry::PeerRoute, LaneDispatchIdentity};
 use nt_io_manager::retained_connect_forward::{
     ConnectForwardIdentity, ConnectForwardPhase, ConnectStackRange, RetainedConnectForward,
 };
+use nt_io_manager::source_irp_ledger::SourceIrpForwardIdentity;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SourceStackLeaseId(usize);
@@ -31,59 +32,46 @@ enum StackOwner {
 
 struct StackLease {
     owner: StackOwner,
-    source: ConnectForwardIdentity,
+    source: StackLeaseSource,
     route: PeerRoute,
     dispatch: LaneDispatchIdentity,
     reply: u64,
     range: ConnectStackRange,
-    snapshot: [u8; 16],
+    snapshot: [u8; 0x58],
+    exec_va: u64,
     pinned: bool,
     indeterminate: bool,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum StackLeaseSource {
+    Connect(ConnectForwardIdentity),
+    Scsi(SourceIrpForwardIdentity),
+}
+
 static mut LEASES: Vec<StackLease> = Vec::new();
 
-fn checked_stack_range(base: u64, bytes: u64, pointer: u64) -> Option<u64> {
+fn checked_stack_range(base: u64, bytes: u64, pointer: u64, length: u64) -> Option<u64> {
     (base != 0
-        && bytes >= 16
+        && bytes >= length
         && pointer != 0
         && pointer & 7 == 0
         && base.checked_add(bytes).is_some_and(|end| {
-            pointer >= base && pointer.checked_add(16).is_some_and(|last| last <= end)
+            pointer >= base && pointer.checked_add(length).is_some_and(|last| last <= end)
         }))
     .then_some(pointer - base)
 }
 
-/// Capture only while this exact physical source is executing its current admitted dispatch.
-/// The returned id must be retained beside the CONNECT forward until terminal reconciliation.
-pub(crate) unsafe fn capture(
-    channel: &crate::spawn_hosts::PumpChannel,
+unsafe fn resolve_stack(
+    instance: usize,
+    inst: DriverInstance,
+    physical: runtime::PhysicalSource,
+    domain: HostedDomainIdentity,
+    route: PeerRoute,
     reply: u64,
-    source_identity: ConnectForwardIdentity,
     pointer: u64,
-) -> Option<(SourceStackLeaseId, ConnectStackRange, [u8; 16])> {
-    let route = runtime::channel_route(channel).ok()??;
-    let physical = runtime::physical_source(route).ok()?;
-    let dispatch = runtime::dispatch(route).ok()?;
-    if reply == 0
-        || runtime::current_reply(route).ok()? != reply
-        || physical.tcb != channel.tcb
-        || physical.pml4 != channel.pml4
-        || !hosted_ingress_sources::verify(physical)
-    {
-        return None;
-    }
-    let PhysicalDomain::Hosted(domain) = physical.domain else {
-        return None;
-    };
-    let (instance, inst) = instance_for_pump_channel(channel, reply)?;
-    if instance_domain_identity(inst) != Some(domain)
-        || source_identity.source.allocation().domain != domain
-        || inst.pml4 != physical.pml4
-    {
-        return None;
-    }
-
+    length: u64,
+) -> Option<(StackOwner, ConnectStackRange, u64)> {
     let (owner, range, exec_va) = match physical.kind {
         PhysicalSourceKind::Primary => {
             let thread = (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_TABLES))
@@ -100,7 +88,7 @@ pub(crate) unsafe fn capture(
             {
                 return None;
             }
-            let offset = checked_stack_range(FSD_STACK_VADDR, FSD_STACK_BYTES, pointer)?;
+            let offset = checked_stack_range(FSD_STACK_VADDR, FSD_STACK_BYTES, pointer, length)?;
             let exec_va = inst.exec_stack_va.checked_add(offset)?;
             (
                 StackOwner::Primary {
@@ -146,7 +134,7 @@ pub(crate) unsafe fn capture(
             }
             let component_base = hosted_worker_component_base_for_slot(worker.component_slot)?;
             let bytes = FSD_WORKER_STACK_FRAMES.checked_mul(0x1000)?;
-            let offset = checked_stack_range(component_base, bytes, pointer)?;
+            let offset = checked_stack_range(component_base, bytes, pointer, length)?;
             let exec_va =
                 hosted_worker_exec_base_for_alias(worker.exec_alias_slot)?.checked_add(offset)?;
             let generation = (worker.construction as u64).checked_add(1)?;
@@ -168,6 +156,40 @@ pub(crate) unsafe fn capture(
         _ => return None,
     };
 
+    Some((owner, range, exec_va))
+}
+
+/// Capture only while this exact physical source is executing its current admitted dispatch.
+/// The returned id must be retained beside the CONNECT forward until terminal reconciliation.
+pub(crate) unsafe fn capture(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply: u64,
+    source_identity: ConnectForwardIdentity,
+    pointer: u64,
+) -> Option<(SourceStackLeaseId, ConnectStackRange, [u8; 16])> {
+    let route = runtime::channel_route(channel).ok()??;
+    let physical = runtime::physical_source(route).ok()?;
+    let dispatch = runtime::dispatch(route).ok()?;
+    if reply == 0
+        || runtime::current_reply(route).ok()? != reply
+        || physical.tcb != channel.tcb
+        || physical.pml4 != channel.pml4
+        || !hosted_ingress_sources::verify(physical)
+    {
+        return None;
+    }
+    let PhysicalDomain::Hosted(domain) = physical.domain else {
+        return None;
+    };
+    let (instance, inst) = instance_for_pump_channel(channel, reply)?;
+    if instance_domain_identity(inst) != Some(domain)
+        || source_identity.source.allocation().domain != domain
+        || inst.pml4 != physical.pml4
+    {
+        return None;
+    }
+
+    let (owner, range, exec_va) = resolve_stack(instance, inst, physical, domain, route, reply, pointer, 16)?;
     let _durable = crate::allocator::enter_durable();
     let leases = &mut *core::ptr::addr_of_mut!(LEASES);
     leases.try_reserve(1).ok()?;
@@ -175,12 +197,13 @@ pub(crate) unsafe fn capture(
     // The pin is published before the first read. Retirement checks it before any unmap.
     leases.push(StackLease {
         owner,
-        source: source_identity,
+        source: StackLeaseSource::Connect(source_identity),
         route,
         dispatch,
         reply,
         range,
-        snapshot: [0; 16],
+        snapshot: [0; 0x58],
+        exec_va,
         pinned: true,
         indeterminate: false,
     });
@@ -188,7 +211,7 @@ pub(crate) unsafe fn capture(
     for (index, byte) in bytes.iter_mut().enumerate() {
         *byte = core::ptr::read_volatile((exec_va + index as u64) as *const u8);
     }
-    leases[id.0].snapshot = bytes;
+    leases[id.0].snapshot[..16].copy_from_slice(&bytes);
     // A changed dispatch or Reply makes the result uncertain; the pin remains owned.
     if runtime::dispatch(route).ok()? != dispatch
         || runtime::current_reply(route).ok()? != reply
@@ -198,6 +221,146 @@ pub(crate) unsafe fn capture(
         return None;
     }
     Some((id, range, bytes))
+}
+
+/// Pin a class driver's stack-local legacy SRB while its synchronous lower-device call is
+/// outstanding. The source address never leaves this domain; the provider gets a copy.
+pub(crate) unsafe fn capture_scsi(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply: u64,
+    source_identity: SourceIrpForwardIdentity,
+    pointer: u64,
+) -> Option<(SourceStackLeaseId, ConnectStackRange, [u8; 0x58])> {
+    let route = runtime::channel_route(channel).ok()??;
+    let physical = runtime::physical_source(route).ok()?;
+    let dispatch = runtime::dispatch(route).ok()?;
+    if reply == 0
+        || runtime::current_reply(route).ok()? != reply
+        || physical.tcb != channel.tcb
+        || physical.pml4 != channel.pml4
+        || !hosted_ingress_sources::verify(physical)
+    { return None; }
+    let PhysicalDomain::Hosted(domain) = physical.domain else { return None; };
+    let (instance, inst) = instance_for_pump_channel(channel, reply)?;
+    if instance_domain_identity(inst) != Some(domain)
+        || source_identity.allocation().domain != domain
+        || inst.pml4 != physical.pml4
+    { return None; }
+    let (owner, range, exec_va) = resolve_stack(
+        instance, inst, physical, domain, route, reply, pointer, 0x58,
+    )?;
+    let _durable = crate::allocator::enter_durable();
+    let leases = &mut *core::ptr::addr_of_mut!(LEASES);
+    leases.try_reserve(1).ok()?;
+    let id = SourceStackLeaseId(leases.len());
+    leases.push(StackLease {
+        owner,
+        source: StackLeaseSource::Scsi(source_identity),
+        route,
+        dispatch,
+        reply,
+        range,
+        snapshot: [0; 0x58],
+        exec_va,
+        pinned: true,
+        indeterminate: false,
+    });
+    let mut bytes = [0u8; 0x58];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = core::ptr::read_volatile((exec_va + index as u64) as *const u8);
+    }
+    leases[id.0].snapshot = bytes;
+    if runtime::dispatch(route).ok()? != dispatch
+        || runtime::current_reply(route).ok()? != reply
+        || runtime::physical_source(route).ok()? != physical
+    {
+        leases[id.0].indeterminate = true;
+        return None;
+    }
+    Some((id, range, bytes))
+}
+
+pub(crate) unsafe fn scsi_matches(
+    id: SourceStackLeaseId,
+    source: SourceIrpForwardIdentity,
+    range: ConnectStackRange,
+    pointer: u64,
+) -> bool {
+    let Some(row) = (&*core::ptr::addr_of!(LEASES)).get(id.0) else { return false; };
+    row.pinned && !row.indeterminate
+        && row.source == StackLeaseSource::Scsi(source)
+        && row.range == range
+        && checked_stack_range(range.base, range.bytes, pointer, 0x58).is_some()
+        && runtime::dispatch(row.route).ok() == Some(row.dispatch)
+        && runtime::current_reply(row.route).ok() == Some(row.reply)
+        && runtime::physical_source(row.route).ok().is_some_and(|physical| {
+            physical.domain == PhysicalDomain::Hosted(range.domain)
+                && match row.owner {
+                    StackOwner::Primary { instance: instance_index, domain, tcb, pml4 } =>
+                        physical.tcb == tcb && physical.pml4 == pml4
+                            && instance(instance_index).is_some_and(|inst| {
+                                instance_domain_identity(inst) == Some(domain)
+                                    && inst.tcb == tcb
+                                    && inst.pml4 == pml4
+                                    && inst.main_thread_id == range.thread
+                                    && inst.exec_stack_va != 0
+                                    && inst.stack_frame_count == FSD_STACK_FRAMES
+                            }),
+                    StackOwner::Worker { construction } =>
+                        (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_RUNTIMES))
+                            .as_ref().is_some_and(|rows| rows.iter().copied().any(|worker| {
+                                worker.construction == construction
+                                    && worker.handle == range.thread
+                                    && worker.ingress_route == Some(row.route)
+                                    && worker.reply_cap == row.reply
+                                    && worker.tcb == physical.tcb
+                                    && worker.pml4 == physical.pml4
+                                    && hosted_thread_resources::stack_live(worker)
+                            })),
+                }
+        })
+}
+
+pub(crate) unsafe fn write_scsi(
+    id: SourceStackLeaseId,
+    source: SourceIrpForwardIdentity,
+    range: ConnectStackRange,
+    pointer: u64,
+    completed: &[u8; 0x58],
+) -> bool {
+    if !scsi_can_write(id, source, range, pointer) { return false; }
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LEASES))[id.0];
+    for (index, byte) in completed.iter().enumerate() {
+        core::ptr::write_volatile((row.exec_va + index as u64) as *mut u8, *byte);
+    }
+    row.snapshot = *completed;
+    true
+}
+
+pub(crate) unsafe fn scsi_can_write(
+    id: SourceStackLeaseId,
+    source: SourceIrpForwardIdentity,
+    range: ConnectStackRange,
+    pointer: u64,
+) -> bool {
+    if !scsi_matches(id, source, range, pointer) { return false; }
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LEASES))[id.0];
+    let unchanged = row.snapshot.iter().enumerate().all(|(index, original)| {
+        core::ptr::read_volatile((row.exec_va + index as u64) as *const u8) == *original
+    });
+    if !unchanged { row.indeterminate = true; }
+    unchanged
+}
+
+pub(crate) unsafe fn release_scsi(
+    id: SourceStackLeaseId, source: SourceIrpForwardIdentity,
+) -> bool {
+    let Some(row) = (&mut *core::ptr::addr_of_mut!(LEASES)).get_mut(id.0) else { return false; };
+    if !row.pinned || row.indeterminate || row.source != StackLeaseSource::Scsi(source) {
+        return false;
+    }
+    row.pinned = false;
+    true
 }
 
 /// Only a consumed terminal of the same retained forward can release the physical stack pin.
@@ -211,7 +374,7 @@ pub(crate) unsafe fn release_terminal(
     };
     if !row.pinned
         || row.indeterminate
-        || row.source != forward.identity()
+        || row.source != StackLeaseSource::Connect(forward.identity())
         || forward.phase() != ConnectForwardPhase::TerminalConsumed
     {
         return false;
@@ -227,7 +390,7 @@ pub(crate) unsafe fn release_unentered(
     forward: &RetainedConnectForward,
 ) -> bool {
     let Some(row) = (&mut *core::ptr::addr_of_mut!(LEASES)).get_mut(id.0) else { return false; };
-    if !row.pinned || row.indeterminate || row.source != forward.identity()
+    if !row.pinned || row.indeterminate || row.source != StackLeaseSource::Connect(forward.identity())
         || forward.phase() != ConnectForwardPhase::Prepared
     { return false; }
     row.pinned = false;
@@ -244,7 +407,7 @@ pub(crate) unsafe fn retain_indeterminate(
         return false;
     };
     if !row.pinned
-        || row.source != forward.identity()
+        || row.source != StackLeaseSource::Connect(forward.identity())
         || !matches!(forward.phase(), ConnectForwardPhase::Indeterminate(_))
     {
         return false;

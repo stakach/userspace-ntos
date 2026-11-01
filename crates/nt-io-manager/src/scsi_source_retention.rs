@@ -8,6 +8,7 @@
 use alloc::vec::Vec;
 
 use crate::retained_query_path_forward::SourceIrpTicket;
+use crate::retained_connect_forward::ConnectStackRange;
 use crate::scsi_srb_transport::ScsiSrbRoute;
 use crate::source_irp_auxiliary::{
     SourceMdlAllocationIdentity, SourceMemoryIdentity, SourcePoolAllocationIdentity,
@@ -20,12 +21,18 @@ pub struct ScsiSourceChildren {
     pub source: SourceIrpAllocation,
     pub ticket: SourceIrpTicket,
     pub route: ScsiSrbRoute,
-    pub srb: SourcePoolAllocationIdentity,
+    pub srb: ScsiSrbSource,
     pub sense: Option<SourcePoolAllocationIdentity>,
     pub sense_length: u8,
     pub mdl: Option<SourceMdlAllocationIdentity>,
     pub data: Option<SourceMemoryIdentity>,
     pub transfer_length: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ScsiSrbSource {
+    Pool(SourcePoolAllocationIdentity),
+    Stack { range: ConnectStackRange, component_address: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -259,7 +266,7 @@ impl ScsiSourceRetentionLedger {
     ) -> bool {
         self.rows.iter().any(|row| row.children.source.owner == owner
             && row.children.source.domain == domain
-            && (row.children.srb.component_address == address
+            && (matches!(row.children.srb, ScsiSrbSource::Pool(srb) if srb.component_address == address)
                 || row.children.sense.is_some_and(|sense| sense.component_address == address)
                 || row.children.mdl.is_some_and(|mdl| mdl.pool.component_address == address)
                 || matches!(row.children.data, Some(SourceMemoryIdentity::Pool { allocation, .. })
@@ -326,7 +333,21 @@ fn valid(children: ScsiSourceChildren) -> bool {
         && route.provider.cookie != 0
         && route.relation_generation != 0
         && route.provider_pdo != 0;
-    let srb_valid = srb.component_address != 0 && srb.capacity >= 0x58 && srb.pool_generation != 0;
+    let srb_valid = match srb {
+        ScsiSrbSource::Pool(srb) => srb.component_address != 0 && srb.capacity >= 0x58 && srb.pool_generation != 0,
+        ScsiSrbSource::Stack { range, component_address } => {
+            range.domain == source.domain
+                && range.thread != 0
+                && range.generation != 0
+                && range.base != 0
+                && range.bytes >= 0x58
+                && component_address & 7 == 0
+                && range.base.checked_add(range.bytes).is_some_and(|end| {
+                    component_address >= range.base
+                        && component_address.checked_add(0x58).is_some_and(|last| last <= end)
+                })
+        }
+    };
     let sense_valid = match (children.sense_length, children.sense) {
         (0, None) => true,
         (length, Some(sense)) => length != 0 && sense.component_address != 0
@@ -397,11 +418,11 @@ mod tests {
                 relation_generation: 7,
                 provider_pdo: 0x9000,
             },
-            srb: SourcePoolAllocationIdentity {
+            srb: ScsiSrbSource::Pool(SourcePoolAllocationIdentity {
                 component_address: 0x2000,
                 capacity: 0x58,
                 pool_generation: 5,
-            },
+            }),
             sense: Some(SourcePoolAllocationIdentity {
                 component_address: 0x5000,
                 capacity: 0x20,
@@ -426,6 +447,73 @@ mod tests {
                 bytes: 0x200,
             }),
             transfer_length: 0x200,
+        }
+    }
+
+    #[test]
+    fn stack_local_claim_srb_is_retained_until_source_completion_and_provider_ack() {
+        let mut children = fixture();
+        children.srb = ScsiSrbSource::Stack {
+            range: ConnectStackRange {
+                domain: children.source.domain,
+                thread: 7,
+                base: 0x8000,
+                bytes: 0x1000,
+                generation: 11,
+            },
+            component_address: 0x8100,
+        };
+        children.sense = None;
+        children.sense_length = 0;
+        children.mdl = None;
+        children.data = None;
+        children.transfer_length = 0;
+        let mut ledger = ScsiSourceRetentionLedger::new();
+        ledger.retain(children).expect("live stack-local SRB must be admissible");
+        assert!(!ledger.protects_pool(
+            children.source.owner,
+            children.source.domain,
+            0x8100,
+        ));
+        let irp = IrpId::new(3, 8);
+        ledger.enter(children, irp).unwrap();
+        ledger.pending(children, irp).unwrap();
+        ledger.terminal(children, irp).unwrap();
+        ledger.source_completed(children, irp).unwrap();
+        assert_eq!(ledger.phase(children.ticket), Some(ScsiSourcePhase::SourceCompleted));
+        ledger.acknowledge(children, irp).unwrap();
+        ledger.release(children).unwrap();
+    }
+
+    #[test]
+    fn stale_or_unbounded_stack_local_srb_is_refused() {
+        let mut children = fixture();
+        children.sense = None;
+        children.sense_length = 0;
+        children.mdl = None;
+        children.data = None;
+        children.transfer_length = 0;
+        let live = ConnectStackRange {
+            domain: children.source.domain,
+            thread: 7,
+            base: 0x8000,
+            bytes: 0x1000,
+            generation: 11,
+        };
+        for (range, address) in [
+            (ConnectStackRange { thread: 0, ..live }, 0x8100),
+            (ConnectStackRange { generation: 0, ..live }, 0x8100),
+            (live, 0x8fc0),
+            (live, 0x8101),
+        ] {
+            children.srb = ScsiSrbSource::Stack {
+                range,
+                component_address: address,
+            };
+            assert_eq!(
+                ScsiSourceRetentionLedger::new().retain(children),
+                Err(ScsiSourceRetentionError::Invalid),
+            );
         }
     }
 
@@ -511,7 +599,9 @@ mod tests {
         ledger.retain(children).unwrap();
         ledger.enter(children, irp).unwrap();
         let mut stale = children;
-        stale.srb.pool_generation += 1;
+        if let ScsiSrbSource::Pool(srb) = &mut stale.srb {
+            srb.pool_generation += 1;
+        }
         assert_eq!(
             ledger.terminal(stale, irp),
             Err(ScsiSourceRetentionError::WrongIdentity)

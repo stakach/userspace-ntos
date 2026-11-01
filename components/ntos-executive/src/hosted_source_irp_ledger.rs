@@ -101,7 +101,9 @@ pub(super) fn capture_scsi_children(
     ticket: SourceIrpTicket,
     target_device: u64,
     route: ScsiSrbRoute,
-) -> Option<(ScsiSourceChildren, Vec<u8>, Option<Vec<u8>>, Vec<u8>, Option<Vec<u8>>)> {
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply: u64,
+) -> Option<(ScsiSourceChildren, Vec<u8>, Option<Vec<u8>>, Vec<u8>, Option<Vec<u8>>, Option<hosted_source_stack_lease::SourceStackLeaseId>)> {
     let _guard = lock();
     let inst = instance(instance_index)?;
     if source.domain != ticket.domain
@@ -128,13 +130,26 @@ pub(super) fn capture_scsi_children(
     if stack.device_object != target_device || stack.file_object != 0
         || irp.associated_irp_system_buffer.0 != 0 || irp.user_buffer.0 != 0
     { return None; }
-    let srb_identity = unsafe { exact_pool_identity_unlocked(
-        inst, srb_address, WDM_X64_LEGACY_SRB_SIZE as u64,
-    )? };
-    let srb_exec = inst.exec_pool_va.checked_add(srb_address.checked_sub(FSD_POOL_VADDR)?)?;
-    let srb_slice = unsafe { core::slice::from_raw_parts(
-        srb_exec as *const u8, WDM_X64_LEGACY_SRB_SIZE,
-    ) };
+    let source_identity = SourceIrpForwardIdentity::new(ticket, source)?;
+    let (srb_identity, srb_bytes, stack_lease) = if let Some(pool) = unsafe {
+        exact_pool_identity_unlocked(inst, srb_address, WDM_X64_LEGACY_SRB_SIZE as u64)
+    } {
+        let srb_exec = inst.exec_pool_va.checked_add(srb_address.checked_sub(FSD_POOL_VADDR)?)?;
+        let mut bytes = [0u8; WDM_X64_LEGACY_SRB_SIZE];
+        bytes.copy_from_slice(unsafe { core::slice::from_raw_parts(
+            srb_exec as *const u8, WDM_X64_LEGACY_SRB_SIZE,
+        ) });
+        (nt_io_manager::scsi_source_retention::ScsiSrbSource::Pool(pool), bytes, None)
+    } else {
+        let (lease, range, bytes) = unsafe {
+            hosted_source_stack_lease::capture_scsi(channel, reply, source_identity, srb_address)?
+        };
+        (nt_io_manager::scsi_source_retention::ScsiSrbSource::Stack {
+            range, component_address: srb_address,
+        }, bytes, Some(lease))
+    };
+    let result = (|| {
+    let srb_slice = &srb_bytes[..];
     if u16::from_le_bytes(srb_slice[..2].try_into().ok()?) as usize != WDM_X64_LEGACY_SRB_SIZE {
         return None;
     }
@@ -206,11 +221,21 @@ pub(super) fn capture_scsi_children(
         data: data_identity, transfer_length,
     };
     scsi_children().retain(children).ok()?;
-    Some((children, srb, mdl_bytes, data_bytes, sense_bytes))
+    Some((children, srb, mdl_bytes, data_bytes, sense_bytes, stack_lease))
+    })();
+    if result.is_none() {
+        if let Some(lease) = stack_lease {
+            // No provider was entered. An exact release is safe; a lease that became
+            // indeterminate stays pinned so its physical stack cannot be recycled.
+            let _ = unsafe { hosted_source_stack_lease::release_scsi(lease, source_identity) };
+        }
+    }
+    result
 }
 
 pub(super) fn scsi_children_match_current(
     instance_index: usize, children: ScsiSourceChildren,
+    stack_lease: Option<hosted_source_stack_lease::SourceStackLeaseId>,
 ) -> bool {
     let _guard = lock();
     if !scsi_children().contains_exact(children)
@@ -225,8 +250,21 @@ pub(super) fn scsi_children_match_current(
         children.source.component_address, children.source.bytes, children.source.stack_count) };
     if let Some(source) = observed.as_mut() { source.owner = children.source.owner; }
     observed == Some(children.source)
-        && unsafe { exact_pool_identity_unlocked(inst, children.srb.component_address, 0x58) }
-            == Some(children.srb)
+        && match children.srb {
+            nt_io_manager::scsi_source_retention::ScsiSrbSource::Pool(pool) => unsafe {
+                exact_pool_identity_unlocked(inst, pool.component_address, 0x58) == Some(pool)
+            },
+            nt_io_manager::scsi_source_retention::ScsiSrbSource::Stack { range, component_address } =>
+                stack_lease.is_some_and(|lease| unsafe {
+                    hosted_source_stack_lease::scsi_matches(
+                        lease,
+                        SourceIrpForwardIdentity::new(children.ticket, children.source)
+                            .expect("retained SCSI source identity"),
+                        range,
+                        component_address,
+                    )
+                }),
+        }
         && children.sense.is_none_or(|sense| unsafe {
             exact_pool_identity_unlocked(inst, sense.component_address,
                 u64::from(children.sense_length)) == Some(sense)

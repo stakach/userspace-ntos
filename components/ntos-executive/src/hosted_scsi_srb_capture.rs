@@ -30,6 +30,7 @@ pub(super) struct CapturedSourceScsi {
     target: Option<HostedForwardTarget>,
     authority: AcceptedPdoProviderAuthority,
     children: ScsiSourceChildren,
+    stack_lease: Option<hosted_source_stack_lease::SourceStackLeaseId>,
     srb: Vec<u8>,
     mdl: Option<Vec<u8>>,
     data: Vec<u8>,
@@ -112,11 +113,18 @@ impl CapturedSourceScsi {
             _ => return Err(CaptureError::InvalidSource),
         };
         // Validate all destinations before the first write while holding the pool lock.
-        if !memory.contains(self.children.srb.component_address, merged.len())
-            || data_address.is_some_and(|address| !memory.contains(address, data.len()))
+        if data_address.is_some_and(|address| !memory.contains(address, data.len()))
             || self.children.sense.is_some_and(|child| !memory.contains(
                 child.component_address, sense.len(),
             ))
+            || match self.children.srb {
+                nt_io_manager::scsi_source_retention::ScsiSrbSource::Pool(pool) =>
+                    !memory.contains(pool.component_address, merged.len()),
+                nt_io_manager::scsi_source_retention::ScsiSrbSource::Stack { range, component_address } =>
+                    !self.stack_lease.is_some_and(|lease| hosted_source_stack_lease::scsi_can_write(
+                        lease, self.source_identity(), range, component_address,
+                    )),
+            }
         {
             return Err(CaptureError::InvalidSource);
         }
@@ -128,9 +136,19 @@ impl CapturedSourceScsi {
                 return Err(CaptureError::InvalidSource);
             }
         }
-        memory.write(self.children.srb.component_address, &merged)
-            .then_some(())
-            .ok_or(CaptureError::InvalidSource)
+        match self.children.srb {
+            nt_io_manager::scsi_source_retention::ScsiSrbSource::Pool(pool) => {
+                memory.write(pool.component_address, &merged)
+                    .then_some(())
+                    .ok_or(CaptureError::InvalidSource)
+            }
+            nt_io_manager::scsi_source_retention::ScsiSrbSource::Stack { range, component_address } => {
+                let lease = self.stack_lease.ok_or(CaptureError::InvalidSource)?;
+                hosted_source_stack_lease::write_scsi(
+                    lease, self.source_identity(), range, component_address, &merged,
+                ).then_some(()).ok_or(CaptureError::InvalidSource)
+            }
+        }
     }
     pub(super) fn provider_authority(&self) -> AcceptedPdoProviderAuthority {
         self.authority
@@ -142,7 +160,7 @@ impl CapturedSourceScsi {
     pub(super) fn validate_retained(&self) -> Result<(), CaptureError> {
         if !self.source_pinned
             || !hosted_source_irp_ledger::scsi_children_match_current(
-                self.instance_index, self.children,
+                self.instance_index, self.children, self.stack_lease,
             )
         {
             return Err(CaptureError::InvalidSource);
@@ -241,6 +259,12 @@ impl CapturedSourceScsi {
     }
 
     fn release_references(&mut self, source_completed: bool) -> Result<(), CaptureError> {
+        if let Some(lease) = self.stack_lease {
+            if !unsafe { hosted_source_stack_lease::release_scsi(lease, self.source_identity()) } {
+                return Err(CaptureError::InvalidSource);
+            }
+            self.stack_lease = None;
+        }
         if self.source_pinned {
             let released = if source_completed {
                 hosted_source_irp_ledger::release_pending_terminal(self.ticket, self.source)
@@ -301,24 +325,27 @@ pub(super) unsafe fn capture(
                 relation_generation: authority.parent_relation().relation().generation(),
                 provider_pdo: authority.provider().address(),
             };
-            let (children, srb, mdl, data, sense) = hosted_source_irp_ledger::capture_scsi_children(
+            let (children, srb, mdl, data, sense, stack_lease) = hosted_source_irp_ledger::capture_scsi_children(
                 instance_index,
                 source,
                 ticket,
                 target_device_address,
                 route,
+                ch,
+                reply_cap,
             )
             .ok_or(CaptureError::InvalidSrb)?;
-            Ok((authority, children, srb, mdl, data, sense))
+            Ok((authority, children, srb, mdl, data, sense, stack_lease))
         })();
         match admitted {
-            Ok((authority, children, srb, mdl, data, sense)) => Ok(CapturedSourceScsi {
+            Ok((authority, children, srb, mdl, data, sense, stack_lease)) => Ok(CapturedSourceScsi {
                 instance_index,
                 source,
                 ticket,
                 target: Some(target),
                 authority,
                 children,
+                stack_lease,
                 srb,
                 mdl,
                 data,
