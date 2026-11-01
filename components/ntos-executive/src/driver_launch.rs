@@ -15923,6 +15923,39 @@ pub(crate) fn hosted_driver_wait_census() -> (u64, u64, u64, u64, u64) {
     )
 }
 
+/// Read-only exact wait owners behind a quiet native driver callback.
+pub(crate) unsafe fn trace_hosted_driver_wait_census() {
+    let Some(waiters) = (&*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS)).as_ref() else {
+        return;
+    };
+    for waiter in waiters.iter().take(4) {
+        print_str(b"[hosted-driver-wait] instance=");
+        print_u64(waiter.instance as u64);
+        print_str(b" handle=0x");
+        print_hex((waiter.thread_handle >> 32) as u32);
+        print_hex(waiter.thread_handle as u32);
+        print_str(b" reply=");
+        print_u64(waiter.reply_cap);
+        print_str(b" route=");
+        print_u64(waiter.shared.route.badge());
+        print_str(b" owner=0x");
+        print_hex((waiter.owner_body >> 32) as u32);
+        print_hex(waiter.owner_body as u32);
+        print_str(b" objects=");
+        print_u64(waiter.objects.len() as u64);
+        print_str(b" first=0x");
+        print_hex((waiter.objects.first().copied().unwrap_or(0) >> 32) as u32);
+        print_hex(waiter.objects.first().copied().unwrap_or(0) as u32);
+        print_str(b" sequence=");
+        print_u64(waiter.sequence);
+        print_str(b" due=");
+        print_u64(waiter.deadline.monotonic_target(crate::nt_time_snapshot()).unwrap_or(0));
+        print_str(b" wake=");
+        print_hex(waiter.wake_status.unwrap_or(i32::MIN) as u32);
+        print_str(b"\n");
+    }
+}
+
 pub(crate) fn hosted_driver_wait_next_deadline(now: nt_time::TimeSnapshot) -> Option<u64> {
     unsafe {
         (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS))
@@ -61766,6 +61799,7 @@ pub(crate) unsafe fn trace_hosted_system_thread_census() {
     let Some(runtimes) = (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_RUNTIMES)).as_ref() else {
         return;
     };
+    let mut parent_sampled = None;
     for runtime in runtimes.iter().rev().take(4) {
         print_str(b"[hosted-system-thread] instance=");
         print_u64(runtime.instance as u64);
@@ -61775,9 +61809,31 @@ pub(crate) unsafe fn trace_hosted_system_thread_census() {
         print_str(b" route=");
         print_u64(runtime.ingress_route.map_or(0, |route| route.badge()));
         print_str(b"\n");
+        if let Some(route) = runtime.ingress_route {
+            print_str(b"[hosted-system-thread] pending-route=");
+            match crate::spawn_hosts::shared_ingress::owner::runtime::pending_route_snapshot(route) {
+                Ok(Some((reply, info))) => {
+                    print_str(b"reply=");
+                    print_u64(reply);
+                    print_str(b" label=");
+                    print_u64(info >> 12);
+                }
+                Ok(None) => print_str(b"none"),
+                Err(_) => print_str(b"invalid"),
+            }
+            print_str(b"\n");
+        }
         crate::win32k_glue::trace_hosted_tcb_debug_state(
             b"hosted-system-thread", runtime.tcb, runtime.reply_cap,
         );
+        if parent_sampled != Some(runtime.instance) {
+            parent_sampled = Some(runtime.instance);
+            if let Some(parent) = instance(runtime.instance) {
+                crate::win32k_glue::trace_hosted_tcb_debug_state(
+                    b"hosted-thread-parent", parent.tcb, parent.reply_cap,
+                );
+            }
+        }
     }
 }
 static mut HOSTED_DRIVER_WAITERS: Option<Vec<HostedDriverRawWaiter>> = None;

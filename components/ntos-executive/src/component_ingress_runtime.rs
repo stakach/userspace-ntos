@@ -910,6 +910,19 @@ pub(crate) unsafe fn next_message(
         .map(|(reply, message)| (reply, message.clone())))
 }
 
+/// Copy only the pending Reply and label for a read-only boot census.
+pub(crate) unsafe fn pending_route_snapshot(route: PeerRoute) -> Result<Option<(u64, u64)>, Error> {
+    if resolve(route, false).is_none() {
+        return Err(Error::PhysicalIdentity);
+    }
+    Ok(owner()
+        .receiver
+        .as_ref()
+        .ok_or(Error::Initialization)?
+        .next_unadmitted(route)
+        .map(|(reply, message)| (reply, message.info())))
+}
+
 pub(crate) unsafe fn stored_current_message(route: PeerRoute) -> Result<ReceivedMessage, Error> {
     let reply = current_reply(route)?;
     owner()

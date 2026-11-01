@@ -29,6 +29,7 @@ pub(crate) fn print_hold_snapshot(now: u64) {
             );
         }
         crate::driver_launch::trace_hosted_system_thread_census();
+        crate::driver_launch::trace_hosted_driver_wait_census();
     }
     // Read-only scheduler/Reply snapshots every fifteenth hold, at most eight times.
     static FONT_HOLD_SAMPLES: core::sync::atomic::AtomicU64 =
