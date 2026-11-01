@@ -18,6 +18,9 @@ static PS_CREATE_AUTONOMOUS_EVENTS: AtomicU64 = AtomicU64::new(0);
 static PS_CREATE_AFTER_AUTONOMOUS_TRACE: AtomicU64 = AtomicU64::new(0);
 static PS_CREATE_AFTER_AUTONOMOUS_SELECT: AtomicU64 = AtomicU64::new(0);
 static PS_CREATE_FOLD_EVENTS: AtomicU64 = AtomicU64::new(0);
+static PS_CREATE_PARENT_MESSAGES: AtomicU64 = AtomicU64::new(0);
+static PS_CREATE_LAST_PARENT_INFO: AtomicU64 = AtomicU64::new(0);
+static PS_CREATE_LAST_PARENT_OP: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn begin_ps_create_receive_trace() {
     PS_CREATE_RECEIVE_TRACE.store(1, Ordering::Relaxed);
@@ -26,6 +29,17 @@ pub(super) fn begin_ps_create_receive_trace() {
     PS_CREATE_AFTER_AUTONOMOUS_TRACE.store(0, Ordering::Relaxed);
     PS_CREATE_AFTER_AUTONOMOUS_SELECT.store(0, Ordering::Relaxed);
     PS_CREATE_FOLD_EVENTS.store(0, Ordering::Relaxed);
+    PS_CREATE_PARENT_MESSAGES.store(0, Ordering::Relaxed);
+    PS_CREATE_LAST_PARENT_INFO.store(0, Ordering::Relaxed);
+    PS_CREATE_LAST_PARENT_OP.store(0, Ordering::Relaxed);
+}
+
+pub(super) fn ps_create_parent_progress() -> (u64, u64, u64) {
+    (
+        PS_CREATE_PARENT_MESSAGES.load(Ordering::Relaxed),
+        PS_CREATE_LAST_PARENT_INFO.load(Ordering::Relaxed),
+        PS_CREATE_LAST_PARENT_OP.load(Ordering::Relaxed),
+    )
 }
 
 fn trace_ps_create_event(stage: &[u8], route: PeerRoute, reply: u64, info: u64) {
@@ -283,6 +297,11 @@ pub(super) unsafe fn receive(
             }
         };
         if let Some((reply, message)) = next {
+            if PS_CREATE_RECEIVE_TRACE.load(Ordering::Relaxed) != 0 {
+                PS_CREATE_LAST_PARENT_INFO.store(message.info(), Ordering::Relaxed);
+                PS_CREATE_LAST_PARENT_OP.store(message.word(0).unwrap_or(0), Ordering::Relaxed);
+                PS_CREATE_PARENT_MESSAGES.fetch_add(1, Ordering::Relaxed);
+            }
             trace_ps_create_event(b"parent-message", route, reply, message.info());
             let completion = message.info() >> 12 == ch.dispatch_label;
             if !completion && runtime::adopt(route, reply).is_err() {

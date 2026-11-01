@@ -1548,6 +1548,10 @@ pub(crate) fn pump_receive_census() -> (u64, u64, u64, u64, u64, u64) {
     shared_pump::receive_census()
 }
 
+pub(crate) fn ps_create_parent_progress() -> (u64, u64, u64) {
+    shared_pump::ps_create_parent_progress()
+}
+
 pub(crate) unsafe fn pump_handle_executive_event_badge(badge: u64) -> (bool, bool, bool) {
     let timer = crate::badge_has_delay_timer(badge);
     let irq_lines = crate::driver_launch::latch_hosted_irq_badge(badge);
@@ -3717,6 +3721,11 @@ unsafe fn component_pump_loop(
         } else if label == crate::driver_launch::FSD_SERVICE_DIRECTORY_OBJECT_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
+            crate::print_str(b"[hosted-directory-request] op=");
+            crate::print_u64(msg.m0);
+            crate::print_str(b" reply=");
+            crate::print_u64(*reply_cap);
+            crate::print_str(b"\n");
             let result = if msg.mi
                 == ((crate::driver_launch::FSD_SERVICE_DIRECTORY_OBJECT_LABEL << 12) | 4)
                 && shared_pump::authenticated_badge(ch, msg.badge)
@@ -3732,10 +3741,14 @@ unsafe fn component_pump_loop(
             };
             match result {
                 crate::provider_directory_broker::SubmitResult::Ready((status, out1, out2, out3)) => {
+                    crate::print_str(b"[hosted-directory-result] ready status=");
+                    crate::print_u64(status as u32 as u64);
+                    crate::print_str(b"\n");
                     pump_reply_recv4_into!(ch, *reply_cap, msg, 4,
                         status as u32 as u64, out1, out2, out3);
                 }
                 crate::provider_directory_broker::SubmitResult::Deferred => {
+                    crate::print_str(b"[hosted-directory-result] deferred\n");
                     if shared_pump::service_wait_yields(ch) {
                         outcome.provider_wait_suspended = true;
                         break;

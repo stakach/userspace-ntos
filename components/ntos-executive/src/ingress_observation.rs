@@ -17,6 +17,9 @@ pub(crate) fn print_hold_snapshot(now: u64) {
     let _ = writeln!(record, "[ingress-gate] t_ms={} {:?}", now / 10_000, gate);
     let registry = unsafe { crate::registry_mutation_work::census_snapshot() };
     let _ = writeln!(record, "[registry-work] t_ms={} {:?}", now / 10_000, registry);
+    let (messages, info, op) = crate::spawn_hosts::ps_create_parent_progress();
+    let _ = writeln!(record, "[ps-create-parent-progress] count={} label={} op={}",
+        messages, info >> 12, op);
     sel4_rt::print_record(if record.overflowed() {
         b"[ingress-hold] record-truncated\n"
     } else {
