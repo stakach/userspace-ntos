@@ -59591,21 +59591,198 @@ fn hosted_device_binding_by_pdo_object(pdo_object: u64) -> Option<HostedDeviceBi
         .find(|slot| slot.used && slot.pdo_object != 0 && slot.pdo_object == pdo_object)
 }
 
+/// The retained publication permits its own disk proof before BusRelations is committed.
+/// This value is copied out before entering the nested provider call: the publication is
+/// mutably borrowed by that call, so the DMA service must not read it again through the static.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PendingScsiProofAuthority {
+    relation: nt_pnp_manager::ParentRelationIdentity,
+    child_pdo: u64,
+    provider: nt_io_manager::HostedDevicePointerRegistration,
+    relation_owner: nt_pnp::AcpiPciProviderEndpoint,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ActivePendingScsiProofAuthority {
+    authority: PendingScsiProofAuthority,
+    irp_id: Option<IrpId>,
+    claimed: bool,
+}
+
+static mut ACTIVE_PENDING_SCSI_PROOF: Option<ActivePendingScsiProofAuthority> = None;
+static PENDING_SCSI_PROOF_LOCK: AtomicBool = AtomicBool::new(false);
+
+struct PendingScsiProofSlotLock;
+
+impl PendingScsiProofSlotLock {
+    fn acquire() -> Self {
+        loop {
+            if PENDING_SCSI_PROOF_LOCK.compare_exchange(false, true, Ordering::Acquire,
+                Ordering::Relaxed).is_ok() { return Self; }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+impl Drop for PendingScsiProofSlotLock {
+    fn drop(&mut self) { PENDING_SCSI_PROOF_LOCK.store(false, Ordering::Release); }
+}
+
+unsafe fn pending_scsi_proof_slot() -> Option<ActivePendingScsiProofAuthority> {
+    let _lock = PendingScsiProofSlotLock::acquire();
+    *core::ptr::addr_of!(ACTIVE_PENDING_SCSI_PROOF)
+}
+
+/// The prepared relation is private and still owns the child. It is sufficient authority only
+/// for this one pending proof, while the same provider registration and started parent remain
+/// live. No accepted child route or global publication is manufactured here.
+unsafe fn prepare_pending_scsi_proof_authority(
+    owner: &HostedRelationPublication,
+    child_pdo: u64,
+    provider: nt_io_manager::HostedDevicePointerRegistration,
+) -> Option<PendingScsiProofAuthority> {
+    let prepared = owner.prepared_relations.as_ref()?;
+    let relation = owner.parent_relation;
+    if !matches!(owner.phase, HostedRelationPublicationPhase::ProveNativeDisk)
+        || owner.commit_entered || owner.refusal_origin.is_some()
+        || owner.provider_batch.is_none() || owner.prepared_devnodes.is_none()
+        || prepared.relation_identity() != relation.relation()
+        || prepared.bus_object_id() != relation.parent().pdo_object_id()
+        || prepared.children().iter().filter(|child| child.pdo_object_id == child_pdo).count() != 1
+        || owner.providers.iter().filter(|(pdo, registration)|
+            *pdo == child_pdo && *registration == provider).count() != 1
+        || !hosted_device_relation_owner_is_current(owner.relation_owner)
+        || !hosted_pnp_manager_mut().devnode_identity_is_started(relation.parent())
+        || io_manager_mut().hosted_device_pointer_registration(
+            provider.domain(), provider.address()) != Some(provider)
+        || provider.device_id().raw() != child_pdo
+    { return None; }
+    Some(PendingScsiProofAuthority {
+        relation, child_pdo, provider, relation_owner: owner.relation_owner,
+    })
+}
+
+struct PendingScsiProofGuard;
+
+impl Drop for PendingScsiProofGuard {
+    fn drop(&mut self) {
+        let _lock = PendingScsiProofSlotLock::acquire();
+        unsafe { *core::ptr::addr_of_mut!(ACTIVE_PENDING_SCSI_PROOF) = None; }
+    }
+}
+
+unsafe fn activate_pending_scsi_proof_authority(
+    authority: PendingScsiProofAuthority,
+) -> Result<PendingScsiProofGuard, nt_status::NtStatus> {
+    let _lock = PendingScsiProofSlotLock::acquire();
+    let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_PENDING_SCSI_PROOF);
+    if slot.is_some() { return Err(nt_status::NtStatus::DEVICE_BUSY); }
+    *slot = Some(ActivePendingScsiProofAuthority { authority, irp_id: None, claimed: false });
+    Ok(PendingScsiProofGuard)
+}
+
+/// Bind only the SCSI IRP prepared for the retained child. This happens before route capture or
+/// provider dispatch, while the prepared owner can still be discarded on refusal.
+unsafe fn bind_pending_scsi_proof_irp(
+    policy: nt_io_manager::detached_file_irp::ExternalFileIrpDispatchPolicy,
+    prepared: &nt_io_manager::detached_file_irp::PreparedExternalFileIrp,
+) -> Result<(), nt_status::NtStatus> {
+    use nt_io_manager::detached_file_irp::ExternalFileIrpDispatchPolicy;
+    let Some(active) = pending_scsi_proof_slot() else { return Ok(()); };
+    let authority = active.authority;
+    let projection = prepared.projection();
+    let provider = authority.provider;
+    let exact = matches!(&projection.parameters, IoParameters::Scsi(params)
+        if params.route.pdo.raw() == authority.child_pdo
+            && params.route.provider == provider.domain()
+            && params.route.relation_generation == authority.relation.relation().generation()
+            && params.route.provider_pdo == provider.address());
+    if active.claimed || active.irp_id.is_some() || prepared.irp_id().raw() == 0
+        || policy != ExternalFileIrpDispatchPolicy::ScsiAtDevice
+        || projection.irp_id != prepared.irp_id()
+        || projection.device_id.raw() != authority.child_pdo
+        || prepared.route().device_id().raw() != authority.child_pdo
+        || projection.major != nt_io_abi::major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+        || !exact
+    { return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST); }
+    let _lock = PendingScsiProofSlotLock::acquire();
+    let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_PENDING_SCSI_PROOF);
+    if *slot != Some(active) { return Err(nt_status::NtStatus::DEVICE_BUSY); }
+    slot.as_mut().unwrap().irp_id = Some(prepared.irp_id());
+    Ok(())
+}
+
+/// Consume the exact one-shot proof authority during SCSI reservation. Ordinary child I/O never
+/// sees this slot; after the nested call returns, the guard removes it even on refusal.
+unsafe fn pending_scsi_proof_relation(
+    request: &IrpDispatchRequest,
+    provider_pdo: u64,
+) -> Option<nt_pnp_manager::ParentRelationIdentity> {
+    let active = pending_scsi_proof_slot()?;
+    let authority = active.authority;
+    let provider = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId(request.target_domain_id),
+        cookie: request.target_domain_cookie,
+    };
+    if active.claimed || active.irp_id.map(IrpId::raw) != Some(request.irp_id)
+        || authority.child_pdo != request.device_id
+        || authority.relation.relation().generation() != request.scsi_relation_generation
+        || authority.provider.domain() != provider
+        || authority.provider.address() != provider_pdo
+        || authority.provider.device_id().raw() != request.device_id
+        || !hosted_device_relation_owner_is_current(authority.relation_owner)
+        || !hosted_pnp_manager_mut().devnode_identity_is_started(authority.relation.parent())
+        || io_manager_mut().hosted_device_pointer_registration(provider, provider_pdo)
+            != Some(authority.provider)
+    { return None; }
+    let _lock = PendingScsiProofSlotLock::acquire();
+    let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_PENDING_SCSI_PROOF);
+    if *slot != Some(active) { return None; }
+    slot.as_mut()?.claimed = true;
+    Some(authority.relation)
+}
+
 /// The in-flight relation owns its children until publication. Afterwards the accepted-PDO
 /// catalog supplies the same exact registration; a pointer scan is never routing authority.
 unsafe fn hosted_provider_child_registration(
     device_id: nt_io_manager::DeviceId,
     provider_domain: HostedDomainIdentity,
+    exact_irp: Option<IrpId>,
 ) -> Option<nt_io_manager::HostedDevicePointerRegistration> {
-    let pending = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
-        .as_ref()
-        .filter(|query| query.phase != HostedDeviceRelationQueryPhase::Barrier
-            && query.relation_domain == Some(provider_domain))
-        .and_then(|query| {
-            query.reported_children.iter().zip(&query.child_pdo_objects)
-                .find(|(child, _)| child.pdo_object_id == device_id.raw())
-                .map(|(_, &address)| (query.relation_owner, address))
-        });
+    // Native disk proof dispatch is nested under a mutable relation publication. Its scoped
+    // authority was copied out before entering that call, so do not touch the publication
+    // static at all while it is active, including for a mismatched child.
+    let scoped = pending_scsi_proof_slot();
+    if let Some(active) = scoped {
+        let authority = active.authority;
+        if exact_irp.is_none() || active.irp_id != exact_irp
+            || authority.child_pdo != device_id.raw()
+            || authority.provider.domain() != provider_domain
+            || authority.provider.address() == 0
+            || authority.provider.device_id() != device_id
+            || !hosted_device_relation_owner_is_current(authority.relation_owner)
+            || !hosted_pnp_manager_mut().devnode_identity_is_started(authority.relation.parent())
+            || io_manager_mut().hosted_device_pointer_registration(
+                provider_domain, authority.provider.address()) != Some(authority.provider)
+        { return None; }
+        return (pending_scsi_proof_slot() == Some(active))
+            .then_some(authority.provider);
+    }
+    let pending = {
+        // Serialize this read with activation, which can expose a mutable publication to the
+        // nested proof. Only a slot-free interval may examine the ordinary query.
+        let _lock = PendingScsiProofSlotLock::acquire();
+        if (*core::ptr::addr_of!(ACTIVE_PENDING_SCSI_PROOF)).is_some() { return None; }
+        (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+            .as_ref()
+            .filter(|query| query.phase != HostedDeviceRelationQueryPhase::Barrier
+                && query.relation_domain == Some(provider_domain))
+            .and_then(|query| {
+                query.reported_children.iter().zip(&query.child_pdo_objects)
+                    .find(|(child, _)| child.pdo_object_id == device_id.raw())
+                    .map(|(_, &address)| (query.relation_owner, address))
+            })
+    };
     if let Some((owner, address)) = pending {
         if hosted_device_relation_owner_is_current(owner) {
             let registration = io_manager_mut()
@@ -59629,6 +59806,7 @@ unsafe fn hosted_provider_child_registration(
 /// physical provider allocation. This is distinct from an FDO binding and its resource state.
 unsafe fn hosted_provider_child_route_by_device_id(
     device_id: u64,
+    exact_irp: Option<IrpId>,
 ) -> Option<(usize, DriverInstance, u64, nt_io_manager::hosted_provider_child_route::HostedProviderChildRouteEvidence)> {
     use nt_io_manager::hosted_provider_child_route::HostedProviderChildRouteEvidence;
     let device_id = nt_io_manager::DeviceId(device_id);
@@ -59646,7 +59824,8 @@ unsafe fn hosted_provider_child_route_by_device_id(
     {
         return None;
     }
-    let registration = hosted_provider_child_registration(device_id, route.provider_domain)?;
+    let registration = hosted_provider_child_registration(device_id, route.provider_domain,
+        exact_irp)?;
     if io_manager_mut().hosted_device_pointer_registration(
         route.provider_domain, registration.address()) != Some(registration)
     {
@@ -59669,6 +59848,18 @@ unsafe fn hosted_provider_child_route_by_device_id(
 }
 
 fn hosted_driver_device_route_by_device_id(device_id: u64) -> Option<(usize, DriverInstance, u64)> {
+    hosted_driver_device_route_by_device_id_for_irp(device_id, None)
+}
+
+fn hosted_driver_device_route_by_device_id_for_irp(
+    device_id: u64,
+    exact_irp: Option<IrpId>,
+) -> Option<(usize, DriverInstance, u64)> {
+    if let Some(active) = unsafe { pending_scsi_proof_slot() } {
+        if exact_irp.is_none() || active.irp_id != exact_irp
+            || active.authority.child_pdo != device_id
+        { return None; }
+    }
     if let Some(binding) = hosted_device_binding_by_device_id(device_id) {
         let inst = instance(binding.instance)?;
         let projection_inst = instance(binding.projection_instance)?;
@@ -59697,7 +59888,7 @@ fn hosted_driver_device_route_by_device_id(device_id: u64) -> Option<(usize, Dri
     }
 
     if let Some((index, inst, object, _)) = unsafe {
-        hosted_provider_child_route_by_device_id(device_id)
+        hosted_provider_child_route_by_device_id(device_id, exact_irp)
     } {
         return Some((index, inst, object));
     }
@@ -71648,7 +71839,8 @@ unsafe fn dispatch_irp_for_instance_exact(
     }
     let canonical_request_route = dispatch_request
         .as_ref()
-        .and_then(|request| hosted_driver_device_route_by_device_id(request.device_id));
+        .and_then(|request| hosted_driver_device_route_by_device_id_for_irp(
+            request.device_id, Some(IrpId(request.irp_id))));
     if dispatch_request.is_some()
         && canonical_request_route.is_none_or(|(instance, route_inst, route_object)| {
             instance != inst
@@ -71712,7 +71904,8 @@ unsafe fn dispatch_irp_for_instance_exact(
                     }
                     Some(binding)
                 } else {
-                    let child = hosted_provider_child_route_by_device_id(request.device_id);
+                    let child = hosted_provider_child_route_by_device_id(
+                        request.device_id, Some(IrpId(request.irp_id)));
                     if child.is_none_or(|(index, _, object, evidence)| {
                         index != inst || object != device_object
                             || evidence.driver_id.raw() != request.driver_id

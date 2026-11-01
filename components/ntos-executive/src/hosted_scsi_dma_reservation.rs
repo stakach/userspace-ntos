@@ -125,13 +125,18 @@ unsafe fn controller_for_scsi_child(
     hosted_device_pointer_registration(
         provider, provider_pdo, nt_io_manager::DeviceId(request.device_id),
     )?;
-    let relation = hosted_pnp_manager_mut()
-        .parent_relation_for_pdo(request.device_id)
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    if relation.relation().generation() != request.scsi_relation_generation
-        || !hosted_bus_relations().relation_contains(relation.relation(), request.device_id)
-        || !hosted_pnp_manager_mut().relation_parent_is_started(relation)
-    { return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST); }
+    let relation = if let Some(pending) = pending_scsi_proof_relation(request, provider_pdo) {
+        pending
+    } else {
+        let accepted = hosted_pnp_manager_mut()
+            .parent_relation_for_pdo(request.device_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        if accepted.relation().generation() != request.scsi_relation_generation
+            || !hosted_bus_relations().relation_contains(accepted.relation(), request.device_id)
+            || !hosted_pnp_manager_mut().relation_parent_is_started(accepted)
+        { return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST); }
+        accepted
+    };
     let parent = relation.parent();
     let authority = ScsiControllerAuthority {
         child_pdo: request.device_id,

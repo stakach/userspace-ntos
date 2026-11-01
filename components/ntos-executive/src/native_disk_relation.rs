@@ -81,6 +81,7 @@ struct EnteredProof {
 pub(super) struct NativeDiskProof {
     handoff: NativeStorageHandoff,
     route: NativeStorageRoute,
+    pending_authority: PendingScsiProofAuthority,
     reserved: Option<(SrbProofRequest, ScsiBlockCommand)>,
     entered: Option<EnteredProof>,
 }
@@ -92,8 +93,12 @@ pub(super) enum ProofProgress {
 }
 
 impl NativeDiskProof {
-    pub(super) fn new(handoff: NativeStorageHandoff, route: NativeStorageRoute) -> Self {
-        Self { handoff, route, reserved: None, entered: None }
+    pub(super) fn new(
+        handoff: NativeStorageHandoff,
+        route: NativeStorageRoute,
+        pending_authority: PendingScsiProofAuthority,
+    ) -> Self {
+        Self { handoff, route, pending_authority, reserved: None, entered: None }
     }
 
     fn packet_capacity(command: &ScsiBlockCommand) -> Option<usize> {
@@ -219,6 +224,8 @@ impl NativeDiskProof {
             stack_flags: StackFlags::empty(),
             initial_information: 0,
         };
+        let Ok(_authority_guard) = activate_pending_scsi_proof_authority(self.pending_authority)
+        else { return ProofProgress::Pending; };
         match hosted_file_owners::dispatch(
             caller, native, &input, &output, ExternalFileIrpDispatchPolicy::ScsiAtDevice,
         ) {

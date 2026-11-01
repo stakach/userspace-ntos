@@ -463,6 +463,7 @@ fn capture_route(id: u64, prepared: &PreparedExternalFileIrp) -> Result<(), nt_s
             dependent,
             physical,
             provider_route.is_some(),
+            prepared.irp_id(),
         )?;
         if !registrations.contains(&registration) {
             registrations.push(registration);
@@ -494,6 +495,7 @@ fn capture_projection_registration(
     dependent: Authority,
     physical: Authority,
     provider_hosted: bool,
+    exact_irp: IrpId,
 ) -> Result<nt_io_manager::HostedDevicePointerRegistration, nt_status::NtStatus> {
     if dependent.driver_id != driver.raw()
         || io_manager_mut()
@@ -517,7 +519,8 @@ fn capture_projection_registration(
             // accepted-provider catalog is committed. The pending query checks its parent,
             // provider domain, physical pointer registration, and current invalidation owner;
             // the allocation check below still pins that same provider object.
-            unsafe { hosted_provider_child_registration(device, physical.domain) }
+            unsafe { hosted_provider_child_registration(device, physical.domain,
+                Some(exact_irp)) }
                 .filter(|registration| registration.device_id() == device)
                 .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
                 .address()
@@ -667,6 +670,10 @@ fn dispatch_with_port_connect(
             return Err(status);
         }
     };
+    if let Err(status) = unsafe { bind_pending_scsi_proof_irp(policy, &prepared) } {
+        discard(id, prepared)?;
+        return Err(status);
+    }
     if let Err(status) = capture_route(id, &prepared) {
         discard(id, prepared)?;
         return Err(status);

@@ -325,6 +325,14 @@ unsafe fn advance_hosted_relation_publication(
                         raw_pointer: registration.address(),
                         provider_driver: driver_id.raw(),
                     };
+                    let Some(pending_authority) = prepare_pending_scsi_proof_authority(
+                        owner, pdo, registration,
+                    ) else {
+                        owner.refusal_origin = Some(owner.phase);
+                        owner.refusal = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+                        owner.phase = Phase::AbortProvider;
+                        continue;
+                    };
                     let handoff = match crate::boot_storage_dma_handoff::begin_native_disk_proof(
                         relation, storage_pdo,
                     ) {
@@ -359,6 +367,7 @@ unsafe fn advance_hosted_relation_publication(
                             crate::driver_launch::native_disk_relation::NativeStorageRoute {
                                 mount, scsi, driver_id, key,
                             },
+                            pending_authority,
                         )
                     );
                 }
