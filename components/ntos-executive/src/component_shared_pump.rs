@@ -15,11 +15,13 @@ static IRQ_RETAINED_SEH_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static PS_CREATE_RECEIVE_TRACE: AtomicU64 = AtomicU64::new(0);
 static PS_CREATE_RECEIVE_EVENTS: AtomicU64 = AtomicU64::new(0);
 static PS_CREATE_AUTONOMOUS_EVENTS: AtomicU64 = AtomicU64::new(0);
+static PS_CREATE_AFTER_AUTONOMOUS_TRACE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn begin_ps_create_receive_trace() {
     PS_CREATE_RECEIVE_TRACE.store(1, Ordering::Relaxed);
     PS_CREATE_RECEIVE_EVENTS.store(0, Ordering::Relaxed);
     PS_CREATE_AUTONOMOUS_EVENTS.store(0, Ordering::Relaxed);
+    PS_CREATE_AFTER_AUTONOMOUS_TRACE.store(0, Ordering::Relaxed);
 }
 
 fn trace_ps_create_event(stage: &[u8], route: PeerRoute, reply: u64, info: u64) {
@@ -51,12 +53,25 @@ fn trace_ps_create_event(stage: &[u8], route: PeerRoute, reply: u64, info: u64) 
 
 fn trace_ps_create_receive(ch: &PumpChannel, stage: &[u8], route: Option<PeerRoute>) {
     let sequence = PS_CREATE_RECEIVE_TRACE.load(Ordering::Relaxed);
-    if sequence == 0 || sequence > 64 {
+    if sequence == 0 {
         return;
     }
-    PS_CREATE_RECEIVE_TRACE.store(sequence + 1, Ordering::Relaxed);
-    crate::print_str(b"[ps-create-receive] #");
-    crate::print_u64(sequence);
+    let (prefix, ordinal) = if sequence <= 64 {
+        PS_CREATE_RECEIVE_TRACE.store(sequence + 1, Ordering::Relaxed);
+        (&b"[ps-create-receive] #"[..], sequence)
+    } else {
+        let after = PS_CREATE_AFTER_AUTONOMOUS_TRACE.load(Ordering::Relaxed);
+        if after == 0 {
+            return;
+        }
+        PS_CREATE_AFTER_AUTONOMOUS_TRACE.store(after + 1, Ordering::Relaxed);
+        if after > 48 && !after.is_power_of_two() {
+            return;
+        }
+        (&b"[ps-create-after-autonomous] #"[..], after)
+    };
+    crate::print_str(prefix);
+    crate::print_u64(ordinal);
     crate::print_str(b" stage=");
     crate::print_str(stage);
     crate::print_str(b" tcb=");
@@ -154,7 +169,10 @@ pub(super) unsafe fn receive(
         trace_ps_create_receive(ch, b"loop", Some(route));
         if !retained_seh {
             match crate::win32k_glue::prepare_receive_yield(ch) {
-                Ok(Some(yielded)) => return PumpMessage::hosted_receive_yield(yielded),
+                Ok(Some(yielded)) => {
+                    trace_ps_create_receive(ch, b"receive-yield", Some(route));
+                    return PumpMessage::hosted_receive_yield(yielded);
+                }
                 Ok(None) => {}
                 Err(error) => {
                     crate::print_str(b"[receive-yield-failure] propagated-error=");
@@ -170,7 +188,10 @@ pub(super) unsafe fn receive(
                 }
             }
             match crate::win32k_glue::prepare_service_wait_yield(ch) {
-                Ok(Some(yielded)) => return PumpMessage::hosted_service_wait_yield(yielded),
+                Ok(Some(yielded)) => {
+                    trace_ps_create_receive(ch, b"service-wait-yield", Some(route));
+                    return PumpMessage::hosted_service_wait_yield(yielded);
+                }
                 Ok(None) => {}
                 Err(_) => panic!("service-wait yield lost its exact physical ownership"),
             }
@@ -275,6 +296,7 @@ pub(super) unsafe fn receive(
                         .expect("autonomous failure retains its own source and parent scope");
                     trace_ps_create_event(b"autonomous-return", sender, 0, 0);
                     trace_ps_create_receive(ch, b"autonomous-return", Some(sender));
+                    PS_CREATE_AFTER_AUTONOMOUS_TRACE.store(1, Ordering::Relaxed);
                     continue;
                 }
                 Ok(None) => {}
@@ -288,6 +310,7 @@ pub(super) unsafe fn receive(
             && (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
             && crate::dispatcher_bootstrap::timer_work_pending();
         if timer_checkpoint && timer_probe_consumed {
+            trace_ps_create_receive(ch, b"timer-yield", Some(route));
             return PumpMessage::scheduler_yield();
         }
         // A pending timer still gets its scheduler pass, but first give a newly arrived Call
@@ -316,14 +339,17 @@ pub(super) unsafe fn receive(
             serviced_scheduler_yield || !timer_checkpoint);
         match arrival {
             Ok(runtime::Arrival::Hosted) => {
+                trace_ps_create_receive(ch, b"hosted-arrival", Some(route));
                 trace_ps_create_event(b"hosted-arrival", route, 0, 0);
             }
             Ok(runtime::Arrival::Call { route: sender, reply }) => {
+                trace_ps_create_receive(ch, b"call-arrival", Some(sender));
                 trace_ps_create_event(b"call-arrival", sender, reply, 0);
                 // The coordinator retains unrelated Calls for their exact source. Inspect only
                 // this invocation's stored arrival on the next pass.
             }
             Ok(runtime::Arrival::Notification(message)) => {
+                trace_ps_create_receive(ch, b"notification", Some(route));
                 // The shared ingress has already proven NoCall with a free Reply. An empty
                 // nonblocking probe has no sender and must not count as watchdog progress.
                 if timer_checkpoint && message.badge() == 0 && message.info() == 0 {
@@ -350,6 +376,7 @@ pub(super) unsafe fn receive(
                     irq_checkpoint = true;
                 }
                 if !inline_irq_checkpoint && pump_scheduler_work_pending(ch, irq) {
+                    trace_ps_create_receive(ch, b"scheduler-yield", Some(route));
                     return PumpMessage::scheduler_yield();
                 }
             }
