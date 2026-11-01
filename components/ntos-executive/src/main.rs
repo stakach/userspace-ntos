@@ -56,6 +56,7 @@ mod registry_checkpoint_audit;
 mod registry_query_audit;
 mod provider_registry_caller;
 mod provider_directory_broker;
+mod canonical_directory_port;
 mod provider_section_broker;
 mod provider_service_ingress;
 mod process_information_bridge;
