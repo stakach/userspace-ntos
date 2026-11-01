@@ -424,6 +424,9 @@ impl Broker {
                     .position(|entry| entry.owner == owner && entry.staged.value() == m2)
                     .ok_or(STATUS_INVALID_HANDLE)?;
                 if op == 8 {
+                    if self.pending[position].phase == PendingPhase::Publishing {
+                        unsafe { settle_publish_reply(handler, &mut self.pending[position]); }
+                    }
                     if self.pending[position].phase != PendingPhase::PublishedUnacknowledged {
                         return Err(STATUS_INVALID_HANDLE);
                     }
@@ -572,6 +575,31 @@ impl Broker {
     }
 }
 
+/// Settle the physical publish Reply before accepting the provider's separate op 8 ACK.
+/// A same-owner op 8 can arrive before the background redrive gets another turn.
+unsafe fn settle_publish_reply(handler: &mut ExecNtHandler, entry: &mut Pending) -> bool {
+    let Some(work) = entry.publish.as_mut() else { return false; };
+    if work.phase != PublishPhase::ReplyEntered { return false; }
+    let owner = entry.owner;
+    let reply_acknowledged = runtime::reconcile_retained_service_reply(owner.route,
+        owner.dispatch.0, work.reply, work.token);
+    if !matches!(reply_acknowledged, Ok(true)) {
+        return false;
+    }
+    runtime::retire_stopped_acknowledged_retained_service(owner.route,
+        owner.dispatch.0, work.reply, work.token)
+        .expect("acknowledged directory service Reply retirement");
+    work.reference.release(&mut handler.pm)
+        .expect("acknowledged directory requestor reference");
+    entry.phase = if work.status == 0 || work.status == 0x4000_0000 {
+        PendingPhase::PublishedUnacknowledged
+    } else {
+        PendingPhase::Aborted
+    };
+    entry.publish = None;
+    true
+}
+
 /// Poll one retained provider publication. The shared-ingress Reply is owned
 /// by the exact service-wait token until transport ACK, independently of the
 /// provider's later directory-upload ACK (op 8).
@@ -702,23 +730,7 @@ unsafe fn redrive_one(handler: &mut ExecNtHandler) -> bool {
         work.phase = PublishPhase::ReplyEntered;
         return true;
     }
-    if matches!(runtime::reconcile_retained_service_reply(owner.route,
-        owner.dispatch.0, work.reply, work.token), Ok(true))
-    {
-        runtime::retire_stopped_acknowledged_retained_service(owner.route,
-            owner.dispatch.0, work.reply, work.token)
-            .expect("acknowledged directory service Reply retirement");
-        work.reference.release(&mut handler.pm)
-            .expect("acknowledged directory requestor reference");
-        entry.phase = if work.status == 0 || work.status == 0x4000_0000 {
-            PendingPhase::PublishedUnacknowledged
-        } else {
-            PendingPhase::Aborted
-        };
-        entry.publish = None;
-        return true;
-    }
-    false
+    settle_publish_reply(handler, entry)
 }
 
 /// The native close is consumed at most once. Its detached directory identity remains in this
