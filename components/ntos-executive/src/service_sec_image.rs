@@ -6055,6 +6055,7 @@ pub(crate) unsafe fn nested_hosted_file_work_ready() -> bool {
         || crate::hosted_routed_file_close_work::nested_work_ready()
         || crate::driver_launch::nested_win32k_source_work_ready()
         || crate::provider_section_broker::nested_work_ready()
+        || crate::provider_directory_broker::nested_work_ready()
 }
 
 /// Run locally ready retained work while the exact parent invocation is parked. The File
@@ -6095,7 +6096,8 @@ pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {
         && crate::driver_launch::redrive_nested_win32k_source_work(handler);
     let section = crate::provider_section_broker::nested_work_ready()
         && crate::provider_section_broker::redrive_nested_ready(handler);
-    let directory = crate::provider_directory_broker::redrive_nested_ready(handler);
+    let directory = crate::provider_directory_broker::nested_work_ready()
+        && crate::provider_directory_broker::redrive_nested_ready(handler);
     crate::provider_mm_section_objects::redrive(handler);
     create || query || internal_control || write || read || flush || query_information || lower_pnp || lower_file || input || kernel_file_query || win32k_async_read || lifecycle || close || source || section || directory
 }

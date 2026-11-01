@@ -914,6 +914,10 @@ pub(crate) fn wake_due(now: u64) -> u64 {
     u64::from(next_deadline().is_some_and(|deadline| now >= deadline))
 }
 
+pub(crate) fn nested_work_ready() -> bool {
+    wake_due(crate::monotonic_time_100ns()) != 0
+}
+
 fn upload_status(error: DirectoryUploadError) -> u32 {
     match error {
         DirectoryUploadError::InvalidLength
