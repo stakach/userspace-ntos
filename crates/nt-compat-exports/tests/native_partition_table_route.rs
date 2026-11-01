@@ -5,6 +5,7 @@ fn partition_table_export_uses_live_geometry_and_sector_irps_before_pool_publica
     let launch = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
     let native = include_str!("../../../components/ntos-executive/src/hosted_partition_table.rs");
     let builder = include_str!("../../../components/ntos-executive/src/hosted_synchronous_fsd_request.rs");
+    let plan = include_str!("../../nt-io-manager/src/kernel_irp_builder.rs");
     let parser = include_str!("../../nt-fs/src/partition_layout.rs");
 
     assert!(launch.contains("hosted_partition_table::bind(reg);"));
@@ -12,7 +13,7 @@ fn partition_table_export_uses_live_geometry_and_sector_irps_before_pool_publica
     assert!(native.contains("hosted_driver_object_reference::ob_reference_object_by_pointer("));
     assert!(native.contains("s_obf_dereference_object(self.0)"));
     assert!(native.contains("build_control(\n            IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, device,"));
-    assert!(native.contains("hosted_synchronous_fsd_request::build(\n            u32::from(major::IRP_MJ_READ), device,"));
+    assert!(native.contains("hosted_synchronous_fsd_request::build_disk_metadata_read("));
     assert!(native.contains("s_iof_call_driver(device, irp)"));
     assert!(native.contains("s_ke_wait_for_single_object(self.event"));
     assert!(native.contains("read_unaligned(self.iosb as *const i32)"));
@@ -25,7 +26,9 @@ fn partition_table_export_uses_live_geometry_and_sector_irps_before_pool_publica
     assert!(!native.contains("STATUS_NOT_IMPLEMENTED"));
 
     assert!(builder.contains("plan_device_io_control_request("));
+    assert!(builder.contains("plan_disk_metadata_read("));
     assert!(builder.contains("request.publish(plan, event, iosb)"));
+    assert!(plan.contains("plan.stack.flags |= SL_OVERRIDE_VERIFY_VOLUME;"));
     assert!(builder.contains("(FSD_SERVICE_SOURCE_IRP_LABEL << 12) | 4,\n            4,"));
     assert!(parser.contains("crc.finish() != header.partition_entries_crc32"));
     assert!(parser.contains("read_gpt_layout(disk_sectors - 1"));
