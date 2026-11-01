@@ -1560,6 +1560,7 @@ struct PendingIrp {
     major: u8,
     minor: u8,
     scsi_route: Option<nt_io_manager::scsi_srb_transport::ScsiSrbRoute>,
+    scsi_dma_receipt: Option<nt_io_manager::scsi_srb_transport::ScsiDmaReceipt>,
     /// Selects the WDM output surface without conflating it with buffer ownership. Buffered pipe
     /// reads may replace SystemBuffer; direct and neither I/O always complete into `data`.
     completion_source_kind: u8,
@@ -2316,6 +2317,7 @@ struct PendingIrpCompletionTarget {
     aux_data: u64,
     output_capacity: u64,
     scsi_route: Option<nt_io_manager::scsi_srb_transport::ScsiSrbRoute>,
+    scsi_dma_receipt: Option<nt_io_manager::scsi_srb_transport::ScsiDmaReceipt>,
     completion_source_kind: u8,
     major: u8,
     minor: u8,
@@ -2438,6 +2440,7 @@ unsafe fn claim_pending_irp_completion(irp: u64) -> Option<PendingIrpCompletionC
                         ),
                         aux_data: owner.aux_data,
                         scsi_route: owner.scsi_route,
+                        scsi_dma_receipt: owner.scsi_dma_receipt,
                         output_capacity: read_volatile(
                             (entry + core::mem::offset_of!(PendingIrp, output_capacity) as u64)
                                 as *const u64,
@@ -13887,7 +13890,7 @@ unsafe fn complete_hosted_irp_with_owner(irp: u64) -> HostedIrpCompletionReceipt
         let scsi_capture_valid = target.scsi_route.is_none_or(|route| {
             hosted_scsi_srb_provider::capture_completion(
                 route, IrpId(canonical_irp_id), target.data,
-                target.output_capacity, target.aux_data,
+                target.output_capacity, target.aux_data, target.scsi_dma_receipt,
             )
         });
         let length = if target.scsi_route.is_some() {
@@ -39781,6 +39784,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         major: major as u8,
         minor: minor as u8,
         scsi_route: scsi_projection.map(|projection| projection.route),
+        scsi_dma_receipt: scsi_projection.and_then(|projection| projection.dma_receipt),
         completion_source_kind,
         read_completion,
         owns_fo,

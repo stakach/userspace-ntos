@@ -4,7 +4,8 @@
 //! completion and acknowledgement. The packet allocation also owns the data and sense slices.
 
 use super::*;
-use nt_io_manager::scsi_srb_transport::{ScsiSrbRoute, WDM_X64_LEGACY_SRB_SIZE};
+use nt_io_manager::scsi_srb_transport::{ScsiDmaReceipt, ScsiSrbRoute,
+    WDM_X64_LEGACY_SRB_SIZE};
 use nt_io_manager::scsi_srb_wire::{
     capture_scsi_completion_in_place, decode_scsi_request,
 };
@@ -14,6 +15,7 @@ pub(super) struct ProviderScsiProjection {
     pub srb: u64,
     pub mdl: u64,
     pub route: ScsiSrbRoute,
+    pub dma_receipt: Option<ScsiDmaReceipt>,
 }
 
 /// `packet` is one provider-local pool allocation already populated by the authenticated
@@ -44,21 +46,26 @@ pub(super) unsafe fn prepare(
     let packet_slice = core::slice::from_raw_parts(packet as *const u8, request.input_len as usize);
     let decoded = decode_scsi_request(packet_slice, route, IrpId(request.irp_id))
         .map_err(|_| STATUS_INVALID_PARAMETER)?;
-    let data_pointer = if decoded.data.is_empty() { 0 } else {
+    let dma_receipt = if decoded.data.is_empty() { None } else {
         let (_label, status, grant_va, grant_len, reservation_id) = call_on5(
             (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
             request.irp_id,
             HOSTED_DMA_SERVICE_QUERY_SCSI_RESERVATION << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
             provider_pdo, 0, 0,
         );
-        if status as u32 as i32 != STATUS_SUCCESS || grant_va == 0
-            || reservation_id == 0 || grant_len != decoded.data.len() as u64
-            || grant_va.checked_add(grant_len).is_none()
-        { return Err(STATUS_INVALID_DEVICE_REQUEST); }
-        core::ptr::copy_nonoverlapping(decoded.data.as_ptr(), grant_va as *mut u8,
-            decoded.data.len());
-        grant_va
+        if status as u32 as i32 != STATUS_SUCCESS {
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        Some(ScsiDmaReceipt::from_authenticated_query(
+            route, IrpId(request.irp_id), grant_va, grant_len, reservation_id,
+            decoded.data.len() as u64,
+        ).ok_or(STATUS_INVALID_DEVICE_REQUEST)?)
     };
+    let data_pointer = dma_receipt.map_or(0, ScsiDmaReceipt::grant_va);
+    if !decoded.data.is_empty() {
+        core::ptr::copy_nonoverlapping(decoded.data.as_ptr(), data_pointer as *mut u8,
+            decoded.data.len());
+    }
     let sense_pointer = if decoded.sense.is_empty() { 0 } else { decoded.sense.as_ptr() as u64 };
     let srb = pool_alloc_zeroed(WDM_X64_LEGACY_SRB_SIZE as u64);
     if srb == 0 { return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw()); }
@@ -73,13 +80,14 @@ pub(super) unsafe fn prepare(
         pool_free(srb);
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw());
     }
-    Ok(ProviderScsiProjection { srb, mdl, route })
+    Ok(ProviderScsiProjection { srb, mdl, route, dma_receipt })
 }
 
 /// Copy only provider scalar/CDB state into the retained packet. No provider-local pointer is
 /// published in the completion buffer, including on a failing SCSI status with sense bytes.
 pub(super) unsafe fn capture_completion(
     route: ScsiSrbRoute, irp_id: IrpId, packet: u64, packet_len: u64, srb: u64,
+    dma_receipt: Option<ScsiDmaReceipt>,
 ) -> bool {
     if packet == 0 || srb == 0 || packet_len > usize::MAX as u64
         || component_pool_allocation_capacity(packet).is_none_or(|cap| cap < packet_len)
@@ -93,20 +101,17 @@ pub(super) unsafe fn capture_completion(
         Err(_) => return false,
     };
     if data_capacity != 0 {
-        let (_label, status, grant_va, grant_len, reservation_id) = call_on5(
-            (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
-            irp_id.raw(),
-            HOSTED_DMA_SERVICE_QUERY_SCSI_RESERVATION << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
-            route.provider_pdo, 0, 0,
-        );
         let transferred = read_unaligned((srb + 0x10) as *const u32) as u64;
-        if status as u32 as i32 != STATUS_SUCCESS || grant_va == 0
-            || reservation_id == 0 || grant_len != data_capacity
-            || transferred > data_capacity
-            || read_unaligned((srb + 0x18) as *const u64) != grant_va
-        { return false; }
+        let Some(grant_va) = dma_receipt.and_then(|receipt| receipt.completion_source(
+            route, irp_id, data_capacity,
+            read_unaligned((srb + 0x18) as *const u64), transferred,
+        )) else { return false; };
         core::ptr::copy_nonoverlapping(grant_va as *const u8,
             data_pointer as *mut u8, transferred as usize);
+    } else if dma_receipt.is_some()
+        || read_unaligned((srb + 0x18) as *const u64) != 0
+    {
+        return false;
     }
     let captured = capture_scsi_completion_in_place(packet_slice, route, irp_id, srb_slice).is_ok();
     static CAPACITY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);

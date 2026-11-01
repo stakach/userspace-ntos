@@ -96,6 +96,45 @@ pub struct ScsiSrbRoute {
     pub provider_pdo: u64,
 }
 
+/// Provider-local receipt for the root reservation queried before entering a SCSI driver.
+/// The root retains the actual DMA reservation until canonical completion acknowledgement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScsiDmaReceipt {
+    route: ScsiSrbRoute,
+    irp_id: IrpId,
+    grant_va: u64,
+    grant_len: u64,
+    reservation_id: u64,
+}
+
+impl ScsiDmaReceipt {
+    pub fn from_authenticated_query(
+        route: ScsiSrbRoute, irp_id: IrpId, grant_va: u64,
+        grant_len: u64, reservation_id: u64, data_len: u64,
+    ) -> Option<Self> {
+        if !route.valid() || irp_id.is_null() || grant_va == 0
+            || reservation_id == 0 || grant_len == 0 || grant_len != data_len
+            || grant_va.checked_add(grant_len).is_none()
+        { return None; }
+        Some(Self { route, irp_id, grant_va, grant_len, reservation_id })
+    }
+
+    pub const fn grant_va(self) -> u64 { self.grant_va }
+
+    /// Validate the retained grant and the driver's terminal SRB before touching DMA bytes.
+    pub fn completion_source(
+        self, route: ScsiSrbRoute, irp_id: IrpId, data_capacity: u64,
+        srb_data_pointer: u64, transferred: u64,
+    ) -> Option<u64> {
+        (self.route == route && self.irp_id == irp_id
+            && self.reservation_id != 0 && self.grant_va != 0
+            && self.grant_len == data_capacity && data_capacity != 0
+            && self.grant_va.checked_add(self.grant_len).is_some()
+            && srb_data_pointer == self.grant_va && transferred <= self.grant_len)
+            .then_some(self.grant_va)
+    }
+}
+
 /// Canonical major-0x0f stack parameters. The SRB image is pointer-free; retained transfer
 /// and sense bytes live in the detached owner's buffers, not in this copyable stack value.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -403,6 +442,35 @@ mod tests {
             relation_generation: 5,
             provider_pdo: 0x1500,
         }
+    }
+
+    #[test]
+    fn dma_receipt_admits_only_the_exact_pending_scsi_completion() {
+        let irp = IrpId::new(2, 3);
+        let receipt = ScsiDmaReceipt::from_authenticated_query(
+            route(), irp, 0x3000, 8, 17, 8,
+        ).unwrap();
+        assert_eq!(receipt.completion_source(route(), irp, 8, 0x3000, 8), Some(0x3000));
+        assert_eq!(receipt.completion_source(route(), irp, 8, 0x3000, 9), None);
+        assert_eq!(receipt.completion_source(route(), irp, 8, 0x3001, 8), None);
+        assert_eq!(receipt.completion_source(route(), IrpId::new(2, 4), 8, 0x3000, 8), None);
+        let mut stale_route = route();
+        stale_route.relation_generation += 1;
+        assert_eq!(receipt.completion_source(stale_route, irp, 8, 0x3000, 8), None);
+        let mut other_provider = route();
+        other_provider.provider_pdo += 1;
+        assert_eq!(receipt.completion_source(other_provider, irp, 8, 0x3000, 8), None);
+    }
+
+    #[test]
+    fn dma_receipt_rejects_unbound_or_inconsistent_grants() {
+        let irp = IrpId::new(2, 3);
+        assert!(ScsiDmaReceipt::from_authenticated_query(route(), irp, 0x3000, 8, 17, 9).is_none());
+        assert!(ScsiDmaReceipt::from_authenticated_query(route(), irp, 0x3000, 8, 0, 8).is_none());
+        assert!(ScsiDmaReceipt::from_authenticated_query(route(), irp, 0, 8, 17, 8).is_none());
+        assert!(ScsiDmaReceipt::from_authenticated_query(route(), irp, u64::MAX, 8, 17, 8).is_none());
+        assert!(ScsiDmaReceipt::from_authenticated_query(route(), IrpId::new(0, 0),
+            0x3000, 8, 17, 8).is_none());
     }
 
     fn transport() -> ScsiSrbTransport {
