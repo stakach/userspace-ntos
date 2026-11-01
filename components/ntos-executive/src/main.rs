@@ -2113,12 +2113,16 @@ const LBL_X86_PAGE_MAP_IO: u64 = 53; // map a frame at an IOVA in a device's IO 
 const OBJ_X86_IO_PAGE_TABLE: u64 = 13; // seL4_X86_IOPageTableObject
 const SLOT_IO_SPACE: u64 = 8; // seL4_CapIOSpace — the master IO-space cap in the root CNode
                               // Per-device bus-master DMA aperture. Common buffers and transient map-register bounce mappings
-                              // share this IOMMU-confined window; IOVA 0 stays invalid, and the rest fits under one x86 IO
-                              // page-table span so every hosted PCI function can use the same per-domain address range.
+                              // share this IOMMU-confined window. Leave the boot controller's existing DMA pages untouched
+                              // and use the remaining capacity of its first 2 MiB IO page-table leaf for either domain.
 const HOSTED_PCI_DMA_WINDOW_IOVA: u64 = 0x1000;
-const HOSTED_PCI_DMA_WINDOW_PAGES: u64 = 68;
+const HOSTED_PCI_DMA_WINDOW_PAGES: u64 = (0x20_0000 - (AHCI_IOVA + AHCI_BOOT_DMA_PAGES * 0x1000)) / 0x1000;
 const HOSTED_PCI_DMA_WINDOW_LEN: u64 = HOSTED_PCI_DMA_WINDOW_PAGES * 0x1000;
-const _: () = assert!(HOSTED_PCI_DMA_WINDOW_IOVA + HOSTED_PCI_DMA_WINDOW_LEN <= 0x20_0000);
+const _: () = {
+    assert!(AHCI_IOVA + AHCI_BOOT_DMA_PAGES * 0x1000 < 0x20_0000);
+    assert!(HOSTED_PCI_DMA_WINDOW_IOVA + HOSTED_PCI_DMA_WINDOW_LEN <= 0x20_0000);
+    assert!(AHCI_IOVA + AHCI_BOOT_DMA_PAGES * 0x1000 + HOSTED_PCI_DMA_WINDOW_LEN == 0x20_0000);
+};
 const HOSTED_BOOT_FRAMEBUFFER_EAGER_MMIO_PAGES: u64 = 32;
 /// Driver-host VSpace: where the executive maps the CM_RESOURCE_LIST + common-buffer
 /// descriptor (also mapped at the same vaddr in the host, aliasing the frame).
