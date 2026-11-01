@@ -43,6 +43,27 @@ enum HostedRelationPublicationProgress {
     Refused(nt_status::NtStatus),
 }
 
+fn trace_native_disk_candidate(
+    outcome: &[u8], parent: u64, pdo: u64, index: usize,
+    status: Option<nt_status::NtStatus>,
+) {
+    static TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+    if TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 16 { return; }
+    print_str(b"[native-disk-candidate] outcome=");
+    print_str(outcome);
+    print_str(b" parent/pdo/index=");
+    print_u64(parent);
+    print_str(b"/");
+    print_u64(pdo);
+    print_str(b"/");
+    print_u64(index as u64);
+    if let Some(status) = status {
+        print_str(b" status=0x");
+        print_hex(status.raw() as u32);
+    }
+    print_str(b"\n");
+}
+
 #[must_use = "retain the exact CM and PnP owners until publication or acknowledged abort"]
 struct HostedRelationPublication {
     claim: nt_pnp_manager::DeviceRelationInvalidation,
@@ -307,10 +328,16 @@ unsafe fn advance_hosted_relation_publication(
                     let handoff = match crate::boot_storage_dma_handoff::begin_native_disk_proof(
                         relation, storage_pdo,
                     ) {
-                        Ok(handoff) => handoff,
+                        Ok(handoff) => {
+                            trace_native_disk_candidate(b"begin-ok", owner.claim.pdo_device_id,
+                                pdo, owner.native_disk_candidate, None);
+                            handoff
+                        }
                         Err(status) if status == nt_status::NtStatus::DEVICE_NOT_READY =>
                             return owner.pending(),
-                        Err(_) => {
+                        Err(status) => {
+                            trace_native_disk_candidate(b"begin-refused", owner.claim.pdo_device_id,
+                                pdo, owner.native_disk_candidate, Some(status));
                             owner.native_disk_candidate += 1;
                             continue;
                         }
@@ -339,6 +366,9 @@ unsafe fn advance_hosted_relation_publication(
                     crate::driver_launch::native_disk_relation::ProofProgress::Pending =>
                         return owner.pending(),
                     crate::driver_launch::native_disk_relation::ProofProgress::Refused => {
+                        trace_native_disk_candidate(b"proof-refused", owner.claim.pdo_device_id,
+                            owner.reported_children[owner.native_disk_candidate].pdo_object_id,
+                            owner.native_disk_candidate, None);
                         owner.native_disk_proof = None;
                         owner.native_disk_candidate += 1;
                     }

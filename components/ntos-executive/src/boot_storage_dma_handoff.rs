@@ -79,7 +79,18 @@ pub(crate) fn begin_native_disk_proof(
             expected,
         )
     }
-    .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+    .map_err(|error| {
+        print_str(b"[native-disk-admission] refused reason=");
+        print_str(match error {
+            nt_pnp_context::native_storage_handoff::Error::InvalidIdentity => b"invalid-identity",
+            nt_pnp_context::native_storage_handoff::Error::WrongControllerPhase => b"controller-phase",
+            nt_pnp_context::native_storage_handoff::Error::ControllerClaimed => b"controller-claimed",
+            nt_pnp_context::native_storage_handoff::Error::InsufficientResources => b"resources",
+            _ => b"other",
+        });
+        print_str(b"\n");
+        nt_status::NtStatus::INVALID_DEVICE_REQUEST
+    })
 }
 
 pub(crate) fn enter_native_disk_srb(

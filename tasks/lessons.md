@@ -757,6 +757,7 @@ diagnosis-free failure.
 - Print the Git worktree path before a multi-worktree task. Pass that exact path as `workdir` on every read, edit, and validation command; never rely on the chat's default checkout.
 
 ## Keep Native Boot Loops Evidence Driven
+- Distinguish a started driver's FDO device ID from the bus PDO that owns its BusRelations query. Correlate the exact PDO pointer, parent, child registration, and IRP before declaring a relation undispatched.
 - Treat the exact no-signaler quiesce gate and a refused shutdown hive durability fence as terminal boot outcomes. Detect them across split serial writes, capture QMP CPU state and framebuffer immediately, then reap the private QEMU process group; do not spend the rest of a long bound sampling an already ended guest.
 - Assign a read-only monitor to long boots so the build owner can investigate the next failure without repeatedly consuming the boot log. Record a specific failing observation and a focused regression before changing source, then compare the next bounded boot against that observation.
 - When boot progress feels slow, compare phase-specific guest time, disk commands, sectors, snapshot generations, and installer completion across two bounded runs before choosing a kernel change. An aggregate timer or disk count alone cannot identify the active bottleneck; measure the live route and preserve one serial validation owner.

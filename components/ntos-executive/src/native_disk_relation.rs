@@ -9,8 +9,37 @@ use nt_io_manager::{
     IoParameters, StackFlags,
 };
 use nt_pnp_context::native_storage_handoff::{
-    HandoffPhase, NativeStorageHandoff, ProofStep, SrbProofRequest,
+    Error as StorageProofError, HandoffPhase, NativeStorageHandoff, ProofStep, SrbProofRequest,
 };
+
+fn trace_native_disk_proof(
+    outcome: &[u8], request: SrbProofRequest, irp: Option<IrpId>,
+    status: Option<nt_status::NtStatus>,
+) {
+    static TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+    if TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 24 { return; }
+    print_str(b"[native-disk-proof] outcome=");
+    print_str(outcome);
+    print_str(b" step=");
+    print_str(match request.step {
+        ProofStep::Capacity => b"capacity",
+        ProofStep::SectorZero => b"sector-zero",
+        ProofStep::VolumeSector => b"volume-sector",
+    });
+    print_str(b" pdo/ticket/lba/irp=");
+    print_u64(request.key.pdo.device);
+    print_str(b"/");
+    print_u64(request.ticket);
+    print_str(b"/");
+    print_u64(request.lba);
+    print_str(b"/");
+    print_u64(irp.map_or(0, |irp| irp.raw()));
+    if let Some(status) = status {
+        print_str(b" status=0x");
+        print_hex(status.raw() as u32);
+    }
+    print_str(b"\n");
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct NativeStorageRoute {
@@ -78,20 +107,36 @@ impl NativeDiskProof {
             entered.command.verify_completion(packet.srb, packet.data.len()).is_ok()
         });
         if !valid {
+            let outcome = if !terminal.status.is_success() { b"terminal-status".as_slice() }
+                else if decoded.is_none() { b"decode".as_slice() }
+                else { b"srb-verify".as_slice() };
+            trace_native_disk_proof(outcome, entered.request, Some(entered.irp),
+                Some(terminal.status));
             self.handoff.refuse_srb(entered.request)
                 .expect("retained native disk proof request lost");
             return ProofProgress::Refused;
         }
         let data = decoded.unwrap().data;
-        let result = match entered.request.step {
-            ProofStep::Capacity => entered.command.parse_capacity(data)
-                .map_err(|_| ())
-                .and_then(|(size, count)| self.handoff.complete_capacity(entered.request, size, count)
-                    .map_err(|_| ())),
+        let refusal = match entered.request.step {
+            ProofStep::Capacity => match entered.command.parse_capacity(data) {
+                Ok((size, count)) => self.handoff.complete_capacity(entered.request, size, count)
+                    .err().map(|error| if error == StorageProofError::GeometryMismatch {
+                        b"geometry-mismatch".as_slice()
+                    } else { b"capacity-contract".as_slice() }),
+                Err(_) => Some(b"capacity-payload".as_slice()),
+            },
             ProofStep::SectorZero | ProofStep::VolumeSector =>
-                self.handoff.complete_sector(entered.request, data).map_err(|_| ()),
+                self.handoff.complete_sector(entered.request, data).err().map(|error| {
+                    if error == StorageProofError::SectorMismatch {
+                        b"sector-mismatch".as_slice()
+                    } else { b"sector-contract".as_slice() }
+                }),
         };
-        if result.is_err() { ProofProgress::Refused } else { ProofProgress::Pending }
+        if let Some(outcome) = refusal {
+            trace_native_disk_proof(outcome, entered.request, Some(entered.irp),
+                Some(terminal.status));
+            ProofProgress::Refused
+        } else { ProofProgress::Pending }
     }
 
     unsafe fn poll_entered(&mut self) -> ProofProgress {
@@ -164,6 +209,7 @@ impl NativeDiskProof {
         ) {
             Ok(hosted_file_owners::DispatchResult::Returned { irp_id, status, buffers, .. }) => {
                 let (request, command) = self.reserved.take().unwrap();
+                trace_native_disk_proof(b"dispatch-returned", request, Some(irp_id), Some(status));
                 let (_, packet) = buffers.into_parts();
                 self.observe(EnteredProof {
                     request, command, irp: irp_id, requestor_tid, terminal: None,
@@ -171,6 +217,7 @@ impl NativeDiskProof {
             }
             Ok(hosted_file_owners::DispatchResult::Outstanding { irp_id }) => {
                 let (request, command) = self.reserved.take().unwrap();
+                trace_native_disk_proof(b"dispatch-outstanding", request, Some(irp_id), None);
                 self.entered = Some(EnteredProof {
                     request, command, irp: irp_id, requestor_tid, terminal: None,
                 });
@@ -178,8 +225,9 @@ impl NativeDiskProof {
             }
             Err(status) if status == nt_status::NtStatus::DEVICE_BUSY
                 || status == nt_status::NtStatus::INSUFFICIENT_RESOURCES => ProofProgress::Pending,
-            Err(_) => {
+            Err(status) => {
                 let (request, _) = self.reserved.take().unwrap();
+                trace_native_disk_proof(b"dispatch-refused", request, None, Some(status));
                 self.handoff.refuse_srb(request)
                     .expect("certainly unentered disk proof refusal lost");
                 ProofProgress::Refused
@@ -216,6 +264,7 @@ impl NativeDiskProof {
                 let Ok(request) = crate::boot_storage_dma_handoff::enter_native_disk_srb(&mut self.handoff)
                 else { return ProofProgress::Pending; };
                 let Some(command) = Self::command(request) else {
+                    trace_native_disk_proof(b"command-invalid", request, None, None);
                     self.handoff.refuse_srb(request)
                         .expect("invalid native disk proof request lost");
                     return ProofProgress::Refused;
