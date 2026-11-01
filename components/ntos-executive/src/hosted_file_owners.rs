@@ -84,12 +84,123 @@ struct Row {
     output_capture: ExternalFileIrpOutputCapture,
     retry_after: u64,
     work_ready: bool,
+    /// Observation only; the canonical IRP and Flight still govern every native effect.
+    phase_pump_ticks: u64,
+    phase_bank_ticks: u64,
+    phase_major: u8,
 }
 
 static mut ROWS: Vec<Row> = Vec::new();
 static mut NEXT_ID: u64 = 1;
 static mut NEXT_DRAIN_ID: u64 = 1;
 static RETRY_READY: AtomicU64 = AtomicU64::new(0);
+
+struct FileRpcTotals {
+    calls: AtomicU64,
+    prepare: AtomicU64,
+    pump: AtomicU64,
+    invoke_other: AtomicU64,
+    terminal: AtomicU64,
+    bank: AtomicU64,
+    total: AtomicU64,
+}
+
+impl FileRpcTotals {
+    const fn new() -> Self {
+        Self { calls: AtomicU64::new(0), prepare: AtomicU64::new(0),
+            pump: AtomicU64::new(0), invoke_other: AtomicU64::new(0),
+            terminal: AtomicU64::new(0), bank: AtomicU64::new(0), total: AtomicU64::new(0) }
+    }
+
+    fn add(&self, phase: nt_hosted_runtime::HostedFileRpcDurations) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.prepare.fetch_add(phase.prepare, Ordering::Relaxed);
+        self.pump.fetch_add(phase.pump, Ordering::Relaxed);
+        self.invoke_other.fetch_add(phase.invoke_other, Ordering::Relaxed);
+        self.terminal.fetch_add(phase.terminal, Ordering::Relaxed);
+        self.bank.fetch_add(phase.bank, Ordering::Relaxed);
+        self.total.fetch_add(phase.total, Ordering::Relaxed);
+    }
+}
+
+static FILE_RPC_TOTALS: [FileRpcTotals; 2] = [FileRpcTotals::new(), FileRpcTotals::new()];
+static FILE_RPC_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+struct FileRpcPhaseGuard {
+    entered: u64,
+    identity: Option<nt_hosted_runtime::HostedFileRpcIdentity>,
+    invoked: u64,
+    returned: u64,
+    pump_ticks: u64,
+    bank_ticks: u64,
+}
+
+impl FileRpcPhaseGuard {
+    fn new(major: u8) -> Self {
+        Self { entered: if matches!(major, major::IRP_MJ_READ | major::IRP_MJ_WRITE) {
+            crate::disk_census_ticks()
+        } else { 0 }, identity: None, invoked: 0, returned: 0,
+            pump_ticks: 0, bank_ticks: 0 }
+    }
+}
+
+impl Drop for FileRpcPhaseGuard {
+    fn drop(&mut self) {
+        let Some(identity) = self.identity else { return; };
+        if self.invoked == 0 || self.returned == 0 { return; }
+        let marks = nt_hosted_runtime::HostedFileRpcMarks {
+            entered: self.entered, invoked: self.invoked, returned: self.returned,
+            terminal: crate::disk_census_ticks(), pump_ticks: self.pump_ticks,
+            bank_ticks: self.bank_ticks,
+        };
+        let mut diagnostic = nt_hosted_runtime::HostedFileRpcDiagnostic::new();
+        if let Some(phase) = diagnostic.record(identity, identity, marks) {
+            let slot = if identity.major == major::IRP_MJ_READ { 0 } else { 1 };
+            FILE_RPC_TOTALS[slot].add(phase);
+        } else {
+            FILE_RPC_REJECTED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Match only the executing retained File IRP; a numeric ID without its live owner is ignored.
+pub(super) fn record_dispatch_pump(
+    irp_id: IrpId, major: u8, pump_ticks: u64, bank_ticks: u64,
+) {
+    if !matches!(major, major::IRP_MJ_READ | major::IRP_MJ_WRITE) { return; }
+    let Some(id) = find(irp_id) else { return; };
+    let owner = row(id);
+    if owner.flight == Flight::Dispatch && owner.irp_id == Some(irp_id)
+        && owner.phase_major == major
+    {
+        owner.phase_pump_ticks = owner.phase_pump_ticks.saturating_add(pump_ticks);
+        owner.phase_bank_ticks = owner.phase_bank_ticks.saturating_add(bank_ticks);
+    }
+}
+
+pub(super) fn print_rpc_phase() {
+    for (index, label) in [b"read".as_slice(), b"write".as_slice()].iter().enumerate() {
+        let total = &FILE_RPC_TOTALS[index];
+        let calls = total.calls.load(Ordering::Relaxed);
+        if calls == 0 { continue; }
+        print_str(b"[file-rpc-phase] ");
+        print_str(label);
+        print_str(b" calls/prepare/pump/invoke-other/terminal/bank/total_Mtick=");
+        print_u64(calls);
+        for field in [&total.prepare, &total.pump, &total.invoke_other,
+            &total.terminal, &total.bank, &total.total] {
+            print_str(b"/");
+            print_u64(field.load(Ordering::Relaxed) / 1_000_000);
+        }
+        print_str(b"\n");
+    }
+    let rejected = FILE_RPC_REJECTED.load(Ordering::Relaxed);
+    if rejected != 0 {
+        print_str(b"[file-rpc-phase] rejected=");
+        print_u64(rejected);
+        print_str(b"\n");
+    }
+}
 
 /// Current retained owners, not cumulative outcomes or proof of provider readiness.
 #[derive(Clone, Copy, Default)]
@@ -276,6 +387,9 @@ fn reserve(
         output_capture,
         retry_after: 0,
         work_ready: false,
+        phase_pump_ticks: 0,
+        phase_bank_ticks: 0,
+        phase_major: 0,
     });
     Ok(id)
 }
@@ -529,6 +643,8 @@ fn dispatch_with_port_connect(
     policy: ExternalFileIrpDispatchPolicy,
     port_connect_device: Option<nt_io_manager::DeviceId>,
 ) -> Result<DispatchResult, nt_status::NtStatus> {
+    let major = request.major;
+    let mut phase = FileRpcPhaseGuard::new(major);
     let _durable = crate::allocator::enter_durable();
     let copy = |source: &[u8]| -> Result<Vec<u8>, nt_status::NtStatus> {
         let mut bytes = Vec::new();
@@ -574,11 +690,23 @@ fn dispatch_with_port_connect(
         }
     };
     row(id).flight = Flight::Dispatch;
+    if phase.entered != 0 {
+        row(id).phase_major = major;
+        phase.identity = Some(nt_hosted_runtime::HostedFileRpcIdentity {
+            irp_id: irp_id.raw(), major,
+        });
+    }
     if let Some(device) = port_connect_device {
         trace_port_connect_dispatch(2, irp_id, device);
     }
+    if phase.entered != 0 { phase.invoked = crate::disk_census_ticks(); }
     let returned =
         hosted_file_dispatch::invoke(invocation, row(id).caller, policy.output_capture());
+    if phase.entered != 0 {
+        phase.returned = crate::disk_census_ticks();
+        phase.pump_ticks = row(id).phase_pump_ticks;
+        phase.bank_ticks = row(id).phase_bank_ticks;
+    }
     if let Some(device) = port_connect_device {
         trace_port_connect_dispatch(3, irp_id, device);
     }

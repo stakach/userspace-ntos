@@ -16,6 +16,7 @@ mod installer_progress_deferral;
 mod setup_read_progress_deferral;
 mod setup_read_stage_sample;
 mod hosted_file_phase_diagnostic;
+mod hosted_file_rpc_phase;
 mod hosted_install_pipe_diagnostic;
 mod native_block_stage_sample;
 mod retained_system_fold_phase;
@@ -112,6 +113,8 @@ pub use installer_progress_deferral::{InstallerOwner, InstallerProgressDeferral}
 pub use setup_read_progress_deferral::SetupReadProgressDeferral;
 pub use setup_read_stage_sample::SetupReadStageSampler;
 pub use hosted_file_phase_diagnostic::{FilePhaseIdentity, FilePhaseCounts, HostedFilePhaseDiagnostic, LocalFilePhaseDurations, LocalFilePhaseMarks, NpfsDispatchDurations, NpfsDispatchMarks, NpfsCallbackDiagnostic, NpfsCallbackIdentity, NpfsCallbackCounts, NpfsMajor, NpfsPoolRetireDurations, NpfsPoolRetireMarks};
+pub use hosted_file_rpc_phase::{HostedFileRpcCounts, HostedFileRpcDiagnostic,
+    HostedFileRpcDurations, HostedFileRpcIdentity, HostedFileRpcMarks};
 pub use hosted_install_pipe_diagnostic::{is_install_pipe_name, InstallChildIdentity, InstallPipeCounts, InstallPipeDiagnostic, InstallPipeIdentity, InstallPipeObservation, InstallPipeTerminal};
 pub use native_block_stage_sample::{NativeBlockStageObservation, NativeBlockStageOwner, NativeBlockStageSample,
     NativeBlockStageSampler};

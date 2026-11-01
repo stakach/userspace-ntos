@@ -187,6 +187,10 @@ pub(crate) mod hosted_add_device_rollback;
 mod hosted_file_dispatch;
 #[path = "hosted_file_owners.rs"]
 mod hosted_file_owners;
+
+pub(crate) fn print_hosted_file_rpc_phase() {
+    hosted_file_owners::print_rpc_phase();
+}
 #[path = "mounted_native_block.rs"]
 mod mounted_native_block;
 #[path = "hosted_device_allocations.rs"]
@@ -60669,6 +60673,8 @@ struct ActiveHostedIrpTransfer {
     input_cursor: BankedTransferCursor,
     output_seed_cursor: BankedTransferCursor,
     output_cursor: BankedTransferCursor,
+    bank_ticks: u64,
+    measure_bank: bool,
 }
 
 static mut ACTIVE_HOSTED_IRP_TRANSFERS: Option<Vec<ActiveHostedIrpTransfer>> = None;
@@ -60707,6 +60713,7 @@ unsafe fn enter_active_hosted_irp_transfer(
     shared_va: u64,
     transfer_id: u64,
     source_instance: usize,
+    measure_bank: bool,
     requestor_thread: Option<nt_process::ThreadLifetime>,
     file_create: Option<(FileId, HostedDomainIdentity)>,
     input: &[u8],
@@ -60734,6 +60741,8 @@ unsafe fn enter_active_hosted_irp_transfer(
         input_cursor: BankedTransferCursor::new(input.len() as u64),
         output_seed_cursor: BankedTransferCursor::new(output.len() as u64),
         output_cursor: BankedTransferCursor::new(output.len() as u64),
+        bank_ticks: 0,
+        measure_bank,
     });
     Some(ActiveHostedIrpTransferGuard { depth })
 }
@@ -64136,6 +64145,7 @@ fn service_hosted_irp_bank_pull(
         let Some(active) = active_hosted_irp_transfer_mut(ch.shared_va, transfer_id) else {
             return STATUS_INVALID_PARAMETER;
         };
+        let started = if active.measure_bank { crate::disk_census_ticks() } else { 0 };
         let (cursor, source) = if from_output {
             (&mut active.output_seed_cursor, active.output)
         } else {
@@ -64151,6 +64161,10 @@ fn service_hosted_irp_bank_pull(
         if length != 0 {
             debug_assert_eq!(range.start as u64, offset);
             copy_bytes(arg, source_address, length);
+        }
+        if active.measure_bank {
+            active.bank_ticks = active.bank_ticks.saturating_add(
+                crate::disk_census_ticks().wrapping_sub(started));
         }
     }
     STATUS_SUCCESS
@@ -64196,6 +64210,7 @@ pub(crate) fn service_hosted_irp_output_push(
         let Some(active) = active_hosted_irp_transfer_mut(ch.shared_va, transfer_id) else {
             return STATUS_INVALID_PARAMETER;
         };
+        let started = if active.measure_bank { crate::disk_census_ticks() } else { 0 };
         let Some(destination_address) = active.output.checked_add(offset) else {
             return STATUS_INVALID_PARAMETER;
         };
@@ -64206,6 +64221,10 @@ pub(crate) fn service_hosted_irp_output_push(
         if length != 0 {
             debug_assert_eq!(range.start as u64, offset);
             copy_bytes(destination_address, arg, length);
+        }
+        if active.measure_bank {
+            active.bank_ticks = active.bank_ticks.saturating_add(
+                crate::disk_census_ticks().wrapping_sub(started));
         }
     }
     STATUS_SUCCESS
@@ -71375,6 +71394,7 @@ unsafe fn dispatch_irp_for_instance_exact(
         sh,
         canonical_irp_id,
         dispatch_index,
+        major == major::IRP_MJ_READ as u64 || major == major::IRP_MJ_WRITE as u64,
         requestor_thread,
         file_create,
         in_data,
@@ -71431,10 +71451,19 @@ unsafe fn dispatch_irp_for_instance_exact(
         trace_port_connect_pump(1, canonical_irp_id, class_hook_request,
             class_selection.is_some(), ingress_route, ch.tcb, ch.reply_cap);
     }
+    let measure_rpc = major == major::IRP_MJ_READ as u64 || major == major::IRP_MJ_WRITE as u64;
+    let pump_started = if measure_rpc { crate::disk_census_ticks() } else { 0 };
     let pr = match caller {
         Some(caller) => component_scheduler::hosted_component_pump_with_caller(&ch, caller),
         None => hosted_component_pump(&ch),
     };
+    if measure_rpc {
+        let pump_ticks = crate::disk_census_ticks().wrapping_sub(pump_started);
+        let bank_ticks = active_hosted_irp_transfer_mut(sh, canonical_irp_id)
+            .map_or(0, |transfer| transfer.bank_ticks);
+        hosted_file_owners::record_dispatch_pump(IrpId(canonical_irp_id), major as u8,
+            pump_ticks, bank_ticks);
+    }
     if trace_connect_pump {
         trace_port_connect_pump(2, canonical_irp_id, class_hook_request,
             class_selection.is_some(), ingress_route, ch.tcb,
