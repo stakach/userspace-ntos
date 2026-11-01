@@ -20678,7 +20678,7 @@ impl HostedPciHardwareGrant {
         let memory_bar_count = device
             .bars
             .iter()
-            .filter(|bar| bar.is_present() && !bar.is_io)
+            .filter(|bar| bar.is_assigned() && !bar.is_io)
             .count();
         if memory.len() != memory_bar_count
             || memory.iter().enumerate().any(|(index, grant)| {
@@ -20746,28 +20746,15 @@ struct HostedPciGrantDiscoveryReport {
     claim_failures: u64,
 }
 
-/// A PCI function may need its BAR authority before its native bus PDO exists. Select it from
-/// current PCI inventory and registry critical-driver policy, or an already enumerated launch
-/// plan. Neither source invents an Enum instance identity.
+/// A PCI function may need BAR authority before its native bus PDO or driver launch plan exists.
+/// Inventory provides the physical BDF and assigned BARs; grant claims still require an exact
+/// device-untyped source for each BAR.
 unsafe fn hosted_pci_selected_for_context(
     device: &nt_pnp::PciDevice,
-    pci_devices: &[nt_pnp::PciDevice],
-    plans: &[&InlineDriverLaunchPlan],
+    _pci_devices: &[nt_pnp::PciDevice],
+    _plans: &[&InlineDriverLaunchPlan],
 ) -> bool {
-    if hosted_pci_selected_from_launch_plans(device, pci_devices, plans) {
-        return true;
-    }
-    let candidates = [
-        alloc::format!(r"PCI\VEN_{:04X}&DEV_{:04X}", device.vendor, device.device),
-        alloc::format!(r"PCI\CC_{:06X}", device.class),
-        alloc::format!(r"PCI\CC_{:04X}", device.class >> 8),
-    ];
-    candidates.iter().any(|id| {
-        config_manager_query_critical_device_binding(id)
-            .ok()
-            .flatten()
-            .is_some_and(|binding| binding.service_name.is_some())
-    })
+    hosted_pci_resource_bar_eligible(device)
 }
 
 fn hosted_pci_selected_from_launch_plans(
@@ -21037,14 +21024,14 @@ unsafe fn claim_hosted_pci_memory_grants(
     let count = device
         .bars
         .iter()
-        .filter(|bar| bar.is_present() && !bar.is_io)
+        .filter(|bar| bar.is_assigned() && !bar.is_io)
         .count();
     let mut grants = Vec::new();
     grants.try_reserve_exact(count).ok()?;
     for bar in device
         .bars
         .iter()
-        .filter(|bar| bar.is_present() && !bar.is_io)
+        .filter(|bar| bar.is_assigned() && !bar.is_io)
     {
         let requested_pages = bar.size.div_ceil(0x1000).max(1);
         let run = if let Some(existing) = boot_storage_bar.filter(|existing| existing.phys == bar.base) {

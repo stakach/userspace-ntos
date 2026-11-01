@@ -86,7 +86,7 @@ struct HostedPciMemoryGrant {
 }
 mod nt_pnp {
     pub struct Bar { pub index: u8, pub base: u64, pub size: u64, pub is_io: bool }
-    impl Bar { pub fn is_present(&self) -> bool { self.size != 0 } }
+    impl Bar { pub fn is_present(&self) -> bool { self.size != 0 } pub fn is_assigned(&self) -> bool { self.is_present() && self.base != 0 } }
     pub struct PciDevice { pub bus: u8, pub dev: u8, pub func: u8, pub bars: Vec<Bar> }
 }
 struct Claim {

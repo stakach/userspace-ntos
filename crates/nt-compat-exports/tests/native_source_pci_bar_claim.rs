@@ -63,7 +63,7 @@ struct HostedPciMemoryGrant {
 }
 mod nt_pnp {
     pub struct Bar { pub index: u8, pub base: u64, pub size: u64, pub is_io: bool }
-    impl Bar { pub fn is_present(&self) -> bool { self.size != 0 } }
+    impl Bar { pub fn is_present(&self) -> bool { self.size != 0 } pub fn is_assigned(&self) -> bool { self.is_present() && self.base != 0 } }
     pub struct PciDevice { pub bus: u8, pub dev: u8, pub func: u8, pub bars: Vec<Bar> }
 }
 fn existing_boot_framebuffer_bar_cap_run(_: u64, _: u64) -> Option<DeviceFrameCapRun> { None }
@@ -134,5 +134,20 @@ fn incomplete_existing_claim_fails_closed_without_second_retype() {
         claim_hosted_pci_memory_grants(&BootInfo, &mut authority, &device(0, 0x8106_1000), Some(claim))
     }.is_none());
     assert_eq!(retypes(), 0);
+}
+#[test]
+fn unassigned_memory_bar_does_not_prevent_claiming_assigned_bar() {
+    reset();
+    let mut authority = HostedPciBarClaimAuthority;
+    let mut pci = device(0, 0x8106_2000);
+    pci.bars.insert(0, nt_pnp::Bar {
+        index: 0, base: 0, size: 0x1000, is_io: false,
+    });
+    let grants = unsafe {
+        claim_hosted_pci_memory_grants(&BootInfo, &mut authority, &pci, None)
+    }.unwrap();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].bar_index, 5);
+    assert_eq!(retypes(), 1);
 }
 "#;
