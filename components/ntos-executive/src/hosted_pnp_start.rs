@@ -746,7 +746,8 @@ impl OwnedHostedPnpStartBatch {
                     };
                     match crate::boot_storage_dma_handoff::begin_native_start_after_preload(receipt, lease) {
                         Ok(crate::boot_storage_dma_handoff::NativeStartAdmission::Ready) => {}
-                        Ok(crate::boot_storage_dma_handoff::NativeStartAdmission::Draining) => {
+                        Ok(crate::boot_storage_dma_handoff::NativeStartAdmission::WaitingForRelation)
+                        | Ok(crate::boot_storage_dma_handoff::NativeStartAdmission::Draining) => {
                             self.pending_grant_admission = Some(pending);
                             return OwnedHostedPnpStartProgress::AwaitingCompletion;
                         }

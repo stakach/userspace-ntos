@@ -527,11 +527,29 @@ impl DeviceRelationInvalidationQueue {
     }
 
     pub fn claim_front(&mut self) -> Option<DeviceRelationInvalidation> {
+        self.claim_pending_where(|_| true)
+    }
+
+    /// Claim the oldest pending action for one exact started parent and relation type.
+    /// Other pending rows retain their sequence and ownership while a physical dependency runs.
+    pub fn claim_parent(
+        &mut self,
+        parent: crate::DevnodeIdentity,
+        relation_type: u32,
+    ) -> Option<DeviceRelationInvalidation> {
+        self.claim_pending_where(|row| row.parent == parent && row.relation_type == relation_type)
+    }
+
+    fn claim_pending_where(
+        &mut self,
+        predicate: impl Fn(&DeviceRelationInvalidationRow) -> bool,
+    ) -> Option<DeviceRelationInvalidation> {
         let (index, sequence) = self
             .rows
             .iter()
             .enumerate()
             .filter_map(|(index, row)| match row.state {
+                _ if !predicate(row) => None,
                 DeviceRelationInvalidationState::Pending { sequence } => Some((index, sequence)),
                 DeviceRelationInvalidationState::Claimed { .. } => None,
             })
@@ -2141,6 +2159,24 @@ mod tests {
         assert_eq!(queue.claim_front(), Some(third));
         queue.complete(first).unwrap();
         queue.complete(third).unwrap();
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn exact_parent_claim_can_advance_storage_without_consuming_earlier_relations() {
+        let mut queue = DeviceRelationInvalidationQueue::new();
+        let earlier = queue.enqueue(parent(20), 0).unwrap().invalidation;
+        let storage = queue.enqueue(parent(10), 0).unwrap().invalidation;
+        let other_type = queue.enqueue(parent(10), 1).unwrap().invalidation;
+        assert_eq!(queue.claim_parent(parent(10), 0), Some(storage));
+        assert_eq!(queue.claim_parent(parent(10), 0), None);
+        assert!(queue.contains(earlier));
+        assert!(queue.contains(other_type));
+        queue.complete(storage).unwrap();
+        assert_eq!(queue.claim_front(), Some(earlier));
+        queue.complete(earlier).unwrap();
+        assert_eq!(queue.claim_front(), Some(other_type));
+        queue.complete(other_type).unwrap();
         assert!(queue.is_empty());
     }
 

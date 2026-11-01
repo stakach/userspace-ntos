@@ -183,6 +183,7 @@ pub(crate) fn boot_disk_reads_admitted() -> bool {
 /// Result of redriving the exact boot-controller transition. A pending boot command keeps
 /// the controller in BootDraining; it never reopens direct AHCI admission.
 pub(crate) enum NativeStartAdmission {
+    WaitingForRelation,
     Draining,
     Ready,
 }
@@ -235,6 +236,14 @@ pub(crate) fn begin_native_start_after_preload(
     }
     match owner.ledger.state(owner.controller, owner.io_space_cap) {
         Ok(ControllerState::BootActive) => {
+            let accepted_pdo = owner.accepted_pdo
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+            if unsafe {
+                driver_launch::hosted_nonstorage_relation_query_active(accepted_pdo)
+            } {
+                trace_native_start_once(65536, b"waiting-relation");
+                return Ok(NativeStartAdmission::WaitingForRelation);
+            }
             owner
                 .ledger
                 .begin_drain(owner.controller, owner.io_space_cap)
@@ -371,6 +380,29 @@ pub(crate) fn remember_boot_controller_pdo(
     }
     owner.accepted_pdo = Some(pdo);
     Ok(())
+}
+
+/// During the physical mount drain, only its accepted controller relation may advance.
+/// An absent accepted identity fails closed rather than opening ordinary FIFO publication.
+pub(crate) fn pending_native_storage_relation_parent(
+) -> Result<Option<u64>, nt_status::NtStatus> {
+    let Some((mount, _)) = (unsafe { crate::fs_loader::exec_expected_disk() }) else {
+        return if unsafe { crate::fs_loader::exec_fs_mount_identity() }
+            .and_then(crate::fs_loader::exec_block_route_kind)
+            == Some(nt_fs::BlockSourceKind::Draining)
+        {
+            Err(nt_status::NtStatus::DEVICE_NOT_READY)
+        } else {
+            Ok(None)
+        };
+    };
+    if crate::fs_loader::exec_block_route_kind(mount) != Some(nt_fs::BlockSourceKind::Draining) {
+        return Ok(None);
+    }
+    let owner = authority().ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    owner.accepted_pdo
+        .map(Some)
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)
 }
 
 pub(crate) fn relation_parent_requires_native_disk_proof(

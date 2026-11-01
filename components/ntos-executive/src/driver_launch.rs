@@ -47579,7 +47579,18 @@ unsafe fn start_hosted_device_relation_query() -> usize {
     if reserve_active_hosted_irp_transfer_slot().is_err() {
         return 0;
     }
-    let Some(claim) = hosted_device_relation_invalidations_mut().claim_front() else {
+    let claim = match crate::boot_storage_dma_handoff::pending_native_storage_relation_parent() {
+        Ok(Some(pdo)) => {
+            let Some(parent) = hosted_pnp_manager_mut().devnode_identity_for_pdo(pdo) else {
+                return 0;
+            };
+            hosted_device_relation_invalidations_mut()
+                .claim_parent(parent, nt_pnp_abi::BUS_RELATIONS)
+        }
+        Ok(None) => hosted_device_relation_invalidations_mut().claim_front(),
+        Err(_) => return 0,
+    };
+    let Some(claim) = claim else {
         return 0;
     };
     let relation_owner = hosted_device_relation_owner(claim)
@@ -53944,6 +53955,19 @@ pub(crate) unsafe fn enqueue_hosted_initial_bus_relations(
             invalidation: enqueued.invalidation,
         }
     })
+}
+
+/// An unrelated relation may already own a prepared CM mutation. Finish it while boot storage
+/// still admits writes; an exact accepted controller BUS_RELATIONS query can proceed with drain.
+pub(crate) unsafe fn hosted_nonstorage_relation_query_active(accepted_pdo: u64) -> bool {
+    let Some(query) = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).as_ref() else {
+        return false;
+    };
+    accepted_pdo == 0
+        || query.claim.pdo_device_id != accepted_pdo
+        || query.claim.relation_type != nt_pnp_abi::BUS_RELATIONS
+        || hosted_pnp_manager_mut().devnode_identity_for_pdo(accepted_pdo)
+            != Some(query.claim.parent)
 }
 
 /// A physical disk request can still complete by IRQ even when all user threads are parked.
