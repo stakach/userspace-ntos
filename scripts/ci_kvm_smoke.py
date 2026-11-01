@@ -29,13 +29,20 @@ STOPPED_MARKER = ROOT / "native-kvm-qemu-stopped"
 # Vary the phase so a periodic guest path cannot masquerade as a CPU hotspot.
 CPU_SAMPLE_DELAYS = (17, 31, 43, 59)
 EXECUTIVE_PANIC = re.compile(rb"!@(src/[A-Za-z0-9_./-]+\.rs:[1-9][0-9]*)\r?\n")
+TERMINAL_BOOT_STOP = re.compile(
+    rb"(?:^|[\r\n])("
+    rb"\[quiesce\] every live process parked/waiting \(no signaler left\) -> run gate"
+    rb"|\[cm-flush\] shutdown hive durability refused status=0x[0-9a-fA-F]{8}"
+    rb")\r?\n"
+)
 
 
 class SerialPanicDetector:
     """Read only new serial output, retaining split panic records across polls."""
 
-    def __init__(self, path):
+    def __init__(self, path, pattern=EXECUTIVE_PANIC):
         self.path = path
+        self.pattern = pattern
         self.offset = 0
         self.tail = b""
 
@@ -50,11 +57,24 @@ class SerialPanicDetector:
             while chunk := stream.read(65536):
                 self.offset += len(chunk)
                 candidate = self.tail + chunk
-                match = EXECUTIVE_PANIC.search(candidate)
+                match = self.pattern.search(candidate)
                 self.tail = candidate[-4096:]
                 if match:
                     return match.group(1).decode("ascii")
         return None
+
+
+class SerialTerminalDetector(SerialPanicDetector):
+    """Detect the guest's terminal quiesce or refused durability gate."""
+
+    def __init__(self, path):
+        super().__init__(path, TERMINAL_BOOT_STOP)
+
+    def poll(self):
+        record = super().poll()
+        if record is None:
+            return None
+        return "quiesce" if record.startswith("[quiesce]") else "durability-refused"
 
 
 def cpu_sample_delay(sample_index):
@@ -261,7 +281,24 @@ def main():
         captured = False
         stall_captured = False
         panic_detector = SerialPanicDetector(LOG)
+        terminal_detector = SerialTerminalDetector(LOG)
         panic_site = None
+        terminal_reason = None
+        def capture_terminal_evidence(reason):
+            nonlocal captured, stall_captured
+            if not QMP_SOCKET.exists():
+                return
+            try:
+                capture_stall_state()
+                stall_captured = True
+            except OSError as error:
+                print(f"QMP {reason} state capture failed: {error}", flush=True)
+            try:
+                capture_framebuffer()
+                captured = True
+                print(f"QMP {reason} framebuffer captured: {SCREENSHOT.name}", flush=True)
+            except (OSError, RuntimeError, ValueError) as error:
+                print(f"QMP {reason} framebuffer capture failed: {error}", flush=True)
         def signal_guest(sig):
             try:
                 os.killpg(process.pid, sig)
@@ -279,18 +316,12 @@ def main():
                 panic_site = panic_detector.poll()
                 if panic_site:
                     print(f"Executive panic at {panic_site}; stopping bounded boot", flush=True)
-                    if QMP_SOCKET.exists():
-                        try:
-                            capture_stall_state()
-                            stall_captured = True
-                        except OSError as error:
-                            print(f"QMP panic state capture failed: {error}", flush=True)
-                        try:
-                            capture_framebuffer()
-                            captured = True
-                            print(f"QMP panic framebuffer captured: {SCREENSHOT.name}", flush=True)
-                        except (OSError, RuntimeError, ValueError) as error:
-                            print(f"QMP panic framebuffer capture failed: {error}", flush=True)
+                    capture_terminal_evidence("panic")
+                    break
+                terminal_reason = terminal_detector.poll()
+                if terminal_reason:
+                    print(f"Guest terminal {terminal_reason}; stopping bounded boot", flush=True)
+                    capture_terminal_evidence(terminal_reason)
                     break
                 if process.poll() is not None:
                     break
@@ -342,8 +373,11 @@ def main():
 
     output = LOG.read_text(errors="replace")
     panic_site = panic_site or panic_detector.poll()
+    terminal_reason = terminal_reason or terminal_detector.poll()
     if panic_site:
         raise SystemExit(f"executive panic at {panic_site}; inspect native-kvm-smoke.log")
+    if terminal_reason:
+        raise SystemExit(f"guest terminal {terminal_reason}; inspect native-kvm-smoke.log")
     if "boot: reading Simpleboot memory map" not in output:
         raise SystemExit("guest startup marker absent; inspect native-kvm-smoke.log")
     if not captured:

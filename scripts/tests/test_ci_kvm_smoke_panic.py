@@ -4,7 +4,15 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import scripts.ci_kvm_smoke as smoke
 from scripts.ci_kvm_smoke import SerialPanicDetector
+
+
+def terminal_detector(log):
+    # Before the terminal detector exists, exercise the live serial scanner and fail on its
+    # missing outcome instead of failing test collection at import time.
+    detector = getattr(smoke, "SerialTerminalDetector", SerialPanicDetector)
+    return detector(log)
 
 
 class SerialPanicDetectorTests(unittest.TestCase):
@@ -50,6 +58,46 @@ class SerialPanicDetectorTests(unittest.TestCase):
             with log.open("ab") as stream:
                 stream.write(b"!@src/win32k_receive.rs:477\n")
             self.assertEqual(detector.poll(), "src/win32k_receive.rs:477")
+
+
+class SerialTerminalDetectorTests(unittest.TestCase):
+    def test_quiesce_gate_is_terminal_across_split_serial_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "serial.log"
+            log.write_bytes(b"[quiesce] every live process parked/waiting (no sig")
+            detector = terminal_detector(log)
+            self.assertIsNone(detector.poll())
+
+            with log.open("ab") as stream:
+                stream.write(b"naler left) -> run gate\r")
+            self.assertIsNone(detector.poll())
+
+            with log.open("ab") as stream:
+                stream.write(b"\n")
+            self.assertEqual(detector.poll(), "quiesce")
+            self.assertIsNone(detector.poll())
+
+    def test_durability_refusal_is_terminal_across_split_serial_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "serial.log"
+            log.write_bytes(b"[cm-flush] shutdown hive durability ref")
+            detector = terminal_detector(log)
+            self.assertIsNone(detector.poll())
+
+            with log.open("ab") as stream:
+                stream.write(b"used status=0xc00000a3\n")
+            self.assertEqual(detector.poll(), "durability-refused")
+            self.assertIsNone(detector.poll())
+
+    def test_partial_or_quoted_quiesce_is_not_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "serial.log"
+            log.write_bytes(
+                b"trace: [quiesce] every live process parked/waiting (no signaler left) -> run gate\n"
+                b"[quiesce] every live process parked/waiting (no signaler left) -> run gate?\n"
+                b"[cm-flush] shutdown hive durability refused status=unknown\n"
+            )
+            self.assertIsNone(terminal_detector(log).poll())
 
 
 if __name__ == "__main__":
