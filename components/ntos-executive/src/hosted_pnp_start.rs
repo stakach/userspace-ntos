@@ -1827,6 +1827,9 @@ where
                 }
                 Ok(driver_launch::AcceptedPciResourceProperties::Present { raw, requirements }) => {
                     if let Err(status) = crate::boot_storage_dma_handoff::remember_boot_controller_pdo(pdo, device) {
+                        driver_launch::trace_hosted_bus_resource_refusal(
+                            b"boot-controller-pdo", instance_id, pdo, status,
+                        );
                         return Err(release_context_lease_after_error(lease, status));
                     }
                     Some((raw, requirements))
@@ -1841,12 +1844,20 @@ where
             .find(|window| window.matches(device))
             .cloned();
         let Some(window) = window else {
+            driver_launch::trace_hosted_bus_resource_refusal(
+                b"pci-window", instance_id, bus_pdo.unwrap_or(0),
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            );
             return Err(release_context_lease_after_error(
                 lease,
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST,
             ));
         };
         let Some(bus_resources) = build_devnode_pci_bus_resources(device, None) else {
+            driver_launch::trace_hosted_bus_resource_refusal(
+                b"pci-bus-resources", instance_id, bus_pdo.unwrap_or(0),
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            );
             return Err(release_context_lease_after_error(
                 lease,
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST,
