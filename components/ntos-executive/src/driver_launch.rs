@@ -50523,6 +50523,7 @@ unsafe fn validate_and_sync_hosted_device_projection(
         )
     };
     if driver_id != expected_driver {
+        hosted_upper_filter_projection::trace_filter_stage(0x32, 1);
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let _guard = hosted_instance_pool_lock(inst.exec_pool_va)
@@ -50547,9 +50548,16 @@ unsafe fn validate_and_sync_hosted_device_projection(
         || read_unaligned((device_exec + kernel_offset) as *const u16) != 13
         || read_unaligned((device_exec + kernel_offset + 2) as *const u16) != 0
         || read_unaligned((device_exec + kernel_offset + 8) as *const u64) != device_object
-        || read_unaligned((device_exec + 0x48) as *const u32) != device_type.0
-        || read_unaligned((device_exec + 0x34) as *const u32) != characteristics.bits()
     {
+        hosted_upper_filter_projection::trace_filter_stage(0x32, 2);
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    if read_unaligned((device_exec + 0x48) as *const u32) != device_type.0 {
+        hosted_upper_filter_projection::trace_filter_stage(0x32, 3);
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    if read_unaligned((device_exec + 0x34) as *const u32) != characteristics.bits() {
+        hosted_upper_filter_projection::trace_filter_stage(0x32, 4);
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     if io_manager_mut().hosted_device_by_identity(domain, device_object) != Some(device_id) {

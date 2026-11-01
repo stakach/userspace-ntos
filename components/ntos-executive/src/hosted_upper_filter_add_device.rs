@@ -142,7 +142,10 @@ unsafe fn attach_prepared(
         let pdo = nt_io_manager::DeviceId(claim.key().child().pdo_object_id());
         let fdo = io_manager_mut()
             .top_of_device_stack(pdo)
-            .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+            .map_err(|_| {
+                hosted_upper_filter_projection::trace_filter_stage(0x31, 1);
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST
+            })?;
         if fdo.raw() == claim.lower_device()
             || !io_manager_mut().device(fdo).is_some_and(|device| {
                 device.driver_id == DriverId(claim.driver_id())
@@ -154,9 +157,19 @@ unsafe fn attach_prepared(
         }
         let fdo_address = io_manager_mut()
             .hosted_device_address_by_identity(prepared.class_domain, fdo)
-            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        let registration =
-            hosted_device_pointer_registration(prepared.class_domain, fdo_address, fdo)?;
+            .ok_or_else(|| {
+                hosted_upper_filter_projection::trace_filter_stage(0x31, 2);
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST
+            })?;
+        let registration = hosted_device_pointer_registration(
+            prepared.class_domain,
+            fdo_address,
+            fdo,
+        )
+        .map_err(|status| {
+            hosted_upper_filter_projection::trace_filter_stage(0x31, 3);
+            status
+        })?;
         if !hosted_add_device_rollback::owns_created_registration(
             rollback.as_ref().unwrap(),
             registration,
@@ -171,8 +184,17 @@ unsafe fn attach_prepared(
             fdo,
             DriverId(claim.driver_id()),
             dispatch.driver_object,
+        )
+        .map_err(|status| {
+            hosted_upper_filter_projection::trace_filter_stage(0x31, 4);
+            status
+        })?;
+        hosted_upper_filter_projection::complete_add_device(owner_id, registration).map_err(
+            |status| {
+                hosted_upper_filter_projection::trace_filter_stage(0x31, 5);
+                status
+            },
         )?;
-        hosted_upper_filter_projection::complete_add_device(owner_id, registration)?;
         hosted_upper_filter_projection::trace_filter_stage(0x08, 0);
         transferred = true;
         ledger()
