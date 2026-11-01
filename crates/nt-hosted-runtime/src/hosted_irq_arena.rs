@@ -152,6 +152,8 @@ pub enum HostedIrqServiceKind {
     DmaFreeMapping = 12,
     SetEvent = 13,
     BeginLocalIrpCompletion = 14,
+    DmaQuerySg = 15,
+    DmaPutSg = 16,
 }
 
 impl HostedIrqServiceKind {
@@ -171,6 +173,8 @@ impl HostedIrqServiceKind {
             12 => Some(Self::DmaFreeMapping),
             13 => Some(Self::SetEvent),
             14 => Some(Self::BeginLocalIrpCompletion),
+            15 => Some(Self::DmaQuerySg),
+            16 => Some(Self::DmaPutSg),
             _ => None,
         }
     }
@@ -513,7 +517,9 @@ impl HostedIrqServiceCommand {
                         && self.arguments[0] != 0
                         && self.arguments[1] != 0
                 }
-                HostedIrqServiceKind::DmaFreeMapping => {
+                HostedIrqServiceKind::DmaFreeMapping
+                | HostedIrqServiceKind::DmaQuerySg
+                | HostedIrqServiceKind::DmaPutSg => {
                     self.authority_cookie == 0
                         && self.argument_count == 4
                         && self.arguments[..4].iter().all(|argument| *argument != 0)
@@ -2553,7 +2559,7 @@ mod tests {
         assert_eq!(HostedIrqServiceKind::from_raw(9), Some(HostedIrqServiceKind::TimerCancel));
         assert_eq!(HostedIrqServiceKind::from_raw(10), Some(HostedIrqServiceKind::TimerSet));
         assert_eq!(HostedIrqServiceKind::from_raw(11), Some(HostedIrqServiceKind::RemoveDpc));
-        assert_eq!(HostedIrqServiceKind::from_raw(15), None);
+        assert_eq!(HostedIrqServiceKind::from_raw(17), None);
         assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
         assert!(HostedIrqServiceKind::ClassServiceRequest.may_request_nested_dispatch());
         assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
@@ -2645,6 +2651,36 @@ mod tests {
         free.arguments[4] = 0;
         free.authority_cookie = 1;
         assert!(!free.valid());
+    }
+
+    #[test]
+    fn irq_dma_sg_commands_carry_only_exact_lease_and_list_identity() {
+        for (raw, kind) in [
+            (15, HostedIrqServiceKind::DmaQuerySg),
+            (16, HostedIrqServiceKind::DmaPutSg),
+        ] {
+            assert_eq!(HostedIrqServiceKind::from_raw(raw), Some(kind));
+            let mut command = service();
+            command.kind = kind;
+            command.authority_cookie = 0;
+            command.argument_count = 4;
+            command.arguments = [17, 19, 0x108000, 2056, 0, 0, 0, 0, 0, 0, 0, 0];
+            assert!(command.valid());
+            for index in 0..4 {
+                let saved = command.arguments[index];
+                command.arguments[index] = 0;
+                assert!(!command.valid(), "missing proof word {index} for {kind:?}");
+                command.arguments[index] = saved;
+            }
+            command.arguments[4] = 1;
+            assert!(!command.valid(), "trailing authority for {kind:?}");
+            command.arguments[4] = 0;
+            command.authority_cookie = 1;
+            assert!(!command.valid(), "unexpected authority cookie for {kind:?}");
+            command.authority_cookie = 0;
+            command.argument_count = 3;
+            assert!(!command.valid(), "truncated proof for {kind:?}");
+        }
     }
 
     #[test]

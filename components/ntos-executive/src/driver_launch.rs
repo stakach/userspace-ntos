@@ -12240,6 +12240,31 @@ unsafe fn dma_retire_map_token(adapter: u64, map: u64) -> bool {
 }
 
 unsafe fn dma_retire_sg_list(adapter: u64, list: u64) -> bool {
+    if let Some((_, identity, _, _, grant)) = hosted_irq_lane_context() {
+        let metadata = dma_adapter_metadata(adapter)
+            .unwrap_or_else(|| hosted_irq_lane_protocol_fault(adapter));
+        let lease_id = read_unaligned((adapter + HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET) as *const u64);
+        if list == 0 || lease_id == 0 {
+            hosted_irq_lane_protocol_fault(adapter);
+        }
+        let adapter_id = metadata.adapter_id;
+        let mut arguments = [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        arguments[..4].copy_from_slice(&[adapter, list, lease_id, adapter_id]);
+        let result = hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
+            kind: nt_hosted_runtime::HostedIrqServiceKind::DmaPutSg,
+            service_id: FSD_SERVICE_DMA_ADAPTER_LABEL,
+            target_domain_id: identity.domain_id,
+            target_domain_cookie: identity.domain_cookie,
+            authority_cookie: 0,
+            grant,
+            argument_count: 4,
+            arguments,
+        });
+        if result.faulted || result.value_count != 0 || result.status != STATUS_SUCCESS {
+            hosted_irq_lane_protocol_fault(lease_id);
+        }
+        return true;
+    }
     let (_label, status, _, _, _) = call_on5(
         (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
         adapter,
@@ -12250,6 +12275,33 @@ unsafe fn dma_retire_sg_list(adapter: u64, list: u64) -> bool {
 }
 
 unsafe fn dma_query_sg_members(adapter: u64, list: u64) -> Option<(u64, u64)> {
+    if let Some((_, identity, _, _, grant)) = hosted_irq_lane_context() {
+        let metadata = dma_adapter_metadata(adapter)
+            .unwrap_or_else(|| hosted_irq_lane_protocol_fault(adapter));
+        let lease_id = read_unaligned((adapter + HOSTED_DMA_ADAPTER_LEASE_ID_OFFSET) as *const u64);
+        if list == 0 || lease_id == 0 {
+            hosted_irq_lane_protocol_fault(adapter);
+        }
+        let adapter_id = metadata.adapter_id;
+        let mut arguments = [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        arguments[..4].copy_from_slice(&[adapter, list, lease_id, adapter_id]);
+        let result = hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
+            kind: nt_hosted_runtime::HostedIrqServiceKind::DmaQuerySg,
+            service_id: FSD_SERVICE_DMA_ADAPTER_LABEL,
+            target_domain_id: identity.domain_id,
+            target_domain_cookie: identity.domain_cookie,
+            authority_cookie: 0,
+            grant,
+            argument_count: 4,
+            arguments,
+        });
+        if result.faulted || result.value_count != 2 || result.status != STATUS_SUCCESS
+            || result.values[0] == 0 || result.values[1] == 0
+        {
+            hosted_irq_lane_protocol_fault(lease_id);
+        }
+        return Some((result.values[0], result.values[1]));
+    }
     let (_label, status, map, context, _) = call_on5(
         (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
         adapter,
@@ -52524,6 +52576,60 @@ pub(crate) unsafe fn service_hosted_irq_lane_dma_free_mapping(
     }
     hosted_device_allocations::retire_dma_private_graph(
         inst, lease_id, map_token, false,
+        |mapping_id| hosted_dma_manager_mut()
+            .free_mapping_for_owner(lease.owner, mapping_id)
+            .map_err(hosted_dma_status),
+    )
+}
+
+/// Resolve only the members of the caller's live, lease-owned SG graph. The list address is a
+/// lookup key, never authority to dereference driver memory in the root broker.
+pub(crate) unsafe fn service_hosted_irq_lane_dma_query_sg(
+    instance_index: usize,
+    domain_id: u64,
+    domain_cookie: u64,
+    adapter_address: u64,
+    list: u64,
+    lease_id: u64,
+    adapter_id: u64,
+) -> Result<(u64, u64), nt_status::NtStatus> {
+    let inst = instance(instance_index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let domain = instance_domain_identity(inst).ok_or(nt_status::NtStatus::ACCESS_DENIED)?;
+    if domain.domain_id.raw() != domain_id || domain.cookie != domain_cookie {
+        return Err(nt_status::NtStatus::ACCESS_DENIED);
+    }
+    let (lease, _) = authenticated_hosted_dma_free_lease(
+        instance_index, domain, inst.exec_shared_va, lease_id, adapter_id,
+    )?;
+    if lease.adapter_address != Some(adapter_address) {
+        return Err(nt_status::NtStatus::ACCESS_DENIED);
+    }
+    hosted_device_allocations::dma_private_sg_members(inst, lease_id, list)
+}
+
+/// Retire an SG graph through its exact root lease, including every mapping owned by the graph.
+pub(crate) unsafe fn service_hosted_irq_lane_dma_put_sg(
+    instance_index: usize,
+    domain_id: u64,
+    domain_cookie: u64,
+    adapter_address: u64,
+    list: u64,
+    lease_id: u64,
+    adapter_id: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let inst = instance(instance_index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let domain = instance_domain_identity(inst).ok_or(nt_status::NtStatus::ACCESS_DENIED)?;
+    if domain.domain_id.raw() != domain_id || domain.cookie != domain_cookie {
+        return Err(nt_status::NtStatus::ACCESS_DENIED);
+    }
+    let (lease, _) = authenticated_hosted_dma_free_lease(
+        instance_index, domain, inst.exec_shared_va, lease_id, adapter_id,
+    )?;
+    if lease.adapter_address != Some(adapter_address) {
+        return Err(nt_status::NtStatus::ACCESS_DENIED);
+    }
+    hosted_device_allocations::retire_dma_private_graph(
+        inst, lease_id, list, true,
         |mapping_id| hosted_dma_manager_mut()
             .free_mapping_for_owner(lease.owner, mapping_id)
             .map_err(hosted_dma_status),
