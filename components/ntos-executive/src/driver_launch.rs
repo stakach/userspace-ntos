@@ -122,6 +122,10 @@ pub(crate) mod hosted_driver_interface_registry;
 mod hosted_device_object_pointer;
 #[path = "hosted_driver_reinitialization.rs"]
 mod hosted_driver_reinitialization;
+#[path = "hosted_boot_driver_reinitialization.rs"]
+mod hosted_boot_driver_reinitialization;
+#[path = "hosted_driver_safe_boot.rs"]
+mod hosted_driver_safe_boot;
 
 pub(crate) unsafe fn service_hosted_driver_zw_load_driver(
     channel: &crate::spawn_hosts::PumpChannel,
@@ -238,6 +242,8 @@ mod hosted_kd_debug;
 mod hosted_synchronous_fsd_request;
 #[path = "hosted_partition_table.rs"]
 mod hosted_partition_table;
+#[path = "hosted_disk_signature.rs"]
+mod hosted_disk_signature;
 #[path = "hosted_source_create_security.rs"]
 mod hosted_source_create_security;
 #[path = "hosted_source_pool_memory.rs"]
@@ -382,6 +388,8 @@ mod hosted_driver_physical_mdl;
 pub(crate) mod hosted_driver_process_identity;
 #[path = "hosted_driver_directory_object.rs"]
 pub(crate) mod hosted_driver_directory_object;
+#[path = "hosted_driver_make_temporary.rs"]
+mod hosted_driver_make_temporary;
 #[path = "hosted_driver_create_event.rs"]
 pub(crate) mod hosted_driver_create_event;
 #[path = "hosted_driver_event_reference.rs"]
@@ -751,6 +759,9 @@ const FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_OFF: u64 = 0x210;
 const FSD_DATA_KD_DEBUGGER_NOT_PRESENT_OFF: u64 = 0x218;
 const FSD_DATA_KE_NUMBER_PROCESSORS_OFF: u64 = 0x220;
 const FSD_DATA_KD_COM_PORT_IN_USE_OFF: u64 = 0x228;
+const _: () = assert!(FSD_DATA_KD_COM_PORT_IN_USE_OFF + 8
+    <= hosted_driver_safe_boot::SAFE_BOOT_MODE_OFFSET
+    && hosted_driver_safe_boot::SAFE_BOOT_MODE_OFFSET + 4 <= FSD_DATA_HAL_DISPATCH_OFF);
 const FSD_DATA_IO_DEVICE_OBJECT_TYPE_CELL_OFF: u64 = hosted_driver_object_reference::DEVICE_OBJECT_TYPE_CELL_OFFSET;
 // HAL_DISPATCH is an imported data object. Its unsupported callbacks remain null.
 const FSD_DATA_HAL_DISPATCH_OFF: u64 = 0x240;
@@ -1431,6 +1442,7 @@ pub const FSD_DISPATCH_VIDEO_RELATION_ACK: u64 = u64::MAX - 0x77E;
 pub const FSD_DISPATCH_CREATE_PDO_PROJECTION: u64 = u64::MAX - 0x77F;
 pub const FSD_DISPATCH_DRAIN_FILE_RETIREMENTS: u64 = u64::MAX - 0x781;
 pub const FSD_DISPATCH_DRIVER_REINIT: u64 = u64::MAX - 0x782;
+pub const FSD_DISPATCH_BOOT_DRIVER_REINIT: u64 = u64::MAX - 0x787;
 pub const FSD_DISPATCH_PNP_NOTIFICATION: u64 = u64::MAX - 0x786;
 pub const FSD_DISPATCH_CLASS_LOWER_ALIAS: u64 = u64::MAX - 0x783;
 pub const FSD_DISPATCH_REVERSE_CLASS_ALIAS: u64 = u64::MAX - 0x784;
@@ -5702,6 +5714,7 @@ unsafe fn initialize_hosted_driver_data_exports(exec_data_va: u64) {
     // cell so serial.sys can compare its controller address without claiming the port.
     let kd_com_port_in_use = exec_data_va + FSD_DATA_KD_COM_PORT_IN_USE_OFF;
     write_volatile(kd_com_port_in_use as *mut u64, 0);
+    hosted_driver_safe_boot::initialize(exec_data_va);
 
     let se_exports_cell = exec_data_va + FSD_DATA_SE_EXPORTS_CELL_OFF;
     let se_exports_struct = exec_data_va + FSD_DATA_SE_EXPORTS_STRUCT_OFF;
@@ -5732,6 +5745,7 @@ fn fsd_data_export_addr(name: &str) -> Option<u64> {
         "MmSystemRangeStart" => FSD_DATA_MM_SYSTEM_RANGE_START_VA,
         "KdDebuggerNotPresent" => FSD_DATA_KD_DEBUGGER_NOT_PRESENT_VA,
         "KdComPortInUse" => FSD_DATA_KD_COM_PORT_IN_USE_VA,
+        "InitSafeBootMode" => hosted_driver_safe_boot::SAFE_BOOT_MODE_VA,
         "KeNumberProcessors" => FSD_DATA_KE_NUMBER_PROCESSORS_VA,
         "IoFileObjectType" => FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_VA,
         "IoDeviceObjectType" => FSD_DATA_IO_DEVICE_OBJECT_TYPE_CELL_VA,
@@ -6258,6 +6272,7 @@ const HOSTED_DEVICE_OP_START_PACKET_CALLBACK_RETURNED: u64 = 24;
 const HOSTED_DEVICE_OP_START_NEXT_PACKET: u64 = 25;
 const HOSTED_DEVICE_OP_START_NEXT_PACKET_CALLBACK_RETURNED: u64 = 26;
 const HOSTED_DEVICE_OP_REGISTER_DRIVER_REINIT: u64 = 27;
+const HOSTED_DEVICE_OP_REGISTER_BOOT_DRIVER_REINIT: u64 = 39;
 const HOSTED_DEVICE_OP_GET_INTERFACE_BEGIN: u64 = 28;
 const HOSTED_DEVICE_OP_GET_INTERFACE_PULL: u64 = 29;
 const HOSTED_DEVICE_OP_GET_INTERFACE_ABORT: u64 = 30;
@@ -14321,76 +14336,111 @@ unsafe fn list_insert_between(entry: u64, prev: u64, next: u64) {
 }
 
 /// `PLIST_ENTRY ExInterlockedInsertTailList(PLIST_ENTRY Head, PLIST_ENTRY Entry, PKSPIN_LOCK)`.
-extern "win64" fn s_ex_interlocked_insert_tail_list(head: u64, entry: u64, _lock: u64) -> u64 {
+extern "win64" fn s_ex_interlocked_insert_tail_list(head: u64, entry: u64, lock: u64) -> u64 {
     if head == 0 || entry == 0 {
         return 0;
     }
-    unsafe {
+    let old_irql = hosted_driver_spin_lock::acquire_raise_to_dpc(lock);
+    let old_tail = unsafe {
         let old_tail = read_unaligned((head + 8) as *const u64);
         let tail = if old_tail == 0 { head } else { old_tail };
         list_insert_between(entry, tail, head);
         old_tail
-    }
+    };
+    hosted_driver_spin_lock::release_restore_irql(lock, old_irql);
+    old_tail
 }
 
 /// `PLIST_ENTRY ExInterlockedInsertHeadList(PLIST_ENTRY Head, PLIST_ENTRY Entry, PKSPIN_LOCK)`.
-extern "win64" fn s_ex_interlocked_insert_head_list(head: u64, entry: u64, _lock: u64) -> u64 {
+extern "win64" fn s_ex_interlocked_insert_head_list(head: u64, entry: u64, lock: u64) -> u64 {
     if head == 0 || entry == 0 {
         return 0;
     }
-    unsafe {
+    let old_irql = hosted_driver_spin_lock::acquire_raise_to_dpc(lock);
+    let old_head = unsafe {
         let old_head = read_unaligned(head as *const u64);
         let first = if old_head == 0 { head } else { old_head };
         list_insert_between(entry, head, first);
         old_head
-    }
+    };
+    hosted_driver_spin_lock::release_restore_irql(lock, old_irql);
+    old_head
 }
 
 /// `PLIST_ENTRY ExInterlockedRemoveHeadList(PLIST_ENTRY Head, PKSPIN_LOCK)`.
-extern "win64" fn s_ex_interlocked_remove_head_list(head: u64, _lock: u64) -> u64 {
+extern "win64" fn s_ex_interlocked_remove_head_list(head: u64, lock: u64) -> u64 {
     if head == 0 {
         return 0;
     }
-    unsafe {
+    let old_irql = hosted_driver_spin_lock::acquire_raise_to_dpc(lock);
+    let first = unsafe {
         let first = read_unaligned(head as *const u64);
         if first == 0 || first == head {
-            return 0;
+            0
+        } else {
+            let next = read_unaligned(first as *const u64);
+            write_unaligned(head as *mut u64, next);
+            write_unaligned((next + 8) as *mut u64, head);
+            write_unaligned(first as *mut u64, first);
+            write_unaligned((first + 8) as *mut u64, first);
+            first
         }
-        let next = read_unaligned(first as *const u64);
-        write_unaligned(head as *mut u64, next);
-        write_unaligned((next + 8) as *mut u64, head);
-        write_unaligned(first as *mut u64, first);
-        write_unaligned((first + 8) as *mut u64, first);
-        first
+    };
+    hosted_driver_spin_lock::release_restore_irql(lock, old_irql);
+    first
+}
+
+/// `PSINGLE_LIST_ENTRY ExInterlockedPopEntryList(PSINGLE_LIST_ENTRY, PKSPIN_LOCK)`.
+extern "win64" fn s_ex_interlocked_pop_entry_list(head: u64, lock: u64) -> u64 {
+    if head == 0 {
+        return 0;
     }
+    let old_irql = hosted_driver_spin_lock::acquire_raise_to_dpc(lock);
+    let first = unsafe { nt_kernel_exec::single_list::pop(head as *mut _) as u64 };
+    hosted_driver_spin_lock::release_restore_irql(lock, old_irql);
+    first
+}
+
+/// `PSINGLE_LIST_ENTRY ExInterlockedPushEntryList(PSINGLE_LIST_ENTRY, PSINGLE_LIST_ENTRY, PKSPIN_LOCK)`.
+extern "win64" fn s_ex_interlocked_push_entry_list(head: u64, entry: u64, lock: u64) -> u64 {
+    if head == 0 || entry == 0 {
+        return 0;
+    }
+    let old_irql = hosted_driver_spin_lock::acquire_raise_to_dpc(lock);
+    let previous =
+        unsafe { nt_kernel_exec::single_list::push(head as *mut _, entry as *mut _) as u64 };
+    hosted_driver_spin_lock::release_restore_irql(lock, old_irql);
+    previous
 }
 
 /// `LARGE_INTEGER ExInterlockedAddLargeInteger(PLARGE_INTEGER, LARGE_INTEGER, PKSPIN_LOCK)`.
 extern "win64" fn s_ex_interlocked_add_large_integer(
     addend: u64,
     increment: i64,
-    _lock: u64,
+    lock: u64,
 ) -> i64 {
-    unsafe {
-        if addend == 0 {
-            return 0;
-        }
-        let old = read_unaligned(addend as *const i64);
-        write_unaligned(addend as *mut i64, old.wrapping_add(increment));
-        old
+    if addend == 0 {
+        return 0;
     }
+    let old_irql = hosted_driver_spin_lock::acquire_raise_to_dpc(lock);
+    let old = unsafe {
+        nt_kernel_exec::interlocked_arithmetic::add_large_integer(addend as *mut i64, increment)
+    };
+    hosted_driver_spin_lock::release_restore_irql(lock, old_irql);
+    old
 }
 
 /// `ULONG ExInterlockedAddUlong(PULONG, ULONG, PKSPIN_LOCK)`.
-extern "win64" fn s_ex_interlocked_add_ulong(addend: u64, increment: u32, _lock: u64) -> u32 {
-    unsafe {
-        if addend == 0 {
-            return 0;
-        }
-        let old = read_unaligned(addend as *const u32);
-        write_unaligned(addend as *mut u32, old.wrapping_add(increment));
-        old
+extern "win64" fn s_ex_interlocked_add_ulong(addend: u64, increment: u32, lock: u64) -> u32 {
+    if addend == 0 {
+        return 0;
     }
+    let old_irql = hosted_driver_spin_lock::acquire_raise_to_dpc(lock);
+    let old = unsafe {
+        nt_kernel_exec::interlocked_arithmetic::add_ulong(addend as *mut u32, increment)
+    };
+    hosted_driver_spin_lock::release_restore_irql(lock, old_irql);
+    old
 }
 
 /// `VOID ExQueueWorkItem(PWORK_QUEUE_ITEM, WORK_QUEUE_TYPE)`.
@@ -36147,6 +36197,7 @@ fn register_fsd_trampolines() -> bool {
         hosted_synchronous_fsd_request::build as *const () as usize as u64,
     );
     hosted_partition_table::bind(reg);
+    hosted_disk_signature::bind(reg);
     reg.bind("IoCancelIrp", s_io_cancel_irp as *const () as usize as u64);
     reg.bind(
         "IoAcquireCancelSpinLock",
@@ -36195,6 +36246,10 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "IoRegisterDriverReinitialization",
         hosted_driver_reinitialization::register as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoRegisterBootDriverReinitialization",
+        hosted_boot_driver_reinitialization::register as *const () as usize as u64,
     );
     reg.bind(
         "IoGetAttachedDeviceReference",
@@ -36710,6 +36765,10 @@ fn register_fsd_trampolines() -> bool {
         hosted_driver_directory_object::zw_create_directory_object as *const () as usize as u64,
     );
     reg.bind(
+        "ZwMakeTemporaryObject",
+        hosted_driver_make_temporary::zw_make_temporary_object as *const () as usize as u64,
+    );
+    reg.bind(
         "ZwCreateEvent",
         hosted_driver_create_event::zw_create_event as *const () as usize as u64,
     );
@@ -36791,6 +36850,14 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "ExInterlockedRemoveHeadList",
         s_ex_interlocked_remove_head_list as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExInterlockedPopEntryList",
+        s_ex_interlocked_pop_entry_list as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExInterlockedPushEntryList",
+        s_ex_interlocked_push_entry_list as *const () as usize as u64,
     );
     reg.bind(
         "ExInterlockedAddLargeInteger",
@@ -38002,6 +38069,9 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
     }
     if major == FSD_DISPATCH_DRIVER_REINIT {
         return hosted_driver_reinitialization::component_dispatch();
+    }
+    if major == FSD_DISPATCH_BOOT_DRIVER_REINIT {
+        return hosted_boot_driver_reinitialization::component_dispatch();
     }
     if major == FSD_DISPATCH_PNP_NOTIFICATION {
         return hosted_driver_pnp_notification::component_dispatch();
@@ -43092,8 +43162,20 @@ pub(crate) fn print_mounted_native_block_census() {
     mounted_native_block::print_census();
 }
 
+pub(crate) unsafe fn run_pending_boot_callbacks() -> Result<usize, nt_status::NtStatus> {
+    hosted_boot_driver_reinitialization::run_pending_boot_callbacks()
+}
+
+pub(crate) unsafe fn run_pending_ordinary_callbacks() -> Result<usize, nt_status::NtStatus> {
+    hosted_driver_reinitialization::run_pending_ordinary_callbacks()
+}
+
 pub(crate) fn print_mounted_native_block_quiesce_snapshot() {
     mounted_native_block::print_quiesce_snapshot();
+}
+
+pub(crate) fn mounted_native_physical_irp_pending() -> bool {
+    mounted_native_block::pending_physical_irp()
 }
 
 /// Consume the manager's complete durable-allocation signal. Unlike the pump
@@ -54565,6 +54647,10 @@ pub(crate) unsafe fn claim_hosted_critical_child_start_ready(
     hosted_critical_child_starts_mut().claim_next_ready(pnp, relations, mount_identity, ready)
 }
 
+pub(crate) unsafe fn hosted_critical_child_start_pending() -> bool {
+    hosted_critical_child_starts_mut().has_unresolved()
+}
+
 pub(crate) unsafe fn hosted_critical_child_instance_id(
     claim: nt_pnp_manager::CriticalChildStartClaim,
 ) -> Option<&'static str> {
@@ -58784,6 +58870,7 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_START_NEXT_PACKET
             | HOSTED_DEVICE_OP_START_NEXT_PACKET_CALLBACK_RETURNED
             | HOSTED_DEVICE_OP_REGISTER_DRIVER_REINIT
+            | HOSTED_DEVICE_OP_REGISTER_BOOT_DRIVER_REINIT
             | HOSTED_DEVICE_OP_GET_INTERFACE_BEGIN
             | HOSTED_DEVICE_OP_GET_INTERFACE_PULL
             | HOSTED_DEVICE_OP_GET_INTERFACE_ABORT
@@ -58838,6 +58925,14 @@ pub(crate) fn service_hosted_device(
             0,
             0,
             0,
+        );
+    }
+    if op == HOSTED_DEVICE_OP_REGISTER_BOOT_DRIVER_REINIT {
+        return (
+            hosted_boot_driver_reinitialization::service_register(
+                ch, pdo_object, arg2, arg3, active_reply_cap,
+            ),
+            0, 0, 0,
         );
     }
     if op == HOSTED_DEVICE_OP_INVALIDATE_STATE {

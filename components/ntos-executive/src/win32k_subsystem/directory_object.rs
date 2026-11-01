@@ -17,6 +17,7 @@ const QUERY_SINGLE_CONTINUE: u64 = 11;
 const QUERY_SINGLE_RESTART: u64 = 12;
 const QUERY_READ: u64 = 13;
 const QUERY_ACK: u64 = 14;
+const MAKE_TEMPORARY: u64 = 15;
 const MAX_NAME_UNITS: usize = 1024;
 const MAX_COMPONENT_UNITS: usize = 128;
 const STATUS_OBJECT_NAME_INVALID: i32 = 0xC000_0033u32 as i32;
@@ -211,6 +212,10 @@ pub(super) extern "win64" fn open(
 
 pub(super) unsafe fn close(handle: u64) -> i32 {
     call(CLOSE, handle, 0, 0, false).0
+}
+
+pub(crate) fn make_temporary_with_label(label: u64, handle: u64) -> i32 {
+    unsafe { call_with_label(label, MAKE_TEMPORARY, handle, 0, 0, false).0 }
 }
 
 unsafe fn query_call(op: u64, first: u64, second: u64, third: u64) -> (i32, u64, u64, u64) {

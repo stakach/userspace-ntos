@@ -5,6 +5,21 @@ use crate::{
 };
 
 #[test]
+fn disk_metadata_read_overrides_verify_volume_without_changing_source_buffers() {
+    let ordinary = plan_synchronous_fsd_request(
+        major::IRP_MJ_READ, 2, DO_DIRECT_IO, 0x1000, 0x2000, 512, Some(0),
+    ).unwrap();
+    let metadata = plan_disk_metadata_read(
+        2, DO_DIRECT_IO, 0x1000, 0x2000, 512, 0,
+    ).unwrap();
+    assert_eq!(ordinary.stack.flags & 0x02, 0);
+    assert_eq!(metadata.stack.flags & 0x02, 0x02);
+    assert_eq!(metadata.stack.parameters, ordinary.stack.parameters);
+    assert_eq!(metadata.mdl, ordinary.mdl);
+    assert_eq!(metadata.user_buffer, ordinary.user_buffer);
+}
+
+#[test]
 fn dispatch_cursor_stays_inside_the_exact_source_irp_stack() {
     let base = 0x1000_2000;
     let count = 2;

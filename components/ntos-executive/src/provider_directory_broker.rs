@@ -285,6 +285,11 @@ impl Broker {
                 handler.close_provider_directory_object(caller, m1)?;
                 Ok((0, 0, 0, 0))
             }
+            15 => {
+                if m2 != 0 || m3 != 0 { return Err(STATUS_INVALID_PARAMETER); }
+                handler.make_temporary_provider_directory_object(caller, m1)?;
+                Ok((0, 0, 0, 0))
+            }
             9..=12 => {
                 let length = m3 as u32 as usize;
                 let context = (m3 >> 32) as u32;

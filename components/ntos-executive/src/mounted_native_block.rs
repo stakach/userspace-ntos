@@ -221,11 +221,28 @@ struct Pending {
 static mut PENDING: Option<Pending> = None;
 static mut SNAPSHOT_FIRST: bool = false;
 
+pub(super) fn pending_physical_irp() -> bool {
+    unsafe { (&*core::ptr::addr_of!(PENDING)).as_ref()
+        .is_some_and(|pending| pending.irp.raw() != 0) }
+}
+
 pub(super) fn print_quiesce_snapshot() {
     print_str(b"[quiesce-native-block] mounted-read-outstanding=");
     print_u64(crate::mounted_volume::mounted_read_outstanding() as u64);
     print_str(b" physical-pending-irp=");
-    print_u64(NATIVE_PENDING_IRP.load(Ordering::Acquire));
+    let pending_irp = NATIVE_PENDING_IRP.load(Ordering::Acquire);
+    print_u64(pending_irp);
+    if pending_irp != 0 {
+        print_str(b" source=");
+        print_str(if NATIVE_PENDING_SOURCE.load(Ordering::Relaxed) == 0 {
+            b"fat".as_slice()
+        } else { b"snapshot".as_slice() });
+        print_str(b" bytes=");
+        print_u64(NATIVE_PENDING_BYTES.load(Ordering::Relaxed));
+        print_str(b" outstanding-Mtick=");
+        print_u64(crate::disk_census_ticks().wrapping_sub(
+            NATIVE_PENDING_STARTED.load(Ordering::Relaxed)) / 1_000_000);
+    }
     print_str(b"\n");
 }
 

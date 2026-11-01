@@ -203,6 +203,26 @@ impl ExecNtHandler {
         Ok(())
     }
 
+    pub(crate) fn make_temporary_provider_directory_object(
+        &mut self,
+        caller: nt_process::native_handle::NativeHandleCaller,
+        handle: u64,
+    ) -> Result<(), u32> {
+        const DELETE_ACCESS: u32 = 0x0001_0000;
+        let identity = self.pm.lookup_native_object_directory_handle(
+            caller, handle, DELETE_ACCESS,
+        )?;
+        let index = self.directory_namespace_index_for_identity(identity)?;
+        let entry = self.obj_ns.get_mut(index).ok_or(0xC000_0008u32)?;
+        if !entry.is_live() || entry.kind != OBJ_KIND_DIRECTORY || entry.identity != identity {
+            return Err(0xC000_0008);
+        }
+        // The handle still owns the body. Its eventual close removes the nonpermanent name
+        // once child and wait references have released their exact directory identity.
+        entry.permanent = false;
+        Ok(())
+    }
+
     pub(crate) fn abort_staged_directory_object_open(
         &mut self,
         staged: &mut StagedDirectoryObjectOpen,

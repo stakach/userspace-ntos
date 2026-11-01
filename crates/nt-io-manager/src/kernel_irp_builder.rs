@@ -15,6 +15,7 @@ pub const DO_DIRECT_IO: u32 = 0x0000_0010;
 pub const IRP_BUFFERED_IO: u32 = 0x0000_0010;
 pub const IRP_DEALLOCATE_BUFFER: u32 = 0x0000_0020;
 pub const IRP_INPUT_OPERATION: u32 = 0x0000_0040;
+pub const SL_OVERRIDE_VERIFY_VOLUME: u8 = 0x02;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelIrpPlanError {
@@ -224,6 +225,24 @@ pub fn plan_synchronous_fsd_request(
             plan.user_buffer = buffer;
         }
     }
+    Ok(plan)
+}
+
+/// A kernel disk-metadata read must bypass a stale volume-verification gate so
+/// partition and signature discovery can inspect the device's real sectors.
+pub fn plan_disk_metadata_read(
+    stack_size: u8,
+    device_flags: u32,
+    device_object: u64,
+    buffer: u64,
+    length: u32,
+    byte_offset: u64,
+) -> Result<KernelBuiltIrpPlan, KernelIrpPlanError> {
+    let mut plan = plan_synchronous_fsd_request(
+        major::IRP_MJ_READ, stack_size, device_flags,
+        device_object, buffer, length, Some(byte_offset),
+    )?;
+    plan.stack.flags |= SL_OVERRIDE_VERIFY_VOLUME;
     Ok(plan)
 }
 

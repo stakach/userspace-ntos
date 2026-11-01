@@ -87,6 +87,10 @@ impl CriticalChildStartQueue {
         }
     }
 
+    pub fn has_unresolved(&self) -> bool {
+        self.entries.iter().any(|entry| !matches!(entry.state, CriticalChildStartState::Retired(_)))
+    }
+
     /// Reserve queue storage before publishing a relation whose child must be started.
     pub fn reserve_capacity(&mut self, additional: usize) -> Result<(), CriticalChildStartError> {
         self.entries
@@ -485,6 +489,21 @@ mod tests {
         PnpBusInformation, PropertyBlobState, GUID_BUS_TYPE_PCI, INTERFACE_TYPE_PCI_BUS,
     };
     use alloc::vec;
+
+    #[test]
+    fn boot_callback_fence_waits_for_exact_critical_start_terminal() {
+        let (pnp, relations, pdo, instance_id) = committed_child();
+        let mut queue = CriticalChildStartQueue::new();
+        assert!(!queue.has_unresolved());
+        queue.reserve_committed(&pnp, &relations, 7, pdo, &instance_id).unwrap();
+        assert!(queue.has_unresolved());
+        let claim = queue.claim_next(&pnp, &relations, 7).unwrap().unwrap();
+        assert!(queue.has_unresolved());
+        queue.complete(claim, 0).unwrap();
+        assert!(queue.has_unresolved());
+        queue.retire(claim).unwrap();
+        assert!(!queue.has_unresolved());
+    }
 
     fn committed_children(include_second: bool) -> (PnpManager, BusRelationTable, Vec<(u64, String)>) {
         let mut pnp = PnpManager::new();

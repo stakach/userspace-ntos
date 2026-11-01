@@ -6,7 +6,8 @@
 
 use super::*;
 use nt_io_manager::kernel_irp_builder::{
-    plan_device_io_control_request, plan_synchronous_fsd_request, plan_wmi_reginfo_request,
+    plan_device_io_control_request, plan_disk_metadata_read, plan_synchronous_fsd_request,
+    plan_wmi_reginfo_request,
     KernelBuiltIrpPlan, MdlAccess,
 };
 
@@ -180,38 +181,52 @@ pub(super) extern "win64" fn build(
         ) else {
             return 0;
         };
-        let Some(mut request) = UnpublishedRequest::allocate(plan.stack_count) else {
-            return 0;
-        };
-
-        if plan.system_buffer_len != 0 {
-            if !request.allocate_system_buffer(plan.system_buffer_len) {
-                return 0;
-            }
-            if plan.system_buffer_input_len != 0 {
-                core::ptr::copy_nonoverlapping(
-                    plan.system_buffer_input as *const u8,
-                    request.system_buffer as *mut u8,
-                    plan.system_buffer_input_len as usize,
-                );
-            }
-        }
-        if let Some(mdl) = plan.mdl {
-            if !request.allocate_mdl(mdl.buffer, mdl.length, mdl.access) {
-                return 0;
-            }
-        }
-
-        let stack = request.irp + plan.next_stack_offset as u64;
-        let stack_bytes = core::slice::from_raw_parts_mut(
-            stack as *mut u8,
-            WDM_X64_IO_STACK_LOCATION_SIZE,
-        );
-        if write_wdm_io_stack_location(stack_bytes, plan.stack).is_err() {
-            return 0;
-        }
-        request.publish(plan, event, iosb)
+        materialize_fsd_plan(plan, event, iosb)
     }
+}
+
+/// Build a sector read for disk identity/partition inspection. The distinct
+/// planner marks the next stack with `SL_OVERRIDE_VERIFY_VOLUME` before the
+/// source IRP is published or dispatched.
+pub(super) unsafe fn build_disk_metadata_read(
+    device: u64,
+    buffer: u64,
+    length: u32,
+    byte_offset: u64,
+    event: u64,
+    iosb: u64,
+) -> u64 {
+    if device == 0 || buffer == 0 || length == 0 || event == 0 || iosb == 0 {
+        return 0;
+    }
+    let Some((stack_count, device_flags)) = device_contract(device) else { return 0; };
+    let Ok(plan) = plan_disk_metadata_read(
+        stack_count, device_flags, device, buffer, length, byte_offset,
+    ) else { return 0; };
+    materialize_fsd_plan(plan, event, iosb)
+}
+
+unsafe fn materialize_fsd_plan(plan: KernelBuiltIrpPlan, event: u64, iosb: u64) -> u64 {
+    let Some(mut request) = UnpublishedRequest::allocate(plan.stack_count) else { return 0; };
+    if plan.system_buffer_len != 0 {
+        if !request.allocate_system_buffer(plan.system_buffer_len) { return 0; }
+        if plan.system_buffer_input_len != 0 {
+            core::ptr::copy_nonoverlapping(
+                plan.system_buffer_input as *const u8,
+                request.system_buffer as *mut u8,
+                plan.system_buffer_input_len as usize,
+            );
+        }
+    }
+    if let Some(mdl) = plan.mdl {
+        if !request.allocate_mdl(mdl.buffer, mdl.length, mdl.access) { return 0; }
+    }
+    let stack = request.irp + plan.next_stack_offset as u64;
+    let stack_bytes = core::slice::from_raw_parts_mut(
+        stack as *mut u8, WDM_X64_IO_STACK_LOCATION_SIZE,
+    );
+    if write_wdm_io_stack_location(stack_bytes, plan.stack).is_err() { return 0; }
+    request.publish(plan, event, iosb)
 }
 
 /// Build a driver-local device-control IRP with the same source-ledger publication

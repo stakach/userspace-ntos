@@ -12,10 +12,10 @@ const IO_DEVICE_ERROR: i32 = 0xc000_0185u32 as i32;
 
 /// Keep the exact canonical device incarnation alive across geometry, all sector reads, and
 /// result publication. The root reference service validates domain, generation, and type.
-struct ReferencedDevice(u64);
+pub(super) struct ReferencedDevice(u64);
 
 impl ReferencedDevice {
-    fn acquire(device: u64) -> Result<Self, i32> {
+    pub(super) fn acquire(device: u64) -> Result<Self, i32> {
         let status = hosted_driver_object_reference::ob_reference_object_by_pointer(
             device, 0, 0, 0,
         );
@@ -29,7 +29,7 @@ impl Drop for ReferencedDevice {
     }
 }
 
-struct PartitionIo {
+pub(super) struct PartitionIo {
     buffer: u64,
     event: u64,
     iosb: u64,
@@ -37,7 +37,7 @@ struct PartitionIo {
 }
 
 impl PartitionIo {
-    unsafe fn new(capacity: u32) -> Option<Self> {
+    pub(super) unsafe fn new(capacity: u32) -> Option<Self> {
         if capacity == 0 { return None; }
         let buffer = pool_alloc_zeroed(u64::from(capacity));
         if buffer == 0 { return None; }
@@ -105,16 +105,15 @@ impl PartitionIo {
         Ok((sector_bytes, disk_bytes / u64::from(sector_bytes)))
     }
 
-    unsafe fn read_sector(
+    pub(super) unsafe fn read_sector(
         &mut self, device: u64, lba: u64, out: &mut [u8],
     ) -> Result<(), i32> {
         if out.len() != self.capacity as usize { return Err(STATUS_INVALID_PARAMETER); }
         let offset = lba.checked_mul(u64::from(self.capacity))
             .ok_or(STATUS_INVALID_PARAMETER)?;
         self.prepare();
-        let irp = hosted_synchronous_fsd_request::build(
-            u32::from(major::IRP_MJ_READ), device, self.buffer, self.capacity,
-            &offset as *const u64 as u64, self.event, self.iosb,
+        let irp = hosted_synchronous_fsd_request::build_disk_metadata_read(
+            device, self.buffer, self.capacity, offset, self.event, self.iosb,
         );
         if irp == 0 { return Err(STATUS_INSUFFICIENT_RESOURCES); }
         let information = self.dispatch(device, irp)?;

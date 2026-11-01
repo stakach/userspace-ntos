@@ -9623,6 +9623,7 @@ pub(crate) unsafe fn service_sec_image(
                 )
                 && !defer_quiesce_for_active_user_callbacks(b"all-live-parked")
                 && !crate::mounted_volume::mounted_read_outstanding()
+                && !driver_launch::mounted_native_physical_irp_pending()
             {
                 print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
                 stop = $ip as u64;
@@ -9757,6 +9758,7 @@ pub(crate) unsafe fn service_sec_image(
                 && !driver_launch::native_disk_proof_hardware_irp_pending()
                 && !driver_launch::active_relation_wal_retained()
                 && !crate::mounted_volume::mounted_read_outstanding()
+                && !driver_launch::mounted_native_physical_irp_pending()
                 && crate::registry_mutation_work::next_deadline().is_none()
                 && crate::mutable_hive_mutation_work::next_deadline().is_none()
                 && crate::section_metadata_work::next_deadline().is_none()
@@ -11974,6 +11976,7 @@ pub(crate) unsafe fn service_sec_image(
                         && !driver_launch::native_disk_proof_hardware_irp_pending()
                         && !driver_launch::active_relation_wal_retained()
                         && !crate::mounted_volume::mounted_read_outstanding()
+                        && !driver_launch::mounted_native_physical_irp_pending()
                     {
                         driver_launch::print_mounted_native_block_quiesce_snapshot();
                         print_str(b"[quiesce] every live process parked/waiting (no signaler left) -> run gate\n");
@@ -26543,7 +26546,7 @@ unsafe fn pump_hosted_io_and_redrive_driver_starts(
     if crate::config_manager_take_device_action_wake() {
         nt_handler.pnp_signal_pending_action();
     }
-    let progress = activated
+    let mut progress = activated
         .saturating_add(retired)
         .saturating_add(video_retired)
         .saturating_add(serviced)
@@ -26552,6 +26555,24 @@ unsafe fn pump_hosted_io_and_redrive_driver_starts(
         .saturating_add(pending_driver_start_redrive_all(nt_handler))
         .saturating_add(start_committed_critical_children(nt_handler))
         .saturating_add(pending_pnp_operation_redrive_all(nt_handler));
+    // Deferred bus relations can load another boot-start driver after the initial plan loop.
+    // Dispatch boot callbacks only at a turn with no relation or START admission in flight;
+    // keep the boot phase open so a later exact registration is still owned and dispatched.
+    if !hosted_pnp_start::hosted_start_batch_drive_active()
+        && !driver_launch::hosted_bus_relation_pending()
+        && !driver_launch::hosted_critical_child_start_pending()
+        && nt_handler.pending_driver_starts.occupied_slots().next().is_none()
+        && nt_handler.pending_pnp_operations.occupied_slots().next().is_none()
+    {
+        progress = progress.saturating_add(
+            driver_launch::run_pending_boot_callbacks()
+                .expect("boot driver reinitialization lost its exact callback terminal") as u64,
+        );
+        progress = progress.saturating_add(
+            driver_launch::run_pending_ordinary_callbacks()
+                .expect("driver reinitialization lost its exact callback terminal") as u64,
+        );
+    }
     if progress != 0 {
         FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
     }
