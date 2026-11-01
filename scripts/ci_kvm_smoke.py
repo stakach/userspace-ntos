@@ -204,25 +204,25 @@ def read_host_state(process_group):
     return state
 
 
+def published_storahci_abars(serial):
+    """Return each published controller BAR once, in discovery order."""
+    matches = re.finditer(
+        rb"assigned PCI resources service=storahci[^\r\n]*mmio=0x(?:0x)?([0-9a-fA-F]+)",
+        serial,
+    )
+    return list(dict.fromkeys(int(match.group(1), 16) for match in matches))
+
+
 def capture_stall_state(path=STALL_STATE):
     """Keep per-CPU and AHCI register evidence at a proof frontier or stall."""
     state = read_cpu_state()
-    # The AHCI controller's published PCI BAR is evidence of the actual hardware route.
+    # Every published AHCI BAR is evidence: a boot may enumerate multiple controllers,
+    # and the last one in the serial log need not own the mounted volume.
     # Read controller registers through QMP without changing the guest or its disk.
     try:
         serial = LOG.read_bytes()
-        matches = list(re.finditer(
-            rb"assigned PCI resources service=storahci[^\r\n]*mmio=0x(?:0x)?([0-9a-fA-F]+)",
-            serial,
-        ))
-        if matches:
-            abar = int(matches[-1].group(1), 16)
-            registers = {
-                "hba": (abar, 4),  # CAP, GHC, IS, PI
-                "port0_status": (abar + 0x110, 3),  # PxIS, PxIE, PxCMD
-                "port0_task": (abar + 0x120, 1),  # PxTFD
-                "port0_error": (abar + 0x130, 3),  # PxSERR, PxSACT, PxCI
-            }
+        bars = published_storahci_abars(serial)
+        if bars:
             with socket.socket(socket.AF_UNIX) as connection:
                 connection.settimeout(3)
                 connection.connect(str(QMP_SOCKET))
@@ -232,14 +232,23 @@ def capture_stall_state(path=STALL_STATE):
                         raise RuntimeError("QMP greeting missing")
                     stream.write(b'{"execute":"qmp_capabilities","id":"capabilities"}\n')
                     qmp_reply(stream, "capabilities")
-                    state["ahci"] = {"abar": abar, "registers": {}}
-                    for name, (address, count) in registers.items():
-                        command_id = f"ahci-{name}"
-                        command = {"execute": "human-monitor-command", "arguments": {
-                            "command-line": f"xp /{count}wx 0x{address:x}"
-                        }, "id": command_id}
-                        stream.write((json.dumps(command) + "\n").encode())
-                        state["ahci"]["registers"][name] = qmp_reply(stream, command_id)["return"]
+                    state["ahci"] = {"controllers": []}
+                    for abar in bars:
+                        controller = {"abar": abar, "registers": {}}
+                        state["ahci"]["controllers"].append(controller)
+                        registers = {
+                            "hba": (abar, 4),  # CAP, GHC, IS, PI
+                            "port0_status": (abar + 0x110, 3),  # PxIS, PxIE, PxCMD
+                            "port0_task": (abar + 0x120, 1),  # PxTFD
+                            "port0_error": (abar + 0x130, 3),  # PxSERR, PxSACT, PxCI
+                        }
+                        for name, (address, count) in registers.items():
+                            command_id = f"ahci-{abar:x}-{name}"
+                            command = {"execute": "human-monitor-command", "arguments": {
+                                "command-line": f"xp /{count}wx 0x{address:x}"
+                            }, "id": command_id}
+                            stream.write((json.dumps(command) + "\n").encode())
+                            controller["registers"][name] = qmp_reply(stream, command_id)["return"]
     except (OSError, RuntimeError, ValueError, KeyError) as error:
         state["ahci_error"] = str(error)
     path.write_text(json.dumps(state, indent=2) + "\n")

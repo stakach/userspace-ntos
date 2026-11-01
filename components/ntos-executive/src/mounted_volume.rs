@@ -81,6 +81,13 @@ pub(crate) fn claim_mounted_read_sectors() -> Option<crate::mounted_volume_backe
     claim
 }
 
+/// A retained installed READ can wake its parked caller even before it claims a sector or
+/// enters the physical SCSI route. Keep the exact completion owner in the no-signaler gate.
+pub(crate) fn mounted_read_outstanding() -> bool {
+    unsafe { (&*core::ptr::addr_of!(MOUNT_READ_QUEUE)).as_ref()
+        .is_some_and(|queue| queue.borrow().has_outstanding()) }
+}
+
 pub(crate) fn complete_mounted_read_sectors(
     claim: crate::mounted_volume_backend::mounted_installed_read::ReadSectorClaim,
     sectors: Result<&[u8], nt_fs::FatPathError>,

@@ -221,6 +221,14 @@ struct Pending {
 static mut PENDING: Option<Pending> = None;
 static mut SNAPSHOT_FIRST: bool = false;
 
+pub(super) fn print_quiesce_snapshot() {
+    print_str(b"[quiesce-native-block] mounted-read-outstanding=");
+    print_u64(crate::mounted_volume::mounted_read_outstanding() as u64);
+    print_str(b" physical-pending-irp=");
+    print_u64(NATIVE_PENDING_IRP.load(Ordering::Acquire));
+    print_str(b"\n");
+}
+
 fn next_sector_claim() -> Option<WorkClaim> {
     crate::mounted_volume::claim_mounted_create_sector()
         .map(SectorClaim::Create)

@@ -9622,6 +9622,7 @@ pub(crate) unsafe fn service_sec_image(
                     b"all-live-parked",
                 )
                 && !defer_quiesce_for_active_user_callbacks(b"all-live-parked")
+                && !crate::mounted_volume::mounted_read_outstanding()
             {
                 print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
                 stop = $ip as u64;
@@ -9755,6 +9756,7 @@ pub(crate) unsafe fn service_sec_image(
                 && !defer_quiesce_for_active_user_callbacks(b"all-live-waiting")
                 && !driver_launch::native_disk_proof_hardware_irp_pending()
                 && !driver_launch::active_relation_wal_retained()
+                && !crate::mounted_volume::mounted_read_outstanding()
                 && crate::registry_mutation_work::next_deadline().is_none()
                 && crate::mutable_hive_mutation_work::next_deadline().is_none()
                 && crate::section_metadata_work::next_deadline().is_none()
@@ -9762,6 +9764,7 @@ pub(crate) unsafe fn service_sec_image(
                 && crate::provider_section_broker::next_deadline().is_none()
             {
                 unsafe { driver_launch::print_hosted_pnp_enumeration_evidence(); }
+                driver_launch::print_mounted_native_block_quiesce_snapshot();
                 print_str(
                     b"[quiesce] every live process parked/waiting (no signaler left) -> run gate\n",
                 );
@@ -11970,7 +11973,9 @@ pub(crate) unsafe fn service_sec_image(
                         && !defer_quiesce_for_active_user_callbacks(b"lsass-post-signal-fault")
                         && !driver_launch::native_disk_proof_hardware_irp_pending()
                         && !driver_launch::active_relation_wal_retained()
+                        && !crate::mounted_volume::mounted_read_outstanding()
                     {
+                        driver_launch::print_mounted_native_block_quiesce_snapshot();
                         print_str(b"[quiesce] every live process parked/waiting (no signaler left) -> run gate\n");
                         stop = addr;
                         break;

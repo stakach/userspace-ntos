@@ -43092,6 +43092,10 @@ pub(crate) fn print_mounted_native_block_census() {
     mounted_native_block::print_census();
 }
 
+pub(crate) fn print_mounted_native_block_quiesce_snapshot() {
+    mounted_native_block::print_quiesce_snapshot();
+}
+
 /// Consume the manager's complete durable-allocation signal. Unlike the pump
 /// report, this includes canonical driver/device/File/IRP/domain records and
 /// their record-owned heap data regardless of which operation created them.
