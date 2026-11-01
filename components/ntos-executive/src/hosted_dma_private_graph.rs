@@ -5,7 +5,25 @@ use super::*;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind { Map, ScatterGatherOwned, ScatterGatherBorrowed }
 
-struct Mapping { id: u64, logical: u64, backing: u64, length: u64, released: bool }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DmaPrivateMappingId {
+    Transfer(u64),
+    Coherent(nt_dma_manager::CoherentReservationAlias),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum DmaPrivateMappingKind { Transfer, Coherent }
+
+impl DmaPrivateMappingId {
+    fn kind(self) -> DmaPrivateMappingKind {
+        match self {
+            Self::Transfer(_) => DmaPrivateMappingKind::Transfer,
+            Self::Coherent(_) => DmaPrivateMappingKind::Coherent,
+        }
+    }
+}
+
+struct Mapping { id: DmaPrivateMappingId, logical: u64, backing: u64, length: u64, released: bool }
 struct Graph {
     instance: DriverInstance,
     domain: HostedDomainIdentity,
@@ -168,9 +186,9 @@ pub(super) unsafe fn provision(
 /// returns its saved mapping ID; a different mapping for one token is a new row member.
 pub(super) unsafe fn record_mapping(
     inst: DriverInstance, lease_id: u64, map: u64,
-    logical: u64, backing: u64, length: u64,
-    register: impl FnOnce() -> Result<u64, nt_status::NtStatus>,
-) -> Result<u64, nt_status::NtStatus> {
+    logical: u64, backing: u64, length: u64, kind: DmaPrivateMappingKind,
+    register: impl FnOnce() -> Result<DmaPrivateMappingId, nt_status::NtStatus>,
+) -> Result<DmaPrivateMappingId, nt_status::NtStatus> {
     let _durable = crate::allocator::enter_durable();
     let _catalog = lock();
     let domain = validate_arena(inst)?;
@@ -185,7 +203,8 @@ pub(super) unsafe fn record_mapping(
         || logical == 0 || backing == 0 || length == 0 {
         return Err(nt_status::NtStatus::INVALID_HANDLE);
     }
-    let exact = |mapping: &Mapping| !mapping.released && mapping.logical == logical
+    let exact = |mapping: &Mapping| !mapping.released && mapping.id.kind() == kind
+        && mapping.logical == logical
         && mapping.backing == backing && mapping.length == length;
     if let Some(mapping) = graphs()[index].mappings.iter().find(|mapping| exact(mapping)) {
         return Ok(mapping.id);
@@ -198,15 +217,19 @@ pub(super) unsafe fn record_mapping(
     graphs()[index].mappings.try_reserve(1)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let id = register()?;
-    if !graphs()[index].mappings.iter().any(|mapping| mapping.id == id) {
-        graphs()[index].mappings.push(Mapping { id, logical, backing, length, released: false });
+    // The manager grants a unique typed ID for each effect. A duplicate ID does not name a
+    // second releasable effect, so never add another release row for it.
+    if id.kind() != kind || graphs()[index].mappings.iter().any(|mapping| mapping.id == id) {
+        return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
     }
+    graphs()[index].mappings.push(Mapping { id, logical, backing, length, released: false });
     Ok(id)
 }
 
 pub(super) unsafe fn mapping_receipt(
     inst: DriverInstance, map: u64, logical: u64, backing: u64, length: u64,
-) -> Option<(u64, u64)> {
+    kind: DmaPrivateMappingKind,
+) -> Option<(u64, DmaPrivateMappingId)> {
     let _catalog = lock();
     let domain = validate_arena(inst).ok()?;
     let _pool = hosted_instance_pool_lock(inst.exec_pool_va)?;
@@ -217,6 +240,7 @@ pub(super) unsafe fn mapping_receipt(
         return None;
     }
     let mapping = row.mappings.iter().find(|mapping| !mapping.released
+        && mapping.id.kind() == kind
         && mapping.logical == logical && mapping.backing == backing
         && mapping.length == length)?;
     Some((row.lease_id, mapping.id))
@@ -224,7 +248,7 @@ pub(super) unsafe fn mapping_receipt(
 
 unsafe fn release_mappings(
     row: &mut Graph,
-    release: &mut impl FnMut(u64) -> Result<(), nt_status::NtStatus>,
+    release: &mut impl FnMut(DmaPrivateMappingId) -> Result<(), nt_status::NtStatus>,
 ) -> Result<(), nt_status::NtStatus> {
     for mapping in &mut row.mappings {
         if !mapping.released {
@@ -238,7 +262,7 @@ unsafe fn release_mappings(
 
 unsafe fn retire_index(
     inst: DriverInstance, index: usize, whole_graph: bool,
-    release: &mut impl FnMut(u64) -> Result<(), nt_status::NtStatus>,
+    release: &mut impl FnMut(DmaPrivateMappingId) -> Result<(), nt_status::NtStatus>,
 ) -> Result<(), nt_status::NtStatus> {
     let row = &graphs()[index];
     for member in [row.map.filter(|_| !row.map_freed),
@@ -299,7 +323,7 @@ unsafe fn retire_index(
 
 pub(super) unsafe fn retire(
     inst: DriverInstance, lease_id: u64, address: u64, whole_graph: bool,
-    mut release: impl FnMut(u64) -> Result<(), nt_status::NtStatus>,
+    mut release: impl FnMut(DmaPrivateMappingId) -> Result<(), nt_status::NtStatus>,
 ) -> Result<(), nt_status::NtStatus> {
     let _durable = crate::allocator::enter_durable();
     let _catalog = lock();
@@ -346,7 +370,7 @@ pub(super) unsafe fn sg_members(
 
 pub(super) unsafe fn retire_lease(
     inst: DriverInstance, lease_id: u64,
-    mut release: impl FnMut(u64) -> Result<(), nt_status::NtStatus>,
+    mut release: impl FnMut(DmaPrivateMappingId) -> Result<(), nt_status::NtStatus>,
 ) -> Result<(), nt_status::NtStatus> {
     let _durable = crate::allocator::enter_durable();
     let _catalog = lock();

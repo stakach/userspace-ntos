@@ -10,6 +10,8 @@ mod dma_adapter_pair;
 #[path = "hosted_dma_private_graph.rs"]
 mod dma_private_graph;
 pub(super) use dma_private_graph::Kind as DmaPrivateKind;
+pub(super) use dma_private_graph::DmaPrivateMappingId;
+use dma_private_graph::DmaPrivateMappingKind;
 #[path = "hosted_interrupt_projection.rs"]
 mod interrupt_projection;
 
@@ -118,18 +120,61 @@ pub(super) unsafe fn record_dma_private_mapping(
     backing: u64, length: u64,
     register: impl FnOnce() -> Result<u64, nt_status::NtStatus>,
 ) -> Result<u64, nt_status::NtStatus> {
-    dma_private_graph::record_mapping(inst, lease_id, map, logical, backing, length, register)
+    match dma_private_graph::record_mapping(inst, lease_id, map, logical, backing, length,
+        DmaPrivateMappingKind::Transfer,
+        || register().map(DmaPrivateMappingId::Transfer))? {
+        DmaPrivateMappingId::Transfer(id) => Ok(id),
+        DmaPrivateMappingId::Coherent(_) => Err(nt_status::NtStatus::INVALID_HANDLE),
+    }
+}
+
+pub(super) unsafe fn record_dma_private_coherent_alias(
+    inst: DriverInstance, lease_id: u64, map: u64, logical: u64,
+    backing: u64, length: u64,
+    register: impl FnOnce() -> Result<nt_dma_manager::CoherentReservationAlias, nt_status::NtStatus>,
+) -> Result<nt_dma_manager::CoherentReservationAlias, nt_status::NtStatus> {
+    match dma_private_graph::record_mapping(inst, lease_id, map, logical, backing, length,
+        DmaPrivateMappingKind::Coherent,
+        || register().map(DmaPrivateMappingId::Coherent))? {
+        DmaPrivateMappingId::Coherent(alias) => Ok(alias),
+        DmaPrivateMappingId::Transfer(_) => Err(nt_status::NtStatus::INVALID_HANDLE),
+    }
 }
 
 pub(super) unsafe fn dma_private_mapping_receipt(
     inst: DriverInstance, map: u64, logical: u64, backing: u64, length: u64,
 ) -> Option<(u64, u64)> {
-    dma_private_graph::mapping_receipt(inst, map, logical, backing, length)
+    match dma_private_graph::mapping_receipt(inst, map, logical, backing, length,
+        DmaPrivateMappingKind::Transfer)? {
+        (lease, DmaPrivateMappingId::Transfer(id)) => Some((lease, id)),
+        (_, DmaPrivateMappingId::Coherent(_)) => None,
+    }
+}
+
+pub(super) unsafe fn dma_private_coherent_alias_receipt(
+    inst: DriverInstance, map: u64, logical: u64, backing: u64, length: u64,
+) -> Option<(u64, nt_dma_manager::CoherentReservationAlias)> {
+    match dma_private_graph::mapping_receipt(inst, map, logical, backing, length,
+        DmaPrivateMappingKind::Coherent)? {
+        (lease, DmaPrivateMappingId::Coherent(alias)) => Some((lease, alias)),
+        (_, DmaPrivateMappingId::Transfer(_)) => None,
+    }
 }
 
 pub(super) unsafe fn retire_dma_private_graph(
     inst: DriverInstance, lease_id: u64, address: u64, whole_graph: bool,
     release: impl FnMut(u64) -> Result<(), nt_status::NtStatus>,
+) -> Result<(), nt_status::NtStatus> {
+    let mut release = release;
+    dma_private_graph::retire(inst, lease_id, address, whole_graph, |id| match id {
+        DmaPrivateMappingId::Transfer(id) => release(id),
+        DmaPrivateMappingId::Coherent(_) => Err(nt_status::NtStatus::INVALID_HANDLE),
+    })
+}
+
+pub(super) unsafe fn retire_dma_private_graph_typed(
+    inst: DriverInstance, lease_id: u64, address: u64, whole_graph: bool,
+    release: impl FnMut(DmaPrivateMappingId) -> Result<(), nt_status::NtStatus>,
 ) -> Result<(), nt_status::NtStatus> {
     dma_private_graph::retire(inst, lease_id, address, whole_graph, release)
 }
@@ -143,6 +188,17 @@ pub(super) unsafe fn dma_private_sg_members(
 pub(super) unsafe fn retire_dma_private_lease(
     inst: DriverInstance, lease_id: u64,
     release: impl FnMut(u64) -> Result<(), nt_status::NtStatus>,
+) -> Result<(), nt_status::NtStatus> {
+    let mut release = release;
+    dma_private_graph::retire_lease(inst, lease_id, |id| match id {
+        DmaPrivateMappingId::Transfer(id) => release(id),
+        DmaPrivateMappingId::Coherent(_) => Err(nt_status::NtStatus::INVALID_HANDLE),
+    })
+}
+
+pub(super) unsafe fn retire_dma_private_lease_typed(
+    inst: DriverInstance, lease_id: u64,
+    release: impl FnMut(DmaPrivateMappingId) -> Result<(), nt_status::NtStatus>,
 ) -> Result<(), nt_status::NtStatus> {
     dma_private_graph::retire_lease(inst, lease_id, release)
 }

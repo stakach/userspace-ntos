@@ -52463,9 +52463,8 @@ unsafe fn release_hosted_dma_adapter_lease(
                 Ok(())
             }
         },
-        || hosted_device_allocations::retire_dma_private_lease(inst, lease.lease_id, |mapping_id| {
-            hosted_dma_manager_mut().free_mapping_for_owner(lease.owner, mapping_id)
-                .map_err(hosted_dma_status)
+        || hosted_device_allocations::retire_dma_private_lease_typed(inst, lease.lease_id, |mapping| {
+            release_hosted_dma_private_mapping(lease.owner, mapping)
         }),
         |put_canonical| hosted_device_allocations::retire_dma_adapter_pair(
             inst, lease.lease_id, adapter_address,
@@ -52481,6 +52480,20 @@ unsafe fn release_hosted_dma_adapter_lease(
     )?;
     leases.remove(index);
     Ok(())
+}
+
+unsafe fn release_hosted_dma_private_mapping(
+    owner: DmaOwner,
+    mapping: hosted_device_allocations::DmaPrivateMappingId,
+) -> Result<(), nt_status::NtStatus> {
+    match mapping {
+        hosted_device_allocations::DmaPrivateMappingId::Transfer(mapping_id) =>
+            hosted_dma_manager_mut().free_mapping_for_owner(owner, mapping_id)
+                .map_err(hosted_dma_status),
+        hosted_device_allocations::DmaPrivateMappingId::Coherent(alias) =>
+            hosted_dma_manager_mut().end_coherent_reservation_alias(owner, alias)
+                .map_err(hosted_dma_status),
+    }
 }
 
 unsafe fn hosted_dma_adapter_has_live_records(
@@ -52656,11 +52669,9 @@ pub(crate) unsafe fn service_hosted_irq_lane_dma_free_mapping(
     if lease.adapter_address != Some(adapter_address) {
         return Err(nt_status::NtStatus::ACCESS_DENIED);
     }
-    hosted_device_allocations::retire_dma_private_graph(
+    hosted_device_allocations::retire_dma_private_graph_typed(
         inst, lease_id, map_token, false,
-        |mapping_id| hosted_dma_manager_mut()
-            .free_mapping_for_owner(lease.owner, mapping_id)
-            .map_err(hosted_dma_status),
+        |mapping| release_hosted_dma_private_mapping(lease.owner, mapping),
     )
 }
 
@@ -52710,11 +52721,9 @@ pub(crate) unsafe fn service_hosted_irq_lane_dma_put_sg(
     if lease.adapter_address != Some(adapter_address) {
         return Err(nt_status::NtStatus::ACCESS_DENIED);
     }
-    hosted_device_allocations::retire_dma_private_graph(
+    hosted_device_allocations::retire_dma_private_graph_typed(
         inst, lease_id, list, true,
-        |mapping_id| hosted_dma_manager_mut()
-            .free_mapping_for_owner(lease.owner, mapping_id)
-            .map_err(hosted_dma_status),
+        |mapping| release_hosted_dma_private_mapping(lease.owner, mapping),
     )
 }
 
@@ -52774,9 +52783,8 @@ unsafe fn revoke_hosted_dma_adapter_leases(
                     Ok(())
                 }
             },
-            || hosted_device_allocations::retire_dma_private_lease(inst, lease.lease_id, |mapping_id| {
-                hosted_dma_manager_mut().free_mapping_for_owner(lease.owner, mapping_id)
-                    .map_err(hosted_dma_status)
+            || hosted_device_allocations::retire_dma_private_lease_typed(inst, lease.lease_id, |mapping| {
+                release_hosted_dma_private_mapping(lease.owner, mapping)
             }),
             |put_canonical| hosted_device_allocations::retire_dma_adapter_pair(
                 inst, lease.lease_id, lease.adapter_address.unwrap_or(0),
@@ -63011,11 +63019,9 @@ pub(crate) fn service_hosted_driver_dma_adapter(
                 if words[0] != 0 || words[1] == 0 || words[2] != 0 || words[3] != 0 {
                     return (STATUS_INVALID_PARAMETER, 0, 0, 0);
                 }
-                return match unsafe { hosted_device_allocations::retire_dma_private_graph(
+                return match unsafe { hosted_device_allocations::retire_dma_private_graph_typed(
                     inst, lease.lease_id, words[1], operation == HOSTED_DMA_SERVICE_PUT_SG,
-                    |mapping_id| hosted_dma_manager_mut()
-                        .free_mapping_for_owner(lease.owner, mapping_id)
-                        .map_err(hosted_dma_status),
+                    |mapping| release_hosted_dma_private_mapping(lease.owner, mapping),
                 ) } {
                     Ok(()) => (STATUS_SUCCESS, 0, 0, 0),
                     Err(status) => (status.raw(), 0, 0, 0),
