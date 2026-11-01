@@ -48269,6 +48269,9 @@ pub(crate) unsafe fn hosted_accepted_bus_owned_root_resources(
         return Err(invalid);
     }
     let properties = pnp.enumerated_pdo_properties(pdo_device_id).ok_or(invalid)?;
+    let nt_pnp_manager::PropertyBlobState::Present(raw) = &properties.boot_resources_raw else {
+        return Ok(None);
+    };
     let Some(information) = properties.bus_information.as_ref() else {
         return Err(invalid);
     };
@@ -48277,9 +48280,6 @@ pub(crate) unsafe fn hosted_accepted_bus_owned_root_resources(
     {
         return Ok(None);
     }
-    let nt_pnp_manager::PropertyBlobState::Present(raw) = &properties.boot_resources_raw else {
-        return Ok(None);
-    };
     // A PCI function's memory/interrupt list is handled by the function-resource path. A
     // BusNumber partial descriptor marks a bus-owned range and must pass full validation.
     let extent = nt_cm_resources::validate_cm_resource_list_extent(raw).map_err(|_| invalid)?;
@@ -70650,7 +70650,9 @@ pub(crate) unsafe fn hosted_accepted_acpi_child_resources(
             .enumerated_pdo_properties(pdo_device_id)
             .ok_or(invalid)?;
         let Some(bus) = properties.bus_information.as_ref() else {
-            return Err(invalid);
+            return if nt_pnp_manager::pci_bus_reports_no_resources(properties) {
+                Ok(None)
+            } else { Err(invalid) };
         };
         if !nt_pnp_manager::is_acpi_child_bus_information(bus) {
             return Ok(None);
@@ -70698,6 +70700,32 @@ pub(crate) unsafe fn hosted_accepted_acpi_child_resources(
     })))
 }
 
+/// A bus may decline bus-information while reporting a fully queried empty
+/// resource assignment. Keep its exact accepted PDO and parent provider.
+pub(crate) unsafe fn hosted_accepted_unidentified_bus_no_resources(
+    instance_path: &str,
+    pdo_device_id: u64,
+) -> Result<Option<(nt_pnp_manager::AcceptedPdoProviderAuthority,
+                    nt_pnp_manager::DevnodeIdentity)>, nt_status::NtStatus> {
+    let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+    if hosted_bus_reported_device_id(instance_path) != Some(pdo_device_id) {
+        return Err(invalid);
+    }
+    let pnp = hosted_pnp_manager_mut();
+    let child = pnp.devnode_identity_for_pdo(pdo_device_id).ok_or(invalid)?;
+    if !pnp.instance_id(child.devnode_id())
+        .is_some_and(|name| name.eq_ignore_ascii_case(instance_path))
+    { return Err(invalid); }
+    let properties = pnp.enumerated_pdo_properties(pdo_device_id).ok_or(invalid)?;
+    if !nt_pnp_manager::accepted_unidentified_bus_child_no_resources(instance_path, properties)
+        .map_err(|_| invalid)?
+    { return Ok(None); }
+    let provider = hosted_accepted_pdo_provider_catalog()
+        .resolve(hosted_pnp_manager_mut(), hosted_bus_relations(), io_manager_mut(), pdo_device_id)
+        .map_err(|_| invalid)?;
+    Ok(Some((provider, child)))
+}
+
 unsafe fn validate_hosted_accepted_no_resource_fdo(
     device_id: u64,
     child: nt_pnp_manager::DevnodeIdentity,
@@ -70721,6 +70749,21 @@ unsafe fn validate_hosted_accepted_no_resource_fdo(
         return Err(invalid);
     }
     Ok(())
+}
+
+pub(crate) unsafe fn validate_hosted_accepted_unidentified_bus_no_resources(
+    instance_path: &str,
+    device_id: u64,
+    provider: nt_pnp_manager::AcceptedPdoProviderAuthority,
+    child: nt_pnp_manager::DevnodeIdentity,
+) -> Result<(), nt_status::NtStatus> {
+    let invalid = nt_status::NtStatus::INVALID_DEVICE_REQUEST;
+    validate_hosted_accepted_no_resource_fdo(device_id, child)?;
+    match hosted_accepted_unidentified_bus_no_resources(instance_path, child.pdo_object_id())? {
+        Some((current_provider, current_child))
+            if current_provider == provider && current_child == child => Ok(()),
+        _ => Err(invalid),
+    }
 }
 
 pub(crate) unsafe fn validate_hosted_accepted_pci_no_resources(

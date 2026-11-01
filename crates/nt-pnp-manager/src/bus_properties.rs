@@ -140,6 +140,29 @@ pub fn pci_bus_reports_no_resources(properties: &crate::PdoProperties) -> bool {
         && matches!(properties.resource_requirements, crate::PropertyBlobState::KnownNone)
 }
 
+/// A bus PDO may decline `IRP_MN_QUERY_BUS_INFORMATION` while still completing
+/// all three resource queries. An accepted child with exactly three empty
+/// results needs no resource arbitration; a partial query is not authority.
+pub fn accepted_unidentified_bus_child_no_resources(
+    instance_path: &str,
+    properties: &crate::PdoProperties,
+) -> Result<bool, BusPropertyCopyError> {
+    if properties.bus_information.is_some() {
+        return Ok(false);
+    }
+    let enumerator = instance_path.split('\\').next().unwrap_or("");
+    if enumerator.eq_ignore_ascii_case("PCI") || enumerator.eq_ignore_ascii_case("ACPI") {
+        // Dedicated PCI/ACPI validation needs the native bus identity even when
+        // their current resource lists are empty. A malformed ID must not bypass it.
+        return Err(BusPropertyCopyError::Malformed);
+    }
+    if pci_bus_reports_no_resources(properties) {
+        Ok(true)
+    } else {
+        Err(BusPropertyCopyError::Malformed)
+    }
+}
+
 /// Retain a complete resource pair from an accepted bus PDO without replacing it with a
 /// synthetic no-resource plan. One-sided and unqueried pairs cannot authorize START.
 pub fn prepare_bus_reported_resource_snapshot(
@@ -578,6 +601,36 @@ mod tests {
                 raw, translated, requirements,
             )));
         }
+    }
+
+    #[test]
+    fn accepted_child_without_bus_information_needs_three_completed_empty_resource_queries() {
+        use crate::PropertyBlobState::{KnownNone, Present, Unqueried};
+        let empty = bus_properties(KnownNone, KnownNone, KnownNone);
+        assert_eq!(accepted_unidentified_bus_child_no_resources(r"SCSI\Disk&Ven_Test", &empty), Ok(true));
+        for named in [r"PCI\VEN_8086&DEV_2922", r"pci\malformed", r"ACPI\PNP0A08", r"acpi\broken"] {
+            assert_eq!(accepted_unidentified_bus_child_no_resources(named, &empty),
+                Err(BusPropertyCopyError::Malformed));
+        }
+        for (raw, translated, requirements) in [
+            (Unqueried, KnownNone, KnownNone),
+            (KnownNone, Unqueried, KnownNone),
+            (KnownNone, KnownNone, Unqueried),
+            (Present(Vec::new()), KnownNone, KnownNone),
+            (KnownNone, Present(Vec::new()), KnownNone),
+            (KnownNone, KnownNone, Present(Vec::new())),
+        ] {
+            assert_eq!(accepted_unidentified_bus_child_no_resources(
+                r"SCSI\Disk&Ven_Test", &bus_properties(raw, translated, requirements)),
+                Err(BusPropertyCopyError::Malformed));
+        }
+        let mut identified = empty;
+        identified.bus_information = Some(crate::PnpBusInformation {
+            bus_type_guid: crate::GUID_BUS_TYPE_PCI,
+            legacy_bus_type: crate::INTERFACE_TYPE_PCI_BUS,
+            bus_number: 0,
+        });
+        assert_eq!(accepted_unidentified_bus_child_no_resources(r"SCSI\Disk&Ven_Test", &identified), Ok(false));
     }
 
     #[test]

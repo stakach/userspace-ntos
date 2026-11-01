@@ -14128,6 +14128,7 @@ unsafe fn grant_hosted_devnode_resources(
         }
         PreparedHostedResourcePlan::PciNoResources { .. }
         | PreparedHostedResourcePlan::AcpiChildNoResources { .. }
+        | PreparedHostedResourcePlan::AcceptedBusNoResources { .. }
         | PreparedHostedResourcePlan::None => {
             if filtered_resource_requirements.is_empty() {
                 Ok(None)

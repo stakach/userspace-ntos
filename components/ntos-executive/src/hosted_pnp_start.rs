@@ -1531,6 +1531,10 @@ pub(crate) enum PreparedHostedResourcePlan {
         provider: nt_pnp_manager::AcceptedPdoProviderAuthority,
         child: nt_pnp_manager::DevnodeIdentity,
     },
+    AcceptedBusNoResources {
+        provider: nt_pnp_manager::AcceptedPdoProviderAuthority,
+        child: nt_pnp_manager::DevnodeIdentity,
+    },
     None,
 }
 
@@ -1580,6 +1584,7 @@ impl PreparedHostedResourcePlan {
             Self::BusReportedBusNumber { .. } | Self::BusOwnedRoot { .. }
             | Self::PciNoResources { .. } | Self::Platform { .. }
             | Self::AcpiChild { .. } | Self::AcpiChildNoResources { .. }
+            | Self::AcceptedBusNoResources { .. }
             | Self::None => crate::boot_storage_dma_handoff::ControllerGrantAdmission::Current,
         }
     }
@@ -1606,7 +1611,8 @@ impl PreparedHostedResourcePlan {
                 Some(&resources.raw_resources),
                 Some(&resources.resource_requirements),
             ),
-            Self::PciNoResources { .. } | Self::AcpiChildNoResources { .. } | Self::None => (None, None),
+            Self::PciNoResources { .. } | Self::AcpiChildNoResources { .. }
+            | Self::AcceptedBusNoResources { .. } | Self::None => (None, None),
         }
     }
 
@@ -1616,6 +1622,7 @@ impl PreparedHostedResourcePlan {
             | Self::AcpiChild { lease, .. } => lease,
             Self::BusReportedBusNumber { .. } | Self::BusOwnedRoot { .. }
             | Self::PciNoResources { .. } | Self::AcpiChildNoResources { .. }
+            | Self::AcceptedBusNoResources { .. }
             | Self::None => return Ok(()),
         };
         release_hosted_pnp_context_lease(lease.into_identity())
@@ -1634,6 +1641,7 @@ impl PreparedHostedResourcePlan {
             | Self::Platform { .. }
             | Self::AcpiChild { .. } | Self::PciNoResources { .. }
             | Self::AcpiChildNoResources { .. }
+            | Self::AcceptedBusNoResources { .. }
             | Self::None => {
                 crate::hosted_pci_topology::HostedPciInterruptRouteAdmission::Current
             }
@@ -1794,6 +1802,24 @@ where
                 },
             });
         }
+        match driver_launch::hosted_accepted_unidentified_bus_no_resources(instance_id, pdo) {
+            Ok(Some((provider, child))) => {
+                release_hosted_pnp_context_lease(lease.into_identity())?;
+                return Ok(PreparedHostedDevnode {
+                    pdo_description: None,
+                    resource_plan: PreparedHostedResourcePlan::AcceptedBusNoResources { provider, child },
+                });
+            }
+            Ok(None) => {}
+            Err(status) => return Err(release_context_lease_after_error(lease, status)),
+        }
+    }
+    // Only an accepted PCI PDO may use host PCI inventory; another bus child
+    // must have supplied its exact resources or completed empty resource queries.
+    if bus_pdo.is_some() && nt_pnp::parse_pci_id_pattern(instance_id).is_none() {
+        return Err(release_context_lease_after_error(
+            lease, nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
     }
     let context = match hosted_pnp_context_description(&lease) {
         Ok(context) => context,
@@ -1997,6 +2023,11 @@ where
     }
 
     release_hosted_pnp_context_lease(lease.into_identity())?;
+
+    // An accepted bus PDO cannot be replaced by a fabricated root PDO/empty assignment.
+    if bus_pdo.is_some() {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
 
 
 
@@ -2450,6 +2481,15 @@ unsafe fn filter_attached_devnode(
     options: HostedPnpStartOptions,
     report: &mut HostedPnpStartReport,
 ) -> HostedPnpDevnodeProgress {
+    if let PreparedHostedResourcePlan::AcceptedBusNoResources { provider, child } = &resource_plan {
+        if let Err(status) = driver_launch::validate_hosted_accepted_unidentified_bus_no_resources(
+            instance_id, device_id, *provider, *child,
+        ) {
+            return finish_filter_failure(
+                device_id, resource_plan, service_name, instance_id, options, status, report,
+            );
+        }
+    }
     if driver_launch::hosted_filter_resource_admission_pending() {
         return HostedPnpDevnodeProgress::FilterAdmissionPending { device_id, resource_plan };
     }
@@ -2570,6 +2610,15 @@ unsafe fn start_filtered_devnode(
     options: HostedPnpStartOptions,
     report: &mut HostedPnpStartReport,
 ) -> HostedPnpDevnodeProgress {
+    if let PreparedHostedResourcePlan::AcceptedBusNoResources { provider, child } = &resource_plan {
+        if let Err(status) = driver_launch::validate_hosted_accepted_unidentified_bus_no_resources(
+            instance_id, device_id, *provider, *child,
+        ) {
+            return finish_filter_failure(
+                device_id, resource_plan, service_name, instance_id, options, status, report,
+            );
+        }
+    }
     match resource_plan.grant_admission() {
         crate::boot_storage_dma_handoff::ControllerGrantAdmission::Current => {}
         crate::boot_storage_dma_handoff::ControllerGrantAdmission::Pending => {
