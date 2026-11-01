@@ -60,6 +60,7 @@ pub enum OwnedCall {
 pub struct PendingDirectoryCall {
     client_id: u64,
     request_id: u64,
+    create: bool,
     _request: Vec<u8>,
 }
 
@@ -143,11 +144,11 @@ fn decode_directory_handle(reply: ObReply, create: bool)
     Ok(DirectoryHandleResult { status, handle: HandleValue(reply.detail0), created: reply.detail1 != 0 })
 }
 
-fn decode_owned_directory_terminal(reply: ObReply) -> DirectoryOwnedTerminal {
+fn decode_owned_directory_terminal(reply: ObReply, create: bool) -> DirectoryOwnedTerminal {
     if !NtStatus(reply.status).is_success() {
         return DirectoryOwnedTerminal::Failure(NtStatus(reply.status));
     }
-    match decode_directory_handle(reply, true) {
+    match decode_directory_handle(reply, create) {
         Ok(result) => DirectoryOwnedTerminal::Success(result),
         Err(_) => DirectoryOwnedTerminal::Incoherent(reply),
     }
@@ -745,6 +746,20 @@ impl<B: OwnedBackend> ObjectClient<B> {
         name: &UnicodeString, access: AccessMask, attributes: ObjAttrFlags)
         -> DirectoryOwnedOutcome
     {
+        self.directory_handle_owned(root, name, access, attributes, true)
+    }
+
+    pub fn open_directory_handle_owned(&mut self, root: Option<HandleValue>,
+        name: &UnicodeString, access: AccessMask, attributes: ObjAttrFlags)
+        -> DirectoryOwnedOutcome
+    {
+        self.directory_handle_owned(root, name, access, attributes, false)
+    }
+
+    fn directory_handle_owned(&mut self, root: Option<HandleValue>,
+        name: &UnicodeString, access: AccessMask, attributes: ObjAttrFlags, create: bool)
+        -> DirectoryOwnedOutcome
+    {
         if !matches!(self.owned_directory_state, DirectoryOwnedState::Idle) {
             return DirectoryOwnedOutcome::NoEffect(NtStatus::DEVICE_BUSY);
         }
@@ -752,10 +767,12 @@ impl<B: OwnedBackend> ObjectClient<B> {
             Ok(request) => request,
             Err(status) => return DirectoryOwnedOutcome::NoEffect(status),
         };
-        match self.backend.call_owned(opcode::OB_OP_CREATE_DIRECTORY_HANDLE, &request, &mut []) {
+        let op = if create { opcode::OB_OP_CREATE_DIRECTORY_HANDLE }
+            else { opcode::OB_OP_OPEN_DIRECTORY_HANDLE };
+        match self.backend.call_owned(op, &request, &mut []) {
             OwnedCall::NoEffect(status) => DirectoryOwnedOutcome::NoEffect(status),
             OwnedCall::Completed(reply) => {
-                let terminal = decode_owned_directory_terminal(reply);
+                let terminal = decode_owned_directory_terminal(reply, create);
                 if matches!(terminal, DirectoryOwnedTerminal::Incoherent(_)) {
                     self.owned_directory_state = DirectoryOwnedState::Quarantined;
                 }
@@ -765,7 +782,7 @@ impl<B: OwnedBackend> ObjectClient<B> {
                 self.owned_directory_state = DirectoryOwnedState::Pending(request_id);
                 DirectoryOwnedOutcome::Indeterminate(PendingDirectoryCall {
                     client_id: self.owned_client_id,
-                    request_id, _request: request,
+                    request_id, create, _request: request,
                 })
             }
         }
@@ -778,7 +795,7 @@ impl<B: OwnedBackend> ObjectClient<B> {
             || !matches!(self.owned_directory_state,
                 DirectoryOwnedState::Pending(id) if id == pending.request_id) { return None; }
         let reply = self.backend.poll_owned(pending.request_id, &mut [])?;
-        let terminal = decode_owned_directory_terminal(reply);
+        let terminal = decode_owned_directory_terminal(reply, pending.create);
         self.owned_directory_state = if matches!(terminal, DirectoryOwnedTerminal::Incoherent(_)) {
             DirectoryOwnedState::Quarantined
         } else {
