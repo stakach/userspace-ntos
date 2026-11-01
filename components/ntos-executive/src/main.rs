@@ -20,6 +20,7 @@ extern crate alloc;
 pub use sel4_rt::*;
 mod serial_records;
 mod ingress_observation;
+mod desktop_completion_marker;
 pub use serial_records::{debug_put_char, print_str, print_u64};
 
 mod acpi_platform;
@@ -34172,9 +34173,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(b"[ntos-exec summary: ");
     print_u64(passed);
     print_str(b"/");
-    print_u64(GATE_TOTAL.load(Ordering::Relaxed));
+    let total = GATE_TOTAL.load(Ordering::Relaxed);
+    print_u64(total);
     print_str(b" executive->isolated-service checks passed]\n");
-    print_str(b"[microtest done]\n");
+    if desktop_completion_marker::complete(passed, total) {
+        print_str(b"[microtest done]\n");
+    }
     park()
 }
 
