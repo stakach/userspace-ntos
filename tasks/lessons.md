@@ -1,6 +1,7 @@
 # Lessons
 
 ## Delegate Bounded Boot Monitoring
+- Treat an hour-long boot that is still in device installation as a performance defect even when counters and progress text move. Require measured throughput and a specific diagnostic question before another long run; use short bounded probes to localize the cost, then a RED regression and source fix before repeating full acceptance.
 - Assign a read-only agent to monitor each long graphical boot and report only new frontier or failure evidence with log lines and timing. Keep one owner for QEMU, builds, tests, and disk images.
 - Diagnostic code running inside an isolated provider pump may read only pump-owned state. A root-owned heap-backed lookup, even for logging, can page fault the provider; carry bounded metadata across the ownership boundary or correlate receipts offline.
 - A repeated installer INF scan is not by itself durable progress. Have the boot monitor correlate each helper with its exact device job, per-job success event, registry WAL publication, and the no-pending-install event. Do not stop merely because numeric section handles, addresses, or view sizes repeat: first verify backing file identity, view and section generations, and matching map/unmap results. A flat NtRead census does not imply a stalled helper when section maps or attribute probes continue; a capped trace's silence is not evidence of inactivity.
