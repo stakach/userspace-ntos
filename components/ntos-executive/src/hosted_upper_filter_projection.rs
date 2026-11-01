@@ -52,6 +52,16 @@ struct Owner {
 static mut OWNERS: Vec<Owner> = Vec::new();
 static mut NEXT_ID: u64 = 1;
 
+/// Bounded diagnostic for the next native upper-filter admission probe. Stage and detail are
+/// fixed numeric predicates, so a failed AddDevice can be attributed without logging every I/O.
+pub(super) fn trace_filter_stage(stage: u32, detail: u32) {
+    print_str(b"[upper-filter-stage] stage=0x");
+    print_hex(stage);
+    print_str(b" detail=0x");
+    print_hex(detail);
+    print_str(b"\n");
+}
+
 /// An alias remains live through blocked and uncertain effects. Driver teardown must wait for an
 /// explicit future retirement owner; absence of a completed AddDevice is not a release signal.
 pub(super) fn instance_quiesced(instance_index: usize) -> bool {
@@ -196,18 +206,25 @@ pub(super) unsafe fn prepare(
     let class_driver = DriverId(class_driver_id);
     let devnode = hosted_pnp_manager_mut()
         .devnode_identity_for_pdo(pdo_id)
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        .ok_or_else(|| {
+            trace_filter_stage(0x10, 1);
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST
+        })?;
     if !hosted_pnp_manager_mut()
         .instance_id(devnode.devnode_id())
         .is_some_and(|current| current.eq_ignore_ascii_case(instance_path))
     {
+        trace_filter_stage(0x10, 2);
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     nt_pnp_manager::UpperFilterAttachmentLedger::validate_current(
         hosted_pnp_manager_mut(),
         claim.key(),
     )
-    .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    .map_err(|_| {
+        trace_filter_stage(0x10, 4);
+        nt_status::NtStatus::INVALID_DEVICE_REQUEST
+    })?;
     let (driver_instance, driver_inst) =
         instance_by_driver_id(class_driver_id).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
     let route = hosted_provider_dispatch_route_for_instance(driver_instance);
@@ -223,30 +240,33 @@ pub(super) unsafe fn prepare(
             .hosted_driver_address_by_identity(class_domain, class_driver)
             .is_none()
     {
+        trace_filter_stage(0x10, 8);
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let binding = hosted_device_binding_by_device_id(function_id)
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    if binding.pdo_device_id != pdo_id
-        || binding.driver_id == class_driver_id
-        || binding.projection_domain == class_domain
-        || binding.device_object == 0
-        || !io_manager_mut()
-            .device(pdo)
-            .is_some_and(|device| !device.delete_pending)
-        || !io_manager_mut()
-            .device(function)
-            .is_some_and(|device| !device.delete_pending && device.attached_to == Some(pdo))
-        || io_manager_mut().top_of_device_stack(pdo) != Ok(lower)
-        || io_manager_mut()
-            .hosted_device_address_by_identity(class_domain, pdo)
-            .is_some()
-        || io_manager_mut()
-            .hosted_device_address_by_identity(class_domain, lower)
-            .is_some()
-    {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        .ok_or_else(|| {
+            trace_filter_stage(0x10, 0x10);
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST
+        })?;
+    macro_rules! check_binding {
+        ($condition:expr, $detail:expr) => {
+            if $condition {
+                trace_filter_stage(0x11, $detail);
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+        };
     }
+    check_binding!(binding.pdo_device_id != pdo_id, 1);
+    check_binding!(binding.driver_id == class_driver_id, 2);
+    check_binding!(binding.projection_domain == class_domain, 3);
+    check_binding!(binding.device_object == 0, 4);
+    check_binding!(!io_manager_mut().device(pdo).is_some_and(|device| !device.delete_pending), 5);
+    check_binding!(!io_manager_mut().device(function).is_some_and(|device| {
+        !device.delete_pending && device.attached_to == Some(pdo)
+    }), 6);
+    check_binding!(io_manager_mut().top_of_device_stack(pdo) != Ok(lower), 7);
+    check_binding!(io_manager_mut().hosted_device_address_by_identity(class_domain, pdo).is_some(), 8);
+    check_binding!(io_manager_mut().hosted_device_address_by_identity(class_domain, lower).is_some(), 9);
     let (lower_domain, lower_origin_registration) = if lower == function {
         (
             binding.projection_domain,
@@ -267,7 +287,10 @@ pub(super) unsafe fn prepare(
                             .is_some_and(|registration| registration.device_id() == lower)
                     })
             })
-            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+            .ok_or_else(|| {
+                trace_filter_stage(0x10, 0x20);
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST
+            })?;
         (
             prior.class_domain,
             prior.class_fdo.unwrap().registration.unwrap(),
@@ -277,6 +300,7 @@ pub(super) unsafe fn prepare(
         .hosted_device_pointer_registration(lower_domain, lower_origin_registration.address())
         != Some(lower_origin_registration)
     {
+        trace_filter_stage(0x10, 0x40);
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     if owners().iter().any(|row| {
@@ -407,27 +431,27 @@ pub(super) unsafe fn validate_before_add_device(
     owner_id: u64,
 ) -> Result<PreparedUpperFilterProjection, nt_status::NtStatus> {
     let row = *owner(owner_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
-    if !matches!(row.phase, Phase::Published | Phase::Configured)
-        || hosted_pnp_manager_mut().devnode_identity_for_pdo(row.pdo.raw()) != Some(row.devnode)
-        || io_manager_mut().hosted_domain_identity(row.class_domain.domain_id)
-            != Some(row.class_domain)
-        || io_manager_mut().hosted_domain_identity(row.lower_domain.domain_id)
-            != Some(row.lower_domain)
-        || io_manager_mut().top_of_device_stack(row.pdo) != Ok(row.lower)
-        || !io_manager_mut()
-            .device(row.function)
-            .is_some_and(|device| !device.delete_pending && device.attached_to == Some(row.pdo))
-        || instance(row.class_instance).and_then(instance_domain_identity) != Some(row.class_domain)
-        || io_manager_mut()
-            .hosted_driver_address_by_identity(row.class_domain, row.class_driver)
-            .is_none()
-        || io_manager_mut().hosted_device_pointer_registration(
-            row.lower_domain,
-            row.lower_origin_registration.address(),
-        ) != Some(row.lower_origin_registration)
-    {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    macro_rules! check_projection {
+        ($condition:expr, $detail:expr) => {
+            if $condition {
+                trace_filter_stage(0x20, $detail);
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
+        };
     }
+    check_projection!(!matches!(row.phase, Phase::Published | Phase::Configured), 1);
+    check_projection!(hosted_pnp_manager_mut().devnode_identity_for_pdo(row.pdo.raw()) != Some(row.devnode), 2);
+    check_projection!(io_manager_mut().hosted_domain_identity(row.class_domain.domain_id) != Some(row.class_domain), 3);
+    check_projection!(io_manager_mut().hosted_domain_identity(row.lower_domain.domain_id) != Some(row.lower_domain), 4);
+    check_projection!(io_manager_mut().top_of_device_stack(row.pdo) != Ok(row.lower), 5);
+    check_projection!(!io_manager_mut().device(row.function).is_some_and(|device| {
+        !device.delete_pending && device.attached_to == Some(row.pdo)
+    }), 6);
+    check_projection!(instance(row.class_instance).and_then(instance_domain_identity) != Some(row.class_domain), 7);
+    check_projection!(io_manager_mut().hosted_driver_address_by_identity(row.class_domain, row.class_driver).is_none(), 8);
+    check_projection!(io_manager_mut().hosted_device_pointer_registration(
+        row.lower_domain, row.lower_origin_registration.address(),
+    ) != Some(row.lower_origin_registration), 9);
     let class_inst =
         instance(row.class_instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     let lower_device = io_manager_mut()
@@ -440,6 +464,7 @@ pub(super) unsafe fn validate_before_add_device(
         lower_device.stack_size,
     );
     if lower_stack_size == 0 || lower_stack_size == u8::MAX {
+        trace_filter_stage(0x21, lower_stack_size as u32);
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let pdo = row
@@ -464,6 +489,7 @@ pub(super) unsafe fn validate_before_add_device(
                 .hosted_device_pointer_registration(row.class_domain, registration.address())
                 != Some(registration)
         {
+            trace_filter_stage(0x22, u32::from(device == row.lower));
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
     }
