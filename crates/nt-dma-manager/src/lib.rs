@@ -14,6 +14,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 mod coherent_window;
+pub mod shared_record;
 pub use coherent_window::{CoherentReservationAlias, CoherentReservationGrant, CoherentWindowIdentity};
 use coherent_window::{CoherentAliasRecord, CoherentReservation, CoherentReservationState, CoherentWindow};
 
@@ -803,6 +804,122 @@ impl DmaManager {
         Ok(())
     }
 
+    /// Retire the exact generation returned by `register_common_buffer_at`. A stale native
+    /// Free callback cannot release a new allocation at the same logical address.
+    pub fn free_common_buffer_for_adapter_id(
+        &mut self,
+        owner: DmaOwner,
+        adapter_id: u64,
+        common_buffer_id: u64,
+        logical_base: u64,
+        length: u64,
+    ) -> Result<(), DmaError> {
+        self.adapter(adapter_id, owner)?;
+        let cb = self.common_buffers.iter().find(|cb| cb.id == common_buffer_id)
+            .ok_or(DmaError::StaleId)?;
+        if !cb.active || cb.logical_base != logical_base {
+            return Err(DmaError::StaleId);
+        }
+        if cb.owner != owner || cb.adapter_id != adapter_id {
+            return Err(DmaError::WrongOwner);
+        }
+        if cb.length != length {
+            return Err(DmaError::OutOfRange);
+        }
+        if self.common_buffer_has_live_alias(common_buffer_id) {
+            return Err(DmaError::AdapterBusy);
+        }
+        let cb = self.common_buffers.iter_mut().find(|cb| cb.id == common_buffer_id).unwrap();
+        cb.active = false;
+        Ok(())
+    }
+
+    /// Check a provider record against the root's pre-publication claim.
+    pub fn common_buffer_claim_matches(
+        &self,
+        owner: DmaOwner,
+        adapter_id: u64,
+        common_buffer_id: u64,
+        logical_base: u64,
+        length: u64,
+        backing_va: u64,
+    ) -> bool {
+        self.common_buffers.iter().any(|cb| cb.active
+            && cb.id == common_buffer_id
+            && cb.owner == owner
+            && cb.adapter_id == adapter_id
+            && cb.logical_base == logical_base
+            && cb.length == length
+            && cb.backing_va == backing_va)
+    }
+
+    /// Resolve the exact live common-buffer generation behind a native allocation result.
+    /// The caller must independently authenticate the device and its DMA grant before using
+    /// this read-only lookup; a logical address or component VA alone is not authority.
+    pub fn common_buffer_claim_at(
+        &self,
+        owner: DmaOwner,
+        logical_base: u64,
+        length: u64,
+        backing_va: u64,
+    ) -> Option<(u64, u64)> {
+        if logical_base == 0 || length == 0 || backing_va == 0
+            || logical_base.checked_add(length).is_none()
+            || backing_va.checked_add(length).is_none()
+        {
+            return None;
+        }
+        self.common_buffers.iter().find(|cb| {
+            cb.active && cb.owner == owner && cb.logical_base == logical_base
+                && cb.length == length && cb.backing_va == backing_va
+                && self.adapter(cb.adapter_id, owner).is_ok()
+        }).map(|cb| (cb.adapter_id, cb.id))
+    }
+
+    /// Resolve a fully covered part of one live common-buffer generation. A provider and a
+    /// dependent may use different virtual aliases; the caller supplies the backing VA that
+    /// was registered for this owner, after translating through its authenticated DMA grant.
+    pub fn common_buffer_claim_covering(
+        &self,
+        owner: DmaOwner,
+        logical: u64,
+        length: u64,
+        backing_va: u64,
+    ) -> Option<(u64, u64)> {
+        if logical == 0 || length == 0 || backing_va == 0
+            || logical.checked_add(length).is_none()
+            || backing_va.checked_add(length).is_none()
+        {
+            return None;
+        }
+        self.common_buffers.iter().find(|cb| {
+            let Some(offset) = logical.checked_sub(cb.logical_base) else {
+                return false;
+            };
+            cb.active && cb.owner == owner && offset <= cb.length
+                && length <= cb.length - offset
+                && cb.backing_va.checked_add(offset) == Some(backing_va)
+                && self.adapter(cb.adapter_id, owner).is_ok()
+        }).map(|cb| (cb.adapter_id, cb.id))
+    }
+
+    /// Verify that the exact claim selected before a provider free call was retired.
+    pub fn common_buffer_claim_retired(
+        &self,
+        owner: DmaOwner,
+        adapter_id: u64,
+        common_buffer_id: u64,
+        logical_base: u64,
+        length: u64,
+    ) -> bool {
+        self.common_buffers.iter().any(|cb| !cb.active
+            && cb.id == common_buffer_id
+            && cb.owner == owner
+            && cb.adapter_id == adapter_id
+            && cb.logical_base == logical_base
+            && cb.length == length)
+    }
+
     /// Decode an owner-scoped device logical address to the backing Driver-Host address — the
     /// IOMMU-facade lookup a simulated device uses to touch memory (spec §19.2). Only
     /// resolves addresses within a live common buffer or active mapping; a device
@@ -1328,6 +1445,77 @@ mod tests {
 
     fn owner() -> DmaOwner {
         DmaOwner::new(1, 100, 10)
+    }
+
+    #[test]
+    fn stale_common_buffer_id_cannot_retire_reallocated_logical_range() {
+        let mut dma = DmaManager::new();
+        let adapter = dma.register_adapter(owner(), true, 4096, true);
+        let first = dma.register_common_buffer_at(owner(), adapter, 0x4000, 512, 0x20_0000)
+            .unwrap();
+        dma.free_common_buffer_for_adapter_id(
+            owner(), adapter, first.common_buffer_id, 0x4000, 512,
+        ).unwrap();
+        let second = dma.register_common_buffer_at(owner(), adapter, 0x4000, 512, 0x20_0000)
+            .unwrap();
+        assert_ne!(first.common_buffer_id, second.common_buffer_id);
+        assert_eq!(dma.free_common_buffer_for_adapter_id(
+            owner(), adapter, first.common_buffer_id, 0x4000, 512,
+        ), Err(DmaError::StaleId));
+        assert!(!dma.common_buffer_claim_matches(
+            owner(), adapter, first.common_buffer_id, 0x4000, 512, 0x20_0000,
+        ));
+        assert!(dma.common_buffer_claim_matches(
+            owner(), adapter, second.common_buffer_id, 0x4000, 512, 0x20_0000,
+        ));
+        assert_eq!(dma.decode_owner_logical(owner(), 0x4000, 512), Ok(0x20_0000));
+    }
+
+    #[test]
+    fn common_buffer_lookup_requires_exact_live_owner_and_generation() {
+        let mut dma = DmaManager::new();
+        let foreign = DmaOwner::new(2, 200, 20);
+        let adapter = dma.register_adapter(owner(), true, 4096, true);
+        let foreign_adapter = dma.register_adapter(foreign, true, 4096, true);
+        let first = dma.register_common_buffer_at(owner(), adapter, 0x4000, 512, 0x20_0000)
+            .unwrap();
+        dma.register_common_buffer_at(foreign, foreign_adapter, 0x4000, 512, 0x20_0000)
+            .unwrap();
+        assert_eq!(dma.common_buffer_claim_at(owner(), 0x4000, 512, 0x20_0000),
+            Some((adapter, first.common_buffer_id)));
+        assert_eq!(dma.common_buffer_claim_at(owner(), 0x4000, 512, 0x30_0000), None);
+        assert_eq!(dma.common_buffer_claim_at(owner(), 0x4000, 256, 0x20_0000), None);
+        assert_eq!(dma.common_buffer_claim_at(foreign, 0x4000, 512, 0x20_0000)
+            .map(|claim| claim.0), Some(foreign_adapter));
+
+        dma.free_common_buffer_for_adapter_id(
+            owner(), adapter, first.common_buffer_id, 0x4000, 512,
+        ).unwrap();
+        assert_eq!(dma.common_buffer_claim_at(owner(), 0x4000, 512, 0x20_0000), None);
+        let second = dma.register_common_buffer_at(owner(), adapter, 0x4000, 512, 0x20_0000)
+            .unwrap();
+        assert_ne!(first.common_buffer_id, second.common_buffer_id);
+        assert_eq!(dma.common_buffer_claim_at(owner(), 0x4000, 512, 0x20_0000),
+            Some((adapter, second.common_buffer_id)));
+    }
+
+    #[test]
+    fn common_buffer_subrange_lookup_checks_backing_and_bounds() {
+        let mut dma = DmaManager::new();
+        let adapter = dma.register_adapter(owner(), true, 4096, true);
+        let claim = dma.register_common_buffer_at(owner(), adapter, 0x4000, 512, 0x20_0000)
+            .unwrap();
+        let expected = Some((adapter, claim.common_buffer_id));
+        assert_eq!(dma.common_buffer_claim_covering(owner(), 0x4000, 512, 0x20_0000), expected);
+        assert_eq!(dma.common_buffer_claim_covering(owner(), 0x4080, 128, 0x20_0080), expected);
+        assert_eq!(dma.common_buffer_claim_covering(owner(), 0x41ff, 1, 0x20_01ff), expected);
+        assert_eq!(dma.common_buffer_claim_covering(owner(), 0x4080, 128, 0x20_0000), None);
+        assert_eq!(dma.common_buffer_claim_covering(owner(), 0x41ff, 2, 0x20_01ff), None);
+        assert_eq!(dma.common_buffer_claim_covering(owner(), 0x4000, 0, 0x20_0000), None);
+        assert_eq!(dma.common_buffer_claim_covering(owner(), u64::MAX, 2, 0x20_0000), None);
+        assert_eq!(dma.common_buffer_claim_covering(
+            DmaOwner::new(1, 101, 10), 0x4080, 128, 0x20_0080,
+        ), None);
     }
 
     fn adapter_request() -> DmaAdapterRequest {
