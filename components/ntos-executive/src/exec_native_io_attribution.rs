@@ -10,6 +10,17 @@ static CALLS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static TICKS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static PENDING_ASYNC: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static PENDING_PARK: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+// Candidate File routes are captured before dispatch. A synchronous retry may consume its
+// retained route during the call, so a lookup at return could name a reused handle instead.
+const ROUTE_BUCKETS: usize = 2;
+static ROUTE_CALLS: [AtomicU64; 3 * ROUTE_BUCKETS] =
+    [const { AtomicU64::new(0) }; 3 * ROUTE_BUCKETS];
+static ROUTE_TICKS: [AtomicU64; 3 * ROUTE_BUCKETS] =
+    [const { AtomicU64::new(0) }; 3 * ROUTE_BUCKETS];
+
+fn route_bucket(kind: NativeIoKind, route: Option<HostedFileRoute>) -> usize {
+    kind.index() * ROUTE_BUCKETS + usize::from(route.is_some())
+}
 
 #[derive(Clone, Copy)]
 struct OwnerSample {
@@ -72,6 +83,9 @@ pub(super) fn record(
     let index = call.kind.index();
     let ordinal = CALLS[index].fetch_add(1, Ordering::Relaxed);
     TICKS[index].fetch_add(ticks, Ordering::Relaxed);
+    let route_index = route_bucket(call.kind, route);
+    ROUTE_CALLS[route_index].fetch_add(1, Ordering::Relaxed);
+    ROUTE_TICKS[route_index].fetch_add(ticks, Ordering::Relaxed);
     let parked = status == nt_io_completion::STATUS_PENDING && match call.kind {
         NativeIoKind::RemoveCompletion => handler.io_completion_park_port >= 0,
         NativeIoKind::Read | NativeIoKind::Write => handler.pending_file_io_wait,
@@ -140,6 +154,14 @@ pub(crate) fn print_summary() {
         print_str(b" dispatch-Mtick="); print_u64(TICKS[index].load(Ordering::Relaxed) / 1_000_000);
         print_str(b" async-pending="); print_u64(PENDING_ASYNC[index].load(Ordering::Relaxed));
         print_str(b" caller-park="); print_u64(PENDING_PARK[index].load(Ordering::Relaxed));
+        print_str(b"\n");
+        let other = route_bucket(kind, None);
+        let hosted = other + 1;
+        print_str(b"[native-io-route-summary] kind="); print_str(label(kind));
+        print_str(b" other-or-unknown-calls="); print_u64(ROUTE_CALLS[other].load(Ordering::Relaxed));
+        print_str(b" other-or-unknown-Mtick="); print_u64(ROUTE_TICKS[other].load(Ordering::Relaxed) / 1_000_000);
+        print_str(b" hosted-calls="); print_u64(ROUTE_CALLS[hosted].load(Ordering::Relaxed));
+        print_str(b" hosted-Mtick="); print_u64(ROUTE_TICKS[hosted].load(Ordering::Relaxed) / 1_000_000);
         print_str(b"\n");
     }
 }
