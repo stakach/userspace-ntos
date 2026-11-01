@@ -12,6 +12,7 @@ pub struct DeviceType(pub u32);
 impl DeviceType {
     pub const BEEP: DeviceType = DeviceType(0x0000_0001);
     pub const DISK: DeviceType = DeviceType(0x0000_0007);
+    pub const MASS_STORAGE: DeviceType = DeviceType(0x0000_002d);
     pub const DISK_FILE_SYSTEM: DeviceType = DeviceType(0x0000_0008);
     pub const CD_ROM_FILE_SYSTEM: DeviceType = DeviceType(0x0000_0003);
     pub const NETWORK_FILE_SYSTEM: DeviceType = DeviceType(0x0000_0014);

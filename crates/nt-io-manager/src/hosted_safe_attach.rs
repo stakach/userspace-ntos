@@ -253,6 +253,48 @@ mod tests {
     }
 
     #[test]
+    fn upper_filter_type_admission_keeps_existing_strict_match_with_exact_stack() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let port_driver = io.register_driver(DriverRecord::new(
+            ObjectId::NULL,
+            NtPath::parse_str("\\Driver\\PortForTypeProjection").unwrap(),
+            DriverBackendId(1),
+            MajorFunctionTable::new(),
+        ));
+        let class_driver = io.register_driver(DriverRecord::new(
+            ObjectId::NULL,
+            NtPath::parse_str("\\Driver\\ClassForTypeProjection").unwrap(),
+            DriverBackendId(2),
+            MajorFunctionTable::new(),
+        ));
+        let pdo = add_device(&mut io, port_driver);
+        let function = add_device(&mut io, port_driver);
+        let class_fdo = add_device(&mut io, class_driver);
+        io.device_mut(function).unwrap().device_type = DeviceType::DISK;
+        io.device_mut(class_fdo).unwrap().device_type = DeviceType::MASS_STORAGE;
+        let class_domain = io.register_hosted_domain();
+        let other_domain = io.register_hosted_domain();
+        io.bind_hosted_driver_identity(class_domain, 0x8000, class_driver).unwrap();
+        let pdo_projection = io.bind_hosted_device_pointer(class_domain, 0x2000, pdo).unwrap();
+        let lower_projection = io.bind_hosted_device_pointer(class_domain, 0x3000, function).unwrap();
+        let class_projection = io.bind_hosted_device_pointer(class_domain, 0x4000, class_fdo).unwrap();
+        let foreign_lower = io.bind_hosted_device_pointer(other_domain, 0x3000, function).unwrap();
+        io.attach_device_to_stack(function, pdo).unwrap();
+        io.attach_hosted_upper_filter_checked(class_projection, pdo_projection, lower_projection).unwrap();
+
+        assert_eq!(io.admitted_hosted_upper_filter_device_type(
+            class_projection, pdo_projection, lower_projection, DeviceType::MASS_STORAGE,
+        ), Ok(DeviceType::MASS_STORAGE));
+        assert_eq!(io.admitted_hosted_upper_filter_device_type(
+            class_projection, pdo_projection, foreign_lower, DeviceType::MASS_STORAGE,
+        ), Err(NtStatus::INVALID_PARAMETER));
+        assert_eq!(io.admitted_hosted_upper_filter_device_type(
+            class_projection, pdo_projection, lower_projection, DeviceType::DISK,
+        ), Err(NtStatus::INVALID_DEVICE_REQUEST));
+        assert_eq!(io.device(class_fdo).unwrap().device_type, DeviceType::MASS_STORAGE);
+    }
+
+    #[test]
     fn class_upper_filter_rejects_stale_or_cross_domain_projections_before_mutation() {
         let mut io = IoManager::new(MockObjectPort::new());
         let driver = io.register_driver(DriverRecord::new(
