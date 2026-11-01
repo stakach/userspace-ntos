@@ -184,17 +184,27 @@ pub(crate) struct MutationPersistence {
 }
 
 impl MutationPersistence {
+    pub(crate) fn retained_native_work(&self) -> Option<nt_pnp_context::native_route_publication::RelationStorageWork> {
+        use nt_pnp_context::native_route_publication::RelationStorageWork;
+        match &self.owner {
+            PersistenceOwner::Admitting { recheck_id, .. } =>
+                Some(RelationStorageWork::HeaderRecheck { id: *recheck_id }),
+            PersistenceOwner::Wal(_) => Some(RelationStorageWork::Wal),
+            _ => None,
+        }
+    }
+
     pub(crate) fn admitting(&self) -> bool {
         matches!(&self.owner, PersistenceOwner::Admitting { .. })
     }
 
-    fn claim_native_wal_io(&mut self) -> Result<Option<(nt_fs::AsyncWalIoRequest, nt_fs::BlockOperation, Vec<u8>, nt_memory_manager::SectionMountId)>, u32> {
+    pub(crate) fn claim_native_wal_io(&mut self) -> Result<Option<(nt_fs::AsyncWalIoRequest, nt_fs::BlockOperation, Vec<u8>, nt_memory_manager::SectionMountId)>, u32> {
         let PersistenceOwner::Wal(wal) = &mut self.owner else { return Ok(None); };
         let mount = wal.mount();
         wal.claim_native_io().map(|claim| claim.map(|(request, operation, input)| (request, operation, input, mount)))
     }
 
-    fn native_wal_mut(&mut self) -> Option<&mut WalJournal> {
+    pub(crate) fn native_wal_mut(&mut self) -> Option<&mut WalJournal> {
         match &mut self.owner { PersistenceOwner::Wal(wal) => Some(wal), _ => None }
     }
 

@@ -340,8 +340,19 @@ pub(super) unsafe fn service() -> usize {
     if (&*core::ptr::addr_of!(PENDING)).is_some() {
         return poll_pending();
     }
-    let Some(route) = native_disk_relation::native_storage_route() else { return 0; };
-    let Some(claim) = next_claim() else { return 0; };
+    let (route, claim) = if let Some(route) = native_disk_relation::native_storage_route() {
+        let Some(claim) = next_claim() else { return 0; };
+        (route, claim)
+    } else {
+        let Some(route) = native_disk_relation::retained_native_storage_recheck_route() else {
+            return 0;
+        };
+        let claim = crate::driver_launch::native_storage_relation_recheck_id()
+            .and_then(|id| crate::writable_fs::native_snapshot_io::claim_relation_header_recheck(id))
+            .or_else(|| crate::writable_fs::native_snapshot_io::claim_retained_relation_wal_io());
+        let Some(claim) = claim.map(WorkClaim::Snapshot) else { return 0; };
+        (route, claim)
+    };
     if claim.mount() != route.mount.value() {
         claim.refuse_unentered(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         return 1;

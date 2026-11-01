@@ -9754,6 +9754,7 @@ pub(crate) unsafe fn service_sec_image(
                 )
                 && !defer_quiesce_for_active_user_callbacks(b"all-live-waiting")
                 && !driver_launch::native_disk_proof_hardware_irp_pending()
+                && !driver_launch::native_storage_relation_wal_retained()
                 && crate::registry_mutation_work::next_deadline().is_none()
                 && crate::mutable_hive_mutation_work::next_deadline().is_none()
                 && crate::section_metadata_work::next_deadline().is_none()
@@ -11968,6 +11969,7 @@ pub(crate) unsafe fn service_sec_image(
                         )
                         && !defer_quiesce_for_active_user_callbacks(b"lsass-post-signal-fault")
                         && !driver_launch::native_disk_proof_hardware_irp_pending()
+                        && !driver_launch::native_storage_relation_wal_retained()
                     {
                         print_str(b"[quiesce] every live process parked/waiting (no signaler left) -> run gate\n");
                         stop = addr;

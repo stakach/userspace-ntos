@@ -53984,6 +53984,95 @@ pub(crate) unsafe fn native_disk_proof_hardware_irp_pending() -> bool {
             .is_some_and(|proof| proof.entered_irp().is_some())
 }
 
+/// Only the exact active storage relation may advance its retained CM admission header read
+/// while its proven route is unpublished or refreshing.
+unsafe fn retained_native_storage_relation_publication_mut() -> Option<&'static mut HostedRelationPublication> {
+    let route = native_disk_relation::retained_native_storage_recheck_route()?;
+    let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY)).as_mut()?;
+    let publication = query.publication.as_mut()?;
+    let exact_relation = if let Some((previous, next)) = publication.native_disk_refresh {
+        previous == route
+            && next.key.relation.generation == publication.parent_relation.relation().generation()
+    } else {
+        publication.native_disk_proof.is_some()
+            && route.key.relation.generation == publication.parent_relation.relation().generation()
+    };
+    if !exact_relation
+        || publication.claim != query.claim
+        || route.key.relation.bus_device != query.claim.pdo_device_id
+    { return None; }
+    Some(publication)
+}
+
+pub(crate) unsafe fn native_storage_relation_recheck_id() -> Option<u64> {
+    let publication = retained_native_storage_relation_publication_mut()?;
+    matches!(publication.phase, HostedRelationPublicationPhase::Admit)
+        .then(|| publication.persistence.retained_native_work()?.header_recheck()).flatten()
+}
+
+pub(crate) unsafe fn native_storage_relation_wal_retained() -> bool {
+    retained_native_storage_relation_publication_mut()
+        .and_then(|publication| publication.persistence.retained_native_work())
+        .is_some_and(|work| work.needs_pump())
+}
+
+pub(crate) unsafe fn claim_native_relation_wal_io()
+    -> Option<crate::writable_fs::native_snapshot_io::SnapshotClaim>
+{
+    let publication = retained_native_storage_relation_publication_mut()?;
+    if !publication.persistence.retained_native_work()?.wal() { return None; }
+    let (request, operation, input, mount) = publication.persistence.claim_native_wal_io().ok()??;
+    Some(crate::writable_fs::native_snapshot_io::SnapshotClaim::from_relation_wal(
+        mount, operation, input, publication.claim, request,
+    ))
+}
+
+unsafe fn relation_wal_for(
+    claim: nt_pnp_manager::DeviceRelationInvalidation,
+) -> Result<&'static mut crate::writable_fs::registry_wal::Journal, u32> {
+    let publication = retained_native_storage_relation_publication_mut()
+        .ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
+    if publication.claim != claim { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); }
+    publication.persistence.native_wal_mut().ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)
+}
+
+pub(crate) unsafe fn mark_native_relation_wal_entered(
+    claim: nt_pnp_manager::DeviceRelationInvalidation, request: nt_fs::AsyncWalIoRequest,
+) -> Result<(), u32> {
+    relation_wal_for(claim)?.mark_native_io_entered(request)
+}
+
+pub(crate) unsafe fn release_unentered_native_relation_wal(
+    claim: nt_pnp_manager::DeviceRelationInvalidation, request: nt_fs::AsyncWalIoRequest,
+) -> Result<(), u32> {
+    relation_wal_for(claim)?.release_unentered_native_io(request)
+}
+
+pub(crate) unsafe fn refuse_unentered_native_relation_wal(
+    claim: nt_pnp_manager::DeviceRelationInvalidation, request: nt_fs::AsyncWalIoRequest,
+    status: nt_status::NtStatus,
+) -> Result<(), u32> {
+    let publication = retained_native_storage_relation_publication_mut()
+        .ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
+    if publication.claim != claim { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); }
+    let refusal = publication.persistence.native_wal_mut()
+        .ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?
+        .refuse_unentered_native_io(request)?;
+    publication.refusal_origin = Some(publication.phase);
+    publication.refusal = status;
+    if refusal == nt_fs::AsyncWalRefusal::NoEffect {
+        publication.phase = HostedRelationPublicationPhase::Rollback;
+    }
+    Ok(())
+}
+
+pub(crate) unsafe fn complete_native_relation_wal_io(
+    claim: nt_pnp_manager::DeviceRelationInvalidation, request: nt_fs::AsyncWalIoRequest,
+    result: Result<&[u8], nt_status::NtStatus>,
+) -> Result<(), u32> {
+    relation_wal_for(claim)?.complete_native_io(request, result)
+}
+
 /// An uncommitted relation may still contribute the exact PDO for a registry devnode. The
 /// claimant is removed from the queue while its query is active, so both owners must be checked.
 pub(crate) unsafe fn hosted_bus_relation_pending() -> bool {

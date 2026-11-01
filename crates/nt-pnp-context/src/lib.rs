@@ -10,6 +10,7 @@ extern crate alloc;
 
 pub mod pci_dma_handoff;
 pub mod native_storage_handoff;
+pub mod native_route_publication;
 pub mod resource_mapping;
 
 use alloc::vec::Vec;

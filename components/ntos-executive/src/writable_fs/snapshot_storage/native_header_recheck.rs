@@ -103,6 +103,16 @@ pub(crate) unsafe fn claim_next_storage_io()
         alloc::vec::Vec::new(), SnapshotStorageTicket { owner_id: owner.id, request }))
 }
 
+/// Claim only the header read retained by the active relation's CM mutation admission.
+pub(crate) unsafe fn claim_storage_io_for(id: u64)
+    -> Option<crate::writable_fs::native_snapshot_io::SnapshotClaim>
+{
+    if id == 0 || (&*core::ptr::addr_of!(PENDING_HEADER)).as_ref()?.id != id {
+        return None;
+    }
+    claim_next_storage_io()
+}
+
 pub(crate) unsafe fn mark_storage_io_entered(ticket: &SnapshotStorageTicket) -> Result<(), u32> {
     let owner = (&mut *core::ptr::addr_of_mut!(PENDING_HEADER)).as_mut()
         .ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;

@@ -6,6 +6,11 @@ use nt_memory_manager::SectionMountId;
 
 enum SnapshotOwnerToken {
     Mutation { work_id: u64, request: nt_fs::AsyncWalIoRequest },
+    RelationWal {
+        claim: nt_pnp_context::native_route_publication::RelationWalClaim<
+            nt_pnp_manager::DeviceRelationInvalidation, nt_fs::AsyncWalIoRequest,
+        >,
+    },
     Hive(super::hive_wal::HiveTicket),
     Storage(snapshot_storage::SnapshotStorageTicket),
     Checkpoint(super::native_checkpoint::CheckpointTicket),
@@ -53,6 +58,17 @@ impl SnapshotClaim {
         Self { mount, operation, input,
             owner: SnapshotOwnerToken::Mutation { work_id, request } }
     }
+
+    pub(crate) fn from_relation_wal(
+        mount: SectionMountId, operation: nt_fs::BlockOperation, input: Vec<u8>,
+        owner: nt_pnp_manager::DeviceRelationInvalidation, request: nt_fs::AsyncWalIoRequest,
+    ) -> Self {
+        Self { mount, operation, input,
+            owner: SnapshotOwnerToken::RelationWal {
+                claim: nt_pnp_context::native_route_publication::RelationWalClaim { owner, request },
+            },
+        }
+    }
 }
 
 pub(crate) fn admission_busy(status: u32) -> bool {
@@ -71,6 +87,14 @@ pub(crate) unsafe fn claim_next_native_snapshot_io() -> Option<SnapshotClaim> {
         .or_else(|| crate::registry_mutation_work::claim_next_native_wal_io())
 }
 
+pub(crate) unsafe fn claim_relation_header_recheck(id: u64) -> Option<SnapshotClaim> {
+    snapshot_storage::claim_storage_io_for(id)
+}
+
+pub(crate) unsafe fn claim_retained_relation_wal_io() -> Option<SnapshotClaim> {
+    crate::driver_launch::claim_native_relation_wal_io()
+}
+
 pub(crate) unsafe fn mark_entered_native_snapshot_io(claim: &SnapshotClaim) -> Result<(), u32> {
     match &claim.owner {
         SnapshotOwnerToken::Hive(ticket) => {
@@ -82,6 +106,8 @@ pub(crate) unsafe fn mark_entered_native_snapshot_io(claim: &SnapshotClaim) -> R
         }
         SnapshotOwnerToken::Mutation { work_id, request } =>
             crate::registry_mutation_work::mark_native_wal_io_entered(*work_id, *request),
+        SnapshotOwnerToken::RelationWal { claim } =>
+            crate::driver_launch::mark_native_relation_wal_entered(claim.owner, claim.request),
         SnapshotOwnerToken::Storage(ticket) => snapshot_storage::mark_storage_io_entered(ticket),
         SnapshotOwnerToken::Checkpoint(ticket) => super::native_checkpoint::mark_entered(ticket),
         SnapshotOwnerToken::Fold(ticket) => super::system_wal_fold::native::mark_entered(ticket),
@@ -93,6 +119,8 @@ pub(crate) unsafe fn release_unentered_native_snapshot_io(claim: SnapshotClaim) 
         SnapshotOwnerToken::Hive(ticket) => super::hive_wal::release_unentered_native_hive_io(ticket),
         SnapshotOwnerToken::Mutation { work_id, request } =>
             crate::registry_mutation_work::release_unentered_native_wal_io(work_id, request),
+        SnapshotOwnerToken::RelationWal { claim } =>
+            crate::driver_launch::release_unentered_native_relation_wal(claim.owner, claim.request),
         SnapshotOwnerToken::Storage(ticket) => snapshot_storage::release_unentered_storage_io(ticket),
         SnapshotOwnerToken::Checkpoint(ticket) => super::native_checkpoint::release_unentered(ticket),
         SnapshotOwnerToken::Fold(ticket) => super::system_wal_fold::native::release_unentered(ticket),
@@ -107,6 +135,8 @@ pub(crate) unsafe fn refuse_unentered_native_snapshot_io(
         SnapshotOwnerToken::Hive(ticket) => super::hive_wal::refuse_unentered_native_hive_io(ticket, status),
         SnapshotOwnerToken::Mutation { work_id, request } =>
             crate::registry_mutation_work::refuse_unentered_native_wal_io(work_id, request, status),
+        SnapshotOwnerToken::RelationWal { claim } =>
+            crate::driver_launch::refuse_unentered_native_relation_wal(claim.owner, claim.request, status),
         SnapshotOwnerToken::Storage(ticket) => snapshot_storage::refuse_unentered_storage_io(ticket, status),
         SnapshotOwnerToken::Checkpoint(ticket) => super::native_checkpoint::refuse_unentered(ticket, status),
         SnapshotOwnerToken::Fold(ticket) => super::system_wal_fold::native::refuse_unentered(ticket, status),
@@ -120,6 +150,8 @@ pub(crate) unsafe fn complete_native_snapshot_io(
         SnapshotOwnerToken::Hive(ticket) => super::hive_wal::complete_native_hive_io(ticket, result),
         SnapshotOwnerToken::Mutation { work_id, request } =>
             crate::registry_mutation_work::complete_native_wal_io(work_id, request, result),
+        SnapshotOwnerToken::RelationWal { claim } =>
+            crate::driver_launch::complete_native_relation_wal_io(claim.owner, claim.request, result),
         SnapshotOwnerToken::Storage(ticket) => snapshot_storage::complete_storage_io(ticket, result),
         SnapshotOwnerToken::Checkpoint(ticket) => super::native_checkpoint::complete(ticket, result),
         SnapshotOwnerToken::Fold(ticket) => super::system_wal_fold::native::complete(ticket, result),

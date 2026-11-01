@@ -60,8 +60,8 @@ pub(crate) struct NativeStorageRoute {
     pub key: nt_pnp_context::native_storage_handoff::StorageHandoffKey,
 }
 
-static mut NATIVE_STORAGE_ROUTE: Option<NativeStorageRoute> = None;
-static mut NATIVE_STORAGE_REFRESHING: bool = false;
+type Publication = nt_pnp_context::native_route_publication::NativeRoutePublication<NativeStorageRoute>;
+static mut NATIVE_STORAGE_PUBLICATION: Publication = Publication::Absent;
 
 struct ProofTerminal {
     status: nt_status::NtStatus,
@@ -318,30 +318,33 @@ impl NativeDiskProof {
 }
 
 pub(crate) fn native_storage_route() -> Option<NativeStorageRoute> {
-    unsafe {
-        if *core::ptr::addr_of!(NATIVE_STORAGE_REFRESHING) { None }
-        else { *core::ptr::addr_of!(NATIVE_STORAGE_ROUTE) }
-    }
+    unsafe { (*core::ptr::addr_of!(NATIVE_STORAGE_PUBLICATION)).published() }
+}
+
+/// A relation retaining the exact mounted route may service only its own WAL header recheck.
+/// Neither initial publication nor refresh exposes the route to ordinary mounted requests.
+pub(crate) fn retained_native_storage_recheck_route() -> Option<NativeStorageRoute> {
+    unsafe { (*core::ptr::addr_of!(NATIVE_STORAGE_PUBLICATION)).retained_recheck_route() }
 }
 
 pub(super) fn begin_native_storage_refresh(
     previous: NativeStorageRoute,
 ) -> Result<(), nt_status::NtStatus> {
     unsafe {
-        if *core::ptr::addr_of!(NATIVE_STORAGE_REFRESHING)
-            || *core::ptr::addr_of!(NATIVE_STORAGE_ROUTE) != Some(previous)
-            || crate::fs_loader::exec_native_block_pending(previous.mount).is_some()
-        { return Err(nt_status::NtStatus::DEVICE_BUSY); }
-        *core::ptr::addr_of_mut!(NATIVE_STORAGE_REFRESHING) = true;
+        let slot = &mut *core::ptr::addr_of_mut!(NATIVE_STORAGE_PUBLICATION);
+        if crate::fs_loader::exec_native_block_pending(previous.mount).is_some() {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        *slot = slot.begin_refresh(previous)
+            .map_err(|_| nt_status::NtStatus::DEVICE_BUSY)?;
         Ok(())
     }
 }
 
 pub(super) fn abort_native_storage_refresh(previous: NativeStorageRoute) {
     unsafe {
-        if *core::ptr::addr_of!(NATIVE_STORAGE_ROUTE) == Some(previous) {
-            *core::ptr::addr_of_mut!(NATIVE_STORAGE_REFRESHING) = false;
-        }
+        let slot = &mut *core::ptr::addr_of_mut!(NATIVE_STORAGE_PUBLICATION);
+        if let Some(published) = slot.abort_refresh(previous) { *slot = published; }
     }
 }
 
@@ -349,14 +352,14 @@ pub(super) fn abort_native_storage_refresh(previous: NativeStorageRoute) {
 /// candidate cannot silently replace the mounted disk even if it reports identical bytes.
 pub(super) fn publish_native_storage_route(route: NativeStorageRoute) -> Result<(), nt_status::NtStatus> {
     unsafe {
-        let slot = &mut *core::ptr::addr_of_mut!(NATIVE_STORAGE_ROUTE);
-        if slot.is_some() || route.scsi.pdo.is_null() || route.driver_id.is_null() {
+        let slot = &mut *core::ptr::addr_of_mut!(NATIVE_STORAGE_PUBLICATION);
+        if route.scsi.pdo.is_null() || route.driver_id.is_null() {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
-        *slot = Some(route);
+        *slot = slot.publish_initial(route)
+            .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
         // The mount is committed, but the accepted PDO catalog and relation-local
         // publication still have to finish before new file requests may enter.
-        *core::ptr::addr_of_mut!(NATIVE_STORAGE_REFRESHING) = true;
         Ok(())
     }
 }
@@ -365,11 +368,11 @@ pub(super) fn complete_initial_native_storage_publication(
     route: NativeStorageRoute,
 ) -> Result<(), nt_status::NtStatus> {
     unsafe {
-        if *core::ptr::addr_of!(NATIVE_STORAGE_ROUTE) != Some(route)
-            || !*core::ptr::addr_of!(NATIVE_STORAGE_REFRESHING)
-            || crate::fs_loader::exec_native_block_pending(route.mount).is_some()
+        if crate::fs_loader::exec_native_block_pending(route.mount).is_some()
         { return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST); }
-        *core::ptr::addr_of_mut!(NATIVE_STORAGE_REFRESHING) = false;
+        let slot = &mut *core::ptr::addr_of_mut!(NATIVE_STORAGE_PUBLICATION);
+        *slot = slot.complete_initial(route)
+            .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
         Ok(())
     }
 }
@@ -380,9 +383,9 @@ pub(super) fn commit_refreshed_native_storage_route(
 ) -> Result<(), nt_status::NtStatus> {
     validate_refreshed_native_storage_route(previous, next)?;
     unsafe {
-        let slot = &mut *core::ptr::addr_of_mut!(NATIVE_STORAGE_ROUTE);
-        *slot = Some(next);
-        *core::ptr::addr_of_mut!(NATIVE_STORAGE_REFRESHING) = false;
+        let slot = &mut *core::ptr::addr_of_mut!(NATIVE_STORAGE_PUBLICATION);
+        *slot = slot.commit_refresh(previous, next)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
         Ok(())
     }
 }
@@ -392,8 +395,8 @@ pub(super) fn validate_refreshed_native_storage_route(
     next: NativeStorageRoute,
 ) -> Result<(), nt_status::NtStatus> {
     unsafe {
-        if *core::ptr::addr_of!(NATIVE_STORAGE_ROUTE) != Some(previous)
-            || !*core::ptr::addr_of!(NATIVE_STORAGE_REFRESHING)
+        if !matches!(*core::ptr::addr_of!(NATIVE_STORAGE_PUBLICATION),
+            Publication::Refreshing { route } if route == previous)
             || crate::fs_loader::exec_native_block_pending(previous.mount).is_some()
             || crate::boot_storage_dma_handoff::validate_native_disk_refresh(previous.key, next.key)
                 .is_err()
