@@ -12,6 +12,28 @@ static ACTIVE_RETAINED_SEH_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static IRQ_IRP_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static IRQ_SYSCALL_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static IRQ_RETAINED_SEH_RECEIVES: AtomicU64 = AtomicU64::new(0);
+static PS_CREATE_RECEIVE_TRACE: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn begin_ps_create_receive_trace() {
+    PS_CREATE_RECEIVE_TRACE.store(1, Ordering::Relaxed);
+}
+
+fn trace_ps_create_receive(ch: &PumpChannel, stage: &[u8], route: Option<PeerRoute>) {
+    let sequence = PS_CREATE_RECEIVE_TRACE.load(Ordering::Relaxed);
+    if sequence == 0 || sequence > 64 {
+        return;
+    }
+    PS_CREATE_RECEIVE_TRACE.store(sequence + 1, Ordering::Relaxed);
+    crate::print_str(b"[ps-create-receive] #");
+    crate::print_u64(sequence);
+    crate::print_str(b" stage=");
+    crate::print_str(stage);
+    crate::print_str(b" tcb=");
+    crate::print_u64(ch.tcb);
+    crate::print_str(b" route=");
+    crate::print_u64(route.map_or(0, |route| route.badge()));
+    crate::print_str(b"\n");
+}
 
 struct ReceiveCensusScope {
     kind: ReqKind,
@@ -98,6 +120,7 @@ pub(super) unsafe fn receive(
     let mut irq_checkpoint = inline_irq_checkpoint && inline_irq_work_pending();
     let mut timer_probe_consumed = false;
     loop {
+        trace_ps_create_receive(ch, b"loop", Some(route));
         if !retained_seh {
             match crate::win32k_glue::prepare_receive_yield(ch) {
                 Ok(Some(yielded)) => return PumpMessage::hosted_receive_yield(yielded),
@@ -172,6 +195,7 @@ pub(super) unsafe fn receive(
             }
             if progressed { continue; }
         }
+        trace_ps_create_receive(ch, b"retained-services", Some(route));
         match runtime::resume_acknowledged_retained_services() {
             Ok(true) => continue,
             Ok(false) => {}
@@ -180,10 +204,12 @@ pub(super) unsafe fn receive(
                 return PumpMessage::transport_wall();
             }
         }
+        trace_ps_create_receive(ch, b"resume-service", Some(route));
         if runtime::resume_service(route).is_err() {
             crate::print_str(b"[pump-ingress] route resume failed\n");
             return PumpMessage::transport_wall();
         }
+        trace_ps_create_receive(ch, b"route-next", Some(route));
         let next = match runtime::next_message(route) {
             Ok(next) => next,
             Err(_) => {
@@ -206,10 +232,13 @@ pub(super) unsafe fn receive(
         // The registry journal has moved the mounted volume into its own transaction.
         // Leave autonomous Calls in the retained receiver until that owner releases it.
         if !crate::writable_fs::registry_journal::owns_volume() {
+            trace_ps_create_receive(ch, b"autonomous-select", Some(route));
             match runtime::next_autonomous() {
                 Ok(Some(sender)) => {
+                    trace_ps_create_receive(ch, b"autonomous-found", Some(sender));
                     service_autonomous(sender)
                         .expect("autonomous failure retains its own source and parent scope");
+                    trace_ps_create_receive(ch, b"autonomous-return", Some(sender));
                     continue;
                 }
                 Ok(None) => {}
@@ -246,8 +275,10 @@ pub(super) unsafe fn receive(
                 return PumpMessage::transport_wall();
             }
         };
+        trace_ps_create_receive(ch, b"physical-receive", Some(route));
         let arrival = runtime::receive(execution, ch.tcb,
             serviced_scheduler_yield || !timer_checkpoint);
+        trace_ps_create_receive(ch, b"physical-return", Some(route));
         match arrival {
             Ok(runtime::Arrival::Hosted) => {}
             Ok(runtime::Arrival::Call { .. }) => {

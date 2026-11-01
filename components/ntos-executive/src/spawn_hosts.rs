@@ -1889,6 +1889,7 @@ unsafe fn pump_reply_recv4_traced(
     }
     crate::driver_launch::trace_port_connect_pump_boundary(1, ch, reply_cap, reply_r0);
     if trace_system_thread_reply {
+        shared_pump::begin_ps_create_receive_trace();
         crate::print_str(b"[driver-thread-reply] enter tcb=");
         crate::print_u64(ch.tcb);
         crate::print_str(b" reply=");
@@ -1925,6 +1926,9 @@ unsafe fn pump_reply_recv4_traced(
         && crate::dispatcher_bootstrap::request_receive_checkpoint()
         && crate::dispatcher_bootstrap::timer_work_pending()
     {
+        if trace_system_thread_reply {
+            crate::print_str(b"[driver-thread-reply] scheduler-checkpoint\n");
+        }
         return PumpMessage::scheduler_yield();
     }
     if trace_system_thread_reply {
