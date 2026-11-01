@@ -16,12 +16,16 @@ static PS_CREATE_RECEIVE_TRACE: AtomicU64 = AtomicU64::new(0);
 static PS_CREATE_RECEIVE_EVENTS: AtomicU64 = AtomicU64::new(0);
 static PS_CREATE_AUTONOMOUS_EVENTS: AtomicU64 = AtomicU64::new(0);
 static PS_CREATE_AFTER_AUTONOMOUS_TRACE: AtomicU64 = AtomicU64::new(0);
+static PS_CREATE_AFTER_AUTONOMOUS_SELECT: AtomicU64 = AtomicU64::new(0);
+static PS_CREATE_FOLD_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn begin_ps_create_receive_trace() {
     PS_CREATE_RECEIVE_TRACE.store(1, Ordering::Relaxed);
     PS_CREATE_RECEIVE_EVENTS.store(0, Ordering::Relaxed);
     PS_CREATE_AUTONOMOUS_EVENTS.store(0, Ordering::Relaxed);
     PS_CREATE_AFTER_AUTONOMOUS_TRACE.store(0, Ordering::Relaxed);
+    PS_CREATE_AFTER_AUTONOMOUS_SELECT.store(0, Ordering::Relaxed);
+    PS_CREATE_FOLD_EVENTS.store(0, Ordering::Relaxed);
 }
 
 fn trace_ps_create_event(stage: &[u8], route: PeerRoute, reply: u64, info: u64) {
@@ -30,11 +34,17 @@ fn trace_ps_create_event(stage: &[u8], route: PeerRoute, reply: u64, info: u64) 
     }
     let counter = if stage.starts_with(b"autonomous-") {
         &PS_CREATE_AUTONOMOUS_EVENTS
+    } else if stage.starts_with(b"fold-") {
+        &PS_CREATE_FOLD_EVENTS
     } else {
         &PS_CREATE_RECEIVE_EVENTS
     };
     let sequence = counter.fetch_add(1, Ordering::Relaxed) + 1;
-    let initial = if stage.starts_with(b"autonomous-") { 32 } else { 8 };
+    let initial = if stage.starts_with(b"autonomous-") || stage.starts_with(b"fold-") {
+        32
+    } else {
+        8
+    };
     if sequence > initial && !sequence.is_power_of_two() {
         return;
     }
@@ -214,14 +224,17 @@ pub(super) unsafe fn receive(
         // Enter CM and native snapshot I/O here with the exact Receive parent parked; the
         // cadence gate prevents a recursive CM call from admitting the same fold again.
         if crate::service_sec_image::system_wal_fold_work_pending() {
+            trace_ps_create_event(b"fold-enter", route, 0, 0);
             let mut parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,
                 Err(_) => return PumpMessage::transport_wall(),
             };
             let result = crate::service_sec_image::service_due_system_wal_fold();
+            trace_ps_create_event(b"fold-service-return", route, 0, 0);
             if runtime::nested::restore(&mut parent).is_err() {
                 return PumpMessage::transport_wall();
             }
+            trace_ps_create_event(b"fold-restore-return", route, 0, 0);
             match result {
                 Ok(true) => continue,
                 Ok(false) => {},
@@ -286,6 +299,12 @@ pub(super) unsafe fn receive(
         // Leave autonomous Calls in the retained receiver until that owner releases it.
         if !crate::writable_fs::registry_journal::owns_volume() {
             trace_ps_create_receive(ch, b"autonomous-select", Some(route));
+            if PS_CREATE_AFTER_AUTONOMOUS_TRACE.load(Ordering::Relaxed) != 0 {
+                let selected = PS_CREATE_AFTER_AUTONOMOUS_SELECT.fetch_add(1, Ordering::Relaxed) + 1;
+                if selected <= 8 || selected.is_power_of_two() {
+                    runtime::trace_autonomous_candidates();
+                }
+            }
             match runtime::next_autonomous() {
                 Ok(Some(sender)) => {
                     if let Ok(Some((reply, info))) = runtime::pending_route_snapshot(sender) {
@@ -297,6 +316,7 @@ pub(super) unsafe fn receive(
                     trace_ps_create_event(b"autonomous-return", sender, 0, 0);
                     trace_ps_create_receive(ch, b"autonomous-return", Some(sender));
                     PS_CREATE_AFTER_AUTONOMOUS_TRACE.store(1, Ordering::Relaxed);
+                    PS_CREATE_AFTER_AUTONOMOUS_SELECT.store(0, Ordering::Relaxed);
                     continue;
                 }
                 Ok(None) => {}

@@ -950,6 +950,28 @@ pub(crate) unsafe fn next_autonomous() -> Result<Option<PeerRoute>, Error> {
     Ok(None)
 }
 
+/// Read-only route census at the autonomous selection boundary. It never admits or consumes a
+/// Call; the subsequent `next_autonomous` still makes the scheduling decision.
+pub(crate) unsafe fn trace_autonomous_candidates() {
+    for row in &*core::ptr::addr_of!(NATIVE_PEERS) {
+        if !matches!(row.physical.kind, PhysicalSourceKind::SystemThread { .. }) {
+            continue;
+        }
+        crate::print_str(b"[autonomous-candidate] route=");
+        crate::print_u64(row.route.map_or(0, |route| route.badge()));
+        crate::print_str(b" quarantined=");
+        crate::print_u64(u64::from(row.quarantined));
+        crate::print_str(b" pending=");
+        let pending = row.route.and_then(|route| next_message(route).ok().flatten());
+        crate::print_u64(u64::from(pending.is_some()));
+        if let Some((_, message)) = pending {
+            crate::print_str(b" label=");
+            crate::print_u64(message.info() >> 12);
+        }
+        crate::print_str(b"\n");
+    }
+}
+
 pub(crate) unsafe fn receive_owner(route: PeerRoute) -> Result<IngressExecutionOwner, Error> {
     if resolve(route, false).is_none() {
         return Err(Error::PhysicalIdentity);
