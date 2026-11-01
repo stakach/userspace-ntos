@@ -700,45 +700,47 @@ impl DmaManager {
         })
     }
 
+    fn conflicting_logical_end_for_owner(
+        &self, owner: DmaOwner, logical: u64, length: u64,
+    ) -> Result<Option<u64>, DmaError> {
+        if logical == 0 || length == 0 {
+            return Err(DmaError::OutOfRange);
+        }
+        let end = logical.checked_add(length).ok_or(DmaError::OutOfRange)?;
+        let ranges = self.common_buffers.iter()
+            .filter(|claim| claim.active && claim.owner == owner)
+            .map(|claim| (claim.logical_base, claim.length))
+            .chain(self.mappings.iter()
+                .filter(|claim| claim.active && claim.owner == owner)
+                .map(|claim| (claim.logical_base, claim.length)))
+            .chain(self.coherent_reservations.iter()
+                .filter(|claim| claim.owner == owner
+                    && claim.state != CoherentReservationState::Released)
+                .map(|claim| (claim.logical_base, claim.length)));
+        let mut furthest_end: Option<u64> = None;
+        for (base, range_length) in ranges {
+            let range_end = base.checked_add(range_length).ok_or(DmaError::OutOfRange)?;
+            if logical < range_end && base < end {
+                furthest_end = Some(furthest_end.map_or(range_end, |previous| previous.max(range_end)));
+            }
+        }
+        Ok(furthest_end)
+    }
+
     fn logical_range_in_use(&self, owner: DmaOwner, logical_base: u64, length: u64) -> bool {
-        let Some(end) = logical_base.checked_add(length) else {
-            return true;
-        };
-        for cb in self
-            .common_buffers
-            .iter()
-            .filter(|c| c.active && c.owner == owner)
-        {
-            let Some(cb_end) = cb.logical_base.checked_add(cb.length) else {
-                return true;
-            };
-            if logical_base < cb_end && cb.logical_base < end {
-                return true;
-            }
+        match self.conflicting_logical_end_for_owner(owner, logical_base, length) {
+            Ok(conflict) => conflict.is_some(),
+            Err(_) => true,
         }
-        for mapping in self
-            .mappings
-            .iter()
-            .filter(|m| m.active && m.owner == owner)
-        {
-            let Some(mapping_end) = mapping.logical_base.checked_add(mapping.length) else {
-                return true;
-            };
-            if logical_base < mapping_end && mapping.logical_base < end {
-                return true;
-            }
-        }
-        for reservation in self.coherent_reservations.iter().filter(|reservation| {
-            reservation.owner == owner && reservation.state != CoherentReservationState::Released
-        }) {
-            let Some(reservation_end) = reservation.logical_base.checked_add(reservation.length) else {
-                return true;
-            };
-            if logical_base < reservation_end && reservation.logical_base < end {
-                return true;
-            }
-        }
-        false
+    }
+
+    /// Furthest end-exclusive address of live owner claims overlapping a candidate range.
+    /// Check every adapter of this owner because all of them share the same logical grant.
+    pub fn conflicting_logical_end(
+        &self, owner: DmaOwner, adapter_id: u64, logical: u64, length: u64,
+    ) -> Result<Option<u64>, DmaError> {
+        self.adapter(adapter_id, owner)?;
+        self.conflicting_logical_end_for_owner(owner, logical, length)
     }
 
     /// `FreeCommonBuffer` (spec §11.2): validate the logical address + length belong
@@ -1516,6 +1518,75 @@ mod tests {
         assert_eq!(dma.common_buffer_claim_covering(
             DmaOwner::new(1, 101, 10), 0x4080, 128, 0x20_0080,
         ), None);
+    }
+
+    #[test]
+    fn logical_conflict_query_spans_adapters_and_live_claim_kinds() {
+        let mut dma = DmaManager::new();
+        let common_adapter = dma.register_adapter(owner(), true, 4096, true);
+        let candidate_adapter = dma.register_adapter(owner(), true, 4096, true);
+        let common = dma.register_common_buffer_at(
+            owner(), common_adapter, 0x2000, 0x100, 0x20_0000,
+        ).unwrap();
+        let mapping = dma.register_mapping_at(
+            owner(), common_adapter, 0x3000, 0x30_0000, 0x80,
+        ).unwrap();
+        // The selected adapter is not the adapter that owns either claim. The root query
+        // must still skip both occupied ranges before a native writer touches grant bytes.
+        assert_eq!(dma.conflicting_logical_end(owner(), candidate_adapter, 0x2080, 0x100),
+            Ok(Some(0x2100)));
+        assert_eq!(dma.conflicting_logical_end(owner(), candidate_adapter, 0x2ff0, 0x20),
+            Ok(Some(0x3080)));
+        // One candidate can overlap more than one disjoint claim. Skip all of them in one
+        // query instead of spending another root round trip at the next occupied slice.
+        assert_eq!(dma.conflicting_logical_end(owner(), candidate_adapter, 0x2080, 0x1100),
+            Ok(Some(0x3080)));
+        assert_eq!(dma.conflicting_logical_end(owner(), candidate_adapter, 0x2100, 0x100),
+            Ok(None));
+
+        dma.free_common_buffer_for_adapter_id(
+            owner(), common_adapter, common.common_buffer_id, 0x2000, 0x100,
+        ).unwrap();
+        dma.free_mapping_for_owner(owner(), mapping.mapping_id).unwrap();
+        assert_eq!(dma.conflicting_logical_end(owner(), candidate_adapter, 0x2080, 0x100),
+            Ok(None));
+        assert_eq!(dma.conflicting_logical_end(owner(), candidate_adapter, 0x2ff0, 0x20),
+            Ok(None));
+    }
+
+    #[test]
+    fn logical_conflict_query_includes_coherent_reservations_and_is_owner_scoped() {
+        let mut dma = DmaManager::new();
+        let adapter = dma.register_adapter(owner(), true, 4096, true);
+        let foreign = DmaOwner::new(2, 200, 20);
+        let foreign_adapter = dma.register_adapter(foreign, true, 4096, true);
+        let window = CoherentWindowIdentity::new(7, 11);
+        dma.register_coherent_window(owner(), window, 0x4000, 0x1000, 0x40_0000)
+            .unwrap();
+        let reservation = dma.register_coherent_reservation_at(
+            owner(), window, 0x4100, 0x200, 0x40_0100,
+        ).unwrap();
+        dma.register_common_buffer_at(foreign, foreign_adapter, 0x5000, 0x100, 0x50_0000)
+            .unwrap();
+        assert_eq!(dma.conflicting_logical_end(owner(), adapter, 0x4200, 0x100),
+            Ok(Some(0x4300)));
+        assert_eq!(dma.conflicting_logical_end(owner(), adapter, 0x5000, 0x100),
+            Ok(None));
+        assert_eq!(dma.conflicting_logical_end(foreign, foreign_adapter, 0x5000, 0x100),
+            Ok(Some(0x5100)));
+        assert_eq!(dma.conflicting_logical_end(foreign, adapter, 0x4200, 0x100),
+            Err(DmaError::WrongOwner));
+
+        dma.release_coherent_reservation(owner(), window, reservation.reservation_id)
+            .unwrap();
+        assert_eq!(dma.conflicting_logical_end(owner(), adapter, 0x4200, 0x100),
+            Ok(None));
+        assert_eq!(dma.conflicting_logical_end(owner(), adapter, 0, 1),
+            Err(DmaError::OutOfRange));
+        assert_eq!(dma.conflicting_logical_end(owner(), adapter, 0x4000, 0),
+            Err(DmaError::OutOfRange));
+        assert_eq!(dma.conflicting_logical_end(owner(), adapter, u64::MAX, 2),
+            Err(DmaError::OutOfRange));
     }
 
     fn adapter_request() -> DmaAdapterRequest {
