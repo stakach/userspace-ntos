@@ -51,6 +51,7 @@ pub trait DirectoryPort {
     fn poll_create(&mut self, pending: &mut Self::Pending)
         -> Option<PortTerminal<CanonicalHandle<Self::Handle>>>;
     fn make_temporary(&mut self, handle: Self::Handle) -> PortEffect<Self::Pending>;
+    fn make_permanent(&mut self, handle: Self::Handle) -> PortEffect<Self::Pending>;
     fn close(&mut self, handle: Self::Handle) -> PortEffect<Self::Pending>;
     fn poll_effect(&mut self, pending: &mut Self::Pending) -> Option<PortTerminal<()>>;
 }
@@ -61,6 +62,7 @@ enum Phase<H, P> {
     Ready(CanonicalHandle<H>),
     Bound(CanonicalHandle<H>),
     MakingTemporary(CanonicalHandle<H>, P),
+    MakingPermanent(CanonicalHandle<H>, P),
     Closing(CanonicalHandle<H>, P),
     RollbackTemporary(CanonicalHandle<H>, P),
     RollbackClose(CanonicalHandle<H>, P),
@@ -68,6 +70,9 @@ enum Phase<H, P> {
     Closed,
     Quarantined(Option<CanonicalHandle<H>>),
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Permanence { Unknown, Temporary, Permanent }
 
 struct Row<O, L, H, P> {
     owner: O,
@@ -77,7 +82,7 @@ struct Row<O, L, H, P> {
     path: Vec<u16>,
     desired_access: u32,
     attributes: u32,
-    temporary: bool,
+    permanence: Permanence,
     phase: Phase<H, P>,
 }
 
@@ -116,7 +121,13 @@ impl<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P> CanonicalDirectoryBackings<O, 
         // of the caller's separately admitted native handle rights.
         self.rows.push(Row { owner, local: None, leases: 0, action, path: retained_path,
             desired_access: desired_access | INTERNAL_DELETE_ACCESS,
-            attributes, temporary: false, phase: Phase::Reserved });
+            attributes,
+            permanence: match action {
+                DirectoryAction::Create if attributes & 0x10 != 0 => Permanence::Permanent,
+                DirectoryAction::Create => Permanence::Temporary,
+                DirectoryAction::Open => Permanence::Unknown,
+            },
+            phase: Phase::Reserved });
         Ok(())
     }
 
@@ -132,6 +143,7 @@ impl<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P> CanonicalDirectoryBackings<O, 
         match result {
             PortCreate::NoEffect(status) => Err(BackingError::NoEffect(status)),
             PortCreate::Completed(Ok(handle)) => {
+                if !handle.created { row.permanence = Permanence::Unknown; }
                 row.phase = Phase::Ready(handle);
                 Ok(Publication::Ready)
             }
@@ -158,6 +170,7 @@ impl<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P> CanonicalDirectoryBackings<O, 
         match port.poll_create(pending) {
             None => Ok(None),
             Some(PortTerminal::Success(handle)) => {
+                if !handle.created { row.permanence = Permanence::Unknown; }
                 row.phase = Phase::Ready(handle); Ok(Some(Publication::Ready))
             }
             Some(PortTerminal::Failure(status)) => {
@@ -196,6 +209,10 @@ impl<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P> CanonicalDirectoryBackings<O, 
         self.rows.iter().find(|row| row.local == Some(local)).map(|row| row.leases)
     }
 
+    pub fn owner_for_local(&self, local: L) -> Option<O> {
+        self.rows.iter().find(|row| row.local == Some(local)).map(|row| row.owner)
+    }
+
     /// Undo a canonical publication when the native mirror could not commit.
     /// A pending cleanup keeps the owner row and canonical handle reserved.
     pub fn rollback_ready(&mut self, owner: O,
@@ -205,10 +222,10 @@ impl<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P> CanonicalDirectoryBackings<O, 
             .ok_or(BackingError::WrongOwner)?;
         if row.local.is_some() { return Err(BackingError::InvalidPhase); }
         let Phase::Ready(handle) = row.phase else { return Err(BackingError::InvalidPhase); };
-        if handle.created && row.attributes & 0x10 != 0 && !row.temporary {
+        if handle.created && row.permanence == Permanence::Permanent {
             match port.make_temporary(handle.handle) {
                 PortEffect::NoEffect(status) => return Err(BackingError::NoEffect(status)),
-                PortEffect::Completed(Ok(())) => row.temporary = true,
+                PortEffect::Completed(Ok(())) => row.permanence = Permanence::Temporary,
                 PortEffect::Completed(Err(status)) => return Err(BackingError::Terminal(status)),
                 PortEffect::Indeterminate(pending) => {
                     row.phase = Phase::RollbackTemporary(handle, pending);
@@ -255,7 +272,7 @@ impl<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P> CanonicalDirectoryBackings<O, 
             match port.poll_effect(pending) {
                 None => return Ok(None),
                 Some(PortTerminal::Success(())) => {
-                    row.temporary = true;
+                    row.permanence = Permanence::Temporary;
                     row.phase = Phase::Ready(handle);
                     return Self::rollback_close(row, handle, port).map(Some);
                 }
@@ -296,11 +313,11 @@ impl<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P> CanonicalDirectoryBackings<O, 
         let row = self.rows.iter_mut().find(|row| row.local == Some(local))
             .ok_or(BackingError::WrongOwner)?;
         let Phase::Bound(handle) = row.phase else { return Err(BackingError::InvalidPhase); };
-        if row.temporary { return Ok(Publication::Ready); }
+        if row.permanence == Permanence::Temporary { return Ok(Publication::Ready); }
         match port.make_temporary(handle.handle) {
             PortEffect::NoEffect(status) => Err(BackingError::NoEffect(status)),
             PortEffect::Completed(Ok(())) => {
-                row.temporary = true;
+                row.permanence = Permanence::Temporary;
                 Ok(Publication::Ready)
             }
             PortEffect::Completed(Err(status)) => Err(BackingError::Terminal(status)),
@@ -327,7 +344,61 @@ impl<O: Copy + Eq, L: Copy + Eq, H: Copy + Eq, P> CanonicalDirectoryBackings<O, 
         match port.poll_effect(pending) {
             None => Ok(None),
             Some(PortTerminal::Success(())) => {
-                row.temporary = true;
+                row.permanence = Permanence::Temporary;
+                row.phase = Phase::Bound(handle);
+                Ok(Some(Publication::Ready))
+            }
+            Some(PortTerminal::Failure(status)) => {
+                row.phase = Phase::Bound(handle);
+                Err(BackingError::Terminal(status))
+            }
+            Some(PortTerminal::Incoherent) => {
+                row.phase = Phase::Quarantined(Some(handle));
+                Err(BackingError::EffectUncertain)
+            }
+        }
+    }
+
+    /// Promote only the exact bound directory generation. Native privilege
+    /// admission belongs to the executive before it calls this operation.
+    pub fn make_permanent(&mut self, local: L,
+        port: &mut impl DirectoryPort<Handle=H, Pending=P>)
+        -> Result<Publication, BackingError> {
+        let row = self.rows.iter_mut().find(|row| row.local == Some(local))
+            .ok_or(BackingError::WrongOwner)?;
+        let Phase::Bound(handle) = row.phase else { return Err(BackingError::InvalidPhase); };
+        if row.permanence == Permanence::Permanent { return Ok(Publication::Ready); }
+        match port.make_permanent(handle.handle) {
+            PortEffect::NoEffect(status) => Err(BackingError::NoEffect(status)),
+            PortEffect::Completed(Ok(())) => {
+                row.permanence = Permanence::Permanent;
+                Ok(Publication::Ready)
+            }
+            PortEffect::Completed(Err(status)) => Err(BackingError::Terminal(status)),
+            PortEffect::Indeterminate(pending) => {
+                row.phase = Phase::MakingPermanent(handle, pending);
+                Ok(Publication::Pending)
+            }
+            PortEffect::Incoherent => {
+                row.phase = Phase::Quarantined(Some(handle));
+                Err(BackingError::EffectUncertain)
+            }
+        }
+    }
+
+    pub fn poll_make_permanent(&mut self, local: L,
+        port: &mut impl DirectoryPort<Handle=H, Pending=P>)
+        -> Result<Option<Publication>, BackingError> {
+        let row = self.rows.iter_mut().find(|row| row.local == Some(local))
+            .ok_or(BackingError::WrongOwner)?;
+        let Phase::MakingPermanent(handle, pending) = &mut row.phase else {
+            return Err(BackingError::InvalidPhase);
+        };
+        let handle = *handle;
+        match port.poll_effect(pending) {
+            None => Ok(None),
+            Some(PortTerminal::Success(())) => {
+                row.permanence = Permanence::Permanent;
                 row.phase = Phase::Bound(handle);
                 Ok(Some(Publication::Ready))
             }

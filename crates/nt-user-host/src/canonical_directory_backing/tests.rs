@@ -45,6 +45,11 @@ impl DirectoryPort for ObjectClient<Direct<'_>> {
             .map_err(|status| status.raw() as u32))
     }
 
+    fn make_permanent(&mut self, handle: Self::Handle) -> PortEffect<Self::Pending> {
+        PortEffect::Completed(ObjectClient::make_permanent(self, handle)
+            .map_err(|status| status.raw() as u32))
+    }
+
     fn close(&mut self, handle: Self::Handle) -> PortEffect<Self::Pending> {
         PortEffect::Completed(self.close_handle(handle).map_err(|status| status.raw() as u32))
     }
@@ -87,6 +92,47 @@ fn open_if_shares_exact_backing_and_reaps_temporary_name_after_last_lease() {
     assert_eq!(backing.release_local(123, &mut client), Ok(Publication::Ready));
     assert!(backing.handle_for(123).is_none());
     assert!(client.lookup("\\Device\\SharedDirectory", true).is_err());
+}
+
+#[test]
+fn temporary_directory_promotion_retains_name_after_last_local_lease() {
+    let mut server = Server::new().unwrap();
+    let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
+    let mut client = ObjectClient::new(Direct { server: &mut server, client: cid });
+    let path: Vec<u16> = "\\Device\\PromotedDirectory".encode_utf16().collect();
+    let mut backing = CanonicalDirectoryBackings::<u64, u64, HandleValue, ()>::new();
+    backing.reserve(15, DirectoryAction::Create, &path, AccessMask::GENERIC_READ.bits(),
+        ObjAttrFlags::CASE_INSENSITIVE.bits()).unwrap();
+    assert_eq!(backing.publish(15, &mut client), Ok(Publication::Ready));
+    backing.bind_local(15, 125).unwrap();
+    assert_eq!(backing.owner_for_local(125), Some(15));
+    assert_eq!(backing.make_permanent(125, &mut client), Ok(Publication::Ready));
+    assert_eq!(backing.release_local(125, &mut client), Ok(Publication::Ready));
+    assert_eq!(backing.owner_for_local(125), Some(15));
+    assert!(client.lookup("\\Device\\PromotedDirectory", true).is_ok());
+    assert_eq!(backing.retire_terminal(15), Ok(()));
+    assert_eq!(backing.owner_for_local(125), None);
+}
+
+#[test]
+fn open_if_existing_temporary_directory_requires_real_promotion() {
+    let mut server = Server::new().unwrap();
+    let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
+    let mut client = ObjectClient::new(Direct { server: &mut server, client: cid });
+    let name = UnicodeString::from_str("\\Device\\ExistingTemporary");
+    let original = client.create_directory_handle(None, &name, AccessMask::DELETE,
+        ObjAttrFlags::CASE_INSENSITIVE).unwrap().handle;
+    let path: Vec<u16> = "\\Device\\ExistingTemporary".encode_utf16().collect();
+    let mut backing = CanonicalDirectoryBackings::<u64, u64, HandleValue, ()>::new();
+    backing.reserve(19, DirectoryAction::Create, &path, AccessMask::DELETE.bits(),
+        (ObjAttrFlags::CASE_INSENSITIVE | ObjAttrFlags::OPEN_IF
+            | ObjAttrFlags::PERMANENT).bits()).unwrap();
+    assert_eq!(backing.publish(19, &mut client), Ok(Publication::Ready));
+    backing.bind_local(19, 128).unwrap();
+    assert_eq!(backing.make_permanent(128, &mut client), Ok(Publication::Ready));
+    client.close_handle(original).unwrap();
+    assert_eq!(backing.release_local(128, &mut client), Ok(Publication::Ready));
+    assert!(client.lookup("\\Device\\ExistingTemporary", true).is_ok());
 }
 
 #[test]
@@ -159,6 +205,9 @@ impl DirectoryPort for DelayedPort {
     fn make_temporary(&mut self, _: u64) -> PortEffect<u64> {
         PortEffect::Completed(Ok(()))
     }
+    fn make_permanent(&mut self, _: u64) -> PortEffect<u64> {
+        PortEffect::Completed(Ok(()))
+    }
     fn close(&mut self, handle: u64) -> PortEffect<u64> {
         assert_eq!(handle, 77);
         self.close_calls += 1;
@@ -208,4 +257,87 @@ fn incoherent_late_create_quarantines_path_and_owner() {
     assert_eq!(backing.reserve(2, DirectoryAction::Create, &path, 0, 0),
         Err(BackingError::PathOccupied));
     assert_eq!(port.create_calls, 1);
+}
+
+struct DelayedPromotionPort {
+    promote_calls: u32,
+    close_calls: u32,
+    ready: bool,
+    incoherent: bool,
+}
+
+impl DirectoryPort for DelayedPromotionPort {
+    type Handle = u64;
+    type Pending = u64;
+
+    fn create(&mut self, _: &[u16], _: u32, _: u32) -> PortCreate<u64, u64> {
+        PortCreate::Completed(Ok(CanonicalHandle { handle: 77, created: true }))
+    }
+    fn open(&mut self, _: &[u16], _: u32, _: u32) -> PortCreate<u64, u64> {
+        PortCreate::Completed(Ok(CanonicalHandle { handle: 77, created: false }))
+    }
+    fn poll_create(&mut self, _: &mut u64) -> Option<PortTerminal<CanonicalHandle<u64>>> {
+        None
+    }
+    fn make_temporary(&mut self, _: u64) -> PortEffect<u64> {
+        PortEffect::Completed(Ok(()))
+    }
+    fn make_permanent(&mut self, handle: u64) -> PortEffect<u64> {
+        assert_eq!(handle, 77);
+        self.promote_calls += 1;
+        PortEffect::Indeterminate(45)
+    }
+    fn close(&mut self, handle: u64) -> PortEffect<u64> {
+        assert_eq!(handle, 77);
+        self.close_calls += 1;
+        PortEffect::Completed(Ok(()))
+    }
+    fn poll_effect(&mut self, pending: &mut u64) -> Option<PortTerminal<()>> {
+        assert_eq!(*pending, 45);
+        self.ready.then_some(if self.incoherent { PortTerminal::Incoherent }
+            else { PortTerminal::Success(()) })
+    }
+}
+
+#[test]
+fn uncertain_promotion_retains_handle_and_does_not_replay() {
+    let path: Vec<u16> = "\\Device\\LatePromotion".encode_utf16().collect();
+    let mut backing = CanonicalDirectoryBackings::<u64, u64, u64, u64>::new();
+    let mut port = DelayedPromotionPort {
+        promote_calls: 0, close_calls: 0, ready: false, incoherent: false,
+    };
+    backing.reserve(16, DirectoryAction::Create, &path, 0, 0).unwrap();
+    assert_eq!(backing.publish(16, &mut port), Ok(Publication::Ready));
+    backing.bind_local(16, 126).unwrap();
+    assert_eq!(backing.make_permanent(126, &mut port), Ok(Publication::Pending));
+    assert_eq!(backing.make_permanent(126, &mut port), Err(BackingError::InvalidPhase));
+    assert_eq!(backing.release_local(126, &mut port), Err(BackingError::InvalidPhase));
+    assert_eq!(backing.poll_make_permanent(126, &mut port), Ok(None));
+    assert_eq!(port.promote_calls, 1);
+    port.ready = true;
+    assert_eq!(backing.poll_make_permanent(126, &mut port), Ok(Some(Publication::Ready)));
+    assert_eq!(backing.make_permanent(126, &mut port), Ok(Publication::Ready));
+    assert_eq!(port.promote_calls, 1);
+    assert_eq!(backing.release_local(126, &mut port), Ok(Publication::Ready));
+    assert_eq!(port.close_calls, 1);
+}
+
+#[test]
+fn incoherent_promotion_quarantines_exact_handle_and_path() {
+    let path: Vec<u16> = "\\Device\\BadPromotion".encode_utf16().collect();
+    let mut backing = CanonicalDirectoryBackings::<u64, u64, u64, u64>::new();
+    let mut port = DelayedPromotionPort {
+        promote_calls: 0, close_calls: 0, ready: true, incoherent: true,
+    };
+    backing.reserve(17, DirectoryAction::Create, &path, 0, 0).unwrap();
+    assert_eq!(backing.publish(17, &mut port), Ok(Publication::Ready));
+    backing.bind_local(17, 127).unwrap();
+    assert_eq!(backing.make_permanent(127, &mut port), Ok(Publication::Pending));
+    assert_eq!(backing.poll_make_permanent(127, &mut port), Err(BackingError::EffectUncertain));
+    assert_eq!(backing.quarantined_handle(17), Some(77));
+    assert_eq!(backing.release_local(127, &mut port), Err(BackingError::InvalidPhase));
+    assert_eq!(backing.reserve(18, DirectoryAction::Create, &path, 0, 0),
+        Err(BackingError::PathOccupied));
+    assert_eq!(port.promote_calls, 1);
+    assert_eq!(port.close_calls, 0);
 }
