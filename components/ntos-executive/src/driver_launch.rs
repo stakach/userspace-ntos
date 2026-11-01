@@ -61760,6 +61760,26 @@ struct HostedDriverSharedWait {
 
 static mut HOSTED_DRIVER_THREAD_TABLES: Option<Vec<HostedDriverThreadTable>> = None;
 static mut HOSTED_DRIVER_THREAD_RUNTIMES: Option<Vec<HostedDriverThreadRuntime>> = None;
+
+/// Sample exact retained system-thread TCBs when a hosted Call is waiting at a census.
+pub(crate) unsafe fn trace_hosted_system_thread_census() {
+    let Some(runtimes) = (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_RUNTIMES)).as_ref() else {
+        return;
+    };
+    for runtime in runtimes.iter().rev().take(4) {
+        print_str(b"[hosted-system-thread] instance=");
+        print_u64(runtime.instance as u64);
+        print_str(b" handle=0x");
+        print_hex((runtime.handle >> 32) as u32);
+        print_hex(runtime.handle as u32);
+        print_str(b" route=");
+        print_u64(runtime.ingress_route.map_or(0, |route| route.badge()));
+        print_str(b"\n");
+        crate::win32k_glue::trace_hosted_tcb_debug_state(
+            b"hosted-system-thread", runtime.tcb, runtime.reply_cap,
+        );
+    }
+}
 static mut HOSTED_DRIVER_WAITERS: Option<Vec<HostedDriverRawWaiter>> = None;
 static mut HOSTED_DRIVER_TIMERS: Option<Vec<nt_kernel_exec::TimerQueue>> = None;
 

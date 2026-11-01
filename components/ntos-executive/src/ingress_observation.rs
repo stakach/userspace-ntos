@@ -22,6 +22,14 @@ pub(crate) fn print_hold_snapshot(now: u64) {
     } else {
         record.bytes()
     });
+    if let Some(oldest) = snapshot.oldest {
+        unsafe {
+            crate::win32k_glue::trace_hosted_tcb_debug_state(
+                b"oldest-hosted", oldest.binding.tcb, oldest.reply,
+            );
+            crate::driver_launch::trace_hosted_system_thread_census();
+        }
+    }
     // Read-only scheduler/Reply snapshots every fifteenth hold, at most eight times.
     static FONT_HOLD_SAMPLES: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
