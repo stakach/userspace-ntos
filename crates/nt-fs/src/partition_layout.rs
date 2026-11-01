@@ -156,6 +156,8 @@ fn read_mbr_layout<E>(
 ) -> Result<Vec<u8>, DriveLayoutReadError<E>> {
     let signature = u32::from_le_bytes(mbr[440..444].try_into().unwrap());
     let mut partitions = Vec::new();
+    let mut slots = Vec::new();
+    slots.try_reserve(4).map_err(|_| DriveLayoutReadError::OutOfMemory)?;
     let mut extended = None;
     for index in 0..4 {
         let offset = 446 + index * 16;
@@ -163,7 +165,11 @@ fn read_mbr_layout<E>(
         let kind = raw[4];
         let start = u64::from(u32::from_le_bytes(raw[8..12].try_into().unwrap()));
         let sectors = u64::from(u32::from_le_bytes(raw[12..16].try_into().unwrap()));
-        if kind == 0 || sectors == 0 { continue; }
+        if kind == 0 || sectors == 0 {
+            if kind != 0 || sectors != 0 { return Err(DriveLayoutReadError::InvalidPartitionTable); }
+            slots.push(MbrPartition { first_lba: 0, sectors: 0, kind: 0, boot: 0, hidden: 0 });
+            continue;
+        }
         if is_extended(kind) {
             if extended.replace((start, sectors)).is_some()
                 || start == 0
@@ -171,9 +177,11 @@ fn read_mbr_layout<E>(
             {
                 return Err(DriveLayoutReadError::InvalidPartitionTable);
             }
+            slots.push(MbrPartition { first_lba: start, sectors, kind, boot: raw[0], hidden: start as u32 });
             continue;
         }
         checked_mbr_partition(&mut partitions, start, sectors, kind, raw[0], start as u32, disk_sectors)?;
+        slots.push(MbrPartition { first_lba: start, sectors, kind, boot: raw[0], hidden: start as u32 });
     }
     if let Some((base, extent)) = extended {
         let limit = base + extent;
@@ -197,41 +205,49 @@ fn read_mbr_layout<E>(
             if sector[510..512] != [0x55, 0xaa] {
                 return Err(DriveLayoutReadError::InvalidPartitionTable);
             }
-            let first = &sector[446..462];
-            let relative = u64::from(u32::from_le_bytes(first[8..12].try_into().unwrap()));
-            let count = u64::from(u32::from_le_bytes(first[12..16].try_into().unwrap()));
-            if first[4] != 0 && count != 0 {
-                if is_extended(first[4]) { return Err(DriveLayoutReadError::InvalidPartitionTable); }
-                let start = next.checked_add(relative).ok_or(DriveLayoutReadError::InvalidPartitionTable)?;
-                if start.checked_add(count).is_none_or(|end| end > limit) {
-                    return Err(DriveLayoutReadError::InvalidPartitionTable);
+            slots.try_reserve(4).map_err(|_| DriveLayoutReadError::OutOfMemory)?;
+            let mut link_target = None;
+            for slot in 0..4 {
+                let entry = &sector[446 + slot * 16..462 + slot * 16];
+                let kind = entry[4];
+                let relative = u64::from(u32::from_le_bytes(entry[8..12].try_into().unwrap()));
+                let count = u64::from(u32::from_le_bytes(entry[12..16].try_into().unwrap()));
+                if kind == 0 || count == 0 {
+                    if kind != 0 || count != 0 { return Err(DriveLayoutReadError::InvalidPartitionTable); }
+                    slots.push(MbrPartition { first_lba: 0, sectors: 0, kind: 0, boot: 0, hidden: 0 });
+                    continue;
                 }
-                checked_mbr_partition(&mut partitions, start, count, first[4], first[0], relative as u32, disk_sectors)?;
+                if is_extended(kind) {
+                    if link_target.is_some() || relative == 0 || relative.checked_add(count).is_none_or(|end| end > extent) {
+                        return Err(DriveLayoutReadError::InvalidPartitionTable);
+                    }
+                    let target = base.checked_add(relative).ok_or(DriveLayoutReadError::InvalidPartitionTable)?;
+                    link_target = Some(target);
+                    slots.push(MbrPartition { first_lba: target, sectors: count, kind, boot: entry[0], hidden: relative as u32 });
+                } else {
+                    let start = next.checked_add(relative).ok_or(DriveLayoutReadError::InvalidPartitionTable)?;
+                    if relative == 0 || start.checked_add(count).is_none_or(|end| end > limit) {
+                        return Err(DriveLayoutReadError::InvalidPartitionTable);
+                    }
+                    checked_mbr_partition(&mut partitions, start, count, kind, entry[0], relative as u32, disk_sectors)?;
+                    slots.push(MbrPartition { first_lba: start, sectors: count, kind, boot: entry[0], hidden: relative as u32 });
+                }
             }
-            let link = &sector[462..478];
-            if link[4] == 0 { break; }
-            if !is_extended(link[4]) {
-                return Err(DriveLayoutReadError::InvalidPartitionTable);
-            }
-            let relative = u64::from(u32::from_le_bytes(link[8..12].try_into().unwrap()));
-            let link_len = u64::from(u32::from_le_bytes(link[12..16].try_into().unwrap()));
-            if link_len == 0 || relative.checked_add(link_len).is_none_or(|end| end > extent) {
-                return Err(DriveLayoutReadError::InvalidPartitionTable);
-            }
-            next = base.checked_add(relative).ok_or(DriveLayoutReadError::InvalidPartitionTable)?;
+            match link_target { Some(target) => next = target, None => break }
         }
     }
-    let bytes = partitions.len().checked_mul(PARTITION_INFORMATION_EX_BYTES)
+    let bytes = slots.len().checked_mul(PARTITION_INFORMATION_EX_BYTES)
         .and_then(|entries| entries.checked_add(DRIVE_LAYOUT_EX_HEADER_BYTES))
         .ok_or(DriveLayoutReadError::InvalidPartitionTable)?;
-    let count = u32::try_from(partitions.len()).map_err(|_| DriveLayoutReadError::InvalidPartitionTable)?;
+    let count = u32::try_from(slots.len()).map_err(|_| DriveLayoutReadError::InvalidPartitionTable)?;
     let mut output = Vec::new();
     output.try_reserve_exact(bytes).map_err(|_| DriveLayoutReadError::OutOfMemory)?;
     output.resize(bytes, 0);
     put_u32(&mut output, 0, 0); // PARTITION_STYLE_MBR
     put_u32(&mut output, 4, count);
     put_u32(&mut output, 8, signature);
-    for (index, partition) in partitions.iter().enumerate() {
+    let mut on_disk_number = 0u32;
+    for (index, partition) in slots.iter().enumerate() {
         let offset = DRIVE_LAYOUT_EX_HEADER_BYTES + index * PARTITION_INFORMATION_EX_BYTES;
         let start = partition.first_lba.checked_mul(u64::from(sector_bytes))
             .ok_or(DriveLayoutReadError::InvalidPartitionTable)?;
@@ -239,7 +255,8 @@ fn read_mbr_layout<E>(
             .ok_or(DriveLayoutReadError::InvalidPartitionTable)?;
         put_u64(&mut output, offset + 8, start);
         put_u64(&mut output, offset + 16, length);
-        put_u32(&mut output, offset + 24, index as u32 + 1);
+        if partition.kind != 0 && !is_extended(partition.kind) { on_disk_number += 1; }
+        put_u32(&mut output, offset + 24, if partition.kind != 0 && !is_extended(partition.kind) { on_disk_number } else { 0 });
         output[offset + 32] = partition.kind;
         output[offset + 33] = (partition.boot == 0x80) as u8;
         output[offset + 34] = is_recognized_partition(partition.kind) as u8;
@@ -501,7 +518,7 @@ mod tests {
             output.copy_from_slice(&disk[lba as usize]); Ok::<_, ()>(())
         }).unwrap();
         assert_eq!(u32::from_le_bytes(mbr[0..4].try_into().unwrap()), 0);
-        assert_eq!(u32::from_le_bytes(mbr[4..8].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(mbr[4..8].try_into().unwrap()), 4);
         assert_eq!(u32::from_le_bytes(mbr[8..12].try_into().unwrap()), 0x1234_5678);
         assert_eq!(u64::from_le_bytes(mbr[56..64].try_into().unwrap()), 8 * 512);
         assert_eq!(mbr[80..84], [7, 1, 1, 0]);
