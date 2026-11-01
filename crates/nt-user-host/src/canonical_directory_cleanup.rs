@@ -37,8 +37,16 @@ impl<T> DirectoryCleanupCredits<T> {
 
     pub fn first_mut(&mut self) -> Option<&mut T> { self.detached.first_mut() }
 
+    /// Inspect one retained obligation without moving another owner.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> { self.detached.get_mut(index) }
+
+    /// Retire only the completed obligation; uncertain neighbours stay retained.
+    pub fn retire(&mut self, index: usize) -> Option<T> {
+        if index >= self.detached.len() { None } else { Some(self.detached.remove(index)) }
+    }
+
     pub fn retire_first(&mut self) -> Option<T> {
-        if self.detached.is_empty() { None } else { Some(self.detached.remove(0)) }
+        self.retire(0)
     }
 
     pub fn outstanding(&self) -> bool { self.live != 0 || !self.detached.is_empty() }
@@ -74,5 +82,18 @@ mod tests {
         credits.detach(42);
         assert_eq!(credits.retire_first(), Some(42));
         assert!(!credits.outstanding());
+    }
+
+    #[test]
+    fn terminal_neighbour_can_retire_while_an_uncertain_owner_stays_in_queue() {
+        let mut credits = DirectoryCleanupCredits::new();
+        credits.reserve().unwrap();
+        credits.reserve().unwrap();
+        credits.detach(41);
+        credits.detach(42);
+        assert_eq!(credits.retire(1), Some(42));
+        assert_eq!(credits.detached_len(), 1);
+        assert_eq!(credits.get_mut(0).map(|identity| *identity), Some(41));
+        assert!(credits.outstanding());
     }
 }
