@@ -65,6 +65,7 @@ pub mod registry_bootstrap;
 pub mod registry_subject;
 pub mod provider_directory_name;
 pub mod canonical_directory_backing;
+pub mod canonical_directory_cleanup;
 pub mod provider_directory_query;
 pub mod provider_named_event;
 pub mod provider_registry_callers;
