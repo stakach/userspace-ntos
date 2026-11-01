@@ -11802,17 +11802,20 @@ const HOSTED_DMA_SERVICE_QUERY_SG: u64 = 11;
 static HOSTED_DMA_PRIVATE_REQUEST_NEXT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_DMA_SERVICE_FREE_COMMON_BUFFER: u64 = 12;
 const HOSTED_DMA_SERVICE_QUERY_SCSI_RESERVATION: u64 = 13;
-const HOSTED_DMA_SERVICE_CHECK_SCSI_OVERLAP: u64 = 14;
+const HOSTED_DMA_SERVICE_CHECK_CONFLICT: u64 = 14;
 const HOSTED_DMA_SERVICE_PROBE_SCSI_SOURCE: u64 = 15;
 const HOSTED_DMA_SERVICE_REGISTER_COMMON_BUFFER: u64 = 16;
+const HOSTED_DMA_CONFLICT_RETRY_LIMIT: u32 = 64;
 
-/// A private root row owns every SCSI grant slice. The provider asks before writing grant
-/// bytes, because a writable shared allocation record is only a local hint, never authority.
-unsafe fn dma_root_reservation_overlap_next(logical: u64, length: u64) -> Result<Option<u64>, ()> {
+/// This query is only a search hint. The root registration still atomically claims the range
+/// before the provider writes or publishes it.
+unsafe fn dma_root_conflict_next(
+    adapter: u64, logical: u64, length: u64,
+) -> Result<Option<u64>, ()> {
     let (_label, status, next, _, _) = call_on5(
         (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
-        0,
-        HOSTED_DMA_SERVICE_CHECK_SCSI_OVERLAP << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+        adapter,
+        HOSTED_DMA_SERVICE_CHECK_CONFLICT << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
         logical, length, 0,
     );
     if status as u32 as i32 != STATUS_SUCCESS { return Err(()); }
@@ -12004,7 +12007,8 @@ extern "win64" fn s_dma_allocate_common_buffer(
             return 0;
         };
         let mut offset = 0u64;
-        loop {
+        let mut conflict_retries = 0u32;
+        let (offset, claim_id) = loop {
             let Some(aligned) = align_up(offset, HOSTED_DMA_COMMON_ALIGNMENT) else {
                 return 0;
             };
@@ -12027,7 +12031,7 @@ extern "win64" fn s_dma_allocate_common_buffer(
             let Some(candidate_logical) = metadata.grant_logical.checked_add(aligned) else {
                 return 0;
             };
-            match dma_root_reservation_overlap_next(candidate_logical, requested) {
+            match dma_root_conflict_next(adapter, candidate_logical, requested) {
                 Ok(Some(next_logical)) => {
                     let Some(next_offset) = next_logical.checked_sub(metadata.grant_logical) else {
                         return 0;
@@ -12038,21 +12042,31 @@ extern "win64" fn s_dma_allocate_common_buffer(
                 Ok(None) => {}
                 Err(()) => return 0,
             }
-            offset = aligned;
-            break;
-        }
+            let Some(va) = metadata.grant_va.checked_add(aligned) else { return 0; };
+            let logical = candidate_logical;
+            let (_label, claim_status, claim_id, _, _) = call_on5(
+                (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+                adapter,
+                HOSTED_DMA_SERVICE_REGISTER_COMMON_BUFFER << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
+                logical, va, requested,
+            );
+            if claim_status as u32 as i32 == nt_status::NtStatus::CONFLICTING_ADDRESSES.raw()
+                && claim_id > logical && conflict_retries < HOSTED_DMA_CONFLICT_RETRY_LIMIT {
+                let Some(next_offset) = claim_id.checked_sub(metadata.grant_logical) else {
+                    return 0;
+                };
+                offset = next_offset;
+                conflict_retries += 1;
+                continue;
+            }
+            if claim_status as u32 as i32 != STATUS_SUCCESS || claim_id == 0 {
+                return 0;
+            }
+            break (aligned, claim_id);
+        };
 
         let va = metadata.grant_va + offset;
         let logical = metadata.grant_logical + offset;
-        let (_label, claim_status, claim_id, _, _) = call_on5(
-            (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
-            adapter,
-            HOSTED_DMA_SERVICE_REGISTER_COMMON_BUFFER << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
-            logical, va, requested,
-        );
-        if claim_status as u32 as i32 != STATUS_SUCCESS || claim_id == 0 {
-            return 0;
-        }
         // Common-buffer allocation does not promise zeroed memory, and provider-domain NDIS must
         // not dereference a VA that belongs to the dependent miniport VSpace.
         begin_dma_allocation_record(record);
@@ -12640,7 +12654,8 @@ extern "win64" fn s_dma_map_transfer(
         }
 
         let mut offset = 0u64;
-        loop {
+        let mut conflict_retries = 0u32;
+        let (offset, mapping_id) = loop {
             let Some(aligned) = align_up(offset, HOSTED_DMA_COMMON_ALIGNMENT) else {
                 write_unaligned(length, 0);
                 trace_hosted_dma_sg(
@@ -12703,7 +12718,7 @@ extern "win64" fn s_dma_map_transfer(
                 write_unaligned(length, 0);
                 return 0;
             };
-            match dma_root_reservation_overlap_next(candidate_logical, mapped_len) {
+            match dma_root_conflict_next(adapter, candidate_logical, mapped_len) {
                 Ok(Some(next_logical)) => {
                     let Some(next_offset) = next_logical.checked_sub(metadata.grant_logical) else {
                         write_unaligned(length, 0);
@@ -12715,27 +12730,41 @@ extern "win64" fn s_dma_map_transfer(
                 Ok(None) => {}
                 Err(()) => { write_unaligned(length, 0); return 0; }
             }
-            offset = aligned;
-            break;
-        }
+            let Some(bounce_va) = metadata.grant_va.checked_add(aligned) else {
+                write_unaligned(length, 0);
+                return 0;
+            };
+            if map_register_base & HOSTED_DMA_SERVICE_OPERATION_MASK != 0 {
+                write_unaligned(length, 0);
+                return 0;
+            }
+            let (_label, mapped_status, mapping_id, _, _) = call_on5(
+                (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+                adapter,
+                (HOSTED_DMA_SERVICE_MAP_TRANSFER << HOSTED_DMA_SERVICE_OPERATION_SHIFT)
+                    | map_register_base,
+                candidate_logical, bounce_va, mapped_len,
+            );
+            if mapped_status as u32 as i32 == nt_status::NtStatus::CONFLICTING_ADDRESSES.raw()
+                && mapping_id > candidate_logical
+                && conflict_retries < HOSTED_DMA_CONFLICT_RETRY_LIMIT {
+                let Some(next_offset) = mapping_id.checked_sub(metadata.grant_logical) else {
+                    write_unaligned(length, 0);
+                    return 0;
+                };
+                offset = next_offset;
+                conflict_retries += 1;
+                continue;
+            }
+            if mapped_status as u32 as i32 != STATUS_SUCCESS || mapping_id == 0 {
+                write_unaligned(length, 0);
+                return 0;
+            }
+            break (aligned, mapping_id);
+        };
 
         let bounce_va = metadata.grant_va + offset;
         let logical = metadata.grant_logical + offset;
-        if map_register_base & HOSTED_DMA_SERVICE_OPERATION_MASK != 0 {
-            write_unaligned(length, 0);
-            return 0;
-        }
-        let (_label, mapped_status, mapping_id, _, _) = call_on5(
-            (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
-            adapter,
-            (HOSTED_DMA_SERVICE_MAP_TRANSFER << HOSTED_DMA_SERVICE_OPERATION_SHIFT)
-                | map_register_base,
-            logical, bounce_va, mapped_len,
-        );
-        if mapped_status as u32 as i32 != STATUS_SUCCESS || mapping_id == 0 {
-            write_unaligned(length, 0);
-            return 0;
-        }
         // Root owns the mapping before this provider writes grant bytes. A racing coherent
         // reservation must conflict with that claim even while the shared record is pending.
         if write_to_device != 0 {
@@ -63129,8 +63158,52 @@ pub(crate) fn service_hosted_driver_dma_adapter(
 ) -> (i32, u64, u64, u64) {
     let operation = words[0] >> HOSTED_DMA_SERVICE_OPERATION_SHIFT;
     words[0] &= !HOSTED_DMA_SERVICE_OPERATION_MASK;
+    if operation == HOSTED_DMA_SERVICE_CHECK_CONFLICT {
+        if pdo_object == 0 || words[0] != 0 || words[1] == 0
+            || words[2] == 0 || words[3] != 0 {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        let Some((_instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
+        let Some(domain) = instance_domain_identity(inst) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
+        let mut matching = (unsafe { hosted_dma_adapter_leases_mut() }).iter().copied()
+            .filter(|lease| lease.consumer_domain == domain
+                && lease.adapter_address == Some(pdo_object));
+        let Some(lease) = matching.next() else {
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
+        };
+        if matching.next().is_some() {
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
+        }
+        if unsafe { io_manager_mut().hosted_device_pointer_registration(
+            lease.pdo_registration.domain(), lease.pdo_registration.address(),
+        ) } != Some(lease.pdo_registration)
+            || !unsafe { hosted_dma_pdo_generation_is_live(
+                lease.pdo_registration.device_id().raw(), lease.pdo_generation,
+            ) }
+            || unsafe { hosted_dma_owner_is_quarantined(lease.owner) }
+        {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        }
+        let Some((_, grant_len, grant_logical)) = lease.grant else {
+            return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+        };
+        let in_grant = words[1].checked_sub(grant_logical)
+            .is_some_and(|offset| offset <= grant_len && words[2] <= grant_len - offset);
+        if !in_grant {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        return match unsafe { hosted_dma_manager_mut().conflicting_logical_end(
+            lease.owner, lease.adapter_id, words[1], words[2],
+        ) } {
+            Ok(next) => (STATUS_SUCCESS, next.unwrap_or(0), 0, 0),
+            Err(error) => (hosted_dma_status(error).raw(), 0, 0, 0),
+        };
+    }
     if operation == HOSTED_DMA_SERVICE_QUERY_SCSI_RESERVATION
-        || operation == HOSTED_DMA_SERVICE_CHECK_SCSI_OVERLAP
         || operation == HOSTED_DMA_SERVICE_PROBE_SCSI_SOURCE
     {
         let Some((_instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
@@ -63164,16 +63237,6 @@ pub(crate) fn service_hosted_driver_dma_adapter(
                 None => (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0),
             };
         }
-        if pdo_object != 0 || words[0] != 0 || words[1] == 0
-            || words[2] == 0 || words[3] != 0 {
-            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
-        }
-        return match unsafe {
-            hosted_scsi_dma_reservation::overlaps(domain, words[1], words[2])
-        } {
-            Ok(next) => (STATUS_SUCCESS, next.unwrap_or(0), 0, 0),
-            Err(status) => (status.raw(), 0, 0, 0),
-        };
     }
     if operation == HOSTED_DMA_SERVICE_RELEASE_ADAPTER {
         if words != [0; 4] || pdo_object == 0 {
@@ -63323,6 +63386,15 @@ pub(crate) fn service_hosted_driver_dma_adapter(
                     lease.owner, lease.adapter_id, logical, length, backing,
                 ) } {
                     Ok(grant) => (STATUS_SUCCESS, grant.common_buffer_id, 0, 0),
+                    Err(DmaError::LogicalViolation) => match unsafe {
+                        hosted_dma_manager_mut().conflicting_logical_end(
+                            lease.owner, lease.adapter_id, logical, length,
+                        )
+                    } {
+                        Ok(Some(next)) if next > logical =>
+                            (nt_status::NtStatus::CONFLICTING_ADDRESSES.raw(), next, 0, 0),
+                        _ => (STATUS_ACCESS_DENIED, 0, 0, 0),
+                    },
                     Err(error) => (hosted_dma_status(error).raw(), 0, 0, 0),
                 };
             }
@@ -63396,13 +63468,28 @@ pub(crate) fn service_hosted_driver_dma_adapter(
                         Err(status) => (status.raw(), 0, 0, 0),
                     };
                 }
+                let mut logical_conflict = false;
                 return match unsafe { hosted_device_allocations::record_dma_private_mapping(
                     inst, lease.lease_id, map, logical, backing, length,
                     || hosted_dma_manager_mut().ensure_mapping_at(
                         lease.owner, lease.adapter_id, logical, backing, length)
-                        .map(|mapping| mapping.mapping_id).map_err(hosted_dma_status),
+                        .map(|mapping| mapping.mapping_id).map_err(|error| {
+                            if error == DmaError::LogicalViolation {
+                                logical_conflict = true;
+                            }
+                            hosted_dma_status(error)
+                        }),
                 ) } {
                     Ok(mapping_id) => (STATUS_SUCCESS, mapping_id, 0, 0),
+                    Err(_) if logical_conflict => match unsafe {
+                        hosted_dma_manager_mut().conflicting_logical_end(
+                            lease.owner, lease.adapter_id, logical, length,
+                        )
+                    } {
+                        Ok(Some(next)) if next > logical =>
+                            (nt_status::NtStatus::CONFLICTING_ADDRESSES.raw(), next, 0, 0),
+                        _ => (STATUS_ACCESS_DENIED, 0, 0, 0),
+                    },
                     Err(status) => (status.raw(), 0, 0, 0),
                 };
             }

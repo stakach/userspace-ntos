@@ -43,14 +43,17 @@ fn scsi_controller_window_comes_from_its_pnp_lease_not_instance_shared_slots() {
 }
 
 #[test]
-fn scsi_overlap_hint_ignores_other_provider_domains() {
-    let source = include_str!("../../../components/ntos-executive/src/hosted_scsi_dma_reservation.rs");
-    let start = source.find("pub(super) unsafe fn overlaps(")
-        .expect("SCSI overlap hint");
-    let end = source[start..].find("\npub(super) unsafe fn release_after_ack")
-        .map(|offset| start + offset).expect("end of overlap hint");
-    let overlaps = &source[start..end];
-    syn::parse_str::<syn::ItemFn>(overlaps).expect("complete overlap hint");
-    assert!(overlaps.contains("row.provider_domain == provider"),
-        "an unrelated provider cannot consume this DMA window with a numerical overlap hint");
+fn dma_conflict_hint_is_bound_to_exact_owner_and_adapter() {
+    let source = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    let start = source.find("if operation == HOSTED_DMA_SERVICE_CHECK_CONFLICT {")
+        .expect("root DMA conflict query");
+    let end = source[start..].find("\n    if operation == HOSTED_DMA_SERVICE_QUERY_SCSI_RESERVATION")
+        .map(|offset| start + offset).expect("end of conflict query");
+    let query = &source[start..end];
+    syn::parse_str::<syn::ExprIf>(query).expect("complete root conflict query");
+    assert!(query.contains("lease.consumer_domain == domain"));
+    assert!(query.contains("lease.adapter_address == Some(pdo_object)"));
+    assert!(query.contains("conflicting_logical_end(")
+        && query.contains("lease.owner, lease.adapter_id, words[1], words[2]"),
+        "the root manager must check the exact owner's adapter, not a global reservation list");
 }

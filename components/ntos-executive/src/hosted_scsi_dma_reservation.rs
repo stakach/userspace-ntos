@@ -80,21 +80,6 @@ pub(super) unsafe fn for_source(
     found
 }
 
-pub(super) unsafe fn overlaps(
-    provider: HostedDomainIdentity,
-    logical: u64,
-    length: u64,
-) -> Result<Option<u64>, nt_status::NtStatus> {
-    let end = logical.checked_add(length)
-        .filter(|_| length != 0)
-        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    Ok(reservations().iter()
-        .filter(|row| row.provider_domain == provider)
-        .filter_map(|row| row.logical.checked_add(row.length)
-            .filter(|row_end| logical < *row_end && row.logical < end))
-        .max())
-}
-
 pub(super) unsafe fn release_after_ack(irp_id: u64) -> Result<(), nt_status::NtStatus> {
     let Some(index) = reservations().iter().position(|row| row.irp_id == irp_id) else {
         return Ok(());
@@ -194,6 +179,7 @@ unsafe fn controller_for_scsi_child(
             lease.owner == owner && lease.consumer_domain == provider
                 && lease.pdo_registration.device_id().raw() == binding.pdo_device_id
                 && lease.grant == Some(grant)
+                && lease.adapter_address.is_some()
                 && hosted_dma_pdo_generation_is_live(binding.pdo_device_id, lease.pdo_generation)
                 && io_manager_mut().hosted_device_pointer_registration(
                     lease.pdo_registration.domain(), lease.pdo_registration.address(),

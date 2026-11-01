@@ -89,6 +89,23 @@ const SH_DMA_ALLOC_RECORD_SOURCE_VA: u64 = 32;
 const SH_DMA_ALLOC_RECORD_FLAGS: u64 = 40;
 const SH_DMA_ALLOC_RECORD_MAP_REGISTER: u64 = 48;
 const SH_DMA_ALLOC_RECORD_ADAPTER_ID: u64 = 56;
+const FSD_SERVICE_DMA_ADAPTER_LABEL: u64 = 1;
+const HOSTED_DMA_SERVICE_REGISTER_COMMON_BUFFER: u64 = 16;
+const HOSTED_DMA_SERVICE_OPERATION_SHIFT: u64 = 56;
+const HOSTED_DMA_CONFLICT_RETRY_LIMIT: u32 = 64;
+const DMA_RECORD_RESERVED: u64 = u64::MAX;
+const STATUS_SUCCESS: i32 = 0;
+
+mod nt_status {
+    pub struct NtStatus;
+    impl NtStatus {
+        pub const CONFLICTING_ADDRESSES: Self = Self;
+        pub fn raw(self) -> i32 { 0xC0000018u32 as i32 }
+    }
+}
+
+struct HostedDmaAllocationGuard;
+impl HostedDmaAllocationGuard { fn acquire() -> Self { Self } }
 
 static mut FSD_SHARED_VADDR: u64 = 0;
 static mut GRANT_LEN: u64 = 0;
@@ -117,15 +134,34 @@ fn first_free_dma_allocation_record(base: u64) -> Option<u64> {
     }
     None
 }
+fn begin_dma_allocation_record(record: u64) {
+    unsafe { write_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *mut u64, DMA_RECORD_RESERVED) }
+}
+fn dma_record_store(record: u64, offset: u64, value: u64) {
+    unsafe { write_volatile((record + offset) as *mut u64, value) }
+}
+fn publish_dma_allocation_record(record: u64, length: u64, _direction: u64) {
+    dma_record_store(record, SH_DMA_ALLOC_RECORD_LEN, length)
+}
+fn dma_root_conflict_next(_adapter: u64, _logical: u64, _length: u64) -> Result<Option<u64>, ()> {
+    Ok(None)
+}
+fn call_on5(_label: u64, adapter: u64, operation: u64, logical: u64, va: u64, length: u64) -> (u64, u64, u64, u64, u64) {
+    assert_eq!(adapter, 7);
+    assert_eq!(operation, HOSTED_DMA_SERVICE_REGISTER_COMMON_BUFFER << HOSTED_DMA_SERVICE_OPERATION_SHIFT);
+    assert!(logical >= 0x1000 && logical + length <= 0x1000 + unsafe { GRANT_LEN });
+    assert_eq!(va, 0x4000_0000 + logical - 0x1000);
+    (0, STATUS_SUCCESS as u64, logical, 0, 0)
+}
 fn align_up(value: u64, alignment: u64) -> Option<u64> {
     value.checked_add(alignment - 1).map(|v| v & !(alignment - 1))
 }
-fn dma_allocation_range_overlaps(base: u64, grant_logical: u64, offset: u64, length: u64) -> Option<u64> {
+fn dma_allocation_range_overlaps(base: u64, adapter_id: u64, grant_logical: u64, offset: u64, length: u64) -> Option<u64> {
     let end = offset.checked_add(length)?;
     for index in 0..2 {
         let record = base + SH_DMA_ALLOC_RECORDS + index * SH_DMA_ALLOC_RECORD_SIZE;
         let logical = unsafe { read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64) };
-        if logical == 0 { continue; }
+        if logical == 0 || unsafe { read_volatile((record + SH_DMA_ALLOC_RECORD_ADAPTER_ID) as *const u64) } != adapter_id { continue; }
         let prior_offset = logical.checked_sub(grant_logical)?;
         let prior_len = unsafe { read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64) };
         let prior_end = prior_offset.checked_add(prior_len)?;
