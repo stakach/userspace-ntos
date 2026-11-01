@@ -702,4 +702,75 @@ mod tests {
             Err(DmaError::Quarantined)
         );
     }
+
+    #[test]
+    fn software_completion_and_device_write_use_the_same_retained_coherent_bytes() {
+        let mut dma = DmaManager::new();
+        let storport = dma.register_adapter(owner(), true, 4096, true);
+        let window = CoherentWindowIdentity::new(23, 5);
+        let mut grant_bytes = [0u8; 64];
+        let backing = grant_bytes.as_mut_ptr() as u64;
+        let logical = 0x60_000;
+        dma.register_coherent_window(owner(), window, logical, 64, backing)
+            .unwrap();
+
+        // A miniport can complete a command in software by writing DataBuffer. Its
+        // result must be the same bytes the SG alias exposes, even if a separate
+        // zeroed DMA bounce buffer was never touched by a device.
+        let first = dma
+            .register_coherent_reservation_at(owner(), window, logical, 32, backing)
+            .unwrap();
+        let software_alias = dma
+            .begin_coherent_reservation_alias(
+                owner(), storport, first.reservation_id, window, backing, 12,
+            )
+            .unwrap();
+        let stale_bounce = [0u8; 12];
+        grant_bytes[..12].copy_from_slice(&[0, 33, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0]);
+        let decoded = dma.decode_owner_logical(owner(), software_alias.logical_base, 12).unwrap();
+        assert_eq!(decoded, backing);
+        // SAFETY: decoded equals the address of grant_bytes, which remains live
+        // and unchanged for the duration of this borrowed slice.
+        let software_result = unsafe { core::slice::from_raw_parts(decoded as *const u8, 12) };
+        assert_ne!(software_result, stale_bounce.as_slice());
+        assert_eq!(software_result, &grant_bytes[..12]);
+
+        dma.end_coherent_reservation_alias(owner(), software_alias).unwrap();
+        // SG completion alone is not the consumer ACK. The retained reservation
+        // keeps both its bytes and IOVA unavailable to another transfer.
+        assert_eq!(
+            dma.register_coherent_reservation_at(owner(), window, logical, 32, backing),
+            Err(DmaError::LogicalViolation)
+        );
+        assert_eq!(&grant_bytes[..12], software_result);
+        dma.release_coherent_reservation(owner(), window, first.reservation_id)
+            .unwrap();
+
+        // A later real device write may reuse the range only after that release.
+        let second = dma
+            .register_coherent_reservation_at(owner(), window, logical, 32, backing)
+            .unwrap();
+        assert_ne!(first.reservation_id, second.reservation_id);
+        let device_alias = dma
+            .begin_coherent_reservation_alias(
+                owner(), storport, second.reservation_id, window, backing, 16,
+            )
+            .unwrap();
+        let device_bytes = [0xa5u8; 16];
+        let device_target = dma.decode_owner_logical(owner(), device_alias.logical_base, 16).unwrap();
+        // SAFETY: the exact reservation is backed by the live grant_bytes
+        // allocation, and the 16-byte alias lies within its 64-byte extent.
+        unsafe {
+            core::ptr::copy_nonoverlapping(device_bytes.as_ptr(), device_target as *mut u8, 16);
+        }
+        assert_eq!(&grant_bytes[..16], &device_bytes);
+        assert_eq!(
+            dma.release_coherent_reservation(owner(), window, second.reservation_id),
+            Err(DmaError::AdapterBusy)
+        );
+        dma.end_coherent_reservation_alias(owner(), device_alias).unwrap();
+        dma.release_coherent_reservation(owner(), window, second.reservation_id)
+            .unwrap();
+        dma.release_coherent_window(owner(), window).unwrap();
+    }
 }
