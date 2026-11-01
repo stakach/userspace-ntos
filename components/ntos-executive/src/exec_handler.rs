@@ -10354,6 +10354,18 @@ impl ExecNtHandler {
         Ok(handle as u64)
     }
 
+    // Once boot storage starts draining, all opens on its physical volume must retain a
+    // mounted File request. The synchronous FAT and overlay readers cannot cross that fence.
+    fn route_absolute_open_to_kernel_file(
+        name16: &[u16],
+        open_options: u32,
+        mount_route: Option<nt_fs::BlockSourceKind>,
+    ) -> bool {
+        open_options & nt_fs::FILE_DIRECTORY_FILE != 0
+            || (matches!(mount_route, Some(nt_fs::BlockSourceKind::Draining | nt_fs::BlockSourceKind::Native))
+                && nt_fs::nt_path_to_volume_relative(name16, crate::installed_layout::ROOT).is_some())
+    }
+
     fn readonly_disk_open_entry(
         name16: &[u16],
         desired_access: u32,
@@ -31773,7 +31785,6 @@ impl ExecNtHandler {
     unsafe fn nt_open_file_service(&mut self, args: &[u64]) -> u32 {
         let ctx = self.loop_ctx.unwrap();
         let reg = &mut *ctx.reg;
-        const FILE_DIRECTORY_FILE: u64 = 0x01;
         let file_handle_out = args[0];
         let desired_access = nt_ulong_arg(args[1]);
         let share_access = nt_ulong_arg(args[4]);
@@ -32054,7 +32065,9 @@ impl ExecNtHandler {
                 return publication.status;
             }
         }
-        if open_options & FILE_DIRECTORY_FILE as u32 != 0 {
+        let mount_route = unsafe { crate::fs_loader::exec_fs_mount_identity() }
+            .and_then(crate::fs_loader::exec_block_route_kind);
+        if Self::route_absolute_open_to_kernel_file(name16, open_options, mount_route) {
             return self.create_registered_kernel_file(
                 parse_root,
                 name16,
