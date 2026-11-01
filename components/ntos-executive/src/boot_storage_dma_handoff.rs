@@ -35,6 +35,16 @@ pub(crate) struct BootStorageDmaAuthority {
 
 static mut BOOT_STORAGE_DMA: Option<BootStorageDmaAuthority> = None;
 static mut NATIVE_STORAGE_ADMISSIONS: NativeStorageAdmissions = NativeStorageAdmissions::new();
+static BOOT_NATIVE_START_TRACE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+fn trace_native_start_once(bit: u32, phase: &[u8]) {
+    if BOOT_NATIVE_START_TRACE.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0 {
+        print_str(b"[boot-ahci-native-start] ");
+        print_str(phase);
+        print_str(b"\n");
+    }
+}
 
 fn authority() -> Option<&'static mut BootStorageDmaAuthority> {
     // The executive dispatches these admission operations on its single broker thread.
@@ -174,51 +184,96 @@ pub(crate) fn begin_native_start_after_preload(
     receipt: driver_launch::PreloadReceipt,
     lease: nt_pnp_context::ContextLeaseIdentity,
 ) -> Result<NativeStartAdmission, nt_status::NtStatus> {
+    trace_native_start_once(1, b"enter");
     // Snapshot recovery may read and repair the reserve. Do it while direct AHCI admission
     // remains open; BusRelations publication must never discover a lazy mount after drain.
-    unsafe { crate::writable_fs::ensure_mounted() }
-        .map_err(|status| nt_status::NtStatus(status as i32))?;
+    unsafe { crate::writable_fs::ensure_mounted() }.map_err(|status| {
+        trace_native_start_once(2, b"mount-error");
+        nt_status::NtStatus(status as i32)
+    })?;
+    trace_native_start_once(4, b"mount-ready");
     if !unsafe { driver_launch::boot_driver_preload_receipt_is_current(receipt) } {
+        trace_native_start_once(8, b"preload-stale");
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    let owner = authority().ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    let owner = authority().ok_or_else(|| {
+        trace_native_start_once(16384, b"authority-absent");
+        nt_status::NtStatus::DEVICE_NOT_READY
+    })?;
     if !owner.ready || owner.native_lease != Some(lease) {
+        trace_native_start_once(16, b"lease-invalid");
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    let window = owner.native_window.ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    let window = owner.native_window.ok_or_else(|| {
+        trace_native_start_once(32, b"window-absent");
+        nt_status::NtStatus::DEVICE_NOT_READY
+    })?;
     if owner
         .ledger
         .window_phase(owner.controller, owner.io_space_cap, window)
         != Ok(WindowPhase::Mapped)
     {
+        trace_native_start_once(64, b"window-unmapped");
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
+    trace_native_start_once(128, b"window-ready");
     // Reject an absent/unpublished mount before the controller enters its irreversible drain.
     if !crate::fs_loader::exec_mount_can_drain() {
+        trace_native_start_once(256, b"route-not-drainable");
         return Err(nt_status::NtStatus::DEVICE_NOT_READY);
     }
     match owner.ledger.state(owner.controller, owner.io_space_cap) {
-        Ok(ControllerState::BootActive) => owner
-            .ledger
-            .begin_drain(owner.controller, owner.io_space_cap)
-            .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?,
+        Ok(ControllerState::BootActive) => {
+            owner
+                .ledger
+                .begin_drain(owner.controller, owner.io_space_cap)
+                .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+            trace_native_start_once(512, b"drain-enter");
+        }
         Ok(ControllerState::BootDraining) => {}
-        Ok(ControllerState::NativeStarting) => return Ok(NativeStartAdmission::Ready),
-        _ => return Err(nt_status::NtStatus::DEVICE_BUSY),
+        Ok(ControllerState::NativeStarting) => {
+            trace_native_start_once(2048, b"ready");
+            return Ok(NativeStartAdmission::Ready);
+        }
+        _ => {
+            trace_native_start_once(1024, b"controller-wrong-phase");
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
     }
     // The controller's exact boot tickets remain the command authority. A separate mount
     // fence prevents copied FAT handles and the snapshot reserve from entering new boot I/O.
-    crate::fs_loader::begin_exec_mount_drain()
-        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    crate::fs_loader::begin_exec_mount_drain().map_err(|_| {
+        trace_native_start_once(32768, b"route-drain-error");
+        nt_status::NtStatus::INVALID_DEVICE_REQUEST
+    })?;
     match owner
         .ledger
         .begin_native_start_exact(owner.controller, owner.io_space_cap, window)
     {
-        Ok(()) => Ok(NativeStartAdmission::Ready),
+        Ok(()) => {
+            trace_native_start_once(2048, b"ready");
+            Ok(NativeStartAdmission::Ready)
+        }
         Err(nt_pnp_context::pci_dma_handoff::Error::BootIoOutstanding) => {
+            if BOOT_NATIVE_START_TRACE.fetch_or(4096, core::sync::atomic::Ordering::Relaxed)
+                & 4096 == 0
+            {
+                print_str(b"[boot-ahci-native-start] draining-tickets=");
+                match owner
+                    .ledger
+                    .outstanding_boot_io_count(owner.controller, owner.io_space_cap)
+                {
+                    Ok(count) => print_u64(count as u64),
+                    Err(_) => print_str(b"unavailable"),
+                }
+                print_str(b"\n");
+            }
             Ok(NativeStartAdmission::Draining)
         }
-        Err(_) => Err(nt_status::NtStatus::DEVICE_BUSY),
+        Err(_) => {
+            trace_native_start_once(8192, b"native-start-refused");
+            Err(nt_status::NtStatus::DEVICE_BUSY)
+        }
     }
 }
 

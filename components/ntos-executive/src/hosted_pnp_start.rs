@@ -3,6 +3,16 @@ use alloc::vec::Vec;
 
 static ACTIVE_HOSTED_START_BATCH_DRIVES: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+static BOOT_AHCI_GRANT_TRACE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+fn trace_boot_ahci_grant_once(bit: u32, phase: &[u8]) {
+    if BOOT_AHCI_GRANT_TRACE.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0 {
+        print_str(b"[boot-ahci-grant] ");
+        print_str(phase);
+        print_str(b"\n");
+    }
+}
 
 struct ActiveHostedStartBatchDrive;
 
@@ -1536,14 +1546,23 @@ impl PreparedHostedResourcePlan {
             Self::Pci { bus_resources, window, lease, .. }
                 if crate::boot_storage_dma_handoff::is_boot_storage_controller(&bus_resources.device) =>
             {
+                trace_boot_ahci_grant_once(1, b"prepare-enter");
                 let device = &bus_resources.device;
-                let mapped = crate::request_hosted_pnp_pci_dma_window(
+                let mapped = match crate::request_hosted_pnp_pci_dma_window(
                     lease.identity(), device.bus, device.dev, device.func,
-                )?;
+                ) {
+                    Ok(mapped) => mapped,
+                    Err(status) => {
+                        trace_boot_ahci_grant_once(2, b"prepare-error");
+                        return Err(status);
+                    }
+                };
                 if !mapped.matches(device) || !mapped.dma_grant_valid() {
+                    trace_boot_ahci_grant_once(4, b"prepare-invalid-grant");
                     return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
                 }
                 *window = mapped;
+                trace_boot_ahci_grant_once(8, b"prepare-mapped");
                 Ok(Some(lease.identity()))
             }
             _ => Ok(None),
