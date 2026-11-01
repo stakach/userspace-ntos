@@ -32,6 +32,43 @@ fn client(server: &mut Server, cid: ClientId) -> ObjectClient<Direct<'_>> {
 }
 
 #[test]
+fn native_directory_handle_publishes_device_parent_and_temporary_close_reaps_name() {
+    use nt_types::{ObjAttrFlags, UnicodeString};
+
+    let mut server = Server::new().unwrap();
+    let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
+    let mut c = client(&mut server, cid);
+    let name = UnicodeString::from_str("\\Device\\Harddisk0");
+    let created = c.create_directory_handle(None, &name,
+        AccessMask::GENERIC_ALL | AccessMask::DELETE,
+        ObjAttrFlags::CASE_INSENSITIVE | ObjAttrFlags::PERMANENT).unwrap();
+    assert!(created.created);
+    c.create_device("\\Device\\Harddisk0\\DR0", 0x494f, 17, true).unwrap();
+    c.delete_object("\\Device\\Harddisk0\\DR0", true).unwrap();
+
+    // The native directory's DELETE-authorized handle can clear permanence.
+    c.make_temporary(created.handle).unwrap();
+    c.close_handle(created.handle).unwrap();
+    assert_eq!(c.lookup("\\Device\\Harddisk0", true).unwrap_err(), NtStatus::OBJECT_NAME_NOT_FOUND);
+}
+
+#[test]
+fn directory_make_temporary_requires_delete_and_exact_live_handle() {
+    use nt_types::{ObjAttrFlags, UnicodeString};
+
+    let mut server = Server::new().unwrap();
+    let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
+    let mut c = client(&mut server, cid);
+    let name = UnicodeString::from_str("\\Device\\TempGuard");
+    let handle = c.create_directory_handle(None, &name, AccessMask::GENERIC_READ,
+        ObjAttrFlags::CASE_INSENSITIVE | ObjAttrFlags::PERMANENT).unwrap().handle;
+    assert_eq!(c.make_temporary(handle).unwrap_err(), NtStatus::ACCESS_DENIED);
+    c.close_handle(handle).unwrap();
+    assert_eq!(c.make_temporary(handle).unwrap_err(), NtStatus::INVALID_HANDLE);
+    assert!(c.lookup("\\Device\\TempGuard", true).is_ok());
+}
+
+#[test]
 fn full_service_roundtrip() {
     let mut server = Server::new().unwrap();
     let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);

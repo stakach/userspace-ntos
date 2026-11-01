@@ -103,6 +103,7 @@ impl Server {
             opcode::OB_OP_PING => Ok(ok()),
             opcode::OB_OP_OPEN_OBJECT => self.op_open(client, in_buf),
             opcode::OB_OP_CLOSE_HANDLE => self.op_close_handle(client, in_buf),
+            opcode::OB_OP_MAKE_TEMPORARY => self.op_make_temporary(client, in_buf),
             opcode::OB_OP_REFERENCE_HANDLE => self.op_reference_handle(client, in_buf),
             opcode::OB_OP_DEREFERENCE_OBJECT => self.op_dereference_object(client, in_buf),
             opcode::OB_OP_DELETE_OBJECT => self.op_delete_object(in_buf),
@@ -148,6 +149,19 @@ impl Server {
     fn op_close_handle(&mut self, client: ClientId, buf: &[u8]) -> Result<ObReply, NtStatus> {
         let req: ObCloseHandleRequest = read_req(buf)?;
         self.om.close_handle(client, HandleValue(req.handle))?;
+        Ok(ok())
+    }
+
+    fn op_make_temporary(&mut self, client: ClientId, buf: &[u8]) -> Result<ObReply, NtStatus> {
+        let req: ObCloseHandleRequest = read_req(buf)?;
+        check_size::<ObCloseHandleRequest>(req.abi_size)?;
+        if req._reserved != 0 || req._reserved2 != 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let directory_type = self.om.directory_type().ok_or(NtStatus::INVALID_HANDLE)?;
+        let object = self.om.reference_by_handle(client, HandleValue(req.handle),
+            Some(directory_type), AccessMask::DELETE)?;
+        self.om.make_temporary(&object)?;
         Ok(ok())
     }
 

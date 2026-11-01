@@ -257,6 +257,20 @@ impl<B: Backend> ObjectClient<B> {
         NtStatus(r.status).to_result()
     }
 
+    /// Clear permanence through a DELETE-authorized handle. The object remains
+    /// named until its final handle closes.
+    pub fn make_temporary(&mut self, handle: HandleValue) -> Result<(), NtStatus> {
+        let req = ObCloseHandleRequest {
+            abi_size: size_of::<ObCloseHandleRequest>() as u16,
+            _reserved: 0,
+            _reserved2: 0,
+            handle: handle.0,
+        };
+        let reply = self.backend.call(opcode::OB_OP_MAKE_TEMPORARY,
+            bytemuck::bytes_of(&req), &mut []);
+        NtStatus(reply.status).to_result()
+    }
+
     /// Take a persistent, client-scoped object reference through `handle`.
     /// Returns the object id and an opaque token that must be released with
     /// [`dereference_object`](Self::dereference_object).
