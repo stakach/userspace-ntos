@@ -741,6 +741,7 @@ diagnosis-free failure.
 - A bounded boot that advances to the next process is still a checkpoint. Identify the specific wait object, selection and resume eligibility before changing wake behavior, and keep genuine Explorer and reboot evidence as closure gates.
 
 ## Commit Verified Increments During Long Native Bring-Up
+- A missing symbol or compilation error is not a behavioral RED. First run an existing behavioral path that exposes the wrong observable result or lost ownership, then add the new contract and prove its corresponding GREEN. Label compilation checks separately.
 - When the user asks for commits as work proceeds, isolate each proven contract and commit it after its focused tests and native integration evidence, before exploring the next boot frontier.
 - Review staged paths and diff before every commit. Keep diagnostic traces and unrelated edits out; push a changed submodule commit before recording its pointer in the parent.
 - A workspace test can pass against unstaged native source while the committed tree fails CI. Before pushing a partial commit, check each source file read by its regressions against the staged snapshot and include all native call sites needed by the contract.

@@ -15,10 +15,13 @@ extern crate alloc;
 mod directory_tests;
 #[cfg(test)]
 mod file_target_tests;
+#[cfg(test)]
+mod owned_directory_tests;
 
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use bytemuck::Pod;
 use nt_object_abi::{
@@ -38,10 +41,52 @@ pub trait Backend {
     fn call(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> ObReply;
 }
 
+/// A submission-aware transport. Once admitted, an unanswered request is an
+/// owned effect and must be polled by its exact request identity, never retried.
+pub trait OwnedBackend: Backend {
+    fn call_owned(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8])
+        -> OwnedCall;
+    fn poll_owned(&mut self, request_id: u64, out_buf: &mut [u8]) -> Option<ObReply>;
+}
+
+pub enum OwnedCall {
+    NoEffect(NtStatus),
+    Completed(ObReply),
+    Indeterminate(u64),
+}
+
+/// Owns the encoded request while a submitted directory create awaits its
+/// exact terminal response. Dropping it does not authorize replay.
+pub struct PendingDirectoryCall {
+    client_id: u64,
+    request_id: u64,
+    _request: Vec<u8>,
+}
+
+pub enum DirectoryOwnedOutcome {
+    NoEffect(NtStatus),
+    Completed(DirectoryOwnedTerminal),
+    Indeterminate(PendingDirectoryCall),
+}
+
+pub enum DirectoryOwnedTerminal {
+    Success(DirectoryHandleResult),
+    Failure(NtStatus),
+    /// Transport completed but the server's success packet was incoherent;
+    /// the caller must retain ownership rather than assume rollback is safe.
+    Incoherent(ObReply),
+}
+
 /// The Object Manager client.
 pub struct ObjectClient<B> {
     backend: B,
+    owned_client_id: u64,
+    owned_directory_state: DirectoryOwnedState,
 }
+
+enum DirectoryOwnedState { Idle, Pending(u64), Quarantined }
+
+static NEXT_OWNED_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ObjectInfo {
@@ -64,6 +109,48 @@ pub struct DirectoryHandleResult {
     pub status: NtStatus,
     pub handle: HandleValue,
     pub created: bool,
+}
+
+fn encode_directory_handle(root: Option<HandleValue>, name: &UnicodeString,
+    access: AccessMask, attributes: ObjAttrFlags) -> Result<Vec<u8>, NtStatus>
+{
+    if root.is_some_and(|handle| handle.0 == 0) { return Err(NtStatus::INVALID_HANDLE); }
+    let flags = u16::try_from(attributes.bits()).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+    let bytes = name.len().checked_mul(2).and_then(|n| u32::try_from(n).ok())
+        .ok_or(NtStatus::INVALID_PARAMETER)?;
+    if bytes > u16::MAX as u32 { return Err(NtStatus::OBJECT_NAME_INVALID); }
+    let req = ObDirectoryHandleRequest { abi_size: size_of::<ObDirectoryHandleRequest>() as u16,
+        obj_attributes: flags, desired_access: access.bits(), root_directory: root.map_or(0, |h| h.0),
+        name_offset: size_of::<ObDirectoryHandleRequest>() as u32, name_len_bytes: bytes };
+    let total = size_of::<ObDirectoryHandleRequest>() + bytes as usize;
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(total).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+    buf.extend_from_slice(bytemuck::bytes_of(&req));
+    for unit in name.as_units() { buf.extend_from_slice(&unit.to_le_bytes()); }
+    Ok(buf)
+}
+
+fn decode_directory_handle(reply: ObReply, create: bool)
+    -> Result<DirectoryHandleResult, NtStatus>
+{
+    let status = NtStatus(reply.status);
+    if !status.is_success() { return Err(status); }
+    if reply.detail0 == 0 || reply.detail1 > 1 { return Err(NtStatus::INVALID_PARAMETER); }
+    if (create && !((status == NtStatus::SUCCESS && reply.detail1 == 1)
+        || (status == NtStatus(0x4000_0000) && reply.detail1 == 0)))
+        || (!create && (status != NtStatus::SUCCESS || reply.detail1 != 0))
+    { return Err(NtStatus::INVALID_PARAMETER); }
+    Ok(DirectoryHandleResult { status, handle: HandleValue(reply.detail0), created: reply.detail1 != 0 })
+}
+
+fn decode_owned_directory_terminal(reply: ObReply) -> DirectoryOwnedTerminal {
+    if !NtStatus(reply.status).is_success() {
+        return DirectoryOwnedTerminal::Failure(NtStatus(reply.status));
+    }
+    match decode_directory_handle(reply, true) {
+        Ok(result) => DirectoryOwnedTerminal::Success(result),
+        Err(_) => DirectoryOwnedTerminal::Incoherent(reply),
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -134,26 +221,10 @@ impl<B: Backend> ObjectClient<B> {
         access: AccessMask, attributes: ObjAttrFlags, create: bool)
         -> Result<DirectoryHandleResult, NtStatus>
     {
-        if root.is_some_and(|handle| handle.0 == 0) { return Err(NtStatus::INVALID_HANDLE); }
-        let flags = u16::try_from(attributes.bits()).map_err(|_| NtStatus::INVALID_PARAMETER)?;
-        let bytes = name.len().checked_mul(2).and_then(|n| u32::try_from(n).ok())
-            .ok_or(NtStatus::INVALID_PARAMETER)?;
-        if bytes > u16::MAX as u32 { return Err(NtStatus::OBJECT_NAME_INVALID); }
-        let req = ObDirectoryHandleRequest { abi_size: size_of::<ObDirectoryHandleRequest>() as u16,
-            obj_attributes: flags, desired_access: access.bits(), root_directory: root.map_or(0, |h| h.0),
-            name_offset: size_of::<ObDirectoryHandleRequest>() as u32, name_len_bytes: bytes };
-        let mut buf = Vec::from(bytemuck::bytes_of(&req));
-        for unit in name.as_units() { buf.extend_from_slice(&unit.to_le_bytes()); }
+        let buf = encode_directory_handle(root, name, access, attributes)?;
         let op = if create { opcode::OB_OP_CREATE_DIRECTORY_HANDLE } else { opcode::OB_OP_OPEN_DIRECTORY_HANDLE };
         let reply = self.backend.call(op, &buf, &mut []);
-        let status = NtStatus(reply.status);
-        if !status.is_success() { return Err(status); }
-        if reply.detail0 == 0 || reply.detail1 > 1 { return Err(NtStatus::INVALID_PARAMETER); }
-        if (create && !((status == NtStatus::SUCCESS && reply.detail1 == 1)
-            || (status == NtStatus(0x4000_0000) && reply.detail1 == 0)))
-            || (!create && (status != NtStatus::SUCCESS || reply.detail1 != 0))
-        { return Err(NtStatus::INVALID_PARAMETER); }
-        Ok(DirectoryHandleResult { status, handle: HandleValue(reply.detail0), created: reply.detail1 != 0 })
+        decode_directory_handle(reply, create)
     }
 
     /// The returned context must be committed by the native adapter only after
@@ -208,7 +279,10 @@ impl<B: Backend> ObjectClient<B> {
 
     /// Wrap a transport backend.
     pub fn new(backend: B) -> Self {
-        Self { backend }
+        let owned_client_id = NEXT_OWNED_CLIENT_ID.fetch_update(
+            Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1),
+        ).expect("object client identity exhausted");
+        Self { backend, owned_client_id, owned_directory_state: DirectoryOwnedState::Idle }
     }
 
     /// Access the backend (e.g. to reach the server in `DirectBackend`).
@@ -663,6 +737,54 @@ impl<B: Backend> ObjectClient<B> {
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect())
+    }
+}
+
+impl<B: OwnedBackend> ObjectClient<B> {
+    pub fn create_directory_handle_owned(&mut self, root: Option<HandleValue>,
+        name: &UnicodeString, access: AccessMask, attributes: ObjAttrFlags)
+        -> DirectoryOwnedOutcome
+    {
+        if !matches!(self.owned_directory_state, DirectoryOwnedState::Idle) {
+            return DirectoryOwnedOutcome::NoEffect(NtStatus::DEVICE_BUSY);
+        }
+        let request = match encode_directory_handle(root, name, access, attributes) {
+            Ok(request) => request,
+            Err(status) => return DirectoryOwnedOutcome::NoEffect(status),
+        };
+        match self.backend.call_owned(opcode::OB_OP_CREATE_DIRECTORY_HANDLE, &request, &mut []) {
+            OwnedCall::NoEffect(status) => DirectoryOwnedOutcome::NoEffect(status),
+            OwnedCall::Completed(reply) => {
+                let terminal = decode_owned_directory_terminal(reply);
+                if matches!(terminal, DirectoryOwnedTerminal::Incoherent(_)) {
+                    self.owned_directory_state = DirectoryOwnedState::Quarantined;
+                }
+                DirectoryOwnedOutcome::Completed(terminal)
+            }
+            OwnedCall::Indeterminate(request_id) => {
+                self.owned_directory_state = DirectoryOwnedState::Pending(request_id);
+                DirectoryOwnedOutcome::Indeterminate(PendingDirectoryCall {
+                    client_id: self.owned_client_id,
+                    request_id, _request: request,
+                })
+            }
+        }
+    }
+
+    pub fn poll_directory_handle_owned(&mut self, pending: &PendingDirectoryCall)
+        -> Option<DirectoryOwnedTerminal>
+    {
+        if pending.client_id != self.owned_client_id
+            || !matches!(self.owned_directory_state,
+                DirectoryOwnedState::Pending(id) if id == pending.request_id) { return None; }
+        let reply = self.backend.poll_owned(pending.request_id, &mut [])?;
+        let terminal = decode_owned_directory_terminal(reply);
+        self.owned_directory_state = if matches!(terminal, DirectoryOwnedTerminal::Incoherent(_)) {
+            DirectoryOwnedState::Quarantined
+        } else {
+            DirectoryOwnedState::Idle
+        };
+        Some(terminal)
     }
 }
 

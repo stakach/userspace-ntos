@@ -15221,6 +15221,37 @@ impl nt_object_client::Backend for ObChan<'_> {
     }
 }
 
+impl nt_object_client::OwnedBackend for ObChan<'_> {
+    fn call_owned(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8])
+        -> nt_object_client::OwnedCall
+    {
+        match self.0.raw_owned(opcode, in_buf, out_buf) {
+            RingCallOutcome::NoEffect(status) =>
+                nt_object_client::OwnedCall::NoEffect(nt_status::NtStatus(status)),
+            RingCallOutcome::Completed(status, _, information, detail0, detail1) =>
+                nt_object_client::OwnedCall::Completed(ObReply {
+                    status,
+                    information: information as u32,
+                    detail0,
+                    detail1,
+                }),
+            RingCallOutcome::Indeterminate { request_id } =>
+                nt_object_client::OwnedCall::Indeterminate(request_id),
+        }
+    }
+
+    fn poll_owned(&mut self, request_id: u64, out_buf: &mut [u8]) -> Option<ObReply> {
+        self.0.poll_owned(request_id, out_buf).map(
+            |(status, _, information, detail0, detail1)| ObReply {
+                status,
+                information: information as u32,
+                detail0,
+                detail1,
+            },
+        )
+    }
+}
+
 static mut OBJECT_CLIENT_PTR: *mut ObjectClient<ObChan<'static>> = core::ptr::null_mut();
 
 unsafe fn install_object_manager_client(client: &mut ObjectClient<ObChan<'static>>) {
