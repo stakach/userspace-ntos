@@ -16,10 +16,11 @@ pub(super) struct ReferencedDevice(u64);
 
 impl ReferencedDevice {
     pub(super) fn acquire(device: u64) -> Result<Self, i32> {
-        let status = hosted_driver_object_reference::ob_reference_object_by_pointer(
-            device, 0, 0, 0,
-        );
-        (status == STATUS_SUCCESS).then_some(Self(device)).ok_or(status)
+        let status =
+            hosted_driver_object_reference::ob_reference_object_by_pointer(device, 0, 0, 0);
+        (status == STATUS_SUCCESS)
+            .then_some(Self(device))
+            .ok_or(status)
     }
 }
 
@@ -38,9 +39,13 @@ pub(super) struct PartitionIo {
 
 impl PartitionIo {
     pub(super) unsafe fn new(capacity: u32) -> Option<Self> {
-        if capacity == 0 { return None; }
+        if capacity == 0 {
+            return None;
+        }
         let buffer = pool_alloc_zeroed(u64::from(capacity));
-        if buffer == 0 { return None; }
+        if buffer == 0 {
+            return None;
+        }
         let event = pool_alloc_zeroed(24);
         if event == 0 {
             pool_free(buffer);
@@ -52,7 +57,12 @@ impl PartitionIo {
             pool_free(buffer);
             return None;
         }
-        Some(Self { buffer, event, iosb, capacity })
+        Some(Self {
+            buffer,
+            event,
+            iosb,
+            capacity,
+        })
     }
 
     /// The source packet owns its own transferred buffers. `self` stays live during a parked
@@ -69,7 +79,8 @@ impl PartitionIo {
             let wait = s_ke_wait_for_single_object(self.event, 5, 0, 0, 0);
             if wait != STATUS_SUCCESS {
                 crate::provider_bugcheck::report(
-                    0xc4, [device, irp, self.event, wait as u32 as u64],
+                    0xc4,
+                    [device, irp, self.event, wait as u32 as u64],
                 );
             }
         }
@@ -77,23 +88,31 @@ impl PartitionIo {
         if terminal == STATUS_PENDING as i32 {
             // A returned non-pending dispatch must have completed. Reusing the source packet
             // or its buffers after an uncertain completion would violate native ownership.
-            crate::provider_bugcheck::report(
-                0xc4, [device, irp, self.iosb, direct as u32 as u64],
-            );
+            crate::provider_bugcheck::report(0xc4, [device, irp, self.iosb, direct as u32 as u64]);
         }
-        if terminal < 0 { return Err(terminal); }
+        if terminal < 0 {
+            return Err(terminal);
+        }
         Ok(read_unaligned((self.iosb + 8) as *const u64))
     }
 
-    unsafe fn geometry(&mut self, device: u64) -> Result<(u32, u64), i32> {
+    pub(super) unsafe fn geometry(&mut self, device: u64) -> Result<(u32, u64), i32> {
         self.prepare();
         let irp = hosted_synchronous_fsd_request::build_control(
-            IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, device,
-            self.buffer, self.capacity, self.event, self.iosb,
+            IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+            device,
+            self.buffer,
+            self.capacity,
+            self.event,
+            self.iosb,
         );
-        if irp == 0 { return Err(STATUS_INSUFFICIENT_RESOURCES); }
+        if irp == 0 {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
         let information = self.dispatch(device, irp)?;
-        if information < 32 { return Err(IO_DEVICE_ERROR); }
+        if information < 32 {
+            return Err(IO_DEVICE_ERROR);
+        }
         let sector_bytes = read_unaligned((self.buffer + 20) as *const u32);
         let disk_bytes = read_unaligned((self.buffer + 24) as *const u64);
         if !(512..=65_536).contains(&sector_bytes)
@@ -106,19 +125,66 @@ impl PartitionIo {
     }
 
     pub(super) unsafe fn read_sector(
-        &mut self, device: u64, lba: u64, out: &mut [u8],
+        &mut self,
+        device: u64,
+        lba: u64,
+        out: &mut [u8],
     ) -> Result<(), i32> {
-        if out.len() != self.capacity as usize { return Err(STATUS_INVALID_PARAMETER); }
-        let offset = lba.checked_mul(u64::from(self.capacity))
+        if out.len() != self.capacity as usize {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let offset = lba
+            .checked_mul(u64::from(self.capacity))
             .ok_or(STATUS_INVALID_PARAMETER)?;
         self.prepare();
         let irp = hosted_synchronous_fsd_request::build_disk_metadata_read(
-            device, self.buffer, self.capacity, offset, self.event, self.iosb,
+            device,
+            self.buffer,
+            self.capacity,
+            offset,
+            self.event,
+            self.iosb,
         );
-        if irp == 0 { return Err(STATUS_INSUFFICIENT_RESOURCES); }
+        if irp == 0 {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
         let information = self.dispatch(device, irp)?;
-        if information != u64::from(self.capacity) { return Err(IO_DEVICE_ERROR); }
+        if information != u64::from(self.capacity) {
+            return Err(IO_DEVICE_ERROR);
+        }
         core::ptr::copy_nonoverlapping(self.buffer as *const u8, out.as_mut_ptr(), out.len());
+        Ok(())
+    }
+
+    pub(super) unsafe fn write_sector(
+        &mut self,
+        device: u64,
+        lba: u64,
+        data: &[u8],
+    ) -> Result<(), i32> {
+        if data.len() != self.capacity as usize {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let offset = lba
+            .checked_mul(u64::from(self.capacity))
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        core::ptr::copy_nonoverlapping(data.as_ptr(), self.buffer as *mut u8, data.len());
+        self.prepare();
+        let irp = hosted_synchronous_fsd_request::build_disk_metadata_write(
+            device,
+            self.buffer,
+            self.capacity,
+            offset,
+            self.event,
+            self.iosb,
+        );
+        if irp == 0 {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let information = self.dispatch(device, irp)?;
+        if information != u64::from(self.capacity) {
+            return Err(IO_DEVICE_ERROR);
+        }
         Ok(())
     }
 }
@@ -135,7 +201,9 @@ impl Drop for PartitionIo {
 
 pub(super) extern "win64" fn read(device: u64, output: u64) -> i32 {
     unsafe {
-        if output == 0 { return STATUS_INVALID_PARAMETER; }
+        if output == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
         write_unaligned(output as *mut u64, 0);
         if hosted_synchronous_fsd_request::device_contract(device).is_none() {
             return STATUS_INVALID_PARAMETER;
@@ -165,7 +233,9 @@ pub(super) extern "win64" fn read(device: u64, output: u64) -> i32 {
             Err(nt_fs::DriveLayoutReadError::InvalidPartitionTable) => return DISK_CORRUPT_ERROR,
         };
         let result = pool_alloc(layout.len() as u64);
-        if result == 0 { return STATUS_INSUFFICIENT_RESOURCES; }
+        if result == 0 {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
         core::ptr::copy_nonoverlapping(layout.as_ptr(), result as *mut u8, layout.len());
         write_unaligned(output as *mut u64, result);
         STATUS_SUCCESS
@@ -174,4 +244,20 @@ pub(super) extern "win64" fn read(device: u64, output: u64) -> i32 {
 
 pub(super) fn bind(reg: &mut DriverExportRegistry) {
     reg.bind("IoReadPartitionTableEx", read as *const () as usize as u64);
+    reg.bind(
+        "IoCreateDisk",
+        super::hosted_partition_mutation::create_disk as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoSetPartitionInformation",
+        super::hosted_partition_mutation::set_partition_information as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoSetPartitionInformationEx",
+        super::hosted_partition_mutation::set_partition_information_ex as *const () as usize as u64,
+    );
+    reg.bind(
+        "IoWritePartitionTableEx",
+        super::hosted_partition_mutation::write_partition_table_ex as *const () as usize as u64,
+    );
 }

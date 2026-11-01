@@ -242,6 +242,8 @@ mod hosted_kd_debug;
 mod hosted_synchronous_fsd_request;
 #[path = "hosted_partition_table.rs"]
 mod hosted_partition_table;
+#[path = "hosted_partition_mutation.rs"]
+mod hosted_partition_mutation;
 #[path = "hosted_disk_signature.rs"]
 mod hosted_disk_signature;
 #[path = "hosted_source_create_security.rs"]
