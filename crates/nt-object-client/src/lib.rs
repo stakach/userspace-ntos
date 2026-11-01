@@ -370,14 +370,25 @@ impl<B: Backend> ObjectClient<B> {
     /// Clear permanence through a DELETE-authorized handle. The object remains
     /// named until its final handle closes.
     pub fn make_temporary(&mut self, handle: HandleValue) -> Result<(), NtStatus> {
+        self.mutate_directory_permanence(handle, opcode::OB_OP_MAKE_TEMPORARY)
+    }
+
+    /// Publish a directory name permanently through a DELETE-authorized handle.
+    /// Native privilege checks remain with the executive's captured subject.
+    pub fn make_permanent(&mut self, handle: HandleValue) -> Result<(), NtStatus> {
+        self.mutate_directory_permanence(handle, opcode::OB_OP_MAKE_PERMANENT)
+    }
+
+    fn mutate_directory_permanence(&mut self, handle: HandleValue, op: u16)
+        -> Result<(), NtStatus>
+    {
         let req = ObCloseHandleRequest {
             abi_size: size_of::<ObCloseHandleRequest>() as u16,
             _reserved: 0,
             _reserved2: 0,
             handle: handle.0,
         };
-        let reply = self.backend.call(opcode::OB_OP_MAKE_TEMPORARY,
-            bytemuck::bytes_of(&req), &mut []);
+        let reply = self.backend.call(op, bytemuck::bytes_of(&req), &mut []);
         NtStatus(reply.status).to_result()
     }
 
@@ -845,6 +856,10 @@ impl<B: OwnedBackend> ObjectClient<B> {
 
     pub fn make_temporary_owned(&mut self, handle: HandleValue) -> HandleMutationOutcome {
         self.handle_mutation_owned(handle, opcode::OB_OP_MAKE_TEMPORARY)
+    }
+
+    pub fn make_permanent_owned(&mut self, handle: HandleValue) -> HandleMutationOutcome {
+        self.handle_mutation_owned(handle, opcode::OB_OP_MAKE_PERMANENT)
     }
 
     fn handle_mutation_owned(&mut self, handle: HandleValue, op: u16)

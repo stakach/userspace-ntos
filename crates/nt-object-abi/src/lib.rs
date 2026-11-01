@@ -34,6 +34,7 @@ pub mod opcode {
     pub const OB_OP_MAKE_TEMPORARY: u16 = 0x2015;
     pub const OB_OP_DELETE_OBJECT: u16 = 0x2016;
     pub const OB_OP_DELETE_SYMBOLIC_LINK_EXACT: u16 = 0x2017;
+    pub const OB_OP_MAKE_PERMANENT: u16 = 0x2018;
 
     pub const OB_OP_CREATE_DIRECTORY: u16 = 0x2020;
     pub const OB_OP_CREATE_SYMBOLIC_LINK: u16 = 0x2021;

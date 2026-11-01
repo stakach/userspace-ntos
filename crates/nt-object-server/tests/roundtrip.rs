@@ -69,6 +69,55 @@ fn directory_make_temporary_requires_delete_and_exact_live_handle() {
 }
 
 #[test]
+fn directory_make_permanent_requires_delete_and_preserves_exact_name() {
+    use nt_object_abi::{opcode, ObCloseHandleRequest};
+    use nt_types::{ObjAttrFlags, UnicodeString};
+
+    let mut server = Server::new().unwrap();
+    let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
+    let mut c = client(&mut server, cid);
+    let name = UnicodeString::from_str("\\Device\\PermanentGuard");
+    let temporary = c.create_directory_handle(None, &name,
+        AccessMask::GENERIC_ALL | AccessMask::DELETE,
+        ObjAttrFlags::CASE_INSENSITIVE).unwrap().handle;
+    let read_only = c.open_directory_handle(None, &name,
+        AccessMask::GENERIC_READ, ObjAttrFlags::CASE_INSENSITIVE).unwrap();
+    let mut req = ObCloseHandleRequest {
+        abi_size: core::mem::size_of::<ObCloseHandleRequest>() as u16,
+        _reserved: 0,
+        _reserved2: 0,
+        handle: read_only.0,
+    };
+    let denied = c.backend_mut().call(opcode::OB_OP_MAKE_PERMANENT,
+        bytemuck::bytes_of(&req), &mut []);
+    assert_eq!(NtStatus(denied.status), NtStatus::ACCESS_DENIED);
+    req.handle = temporary.0;
+    req._reserved = 1;
+    let invalid = c.backend_mut().call(opcode::OB_OP_MAKE_PERMANENT,
+        bytemuck::bytes_of(&req), &mut []);
+    assert_eq!(NtStatus(invalid.status), NtStatus::INVALID_PARAMETER);
+    req._reserved = 0;
+    let allowed = c.backend_mut().call(opcode::OB_OP_MAKE_PERMANENT,
+        bytemuck::bytes_of(&req), &mut []);
+    assert_eq!(NtStatus(allowed.status), NtStatus::SUCCESS);
+    assert_eq!(allowed.information, 0);
+    assert_eq!((allowed.detail0, allowed.detail1), (0, 0));
+    c.make_permanent(temporary).unwrap(); // idempotent through the client stub
+    c.close_handle(read_only).unwrap();
+    c.close_handle(temporary).unwrap();
+    assert!(c.lookup("\\Device\\PermanentGuard", true).is_ok());
+    let stale = c.backend_mut().call(opcode::OB_OP_MAKE_PERMANENT,
+        bytemuck::bytes_of(&req), &mut []);
+    assert_eq!(NtStatus(stale.status), NtStatus::INVALID_HANDLE);
+    let delete = c.open_directory_handle(None, &name, AccessMask::DELETE,
+        ObjAttrFlags::CASE_INSENSITIVE).unwrap();
+    c.make_temporary(delete).unwrap();
+    c.close_handle(delete).unwrap();
+    assert_eq!(c.lookup("\\Device\\PermanentGuard", true).unwrap_err(),
+        NtStatus::OBJECT_NAME_NOT_FOUND);
+}
+
+#[test]
 fn full_service_roundtrip() {
     let mut server = Server::new().unwrap();
     let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);

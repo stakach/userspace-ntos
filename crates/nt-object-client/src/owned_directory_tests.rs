@@ -284,15 +284,17 @@ impl Backend for LegacyMutationUncertain<'_> {
 
 #[test]
 fn synchronous_cleanup_collapses_submitted_uncertainty_to_status() {
-    for op in [opcode::OB_OP_CLOSE_HANDLE, opcode::OB_OP_MAKE_TEMPORARY] {
+    for op in [opcode::OB_OP_CLOSE_HANDLE, opcode::OB_OP_MAKE_TEMPORARY,
+        opcode::OB_OP_MAKE_PERMANENT] {
         let submitted = Cell::new(false);
         let mut client = ObjectClient::new(LegacyMutationUncertain {
             submitted: &submitted, op,
         });
-        let result = if op == opcode::OB_OP_CLOSE_HANDLE {
-            client.close_handle(HandleValue(91))
-        } else {
-            client.make_temporary(HandleValue(91))
+        let result = match op {
+            opcode::OB_OP_CLOSE_HANDLE => client.close_handle(HandleValue(91)),
+            opcode::OB_OP_MAKE_TEMPORARY => client.make_temporary(HandleValue(91)),
+            opcode::OB_OP_MAKE_PERMANENT => client.make_permanent(HandleValue(91)),
+            _ => unreachable!(),
         };
         assert_eq!(result, Err(NtStatus::UNSUCCESSFUL));
         assert!(submitted.get());
@@ -336,15 +338,18 @@ impl OwnedBackend for UncertainMutation {
 
 #[test]
 fn uncertain_cleanup_retains_exact_request_and_blocks_directory_publication() {
-    for op in [opcode::OB_OP_CLOSE_HANDLE, opcode::OB_OP_MAKE_TEMPORARY] {
+    for op in [opcode::OB_OP_CLOSE_HANDLE, opcode::OB_OP_MAKE_TEMPORARY,
+        opcode::OB_OP_MAKE_PERMANENT] {
         let mut client = ObjectClient::new(UncertainMutation {
             expected_op: op, sent: 0, pending: false, malformed: false,
         });
-        let pending = match if op == opcode::OB_OP_CLOSE_HANDLE {
-            client.close_handle_owned(HandleValue(91))
-        } else {
-            client.make_temporary_owned(HandleValue(91))
-        } {
+        let outcome = match op {
+            opcode::OB_OP_CLOSE_HANDLE => client.close_handle_owned(HandleValue(91)),
+            opcode::OB_OP_MAKE_TEMPORARY => client.make_temporary_owned(HandleValue(91)),
+            opcode::OB_OP_MAKE_PERMANENT => client.make_permanent_owned(HandleValue(91)),
+            _ => unreachable!(),
+        };
+        let pending = match outcome {
             HandleMutationOutcome::Indeterminate(pending) => pending,
             _ => panic!("cleanup request must retain ownership"),
         };
@@ -365,10 +370,10 @@ fn uncertain_cleanup_retains_exact_request_and_blocks_directory_publication() {
 #[test]
 fn malformed_late_cleanup_success_quarantines_shared_gate() {
     let mut client = ObjectClient::new(UncertainMutation {
-        expected_op: opcode::OB_OP_MAKE_TEMPORARY,
+        expected_op: opcode::OB_OP_MAKE_PERMANENT,
         sent: 0, pending: false, malformed: true,
     });
-    let pending = match client.make_temporary_owned(HandleValue(91)) {
+    let pending = match client.make_permanent_owned(HandleValue(91)) {
         HandleMutationOutcome::Indeterminate(pending) => pending,
         _ => panic!("cleanup request must retain ownership"),
     };

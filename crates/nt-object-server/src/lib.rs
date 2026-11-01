@@ -104,6 +104,7 @@ impl Server {
             opcode::OB_OP_OPEN_OBJECT => self.op_open(client, in_buf),
             opcode::OB_OP_CLOSE_HANDLE => self.op_close_handle(client, in_buf),
             opcode::OB_OP_MAKE_TEMPORARY => self.op_make_temporary(client, in_buf),
+            opcode::OB_OP_MAKE_PERMANENT => self.op_make_permanent(client, in_buf),
             opcode::OB_OP_REFERENCE_HANDLE => self.op_reference_handle(client, in_buf),
             opcode::OB_OP_DEREFERENCE_OBJECT => self.op_dereference_object(client, in_buf),
             opcode::OB_OP_DELETE_OBJECT => self.op_delete_object(in_buf),
@@ -153,16 +154,30 @@ impl Server {
     }
 
     fn op_make_temporary(&mut self, client: ClientId, buf: &[u8]) -> Result<ObReply, NtStatus> {
+        let object = self.directory_mutation_object(client, buf)?;
+        self.om.make_temporary(&object)?;
+        Ok(ok())
+    }
+
+    fn op_make_permanent(&mut self, client: ClientId, buf: &[u8]) -> Result<ObReply, NtStatus> {
+        let object = self.directory_mutation_object(client, buf)?;
+        // A directory's parent already owns its published name. Unlike a
+        // provider body, no separate backing-store reference is needed.
+        self.om.make_permanent(&object)?;
+        Ok(ok())
+    }
+
+    fn directory_mutation_object(&self, client: ClientId, buf: &[u8])
+        -> Result<ObjectRef, NtStatus>
+    {
         let req: ObCloseHandleRequest = read_req(buf)?;
         check_size::<ObCloseHandleRequest>(req.abi_size)?;
         if req._reserved != 0 || req._reserved2 != 0 {
             return Err(NtStatus::INVALID_PARAMETER);
         }
         let directory_type = self.om.directory_type().ok_or(NtStatus::INVALID_HANDLE)?;
-        let object = self.om.reference_by_handle(client, HandleValue(req.handle),
-            Some(directory_type), AccessMask::DELETE)?;
-        self.om.make_temporary(&object)?;
-        Ok(ok())
+        self.om.reference_by_handle(client, HandleValue(req.handle),
+            Some(directory_type), AccessMask::DELETE)
     }
 
     fn op_reference_handle(&mut self, client: ClientId, buf: &[u8]) -> Result<ObReply, NtStatus> {
