@@ -31766,6 +31766,18 @@ impl NativeSyscallHandler for ExecNtHandler {
         });
         let io_started = io_call.map(|_| crate::disk_census_ticks());
         let status = self.handle_service(ctx, args, out);
+        if status == STATUS_NOT_SUPPORTED {
+            static UNSUPPORTED_SYSCALL_TRACE_N: AtomicU64 = AtomicU64::new(0);
+            if UNSUPPORTED_SYSCALL_TRACE_N.fetch_add(1, Ordering::Relaxed) < 12 {
+                print_str(b"[native-not-supported] service=");
+                print_str(service_name.as_bytes());
+                print_str(b" pi=");
+                print_u64(self.pi as u64);
+                print_str(b" tid=");
+                print_u64(self.current_tid);
+                print_str(b"\n");
+            }
+        }
         if let (Some(call), Some(started)) = (io_call, io_started) {
             native_io_attribution::record(
                 self, call, io_pi, io_owner, io_route, status,

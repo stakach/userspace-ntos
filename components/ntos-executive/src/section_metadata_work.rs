@@ -1371,6 +1371,7 @@ unsafe fn advance(
             }
         }
         Phase::ReadyReply => {
+            trace_image_not_supported(work, b"reply", work.status);
             if work.cancelled {
                 if let Some(handle) = work
                     .published_handle
