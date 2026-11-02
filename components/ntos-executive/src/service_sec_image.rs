@@ -27000,8 +27000,23 @@ unsafe fn pending_file_io_transfer(
 
     pending.native_call_transport = native_call_transport;
     if !wait_for_completion {
+        assert_eq!(pending.reply_cap, 0, "nonwaiting File transfer retained a parked Reply");
         let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
         return commit_or_panic(table, reservation, pending, false);
+    }
+    if pending.reply_cap != 0 {
+        // The original caller already owns this saved Reply. A redriven CREATE must transfer
+        // that exact capability to its reserved File owner, leaving the current ingress Reply
+        // untouched. Validation also rejects an alias of the active main slot.
+        parked_reply::validate_saved(pending.reply_cap)
+            .expect("pending File transfer lost its preparked Reply");
+        assert!(pending.reply_required);
+        pending.resume_ip = resume_ip;
+        pending.resume_sp = sp;
+        pending.resume_flags = flags;
+        let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
+        commit_or_panic(table, reservation, pending, true);
+        return;
     }
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     assert_ne!(

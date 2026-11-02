@@ -2485,6 +2485,59 @@ mod tests {
     }
 
     #[test]
+    fn preparked_create_reply_keeps_exact_caller_until_verified_reply_and_backend_ack() {
+        let mut table = PendingFileIoTable::new();
+        let reservation = table.reserve().unwrap();
+        let caller = reservation.identity();
+        let mut request = pending(11, 0x294, 24);
+        request.major = nt_io_abi::major::IRP_MJ_CREATE;
+        request.operation = PendingFileIoOperation::Create(PendingFileCreate {
+            handle_va: 0x7000,
+            desired_access: 0x12019F,
+            provider_context: 0,
+            lifecycle_reserved: false,
+            reservation_pid: 12,
+            reserved_handle: 0x44,
+            reservation_generation: 7,
+            status: nt_status::NtStatus::PENDING.raw() as u32,
+            information: 0,
+            handle_value: 0,
+            output: PendingCreateOutput::default(),
+        });
+        request.output_va = 0;
+        request.output_len = 0;
+        request.iosb_va = 0x7100;
+        request.apc_routine = 0;
+        request.signal_file = false;
+        request.publish_iocp = false;
+        request.event_obj_idx = u64::MAX;
+        request.reply_cap = 0x50; // Already parked; never substitute the current main Reply.
+        request.reply_required = true;
+        request.native_call_transport = true;
+        let slot = table.park_reserved(reservation, request).unwrap();
+        assert_eq!(slot, caller.slot());
+        assert_eq!(table.get_exact(caller).unwrap().reply_cap, 0x50);
+
+        table.commit_create_exact(slot, 0x294, 0, 1, 0x44).unwrap();
+        table.settle_test_create(slot, 0x294);
+        assert_eq!(table.claim_reply_cap_exact(slot, 0x294), Some(Some(0x50)));
+        // An uncertain send cannot be replayed or used to retire the File/Reply owner.
+        assert_eq!(table.claim_reply_cap_exact(slot, 0x294), Some(None));
+        assert!(table.mark_backend_acked_exact(slot, 0x294).is_none());
+        assert!(table.finish_exact(slot, 0x294).is_none());
+        assert_eq!(table.get_exact(caller).unwrap().reply_cap, 0x50);
+
+        // Only a verified Reply receipt may advance delivery; backend ACK follows it.
+        table.mark_reply_published_exact(slot, 0x294).unwrap();
+        assert!(table.mark_backend_acked_exact(slot, 0x294).is_some());
+        assert_eq!(table.finish_exact(slot, 0x294).unwrap().irp_id, 0x294);
+        assert!(table.get_exact(caller).is_none());
+        let next = table.reserve().unwrap().identity();
+        assert_ne!(next, caller, "slot reuse must not reauthorize the old caller generation");
+        assert!(table.get_exact(caller).is_none());
+    }
+
+    #[test]
     fn pending_create_failure_commits_a_null_handle() {
         let mut table = PendingFileIoTable::new();
         let mut request = pending(1, 2, 7);
