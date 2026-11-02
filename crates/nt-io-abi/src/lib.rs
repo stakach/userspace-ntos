@@ -46,6 +46,47 @@ pub const IO_ABI_VERSION: u32 = 19;
 pub const IRP_DISPATCH_SUBSIDIARY_FILE_LIFECYCLE: u16 = 1;
 /// Root-authenticated, File-less `IRP_MJ_SCSI` payload. Its SRB is pointer-free on the wire.
 pub const IRP_DISPATCH_SCSI_SRB: u16 = 2;
+/// Root-authenticated METHOD_BUFFERED device control whose complete declared output buffer is
+/// captured even if the provider reports zero IoStatus.Information.
+pub const IRP_DISPATCH_BUFFERED_OUTPUT_CAPACITY: u16 = 3;
+
+pub const fn valid_buffered_output_capacity_dispatch(request: &IrpDispatchRequest) -> bool {
+    request._reserved0 == IRP_DISPATCH_BUFFERED_OUTPUT_CAPACITY
+        && matches!(request.major, major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL)
+        && request.file_id == 0
+        && request.scsi_relation_generation == 0
+        && ioctl::method(request.ioctl_code) == ioctl::METHOD_BUFFERED
+        && request.output_len != 0
+        && request.buffer_len >= request.input_len
+        && request.buffer_len >= request.output_len
+}
+
+#[cfg(test)]
+mod buffered_capture_tests {
+    use super::*;
+
+    #[test]
+    fn capacity_capture_requires_fileless_buffered_device_control() {
+        let mut request = IrpDispatchRequest {
+            _reserved0: IRP_DISPATCH_BUFFERED_OUTPUT_CAPACITY,
+            major: major::IRP_MJ_DEVICE_CONTROL,
+            ioctl_code: ioctl::ctl_code(0x22, 0x800, ioctl::METHOD_BUFFERED, ioctl::FILE_ANY_ACCESS),
+            input_len: 12,
+            output_len: 8,
+            buffer_len: 12,
+            ..IrpDispatchRequest::default()
+        };
+        assert!(valid_buffered_output_capacity_dispatch(&request));
+        request.file_id = 1;
+        assert!(!valid_buffered_output_capacity_dispatch(&request));
+        request.file_id = 0;
+        request.ioctl_code |= ioctl::METHOD_NEITHER;
+        assert!(!valid_buffered_output_capacity_dispatch(&request));
+        request.ioctl_code &= !ioctl::METHOD_NEITHER;
+        request.major = major::IRP_MJ_READ;
+        assert!(!valid_buffered_output_capacity_dispatch(&request));
+    }
+}
 
 /// Validate original canonical File CREATE options separately from mutable stack options.
 /// CREATE, named-pipe CREATE, and mailslot CREATE carry only the low 24 option bits and cannot

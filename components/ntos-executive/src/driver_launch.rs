@@ -1589,7 +1589,8 @@ struct PendingIrp {
     subsidiary_file_lifecycle: bool,
     /// Immutable transfer method captured before the driver can modify its stack location.
     control_method: u8,
-    _pad: [u8; 1],
+    /// Root-authenticated request to retain the full buffered output capacity.
+    buffered_output_capacity: bool,
     /// Immutable IOCTL code used to select structured completion payloads.
     control_code: u32,
     /// Root-issued authority for an inbound, caller-owned projected IRP.
@@ -1816,11 +1817,17 @@ fn pending_irp_completion_output_len(
     minor: u64,
     control_code: u32,
     control_method: u8,
+    buffered_output_capacity: bool,
     output_len: u64,
     status: u32,
     information: u64,
 ) -> u64 {
-    if major == IRP_MJ_PNP
+    if buffered_output_capacity
+        && matches!(major, IRP_MJ_DEVICE_CONTROL | IRP_MJ_INTERNAL_DEVICE_CONTROL)
+        && control_method == ioctl::METHOD_BUFFERED as u8
+    {
+        output_len
+    } else if major == IRP_MJ_PNP
         && minor == nt_pnp_abi::IRP_MN_QUERY_CAPABILITIES as u64
         && output_len == nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE as u64
     {
@@ -2336,6 +2343,7 @@ struct PendingIrpCompletionTarget {
     major: u8,
     minor: u8,
     control_method: u8,
+    buffered_output_capacity: bool,
     control_code: u32,
 }
 
@@ -2473,6 +2481,10 @@ unsafe fn claim_pending_irp_completion(irp: u64) -> Option<PendingIrpCompletionC
                         control_method: read_volatile(
                             (entry + core::mem::offset_of!(PendingIrp, control_method) as u64)
                                 as *const u8,
+                        ),
+                        buffered_output_capacity: read_volatile(
+                            (entry + core::mem::offset_of!(PendingIrp, buffered_output_capacity) as u64)
+                                as *const bool,
                         ),
                         control_code: read_volatile(
                             (entry + core::mem::offset_of!(PendingIrp, control_code) as u64)
@@ -13917,6 +13929,7 @@ unsafe fn complete_hosted_irp_with_owner(irp: u64) -> HostedIrpCompletionReceipt
             target.minor as u64,
             target.control_code,
             target.control_method,
+            target.buffered_output_capacity,
             target.output_capacity,
             status,
             information,
@@ -38836,7 +38849,8 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                     major::IRP_MJ_CREATE | major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE))
                 || (request._reserved0 == nt_io_abi::IRP_DISPATCH_SCSI_SRB
                     && request.major == major::IRP_MJ_INTERNAL_DEVICE_CONTROL
-                    && request.file_id == 0)))
+                    && request.file_id == 0)
+                || nt_io_abi::valid_buffered_output_capacity_dispatch(&request)))
         || ((request._reserved0 == nt_io_abi::IRP_DISPATCH_SCSI_SRB)
             != (request.scsi_relation_generation != 0))
         || !nt_io_abi::valid_create_case_sensitive(request.major, request.create_case_sensitive)
@@ -38866,6 +38880,8 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
     let subsidiary_file_lifecycle =
         request._reserved0 == nt_io_abi::IRP_DISPATCH_SUBSIDIARY_FILE_LIFECYCLE;
     let is_scsi = request._reserved0 == nt_io_abi::IRP_DISPATCH_SCSI_SRB;
+    let buffered_output_capacity =
+        request._reserved0 == nt_io_abi::IRP_DISPATCH_BUFFERED_OUTPUT_CAPACITY;
     let owner_domain = HostedDomainIdentity {
         domain_id: nt_io_manager::HostedDomainId(request.target_domain_id),
         cookie: request.target_domain_cookie,
@@ -39895,7 +39911,7 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         owns_fo,
         subsidiary_file_lifecycle,
         control_method: control_method.unwrap_or(ioctl::METHOD_BUFFERED) as u8,
-        _pad: [0; 1],
+        buffered_output_capacity,
         control_code: fsctl as u32,
         source_ticket_id: 0,
         source_ticket_generation: 0,
@@ -40366,11 +40382,12 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
                 minor,
                 completed.control_code,
                 completed.control_method,
+                completed.buffered_output_capacity,
                 outlen,
                 st as u32,
                 info,
             ) };
-            let full_control_output = (major == IRP_MJ_DEVICE_CONTROL
+            let full_control_output = completed.buffered_output_capacity || (major == IRP_MJ_DEVICE_CONTROL
                 || major == IRP_MJ_INTERNAL_DEVICE_CONTROL)
                 && (ioctl::METHOD_IN_DIRECT as u8..=ioctl::METHOD_NEITHER as u8)
                     .contains(&completed.control_method);
@@ -72565,7 +72582,8 @@ unsafe fn dispatch_irp_for_instance_exact(
                     || (request._reserved0 == nt_io_abi::IRP_DISPATCH_SCSI_SRB
                         && request.major == major::IRP_MJ_INTERNAL_DEVICE_CONTROL
                         && request.file_id == 0
-                        && request.scsi_relation_generation != 0)))
+                        && request.scsi_relation_generation != 0)
+                    || nt_io_abi::valid_buffered_output_capacity_dispatch(request)))
             || ((request._reserved0 == nt_io_abi::IRP_DISPATCH_SCSI_SRB)
                 != (request.scsi_relation_generation != 0))
             || request.stack_count == 0

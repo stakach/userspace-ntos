@@ -43,7 +43,7 @@ pub(super) fn invoke(
             match nt_io_manager::scsi_srb_wire::encode_scsi_dispatch_input(
                 parameters, projection.irp_id, input,
             ) {
-                Ok(packet) => execute(instance_index, Some(caller), &projection, &packet, output),
+                Ok(packet) => execute_with_capture(instance_index, Some(caller), &projection, &packet, output, capture),
                 Err(error) => HostedIrpTransportResult::NotDispatched {
                     status: match error {
                         nt_io_manager::scsi_srb_wire::ScsiWireError::NoCapacity =>
@@ -53,7 +53,7 @@ pub(super) fn invoke(
                 },
             }
         } else {
-            execute(instance_index, Some(caller), &projection, input, output)
+            execute_with_capture(instance_index, Some(caller), &projection, input, output, capture)
         }
     };
     if trace_connect {
@@ -435,11 +435,31 @@ pub(super) fn execute(
     input: &[u8],
     output: &mut [u8],
 ) -> HostedIrpTransportResult {
-    let request =
+    execute_with_capture(instance_index, caller, projection, input, output,
+        ExternalFileIrpOutputCapture::Information)
+}
+
+fn execute_with_capture(
+    instance_index: usize,
+    caller: Option<nt_process::native_handle::NativeHandleCaller>,
+    projection: &IrpProjection,
+    input: &[u8],
+    output: &mut [u8],
+    capture: ExternalFileIrpOutputCapture,
+) -> HostedIrpTransportResult {
+    let mut request =
         match hosted_irp_dispatch_request(instance_index, projection, input.len(), output.len()) {
             Ok(request) => request,
             Err(status) => return HostedIrpTransportResult::NotDispatched { status },
         };
+    if capture == ExternalFileIrpOutputCapture::BufferedDeviceControlCapacity {
+        request._reserved0 = nt_io_abi::IRP_DISPATCH_BUFFERED_OUTPUT_CAPACITY;
+        if !nt_io_abi::valid_buffered_output_capacity_dispatch(&request) {
+            return HostedIrpTransportResult::NotDispatched {
+                status: nt_status::NtStatus::INVALID_PARAMETER,
+            };
+        }
+    }
     let Some((route_instance, route_inst, device_object)) =
         hosted_driver_device_route_by_device_id_for_irp(
             projection.device_id.raw(), Some(projection.irp_id))
