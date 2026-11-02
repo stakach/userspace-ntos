@@ -462,6 +462,7 @@ dependencies = [
  "nt-fs",
  "nt-io-abi",
  "nt-io-completion",
+ "nt-kernel-abi",
  "nt-kernel-exec",
  "nt-memory-manager",
  "nt-object-manager",

@@ -16,7 +16,7 @@ pub const WDM_X64_DEVICE_OBJECT_SIZE: usize = 0x150;
 pub const WDM_X64_FILE_OBJECT_SIZE: usize = 0x100;
 pub const WDM_X64_FILE_OBJECT_EVENT_OFFSET: usize = 0x98;
 pub const WDM_X64_FILE_OBJECT_EVENT_SIGNAL_STATE_OFFSET: usize = 0x9c;
-pub const WDM_X64_IRP_SIZE: usize = 0x120;
+pub const WDM_X64_IRP_SIZE: usize = core::mem::size_of::<nt_kernel_abi::Irp>();
 pub const WDM_X64_IO_STACK_LOCATION_SIZE: usize = 0x48;
 
 pub const WDM_X64_IO_TYPE_DRIVER: i16 = 4;

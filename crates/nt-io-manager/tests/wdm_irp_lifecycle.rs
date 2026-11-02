@@ -2,6 +2,7 @@ use nt_io_manager::{
     initialize_wdm_irp_packet, reuse_wdm_irp_packet, WdmLayoutError,
     WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IRP_SIZE,
 };
+use nt_io_manager::kernel_irp_builder::validate_new_kernel_irp_packet;
 
 const IRP: u64 = 0x1234_5000;
 const STACKS: u8 = 2;
@@ -13,6 +14,20 @@ fn u16_at(bytes: &[u8], offset: usize) -> u16 {
 
 fn u64_at(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+#[test]
+fn classpnp_io_size_of_irp_fits_and_registers_exact_caller_packet() {
+    // Pinned classpnp allocates IoSizeOfIrp(stack_count), not our source allocator's size.
+    const CLASS_IRP_BYTES: usize = 0xd0 + 2 * 0x48;
+    let mut packet = vec![0xa5; CLASS_IRP_BYTES + 16];
+    initialize_wdm_irp_packet(&mut packet, IRP, CLASS_IRP_BYTES as u16, 2, 0).unwrap();
+    assert_eq!(WDM_X64_IRP_SIZE, 0xd0);
+    assert_eq!(WDM_X64_IO_STACK_LOCATION_SIZE, 0x48);
+    assert_eq!(u64_at(&packet, 0xb8), IRP + CLASS_IRP_BYTES as u64);
+    assert_eq!(packet[0xd0], 0); // first IO_STACK_LOCATION starts at sizeof(IRP)
+    assert_eq!(&packet[CLASS_IRP_BYTES..], &[0xa5; 16]);
+    validate_new_kernel_irp_packet(IRP, &packet[..CLASS_IRP_BYTES], 2).unwrap();
 }
 
 #[test]

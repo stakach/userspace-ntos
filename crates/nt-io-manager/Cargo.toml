@@ -26,6 +26,7 @@ nt-pnp-abi = { workspace = true }
 nt-power-types = { workspace = true }
 nt-provider-wait = { workspace = true }
 nt-kernel-exec = { workspace = true }
+nt-kernel-abi = { workspace = true }
 nt-object-manager = { workspace = true, optional = true }
 bitflags = { workspace = true }
 
