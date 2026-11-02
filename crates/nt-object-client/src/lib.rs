@@ -16,10 +16,13 @@ mod directory_tests;
 #[cfg(test)]
 mod file_target_tests;
 #[cfg(test)]
+mod owned_file_target_tests;
+#[cfg(test)]
 mod owned_directory_tests;
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -75,6 +78,27 @@ pub enum DirectoryOwnedTerminal {
     Failure(NtStatus),
     /// Transport completed but the server's success packet was incoherent;
     /// the caller must retain ownership rather than assume rollback is safe.
+    Incoherent(ObReply),
+}
+
+/// Owns the exact namespace request and reply buffer until its terminal completion.
+pub struct PendingFileTargetCall {
+    client_id: u64,
+    request_id: u64,
+    _request: Vec<u8>,
+    output: RefCell<Vec<u8>>,
+}
+
+pub enum FileTargetOwnedOutcome {
+    NoEffect(NtStatus),
+    Completed(FileTargetOwnedTerminal),
+    Indeterminate(PendingFileTargetCall),
+}
+
+pub enum FileTargetOwnedTerminal {
+    Success(FilePathTarget),
+    Failure(NtStatus),
+    /// A successful transport reply with an invalid Device identity or suffix.
     Incoherent(ObReply),
 }
 
@@ -173,6 +197,60 @@ fn decode_owned_directory_terminal(reply: ObReply, create: bool) -> DirectoryOwn
     match decode_directory_handle(reply, create) {
         Ok(result) => DirectoryOwnedTerminal::Success(result),
         Err(_) => DirectoryOwnedTerminal::Incoherent(reply),
+    }
+}
+
+fn encode_file_target_request(path: &[u16], case_insensitive: bool) -> Result<Vec<u8>, NtStatus> {
+    let path_len_bytes = path.len().checked_mul(2)
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or(NtStatus::INVALID_PARAMETER)?;
+    let req = ObLookupPathRequest {
+        abi_size: size_of::<ObLookupPathRequest>() as u16,
+        flags: case_flag(case_insensitive),
+        path_offset: size_of::<ObLookupPathRequest>() as u32,
+        path_len_bytes,
+    };
+    let mut request = Vec::new();
+    let total = size_of::<ObLookupPathRequest>()
+        .checked_add(path_len_bytes as usize).ok_or(NtStatus::INVALID_PARAMETER)?;
+    request.try_reserve_exact(total)
+        .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+    request.extend_from_slice(bytemuck::bytes_of(&req));
+    for unit in path { request.extend_from_slice(&unit.to_le_bytes()); }
+    Ok(request)
+}
+
+fn decode_file_target(reply: ObReply, output: &[u8]) -> Result<FilePathTarget, NtStatus> {
+    NtStatus(reply.status).to_result()?;
+    if reply.detail0 == 0 || reply.detail1 != 0 {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+    let bytes = output.get(..reply.information as usize)
+        .filter(|bytes| bytes.len() & 1 == 0)
+        .ok_or(NtStatus::INVALID_PARAMETER)?;
+    if !bytes.is_empty() && bytes[..2] != (b'\\' as u16).to_le_bytes() {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+    let mut remaining_name = Vec::new();
+    remaining_name.try_reserve_exact(bytes.len() / 2)
+        .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+    remaining_name.extend(bytes.chunks_exact(2)
+        .map(|word| u16::from_le_bytes([word[0], word[1]])));
+    Ok(FilePathTarget { device_object: ObjectId(reply.detail0), remaining_name })
+}
+
+fn decode_owned_file_target_terminal(reply: ObReply, output: &[u8]) -> FileTargetOwnedTerminal {
+    if !NtStatus(reply.status).is_success() {
+        return FileTargetOwnedTerminal::Failure(NtStatus(reply.status));
+    }
+    if NtStatus(reply.status) != NtStatus::SUCCESS {
+        return FileTargetOwnedTerminal::Incoherent(reply);
+    }
+    match decode_file_target(reply, output) {
+        Ok(target) => FileTargetOwnedTerminal::Success(target),
+        Err(NtStatus::INSUFFICIENT_RESOURCES) =>
+            FileTargetOwnedTerminal::Failure(NtStatus::INSUFFICIENT_RESOURCES),
+        Err(_) => FileTargetOwnedTerminal::Incoherent(reply),
     }
 }
 
@@ -454,40 +532,12 @@ impl<B: Backend> ObjectClient<B> {
         path: &[u16],
         case_insensitive: bool,
     ) -> Result<FilePathTarget, NtStatus> {
-        let path_len_bytes = path
-            .len()
-            .checked_mul(2)
-            .and_then(|bytes| u32::try_from(bytes).ok())
-            .ok_or(NtStatus::INVALID_PARAMETER)?;
-        let req = ObLookupPathRequest {
-            abi_size: size_of::<ObLookupPathRequest>() as u16,
-            flags: case_flag(case_insensitive),
-            path_offset: size_of::<ObLookupPathRequest>() as u32,
-            path_len_bytes,
-        };
-        let buf = pack(&req, path);
+        let buf = encode_file_target_request(path, case_insensitive)?;
         let mut out = vec![0u8; 4096];
         let reply = self
             .backend
             .call(opcode::OB_OP_RESOLVE_FILE_TARGET, &buf, &mut out);
-        NtStatus(reply.status).to_result()?;
-        if reply.detail0 == 0 || reply.detail1 != 0 {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
-        let bytes = out
-            .get(..reply.information as usize)
-            .filter(|bytes| bytes.len() & 1 == 0)
-            .ok_or(NtStatus::INVALID_PARAMETER)?;
-        if !bytes.is_empty() && bytes[..2] != (b'\\' as u16).to_le_bytes() {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
-        Ok(FilePathTarget {
-            device_object: ObjectId(reply.detail0),
-            remaining_name: bytes
-                .chunks_exact(2)
-                .map(|word| u16::from_le_bytes([word[0], word[1]]))
-                .collect(),
-        })
+        decode_file_target(reply, &out)
     }
 
     /// Delete a named object from its parent directory. This unlinks the namespace route; outstanding
@@ -788,6 +838,57 @@ impl<B: Backend> ObjectClient<B> {
 }
 
 impl<B: OwnedBackend> ObjectClient<B> {
+    pub fn resolve_file_target_owned(&mut self, path: &[u16], case_insensitive: bool)
+        -> FileTargetOwnedOutcome
+    {
+        if !matches!(self.owned_request_state, OwnedRequestState::Idle) {
+            return FileTargetOwnedOutcome::NoEffect(NtStatus::DEVICE_BUSY);
+        }
+        let request = match encode_file_target_request(path, case_insensitive) {
+            Ok(request) => request,
+            Err(status) => return FileTargetOwnedOutcome::NoEffect(status),
+        };
+        let mut output = Vec::new();
+        if output.try_reserve_exact(4096).is_err() {
+            return FileTargetOwnedOutcome::NoEffect(NtStatus::INSUFFICIENT_RESOURCES);
+        }
+        output.resize(4096, 0);
+        match self.backend.call_owned(opcode::OB_OP_RESOLVE_FILE_TARGET, &request, &mut output) {
+            OwnedCall::NoEffect(status) => FileTargetOwnedOutcome::NoEffect(status),
+            OwnedCall::Completed(reply) => {
+                let terminal = decode_owned_file_target_terminal(reply, &output);
+                if matches!(terminal, FileTargetOwnedTerminal::Incoherent(_)) {
+                    self.owned_request_state = OwnedRequestState::Quarantined;
+                }
+                FileTargetOwnedOutcome::Completed(terminal)
+            }
+            OwnedCall::Indeterminate(request_id) => {
+                self.owned_request_state = OwnedRequestState::Pending(request_id);
+                FileTargetOwnedOutcome::Indeterminate(PendingFileTargetCall {
+                    client_id: self.owned_client_id, request_id, _request: request,
+                    output: RefCell::new(output),
+                })
+            }
+        }
+    }
+
+    pub fn poll_file_target_owned(&mut self, pending: &PendingFileTargetCall)
+        -> Option<FileTargetOwnedTerminal>
+    {
+        if pending.client_id != self.owned_client_id
+            || !matches!(self.owned_request_state,
+                OwnedRequestState::Pending(id) if id == pending.request_id) { return None; }
+        let mut output = pending.output.borrow_mut();
+        let reply = self.backend.poll_owned(pending.request_id, &mut output[..])?;
+        let terminal = decode_owned_file_target_terminal(reply, &output[..]);
+        self.owned_request_state = if matches!(terminal, FileTargetOwnedTerminal::Incoherent(_)) {
+            OwnedRequestState::Quarantined
+        } else {
+            OwnedRequestState::Idle
+        };
+        Some(terminal)
+    }
+
     pub fn create_directory_handle_owned(&mut self, root: Option<HandleValue>,
         name: &UnicodeString, access: AccessMask, attributes: ObjAttrFlags)
         -> DirectoryOwnedOutcome
