@@ -87,6 +87,15 @@ fn needs_epoch_rollover(high_water_end_lba: u64, wal_sectors: u64) -> bool {
         && high_water_end_lba >= wal_sectors.saturating_sub(wal_sectors / 4)
 }
 
+fn report_fold_failure(stage: &[u8], status: u32) -> u32 {
+    print_str(b"[system-wal-fold] stage=");
+    print_str(stage);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b"\n");
+    status
+}
+
 /// Background/shutdown checkpoint boundary. A clean CM observation has no image to fold.
 /// An ambiguous ACK may be retried; an uncertain physical fold refuses reentry.
 pub(crate) unsafe fn fold_system_wal_if_dirty() -> Result<bool, u32> {
@@ -154,7 +163,7 @@ pub(crate) unsafe fn fold_system_wal_if_dirty() -> Result<bool, u32> {
 
     let result = fold_retained(store, manifest);
     if let Err(status) = result {
-        return Err(block(status));
+        return Err(block(report_fold_failure(b"fold-retained", status)));
     }
     (&mut *core::ptr::addr_of_mut!(FOLD_WORK)).as_mut()
         .expect("retained fold owner").phase = Phase::Acknowledging;
@@ -182,18 +191,19 @@ unsafe fn fold_retained(
     };
     // Both folded slots must contain the same CM image. Capture before the first disk write so
     // native I/O reentry cannot change the live tree between CRC and payload serialization.
-    let snapshot = snapshot_capture::CapturedSnapshot::capture(&work.lease, fs)?;
+    let snapshot = snapshot_capture::CapturedSnapshot::capture(&work.lease, fs)
+        .map_err(|status| report_fold_failure(b"capture", status))?;
     let snapshot_bytes = snapshot.as_slice();
     let bytes = snapshot_bytes.len();
     let generation = store.commit_next_with_wal_manifest(&mut work.lease, snapshot_bytes, folded)
-        .map_err(snapshot_store_error_status)?;
+        .map_err(|error| report_fold_failure(b"first-snapshot", snapshot_store_error_status(error)))?;
     WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
     WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);
     WRITABLE_FS_SNAPSHOT_COMMIT_BYTES.store(bytes as u64, Ordering::Relaxed);
     // The second commit replaces the other slot. Both must carry the folded base before the
     // rollover can publish a RESETTING header or erase any old WAL sectors.
     let generation = store.commit_next_with_wal_manifest(&mut work.lease, snapshot_bytes, folded)
-        .map_err(snapshot_store_error_status)?;
+        .map_err(|error| report_fold_failure(b"second-snapshot", snapshot_store_error_status(error)))?;
     WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
     WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);
     WRITABLE_FS_SNAPSHOT_COMMIT_BYTES.store(bytes as u64, Ordering::Relaxed);

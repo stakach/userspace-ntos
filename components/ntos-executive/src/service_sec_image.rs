@@ -3183,6 +3183,15 @@ fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
     status
 }
 
+fn report_service_finalize_failure(stage: &[u8], status: u32) -> u32 {
+    print_str(b"[service-finalize] stage=");
+    print_str(stage);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b"\n");
+    status
+}
+
 const SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS: u64 = 5 * 10_000_000;
 static SYSTEM_WAL_FIRST_DIRTY_100NS: AtomicU64 = AtomicU64::new(0);
 static SYSTEM_WAL_USED_SECTORS: AtomicU64 = AtomicU64::new(0);
@@ -3405,7 +3414,7 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
         if let Err(status) = unsafe {
             service_drain_section_retirement_for_handler(&mut *ctx.generic_sections, nt_handler)
         } {
-            return status;
+            return report_service_finalize_failure(b"section-retirement", status);
         }
     }
     unsafe { crate::writable_fs::redrive_file_cleanup_work() };
@@ -3420,7 +3429,7 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
         if crate::writable_fs::snapshot_restore_seen() {
             if let Err(status) = nt_handler.refresh_boot_hive_checkpoints_from_writable_config() {
                 nt_handler.writable_fs_dirty = true;
-                return status;
+                return report_service_finalize_failure(b"hive-refresh", status);
             }
         }
         if nt_handler.writable_fs_commit_required {
@@ -3454,8 +3463,11 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
         if let Err(status) = maybe_fold_system_wal() {
             nt_handler.writable_fs_dirty = true;
             nt_handler.writable_fs_commit_required = true;
-            return status;
+            return report_service_finalize_failure(b"system-wal-fold", status);
         }
+    }
+    if checkpoint_status != nt_fs::STATUS_SUCCESS {
+        return report_service_finalize_failure(b"volume-checkpoint", checkpoint_status);
     }
     checkpoint_status
 }

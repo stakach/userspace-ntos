@@ -796,6 +796,15 @@ pub(crate) unsafe fn verify_durable_system_wal() -> Result<(), u32> {
     })
 }
 
+fn report_quiesce_proof_failure(stage: &[u8], status: u32) -> u32 {
+    print_str(b"[cm-quiesce-proof] stage=");
+    print_str(stage);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b"\n");
+    status
+}
+
 /// Terminal quiesce may inspect durability but cannot start native snapshot I/O: its service
 /// receive loop has ended and would never deliver the provider completions. Hold the reserve
 /// while checking both the clean volume bit and the exact paired WAL publication.
@@ -808,19 +817,24 @@ where
         == Some(nt_fs::BlockSourceKind::Native);
     if native {
         if (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_none() {
-            return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+            return Err(report_quiesce_proof_failure(
+                b"native-volume-absent", nt_fs::STATUS_DEVICE_NOT_READY,
+            ));
         }
     } else {
-        ensure_mounted()?;
+        ensure_mounted().map_err(|status| report_quiesce_proof_failure(b"mount", status))?;
     }
     if legacy_snapshot_writes_allowed() || WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
-        return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+        return Err(report_quiesce_proof_failure(
+            b"format-or-blocked", nt_fs::STATUS_INVALID_DEVICE_REQUEST,
+        ));
     }
-    let mut lease = snapshot_storage::acquire()?;
+    let mut lease = snapshot_storage::acquire()
+        .map_err(|status| report_quiesce_proof_failure(b"reserve-acquire", status))?;
     if WRITABLE_FS_SNAPSHOT_DIRTY.load(Ordering::Acquire) {
-        return Err(snapshot_storage::BUSY);
+        return Err(report_quiesce_proof_failure(b"snapshot-dirty", snapshot_storage::BUSY));
     }
-    verify_hives()?;
+    verify_hives().map_err(|status| report_quiesce_proof_failure(b"hive-proof", status))?;
     let result = if native {
         snapshot_storage::check_cached_wal_fence(&lease)
     } else {
@@ -828,7 +842,7 @@ where
     };
     result.map_err(|status| {
         WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
-        status
+        report_quiesce_proof_failure(b"wal-continuation", status)
     })
 }
 
