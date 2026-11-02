@@ -65,6 +65,11 @@ pub(crate) fn claim_mounted_directory_sector() -> Option<crate::mounted_volume_b
     claim
 }
 
+pub(crate) fn mounted_directory_outstanding() -> bool {
+    unsafe { (&*core::ptr::addr_of!(MOUNT_DIRECTORY_QUEUE)).as_ref()
+        .is_some_and(|queue| queue.borrow().has_outstanding()) }
+}
+
 pub(crate) fn complete_mounted_directory_sector(
     claim: crate::mounted_volume_backend::mounted_directory_lookup::DirectorySectorClaim,
     sector: Result<&[u8; 512], nt_fs::FatPathError>,

@@ -35,6 +35,8 @@ pub(crate) struct DirectoryLookupQueue<P> { entries: Vec<Entry<P>> }
 impl<P> DirectoryLookupQueue<P> {
     pub const fn new() -> Self { Self { entries: Vec::new() } }
 
+    pub fn has_outstanding(&self) -> bool { !self.entries.is_empty() }
+
     pub fn capture(&mut self, irp: u64, mount: u64, payload: P,
         lookup: FatDirectoryLookup) -> Result<(), DirectoryLookupError>
     {
@@ -140,5 +142,29 @@ mod tests {
         queue.restore_resolved(resolved).unwrap();
         assert!(queue.claim_next().is_none());
         assert_eq!(queue.take_resolved().unwrap().result.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn captured_directory_irp_remains_outstanding_without_a_physical_claim() {
+        let geometry = FatPathGeometry { fat_start_sector: 1, data_start_sector: 10,
+            total_sectors: 1000, sectors_per_cluster: 1 };
+        let mut queue = DirectoryLookupQueue::new();
+        assert!(!queue.has_outstanding());
+        queue.capture(0x294, 7, (), FatDirectoryLookup::new(geometry, 2).unwrap()).unwrap();
+        // SMSS may park before the native block lane claims its first sector.
+        assert!(queue.has_outstanding());
+        let claim = queue.claim_next().unwrap();
+        assert!(queue.has_outstanding(), "physical entry does not retire the logical IRP");
+        queue.release_unentered(claim).unwrap();
+        assert!(queue.has_outstanding(), "an unentered claim still needs redrive");
+        let claim = queue.claim_next().unwrap();
+        assert_eq!(queue.complete(claim, Ok(&[0; 512])), Ok(FatDirectoryProgress::Complete));
+        assert!(queue.has_outstanding(), "resolved output remains owned until handoff");
+        let resolved = queue.take_resolved().unwrap();
+        assert!(!queue.has_outstanding());
+        queue.restore_resolved(resolved).unwrap();
+        assert!(queue.has_outstanding(), "a refused handoff retains the exact IRP");
+        assert_eq!(queue.take_resolved().unwrap().irp, 0x294);
+        assert!(!queue.has_outstanding());
     }
 }
