@@ -4511,3 +4511,24 @@ fn process_create_ex_decodes_boolean_without_consuming_dirty_stack_padding() {
         1
     );
 }
+
+#[test]
+fn initialized_child_wait_refs_pin_pre_spawn_lifetime_until_unentered_rollback() {
+    let mut pm = ProcessManager::new();
+    let child = pm.create_process("child.exe", None, None);
+    let main = pm.create_thread(child, 0, 0, false).unwrap();
+    pm.set_thread_state(main, ThreadState::Initialized).unwrap();
+    assert_eq!(pm.thread(main).unwrap().state, ThreadState::Initialized);
+    let lifetime = pm.thread_lifetime(main).unwrap();
+
+    pm.retain_process_wait_reference(child).unwrap();
+    pm.retain_thread_wait_reference(main).unwrap();
+    assert_eq!(pm.thread_lifetime(main), Some(lifetime));
+    assert!(pm.abort_process_creation(child).is_none(),
+        "the entered spawn owner must keep the initialized child alive");
+
+    pm.release_thread_wait_reference(main).unwrap();
+    pm.release_process_wait_reference(child).unwrap();
+    assert!(pm.abort_process_creation(child).is_some(),
+        "proven-unentered cleanup must release both exact wait references");
+}

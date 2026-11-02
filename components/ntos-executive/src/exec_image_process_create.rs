@@ -39,7 +39,6 @@ impl ExecNtHandler {
         previous_mode: nt_syscall::ProcessorMode,
     ) -> Result<Option<nt_exe_image::SpawnRequest>, u32> {
         let caller = self.native_handle_caller(previous_mode)?;
-        let ctx = self.loop_ctx.ok_or(NOT_READY)?;
         let handle = match self.pm.lookup_native_section_handle(caller, create.section_handle) {
             Ok(handle) => handle,
             Err(nt_process::STATUS_INVALID_HANDLE) => return Ok(None),
@@ -52,6 +51,33 @@ impl ExecNtHandler {
         let area = self.image_sections.area(id).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         let source = self.image_sections.source(id).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         if !source.has_readable_image() { return Err(STATUS_NOT_SUPPORTED); }
+        let _durable = crate::allocator::enter_durable();
+        let bytes = source.materialize_process_snapshot(self, area)?;
+        let view = self.image_sections.reference_view(id)
+            .map_err(image_section_create::map_image_error)?;
+        self.reserve_native_image_process_with_bytes(
+            parent, create, desired_access, output, previous_mode, view, bytes,
+        )
+    }
+
+    /// Finish a process from a complete, acknowledged image snapshot and a pinned Section view.
+    /// The caller transfers `view`; this method releases it on prepublication failure.
+    pub(crate) unsafe fn reserve_native_image_process_with_bytes(
+        &mut self,
+        parent: nt_process::ProcessId,
+        create: nt_process::ProcessCreateInput,
+        desired_access: u32,
+        output: u64,
+        previous_mode: nt_syscall::ProcessorMode,
+        view: ImageViewRef,
+        mut bytes: Vec<u8>,
+    ) -> Result<Option<nt_exe_image::SpawnRequest>, u32> {
+        let mut untransferred_view = Some(view);
+        let result = (|| -> Result<Option<nt_exe_image::SpawnRequest>, u32> {
+        let caller = self.native_handle_caller(previous_mode)?;
+        let ctx = self.loop_ctx.ok_or(NOT_READY)?;
+        let source = self.image_sections.source_for_view(view)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         let path = source.image_path.as_deref().ok_or(STATUS_NOT_SUPPORTED)?;
         let leaf = nt_exe_image::canonical_exe_leaf(path).ok_or(INVALID_IMAGE)?;
         let mut captured_leaf = [0; nt_exe_image::MAX_EXE_LEAF];
@@ -60,8 +86,6 @@ impl ExecNtHandler {
         let mut image_path = [0; nt_exe_image::MAX_NT_IMAGE_PATH];
         let (path_len, root) = dynamic_hosted_nt_image_path(path, leaf, &mut image_path)
             .ok_or(STATUS_NOT_SUPPORTED)?;
-        let _durable = crate::allocator::enter_durable();
-        let mut bytes = source.materialize_process_snapshot(self, area)?;
         if bytes.len() as u64 != source.backing.file_extent { return Err(INVALID_IMAGE); }
         // Preserve the canonical preferred transfer address through main-image placement.
         let headers = source.layout.headers();
@@ -84,41 +108,44 @@ impl ExecNtHandler {
             .then(|| (ctx.nt_base, image_extent(&*ctx.ntdll_pe)));
         img_spawn::validate_hosted_main_image_layout(layout, ntdll_extent, true)?;
         self.process_image_owners.try_reserve(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        let view = self.image_sections.reference_view(id).map_err(image_section_create::map_image_error)?;
         let catalog = &mut *ctx.exe_image_catalog;
         let pi = match catalog.admit_dynamic_executable_observed(
             leaf, role, &image_path[..path_len], &image_path[..path_len], root, observation_target, MAX_PI,
         ) {
             Ok(pi) => pi,
             Err(_) => {
-                self.image_sections.release_view(view).expect("unpublished process image view");
                 return Err(STATUS_INSUFFICIENT_RESOURCES);
             }
         };
         let image = catalog.get_by_pi(pi).expect("new exact process image registration");
         let target = nt_exe_image::SpawnTarget::from_image(image);
+        if self.pm_pid_for_pi(pi).is_some() {
+            // Catalog admission is separate from ProcessManager ownership. A reused PI
+            // must not make this new image the owner of an older hosted process.
+            catalog.retire_dynamic_target(target).expect("unpublished occupied image slot");
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
         let source = match nt_exe_image::ProcessImageSourceEvidence::capture_with_registered_file(
             image, section_file, registered_file, observation_target,
         ) {
             Ok(source) => source,
             Err(_) => {
                 catalog.retire_dynamic_target(target).expect("unpublished exact image registration");
-                self.image_sections.release_view(view).expect("unpublished process image view");
                 return Err(INVALID_IMAGE);
             }
         };
         if register_hosted_process_runtime_for_image(image).is_err() {
             catalog.retire_dynamic_target(target).expect("unpublished exact image registration");
-            self.image_sections.release_view(view).expect("unpublished process image view");
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
         if (&mut *ctx.hosted_loaded_images).register_exact_loaded(image, bytes).is_err() {
             retire_hosted_process_runtime(target).expect("unpublished exact process runtime");
             catalog.retire_dynamic_target(target).expect("unpublished exact image registration");
-            self.image_sections.release_view(view).expect("unpublished process image view");
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
-        self.process_image_owners.push(ProcessImageOwner { target, pid: None, view, source, mechanism_retired: false });
+        self.process_image_owners.push(ProcessImageOwner { target, pid: None,
+            view: untransferred_view.take().expect("unpublished pinned Section view"),
+            source, mechanism_retired: false });
         let request = match (&mut *ctx.exe_images).reserve_spawn_from_native_section(
             catalog, target, self.pi, create.section_handle, metadata, desired_access, output,
         ) {
@@ -145,11 +172,23 @@ impl ExecNtHandler {
             _ => {}
         }
         Ok(Some(request))
+        })();
+        if let Some(view) = untransferred_view.take() {
+            self.image_sections.release_view(view)
+                .expect("failed prepublication process image view");
+        }
+        result
     }
 
     unsafe fn abort_native_image_process(&mut self, target: nt_exe_image::SpawnTarget) {
         // A retained process construction cannot be rolled back as if it never existed.
-        if let Some(pid) = self.pm_pid_for_pi(target.pi) {
+        let exact_pid = self.process_mechanisms.get(target.pi)
+            .filter(|mechanism| mechanism.pi == target.pi
+                && mechanism.generation == target.generation
+                && mechanism.top_badge == target.top_badge)
+            .map(|mechanism| mechanism.pid)
+            .filter(|pid| self.pm.process(*pid).is_some());
+        if let Some(pid) = exact_pid {
             let row = self.process_image_owners.iter_mut().find(|row| row.target == target)
                 .expect("retained failed process image owner");
             row.pid = Some(pid);
@@ -161,6 +200,70 @@ impl ExecNtHandler {
         assert!(retire_unspawned_dynamic_hosted_identity(ctx, target));
         self.process_image_owners[index].mechanism_retired = true;
         self.drain_native_process_images();
+    }
+
+    /// Undo a child reserved for this exact image when physical spawn never entered.
+    /// A different generation in the same PI must never be touched by this rollback.
+    pub(crate) unsafe fn abort_unentered_native_image_process(
+        &mut self,
+        request: nt_exe_image::SpawnRequest,
+    ) -> bool {
+        let Some(target) = request.target else { return false; };
+        let Some(mechanism) = self.process_mechanisms.get(target.pi) else { return false; };
+        if mechanism.pi != target.pi || mechanism.generation != target.generation
+            || mechanism.top_badge != target.top_badge
+            || self.pm.process(mechanism.pid).is_none()
+            || !hosted_process_runtime_target_is_unspawned(target)
+        { return false; }
+        let pid = mechanism.pid;
+        let Some(ctx) = self.loop_ctx else { return false; };
+        if (&mut *ctx.exe_images).discard_native_section_spawn(request).is_err() {
+            return false;
+        }
+        self.rollback_hosted_process_creation(target.pi, pid);
+        self.abort_native_image_process(target);
+        true
+    }
+
+    /// Retire an immediate-route reservation only when the physical child spawn did not enter.
+    /// Static catalog images keep their Section/loaded image; only a child PM slot created by
+    /// this syscall is rolled back. Dynamic Section-backed children use their exact owner path.
+    pub(crate) unsafe fn abort_unentered_hosted_exe(
+        &mut self,
+        request: nt_exe_image::SpawnRequest,
+        new_process: bool,
+    ) -> bool {
+        let Some(target) = request.target else { return false; };
+        if self.process_image_owners.iter().any(|owner| owner.target == target) {
+            return self.abort_unentered_native_image_process(request);
+        }
+        let Some(ctx) = self.loop_ctx else { return false; };
+        let exact_pid = if new_process {
+            let Some(mechanism) = self.process_mechanisms.get(target.pi) else { return false; };
+            if mechanism.pi != target.pi || mechanism.generation != target.generation
+                || mechanism.top_badge != target.top_badge
+                || self.pm.process(mechanism.pid).is_none()
+            { return false; }
+            Some(mechanism.pid)
+        } else { None };
+        if (&mut *ctx.exe_images).rollback_spawn(request).is_err() { return false; }
+        if let Some(pid) = exact_pid {
+            self.rollback_hosted_process_creation(target.pi, pid);
+        }
+        true
+    }
+
+    pub(crate) unsafe fn abort_unentered_hosted_child(
+        &mut self,
+        target: nt_exe_image::SpawnTarget,
+    ) -> bool {
+        let Some(mechanism) = self.process_mechanisms.get(target.pi) else { return false; };
+        if mechanism.pi != target.pi || mechanism.generation != target.generation
+            || mechanism.top_badge != target.top_badge
+            || self.pm.process(mechanism.pid).is_none()
+        { return false; }
+        self.rollback_hosted_process_creation(target.pi, mechanism.pid);
+        true
     }
 
     pub(super) fn release_native_process_image(&mut self, pi: usize, pid: nt_process::ProcessId, generation: u64) {

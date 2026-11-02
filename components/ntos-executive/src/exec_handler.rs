@@ -4286,6 +4286,7 @@ impl ExecNtHandler {
         write_field!(out_writes_n, 0);
         write_field!(loop_ctx, None);
         write_field!(exe_spawn_request, None);
+        write_field!(exe_spawn_new_process, false);
         write_field!(thread_spawn_request, None);
         write_field!(remote_thread_request, None);
         write_field!(wait_park_event, -1);
@@ -9678,6 +9679,8 @@ impl ExecNtHandler {
                 || crate::registry_mutation_work::has_thread(tid)
                 || crate::mutable_hive_mutation_work::has_thread(tid)
                 || crate::section_metadata_work::has_thread(tid)
+                || crate::process_image_snapshot_work::has_thread(tid)
+                || crate::hosted_spawn_uncertainty::has_thread(tid)
         }
         {
             return None;
@@ -32802,9 +32805,17 @@ impl ExecNtHandler {
         {
             return STATUS_NOT_SUPPORTED;
         }
+        match crate::process_image_snapshot_work::submit_routed_process_image(
+            self, parent, args[3], create, nt_ulong_arg(args[1]), args[0], previous_mode,
+        ) {
+            Ok(true) => return 0x0000_0103,
+            Ok(false) => {},
+            Err(status) => return status,
+        }
         match self.reserve_native_image_process(parent, create, nt_ulong_arg(args[1]), args[0], previous_mode) {
             Ok(Some(request)) => {
                 self.exe_spawn_request = Some(request);
+                self.exe_spawn_new_process = true;
                 return 0;
             }
             Ok(None) => {}
@@ -32859,6 +32870,7 @@ impl ExecNtHandler {
             };
             image
         };
+        let new_process = self.pm_pid_for_pi(image.pi).is_none();
         if let Err(status) =
             self.allocate_hosted_process_slot(parent, image, create.flags, create.job_member_level)
         {
@@ -32883,9 +32895,18 @@ impl ExecNtHandler {
         ) {
             Ok(request) => {
                 self.exe_spawn_request = Some(request);
+                self.exe_spawn_new_process = new_process;
                 0
             }
-            Err(_) => 0xC000_000D,
+            Err(_) => {
+                if new_process {
+                    if !self.abort_unentered_hosted_child(
+                        nt_exe_image::SpawnTarget::from_image(image)) {
+                        panic!("unreserved hosted child lost exact PM ownership");
+                    }
+                }
+                0xC000_000D
+            },
         }
     }
 

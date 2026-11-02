@@ -1,5 +1,6 @@
 use super::*;
 use alloc::string::String;
+use alloc::vec;
 
 #[test]
 fn pending_windows_require_exact_copy_and_ack_before_advancing() {
@@ -27,6 +28,40 @@ fn pending_windows_require_exact_copy_and_ack_before_advancing() {
     let (owner, result) = read.into_terminal().ok().unwrap();
     assert_eq!(owner, "file owner");
     assert_eq!(result.unwrap(), b"abcdefghij");
+}
+
+#[test]
+fn process_sized_snapshot_advances_only_after_each_pending_window_ack() {
+    const EXTENT: usize = 197_632;
+    let mut read = RoutedImageRead::<_, u64, _>::new(
+        (17, 29), EXTENT as u64, MAX_IMAGE_READ_WINDOW,
+        String::from("exact Section and File owner"),
+    ).unwrap();
+    let mut offset = 0;
+    let mut key = 100;
+    while offset < EXTENT {
+        let window = read.enter_window().unwrap();
+        assert_eq!(window.offset, offset as u64);
+        assert_eq!(window.length, (EXTENT - offset).min(MAX_IMAGE_READ_WINDOW));
+        assert!(read.bind_pending(key));
+        assert!(read.terminal(key, 0, window.length as u64));
+        let bytes = vec![(key & 0xff) as u8; window.length];
+        assert!(read.copy_fragment(key, 0, &bytes));
+        assert_eq!(read.acknowledgment_key(), Some(key));
+        assert!(read.enter_window().is_none(), "next window waits for provider ACK");
+        read = read.into_terminal().err().expect("source owner cannot publish before ACK");
+        assert!(!read.acknowledge(key + 1), "wrong IRP cannot release the captured source");
+        assert!(read.acknowledge(key));
+        offset += window.length;
+        key += 1;
+    }
+    assert_eq!(key, 107, "197632 bytes require seven bounded reads");
+    let (owner, bytes) = read.into_terminal().ok().unwrap();
+    assert_eq!(owner, "exact Section and File owner");
+    let bytes = bytes.unwrap();
+    assert_eq!(bytes.len(), EXTENT);
+    assert_eq!(&bytes[..MAX_IMAGE_READ_WINDOW], &[100u8; MAX_IMAGE_READ_WINDOW]);
+    assert_eq!(&bytes[6 * MAX_IMAGE_READ_WINDOW..], &[106u8; 1024]);
 }
 
 #[test]

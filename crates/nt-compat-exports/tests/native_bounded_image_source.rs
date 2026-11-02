@@ -101,13 +101,66 @@ fn mapping_and_query_use_the_single_typed_layout_without_snapshot_gates() {
 }
 
 #[test]
-fn only_actual_process_construction_materializes_a_full_owned_snapshot() {
-    let process = audit(&body(&source("exec_image_process_create.rs"), "reserve_native_image_process"));
-    assert!(has(&process, "materialize_process_snapshot"),
-        "process-owned raw PE readers require one exact isolated materialization");
-    assert!(!process.fields.iter().any(|field| field == "pe_header"));
-    assert!(has(&process, "register_exact_loaded") && has(&process, "reference_view"),
-        "process snapshot readers and canonical Section view retirement retain their existing ownership");
-    let materialize = audit(&body(&source("native_image_source_io.rs"), "materialize_process_snapshot"));
-    assert!(has(&materialize, "try_reserve_exact") && has(&materialize, "read_exact"));
+fn routed_process_snapshot_retains_pending_file_reads_before_process_publication() {
+    let ingress = audit(&body(&source("exec_handler.rs"), "nt_create_process_service"));
+    assert!(has(&ingress, "submit_routed_process_image"),
+        "a routed installed image may return a pending File READ; process creation must retain its Section, File and original Reply instead of returning IO_DEVICE_ERROR");
+
+    let worker_source = source("process_image_snapshot_work.rs");
+    let mut worker = Audit::default();
+    worker.visit_file(&worker_source);
+    for required in ["bind_pending", "terminal", "copy_fragment",
+        "acknowledge_completed_irp_strict", "acknowledge", "into_terminal"] {
+        assert!(has(&worker, required),
+            "routed process image snapshot must retain exact pending bytes through provider ACK: {required}");
+    }
+    assert!(has(&worker, "reserve_native_image_process_with_bytes"),
+        "process construction may publish only the fully acknowledged owned PE snapshot");
+    let process = audit(&body(&source("exec_image_process_create.rs"),
+        "reserve_native_image_process_with_bytes"));
+    assert!(has(&process, "register_exact_loaded"),
+        "the completed snapshot must become the exact process-owned image");
+}
+
+#[test]
+fn failed_dynamic_process_admission_never_binds_an_older_pi_occupant() {
+    let source = source("exec_image_process_create.rs");
+    let reserve = audit(&body(&source, "reserve_native_image_process_with_bytes"));
+    assert!(reserve.calls.iter().position(|call| call == "pm_pid_for_pi")
+        .expect("fresh process index preflight")
+        < reserve.calls.iter().position(|call| call == "allocate_hosted_process_slot")
+            .expect("hosted process allocation"),
+        "a fresh dynamic image must reject an occupied process index before process allocation");
+    let abort = audit(&body(&source, "abort_native_image_process"));
+    assert!(has(&abort, "get") && abort.fields.iter().any(|field| field == "generation")
+        && abort.fields.iter().any(|field| field == "top_badge"),
+        "failed admission may bind the image owner only to its exact hosted mechanism generation");
+    let unentered = audit(&body(&source, "abort_unentered_native_image_process"));
+    assert!(has(&unentered, "discard_native_section_spawn")
+        && has(&unentered, "rollback_hosted_process_creation")
+        && has(&unentered, "abort_native_image_process"),
+        "a proven unentered spawn must retire its exact image reservation and child metadata");
+}
+
+#[test]
+fn immediate_spawn_entered_error_keeps_original_reply_and_process_owner() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../components/ntos-executive/src/service_sec_image.rs");
+    let service_source = std::fs::read_to_string(path).unwrap();
+    let start = service_source.find("if let Some(request) = nt_handler.exe_spawn_request")
+        .expect("immediate hosted spawn branch");
+    let end = service_source[start..].find("} else if m0 >= win32k_subsystem")
+        .expect("end of hosted spawn branch") + start;
+    let branch = &service_source[start..end];
+    assert!(branch.find("hosted_spawn_uncertainty::prepare")
+        .expect("pre-effect Reply owner admission")
+        < branch.find("publish_reserved_hosted_exe").expect("physical hosted spawn"),
+        "the original Reply and retained owner must be admitted before physical spawn");
+    assert!(branch.contains("hosted_spawn_uncertainty::retain_entered"),
+        "an entered spawn error cannot become an ordinary failed syscall Reply");
+    assert!(branch.contains("abort_unentered_hosted_exe"),
+        "failed pre-effect admission must retire the exact reserved spawn and new child");
+    let process = audit(&body(&source("exec_handler.rs"), "nt_create_process_service"));
+    assert!(has(&process, "abort_unentered_hosted_child"),
+        "a failed spawn reservation after child allocation must release that exact PM slot");
 }

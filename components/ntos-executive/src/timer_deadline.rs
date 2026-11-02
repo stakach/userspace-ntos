@@ -67,13 +67,10 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
             DELAY_TIMER_SOURCE_REGISTRY_MUTATION,
         ),
         (
-            match (
-                section_metadata_work::next_deadline(),
-                provider_section_broker::next_deadline(),
-            ) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            },
+            [section_metadata_work::next_deadline(),
+                process_image_snapshot_work::next_deadline(),
+                provider_section_broker::next_deadline()]
+                .into_iter().flatten().min(),
             DELAY_TIMER_SOURCE_SECTION_METADATA,
         ),
         (

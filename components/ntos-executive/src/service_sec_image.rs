@@ -7410,6 +7410,36 @@ unsafe fn hosted_exe_spawn_for<'a>(
     })
 }
 
+/// Complete one already reserved image spawn before the syscall's original Reply is sent.
+/// Both immediate and retained process-image paths use this same physical publication.
+pub(crate) enum HostedExeSpawnError {
+    Unentered(u32),
+    Entered(u32),
+}
+
+pub(crate) unsafe fn publish_reserved_hosted_exe(
+    request: nt_exe_image::SpawnRequest,
+    catalog: &nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
+    loaded_images: *mut HostedLoadedImageTable,
+    ntdll: (u64, &nt_pe_loader::PeFile),
+    fault_ep: u64,
+    procs: &mut [ProcExec],
+    nt_handler: &mut ExecNtHandler,
+    exe_images: &mut nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP>,
+) -> Result<(u64, bool), HostedExeSpawnError> {
+    let Some(spec) = hosted_exe_spawn_for(request, catalog, loaded_images) else {
+        return Err(HostedExeSpawnError::Unentered(nt_process::STATUS_INVALID_PARAMETER));
+    };
+    if spec.spawned.load(Ordering::Relaxed) != 0 {
+        return Err(HostedExeSpawnError::Unentered(nt_process::STATUS_INVALID_PARAMETER));
+    }
+    let is_csrss = spec.image.role == nt_exe_image::HostedProcessRole::Win32Subsystem;
+    let handle = spawn_requested_hosted_exe(
+        request, spec, ntdll, fault_ep, procs, nt_handler, exe_images,
+    )?;
+    Ok((handle, is_csrss))
+}
+
 unsafe fn spawn_requested_hosted_exe(
     request: nt_exe_image::SpawnRequest,
     spec: HostedExeSpawn<'_>,
@@ -7418,27 +7448,29 @@ unsafe fn spawn_requested_hosted_exe(
     procs: &mut [ProcExec],
     nt_handler: &mut ExecNtHandler,
     exe_images: &mut nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP>,
-) -> Result<u64, u32> {
+) -> Result<u64, HostedExeSpawnError> {
     let pi = spec.image.pi;
     let child_pid = nt_handler
         .pm_pid_for_pi(pi)
-        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        .ok_or(HostedExeSpawnError::Unentered(nt_process::STATUS_INVALID_HANDLE))?;
     let child_tid = nt_handler
         .pm_main_tid_for_pi(pi)
-        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        .ok_or(HostedExeSpawnError::Unentered(nt_process::STATUS_INVALID_HANDLE))?;
     let creator_pid = nt_handler
         .pm_pid_for_pi(request.creator_pi)
-        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-    let initial_priority = native_thread_priority::initial_priority(&nt_handler.pm, u64::from(child_tid))?;
+        .ok_or(HostedExeSpawnError::Unentered(nt_process::STATUS_INVALID_HANDLE))?;
+    let initial_priority = native_thread_priority::initial_priority(&nt_handler.pm, u64::from(child_tid))
+        .map_err(HostedExeSpawnError::Unentered)?;
+    let identity = nt_handler.capture_process_identity(pi)
+        .ok_or(HostedExeSpawnError::Unentered(nt_process::STATUS_INVALID_HANDLE))?;
+    let fault_badge = mint_badged(fault_ep, spec.image.top_badge)
+        .map_err(HostedExeSpawnError::Unentered)?;
     let child_spawn = spawn_hosted_sec_image_for_image(
         spec.image,
-        nt_memory_manager::MemoryLifetime::Process(
-            nt_handler.capture_process_identity(pi)
-                .ok_or(nt_process::STATUS_INVALID_HANDLE)?,
-        ),
+        nt_memory_manager::MemoryLifetime::Process(identity),
         spec.pe,
         spec.layout,
-        mint_badged(fault_ep, spec.image.top_badge)?,
+        fault_badge,
         Some(ntdll),
         true,
         false,
@@ -7449,11 +7481,13 @@ unsafe fn spawn_requested_hosted_exe(
     );
     procs[pi].pid = child_pid as u64;
     procs[pi].pml4 = child_spawn.pml4;
-    nt_handler.publish_hosted_process_vspace(pi, child_spawn.vspace_caps)?;
+    nt_handler.publish_hosted_process_vspace(pi, child_spawn.vspace_caps)
+        .map_err(HostedExeSpawnError::Entered)?;
     if !nt_handler.pm.set_peb_base(child_pid, SMSS_PEB_VA) {
-        return Err(nt_process::STATUS_INVALID_HANDLE);
+        return Err(HostedExeSpawnError::Entered(nt_process::STATUS_INVALID_HANDLE));
     }
-    nt_handler.register_main_thread_spawn(pi, child_spawn)?;
+    nt_handler.register_main_thread_spawn(pi, child_spawn)
+        .map_err(HostedExeSpawnError::Entered)?;
     procs[pi].img_base = spec.layout.base();
     procs[pi].img_end = spec.layout.end();
     procs[pi].scratch_base = spec.runtime.scratch_base;
@@ -7466,18 +7500,16 @@ unsafe fn spawn_requested_hosted_exe(
     ) {
         Ok(handle) => handle as u64,
         Err(status) => {
-            let _ = exe_images.rollback_spawn(request);
-            return Err(status);
+            return Err(HostedExeSpawnError::Entered(status));
         }
     };
 
     if !nt_handler.publish_created_process(request.process_handle_out, process_handle, SMSS_PEB_VA)
     {
-        let _ = exe_images.rollback_spawn(request);
-        return Err(0xC000_0005);
+        return Err(HostedExeSpawnError::Entered(0xC000_0005));
     }
     if exe_images.publish(request, process_handle).is_err() {
-        return Err(0xC000_000D);
+        return Err(HostedExeSpawnError::Entered(0xC000_000D));
     }
     spec.spawned.store(1, Ordering::Relaxed);
 
@@ -9816,6 +9848,7 @@ pub(crate) unsafe fn service_sec_image(
                 && crate::registry_mutation_work::next_deadline().is_none()
                 && crate::mutable_hive_mutation_work::next_deadline().is_none()
                 && crate::section_metadata_work::next_deadline().is_none()
+                && crate::process_image_snapshot_work::next_deadline().is_none()
                 && crate::section_pagein_work::next_deadline().is_none()
                 && crate::provider_section_broker::next_deadline().is_none()
                 && !crate::native_directory_open_work::occupied()
@@ -10001,6 +10034,9 @@ pub(crate) unsafe fn service_sec_image(
             crate::registry_mutation_work::redrive(&mut nt_handler, &mut *delay_queue);
             crate::mutable_hive_mutation_work::redrive(&mut nt_handler, &mut *delay_queue);
             crate::section_metadata_work::redrive(&mut nt_handler, &mut *delay_queue);
+            crate::process_image_snapshot_work::redrive(&mut nt_handler, &mut *delay_queue,
+                ntdll, fault_ep, procs, exe_images, &*exe_image_catalog,
+                hosted_loaded_images_ptr);
             crate::section_pagein_work::redrive(&mut nt_handler);
             crate::provider_section_broker::redrive(nt_handler as *mut _);
             crate::provider_directory_broker::redrive(nt_handler as *mut _);
@@ -12549,6 +12585,8 @@ pub(crate) unsafe fn service_sec_image(
                     || crate::pending_file_apc::owns_thread(current_tid)
                     || crate::current_apc::owns_thread(current_tid)
                     || crate::section_metadata_work::has_thread(current_tid)
+                    || crate::process_image_snapshot_work::has_thread(current_tid)
+                    || crate::hosted_spawn_uncertainty::has_thread(current_tid)
             }
             {
                 // An uncertain earlier retry is not a fresh File acquisition. Reject only this
@@ -13206,6 +13244,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.system_time_change = None;
                 nt_handler.out_writes_n = 0;
                 nt_handler.exe_spawn_request = None;
+                nt_handler.exe_spawn_new_process = false;
                 nt_handler.thread_spawn_request = None;
                 nt_handler.wait_park_event = -1;
                 nt_handler.wait_alertable = false;
@@ -13561,6 +13600,22 @@ pub(crate) unsafe fn service_sec_image(
                     if crate::section_metadata_work::take_transferred() {
                         mark_wait_parked!(pi, resume_ip);
                         crate::section_metadata_work::redrive(&mut nt_handler, &mut *delay_queue);
+                        let _ = finalize_service_loop_state(&mut nt_handler);
+                        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                        let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                        badge = nb;
+                        mi = nmi;
+                        m0 = nm0;
+                        m1 = nm1;
+                        m2 = nm2;
+                        m3 = nm3;
+                        continue;
+                    }
+                    if crate::process_image_snapshot_work::take_transferred() {
+                        mark_wait_parked!(pi, resume_ip);
+                        crate::process_image_snapshot_work::redrive(&mut nt_handler,
+                            &mut *delay_queue, ntdll, fault_ep, procs, exe_images,
+                            &*exe_image_catalog, hosted_loaded_images_ptr);
                         let _ = finalize_service_loop_state(&mut nt_handler);
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
@@ -14109,33 +14164,33 @@ pub(crate) unsafe fn service_sec_image(
                 // the address-space descriptor; handle publication and ProcessManager wiring are
                 // common for csrss/winlogon and later Win32 children.
                 if let Some(request) = nt_handler.exe_spawn_request {
-                    if let Some(spec) =
-                        hosted_exe_spawn_for(request, &*exe_image_catalog, hosted_loaded_images_ptr)
-                    {
-                        if spec.spawned.load(Ordering::Relaxed) == 0 {
-                            let is_csrss_spawn =
-                                spec.image.role == nt_exe_image::HostedProcessRole::Win32Subsystem;
-                            match spawn_requested_hosted_exe(
-                                request,
-                                spec,
-                                ntdll,
-                                fault_ep,
-                                procs,
-                                &mut nt_handler,
-                                exe_images,
-                            ) {
-                                Ok(process_handle) if is_csrss_spawn => {
-                                    csrss_process_handle = process_handle;
-                                }
-                                Ok(_) => {}
-                                Err(status) => {
-                                    result = u64::from(status);
-                                }
+                    let new_process = nt_handler.exe_spawn_new_process;
+                    match hosted_spawn_uncertainty::prepare(&mut nt_handler, request) {
+                        Ok(prepared) => match publish_reserved_hosted_exe(request,
+                            &*exe_image_catalog, hosted_loaded_images_ptr, ntdll, fault_ep,
+                            procs, &mut nt_handler, exe_images)
+                        {
+                            Ok((process_handle, is_csrss)) => {
+                                hosted_spawn_uncertainty::release_unentered(&mut nt_handler, prepared);
+                                if is_csrss { csrss_process_handle = process_handle; }
                             }
+                            Err(HostedExeSpawnError::Unentered(status)) => {
+                                hosted_spawn_uncertainty::release_unentered(&mut nt_handler, prepared);
+                                assert!(nt_handler.abort_unentered_hosted_exe(
+                                    request, new_process),
+                                    "unentered hosted spawn lost its exact reservation");
+                                result = u64::from(status);
+                            }
+                            Err(HostedExeSpawnError::Entered(status)) => {
+                                hosted_spawn_uncertainty::retain_entered(prepared, status);
+                            }
+                        },
+                        Err(status) => {
+                            assert!(nt_handler.abort_unentered_hosted_exe(
+                                request, new_process),
+                                "preflighted hosted spawn lost its exact reservation");
+                            result = u64::from(status);
                         }
-                    } else {
-                        let _ = exe_images.rollback_spawn(request);
-                        result = u64::from(nt_process::STATUS_INVALID_PARAMETER);
                     }
                 }
             } else if m0 >= win32k_subsystem::WIN32K_SERVICE_BASE
@@ -18613,6 +18668,19 @@ pub(crate) unsafe fn service_sec_image(
                 // SSNs absent from the registered native table are complete dispatcher decisions:
                 // the NT syscall layer rejects them instead of treating them as missing kernel code.
                 result = nt_syscall::STATUS_INVALID_SYSTEM_SERVICE as u64;
+            }
+            if hosted_spawn_uncertainty::take_transferred() {
+                mark_wait_parked!(pi, resume_ip);
+                let _ = finalize_service_loop_state(&mut nt_handler);
+                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                badge = nb;
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                m2 = nm2;
+                m3 = nm3;
+                continue;
             }
             if !handled {
                 // ★ BATCH 43 — winlogon SAS-window MILESTONE park (recv-next-without-reply). winlogon has
