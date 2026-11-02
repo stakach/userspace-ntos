@@ -14,6 +14,9 @@ pub enum ExternalFileIrpDispatchPolicy {
     FileDeviceControl,
     /// Kernel File-less controls enter the exact Device and retain method-aware output capture.
     DeviceControlAtDevice,
+    /// File-less buffered controls whose source caller copies the declared output capacity,
+    /// even when the driver's `IoStatus.Information` is zero.
+    BufferedDeviceControlAtDevice,
     /// File-less METHOD_NEITHER control whose input bytes are modified by the driver.
     MutableMethodNeitherInputAtDevice,
     /// File-less `IRP_MJ_SCSI` at one authenticated PDO, with a pointer-free SRB packet.
@@ -29,6 +32,9 @@ impl ExternalFileIrpDispatchPolicy {
             Self::File => ExternalFileIrpOutputCapture::Information,
             Self::FileDeviceControl => ExternalFileIrpOutputCapture::DeviceControl,
             Self::DeviceControlAtDevice => ExternalFileIrpOutputCapture::DeviceControl,
+            Self::BufferedDeviceControlAtDevice => {
+                ExternalFileIrpOutputCapture::BufferedDeviceControlCapacity
+            }
             Self::MutableMethodNeitherInputAtDevice => {
                 ExternalFileIrpOutputCapture::MethodNeitherInput
             }
@@ -57,11 +63,25 @@ impl ExternalFileIrpDispatchPolicy {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
         }
+        if self == Self::BufferedDeviceControlAtDevice {
+            let eligible = request.file_id.is_none()
+                && matches!(&request.parameters,
+                    IoParameters::DeviceControl(p) | IoParameters::InternalDeviceControl(p)
+                        if nt_io_abi::ioctl::method(p.ioctl_code)
+                            == nt_io_abi::ioctl::METHOD_BUFFERED
+                            && p.input_len as usize == buffers.input().len()
+                            && p.output_len as usize == buffers.output().len());
+            if !eligible {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+        }
         match self {
             Self::File | Self::FileDeviceControl => {
                 manager.prepare_external_file_irp_owned(request, buffers)
             }
-            Self::DeviceControlAtDevice | Self::MutableMethodNeitherInputAtDevice => {
+            Self::DeviceControlAtDevice
+            | Self::BufferedDeviceControlAtDevice
+            | Self::MutableMethodNeitherInputAtDevice => {
                 manager.prepare_external_device_control_irp_owned_at_device(request, buffers)
             }
             Self::ScsiAtDevice => {

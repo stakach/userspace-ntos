@@ -60,6 +60,75 @@ fn control_buffers() -> ExternalFileIrpBuffers {
 }
 
 #[test]
+fn buffered_lower_control_retains_full_header_until_copy_and_ack() {
+    let (mut f, lower, _, _) = stack_fixture();
+    let policy = ExternalFileIrpDispatchPolicy::BufferedDeviceControlAtDevice;
+    let request = ExternalFileIrpRequest {
+        device_id: lower,
+        parameters: IoParameters::DeviceControl(crate::DeviceControlParameters {
+            ioctl_code: 0x002d_1400, // IOCTL_STORAGE_QUERY_PROPERTY, METHOD_BUFFERED
+            input_len: 12,
+            output_len: 8,
+        }),
+        ..request(&f, 0, false)
+    };
+    let query = vec![0u8; 12]; // StorageDeviceProperty / PropertyStandardQuery
+    let prepared = policy.prepare(&mut f.io, request, ExternalFileIrpBuffers::new(query.clone(), vec![0; 8])).unwrap();
+    assert_eq!(prepared.route().device_id(), lower);
+    assert_eq!(prepared.projection().file_id, None);
+    assert_eq!(policy.output_capture(), ExternalFileIrpOutputCapture::BufferedDeviceControlCapacity);
+    let invocation = f.io.begin_prepared_external_file_irp(prepared).unwrap();
+    let owner = match f.io.finish_external_file_irp(invocation.returned(ExternalFileIrpOutcome::Pending)).unwrap() {
+        ExternalFileIrpResult::Pending(owner) => owner,
+        other => panic!("expected pending lower control, got {other:?}"),
+    };
+    publish_policy_completion(&mut f, &owner, NtStatus::SUCCESS, 0);
+    let completion = f.io.prepare_external_file_irp_completion_with_capture(owner, policy.output_capture()).unwrap();
+    assert_eq!(completion.capture_len(), 8);
+    let completion = f.io.begin_external_file_irp_acknowledgement(completion).unwrap_err().into_owner();
+    let mut copy = f.io.begin_external_file_irp_copy(completion, 8).unwrap();
+    let header = [8u8, 0, 0, 0, 0x30, 0, 0, 0];
+    copy.staging_mut().copy_from_slice(&header);
+    let completion = f.io.finish_external_file_irp_copy(copy.returned(ExternalFileIrpCopyOutcome::Copied { bytes: 8 })).unwrap();
+    let ack = f.io.begin_external_file_irp_acknowledgement(completion).unwrap();
+    let (receipt, buffers) = f.io.finish_external_file_irp_completion(
+        ack.acknowledged(ExternalFileIrpAcknowledgement::Acknowledged),
+    ).unwrap();
+    assert!(f.io.accepts_external_file_irp_receipt(&receipt));
+    assert_eq!(receipt.completion().information, 0);
+    assert_eq!(buffers.input(), query);
+    assert_eq!(buffers.output(), header);
+}
+
+#[test]
+fn capacity_capture_policy_rejects_other_methods_and_mismatched_lengths() {
+    let mut f = fixture();
+    let policy = ExternalFileIrpDispatchPolicy::BufferedDeviceControlAtDevice;
+    for method in [1u32, 2, 3] {
+        let mut request = request(&f, method, false);
+        request.parameters = IoParameters::DeviceControl(crate::DeviceControlParameters {
+            ioctl_code: 0x002d_1400 | method,
+            input_len: 12,
+            output_len: 8,
+        });
+        assert_eq!(
+            policy.prepare(&mut f.io, request, ExternalFileIrpBuffers::new(vec![0; 12], vec![0; 8])).err(),
+            Some(NtStatus::INVALID_PARAMETER),
+        );
+    }
+    let mut wrong_length = request(&f, 0, false);
+    wrong_length.parameters = IoParameters::DeviceControl(crate::DeviceControlParameters {
+        ioctl_code: 0x002d_1400,
+        input_len: 12,
+        output_len: 8,
+    });
+    assert_eq!(
+        policy.prepare(&mut f.io, wrong_length, ExternalFileIrpBuffers::new(vec![0; 11], vec![0; 8])).err(),
+        Some(NtStatus::INVALID_PARAMETER),
+    );
+}
+
+#[test]
 fn scsi_srb_requires_pointer_free_exact_pdo_admission() {
     use crate::scsi_srb_transport::{ScsiParameters, ScsiSrbRoute, WDM_X64_LEGACY_SRB_SIZE};
     use crate::{HostedDomainId, HostedDomainIdentity};
@@ -408,6 +477,7 @@ fn explicit_policy_prepares_same_request_with_distinct_route_and_completion_capt
             ExternalFileIrpDispatchPolicy::File
             | ExternalFileIrpDispatchPolicy::FileDeviceControl => (upper_driver, upper),
             ExternalFileIrpDispatchPolicy::DeviceControlAtDevice
+            | ExternalFileIrpDispatchPolicy::BufferedDeviceControlAtDevice
             | ExternalFileIrpDispatchPolicy::MutableMethodNeitherInputAtDevice => {
                 (f.driver, f.device)
             }
