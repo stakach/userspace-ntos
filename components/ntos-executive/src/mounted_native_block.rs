@@ -25,6 +25,24 @@ static NATIVE_PENDING_BYTES: AtomicU64 = AtomicU64::new(0);
 static NATIVE_PENDING_SOURCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn print_census() {
+    crate::mounted_volume::print_mounted_create_census();
+    let published = native_disk_relation::native_storage_route();
+    let retained = native_disk_relation::retained_native_storage_recheck_route();
+    print_str(b"[mounted-route-census] phase=");
+    print_str(if published.is_some() { b"published".as_slice() }
+        else if retained.is_some() { b"retained-recheck-only".as_slice() }
+        else { b"absent".as_slice() });
+    if let Some(route) = published.or(retained) {
+        print_str(b" mount=");
+        print_u64(route.mount.value());
+        print_str(b" driver=");
+        print_u64(route.driver_id.raw());
+        print_str(b" generation=");
+        print_u64(route.key.relation.generation);
+    }
+    print_str(b" recheck-id=");
+    print_u64(unsafe { crate::driver_launch::native_storage_relation_recheck_id() }.unwrap_or(0));
+    print_str(b"\n");
     for (source, census) in [
         (b"fat".as_slice(), &NATIVE_FAT_CENSUS),
         (b"snapshot".as_slice(), &NATIVE_SNAPSHOT_CENSUS),
@@ -71,6 +89,7 @@ pub(super) fn print_census() {
 #[derive(Clone, Copy)]
 enum SectorClaim {
     Create(crate::mounted_volume_backend::mounted_create_lookup::CreateSectorClaim),
+    Overlay(nt_fs::OverlaySectorClaim),
     Read(crate::mounted_volume_backend::mounted_installed_read::ReadSectorClaim),
     Directory(crate::mounted_volume_backend::mounted_directory_lookup::DirectorySectorClaim),
 }
@@ -79,6 +98,7 @@ impl SectorClaim {
     fn mount(self) -> u64 {
         match self {
             Self::Create(c) => c.mount,
+            Self::Overlay(c) => c.mount,
             Self::Read(c) => c.mount,
             Self::Directory(c) => c.mount,
         }
@@ -87,6 +107,10 @@ impl SectorClaim {
     fn sector(self) -> u32 {
         match self {
             Self::Create(c) => c.request.sector,
+            Self::Overlay(c) => match c.request {
+                nt_fs::OverlaySectorRequest::Parent(request) => request.sector,
+                nt_fs::OverlaySectorRequest::Contents(request) => request.sector,
+            },
             Self::Read(c) => c.request.sector,
             Self::Directory(c) => c.request.sector,
         }
@@ -96,6 +120,8 @@ impl SectorClaim {
         match self {
             Self::Create(c) => crate::mounted_volume::release_unentered_mounted_create_sector(c)
                 .expect("unentered CREATE sector claim lost"),
+            Self::Overlay(c) => crate::mounted_volume::release_unentered_mounted_overlay_sector(c)
+                .expect("unentered overlay sector claim lost"),
             Self::Read(c) => crate::mounted_volume::release_unentered_mounted_read_sector(c)
                 .expect("unentered READ sector claim lost"),
             Self::Directory(c) => crate::mounted_volume::release_unentered_mounted_directory_sector(c)
@@ -110,6 +136,12 @@ impl SectorClaim {
                     .map_err(|_| nt_fs::FatPathError::Corrupt));
                 crate::mounted_volume::complete_mounted_create_sector(c, sector)
                     .expect("entered CREATE sector claim lost");
+            }
+            Self::Overlay(c) => {
+                let sector = bytes.and_then(|bytes| <&[u8; 512]>::try_from(bytes)
+                    .map_err(|_| nt_fs::FatPathError::Corrupt));
+                crate::mounted_volume::complete_mounted_overlay_sector(c, sector)
+                    .expect("entered overlay sector claim lost");
             }
             Self::Read(c) => {
                 crate::mounted_volume::complete_mounted_read_sectors(c, bytes)
@@ -251,6 +283,7 @@ pub(super) fn print_quiesce_snapshot() {
 fn next_sector_claim() -> Option<WorkClaim> {
     crate::mounted_volume::claim_mounted_create_sector()
         .map(SectorClaim::Create)
+        .or_else(|| crate::mounted_volume::claim_mounted_overlay_sector().map(SectorClaim::Overlay))
         .or_else(|| crate::mounted_volume::claim_mounted_read_sectors().map(SectorClaim::Read))
         .or_else(|| crate::mounted_volume::claim_mounted_directory_sector().map(SectorClaim::Directory))
         .map(WorkClaim::Sector)

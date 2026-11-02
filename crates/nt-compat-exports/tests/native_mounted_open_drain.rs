@@ -157,6 +157,67 @@ fn released_journal_restores_overlay_precedence_for_an_installed_dll() {
 }
 
 #[test]
+fn native_resolved_writable_create_has_a_continuation_beyond_resident_busy() {
+    let backend = include_str!("../../../components/ntos-executive/src/mounted_volume_backend.rs");
+    let service = backend.split_once("fn service_resolved_create(&mut self) -> usize")
+        .expect("actual mounted CREATE service").1
+        .split_once("fn service_resolved_directory(&mut self)")
+        .expect("CREATE service boundary").0;
+    let overlay = backend.split_once("fn create_overlay(")
+        .expect("actual writable open path").1
+        .split_once("fn binding(").expect("overlay boundary").0;
+    assert!(service.contains("&owner.parameters, !deferred_boot"),
+        "native resolved CREATE currently enters the resident-only decision");
+    assert!(overlay.contains("OverlayCreateSpec") && !overlay.contains("if resident_only { return Err(RESIDENT_BUSY); }"),
+        "native writable CREATE must capture a typed preparation decision");
+    assert!(service.contains("restore_resolved(resolved)"),
+        "a busy resident dependency must retain the exact CREATE owner");
+
+    // Exercise the production queue with a bootstat-like writable File owner. Its resolved
+    // result cannot issue another FAT sector; restoring it twice preserves the same IRP.
+    assert_eq!(layered_file_open_decision(Ok(true), true, 0x3, FILE_OPEN, 0),
+        Ok(LayeredFileOpenDecision::UseOverlay));
+    let geometry = FatPathGeometry { fat_start_sector: 1, data_start_sector: 100,
+        total_sectors: 200, sectors_per_cluster: 1 };
+    let lookup = FatPathLookup::new(geometry, 2, b"bootstat.dat").unwrap();
+    let mut creates = mounted_create_lookup::CreateLookupQueue::new();
+    creates.capture(0x225, 7, b"bootstat.dat".to_vec(), lookup).unwrap();
+    let claim = creates.claim_next().unwrap();
+    assert_eq!(creates.complete(claim, Ok(&[0; 512])), Ok(FatPathProgress::NotFound));
+    for _ in 0..2 {
+        let resolved = creates.take_resolved().unwrap();
+        assert_eq!((resolved.irp, resolved.mount), (0x225, 7));
+        creates.restore_resolved(resolved).unwrap();
+        assert!(creates.has_outstanding());
+        assert_eq!(creates.first_state(), Some((0x225, 7, b"resolved".as_slice())));
+        assert!(creates.claim_next().is_none(), "resolved CREATE has no new physical signaler");
+    }
+
+    assert!(backend.contains("OverlayPreparations")
+        && service.contains("pending_overlays"),
+        "native writable CREATE needs an independently driven preparation owner; resident-only retry cannot complete it");
+    let native = include_str!("../../../components/ntos-executive/src/mounted_native_block.rs");
+    let mount = include_str!("../../../components/ntos-executive/src/mounted_volume.rs");
+    let writable = include_str!("../../../components/ntos-executive/src/writable_fs.rs");
+    assert!(native.contains("SectorClaim::Overlay")
+        && native.contains("claim_mounted_overlay_sector"),
+        "the outer native block owner must drive overlay sectors without reentering backend dispatch");
+    assert!(mount.contains("MOUNT_OVERLAY_QUEUE") && mount.contains("mounted_overlay_outstanding"),
+        "prepared CREATE must stay visible to the no-signaler guard");
+    assert!(backend.contains("self.pending_overlays.borrow_mut().take_next_ready()")
+        && backend.contains("self.opens.finish(context, file,")
+        && backend.contains("file_context: Some(context.raw())"),
+        "resident completion must publish the canonical File context for the exact IRP");
+    assert!(backend.contains("query_metadata_relative_if_mounted(")
+        && backend.contains("spec.materialize_parent = false"),
+        "an existing upper parent must win without a lower FAT parent read");
+    assert!(writable.contains("pub(crate) unsafe fn create_prepared_overlay_relative_if_mounted")
+        && writable.contains("fs.create_prepared_overlay_relative(")
+        && writable.contains("match mounted_namespace_fs()"),
+        "native overlay completion must use the non-mounting resident transaction");
+}
+
+#[test]
 fn pending_create_keeps_exact_mount_and_sector_until_native_completion() {
     let mut route = BlockRouteOwner::new(7, 1_000).unwrap();
     route.begin_drain(7).unwrap();

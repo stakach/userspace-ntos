@@ -49,6 +49,22 @@ impl<P> CreateLookupQueue<P> {
     /// CREATE. All retain a File IRP that can still wake its caller.
     pub fn has_outstanding(&self) -> bool { !self.entries.is_empty() }
 
+    /// Read-only census of the oldest retained CREATE. A resolved or deferred entry has no
+    /// claimable sector, even though it still owns a File IRP and can wake its caller.
+    pub fn first_state(&self) -> Option<(u64, u64, &'static [u8])> {
+        let entry = self.entries.first()?;
+        let phase = if entry.claimed.is_some() {
+            b"sector-entered".as_slice()
+        } else if matches!(&entry.result, Some(Ok(CreateLookupFound::DeferredBoot))) {
+            b"deferred-boot".as_slice()
+        } else if entry.result.is_some() {
+            b"resolved".as_slice()
+        } else {
+            b"sector-ready".as_slice()
+        };
+        Some((entry.irp, entry.mount, phase))
+    }
+
     pub fn capture(&mut self, irp: u64, mount: u64, payload: P, lookup: FatPathLookup) -> Result<(), CreateLookupError> {
         if irp == 0 || mount == 0 || lookup.request().is_none() {
             return Err(CreateLookupError::Invalid);

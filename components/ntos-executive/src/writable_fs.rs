@@ -1278,6 +1278,19 @@ unsafe fn mounted_namespace_fs() -> Result<Option<&'static mut nt_fs::FileSystem
     }
 }
 
+/// A non-mounting admission check for prepared Native CREATEs. The queue retains their
+/// source bytes while another owner restores or exclusively uses the writable volume.
+pub(crate) unsafe fn prepared_overlay_resident() -> Result<bool, u32> {
+    match mounted_namespace_fs() {
+        Ok(Some(_)) => Ok(true),
+        // Native relation publication follows ensure_mounted() at the boot storage handoff.
+        // Only the independently driven journal lease can make this temporarily unavailable.
+        Ok(None) => Err(nt_fs::STATUS_DEVICE_NOT_READY),
+        Err(snapshot_storage::BUSY) => Ok(false),
+        Err(status) => Err(status),
+    }
+}
+
 pub(crate) enum BootSystemPersistence {
     Absent,
     Restored(RestoredBootSystem),
@@ -1879,6 +1892,40 @@ pub(crate) unsafe fn create(
     } else {
         (result.status, None, 0)
     }
+}
+
+/// Complete a lower-layer CREATE using only the already mounted, resident namespace.
+/// Native FAT reads and snapshot restoration belong to their retained outer owners.
+pub(crate) unsafe fn create_prepared_overlay_relative_if_mounted(
+    relative: &[u8], parent: Option<&[u8]>, import: Option<(nt_fs::FileMetadata, alloc::vec::Vec<u8>)>,
+    desired_access: u32, file_attributes: u32, share_access: u32, disposition: u32,
+    options: u32,
+) -> (u32, Option<u64>, u64) {
+    let fs = match mounted_namespace_fs() {
+        Ok(Some(fs)) => fs,
+        Ok(None) => return (snapshot_storage::BUSY, None, 0),
+        Err(status) => return (status, None, 0),
+    };
+    let imported = import.is_some();
+    let result = fs.create_prepared_overlay_relative(relative, parent, import,
+        desired_access, file_attributes, share_access, disposition, options);
+    if result.status != nt_fs::STATUS_SUCCESS {
+        return (result.status, None, 0);
+    }
+    mark_runtime_dirty();
+    if create_information_changes_volume(result.information) || parent.is_some() || imported {
+        mark_snapshot_dirty();
+    }
+    match result.information {
+        nt_fs::FILE_CREATED => {
+            OVERLAY_CREATES.fetch_add(1, Ordering::Relaxed);
+            if options & nt_fs::FILE_DIRECTORY_FILE != 0 {
+                OVERLAY_DIRS_CREATED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        _ => { OVERLAY_OPENS.fetch_add(1, Ordering::Relaxed); }
+    }
+    (result.status, Some(result.handle), result.information as u64)
 }
 
 /// `NtCreateFile` / `NtOpenFile` beneath an existing writable-volume directory FILE_OBJECT.

@@ -110,6 +110,20 @@ impl<P> OverlayPreparations<P> {
         !self.entries.is_empty()
     }
 
+    pub fn first_state(&self) -> Option<(u64, u64, &'static [u8])> {
+        let entry = self.entries.first()?;
+        let phase = if entry.claimed.is_some() {
+            b"sector-entered".as_slice()
+        } else {
+            match &entry.phase {
+                Phase::Parent(_) => b"parent-sector".as_slice(),
+                Phase::Contents(_) => b"contents-sector".as_slice(),
+                Phase::Ready(_) => b"resident-ready".as_slice(),
+            }
+        };
+        Some((entry.irp, entry.mount, phase))
+    }
+
     pub fn has_claimable_sector(&self) -> bool {
         self.entries
             .iter()
@@ -120,6 +134,11 @@ impl<P> OverlayPreparations<P> {
         self.entries
             .iter()
             .any(|entry| matches!(entry.phase, Phase::Ready(_)))
+    }
+
+    pub fn next_ready_identity(&self) -> Option<(u64, u64)> {
+        self.entries.iter().find(|entry| matches!(entry.phase, Phase::Ready(_)))
+            .map(|entry| (entry.irp, entry.mount))
     }
 
     /// Capture all output storage and both FAT cursors before the first native effect.

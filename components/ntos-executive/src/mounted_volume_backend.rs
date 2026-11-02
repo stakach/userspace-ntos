@@ -7,6 +7,7 @@
 
 use alloc::{rc::Rc, vec::Vec};
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use nt_io_abi::major;
 use nt_io_manager::{
@@ -33,6 +34,9 @@ use mounted_directory_lookup::DirectoryLookupQueue;
 
 const RESIDENT_BUSY: NtStatus = NtStatus(0x8000_0011u32 as i32);
 
+static CREATE_DECISION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static CREATE_BUSY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
 struct CompletedCreate {
     owner: CapturedCreate,
     completion: DriverCompletion,
@@ -48,6 +52,27 @@ pub(crate) struct CapturedCreate {
 }
 
 pub(crate) type MountedCreateQueue = Rc<RefCell<CreateLookupQueue<CapturedCreate>>>;
+
+#[derive(Clone, Copy)]
+struct OverlayCreateSpec {
+    installed: Option<FatOpenMetadata>,
+    copy_action: Option<nt_fs::InstalledFileOpenAction>,
+    materialize_parent: bool,
+    is_directory: bool,
+}
+
+enum CreateDecision {
+    Dispatch(DispatchOutcome),
+    Prepare(OverlayCreateSpec),
+}
+
+pub(crate) struct PreparedCreateOwner {
+    owner: CapturedCreate,
+    context: nt_fs::LayeredOpenContextId,
+    spec: OverlayCreateSpec,
+}
+
+pub(crate) type MountedOverlayQueue = Rc<RefCell<nt_fs::OverlayPreparations<PreparedCreateOwner>>>;
 
 pub(crate) struct CapturedDirectory {
     irp: IrpId,
@@ -112,6 +137,7 @@ pub(crate) struct MountedVolumeBackend {
     bindings: Vec<Option<MountedBinding>>,
     read_completions: MountedReadQueue,
     pending_creates: MountedCreateQueue,
+    pending_overlays: MountedOverlayQueue,
     create_completions: Vec<CompletedCreate>,
     pending_directories: MountedDirectoryQueue,
     directory_completions: Vec<CompletedDirectory>,
@@ -119,7 +145,8 @@ pub(crate) struct MountedVolumeBackend {
 
 impl MountedVolumeBackend {
     pub(crate) fn new(fs: crate::Fat32, pending_creates: MountedCreateQueue,
-        read_completions: MountedReadQueue, pending_directories: MountedDirectoryQueue) -> Self {
+        pending_overlays: MountedOverlayQueue, read_completions: MountedReadQueue,
+        pending_directories: MountedDirectoryQueue) -> Self {
         Self {
             fs,
             opens: nt_fs::LayeredOpenTable::new(),
@@ -128,6 +155,7 @@ impl MountedVolumeBackend {
             bindings: Vec::new(),
             read_completions,
             pending_creates,
+            pending_overlays,
             create_completions: Vec::new(),
             pending_directories,
             directory_completions: Vec::new(),
@@ -280,7 +308,10 @@ impl MountedVolumeBackend {
             return Ok(DispatchOutcome::Pending);
         }
         let installed = unsafe { fat_open_path_metadata_from(&self.fs, self.fs.root_cl, relative) };
-        self.create_decided(file_id.raw(), units, relative, installed, parameters, false)
+        match self.create_decided(file_id.raw(), units, relative, installed, parameters, false)? {
+            CreateDecision::Dispatch(outcome) => Ok(outcome),
+            CreateDecision::Prepare(_) => unreachable!("Boot CREATE does not prepare native I/O"),
+        }
     }
 
     fn create_decided(
@@ -291,7 +322,7 @@ impl MountedVolumeBackend {
         installed: Option<FatOpenMetadata>,
         parameters: &nt_io_manager::CreateParameters,
         resident_only: bool,
-    ) -> Result<DispatchOutcome, NtStatus> {
+    ) -> Result<CreateDecision, NtStatus> {
         let access = parameters.desired_access.bits();
         let share = parameters.share_access.bits();
         let options = parameters.create_options.bits();
@@ -324,6 +355,38 @@ impl MountedVolumeBackend {
             options,
         )
         .map_err(status)?;
+        if resident_only
+            && matches!(decision,
+                nt_fs::LayeredFileOpenDecision::UseOverlay
+                | nt_fs::LayeredFileOpenDecision::CreateOverlay
+                | nt_fs::LayeredFileOpenDecision::Installed(
+                    nt_fs::InstalledFileOpenAction::CopyContents
+                    | nt_fs::InstalledFileOpenAction::CopyMetadata))
+            && CREATE_DECISION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 64
+        {
+            crate::print_str(b"[mounted-create-decision] path=\"");
+            crate::print_str(&relative[..relative.len().min(120)]);
+            crate::print_str(b"\" installed/overlay=");
+            crate::print_u64(installed.is_some() as u64);
+            crate::print_str(b"/");
+            crate::print_u64(overlay.is_some() as u64);
+            crate::print_str(b" access/disposition/options=");
+            crate::print_u64(access as u64);
+            crate::print_str(b"/");
+            crate::print_u64(parameters.create_disposition as u64);
+            crate::print_str(b"/");
+            crate::print_u64(options as u64);
+            crate::print_str(b" decision=");
+            crate::print_str(match decision {
+                nt_fs::LayeredFileOpenDecision::UseOverlay => b"use-overlay".as_slice(),
+                nt_fs::LayeredFileOpenDecision::CreateOverlay => b"create-overlay".as_slice(),
+                nt_fs::LayeredFileOpenDecision::Installed(nt_fs::InstalledFileOpenAction::ReadOnly) => b"installed-read".as_slice(),
+                nt_fs::LayeredFileOpenDecision::Installed(nt_fs::InstalledFileOpenAction::CopyContents) => b"copy-contents".as_slice(),
+                nt_fs::LayeredFileOpenDecision::Installed(nt_fs::InstalledFileOpenAction::CopyMetadata) => b"copy-metadata".as_slice(),
+                nt_fs::LayeredFileOpenDecision::Installed(nt_fs::InstalledFileOpenAction::NameCollision) => b"collision".as_slice(),
+            });
+            crate::print_str(b"\n");
+        }
         match decision {
             nt_fs::LayeredFileOpenDecision::Installed(nt_fs::InstalledFileOpenAction::ReadOnly) => {
                 self.create_installed(
@@ -334,7 +397,7 @@ impl MountedVolumeBackend {
                     access,
                     share,
                     options,
-                )
+                ).map(CreateDecision::Dispatch)
             }
             nt_fs::LayeredFileOpenDecision::Installed(
                 nt_fs::InstalledFileOpenAction::NameCollision,
@@ -441,16 +504,105 @@ impl MountedVolumeBackend {
         let owner = &resolved.payload;
         let outcome = self.create_decided(owner.file.raw(), &owner.name, &owner.relative,
             installed, &owner.parameters, !deferred_boot);
+        if let Ok(CreateDecision::Prepare(spec)) = &outcome {
+                let mut spec = *spec;
+                let mut parent_len = spec.materialize_parent.then(||
+                    resolved.payload.relative.iter().rposition(|byte| *byte == b'\\')).flatten();
+                if let Some(len) = parent_len {
+                    if len >= PATH_CAP {
+                        self.complete_failed_create(resolved.payload, NtStatus::OBJECT_NAME_INVALID);
+                        return 1;
+                    }
+                    match unsafe { crate::writable_fs::query_metadata_relative_if_mounted(
+                        &resolved.payload.relative[..len]) } {
+                        Ok(Some(metadata)) if metadata.is_directory => {
+                            spec.materialize_parent = false;
+                            parent_len = None;
+                        }
+                        Ok(Some(_)) => {
+                            self.complete_failed_create(resolved.payload, status(nt_fs::STATUS_NOT_A_DIRECTORY));
+                            return 1;
+                        }
+                        Ok(None) => {},
+                        Err(raw) if status(raw) == RESIDENT_BUSY => {
+                            self.pending_creates.borrow_mut().restore_resolved(resolved)
+                                .expect("busy parent lookup retains exact CREATE");
+                            return 0;
+                        }
+                        Err(raw) => {
+                            self.complete_failed_create(resolved.payload, status(raw));
+                            return 1;
+                        }
+                    }
+                }
+                let file = resolved.payload.file.raw();
+                let context = match self.reserve_open_context(file, &resolved.payload.name) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        self.complete_failed_create(resolved.payload, error);
+                        return 1;
+                    }
+                };
+                let mut parent = [0u8; PATH_CAP];
+                if let Some(len) = parent_len {
+                    parent[..len].copy_from_slice(&resolved.payload.relative[..len]);
+                }
+                let copy = match (spec.installed, spec.copy_action) {
+                    (Some(source), Some(nt_fs::InstalledFileOpenAction::CopyContents)) => {
+                        nt_fs::OverlayCopyPlan::Contents {
+                            first_cluster: source.first_cluster,
+                            length: match u32::try_from(source.metadata.end_of_file) {
+                                Ok(length) => length,
+                                Err(_) => {
+                                    self.opens.cancel(context, file).expect("unpublished context");
+                                    self.complete_failed_create(resolved.payload, NtStatus::INSUFFICIENT_RESOURCES);
+                                    return 1;
+                                }
+                            },
+                        }
+                    }
+                    (Some(_), Some(nt_fs::InstalledFileOpenAction::CopyMetadata)) =>
+                        nt_fs::OverlayCopyPlan::MetadataOnly,
+                    _ => nt_fs::OverlayCopyPlan::None,
+                };
+                let geometry = nt_fs::FatPathGeometry {
+                    fat_start_sector: self.fs.fat_start, data_start_sector: self.fs.data_start,
+                    total_sectors: self.fs.total_sectors, sectors_per_cluster: self.fs.spc,
+                };
+                let captured = PreparedCreateOwner { owner: resolved.payload, context, spec };
+                let result = self.pending_overlays.borrow_mut().capture_owned(
+                    resolved.irp, resolved.mount, captured, geometry, self.fs.root_cl,
+                    parent_len.map(|len| &parent[..len]), copy);
+                if let Err((error, captured)) = result {
+                    self.opens.cancel(context, file).expect("unpublished context");
+                    self.complete_failed_create(captured.owner, overlay_prepare_status(error));
+                }
+                return 1;
+        }
         if matches!(outcome, Err(RESIDENT_BUSY)) {
+            if CREATE_BUSY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
+                crate::print_str(b"[mounted-create-busy] irp=");
+                crate::print_u64(resolved.irp);
+                crate::print_str(b" mount=");
+                crate::print_u64(resolved.mount);
+                crate::print_str(b" path=\"");
+                crate::print_str(&owner.relative[..owner.relative.len().min(120)]);
+                crate::print_str(b"\" deferred-boot=");
+                crate::print_u64(deferred_boot as u64);
+                crate::print_str(b" journal-owned=");
+                crate::print_u64(crate::writable_fs::registry_journal::owns_volume() as u64);
+                crate::print_str(b"\n");
+            }
             self.pending_creates.borrow_mut().restore_resolved(resolved)
                 .expect("a removed queue entry retains its allocation");
             return 0;
         }
         let (status, information, file_context) = match outcome {
-            Ok(DispatchOutcome::Completed { status, information, file_context }) =>
+            Ok(CreateDecision::Dispatch(DispatchOutcome::Completed { status, information, file_context })) =>
                 (status, information, file_context),
-            Ok(DispatchOutcome::Failed { status }) | Err(status) => (status, 0, None),
-            Ok(DispatchOutcome::Pending) => panic!("mounted CREATE decision cannot nest pending work"),
+            Ok(CreateDecision::Dispatch(DispatchOutcome::Failed { status })) | Err(status) => (status, 0, None),
+            Ok(CreateDecision::Dispatch(DispatchOutcome::Pending)) => panic!("mounted CREATE decision cannot nest pending work"),
+            Ok(CreateDecision::Prepare(_)) => unreachable!("prepared CREATE owner transferred"),
         };
         self.create_completions.push(CompletedCreate {
             completion: DriverCompletion {
@@ -458,6 +610,130 @@ impl MountedVolumeBackend {
             }, owner: resolved.payload, published: false,
         });
         1
+    }
+
+    fn complete_failed_create(&mut self, owner: CapturedCreate, status: NtStatus) {
+        self.create_completions.push(CompletedCreate {
+            completion: DriverCompletion { irp_id: owner.irp, status, information: 0,
+                file_context: None }, owner, published: false,
+        });
+    }
+
+    fn service_prepared_overlay(&mut self) -> usize {
+        if !self.pending_overlays.borrow().has_ready() ||
+            self.create_completions.try_reserve(1).is_err() { return 0; }
+        // The storage handoff owns Draining -> Native publication. A sectorless upper open
+        // can become ready before that handoff; retain its IRP until the exact route is live.
+        let ready_mount = self.pending_overlays.borrow().next_ready_identity()
+            .map(|(_, mount)| mount);
+        let route = unsafe { crate::fs_loader::exec_fs_mount_identity() }
+            .filter(|mount| Some(mount.value()) == ready_mount)
+            .and_then(crate::fs_loader::exec_block_route_kind);
+        if route == Some(nt_fs::BlockSourceKind::Draining) { return 0; }
+        // Only the journal's exact owner can wake a ready Native request. A retired mount has
+        // no such signaler, even if the journal happens to be busy on a different volume.
+        let resident = if route == Some(nt_fs::BlockSourceKind::Native) {
+            unsafe { crate::writable_fs::prepared_overlay_resident() }
+        } else {
+            Err(nt_fs::STATUS_DEVICE_NOT_READY)
+        };
+        if resident == Ok(false) { return 0; }
+        let Some(prepared) = self.pending_overlays.borrow_mut().take_next_ready() else {
+            return 0;
+        };
+        let captured = prepared.payload;
+        let file = captured.owner.file.raw();
+        let context = captured.context;
+        let terminal = if let Err(status) = resident {
+            Err(NtStatus(status as i32))
+        } else if unsafe { crate::fs_loader::exec_fs_mount_identity() }
+            .is_none_or(|mount| mount.value() != prepared.mount ||
+                crate::fs_loader::exec_block_route_kind(mount) != Some(nt_fs::BlockSourceKind::Native))
+        {
+            Err(NtStatus::DEVICE_NOT_READY)
+        } else {
+            match prepared.result {
+                Err(error) => Err(overlay_prepare_status(error)),
+                Ok(inputs) => self.finish_prepared_overlay(&captured, prepared.copy, inputs),
+            }
+        };
+        match terminal {
+            Ok((overlay_file, information)) => {
+                self.opens.finish(context, file,
+                    nt_fs::LayeredOpenSource::Overlay { file_id: overlay_file })
+                    .expect("exact prepared CREATE context");
+                let index = context_index(context).expect("bounded layered context");
+                debug_assert!(self.bindings[index].is_none());
+                self.bindings[index] = Some(MountedBinding {
+                    context, installed_open: None, installed_handle_open: false,
+                    directory_open: None, overlay_open: true,
+                    is_directory: captured.spec.is_directory,
+                    granted_access: captured.owner.parameters.desired_access.bits(),
+                    create_options: captured.owner.parameters.create_options.bits(),
+                    installed_directory_cluster: captured.spec.installed
+                        .filter(|source| captured.spec.is_directory && source.metadata.is_directory)
+                        .map(|source| source.first_cluster),
+                    directory_query: nt_fs::DirectoryQueryState::default(),
+                });
+                self.create_completions.push(CompletedCreate {
+                    completion: DriverCompletion { irp_id: captured.owner.irp,
+                        status: NtStatus::SUCCESS, information,
+                        file_context: Some(context.raw()) },
+                    owner: captured.owner, published: false,
+                });
+            }
+            Err(status) => {
+                self.opens.cancel(context, file).expect("unpublished prepared CREATE context");
+                self.complete_failed_create(captured.owner, status);
+            }
+        }
+        1
+    }
+
+    fn finish_prepared_overlay(&mut self, captured: &PreparedCreateOwner,
+        copy: nt_fs::OverlayCopyPlan, inputs: nt_fs::PreparedOverlay)
+        -> Result<(u64, u64), NtStatus>
+    {
+        let owner = &captured.owner;
+        let relative = &owner.relative;
+        let spec = captured.spec;
+        if let Some(source) = spec.installed {
+            if spec.is_directory {
+                self.directories.check_share(relative, source.metadata,
+                    owner.parameters.desired_access.bits(), owner.parameters.share_access.bits())
+                    .map_err(status)?;
+            } else {
+                self.shares.check_share(relative, source.metadata,
+                    owner.parameters.desired_access.bits(), owner.parameters.share_access.bits())
+                    .map_err(status)?;
+            }
+        }
+        let parent = relative.iter().rposition(|byte| *byte == b'\\')
+            .filter(|_| spec.materialize_parent).map(|end| &relative[..end]);
+        if parent.is_some() && inputs.parent.is_none() {
+            return Err(NtStatus::OBJECT_PATH_NOT_FOUND);
+        }
+        let import = match (spec.installed, copy) {
+            (Some(source), nt_fs::OverlayCopyPlan::Contents { .. }) =>
+                Some((source.metadata, inputs.contents)),
+            (Some(source), nt_fs::OverlayCopyPlan::MetadataOnly) => {
+                let mut metadata = source.metadata;
+                metadata.allocation_size = 0;
+                metadata.end_of_file = 0;
+                metadata.valid_data_length = 0;
+                Some((metadata, Vec::new()))
+            }
+            _ => None,
+        };
+        let parameters = &owner.parameters;
+        let (status, opened, information) = unsafe {
+            crate::writable_fs::create_prepared_overlay_relative_if_mounted(relative, parent,
+                import, parameters.desired_access.bits(), parameters.file_attributes,
+                parameters.share_access.bits(), parameters.create_disposition,
+                parameters.create_options.bits())
+        };
+        if status != nt_fs::STATUS_SUCCESS { return Err(NtStatus(status as i32)); }
+        Ok((opened.expect("successful prepared CREATE owns File"), information))
     }
 
     fn service_resolved_directory(&mut self) -> usize {
@@ -528,7 +804,7 @@ impl MountedVolumeBackend {
         overlay: Option<nt_fs::FileMetadata>,
         parameters: &nt_io_manager::CreateParameters,
         resident_only: bool,
-    ) -> Result<DispatchOutcome, NtStatus> {
+    ) -> Result<CreateDecision, NtStatus> {
         let access = parameters.desired_access.bits();
         let share = parameters.share_access.bits();
         let options = parameters.create_options.bits();
@@ -549,7 +825,7 @@ impl MountedVolumeBackend {
                 }
                 self.create_installed_directory(
                     file_id, units, relative, source, access, share, options,
-                )
+                ).map(CreateDecision::Dispatch)
             }
             nt_fs::LayeredDirectoryOpenDecision::Overlay => {
                 if let Some(source) = installed.filter(|source| source.metadata.is_directory) {
@@ -706,10 +982,13 @@ impl MountedVolumeBackend {
         is_directory: bool,
         parameters: &nt_io_manager::CreateParameters,
         resident_only: bool,
-    ) -> Result<DispatchOutcome, NtStatus> {
-        // Overlay creation/copy-up may walk installed parents or access the snapshot device.
-        // Its native continuation is separate from the read-only installed CREATE lane.
-        if resident_only { return Err(RESIDENT_BUSY); }
+    ) -> Result<CreateDecision, NtStatus> {
+        // Native CREATE owns its immutable inputs in OverlayPreparations. This backend turn
+        // must not enter lower FAT or snapshot I/O while the I/O Manager is borrowed.
+        if resident_only {
+            return Ok(CreateDecision::Prepare(OverlayCreateSpec { installed, copy_action,
+                materialize_parent, is_directory }));
+        }
         let context = self.reserve_open_context(file_id, units)?;
         let access = parameters.desired_access.bits();
         let share = parameters.share_access.bits();
@@ -804,11 +1083,11 @@ impl MountedVolumeBackend {
                 .map(|source| source.first_cluster),
             directory_query: nt_fs::DirectoryQueryState::default(),
         });
-        Ok(DispatchOutcome::Completed {
+        Ok(CreateDecision::Dispatch(DispatchOutcome::Completed {
             status: NtStatus::SUCCESS,
             information,
             file_context: Some(context.raw()),
-        })
+        }))
     }
 
     fn binding(
@@ -1280,6 +1559,7 @@ impl DriverDispatchBackend for MountedVolumeBackend {
 
     fn service_pending(&mut self) -> usize {
         let mut progress = self.service_resolved_create();
+        progress += self.service_prepared_overlay();
         progress += self.service_resolved_directory();
         let pending_position = self.read_completions.borrow().pending_position();
         if let Some((irp, open, next)) = pending_position {
@@ -1352,4 +1632,13 @@ fn context_index(context: nt_fs::LayeredOpenContextId) -> Option<usize> {
 
 fn status(raw: u32) -> NtStatus {
     NtStatus(raw as i32)
+}
+
+fn overlay_prepare_status(error: nt_fs::OverlayPrepareError) -> NtStatus {
+    match error {
+        nt_fs::OverlayPrepareError::NoCapacity => NtStatus::INSUFFICIENT_RESOURCES,
+        nt_fs::OverlayPrepareError::ParentMissing => NtStatus::OBJECT_PATH_NOT_FOUND,
+        nt_fs::OverlayPrepareError::ParentNotDirectory => status(nt_fs::STATUS_NOT_A_DIRECTORY),
+        _ => status(nt_fs::STATUS_DATA_ERROR),
+    }
 }

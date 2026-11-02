@@ -6,12 +6,13 @@ use nt_memory_manager::{SectionMountBindings, SectionMountId, SectionMountIds};
 use nt_status::NtStatus;
 
 use crate::fs_loader::fat_visit_directory_checked;
-use crate::mounted_volume_backend::{MountedCreateQueue, MountedDirectoryQueue, MountedReadQueue, MountedVolumeBackend};
+use crate::mounted_volume_backend::{MountedCreateQueue, MountedDirectoryQueue, MountedOverlayQueue, MountedReadQueue, MountedVolumeBackend};
 
 static mut MOUNT_IDS: SectionMountIds = SectionMountIds::new();
 static mut MOUNT_BINDINGS: SectionMountBindings<nt_io_manager::DeviceId> =
     SectionMountBindings::new();
 static mut MOUNT_CREATE_QUEUE: Option<MountedCreateQueue> = None;
+static mut MOUNT_OVERLAY_QUEUE: Option<MountedOverlayQueue> = None;
 static mut MOUNT_READ_QUEUE: Option<MountedReadQueue> = None;
 static mut MOUNT_DIRECTORY_QUEUE: Option<MountedDirectoryQueue> = None;
 /// The published File device for the executive's exact physical FAT mount.
@@ -125,7 +126,61 @@ pub(crate) fn claim_mounted_create_sector() -> Option<crate::mounted_volume_back
 
 pub(crate) fn mounted_create_outstanding() -> bool {
     unsafe { (&*core::ptr::addr_of!(MOUNT_CREATE_QUEUE)).as_ref()
+        .is_some_and(|queue| queue.borrow().has_outstanding())
+        || (&*core::ptr::addr_of!(MOUNT_OVERLAY_QUEUE)).as_ref()
+            .is_some_and(|queue| queue.borrow().has_outstanding()) }
+}
+
+pub(crate) fn mounted_overlay_outstanding() -> bool {
+    unsafe { (&*core::ptr::addr_of!(MOUNT_OVERLAY_QUEUE)).as_ref()
         .is_some_and(|queue| queue.borrow().has_outstanding()) }
+}
+
+pub(crate) fn claim_mounted_overlay_sector() -> Option<nt_fs::OverlaySectorClaim> {
+    let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_OVERLAY_QUEUE)).as_ref()?.clone() };
+    let claim = queue.borrow_mut().claim_next();
+    claim
+}
+
+pub(crate) fn complete_mounted_overlay_sector(claim: nt_fs::OverlaySectorClaim,
+    sector: Result<&[u8; 512], nt_fs::FatPathError>) -> Result<nt_fs::OverlayPrepareProgress, nt_fs::OverlayPrepareError> {
+    let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_OVERLAY_QUEUE)).as_ref().cloned() }
+        .ok_or(nt_fs::OverlayPrepareError::Invalid)?;
+    let result = queue.borrow_mut().complete_sector(claim, sector);
+    result
+}
+
+pub(crate) fn release_unentered_mounted_overlay_sector(claim: nt_fs::OverlaySectorClaim)
+    -> Result<(), nt_fs::OverlayPrepareError> {
+    let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_OVERLAY_QUEUE)).as_ref().cloned() }
+        .ok_or(nt_fs::OverlayPrepareError::Invalid)?;
+    let result = queue.borrow_mut().release_unentered(claim);
+    result
+}
+
+pub(crate) fn print_mounted_create_census() {
+    let state = unsafe { (&*core::ptr::addr_of!(MOUNT_CREATE_QUEUE)).as_ref()
+        .and_then(|queue| queue.borrow().first_state()) };
+    if let Some((irp, mount, phase)) = state {
+        crate::print_str(b"[mounted-create-census] irp=");
+        crate::print_u64(irp);
+        crate::print_str(b" mount=");
+        crate::print_u64(mount);
+        crate::print_str(b" phase=");
+        crate::print_str(phase);
+        crate::print_str(b"\n");
+    }
+    let overlay = unsafe { (&*core::ptr::addr_of!(MOUNT_OVERLAY_QUEUE)).as_ref()
+        .and_then(|queue| queue.borrow().first_state()) };
+    if let Some((irp, mount, phase)) = overlay {
+        crate::print_str(b"[mounted-overlay-census] irp=");
+        crate::print_u64(irp);
+        crate::print_str(b" mount=");
+        crate::print_u64(mount);
+        crate::print_str(b" phase=");
+        crate::print_str(phase);
+        crate::print_str(b"\n");
+    }
 }
 
 pub(crate) fn complete_mounted_create_sector(
@@ -214,9 +269,11 @@ pub(crate) fn register_mounted_volume(
     let driver_path = alloc::format!("\\Driver\\MountedVolume{{{guid}}}");
     let device_path = alloc::format!("\\Device\\Volume{{{guid}}}");
     let create_queue = Rc::new(RefCell::new(crate::mounted_volume_backend::mounted_create_lookup::CreateLookupQueue::new()));
+    let overlay_queue = Rc::new(RefCell::new(nt_fs::OverlayPreparations::new()));
     let read_queue = Rc::new(RefCell::new(crate::mounted_volume_backend::mounted_installed_read::ReadCompletions::new()));
     let directory_queue = Rc::new(RefCell::new(crate::mounted_volume_backend::mounted_directory_lookup::DirectoryLookupQueue::new()));
-    let backend = MountedVolumeBackend::new(fs, create_queue.clone(), read_queue.clone(), directory_queue.clone());
+    let backend = MountedVolumeBackend::new(fs, create_queue.clone(), overlay_queue.clone(),
+        read_queue.clone(), directory_queue.clone());
     let mount = unsafe { allocate_mount_id() }.map_err(|status| NtStatus(status as i32))?;
     unsafe { (&mut *core::ptr::addr_of_mut!(MOUNT_BINDINGS)).reserve(mount) }
         .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
@@ -247,6 +304,7 @@ pub(crate) fn register_mounted_volume(
     }
     .expect("newly registered volume has a unique prepared mount binding");
     unsafe { *core::ptr::addr_of_mut!(MOUNT_CREATE_QUEUE) = Some(create_queue); }
+    unsafe { *core::ptr::addr_of_mut!(MOUNT_OVERLAY_QUEUE) = Some(overlay_queue); }
     unsafe { *core::ptr::addr_of_mut!(MOUNT_READ_QUEUE) = Some(read_queue); }
     unsafe { *core::ptr::addr_of_mut!(MOUNT_DIRECTORY_QUEUE) = Some(directory_queue); }
     unsafe { *core::ptr::addr_of_mut!(EXEC_VOLUME_DEVICE) = Some((physical_mount, device_id)); }
