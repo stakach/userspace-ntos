@@ -277,6 +277,56 @@ pub(super) fn scsi_children_match_current(
         })
 }
 
+/// The source completion callback may unlock its MDL and request deferred IRP free before
+/// returning MORE_PROCESSING_REQUIRED. At that point child liveness is no longer a valid
+/// lookup key. The exact source allocation is still pinned, and its child row remains owned
+/// through provider ACK and source completion.
+fn scsi_after_callback_phase(
+    phase: Option<nt_io_manager::scsi_source_retention::ScsiSourcePhase>,
+    deferred_free_requested: bool,
+) -> bool {
+    use nt_io_manager::scsi_source_retention::ScsiSourcePhase;
+    deferred_free_requested && matches!(phase,
+        Some(ScsiSourcePhase::Terminal | ScsiSourcePhase::ProviderAcknowledged
+            | ScsiSourcePhase::SourceCompleted | ScsiSourcePhase::ReadyToRelease))
+}
+
+pub(super) fn scsi_children_match_after_callback(
+    instance_index: usize, children: ScsiSourceChildren,
+    stack_lease: Option<hosted_source_stack_lease::SourceStackLeaseId>,
+) -> bool {
+    let _guard = lock();
+    if !scsi_children().contains_exact(children)
+        || !scsi_after_callback_phase(
+            scsi_children().phase(children.ticket),
+            ledger().deferred_free_requested(children.ticket),
+        )
+        || !ledger().admits_forward(children.ticket, children.source)
+    { return false; }
+    let Some(inst) = instance(instance_index) else { return false; };
+    if instance_domain_identity(inst) != Some(children.source.domain) { return false; }
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        return false;
+    };
+    let mut observed = unsafe { allocation_unlocked(instance_index, inst,
+        children.source.component_address, children.source.bytes, children.source.stack_count) };
+    if let Some(source) = observed.as_mut() { source.owner = children.source.owner; }
+    observed == Some(children.source)
+        && match children.srb {
+            nt_io_manager::scsi_source_retention::ScsiSrbSource::Pool(_) => true,
+            nt_io_manager::scsi_source_retention::ScsiSrbSource::Stack { range, component_address } =>
+                stack_lease.is_some_and(|lease| unsafe {
+                    hosted_source_stack_lease::scsi_matches(
+                        lease,
+                        SourceIrpForwardIdentity::new(children.ticket, children.source)
+                            .expect("retained SCSI source identity"),
+                        range,
+                        component_address,
+                    )
+                }),
+        }
+}
+
 pub(super) fn abandon_scsi_children(children: ScsiSourceChildren) -> bool {
     let _guard = lock();
     scsi_children().abandon_prepared(children).is_ok()

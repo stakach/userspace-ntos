@@ -40,6 +40,7 @@ struct Work {
     reply_entered: bool,
     inline_held: bool,
     ack: Option<RetainedAck>,
+    pending_wake: Option<WakeAction>,
     cancel_requested: bool,
     quarantined: bool,
 }
@@ -50,6 +51,34 @@ struct RetainedAck {
     reply: u64,
     token: u64,
     reply_entered: bool,
+}
+
+#[derive(Clone, Copy)]
+enum WakeAction {
+    Source {
+        route: nt_component_suspension::peer_registry::PeerRoute,
+        dispatch: nt_component_suspension::LaneDispatchIdentity,
+        reply: u64,
+        token: u64,
+        disposition: HostedForwardDispatchReply,
+    },
+    Ack {
+        route: nt_component_suspension::peer_registry::PeerRoute,
+        dispatch: nt_component_suspension::LaneDispatchIdentity,
+        reply: u64,
+        token: u64,
+    },
+}
+
+unsafe fn wake_after_restore(wake: WakeAction) {
+    match wake {
+        WakeAction::Source { route, dispatch, reply, token, disposition } => {
+            let _ = runtime::wake_hosted_forward_service(route, dispatch, reply, token, disposition);
+        }
+        WakeAction::Ack { route, dispatch, reply, token } => {
+            let _ = runtime::wake_query_path_service(route, dispatch, reply, token, STATUS_SUCCESS);
+        }
+    }
 }
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
@@ -231,6 +260,7 @@ pub(super) unsafe fn submit(
         reply_entered: false,
         inline_held: false,
         ack: None,
+        pending_wake: None,
         cancel_requested: false,
         quarantined: false,
     };
@@ -431,9 +461,7 @@ impl Work {
                 return false;
             }
             self.ack.as_mut().expect("retained buffered control ACK").reply_entered = true;
-            let _ = runtime::wake_query_path_service(
-                route, dispatch, reply, token, STATUS_SUCCESS,
-            );
+            self.pending_wake = Some(WakeAction::Ack { route, dispatch, reply, token });
             return false;
         }
         if self.reply_entered {
@@ -482,13 +510,13 @@ impl Work {
         if !self.publish_source_terminal() { return false; }
         self.source_published = true;
         self.reply_entered = true;
-        let _ = runtime::wake_hosted_forward_service(
-            self.route,
-            self.dispatch,
-            self.reply,
-            self.token,
-            HostedForwardDispatchReply::InlineTerminal(status),
-        );
+        self.pending_wake = Some(WakeAction::Source {
+            route: self.route,
+            dispatch: self.dispatch,
+            reply: self.reply,
+            token: self.token,
+            disposition: HostedForwardDispatchReply::InlineTerminal(status),
+        });
         false
     }
 }
@@ -529,6 +557,7 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
         work.quarantined,
     );
     let done = work.advance(handler);
+    let wake = work.pending_wake.take();
     let after = (
         work.inline_held,
         work.canonical_irp.is_some(),
@@ -540,8 +569,15 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
         work.cancel_requested,
         work.quarantined,
     );
-    if !done { (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work); }
+    if !done {
+        (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
+    } else {
+        assert!(wake.is_none(), "retired buffered control row cannot expose an unowned Reply");
+    }
     assert_eq!((&mut *core::ptr::addr_of_mut!(EXECUTING)).pop().map(|row| row.0), Some(index));
+    if let Some(wake) = wake {
+        wake_after_restore(wake);
+    }
     done || before != after
 }
 

@@ -44,6 +44,7 @@ struct Work {
     reply_entered: bool,
     inline_held: bool,
     ack: Option<RetainedAck>,
+    pending_wake: Option<WakeAction>,
     cancel_requested: bool,
 }
 
@@ -53,6 +54,34 @@ struct RetainedAck {
     reply: u64,
     token: u64,
     reply_entered: bool,
+}
+
+#[derive(Clone, Copy)]
+enum WakeAction {
+    Source {
+        route: nt_component_suspension::peer_registry::PeerRoute,
+        dispatch: nt_component_suspension::LaneDispatchIdentity,
+        reply: u64,
+        token: u64,
+        disposition: HostedForwardDispatchReply,
+    },
+    Ack {
+        route: nt_component_suspension::peer_registry::PeerRoute,
+        dispatch: nt_component_suspension::LaneDispatchIdentity,
+        reply: u64,
+        token: u64,
+    },
+}
+
+unsafe fn wake_after_restore(wake: WakeAction) {
+    match wake {
+        WakeAction::Source { route, dispatch, reply, token, disposition } => {
+            let _ = runtime::wake_hosted_forward_service(route, dispatch, reply, token, disposition);
+        }
+        WakeAction::Ack { route, dispatch, reply, token } => {
+            let _ = runtime::wake_query_path_service(route, dispatch, reply, token, STATUS_SUCCESS);
+        }
+    }
 }
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
@@ -244,6 +273,7 @@ pub(super) unsafe fn submit(
         reply_entered: false,
         inline_held: false,
         ack: None,
+        pending_wake: None,
         cancel_requested: false,
     };
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
@@ -572,7 +602,7 @@ impl Work {
                 return false;
             }
             self.ack.as_mut().expect("retained SCSI ACK").reply_entered = true;
-            let _ = runtime::wake_query_path_service(route, dispatch, reply, token, STATUS_SUCCESS);
+            self.pending_wake = Some(WakeAction::Ack { route, dispatch, reply, token });
             return false;
         }
         if self.reply_entered {
@@ -663,13 +693,13 @@ impl Work {
         } else {
             HostedForwardDispatchReply::Rejected(status)
         };
-        let _ = runtime::wake_hosted_forward_service(
-            self.route,
-            self.dispatch,
-            self.reply,
-            self.token,
+        self.pending_wake = Some(WakeAction::Source {
+            route: self.route,
+            dispatch: self.dispatch,
+            reply: self.reply,
+            token: self.token,
             disposition,
-        );
+        });
         false
     }
 }
@@ -724,6 +754,7 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
         work.ack.as_ref().map(|ack| ack.reply_entered),
     );
     let done = work.advance(handler);
+    let wake = work.pending_wake.take();
     let after = (
         work.canonical_irp,
         work.terminal_status,
@@ -734,6 +765,8 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
     );
     if !done {
         (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
+    } else {
+        assert!(wake.is_none(), "retired SCSI row cannot expose an unowned Reply");
     }
     assert_eq!(
         (&mut *core::ptr::addr_of_mut!(EXECUTING))
@@ -741,6 +774,9 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
             .map(|row| row.0),
         Some(index)
     );
+    if let Some(wake) = wake {
+        wake_after_restore(wake);
+    }
     done || before != after
 }
 

@@ -173,9 +173,15 @@ impl CapturedSourceScsi {
     /// source pool children safe to discard before the caller-local completion and ACK.
     pub(super) fn validate_retained(&self) -> Result<(), CaptureError> {
         if !self.source_pinned
-            || !hosted_source_irp_ledger::scsi_children_match_current(
-                self.instance_index, self.children, self.stack_lease,
-            )
+            || !(if hosted_source_irp_ledger::deferred_free_requested(self.ticket) {
+                hosted_source_irp_ledger::scsi_children_match_after_callback(
+                    self.instance_index, self.children, self.stack_lease,
+                )
+            } else {
+                hosted_source_irp_ledger::scsi_children_match_current(
+                    self.instance_index, self.children, self.stack_lease,
+                )
+            })
         {
             return Err(CaptureError::InvalidSource);
         }
