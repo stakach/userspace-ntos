@@ -451,6 +451,9 @@ struct Work {
 static mut ATTEMPTS: CmMutationBeginAttempts = CmMutationBeginAttempts::new();
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static NEXT_WORK_ID: AtomicU64 = AtomicU64::new(1);
+static LAST_INTERFACE_RETRY_WORK_ID: AtomicU64 = AtomicU64::new(0);
+static LAST_INTERFACE_RETRY_PHASE: AtomicU64 = AtomicU64::new(0);
+static INTERFACE_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn next_work_id() -> u64 {
     let id = NEXT_WORK_ID.fetch_add(1, Ordering::Relaxed);
@@ -486,6 +489,84 @@ fn phase_progress_fingerprint(phase: &Phase) -> PhaseProgressFingerprint {
     }
 }
 
+fn trace_interface_retry_at(failures: u64) -> bool {
+    failures != 0 && failures.is_power_of_two()
+}
+
+fn phase_name(phase: &Phase) -> &'static str {
+    match phase {
+        Phase::ProviderAdmit => "provider-admit", Phase::Begin(_) => "begin",
+        Phase::Prepare(_) => "prepare", Phase::Admit => "admit",
+        Phase::Durable => "durable", Phase::Commit => "commit",
+        Phase::CommitDurable => "commit-durable", Phase::Open => "open",
+        Phase::Acknowledge => "acknowledge",
+        Phase::ReleasePublication(_) => "release-publication",
+        Phase::Abort => "abort", Phase::Rollback => "rollback",
+        Phase::DurableAbort(_) => "durable-abort",
+        Phase::AcknowledgeAbort(_) => "acknowledge-abort",
+        Phase::ReleaseRollback(_) => "release-rollback",
+        Phase::Complete => "complete", Phase::ReadyReply => "ready-reply",
+        Phase::ReplyEntered => "reply-entered", Phase::ReplySent => "reply-sent",
+        Phase::RevokeReply => "revoke-reply", Phase::RetypeReply => "retype-reply",
+        Phase::ReconcileRuntime => "reconcile-runtime",
+        Phase::ProviderReplyEntered => "provider-reply-entered",
+    }
+}
+
+/// The registry writer can retry a retained provider mutation indefinitely. Log only the
+/// first and power-of-two failures of the same interface-registration owner/phase so a bounded
+/// boot names the refused CM step without flooding serial or changing its retry contract.
+fn trace_interface_retry(work: &Work, error: i32) {
+    let Caller::Provider(provider::ProviderCaller {
+        admission: provider::ProviderAdmission::InterfaceRegister(admission), ..
+    }) = &work.caller else { return; };
+    let phase = phase_name(&work.phase);
+    let phase_key = phase.as_ptr() as usize as u64;
+    let previous = LAST_INTERFACE_RETRY_WORK_ID.swap(work.id, Ordering::AcqRel);
+    let previous_phase = LAST_INTERFACE_RETRY_PHASE.swap(phase_key, Ordering::AcqRel);
+    let count = if previous == work.id && previous_phase == phase_key {
+        INTERFACE_RETRY_COUNT.fetch_add(1, Ordering::AcqRel).saturating_add(1)
+    } else {
+        INTERFACE_RETRY_COUNT.store(1, Ordering::Release);
+        1
+    };
+    if !trace_interface_retry_at(count) { return; }
+    print_str(b"[registry-interface-retry] id="); print_u64(work.id);
+    print_str(b" count="); print_u64(count);
+    print_str(b" route="); print_u64(admission.dispatch.route().badge());
+    print_str(b" phase="); print_str(phase.as_bytes());
+    print_str(b" error=0x"); print_hex_u64(error as u32 as u64);
+    print_str(b" work-status=0x"); print_hex_u64(work.status as u64);
+    print_str(b" expected-generation="); print_u64(admission.expected_generation);
+    match &work.phase {
+        Phase::Begin(attempt) => {
+            print_str(b" begin-nonce="); print_u64(attempt.server_nonce().unwrap_or(0));
+            print_str(b" begin-outcome=0x");
+            print_hex_u64(attempt.outcome_status().unwrap_or(0) as u32 as u64);
+            print_str(b" begin-ack="); print_u64(u64::from(attempt.is_acknowledged()));
+        }
+        Phase::Prepare(preparation) => {
+            print_str(b" prepare-phase=");
+            print_str(match preparation.phase() {
+                CmMutationPreparationPhase::Appending => b"appending",
+                CmMutationPreparationPhase::Preparing => b"preparing",
+                CmMutationPreparationPhase::Allocating => b"allocating",
+                CmMutationPreparationPhase::Pulling => b"pulling",
+                CmMutationPreparationPhase::Prepared => b"prepared",
+                CmMutationPreparationPhase::Cancelling => b"cancelling",
+                CmMutationPreparationPhase::AcknowledgingCancellation => b"acknowledging-cancellation",
+                CmMutationPreparationPhase::Cancelled => b"cancelled",
+                CmMutationPreparationPhase::Taken => b"taken",
+            });
+            print_str(b" uploaded="); print_u64(preparation.uploaded_len() as u64);
+            print_str(b" collected="); print_u64(preparation.collected_len() as u64);
+        }
+        _ => {}
+    }
+    print_str(b" retry-100ns="); print_u64(RETRY_DELAY);
+    print_str(b"\n");
+}
+
 /// Includes work retained across a failed CM exchange or a storage effect. The bootstrap
 /// handoff must wait for this count and the journal owner before moving Ps into the handler.
 pub(crate) fn pending_count() -> u64 {
@@ -514,23 +595,7 @@ pub(crate) unsafe fn census_snapshot() -> CensusSnapshot {
             Caller::Hosted(_) => {
                 hosted_rows += 1;
                 if first_hosted.is_none() {
-                    let phase = match work.phase {
-                        Phase::ProviderAdmit => "provider-admit", Phase::Begin(_) => "begin",
-                        Phase::Prepare(_) => "prepare", Phase::Admit => "admit",
-                        Phase::Durable => "durable", Phase::Commit => "commit",
-                        Phase::CommitDurable => "commit-durable", Phase::Open => "open",
-                        Phase::Acknowledge => "acknowledge",
-                        Phase::ReleasePublication(_) => "release-publication",
-                        Phase::Abort => "abort", Phase::Rollback => "rollback",
-                        Phase::DurableAbort(_) => "durable-abort",
-                        Phase::AcknowledgeAbort(_) => "acknowledge-abort",
-                        Phase::ReleaseRollback(_) => "release-rollback",
-                        Phase::Complete => "complete", Phase::ReadyReply => "ready-reply",
-                        Phase::ReplyEntered => "reply-entered", Phase::ReplySent => "reply-sent",
-                        Phase::RevokeReply => "revoke-reply", Phase::RetypeReply => "retype-reply",
-                        Phase::ReconcileRuntime => "reconcile-runtime",
-                        Phase::ProviderReplyEntered => "provider-reply-entered",
-                    };
+                    let phase = phase_name(&work.phase);
                     let storage = match work.persistence.owner {
                         PersistenceOwner::Unadmitted => "unadmitted",
                         PersistenceOwner::NoStorage => "no-storage",
@@ -971,7 +1036,12 @@ unsafe fn redrive_inner(mut context: HostedContext<'_>) -> bool {
                 Ok(false) => {
                     immediate_progress = previous_phase != phase_progress_fingerprint(&work.phase);
                 }
-                Err(_) => { failed = true; immediate_progress = false; break; }
+                Err(status) => {
+                    trace_interface_retry(&work, status);
+                    failed = true;
+                    immediate_progress = false;
+                    break;
+                }
             }
         }
         if completed {
