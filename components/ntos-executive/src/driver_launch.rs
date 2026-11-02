@@ -49810,10 +49810,31 @@ impl DriverDispatchBackend for HostedDriverBackend {
                 Some(caller),
             )
         };
+        let trace_start_transport = |stage: &[u8], status: nt_status::NtStatus| {
+            if irp.minor == IRP_MN_START_DEVICE as u8 {
+                static START_TRANSPORT_COUNT: AtomicU64 = AtomicU64::new(0);
+                if START_TRANSPORT_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
+                    print_str(b"[hosted-start-transport] stage=");
+                    print_str(stage);
+                    print_str(b" irp=");
+                    print_u64(irp.irp_id.raw());
+                    print_str(b" driver=");
+                    print_u64(irp.driver_id.raw());
+                    print_str(b" device=");
+                    print_u64(irp.device_id.raw());
+                    print_str(b" status=0x");
+                    print_hex(status.raw() as u32);
+                    print_str(b"\n");
+                }
+            }
+        };
         match result {
-            None => PnpBackendDispatch::NotDispatched {
-                status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
-            },
+            None => {
+                trace_start_transport(b"dispatch-none", nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+                PnpBackendDispatch::NotDispatched {
+                    status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+                }
+            }
             Some(HostedIrpTransportResult::NotDispatched { status }) => {
                 PnpBackendDispatch::NotDispatched { status }
             }
@@ -49830,6 +49851,7 @@ impl DriverDispatchBackend for HostedDriverBackend {
                 information,
             },
             Some(HostedIrpTransportResult::Indeterminate { transport_status }) => {
+                trace_start_transport(b"dispatch-indeterminate", transport_status);
                 PnpBackendDispatch::Indeterminate { transport_status }
             }
         }
@@ -72327,13 +72349,33 @@ unsafe fn dispatch_irp_for_instance_exact(
     out: &mut [u8],
     caller: Option<nt_process::native_handle::NativeHandleCaller>,
 ) -> Option<HostedIrpTransportResult> {
+    let trace_start_gap = |stage: &[u8], dispatch_instance: usize| {
+        if major == major::IRP_MJ_PNP as u64 && minor == IRP_MN_START_DEVICE {
+            static START_GAP_COUNT: AtomicU64 = AtomicU64::new(0);
+            if START_GAP_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
+                print_str(b"[hosted-start-dispatch-gap] stage=");
+                print_str(stage);
+                print_str(b" irp=");
+                print_u64(canonical_irp_id);
+                print_str(b" instance=");
+                print_u64(dispatch_instance as u64);
+                print_str(b" object=0x");
+                print_hex_u64(device_object);
+                print_str(b"\n");
+            }
+        }
+    };
     if in_data.len() > u32::MAX as usize || out.len() > u32::MAX as usize {
         return Some(HostedIrpTransportResult::NotDispatched {
             status: nt_status::NtStatus(STATUS_INVALID_BUFFER_SIZE as i32),
         });
     }
-    let dependent_inst = instance(inst)?;
+    let Some(dependent_inst) = instance(inst) else {
+        trace_start_gap(b"dependent-missing", inst);
+        return None;
+    };
     if !dependent_inst.ready {
+        trace_start_gap(b"dependent-unready", inst);
         return None;
     }
     let canonical_request_route = dispatch_request
@@ -72379,8 +72421,14 @@ unsafe fn dispatch_irp_for_instance_exact(
                     status: nt_status::NtStatus(STATUS_INVALID_DEVICE_REQUEST),
                 });
             }
-            let provider_inst = instance(route.provider_instance)?;
-            let provider_domain = instance_domain_identity(provider_inst)?;
+            let Some(provider_inst) = instance(route.provider_instance) else {
+                trace_start_gap(b"provider-missing", route.provider_instance);
+                return None;
+            };
+            let Some(provider_domain) = instance_domain_identity(provider_inst) else {
+                trace_start_gap(b"provider-domain-missing", route.provider_instance);
+                return None;
+            };
             if provider_domain != route.provider_domain
                 || instance_domain_identity(dependent_inst) != Some(route.dependent_domain)
             {
@@ -72426,6 +72474,7 @@ unsafe fn dispatch_irp_for_instance_exact(
                 || provider_inst.pml4 == 0
                 || provider_inst.reply_cap == 0
             {
+                trace_start_gap(b"provider-caps-missing", route.provider_instance);
                 return None;
             }
             dispatch_index = route.provider_instance;
@@ -72487,7 +72536,13 @@ unsafe fn dispatch_irp_for_instance_exact(
     } else { None };
     let ingress_route = match class_selection.as_ref() {
         Some(selection) => selection.route,
-        None => hosted_ingress_sources::primary_route(dispatch_index)?,
+        None => match hosted_ingress_sources::primary_route(dispatch_index) {
+            Some(route) => route,
+            None => {
+                trace_start_gap(b"primary-route-missing", dispatch_index);
+                return None;
+            }
+        },
     };
     let trace_connect_pump = dispatch_request.as_ref().is_some_and(|request| {
         hosted_file_owners::port_connect_dispatch_for_trace(
@@ -72501,16 +72556,25 @@ unsafe fn dispatch_irp_for_instance_exact(
             class_selection.as_ref().map_or(d.tcb, |selection| selection.tcb),
             dispatch_index as u64);
     }
-    if !crate::spawn_hosts::shared_ingress::owner::runtime::ready_for_admission(ingress_route)
-        .ok()?
-    {
+    let ready = match crate::spawn_hosts::shared_ingress::owner::runtime::ready_for_admission(ingress_route) {
+        Ok(ready) => ready,
+        Err(_) => {
+            trace_start_gap(b"route-admission-error", dispatch_index);
+            return None;
+        }
+    };
+    if !ready {
         return Some(HostedIrpTransportResult::NotDispatched {
             status: nt_status::NtStatus::DEVICE_BUSY,
         });
     }
     if let Some(binding) = provider_binding {
-        project_provider_device_dispatch_state(binding, dependent_inst.exec_shared_va, d, sh)
-        .ok()?;
+        if project_provider_device_dispatch_state(binding, dependent_inst.exec_shared_va, d, sh)
+            .is_err()
+        {
+            trace_start_gap(b"provider-state-error", dispatch_index);
+            return None;
+        }
     } else if let Some(binding) = dispatch_binding {
         if class_selection.is_some() {
             let state = hosted_device_resource_state_by_device_id(binding.device_id);
