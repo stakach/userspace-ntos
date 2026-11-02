@@ -3190,8 +3190,16 @@ static SYSTEM_WAL_CAPACITY_SECTORS: AtomicU64 = AtomicU64::new(0);
 // A timer scan records demand without entering CM or native snapshot I/O while its delivery
 // gate and dispatcher borrows are live. The next safe service boundary owns the attempt.
 static SYSTEM_WAL_FOLD_DUE: AtomicBool = AtomicBool::new(false);
+// DUE keeps the retry deadline armed; READY grants one receive-boundary attempt.
+static SYSTEM_WAL_FOLD_READY: AtomicBool = AtomicBool::new(false);
 static SYSTEM_WAL_FOLD_RUNNING: AtomicBool = AtomicBool::new(false);
 static SYSTEM_WAL_FOLD_RETRY_100NS: AtomicU64 = AtomicU64::new(0);
+
+fn retire_system_wal_fold_demand() {
+    SYSTEM_WAL_FOLD_READY.store(false, Ordering::Release);
+    SYSTEM_WAL_FOLD_DUE.store(false, Ordering::Release);
+    SYSTEM_WAL_FOLD_RETRY_100NS.store(0, Ordering::Release);
+}
 
 /// Called only after the exact WAL continuation and both anchored snapshot headers are
 /// installed. All durable volume WAL users share this publication boundary.
@@ -3206,10 +3214,16 @@ pub(crate) fn note_durable_system_wal_mutation(used_sectors: u64, capacity_secto
     if crate::wal_fold_cadence::background_fold_due(
         first_dirty, now, used_sectors, capacity_sectors,
     ) {
-        SYSTEM_WAL_FOLD_RETRY_100NS.store(
-            now.saturating_add(SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS), Ordering::Release,
-        );
-        SYSTEM_WAL_FOLD_DUE.store(true, Ordering::Release);
+        if !SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire) {
+            SYSTEM_WAL_FOLD_RETRY_100NS.store(
+                now.saturating_add(SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS), Ordering::Release,
+            );
+            if SYSTEM_WAL_FOLD_DUE.compare_exchange(
+                false, true, Ordering::AcqRel, Ordering::Acquire,
+            ).is_ok() {
+                SYSTEM_WAL_FOLD_READY.store(true, Ordering::Release);
+            }
+        }
     }
     unsafe { rearm_registered_active_delay_timer() };
 }
@@ -3220,8 +3234,7 @@ pub(crate) fn note_system_wal_fold_complete() {
     SYSTEM_WAL_CAPACITY_SECTORS.store(0, Ordering::Release);
     // An explicit or asynchronously completed fold bypasses maybe_fold_system_wal's success
     // branch. Its exact paired snapshot and CM ACK retire the pending timer demand as well.
-    SYSTEM_WAL_FOLD_DUE.store(false, Ordering::Release);
-    SYSTEM_WAL_FOLD_RETRY_100NS.store(0, Ordering::Release);
+    retire_system_wal_fold_demand();
 }
 
 pub(crate) fn system_wal_fold_next_deadline() -> Option<u64> {
@@ -3251,11 +3264,13 @@ pub(crate) fn record_due_system_wal_fold(now_100ns: u64) -> u64 {
         now_100ns.saturating_add(SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS), Ordering::Release,
     );
     SYSTEM_WAL_FOLD_DUE.store(true, Ordering::Release);
+    SYSTEM_WAL_FOLD_READY.store(true, Ordering::Release);
     1
 }
 
 pub(crate) fn system_wal_fold_work_pending() -> bool {
     SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire)
+        && SYSTEM_WAL_FOLD_READY.load(Ordering::Acquire)
         && !SYSTEM_WAL_FOLD_RUNNING.load(Ordering::Acquire)
         && crate::config_manager_channel_idle()
 }
@@ -3263,16 +3278,17 @@ pub(crate) fn system_wal_fold_work_pending() -> bool {
 /// Enter the same physical fold contract as the outer finalizer, but only after the nested
 /// receiver has parked its exact parent. A busy native fold retains its owner and async work.
 pub(crate) fn service_due_system_wal_fold() -> Result<bool, u32> {
-    if !SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire) || !crate::config_manager_channel_idle() {
+    if !system_wal_fold_work_pending() {
         return Ok(false);
     }
     if SYSTEM_WAL_FOLD_RUNNING.swap(true, Ordering::AcqRel) {
         return Ok(false);
     }
+    SYSTEM_WAL_FOLD_READY.store(false, Ordering::Release);
     let result = maybe_fold_system_wal();
     SYSTEM_WAL_FOLD_RUNNING.store(false, Ordering::Release);
     result?;
-    Ok(true)
+    Ok(!SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire))
 }
 
 /// Coalesce CM-owned SYSTEM mutations independently of ordinary file snapshot dirtiness.
@@ -3282,11 +3298,17 @@ fn maybe_fold_system_wal() -> Result<(), u32> {
     if !unsafe { crate::writable_fs::writable_fs_mounted() }
         || crate::writable_fs::legacy_snapshot_writes_allowed()
     {
+        retire_system_wal_fold_demand();
         return Ok(());
     }
     let now = monotonic_time_100ns();
     let first_dirty = SYSTEM_WAL_FIRST_DIRTY_100NS.load(Ordering::Acquire);
-    if first_dirty == 0 || !crate::wal_fold_cadence::background_fold_due(
+    if first_dirty == 0 {
+        // No epoch exists to fold. Retire stale timer demand without publishing a fold ACK.
+        retire_system_wal_fold_demand();
+        return Ok(());
+    }
+    if !crate::wal_fold_cadence::background_fold_due(
         first_dirty, now,
         SYSTEM_WAL_USED_SECTORS.load(Ordering::Acquire),
         SYSTEM_WAL_CAPACITY_SECTORS.load(Ordering::Acquire),
@@ -3298,6 +3320,7 @@ fn maybe_fold_system_wal() -> Result<(), u32> {
     let result = unsafe { crate::writable_fs::fold_system_wal_if_dirty() };
     if result.is_ok() {
         SYSTEM_WAL_FOLD_DUE.store(false, Ordering::Release);
+        SYSTEM_WAL_FOLD_RETRY_100NS.store(0, Ordering::Release);
     } else if !crate::writable_fs::system_wal_fold_blocked() {
         SYSTEM_WAL_FOLD_RETRY_100NS.store(
             now.saturating_add(SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS), Ordering::Release,
