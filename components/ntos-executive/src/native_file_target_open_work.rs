@@ -139,6 +139,34 @@ unsafe fn abandon_one(work: &mut PendingNativeFileTargetOpen) {
     }
 }
 
+/// A torn-down caller must never receive a second Reply after cancellation was attempted.
+/// Keep an uncertain private Reply and its process reference quarantined; a hosted Reply
+/// may retire only after its cancellation receipt is acknowledged.
+unsafe fn settle_abandoned_reply(
+    handler: &mut ExecNtHandler,
+    work: &mut PendingNativeFileTargetOpen,
+) -> bool {
+    if work.reply != 0 {
+        if !spawn_hosts::shared_ingress::owner::runtime::owns_hosted_reply(work.reply) {
+            work.phase = Phase::Quarantined;
+            return false;
+        }
+        if !matches!(spawn_hosts::shared_ingress::owner::runtime::finish_acknowledged_hosted_reply(
+            work.reply), Ok(true))
+        {
+            work.phase = Phase::ReplyIndeterminate;
+            return false;
+        }
+        release_reply_pool_cap(work.reply);
+        work.reply = 0;
+    }
+    thread_wait_state_clear_badge_ready(handler, work.badge);
+    work.phase = if work.reference.release(&mut handler.pm).is_ok() {
+        Phase::Done
+    } else { Phase::Quarantined };
+    true
+}
+
 unsafe fn terminal(
     terminal: FileTargetOwnedTerminal,
 ) -> Phase {
@@ -158,6 +186,24 @@ unsafe fn poll_file_target_owned(
 
 unsafe fn step(handler: &mut ExecNtHandler, work: &mut PendingNativeFileTargetOpen) -> bool {
     let phase = core::mem::replace(&mut work.phase, Phase::Quarantined);
+    if work.abandoned {
+        match phase {
+            Phase::Submitted(pending) => {
+                // The entered Object Manager request still owns its exact request and response
+                // buffers until a terminal CQE. Teardown does not authorize replay or reuse.
+                if poll_file_target_owned(&pending).is_none() {
+                    work.phase = Phase::Submitted(pending);
+                    return false;
+                }
+            }
+            Phase::Quarantined | Phase::Done => {
+                work.phase = phase;
+                return false;
+            }
+            _ => {}
+        }
+        return settle_abandoned_reply(handler, work);
+    }
     match phase {
         Phase::Lookup => {
             if work.abandoned {
