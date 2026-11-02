@@ -37,6 +37,7 @@ TERMINAL_BOOT_STOP = re.compile(
     rb"|\[quiesce\] no boot milestone for ~[0-9]+s wall-clock -> run gate"
     rb"|\[cm-flush\] shutdown hive durability refused status=(?:0x){1,2}[0-9a-fA-F]{8}"
     rb"|\[provider-bugcheck\] terminal"
+    rb"|\[dbg\] err:\(base\\system\\winlogon\\winlogon\.c:[0-9]+\) WL: Failed to initialize Gina"
     rb")\r?\n"
 )
 PS_CREATE_FOLD_EVENT = re.compile(
@@ -204,6 +205,8 @@ class SerialTerminalDetector(SerialPanicDetector):
             return "quiesce"
         if record.startswith("[provider-bugcheck]"):
             return "provider-bugcheck"
+        if "WL: Failed to initialize Gina" in record:
+            return "gina-load-failed"
         return "durability-refused"
 
 

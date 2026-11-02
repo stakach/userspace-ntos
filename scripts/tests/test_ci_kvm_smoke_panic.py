@@ -116,6 +116,15 @@ class SerialTerminalDetectorTests(unittest.TestCase):
             )
             self.assertEqual(terminal_detector(log).poll(), "durability-refused")
 
+    def test_winlogon_gina_initialization_failure_is_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "serial.log"
+            log.write_bytes(
+                b"[dbg] err:(base\\system\\winlogon\\winlogon.c:538) "
+                b"WL: Failed to initialize Gina\n"
+            )
+            self.assertEqual(terminal_detector(log).poll(), "gina-load-failed")
+
     def test_partial_or_quoted_quiesce_is_not_terminal(self):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "serial.log"
