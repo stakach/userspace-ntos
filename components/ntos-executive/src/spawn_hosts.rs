@@ -4400,6 +4400,17 @@ unsafe fn component_pump_loop(
         } else if label == crate::driver_launch::FSD_SERVICE_DEVICE_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
+            static DEVICE_DEREFERENCE_TRACE: AtomicU64 = AtomicU64::new(0);
+            let trace = msg.m0 == crate::driver_launch::HOSTED_DEVICE_OP_DEREFERENCE_POINTER
+                && DEVICE_DEREFERENCE_TRACE.fetch_add(1, Ordering::Relaxed) < 16;
+            if trace {
+                crate::print_str(b"[device-dereference-request] reply="); crate::print_u64(*reply_cap);
+                crate::print_str(b" info=0x"); crate::print_hex_u64(msg.mi);
+                crate::print_str(b" object=0x"); crate::print_hex_u64(msg.m1);
+                crate::print_str(b" arg2=0x"); crate::print_hex_u64(msg.m2);
+                crate::print_str(b" arg3=0x"); crate::print_hex_u64(msg.m3);
+                crate::print_str(b"\n");
+            }
             let (status, required_len, transfer_token, chunk_len) =
                 if msg.mi != ((crate::driver_launch::FSD_SERVICE_DEVICE_LABEL << 12) | 4) {
                     (0xc000_000du32 as i32, 0, 0, 0)
@@ -4408,6 +4419,20 @@ unsafe fn component_pump_loop(
                         ch, msg.m0, msg.m1, msg.m2, msg.m3, *reply_cap, msg.badge,
                     )
                 };
+            if msg.m0 == crate::driver_launch::HOSTED_DEVICE_OP_DEREFERENCE_POINTER
+                && (trace || status != 0)
+            {
+                crate::print_str(b"[device-dereference-decision] reply="); crate::print_u64(*reply_cap);
+                crate::print_str(b" info=0x"); crate::print_hex_u64(msg.mi);
+                crate::print_str(b" object=0x"); crate::print_hex_u64(msg.m1);
+                crate::print_str(b" arg2=0x"); crate::print_hex_u64(msg.m2);
+                crate::print_str(b" arg3=0x"); crate::print_hex_u64(msg.m3);
+                crate::print_str(b" status=0x"); crate::print_hex_u64(status as u32 as u64);
+                crate::print_str(b" count=0x"); crate::print_hex_u64(required_len);
+                crate::print_str(b" spare=0x"); crate::print_hex_u64(transfer_token);
+                crate::print_str(b"/0x"); crate::print_hex_u64(chunk_len);
+                crate::print_str(b" reply-info=0x4\n");
+            }
             if msg.m0 == crate::driver_launch::HOSTED_DEVICE_OP_REPORT_POWER_STATE {
                 crate::driver_launch::trace_report_rpc(
                     b"service-return", *reply_cap, msg.badge, status, required_len,

@@ -6279,7 +6279,7 @@ const HOSTED_DEVICE_OP_CREATE_SYMBOLIC_LINK: u64 = 10;
 const HOSTED_DEVICE_OP_DELETE_SYMBOLIC_LINK: u64 = 11;
 const HOSTED_DEVICE_OP_SET_INTERFACE_STATE: u64 = 13;
 const HOSTED_DEVICE_OP_REFERENCE_POINTER: u64 = 14;
-const HOSTED_DEVICE_OP_DEREFERENCE_POINTER: u64 = 15;
+pub(crate) const HOSTED_DEVICE_OP_DEREFERENCE_POINTER: u64 = 15;
 const HOSTED_DEVICE_OP_REFERENCE_ATTACHED_TOP: u64 = 16;
 const HOSTED_DEVICE_OP_ATTACH_SAFE: u64 = 17;
 const HOSTED_DEVICE_OP_ROLLBACK_ATTACH_SAFE: u64 = 18;
@@ -17682,8 +17682,28 @@ unsafe fn consumer_device_object_in_local_pool(object: u64) -> bool {
 }
 
 unsafe fn hosted_device_pointer_count_mutation(object: u64, op: u64) -> u64 {
+    static DEREFERENCE_TRACE: AtomicU64 = AtomicU64::new(0);
+    let trace = op == HOSTED_DEVICE_OP_DEREFERENCE_POINTER
+        && DEREFERENCE_TRACE.fetch_add(1, Ordering::Relaxed) < 16;
+    if trace {
+        print_str(b"[device-dereference-call] object=0x"); print_hex64(object);
+        print_str(b" request-info=0x");
+        print_hex64((FSD_SERVICE_DEVICE_LABEL << 12) | 4);
+        print_str(b"\n");
+    }
     let (words, status, count, reserved0, reserved1) =
         call_on4_raw((FSD_SERVICE_DEVICE_LABEL << 12) | 4, op, object, 0, 0);
+    if op == HOSTED_DEVICE_OP_DEREFERENCE_POINTER
+        && (trace || words != 4 || reserved0 != 0 || reserved1 != 0 || status != 0)
+    {
+        print_str(b"[device-dereference-return] object=0x"); print_hex64(object);
+        print_str(b" reply-info=0x"); print_hex64(words);
+        print_str(b" status=0x"); print_hex64(status);
+        print_str(b" count=0x"); print_hex64(count);
+        print_str(b" reserved=0x"); print_hex64(reserved0);
+        print_str(b"/0x"); print_hex64(reserved1);
+        print_str(b"\n");
+    }
     if words != 4 || reserved0 != 0 || reserved1 != 0 {
         crate::provider_bugcheck::report(0xc4, [FSD_SERVICE_DEVICE_LABEL, op, words, status]);
     }
