@@ -57,6 +57,10 @@ SPEC_PASS = re.compile(rb" {0,2}PASS ([A-Za-z0-9_]+)")
 DIRECTORY_PUBLISH_REPLY = re.compile(
     rb"\[directory-publish\] token=([0-9]+) stage=reply status=(?:0x){1,2}0+"
 )
+HOSTED_PROCESS_ALLOCATED = re.compile(
+    rb"\[pm-dynamic\] allocated hosted process pi=[0-9]+ pid=([0-9]+) "
+    rb"parent=[0-9]+ image=([^ ]+) token=[0-9]+ inherited"
+)
 DESKTOP_SWITCH_PREFIX = b"[win32k-desktop-switch] pi/ret/"
 
 
@@ -102,6 +106,9 @@ class BootProgressWatchdog:
                 key = "PASS " + match.group(1).decode("ascii")
             elif match := DIRECTORY_PUBLISH_REPLY.fullmatch(line):
                 key = "directory-publish:" + match.group(1).decode("ascii")
+            elif match := HOSTED_PROCESS_ALLOCATED.fullmatch(line):
+                key = ("process:" + match.group(1).decode("ascii") + ":"
+                       + match.group(2).decode("ascii", "replace"))
             elif line.startswith(DESKTOP_SWITCH_PREFIX):
                 fields = line.partition(b"=")[2].split(b"/")
                 if len(fields) >= 3:

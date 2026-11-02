@@ -282,6 +282,17 @@ class BootProgressWatchdogTests(unittest.TestCase):
             ["directory-publish:2"],
         )
 
+    def test_new_hosted_process_is_progress_but_repeated_census_is_not(self):
+        watchdog = self.watchdog()
+        allocation = (
+            b"[pm-dynamic] allocated hosted process pi=18 pid=388 parent=100 "
+            b"image=diagdata.exe token=22 inherited\n"
+        )
+        self.assertEqual(watchdog.observe_serial(allocation, 170), ["process:388:diagdata.exe"])
+        self.assertEqual(watchdog.observe_serial(allocation, 200), [])
+        self.assertIsNone(watchdog.idle_reason(349))
+        self.assertIsNotNone(watchdog.idle_reason(350))
+
     def test_successful_win32k_desktop_switch_is_one_shot_milestone(self):
         watchdog = self.watchdog()
         switch = (
