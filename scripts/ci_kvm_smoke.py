@@ -46,6 +46,121 @@ PS_CREATE_FOLD_EVENT = re.compile(
 PS_CREATE_FOLD_LOOP = re.compile(
     rb"\[ps-create-after-autonomous\] #[0-9]+ stage=loop tcb=([0-9]+) route=([0-9]+)"
 )
+SETUP_PHASE_COMPLETE = re.compile(
+    rb"\[setup-provision\] phase=([a-z0-9-]+-end) detail=[0-9]+"
+)
+DRIVER_START_COMPLETE = re.compile(
+    rb"\[driver-launch\] demand StartDevice service=([^ ]+) devnode=(.+) status=0x0*0\s*$"
+)
+SPEC_PASS = re.compile(rb" {0,2}PASS ([A-Za-z0-9_]+)")
+DIRECTORY_PUBLISH_REPLY = re.compile(
+    rb"\[directory-publish\] token=([0-9]+) stage=reply status=(?:0x){1,2}0+"
+)
+DESKTOP_SWITCH_PREFIX = b"[win32k-desktop-switch] pi/ret/"
+
+
+class BootProgressWatchdog:
+    """Bound a boot by finite milestones and two real disk-I/O graces per epoch."""
+
+    def __init__(self, started, idle_seconds=180, max_disk_extensions=2):
+        self.idle_seconds = idle_seconds
+        self.max_disk_extensions = max_disk_extensions
+        self.last_progress = started
+        self.last_milestone = "startup"
+        self.armed = False
+        self.disk_extensions = 0
+        self.disk_bytes = None
+        self.disk_checkpoint = None
+        self.seen = set()
+        self.pending = b""
+
+    def observe_serial(self, chunk, now):
+        """Consume completed serial lines; repeated log messages are never progress."""
+        if not isinstance(chunk, bytes):
+            return []
+        records = self.pending + chunk
+        lines = records.split(b"\n")
+        self.pending = lines.pop()[-4096:]
+        milestones = []
+        for line in lines:
+            line = line.rstrip(b"\r")
+            if b"boot: reading Simpleboot memory map" in line and not self.armed:
+                self.armed = True
+                self.last_progress = now
+                self.last_milestone = "guest-started"
+                milestones.append("guest-started")
+            if not self.armed:
+                continue
+            key = None
+            if match := SETUP_PHASE_COMPLETE.fullmatch(line):
+                key = "setup-provision:" + match.group(1).decode("ascii")
+            elif match := DRIVER_START_COMPLETE.fullmatch(line):
+                key = ("driver-start:" + match.group(1).decode("ascii") + ":"
+                       + match.group(2).decode("ascii", "replace"))
+            elif match := SPEC_PASS.fullmatch(line):
+                key = "PASS " + match.group(1).decode("ascii")
+            elif match := DIRECTORY_PUBLISH_REPLY.fullmatch(line):
+                key = "directory-publish:" + match.group(1).decode("ascii")
+            elif line.startswith(DESKTOP_SWITCH_PREFIX):
+                fields = line.partition(b"=")[2].split(b"/")
+                if len(fields) >= 3:
+                    returned = fields[2]
+                    if returned.startswith(b"0x"):
+                        final_hex = returned.rpartition(b"0x")[2]
+                        if final_hex and all(byte in b"0123456789abcdefABCDEF" for byte in final_hex):
+                            if int(final_hex, 16) == 1:
+                                key = "win32k-desktop-switch"
+            if key is not None and key not in self.seen:
+                self.seen.add(key)
+                self.last_progress = now
+                self.last_milestone = key
+                self.disk_extensions = 0
+                self.disk_checkpoint = self.disk_bytes
+                milestones.append(key)
+        return milestones
+
+    def observe_blockstats(self, reply, now):
+        """Count completed bytes from the single named boot disk, with finite grace."""
+        if not self.armed or not isinstance(reply, dict):
+            return False
+        records = reply.get("return")
+        if not isinstance(records, list):
+            return False
+        boot_disks = [record for record in records if isinstance(record, dict)
+                      and record.get("device") == "bootdisk"]
+        if len(boot_disks) != 1:
+            return False
+        stats = boot_disks[0].get("stats")
+        if not isinstance(stats, dict):
+            return False
+        read_bytes, written_bytes = stats.get("rd_bytes"), stats.get("wr_bytes")
+        if (not isinstance(read_bytes, int) or isinstance(read_bytes, bool) or read_bytes < 0
+                or not isinstance(written_bytes, int) or isinstance(written_bytes, bool)
+                or written_bytes < 0):
+            return False
+        total = read_bytes + written_bytes
+        previous = self.disk_bytes
+        if previous is not None and total < previous:
+            return False
+        self.disk_bytes = total
+        if previous is None or self.disk_checkpoint is None:
+            self.disk_checkpoint = total
+            return False
+        if (now - self.last_progress < self.idle_seconds
+                or total <= self.disk_checkpoint
+                or self.disk_extensions >= self.max_disk_extensions):
+            return False
+        self.disk_extensions += 1
+        self.disk_checkpoint = total
+        self.last_progress = now
+        self.last_milestone = f"bootdisk completed bytes={total}"
+        return True
+
+    def idle_reason(self, now):
+        if not self.armed or now - self.last_progress < self.idle_seconds:
+            return None
+        return (f"no boot milestone or bounded disk work for {now - self.last_progress:.0f}s; "
+                f"last={self.last_milestone}, bootdisk_bytes={self.disk_bytes}")
 
 
 class SerialPanicDetector:
@@ -262,6 +377,21 @@ def read_cpu_state():
     return state
 
 
+def read_bootdisk_blockstats():
+    """Read completed I/O counters without changing guest execution."""
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.settimeout(3)
+        connection.connect(str(QMP_SOCKET))
+        with connection.makefile("rwb", buffering=0) as stream:
+            greeting = json.loads(stream.readline())
+            if "QMP" not in greeting:
+                raise RuntimeError("QMP greeting missing")
+            stream.write(b'{"execute":"qmp_capabilities","id":"capabilities"}\n')
+            qmp_reply(stream, "capabilities")
+            stream.write(b'{"execute":"query-blockstats","id":"blockstats"}\n')
+            return qmp_reply(stream, "blockstats")
+
+
 def parse_proc_stat(stat):
     """Return process-group identity, CPU ticks, and RSS pages from /proc/PID/stat."""
     # comm is parenthesized and may itself contain spaces or closing parentheses.
@@ -434,6 +564,8 @@ def main():
         started = time.monotonic()
         deadline = started + args.seconds
         next_capture = started + 10
+        next_blockstats = started + 10
+        progress_offset = 0
         cpu_sample_index = 0
         next_cpu_sample = started + cpu_sample_delay(cpu_sample_index)
         captured = False
@@ -441,6 +573,7 @@ def main():
         volume_dispatch_captured = False
         panic_detector = SerialPanicDetector(LOG)
         terminal_detector = SerialTerminalDetector(LOG)
+        progress_watchdog = BootProgressWatchdog(started)
         panic_site = None
         terminal_reason = None
         stationary_reason = None
@@ -489,6 +622,29 @@ def main():
                     capture_terminal_evidence(terminal_reason)
                     break
                 if process.poll() is not None:
+                    break
+                with LOG.open("rb") as serial_stream:
+                    serial_stream.seek(progress_offset)
+                    while chunk := serial_stream.read(65536):
+                        progress_offset += len(chunk)
+                        for milestone in progress_watchdog.observe_serial(chunk, time.monotonic()):
+                            print(f"Boot progress {time.monotonic() - started:.0f}s: {milestone}",
+                                  flush=True)
+                if time.monotonic() >= next_blockstats and QMP_SOCKET.exists():
+                    try:
+                        blockstats = read_bootdisk_blockstats()
+                    except (OSError, RuntimeError, ValueError, KeyError):
+                        blockstats = None
+                    if progress_watchdog.observe_blockstats(blockstats, time.monotonic()):
+                        print(f"Boot progress {time.monotonic() - started:.0f}s: "
+                              f"{progress_watchdog.last_milestone}", flush=True)
+                    next_blockstats = time.monotonic() + 10
+                idle_reason = progress_watchdog.idle_reason(time.monotonic())
+                if idle_reason:
+                    stationary_reason = idle_reason
+                    STATIONARY_MARKER.write_text(stationary_reason + "\n")
+                    print(f"Guest stationary: {stationary_reason}; stopping bounded boot", flush=True)
+                    capture_terminal_evidence("stationary")
                     break
                 if (not stall_captured and time.monotonic() >= deadline - 45
                         and QMP_SOCKET.exists()):

@@ -127,5 +127,167 @@ class SerialTerminalDetectorTests(unittest.TestCase):
             self.assertIsNone(terminal_detector(log).poll())
 
 
+class BootProgressWatchdogTests(unittest.TestCase):
+    """Only finite boot milestones and bounded completed disk I/O buy more time."""
+
+    @staticmethod
+    def watchdog():
+        watchdog = smoke.BootProgressWatchdog(
+            started=0, idle_seconds=180, max_disk_extensions=2
+        )
+        watchdog.observe_serial(b"boot: reading Simpleboot memory map\n", 0)
+        return watchdog
+
+    @staticmethod
+    def blockstats(read_bytes, written_bytes, *, device="bootdisk"):
+        return {"return": [{
+            "device": device,
+            "stats": {"rd_bytes": read_bytes, "wr_bytes": written_bytes},
+        }]}
+
+    def test_duplicate_milestone_and_serial_chatter_do_not_reset_idle_clock(self):
+        watchdog = self.watchdog()
+        self.assertEqual(
+            watchdog.observe_serial(b"[setup-provision] phase=network-end detail=0\n", 10),
+            ["setup-provision:network-end"],
+        )
+        for at in (40, 100, 179, 189):
+            self.assertEqual(
+                watchdog.observe_serial(
+                    b"[setup-provision] phase=network-end detail=0\n"
+                    b"[hosted-irq] serviced event=3 claimed=1\n"
+                    b"[registry-interface-retry] id=28 count=4 phase=durable\n",
+                    at,
+                ),
+                [],
+            )
+        self.assertIsNone(watchdog.idle_reason(189))
+        self.assertIsNotNone(watchdog.idle_reason(190))
+
+    def test_distinct_completed_milestone_resets_180_second_window(self):
+        watchdog = self.watchdog()
+        self.assertEqual(
+            watchdog.observe_serial(b"[setup-provision] phase=network-end detail=0\n", 20),
+            ["setup-provision:network-end"],
+        )
+        self.assertEqual(
+            watchdog.observe_serial(b"[setup-provision] phase=print-end detail=0\n", 170),
+            ["setup-provision:print-end"],
+        )
+        self.assertIsNone(watchdog.idle_reason(349))
+        self.assertIsNotNone(watchdog.idle_reason(350))
+
+    def test_completed_bootdisk_bytes_allow_only_two_bounded_extensions(self):
+        watchdog = self.watchdog()
+        self.assertFalse(watchdog.observe_blockstats(self.blockstats(0, 0), 0))
+        self.assertTrue(watchdog.observe_blockstats(self.blockstats(4096, 0), 180))
+        self.assertIsNone(watchdog.idle_reason(359))
+        self.assertTrue(watchdog.observe_blockstats(self.blockstats(8192, 0), 360))
+        self.assertIsNone(watchdog.idle_reason(539))
+        self.assertFalse(watchdog.observe_blockstats(self.blockstats(12288, 0), 540))
+        self.assertIsNotNone(watchdog.idle_reason(540))
+
+    def test_frequent_early_disk_polls_do_not_spend_grace_before_idle_window(self):
+        watchdog = self.watchdog()
+        self.assertFalse(watchdog.observe_blockstats(self.blockstats(0, 0), 0))
+        for at in range(10, 180, 10):
+            self.assertFalse(
+                watchdog.observe_blockstats(self.blockstats(at * 4096, 0), at),
+                f"bootdisk bytes at {at}s are real but the milestone is not yet idle",
+            )
+        self.assertIsNone(watchdog.idle_reason(179))
+        self.assertTrue(watchdog.observe_blockstats(self.blockstats(180 * 4096, 0), 180))
+        for at in range(190, 360, 10):
+            self.assertFalse(watchdog.observe_blockstats(self.blockstats(at * 4096, 0), at))
+        self.assertTrue(watchdog.observe_blockstats(self.blockstats(360 * 4096, 0), 360))
+        for at in range(370, 540, 10):
+            self.assertFalse(watchdog.observe_blockstats(self.blockstats(at * 4096, 0), at))
+        self.assertFalse(watchdog.observe_blockstats(self.blockstats(540 * 4096, 0), 540))
+        self.assertIsNotNone(watchdog.idle_reason(540))
+
+    def test_missing_or_ambiguous_bootdisk_statistics_are_not_progress(self):
+        watchdog = self.watchdog()
+        self.assertFalse(watchdog.observe_blockstats(self.blockstats(4096, 0, device="pflash0"), 90))
+        self.assertFalse(watchdog.observe_blockstats({"return": []}, 100))
+        self.assertFalse(watchdog.observe_blockstats({"error": "QMP disconnected"}, 110))
+        ambiguous = {"return": [
+            self.blockstats(4096, 0)["return"][0],
+            self.blockstats(8192, 0)["return"][0],
+        ]}
+        self.assertFalse(watchdog.observe_blockstats(ambiguous, 120))
+        self.assertIsNotNone(watchdog.idle_reason(180))
+
+    def test_split_serial_milestone_is_counted_once_when_line_completes(self):
+        watchdog = self.watchdog()
+        self.assertEqual(watchdog.observe_serial(b"[setup-provision] phase=profile-shell-", 100), [])
+        self.assertEqual(watchdog.observe_serial(b"end detail=0\r", 110), [])
+        self.assertEqual(
+            watchdog.observe_serial(b"\n", 120),
+            ["setup-provision:profile-shell-end"],
+        )
+        self.assertEqual(
+            watchdog.observe_serial(b"[setup-provision] phase=profile-shell-end detail=0\n", 130),
+            [],
+        )
+        self.assertIsNone(watchdog.idle_reason(299))
+        self.assertIsNotNone(watchdog.idle_reason(300))
+
+    def test_no_progress_for_180_seconds_is_a_stop_even_with_serial_output(self):
+        watchdog = self.watchdog()
+        for at in (30, 60, 90, 120, 150):
+            watchdog.observe_serial(b"[hosted-irq] serviced event=3 claimed=1\n", at)
+        self.assertIsNone(watchdog.idle_reason(179))
+        self.assertIsNotNone(watchdog.idle_reason(180))
+
+    def test_real_indented_pass_records_are_unique_milestones(self):
+        watchdog = self.watchdog()
+        self.assertEqual(watchdog.observe_serial(b"  PASS exec_ob_ping\n", 30), ["PASS exec_ob_ping"])
+        self.assertEqual(watchdog.observe_serial(b"  PASS exec_ob_ping\n", 60), [])
+        self.assertEqual(
+            watchdog.observe_serial(b"  PASS exec_ob_create_directory\n", 170),
+            ["PASS exec_ob_create_directory"],
+        )
+        self.assertIsNone(watchdog.idle_reason(349))
+        self.assertIsNotNone(watchdog.idle_reason(350))
+
+    def test_directory_publication_counts_only_successful_reply_for_new_token(self):
+        watchdog = self.watchdog()
+        self.assertEqual(
+            watchdog.observe_serial(b"[directory-publish] token=1 stage=poll status=0x0000000000000000\n", 10),
+            [],
+        )
+        self.assertEqual(
+            watchdog.observe_serial(b"[directory-publish] token=1 stage=reply status=0x0000000000000000\n", 20),
+            ["directory-publish:1"],
+        )
+        self.assertEqual(
+            watchdog.observe_serial(b"[directory-publish] token=1 stage=reply status=0x0000000000000000\n", 60),
+            [],
+        )
+        self.assertEqual(
+            watchdog.observe_serial(b"[directory-publish] token=2 stage=reply status=0xc000000d\n", 90),
+            [],
+        )
+        self.assertEqual(
+            watchdog.observe_serial(b"[directory-publish] token=2 stage=reply status=0x0000000000000000\n", 170),
+            ["directory-publish:2"],
+        )
+
+    def test_successful_win32k_desktop_switch_is_one_shot_milestone(self):
+        watchdog = self.watchdog()
+        switch = (
+            b"[win32k-desktop-switch] pi/ret/target/active/info/wnd/hwnd/style/resolved="
+            b"/0x000000000x00000008/0x000000000x00000001/0x000001000x0a09b370"
+            b"/0x000001000x0a09b370/0x000001000x07802730/0x000001000x078028b0"
+            b"/0x000000000x00020026/0x000000000x96000000/0x000001000x078028b0\n"
+        )
+        self.assertEqual(
+            watchdog.observe_serial(switch, 90), ["win32k-desktop-switch"]
+        )
+        self.assertEqual(watchdog.observe_serial(switch, 170), [])
+        self.assertIsNone(watchdog.idle_reason(269))
+        self.assertIsNotNone(watchdog.idle_reason(270))
+
+
 if __name__ == "__main__":
     unittest.main()
