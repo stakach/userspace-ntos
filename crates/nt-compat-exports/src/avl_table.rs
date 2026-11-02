@@ -59,14 +59,31 @@ impl BalancedLinks {
     }
 }
 
+// Released x64 drivers pass Microsoft-ABI callbacks even when the kernel is
+// built for a non-Windows x86_64 target. Other hosts use their native ABI so
+// the pure table tests can run there too.
 /// `RTL_AVL_TABLE` compare callback.
+#[cfg(target_arch = "x86_64")]
+pub type CompareRoutine =
+    unsafe extern "win64" fn(*mut RtlAvlTable, *mut c_void, *mut c_void) -> u32;
+#[cfg(not(target_arch = "x86_64"))]
 pub type CompareRoutine =
     unsafe extern "system" fn(*mut RtlAvlTable, *mut c_void, *mut c_void) -> u32;
 /// `RTL_AVL_TABLE` allocate callback.
+#[cfg(target_arch = "x86_64")]
+pub type AllocateRoutine = unsafe extern "win64" fn(*mut RtlAvlTable, u32) -> *mut c_void;
+#[cfg(not(target_arch = "x86_64"))]
 pub type AllocateRoutine = unsafe extern "system" fn(*mut RtlAvlTable, u32) -> *mut c_void;
 /// `RTL_AVL_TABLE` free callback.
+#[cfg(target_arch = "x86_64")]
+pub type FreeRoutine = unsafe extern "win64" fn(*mut RtlAvlTable, *mut c_void);
+#[cfg(not(target_arch = "x86_64"))]
 pub type FreeRoutine = unsafe extern "system" fn(*mut RtlAvlTable, *mut c_void);
 /// `RTL_AVL_MATCH_FUNCTION`.
+#[cfg(target_arch = "x86_64")]
+pub type MatchRoutine =
+    unsafe extern "win64" fn(*mut RtlAvlTable, *mut c_void, *mut c_void) -> u32;
+#[cfg(not(target_arch = "x86_64"))]
 pub type MatchRoutine =
     unsafe extern "system" fn(*mut RtlAvlTable, *mut c_void, *mut c_void) -> u32;
 
@@ -935,13 +952,22 @@ mod tests {
     use core::alloc::Layout;
     use std::alloc::{alloc, dealloc};
 
+    macro_rules! avl_callback {
+        (unsafe fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)? $body:block) => {
+            #[cfg(target_arch = "x86_64")]
+            unsafe extern "win64" fn $name($($arg: $ty),*) $(-> $ret)? $body
+            #[cfg(not(target_arch = "x86_64"))]
+            unsafe extern "system" fn $name($($arg: $ty),*) $(-> $ret)? $body
+        };
+    }
+
     #[derive(Default)]
     struct AllocationCounts {
         allocated: usize,
         freed: usize,
     }
 
-    unsafe extern "system" fn counted_allocate(
+    avl_callback! { unsafe fn counted_allocate(
         table: *mut RtlAvlTable,
         byte_size: u32,
     ) -> *mut c_void {
@@ -949,14 +975,14 @@ mod tests {
         counts.allocated += 1;
         let layout = Layout::from_size_align(byte_size as usize, 8).unwrap();
         unsafe { alloc(layout) as *mut c_void }
-    }
+    } }
 
-    unsafe extern "system" fn counted_free(table: *mut RtlAvlTable, buffer: *mut c_void) {
+    avl_callback! { unsafe fn counted_free(table: *mut RtlAvlTable, buffer: *mut c_void) {
         let counts = unsafe { &mut *((*table).table_context as *mut AllocationCounts) };
         counts.freed += 1;
         let layout = Layout::from_size_align(TABLE_ENTRY_USER_DATA_OFFSET + 4, 8).unwrap();
         unsafe { dealloc(buffer as *mut u8, layout) };
-    }
+    } }
 
     unsafe fn assert_avl_subtree(node: *mut BalancedLinks, parent: *mut BalancedLinks) -> u32 {
         if node.is_null() {
@@ -1033,7 +1059,7 @@ mod tests {
         }
     }
 
-    unsafe extern "system" fn compare_i32(
+    avl_callback! { unsafe fn compare_i32(
         _table: *mut RtlAvlTable,
         first: *mut c_void,
         second: *mut c_void,
@@ -1048,19 +1074,19 @@ mod tests {
         } else {
             GENERIC_EQUAL
         }
-    }
+    } }
 
-    unsafe extern "system" fn allocate_node(
+    avl_callback! { unsafe fn allocate_node(
         _table: *mut RtlAvlTable,
         byte_size: u32,
     ) -> *mut c_void {
         let layout = Layout::from_size_align(byte_size as usize, 8).unwrap();
         unsafe { alloc(layout) as *mut c_void }
-    }
+    } }
 
-    unsafe extern "system" fn free_node(_table: *mut RtlAvlTable, _buffer: *mut c_void) {
+    avl_callback! { unsafe fn free_node(_table: *mut RtlAvlTable, _buffer: *mut c_void) {
         // The tests leak these tiny allocations; production callers provide the matching free.
-    }
+    } }
 
     unsafe fn initialize_test_table(table: *mut RtlAvlTable) {
         unsafe {
@@ -1237,7 +1263,7 @@ mod tests {
         }
     }
 
-    unsafe extern "system" fn even_match(
+    avl_callback! { unsafe fn even_match(
         _table: *mut RtlAvlTable,
         user_data: *mut c_void,
         _match_data: *mut c_void,
@@ -1248,7 +1274,7 @@ mod tests {
         } else {
             STATUS_NO_MATCH
         }
-    }
+    } }
 
     #[test]
     fn like_a_directory_filters_and_recovers_after_delete() {

@@ -9,7 +9,16 @@ use nt_compat_exports::avl_table::{
     GENERIC_EQUAL, GENERIC_GREATER_THAN, GENERIC_LESS_THAN,
 };
 
-unsafe extern "system" fn compare(
+macro_rules! avl_callback {
+    (unsafe fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)? $body:block) => {
+        #[cfg(target_arch = "x86_64")]
+        unsafe extern "win64" fn $name($($arg: $ty),*) $(-> $ret)? $body
+        #[cfg(not(target_arch = "x86_64"))]
+        unsafe extern "system" fn $name($($arg: $ty),*) $(-> $ret)? $body
+    };
+}
+
+avl_callback! { unsafe fn compare(
     _table: *mut RtlAvlTable,
     left: *mut c_void,
     right: *mut c_void,
@@ -22,16 +31,16 @@ unsafe extern "system" fn compare(
     } else {
         GENERIC_EQUAL
     }
-}
+} }
 
-unsafe extern "system" fn allocate(_table: *mut RtlAvlTable, bytes: u32) -> *mut c_void {
+avl_callback! { unsafe fn allocate(_table: *mut RtlAvlTable, bytes: u32) -> *mut c_void {
     let layout = std::alloc::Layout::from_size_align(bytes as usize, 8).unwrap();
     unsafe { std::alloc::alloc(layout) as *mut c_void }
-}
+} }
 
-unsafe extern "system" fn free(_table: *mut RtlAvlTable, _node: *mut c_void) {
+avl_callback! { unsafe fn free(_table: *mut RtlAvlTable, _node: *mut c_void) {
     // The small test allocation is intentionally retained because the RTL callback has no size.
-}
+} }
 
 #[test]
 fn four_libernt_avl_imports_share_one_ordered_table() {
