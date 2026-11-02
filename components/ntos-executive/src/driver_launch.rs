@@ -59037,6 +59037,31 @@ pub(crate) unsafe fn win32k_pdo_instance_path(
     Ok(path)
 }
 
+fn trace_hosted_pointer_service(
+    op: u64,
+    object: u64,
+    registration: Option<nt_io_manager::HostedDevicePointerRegistration>,
+    callers_observed: Option<u64>,
+    status: u32,
+    reason: &[u8],
+) {
+    static TRACES: AtomicU64 = AtomicU64::new(0);
+    if TRACES.fetch_add(1, Ordering::Relaxed) >= 16 && status == 0 { return; }
+    print_str(b"[hosted-pointer-service] op="); print_u64(op);
+    print_str(b" object=0x"); print_hex64(object);
+    if let Some(registration) = registration {
+        print_str(b" device="); print_u64(registration.device_id().raw());
+        print_str(b" generation="); print_u64(registration.generation());
+        print_str(b" domain="); print_u64(registration.domain().domain_id.raw());
+        print_str(b"/"); print_u64(registration.domain().cookie);
+    }
+    if let Some(callers) = callers_observed {
+        print_str(b" callers-observed="); print_u64(callers);
+    }
+    print_str(b" status=0x"); print_hex64(status as u64);
+    print_str(b" reason="); print_str(reason); print_str(b"\n");
+}
+
 pub(crate) fn service_hosted_device(
     ch: &crate::spawn_hosts::PumpChannel,
     op: u64,
@@ -59172,23 +59197,38 @@ pub(crate) fn service_hosted_device(
     }
     if op == HOSTED_DEVICE_OP_REFERENCE_ATTACHED_TOP {
         if arg2 != 0 || arg3 != 0 {
+            trace_hosted_pointer_service(op, pdo_object, None, None,
+                STATUS_INVALID_PARAMETER as u32, b"reserved-arguments");
             return (STATUS_INVALID_PARAMETER, 0, 0, 0);
         }
         let (_, inst, _) = match authenticated_hosted_device(ch, pdo_object, active_reply_cap) {
             Ok(identity) => identity,
-            Err(status) => return (status.raw(), 0, 0, 0),
+            Err(status) => {
+                trace_hosted_pointer_service(op, pdo_object, None, None,
+                    status.raw() as u32, b"authentication");
+                return (status.raw(), 0, 0, 0);
+            }
         };
         let domain = HostedDomainIdentity {
             domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
             cookie: inst.hosted_domain_cookie,
         };
+        let input = io_manager_mut().hosted_device_pointer_registration(domain, pdo_object);
         return match unsafe {
             io_manager_mut().reference_hosted_attached_device(domain, pdo_object)
         } {
             Ok(top) => {
+                let registration = io_manager_mut().hosted_device_pointer_registration(domain, top);
+                let callers = registration.and_then(|registration|
+                    io_manager_mut().hosted_device_pointer_count(registration).ok());
+                trace_hosted_pointer_service(op, top, registration, callers, 0, b"attached-top");
                 (STATUS_SUCCESS, top, 0, 0)
             }
             Err(status) => {
+                trace_hosted_pointer_service(op, pdo_object, input, None,
+                    status.raw() as u32,
+                    if input.is_some() { b"top-or-reference-refused" }
+                    else { b"registration-missing" });
                 (status.raw(), 0, 0, 0)
             }
         };
@@ -59276,12 +59316,18 @@ pub(crate) fn service_hosted_device(
     }
     if op == HOSTED_DEVICE_OP_REFERENCE_POINTER || op == HOSTED_DEVICE_OP_DEREFERENCE_POINTER {
         if arg2 != 0 || arg3 != 0 {
+            trace_hosted_pointer_service(op, pdo_object, None, None,
+                STATUS_INVALID_PARAMETER as u32, b"reserved-arguments");
             return (STATUS_INVALID_PARAMETER, 0, 0, 0);
         }
         let (_, inst, device_id) =
             match authenticated_hosted_device(ch, pdo_object, active_reply_cap) {
                 Ok(identity) => identity,
-                Err(status) => return (status.raw(), 0, 0, 0),
+                Err(status) => {
+                    trace_hosted_pointer_service(op, pdo_object, None, None,
+                        status.raw() as u32, b"authentication");
+                    return (status.raw(), 0, 0, 0);
+                }
             };
         let domain = HostedDomainIdentity {
             domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
@@ -59289,13 +59335,26 @@ pub(crate) fn service_hosted_device(
         };
         let registration = match hosted_device_pointer_registration(domain, pdo_object, device_id) {
             Ok(registration) => registration,
-            Err(status) => return (status.raw(), 0, 0, 0),
+            Err(status) => {
+                trace_hosted_pointer_service(op, pdo_object, None, None,
+                    status.raw() as u32, b"registration-missing");
+                return (status.raw(), 0, 0, 0);
+            }
         };
+        let before = io_manager_mut().hosted_device_pointer_count(registration);
         let result = if op == HOSTED_DEVICE_OP_REFERENCE_POINTER {
             io_manager_mut().reference_hosted_device_pointer(registration)
         } else {
             io_manager_mut().dereference_hosted_device_pointer(registration)
         };
+        let status = result.as_ref().err().map_or(0, |status| status.raw() as u32);
+        let reason: &[u8] = if status == 0 { b"complete" }
+            else if before.is_err() { b"stale-registration" }
+            else if op == HOSTED_DEVICE_OP_DEREFERENCE_POINTER && before == Ok(0) {
+                b"missing-caller-reference"
+            } else { b"mutation-refused" };
+        trace_hosted_pointer_service(op, pdo_object, Some(registration),
+            before.ok(), status, reason);
         return match result {
             Ok(_) => (
                 STATUS_SUCCESS,
