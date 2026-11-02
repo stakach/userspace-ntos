@@ -154,8 +154,11 @@ pub(crate) unsafe fn submit_routed_process_image(
     if index.is_none() { rows.try_reserve(1).map_err(|_| RESOURCES)?; }
     let view = handler.image_sections.reference_view(id)
         .map_err(crate::exec_handler::image_section_create::map_image_error)?;
+    // NtCreateProcessEx already admitted PROCESS_CREATE_PROCESS on this handle before
+    // submission. Pin the same live Process object without rechecking a pseudo-handle's
+    // unpublished grant; the exact PID and body are checked below before any File read.
     let mut parent = match handler.pm.reference_native_ps_handle(caller, parent_handle,
-        Some(PsHandleType::Process), nt_process::PROCESS_CREATE_PROCESS)
+        Some(PsHandleType::Process), 0)
     {
         Ok(parent) => parent,
         Err(status) => {

@@ -123,6 +123,64 @@ fn routed_process_snapshot_retains_pending_file_reads_before_process_publication
 }
 
 #[test]
+fn routed_process_parent_is_pinned_after_one_access_admission() {
+    use nt_process::{native_handle::{PsHandleType, STATUS_NOT_SUPPORTED}, HandleObject,
+        ProcessManager, PROCESS_CREATE_PROCESS, STATUS_ACCESS_DENIED};
+    use nt_types::AccessMode;
+
+    let mut pm = ProcessManager::new();
+    let system_pid = pm.create_process("kernel", None, None);
+    let system_tid = pm.create_thread(system_pid, 0, 0, true).unwrap();
+    pm.designate_initial_system(system_pid, system_tid).unwrap();
+    assert!(pm.publish_process_kernel_object(system_pid, 0x1000));
+    assert!(pm.publish_thread_kernel_object(system_tid, 0x2000));
+    let pid = pm.create_process("smss", None, None);
+    let tid = pm.create_thread(pid, 0, 0, false).unwrap();
+    assert!(pm.publish_process_kernel_object(pid, 0x3000));
+    assert!(pm.publish_thread_kernel_object(tid, 0x4000));
+    let caller = pm.capture_native_handle_caller(
+        pm.thread_lifetime(tid).unwrap(), AccessMode::UserMode).unwrap();
+    assert_eq!(pm.resolve_process_handle(pid, u64::MAX, PROCESS_CREATE_PROCESS), Ok(pid));
+    assert_eq!(pm.reference_native_ps_handle(caller, u64::MAX,
+        Some(PsHandleType::Process), PROCESS_CREATE_PROCESS).unwrap_err(), STATUS_NOT_SUPPORTED,
+        "a second pseudo-handle grant check rejects the already admitted parent");
+    let denied = pm.insert_handle(pid, HandleObject::Process(pid), 0).unwrap();
+    assert_eq!(pm.resolve_process_handle(pid, u64::from(denied), PROCESS_CREATE_PROCESS),
+        Err(STATUS_ACCESS_DENIED), "an ordinary handle still needs the first access admission");
+    let mut parent = pm.reference_native_ps_handle(caller, u64::MAX,
+        Some(PsHandleType::Process), 0).unwrap();
+    assert_eq!(parent.object(), HandleObject::Process(pid));
+    assert_eq!(Some(parent.body()), pm.process_kernel_object(pid));
+    parent.release(&mut pm).unwrap();
+
+    let ingress = audit(&body(&source("exec_handler.rs"), "nt_create_process_service"));
+    assert!(ingress.calls.iter().position(|name| name == "resolve_process_handle")
+        .expect("parent Process access admission")
+        < ingress.calls.iter().position(|name| name == "submit_routed_process_image")
+            .expect("retained routed image admission"),
+        "parent access must be admitted before the retained snapshot owner enters");
+    let worker = source("process_image_snapshot_work.rs");
+    let source_text = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../components/ntos-executive/src/process_image_snapshot_work.rs")).unwrap();
+    assert!(source_text.contains("parent.object() != nt_process::HandleObject::Process(parent_pid)")
+        && source_text.contains("process_kernel_object(parent_pid) != Some(parent.body())"),
+        "the captured parent must still match both admitted Process identity and physical body");
+    struct ParentReference(Option<syn::ExprMethodCall>);
+    impl<'ast> Visit<'ast> for ParentReference {
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "reference_native_ps_handle" { self.0 = Some(call.clone()); }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+    let mut reference = ParentReference(None);
+    reference.visit_block(&body(&worker, "submit_routed_process_image"));
+    let reference = reference.0.expect("retained exact parent Process reference");
+    assert!(matches!(reference.args.last(), Some(Expr::Lit(lit))
+        if matches!(&lit.lit, syn::Lit::Int(value) if value.base10_parse::<u32>().ok() == Some(0))),
+        "once parent access was admitted, pin its exact object with zero additional access");
+}
+
+#[test]
 fn failed_dynamic_process_admission_never_binds_an_older_pi_occupant() {
     let source = source("exec_image_process_create.rs");
     let reserve = audit(&body(&source, "reserve_native_image_process_with_bytes"));
