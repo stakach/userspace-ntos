@@ -16,7 +16,31 @@ fn process_owner_captures_section_file_and_registered_alias_before_runtime_publi
     let published = BRIDGE.find("register_hosted_process_runtime_for_image(image)").unwrap();
     assert!(section < alias && alias < captured && captured < published);
     assert!(BRIDGE.contains("image, section_file, registered_file, observation_target"));
-    assert!(BRIDGE.contains("target, pid: None, view, source, mechanism_retired: false"));
+    let initializer = source.items.iter().filter_map(|item| match item {
+        syn::Item::Impl(value) => Some(&value.items), _ => None,
+    }).flatten().find_map(|item| match item {
+        syn::ImplItem::Fn(value) if value.sig.ident == "reserve_native_image_process_with_bytes" => Some(value),
+        _ => None,
+    }).expect("exact image process publisher");
+    struct OwnerInit(bool);
+    impl<'ast> syn::visit::Visit<'ast> for OwnerInit {
+        fn visit_expr_struct(&mut self, value: &'ast syn::ExprStruct) {
+            if value.path.is_ident("ProcessImageOwner") {
+                let field = |name: &str| value.fields.iter().find(|field|
+                    matches!(&field.member, syn::Member::Named(member) if member == name));
+                self.0 = ["target", "view", "source"].iter().all(|name| field(name).is_some())
+                    && field("pid").is_some_and(|field|
+                        matches!(&field.expr, syn::Expr::Path(path) if path.path.is_ident("None")))
+                    && field("mechanism_retired").is_some_and(|field|
+                        matches!(&field.expr, syn::Expr::Lit(lit)
+                            if matches!(&lit.lit, syn::Lit::Bool(value) if !value.value)));
+            }
+            syn::visit::visit_expr_struct(self, value);
+        }
+    }
+    let mut retained = OwnerInit(false);
+    syn::visit::Visit::visit_block(&mut retained, &initializer.block);
+    assert!(retained.0, "exact target, Section view and captured source must remain owned together");
 }
 
 #[test]
