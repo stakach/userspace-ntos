@@ -19,6 +19,42 @@ static SYNC_FAT_HANDOFF_TRACE_N: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 
 // Diagnostic only: one bounded trace of the failed DLL opens across the
 // namespace decision and the canonical File CREATE result.
 static WINLOGON_OPEN_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static WINLOGON_OPEN_EARLY_BUSY_TRACE_N: AtomicU64 = AtomicU64::new(0);
+
+fn trace_winlogon_open_early_busy(stage: &[u8], pi: usize, tid: u64,
+    root_handle: u64, status: u32, name: &[u16]) {
+    if status != 0x8000_0011 || WINLOGON_OPEN_EARLY_BUSY_TRACE_N.load(Ordering::Relaxed) >= 8 {
+        return;
+    }
+    if ![b"msgina.dll" as &[u8], b"sfc.dll"].iter().any(|suffix| {
+        name.len() >= suffix.len() && name[name.len() - suffix.len()..].iter().zip(*suffix)
+            .all(|(&unit, &byte)| unit <= 0x7f && (unit as u8).eq_ignore_ascii_case(&byte))
+    }) {
+        return;
+    }
+    if WINLOGON_OPEN_EARLY_BUSY_TRACE_N.fetch_add(1, Ordering::Relaxed) >= 8 { return; }
+    print_str(b"[winlogon-open-early-busy] stage=");
+    print_str(stage);
+    print_str(b" pi/tid=");
+    print_u64(pi as u64);
+    print_str(b"/");
+    print_u64(tid);
+    print_str(b" root-handle=");
+    print_u64(root_handle);
+    print_str(b" route=");
+    print_str(match unsafe { crate::fs_loader::exec_fs_mount_identity() }
+        .and_then(crate::fs_loader::exec_block_route_kind) {
+        Some(nt_fs::BlockSourceKind::Boot) => b"boot",
+        Some(nt_fs::BlockSourceKind::Draining) => b"draining",
+        Some(nt_fs::BlockSourceKind::Native) => b"native",
+        None => b"none",
+    });
+    print_str(b" journal-owned=");
+    print_u64(crate::writable_fs::registry_journal::owns_volume() as u64);
+    print_str(b" name=\"");
+    print_sanitized_utf16_ascii(name, 160);
+    print_str(b"\"\n");
+}
 
 fn trace_winlogon_open(
     stage: &[u8], pi: usize, tid: u64, root: FileParseRoot,
@@ -31766,6 +31802,16 @@ impl NativeSyscallHandler for ExecNtHandler {
         });
         let io_started = io_call.map(|_| crate::disk_census_ticks());
         let status = self.handle_service(ctx, args, out);
+        if status == 0x8000_0011 && ctx.service == NativeService::NtOpenFile {
+            static OPEN_BUSY_RETURN_TRACE_N: AtomicU64 = AtomicU64::new(0);
+            if OPEN_BUSY_RETURN_TRACE_N.fetch_add(1, Ordering::Relaxed) < 8 {
+                print_str(b"[winlogon-open-busy-return] pi/tid=");
+                print_u64(self.pi as u64);
+                print_str(b"/");
+                print_u64(self.current_tid);
+                print_str(b"\n");
+            }
+        }
         if status == STATUS_NOT_SUPPORTED {
             static UNSUPPORTED_SYSCALL_TRACE_N: AtomicU64 = AtomicU64::new(0);
             if UNSUPPORTED_SYSCALL_TRACE_N.fetch_add(1, Ordering::Relaxed) < 12 {
@@ -32131,7 +32177,11 @@ impl ExecNtHandler {
         };
         let parse_root = match self.resolve_file_parse_root(&captured) {
             Ok(root) => root,
-            Err(status) => return status,
+            Err(status) => {
+                trace_winlogon_open_early_busy(b"resolve-root", self.pi, self.current_tid,
+                    captured.root, status, captured.name());
+                return status;
+            }
         };
         let mut namespace_path = [0u8; NAMED_OBJECT_PATH_CAP];
         let mut absolute_name = [0u16; FILE_OBJECT_NAME_CAP];
@@ -32142,7 +32192,11 @@ impl ExecNtHandler {
             &mut absolute_name,
         ) {
             Ok(resolved) => resolved,
-            Err(status) => return status,
+            Err(status) => {
+                trace_winlogon_open_early_busy(b"normalize-name", self.pi, self.current_tid,
+                    captured.root, status, captured.name());
+                return status;
+            }
         };
         let mut nb = [0u8; 96];
         let nlen = {
@@ -32156,13 +32210,17 @@ impl ExecNtHandler {
             }
             n
         };
+        trace_winlogon_open(b"entry", self.pi, self.current_tid, parse_root,
+            unsafe { crate::fs_loader::exec_fs_mount_identity() }
+                .and_then(crate::fs_loader::exec_block_route_kind),
+            crate::writable_fs::registry_journal::owns_volume(), false, None, None, name16);
         if !matches!(parse_root, FileParseRoot::Absolute) {
             if let FileParseRoot::HostedFile { file_id, device_id } = parse_root {
                 if name16.first() == Some(&(b'\\' as u16)) {
                     return STATUS_OBJECT_NAME_INVALID;
                 }
                 if driver_launch::require_registered_kernel_filesystem_device(device_id).is_ok() {
-                    return self.create_registered_kernel_file(
+                    let status = self.create_registered_kernel_file(
                         parse_root,
                         name16,
                         captured.attributes,
@@ -32175,6 +32233,9 @@ impl ExecNtHandler {
                         file_handle_out,
                         args[3],
                     );
+                    trace_winlogon_open_early_busy(b"relative-mounted", self.pi, self.current_tid,
+                        captured.root, status, name16);
+                    return status;
                 }
                 if let Some(status) = self.create_registered_driver_peer_relative_file(
                     device_id,
@@ -32190,6 +32251,8 @@ impl ExecNtHandler {
                     file_handle_out,
                     args[3],
                 ) {
+                    trace_winlogon_open_early_busy(b"relative-driver-peer", self.pi, self.current_tid,
+                        captured.root, status, name16);
                     return status;
                 }
                 if driver_launch::device_id_by_name("\\Device\\NamedPipe") != Some(device_id) {
@@ -32264,12 +32327,16 @@ impl ExecNtHandler {
                 nt_fs::FILE_OPEN,
                 open_options,
             );
+            trace_winlogon_open_early_busy(b"relative-local", self.pi, self.current_tid,
+                captured.root, status, name16);
             let registry_slot = (status == nt_fs::STATUS_SUCCESS && handle != 0)
                 .then(|| reg.resolve_name(&nb[..nlen]))
                 .flatten();
             if let Err(status) = self.publish_file_create_result(
                 file_handle_out, args[3], handle, status, information,
             ) {
+                trace_winlogon_open_early_busy(b"relative-publish", self.pi, self.current_tid,
+                    captured.root, status, name16);
                 return status;
             }
             if handle != 0 {
@@ -32301,6 +32368,8 @@ impl ExecNtHandler {
                 file_handle_out,
                 args[3],
             ) {
+                trace_winlogon_open_early_busy(b"absolute-driver-peer", self.pi, self.current_tid,
+                    captured.root, status, name16);
                 return status;
             }
         }
