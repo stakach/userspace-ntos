@@ -59046,7 +59046,7 @@ fn trace_hosted_pointer_service(
     reason: &[u8],
 ) {
     static TRACES: AtomicU64 = AtomicU64::new(0);
-    if TRACES.fetch_add(1, Ordering::Relaxed) >= 16 && status == 0 { return; }
+    if TRACES.fetch_add(1, Ordering::Relaxed) >= 512 && status == 0 { return; }
     print_str(b"[hosted-pointer-service] op="); print_u64(op);
     print_str(b" object=0x"); print_hex64(object);
     if let Some(registration) = registration {
