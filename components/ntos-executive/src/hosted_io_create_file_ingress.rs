@@ -22,10 +22,21 @@ pub(super) fn resolve_absolute_name(
         crate::object_manager_resolve_file_target_owned(name, case_insensitive)
     }
     .map_err(|status| status.raw() as u32)?;
+    from_resolved_file_target(nt_object_client::FilePathTarget {
+        device_object: object_id,
+        remaining_name: relative_name,
+    })
+}
+
+/// Map a terminal Object Manager target to the live registered Device without repeating its
+/// namespace traversal. Both synchronous and retained native callers use this exact authority.
+pub(super) fn from_resolved_file_target(
+    target: nt_object_client::FilePathTarget,
+) -> Result<(u64, Vec<u16>), u32> {
     let device_id = unsafe { io_manager_mut() }
-        .device_id_by_object_id(object_id)
+        .device_id_by_object_id(target.device_object)
         .ok_or(STATUS_OBJECT_NAME_NOT_FOUND as u32)?;
-    Ok((device_id.raw(), relative_name))
+    Ok((device_id.raw(), target.remaining_name))
 }
 
 pub(super) struct CapturedCreate {

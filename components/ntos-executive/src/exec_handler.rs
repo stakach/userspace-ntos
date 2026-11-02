@@ -27175,12 +27175,41 @@ impl ExecNtHandler {
         file_handle_va: u64,
         iosb_va: u64,
     ) -> u32 {
+        let resolved = if matches!(root, FileParseRoot::Absolute) {
+            Some(driver_launch::resolve_hosted_device_file_name(
+                name16, object_attributes & 0x40 != 0))
+        } else { None };
+        self.create_registered_kernel_file_from_resolved(
+            root, resolved.as_ref(), name16, object_attributes, desired_access,
+            share_access, disposition, file_attributes, create_options, ea,
+            file_handle_va, iosb_va,
+        )
+    }
+
+    /// Consume a previously resolved Object Manager target without looking up its name again.
+    /// The same target can be classified for peer dispatch before this mounted File decision.
+    unsafe fn create_registered_kernel_file_from_resolved(
+        &mut self,
+        root: FileParseRoot,
+        resolved: Option<&Result<(u64, alloc::vec::Vec<u16>), u32>>,
+        name16: &[u16],
+        object_attributes: u32,
+        desired_access: u32,
+        share_access: u32,
+        disposition: u32,
+        file_attributes: u32,
+        create_options: u32,
+        ea: &[u8],
+        file_handle_va: u64,
+        iosb_va: u64,
+    ) -> u32 {
         let target = match root {
-            FileParseRoot::Absolute => driver_launch::resolve_kernel_directory_file_name(
-                name16,
-                object_attributes & 0x40 != 0,
-            )
-            .map(|(device_id, name)| (device_id, None, Some(name))),
+            FileParseRoot::Absolute => resolved.ok_or(STATUS_INVALID_HANDLE)
+                .and_then(|resolved| resolved.as_ref().map_err(|status| *status))
+                .and_then(|(device_id, name)| {
+                    driver_launch::require_registered_kernel_filesystem_device(*device_id)?;
+                    Ok((*device_id, None, Some(name.as_slice())))
+                }),
             FileParseRoot::HostedFile { file_id, device_id } => {
                 driver_launch::require_registered_kernel_filesystem_device(device_id)
                     .map(|()| (device_id, Some(file_id), None))
@@ -27224,24 +27253,44 @@ impl ExecNtHandler {
         file_handle_va: u64,
         iosb_va: u64,
     ) -> Option<u32> {
-        let target = named_device_route::resolve_named_driver_peer(
-            name16,
-            object_attributes & 0x40 != 0,
-            driver_launch::resolve_hosted_device_file_name,
-            |device_id| {
-                driver_launch::registered_file_target(*device_id, major::IRP_MJ_CREATE)
-                    .map(|target| target == driver_launch::RegisteredFileTarget::DriverPeer)
-            },
-        );
-        let (device_id, owned_name) = match target {
-            Ok(Some(target)) => target,
-            Ok(None)
-            | Err(STATUS_OBJECT_NAME_NOT_FOUND)
+        let resolved = driver_launch::resolve_hosted_device_file_name(
+            name16, object_attributes & 0x40 != 0);
+        self.create_registered_driver_peer_file_from_resolved(
+            &resolved, name16, object_attributes, desired_access, share_access,
+            disposition, file_attributes, create_options, ea, file_handle_va, iosb_va,
+        )
+    }
+
+    /// Classify a canonical File target without another Object Manager request. A filesystem
+    /// target remains available to the caller for its mounted-volume or legacy path.
+    unsafe fn create_registered_driver_peer_file_from_resolved(
+        &mut self,
+        resolved: &Result<(u64, alloc::vec::Vec<u16>), u32>,
+        name16: &[u16],
+        object_attributes: u32,
+        desired_access: u32,
+        share_access: u32,
+        disposition: u32,
+        file_attributes: u32,
+        create_options: u32,
+        ea: &[u8],
+        file_handle_va: u64,
+        iosb_va: u64,
+    ) -> Option<u32> {
+        let peer = named_device_route::classify_resolved_named_driver_peer(resolved, |device_id| {
+            driver_launch::registered_file_target(*device_id, major::IRP_MJ_CREATE)
+                .map(|target| target == driver_launch::RegisteredFileTarget::DriverPeer)
+        });
+        match peer {
+            Ok(true) => {}
+            Ok(false) | Err(STATUS_OBJECT_NAME_NOT_FOUND)
             | Err(nt_fs::STATUS_OBJECT_PATH_NOT_FOUND) => return None,
             Err(status) => return Some(status),
-        };
+        }
+        let (device_id, owned_name) = resolved.as_ref()
+            .expect("classified peer retains its exact resolved target");
         Some(self.create_registered_file_from_target(
-            Ok((device_id, None, Some(owned_name))),
+            Ok((*device_id, None, Some(owned_name.as_slice()))),
             name16,
             object_attributes,
             desired_access,
@@ -27293,7 +27342,7 @@ impl ExecNtHandler {
 
     unsafe fn create_registered_file_from_target(
         &mut self,
-        target: Result<(u64, Option<u64>, Option<alloc::vec::Vec<u16>>), u32>,
+        target: Result<(u64, Option<u64>, Option<&[u16]>), u32>,
         name16: &[u16],
         object_attributes: u32,
         desired_access: u32,
@@ -27309,7 +27358,7 @@ impl ExecNtHandler {
             self.registered_create_file(
                 device_id,
                 major::IRP_MJ_CREATE,
-                owned_name.as_deref().unwrap_or(name16),
+                owned_name.unwrap_or(name16),
                 parent,
                 object_attributes,
                 0,

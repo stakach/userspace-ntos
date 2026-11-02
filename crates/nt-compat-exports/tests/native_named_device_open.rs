@@ -49,16 +49,25 @@ fn native_open_and_create_route_named_driver_peers_before_filesystem_fallback() 
 fn named_driver_peer_route_uses_object_namespace_and_canonical_dispatch() {
     let source = native_source("exec_handler.rs");
     let route = function_body(&source, "create_registered_driver_peer_file");
-    assert!(route.contains("resolve_named_driver_peer"));
     assert!(route.contains("resolve_hosted_device_file_name"));
-    assert!(route.contains("registered_file_target"));
-    assert!(route.contains("RegisteredFileTarget::DriverPeer"));
-    assert!(route.contains("create_registered_file_from_target"));
+    assert!(route.contains("create_registered_driver_peer_file_from_resolved"));
+    let resolved = function_body(&source, "create_registered_driver_peer_file_from_resolved");
+    assert!(resolved.contains("classify_resolved_named_driver_peer"));
+    assert!(resolved.contains("STATUS_OBJECT_NAME_NOT_FOUND"));
+    assert!(resolved.contains("STATUS_OBJECT_PATH_NOT_FOUND"));
+    assert!(resolved.contains("RegisteredFileTarget::DriverPeer"));
+    assert!(resolved.contains("create_registered_file_from_target"));
+    assert!(!resolved.contains("resolve_hosted_device_file_name"),
+        "pre-resolved peer dispatch must not repeat the Object Manager lookup");
+    assert!(resolved.contains("registered_file_target"));
+    let kernel = function_body(&source, "create_registered_kernel_file_from_resolved");
+    assert!(kernel.contains("require_registered_kernel_filesystem_device"));
+    assert!(kernel.contains("create_registered_file_from_target"));
+    assert!(!kernel.contains("resolve_hosted_device_file_name"),
+        "pre-resolved mounted dispatch must not repeat the Object Manager lookup");
     let dispatch = function_body(&source, "create_registered_file_from_target");
     assert!(dispatch.contains("registered_create_file"));
-    assert!(!route.contains("KeyboardClass"), "routing must not hardcode the guest class name");
-    assert!(route.contains("STATUS_OBJECT_NAME_NOT_FOUND"));
-    assert!(route.contains("STATUS_OBJECT_PATH_NOT_FOUND"));
+    assert!(!resolved.contains("KeyboardClass"), "routing must not hardcode the guest class name");
     let relative = function_body(&source, "create_registered_driver_peer_relative_file");
     assert!(relative.contains("device_id_by_name(\"\\\\Device\\\\NamedPipe\")"));
     assert!(relative.contains("Some(parent_file_id)"));
