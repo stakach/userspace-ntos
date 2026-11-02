@@ -360,8 +360,27 @@ unsafe fn poll_pending() -> usize {
     1
 }
 
-/// Drive at most one physical command per outer service turn. Backends only publish claims.
+// Native dispatch may enter a hosted component pump before its IRP is returned. A nested
+// receive may then service a retained header recheck, but must not reenter this executor while
+// the first command still owns its unreturned dispatch and physical ticket.
+static SERVICE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct NativeServiceGuard;
+
+impl NativeServiceGuard {
+    fn enter() -> Option<Self> {
+        SERVICE_ACTIVE.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok().map(|_| Self)
+    }
+}
+
+impl Drop for NativeServiceGuard {
+    fn drop(&mut self) { SERVICE_ACTIVE.store(false, Ordering::Release); }
+}
+
+/// Drive at most one physical command per service turn. Backends only publish claims.
 pub(super) unsafe fn service() -> usize {
+    let Some(_guard) = NativeServiceGuard::enter() else { return 0; };
     if (&*core::ptr::addr_of!(PENDING)).is_some() {
         return poll_pending();
     }
@@ -381,6 +400,31 @@ pub(super) unsafe fn service() -> usize {
         let Some(claim) = claim.map(WorkClaim::Snapshot) else { return 0; };
         (route, claim, wal_authority)
     };
+    dispatch_claim(route, claim, wal_authority)
+}
+
+/// Under a parked Receive parent, drain an already-entered physical command through its exact
+/// completion/ACK. When that single slot is vacant, admit only the retained registry owner's
+/// header recheck under the normally published native route.
+pub(super) unsafe fn service_registry_recheck(id: u64) -> usize {
+    if id == 0 || crate::registry_mutation_work::pending_provider_header_recheck() != Some(id) {
+        return 0;
+    }
+    let Some(_guard) = NativeServiceGuard::enter() else { return 0; };
+    if (&*core::ptr::addr_of!(PENDING)).is_some() {
+        return poll_pending();
+    }
+    let Some(route) = native_disk_relation::native_storage_route() else { return 0; };
+    let Some(claim) = crate::writable_fs::native_snapshot_io::claim_registry_header_recheck(id)
+    else { return 0; };
+    dispatch_claim(route, WorkClaim::Snapshot(claim), None)
+}
+
+unsafe fn dispatch_claim(
+    route: native_disk_relation::NativeStorageRoute,
+    claim: WorkClaim,
+    wal_authority: Option<PendingScsiProofAuthority>,
+) -> usize {
     if claim.mount() != route.mount.value() {
         claim.refuse_unentered(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         return 1;

@@ -43282,6 +43282,10 @@ pub(crate) fn service_mounted_native_blocks() -> usize {
     unsafe { mounted_native_block::service() }
 }
 
+pub(crate) fn service_mounted_native_registry_recheck(id: u64) -> usize {
+    unsafe { mounted_native_block::service_registry_recheck(id) }
+}
+
 pub(crate) fn print_mounted_native_block_census() {
     mounted_native_block::print_census();
 }

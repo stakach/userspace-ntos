@@ -599,6 +599,21 @@ pub(crate) fn pending_count() -> u64 {
     PENDING.load(Ordering::Acquire)
 }
 
+/// A provider's retained storage admission is the authority for its native header recheck.
+/// The numeric recheck id alone never authorizes unrelated mounted block work.
+pub(crate) fn pending_provider_header_recheck() -> Option<u64> {
+    unsafe {
+        if ACTIVE.load(Ordering::Acquire) {
+            return None;
+        }
+        (&*core::ptr::addr_of!(WORK)).iter().flatten().find_map(|work| {
+            (matches!(&work.caller, Caller::Provider(_)) && matches!(&work.phase, Phase::Admit))
+                .then(|| work.persistence.admission_recheck_id())
+                .flatten()
+        })
+    }
+}
+
 /// Copied census evidence. The work table is inspected only on the executive thread.
 #[derive(Debug)]
 pub(crate) struct CensusSnapshot {

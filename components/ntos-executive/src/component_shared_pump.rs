@@ -262,6 +262,18 @@ pub(super) unsafe fn receive(
         if progressed && crate::registry_mutation_work::wake_due(crate::monotonic_time_100ns()) != 0 {
             continue;
         }
+        if let Some(id) = crate::registry_mutation_work::pending_provider_header_recheck() {
+            let _message = crate::ipc_message::SavedMessageBuffer::capture();
+            let mut parent = match runtime::nested::park_current() {
+                Ok(parent) => parent,
+                Err(_) => return PumpMessage::transport_wall(),
+            };
+            let serviced = crate::driver_launch::service_mounted_native_registry_recheck(id);
+            if runtime::nested::restore(&mut parent).is_err() {
+                return PumpMessage::transport_wall();
+            }
+            if serviced != 0 { continue; }
+        }
         if crate::service_sec_image::nested_hosted_file_work_ready() {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             let mut parent = match runtime::nested::park_current() {

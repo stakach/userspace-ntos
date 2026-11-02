@@ -104,6 +104,12 @@ pub(crate) unsafe fn claim_relation_header_recheck(id: u64) -> Option<SnapshotCl
     snapshot_storage::claim_storage_io_for(id)
 }
 
+/// A retained registry mutation may claim only its own authenticated header recheck.
+/// The caller separately requires the normally published native storage route.
+pub(crate) unsafe fn claim_registry_header_recheck(id: u64) -> Option<SnapshotClaim> {
+    snapshot_storage::claim_storage_io_for(id)
+}
+
 pub(crate) unsafe fn claim_retained_relation_wal_io() -> Option<SnapshotClaim> {
     crate::driver_launch::claim_native_relation_wal_io()
 }
