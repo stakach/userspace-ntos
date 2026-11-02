@@ -19,9 +19,22 @@ fn foreign_lower_buffered_control_has_retained_source_route() {
     assert!(worker.contains("completed_device_control_irp_exact"));
     assert!(worker.contains("copy_completed_irp_output_exact"));
     assert!(worker.contains("self.inline_held && self.source.completion_finished()"));
+    assert!(worker.contains("wake_hosted_forward_service"),
+        "op1 must return its exact retained token, not a two-word QueryPath reply");
+    let ingress = include_str!("../../../components/ntos-executive/src/component_ingress_services.rs");
+    let reply_start = ingress.find("Self::HostedForward { disposition, token } =>").unwrap();
+    let reply_end = ingress[reply_start..].find("Self::QueryPath").unwrap() + reply_start;
+    assert!(ingress[reply_start..reply_end].contains("(3, [status as u32 as u64, kind, token, 0])"),
+        "retained op1 reply must overwrite the caller's third register with the exact token");
+    assert!(worker.contains("work.token != token"),
+        "held source completion must reject a forged or stale token");
     assert!(capture.contains("pool_range_identity_unlocked"));
     assert!(capture.contains("write_refusal"));
     assert!(source.contains("HostedIrpUnwindOutcome::MoreProcessingRequired"));
+    let origin_start = source.find("unsafe fn forward_hosted_buffered_control(").unwrap();
+    let origin_end = source[origin_start..].find("\n///").unwrap() + origin_start;
+    assert!(source[origin_start..origin_end].contains("HostedForwardDispatchReply::decode"),
+        "origin must decode typed three-word reply before sending held token");
 }
 
 #[test]

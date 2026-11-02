@@ -8,6 +8,7 @@ use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_io_manager::{
     detached_file_irp::{ExternalFileIrpDispatchPolicy, ExternalFileIrpRequest},
+    hosted_forward_progress::HostedForwardDispatchReply,
     source_irp_ledger::SourceIrpForwardIdentity,
     DeviceControlParameters, IoParameters, StackFlags,
 };
@@ -54,6 +55,20 @@ struct RetainedAck {
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static mut EXECUTING: Vec<(usize, DriverInstance, SourceIrpForwardIdentity)> = Vec::new();
 static CURSOR: AtomicU64 = AtomicU64::new(0);
+static HOLD_REFUSAL_TRACE: AtomicU64 = AtomicU64::new(0);
+
+fn trace_hold_refusal(stage: u64, source_irp: u64, observed: u64, expected: u64) {
+    if HOLD_REFUSAL_TRACE.fetch_add(1, Ordering::Relaxed) >= 8 { return; }
+    print_str(b"[buffered-control-hold-refusal] stage/irp/token/expected=");
+    print_u64(stage);
+    print_str(b"/");
+    print_hex_u64(source_irp);
+    print_str(b"/");
+    print_hex_u64(observed);
+    print_str(b"/");
+    print_hex_u64(expected);
+    print_str(b"\n");
+}
 
 fn capture_status(error: hosted_buffered_control_capture::CaptureError) -> i32 {
     use hosted_buffered_control_capture::CaptureError;
@@ -467,7 +482,13 @@ impl Work {
         if !self.publish_source_terminal() { return false; }
         self.source_published = true;
         self.reply_entered = true;
-        let _ = runtime::wake_query_path_service(self.route, self.dispatch, self.reply, self.token, status);
+        let _ = runtime::wake_hosted_forward_service(
+            self.route,
+            self.dispatch,
+            self.reply,
+            self.token,
+            HostedForwardDispatchReply::InlineTerminal(status),
+        );
         false
     }
 }
@@ -553,29 +574,50 @@ pub(super) unsafe fn hold_inline(
     token: u64,
 ) -> i32 {
     let Some((_, source_instance)) = instance_for_pump_channel(ch, reply_cap) else {
+        trace_hold_refusal(1, source_irp, token, 0);
         return INVALID_HANDLE;
     };
     if token == 0 || hosted_driver_pump_caller_tcb(ch, reply_cap, badge).is_none() {
+        trace_hold_refusal(2, source_irp, token, 0);
         return INVALID_HANDLE;
     }
     let Some(index) = source_address_work_index(source_instance, source_irp) else {
+        trace_hold_refusal(3, source_irp, token, 0);
         return INVALID_HANDLE;
     };
     if (&*core::ptr::addr_of!(EXECUTING)).iter().any(|(active, _, _)| *active == index) {
+        trace_hold_refusal(4, source_irp, token, 0);
         return DEVICE_BUSY;
     }
     let Some(work) = (&mut *core::ptr::addr_of_mut!(WORK))[index].as_mut() else {
+        trace_hold_refusal(5, source_irp, token, 0);
         return INVALID_HANDLE;
     };
-    if work.token != token || work.inline_held || work.ack.is_some()
-        || !work.reply_entered || !work.source_published
-        || crate::provider_registry_caller::resolve(ch) != Ok(work.caller)
-        || runtime::channel_route(ch).ok().flatten() != Some(work.route)
-        || !matches!(runtime::reconcile_retained_service_reply(
-            work.route, work.dispatch, work.reply, work.token,
-        ), Ok(true))
-    {
+    if work.token != token {
+        trace_hold_refusal(6, source_irp, token, work.token);
         return INVALID_HANDLE;
+    }
+    if work.inline_held || work.ack.is_some() {
+        trace_hold_refusal(7, source_irp, token, work.token);
+        return INVALID_HANDLE;
+    }
+    if !work.reply_entered || !work.source_published {
+        trace_hold_refusal(8, source_irp, token, work.token);
+        return INVALID_HANDLE;
+    }
+    if crate::provider_registry_caller::resolve(ch) != Ok(work.caller) {
+        trace_hold_refusal(9, source_irp, token, work.token);
+        return INVALID_HANDLE;
+    }
+    if runtime::channel_route(ch).ok().flatten() != Some(work.route) {
+        trace_hold_refusal(10, source_irp, token, work.token);
+        return INVALID_HANDLE;
+    }
+    if !matches!(runtime::reconcile_retained_service_reply(
+        work.route, work.dispatch, work.reply, work.token,
+    ), Ok(true)) {
+        trace_hold_refusal(11, source_irp, token, work.token);
+        return DEVICE_BUSY;
     }
     work.inline_held = true;
     STATUS_SUCCESS

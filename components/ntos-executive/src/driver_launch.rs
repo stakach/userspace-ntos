@@ -9772,17 +9772,25 @@ unsafe fn forward_hosted_buffered_control(
     device: u64, irp: u64, next: u64, current_location_after_forward: u8,
 ) -> i32 {
     write_unaligned((next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64, device);
-    let (label, status, accepted, token, _) = call_on4(
+    let (label, status, disposition_word, token, _) = call_on4(
         (FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL << 12) | 4,
         1, device, irp, 0,
     );
-    if label != 0 || accepted > 1 || (accepted != 0 && token == 0) {
+    let status = status as u32 as i32;
+    let disposition = nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply::decode(
+        status, disposition_word,
+    );
+    if label != 0
+        || disposition.is_none()
+        || matches!(disposition, Some(nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply::Pending))
+        || matches!(disposition, Some(nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply::InlineTerminal(_)))
+            && token == 0
+    {
         crate::provider_bugcheck::report(
             0xc4, [FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL, 1, irp, label],
         );
     }
-    let status = status as u32 as i32;
-    if accepted == 0 {
+    if matches!(disposition, Some(nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply::Rejected(_))) {
         // The source packet was already checked by s_iof_call_driver. Classpnp
         // reads IoStatus even after a direct IoCallDriver refusal, so publish
         // the definite failure rather than leaving its zero-initialized SUCCESS.
