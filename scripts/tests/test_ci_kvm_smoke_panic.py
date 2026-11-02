@@ -101,6 +101,21 @@ class SerialTerminalDetectorTests(unittest.TestCase):
             self.assertEqual(detector.poll(), "durability-refused")
             self.assertIsNone(detector.poll())
 
+    def test_no_boot_milestone_run_gate_is_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "serial.log"
+            log.write_bytes(b"[quiesce] no boot milestone for ~180s wall-clock -> run gate\n")
+            self.assertEqual(terminal_detector(log).poll(), "quiesce")
+
+    def test_double_prefixed_durability_refusal_is_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "serial.log"
+            log.write_bytes(
+                b"[cm-flush] quiesce boot hive checkpoint failed status=0x0x80000011\n"
+                b"[cm-flush] shutdown hive durability refused status=0x0x80000011\n"
+            )
+            self.assertEqual(terminal_detector(log).poll(), "durability-refused")
+
     def test_partial_or_quoted_quiesce_is_not_terminal(self):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "serial.log"

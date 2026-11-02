@@ -34,7 +34,8 @@ EXECUTIVE_PANIC = re.compile(rb"!@(src/[A-Za-z0-9_./-]+\.rs:[1-9][0-9]*)\r?\n")
 TERMINAL_BOOT_STOP = re.compile(
     rb"(?:^|[\r\n])("
     rb"\[quiesce\] every live process parked/waiting \(no signaler left\) -> run gate"
-    rb"|\[cm-flush\] shutdown hive durability refused status=0x[0-9a-fA-F]{8}"
+    rb"|\[quiesce\] no boot milestone for ~[0-9]+s wall-clock -> run gate"
+    rb"|\[cm-flush\] shutdown hive durability refused status=(?:0x){1,2}[0-9a-fA-F]{8}"
     rb"|\[provider-bugcheck\] terminal"
     rb")\r?\n"
 )
