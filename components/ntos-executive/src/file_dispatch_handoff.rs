@@ -11,6 +11,26 @@ pub(super) struct PublishedFileIo {
 }
 
 impl PublishedFileIo {
+    /// A bounded owner trace for a parked SMSS File call. Inspect only the already-published
+    /// pending row; no provider or filesystem work is safe from this scheduling boundary.
+    pub(super) unsafe fn trace_parked_smss(&self, pi: usize) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if pi != 0 || N.fetch_add(1, Ordering::Relaxed) >= 24 { return; }
+        let Some(pending) = (&*core::ptr::addr_of!(PENDING_FILE_IO)).get_exact(self.identity)
+            .filter(|pending| pending.irp_id == self.irp_id) else { return; };
+        print_str(b"[smss-file-wait] irp=0x");
+        print_hex_u64(self.irp_id);
+        print_str(b" major=");
+        print_u64(pending.major as u64);
+        print_str(b" file=0x");
+        print_hex_u64(pending.route.hosted_file_id().unwrap_or(0));
+        print_str(b" tid=");
+        print_u64(self.tid);
+        print_str(b" reply=");
+        print_u64(pending.reply_required as u64);
+        print_str(b"\n");
+    }
+
     pub(super) unsafe fn still_waiting(&self) -> bool {
         self.wait_for_completion
             && thread_wait_state_badge_parked(self.badge)

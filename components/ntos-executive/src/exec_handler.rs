@@ -32306,6 +32306,21 @@ impl ExecNtHandler {
         let mount_route = unsafe { crate::fs_loader::exec_fs_mount_identity() }
             .and_then(crate::fs_loader::exec_block_route_kind);
         if Self::route_absolute_open_to_kernel_file(name16, open_options, mount_route) {
+            static SMSS_MOUNTED_OPEN_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+            if self.pi == 0 && SMSS_MOUNTED_OPEN_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 24 {
+                print_str(b"[smss-mounted-open] tid=");
+                print_u64(self.current_tid);
+                print_str(b" route=");
+                print_str(match mount_route {
+                    Some(nt_fs::BlockSourceKind::Boot) => b"boot",
+                    Some(nt_fs::BlockSourceKind::Draining) => b"draining",
+                    Some(nt_fs::BlockSourceKind::Native) => b"native",
+                    None => b"none",
+                });
+                print_str(b" name=\"");
+                print_sanitized_utf16_ascii(name16, 128);
+                print_str(b"\"\n");
+            }
             return self.create_registered_kernel_file(
                 parse_root,
                 name16,

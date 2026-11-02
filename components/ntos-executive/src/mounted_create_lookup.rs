@@ -45,6 +45,10 @@ pub(crate) struct CreateLookupQueue<P> {
 impl<P> CreateLookupQueue<P> {
     pub const fn new() -> Self { Self { entries: Vec::new() } }
 
+    /// Includes a sector claim, a completed lookup awaiting publication, and a deferred Boot
+    /// CREATE. All retain a File IRP that can still wake its caller.
+    pub fn has_outstanding(&self) -> bool { !self.entries.is_empty() }
+
     pub fn capture(&mut self, irp: u64, mount: u64, payload: P, lookup: FatPathLookup) -> Result<(), CreateLookupError> {
         if irp == 0 || mount == 0 || lookup.request().is_none() {
             return Err(CreateLookupError::Invalid);

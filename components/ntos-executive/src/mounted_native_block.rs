@@ -227,7 +227,9 @@ pub(super) fn pending_physical_irp() -> bool {
 }
 
 pub(super) fn print_quiesce_snapshot() {
-    print_str(b"[quiesce-native-block] mounted-read-outstanding=");
+    print_str(b"[quiesce-native-block] mounted-create-outstanding=");
+    print_u64(crate::mounted_volume::mounted_create_outstanding() as u64);
+    print_str(b" mounted-read-outstanding=");
     print_u64(crate::mounted_volume::mounted_read_outstanding() as u64);
     print_str(b" physical-pending-irp=");
     let pending_irp = NATIVE_PENDING_IRP.load(Ordering::Acquire);

@@ -13675,6 +13675,7 @@ pub(crate) unsafe fn service_sec_image(
                             let apc_interrupted =
                                 reconcile_user_apc_file_wait(&mut nt_handler, waiter_tid);
                             if !apc_interrupted {
+                                trace_smss_file_busy_wait(waiter);
                                 trace_indefinite_wait_park(
                                     &nt_handler, badge, live_top_badges(&nt_handler),
                                     crash_parked, wait_parked,
@@ -19468,6 +19469,7 @@ pub(crate) unsafe fn service_sec_image(
                     let _ = reconcile_user_apc_file_wait(&mut nt_handler, published.tid);
                 }
                 if published.still_waiting() {
+                    published.trace_parked_smss(pi);
                     trace_indefinite_wait_park(
                         &nt_handler,
                         badge,
@@ -28489,11 +28491,29 @@ fn print_wait_snapshot_thread(thread: HostedThreadQuiesceRecord) {
     });
 }
 
+fn trace_smss_file_busy_wait(waiter: nt_io_manager::SynchronousFileWaiter) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if waiter.pi != 0 || N.fetch_add(1, Ordering::Relaxed) >= 24 { return; }
+    print_str(b"[smss-file-busy] ssn=");
+    print_u64(waiter.service_number as u64);
+    print_str(b" handle=0x");
+    print_hex_u64(waiter.handle as u64);
+    print_str(b" tid=");
+    print_u64(waiter.tid);
+    print_str(b" file=0x");
+    match waiter.route {
+        nt_io_manager::FileIoWaitRoute::Hosted { file_id, .. } => print_hex_u64(file_id),
+        nt_io_manager::FileIoWaitRoute::LocalOverlay { file_object } => print_hex_u64(file_object),
+    }
+    print_str(b"\n");
+}
+
 /// A DEADLINE-LESS wait park is the one park that can wedge the boot: the parked thread can only be
 /// woken by another RUNNABLE thread, and if none is left the loop's next `recv` blocks forever —
 /// past even the wall-clock stall watchdog, which lives at the loop top and therefore never runs.
 /// Trace each indefinite park with the masks read by the quiesce test. The wait owner mask is derived
 /// from live per-thread parked state, not from the current thread's role.
+#[track_caller]
 fn trace_indefinite_wait_park(
     nt_handler: &ExecNtHandler,
     badge: u64,
@@ -28505,7 +28525,15 @@ fn trace_indefinite_wait_park(
     if N.fetch_add(1, Ordering::Relaxed) >= 320 {
         return;
     }
-    print_str(b"[wait-park] badge=");
+    print_str(b"[wait-park] site=");
+    print_u64(core::panic::Location::caller().line() as u64);
+    print_str(b" pi=");
+    print_u64(nt_handler.pi as u64);
+    print_str(b" tid=");
+    print_u64(nt_handler.current_tid);
+    print_str(b" ssn=");
+    print_u64(nt_handler.current_service_number as u64);
+    print_str(b" badge=");
     print_u64(badge);
     print_str(b" owner=");
     match owner_top_badge_for(nt_handler, badge) {

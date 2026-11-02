@@ -123,6 +123,11 @@ pub(crate) fn claim_mounted_create_sector() -> Option<crate::mounted_volume_back
     claim
 }
 
+pub(crate) fn mounted_create_outstanding() -> bool {
+    unsafe { (&*core::ptr::addr_of!(MOUNT_CREATE_QUEUE)).as_ref()
+        .is_some_and(|queue| queue.borrow().has_outstanding()) }
+}
+
 pub(crate) fn complete_mounted_create_sector(
     claim: crate::mounted_volume_backend::mounted_create_lookup::CreateSectorClaim,
     sector: Result<&[u8; 512], nt_fs::FatPathError>,
