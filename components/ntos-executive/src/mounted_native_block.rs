@@ -474,26 +474,28 @@ impl Drop for NativeServiceGuard {
 /// Drive at most one physical command per service turn. Backends only publish claims.
 pub(super) unsafe fn service() -> usize {
     let Some(_guard) = NativeServiceGuard::enter() else { return 0; };
-    if (&*core::ptr::addr_of!(PENDING)).is_some() {
-        return poll_pending();
-    }
+    let settled = if (&*core::ptr::addr_of!(PENDING)).is_some() {
+        let settled = poll_pending();
+        if settled == 0 { return 0; }
+        settled
+    } else { 0 };
     let (route, claim, wal_authority) = if let Some(route) = native_disk_relation::native_storage_route() {
-        let Some(claim) = next_claim() else { return 0; };
+        let Some(claim) = next_claim() else { return settled; };
         (route, claim, None)
     } else {
         let Some(route) = native_disk_relation::retained_native_storage_recheck_route() else {
-            return 0;
+            return settled;
         };
         let Some(wal_authority) = retained_native_storage_wal_scsi_authority(route) else {
-            return 0;
+            return settled;
         };
         let claim = crate::driver_launch::native_storage_relation_recheck_id()
             .and_then(|id| crate::writable_fs::native_snapshot_io::claim_relation_header_recheck(id))
             .or_else(|| crate::writable_fs::native_snapshot_io::claim_retained_relation_wal_io());
-        let Some(claim) = claim.map(WorkClaim::Snapshot) else { return 0; };
+        let Some(claim) = claim.map(WorkClaim::Snapshot) else { return settled; };
         (route, claim, wal_authority)
     };
-    dispatch_claim(route, claim, wal_authority)
+    settled + dispatch_claim(route, claim, wal_authority)
 }
 
 /// Under a parked Receive parent, drain an already-entered physical command through its exact

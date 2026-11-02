@@ -10107,6 +10107,11 @@ pub(crate) unsafe fn service_sec_image(
             if badge_has_delay_timer(badge) {
                 badge = DELAY_TIMER_BADGE;
             } else {
+                // IRQ-owned DPCs can publish the exact native IRP terminal. Observe and
+                // ACK it before sleeping; otherwise each sector waits for a timer wakeup.
+                if driver_launch::mounted_native_physical_irp_pending() {
+                    let _ = driver_launch::service_mounted_native_blocks();
+                }
                 let irq_durable_status = finalize_service_loop_state(&mut nt_handler);
                 if irq_durable_status != nt_fs::STATUS_SUCCESS {
                     print_str(b"[service-loop] IRQ checkpoint failure=0x");

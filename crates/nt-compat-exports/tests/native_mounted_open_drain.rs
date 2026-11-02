@@ -218,6 +218,78 @@ fn native_resolved_writable_create_has_a_continuation_beyond_resident_busy() {
 }
 
 #[test]
+fn acknowledged_native_fat_sector_can_dispatch_its_successor_in_the_same_service_turn() {
+    // The production cursor makes the second sector claimable as soon as the first terminal
+    // feeds it. Waiting for another outer service turn adds one whole wakeup per FAT component.
+    let geometry = FatPathGeometry { fat_start_sector: 1, data_start_sector: 100,
+        total_sectors: 200, sectors_per_cluster: 1 };
+    let lookup = FatPathLookup::new(geometry, 2, b"windows\\file.txt").unwrap();
+    let mut creates = mounted_create_lookup::CreateLookupQueue::new();
+    creates.capture(0x226, 7, (), lookup).unwrap();
+    let first = creates.claim_next().unwrap();
+    assert_eq!(first.request.sector, 100);
+    assert!(creates.claim_next().is_none(), "entered command cannot be claimed twice");
+    let mut root = [0u8; 512];
+    root[..11].copy_from_slice(b"WINDOWS    ");
+    root[11] = 0x10;
+    root[26..28].copy_from_slice(&3u16.to_le_bytes());
+    assert_eq!(creates.complete(first, Ok(&root)), Ok(FatPathProgress::Pending));
+    let second = creates.claim_next().expect("exact first terminal enables next FAT sector");
+    assert_eq!((second.irp, second.mount, second.request.sector), (0x226, 7, 101));
+    assert!(creates.claim_next().is_none(), "only one physical successor can enter");
+
+    let source = include_str!("../../../components/ntos-executive/src/mounted_native_block.rs");
+    let poll = source.split_once("unsafe fn poll_pending() -> usize")
+        .expect("actual native completion poll").1
+        .split_once("static SERVICE_ACTIVE").expect("poll boundary").0;
+    let ack = poll.find("acknowledge_completed_irp_strict").expect("strict native ACK");
+    let slot_release = poll.find("slot.take().expect").expect("exact pending owner retirement");
+    assert!(ack < slot_release,
+        "a pending command must be strictly ACKed before its physical slot is reusable");
+    let service = source.split_once("pub(super) unsafe fn service() -> usize")
+        .expect("actual top-level native block service").1
+        .split_once("unsafe fn service_registry_exact(").expect("service boundary").0;
+    assert!(service.contains("NativeServiceGuard::enter()")
+        && service.contains("poll_pending()")
+        && service.contains("dispatch_claim("),
+        "the same guarded turn must own completion and next dispatch");
+    assert!(!service.contains("return poll_pending();"),
+        "strict ACK already made the next FAT sector claimable; do not wait another outer wakeup");
+    let pending_branch = service.split_once("if (&*core::ptr::addr_of!(PENDING)).is_some() {")
+        .expect("exact pending-slot branch").1
+        .split_once("\n    }").expect("pending-slot branch boundary").0;
+    assert!(pending_branch.contains("let settled = poll_pending();")
+        && pending_branch.contains("if settled == 0 { return 0; }"),
+        "an unproven terminal or refused ACK must retain the occupied slot and forbid next dispatch");
+    assert_eq!(service.matches("dispatch_claim(").count(), 1,
+        "a completion turn may admit at most one new physical command");
+    assert!(!service.contains("pump_hosted_io_completions"),
+        "native block service must not nest a completion pump");
+}
+
+#[test]
+fn native_completion_irq_polls_exact_physical_slot_before_receiving_again() {
+    let service = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
+    let irq = service.split_once("let current_irq_lines = driver_launch::latch_hosted_irq_badge(badge);")
+        .expect("root hardware IRQ dispatch").1
+        .split_once("if pending_driver_start_redrive_needed(&nt_handler)")
+        .expect("end of pure IRQ branch").0;
+    let drain = irq.find("driver_launch::drain_pending_hosted_irqs()")
+        .expect("physical IRQ and its DPCs are drained");
+    let pure_irq = irq.find("if current_irq_lines != 0")
+        .expect("pure hardware IRQ branch");
+    let branch = &irq[pure_irq..];
+    let pending = branch.find("driver_launch::mounted_native_physical_irp_pending()")
+        .expect("only an entered native command needs an IRQ completion poll");
+    let poll = branch.find("driver_launch::service_mounted_native_blocks()")
+        .expect("publish and ACK the exact native completion on its IRQ");
+    let receive = branch.find("component_recv!(fault_ep")
+        .expect("root receives after the IRQ checkpoint");
+    assert!(drain < pure_irq && pending < poll && poll < receive,
+        "DPC completion must reach the native slot before root sleeps for another timer");
+}
+
+#[test]
 fn pending_create_keeps_exact_mount_and_sector_until_native_completion() {
     let mut route = BlockRouteOwner::new(7, 1_000).unwrap();
     route.begin_drain(7).unwrap();
