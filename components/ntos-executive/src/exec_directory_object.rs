@@ -60,6 +60,14 @@ fn backing_status(error: BackingError) -> u32 {
     }
 }
 
+fn trace_directory_failure(stage: &[u8], status: u32) {
+    crate::print_str(b"[directory-stage-failed] stage=");
+    crate::print_str(stage);
+    crate::print_str(b" status=");
+    crate::print_hex_u64(status as u64);
+    crate::print_str(b"\n");
+}
+
 impl ExecNtHandler {
     fn canonical_directory_path(
         &self,
@@ -245,6 +253,7 @@ impl ExecNtHandler {
                         DirectoryPublishProgress::Pending
                     }
                     Err(error) => {
+                        trace_directory_failure(b"canonical-publish", backing_status(error));
                         if self.abort_reserved_provider_directory_object(staged) {
                             DirectoryPublishProgress::Failed(backing_status(error))
                         } else { DirectoryPublishProgress::Pending }
@@ -348,6 +357,7 @@ impl ExecNtHandler {
                 DirectoryPublishProgress::Pending
             }
             Err(error) => {
+                trace_directory_failure(b"canonical-poll", backing_status(error));
                 staged.canonical_pending = false;
                 if self.abort_reserved_provider_directory_object(staged) {
                     DirectoryPublishProgress::Failed(backing_status(error))
@@ -400,7 +410,10 @@ impl ExecNtHandler {
         })();
         match result {
             Ok(status) => DirectoryPublishProgress::Ready(status),
-            Err(status) => self.rollback_unpublished_directory_open(staged, status),
+            Err(status) => {
+                trace_directory_failure(b"local-commit", status);
+                self.rollback_unpublished_directory_open(staged, status)
+            }
         }
     }
 

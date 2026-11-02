@@ -36845,6 +36845,13 @@ impl ExecNtHandler {
                             SYSTEM_SESSION_NEXT_ID.store(u32::MAX, Ordering::Relaxed);
                             return STATUS_INSUFFICIENT_RESOURCES;
                         }
+                        if session_id <= 4 {
+                            crate::print_str(b"[session-namespace] create id=");
+                            crate::print_u64(session_id as u64);
+                            crate::print_str(b" pid=");
+                            crate::print_u64(pid as u64);
+                            crate::print_str(b"\n");
+                        }
                         if let Err(status) = self.pm.create_process_session(pid, session_id) {
                             return status;
                         }
@@ -36881,6 +36888,13 @@ impl ExecNtHandler {
                         let Some(pid) = self.pm_pid_for_pi(self.pi) else {
                             return STATUS_INVALID_HANDLE;
                         };
+                        if session_id <= 4 {
+                            crate::print_str(b"[session-namespace] detach id=");
+                            crate::print_u64(session_id as u64);
+                            crate::print_str(b" pid=");
+                            crate::print_u64(pid as u64);
+                            crate::print_str(b"\n");
+                        }
                         if let Err(status) = self.pm.delete_process_session(pid, session_id) {
                             return status;
                         }

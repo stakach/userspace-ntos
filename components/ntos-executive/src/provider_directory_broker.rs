@@ -33,6 +33,17 @@ static NEXT_RETRY: AtomicU64 = AtomicU64::new(0);
 static NEXT_SCAN: AtomicU64 = AtomicU64::new(0);
 static EFFECT_NEXT_SCAN: AtomicU64 = AtomicU64::new(0);
 
+fn trace_publish_status(token: u64, stage: &[u8], status: u32) {
+    if token > 4 && status == 0 { return; }
+    crate::print_str(b"[directory-publish] token=");
+    crate::print_u64(token);
+    crate::print_str(b" stage=");
+    crate::print_str(stage);
+    crate::print_str(b" status=");
+    crate::print_hex_u64(status as u64);
+    crate::print_str(b"\n");
+}
+
 pub(crate) enum SubmitResult {
     Ready((i32, u64, u64, u64)),
     Deferred,
@@ -374,6 +385,17 @@ impl Broker {
                     .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
                 let owner = Self::owner(route, dispatch, caller, token);
                 let capture = self.uploads.commit(owner).map_err(upload_status)?;
+                if token <= 4 {
+                    crate::print_str(b"[directory-reserve] token=");
+                    crate::print_u64(token);
+                    crate::print_str(b" root=");
+                    crate::print_hex_u64(capture.root_directory);
+                    crate::print_str(b" attrs=");
+                    crate::print_hex_u64(capture.attributes as u64);
+                    crate::print_str(b" name=");
+                    for &unit in &capture.name { crate::print_str(&[unit as u8]); }
+                    crate::print_str(b"\n");
+                }
                 let create = self.kinds.swap_remove(position).3;
                 let staged = handler.reserve_provider_directory_object(
                     capture.root_directory,
@@ -651,6 +673,7 @@ unsafe fn redrive_one(handler: &mut ExecNtHandler) -> bool {
         } else {
             match handler.publish_provider_directory_object(&mut entry.staged, owner.caller) {
                 DirectoryPublishProgress::Ready(status) | DirectoryPublishProgress::Failed(status) => {
+                    trace_publish_status(owner.dispatch.1, b"initial", status);
                     work.status = status;
                 }
                 DirectoryPublishProgress::Pending => {
@@ -708,6 +731,7 @@ unsafe fn redrive_one(handler: &mut ExecNtHandler) -> bool {
     if work.phase == PublishPhase::CanonicalPending {
         match handler.poll_provider_directory_object(&mut entry.staged) {
             DirectoryPublishProgress::Ready(status) | DirectoryPublishProgress::Failed(status) => {
+                trace_publish_status(owner.dispatch.1, b"poll", status);
                 work.status = status;
                 work.phase = PublishPhase::ReadyReply;
                 return true;
@@ -732,6 +756,7 @@ unsafe fn redrive_one(handler: &mut ExecNtHandler) -> bool {
         return true;
     }
     if work.phase == PublishPhase::ReadyReply {
+        trace_publish_status(owner.dispatch.1, b"reply", work.status);
         if runtime::wake_directory_service(owner.route, owner.dispatch.0,
             work.reply, work.token, work.status as i32).is_err()
             && matches!(runtime::retained_service_reply_not_entered(owner.route,

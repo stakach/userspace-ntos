@@ -60,7 +60,25 @@ impl ExecNtHandler {
         // The canonical server owns the paths; the executive mirror carries its exact IDs.
         // All fallible allocations and security assignments precede this native effect.
         let canonical = unsafe { crate::object_manager_create_session_namespace(session_id) }
-            .map_err(|status| status.0 as u32)?;
+            .map_err(|status| {
+                crate::print_str(b"[session-namespace] publish-failed id=");
+                crate::print_u64(session_id as u64);
+                crate::print_str(b" status=");
+                crate::print_hex_u64(status.0 as u32 as u64);
+                crate::print_str(b"\n");
+                status.0 as u32
+            })?;
+        if session_id <= 4 {
+            crate::print_str(b"[session-namespace] published id=");
+            crate::print_u64(session_id as u64);
+            crate::print_str(b" canonical=");
+            crate::print_u64(canonical.session.0);
+            crate::print_str(b"/");
+            crate::print_u64(canonical.windows.0);
+            crate::print_str(b"/");
+            crate::print_u64(canonical.base_named_objects.0);
+            crate::print_str(b"\n");
+        }
         let session = ObjEntry::push_dir(&mut self.obj_ns, name.as_bytes(), parent, true)
             .expect("preflighted namespace capacity and monotonically allocated identity");
         self.obj_ns[session].payload = canonical.session.0;
@@ -104,21 +122,31 @@ impl ExecNtHandler {
         let session_entry = self.obj_ns[session];
         let windows_entry = self.obj_ns[windows];
         let bno_entry = self.obj_ns[bno];
-        if session_entry.kind != OBJ_KIND_DIRECTORY || windows_entry.kind != OBJ_KIND_DIRECTORY
-            || bno_entry.kind != OBJ_KIND_DIRECTORY
-            || session_entry.payload == 0 || windows_entry.payload == 0 || bno_entry.payload == 0
-            || self.obj_ns.iter().any(|entry| entry.is_live()
-                && (entry.parent == windows || entry.parent == bno
-                    || (entry.parent == session && entry.identity != windows_entry.identity
-                        && entry.identity != bno_entry.identity)))
-            || self.pm.handle_object_count(nt_process::HandleObject::ObjectDirectory(session_entry.identity)) != 0
+        let live_refs = self.pm.handle_object_count(nt_process::HandleObject::ObjectDirectory(session_entry.identity)) != 0
             || self.pm.handle_object_count(nt_process::HandleObject::ObjectDirectory(windows_entry.identity)) != 0
             || self.pm.handle_object_count(nt_process::HandleObject::ObjectDirectory(bno_entry.identity)) != 0
             || self.directory_security.iter().any(|record|
                 (record.identity == session_entry.identity || record.identity == windows_entry.identity
                     || record.identity == bno_entry.identity)
-                    && record.references != 0)
-        {
+                    && record.references != 0);
+        let live_children = self.obj_ns.iter().any(|entry| entry.is_live()
+            && (entry.parent == windows || entry.parent == bno
+                || (entry.parent == session && entry.identity != windows_entry.identity
+                    && entry.identity != bno_entry.identity)));
+        let blocked = session_entry.kind != OBJ_KIND_DIRECTORY || windows_entry.kind != OBJ_KIND_DIRECTORY
+            || bno_entry.kind != OBJ_KIND_DIRECTORY
+            || session_entry.payload == 0 || windows_entry.payload == 0 || bno_entry.payload == 0
+            || live_children || live_refs;
+        if blocked {
+            if session_id <= 4 {
+                crate::print_str(b"[session-namespace] retire-skipped id=");
+                crate::print_u64(session_id as u64);
+                crate::print_str(b" children=");
+                crate::print_u64(u64::from(live_children));
+                crate::print_str(b" refs=");
+                crate::print_u64(u64::from(live_refs));
+                crate::print_str(b"\n");
+            }
             return;
         }
         let canonical = nt_object_client::SessionNamespace {
@@ -129,7 +157,17 @@ impl ExecNtHandler {
         if unsafe { crate::object_manager_retire_session_namespace_exact(session_id, canonical) }
             .is_err()
         {
+            if session_id <= 4 {
+                crate::print_str(b"[session-namespace] canonical-retire-refused id=");
+                crate::print_u64(session_id as u64);
+                crate::print_str(b"\n");
+            }
             return;
+        }
+        if session_id <= 4 {
+            crate::print_str(b"[session-namespace] retired id=");
+            crate::print_u64(session_id as u64);
+            crate::print_str(b"\n");
         }
         self.obj_ns[bno].unlink();
         self.obj_ns[windows].unlink();
