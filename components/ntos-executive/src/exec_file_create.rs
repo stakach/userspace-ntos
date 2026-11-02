@@ -106,6 +106,48 @@ impl ExecNtHandler {
             Ok(resolved) => resolved,
             Err(status) => return status,
         };
+        if matches!(parse_root, FileParseRoot::Absolute)
+            && !Self::is_named_pipe_root_path(name16)
+            && !nt_fs::is_named_pipe_path(name16)
+        {
+            let resolved = driver_launch::resolve_hosted_device_file_name(
+                name16, captured.attributes & 0x40 != 0,
+            );
+            if matches!(&resolved, Err(status) if *status == nt_status::NtStatus::DEVICE_BUSY.raw() as u32) {
+                return match crate::native_file_target_open_work::capture(
+                    self, crate::native_file_target_open_work::Kind::Create,
+                    args, captured.clone(), name16, ea,
+                ) {
+                    Ok(()) => STATUS_PENDING,
+                    Err(status) => status,
+                };
+            }
+            return self.nt_create_file_captured(
+                args, &captured, parse_root, name16, &ea, Some(&resolved),
+            );
+        }
+        self.nt_create_file_captured(
+            args, &captured, parse_root, name16, &ea, None,
+        )
+    }
+
+    /// Continue from validated, copied NtCreateFile inputs after an owned namespace lookup.
+    pub(crate) unsafe fn nt_create_file_captured(
+        &mut self,
+        args: &[u64],
+        captured: &CapturedFileObjectAttributes,
+        parse_root: FileParseRoot,
+        name16: &[u16],
+        ea: &[u8],
+        resolved: Option<&Result<(u64, alloc::vec::Vec<u16>), u32>>,
+    ) -> u32 {
+        let file_handle_out = args[0];
+        let desired_access = nt_ulong_arg(args[1]);
+        let file_attributes = nt_ulong_arg(args[5]);
+        let share_access = nt_ulong_arg(args[6]);
+        let create_disposition = nt_ulong_arg(args[7]);
+        let create_options = nt_ulong_arg(args[8]);
+        let iosb = args[3];
         let pnp_install_pipe = is_pnp_install_pipe_name(name16);
         if pnp_install_pipe {
             trace_pnp_install_pipe(
@@ -255,7 +297,12 @@ impl ExecNtHandler {
             };
         }
         if !Self::is_named_pipe_root_path(name16) && !nt_fs::is_named_pipe_path(name16) {
-            if let Some(status) = self.create_registered_driver_peer_file(
+            let owned_resolution = resolved.is_none().then(||
+                driver_launch::resolve_hosted_device_file_name(
+                    name16, captured.attributes & 0x40 != 0));
+            let resolved = resolved.unwrap_or_else(|| owned_resolution.as_ref().unwrap());
+            if let Some(status) = self.create_registered_driver_peer_file_from_resolved(
+                resolved,
                 name16,
                 captured.attributes,
                 desired_access,
@@ -274,8 +321,11 @@ impl ExecNtHandler {
             && !Self::is_named_pipe_root_path(name16)
             && !nt_fs::is_named_pipe_path(name16)
         {
-            return self.create_registered_kernel_file(
-                parse_root,
+            let owned_resolution = resolved.is_none().then(||
+                driver_launch::resolve_hosted_device_file_name(
+                    name16, captured.attributes & 0x40 != 0));
+            return self.create_registered_kernel_file_from_resolved(
+                parse_root, resolved.or(owned_resolution.as_ref()),
                 name16,
                 captured.attributes,
                 desired_access,
@@ -293,8 +343,11 @@ impl ExecNtHandler {
         if create_options & nt_fs::FILE_DIRECTORY_FILE == 0
             && Self::route_absolute_open_to_kernel_file(name16, create_options, mount_route)
         {
-            return self.create_registered_kernel_file(
-                parse_root,
+            let owned_resolution = resolved.is_none().then(||
+                driver_launch::resolve_hosted_device_file_name(
+                    name16, captured.attributes & 0x40 != 0));
+            return self.create_registered_kernel_file_from_resolved(
+                parse_root, resolved.or(owned_resolution.as_ref()),
                 name16,
                 captured.attributes,
                 desired_access,

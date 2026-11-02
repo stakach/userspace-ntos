@@ -422,9 +422,10 @@ impl CapturedNamedObjectAttributes {
     }
 }
 
-struct CapturedFileObjectAttributes {
+#[derive(Clone)]
+pub(crate) struct CapturedFileObjectAttributes {
     root: u64,
-    attributes: u32,
+    pub(crate) attributes: u32,
     name_len: usize,
     name: [u16; FILE_OBJECT_NAME_CAP],
 }
@@ -436,7 +437,7 @@ impl CapturedFileObjectAttributes {
 }
 
 #[derive(Copy, Clone)]
-enum FileParseRoot {
+pub(crate) enum FileParseRoot {
     Absolute,
     ObjectDirectory { index: usize },
     FatDirectory { first_cluster: u32, object_id: u32 },
@@ -4268,6 +4269,7 @@ impl ExecNtHandler {
         write_field!(directory_cleanup,
             nt_user_host::canonical_directory_cleanup::DirectoryCleanupCredits::new());
         write_field!(pending_native_directory_open_transfer, None);
+        write_field!(pending_native_file_target_transfer, None);
         write_field!(pending_native_directory_effect_transfer, None);
         write_field!(data_section_security, Vec::new());
         write_field!(data_section_names, Vec::new());
@@ -27188,7 +27190,7 @@ impl ExecNtHandler {
 
     /// Consume a previously resolved Object Manager target without looking up its name again.
     /// The same target can be classified for peer dispatch before this mounted File decision.
-    unsafe fn create_registered_kernel_file_from_resolved(
+    pub(crate) unsafe fn create_registered_kernel_file_from_resolved(
         &mut self,
         root: FileParseRoot,
         resolved: Option<&Result<(u64, alloc::vec::Vec<u16>), u32>>,
@@ -27263,7 +27265,7 @@ impl ExecNtHandler {
 
     /// Classify a canonical File target without another Object Manager request. A filesystem
     /// target remains available to the caller for its mounted-volume or legacy path.
-    unsafe fn create_registered_driver_peer_file_from_resolved(
+    pub(crate) unsafe fn create_registered_driver_peer_file_from_resolved(
         &mut self,
         resolved: &Result<(u64, alloc::vec::Vec<u16>), u32>,
         name16: &[u16],
@@ -32195,8 +32197,6 @@ impl ExecNtHandler {
 
     #[inline(never)]
     unsafe fn nt_open_file_service(&mut self, args: &[u64]) -> u32 {
-        let ctx = self.loop_ctx.unwrap();
-        let reg = &mut *ctx.reg;
         let file_handle_out = args[0];
         let desired_access = nt_ulong_arg(args[1]);
         let share_access = nt_ulong_arg(args[4]);
@@ -32247,6 +32247,43 @@ impl ExecNtHandler {
                 return status;
             }
         };
+        if matches!(parse_root, FileParseRoot::Absolute)
+            && !Self::is_named_pipe_root_path(name16)
+            && !nt_fs::is_named_pipe_path(name16)
+        {
+            let resolved = driver_launch::resolve_hosted_device_file_name(
+                name16, captured.attributes & 0x40 != 0,
+            );
+            if matches!(&resolved, Err(status) if *status == nt_status::NtStatus::DEVICE_BUSY.raw() as u32) {
+                return match crate::native_file_target_open_work::capture(
+                    self, crate::native_file_target_open_work::Kind::Open,
+                    args, captured.clone(), name16, alloc::vec::Vec::new(),
+                ) {
+                    Ok(()) => STATUS_PENDING,
+                    Err(status) => status,
+                };
+            }
+            return self.nt_open_file_captured(args, &captured, parse_root, name16, Some(&resolved));
+        }
+        self.nt_open_file_captured(args, &captured, parse_root, name16, None)
+    }
+
+    /// Resume only from captured syscall inputs. A retained Object Manager lookup can call this
+    /// after its exact completion without reading the caller's mutable ObjectAttributes again.
+    pub(crate) unsafe fn nt_open_file_captured(
+        &mut self,
+        args: &[u64],
+        captured: &CapturedFileObjectAttributes,
+        parse_root: FileParseRoot,
+        name16: &[u16],
+        resolved: Option<&Result<(u64, alloc::vec::Vec<u16>), u32>>,
+    ) -> u32 {
+        let ctx = self.loop_ctx.unwrap();
+        let reg = &mut *ctx.reg;
+        let file_handle_out = args[0];
+        let desired_access = nt_ulong_arg(args[1]);
+        let share_access = nt_ulong_arg(args[4]);
+        let open_options = nt_ulong_arg(args[5]);
         let mut nb = [0u8; 96];
         let nlen = {
             let mut n = 0;
@@ -32405,7 +32442,12 @@ impl ExecNtHandler {
             return status;
         }
         if !Self::is_named_pipe_root_path(name16) && !nt_fs::is_named_pipe_path(name16) {
-            if let Some(status) = self.create_registered_driver_peer_file(
+            let owned_resolution = resolved.is_none().then(||
+                driver_launch::resolve_hosted_device_file_name(
+                    name16, captured.attributes & 0x40 != 0));
+            let resolved = resolved.unwrap_or_else(|| owned_resolution.as_ref().unwrap());
+            if let Some(status) = self.create_registered_driver_peer_file_from_resolved(
+                resolved,
                 name16,
                 captured.attributes,
                 desired_access,
@@ -32528,8 +32570,12 @@ impl ExecNtHandler {
                 print_sanitized_utf16_ascii(name16, 128);
                 print_str(b"\"\n");
             }
-            let status = self.create_registered_kernel_file(
-                parse_root,
+            let owned_resolution = resolved.is_none().then(||
+                driver_launch::resolve_hosted_device_file_name(
+                    name16, captured.attributes & 0x40 != 0));
+            let resolved = resolved.or(owned_resolution.as_ref());
+            let status = self.create_registered_kernel_file_from_resolved(
+                parse_root, resolved,
                 name16,
                 captured.attributes,
                 desired_access,

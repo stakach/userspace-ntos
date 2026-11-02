@@ -59,6 +59,7 @@ mod provider_registry_caller;
 mod provider_directory_broker;
 mod canonical_directory_port;
 mod native_directory_open_work;
+mod native_file_target_open_work;
 mod native_directory_effect_work;
 mod provider_section_broker;
 mod provider_service_ingress;
@@ -15464,6 +15465,22 @@ pub(crate) unsafe fn object_manager_resolve_file_target_owned(
     Ok((target.device_object, target.remaining_name))
 }
 
+pub(crate) unsafe fn object_manager_resolve_file_target_async(
+    path: &[u16],
+    case_insensitive: bool,
+) -> nt_object_client::FileTargetOwnedOutcome {
+    let Some(client) = OBJECT_CLIENT_PTR.as_mut() else {
+        return nt_object_client::FileTargetOwnedOutcome::NoEffect(nt_status::NtStatus::DEVICE_NOT_READY);
+    };
+    client.resolve_file_target_owned(path, case_insensitive)
+}
+
+pub(crate) unsafe fn object_manager_poll_file_target_async(
+    pending: &nt_object_client::PendingFileTargetCall,
+) -> Option<nt_object_client::FileTargetOwnedTerminal> {
+    OBJECT_CLIENT_PTR.as_mut()?.poll_file_target_owned(pending)
+}
+
 pub(crate) unsafe fn object_manager_create_file_handle(
     owner_component: u64,
     owner_local_id: u64,
@@ -17273,6 +17290,7 @@ unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
         + subdrain!(19, provider_section_broker::wake_due(now_100ns))
         + subdrain!(21, provider_directory_broker::wake_due(now_100ns))
         + subdrain!(22, native_directory_open_work::wake_due(now_100ns))
+        + subdrain!(22, native_file_target_open_work::wake_due(now_100ns))
         + subdrain!(23, native_directory_effect_work::wake_due(now_100ns))
 }
 
@@ -18238,6 +18256,7 @@ unsafe fn release_unpublished_sec_image_spawn(
 unsafe fn hosted_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
     let _ = power_manager::remove_thread_execution_state(tid);
     native_directory_open_work::abandon_thread(tid);
+    native_file_target_open_work::abandon_thread(tid);
     native_directory_effect_work::abandon_thread(tid);
     native_directory_effect_work::abandon_detached_thread(handler, tid);
     let _ = crate::service_sec_image::pending_driver_start_abandon_thread(handler, tid);
@@ -23374,6 +23393,7 @@ struct ExecNtHandler {
     >,
     /// A native directory syscall reserved before its original Reply is parked.
     pending_native_directory_open_transfer: Option<native_directory_open_work::PendingNativeDirectoryOpen>,
+    pending_native_file_target_transfer: Option<native_file_target_open_work::PendingNativeFileTargetOpen>,
     pending_native_directory_effect_transfer: Option<native_directory_effect_work::PendingNativeDirectoryEffect>,
     data_section_security: alloc::vec::Vec<exec_handler::named_data_sections::DataSectionSecurity>,
     data_section_names: alloc::vec::Vec<exec_handler::named_data_sections::DataSectionName>,

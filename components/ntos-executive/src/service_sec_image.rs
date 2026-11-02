@@ -3351,6 +3351,7 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
     {
         let _message = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
         unsafe { crate::native_directory_open_work::redrive(nt_handler) };
+        unsafe { crate::native_file_target_open_work::redrive(nt_handler) };
         unsafe { crate::native_directory_effect_work::redrive_effects(nt_handler) };
         unsafe { crate::native_directory_effect_work::redrive_detached(nt_handler) };
     }
@@ -3470,6 +3471,29 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
         return report_service_finalize_failure(b"volume-checkpoint", checkpoint_status);
     }
     checkpoint_status
+}
+
+/// The native lookup owner has already parked its original Reply. Publish a pending canonical
+/// CREATE with that saved capability, or cancel its unused File reservation after inline work.
+pub(crate) unsafe fn finish_preparked_file_target_dispatch(
+    handler: &mut ExecNtHandler,
+    status: u32,
+    reply: u64,
+    native_call_transport: bool,
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+) -> bool {
+    if let Some(pending) = handler.pending_file_io_transfer.as_mut() {
+        assert_eq!(status, nt_status::NtStatus::PENDING.raw() as u32);
+        assert_ne!(reply, 0);
+        assert_eq!(pending.reply_cap, 0);
+        pending.reply_cap = reply;
+        pending.reply_required = true;
+    }
+    file_dispatch_handoff::before_post_action(
+        handler, ExecPostAction::None, native_call_transport, resume_ip, sp, flags,
+    ).is_some()
 }
 
 fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
@@ -9720,6 +9744,7 @@ pub(crate) unsafe fn service_sec_image(
                 && !crate::mounted_volume::mounted_directory_outstanding()
                 && !driver_launch::mounted_native_physical_irp_pending()
                 && !crate::native_directory_open_work::occupied()
+                && !crate::native_file_target_open_work::occupied()
                 && !crate::native_directory_effect_work::has_outstanding(&nt_handler)
                 && !crate::provider_directory_broker::has_outstanding()
             {
@@ -9866,6 +9891,7 @@ pub(crate) unsafe fn service_sec_image(
                 && crate::section_pagein_work::next_deadline().is_none()
                 && crate::provider_section_broker::next_deadline().is_none()
                 && !crate::native_directory_open_work::occupied()
+                && !crate::native_file_target_open_work::occupied()
                 && !crate::native_directory_effect_work::has_outstanding(&nt_handler)
                 && !crate::provider_directory_broker::has_outstanding()
                 && crate::provider_directory_broker::next_deadline().is_none()
@@ -12095,6 +12121,7 @@ pub(crate) unsafe fn service_sec_image(
                         && !crate::mounted_volume::mounted_directory_outstanding()
                         && !driver_launch::mounted_native_physical_irp_pending()
                         && !crate::native_directory_open_work::occupied()
+                        && !crate::native_file_target_open_work::occupied()
                         && !crate::native_directory_effect_work::has_outstanding(&nt_handler)
                         && !crate::provider_directory_broker::has_outstanding()
                     {
@@ -13121,6 +13148,9 @@ pub(crate) unsafe fn service_sec_image(
             let mut transfer_native_directory_open: Option<
                 crate::native_directory_open_work::PendingNativeDirectoryOpen,
             > = None;
+            let mut transfer_native_file_target: Option<
+                crate::native_file_target_open_work::PendingNativeFileTargetOpen,
+            > = None;
             let mut transfer_native_directory_effect: Option<
                 crate::native_directory_effect_work::PendingNativeDirectoryEffect,
             > = None;
@@ -13294,6 +13324,8 @@ pub(crate) unsafe fn service_sec_image(
                     "previous syscall retained an accepted File transfer");
                 assert!(nt_handler.pending_native_directory_open_transfer.is_none(),
                     "previous syscall retained a native directory Reply transfer");
+                assert!(nt_handler.pending_native_file_target_transfer.is_none(),
+                    "previous syscall retained a native file target Reply transfer");
                 assert!(nt_handler.pending_native_directory_effect_transfer.is_none(),
                     "previous syscall retained a native directory effect Reply transfer");
                 nt_handler.pending_file_io_wait = false;
@@ -14121,6 +14153,7 @@ pub(crate) unsafe fn service_sec_image(
                     transfer_pending_driver_start = Some(transfer);
                 }
                 transfer_native_directory_open = nt_handler.pending_native_directory_open_transfer.take();
+                transfer_native_file_target = nt_handler.pending_native_file_target_transfer.take();
                 transfer_native_directory_effect = nt_handler.pending_native_directory_effect_transfer.take();
                 if let Some(transfer) = nt_handler.pending_pnp_operation_transfer.take() {
                     transfer_pending_pnp_operation = Some(transfer);
@@ -19515,6 +19548,24 @@ pub(crate) unsafe fn service_sec_image(
                 m2 = nm2;
                 m3 = nm3;
                 continue;
+            }
+            if let Some(transfer) = transfer_native_file_target.take() {
+                match unsafe { crate::native_file_target_open_work::park(&mut nt_handler, transfer) } {
+                    Ok(()) => {
+                        mark_wait_parked!(pi, resume_ip);
+                        let _ = finalize_service_loop_state(&mut nt_handler);
+                        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                        let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                        badge = nb;
+                        mi = nmi;
+                        m0 = nm0;
+                        m1 = nm1;
+                        m2 = nm2;
+                        m3 = nm3;
+                        continue;
+                    }
+                    Err(status) => result = status as u64,
+                }
             }
             if let Some(transfer) = transfer_native_directory_open.take() {
                 match unsafe { crate::native_directory_open_work::park(&mut nt_handler, transfer) } {
@@ -26998,7 +27049,11 @@ unsafe fn pending_file_io_transfer(
         panic!("pre-dispatch pending File reservation rejected its exact IRP");
     }
 
-    pending.native_call_transport = native_call_transport;
+    // A preparked Reply belongs to the original native caller, not the timer or ingress
+    // event that happens to redrive its File CREATE.
+    if pending.reply_cap == 0 {
+        pending.native_call_transport = native_call_transport;
+    }
     if !wait_for_completion {
         assert_eq!(pending.reply_cap, 0, "nonwaiting File transfer retained a parked Reply");
         let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);

@@ -43266,6 +43266,12 @@ pub(crate) fn resolve_hosted_device_file_name(
     hosted_io_create_file_ingress::resolve_absolute_name(name, case_insensitive)
 }
 
+pub(crate) fn registered_device_for_file_target(
+    target: nt_object_client::FilePathTarget,
+) -> Result<(u64, alloc::vec::Vec<u16>), u32> {
+    hosted_io_create_file_ingress::from_resolved_file_target(target)
+}
+
 pub(crate) fn require_registered_kernel_filesystem_device(device_id: u64) -> Result<(), u32> {
     let device = io_manager_mut()
         .device(nt_io_manager::DeviceId(device_id))

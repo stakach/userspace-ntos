@@ -11,6 +11,8 @@ fn pending_file_handoff_accepts_one_validated_preparked_reply_without_a_second_p
         .split_once("unsafe fn file_irp_drain_transfer(").unwrap().0;
     let preparked = transfer.find("if pending.reply_cap != 0")
         .expect("a prepared Reply needs an explicit transfer branch");
+    assert!(transfer[..preparked].contains("if pending.reply_cap == 0 {\n        pending.native_call_transport = native_call_transport;"),
+        "a timer redrive must preserve the original caller's native transport");
     let active = transfer.find("let stolen = REPLY_MAIN_SLOT.load")
         .expect("ordinary pending File calls still park the active Reply");
     assert!(preparked < active, "preparked ownership must be selected before the active Reply");
