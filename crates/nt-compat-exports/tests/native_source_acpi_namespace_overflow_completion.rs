@@ -14,15 +14,16 @@ fn pending_acpi_namespace_overflow_retains_exact_header() {
     assert!(driver.contains("control_code: read_volatile("));
     assert!(driver.contains("control_code: fsctl as u32"));
     assert!(driver.contains(
-        "target.control_code,\n            target.control_method,\n            target.output_capacity,\n            status,\n            information,"
+        "target.control_code,\n            target.control_method,\n            target.buffered_output_capacity,\n            target.output_capacity,\n            status,\n            information,"
     ));
     assert!(driver.contains(
-        "completed.control_code,\n                completed.control_method,\n                outlen,\n                st as u32,\n                info,"
+        "completed.control_code,\n                completed.control_method,\n                completed.buffered_output_capacity,\n                outlen,\n                st as u32,\n                info,"
     ));
 
     let fixture = format!(
         "const IRP_MJ_PNP: u64 = 0x1b;\n\
          const IRP_MJ_DEVICE_CONTROL: u64 = 0x0e;\n\
+         const IRP_MJ_INTERNAL_DEVICE_CONTROL: u64 = 0x0f;\n\
          const STATUS_BUFFER_OVERFLOW: u32 = 0x80000005;\n\
          const STATUS_BUFFER_TOO_SMALL: u32 = 0xc0000023;\n\
          const HOSTED_ACPI_NAMESPACE_HEADER_LEN: usize = 8;\n\
@@ -35,16 +36,16 @@ fn pending_acpi_namespace_overflow_retains_exact_header() {
          {helper}\n\
          #[test] fn exact_acpi_probe_only() {{\n\
          assert_eq!(pending_irp_completion_output_len(IRP_MJ_DEVICE_CONTROL, 0, \
-         nt_acpi::IOCTL_ACPI_ENUM_CHILDREN, 0, 8, STATUS_BUFFER_OVERFLOW, 0), 8);\n\
+         nt_acpi::IOCTL_ACPI_ENUM_CHILDREN, 0, false, 8, STATUS_BUFFER_OVERFLOW, 0), 8);\n\
          assert_eq!(pending_irp_completion_output_len(IRP_MJ_DEVICE_CONTROL, 0, \
-         nt_acpi::IOCTL_ACPI_ENUM_CHILDREN, 0, 8, STATUS_BUFFER_TOO_SMALL, 0), 8);\n\
+         nt_acpi::IOCTL_ACPI_ENUM_CHILDREN, 0, false, 8, STATUS_BUFFER_TOO_SMALL, 0), 8);\n\
          assert_eq!(pending_irp_completion_output_len(IRP_MJ_DEVICE_CONTROL, 0, \
-         nt_acpi::IOCTL_ACPI_ENUM_CHILDREN, 0, 16, STATUS_BUFFER_OVERFLOW, 0), 0);\n\
+         nt_acpi::IOCTL_ACPI_ENUM_CHILDREN, 0, false, 16, STATUS_BUFFER_OVERFLOW, 0), 0);\n\
          assert_eq!(pending_irp_completion_output_len(IRP_MJ_DEVICE_CONTROL, 0, \
-         0x0032c024, 0, 8, STATUS_BUFFER_OVERFLOW, 0), 0);\n\
+         0x0032c024, 0, false, 8, STATUS_BUFFER_OVERFLOW, 0), 0);\n\
          assert_eq!(pending_irp_completion_output_len(IRP_MJ_DEVICE_CONTROL, 0, \
-         nt_acpi::IOCTL_ACPI_ENUM_CHILDREN, 0, 8, 0, 0), 0);\n\
-         assert_eq!(pending_irp_completion_output_len(IRP_MJ_PNP, 9, 0, 0, 64, 0, 0), 64);\n\
+         nt_acpi::IOCTL_ACPI_ENUM_CHILDREN, 0, false, 8, 0, 0), 0);\n\
+         assert_eq!(pending_irp_completion_output_len(IRP_MJ_PNP, 9, 0, 0, false, 64, 0, 0), 64);\n\
          }}"
     );
     let directory = std::env::temp_dir().join(format!(

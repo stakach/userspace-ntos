@@ -9,7 +9,7 @@ fn pending_capabilities_completion_uses_pnp_payload_length() {
     let completion = &driver[driver.find("unsafe fn complete_hosted_irp_with_owner(").unwrap()..];
     let completion = &completion[..completion.find("/// `PVOID IoAllocateErrorLogEntry").unwrap()];
     assert!(completion.contains(
-        "pending_irp_completion_output_len(\n            target.major as u64,\n            target.minor as u64,\n            target.control_code,\n            target.control_method,\n            target.output_capacity,\n            status,\n            information,\n        )"
+        "pending_irp_completion_output_len(\n            target.major as u64,\n            target.minor as u64,\n            target.control_code,\n            target.control_method,\n            target.buffered_output_capacity,\n            target.output_capacity,\n            status,\n            information,\n        )"
     ));
 
     let start = driver.find("fn pending_irp_completion_output_len(").unwrap();
@@ -20,6 +20,7 @@ fn pending_capabilities_completion_uses_pnp_payload_length() {
     let fixture = format!(
         "const IRP_MJ_PNP: u64 = 0x1b;\n\
          const IRP_MJ_DEVICE_CONTROL: u64 = 0x0e;\n\
+         const IRP_MJ_INTERNAL_DEVICE_CONTROL: u64 = 0x0f;\n\
          const STATUS_BUFFER_OVERFLOW: u32 = 0x80000005;\n\
          const STATUS_BUFFER_TOO_SMALL: u32 = 0xc0000023;\n\
          const HOSTED_ACPI_NAMESPACE_HEADER_LEN: usize = 8;\n\
@@ -31,8 +32,8 @@ fn pending_capabilities_completion_uses_pnp_payload_length() {
          _: u8, _: u8, _: u64, _: u64) -> u64 {{ 7 }} }}\n\
          {helper}\n\
          #[test] fn zero_information_still_retains_capabilities() {{\n\
-         assert_eq!(pending_irp_completion_output_len(IRP_MJ_PNP, 9, 0, 0, 64, 0, 0), 64);\n\
-         assert_eq!(pending_irp_completion_output_len(IRP_MJ_PNP, 8, 0, 0, 64, 0, 0), 7);\n\
+         assert_eq!(pending_irp_completion_output_len(IRP_MJ_PNP, 9, 0, 0, false, 64, 0, 0), 64);\n\
+         assert_eq!(pending_irp_completion_output_len(IRP_MJ_PNP, 8, 0, 0, false, 64, 0, 0), 7);\n\
          }}"
     );
     let directory = std::env::temp_dir().join(format!(
