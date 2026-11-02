@@ -493,6 +493,13 @@ fn trace_interface_retry_at(failures: u64) -> bool {
     failures != 0 && failures.is_power_of_two()
 }
 
+#[derive(Clone, Copy)]
+enum AdmitRetrySubstage {
+    None,
+    ValidateStorage,
+    PersistenceAdmit,
+}
+
 fn phase_name(phase: &Phase) -> &'static str {
     match phase {
         Phase::ProviderAdmit => "provider-admit", Phase::Begin(_) => "begin",
@@ -516,7 +523,7 @@ fn phase_name(phase: &Phase) -> &'static str {
 /// The registry writer can retry a retained provider mutation indefinitely. Log only the
 /// first and power-of-two failures of the same interface-registration owner/phase so a bounded
 /// boot names the refused CM step without flooding serial or changing its retry contract.
-fn trace_interface_retry(work: &Work, error: i32) {
+fn trace_interface_retry(work: &Work, error: i32, substage: AdmitRetrySubstage) {
     let Caller::Provider(provider::ProviderCaller {
         admission: provider::ProviderAdmission::InterfaceRegister(admission), ..
     }) = &work.caller else { return; };
@@ -535,6 +542,25 @@ fn trace_interface_retry(work: &Work, error: i32) {
     print_str(b" count="); print_u64(count);
     print_str(b" route="); print_u64(admission.dispatch.route().badge());
     print_str(b" phase="); print_str(phase.as_bytes());
+    if matches!(work.phase, Phase::Admit) {
+        print_str(b" admit-substage=");
+        print_str(match substage {
+            AdmitRetrySubstage::None => b"none",
+            AdmitRetrySubstage::ValidateStorage => b"validate-storage",
+            AdmitRetrySubstage::PersistenceAdmit => b"persistence-admit",
+        });
+        print_str(b" storage-owner=");
+        print_str(match &work.persistence.owner {
+            PersistenceOwner::Unadmitted => b"unadmitted",
+            PersistenceOwner::NoStorage => b"no-storage",
+            PersistenceOwner::Admitting { .. } => b"admitting",
+            PersistenceOwner::Legacy(_) => b"legacy",
+            PersistenceOwner::Wal(_) => b"wal",
+        });
+        if let Some(recheck_id) = work.persistence.admission_recheck_id() {
+            print_str(b" recheck-id="); print_u64(recheck_id);
+        }
+    }
     print_str(b" error=0x"); print_hex_u64(error as u32 as u64);
     print_str(b" work-status=0x"); print_hex_u64(work.status as u64);
     print_str(b" expected-generation="); print_u64(admission.expected_generation);
@@ -1031,13 +1057,14 @@ unsafe fn redrive_inner(mut context: HostedContext<'_>) -> bool {
             *core::ptr::addr_of_mut!(EXECUTING) =
                 if matches!(work.phase, Phase::ReconcileRuntime) { None } else { work.caller.logical() };
             let previous_phase = phase_progress_fingerprint(&work.phase);
-            match advance(&mut context, &mut work) {
+            let mut admit_retry_substage = AdmitRetrySubstage::None;
+            match advance(&mut context, &mut work, &mut admit_retry_substage) {
                 Ok(true) => { completed = true; immediate_progress = true; break; }
                 Ok(false) => {
                     immediate_progress = previous_phase != phase_progress_fingerprint(&work.phase);
                 }
                 Err(status) => {
-                    trace_interface_retry(&work, status);
+                    trace_interface_retry(&work, status, admit_retry_substage);
                     failed = true;
                     immediate_progress = false;
                     break;
@@ -1071,6 +1098,7 @@ unsafe fn caller_cancelled(handler: &ExecNtHandler, caller: &HostedCaller) -> bo
 unsafe fn advance(
     context: &mut HostedContext<'_>,
     work: &mut Work,
+    admit_retry_substage: &mut AdmitRetrySubstage,
 ) -> Result<bool, i32> {
     work.cancelled |= match &work.caller {
         Caller::Hosted(caller) => caller_cancelled(&*context.as_ref().unwrap().0, caller),
@@ -1200,6 +1228,7 @@ unsafe fn advance(
             let prepared = work.prepared.as_ref().unwrap();
             if let Err(status) = cm_mutation_transport::validate_storage(prepared) {
                 if status == nt_status::NtStatus::DEVICE_BUSY.raw() {
+                    *admit_retry_substage = AdmitRetrySubstage::ValidateStorage;
                     return Err(status);
                 }
                 work.status = status as u32;
@@ -1213,6 +1242,7 @@ unsafe fn advance(
                     work.phase = if work.persistence.has_journal() { Phase::Durable } else { Phase::Commit };
                 }
                 Err(status) if status == nt_status::NtStatus::DEVICE_BUSY.raw() as u32 => {
+                    *admit_retry_substage = AdmitRetrySubstage::PersistenceAdmit;
                     return Err(status as i32)
                 }
                 Err(status) => {
