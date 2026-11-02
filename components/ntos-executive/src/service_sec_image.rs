@@ -27103,6 +27103,10 @@ unsafe fn pending_file_io_redrive_pass(
                 .get(id)
                 .and_then(|transaction| transaction.terminal_result())
         });
+        let attribute_inline_terminal = match pending.operation {
+            nt_io_manager::PendingFileIoOperation::AttributeQuery(operation) => operation.inline_terminal,
+            _ => None,
+        };
         // Once local output is committed, the I/O owner retains the terminal result even after
         // the FSD acknowledges its bytes. Later surface/reference retries must not re-query it.
         let local_terminal = if let Some(terminal) = pending.owned_terminal_result() {
@@ -27141,7 +27145,8 @@ unsafe fn pending_file_io_redrive_pass(
         {
             continue;
         }
-        if completed.is_none() && transaction_terminal.is_none() && local_terminal.is_none() {
+        if completed.is_none() && transaction_terminal.is_none()
+            && attribute_inline_terminal.is_none() && local_terminal.is_none() {
             if !pending.is_local() && driver_launch::completed_irp_copy_requires_retry(pending.irp_id) {
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
             }
@@ -27201,11 +27206,13 @@ unsafe fn pending_file_io_redrive_pass(
         let mut delivery_state = pending.delivery_state;
         let mut terminal_status = transaction_terminal
             .map(|result| result.0)
+            .or_else(|| attribute_inline_terminal.map(|result| result.0))
             .or_else(|| local_terminal.map(|result| result.0))
             .or_else(|| completed.map(|completion| completion.status))
             .expect("pending File owner has no terminal status");
         let mut terminal_information = transaction_terminal
             .map(|result| result.1)
+            .or_else(|| attribute_inline_terminal.map(|result| result.1))
             .or_else(|| local_terminal.map(|result| result.1))
             .or_else(|| completed.map(|completion| completion.information))
             .expect("pending File owner has no terminal information");
@@ -27222,6 +27229,69 @@ unsafe fn pending_file_io_redrive_pass(
             }
         }
         let mut backend_ack_required = completed.is_some();
+        if let nt_io_manager::PendingFileIoOperation::AttributeQuery(operation) = pending.operation {
+            if pending.major == nt_io_abi::major::IRP_MJ_CREATE {
+                let create = completed.expect("attribute CREATE lost its exact completion");
+                if driver_launch::acknowledge_completed_irp(pending.irp_id).is_err() {
+                    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                    restore_file_io_mirrors!();
+                    continue;
+                }
+                let file_id = hosted_file_id.expect("attribute CREATE lost its File");
+                if (create.status as i32) < 0 {
+                    (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                        .complete_attribute_query_inline_owner_exact(identity, pending.irp_id,
+                            create.status, 0)
+                        .expect("attribute CREATE terminal lost owner");
+                } else {
+                    let mut output = [0u8; 56];
+                    let length = if operation.information_class == nt_fs::FILE_BASIC_INFORMATION {
+                        40usize
+                    } else { 56usize };
+                    let query = pending_file_native_caller(nt_handler, identity, pending)
+                        .and_then(|caller| driver_launch::dispatch_hosted_file_irp_result_exact(
+                            file_id, nt_io_abi::major::IRP_MJ_QUERY_INFORMATION as u64,
+                            operation.information_class as u64, caller, &[],
+                            &mut output[..length], 0));
+                    match query {
+                        Ok((status, _, Some(irp_id), _)) if status == nt_status::NtStatus::PENDING.raw() => {
+                            (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                                .retarget_attribute_query_owner_exact(identity, pending.irp_id,
+                                    irp_id.raw())
+                                .expect("attribute query lost CREATE owner");
+                        }
+                        result => {
+                            let (status, information) = match result {
+                                Ok((status, information, None, _)) if status >= 0 => {
+                                    if information != length as u64 {
+                                        (nt_fs::STATUS_DATA_ERROR, 0)
+                                    } else if nt_handler.xas_try_write_buf(pending.output_va,
+                                        &output[..length]) {
+                                        (status as u32, information)
+                                    } else { (0xC000_0005, 0) }
+                                }
+                                Ok((status, _, _, _)) => (status as u32, 0),
+                                Err(status) => (status, 0),
+                            };
+                            (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                                .complete_attribute_query_inline_owner_exact(identity, pending.irp_id,
+                                    status, information)
+                                .expect("inline attribute query lost CREATE owner");
+                        }
+                    }
+                }
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_file_io_mirrors!();
+                continue;
+            }
+            if pending.major == nt_io_abi::major::IRP_MJ_QUERY_INFORMATION
+                && (terminal_status as i32) >= 0
+                && terminal_information != u64::from(pending.output_len)
+            {
+                terminal_status = nt_fs::STATUS_DATA_ERROR;
+                terminal_information = 0;
+            }
+        }
         if pending.major == nt_io_abi::major::IRP_MJ_QUERY_INFORMATION {
             if let Some(transaction_id) = set_file_name_id {
                 let phase = (&*core::ptr::addr_of!(PENDING_SET_FILE_NAMES))
@@ -27915,6 +27985,15 @@ unsafe fn pending_file_io_redrive_pass(
             !matches!(pending.operation, nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(_)),
             "nonterminal mode preparation cannot retire its retained File owner",
         );
+        if matches!(pending.operation, nt_io_manager::PendingFileIoOperation::AttributeQuery(_)) {
+            if driver_launch::abandon_unpublished_hosted_file(
+                hosted_file_id.expect("attribute query lost its File route")
+            ).is_err() {
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_file_io_mirrors!();
+                continue;
+            }
+        }
         let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
         let finished = table
             .finish_owner_exact(identity, pending.irp_id)
@@ -27965,6 +28044,7 @@ unsafe fn pending_file_io_redrive_pass(
                 }
                 nt_handler.release_file_reference(finished.route.hosted_file_id().expect("provider rename lost its File route"));
             }
+            nt_io_manager::PendingFileIoOperation::AttributeQuery(_) => {}
             nt_io_manager::PendingFileIoOperation::LocalByteLock(_)
             | nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(_)
             | nt_io_manager::PendingFileIoOperation::OwnedInline(_)

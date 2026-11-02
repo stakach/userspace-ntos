@@ -122,6 +122,9 @@ mod file_capture;
 #[path = "exec_file_create.rs"]
 mod file_create;
 
+#[path = "exec_attribute_query.rs"]
+pub(crate) mod attribute_query;
+
 #[path = "exec_named_device_route.rs"]
 mod named_device_route;
 
@@ -31754,6 +31757,15 @@ impl ExecNtHandler {
                 STATUS_ACCESS_VIOLATION
             };
         }
+        if crate::writable_fs::registry_journal::owns_volume() {
+            let folded = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_FOLDED_SCRATCH) };
+            let relative = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_RELATIVE_SCRATCH) };
+            if crate::writable_fs::volume_path_into(name16, folded, relative).is_some() {
+                return self.query_native_mounted_attributes(
+                    name16, captured.attributes, nt_fs::FILE_BASIC_INFORMATION, args[1],
+                ).unwrap_or(STATUS_DEVICE_NOT_READY);
+            }
+        }
         // The writable overlay wins for paths it owns. A miss is not enough to hide an installed
         // read-only file that has not been modified yet, so unresolved prefix paths continue into
         // the FAT lookup below.
@@ -31794,6 +31806,9 @@ impl ExecNtHandler {
                 };
             }
         }
+        if let Some(status) = self.query_native_mounted_attributes(
+            name16, captured.attributes, nt_fs::FILE_BASIC_INFORMATION, args[1],
+        ) { return status; }
         // General read-only namespace lookup. This is intentionally below the writable mount so
         // Profile paths stay overlay-backed; all remaining names resolve through mounted FAT.
         trace_sync_fat_after_handoff(3, b"absolute-attr-fat", self.pi,
@@ -31884,6 +31899,16 @@ impl ExecNtHandler {
             };
         }
 
+        if crate::writable_fs::registry_journal::owns_volume() {
+            let folded = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_FOLDED_SCRATCH) };
+            let relative = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_RELATIVE_SCRATCH) };
+            if crate::writable_fs::volume_path_into(name16, folded, relative).is_some() {
+                return self.query_native_mounted_attributes(
+                    name16, captured.attributes, nt_fs::FILE_NETWORK_OPEN_INFORMATION, args[1],
+                ).unwrap_or(STATUS_DEVICE_NOT_READY);
+            }
+        }
+
         let folded_scratch = unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_FOLDED_SCRATCH) };
         let relative_scratch =
             unsafe { &mut *core::ptr::addr_of_mut!(NT_QUERY_ATTR_RELATIVE_SCRATCH) };
@@ -31922,6 +31947,9 @@ impl ExecNtHandler {
             }
         }
 
+        if let Some(status) = self.query_native_mounted_attributes(
+            name16, captured.attributes, nt_fs::FILE_NETWORK_OPEN_INFORMATION, args[1],
+        ) { return status; }
         trace_sync_fat_after_handoff(5, b"absolute-full-attr-fat", self.pi,
             self.current_tid as u64, None, name16);
         if let Some(info) =

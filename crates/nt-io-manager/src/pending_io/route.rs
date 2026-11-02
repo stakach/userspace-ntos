@@ -57,6 +57,7 @@ impl PendingFileIo {
         match self.operation {
             PendingFileIoOperation::Transfer
             | PendingFileIoOperation::Create(_)
+            | PendingFileIoOperation::AttributeQuery(_)
             | PendingFileIoOperation::SetFileName(_) => matches!(self.route, Hosted(_)),
             PendingFileIoOperation::LocalByteLock(_) => {
                 matches!(self.route, Local(ReadonlyFile(_) | Overlay(_)))

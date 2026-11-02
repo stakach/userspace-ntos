@@ -90,6 +90,14 @@ pub struct PendingSetFileNameOperation {
     pub target_file_id: u64,
 }
 
+/// An internal, process-handle-free File CREATE followed by QUERY_INFORMATION for a
+/// name-based attribute syscall. The same File and caller own both exact IRPs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingFileAttributeQuery {
+    pub information_class: u32,
+    pub inline_terminal: Option<(u32, u64)>,
+}
+
 /// Terminal state for one local-filesystem byte-range lock wait. Provider-backed locks retain a
 /// canonical IRP and use [`PendingFileIoOperation::Transfer`]; this variant lets the same delivery
 /// owner publish local FSD completions without pretending that an executive IRP exists.
@@ -141,6 +149,7 @@ pub enum PendingFileIoOperation {
     Transfer,
     Create(PendingFileCreate),
     SetFileName(PendingSetFileNameOperation),
+    AttributeQuery(PendingFileAttributeQuery),
     LocalByteLock(PendingLocalByteLock),
     LocalDirectoryNotify(PendingLocalDirectoryNotify),
     OwnedInline(PendingOwnedInline),
@@ -543,6 +552,21 @@ impl PendingFileIoTable {
                     && !pending.publish_iocp
                     && pending.event_obj_idx == u64::MAX
             }
+            PendingFileIoOperation::AttributeQuery(operation) => {
+                matches!(pending.major,
+                    nt_io_abi::major::IRP_MJ_CREATE | nt_io_abi::major::IRP_MJ_QUERY_INFORMATION)
+                    && matches!(operation.information_class,
+                        nt_fs::FILE_BASIC_INFORMATION | nt_fs::FILE_NETWORK_OPEN_INFORMATION)
+                    && pending.output_va != 0
+                    && pending.output_len == if operation.information_class
+                        == nt_fs::FILE_BASIC_INFORMATION { 40 } else { 56 }
+                    && pending.iosb_va == 0
+                    && pending.apc_routine == 0
+                    && !pending.signal_file
+                    && !pending.publish_iocp
+                    && pending.event_obj_idx == u64::MAX
+                    && pending.busy.is_none()
+            }
             PendingFileIoOperation::LocalByteLock(operation) => {
                 pending.major == nt_io_abi::major::IRP_MJ_LOCK_CONTROL
                     && operation.wait_id != 0
@@ -917,6 +941,47 @@ impl PendingFileIoTable {
         }
         pending.irp_id = new_irp_id;
         pending.major = nt_io_abi::major::IRP_MJ_SET_INFORMATION;
+        Some(())
+    }
+
+    /// Transfer a name-based attribute owner from an acknowledged CREATE to its query IRP.
+    pub fn retarget_attribute_query_exact(
+        &mut self,
+        slot: usize,
+        old_irp_id: u64,
+        new_irp_id: u64,
+    ) -> Option<()> {
+        if self.apc_owned_slot(slot) { return None; }
+        let pending = self.slots.get_mut(slot)?.as_mut()?;
+        if pending.irp_id != old_irp_id || new_irp_id == 0
+            || pending.major != nt_io_abi::major::IRP_MJ_CREATE
+            || !matches!(pending.operation,
+                PendingFileIoOperation::AttributeQuery(PendingFileAttributeQuery { inline_terminal: None, .. }))
+            || pending.delivery_state != 0
+            || pending.busy.is_some_and(|busy| !busy.release_unstarted())
+        { return None; }
+        pending.irp_id = new_irp_id;
+        pending.major = nt_io_abi::major::IRP_MJ_QUERY_INFORMATION;
+        Some(())
+    }
+
+    /// A successful CREATE may be followed by an inline QUERY. Its output has already been
+    /// copied by the executive; the row still owns the original reply and File retirement.
+    pub fn complete_attribute_query_inline_exact(
+        &mut self, slot: usize, create_irp_id: u64, status: u32, information: u64,
+    ) -> Option<()> {
+        let pending = self.slots.get_mut(slot)?.as_mut()?;
+        let PendingFileIoOperation::AttributeQuery(mut operation) = pending.operation else { return None; };
+        if pending.irp_id != create_irp_id
+            || pending.major != nt_io_abi::major::IRP_MJ_CREATE
+            || pending.delivery_state != 0
+            || operation.inline_terminal.is_some()
+            || status == nt_status::NtStatus::PENDING.raw() as u32
+        { return None; }
+        operation.inline_terminal = Some((status, information));
+        pending.operation = PendingFileIoOperation::AttributeQuery(operation);
+        pending.major = nt_io_abi::major::IRP_MJ_QUERY_INFORMATION;
+        pending.delivery_state = IO_DELIVERY_BUFFER_PUBLISHED;
         Some(())
     }
 

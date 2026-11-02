@@ -25,11 +25,20 @@ pub(crate) fn draining_exec_volume_device() -> Option<u64> {
     ) {
         return None;
     }
+    exec_volume_device_for_mount(physical)
+}
+
+fn exec_volume_device_for_mount(physical: SectionMountId) -> Option<u64> {
     let (bound, device_id) = unsafe { *core::ptr::addr_of!(EXEC_VOLUME_DEVICE) }?;
     if bound != physical || mount_id_for_live_device(device_id).is_none() {
         return None;
     }
     Some(device_id)
+}
+
+/// The canonical File device for the exact mounted volume, including Boot-v2 journal ownership.
+pub(crate) fn exec_volume_device() -> Option<u64> {
+    exec_volume_device_for_mount(unsafe { crate::fs_loader::exec_fs_mount_identity() }?)
 }
 
 /// Catalog lookup alias for a routed File on the exact live installed-volume device.

@@ -42,6 +42,24 @@ impl PendingFileIoTable {
         self.retarget_set_file_name_irp_exact(identity.slot, old_irp_id, new_irp_id)
     }
 
+    pub fn retarget_attribute_query_owner_exact(
+        &mut self,
+        identity: PendingFileIoIdentity,
+        old_irp_id: u64,
+        new_irp_id: u64,
+    ) -> Option<()> {
+        self.get_exact(identity)?;
+        self.retarget_attribute_query_exact(identity.slot, old_irp_id, new_irp_id)
+    }
+
+    pub fn complete_attribute_query_inline_owner_exact(
+        &mut self, identity: PendingFileIoIdentity, create_irp_id: u64,
+        status: u32, information: u64,
+    ) -> Option<()> {
+        self.get_exact(identity)?;
+        self.complete_attribute_query_inline_exact(identity.slot, create_irp_id, status, information)
+    }
+
     pub fn retarget_set_file_name_query_owner_exact(
         &mut self,
         identity: PendingFileIoIdentity,

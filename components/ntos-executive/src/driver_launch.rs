@@ -43291,7 +43291,8 @@ fn pump_io_manager() -> usize {
 }
 
 pub(crate) fn pump_registered_file_lifecycle() -> usize {
-    pump_io_manager()
+    let retried = crate::exec_handler::attribute_query::retry_attribute_releases();
+    retried + pump_io_manager()
 }
 
 pub(crate) fn service_pending_file_backends() -> usize {
