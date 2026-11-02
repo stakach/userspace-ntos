@@ -18,9 +18,10 @@ impl ReferencedDevice {
     pub(super) fn acquire(device: u64) -> Result<Self, i32> {
         let status =
             hosted_driver_object_reference::ob_reference_object_by_pointer(device, 0, 0, 0);
-        (status == STATUS_SUCCESS)
-            .then_some(Self(device))
-            .ok_or(status)
+        if status != STATUS_SUCCESS {
+            return Err(status);
+        }
+        Ok(Self(device))
     }
 }
 
