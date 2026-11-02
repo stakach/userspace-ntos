@@ -680,7 +680,10 @@ unsafe fn dispatch_claim(
             NATIVE_PENDING_BYTES.store(bytes as u64, Ordering::Relaxed);
             NATIVE_PENDING_SOURCE.store(u64::from(source == nt_fs::BlockSource::Snapshot), Ordering::Relaxed);
             NATIVE_PENDING_IRP.store(irp_id.raw(), Ordering::Release);
-            1
+            // The nested dispatch pump may already have drained this command's IRQ/DPC.
+            // Probe once now that its exact physical owner is installed; an unproven
+            // terminal or uncertain ACK leaves the slot occupied for a later wakeup.
+            1 + poll_pending()
         }
         Err(status) => {
             crate::fs_loader::cancel_unentered_exec_native_block(ticket)

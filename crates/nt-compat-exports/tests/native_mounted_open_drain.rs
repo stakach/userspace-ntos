@@ -290,6 +290,51 @@ fn native_completion_irq_polls_exact_physical_slot_before_receiving_again() {
 }
 
 #[test]
+fn irq_completed_during_nested_dispatch_is_polled_after_pending_slot_publication() {
+    // The component pump can service the physical IRQ and its DPC before the dispatch Call
+    // returns PENDING. At that point no native Pending slot exists for the IRQ path to poll.
+    // Installing the slot must therefore be followed by one exact completion probe in this
+    // guarded turn, without waiting for the next timer or replaying the physical command.
+    let source = include_str!("../../../components/ntos-executive/src/mounted_native_block.rs");
+    let service = source.split_once("pub(super) unsafe fn service() -> usize")
+        .expect("top-level native block service").1
+        .split_once("unsafe fn service_registry_exact(").expect("service boundary").0;
+    assert!(service.contains("NativeServiceGuard::enter()"),
+        "nested completion must not reenter the physical dispatcher");
+
+    let pending = source.split_once(
+        "Ok(hosted_file_owners::DispatchResult::Outstanding { irp_id }) => {")
+        .expect("retained pending dispatch branch").1
+        .split_once("\n        Err(status) => {").expect("pending dispatch boundary").0;
+    let installed = pending.find("*core::ptr::addr_of_mut!(PENDING) = Some(Pending {")
+        .expect("retain the exact physical claim, ticket and IRP before probing");
+    let published = pending.find("NATIVE_PENDING_IRP.store(irp_id.raw(), Ordering::Release)")
+        .expect("publish the exact pending IRP to nested observers");
+    let poll = pending.find("poll_pending()")
+        .expect("an IRQ completed inside dispatch must be observed before this turn returns");
+    assert!(installed < published && published < poll,
+        "the pending owner must exist before completion import or strict acknowledgement");
+    assert_eq!(pending.matches("poll_pending()").count(), 1,
+        "a single bounded probe suffices; an unproven completion remains pending");
+    assert!(!pending.contains("dispatch_claim(") && !pending.contains("loop {"),
+        "a nested completion must not recursively issue unbounded successors");
+
+    let completion = source.split_once("unsafe fn poll_pending() -> usize")
+        .expect("exact native completion poll").1
+        .split_once("static SERVICE_ACTIVE").expect("poll boundary").0;
+    for identity in ["completion.client_id", "completion.driver_id", "completion.device_id",
+        "completion.requestor_tid", "completion.major"] {
+        assert!(completion.contains(identity), "retain exact completion authority: {identity}");
+    }
+    let ack = completion.find("acknowledge_completed_irp_strict")
+        .expect("strict completion ACK");
+    let release = completion.find("slot.take().expect")
+        .expect("physical slot retirement after ACK");
+    assert!(ack < release && completion[ack..release].contains("return 0;"),
+        "uncertain ACK must retain the occupied physical slot");
+}
+
+#[test]
 fn pending_create_keeps_exact_mount_and_sector_until_native_completion() {
     let mut route = BlockRouteOwner::new(7, 1_000).unwrap();
     route.begin_drain(7).unwrap();
