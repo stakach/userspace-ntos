@@ -12,6 +12,42 @@ use std::process::Command;
 mod mounted_create_lookup;
 
 #[test]
+fn parked_mounted_create_remains_a_live_signaler_until_native_service_drives_it() {
+    let service = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
+    let native_block = include_str!("../../../components/ntos-executive/src/mounted_native_block.rs");
+    let driver = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    let volume = include_str!("../../../components/ntos-executive/src/mounted_volume.rs");
+
+    // The exact bootstat CREATE is retained after SMSS parks, even before any physical IRP
+    // has entered. A queue owner is sufficient to keep the native service lane runnable.
+    let mut queue = mounted_create_lookup::CreateLookupQueue::new();
+    queue.capture_resolved_root(1, 7, ()).unwrap();
+    assert!(queue.has_outstanding());
+    assert!(volume.contains("pub(crate) fn mounted_create_outstanding() -> bool"));
+    assert!(native_block.contains("crate::mounted_volume::claim_mounted_create_sector()"));
+    assert!(driver.contains("mounted_native_block::service()"));
+    assert!(service.contains("if badge == DELAY_TIMER_BADGE"));
+    assert!(service.contains("let native_blocks = driver_launch::service_mounted_native_blocks() as u64"));
+
+    // Every terminal all-parked admission must recognize that queued CREATE as a signaler.
+    // Keep each check local to its own guard; a mention elsewhere cannot satisfy this test.
+    let crash_guard = service.split_once("macro_rules! park_and_log")
+        .unwrap().1.split_once("macro_rules! mark_wait_parked").unwrap().0;
+    let waiting_guard = service.split_once("macro_rules! mark_wait_parked")
+        .unwrap().1.split_once("// Boot-milestone watchdog").unwrap().0;
+    let lsass_guard = service.split_once("b\"lsass-post-signal-fault\"")
+        .unwrap().1.split_once("[quiesce] every live process parked/waiting").unwrap().0;
+    for (name, guard) in [
+        ("crash park", crash_guard),
+        ("cooperative wait", waiting_guard),
+        ("LSASS fault", lsass_guard),
+    ] {
+        assert!(guard.contains("!crate::mounted_volume::mounted_create_outstanding()"),
+            "{name} quiesced while an exact mounted CREATE can still drive its parked caller");
+    }
+}
+
+#[test]
 fn absolute_installed_open_enters_mounted_create_before_synchronous_fat_fallback() {
     let source = include_str!("../../../components/ntos-executive/src/exec_handler.rs");
     let start = source.find("    fn route_absolute_open_to_kernel_file(")

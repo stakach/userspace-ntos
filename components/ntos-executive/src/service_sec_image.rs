@@ -9671,6 +9671,7 @@ pub(crate) unsafe fn service_sec_image(
                     b"all-live-parked",
                 )
                 && !defer_quiesce_for_active_user_callbacks(b"all-live-parked")
+                && !crate::mounted_volume::mounted_create_outstanding()
                 && !crate::mounted_volume::mounted_read_outstanding()
                 && !driver_launch::mounted_native_physical_irp_pending()
                 && !crate::native_directory_open_work::occupied()
@@ -9809,6 +9810,7 @@ pub(crate) unsafe fn service_sec_image(
                 && !defer_quiesce_for_active_user_callbacks(b"all-live-waiting")
                 && !driver_launch::native_disk_proof_hardware_irp_pending()
                 && !driver_launch::active_relation_wal_retained()
+                && !crate::mounted_volume::mounted_create_outstanding()
                 && !crate::mounted_volume::mounted_read_outstanding()
                 && !driver_launch::mounted_native_physical_irp_pending()
                 && crate::registry_mutation_work::next_deadline().is_none()
@@ -12033,6 +12035,7 @@ pub(crate) unsafe fn service_sec_image(
                         && !defer_quiesce_for_active_user_callbacks(b"lsass-post-signal-fault")
                         && !driver_launch::native_disk_proof_hardware_irp_pending()
                         && !driver_launch::active_relation_wal_retained()
+                        && !crate::mounted_volume::mounted_create_outstanding()
                         && !crate::mounted_volume::mounted_read_outstanding()
                         && !driver_launch::mounted_native_physical_irp_pending()
                         && !crate::native_directory_open_work::occupied()
