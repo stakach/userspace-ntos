@@ -6051,6 +6051,7 @@ pub(crate) unsafe fn nested_hosted_file_work_ready() -> bool {
         || crate::driver_launch::nested_hosted_driver_create_ready()
         || crate::driver_launch::nested_hosted_query_path_ready()
         || crate::driver_launch::nested_hosted_internal_control_ready()
+        || crate::driver_launch::nested_hosted_buffered_control_ready()
         || crate::driver_launch::nested_hosted_write_ready()
         || crate::driver_launch::nested_hosted_read_ready()
         || crate::driver_launch::nested_hosted_flush_ready()
@@ -6079,6 +6080,8 @@ pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {
         && crate::driver_launch::redrive_nested_hosted_query_path(handler);
     let internal_control = crate::driver_launch::nested_hosted_internal_control_ready()
         && crate::driver_launch::redrive_nested_hosted_internal_control(handler);
+    let buffered_control = crate::driver_launch::nested_hosted_buffered_control_ready()
+        && crate::driver_launch::redrive_nested_hosted_buffered_control(handler);
     let write = crate::driver_launch::nested_hosted_write_ready()
         && crate::driver_launch::redrive_nested_hosted_write(handler);
     let read = crate::driver_launch::nested_hosted_read_ready()
@@ -6107,7 +6110,7 @@ pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {
     let directory = crate::provider_directory_broker::nested_work_ready()
         && crate::provider_directory_broker::redrive_nested_ready(handler);
     crate::provider_mm_section_objects::redrive(handler);
-    create || query || internal_control || write || read || flush || query_information || lower_pnp || lower_file || input || kernel_file_query || win32k_async_read || lifecycle || close || source || section || directory
+    create || query || internal_control || buffered_control || write || read || flush || query_information || lower_pnp || lower_file || input || kernel_file_query || win32k_async_read || lifecycle || close || source || section || directory
 }
 
 pub(crate) unsafe fn watchdog_defer_if_hosted_work_can_run(site: &[u8]) -> bool {
@@ -9980,6 +9983,7 @@ pub(crate) unsafe fn service_sec_image(
             crate::driver_launch::redrive_hosted_driver_io_create_file(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_query_path_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_internal_control_forward(nt_handler as *mut _);
+            crate::driver_launch::redrive_hosted_buffered_control_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_scsi_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_write_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_read_forward(nt_handler as *mut _);

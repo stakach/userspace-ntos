@@ -540,6 +540,29 @@ fn recycled_pool_generation_invalidates_captured_identity() {
 }
 
 #[test]
+fn buffered_control_system_buffer_keeps_exact_interior_pool_generation_and_extent() {
+    reset(POOL_DATA_OFF + 16 + 0x80, 0x80, 7, false);
+    let interior = FSD_POOL_VADDR + POOL_DATA_OFF + 16 + 4;
+    let captured = unsafe { pool_range_identity_unlocked(instance(), interior, 12) }
+        .expect("live interior SystemBuffer with max(input, output) extent");
+    assert_eq!(captured.component_address, interior - 4);
+    assert_eq!(captured.capacity, 0x80);
+    assert_eq!(captured.pool_generation, 7);
+    assert_eq!(unsafe { pool_range_identity_unlocked(instance(), interior, 12) }, Some(captured));
+
+    MEMORY.with(|memory| {
+        memory.borrow_mut().words.insert(instance().exec_pool_va + POOL_DATA_OFF + 8, 8);
+    });
+    assert_ne!(unsafe { pool_range_identity_unlocked(instance(), interior, 12) }, Some(captured),
+        "reused allocation cannot receive source completion bytes");
+
+    reset(POOL_DATA_OFF + 16 + 0x20, 0x20, 7, false);
+    let near_end = FSD_POOL_VADDR + POOL_DATA_OFF + 16 + 0x1c;
+    assert_eq!(unsafe { pool_range_identity_unlocked(instance(), near_end, 8) }, None,
+        "declared output cannot extend across the allocation boundary");
+}
+
+#[test]
 fn pool_address_cannot_revalidate_as_generationless_mapped_range() {
     reset(POOL_DATA_OFF + 16 + 0x80, 0x80, 7, false);
     let address = FSD_POOL_VADDR + POOL_DATA_OFF + 16;

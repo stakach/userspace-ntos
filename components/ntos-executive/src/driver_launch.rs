@@ -258,6 +258,8 @@ mod hosted_write_capture;
 mod hosted_read_capture;
 #[path = "hosted_internal_control_capture.rs"]
 mod hosted_internal_control_capture;
+#[path = "hosted_buffered_control_capture.rs"]
+mod hosted_buffered_control_capture;
 #[path = "hosted_flush_capture.rs"]
 mod hosted_flush_capture;
 #[path = "hosted_query_information_capture.rs"]
@@ -270,6 +272,8 @@ mod hosted_write_work;
 mod hosted_read_work;
 #[path = "hosted_internal_control_work.rs"]
 mod hosted_internal_control_work;
+#[path = "hosted_buffered_control_work.rs"]
+mod hosted_buffered_control_work;
 #[path = "hosted_scsi_srb_capture.rs"]
 mod hosted_scsi_srb_capture;
 #[path = "hosted_scsi_srb_provider.rs"]
@@ -1282,6 +1286,7 @@ pub const FSD_SERVICE_IO_CREATE_FILE_LABEL: u64 = 0x78E;
 // 0x880..=0x889 belongs to nt-unwind's SEH transport on this same endpoint.
 pub const FSD_SERVICE_SOURCE_IRP_LABEL: u64 = 0x799;
 pub const FSD_SERVICE_QUERY_PATH_FORWARD_LABEL: u64 = 0x79A;
+pub const FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL: u64 = 0x7F0;
 pub const FSD_SERVICE_TOKEN_QUERY_LABEL: u64 = 0x79B;
 pub(crate) const FSD_SERVICE_PRIMARY_TOKEN_LABEL: u64 = 0x7D6;
 pub const FSD_SERVICE_CREATE_SUBJECT_LABEL: u64 = 0x79C;
@@ -1365,6 +1370,7 @@ const _: () = {
     let labels = [
         FSD_SERVICE_SOURCE_IRP_LABEL,
         FSD_SERVICE_QUERY_PATH_FORWARD_LABEL,
+        FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL,
         FSD_SERVICE_TOKEN_QUERY_LABEL,
         FSD_SERVICE_CREATE_SUBJECT_LABEL,
         FSD_SERVICE_ZW_FS_CONTROL_FILE_LABEL,
@@ -9759,6 +9765,59 @@ unsafe fn forward_hosted_internal_control(
     status as u32 as i32
 }
 
+/// A source-created METHOD_BUFFERED control IRP sent to a foreign lower PDO.
+/// The root retains its exact source allocation and canonical provider result
+/// before the source-local completion routine may observe it.
+unsafe fn forward_hosted_buffered_control(
+    device: u64, irp: u64, next: u64, current_location_after_forward: u8,
+) -> i32 {
+    write_unaligned((next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64, device);
+    let (label, status, accepted, token, _) = call_on4(
+        (FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL << 12) | 4,
+        1, device, irp, 0,
+    );
+    if label != 0 || accepted > 1 || (accepted != 0 && token == 0) {
+        crate::provider_bugcheck::report(
+            0xc4, [FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL, 1, irp, label],
+        );
+    }
+    let status = status as u32 as i32;
+    if accepted == 0 {
+        // The source packet was already checked by s_iof_call_driver. Classpnp
+        // reads IoStatus even after a direct IoCallDriver refusal, so publish
+        // the definite failure rather than leaving its zero-initialized SUCCESS.
+        write_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32, status);
+        write_unaligned((irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *mut u64, 0);
+        return status;
+    }
+    write_unaligned((irp + WDM_X64_IRP_CURRENT_LOCATION_OFFSET) as *mut u8,
+        current_location_after_forward);
+    write_unaligned((irp + 0xb8) as *mut u64, next);
+    let completion = complete_hosted_irp_with_owner(irp);
+    if completion.outcome == HostedIrpUnwindOutcome::MoreProcessingRequired {
+        let (ack_label, ack_status, _, _, _) = call_on4(
+            (FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL << 12) | 4,
+            4, irp, token, 0,
+        );
+        if ack_label != 0 || ack_status as u32 as i32 != STATUS_SUCCESS {
+            crate::provider_bugcheck::report(
+                0xc4, [FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL, 4, irp, ack_status],
+            );
+        }
+        return status;
+    }
+    let (ack_label, ack_status, _, _, _) = call_on4(
+        (FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL << 12) | 4,
+        2, irp, 0, 0,
+    );
+    if ack_label != 0 || ack_status as u32 as i32 != STATUS_SUCCESS {
+        crate::provider_bugcheck::report(
+            0xc4, [FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL, 2, irp, ack_status],
+        );
+    }
+    status
+}
+
 /// Major 0x0f overloads internal control and SCSI. Resolve the exact foreign accepted PDO
 /// before inspecting the stack union, which contains an SRB pointer on the storage route.
 unsafe fn is_hosted_foreign_scsi_pdo(device: u64) -> bool {
@@ -10188,6 +10247,11 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
         }
         if major == major::IRP_MJ_POWER as u64 {
             return forward_hosted_power(device, irp, next, previous_location);
+        }
+        if major == IRP_MJ_DEVICE_CONTROL {
+            return forward_hosted_buffered_control(
+                device, irp, next, current_location_after_forward,
+            );
         }
         if major != IRP_MJ_PNP {
             return nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw();
@@ -66001,6 +66065,31 @@ pub(crate) unsafe fn redrive_hosted_internal_control_forward(handler: *mut ExecN
     hosted_internal_control_work::redrive(handler);
 }
 
+pub(crate) unsafe fn service_hosted_buffered_control_forward(
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    operation: u64,
+    address: u64,
+    irp_or_token: u64,
+) -> Option<(i32, bool)> {
+    match operation {
+        1 => hosted_buffered_control_work::submit(ch, irp_or_token, address, badge, reply_cap)
+            .map(|status| (status, false)),
+        2 if irp_or_token == 0 => hosted_buffered_control_work::acknowledge(
+            ch, reply_cap, badge, address,
+        ).map(|status| (status, false)),
+        4 => Some((hosted_buffered_control_work::hold_inline(
+            ch, reply_cap, badge, address, irp_or_token,
+        ), false)),
+        _ => Some((STATUS_INVALID_PARAMETER, false)),
+    }
+}
+
+pub(crate) unsafe fn redrive_hosted_buffered_control_forward(handler: *mut ExecNtHandler) {
+    hosted_buffered_control_work::redrive(handler);
+}
+
 pub(crate) unsafe fn service_hosted_scsi_forward(
     ch: &crate::spawn_hosts::PumpChannel,
     reply_cap: u64,
@@ -66349,6 +66438,14 @@ pub(crate) unsafe fn nested_hosted_internal_control_ready() -> bool {
 pub(crate) unsafe fn redrive_nested_hosted_internal_control(handler: *mut ExecNtHandler) -> bool {
     hosted_internal_control_work::redrive_nested_ready(handler)
         || hosted_scsi_srb_work::redrive_nested_ready(handler)
+}
+
+pub(crate) unsafe fn nested_hosted_buffered_control_ready() -> bool {
+    hosted_buffered_control_work::nested_work_ready()
+}
+
+pub(crate) unsafe fn redrive_nested_hosted_buffered_control(handler: *mut ExecNtHandler) -> bool {
+    hosted_buffered_control_work::redrive_nested_ready(handler)
 }
 
 pub(crate) unsafe fn redrive_nested_hosted_query_path(handler: *mut ExecNtHandler) -> bool {
