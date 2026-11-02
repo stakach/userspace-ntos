@@ -142,6 +142,20 @@ static EXECUTING_ADMISSION_RELEASED: AtomicBool = AtomicBool::new(false);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 static NEXT: AtomicU64 = AtomicU64::new(0);
 static ROUTED_OBSERVATION_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static IMAGE_NOT_SUPPORTED_TRACE_N: AtomicU64 = AtomicU64::new(0);
+
+fn trace_image_not_supported(work: &Work, phase: &[u8], status: u32) {
+    if work.allocation_attrs & 0x0100_0000 == 0 || status != 0xc000_00bb
+        || IMAGE_NOT_SUPPORTED_TRACE_N.fetch_add(1, Ordering::Relaxed) >= 8
+    { return; }
+    print_str(b"[section-image-not-supported] phase=");
+    print_str(phase);
+    print_str(b" tid=");
+    print_u64(work.tid);
+    print_str(b" file=0x");
+    print_hex(work.file_handle as u32);
+    print_str(b"\n");
+}
 
 fn finish_sparse_header_window(work: &mut Work) {
     let capture = work.sparse_image.as_mut().expect("sparse image header owner");
@@ -1114,6 +1128,7 @@ unsafe fn advance(
                     } else {
                         status.raw() as u32
                     };
+                    trace_image_not_supported(work, b"header-inline", work.status);
                     work.phase = Phase::ReadyReply;
                 }
                 Ok(ExternalDispatchResult::Pending { irp_id }) => {
@@ -1124,6 +1139,7 @@ unsafe fn advance(
                 }
                 Err(status) => {
                     work.status = status.raw() as u32;
+                    trace_image_not_supported(work, b"header-dispatch", work.status);
                     work.phase = Phase::ReadyReply;
                 }
             }
@@ -1163,6 +1179,7 @@ unsafe fn advance(
                 } else {
                     completion.status
                 };
+                trace_image_not_supported(work, b"header-terminal", work.status);
                 work.phase = Phase::HeaderAckPending { irp };
             }
             Step::Progress
@@ -1286,6 +1303,7 @@ unsafe fn advance(
                     return Step::Progress;
                 }
                 Err(status) => {
+                    trace_image_not_supported(work, b"publish", status);
                     work.status = status;
                 }
             }

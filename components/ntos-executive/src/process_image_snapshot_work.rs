@@ -78,6 +78,20 @@ static CURSOR: AtomicU64 = AtomicU64::new(0);
 static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 static EXECUTING_TID: AtomicU64 = AtomicU64::new(0);
 static EXECUTING_PI: AtomicU64 = AtomicU64::new(u64::MAX);
+static IMAGE_NOT_SUPPORTED_TRACE_N: AtomicU64 = AtomicU64::new(0);
+
+fn trace_image_not_supported(work: &Work, phase: &[u8], status: u32) {
+    if status != 0xc000_00bb
+        || IMAGE_NOT_SUPPORTED_TRACE_N.fetch_add(1, Ordering::Relaxed) >= 8
+    { return; }
+    print_str(b"[process-image-not-supported] phase=");
+    print_str(phase);
+    print_str(b" tid=");
+    print_u64(work.tid);
+    print_str(b" section=0x");
+    print_hex(work.capture().create.section_handle as u32);
+    print_str(b"\n");
+}
 
 fn release_capture(handler: &mut ExecNtHandler, capture: &mut Capture) {
     if let Some(view) = capture.view.take() {
@@ -337,7 +351,10 @@ unsafe fn advance(
                     }
                 },
                 Ok(None) => nt_fs::STATUS_INVALID_HANDLE,
-                Err(status) => status,
+                Err(status) => {
+                    trace_image_not_supported(work, b"admission", status);
+                    status
+                },
             };
             work.phase = Phase::ReadyReply;
             Step::Progress
@@ -409,7 +426,11 @@ unsafe fn advance_read(work: &mut Work) -> Step {
             }
             Ok(()) => work.phase = Phase::RevokeReply,
             Err(status) if work.cancelled => { work.status = status; work.phase = Phase::RevokeReply; }
-            Err(status) => { work.status = status; work.phase = Phase::ReadyReply; }
+            Err(status) => {
+                trace_image_not_supported(work, b"read", status);
+                work.status = status;
+                work.phase = Phase::ReadyReply;
+            }
         }
         return Step::Progress;
     }

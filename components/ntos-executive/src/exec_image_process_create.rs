@@ -6,6 +6,18 @@ use nt_memory_manager::image_section::ImageViewRef;
 
 const INVALID_IMAGE: u32 = 0xc000_007b;
 const NOT_READY: u32 = 0xc000_00a3;
+static IMAGE_ADMISSION_NOT_SUPPORTED_TRACE_N: AtomicU64 = AtomicU64::new(0);
+
+fn trace_image_admission_not_supported(phase: &[u8], path: Option<&[u8]>) {
+    if IMAGE_ADMISSION_NOT_SUPPORTED_TRACE_N.fetch_add(1, Ordering::Relaxed) >= 8 { return; }
+    print_str(b"[process-image-not-supported] phase=");
+    print_str(phase);
+    if let Some(path) = path {
+        print_str(b" path=");
+        print_str(path);
+    }
+    print_str(b"\n");
+}
 
 pub(crate) struct ProcessImageOwner {
     target: nt_exe_image::SpawnTarget,
@@ -50,7 +62,10 @@ impl ExecNtHandler {
         { return Err(nt_process::STATUS_ACCESS_DENIED); }
         let area = self.image_sections.area(id).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         let source = self.image_sections.source(id).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        if !source.has_readable_image() { return Err(STATUS_NOT_SUPPORTED); }
+        if !source.has_readable_image() {
+            trace_image_admission_not_supported(b"source-unreadable", None);
+            return Err(STATUS_NOT_SUPPORTED);
+        }
         let _durable = crate::allocator::enter_durable();
         let bytes = source.materialize_process_snapshot(self, area)?;
         let view = self.image_sections.reference_view(id)
@@ -78,20 +93,29 @@ impl ExecNtHandler {
         let ctx = self.loop_ctx.ok_or(NOT_READY)?;
         let source = self.image_sections.source_for_view(view)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        let path = source.image_path.as_deref().ok_or(STATUS_NOT_SUPPORTED)?;
+        let path = source.image_path.as_deref().ok_or_else(|| {
+            trace_image_admission_not_supported(b"path-missing", None);
+            STATUS_NOT_SUPPORTED
+        })?;
         let leaf = nt_exe_image::canonical_exe_leaf(path).ok_or(INVALID_IMAGE)?;
         let mut captured_leaf = [0; nt_exe_image::MAX_EXE_LEAF];
         captured_leaf[..leaf.len()].copy_from_slice(leaf);
         let leaf = &captured_leaf[..leaf.len()];
         let mut image_path = [0; nt_exe_image::MAX_NT_IMAGE_PATH];
         let (path_len, root) = dynamic_hosted_nt_image_path(path, leaf, &mut image_path)
-            .ok_or(STATUS_NOT_SUPPORTED)?;
+            .ok_or_else(|| {
+                trace_image_admission_not_supported(b"path-unaccepted", Some(path));
+                STATUS_NOT_SUPPORTED
+            })?;
         if bytes.len() as u64 != source.backing.file_extent { return Err(INVALID_IMAGE); }
         // Preserve the canonical preferred transfer address through main-image placement.
         let headers = source.layout.headers();
         if headers.machine != 0x8664 || !headers.is_executable() { return Err(INVALID_IMAGE); }
         let role = nt_exe_image::HostedProcessRole::for_image_subsystem(headers.subsystem)
-            .ok_or(STATUS_NOT_SUPPORTED)?;
+            .ok_or_else(|| {
+                trace_image_admission_not_supported(b"subsystem-unaccepted", None);
+                STATUS_NOT_SUPPORTED
+            })?;
         let section_file = source.backing.file.ok_or(INVALID_IMAGE)?;
         let registered_file = source.registered_file;
         let observation_target = source.observation_target;

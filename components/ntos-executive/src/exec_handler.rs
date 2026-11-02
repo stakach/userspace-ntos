@@ -32803,6 +32803,16 @@ impl ExecNtHandler {
             || create.debug_port != 0
             || create.exception_port != 0
         {
+            static PROCESS_CREATE_UNSUPPORTED_TRACE_N: AtomicU64 = AtomicU64::new(0);
+            if PROCESS_CREATE_UNSUPPORTED_TRACE_N.fetch_add(1, Ordering::Relaxed) < 4 {
+                print_str(b"[process-image-not-supported] phase=create-flags flags=0x");
+                print_hex(create.flags);
+                print_str(b" debug=0x");
+                print_hex(create.debug_port as u32);
+                print_str(b" exception=0x");
+                print_hex(create.exception_port as u32);
+                print_str(b"\n");
+            }
             return STATUS_NOT_SUPPORTED;
         }
         match crate::process_image_snapshot_work::submit_routed_process_image(
