@@ -443,6 +443,12 @@ impl Broker {
                     self.pending[position].phase = PendingPhase::Acknowledged;
                     Ok((0, 0, 0, 0))
                 } else {
+                    // A failed PUBLISH may resume the provider before background redrive
+                    // settles its retained Reply. Only the exact acknowledged Reply can
+                    // transition Publishing to Aborted; uncertain work remains owned.
+                    if self.pending[position].phase == PendingPhase::Publishing {
+                        unsafe { settle_publish_reply(handler, &mut self.pending[position]); }
+                    }
                     if !matches!(
                         self.pending[position].phase,
                         PendingPhase::Reserved | PendingPhase::Aborted
@@ -582,8 +588,8 @@ impl Broker {
     }
 }
 
-/// Settle the physical publish Reply before accepting the provider's separate op 8 ACK.
-/// A same-owner op 8 can arrive before the background redrive gets another turn.
+/// Settle the physical publish Reply before accepting the provider's separate ACK or ABORT.
+/// A same-owner op 8 or op 6 can arrive before background redrive gets another turn.
 unsafe fn settle_publish_reply(handler: &mut ExecNtHandler, entry: &mut Pending) -> bool {
     let Some(work) = entry.publish.as_mut() else { return false; };
     if work.phase != PublishPhase::ReplyEntered { return false; }
