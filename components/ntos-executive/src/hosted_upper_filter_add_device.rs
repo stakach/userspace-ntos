@@ -179,6 +179,9 @@ unsafe fn attach_prepared(
     match result {
         Ok(()) => {
             hosted_add_device_rollback::commit(rollback.take().unwrap());
+            // A filter with no DriverEntry device becomes dispatchable only after its exact
+            // attached FDO and retained ledger claim have both been committed.
+            register_instance_ready(index, true);
             Ok(())
         }
         Err(status) => {
