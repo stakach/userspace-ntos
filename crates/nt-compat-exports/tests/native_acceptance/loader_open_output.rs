@@ -36,6 +36,10 @@ fn open_service() -> syn::ImplItemFn {
     handler_function("nt_open_file_service")
 }
 
+fn open_captured() -> syn::ImplItemFn {
+    handler_function("nt_open_file_captured")
+}
+
 #[test]
 fn file_object_attributes_preserve_all_three_checked_read_faults() {
     let function = handler_function("capture_file_object_attributes");
@@ -160,10 +164,15 @@ fn open_file_outputs_are_probed_before_object_attributes_or_loader_effects() {
     let handle_probe = calls.0.iter().position(|name| name == "probe_copy_output")
         .expect("typed Handle output probe");
     assert!(handle_probe < probe, "Handle probe precedes IOSB probe");
-    for effect in ["capture_file_object_attributes", "mint_disk_file_handle"] {
-        assert!(probe < calls.0.iter().position(|name| name == effect).unwrap(),
-            "output fault precedes {effect}");
-    }
+    let attributes = calls.0.iter().position(|name| name == "capture_file_object_attributes")
+        .expect("object attributes capture follows the output probes");
+    let dispatch = calls.0.iter().position(|name| name == "nt_open_file_captured")
+        .expect("captured File admission follows validation");
+    assert!(probe < attributes && attributes < dispatch);
+    let mut captured = Calls::default();
+    captured.visit_block(&open_captured().block);
+    assert!(captured.0.iter().any(|name| name == "mint_disk_file_handle"),
+        "loader File effects remain behind the validated service boundary");
 }
 
 #[test]
@@ -241,7 +250,7 @@ fn loader_open_result_uses_checked_publication_not_fire_and_forget_writes() {
         }
     }
     let mut arm = LoaderArm(None);
-    arm.visit_block(&open_service().block);
+    arm.visit_block(&open_captured().block);
     let arm = arm.0.expect("successful canonical loader File branch");
     let mut calls = Calls::default();
     calls.visit_block(&arm);
@@ -313,13 +322,17 @@ fn internal_loader_record_failure_retires_only_its_unpublished_minted_handle() {
         }
     }
     let mut failure = RecordFailure(false);
-    failure.visit_block(&open_service().block);
+    failure.visit_block(&open_captured().block);
     assert!(failure.0, "loader record admission failure boundary exists");
 }
 
 #[test]
 fn finalized_open_routes_share_checked_publication_without_error_output_stores() {
-    for name in ["nt_open_file_service", "create_registered_file_from_target"] {
+    let mut service_calls = Calls::default();
+    service_calls.visit_block(&open_service().block);
+    assert!(service_calls.0.iter().any(|name| name == "nt_open_file_captured"),
+        "validated OpenFile service must enter captured admission");
+    for name in ["nt_open_file_captured", "create_registered_file_from_target"] {
         let function = handler_function(name);
         let mut calls = Calls::default();
         calls.visit_block(&function.block);
@@ -332,9 +345,9 @@ fn finalized_open_routes_share_checked_publication_without_error_output_stores()
             "{name} cannot retain a private unchecked or unconditional final-output path");
     }
     let mut kernel_calls = Calls::default();
-    kernel_calls.visit_block(&handler_function("create_registered_kernel_file").block);
+    kernel_calls.visit_block(&handler_function("create_registered_kernel_file_from_resolved").block);
     assert!(kernel_calls.0.iter().any(|name| name == "create_registered_file_from_target"));
     let mut peer_calls = Calls::default();
-    peer_calls.visit_block(&handler_function("create_registered_driver_peer_file").block);
+    peer_calls.visit_block(&handler_function("create_registered_driver_peer_file_from_resolved").block);
     assert!(peer_calls.0.iter().any(|name| name == "create_registered_file_from_target"));
 }
