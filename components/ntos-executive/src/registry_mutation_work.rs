@@ -614,6 +614,29 @@ pub(crate) fn pending_provider_header_recheck() -> Option<u64> {
     }
 }
 
+/// A provider mutation waiting for its own native WAL PREPARE, marker, abort, or anchor.
+/// The row remains pinned while the physical command is outstanding. A numeric work id alone
+/// cannot authorize native I/O; the exact retained owner and phase are checked here.
+pub(crate) fn pending_provider_native_wal_io() -> Option<u64> {
+    unsafe {
+        if ACTIVE.load(Ordering::Acquire) {
+            return None;
+        }
+        (&*core::ptr::addr_of!(WORK)).iter().flatten().find_map(|work| {
+            if !matches!(&work.caller, Caller::Provider(_))
+                || !matches!(&work.phase,
+                    Phase::Durable | Phase::CommitDurable | Phase::DurableAbort(_))
+            {
+                return None;
+            }
+            match &work.persistence.owner {
+                PersistenceOwner::Wal(wal) if wal.native_io_active() => Some(work.id),
+                _ => None,
+            }
+        })
+    }
+}
+
 /// Copied census evidence. The work table is inspected only on the executive thread.
 #[derive(Debug)]
 pub(crate) struct CensusSnapshot {
@@ -685,6 +708,23 @@ pub(crate) unsafe fn claim_next_native_wal_io() -> Option<writable_fs::native_sn
         }
     }
     None
+}
+
+/// Claim only the retained provider row selected under a parked Receive parent. The outer
+/// executor may claim any work; nested Receive has authority for this one exact WAL owner.
+pub(crate) unsafe fn claim_native_wal_io_for(id: u64) -> Option<writable_fs::native_snapshot_io::SnapshotClaim> {
+    if pending_provider_native_wal_io() != Some(id) {
+        return None;
+    }
+    let work = (&mut *core::ptr::addr_of_mut!(WORK)).iter_mut().flatten()
+        .find(|work| work.id == id)?;
+    match work.persistence.claim_native_wal_io() {
+        Ok(Some((request, operation, input, mount))) =>
+            Some(writable_fs::native_snapshot_io::SnapshotClaim::from_mutation(
+                mount, operation, input, work.id, request,
+            )),
+        Ok(None) | Err(_) => None,
+    }
 }
 
 unsafe fn native_wal_by_id(id: u64) -> Result<&'static mut WalJournal, u32> {

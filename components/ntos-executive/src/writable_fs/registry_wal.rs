@@ -102,6 +102,15 @@ fn restore_continuation(
 impl Journal {
     pub(crate) fn mount(&self) -> nt_memory_manager::SectionMountId { self.mount }
 
+    pub(crate) fn native_io_active(&self) -> bool {
+        match self.stage.as_ref() {
+            Some(Stage::Wal(wal)) =>
+                wal.async_active() && wal.state() != RegistryWalState::Uncertain,
+            Some(Stage::AsyncAnchoring(_)) => true,
+            _ => false,
+        }
+    }
+
     pub(crate) fn claim_native_io(&mut self) -> Result<Option<(nt_fs::AsyncWalIoRequest, nt_fs::BlockOperation, Vec<u8>)>, u32> {
         if let Some(Stage::AsyncAnchoring(update)) = self.stage.as_mut() {
             let request = match update.enter_next() {

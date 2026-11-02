@@ -404,10 +404,14 @@ pub(super) unsafe fn service() -> usize {
 }
 
 /// Under a parked Receive parent, drain an already-entered physical command through its exact
-/// completion/ACK. When that single slot is vacant, admit only the retained registry owner's
-/// header recheck under the normally published native route.
-pub(super) unsafe fn service_registry_recheck(id: u64) -> usize {
-    if id == 0 || crate::registry_mutation_work::pending_provider_header_recheck() != Some(id) {
+/// completion/ACK. When that single slot is vacant, admit only the selected registry owner's
+/// command under the normally published native route.
+unsafe fn service_registry_exact(
+    id: u64,
+    selected: fn() -> Option<u64>,
+    claim: unsafe fn(u64) -> Option<crate::writable_fs::native_snapshot_io::SnapshotClaim>,
+) -> usize {
+    if id == 0 || selected() != Some(id) {
         return 0;
     }
     let Some(_guard) = NativeServiceGuard::enter() else { return 0; };
@@ -415,9 +419,20 @@ pub(super) unsafe fn service_registry_recheck(id: u64) -> usize {
         return poll_pending();
     }
     let Some(route) = native_disk_relation::native_storage_route() else { return 0; };
-    let Some(claim) = crate::writable_fs::native_snapshot_io::claim_registry_header_recheck(id)
-    else { return 0; };
+    let Some(claim) = claim(id) else { return 0; };
     dispatch_claim(route, WorkClaim::Snapshot(claim), None)
+}
+
+pub(super) unsafe fn service_registry_recheck(id: u64) -> usize {
+    service_registry_exact(id,
+        crate::registry_mutation_work::pending_provider_header_recheck,
+        crate::writable_fs::native_snapshot_io::claim_registry_header_recheck)
+}
+
+pub(super) unsafe fn service_registry_wal(id: u64) -> usize {
+    service_registry_exact(id,
+        crate::registry_mutation_work::pending_provider_native_wal_io,
+        crate::writable_fs::native_snapshot_io::claim_registry_wal_for)
 }
 
 unsafe fn dispatch_claim(

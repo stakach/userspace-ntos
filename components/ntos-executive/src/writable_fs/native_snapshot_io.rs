@@ -110,6 +110,11 @@ pub(crate) unsafe fn claim_registry_header_recheck(id: u64) -> Option<SnapshotCl
     snapshot_storage::claim_storage_io_for(id)
 }
 
+/// Claim only a native WAL command from the provider mutation retained by Receive.
+pub(crate) unsafe fn claim_registry_wal_for(id: u64) -> Option<SnapshotClaim> {
+    crate::registry_mutation_work::claim_native_wal_io_for(id)
+}
+
 pub(crate) unsafe fn claim_retained_relation_wal_io() -> Option<SnapshotClaim> {
     crate::driver_launch::claim_native_relation_wal_io()
 }
