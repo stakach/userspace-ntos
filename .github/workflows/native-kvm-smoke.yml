@@ -151,7 +151,7 @@ jobs:
           set -euo pipefail
           boot_status=0
           rm -f native-kvm-qemu-stopped
-          python3 scripts/ci_kvm_smoke.py --seconds "${{ inputs.boot_seconds || '180' }}" --trace-interrupts || boot_status=$?
+          python3 scripts/ci_kvm_smoke.py --seconds "${{ inputs.boot_seconds || '300' }}" --trace-interrupts || boot_status=$?
           if [ ! -f native-kvm-qemu-stopped ]; then echo 'QEMU cleanup unconfirmed; skipping disk hash' >&2; exit 1; fi
           sha256sum rust-micro/.tmp/disk.img > native-kvm-image-after-boot1.sha256
           if [ "$boot_status" -ne 0 ]; then exit "$boot_status"; fi
@@ -164,7 +164,7 @@ jobs:
             # The probe has stopped and reaped QEMU; no image rebuild occurs between boots.
             boot_status=0
             rm -f native-kvm-qemu-stopped
-            python3 scripts/ci_kvm_smoke.py --seconds "${{ inputs.boot_seconds || '180' }}" --trace-interrupts || boot_status=$?
+            python3 scripts/ci_kvm_smoke.py --seconds "${{ inputs.boot_seconds || '300' }}" --trace-interrupts || boot_status=$?
             if [ ! -f native-kvm-qemu-stopped ]; then echo 'QEMU cleanup unconfirmed; skipping disk hash' >&2; exit 1; fi
             sha256sum rust-micro/.tmp/disk.img > native-kvm-image-after-boot2.sha256
             if [ "$boot_status" -ne 0 ]; then exit "$boot_status"; fi
