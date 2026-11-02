@@ -282,6 +282,25 @@ impl ExecNtHandler {
                 iosb,
             );
         }
+        let mount_route = unsafe { crate::fs_loader::exec_fs_mount_identity() }
+            .and_then(crate::fs_loader::exec_block_route_kind);
+        if create_options & nt_fs::FILE_DIRECTORY_FILE == 0
+            && Self::route_absolute_open_to_kernel_file(name16, create_options, mount_route)
+        {
+            return self.create_registered_kernel_file(
+                parse_root,
+                name16,
+                captured.attributes,
+                desired_access,
+                share_access,
+                create_disposition,
+                file_attributes,
+                create_options,
+                &ea,
+                file_handle_out,
+                iosb,
+            );
+        }
         let mut status;
         let mut info = 0u64;
         let mut opened_handle = 0;

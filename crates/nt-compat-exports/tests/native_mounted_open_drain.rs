@@ -3,8 +3,8 @@
 extern crate alloc;
 
 use nt_fs::{
-    BlockOperation, BlockRouteError, BlockRouteOwner, BlockSource, FatPathGeometry,
-    FatPathLookup, FatPathProgress,
+    layered_file_open_decision, BlockOperation, BlockRouteError, BlockRouteOwner, BlockSource,
+    FatPathGeometry, FatPathLookup, FatPathProgress, LayeredFileOpenDecision, FILE_OPEN,
 };
 use std::process::Command;
 
@@ -40,6 +40,14 @@ mod nt_fs {{
     }}
 }}
 mod installed_layout {{ pub const ROOT: &[u8] = b"Windows"; }}
+mod writable_fs {{
+    pub mod registry_journal {{
+        use std::cell::Cell;
+        thread_local! {{ static OWNED: Cell<bool> = const {{ Cell::new(false) }}; }}
+        pub fn owns_volume() -> bool {{ OWNED.with(Cell::get) }}
+        pub fn set_owned(value: bool) {{ OWNED.with(|owned| owned.set(value)); }}
+    }}
+}}
 struct ExecNtHandler;
 impl ExecNtHandler {{ {selector} }}
 #[test]
@@ -57,6 +65,18 @@ fn installed_file_open_waits_for_native_mount() {{
         &unrelated, 0, Some(nt_fs::BlockSourceKind::Draining)));
     assert!(ExecNtHandler::route_absolute_open_to_kernel_file(
         &name, 1, Some(nt_fs::BlockSourceKind::Boot)));
+}}
+#[test]
+fn installed_dll_open_waits_while_registry_journal_owns_boot_volume() {{
+    let name: Vec<u16> = r"\??\C:\Windows\System32\msgina.dll".encode_utf16().collect();
+    writable_fs::registry_journal::set_owned(true);
+    assert!(ExecNtHandler::route_absolute_open_to_kernel_file(
+        &name, 0x60, Some(nt_fs::BlockSourceKind::Boot)),
+        "journal-owned installed DLL must retain CREATE until overlay ownership returns");
+    writable_fs::registry_journal::set_owned(false);
+    assert!(!ExecNtHandler::route_absolute_open_to_kernel_file(
+        &name, 0x60, Some(nt_fs::BlockSourceKind::Boot)),
+        "after release the ordinary Boot route may inspect the overlay again");
 }}
 "#);
     let directory = std::env::temp_dir().join(format!(
@@ -77,6 +97,27 @@ fn installed_file_open_waits_for_native_mount() {{
     let _ = std::fs::remove_dir_all(directory);
     assert!(result.status.success(), "native NtOpenFile cutover regression:\n{}\n{}",
         String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+}
+
+#[test]
+fn create_file_routes_journal_owned_volume_before_overlay_admission() {
+    let source = include_str!("../../../components/ntos-executive/src/exec_file_create.rs");
+    let create = source.split("unsafe fn nt_create_file_service(").nth(1)
+        .expect("native NtCreateFile service");
+    let route = create.find("Self::route_absolute_open_to_kernel_file(name16, create_options, mount_route)")
+        .expect("native NtCreateFile must consume the same journal-aware mounted File route");
+    let overlay = create.find("crate::writable_fs::query_metadata_relative_if_mounted")
+        .expect("native NtCreateFile overlay lookup");
+    assert!(route < overlay, "journal ownership must retain CREATE before overlay admission");
+}
+
+#[test]
+fn released_journal_restores_overlay_precedence_for_an_installed_dll() {
+    assert_eq!(
+        layered_file_open_decision(Ok(true), true, 0x0010_0021, FILE_OPEN, 0x60),
+        Ok(LayeredFileOpenDecision::UseOverlay),
+        "an overlay file wins once its journal returns namespace ownership",
+    );
 }
 
 #[test]

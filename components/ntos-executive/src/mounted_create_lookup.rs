@@ -26,6 +26,7 @@ pub(crate) struct ResolvedCreate<P> {
 pub(crate) enum CreateLookupFound {
     Path(Option<FatDirectoryRecord>),
     Root,
+    DeferredBoot,
 }
 
 struct Entry<P> {
@@ -66,6 +67,36 @@ impl<P> CreateLookupQueue<P> {
         self.entries.try_reserve(1).map_err(|_| CreateLookupError::NoCapacity)?;
         self.entries.push(Entry { irp, mount, payload: Some(payload), lookup: None,
             claimed: None, result: Some(Ok(CreateLookupFound::Root)) });
+        Ok(())
+    }
+
+    /// A boot-route CREATE waits for exclusive journal ownership to return before it inspects
+    /// either the installed FAT tree or the overlay. No sector may be claimed in this state.
+    pub fn capture_deferred_boot(&mut self, irp: u64, mount: u64, payload: P)
+        -> Result<(), CreateLookupError>
+    {
+        if irp == 0 || mount == 0 { return Err(CreateLookupError::Invalid); }
+        if self.entries.iter().any(|entry| entry.irp == irp) {
+            return Err(CreateLookupError::Duplicate);
+        }
+        self.entries.try_reserve(1).map_err(|_| CreateLookupError::NoCapacity)?;
+        self.entries.push(Entry { irp, mount, payload: Some(payload), lookup: None,
+            claimed: None, result: Some(Ok(CreateLookupFound::DeferredBoot)) });
+        Ok(())
+    }
+
+    /// The physical route changed while a boot CREATE waited for the journal. Convert the
+    /// retained owner to a native sector lookup without allocating or changing its identity.
+    pub fn activate_deferred_boot(&mut self, irp: u64, mount: u64, lookup: FatPathLookup)
+        -> Result<(), CreateLookupError>
+    {
+        let entry = self.entries.iter_mut().find(|entry| entry.irp == irp && entry.mount == mount)
+            .ok_or(CreateLookupError::WrongClaim)?;
+        if entry.result != Some(Ok(CreateLookupFound::DeferredBoot)) || entry.claimed.is_some() {
+            return Err(CreateLookupError::WrongClaim);
+        }
+        entry.lookup = Some(lookup);
+        entry.result = None;
         Ok(())
     }
 
@@ -196,5 +227,22 @@ mod tests {
         queue.restore_resolved(resolved).unwrap();
         assert!(queue.claim_next().is_none());
         assert_eq!(queue.take_resolved().unwrap().payload, 81);
+    }
+
+    #[test]
+    fn deferred_boot_create_never_claims_a_sector_before_route_activation() {
+        let mut queue = CreateLookupQueue::new();
+        queue.capture_deferred_boot(21, 7, b"msgina.dll".to_vec()).unwrap();
+        assert!(queue.claim_next().is_none());
+        let resolved = queue.take_resolved().unwrap();
+        assert_eq!(resolved.result, Ok(CreateLookupFound::DeferredBoot));
+        assert_eq!(resolved.payload, b"msgina.dll");
+        queue.restore_resolved(resolved).unwrap();
+        assert!(queue.claim_next().is_none());
+        assert_eq!(queue.activate_deferred_boot(21, 8, lookup()), Err(CreateLookupError::WrongClaim));
+        queue.activate_deferred_boot(21, 7, lookup()).unwrap();
+        let claim = queue.claim_next().unwrap();
+        assert_eq!((claim.irp, claim.mount), (21, 7));
+        assert!(queue.claim_next().is_none());
     }
 }

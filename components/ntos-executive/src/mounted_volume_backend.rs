@@ -176,6 +176,17 @@ impl MountedVolumeBackend {
         Ok(context)
     }
 
+    fn create_lookup(&self, relative: &[u8]) -> Result<nt_fs::FatPathLookup, NtStatus> {
+        let geometry = nt_fs::FatPathGeometry {
+            fat_start_sector: self.fs.fat_start,
+            data_start_sector: self.fs.data_start,
+            total_sectors: self.fs.total_sectors,
+            sectors_per_cluster: self.fs.spc,
+        };
+        nt_fs::FatPathLookup::new(geometry, self.fs.root_cl, relative)
+            .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)
+    }
+
     fn create(&mut self, irp: &IrpProjection) -> Result<DispatchOutcome, NtStatus> {
         let Some(file_id) = irp.file_id else {
             return Err(NtStatus::INVALID_PARAMETER);
@@ -242,7 +253,8 @@ impl MountedVolumeBackend {
             .ok_or(NtStatus::DEVICE_NOT_READY)?;
         let route_kind = crate::fs_loader::exec_block_route_kind(physical_mount)
             .ok_or(NtStatus::DEVICE_NOT_READY)?;
-        if route_kind != nt_fs::BlockSourceKind::Boot {
+        let journal_owned = crate::writable_fs::registry_journal::owns_volume();
+        if route_kind != nt_fs::BlockSourceKind::Boot || journal_owned {
             let mut owned_name = Vec::new();
             owned_name.try_reserve_exact(units.len()).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
             owned_name.extend_from_slice(units);
@@ -251,19 +263,16 @@ impl MountedVolumeBackend {
             owned_relative.extend_from_slice(relative);
             let owner = CapturedCreate { irp: irp.irp_id, file: file_id,
                 name: owned_name, relative: owned_relative, parameters: *parameters };
-            if relative.is_empty() {
+            if journal_owned && route_kind == nt_fs::BlockSourceKind::Boot {
+                self.pending_creates.borrow_mut().capture_deferred_boot(
+                    irp.irp_id.raw(), physical_mount.value(), owner)
+                    .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+            } else if relative.is_empty() {
                 self.pending_creates.borrow_mut().capture_resolved_root(
                     irp.irp_id.raw(), physical_mount.value(), owner)
                     .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
             } else {
-                let geometry = nt_fs::FatPathGeometry {
-                    fat_start_sector: self.fs.fat_start,
-                    data_start_sector: self.fs.data_start,
-                    total_sectors: self.fs.total_sectors,
-                    sectors_per_cluster: self.fs.spc,
-                };
-                let lookup = nt_fs::FatPathLookup::new(geometry, self.fs.root_cl, relative)
-                    .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+                let lookup = self.create_lookup(relative)?;
                 self.pending_creates.borrow_mut().capture(
                     irp.irp_id.raw(), physical_mount.value(), owner, lookup)
                     .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
@@ -358,7 +367,47 @@ impl MountedVolumeBackend {
 
     /// This is called only by the outer I/O service turn, never from completion polling.
     fn service_resolved_create(&mut self) -> usize {
-        let Some(resolved) = self.pending_creates.borrow_mut().take_resolved() else { return 0; };
+        let Some(mut resolved) = self.pending_creates.borrow_mut().take_resolved() else { return 0; };
+        let deferred_boot = matches!(resolved.result, Ok(CreateLookupFound::DeferredBoot));
+        if deferred_boot {
+            if crate::writable_fs::registry_journal::owns_volume() {
+                self.pending_creates.borrow_mut().restore_resolved(resolved)
+                    .expect("journal-owned CREATE retains its exact pending owner");
+                return 0;
+            }
+            let route = unsafe { crate::fs_loader::exec_fs_mount_identity() }
+                .filter(|mount| mount.value() == resolved.mount)
+                .and_then(crate::fs_loader::exec_block_route_kind);
+            let Some(route) = route else {
+                self.pending_creates.borrow_mut().restore_resolved(resolved)
+                    .expect("unavailable mount retains its exact pending CREATE");
+                return 0;
+            };
+            if route != nt_fs::BlockSourceKind::Boot {
+                if resolved.payload.relative.is_empty() {
+                    resolved.result = Ok(CreateLookupFound::Root);
+                    self.pending_creates.borrow_mut().restore_resolved(resolved)
+                        .expect("pending root CREATE retains its owner across route change");
+                } else {
+                    let lookup = match self.create_lookup(&resolved.payload.relative) {
+                        Ok(lookup) => lookup,
+                        Err(_) => {
+                            resolved.result = Err(nt_fs::FatPathError::NoCapacity);
+                            self.pending_creates.borrow_mut().restore_resolved(resolved)
+                                .expect("failed lookup admission retains terminal CREATE");
+                            return 1;
+                        }
+                    };
+                    let irp = resolved.irp;
+                    let mount = resolved.mount;
+                    self.pending_creates.borrow_mut().restore_resolved(resolved)
+                        .expect("pending CREATE retains its owner across route change");
+                    self.pending_creates.borrow_mut().activate_deferred_boot(irp, mount, lookup)
+                        .expect("restored deferred CREATE can activate only its exact lookup");
+                }
+                return 1;
+            }
+        }
         if self.create_completions.try_reserve(1).is_err() {
             self.pending_creates.borrow_mut().restore_resolved(resolved)
                 .expect("a removed queue entry retains its allocation");
@@ -367,6 +416,14 @@ impl MountedVolumeBackend {
         let installed = match resolved.result {
             Ok(CreateLookupFound::Path(record)) => record.map(FatOpenMetadata::from_record),
             Ok(CreateLookupFound::Root) => Some(crate::fs_loader::fat_root_metadata(&self.fs)),
+            Ok(CreateLookupFound::DeferredBoot) => {
+                if resolved.payload.relative.is_empty() {
+                    Some(crate::fs_loader::fat_root_metadata(&self.fs))
+                } else {
+                    unsafe { fat_open_path_metadata_from(&self.fs, self.fs.root_cl,
+                        &resolved.payload.relative) }
+                }
+            },
             Err(error) => {
                 let status = match error {
                     nt_fs::FatPathError::NoCapacity => NtStatus::INSUFFICIENT_RESOURCES,
@@ -383,7 +440,7 @@ impl MountedVolumeBackend {
         };
         let owner = &resolved.payload;
         let outcome = self.create_decided(owner.file.raw(), &owner.name, &owner.relative,
-            installed, &owner.parameters, true);
+            installed, &owner.parameters, !deferred_boot);
         if matches!(outcome, Err(RESIDENT_BUSY)) {
             self.pending_creates.borrow_mut().restore_resolved(resolved)
                 .expect("a removed queue entry retains its allocation");

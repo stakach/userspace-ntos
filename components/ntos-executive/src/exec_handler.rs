@@ -10366,15 +10366,17 @@ impl ExecNtHandler {
         Ok(handle as u64)
     }
 
-    // Once boot storage starts draining, all opens on its physical volume must retain a
-    // mounted File request. The synchronous FAT and overlay readers cannot cross that fence.
+    // Once boot storage starts draining, or a registry journal owns the overlay, all opens on
+    // its physical volume must retain a mounted File request. A direct overlay lookup cannot
+    // interpret the journal's exclusive ownership as an ordinary file-open failure.
     fn route_absolute_open_to_kernel_file(
         name16: &[u16],
         open_options: u32,
         mount_route: Option<nt_fs::BlockSourceKind>,
     ) -> bool {
         open_options & nt_fs::FILE_DIRECTORY_FILE != 0
-            || (matches!(mount_route, Some(nt_fs::BlockSourceKind::Draining | nt_fs::BlockSourceKind::Native))
+            || ((matches!(mount_route, Some(nt_fs::BlockSourceKind::Draining | nt_fs::BlockSourceKind::Native))
+                || crate::writable_fs::registry_journal::owns_volume())
                 && nt_fs::nt_path_to_volume_relative(name16, crate::installed_layout::ROOT).is_some())
     }
 
