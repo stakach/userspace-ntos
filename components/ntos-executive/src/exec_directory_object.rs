@@ -110,11 +110,13 @@ impl ExecNtHandler {
             security_descriptor: 0,
             path_len: Some(name.len()),
             path: [0; NAMED_OBJECT_PATH_CAP],
+            original_path: [0; NAMED_OBJECT_PATH_CAP],
         };
         for (index, &unit) in name.iter().enumerate() {
             if unit == 0 || unit > 0x7f {
                 return Err(STATUS_OBJECT_NAME_INVALID);
             }
+            captured.original_path[index] = unit as u8;
             captured.path[index] = (unit as u8).to_ascii_lowercase();
         }
         let mut components = captured.path[..name.len()].split(|&byte| byte == b'\\');

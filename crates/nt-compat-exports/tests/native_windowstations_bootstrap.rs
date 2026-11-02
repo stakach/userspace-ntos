@@ -12,9 +12,9 @@ fn executive_mirror_has_the_canonical_windowstations_parent_chain() {
         .split("fn ascii_eq_ignore_case")
         .next()
         .unwrap();
-    assert!(bootstrap.contains("b\"windows\""), "missing \\Windows parent");
+    assert!(bootstrap.contains("b\"Windows\""), "missing \\Windows parent");
     assert!(
-        bootstrap.contains("b\"windowstations\", windows"),
+        bootstrap.contains("b\"WindowStations\", windows"),
         "missing \\Windows\\WindowStations child of \\Windows"
     );
     assert!(

@@ -129,6 +129,17 @@ impl ExecNtHandler {
         path: &[u8],
         root_idx: usize,
         follow_final_link: bool,
+        traverse: impl FnMut(usize) -> Result<(), u32>,
+    ) -> Result<Option<usize>, u32> {
+        self.obj_resolve_authorized_case(path, root_idx, follow_final_link, true, traverse)
+    }
+
+    pub(super) fn obj_resolve_authorized_case(
+        &self,
+        path: &[u8],
+        root_idx: usize,
+        follow_final_link: bool,
+        case_insensitive: bool,
         mut traverse: impl FnMut(usize) -> Result<(), u32>,
     ) -> Result<Option<usize>, u32> {
         const SYMLINK_LIMIT: u32 = 32;
@@ -148,7 +159,7 @@ impl ExecNtHandler {
                 return Ok(None);
             }
             traverse(cur)?;
-            let Some(child) = self.obj_child(cur, &components[index]) else {
+            let Some(child) = self.obj_child_case(cur, &components[index], case_insensitive) else {
                 return Ok(None);
             };
             let Some(entry) = self.obj_ns.get(child) else {

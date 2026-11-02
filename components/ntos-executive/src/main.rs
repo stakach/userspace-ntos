@@ -22784,7 +22784,7 @@ fn mark_object_namespace_growth(old_capacity: usize, new_capacity: usize, len: u
 #[derive(Clone, Copy)]
 struct ObjEntry {
     identity: u64,
-    name: [u8; OBJ_NAME_CAP], // leaf name, lowercased ASCII (len in name_len)
+    name: [u8; OBJ_NAME_CAP], // stored ASCII leaf; directory objects retain caller spelling
     name_len: u8,
     parent: usize, // index of the parent directory; OBJ_PARENT_ROOT = the root itself
     kind: u8,

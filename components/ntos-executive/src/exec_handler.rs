@@ -243,11 +243,16 @@ struct CapturedNamedObjectAttributes {
     security_descriptor: u64,
     path_len: Option<usize>,
     path: [u8; NAMED_OBJECT_PATH_CAP],
+    original_path: [u8; NAMED_OBJECT_PATH_CAP],
 }
 
 impl CapturedNamedObjectAttributes {
     fn path(&self) -> Option<&[u8]> {
         self.path_len.map(|len| &self.path[..len])
+    }
+
+    fn original_path(&self) -> Option<&[u8]> {
+        self.path_len.map(|len| &self.original_path[..len])
     }
 }
 
@@ -3299,20 +3304,20 @@ pub(super) fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
     ObjEntry::push_dir(&mut v, b"", OBJ_PARENT_ROOT, true).expect("object namespace root"); // 0 = root "\"
     for d in [
         b"??".as_slice(),
-        b"device",
-        b"global??",
-        b"objecttypes",
-        b"driver",
-        b"filesystem",
-        b"security",
+        b"Device",
+        b"Global??",
+        b"ObjectTypes",
+        b"Driver",
+        b"FileSystem",
+        b"Security",
     ] {
         ObjEntry::push_dir(&mut v, d, 0, true).expect("initial object directory");
     }
-    let windows = ObjEntry::push_dir(&mut v, b"windows", 0, true)
+    let windows = ObjEntry::push_dir(&mut v, b"Windows", 0, true)
         .expect("initial Windows directory");
-    ObjEntry::push_dir(&mut v, b"windowstations", windows, true)
+    ObjEntry::push_dir(&mut v, b"WindowStations", windows, true)
         .expect("initial WindowStations directory");
-    ObjEntry::push_symlink(&mut v, b"dosdevices", 0, b"\\??", true)
+    ObjEntry::push_symlink(&mut v, b"DosDevices", 0, b"\\??", true)
         .expect("initial DosDevices alias");
     v
 }
@@ -24461,6 +24466,7 @@ impl ExecNtHandler {
                 security_descriptor,
                 path_len: None,
                 path: [0; NAMED_OBJECT_PATH_CAP],
+                original_path: [0; NAMED_OBJECT_PATH_CAP],
             });
         }
 
@@ -24481,11 +24487,13 @@ impl ExecNtHandler {
         self.process_memory_read_status(self.pi, buffer, &mut bytes[..length])?;
         let path_len = length / 2;
         let mut path = [0u8; NAMED_OBJECT_PATH_CAP];
+        let mut original_path = [0u8; NAMED_OBJECT_PATH_CAP];
         for (index, word) in bytes[..length].chunks_exact(2).enumerate() {
             let unit = u16::from_le_bytes([word[0], word[1]]);
             if unit > 0x7f {
                 return Err(STATUS_OBJECT_NAME_INVALID);
             }
+            original_path[index] = unit as u8;
             path[index] = (unit as u8).to_ascii_lowercase();
         }
         let mut components = path[..path_len].split(|&byte| byte == b'\\');
@@ -24501,6 +24509,7 @@ impl ExecNtHandler {
             security_descriptor,
             path_len: Some(path_len),
             path,
+            original_path,
         })
     }
 
@@ -31035,7 +31044,7 @@ impl ExecNtHandler {
             }
         }
     }
-    /// Lowercase-ASCII a UTF-16 name into a fixed buffer (object names are case-insensitive);
+    /// Lowercase-ASCII a UTF-16 name for compact consumers that use folded lookup;
     /// returns the filled length. Non-ASCII code units are truncated to their low byte.
     pub(crate) fn fold_name(name16: &[u16], out: &mut [u8]) -> usize {
         let mut n = 0;
@@ -31051,12 +31060,7 @@ impl ExecNtHandler {
     fn object_path_components(path: &[u8]) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
         path.split(|&c| c == b'\\')
             .filter(|component| !component.is_empty())
-            .map(|component| {
-                component
-                    .iter()
-                    .map(|byte| byte.to_ascii_lowercase())
-                    .collect()
-            })
+            .map(|component| component.to_vec())
             .collect()
     }
 
@@ -31082,11 +31086,18 @@ impl ExecNtHandler {
     fn obj_resolve_open_link(&self, path: &[u8], root_idx: usize) -> Option<usize> {
         self.obj_resolve_ex(path, root_idx, false)
     }
-    /// Find a direct child of directory `parent` whose (folded) name matches `leaf`.
+    /// Find a direct child using the request's case-sensitivity policy.
+    pub(crate) fn obj_child_case(&self, parent: usize, leaf: &[u8], case_insensitive: bool) -> Option<usize> {
+        self.obj_ns.iter().position(|entry| {
+            if !entry.is_live() || entry.parent != parent { return false; }
+            if case_insensitive { ascii_eq_ignore_case(entry.name(), leaf) }
+            else { entry.name() == leaf }
+        })
+    }
+
+    /// Existing compact-namespace consumers use case-insensitive lookup.
     pub(crate) fn obj_child(&self, parent: usize, leaf: &[u8]) -> Option<usize> {
-        self.obj_ns
-            .iter()
-            .position(|e| e.is_live() && e.parent == parent && e.name() == leaf)
+        self.obj_child_case(parent, leaf, true)
     }
     /// Insert a child (dir or symlink) under `parent`, or return the existing one (OPENIF/name
     /// collision → reuse). Returns the index, or None if the table is at capacity.
@@ -41653,7 +41664,8 @@ impl ExecNtHandler {
                 let _durable = allocator::enter_durable();
                 let captured = if args[2] == 0 {
                     CapturedNamedObjectAttributes { root: 0, attributes: 0, security_descriptor: 0,
-                        path_len: None, path: [0; NAMED_OBJECT_PATH_CAP] }
+                        path_len: None, path: [0; NAMED_OBJECT_PATH_CAP],
+                        original_path: [0; NAMED_OBJECT_PATH_CAP] }
                 } else {
                     match self.capture_named_object_attributes(args[2]) {
                         Ok(captured) => captured,

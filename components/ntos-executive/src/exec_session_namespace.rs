@@ -82,10 +82,10 @@ impl ExecNtHandler {
         let session = ObjEntry::push_dir(&mut self.obj_ns, name.as_bytes(), parent, true)
             .expect("preflighted namespace capacity and monotonically allocated identity");
         self.obj_ns[session].payload = canonical.session.0;
-        let windows = ObjEntry::push_dir(&mut self.obj_ns, b"windows", session, true)
+        let windows = ObjEntry::push_dir(&mut self.obj_ns, b"Windows", session, true)
             .expect("preflighted Windows child capacity and identity");
         self.obj_ns[windows].payload = canonical.windows.0;
-        let bno = ObjEntry::push_dir(&mut self.obj_ns, b"basenamedobjects", session, true)
+        let bno = ObjEntry::push_dir(&mut self.obj_ns, b"BaseNamedObjects", session, true)
             .expect("preflighted BaseNamedObjects child capacity and identity");
         self.obj_ns[bno].payload = canonical.base_named_objects.0;
         self.directory_security.push(directory_security::DirectorySecurityRecord {

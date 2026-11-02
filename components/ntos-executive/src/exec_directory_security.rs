@@ -25,6 +25,7 @@ pub(crate) struct DirectorySecurityAdmission {
     pub(super) handle_attributes: u32,
     pub(super) granted_access: u32,
     pub(super) opened_existing: bool,
+    case_insensitive: bool,
     permanent: bool,
     released: bool,
 }
@@ -41,6 +42,8 @@ impl DirectorySecurityAdmission {
     pub(super) fn parent_and_leaf(&self) -> (usize, &[u8]) {
         (self.parent, &self.leaf)
     }
+
+    pub(super) fn case_insensitive(&self) -> bool { self.case_insensitive }
 }
 
 static ACCESS_CHECKS: AtomicU64 = AtomicU64::new(0);
@@ -125,17 +128,18 @@ pub(super) fn prepare_boot_directory_security(
             .filter(|entry| entry.kind == OBJ_KIND_DIRECTORY)
         {
             let mut audit = nt_security::SecurityAssignmentAudit::default();
-            let assigned = if entry.parent == OBJ_PARENT_ROOT || entry.name() == b"device" {
+            let assigned = if entry.parent == OBJ_PARENT_ROOT || entry.name().eq_ignore_ascii_case(b"device") {
                 nt_security::assign_object_directory_root_security(&subject, &mut audit)
-            } else if matches!(entry.name(), b"??" | b"global??") {
+            } else if entry.name() == b"??" || entry.name().eq_ignore_ascii_case(b"global??") {
                 nt_security::assign_dos_devices_directory_security(
                     &subject,
                     protection_mode,
                     &mut audit,
                 )
-            } else if entry.name() == b"security" {
+            } else if entry.name().eq_ignore_ascii_case(b"security") {
                 nt_security::assign_security_directory_security(&subject, &mut audit)
-            } else if matches!(entry.name(), b"objecttypes" | b"driver" | b"filesystem" | b"windows") {
+            } else if [b"objecttypes".as_slice(), b"driver", b"filesystem", b"windows"]
+                .iter().any(|name| entry.name().eq_ignore_ascii_case(name)) {
                 nt_security::assign_directory_security(
                     &subject,
                     None,
@@ -143,9 +147,9 @@ pub(super) fn prepare_boot_directory_security(
                     nt_security::ProcessorMode::KernelMode,
                     &mut audit,
                 )
-            } else if entry.name() == b"windowstations" {
+            } else if entry.name().eq_ignore_ascii_case(b"windowstations") {
                 let parent = namespace.get(entry.parent).ok_or(0xC000_0008u32)?;
-                if parent.name() != b"windows" || parent.parent != 0 {
+                if !parent.name().eq_ignore_ascii_case(b"windows") || parent.parent != 0 {
                     return Err(0xC000_0008);
                 }
                 let inherited = records
@@ -239,6 +243,7 @@ impl ExecNtHandler {
         )
         .map_err(|status| status.0 as u32)?;
         let handle_attributes = attributes & (nt_process::native_handle::OBJ_KERNEL_HANDLE | 0x2);
+        let case_insensitive = attributes & 0x40 != 0;
         let mut subject = nt_user_host::native_caller_subject::NativeCallerSubject::capture(
             &self.pm,
             &mut self.token_store,
@@ -262,7 +267,7 @@ impl ExecNtHandler {
                 return Err(0xC000_0061);
             }
             let traverse_bypass = privilege(&tokens, access_mode, 23); // SeChangeNotifyPrivilege
-            let path = captured.path().ok_or(0xC000_0033u32)?;
+            let path = captured.original_path().ok_or(0xC000_0033u32)?;
             let (root, path) = self.native_directory_root_and_path(caller, captured.root, path)?;
             let (parent_path, leaf) = match path.iter().rposition(|&byte| byte == b'\\') {
                 Some(position) => (&path[..position], &path[position + 1..]),
@@ -293,12 +298,12 @@ impl ExecNtHandler {
                     root
                 }
             } else {
-                self.obj_resolve_authorized(parent_path, root, true, check)?
+                self.obj_resolve_authorized_case(parent_path, root, true, case_insensitive, check)?
                     .ok_or(0xC000_003Au32)?
             };
             check(parent)?;
             let parent_descriptor = self.directory_security_descriptor(parent)?;
-            let existing = self.obj_resolve_authorized(path, root, true, check)?;
+            let existing = self.obj_resolve_authorized_case(path, root, true, case_insensitive, check)?;
             let (descriptor, granted_access, opened_existing) = if let Some(index) = existing {
                 if create && captured.attributes & 0x80 == 0 {
                     return Err(0xC000_0035);
@@ -411,6 +416,7 @@ impl ExecNtHandler {
                     descriptor,
                     granted_access,
                     opened_existing,
+                    case_insensitive,
                     permanent,
                     released: false,
                 })
@@ -444,7 +450,7 @@ impl ExecNtHandler {
         let current = if admission.leaf.is_empty() {
             Some(admission.parent)
         } else {
-            self.obj_child(admission.parent, &admission.leaf)
+            self.obj_child_case(admission.parent, &admission.leaf, admission.case_insensitive)
         };
         if let Some((index, identity)) = admission.existing {
             if !self.obj_ns[index].is_live()
@@ -464,12 +470,8 @@ impl ExecNtHandler {
             .map_err(|_| 0xC000_009Au32)?;
         self.obj_ns.try_reserve(1).map_err(|_| 0xC000_009Au32)?;
         let descriptor = admission.descriptor.take().ok_or(0xC000_0008u32)?;
-        let Some(index) = self.obj_insert(
-            admission.parent,
-            &admission.leaf,
-            OBJ_KIND_DIRECTORY,
-            &[],
-            admission.permanent,
+        let Some(index) = ObjEntry::push_dir(
+            &mut self.obj_ns, &admission.leaf, admission.parent, admission.permanent,
         ) else {
             admission.descriptor = Some(descriptor);
             return Err(0xC000_009A);
