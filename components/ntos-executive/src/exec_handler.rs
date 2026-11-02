@@ -32827,12 +32827,26 @@ impl ExecNtHandler {
             }
             return STATUS_NOT_SUPPORTED;
         }
+        static PROCESS_ROUTE_ERROR_TRACE_N: AtomicU64 = AtomicU64::new(0);
         match crate::process_image_snapshot_work::submit_routed_process_image(
             self, parent, args[3], create, nt_ulong_arg(args[1]), args[0], previous_mode,
         ) {
             Ok(true) => return 0x0000_0103,
-            Ok(false) => {},
-            Err(status) => return status,
+            Ok(false) => {
+                static PROCESS_ROUTE_FALLBACK_TRACE_N: AtomicU64 = AtomicU64::new(0);
+                if PROCESS_ROUTE_FALLBACK_TRACE_N.fetch_add(1, Ordering::Relaxed) < 8 {
+                    print_str(b"[process-create-route] phase=routed-not-selected tid=");
+                    print_u64(self.current_tid);
+                    print_str(b"\n");
+                }
+            },
+            Err(status) => {
+                if status == STATUS_NOT_SUPPORTED
+                    && PROCESS_ROUTE_ERROR_TRACE_N.fetch_add(1, Ordering::Relaxed) < 8 {
+                    print_str(b"[process-create-route] phase=routed-submit status=0xc00000bb\n");
+                }
+                return status;
+            },
         }
         match self.reserve_native_image_process(parent, create, nt_ulong_arg(args[1]), args[0], previous_mode) {
             Ok(Some(request)) => {
@@ -32841,7 +32855,13 @@ impl ExecNtHandler {
                 return 0;
             }
             Ok(None) => {}
-            Err(status) => return status,
+            Err(status) => {
+                if status == STATUS_NOT_SUPPORTED
+                    && PROCESS_ROUTE_ERROR_TRACE_N.fetch_add(1, Ordering::Relaxed) < 8 {
+                    print_str(b"[process-create-route] phase=direct-reserve status=0xc00000bb\n");
+                }
+                return status;
+            },
         }
         let ctx = self.loop_ctx.unwrap();
         let sect = create.section_handle;
