@@ -27,6 +27,10 @@ fn pending_file_handoff_accepts_one_validated_preparked_reply_without_a_second_p
         "saved Reply validation must reject an alias of the current main Reply");
     assert!(HANDOFF.contains("pending_file_io_transfer("),
         "post-dispatch handoff must retain the existing exact File reservation");
+    let finish = SERVICE.split_once("pub(crate) unsafe fn finish_preparked_file_target_dispatch(")
+        .unwrap().1.split_once("fn checkpoint_boot_hives_at_quiesce").unwrap().0;
+    assert!(finish.contains("pending.native_call_transport = native_call_transport;"),
+        "the saved Reply's File owner must retain the original native transport");
     assert!(transfer.contains("crate::pending_file_caller::publish(reservation, pending)"),
         "the reply transfer must retain the caller captured before provider CREATE");
     assert!(CALLER.contains("get_reserved(identity.slot(), identity)"),

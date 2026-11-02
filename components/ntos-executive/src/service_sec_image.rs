@@ -3490,6 +3490,7 @@ pub(crate) unsafe fn finish_preparked_file_target_dispatch(
         assert_eq!(pending.reply_cap, 0);
         pending.reply_cap = reply;
         pending.reply_required = true;
+        pending.native_call_transport = native_call_transport;
     }
     file_dispatch_handoff::before_post_action(
         handler, ExecPostAction::None, native_call_transport, resume_ip, sp, flags,
