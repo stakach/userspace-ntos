@@ -599,6 +599,43 @@ pub(crate) fn pending_count() -> u64 {
     PENDING.load(Ordering::Acquire)
 }
 
+/// Bounded quiesce-only census. The selected row may be temporarily moved out while ACTIVE.
+pub(crate) unsafe fn print_quiesce_owners() {
+    print_str(b"[quiesce-registry-mutation] pending=");
+    print_u64(PENDING.load(Ordering::Acquire));
+    print_str(b" active="); print_u64(u64::from(ACTIVE.load(Ordering::Acquire)));
+    print_str(b" next-100ns="); print_u64(NEXT.load(Ordering::Acquire));
+    print_str(b" selected-index="); print_u64(EXECUTING_INDEX.load(Ordering::Relaxed));
+    print_str(b"\n");
+    let mut shown = 0usize;
+    let mut omitted = 0usize;
+    for work in (&*core::ptr::addr_of!(WORK)).iter().flatten() {
+        if shown == 8 { omitted += 1; continue; }
+        print_str(b"[quiesce-registry-owner] id="); print_u64(work.id);
+        print_str(b" caller=");
+        print_str(match &work.caller { Caller::Hosted(_) => b"hosted", Caller::Provider(_) => b"provider" });
+        print_str(b" phase="); print_str(phase_name(&work.phase).as_bytes());
+        print_str(b" storage=");
+        print_str(match &work.persistence.owner {
+            PersistenceOwner::Unadmitted => b"unadmitted",
+            PersistenceOwner::NoStorage => b"no-storage",
+            PersistenceOwner::Admitting { .. } => b"admitting",
+            PersistenceOwner::Legacy(_) => b"legacy",
+            PersistenceOwner::Wal(_) => b"wal",
+        });
+        print_str(b" recheck-id=");
+        print_u64(work.persistence.admission_recheck_id().unwrap_or(0));
+        print_str(b" status="); print_hex(work.status);
+        print_str(b" commit-entered="); print_u64(u64::from(work.commit_entered));
+        print_str(b"\n");
+        shown += 1;
+    }
+    if omitted != 0 {
+        print_str(b"[quiesce-registry-owner] omitted="); print_u64(omitted as u64);
+        print_str(b"\n");
+    }
+}
+
 /// A provider's retained storage admission is the authority for its native header recheck.
 /// The numeric recheck id alone never authorizes unrelated mounted block work.
 pub(crate) fn pending_provider_header_recheck() -> Option<u64> {

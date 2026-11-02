@@ -19875,6 +19875,18 @@ pub(crate) unsafe fn service_sec_image(
         park();
     }
     nt_handler.loop_ctx = nt_handler.loop_ctx.map(|ctx| ctx.checkpoint_live());
+    // Attribute a busy snapshot reserve before the terminal durability proof attempts to
+    // acquire it. These owners are inspected once, after the serialized service loop exits.
+    unsafe {
+        crate::writable_fs::snapshot_storage::print_quiesce_header_owner();
+        crate::writable_fs::print_quiesce_snapshot_owners();
+        crate::registry_mutation_work::print_quiesce_owners();
+        print_str(b"[quiesce-hive-journal] boot=");
+        print_u64(u64::from(crate::writable_fs::hive_wal::has_retained_boot_hive_journal()));
+        print_str(b" native=");
+        print_u64(u64::from(crate::writable_fs::hive_wal::has_retained_native_hive_journal()));
+        print_str(b"\n");
+    }
     let quiesce_cm_status = checkpoint_boot_hives_at_quiesce(&mut nt_handler);
     if quiesce_cm_status != nt_fs::STATUS_SUCCESS {
         print_str(b"[cm-flush] shutdown hive durability refused status=0x");

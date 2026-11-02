@@ -26,7 +26,7 @@ fn trace_winlogon_open_early_busy(stage: &[u8], pi: usize, tid: u64,
     if status != 0x8000_0011 || WINLOGON_OPEN_EARLY_BUSY_TRACE_N.load(Ordering::Relaxed) >= 8 {
         return;
     }
-    if ![b"msgina.dll" as &[u8], b"sfc.dll"].iter().any(|suffix| {
+    if ![b"msgina.dll" as &[u8], b"sfc.dll", b"shsvcs.dll"].iter().any(|suffix| {
         name.len() >= suffix.len() && name[name.len() - suffix.len()..].iter().zip(*suffix)
             .all(|(&unit, &byte)| unit <= 0x7f && (unit as u8).eq_ignore_ascii_case(&byte))
     }) {
@@ -61,7 +61,7 @@ fn trace_winlogon_open(
     route: Option<nt_fs::BlockSourceKind>, journal_owned: bool,
     mounted: bool, status: Option<u32>, file: Option<(u64, u64)>, name: &[u16],
 ) {
-    if ![b"msgina.dll" as &[u8], b"sfc.dll"].iter().any(|suffix| {
+    if ![b"msgina.dll" as &[u8], b"sfc.dll", b"shsvcs.dll"].iter().any(|suffix| {
         name.len() >= suffix.len() && name[name.len() - suffix.len()..].iter().zip(*suffix)
             .all(|(&unit, &byte)| unit <= 0x7f && (unit as u8).eq_ignore_ascii_case(&byte))
     }) {
@@ -32594,6 +32594,9 @@ impl ExecNtHandler {
                         share_access,
                         open_options,
                     );
+                trace_winlogon_open(b"legacy-overlay-open-existing", self.pi, self.current_tid,
+                    parse_root, mount_route, crate::writable_fs::registry_journal::owns_volume(),
+                    false, Some(status), None, name16);
                 let mut opened_handle = 0u64;
                 if let Some(file_id) = file_id {
                     self.writable_fs_dirty = true;

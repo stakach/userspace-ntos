@@ -28,6 +28,25 @@ type Phase = nt_hosted_runtime::RetainedSystemFoldPhase;
 // ACK result, so an uncertain ACK may be retried with this preparation and without replaying I/O.
 static mut FOLD_WORK: Option<FoldWork> = None;
 
+/// One terminal observation; do not enter CM or the physical reserve while Receive is gone.
+pub(crate) unsafe fn print_quiesce_owner() {
+    let work = (&*core::ptr::addr_of!(FOLD_WORK)).as_ref();
+    print_str(b"[quiesce-system-fold] phase=");
+    print_str(match work.map(|work| work.phase) {
+        None => b"absent",
+        Some(Phase::Folding) => b"folding",
+        Some(Phase::Acknowledging) => b"acknowledging",
+        Some(Phase::Installing) => b"installing",
+        Some(Phase::Failed) => b"failed",
+    });
+    print_str(b" lease="); print_u64(u64::from(work.is_some()));
+    print_str(b" ack-pending=");
+    print_u64(u64::from(work.is_some_and(|work| matches!(work.phase,
+        Phase::Acknowledging | Phase::Installing))));
+    print_str(b"\n");
+    native::print_quiesce_owner();
+}
+
 /// The service loop must redrive this exact CM ACK before trying another reserve owner.
 pub(crate) fn system_wal_fold_ack_pending() -> bool {
     unsafe { (*core::ptr::addr_of!(FOLD_WORK)).as_ref()

@@ -70,6 +70,29 @@ enum Work {
 
 static mut WORK: Option<Work> = None;
 
+pub(super) unsafe fn print_quiesce_owner() {
+    let work = (&*core::ptr::addr_of!(WORK)).as_ref();
+    print_str(b"[quiesce-native-fold] phase=");
+    print_str(match work {
+        None => b"absent",
+        Some(Work::Rechecking { .. }) => b"rechecking",
+        Some(Work::Active(_)) => b"active",
+        Some(Work::Stalled { .. }) => b"stalled",
+    });
+    let (id, lease, entered, failed) = match work {
+        Some(Work::Rechecking { id, .. }) => (*id, false, false, false),
+        Some(Work::Active(active)) =>
+            (active.id, true, active.entered, active.failed),
+        Some(Work::Stalled { .. }) => (0, true, false, true),
+        None => (0, false, false, false),
+    };
+    print_str(b" id="); print_u64(id);
+    print_str(b" local-lease="); print_u64(u64::from(lease));
+    print_str(b" entered="); print_u64(u64::from(entered));
+    print_str(b" failed="); print_u64(u64::from(failed));
+    print_str(b"\n");
+}
+
 #[must_use = "retain through native provider terminal and ACK"]
 pub(crate) struct FoldTicket { id: u64, request: AsyncSnapshotRequest }
 

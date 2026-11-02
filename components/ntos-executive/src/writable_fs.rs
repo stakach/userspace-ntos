@@ -59,6 +59,12 @@ mod system_wal_fold;
 pub(crate) use system_wal_fold::{fold_system_wal_if_dirty,
     redrive_retained_system_wal_fold_after_native_completion, system_wal_fold_ack_pending};
 
+/// Inspect only; terminal quiesce cannot start a new snapshot or CM operation.
+pub(crate) unsafe fn print_quiesce_snapshot_owners() {
+    system_wal_fold::print_quiesce_owner();
+    native_checkpoint::print_quiesce_owner();
+}
+
 #[path = "writable_fs/file_cleanup.rs"]
 mod file_cleanup;
 pub(crate) use file_cleanup::{

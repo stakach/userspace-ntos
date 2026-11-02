@@ -29,6 +29,27 @@ static mut NEXT_HEADER_ID: u64 = 1;
 static LAST_NO_EFFECT_ABORT_ID: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// Quiesce-only evidence for the move-only header proof and its reserve lease.
+pub(crate) unsafe fn print_quiesce_header_owner() {
+    let owner = (&*core::ptr::addr_of!(PENDING_HEADER)).as_ref();
+    print_str(b"[quiesce-header-recheck] present=");
+    print_u64(u64::from(owner.is_some()));
+    if let Some(owner) = owner {
+        print_str(b" id="); print_u64(owner.id);
+        print_str(b" state=");
+        print_str(match &owner.state {
+            HeaderState::Running(_) => b"running",
+            HeaderState::Ready(_) => b"ready",
+            HeaderState::Transitioning => b"transitioning",
+            HeaderState::Aborted => b"aborted",
+        });
+        print_str(b" entered="); print_u64(u64::from(owner.entered));
+        print_str(b" lease="); print_u64(u64::from(owner.lease.is_some()));
+        print_str(b" failed="); print_hex(owner.failed.unwrap_or(0));
+    }
+    print_str(b"\n");
+}
+
 /// True only after the original pair/token were restored under the exact lease and the
 /// refused native read was proven unentered. Callers may then release their preparation.
 pub(crate) fn recheck_was_aborted_no_effect(id: u64) -> bool {
