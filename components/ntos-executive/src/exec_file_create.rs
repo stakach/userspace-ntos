@@ -234,6 +234,12 @@ impl ExecNtHandler {
                     Err(status) => status,
                 };
             }
+            if let FileParseRoot::FatDirectory { first_cluster, object_id } = parse_root {
+                if let Ok(open) = self.directory_opens.get(object_id) {
+                    trace_sync_fat_after_handoff(0, b"relative-create-caller", self.pi,
+                        self.current_tid as u64, Some((object_id, first_cluster, open.volume_relative_path())), name16);
+                }
+            }
             let (status, information, handle) = self.create_local_file_relative(
                 parse_root,
                 name16,

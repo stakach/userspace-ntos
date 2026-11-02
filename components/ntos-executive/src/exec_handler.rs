@@ -13,6 +13,77 @@ static PNP_START_RESULT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PNP_START_FAILURE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PNP_DEVICE_STATUS_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PNP_DEVICE_STATUS_FAILURE_TRACE_N: AtomicU64 = AtomicU64::new(0);
+// Diagnostic only: identify any legacy FAT lookup attempted after the boot route drains.
+// Each call site has its own small budget so a noisy query cannot hide an open.
+static SYNC_FAT_HANDOFF_TRACE_N: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+fn print_exact_path_bytes(bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 320];
+    let len = bytes.len().min(160);
+    for (i, &byte) in bytes[..len].iter().enumerate() {
+        out[i * 2] = HEX[(byte >> 4) as usize];
+        out[i * 2 + 1] = HEX[(byte & 0x0f) as usize];
+    }
+    print_str(&out[..len * 2]);
+}
+
+fn print_exact_path_units(units: &[u16]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 640];
+    let len = units.len().min(160);
+    for (i, &unit) in units[..len].iter().enumerate() {
+        out[i * 4] = HEX[((unit >> 12) & 0x0f) as usize];
+        out[i * 4 + 1] = HEX[((unit >> 8) & 0x0f) as usize];
+        out[i * 4 + 2] = HEX[((unit >> 4) & 0x0f) as usize];
+        out[i * 4 + 3] = HEX[(unit & 0x0f) as usize];
+    }
+    print_str(&out[..len * 4]);
+}
+
+fn trace_sync_fat_after_handoff(
+    site: usize,
+    label: &[u8],
+    pi: usize,
+    tid: u64,
+    parent: Option<(u32, u32, &[u8])>,
+    name: &[u16],
+) {
+    let route = unsafe { crate::fs_loader::exec_fs_mount_identity() }
+        .and_then(crate::fs_loader::exec_block_route_kind);
+    let route_label: &[u8] = match route {
+        Some(nt_fs::BlockSourceKind::Draining) => b"draining",
+        Some(nt_fs::BlockSourceKind::Native) => b"native",
+        _ => return,
+    };
+    let count = SYNC_FAT_HANDOFF_TRACE_N[site].fetch_add(1, Ordering::Relaxed);
+    if count >= 4 { return; }
+    print_str(b"[sync-fat-after-handoff] site=");
+    print_str(label);
+    print_str(b" n=");
+    print_u64(count + 1);
+    print_str(b" route=");
+    print_str(route_label);
+    print_str(b" pi/tid=");
+    print_u64(pi as u64);
+    print_str(b"/");
+    print_u64(tid);
+    if let Some((object_id, first_cluster, path)) = parent {
+        print_str(b" parent-id/cluster=");
+        print_u64(object_id as u64);
+        print_str(b"/");
+        print_u64(first_cluster as u64);
+        print_str(b" parent-bytes=");
+        print_u64(path.len() as u64);
+        print_str(b" parent-hex=");
+        print_exact_path_bytes(path);
+    }
+    print_str(b" name-units=");
+    print_u64(name.len() as u64);
+    print_str(b" name16-hex=");
+    print_exact_path_units(name);
+    print_str(b"\n");
+}
 
 #[path = "native_job_bodies.rs"]
 pub(crate) mod native_job_bodies;
@@ -10699,6 +10770,8 @@ impl ExecNtHandler {
                 if let Err(status) = overlay_lookup {
                     return (status, 0, 0);
                 }
+                trace_sync_fat_after_handoff(6, b"relative-open-fat", self.pi,
+                    self.current_tid as u64, Some((object_id, first_cluster, &parent_path[..parent_len])), name16);
                 let fat_entry = exec_fs().and_then(|fs| {
                     crate::fs_loader::fat_open_path_metadata_from(&fs, first_cluster, relative)
                 });
@@ -24393,6 +24466,8 @@ impl ExecNtHandler {
                 )? {
                     return Ok(info);
                 }
+                trace_sync_fat_after_handoff(7, b"relative-query-fat", self.pi,
+                    self.current_tid as u64, Some((object_id, first_cluster, open.volume_relative_path())), name);
                 let Some(entry) = exec_fs().and_then(|fs| {
                     crate::fs_loader::fat_open_path_metadata_from(&fs, first_cluster, relative)
                 }) else {
@@ -31663,6 +31738,12 @@ impl ExecNtHandler {
             Err(status) => return status,
         };
         if !matches!(parse_root, FileParseRoot::Absolute) {
+            if let FileParseRoot::FatDirectory { first_cluster, object_id } = parse_root {
+                if let Ok(open) = self.directory_opens.get(object_id) {
+                    trace_sync_fat_after_handoff(2, b"relative-attr-caller", self.pi,
+                        self.current_tid as u64, Some((object_id, first_cluster, open.volume_relative_path())), name16);
+                }
+            }
             let info = match unsafe { self.query_local_file_relative(parse_root, name16) } {
                 Ok(info) => info,
                 Err(status) => return status,
@@ -31715,6 +31796,8 @@ impl ExecNtHandler {
         }
         // General read-only namespace lookup. This is intentionally below the writable mount so
         // Profile paths stay overlay-backed; all remaining names resolve through mounted FAT.
+        trace_sync_fat_after_handoff(3, b"absolute-attr-fat", self.pi,
+            self.current_tid as u64, None, name16);
         if let Some(info) =
             crate::fs_loader::query_nt_path_metadata_into(name16, folded_scratch, relative_scratch)
         {
@@ -31784,6 +31867,12 @@ impl ExecNtHandler {
             Err(status) => return status,
         };
         if !matches!(parse_root, FileParseRoot::Absolute) {
+            if let FileParseRoot::FatDirectory { first_cluster, object_id } = parse_root {
+                if let Ok(open) = self.directory_opens.get(object_id) {
+                    trace_sync_fat_after_handoff(4, b"relative-full-attr-caller", self.pi,
+                        self.current_tid as u64, Some((object_id, first_cluster, open.volume_relative_path())), name16);
+                }
+            }
             let info = match unsafe { self.query_local_file_relative(parse_root, name16) } {
                 Ok(info) => info,
                 Err(status) => return status,
@@ -31833,6 +31922,8 @@ impl ExecNtHandler {
             }
         }
 
+        trace_sync_fat_after_handoff(5, b"absolute-full-attr-fat", self.pi,
+            self.current_tid as u64, None, name16);
         if let Some(info) =
             crate::fs_loader::query_nt_path_metadata_into(name16, folded_scratch, relative_scratch)
         {
@@ -32044,6 +32135,12 @@ impl ExecNtHandler {
                     name16,
                 );
                 return publication.status;
+            }
+            if let FileParseRoot::FatDirectory { first_cluster, object_id } = parse_root {
+                if let Ok(open) = self.directory_opens.get(object_id) {
+                    trace_sync_fat_after_handoff(1, b"relative-open-caller", self.pi,
+                        self.current_tid as u64, Some((object_id, first_cluster, open.volume_relative_path())), name16);
+                }
             }
             let (status, information, handle) = self.create_local_file_relative(
                 parse_root,
