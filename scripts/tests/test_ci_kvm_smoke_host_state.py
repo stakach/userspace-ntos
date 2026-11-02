@@ -1,11 +1,34 @@
 """Linux process stat parsing must keep CPU evidence aligned with QEMU's group."""
 
 import os
+import json
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
 import scripts.ci_kvm_smoke as smoke
 from scripts.ci_kvm_smoke import cpu_sample_delay, parse_proc_stat, read_host_state, stationary_boot_pair
+
+
+class BootDiskBlockstatsTests(unittest.TestCase):
+    def test_records_only_one_exact_boot_disk_and_valid_completed_counters(self):
+        reply = {"return": [
+            {"device": "pflash0", "stats": {"rd_operations": 999}},
+            {"device": "bootdisk", "stats": {
+                "rd_operations": 12, "rd_total_time_ns": 34_000,
+                "wr_operations": True, "wr_bytes": -1,
+            }},
+        ]}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "blockstats.jsonl"
+            with patch.object(smoke, "BLOCKSTATS", path):
+                smoke.record_bootdisk_blockstats(reply, 10.5)
+                smoke.record_bootdisk_blockstats({"return": reply["return"] * 2}, 20)
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(records, [{"elapsed_seconds": 10.5, "device": "bootdisk",
+                                    "stats": {"rd_operations": 12,
+                                              "rd_total_time_ns": 34_000}}])
 
 
 class StationaryBootTests(unittest.TestCase):

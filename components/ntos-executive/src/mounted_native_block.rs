@@ -60,6 +60,8 @@ impl PhaseCensus {
 
 static NATIVE_PREP_PHASE: PhaseCensus = PhaseCensus::new();
 static NATIVE_DISPATCH_TERMINAL_PHASE: PhaseCensus = PhaseCensus::new();
+static NATIVE_DISPATCH_CALL_PHASE: PhaseCensus = PhaseCensus::new();
+static NATIVE_DISPATCH_RETURN_TERMINAL_PHASE: PhaseCensus = PhaseCensus::new();
 static NATIVE_TERMINAL_SETTLE_PHASE: PhaseCensus = PhaseCensus::new();
 // This is an upper bound on idle time: there may be no claimable work between two commands.
 static NATIVE_INTER_COMMAND_PHASE: PhaseCensus = PhaseCensus::new();
@@ -117,6 +119,8 @@ pub(super) fn print_census() {
     }
     NATIVE_PREP_PHASE.print(b"claim-to-dispatch");
     NATIVE_DISPATCH_TERMINAL_PHASE.print(b"dispatch-to-terminal");
+    NATIVE_DISPATCH_CALL_PHASE.print(b"dispatch-call");
+    NATIVE_DISPATCH_RETURN_TERMINAL_PHASE.print(b"dispatch-return-to-terminal");
     NATIVE_TERMINAL_SETTLE_PHASE.print(b"terminal-to-settle");
     NATIVE_INTER_COMMAND_PHASE.print(b"between-commands-upper-bound");
     let pending_irp = NATIVE_PENDING_IRP.load(Ordering::Acquire);
@@ -300,6 +304,7 @@ struct Pending {
     requestor_tid: u64,
     terminal: Option<Terminal>,
     started_ticks: u64,
+    dispatch_returned_ticks: u64,
     terminal_ticks: u64,
 }
 
@@ -442,6 +447,9 @@ unsafe fn poll_pending() -> usize {
         pending.terminal = Some(Terminal { status, packet });
         pending.terminal_ticks = crate::disk_census_ticks();
         NATIVE_DISPATCH_TERMINAL_PHASE.record(pending.started_ticks, pending.terminal_ticks);
+        NATIVE_DISPATCH_RETURN_TERMINAL_PHASE.record(
+            pending.dispatch_returned_ticks, pending.terminal_ticks,
+        );
     }
     if acknowledge_completed_irp_strict(pending.irp.raw()).is_err() {
         return 0;
@@ -636,9 +644,11 @@ unsafe fn dispatch_claim(
     let dispatch = hosted_file_owners::dispatch(
         caller, request, input, &output, ExternalFileIrpDispatchPolicy::ScsiAtDevice,
     );
+    let dispatch_returned_ticks = crate::disk_census_ticks();
     drop(_authority_guard);
     match dispatch {
         Ok(hosted_file_owners::DispatchResult::Returned { irp_id, status, buffers, .. }) => {
+            NATIVE_DISPATCH_CALL_PHASE.record(started_ticks, dispatch_returned_ticks);
             NATIVE_PREP_PHASE.record(claim_started_ticks, started_ticks);
             record_inter_command_gap(claim_started_ticks);
             let terminal_ticks = crate::disk_census_ticks();
@@ -648,11 +658,13 @@ unsafe fn dispatch_claim(
                 .expect("returned native block ticket lost");
             let (_, packet) = buffers.into_parts();
             settle(Pending { claim, ticket, route, command, irp: irp_id,
-                requestor_tid, terminal: None, started_ticks, terminal_ticks },
+                requestor_tid, terminal: None, started_ticks, dispatch_returned_ticks,
+                terminal_ticks },
                 Terminal { status, packet });
             1
         }
         Ok(hosted_file_owners::DispatchResult::Outstanding { irp_id }) => {
+            NATIVE_DISPATCH_CALL_PHASE.record(started_ticks, dispatch_returned_ticks);
             NATIVE_PREP_PHASE.record(claim_started_ticks, started_ticks);
             record_inter_command_gap(claim_started_ticks);
             claim.mark_entered();
@@ -662,7 +674,7 @@ unsafe fn dispatch_claim(
             let bytes = command.data_len();
             *core::ptr::addr_of_mut!(PENDING) = Some(Pending {
                 claim, ticket, route, command, irp: irp_id, requestor_tid, terminal: None,
-                started_ticks, terminal_ticks: 0,
+                started_ticks, dispatch_returned_ticks, terminal_ticks: 0,
             });
             NATIVE_PENDING_STARTED.store(started_ticks, Ordering::Relaxed);
             NATIVE_PENDING_BYTES.store(bytes as u64, Ordering::Relaxed);

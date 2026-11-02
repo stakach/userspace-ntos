@@ -23,6 +23,7 @@ INTERRUPT_TRACE_TAIL = ROOT / "native-kvm-qemu-int-tail.log"
 STALL_STATE = ROOT / "native-kvm-stall-state.json"
 VOLUME_DISPATCH_STATE = ROOT / "native-kvm-volume-dispatch-state.json"
 CPU_SAMPLES = ROOT / "native-kvm-cpu-samples.jsonl"
+BLOCKSTATS = ROOT / "native-kvm-blockstats.jsonl"
 STOPPED_MARKER = ROOT / "native-kvm-qemu-stopped"
 STATIONARY_MARKER = ROOT / "native-kvm-stationary.txt"
 
@@ -402,6 +403,26 @@ def read_bootdisk_blockstats():
             return qmp_reply(stream, "blockstats")
 
 
+def record_bootdisk_blockstats(reply, elapsed_seconds):
+    """Retain only the named boot disk's completed I/O and time counters."""
+    if not isinstance(reply, dict) or not isinstance(reply.get("return"), list):
+        return
+    disks = [record for record in reply["return"] if isinstance(record, dict)
+             and record.get("device") == "bootdisk"]
+    if len(disks) != 1 or not isinstance(disks[0].get("stats"), dict):
+        return
+    fields = ("rd_operations", "rd_bytes", "rd_total_time_ns", "wr_operations", "wr_bytes",
+              "wr_total_time_ns", "flush_operations", "flush_total_time_ns")
+    stats = disks[0]["stats"]
+    sample = {field: stats[field] for field in fields
+              if isinstance(stats.get(field), int) and not isinstance(stats[field], bool)
+              and stats[field] >= 0}
+    if sample:
+        with BLOCKSTATS.open("a") as output:
+            output.write(json.dumps({"elapsed_seconds": round(elapsed_seconds, 2),
+                                     "device": "bootdisk", "stats": sample}) + "\n")
+
+
 def parse_proc_stat(stat):
     """Return process-group identity, CPU ticks, and RSS pages from /proc/PID/stat."""
     # comm is parenthesized and may itself contain spaces or closing parentheses.
@@ -553,6 +574,7 @@ def main():
     STALL_STATE.unlink(missing_ok=True)
     VOLUME_DISPATCH_STATE.unlink(missing_ok=True)
     CPU_SAMPLES.unlink(missing_ok=True)
+    BLOCKSTATS.unlink(missing_ok=True)
     STOPPED_MARKER.unlink(missing_ok=True)
     STATIONARY_MARKER.unlink(missing_ok=True)
     command = [
@@ -645,6 +667,7 @@ def main():
                         blockstats = read_bootdisk_blockstats()
                     except (OSError, RuntimeError, ValueError, KeyError):
                         blockstats = None
+                    record_bootdisk_blockstats(blockstats, time.monotonic() - started)
                     if progress_watchdog.observe_blockstats(blockstats, time.monotonic()):
                         print(f"Boot progress {time.monotonic() - started:.0f}s: "
                               f"{progress_watchdog.last_milestone}", flush=True)
