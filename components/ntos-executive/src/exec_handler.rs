@@ -16,6 +16,62 @@ static PNP_DEVICE_STATUS_FAILURE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 // Diagnostic only: identify any legacy FAT lookup attempted after the boot route drains.
 // Each call site has its own small budget so a noisy query cannot hide an open.
 static SYNC_FAT_HANDOFF_TRACE_N: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+// Diagnostic only: one bounded trace of the failed DLL opens across the
+// namespace decision and the canonical File CREATE result.
+static WINLOGON_OPEN_TRACE_N: AtomicU64 = AtomicU64::new(0);
+
+fn trace_winlogon_open(
+    stage: &[u8], pi: usize, tid: u64, root: FileParseRoot,
+    route: Option<nt_fs::BlockSourceKind>, journal_owned: bool,
+    mounted: bool, status: Option<u32>, file: Option<(u64, u64)>, name: &[u16],
+) {
+    if ![b"msgina.dll" as &[u8], b"sfc.dll"].iter().any(|suffix| {
+        name.len() >= suffix.len() && name[name.len() - suffix.len()..].iter().zip(*suffix)
+            .all(|(&unit, &byte)| unit <= 0x7f && (unit as u8).eq_ignore_ascii_case(&byte))
+    }) {
+        return;
+    }
+    if WINLOGON_OPEN_TRACE_N.fetch_add(1, Ordering::Relaxed) >= 48 { return; }
+    print_str(b"[winlogon-open-route] stage=");
+    print_str(stage);
+    print_str(b" pi/tid=");
+    print_u64(pi as u64);
+    print_str(b"/");
+    print_u64(tid);
+    print_str(b" root=");
+    print_str(match root {
+        FileParseRoot::Absolute => b"absolute",
+        FileParseRoot::FatDirectory { .. } => b"fat-directory",
+        FileParseRoot::OverlayFile(_) => b"overlay-file",
+        FileParseRoot::HostedFile { .. } => b"hosted-file",
+        FileParseRoot::NonDirectoryFile => b"non-directory",
+        FileParseRoot::ObjectDirectory { .. } => b"object-directory",
+    });
+    print_str(b" route=");
+    print_str(match route {
+        Some(nt_fs::BlockSourceKind::Boot) => b"boot",
+        Some(nt_fs::BlockSourceKind::Draining) => b"draining",
+        Some(nt_fs::BlockSourceKind::Native) => b"native",
+        None => b"none",
+    });
+    print_str(b" journal=");
+    print_u64(journal_owned as u64);
+    print_str(b" mounted=");
+    print_u64(mounted as u64);
+    if let Some(status) = status {
+        print_str(b" status=0x");
+        print_hex(status);
+    }
+    if let Some((file_id, irp_id)) = file {
+        print_str(b" file=");
+        print_u64(file_id);
+        print_str(b" irp=");
+        print_u64(irp_id);
+    }
+    print_str(b" name=\"");
+    print_sanitized_utf16_ascii(name, 128);
+    print_str(b"\"\n");
+}
 
 fn print_exact_path_bytes(bytes: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -27092,6 +27148,13 @@ impl ExecNtHandler {
             }
             _ => Err(STATUS_INVALID_HANDLE),
         };
+        trace_winlogon_open(b"target-resolve", self.pi, self.current_tid, root,
+            unsafe { crate::fs_loader::exec_fs_mount_identity() }
+                .and_then(crate::fs_loader::exec_block_route_kind),
+            crate::writable_fs::registry_journal::owns_volume(), true,
+            Some(target.as_ref().map(|_| nt_fs::STATUS_SUCCESS)
+                .unwrap_or_else(|&status| status)),
+            target.as_ref().ok().map(|(device_id, _, _)| (*device_id, 0)), name16);
         self.create_registered_file_from_target(
             target,
             name16,
@@ -27419,6 +27482,13 @@ impl ExecNtHandler {
                 return Err(status);
             }
         };
+        trace_winlogon_open(b"file-create-dispatch", self.pi, self.current_tid,
+            FileParseRoot::Absolute,
+            unsafe { crate::fs_loader::exec_fs_mount_identity() }
+                .and_then(crate::fs_loader::exec_block_route_kind),
+            crate::writable_fs::registry_journal::owns_volume(), true,
+            Some(status as u32), Some((canonical_file_id,
+                pending_irp_id.map_or(0, nt_io_manager::IrpId::raw))), name16);
         if let Some(irp_id) = pending_irp_id {
             self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
                 route: PendingFileRoute::Hosted(canonical_file_id),
@@ -32305,7 +32375,11 @@ impl ExecNtHandler {
         }
         let mount_route = unsafe { crate::fs_loader::exec_fs_mount_identity() }
             .and_then(crate::fs_loader::exec_block_route_kind);
-        if Self::route_absolute_open_to_kernel_file(name16, open_options, mount_route) {
+        let mounted_route = Self::route_absolute_open_to_kernel_file(name16, open_options, mount_route);
+        trace_winlogon_open(b"decide", self.pi, self.current_tid, parse_root,
+            mount_route, crate::writable_fs::registry_journal::owns_volume(),
+            mounted_route, None, None, name16);
+        if mounted_route {
             static SMSS_MOUNTED_OPEN_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
             if self.pi == 0 && SMSS_MOUNTED_OPEN_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 24 {
                 print_str(b"[smss-mounted-open] tid=");
@@ -32321,7 +32395,7 @@ impl ExecNtHandler {
                 print_sanitized_utf16_ascii(name16, 128);
                 print_str(b"\"\n");
             }
-            return self.create_registered_kernel_file(
+            let status = self.create_registered_kernel_file(
                 parse_root,
                 name16,
                 captured.attributes,
@@ -32334,6 +32408,10 @@ impl ExecNtHandler {
                 file_handle_out,
                 args[3],
             );
+            trace_winlogon_open(b"mounted-return", self.pi, self.current_tid, parse_root,
+                mount_route, crate::writable_fs::registry_journal::owns_volume(),
+                true, Some(status), None, name16);
+            return status;
         }
         let mut path_folded = [0u8; FILE_OBJECT_NAME_CAP];
         let mut path_relative = [0u8; FILE_VOLUME_RELATIVE_CAP];
@@ -32349,6 +32427,9 @@ impl ExecNtHandler {
                 nt_fs::FILE_OPEN,
                 open_options,
             );
+            trace_winlogon_open(b"legacy-overlay-create", self.pi, self.current_tid, parse_root,
+                mount_route, crate::writable_fs::registry_journal::owns_volume(),
+                false, Some(status), None, name16);
             if Self::overlay_open_missed(status) {
                 if let Some(source) = Self::readonly_volume_metadata(name16)
                     .filter(|entry| !entry.metadata.is_directory)
@@ -32414,6 +32495,9 @@ impl ExecNtHandler {
             let overlay_hit = match crate::writable_fs::query_metadata_relative_if_mounted(relative) {
                 Ok(info) => info.is_some(),
                 Err(status) => {
+                    trace_winlogon_open(b"legacy-overlay-query", self.pi, self.current_tid, parse_root,
+                        mount_route, crate::writable_fs::registry_journal::owns_volume(),
+                        false, Some(status), None, name16);
                     return status;
                 }
             };
