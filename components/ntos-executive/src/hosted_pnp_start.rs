@@ -1701,16 +1701,14 @@ fn acpi_child_reported_interrupt(
     interrupt.ok_or(invalid)
 }
 
-unsafe fn prepare_current_hosted_devnode<H, C>(
+unsafe fn prepare_current_hosted_devnode<H>(
     bus_pdo: Option<u64>,
     require_accepted_bus_pdo: bool,
     instance_id: &str,
     hardware_ids: &[H],
-    compatible_ids: &[C],
 ) -> Result<PreparedHostedDevnode, nt_status::NtStatus>
 where
     H: AsRef<str>,
-    C: AsRef<str>,
 {
     if require_accepted_bus_pdo && bus_pdo.is_none() {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
@@ -1841,12 +1839,9 @@ where
             address,
         )
     } else {
-        nt_pnp::find_pci_device_for_devnode(
-            &context.pci_devices,
-            instance_id,
-            hardware_ids,
-            compatible_ids,
-        )
+        // Host PCI inventory describes hardware; only the bus driver's accepted PDO
+        // authorizes a child device identity and its resource assignment.
+        None
     };
 
     if accepted_pci_pdo.is_some() && pci_device.is_none() {
@@ -1948,7 +1943,9 @@ where
     let platform_window = context
         .platform_windows
         .iter()
-        .find(|window| window.matches_devnode(instance_id, hardware_ids, compatible_ids))
+        // A firmware-granted root window is authority for its registered instance only;
+        // sharing a hardware ID does not turn a bus child into a platform root PDO.
+        .find(|window| window.instance_path.eq_ignore_ascii_case(instance_id))
         .cloned();
 
     if let Some(window) = platform_window {
@@ -2203,7 +2200,7 @@ where
     let bus_pdo = driver_launch::hosted_bus_reported_device_id(devnode.instance_id);
     let relation_pending = (bus_pdo.is_none() && driver_launch::hosted_bus_relation_pending())
         || driver_launch::hosted_relation_cm_writer_pending();
-    if relation_pending {
+    if relation_pending || (require_accepted_bus_pdo && bus_pdo.is_none()) {
         return HostedPnpDevnodeProgress::BusRelationPending { require_accepted_bus_pdo };
     }
     let prepared = match prepare_current_hosted_devnode(
@@ -2211,7 +2208,6 @@ where
         require_accepted_bus_pdo,
         devnode.instance_id,
         devnode.hardware_ids,
-        devnode.compatible_ids,
     ) {
         Ok(prepared) => prepared,
         Err(status) => {
@@ -2236,6 +2232,14 @@ where
         pdo_description,
         resource_plan,
     } = prepared;
+    if bus_pdo.is_none()
+        && matches!(&resource_plan, PreparedHostedResourcePlan::None)
+        && !nt_root_bus::is_root_enumerated_instance(devnode.instance_id)
+    {
+        // A persisted bus child may be listed before its bus driver reports the new PDO.
+        // Retain this START owner instead of registering a competing root PDO.
+        return HostedPnpDevnodeProgress::BusRelationPending { require_accepted_bus_pdo: true };
+    }
     match resource_plan.interrupt_route_admission() {
         crate::hosted_pci_topology::HostedPciInterruptRouteAdmission::Current => {}
         crate::hosted_pci_topology::HostedPciInterruptRouteAdmission::Pending => {
