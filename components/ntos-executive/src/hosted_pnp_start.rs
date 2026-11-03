@@ -1,5 +1,6 @@
 use crate::*;
 use alloc::vec::Vec;
+use nt_pnp_context::native_cutover_admission::{CutoverPhase, DeferredVideoOwner};
 
 static ACTIVE_HOSTED_START_BATCH_DRIVES: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
@@ -214,6 +215,10 @@ pub(crate) struct OwnedHostedPnpStartBatch {
     pending_filter: Option<PendingHostedPnpFilter>,
     pending_grant_admission: Option<PendingHostedGrantAdmission>,
     pending_relations: Option<driver_launch::HostedPnpRelationRefresh>,
+    pending_video_publication: Option<(
+        usize,
+        DeferredVideoOwner<driver_launch::HostedVideoPublicationIdentity>,
+    )>,
     pending_bus_relation_devnode: Option<usize>,
     bootstrap_required_bus_pdos: Vec<usize>,
     single_start_evidence: SingleStartEvidence,
@@ -295,6 +300,7 @@ impl OwnedHostedPnpStartBatch {
             pending_filter: None,
             pending_grant_admission: None,
             pending_relations: None,
+            pending_video_publication: None,
             pending_bus_relation_devnode: None,
             bootstrap_required_bus_pdos: Vec::new(),
             single_start_evidence: SingleStartEvidence::NotDispatched,
@@ -473,6 +479,7 @@ impl OwnedHostedPnpStartBatch {
             .as_ref()
             .is_some_and(|pending| pending.ownership_lost.is_none())
             || self.pending_relations.is_some()
+            || self.pending_video_publication.is_some()
             || matches!(
                 self.coordinator.phase(),
                 nt_driver_start::BatchPhase::Ready | nt_driver_start::BatchPhase::Awaiting { .. }
@@ -491,9 +498,23 @@ impl OwnedHostedPnpStartBatch {
 
     unsafe fn schedule_initial_bus_relations(
         &mut self,
+        devnode_index: usize,
         device_id: u64,
     ) -> OwnedHostedPnpStartProgress {
         assert_ne!(device_id, 0, "successful START lost its canonical device");
+        if hosted_video_route_candidate(device_id) {
+            let identity = driver_launch::hosted_video_publication_identity(device_id)
+                .expect("video candidate lost its registered device binding");
+            if crate::boot_storage_dma_handoff::native_storage_cutover_phase().admit_video_create() {
+                let instance_id = &self.spec.devnodes[devnode_index].instance_id;
+                try_publish_hosted_video_route(
+                    device_id, &self.spec.service_name, instance_id, &mut self.report,
+                );
+            } else {
+                assert!(self.pending_video_publication.is_none());
+                self.pending_video_publication = Some((devnode_index, DeferredVideoOwner::new(identity)));
+            }
+        }
         match driver_launch::enqueue_hosted_initial_bus_relations(device_id) {
             Ok(refresh) => {
                 self.pending_relations = Some(refresh);
@@ -624,7 +645,7 @@ impl OwnedHostedPnpStartBatch {
                         .stop()
                         .expect("terminal START failure could not stop batch");
                 } else {
-                    return Some(self.schedule_initial_bus_relations(device_id));
+                    return Some(self.schedule_initial_bus_relations(devnode_index, device_id));
                 }
                 None
             }
@@ -692,7 +713,29 @@ impl OwnedHostedPnpStartBatch {
                 }
                 continue;
             }
+            if let Some((devnode_index, owner)) = self.pending_video_publication {
+                if !crate::boot_storage_dma_handoff::native_storage_cutover_phase().admit_video_create() {
+                    return OwnedHostedPnpStartProgress::AwaitingCompletion;
+                }
+                self.pending_video_publication = None;
+                let device_id = owner.identity().device_id;
+                if !owner.matches_current(driver_launch::hosted_video_publication_identity(device_id))
+                    || !driver_launch::hosted_video_publication_identity_is_live(owner.identity())
+                {
+                    remember_error(&mut self.report, nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                    continue;
+                }
+                let instance_id = &self.spec.devnodes[devnode_index].instance_id;
+                try_publish_hosted_video_route(
+                    device_id, &self.spec.service_name, instance_id, &mut self.report,
+                );
+                continue;
+            }
             if let Some(pending) = self.pending_filter_admission.take() {
+                if defer_unrelated_start_during_native_drain(false) {
+                    self.pending_filter_admission = Some(pending);
+                    return OwnedHostedPnpStartProgress::AwaitingCompletion;
+                }
                 let devnode_index = pending.devnode_index;
                 let devnode = &self.spec.devnodes[devnode_index];
                 let progress = filter_attached_devnode(
@@ -715,6 +758,12 @@ impl OwnedHostedPnpStartBatch {
             }
             if let Some(pending) = self.pending_grant_admission.take() {
                 let mut pending = pending;
+                if defer_unrelated_start_during_native_drain(
+                    pending.resource_plan.is_boot_storage_controller(),
+                ) {
+                    self.pending_grant_admission = Some(pending);
+                    return OwnedHostedPnpStartProgress::AwaitingCompletion;
+                }
                 if pending.resource_plan.is_boot_storage_controller() {
                     let Some(receipt) = driver_launch::current_boot_driver_preload_receipt() else {
                         pending.blocked_status = Some(nt_status::NtStatus::DEVICE_NOT_READY);
@@ -909,7 +958,7 @@ impl OwnedHostedPnpStartBatch {
                                     .stop()
                                     .expect("terminal START failure could not stop batch");
                             } else {
-                                return self.schedule_initial_bus_relations(device_id);
+                                return self.schedule_initial_bus_relations(devnode_index, device_id);
                             }
                         }
                         CanonicalStartDisposition::OwnershipLost {
@@ -941,6 +990,9 @@ impl OwnedHostedPnpStartBatch {
                     }
                 }
                 nt_driver_start::BatchPhase::Ready => {
+                    if defer_unrelated_start_during_native_drain(false) {
+                        return OwnedHostedPnpStartProgress::AwaitingCompletion;
+                    }
                     let devnode_index = self.coordinator.next_devnode();
                     let devnode = &self.spec.devnodes[devnode_index];
                     let progress = start_one_devnode(
@@ -969,6 +1021,11 @@ impl OwnedHostedPnpStartBatch {
             }
         }
     }
+}
+
+fn defer_unrelated_start_during_native_drain(exact_boot_controller: bool) -> bool {
+    let phase: CutoverPhase = crate::boot_storage_dma_handoff::native_storage_cutover_phase();
+    !phase.admit_unentered_start(exact_boot_controller)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2947,9 +3004,6 @@ unsafe fn finish_started_devnode(
         status_raw,
         report,
     );
-    if status.is_success() {
-        try_publish_hosted_video_route(device_id, service_name, instance_id, report);
-    }
 }
 
 fn hosted_display_service_registry_path(service_name: &str) -> Option<Vec<u8>> {
@@ -3007,6 +3061,11 @@ pub(crate) fn print_hosted_video_route_census() {
     print_str(b"/");
     print_u64(VIDEO_ROUTE_STAGE.load(core::sync::atomic::Ordering::Acquire));
     print_str(b"\n");
+}
+
+fn hosted_video_route_candidate(device_id: u64) -> bool {
+    crate::current_win32k_provider_domain().is_some()
+        && driver_launch::hosted_device_video_port_initialized(device_id)
 }
 
 unsafe fn try_publish_hosted_video_route(

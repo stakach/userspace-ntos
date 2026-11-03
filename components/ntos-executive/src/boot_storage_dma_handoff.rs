@@ -11,6 +11,22 @@ use nt_pnp_context::native_storage_handoff::{
     MountCommit, NativeStorageAdmissions, NativeStorageHandoff, SrbProofRequest,
     StorageHandoffKey, StoragePdo, StorageRelation,
 };
+use nt_pnp_context::native_cutover_admission::{admit_native_drain, CutoverPhase};
+
+pub(crate) fn native_storage_cutover_phase() -> CutoverPhase {
+    let Some(mount) = (unsafe { crate::fs_loader::exec_fs_mount_identity() }) else {
+        return CutoverPhase::Unavailable;
+    };
+    match crate::fs_loader::exec_block_route_kind(mount) {
+        Some(nt_fs::BlockSourceKind::Boot) => CutoverPhase::Boot,
+        Some(nt_fs::BlockSourceKind::Draining) => CutoverPhase::Draining,
+        Some(nt_fs::BlockSourceKind::Native) => CutoverPhase::for_native_mount(
+            mount,
+            driver_launch::published_native_storage_mount(),
+        ),
+        None => CutoverPhase::Unavailable,
+    }
+}
 
 const BOOT_GENERATION: u64 = 1;
 pub(crate) const BOOT_DOMAIN: u64 = 2;
@@ -240,7 +256,10 @@ pub(crate) fn begin_native_start_after_preload(
                 .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
             if unsafe {
                 driver_launch::hosted_nonstorage_relation_query_active(accepted_pdo)
-            } {
+            } || !admit_native_drain(
+                driver_launch::hosted_pnp_lifecycle_dispatch_active(),
+                crate::video_device::video_publication_active(),
+            ) {
                 trace_native_start_once(65536, b"waiting-relation");
                 return Ok(NativeStartAdmission::WaitingForRelation);
             }

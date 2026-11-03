@@ -284,6 +284,10 @@ mod hosted_scsi_dma_reservation;
 mod hosted_scsi_srb_work;
 #[path = "native_disk_relation.rs"]
 mod native_disk_relation;
+
+pub(crate) fn published_native_storage_mount() -> Option<nt_memory_manager::SectionMountId> {
+    native_disk_relation::native_storage_route().map(|route| route.mount)
+}
 #[path = "hosted_source_completion_lane.rs"]
 pub(crate) mod hosted_source_completion_lane;
 #[path = "hosted_class_irp_lane.rs"]
@@ -43652,7 +43656,7 @@ pub(crate) fn file_thread_io_drain_state(
     )
 }
 
-fn hosted_pnp_lifecycle_dispatch_active() -> bool {
+pub(crate) fn hosted_pnp_lifecycle_dispatch_active() -> bool {
     unsafe {
         let lifecycle_active = (*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS))
             .as_ref()
@@ -50990,6 +50994,45 @@ struct HostedDeviceBinding {
     used: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HostedVideoPublicationIdentity {
+    pub(crate) device_id: u64,
+    driver_id: u64,
+    pdo_device_id: u64,
+    instance: usize,
+    projection_instance: usize,
+    projection_domain: HostedDomainIdentity,
+    device_object: u64,
+    pdo_object: u64,
+    registry_identity_id: HostedRegistryIdentityId,
+    pdo_generation: HostedDmaPdoGeneration,
+}
+
+pub(crate) fn hosted_video_publication_identity(
+    device_id: u64,
+) -> Option<HostedVideoPublicationIdentity> {
+    let binding = hosted_device_binding_by_device_id(device_id)?;
+    let pdo_generation = unsafe { hosted_dma_pdo_generation(binding.pdo_device_id)? };
+    Some(HostedVideoPublicationIdentity {
+        device_id,
+        driver_id: binding.driver_id,
+        pdo_device_id: binding.pdo_device_id,
+        instance: binding.instance,
+        projection_instance: binding.projection_instance,
+        projection_domain: binding.projection_domain,
+        device_object: binding.device_object,
+        pdo_object: binding.pdo_object,
+        registry_identity_id: binding.registry_identity_id,
+        pdo_generation,
+    })
+}
+
+pub(crate) fn hosted_video_publication_identity_is_live(
+    identity: HostedVideoPublicationIdentity,
+) -> bool {
+    unsafe { hosted_dma_pdo_generation_is_live(identity.pdo_device_id, identity.pdo_generation) }
+}
+
 #[derive(Clone, Copy)]
 struct HostedDeviceDispatchContext {
     instance: usize,
@@ -51662,7 +51705,7 @@ struct HostedDeviceRetirement {
     barrier_status: Option<nt_status::NtStatus>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostedDmaPdoGeneration {
     Root(nt_pnp_manager::DevnodeIdentity),
     Child(nt_pnp_manager::ParentRelationIdentity),

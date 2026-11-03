@@ -302,6 +302,10 @@ impl Drop for PublicationGuard {
     }
 }
 
+pub(crate) fn video_publication_active() -> bool {
+    VIDEO_PUBLICATION_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
+}
+
 pub(crate) unsafe fn video_file_owners_quiesced() -> bool {
     !VIDEO_PUBLICATION_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
         && !video_projection_owners::has_owners()
