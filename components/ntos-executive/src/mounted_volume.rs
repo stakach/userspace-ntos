@@ -292,6 +292,7 @@ pub(crate) fn register_mounted_volume(
             nt_io_abi::major::IRP_MJ_WRITE,
             nt_io_abi::major::IRP_MJ_QUERY_INFORMATION,
             nt_io_abi::major::IRP_MJ_QUERY_VOLUME_INFORMATION,
+            nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL,
             nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL,
             nt_io_abi::major::IRP_MJ_CLEANUP,
             nt_io_abi::major::IRP_MJ_CLOSE,

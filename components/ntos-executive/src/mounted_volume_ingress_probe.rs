@@ -160,9 +160,29 @@ unsafe fn conflicting_volume_open(device_id: u64, caller: nt_process::native_han
     denied && retired
 }
 
+unsafe fn query_volume_dirty(
+    file: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
+    expected_dirty: bool,
+) -> bool {
+    let mut mask = [0xa5; 4];
+    matches!(
+        crate::driver_launch::dispatch_hosted_file_irp_result_exact(
+            file,
+            major::IRP_MJ_FILE_SYSTEM_CONTROL as u64,
+            nt_fs::FSCTL_IS_VOLUME_DIRTY as u64,
+            caller,
+            &[],
+            &mut mask,
+            0,
+        ),
+        Ok((0, 4, None, _))
+    ) && u32::from_le_bytes(mask) == u32::from(expected_dirty)
+}
+
 /// The empty FileName is a volume File; a single backslash is the root directory instead.
 /// Autochk opens the former without OBJ_CASE_INSENSITIVE before querying and controlling it.
-pub(crate) unsafe fn run_volume_open(device_id: u64) -> bool {
+pub(crate) unsafe fn run_volume_open(device_id: u64, expected_dirty: bool) -> (bool, bool) {
     const FILE_GENERIC_READ: u32 = 0x0012_0089;
     let caller = crate::initial_system_driver_caller();
     let file = match crate::driver_launch::allocate_hosted_file(
@@ -173,10 +193,10 @@ pub(crate) unsafe fn run_volume_open(device_id: u64) -> bool {
         &[],
     ) {
         Ok(file) => file,
-        Err(_) => return false,
+        Err(_) => return (false, false),
     };
     let mut published = false;
-    let tested = (|| -> Result<bool, u32> {
+    let tested = (|| -> Result<(bool, bool), u32> {
         let (status, information, pending, context) =
             crate::driver_launch::dispatch_hosted_file_create_irp_result_exact(
                 file,
@@ -196,14 +216,16 @@ pub(crate) unsafe fn run_volume_open(device_id: u64) -> bool {
                 &[],
             )?;
         published = status == 0 && pending.is_none() && context.is_some();
-        Ok(published
-            && information == nt_fs::FILE_OPENED as u64
-            && query_fat32_attributes(file, caller)
-            && conflicting_volume_open(device_id, caller))
+        if !published || information != nt_fs::FILE_OPENED as u64 {
+            return Ok((false, false));
+        }
+        let dirty = query_volume_dirty(file, caller, expected_dirty);
+        Ok((query_fat32_attributes(file, caller)
+            && conflicting_volume_open(device_id, caller), dirty))
     })()
-    .unwrap_or(false);
+    .unwrap_or((false, false));
     let retired = retire_probe_file(file, published);
-    tested && retired
+    (tested.0 && retired, tested.1 && retired)
 }
 
 pub(crate) unsafe fn run_directory(device_id: u64) -> bool {

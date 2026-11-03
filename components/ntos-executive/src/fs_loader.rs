@@ -1506,12 +1506,16 @@ unsafe fn fat32_mount_for_owner(
         fs_info_sector: geometry.fs_info_sector,
         volume_serial: geometry.volume_serial,
         volume_label: geometry.volume_label,
+        volume_dirty: geometry.volume_dirty,
         fat_start: geometry.fat_start_sector,
         data_start: geometry.data_start_sector,
         root_cl: geometry.root_cluster,
     };
     print_str(b"[fat-mount] partition-guid=");
     print_str(&nt_fs::format_gpt_guid(mounted.partition_guid));
+    print_str(b"\n");
+    print_str(b"[fat-mount-bpb] dirty=");
+    print_u64(u64::from(sector[0x41] & 1));
     print_str(b"\n");
     Some(mounted)
 }

@@ -1447,6 +1447,57 @@ impl MountedVolumeBackend {
         })
     }
 
+    fn filesystem_control(
+        &self,
+        ctx: DispatchContext<'_>,
+        irp: &IrpProjection,
+    ) -> Result<DispatchOutcome, NtStatus> {
+        let (context, _) = self.binding(irp)?;
+        let file_id = irp.file_id.ok_or(NtStatus::INVALID_PARAMETER)?;
+        if self.opens.get(context, file_id.raw()).map_err(status)?.source
+            != nt_fs::LayeredOpenSource::Volume
+        {
+            return Err(NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        let IoParameters::DeviceControl(parameters) = &irp.parameters else {
+            return Err(NtStatus::INVALID_PARAMETER);
+        };
+        let output_len = parameters.output_len as usize;
+        if output_len > ctx.system_buffer.len() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let written = nt_fs::encode_fat_volume_fsctl(
+            parameters.ioctl_code,
+            parameters.input_len,
+            &mut ctx.system_buffer[..output_len],
+            self.fs.volume_dirty,
+        )
+        .map_err(status)?;
+        // Native acceptance: this marker only follows an exact generation-bound volume File
+        // and a successful buffered dirty query. Compare it with [fat-mount-bpb] from the
+        // sector read at mount, and with the guest's successful NtFsControlFile receipt.
+        let reported = u32::from_le_bytes(
+            ctx.system_buffer[..4].try_into().expect("successful dirty FSCTL wrote four bytes")
+        );
+        if written != 4 || reported != u32::from(self.fs.volume_dirty) {
+            return Err(status(nt_fs::STATUS_DATA_ERROR));
+        }
+        crate::print_str(b"[mounted-volume-fsctl-dirty] file=");
+        crate::print_u64(file_id.raw());
+        crate::print_str(b" context=");
+        crate::print_u64(context.raw());
+        crate::print_str(b" status=0 information=");
+        crate::print_u64(written as u64);
+        crate::print_str(b" dirty=");
+        crate::print_u64(u64::from(reported));
+        crate::print_str(b"\n");
+        Ok(DispatchOutcome::Completed {
+            status: NtStatus::SUCCESS,
+            information: written as u64,
+            file_context: None,
+        })
+    }
+
     fn write(
         &mut self,
         ctx: DispatchContext<'_>,
@@ -1638,6 +1689,7 @@ impl DriverDispatchBackend for MountedVolumeBackend {
             major::IRP_MJ_SET_INFORMATION => self.set_information(ctx, irp),
             major::IRP_MJ_QUERY_INFORMATION => self.query(ctx, irp),
             major::IRP_MJ_QUERY_VOLUME_INFORMATION => self.query_volume_information(ctx, irp),
+            major::IRP_MJ_FILE_SYSTEM_CONTROL => self.filesystem_control(ctx, irp),
             major::IRP_MJ_DIRECTORY_CONTROL => self.query_directory(ctx, irp),
             major::IRP_MJ_CLEANUP => self.cleanup_or_close(irp, false),
             major::IRP_MJ_CLOSE => self.cleanup_or_close(irp, true),

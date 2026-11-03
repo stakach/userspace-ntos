@@ -28688,6 +28688,8 @@ struct Fat32 {
     fs_info_sector: u32,
     volume_serial: u32,
     volume_label: [u8; 11],
+    /// FAT32 BPB dirty bit captured from the validated boot sector at mount.
+    volume_dirty: bool,
     fat_start: u32,  // first FAT sector
     data_start: u32, // first data sector (cluster 2)
     root_cl: u32,    // root directory cluster
@@ -30789,11 +30791,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             mounted_volume_attribute_ok,
             &mut passed,
         );
-        let mounted_volume_root_open_ok = mounted_volume_device_id
-            .is_some_and(|device_id| mounted_volume_ingress_probe::run_volume_open(device_id));
+        let (mounted_volume_root_open_ok, mounted_volume_dirty_ok) = mounted_volume_device_id
+            .map(|device_id| mounted_volume_ingress_probe::run_volume_open(device_id, fs.volume_dirty))
+            .unwrap_or((false, false));
         check(
             b"exec_mounted_volume_case_sensitive_volume_open",
             mounted_volume_root_open_ok,
+            &mut passed,
+        );
+        check(
+            b"exec_mounted_volume_fsctl_is_dirty",
+            mounted_volume_dirty_ok,
             &mut passed,
         );
         let mounted_directory_open_ok = mounted_volume_device_id

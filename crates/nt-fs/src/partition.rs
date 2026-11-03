@@ -203,6 +203,8 @@ pub struct Fat32Geometry {
     pub fs_info_sector: u32,
     pub volume_serial: u32,
     pub volume_label: [u8; 11],
+    /// Dirty bit recorded in the validated FAT32 boot-sector BPB at mount.
+    pub volume_dirty: bool,
     pub fat_start_sector: u32,
     pub data_start_sector: u32,
     pub root_cluster: u32,
@@ -256,6 +258,7 @@ impl Fat32Geometry {
             fs_info_sector,
             volume_serial,
             volume_label,
+            volume_dirty: sector[0x41] & 0x01 != 0,
             fat_start_sector: reserved,
             data_start_sector,
             root_cluster,
@@ -516,6 +519,25 @@ mod tests {
         assert_eq!(
             Fat32Geometry::parse(&invalid, 65_536),
             Err(GptError::InvalidFat32)
+        );
+    }
+
+    #[test]
+    fn fat32_boot_sector_preserves_the_recorded_volume_dirty_bit() {
+        let mut sector = fat32_sector();
+        assert!(!Fat32Geometry::parse(&sector, 65_536).unwrap().volume_dirty);
+
+        sector[0x41] = 0x01;
+        assert!(Fat32Geometry::parse(&sector, 65_536).unwrap().volume_dirty);
+
+        sector[0x41] = 0x02;
+        assert!(!Fat32Geometry::parse(&sector, 65_536).unwrap().volume_dirty);
+
+        sector[510] = 0;
+        assert_eq!(
+            Fat32Geometry::parse(&sector, 65_536),
+            Err(GptError::InvalidFat32),
+            "an invalid BPB must not be interpreted as a clean volume"
         );
     }
 

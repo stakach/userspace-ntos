@@ -4,6 +4,8 @@ mod dynamic_boot_protocol;
 mod file_all_owned_fields;
 #[path = "native_acceptance/mounted_volume_query.rs"]
 mod mounted_volume_query;
+#[path = "native_acceptance/mounted_volume_dirty.rs"]
+mod mounted_volume_dirty;
 #[path = "native_acceptance/mounted_volume_root_open.rs"]
 mod mounted_volume_root_open;
 #[path = "native_acceptance/kernel_query_seed.rs"]
