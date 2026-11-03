@@ -8,6 +8,10 @@ use nt_status::NtStatus;
 use crate::fs_loader::fat_visit_directory_checked;
 use crate::mounted_volume_backend::{MountedCreateQueue, MountedDirectoryQueue, MountedOverlayQueue, MountedReadQueue, MountedVolumeBackend};
 
+#[path = "exec_volume_mount_pair.rs"]
+mod exec_volume_mount_pair;
+use exec_volume_mount_pair::ExecVolumeDevice;
+
 static mut MOUNT_IDS: SectionMountIds = SectionMountIds::new();
 static mut MOUNT_BINDINGS: SectionMountBindings<nt_io_manager::DeviceId> =
     SectionMountBindings::new();
@@ -15,8 +19,8 @@ static mut MOUNT_CREATE_QUEUE: Option<MountedCreateQueue> = None;
 static mut MOUNT_OVERLAY_QUEUE: Option<MountedOverlayQueue> = None;
 static mut MOUNT_READ_QUEUE: Option<MountedReadQueue> = None;
 static mut MOUNT_DIRECTORY_QUEUE: Option<MountedDirectoryQueue> = None;
-/// The published File device for the executive's exact physical FAT mount.
-static mut EXEC_VOLUME_DEVICE: Option<(SectionMountId, u64)> = None;
+/// The published File device with both its physical FAT and logical File mount owners.
+static mut EXEC_VOLUME_DEVICE: Option<ExecVolumeDevice> = None;
 
 pub(crate) fn draining_exec_volume_device() -> Option<u64> {
     let physical = unsafe { crate::fs_loader::exec_fs_mount_identity() }?;
@@ -30,11 +34,9 @@ pub(crate) fn draining_exec_volume_device() -> Option<u64> {
 }
 
 fn exec_volume_device_for_mount(physical: SectionMountId) -> Option<u64> {
-    let (bound, device_id) = unsafe { *core::ptr::addr_of!(EXEC_VOLUME_DEVICE) }?;
-    if bound != physical || mount_id_for_live_device(device_id) != Some(physical) {
-        return None;
-    }
-    Some(device_id)
+    let published = unsafe { *core::ptr::addr_of!(EXEC_VOLUME_DEVICE) }?;
+    let device_id = published.device_id;
+    published.exact_device(physical, mount_id_for_live_device(device_id))
 }
 
 /// The canonical File device for the exact mounted volume, including Boot-v2 journal ownership.
@@ -279,8 +281,8 @@ pub(crate) fn register_mounted_volume(
     let directory_queue = Rc::new(RefCell::new(crate::mounted_volume_backend::mounted_directory_lookup::DirectoryLookupQueue::new()));
     let backend = MountedVolumeBackend::new(fs, create_queue.clone(), overlay_queue.clone(),
         read_queue.clone(), directory_queue.clone());
-    let mount = unsafe { allocate_mount_id() }.map_err(|status| NtStatus(status as i32))?;
-    unsafe { (&mut *core::ptr::addr_of_mut!(MOUNT_BINDINGS)).reserve(mount) }
+    let logical_mount = unsafe { allocate_mount_id() }.map_err(|status| NtStatus(status as i32))?;
+    unsafe { (&mut *core::ptr::addr_of_mut!(MOUNT_BINDINGS)).reserve(logical_mount) }
         .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
     let device_id = match crate::driver_launch::register_kernel_volume_device(
         &driver_path,
@@ -300,21 +302,23 @@ pub(crate) fn register_mounted_volume(
     ) {
         Ok(device_id) => device_id,
         Err(status) => {
-            unsafe { (&mut *core::ptr::addr_of_mut!(MOUNT_BINDINGS)).cancel(mount) }
+            unsafe { (&mut *core::ptr::addr_of_mut!(MOUNT_BINDINGS)).cancel(logical_mount) }
                 .expect("failed volume registration left a prepared mount binding");
             return Err(status);
         }
     };
     unsafe {
         (&mut *core::ptr::addr_of_mut!(MOUNT_BINDINGS))
-            .publish(mount, nt_io_manager::DeviceId(device_id))
+            .publish(logical_mount, nt_io_manager::DeviceId(device_id))
     }
     .expect("newly registered volume has a unique prepared mount binding");
     unsafe { *core::ptr::addr_of_mut!(MOUNT_CREATE_QUEUE) = Some(create_queue); }
     unsafe { *core::ptr::addr_of_mut!(MOUNT_OVERLAY_QUEUE) = Some(overlay_queue); }
     unsafe { *core::ptr::addr_of_mut!(MOUNT_READ_QUEUE) = Some(read_queue); }
     unsafe { *core::ptr::addr_of_mut!(MOUNT_DIRECTORY_QUEUE) = Some(directory_queue); }
-    unsafe { *core::ptr::addr_of_mut!(EXEC_VOLUME_DEVICE) = Some((physical_mount, device_id)); }
+    unsafe { *core::ptr::addr_of_mut!(EXEC_VOLUME_DEVICE) = Some(ExecVolumeDevice {
+        physical_mount, logical_mount, device_id,
+    }); }
     crate::print_str(b"[mounted-volume] registered ");
     crate::print_str(device_path.as_bytes());
     crate::print_str(b" device=");

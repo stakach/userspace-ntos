@@ -309,6 +309,6 @@ fn relative_attribute_queries_use_mounted_owner_and_local_fat_is_fail_closed() {
     let mounted_volume = include_str!("../../../components/ntos-executive/src/mounted_volume.rs");
     let device = mounted_volume.split("fn exec_volume_device_for_mount(").nth(1).unwrap()
         .split("\n}").next().unwrap();
-    assert!(device.contains("mount_id_for_live_device(device_id) != Some(physical)"),
-        "a registered File device must be bound to the same physical mount generation");
+    assert!(device.contains("published.exact_device(physical, mount_id_for_live_device(device_id))"),
+        "the published physical FAT mount and live logical File binding must both match");
 }
