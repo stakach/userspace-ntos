@@ -23,6 +23,9 @@
 #[path = "hosted_irq_broker.rs"]
 #[allow(dead_code)]// Activated only by the atomic ISR/DPC/provider cutover tracked in the plan.
 mod hosted_irq_broker;
+#[path = "hosted_irq_service_trace.rs"]
+mod hosted_irq_service_trace;
+use hosted_irq_service_trace::HostedIrqServiceTrace;
 #[path = "hosted_bus_interface.rs"]
 pub(crate) mod hosted_bus_interface;
 #[path = "hosted_driver_frame_capture.rs"]
@@ -51782,7 +51785,7 @@ static HOSTED_IRQ_NOTIFICATION_EPOCH: AtomicU64 = AtomicU64::new(0);
 static mut HOSTED_IRQ_EVENT_RETIREMENT_EPOCHS: [u64; crate::HOSTED_IRQ_EVENT_SLOT_COUNT as usize] =
     [0; crate::HOSTED_IRQ_EVENT_SLOT_COUNT as usize];
 static HOSTED_IRQ_EVENTS_RECEIVED: AtomicU64 = AtomicU64::new(0);
-static HOSTED_IRQ_EVENTS_SERVICED: AtomicU64 = AtomicU64::new(0);
+static HOSTED_IRQ_SERVICE_TRACE: HostedIrqServiceTrace = HostedIrqServiceTrace::new();
 static HOSTED_IRQ_EVENTS_DEFERRED_BUSY: AtomicU64 = AtomicU64::new(0);
 static HOSTED_IRQ_EVENTS_ACKNOWLEDGED: AtomicU64 = AtomicU64::new(0);
 static mut HOSTED_DEVICE_PROPERTY_TRANSFERS: Option<HostedDevicePropertyTransferTable> = None;
@@ -57776,7 +57779,7 @@ pub(crate) fn hosted_irq_delivery_census() -> (u64, u64, u64, u64, u64) {
     (
         HOSTED_IRQ_EVENTS_RECEIVED.load(Ordering::Relaxed),
         HOSTED_IRQ_PENDING_EVENTS.load(Ordering::Acquire),
-        HOSTED_IRQ_EVENTS_SERVICED.load(Ordering::Relaxed),
+        HOSTED_IRQ_SERVICE_TRACE.total(),
         HOSTED_IRQ_EVENTS_DEFERRED_BUSY.load(Ordering::Relaxed),
         HOSTED_IRQ_EVENTS_ACKNOWLEDGED.load(Ordering::Relaxed),
     )
@@ -58889,9 +58892,9 @@ unsafe fn drain_pending_hosted_irqs_snapshot() -> u64 {
         bits &= !event;
         match service_hosted_irq_event(event_bit) {
             Ok(HostedIrqServiceOutcome::Serviced(claimed)) => {
-                HOSTED_IRQ_EVENTS_SERVICED.fetch_add(1, Ordering::Relaxed);
+                let trace_claim = HOSTED_IRQ_SERVICE_TRACE.record(claimed);
                 serviced += 1;
-                if claimed != 0 && serviced <= 16 {
+                if trace_claim {
                     print_str(b"[hosted-irq] serviced event=");
                     print_u64(event_bit as u64);
                     print_str(b" claimed=");
