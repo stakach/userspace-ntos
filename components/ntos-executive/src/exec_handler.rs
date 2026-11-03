@@ -10538,14 +10538,19 @@ impl ExecNtHandler {
     }
 
     // Once boot storage starts draining, or a registry journal owns the overlay, all opens on
-    // its physical volume must retain a mounted File request. A direct overlay lookup cannot
-    // interpret the journal's exclusive ownership as an ordinary file-open failure.
+    // its physical volume must retain a mounted File request. An exact volume File retains the
+    // mounted filesystem owner even while the ordinary file route is still Boot/local.
     fn route_absolute_open_to_kernel_file(
         name16: &[u16],
         open_options: u32,
         mount_route: Option<nt_fs::BlockSourceKind>,
+        resolved: Option<&Result<(u64, alloc::vec::Vec<u16>), u32>>,
     ) -> bool {
         open_options & nt_fs::FILE_DIRECTORY_FILE != 0
+            || crate::exec_volume_open_route::route_exact_volume_file_target(
+                resolved,
+                |device_id| driver_launch::require_registered_kernel_filesystem_device(device_id).is_ok(),
+            )
             || ((matches!(mount_route, Some(nt_fs::BlockSourceKind::Draining | nt_fs::BlockSourceKind::Native))
                 || crate::writable_fs::registry_journal::owns_volume())
                 && nt_fs::nt_path_to_volume_relative(name16, crate::installed_layout::ROOT).is_some())
@@ -32511,7 +32516,7 @@ impl ExecNtHandler {
         }
         let mount_route = unsafe { crate::fs_loader::exec_fs_mount_identity() }
             .and_then(crate::fs_loader::exec_block_route_kind);
-        let mounted_route = Self::route_absolute_open_to_kernel_file(name16, open_options, mount_route);
+        let mounted_route = Self::route_absolute_open_to_kernel_file(name16, open_options, mount_route, resolved);
         trace_winlogon_open(b"decide", self.pi, self.current_tid, parse_root,
             mount_route, crate::writable_fs::registry_journal::owns_volume(),
             mounted_route, None, None, name16);

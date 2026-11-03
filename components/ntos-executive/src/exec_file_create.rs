@@ -341,7 +341,7 @@ impl ExecNtHandler {
         let mount_route = unsafe { crate::fs_loader::exec_fs_mount_identity() }
             .and_then(crate::fs_loader::exec_block_route_kind);
         if create_options & nt_fs::FILE_DIRECTORY_FILE == 0
-            && Self::route_absolute_open_to_kernel_file(name16, create_options, mount_route)
+            && Self::route_absolute_open_to_kernel_file(name16, create_options, mount_route, resolved)
         {
             let owned_resolution = resolved.is_none().then(||
                 driver_launch::resolve_hosted_device_file_name(

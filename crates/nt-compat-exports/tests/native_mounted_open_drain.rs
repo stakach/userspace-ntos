@@ -57,7 +57,7 @@ fn absolute_installed_open_enters_mounted_create_before_synchronous_fat_fallback
     let selector = &source[start..start + end];
     let open = source.split("unsafe fn nt_open_file_service(").nth(1)
         .expect("native NtOpenFile service");
-    let routed = open.find("Self::route_absolute_open_to_kernel_file(name16, open_options, mount_route)")
+    let routed = open.find("Self::route_absolute_open_to_kernel_file(name16, open_options, mount_route, resolved)")
         .expect("native NtOpenFile consumes production route selector");
     let fallback = open.find("crate::writable_fs::writable_path_into")
         .expect("native NtOpenFile synchronous installed-volume fallback");
@@ -65,7 +65,13 @@ fn absolute_installed_open_enters_mounted_create_before_synchronous_fat_fallback
 
     // Compile and execute the actual selector body. The current directory-only behavior is
     // deliberately RED for a regular installed file while the exact mount is Draining.
+    let volume_route = include_str!("../../../components/ntos-executive/src/exec_volume_open_route.rs");
     let harness = format!(r#"
+extern crate alloc;
+mod exec_volume_open_route {{ {volume_route} }}
+mod driver_launch {{
+    pub fn require_registered_kernel_filesystem_device(_: u64) -> Result<(), u32> {{ Ok(()) }}
+}}
 mod nt_fs {{
     #[derive(Clone, Copy)]
     pub enum BlockSourceKind {{ Boot, Draining, Native }}
@@ -91,27 +97,27 @@ fn installed_file_open_waits_for_native_mount() {{
     let name: Vec<u16> = r"\??\C:\Windows\System32\autochk.exe".encode_utf16().collect();
     let unrelated: Vec<u16> = r"\Device\NamedPipe\foo".encode_utf16().collect();
     assert!(!ExecNtHandler::route_absolute_open_to_kernel_file(
-        &name, 0, Some(nt_fs::BlockSourceKind::Boot)));
+        &name, 0, Some(nt_fs::BlockSourceKind::Boot), None));
     assert!(ExecNtHandler::route_absolute_open_to_kernel_file(
-        &name, 0, Some(nt_fs::BlockSourceKind::Draining)),
+        &name, 0, Some(nt_fs::BlockSourceKind::Draining), None),
         "Draining installed-file open must enter the retained mounted CREATE lane");
     assert!(ExecNtHandler::route_absolute_open_to_kernel_file(
-        &name, 0, Some(nt_fs::BlockSourceKind::Native)));
+        &name, 0, Some(nt_fs::BlockSourceKind::Native), None));
     assert!(!ExecNtHandler::route_absolute_open_to_kernel_file(
-        &unrelated, 0, Some(nt_fs::BlockSourceKind::Draining)));
+        &unrelated, 0, Some(nt_fs::BlockSourceKind::Draining), None));
     assert!(ExecNtHandler::route_absolute_open_to_kernel_file(
-        &name, 1, Some(nt_fs::BlockSourceKind::Boot)));
+        &name, 1, Some(nt_fs::BlockSourceKind::Boot), None));
 }}
 #[test]
 fn installed_dll_open_waits_while_registry_journal_owns_boot_volume() {{
     let name: Vec<u16> = r"\??\C:\Windows\System32\msgina.dll".encode_utf16().collect();
     writable_fs::registry_journal::set_owned(true);
     assert!(ExecNtHandler::route_absolute_open_to_kernel_file(
-        &name, 0x60, Some(nt_fs::BlockSourceKind::Boot)),
+        &name, 0x60, Some(nt_fs::BlockSourceKind::Boot), None),
         "journal-owned installed DLL must retain CREATE until overlay ownership returns");
     writable_fs::registry_journal::set_owned(false);
     assert!(!ExecNtHandler::route_absolute_open_to_kernel_file(
-        &name, 0x60, Some(nt_fs::BlockSourceKind::Boot)),
+        &name, 0x60, Some(nt_fs::BlockSourceKind::Boot), None),
         "after release the ordinary Boot route may inspect the overlay again");
 }}
 "#);
@@ -140,7 +146,7 @@ fn create_file_routes_journal_owned_volume_before_overlay_admission() {
     let source = include_str!("../../../components/ntos-executive/src/exec_file_create.rs");
     let create = source.split("unsafe fn nt_create_file_service(").nth(1)
         .expect("native NtCreateFile service");
-    let route = create.find("Self::route_absolute_open_to_kernel_file(name16, create_options, mount_route)")
+    let route = create.find("Self::route_absolute_open_to_kernel_file(name16, create_options, mount_route, resolved)")
         .expect("native NtCreateFile must consume the same journal-aware mounted File route");
     let overlay = create.find("crate::writable_fs::query_metadata_relative_if_mounted")
         .expect("native NtCreateFile overlay lookup");

@@ -105,6 +105,7 @@ pub(crate) use service_sec_image::*;
 mod loader_trace_diag;
 pub(crate) use loader_trace_diag::*;
 mod exec_handler;
+mod exec_volume_open_route;
 use exec_handler::lpc_connection_views::PendingLpcConnectionViews;
 mod desktop_observation;
 use desktop_observation::{DesktopAcceptanceReport, DesktopGuiFact, DesktopLaunchContract, DesktopObservations};
