@@ -31,7 +31,7 @@ pub(crate) fn draining_exec_volume_device() -> Option<u64> {
 
 fn exec_volume_device_for_mount(physical: SectionMountId) -> Option<u64> {
     let (bound, device_id) = unsafe { *core::ptr::addr_of!(EXEC_VOLUME_DEVICE) }?;
-    if bound != physical || mount_id_for_live_device(device_id).is_none() {
+    if bound != physical || mount_id_for_live_device(device_id) != Some(physical) {
         return None;
     }
     Some(device_id)

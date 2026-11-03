@@ -30,6 +30,7 @@ const FILE_OBJECT_NAME_CAP: usize = 512;
 const STATUS_DEVICE_NOT_READY: u32 = 0xc000_00a3;
 
 mod nt_fs {
+    pub const DIRECTORY_OPEN_PATH_CAP: usize = 1024;
     pub const STATUS_SUCCESS: u32 = 0;
     pub const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xc000_0034;
     pub const FILE_BASIC_INFORMATION: u32 = 4;
@@ -111,6 +112,14 @@ struct ExecNtHandler {
     current_tid: u64,
 }
 impl ExecNtHandler {
+    fn mounted_target_for_legacy_fat_child(&self, _: FileParseRoot, _: &[u16], _: &mut [u16])
+        -> Result<Option<(u64, usize)>, u32> {
+        panic!("absolute attribute query reached legacy directory target")
+    }
+    unsafe fn query_mounted_attributes_on_target(&mut self, _: u64, _: &[u16], _: u32,
+        _: u32, _: u64) -> Option<u32> {
+        panic!("absolute attribute query reached relative target")
+    }
     fn query_native_mounted_attributes(&mut self, name: &[u16], _: u32, class: u32, _: u64)
         -> Option<u32> {
         if !NATIVE.load(Ordering::SeqCst) { return None; }

@@ -10668,7 +10668,10 @@ impl ExecNtHandler {
         if !directory.metadata.is_directory {
             return Err(nt_fs::STATUS_NOT_A_DIRECTORY);
         }
+        let physical_mount = unsafe { crate::fs_loader::exec_fs_mount_identity() }
+            .ok_or(STATUS_DEVICE_NOT_READY)?;
         let object_id = self.directory_opens.create(
+            physical_mount.value(),
             first_cluster,
             volume_relative_path,
             access,
@@ -10854,6 +10857,17 @@ impl ExecNtHandler {
                         || open.volume_relative_path().len() > parent_path.len()
                     {
                         return (STATUS_INVALID_HANDLE, 0, 0);
+                    }
+                    let Some(mount) = (unsafe { crate::fs_loader::exec_fs_mount_identity() }) else {
+                        return (STATUS_DEVICE_NOT_READY, 0, 0);
+                    };
+                    if open.physical_mount() != Some(mount.value()) {
+                        return (STATUS_INVALID_HANDLE, 0, 0);
+                    }
+                    if crate::fs_loader::exec_block_route_kind(mount)
+                        != Some(nt_fs::BlockSourceKind::Boot)
+                    {
+                        return (STATUS_DEVICE_NOT_READY, 0, 0);
                     }
                     let length = open.volume_relative_path().len();
                     parent_path[..length].copy_from_slice(open.volume_relative_path());
@@ -24407,6 +24421,50 @@ impl ExecNtHandler {
         Ok(length)
     }
 
+    /// A legacy FAT directory has no mounted File id. Rebind its validated path to
+    /// the registered File device for the same physical mount after handoff.
+    fn mounted_target_for_legacy_fat_child(
+        &self,
+        root: FileParseRoot,
+        name: &[u16],
+        output: &mut [u16],
+    ) -> Result<Option<(u64, usize)>, u32> {
+        let FileParseRoot::FatDirectory { first_cluster, object_id } = root else {
+            return Ok(None);
+        };
+        let open = self.directory_opens.get(object_id)?;
+        if open.first_cluster != first_cluster {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let mount = unsafe { crate::fs_loader::exec_fs_mount_identity() }
+            .ok_or(STATUS_DEVICE_NOT_READY)?;
+        if open.physical_mount() != Some(mount.value()) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let route = crate::fs_loader::exec_block_route_kind(mount)
+            .ok_or(STATUS_DEVICE_NOT_READY)?;
+        if route == nt_fs::BlockSourceKind::Boot {
+            return Ok(None);
+        }
+        let device_id = crate::mounted_volume::exec_volume_device()
+            .ok_or(STATUS_DEVICE_NOT_READY)?;
+        driver_launch::require_registered_kernel_filesystem_device(device_id)?;
+        let mut folded = [0u8; FILE_OBJECT_NAME_CAP];
+        let mut relative = [0u8; FILE_OBJECT_NAME_CAP];
+        let length = Self::capture_relative_file_path(name, &mut folded, &mut relative)?;
+        let mut full_path = [0u8; nt_fs::DIRECTORY_OPEN_PATH_CAP];
+        let full_len = Self::join_volume_relative_path(
+            open.volume_relative_path(), &relative[..length], &mut full_path,
+        )?;
+        if full_len > output.len() {
+            return Err(STATUS_OBJECT_NAME_INVALID);
+        }
+        for (unit, &byte) in output[..full_len].iter_mut().zip(&full_path[..full_len]) {
+            *unit = byte as u16;
+        }
+        Ok(Some((device_id, full_len)))
+    }
+
     fn decode_set_file_name_units(file_name: &[u8], output: &mut [u16]) -> Result<usize, u32> {
         if file_name.is_empty() || file_name.len() & 1 != 0 || file_name.len() / 2 > output.len() {
             return Err(nt_fs::STATUS_OBJECT_NAME_INVALID);
@@ -24559,6 +24617,16 @@ impl ExecNtHandler {
                 let open = self.directory_opens.get(object_id)?;
                 if open.first_cluster != first_cluster {
                     return Err(STATUS_INVALID_HANDLE);
+                }
+                let mount = unsafe { crate::fs_loader::exec_fs_mount_identity() }
+                    .ok_or(STATUS_DEVICE_NOT_READY)?;
+                if open.physical_mount() != Some(mount.value()) {
+                    return Err(STATUS_INVALID_HANDLE);
+                }
+                if crate::fs_loader::exec_block_route_kind(mount)
+                    != Some(nt_fs::BlockSourceKind::Boot)
+                {
+                    return Err(STATUS_DEVICE_NOT_READY);
                 }
                 let mut full_path = [0u8; nt_fs::DIRECTORY_OPEN_PATH_CAP];
                 let full_len = Self::join_volume_relative_path(
@@ -31890,6 +31958,19 @@ impl ExecNtHandler {
         };
         if !matches!(parse_root, FileParseRoot::Absolute) {
             if let FileParseRoot::FatDirectory { first_cluster, object_id } = parse_root {
+                let mut mounted_name = [0u16; nt_fs::DIRECTORY_OPEN_PATH_CAP];
+                match self.mounted_target_for_legacy_fat_child(
+                    parse_root, name16, &mut mounted_name,
+                ) {
+                    Ok(Some((device_id, length))) => {
+                        return self.query_mounted_attributes_on_target(
+                            device_id, &mounted_name[..length], captured.attributes,
+                            nt_fs::FILE_BASIC_INFORMATION, args[1],
+                        ).unwrap_or(STATUS_DEVICE_NOT_READY);
+                    }
+                    Ok(None) => {}
+                    Err(status) => return status,
+                }
                 if let Ok(open) = self.directory_opens.get(object_id) {
                     trace_sync_fat_after_handoff(2, b"relative-attr-caller", self.pi,
                         self.current_tid as u64, Some((object_id, first_cluster, open.volume_relative_path())), name16);
@@ -32031,6 +32112,19 @@ impl ExecNtHandler {
         };
         if !matches!(parse_root, FileParseRoot::Absolute) {
             if let FileParseRoot::FatDirectory { first_cluster, object_id } = parse_root {
+                let mut mounted_name = [0u16; nt_fs::DIRECTORY_OPEN_PATH_CAP];
+                match self.mounted_target_for_legacy_fat_child(
+                    parse_root, name16, &mut mounted_name,
+                ) {
+                    Ok(Some((device_id, length))) => {
+                        return self.query_mounted_attributes_on_target(
+                            device_id, &mounted_name[..length], captured.attributes,
+                            nt_fs::FILE_NETWORK_OPEN_INFORMATION, args[1],
+                        ).unwrap_or(STATUS_DEVICE_NOT_READY);
+                    }
+                    Ok(None) => {}
+                    Err(status) => return status,
+                }
                 if let Ok(open) = self.directory_opens.get(object_id) {
                     trace_sync_fat_after_handoff(4, b"relative-full-attr-caller", self.pi,
                         self.current_tid as u64, Some((object_id, first_cluster, open.volume_relative_path())), name16);
@@ -32365,6 +32459,20 @@ impl ExecNtHandler {
                 return publication.status;
             }
             if let FileParseRoot::FatDirectory { first_cluster, object_id } = parse_root {
+                let mut mounted_name = [0u16; nt_fs::DIRECTORY_OPEN_PATH_CAP];
+                match self.mounted_target_for_legacy_fat_child(
+                    parse_root, name16, &mut mounted_name,
+                ) {
+                    Ok(Some((device_id, length))) => {
+                        return self.create_registered_file_from_target(
+                            Ok((device_id, None, Some(&mounted_name[..length]))),
+                            name16, captured.attributes, desired_access, share_access,
+                            nt_fs::FILE_OPEN, 0, open_options, &[], file_handle_out, args[3],
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(status) => return status,
+                }
                 if let Ok(open) = self.directory_opens.get(object_id) {
                     trace_sync_fat_after_handoff(1, b"relative-open-caller", self.pi,
                         self.current_tid as u64, Some((object_id, first_cluster, open.volume_relative_path())), name16);

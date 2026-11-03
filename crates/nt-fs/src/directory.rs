@@ -158,6 +158,8 @@ impl DirectoryQueryState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectoryOpen {
     pub first_cluster: u32,
+    /// Exact physical mount captured when the executive mints a legacy FAT handle.
+    physical_mount: Option<u64>,
     pub create_options: u32,
     mode_state: crate::FileModeState,
     pub metadata: crate::FileMetadata,
@@ -173,6 +175,7 @@ pub struct DirectoryOpen {
 pub const DIRECTORY_OPEN_PATH_CAP: usize = 1024;
 
 impl DirectoryOpen {
+    pub fn physical_mount(&self) -> Option<u64> { self.physical_mount }
     pub const fn mode_state(&self) -> crate::FileModeState { self.mode_state }
 
     pub fn set_mode(&mut self, requested: u32) -> Result<crate::FileModeState, u32> {
@@ -217,6 +220,7 @@ impl DirectoryOpenSlot {
             references: 0,
             open: DirectoryOpen {
                 first_cluster: 0,
+                physical_mount: None,
                 create_options: 0,
                 mode_state: crate::FileModeState::from_create_options(0),
                 metadata: crate::FileMetadata {
@@ -274,6 +278,36 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
         metadata: crate::FileMetadata,
         alternate_name: crate::FatShortName,
     ) -> Result<u32, u32> {
+        self.create_with_mount(None, first_cluster, volume_relative_path, desired_access,
+            share_access, create_options, metadata, alternate_name)
+    }
+
+    pub fn create_for_mount(
+        &mut self,
+        physical_mount: u64,
+        first_cluster: u32,
+        volume_relative_path: &[u8],
+        desired_access: u32,
+        share_access: u32,
+        create_options: u32,
+        metadata: crate::FileMetadata,
+        alternate_name: crate::FatShortName,
+    ) -> Result<u32, u32> {
+        self.create_with_mount(Some(physical_mount), first_cluster, volume_relative_path,
+            desired_access, share_access, create_options, metadata, alternate_name)
+    }
+
+    fn create_with_mount(
+        &mut self,
+        physical_mount: Option<u64>,
+        first_cluster: u32,
+        volume_relative_path: &[u8],
+        desired_access: u32,
+        share_access: u32,
+        create_options: u32,
+        metadata: crate::FileMetadata,
+        alternate_name: crate::FatShortName,
+    ) -> Result<u32, u32> {
         if volume_relative_path.len() > DIRECTORY_OPEN_PATH_CAP {
             return Err(STATUS_OBJECT_NAME_INVALID);
         }
@@ -304,6 +338,7 @@ impl<const SLOTS: usize> DirectoryOpenTable<SLOTS> {
             references: 1,
             open: DirectoryOpen {
                 first_cluster,
+                physical_mount,
                 create_options,
                 mode_state: crate::FileModeState::from_create_options(create_options),
                 metadata,
@@ -1056,6 +1091,25 @@ mod tests {
         assert_eq!(table.retain(shared), Err(STATUS_INVALID_HANDLE));
         assert_eq!(table.release(shared), Err(STATUS_INVALID_HANDLE));
         assert_eq!(table.get(reused).unwrap().first_cluster, 99);
+    }
+
+    #[test]
+    fn legacy_directory_generation_retains_its_physical_mount() {
+        let mut table = DirectoryOpenTable::<1>::new();
+        let first = table.create_for_mount(
+            17, 41, b"windows\\system32", 0, 0, 0,
+            crate::FileMetadata::default(), crate::FatShortName::EMPTY,
+        ).unwrap();
+        assert_eq!(table.get(first).unwrap().physical_mount(), Some(17));
+        table.release(first).unwrap();
+        assert_eq!(table.get(first), Err(STATUS_INVALID_HANDLE));
+        let next = table.create_for_mount(
+            18, 41, b"windows\\system32", 0, 0, 0,
+            crate::FileMetadata::default(), crate::FatShortName::EMPTY,
+        ).unwrap();
+        assert_ne!(first, next);
+        assert_eq!(table.get(first), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.get(next).unwrap().physical_mount(), Some(18));
     }
 
     #[test]

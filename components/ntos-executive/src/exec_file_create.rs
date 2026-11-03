@@ -277,6 +277,21 @@ impl ExecNtHandler {
                 };
             }
             if let FileParseRoot::FatDirectory { first_cluster, object_id } = parse_root {
+                let mut mounted_name = [0u16; nt_fs::DIRECTORY_OPEN_PATH_CAP];
+                match self.mounted_target_for_legacy_fat_child(
+                    parse_root, name16, &mut mounted_name,
+                ) {
+                    Ok(Some((device_id, length))) => {
+                        return self.create_registered_file_from_target(
+                            Ok((device_id, None, Some(&mounted_name[..length]))),
+                            name16, captured.attributes, desired_access, share_access,
+                            create_disposition, file_attributes, create_options, &ea,
+                            file_handle_out, iosb,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(status) => return status,
+                }
                 if let Ok(open) = self.directory_opens.get(object_id) {
                     trace_sync_fat_after_handoff(0, b"relative-create-caller", self.pi,
                         self.current_tid as u64, Some((object_id, first_cluster, open.volume_relative_path())), name16);

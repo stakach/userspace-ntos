@@ -24872,6 +24872,7 @@ impl ExecDirectoryOpens {
 
     fn create(
         &mut self,
+        physical_mount: u64,
         first_cluster: u32,
         volume_relative_path: &[u8],
         desired_access: u32,
@@ -24882,7 +24883,8 @@ impl ExecDirectoryOpens {
     ) -> Result<u32, u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe {
-            (&mut *self.table).create(
+            (&mut *self.table).create_for_mount(
+                physical_mount,
                 first_cluster,
                 volume_relative_path,
                 desired_access,

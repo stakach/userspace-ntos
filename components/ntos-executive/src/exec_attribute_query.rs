@@ -87,11 +87,6 @@ impl ExecNtHandler {
             Some(device) => device,
             None => return Some(STATUS_DEVICE_NOT_READY),
         };
-        let output_len = match information_class {
-            nt_fs::FILE_BASIC_INFORMATION => 40,
-            nt_fs::FILE_NETWORK_OPEN_INFORMATION => 56,
-            _ => return Some(nt_fs::STATUS_INVALID_PARAMETER),
-        };
         let (resolved_device, relative) = match driver_launch::resolve_kernel_directory_file_name(
             name, object_attributes & 0x40 != 0,
         ) {
@@ -101,6 +96,26 @@ impl ExecNtHandler {
         if resolved_device != device_id {
             return Some(nt_fs::STATUS_NOT_SAME_DEVICE);
         }
+        self.query_mounted_attributes_on_target(
+            device_id, &relative, object_attributes, information_class, output_va,
+        )
+    }
+
+    /// Query a validated target on the exact mounted File device. The caller owns the
+    /// namespace or legacy-directory identity proof before entering this retained IRP path.
+    pub(super) unsafe fn query_mounted_attributes_on_target(
+        &mut self,
+        device_id: u64,
+        relative: &[u16],
+        object_attributes: u32,
+        information_class: u32,
+        output_va: u64,
+    ) -> Option<u32> {
+        let output_len = match information_class {
+            nt_fs::FILE_BASIC_INFORMATION => 40,
+            nt_fs::FILE_NETWORK_OPEN_INFORMATION => 56,
+            _ => return Some(nt_fs::STATUS_INVALID_PARAMETER),
+        };
         if !self.probe_user_output(output_va, output_len) {
             return Some(STATUS_ACCESS_VIOLATION);
         }
@@ -131,7 +146,7 @@ impl ExecNtHandler {
             release_or_retain(release_token, file_id);
             return Some(STATUS_INSUFFICIENT_RESOURCES);
         }
-        for &unit in &relative { name_bytes.extend_from_slice(&unit.to_le_bytes()); }
+        for &unit in relative { name_bytes.extend_from_slice(&unit.to_le_bytes()); }
         let created = driver_launch::dispatch_hosted_file_create_irp_result_exact(
             file_id,
             major::IRP_MJ_CREATE,
