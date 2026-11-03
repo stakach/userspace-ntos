@@ -12,6 +12,45 @@ from scripts.ci_kvm_smoke import cpu_sample_delay, parse_proc_stat, read_host_st
 
 
 class BootDiskBlockstatsTests(unittest.TestCase):
+    @staticmethod
+    def blockstats(read_bytes):
+        return {"return": [{"device": "bootdisk", "stats": {
+            "rd_bytes": read_bytes, "wr_bytes": 0,
+        }}]}
+
+    def test_idle_threshold_refreshes_blockstats_before_declaring_stationary(self):
+        # KVM 41549415327: the 281 s QMP sample still showed reads, but was seven
+        # seconds before the 180 s idle threshold. The watchdog stopped the guest
+        # at 288 s, three seconds before its next scheduled QMP sample.
+        watchdog = smoke.BootProgressWatchdog(0, idle_seconds=180)
+        watchdog.armed = True
+        watchdog.last_progress = 108
+        watchdog.last_milestone = "process:72:autochk.exe"
+        watchdog.observe_blockstats(self.blockstats(145_427_968), 110)
+        self.assertFalse(watchdog.observe_blockstats(self.blockstats(151_414_784), 281))
+        self.assertIsNotNone(watchdog.idle_reason(288))
+
+        sampled = []
+        reason = smoke.refresh_idle_progress(
+            watchdog, 288,
+            lambda: sampled.append(True) or self.blockstats(151_520_000),
+        )
+        self.assertEqual(sampled, [True], "the threshold must force one fresh QMP sample")
+        self.assertIsNone(reason, "completed disk work keeps a progressing Native boot alive")
+        self.assertEqual(watchdog.last_progress, 288)
+        self.assertEqual(watchdog.disk_extensions, 1)
+
+    def test_idle_threshold_without_new_disk_bytes_is_stationary(self):
+        watchdog = smoke.BootProgressWatchdog(0, idle_seconds=180)
+        watchdog.armed = True
+        watchdog.last_progress = 108
+        watchdog.observe_blockstats(self.blockstats(151_414_784), 110)
+        watchdog.observe_blockstats(self.blockstats(151_414_784), 281)
+        reason = smoke.refresh_idle_progress(
+            watchdog, 288, lambda: self.blockstats(151_414_784),
+        )
+        self.assertIn("no boot milestone", reason)
+
     def test_records_only_one_exact_boot_disk_and_valid_completed_counters(self):
         reply = {"return": [
             {"device": "pflash0", "stats": {"rd_operations": 999}},

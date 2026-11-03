@@ -172,6 +172,19 @@ class BootProgressWatchdog:
                 f"last={self.last_milestone}, bootdisk_bytes={self.disk_bytes}")
 
 
+def refresh_idle_progress(watchdog, now, read_blockstats):
+    """Observe completed disk work at the idle boundary before classifying a stall."""
+    reason = watchdog.idle_reason(now)
+    if reason is None:
+        return None
+    try:
+        reply = read_blockstats()
+    except (OSError, RuntimeError, ValueError, KeyError):
+        return reason
+    watchdog.observe_blockstats(reply, now)
+    return watchdog.idle_reason(now)
+
+
 class SerialPanicDetector:
     """Read only new serial output, retaining split panic records across polls."""
 
@@ -673,6 +686,20 @@ def main():
                               f"{progress_watchdog.last_milestone}", flush=True)
                     next_blockstats = time.monotonic() + 10
                 idle_reason = progress_watchdog.idle_reason(time.monotonic())
+                if idle_reason and QMP_SOCKET.exists():
+                    # A scheduled sample can fall just before the idle boundary while disk
+                    # traffic is still advancing. Take one fresh sample before stopping QEMU.
+                    sample_time = time.monotonic()
+                    def threshold_blockstats():
+                        reply = read_bootdisk_blockstats()
+                        record_bootdisk_blockstats(reply, sample_time - started)
+                        return reply
+                    idle_reason = refresh_idle_progress(
+                        progress_watchdog, sample_time, threshold_blockstats)
+                    if idle_reason is None:
+                        print(f"Boot progress {sample_time - started:.0f}s: "
+                              f"{progress_watchdog.last_milestone}", flush=True)
+                    next_blockstats = sample_time + 10
                 if idle_reason:
                     stationary_reason = idle_reason
                     STATIONARY_MARKER.write_text(stationary_reason + "\n")
