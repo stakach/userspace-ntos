@@ -194,6 +194,9 @@ mod hosted_file_owners;
 #[path = "scsi_srb_pump_phase.rs"]
 mod scsi_srb_pump_phase;
 use scsi_srb_pump_phase::ScsiSrbPumpPhase;
+#[path = "scsi_srb_pump_owner.rs"]
+mod scsi_srb_pump_owner;
+use scsi_srb_pump_owner::{ScsiSrbPumpOwnerIdentity, ScsiSrbPumpOwners};
 
 pub(crate) fn print_hosted_file_rpc_phase() {
     hosted_file_owners::print_rpc_phase();
@@ -72891,6 +72894,9 @@ static SCSI_SRB_PUMP_UNENTERED: AtomicU64 = AtomicU64::new(0);
 static SCSI_SRB_PRE_PUMP_TICKS: AtomicU64 = AtomicU64::new(0);
 static SCSI_SRB_COMPONENT_PUMP_TICKS: AtomicU64 = AtomicU64::new(0);
 static SCSI_SRB_POST_PUMP_TICKS: AtomicU64 = AtomicU64::new(0);
+const SCSI_SRB_PUMP_OWNER_SLOTS: usize = 32;
+static SCSI_SRB_PUMP_OWNERS: ScsiSrbPumpOwners<SCSI_SRB_PUMP_OWNER_SLOTS> =
+    ScsiSrbPumpOwners::new();
 
 impl ScsiSrbPumpTiming {
     fn new(scsi_srb: bool) -> Self {
@@ -72945,6 +72951,33 @@ fn print_scsi_srb_pump_timing() {
         print_u64(ticks.load(Ordering::Relaxed) / 1_000_000);
     }
     print_str(b" Mtick\n");
+    let overflow = SCSI_SRB_PUMP_OWNERS.overflow_count();
+    if overflow != 0 {
+        print_str(b"[scsi-srb-owner] overflow=");
+        print_u64(overflow);
+        print_str(b"\n");
+    }
+    for slot in 0..SCSI_SRB_PUMP_OWNER_SLOTS {
+        let Some(owner) = SCSI_SRB_PUMP_OWNERS.snapshot(slot) else { continue; };
+        print_str(b"[scsi-srb-owner] slot/seq/inst=");
+        print_u64(slot as u64);
+        print_str(b"/"); print_u64(owner.sequence);
+        print_str(b"/"); print_u64(owner.instance);
+        print_str(b" irp/device/reply/tcb=");
+        print_hex64(owner.irp_id); print_str(b"/");
+        print_hex64(owner.device_id); print_str(b"/");
+        print_hex64(owner.reply_cap); print_str(b"/");
+        print_hex64(owner.tcb);
+        print_str(b" caller-tid/gen=");
+        print_u64(owner.caller_tid); print_str(b"/");
+        print_u64(owner.caller_generation);
+        print_str(b" route-badge/ep=");
+        print_hex64(owner.route_badge); print_str(b"/");
+        print_hex64(owner.route_endpoint);
+        print_str(b" entered-Mtick=");
+        print_u64(owner.entered_ticks / 1_000_000);
+        print_str(b"\n");
+    }
 }
 
 unsafe fn dispatch_irp_for_instance_exact(
@@ -73431,12 +73464,28 @@ unsafe fn dispatch_irp_for_instance_exact(
     }
     let measure_rpc = major == major::IRP_MJ_READ as u64 || major == major::IRP_MJ_WRITE as u64;
     let pump_started = if measure_rpc { crate::disk_census_ticks() } else { 0 };
+    let scsi_srb_pump_owner = dispatch_request.as_ref()
+        .filter(|request| request._reserved0 == nt_io_abi::IRP_DISPATCH_SCSI_SRB)
+        .and_then(|request| SCSI_SRB_PUMP_OWNERS.claim(ScsiSrbPumpOwnerIdentity {
+            sequence: dispatch_seq,
+            irp_id: canonical_irp_id,
+            device_id: request.device_id,
+            instance: dispatch_index as u64,
+            reply_cap: ch.reply_cap,
+            tcb: ch.tcb,
+            caller_tid: caller.map_or(0, |caller| caller.original_thread().thread_id() as u64),
+            caller_generation: caller.map_or(0, |caller| caller.original_thread().generation()),
+            route_badge: ingress_route.badge(),
+            route_endpoint: ingress_route.endpoint(),
+            entered_ticks: crate::disk_census_ticks(),
+        }));
     scsi_srb_pump_timing.enter_pump();
     let pr = match caller {
         Some(caller) => component_scheduler::hosted_component_pump_with_caller(&ch, caller),
         None => hosted_component_pump(&ch),
     };
     scsi_srb_pump_timing.exit_pump();
+    drop(scsi_srb_pump_owner);
     if measure_rpc {
         let pump_ticks = crate::disk_census_ticks().wrapping_sub(pump_started);
         let bank_ticks = active_hosted_irp_transfer_mut(sh, canonical_irp_id)
