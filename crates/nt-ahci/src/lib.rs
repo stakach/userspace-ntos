@@ -2,7 +2,10 @@
 #![no_std]
 
 mod census;
-pub use census::{CommandCensus, CommandWindow, CommandWindowSnapshot, IoOperation, IoSnapshot};
+pub use census::{
+    CommandCensus, CommandWindow, CommandWindowSnapshot, DirectReadBucket, DirectReadCensus,
+    DirectReadSnapshot, DirectReadSource, IoOperation, IoSnapshot,
+};
 
 #[cfg(test)]
 mod tests;

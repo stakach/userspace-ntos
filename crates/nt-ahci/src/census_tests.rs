@@ -94,3 +94,46 @@ fn const_initialization_starts_all_categories_empty() {
         assert_eq!(census.snapshot(operation), IoSnapshot::default());
     }
 }
+
+#[test]
+fn direct_read_census_keeps_source_and_request_size_boundaries_separate() {
+    let census = DirectReadCensus::new();
+    for sectors in [1, 2, 8, 9, 36, 37] {
+        census.record(DirectReadSource::Fat, sectors);
+    }
+    census.record(DirectReadSource::Snapshot, 1);
+    census.record(DirectReadSource::Snapshot, 36);
+
+    for (bucket, commands, sectors) in [
+        (DirectReadBucket::One, 1, 1),
+        (DirectReadBucket::TwoToEight, 2, 10),
+        (DirectReadBucket::NineToThirtySix, 2, 45),
+        (DirectReadBucket::OverThirtySix, 1, 37),
+    ] {
+        assert_eq!(
+            census.snapshot(DirectReadSource::Fat, bucket),
+            DirectReadSnapshot { commands, sectors }
+        );
+    }
+    assert_eq!(
+        census.snapshot(DirectReadSource::Snapshot, DirectReadBucket::One),
+        DirectReadSnapshot {
+            commands: 1,
+            sectors: 1
+        }
+    );
+    assert_eq!(
+        census.snapshot(
+            DirectReadSource::Snapshot,
+            DirectReadBucket::NineToThirtySix
+        ),
+        DirectReadSnapshot {
+            commands: 1,
+            sectors: 36
+        }
+    );
+    assert_eq!(
+        census.snapshot(DirectReadSource::Snapshot, DirectReadBucket::OverThirtySix),
+        DirectReadSnapshot::default()
+    );
+}

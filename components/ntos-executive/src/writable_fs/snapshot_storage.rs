@@ -325,6 +325,11 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
                 chunk_sectors as u64,
                 tfd & nt_ahci::TASK_FILE_FAILURE != 0,
             );
+            crate::fs_loader::direct_read_census_record(
+                nt_ahci::DirectReadSource::Snapshot,
+                started,
+                chunk_sectors as u64,
+            );
             if tfd & nt_ahci::TASK_FILE_FAILURE != 0 {
                 return Err(nt_fs::SnapshotBlockStoreError::Io);
             }

@@ -271,6 +271,7 @@ pub(crate) fn begin_native_start_after_preload(
         }
         Ok(ControllerState::BootDraining) => {}
         Ok(ControllerState::NativeStarting) => {
+            crate::fs_loader::print_direct_read_census_once();
             trace_native_start_once(2048, b"ready");
             return Ok(NativeStartAdmission::Ready);
         }
@@ -290,6 +291,7 @@ pub(crate) fn begin_native_start_after_preload(
         .begin_native_start_exact(owner.controller, owner.io_space_cap, window)
     {
         Ok(()) => {
+            crate::fs_loader::print_direct_read_census_once();
             trace_native_start_once(2048, b"ready");
             Ok(NativeStartAdmission::Ready)
         }

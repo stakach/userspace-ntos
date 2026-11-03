@@ -19,6 +19,9 @@ const FAT32_FAT_CACHE_OFFSET: u64 = FAT32_SCRATCH_OFFSET;
 static mut EXEC_FAT_RANGE_CURSORS: nt_fs::FatRangeCursorSet<16> =
     nt_fs::FatRangeCursorSet::new();
 static mut EXEC_FAT_SECTOR_CACHE: nt_fs::FatSectorCache = nt_fs::FatSectorCache::new();
+static DIRECT_READ_CENSUS: nt_ahci::DirectReadCensus = nt_ahci::DirectReadCensus::new();
+static DIRECT_READ_CENSUS_PRINTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 const _: () = assert!(
     FAT32_FAT_CACHE_OFFSET + core::mem::size_of::<FatSectorCacheScratch>() as u64 <= 0x1000
 );
@@ -189,6 +192,7 @@ unsafe fn fat_read_sector_checked(fs: &Fat32, sector: u32) -> Option<*const u8> 
         1,
         status & nt_ahci::TASK_FILE_FAILURE != 0,
     );
+    direct_read_census_record(nt_ahci::DirectReadSource::Fat, census_started, 1);
     if status == 0xFF {
         print_str(b"[fat-sector] read timeout sector=");
         print_u64(sector as u64);
@@ -210,6 +214,7 @@ unsafe fn fat_read_sectors_checked(fs: &Fat32, sector: u32, count: u32) -> Optio
         count as u64,
         status & nt_ahci::TASK_FILE_FAILURE != 0,
     );
+    direct_read_census_record(nt_ahci::DirectReadSource::Fat, census_started, count as u64);
     if status == 0xFF {
         print_str(b"[fat-sector] read timeout sector=");
         print_u64(sector as u64);
@@ -230,6 +235,45 @@ pub(crate) fn disk_census_record(
 ) {
     let Some(started) = started else { return };
     AHCI_CENSUS.record(operation, started, disk_census_ticks(), sectors, failed);
+}
+
+/// Classify the same returned Executive read attempts as the aggregate disk census.
+pub(crate) fn direct_read_census_record(
+    source: nt_ahci::DirectReadSource,
+    started: Option<u64>,
+    sectors: u64,
+) {
+    if started.is_some() {
+        DIRECT_READ_CENSUS.record(source, sectors);
+    }
+}
+
+/// Native-start Ready follows the exact boot-ticket drain, so these are final boot totals.
+pub(crate) fn print_direct_read_census_once() {
+    if DIRECT_READ_CENSUS_PRINTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    for (source, label) in [
+        (nt_ahci::DirectReadSource::Fat, b"fat".as_slice()),
+        (nt_ahci::DirectReadSource::Snapshot, b"snapshot".as_slice()),
+    ] {
+        print_str(b"[census] direct-read-source=");
+        print_str(label);
+        for (bucket, bucket_label) in [
+            (nt_ahci::DirectReadBucket::One, b" one=".as_slice()),
+            (nt_ahci::DirectReadBucket::TwoToEight, b" 2-8=".as_slice()),
+            (nt_ahci::DirectReadBucket::NineToThirtySix, b" 9-36=".as_slice()),
+            (nt_ahci::DirectReadBucket::OverThirtySix, b" over36=".as_slice()),
+        ] {
+            let sample = DIRECT_READ_CENSUS.snapshot(source, bucket);
+            print_str(bucket_label);
+            print_u64(sample.commands);
+            print_str(b"attempt/");
+            print_u64(sample.sectors);
+            print_str(b"sec");
+        }
+        print_str(b"\n");
+    }
 }
 
 unsafe fn fat_cache_invalidate(fs: &Fat32) {
