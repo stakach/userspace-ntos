@@ -47809,35 +47809,53 @@ unsafe fn retire_hosted_device_relation_barrier() -> usize {
 }
 
 unsafe fn start_hosted_device_relation_query() -> usize {
+    let queued = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_INVALIDATIONS))
+        .as_ref().map_or(0, |queue| queue.len());
     if (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
         .as_ref()
         .is_some_and(|query| query.phase == HostedDeviceRelationQueryPhase::Barrier)
     {
+        note_relation_gate(1, 1, queued, 0);
         return retire_hosted_device_relation_barrier();
     }
     let relation_active = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).is_some();
     let route_active = (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_QUERY)).is_some();
     let lifecycle_active = hosted_pnp_lifecycle_dispatch_active();
-    if relation_active || route_active || lifecycle_active {
+    let active_mask = (relation_active as u64)
+        | ((route_active as u64) << 1) | ((lifecycle_active as u64) << 2);
+    if active_mask != 0 {
+        note_relation_gate(2, active_mask, queued, 0);
         return 0;
     }
     if reserve_active_hosted_irp_transfer_slot().is_err() {
+        note_relation_gate(3, 0, queued, 0);
         return 0;
     }
-    let claim = match crate::boot_storage_dma_handoff::pending_native_storage_relation_parent() {
+    let selected = crate::boot_storage_dma_handoff::pending_native_storage_relation_parent();
+    let selected_pdo = match selected {
+        Ok(Some(pdo)) => pdo,
+        Ok(None) | Err(_) => 0,
+    };
+    let claim = match selected {
         Ok(Some(pdo)) => {
             let Some(parent) = hosted_pnp_manager_mut().devnode_identity_for_pdo(pdo) else {
+                note_relation_gate(4, 0, queued, pdo);
                 return 0;
             };
             hosted_device_relation_invalidations_mut()
                 .claim_parent(parent, nt_pnp_abi::BUS_RELATIONS)
         }
         Ok(None) => hosted_device_relation_invalidations_mut().claim_front(),
-        Err(_) => return 0,
+        Err(_) => {
+            note_relation_gate(4, 0, queued, 0);
+            return 0;
+        }
     };
     let Some(claim) = claim else {
+        note_relation_gate(5, 0, queued, selected_pdo);
         return 0;
     };
+    note_relation_gate(7, 0, queued, selected_pdo);
     let relation_owner = hosted_device_relation_owner(claim)
         .expect("claimed relation action lost its exact owner");
     let pdo_device_id = nt_io_manager::DeviceId(claim.pdo_device_id);
@@ -47846,6 +47864,7 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         .map(|device| device.driver_id)
         .unwrap_or(DriverId(0));
     if hosted_acpi_pci_route_transport_fences(pdo_device_id, pdo_driver_id) {
+        note_relation_gate(6, 0, queued, selected_pdo);
         hosted_device_relation_invalidations_mut()
             .abort(claim)
             .expect("fenced hosted relation claim could not be returned to its queue");
@@ -47855,6 +47874,7 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         || io_manager_mut().device(pdo_device_id).is_none()
         || !hosted_device_relation_owner_is_current(relation_owner)
     {
+        note_relation_gate(8, 0, queued, selected_pdo);
         retain_hosted_relation_query_barrier(
             claim,
             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
@@ -54075,6 +54095,155 @@ pub(crate) enum HostedPnpRelationProgress {
     Blocked(nt_status::NtStatus),
 }
 
+// Observation only. The periodic census may run inside a nested provider pump, so it reads
+// these atomics rather than borrowing the mutable global relation query or invalidation queue.
+// Gate values: 1 barrier, 2 active query/route/lifecycle, 3 transfer slot, 4 native selector,
+// 5 no matching claim, 6 transport fence, 7 claimed, 8 claim-target barrier.
+// The active mask is relation=1, ACPI/PCI route=2, lifecycle=4. Wait states are matching
+// query=1, other active query=2, queued without a query=3, and current=4. Query phase codes
+// distinguish relations 1..6, other dispatch/completion/copy/ACK 7..10, ready=11, barrier=12;
+// the operation field identifies which child/property phase those 7..10 codes belong to.
+static RELATION_GATE_CALLS: AtomicU64 = AtomicU64::new(0);
+static RELATION_GATE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static RELATION_GATE_REASON: AtomicU64 = AtomicU64::new(0);
+static RELATION_GATE_ACTIVE_MASK: AtomicU64 = AtomicU64::new(0);
+static RELATION_GATE_QUEUED: AtomicU64 = AtomicU64::new(0);
+static RELATION_GATE_SELECTED_PDO: AtomicU64 = AtomicU64::new(0);
+static RELATION_WAIT_CALLS: AtomicU64 = AtomicU64::new(0);
+static RELATION_WAIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static RELATION_WAIT_STATE: AtomicU64 = AtomicU64::new(0);
+static RELATION_WAIT_WANTED_PDO: AtomicU64 = AtomicU64::new(0);
+static RELATION_WAIT_WANTED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static RELATION_WAIT_ACTIVE_PDO: AtomicU64 = AtomicU64::new(0);
+static RELATION_WAIT_ACTIVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static RELATION_WAIT_ACTIVE_IRP: AtomicU64 = AtomicU64::new(0);
+static RELATION_WAIT_ACTIVE_PHASE: AtomicU64 = AtomicU64::new(0);
+static RELATION_WAIT_ACTIVE_OPERATION: AtomicU64 = AtomicU64::new(0);
+
+fn begin_relation_observation(sequence: &AtomicU64) -> bool {
+    let current = sequence.load(Ordering::Acquire);
+    current & 1 == 0
+        && sequence.compare_exchange(current, current.wrapping_add(1),
+            Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
+fn end_relation_observation(sequence: &AtomicU64) {
+    sequence.fetch_add(1, Ordering::Release);
+}
+
+fn note_relation_gate(reason: u64, active_mask: u64, queued: usize, selected_pdo: u64) {
+    if queued == 0 && selected_pdo == 0 && active_mask == 0 && reason != 3 { return; }
+    if !begin_relation_observation(&RELATION_GATE_SEQUENCE) { return; }
+    RELATION_GATE_REASON.store(reason, Ordering::Relaxed);
+    RELATION_GATE_ACTIVE_MASK.store(active_mask, Ordering::Relaxed);
+    RELATION_GATE_QUEUED.store(queued as u64, Ordering::Relaxed);
+    RELATION_GATE_SELECTED_PDO.store(selected_pdo, Ordering::Relaxed);
+    RELATION_GATE_CALLS.fetch_add(1, Ordering::Release);
+    end_relation_observation(&RELATION_GATE_SEQUENCE);
+}
+
+fn relation_query_phase_code(phase: HostedDeviceRelationQueryPhase) -> u64 {
+    match phase {
+        HostedDeviceRelationQueryPhase::AwaitingCompletion => 1,
+        HostedDeviceRelationQueryPhase::AwaitingCopy { .. } => 2,
+        HostedDeviceRelationQueryPhase::AwaitingProviderRelationAck { .. } => 3,
+        HostedDeviceRelationQueryPhase::AwaitingAck { .. } => 4,
+        HostedDeviceRelationQueryPhase::NoRelations => 5,
+        HostedDeviceRelationQueryPhase::RelationsCopied => 6,
+        HostedDeviceRelationQueryPhase::Barrier => 12,
+        HostedDeviceRelationQueryPhase::DispatchId { .. }
+        | HostedDeviceRelationQueryPhase::DispatchProperty { .. }
+        | HostedDeviceRelationQueryPhase::DispatchCapabilities { .. }
+        | HostedDeviceRelationQueryPhase::DispatchNamespace { .. }
+        | HostedDeviceRelationQueryPhase::DispatchAcpiPciRootMethod { .. }
+        | HostedDeviceRelationQueryPhase::DispatchAcpiPciNamespaceFilter { .. }
+        | HostedDeviceRelationQueryPhase::DispatchAcpiPciAddressMethod { .. } => 7,
+        HostedDeviceRelationQueryPhase::AwaitingIdCompletion { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingPropertyCompletion { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingCapabilitiesCompletion { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingNamespaceCompletion { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingAcpiPciRootMethodCompletion { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingAcpiPciNamespaceFilterCompletion { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingAcpiPciAddressMethodCompletion { .. } => 8,
+        HostedDeviceRelationQueryPhase::AwaitingIdCopy { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingPropertyCopy { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingCapabilitiesCopy { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingNamespaceCopy { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingAcpiPciRootMethodCopy { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingAcpiPciNamespaceFilterCopy { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingAcpiPciAddressMethodCopy { .. } => 9,
+        HostedDeviceRelationQueryPhase::AwaitingIdAck { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingPropertyAck { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingCapabilitiesAck { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingNamespaceAck { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingAcpiPciRootMethodAck { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingAcpiPciNamespaceFilterAck { .. }
+        | HostedDeviceRelationQueryPhase::AwaitingAcpiPciAddressMethodAck { .. } => 10,
+        _ => 11,
+    }
+}
+
+fn note_relation_wait(
+    refresh: HostedPnpRelationRefresh,
+    state: u64,
+    active: Option<&HostedDeviceRelationQuery>,
+) {
+    if !begin_relation_observation(&RELATION_WAIT_SEQUENCE) { return; }
+    RELATION_WAIT_STATE.store(state, Ordering::Relaxed);
+    RELATION_WAIT_WANTED_PDO.store(refresh.invalidation.pdo_device_id, Ordering::Relaxed);
+    RELATION_WAIT_WANTED_SEQUENCE.store(refresh.invalidation.sequence, Ordering::Relaxed);
+    RELATION_WAIT_ACTIVE_PDO.store(active.map_or(0, |query| query.claim.pdo_device_id), Ordering::Relaxed);
+    RELATION_WAIT_ACTIVE_SEQUENCE.store(active.map_or(0, |query| query.claim.sequence), Ordering::Relaxed);
+    RELATION_WAIT_ACTIVE_IRP.store(active.map_or(0, |query| query.irp_id.raw()), Ordering::Relaxed);
+    RELATION_WAIT_ACTIVE_PHASE.store(active.map_or(0, |query| relation_query_phase_code(query.phase)), Ordering::Relaxed);
+    RELATION_WAIT_ACTIVE_OPERATION.store(active.map_or(0, |query| query.last_operation as u64), Ordering::Relaxed);
+    RELATION_WAIT_CALLS.fetch_add(1, Ordering::Release);
+    end_relation_observation(&RELATION_WAIT_SEQUENCE);
+}
+
+pub(crate) fn print_hosted_pnp_relation_census() {
+    let gate_sequence = RELATION_GATE_SEQUENCE.load(Ordering::Acquire);
+    let gate = [RELATION_GATE_CALLS.load(Ordering::Relaxed),
+        RELATION_GATE_REASON.load(Ordering::Relaxed),
+        RELATION_GATE_ACTIVE_MASK.load(Ordering::Relaxed),
+        RELATION_GATE_QUEUED.load(Ordering::Relaxed),
+        RELATION_GATE_SELECTED_PDO.load(Ordering::Relaxed)];
+    let gate_stable = gate_sequence & 1 == 0
+        && RELATION_GATE_SEQUENCE.load(Ordering::Acquire) == gate_sequence;
+    let wait_sequence = RELATION_WAIT_SEQUENCE.load(Ordering::Acquire);
+    let wait = [RELATION_WAIT_CALLS.load(Ordering::Relaxed),
+        RELATION_WAIT_STATE.load(Ordering::Relaxed),
+        RELATION_WAIT_WANTED_PDO.load(Ordering::Relaxed),
+        RELATION_WAIT_WANTED_SEQUENCE.load(Ordering::Relaxed),
+        RELATION_WAIT_ACTIVE_PDO.load(Ordering::Relaxed),
+        RELATION_WAIT_ACTIVE_SEQUENCE.load(Ordering::Relaxed),
+        RELATION_WAIT_ACTIVE_IRP.load(Ordering::Relaxed),
+        RELATION_WAIT_ACTIVE_PHASE.load(Ordering::Relaxed),
+        RELATION_WAIT_ACTIVE_OPERATION.load(Ordering::Relaxed)];
+    let wait_stable = wait_sequence & 1 == 0
+        && RELATION_WAIT_SEQUENCE.load(Ordering::Acquire) == wait_sequence;
+    if gate[0] == 0 && wait[0] == 0 { return; }
+    print_str(b"[pnp-relation-census] gate-calls/reason/active-mask/queued/selected-pdo=");
+    if gate_stable {
+        for (index, value) in gate.iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(*value);
+        }
+    } else {
+        print_str(b"updating");
+    }
+    print_str(b" wait-calls/state/wanted-pdo/sequence/active-pdo/sequence/irp/phase/op=");
+    if wait_stable {
+        for (index, value) in wait.iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(*value);
+        }
+    } else {
+        print_str(b"updating");
+    }
+    print_str(b"\n");
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HostedPnpRelationRefresh {
     invalidation: nt_pnp_manager::DeviceRelationInvalidation,
@@ -54478,8 +54647,10 @@ pub(crate) unsafe fn hosted_pnp_relation_progress(
     if !hosted_pnp_manager_mut().devnode_identity_is_started(refresh.invalidation.parent) {
         return HostedPnpRelationProgress::Blocked(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    if let Some(query) = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).as_ref() {
+    let active_query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).as_ref();
+    if let Some(query) = active_query {
         if query.claim == refresh.invalidation {
+            note_relation_wait(refresh, 1, Some(query));
             if query.phase == HostedDeviceRelationQueryPhase::Barrier {
                 return HostedPnpRelationProgress::Blocked(
                     query
@@ -54490,10 +54661,12 @@ pub(crate) unsafe fn hosted_pnp_relation_progress(
             return HostedPnpRelationProgress::Pending;
         }
     }
-    if (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_INVALIDATIONS))
+    let queued = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_INVALIDATIONS))
         .as_ref()
-        .is_some_and(|queue| queue.contains(refresh.invalidation))
-    {
+        .is_some_and(|queue| queue.contains(refresh.invalidation));
+    note_relation_wait(refresh, if queued { if active_query.is_some() { 2 } else { 3 } } else { 4 },
+        active_query);
+    if queued {
         return HostedPnpRelationProgress::Pending;
     }
     // The exact invalidation can leave the queue only through terminal completion. A real
