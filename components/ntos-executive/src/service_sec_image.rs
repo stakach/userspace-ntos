@@ -27435,6 +27435,9 @@ unsafe fn pending_file_io_redrive_pass(
                                 .retarget_attribute_query_owner_exact(identity, pending.irp_id,
                                     irp_id.raw())
                                 .expect("attribute query lost CREATE owner");
+                            crate::exec_handler::smss_attribute_probe_trace::trace_smss_attribute_retarget(
+                                pending.pi, pending.tid, file_id, pending.irp_id, irp_id.raw(),
+                            );
                         }
                         result => {
                             let (status, information) = match result {
@@ -28169,6 +28172,10 @@ unsafe fn pending_file_io_redrive_pass(
                 restore_file_io_mirrors!();
                 continue;
             }
+            crate::exec_handler::smss_attribute_probe_trace::trace_smss_attribute_terminal(
+                pending.pi, pending.tid, hosted_file_id, pending.irp_id,
+                terminal_status, pending.owned_syscall_status().unwrap_or(terminal_status),
+            );
         }
         let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
         let finished = table

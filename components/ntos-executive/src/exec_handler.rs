@@ -217,6 +217,9 @@ mod file_create;
 #[path = "exec_attribute_query.rs"]
 pub(crate) mod attribute_query;
 
+#[path = "exec_smss_attribute_probe_trace.rs"]
+pub(crate) mod smss_attribute_probe_trace;
+
 #[path = "exec_named_device_route.rs"]
 mod named_device_route;
 
@@ -31956,6 +31959,9 @@ impl ExecNtHandler {
             Ok(resolved) => resolved,
             Err(status) => return status,
         };
+        smss_attribute_probe_trace::trace_smss_attribute_candidate(
+            self.pi, self.current_tid, name16, matches!(parse_root, FileParseRoot::Absolute),
+        );
         if !matches!(parse_root, FileParseRoot::Absolute) {
             if let FileParseRoot::FatDirectory { first_cluster, object_id } = parse_root {
                 let mut mounted_name = [0u16; nt_fs::DIRECTORY_OPEN_PATH_CAP];
@@ -32110,6 +32116,9 @@ impl ExecNtHandler {
             Ok(resolved) => resolved,
             Err(status) => return status,
         };
+        smss_attribute_probe_trace::trace_smss_attribute_candidate(
+            self.pi, self.current_tid, name16, matches!(parse_root, FileParseRoot::Absolute),
+        );
         if !matches!(parse_root, FileParseRoot::Absolute) {
             if let FileParseRoot::FatDirectory { first_cluster, object_id } = parse_root {
                 let mut mounted_name = [0u16; nt_fs::DIRECTORY_OPEN_PATH_CAP];

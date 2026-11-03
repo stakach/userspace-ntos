@@ -81,21 +81,41 @@ impl ExecNtHandler {
         let mut folded = [0u8; FILE_OBJECT_NAME_CAP];
         let mut relative_path = [0u8; FILE_VOLUME_RELATIVE_CAP];
         if crate::writable_fs::volume_path_into(name, &mut folded, &mut relative_path).is_none() {
+            smss_attribute_probe_trace::trace_smss_attribute_resolution(
+                self.pi, self.current_tid, name, None, nt_fs::STATUS_OBJECT_NAME_NOT_FOUND,
+            );
             return Some(nt_fs::STATUS_OBJECT_NAME_NOT_FOUND);
         }
         let device_id = match crate::mounted_volume::exec_volume_device() {
             Some(device) => device,
-            None => return Some(STATUS_DEVICE_NOT_READY),
+            None => {
+                smss_attribute_probe_trace::trace_smss_attribute_resolution(
+                    self.pi, self.current_tid, name, None, STATUS_DEVICE_NOT_READY,
+                );
+                return Some(STATUS_DEVICE_NOT_READY);
+            }
         };
         let (resolved_device, relative) = match driver_launch::resolve_kernel_directory_file_name(
             name, object_attributes & 0x40 != 0,
         ) {
             Ok(target) => target,
-            Err(status) => return Some(status),
+            Err(status) => {
+                smss_attribute_probe_trace::trace_smss_attribute_resolution(
+                    self.pi, self.current_tid, name, None, status,
+                );
+                return Some(status);
+            }
         };
         if resolved_device != device_id {
+            smss_attribute_probe_trace::trace_smss_attribute_resolution(
+                self.pi, self.current_tid, name,
+                Some((resolved_device, &relative)), nt_fs::STATUS_NOT_SAME_DEVICE,
+            );
             return Some(nt_fs::STATUS_NOT_SAME_DEVICE);
         }
+        smss_attribute_probe_trace::trace_smss_attribute_resolution(
+            self.pi, self.current_tid, name, Some((device_id, &relative)), nt_fs::STATUS_SUCCESS,
+        );
         self.query_mounted_attributes_on_target(
             device_id, &relative, object_attributes, information_class, output_va,
         )
@@ -111,38 +131,61 @@ impl ExecNtHandler {
         information_class: u32,
         output_va: u64,
     ) -> Option<u32> {
+        let trace_pi = self.pi;
+        let trace_tid = self.current_tid;
+        let report_failure = |stage: &[u8], status: u32, file_id: u64| {
+            if (status as i32) < 0 {
+                smss_attribute_probe_trace::trace_smss_attribute_target(
+                    trace_pi, trace_tid, device_id, relative, file_id, None, stage, status,
+                );
+            }
+        };
         let output_len = match information_class {
             nt_fs::FILE_BASIC_INFORMATION => 40,
             nt_fs::FILE_NETWORK_OPEN_INFORMATION => 56,
-            _ => return Some(nt_fs::STATUS_INVALID_PARAMETER),
+            _ => {
+                report_failure(b"class", nt_fs::STATUS_INVALID_PARAMETER, 0);
+                return Some(nt_fs::STATUS_INVALID_PARAMETER);
+            }
         };
         if !self.probe_user_output(output_va, output_len) {
+            report_failure(b"output", STATUS_ACCESS_VIOLATION, 0);
             return Some(STATUS_ACCESS_VIOLATION);
         }
         if !self.reserve_pending_file_io_owner()
             || REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
             || !wait_reply_pool_has_free()
         {
+            report_failure(b"owner-capacity", STATUS_INSUFFICIENT_RESOURCES, 0);
             return Some(STATUS_INSUFFICIENT_RESOURCES);
         }
         let Some(release_token) = reserve_release_owner() else {
+            report_failure(b"release-capacity", STATUS_INSUFFICIENT_RESOURCES, 0);
             return Some(STATUS_INSUFFICIENT_RESOURCES);
         };
         let file_id = match driver_launch::allocate_hosted_file(
             device_id, ATTRIBUTE_READ_ACCESS, ATTRIBUTE_SHARE_ALL, 0, &relative,
         ) {
             Ok(file) => file,
-            Err(status) => { finish_release_owner(release_token); return Some(status); }
+            Err(status) => {
+                smss_attribute_probe_trace::trace_smss_attribute_resolution(
+                    self.pi, self.current_tid, relative, Some((device_id, relative)), status,
+                );
+                finish_release_owner(release_token);
+                return Some(status);
+            }
         };
         let caller = match self.hosted_file_native_caller() {
             Ok(caller) => caller,
             Err(status) => {
+                report_failure(b"caller", status, file_id);
                 release_or_retain(release_token, file_id);
                 return Some(status);
             }
         };
         let mut name_bytes = alloc::vec::Vec::new();
         if name_bytes.try_reserve_exact(relative.len() * 2).is_err() {
+            report_failure(b"name-capacity", STATUS_INSUFFICIENT_RESOURCES, file_id);
             release_or_retain(release_token, file_id);
             return Some(STATUS_INSUFFICIENT_RESOURCES);
         }
@@ -166,11 +209,20 @@ impl ExecNtHandler {
         let (status, _, pending_irp, _) = match created {
             Ok(result) => result,
             Err(status) => {
+                smss_attribute_probe_trace::trace_smss_attribute_target(
+                    self.pi, self.current_tid, device_id, relative, file_id, None,
+                    b"create", status,
+                );
                 release_or_retain(release_token, file_id);
                 return Some(status);
             }
         };
+        smss_attribute_probe_trace::trace_smss_attribute_target(
+            self.pi, self.current_tid, device_id, relative, file_id,
+            pending_irp.as_ref().map(|irp| irp.raw()), b"create", status as u32,
+        );
         if status == STATUS_PENDING as i32 && pending_irp.is_none() {
+            report_failure(b"create-pending-owner", STATUS_INSUFFICIENT_RESOURCES, file_id);
             release_or_retain(release_token, file_id);
             return Some(STATUS_INSUFFICIENT_RESOURCES);
         }
@@ -192,11 +244,20 @@ impl ExecNtHandler {
         let (status, information, pending_irp, _) = match queried {
             Ok(result) => result,
             Err(status) => {
+                smss_attribute_probe_trace::trace_smss_attribute_target(
+                    self.pi, self.current_tid, device_id, relative, file_id, None,
+                    b"query", status,
+                );
                 release_or_retain(release_token, file_id);
                 return Some(status);
             }
         };
+        smss_attribute_probe_trace::trace_smss_attribute_target(
+            self.pi, self.current_tid, device_id, relative, file_id,
+            pending_irp.as_ref().map(|irp| irp.raw()), b"query", status as u32,
+        );
         if status == STATUS_PENDING as i32 && pending_irp.is_none() {
+            report_failure(b"query-pending-owner", STATUS_INSUFFICIENT_RESOURCES, file_id);
             release_or_retain(release_token, file_id);
             return Some(STATUS_INSUFFICIENT_RESOURCES);
         }
@@ -215,6 +276,7 @@ impl ExecNtHandler {
                 STATUS_ACCESS_VIOLATION
             }
         } else { status as u32 };
+        report_failure(b"inline-terminal", terminal, file_id);
         release_or_retain(release_token, file_id);
         Some(terminal)
     }

@@ -38,6 +38,10 @@ mod nt_fs {
     #[derive(Clone, Copy)] pub struct FileMetadata;
 }
 
+mod smss_attribute_probe_trace {
+    pub fn trace_smss_attribute_candidate(_: usize, _: u64, _: &[u16], _: bool) {}
+}
+
 mod writable_fs {
     use crate::{nt_fs, JOURNAL_OWNS};
     use std::sync::atomic::Ordering;
