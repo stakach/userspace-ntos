@@ -191,9 +191,13 @@ pub(crate) mod hosted_add_device_rollback;
 mod hosted_file_dispatch;
 #[path = "hosted_file_owners.rs"]
 mod hosted_file_owners;
+#[path = "scsi_srb_pump_phase.rs"]
+mod scsi_srb_pump_phase;
+use scsi_srb_pump_phase::ScsiSrbPumpPhase;
 
 pub(crate) fn print_hosted_file_rpc_phase() {
     hosted_file_owners::print_rpc_phase();
+    print_scsi_srb_pump_timing();
 }
 #[path = "mounted_native_block.rs"]
 mod mounted_native_block;
@@ -72876,6 +72880,73 @@ fn trace_port_connect_pump(
     print_hex_u64(detail); print_str(b"\n");
 }
 
+struct ScsiSrbPumpTiming {
+    phase: Option<ScsiSrbPumpPhase>,
+}
+
+// This census is read from nested pumps. Never borrow a retained File, IRP, or transfer owner.
+static SCSI_SRB_PUMP_ENTRIES: AtomicU64 = AtomicU64::new(0);
+static SCSI_SRB_PUMP_EXITS: AtomicU64 = AtomicU64::new(0);
+static SCSI_SRB_PUMP_UNENTERED: AtomicU64 = AtomicU64::new(0);
+static SCSI_SRB_PRE_PUMP_TICKS: AtomicU64 = AtomicU64::new(0);
+static SCSI_SRB_COMPONENT_PUMP_TICKS: AtomicU64 = AtomicU64::new(0);
+static SCSI_SRB_POST_PUMP_TICKS: AtomicU64 = AtomicU64::new(0);
+
+impl ScsiSrbPumpTiming {
+    fn new(scsi_srb: bool) -> Self {
+        Self { phase: scsi_srb.then(|| ScsiSrbPumpPhase::new(crate::disk_census_ticks())) }
+    }
+
+    fn enter_pump(&mut self) {
+        if let Some(pre) = self.phase.as_mut()
+            .and_then(|phase| phase.enter(crate::disk_census_ticks())) {
+            SCSI_SRB_PRE_PUMP_TICKS.fetch_add(pre, Ordering::Relaxed);
+            SCSI_SRB_PUMP_ENTRIES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn exit_pump(&mut self) {
+        if let Some(pump) = self.phase.as_mut()
+            .and_then(|phase| phase.exit(crate::disk_census_ticks())) {
+            SCSI_SRB_COMPONENT_PUMP_TICKS.fetch_add(pump, Ordering::Relaxed);
+            SCSI_SRB_PUMP_EXITS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for ScsiSrbPumpTiming {
+    fn drop(&mut self) {
+        if let Some(phase) = self.phase.take() {
+            if let Some(post) = phase.finish(crate::disk_census_ticks()) {
+                SCSI_SRB_POST_PUMP_TICKS.fetch_add(post, Ordering::Relaxed);
+            } else {
+                SCSI_SRB_PUMP_UNENTERED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+fn print_scsi_srb_pump_timing() {
+    let entries = SCSI_SRB_PUMP_ENTRIES.load(Ordering::Relaxed);
+    let unentered = SCSI_SRB_PUMP_UNENTERED.load(Ordering::Relaxed);
+    if entries == 0 && unentered == 0 { return; }
+    print_str(b"[scsi-srb-pump] entries/exits/unentered=");
+    print_u64(entries);
+    print_str(b"/");
+    print_u64(SCSI_SRB_PUMP_EXITS.load(Ordering::Relaxed));
+    print_str(b"/");
+    print_u64(unentered);
+    for (label, ticks) in [
+        (b" pre-pump=".as_slice(), &SCSI_SRB_PRE_PUMP_TICKS),
+        (b" component-pump=".as_slice(), &SCSI_SRB_COMPONENT_PUMP_TICKS),
+        (b" post-pump=".as_slice(), &SCSI_SRB_POST_PUMP_TICKS),
+    ] {
+        print_str(label);
+        print_u64(ticks.load(Ordering::Relaxed) / 1_000_000);
+    }
+    print_str(b" Mtick\n");
+}
+
 unsafe fn dispatch_irp_for_instance_exact(
     inst: usize,
     major: u64,
@@ -73309,6 +73380,8 @@ unsafe fn dispatch_irp_for_instance_exact(
             status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
         });
     };
+    let mut scsi_srb_pump_timing = ScsiSrbPumpTiming::new(dispatch_request.as_ref()
+        .is_some_and(|request| request._reserved0 == nt_io_abi::IRP_DISPATCH_SCSI_SRB));
     let bugchecks_before = FSD_BUGCHECKS.load(Ordering::Relaxed);
     // DIAGNOSTIC (bounded): an IRP dispatch is the one place the executive blocks on a hosted
     // component, so an `ENTER` with no matching `EXIT` is the signature of a driver that never
@@ -73358,10 +73431,12 @@ unsafe fn dispatch_irp_for_instance_exact(
     }
     let measure_rpc = major == major::IRP_MJ_READ as u64 || major == major::IRP_MJ_WRITE as u64;
     let pump_started = if measure_rpc { crate::disk_census_ticks() } else { 0 };
+    scsi_srb_pump_timing.enter_pump();
     let pr = match caller {
         Some(caller) => component_scheduler::hosted_component_pump_with_caller(&ch, caller),
         None => hosted_component_pump(&ch),
     };
+    scsi_srb_pump_timing.exit_pump();
     if measure_rpc {
         let pump_ticks = crate::disk_census_ticks().wrapping_sub(pump_started);
         let bank_ticks = active_hosted_irp_transfer_mut(sh, canonical_irp_id)
