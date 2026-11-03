@@ -10,7 +10,7 @@ use super::*;
 const OTHER_LABEL: usize = 0x900;
 const BUCKETS: usize = OTHER_LABEL + 1;
 const TOP_LABELS: usize = 6;
-const STAGES: usize = 7;
+const STAGES: usize = 9;
 
 static LABEL_COUNTS: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
 static LABEL_TICKS: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
@@ -34,6 +34,8 @@ pub(super) enum Stage {
     NextMessage,
     AutonomousSelect,
     AutonomousService,
+    CensusTick,
+    EventBadge,
 }
 
 pub(super) struct StageScope {
@@ -140,7 +142,8 @@ pub(super) fn print_census() {
     crate::print_str(b"\n");
     crate::print_str(b"[census] file-recv-stage count/ticks-M:");
     for (index, name) in [b"nested".as_slice(), b"registry", b"retained", b"route",
-        b"next-message", b"autonomous-select", b"autonomous-service"].iter().enumerate() {
+        b"next-message", b"autonomous-select", b"autonomous-service", b"census-tick",
+        b"event-badge"].iter().enumerate() {
         crate::print_str(b" ");
         crate::print_str(name);
         crate::print_str(b"=");

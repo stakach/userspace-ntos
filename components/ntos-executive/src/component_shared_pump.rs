@@ -495,8 +495,14 @@ pub(super) unsafe fn receive(
                     }
                     return PumpMessage::scheduler_yield();
                 }
-                crate::census_tick_static(crate::monotonic_time_100ns());
-                let (event, _, irq) = pump_handle_executive_event_badge(message.badge());
+                {
+                    let _stage = StageScope::enter(ch, Stage::CensusTick);
+                    crate::census_tick_static(crate::monotonic_time_100ns());
+                }
+                let (event, _, irq) = {
+                    let _stage = StageScope::enter(ch, Stage::EventBadge);
+                    pump_handle_executive_event_badge(message.badge())
+                };
                 if irq {
                     match ch.caps.kind {
                         ReqKind::Irp => { IRQ_IRP_RECEIVES.fetch_add(1, Ordering::Relaxed); }
