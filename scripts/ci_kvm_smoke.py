@@ -63,6 +63,9 @@ HOSTED_PROCESS_ALLOCATED = re.compile(
     rb"parent=[0-9]+ image=([^ ]+) token=[0-9]+ inherited"
 )
 DESKTOP_SWITCH_PREFIX = b"[win32k-desktop-switch] pi/ret/"
+# QMP block statistics are sampled every ten seconds. A change observed after
+# more than two missed samples cannot prove when its disk work actually ran.
+RECENT_DISK_SAMPLE_SECONDS = 30
 
 
 class BootProgressWatchdog:
@@ -77,6 +80,8 @@ class BootProgressWatchdog:
         self.disk_extensions = 0
         self.disk_bytes = None
         self.disk_checkpoint = None
+        self.disk_sampled_at = None
+        self.disk_changed_at = None
         self.seen = set()
         self.pending = b""
 
@@ -151,12 +156,22 @@ class BootProgressWatchdog:
         previous = self.disk_bytes
         if previous is not None and total < previous:
             return False
+        previous_sample = self.disk_sampled_at
         self.disk_bytes = total
+        self.disk_sampled_at = now
+        if previous is not None and total > previous:
+            # A long observation gap cannot date the completed I/O. Require a
+            # later fresh change before granting another boot interval.
+            self.disk_changed_at = (now if previous_sample is not None
+                                    and now - previous_sample <= RECENT_DISK_SAMPLE_SECONDS
+                                    else None)
         if previous is None or self.disk_checkpoint is None:
             self.disk_checkpoint = total
             return False
         if (now - self.last_progress < self.idle_seconds
                 or total <= self.disk_checkpoint
+                or self.disk_changed_at is None
+                or now - self.disk_changed_at > RECENT_DISK_SAMPLE_SECONDS
                 or self.disk_extensions >= self.max_disk_extensions):
             return False
         self.disk_extensions += 1

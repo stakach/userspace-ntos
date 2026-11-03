@@ -189,12 +189,51 @@ class BootProgressWatchdogTests(unittest.TestCase):
     def test_completed_bootdisk_bytes_allow_only_two_bounded_extensions(self):
         watchdog = self.watchdog()
         self.assertFalse(watchdog.observe_blockstats(self.blockstats(0, 0), 0))
+        self.assertFalse(watchdog.observe_blockstats(self.blockstats(0, 0), 170))
         self.assertTrue(watchdog.observe_blockstats(self.blockstats(4096, 0), 180))
         self.assertIsNone(watchdog.idle_reason(359))
+        self.assertFalse(watchdog.observe_blockstats(self.blockstats(4096, 0), 350))
         self.assertTrue(watchdog.observe_blockstats(self.blockstats(8192, 0), 360))
         self.assertIsNone(watchdog.idle_reason(539))
+        self.assertFalse(watchdog.observe_blockstats(self.blockstats(8192, 0), 530))
         self.assertFalse(watchdog.observe_blockstats(self.blockstats(12288, 0), 540))
         self.assertIsNotNone(watchdog.idle_reason(540))
+
+    def test_old_disk_bytes_cannot_extend_a_stationary_boot(self):
+        # KVM 41608161520: a 36 s driver milestone was followed by a final write
+        # near 40 s. The 210 s sample was flat, yet the old watchdog credited
+        # those stale bytes at the 216 s idle boundary.
+        watchdog = self.watchdog()
+        watchdog.observe_blockstats(self.blockstats(0, 0), 30)
+        watchdog.observe_serial(b"[setup-provision] phase=network-end detail=0\n", 36)
+        watchdog.observe_blockstats(self.blockstats(4096, 0), 40)
+        watchdog.observe_blockstats(self.blockstats(4096, 0), 210)
+        reason = smoke.refresh_idle_progress(
+            watchdog, 216, lambda: self.blockstats(4096, 0),
+        )
+        self.assertIsNotNone(reason, "completed bytes from 176 seconds ago are not live progress")
+        self.assertEqual(watchdog.last_progress, 36)
+        self.assertEqual(watchdog.disk_extensions, 0)
+
+    def test_long_qmp_gap_cannot_date_accumulated_disk_bytes(self):
+        watchdog = self.watchdog()
+        watchdog.observe_blockstats(self.blockstats(0, 0), 0)
+        reason = smoke.refresh_idle_progress(
+            watchdog, 180, lambda: self.blockstats(4096, 0),
+        )
+        self.assertIsNotNone(reason, "an unsampled 180-second interval is not fresh disk proof")
+        self.assertEqual(watchdog.disk_extensions, 0)
+
+    def test_recent_disk_change_survives_one_flat_threshold_sample(self):
+        watchdog = self.watchdog()
+        watchdog.observe_blockstats(self.blockstats(0, 0), 0)
+        watchdog.observe_blockstats(self.blockstats(0, 0), 170)
+        watchdog.observe_blockstats(self.blockstats(4096, 0), 175)
+        reason = smoke.refresh_idle_progress(
+            watchdog, 180, lambda: self.blockstats(4096, 0),
+        )
+        self.assertIsNone(reason)
+        self.assertEqual(watchdog.disk_extensions, 1)
 
     def test_frequent_early_disk_polls_do_not_spend_grace_before_idle_window(self):
         watchdog = self.watchdog()
