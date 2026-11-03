@@ -258,8 +258,11 @@ fn acknowledged_native_fat_sector_can_dispatch_its_successor_in_the_same_service
     let pending_branch = service.split_once("if (&*core::ptr::addr_of!(PENDING)).is_some() {")
         .expect("exact pending-slot branch").1
         .split_once("\n    }").expect("pending-slot branch boundary").0;
+    let pending_wait = pending_branch.split_once("if settled == 0 {")
+        .expect("an unsettled physical slot must block successor dispatch").1
+        .split_once('}').expect("complete pending wait guard").0;
     assert!(pending_branch.contains("let settled = poll_pending();")
-        && pending_branch.contains("if settled == 0 { return 0; }"),
+        && pending_wait.contains("return 0;"),
         "an unproven terminal or refused ACK must retain the occupied slot and forbid next dispatch");
     assert_eq!(service.matches("dispatch_claim(").count(), 1,
         "a completion turn may admit at most one new physical command");

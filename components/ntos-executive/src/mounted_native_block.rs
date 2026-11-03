@@ -99,9 +99,18 @@ static NATIVE_DISPATCH_TERMINAL_PHASE: PhaseCensus = PhaseCensus::new();
 static NATIVE_DISPATCH_CALL_PHASE: PhaseCensus = PhaseCensus::new();
 static NATIVE_DISPATCH_RETURN_TERMINAL_PHASE: PhaseCensus = PhaseCensus::new();
 static NATIVE_TERMINAL_SETTLE_PHASE: PhaseCensus = PhaseCensus::new();
+static NATIVE_CLAIM_SEARCH_PHASE: PhaseCensus = PhaseCensus::new();
 // This is an upper bound on idle time: there may be no claimable work between two commands.
 static NATIVE_INTER_COMMAND_PHASE: PhaseCensus = PhaseCensus::new();
 static NATIVE_LAST_SETTLED_TICKS: AtomicU64 = AtomicU64::new(0);
+
+// Counts service admission without conflating an empty backend queue with physical latency.
+static NATIVE_SERVICE_GUARD_BUSY: AtomicU64 = AtomicU64::new(0);
+static NATIVE_SERVICE_PENDING_WAIT: AtomicU64 = AtomicU64::new(0);
+static NATIVE_SERVICE_CLAIM_HIT_FRESH: AtomicU64 = AtomicU64::new(0);
+static NATIVE_SERVICE_CLAIM_HIT_AFTER_SETTLE: AtomicU64 = AtomicU64::new(0);
+static NATIVE_SERVICE_CLAIM_MISS_FRESH: AtomicU64 = AtomicU64::new(0);
+static NATIVE_SERVICE_CLAIM_MISS_AFTER_SETTLE: AtomicU64 = AtomicU64::new(0);
 
 fn record_inter_command_gap(claim_started_ticks: u64) {
     let last_settled = NATIVE_LAST_SETTLED_TICKS.swap(0, Ordering::Relaxed);
@@ -161,7 +170,24 @@ pub(super) fn print_census() {
     NATIVE_DISPATCH_CALL_PHASE.print(b"dispatch-call");
     NATIVE_DISPATCH_RETURN_TERMINAL_PHASE.print(b"dispatch-return-to-terminal");
     NATIVE_TERMINAL_SETTLE_PHASE.print(b"terminal-to-settle");
+    print_str(b"[census] native-block-phase published-claim-search=");
+    print_u64(NATIVE_CLAIM_SEARCH_PHASE.commands.load(Ordering::Relaxed));
+    print_str(b"attempt/");
+    print_u64(NATIVE_CLAIM_SEARCH_PHASE.ticks.load(Ordering::Relaxed) / 1_000_000);
+    print_str(b"total-Mtick/");
+    print_u64(NATIVE_CLAIM_SEARCH_PHASE.max_ticks.load(Ordering::Relaxed) / 1_000_000);
+    print_str(b"max-Mtick\n");
     NATIVE_INTER_COMMAND_PHASE.print(b"between-commands-upper-bound");
+    print_str(b"[census] native-block-service guard-busy/pending-wait/");
+    print_str(b"claim-hit-fresh/claim-hit-after-settle/claim-miss-fresh/claim-miss-after-settle=");
+    for (index, count) in [&NATIVE_SERVICE_GUARD_BUSY, &NATIVE_SERVICE_PENDING_WAIT,
+        &NATIVE_SERVICE_CLAIM_HIT_FRESH, &NATIVE_SERVICE_CLAIM_HIT_AFTER_SETTLE,
+        &NATIVE_SERVICE_CLAIM_MISS_FRESH, &NATIVE_SERVICE_CLAIM_MISS_AFTER_SETTLE]
+        .iter().enumerate() {
+        if index != 0 { print_str(b"/"); }
+        print_u64(count.load(Ordering::Relaxed));
+    }
+    print_str(b"\n");
     let pending_irp = NATIVE_PENDING_IRP.load(Ordering::Acquire);
     if pending_irp != 0 {
         print_str(b"[census] native-block pending irp=");
@@ -571,14 +597,35 @@ impl Drop for NativeServiceGuard {
 
 /// Drive at most one physical command per service turn. Backends only publish claims.
 pub(super) unsafe fn service() -> usize {
-    let Some(_guard) = NativeServiceGuard::enter() else { return 0; };
+    let Some(_guard) = NativeServiceGuard::enter() else {
+        NATIVE_SERVICE_GUARD_BUSY.fetch_add(1, Ordering::Relaxed);
+        return 0;
+    };
     let settled = if (&*core::ptr::addr_of!(PENDING)).is_some() {
         let settled = poll_pending();
-        if settled == 0 { return 0; }
+        if settled == 0 {
+            NATIVE_SERVICE_PENDING_WAIT.fetch_add(1, Ordering::Relaxed);
+            return 0;
+        }
         settled
     } else { 0 };
     let (route, claim, wal_authority) = if let Some(route) = native_disk_relation::native_storage_route() {
-        let Some(claim) = next_claim() else { return settled; };
+        let search_started = crate::disk_census_ticks();
+        let claim = next_claim();
+        NATIVE_CLAIM_SEARCH_PHASE.record(search_started, crate::disk_census_ticks());
+        let Some(claim) = claim else {
+            if settled == 0 {
+                NATIVE_SERVICE_CLAIM_MISS_FRESH.fetch_add(1, Ordering::Relaxed);
+            } else {
+                NATIVE_SERVICE_CLAIM_MISS_AFTER_SETTLE.fetch_add(1, Ordering::Relaxed);
+            }
+            return settled;
+        };
+        if settled == 0 {
+            NATIVE_SERVICE_CLAIM_HIT_FRESH.fetch_add(1, Ordering::Relaxed);
+        } else {
+            NATIVE_SERVICE_CLAIM_HIT_AFTER_SETTLE.fetch_add(1, Ordering::Relaxed);
+        }
         (route, claim, None)
     } else {
         let Some(route) = native_disk_relation::retained_native_storage_recheck_route() else {

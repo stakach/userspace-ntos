@@ -126,6 +126,60 @@ impl FileRpcTotals {
 static FILE_RPC_TOTALS: [FileRpcTotals; 2] = [FileRpcTotals::new(), FileRpcTotals::new()];
 static FILE_RPC_REJECTED: AtomicU64 = AtomicU64::new(0);
 
+// Mounted FAT uses INTERNAL_DEVICE_CONTROL, which does not enter the File READ/WRITE phase
+// census. Keep these three spans exclusive and record early preparation refusals as well.
+struct ScsiRpcTotals {
+    calls: AtomicU64,
+    uninvoked: AtomicU64,
+    prepare_ticks: AtomicU64,
+    invoke_ticks: AtomicU64,
+    finish_ticks: AtomicU64,
+}
+
+static SCSI_RPC_TOTALS: ScsiRpcTotals = ScsiRpcTotals {
+    calls: AtomicU64::new(0), uninvoked: AtomicU64::new(0),
+    prepare_ticks: AtomicU64::new(0), invoke_ticks: AtomicU64::new(0),
+    finish_ticks: AtomicU64::new(0),
+};
+
+struct ScsiRpcPhaseGuard {
+    started: Option<u64>,
+    invoked: Option<u64>,
+    returned: Option<u64>,
+}
+
+impl ScsiRpcPhaseGuard {
+    fn new(major: u8, policy: ExternalFileIrpDispatchPolicy) -> Self {
+        Self {
+            started: (major == major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                && policy == ExternalFileIrpDispatchPolicy::ScsiAtDevice)
+                .then(crate::disk_census_ticks),
+            invoked: None,
+            returned: None,
+        }
+    }
+}
+
+impl Drop for ScsiRpcPhaseGuard {
+    fn drop(&mut self) {
+        let Some(started) = self.started else { return; };
+        SCSI_RPC_TOTALS.calls.fetch_add(1, Ordering::Relaxed);
+        let Some(invoked) = self.invoked else {
+            SCSI_RPC_TOTALS.uninvoked.fetch_add(1, Ordering::Relaxed);
+            SCSI_RPC_TOTALS.prepare_ticks.fetch_add(
+                crate::disk_census_ticks().wrapping_sub(started), Ordering::Relaxed);
+            return;
+        };
+        SCSI_RPC_TOTALS.prepare_ticks.fetch_add(
+            invoked.wrapping_sub(started), Ordering::Relaxed);
+        let Some(returned) = self.returned else { return; };
+        SCSI_RPC_TOTALS.invoke_ticks.fetch_add(
+            returned.wrapping_sub(invoked), Ordering::Relaxed);
+        SCSI_RPC_TOTALS.finish_ticks.fetch_add(
+            crate::disk_census_ticks().wrapping_sub(returned), Ordering::Relaxed);
+    }
+}
+
 struct FileRpcPhaseGuard {
     entered: u64,
     identity: Option<nt_hosted_runtime::HostedFileRpcIdentity>,
@@ -188,6 +242,19 @@ pub(super) fn file_read_write_dispatch_for_diagnostic(irp_id: IrpId) -> bool {
 }
 
 pub(super) fn print_rpc_phase() {
+    let scsi_calls = SCSI_RPC_TOTALS.calls.load(Ordering::Relaxed);
+    if scsi_calls != 0 {
+        print_str(b"[scsi-rpc-phase] calls/uninvoked/prepare/invoke/finish_Mtick=");
+        print_u64(scsi_calls);
+        print_str(b"/");
+        print_u64(SCSI_RPC_TOTALS.uninvoked.load(Ordering::Relaxed));
+        for ticks in [&SCSI_RPC_TOTALS.prepare_ticks, &SCSI_RPC_TOTALS.invoke_ticks,
+            &SCSI_RPC_TOTALS.finish_ticks] {
+            print_str(b"/");
+            print_u64(ticks.load(Ordering::Relaxed) / 1_000_000);
+        }
+        print_str(b"\n");
+    }
     for (index, label) in [b"read".as_slice(), b"write".as_slice()].iter().enumerate() {
         let total = &FILE_RPC_TOTALS[index];
         let calls = total.calls.load(Ordering::Relaxed);
@@ -657,6 +724,7 @@ fn dispatch_with_port_connect(
 ) -> Result<DispatchResult, nt_status::NtStatus> {
     let major = request.major;
     let mut phase = FileRpcPhaseGuard::new(major);
+    let mut scsi_phase = ScsiRpcPhaseGuard::new(major, policy);
     let _durable = crate::allocator::enter_durable();
     let copy = |source: &[u8]| -> Result<Vec<u8>, nt_status::NtStatus> {
         let mut bytes = Vec::new();
@@ -716,8 +784,10 @@ fn dispatch_with_port_connect(
         trace_port_connect_dispatch(2, irp_id, device);
     }
     if phase.entered != 0 { phase.invoked = crate::disk_census_ticks(); }
+    if scsi_phase.started.is_some() { scsi_phase.invoked = Some(crate::disk_census_ticks()); }
     let returned =
         hosted_file_dispatch::invoke(invocation, row(id).caller, policy.output_capture());
+    if scsi_phase.started.is_some() { scsi_phase.returned = Some(crate::disk_census_ticks()); }
     if phase.entered != 0 {
         phase.returned = crate::disk_census_ticks();
         phase.pump_ticks = row(id).phase_pump_ticks;

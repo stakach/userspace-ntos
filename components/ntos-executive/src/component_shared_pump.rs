@@ -250,7 +250,11 @@ pub(super) unsafe fn receive(
         // A native SYSTEM fold may finish its second physical slot while this IRP Receive
         // retains the parent Call. Release its exact CM checkpoint and reserve before a
         // dependent registry writer retries; the generic outer finalizer cannot run here.
-        if crate::writable_fs::system_wal_fold_ack_pending() {
+        let wal_ack_pending = {
+            let _stage = StageScope::enter(ch, Stage::WalAckReady);
+            crate::writable_fs::system_wal_fold_ack_pending()
+        };
+        if wal_ack_pending {
             let _stage = StageScope::enter(ch, Stage::NestedWork);
             let mut parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,
@@ -265,7 +269,11 @@ pub(super) unsafe fn receive(
         // Timer delivery only records a due fold while the outer service loop is retained.
         // Enter CM and native snapshot I/O here with the exact Receive parent parked; the
         // cadence gate prevents a recursive CM call from admitting the same fold again.
-        if crate::service_sec_image::system_wal_fold_work_pending() {
+        let wal_fold_pending = {
+            let _stage = StageScope::enter(ch, Stage::WalFoldReady);
+            crate::service_sec_image::system_wal_fold_work_pending()
+        };
+        if wal_fold_pending {
             let _stage = StageScope::enter(ch, Stage::NestedWork);
             trace_ps_create_event(b"fold-enter", route, 0, 0);
             let mut parent = match runtime::nested::park_current() {
@@ -293,7 +301,11 @@ pub(super) unsafe fn receive(
         if progressed && crate::registry_mutation_work::wake_due(crate::monotonic_time_100ns()) != 0 {
             continue;
         }
-        if let Some(id) = crate::registry_mutation_work::pending_provider_header_recheck() {
+        let header_recheck = {
+            let _stage = StageScope::enter(ch, Stage::RegistryHeaderReady);
+            crate::registry_mutation_work::pending_provider_header_recheck()
+        };
+        if let Some(id) = header_recheck {
             let _stage = StageScope::enter(ch, Stage::NestedWork);
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             let mut parent = match runtime::nested::park_current() {
@@ -306,7 +318,11 @@ pub(super) unsafe fn receive(
             }
             if serviced != 0 { continue; }
         }
-        if let Some(id) = crate::registry_mutation_work::pending_provider_native_wal_io() {
+        let registry_wal = {
+            let _stage = StageScope::enter(ch, Stage::RegistryWalReady);
+            crate::registry_mutation_work::pending_provider_native_wal_io()
+        };
+        if let Some(id) = registry_wal {
             let _stage = StageScope::enter(ch, Stage::NestedWork);
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             let mut parent = match runtime::nested::park_current() {
@@ -319,7 +335,11 @@ pub(super) unsafe fn receive(
             }
             if serviced != 0 { continue; }
         }
-        if crate::service_sec_image::nested_hosted_file_work_ready() {
+        let nested_file_ready = {
+            let _stage = StageScope::enter(ch, Stage::NestedFileReady);
+            crate::service_sec_image::nested_hosted_file_work_ready()
+        };
+        if nested_file_ready {
             let _stage = StageScope::enter(ch, Stage::NestedWork);
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             let mut parent = match runtime::nested::park_current() {

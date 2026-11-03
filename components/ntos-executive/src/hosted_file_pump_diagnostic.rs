@@ -10,7 +10,7 @@ use super::*;
 const OTHER_LABEL: usize = 0x900;
 const BUCKETS: usize = OTHER_LABEL + 1;
 const TOP_LABELS: usize = 6;
-const STAGES: usize = 13;
+const STAGES: usize = 18;
 
 static LABEL_COUNTS: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
 static LABEL_TICKS: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
@@ -40,6 +40,11 @@ pub(super) enum Stage {
     YieldPreflight,
     TimerIrqPreflight,
     ReceiveOwner,
+    WalAckReady,
+    WalFoldReady,
+    RegistryHeaderReady,
+    RegistryWalReady,
+    NestedFileReady,
 }
 
 pub(super) struct StageScope {
@@ -148,7 +153,9 @@ pub(super) fn print_census() {
     for (index, name) in [b"nested".as_slice(), b"registry", b"retained", b"route",
         b"next-message", b"autonomous-select", b"autonomous-service", b"census-tick",
         b"event-badge", b"call-adoption", b"yield-preflight", b"timer-irq-preflight",
-        b"receive-owner"].iter().enumerate() {
+        b"receive-owner", b"wal-ack-ready", b"wal-fold-ready",
+        b"registry-header-ready", b"registry-wal-ready", b"nested-file-ready"]
+        .iter().enumerate() {
         crate::print_str(b" ");
         crate::print_str(name);
         crate::print_str(b"=");
