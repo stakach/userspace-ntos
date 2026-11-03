@@ -2970,18 +2970,60 @@ fn hosted_display_service_registry_path(service_name: &str) -> Option<Vec<u8>> {
     Some(path)
 }
 
+// Observation only: periodic census can run inside the native video callback, so it reads
+// atomics instead of the mutable start batch or video route state. Stage 1 entered, 2 provider
+// present, 3 VideoPort initialized, 4 route and registry path ready, 5 publish returned.
+static VIDEO_ROUTE_ENTRIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static VIDEO_ROUTE_EXITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static VIDEO_ROUTE_DEVICE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static VIDEO_ROUTE_STAGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+struct VideoRouteObservation;
+
+impl VideoRouteObservation {
+    fn enter(device_id: u64) -> Self {
+        VIDEO_ROUTE_ENTRIES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        VIDEO_ROUTE_DEVICE.store(device_id, core::sync::atomic::Ordering::Relaxed);
+        VIDEO_ROUTE_STAGE.store(1, core::sync::atomic::Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for VideoRouteObservation {
+    fn drop(&mut self) {
+        VIDEO_ROUTE_EXITS.fetch_add(1, core::sync::atomic::Ordering::Release);
+    }
+}
+
+pub(crate) fn print_hosted_video_route_census() {
+    let entries = VIDEO_ROUTE_ENTRIES.load(core::sync::atomic::Ordering::Acquire);
+    if entries == 0 { return; }
+    print_str(b"[video-route-census] entries/exits/device/stage=");
+    print_u64(entries);
+    print_str(b"/");
+    print_u64(VIDEO_ROUTE_EXITS.load(core::sync::atomic::Ordering::Acquire));
+    print_str(b"/");
+    print_u64(VIDEO_ROUTE_DEVICE.load(core::sync::atomic::Ordering::Acquire));
+    print_str(b"/");
+    print_u64(VIDEO_ROUTE_STAGE.load(core::sync::atomic::Ordering::Acquire));
+    print_str(b"\n");
+}
+
 unsafe fn try_publish_hosted_video_route(
     device_id: u64,
     service_name: &str,
     instance_id: &str,
     report: &mut HostedPnpStartReport,
 ) {
+    let _observation = VideoRouteObservation::enter(device_id);
     if crate::current_win32k_provider_domain().is_none() {
         return;
     }
+    VIDEO_ROUTE_STAGE.store(2, core::sync::atomic::Ordering::Release);
     if !driver_launch::hosted_device_video_port_initialized(device_id) {
         return;
     }
+    VIDEO_ROUTE_STAGE.store(3, core::sync::atomic::Ordering::Release);
     report.video_route_attempted_count += 1;
     let Some(_route) = driver_launch::hosted_video_route_info(device_id) else {
         remember_error(report, nt_status::NtStatus::INVALID_DEVICE_REQUEST);
@@ -2993,6 +3035,7 @@ unsafe fn try_publish_hosted_video_route(
         print_hosted_video_route_published(service_name, instance_id, device_id, false);
         return;
     };
+    VIDEO_ROUTE_STAGE.store(4, core::sync::atomic::Ordering::Release);
     let published = crate::video_device::publish_hosted_video_device_route(
         &crate::video_device::HostedVideoDeviceRegistration {
             device_id,
@@ -3000,6 +3043,7 @@ unsafe fn try_publish_hosted_video_route(
             allocate_projection: crate::win32k_subsystem::allocate_root_provider_pool_allocation,
         },
     );
+    VIDEO_ROUTE_STAGE.store(5, core::sync::atomic::Ordering::Release);
     report.video_route_published |= published;
     if published {
         report.video_route_published_count += 1;

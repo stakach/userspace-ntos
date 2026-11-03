@@ -20051,12 +20051,31 @@ fn hosted_ascii_push_decimal_u32<const N: usize>(dst: &mut HostedAscii<N>, mut v
 
 /// `VP_STATUS VideoPortSetRegistryParameters(...)` — write REG_BINARY hardware information under
 /// the active hosted display driver's class key.
+static VIDEO_REGISTRY_SET_ENTRIES: AtomicU64 = AtomicU64::new(0);
+static VIDEO_REGISTRY_SET_EXITS: AtomicU64 = AtomicU64::new(0);
+
+struct VideoRegistrySetObservation;
+
+impl VideoRegistrySetObservation {
+    fn enter() -> Self {
+        VIDEO_REGISTRY_SET_ENTRIES.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for VideoRegistrySetObservation {
+    fn drop(&mut self) {
+        VIDEO_REGISTRY_SET_EXITS.fetch_add(1, Ordering::Release);
+    }
+}
+
 extern "win64" fn s_video_port_set_registry_parameters(
     _hw_device_extension: u64,
     value_name: u64,
     value_data: u64,
     value_length: u32,
 ) -> u32 {
+    let _observation = VideoRegistrySetObservation::enter();
     if value_name == 0 || (value_length != 0 && value_data == 0) {
         return VP_ERROR_INVALID_PARAMETER;
     }
@@ -20082,6 +20101,16 @@ extern "win64" fn s_video_port_set_registry_parameters(
             }
         }
     }
+}
+
+pub(crate) fn print_hosted_video_registry_set_census() {
+    let entries = VIDEO_REGISTRY_SET_ENTRIES.load(Ordering::Acquire);
+    if entries == 0 { return; }
+    print_str(b"[video-registry-set-census] entries/exits=");
+    print_u64(entries);
+    print_str(b"/");
+    print_u64(VIDEO_REGISTRY_SET_EXITS.load(Ordering::Acquire));
+    print_str(b"\n");
 }
 
 unsafe fn read_video_hw_initialization_data(
@@ -48265,7 +48294,26 @@ unsafe fn drain_hosted_filter_requirements_transactions() -> usize {
     progress
 }
 
+static HOSTED_IO_PUMP_ENTRIES: AtomicU64 = AtomicU64::new(0);
+static HOSTED_IO_PUMP_EXITS: AtomicU64 = AtomicU64::new(0);
+
+struct HostedIoPumpObservation;
+
+impl HostedIoPumpObservation {
+    fn enter() -> Self {
+        HOSTED_IO_PUMP_ENTRIES.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for HostedIoPumpObservation {
+    fn drop(&mut self) {
+        HOSTED_IO_PUMP_EXITS.fetch_add(1, Ordering::Release);
+    }
+}
+
 pub(crate) fn pump_hosted_io_completions() -> usize {
+    let _observation = HostedIoPumpObservation::enter();
     // A nested provider dispatch can queue PASSIVE_LEVEL work while the scheduler is active.
     // Revisit it from the outer pump before looking for IRP completions produced by that work.
     let deferred = match unsafe { drain_hosted_work_queues_at_passive_level() } {
@@ -54109,6 +54157,12 @@ static RELATION_GATE_REASON: AtomicU64 = AtomicU64::new(0);
 static RELATION_GATE_ACTIVE_MASK: AtomicU64 = AtomicU64::new(0);
 static RELATION_GATE_QUEUED: AtomicU64 = AtomicU64::new(0);
 static RELATION_GATE_SELECTED_PDO: AtomicU64 = AtomicU64::new(0);
+static RELATION_GATE_LIFECYCLE_IRP: AtomicU64 = AtomicU64::new(0);
+static RELATION_GATE_LIFECYCLE_PDO: AtomicU64 = AtomicU64::new(0);
+static RELATION_GATE_LIFECYCLE_PHASE: AtomicU64 = AtomicU64::new(0);
+static RELATION_GATE_FILTER_IRP: AtomicU64 = AtomicU64::new(0);
+static RELATION_GATE_FILTER_PDO: AtomicU64 = AtomicU64::new(0);
+static RELATION_GATE_FILTER_PHASE: AtomicU64 = AtomicU64::new(0);
 static RELATION_WAIT_CALLS: AtomicU64 = AtomicU64::new(0);
 static RELATION_WAIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static RELATION_WAIT_STATE: AtomicU64 = AtomicU64::new(0);
@@ -54138,8 +54192,60 @@ fn note_relation_gate(reason: u64, active_mask: u64, queued: usize, selected_pdo
     RELATION_GATE_ACTIVE_MASK.store(active_mask, Ordering::Relaxed);
     RELATION_GATE_QUEUED.store(queued as u64, Ordering::Relaxed);
     RELATION_GATE_SELECTED_PDO.store(selected_pdo, Ordering::Relaxed);
+    let (lifecycle, filter) = if active_mask & 4 != 0 {
+        unsafe {
+            let lifecycle = (*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS))
+                .as_ref()
+                .and_then(|rows| rows.iter().find(|row| row.phase != HostedPnpTransactionPhase::Terminal))
+                .map(|row| (row.irp_id.raw(), row.binding.pdo_device_id, hosted_pnp_phase_code(row.phase)));
+            let filter = (*core::ptr::addr_of!(HOSTED_FILTER_REQUIREMENTS_TRANSACTIONS))
+                .as_ref()
+                .and_then(|rows| rows.first())
+                .map(|row| (row.irp_id.raw(), row.binding.pdo_device_id, hosted_filter_phase_code(row.phase)));
+            (lifecycle, filter)
+        }
+    } else {
+        (None, None)
+    };
+    let (lifecycle_irp, lifecycle_pdo, lifecycle_phase) = lifecycle.unwrap_or((0, 0, 0));
+    let (filter_irp, filter_pdo, filter_phase) = filter.unwrap_or((0, 0, 0));
+    RELATION_GATE_LIFECYCLE_IRP.store(lifecycle_irp, Ordering::Relaxed);
+    RELATION_GATE_LIFECYCLE_PDO.store(lifecycle_pdo, Ordering::Relaxed);
+    RELATION_GATE_LIFECYCLE_PHASE.store(lifecycle_phase, Ordering::Relaxed);
+    RELATION_GATE_FILTER_IRP.store(filter_irp, Ordering::Relaxed);
+    RELATION_GATE_FILTER_PDO.store(filter_pdo, Ordering::Relaxed);
+    RELATION_GATE_FILTER_PHASE.store(filter_phase, Ordering::Relaxed);
     RELATION_GATE_CALLS.fetch_add(1, Ordering::Release);
     end_relation_observation(&RELATION_GATE_SEQUENCE);
+}
+
+fn hosted_pnp_phase_code(phase: HostedPnpTransactionPhase) -> u64 {
+    match phase {
+        HostedPnpTransactionPhase::Prepared => 1,
+        HostedPnpTransactionPhase::AwaitingVideoProvider => 2,
+        HostedPnpTransactionPhase::Dispatching => 3,
+        HostedPnpTransactionPhase::DetachedDispatchInFlight => 4,
+        HostedPnpTransactionPhase::AwaitingCompletion => 5,
+        HostedPnpTransactionPhase::DetachedAckInFlight => 6,
+        HostedPnpTransactionPhase::DetachedAckRetry => 7,
+        HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck => 8,
+        HostedPnpTransactionPhase::PostPublicationRepair => 9,
+        HostedPnpTransactionPhase::Terminal => 10,
+        HostedPnpTransactionPhase::Indeterminate => 11,
+    }
+}
+
+fn hosted_filter_phase_code(phase: HostedFilterRequirementsPhase) -> u64 {
+    match phase {
+        HostedFilterRequirementsPhase::AwaitingVideoProvider => 1,
+        HostedFilterRequirementsPhase::AwaitingCompletion => 2,
+        HostedFilterRequirementsPhase::AwaitingCopy { .. } => 3,
+        HostedFilterRequirementsPhase::AwaitingCommit { .. } => 4,
+        HostedFilterRequirementsPhase::AwaitingAck { .. } => 5,
+        HostedFilterRequirementsPhase::Ready => 6,
+        HostedFilterRequirementsPhase::Barrier => 7,
+        HostedFilterRequirementsPhase::Indeterminate => 8,
+    }
 }
 
 fn relation_query_phase_code(phase: HostedDeviceRelationQueryPhase) -> u64 {
@@ -54202,12 +54308,23 @@ fn note_relation_wait(
 }
 
 pub(crate) fn print_hosted_pnp_relation_census() {
+    print_str(b"[pnp-pump-census] entries/exits=");
+    print_u64(HOSTED_IO_PUMP_ENTRIES.load(Ordering::Acquire));
+    print_str(b"/");
+    print_u64(HOSTED_IO_PUMP_EXITS.load(Ordering::Acquire));
+    print_str(b"\n");
     let gate_sequence = RELATION_GATE_SEQUENCE.load(Ordering::Acquire);
     let gate = [RELATION_GATE_CALLS.load(Ordering::Relaxed),
         RELATION_GATE_REASON.load(Ordering::Relaxed),
         RELATION_GATE_ACTIVE_MASK.load(Ordering::Relaxed),
         RELATION_GATE_QUEUED.load(Ordering::Relaxed),
-        RELATION_GATE_SELECTED_PDO.load(Ordering::Relaxed)];
+        RELATION_GATE_SELECTED_PDO.load(Ordering::Relaxed),
+        RELATION_GATE_LIFECYCLE_IRP.load(Ordering::Relaxed),
+        RELATION_GATE_LIFECYCLE_PDO.load(Ordering::Relaxed),
+        RELATION_GATE_LIFECYCLE_PHASE.load(Ordering::Relaxed),
+        RELATION_GATE_FILTER_IRP.load(Ordering::Relaxed),
+        RELATION_GATE_FILTER_PDO.load(Ordering::Relaxed),
+        RELATION_GATE_FILTER_PHASE.load(Ordering::Relaxed)];
     let gate_stable = gate_sequence & 1 == 0
         && RELATION_GATE_SEQUENCE.load(Ordering::Acquire) == gate_sequence;
     let wait_sequence = RELATION_WAIT_SEQUENCE.load(Ordering::Acquire);
@@ -54223,7 +54340,7 @@ pub(crate) fn print_hosted_pnp_relation_census() {
     let wait_stable = wait_sequence & 1 == 0
         && RELATION_WAIT_SEQUENCE.load(Ordering::Acquire) == wait_sequence;
     if gate[0] == 0 && wait[0] == 0 { return; }
-    print_str(b"[pnp-relation-census] gate-calls/reason/active-mask/queued/selected-pdo=");
+    print_str(b"[pnp-relation-census] gate-calls/reason/active-mask/queued/selected-pdo/lifecycle-irp/pdo/phase/filter-irp/pdo/phase=");
     if gate_stable {
         for (index, value) in gate.iter().enumerate() {
             if index != 0 { print_str(b"/"); }

@@ -7285,6 +7285,8 @@ pub(crate) fn census_tick_static(now: u64) {
     print_native_ssn_time();
     driver_launch::print_hosted_file_rpc_phase();
     driver_launch::print_hosted_pnp_relation_census();
+    driver_launch::print_hosted_video_registry_set_census();
+    hosted_pnp_start::print_hosted_video_route_census();
     if n.is_power_of_two() {
         exec_handler::native_io_attribution::print_summary();
     }
