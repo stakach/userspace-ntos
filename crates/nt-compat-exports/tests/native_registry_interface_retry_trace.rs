@@ -59,3 +59,22 @@ fn interface_busy_trace_names_the_exact_admit_substage_and_retained_storage_owne
     assert!(validate < validate_stage && validate_stage < persistence && persistence < persistence_stage,
         "the two BUSY returns need distinct caller-owned stages without changing either effect");
 }
+
+#[test]
+fn existing_provider_retry_reports_bounded_failure_and_retained_owner() {
+    let source = include_str!("../../../components/ntos-executive/src/registry_mutation_work.rs");
+    let diagnostic = &source[source.find("fn trace_existing_provider_retry(work:").expect("existing provider retry trace")..
+        source.find("/// Includes work retained across").unwrap()];
+    assert!(diagnostic.contains("ProviderAdmission::Existing("));
+    assert!(diagnostic.contains("trace_interface_retry_at(count)"));
+    for evidence in ["[registry-existing-retry] id=", " phase=", " error=0x",
+        "admit-substage=", "storage-owner="] {
+        assert!(diagnostic.contains(evidence), "missing {evidence}");
+    }
+    let redrive = &source[source.find("unsafe fn redrive_inner(").unwrap()..
+        source.find("unsafe fn caller_cancelled(").unwrap()];
+    assert!(redrive.contains("trace_existing_provider_retry(&work, status, admit_retry_substage);"));
+    let census = &source[source.find("pub(crate) struct CensusSnapshot").unwrap()..
+        source.find("pub(crate) fn redrive_active()").unwrap()];
+    assert!(census.contains("first_provider:") && census.contains("phase_name(&work.phase)"));
+}

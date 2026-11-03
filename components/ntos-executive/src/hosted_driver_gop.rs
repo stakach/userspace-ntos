@@ -8,6 +8,7 @@ mod hosted_gop_bar_projection;
 
 /// Once a display driver takes postdisplay ownership, this boot-video owner never paints again.
 static DISPLAY_OWNERSHIP_LOST: AtomicBool = AtomicBool::new(false);
+static GOP_QUERY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// LiberNT `LOADER_PARAMETER_FRAMEBUFFER` from `sdk/include/reactos/loader_framebuffer.h`.
 #[allow(non_snake_case)]
@@ -47,9 +48,20 @@ pub(super) extern "win64" fn s_inbv_get_gop_frame_buffer_info(output: u64) -> u8
     if output == 0 || output.checked_add(GOP_ARG_BYTES).is_none() {
         return 0;
     }
+    let ordinal = GOP_QUERY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if ordinal <= 16 || hosted_video_port_control::video_create_hw_initialize_active() {
+        print_str(b"[gop-query-stage] ordinal="); print_u64(ordinal);
+        print_str(b" stage=enter\n");
+    }
     let (label, valid, _, _, _) = unsafe {
         call_on4(FSD_SERVICE_GOP_QUERY_LABEL << 12, 0, 0, 0, 0)
     };
+    if ordinal <= 16 || hosted_video_port_control::video_create_hw_initialize_active() {
+        print_str(b"[gop-query-stage] ordinal="); print_u64(ordinal);
+        print_str(b" stage=returned label="); print_u64(label);
+        print_str(b" valid="); print_u64(valid);
+        print_str(b"\n");
+    }
     if label != 0 || valid != 1 {
         return 0;
     }

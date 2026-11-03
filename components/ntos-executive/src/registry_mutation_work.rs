@@ -454,6 +454,9 @@ static NEXT_WORK_ID: AtomicU64 = AtomicU64::new(1);
 static LAST_INTERFACE_RETRY_WORK_ID: AtomicU64 = AtomicU64::new(0);
 static LAST_INTERFACE_RETRY_PHASE: AtomicU64 = AtomicU64::new(0);
 static INTERFACE_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
+static LAST_EXISTING_RETRY_WORK_ID: AtomicU64 = AtomicU64::new(0);
+static LAST_EXISTING_RETRY_PHASE: AtomicU64 = AtomicU64::new(0);
+static EXISTING_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn next_work_id() -> u64 {
     let id = NEXT_WORK_ID.fetch_add(1, Ordering::Relaxed);
@@ -593,6 +596,50 @@ fn trace_interface_retry(work: &Work, error: i32, substage: AdmitRetrySubstage) 
     print_str(b"\n");
 }
 
+/// Name a retained SYSTEM value mutation that repeatedly fails during a nested provider call.
+fn trace_existing_provider_retry(work: &Work, error: i32, substage: AdmitRetrySubstage) {
+    let Caller::Provider(provider::ProviderCaller {
+        admission: provider::ProviderAdmission::Existing(admission), ..
+    }) = &work.caller else { return; };
+    let phase = phase_name(&work.phase);
+    let phase_key = phase.as_ptr() as usize as u64;
+    let previous = LAST_EXISTING_RETRY_WORK_ID.swap(work.id, Ordering::AcqRel);
+    let previous_phase = LAST_EXISTING_RETRY_PHASE.swap(phase_key, Ordering::AcqRel);
+    let count = if previous == work.id && previous_phase == phase_key {
+        EXISTING_RETRY_COUNT.fetch_add(1, Ordering::AcqRel).saturating_add(1)
+    } else {
+        EXISTING_RETRY_COUNT.store(1, Ordering::Release);
+        1
+    };
+    if !trace_interface_retry_at(count) { return; }
+    print_str(b"[registry-existing-retry] id="); print_u64(work.id);
+    print_str(b" count="); print_u64(count);
+    print_str(b" route="); print_u64(admission.dispatch.route().badge());
+    print_str(b" phase="); print_str(phase.as_bytes());
+    print_str(b" admit-substage=");
+    print_str(match substage {
+        AdmitRetrySubstage::None => b"none",
+        AdmitRetrySubstage::ValidateStorage => b"validate-storage",
+        AdmitRetrySubstage::PersistenceAdmit => b"persistence-admit",
+    });
+    print_str(b" storage-owner=");
+    print_str(match &work.persistence.owner {
+        PersistenceOwner::Unadmitted => b"unadmitted",
+        PersistenceOwner::NoStorage => b"no-storage",
+        PersistenceOwner::Admitting { .. } => b"admitting",
+        PersistenceOwner::Legacy(_) => b"legacy",
+        PersistenceOwner::Wal(_) => b"wal",
+    });
+    if let Some(recheck_id) = work.persistence.admission_recheck_id() {
+        print_str(b" recheck-id="); print_u64(recheck_id);
+    }
+    print_str(b" error=0x"); print_hex_u64(error as u32 as u64);
+    print_str(b" work-status=0x"); print_hex_u64(work.status as u64);
+    print_str(b" expected-generation="); print_u64(admission.expected_generation);
+    print_str(b" retry-100ns="); print_u64(RETRY_DELAY);
+    print_str(b"\n");
+}
+
 /// Includes work retained across a failed CM exchange or a storage effect. The bootstrap
 /// handoff must wait for this count and the journal owner before moving Ps into the handler.
 pub(crate) fn pending_count() -> u64 {
@@ -684,6 +731,7 @@ pub(crate) struct CensusSnapshot {
     hosted_rows: usize,
     provider_rows: usize,
     first_hosted: Option<(u64, &'static str, &'static str)>,
+    first_provider: Option<(u64, &'static str, &'static str)>,
 }
 
 pub(crate) unsafe fn census_snapshot() -> CensusSnapshot {
@@ -691,6 +739,7 @@ pub(crate) unsafe fn census_snapshot() -> CensusSnapshot {
     let mut hosted_rows = 0;
     let mut provider_rows = 0;
     let mut first_hosted = None;
+    let mut first_provider = None;
     for work in rows.iter().flatten() {
         match &work.caller {
             Caller::Hosted(_) => {
@@ -707,7 +756,19 @@ pub(crate) unsafe fn census_snapshot() -> CensusSnapshot {
                     first_hosted = Some((work.id, phase, storage));
                 }
             }
-            Caller::Provider(_) => provider_rows += 1,
+            Caller::Provider(_) => {
+                provider_rows += 1;
+                if first_provider.is_none() {
+                    let storage = match work.persistence.owner {
+                        PersistenceOwner::Unadmitted => "unadmitted",
+                        PersistenceOwner::NoStorage => "no-storage",
+                        PersistenceOwner::Admitting { .. } => "admitting",
+                        PersistenceOwner::Legacy(_) => "legacy",
+                        PersistenceOwner::Wal(_) => "wal",
+                    };
+                    first_provider = Some((work.id, phase_name(&work.phase), storage));
+                }
+            }
         }
     }
     CensusSnapshot {
@@ -718,6 +779,7 @@ pub(crate) unsafe fn census_snapshot() -> CensusSnapshot {
         hosted_rows,
         provider_rows,
         first_hosted,
+        first_provider,
     }
 }
 
@@ -1157,6 +1219,7 @@ unsafe fn redrive_inner(mut context: HostedContext<'_>) -> bool {
                 }
                 Err(status) => {
                     trace_interface_retry(&work, status, admit_retry_substage);
+                    trace_existing_provider_retry(&work, status, admit_retry_substage);
                     failed = true;
                     immediate_progress = false;
                     break;

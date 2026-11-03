@@ -23,11 +23,11 @@ pub(crate) enum ProviderValueMutation {
 /// The mutation payload is copied out of provider scratch memory before the lane is parked.
 pub(crate) struct DeferredRegistryExisting {
     caller: NativeHandleCaller,
-    dispatch: RegistryPublicationDispatch,
+    pub(super) dispatch: RegistryPublicationDispatch,
     key_owner: OwnedDriverRegistryPublication,
     lease: SystemHiveKeyLease,
     physical_path: String,
-    expected_generation: u64,
+    pub(super) expected_generation: u64,
     pub(super) mutation: ProviderValueMutation,
 }
 

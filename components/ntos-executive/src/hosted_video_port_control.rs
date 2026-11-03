@@ -7,6 +7,23 @@ use nt_video_miniport::{
     VIDEO_PORT_DEVICE_STATE_SIZE, VIDEO_REQUEST_PACKET_X64_SIZE,
 };
 
+static VIDEO_CREATE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static VIDEO_CREATE_HW_INITIALIZE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn video_create_hw_initialize_active() -> bool {
+    VIDEO_CREATE_HW_INITIALIZE_ACTIVE.load(Ordering::Acquire)
+}
+
+fn trace_video_create(ordinal: u64, stage: u64, device: u64, irp: u64, result: u64) {
+    if ordinal > 8 { return; }
+    print_str(b"[video-create-stage] ordinal="); print_u64(ordinal);
+    print_str(b" stage="); print_u64(stage);
+    print_str(b" device="); print_hex64(device);
+    print_str(b" irp="); print_hex64(irp);
+    print_str(b" result="); print_hex64(result);
+    print_str(b"\n");
+}
+
 fn protocol_violation(device: u64, irp: u64, status: u64, information: u64) -> ! {
     // The guarded run_irp caller retains the graph and reports indeterminate provider execution.
     s_ke_bug_check_ex(0xC4, device, irp, status, information);
@@ -83,6 +100,8 @@ pub(super) unsafe fn finish_find_adapter(device: u64, success: bool) {
 }
 
 unsafe fn create(device: u64, irp: u64, stack: u64, hw_extension: u64) -> i32 {
+    let ordinal = VIDEO_CREATE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    trace_video_create(ordinal, 1, device, irp, 0);
     let mode = read_unaligned((irp + 0x40) as *const u8);
     if mode > 1 {
         return complete(irp, STATUS_INVALID_PARAMETER, 0);
@@ -112,7 +131,11 @@ unsafe fn create(device: u64, irp: u64, stack: u64, hw_extension: u64) -> i32 {
     if initialize == 0 {
         protocol_violation(device, irp, STATUS_INVALID_DEVICE_REQUEST as u32 as u64, 0);
     }
+    trace_video_create(ordinal, 2, device, irp, initialize);
+    VIDEO_CREATE_HW_INITIALIZE_ACTIVE.store(true, Ordering::Release);
     let ok = call_hosted_pe(initialize, &[hw_extension]) as u8;
+    VIDEO_CREATE_HW_INITIALIZE_ACTIVE.store(false, Ordering::Release);
+    trace_video_create(ordinal, 3, device, irp, ok as u64);
     let calls = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE_CALLS) as *const u64);
     write_volatile(
         (FSD_SHARED_VADDR + SH_VIDEO_HW_INITIALIZE_CALLS) as *mut u64,
@@ -124,7 +147,10 @@ unsafe fn create(device: u64, irp: u64, stack: u64, hw_extension: u64) -> i32 {
     );
     let completion = update_device_state(device, |state| state.finish_initialize(ok != 0))
         .unwrap_or_else(|status| protocol_violation(device, irp, status as u32 as u64, ok as u64));
-    complete(irp, completion.status as i32, completion.information)
+    trace_video_create(ordinal, 4, device, irp, completion.status as u64);
+    let status = complete(irp, completion.status as i32, completion.information);
+    trace_video_create(ordinal, 5, device, irp, status as u32 as u64);
+    status
 }
 
 pub(super) unsafe extern "win64" fn dispatch(device: u64, irp: u64) -> i32 {
