@@ -11,6 +11,26 @@ fn source(name: &str) -> String {
 }
 
 #[test]
+fn draining_route_defers_system_fold_before_snapshot_io() {
+    let fold = source("writable_fs/system_wal_fold.rs");
+    let entry = &fold[fold.find("pub(crate) unsafe fn fold_system_wal_if_dirty()").unwrap()..];
+    let draining = entry.find("Some(nt_fs::BlockSourceKind::Draining)")
+        .expect("storage handoff must explicitly defer the fold");
+    let defer = entry[draining..]
+        .find("return Err(nt_fs::STATUS_DEVICE_NOT_READY)")
+        .expect("handoff is a retryable condition, not a failed fold") + draining;
+    assert!(defer < entry.find("ensure_mounted()?").unwrap()
+        && defer < entry.find("snapshot_storage::acquire()?").unwrap()
+        && defer < entry.find("snapshot_storage::peek_wal_continuation").unwrap(),
+        "a draining route must refuse the fold before synchronous snapshot I/O");
+    let service = source("service_sec_image.rs");
+    let retry = &service[service.find("fn maybe_fold_system_wal()").unwrap()..];
+    assert!(retry.contains("SYSTEM_WAL_FOLD_DUE.store(true")
+        && retry.contains("SYSTEM_WAL_FOLD_RETRY_100NS.store("),
+        "a deferred fold must retain demand for the native route");
+}
+
+#[test]
 fn v2_fold_owns_cm_checkpoint_and_exact_reserve_until_two_slots_and_rollover() {
     let fold = source("writable_fs/system_wal_fold.rs");
     let native = source("writable_fs/system_wal_fold/native.rs");

@@ -129,10 +129,13 @@ pub(crate) unsafe fn fold_system_wal_if_dirty() -> Result<bool, u32> {
             Phase::Failed => Err(nt_fs::STATUS_DEVICE_NOT_READY),
         };
     }
-    if crate::fs_loader::exec_fs_mount_identity()
-        .and_then(crate::fs_loader::exec_block_route_kind)
-        == Some(nt_fs::BlockSourceKind::Native) {
-        return native::fold_system_wal_native();
+    match crate::fs_loader::exec_fs_mount_identity()
+        .and_then(crate::fs_loader::exec_block_route_kind) {
+        Some(nt_fs::BlockSourceKind::Native) => return native::fold_system_wal_native(),
+        // Boot I/O is fenced during handoff. Preserve fold demand for the timer to retry
+        // after the native route commits; probing a snapshot header here would poison mount.
+        Some(nt_fs::BlockSourceKind::Draining) => return Err(nt_fs::STATUS_DEVICE_NOT_READY),
+        Some(nt_fs::BlockSourceKind::Boot) | None => {}
     }
     ensure_mounted()?;
     if legacy_snapshot_writes_allowed() || WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
