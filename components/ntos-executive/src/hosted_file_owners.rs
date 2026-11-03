@@ -178,6 +178,15 @@ pub(super) fn record_dispatch_pump(
     }
 }
 
+/// Observation only: the physical dispatch must still own this File READ/WRITE IRP.
+pub(super) fn file_read_write_dispatch_for_diagnostic(irp_id: IrpId) -> bool {
+    let Some(id) = find(irp_id) else { return false; };
+    let owner = row(id);
+    owner.flight == Flight::Dispatch
+        && owner.irp_id == Some(irp_id)
+        && matches!(owner.phase_major, major::IRP_MJ_READ | major::IRP_MJ_WRITE)
+}
+
 pub(super) fn print_rpc_phase() {
     for (index, label) in [b"read".as_slice(), b"write".as_slice()].iter().enumerate() {
         let total = &FILE_RPC_TOTALS[index];

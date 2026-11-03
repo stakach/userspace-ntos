@@ -1548,6 +1548,10 @@ pub(crate) fn pump_receive_census() -> (u64, u64, u64, u64, u64, u64) {
     shared_pump::receive_census()
 }
 
+pub(crate) fn file_receive_census() -> [u64; 9] {
+    shared_pump::file_receive_census()
+}
+
 pub(crate) fn ps_create_parent_progress() -> (u64, u64, u64) {
     shared_pump::ps_create_parent_progress()
 }

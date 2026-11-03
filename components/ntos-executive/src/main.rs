@@ -7054,6 +7054,18 @@ fn print_shared_receive_census() {
         }
     }
     print_str(b"\n");
+    let [calls, ticks, hosted, call, timer, other_notification, error,
+        scheduler_yield, autonomous] =
+        spawn_hosts::file_receive_census();
+    if calls != 0 {
+        print_str(b"[census] file-recv calls/ticks-M/hosted/call/timer/other-notification/error/yield/autonomous=");
+        for (index, value) in [calls, ticks / 1_000_000, hosted, call, timer,
+            other_notification, error, scheduler_yield, autonomous].into_iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(value);
+        }
+        print_str(b"\n");
+    }
 }
 
 fn print_periodic_census_heartbeat(n: u64, now: u64) {

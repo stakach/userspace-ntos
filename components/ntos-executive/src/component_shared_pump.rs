@@ -12,6 +12,17 @@ static ACTIVE_RETAINED_SEH_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static IRQ_IRP_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static IRQ_SYSCALL_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static IRQ_RETAINED_SEH_RECEIVES: AtomicU64 = AtomicU64::new(0);
+// Route-scoped File READ/WRITE receive observations. The physical transport and retained File IRP
+// are checked at the point of measurement; these counters are never used to make a routing choice.
+static FILE_RECEIVE_CALLS: AtomicU64 = AtomicU64::new(0);
+static FILE_RECEIVE_TICKS: AtomicU64 = AtomicU64::new(0);
+static FILE_RECEIVE_HOSTED: AtomicU64 = AtomicU64::new(0);
+static FILE_RECEIVE_CALL: AtomicU64 = AtomicU64::new(0);
+static FILE_RECEIVE_TIMER: AtomicU64 = AtomicU64::new(0);
+static FILE_RECEIVE_OTHER_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
+static FILE_RECEIVE_ERROR: AtomicU64 = AtomicU64::new(0);
+static FILE_RECEIVE_SCHEDULER_YIELD: AtomicU64 = AtomicU64::new(0);
+static FILE_RECEIVE_AUTONOMOUS: AtomicU64 = AtomicU64::new(0);
 static PS_CREATE_RECEIVE_TRACE: AtomicU64 = AtomicU64::new(0);
 static PS_CREATE_RECEIVE_EVENTS: AtomicU64 = AtomicU64::new(0);
 static PS_CREATE_AUTONOMOUS_EVENTS: AtomicU64 = AtomicU64::new(0);
@@ -144,6 +155,20 @@ pub(super) fn receive_census() -> (u64, u64, u64, u64, u64, u64) {
         IRQ_SYSCALL_RECEIVES.load(Ordering::Relaxed),
         IRQ_RETAINED_SEH_RECEIVES.load(Ordering::Relaxed),
     )
+}
+
+pub(super) fn file_receive_census() -> [u64; 9] {
+    [
+        FILE_RECEIVE_CALLS.load(Ordering::Relaxed),
+        FILE_RECEIVE_TICKS.load(Ordering::Relaxed),
+        FILE_RECEIVE_HOSTED.load(Ordering::Relaxed),
+        FILE_RECEIVE_CALL.load(Ordering::Relaxed),
+        FILE_RECEIVE_TIMER.load(Ordering::Relaxed),
+        FILE_RECEIVE_OTHER_NOTIFICATION.load(Ordering::Relaxed),
+        FILE_RECEIVE_ERROR.load(Ordering::Relaxed),
+        FILE_RECEIVE_SCHEDULER_YIELD.load(Ordering::Relaxed),
+        FILE_RECEIVE_AUTONOMOUS.load(Ordering::Relaxed),
+    ]
 }
 
 /// Run the established bounded IRQ/DPC scheduler while the exact dispatch remains parked.
@@ -350,6 +375,9 @@ pub(super) unsafe fn receive(
             }
             match runtime::next_autonomous() {
                 Ok(Some(sender)) => {
+                    if crate::driver_launch::file_rpc_pump_for_diagnostic(ch) {
+                        FILE_RECEIVE_AUTONOMOUS.fetch_add(1, Ordering::Relaxed);
+                    }
                     if let Ok(Some((reply, info))) = runtime::pending_route_snapshot(sender) {
                         trace_ps_create_event(b"autonomous-message", sender, reply, info);
                     }
@@ -373,6 +401,9 @@ pub(super) unsafe fn receive(
             && (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
             && crate::dispatcher_bootstrap::timer_work_pending();
         if timer_checkpoint && timer_probe_consumed {
+            if crate::driver_launch::file_rpc_pump_for_diagnostic(ch) {
+                FILE_RECEIVE_SCHEDULER_YIELD.fetch_add(1, Ordering::Relaxed);
+            }
             trace_ps_create_receive(ch, b"timer-yield", Some(route));
             return PumpMessage::scheduler_yield();
         }
@@ -398,8 +429,24 @@ pub(super) unsafe fn receive(
             }
         };
         trace_ps_create_receive(ch, b"physical-receive", Some(route));
+        let file_receive = crate::driver_launch::file_rpc_pump_for_diagnostic(ch);
+        let receive_started = if file_receive { crate::disk_census_ticks() } else { 0 };
         let arrival = runtime::receive(execution, ch.tcb,
             serviced_scheduler_yield || !timer_checkpoint);
+        if file_receive {
+            FILE_RECEIVE_CALLS.fetch_add(1, Ordering::Relaxed);
+            FILE_RECEIVE_TICKS.fetch_add(
+                crate::disk_census_ticks().wrapping_sub(receive_started), Ordering::Relaxed);
+            let counter = match &arrival {
+                Ok(runtime::Arrival::Hosted) => &FILE_RECEIVE_HOSTED,
+                Ok(runtime::Arrival::Call { .. }) => &FILE_RECEIVE_CALL,
+                Ok(runtime::Arrival::Notification(message))
+                    if crate::badge_has_delay_timer(message.badge()) => &FILE_RECEIVE_TIMER,
+                Ok(runtime::Arrival::Notification(_)) => &FILE_RECEIVE_OTHER_NOTIFICATION,
+                Err(_) => &FILE_RECEIVE_ERROR,
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
         match arrival {
             Ok(runtime::Arrival::Hosted) => {
                 trace_ps_create_receive(ch, b"hosted-arrival", Some(route));
@@ -416,6 +463,9 @@ pub(super) unsafe fn receive(
                 // The shared ingress has already proven NoCall with a free Reply. An empty
                 // nonblocking probe has no sender and must not count as watchdog progress.
                 if timer_checkpoint && message.badge() == 0 && message.info() == 0 {
+                    if file_receive {
+                        FILE_RECEIVE_SCHEDULER_YIELD.fetch_add(1, Ordering::Relaxed);
+                    }
                     return PumpMessage::scheduler_yield();
                 }
                 crate::census_tick_static(crate::monotonic_time_100ns());
@@ -439,6 +489,9 @@ pub(super) unsafe fn receive(
                     irq_checkpoint = true;
                 }
                 if !inline_irq_checkpoint && pump_scheduler_work_pending(ch, irq) {
+                    if file_receive {
+                        FILE_RECEIVE_SCHEDULER_YIELD.fetch_add(1, Ordering::Relaxed);
+                    }
                     trace_ps_create_receive(ch, b"scheduler-yield", Some(route));
                     return PumpMessage::scheduler_yield();
                 }

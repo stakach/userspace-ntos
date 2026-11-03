@@ -61874,6 +61874,7 @@ struct ActiveHostedIrpTransfer {
     output_cursor: BankedTransferCursor,
     bank_ticks: u64,
     measure_bank: bool,
+    diagnostic_file_rpc: bool,
 }
 
 static mut ACTIVE_HOSTED_IRP_TRANSFERS: Option<Vec<ActiveHostedIrpTransfer>> = None;
@@ -61942,6 +61943,8 @@ unsafe fn enter_active_hosted_irp_transfer(
         output_cursor: BankedTransferCursor::new(output.len() as u64),
         bank_ticks: 0,
         measure_bank,
+        diagnostic_file_rpc: measure_bank
+            && hosted_file_owners::file_read_write_dispatch_for_diagnostic(IrpId(transfer_id)),
     });
     Some(ActiveHostedIrpTransferGuard { depth })
 }
@@ -61953,6 +61956,18 @@ unsafe fn active_hosted_irp_transfer_mut(
     let transfers = (*core::ptr::addr_of_mut!(ACTIVE_HOSTED_IRP_TRANSFERS)).as_mut()?;
     let active = transfers.last_mut()?;
     (active.shared_va == shared_va && active.transfer_id == transfer_id).then_some(active)
+}
+
+/// Tag receive diagnostics only while the currently entered physical transport belongs to an
+/// exact retained File READ/WRITE dispatch. This does not grant access or alter dispatch routing.
+pub(crate) unsafe fn file_rpc_pump_for_diagnostic(ch: &crate::spawn_hosts::PumpChannel) -> bool {
+    let Some(transfers) = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS)).as_ref() else {
+        return false;
+    };
+    let Some(active) = transfers.last() else { return false; };
+    active.shared_va == ch.shared_va
+        && active.diagnostic_file_rpc
+        && ch.ingress_route.is_some()
 }
 
 #[allow(dead_code)]
