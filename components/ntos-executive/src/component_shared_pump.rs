@@ -428,31 +428,32 @@ pub(super) unsafe fn receive(
                 }
             }
         }
-        let timer_checkpoint;
-        {
-            let _stage = StageScope::enter(ch, Stage::TimerIrqPreflight);
-            timer_checkpoint = !retained_seh
-                && (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
-                && crate::dispatcher_bootstrap::timer_work_pending();
-            if timer_checkpoint && timer_probe_consumed {
-                if crate::driver_launch::file_rpc_pump_for_diagnostic(ch) {
-                    FILE_RECEIVE_SCHEDULER_YIELD.fetch_add(1, Ordering::Relaxed);
-                }
-                trace_ps_create_receive(ch, b"timer-yield", Some(route));
-                return PumpMessage::scheduler_yield();
+        let timer_irq_stage = StageScope::enter(ch, Stage::TimerIrqPreflight);
+        let timer_checkpoint = !retained_seh
+            && (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
+            && crate::dispatcher_bootstrap::timer_work_pending();
+        if timer_checkpoint && timer_probe_consumed {
+            if crate::driver_launch::file_rpc_pump_for_diagnostic(ch) {
+                FILE_RECEIVE_SCHEDULER_YIELD.fetch_add(1, Ordering::Relaxed);
             }
-            // A pending timer still gets its scheduler pass, but first give a newly arrived Call
-            // one nonblocking physical receive through the exact retained ingress owner.
-            timer_probe_consumed = timer_checkpoint;
-            if inline_irq_checkpoint && irq_checkpoint {
-                if service_inline_irq_checkpoint(ch, route).is_err() {
-                    crate::print_str(b"[pump-ingress] inline IRQ checkpoint lost its route\n");
-                    return PumpMessage::transport_wall();
-                }
-                irq_checkpoint = false;
-                continue;
-            }
+            trace_ps_create_receive(ch, b"timer-yield", Some(route));
+            return PumpMessage::scheduler_yield();
         }
+        // A pending timer still gets its scheduler pass, but first give a newly arrived Call
+        // one nonblocking physical receive through the exact retained ingress owner. Otherwise
+        // continuously republished timer demand can starve a worker's READY Call forever.
+        timer_probe_consumed = timer_checkpoint;
+        if inline_irq_checkpoint && irq_checkpoint {
+            if service_inline_irq_checkpoint(ch, route).is_err() {
+                crate::print_str(b"[pump-ingress] inline IRQ checkpoint lost its route\n");
+                return PumpMessage::transport_wall();
+            }
+            // Deferred IRQ bits may remain set. This pass belongs to the observed arrival only;
+            // inspect new Calls before waiting, then await another notification to retry.
+            irq_checkpoint = false;
+            continue;
+        }
+        drop(timer_irq_stage);
         let owner_result = {
             let _stage = StageScope::enter(ch, Stage::ReceiveOwner);
             runtime::receive_owner(route)
