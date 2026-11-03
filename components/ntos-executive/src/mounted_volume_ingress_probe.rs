@@ -6,7 +6,7 @@ use nt_io_abi::major;
 use nt_io_manager::{CreateParameters, ReadWriteParameters};
 use nt_types::UnicodeString;
 
-pub(crate) unsafe fn run(device_id: u64) -> bool {
+pub(crate) unsafe fn run(device_id: u64) -> (bool, bool) {
     let caller = crate::initial_system_driver_caller();
     let name = UnicodeString::from_str(crate::installed_layout::ARIAL_STR);
     let file = match crate::driver_launch::allocate_hosted_file(
@@ -17,9 +17,9 @@ pub(crate) unsafe fn run(device_id: u64) -> bool {
         name.as_units(),
     ) {
         Ok(file) => file,
-        Err(_) => return false,
+        Err(_) => return (false, false),
     };
-    let opened = (|| -> Result<bool, u32> {
+    let opened = (|| -> Result<(bool, bool), u32> {
         let mut input = Vec::new();
         input
             .try_reserve_exact(name.as_units().len() * 2)
@@ -41,7 +41,7 @@ pub(crate) unsafe fn run(device_id: u64) -> bool {
                 &input,
             )?;
         if status != 0 || pending.is_some() || context.is_none() {
-            return Ok(false);
+            return Ok((false, false));
         }
         let mut standard = [0u8; 24];
         let (status, information, pending, _) =
@@ -59,8 +59,29 @@ pub(crate) unsafe fn run(device_id: u64) -> bool {
             || pending.is_some()
             || u64::from_le_bytes(standard[8..16].try_into().unwrap()) < 4
         {
-            return Ok(false);
+            return Ok((false, false));
         }
+        let mut volume = [0u8; 64];
+        let volume_attribute = match
+            crate::driver_launch::dispatch_hosted_file_query_volume_information_irp_result_exact(
+                file,
+                caller,
+                nt_io_manager::QueryVolumeInformationParameters {
+                    information_class: nt_fs::FILE_FS_ATTRIBUTE_INFORMATION,
+                    length: volume.len() as u32,
+                },
+                &mut volume,
+            ) {
+                Ok((status, information, pending, _)) => status == 0
+                    && pending.is_none()
+                    && information == 22
+                    && u32::from_le_bytes(volume[0..4].try_into().unwrap())
+                        == (nt_fs::FILE_CASE_PRESERVED_NAMES | nt_fs::FILE_UNICODE_ON_DISK)
+                    && u32::from_le_bytes(volume[4..8].try_into().unwrap()) == 255
+                    && u32::from_le_bytes(volume[8..12].try_into().unwrap()) == 10
+                    && volume[12..22] == [b'F', 0, b'A', 0, b'T', 0, b'3', 0, b'2', 0],
+                Err(_) => false,
+            };
         let mut signature = [0u8; 4];
         let (status, information, pending, _) =
             crate::driver_launch::dispatch_hosted_file_read_write_irp_result_exact(
@@ -75,12 +96,13 @@ pub(crate) unsafe fn run(device_id: u64) -> bool {
                 &[],
                 &mut signature,
             )?;
-        Ok(status == 0
+        Ok((status == 0
             && information == signature.len() as u64
             && pending.is_none()
-            && signature == [0, 1, 0, 0])
+            && signature == [0, 1, 0, 0],
+            volume_attribute))
     })()
-    .unwrap_or(false);
+    .unwrap_or((false, false));
     let released = crate::driver_launch::release_hosted_file(file).is_ok();
     for _ in 0..4 {
         crate::driver_launch::pump_registered_file_lifecycle();
@@ -88,7 +110,8 @@ pub(crate) unsafe fn run(device_id: u64) -> bool {
             break;
         }
     }
-    opened && released && !crate::driver_launch::hosted_file_exists(file)
+    let retired = released && !crate::driver_launch::hosted_file_exists(file);
+    (opened.0 && retired, opened.1 && retired)
 }
 
 pub(crate) unsafe fn run_directory(device_id: u64) -> bool {

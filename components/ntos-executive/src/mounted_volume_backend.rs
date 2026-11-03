@@ -1359,6 +1359,35 @@ impl MountedVolumeBackend {
         })
     }
 
+    fn query_volume_information(
+        &self,
+        ctx: DispatchContext<'_>,
+        irp: &IrpProjection,
+    ) -> Result<DispatchOutcome, NtStatus> {
+        // Query the volume that owns the exact opened File, including its retained generation.
+        let _ = self.binding(irp)?;
+        let IoParameters::QueryVolumeInformation(parameters) = &irp.parameters else {
+            return Err(NtStatus::INVALID_PARAMETER);
+        };
+        if parameters.length as usize > ctx.system_buffer.len() {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let output = &mut ctx.system_buffer[..parameters.length as usize];
+        let result = unsafe {
+            crate::fat_volume_information::encode_query(
+                &self.fs,
+                parameters.information_class,
+                output,
+            )
+        }
+        .map_err(status)?;
+        Ok(DispatchOutcome::Completed {
+            status: status(result.status),
+            information: result.information as u64,
+            file_context: None,
+        })
+    }
+
     fn write(
         &mut self,
         ctx: DispatchContext<'_>,
@@ -1546,6 +1575,7 @@ impl DriverDispatchBackend for MountedVolumeBackend {
             major::IRP_MJ_FLUSH_BUFFERS => self.flush(irp),
             major::IRP_MJ_SET_INFORMATION => self.set_information(ctx, irp),
             major::IRP_MJ_QUERY_INFORMATION => self.query(ctx, irp),
+            major::IRP_MJ_QUERY_VOLUME_INFORMATION => self.query_volume_information(ctx, irp),
             major::IRP_MJ_DIRECTORY_CONTROL => self.query_directory(ctx, irp),
             major::IRP_MJ_CLEANUP => self.cleanup_or_close(irp, false),
             major::IRP_MJ_CLOSE => self.cleanup_or_close(irp, true),

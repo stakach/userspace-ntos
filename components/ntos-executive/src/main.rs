@@ -133,6 +133,7 @@ mod ipc_message;
 mod executive_ingress;
 mod executive_va;
 mod fs_loader;
+mod fat_volume_information;
 mod mounted_volume;
 mod mounted_volume_backend;
 mod mounted_volume_ingress_probe;
@@ -30775,11 +30776,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_str(b" load failed\n");
             }
         }
-        let mounted_volume_ingress_ok = mounted_volume_device_id
-            .is_some_and(|device_id| mounted_volume_ingress_probe::run(device_id));
+        let (mounted_volume_ingress_ok, mounted_volume_attribute_ok) = mounted_volume_device_id
+            .map(|device_id| mounted_volume_ingress_probe::run(device_id))
+            .unwrap_or((false, false));
         check(
             b"exec_mounted_volume_external_file_dispatch_font_read",
             mounted_volume_ingress_ok,
+            &mut passed,
+        );
+        check(
+            b"exec_mounted_volume_file_fs_attribute_information",
+            mounted_volume_attribute_ok,
             &mut passed,
         );
         let mounted_directory_open_ok = mounted_volume_device_id
