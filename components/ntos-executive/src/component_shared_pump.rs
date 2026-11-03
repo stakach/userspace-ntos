@@ -1,6 +1,7 @@
 //! Shared receiver routing for a currently entered component invocation.
 
 use super::shared_ingress::owner::runtime;
+use super::file_pump_diagnostic::{Stage, StageScope};
 use super::*;
 use nt_component_suspension::peer_registry::PeerRoute;
 
@@ -249,6 +250,7 @@ pub(super) unsafe fn receive(
         // retains the parent Call. Release its exact CM checkpoint and reserve before a
         // dependent registry writer retries; the generic outer finalizer cannot run here.
         if crate::writable_fs::system_wal_fold_ack_pending() {
+            let _stage = StageScope::enter(ch, Stage::NestedWork);
             let mut parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,
                 Err(_) => return PumpMessage::transport_wall(),
@@ -263,6 +265,7 @@ pub(super) unsafe fn receive(
         // Enter CM and native snapshot I/O here with the exact Receive parent parked; the
         // cadence gate prevents a recursive CM call from admitting the same fold again.
         if crate::service_sec_image::system_wal_fold_work_pending() {
+            let _stage = StageScope::enter(ch, Stage::NestedWork);
             trace_ps_create_event(b"fold-enter", route, 0, 0);
             let mut parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,
@@ -280,7 +283,9 @@ pub(super) unsafe fn receive(
                 Err(_) => return PumpMessage::transport_wall(),
             }
         }
+        let registry_stage = StageScope::enter(ch, Stage::Registry);
         let progressed = crate::registry_mutation_work::redrive_provider();
+        drop(registry_stage);
         // A retained CM mutation can use all sixteen steps and still have a local terminal
         // phase to run. Take another fair, bounded pass before entering a blocking Receive.
         // A stalled or ineligible owner returns false, so it cannot spin this pump.
@@ -288,6 +293,7 @@ pub(super) unsafe fn receive(
             continue;
         }
         if let Some(id) = crate::registry_mutation_work::pending_provider_header_recheck() {
+            let _stage = StageScope::enter(ch, Stage::NestedWork);
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             let mut parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,
@@ -300,6 +306,7 @@ pub(super) unsafe fn receive(
             if serviced != 0 { continue; }
         }
         if let Some(id) = crate::registry_mutation_work::pending_provider_native_wal_io() {
+            let _stage = StageScope::enter(ch, Stage::NestedWork);
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             let mut parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,
@@ -312,6 +319,7 @@ pub(super) unsafe fn receive(
             if serviced != 0 { continue; }
         }
         if crate::service_sec_image::nested_hosted_file_work_ready() {
+            let _stage = StageScope::enter(ch, Stage::NestedWork);
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             let mut parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,
@@ -324,7 +332,11 @@ pub(super) unsafe fn receive(
             if progressed { continue; }
         }
         trace_ps_create_receive(ch, b"retained-services", Some(route));
-        match runtime::resume_acknowledged_retained_services() {
+        let retained = {
+            let _stage = StageScope::enter(ch, Stage::RetainedService);
+            runtime::resume_acknowledged_retained_services()
+        };
+        match retained {
             Ok(true) => continue,
             Ok(false) => {}
             Err(_) => {
@@ -333,12 +345,20 @@ pub(super) unsafe fn receive(
             }
         }
         trace_ps_create_receive(ch, b"resume-service", Some(route));
-        if runtime::resume_service(route).is_err() {
+        let resumed = {
+            let _stage = StageScope::enter(ch, Stage::RouteResume);
+            runtime::resume_service(route)
+        };
+        if resumed.is_err() {
             crate::print_str(b"[pump-ingress] route resume failed\n");
             return PumpMessage::transport_wall();
         }
         trace_ps_create_receive(ch, b"route-next", Some(route));
-        let next = match runtime::next_message(route) {
+        let next_result = {
+            let _stage = StageScope::enter(ch, Stage::NextMessage);
+            runtime::next_message(route)
+        };
+        let next = match next_result {
             Ok(next) => next,
             Err(_) => {
                 crate::print_str(b"[pump-ingress] next-message failed\n");
@@ -373,7 +393,11 @@ pub(super) unsafe fn receive(
                     runtime::trace_autonomous_candidates();
                 }
             }
-            match runtime::next_autonomous() {
+            let autonomous = {
+                let _stage = StageScope::enter(ch, Stage::AutonomousSelect);
+                runtime::next_autonomous()
+            };
+            match autonomous {
                 Ok(Some(sender)) => {
                     if crate::driver_launch::file_rpc_pump_for_diagnostic(ch) {
                         FILE_RECEIVE_AUTONOMOUS.fetch_add(1, Ordering::Relaxed);
@@ -382,8 +406,11 @@ pub(super) unsafe fn receive(
                         trace_ps_create_event(b"autonomous-message", sender, reply, info);
                     }
                     trace_ps_create_receive(ch, b"autonomous-found", Some(sender));
-                    service_autonomous(sender)
-                        .expect("autonomous failure retains its own source and parent scope");
+                    {
+                        let _stage = StageScope::enter(ch, Stage::AutonomousService);
+                        service_autonomous(sender)
+                            .expect("autonomous failure retains its own source and parent scope");
+                    }
                     trace_ps_create_event(b"autonomous-return", sender, 0, 0);
                     trace_ps_create_receive(ch, b"autonomous-return", Some(sender));
                     PS_CREATE_AFTER_AUTONOMOUS_TRACE.store(1, Ordering::Relaxed);

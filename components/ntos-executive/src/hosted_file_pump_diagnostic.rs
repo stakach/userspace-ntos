@@ -6,11 +6,11 @@
 
 use super::*;
 
-const LABEL_BASE: u64 = 0x770;
-const LABEL_SLOTS: usize = 0x120;
-const OTHER_LABEL: usize = LABEL_SLOTS;
-const BUCKETS: usize = LABEL_SLOTS + 1;
+// Includes kernel fault labels and the currently registered hosted FSD service labels (<0x900).
+const OTHER_LABEL: usize = 0x900;
+const BUCKETS: usize = OTHER_LABEL + 1;
 const TOP_LABELS: usize = 6;
+const STAGES: usize = 7;
 
 static LABEL_COUNTS: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
 static LABEL_TICKS: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
@@ -18,11 +18,45 @@ static REPLY_CALLS: AtomicU64 = AtomicU64::new(0);
 static REPLY_TICKS: AtomicU64 = AtomicU64::new(0);
 static RECEIVE_CALLS: AtomicU64 = AtomicU64::new(0);
 static RECEIVE_TICKS: AtomicU64 = AtomicU64::new(0);
+static STAGE_COUNTS: [AtomicU64; STAGES] = [const { AtomicU64::new(0) }; STAGES];
+static STAGE_TICKS: [AtomicU64; STAGES] = [const { AtomicU64::new(0) }; STAGES];
 
 fn bucket(label: u64) -> usize {
-    label.checked_sub(LABEL_BASE)
-        .filter(|offset| *offset < LABEL_SLOTS as u64)
-        .map_or(OTHER_LABEL, |offset| offset as usize)
+    if label < OTHER_LABEL as u64 { label as usize } else { OTHER_LABEL }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Stage {
+    NestedWork,
+    Registry,
+    RetainedService,
+    RouteResume,
+    NextMessage,
+    AutonomousSelect,
+    AutonomousService,
+}
+
+pub(super) struct StageScope {
+    stage: Stage,
+    started: u64,
+}
+
+impl StageScope {
+    pub(super) unsafe fn enter(ch: &PumpChannel, stage: Stage) -> Option<Self> {
+        crate::driver_launch::file_rpc_pump_for_diagnostic(ch).then(|| Self {
+            stage,
+            started: crate::disk_census_ticks(),
+        })
+    }
+}
+
+impl Drop for StageScope {
+    fn drop(&mut self) {
+        let index = self.stage as usize;
+        STAGE_COUNTS[index].fetch_add(1, Ordering::Relaxed);
+        STAGE_TICKS[index].fetch_add(
+            crate::disk_census_ticks().wrapping_sub(self.started), Ordering::Relaxed);
+    }
 }
 
 pub(super) struct MessageCycle {
@@ -96,13 +130,23 @@ pub(super) fn print_census() {
         if best == OTHER_LABEL {
             crate::print_str(b"other");
         } else {
-            crate::print_str(b"0x");
-            crate::print_hex((LABEL_BASE + best as u64) as u32);
+            crate::print_hex(best as u32);
         }
         crate::print_str(b"/");
         crate::print_u64(LABEL_COUNTS[best].load(Ordering::Relaxed));
         crate::print_str(b"/");
         crate::print_u64(best_ticks / 1_000_000);
+    }
+    crate::print_str(b"\n");
+    crate::print_str(b"[census] file-recv-stage count/ticks-M:");
+    for (index, name) in [b"nested".as_slice(), b"registry", b"retained", b"route",
+        b"next-message", b"autonomous-select", b"autonomous-service"].iter().enumerate() {
+        crate::print_str(b" ");
+        crate::print_str(name);
+        crate::print_str(b"=");
+        crate::print_u64(STAGE_COUNTS[index].load(Ordering::Relaxed));
+        crate::print_str(b"/");
+        crate::print_u64(STAGE_TICKS[index].load(Ordering::Relaxed) / 1_000_000);
     }
     crate::print_str(b"\n");
 }
