@@ -1,5 +1,7 @@
 #[path = "../../../components/ntos-executive/src/scsi_srb_pump_owner.rs"]
 mod scsi_srb_pump_owner;
+#[path = "../../../components/ntos-executive/src/scsi_srb_scheduler_service.rs"]
+mod scsi_srb_scheduler_service;
 
 use scsi_srb_pump_owner::{
     ScsiSrbPumpOwnerIdentity, ScsiSrbPumpOwners, ScsiSrbPumpStage, ScsiSrbPumpTimeline,

@@ -194,6 +194,9 @@ mod hosted_file_owners;
 #[path = "scsi_srb_pump_phase.rs"]
 mod scsi_srb_pump_phase;
 use scsi_srb_pump_phase::ScsiSrbPumpPhase;
+#[path = "scsi_srb_scheduler_service.rs"]
+mod scsi_srb_scheduler_service;
+use scsi_srb_scheduler_service::SchedulerServicePhase;
 #[path = "scsi_srb_pump_owner.rs"]
 mod scsi_srb_pump_owner;
 use scsi_srb_pump_owner::{ScsiSrbPumpOwnerIdentity, ScsiSrbPumpOwners, ScsiSrbPumpStage};
@@ -72958,6 +72961,22 @@ fn print_scsi_srb_pump_timing() {
         print_str(stage.label());
         print_str(b"="); print_u64(count);
         print_str(b"/"); print_u64(ticks / 1_000_000);
+    }
+    print_str(b"\n");
+    let (passes, empty, timer_work, irq_lines, dpcs) =
+        SCSI_SRB_PUMP_OWNERS.scheduler_service_summary();
+    print_str(b"[scsi-srb-scheduler] inclusive passes/empty/timer-work/irq-lines/dpcs=");
+    print_u64(passes); print_str(b"/");
+    print_u64(empty); print_str(b"/");
+    print_u64(timer_work); print_str(b"/");
+    print_u64(irq_lines); print_str(b"/");
+    print_u64(dpcs);
+    for phase in SchedulerServicePhase::ALL {
+        let (_, ticks) = SCSI_SRB_PUMP_OWNERS.scheduler_service_phase_total(phase);
+        print_str(b" ");
+        print_str(phase.label());
+        print_str(b"-M=");
+        print_u64(ticks / 1_000_000);
     }
     print_str(b"\n");
     let overflow = SCSI_SRB_PUMP_OWNERS.overflow_count();

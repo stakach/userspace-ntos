@@ -69,16 +69,24 @@ impl ComponentSchedulerScope {
 
     /// Caller has retained the exact yielded invocation before any scheduler effect. A kernel
     /// caller must also have claimed its canonical receive attempt and released coordinator borrows.
-    pub(crate) unsafe fn service_irq_yield(&self, shared_va: u64) {
+    pub(crate) unsafe fn service_irq_yield(
+        &self, shared_va: u64,
+    ) -> scsi_srb_scheduler_service::SchedulerServiceSample {
+        use scsi_srb_scheduler_service::{SchedulerServiceClock, SchedulerServicePhase};
+        let mut clock = SchedulerServiceClock::new(crate::disk_census_ticks());
         let _message = crate::ipc_message::SavedMessageBuffer::capture();
         let _durable = crate::allocator::enter_durable();
         let mut parent = crate::spawn_hosts::shared_ingress::owner::runtime::nested::park_current()
             .expect("IRQ scheduling must preserve its exact parent invocation");
         let yield_number = YIELDS.fetch_add(1, Ordering::Relaxed) + 1;
+        clock.transition(SchedulerServicePhase::TimerWork, crate::disk_census_ticks());
         crate::dispatcher_bootstrap::request_receive_checkpoint();
         let timer_work = crate::dispatcher_bootstrap::service_hosted_timer_work();
+        clock.transition(SchedulerServicePhase::IrqDrain, crate::disk_census_ticks());
         let irq_lines = drain_pending_hosted_irqs_snapshot();
+        clock.transition(SchedulerServicePhase::DpcDrain, crate::disk_census_ticks());
         let dpcs = drain_hosted_driver_dpcs();
+        clock.transition(SchedulerServicePhase::ReceivePrepare, crate::disk_census_ticks());
         // Nested exchanges may reconcile earlier requests before these effects publish new demand.
         crate::dispatcher_bootstrap::request_receive_checkpoint();
         crate::dispatcher_bootstrap::prepare_receive()
@@ -111,8 +119,10 @@ impl ComponentSchedulerScope {
             }
             print_str(b"\n");
         }
+        clock.transition(SchedulerServicePhase::ParentRestore, crate::disk_census_ticks());
         crate::spawn_hosts::shared_ingress::owner::runtime::nested::restore(&mut parent)
             .expect("IRQ scheduling must restore its retained parent invocation");
+        clock.finish(crate::disk_census_ticks(), timer_work, irq_lines, dpcs)
     }
 }
 
@@ -203,7 +213,10 @@ unsafe fn hosted_component_pump_inner(
         }
         trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 2, Some(&result));
         trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 2, Some(&result));
-        scope.service_irq_yield(channel.shared_va);
+        let service_sample = scope.service_irq_yield(channel.shared_va);
+        if let Some(owner) = observed_owner {
+            owner.record_scheduler_service(service_sample);
+        }
         trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 3, Some(&result));
         trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 3, Some(&result));
         if route.is_some() {

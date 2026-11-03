@@ -4,6 +4,7 @@
 //! consulted to authorize dispatch, completion, or retirement.
 
 use core::sync::atomic::{AtomicU64, Ordering};
+use super::scsi_srb_scheduler_service::{SchedulerServicePhase, SchedulerServiceSample};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -127,6 +128,12 @@ pub(crate) struct ScsiSrbPumpOwners<const N: usize> {
     overflow: AtomicU64,
     stage_counts: [AtomicU64; 7],
     stage_ticks: [AtomicU64; 7],
+    scheduler_passes: AtomicU64,
+    scheduler_empty: AtomicU64,
+    scheduler_timer_work: AtomicU64,
+    scheduler_irq_lines: AtomicU64,
+    scheduler_dpcs: AtomicU64,
+    scheduler_phase_ticks: [AtomicU64; 6],
 }
 
 impl<const N: usize> ScsiSrbPumpOwners<N> {
@@ -136,6 +143,12 @@ impl<const N: usize> ScsiSrbPumpOwners<N> {
             overflow: AtomicU64::new(0),
             stage_counts: [const { AtomicU64::new(0) }; 7],
             stage_ticks: [const { AtomicU64::new(0) }; 7],
+            scheduler_passes: AtomicU64::new(0),
+            scheduler_empty: AtomicU64::new(0),
+            scheduler_timer_work: AtomicU64::new(0),
+            scheduler_irq_lines: AtomicU64::new(0),
+            scheduler_dpcs: AtomicU64::new(0),
+            scheduler_phase_ticks: [const { AtomicU64::new(0) }; 6],
         }
     }
 
@@ -179,11 +192,41 @@ impl<const N: usize> ScsiSrbPumpOwners<N> {
         (self.stage_counts[index].load(Ordering::Relaxed),
             self.stage_ticks[index].load(Ordering::Relaxed))
     }
+
+    pub(crate) fn scheduler_service_summary(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.scheduler_passes.load(Ordering::Relaxed),
+            self.scheduler_empty.load(Ordering::Relaxed),
+            self.scheduler_timer_work.load(Ordering::Relaxed),
+            self.scheduler_irq_lines.load(Ordering::Relaxed),
+            self.scheduler_dpcs.load(Ordering::Relaxed),
+        )
+    }
+
+    pub(crate) fn scheduler_service_phase_total(&self, phase: SchedulerServicePhase) -> (u64, u64) {
+        (self.scheduler_passes.load(Ordering::Relaxed),
+            self.scheduler_phase_ticks[phase as usize].load(Ordering::Relaxed))
+    }
 }
 
 pub(crate) struct ScsiSrbPumpOwnerClaim<'a, const N: usize> {
     slot: &'a Slot,
     _pool: &'a ScsiSrbPumpOwners<N>,
+}
+
+impl<const N: usize> ScsiSrbPumpOwnerClaim<'_, N> {
+    pub(crate) fn record_scheduler_service(&self, sample: SchedulerServiceSample) {
+        self._pool.scheduler_passes.fetch_add(1, Ordering::Relaxed);
+        self._pool.scheduler_empty.fetch_add(u64::from(sample.is_empty()), Ordering::Relaxed);
+        let (timer_work, irq_lines, dpcs) = sample.work_counts();
+        self._pool.scheduler_timer_work.fetch_add(timer_work, Ordering::Relaxed);
+        self._pool.scheduler_irq_lines.fetch_add(irq_lines, Ordering::Relaxed);
+        self._pool.scheduler_dpcs.fetch_add(dpcs, Ordering::Relaxed);
+        for phase in SchedulerServicePhase::ALL {
+            self._pool.scheduler_phase_ticks[phase as usize]
+                .fetch_add(sample.ticks(phase), Ordering::Relaxed);
+        }
+    }
 }
 
 impl<const N: usize> Drop for ScsiSrbPumpOwnerClaim<'_, N> {
