@@ -24,6 +24,42 @@ static NATIVE_PENDING_STARTED: AtomicU64 = AtomicU64::new(0);
 static NATIVE_PENDING_BYTES: AtomicU64 = AtomicU64::new(0);
 static NATIVE_PENDING_SOURCE: AtomicU64 = AtomicU64::new(0);
 
+// Measurement only: authenticated metadata bytes are copied after terminal/ACK, but every
+// request still enters the physical route. This measures whether repeat lookups justify a
+// read-through cache without changing the mounted File or SCSI ownership contract.
+type MetadataKey = (u64, nt_pnp_context::native_storage_handoff::StorageHandoffKey);
+static mut METADATA_SHADOW: nt_fs::InstalledMetadataSectorCache<MetadataKey, 512> =
+    nt_fs::InstalledMetadataSectorCache::new();
+static mut METADATA_SHADOW_ROUTE: Option<MetadataKey> = None;
+
+struct MetadataShadowCensus {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+}
+
+impl MetadataShadowCensus {
+    const fn new() -> Self {
+        Self { hits: AtomicU64::new(0), misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0) }
+    }
+
+    fn print(&self, kind: &[u8]) {
+        print_str(b"[census] native-metadata-shadow kind=");
+        print_str(kind);
+        print_str(b" hits/misses/evictions=");
+        print_u64(self.hits.load(Ordering::Relaxed));
+        print_str(b"/");
+        print_u64(self.misses.load(Ordering::Relaxed));
+        print_str(b"/");
+        print_u64(self.evictions.load(Ordering::Relaxed));
+        print_str(b"\n");
+    }
+}
+
+static METADATA_CREATE_SHADOW: MetadataShadowCensus = MetadataShadowCensus::new();
+static METADATA_DIRECTORY_SHADOW: MetadataShadowCensus = MetadataShadowCensus::new();
+
 /// Diagnostic timings only. These atomics can be sampled from a nested completion pump without
 /// borrowing the retained physical command or changing its admission and ACK ownership.
 struct PhaseCensus {
@@ -76,6 +112,9 @@ fn record_inter_command_gap(claim_started_ticks: u64) {
 
 pub(super) fn print_census() {
     crate::mounted_volume::print_mounted_create_census();
+    // Census can run in a nested completion pump: only observe atomics here.
+    METADATA_CREATE_SHADOW.print(b"create");
+    METADATA_DIRECTORY_SHADOW.print(b"directory");
     let published = native_disk_relation::native_storage_route();
     let retained = native_disk_relation::retained_native_storage_recheck_route();
     print_str(b"[mounted-route-census] phase=");
@@ -290,6 +329,51 @@ impl WorkClaim {
     }
 }
 
+fn metadata_sector(claim: &WorkClaim) -> Option<(u32, &'static MetadataShadowCensus)> {
+    match claim {
+        WorkClaim::Sector(SectorClaim::Create(claim)) =>
+            Some((claim.request.sector, &METADATA_CREATE_SHADOW)),
+        WorkClaim::Sector(SectorClaim::Directory(claim)) =>
+            Some((claim.request.sector, &METADATA_DIRECTORY_SHADOW)),
+        WorkClaim::Sector(SectorClaim::Overlay(_) | SectorClaim::Read(_))
+        | WorkClaim::Snapshot(_) => None,
+    }
+}
+
+unsafe fn metadata_shadow_for(route: native_disk_relation::NativeStorageRoute)
+    -> &'static mut nt_fs::InstalledMetadataSectorCache<MetadataKey, 512>
+{
+    let key = (route.mount.value(), route.key);
+    let cache = &mut *core::ptr::addr_of_mut!(METADATA_SHADOW);
+    let active = &mut *core::ptr::addr_of_mut!(METADATA_SHADOW_ROUTE);
+    if *active != Some(key) {
+        cache.invalidate();
+        *active = Some(key);
+    }
+    cache
+}
+
+unsafe fn observe_metadata_shadow(
+    route: native_disk_relation::NativeStorageRoute, claim: &WorkClaim,
+) {
+    let Some((sector, census)) = metadata_sector(claim) else { return; };
+    let key = (route.mount.value(), route.key);
+    let hit = metadata_shadow_for(route).lookup(key, sector).is_some();
+    if hit { census.hits.fetch_add(1, Ordering::Relaxed); }
+    else { census.misses.fetch_add(1, Ordering::Relaxed); }
+}
+
+unsafe fn publish_metadata_shadow(
+    route: native_disk_relation::NativeStorageRoute, claim: &WorkClaim, bytes: &[u8],
+) {
+    let Some((sector, census)) = metadata_sector(claim) else { return; };
+    let Ok(bytes) = <&[u8; 512]>::try_from(bytes) else { return; };
+    let key = (route.mount.value(), route.key);
+    if metadata_shadow_for(route).publish(key, sector, bytes) {
+        census.evictions.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 struct Terminal {
     status: nt_status::NtStatus,
     packet: Vec<u8>,
@@ -409,6 +493,12 @@ fn settle(pending: Pending, terminal: Terminal) {
     } else {
         crate::fs_loader::complete_exec_native_block_failure(pending.ticket)
             .expect("exact failed native block ticket lost");
+    }
+    // Returned commands are terminal inline; pending commands reach settle only after the
+    // authenticated completion and strict ACK in poll_pending. Never publish a refused or
+    // malformed packet, and never shadow writable overlay, file data, or snapshot sectors.
+    if let Ok(bytes) = &result {
+        unsafe { publish_metadata_shadow(pending.route, &pending.claim, bytes) };
     }
     pending.claim.complete(result);
     let finished = crate::disk_census_ticks();
@@ -656,6 +746,7 @@ unsafe fn dispatch_claim(
             claim.mark_entered();
             crate::fs_loader::mark_entered_exec_native_block(ticket)
                 .expect("returned native block ticket lost");
+            observe_metadata_shadow(route, &claim);
             let (_, packet) = buffers.into_parts();
             settle(Pending { claim, ticket, route, command, irp: irp_id,
                 requestor_tid, terminal: None, started_ticks, dispatch_returned_ticks,
@@ -670,6 +761,7 @@ unsafe fn dispatch_claim(
             claim.mark_entered();
             crate::fs_loader::mark_entered_exec_native_block(ticket)
                 .expect("pending native block ticket lost");
+            observe_metadata_shadow(route, &claim);
             let source = claim.source();
             let bytes = command.data_len();
             *core::ptr::addr_of_mut!(PENDING) = Some(Pending {
