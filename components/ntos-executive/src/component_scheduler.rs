@@ -129,22 +129,33 @@ impl Drop for ComponentSchedulerScope {
 pub(super) unsafe fn hosted_component_pump(
     channel: &crate::spawn_hosts::PumpChannel,
 ) -> crate::spawn_hosts::PumpResult {
-    hosted_component_pump_inner(channel, None)
+    hosted_component_pump_inner(channel, None, None)
 }
 
 pub(super) unsafe fn hosted_component_pump_with_caller(
     channel: &crate::spawn_hosts::PumpChannel,
     caller: nt_process::native_handle::NativeHandleCaller,
 ) -> crate::spawn_hosts::PumpResult {
-    hosted_component_pump_inner(channel, Some(caller))
+    hosted_component_pump_inner(channel, Some(caller), None)
+}
+
+pub(super) unsafe fn hosted_component_pump_observed(
+    channel: &crate::spawn_hosts::PumpChannel,
+    caller: Option<nt_process::native_handle::NativeHandleCaller>,
+    owner: &scsi_srb_pump_owner::ScsiSrbPumpOwnerClaim<'_, SCSI_SRB_PUMP_OWNER_SLOTS>,
+) -> crate::spawn_hosts::PumpResult {
+    hosted_component_pump_inner(channel, caller, Some(owner))
 }
 
 unsafe fn hosted_component_pump_inner(
     channel: &crate::spawn_hosts::PumpChannel,
     caller: Option<nt_process::native_handle::NativeHandleCaller>,
+    observed_owner: Option<&scsi_srb_pump_owner::ScsiSrbPumpOwnerClaim<'_, SCSI_SRB_PUMP_OWNER_SLOTS>>,
 ) -> crate::spawn_hosts::PumpResult {
     use crate::spawn_hosts::shared_ingress::owner::runtime;
     let mut channel = *channel;
+    let mut timeline = observed_owner.map(|owner|
+        scsi_srb_pump_owner::ScsiSrbPumpTimeline::new(owner, crate::disk_census_ticks()));
     let route = runtime::channel_route(&channel).expect("physical hosted ingress identity");
     let mut parent = if channel.initial == crate::spawn_hosts::InitialAction::ReplyRequest {
         let parent = runtime::nested::park_current().expect("retain nested hosted parent");
@@ -158,6 +169,10 @@ unsafe fn hosted_component_pump_inner(
     } else {
         None
     };
+    if let Some(timeline) = timeline.as_mut() {
+        timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::Setup,
+            crate::disk_census_ticks());
+    }
     let channel = &mut channel;
     let _registry_caller = caller.map(|caller| {
         crate::provider_registry_caller::Scope::enter(channel, caller)
@@ -174,10 +189,18 @@ unsafe fn hosted_component_pump_inner(
             .map(|words| words[0]);
     trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 0, None);
     trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 0, None);
+    if let Some(timeline) = timeline.as_mut() {
+        timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::ProviderPump,
+            crate::disk_census_ticks());
+    }
     let mut result = crate::spawn_hosts::component_pump(channel);
     trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 1, Some(&result));
     trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 1, Some(&result));
     while result.scheduler_yielded {
+        if let Some(timeline) = timeline.as_mut() {
+            timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::SchedulerService,
+                crate::disk_census_ticks());
+        }
         trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 2, Some(&result));
         trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 2, Some(&result));
         scope.service_irq_yield(channel.shared_va);
@@ -189,6 +212,10 @@ unsafe fn hosted_component_pump_inner(
         if let Some(route) = route {
             channel.reply_cap = runtime::current_reply(route).expect("retained canonical Reply");
         }
+        if let Some(timeline) = timeline.as_mut() {
+            timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::ReceiveContinuation,
+                crate::disk_census_ticks());
+        }
         result = crate::spawn_hosts::component_pump_continue_receive_after_scheduler_service(
             channel, &result)
             .expect("hosted IRQ yield must retain its exact receive continuation");
@@ -196,6 +223,10 @@ unsafe fn hosted_component_pump_inner(
         trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 4, Some(&result));
     }
     if result.completed {
+        if let Some(timeline) = timeline.as_mut() {
+            timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::Completion,
+                crate::disk_census_ticks());
+        }
         trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 5, Some(&result));
         trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 5, Some(&result));
         let route = route.expect("hosted completion requires enrolled source");
@@ -223,8 +254,15 @@ unsafe fn hosted_component_pump_inner(
     }
     trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 7, Some(&result));
     trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 7, Some(&result));
+    if let Some(timeline) = timeline.as_mut() {
+        timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::Restore,
+            crate::disk_census_ticks());
+    }
     runtime::nested::restore(&mut parent).expect("restore nested hosted parent");
     trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 8, Some(&result));
     trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 8, Some(&result));
+    if let Some(timeline) = timeline {
+        timeline.finish(crate::disk_census_ticks());
+    }
     result
 }

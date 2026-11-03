@@ -196,7 +196,7 @@ mod scsi_srb_pump_phase;
 use scsi_srb_pump_phase::ScsiSrbPumpPhase;
 #[path = "scsi_srb_pump_owner.rs"]
 mod scsi_srb_pump_owner;
-use scsi_srb_pump_owner::{ScsiSrbPumpOwnerIdentity, ScsiSrbPumpOwners};
+use scsi_srb_pump_owner::{ScsiSrbPumpOwnerIdentity, ScsiSrbPumpOwners, ScsiSrbPumpStage};
 
 pub(crate) fn print_hosted_file_rpc_phase() {
     hosted_file_owners::print_rpc_phase();
@@ -72951,6 +72951,15 @@ fn print_scsi_srb_pump_timing() {
         print_u64(ticks.load(Ordering::Relaxed) / 1_000_000);
     }
     print_str(b" Mtick\n");
+    print_str(b"[scsi-srb-stage] inclusive count/ticks-M");
+    for stage in ScsiSrbPumpStage::ALL {
+        let (count, ticks) = SCSI_SRB_PUMP_OWNERS.stage_total(stage);
+        print_str(b" ");
+        print_str(stage.label());
+        print_str(b"="); print_u64(count);
+        print_str(b"/"); print_u64(ticks / 1_000_000);
+    }
+    print_str(b"\n");
     let overflow = SCSI_SRB_PUMP_OWNERS.overflow_count();
     if overflow != 0 {
         print_str(b"[scsi-srb-owner] overflow=");
@@ -72958,7 +72967,7 @@ fn print_scsi_srb_pump_timing() {
         print_str(b"\n");
     }
     for slot in 0..SCSI_SRB_PUMP_OWNER_SLOTS {
-        let Some(owner) = SCSI_SRB_PUMP_OWNERS.snapshot(slot) else { continue; };
+        let Some((owner, stage)) = SCSI_SRB_PUMP_OWNERS.snapshot_with_stage(slot) else { continue; };
         print_str(b"[scsi-srb-owner] slot/seq/inst=");
         print_u64(slot as u64);
         print_str(b"/"); print_u64(owner.sequence);
@@ -72976,6 +72985,8 @@ fn print_scsi_srb_pump_timing() {
         print_hex64(owner.route_endpoint);
         print_str(b" entered-Mtick=");
         print_u64(owner.entered_ticks / 1_000_000);
+        print_str(b" phase=");
+        print_str(stage.map_or(b"none".as_slice(), ScsiSrbPumpStage::label));
         print_str(b"\n");
     }
 }
@@ -73480,9 +73491,10 @@ unsafe fn dispatch_irp_for_instance_exact(
             entered_ticks: crate::disk_census_ticks(),
         }));
     scsi_srb_pump_timing.enter_pump();
-    let pr = match caller {
-        Some(caller) => component_scheduler::hosted_component_pump_with_caller(&ch, caller),
-        None => hosted_component_pump(&ch),
+    let pr = match (scsi_srb_pump_owner.as_ref(), caller) {
+        (Some(owner), caller) => component_scheduler::hosted_component_pump_observed(&ch, caller, owner),
+        (None, Some(caller)) => component_scheduler::hosted_component_pump_with_caller(&ch, caller),
+        (None, None) => hosted_component_pump(&ch),
     };
     scsi_srb_pump_timing.exit_pump();
     drop(scsi_srb_pump_owner);

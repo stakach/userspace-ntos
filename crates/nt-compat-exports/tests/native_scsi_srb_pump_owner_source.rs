@@ -24,7 +24,7 @@ fn scsi_owner_is_published_after_transfer_admission_and_retires_after_pump() {
 fn nested_census_samples_only_atomic_scsi_owner_slots() {
     let print = SOURCE.split("fn print_scsi_srb_pump_timing()").nth(1).unwrap()
         .split("unsafe fn dispatch_irp_for_instance_exact(").next().unwrap();
-    assert!(print.contains("SCSI_SRB_PUMP_OWNERS.snapshot("),
+    assert!(print.contains("SCSI_SRB_PUMP_OWNERS.snapshot_with_stage("),
         "RED: nested census needs stable per-owner atomic snapshots");
     assert!(print.contains("SCSI_SRB_PUMP_OWNERS.overflow_count()"));
     assert!(!print.contains("active_hosted_irp_transfer_mut(")
