@@ -47,6 +47,7 @@ impl MountedVolumeBackend {
                         .get(binding.directory_open.ok_or(NtStatus::INVALID_HANDLE)?)
                         .map_err(status)?.volume_relative_path()),
                     nt_fs::LayeredOpenSource::Overlay { .. } => None,
+                    nt_fs::LayeredOpenSource::Volume => return Err(NtStatus::INVALID_DEVICE_REQUEST),
                 };
                 let source = directory_source::capture_directory_source(
                     record.source, record.name, installed_path,
@@ -102,6 +103,7 @@ impl MountedVolumeBackend {
                 }
             }
             let overlay = match record.source {
+                nt_fs::LayeredOpenSource::Volume => return Err(NtStatus::INVALID_DEVICE_REQUEST),
                 nt_fs::LayeredOpenSource::Overlay { file_id } => {
                     if !binding.overlay_open {
                         return Err(NtStatus::INVALID_HANDLE);

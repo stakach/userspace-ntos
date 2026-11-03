@@ -39,6 +39,8 @@ pub fn join_layered_relative_name_into(
 /// The source selected by CREATE. Later operations must not repeat namespace lookup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayeredOpenSource {
+    /// An exact empty-name open of the mounted volume, distinct from its root directory.
+    Volume,
     Installed {
         first_cluster: u32,
         metadata: FileMetadata,
@@ -386,6 +388,23 @@ mod tests {
                 name: &[b'x' as u16]
             })
         );
+    }
+
+    #[test]
+    fn volume_file_keeps_its_own_generation_and_is_not_a_named_file() {
+        let mut table = LayeredOpenTable::<1>::new();
+        let volume = table.insert(17, LayeredOpenSource::Volume, &[]).unwrap();
+        assert_eq!(table.get(volume, 17).unwrap().source, LayeredOpenSource::Volume);
+        assert_eq!(table.get(volume, 17).unwrap().name, &[]);
+        assert_eq!(
+            LayeredOpenSource::Volume.file_internal_index(1),
+            Err(STATUS_DATA_ERROR),
+        );
+        assert_eq!(table.release(volume, 17), Ok(LayeredOpenSource::Volume));
+        let next = table.insert(18, LayeredOpenSource::Volume, &[]).unwrap();
+        assert_ne!(volume, next);
+        assert_eq!(table.get(volume, 17), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.get(next, 18).unwrap().source, LayeredOpenSource::Volume);
     }
 
     #[test]

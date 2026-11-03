@@ -14,6 +14,7 @@ pub(crate) fn capture_directory_source(
     installed_path: Option<&[u8]>,
 ) -> Result<DirectorySource, u32> {
     match source {
+        LayeredOpenSource::Volume => Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST),
         LayeredOpenSource::Installed { .. } => {
             let path = installed_path.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
             let mut relative = Vec::new();

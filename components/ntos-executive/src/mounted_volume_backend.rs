@@ -118,6 +118,8 @@ fn capture_manager_owned_query_fields(
 #[derive(Clone, Copy)]
 struct MountedBinding {
     context: nt_fs::LayeredOpenContextId,
+    /// A volume File participates in volume sharing until CLEANUP; its context remains until CLOSE.
+    volume_share: Option<nt_fs::FileShareAccess>,
     installed_open: Option<u32>,
     installed_handle_open: bool,
     directory_open: Option<u32>,
@@ -226,7 +228,6 @@ impl MountedVolumeBackend {
             return Err(NtStatus::INVALID_PARAMETER);
         };
         if parameters.ea_length != 0
-            || irp.create_case_sensitive
             || parameters.create_options.bits() & nt_fs::FILE_OPEN_BY_FILE_ID != 0
         {
             return Err(NtStatus::NOT_SUPPORTED);
@@ -264,6 +265,15 @@ impl MountedVolumeBackend {
         } else {
             name.as_units()
         };
+        // An empty FILE_OBJECT.FileName without a related File opens the volume itself.
+        // It has no component whose spelling could be folded; a single '\\' names the root
+        // directory and continues through ordinary path lookup below.
+        if units.is_empty() && parameters.related_file.is_none() {
+            return self.create_volume(file_id.raw(), units, parameters);
+        }
+        if irp.create_case_sensitive {
+            return Err(NtStatus::NOT_SUPPORTED);
+        }
         // The retained full name is device-relative; the bounded FAT canonicalizer is only used
         // for lookup and sharing, not to replace the child's FILE_OBJECT spelling.
         let relative_name = units.strip_prefix(&[b'\\' as u16]).unwrap_or(units);
@@ -312,6 +322,51 @@ impl MountedVolumeBackend {
             CreateDecision::Dispatch(outcome) => Ok(outcome),
             CreateDecision::Prepare(_) => unreachable!("Boot CREATE does not prepare native I/O"),
         }
+    }
+
+    fn create_volume(
+        &mut self,
+        file_id: u64,
+        units: &[u16],
+        parameters: &nt_io_manager::CreateParameters,
+    ) -> Result<DispatchOutcome, NtStatus> {
+        let options = parameters.create_options.bits();
+        if options & nt_fs::FILE_DIRECTORY_FILE != 0 {
+            return Err(status(nt_fs::STATUS_NOT_A_DIRECTORY));
+        }
+        if !matches!(parameters.create_disposition, nt_fs::FILE_OPEN | nt_fs::FILE_OPEN_IF) {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
+        let requested = nt_fs::FileShareAccess::new(
+            parameters.desired_access.bits(), parameters.share_access.bits(),
+        );
+        if self.bindings.iter().flatten().filter_map(|binding| binding.volume_share)
+            .any(|existing| !requested.compatible_with(existing))
+        {
+            return Err(status(nt_fs::STATUS_SHARING_VIOLATION));
+        }
+        let context = self.reserve_open_context(file_id, units)?;
+        self.opens.finish(context, file_id, nt_fs::LayeredOpenSource::Volume)
+            .expect("reserved volume File context");
+        let index = context_index(context).expect("bounded layered context");
+        self.bindings[index] = Some(MountedBinding {
+            context,
+            volume_share: Some(requested),
+            installed_open: None,
+            installed_handle_open: false,
+            directory_open: None,
+            overlay_open: false,
+            is_directory: false,
+            granted_access: parameters.desired_access.bits(),
+            create_options: options,
+            installed_directory_cluster: None,
+            directory_query: nt_fs::DirectoryQueryState::default(),
+        });
+        Ok(DispatchOutcome::Completed {
+            status: NtStatus::SUCCESS,
+            information: nt_fs::FILE_OPENED as u64,
+            file_context: Some(context.raw()),
+        })
     }
 
     fn create_decided(
@@ -665,7 +720,7 @@ impl MountedVolumeBackend {
                 let index = context_index(context).expect("bounded layered context");
                 debug_assert!(self.bindings[index].is_none());
                 self.bindings[index] = Some(MountedBinding {
-                    context, installed_open: None, installed_handle_open: false,
+                    context, volume_share: None, installed_open: None, installed_handle_open: false,
                     directory_open: None, overlay_open: true,
                     is_directory: captured.spec.is_directory,
                     granted_access: captured.owner.parameters.desired_access.bits(),
@@ -887,6 +942,7 @@ impl MountedVolumeBackend {
         debug_assert!(self.bindings[index].is_none());
         self.bindings[index] = Some(MountedBinding {
             context,
+            volume_share: None,
             installed_open: None,
             installed_handle_open: false,
             directory_open: Some(directory_open),
@@ -954,6 +1010,7 @@ impl MountedVolumeBackend {
         debug_assert!(self.bindings[index].is_none());
         self.bindings[index] = Some(MountedBinding {
             context,
+            volume_share: None,
             installed_open: Some(installed_open),
             installed_handle_open: true,
             directory_open: None,
@@ -1071,6 +1128,7 @@ impl MountedVolumeBackend {
         debug_assert!(self.bindings[index].is_none());
         self.bindings[index] = Some(MountedBinding {
             context,
+            volume_share: None,
             installed_open: None,
             installed_handle_open: false,
             directory_open: None,
@@ -1263,6 +1321,7 @@ impl MountedVolumeBackend {
         let file_id = irp.file_id.ok_or(NtStatus::INVALID_PARAMETER)?;
         let record = self.opens.get(context, file_id.raw()).map_err(status)?;
         let (metadata, alternate_name, current_offset, mode) = match record.source {
+            nt_fs::LayeredOpenSource::Volume => return Err(NtStatus::INVALID_DEVICE_REQUEST),
             nt_fs::LayeredOpenSource::Installed {
                 metadata,
                 alternate_name,
@@ -1503,6 +1562,9 @@ impl MountedVolumeBackend {
     ) -> Result<DispatchOutcome, NtStatus> {
         let (context, binding) = self.binding(irp)?;
         let index = context_index(context).ok_or(NtStatus::INVALID_HANDLE)?;
+        if binding.volume_share.is_some() {
+            self.bindings[index].as_mut().expect("validated binding").volume_share = None;
+        }
         if binding.installed_handle_open {
             let installed_open = binding.installed_open.ok_or(NtStatus::INVALID_HANDLE)?;
             self.shares.release(installed_open).map_err(status)?;

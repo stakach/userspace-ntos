@@ -30789,6 +30789,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             mounted_volume_attribute_ok,
             &mut passed,
         );
+        let mounted_volume_root_open_ok = mounted_volume_device_id
+            .is_some_and(|device_id| mounted_volume_ingress_probe::run_volume_open(device_id));
+        check(
+            b"exec_mounted_volume_case_sensitive_volume_open",
+            mounted_volume_root_open_ok,
+            &mut passed,
+        );
         let mounted_directory_open_ok = mounted_volume_device_id
             .is_some_and(|device_id| mounted_volume_ingress_probe::run_directory(device_id));
         check(
