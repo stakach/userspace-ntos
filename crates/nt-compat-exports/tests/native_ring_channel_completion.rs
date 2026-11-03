@@ -29,7 +29,7 @@ fn owned_object_manager_request_returns_with_its_exact_completion_pending() {
     calls.visit_block(body);
     assert!(!calls.synchronous_raw,
         "an owned directory request must not block its parent pump in the synchronous SURT wait");
-    for method in ["begin", "try_push", "notify_consumer"] {
+    for method in ["begin_owned", "try_push", "notify_consumer"] {
         assert!(calls.methods.iter().any(|call| call == method),
             "owned submission must {method} before returning its exact pending identity");
     }
@@ -37,58 +37,25 @@ fn owned_object_manager_request_returns_with_its_exact_completion_pending() {
         "the Object Manager adapter must use the nonblocking owned submit path");
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct Reply {
-    status: u32,
-    payload: [u8; 4],
-}
-
 #[test]
-fn nested_wait_preserves_outer_completion_and_its_payload() {
-    let mut inbox = CompletionInbox::new();
+fn parked_outer_completion_survives_a_borrowed_frame() {
+    let mut inbox = CompletionInbox::<[u8; 4]>::new();
     let outer = 41;
     let nested = 42;
-
-    // The outer CQE can arrive while the nested wait is consuming the same completion ring.
+    assert!(inbox.begin_owned(outer));
+    assert_eq!(inbox.park_active_owned(outer, *b"OUTR"), Ok(()));
+    assert!(inbox.begin(nested));
     assert_eq!(
-        inbox.accept(
-            nested,
-            outer,
-            Reply {
-                status: 0,
-                payload: *b"OUTR",
-            },
-        ),
-        None
-    );
-    assert_eq!(
-        inbox.accept(
-            nested,
-            nested,
-            Reply {
-                status: 0,
-                payload: *b"NEST",
-            },
-        ),
-        Some(Reply {
-            status: 0,
-            payload: *b"NEST",
-        })
-    );
-
-    assert_eq!(
-        inbox.take(outer),
-        Some(Reply {
-            status: 0,
-            payload: *b"OUTR",
-        }),
+        inbox.take_parked_owned(outer),
+        Some(*b"OUTR"),
         "outer completion and payload must remain available to the outer request"
     );
+    assert_eq!(inbox.active_request(), Some(nested));
 }
 
 #[test]
 fn shared_request_frame_rejects_nested_submission_until_owner_finishes() {
-    let mut inbox = CompletionInbox::<Reply>::new();
+    let mut inbox = CompletionInbox::<[u8; 4]>::new();
     assert!(inbox.begin(41));
     assert!(!inbox.begin(42), "nested request must not overwrite the outer request frame");
     inbox.finish(41);

@@ -15008,6 +15008,8 @@ struct RingChannel<'a> {
     rep_vaddr: u64,
     next_id: u64,
     completion_inbox: ring_channel_completion::CompletionInbox<OwnedSurtCompletion>,
+    owned_capture: Option<Vec<u8>>,
+    raw_capture: Vec<u8>,
 }
 struct OwnedSurtCompletion {
     cqe: SurtCqe,
@@ -15026,8 +15028,7 @@ static SURT_CLIENT_WAIT_WAKES: AtomicU64 = AtomicU64::new(0);
 const SURT_STATUS_INVALID_BUFFER_SIZE: i32 = 0xC000_0206u32 as i32;
 
 impl RingChannel<'_> {
-    /// Retain the exact completion identity when the synchronous transport
-    /// yields without a terminal CQE.
+    /// Preserve the exact request identity if a synchronous retained call loses its wait.
     fn raw_owned(
         &mut self,
         opcode: u16,
@@ -15037,13 +15038,18 @@ impl RingChannel<'_> {
         if in_buf.len() > REP_DATA_LEN {
             return RingCallOutcome::NoEffect(SURT_STATUS_INVALID_BUFFER_SIZE);
         }
-        if self.completion_inbox.active_request().is_some() {
+        if self.completion_inbox.active_request().is_some()
+            || self.completion_inbox.has_parked_owned() {
             return RingCallOutcome::NoEffect(nt_status::NtStatus::DEVICE_BUSY.raw());
         }
         let request_id = self.next_id;
-        let (status, flags, information, detail0, detail1) =
-            self.raw(opcode, in_buf, out_buf);
-        if self.completion_inbox.active_request() == Some(request_id) {
+        let (status, flags, information, detail0, detail1) = self.raw(opcode, in_buf, out_buf);
+        if self.next_id == request_id {
+            RingCallOutcome::NoEffect(status)
+        } else if self.completion_inbox.active_request() == Some(request_id) {
+            // `raw` reserved this reply capacity before publishing its SQE. An
+            // interrupted wait transfers that capacity to the exact later poll.
+            self.owned_capture = Some(core::mem::take(&mut self.raw_capture));
             RingCallOutcome::Indeterminate { request_id }
         } else {
             RingCallOutcome::Completed(status, flags, information, detail0, detail1)
@@ -15063,10 +15069,17 @@ impl RingChannel<'_> {
         if self.completion_inbox.active_request().is_some() {
             return RingCallOutcome::NoEffect(nt_status::NtStatus::DEVICE_BUSY.raw());
         }
+        // Reserve the entire reply frame before publication. No allocation failure after
+        // a CQE may discard an owned terminal or authorize reuse of its shared frame.
+        let mut capture = Vec::new();
+        if capture.try_reserve_exact(REP_DATA_LEN).is_err() {
+            return RingCallOutcome::NoEffect(nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw());
+        }
         let request_id = self.next_id;
-        if !self.completion_inbox.begin(request_id) {
+        if !self.completion_inbox.begin_owned(request_id) {
             return RingCallOutcome::NoEffect(nt_status::NtStatus::DEVICE_BUSY.raw());
         }
+        self.owned_capture = Some(capture);
         self.next_id = self.next_id.checked_add(1).expect("SURT request identity exhausted");
         // The active request owns both shared frames until its exact CQE is polled.
         unsafe {
@@ -15084,12 +15097,58 @@ impl RingChannel<'_> {
         };
         if self.sq.try_push(sqe).is_err() {
             self.completion_inbox.finish(request_id);
+            self.owned_capture = None;
             return RingCallOutcome::NoEffect(nt_status::NtStatus::DEVICE_BUSY.raw());
         }
         // Once the SQE is visible, a failed or uncertain notification cannot
         // make this request replayable; the owner must poll its exact receipt.
         let _ = self.sq.notify_consumer(&self.signal);
         RingCallOutcome::Indeterminate { request_id }
+    }
+
+    fn copy_owned_terminal(&mut self, cqe: SurtCqe) -> OwnedSurtCompletion {
+        let mut payload = self.owned_capture.take()
+            .expect("published SURT owned request must retain its reply capacity");
+        let n = (cqe.information as usize).min(REP_DATA_LEN);
+        payload.resize(n, 0);
+        unsafe {
+            let src = self.rep_vaddr as *const u8;
+            for (index, slot) in payload.iter_mut().enumerate() {
+                *slot = core::ptr::read_volatile(src.add(index));
+            }
+        }
+        OwnedSurtCompletion { cqe, payload }
+    }
+
+    /// Settle the existing owned effect before a borrowed call needs the shared frames.
+    /// The original ObjectClient owner consumes the parked result on its later exact poll.
+    fn park_owned_terminal_before_raw(&mut self) -> bool {
+        if self.completion_inbox.unexpected_receipt().is_some() { return false; }
+        let Some(request_id) = self.completion_inbox.active_request() else { return true; };
+        if self.owned_capture.is_none() { return false; }
+        loop {
+            if WATCHDOG_TRIPPED.load(Ordering::Acquire) == 2 { return false; }
+            match self.cq.try_pop() {
+                Ok(Some(cqe)) => {
+                    let completed_id = cqe.request_id;
+                    let terminal = self.copy_owned_terminal(cqe);
+                    if completed_id != request_id {
+                        self.completion_inbox.quarantine_unexpected(completed_id, terminal)
+                            .unwrap_or_else(|_| panic!("SURT unexpected terminal already retained"));
+                        return false;
+                    }
+                    self.completion_inbox.park_active_owned(request_id, terminal)
+                        .unwrap_or_else(|_| panic!("SURT owned terminal could not be parked"));
+                    return true;
+                }
+                Ok(None) => match self.cq.prepare_wait() {
+                    Ok(WaitDecision::Ready) => {}
+                    Ok(WaitDecision::Block) => unsafe { self.wait_completion_timer_aware() },
+                    Err(_) => return false,
+                },
+                Err(_) => return false,
+            }
+        }
     }
 
     /// Retire only the exact in-flight request. A missing or unusable CQE keeps
@@ -15099,37 +15158,28 @@ impl RingChannel<'_> {
         request_id: u64,
         out_buf: &mut [u8],
     ) -> Option<(i32, u32, u64, u64, u64)> {
-        assert_eq!(self.completion_inbox.active_request(), Some(request_id));
-        let completion = if let Some(owned) = self.completion_inbox.take(request_id) {
-            Some(owned)
-        } else {
-            match self.cq.try_pop() {
-                Ok(Some(mut cqe)) => {
-                    let mut payload = Vec::new();
-                    let n = (cqe.information as usize).min(REP_DATA_LEN);
-                    if payload.try_reserve_exact(n).is_err() {
-                        // The CQE itself is exact and terminal. Preserve its
-                        // identity and detail words, but never expose success
-                        // without the payload that the service returned.
-                        cqe.status = nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw();
-                        cqe.information = 0;
-                    } else {
-                        payload.resize(n, 0);
-                        unsafe {
-                            let src = self.rep_vaddr as *const u8;
-                            for (index, slot) in payload.iter_mut().enumerate() {
-                                *slot = core::ptr::read_volatile(src.add(index));
-                            }
-                        }
-                    }
-                    self.completion_inbox.accept(
-                        request_id,
-                        cqe.request_id,
-                        OwnedSurtCompletion { cqe, payload },
-                    )
+        if self.completion_inbox.unexpected_receipt().is_some() { return None; }
+        if let Some(completion) = self.completion_inbox.take_parked_owned(request_id) {
+            let cqe = completion.cqe;
+            let n = (cqe.information as usize).min(out_buf.len()).min(completion.payload.len());
+            out_buf[..n].copy_from_slice(&completion.payload[..n]);
+            return Some((cqe.status, cqe.flags, cqe.information, cqe.detail0, cqe.detail1));
+        }
+        if self.completion_inbox.active_request() != Some(request_id) {
+            return None;
+        }
+        let completion = match self.cq.try_pop() {
+            Ok(Some(cqe)) => {
+                let completed_id = cqe.request_id;
+                let terminal = self.copy_owned_terminal(cqe);
+                if completed_id != request_id {
+                    self.completion_inbox.quarantine_unexpected(completed_id, terminal)
+                        .unwrap_or_else(|_| panic!("SURT unexpected terminal already retained"));
+                    return None;
                 }
-                Ok(None) | Err(_) => None,
+                Some(terminal)
             }
+            Ok(None) | Err(_) => None,
         }?;
         let cqe = completion.cqe;
         let n = (cqe.information as usize)
@@ -15146,6 +15196,15 @@ impl RingChannel<'_> {
     fn raw(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> (i32, u32, u64, u64, u64) {
         if in_buf.len() > REP_DATA_LEN {
             return (SURT_STATUS_INVALID_BUFFER_SIZE, 0, 0, 0, 0);
+        }
+        if !self.park_owned_terminal_before_raw() {
+            return (nt_status::NtStatus::DEVICE_BUSY.raw(), 0, 0, 0, 0);
+        }
+        // A foreign CQE is unexpected with a single shared frame. Reserve its complete
+        // reply before submission so its bytes can be quarantined without allocation.
+        if self.raw_capture.capacity() < REP_DATA_LEN
+            && self.raw_capture.try_reserve_exact(REP_DATA_LEN).is_err() {
+            return (nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw(), 0, 0, 0, 0);
         }
         let id = self.next_id;
         if !self.completion_inbox.begin(id) {
@@ -15178,40 +15237,24 @@ impl RingChannel<'_> {
                 out.0 = nt_status::NtStatus::UNSUCCESSFUL.raw();
                 break;
             }
-            if let Some(owned) = self.completion_inbox.take(id) {
-                let cqe = owned.cqe;
-                out = (cqe.status, cqe.flags, cqe.information, cqe.detail0, cqe.detail1);
-                let n = (cqe.information as usize).min(out_buf.len()).min(owned.payload.len());
-                out_buf[..n].copy_from_slice(&owned.payload[..n]);
-                completed = true;
-                break;
-            }
             match self.cq.try_pop() {
                 Ok(Some(cqe)) => {
                     if cqe.request_id != id {
-                        // Capture the payload before another service call can reuse the reply
-                        // frame. The inbox preserves the exact request identity and bytes.
-                        let mut captured = cqe;
-                        let n = (captured.information as usize).min(REP_DATA_LEN);
-                        let mut payload = Vec::new();
-                        if payload.try_reserve_exact(n).is_err() {
-                            captured.status = nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw();
-                            captured.information = 0;
-                        } else {
-                            payload.resize(n, 0);
-                            unsafe {
-                                let src = self.rep_vaddr as *const u8;
-                                for (i, slot) in payload.iter_mut().enumerate() {
-                                    *slot = core::ptr::read_volatile(src.add(i));
-                                }
+                        let n = (cqe.information as usize).min(REP_DATA_LEN);
+                        let mut unexpected_payload = core::mem::take(&mut self.raw_capture);
+                        unexpected_payload.resize(n, 0);
+                        unsafe {
+                            let src = self.rep_vaddr as *const u8;
+                            for (i, slot) in unexpected_payload.iter_mut().enumerate() {
+                                *slot = core::ptr::read_volatile(src.add(i));
                             }
                         }
-                        let _ = self.completion_inbox.accept(
-                            id,
-                            captured.request_id,
-                            OwnedSurtCompletion { cqe: captured, payload },
-                        );
-                        continue;
+                        self.completion_inbox.quarantine_unexpected(
+                            cqe.request_id,
+                            OwnedSurtCompletion { cqe, payload: unexpected_payload },
+                        ).unwrap_or_else(|_| panic!("SURT unexpected terminal already retained"));
+                        out.0 = nt_status::NtStatus::DEVICE_BUSY.raw();
+                        break;
                     }
                     out = (cqe.status, cqe.flags, cqe.information, cqe.detail0, cqe.detail1);
                     let n = (cqe.information as usize).min(out_buf.len()).min(REP_DATA_LEN);
@@ -27916,6 +27959,8 @@ unsafe fn stand_up_service(
         rep_vaddr: rep_v,
         next_id: 1,
         completion_inbox: ring_channel_completion::CompletionInbox::new(),
+        owned_capture: None,
+        raw_capture: Vec::new(),
     }
 }
 
