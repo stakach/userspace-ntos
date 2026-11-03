@@ -22,6 +22,8 @@ pub(crate) mod shared_ingress;
 
 #[path = "component_shared_pump.rs"]
 mod shared_pump;
+#[path = "hosted_file_pump_diagnostic.rs"]
+mod file_pump_diagnostic;
 #[path = "hosted_seh_pump.rs"]
 mod hosted_seh_pump;
 
@@ -1552,6 +1554,10 @@ pub(crate) fn file_receive_census() -> [u64; 9] {
     shared_pump::file_receive_census()
 }
 
+pub(crate) fn print_file_pump_census() {
+    file_pump_diagnostic::print_census();
+}
+
 pub(crate) fn ps_create_parent_progress() -> (u64, u64, u64) {
     shared_pump::ps_create_parent_progress()
 }
@@ -1815,13 +1821,16 @@ unsafe fn pump_recv(ch: &PumpChannel, _reply_cap: u64) -> PumpMessage {
 unsafe fn pump_recv_with_scheduler_checkpoint(
     ch: &PumpChannel, serviced_scheduler_yield: bool,
 ) -> PumpMessage {
-    match shared_ingress::owner::runtime::channel_route(ch) {
+    let started = file_pump_diagnostic::start(ch);
+    let result = match shared_ingress::owner::runtime::channel_route(ch) {
         Ok(Some(route)) => shared_pump::receive(ch, route, false, serviced_scheduler_yield),
         Err(_) | Ok(None) => {
             crate::print_str(b"[pump-ingress] channel route unavailable\n");
             PumpMessage::transport_wall()
         }
-    }
+    };
+    file_pump_diagnostic::record_receive(started);
+    result
 }
 
 /// A handler exchange cannot shed its one-shot walk or its parent IRP at a scheduler checkpoint.
@@ -1906,7 +1915,9 @@ unsafe fn pump_reply_recv4_traced(
         crate::print_hex(reply_r0 as u32);
         crate::print_str(b"\n");
     }
+    let reply_started = file_pump_diagnostic::start(ch);
     let sent = shared_pump::reply(ch, reply_cap, reply_msginfo, [reply_r0, reply_r1, reply_r2, reply_r3]);
+    file_pump_diagnostic::record_reply(reply_started);
     if trace_system_thread_reply {
         crate::print_str(b"[driver-thread-reply] sent=");
         crate::print_u64(u64::from(sent));
@@ -2630,6 +2641,7 @@ unsafe fn component_pump_loop(
             break;
         }
         let label = msg.label();
+        let _file_cycle = file_pump_diagnostic::MessageCycle::enter(ch, label);
         crate::driver_launch::trace_port_connect_worker_message(
             ch.tcb, *reply_cap, msg.mi, msg.badge,
             [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4], seh.retained(),

@@ -7066,6 +7066,7 @@ fn print_shared_receive_census() {
         }
         print_str(b"\n");
     }
+    spawn_hosts::print_file_pump_census();
 }
 
 fn print_periodic_census_heartbeat(n: u64, now: u64) {
