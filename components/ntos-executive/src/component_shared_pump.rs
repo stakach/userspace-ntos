@@ -218,6 +218,7 @@ pub(super) unsafe fn receive(
     loop {
         trace_ps_create_receive(ch, b"loop", Some(route));
         if !retained_seh {
+            let _stage = StageScope::enter(ch, Stage::YieldPreflight);
             match crate::win32k_glue::prepare_receive_yield(ch) {
                 Ok(Some(yielded)) => {
                     trace_ps_create_receive(ch, b"receive-yield", Some(route));
@@ -373,9 +374,12 @@ pub(super) unsafe fn receive(
             }
             trace_ps_create_event(b"parent-message", route, reply, message.info());
             let completion = message.info() >> 12 == ch.dispatch_label;
-            if !completion && runtime::adopt(route, reply).is_err() {
-                crate::print_str(b"[pump-ingress] Call adoption failed\n");
-                return PumpMessage::transport_wall();
+            {
+                let _stage = StageScope::enter(ch, Stage::CallAdoption);
+                if !completion && runtime::adopt(route, reply).is_err() {
+                    crate::print_str(b"[pump-ingress] Call adoption failed\n");
+                    return PumpMessage::transport_wall();
+                }
             }
             let mut message = PumpMessage::from_received(message);
             if !completion {
@@ -424,31 +428,36 @@ pub(super) unsafe fn receive(
                 }
             }
         }
-        let timer_checkpoint = !retained_seh
-            && (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
-            && crate::dispatcher_bootstrap::timer_work_pending();
-        if timer_checkpoint && timer_probe_consumed {
-            if crate::driver_launch::file_rpc_pump_for_diagnostic(ch) {
-                FILE_RECEIVE_SCHEDULER_YIELD.fetch_add(1, Ordering::Relaxed);
+        let timer_checkpoint;
+        {
+            let _stage = StageScope::enter(ch, Stage::TimerIrqPreflight);
+            timer_checkpoint = !retained_seh
+                && (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
+                && crate::dispatcher_bootstrap::timer_work_pending();
+            if timer_checkpoint && timer_probe_consumed {
+                if crate::driver_launch::file_rpc_pump_for_diagnostic(ch) {
+                    FILE_RECEIVE_SCHEDULER_YIELD.fetch_add(1, Ordering::Relaxed);
+                }
+                trace_ps_create_receive(ch, b"timer-yield", Some(route));
+                return PumpMessage::scheduler_yield();
             }
-            trace_ps_create_receive(ch, b"timer-yield", Some(route));
-            return PumpMessage::scheduler_yield();
-        }
-        // A pending timer still gets its scheduler pass, but first give a newly arrived Call
-        // one nonblocking physical receive through the exact retained ingress owner. Otherwise
-        // continuously republished timer demand can starve a worker's READY Call forever.
-        timer_probe_consumed = timer_checkpoint;
-        if inline_irq_checkpoint && irq_checkpoint {
-            if service_inline_irq_checkpoint(ch, route).is_err() {
-                crate::print_str(b"[pump-ingress] inline IRQ checkpoint lost its route\n");
-                return PumpMessage::transport_wall();
+            // A pending timer still gets its scheduler pass, but first give a newly arrived Call
+            // one nonblocking physical receive through the exact retained ingress owner.
+            timer_probe_consumed = timer_checkpoint;
+            if inline_irq_checkpoint && irq_checkpoint {
+                if service_inline_irq_checkpoint(ch, route).is_err() {
+                    crate::print_str(b"[pump-ingress] inline IRQ checkpoint lost its route\n");
+                    return PumpMessage::transport_wall();
+                }
+                irq_checkpoint = false;
+                continue;
             }
-            // Deferred IRQ bits may remain set. This pass belongs to the observed arrival only;
-            // inspect new Calls before waiting, then await another notification to retry.
-            irq_checkpoint = false;
-            continue;
         }
-        let execution = match runtime::receive_owner(route) {
+        let owner_result = {
+            let _stage = StageScope::enter(ch, Stage::ReceiveOwner);
+            runtime::receive_owner(route)
+        };
+        let execution = match owner_result {
             Ok(execution) => execution,
             Err(_) => {
                 crate::print_str(b"[pump-ingress] receive owner failed\n");
