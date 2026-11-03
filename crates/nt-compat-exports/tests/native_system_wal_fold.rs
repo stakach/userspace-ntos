@@ -57,7 +57,8 @@ fn v2_fold_owns_cm_checkpoint_and_exact_reserve_until_two_slots_and_rollover() {
     let ready = complete.find("Cursor::Rollover(cursor) =>").unwrap();
     assert!(first < reused && reused < second && second < rollover && rollover < ready,
         "both slots must use the same owned capture before optional rollover");
-    assert!(complete.contains("AsyncSnapshotCommit::new(active.lease.store(), image,")
+    assert!(stage.contains("AsyncSnapshotCommit::new_from_rechecked_pair(")
+        && complete.contains("AsyncSnapshotCommit::new_from_verified_pair(")
         && complete.contains("publish_ready(active, None, pair)")
         && complete.contains("publish_ready(active, Some(next), pair)"),
         "small and rollover folds must retain the exact pair until CM acknowledgement");
