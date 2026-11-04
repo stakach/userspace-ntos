@@ -142,6 +142,11 @@ impl PartitionIo {
         }
         let sector_bytes = read_unaligned((self.buffer + 20) as *const u32);
         let disk_bytes = read_unaligned((self.buffer + 24) as *const u64);
+        print_str(b"[partition-geometry-payload] sector/disk=");
+        print_u64(u64::from(sector_bytes));
+        print_str(b"/");
+        print_u64(disk_bytes);
+        print_str(b"\n");
         if !(512..=65_536).contains(&sector_bytes)
             || !sector_bytes.is_power_of_two()
             || disk_bytes < u64::from(sector_bytes) * 2
