@@ -431,6 +431,9 @@ pub(super) unsafe fn before_external_scsi_effect(
         IoParameters::Scsi(parameters) if metadata_disk(parameters.route) == metadata_disk(route.scsi) =>
             nt_fs::PossibleScsiEffect::from_legacy_srb(&parameters.srb),
         IoParameters::Read(_) if targets_disk => nt_fs::PossibleScsiEffect::ProvenReadOnly,
+        IoParameters::DeviceControl(parameters) if targets_disk =>
+            nt_fs::PossibleScsiEffect::from_storage_ioctl(
+                parameters.ioctl_code, parameters.input_len, parameters.output_len),
         _ if targets_disk => nt_fs::PossibleScsiEffect::PossiblyMutating,
         _ => return,
     };

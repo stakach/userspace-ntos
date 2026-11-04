@@ -38,6 +38,18 @@ pub enum PossibleScsiEffect {
 }
 
 impl PossibleScsiEffect {
+    /// Classify the exact external storage property query from its canonical control shape.
+    /// The caller must first authenticate the physical disk stack; other controls may mutate
+    /// media even when their access bits appear read-only.
+    pub fn from_storage_ioctl(ioctl_code: u32, input_len: u32, output_len: u32) -> Self {
+        const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002d_1400;
+        if ioctl_code == IOCTL_STORAGE_QUERY_PROPERTY && input_len >= 12 && output_len >= 8 {
+            Self::ProvenReadOnly
+        } else {
+            Self::PossiblyMutating
+        }
+    }
+
     /// Classify only the pointer-free legacy SRB/CDB encodings used by the native block route.
     /// The Executive must first authenticate the route and validate the canonical transfer
     /// buffers. Any unfamiliar command or malformed scalar is a possible media mutation.

@@ -1,5 +1,23 @@
 use nt_fs::{InstalledMetadataReadThroughFence, PhysicalSectorRange, PossibleScsiEffect};
 
+#[test]
+fn only_storage_property_query_is_proven_read_only_device_control() {
+    // FILE_DEVICE_MASS_STORAGE, function 0x500, buffered, any access.
+    assert_eq!(PossibleScsiEffect::from_storage_ioctl(0x002d_1400, 12, 8),
+        PossibleScsiEffect::ProvenReadOnly);
+    assert_eq!(PossibleScsiEffect::from_storage_ioctl(0x002d_1400, 12, 64),
+        PossibleScsiEffect::ProvenReadOnly);
+    assert_eq!(PossibleScsiEffect::from_storage_ioctl(0x002d_1400, 11, 8),
+        PossibleScsiEffect::PossiblyMutating);
+    assert_eq!(PossibleScsiEffect::from_storage_ioctl(0x002d_1400, 12, 7),
+        PossibleScsiEffect::PossiblyMutating);
+    // The adjacent property-set control and unknown controls cannot keep copied metadata live.
+    assert_eq!(PossibleScsiEffect::from_storage_ioctl(0x002d_93fc, 12, 8),
+        PossibleScsiEffect::PossiblyMutating);
+    assert_eq!(PossibleScsiEffect::from_storage_ioctl(0x002d_1401, 12, 8),
+        PossibleScsiEffect::PossiblyMutating);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Disk { controller: u64, physical_pdo: u64 }
 
