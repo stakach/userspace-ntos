@@ -6,7 +6,42 @@ use crate::mounted_create_owner_snapshot::{OwnerKey, OwnerSnapshot, Phase};
 static LAST: OwnerSnapshot = OwnerSnapshot::new();
 static PARK_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static ACK_TIMING_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static LOOKUP_PROGRESS_SAMPLES: AtomicU64 = AtomicU64::new(0);
 const ACK_TIMING_SAMPLE_LIMIT: u64 = 64;
+
+/// Join one exact lookup's settled work to the already published File CREATE owner.
+/// Bounded samples reveal a slow lookup while it is still pending; they do not retain
+/// any provider command, reply, or second owner ledger.
+pub(crate) fn lookup_progress(
+    irp: u64, physical_mount: u64,
+    attribution: crate::mounted_volume_backend::mounted_create_lookup::CreateLookupAttribution,
+) {
+    let owner = LAST.read().filter(|owner| {
+        owner.key.irp == irp && owner.key.physical == physical_mount
+    });
+    let ordinal = LOOKUP_PROGRESS_SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
+    if ordinal > ACK_TIMING_SAMPLE_LIMIT && !ordinal.is_power_of_two() { return; }
+    let now = crate::monotonic_time_100ns();
+    crate::print_str(b"[mounted-create-lookup] irp/mount/cache-copies/physical-settlements/park-elapsed-ms/owner-phase/t_ms=");
+    crate::print_hex_u64(irp);
+    crate::print_str(b"/");
+    crate::print_u64(physical_mount);
+    crate::print_str(b"/");
+    crate::print_u64(attribution.copied_cache_completions);
+    crate::print_str(b"/");
+    crate::print_u64(attribution.physical_settlements);
+    crate::print_str(b"/");
+    print_elapsed_ms(owner.map(|owner| owner.parked_100ns), Some(now));
+    crate::print_str(b"/");
+    if let Some(owner) = owner {
+        crate::print_u64(owner.phase as u64);
+    } else {
+        crate::print_str(b"-");
+    }
+    crate::print_str(b"/");
+    crate::print_u64(now / 10_000);
+    crate::print_str(b"\n");
+}
 
 fn print_elapsed_ms(start: Option<u64>, end: Option<u64>) {
     match start.zip(end).and_then(|(start, end)| end.checked_sub(start)) {

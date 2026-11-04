@@ -19,8 +19,18 @@ pub(crate) struct ResolvedCreate<P> {
     pub mount: u64,
     pub payload: P,
     pub result: Result<CreateLookupFound, FatPathError>,
+    pub attribution: CreateLookupAttribution,
     lookup: Option<FatPathLookup>,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CreateLookupAttribution {
+    pub copied_cache_completions: u64,
+    pub physical_settlements: u64,
+}
+
+#[derive(Clone, Copy)]
+enum CompletionSource { Cached, Physical, Unattributed }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CreateLookupFound {
@@ -36,6 +46,7 @@ struct Entry<P> {
     lookup: Option<FatPathLookup>,
     claimed: Option<FatPathRequest>,
     result: Option<Result<CreateLookupFound, FatPathError>>,
+    attribution: CreateLookupAttribution,
 }
 
 pub(crate) struct CreateLookupQueue<P> {
@@ -73,7 +84,8 @@ impl<P> CreateLookupQueue<P> {
             return Err(CreateLookupError::Duplicate);
         }
         self.entries.try_reserve(1).map_err(|_| CreateLookupError::NoCapacity)?;
-        self.entries.push(Entry { irp, mount, payload: Some(payload), lookup: Some(lookup), claimed: None, result: None });
+        self.entries.push(Entry { irp, mount, payload: Some(payload), lookup: Some(lookup), claimed: None,
+            result: None, attribution: CreateLookupAttribution::default() });
         Ok(())
     }
 
@@ -86,7 +98,8 @@ impl<P> CreateLookupQueue<P> {
         }
         self.entries.try_reserve(1).map_err(|_| CreateLookupError::NoCapacity)?;
         self.entries.push(Entry { irp, mount, payload: Some(payload), lookup: None,
-            claimed: None, result: Some(Ok(CreateLookupFound::Root)) });
+            claimed: None, result: Some(Ok(CreateLookupFound::Root)),
+            attribution: CreateLookupAttribution::default() });
         Ok(())
     }
 
@@ -101,7 +114,8 @@ impl<P> CreateLookupQueue<P> {
         }
         self.entries.try_reserve(1).map_err(|_| CreateLookupError::NoCapacity)?;
         self.entries.push(Entry { irp, mount, payload: Some(payload), lookup: None,
-            claimed: None, result: Some(Ok(CreateLookupFound::DeferredBoot)) });
+            claimed: None, result: Some(Ok(CreateLookupFound::DeferredBoot)),
+            attribution: CreateLookupAttribution::default() });
         Ok(())
     }
 
@@ -137,15 +151,49 @@ impl<P> CreateLookupQueue<P> {
         Ok(())
     }
 
-    /// Feed only bytes from the exact completed native read. A failure keeps the owner for
-    /// terminal CREATE completion; no ambiguous command is replayed through this method.
+    /// Preserve the existing unattributed completion path, including an unentered refusal.
+    /// A failure keeps the owner for terminal CREATE completion; no command is replayed.
     pub fn complete(&mut self, claim: CreateSectorClaim, sector: Result<&[u8; 512], FatPathError>)
+        -> Result<FatPathProgress, CreateLookupError>
+    {
+        self.complete_attributed(claim, sector, CompletionSource::Unattributed)
+    }
+
+    /// The native block owner calls this only after the command has reached an exact
+    /// terminal and a pending command has passed strict provider ACK.
+    pub fn complete_physical(&mut self, claim: CreateSectorClaim,
+        sector: Result<&[u8; 512], FatPathError>) -> Result<FatPathProgress, CreateLookupError>
+    {
+        self.complete_attributed(claim, sector, CompletionSource::Physical)
+    }
+
+    /// A copied sector has no provider command or terminal; count it only after the exact
+    /// logical claim has been accepted. Physical completions use `complete_physical`.
+    pub fn complete_cached(&mut self, claim: CreateSectorClaim,
+        sector: Result<&[u8; 512], FatPathError>) -> Result<FatPathProgress, CreateLookupError>
+    {
+        self.complete_attributed(claim, sector, CompletionSource::Cached)
+    }
+
+    fn complete_attributed(&mut self, claim: CreateSectorClaim,
+        sector: Result<&[u8; 512], FatPathError>, source: CompletionSource)
         -> Result<FatPathProgress, CreateLookupError>
     {
         let entry = self.entries.iter_mut().find(|entry| entry.irp == claim.irp && entry.mount == claim.mount)
             .ok_or(CreateLookupError::WrongClaim)?;
         if entry.claimed != Some(claim.request) || entry.result.is_some() {
             return Err(CreateLookupError::WrongClaim);
+        }
+        match source {
+            CompletionSource::Cached if sector.is_ok() => {
+                entry.attribution.copied_cache_completions =
+                    entry.attribution.copied_cache_completions.saturating_add(1);
+            }
+            CompletionSource::Physical => {
+                entry.attribution.physical_settlements =
+                    entry.attribution.physical_settlements.saturating_add(1);
+            }
+            CompletionSource::Cached | CompletionSource::Unattributed => {}
         }
         let result = match sector {
             Ok(bytes) => entry.lookup.as_mut().ok_or(CreateLookupError::WrongClaim)?
@@ -179,8 +227,14 @@ impl<P> CreateLookupQueue<P> {
             mount: entry.mount,
             payload: entry.payload.take()?,
             result: entry.result.take()?,
+            attribution: entry.attribution,
             lookup: entry.lookup,
         })
+    }
+
+    pub fn attribution(&self, irp: u64, mount: u64) -> Option<CreateLookupAttribution> {
+        self.entries.iter().find(|entry| entry.irp == irp && entry.mount == mount)
+            .map(|entry| entry.attribution)
     }
 
     /// A resident dependency was busy before CREATE entered any native effect.
@@ -192,6 +246,7 @@ impl<P> CreateLookupQueue<P> {
         self.entries.push(Entry {
             irp: resolved.irp, mount: resolved.mount, payload: Some(resolved.payload),
             lookup: resolved.lookup, claimed: None, result: Some(resolved.result),
+            attribution: resolved.attribution,
         });
         Ok(())
     }
@@ -264,5 +319,49 @@ mod tests {
         let claim = queue.claim_next().unwrap();
         assert_eq!((claim.irp, claim.mount), (21, 7));
         assert!(queue.claim_next().is_none());
+    }
+
+    #[test]
+    fn exact_create_attributes_acknowledged_cache_and_physical_sectors() {
+        let mut queue = CreateLookupQueue::new();
+        queue.capture(31, 7, (), lookup()).unwrap();
+        let first = queue.claim_next().unwrap();
+        assert_eq!(queue.complete_cached(CreateSectorClaim { irp: 32, ..first }, Ok(&[0; 512])),
+            Err(CreateLookupError::WrongClaim));
+        assert_eq!(queue.attribution(31, 7), Some(CreateLookupAttribution::default()));
+        queue.release_unentered(first).unwrap();
+        assert_eq!(queue.attribution(31, 7), Some(CreateLookupAttribution::default()));
+        let first = queue.claim_next().unwrap();
+        let mut root = [0u8; 512];
+        root[..11].copy_from_slice(b"WINDOWS    ");
+        root[11] = 0x10;
+        root[26..28].copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(queue.complete_cached(first, Ok(&root)), Ok(FatPathProgress::Pending));
+        assert_eq!(queue.attribution(31, 7), Some(CreateLookupAttribution {
+            copied_cache_completions: 1, physical_settlements: 0,
+        }));
+        let second = queue.claim_next().unwrap();
+        assert_eq!(second.request.sector, 11);
+        assert_eq!(queue.complete_physical(CreateSectorClaim { mount: 8, ..second }, Ok(&[0; 512])),
+            Err(CreateLookupError::WrongClaim));
+        assert_eq!(queue.complete_physical(second, Ok(&[0; 512])), Ok(FatPathProgress::NotFound));
+        let resolved = queue.take_resolved().unwrap();
+        assert_eq!(resolved.attribution,
+            CreateLookupAttribution { copied_cache_completions: 1, physical_settlements: 1 });
+        queue.restore_resolved(resolved).unwrap();
+        assert_eq!(queue.take_resolved().unwrap().attribution,
+            CreateLookupAttribution { copied_cache_completions: 1, physical_settlements: 1 },
+            "resident retry cannot reattribute a settled physical command");
+    }
+
+    #[test]
+    fn unentered_refusal_is_not_attributed_to_a_physical_settlement() {
+        let mut queue = CreateLookupQueue::new();
+        queue.capture(32, 7, (), lookup()).unwrap();
+        let refused = queue.claim_next().unwrap();
+        assert_eq!(queue.complete(refused, Err(FatPathError::Corrupt)),
+            Err(CreateLookupError::Invalid));
+        assert_eq!(queue.take_resolved().unwrap().attribution,
+            CreateLookupAttribution::default());
     }
 }

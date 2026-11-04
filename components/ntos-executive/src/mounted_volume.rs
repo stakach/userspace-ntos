@@ -200,6 +200,40 @@ pub(crate) fn complete_mounted_create_sector(
     completed
 }
 
+pub(crate) fn complete_cached_mounted_create_sector(
+    claim: crate::mounted_volume_backend::mounted_create_lookup::CreateSectorClaim,
+    sector: &[u8; 512],
+) -> Result<nt_fs::FatPathProgress, crate::mounted_volume_backend::mounted_create_lookup::CreateLookupError> {
+    let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_CREATE_QUEUE)).as_ref().cloned() }
+        .ok_or(crate::mounted_volume_backend::mounted_create_lookup::CreateLookupError::Invalid)?;
+    let completed = queue.borrow_mut().complete_cached(claim, Ok(sector));
+    if !matches!(&completed, Err(crate::mounted_volume_backend::mounted_create_lookup::CreateLookupError::WrongClaim)) {
+        let attribution = queue.borrow().attribution(claim.irp, claim.mount);
+        if let Some(attribution) = attribution {
+            crate::service_sec_image::mounted_create_owner_trace::lookup_progress(
+                claim.irp, claim.mount, attribution);
+        }
+    }
+    completed
+}
+
+pub(crate) fn complete_physical_mounted_create_sector(
+    claim: crate::mounted_volume_backend::mounted_create_lookup::CreateSectorClaim,
+    sector: Result<&[u8; 512], nt_fs::FatPathError>,
+) -> Result<nt_fs::FatPathProgress, crate::mounted_volume_backend::mounted_create_lookup::CreateLookupError> {
+    let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_CREATE_QUEUE)).as_ref().cloned() }
+        .ok_or(crate::mounted_volume_backend::mounted_create_lookup::CreateLookupError::Invalid)?;
+    let completed = queue.borrow_mut().complete_physical(claim, sector);
+    if !matches!(&completed, Err(crate::mounted_volume_backend::mounted_create_lookup::CreateLookupError::WrongClaim)) {
+        let attribution = queue.borrow().attribution(claim.irp, claim.mount);
+        if let Some(attribution) = attribution {
+            crate::service_sec_image::mounted_create_owner_trace::lookup_progress(
+                claim.irp, claim.mount, attribution);
+        }
+    }
+    completed
+}
+
 pub(crate) fn release_unentered_mounted_create_sector(
     claim: crate::mounted_volume_backend::mounted_create_lookup::CreateSectorClaim,
 ) -> Result<(), crate::mounted_volume_backend::mounted_create_lookup::CreateLookupError> {

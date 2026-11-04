@@ -302,6 +302,18 @@ impl SectorClaim {
             }
         }
     }
+
+    fn complete_physical(self, bytes: Result<&[u8], nt_fs::FatPathError>) {
+        match self {
+            Self::Create(c) => {
+                let sector = bytes.and_then(|bytes| <&[u8; 512]>::try_from(bytes)
+                    .map_err(|_| nt_fs::FatPathError::Corrupt));
+                crate::mounted_volume::complete_physical_mounted_create_sector(c, sector)
+                    .expect("settled physical CREATE sector claim lost");
+            }
+            claim => claim.complete(bytes),
+        }
+    }
 }
 
 enum WorkClaim {
@@ -370,6 +382,28 @@ impl WorkClaim {
             Self::Snapshot(claim) => unsafe {
                 crate::writable_fs::native_snapshot_io::complete_native_snapshot_io(claim, result)
             }.expect("acknowledged snapshot claim lost"),
+        }
+    }
+
+    fn complete_physical(self, result: Result<&[u8], nt_status::NtStatus>) {
+        match self {
+            Self::Sector(claim) => claim.complete_physical(result.map_err(|_| nt_fs::FatPathError::Corrupt)),
+            claim => claim.complete(result),
+        }
+    }
+
+    fn complete_cached(self, bytes: &[u8; 512]) {
+        match self {
+            Self::Sector(SectorClaim::Create(claim)) => {
+                crate::mounted_volume::complete_cached_mounted_create_sector(claim, bytes)
+                    .expect("copied exact CREATE sector claim lost");
+            }
+            Self::Sector(SectorClaim::Directory(claim)) => {
+                crate::mounted_volume::complete_mounted_directory_sector(claim, Ok(bytes))
+                    .expect("copied exact DIRECTORY sector claim lost");
+            }
+            Self::Sector(SectorClaim::Overlay(_) | SectorClaim::Read(_))
+            | Self::Snapshot(_) => unreachable!("only metadata claims can use copied sectors"),
         }
     }
 
@@ -667,7 +701,7 @@ fn settle(pending: Pending, terminal: Terminal) {
     if let Ok(bytes) = &result {
         unsafe { publish_metadata_shadow(pending.route, &pending.claim, bytes) };
     }
-    pending.claim.complete(result);
+    pending.claim.complete_physical(result);
     let finished = crate::disk_census_ticks();
     NATIVE_TERMINAL_SETTLE_PHASE.record(pending.terminal_ticks, finished);
     NATIVE_LAST_SETTLED_TICKS.store(finished, Ordering::Relaxed);
@@ -859,7 +893,7 @@ unsafe fn dispatch_claim(
                     let bytes = *bytes;
                     census.hits.fetch_add(1, Ordering::Relaxed);
                     METADATA_READ_THROUGH_HITS.fetch_add(1, Ordering::Relaxed);
-                    claim.complete(Ok(&bytes));
+                    claim.complete_cached(&bytes);
                     return CacheClaimStep::Cached;
                 }
             }
