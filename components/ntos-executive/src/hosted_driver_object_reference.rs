@@ -13,6 +13,43 @@ pub(super) const DEVICE_OBJECT_TYPE_MARKER: u64 = u64::from_le_bytes(*b"DEVCTYPE
 const STATUS_OBJECT_TYPE_MISMATCH: i32 = 0xC000_0024u32 as i32;
 static LOCAL_REFUSAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static ROOT_REFUSAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static LOCAL_ACCESS_TRACE: AtomicU64 = AtomicU64::new(0);
+static LOCAL_RPC_TRACE: AtomicU64 = AtomicU64::new(0);
+static ROOT_REQUEST_TRACE: AtomicU64 = AtomicU64::new(0);
+
+fn trace_local_access_refusal(object: u64, desired_access: u32, object_type: u64, access_mode: u8) {
+    if LOCAL_ACCESS_TRACE.fetch_add(1, Ordering::Relaxed) >= 32 { return; }
+    print_str(b"[device-reference-access] object/desired/type/mode=");
+    print_hex64(object);
+    print_str(b"/"); print_hex(desired_access);
+    print_str(b"/"); print_hex64(object_type);
+    print_str(b"/"); print_u64(u64::from(access_mode));
+    print_str(b"\n");
+}
+
+fn trace_local_rpc_result(object: u64, object_type: u64, words: u64, status: u64, count: u64) {
+    if status == 0 || LOCAL_RPC_TRACE.fetch_add(1, Ordering::Relaxed) >= 32 { return; }
+    print_str(b"[device-reference-rpc] object/type/words/status/count=");
+    print_hex64(object);
+    print_str(b"/"); print_hex64(object_type);
+    print_str(b"/"); print_u64(words);
+    print_str(b"/"); print_hex64(status);
+    print_str(b"/"); print_u64(count);
+    print_str(b"\n");
+}
+
+pub(super) fn trace_root_request(
+    object: u64, object_type: u64, reserved: u64, reply_cap: u64, caller_badge: u64,
+) {
+    if ROOT_REQUEST_TRACE.fetch_add(1, Ordering::Relaxed) >= 64 { return; }
+    print_str(b"[device-reference-root-entry] object/type/reserved/reply/badge=");
+    print_hex64(object);
+    print_str(b"/"); print_hex64(object_type);
+    print_str(b"/"); print_hex64(reserved);
+    print_str(b"/"); print_hex64(reply_cap);
+    print_str(b"/"); print_hex64(caller_badge);
+    print_str(b"\n");
+}
 
 fn trace_local_refusal(stage: &[u8], object: u64, status: i32, published_type: u64, marker: u64) {
     if LOCAL_REFUSAL_TRACE.fetch_add(1, Ordering::Relaxed) >= 16 { return; }
@@ -55,6 +92,7 @@ pub(super) extern "win64" fn ob_reference_object_by_pointer(
         return STATUS_INVALID_PARAMETER;
     }
     if access_mode != 0 || desired_access != 0 {
+        trace_local_access_refusal(object, desired_access, object_type, access_mode);
         return STATUS_ACCESS_DENIED;
     }
     if !unsafe { consumer_device_object_in_local_pool(object) } {
@@ -86,6 +124,7 @@ pub(super) extern "win64" fn ob_reference_object_by_pointer(
             0,
         )
     };
+    trace_local_rpc_result(object, object_type, words, status, count);
     if words != 4 || reserved0 != 0 || reserved1 != 0 {
         unsafe {
             crate::provider_bugcheck::report(

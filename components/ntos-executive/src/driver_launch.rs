@@ -59649,6 +59649,9 @@ pub(crate) fn service_hosted_device(
         };
     }
     if op == HOSTED_DEVICE_OP_REFERENCE_BY_POINTER {
+        hosted_driver_object_reference::trace_root_request(
+            pdo_object, arg2, arg3, active_reply_cap, caller_badge,
+        );
         if arg3 != 0 {
             return (STATUS_INVALID_PARAMETER, 0, 0, 0);
         }
