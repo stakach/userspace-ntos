@@ -286,8 +286,16 @@ pub struct PendingFileIoIdentity {
 }
 
 impl PendingFileIoIdentity {
+    pub const fn table(self) -> u64 {
+        self.table
+    }
+
     pub const fn slot(self) -> usize {
         self.slot
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
     }
 }
 

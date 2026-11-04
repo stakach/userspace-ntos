@@ -137,6 +137,7 @@ mod fs_loader;
 mod fat_volume_information;
 mod mounted_volume;
 mod mounted_volume_backend;
+mod mounted_create_owner_snapshot;
 mod mounted_volume_ingress_probe;
 mod mounted_section_probe;
 mod hosted_routed_section_capture;
@@ -7246,6 +7247,7 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
     });
     print_str(b"\n");
     driver_launch::print_mounted_native_block_census();
+    service_sec_image::mounted_create_owner_trace::print_snapshot();
     print_shared_receive_census();
     if LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) != 0 {
         let tcb = LSA_LOGON_LAST_TCB.load(Ordering::Relaxed);
