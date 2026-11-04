@@ -89,3 +89,77 @@ fn invalid_or_overlapping_geometry_cannot_claim_a_disjoint_reserve() {
         Some(PhysicalSectorRange::new(199, 10).unwrap()),
     ).is_none());
 }
+
+// Exact pointer-free legacy SRB/CDB layout emitted by nt_io_manager::ScsiBlockCommand.
+fn srb(cdb_len: u8, opcode: u8, flags: u32, transfer: u32) -> [u8; 0x58] {
+    let mut srb = [0; 0x58];
+    srb[..2].copy_from_slice(&0x58u16.to_le_bytes());
+    srb[0x0a] = cdb_len;
+    srb[0x0c..0x10].copy_from_slice(&flags.to_le_bytes());
+    srb[0x10..0x14].copy_from_slice(&transfer.to_le_bytes());
+    srb[0x48] = opcode;
+    srb
+}
+
+#[test]
+fn exact_read_capacity_reads_and_flush_are_proven_nonmutating() {
+    let mut capacity = srb(16, 0x9e, 0x40, 32);
+    capacity[0x49] = 0x10;
+    capacity[0x52..0x56].copy_from_slice(&32u32.to_be_bytes());
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&capacity), PossibleScsiEffect::ProvenReadOnly);
+
+    let mut read10 = srb(10, 0x28, 0x40, 2 * 512);
+    read10[0x4a..0x4e].copy_from_slice(&2048u32.to_be_bytes());
+    read10[0x4f..0x51].copy_from_slice(&2u16.to_be_bytes());
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&read10), PossibleScsiEffect::ProvenReadOnly);
+
+    let mut read16 = srb(16, 0x88, 0x40, 512);
+    read16[0x4a..0x52].copy_from_slice(&(u32::MAX as u64 + 1).to_be_bytes());
+    read16[0x52..0x56].copy_from_slice(&1u32.to_be_bytes());
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&read16), PossibleScsiEffect::ProvenReadOnly);
+
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&srb(10, 0x35, 0, 0)),
+        PossibleScsiEffect::ProvenReadOnly);
+}
+
+#[test]
+fn exact_write_10_and_16_report_checked_physical_ranges() {
+    let mut write10 = srb(10, 0x2a, 0x80, 3 * 512);
+    write10[0x4a..0x4e].copy_from_slice(&4096u32.to_be_bytes());
+    write10[0x4f..0x51].copy_from_slice(&3u16.to_be_bytes());
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&write10),
+        PossibleScsiEffect::Write { lba: 4096, sectors: 3 });
+
+    let mut write16 = srb(16, 0x8a, 0x80, 512);
+    write16[0x4a..0x52].copy_from_slice(&(u32::MAX as u64 + 1).to_be_bytes());
+    write16[0x52..0x56].copy_from_slice(&1u32.to_be_bytes());
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&write16),
+        PossibleScsiEffect::Write { lba: u32::MAX as u64 + 1, sectors: 1 });
+}
+
+#[test]
+fn malformed_unknown_or_unbounded_srb_fails_closed() {
+    let mut write = srb(10, 0x2a, 0x80, 512);
+    write[0x4a..0x4e].copy_from_slice(&4096u32.to_be_bytes());
+    write[0x4f..0x51].copy_from_slice(&1u16.to_be_bytes());
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&write[..0x57]),
+        PossibleScsiEffect::PossiblyMutating);
+    let mut cases = Vec::new();
+    let mut changed = write; changed[..2].copy_from_slice(&0x57u16.to_le_bytes()); cases.push(changed);
+    let mut changed = write; changed[2] = 1; cases.push(changed);
+    let mut changed = write; changed[0x0a] = 16; cases.push(changed);
+    let mut changed = write; changed[0x0c..0x10].copy_from_slice(&0xc0u32.to_le_bytes()); cases.push(changed);
+    let mut changed = write; changed[0x10..0x14].copy_from_slice(&1024u32.to_le_bytes()); cases.push(changed);
+    let mut changed = write; changed[0x4f..0x51].fill(0); cases.push(changed);
+    let mut changed = write; changed[0x49] = 1; cases.push(changed);
+    let mut changed = write; changed[0x48] = 0x42; cases.push(changed);
+    let mut changed = write; changed[0x57] = 1; cases.push(changed);
+    let mut overflow = srb(16, 0x8a, 0x80, 1024);
+    overflow[0x4a..0x52].copy_from_slice(&u64::MAX.to_be_bytes());
+    overflow[0x52..0x56].copy_from_slice(&2u32.to_be_bytes());
+    cases.push(overflow);
+    for case in cases {
+        assert_eq!(PossibleScsiEffect::from_legacy_srb(&case),
+            PossibleScsiEffect::PossiblyMutating, "unproven CDB {:x}", case[0x48]);
+    }
+}

@@ -37,6 +37,79 @@ pub enum PossibleScsiEffect {
     PossiblyMutating,
 }
 
+impl PossibleScsiEffect {
+    /// Classify only the pointer-free legacy SRB/CDB encodings used by the native block route.
+    /// The Executive must first authenticate the route and validate the canonical transfer
+    /// buffers. Any unfamiliar command or malformed scalar is a possible media mutation.
+    pub fn from_legacy_srb(srb: &[u8]) -> Self {
+        const LEGACY_BYTES: usize = 0x58;
+        const DATA_IN: u32 = 0x40;
+        if srb.len() != LEGACY_BYTES
+            || u16::from_le_bytes([srb[0], srb[1]]) as usize != LEGACY_BYTES
+            || srb[2] != 0 // SRB_FUNCTION_EXECUTE_SCSI
+        {
+            return Self::PossiblyMutating;
+        }
+        let cdb_len = srb[0x0a];
+        let flags = u32::from_le_bytes(srb[0x0c..0x10].try_into().unwrap());
+        let data_len = u32::from_le_bytes(srb[0x10..0x14].try_into().unwrap());
+        let cdb: &[u8; 16] = srb[0x48..0x58].try_into().unwrap();
+        match cdb[0] {
+            0x28 | 0x2a if cdb_len == 10 => {
+                let lba = u32::from_be_bytes(cdb[2..6].try_into().unwrap()) as u64;
+                let sectors = u16::from_be_bytes(cdb[7..9].try_into().unwrap()) as u32;
+                Self::checked_transfer(*cdb, flags, data_len, lba, sectors, false)
+            }
+            0x88 | 0x8a if cdb_len == 16 => {
+                let lba = u64::from_be_bytes(cdb[2..10].try_into().unwrap());
+                let sectors = u32::from_be_bytes(cdb[10..14].try_into().unwrap());
+                Self::checked_transfer(*cdb, flags, data_len, lba, sectors, true)
+            }
+            0x9e if cdb_len == 16 && flags == DATA_IN && data_len == 32 => {
+                let mut expected = [0; 16];
+                expected[0] = 0x9e;
+                expected[1] = 0x10; // READ CAPACITY(16) service action
+                expected[10..14].copy_from_slice(&32u32.to_be_bytes());
+                if *cdb == expected { Self::ProvenReadOnly } else { Self::PossiblyMutating }
+            }
+            0x35 if cdb_len == 10 && flags == 0 && data_len == 0 => {
+                let mut expected = [0; 16];
+                expected[0] = 0x35; // SYNCHRONIZE CACHE(10)
+                if *cdb == expected { Self::ProvenReadOnly } else { Self::PossiblyMutating }
+            }
+            _ => Self::PossiblyMutating,
+        }
+    }
+
+    fn checked_transfer(
+        cdb: [u8; 16], flags: u32, data_len: u32, lba: u64, sectors: u32,
+        sixteen_byte: bool,
+    ) -> Self {
+        if sectors == 0
+            || lba.checked_add(u64::from(sectors)).is_none()
+            || u64::from(sectors).checked_mul(512) != Some(u64::from(data_len))
+        {
+            return Self::PossiblyMutating;
+        }
+        let write = matches!(cdb[0], 0x2a | 0x8a);
+        let expected_flags = if write { 0x80 } else { 0x40 };
+        if flags != expected_flags {
+            return Self::PossiblyMutating;
+        }
+        let mut expected = [0; 16];
+        expected[0] = cdb[0];
+        if sixteen_byte {
+            expected[2..10].copy_from_slice(&lba.to_be_bytes());
+            expected[10..14].copy_from_slice(&sectors.to_be_bytes());
+        } else {
+            expected[2..6].copy_from_slice(&(lba as u32).to_be_bytes());
+            expected[7..9].copy_from_slice(&(sectors as u16).to_be_bytes());
+        }
+        if cdb != expected { return Self::PossiblyMutating; }
+        if write { Self::Write { lba, sectors } } else { Self::ProvenReadOnly }
+    }
+}
+
 /// One authoritative eligibility fence for an installed-volume metadata cache.
 ///
 /// `D` is an authenticated physical disk identity; `R` includes mount and relation generation.
