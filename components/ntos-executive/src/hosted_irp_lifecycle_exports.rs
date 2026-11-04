@@ -32,6 +32,9 @@ fn commit(operation: u64, irp: u64, third: u64, fourth: u64) {
         unsafe { crate::provider_bugcheck::report(0xc4,
             [FSD_SERVICE_SOURCE_IRP_LABEL, operation, irp, status]); }
     }
+    if operation == REUSE {
+        unsafe { acknowledge_held_scsi_on_reuse(irp); }
+    }
 }
 
 /// `VOID IoInitializeIrp(PIRP Irp, USHORT PacketSize, CCHAR StackSize)`.

@@ -9905,8 +9905,8 @@ unsafe fn forward_hosted_scsi(
         hosted_forward_origin::acknowledge_inline_held(
             FSD_SERVICE_SCSI_FORWARD_LABEL, irp, token,
         );
-        if arm_held_scsi_completion(irp, token) {
-            acknowledge_held_scsi_terminal(irp, token);
+        if let Some(identity) = arm_held_scsi_completion(irp, token) {
+            acknowledge_held_scsi_terminal(identity);
         }
         return status as u32 as i32;
     }
@@ -13658,7 +13658,9 @@ type HeldPnpTable = nt_io_manager::held_pnp_completion::HeldPnpCompletionTable<6
 type HeldPnpAcknowledgement = nt_io_manager::held_pnp_completion::HeldPnpAcknowledgement;
 type HeldPnpIdentity = nt_io_manager::held_pnp_completion::HeldPnpIdentity;
 type HeldPnpError = nt_io_manager::held_pnp_completion::HeldPnpError;
-const HELD_SCSI_CAP: usize = 32;
+type HeldScsiTable = nt_io_manager::held_scsi_completion::HeldScsiCompletionTable<32>;
+type HeldScsiIdentity = nt_io_manager::held_scsi_completion::HeldScsiIdentity;
+type HeldScsiError = nt_io_manager::held_scsi_completion::HeldScsiError;
 
 /// The executive image is shared across hosted components. Keep both the lock and the table in
 /// each component's private DATA arena; no pointer in this state refers into a component heap.
@@ -13666,28 +13668,16 @@ const HELD_SCSI_CAP: usize = 32;
 struct HostedHeldPnpCompletions {
     lock: AtomicBool,
     table: HeldPnpTable,
-    scsi: [HeldScsiCompletion; HELD_SCSI_CAP],
+    scsi: HeldScsiTable,
 }
 
 impl HostedHeldPnpCompletions {
     const fn new() -> Self {
         Self {
             lock: AtomicBool::new(false), table: HeldPnpTable::new(),
-            scsi: [HeldScsiCompletion::EMPTY; HELD_SCSI_CAP],
+            scsi: HeldScsiTable::new(),
         }
     }
-}
-
-#[derive(Clone, Copy)]
-struct HeldScsiCompletion {
-    irp: u64,
-    token: u64,
-    armed: bool,
-    terminal_seen: bool,
-}
-
-impl HeldScsiCompletion {
-    const EMPTY: Self = Self { irp: 0, token: 0, armed: false, terminal_seen: false };
 }
 
 const _: () = assert!(core::mem::size_of::<HostedHeldPnpCompletions>() <= 0x1000);
@@ -13708,7 +13698,7 @@ unsafe fn with_held_pnp_completions<R>(f: impl FnOnce(&mut HeldPnpTable) -> R) -
 }
 
 unsafe fn with_held_scsi_completions<R>(
-    f: impl FnOnce(&mut [HeldScsiCompletion; HELD_SCSI_CAP]) -> R,
+    f: impl FnOnce(&mut HeldScsiTable) -> R,
 ) -> R {
     let state = (FSD_DATA_VADDR + FSD_DATA_HELD_PNP_COMPLETIONS_OFF)
         as *mut HostedHeldPnpCompletions;
@@ -13722,83 +13712,65 @@ unsafe fn with_held_scsi_completions<R>(
 }
 
 unsafe fn reserve_held_scsi_completion(irp: u64) -> bool {
-    with_held_scsi_completions(|table| {
-        if irp == 0 || table.iter().any(|row| row.irp == irp) { return false; }
-        let Some(row) = table.iter_mut().find(|row| row.irp == 0) else { return false; };
-        *row = HeldScsiCompletion { irp, token: 0, armed: false, terminal_seen: false };
-        true
-    })
+    with_held_scsi_completions(|table| table.reserve(irp).is_ok())
 }
 
 unsafe fn bind_held_scsi_completion(irp: u64, token: u64) -> bool {
-    with_held_scsi_completions(|table| {
-        let Some(row) = table.iter_mut().find(|row| row.irp == irp && row.token == 0)
-        else { return false; };
-        if token == 0 || row.armed || row.terminal_seen { return false; }
-        row.token = token;
-        true
-    })
+    with_held_scsi_completions(|table| table.bind(irp, token).is_ok())
 }
 
 unsafe fn cancel_unbound_scsi_completion(irp: u64) -> bool {
-    with_held_scsi_completions(|table| {
-        let Some(row) = table.iter_mut().find(|row| row.irp == irp && row.token == 0)
-        else { return false; };
-        *row = HeldScsiCompletion::EMPTY;
-        true
-    })
+    with_held_scsi_completions(|table| table.cancel_unbound(irp).is_ok())
 }
 
 unsafe fn cancel_held_scsi_completion(irp: u64, token: u64) -> bool {
-    with_held_scsi_completions(|table| {
-        let Some(row) = table.iter_mut().find(|row| row.irp == irp && row.token == token)
-        else { return false; };
-        if row.armed || row.terminal_seen { return false; }
-        *row = HeldScsiCompletion::EMPTY;
-        true
-    })
+    with_held_scsi_completions(|table| table.cancel_bound(HeldScsiIdentity { irp, token }).is_ok())
 }
 
 /// The later terminal may race the native origin's operation-4 hold receipt. The row records
 /// either order and yields the token exactly once after both causal observations are present.
-unsafe fn arm_held_scsi_completion(irp: u64, token: u64) -> bool {
-    with_held_scsi_completions(|table| {
-        let row = table.iter_mut().find(|row| row.irp == irp && row.token == token)
-            .expect("held SCSI origin row");
-        if row.armed { crate::provider_bugcheck::report(
+unsafe fn arm_held_scsi_completion(irp: u64, token: u64) -> Option<HeldScsiIdentity> {
+    with_held_scsi_completions(|table| table.arm(HeldScsiIdentity { irp, token }))
+        .unwrap_or_else(|_| crate::provider_bugcheck::report(
             0xc4, [FSD_SERVICE_SCSI_FORWARD_LABEL, 8, irp, token],
-        ); }
-        row.armed = true;
-        if row.terminal_seen {
-            *row = HeldScsiCompletion::EMPTY;
-            true
-        } else { false }
-    })
+        ))
 }
 
-unsafe fn observe_held_scsi_terminal(irp: u64) -> Option<u64> {
-    with_held_scsi_completions(|table| {
-        let row = table.iter_mut().find(|row| row.irp == irp)?;
-        if row.terminal_seen { crate::provider_bugcheck::report(
-            0xc4, [FSD_SERVICE_SCSI_FORWARD_LABEL, 9, irp, row.token],
-        ); }
-        row.terminal_seen = true;
-        if row.armed {
-            let token = row.token;
-            *row = HeldScsiCompletion::EMPTY;
-            Some(token)
-        } else { None }
-    })
+unsafe fn observe_held_scsi_terminal(irp: u64) -> Option<HeldScsiIdentity> {
+    match with_held_scsi_completions(|table| table.terminal(irp)) {
+        Ok(identity) => identity,
+        Err(HeldScsiError::NotFound) => None,
+        Err(_) => crate::provider_bugcheck::report(
+            0xc4, [FSD_SERVICE_SCSI_FORWARD_LABEL, 9, irp, 0],
+        ),
+    }
 }
 
-unsafe fn acknowledge_held_scsi_terminal(irp: u64, token: u64) {
+unsafe fn acknowledge_held_scsi_terminal(identity: HeldScsiIdentity) {
     let (label, status, _, _, _) = call_on4(
-        (FSD_SERVICE_SCSI_FORWARD_LABEL << 12) | 4, 5, irp, token, 0,
+        (FSD_SERVICE_SCSI_FORWARD_LABEL << 12) | 4, 5, identity.irp, identity.token, 0,
     );
     if label != 0 || status as u32 as i32 != STATUS_SUCCESS {
         crate::provider_bugcheck::report(
-            0xc4, [FSD_SERVICE_SCSI_FORWARD_LABEL, 5, irp, status],
+            0xc4, [FSD_SERVICE_SCSI_FORWARD_LABEL, 5, identity.irp, status],
         );
+    }
+    if with_held_scsi_completions(|table| table.retire_exact(identity)).is_err() {
+        crate::provider_bugcheck::report(
+            0xc4, [FSD_SERVICE_SCSI_FORWARD_LABEL, 6, identity.irp, identity.token],
+        );
+    }
+}
+
+/// Root has committed exact old-use publication and the next IoReuse epoch. This
+/// proves the old held callback cannot require another native terminal walk.
+unsafe fn acknowledge_held_scsi_on_reuse(irp: u64) {
+    match with_held_scsi_completions(|table| table.reuse_committed(irp)) {
+        Ok(Some(identity)) => acknowledge_held_scsi_terminal(identity),
+        Ok(None) | Err(HeldScsiError::NotFound) => {},
+        Err(_) => crate::provider_bugcheck::report(
+            0xc4, [FSD_SERVICE_SCSI_FORWARD_LABEL, 12, irp, 0],
+        ),
     }
 }
 
@@ -13904,8 +13876,8 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         let outcome = complete_hosted_irp(irp);
         if outcome == HostedIrpUnwindOutcome::Terminal {
             acknowledge_held_pnp_if_terminal(irp);
-            if let Some(token) = observe_held_scsi_terminal(irp) {
-                acknowledge_held_scsi_terminal(irp, token);
+            if let Some(identity) = observe_held_scsi_terminal(irp) {
+                acknowledge_held_scsi_terminal(identity);
             }
         }
     }

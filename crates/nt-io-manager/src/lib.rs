@@ -123,6 +123,7 @@ pub mod retained_file_close_progress;
 pub mod retained_source_progress;
 pub mod hosted_forward_progress;
 pub mod held_pnp_completion;
+pub mod held_scsi_completion;
 pub mod win32k_async_read_wire;
 pub mod win32k_section_create_wire;
 pub mod win32k_mm_section_wire;
