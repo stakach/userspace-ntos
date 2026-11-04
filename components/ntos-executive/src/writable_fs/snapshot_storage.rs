@@ -13,6 +13,13 @@ pub(crate) type Lease = SnapshotReserveLease<'static, AhciSnapshotDevice, Sectio
 static mut RESERVE: Option<Reserve> = None;
 static mut PHYSICAL_RANGE: Option<(SectionMountId, u64, u64)> = None;
 
+/// The exact reserve published with this mounted filesystem, including its WAL tail.
+/// A metadata reader may use this only to prove a SCSI write is disjoint from installed FAT.
+pub(crate) fn published_physical_range(mount: SectionMountId) -> Option<(u64, u64)> {
+    unsafe { *core::ptr::addr_of!(PHYSICAL_RANGE) }
+        .and_then(|(owner, start, sectors)| (owner == mount).then_some((start, sectors)))
+}
+
 struct MountedWalContinuation {
     mount: SectionMountId,
     token: nt_fs::RegistryWalContinuation,

@@ -28,9 +28,15 @@ static NATIVE_PENDING_SOURCE: AtomicU64 = AtomicU64::new(0);
 // request still enters the physical route. This measures whether repeat lookups justify a
 // read-through cache without changing the mounted File or SCSI ownership contract.
 type MetadataKey = (u64, nt_pnp_context::native_storage_handoff::StorageHandoffKey);
+type MetadataDisk = (HostedDomainIdentity, nt_io_manager::DeviceId, u64);
 static mut METADATA_SHADOW: nt_fs::InstalledMetadataSectorCache<MetadataKey, 512> =
     nt_fs::InstalledMetadataSectorCache::new();
 static mut METADATA_SHADOW_ROUTE: Option<MetadataKey> = None;
+// The first accepted native route owns this for the rest of its mount. A relation refresh may
+// invalidate the shadow, but cannot erase an earlier possible write or uncertain effect.
+static mut METADATA_FENCE: Option<nt_fs::InstalledMetadataReadThroughFence<MetadataDisk, MetadataKey>> = None;
+static METADATA_FENCE_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static METADATA_FENCE_POISONS: AtomicU64 = AtomicU64::new(0);
 
 struct MetadataShadowCensus {
     hits: AtomicU64,
@@ -124,6 +130,11 @@ pub(super) fn print_census() {
     // Census can run in a nested completion pump: only observe atomics here.
     METADATA_CREATE_SHADOW.print(b"create");
     METADATA_DIRECTORY_SHADOW.print(b"directory");
+    print_str(b"[census] native-metadata-fence initialized/poisoned=");
+    print_u64(u64::from(METADATA_FENCE_INITIALIZED.load(Ordering::Acquire)));
+    print_str(b"/");
+    print_u64(METADATA_FENCE_POISONS.load(Ordering::Relaxed));
+    print_str(b"\n");
     let published = native_disk_relation::native_storage_route();
     let retained = native_disk_relation::retained_native_storage_recheck_route();
     print_str(b"[mounted-route-census] phase=");
@@ -377,6 +388,63 @@ unsafe fn metadata_shadow_for(route: native_disk_relation::NativeStorageRoute)
         *active = Some(key);
     }
     cache
+}
+
+fn metadata_disk(route: nt_io_manager::scsi_srb_transport::ScsiSrbRoute) -> MetadataDisk {
+    (route.provider, route.pdo, route.provider_pdo)
+}
+
+unsafe fn metadata_fence_for(route: native_disk_relation::NativeStorageRoute)
+    -> Option<&'static nt_fs::InstalledMetadataReadThroughFence<MetadataDisk, MetadataKey>>
+{
+    let slot = &mut *core::ptr::addr_of_mut!(METADATA_FENCE);
+    if slot.is_none() {
+        if crate::fs_loader::exec_fs_mount_identity() != Some(route.mount) { return None; }
+        let fat = crate::fs_loader::exec_fs()?;
+        let installed = nt_fs::PhysicalSectorRange::new(
+            fat.volume_start_lba, u64::from(fat.total_sectors))?;
+        let reserve = crate::writable_fs::snapshot_storage::published_physical_range(route.mount)
+            .and_then(|(start, sectors)| nt_fs::PhysicalSectorRange::new(start, sectors));
+        *slot = nt_fs::InstalledMetadataReadThroughFence::new(
+            metadata_disk(route.scsi), (route.mount.value(), route.key), installed, reserve);
+        METADATA_FENCE_INITIALIZED.store(slot.is_some(), Ordering::Release);
+    }
+    slot.as_ref()
+}
+
+/// Called after the canonical File IRP has captured its physical stack, before provider entry.
+/// The irreversible poison prevents a read from refilling the shadow while a write remains
+/// pending or uncertain. This runs in Executive memory, where the metadata bytes are owned.
+pub(super) unsafe fn before_external_scsi_effect(
+    prepared: &nt_io_manager::detached_file_irp::PreparedExternalFileIrp,
+    stack: &[(nt_io_manager::DeviceId, nt_io_manager::DriverId)],
+) {
+    let Some(route) = native_disk_relation::native_storage_route() else { return; };
+    let targets_disk = stack.iter().any(|(device, _)| *device == route.scsi.pdo);
+    let projection = prepared.projection();
+    let effect = match &projection.parameters {
+        IoParameters::Scsi(parameters) if metadata_disk(parameters.route) == metadata_disk(route.scsi) =>
+            nt_fs::PossibleScsiEffect::from_legacy_srb(&parameters.srb),
+        IoParameters::Read(_) if targets_disk => nt_fs::PossibleScsiEffect::ProvenReadOnly,
+        _ if targets_disk => nt_fs::PossibleScsiEffect::PossiblyMutating,
+        _ => return,
+    };
+    let Some(fence) = metadata_fence_for(route) else { return; };
+    let was_poisoned = fence.poisoned();
+    fence.before_effect(&metadata_disk(route.scsi), effect);
+    if !was_poisoned && fence.poisoned() {
+        METADATA_FENCE_POISONS.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[native-metadata-fence] poisoned before irp/major/opcode=");
+        print_u64(prepared.irp_id().raw());
+        print_str(b"/");
+        print_u64(u64::from(projection.major));
+        print_str(b"/");
+        print_u64(match &projection.parameters {
+            IoParameters::Scsi(parameters) => u64::from(parameters.srb[0x48]),
+            _ => 0,
+        });
+        print_str(b"\n");
+    }
 }
 
 unsafe fn observe_metadata_shadow(

@@ -755,6 +755,9 @@ fn dispatch_with_port_connect(
         discard(id, prepared)?;
         return Err(status);
     }
+    // This exact retained stack is the last Executive-side point before a disk provider may
+    // enter. A possible installed-media mutation permanently disables metadata read-through.
+    unsafe { mounted_native_block::before_external_scsi_effect(&prepared, &row(id).stack) };
     let irp_id = prepared.irp_id();
     if let Some(device) = port_connect_device {
         trace_port_connect_dispatch(1, irp_id, device);
