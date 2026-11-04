@@ -90,21 +90,23 @@ pub fn classify_source_auxiliary_buffer(
     })
 }
 
-/// A provider may modify the source packet after dispatch. Before completion
-/// begins, the root must still see the exact code and output extent captured
-/// when it accepted the child allocations.
+/// The native completion walk clears the source stack parameters before the
+/// auxiliary ledger begins completion. The code and output extent accepted at
+/// registration stay in `captured`; the current stack fields are no longer
+/// authority. The IRP header still has to describe the retained buffer graph.
 pub fn matches_captured_buffered_control(
     request: SourceAuxiliaryBufferRequest,
     captured: CapturedBufferedControlOutput,
 ) -> bool {
     captured.valid()
-        && request.control_code == captured.code
-        && request.control_output_length == captured.output_length
-        && classify_source_auxiliary_buffer(request).is_some_and(|contract| {
-            contract.kind == SourceAuxiliaryBufferKind::BufferedControlOutput
-                && contract.system_length == captured.output_length
-                && contract.output_length == captured.output_length
-        })
+        && request.major == major::IRP_MJ_DEVICE_CONTROL
+        && request.minor == 0
+        && request.irp_flags == (crate::kernel_irp_builder::IRP_BUFFERED_IO
+            | crate::kernel_irp_builder::IRP_DEALLOCATE_BUFFER
+            | crate::kernel_irp_builder::IRP_INPUT_OPERATION)
+        && request.system_buffer != 0
+        && request.mdl == 0
+        && request.user_buffer != 0
 }
 
 #[cfg(test)]
@@ -161,20 +163,48 @@ mod tests {
     }
 
     #[test]
-    fn buffered_control_revalidation_rejects_mutated_code_length_and_flags() {
+    fn buffered_control_completion_uses_captured_extent_and_live_header() {
         let valid = geometry_output();
         let captured = CapturedBufferedControlOutput {
             code: valid.control_code,
             output_length: valid.control_output_length,
         };
         assert!(matches_captured_buffered_control(valid, captured));
+        // These stack fields are mutable and are cleared by the normal unwind;
+        // the retained descriptor continues to bound copyout at 40 bytes.
+        assert!(matches_captured_buffered_control(SourceAuxiliaryBufferRequest {
+            control_code: valid.control_code + 4,
+            control_output_length: 32,
+            ..valid
+        }, captured));
         for mutated in [
-            SourceAuxiliaryBufferRequest { control_code: valid.control_code + 4, ..valid },
-            SourceAuxiliaryBufferRequest { control_output_length: 32, ..valid },
             SourceAuxiliaryBufferRequest { irp_flags: valid.irp_flags & !IRP_INPUT_OPERATION, ..valid },
+            SourceAuxiliaryBufferRequest { system_buffer: 0, ..valid },
+            SourceAuxiliaryBufferRequest { user_buffer: 0, ..valid },
+            SourceAuxiliaryBufferRequest { mdl: 0x4000, ..valid },
         ] {
             assert!(!matches_captured_buffered_control(mutated, captured));
         }
+    }
+
+    #[test]
+    fn normal_completion_keeps_captured_output_after_stack_unwind() {
+        let valid = geometry_output();
+        let captured = CapturedBufferedControlOutput {
+            code: valid.control_code,
+            output_length: valid.control_output_length,
+        };
+        // The native completion walk clears the source stack's parameters before
+        // it asks the auxiliary ledger to begin completion. IRP buffer fields
+        // and the retained owner are still live at that point.
+        let unwound = SourceAuxiliaryBufferRequest {
+            control_code: 0,
+            control_input_length: 0,
+            control_output_length: 0,
+            control_type3_input_buffer: 0,
+            ..valid
+        };
+        assert!(matches_captured_buffered_control(unwound, captured));
     }
 
     #[test]
