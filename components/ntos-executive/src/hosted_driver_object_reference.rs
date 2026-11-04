@@ -5,7 +5,6 @@
 
 use super::*;
 
-pub(super) const OP_REFERENCE_BY_POINTER: u64 = 39;
 pub(super) const DEVICE_OBJECT_TYPE_CELL_OFFSET: u64 = 0x230;
 pub(super) const DEVICE_OBJECT_TYPE_BODY_OFFSET: u64 = 0x380;
 pub(super) const DEVICE_OBJECT_TYPE_MARKER: u64 = u64::from_le_bytes(*b"DEVCTYPE");
@@ -118,7 +117,7 @@ pub(super) extern "win64" fn ob_reference_object_by_pointer(
     let (words, status, count, reserved0, reserved1) = unsafe {
         call_on4_raw(
             (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
-            OP_REFERENCE_BY_POINTER,
+            HOSTED_DEVICE_OP_REFERENCE_BY_POINTER,
             object,
             object_type,
             0,
@@ -129,7 +128,7 @@ pub(super) extern "win64" fn ob_reference_object_by_pointer(
         unsafe {
             crate::provider_bugcheck::report(
                 0xc4,
-                [FSD_SERVICE_DEVICE_LABEL, OP_REFERENCE_BY_POINTER, words, status],
+                [FSD_SERVICE_DEVICE_LABEL, HOSTED_DEVICE_OP_REFERENCE_BY_POINTER, words, status],
             )
         }
     }
@@ -137,7 +136,7 @@ pub(super) extern "win64" fn ob_reference_object_by_pointer(
         .unwrap_or_else(|_| unsafe {
             crate::provider_bugcheck::report(
                 0xc4,
-                [FSD_SERVICE_DEVICE_LABEL, OP_REFERENCE_BY_POINTER, status, count],
+                [FSD_SERVICE_DEVICE_LABEL, HOSTED_DEVICE_OP_REFERENCE_BY_POINTER, status, count],
             )
         });
     match reply.into_result() {
