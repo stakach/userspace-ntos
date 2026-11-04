@@ -15,6 +15,7 @@ fn terminal_callback_retains_exact_source_without_requiring_live_children() {
 mod nt_io_manager {{ pub mod scsi_source_retention {{
     #[derive(Clone, Copy)]
     pub enum ScsiSourcePhase {{ Prepared, Entered, Pending, Uncertain, Terminal,
+        SourcePublished,
         ProviderAcknowledged, SourceCompleted, ReadyToRelease }}
 }} }}
 {rule}
@@ -23,7 +24,7 @@ mod nt_io_manager {{ pub mod scsi_source_retention {{
     for phase in [None, Some(Prepared), Some(Entered), Some(Pending), Some(Uncertain)] {{
         assert!(!scsi_after_callback_phase(phase, true));
     }}
-    for phase in [Terminal, ProviderAcknowledged, SourceCompleted, ReadyToRelease] {{
+    for phase in [Terminal, SourcePublished, ProviderAcknowledged, SourceCompleted, ReadyToRelease] {{
         assert!(scsi_after_callback_phase(Some(phase), true));
         assert!(scsi_after_callback_phase(Some(phase), false),
             "a terminal callback may unlock its source MDL without requesting IRP free");
@@ -53,6 +54,6 @@ mod nt_io_manager {{ pub mod scsi_source_retention {{
     assert!(!validation.contains(
         "if hosted_source_irp_ledger::deferred_free_requested(self.ticket) {"
     ), "terminal retained validation must not depend solely on a deferred IRP free request");
-    assert!(ledger.contains("observed == Some(children.source)"),
-        "callback lookup still validates the pinned allocation generation");
+    assert!(ledger.contains("scsi_registered_pool_matches_unlocked(inst, children.source)"),
+        "callback lookup validates the pinned pool generation after reuse changes the IRP header");
 }
