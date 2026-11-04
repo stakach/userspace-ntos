@@ -102,6 +102,10 @@ impl BlockRouteOwner {
     pub const fn source_kind(&self) -> BlockSourceKind {
         self.phase
     }
+    /// Physical mount generation bound to this route owner.
+    pub const fn mount(&self) -> u64 {
+        self.mount
+    }
     pub const fn native_route(&self) -> Option<u64> {
         self.native_route
     }

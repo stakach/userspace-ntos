@@ -1,9 +1,9 @@
-//! The Executive path walker reuses only mounted FAT-link sectors.
+//! The Executive path walker reuses mounted FAT-link sectors.
 
 const FAT: &str = include_str!("../../../components/ntos-executive/src/fs_loader.rs");
 
 #[test]
-fn mounted_fat_path_links_share_generation_bound_cache_without_caching_directory_data() {
+fn mounted_fat_path_links_share_generation_bound_cache() {
     let lookup = FAT.split_once("unsafe fn fat_lookup_metadata(").unwrap().1
         .split_once("/// Find one native FAT directory entry").unwrap().0;
     assert!(lookup.contains("FatPathRequestKind::Fat"));

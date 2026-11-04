@@ -19,6 +19,12 @@ const FAT32_FAT_CACHE_OFFSET: u64 = FAT32_SCRATCH_OFFSET;
 static mut EXEC_FAT_RANGE_CURSORS: nt_fs::FatRangeCursorSet<16> =
     nt_fs::FatRangeCursorSet::new();
 static mut EXEC_FAT_SECTOR_CACHE: nt_fs::FatSectorCache = nt_fs::FatSectorCache::new();
+// Boot AHCI has one authenticated disk owner; its mount ID changes on publication/remount.
+// This copied Directory cache is fenced before installed writes and at Boot→Draining.
+const EXEC_FAT_DIRECTORY_CACHE_SECTORS: usize = 256;
+static mut EXEC_FAT_DIRECTORY_CACHE:
+    nt_fs::InstalledMetadataSectorCache<u64, EXEC_FAT_DIRECTORY_CACHE_SECTORS> =
+    nt_fs::InstalledMetadataSectorCache::new();
 const FAT_PATH_PARENT_CANDIDATES: usize = 8;
 static mut EXEC_FAT_PATH_LOOKUP_CENSUS: nt_fs::FatPathLookupCensus<FAT_PATH_PARENT_CANDIDATES> =
     nt_fs::FatPathLookupCensus::new();
@@ -386,6 +392,7 @@ unsafe fn fat_cache_invalidate(fs: &Fat32) {
 unsafe fn fat_chain_cache_invalidate(fs: &Fat32) {
     if fs.census {
         (&mut *core::ptr::addr_of_mut!(EXEC_FAT_SECTOR_CACHE)).invalidate();
+        (&mut *core::ptr::addr_of_mut!(EXEC_FAT_DIRECTORY_CACHE)).invalidate();
         (&mut *core::ptr::addr_of_mut!(EXEC_FAT_RANGE_CURSORS)).invalidate();
     } else {
         fat_cache_invalidate(fs);
@@ -1175,13 +1182,37 @@ unsafe fn fat_lookup_metadata(
                 })
                 .ok()?;
             bytes.copy_from_slice(sector);
+        } else if request.kind == nt_fs::FatPathRequestKind::Directory
+            && fs.census
+            && matches!(fs.io_owner, FatIoOwner::Executive)
+            && matches!(
+                (&*core::ptr::addr_of!(EXEC_BLOCK_ROUTE)).as_ref().map(|route| route.source_kind()),
+                Some(nt_fs::BlockSourceKind::Boot)
+            )
+        {
+            let mount = exec_fs_mount_identity()?;
+            let route = (&*core::ptr::addr_of!(EXEC_BLOCK_ROUTE)).as_ref()?;
+            if route.mount() != mount.value() {
+                return None;
+            }
+            let parent = lookup.parent_cluster();
+            bytes = (&mut *core::ptr::addr_of_mut!(EXEC_FAT_DIRECTORY_CACHE))
+                .read_or_fetch(mount.value(), request.sector, |sector, data| {
+                    let ptr = fat_read_sector_checked(fs, sector, callsite)
+                        .ok_or(nt_fs::STATUS_DATA_ERROR)?;
+                    core::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), data.len());
+                    (&mut *core::ptr::addr_of_mut!(EXEC_FAT_PATH_LOOKUP_CENSUS))
+                        .directory_sector(parent);
+                    Ok::<(), u32>(())
+                })
+                .ok()?;
         } else {
             let sector = fat_read_sector_checked(fs, request.sector, callsite)?;
             core::ptr::copy_nonoverlapping(sector, bytes.as_mut_ptr(), bytes.len());
-        }
-        if request.kind == nt_fs::FatPathRequestKind::Directory && fs.census {
-            (&mut *core::ptr::addr_of_mut!(EXEC_FAT_PATH_LOOKUP_CENSUS))
-                .directory_sector(lookup.parent_cluster());
+            if request.kind == nt_fs::FatPathRequestKind::Directory && fs.census {
+                (&mut *core::ptr::addr_of_mut!(EXEC_FAT_PATH_LOOKUP_CENSUS))
+                    .directory_sector(lookup.parent_cluster());
+            }
         }
         match lookup.feed(request, &bytes).ok()? {
             nt_fs::FatPathProgress::Pending => {}
@@ -1521,6 +1552,7 @@ pub(crate) fn begin_exec_mount_drain() -> Result<(), nt_fs::BlockRouteError> {
             nt_fs::BlockSourceKind::Boot => {
                 route.begin_drain(mount.value())?;
                 (&mut *core::ptr::addr_of_mut!(EXEC_FAT_SECTOR_CACHE)).invalidate();
+                (&mut *core::ptr::addr_of_mut!(EXEC_FAT_DIRECTORY_CACHE)).invalidate();
                 (&mut *core::ptr::addr_of_mut!(EXEC_FAT_RANGE_CURSORS)).invalidate();
                 Ok(())
             }
@@ -1542,6 +1574,7 @@ pub(crate) unsafe fn publish_exec_fs(fs: Fat32) -> Result<(), u32> {
         .map_err(|_| nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
     crate::writable_fs::snapshot_storage::publish(fs, id, physical_sectors)?;
     (&mut *core::ptr::addr_of_mut!(EXEC_FAT_SECTOR_CACHE)).invalidate();
+    (&mut *core::ptr::addr_of_mut!(EXEC_FAT_DIRECTORY_CACHE)).invalidate();
     (&mut *core::ptr::addr_of_mut!(EXEC_FAT_RANGE_CURSORS)).invalidate();
     *core::ptr::addr_of_mut!(EXEC_FS_MOUNT_ID) = Some(id);
     *core::ptr::addr_of_mut!(EXEC_BLOCK_ROUTE) = Some(route);
