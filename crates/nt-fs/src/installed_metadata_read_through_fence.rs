@@ -85,9 +85,9 @@ impl PossibleScsiEffect {
         match cdb[0] {
             0x12 if cdb_len == 6 => {
                 // INQUIRY only reports standard/VPD properties. LiberNT uses data-in plus
-                // optional synchronous-transfer and queue-freeze policy flags; its receive
-                // buffer may exceed the six-byte CDB allocation length.
-                let inquiry_flags = DATA_IN | 0x08 | 0x100;
+                // optional synchronous-transfer, queue-freeze and port allocation policy
+                // flags; its receive buffer may exceed the six-byte CDB allocation length.
+                let inquiry_flags = DATA_IN | 0x08 | 0x100 | 0x20_0000;
                 if flags & DATA_IN != 0
                     && flags & !inquiry_flags == 0
                     && data_len != 0

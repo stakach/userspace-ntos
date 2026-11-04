@@ -272,6 +272,39 @@ fn source_backed_scsi_inquiry_shapes_do_not_mutate_installed_media() {
 }
 
 #[test]
+fn class_inquiry_port_policy_preserves_installed_metadata_read_through() {
+    // KVM 41893363837: released disk class sent EVPD INQUIRY(6) with a 255-byte
+    // receive buffer and the same port-policy flag used by MODE SENSE(6).
+    let mut inquiry = srb(6, 0x12, 0x20_0148, 255);
+    inquiry[0x49] = 1; // EVPD
+    inquiry[0x4c] = 255;
+    assert_eq!(&inquiry[0x48..0x4e], &[0x12, 0x01, 0x00, 0x00, 0xff, 0x00]);
+    let effect = PossibleScsiEffect::from_legacy_srb(&inquiry);
+    assert_eq!(effect, PossibleScsiEffect::ProvenReadOnly);
+    let disk = Disk { controller: 3, physical_pdo: 9 };
+    let route = Route { mount: 7, relation_generation: 11 };
+    let fence = fixture();
+    fence.before_effect(&disk, effect);
+    assert!(fence.eligible(&disk, &route));
+
+    for changed in [
+        { let mut x = inquiry; x[0x0a] = 10; x },
+        { let mut x = inquiry; x[0x0c..0x10].copy_from_slice(&0x20_0108u32.to_le_bytes()); x },
+        { let mut x = inquiry; x[0x0c..0x10].copy_from_slice(&0x20_01c8u32.to_le_bytes()); x },
+        { let mut x = inquiry; x[0x0c..0x10].copy_from_slice(&0x20_0548u32.to_le_bytes()); x },
+        { let mut x = inquiry; x[0x10..0x14].fill(0); x },
+        { let mut x = inquiry; x[0x49] = 2; x },
+        { let mut x = inquiry; x[0x49] = 0; x[0x4a] = 1; x }, // standard inquiry has no page
+        { let mut x = inquiry; x[0x4b] = 1; x },
+        { let mut x = inquiry; x[0x4c] = 0; x },
+        { let mut x = inquiry; x[0x4d] = 1; x },
+    ] {
+        assert_eq!(PossibleScsiEffect::from_legacy_srb(&changed),
+            PossibleScsiEffect::PossiblyMutating, "unexpected INQUIRY shape: {changed:?}");
+    }
+}
+
+#[test]
 fn mode_sense_six_data_in_keeps_installed_metadata_read_through_eligible() {
     // The released disk class sent MODE SENSE(6) for the fault-reporting page:
     // CDB 1A 00 1C 00 C0 00, DATA_IN plus observed port policy, 192-byte buffer.

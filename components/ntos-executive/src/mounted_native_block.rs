@@ -38,6 +38,10 @@ static mut METADATA_FENCE: Option<nt_fs::InstalledMetadataReadThroughFence<Metad
 static METADATA_FENCE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static METADATA_FENCE_POISONS: AtomicU64 = AtomicU64::new(0);
 static METADATA_READ_THROUGH_HITS: AtomicU64 = AtomicU64::new(0);
+// Observation only: sample the first two unclassified shapes per opcode even after the
+// irreversible fence has poisoned. This may expose later read-only classification gaps.
+static UNCLASSIFIED_SRB_TRACES: [AtomicU64; 256] =
+    [const { AtomicU64::new(0) }; 256];
 
 struct MetadataShadowCensus {
     hits: AtomicU64,
@@ -416,6 +420,23 @@ unsafe fn metadata_fence_for(route: native_disk_relation::NativeStorageRoute)
     slot.as_ref()
 }
 
+fn print_srb_effect_shape(srb: &[u8]) {
+    print_str(b" srb cdb-len/flags/transfer/cdb1/cdb2/cdb3/cdb4/cdb5=");
+    print_u64(u64::from(srb.get(0x0a).copied().unwrap_or(0)));
+    print_str(b"/");
+    print_u64(srb.get(0x0c..0x10)
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .map(u32::from_le_bytes).unwrap_or(0) as u64);
+    print_str(b"/");
+    print_u64(srb.get(0x10..0x14)
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .map(u32::from_le_bytes).unwrap_or(0) as u64);
+    for offset in 0x49..=0x4d {
+        print_str(b"/");
+        print_u64(u64::from(srb.get(offset).copied().unwrap_or(0)));
+    }
+}
+
 /// Called after the canonical File IRP has captured its physical stack, before provider entry.
 /// The irreversible poison prevents a read from refilling the shadow while a write remains
 /// pending or uncertain. This runs in Executive memory, where the metadata bytes are owned.
@@ -437,6 +458,25 @@ pub(super) unsafe fn before_external_scsi_effect(
         _ if targets_disk => nt_fs::PossibleScsiEffect::PossiblyMutating,
         _ => return,
     };
+    if matches!(effect, nt_fs::PossibleScsiEffect::PossiblyMutating) {
+        if let IoParameters::Scsi(parameters) = &projection.parameters {
+            if metadata_disk(parameters.route) == metadata_disk(route.scsi) {
+                let opcode = parameters.srb.get(0x48).copied().unwrap_or(0);
+                let occurrence = UNCLASSIFIED_SRB_TRACES[usize::from(opcode)]
+                    .fetch_add(1, Ordering::Relaxed);
+                if occurrence < 2 {
+                    print_str(b"[native-metadata-unclassified-srb] occurrence/opcode/irp=");
+                    print_u64(occurrence + 1);
+                    print_str(b"/");
+                    print_u64(u64::from(opcode));
+                    print_str(b"/");
+                    print_u64(prepared.irp_id().raw());
+                    print_srb_effect_shape(&parameters.srb);
+                    print_str(b"\n");
+                }
+            }
+        }
+    }
     let Some(fence) = metadata_fence_for(route) else { return; };
     let was_poisoned = fence.poisoned();
     fence.before_effect(&metadata_disk(route.scsi), effect);
@@ -467,20 +507,7 @@ pub(super) unsafe fn before_external_scsi_effect(
             _ => 0,
         });
         if let IoParameters::Scsi(parameters) = &projection.parameters {
-            print_str(b" srb cdb-len/flags/transfer/cdb1/cdb2/cdb3/cdb4/cdb5=");
-            print_u64(u64::from(parameters.srb.get(0x0a).copied().unwrap_or(0)));
-            print_str(b"/");
-            print_u64(parameters.srb.get(0x0c..0x10)
-                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-                .map(u32::from_le_bytes).unwrap_or(0) as u64);
-            print_str(b"/");
-            print_u64(parameters.srb.get(0x10..0x14)
-                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-                .map(u32::from_le_bytes).unwrap_or(0) as u64);
-            for offset in 0x49..=0x4d {
-                print_str(b"/");
-                print_u64(u64::from(parameters.srb.get(offset).copied().unwrap_or(0)));
-            }
+            print_srb_effect_shape(&parameters.srb);
         }
         print_str(b"\n");
     }
