@@ -166,6 +166,46 @@ fn exact_read_capacity_reads_and_flush_are_proven_nonmutating() {
 }
 
 #[test]
+fn classpnp_read_ten_with_port_sense_and_cache_policy_does_not_poison_metadata() {
+    // LiberNT ClassPnP's READ(10) reached the native route with DATA_IN,
+    // NO_QUEUE_FREEZE, ADAPTER_CACHE_ENABLE and PORT_DRIVER_ALLOCSENSE.
+    let mut read = srb(10, 0x28, 0x20_0340, 512);
+    read[0x4f..0x51].copy_from_slice(&1u16.to_be_bytes());
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&read),
+        PossibleScsiEffect::ProvenReadOnly);
+
+    let mut data_out = read;
+    data_out[0x0c..0x10].copy_from_slice(&0x20_03c0u32.to_le_bytes());
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&data_out),
+        PossibleScsiEffect::PossiblyMutating);
+
+    let mut unknown_flag = read;
+    unknown_flag[0x0c..0x10].copy_from_slice(&0x20_0740u32.to_le_bytes());
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&unknown_flag),
+        PossibleScsiEffect::PossiblyMutating);
+
+    let mut missing_direction = read;
+    missing_direction[0x0c..0x10].copy_from_slice(&0x20_0300u32.to_le_bytes());
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&missing_direction),
+        PossibleScsiEffect::PossiblyMutating);
+
+    let mut force_unit_access = read;
+    force_unit_access[0x49] = 0x08;
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&force_unit_access),
+        PossibleScsiEffect::PossiblyMutating);
+
+    let mut wrong_transfer = read;
+    wrong_transfer[0x10..0x14].copy_from_slice(&1024u32.to_le_bytes());
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&wrong_transfer),
+        PossibleScsiEffect::PossiblyMutating);
+
+    let mut write = read;
+    write[0x48] = 0x2a;
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&write),
+        PossibleScsiEffect::PossiblyMutating);
+}
+
+#[test]
 fn source_backed_scsi_inquiry_shapes_do_not_mutate_installed_media() {
     let mut standard = srb(6, 0x12, 0x48, 36);
     standard[0x4c] = 36;

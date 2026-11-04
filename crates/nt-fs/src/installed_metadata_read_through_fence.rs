@@ -138,8 +138,13 @@ impl PossibleScsiEffect {
             return Self::PossiblyMutating;
         }
         let write = matches!(cdb[0], 0x2a | 0x8a);
-        let expected_flags = if write { 0x80 } else { 0x40 };
-        if flags != expected_flags {
+        // ClassPnP carries queue, adapter-cache and port-sense policy on
+        // reads. These bits do not change the command's media effect; require
+        // DATA_IN and reject every unknown or write-direction bit.
+        const READ_POLICY_FLAGS: u32 = 0x20_0348;
+        if (write && flags != 0x80)
+            || (!write && (flags & 0x40 == 0 || flags & !READ_POLICY_FLAGS != 0))
+        {
             return Self::PossiblyMutating;
         }
         let mut expected = [0; 16];
