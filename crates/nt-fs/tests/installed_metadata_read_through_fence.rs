@@ -62,6 +62,24 @@ fn basic_disk_geometry_query_preserves_read_through_only_for_its_exact_shape() {
     }
 }
 
+#[test]
+fn scsi_address_query_preserves_read_through_only_for_its_exact_shape() {
+    // Disk class asks for the 8-byte SCSI_ADDRESS using a buffered query.
+    assert_eq!(PossibleScsiEffect::from_disk_device_control(0x0004_1018, 0, 8),
+        PossibleScsiEffect::ProvenReadOnly);
+    assert_eq!(PossibleScsiEffect::from_disk_device_control(0x0004_1018, 0, 16),
+        PossibleScsiEffect::ProvenReadOnly);
+    for (code, input, output) in [
+        (0x0004_1018, 1, 8),
+        (0x0004_1018, 0, 7),
+        (0x0004_1014, 0, 8), // pass-through direct
+        (0x0004_101c, 0, 8), // rescan bus
+    ] {
+        assert_eq!(PossibleScsiEffect::from_disk_device_control(code, input, output),
+            PossibleScsiEffect::PossiblyMutating);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Disk { controller: u64, physical_pdo: u64 }
 
