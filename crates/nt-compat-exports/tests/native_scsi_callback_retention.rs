@@ -7,8 +7,7 @@ use std::process::Command;
 fn terminal_callback_retains_exact_source_without_requiring_live_children() {
     let ledger = include_str!("../../../components/ntos-executive/src/hosted_source_irp_ledger.rs");
     let start = ledger.find("fn scsi_after_callback_phase(").expect("post-callback rule");
-    let end = start + ledger[start..].find("\npub(super) fn scsi_children_match_after_callback(")
-        .expect("exact native identity check");
+    let end = start + ledger[start..].find("\n}\n").expect("callback phase end") + 2;
     let rule = &ledger[start..end];
     syn::parse_str::<syn::ItemFn>(rule).expect("actual native callback phase rule");
     let harness = format!(r#"
@@ -47,7 +46,7 @@ mod nt_io_manager {{ pub mod scsi_source_retention {{
 
     let capture = include_str!("../../../components/ntos-executive/src/hosted_scsi_srb_capture.rs");
     let start = capture.find("pub(super) fn validate_retained(&self)").unwrap();
-    let end = start + capture[start..].find("\n    /// Re-observe").unwrap();
+    let end = start + capture[start..].find("\n    /// Native completion after publication").unwrap();
     let validation = &capture[start..end];
     assert!(validation.contains("scsi_children_match_after_callback("));
     assert!(validation.contains("scsi_children_match_current("));
@@ -56,4 +55,6 @@ mod nt_io_manager {{ pub mod scsi_source_retention {{
     ), "terminal retained validation must not depend solely on a deferred IRP free request");
     assert!(ledger.contains("scsi_registered_pool_matches_unlocked(inst, children.source)"),
         "callback lookup validates the pinned pool generation after reuse changes the IRP header");
+    assert!(capture.contains("pub(super) fn validate_published_source(&self, provider_irp: IrpId)"));
+    assert!(ledger.contains("scsi_children().published_source_owned(children, provider_irp)"));
 }

@@ -146,6 +146,26 @@ impl ScsiSourceRetentionLedger {
         })
     }
 
+    /// Exact old-use admission for a source-completion ACK after copyback was
+    /// published. The native adapter separately verifies the physical source
+    /// allocation; caller-owned child buffers may change after publication.
+    pub fn published_source_owned(
+        &self,
+        children: ScsiSourceChildren,
+        provider_irp: IrpId,
+    ) -> bool {
+        self.rows.iter().any(|row| {
+            row.children == children
+                && row.provider_irp == Some(provider_irp)
+                && row.source_published
+                && matches!(row.phase,
+                    ScsiSourcePhase::SourcePublished
+                        | ScsiSourcePhase::ProviderAcknowledged
+                        | ScsiSourcePhase::SourceCompleted
+                        | ScsiSourcePhase::ReadyToRelease)
+        })
+    }
+
     pub fn contains_exact(&self, children: ScsiSourceChildren) -> bool {
         self.rows.iter().any(|row| row.children == children)
     }
@@ -777,6 +797,40 @@ mod tests {
         ledger.acknowledge(next, next_provider).unwrap();
         ledger.release(next).unwrap();
         assert!(!ledger.protects_pool(next.source.owner, next.source.domain, 0x2000));
+    }
+
+    #[test]
+    fn published_old_use_admits_exact_completion_after_a_new_use_starts() {
+        let mut ledger = ScsiSourceRetentionLedger::new();
+        let old = fixture();
+        let mut next = old;
+        next.use_ticket = SourceIrpUseTicket::new(next.ticket, NonZeroU64::new(2).unwrap()).unwrap();
+        let old_provider = IrpId::new(3, 41);
+        let next_provider = IrpId::new(3, 42);
+        ledger.retain(old).unwrap();
+        ledger.enter(old, old_provider).unwrap();
+        ledger.terminal(old, old_provider).unwrap();
+        assert!(!ledger.published_source_owned(old, old_provider),
+            "provider terminal alone does not prove source copyback");
+        ledger.publish_source(old, old_provider).unwrap();
+        ledger.retain(next).unwrap();
+        ledger.enter(next, next_provider).unwrap();
+        assert!(ledger.published_source_owned(old, old_provider),
+            "the published old use survives same-address packet reuse");
+        assert!(!ledger.published_source_owned(next, next_provider),
+            "the uncompleted new use has no publication receipt");
+        assert!(!ledger.published_source_owned(old, next_provider),
+            "a provider from the next use cannot complete the old source");
+        let mut forged = old;
+        forged.data = None;
+        assert!(!ledger.published_source_owned(forged, old_provider),
+            "a changed child descriptor cannot forge the old-use receipt");
+        ledger.acknowledge(old, old_provider).unwrap();
+        assert!(ledger.published_source_owned(old, old_provider));
+        ledger.source_completed(old, old_provider).unwrap();
+        assert!(ledger.published_source_owned(old, old_provider));
+        ledger.release(old).unwrap();
+        assert!(!ledger.published_source_owned(old, old_provider));
     }
 
     #[test]

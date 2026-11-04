@@ -525,6 +525,24 @@ pub(super) fn scsi_children_match_after_callback(
     true
 }
 
+/// After source copyback is published, the caller may free or repurpose its
+/// transfer buffer. Completion and ACK still require the exact retained use,
+/// provider IRP, registered source allocation and physical pool generation.
+pub(super) fn scsi_published_source_matches(
+    instance_index: usize, children: ScsiSourceChildren, provider_irp: IrpId,
+) -> bool {
+    let _guard = lock();
+    if !scsi_children().published_source_owned(children, provider_irp)
+        || !ledger().admits_forward(children.ticket, children.source)
+    { return false; }
+    let Some(inst) = instance(instance_index) else { return false; };
+    if instance_domain_identity(inst) != Some(children.source.domain) { return false; }
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        return false;
+    };
+    unsafe { scsi_registered_pool_matches_unlocked(inst, children.source) }
+}
+
 pub(super) fn abandon_scsi_children(children: ScsiSourceChildren) -> bool {
     let _guard = lock();
     scsi_children().abandon_prepared(children).is_ok()

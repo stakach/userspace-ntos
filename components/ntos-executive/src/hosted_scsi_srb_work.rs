@@ -924,7 +924,8 @@ pub(super) unsafe fn acknowledge(
                 && same_instance(work.source_instance, source_instance)
                 && work.source.source_irp_address() == source_irp
                 && work.token == source_token
-                && work.source.validate_retained().is_ok()
+                && work.provider_irp.is_some_and(|provider_irp|
+                    work.source.validate_published_source(provider_irp).is_ok())
         })
     }) else {
         return Some(INVALID_HANDLE);
@@ -1017,7 +1018,8 @@ pub(super) unsafe fn hold_inline(
                 && same_instance(work.source_instance, source_instance)
                 && work.source.source_irp_address() == source_irp
                 && work.token == source_token
-                && work.source.validate_retained().is_ok()
+                && work.provider_irp.is_some_and(|provider_irp|
+                    work.source.validate_published_source(provider_irp).is_ok())
         })
     }) else {
         return INVALID_HANDLE;
@@ -1093,7 +1095,8 @@ pub(super) unsafe fn complete_held(
         trace_scsi_held_refusal(3, source_irp, source_token, index as u64);
         return INVALID_HANDLE;
     };
-    if work.source.validate_retained().is_err() {
+    if !work.provider_irp.is_some_and(|provider_irp|
+        work.source.validate_published_source(provider_irp).is_ok()) {
         trace_scsi_held_refusal(4, source_irp, source_token,
             work.source.scsi_identity().use_ticket().epoch().get());
         return INVALID_HANDLE;

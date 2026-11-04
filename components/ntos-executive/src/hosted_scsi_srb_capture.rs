@@ -264,6 +264,18 @@ impl CapturedSourceScsi {
         Ok(())
     }
 
+    /// Native completion after publication does not access the caller's SRB,
+    /// MDL, data or sense memory. The exact source use and physical IRP remain
+    /// pinned until provider ACK and source completion both finish.
+    pub(super) fn validate_published_source(&self, provider_irp: IrpId) -> Result<(), CaptureError> {
+        if !self.source_pinned || !self.children_retained
+            || !hosted_source_irp_ledger::scsi_published_source_matches(
+                self.instance_index, self.children, provider_irp,
+            )
+        { return Err(CaptureError::InvalidSource); }
+        Ok(())
+    }
+
     /// Re-observe the accepted parent relation and provider registration before entry. The
     /// physical source pins are independent and remain valid after this route is retired.
     pub(super) fn validate(&self) -> Result<(), CaptureError> {
