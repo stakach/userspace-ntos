@@ -32,6 +32,7 @@ static mut LEDGER: SourceIrpLedger = SourceIrpLedger::new();
 static mut AUXILIARY: SourceIrpAuxiliaryLedger = SourceIrpAuxiliaryLedger::new();
 static mut SCSI_CHILDREN: ScsiSourceRetentionLedger = ScsiSourceRetentionLedger::new();
 static IOREUSE_REFUSAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static IOREUSE_SCSI_SUCCESS_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static mut CALLER_PROJECTIONS: Option<Vec<CallerProjection>> = None;
 static mut CALLER_ACKS: Option<Vec<CallerTerminalAck>> = None;
 
@@ -1445,6 +1446,7 @@ struct IrpMutationDiagnostic {
     mutation_error: u8,
     auxiliary_present: u8,
     free_requested: u8,
+    scsi_use_epoch: u64,
 }
 
 fn trace_ioreuse_refusal(instance_index: usize, irp: u64, diagnostic: &IrpMutationDiagnostic) {
@@ -1486,6 +1488,19 @@ fn mutate_local_irp_packet(
     );
     if operation == hosted_irp_lifecycle_exports::REUSE && result.0 == STATUS_INVALID_HANDLE {
         trace_ioreuse_refusal(instance_index, irp, &diagnostic);
+    } else if operation == hosted_irp_lifecycle_exports::REUSE
+        && result.0 == STATUS_SUCCESS && diagnostic.scsi_use_epoch != 0
+        && IOREUSE_SCSI_SUCCESS_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 32
+    {
+        print_str(b"[ioreuse-scsi] instance/irp/registration/epoch=");
+        print_u64(instance_index as u64);
+        print_str(b"/");
+        print_hex64(irp);
+        print_str(b"/");
+        print_u64(diagnostic.ticket);
+        print_str(b"/");
+        print_u64(diagnostic.scsi_use_epoch);
+        print_str(b"\n");
     }
     result
 }
@@ -1641,11 +1656,13 @@ fn mutate_local_irp_packet_inner(
             return (STATUS_INVALID_PARAMETER, 0, 0);
         }
         diagnostic.stage = b"scsi-use-publication";
-        if ledger().plan_scsi_reuse(ticket, owner, |old_use| {
+        let use_ticket = match ledger().plan_scsi_reuse(ticket, owner, |old_use| {
             scsi_children().source_published(old_use)
-        }).is_err() {
-            return (STATUS_INVALID_HANDLE, 0, 0);
-        }
+        }) {
+            Ok(use_ticket) => use_ticket,
+            Err(_) => return (STATUS_INVALID_HANDLE, 0, 0),
+        };
+        diagnostic.scsi_use_epoch = use_ticket.epoch().get();
         packet.copy_from_slice(&staged);
         return (STATUS_SUCCESS, 0, 0);
     }

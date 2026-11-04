@@ -7285,6 +7285,7 @@ pub(crate) fn census_tick_static(now: u64) {
     CENSUS_LAST_DUMP.store(now, Ordering::Relaxed);
     let n = CENSUS_PERIODIC_DUMPS.fetch_add(1, Ordering::Relaxed);
     print_periodic_census_heartbeat(n, now);
+    spawn_hosts::print_active_irp_receive_census();
     service_sec_image::trace_csrss_post_resume_census(n);
     print_native_ssn_time();
     driver_launch::print_hosted_file_rpc_phase();

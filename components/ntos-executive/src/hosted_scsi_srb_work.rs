@@ -41,6 +41,7 @@ struct Work {
     terminal_information: u64,
     source_copyback_committed: bool,
     source_published: bool,
+    source_publish_failure_traced: bool,
     source_released: bool,
     reply_entered: bool,
     inline_held: bool,
@@ -90,6 +91,40 @@ static mut EXECUTING: Vec<(usize, DriverInstance, ScsiStackSource)> = Vec::new()
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 static CLAIM_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static SCSI_CAPTURE_REFUSAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static SCSI_PROGRESS_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Stages: 1 captured, 2 returned, 3 outstanding, 4 terminal,
+/// 5 source published, 6 publication refused, 7 source completed,
+/// 8 provider ACK, 9 released. Result is 1 for committed copyback at
+/// terminal, 0 for uncommitted copyback, and 0 at other stages.
+fn trace_scsi_progress(
+    stage: u64,
+    source: &hosted_scsi_srb_capture::CapturedSourceScsi,
+    provider_irp: Option<IrpId>,
+    status: i32,
+    information: u64,
+    result: u64,
+) {
+    if SCSI_PROGRESS_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 256 { return; }
+    let opcode = source.wire_srb().ok().map_or(0xff, |srb| srb[0x48]);
+    print_str(b"[scsi-progress] stage/source/use/cdb/provider/status/info/result=");
+    print_u64(stage);
+    print_str(b"/");
+    print_u64(source.source_irp_address());
+    print_str(b"/");
+    print_u64(source.scsi_identity().use_ticket().epoch().get());
+    print_str(b"/");
+    print_hex(u32::from(opcode));
+    print_str(b"/");
+    print_u64(provider_irp.map_or(0, IrpId::raw));
+    print_str(b"/");
+    print_hex(status as u32);
+    print_str(b"/");
+    print_u64(information);
+    print_str(b"/");
+    print_u64(result);
+    print_str(b"\n");
+}
 
 fn trace_claim(stage: u64, status: i32, detail: u64) {
     if CLAIM_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 16 { return; }
@@ -182,6 +217,7 @@ pub(super) unsafe fn submit(
             Ok(source) => source,
             Err(error) => return Some(capture_status(error)),
         };
+    trace_scsi_progress(1, &source, None, STATUS_SUCCESS, 0, 0);
     if work_index(source_instance, source.scsi_identity()).is_some() {
         source
             .abandon_unentered()
@@ -271,6 +307,7 @@ pub(super) unsafe fn submit(
         terminal_information: 0,
         source_copyback_committed: false,
         source_published: false,
+        source_publish_failure_traced: false,
         source_released: false,
         reply_entered: false,
         inline_held: false,
@@ -298,6 +335,15 @@ pub(super) unsafe fn submit(
 }
 
 impl Work {
+    fn trace_terminal(&self) {
+        if let Some(status) = self.terminal_status {
+            trace_scsi_progress(
+                4, &self.source, self.provider_irp, status,
+                self.terminal_information, u64::from(self.source_copyback_committed),
+            );
+        }
+    }
+
     unsafe fn actor_release(&mut self) -> Result<(), u32> {
         crate::service_sec_image::with_provider_process_manager(|pm| self.actor.release(pm))
     }
@@ -402,12 +448,14 @@ impl Work {
                 self.provider_irp = Some(irp_id);
                 self.canonical_irp = Some(irp_id);
                 self.entered_provider = true;
+                trace_scsi_progress(2, &self.source, Some(irp_id), status.raw(), information, 0);
                 let (_, output) = buffers.into_parts();
                 self.observe_terminal(status.raw(), information, &output);
                 self.provider_acknowledged = true;
                 self.source
                     .provider_acknowledged(irp_id)
                     .expect("SCSI returned canonical acknowledgement");
+                trace_scsi_progress(8, &self.source, Some(irp_id), status.raw(), information, 0);
                 self.canonical_irp = None;
             }
             Ok(hosted_file_owners::DispatchResult::Outstanding { irp_id }) => {
@@ -423,6 +471,7 @@ impl Work {
                 self.provider_irp = Some(irp_id);
                 self.canonical_irp = Some(irp_id);
                 self.entered_provider = true;
+                trace_scsi_progress(3, &self.source, Some(irp_id), STATUS_PENDING as i32, 0, 0);
             }
             Err(status) if status == nt_status::NtStatus::DEVICE_BUSY => {}
             Err(status) => {
@@ -475,6 +524,7 @@ impl Work {
                 return;
             },
         });
+        self.trace_terminal();
     }
 
     unsafe fn project_invalid_provider_terminal(&mut self) {
@@ -482,6 +532,7 @@ impl Work {
         self.terminal_information = 0;
         self.source_copyback_committed = self.source
             .write_error_completion(INVALID_DEVICE_REQUEST).is_ok();
+        self.trace_terminal();
     }
 
     unsafe fn poll_provider(&mut self) {
@@ -562,6 +613,7 @@ impl Work {
                     .provider_acknowledged(irp)
                     .expect("SCSI acknowledged canonical completion");
                 self.provider_acknowledged = true;
+                trace_scsi_progress(8, &self.source, Some(irp), STATUS_SUCCESS, 0, 0);
             }
             self.canonical_irp = None;
         }
@@ -574,6 +626,7 @@ impl Work {
                 return false;
             }
             self.source_released = true;
+            trace_scsi_progress(9, &self.source, self.provider_irp, STATUS_SUCCESS, 0, 0);
         }
         !self.actor.is_held() || self.actor_release().is_ok()
     }
@@ -709,9 +762,16 @@ impl Work {
         };
         if self.entered_provider {
             if !self.publish_source_terminal() {
+                if !self.source_publish_failure_traced {
+                    trace_scsi_progress(6, &self.source, self.provider_irp, status,
+                        self.terminal_information, 0);
+                    self.source_publish_failure_traced = true;
+                }
                 return false;
             }
             self.source_published = true;
+            trace_scsi_progress(5, &self.source, self.provider_irp, status,
+                self.terminal_information, 0);
         }
         self.reply_entered = true;
         let disposition = if self.source_published {
@@ -904,6 +964,7 @@ pub(super) unsafe fn acknowledge(
             return Some(DEVICE_BUSY);
         }
         work.source_completed = true;
+        trace_scsi_progress(7, &work.source, Some(provider_irp), STATUS_SUCCESS, 0, 0);
     }
     runtime::retire_stopped_acknowledged_retained_service(
         work.route,
@@ -1031,5 +1092,6 @@ pub(super) unsafe fn complete_held(
         return DEVICE_BUSY;
     }
     work.source_completed = true;
+    trace_scsi_progress(7, &work.source, Some(provider_irp), STATUS_SUCCESS, 0, 0);
     STATUS_SUCCESS
 }

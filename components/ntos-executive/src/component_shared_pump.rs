@@ -10,6 +10,106 @@ use nt_component_suspension::peer_registry::PeerRoute;
 static ACTIVE_IRP_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SYSCALL_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_RETAINED_SEH_RECEIVES: AtomicU64 = AtomicU64::new(0);
+const ACTIVE_IRP_SNAPSHOT_SLOTS: usize = 8;
+const SNAPSHOT_CLAIMED: u64 = u64::MAX;
+static NEXT_IRP_SNAPSHOT: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_IRP_SNAPSHOT_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+// The receive scope owns the shared mapping. Publish only copied numeric values so a periodic
+// census never dereferences a component mapping after its scope or instance has retired.
+struct ActiveIrpSnapshot {
+    sequence: AtomicU64,
+    domain: AtomicU64,
+    cookie: AtomicU64,
+    route: AtomicU64,
+    tcb: AtomicU64,
+    shared_va: AtomicU64,
+    reply: AtomicU64,
+    source_irp: AtomicU64,
+    control_id: AtomicU64,
+    major: AtomicU64,
+    minor: AtomicU64,
+}
+
+impl ActiveIrpSnapshot {
+    const fn new() -> Self {
+        Self {
+            sequence: AtomicU64::new(0),
+            domain: AtomicU64::new(0),
+            cookie: AtomicU64::new(0),
+            route: AtomicU64::new(0),
+            tcb: AtomicU64::new(0),
+            shared_va: AtomicU64::new(0),
+            reply: AtomicU64::new(0),
+            source_irp: AtomicU64::new(0),
+            control_id: AtomicU64::new(0),
+            major: AtomicU64::new(0),
+            minor: AtomicU64::new(0),
+        }
+    }
+}
+
+static ACTIVE_IRP_SNAPSHOTS: [ActiveIrpSnapshot; ACTIVE_IRP_SNAPSHOT_SLOTS] =
+    [const { ActiveIrpSnapshot::new() }; ACTIVE_IRP_SNAPSHOT_SLOTS];
+
+fn capture_active_irp_snapshot(ch: &PumpChannel, route: PeerRoute) -> Option<(usize, u64)> {
+    let sequence = NEXT_IRP_SNAPSHOT.fetch_add(1, Ordering::Relaxed);
+    if sequence == 0 || sequence == SNAPSHOT_CLAIMED {
+        ACTIVE_IRP_SNAPSHOT_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let Some((index, slot)) = ACTIVE_IRP_SNAPSHOTS.iter().enumerate().find(|(_, slot)| {
+        slot.sequence.compare_exchange(0, SNAPSHOT_CLAIMED,
+            Ordering::AcqRel, Ordering::Relaxed).is_ok()
+    }) else {
+        ACTIVE_IRP_SNAPSHOT_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let domain = ch.physical_domain;
+    slot.domain.store(domain.map_or(0, |id| id.domain_id.raw()), Ordering::Relaxed);
+    slot.cookie.store(domain.map_or(0, |id| id.cookie), Ordering::Relaxed);
+    slot.route.store(route.badge(), Ordering::Relaxed);
+    slot.tcb.store(ch.tcb, Ordering::Relaxed);
+    slot.shared_va.store(ch.shared_va, Ordering::Relaxed);
+    slot.reply.store(unsafe { runtime::current_reply(route).unwrap_or(0) }, Ordering::Relaxed);
+    if ch.shared_va != 0 {
+        let read = |offset| unsafe { core::ptr::read_volatile((ch.shared_va + offset) as *const u64) };
+        slot.source_irp.store(read(crate::driver_launch::SH_ACTIVE_IRP), Ordering::Relaxed);
+        slot.control_id.store(read(crate::driver_launch::SH_REQ_CONTROL_ID), Ordering::Relaxed);
+        slot.major.store(read(crate::driver_launch::SH_REQ_MAJOR), Ordering::Relaxed);
+        slot.minor.store(read(crate::driver_launch::SH_REQ_MINOR), Ordering::Relaxed);
+    }
+    slot.sequence.store(sequence, Ordering::Release);
+    Some((index, sequence))
+}
+
+pub(super) fn print_active_irp_receive_census() {
+    for (index, slot) in ACTIVE_IRP_SNAPSHOTS.iter().enumerate() {
+        let sequence = slot.sequence.load(Ordering::Acquire);
+        if sequence == 0 || sequence == SNAPSHOT_CLAIMED { continue; }
+        let values = [
+            slot.domain.load(Ordering::Relaxed), slot.cookie.load(Ordering::Relaxed),
+            slot.route.load(Ordering::Relaxed), slot.tcb.load(Ordering::Relaxed),
+            slot.shared_va.load(Ordering::Relaxed), slot.reply.load(Ordering::Relaxed),
+            slot.source_irp.load(Ordering::Relaxed), slot.control_id.load(Ordering::Relaxed),
+            slot.major.load(Ordering::Relaxed), slot.minor.load(Ordering::Relaxed),
+        ];
+        if slot.sequence.load(Ordering::Acquire) != sequence { continue; }
+        crate::print_str(b"[pump-active-irp] slot/sequence/domain/cookie/route/tcb/shared/reply/source-irp/control-id/major/minor=");
+        crate::print_u64(index as u64);
+        crate::print_str(b"/"); crate::print_u64(sequence);
+        for value in values {
+            crate::print_str(b"/"); crate::print_u64(value);
+        }
+        crate::print_str(b"\n");
+    }
+    let overflow = ACTIVE_IRP_SNAPSHOT_OVERFLOW.load(Ordering::Relaxed);
+    if overflow != 0 {
+        crate::print_str(b"[pump-active-irp] snapshot-overflow=");
+        crate::print_u64(overflow);
+        crate::print_str(b"\n");
+    }
+}
 static IRQ_IRP_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static IRQ_SYSCALL_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static IRQ_RETAINED_SEH_RECEIVES: AtomicU64 = AtomicU64::new(0);
@@ -120,10 +220,15 @@ fn trace_ps_create_receive(ch: &PumpChannel, stage: &[u8], route: Option<PeerRou
 struct ReceiveCensusScope {
     kind: ReqKind,
     retained_seh: bool,
+    irp_snapshot: Option<(usize, u64)>,
 }
 
 impl ReceiveCensusScope {
-    fn enter(kind: ReqKind, retained_seh: bool) -> Self {
+    fn enter(ch: &PumpChannel, route: PeerRoute, retained_seh: bool) -> Self {
+        let kind = ch.caps.kind;
+        let irp_snapshot = if kind == ReqKind::Irp {
+            capture_active_irp_snapshot(ch, route)
+        } else { None };
         match kind {
             ReqKind::Irp => { ACTIVE_IRP_RECEIVES.fetch_add(1, Ordering::Relaxed); }
             ReqKind::Syscall => { ACTIVE_SYSCALL_RECEIVES.fetch_add(1, Ordering::Relaxed); }
@@ -131,12 +236,17 @@ impl ReceiveCensusScope {
         if retained_seh {
             ACTIVE_RETAINED_SEH_RECEIVES.fetch_add(1, Ordering::Relaxed);
         }
-        Self { kind, retained_seh }
+        Self { kind, retained_seh, irp_snapshot }
     }
 }
 
 impl Drop for ReceiveCensusScope {
     fn drop(&mut self) {
+        if let Some((index, sequence)) = self.irp_snapshot {
+            let _ = ACTIVE_IRP_SNAPSHOTS[index].sequence.compare_exchange(
+                sequence, 0, Ordering::AcqRel, Ordering::Relaxed,
+            );
+        }
         match self.kind {
             ReqKind::Irp => { ACTIVE_IRP_RECEIVES.fetch_sub(1, Ordering::Relaxed); }
             ReqKind::Syscall => { ACTIVE_SYSCALL_RECEIVES.fetch_sub(1, Ordering::Relaxed); }
@@ -208,7 +318,7 @@ unsafe fn inline_irq_work_pending() -> bool {
 pub(super) unsafe fn receive(
     ch: &PumpChannel, route: PeerRoute, retained_seh: bool, serviced_scheduler_yield: bool,
 ) -> PumpMessage {
-    let _census_scope = ReceiveCensusScope::enter(ch.caps.kind, retained_seh);
+    let _census_scope = ReceiveCensusScope::enter(ch, route, retained_seh);
     // A retained exception walk and an ordinary syscall channel without kernel IRQ yield cannot
     // return a scheduler continuation. Give already-latched work one isolated pass here instead.
     let inline_irq_checkpoint =
