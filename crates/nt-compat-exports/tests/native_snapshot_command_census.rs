@@ -103,6 +103,12 @@ fn audit_commands(file: &syn::File, transport: &str, operation: &str, sectors: &
         found: usize,
     }
     impl<'ast> Visit<'ast> for Audit<'_> {
+        fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
+            // GPT discovery runs before Fat32 exists, so it has no mount census gate.
+            if function.sig.ident != "read_disk_sector_into" {
+                syn::visit::visit_item_fn(self, function);
+            }
+        }
         fn visit_block(&mut self, block: &'ast syn::Block) {
             for (index, statement) in block.stmts.iter().enumerate() {
                 let command = facts(statement);

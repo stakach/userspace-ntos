@@ -23,11 +23,33 @@ const FAT_PATH_PARENT_CANDIDATES: usize = 8;
 static mut EXEC_FAT_PATH_LOOKUP_CENSUS: nt_fs::FatPathLookupCensus<FAT_PATH_PARENT_CANDIDATES> =
     nt_fs::FatPathLookupCensus::new();
 static DIRECT_READ_CENSUS: nt_ahci::DirectReadCensus = nt_ahci::DirectReadCensus::new();
+static FAT_READ_FAILURE_REPORTS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 static DIRECT_READ_CENSUS_PRINTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 const _: () = assert!(
     FAT32_FAT_CACHE_OFFSET + core::mem::size_of::<FatSectorCacheScratch>() as u64 <= 0x1000
 );
+
+fn report_fat_read_failure(context: &[u8], sector: u64, count: u32, status: u32) {
+    use core::sync::atomic::Ordering;
+    let reported = FAT_READ_FAILURE_REPORTS.fetch_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |reported| Some(reported.saturating_add(1)),
+    ).unwrap_or(u32::MAX);
+    if reported >= 8 {
+        return;
+    }
+    print_str(context);
+    print_str(b" read failure sector=");
+    print_u64(sector);
+    print_str(b" count=");
+    print_u64(count as u64);
+    print_str(b" status=");
+    print_hex(status);
+    print_str(b"\n");
+}
 
 unsafe fn read_owner_sector(
     owner: FatIoOwner,
@@ -200,10 +222,8 @@ unsafe fn fat_read_sector_checked(
         status & nt_ahci::TASK_FILE_FAILURE != 0,
     );
     fat_direct_read_census_record(census_started, 1, callsite);
-    if status == 0xFF {
-        print_str(b"[fat-sector] read timeout sector=");
-        print_u64(sector as u64);
-        print_str(b"\n");
+    if !nt_ahci::read_completion_ok(status) {
+        report_fat_read_failure(b"[fat-sector]", sector as u64, 1, status);
         return None;
     }
     Some((fs.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *const u8)
@@ -226,12 +246,8 @@ unsafe fn fat_read_sectors_checked(fs: &Fat32, sector: u32, count: u32) -> Optio
         count as u64,
         nt_ahci::FatOneSectorCallsite::FilePayload,
     );
-    if status == 0xFF {
-        print_str(b"[fat-sector] read timeout sector=");
-        print_u64(sector as u64);
-        print_str(b" count=");
-        print_u64(count as u64);
-        print_str(b"\n");
+    if !nt_ahci::read_completion_ok(status) {
+        report_fat_read_failure(b"[fat-sector]", sector as u64, count, status);
         return None;
     }
     Some((fs.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *const u8)
@@ -476,14 +492,27 @@ pub(crate) unsafe fn fat_volume_size(fs: &Fat32) -> Option<nt_fs::VolumeSizeInfo
         || fs.spc == 0
         || fs.total_sectors <= fs.data_start
         || fs.fs_info_sector == 0
-        || read_owner_sector(
-            fs.io_owner,
-            fs.ahci_vaddr,
-            fs.dma_vaddr,
-            fs.dma_paddr,
-            nt_fs::checked_partition_lba(fs.volume_start_lba, fs.fs_info_sector)?,
-        ) == 0xff
     {
+        return None;
+    }
+    let disk_lba = nt_fs::checked_partition_lba(fs.volume_start_lba, fs.fs_info_sector)?;
+    let census_started = fs.census.then(disk_census_ticks);
+    let status = read_owner_sector(
+        fs.io_owner,
+        fs.ahci_vaddr,
+        fs.dma_vaddr,
+        fs.dma_paddr,
+        disk_lba,
+    );
+    disk_census_record(
+        nt_ahci::IoOperation::Read,
+        census_started,
+        1,
+        status & nt_ahci::TASK_FILE_FAILURE != 0,
+    );
+    fat_direct_read_census_record(census_started, 1, nt_ahci::FatOneSectorCallsite::Other);
+    if !nt_ahci::read_completion_ok(status) {
+        report_fat_read_failure(b"[fat-fsinfo]", fs.fs_info_sector as u64, 1, status);
         return None;
     }
     let base = fs.dma_vaddr + AHCI_DMA_DATA_OFFSET;
@@ -1607,10 +1636,9 @@ unsafe fn read_disk_sector_into(
     lba: u64,
     out: &mut [u8; nt_fs::DISK_SECTOR_BYTES],
 ) -> Option<()> {
-    if read_owner_sector(owner, ahci_vaddr, dma_vaddr, dma_paddr, lba) == 0xff {
-        print_str(b"[fat-mount] read timeout lba=");
-        print_u64(lba);
-        print_str(b"\n");
+    let status = read_owner_sector(owner, ahci_vaddr, dma_vaddr, dma_paddr, lba);
+    if !nt_ahci::read_completion_ok(status) {
+        report_fat_read_failure(b"[fat-mount]", lba, 1, status);
         return None;
     }
     core::ptr::copy_nonoverlapping(
