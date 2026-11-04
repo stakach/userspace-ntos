@@ -13,6 +13,10 @@ use nt_io_manager::source_irp_auxiliary::{
     SourceIrpCompletionOwner, SourceMdlAllocationIdentity, SourceMemoryIdentity,
     SourcePoolAllocationIdentity,
 };
+use nt_io_manager::source_irp_auxiliary_buffer::{
+    classify_source_auxiliary_buffer, matches_captured_buffered_control,
+    CapturedBufferedControlOutput, SourceAuxiliaryBufferKind, SourceAuxiliaryBufferRequest,
+};
 use nt_io_manager::source_irp_ledger::{
     SourceIrpAllocation, SourceIrpForwardIdentity, SourceIrpLedger, SourceIrpLedgerError,
     SourceIrpOwner, SourceIrpRetirement,
@@ -601,6 +605,32 @@ fn memory_bytes(identity: SourceMemoryIdentity) -> u64 {
     }
 }
 
+/// Read the source's selected stack, not a lower driver's current stack. The
+/// offsets follow the WDM x64 IO_STACK_LOCATION serializer in nt-io-manager.
+unsafe fn source_auxiliary_buffer_request(irp: u64, stack: u64) -> SourceAuxiliaryBufferRequest {
+    let major = read_unaligned(stack as *const u8);
+    let minor = read_unaligned((stack + 1) as *const u8);
+    let stack_length = if matches!(major, major::IRP_MJ_READ | major::IRP_MJ_WRITE) {
+        read_unaligned((stack + 0x08) as *const u32)
+    } else if major == major::IRP_MJ_SYSTEM_CONTROL && minor == 8 {
+        read_unaligned((stack + 0x18) as *const u32)
+    } else { 0 };
+    let control = major == major::IRP_MJ_DEVICE_CONTROL;
+    SourceAuxiliaryBufferRequest {
+        major,
+        minor,
+        stack_length,
+        control_code: if control { read_unaligned((stack + 0x18) as *const u32) } else { 0 },
+        control_input_length: if control { read_unaligned((stack + 0x10) as *const u32) } else { 0 },
+        control_output_length: if control { read_unaligned((stack + 0x08) as *const u32) } else { 0 },
+        control_type3_input_buffer: if control { read_unaligned((stack + 0x20) as *const u64) } else { 0 },
+        irp_flags: read_unaligned((irp + 0x10) as *const u32),
+        system_buffer: read_unaligned((irp + 0x18) as *const u64),
+        mdl: read_unaligned((irp + 0x08) as *const u64),
+        user_buffer: read_unaligned((irp + 0x70) as *const u64),
+    }
+}
+
 unsafe fn capture_auxiliary_unlocked(
     instance_index: usize,
     inst: DriverInstance,
@@ -630,31 +660,19 @@ unsafe fn capture_auxiliary_unlocked(
         return None;
     }
     let stack = irp + source.bytes - WDM_X64_IO_STACK_LOCATION_SIZE as u64;
-    let major = read_unaligned(stack as *const u8);
-    let minor = read_unaligned((stack + 1) as *const u8);
-    let wmi_reginfo = major == major::IRP_MJ_SYSTEM_CONTROL && minor == 8;
-    if !matches!(
-        major,
-        major::IRP_MJ_READ
-            | major::IRP_MJ_WRITE
-            | major::IRP_MJ_FLUSH_BUFFERS
-            | major::IRP_MJ_SHUTDOWN
-            | major::IRP_MJ_PNP
-            | major::IRP_MJ_POWER
-    ) && !wmi_reginfo {
-        return None;
-    }
-    let transfer = matches!(major, major::IRP_MJ_READ | major::IRP_MJ_WRITE);
-    let length = if transfer || wmi_reginfo {
-        let length_offset = if wmi_reginfo { 0x18 } else { 0x08 };
-        read_unaligned((stack + length_offset) as *const u32)
-    } else {
-        0
-    };
-    let flags = read_unaligned((irp + 0x10) as *const u32);
-    let system_address = read_unaligned((irp + 0x18) as *const u64);
-    let mdl_address = read_unaligned((irp + 0x08) as *const u64);
-    let user_buffer = read_unaligned((irp + 0x70) as *const u64);
+    let request = source_auxiliary_buffer_request(irp, stack);
+    let major = request.major;
+    let flags = request.irp_flags;
+    let system_address = request.system_buffer;
+    let mdl_address = request.mdl;
+    let user_buffer = request.user_buffer;
+    let Some(buffer_contract) = classify_source_auxiliary_buffer(request) else { return None; };
+    let wmi_reginfo = buffer_contract.kind == SourceAuxiliaryBufferKind::WmiReginfo;
+    let transfer = matches!(buffer_contract.kind,
+        SourceAuxiliaryBufferKind::Read | SourceAuxiliaryBufferKind::Write);
+    let buffered_control = buffer_contract.kind
+        == SourceAuxiliaryBufferKind::BufferedControlOutput;
+    let length = buffer_contract.system_length;
     if system_address != 0 && mdl_address != 0 {
         return None;
     }
@@ -680,12 +698,12 @@ unsafe fn capture_auxiliary_unlocked(
     let system_buffer = if system_address != 0 {
         let expected = IRP_BUFFERED_IO
             | IRP_DEALLOCATE_BUFFER
-            | if major == major::IRP_MJ_READ {
+            | if major == major::IRP_MJ_READ || buffered_control {
                 IRP_INPUT_OPERATION
             } else {
                 0
             };
-        if length == 0 || (!wmi_reginfo && (!transfer || flags != expected)) {
+        if length == 0 || (!wmi_reginfo && (!transfer && !buffered_control || flags != expected)) {
             return None;
         }
         Some(exact_pool_identity_unlocked(
@@ -708,7 +726,8 @@ unsafe fn capture_auxiliary_unlocked(
         (None, None)
     };
 
-    let transfer_address = if length == 0 || major == major::IRP_MJ_WRITE && system_buffer.is_some()
+    let output_length = if buffered_control { buffer_contract.output_length } else { length };
+    let transfer_address = if output_length == 0 || major == major::IRP_MJ_WRITE && system_buffer.is_some()
     {
         None
     } else if let Some(address) = mdl_buffer_address {
@@ -716,10 +735,10 @@ unsafe fn capture_auxiliary_unlocked(
     } else {
         (user_buffer != 0).then_some(user_buffer)
     };
-    if transfer && length != 0 && transfer_address.is_none() {
+    if (transfer || buffered_control) && output_length != 0 && transfer_address.is_none() {
         return None;
     }
-    if !transfer && !wmi_reginfo
+    if !transfer && !wmi_reginfo && !buffered_control
         && (flags != 0 || system_address != 0 || mdl_address != 0 || user_buffer != 0)
     {
         return None;
@@ -730,7 +749,7 @@ unsafe fn capture_auxiliary_unlocked(
             inst,
             caller.runtime,
             address,
-            u64::from(length),
+            u64::from(output_length),
         )
     });
     if transfer_address.is_some() && transfer_buffer.is_none() {
@@ -785,6 +804,12 @@ unsafe fn capture_auxiliary_unlocked(
         system_buffer,
         mdl,
         transfer_buffer,
+        buffered_control: buffered_control.then(||
+            CapturedBufferedControlOutput {
+                code: request.control_code,
+                output_length: buffer_contract.output_length,
+            },
+        ),
         completion: SourceIrpCompletionOwner {
             thread_handle: caller.thread_handle,
             thread_object,
@@ -868,6 +893,19 @@ unsafe fn auxiliary_matches_unlocked(
         || !memory_identity_matches_unlocked(instance_index, inst, auxiliary.completion.iosb)
     {
         return false;
+    }
+    if phase == SourceIrpAuxiliaryPhase::Protected {
+        if let Some(control) = auxiliary.buffered_control {
+            let Some(stack) = auxiliary.source.bytes
+                .checked_sub(WDM_X64_IO_STACK_LOCATION_SIZE as u64)
+                .and_then(|offset| irp.checked_add(offset))
+            else { return false; };
+            if !matches_captured_buffered_control(
+                source_auxiliary_buffer_request(irp, stack), control,
+            ) {
+                return false;
+            }
+        }
     }
     if phase == SourceIrpAuxiliaryPhase::Completing {
         return true;
