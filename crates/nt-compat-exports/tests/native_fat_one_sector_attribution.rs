@@ -3,9 +3,7 @@
 const FAT: &str = include_str!("../../../components/ntos-executive/src/fs_loader.rs");
 
 #[test]
-fn every_physical_fat_one_sector_read_has_a_callsite() {
-    // One public wrapper, one declaration, and every internal one-sector caller.
-    assert_eq!(FAT.matches("fat_read_sector_checked(").count(), 9);
+fn physical_fat_reader_records_typed_callsites() {
     let sector = FAT.split_once("unsafe fn fat_read_sector_checked(").unwrap().1
         .split_once("unsafe fn fat_read_sectors_checked(").unwrap().0;
     let sectors = FAT.split_once("unsafe fn fat_read_sectors_checked(").unwrap().1

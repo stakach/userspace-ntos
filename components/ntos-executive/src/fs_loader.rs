@@ -1083,9 +1083,25 @@ unsafe fn fat_lookup_metadata(
             nt_fs::FatPathRequestKind::Fat => nt_ahci::FatOneSectorCallsite::FatLink,
             nt_fs::FatPathRequestKind::Directory => nt_ahci::FatOneSectorCallsite::Directory,
         };
-        let sector = fat_read_sector_checked(fs, request.sector, callsite)?;
         let mut bytes = [0; 512];
-        core::ptr::copy_nonoverlapping(sector, bytes.as_mut_ptr(), bytes.len());
+        if request.kind == nt_fs::FatPathRequestKind::Fat
+            && fs.census
+            && matches!(fs.io_owner, FatIoOwner::Executive)
+        {
+            let mount = exec_fs_mount_identity()?;
+            let sector = (&mut *core::ptr::addr_of_mut!(EXEC_FAT_SECTOR_CACHE))
+                .read_sector(mount.value(), request.sector, |sector, data| {
+                    let ptr = fat_read_sector_checked(fs, sector, callsite)
+                        .ok_or(nt_fs::STATUS_DATA_ERROR)?;
+                    core::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), data.len());
+                    Ok(())
+                })
+                .ok()?;
+            bytes.copy_from_slice(sector);
+        } else {
+            let sector = fat_read_sector_checked(fs, request.sector, callsite)?;
+            core::ptr::copy_nonoverlapping(sector, bytes.as_mut_ptr(), bytes.len());
+        }
         match lookup.feed(request, &bytes).ok()? {
             nt_fs::FatPathProgress::Pending => {}
             nt_fs::FatPathProgress::Found => {
@@ -1413,7 +1429,12 @@ pub(crate) fn begin_exec_mount_drain() -> Result<(), nt_fs::BlockRouteError> {
             .as_mut()
             .ok_or(nt_fs::BlockRouteError::InvalidMount)?;
         match route.source_kind() {
-            nt_fs::BlockSourceKind::Boot => route.begin_drain(mount.value()),
+            nt_fs::BlockSourceKind::Boot => {
+                route.begin_drain(mount.value())?;
+                (&mut *core::ptr::addr_of_mut!(EXEC_FAT_SECTOR_CACHE)).invalidate();
+                (&mut *core::ptr::addr_of_mut!(EXEC_FAT_RANGE_CURSORS)).invalidate();
+                Ok(())
+            }
             nt_fs::BlockSourceKind::Draining => Ok(()),
             nt_fs::BlockSourceKind::Native => Err(nt_fs::BlockRouteError::WrongPhase),
         }

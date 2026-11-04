@@ -30,12 +30,26 @@ impl FatSectorCache {
         mount_generation: u64,
         sector: u32,
         byte_offset: u32,
-        mut fetch: impl FnMut(u32, &mut [u8; 512]) -> Result<(), u32>,
+        fetch: impl FnMut(u32, &mut [u8; 512]) -> Result<(), u32>,
     ) -> Result<u32, u32> {
         let offset = byte_offset as usize;
         if offset > self.data.len() - 4 {
             return Err(STATUS_DATA_ERROR);
         }
+        let sector = self.read_sector(mount_generation, sector, fetch)?;
+        let mut entry = [0; 4];
+        entry.copy_from_slice(&sector[offset..offset + 4]);
+        Ok(u32::from_le_bytes(entry))
+    }
+
+    /// Borrow the exact-generation FAT sector, fetching it on a miss. Copy data before any
+    /// subsequent I/O or cache mutation; a failed fetch leaves no valid cached sector.
+    pub fn read_sector(
+        &mut self,
+        mount_generation: u64,
+        sector: u32,
+        mut fetch: impl FnMut(u32, &mut [u8; 512]) -> Result<(), u32>,
+    ) -> Result<&[u8; 512], u32> {
         if !self.valid || self.mount_generation != mount_generation || self.sector != sector {
             self.valid = false;
             fetch(sector, &mut self.data)?;
@@ -43,9 +57,7 @@ impl FatSectorCache {
             self.sector = sector;
             self.valid = true;
         }
-        let mut entry = [0; 4];
-        entry.copy_from_slice(&self.data[offset..offset + 4]);
-        Ok(u32::from_le_bytes(entry))
+        Ok(&self.data)
     }
 }
 
