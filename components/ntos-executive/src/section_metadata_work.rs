@@ -18,6 +18,7 @@ const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xc000_007b;
 const RETRY_DELAY: u64 = 1_000_000;
 const IMAGE_HEADER_READ_SIZE: usize = 0x1000;
 const IMAGE_HEADER_WINDOW_SIZE: usize = 2 * IMAGE_HEADER_READ_SIZE;
+const IMAGE_TIMING_SAMPLE_LIMIT: u64 = 64;
 
 pub(crate) struct ImageObjectName {
     pub(crate) root_index: usize,
@@ -92,6 +93,10 @@ impl ReservedSection {
 }
 
 struct Work {
+    // Observation only: elapsed time for the first bounded set of routed image requests.
+    timing_started_100ns: u64,
+    timing_header_ready_100ns: Option<u64>,
+    timing_trace_pending: bool,
     caller: NativeHandleCaller,
     logical: ProviderLogicalCaller,
     reference: NativeThreadProcessReference,
@@ -143,6 +148,30 @@ static CURSOR: AtomicU64 = AtomicU64::new(0);
 static NEXT: AtomicU64 = AtomicU64::new(0);
 static ROUTED_OBSERVATION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static IMAGE_NOT_SUPPORTED_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static IMAGE_TIMING_TRACE_N: AtomicU64 = AtomicU64::new(0);
+
+fn trace_image_timing(work: &mut Work) {
+    if !work.timing_trace_pending { return; }
+    work.timing_trace_pending = false;
+    let ready = monotonic_time_100ns();
+    print_str(b"[section-image-timing] tid/file/status/header-ms/after-header-ms/total-ms=");
+    print_u64(work.tid);
+    print_str(b"/");
+    print_hex_u64(work.file_handle);
+    print_str(b"/");
+    print_hex_u64(u64::from(work.status));
+    print_str(b"/");
+    if let Some(header) = work.timing_header_ready_100ns {
+        print_u64(header.saturating_sub(work.timing_started_100ns) / 10_000);
+        print_str(b"/");
+        print_u64(ready.saturating_sub(header) / 10_000);
+    } else {
+        print_str(b"-/-");
+    }
+    print_str(b"/");
+    print_u64(ready.saturating_sub(work.timing_started_100ns) / 10_000);
+    print_str(b"\n");
+}
 
 fn trace_image_not_supported(work: &Work, phase: &[u8], status: u32) {
     if work.allocation_attrs & 0x0100_0000 == 0 || status != 0xc000_00bb
@@ -163,6 +192,7 @@ fn finish_sparse_header_window(work: &mut Work) {
         Ok(Some(layout)) => {
             work.image_header.clear();
             work.image_layout = Some(layout);
+            work.timing_header_ready_100ns = Some(monotonic_time_100ns());
             work.phase = Phase::Publish;
         }
         Ok(None) => {
@@ -420,7 +450,13 @@ unsafe fn retain_work(
     }
     let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     assert_ne!(reply, 0);
+    let timing_trace_pending = submission.allocation_attrs & 0x0100_0000 != 0
+        && submission.mount.is_some()
+        && IMAGE_TIMING_TRACE_N.fetch_add(1, Ordering::Relaxed) < IMAGE_TIMING_SAMPLE_LIMIT;
     let work = Work {
+        timing_started_100ns: monotonic_time_100ns(),
+        timing_header_ready_100ns: None,
+        timing_trace_pending,
         caller,
         logical,
         reference,
@@ -1002,6 +1038,7 @@ unsafe fn advance(
                             match layout {
                                 Ok(layout) => {
                                     work.image_layout = Some(layout);
+                                    work.timing_header_ready_100ns = Some(monotonic_time_100ns());
                                     work.phase = Phase::Publish;
                                 }
                                 Err(nt_pe_loader::ImageHeaderCaptureError::Read(status)) => {
@@ -1371,6 +1408,7 @@ unsafe fn advance(
             }
         }
         Phase::ReadyReply => {
+            trace_image_timing(work);
             trace_image_not_supported(work, b"reply", work.status);
             if work.cancelled {
                 if let Some(handle) = work
