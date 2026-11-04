@@ -59649,7 +59649,13 @@ pub(crate) fn service_hosted_device(
         let (_, inst, device_id) =
             match authenticated_hosted_device(ch, pdo_object, active_reply_cap) {
                 Ok(identity) => identity,
-                Err(status) => return (status.raw(), 0, 0, 0),
+                Err(status) => {
+                    let domain = instance_for_pump_channel(ch, active_reply_cap)
+                        .and_then(|(_, inst)| instance_domain_identity(inst));
+                    hosted_driver_object_reference::trace_root_rejection(
+                        b"authentication", pdo_object, domain, 0, status);
+                    return (status.raw(), 0, 0, 0);
+                }
             };
         let domain = HostedDomainIdentity {
             domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
@@ -59657,7 +59663,11 @@ pub(crate) fn service_hosted_device(
         };
         let registration = match hosted_device_pointer_registration(domain, pdo_object, device_id) {
             Ok(registration) => registration,
-            Err(status) => return (status.raw(), 0, 0, 0),
+            Err(status) => {
+                hosted_driver_object_reference::trace_root_rejection(
+                    b"registration", pdo_object, Some(domain), device_id.raw(), status);
+                return (status.raw(), 0, 0, 0);
+            }
         };
         return match io_manager_mut().reference_hosted_device_object_by_pointer(
             domain,
@@ -59666,7 +59676,11 @@ pub(crate) fn service_hosted_device(
             FSD_DATA_IO_DEVICE_OBJECT_TYPE_BODY_VA,
         ) {
             Ok(count) => (STATUS_SUCCESS, count, 0, 0),
-            Err(status) => (status.raw(), 0, 0, 0),
+            Err(status) => {
+                hosted_driver_object_reference::trace_root_rejection(
+                    b"reference", pdo_object, Some(domain), device_id.raw(), status);
+                (status.raw(), 0, 0, 0)
+            }
         };
     }
     if op == HOSTED_DEVICE_OP_REFERENCE_POINTER || op == HOSTED_DEVICE_OP_DEREFERENCE_POINTER {

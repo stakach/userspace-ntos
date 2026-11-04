@@ -11,6 +11,34 @@ pub(super) const DEVICE_OBJECT_TYPE_BODY_OFFSET: u64 = 0x380;
 pub(super) const DEVICE_OBJECT_TYPE_MARKER: u64 = u64::from_le_bytes(*b"DEVCTYPE");
 
 const STATUS_OBJECT_TYPE_MISMATCH: i32 = 0xC000_0024u32 as i32;
+static LOCAL_REFUSAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static ROOT_REFUSAL_TRACE: AtomicU64 = AtomicU64::new(0);
+
+fn trace_local_refusal(stage: &[u8], object: u64, status: i32, published_type: u64, marker: u64) {
+    if LOCAL_REFUSAL_TRACE.fetch_add(1, Ordering::Relaxed) >= 16 { return; }
+    print_str(b"[device-reference-local] stage/object/status/published-type/marker=");
+    print_str(stage);
+    print_str(b"/"); print_hex64(object);
+    print_str(b"/"); print_hex(status as u32);
+    print_str(b"/"); print_hex64(published_type);
+    print_str(b"/"); print_hex64(marker);
+    print_str(b"\n");
+}
+
+pub(super) fn trace_root_rejection(
+    stage: &[u8], object: u64, domain: Option<nt_io_manager::HostedDomainIdentity>,
+    device_id: u64, status: nt_status::NtStatus,
+) {
+    if ROOT_REFUSAL_TRACE.fetch_add(1, Ordering::Relaxed) >= 16 { return; }
+    print_str(b"[device-reference-root] stage/object/domain/cookie/device/status=");
+    print_str(stage);
+    print_str(b"/"); print_hex64(object);
+    print_str(b"/"); print_u64(domain.map_or(0, |identity| identity.domain_id.raw()));
+    print_str(b"/"); print_hex64(domain.map_or(0, |identity| identity.cookie));
+    print_str(b"/"); print_u64(device_id);
+    print_str(b"/"); print_hex(status.raw() as u32);
+    print_str(b"\n");
+}
 
 /// `NTSTATUS ObReferenceObjectByPointer(PVOID, ACCESS_MASK, POBJECT_TYPE, KPROCESSOR_MODE)`.
 ///
@@ -30,6 +58,7 @@ pub(super) extern "win64" fn ob_reference_object_by_pointer(
         return STATUS_ACCESS_DENIED;
     }
     if !unsafe { consumer_device_object_in_local_pool(object) } {
+        trace_local_refusal(b"pool", object, STATUS_INVALID_PARAMETER, 0, 0);
         return STATUS_INVALID_PARAMETER;
     }
     let expected_type = FSD_DATA_VADDR + DEVICE_OBJECT_TYPE_BODY_OFFSET;
@@ -38,6 +67,8 @@ pub(super) extern "win64" fn ob_reference_object_by_pointer(
     };
     let marker = unsafe { read_volatile(expected_type as *const u64) };
     if published_type != expected_type || marker != DEVICE_OBJECT_TYPE_MARKER {
+        trace_local_refusal(b"type-marker", object, STATUS_INVALID_DEVICE_REQUEST,
+            published_type, marker);
         return STATUS_INVALID_DEVICE_REQUEST;
     }
     if object_type != 0 && object_type != expected_type {
