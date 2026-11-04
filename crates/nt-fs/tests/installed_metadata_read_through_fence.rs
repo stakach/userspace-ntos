@@ -43,6 +43,25 @@ fn disk_geometry_query_cannot_mutate_media() {
         PossibleScsiEffect::PossiblyMutating);
 }
 
+#[test]
+fn basic_disk_geometry_query_preserves_read_through_only_for_its_exact_shape() {
+    // LiberNT disk class issues the buffered, input-free DISK_GEOMETRY query
+    // with its 24-byte output during StartDevice.
+    assert_eq!(PossibleScsiEffect::from_disk_device_control(0x0007_0000, 0, 24),
+        PossibleScsiEffect::ProvenReadOnly);
+    assert_eq!(PossibleScsiEffect::from_disk_device_control(0x0007_0000, 0, 32),
+        PossibleScsiEffect::ProvenReadOnly);
+    for (code, input, output) in [
+        (0x0007_0000, 1, 24),
+        (0x0007_0000, 0, 23),
+        (0x0007_0001, 0, 24),
+        (0x0007_0004, 0, 24),
+    ] {
+        assert_eq!(PossibleScsiEffect::from_disk_device_control(code, input, output),
+            PossibleScsiEffect::PossiblyMutating);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Disk { controller: u64, physical_pdo: u64 }
 
