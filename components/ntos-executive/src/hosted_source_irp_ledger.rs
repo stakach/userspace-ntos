@@ -2336,8 +2336,31 @@ pub(super) fn service(
                 {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
+                // A projected direct-I/O MDL is a registered physical owner, not
+                // merely a pool block. Keep its registry identity until all
+                // partial mappings/read leases have drained, then retire that
+                // identity with this exact captured graph member.
+                let registered_mdl = if member.roles.contains(GraphRoles::MDL) {
+                    let Some(key) = hosted_mdl_key(domain, member_address) else {
+                        return (STATUS_INVALID_HANDLE, 0, 0);
+                    };
+                    if unsafe { hosted_mdl_registry_mut().id_for(key) }.is_some() {
+                        if let Err(error) = unsafe { hosted_mdl_registry_mut().can_free_key(key) } {
+                            return (hosted_mdl_status(error).raw(), 0, 0);
+                        }
+                        Some(key)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 if !unsafe { hosted_instance_pool_free_unlocked(inst, member_address) } {
                     return (STATUS_INVALID_HANDLE, 0, 0);
+                }
+                if let Some(key) = registered_mdl {
+                    unsafe { hosted_mdl_registry_mut().free_key(key) }
+                        .expect("captured MDL changed between exact pool and registry retirement");
                 }
                 // A definite refusal leaves the captured member pending for exact retry.
                 row.released_members |= bit;
@@ -2984,8 +3007,11 @@ pub(super) fn mdl_release_allowed(
     domain: HostedDomainIdentity,
     mdl: u64,
 ) -> bool {
+    let Some(inst) = instance(instance_index) else { return false; };
+    if instance_domain_identity(inst) != Some(domain) { return false; }
     let _guard = lock();
-    !auxiliary().protected_pool_child(SourceIrpOwner::HostedDriver(instance_index), domain, mdl)
+    !unsafe { caller_graph_protects_current_member_unlocked(inst, domain, mdl) }
+        && !auxiliary().protected_pool_child(SourceIrpOwner::HostedDriver(instance_index), domain, mdl)
         && !scsi_children().protects_mdl(SourceIrpOwner::HostedDriver(instance_index), domain, mdl)
         && !partial_source_in_flight_unlocked(instance_index, domain, mdl)
 }

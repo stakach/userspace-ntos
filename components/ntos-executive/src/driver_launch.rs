@@ -2141,7 +2141,7 @@ unsafe fn pool_push_request_bytes(
 
 unsafe fn pool_free_request_buffers(data: u64, aux_data: u64, mdl: u64) {
     if mdl != 0 {
-        pool_free(mdl);
+        s_io_free_mdl(mdl);
     }
     if aux_data != 0 && aux_data != data {
         pool_free(aux_data);
@@ -2173,36 +2173,11 @@ unsafe fn allocate_nonpaged_mdl(virtual_address: u64, length: u64) -> u64 {
     if virtual_address == 0 || length == 0 || length > u32::MAX as u64 {
         return 0;
     }
-    let mdl = pool_alloc_zeroed(nt_mdl::MDL_SIZE as u64);
+    let mdl = s_io_allocate_mdl(virtual_address, length as u32, 0, 0, 0);
     if mdl == 0 {
         return 0;
     }
-    write_unaligned(
-        (mdl + nt_mdl::MDL_OFF_SIZE) as *mut i16,
-        nt_mdl::MDL_SIZE as i16,
-    );
-    write_unaligned(
-        (mdl + nt_mdl::MDL_OFF_FLAGS) as *mut i16,
-        nt_mdl::MDL_MAPPED_TO_SYSTEM_VA
-            | nt_mdl::MDL_PAGES_LOCKED
-            | nt_mdl::MDL_SOURCE_IS_NONPAGED_POOL,
-    );
-    write_unaligned(
-        (mdl + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *mut u64,
-        virtual_address,
-    );
-    write_unaligned(
-        (mdl + nt_mdl::MDL_OFF_START_VA) as *mut u64,
-        virtual_address & !0xFFF,
-    );
-    write_unaligned(
-        (mdl + nt_mdl::MDL_OFF_BYTE_COUNT) as *mut u32,
-        length as u32,
-    );
-    write_unaligned(
-        (mdl + nt_mdl::MDL_OFF_BYTE_OFFSET) as *mut u32,
-        (virtual_address & 0xFFF) as u32,
-    );
+    s_mm_build_mdl_for_nonpaged_pool(mdl);
     mdl
 }
 
@@ -2754,7 +2729,11 @@ unsafe fn release_pending_irp_graph_component(entry: PendingIrp) {
                     hosted_file_objects::retire_created_file_storage(storage);
                 }
                 nt_io_manager::pending_irp_graph::GraphReleaseKind::Pool => {
-                    pool_free(allocation.pointer);
+                    if allocation.pointer == entry.mdl {
+                        s_io_free_mdl(allocation.pointer);
+                    } else {
+                        pool_free(allocation.pointer);
+                    }
                 }
             }
         }
@@ -39375,13 +39354,38 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
         }
         return (0xC000_0001u32 as i32, 0); // STATUS_UNSUCCESSFUL
     }
+    let read_write_buffers = if matches!(major, IRP_MJ_READ | IRP_MJ_WRITE) {
+        let device_flags = read_unaligned((devobj + 0x30) as *const u32);
+        let transfer_length = if major == IRP_MJ_READ { outlen } else { inlen };
+        match nt_io_manager::kernel_irp_builder::plan_provider_read_write_buffers(
+            major as u8, device_flags, data, transfer_length as u32,
+        ) {
+            Ok(plan) => Some(plan),
+            Err(_) => {
+                pool_free_request_buffers(data, aux_data, 0);
+                if owns_fo {
+                    free_pre_entry_created_file_storage(
+                        created_file_storage.expect("CREATE lost its constructor storage"),
+                    );
+                }
+                return (STATUS_INVALID_PARAMETER, 0);
+            }
+        }
+    } else {
+        None
+    };
     let mut mdl = 0u64;
-    if matches!(
+    let direct_control = matches!(
         control_method,
         Some(ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT)
-    ) && outlen != 0
-    {
-        mdl = allocate_nonpaged_mdl(data, outlen);
+    ) && outlen != 0;
+    if direct_control || read_write_buffers.is_some_and(|plan| plan.mdl.is_some()) {
+        let mdl_length = if direct_control {
+            outlen
+        } else {
+            read_write_buffers.and_then(|plan| plan.mdl).unwrap().length as u64
+        };
+        mdl = allocate_nonpaged_mdl(data, mdl_length);
         if mdl == 0 {
             pool_free_request_buffers(data, aux_data, 0);
             if owns_fo {
@@ -39466,6 +39470,10 @@ unsafe fn run_irp_with_bank(major: u64, handler: u64, shared: u64, request_addre
             )
         }
         _ if is_scsi => (0, 0, 0, 0),
+        _ if read_write_buffers.is_some() => {
+            let plan = read_write_buffers.unwrap();
+            (plan.system_buffer, plan.user_buffer, 0, plan.irp_flags)
+        }
         _ => (data, data, data, 0),
     };
 

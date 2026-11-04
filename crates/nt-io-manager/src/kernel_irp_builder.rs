@@ -121,6 +121,75 @@ pub struct MdlPlan {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadWriteTransferMethod {
+    Buffered,
+    Direct,
+    Neither,
+}
+
+/// The device's transfer method is authoritative for both caller-built and
+/// provider-projected READ/WRITE IRPs. NT gives buffered I/O precedence when
+/// both bits are present.
+pub const fn read_write_transfer_method(device_flags: u32) -> ReadWriteTransferMethod {
+    if device_flags & DO_BUFFERED_IO != 0 {
+        ReadWriteTransferMethod::Buffered
+    } else if device_flags & DO_DIRECT_IO != 0 {
+        ReadWriteTransferMethod::Direct
+    } else {
+        ReadWriteTransferMethod::Neither
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderReadWriteBuffers {
+    pub system_buffer: u64,
+    pub user_buffer: u64,
+    pub irp_flags: u32,
+    pub mdl: Option<MdlPlan>,
+}
+
+/// Project the provider's already owned transfer allocation into its WDM IRP.
+/// The caller retains `data` and any MDL through terminal completion and ACK.
+pub fn plan_provider_read_write_buffers(
+    major: u8,
+    device_flags: u32,
+    data: u64,
+    length: u32,
+) -> Result<ProviderReadWriteBuffers, KernelIrpPlanError> {
+    if !matches!(major, major::IRP_MJ_READ | major::IRP_MJ_WRITE)
+        || length != 0 && data == 0
+    {
+        return Err(KernelIrpPlanError::InvalidIrpHeader);
+    }
+    let read = major == major::IRP_MJ_READ;
+    Ok(match read_write_transfer_method(device_flags) {
+        ReadWriteTransferMethod::Buffered => ProviderReadWriteBuffers {
+            system_buffer: data,
+            user_buffer: if read { data } else { 0 },
+            irp_flags: IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER
+                | if read { IRP_INPUT_OPERATION } else { 0 },
+            mdl: None,
+        },
+        ReadWriteTransferMethod::Direct => ProviderReadWriteBuffers {
+            system_buffer: 0,
+            user_buffer: 0,
+            irp_flags: 0,
+            mdl: (length != 0).then_some(MdlPlan {
+                buffer: data,
+                length,
+                access: if read { MdlAccess::Write } else { MdlAccess::Read },
+            }),
+        },
+        ReadWriteTransferMethod::Neither => ProviderReadWriteBuffers {
+            system_buffer: 0,
+            user_buffer: data,
+            irp_flags: 0,
+            mdl: None,
+        },
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KernelBuiltIrpPlan {
     pub packet_size: u16,
     pub stack_count: u8,
@@ -199,7 +268,7 @@ pub fn plan_synchronous_fsd_request(
                 byte_offset: offset,
             }
         };
-        if device_flags & DO_BUFFERED_IO != 0 {
+        if read_write_transfer_method(device_flags) == ReadWriteTransferMethod::Buffered {
             plan.system_buffer_len = length;
             plan.irp_flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER;
             if major == major::IRP_MJ_READ {
@@ -209,7 +278,7 @@ pub fn plan_synchronous_fsd_request(
                 plan.system_buffer_input = buffer;
                 plan.system_buffer_input_len = length;
             }
-        } else if device_flags & DO_DIRECT_IO != 0 {
+        } else if read_write_transfer_method(device_flags) == ReadWriteTransferMethod::Direct {
             if length != 0 {
                 plan.mdl = Some(MdlPlan {
                     buffer,

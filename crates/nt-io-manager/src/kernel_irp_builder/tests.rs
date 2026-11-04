@@ -5,6 +5,46 @@ use crate::{
 };
 
 #[test]
+fn provider_read_projection_preserves_device_transfer_method() {
+    let data = 0x2000;
+    let direct = plan_provider_read_write_buffers(
+        major::IRP_MJ_READ, DO_DIRECT_IO, data, 512,
+    ).unwrap();
+    assert_eq!(direct.mdl, Some(MdlPlan { buffer: data, length: 512, access: MdlAccess::Write }));
+    assert_eq!((direct.system_buffer, direct.user_buffer, direct.irp_flags), (0, 0, 0));
+
+    let buffered = plan_provider_read_write_buffers(
+        major::IRP_MJ_READ, DO_BUFFERED_IO | DO_DIRECT_IO, data, 512,
+    ).unwrap();
+    assert_eq!(buffered.mdl, None);
+    assert_eq!((buffered.system_buffer, buffered.user_buffer, buffered.irp_flags),
+        (data, data, IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | IRP_INPUT_OPERATION));
+
+    let neither = plan_provider_read_write_buffers(
+        major::IRP_MJ_READ, 0, data, 512,
+    ).unwrap();
+    assert_eq!(neither.mdl, None);
+    assert_eq!((neither.system_buffer, neither.user_buffer, neither.irp_flags), (0, data, 0));
+}
+
+#[test]
+fn provider_write_projection_uses_read_access_for_direct_input() {
+    let data = 0x3000;
+    let direct = plan_provider_read_write_buffers(
+        major::IRP_MJ_WRITE, DO_DIRECT_IO, data, 512,
+    ).unwrap();
+    assert_eq!(direct.mdl, Some(MdlPlan { buffer: data, length: 512, access: MdlAccess::Read }));
+    assert_eq!((direct.system_buffer, direct.user_buffer, direct.irp_flags), (0, 0, 0));
+
+    let buffered = plan_provider_read_write_buffers(
+        major::IRP_MJ_WRITE, DO_BUFFERED_IO, data, 512,
+    ).unwrap();
+    assert_eq!(buffered.mdl, None);
+    assert_eq!((buffered.system_buffer, buffered.user_buffer, buffered.irp_flags),
+        (data, 0, IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER));
+}
+
+#[test]
 fn disk_metadata_read_overrides_verify_volume_without_changing_source_buffers() {
     let ordinary = plan_synchronous_fsd_request(
         major::IRP_MJ_READ, 2, DO_DIRECT_IO, 0x1000, 0x2000, 512, Some(0),
