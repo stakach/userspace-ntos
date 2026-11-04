@@ -5,6 +5,7 @@
 //! dispatch will consume the owned byte snapshots and must report exact terminal/ACK events.
 
 use super::*;
+use core::sync::atomic::{AtomicU64, Ordering};
 use super::hosted_source_pool_memory::SourcePoolMemory;
 use nt_io_manager::{
     hosted_forward_target::HostedForwardTarget, retained_query_path_forward::SourceIrpTicket,
@@ -13,6 +14,37 @@ use nt_io_manager::{
     source_irp_ledger::{SourceIrpAllocation, SourceIrpForwardIdentity}, HostedDomainIdentity,
 };
 use nt_pnp_manager::AcceptedPdoProviderAuthority;
+
+static SCSI_CHILD_ADMISSION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn trace_scsi_child_admission(diagnostic: &hosted_source_irp_ledger::ScsiCaptureDiagnostic) {
+    if SCSI_CHILD_ADMISSION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 4 { return; }
+    print_str(b"[scsi-child-admission] stage/srb/mdl/data/len/mdl-size/flags/count/reg-len/reg-va/locked/origin=");
+    print_str(diagnostic.stage);
+    print_str(b"/");
+    print_hex64(diagnostic.srb);
+    print_str(b"/");
+    print_hex64(diagnostic.mdl);
+    print_str(b"/");
+    print_hex64(diagnostic.data);
+    print_str(b"/");
+    print_u64(u64::from(diagnostic.transfer));
+    print_str(b"/");
+    print_u64(diagnostic.mdl_size as u16 as u64);
+    print_str(b"/");
+    print_hex(diagnostic.mdl_flags as u16 as u32);
+    print_str(b"/");
+    print_u64(u64::from(diagnostic.mdl_count));
+    print_str(b"/");
+    print_u64(u64::from(diagnostic.registry_length));
+    print_str(b"/");
+    print_hex64(diagnostic.registry_va);
+    print_str(b"/");
+    print_u64(u64::from(diagnostic.registry_locked));
+    print_str(b"/");
+    print_u64(u64::from(diagnostic.data_origin));
+    print_str(b"\n");
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CaptureError {
@@ -375,7 +407,8 @@ pub(super) unsafe fn capture(
                 relation_generation: authority.parent_relation().relation().generation(),
                 provider_pdo: authority.provider().address(),
             };
-            let (children, srb, mdl, data, sense, stack_lease, data_stack_lease) = hosted_source_irp_ledger::capture_scsi_children(
+            let mut diagnostic = hosted_source_irp_ledger::ScsiCaptureDiagnostic::default();
+            let captured = hosted_source_irp_ledger::capture_scsi_children(
                 instance_index,
                 source,
                 ticket,
@@ -383,8 +416,11 @@ pub(super) unsafe fn capture(
                 route,
                 ch,
                 reply_cap,
-            )
-            .ok_or(CaptureError::InvalidSrb)?;
+                &mut diagnostic,
+            );
+            if captured.is_none() { trace_scsi_child_admission(&diagnostic); }
+            let (children, srb, mdl, data, sense, stack_lease, data_stack_lease) =
+                captured.ok_or(CaptureError::InvalidSrb)?;
             Ok((authority, children, srb, mdl, data, sense, stack_lease, data_stack_lease))
         })();
         match admitted {

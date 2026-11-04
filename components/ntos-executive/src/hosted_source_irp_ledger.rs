@@ -99,6 +99,32 @@ fn scsi_children() -> &'static mut ScsiSourceRetentionLedger {
 /// Capture every independently allocated source object and register its free guard under the
 /// same source/pool locks. There is no window in which a copied SRB can be freed and reused
 /// before retention becomes visible to ExFreePool/MmFreePagesFromMdl.
+/// Per-call observation copied out before logging, so diagnostics never print
+/// while the source or pool ownership locks are held. `data_origin` is 0 before
+/// its ownership check, 1 for a proved pool allocation, or 2 for a stack attempt.
+pub(super) struct ScsiCaptureDiagnostic {
+    pub stage: &'static [u8],
+    pub srb: u64,
+    pub mdl: u64,
+    pub data: u64,
+    pub transfer: u32,
+    pub mdl_size: i16,
+    pub mdl_flags: i16,
+    pub mdl_count: u32,
+    pub registry_length: u32,
+    pub registry_va: u64,
+    pub registry_locked: u8,
+    pub data_origin: u8,
+}
+
+impl Default for ScsiCaptureDiagnostic {
+    fn default() -> Self {
+        Self { stage: b"start", srb: 0, mdl: 0, data: 0, transfer: 0,
+            mdl_size: 0, mdl_flags: 0, mdl_count: 0,
+            registry_length: 0, registry_va: 0, registry_locked: 0, data_origin: 0 }
+    }
+}
+
 pub(super) fn capture_scsi_children(
     instance_index: usize,
     source: SourceIrpAllocation,
@@ -107,18 +133,22 @@ pub(super) fn capture_scsi_children(
     route: ScsiSrbRoute,
     channel: &crate::spawn_hosts::PumpChannel,
     reply: u64,
+    diagnostic: &mut ScsiCaptureDiagnostic,
 ) -> Option<(ScsiSourceChildren, Vec<u8>, Option<Vec<u8>>, Vec<u8>, Option<Vec<u8>>, Option<hosted_source_stack_lease::SourceStackLeaseId>, Option<hosted_source_stack_lease::SourceStackLeaseId>)> {
+    diagnostic.stage = b"source-owner";
     let _guard = lock();
     let inst = instance(instance_index)?;
     if source.domain != ticket.domain
         || instance_domain_identity(inst) != Some(source.domain)
         || !ledger().admits_forward(ticket, source)
     { return None; }
+    diagnostic.stage = b"source-pool";
     let _pool_guard = unsafe { hosted_instance_pool_lock(inst.exec_pool_va)? };
     let mut current = allocation_unlocked(instance_index, inst,
         source.component_address, source.bytes, source.stack_count)?;
     current.owner = source.owner;
     if current != source { return None; }
+    diagnostic.stage = b"source-irp";
     let irp_exec = unsafe { hosted_pool_allocation_exec_va(
         inst.exec_pool_va, source.component_address, source.bytes,
     )? };
@@ -128,13 +158,16 @@ pub(super) fn capture_scsi_children(
     let stack_bytes = unsafe { core::slice::from_raw_parts(
         stack_exec as *const u8, WDM_X64_IO_STACK_LOCATION_SIZE,
     ) };
+    diagnostic.stage = b"source-stack";
     let stack = nt_io_manager::decode_wdm_kernel_built_scsi_stack(stack_bytes).ok()?;
     let nt_io_manager::WdmIoStackParameters::Scsi { srb: srb_address } = stack.parameters
     else { return None };
+    diagnostic.srb = srb_address;
     if stack.device_object != target_device || stack.file_object != 0
         || irp.associated_irp_system_buffer.0 != 0 || irp.user_buffer.0 != 0
     { return None; }
     let source_identity = SourceIrpForwardIdentity::new(ticket, source)?;
+    diagnostic.stage = b"srb-owner";
     let (srb_identity, srb_bytes, stack_lease) = if let Some(pool) = unsafe {
         exact_pool_identity_unlocked(inst, srb_address, WDM_X64_LEGACY_SRB_SIZE as u64)
     } {
@@ -155,6 +188,7 @@ pub(super) fn capture_scsi_children(
     let mut data_stack_lease = None;
     let result = (|| {
     let srb_slice = &srb_bytes[..];
+    diagnostic.stage = b"srb-shape";
     if u16::from_le_bytes(srb_slice[..2].try_into().ok()?) as usize != WDM_X64_LEGACY_SRB_SIZE {
         return None;
     }
@@ -163,6 +197,7 @@ pub(super) fn capture_scsi_children(
     if u64::from_le_bytes(srb_slice[0x28..0x30].try_into().ok()?) != 0 { return None; }
     let sense_length = srb_slice[0x0b];
     let sense_address = u64::from_le_bytes(srb_slice[0x20..0x28].try_into().ok()?);
+    diagnostic.stage = b"sense-owner";
     let (sense_identity, sense_bytes) = if sense_length == 0 {
         (None, None)
     } else {
@@ -180,15 +215,36 @@ pub(super) fn capture_scsi_children(
     };
     let transfer_length = u32::from_le_bytes(srb_slice[0x10..0x14].try_into().ok()?);
     let data_address = u64::from_le_bytes(srb_slice[0x18..0x20].try_into().ok()?);
+    diagnostic.transfer = transfer_length;
+    diagnostic.data = data_address;
+    diagnostic.mdl = irp.mdl_address.0;
+    diagnostic.stage = b"transfer-shape";
     let (mdl_identity, mdl_bytes, data_identity, data_stack, data_bytes) = if transfer_length == 0 {
         if irp.mdl_address.0 != 0 { return None; }
         (None, None, None, None, Vec::new())
     } else {
         let mdl_address = irp.mdl_address.0;
         if mdl_address == 0 || data_address == 0 { return None; }
+        diagnostic.stage = b"mdl-identity";
+        if unsafe { exact_pool_identity_unlocked(inst, mdl_address, nt_mdl::MDL_SIZE as u64) }.is_some() {
+            if let Some(mdl_exec) = inst.exec_pool_va.checked_add(mdl_address.checked_sub(FSD_POOL_VADDR)?) {
+                diagnostic.mdl_size = unsafe { read_unaligned((mdl_exec + nt_mdl::MDL_OFF_SIZE) as *const i16) };
+                diagnostic.mdl_flags = unsafe { read_unaligned((mdl_exec + nt_mdl::MDL_OFF_FLAGS) as *const i16) };
+                diagnostic.mdl_count = unsafe { read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32) };
+            }
+        }
+        if let Some(key) = hosted_mdl_key(source.domain, mdl_address) {
+            let registry = unsafe { hosted_mdl_registry_mut() };
+            if let Some(id) = registry.id_for(key) {
+                diagnostic.registry_length = registry.byte_count(id).unwrap_or(0);
+                diagnostic.registry_va = registry.virtual_address(id).unwrap_or(0);
+                diagnostic.registry_locked = u8::from(registry.is_locked(id));
+            }
+        }
         let (mdl_identity, mapped_address) = unsafe {
             mdl_identity_unlocked(inst, source.domain, mdl_address, transfer_length)?
         };
+        diagnostic.stage = b"mdl-data-address";
         if mapped_address != data_address { return None; }
         let mdl_exec = inst.exec_pool_va.checked_add(mdl_address.checked_sub(FSD_POOL_VADDR)?)?;
         let mdl_slice = unsafe { core::slice::from_raw_parts(
@@ -198,10 +254,13 @@ pub(super) fn capture_scsi_children(
             mdl_slice[nt_mdl::MDL_OFF_BYTE_COUNT as usize
                 ..nt_mdl::MDL_OFF_BYTE_COUNT as usize + 4].try_into().ok()?,
         );
+        diagnostic.stage = b"mdl-count";
         if mdl_count < transfer_length { return None; }
+        diagnostic.stage = b"data-owner";
         let (data_identity, data_stack, data) = if let Some(data_allocation) = unsafe {
             pool_range_identity_unlocked(inst, data_address, u64::from(transfer_length))
         } {
+            diagnostic.data_origin = 1;
             let data_exec = inst.exec_pool_va.checked_add(data_address.checked_sub(FSD_POOL_VADDR)?)?;
             let data_slice = unsafe { core::slice::from_raw_parts(data_exec as *const u8,
                 transfer_length as usize) };
@@ -214,6 +273,8 @@ pub(super) fn capture_scsi_children(
                 bytes: u64::from(transfer_length),
             }, None, data)
         } else {
+            diagnostic.data_origin = 2;
+            diagnostic.stage = b"data-stack-lease";
             let (lease, range, exec_address, data) = unsafe {
                 hosted_source_stack_lease::capture_scsi_data(
                     channel, reply, source_identity, data_address, transfer_length,
@@ -226,12 +287,14 @@ pub(super) fn capture_scsi_children(
                 exec_address,
             }, Some(range), data)
         };
+        diagnostic.stage = b"mdl-snapshot";
         let mut mdl = Vec::new();
         mdl.try_reserve_exact(nt_mdl::MDL_SIZE).ok()?;
         mdl.extend_from_slice(mdl_slice);
         (Some(mdl_identity), Some(mdl), Some(data_identity), data_stack, data)
     };
     let mut srb = Vec::new();
+    diagnostic.stage = b"srb-snapshot";
     srb.try_reserve_exact(WDM_X64_LEGACY_SRB_SIZE).ok()?;
     srb.extend_from_slice(srb_slice);
     let children = ScsiSourceChildren {
@@ -239,7 +302,9 @@ pub(super) fn capture_scsi_children(
         sense_length, mdl: mdl_identity,
         data: data_identity, data_stack, transfer_length,
     };
+    diagnostic.stage = b"children-retain";
     scsi_children().retain(children).ok()?;
+    diagnostic.stage = b"accepted";
     Some((children, srb, mdl_bytes, data_bytes, sense_bytes, stack_lease, data_stack_lease))
     })();
     if result.is_none() {
