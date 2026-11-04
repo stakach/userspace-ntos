@@ -3,18 +3,18 @@ use nt_fs::{InstalledMetadataReadThroughFence, PhysicalSectorRange, PossibleScsi
 #[test]
 fn only_storage_property_query_is_proven_read_only_device_control() {
     // FILE_DEVICE_MASS_STORAGE, function 0x500, buffered, any access.
-    assert_eq!(PossibleScsiEffect::from_storage_ioctl(0x002d_1400, 12, 8),
+    assert_eq!(PossibleScsiEffect::from_disk_device_control(0x002d_1400, 12, 8),
         PossibleScsiEffect::ProvenReadOnly);
-    assert_eq!(PossibleScsiEffect::from_storage_ioctl(0x002d_1400, 12, 64),
+    assert_eq!(PossibleScsiEffect::from_disk_device_control(0x002d_1400, 12, 64),
         PossibleScsiEffect::ProvenReadOnly);
-    assert_eq!(PossibleScsiEffect::from_storage_ioctl(0x002d_1400, 11, 8),
+    assert_eq!(PossibleScsiEffect::from_disk_device_control(0x002d_1400, 11, 8),
         PossibleScsiEffect::PossiblyMutating);
-    assert_eq!(PossibleScsiEffect::from_storage_ioctl(0x002d_1400, 12, 7),
+    assert_eq!(PossibleScsiEffect::from_disk_device_control(0x002d_1400, 12, 7),
         PossibleScsiEffect::PossiblyMutating);
     // The adjacent property-set control and unknown controls cannot keep copied metadata live.
-    assert_eq!(PossibleScsiEffect::from_storage_ioctl(0x002d_93fc, 12, 8),
+    assert_eq!(PossibleScsiEffect::from_disk_device_control(0x002d_93fc, 12, 8),
         PossibleScsiEffect::PossiblyMutating);
-    assert_eq!(PossibleScsiEffect::from_storage_ioctl(0x002d_1401, 12, 8),
+    assert_eq!(PossibleScsiEffect::from_disk_device_control(0x002d_1401, 12, 8),
         PossibleScsiEffect::PossiblyMutating);
 }
 
@@ -22,11 +22,24 @@ fn only_storage_property_query_is_proven_read_only_device_control() {
 fn storage_device_number_query_cannot_mutate_media() {
     // The disk class issues this buffered query during StartDevice; its result is a
     // 12-byte STORAGE_DEVICE_NUMBER, with no input payload.
-    assert_eq!(PossibleScsiEffect::from_storage_ioctl(0x002d_1080, 0, 12),
+    assert_eq!(PossibleScsiEffect::from_disk_device_control(0x002d_1080, 0, 12),
         PossibleScsiEffect::ProvenReadOnly);
-    assert_eq!(PossibleScsiEffect::from_storage_ioctl(0x002d_1080, 1, 12),
+    assert_eq!(PossibleScsiEffect::from_disk_device_control(0x002d_1080, 1, 12),
         PossibleScsiEffect::PossiblyMutating);
-    assert_eq!(PossibleScsiEffect::from_storage_ioctl(0x002d_1080, 0, 11),
+    assert_eq!(PossibleScsiEffect::from_disk_device_control(0x002d_1080, 0, 11),
+        PossibleScsiEffect::PossiblyMutating);
+}
+
+#[test]
+fn disk_geometry_query_cannot_mutate_media() {
+    // PartMgr sends this disk-class query while enumerating installed partitions.
+    assert_eq!(PossibleScsiEffect::from_disk_device_control(0x0007_00a0, 0, 40),
+        PossibleScsiEffect::ProvenReadOnly);
+    assert_eq!(PossibleScsiEffect::from_disk_device_control(0x0007_00a0, 1, 40),
+        PossibleScsiEffect::PossiblyMutating);
+    assert_eq!(PossibleScsiEffect::from_disk_device_control(0x0007_00a0, 0, 39),
+        PossibleScsiEffect::PossiblyMutating);
+    assert_eq!(PossibleScsiEffect::from_disk_device_control(0x0007_00a1, 0, 40),
         PossibleScsiEffect::PossiblyMutating);
 }
 

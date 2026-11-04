@@ -38,14 +38,16 @@ pub enum PossibleScsiEffect {
 }
 
 impl PossibleScsiEffect {
-    /// Classify the exact external storage property query from its canonical control shape.
+    /// Classify proven read-only external disk controls from their canonical request shapes.
     /// The caller must first authenticate the physical disk stack; other controls may mutate
     /// media even when their access bits appear read-only.
-    pub fn from_storage_ioctl(ioctl_code: u32, input_len: u32, output_len: u32) -> Self {
+    pub fn from_disk_device_control(ioctl_code: u32, input_len: u32, output_len: u32) -> Self {
         const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002d_1400;
         const IOCTL_STORAGE_GET_DEVICE_NUMBER: u32 = 0x002d_1080;
+        const IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: u32 = 0x0007_00a0;
         if (ioctl_code == IOCTL_STORAGE_QUERY_PROPERTY && input_len >= 12 && output_len >= 8)
             || (ioctl_code == IOCTL_STORAGE_GET_DEVICE_NUMBER && input_len == 0 && output_len >= 12)
+            || (ioctl_code == IOCTL_DISK_GET_DRIVE_GEOMETRY_EX && input_len == 0 && output_len >= 40)
         {
             Self::ProvenReadOnly
         } else {
