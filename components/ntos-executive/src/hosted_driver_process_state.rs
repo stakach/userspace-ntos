@@ -7,16 +7,18 @@
 
 use super::*;
 
-pub(super) const INITIAL_SYSTEM_PROCESS_CELL_OFF: u64 = 0x220;
-pub(super) const PROCESS_TYPE_CELL_OFF: u64 = 0x228;
-pub(super) const THREAD_TYPE_CELL_OFF: u64 = 0x230;
+pub(super) const INITIAL_SYSTEM_PROCESS_CELL_OFF: u64 = 0xA10;
+pub(super) const PROCESS_TYPE_CELL_OFF: u64 = 0xA18;
+pub(super) const THREAD_TYPE_CELL_OFF: u64 = 0xA20;
 
 pub(super) const INITIAL_SYSTEM_PROCESS_CELL_VA: u64 =
     FSD_DATA_VADDR + INITIAL_SYSTEM_PROCESS_CELL_OFF;
 pub(super) const PROCESS_TYPE_CELL_VA: u64 = FSD_DATA_VADDR + PROCESS_TYPE_CELL_OFF;
 pub(super) const THREAD_TYPE_CELL_VA: u64 = FSD_DATA_VADDR + THREAD_TYPE_CELL_OFF;
 
-const _: () = assert!(THREAD_TYPE_CELL_OFF + 8 <= 0x300);
+const _: () = assert!(INITIAL_SYSTEM_PROCESS_CELL_OFF & 7 == 0);
+const _: () = assert!(PROCESS_TYPE_CELL_OFF & 7 == 0);
+const _: () = assert!(THREAD_TYPE_CELL_OFF & 7 == 0);
 
 /// Initialize all three pointer-valued Ps data exports for an isolated driver.
 /// The initial process body and object-type descriptors live in executive-image

@@ -784,9 +784,6 @@ const FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_OFF: u64 = 0x210;
 const FSD_DATA_KD_DEBUGGER_NOT_PRESENT_OFF: u64 = 0x218;
 const FSD_DATA_KE_NUMBER_PROCESSORS_OFF: u64 = 0x220;
 const FSD_DATA_KD_COM_PORT_IN_USE_OFF: u64 = 0x228;
-const _: () = assert!(FSD_DATA_KD_COM_PORT_IN_USE_OFF + 8
-    <= hosted_driver_safe_boot::SAFE_BOOT_MODE_OFFSET
-    && hosted_driver_safe_boot::SAFE_BOOT_MODE_OFFSET + 4 <= FSD_DATA_HAL_DISPATCH_OFF);
 const FSD_DATA_IO_DEVICE_OBJECT_TYPE_CELL_OFF: u64 = hosted_driver_object_reference::DEVICE_OBJECT_TYPE_CELL_OFFSET;
 // HAL_DISPATCH is an imported data object. Its unsupported callbacks remain null.
 const FSD_DATA_HAL_DISPATCH_OFF: u64 = 0x240;
@@ -794,10 +791,12 @@ const FSD_DATA_HAL_DISPATCH_BYTES: u64 = 0xC0;
 const FSD_DATA_HAL_DISPATCH_VERSION: u32 = 4;
 const FSD_DATA_HAL_DISPATCH_VA: u64 = FSD_DATA_VADDR + FSD_DATA_HAL_DISPATCH_OFF;
 const _: () = assert!(FSD_DATA_HAL_DISPATCH_OFF + FSD_DATA_HAL_DISPATCH_BYTES <= 0x300);
+const _: () = assert!(FSD_DATA_KE_NUMBER_PROCESSORS_OFF + 1 <= FSD_DATA_KD_COM_PORT_IN_USE_OFF);
+const _: () = assert!(FSD_DATA_KD_COM_PORT_IN_USE_OFF + 8 <= FSD_DATA_IO_DEVICE_OBJECT_TYPE_CELL_OFF);
+const _: () = assert!(FSD_DATA_IO_DEVICE_OBJECT_TYPE_CELL_OFF + 8 <= FSD_DATA_HAL_DISPATCH_OFF);
 const FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_OFF: u64 = 0x300;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_OFF: u64 = 0x340;
 const FSD_DATA_IO_DEVICE_OBJECT_TYPE_BODY_OFF: u64 = hosted_driver_object_reference::DEVICE_OBJECT_TYPE_BODY_OFFSET;
-const _: () = assert!(FSD_DATA_IO_DEVICE_OBJECT_TYPE_CELL_OFF + 8 <= FSD_DATA_HAL_DISPATCH_OFF);
 const _: () = assert!(FSD_DATA_IO_DEVICE_OBJECT_TYPE_BODY_OFF + 8 <= FSD_DATA_SE_EXPORTS_CELL_OFF);
 const FSD_DATA_SE_EXPORTS_CELL_OFF: u64 = 0x400;
 const FSD_DATA_SE_EXPORTS_STRUCT_OFF: u64 = 0x500;
@@ -815,7 +814,18 @@ const FSD_LOADER_CONFIGURATION_ROOT_OFF: u64 = 0xB0;
 // Keep the whole version-32 table resident in the provider data frame. A null optional slot
 // advertises that this HAL operation is unavailable; ACPI itself returns STATUS_NOT_SUPPORTED.
 const FSD_DATA_HAL_PRIVATE_DISPATCH_OFF: u64 = 0xC00;
-const _: () = assert!(crate::hosted_driver_nls_exports::FSD_NLS_STATE_OFFSET + crate::hosted_driver_nls_exports::FSD_NLS_STATE_BYTES <= FSD_DATA_HAL_PRIVATE_DISPATCH_OFF);
+const _: () = assert!(crate::hosted_driver_nls_exports::FSD_NLS_STATE_OFFSET
+    + crate::hosted_driver_nls_exports::FSD_NLS_STATE_BYTES
+    <= hosted_driver_process_state::INITIAL_SYSTEM_PROCESS_CELL_OFF);
+const _: () = assert!(hosted_driver_process_state::INITIAL_SYSTEM_PROCESS_CELL_OFF + 8
+    <= hosted_driver_process_state::PROCESS_TYPE_CELL_OFF);
+const _: () = assert!(hosted_driver_process_state::PROCESS_TYPE_CELL_OFF + 8
+    <= hosted_driver_process_state::THREAD_TYPE_CELL_OFF);
+const _: () = assert!(hosted_driver_process_state::THREAD_TYPE_CELL_OFF + 8
+    <= hosted_driver_safe_boot::SAFE_BOOT_MODE_OFFSET);
+const _: () = assert!(hosted_driver_safe_boot::SAFE_BOOT_MODE_OFFSET & 3 == 0);
+const _: () = assert!(hosted_driver_safe_boot::SAFE_BOOT_MODE_OFFSET + 4
+    <= FSD_DATA_HAL_PRIVATE_DISPATCH_OFF);
 const FSD_DATA_HAL_PRIVATE_DISPATCH_BYTES: u64 = 0x400;
 const FSD_DATA_HAL_PRIVATE_DISPATCH_VERSION: u32 = 32;
 const FSD_DATA_HAL_PRIVATE_DISPATCH_VA: u64 =
@@ -845,7 +855,6 @@ const FSD_DATA_KE_NUMBER_PROCESSORS_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_KE_NUMBER_PROCESSORS_OFF;
 const FSD_DATA_KD_COM_PORT_IN_USE_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_KD_COM_PORT_IN_USE_OFF;
-const _: () = assert!(FSD_DATA_KD_COM_PORT_IN_USE_OFF + 8 <= FSD_DATA_HAL_DISPATCH_OFF);
 const FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_IO_FILE_OBJECT_TYPE_BODY_OFF;
 const FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_VA: u64 =
