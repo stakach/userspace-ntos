@@ -2773,6 +2773,113 @@ pub(super) fn pin(
     Some((ticket, owner))
 }
 
+/// Return only the Protected auxiliary of an exact pinned hosted source IRP.
+/// The caller retains the pin and must recheck this receipt before source
+/// copyback; neither an address nor the packet's current pointers confer
+/// authority after the provider has entered.
+pub(super) fn protected_auxiliary(
+    instance_index: usize,
+    owner: SourceIrpAllocation,
+    ticket: SourceIrpTicket,
+) -> Option<SourceIrpAuxiliary> {
+    let _guard = lock();
+    if owner.owner != SourceIrpOwner::HostedDriver(instance_index)
+        || !ledger().matches(owner.owner, owner, ticket)
+        || !ledger().admits_forward(ticket, owner)
+    {
+        return None;
+    }
+    let inst = instance(instance_index)?;
+    if instance_domain_identity(inst) != Some(owner.domain) {
+        return None;
+    }
+    let _pool_guard = unsafe { hosted_instance_pool_lock(inst.exec_pool_va)? };
+    let mut current = allocation_unlocked(
+        instance_index, inst, owner.component_address, owner.bytes, owner.stack_count,
+    );
+    if let Some(current) = current.as_mut() { current.owner = owner.owner; }
+    if current != Some(owner) { return None; }
+    let (auxiliary, phase) = auxiliary().snapshot(ticket, owner).ok()?;
+    if phase != SourceIrpAuxiliaryPhase::Protected
+        || !unsafe { auxiliary_matches_unlocked(instance_index, inst, auxiliary, phase) }
+    {
+        return None;
+    }
+    Some(auxiliary)
+}
+
+/// Publish a terminal fileless READ into the source's retained buffer graph.
+/// The source-local IoCompleteRequest later copies buffered output to the
+/// caller and signals its IOSB/event. No provider result is synthesized here.
+pub(super) fn publish_device_read_result(
+    instance_index: usize,
+    captured: nt_io_manager::source_device_read::SourceDeviceRead,
+    status: i32,
+    information: u64,
+    output: &[u8],
+) -> bool {
+    if information > u64::from(captured.length)
+        || output.len() != captured.length as usize
+    {
+        return false;
+    }
+    let published = (|| {
+        let _guard = lock();
+        let inst = instance(instance_index)?;
+        if instance_domain_identity(inst) != Some(captured.source.domain)
+            || captured.source.owner != SourceIrpOwner::HostedDriver(instance_index)
+            || !ledger().matches(captured.source.owner, captured.source, captured.ticket)
+            || !ledger().admits_forward(captured.ticket, captured.source)
+        {
+            return None;
+        }
+        let _pool_guard = unsafe { hosted_instance_pool_lock(inst.exec_pool_va)? };
+        let (auxiliary, phase) = auxiliary().snapshot(captured.ticket, captured.source).ok()?;
+        if phase != SourceIrpAuxiliaryPhase::Protected
+            || auxiliary.transfer_buffer != Some(captured.output)
+            || auxiliary.system_buffer != captured.system_buffer
+            || auxiliary.mdl != captured.mdl
+            || auxiliary.completion != captured.completion
+            || !unsafe { auxiliary_matches_unlocked(instance_index, inst, auxiliary, phase) }
+        {
+            return None;
+        }
+        if let Some(mdl) = captured.mdl {
+            let (current, virtual_address) = unsafe { mdl_identity_unlocked(
+                inst, captured.source.domain, mdl.pool.component_address, captured.length,
+            )? };
+            if current != mdl || virtual_address != memory_component_address(captured.output) {
+                return None;
+            }
+        }
+        let destination = if let Some(system) = captured.system_buffer {
+            if unsafe { pool_range_identity_unlocked(inst, system.component_address,
+                u64::from(captured.length)) } != Some(system)
+            {
+                return None;
+            }
+            inst.exec_pool_va.checked_add(system.component_address.checked_sub(FSD_POOL_VADDR)?)?
+        } else {
+            match captured.output {
+                SourceMemoryIdentity::Pool { component_address, .. } =>
+                    inst.exec_pool_va.checked_add(component_address.checked_sub(FSD_POOL_VADDR)?)?,
+                SourceMemoryIdentity::MappedRange { exec_address, .. } => exec_address,
+            }
+        };
+        let irp = unsafe { hosted_pool_allocation_exec_va(
+            inst.exec_pool_va, captured.source.component_address, captured.source.bytes,
+        )? };
+        unsafe {
+            core::ptr::copy(output.as_ptr(), destination as *mut u8, information as usize);
+            write_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32, status);
+            write_unaligned((irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *mut u64,
+                information);
+        }
+        Some(())
+    })();
+    published.is_some() && arm_deferred_free(captured.ticket)
+}
+
 pub(super) fn pin_scsi(
     instance_index: usize,
     domain: HostedDomainIdentity,

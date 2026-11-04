@@ -24,6 +24,6 @@ fn scsi_and_buffered_control_restore_owned_row_before_reply() {
         "../../../components/ntos-executive/src/hosted_scsi_srb_work.rs"
     ));
     assert_retained_row_is_visible_before_source_wake(include_str!(
-        "../../../components/ntos-executive/src/hosted_buffered_control_work.rs"
+        "../../../components/ntos-executive/src/hosted_device_forward_work.rs"
     ));
 }

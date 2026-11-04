@@ -1,8 +1,8 @@
-//! Retained file-less buffered control dispatch between hosted driver domains.
+//! Retained fileless device control and READ dispatch between hosted domains.
 //!
 //! The canonical Device IRP may finish later than the source Call. Both the source IRP pin and
 //! physical Reply are retained until the provider terminal and source-local IoCompleteRequest.
-//! Provider bytes return only through the exact source SystemBuffer allocation.
+//! Provider bytes return only through the source's exact retained output graph.
 
 use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
@@ -10,7 +10,7 @@ use nt_io_manager::{
     detached_file_irp::{ExternalFileIrpDispatchPolicy, ExternalFileIrpRequest},
     hosted_forward_progress::HostedForwardDispatchReply,
     source_irp_ledger::SourceIrpForwardIdentity,
-    DeviceControlParameters, IoParameters, StackFlags,
+    DeviceControlParameters, IoParameters, ReadWriteParameters, StackFlags,
 };
 use nt_process::native_handle::{NativeHandleCaller, NativeThreadProcessReference};
 
@@ -21,7 +21,7 @@ const NOT_SUPPORTED: i32 = nt_status::NtStatus::NOT_SUPPORTED.raw();
 const INSUFFICIENT_RESOURCES: i32 = nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw();
 
 struct Work {
-    source: hosted_buffered_control_capture::CapturedBufferedControl,
+    source: Source,
     source_instance: DriverInstance,
     provider_instance: DriverInstance,
     caller: NativeHandleCaller,
@@ -43,6 +43,86 @@ struct Work {
     pending_wake: Option<WakeAction>,
     cancel_requested: bool,
     quarantined: bool,
+}
+
+enum Source {
+    Control(hosted_buffered_control_capture::CapturedBufferedControl),
+    Read(hosted_device_read_capture::CapturedDeviceRead),
+}
+
+impl Source {
+    fn identity(&self) -> SourceIrpForwardIdentity {
+        match self {
+            Self::Control(source) => source.identity(),
+            Self::Read(source) => source.identity(),
+        }
+    }
+    fn address(&self) -> u64 {
+        match self {
+            Self::Control(source) => source.address(),
+            Self::Read(source) => source.address(),
+        }
+    }
+    fn device_id(&self) -> nt_io_manager::DeviceId {
+        match self {
+            Self::Control(source) => source.device_id(),
+            Self::Read(source) => source.device_id(),
+        }
+    }
+    fn output_len(&self) -> u32 {
+        match self {
+            Self::Control(source) => source.request().output_len,
+            Self::Read(source) => source.request().length,
+        }
+    }
+    fn major(&self) -> u8 {
+        match self {
+            Self::Control(_) => major::IRP_MJ_DEVICE_CONTROL,
+            Self::Read(_) => major::IRP_MJ_READ,
+        }
+    }
+    fn label(&self) -> u64 {
+        match self {
+            Self::Control(_) => FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL,
+            Self::Read(_) => FSD_SERVICE_DEVICE_READ_FORWARD_LABEL,
+        }
+    }
+    fn completion_finished(&self) -> bool {
+        match self {
+            Self::Control(source) => source.completion_finished(),
+            Self::Read(source) => source.completion_finished(),
+        }
+    }
+    fn validate(&self) -> bool {
+        match self {
+            Self::Control(source) => source.validate().is_ok(),
+            Self::Read(source) => source.validate().is_ok(),
+        }
+    }
+    unsafe fn validate_before_entry(&self) -> bool {
+        match self {
+            Self::Control(source) => source.validate_before_entry().is_ok(),
+            Self::Read(source) => source.validate_before_entry().is_ok(),
+        }
+    }
+    unsafe fn write_refusal(&self, status: i32) -> bool {
+        match self {
+            Self::Control(source) => source.write_refusal(status).is_ok(),
+            Self::Read(source) => source.write_refusal(status).is_ok(),
+        }
+    }
+    unsafe fn write_result(&self, status: i32, information: u64, output: &[u8]) -> bool {
+        match self {
+            Self::Control(source) => source.write_result(status, information, output).is_ok(),
+            Self::Read(source) => source.write_result(status, information, output).is_ok(),
+        }
+    }
+    fn release(&mut self, pending_terminal: bool) -> bool {
+        match self {
+            Self::Control(source) => source.release(pending_terminal).is_ok(),
+            Self::Read(source) => source.release(pending_terminal).is_ok(),
+        }
+    }
 }
 
 struct RetainedAck {
@@ -109,17 +189,17 @@ fn capture_status(error: hosted_buffered_control_capture::CaptureError) -> i32 {
 }
 
 unsafe fn refuse_unentered(
-    mut source: hosted_buffered_control_capture::CapturedBufferedControl,
+    mut source: Source,
     status: i32,
 ) -> Option<i32> {
-    if source.write_refusal(status).is_err() {
+    if !source.write_refusal(status) {
         // A captured source changed while this exact Call was parked. Releasing
         // its pin or returning a value would let classpnp observe stale SUCCESS.
         crate::provider_bugcheck::report(
-            0xc4, [FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL, 10, source.address(), status as u32 as u64],
+            0xc4, [source.label(), 10, source.address(), status as u32 as u64],
         );
     }
-    source.release(false).expect("unentered buffered control release");
+    assert!(source.release(false), "unentered device forward release");
     Some(status)
 }
 
@@ -154,7 +234,7 @@ fn source_address_work_index(instance: DriverInstance, address: u64) -> Option<u
                 && work.source_instance.hosted_domain_id == instance.hosted_domain_id
                 && work.source_instance.hosted_domain_cookie == instance.hosted_domain_cookie
             && work.source.address() == address
-            && work.source.validate().is_ok()
+            && work.source.validate()
         })
     })
 }
@@ -166,20 +246,50 @@ pub(super) unsafe fn submit(
     badge: u64,
     reply_cap: u64,
 ) -> Option<i32> {
+    let source = match hosted_buffered_control_capture::capture(
+        ch, reply_cap, badge, source_irp, target_device,
+    ) {
+        Ok(source) => Source::Control(source),
+        Err(error) => return Some(capture_status(error)),
+    };
+    submit_captured(ch, source, reply_cap)
+}
+
+pub(super) unsafe fn submit_read(
+    ch: &crate::spawn_hosts::PumpChannel,
+    source_irp: u64,
+    target_device: u64,
+    badge: u64,
+    reply_cap: u64,
+) -> Option<i32> {
+    let source = match hosted_device_read_capture::capture(
+        ch, reply_cap, badge, source_irp, target_device,
+    ) {
+        Ok(source) => Source::Read(source),
+        Err(hosted_device_read_capture::CaptureError::InvalidCaller
+            | hosted_device_read_capture::CaptureError::InvalidSource) => return Some(INVALID_HANDLE),
+        Err(hosted_device_read_capture::CaptureError::InvalidTarget) =>
+            return Some(INVALID_DEVICE_REQUEST),
+        Err(hosted_device_read_capture::CaptureError::Unsupported) => return Some(NOT_SUPPORTED),
+    };
+    submit_captured(ch, source, reply_cap)
+}
+
+unsafe fn submit_captured(
+    ch: &crate::spawn_hosts::PumpChannel,
+    mut source: Source,
+    reply_cap: u64,
+) -> Option<i32> {
     let Some((_, source_instance)) = instance_for_pump_channel(ch, reply_cap) else {
+        assert!(source.release(false), "captured source channel rollback");
         return Some(INVALID_HANDLE);
     };
     let Some(route) = runtime::channel_route(ch).ok().flatten() else {
+        assert!(source.release(false), "captured source route rollback");
         return Some(INVALID_HANDLE);
     };
-    let mut source = match hosted_buffered_control_capture::capture(
-        ch, reply_cap, badge, source_irp, target_device,
-    ) {
-        Ok(source) => source,
-        Err(error) => return Some(capture_status(error)),
-    };
     if source_work_index(source_instance, source.identity()).is_some() {
-        source.release(false).expect("duplicate buffered control capture rollback");
+        assert!(source.release(false), "duplicate device forward capture rollback");
         return Some(DEVICE_BUSY);
     }
     let provider = hosted_driver_device_route_by_device_id(source.device_id().raw())
@@ -221,12 +331,12 @@ pub(super) unsafe fn submit(
         }
     };
     let mut terminal_output = Vec::new();
-    if terminal_output.try_reserve_exact(source.request().output_len as usize).is_err() {
+    if terminal_output.try_reserve_exact(source.output_len() as usize).is_err() {
         let mut actor = actor;
         let _ = crate::service_sec_image::with_provider_process_manager(|pm| actor.release(pm));
         return refuse_unentered(source, INSUFFICIENT_RESOURCES);
     }
-    terminal_output.resize(source.request().output_len as usize, 0);
+    terminal_output.resize(source.output_len() as usize, 0);
     if (&mut *core::ptr::addr_of_mut!(WORK)).try_reserve(1).is_err() {
         let mut actor = actor;
         let _ = crate::service_sec_image::with_provider_process_manager(|pm| actor.release(pm));
@@ -296,8 +406,9 @@ impl Work {
         {
             return true;
         }
-        self.canonical_irp
-            .is_some_and(|irp| completed_device_control_irp_exact(irp.raw()).is_some())
+        self.canonical_irp.is_some_and(|irp| {
+            completed_device_irp_exact(irp.raw(), self.source.major()).is_some()
+        })
     }
 
     unsafe fn actor_release(&mut self) -> Result<(), u32> {
@@ -324,36 +435,64 @@ impl Work {
             self.terminal_status = Some(status as i32);
             return;
         }
-        if self.source.validate_before_entry().is_err() || !self.provider_exact() {
+        if !self.source.validate_before_entry() || !self.provider_exact() {
             self.terminal_status = Some(INVALID_DEVICE_REQUEST);
             return;
         }
-        let control = self.source.request();
+        let (major, parameters, stack_flags, initial_information, policy, input) =
+            match &self.source {
+                Source::Control(source) => {
+                    let control = source.request();
+                    (
+                        major::IRP_MJ_DEVICE_CONTROL,
+                        IoParameters::DeviceControl(DeviceControlParameters {
+                            ioctl_code: control.code,
+                            input_len: control.input_len,
+                            output_len: control.output_len,
+                        }),
+                        StackFlags::empty(),
+                        control.initial_information,
+                        if control.output_len == 0 {
+                            ExternalFileIrpDispatchPolicy::DeviceControlAtDevice
+                        } else {
+                            ExternalFileIrpDispatchPolicy::BufferedDeviceControlAtDevice
+                        },
+                        source.input(),
+                    )
+                }
+                Source::Read(source) => {
+                    let read = source.request();
+                    (
+                        major::IRP_MJ_READ,
+                        IoParameters::Read(ReadWriteParameters {
+                            length: read.length,
+                            key: 0,
+                            offset: read.byte_offset,
+                        }),
+                        StackFlags::from_bits_retain(read.stack_flags),
+                        0,
+                        ExternalFileIrpDispatchPolicy::ReadAtDevice,
+                        &[][..],
+                    )
+                }
+            };
         let request = ExternalFileIrpRequest {
             client: nt_types::ClientId(IO_MANAGER_COMPONENT_ID),
             device_id: self.source.device_id(),
             file_id: None,
             user_data: 0,
             requestor_tid: u64::from(self.caller.original_thread().thread_id()),
-            major: major::IRP_MJ_DEVICE_CONTROL,
-            parameters: IoParameters::DeviceControl(DeviceControlParameters {
-                ioctl_code: control.code,
-                input_len: control.input_len,
-                output_len: control.output_len,
-            }),
-            stack_flags: StackFlags::empty(),
-            initial_information: control.initial_information,
+            major,
+            parameters,
+            stack_flags,
+            initial_information,
         };
         let result = hosted_file_owners::dispatch(
             self.caller,
             request,
-            self.source.input(),
+            input,
             &self.terminal_output,
-            if control.output_len == 0 {
-                ExternalFileIrpDispatchPolicy::DeviceControlAtDevice
-            } else {
-                ExternalFileIrpDispatchPolicy::BufferedDeviceControlAtDevice
-            },
+            policy,
         );
         let result = match result {
             Ok(result) => result,
@@ -369,7 +508,7 @@ impl Work {
                 status, information, buffers, ..
             } => {
                 let (_, output) = buffers.into_parts();
-                if output.len() != control.output_len as usize {
+                if output.len() != self.source.output_len() as usize {
                     self.terminal_status = Some(INVALID_DEVICE_REQUEST);
                     return;
                 }
@@ -385,7 +524,9 @@ impl Work {
         // A completed provider IRP cannot report STATUS_PENDING as its terminal status.
         // Completing the source with it would violate IoCompleteRequest's contract.
         if status as u32 == nt_status::NtStatus::PENDING.raw() as u32
-            || output.len() != self.source.request().output_len as usize
+            || output.len() != self.source.output_len() as usize
+            || self.source.major() == major::IRP_MJ_READ
+                && information > u64::from(self.source.output_len())
         {
             self.terminal_status = Some(INVALID_DEVICE_REQUEST);
             return;
@@ -397,12 +538,12 @@ impl Work {
 
     unsafe fn poll_provider(&mut self) {
         let Some(irp) = self.canonical_irp else { return; };
-        let Some(completion) = completed_device_control_irp_exact(irp.raw()) else { return; };
+        let Some(completion) = completed_device_irp_exact(irp.raw(), self.source.major()) else { return; };
         if completion.client_id != IO_MANAGER_COMPONENT_ID
             || completion.driver_id != self.provider_instance.driver_id
             || completion.device_id != self.source.device_id().raw()
             || completion.requestor_tid != u64::from(self.caller.original_thread().thread_id())
-            || completion.major != major::IRP_MJ_DEVICE_CONTROL
+            || completion.major != self.source.major()
             || !self.provider_exact()
         {
             self.quarantined = true;
@@ -412,9 +553,21 @@ impl Work {
             self.quarantined = true;
             return;
         }
-        let output_len = self.terminal_output.len();
+        let output_len = if self.source.major() == major::IRP_MJ_READ {
+            let Ok(length) = usize::try_from(completion.information) else {
+                self.quarantined = true;
+                return;
+            };
+            if length > self.terminal_output.len() {
+                self.quarantined = true;
+                return;
+            }
+            length
+        } else {
+            self.terminal_output.len()
+        };
         if output_len != 0
-            && copy_completed_irp_output_exact(irp.raw(), 0, &mut self.terminal_output) != Ok(output_len)
+            && copy_completed_irp_output_exact(irp.raw(), 0, &mut self.terminal_output[..output_len]) != Ok(output_len)
         {
             return;
         }
@@ -424,7 +577,7 @@ impl Work {
 
     unsafe fn publish_source_terminal(&mut self) -> bool {
         let status = self.terminal_status.expect("buffered control terminal status");
-        self.source.write_result(status, self.terminal_information, &self.terminal_output).is_ok()
+        self.source.write_result(status, self.terminal_information, &self.terminal_output)
     }
 
     unsafe fn retire_terminal(&mut self, stopped: bool) -> bool {
@@ -433,7 +586,7 @@ impl Work {
             self.canonical_irp = None;
         }
         if !self.source_released {
-            if self.source.release(!stopped).is_err() { return false; }
+            if !self.source.release(!stopped) { return false; }
             self.source_released = true;
         }
         !self.actor.is_held() || self.actor_release().is_ok()
@@ -608,6 +761,7 @@ pub(super) unsafe fn hold_inline(
     badge: u64,
     source_irp: u64,
     token: u64,
+    expected_label: u64,
 ) -> i32 {
     let Some((_, source_instance)) = instance_for_pump_channel(ch, reply_cap) else {
         trace_hold_refusal(1, source_irp, token, 0);
@@ -629,7 +783,7 @@ pub(super) unsafe fn hold_inline(
         trace_hold_refusal(5, source_irp, token, 0);
         return INVALID_HANDLE;
     };
-    if work.token != token {
+    if work.token != token || work.source.label() != expected_label {
         trace_hold_refusal(6, source_irp, token, work.token);
         return INVALID_HANDLE;
     }
@@ -664,6 +818,7 @@ pub(super) unsafe fn acknowledge(
     reply_cap: u64,
     badge: u64,
     source_irp: u64,
+    expected_label: u64,
 ) -> Option<i32> {
     let Some((_, source_instance)) = instance_for_pump_channel(ch, reply_cap) else {
         return Some(INVALID_HANDLE);
@@ -681,6 +836,7 @@ pub(super) unsafe fn acknowledge(
         return Some(INVALID_HANDLE);
     };
     if crate::provider_registry_caller::resolve(ch) != Ok(work.caller)
+        || work.source.label() != expected_label
         || work.ack.is_some()
         || !work.reply_entered
         || !work.source_published

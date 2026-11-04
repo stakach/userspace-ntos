@@ -13,10 +13,10 @@ fn foreign_lower_buffered_control_has_retained_source_route() {
     assert!(source.contains("service_hosted_buffered_control_forward"));
     assert!(source.contains("redrive_hosted_buffered_control_forward"));
 
-    let worker = include_str!("../../../components/ntos-executive/src/hosted_buffered_control_work.rs");
+    let worker = include_str!("../../../components/ntos-executive/src/hosted_device_forward_work.rs");
     let capture = include_str!("../../../components/ntos-executive/src/hosted_buffered_control_capture.rs");
     assert!(worker.contains("BufferedDeviceControlAtDevice"));
-    assert!(worker.contains("completed_device_control_irp_exact"));
+    assert!(worker.contains("completed_device_irp_exact"));
     assert!(worker.contains("copy_completed_irp_output_exact"));
     assert!(worker.contains("self.inline_held && self.source.completion_finished()"));
     assert!(worker.contains("wake_hosted_forward_service"),
@@ -31,7 +31,7 @@ fn foreign_lower_buffered_control_has_retained_source_route() {
     assert!(capture.contains("pool_range_identity_unlocked"));
     assert!(capture.contains("write_refusal"));
     assert!(source.contains("HostedIrpUnwindOutcome::MoreProcessingRequired"));
-    let origin_start = source.find("unsafe fn forward_hosted_buffered_control(").unwrap();
+    let origin_start = source.find("unsafe fn forward_hosted_fileless_device(").unwrap();
     let origin_end = source[origin_start..].find("\n///").unwrap() + origin_start;
     assert!(source[origin_start..origin_end].contains("HostedForwardDispatchReply::decode"),
         "origin must decode typed three-word reply before sending held token");

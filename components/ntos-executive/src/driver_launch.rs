@@ -275,6 +275,8 @@ mod hosted_read_capture;
 mod hosted_internal_control_capture;
 #[path = "hosted_buffered_control_capture.rs"]
 mod hosted_buffered_control_capture;
+#[path = "hosted_device_read_capture.rs"]
+mod hosted_device_read_capture;
 #[path = "hosted_flush_capture.rs"]
 mod hosted_flush_capture;
 #[path = "hosted_query_information_capture.rs"]
@@ -287,8 +289,8 @@ mod hosted_write_work;
 mod hosted_read_work;
 #[path = "hosted_internal_control_work.rs"]
 mod hosted_internal_control_work;
-#[path = "hosted_buffered_control_work.rs"]
-mod hosted_buffered_control_work;
+#[path = "hosted_device_forward_work.rs"]
+mod hosted_device_forward_work;
 #[path = "hosted_scsi_srb_capture.rs"]
 mod hosted_scsi_srb_capture;
 #[path = "hosted_scsi_srb_provider.rs"]
@@ -1315,6 +1317,7 @@ pub const FSD_SERVICE_IO_CREATE_FILE_LABEL: u64 = 0x78E;
 pub const FSD_SERVICE_SOURCE_IRP_LABEL: u64 = 0x799;
 pub const FSD_SERVICE_QUERY_PATH_FORWARD_LABEL: u64 = 0x79A;
 pub const FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL: u64 = 0x7F0;
+pub const FSD_SERVICE_DEVICE_READ_FORWARD_LABEL: u64 = 0x7F1;
 pub const FSD_SERVICE_TOKEN_QUERY_LABEL: u64 = 0x79B;
 pub(crate) const FSD_SERVICE_PRIMARY_TOKEN_LABEL: u64 = 0x7D6;
 pub const FSD_SERVICE_CREATE_SUBJECT_LABEL: u64 = 0x79C;
@@ -1399,6 +1402,7 @@ const _: () = {
         FSD_SERVICE_SOURCE_IRP_LABEL,
         FSD_SERVICE_QUERY_PATH_FORWARD_LABEL,
         FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL,
+        FSD_SERVICE_DEVICE_READ_FORWARD_LABEL,
         FSD_SERVICE_TOKEN_QUERY_LABEL,
         FSD_SERVICE_CREATE_SUBJECT_LABEL,
         FSD_SERVICE_ZW_FS_CONTROL_FILE_LABEL,
@@ -9793,35 +9797,35 @@ unsafe fn forward_hosted_internal_control(
     status as u32 as i32
 }
 
-/// A source-created METHOD_BUFFERED control IRP sent to a foreign lower PDO.
-/// The root retains its exact source allocation and canonical provider result
-/// before the source-local completion routine may observe it.
-unsafe fn forward_hosted_buffered_control(
-    device: u64, irp: u64, next: u64, current_location_after_forward: u8,
+/// A source-created fileless Device IRP sent to an exact foreign lower Device.
+/// The root retains its source allocation and canonical provider result until
+/// source-local completion and exact acknowledgement.
+unsafe fn forward_hosted_fileless_device(
+    label: u64, device: u64, irp: u64, next: u64,
+    current_location_after_forward: u8,
 ) -> i32 {
     write_unaligned((next + WDM_X64_IO_STACK_DEVICE_OBJECT_OFFSET) as *mut u64, device);
-    let (label, status, disposition_word, token, _) = call_on4(
-        (FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL << 12) | 4,
+    let (reply_label, status, disposition_word, token, _) = call_on4(
+        (label << 12) | 4,
         1, device, irp, 0,
     );
     let status = status as u32 as i32;
     let disposition = nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply::decode(
         status, disposition_word,
     );
-    if label != 0
+    if reply_label != 0
         || disposition.is_none()
         || matches!(disposition, Some(nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply::Pending))
         || matches!(disposition, Some(nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply::InlineTerminal(_)))
             && token == 0
     {
         crate::provider_bugcheck::report(
-            0xc4, [FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL, 1, irp, label],
+            0xc4, [label, 1, irp, reply_label],
         );
     }
     if matches!(disposition, Some(nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply::Rejected(_))) {
-        // The source packet was already checked by s_iof_call_driver. Classpnp
-        // reads IoStatus even after a direct IoCallDriver refusal, so publish
-        // the definite failure rather than leaving its zero-initialized SUCCESS.
+        // A source may inspect IoStatus even after a definite dispatch refusal.
+        // Publish that failure without running a completion callback.
         write_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32, status);
         write_unaligned((irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *mut u64, 0);
         return status;
@@ -9832,26 +9836,40 @@ unsafe fn forward_hosted_buffered_control(
     let completion = complete_hosted_irp_with_owner(irp);
     if completion.outcome == HostedIrpUnwindOutcome::MoreProcessingRequired {
         let (ack_label, ack_status, _, _, _) = call_on4(
-            (FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL << 12) | 4,
+            (label << 12) | 4,
             4, irp, token, 0,
         );
         if ack_label != 0 || ack_status as u32 as i32 != STATUS_SUCCESS {
             crate::provider_bugcheck::report(
-                0xc4, [FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL, 4, irp, ack_status],
+                0xc4, [label, 4, irp, ack_status],
             );
         }
         return status;
     }
     let (ack_label, ack_status, _, _, _) = call_on4(
-        (FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL << 12) | 4,
+        (label << 12) | 4,
         2, irp, 0, 0,
     );
     if ack_label != 0 || ack_status as u32 as i32 != STATUS_SUCCESS {
         crate::provider_bugcheck::report(
-            0xc4, [FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL, 2, irp, ack_status],
+            0xc4, [label, 2, irp, ack_status],
         );
     }
     status
+}
+
+unsafe fn forward_hosted_buffered_control(
+    device: u64, irp: u64, next: u64, current_location_after_forward: u8,
+) -> i32 {
+    forward_hosted_fileless_device(FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL,
+        device, irp, next, current_location_after_forward)
+}
+
+unsafe fn forward_hosted_device_read(
+    device: u64, irp: u64, next: u64, current_location_after_forward: u8,
+) -> i32 {
+    forward_hosted_fileless_device(FSD_SERVICE_DEVICE_READ_FORWARD_LABEL,
+        device, irp, next, current_location_after_forward)
 }
 
 /// Major 0x0f overloads internal control and SCSI. Resolve the exact foreign accepted PDO
@@ -9995,6 +10013,14 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
                     as *const u64,
             );
             if handler == 0 {
+                if major == major::IRP_MJ_READ as u64
+                    && read_unaligned(next as *const nt_kernel_abi::IoStackLocation)
+                        .file_object.0 == 0
+                {
+                    return forward_hosted_device_read(
+                        device, irp, next, current_location_after_forward,
+                    );
+                }
                 if major == major::IRP_MJ_POWER as u64 {
                     return forward_hosted_power(device, irp, next, previous_location);
                 }
@@ -10286,6 +10312,14 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
         }
         if major == IRP_MJ_DEVICE_CONTROL {
             return forward_hosted_buffered_control(
+                device, irp, next, current_location_after_forward,
+            );
+        }
+        if major == major::IRP_MJ_READ as u64
+            && read_unaligned(next as *const nt_kernel_abi::IoStackLocation)
+                .file_object.0 == 0
+        {
+            return forward_hosted_device_read(
                 device, irp, next, current_location_after_forward,
             );
         }
@@ -43542,21 +43576,19 @@ pub(crate) unsafe fn completed_irp_exact(irp_id: u64) -> Option<HostedCompletedI
     })
 }
 
-/// Observe an exact terminal File-less control without consuming the canonical IRP.
-/// File-bound work must continue through `completed_irp_exact` and its File lease.
-pub(crate) unsafe fn completed_device_control_irp_exact(
+/// Observe an exact terminal fileless Device IRP without consuming it.
+/// The caller specifies the major it prepared and retains the source owner.
+pub(crate) unsafe fn completed_device_irp_exact(
     irp_id: u64,
+    expected_major: u8,
 ) -> Option<HostedCompletedDeviceControlIrp> {
+    if !matches!(expected_major,
+        nt_io_abi::major::IRP_MJ_READ
+            | nt_io_abi::major::IRP_MJ_DEVICE_CONTROL
+            | nt_io_abi::major::IRP_MJ_INTERNAL_DEVICE_CONTROL)
+    { return None; }
     let completion = completed_irp_snapshot_exact(irp_id)?;
-    if completion.file_id.is_some()
-        || !matches!(
-            completion.major,
-            nt_io_abi::major::IRP_MJ_DEVICE_CONTROL
-                | nt_io_abi::major::IRP_MJ_INTERNAL_DEVICE_CONTROL
-        )
-    {
-        return None;
-    }
+    if completion.file_id.is_some() || completion.major != expected_major { return None; }
     Some(HostedCompletedDeviceControlIrp {
         client_id: completion.client_id.0,
         driver_id: completion.driver_id.raw(),
@@ -43568,6 +43600,18 @@ pub(crate) unsafe fn completed_device_control_irp_exact(
         status: completion.status.raw() as u32,
         information: completion.information,
     })
+}
+
+/// Control callers accept either external or internal device-control major.
+pub(crate) unsafe fn completed_device_control_irp_exact(
+    irp_id: u64,
+) -> Option<HostedCompletedDeviceControlIrp> {
+    let completion = completed_irp_snapshot_exact(irp_id)?;
+    if !matches!(completion.major,
+        nt_io_abi::major::IRP_MJ_DEVICE_CONTROL
+            | nt_io_abi::major::IRP_MJ_INTERNAL_DEVICE_CONTROL)
+    { return None; }
+    completed_device_irp_exact(irp_id, completion.major)
 }
 
 /// Copy one retained terminal-output chunk without consuming the canonical completion.
@@ -66632,20 +66676,43 @@ pub(crate) unsafe fn service_hosted_buffered_control_forward(
     irp_or_token: u64,
 ) -> Option<(i32, bool)> {
     match operation {
-        1 => hosted_buffered_control_work::submit(ch, irp_or_token, address, badge, reply_cap)
+        1 => hosted_device_forward_work::submit(ch, irp_or_token, address, badge, reply_cap)
             .map(|status| (status, false)),
-        2 if irp_or_token == 0 => hosted_buffered_control_work::acknowledge(
-            ch, reply_cap, badge, address,
+        2 if irp_or_token == 0 => hosted_device_forward_work::acknowledge(
+            ch, reply_cap, badge, address, FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL,
         ).map(|status| (status, false)),
-        4 => Some((hosted_buffered_control_work::hold_inline(
+        4 => Some((hosted_device_forward_work::hold_inline(
             ch, reply_cap, badge, address, irp_or_token,
+            FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL,
         ), false)),
         _ => Some((STATUS_INVALID_PARAMETER, false)),
     }
 }
 
 pub(crate) unsafe fn redrive_hosted_buffered_control_forward(handler: *mut ExecNtHandler) {
-    hosted_buffered_control_work::redrive(handler);
+    hosted_device_forward_work::redrive(handler);
+}
+
+pub(crate) unsafe fn service_hosted_device_read_forward(
+    ch: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    operation: u64,
+    address: u64,
+    irp_or_token: u64,
+) -> Option<(i32, bool)> {
+    match operation {
+        1 => hosted_device_forward_work::submit_read(ch, irp_or_token, address, badge, reply_cap)
+            .map(|status| (status, false)),
+        2 if irp_or_token == 0 => hosted_device_forward_work::acknowledge(
+            ch, reply_cap, badge, address, FSD_SERVICE_DEVICE_READ_FORWARD_LABEL,
+        ).map(|status| (status, false)),
+        4 => Some((hosted_device_forward_work::hold_inline(
+            ch, reply_cap, badge, address, irp_or_token,
+            FSD_SERVICE_DEVICE_READ_FORWARD_LABEL,
+        ), false)),
+        _ => Some((STATUS_INVALID_PARAMETER, false)),
+    }
 }
 
 pub(crate) unsafe fn service_hosted_scsi_forward(
@@ -66999,11 +67066,11 @@ pub(crate) unsafe fn redrive_nested_hosted_internal_control(handler: *mut ExecNt
 }
 
 pub(crate) unsafe fn nested_hosted_buffered_control_ready() -> bool {
-    hosted_buffered_control_work::nested_work_ready()
+    hosted_device_forward_work::nested_work_ready()
 }
 
 pub(crate) unsafe fn redrive_nested_hosted_buffered_control(handler: *mut ExecNtHandler) -> bool {
-    hosted_buffered_control_work::redrive_nested_ready(handler)
+    hosted_device_forward_work::redrive_nested_ready(handler)
 }
 
 pub(crate) unsafe fn redrive_nested_hosted_query_path(handler: *mut ExecNtHandler) -> bool {
