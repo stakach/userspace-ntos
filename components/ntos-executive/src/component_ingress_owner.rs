@@ -329,7 +329,7 @@ impl NativeSharedIngress {
         execution: IngressExecutionOwner,
         probe_tcb: u64,
         blocking: bool,
-    ) -> Result<(), super::ReceiveError> {
+    ) -> Result<u64, super::ReceiveError> {
         if !self.ready {
             return Err(super::ReceiveError::Ownership(
                 nt_component_suspension::ReservedReceiveError::InvalidPhase,

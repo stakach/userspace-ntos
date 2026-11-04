@@ -11,6 +11,13 @@ pub enum SharedReceiveOwner {
     Startup,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SharedReceiveReturn {
+    Call,
+    Timer,
+    OtherNotification,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SharedReceiveSample {
     pub count: u64,
@@ -21,13 +28,21 @@ pub struct SharedReceiveSample {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SharedReceiveCensus {
     samples: [SharedReceiveSample; 6],
+    idle_returns: [SharedReceiveSample; 3],
+    sequence: u64,
+    pending: Option<(u64, u64, SharedReceiveOwner, bool)>,
 }
 
 impl SharedReceiveCensus {
     pub const BUCKETS: usize = 6;
 
     pub const fn new() -> Self {
-        Self { samples: [SharedReceiveSample { count: 0, total_ticks: 0, max_ticks: 0 }; Self::BUCKETS] }
+        Self {
+            samples: [SharedReceiveSample { count: 0, total_ticks: 0, max_ticks: 0 }; Self::BUCKETS],
+            idle_returns: [SharedReceiveSample { count: 0, total_ticks: 0, max_ticks: 0 }; 3],
+            sequence: 0,
+            pending: None,
+        }
     }
 
     pub const fn bucket(owner: SharedReceiveOwner, blocking: bool) -> usize {
@@ -40,12 +55,48 @@ impl SharedReceiveCensus {
     }
 
     /// The caller brackets only the receive syscall, after admission and before capture.
-    pub fn observe(&mut self, owner: SharedReceiveOwner, blocking: bool, start: u64, end: u64) {
+    pub fn observe(&mut self, owner: SharedReceiveOwner, blocking: bool, start: u64, end: u64) -> u64 {
         let elapsed = end.wrapping_sub(start);
         let sample = &mut self.samples[Self::bucket(owner, blocking)];
         sample.count = sample.count.saturating_add(1);
         sample.total_ticks = sample.total_ticks.saturating_add(elapsed);
         sample.max_ticks = sample.max_ticks.max(elapsed);
+        self.sequence = self.sequence.wrapping_add(1);
+        self.pending = Some((self.sequence, elapsed, owner, blocking));
+        self.sequence
+    }
+
+    /// Attribute the exact returned receive once classification has authenticated Call versus
+    /// notification. An intervening receive invalidates the older token rather than mischarging it.
+    pub fn classify_return(&mut self, sequence: u64, reason: SharedReceiveReturn) -> bool {
+        let Some((pending_sequence, elapsed, owner, blocking)) = self.pending else {
+            return false;
+        };
+        if pending_sequence != sequence {
+            return false;
+        }
+        self.pending = None;
+        if owner == SharedReceiveOwner::Idle && blocking {
+            let index = match reason {
+                SharedReceiveReturn::Call => 0,
+                SharedReceiveReturn::Timer => 1,
+                SharedReceiveReturn::OtherNotification => 2,
+            };
+            let sample = &mut self.idle_returns[index];
+            sample.count = sample.count.saturating_add(1);
+            sample.total_ticks = sample.total_ticks.saturating_add(elapsed);
+            sample.max_ticks = sample.max_ticks.max(elapsed);
+        }
+        true
+    }
+
+    pub const fn idle_return(&self, reason: SharedReceiveReturn) -> SharedReceiveSample {
+        let index = match reason {
+            SharedReceiveReturn::Call => 0,
+            SharedReceiveReturn::Timer => 1,
+            SharedReceiveReturn::OtherNotification => 2,
+        };
+        self.idle_returns[index]
     }
 
     pub const fn sample(&self, owner: SharedReceiveOwner, blocking: bool) -> SharedReceiveSample {
@@ -104,5 +155,52 @@ mod tests {
             count: 2, total_ticks: u64::MAX, max_ticks: u64::MAX,
         });
         assert_eq!(census.sample(SharedReceiveOwner::Idle, false), SharedReceiveSample::default());
+    }
+
+    #[test]
+    fn idle_returns_charge_exact_elapsed_once_after_classification() {
+        let mut census = SharedReceiveCensus::new();
+        let timer = census.observe(SharedReceiveOwner::Idle, true, 10, 110);
+        assert_eq!(census.idle_return(SharedReceiveReturn::Timer), SharedReceiveSample::default());
+        assert!(census.classify_return(timer, SharedReceiveReturn::Timer));
+        assert!(!census.classify_return(timer, SharedReceiveReturn::Call));
+        let call = census.observe(SharedReceiveOwner::Idle, true, u64::MAX - 3, 4);
+        assert!(census.classify_return(call, SharedReceiveReturn::Call));
+        let other = census.observe(SharedReceiveOwner::Idle, true, 20, 23);
+        assert!(census.classify_return(other, SharedReceiveReturn::OtherNotification));
+        assert_eq!(census.idle_return(SharedReceiveReturn::Timer), SharedReceiveSample {
+            count: 1, total_ticks: 100, max_ticks: 100,
+        });
+        assert_eq!(census.idle_return(SharedReceiveReturn::Call), SharedReceiveSample {
+            count: 1, total_ticks: 8, max_ticks: 8,
+        });
+        assert_eq!(census.idle_return(SharedReceiveReturn::OtherNotification), SharedReceiveSample {
+            count: 1, total_ticks: 3, max_ticks: 3,
+        });
+    }
+
+    #[test]
+    fn overwritten_and_nonidle_receives_do_not_mischarge_idle_returns() {
+        let mut census = SharedReceiveCensus::new();
+        let old = census.observe(SharedReceiveOwner::Idle, true, 1, 100);
+        let next = census.observe(SharedReceiveOwner::Idle, true, 2, 5);
+        assert!(!census.classify_return(old, SharedReceiveReturn::Timer));
+        assert!(census.classify_return(next, SharedReceiveReturn::Call));
+        let dispatch = census.observe(SharedReceiveOwner::Dispatch, true, 1, 50);
+        assert!(census.classify_return(dispatch, SharedReceiveReturn::Timer));
+        assert_eq!(census.idle_return(SharedReceiveReturn::Call).total_ticks, 3);
+        assert_eq!(census.idle_return(SharedReceiveReturn::Timer), SharedReceiveSample::default());
+    }
+
+    #[test]
+    fn classified_return_totals_saturate() {
+        let mut census = SharedReceiveCensus::new();
+        let first = census.observe(SharedReceiveOwner::Idle, true, 0, u64::MAX);
+        assert!(census.classify_return(first, SharedReceiveReturn::Timer));
+        let second = census.observe(SharedReceiveOwner::Idle, true, 0, 10);
+        assert!(census.classify_return(second, SharedReceiveReturn::Timer));
+        assert_eq!(census.idle_return(SharedReceiveReturn::Timer), SharedReceiveSample {
+            count: 2, total_ticks: u64::MAX, max_ticks: u64::MAX,
+        });
     }
 }

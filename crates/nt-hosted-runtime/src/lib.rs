@@ -107,7 +107,7 @@ pub use badge_census::{
     BadgeCensusSource, BADGE_CENSUS_SLOTS, DIRECT_BADGE_SLOTS, GUARD_OR_ISR_SLOT,
     HOSTED_IRQ_SLOT, OVERFLOW_SLOT, TIMER_SLOT,
 };
-pub use shared_receive_census::{SharedReceiveCensus, SharedReceiveOwner, SharedReceiveSample};
+pub use shared_receive_census::{SharedReceiveCensus, SharedReceiveOwner, SharedReceiveReturn, SharedReceiveSample};
 pub use progress_deferral::ProgressDeferralBudget;
 pub use installer_progress_deferral::{InstallerOwner, InstallerProgressDeferral};
 pub use setup_read_progress_deferral::SetupReadProgressDeferral;

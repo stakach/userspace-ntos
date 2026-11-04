@@ -623,7 +623,7 @@ pub(crate) unsafe fn receive(
     hosted::recycle_completed()?;
     let owner = owner();
     let lanes = lanes();
-    owner
+    let receive_sequence = owner
         .receive(lanes, execution, probe_tcb, blocking)
         .map_err(|error| {
             print_str(b"[ingress-receive-error] stage=receive kind=");
@@ -653,6 +653,13 @@ pub(crate) unsafe fn receive(
         log_receive_error_kind(error);
         Error::Receive
     })?;
+    let reason = match notification.as_ref() {
+        Some(message) if crate::badge_has_delay_timer(message.badge()) =>
+            nt_hosted_runtime::SharedReceiveReturn::Timer,
+        Some(_) => nt_hosted_runtime::SharedReceiveReturn::OtherNotification,
+        None => nt_hosted_runtime::SharedReceiveReturn::Call,
+    };
+    super::super::classify_receive_census(receive_sequence, reason);
     if let Some(message) = notification {
         return Ok(Arrival::Notification(message));
     }

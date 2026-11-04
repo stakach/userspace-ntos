@@ -7035,7 +7035,7 @@ fn print_hot_ssn_field(who: &[u8], hist: &[AtomicU64; SSN_HIST_N]) {
 }
 
 fn print_shared_receive_census() {
-    use nt_hosted_runtime::SharedReceiveOwner;
+    use nt_hosted_runtime::{SharedReceiveOwner, SharedReceiveReturn};
     let census = spawn_hosts::shared_ingress::receive_census_snapshot();
     print_str(b"[census] shared-recv count/total-Mtick/max-ktick");
     for (owner, label) in [
@@ -7055,6 +7055,22 @@ fn print_shared_receive_census() {
             print_str(b"/");
             print_u64(sample.max_ticks / 1_000);
         }
+    }
+    print_str(b"\n");
+    print_str(b"[census] idle-recv-return count/total-Mtick/max-ktick");
+    for (reason, label) in [
+        (SharedReceiveReturn::Call, b" call".as_slice()),
+        (SharedReceiveReturn::Timer, b" timer".as_slice()),
+        (SharedReceiveReturn::OtherNotification, b" other-notification".as_slice()),
+    ] {
+        let sample = census.idle_return(reason);
+        print_str(label);
+        print_str(b"=");
+        print_u64(sample.count);
+        print_str(b"/");
+        print_u64(sample.total_ticks / 1_000_000);
+        print_str(b"/");
+        print_u64(sample.max_ticks / 1_000);
     }
     print_str(b"\n");
     let [calls, ticks, hosted, call, timer, other_notification, error,

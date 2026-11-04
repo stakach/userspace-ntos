@@ -12,7 +12,7 @@ use nt_component_suspension::{
     ReservedReceiveError, ReservedReceivePhase,
 };
 use nt_component_suspension::{IngressReplyPool, ReplyPoolError};
-use nt_hosted_runtime::{SharedReceiveCensus, SharedReceiveOwner};
+use nt_hosted_runtime::{SharedReceiveCensus, SharedReceiveOwner, SharedReceiveReturn};
 
 // The executive alone owns this ingress and runs its root loop and nested pumps serially. No
 // borrow of the census crosses a receive syscall or a callback boundary.
@@ -21,6 +21,14 @@ static mut SHARED_RECEIVE_CENSUS: SharedReceiveCensus = SharedReceiveCensus::new
 pub(crate) fn receive_census_snapshot() -> SharedReceiveCensus {
     // A value copy at a serialized executive event boundary; no reference escapes.
     unsafe { *core::ptr::addr_of!(SHARED_RECEIVE_CENSUS) }
+}
+
+pub(crate) fn classify_receive_census(sequence: u64, reason: SharedReceiveReturn) {
+    // Classification immediately follows capture on the sole executive ingress owner. A nested
+    // receive replaces the pending token, so a stale result cannot be charged to the next call.
+    unsafe {
+        (*core::ptr::addr_of_mut!(SHARED_RECEIVE_CENSUS)).classify_return(sequence, reason);
+    }
 }
 
 pub(crate) enum ReceiveError {
@@ -85,7 +93,7 @@ pub(crate) unsafe fn receive<C, R, T>(
     execution: IngressExecutionOwner,
     probe_tcb: u64,
     blocking: bool,
-) -> Result<(), ReceiveError> {
+) -> Result<u64, ReceiveError> {
     let endpoint = owner.endpoint();
     let reply = owner.reply();
     {
@@ -128,14 +136,15 @@ pub(crate) unsafe fn receive<C, R, T>(
         IngressExecutionOwner::Dispatch(_) => SharedReceiveOwner::Dispatch,
         IngressExecutionOwner::Startup(_) => SharedReceiveOwner::Startup,
     };
-    (*core::ptr::addr_of_mut!(SHARED_RECEIVE_CENSUS)).observe(
+    let sequence = (*core::ptr::addr_of_mut!(SHARED_RECEIVE_CENSUS)).observe(
         census_owner, blocking, recv_started, recv_finished,
     );
     // Own the entire IPC bank before binding queries or notification processing reuse it.
     let message = crate::ipc_message::capture_received(badge, info, [m0, m1, m2, m3]);
     owner
         .capture(message)
-        .map_err(|(error, message)| ReceiveError::Capture(error, message))
+        .map_err(|(error, message)| ReceiveError::Capture(error, message))?;
+    Ok(sequence)
 }
 
 /// Resolve only after complete capture. The resolver must authenticate badge, endpoint,
