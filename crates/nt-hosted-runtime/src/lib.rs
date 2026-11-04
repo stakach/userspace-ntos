@@ -20,6 +20,7 @@ mod hosted_file_phase_diagnostic;
 mod hosted_file_rpc_phase;
 mod hosted_install_pipe_diagnostic;
 mod native_block_stage_sample;
+mod native_cache_claim_drain;
 mod retained_system_fold_phase;
 mod driver_load_receipt;
 mod dxg_registration;
@@ -120,6 +121,7 @@ pub use hosted_file_rpc_phase::{HostedFileRpcCounts, HostedFileRpcDiagnostic,
 pub use hosted_install_pipe_diagnostic::{is_install_pipe_name, InstallChildIdentity, InstallPipeCounts, InstallPipeDiagnostic, InstallPipeIdentity, InstallPipeObservation, InstallPipeTerminal};
 pub use native_block_stage_sample::{NativeBlockStageObservation, NativeBlockStageOwner, NativeBlockStageSample,
     NativeBlockStageSampler};
+pub use native_cache_claim_drain::{drain_cached_claims, CacheClaimStep};
 pub use retained_system_fold_phase::RetainedSystemFoldPhase;
 
 pub const PAGE_SIZE: u64 = 0x1000;

@@ -12,6 +12,9 @@ use nt_io_manager::{
     scsi_srb_wire::decode_scsi_completion,
     IoParameters, StackFlags,
 };
+use nt_hosted_runtime::{drain_cached_claims, CacheClaimStep};
+
+const CACHE_CLAIMS_PER_TURN: usize = 32;
 
 // Native mounted SCSI traffic is distinct from the direct boot AHCI census. Completion is
 // counted only after the exact IRP terminal (and, for pending IRPs, acknowledgement).
@@ -38,6 +41,7 @@ static mut METADATA_FENCE: Option<nt_fs::InstalledMetadataReadThroughFence<Metad
 static METADATA_FENCE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static METADATA_FENCE_POISONS: AtomicU64 = AtomicU64::new(0);
 static METADATA_READ_THROUGH_HITS: AtomicU64 = AtomicU64::new(0);
+static METADATA_EXTRA_HITS_IN_TURN: AtomicU64 = AtomicU64::new(0);
 // Observation only: sample the first two unclassified shapes per opcode even after the
 // irreversible fence has poisoned. This may expose later read-only classification gaps.
 static UNCLASSIFIED_SRB_TRACES: [AtomicU64; 256] =
@@ -142,6 +146,9 @@ pub(super) fn print_census() {
     print_str(b"\n");
     print_str(b"[census] native-metadata-read-through hits=");
     print_u64(METADATA_READ_THROUGH_HITS.load(Ordering::Relaxed));
+    print_str(b"\n");
+    print_str(b"[census] native-metadata-cache-drain extra-hits=");
+    print_u64(METADATA_EXTRA_HITS_IN_TURN.load(Ordering::Relaxed));
     print_str(b"\n");
     let published = native_disk_relation::native_storage_route();
     let retained = native_disk_relation::retained_native_storage_recheck_route();
@@ -729,7 +736,8 @@ impl Drop for NativeServiceGuard {
     fn drop(&mut self) { SERVICE_ACTIVE.store(false, Ordering::Release); }
 }
 
-/// Drive at most one physical command per service turn. Backends only publish claims.
+/// Complete bounded cached claims and drive at most one physical command per service turn.
+/// Backends only publish claims.
 pub(super) unsafe fn service() -> usize {
     let Some(_guard) = NativeServiceGuard::enter() else {
         NATIVE_SERVICE_GUARD_BUSY.fetch_add(1, Ordering::Relaxed);
@@ -743,38 +751,54 @@ pub(super) unsafe fn service() -> usize {
         }
         settled
     } else { 0 };
-    let (route, claim, wal_authority) = if let Some(route) = native_disk_relation::native_storage_route() {
-        let search_started = crate::disk_census_ticks();
-        let claim = next_claim();
-        NATIVE_CLAIM_SEARCH_PHASE.record(search_started, crate::disk_census_ticks());
-        let Some(claim) = claim else {
-            if settled == 0 {
-                NATIVE_SERVICE_CLAIM_MISS_FRESH.fetch_add(1, Ordering::Relaxed);
-            } else {
-                NATIVE_SERVICE_CLAIM_MISS_AFTER_SETTLE.fetch_add(1, Ordering::Relaxed);
-            }
-            return settled;
-        };
-        if settled == 0 {
-            NATIVE_SERVICE_CLAIM_HIT_FRESH.fetch_add(1, Ordering::Relaxed);
-        } else {
-            NATIVE_SERVICE_CLAIM_HIT_AFTER_SETTLE.fetch_add(1, Ordering::Relaxed);
-        }
-        (route, claim, None)
-    } else {
-        let Some(route) = native_disk_relation::retained_native_storage_recheck_route() else {
-            return settled;
-        };
-        let Some(wal_authority) = retained_native_storage_wal_scsi_authority(route) else {
-            return settled;
-        };
-        let claim = crate::driver_launch::native_storage_relation_recheck_id()
-            .and_then(|id| crate::writable_fs::native_snapshot_io::claim_relation_header_recheck(id))
-            .or_else(|| crate::writable_fs::native_snapshot_io::claim_retained_relation_wal_io());
-        let Some(claim) = claim.map(WorkClaim::Snapshot) else { return settled; };
-        (route, claim, wal_authority)
+    if native_disk_relation::native_storage_route().is_some() {
+        let mut first_claim = true;
+        let mut cached_in_turn = 0usize;
+        // Each cached completion may synchronously publish another FAT lookup sector.
+        // Reacquire the published physical route before each claim; the first non-cache
+        // result ends this turn even if its provider returned inline or refused entry.
+        let driven = drain_cached_claims(CACHE_CLAIMS_PER_TURN,
+            || {
+                let route = native_disk_relation::native_storage_route()?;
+                let search_started = crate::disk_census_ticks();
+                let claim = next_claim();
+                NATIVE_CLAIM_SEARCH_PHASE.record(search_started, crate::disk_census_ticks());
+                if first_claim {
+                    if claim.is_some() {
+                        if settled == 0 {
+                            NATIVE_SERVICE_CLAIM_HIT_FRESH.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            NATIVE_SERVICE_CLAIM_HIT_AFTER_SETTLE.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else if settled == 0 {
+                        NATIVE_SERVICE_CLAIM_MISS_FRESH.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        NATIVE_SERVICE_CLAIM_MISS_AFTER_SETTLE.fetch_add(1, Ordering::Relaxed);
+                    }
+                    first_claim = false;
+                }
+                claim.map(|claim| (route, claim))
+            },
+            |(route, claim)| {
+                let result = dispatch_claim(route, claim, None);
+                if result == CacheClaimStep::Cached { cached_in_turn += 1; }
+                result
+            });
+        METADATA_EXTRA_HITS_IN_TURN.fetch_add(
+            cached_in_turn.saturating_sub(1) as u64, Ordering::Relaxed);
+        return settled.saturating_add(driven);
+    }
+    let Some(route) = native_disk_relation::retained_native_storage_recheck_route() else {
+        return settled;
     };
-    settled + dispatch_claim(route, claim, wal_authority)
+    let Some(wal_authority) = retained_native_storage_wal_scsi_authority(route) else {
+        return settled;
+    };
+    let claim = crate::driver_launch::native_storage_relation_recheck_id()
+        .and_then(|id| crate::writable_fs::native_snapshot_io::claim_relation_header_recheck(id))
+        .or_else(|| crate::writable_fs::native_snapshot_io::claim_retained_relation_wal_io());
+    let Some(claim) = claim.map(WorkClaim::Snapshot) else { return settled; };
+    settled.saturating_add(dispatch_claim(route, claim, wal_authority).progress())
 }
 
 /// Under a parked Receive parent, drain an already-entered physical command through its exact
@@ -794,7 +818,7 @@ unsafe fn service_registry_exact(
     }
     let Some(route) = native_disk_relation::native_storage_route() else { return 0; };
     let Some(claim) = claim(id) else { return 0; };
-    dispatch_claim(route, WorkClaim::Snapshot(claim), None)
+    dispatch_claim(route, WorkClaim::Snapshot(claim), None).progress()
 }
 
 pub(super) unsafe fn service_registry_recheck(id: u64) -> usize {
@@ -813,15 +837,15 @@ unsafe fn dispatch_claim(
     route: native_disk_relation::NativeStorageRoute,
     claim: WorkClaim,
     wal_authority: Option<PendingScsiProofAuthority>,
-) -> usize {
+) -> CacheClaimStep {
     let claim_started_ticks = crate::disk_census_ticks();
     if claim.mount() != route.mount.value() {
         claim.refuse_unentered(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-        return 1;
+        return CacheClaimStep::Stop(1);
     }
     let Some(operation) = claim.operation() else {
         claim.refuse_unentered(nt_status::NtStatus(nt_fs::STATUS_DATA_ERROR as i32));
-        return 1;
+        return CacheClaimStep::Stop(1);
     };
     // A hit is an exact copied sector from an earlier authenticated terminal/ACK under this
     // physical mount and provider generation. The Executive-owned poison linearizes before any
@@ -836,7 +860,7 @@ unsafe fn dispatch_claim(
                     census.hits.fetch_add(1, Ordering::Relaxed);
                     METADATA_READ_THROUGH_HITS.fetch_add(1, Ordering::Relaxed);
                     claim.complete(Ok(&bytes));
-                    return 1;
+                    return CacheClaimStep::Cached;
                 }
             }
         }
@@ -845,7 +869,7 @@ unsafe fn dispatch_claim(
         route.mount, claim.source(), operation,
     ) else {
         claim.release_unentered();
-        return 0;
+        return CacheClaimStep::Stop(0);
     };
     let command = match operation {
         nt_fs::BlockOperation::Read { lba, sectors } => ScsiBlockCommand::read(lba, sectors),
@@ -856,20 +880,20 @@ unsafe fn dispatch_claim(
         crate::fs_loader::cancel_unentered_exec_native_block(ticket)
             .expect("unentered invalid native command ticket lost");
         claim.refuse_unentered(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-        return 1;
+        return CacheClaimStep::Stop(1);
     };
     let Some(capacity) = packet_capacity(&command) else {
         crate::fs_loader::cancel_unentered_exec_native_block(ticket)
             .expect("unentered native packet ticket lost");
         claim.release_unentered();
-        return 0;
+        return CacheClaimStep::Stop(0);
     };
     let mut output = Vec::new();
     if output.try_reserve_exact(capacity).is_err() {
         crate::fs_loader::cancel_unentered_exec_native_block(ticket)
             .expect("unentered native packet ticket lost");
         claim.release_unentered();
-        return 0;
+        return CacheClaimStep::Stop(0);
     }
     output.resize(capacity, 0);
     let Ok(parameters) = ScsiParameters::from_wire(
@@ -878,7 +902,7 @@ unsafe fn dispatch_claim(
         crate::fs_loader::cancel_unentered_exec_native_block(ticket)
             .expect("unentered native SCSI parameters ticket lost");
         claim.refuse_unentered(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-        return 1;
+        return CacheClaimStep::Stop(1);
     };
     let mut read_input = Vec::new();
     let input = if matches!(operation, nt_fs::BlockOperation::Write { .. }) {
@@ -886,13 +910,13 @@ unsafe fn dispatch_claim(
             crate::fs_loader::cancel_unentered_exec_native_block(ticket)
                 .expect("unentered native write ticket lost");
             claim.refuse_unentered(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-            return 1;
+            return CacheClaimStep::Stop(1);
         };
         if bytes.len() != command.data_len() as usize {
             crate::fs_loader::cancel_unentered_exec_native_block(ticket)
                 .expect("unentered native write length ticket lost");
             claim.refuse_unentered(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-            return 1;
+            return CacheClaimStep::Stop(1);
         }
         bytes
     } else {
@@ -900,7 +924,7 @@ unsafe fn dispatch_claim(
             crate::fs_loader::cancel_unentered_exec_native_block(ticket)
                 .expect("unentered native input ticket lost");
             claim.release_unentered();
-            return 0;
+            return CacheClaimStep::Stop(0);
         }
         read_input.resize(command.data_len() as usize, 0);
         read_input.as_slice()
@@ -925,7 +949,7 @@ unsafe fn dispatch_claim(
                 crate::fs_loader::cancel_unentered_exec_native_block(ticket)
                     .expect("unentered WAL authority ticket lost");
                 claim.release_unentered();
-                return 0;
+                return CacheClaimStep::Stop(0);
             }
         }
     } else { None };
@@ -951,7 +975,7 @@ unsafe fn dispatch_claim(
                 requestor_tid, terminal: None, started_ticks, dispatch_returned_ticks,
                 terminal_ticks },
                 Terminal { status, packet });
-            1
+            CacheClaimStep::Stop(1)
         }
         Ok(hosted_file_owners::DispatchResult::Outstanding { irp_id }) => {
             NATIVE_DISPATCH_CALL_PHASE.record(started_ticks, dispatch_returned_ticks);
@@ -974,7 +998,7 @@ unsafe fn dispatch_claim(
             // The nested dispatch pump may already have drained this command's IRQ/DPC.
             // Probe once now that its exact physical owner is installed; an unproven
             // terminal or uncertain ACK leaves the slot occupied for a later wakeup.
-            1 + poll_pending()
+            CacheClaimStep::Stop(1 + poll_pending())
         }
         Err(status) => {
             crate::fs_loader::cancel_unentered_exec_native_block(ticket)
@@ -982,10 +1006,10 @@ unsafe fn dispatch_claim(
             if status == nt_status::NtStatus::DEVICE_BUSY
                 || status == nt_status::NtStatus::INSUFFICIENT_RESOURCES {
                 claim.release_unentered();
-                0
+                CacheClaimStep::Stop(0)
             } else {
                 claim.refuse_unentered(status);
-                1
+                CacheClaimStep::Stop(1)
             }
         }
     }
