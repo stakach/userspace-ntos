@@ -73612,6 +73612,16 @@ unsafe fn dispatch_irp_for_instance_exact(
     let st = pr.status;
     // IoStatus.Information is at SH_REQ_INFO(0x78); the pump doesn't touch it.
     let info = read_volatile((sh + SH_REQ_INFO) as *const u64);
+    if major == major::IRP_MJ_DEVICE_CONTROL as u64
+        && fsctl == u64::from(hosted_partition_table::IOCTL_DISK_GET_DRIVE_GEOMETRY_EX)
+    {
+        hosted_partition_table::trace_geometry_terminal(
+            canonical_irp_id,
+            dispatch_request.as_ref().map_or(0, |request| request.device_id),
+            st,
+            info,
+        );
+    }
     // CREATE publishes the driver-mutated FsContext before any deferred hosted
     // work can reuse the transport. It is payload attached to canonical FileId,
     // never the cross-domain identity itself.

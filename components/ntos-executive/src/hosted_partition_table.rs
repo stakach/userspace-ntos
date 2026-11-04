@@ -5,10 +5,36 @@
 
 use super::*;
 
-const IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: u32 = 0x0007_00a0;
+pub(super) const IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: u32 = 0x0007_00a0;
 const DISK_GEOMETRY_EX_BYTES: u32 = 40;
 const DISK_CORRUPT_ERROR: i32 = 0xc000_0032u32 as i32;
 const IO_DEVICE_ERROR: i32 = 0xc000_0185u32 as i32;
+
+/// Observation only: the canonical hosted disk-class return, before its status is delivered
+/// to the calling PartMgr stack. No identity or status from this trace authorizes completion.
+pub(super) fn trace_geometry_terminal(irp: u64, device: u64, status: i32, information: u64) {
+    print_str(b"[disk-geometry-terminal] irp/device/status/information=");
+    print_hex64(irp);
+    print_str(b"/");
+    print_hex64(device);
+    print_str(b"/");
+    print_hex(status as u32);
+    print_str(b"/");
+    print_u64(information);
+    print_str(b"\n");
+}
+
+fn trace_partition_read(device: u64, stage: &[u8], status: i32, detail: u64) {
+    print_str(b"[partition-table-read] device/stage/status/detail=");
+    print_hex64(device);
+    print_str(b"/");
+    print_str(stage);
+    print_str(b"/");
+    print_hex(status as u32);
+    print_str(b"/");
+    print_u64(detail);
+    print_str(b"\n");
+}
 
 /// Keep the exact canonical device incarnation alive across geometry, all sector reads, and
 /// result publication. The root reference service validates domain, generation, and type.
@@ -203,42 +229,69 @@ impl Drop for PartitionIo {
 pub(super) extern "win64" fn read(device: u64, output: u64) -> i32 {
     unsafe {
         if output == 0 {
+            trace_partition_read(device, b"output", STATUS_INVALID_PARAMETER, 0);
             return STATUS_INVALID_PARAMETER;
         }
         write_unaligned(output as *mut u64, 0);
         if hosted_synchronous_fsd_request::device_contract(device).is_none() {
+            trace_partition_read(device, b"device-contract", STATUS_INVALID_PARAMETER, 0);
             return STATUS_INVALID_PARAMETER;
         }
         let _device_reference = match ReferencedDevice::acquire(device) {
             Ok(reference) => reference,
-            Err(status) => return status,
+            Err(status) => {
+                trace_partition_read(device, b"device-reference", status, 0);
+                return status;
+            }
         };
         let Some(mut geometry_io) = PartitionIo::new(DISK_GEOMETRY_EX_BYTES) else {
+            trace_partition_read(device, b"geometry-io-allocation", STATUS_INSUFFICIENT_RESOURCES, 0);
             return STATUS_INSUFFICIENT_RESOURCES;
         };
         let (sector_bytes, sectors) = match geometry_io.geometry(device) {
             Ok(geometry) => geometry,
-            Err(status) => return status,
+            Err(status) => {
+                trace_partition_read(device, b"geometry", status, 0);
+                return status;
+            }
         };
+        trace_partition_read(device, b"geometry-ready", STATUS_SUCCESS, sectors);
         drop(geometry_io);
         let Some(mut sector_io) = PartitionIo::new(sector_bytes) else {
+            trace_partition_read(device, b"sector-io-allocation", STATUS_INSUFFICIENT_RESOURCES,
+                u64::from(sector_bytes));
             return STATUS_INSUFFICIENT_RESOURCES;
         };
         let layout = match nt_fs::read_drive_layout_ex(sector_bytes, sectors, |lba, out| {
             sector_io.read_sector(device, lba, out)
         }) {
             Ok(layout) => layout,
-            Err(nt_fs::DriveLayoutReadError::Io(status)) => return status,
-            Err(nt_fs::DriveLayoutReadError::OutOfMemory) => return STATUS_INSUFFICIENT_RESOURCES,
-            Err(nt_fs::DriveLayoutReadError::InvalidGeometry) => return STATUS_DEVICE_NOT_READY,
-            Err(nt_fs::DriveLayoutReadError::InvalidPartitionTable) => return DISK_CORRUPT_ERROR,
+            Err(nt_fs::DriveLayoutReadError::Io(status)) => {
+                trace_partition_read(device, b"layout", status, 0);
+                return status;
+            }
+            Err(nt_fs::DriveLayoutReadError::OutOfMemory) => {
+                trace_partition_read(device, b"layout", STATUS_INSUFFICIENT_RESOURCES, 0);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            Err(nt_fs::DriveLayoutReadError::InvalidGeometry) => {
+                trace_partition_read(device, b"layout", STATUS_DEVICE_NOT_READY, 0);
+                return STATUS_DEVICE_NOT_READY;
+            }
+            Err(nt_fs::DriveLayoutReadError::InvalidPartitionTable) => {
+                trace_partition_read(device, b"layout", DISK_CORRUPT_ERROR, 0);
+                return DISK_CORRUPT_ERROR;
+            }
         };
         let result = pool_alloc(layout.len() as u64);
         if result == 0 {
+            trace_partition_read(device, b"layout-allocation", STATUS_INSUFFICIENT_RESOURCES,
+                layout.len() as u64);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
         core::ptr::copy_nonoverlapping(layout.as_ptr(), result as *mut u8, layout.len());
         write_unaligned(output as *mut u64, result);
+        trace_partition_read(device, b"published", STATUS_SUCCESS, layout.len() as u64);
         STATUS_SUCCESS
     }
 }
