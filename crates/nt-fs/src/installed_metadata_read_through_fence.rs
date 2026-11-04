@@ -98,6 +98,19 @@ impl PossibleScsiEffect {
                     && cdb[5..].iter().all(|byte| *byte == 0)
                 { Self::ProvenReadOnly } else { Self::PossiblyMutating }
             }
+            0x1a if cdb_len == 6 => {
+                // MODE SENSE(6) returns mode-page data without changing media. The page
+                // and subpage select reported data; the receive buffer must cover the
+                // CDB allocation. Admit only DATA_IN and observed port policy bits.
+                const MODE_SENSE_FLAGS: u32 = DATA_IN | 0x08 | 0x100 | 0x20_0000;
+                if flags & DATA_IN != 0
+                    && flags & !MODE_SENSE_FLAGS == 0
+                    && cdb[1] & !0x08 == 0 // DBD; no reserved or LUN bits
+                    && cdb[4] != 0
+                    && data_len >= u32::from(cdb[4])
+                    && cdb[5..].iter().all(|byte| *byte == 0)
+                { Self::ProvenReadOnly } else { Self::PossiblyMutating }
+            }
             0x28 | 0x2a if cdb_len == 10 => {
                 let lba = u32::from_be_bytes(cdb[2..6].try_into().unwrap()) as u64;
                 let sectors = u16::from_be_bytes(cdb[7..9].try_into().unwrap()) as u32;

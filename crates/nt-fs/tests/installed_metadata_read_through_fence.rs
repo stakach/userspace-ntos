@@ -272,6 +272,47 @@ fn source_backed_scsi_inquiry_shapes_do_not_mutate_installed_media() {
 }
 
 #[test]
+fn mode_sense_six_data_in_keeps_installed_metadata_read_through_eligible() {
+    // The released disk class sent MODE SENSE(6) for the fault-reporting page:
+    // CDB 1A 00 1C 00 C0 00, DATA_IN plus observed port policy, 192-byte buffer.
+    let mut sense = srb(6, 0x1a, 0x20_0148, 192);
+    sense[0x4a] = 0x1c;
+    sense[0x4c] = 192;
+    let effect = PossibleScsiEffect::from_legacy_srb(&sense);
+    assert_eq!(effect, PossibleScsiEffect::ProvenReadOnly);
+    let disk = Disk { controller: 3, physical_pdo: 9 };
+    let route = Route { mount: 7, relation_generation: 11 };
+    let fence = fixture();
+    fence.before_effect(&disk, effect);
+    assert!(fence.eligible(&disk, &route));
+    assert!(!fence.poisoned());
+
+    // Page choice is data selection rather than a media write, and a larger
+    // receive buffer is safe when it covers the CDB's allocation length.
+    let mut another_page = sense;
+    another_page[0x4a] = 0x3f;
+    another_page[0x10..0x14].copy_from_slice(&256u32.to_le_bytes());
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&another_page),
+        PossibleScsiEffect::ProvenReadOnly);
+
+    for changed in [
+        { let mut x = sense; x[0x0a] = 10; x },
+        { let mut x = sense; x[0x0c..0x10].copy_from_slice(&0x20_0108u32.to_le_bytes()); x },
+        { let mut x = sense; x[0x0c..0x10].copy_from_slice(&0x20_01c8u32.to_le_bytes()); x },
+        { let mut x = sense; x[0x0c..0x10].copy_from_slice(&0x20_0548u32.to_le_bytes()); x },
+        { let mut x = sense; x[0x10..0x14].fill(0); x },
+        { let mut x = sense; x[0x10..0x14].copy_from_slice(&191u32.to_le_bytes()); x },
+        { let mut x = sense; x[0x4c] = 0; x },
+        { let mut x = sense; x[0x49] = 1; x },
+        { let mut x = sense; x[0x4d] = 1; x },
+        { let mut x = sense; x[0x4e] = 1; x },
+    ] {
+        assert_eq!(PossibleScsiEffect::from_legacy_srb(&changed),
+            PossibleScsiEffect::PossiblyMutating, "unexpected MODE SENSE shape: {changed:?}");
+    }
+}
+
+#[test]
 fn exact_class_device_claim_does_not_mutate_media_or_transfer_write_authority() {
     // The pinned LiberNT ClassClaimDevice zero-initializes the SRB and sets only Length and
     // SRB_FUNCTION_CLAIM_DEVICE before filling the pointer fields stripped by the wire owner.
