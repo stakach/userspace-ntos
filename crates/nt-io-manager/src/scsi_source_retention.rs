@@ -26,6 +26,7 @@ pub struct ScsiSourceChildren {
     pub sense_length: u8,
     pub mdl: Option<SourceMdlAllocationIdentity>,
     pub data: Option<SourceMemoryIdentity>,
+    pub data_stack: Option<ConnectStackRange>,
     pub transfer_length: u32,
 }
 
@@ -370,7 +371,7 @@ fn valid(children: ScsiSourceChildren) -> bool {
         _ => false,
     };
     let data_valid = match (children.transfer_length, children.data, children.mdl) {
-        (0, None, None) => true,
+        (0, None, None) => children.data_stack.is_none(),
         (
             length,
             Some(SourceMemoryIdentity::Pool {
@@ -380,7 +381,8 @@ fn valid(children: ScsiSourceChildren) -> bool {
             }),
             Some(mdl),
         ) => {
-            length != 0
+            children.data_stack.is_none()
+                && length != 0
                 && bytes == u64::from(length)
                 && allocation.component_address != 0
                 && allocation.capacity != 0
@@ -397,13 +399,50 @@ fn valid(children: ScsiSourceChildren) -> bool {
                 && mdl.pool.pool_generation != 0
                 && mdl.registry_generation != 0
         }
-        // A native mapped range is not currently guarded by the source pool/MDL free paths.
-        // Its address mapping could disappear while the provider is Pending. Admit it only
-        // after an exact mapping lease and unmap fence are integrated.
-        (_, Some(SourceMemoryIdentity::MappedRange { .. }), _) => false,
+        (
+            length,
+            Some(SourceMemoryIdentity::MappedRange {
+                component_address,
+                bytes,
+                exec_address,
+            }),
+            Some(mdl),
+        ) => children.data_stack.is_some_and(|range| {
+            length != 0
+                && bytes == u64::from(length)
+                && exec_address != 0
+                && mdl.pool.component_address != 0
+                && mdl.pool.capacity >= 0x30
+                && mdl.pool.pool_generation != 0
+                && mdl.registry_generation != 0
+                && range.domain == source.domain
+                && range.thread != 0
+                && range.generation != 0
+                && range.base != 0
+                && range.base.checked_add(range.bytes).is_some_and(|end| {
+                    component_address >= range.base
+                        && component_address.checked_add(bytes).is_some_and(|last| last <= end)
+                })
+        }),
         _ => false,
     };
-    source_valid && route_valid && srb_valid && sense_valid && data_valid
+    let stack_children_disjoint = match (srb, children.data, children.data_stack) {
+        (
+            ScsiSrbSource::Stack { range: srb_range, component_address: srb_address },
+            Some(SourceMemoryIdentity::MappedRange { component_address: data_address, bytes, .. }),
+            Some(data_range),
+        ) if srb_range.domain == data_range.domain
+            && srb_range.thread == data_range.thread
+            && srb_range.generation == data_range.generation => {
+                srb_address.checked_add(0x58).is_some_and(|srb_end| {
+                    data_address.checked_add(bytes).is_some_and(|data_end| {
+                        srb_end <= data_address || data_end <= srb_address
+                    })
+                })
+            }
+        _ => true,
+    };
+    source_valid && route_valid && srb_valid && sense_valid && data_valid && stack_children_disjoint
 }
 
 #[cfg(test)]
@@ -461,6 +500,7 @@ mod tests {
                 component_address: 0x4100,
                 bytes: 0x200,
             }),
+            data_stack: None,
             transfer_length: 0x200,
         }
     }
@@ -680,6 +720,72 @@ mod tests {
             ledger.retain(children),
             Err(ScsiSourceRetentionError::Invalid)
         );
+    }
+
+    #[test]
+    fn stack_data_requires_exact_generation_bound_range_and_transfer_extent() {
+        let mut children = fixture();
+        let range = ConnectStackRange {
+            domain: children.source.domain,
+            thread: 7,
+            base: 0x9000,
+            bytes: 0x1000,
+            generation: 11,
+        };
+        children.data = Some(SourceMemoryIdentity::MappedRange {
+            component_address: 0x9100,
+            bytes: 0x200,
+            exec_address: 0x19100,
+        });
+        // An address translation alone is not authority to retain a caller stack.
+        assert_eq!(
+            ScsiSourceRetentionLedger::new().retain(children),
+            Err(ScsiSourceRetentionError::Invalid)
+        );
+
+        children.data_stack = Some(range);
+        ScsiSourceRetentionLedger::new().retain(children)
+            .expect("the exact pinned stack range admits the transfer");
+
+        let mut wrong_generation = children;
+        wrong_generation.data_stack.as_mut().unwrap().generation = 0;
+        assert_eq!(
+            ScsiSourceRetentionLedger::new().retain(wrong_generation),
+            Err(ScsiSourceRetentionError::Invalid)
+        );
+        let mut escaped = children;
+        escaped.data = Some(SourceMemoryIdentity::MappedRange {
+            component_address: 0x9f00,
+            bytes: 0x200,
+            exec_address: 0x19f00,
+        });
+        assert_eq!(
+            ScsiSourceRetentionLedger::new().retain(escaped),
+            Err(ScsiSourceRetentionError::Invalid)
+        );
+        let mut wrong_extent = children;
+        wrong_extent.transfer_length = 0x201;
+        assert_eq!(
+            ScsiSourceRetentionLedger::new().retain(wrong_extent),
+            Err(ScsiSourceRetentionError::Invalid)
+        );
+
+        let mut overlapping_srb = children;
+        overlapping_srb.srb = ScsiSrbSource::Stack {
+            range,
+            component_address: 0x92f8,
+        };
+        assert_eq!(
+            ScsiSourceRetentionLedger::new().retain(overlapping_srb),
+            Err(ScsiSourceRetentionError::Invalid)
+        );
+        let mut touching_srb = children;
+        touching_srb.srb = ScsiSrbSource::Stack {
+            range,
+            component_address: 0x9300,
+        };
+        ScsiSourceRetentionLedger::new().retain(touching_srb)
+            .expect("adjacent stack snapshots do not interfere with copyback");
     }
 
     #[test]

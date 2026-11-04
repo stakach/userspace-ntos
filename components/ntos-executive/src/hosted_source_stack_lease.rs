@@ -39,6 +39,8 @@ struct StackLease {
     reply: u64,
     range: ConnectStackRange,
     snapshot: [u8; 0x58],
+    data_snapshot: Option<Vec<u8>>,
+    component_address: u64,
     exec_va: u64,
     pinned: bool,
     indeterminate: bool,
@@ -48,15 +50,16 @@ struct StackLease {
 enum StackLeaseSource {
     Connect(ConnectForwardIdentity),
     Scsi(SourceIrpForwardIdentity),
+    ScsiData(SourceIrpForwardIdentity),
 }
 
 static mut LEASES: Vec<StackLease> = Vec::new();
 
-fn checked_stack_range(base: u64, bytes: u64, pointer: u64, length: u64) -> Option<u64> {
+fn checked_stack_range(base: u64, bytes: u64, pointer: u64, length: u64, alignment: u64) -> Option<u64> {
     (base != 0
         && bytes >= length
         && pointer != 0
-        && pointer & 7 == 0
+        && pointer & (alignment - 1) == 0
         && base.checked_add(bytes).is_some_and(|end| {
             pointer >= base && pointer.checked_add(length).is_some_and(|last| last <= end)
         }))
@@ -72,7 +75,11 @@ unsafe fn resolve_stack(
     reply: u64,
     pointer: u64,
     length: u64,
+    alignment: u64,
 ) -> Option<(StackOwner, ConnectStackRange, u64)> {
+    if alignment == 0 || !alignment.is_power_of_two() || pointer & (alignment - 1) != 0 {
+        return None;
+    }
     let (owner, range, exec_va) = match physical.kind {
         PhysicalSourceKind::Primary => {
             let thread = (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_TABLES))
@@ -89,7 +96,7 @@ unsafe fn resolve_stack(
             {
                 return None;
             }
-            let offset = checked_stack_range(FSD_STACK_VADDR, FSD_STACK_BYTES, pointer, length)?;
+            let offset = checked_stack_range(FSD_STACK_VADDR, FSD_STACK_BYTES, pointer, length, alignment)?;
             let exec_va = inst.exec_stack_va.checked_add(offset)?;
             (
                 StackOwner::Primary {
@@ -135,7 +142,7 @@ unsafe fn resolve_stack(
             }
             let component_base = hosted_worker_component_base_for_slot(worker.component_slot)?;
             let bytes = FSD_WORKER_STACK_FRAMES.checked_mul(0x1000)?;
-            let offset = checked_stack_range(component_base, bytes, pointer, length)?;
+            let offset = checked_stack_range(component_base, bytes, pointer, length, alignment)?;
             let exec_va =
                 hosted_worker_exec_base_for_alias(worker.exec_alias_slot)?.checked_add(offset)?;
             let generation = (worker.construction as u64).checked_add(1)?;
@@ -190,7 +197,7 @@ pub(crate) unsafe fn capture(
         return None;
     }
 
-    let (owner, range, exec_va) = resolve_stack(instance, inst, physical, domain, route, reply, pointer, 16)?;
+    let (owner, range, exec_va) = resolve_stack(instance, inst, physical, domain, route, reply, pointer, 16, 8)?;
     let _durable = crate::allocator::enter_durable();
     let leases = &mut *core::ptr::addr_of_mut!(LEASES);
     leases.try_reserve(1).ok()?;
@@ -204,6 +211,8 @@ pub(crate) unsafe fn capture(
         reply,
         range,
         snapshot: [0; 0x58],
+        data_snapshot: None,
+        component_address: pointer,
         exec_va,
         pinned: true,
         indeterminate: false,
@@ -248,7 +257,7 @@ pub(crate) unsafe fn capture_scsi(
         || inst.pml4 != physical.pml4
     { return None; }
     let (owner, range, exec_va) = resolve_stack(
-        instance, inst, physical, domain, route, reply, pointer, 0x58,
+        instance, inst, physical, domain, route, reply, pointer, 0x58, 8,
     )?;
     let _durable = crate::allocator::enter_durable();
     let leases = &mut *core::ptr::addr_of_mut!(LEASES);
@@ -262,6 +271,8 @@ pub(crate) unsafe fn capture_scsi(
         reply,
         range,
         snapshot: [0; 0x58],
+        data_snapshot: None,
+        component_address: pointer,
         exec_va,
         pinned: true,
         indeterminate: false,
@@ -281,25 +292,104 @@ pub(crate) unsafe fn capture_scsi(
     Some((id, range, bytes))
 }
 
-pub(crate) unsafe fn scsi_matches(
+/// Pin and snapshot a caller-stack transfer buffer independently of its SRB. The
+/// physical stack and Reply stay owned until both source completion and provider ACK.
+pub(crate) unsafe fn capture_scsi_data(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply: u64,
+    source_identity: SourceIrpForwardIdentity,
+    pointer: u64,
+    length: u32,
+) -> Option<(SourceStackLeaseId, ConnectStackRange, u64, Vec<u8>)> {
+    if length == 0 { return None; }
+    let route = runtime::channel_route(channel).ok()??;
+    let physical = runtime::physical_source(route).ok()?;
+    let dispatch = runtime::dispatch(route).ok()?;
+    if reply == 0
+        || runtime::current_reply(route).ok()? != reply
+        || physical.tcb != channel.tcb
+        || physical.pml4 != channel.pml4
+        || !hosted_ingress_sources::verify(physical)
+    { return None; }
+    let PhysicalDomain::Hosted(domain) = physical.domain else { return None; };
+    let (instance, inst) = instance_for_pump_channel(channel, reply)?;
+    if instance_domain_identity(inst) != Some(domain)
+        || source_identity.allocation().domain != domain
+        || inst.pml4 != physical.pml4
+    { return None; }
+    let (owner, range, exec_va) = resolve_stack(
+        instance, inst, physical, domain, route, reply, pointer, u64::from(length), 1,
+    )?;
+    let _durable = crate::allocator::enter_durable();
+    let mut snapshot = Vec::new();
+    snapshot.try_reserve_exact(length as usize).ok()?;
+    snapshot.resize(length as usize, 0);
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(length as usize).ok()?;
+    bytes.resize(length as usize, 0);
+    let id = {
+        let leases = &mut *core::ptr::addr_of_mut!(LEASES);
+        leases.try_reserve(1).ok()?;
+        let id = SourceStackLeaseId(leases.len());
+        leases.push(StackLease {
+            owner,
+            source: StackLeaseSource::ScsiData(source_identity),
+            route,
+            dispatch,
+            reply,
+            range,
+            snapshot: [0; 0x58],
+            data_snapshot: Some(snapshot),
+            component_address: pointer,
+            exec_va,
+            pinned: true,
+            indeterminate: false,
+        });
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = core::ptr::read_volatile((exec_va + index as u64) as *const u8);
+        }
+        leases[id.0].data_snapshot.as_mut()
+            .expect("published stack data snapshot").copy_from_slice(&bytes);
+        id
+    };
+    if runtime::dispatch(route).ok() != Some(dispatch)
+        || runtime::current_reply(route).ok() != Some(reply)
+        || runtime::physical_source(route).ok() != Some(physical)
+    {
+        (&mut *core::ptr::addr_of_mut!(LEASES))[id.0].indeterminate = true;
+        return None;
+    }
+    Some((id, range, exec_va, bytes))
+}
+
+unsafe fn scsi_lease_matches(
     id: SourceStackLeaseId,
     source: SourceIrpForwardIdentity,
     range: ConnectStackRange,
     pointer: u64,
+    length: u64,
+    alignment: u64,
+    data: bool,
 ) -> bool {
-    let Some(row) = (&*core::ptr::addr_of!(LEASES)).get(id.0) else { return false; };
-    row.pinned && !row.indeterminate
-        && row.source == StackLeaseSource::Scsi(source)
-        && row.range == range
-        && checked_stack_range(range.base, range.bytes, pointer, 0x58).is_some()
+    let (pinned, indeterminate, held_source, held_range, component_address,
+        route, dispatch, reply, owner) = {
+        let Some(row) = (&*core::ptr::addr_of!(LEASES)).get(id.0) else { return false; };
+        (row.pinned, row.indeterminate, row.source, row.range, row.component_address,
+            row.route, row.dispatch, row.reply, row.owner)
+    };
+    pinned && !indeterminate
+        && held_source == if data { StackLeaseSource::ScsiData(source) } else { StackLeaseSource::Scsi(source) }
+        && held_range == range
+        && component_address == pointer
+        && checked_stack_range(range.base, range.bytes, pointer, length, alignment).is_some()
         && scsi_stack_reply_admits(
             ScsiStackAccess::RetainedThroughAck,
-            runtime::dispatch(row.route).ok() == Some(row.dispatch)
-                && runtime::current_reply(row.route).ok() == Some(row.reply),
+            runtime::dispatch(route).ok() == Some(dispatch)
+                && runtime::current_reply(route).ok() == Some(reply),
         )
-        && runtime::physical_source(row.route).ok().is_some_and(|physical| {
+        && runtime::physical_source(route).ok().is_some_and(|physical| {
             physical.domain == PhysicalDomain::Hosted(range.domain)
-                && match row.owner {
+                && match owner {
                     StackOwner::Primary { instance: instance_index, domain, tcb, pml4 } =>
                         physical.tcb == tcb && physical.pml4 == pml4
                             && instance(instance_index).is_some_and(|inst| {
@@ -315,13 +405,102 @@ pub(crate) unsafe fn scsi_matches(
                             .as_ref().is_some_and(|rows| rows.iter().copied().any(|worker| {
                                 worker.construction == construction
                                     && worker.handle == range.thread
-                                    && worker.ingress_route == Some(row.route)
+                                    && worker.ingress_route == Some(route)
                                     && worker.tcb == physical.tcb
                                     && worker.pml4 == physical.pml4
                                     && hosted_thread_resources::stack_live(worker)
                             })),
                 }
         })
+}
+
+pub(crate) unsafe fn scsi_matches(
+    id: SourceStackLeaseId,
+    source: SourceIrpForwardIdentity,
+    range: ConnectStackRange,
+    pointer: u64,
+) -> bool {
+    scsi_lease_matches(id, source, range, pointer, 0x58, 8, false)
+}
+
+pub(crate) unsafe fn scsi_data_matches(
+    id: SourceStackLeaseId,
+    source: SourceIrpForwardIdentity,
+    range: ConnectStackRange,
+    pointer: u64,
+    length: u32,
+    exec_va: u64,
+) -> bool {
+    let (held_exec_va, held_length) = {
+        let Some(row) = (&*core::ptr::addr_of!(LEASES)).get(id.0) else { return false; };
+        (row.exec_va, row.data_snapshot.as_ref().map(Vec::len))
+    };
+    held_exec_va == exec_va
+        && held_length == Some(length as usize)
+        && scsi_lease_matches(id, source, range, pointer, u64::from(length), 1, true)
+}
+
+pub(crate) unsafe fn scsi_data_can_write(
+    id: SourceStackLeaseId,
+    source: SourceIrpForwardIdentity,
+    range: ConnectStackRange,
+    pointer: u64,
+    length: u32,
+    exec_va: u64,
+) -> bool {
+    if !scsi_data_matches(id, source, range, pointer, length, exec_va) { return false; }
+    let (route, dispatch, reply) = {
+        let row = &(&*core::ptr::addr_of!(LEASES))[id.0];
+        (row.route, row.dispatch, row.reply)
+    };
+    let original_reply_current = runtime::dispatch(route).ok() == Some(dispatch)
+        && runtime::current_reply(route).ok() == Some(reply);
+    if !scsi_stack_reply_admits(ScsiStackAccess::SourceCopyback, original_reply_current) {
+        return false;
+    }
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LEASES))[id.0];
+    if !row.pinned || row.indeterminate || row.source != StackLeaseSource::ScsiData(source)
+        || row.route != route || row.dispatch != dispatch || row.reply != reply
+        || row.range != range || row.component_address != pointer || row.exec_va != exec_va
+    { return false; }
+    let unchanged = row.data_snapshot.as_ref().is_some_and(|snapshot| {
+        snapshot.iter().enumerate().all(|(index, original)| {
+            core::ptr::read_volatile((row.exec_va + index as u64) as *const u8) == *original
+        })
+    });
+    if !unchanged { row.indeterminate = true; }
+    unchanged
+}
+
+pub(crate) unsafe fn write_scsi_data(
+    id: SourceStackLeaseId,
+    source: SourceIrpForwardIdentity,
+    range: ConnectStackRange,
+    pointer: u64,
+    exec_va: u64,
+    completed: &[u8],
+) -> bool {
+    let Ok(length) = u32::try_from(completed.len()) else { return false; };
+    if !scsi_data_can_write(id, source, range, pointer, length, exec_va) { return false; }
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LEASES))[id.0];
+    for (index, byte) in completed.iter().enumerate() {
+        core::ptr::write_volatile((row.exec_va + index as u64) as *mut u8, *byte);
+    }
+    if let Some(snapshot) = row.data_snapshot.as_mut() { snapshot.copy_from_slice(completed); }
+    true
+}
+
+pub(crate) unsafe fn release_scsi_data(
+    id: SourceStackLeaseId,
+    source: SourceIrpForwardIdentity,
+) -> bool {
+    let Some(row) = (&mut *core::ptr::addr_of_mut!(LEASES)).get_mut(id.0) else { return false; };
+    if !row.pinned || row.indeterminate || row.source != StackLeaseSource::ScsiData(source) {
+        return false;
+    }
+    row.pinned = false;
+    row.data_snapshot = None;
+    true
 }
 
 pub(crate) unsafe fn write_scsi(

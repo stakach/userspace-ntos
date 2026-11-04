@@ -107,7 +107,7 @@ pub(super) fn capture_scsi_children(
     route: ScsiSrbRoute,
     channel: &crate::spawn_hosts::PumpChannel,
     reply: u64,
-) -> Option<(ScsiSourceChildren, Vec<u8>, Option<Vec<u8>>, Vec<u8>, Option<Vec<u8>>, Option<hosted_source_stack_lease::SourceStackLeaseId>)> {
+) -> Option<(ScsiSourceChildren, Vec<u8>, Option<Vec<u8>>, Vec<u8>, Option<Vec<u8>>, Option<hosted_source_stack_lease::SourceStackLeaseId>, Option<hosted_source_stack_lease::SourceStackLeaseId>)> {
     let _guard = lock();
     let inst = instance(instance_index)?;
     if source.domain != ticket.domain
@@ -152,6 +152,7 @@ pub(super) fn capture_scsi_children(
             range, component_address: srb_address,
         }, bytes, Some(lease))
     };
+    let mut data_stack_lease = None;
     let result = (|| {
     let srb_slice = &srb_bytes[..];
     if u16::from_le_bytes(srb_slice[..2].try_into().ok()?) as usize != WDM_X64_LEGACY_SRB_SIZE {
@@ -179,9 +180,9 @@ pub(super) fn capture_scsi_children(
     };
     let transfer_length = u32::from_le_bytes(srb_slice[0x10..0x14].try_into().ok()?);
     let data_address = u64::from_le_bytes(srb_slice[0x18..0x20].try_into().ok()?);
-    let (mdl_identity, mdl_bytes, data_identity, data_bytes) = if transfer_length == 0 {
+    let (mdl_identity, mdl_bytes, data_identity, data_stack, data_bytes) = if transfer_length == 0 {
         if irp.mdl_address.0 != 0 { return None; }
-        (None, None, None, Vec::new())
+        (None, None, None, None, Vec::new())
     } else {
         let mdl_address = irp.mdl_address.0;
         if mdl_address == 0 || data_address == 0 { return None; }
@@ -198,23 +199,37 @@ pub(super) fn capture_scsi_children(
                 ..nt_mdl::MDL_OFF_BYTE_COUNT as usize + 4].try_into().ok()?,
         );
         if mdl_count < transfer_length { return None; }
-        let data_allocation = unsafe { pool_range_identity_unlocked(
-            inst, data_address, u64::from(transfer_length),
-        )? };
-        let data_exec = inst.exec_pool_va.checked_add(data_address.checked_sub(FSD_POOL_VADDR)?)?;
-        let data_slice = unsafe { core::slice::from_raw_parts(data_exec as *const u8,
-            transfer_length as usize) };
-        let mut data = Vec::new();
-        data.try_reserve_exact(transfer_length as usize).ok()?;
-        data.extend_from_slice(data_slice);
+        let (data_identity, data_stack, data) = if let Some(data_allocation) = unsafe {
+            pool_range_identity_unlocked(inst, data_address, u64::from(transfer_length))
+        } {
+            let data_exec = inst.exec_pool_va.checked_add(data_address.checked_sub(FSD_POOL_VADDR)?)?;
+            let data_slice = unsafe { core::slice::from_raw_parts(data_exec as *const u8,
+                transfer_length as usize) };
+            let mut data = Vec::new();
+            data.try_reserve_exact(transfer_length as usize).ok()?;
+            data.extend_from_slice(data_slice);
+            (SourceMemoryIdentity::Pool {
+                allocation: data_allocation,
+                component_address: data_address,
+                bytes: u64::from(transfer_length),
+            }, None, data)
+        } else {
+            let (lease, range, exec_address, data) = unsafe {
+                hosted_source_stack_lease::capture_scsi_data(
+                    channel, reply, source_identity, data_address, transfer_length,
+                )?
+            };
+            data_stack_lease = Some(lease);
+            (SourceMemoryIdentity::MappedRange {
+                component_address: data_address,
+                bytes: u64::from(transfer_length),
+                exec_address,
+            }, Some(range), data)
+        };
         let mut mdl = Vec::new();
         mdl.try_reserve_exact(nt_mdl::MDL_SIZE).ok()?;
         mdl.extend_from_slice(mdl_slice);
-        (Some(mdl_identity), Some(mdl), Some(SourceMemoryIdentity::Pool {
-            allocation: data_allocation,
-            component_address: data_address,
-            bytes: u64::from(transfer_length),
-        }), data)
+        (Some(mdl_identity), Some(mdl), Some(data_identity), data_stack, data)
     };
     let mut srb = Vec::new();
     srb.try_reserve_exact(WDM_X64_LEGACY_SRB_SIZE).ok()?;
@@ -222,12 +237,15 @@ pub(super) fn capture_scsi_children(
     let children = ScsiSourceChildren {
         source, ticket, route, srb: srb_identity, sense: sense_identity,
         sense_length, mdl: mdl_identity,
-        data: data_identity, transfer_length,
+        data: data_identity, data_stack, transfer_length,
     };
     scsi_children().retain(children).ok()?;
-    Some((children, srb, mdl_bytes, data_bytes, sense_bytes, stack_lease))
+    Some((children, srb, mdl_bytes, data_bytes, sense_bytes, stack_lease, data_stack_lease))
     })();
     if result.is_none() {
+        if let Some(lease) = data_stack_lease {
+            let _ = unsafe { hosted_source_stack_lease::release_scsi_data(lease, source_identity) };
+        }
         if let Some(lease) = stack_lease {
             // No provider was entered. An exact release is safe; a lease that became
             // indeterminate stays pinned so its physical stack cannot be recycled.
@@ -237,9 +255,31 @@ pub(super) fn capture_scsi_children(
     result
 }
 
+fn scsi_data_stack_matches(
+    children: ScsiSourceChildren,
+    data_stack_lease: Option<hosted_source_stack_lease::SourceStackLeaseId>,
+) -> bool {
+    match (children.data, children.data_stack, data_stack_lease) {
+        (Some(SourceMemoryIdentity::MappedRange {
+            component_address, bytes, exec_address,
+        }), Some(range), Some(lease)) => {
+            u32::try_from(bytes).ok() == Some(children.transfer_length)
+                && unsafe { hosted_source_stack_lease::scsi_data_matches(
+                    lease,
+                    SourceIrpForwardIdentity::new(children.ticket, children.source)
+                        .expect("retained SCSI source identity"),
+                    range, component_address, children.transfer_length, exec_address,
+                ) }
+        }
+        (Some(SourceMemoryIdentity::Pool { .. }), None, None) | (None, None, None) => true,
+        _ => false,
+    }
+}
+
 pub(super) fn scsi_children_match_current(
     instance_index: usize, children: ScsiSourceChildren,
     stack_lease: Option<hosted_source_stack_lease::SourceStackLeaseId>,
+    data_stack_lease: Option<hosted_source_stack_lease::SourceStackLeaseId>,
 ) -> bool {
     let _guard = lock();
     if !scsi_children().contains_exact(children)
@@ -276,8 +316,12 @@ pub(super) fn scsi_children_match_current(
         && children.mdl.is_none_or(|mdl| unsafe {
             mdl_identity_matches_unlocked(inst, children.source.domain, mdl)
         })
-        && children.data.is_none_or(|data| unsafe {
-            memory_identity_matches_unlocked(instance_index, inst, data)
+        && scsi_data_stack_matches(children, data_stack_lease)
+        && children.data.is_none_or(|data| match data {
+            SourceMemoryIdentity::Pool { .. } => unsafe {
+                memory_identity_matches_unlocked(instance_index, inst, data)
+            },
+            SourceMemoryIdentity::MappedRange { .. } => true,
         })
 }
 
@@ -298,6 +342,7 @@ fn scsi_after_callback_phase(
 pub(super) fn scsi_children_match_after_callback(
     instance_index: usize, children: ScsiSourceChildren,
     stack_lease: Option<hosted_source_stack_lease::SourceStackLeaseId>,
+    data_stack_lease: Option<hosted_source_stack_lease::SourceStackLeaseId>,
 ) -> bool {
     let _guard = lock();
     if !scsi_children().contains_exact(children)
@@ -316,6 +361,7 @@ pub(super) fn scsi_children_match_after_callback(
         children.source.component_address, children.source.bytes, children.source.stack_count) };
     if let Some(source) = observed.as_mut() { source.owner = children.source.owner; }
     observed == Some(children.source)
+        && scsi_data_stack_matches(children, data_stack_lease)
         && match children.srb {
             nt_io_manager::scsi_source_retention::ScsiSrbSource::Pool(_) => true,
             nt_io_manager::scsi_source_retention::ScsiSrbSource::Stack { range, component_address } =>

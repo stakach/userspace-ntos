@@ -32,6 +32,7 @@ pub(super) struct CapturedSourceScsi {
     authority: AcceptedPdoProviderAuthority,
     children: ScsiSourceChildren,
     stack_lease: Option<hosted_source_stack_lease::SourceStackLeaseId>,
+    data_stack_lease: Option<hosted_source_stack_lease::SourceStackLeaseId>,
     srb: Vec<u8>,
     mdl: Option<Vec<u8>>,
     data: Vec<u8>,
@@ -123,11 +124,28 @@ impl CapturedSourceScsi {
             Some(nt_io_manager::source_irp_auxiliary::SourceMemoryIdentity::Pool {
                 component_address, ..
             }) => Some(component_address),
+            Some(nt_io_manager::source_irp_auxiliary::SourceMemoryIdentity::MappedRange { .. }) => None,
             None if data.is_empty() => None,
             _ => return Err(CaptureError::InvalidSource),
         };
+        let stack_data_ready = match (self.children.data, self.children.data_stack) {
+            (Some(nt_io_manager::source_irp_auxiliary::SourceMemoryIdentity::MappedRange {
+                component_address, bytes, exec_address,
+            }), Some(range)) => {
+                bytes == data.len() as u64 && self.data_stack_lease.is_some_and(|lease| {
+                    hosted_source_stack_lease::scsi_data_can_write(
+                        lease, self.source_identity(), range, component_address,
+                        self.children.transfer_length, exec_address,
+                    )
+                })
+            }
+            (Some(nt_io_manager::source_irp_auxiliary::SourceMemoryIdentity::Pool { .. }), None)
+            | (None, None) => true,
+            _ => false,
+        };
         // Validate all destinations before the first write while holding the pool lock.
-        if data_address.is_some_and(|address| !memory.contains(address, data.len()))
+        if !stack_data_ready
+            || data_address.is_some_and(|address| !memory.contains(address, data.len()))
             || self.children.sense.is_some_and(|child| !memory.contains(
                 child.component_address, sense.len(),
             ))
@@ -144,6 +162,12 @@ impl CapturedSourceScsi {
         }
         if let Some(address) = data_address {
             if !memory.write(address, data) { return Err(CaptureError::InvalidSource); }
+        } else if let (Some(nt_io_manager::source_irp_auxiliary::SourceMemoryIdentity::MappedRange {
+            component_address, exec_address, ..
+        }), Some(range), Some(lease)) = (self.children.data, self.children.data_stack, self.data_stack_lease) {
+            if !hosted_source_stack_lease::write_scsi_data(
+                lease, self.source_identity(), range, component_address, exec_address, data,
+            ) { return Err(CaptureError::InvalidSource); }
         }
         if let Some(child) = self.children.sense {
             if !memory.write(child.component_address, sense) {
@@ -175,11 +199,11 @@ impl CapturedSourceScsi {
         if !self.source_pinned
             || !(if hosted_source_irp_ledger::deferred_free_requested(self.ticket) {
                 hosted_source_irp_ledger::scsi_children_match_after_callback(
-                    self.instance_index, self.children, self.stack_lease,
+                    self.instance_index, self.children, self.stack_lease, self.data_stack_lease,
                 )
             } else {
                 hosted_source_irp_ledger::scsi_children_match_current(
-                    self.instance_index, self.children, self.stack_lease,
+                    self.instance_index, self.children, self.stack_lease, self.data_stack_lease,
                 )
             })
         {
@@ -279,6 +303,12 @@ impl CapturedSourceScsi {
     }
 
     fn release_references(&mut self, source_completed: bool) -> Result<(), CaptureError> {
+        if let Some(lease) = self.data_stack_lease {
+            if !unsafe { hosted_source_stack_lease::release_scsi_data(lease, self.source_identity()) } {
+                return Err(CaptureError::InvalidSource);
+            }
+            self.data_stack_lease = None;
+        }
         if let Some(lease) = self.stack_lease {
             if !unsafe { hosted_source_stack_lease::release_scsi(lease, self.source_identity()) } {
                 return Err(CaptureError::InvalidSource);
@@ -345,7 +375,7 @@ pub(super) unsafe fn capture(
                 relation_generation: authority.parent_relation().relation().generation(),
                 provider_pdo: authority.provider().address(),
             };
-            let (children, srb, mdl, data, sense, stack_lease) = hosted_source_irp_ledger::capture_scsi_children(
+            let (children, srb, mdl, data, sense, stack_lease, data_stack_lease) = hosted_source_irp_ledger::capture_scsi_children(
                 instance_index,
                 source,
                 ticket,
@@ -355,10 +385,10 @@ pub(super) unsafe fn capture(
                 reply_cap,
             )
             .ok_or(CaptureError::InvalidSrb)?;
-            Ok((authority, children, srb, mdl, data, sense, stack_lease))
+            Ok((authority, children, srb, mdl, data, sense, stack_lease, data_stack_lease))
         })();
         match admitted {
-            Ok((authority, children, srb, mdl, data, sense, stack_lease)) => Ok(CapturedSourceScsi {
+            Ok((authority, children, srb, mdl, data, sense, stack_lease, data_stack_lease)) => Ok(CapturedSourceScsi {
                 instance_index,
                 source,
                 source_pdo_alias: target_device_address,
@@ -367,6 +397,7 @@ pub(super) unsafe fn capture(
                 authority,
                 children,
                 stack_lease,
+                data_stack_lease,
                 srb,
                 mdl,
                 data,
