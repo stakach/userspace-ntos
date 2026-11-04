@@ -18,3 +18,16 @@ fn canonical_scsi_owner_fences_media_before_provider_entry() {
     assert!(NATIVE_BLOCK.contains("PossibleScsiEffect::from_legacy_srb"));
     assert!(NATIVE_BLOCK.contains("fence.before_effect"));
 }
+
+#[test]
+fn refresh_recheck_cannot_hide_a_possible_write_before_abort_to_old_route() {
+    let hook = NATIVE_BLOCK
+        .split_once("pub(super) unsafe fn before_external_scsi_effect(")
+        .expect("Executive pre-effect hook")
+        .1
+        .split_once("unsafe fn observe_metadata_shadow(")
+        .expect("hook boundary")
+        .0;
+    assert!(hook.contains("retained_native_storage_recheck_route()"),
+        "a temporarily unpublished route must still poison its old cache");
+}

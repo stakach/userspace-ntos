@@ -37,6 +37,7 @@ static mut METADATA_SHADOW_ROUTE: Option<MetadataKey> = None;
 static mut METADATA_FENCE: Option<nt_fs::InstalledMetadataReadThroughFence<MetadataDisk, MetadataKey>> = None;
 static METADATA_FENCE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static METADATA_FENCE_POISONS: AtomicU64 = AtomicU64::new(0);
+static METADATA_READ_THROUGH_HITS: AtomicU64 = AtomicU64::new(0);
 
 struct MetadataShadowCensus {
     hits: AtomicU64,
@@ -134,6 +135,9 @@ pub(super) fn print_census() {
     print_u64(u64::from(METADATA_FENCE_INITIALIZED.load(Ordering::Acquire)));
     print_str(b"/");
     print_u64(METADATA_FENCE_POISONS.load(Ordering::Relaxed));
+    print_str(b"\n");
+    print_str(b"[census] native-metadata-read-through hits=");
+    print_u64(METADATA_READ_THROUGH_HITS.load(Ordering::Relaxed));
     print_str(b"\n");
     let published = native_disk_relation::native_storage_route();
     let retained = native_disk_relation::retained_native_storage_recheck_route();
@@ -419,7 +423,8 @@ pub(super) unsafe fn before_external_scsi_effect(
     prepared: &nt_io_manager::detached_file_irp::PreparedExternalFileIrp,
     stack: &[(nt_io_manager::DeviceId, nt_io_manager::DriverId)],
 ) {
-    let Some(route) = native_disk_relation::native_storage_route() else { return; };
+    let Some(route) = native_disk_relation::native_storage_route()
+        .or_else(|| native_disk_relation::retained_native_storage_recheck_route()) else { return; };
     let targets_disk = stack.iter().any(|(device, _)| *device == route.scsi.pdo);
     let projection = prepared.projection();
     let effect = match &projection.parameters {
@@ -433,14 +438,29 @@ pub(super) unsafe fn before_external_scsi_effect(
     let was_poisoned = fence.poisoned();
     fence.before_effect(&metadata_disk(route.scsi), effect);
     if !was_poisoned && fence.poisoned() {
+        (&mut *core::ptr::addr_of_mut!(METADATA_SHADOW)).invalidate();
         METADATA_FENCE_POISONS.fetch_add(1, Ordering::Relaxed);
-        print_str(b"[native-metadata-fence] poisoned before irp/major/opcode=");
+        print_str(b"[native-metadata-fence] poisoned before irp/major/code/input/output=");
         print_u64(prepared.irp_id().raw());
         print_str(b"/");
         print_u64(u64::from(projection.major));
         print_str(b"/");
         print_u64(match &projection.parameters {
             IoParameters::Scsi(parameters) => u64::from(parameters.srb[0x48]),
+            IoParameters::DeviceControl(parameters)
+            | IoParameters::InternalDeviceControl(parameters) => u64::from(parameters.ioctl_code),
+            _ => 0,
+        });
+        print_str(b"/");
+        print_u64(match &projection.parameters {
+            IoParameters::DeviceControl(parameters)
+            | IoParameters::InternalDeviceControl(parameters) => u64::from(parameters.input_len),
+            _ => 0,
+        });
+        print_str(b"/");
+        print_u64(match &projection.parameters {
+            IoParameters::DeviceControl(parameters)
+            | IoParameters::InternalDeviceControl(parameters) => u64::from(parameters.output_len),
             _ => 0,
         });
         print_str(b"\n");
@@ -757,6 +777,24 @@ unsafe fn dispatch_claim(
         claim.refuse_unentered(nt_status::NtStatus(nt_fs::STATUS_DATA_ERROR as i32));
         return 1;
     };
+    // A hit is an exact copied sector from an earlier authenticated terminal/ACK under this
+    // physical mount and provider generation. The Executive-owned poison linearizes before any
+    // possible same-disk write enters its provider. Complete only the retained logical claim;
+    // no physical ticket or fabricated provider terminal is created.
+    if let Some((sector, census)) = metadata_sector(&claim) {
+        if let Some(fence) = metadata_fence_for(route) {
+            let key = (route.mount.value(), route.key);
+            if fence.eligible(&metadata_disk(route.scsi), &key) {
+                if let Some(bytes) = metadata_shadow_for(route).lookup(key, sector) {
+                    let bytes = *bytes;
+                    census.hits.fetch_add(1, Ordering::Relaxed);
+                    METADATA_READ_THROUGH_HITS.fetch_add(1, Ordering::Relaxed);
+                    claim.complete(Ok(&bytes));
+                    return 1;
+                }
+            }
+        }
+    }
     let Ok(ticket) = crate::fs_loader::enter_exec_native_block(
         route.mount, claim.source(), operation,
     ) else {
