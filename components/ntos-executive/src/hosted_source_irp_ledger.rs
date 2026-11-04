@@ -2714,6 +2714,29 @@ pub(super) fn unpin(ticket: SourceIrpTicket) -> bool {
     ledger().unpin(ticket).is_ok()
 }
 
+/// A completed SCSI callback may have declined to free its reusable IRP.
+/// Release that exact forward and its unused free arm only after the caller
+/// has observed provider ACK and source completion. Physical identity remains
+/// checked under the same source and pool locks as terminal free.
+pub(super) fn complete_driver_forward_without_free(
+    ticket: SourceIrpTicket,
+    allocation: SourceIrpAllocation,
+) -> bool {
+    let SourceIrpOwner::HostedDriver(index) = allocation.owner else { return false; };
+    let Some(inst) = instance(index) else { return false; };
+    if instance_domain_identity(inst) != Some(allocation.domain) { return false; }
+    let _guard = lock();
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        return false;
+    };
+    let mut current = unsafe { allocation_unlocked(
+        index, inst, allocation.component_address, allocation.bytes, allocation.stack_count,
+    ) };
+    if let Some(current) = current.as_mut() { current.owner = allocation.owner; }
+    if current != Some(allocation) { return false; }
+    ledger().complete_driver_forward_without_free(ticket, allocation).is_ok()
+}
+
 unsafe fn caller_terminal_ready_unlocked(ticket: SourceIrpTicket, allocation: SourceIrpAllocation) -> bool {
     let SourceIrpOwner::HostedCaller(instance_index) = allocation.owner else { return false; };
     let Some(inst) = instance(instance_index) else { return false; };

@@ -324,7 +324,7 @@ impl CapturedSourceScsi {
             }
             self.children_retained = false;
         }
-        self.release_references(false)
+        self.release_references(false, false)
     }
 
     pub(super) fn release_after_completions(&mut self) -> Result<(), CaptureError> {
@@ -334,10 +334,14 @@ impl CapturedSourceScsi {
             }
             self.children_retained = false;
         }
-        self.release_references(self.completion_finished())
+        self.release_references(self.completion_finished(), true)
     }
 
-    fn release_references(&mut self, source_completed: bool) -> Result<(), CaptureError> {
+    fn release_references(
+        &mut self,
+        free_requested: bool,
+        completed_scsi: bool,
+    ) -> Result<(), CaptureError> {
         if let Some(lease) = self.data_stack_lease {
             if !unsafe { hosted_source_stack_lease::release_scsi_data(lease, self.source_identity()) } {
                 return Err(CaptureError::InvalidSource);
@@ -351,8 +355,15 @@ impl CapturedSourceScsi {
             self.stack_lease = None;
         }
         if self.source_pinned {
-            let released = if source_completed {
+            let released = if free_requested {
                 hosted_source_irp_ledger::release_pending_terminal(self.ticket, self.source)
+            } else if completed_scsi
+                && matches!(self.source.owner,
+                    nt_io_manager::source_irp_ledger::SourceIrpOwner::HostedDriver(_))
+            {
+                hosted_source_irp_ledger::complete_driver_forward_without_free(
+                    self.ticket, self.source,
+                )
             } else {
                 hosted_source_irp_ledger::unpin(self.ticket)
             };

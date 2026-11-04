@@ -319,6 +319,34 @@ impl SourceIrpLedger {
         Ok(())
     }
 
+    /// Release a completed driver forward whose callback did not request IRP free.
+    /// The terminal adapter calls this only after both source completion and
+    /// provider acknowledgement. An unused callback-free arm survives other
+    /// active pins and is cleared only when the last owner is released.
+    pub fn complete_driver_forward_without_free(
+        &mut self,
+        ticket: SourceIrpTicket,
+        allocation: SourceIrpAllocation,
+    ) -> Result<(), SourceIrpLedgerError> {
+        if !matches!(allocation.owner, SourceIrpOwner::HostedDriver(_)) {
+            return Err(SourceIrpLedgerError::WrongIdentity);
+        }
+        let row = self.rows.iter_mut()
+            .find(|row| row.ticket == ticket && row.allocation == allocation)
+            .ok_or(SourceIrpLedgerError::WrongIdentity)?;
+        if row.retirement_started || row.free_requested {
+            return Err(SourceIrpLedgerError::RetirementStarted);
+        }
+        if !row.defer_free_armed || row.pins == 0 {
+            return Err(SourceIrpLedgerError::WrongIdentity);
+        }
+        row.pins -= 1;
+        if row.pins == 0 {
+            row.defer_free_armed = false;
+        }
+        Ok(())
+    }
+
     /// Identity observation remains valid during retirement, but fresh forwarding does not.
     pub fn admits_forward(&self, ticket: SourceIrpTicket, allocation: SourceIrpAllocation) -> bool {
         self.rows.iter().any(|row| row.ticket == ticket && row.allocation == allocation
@@ -887,6 +915,50 @@ mod tests {
         assert!(ledger.matches(owner.owner, owner, ticket));
         ledger.retire(ticket, owner).unwrap();
         assert!(!ledger.deferred_free_requested(ticket));
+    }
+
+    #[test]
+    fn completed_pooled_driver_irp_without_free_can_be_reused_after_exact_release() {
+        let mut ledger = SourceIrpLedger::new();
+        let owner = allocation(0x5000, 44);
+        let ticket = ledger.register(owner).unwrap();
+        ledger.pin_hosted_forward(3, owner.domain, owner.component_address).unwrap();
+        ledger.arm_deferred_free(ticket).unwrap();
+        assert_eq!(ledger.mutation_ready(ticket, owner),
+            Err(SourceIrpLedgerError::RetirementStarted));
+
+        // The completion did not call IoFreeIrp. Only the exact ticket and
+        // physical allocation may release its arm after provider ACK and
+        // source completion; ClassPnP then reuses this transfer-packet IRP.
+        let stale = SourceIrpAllocation { pool_generation: 45, ..owner };
+        assert!(ledger.complete_driver_forward_without_free(ticket, stale).is_err());
+        ledger.complete_driver_forward_without_free(ticket, owner).unwrap();
+        assert_eq!(ledger.mutation_ready(ticket, owner), Ok(()));
+        assert!(ledger.complete_driver_forward_without_free(ticket, owner).is_err());
+
+        let freed = allocation(0x6000, 44);
+        let free_ticket = ledger.register(freed).unwrap();
+        ledger.pin_hosted_forward(3, freed.domain, freed.component_address).unwrap();
+        ledger.arm_deferred_free(free_ticket).unwrap();
+        assert_eq!(ledger.prepare_driver_free(3, freed.domain, freed.component_address),
+            Ok(SourceIrpRetirement::Deferred(free_ticket)));
+        assert!(ledger.complete_driver_forward_without_free(free_ticket, freed).is_err());
+        assert_eq!(ledger.mutation_ready(free_ticket, freed),
+            Err(SourceIrpLedgerError::RetirementStarted));
+        assert_eq!(ledger.begin_deferred_driver_retirement(free_ticket, freed),
+            Ok(SourceIrpRetirement::Retired(free_ticket)));
+        ledger.retire(free_ticket, freed).unwrap();
+
+        let shared = allocation(0x7000, 44);
+        let shared_ticket = ledger.register(shared).unwrap();
+        ledger.pin_hosted_forward(3, shared.domain, shared.component_address).unwrap();
+        ledger.pin_hosted_forward(3, shared.domain, shared.component_address).unwrap();
+        ledger.arm_deferred_free(shared_ticket).unwrap();
+        ledger.complete_driver_forward_without_free(shared_ticket, shared).unwrap();
+        assert!(ledger.mutation_ready(shared_ticket, shared).is_err(),
+            "one remaining forward still owns the reusable packet");
+        ledger.complete_driver_forward_without_free(shared_ticket, shared).unwrap();
+        assert_eq!(ledger.mutation_ready(shared_ticket, shared), Ok(()));
     }
 
     #[test]
