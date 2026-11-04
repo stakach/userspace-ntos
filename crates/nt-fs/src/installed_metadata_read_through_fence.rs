@@ -43,7 +43,10 @@ impl PossibleScsiEffect {
     /// media even when their access bits appear read-only.
     pub fn from_storage_ioctl(ioctl_code: u32, input_len: u32, output_len: u32) -> Self {
         const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002d_1400;
-        if ioctl_code == IOCTL_STORAGE_QUERY_PROPERTY && input_len >= 12 && output_len >= 8 {
+        const IOCTL_STORAGE_GET_DEVICE_NUMBER: u32 = 0x002d_1080;
+        if (ioctl_code == IOCTL_STORAGE_QUERY_PROPERTY && input_len >= 12 && output_len >= 8)
+            || (ioctl_code == IOCTL_STORAGE_GET_DEVICE_NUMBER && input_len == 0 && output_len >= 12)
+        {
             Self::ProvenReadOnly
         } else {
             Self::PossiblyMutating

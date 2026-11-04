@@ -18,6 +18,18 @@ fn only_storage_property_query_is_proven_read_only_device_control() {
         PossibleScsiEffect::PossiblyMutating);
 }
 
+#[test]
+fn storage_device_number_query_cannot_mutate_media() {
+    // The disk class issues this buffered query during StartDevice; its result is a
+    // 12-byte STORAGE_DEVICE_NUMBER, with no input payload.
+    assert_eq!(PossibleScsiEffect::from_storage_ioctl(0x002d_1080, 0, 12),
+        PossibleScsiEffect::ProvenReadOnly);
+    assert_eq!(PossibleScsiEffect::from_storage_ioctl(0x002d_1080, 1, 12),
+        PossibleScsiEffect::PossiblyMutating);
+    assert_eq!(PossibleScsiEffect::from_storage_ioctl(0x002d_1080, 0, 11),
+        PossibleScsiEffect::PossiblyMutating);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Disk { controller: u64, physical_pdo: u64 }
 
