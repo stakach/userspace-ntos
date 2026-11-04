@@ -30,6 +30,7 @@ static LOCK: AtomicU64 = AtomicU64::new(0);
 static mut LEDGER: SourceIrpLedger = SourceIrpLedger::new();
 static mut AUXILIARY: SourceIrpAuxiliaryLedger = SourceIrpAuxiliaryLedger::new();
 static mut SCSI_CHILDREN: ScsiSourceRetentionLedger = ScsiSourceRetentionLedger::new();
+static IOREUSE_REFUSAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static mut CALLER_PROJECTIONS: Option<Vec<CallerProjection>> = None;
 static mut CALLER_ACKS: Option<Vec<CallerTerminalAck>> = None;
 
@@ -1411,6 +1412,40 @@ pub(super) fn begin_irq_local_completion(
 /// Commit `IoInitializeIrp`/`IoReuseIrp` in the provider's mapped pool while the
 /// physical allocation and every source owner are serialized. The caller's pointer
 /// selects storage only; exact allocation identity and ownership are rederived here.
+#[derive(Default)]
+struct IrpMutationDiagnostic {
+    stage: &'static [u8],
+    pool_generation: u64,
+    owner: u8,
+    ticket: u64,
+    ticket_generation: u64,
+    mutation_error: u8,
+    auxiliary_present: u8,
+}
+
+fn trace_ioreuse_refusal(instance_index: usize, irp: u64, diagnostic: &IrpMutationDiagnostic) {
+    if IOREUSE_REFUSAL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 4 { return; }
+    print_str(b"[ioreuse-refusal] stage/instance/irp/pool-gen/owner/ticket/gen/mutation/aux=");
+    print_str(diagnostic.stage);
+    print_str(b"/");
+    print_u64(instance_index as u64);
+    print_str(b"/");
+    print_hex64(irp);
+    print_str(b"/");
+    print_u64(diagnostic.pool_generation);
+    print_str(b"/");
+    print_u64(u64::from(diagnostic.owner));
+    print_str(b"/");
+    print_u64(diagnostic.ticket);
+    print_str(b"/");
+    print_u64(diagnostic.ticket_generation);
+    print_str(b"/");
+    print_u64(u64::from(diagnostic.mutation_error));
+    print_str(b"/");
+    print_u64(u64::from(diagnostic.auxiliary_present));
+    print_str(b"\n");
+}
+
 fn mutate_local_irp_packet(
     instance_index: usize,
     inst: DriverInstance,
@@ -1419,6 +1454,26 @@ fn mutate_local_irp_packet(
     argument: u64,
     flags: u64,
 ) -> (i32, u64, u64) {
+    let mut diagnostic = IrpMutationDiagnostic::default();
+    let result = mutate_local_irp_packet_inner(
+        instance_index, inst, operation, irp, argument, flags, &mut diagnostic,
+    );
+    if operation == hosted_irp_lifecycle_exports::REUSE && result.0 == STATUS_INVALID_HANDLE {
+        trace_ioreuse_refusal(instance_index, irp, &diagnostic);
+    }
+    result
+}
+
+fn mutate_local_irp_packet_inner(
+    instance_index: usize,
+    inst: DriverInstance,
+    operation: u64,
+    irp: u64,
+    argument: u64,
+    flags: u64,
+    diagnostic: &mut IrpMutationDiagnostic,
+) -> (i32, u64, u64) {
+    diagnostic.stage = b"shape";
     let initialize = operation == hosted_irp_lifecycle_exports::INITIALIZE;
     if irp == 0 || irp & 15 != 0 {
         return (STATUS_INVALID_PARAMETER, 0, 0);
@@ -1437,18 +1492,22 @@ fn mutate_local_irp_packet(
     if apc_environment > 1 {
         return (STATUS_INVALID_PARAMETER, 0, 0);
     }
+    diagnostic.stage = b"domain";
     let Some(domain) = instance_domain_identity(inst) else {
         return (STATUS_INVALID_HANDLE, 0, 0);
     };
     let _source_guard = lock();
+    diagnostic.stage = b"pool-lock";
     let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
         return (STATUS_INVALID_HANDLE, 0, 0);
     };
+    diagnostic.stage = b"pool-identity";
     let Some(identity) = (unsafe {
         exact_pool_identity_unlocked(inst, irp, WDM_X64_IRP_SIZE as u64)
     }) else {
         return (STATUS_INVALID_PARAMETER, 0, 0);
     };
+    diagnostic.pool_generation = identity.pool_generation;
     let Some(header_exec) = (unsafe {
         hosted_pool_allocation_exec_va(inst.exec_pool_va, irp, WDM_X64_IRP_SIZE as u64)
     }) else {
@@ -1472,23 +1531,54 @@ fn mutate_local_irp_packet(
     {
         return (STATUS_INVALID_PARAMETER, 0, 0);
     }
+    diagnostic.stage = b"ledger-admission";
     match ledger().pool_free_admission(instance_index, domain, irp) {
         Ok(SourcePoolFreeAdmission::Unregistered) => {},
         Ok(SourcePoolFreeAdmission::DriverOwned(owner)) => {
+            diagnostic.owner = 1;
             let Some((ticket, registered)) = ledger().registered(
                 SourceIrpOwner::HostedDriver(instance_index), domain, irp,
             ) else {
+                diagnostic.stage = b"registration-missing";
                 return (STATUS_INVALID_HANDLE, 0, 0);
             };
+            diagnostic.ticket = ticket.id.get();
+            diagnostic.ticket_generation = ticket.generation.get();
+            diagnostic.stage = b"registration-shape";
             if registered != owner || owner.pool_generation != identity.pool_generation
                 || owner.bytes != packet_size as u64 || owner.stack_count != stack_count
-                || ledger().mutation_ready(ticket, owner).is_err()
-                || auxiliary().snapshot(ticket, owner).is_ok()
             {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             }
+            diagnostic.stage = b"mutation-ready";
+            let mutation = ledger().mutation_ready(ticket, owner);
+            diagnostic.mutation_error = match mutation {
+                Ok(()) => 0,
+                Err(SourceIrpLedgerError::Pinned) => 1,
+                Err(SourceIrpLedgerError::RetirementStarted) => 2,
+                Err(SourceIrpLedgerError::WrongIdentity) => 3,
+                Err(_) => 4,
+            };
+            if mutation.is_err() {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            }
+            diagnostic.stage = b"auxiliary";
+            diagnostic.auxiliary_present = u8::from(auxiliary().snapshot(ticket, owner).is_ok());
+            if diagnostic.auxiliary_present != 0 {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            }
         }
-        Ok(SourcePoolFreeAdmission::Protected(_)) | Err(_) => {
+        Ok(SourcePoolFreeAdmission::Protected(owner)) => {
+            diagnostic.stage = b"protected-owner";
+            diagnostic.owner = match owner.owner {
+                SourceIrpOwner::HostedDriver(_) => 1,
+                SourceIrpOwner::HostedCaller(_) => 2,
+                _ => 3,
+            };
+            return (STATUS_INVALID_HANDLE, 0, 0);
+        }
+        Err(_) => {
+            diagnostic.stage = b"ledger-error";
             return (STATUS_INVALID_HANDLE, 0, 0);
         }
     }
@@ -1609,9 +1699,17 @@ pub(super) fn service(
     active_reply_cap: u64,
 ) -> (i32, u64, u64) {
     let Some((instance_index, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        if op == hosted_irp_lifecycle_exports::REUSE {
+            trace_ioreuse_refusal(usize::MAX, component_address,
+                &IrpMutationDiagnostic { stage: b"channel", ..Default::default() });
+        }
         return (STATUS_INVALID_HANDLE, 0, 0);
     };
     if hosted_driver_pump_caller_tcb(ch, active_reply_cap, caller_badge).is_none() {
+        if op == hosted_irp_lifecycle_exports::REUSE {
+            trace_ioreuse_refusal(instance_index, component_address,
+                &IrpMutationDiagnostic { stage: b"caller-tcb", ..Default::default() });
+        }
         return (STATUS_INVALID_HANDLE, 0, 0);
     }
     match op {
