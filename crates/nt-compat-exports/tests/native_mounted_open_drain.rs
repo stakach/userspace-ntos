@@ -270,8 +270,14 @@ fn acknowledged_native_fat_sector_can_dispatch_its_successor_in_the_same_service
     assert!(pending_branch.contains("let settled = poll_pending();")
         && pending_wait.contains("return 0;"),
         "an unproven terminal or refused ACK must retain the occupied slot and forbid next dispatch");
-    assert_eq!(service.matches("dispatch_claim(").count(), 1,
-        "a completion turn may admit at most one new physical command");
+    let (published_route, retained_route) = service
+        .split_once("let Some(route) = native_disk_relation::retained_native_storage_recheck_route()")
+        .expect("retained-route fallback follows the published-route branch");
+    assert!(published_route.contains("drain_cached_claims(CACHE_CLAIMS_PER_TURN")
+        && published_route.contains("return settled.saturating_add(driven);")
+        && published_route.matches("dispatch_claim(").count() == 1
+        && retained_route.matches("dispatch_claim(").count() == 1,
+        "the bounded published-route drain and single retained-route command must be disjoint");
     assert!(!service.contains("pump_hosted_io_completions"),
         "native block service must not nest a completion pump");
 }
