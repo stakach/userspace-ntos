@@ -91,6 +91,20 @@ pub const MDL_PARTIAL: i16 = 0x0010;
 pub const MDL_IO_PAGE_READ: i16 = 0x0040;
 pub const MDL_IO_SPACE: i16 = 0x0800;
 
+/// A source MDL can retain its backing either through locked pages or through
+/// a nonpaged-pool mapping. For the latter, the public mapping must still name
+/// the exact address held by the registry; a flag alone is not authority.
+pub const fn source_mdl_has_retained_mapping(
+    flags: i16,
+    mapped_system_va: u64,
+    registered_address: u64,
+) -> bool {
+    flags & MDL_PAGES_LOCKED != 0
+        || flags & MDL_SOURCE_IS_NONPAGED_POOL != 0
+            && registered_address != 0
+            && mapped_system_va == registered_address
+}
+
 /// Why an MDL operation was rejected (spec §8.4, §25).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MdlError {
@@ -658,6 +672,28 @@ mod tests {
         assert_eq!(mdl_allocation_size(0, 0), None);
         assert_eq!(mdl_allocation_size(0, 0x8000_0000), None);
         assert_eq!(mdl_allocation_size(u64::MAX, 2), None);
+    }
+
+    #[test]
+    fn nonpaged_source_mdl_is_usable_without_pages_locked() {
+        let address = 0x2000;
+        assert!(source_mdl_has_retained_mapping(
+            MDL_SOURCE_IS_NONPAGED_POOL | MDL_MAPPED_TO_SYSTEM_VA,
+            address,
+            address,
+        ));
+        assert!(source_mdl_has_retained_mapping(
+            MDL_SOURCE_IS_NONPAGED_POOL,
+            address,
+            address,
+        ));
+        assert!(source_mdl_has_retained_mapping(MDL_PAGES_LOCKED, 0, address));
+        assert!(!source_mdl_has_retained_mapping(
+            MDL_SOURCE_IS_NONPAGED_POOL,
+            0,
+            address,
+        ));
+        assert!(!source_mdl_has_retained_mapping(0, address, address));
     }
 
     #[test]

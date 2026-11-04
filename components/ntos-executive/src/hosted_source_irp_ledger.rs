@@ -793,6 +793,7 @@ unsafe fn mdl_identity_unlocked(
     let virtual_address = registry.virtual_address(id)?;
     let mdl_exec = inst.exec_pool_va + mdl.saturating_sub(FSD_POOL_VADDR);
     let raw_flags = read_unaligned((mdl_exec + nt_mdl::MDL_OFF_FLAGS) as *const i16);
+    let raw_mapped = read_unaligned((mdl_exec + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *const u64);
     let raw_start = read_unaligned((mdl_exec + nt_mdl::MDL_OFF_START_VA) as *const u64);
     let raw_offset = read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32);
     let raw_size = read_unaligned((mdl_exec + nt_mdl::MDL_OFF_SIZE) as *const i16);
@@ -804,7 +805,9 @@ unsafe fn mdl_identity_unlocked(
             !registry.is_partial_key(key)
                 || registry.allocated_bytes_for_key(key) != Some(raw_size as u16)
         } else {
-            raw_flags & nt_mdl::MDL_PAGES_LOCKED == 0
+            !nt_mdl::source_mdl_has_retained_mapping(
+                raw_flags, raw_mapped, virtual_address,
+            )
         })
         || raw_start.checked_add(u64::from(raw_offset)) != Some(virtual_address)
     {
