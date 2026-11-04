@@ -165,3 +165,21 @@ fn fat_one_sector_callsites_reconcile_with_the_existing_one_sector_bucket() {
         assert_eq!(census.fat_one_sector_calls(kind), 1);
     }
 }
+
+#[test]
+fn directory_callsites_reconcile_with_the_existing_directory_bucket() {
+    let census = DirectReadCensus::new();
+    for site in [
+        FatOneSectorCallsite::PathDirectory,
+        FatOneSectorCallsite::CheckedDirectory,
+        FatOneSectorCallsite::LegacyDirectory,
+        FatOneSectorCallsite::ShortDirectory,
+        FatOneSectorCallsite::Directory,
+    ] {
+        census.record_fat(site, 1);
+        assert_eq!(census.fat_directory_calls(site), 1);
+        assert_eq!(census.fat_directory_total(), census.fat_one_sector_calls(FatOneSectorCallsite::Directory));
+    }
+    census.record_fat(FatOneSectorCallsite::PathDirectory, 2);
+    assert_eq!(census.fat_directory_total(), 5);
+}

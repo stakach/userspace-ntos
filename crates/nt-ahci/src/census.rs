@@ -183,6 +183,10 @@ pub enum DirectReadSource {
 pub enum FatOneSectorCallsite {
     FatLink,
     Directory,
+    PathDirectory,
+    CheckedDirectory,
+    LegacyDirectory,
+    ShortDirectory,
     FilePayload,
     Other,
 }
@@ -191,9 +195,21 @@ impl FatOneSectorCallsite {
     const fn index(self) -> usize {
         match self {
             Self::FatLink => 0,
-            Self::Directory => 1,
+            Self::Directory | Self::PathDirectory | Self::CheckedDirectory
+                | Self::LegacyDirectory | Self::ShortDirectory => 1,
             Self::FilePayload => 2,
             Self::Other => 3,
+        }
+    }
+
+    const fn directory_index(self) -> Option<usize> {
+        match self {
+            Self::PathDirectory => Some(0),
+            Self::CheckedDirectory => Some(1),
+            Self::LegacyDirectory => Some(2),
+            Self::ShortDirectory => Some(3),
+            Self::Directory => Some(4),
+            _ => None,
         }
     }
 }
@@ -259,6 +275,7 @@ pub struct DirectReadCensus {
     fat: [DirectReadCounters; 4],
     snapshot: [DirectReadCounters; 4],
     fat_one_sector: [AtomicU64; 4],
+    fat_directory: [AtomicU64; 5],
 }
 
 impl DirectReadCensus {
@@ -277,6 +294,7 @@ impl DirectReadCensus {
                 DirectReadCounters::new(),
             ],
             fat_one_sector: [const { AtomicU64::new(0) }; 4],
+            fat_directory: [const { AtomicU64::new(0) }; 5],
         }
     }
 
@@ -306,6 +324,9 @@ impl DirectReadCensus {
         }
         if sectors == 1 {
             self.fat_one_sector[callsite.index()].fetch_add(1, Ordering::Relaxed);
+            if let Some(index) = callsite.directory_index() {
+                self.fat_directory[index].fetch_add(1, Ordering::Relaxed);
+            }
         }
         let counters = self.counters(DirectReadSource::Fat, DirectReadBucket::for_sectors(sectors));
         counters.commands.fetch_add(1, Ordering::Relaxed);
@@ -314,6 +335,14 @@ impl DirectReadCensus {
 
     pub fn fat_one_sector_calls(&self, callsite: FatOneSectorCallsite) -> u64 {
         self.fat_one_sector[callsite.index()].load(Ordering::Relaxed)
+    }
+
+    pub fn fat_directory_calls(&self, callsite: FatOneSectorCallsite) -> u64 {
+        callsite.directory_index().map_or(0, |index| self.fat_directory[index].load(Ordering::Relaxed))
+    }
+
+    pub fn fat_directory_total(&self) -> u64 {
+        self.fat_directory.iter().map(|count| count.load(Ordering::Relaxed)).sum()
     }
 
     /// Exact after the native-start Ready drain; concurrent snapshots are advisory only.

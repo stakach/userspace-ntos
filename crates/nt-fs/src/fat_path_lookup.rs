@@ -109,6 +109,9 @@ impl FatPathLookup {
         (sector < limit).then_some(FatPathRequest { sector, kind })
     }
 
+    /// Parent directory whose current sector the caller is about to read.
+    pub const fn parent_cluster(&self) -> u32 { self.directory_cluster }
+
     pub fn feed(&mut self, request: FatPathRequest, bytes: &[u8; 512]) -> Result<FatPathProgress, FatPathError> {
         if self.request() != Some(request) { return Err(FatPathError::WrongRequest); }
         match request.kind {

@@ -19,6 +19,9 @@ const FAT32_FAT_CACHE_OFFSET: u64 = FAT32_SCRATCH_OFFSET;
 static mut EXEC_FAT_RANGE_CURSORS: nt_fs::FatRangeCursorSet<16> =
     nt_fs::FatRangeCursorSet::new();
 static mut EXEC_FAT_SECTOR_CACHE: nt_fs::FatSectorCache = nt_fs::FatSectorCache::new();
+const FAT_PATH_PARENT_CANDIDATES: usize = 8;
+static mut EXEC_FAT_PATH_LOOKUP_CENSUS: nt_fs::FatPathLookupCensus<FAT_PATH_PARENT_CANDIDATES> =
+    nt_fs::FatPathLookupCensus::new();
 static DIRECT_READ_CENSUS: nt_ahci::DirectReadCensus = nt_ahci::DirectReadCensus::new();
 static DIRECT_READ_CENSUS_PRINTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
@@ -312,6 +315,48 @@ pub(crate) fn print_direct_read_census_once() {
                 .commands,
     ));
     print_str(b"\n");
+    print_str(b"[census] fat-directory-callsites");
+    for (callsite, label) in [
+        (nt_ahci::FatOneSectorCallsite::PathDirectory, b" path=".as_slice()),
+        (nt_ahci::FatOneSectorCallsite::CheckedDirectory, b" checked=".as_slice()),
+        (nt_ahci::FatOneSectorCallsite::LegacyDirectory, b" legacy=".as_slice()),
+        (nt_ahci::FatOneSectorCallsite::ShortDirectory, b" short=".as_slice()),
+        (nt_ahci::FatOneSectorCallsite::Directory, b" other=".as_slice()),
+    ] {
+        print_str(label);
+        print_u64(DIRECT_READ_CENSUS.fat_directory_calls(callsite));
+    }
+    print_str(b" total=");
+    print_u64(DIRECT_READ_CENSUS.fat_directory_total());
+    print_str(b" reconciled=");
+    print_u64(u64::from(DIRECT_READ_CENSUS.fat_directory_total()
+        == DIRECT_READ_CENSUS.fat_one_sector_calls(nt_ahci::FatOneSectorCallsite::Directory)));
+    print_str(b"\n");
+    let path = unsafe { &*core::ptr::addr_of!(EXEC_FAT_PATH_LOOKUP_CENSUS) };
+    print_str(b"[census] fat-path-lookups=");
+    print_u64(path.lookups());
+    print_str(b" found=");
+    print_u64(path.found_count());
+    print_str(b" not-found=");
+    print_u64(path.not_found_count());
+    let path_attempts = DIRECT_READ_CENSUS
+        .fat_directory_calls(nt_ahci::FatOneSectorCallsite::PathDirectory);
+    print_str(b" physical-directory-attempts=");
+    print_u64(path_attempts);
+    print_str(b" successful-directory-sectors=");
+    print_u64(path.directory_sectors());
+    print_str(b" no-data-attempts=");
+    print_u64(path_attempts.saturating_sub(path.directory_sectors()));
+    print_str(b"\n");
+    for index in 0..FAT_PATH_PARENT_CANDIDATES {
+        if let Some((cluster, lower_bound)) = path.parent_candidate(index) {
+            print_str(b"[census] fat-path-parent cluster=");
+            print_u64(cluster as u64);
+            print_str(b" lower-bound-sectors=");
+            print_u64(lower_bound);
+            print_str(b"\n");
+        }
+    }
 }
 
 unsafe fn fat_cache_invalidate(fs: &Fat32) {
@@ -528,7 +573,7 @@ pub(crate) unsafe fn fat_visit_directory_checked(
         },
         dir_cluster,
         |sector| {
-            let data = fat_read_sector_checked(fs, sector, nt_ahci::FatOneSectorCallsite::Directory)
+            let data = fat_read_sector_checked(fs, sector, nt_ahci::FatOneSectorCallsite::CheckedDirectory)
                 .ok_or(nt_fs::STATUS_DATA_ERROR)?;
             let mut bytes = [0; 512];
             core::ptr::copy_nonoverlapping(data, bytes.as_mut_ptr(), bytes.len());
@@ -568,7 +613,7 @@ pub(crate) unsafe fn fat_visit_directory(
             let data = match fat_read_sector_checked(
                 fs,
                 fat_cluster_sector(fs, cluster) + sector,
-                nt_ahci::FatOneSectorCallsite::Directory,
+                nt_ahci::FatOneSectorCallsite::LegacyDirectory,
             ) {
                 Some(data) => data,
                 None => return,
@@ -805,7 +850,7 @@ pub(crate) unsafe fn dir_find(
             let p = fat_read_sector_checked(
                 fs,
                 fat_cluster_sector(fs, cl) + s,
-                nt_ahci::FatOneSectorCallsite::Directory,
+                nt_ahci::FatOneSectorCallsite::ShortDirectory,
             )?;
             for e in 0..(fs.bps as usize / 32) {
                 let ent = p.add(e * 32);
@@ -1077,11 +1122,14 @@ unsafe fn fat_lookup_metadata(
         sectors_per_cluster: fs.spc,
     };
     let mut lookup = nt_fs::FatPathLookup::new(geometry, start_cluster, path).ok()?;
+    if fs.census {
+        (&mut *core::ptr::addr_of_mut!(EXEC_FAT_PATH_LOOKUP_CENSUS)).begin();
+    }
     loop {
         let request = lookup.request()?;
         let callsite = match request.kind {
             nt_fs::FatPathRequestKind::Fat => nt_ahci::FatOneSectorCallsite::FatLink,
-            nt_fs::FatPathRequestKind::Directory => nt_ahci::FatOneSectorCallsite::Directory,
+            nt_fs::FatPathRequestKind::Directory => nt_ahci::FatOneSectorCallsite::PathDirectory,
         };
         let mut bytes = [0; 512];
         if request.kind == nt_fs::FatPathRequestKind::Fat
@@ -1102,12 +1150,24 @@ unsafe fn fat_lookup_metadata(
             let sector = fat_read_sector_checked(fs, request.sector, callsite)?;
             core::ptr::copy_nonoverlapping(sector, bytes.as_mut_ptr(), bytes.len());
         }
+        if request.kind == nt_fs::FatPathRequestKind::Directory && fs.census {
+            (&mut *core::ptr::addr_of_mut!(EXEC_FAT_PATH_LOOKUP_CENSUS))
+                .directory_sector(lookup.parent_cluster());
+        }
         match lookup.feed(request, &bytes).ok()? {
             nt_fs::FatPathProgress::Pending => {}
             nt_fs::FatPathProgress::Found => {
+                if fs.census {
+                    (&mut *core::ptr::addr_of_mut!(EXEC_FAT_PATH_LOOKUP_CENSUS)).found();
+                }
                 return lookup.take_found().map(FatOpenMetadata::from_record);
             }
-            nt_fs::FatPathProgress::NotFound => return None,
+            nt_fs::FatPathProgress::NotFound => {
+                if fs.census {
+                    (&mut *core::ptr::addr_of_mut!(EXEC_FAT_PATH_LOOKUP_CENSUS)).not_found();
+                }
+                return None;
+            }
         }
     }
 }
