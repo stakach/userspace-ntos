@@ -12,6 +12,8 @@ pub enum ExternalFileIrpDispatchPolicy {
     /// File-backed direct/neither controls enter the File's stack but retain caller-buffer writes
     /// independently of IoStatus.Information.
     FileDeviceControl,
+    /// A kernel File-less READ enters the exact authenticated Device object.
+    ReadAtDevice,
     /// Kernel File-less controls enter the exact Device and retain method-aware output capture.
     DeviceControlAtDevice,
     /// File-less buffered controls whose source caller copies the declared output capacity,
@@ -29,7 +31,7 @@ pub const MAX_MUTABLE_METHOD_NEITHER_INPUT: usize = 4096;
 impl ExternalFileIrpDispatchPolicy {
     pub const fn output_capture(self) -> ExternalFileIrpOutputCapture {
         match self {
-            Self::File => ExternalFileIrpOutputCapture::Information,
+            Self::File | Self::ReadAtDevice => ExternalFileIrpOutputCapture::Information,
             Self::FileDeviceControl => ExternalFileIrpOutputCapture::DeviceControl,
             Self::DeviceControlAtDevice => ExternalFileIrpOutputCapture::DeviceControl,
             Self::BufferedDeviceControlAtDevice => {
@@ -78,6 +80,9 @@ impl ExternalFileIrpDispatchPolicy {
         match self {
             Self::File | Self::FileDeviceControl => {
                 manager.prepare_external_file_irp_owned(request, buffers)
+            }
+            Self::ReadAtDevice => {
+                manager.prepare_external_read_irp_owned_at_device(request, buffers)
             }
             Self::DeviceControlAtDevice
             | Self::BufferedDeviceControlAtDevice

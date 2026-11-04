@@ -384,7 +384,8 @@ fn validate_buffers(
         || request.file_id.is_none()
             && !matches!(
                 request.parameters,
-                IoParameters::DeviceControl(_)
+                IoParameters::Read(_)
+                    | IoParameters::DeviceControl(_)
                     | IoParameters::InternalDeviceControl(_)
                     | IoParameters::Scsi(_)
                     | IoParameters::FlushBuffers
@@ -425,6 +426,24 @@ impl<P: ObjectManagerPort> IoManager<P> {
         buffers: ExternalFileIrpBuffers,
     ) -> Result<PreparedExternalFileIrp, NtStatus> {
         self.prepare_external_file_irp_owned_with_start(request, buffers, false)
+    }
+
+    /// Prepare a File-less kernel READ at the exact authenticated Device, without
+    /// selecting an attached device above it. The native caller retains the source
+    /// IRP, output buffer, completion event and IOSB through provider acknowledgement.
+    pub fn prepare_external_read_irp_owned_at_device(
+        &mut self,
+        request: ExternalFileIrpRequest,
+        buffers: ExternalFileIrpBuffers,
+    ) -> Result<PreparedExternalFileIrp, NtStatus> {
+        if request.file_id.is_some()
+            || !matches!((&request.parameters, request.major),
+                (IoParameters::Read(parameters), major::IRP_MJ_READ)
+                    if parameters.length != 0)
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        self.prepare_external_file_irp_owned_with_start(request, buffers, true)
     }
 
     /// Prepare a File-less kernel IOCTL starting at the exact authenticated Device object,
@@ -471,7 +490,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
         buffers: ExternalFileIrpBuffers,
         exact_device: bool,
     ) -> Result<PreparedExternalFileIrp, NtStatus> {
-        if matches!(request.parameters, IoParameters::Scsi(_)) && !exact_device {
+        if !exact_device && (matches!(request.parameters, IoParameters::Scsi(_))
+            || request.file_id.is_none() && matches!(request.parameters, IoParameters::Read(_)))
+        {
             return Err(NtStatus::INVALID_PARAMETER);
         }
         let (input, output, total) = validate_buffers(&request, &buffers)?;

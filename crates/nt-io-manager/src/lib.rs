@@ -114,6 +114,7 @@ pub mod hard_error_verify_device;
 pub mod verify_device_retirement;
 pub mod source_irp_auxiliary;
 pub mod source_irp_auxiliary_buffer;
+pub mod source_device_read;
 pub mod provider_source_irp;
 pub mod query_path_wire;
 pub mod io_create_file_wire;
