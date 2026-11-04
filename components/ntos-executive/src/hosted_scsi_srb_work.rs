@@ -92,6 +92,20 @@ static CURSOR: AtomicU64 = AtomicU64::new(0);
 static CLAIM_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static SCSI_CAPTURE_REFUSAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static SCSI_PROGRESS_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static SCSI_HELD_REFUSAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn trace_scsi_held_refusal(stage: u64, source_irp: u64, token: u64, detail: u64) {
+    if SCSI_HELD_REFUSAL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 4 { return; }
+    print_str(b"[scsi-held-refusal] stage/irp/token/detail=");
+    print_u64(stage);
+    print_str(b"/");
+    print_hex64(source_irp);
+    print_str(b"/");
+    print_u64(token);
+    print_str(b"/");
+    print_u64(detail);
+    print_str(b"\n");
+}
 
 /// Stages: 1 captured, 2 returned, 3 outstanding, 4 terminal,
 /// 5 source published, 6 publication refused, 7 source completed,
@@ -1051,9 +1065,11 @@ pub(super) unsafe fn complete_held(
     source_token: u64,
 ) -> i32 {
     let Some((_, source_instance)) = instance_for_pump_channel(ch, reply_cap) else {
+        trace_scsi_held_refusal(1, source_irp, source_token, reply_cap);
         return INVALID_HANDLE;
     };
     if hosted_driver_pump_caller_tcb(ch, reply_cap, badge).is_none() || source_token == 0 {
+        trace_scsi_held_refusal(2, source_irp, source_token, badge);
         return INVALID_HANDLE;
     }
     let Some(index) = (&*core::ptr::addr_of!(WORK)).iter().position(|slot| {
@@ -1062,9 +1078,9 @@ pub(super) unsafe fn complete_held(
                 && same_instance(work.source_instance, source_instance)
                 && work.source.source_irp_address() == source_irp
                 && work.token == source_token
-                && work.source.validate_retained().is_ok()
         })
     }) else {
+        trace_scsi_held_refusal(3, source_irp, source_token, 0);
         return INVALID_HANDLE;
     };
     if (&*core::ptr::addr_of!(EXECUTING))
@@ -1074,8 +1090,14 @@ pub(super) unsafe fn complete_held(
         return DEVICE_BUSY;
     }
     let Some(work) = (&mut *core::ptr::addr_of_mut!(WORK))[index].as_mut() else {
+        trace_scsi_held_refusal(3, source_irp, source_token, index as u64);
         return INVALID_HANDLE;
     };
+    if work.source.validate_retained().is_err() {
+        trace_scsi_held_refusal(4, source_irp, source_token,
+            work.source.scsi_identity().use_ticket().epoch().get());
+        return INVALID_HANDLE;
+    }
     if !work.inline_held
         || !work.reply_entered
         || !work.source_published
@@ -1083,6 +1105,13 @@ pub(super) unsafe fn complete_held(
         || work.source_completed
         || work.ack.is_some()
     {
+        let detail = u64::from(work.inline_held)
+            | (u64::from(work.reply_entered) << 1)
+            | (u64::from(work.source_published) << 2)
+            | (u64::from(work.provider_terminal) << 3)
+            | (u64::from(work.source_completed) << 4)
+            | (u64::from(work.ack.is_some()) << 5);
+        trace_scsi_held_refusal(5, source_irp, source_token, detail);
         return INVALID_HANDLE;
     }
     let Some(provider_irp) = work.provider_irp else {

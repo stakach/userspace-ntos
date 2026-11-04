@@ -33,6 +33,7 @@ static mut AUXILIARY: SourceIrpAuxiliaryLedger = SourceIrpAuxiliaryLedger::new()
 static mut SCSI_CHILDREN: ScsiSourceRetentionLedger = ScsiSourceRetentionLedger::new();
 static IOREUSE_REFUSAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static IOREUSE_SCSI_SUCCESS_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static SCSI_AFTER_CALLBACK_REFUSAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static mut CALLER_PROJECTIONS: Option<Vec<CallerProjection>> = None;
 static mut CALLER_ACKS: Option<Vec<CallerTerminalAck>> = None;
 
@@ -418,6 +419,19 @@ fn scsi_after_callback_phase(
             | ScsiSourcePhase::SourceCompleted | ScsiSourcePhase::ReadyToRelease))
 }
 
+/// A source use can be reused only after copyback publication. Keep the first
+/// failed retained-identity gate visible without changing its admission rule.
+fn trace_scsi_after_callback_refusal(stage: u64, children: ScsiSourceChildren) {
+    if SCSI_AFTER_CALLBACK_REFUSAL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 4 { return; }
+    print_str(b"[scsi-after-callback-refusal] stage/irp/use=");
+    print_u64(stage);
+    print_str(b"/");
+    print_hex64(children.source.component_address);
+    print_str(b"/");
+    print_u64(children.use_ticket.epoch().get());
+    print_str(b"\n");
+}
+
 pub(super) fn scsi_children_match_after_callback(
     instance_index: usize, children: ScsiSourceChildren,
     stack_lease: Option<hosted_source_stack_lease::SourceStackLeaseId>,
@@ -425,40 +439,72 @@ pub(super) fn scsi_children_match_after_callback(
 ) -> bool {
     let _guard = lock();
     let deferred_free_requested = ledger().deferred_free_requested(children.ticket);
-    if !scsi_children().contains_exact(children)
-        || !scsi_after_callback_phase(
+    if !scsi_children().contains_exact(children) {
+        trace_scsi_after_callback_refusal(1, children);
+        return false;
+    }
+    if !scsi_after_callback_phase(
             scsi_children().phase(children.use_ticket),
             deferred_free_requested,
-        )
-        || !ledger().admits_forward(children.ticket, children.source)
-    { return false; }
-    let Some(inst) = instance(instance_index) else { return false; };
-    if instance_domain_identity(inst) != Some(children.source.domain) { return false; }
-    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        ) {
+        trace_scsi_after_callback_refusal(2, children);
+        return false;
+    }
+    if !ledger().admits_forward(children.ticket, children.source) {
+        trace_scsi_after_callback_refusal(3, children);
+        return false;
+    }
+    let Some(inst) = instance(instance_index) else {
+        trace_scsi_after_callback_refusal(4, children);
         return false;
     };
-    (unsafe { scsi_registered_pool_matches_unlocked(inst, children.source) })
-        && (deferred_free_requested ||
-            match children.srb {
+    if instance_domain_identity(inst) != Some(children.source.domain) {
+        trace_scsi_after_callback_refusal(5, children);
+        return false;
+    }
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        trace_scsi_after_callback_refusal(6, children);
+        return false;
+    };
+    if !(unsafe { scsi_registered_pool_matches_unlocked(inst, children.source) }) {
+        trace_scsi_after_callback_refusal(7, children);
+        return false;
+    }
+    if !(deferred_free_requested || match children.srb {
                 nt_io_manager::scsi_source_retention::ScsiSrbSource::Pool(pool) => unsafe {
                     exact_pool_identity_unlocked(inst, pool.component_address, 0x58) == Some(pool)
                 },
                 nt_io_manager::scsi_source_retention::ScsiSrbSource::Stack { .. } => true,
-            })
-        && (deferred_free_requested || children.sense.is_none_or(|sense| unsafe {
+            }) {
+        trace_scsi_after_callback_refusal(8, children);
+        return false;
+    }
+    if !(deferred_free_requested || children.sense.is_none_or(|sense| unsafe {
             scsi_sense_matches_unlocked(inst, sense, children.sense_length)
-        }))
-        && (deferred_free_requested || children.mdl.is_none_or(|mdl| unsafe {
+        })) {
+        trace_scsi_after_callback_refusal(9, children);
+        return false;
+    }
+    if !(deferred_free_requested || children.mdl.is_none_or(|mdl| unsafe {
             mdl_identity_retained_matches_unlocked(inst, children.source.domain, mdl)
-        }))
-        && (deferred_free_requested || children.data.is_none_or(|data| match data {
+        })) {
+        trace_scsi_after_callback_refusal(10, children);
+        return false;
+    }
+    if !(deferred_free_requested || children.data.is_none_or(|data| match data {
             SourceMemoryIdentity::Pool { .. } => unsafe {
                 memory_identity_matches_unlocked(instance_index, inst, data)
             },
             SourceMemoryIdentity::MappedRange { .. } => true,
-        }))
-        && scsi_data_stack_matches(children, data_stack_lease)
-        && match children.srb {
+        })) {
+        trace_scsi_after_callback_refusal(11, children);
+        return false;
+    }
+    if !scsi_data_stack_matches(children, data_stack_lease) {
+        trace_scsi_after_callback_refusal(12, children);
+        return false;
+    }
+    if !(match children.srb {
             nt_io_manager::scsi_source_retention::ScsiSrbSource::Pool(_) => true,
             nt_io_manager::scsi_source_retention::ScsiSrbSource::Stack { range, component_address } =>
                 stack_lease.is_some_and(|lease| unsafe {
@@ -472,7 +518,11 @@ pub(super) fn scsi_children_match_after_callback(
                         component_address,
                     )
                 }),
-        }
+        }) {
+        trace_scsi_after_callback_refusal(13, children);
+        return false;
+    }
+    true
 }
 
 pub(super) fn abandon_scsi_children(children: ScsiSourceChildren) -> bool {
