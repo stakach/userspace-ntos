@@ -141,6 +141,35 @@ fn exact_read_capacity_reads_and_flush_are_proven_nonmutating() {
 }
 
 #[test]
+fn source_backed_scsi_inquiry_shapes_do_not_mutate_installed_media() {
+    let mut standard = srb(6, 0x12, 0x48, 36);
+    standard[0x4c] = 36;
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&standard),
+        PossibleScsiEffect::ProvenReadOnly);
+
+    let mut vpd = srb(6, 0x12, 0x148, 512);
+    vpd[0x49] = 1; // EVPD
+    vpd[0x4a] = 0x8f; // token limits page
+    vpd[0x4c] = 255; // transfer buffer can be larger than CDB allocation
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&vpd),
+        PossibleScsiEffect::ProvenReadOnly);
+
+    for changed in [
+        { let mut x = vpd; x[0x0a] = 10; x },
+        { let mut x = vpd; x[0x0c..0x10].copy_from_slice(&0x80u32.to_le_bytes()); x },
+        { let mut x = vpd; x[0x0c..0x10].copy_from_slice(&0x248u32.to_le_bytes()); x },
+        { let mut x = vpd; x[0x10..0x14].fill(0); x },
+        { let mut x = vpd; x[0x49] = 2; x },
+        { let mut x = vpd; x[0x4b] = 1; x },
+        { let mut x = vpd; x[0x4d] = 1; x },
+        { let mut x = standard; x[0x4a] = 1; x },
+    ] {
+        assert_eq!(PossibleScsiEffect::from_legacy_srb(&changed),
+            PossibleScsiEffect::PossiblyMutating);
+    }
+}
+
+#[test]
 fn exact_class_device_claim_does_not_mutate_media_or_transfer_write_authority() {
     // The pinned LiberNT ClassClaimDevice zero-initializes the SRB and sets only Length and
     // SRB_FUNCTION_CLAIM_DEVICE before filling the pointer fields stripped by the wire owner.

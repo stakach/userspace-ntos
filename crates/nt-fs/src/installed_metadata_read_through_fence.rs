@@ -74,6 +74,21 @@ impl PossibleScsiEffect {
         let data_len = u32::from_le_bytes(srb[0x10..0x14].try_into().unwrap());
         let cdb: &[u8; 16] = srb[0x48..0x58].try_into().unwrap();
         match cdb[0] {
+            0x12 if cdb_len == 6 => {
+                // INQUIRY only reports standard/VPD properties. LiberNT uses data-in plus
+                // optional synchronous-transfer and queue-freeze policy flags; its receive
+                // buffer may exceed the six-byte CDB allocation length.
+                let inquiry_flags = DATA_IN | 0x08 | 0x100;
+                if flags & DATA_IN != 0
+                    && flags & !inquiry_flags == 0
+                    && data_len != 0
+                    && cdb[1] <= 1
+                    && (cdb[1] == 1 || cdb[2] == 0)
+                    && cdb[3] == 0
+                    && cdb[4] != 0
+                    && cdb[5..].iter().all(|byte| *byte == 0)
+                { Self::ProvenReadOnly } else { Self::PossiblyMutating }
+            }
             0x28 | 0x2a if cdb_len == 10 => {
                 let lba = u32::from_be_bytes(cdb[2..6].try_into().unwrap()) as u64;
                 let sectors = u16::from_be_bytes(cdb[7..9].try_into().unwrap()) as u32;

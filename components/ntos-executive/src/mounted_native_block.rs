@@ -449,7 +449,7 @@ pub(super) unsafe fn before_external_scsi_effect(
         print_u64(u64::from(projection.major));
         print_str(b"/");
         print_u64(match &projection.parameters {
-            IoParameters::Scsi(parameters) => u64::from(parameters.srb[0x48]),
+            IoParameters::Scsi(parameters) => u64::from(parameters.srb.get(0x48).copied().unwrap_or(0)),
             IoParameters::DeviceControl(parameters)
             | IoParameters::InternalDeviceControl(parameters) => u64::from(parameters.ioctl_code),
             _ => 0,
@@ -466,6 +466,22 @@ pub(super) unsafe fn before_external_scsi_effect(
             | IoParameters::InternalDeviceControl(parameters) => u64::from(parameters.output_len),
             _ => 0,
         });
+        if let IoParameters::Scsi(parameters) = &projection.parameters {
+            print_str(b" srb cdb-len/flags/transfer/cdb1/cdb2/cdb3/cdb4/cdb5=");
+            print_u64(u64::from(parameters.srb.get(0x0a).copied().unwrap_or(0)));
+            print_str(b"/");
+            print_u64(parameters.srb.get(0x0c..0x10)
+                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                .map(u32::from_le_bytes).unwrap_or(0) as u64);
+            print_str(b"/");
+            print_u64(parameters.srb.get(0x10..0x14)
+                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                .map(u32::from_le_bytes).unwrap_or(0) as u64);
+            for offset in 0x49..=0x4d {
+                print_str(b"/");
+                print_u64(u64::from(parameters.srb.get(offset).copied().unwrap_or(0)));
+            }
+        }
         print_str(b"\n");
     }
 }
