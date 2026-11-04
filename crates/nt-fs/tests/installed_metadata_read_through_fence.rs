@@ -123,6 +123,29 @@ fn exact_read_capacity_reads_and_flush_are_proven_nonmutating() {
 }
 
 #[test]
+fn exact_class_device_claim_does_not_mutate_media_or_transfer_write_authority() {
+    // The pinned LiberNT ClassClaimDevice zero-initializes the SRB and sets only Length and
+    // SRB_FUNCTION_CLAIM_DEVICE before filling the pointer fields stripped by the wire owner.
+    let mut claim = srb(0, 0, 0, 0);
+    claim[2] = 1;
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&claim),
+        PossibleScsiEffect::ProvenReadOnly);
+
+    let mut malformed = claim;
+    malformed[0x0a] = 10;
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&malformed),
+        PossibleScsiEffect::PossiblyMutating);
+    let mut malformed = claim;
+    malformed[0x10..0x14].copy_from_slice(&512u32.to_le_bytes());
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&malformed),
+        PossibleScsiEffect::PossiblyMutating);
+    let mut release = claim;
+    release[2] = 2; // RELEASE_DEVICE can transfer subsequent write authority.
+    assert_eq!(PossibleScsiEffect::from_legacy_srb(&release),
+        PossibleScsiEffect::PossiblyMutating);
+}
+
+#[test]
 fn exact_write_10_and_16_report_checked_physical_ranges() {
     let mut write10 = srb(10, 0x2a, 0x80, 3 * 512);
     write10[0x4a..0x4e].copy_from_slice(&4096u32.to_be_bytes());

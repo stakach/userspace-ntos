@@ -46,10 +46,17 @@ impl PossibleScsiEffect {
         const DATA_IN: u32 = 0x40;
         if srb.len() != LEGACY_BYTES
             || u16::from_le_bytes([srb[0], srb[1]]) as usize != LEGACY_BYTES
-            || srb[2] != 0 // SRB_FUNCTION_EXECUTE_SCSI
         {
             return Self::PossiblyMutating;
         }
+        if srb[2] == 1 { // SRB_FUNCTION_CLAIM_DEVICE
+            let mut exact = [0; LEGACY_BYTES];
+            exact[0..2].copy_from_slice(&(LEGACY_BYTES as u16).to_le_bytes());
+            exact[2] = 1;
+            return if srb == exact { Self::ProvenReadOnly }
+                else { Self::PossiblyMutating };
+        }
+        if srb[2] != 0 { return Self::PossiblyMutating; } // SRB_FUNCTION_EXECUTE_SCSI
         let cdb_len = srb[0x0a];
         let flags = u32::from_le_bytes(srb[0x0c..0x10].try_into().unwrap());
         let data_len = u32::from_le_bytes(srb[0x10..0x14].try_into().unwrap());
