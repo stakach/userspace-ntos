@@ -202,6 +202,8 @@ mod scsi_srb_scheduler_service;
 use scsi_srb_scheduler_service::SchedulerServicePhase;
 #[path = "scsi_srb_pump_owner.rs"]
 mod scsi_srb_pump_owner;
+#[path = "scsi_srb_owner_tcb_trace.rs"]
+mod scsi_srb_owner_tcb_trace;
 use scsi_srb_pump_owner::{ScsiSrbPumpOwnerIdentity, ScsiSrbPumpOwners, ScsiSrbPumpStage};
 
 pub(crate) fn print_hosted_file_rpc_phase() {
@@ -73010,6 +73012,7 @@ fn print_scsi_srb_pump_timing() {
         print_str(b" phase=");
         print_str(stage.map_or(b"none".as_slice(), ScsiSrbPumpStage::label));
         print_str(b"\n");
+        scsi_srb_owner_tcb_trace::print(&owner);
     }
 }
 
