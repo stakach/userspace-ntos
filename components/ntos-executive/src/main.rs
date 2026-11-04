@@ -146,6 +146,7 @@ mod section_metadata_work;
 mod process_image_snapshot_work;
 mod hosted_spawn_uncertainty;
 mod section_pagein_work;
+mod native_image_pagein_work;
 pub(crate) use fs_loader::*;
 mod hosted_bootstrap;
 mod installed_layout;
@@ -6699,7 +6700,7 @@ pub(crate) static DRAIN_DUE_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SCHED_RUNTIME_READ_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to independently timed wake paths;
 /// one of them owns the whole boot, so they are timed individually.
-pub(crate) const SUBDRAIN_N: usize = 25;
+pub(crate) const SUBDRAIN_N: usize = 26;
 pub(crate) static SUBDRAIN_TICKS: [AtomicU64; SUBDRAIN_N] =
     [const { AtomicU64::new(0) }; SUBDRAIN_N];
 pub(crate) static SUBDRAIN_WOKEN: [AtomicU64; SUBDRAIN_N] =
@@ -17408,6 +17409,7 @@ unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
         + subdrain!(18, section_metadata_work::wake_due(now_100ns))
         + subdrain!(24, process_image_snapshot_work::wake_due(now_100ns))
         + subdrain!(20, section_pagein_work::wake_due(now_100ns))
+        + subdrain!(25, native_image_pagein_work::wake_due(now_100ns))
         + subdrain!(19, provider_section_broker::wake_due(now_100ns))
         + subdrain!(21, provider_directory_broker::wake_due(now_100ns))
         + subdrain!(22, native_directory_open_work::wake_due(now_100ns))
@@ -18600,6 +18602,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         || process_image_snapshot_work::has_thread(tid)
         || hosted_spawn_uncertainty::has_thread(tid)
         || section_pagein_work::has_thread(tid)
+        || native_image_pagein_work::has_thread(tid)
     {
         return false;
     }
@@ -18644,6 +18647,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         || process_image_snapshot_work::has_thread(tid)
         || hosted_spawn_uncertainty::has_thread(tid)
         || section_pagein_work::has_thread(tid)
+        || native_image_pagein_work::has_thread(tid)
     {
         return false;
     }
@@ -18769,6 +18773,7 @@ unsafe fn terminate_hosted_process_mechanisms(
         || process_image_snapshot_work::has_process(process_index as usize, preserve_tid)
         || hosted_spawn_uncertainty::has_process(process_index as usize, preserve_tid)
         || section_pagein_work::has_process(process_index as usize, preserve_tid)
+        || native_image_pagein_work::has_process(process_index as usize, preserve_tid)
     {
         return 0;
     }

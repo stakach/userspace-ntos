@@ -80,6 +80,7 @@ struct SourceIo<'a> {
     handler: &'a ExecNtHandler,
     view: NativeImageViewDescriptor,
     revoke_acked: &'a mut bool,
+    acknowledged_page: Option<&'a [u8; 4096]>,
 }
 impl ImageSourcePageIo<SourceKey> for SourceIo<'_> {
     fn acquire(&mut self, _: SourceKey) -> Result<InstallationCap, u32> {
@@ -94,13 +95,12 @@ impl ImageSourcePageIo<SourceKey> for SourceIo<'_> {
         if key.area != self.view.view.area() || !source.has_readable_image() {
             return InstallationEffect::Refused(INVALID);
         }
-        let plan = match source
-            .layout
-            .image_page_fill_plan(key.rva, source.backing.file_extent)
-        {
-            Ok(plan) => plan,
-            Err(_) => return InstallationEffect::Refused(INVALID),
-        };
+        let plan = if self.acknowledged_page.is_none() {
+            match source.layout.image_page_fill_plan(key.rva, source.backing.file_extent) {
+                Ok(plan) => Some(plan),
+                Err(_) => return InstallationEffect::Refused(INVALID),
+            }
+        } else { None };
         let mut wrote = false;
         let result = unsafe {
             temporary_frame_alias::with_scratch_range(
@@ -113,15 +113,20 @@ impl ImageSourcePageIo<SourceKey> for SourceIo<'_> {
                     // therefore retains this initializer owner rather than replaying it.
                     wrote = true;
                     let page = core::slice::from_raw_parts_mut(address as *mut u8, 4096);
-                    plan.read_into_page(page, |offset, output| {
-                        source.read_exact(self.handler, key.area, offset, output)?;
-                        Ok::<usize, u32>(output.len())
-                    })
-                    .map_err(|error| match error {
-                        nt_pe_loader::ImagePageReadError::Read(status) => status,
-                        nt_pe_loader::ImagePageReadError::ShortRead { .. } => 0xc000_0185,
-                        nt_pe_loader::ImagePageReadError::InvalidPageSize(_) => INVALID,
-                    })
+                    if let Some(acknowledged_page) = self.acknowledged_page {
+                        page.copy_from_slice(acknowledged_page);
+                        Ok(())
+                    } else {
+                        plan.as_ref().unwrap().read_into_page(page, |offset, output| {
+                            source.read_exact(self.handler, key.area, offset, output)?;
+                            Ok::<usize, u32>(output.len())
+                        })
+                        .map_err(|error| match error {
+                            nt_pe_loader::ImagePageReadError::Read(status) => status,
+                            nt_pe_loader::ImagePageReadError::ShortRead { .. } => 0xc000_0185,
+                            nt_pe_loader::ImagePageReadError::InvalidPageSize(_) => INVALID,
+                        })
+                    }
                 },
             )
         };
@@ -163,10 +168,33 @@ fn release_source(
     }
 }
 
+pub(crate) unsafe fn has_source_row(area: ImageAreaId, rva: u32) -> bool {
+    (&*core::ptr::addr_of!(SOURCES)).iter().any(|row|
+        row.owner.descriptor() == SourceKey { area, rva })
+}
+
+pub(crate) unsafe fn ensure_source_page_from_acknowledged_bytes(
+    handler: &ExecNtHandler,
+    view: NativeImageViewDescriptor,
+    rva: u32,
+    bytes: &[u8; 4096],
+) -> Result<u64, u32> {
+    ensure_source_page_inner(handler, view, rva, Some(bytes))
+}
+
 unsafe fn ensure_source_page(
     handler: &ExecNtHandler,
     view: NativeImageViewDescriptor,
     rva: u32,
+) -> Result<u64, u32> {
+    ensure_source_page_inner(handler, view, rva, None)
+}
+
+unsafe fn ensure_source_page_inner(
+    handler: &ExecNtHandler,
+    view: NativeImageViewDescriptor,
+    rva: u32,
+    acknowledged_page: Option<&[u8; 4096]>,
 ) -> Result<u64, u32> {
     let key = SourceKey {
         area: view.view.area(),
@@ -194,6 +222,7 @@ unsafe fn ensure_source_page(
         handler,
         view,
         revoke_acked: &mut row.revoke_acked,
+        acknowledged_page,
     }) {
         ImageSourcePageOutcome::Ready(frame) => Ok(frame.cap),
         ImageSourcePageOutcome::Failed(status) => {

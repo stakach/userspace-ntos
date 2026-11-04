@@ -9892,6 +9892,7 @@ pub(crate) unsafe fn service_sec_image(
                 && crate::section_metadata_work::next_deadline().is_none()
                 && crate::process_image_snapshot_work::next_deadline().is_none()
                 && crate::section_pagein_work::next_deadline().is_none()
+                && crate::native_image_pagein_work::next_deadline().is_none()
                 && crate::provider_section_broker::next_deadline().is_none()
                 && !crate::native_directory_open_work::occupied()
                 && !crate::native_file_target_open_work::occupied()
@@ -10081,6 +10082,7 @@ pub(crate) unsafe fn service_sec_image(
                 ntdll, fault_ep, procs, exe_images, &*exe_image_catalog,
                 hosted_loaded_images_ptr);
             crate::section_pagein_work::redrive(&mut nt_handler);
+            crate::native_image_pagein_work::redrive(&mut nt_handler);
             crate::provider_section_broker::redrive(nt_handler as *mut _);
             crate::provider_directory_broker::redrive(nt_handler as *mut _);
             crate::provider_mm_section_objects::redrive(nt_handler as *mut _);
@@ -11830,6 +11832,30 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(status);
                     print_str(b"\n");
                     park_and_log!(pi, b"private-page", m0, addr);
+                }
+            }
+            match crate::native_image_pagein_work::submit(
+                &mut nt_handler, pi, page, vm_fault_access_from_x86_error(m3),
+                nt_address_space::ImageFaultObservation::from_x86_error(m3),
+            ) {
+                Ok(true) => {
+                    crate::native_image_pagein_work::redrive(&mut nt_handler);
+                    let _ = finalize_service_loop_state(&mut nt_handler);
+                    let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    badge = received.0;
+                    mi = received.1;
+                    m0 = received.2;
+                    m1 = received.3;
+                    m2 = received.4;
+                    m3 = received.5;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(status) => {
+                    print_str(b"[native-image] deferred fault admission failed status=0x");
+                    print_hex(status);
+                    print_str(b"\n");
+                    park_and_log!(pi, b"native-image-pagein-admission", m0, addr);
                 }
             }
             match nt_handler.service_native_image_page_residency(

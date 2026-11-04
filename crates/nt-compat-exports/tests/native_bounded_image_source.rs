@@ -123,6 +123,72 @@ fn routed_process_snapshot_retains_pending_file_reads_before_process_publication
 }
 
 #[test]
+fn routed_dll_fault_retains_pending_read_until_page_and_reply_are_safe() {
+    let fault_loop = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/service_sec_image.rs"),
+    ).unwrap();
+    let deferred = fault_loop.find("native_image_pagein_work::submit(")
+        .expect("retained routed DLL fault must park its original Reply before provider READ");
+    let synchronous = fault_loop.find("match nt_handler.service_native_image_page_residency(")
+        .expect("local and already resident image pages retain the synchronous root fault path");
+    assert!(deferred < synchronous,
+        "a pending installed DLL READ must not enter synchronous source-page initialization");
+
+    let worker_text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/native_image_pagein_work.rs"),
+    ).expect("native image page-in worker");
+    let worker = syn::parse_file(&worker_text).expect("parsed native image page-in worker");
+    let mut audited = Audit::default();
+    audited.visit_file(&worker);
+    for required in ["prepare", "commit", "new_at", "next_span",
+        "bind_pending", "completed_irp_exact", "copy_completed_irp_output_exact",
+        "terminal", "copy_fragment", "acknowledge_completed_irp_strict",
+        "acknowledge", "accept_acknowledged_span", "completed_page"] {
+        assert!(has(&audited, required),
+            "pending DLL page worker must retain exact I/O and accept only ACKed spans: {required}");
+    }
+    for required in ["RootReplyPark", "RoutedImageRead", "ImagePageFillCapture",
+        "capture_process_identity", "source_for_view", "capture_owned"] {
+        assert!(worker_text.contains(required),
+            "page worker must retain and revalidate the fault, source and File: {required}");
+    }
+}
+
+#[test]
+fn cancelled_dll_page_read_keeps_exact_key_through_copy_and_ack() {
+    use nt_memory_manager::routed_image_read::RoutedImageRead;
+
+    let mut read = RoutedImageRead::<_, u64, _>::new_at(17, 0, 4, 4, "captured File")
+        .unwrap();
+    read.enter_window().unwrap();
+    assert!(read.bind_pending(41));
+    assert!(read.terminal(41, 0, 4));
+    assert_eq!(read.pending_key(), Some(41),
+        "a terminal IRP remains the pending owner during copying");
+    assert_eq!(read.copy_position(), Some((41, 0, 4)));
+    read = read.abort_ready().err().expect("cancellation cannot withdraw an unacked IRP");
+    assert!(read.copy_fragment(41, 0, b"data"));
+    assert_eq!(read.acknowledgment_key(), Some(41));
+    assert_eq!(read.pending_key(), Some(41),
+        "the same IRP remains owned until strict ACK");
+    read = read.abort_ready().err().expect("cancellation must still wait for strict ACK");
+    assert!(read.acknowledge(41));
+    assert_eq!(read.pending_key(), None);
+    assert_eq!(read.into_terminal().ok().unwrap().1.unwrap(), b"data");
+
+    let worker = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/native_image_pagein_work.rs"),
+    ).unwrap();
+    assert!(worker.contains("if cancelled && read.pending_key().is_none()")
+        && worker.contains("abort_ready()")
+        && worker.contains("acknowledge_completed_irp_strict"),
+        "the worker may withdraw only a Ready owner and must ACK an entered IRP");
+}
+
+#[test]
 fn routed_process_parent_is_pinned_after_one_access_admission() {
     use nt_process::{native_handle::{PsHandleType, STATUS_NOT_SUPPORTED}, HandleObject,
         ProcessManager, PROCESS_CREATE_PROCESS, STATUS_ACCESS_DENIED};
