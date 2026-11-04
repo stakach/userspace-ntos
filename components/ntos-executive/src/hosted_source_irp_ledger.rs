@@ -1421,11 +1421,13 @@ struct IrpMutationDiagnostic {
     ticket_generation: u64,
     mutation_error: u8,
     auxiliary_present: u8,
+    free_requested: u8,
+    scsi_phase: u8,
 }
 
 fn trace_ioreuse_refusal(instance_index: usize, irp: u64, diagnostic: &IrpMutationDiagnostic) {
     if IOREUSE_REFUSAL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 4 { return; }
-    print_str(b"[ioreuse-refusal] stage/instance/irp/pool-gen/owner/ticket/gen/mutation/aux=");
+    print_str(b"[ioreuse-refusal] stage/instance/irp/pool-gen/owner/ticket/gen/mutation/aux/free/scsi-phase=");
     print_str(diagnostic.stage);
     print_str(b"/");
     print_u64(instance_index as u64);
@@ -1443,6 +1445,10 @@ fn trace_ioreuse_refusal(instance_index: usize, irp: u64, diagnostic: &IrpMutati
     print_u64(u64::from(diagnostic.mutation_error));
     print_str(b"/");
     print_u64(u64::from(diagnostic.auxiliary_present));
+    print_str(b"/");
+    print_u64(u64::from(diagnostic.free_requested));
+    print_str(b"/");
+    print_u64(u64::from(diagnostic.scsi_phase));
     print_str(b"\n");
 }
 
@@ -1560,6 +1566,19 @@ fn mutate_local_irp_packet_inner(
                 Err(_) => 4,
             };
             if mutation.is_err() {
+                use nt_io_manager::scsi_source_retention::ScsiSourcePhase;
+                diagnostic.free_requested = u8::from(ledger().deferred_free_requested(ticket));
+                diagnostic.scsi_phase = match scsi_children().phase(ticket) {
+                    None => 0,
+                    Some(ScsiSourcePhase::Prepared) => 1,
+                    Some(ScsiSourcePhase::Entered) => 2,
+                    Some(ScsiSourcePhase::Pending) => 3,
+                    Some(ScsiSourcePhase::Uncertain) => 4,
+                    Some(ScsiSourcePhase::Terminal) => 5,
+                    Some(ScsiSourcePhase::ProviderAcknowledged) => 6,
+                    Some(ScsiSourcePhase::SourceCompleted) => 7,
+                    Some(ScsiSourcePhase::ReadyToRelease) => 8,
+                };
                 return (STATUS_INVALID_HANDLE, 0, 0);
             }
             diagnostic.stage = b"auxiliary";
