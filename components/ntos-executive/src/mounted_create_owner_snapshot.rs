@@ -2,6 +2,8 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+const UNOBSERVED: u64 = u64::MAX;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OwnerKey {
     pub table: u64,
@@ -30,6 +32,10 @@ pub(crate) struct Observation {
     pub phase: Phase,
     pub status: u64,
     pub delivery: u64,
+    pub parked_100ns: u64,
+    pub terminal_100ns: Option<u64>,
+    pub reply_100ns: Option<u64>,
+    pub ack_100ns: Option<u64>,
 }
 
 /// One latest-owner sample. Writers use a nonblocking sequence claim; nested diagnostics may
@@ -53,6 +59,10 @@ pub(crate) struct OwnerSnapshot {
     phase: AtomicU64,
     status: AtomicU64,
     delivery: AtomicU64,
+    parked_100ns: AtomicU64,
+    terminal_100ns: AtomicU64,
+    reply_100ns: AtomicU64,
+    ack_100ns: AtomicU64,
 }
 
 impl OwnerSnapshot {
@@ -68,6 +78,10 @@ impl OwnerSnapshot {
             route: AtomicU64::new(0),
             phase: AtomicU64::new(0), status: AtomicU64::new(0),
             delivery: AtomicU64::new(0),
+            parked_100ns: AtomicU64::new(UNOBSERVED),
+            terminal_100ns: AtomicU64::new(UNOBSERVED),
+            reply_100ns: AtomicU64::new(UNOBSERVED),
+            ack_100ns: AtomicU64::new(UNOBSERVED),
         }
     }
 
@@ -96,7 +110,7 @@ impl OwnerSnapshot {
     }
 
     pub(crate) fn park(&self, key: OwnerKey, pi: u64, tid: u64, badge: u64,
-        name_hash: u64, name_len: u64, route: u64) -> bool {
+        name_hash: u64, name_len: u64, route: u64, now_100ns: u64) -> bool {
         if key.table == 0 || key.generation == 0 || key.irp == 0 || key.file == 0
             || key.device == 0 || key.physical == 0 || key.logical == 0 { return false; }
         let Some(previous) = self.claim() else { return false; };
@@ -117,11 +131,16 @@ impl OwnerSnapshot {
         self.phase.store(Phase::Parked as u64, Ordering::Relaxed);
         self.status.store(0, Ordering::Relaxed);
         self.delivery.store(0, Ordering::Relaxed);
+        self.parked_100ns.store(now_100ns, Ordering::Relaxed);
+        self.terminal_100ns.store(UNOBSERVED, Ordering::Relaxed);
+        self.reply_100ns.store(UNOBSERVED, Ordering::Relaxed);
+        self.ack_100ns.store(UNOBSERVED, Ordering::Relaxed);
         self.release(previous);
         true
     }
 
-    pub(crate) fn advance(&self, key: OwnerKey, phase: Phase, status: u64, delivery: u64) -> bool {
+    pub(crate) fn advance(&self, key: OwnerKey, phase: Phase, status: u64,
+        delivery: u64, now_100ns: u64) -> bool {
         let Some(previous) = self.claim() else { return false; };
         if self.key() != key || (phase as u64) < self.phase.load(Ordering::Relaxed) {
             self.release(previous);
@@ -130,6 +149,15 @@ impl OwnerSnapshot {
         self.phase.store(phase as u64, Ordering::Relaxed);
         self.status.store(status, Ordering::Relaxed);
         self.delivery.store(delivery, Ordering::Relaxed);
+        let timestamp = match phase {
+            Phase::Parked => &self.parked_100ns,
+            Phase::Terminal => &self.terminal_100ns,
+            Phase::ReplyPublished => &self.reply_100ns,
+            Phase::BackendAcked => &self.ack_100ns,
+        };
+        if timestamp.load(Ordering::Relaxed) == UNOBSERVED {
+            timestamp.store(now_100ns, Ordering::Relaxed);
+        }
         self.release(previous);
         true
     }
@@ -152,7 +180,15 @@ impl OwnerSnapshot {
             route: self.route.load(Ordering::Relaxed),
             phase, status: self.status.load(Ordering::Relaxed),
             delivery: self.delivery.load(Ordering::Relaxed),
+            parked_100ns: self.parked_100ns.load(Ordering::Relaxed),
+            terminal_100ns: observed(self.terminal_100ns.load(Ordering::Relaxed)),
+            reply_100ns: observed(self.reply_100ns.load(Ordering::Relaxed)),
+            ack_100ns: observed(self.ack_100ns.load(Ordering::Relaxed)),
         };
         (self.sequence.load(Ordering::Acquire) == before).then_some(observation)
     }
+}
+
+fn observed(timestamp: u64) -> Option<u64> {
+    (timestamp != UNOBSERVED).then_some(timestamp)
 }

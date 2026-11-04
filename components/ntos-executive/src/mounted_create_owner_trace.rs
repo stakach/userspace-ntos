@@ -5,6 +5,15 @@ use crate::mounted_create_owner_snapshot::{OwnerKey, OwnerSnapshot, Phase};
 
 static LAST: OwnerSnapshot = OwnerSnapshot::new();
 static PARK_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static ACK_TIMING_SAMPLES: AtomicU64 = AtomicU64::new(0);
+const ACK_TIMING_SAMPLE_LIMIT: u64 = 64;
+
+fn print_elapsed_ms(start: Option<u64>, end: Option<u64>) {
+    match start.zip(end).and_then(|(start, end)| end.checked_sub(start)) {
+        Some(elapsed) => crate::print_u64(elapsed / 10_000),
+        None => crate::print_str(b"-"),
+    }
+}
 
 fn name_fingerprint(units: &[u16]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -55,9 +64,11 @@ pub(super) unsafe fn park_exact(
         generation: identity.generation(), irp, file: file_id, device,
         physical: physical.value(), logical: logical.value(),
     };
-    if !LAST.park(key, pending.pi as u64, pending.tid, pending.badge, hash, name_len, route) { return; }
+    let parked_100ns = crate::monotonic_time_100ns();
+    if !LAST.park(key, pending.pi as u64, pending.tid, pending.badge,
+        hash, name_len, route, parked_100ns) { return; }
     let n = PARK_SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= 32 || n.is_power_of_two() {
+    if n <= ACK_TIMING_SAMPLE_LIMIT || n.is_power_of_two() {
         crate::print_str(b"[mounted-create-owner] parked irp/file/device/mount/owner=");
         crate::print_hex_u64(irp);
         crate::print_str(b"/");
@@ -72,6 +83,8 @@ pub(super) unsafe fn park_exact(
         crate::print_u64(identity.generation());
         crate::print_str(b" route=");
         crate::print_u64(route);
+        crate::print_str(b" t_ms=");
+        crate::print_u64(parked_100ns / 10_000);
         crate::print_str(b" name-hash=");
         crate::print_hex_u64(hash);
         crate::print_str(b" name=\"");
@@ -97,7 +110,33 @@ unsafe fn advance_exact(
     let key = observation.key;
     if key.table != identity.table() || key.slot != identity.slot() as u64
         || key.generation != identity.generation() || key.irp != irp || key.file != file { return; }
-    let _ = LAST.advance(key, phase, u64::from(status), u64::from(pending.delivery_state));
+    let now_100ns = crate::monotonic_time_100ns();
+    if !LAST.advance(key, phase, u64::from(status), u64::from(pending.delivery_state), now_100ns)
+        || phase != Phase::BackendAcked
+        || observation.phase == Phase::BackendAcked
+    { return; }
+    let Some(sample) = LAST.read() else { return; };
+    if sample.key != key || sample.phase != Phase::BackendAcked { return; }
+    if ACK_TIMING_SAMPLES.fetch_add(1, Ordering::Relaxed) >= ACK_TIMING_SAMPLE_LIMIT { return; }
+    crate::print_str(b"[mounted-create-timing] irp/file/tid/status/park-terminal-ms/terminal-reply-ms/reply-ack-ms/total-ms/t_ms=");
+    crate::print_hex_u64(sample.key.irp);
+    crate::print_str(b"/");
+    crate::print_hex_u64(sample.key.file);
+    crate::print_str(b"/");
+    crate::print_u64(sample.tid);
+    crate::print_str(b"/");
+    crate::print_hex_u64(sample.status);
+    crate::print_str(b"/");
+    print_elapsed_ms(Some(sample.parked_100ns), sample.terminal_100ns);
+    crate::print_str(b"/");
+    print_elapsed_ms(sample.terminal_100ns, sample.reply_100ns);
+    crate::print_str(b"/");
+    print_elapsed_ms(sample.reply_100ns, sample.ack_100ns);
+    crate::print_str(b"/");
+    print_elapsed_ms(Some(sample.parked_100ns), sample.ack_100ns);
+    crate::print_str(b"/");
+    crate::print_u64(now_100ns / 10_000);
+    crate::print_str(b"\n");
 }
 
 pub(super) unsafe fn terminal_exact(
