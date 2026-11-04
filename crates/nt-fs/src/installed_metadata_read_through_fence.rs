@@ -104,6 +104,13 @@ impl PossibleScsiEffect {
                 let sectors = u32::from_be_bytes(cdb[10..14].try_into().unwrap());
                 Self::checked_transfer(*cdb, flags, data_len, lba, sectors, true)
             }
+            0x25 if cdb_len == 10 && flags == 0x20_0148 && data_len == 8 => {
+                // READ CAPACITY(10), with only LiberNT's observed receive and
+                // port policy flags. PMI/LBA and control bytes must be zero.
+                let mut expected = [0; 16];
+                expected[0] = 0x25;
+                if *cdb == expected { Self::ProvenReadOnly } else { Self::PossiblyMutating }
+            }
             0x9e if cdb_len == 16 && flags == DATA_IN && data_len == 32 => {
                 let mut expected = [0; 16];
                 expected[0] = 0x9e;
@@ -200,5 +207,47 @@ impl<D: Eq, R: Eq> InstalledMetadataReadThroughFence<D, R> {
         if !harmless {
             self.poisoned.store(true, Ordering::SeqCst);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PossibleScsiEffect;
+
+    #[test]
+    fn read_capacity_ten_with_native_policy_flags_preserves_metadata_read_through() {
+        let mut srb = [0u8; 0x58];
+        srb[0..2].copy_from_slice(&0x58u16.to_le_bytes());
+        srb[0x0a] = 10;
+        srb[0x0c..0x10].copy_from_slice(&0x20_0148u32.to_le_bytes());
+        srb[0x10..0x14].copy_from_slice(&8u32.to_le_bytes());
+        srb[0x48] = 0x25;
+        assert_eq!(PossibleScsiEffect::from_legacy_srb(&srb),
+            PossibleScsiEffect::ProvenReadOnly);
+
+        let mut malformed = srb;
+        malformed[0x0a] = 9;
+        assert_eq!(PossibleScsiEffect::from_legacy_srb(&malformed),
+            PossibleScsiEffect::PossiblyMutating);
+
+        malformed = srb;
+        malformed[0x0c..0x10].copy_from_slice(&0x20_0108u32.to_le_bytes()); // no DATA_IN
+        assert_eq!(PossibleScsiEffect::from_legacy_srb(&malformed),
+            PossibleScsiEffect::PossiblyMutating);
+
+        malformed = srb;
+        malformed[0x0c..0x10].copy_from_slice(&0x20_0149u32.to_le_bytes()); // unknown bit
+        assert_eq!(PossibleScsiEffect::from_legacy_srb(&malformed),
+            PossibleScsiEffect::PossiblyMutating);
+
+        malformed = srb;
+        malformed[0x10..0x14].copy_from_slice(&9u32.to_le_bytes());
+        assert_eq!(PossibleScsiEffect::from_legacy_srb(&malformed),
+            PossibleScsiEffect::PossiblyMutating);
+
+        malformed = srb;
+        malformed[0x49] = 1;
+        assert_eq!(PossibleScsiEffect::from_legacy_srb(&malformed),
+            PossibleScsiEffect::PossiblyMutating);
     }
 }
