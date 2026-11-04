@@ -10891,9 +10891,9 @@ extern "win64" fn s_io_allocate_mdl(
     irp: u64,
 ) -> u64 {
     unsafe {
-        if virtual_address == 0 || length == 0 {
+        let Some(mdl_bytes) = nt_mdl::mdl_allocation_size(virtual_address, length) else {
             return 0;
-        }
+        };
         let link = if irp == 0 {
             None
         } else {
@@ -10907,12 +10907,15 @@ extern "win64" fn s_io_allocate_mdl(
                 if current == 0 {
                     break;
                 }
-                if count == 256
-                    || component_pool_allocation_capacity(current)
-                        .is_none_or(|capacity| capacity < nt_mdl::MDL_SIZE as u64)
-                    || read_unaligned((current + nt_mdl::MDL_OFF_SIZE) as *const i16)
-                        != nt_mdl::MDL_SIZE as i16
-                {
+                let Some(capacity) = component_pool_allocation_capacity(current) else {
+                    return 0;
+                };
+                if capacity < nt_mdl::MDL_SIZE as u64 {
+                    return 0;
+                }
+                let declared = read_unaligned((current + nt_mdl::MDL_OFF_SIZE) as *const i16);
+                if count == 256 || declared < nt_mdl::MDL_SIZE as i16
+                    || capacity < declared as u64 {
                     return 0;
                 }
                 slot = current + nt_mdl::MDL_OFF_NEXT;
@@ -10920,15 +10923,15 @@ extern "win64" fn s_io_allocate_mdl(
             }
             Some(slot)
         };
-        let mdl = pool_alloc(nt_mdl::MDL_SIZE as u64);
+        let mdl = pool_alloc(u64::from(mdl_bytes));
         if mdl == 0 {
             return 0;
         }
-        core::ptr::write_bytes(mdl as *mut u8, 0, nt_mdl::MDL_SIZE);
+        core::ptr::write_bytes(mdl as *mut u8, 0, usize::from(mdl_bytes));
         write_unaligned((mdl + nt_mdl::MDL_OFF_NEXT) as *mut u64, 0);
         write_unaligned(
             (mdl + nt_mdl::MDL_OFF_SIZE) as *mut i16,
-            nt_mdl::MDL_SIZE as i16,
+            mdl_bytes as i16,
         );
         write_unaligned(
             (mdl + nt_mdl::MDL_OFF_START_VA) as *mut u64,
@@ -10982,21 +10985,33 @@ extern "win64" fn s_io_build_partial_mdl(
         return;
     }
     unsafe {
-        let source_start = read_unaligned((source_mdl + nt_mdl::MDL_OFF_START_VA) as *const u64);
-        let source_offset =
-            read_unaligned((source_mdl + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32);
-        let source_len = read_unaligned((source_mdl + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32);
-        let va = if virtual_address != 0 {
-            virtual_address
-        } else {
-            source_start + source_offset as u64
+        let binding = (|| {
+            if component_pool_allocation_capacity(source_mdl)? < nt_mdl::MDL_SIZE as u64 {
+                return None;
+            }
+            let source_start = read_unaligned((source_mdl + nt_mdl::MDL_OFF_START_VA) as *const u64);
+            let source_offset =
+                read_unaligned((source_mdl + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32);
+            let source_address = source_start.checked_add(u64::from(source_offset))?;
+            let source_len = read_unaligned((source_mdl + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32);
+            let (va, len) = nt_mdl::partial_mdl_range(
+                source_address, source_len, virtual_address, length,
+            )?;
+            let target_capacity = component_pool_allocation_capacity(target_mdl)?;
+            if target_capacity < nt_mdl::MDL_SIZE as u64 {
+                return None;
+            }
+            let declared = read_unaligned((target_mdl + nt_mdl::MDL_OFF_SIZE) as *const i16);
+            let required = nt_mdl::mdl_allocation_size(va, len)?;
+            (declared >= required as i16 && target_capacity >= declared as u64)
+                .then_some((va, len))
+        })();
+        let Some((va, len)) = binding else {
+            s_ke_bug_check_ex(0xC4, 0x4D44_4C53, target_mdl, STATUS_INVALID_PARAMETER as u32 as u64,
+                hosted_thread_correlation());
+            return;
         };
-        let len = if length != 0 { length } else { source_len };
         write_unaligned((target_mdl + nt_mdl::MDL_OFF_NEXT) as *mut u64, 0);
-        write_unaligned(
-            (target_mdl + nt_mdl::MDL_OFF_SIZE) as *mut i16,
-            nt_mdl::MDL_SIZE as i16,
-        );
         write_unaligned(
             (target_mdl + nt_mdl::MDL_OFF_FLAGS) as *mut i16,
             nt_mdl::MDL_MAPPED_TO_SYSTEM_VA,
@@ -65096,16 +65111,16 @@ unsafe fn service_hosted_driver_mdl_for_instance(
             let Ok(length) = u32::try_from(length) else {
                 return STATUS_INVALID_PARAMETER;
             };
-            if virtual_address == 0 || length == 0 {
+            let Some(mdl_bytes) = nt_mdl::mdl_allocation_size(virtual_address, length) else {
                 return STATUS_INVALID_PARAMETER;
-            }
+            };
             let Some(mdl_exec) =
-                hosted_instance_pool_allocation_exec_if_live(inst, mdl, nt_mdl::MDL_SIZE as u64)
+                hosted_instance_pool_allocation_exec_if_live(inst, mdl, u64::from(mdl_bytes))
             else {
                 return STATUS_INVALID_PARAMETER;
             };
             if read_unaligned((mdl_exec + nt_mdl::MDL_OFF_SIZE) as *const i16)
-                != nt_mdl::MDL_SIZE as i16
+                != mdl_bytes as i16
                 || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_START_VA) as *const u64)
                     != virtual_address & !0xfff
                 || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32) != length
@@ -65134,7 +65149,10 @@ unsafe fn service_hosted_driver_mdl_for_instance(
             let Ok(length) = u32::try_from(length) else {
                 return STATUS_INVALID_PARAMETER;
             };
-            if virtual_address == 0 || length == 0 {
+            let Some(required_bytes) = nt_mdl::mdl_allocation_size(virtual_address, length) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            if virtual_address == 0 {
                 return STATUS_INVALID_PARAMETER;
             }
             let Some(mdl_exec) =
@@ -65142,7 +65160,11 @@ unsafe fn service_hosted_driver_mdl_for_instance(
             else {
                 return STATUS_INVALID_PARAMETER;
             };
-            if read_unaligned((mdl_exec + nt_mdl::MDL_OFF_START_VA) as *const u64)
+            let declared_bytes = read_unaligned((mdl_exec + nt_mdl::MDL_OFF_SIZE) as *const i16);
+            if declared_bytes < required_bytes as i16
+                || hosted_instance_pool_allocation_exec_if_live(inst, mdl, declared_bytes as u64)
+                    .is_none()
+                || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_START_VA) as *const u64)
                 != virtual_address & !0xfff
                 || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32) != length
                 || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32)

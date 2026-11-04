@@ -552,7 +552,9 @@ unsafe fn mdl_identity_unlocked(
     let raw_flags = read_unaligned((mdl_exec + nt_mdl::MDL_OFF_FLAGS) as *const i16);
     let raw_start = read_unaligned((mdl_exec + nt_mdl::MDL_OFF_START_VA) as *const u64);
     let raw_offset = read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32);
-    if read_unaligned((mdl_exec + nt_mdl::MDL_OFF_SIZE) as *const i16) != nt_mdl::MDL_SIZE as i16
+    let raw_size = read_unaligned((mdl_exec + nt_mdl::MDL_OFF_SIZE) as *const i16);
+    if nt_mdl::mdl_allocation_size(virtual_address, expected_length)
+        .is_none_or(|required| raw_size < required as i16 || pool.capacity < raw_size as u64)
         || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32) != expected_length
         || raw_flags & nt_mdl::MDL_PAGES_LOCKED == 0
         || raw_start.checked_add(u64::from(raw_offset)) != Some(virtual_address)

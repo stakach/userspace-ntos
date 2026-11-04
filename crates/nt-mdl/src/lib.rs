@@ -45,6 +45,43 @@ pub const MDL_OFF_BYTE_OFFSET: u64 = 44;
 /// single-page MDL adds a PFN array, but v0.1 doesn't populate it).
 pub const MDL_SIZE: usize = 48;
 
+/// Bytes needed for the public MDL header and one PFN slot per spanned page.
+/// `MDL.Size` is a signed 16-bit field; reject layouts it cannot describe.
+pub fn mdl_allocation_size(virtual_address: u64, length: u32) -> Option<u16> {
+    if length == 0 || length & 0x8000_0000 != 0 {
+        return None;
+    }
+    if virtual_address != 0 {
+        virtual_address.checked_add(u64::from(length) - 1)?;
+    }
+    let offset = virtual_address & 0xfff;
+    let pages = offset.checked_add(u64::from(length))?.checked_add(0xfff)? >> 12;
+    let bytes = (MDL_SIZE as u64).checked_add(pages.checked_mul(8)?)?;
+    (bytes <= i16::MAX as u64).then_some(bytes as u16)
+}
+
+/// Resolve a partial MDL's requested subrange before changing its public fields.
+/// A zero requested address means the source start; a zero length means the remainder.
+pub fn partial_mdl_range(
+    source_address: u64,
+    source_length: u32,
+    requested_address: u64,
+    requested_length: u32,
+) -> Option<(u64, u32)> {
+    if source_address == 0 || source_length == 0 {
+        return None;
+    }
+    source_address.checked_add(u64::from(source_length) - 1)?;
+    let address = if requested_address == 0 { source_address } else { requested_address };
+    let offset = address.checked_sub(source_address)?;
+    let remaining = u64::from(source_length).checked_sub(offset)?;
+    let length = if requested_length == 0 { remaining } else { u64::from(requested_length) };
+    if length == 0 || length > remaining || address.checked_add(length - 1).is_none() {
+        return None;
+    }
+    Some((address, length as u32))
+}
+
 // --- MdlFlags bits (WDK) -----------------------------------------------------
 
 pub const MDL_MAPPED_TO_SYSTEM_VA: i16 = 0x0001;
@@ -302,7 +339,11 @@ impl MdlRegistry {
 
     /// `MmBuildMdlForNonPagedPool` — mark the MDL as backed by locked nonpaged pool.
     pub fn build_for_nonpaged(&mut self, id: u64) -> Result<(), MdlError> {
-        self.find_mut(id).ok_or(MdlError::StaleId)?.locked = true;
+        let record = self.find_mut(id).ok_or(MdlError::StaleId)?;
+        if record.virtual_address == 0 {
+            return Err(MdlError::OutOfRange);
+        }
+        record.locked = true;
         Ok(())
     }
 
@@ -330,7 +371,7 @@ impl MdlRegistry {
     /// precondition for a DMA map (spec §12.2).
     pub fn validate_slice(&self, id: u64, offset: u64, length: u64) -> Result<(), MdlError> {
         let m = self.find(id).ok_or(MdlError::StaleId)?;
-        if !m.locked {
+        if !m.locked || m.virtual_address == 0 {
             return Err(MdlError::StaleId);
         }
         if length == 0
@@ -402,7 +443,11 @@ impl MdlRegistry {
 
     /// Record a DMA mapping against the MDL (bumps `active_mappings`).
     pub fn add_mapping(&mut self, id: u64) -> Result<(), MdlError> {
-        self.find_mut(id).ok_or(MdlError::StaleId)?.active_mappings += 1;
+        let record = self.find_mut(id).ok_or(MdlError::StaleId)?;
+        if record.virtual_address == 0 {
+            return Err(MdlError::OutOfRange);
+        }
+        record.active_mappings += 1;
         Ok(())
     }
 
@@ -431,6 +476,28 @@ impl MdlRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mdl_allocation_covers_exact_null_and_unaligned_page_spans() {
+        assert_eq!(mdl_allocation_size(0, 1), Some(56));
+        assert_eq!(mdl_allocation_size(0xfff, 1), Some(56));
+        assert_eq!(mdl_allocation_size(0xfff, 2), Some(64));
+        assert_eq!(mdl_allocation_size(0x1000, 4097), Some(64));
+        assert_eq!(mdl_allocation_size(0, 4089 * 4096), Some(32760));
+        assert_eq!(mdl_allocation_size(0, 4090 * 4096), None);
+        assert_eq!(mdl_allocation_size(0, 0), None);
+        assert_eq!(mdl_allocation_size(0, 0x8000_0000), None);
+        assert_eq!(mdl_allocation_size(u64::MAX, 2), None);
+    }
+
+    #[test]
+    fn partial_mdl_range_uses_source_remainder_and_rejects_escape() {
+        assert_eq!(partial_mdl_range(0x2000, 8192, 0, 0), Some((0x2000, 8192)));
+        assert_eq!(partial_mdl_range(0x2000, 8192, 0x3000, 0), Some((0x3000, 4096)));
+        assert_eq!(partial_mdl_range(0x2000, 8192, 0x3000, 4097), None);
+        assert_eq!(partial_mdl_range(0x2000, 8192, 0x1fff, 1), None);
+        assert_eq!(partial_mdl_range(0, 8192, 0, 1), None);
+    }
 
     #[test]
     fn alloc_records_range() {
@@ -505,6 +572,27 @@ mod tests {
         r.unlock_key(key).unwrap();
         r.free_key(key).unwrap();
         assert_eq!(r.id_for(key), None);
+    }
+
+    #[test]
+    fn unbound_transfer_packet_mdl_cannot_be_locked_before_partial_binding() {
+        let mut registry = MdlRegistry::new();
+        let key = MdlKey::new(2, 4, 0x20_0300).unwrap();
+        let id = registry.register(key, 0, 2 * 1024 * 1024).unwrap();
+        assert_eq!(registry.virtual_address(id), Some(0));
+        assert_eq!(registry.build_for_nonpaged_key(key), Err(MdlError::OutOfRange));
+        assert!(!registry.is_locked(id));
+        assert_eq!(registry.validate_slice(id, 0, 1), Err(MdlError::StaleId));
+        assert_eq!(registry.add_mapping(id), Err(MdlError::OutOfRange));
+
+        let retired_shell = MdlKey::new(2, 4, 0x20_0400).unwrap();
+        registry.register(retired_shell, 0, 4096).unwrap();
+        registry.free_key(retired_shell).unwrap();
+
+        registry.update_key(key, 0x40_1000, 4096).unwrap();
+        registry.build_for_nonpaged_key(key).unwrap();
+        assert_eq!(registry.validate_slice(id, 0, 4096), Ok(()));
+        registry.free_key(key).unwrap();
     }
 
     #[test]
