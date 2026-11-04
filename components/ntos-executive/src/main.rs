@@ -6910,6 +6910,10 @@ pub(crate) static TIMER_SHOTS_PROGRAMMED: AtomicU64 = AtomicU64::new(0);
 /// deliberately leave it stopped instead of programming a sentinel or periodic fallback.
 pub(crate) static TIMER_IDLE_DISARMS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TIMER_DUE_WORK_DRAINS: AtomicU64 = AtomicU64::new(0);
+// Sole executive timer-delivery owner updates this after the due-work scan. Periodic census
+// copies it only at a serialized service-loop boundary.
+static mut TIMER_DEADLINE_CENSUS: nt_hosted_runtime::TimerDeadlineCensus =
+    nt_hosted_runtime::TimerDeadlineCensus::new();
 pub(crate) static IO_COMPLETION_TIMEOUT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DELAY_TIMER_REARM_TRACE_N: AtomicU64 = AtomicU64::new(0);
 /// The deadline SOURCE the last spurious rearm picked, so the storm is attributable:
@@ -7086,6 +7090,41 @@ fn print_shared_receive_census() {
         print_str(b"\n");
     }
     spawn_hosts::print_file_pump_census();
+}
+
+fn print_timer_deadline_census() {
+    use nt_hosted_runtime::TimerDeadlineCensus;
+    print_str(b"[census] timer-scan seen/spurious/early-stale/shots/idle-disarms/due-drains/past-rearms=");
+    for (index, value) in [
+        TIMER_TICKS_SEEN.load(Ordering::Relaxed),
+        TIMER_TICKS_SPURIOUS.load(Ordering::Relaxed),
+        TIMER_TICKS_EARLY_STALE.load(Ordering::Relaxed),
+        TIMER_SHOTS_PROGRAMMED.load(Ordering::Relaxed),
+        TIMER_IDLE_DISARMS.load(Ordering::Relaxed),
+        TIMER_DUE_WORK_DRAINS.load(Ordering::Relaxed),
+        TIMER_PAST_DEADLINE_REARMS.load(Ordering::Relaxed),
+    ].into_iter().enumerate() {
+        if index != 0 { print_str(b"/"); }
+        print_u64(value);
+    }
+    print_str(b"\n");
+    let census = unsafe { *core::ptr::addr_of!(TIMER_DEADLINE_CENSUS) };
+    for bucket in 0..TimerDeadlineCensus::BUCKETS {
+        let source = if bucket == 0 { None } else { Some(bucket as u64) };
+        let sample = census.sample(source);
+        if sample.scans == 0 { continue; }
+        print_str(b"[census] timer-live-source=");
+        if bucket == TimerDeadlineCensus::OVERFLOW { print_str(b"overflow"); }
+        else { print_u64(bucket as u64); }
+        print_str(b" scans/due/early/work-units/late-us-total/max=");
+        for (index, value) in [sample.scans, sample.due, sample.early, sample.work_units,
+            sample.lateness_total_100ns / 10, sample.lateness_max_100ns / 10]
+            .into_iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(value);
+        }
+        print_str(b"\n");
+    }
 }
 
 fn print_periodic_census_heartbeat(n: u64, now: u64) {
@@ -7265,6 +7304,7 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
     driver_launch::print_mounted_native_block_census();
     service_sec_image::mounted_create_owner_trace::print_snapshot();
     print_shared_receive_census();
+    print_timer_deadline_census();
     if LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) != 0 {
         let tcb = LSA_LOGON_LAST_TCB.load(Ordering::Relaxed);
         print_str(b"[lsa-logon-census] calls=");
@@ -17675,9 +17715,10 @@ unsafe fn delay_timer_interrupt_claimed(
     // a scan, never advance the clock or consume metadata belonging to a newer shot.
     let now = nt_time_snapshot();
     let now_100ns = now.monotonic_100ns;
-    let early_or_stale = delay_timer_next_deadline(queue, handler, now)
-        .is_none_or(|(deadline, _)| deadline > now_100ns);
+    let selected = delay_timer_next_deadline(queue, handler, now);
+    let early_or_stale = selected.is_none_or(|(deadline, _)| deadline > now_100ns);
     let woken = delay_timer_drain_due_work(queue, handler, now);
+    (*core::ptr::addr_of_mut!(TIMER_DEADLINE_CENSUS)).observe(selected, now_100ns, woken);
     teardown_pending_job_time_terminations(queue, handler);
     TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
     if woken == 0 && early_or_stale {

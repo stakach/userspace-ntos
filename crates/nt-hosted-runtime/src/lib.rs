@@ -11,6 +11,7 @@ mod hosted_irq_cr8_source;
 mod hosted_irq_call_stack;
 mod badge_census;
 mod shared_receive_census;
+mod timer_deadline_census;
 mod progress_deferral;
 mod installer_progress_deferral;
 mod setup_read_progress_deferral;
@@ -108,6 +109,7 @@ pub use badge_census::{
     HOSTED_IRQ_SLOT, OVERFLOW_SLOT, TIMER_SLOT,
 };
 pub use shared_receive_census::{SharedReceiveCensus, SharedReceiveOwner, SharedReceiveReturn, SharedReceiveSample};
+pub use timer_deadline_census::{TimerDeadlineCensus, TimerDeadlineSample};
 pub use progress_deferral::ProgressDeferralBudget;
 pub use installer_progress_deferral::{InstallerOwner, InstallerProgressDeferral};
 pub use setup_read_progress_deferral::SetupReadProgressDeferral;
