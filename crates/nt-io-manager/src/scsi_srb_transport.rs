@@ -58,6 +58,22 @@ pub fn sanitized_legacy_srb(
     Ok(wire)
 }
 
+/// Project a failed terminal result from the captured source SRB when the
+/// provider's completion cannot be accepted. The returned provider-shaped
+/// image contains no source pointers or claimed transfer/sense bytes.
+pub fn failed_legacy_srb(
+    source: &[u8],
+    data_length: usize,
+    sense_length: usize,
+) -> Result<[u8; WDM_X64_LEGACY_SRB_SIZE], ScsiSrbError> {
+    let mut failed = sanitized_legacy_srb(source, data_length, sense_length)?;
+    failed[3] = 0x30; // SRB_STATUS_INTERNAL_ERROR, with no autosense flag.
+    failed[4] = 0; // ScsiStatus
+    failed[0x0b] = 0; // SenseInfoBufferLength
+    failed[SRB_DATA_TRANSFER_LENGTH..SRB_DATA_TRANSFER_LENGTH + 4].fill(0);
+    Ok(failed)
+}
+
 /// Merge provider completion into the retained source SRB without importing its address-space
 /// pointers. Data and sense bytes are copied through their separately bounded allocations.
 pub fn merge_provider_legacy_srb(
@@ -711,6 +727,41 @@ mod tests {
         assert_eq!(
             merge_provider_legacy_srb(&source, &provider, 8, 0x20),
             Err(ScsiSrbError::InvalidSrb)
+        );
+    }
+
+    #[test]
+    fn failed_legacy_srb_projects_error_without_source_pointers_or_transfer() {
+        let mut source = transport().srb().to_vec();
+        source[0x0b] = 0x20;
+        for (offset, address) in [
+            (SRB_SENSE_BUFFER, 0x1122_3344_5566_7788u64),
+            (SRB_ORIGINAL_REQUEST, 0x2233_4455_6677_8899),
+            (SRB_EXTENSION, 0x3344_5566_7788_99aau64),
+        ] {
+            source[offset..offset + 8].copy_from_slice(&address.to_le_bytes());
+        }
+        let failed = failed_legacy_srb(&source, 8, 0x20).unwrap();
+        assert_eq!(failed[2], source[2]);
+        assert_eq!(failed[3], 0x30); // SRB_STATUS_INTERNAL_ERROR
+        assert_eq!(failed[4], 0); // ScsiStatus
+        assert_eq!(failed[0x0b], 0); // no autosense bytes
+        assert_eq!(&failed[SRB_DATA_TRANSFER_LENGTH..SRB_DATA_TRANSFER_LENGTH + 4], &[0; 4]);
+        assert_eq!(&failed[SRB_DATA_BUFFER..SRB_EXTENSION + 8], &[0; 0x28]);
+
+        let merged = merge_provider_legacy_srb(&source, &failed, 8, 0x20).unwrap();
+        assert_eq!(merged[2], source[2]);
+        assert_eq!(merged[3], 0x30);
+        assert_eq!(merged[4], 0);
+        assert_eq!(merged[0x0b], 0);
+        assert_eq!(&merged[SRB_DATA_TRANSFER_LENGTH..SRB_DATA_TRANSFER_LENGTH + 4], &[0; 4]);
+        assert_eq!(
+            &merged[SRB_DATA_BUFFER..SRB_EXTENSION + 8],
+            &source[SRB_DATA_BUFFER..SRB_EXTENSION + 8],
+        );
+        assert_eq!(
+            failed_legacy_srb(&source, 7, 0x20),
+            Err(ScsiSrbError::InvalidSrb),
         );
     }
 

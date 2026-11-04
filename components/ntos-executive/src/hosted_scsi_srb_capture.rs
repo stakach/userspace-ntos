@@ -10,8 +10,8 @@ use super::hosted_source_pool_memory::SourcePoolMemory;
 use nt_io_manager::{
     hosted_forward_target::HostedForwardTarget, retained_query_path_forward::SourceIrpTicket,
     scsi_source_retention::ScsiSourceChildren,
-    scsi_srb_transport::{merge_provider_legacy_srb, project_claim_source_alias, sanitized_legacy_srb, ScsiSrbRoute, WDM_X64_LEGACY_SRB_SIZE},
-    source_irp_ledger::{SourceIrpAllocation, SourceIrpForwardIdentity}, HostedDomainIdentity,
+    scsi_srb_transport::{failed_legacy_srb, merge_provider_legacy_srb, project_claim_source_alias, sanitized_legacy_srb, ScsiSrbRoute, WDM_X64_LEGACY_SRB_SIZE},
+    source_irp_ledger::{SourceIrpAllocation, SourceIrpForwardIdentity, SourceIrpUseTicket}, HostedDomainIdentity,
 };
 use nt_pnp_manager::AcceptedPdoProviderAuthority;
 
@@ -60,6 +60,7 @@ pub(super) struct CapturedSourceScsi {
     source: SourceIrpAllocation,
     source_pdo_alias: u64,
     ticket: SourceIrpTicket,
+    use_ticket: SourceIrpUseTicket,
     target: Option<HostedForwardTarget>,
     authority: AcceptedPdoProviderAuthority,
     children: ScsiSourceChildren,
@@ -79,6 +80,11 @@ impl CapturedSourceScsi {
             .expect("retained SCSI source identity")
     }
 
+    pub(super) fn scsi_identity(&self) -> hosted_source_stack_lease::ScsiStackSource {
+        hosted_source_stack_lease::ScsiStackSource::new(self.source_identity(), self.use_ticket)
+            .expect("retained exact SCSI use identity")
+    }
+
     pub(super) fn source_irp_address(&self) -> u64 {
         self.source.component_address
     }
@@ -90,7 +96,7 @@ impl CapturedSourceScsi {
     }
     pub(super) fn arm_callback_free(&self) -> Result<(), CaptureError> {
         self.validate_retained()?;
-        hosted_source_irp_ledger::arm_deferred_free(self.ticket)
+        hosted_source_irp_ledger::arm_scsi_deferred_free(self.use_ticket, self.source)
             .then_some(())
             .ok_or(CaptureError::InvalidSource)
     }
@@ -175,7 +181,7 @@ impl CapturedSourceScsi {
             }), Some(range)) => {
                 bytes == data.len() as u64 && self.data_stack_lease.is_some_and(|lease| {
                     hosted_source_stack_lease::scsi_data_can_write(
-                        lease, self.source_identity(), range, component_address,
+                        lease, self.scsi_identity(), range, component_address,
                         self.children.transfer_length, exec_address,
                     )
                 })
@@ -193,7 +199,7 @@ impl CapturedSourceScsi {
                     !memory.contains(pool.component_address, merged.len()),
                 nt_io_manager::scsi_source_retention::ScsiSrbSource::Stack { range, component_address } =>
                     !self.stack_lease.is_some_and(|lease| hosted_source_stack_lease::scsi_can_write(
-                        lease, self.source_identity(), range, component_address,
+                        lease, self.scsi_identity(), range, component_address,
                     )),
             }
         {
@@ -205,7 +211,7 @@ impl CapturedSourceScsi {
             component_address, exec_address, ..
         }), Some(range), Some(lease)) = (self.children.data, self.children.data_stack, self.data_stack_lease) {
             if !hosted_source_stack_lease::write_scsi_data(
-                lease, self.source_identity(), range, component_address, exec_address, data,
+                lease, self.scsi_identity(), range, component_address, exec_address, data,
             ) { return Err(CaptureError::InvalidSource); }
         }
         if let Some(address) = sense_address {
@@ -222,10 +228,21 @@ impl CapturedSourceScsi {
             nt_io_manager::scsi_source_retention::ScsiSrbSource::Stack { range, component_address } => {
                 let lease = self.stack_lease.ok_or(CaptureError::InvalidSource)?;
                 hosted_source_stack_lease::write_scsi(
-                    lease, self.source_identity(), range, component_address, &merged,
+                    lease, self.scsi_identity(), range, component_address, &merged,
                 ).then_some(()).ok_or(CaptureError::InvalidSource)
             }
         }
+    }
+
+    /// A malformed provider terminal is projected as an explicit failed SRB
+    /// and IRP status. No provider bytes or pointers enter the source domain.
+    pub(super) unsafe fn write_error_completion(&self, status: i32) -> Result<(), CaptureError> {
+        let failed = failed_legacy_srb(
+            &self.srb, self.data.len(), self.sense.as_ref().map_or(0, Vec::len),
+        ).map_err(|_| CaptureError::InvalidSrb)?;
+        self.write_completion(
+            &failed, &self.data, self.sense.as_deref().unwrap_or(&[]), false, status,
+        )
     }
     pub(super) fn provider_authority(&self) -> AcceptedPdoProviderAuthority {
         self.authority
@@ -343,29 +360,24 @@ impl CapturedSourceScsi {
         completed_scsi: bool,
     ) -> Result<(), CaptureError> {
         if let Some(lease) = self.data_stack_lease {
-            if !unsafe { hosted_source_stack_lease::release_scsi_data(lease, self.source_identity()) } {
+            if !unsafe { hosted_source_stack_lease::release_scsi_data(lease, self.scsi_identity()) } {
                 return Err(CaptureError::InvalidSource);
             }
             self.data_stack_lease = None;
         }
         if let Some(lease) = self.stack_lease {
-            if !unsafe { hosted_source_stack_lease::release_scsi(lease, self.source_identity()) } {
+            if !unsafe { hosted_source_stack_lease::release_scsi(lease, self.scsi_identity()) } {
                 return Err(CaptureError::InvalidSource);
             }
             self.stack_lease = None;
         }
         if self.source_pinned {
             let released = if free_requested {
-                hosted_source_irp_ledger::release_pending_terminal(self.ticket, self.source)
-            } else if completed_scsi
-                && matches!(self.source.owner,
-                    nt_io_manager::source_irp_ledger::SourceIrpOwner::HostedDriver(_))
-            {
-                hosted_source_irp_ledger::complete_driver_forward_without_free(
-                    self.ticket, self.source,
-                )
+                hosted_source_irp_ledger::release_pending_scsi_terminal(self.use_ticket, self.source)
+            } else if completed_scsi {
+                hosted_source_irp_ledger::complete_scsi_use(self.use_ticket, self.source)
             } else {
-                hosted_source_irp_ledger::unpin(self.ticket)
+                hosted_source_irp_ledger::abandon_scsi_use(self.use_ticket, self.source)
             };
             if !released { return Err(CaptureError::InvalidSource); }
             self.source_pinned = false;
@@ -393,8 +405,8 @@ pub(super) unsafe fn capture(
         .ok_or(CaptureError::InvalidCaller)?;
     let domain: HostedDomainIdentity =
         instance_domain_identity(inst).ok_or(CaptureError::InvalidCaller)?;
-    let (ticket, source) =
-        hosted_source_irp_ledger::pin(instance_index, domain, source_irp_address)
+    let (ticket, use_ticket, source) =
+        hosted_source_irp_ledger::pin_scsi(instance_index, domain, source_irp_address)
             .ok_or(CaptureError::InvalidSource)?;
     let result = (|| {
         let mut target =
@@ -426,6 +438,7 @@ pub(super) unsafe fn capture(
                 instance_index,
                 source,
                 ticket,
+                use_ticket,
                 target_device_address,
                 route,
                 ch,
@@ -443,6 +456,7 @@ pub(super) unsafe fn capture(
                 source,
                 source_pdo_alias: target_device_address,
                 ticket,
+                use_ticket,
                 target: Some(target),
                 authority,
                 children,
@@ -465,7 +479,7 @@ pub(super) unsafe fn capture(
     })();
     if result.is_err() {
         assert!(
-            hosted_source_irp_ledger::unpin(ticket),
+            hosted_source_irp_ledger::abandon_scsi_use(use_ticket, source),
             "unentered SCSI source rollback"
         );
     }

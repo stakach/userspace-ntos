@@ -2,8 +2,9 @@
 //!
 //! An IRP pin does not cover a separately allocated SRB, MDL or transfer buffer. This
 //! ledger is acquired before provider entry and consulted by source pool/MDL free paths.
-//! It refuses reuse after Pending or uncertain entry until the exact provider completion and
-//! acknowledgement have both been observed. The native adapter still owns the physical pins.
+//! A new use of the same source waits for terminal provider status and published source
+//! copyback. Each old use keeps its physical children until its own source completion and
+//! provider acknowledgement. The native adapter still owns the physical pins.
 
 use alloc::vec::Vec;
 
@@ -13,13 +14,14 @@ use crate::scsi_srb_transport::ScsiSrbRoute;
 use crate::source_irp_auxiliary::{
     SourceMdlAllocationIdentity, SourceMemoryIdentity, SourcePoolAllocationIdentity,
 };
-use crate::source_irp_ledger::{SourceIrpAllocation, SourceIrpOwner};
+use crate::source_irp_ledger::{SourceIrpAllocation, SourceIrpOwner, SourceIrpUseTicket};
 use crate::{HostedDomainIdentity, IrpId};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScsiSourceChildren {
     pub source: SourceIrpAllocation,
     pub ticket: SourceIrpTicket,
+    pub use_ticket: SourceIrpUseTicket,
     pub route: ScsiSrbRoute,
     pub srb: ScsiSrbSource,
     pub sense: Option<SourceMemoryIdentity>,
@@ -67,6 +69,7 @@ pub enum ScsiSourcePhase {
     Pending,
     Uncertain,
     Terminal,
+    SourcePublished,
     ProviderAcknowledged,
     SourceCompleted,
     ReadyToRelease,
@@ -77,6 +80,7 @@ struct Row {
     children: ScsiSourceChildren,
     provider_irp: Option<IrpId>,
     phase: ScsiSourcePhase,
+    source_published: bool,
 }
 
 #[derive(Default)]
@@ -94,7 +98,24 @@ impl ScsiSourceRetentionLedger {
             return Err(ScsiSourceRetentionError::Invalid);
         }
         if self.rows.iter().any(|row| {
-            row.children.ticket == children.ticket || row.children.source == children.source
+            if row.children.use_ticket == children.use_ticket {
+                return true;
+            }
+            let same_registration = row.children.ticket == children.ticket;
+            let same_address = row.children.source.domain == children.source.domain
+                && row.children.source.component_address == children.source.component_address;
+            if !same_registration && !same_address {
+                return false;
+            }
+            row.children.source != children.source
+                || !same_registration
+                || row.children.use_ticket.epoch() >= children.use_ticket.epoch()
+                || !row.source_published
+                || !matches!(row.phase,
+                    ScsiSourcePhase::SourcePublished
+                        | ScsiSourcePhase::ProviderAcknowledged
+                        | ScsiSourcePhase::SourceCompleted
+                        | ScsiSourcePhase::ReadyToRelease)
         }) {
             return Err(ScsiSourceRetentionError::AlreadyOwned);
         }
@@ -105,15 +126,24 @@ impl ScsiSourceRetentionLedger {
             children,
             provider_irp: None,
             phase: ScsiSourcePhase::Prepared,
+            source_published: false,
         });
         Ok(())
     }
 
-    pub fn phase(&self, ticket: SourceIrpTicket) -> Option<ScsiSourcePhase> {
+    pub fn phase(&self, use_ticket: SourceIrpUseTicket) -> Option<ScsiSourcePhase> {
         self.rows
             .iter()
-            .find(|row| row.children.ticket == ticket)
+            .find(|row| row.children.use_ticket == use_ticket)
             .map(|row| row.phase)
+    }
+
+    /// Provider acknowledgement may arrive before source copyback. Reuse
+    /// requires this exact use's publication receipt, not its phase alone.
+    pub fn source_published(&self, use_ticket: SourceIrpUseTicket) -> bool {
+        self.rows.iter().any(|row| {
+            row.children.use_ticket == use_ticket && row.source_published
+        })
     }
 
     pub fn contains_exact(&self, children: ScsiSourceChildren) -> bool {
@@ -128,7 +158,7 @@ impl ScsiSourceRetentionLedger {
         let index = self
             .rows
             .iter()
-            .position(|row| row.children.ticket == children.ticket)
+            .position(|row| row.children.use_ticket == children.use_ticket)
             .ok_or(ScsiSourceRetentionError::WrongIdentity)?;
         if self.rows[index].children != children {
             return Err(ScsiSourceRetentionError::WrongIdentity);
@@ -216,6 +246,29 @@ impl ScsiSourceRetentionLedger {
         )
     }
 
+    /// Provider terminal alone does not permit the caller to reuse its IRP:
+    /// the old SRB, sense, data and IRP status must be copied back first.
+    /// The native adapter publishes this receipt after all source writes and
+    /// before the terminal Reply can resume a ClassPnP retry.
+    pub fn publish_source(
+        &mut self,
+        children: ScsiSourceChildren,
+        provider_irp: IrpId,
+    ) -> Result<(), ScsiSourceRetentionError> {
+        let row = self.exact_mut(children)?;
+        if row.provider_irp != Some(provider_irp) {
+            return Err(ScsiSourceRetentionError::WrongPhase);
+        }
+        if row.source_published { return Ok(()); }
+        match row.phase {
+            ScsiSourcePhase::Terminal => row.phase = ScsiSourcePhase::SourcePublished,
+            ScsiSourcePhase::ProviderAcknowledged => {},
+            _ => return Err(ScsiSourceRetentionError::WrongPhase),
+        }
+        row.source_published = true;
+        Ok(())
+    }
+
     /// Provider completion alone is insufficient: caller-local completion may still access
     /// the SRB and MDL. ACK and source-local completion can arrive in either order.
     pub fn acknowledge(
@@ -228,7 +281,8 @@ impl ScsiSourceRetentionLedger {
             return Err(ScsiSourceRetentionError::WrongIdentity);
         }
         row.phase = match row.phase {
-            ScsiSourcePhase::Terminal => ScsiSourcePhase::ProviderAcknowledged,
+            ScsiSourcePhase::Terminal | ScsiSourcePhase::SourcePublished =>
+                ScsiSourcePhase::ProviderAcknowledged,
             ScsiSourcePhase::SourceCompleted => ScsiSourcePhase::ReadyToRelease,
             _ => return Err(ScsiSourceRetentionError::WrongPhase),
         };
@@ -246,8 +300,11 @@ impl ScsiSourceRetentionLedger {
         if row.provider_irp != Some(provider_irp) {
             return Err(ScsiSourceRetentionError::WrongIdentity);
         }
+        if !row.source_published {
+            return Err(ScsiSourceRetentionError::WrongPhase);
+        }
         row.phase = match row.phase {
-            ScsiSourcePhase::Terminal => ScsiSourcePhase::SourceCompleted,
+            ScsiSourcePhase::SourcePublished => ScsiSourcePhase::SourceCompleted,
             ScsiSourcePhase::ProviderAcknowledged => ScsiSourcePhase::ReadyToRelease,
             _ => return Err(ScsiSourceRetentionError::WrongPhase),
         };
@@ -262,12 +319,13 @@ impl ScsiSourceRetentionLedger {
         let index = self
             .rows
             .iter()
-            .position(|row| row.children.ticket == children.ticket)
+            .position(|row| row.children.use_ticket == children.use_ticket)
             .ok_or(ScsiSourceRetentionError::WrongIdentity)?;
         if self.rows[index].children != children {
             return Err(ScsiSourceRetentionError::WrongIdentity);
         }
-        if self.rows[index].phase != ScsiSourcePhase::ReadyToRelease {
+        if self.rows[index].phase != ScsiSourcePhase::ReadyToRelease
+            || !self.rows[index].source_published {
             return Err(ScsiSourceRetentionError::WrongPhase);
         }
         self.rows.swap_remove(index);
@@ -334,7 +392,7 @@ impl ScsiSourceRetentionLedger {
         let row = self
             .rows
             .iter_mut()
-            .find(|row| row.children.ticket == children.ticket)
+            .find(|row| row.children.use_ticket == children.use_ticket)
             .ok_or(ScsiSourceRetentionError::WrongIdentity)?;
         if row.children != children {
             return Err(ScsiSourceRetentionError::WrongIdentity);
@@ -365,7 +423,9 @@ fn valid(children: ScsiSourceChildren) -> bool {
     let source = children.source;
     let srb = children.srb;
     let route = children.route;
-    let source_valid = source.valid() && source.domain == children.ticket.domain;
+    let source_valid = source.valid()
+        && source.domain == children.ticket.domain
+        && children.use_ticket.registration() == children.ticket;
     let route_valid = !route.pdo.is_null()
         && !route.provider.domain_id.is_null()
         && route.provider.cookie != 0
@@ -482,7 +542,8 @@ fn valid(children: ScsiSourceChildren) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source_irp_ledger::SourceIrpOwner;
+    use core::num::NonZeroU64;
+    use crate::source_irp_ledger::{SourceIrpOwner, SourceIrpUseTicket};
     use crate::{DeviceId, HostedDomainId};
 
     fn fixture() -> ScsiSourceChildren {
@@ -500,6 +561,10 @@ mod tests {
                 pool_generation: 4,
             },
             ticket: SourceIrpTicket::new(domain, 1, 1).unwrap(),
+            use_ticket: SourceIrpUseTicket::new(
+                SourceIrpTicket::new(domain, 1, 1).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+            ).unwrap(),
             route: ScsiSrbRoute {
                 pdo: DeviceId::new(2, 4),
                 provider: domain,
@@ -572,8 +637,9 @@ mod tests {
         ledger.enter(children, irp).unwrap();
         ledger.pending(children, irp).unwrap();
         ledger.terminal(children, irp).unwrap();
+        ledger.publish_source(children, irp).unwrap();
         ledger.source_completed(children, irp).unwrap();
-        assert_eq!(ledger.phase(children.ticket), Some(ScsiSourcePhase::SourceCompleted));
+        assert_eq!(ledger.phase(children.use_ticket), Some(ScsiSourcePhase::SourceCompleted));
         ledger.acknowledge(children, irp).unwrap();
         ledger.release(children).unwrap();
     }
@@ -650,6 +716,13 @@ mod tests {
             Err(ScsiSourceRetentionError::WrongPhase)
         );
         ledger.acknowledge(children, irp).unwrap();
+        assert!(!ledger.source_published(children.use_ticket));
+        let mut next = children;
+        next.use_ticket = SourceIrpUseTicket::new(next.ticket, NonZeroU64::new(2).unwrap()).unwrap();
+        assert_eq!(ledger.retain(next), Err(ScsiSourceRetentionError::AlreadyOwned),
+            "provider ACK without source publication cannot authorize reuse");
+        ledger.publish_source(children, irp).unwrap();
+        assert!(ledger.source_published(children.use_ticket));
         assert!(ledger.protects_pool(children.source.owner, children.source.domain, 0x2000));
         assert_eq!(
             ledger.release(children),
@@ -658,6 +731,84 @@ mod tests {
         ledger.source_completed(children, irp).unwrap();
         ledger.release(children).unwrap();
         assert!(!ledger.protects_pool(children.source.owner, children.source.domain, 0x2000));
+    }
+
+    #[test]
+    fn terminal_use_can_overlap_next_use_without_old_ack_releasing_it() {
+        let mut ledger = ScsiSourceRetentionLedger::new();
+        let old = fixture();
+        let mut next = old;
+        next.use_ticket = SourceIrpUseTicket::new(next.ticket, NonZeroU64::new(2).unwrap()).unwrap();
+        let old_provider = IrpId::new(3, 31);
+        let next_provider = IrpId::new(3, 32);
+
+        ledger.retain(old).unwrap();
+        ledger.enter(old, old_provider).unwrap();
+        ledger.pending(old, old_provider).unwrap();
+        assert_eq!(ledger.retain(next), Err(ScsiSourceRetentionError::AlreadyOwned));
+        ledger.uncertain(old, old_provider).unwrap();
+        assert_eq!(ledger.retain(next), Err(ScsiSourceRetentionError::AlreadyOwned));
+
+        ledger.terminal(old, old_provider).unwrap();
+        assert_eq!(ledger.retain(next), Err(ScsiSourceRetentionError::AlreadyOwned),
+            "provider terminal alone does not prove source copyback is published");
+        ledger.publish_source(old, old_provider).unwrap();
+        ledger.publish_source(old, old_provider).unwrap();
+        ledger.retain(next).expect("published source copyback permits a distinct use");
+        ledger.enter(next, next_provider).unwrap();
+        ledger.pending(next, next_provider).unwrap();
+        assert_eq!(ledger.phase(old.use_ticket), Some(ScsiSourcePhase::SourcePublished));
+        assert_eq!(ledger.phase(next.use_ticket), Some(ScsiSourcePhase::Pending));
+
+        ledger.acknowledge(old, old_provider).unwrap();
+        ledger.source_completed(old, old_provider).unwrap();
+        ledger.release(old).unwrap();
+        assert!(!ledger.contains_exact(old));
+        assert!(ledger.contains_exact(next));
+        assert_eq!(ledger.phase(next.use_ticket), Some(ScsiSourcePhase::Pending));
+        for address in [0x2000, 0x3000, 0x4000, 0x5000] {
+            assert!(ledger.protects_pool(next.source.owner, next.source.domain, address),
+                "new use still owns each physical child after old ACK");
+        }
+        assert!(ledger.protects_mdl(next.source.owner, next.source.domain, 0x3000));
+        ledger.terminal(next, next_provider).unwrap();
+        ledger.publish_source(next, next_provider).unwrap();
+        ledger.source_completed(next, next_provider).unwrap();
+        ledger.acknowledge(next, next_provider).unwrap();
+        ledger.release(next).unwrap();
+        assert!(!ledger.protects_pool(next.source.owner, next.source.domain, 0x2000));
+    }
+
+    #[test]
+    fn use_ticket_must_name_the_same_exact_registration_and_advance_epoch() {
+        let old = fixture();
+        let mut duplicate = old;
+        duplicate.use_ticket = SourceIrpUseTicket::new(duplicate.ticket, NonZeroU64::new(1).unwrap()).unwrap();
+        let mut ledger = ScsiSourceRetentionLedger::new();
+        ledger.retain(old).unwrap();
+        let old_provider = IrpId::new(3, 33);
+        ledger.enter(old, old_provider).unwrap();
+        assert_eq!(ledger.publish_source(old, old_provider),
+            Err(ScsiSourceRetentionError::WrongPhase));
+        ledger.terminal(old, old_provider).unwrap();
+        ledger.publish_source(old, old_provider).unwrap();
+        assert_eq!(ledger.retain(duplicate), Err(ScsiSourceRetentionError::AlreadyOwned));
+
+        let mut stale = old;
+        stale.use_ticket = SourceIrpUseTicket::new(
+            SourceIrpTicket::new(old.source.domain, 2, 2).unwrap(),
+            NonZeroU64::new(2).unwrap(),
+        ).unwrap();
+        assert_eq!(ledger.retain(stale), Err(ScsiSourceRetentionError::Invalid));
+
+        let mut foreign = old;
+        foreign.use_ticket = SourceIrpUseTicket::new(
+            SourceIrpTicket::new(
+                HostedDomainIdentity { cookie: old.source.domain.cookie + 1, ..old.source.domain }, 1, 1,
+            ).unwrap(),
+            NonZeroU64::new(2).unwrap(),
+        ).unwrap();
+        assert_eq!(ledger.retain(foreign), Err(ScsiSourceRetentionError::Invalid));
     }
 
     #[test]
@@ -691,6 +842,7 @@ mod tests {
         ledger.retain(children).unwrap();
         ledger.enter(children, irp).unwrap();
         ledger.terminal(children, irp).unwrap();
+        ledger.publish_source(children, irp).unwrap();
         ledger.source_completed(children, irp).unwrap();
         assert_eq!(
             ledger.release(children),

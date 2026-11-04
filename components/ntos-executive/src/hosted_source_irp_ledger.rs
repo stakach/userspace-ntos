@@ -19,6 +19,7 @@ use nt_io_manager::source_irp_auxiliary_buffer::{
 };
 use nt_io_manager::source_irp_ledger::{
     SourceIrpAllocation, SourceIrpForwardIdentity, SourceIrpLedger, SourceIrpLedgerError,
+    SourceIrpUseTicket,
     SourceIrpOwner, SourceIrpRetirement,
     SourcePoolFreeAdmission,
 };
@@ -130,6 +131,7 @@ pub(super) fn capture_scsi_children(
     instance_index: usize,
     source: SourceIrpAllocation,
     ticket: SourceIrpTicket,
+    use_ticket: SourceIrpUseTicket,
     target_device: u64,
     route: ScsiSrbRoute,
     channel: &crate::spawn_hosts::PumpChannel,
@@ -167,7 +169,9 @@ pub(super) fn capture_scsi_children(
     if stack.device_object != target_device || stack.file_object != 0
         || irp.associated_irp_system_buffer.0 != 0 || irp.user_buffer.0 != 0
     { return None; }
-    let source_identity = SourceIrpForwardIdentity::new(ticket, source)?;
+    let source_identity = hosted_source_stack_lease::ScsiStackSource::new(
+        SourceIrpForwardIdentity::new(ticket, source)?, use_ticket,
+    )?;
     diagnostic.stage = b"srb-owner";
     let (srb_identity, srb_bytes, stack_lease) = if let Some(pool) = unsafe {
         exact_pool_identity_unlocked(inst, srb_address, WDM_X64_LEGACY_SRB_SIZE as u64)
@@ -304,7 +308,7 @@ pub(super) fn capture_scsi_children(
     srb.try_reserve_exact(WDM_X64_LEGACY_SRB_SIZE).ok()?;
     srb.extend_from_slice(srb_slice);
     let children = ScsiSourceChildren {
-        source, ticket, route, srb: srb_identity, sense: sense_identity,
+        source, ticket, use_ticket, route, srb: srb_identity, sense: sense_identity,
         sense_length, mdl: mdl_identity,
         data: data_identity, data_stack, transfer_length,
     };
@@ -337,8 +341,10 @@ fn scsi_data_stack_matches(
             u32::try_from(bytes).ok() == Some(children.transfer_length)
                 && unsafe { hosted_source_stack_lease::scsi_data_matches(
                     lease,
-                    SourceIrpForwardIdentity::new(children.ticket, children.source)
-                        .expect("retained SCSI source identity"),
+                    hosted_source_stack_lease::ScsiStackSource::new(
+                        SourceIrpForwardIdentity::new(children.ticket, children.source)
+                            .expect("retained SCSI source identity"), children.use_ticket,
+                    ).expect("retained SCSI use identity"),
                     range, component_address, children.transfer_length, exec_address,
                 ) }
         }
@@ -373,8 +379,10 @@ pub(super) fn scsi_children_match_current(
                 stack_lease.is_some_and(|lease| unsafe {
                     hosted_source_stack_lease::scsi_matches(
                         lease,
-                        SourceIrpForwardIdentity::new(children.ticket, children.source)
-                            .expect("retained SCSI source identity"),
+                        hosted_source_stack_lease::ScsiStackSource::new(
+                            SourceIrpForwardIdentity::new(children.ticket, children.source)
+                                .expect("retained SCSI source identity"), children.use_ticket,
+                        ).expect("retained SCSI use identity"),
                         range,
                         component_address,
                     )
@@ -404,7 +412,8 @@ fn scsi_after_callback_phase(
 ) -> bool {
     use nt_io_manager::scsi_source_retention::ScsiSourcePhase;
     matches!(phase,
-        Some(ScsiSourcePhase::Terminal | ScsiSourcePhase::ProviderAcknowledged
+        Some(ScsiSourcePhase::Terminal | ScsiSourcePhase::SourcePublished
+            | ScsiSourcePhase::ProviderAcknowledged
             | ScsiSourcePhase::SourceCompleted | ScsiSourcePhase::ReadyToRelease))
 }
 
@@ -417,7 +426,7 @@ pub(super) fn scsi_children_match_after_callback(
     let deferred_free_requested = ledger().deferred_free_requested(children.ticket);
     if !scsi_children().contains_exact(children)
         || !scsi_after_callback_phase(
-            scsi_children().phase(children.ticket),
+            scsi_children().phase(children.use_ticket),
             deferred_free_requested,
         )
         || !ledger().admits_forward(children.ticket, children.source)
@@ -427,10 +436,7 @@ pub(super) fn scsi_children_match_after_callback(
     let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
         return false;
     };
-    let mut observed = unsafe { allocation_unlocked(instance_index, inst,
-        children.source.component_address, children.source.bytes, children.source.stack_count) };
-    if let Some(source) = observed.as_mut() { source.owner = children.source.owner; }
-    observed == Some(children.source)
+    (unsafe { scsi_registered_pool_matches_unlocked(inst, children.source) })
         && (deferred_free_requested ||
             match children.srb {
                 nt_io_manager::scsi_source_retention::ScsiSrbSource::Pool(pool) => unsafe {
@@ -457,8 +463,10 @@ pub(super) fn scsi_children_match_after_callback(
                 stack_lease.is_some_and(|lease| unsafe {
                     hosted_source_stack_lease::scsi_matches(
                         lease,
-                        SourceIrpForwardIdentity::new(children.ticket, children.source)
-                            .expect("retained SCSI source identity"),
+                        hosted_source_stack_lease::ScsiStackSource::new(
+                            SourceIrpForwardIdentity::new(children.ticket, children.source)
+                                .expect("retained SCSI source identity"), children.use_ticket,
+                        ).expect("retained SCSI use identity"),
                         range,
                         component_address,
                     )
@@ -489,6 +497,11 @@ pub(super) fn scsi_children_uncertain(children: ScsiSourceChildren, provider_irp
 pub(super) fn scsi_children_terminal(children: ScsiSourceChildren, provider_irp: IrpId) -> bool {
     let _guard = lock();
     scsi_children().terminal(children, provider_irp).is_ok()
+}
+
+pub(super) fn publish_scsi_source(children: ScsiSourceChildren, provider_irp: IrpId) -> bool {
+    let _guard = lock();
+    scsi_children().publish_source(children, provider_irp).is_ok()
 }
 
 pub(super) fn scsi_children_acknowledge(children: ScsiSourceChildren, provider_irp: IrpId) -> bool {
@@ -552,6 +565,16 @@ pub(super) unsafe fn exact_pool_identity_unlocked(
 ) -> Option<SourcePoolAllocationIdentity> {
     let identity = pool_range_identity_unlocked(inst, component_address, bytes)?;
     (identity.component_address == component_address).then_some(identity)
+}
+
+/// An older SCSI use retains physical storage while IoReuseIrp can rewrite
+/// its header. Observe the exact pool generation, not old mutable IRP fields.
+unsafe fn scsi_registered_pool_matches_unlocked(
+    inst: DriverInstance, allocation: SourceIrpAllocation,
+) -> bool {
+    exact_pool_identity_unlocked(inst, allocation.component_address, allocation.bytes)
+        .is_some_and(|pool| pool.pool_generation == allocation.pool_generation
+            && pool.capacity >= allocation.bytes)
 }
 
 /// A retained sense buffer may be embedded in a larger transfer packet. Recheck the
@@ -1422,12 +1445,11 @@ struct IrpMutationDiagnostic {
     mutation_error: u8,
     auxiliary_present: u8,
     free_requested: u8,
-    scsi_phase: u8,
 }
 
 fn trace_ioreuse_refusal(instance_index: usize, irp: u64, diagnostic: &IrpMutationDiagnostic) {
     if IOREUSE_REFUSAL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 4 { return; }
-    print_str(b"[ioreuse-refusal] stage/instance/irp/pool-gen/owner/ticket/gen/mutation/aux/free/scsi-phase=");
+    print_str(b"[ioreuse-refusal] stage/instance/irp/pool-gen/owner/ticket/gen/mutation/aux/free=");
     print_str(diagnostic.stage);
     print_str(b"/");
     print_u64(instance_index as u64);
@@ -1447,8 +1469,6 @@ fn trace_ioreuse_refusal(instance_index: usize, irp: u64, diagnostic: &IrpMutati
     print_u64(u64::from(diagnostic.auxiliary_present));
     print_str(b"/");
     print_u64(u64::from(diagnostic.free_requested));
-    print_str(b"/");
-    print_u64(u64::from(diagnostic.scsi_phase));
     print_str(b"\n");
 }
 
@@ -1538,6 +1558,7 @@ fn mutate_local_irp_packet_inner(
         return (STATUS_INVALID_PARAMETER, 0, 0);
     }
     diagnostic.stage = b"ledger-admission";
+    let mut scsi_reuse = None;
     match ledger().pool_free_admission(instance_index, domain, irp) {
         Ok(SourcePoolFreeAdmission::Unregistered) => {},
         Ok(SourcePoolFreeAdmission::DriverOwned(owner)) => {
@@ -1565,25 +1586,23 @@ fn mutate_local_irp_packet_inner(
                 Err(SourceIrpLedgerError::WrongIdentity) => 3,
                 Err(_) => 4,
             };
-            if mutation.is_err() {
-                use nt_io_manager::scsi_source_retention::ScsiSourcePhase;
+            if mutation.is_err()
+                && !(operation == hosted_irp_lifecycle_exports::REUSE
+                    && mutation == Err(SourceIrpLedgerError::Pinned))
+            {
                 diagnostic.free_requested = u8::from(ledger().deferred_free_requested(ticket));
-                diagnostic.scsi_phase = match scsi_children().phase(ticket) {
-                    None => 0,
-                    Some(ScsiSourcePhase::Prepared) => 1,
-                    Some(ScsiSourcePhase::Entered) => 2,
-                    Some(ScsiSourcePhase::Pending) => 3,
-                    Some(ScsiSourcePhase::Uncertain) => 4,
-                    Some(ScsiSourcePhase::Terminal) => 5,
-                    Some(ScsiSourcePhase::ProviderAcknowledged) => 6,
-                    Some(ScsiSourcePhase::SourceCompleted) => 7,
-                    Some(ScsiSourcePhase::ReadyToRelease) => 8,
-                };
                 return (STATUS_INVALID_HANDLE, 0, 0);
             }
             diagnostic.stage = b"auxiliary";
             diagnostic.auxiliary_present = u8::from(auxiliary().snapshot(ticket, owner).is_ok());
             if diagnostic.auxiliary_present != 0 {
+                return (STATUS_INVALID_HANDLE, 0, 0);
+            }
+            if operation == hosted_irp_lifecycle_exports::REUSE
+                && ledger().scsi_reuse_needed(ticket, owner)
+            {
+                scsi_reuse = Some((ticket, owner));
+            } else if mutation.is_err() {
                 return (STATUS_INVALID_HANDLE, 0, 0);
             }
         }
@@ -1607,6 +1626,29 @@ fn mutate_local_irp_packet_inner(
         return (STATUS_INVALID_PARAMETER, 0, 0);
     };
     let packet = unsafe { core::slice::from_raw_parts_mut(exec as *mut u8, usize::from(packet_size)) };
+    if let Some((ticket, owner)) = scsi_reuse {
+        // Validate the fallible packet transformation before consuming the
+        // next exact-use epoch. Commit the bytes only after the ledger admits
+        // every older use's source-publication receipt.
+        let mut staged = Vec::new();
+        if staged.try_reserve_exact(packet.len()).is_err() {
+            return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
+        }
+        staged.extend_from_slice(packet);
+        if nt_io_manager::reuse_wdm_irp_packet(
+            &mut staged, irp, argument as u32 as i32, false, apc_environment,
+        ).is_err() {
+            return (STATUS_INVALID_PARAMETER, 0, 0);
+        }
+        diagnostic.stage = b"scsi-use-publication";
+        if ledger().plan_scsi_reuse(ticket, owner, |old_use| {
+            scsi_children().source_published(old_use)
+        }).is_err() {
+            return (STATUS_INVALID_HANDLE, 0, 0);
+        }
+        packet.copy_from_slice(&staged);
+        return (STATUS_SUCCESS, 0, 0);
+    }
     let result = if initialize {
         nt_io_manager::initialize_wdm_irp_packet(
             packet, irp, packet_size, stack_count, apc_environment,
@@ -2646,6 +2688,34 @@ pub(super) fn pin(
     Some((ticket, owner))
 }
 
+pub(super) fn pin_scsi(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+    component_address: u64,
+) -> Option<(SourceIrpTicket, SourceIrpUseTicket, SourceIrpAllocation)> {
+    let inst = instance(instance_index)?;
+    if instance_domain_identity(inst)? != domain { return None; }
+    let _guard = lock();
+    let (ticket, owner) = ledger().registered(
+        SourceIrpOwner::HostedDriver(instance_index), domain, component_address,
+    )?;
+    let _pool_guard = unsafe { hosted_instance_pool_lock(inst.exec_pool_va)? };
+    let mut current = allocation_unlocked(
+        instance_index, inst, component_address, owner.bytes, owner.stack_count,
+    );
+    if let Some(allocation) = current.as_mut() { allocation.owner = owner.owner; }
+    if current != Some(owner) { return None; }
+    match auxiliary().snapshot(ticket, owner) {
+        Ok((auxiliary, phase))
+            if phase == SourceIrpAuxiliaryPhase::Protected
+                && unsafe { auxiliary_matches_unlocked(instance_index, inst, auxiliary, phase) } => {}
+        Err(SourceIrpAuxiliaryError::NotFound) => {}
+        _ => return None,
+    }
+    let use_ticket = ledger().pin_scsi_use(ticket, owner).ok()?;
+    Some((ticket, use_ticket, owner))
+}
+
 pub(super) fn matches(
     instance_index: usize,
     owner: SourceIrpAllocation,
@@ -2733,13 +2803,22 @@ pub(super) fn unpin(ticket: SourceIrpTicket) -> bool {
     ledger().unpin(ticket).is_ok()
 }
 
-/// A completed SCSI callback may have declined to free its reusable IRP.
-/// Release that exact forward and its unused free arm only after the caller
-/// has observed provider ACK and source completion. Physical identity remains
-/// checked under the same source and pool locks as terminal free.
-pub(super) fn complete_driver_forward_without_free(
-    ticket: SourceIrpTicket,
-    allocation: SourceIrpAllocation,
+pub(super) fn abandon_scsi_use(
+    use_ticket: SourceIrpUseTicket, allocation: SourceIrpAllocation,
+) -> bool {
+    let _guard = lock();
+    ledger().abandon_scsi_use(use_ticket, allocation).is_ok()
+}
+
+pub(super) fn arm_scsi_deferred_free(
+    use_ticket: SourceIrpUseTicket, allocation: SourceIrpAllocation,
+) -> bool {
+    let _guard = lock();
+    ledger().arm_scsi_deferred_free(use_ticket, allocation).is_ok()
+}
+
+pub(super) fn complete_scsi_use(
+    use_ticket: SourceIrpUseTicket, allocation: SourceIrpAllocation,
 ) -> bool {
     let SourceIrpOwner::HostedDriver(index) = allocation.owner else { return false; };
     let Some(inst) = instance(index) else { return false; };
@@ -2748,12 +2827,8 @@ pub(super) fn complete_driver_forward_without_free(
     let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
         return false;
     };
-    let mut current = unsafe { allocation_unlocked(
-        index, inst, allocation.component_address, allocation.bytes, allocation.stack_count,
-    ) };
-    if let Some(current) = current.as_mut() { current.owner = allocation.owner; }
-    if current != Some(allocation) { return false; }
-    ledger().complete_driver_forward_without_free(ticket, allocation).is_ok()
+    (unsafe { scsi_registered_pool_matches_unlocked(inst, allocation) })
+        && ledger().complete_scsi_use(use_ticket, allocation).is_ok()
 }
 
 unsafe fn caller_terminal_ready_unlocked(ticket: SourceIrpTicket, allocation: SourceIrpAllocation) -> bool {
@@ -2871,6 +2946,48 @@ pub(super) fn release_pending_terminal(ticket: SourceIrpTicket, allocation: Sour
         _ => return false,
     }
     match ledger().begin_deferred_driver_retirement(ticket, allocation) {
+        Ok(SourceIrpRetirement::Deferred(_)) => return true,
+        Ok(SourceIrpRetirement::Retired(exact)) if exact == ticket => {}
+        _ => return false,
+    }
+    if !unsafe { hosted_instance_pool_free_unlocked(inst, allocation.component_address) }
+        || ledger().retire(ticket, allocation).is_err()
+    {
+        unsafe { crate::provider_bugcheck::report(0xc4,
+            [FSD_SERVICE_SOURCE_IRP_LABEL, 2, allocation.component_address, ticket.id.get()]); }
+    }
+    match auxiliary().retire(ticket, allocation) {
+        Ok(_) | Err(SourceIrpAuxiliaryError::NotFound) => {}
+        Err(_) => unsafe { crate::provider_bugcheck::report(0xc4,
+            [FSD_SERVICE_SOURCE_IRP_LABEL, 6, allocation.component_address, ticket.id.get()]); },
+    }
+    true
+}
+
+/// Consume one exact SCSI use after source completion and provider ACK. A
+/// concurrent newer use retains its own pin; only the final use may free the
+/// registered physical allocation.
+pub(super) fn release_pending_scsi_terminal(
+    use_ticket: SourceIrpUseTicket, allocation: SourceIrpAllocation,
+) -> bool {
+    let SourceIrpOwner::HostedDriver(index) = allocation.owner else { return false; };
+    let ticket = use_ticket.registration();
+    let _guard = lock();
+    let Some(inst) = instance(index) else { return false; };
+    if instance_domain_identity(inst) != Some(allocation.domain) { return false; }
+    let Ok(_projection_guard) = hosted_device_allocations::generic_free_admission(
+        inst, allocation.component_address,
+    ) else { return false; };
+    let Some(_pool_guard) = (unsafe { hosted_instance_pool_lock(inst.exec_pool_va) }) else {
+        return false;
+    };
+    if !unsafe { scsi_registered_pool_matches_unlocked(inst, allocation) } { return false; }
+    match auxiliary().snapshot(ticket, allocation) {
+        Ok((owner, phase)) if unsafe { auxiliary_matches_unlocked(index, inst, owner, phase) } => {}
+        Err(SourceIrpAuxiliaryError::NotFound) => {}
+        _ => return false,
+    }
+    match ledger().begin_deferred_scsi_retirement(use_ticket, allocation) {
         Ok(SourceIrpRetirement::Deferred(_)) => return true,
         Ok(SourceIrpRetirement::Retired(exact)) if exact == ticket => {}
         _ => return false,

@@ -10,10 +10,10 @@ use nt_io_manager::{
     hosted_forward_progress::HostedForwardDispatchReply,
     scsi_srb_transport::{bounded_scsi_information, ScsiParameters},
     scsi_srb_wire::decode_scsi_completion,
-    source_irp_ledger::SourceIrpForwardIdentity,
     IoParameters, StackFlags,
 };
 use nt_process::native_handle::{NativeHandleCaller, NativeThreadProcessReference};
+use super::hosted_source_stack_lease::ScsiStackSource;
 
 const INVALID_HANDLE: i32 = nt_status::NtStatus::INVALID_HANDLE.raw();
 const INVALID_PARAMETER: i32 = nt_status::NtStatus::INVALID_PARAMETER.raw();
@@ -39,6 +39,7 @@ struct Work {
     source_completed: bool,
     terminal_status: Option<i32>,
     terminal_information: u64,
+    source_copyback_committed: bool,
     source_published: bool,
     source_released: bool,
     reply_entered: bool,
@@ -85,7 +86,7 @@ unsafe fn wake_after_restore(wake: WakeAction) {
 }
 
 static mut WORK: Vec<Option<Work>> = Vec::new();
-static mut EXECUTING: Vec<(usize, DriverInstance, SourceIrpForwardIdentity)> = Vec::new();
+static mut EXECUTING: Vec<(usize, DriverInstance, ScsiStackSource)> = Vec::new();
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 static CLAIM_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static SCSI_CAPTURE_REFUSAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -118,7 +119,7 @@ fn same_instance(a: DriverInstance, b: DriverInstance) -> bool {
         && a.driver_id == b.driver_id
 }
 
-fn work_index(instance: DriverInstance, identity: SourceIrpForwardIdentity) -> Option<usize> {
+fn work_index(instance: DriverInstance, identity: ScsiStackSource) -> Option<usize> {
     unsafe { &*core::ptr::addr_of!(EXECUTING) }
         .iter()
         .find(|(_, live, source)| same_instance(*live, instance) && *source == identity)
@@ -130,7 +131,7 @@ fn work_index(instance: DriverInstance, identity: SourceIrpForwardIdentity) -> O
                     slot.as_ref().is_some_and(|work| {
                         !work.source_released
                             && same_instance(work.source_instance, instance)
-                            && work.source.source_identity() == identity
+                            && work.source.scsi_identity() == identity
                     })
                 })
         })
@@ -181,7 +182,7 @@ pub(super) unsafe fn submit(
             Ok(source) => source,
             Err(error) => return Some(capture_status(error)),
         };
-    if work_index(source_instance, source.source_identity()).is_some() {
+    if work_index(source_instance, source.scsi_identity()).is_some() {
         source
             .abandon_unentered()
             .expect("duplicate SCSI source rollback");
@@ -268,6 +269,7 @@ pub(super) unsafe fn submit(
         source_completed: false,
         terminal_status: None,
         terminal_information: 0,
+        source_copyback_committed: false,
         source_published: false,
         source_released: false,
         reply_entered: false,
@@ -443,31 +445,43 @@ impl Work {
             .terminal(irp)
             .expect("SCSI exact provider terminal");
         self.provider_terminal = true;
+        self.source_copyback_committed = false;
         if status as u32 == STATUS_PENDING {
-            self.terminal_status = Some(INVALID_DEVICE_REQUEST);
+            self.project_invalid_provider_terminal();
             return;
         }
         let Ok(information) = bounded_scsi_information(information, self.source.data().len())
         else {
-            self.terminal_status = Some(INVALID_DEVICE_REQUEST);
+            self.project_invalid_provider_terminal();
             return;
         };
         self.terminal_information = information;
         let route = self.source.children().route;
         self.terminal_status = Some(match decode_scsi_completion(output, route, irp) {
-            Ok(packet)
-                if self
-                    .source
-                    .write_completion(
-                        packet.srb, packet.data, packet.sense,
-                        packet.claim_result, status,
-                    )
-                    .is_ok() =>
-            {
-                status
+            Ok(packet) => {
+                self.source_copyback_committed = false;
+                if self.source.write_completion(
+                    packet.srb, packet.data, packet.sense,
+                    packet.claim_result, status,
+                ).is_ok() {
+                    self.source_copyback_committed = true;
+                    status
+                } else {
+                    INVALID_DEVICE_REQUEST
+                }
             }
-            _ => INVALID_DEVICE_REQUEST,
+            _ => {
+                self.project_invalid_provider_terminal();
+                return;
+            },
         });
+    }
+
+    unsafe fn project_invalid_provider_terminal(&mut self) {
+        self.terminal_status = Some(INVALID_DEVICE_REQUEST);
+        self.terminal_information = 0;
+        self.source_copyback_committed = self.source
+            .write_error_completion(INVALID_DEVICE_REQUEST).is_ok();
     }
 
     unsafe fn poll_provider(&mut self) {
@@ -506,7 +520,13 @@ impl Work {
     }
 
     unsafe fn publish_source_terminal(&mut self) -> bool {
+        if !self.source_copyback_committed {
+            return false;
+        }
         let Ok(irp) = self.source.source_irp_exec() else {
+            return false;
+        };
+        let Some(provider_irp) = self.provider_irp else {
             return false;
         };
         let status = self.terminal_status.expect("SCSI source terminal");
@@ -520,7 +540,13 @@ impl Work {
             (irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *mut u64,
             self.terminal_information,
         );
-        self.source.arm_callback_free().is_ok()
+        if self.source.arm_callback_free().is_err() {
+            return false;
+        }
+        // The use becomes reusable only after SRB/data/sense copyback, IRP
+        // status and information, and deferred-free ownership are published.
+        // The terminal Reply has not yet been sent to the source driver.
+        hosted_source_irp_ledger::publish_scsi_source(self.source.children(), provider_irp)
     }
 
     unsafe fn retire_provider_and_source(&mut self) -> bool {
@@ -742,7 +768,7 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
     (&mut *core::ptr::addr_of_mut!(EXECUTING)).push((
         index,
         work.source_instance,
-        work.source.source_identity(),
+        work.source.scsi_identity(),
     ));
     CURSOR.store(index as u64 + 1, Ordering::Relaxed);
     let before = (

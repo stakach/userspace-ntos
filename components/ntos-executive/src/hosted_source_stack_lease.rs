@@ -12,7 +12,7 @@ use nt_component_suspension::{peer_registry::PeerRoute, LaneDispatchIdentity};
 use nt_io_manager::retained_connect_forward::{
     ConnectForwardIdentity, ConnectForwardPhase, ConnectStackRange, RetainedConnectForward,
 };
-use nt_io_manager::source_irp_ledger::SourceIrpForwardIdentity;
+use nt_io_manager::source_irp_ledger::{SourceIrpForwardIdentity, SourceIrpUseTicket};
 use nt_io_manager::scsi_source_retention::{scsi_stack_reply_admits, ScsiStackAccess};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,11 +46,32 @@ struct StackLease {
     indeterminate: bool,
 }
 
+/// A stack pin belongs to one submission, even when ClassPnP reuses the same
+/// registered source IRP before the prior provider acknowledgement arrives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ScsiStackSource {
+    forward: SourceIrpForwardIdentity,
+    use_ticket: SourceIrpUseTicket,
+}
+
+impl ScsiStackSource {
+    pub(crate) fn new(
+        forward: SourceIrpForwardIdentity,
+        use_ticket: SourceIrpUseTicket,
+    ) -> Option<Self> {
+        (use_ticket.registration() == forward.ticket()).then_some(Self { forward, use_ticket })
+    }
+
+    pub(crate) fn forward(self) -> SourceIrpForwardIdentity { self.forward }
+
+    pub(crate) fn use_ticket(self) -> SourceIrpUseTicket { self.use_ticket }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum StackLeaseSource {
     Connect(ConnectForwardIdentity),
-    Scsi(SourceIrpForwardIdentity),
-    ScsiData(SourceIrpForwardIdentity),
+    Scsi(ScsiStackSource),
+    ScsiData(ScsiStackSource),
 }
 
 static mut LEASES: Vec<StackLease> = Vec::new();
@@ -238,7 +259,7 @@ pub(crate) unsafe fn capture(
 pub(crate) unsafe fn capture_scsi(
     channel: &crate::spawn_hosts::PumpChannel,
     reply: u64,
-    source_identity: SourceIrpForwardIdentity,
+    source: ScsiStackSource,
     pointer: u64,
 ) -> Option<(SourceStackLeaseId, ConnectStackRange, [u8; 0x58])> {
     let route = runtime::channel_route(channel).ok()??;
@@ -253,7 +274,7 @@ pub(crate) unsafe fn capture_scsi(
     let PhysicalDomain::Hosted(domain) = physical.domain else { return None; };
     let (instance, inst) = instance_for_pump_channel(channel, reply)?;
     if instance_domain_identity(inst) != Some(domain)
-        || source_identity.allocation().domain != domain
+        || source.forward().allocation().domain != domain
         || inst.pml4 != physical.pml4
     { return None; }
     let (owner, range, exec_va) = resolve_stack(
@@ -265,7 +286,7 @@ pub(crate) unsafe fn capture_scsi(
     let id = SourceStackLeaseId(leases.len());
     leases.push(StackLease {
         owner,
-        source: StackLeaseSource::Scsi(source_identity),
+        source: StackLeaseSource::Scsi(source),
         route,
         dispatch,
         reply,
@@ -297,7 +318,7 @@ pub(crate) unsafe fn capture_scsi(
 pub(crate) unsafe fn capture_scsi_data(
     channel: &crate::spawn_hosts::PumpChannel,
     reply: u64,
-    source_identity: SourceIrpForwardIdentity,
+    source: ScsiStackSource,
     pointer: u64,
     length: u32,
 ) -> Option<(SourceStackLeaseId, ConnectStackRange, u64, Vec<u8>)> {
@@ -314,7 +335,7 @@ pub(crate) unsafe fn capture_scsi_data(
     let PhysicalDomain::Hosted(domain) = physical.domain else { return None; };
     let (instance, inst) = instance_for_pump_channel(channel, reply)?;
     if instance_domain_identity(inst) != Some(domain)
-        || source_identity.allocation().domain != domain
+        || source.forward().allocation().domain != domain
         || inst.pml4 != physical.pml4
     { return None; }
     let (owner, range, exec_va) = resolve_stack(
@@ -333,7 +354,7 @@ pub(crate) unsafe fn capture_scsi_data(
         let id = SourceStackLeaseId(leases.len());
         leases.push(StackLease {
             owner,
-            source: StackLeaseSource::ScsiData(source_identity),
+            source: StackLeaseSource::ScsiData(source),
             route,
             dispatch,
             reply,
@@ -364,7 +385,7 @@ pub(crate) unsafe fn capture_scsi_data(
 
 unsafe fn scsi_lease_matches(
     id: SourceStackLeaseId,
-    source: SourceIrpForwardIdentity,
+    source: ScsiStackSource,
     range: ConnectStackRange,
     pointer: u64,
     length: u64,
@@ -416,7 +437,7 @@ unsafe fn scsi_lease_matches(
 
 pub(crate) unsafe fn scsi_matches(
     id: SourceStackLeaseId,
-    source: SourceIrpForwardIdentity,
+    source: ScsiStackSource,
     range: ConnectStackRange,
     pointer: u64,
 ) -> bool {
@@ -425,7 +446,7 @@ pub(crate) unsafe fn scsi_matches(
 
 pub(crate) unsafe fn scsi_data_matches(
     id: SourceStackLeaseId,
-    source: SourceIrpForwardIdentity,
+    source: ScsiStackSource,
     range: ConnectStackRange,
     pointer: u64,
     length: u32,
@@ -442,7 +463,7 @@ pub(crate) unsafe fn scsi_data_matches(
 
 pub(crate) unsafe fn scsi_data_can_write(
     id: SourceStackLeaseId,
-    source: SourceIrpForwardIdentity,
+    source: ScsiStackSource,
     range: ConnectStackRange,
     pointer: u64,
     length: u32,
@@ -474,7 +495,7 @@ pub(crate) unsafe fn scsi_data_can_write(
 
 pub(crate) unsafe fn write_scsi_data(
     id: SourceStackLeaseId,
-    source: SourceIrpForwardIdentity,
+    source: ScsiStackSource,
     range: ConnectStackRange,
     pointer: u64,
     exec_va: u64,
@@ -492,7 +513,7 @@ pub(crate) unsafe fn write_scsi_data(
 
 pub(crate) unsafe fn release_scsi_data(
     id: SourceStackLeaseId,
-    source: SourceIrpForwardIdentity,
+    source: ScsiStackSource,
 ) -> bool {
     let Some(row) = (&mut *core::ptr::addr_of_mut!(LEASES)).get_mut(id.0) else { return false; };
     if !row.pinned || row.indeterminate || row.source != StackLeaseSource::ScsiData(source) {
@@ -505,7 +526,7 @@ pub(crate) unsafe fn release_scsi_data(
 
 pub(crate) unsafe fn write_scsi(
     id: SourceStackLeaseId,
-    source: SourceIrpForwardIdentity,
+    source: ScsiStackSource,
     range: ConnectStackRange,
     pointer: u64,
     completed: &[u8; 0x58],
@@ -521,7 +542,7 @@ pub(crate) unsafe fn write_scsi(
 
 pub(crate) unsafe fn scsi_can_write(
     id: SourceStackLeaseId,
-    source: SourceIrpForwardIdentity,
+    source: ScsiStackSource,
     range: ConnectStackRange,
     pointer: u64,
 ) -> bool {
@@ -540,7 +561,7 @@ pub(crate) unsafe fn scsi_can_write(
 }
 
 pub(crate) unsafe fn release_scsi(
-    id: SourceStackLeaseId, source: SourceIrpForwardIdentity,
+    id: SourceStackLeaseId, source: ScsiStackSource,
 ) -> bool {
     let Some(row) = (&mut *core::ptr::addr_of_mut!(LEASES)).get_mut(id.0) else { return false; };
     if !row.pinned || row.indeterminate || row.source != StackLeaseSource::Scsi(source) {
