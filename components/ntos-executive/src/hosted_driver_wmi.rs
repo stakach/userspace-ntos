@@ -3,7 +3,7 @@
 //! does not advertise GUIDs or accept an event.
 
 use super::*;
-use nt_wmi::{RegInfoTicket, WmiDeviceIdentity, WmiEventOwnership, WmiGuid, WmiRegistry};
+use nt_wmi::{reply::TwoWordReply, RegInfoTicket, WmiDeviceIdentity, WmiEventOwnership, WmiGuid, WmiRegistry};
 
 pub(super) const LABEL: u64 = 0x7E5;
 const OP_PROVIDER_ID: u64 = 1;
@@ -155,20 +155,21 @@ pub(super) extern "win64" fn device_object_to_provider_id(device_object: u64) ->
     let (words, raw, id, extra_a, extra_b) = unsafe {
         call_on4_raw((LABEL << 12) | 4, OP_PROVIDER_ID, device_object, 0, 0)
     };
-    if words != 2 || extra_a != 0 || extra_b != 0
-        || (raw as u32 as i32 == STATUS_SUCCESS && id == 0)
-    {
+    let Some(reply) = TwoWordReply::decode(words, [raw, id, extra_a, extra_b]) else {
         unsafe {
             crate::provider_bugcheck::report(
                 0xc4,
                 [LABEL, OP_PROVIDER_ID, words, raw],
             );
         }
+    };
+    if reply.status == STATUS_SUCCESS && reply.value == 0 {
+        unsafe { crate::provider_bugcheck::report(0xc4, [LABEL, OP_PROVIDER_ID, words, raw]); }
     }
-    if raw as u32 as i32 != STATUS_SUCCESS {
+    if reply.status != STATUS_SUCCESS {
         return 0;
     }
-    u32::try_from(id).unwrap_or(0)
+    u32::try_from(reply.value).unwrap_or(0)
 }
 
 pub(super) fn ticket_operation(
@@ -180,13 +181,12 @@ pub(super) fn ticket_operation(
     let (words, raw, result, extra_a, extra_b) = unsafe {
         call_on4_raw((LABEL << 12) | 4, op, device_object, ticket, value)
     };
-    if words != 2 || extra_a != 0 || extra_b != 0 {
+    let Some(reply) = TwoWordReply::decode(words, [raw, result, extra_a, extra_b]) else {
         unsafe {
             crate::provider_bugcheck::report(0xc4, [LABEL, op, words, raw]);
         }
-    }
-    let status = raw as u32 as i32;
-    if status == STATUS_SUCCESS { Ok(result) } else { Err(status) }
+    };
+    if reply.status == STATUS_SUCCESS { Ok(reply.value) } else { Err(reply.status) }
 }
 
 pub(crate) fn service(

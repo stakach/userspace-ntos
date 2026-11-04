@@ -9,6 +9,7 @@ extern crate alloc;
 
 pub mod reginfo;
 pub mod event;
+pub mod reply;
 
 use alloc::vec::Vec;
 
