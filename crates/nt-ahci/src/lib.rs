@@ -4,7 +4,7 @@
 mod census;
 pub use census::{
     CommandCensus, CommandWindow, CommandWindowSnapshot, DirectReadBucket, DirectReadCensus,
-    DirectReadSnapshot, DirectReadSource, IoOperation, IoSnapshot,
+    DirectReadSnapshot, DirectReadSource, FatOneSectorCallsite, IoOperation, IoSnapshot,
 };
 
 #[cfg(test)]

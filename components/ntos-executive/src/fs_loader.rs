@@ -179,10 +179,14 @@ unsafe fn system32_cache_entries() -> Option<&'static [System32CacheEntry]> {
 
 /// Read `sector` off the disk (via AHCI) and return a pointer to its 512 bytes.
 pub(crate) unsafe fn fat_read_sector(fs: &Fat32, sector: u32) -> Option<*const u8> {
-    fat_read_sector_checked(fs, sector)
+    fat_read_sector_checked(fs, sector, nt_ahci::FatOneSectorCallsite::Other)
 }
 
-unsafe fn fat_read_sector_checked(fs: &Fat32, sector: u32) -> Option<*const u8> {
+unsafe fn fat_read_sector_checked(
+    fs: &Fat32,
+    sector: u32,
+    callsite: nt_ahci::FatOneSectorCallsite,
+) -> Option<*const u8> {
     let disk_lba = nt_fs::checked_partition_lba(fs.volume_start_lba, sector)?;
     let census_started = fs.census.then(disk_census_ticks);
     let status = read_owner_sector(fs.io_owner, fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba);
@@ -192,7 +196,7 @@ unsafe fn fat_read_sector_checked(fs: &Fat32, sector: u32) -> Option<*const u8> 
         1,
         status & nt_ahci::TASK_FILE_FAILURE != 0,
     );
-    direct_read_census_record(nt_ahci::DirectReadSource::Fat, census_started, 1);
+    fat_direct_read_census_record(census_started, 1, callsite);
     if status == 0xFF {
         print_str(b"[fat-sector] read timeout sector=");
         print_u64(sector as u64);
@@ -214,7 +218,11 @@ unsafe fn fat_read_sectors_checked(fs: &Fat32, sector: u32, count: u32) -> Optio
         count as u64,
         status & nt_ahci::TASK_FILE_FAILURE != 0,
     );
-    direct_read_census_record(nt_ahci::DirectReadSource::Fat, census_started, count as u64);
+    fat_direct_read_census_record(
+        census_started,
+        count as u64,
+        nt_ahci::FatOneSectorCallsite::FilePayload,
+    );
     if status == 0xFF {
         print_str(b"[fat-sector] read timeout sector=");
         print_u64(sector as u64);
@@ -248,6 +256,16 @@ pub(crate) fn direct_read_census_record(
     }
 }
 
+fn fat_direct_read_census_record(
+    started: Option<u64>,
+    sectors: u64,
+    callsite: nt_ahci::FatOneSectorCallsite,
+) {
+    if started.is_some() {
+        DIRECT_READ_CENSUS.record_fat(callsite, sectors);
+    }
+}
+
 /// Native-start Ready follows the exact boot-ticket drain, so these are final boot totals.
 pub(crate) fn print_direct_read_census_once() {
     if DIRECT_READ_CENSUS_PRINTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
@@ -274,6 +292,26 @@ pub(crate) fn print_direct_read_census_once() {
         }
         print_str(b"\n");
     }
+    print_str(b"[census] fat-one-sector-callsite");
+    for (callsite, label) in [
+        (nt_ahci::FatOneSectorCallsite::FatLink, b" link=".as_slice()),
+        (nt_ahci::FatOneSectorCallsite::Directory, b" directory=".as_slice()),
+        (nt_ahci::FatOneSectorCallsite::FilePayload, b" payload=".as_slice()),
+        (nt_ahci::FatOneSectorCallsite::Other, b" other=".as_slice()),
+    ] {
+        print_str(label);
+        print_u64(DIRECT_READ_CENSUS.fat_one_sector_calls(callsite));
+    }
+    print_str(b" total=");
+    print_u64(DIRECT_READ_CENSUS.fat_one_sector_total());
+    print_str(b" reconciled=");
+    print_u64(u64::from(
+        DIRECT_READ_CENSUS.fat_one_sector_total()
+            == DIRECT_READ_CENSUS
+                .snapshot(nt_ahci::DirectReadSource::Fat, nt_ahci::DirectReadBucket::One)
+                .commands,
+    ));
+    print_str(b"\n");
 }
 
 unsafe fn fat_cache_invalidate(fs: &Fat32) {
@@ -452,7 +490,8 @@ unsafe fn fat_next_checked(fs: &Fat32, cluster: u32) -> Result<u32, u32> {
             sec,
             off,
             |sector, data| {
-                let p = fat_read_sector_checked(fs, sector).ok_or(nt_fs::STATUS_DATA_ERROR)?;
+                let p = fat_read_sector_checked(fs, sector, nt_ahci::FatOneSectorCallsite::FatLink)
+                    .ok_or(nt_fs::STATUS_DATA_ERROR)?;
                 core::ptr::copy_nonoverlapping(p, data.as_mut_ptr(), data.len());
                 Ok(())
             },
@@ -461,7 +500,8 @@ unsafe fn fat_next_checked(fs: &Fat32, cluster: u32) -> Result<u32, u32> {
     }
     let cache = &mut *((fs.dma_vaddr + FAT32_FAT_CACHE_OFFSET) as *mut FatSectorCacheScratch);
     if cache.valid != 1 || cache.sector != sec {
-        let p = fat_read_sector_checked(fs, sec).ok_or(nt_fs::STATUS_DATA_ERROR)?;
+        let p = fat_read_sector_checked(fs, sec, nt_ahci::FatOneSectorCallsite::FatLink)
+            .ok_or(nt_fs::STATUS_DATA_ERROR)?;
         core::ptr::copy_nonoverlapping(p, cache.data.as_mut_ptr(), cache.data.len());
         cache.sector = sec;
         cache.valid = 1;
@@ -488,7 +528,8 @@ pub(crate) unsafe fn fat_visit_directory_checked(
         },
         dir_cluster,
         |sector| {
-            let data = fat_read_sector_checked(fs, sector).ok_or(nt_fs::STATUS_DATA_ERROR)?;
+            let data = fat_read_sector_checked(fs, sector, nt_ahci::FatOneSectorCallsite::Directory)
+                .ok_or(nt_fs::STATUS_DATA_ERROR)?;
             let mut bytes = [0; 512];
             core::ptr::copy_nonoverlapping(data, bytes.as_mut_ptr(), bytes.len());
             Ok(bytes)
@@ -524,7 +565,11 @@ pub(crate) unsafe fn fat_visit_directory(
         }
         clusters_seen += 1;
         for sector in 0..fs.spc {
-            let data = match fat_read_sector_checked(fs, fat_cluster_sector(fs, cluster) + sector) {
+            let data = match fat_read_sector_checked(
+                fs,
+                fat_cluster_sector(fs, cluster) + sector,
+                nt_ahci::FatOneSectorCallsite::Directory,
+            ) {
                 Some(data) => data,
                 None => return,
             };
@@ -757,7 +802,11 @@ pub(crate) unsafe fn dir_find(
     let mut cl = dir_cluster;
     while cl >= 2 && cl < 0x0FFF_FFF8 {
         for s in 0..fs.spc {
-            let p = fat_read_sector_checked(fs, fat_cluster_sector(fs, cl) + s)?;
+            let p = fat_read_sector_checked(
+                fs,
+                fat_cluster_sector(fs, cl) + s,
+                nt_ahci::FatOneSectorCallsite::Directory,
+            )?;
             for e in 0..(fs.bps as usize / 32) {
                 let ent = p.add(e * 32);
                 let first = *ent;
@@ -988,7 +1037,11 @@ pub(crate) unsafe fn fat_read_file_range(
                 continue;
             }
             let start = within_cluster.saturating_sub(sector_start) as usize;
-            let Some(data) = fat_read_sector_checked(fs, fat_cluster_sector(fs, cluster) + sector)
+            let Some(data) = fat_read_sector_checked(
+                fs,
+                fat_cluster_sector(fs, cluster) + sector,
+                nt_ahci::FatOneSectorCallsite::FilePayload,
+            )
             else {
                 return written;
             };
@@ -1026,7 +1079,11 @@ unsafe fn fat_lookup_metadata(
     let mut lookup = nt_fs::FatPathLookup::new(geometry, start_cluster, path).ok()?;
     loop {
         let request = lookup.request()?;
-        let sector = fat_read_sector_checked(fs, request.sector)?;
+        let callsite = match request.kind {
+            nt_fs::FatPathRequestKind::Fat => nt_ahci::FatOneSectorCallsite::FatLink,
+            nt_fs::FatPathRequestKind::Directory => nt_ahci::FatOneSectorCallsite::Directory,
+        };
+        let sector = fat_read_sector_checked(fs, request.sector, callsite)?;
         let mut bytes = [0; 512];
         core::ptr::copy_nonoverlapping(sector, bytes.as_mut_ptr(), bytes.len());
         match lookup.feed(request, &bytes).ok()? {

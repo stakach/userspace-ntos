@@ -31,17 +31,16 @@ fn executive_fat_and_snapshot_reads_are_attributed_only_after_returned_attempts(
         "pub(crate) fn disk_census_record(",
     );
     let snapshot = body(SNAPSHOT, "    fn read_sectors(", "    fn write_sector(");
-    for (read, source) in [
-        (sector, "DirectReadSource::Fat"),
-        (sectors, "DirectReadSource::Fat"),
-        (snapshot, "DirectReadSource::Snapshot"),
+    for (read, recorder) in [
+        (sector, "fat_direct_read_census_record("),
+        (sectors, "fat_direct_read_census_record("),
+        (snapshot, "direct_read_census_record("),
     ] {
         assert!(read.contains(".then(disk_census_ticks)"));
         assert!(read.contains("disk_census_record("));
-        assert!(read.contains("direct_read_census_record("));
-        assert!(read.contains(source));
+        assert!(read.contains(recorder));
         assert!(
-            read.find("direct_read_census_record(").unwrap()
+            read.find(recorder).unwrap()
                 > read
                     .find("let status =")
                     .unwrap_or_else(|| read.find("let tfd =").unwrap())

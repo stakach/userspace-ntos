@@ -178,6 +178,26 @@ pub enum DirectReadSource {
     Snapshot,
 }
 
+/// Origin of a physical one-sector FAT read attempt. The final boot snapshot is quiescent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FatOneSectorCallsite {
+    FatLink,
+    Directory,
+    FilePayload,
+    Other,
+}
+
+impl FatOneSectorCallsite {
+    const fn index(self) -> usize {
+        match self {
+            Self::FatLink => 0,
+            Self::Directory => 1,
+            Self::FilePayload => 2,
+            Self::Other => 3,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectReadBucket {
     One,
@@ -238,6 +258,7 @@ impl DirectReadCounters {
 pub struct DirectReadCensus {
     fat: [DirectReadCounters; 4],
     snapshot: [DirectReadCounters; 4],
+    fat_one_sector: [AtomicU64; 4],
 }
 
 impl DirectReadCensus {
@@ -255,6 +276,7 @@ impl DirectReadCensus {
                 DirectReadCounters::new(),
                 DirectReadCounters::new(),
             ],
+            fat_one_sector: [const { AtomicU64::new(0) }; 4],
         }
     }
 
@@ -269,9 +291,34 @@ impl DirectReadCensus {
         if sectors == 0 {
             return;
         }
+        if source == DirectReadSource::Fat {
+            self.record_fat(FatOneSectorCallsite::Other, sectors);
+            return;
+        }
         let counters = self.counters(source, DirectReadBucket::for_sectors(sectors));
         counters.commands.fetch_add(1, Ordering::Relaxed);
         counters.sectors.fetch_add(sectors, Ordering::Relaxed);
+    }
+
+    pub fn record_fat(&self, callsite: FatOneSectorCallsite, sectors: u64) {
+        if sectors == 0 {
+            return;
+        }
+        if sectors == 1 {
+            self.fat_one_sector[callsite.index()].fetch_add(1, Ordering::Relaxed);
+        }
+        let counters = self.counters(DirectReadSource::Fat, DirectReadBucket::for_sectors(sectors));
+        counters.commands.fetch_add(1, Ordering::Relaxed);
+        counters.sectors.fetch_add(sectors, Ordering::Relaxed);
+    }
+
+    pub fn fat_one_sector_calls(&self, callsite: FatOneSectorCallsite) -> u64 {
+        self.fat_one_sector[callsite.index()].load(Ordering::Relaxed)
+    }
+
+    /// Exact after the native-start Ready drain; concurrent snapshots are advisory only.
+    pub fn fat_one_sector_total(&self) -> u64 {
+        self.fat_one_sector.iter().map(|count| count.load(Ordering::Relaxed)).sum()
     }
 
     pub fn snapshot(

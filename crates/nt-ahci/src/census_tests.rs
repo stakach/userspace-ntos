@@ -137,3 +137,31 @@ fn direct_read_census_keeps_source_and_request_size_boundaries_separate() {
         DirectReadSnapshot::default()
     );
 }
+
+#[test]
+fn fat_one_sector_callsites_reconcile_with_the_existing_one_sector_bucket() {
+    let census = DirectReadCensus::new();
+    for kind in [
+        FatOneSectorCallsite::FatLink,
+        FatOneSectorCallsite::Directory,
+        FatOneSectorCallsite::FilePayload,
+        FatOneSectorCallsite::Other,
+    ] {
+        census.record_fat(kind, 1);
+    }
+    census.record_fat(FatOneSectorCallsite::FilePayload, 8);
+    census.record(DirectReadSource::Snapshot, 1);
+    assert_eq!(census.fat_one_sector_total(), 4);
+    assert_eq!(
+        census.snapshot(DirectReadSource::Fat, DirectReadBucket::One).commands,
+        census.fat_one_sector_total()
+    );
+    for kind in [
+        FatOneSectorCallsite::FatLink,
+        FatOneSectorCallsite::Directory,
+        FatOneSectorCallsite::FilePayload,
+        FatOneSectorCallsite::Other,
+    ] {
+        assert_eq!(census.fat_one_sector_calls(kind), 1);
+    }
+}
