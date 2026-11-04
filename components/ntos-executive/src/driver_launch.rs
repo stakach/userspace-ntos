@@ -1490,7 +1490,7 @@ const HOSTED_INTERRUPT_OP_ACQUIRE_LOCK: u64 = 3;
 const HOSTED_INTERRUPT_OP_RELEASE_LOCK: u64 = 4;
 const HOSTED_MDL_OP_REGISTER: u64 = 1;
 const HOSTED_MDL_OP_BUILD_NONPAGED: u64 = 2;
-const HOSTED_MDL_OP_UPDATE: u64 = 3;
+const HOSTED_MDL_OP_BIND_PARTIAL: u64 = 3;
 const HOSTED_MDL_OP_UNLOCK: u64 = 4;
 const HOSTED_MDL_OP_FREE: u64 = 5;
 const HOSTED_KINTERRUPT_MAGIC: u64 = 0x4B49_4E54_5250_5431;
@@ -10997,6 +10997,10 @@ extern "win64" fn s_io_build_partial_mdl(
             let (va, len) = nt_mdl::partial_mdl_range(
                 source_address, source_len, virtual_address, length,
             )?;
+            let source_mapped = read_unaligned((source_mdl + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *const u64);
+            let mapped = source_mapped.checked_add(va.checked_sub(source_address)?)?;
+            let source_flags = read_unaligned((source_mdl + nt_mdl::MDL_OFF_FLAGS) as *const i16);
+            let source_process = read_unaligned((source_mdl + nt_mdl::MDL_OFF_PROCESS) as *const u64);
             let target_capacity = component_pool_allocation_capacity(target_mdl)?;
             if target_capacity < nt_mdl::MDL_SIZE as u64 {
                 return None;
@@ -11004,9 +11008,9 @@ extern "win64" fn s_io_build_partial_mdl(
             let declared = read_unaligned((target_mdl + nt_mdl::MDL_OFF_SIZE) as *const i16);
             let required = nt_mdl::mdl_allocation_size(va, len)?;
             (declared >= required as i16 && target_capacity >= declared as u64)
-                .then_some((va, len))
+                .then_some((va, len, mapped, source_flags, source_process))
         })();
-        let Some((va, len)) = binding else {
+        let Some((va, len, mapped, source_flags, source_process)) = binding else {
             s_ke_bug_check_ex(0xC4, 0x4D44_4C53, target_mdl, STATUS_INVALID_PARAMETER as u32 as u64,
                 hosted_thread_correlation());
             return;
@@ -11014,8 +11018,13 @@ extern "win64" fn s_io_build_partial_mdl(
         write_unaligned((target_mdl + nt_mdl::MDL_OFF_NEXT) as *mut u64, 0);
         write_unaligned(
             (target_mdl + nt_mdl::MDL_OFF_FLAGS) as *mut i16,
-            nt_mdl::MDL_MAPPED_TO_SYSTEM_VA,
+            nt_mdl::MDL_PARTIAL
+                | (source_flags & (nt_mdl::MDL_IO_PAGE_READ
+                    | nt_mdl::MDL_SOURCE_IS_NONPAGED_POOL
+                    | nt_mdl::MDL_MAPPED_TO_SYSTEM_VA
+                    | nt_mdl::MDL_IO_SPACE)),
         );
+        write_unaligned((target_mdl + nt_mdl::MDL_OFF_PROCESS) as *mut u64, source_process);
         write_unaligned(
             (target_mdl + nt_mdl::MDL_OFF_START_VA) as *mut u64,
             va & !0xFFF,
@@ -11027,9 +11036,9 @@ extern "win64" fn s_io_build_partial_mdl(
         );
         write_unaligned(
             (target_mdl + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *mut u64,
-            va,
+            mapped,
         );
-        require_hosted_mdl_service(HOSTED_MDL_OP_UPDATE, target_mdl, va, len as u64);
+        require_hosted_mdl_service(HOSTED_MDL_OP_BIND_PARTIAL, target_mdl, source_mdl, 0);
     }
 }
 
@@ -11081,12 +11090,12 @@ extern "win64" fn s_mm_unlock_pages(mdl: u64) {
         if mdl == 0 {
             return;
         }
+        require_hosted_mdl_service(HOSTED_MDL_OP_UNLOCK, mdl, 0, 0);
         let flags = read_unaligned((mdl + nt_mdl::MDL_OFF_FLAGS) as *const i16);
         write_unaligned(
             (mdl + nt_mdl::MDL_OFF_FLAGS) as *mut i16,
             flags & !nt_mdl::MDL_PAGES_LOCKED,
         );
-        require_hosted_mdl_service(HOSTED_MDL_OP_UNLOCK, mdl, 0, 0);
     }
 }
 
@@ -65145,42 +65154,106 @@ unsafe fn service_hosted_driver_mdl_for_instance(
                 Err(error) => hosted_mdl_status(error).raw(),
             }
         }
-        HOSTED_MDL_OP_UPDATE => {
-            let Ok(length) = u32::try_from(length) else {
-                return STATUS_INVALID_PARAMETER;
-            };
-            let Some(required_bytes) = nt_mdl::mdl_allocation_size(virtual_address, length) else {
-                return STATUS_INVALID_PARAMETER;
-            };
-            if virtual_address == 0 {
-                return STATUS_INVALID_PARAMETER;
-            }
-            let Some(mdl_exec) =
-                hosted_instance_pool_allocation_exec_if_live(inst, mdl, nt_mdl::MDL_SIZE as u64)
-            else {
-                return STATUS_INVALID_PARAMETER;
-            };
-            let declared_bytes = read_unaligned((mdl_exec + nt_mdl::MDL_OFF_SIZE) as *const i16);
-            if declared_bytes < required_bytes as i16
-                || hosted_instance_pool_allocation_exec_if_live(inst, mdl, declared_bytes as u64)
-                    .is_none()
-                || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_START_VA) as *const u64)
-                != virtual_address & !0xfff
-                || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32) != length
-                || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32)
-                    != (virtual_address & 0xfff) as u32
+        HOSTED_MDL_OP_BIND_PARTIAL => {
+            let source_mdl = virtual_address;
+            if length != 0 || source_mdl == 0 || source_mdl == mdl
+                || !hosted_source_irp_ledger::mdl_release_allowed(instance_index, caller_domain, mdl)
             {
                 return STATUS_INVALID_PARAMETER;
             }
-            match hosted_mdl_registry_mut().update_key(key, virtual_address, length) {
+            let Some(source_key) = hosted_mdl_key(caller_domain, source_mdl) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let registry = hosted_mdl_registry_mut();
+            let Some(target_allocated) = registry.allocated_bytes_for_key(key) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let Some(source_allocated) = registry.allocated_bytes_for_key(source_key) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let Some(target_exec) = hosted_instance_pool_allocation_exec_if_live(
+                inst, mdl, u64::from(target_allocated),
+            ) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let Some(source_exec) = hosted_instance_pool_allocation_exec_if_live(
+                inst, source_mdl, u64::from(source_allocated),
+            ) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let Some(source_id) = registry.id_for(source_key) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            if !registry.is_locked(source_id) {
+                return STATUS_INVALID_PARAMETER;
+            }
+            let Some(source_address) = registry.virtual_address(source_id) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let Some(source_length) = registry.byte_count(source_id) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let source_flags = read_unaligned((source_exec + nt_mdl::MDL_OFF_FLAGS) as *const i16);
+            let source_start = read_unaligned((source_exec + nt_mdl::MDL_OFF_START_VA) as *const u64);
+            let source_offset = read_unaligned((source_exec + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32);
+            let source_mapped = read_unaligned((source_exec + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *const u64);
+            let source_process = read_unaligned((source_exec + nt_mdl::MDL_OFF_PROCESS) as *const u64);
+            if read_unaligned((source_exec + nt_mdl::MDL_OFF_SIZE) as *const i16)
+                != source_allocated as i16
+                || read_unaligned((source_exec + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32)
+                    != source_length
+                || source_start != source_address & !0xfff
+                || source_offset != (source_address & 0xfff) as u32
+                || source_mapped != source_address
+                || source_flags & (nt_mdl::MDL_PAGES_LOCKED
+                    | nt_mdl::MDL_SOURCE_IS_NONPAGED_POOL) == 0
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+            let target_start = read_unaligned((target_exec + nt_mdl::MDL_OFF_START_VA) as *const u64);
+            let target_offset = read_unaligned((target_exec + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32);
+            let Some(address) = target_start.checked_add(u64::from(target_offset)) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let target_length = read_unaligned((target_exec + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32);
+            let target_flags = read_unaligned((target_exec + nt_mdl::MDL_OFF_FLAGS) as *const i16);
+            let expected_flags = nt_mdl::MDL_PARTIAL
+                | (source_flags & (nt_mdl::MDL_IO_PAGE_READ
+                    | nt_mdl::MDL_SOURCE_IS_NONPAGED_POOL
+                    | nt_mdl::MDL_MAPPED_TO_SYSTEM_VA
+                    | nt_mdl::MDL_IO_SPACE));
+            let Some(required_bytes) = nt_mdl::mdl_allocation_size(address, target_length) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            if read_unaligned((target_exec + nt_mdl::MDL_OFF_SIZE) as *const i16)
+                != target_allocated as i16
+                || required_bytes > target_allocated
+                || target_start != address & !0xfff
+                || target_offset != (address & 0xfff) as u32
+                || target_flags != expected_flags
+                || read_unaligned((target_exec + nt_mdl::MDL_OFF_PROCESS) as *const u64)
+                    != source_process
+                || read_unaligned((target_exec + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *const u64)
+                    != address
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+            match registry.bind_partial_key(source_key, key, address, target_length) {
                 Ok(()) => STATUS_SUCCESS,
                 Err(error) => hosted_mdl_status(error).raw(),
             }
         }
-        HOSTED_MDL_OP_UNLOCK => match hosted_mdl_registry_mut().unlock_key(key) {
+        HOSTED_MDL_OP_UNLOCK => {
+            if !hosted_source_irp_ledger::partial_source_retirement_allowed(
+                instance_index, caller_domain, mdl,
+            ) {
+                return nt_status::NtStatus::PENDING.raw();
+            }
+            match hosted_mdl_registry_mut().unlock_key(key) {
                 Ok(()) => STATUS_SUCCESS,
                 Err(error) => hosted_mdl_status(error).raw(),
-        },
+            }
+        }
         HOSTED_MDL_OP_FREE => {
             if !hosted_source_irp_ledger::mdl_release_allowed(instance_index, caller_domain, mdl) {
                 return nt_status::NtStatus::PENDING.raw();

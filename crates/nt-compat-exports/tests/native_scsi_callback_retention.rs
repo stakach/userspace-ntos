@@ -25,8 +25,8 @@ mod nt_io_manager {{ pub mod scsi_source_retention {{
     }}
     for phase in [Terminal, ProviderAcknowledged, SourceCompleted, ReadyToRelease] {{
         assert!(scsi_after_callback_phase(Some(phase), true));
-        assert!(!scsi_after_callback_phase(Some(phase), false),
-            "ordinary terminal still requires live child validation");
+        assert!(scsi_after_callback_phase(Some(phase), false),
+            "a terminal callback may unlock its source MDL without requesting IRP free");
     }}
 }}
 "#);
@@ -47,8 +47,12 @@ mod nt_io_manager {{ pub mod scsi_source_retention {{
     let capture = include_str!("../../../components/ntos-executive/src/hosted_scsi_srb_capture.rs");
     let start = capture.find("pub(super) fn validate_retained(&self)").unwrap();
     let end = start + capture[start..].find("\n    /// Re-observe").unwrap();
-    assert!(capture[start..end].contains("scsi_children_match_after_callback("));
-    assert!(capture[start..end].contains("scsi_children_match_current("));
+    let validation = &capture[start..end];
+    assert!(validation.contains("scsi_children_match_after_callback("));
+    assert!(validation.contains("scsi_children_match_current("));
+    assert!(!validation.contains(
+        "if hosted_source_irp_ledger::deferred_free_requested(self.ticket) {"
+    ), "terminal retained validation must not depend solely on a deferred IRP free request");
     assert!(ledger.contains("observed == Some(children.source)"),
         "callback lookup still validates the pinned allocation generation");
 }

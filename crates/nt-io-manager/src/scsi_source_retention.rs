@@ -22,7 +22,7 @@ pub struct ScsiSourceChildren {
     pub ticket: SourceIrpTicket,
     pub route: ScsiSrbRoute,
     pub srb: ScsiSrbSource,
-    pub sense: Option<SourcePoolAllocationIdentity>,
+    pub sense: Option<SourceMemoryIdentity>,
     pub sense_length: u8,
     pub mdl: Option<SourceMdlAllocationIdentity>,
     pub data: Option<SourceMemoryIdentity>,
@@ -283,7 +283,8 @@ impl ScsiSourceRetentionLedger {
         self.rows.iter().any(|row| row.children.source.owner == owner
             && row.children.source.domain == domain
             && (matches!(row.children.srb, ScsiSrbSource::Pool(srb) if srb.component_address == address)
-                || row.children.sense.is_some_and(|sense| sense.component_address == address)
+                || matches!(row.children.sense, Some(SourceMemoryIdentity::Pool { allocation, .. })
+                    if allocation.component_address == address)
                 || row.children.mdl.is_some_and(|mdl| mdl.pool.component_address == address)
                 || matches!(row.children.data, Some(SourceMemoryIdentity::Pool { allocation, .. })
                     if allocation.component_address == address)))
@@ -302,6 +303,27 @@ impl ScsiSourceRetentionLedger {
                     .children
                     .mdl
                     .is_some_and(|mdl| mdl.pool.component_address == address)
+        })
+    }
+
+    /// A partial packet MDL may refer to a distinct source MDL. Protect that
+    /// source while provider effects are pending or uncertain. A terminal
+    /// callback may unlock its source after the result is retained.
+    pub fn protects_partial_source_in_flight(
+        &self,
+        owner: SourceIrpOwner,
+        domain: HostedDomainIdentity,
+        mut target_matches: impl FnMut(u64) -> bool,
+    ) -> bool {
+        self.rows.iter().any(|row| {
+            row.children.source.owner == owner
+                && row.children.source.domain == domain
+                && matches!(row.phase,
+                    ScsiSourcePhase::Prepared | ScsiSourcePhase::Entered
+                        | ScsiSourcePhase::Pending | ScsiSourcePhase::Uncertain)
+                && row.children.mdl.is_some_and(|mdl| {
+                    target_matches(mdl.pool.component_address)
+                })
         })
     }
 
@@ -366,8 +388,20 @@ fn valid(children: ScsiSourceChildren) -> bool {
     };
     let sense_valid = match (children.sense_length, children.sense) {
         (0, None) => true,
-        (length, Some(sense)) => length != 0 && sense.component_address != 0
-            && sense.capacity >= u64::from(length) && sense.pool_generation != 0,
+        (length, Some(SourceMemoryIdentity::Pool {
+            allocation, component_address, bytes,
+        })) => {
+            length != 0
+                && bytes == u64::from(length)
+                && allocation.component_address != 0
+                && allocation.capacity != 0
+                && allocation.pool_generation != 0
+                && component_address >= allocation.component_address
+                && component_address.checked_add(bytes).is_some_and(|end| {
+                    allocation.component_address.checked_add(allocation.capacity)
+                        .is_some_and(|allocation_end| end <= allocation_end)
+                })
+        }
         _ => false,
     };
     let data_valid = match (children.transfer_length, children.data, children.mdl) {
@@ -477,10 +511,14 @@ mod tests {
                 capacity: 0x58,
                 pool_generation: 5,
             }),
-            sense: Some(SourcePoolAllocationIdentity {
+            sense: Some(SourceMemoryIdentity::Pool {
+                allocation: SourcePoolAllocationIdentity {
+                    component_address: 0x5000,
+                    capacity: 0x20,
+                    pool_generation: 12,
+                },
                 component_address: 0x5000,
-                capacity: 0x20,
-                pool_generation: 12,
+                bytes: 0x20,
             }),
             sense_length: 0x20,
             mdl: Some(SourceMdlAllocationIdentity {
@@ -620,6 +658,29 @@ mod tests {
         ledger.source_completed(children, irp).unwrap();
         ledger.release(children).unwrap();
         assert!(!ledger.protects_pool(children.source.owner, children.source.domain, 0x2000));
+    }
+
+    #[test]
+    fn partial_source_is_protected_only_while_provider_effect_is_in_flight() {
+        let mut ledger = ScsiSourceRetentionLedger::new();
+        let children = fixture();
+        let owner = children.source.owner;
+        let domain = children.source.domain;
+        let irp = IrpId::new(3, 17);
+        ledger.retain(children).unwrap();
+        let protects = |ledger: &ScsiSourceRetentionLedger| {
+            ledger.protects_partial_source_in_flight(owner, domain, |address| address == 0x3000)
+        };
+        assert!(protects(&ledger));
+        assert!(!ledger.protects_partial_source_in_flight(owner, domain, |address| address == 0x3010));
+        ledger.enter(children, irp).unwrap();
+        ledger.pending(children, irp).unwrap();
+        assert!(protects(&ledger));
+        ledger.uncertain(children, irp).unwrap();
+        assert!(protects(&ledger));
+        ledger.terminal(children, irp).unwrap();
+        assert!(!protects(&ledger));
+        assert!(ledger.protects_mdl(owner, domain, 0x3000));
     }
 
     #[test]
@@ -795,7 +856,9 @@ mod tests {
         ledger.retain(children).unwrap();
         assert!(ledger.protects_pool(children.source.owner, children.source.domain, 0x5000));
         let mut stale = children;
-        stale.sense.as_mut().unwrap().pool_generation += 1;
+        if let Some(SourceMemoryIdentity::Pool { allocation, .. }) = &mut stale.sense {
+            allocation.pool_generation += 1;
+        }
         assert!(!ledger.contains_exact(stale));
         ledger.abandon_prepared(children).unwrap();
 
@@ -803,10 +866,58 @@ mod tests {
         missing.sense = None;
         assert_eq!(ledger.retain(missing), Err(ScsiSourceRetentionError::Invalid));
         let mut short = children;
-        short.sense.as_mut().unwrap().capacity = 0x1f;
+        if let Some(SourceMemoryIdentity::Pool { allocation, .. }) = &mut short.sense {
+            allocation.capacity = 0x1f;
+        }
         assert_eq!(ledger.retain(short), Err(ScsiSourceRetentionError::Invalid));
         let mut zero = children;
         zero.sense_length = 0;
         assert_eq!(ledger.retain(zero), Err(ScsiSourceRetentionError::Invalid));
+    }
+
+    #[test]
+    fn embedded_sense_range_retains_exact_pool_generation_and_offset() {
+        let mut children = fixture();
+        let allocation = SourcePoolAllocationIdentity {
+            component_address: 0x5000,
+            capacity: 0x100,
+            pool_generation: 12,
+        };
+        children.sense = Some(SourceMemoryIdentity::Pool {
+            allocation,
+            component_address: 0x5060,
+            bytes: 0x20,
+        });
+        let mut ledger = ScsiSourceRetentionLedger::new();
+        ledger.retain(children)
+            .expect("ClassPnP embeds its sense buffer inside a live transfer-packet allocation");
+        assert!(ledger.protects_pool(children.source.owner, children.source.domain, 0x5000));
+
+        let mut escaped = children;
+        escaped.sense = Some(SourceMemoryIdentity::Pool {
+            allocation,
+            component_address: 0x50f0,
+            bytes: 0x20,
+        });
+        assert_eq!(ScsiSourceRetentionLedger::new().retain(escaped),
+            Err(ScsiSourceRetentionError::Invalid));
+
+        let mut stale = children;
+        stale.sense = Some(SourceMemoryIdentity::Pool {
+            allocation: SourcePoolAllocationIdentity { pool_generation: 0, ..allocation },
+            component_address: 0x5060,
+            bytes: 0x20,
+        });
+        assert_eq!(ScsiSourceRetentionLedger::new().retain(stale),
+            Err(ScsiSourceRetentionError::Invalid));
+
+        let mut wrong_length = children;
+        wrong_length.sense = Some(SourceMemoryIdentity::Pool {
+            allocation,
+            component_address: 0x5060,
+            bytes: 0x10,
+        });
+        assert_eq!(ScsiSourceRetentionLedger::new().retain(wrong_length),
+            Err(ScsiSourceRetentionError::Invalid));
     }
 }

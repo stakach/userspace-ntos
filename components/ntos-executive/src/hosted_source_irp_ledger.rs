@@ -201,9 +201,14 @@ pub(super) fn capture_scsi_children(
     let (sense_identity, sense_bytes) = if sense_length == 0 {
         (None, None)
     } else {
-        let identity = unsafe { exact_pool_identity_unlocked(
+        let allocation = unsafe { pool_range_identity_unlocked(
             inst, sense_address, u64::from(sense_length),
         )? };
+        let identity = SourceMemoryIdentity::Pool {
+            allocation,
+            component_address: sense_address,
+            bytes: u64::from(sense_length),
+        };
         let sense_exec = inst.exec_pool_va.checked_add(sense_address.checked_sub(FSD_POOL_VADDR)?)?;
         let sense_slice = unsafe { core::slice::from_raw_parts(
             sense_exec as *const u8, usize::from(sense_length),
@@ -375,8 +380,7 @@ pub(super) fn scsi_children_match_current(
                 }),
         }
         && children.sense.is_none_or(|sense| unsafe {
-            exact_pool_identity_unlocked(inst, sense.component_address,
-                u64::from(children.sense_length)) == Some(sense)
+            scsi_sense_matches_unlocked(inst, sense, children.sense_length)
         })
         && children.mdl.is_none_or(|mdl| unsafe {
             mdl_identity_matches_unlocked(inst, children.source.domain, mdl)
@@ -390,16 +394,15 @@ pub(super) fn scsi_children_match_current(
         })
 }
 
-/// The source completion callback may unlock its MDL and request deferred IRP free before
-/// returning MORE_PROCESSING_REQUIRED. At that point child liveness is no longer a valid
-/// lookup key. The exact source allocation is still pinned, and its child row remains owned
-/// through provider ACK and source completion.
+/// A terminal source callback may unlock its MDL before returning
+/// MORE_PROCESSING_REQUIRED. The exact source allocation and child row remain
+/// owned through provider ACK and source completion.
 fn scsi_after_callback_phase(
     phase: Option<nt_io_manager::scsi_source_retention::ScsiSourcePhase>,
-    deferred_free_requested: bool,
+    _deferred_free_requested: bool,
 ) -> bool {
     use nt_io_manager::scsi_source_retention::ScsiSourcePhase;
-    deferred_free_requested && matches!(phase,
+    matches!(phase,
         Some(ScsiSourcePhase::Terminal | ScsiSourcePhase::ProviderAcknowledged
             | ScsiSourcePhase::SourceCompleted | ScsiSourcePhase::ReadyToRelease))
 }
@@ -410,10 +413,11 @@ pub(super) fn scsi_children_match_after_callback(
     data_stack_lease: Option<hosted_source_stack_lease::SourceStackLeaseId>,
 ) -> bool {
     let _guard = lock();
+    let deferred_free_requested = ledger().deferred_free_requested(children.ticket);
     if !scsi_children().contains_exact(children)
         || !scsi_after_callback_phase(
             scsi_children().phase(children.ticket),
-            ledger().deferred_free_requested(children.ticket),
+            deferred_free_requested,
         )
         || !ledger().admits_forward(children.ticket, children.source)
     { return false; }
@@ -426,6 +430,25 @@ pub(super) fn scsi_children_match_after_callback(
         children.source.component_address, children.source.bytes, children.source.stack_count) };
     if let Some(source) = observed.as_mut() { source.owner = children.source.owner; }
     observed == Some(children.source)
+        && (deferred_free_requested ||
+            match children.srb {
+                nt_io_manager::scsi_source_retention::ScsiSrbSource::Pool(pool) => unsafe {
+                    exact_pool_identity_unlocked(inst, pool.component_address, 0x58) == Some(pool)
+                },
+                nt_io_manager::scsi_source_retention::ScsiSrbSource::Stack { .. } => true,
+            })
+        && (deferred_free_requested || children.sense.is_none_or(|sense| unsafe {
+            scsi_sense_matches_unlocked(inst, sense, children.sense_length)
+        }))
+        && (deferred_free_requested || children.mdl.is_none_or(|mdl| unsafe {
+            mdl_identity_retained_matches_unlocked(inst, children.source.domain, mdl)
+        }))
+        && (deferred_free_requested || children.data.is_none_or(|data| match data {
+            SourceMemoryIdentity::Pool { .. } => unsafe {
+                memory_identity_matches_unlocked(instance_index, inst, data)
+            },
+            SourceMemoryIdentity::MappedRange { .. } => true,
+        }))
         && scsi_data_stack_matches(children, data_stack_lease)
         && match children.srb {
             nt_io_manager::scsi_source_retention::ScsiSrbSource::Pool(_) => true,
@@ -528,6 +551,22 @@ pub(super) unsafe fn exact_pool_identity_unlocked(
 ) -> Option<SourcePoolAllocationIdentity> {
     let identity = pool_range_identity_unlocked(inst, component_address, bytes)?;
     (identity.component_address == component_address).then_some(identity)
+}
+
+/// A retained sense buffer may be embedded in a larger transfer packet. Recheck the
+/// exact allocation generation and the original byte range before source copyback.
+pub(super) unsafe fn scsi_sense_matches_unlocked(
+    inst: DriverInstance,
+    sense: SourceMemoryIdentity,
+    length: u8,
+) -> bool {
+    match sense {
+        SourceMemoryIdentity::Pool { allocation, component_address, bytes }
+            if length != 0 && bytes == u64::from(length) => {
+                pool_range_identity_unlocked(inst, component_address, bytes) == Some(allocation)
+            }
+        _ => false,
+    }
 }
 
 /// Capture constructor-owned graph members under the root pool lock, before the driver can
@@ -664,10 +703,16 @@ unsafe fn mdl_identity_unlocked(
     let raw_start = read_unaligned((mdl_exec + nt_mdl::MDL_OFF_START_VA) as *const u64);
     let raw_offset = read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32);
     let raw_size = read_unaligned((mdl_exec + nt_mdl::MDL_OFF_SIZE) as *const i16);
+    let partial = raw_flags & nt_mdl::MDL_PARTIAL != 0;
     if nt_mdl::mdl_allocation_size(virtual_address, expected_length)
         .is_none_or(|required| raw_size < required as i16 || pool.capacity < raw_size as u64)
         || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32) != expected_length
-        || raw_flags & nt_mdl::MDL_PAGES_LOCKED == 0
+        || (if partial {
+            !registry.is_partial_key(key)
+                || registry.allocated_bytes_for_key(key) != Some(raw_size as u16)
+        } else {
+            raw_flags & nt_mdl::MDL_PAGES_LOCKED == 0
+        })
         || raw_start.checked_add(u64::from(raw_offset)) != Some(virtual_address)
     {
         return None;
@@ -697,6 +742,28 @@ unsafe fn mdl_identity_matches_unlocked(
     let registry = hosted_mdl_registry_mut();
     registry.id_for(key).is_some_and(|id| {
         registry.generation(id) == Some(mdl.registry_generation) && registry.is_locked(id)
+    })
+}
+
+/// Once a provider result is terminal, a callback may have unlocked the
+/// partial MDL's source. The target still has to be the same physical pool
+/// allocation and registry generation retained at capture.
+unsafe fn mdl_identity_retained_matches_unlocked(
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    mdl: SourceMdlAllocationIdentity,
+) -> bool {
+    if exact_pool_identity_unlocked(inst, mdl.pool.component_address, nt_mdl::MDL_SIZE as u64)
+        != Some(mdl.pool)
+    {
+        return false;
+    }
+    let Some(key) = hosted_mdl_key(domain, mdl.pool.component_address) else {
+        return false;
+    };
+    let registry = hosted_mdl_registry_mut();
+    registry.id_for(key).is_some_and(|id| {
+        registry.generation(id) == Some(mdl.registry_generation)
     })
 }
 
@@ -2505,6 +2572,34 @@ pub(super) fn matches(
     }
 }
 
+fn partial_source_in_flight_unlocked(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+    source_mdl: u64,
+) -> bool {
+    let Some(source_key) = hosted_mdl_key(domain, source_mdl) else {
+        return false;
+    };
+    scsi_children().protects_partial_source_in_flight(
+        SourceIrpOwner::HostedDriver(instance_index), domain, |target_mdl| {
+            hosted_mdl_key(domain, target_mdl).is_some_and(|target_key| unsafe {
+                hosted_mdl_registry_mut().is_partial_target_of(source_key, target_key)
+            })
+        },
+    )
+}
+
+/// A source may be unlocked by its terminal completion callback, but not while
+/// a partial target still owns a pending or uncertain provider effect.
+pub(super) fn partial_source_retirement_allowed(
+    instance_index: usize,
+    domain: HostedDomainIdentity,
+    source_mdl: u64,
+) -> bool {
+    let _guard = lock();
+    !partial_source_in_flight_unlocked(instance_index, domain, source_mdl)
+}
+
 pub(super) fn mdl_release_allowed(
     instance_index: usize,
     domain: HostedDomainIdentity,
@@ -2513,6 +2608,7 @@ pub(super) fn mdl_release_allowed(
     let _guard = lock();
     !auxiliary().protected_pool_child(SourceIrpOwner::HostedDriver(instance_index), domain, mdl)
         && !scsi_children().protects_mdl(SourceIrpOwner::HostedDriver(instance_index), domain, mdl)
+        && !partial_source_in_flight_unlocked(instance_index, domain, mdl)
 }
 
 pub(super) fn unpin(ticket: SourceIrpTicket) -> bool {

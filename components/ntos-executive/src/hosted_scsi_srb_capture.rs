@@ -152,6 +152,15 @@ impl CapturedSourceScsi {
             .map_err(|_| CaptureError::InvalidSrb)?;
         let inst = instance(self.instance_index).ok_or(CaptureError::InvalidSource)?;
         let memory = SourcePoolMemory::new(inst).ok_or(CaptureError::InvalidSource)?;
+        let sense_address = match self.children.sense {
+            Some(identity @ nt_io_manager::source_irp_auxiliary::SourceMemoryIdentity::Pool {
+                component_address, ..
+            }) if hosted_source_irp_ledger::scsi_sense_matches_unlocked(
+                inst, identity, self.children.sense_length,
+            ) => Some(component_address),
+            None if sense.is_empty() => None,
+            _ => return Err(CaptureError::InvalidSource),
+        };
         let data_address = match self.children.data {
             Some(nt_io_manager::source_irp_auxiliary::SourceMemoryIdentity::Pool {
                 component_address, ..
@@ -178,9 +187,7 @@ impl CapturedSourceScsi {
         // Validate all destinations before the first write while holding the pool lock.
         if !stack_data_ready
             || data_address.is_some_and(|address| !memory.contains(address, data.len()))
-            || self.children.sense.is_some_and(|child| !memory.contains(
-                child.component_address, sense.len(),
-            ))
+            || sense_address.is_some_and(|address| !memory.contains(address, sense.len()))
             || match self.children.srb {
                 nt_io_manager::scsi_source_retention::ScsiSrbSource::Pool(pool) =>
                     !memory.contains(pool.component_address, merged.len()),
@@ -201,8 +208,8 @@ impl CapturedSourceScsi {
                 lease, self.source_identity(), range, component_address, exec_address, data,
             ) { return Err(CaptureError::InvalidSource); }
         }
-        if let Some(child) = self.children.sense {
-            if !memory.write(child.component_address, sense) {
+        if let Some(address) = sense_address {
+            if !memory.write(address, sense) {
                 return Err(CaptureError::InvalidSource);
             }
         }
@@ -229,15 +236,11 @@ impl CapturedSourceScsi {
     /// source pool children safe to discard before the caller-local completion and ACK.
     pub(super) fn validate_retained(&self) -> Result<(), CaptureError> {
         if !self.source_pinned
-            || !(if hosted_source_irp_ledger::deferred_free_requested(self.ticket) {
-                hosted_source_irp_ledger::scsi_children_match_after_callback(
+            || !(hosted_source_irp_ledger::scsi_children_match_current(
                     self.instance_index, self.children, self.stack_lease, self.data_stack_lease,
-                )
-            } else {
-                hosted_source_irp_ledger::scsi_children_match_current(
+                ) || hosted_source_irp_ledger::scsi_children_match_after_callback(
                     self.instance_index, self.children, self.stack_lease, self.data_stack_lease,
-                )
-            })
+                ))
         {
             return Err(CaptureError::InvalidSource);
         }

@@ -87,6 +87,9 @@ pub fn partial_mdl_range(
 pub const MDL_MAPPED_TO_SYSTEM_VA: i16 = 0x0001;
 pub const MDL_SOURCE_IS_NONPAGED_POOL: i16 = 0x0004;
 pub const MDL_PAGES_LOCKED: i16 = 0x0002;
+pub const MDL_PARTIAL: i16 = 0x0010;
+pub const MDL_IO_PAGE_READ: i16 = 0x0040;
+pub const MDL_IO_SPACE: i16 = 0x0800;
 
 /// Why an MDL operation was rejected (spec §8.4, §25).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -315,6 +318,28 @@ impl MdlRegistry {
     /// partial bindings and mutations to the public `MDL.Size` field.
     pub fn allocated_bytes_for_key(&self, key: MdlKey) -> Option<u16> {
         self.find_key(key)?.allocated_bytes
+    }
+
+    /// Whether the exact live target derives its readable range from a source
+    /// MDL rather than its own page lock.
+    pub fn is_partial_key(&self, key: MdlKey) -> bool {
+        self.find_key(key)
+            .is_some_and(|record| self.partial_source_matches(record))
+    }
+
+    /// Match a live partial target to this source's exact registration, rather
+    /// than another MDL later allocated at the same component address.
+    pub fn is_partial_target_of(&self, source: MdlKey, target: MdlKey) -> bool {
+        let Some(source_record) = self.find_key(source) else {
+            return false;
+        };
+        self.find_key(target).is_some_and(|target_record| {
+            target_record.partial_source.is_some_and(|binding| {
+                binding.key == source
+                    && binding.id == source_record.id
+                    && binding.generation == source_record.generation
+            }) && self.partial_source_matches(target_record)
+        })
     }
 
     pub fn build_for_nonpaged_key(&mut self, key: MdlKey) -> Result<(), MdlError> {
@@ -759,6 +784,8 @@ mod tests {
         assert_eq!(registry.byte_count(target_id), Some(4096));
         assert_eq!(registry.allocated_bytes_for_key(target), shell_bytes);
         assert!(registry.is_locked(target_id));
+        assert!(registry.is_partial_key(target));
+        assert!(registry.is_partial_target_of(source, target));
         assert_eq!(registry.validate_slice(target_id, 0, 4096), Ok(()));
     }
 
@@ -819,6 +846,8 @@ mod tests {
         registry.register(source, 0x40_0000, 4096).unwrap();
         registry.build_for_nonpaged_key(source).unwrap();
         assert!(!registry.is_locked(target_id));
+        assert!(!registry.is_partial_key(target));
+        assert!(!registry.is_partial_target_of(source, target));
         assert_eq!(registry.acquire_read_lease(target, 0, 1), Err(MdlError::StaleId));
     }
 
