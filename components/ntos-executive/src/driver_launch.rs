@@ -50873,6 +50873,9 @@ pub(crate) fn probe_kernel_volume_file(device_path: &str) -> bool {
     let Some(mount) = crate::mounted_volume::mount_id_for_live_device(device.raw()) else {
         return false;
     };
+    if !crate::mounted_volume::boot_inline_read_admitted(mount) {
+        return false;
+    }
     let client = ClientId(IO_MANAGER_COMPONENT_ID);
     let name = nt_types::UnicodeString::from_str(crate::installed_layout::ARIAL_STR);
     let Ok(file) = io_manager_mut().allocate_external_file(

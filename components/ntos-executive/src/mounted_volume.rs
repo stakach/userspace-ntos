@@ -46,6 +46,13 @@ pub(crate) fn mounted_sector_claimable() -> Option<bool> {
 /// The published File device with both its physical FAT and logical File mount owners.
 static mut EXEC_VOLUME_DEVICE: Option<ExecVolumeDevice> = None;
 
+/// Synchronous boot probes may read only the mount route that completes inline.
+/// The native block route returns Pending and requires an owned continuation.
+pub(crate) fn boot_inline_read_admitted(mount: SectionMountId) -> bool {
+    matches!(unsafe { crate::fs_loader::exec_block_route_kind(mount) },
+        Some(nt_fs::BlockSourceKind::Boot))
+}
+
 pub(crate) fn draining_exec_volume_device() -> Option<u64> {
     let physical = unsafe { crate::fs_loader::exec_fs_mount_identity() }?;
     if !matches!(

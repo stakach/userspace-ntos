@@ -19,6 +19,12 @@ const FONT: &str = crate::installed_layout::ARIAL_STR;
 const PAGE_SIZE: usize = 4096;
 
 pub(crate) unsafe fn probe_font_section_after_file_close(device_id: u64, scratch_base: u64) -> bool {
+    let Some(mount) = mounted_volume::mount_id_for_live_device(device_id) else {
+        return false;
+    };
+    if !mounted_volume::boot_inline_read_admitted(mount) {
+        return false;
+    }
     let mut status = 0u32;
     let mut checksum = 0u64;
     let mut content_ok = false;
@@ -71,8 +77,6 @@ pub(crate) unsafe fn probe_font_section_after_file_close(device_id: u64, scratch
                     }) {
                         return Err(nt_memory_manager::data_section::STATUS_IO_DEVICE_ERROR);
                     }
-                    let mount = mounted_volume::mount_id_for_live_device(device_id)
-                        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
                     let capture = hosted_file_capture::capture(
                         file.raw(), device_id, AccessMask::GENERIC_READ.bits(),
                     )?;
