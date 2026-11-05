@@ -93,8 +93,7 @@ pub(crate) fn release_unentered_mounted_directory_sector(
 
 pub(crate) fn claim_mounted_read_sectors() -> Option<crate::mounted_volume_backend::mounted_installed_read::ReadSectorClaim> {
     let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_READ_QUEUE)).as_ref()?.clone() };
-    // The live native SCSI route already carries four-sector snapshot transfers.
-    let claim = queue.borrow_mut().claim_next_bounded(4);
+    let claim = queue.borrow_mut().claim_next();
     claim
 }
 

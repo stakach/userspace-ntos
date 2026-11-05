@@ -489,6 +489,73 @@ mod tests {
         reads.ack(12).unwrap();
     }
 
+    fn read_with_proven_contiguous_tail() -> ReadCompletions {
+        let geometry = FatPathGeometry { fat_start_sector: 1, data_start_sector: 10,
+            total_sectors: 1000, sectors_per_cluster: 1 };
+        let mut reads = ReadCompletions::new();
+        reads.capture_range(21, 7, 9, geometry, 2, 0, 40 * 512, None).unwrap();
+        let first = reads.claim_next_bounded(32).unwrap();
+        assert_eq!(first.request, FatRangeRequest { sector: 10, kind: FatRangeRequestKind::Data });
+        assert_eq!(first.sectors, 1, "a FAT successor must be proved before batching");
+        assert_eq!(reads.complete_sectors(first, Ok(&[1; 512])), Ok(FatRangeProgress::Pending));
+        let fat_claim = reads.claim_next_bounded(32).unwrap();
+        assert_eq!(fat_claim.request.kind, FatRangeRequestKind::Fat);
+        assert_eq!(fat_claim.sectors, 1);
+        let mut fat = [0; 512];
+        for cluster in 2..41 {
+            fat[cluster * 4..(cluster + 1) * 4]
+                .copy_from_slice(&((cluster + 1) as u32).to_le_bytes());
+        }
+        assert_eq!(reads.complete_sectors(fat_claim, Ok(&fat)), Ok(FatRangeProgress::Pending));
+        reads
+    }
+
+    #[test]
+    fn retained_read_claims_32_then_7_proven_sectors_with_one_terminal_ack() {
+        let mut reads = read_with_proven_contiguous_tail();
+        let wide = reads.claim_next_bounded(32).unwrap();
+        assert_eq!(wide.request, FatRangeRequest { sector: 11, kind: FatRangeRequestKind::Data });
+        assert_eq!(wide.sectors, 32);
+        assert_eq!(wide.block_read_operation(100), Some(BlockOperation::Read {
+            lba: 111, sectors: 32,
+        }));
+        assert_eq!(reads.complete_sectors(wide, Ok(&[2; 32 * 512])),
+            Ok(FatRangeProgress::Pending));
+        assert_eq!(reads.next_completion(), None);
+        let tail = reads.claim_next_bounded(32).unwrap();
+        assert_eq!(tail.request.sector, 43);
+        assert_eq!(tail.sectors, 7);
+        assert_eq!(reads.complete_sectors(tail, Ok(&[3; 7 * 512])),
+            Ok(FatRangeProgress::Complete));
+        assert_eq!(reads.next_completion(), Some((21, 0, 40 * 512)));
+        assert_eq!(reads.next_completion(), None);
+        let mut output = [0; 40 * 512];
+        assert_eq!(reads.copy(21, 0, &mut output), Ok(output.len()));
+        assert_eq!(&output[..512], &[1; 512]);
+        assert_eq!(&output[512..33 * 512], &[2; 32 * 512]);
+        assert_eq!(&output[33 * 512..], &[3; 7 * 512]);
+        assert!(reads.has_outstanding());
+        reads.ack(21).unwrap();
+        assert!(!reads.has_outstanding());
+        assert_eq!(reads.ack(21), Err(ReadError::WrongIdentity));
+    }
+
+    #[test]
+    fn short_32_sector_terminal_cannot_publish_a_prefix() {
+        let mut reads = read_with_proven_contiguous_tail();
+        let wide = reads.claim_next_bounded(32).unwrap();
+        assert_eq!(wide.sectors, 32);
+        let before = reads.entries[0].output.clone();
+        assert_eq!(reads.complete_sectors(wide, Ok(&[2; 31 * 512])),
+            Ok(FatRangeProgress::Complete));
+        assert_eq!(reads.entries[0].output, before);
+        assert_eq!(reads.next_completion(), Some((21, STATUS_DATA_ERROR as i32, 0)));
+        assert_eq!(reads.next_completion(), None);
+        assert_eq!(reads.copy(21, 0, &mut [0; 1]), Ok(0));
+        reads.ack(21).unwrap();
+        assert!(!reads.has_outstanding());
+    }
+
     #[test]
     fn native_block_read_uses_the_entire_verified_claim_and_exact_completion() {
         let geometry = FatPathGeometry { fat_start_sector: 1, data_start_sector: 10,
