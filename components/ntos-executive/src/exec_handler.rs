@@ -34849,6 +34849,13 @@ impl ExecNtHandler {
                         },
                     }
                 };
+                if name_lc == "computername" {
+                    if let Some(path) = key_path.as_deref() {
+                        registry_admission::trace_computer_name_registry(
+                            b"query-return", path, query_status, query_pi, query_tid,
+                        );
+                    }
+                }
                 query_status
             },
             // NtQuerySystemInformation(Class[R10]=args[0], Buffer[RDX]=args[1], Len[R8]=args[2],

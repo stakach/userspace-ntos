@@ -6,6 +6,33 @@ use nt_user_host::registry_subject::RegistrySubject;
 
 static REGISTRY_CREATE_CAPTURE_ERROR_REPORTS: AtomicU64 = AtomicU64::new(0);
 static REGISTRY_OPEN_CAPTURE_ERROR_REPORTS: AtomicU64 = AtomicU64::new(0);
+static COMPUTER_NAME_REGISTRY_TRACE_REPORTS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn trace_computer_name_registry(
+    operation: &[u8], path: &str, status: u32, pi: usize, tid: u64,
+) {
+    const MARKER: &[u8] = b"\\control\\computername";
+    if !path.as_bytes().windows(MARKER.len())
+        .enumerate()
+        .any(|(index, part)| part.eq_ignore_ascii_case(MARKER)
+            && path.as_bytes().get(index + MARKER.len())
+                .is_none_or(|next| *next == b'\\'))
+        || COMPUTER_NAME_REGISTRY_TRACE_REPORTS.fetch_add(1, Ordering::Relaxed) >= 64
+    {
+        return;
+    }
+    print_str(b"[computer-name-registry] op=");
+    print_str(operation);
+    print_str(b" pi=");
+    print_u64(pi as u64);
+    print_str(b" tid=");
+    print_u64(tid);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b" path=");
+    print_ascii_str(path);
+    print_str(b"\n");
+}
 
 fn note_registry_capture_error(operation: &[u8], status: u32, pi: usize, tid: u64) {
     let reports = if operation == b"create" {
@@ -479,6 +506,7 @@ impl ExecNtHandler {
                 return status;
             }
         };
+        trace_computer_name_registry(b"open-ingress", &state.path, 0, self.pi, self.current_tid);
         let result = (|| {
             let target = self.acquire_hosted_registry_target(&state)?;
             self.bind_hosted_registry_target(&mut state, target)?;
@@ -489,8 +517,12 @@ impl ExecNtHandler {
             self.finish_hosted_registry_publication(&mut state, target, granted, false)
         })();
         match result {
-            Ok(()) => 0,
+            Ok(()) => {
+                trace_computer_name_registry(b"open-return", &state.path, 0, self.pi, self.current_tid);
+                0
+            },
             Err(status) => {
+                trace_computer_name_registry(b"open-return", &state.path, status, self.pi, self.current_tid);
                 if status == STATUS_OBJECT_NAME_NOT_FOUND {
                     self.note_registry_open_miss(&state.path);
                     self.note_completed_installer_inf_probe(&state.path, status);
@@ -522,6 +554,7 @@ impl ExecNtHandler {
                     return status;
                 }
             };
+        trace_computer_name_registry(b"create-ingress", &state.path, 0, self.pi, self.current_tid);
         let mut parent_retention = None;
         let mut durable_create = None;
         let mut mutable_create = None;
@@ -714,12 +747,14 @@ impl ExecNtHandler {
                 descriptor: &prepared.descriptor,
                 volatile,
             };
+            trace_computer_name_registry(b"create-submit-enter", &state.path, 0, self.pi, self.current_tid);
             match crate::registry_mutation_work::submit_hosted(
                 self, state, owner, parent, leaf.clone(), prepared.granted_access,
                 expected_generation, mutation,
             ) {
                 Ok(()) => return 0x103,
                 Err((status, mut state, mut owner)) => {
+                    trace_computer_name_registry(b"create-submit", &state.path, status, self.pi, self.current_tid);
                     crate::registry_security_audit::admission_error(
                         b"create-submit", &state.path, status, self.pi, self.current_tid,
                     );
@@ -756,8 +791,12 @@ impl ExecNtHandler {
             }
         }
         match result {
-            Ok(()) => 0,
+            Ok(()) => {
+                trace_computer_name_registry(b"create-return", &state.path, 0, self.pi, self.current_tid);
+                0
+            },
             Err(status) => {
+                trace_computer_name_registry(b"create-return", &state.path, status, self.pi, self.current_tid);
                 crate::registry_security_audit::admission_error(
                     b"create", &state.path, status, self.pi, self.current_tid,
                 );

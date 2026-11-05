@@ -90,6 +90,22 @@ impl ExecNtHandler {
             Ok(key) => key,
             Err(status) => return status,
         };
+        let path = self.registry_target_path(key);
+        if let Some(path) = path.as_deref() {
+            registry_admission::trace_computer_name_registry(
+                b"set-ingress", path, 0, self.pi, self.current_tid,
+            );
+        }
+        let status = self.nt_set_value_key_admitted_with_key(args, key);
+        if let Some(path) = path.as_deref() {
+            registry_admission::trace_computer_name_registry(
+                b"set-return", path, status, self.pi, self.current_tid,
+            );
+        }
+        status
+    }
+
+    unsafe fn nt_set_value_key_admitted_with_key(&mut self, args: &[u64], key: KeyRef) -> u32 {
         let mut retained = if self.cm_system_key_target(key).is_some() {
             let _scope = allocator::enter_scope(b"registry.set-value-retain-cm");
             match crate::registry_mutation_work::retain_hosted_existing(self, key) {

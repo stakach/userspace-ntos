@@ -1572,6 +1572,10 @@ unsafe fn advance(
                     let handler = &mut *context.as_mut().unwrap().0;
                     match &mut caller.completion {
                         HostedCompletion::Create { publication, parent_owner, .. } => {
+                            crate::exec_handler::registry_admission::trace_computer_name_registry(
+                                b"create-completion", &publication.path, work.status,
+                                caller.pi, caller.tid,
+                            );
                             crate::registry_security_audit::admission_error(
                                 b"create-completion", &publication.path, work.status,
                                 caller.pi, caller.tid,
@@ -1587,6 +1591,14 @@ unsafe fn advance(
                         HostedCompletion::Existing { key_owner, kind } => {
                             if let Some(target) = key_owner.abort(&mut handler.pm)
                                 .expect("retained existing Key") {
+                                if matches!(*kind, ExistingMutationKind::SetValue) {
+                                    if let Some(path) = handler.registry_target_path(target) {
+                                        crate::exec_handler::registry_admission::trace_computer_name_registry(
+                                            b"set-completion", &path, work.status,
+                                            caller.pi, caller.tid,
+                                        );
+                                    }
+                                }
                                 if work.status != 0 {
                                     if let Some(path) = handler.registry_target_path(target) {
                                         let operation: &[u8] = match kind {
