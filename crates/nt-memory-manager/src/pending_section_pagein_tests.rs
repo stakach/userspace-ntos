@@ -217,6 +217,71 @@ fn window_output_is_invisible_until_exact_ack_and_pads_only_eof() {
 }
 
 #[test]
+fn acknowledged_window_selects_exact_pages_and_rejects_stale_owner() {
+    let plan = plan_data_section_read_window(3, 0x9000, 0x7180, 8).unwrap();
+    let section = section();
+    let lease = lease();
+    assert_eq!((plan.pages(), plan.length(), plan.capacity()), (5, 0x4180, 0x5000));
+    let mut reads = PendingSectionPageReads::<Box<u32>, u64>::new();
+    let id = reads.reserve_window(section, lease, 3, plan, Box::new(53)).unwrap();
+    assert!(reads.bind(id, 93));
+    assert!(reads.terminal(id, 93, 0, plan.length() as u64));
+    for offset in (0..plan.length()).step_by(DATA_PAGE_SIZE) {
+        let length = (plan.length() - offset).min(DATA_PAGE_SIZE);
+        assert!(reads.append(id, 93, offset, &vec![(offset / DATA_PAGE_SIZE) as u8 + 1; length]));
+    }
+    assert!(reads.take_acknowledged(id, 93).is_none());
+    assert!(reads.acknowledge_backend(id, 93));
+    // A rejected identity check cannot consume the staged bytes or owner.
+    assert!(reads.take_acknowledged_if(id, 93, |_, _, _, _| false).is_none());
+    assert_eq!(reads.identity(id), Some((section, lease, 3)));
+    let (_, result) = reads.take_acknowledged_if(id, 93, |_, identity, backing, first| {
+        identity == section && backing == lease && first == 3
+    }).unwrap();
+    let bytes = result.unwrap();
+    for page in 3..8 {
+        let expected = if page == 7 { 5 } else { page - 2 };
+        let page_bytes = plan.page_bytes(page, &bytes).unwrap();
+        let file_bytes = if page == 7 { 0x180 } else { DATA_PAGE_SIZE };
+        assert!(page_bytes[..file_bytes].iter().all(|byte| *byte == expected as u8));
+        assert!(page_bytes[file_bytes..].iter().all(|byte| *byte == 0));
+    }
+    assert!(plan.page_bytes(2, &bytes).is_none());
+    assert!(plan.page_bytes(8, &bytes).is_none());
+    assert!(plan.page_bytes(3, &bytes[..bytes.len() - 1]).is_none());
+}
+
+#[test]
+fn cancelled_window_has_no_publishable_page_after_terminal_ack() {
+    const CANCELLED: u32 = 0xc000_0120;
+    let plan = plan_data_section_read_window(0, 0x8000, 0x8000, 8).unwrap();
+    let mut reads = PendingSectionPageReads::<Box<u32>, u64>::new();
+    let id = reads.reserve_window(section(), lease(), 0, plan, Box::new(54)).unwrap();
+    assert!(reads.bind(id, 94));
+    assert!(reads.terminal(id, 94, CANCELLED, 0));
+    assert!(reads.ready_page(id, 94).is_none());
+    assert!(reads.take_acknowledged(id, 94).is_none());
+    assert!(reads.acknowledge_backend(id, 94));
+    let (owner, result) = reads.take_acknowledged(id, 94).unwrap();
+    assert_eq!(*owner, 54);
+    assert_eq!(result, Err(CANCELLED));
+}
+
+#[test]
+fn short_window_completion_rejects_all_pages_after_ack() {
+    let plan = plan_data_section_read_window(0, 0x8000, 0x8000, 8).unwrap();
+    let mut reads = PendingSectionPageReads::<Box<u32>, u64>::new();
+    let id = reads.reserve_window(section(), lease(), 0, plan, Box::new(55)).unwrap();
+    assert!(reads.bind(id, 95));
+    assert!(reads.terminal(id, 95, 0, (plan.length() - 1) as u64));
+    assert!(reads.ready_page(id, 95).is_none());
+    assert!(reads.acknowledge_backend(id, 95));
+    let (owner, result) = reads.take_acknowledged(id, 95).unwrap();
+    assert_eq!(*owner, 55);
+    assert_eq!(result, Err(STATUS_IO_DEVICE_ERROR));
+}
+
+#[test]
 fn acknowledged_read_cannot_publish_into_reused_section_or_view() {
     let mut table = GenericSectionTable::new();
     let mount = crate::SectionMountIds::new().allocate().unwrap();

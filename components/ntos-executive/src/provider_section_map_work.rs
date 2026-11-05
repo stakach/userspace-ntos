@@ -440,7 +440,7 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) {
                     work.page as u64,
                     prepared.backing.size,
                     work.file_size,
-                    1,
+                    (prepared.pages - work.page).min(8),
                 ) {
                     Ok(plan) => plan,
                     Err(status) => {
@@ -680,13 +680,19 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) {
                     return;
                 }
             };
+            let plan = work.plan.unwrap();
             let bytes = work.bytes.as_ref().unwrap();
+            let Some(page_bytes) = plan.page_bytes(work.page as u64, bytes) else {
+                work.result.0 = STATUS_IO_DEVICE_ERROR;
+                work.phase = Phase::Abort;
+                return;
+            };
             let frame =
                 crate::service_sec_image::section_pagein::service_publish_section_frame_from_bytes(
                     sections,
                     prepared.section,
                     work.page as u64,
-                    bytes,
+                    page_bytes,
                     EXECUTIVE_WIN32K_SCRATCH_BASE,
                 );
             match frame.and_then(|frame| {
@@ -698,11 +704,15 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) {
                 )
             }) {
                 Ok(()) => {
-                    work.bytes = None;
-                    work.read = None;
-                    work.plan = None;
                     work.page += 1;
-                    work.phase = Phase::Frame;
+                    if plan.page_bytes(work.page as u64, work.bytes.as_ref().unwrap()).is_some() {
+                        work.phase = Phase::PublishFrame;
+                    } else {
+                        work.bytes = None;
+                        work.read = None;
+                        work.plan = None;
+                        work.phase = Phase::Frame;
+                    }
                 }
                 Err(status) => {
                     work.result.0 = status;
