@@ -411,6 +411,11 @@ fn dma_private_graph_retires_captured_members_and_mapping_once() {
             if id == 502 { Err(nt_status::NtStatus::DEVICE_BUSY) } else { Ok(()) }
         }), Err(nt_status::NtStatus::DEVICE_BUSY));
         assert_eq!(releases, vec![501, 502]);
+        {
+            let _pool = hosted_instance_pool_lock(pool.inst.exec_pool_va).unwrap();
+            assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, context), Some(false),
+                "an unretired mapping keeps its SG context live for the exact retry");
+        }
         native::retire_dma_private_graph(pool.inst, 777, list, true, |id| {
             releases.push(id);
             Ok(())
@@ -418,13 +423,14 @@ fn dma_private_graph_retires_captured_members_and_mapping_once() {
         assert_eq!(releases, vec![501, 502, 502], "retry cannot replay acknowledged release");
         {
             let _pool = hosted_instance_pool_lock(pool.inst.exec_pool_va).unwrap();
-            assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, context), Some(false));
+            assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, context), Some(true),
+                "an exact retired SG context is not a pointer-only release identity");
             assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, ADDRESS), Some(false));
         }
         assert!(native::generic_free_admission(pool.inst, map).is_err());
         assert!(native::generic_free_admission(pool.inst, list).is_err());
         assert!(!native::instance_quiesced(pool.inst));
-        REFUSE_DMA_FREE.with(|refuse| refuse.set(Some(context)));
+        REFUSE_DMA_FREE.with(|refuse| refuse.set(Some(map)));
         assert_eq!(native::drain_dma_private_tombstones(pool.inst),
             Err(nt_status::NtStatus::INVALID_HANDLE));
         assert!(!native::instance_quiesced(pool.inst));

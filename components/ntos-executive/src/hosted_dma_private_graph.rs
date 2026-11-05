@@ -297,22 +297,26 @@ unsafe fn retire_index(
     }
     // A map token is externally visible even when its SG graph remains live. Quarantine it
     // only when the whole graph is removed; an SG list also becomes an address tombstone.
+    // The context is reached only through a live graph, so it can be freed after exact
+    // mapping release without making a stale pointer-only retirement ambiguous.
     if whole_graph {
-        let needed = 1 + 2 * usize::from(row.kind != Kind::Map);
+        let needed = 1 + usize::from(row.kind != Kind::Map);
         tombstones().try_reserve(needed)
             .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     }
     release_mappings(&mut graphs()[index], release)?;
     if !whole_graph { return Ok(()); }
+    if let Some(context) = graphs()[index].context.filter(|_| !graphs()[index].context_freed) {
+        if !hosted_instance_pool_free_unlocked(inst, context.component_address) {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+        graphs()[index].context_freed = true;
+    }
     let row = graphs().swap_remove(index);
     if let Some(map) = row.map {
         tombstones().push(Tombstone { instance: inst, physical: Some(map),
             address: map.component_address,
             retire_receipt: (row.kind == Kind::Map).then_some((row.lease_id, false)) });
-    }
-    if let Some(context) = row.context.filter(|_| !row.context_freed) {
-        tombstones().push(Tombstone { instance: inst, physical: Some(context),
-            address: context.component_address, retire_receipt: None });
     }
     if let Some(list) = row.list {
         tombstones().push(Tombstone { instance: inst, physical: row.list,
