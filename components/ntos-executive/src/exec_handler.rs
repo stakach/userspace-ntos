@@ -261,6 +261,8 @@ mod disk_file;
 
 #[path = "exec_virtual_memory_copy.rs"]
 mod virtual_memory_copy;
+#[path = "exec_virtual_memory_resident.rs"]
+mod virtual_memory_resident;
 
 #[path = "exec_private_residency.rs"]
 pub(crate) mod private_residency;

@@ -1857,10 +1857,10 @@ unsafe fn recorded_frame_copyin(
 }
 
 unsafe fn recorded_frame_copyout(pi: u64, va: u64, src: &[u8], scratch_base: u64) -> bool {
-    recorded_frame_copyout_impl(pi, va, src, scratch_base, false)
+    recorded_frame_copyout_impl(pi, None, va, src, scratch_base, false)
 }
 
-unsafe fn recorded_frame_copyout_impl(pi: u64, va: u64, src: &[u8], scratch_base: u64, admitted: bool) -> bool {
+unsafe fn recorded_frame_copyout_impl(pi: u64, process: Option<nt_memory_manager::ProcessIdentity>, va: u64, src: &[u8], scratch_base: u64, admitted: bool) -> bool {
     if crate::temporary_frame_alias::drain().is_err()
         || hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
         return false;
@@ -1873,7 +1873,7 @@ unsafe fn recorded_frame_copyout_impl(pi: u64, va: u64, src: &[u8], scratch_base
         if !admitted && crate::service_sec_image::service_admit_section_alias(pi, chunk.page_base, true, None).is_err() {
             return false;
         }
-        let ok = with_recorded_frame_alias(pi, None, chunk.page_base, scratch_base, true, |alias| {
+        let ok = with_recorded_frame_alias(pi, process, chunk.page_base, scratch_base, true, |alias| {
             core::ptr::copy_nonoverlapping(
                 src.as_ptr().add(copied),
                 (alias + chunk.page_offset as u64) as *mut u8,
@@ -2134,7 +2134,7 @@ pub(crate) unsafe fn client_copyout_mapped(
     src: &[u8],
     scratch_base: u64,
 ) -> bool {
-    client_copyout_mapped_impl(pi, va, src, scratch_base, false)
+    client_copyout_mapped_impl(pi, None, va, src, scratch_base, false)
 }
 
 /// Only for the checked native-copy engine, after its own protection/residency/COW admission.
@@ -2144,11 +2144,23 @@ pub(crate) unsafe fn client_copyout_mapped_admitted(
     src: &[u8],
     scratch_base: u64,
 ) -> bool {
-    client_copyout_mapped_impl(pi, va, src, scratch_base, true)
+    client_copyout_mapped_impl(pi, None, va, src, scratch_base, true)
+}
+
+/// Exact process-generation counterpart for a retained syscall after access admission.
+pub(crate) unsafe fn client_copyout_mapped_admitted_for(
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+    va: u64,
+    src: &[u8],
+    scratch_base: u64,
+) -> bool {
+    client_copyout_mapped_impl(pi, Some(process), va, src, scratch_base, true)
 }
 
 unsafe fn client_copyout_mapped_impl(
     pi: u64,
+    process: Option<nt_memory_manager::ProcessIdentity>,
     va: u64,
     src: &[u8],
     scratch_base: u64,
@@ -2177,7 +2189,7 @@ unsafe fn client_copyout_mapped_impl(
             return false;
         }
         if csrss_frame_get_exact_record(pi, page).is_some() {
-            if !recorded_frame_copyout_impl(pi, current, &src[copied..copied + chunk], scratch_base, true) {
+            if !recorded_frame_copyout_impl(pi, process, current, &src[copied..copied + chunk], scratch_base, true) {
                 return false;
             }
             copied += chunk;

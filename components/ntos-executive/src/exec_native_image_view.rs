@@ -65,6 +65,16 @@ impl ExecNtHandler {
         Ok(Some(()))
     }
 
+    /// Return Some(true) only when a canonical image needs an owned routed source page-in.
+    /// Some(false) means admission completed; None leaves legacy image admission to its owner.
+    pub(crate) unsafe fn admit_native_image_copy_page(
+        &mut self, pi: usize, page: u64, access: nt_address_space::FaultAccess,
+    ) -> Result<Option<bool>, u32> {
+        let Some(view) = self.native_image_view_for_page(pi, page)? else { return Ok(None); };
+        crate::native_image_residency::admit_native_image_copy_page(self, view, page, access)
+            .map(Some)
+    }
+
     pub(super) unsafe fn map_native_image_section_view(
         &mut self, args: &[u64], previous_mode: nt_syscall::ProcessorMode,
     ) -> Result<Option<u32>, u32> {

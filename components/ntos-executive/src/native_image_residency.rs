@@ -426,13 +426,36 @@ pub(crate) unsafe fn service_native_image_page_residency(
     observation: ImageFaultObservation,
 ) -> Result<(), u32> {
     let mut stage = "borrow";
-    let result = service_page_residency(handler, view, page, access, observation, &mut stage);
+    let result = service_page_residency(handler, view, page, access, observation, false, &mut stage)
+        .map(|_| ());
     if let Err(status) = result {
         if observation != ImageFaultObservation::CopyAccess {
             trace_image_fault_failure(handler, view, page, access, observation, stage, status);
         }
     }
     result
+}
+
+/// Copy admission may map a ready image page, but must hand an unready routed source to an
+/// owned page-in worker before any File READ. The decision and source state are checked under
+/// the same borrow as the page installation.
+pub(crate) unsafe fn admit_native_image_copy_page(
+    handler: &mut ExecNtHandler,
+    view: NativeImageViewDescriptor,
+    page: u64,
+    access: FaultAccess,
+) -> Result<bool, u32> {
+    let mut stage = "borrow";
+    service_page_residency(
+        handler, view, page, access, ImageFaultObservation::CopyAccess, true, &mut stage,
+    )
+    .map(|outcome| outcome == ImageCopyAdmission::NeedsRoutedPageIn)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ImageCopyAdmission {
+    Resident,
+    NeedsRoutedPageIn,
 }
 
 unsafe fn ready_source_frame(view: NativeImageViewDescriptor, rva: u32) -> Result<u64, u32> {
@@ -637,8 +660,9 @@ unsafe fn service_page_residency(
     page: u64,
     access: FaultAccess,
     observation: ImageFaultObservation,
+    defer_routed: bool,
     stage: &mut &'static str,
-) -> Result<(), u32> {
+) -> Result<ImageCopyAdmission, u32> {
     let _borrow = Borrow::acquire()?;
     *stage = "view-identity";
     if !current(handler, view, page) || page & 0xfff != 0 {
@@ -662,6 +686,11 @@ unsafe fn service_page_residency(
         .layout
         .image_page_fill_plan(rva, source.backing.file_extent)
         .map_err(|_| INVALID)?;
+    let routed_source = matches!(
+        source.contents,
+        crate::native_image_sections::NativeImageContents::RetainedRouted
+    );
+    let routed_source_readable = !routed_source || source.has_readable_image();
     *stage = "committed-mapping";
     let info = process_committed_mapping_basic_information(view.pi as u64, page)
         .ok_or(nt_address_space::STATUS_NOT_COMMITTED)?;
@@ -688,7 +717,8 @@ unsafe fn service_page_residency(
             && (record.owns_frame || !fault_plan.copy_on_write)
         {
             *stage = "resident-revalidation";
-            return revalidate_resident_image_page(handler, view, page, protection, rva, record);
+            return revalidate_resident_image_page(handler, view, page, protection, rva, record)
+                .map(|()| ImageCopyAdmission::Resident);
         }
         if record.owns_frame {
             // A private COW page already contains loader/application changes; never refill it.
@@ -705,9 +735,9 @@ unsafe fn service_page_residency(
                     nt_address_space::image_view_fault_plan(protection, false).map_protection,
                     fault_plan.map_protection,
                     view.pml4,
-                );
+                ).map(|()| ImageCopyAdmission::Resident);
             }
-            return Ok(());
+            return Ok(ImageCopyAdmission::Resident);
         }
         if observation == ImageFaultObservation::Protection && !fault_plan.copy_on_write {
             *stage = "resident-shared-fault";
@@ -718,9 +748,16 @@ unsafe fn service_page_residency(
     }
     *stage = "pagefile-restore";
     if handler.restore_process_pagefile_page(view.pi, page, view.pml4, view.scratch_base)? {
-        return Ok(());
+        return Ok(ImageCopyAdmission::Resident);
     }
     *stage = "source-page";
+    if defer_routed && routed_source && !source_page_ready(view.view.area(), rva)
+    {
+        if !routed_source_readable {
+            return Err(INVALID);
+        }
+        return Ok(ImageCopyAdmission::NeedsRoutedPageIn);
+    }
     let source_frame = ensure_source_page(handler, view, rva)?;
     if fault_plan.copy_on_write {
         let target = ViewPage {
@@ -753,7 +790,7 @@ unsafe fn service_page_residency(
         {
             *preparation = None;
         }
-        return result;
+        return result.map(|()| ImageCopyAdmission::Resident);
     }
     *stage = "shared-install";
     install_view_page(
@@ -765,7 +802,7 @@ unsafe fn service_page_residency(
         },
         source_frame,
         stage,
-    )
+    ).map(|()| ImageCopyAdmission::Resident)
 }
 
 /// Invoked only by checked ImageSectionPurge after the authority's references have drained.
