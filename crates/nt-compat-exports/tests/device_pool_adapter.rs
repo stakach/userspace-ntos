@@ -87,6 +87,82 @@ thread_local! {
     static GUARDED_READ: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
     static ALLOC_FAIL_CALL: Cell<u64> = const { Cell::new(0) };
     static ALLOC_CALLS: Cell<u64> = const { Cell::new(0) };
+    static DMA_ALIAS_NEXT_FRAME: Cell<u64> = const { Cell::new(0x9000) };
+    static DMA_ALIAS_RECYCLED_FRAME: Cell<Option<u64>> = const { Cell::new(None) };
+    static DMA_ALIAS_GENERATION: Cell<u64> = const { Cell::new(0) };
+    static DMA_ALIAS_RELEASES: Cell<u64> = const { Cell::new(0) };
+    static DMA_ALIAS_RELEASE_FAIL_ONCE: Cell<bool> = const { Cell::new(false) };
+    static DMA_ALIAS_PT_FAIL_ONCE: Cell<bool> = const { Cell::new(false) };
+    static DMA_ALIAS_ACQUIRE_FAIL_ONCE: Cell<bool> = const { Cell::new(false) };
+    static DMA_ALIAS_MAP_FAIL_ONCE: Cell<bool> = const { Cell::new(false) };
+}
+
+mod driver_launch {
+    use super::*;
+    use super::native::dma_owned_sg_alias::NativePage;
+
+    pub unsafe fn acquire_dma_alias_page(inst: DriverInstance, domain: HostedDomainIdentity,
+        component_va: u64) -> Result<NativePage, nt_status::NtStatus> {
+        if DMA_ALIAS_ACQUIRE_FAIL_ONCE.with(|fail| fail.replace(false)) {
+            return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+        }
+        let frame = DMA_ALIAS_RECYCLED_FRAME.with(|free| free.take()).unwrap_or_else(|| {
+            DMA_ALIAS_NEXT_FRAME.with(|next| {
+                let frame = next.get(); next.set(frame + 1); frame
+            })
+        });
+        let generation = DMA_ALIAS_GENERATION.with(|next| {
+            let generation = next.get() + 1; next.set(generation); generation
+        });
+        Ok(NativePage { component_va, pml4: inst.pml4, domain, owner: 1,
+            frame, generation, map_cap: 0, mapped: false, recycled: false,
+            uncertain: false, pt_pending: false, leases: [0; 16] })
+    }
+
+    pub unsafe fn map_dma_alias_page(page: &mut NativePage)
+        -> Result<(), nt_status::NtStatus> {
+        page.map_cap = page.frame + 0x10000;
+        if DMA_ALIAS_MAP_FAIL_ONCE.with(|fail| fail.replace(false)) {
+            page.uncertain = true;
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        page.mapped = true;
+        Ok(())
+    }
+
+    pub unsafe fn release_dma_alias_page(page: &mut NativePage)
+        -> Result<(), nt_status::NtStatus> {
+        if page.frame == 0 || page.uncertain || page.recycled {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+        // Mirror the native ordering: the component leaf is gone before a frame-pool
+        // publication can refuse. The exact frame must survive that refusal for Put retry.
+        page.map_cap = 0;
+        page.mapped = false;
+        if DMA_ALIAS_RELEASE_FAIL_ONCE.with(|fail| fail.replace(false)) {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        DMA_ALIAS_RECYCLED_FRAME.with(|free| {
+            assert!(free.get().is_none(), "a frame was recycled twice without acquisition");
+            free.set(Some(page.frame));
+        });
+        DMA_ALIAS_RELEASES.with(|count| count.set(count.get() + 1));
+        page.frame = 0;
+        page.recycled = true;
+        Ok(())
+    }
+
+    pub unsafe fn copy_dma_alias_list(_: &NativePage, _: u64, _: u64, _: u64)
+        -> Result<(), nt_status::NtStatus> {
+        Err(nt_status::NtStatus::INVALID_HANDLE)
+    }
+
+    pub unsafe fn retire_dma_alias_pt_if_empty(_: HostedDomainIdentity, _: u64, _: u64)
+        -> Result<(), nt_status::NtStatus> {
+        if DMA_ALIAS_PT_FAIL_ONCE.with(|fail| fail.replace(false)) {
+            Err(nt_status::NtStatus::DEVICE_BUSY)
+        } else { Ok(()) }
+    }
 }
 
 unsafe fn read_unaligned<T>(pointer: *const T) -> T {
@@ -380,7 +456,7 @@ fn dma_private_graph_retires_captured_members_and_mapping_once() {
     let pool = Pool::new(domain, 90, 0xe000);
     unsafe {
         let (map, context, list) = native::provision_dma_private_graph(
-            pool.inst, 777, 1, native::DmaPrivateKind::ScatterGatherOwned, 0,
+            pool.inst, 777, 1, native::DmaPrivateKind::ScatterGatherBorrowed, ADDRESS,
         ).unwrap();
         assert_ne!(map, context);
         assert_ne!(context, list);
@@ -396,7 +472,6 @@ fn dma_private_graph_retires_captured_members_and_mapping_once() {
         write_unaligned((list_exec + 8) as *mut u64, ADDRESS);
         assert!(native::generic_free_admission(pool.inst, map).is_err());
         assert!(native::generic_free_admission(pool.inst, context).is_err());
-        assert!(native::generic_free_admission(pool.inst, list).is_err());
         let original_generation = read_volatile((map_exec - 8) as *const u64);
         write_volatile((map_exec - 8) as *mut u64, original_generation + 1);
         let mut releases = Vec::new();
@@ -428,13 +503,142 @@ fn dma_private_graph_retires_captured_members_and_mapping_once() {
             assert_eq!(hosted_instance_pool_allocation_is_free_unlocked(pool.inst, ADDRESS), Some(false));
         }
         assert!(native::generic_free_admission(pool.inst, map).is_err());
-        assert!(native::generic_free_admission(pool.inst, list).is_err());
         assert!(!native::instance_quiesced(pool.inst));
         REFUSE_DMA_FREE.with(|refuse| refuse.set(Some(map)));
         assert_eq!(native::drain_dma_private_tombstones(pool.inst),
             Err(nt_status::NtStatus::INVALID_HANDLE));
         assert!(!native::instance_quiesced(pool.inst));
         REFUSE_DMA_FREE.with(|refuse| refuse.set(None));
+        native::drain_dma_private_tombstones(pool.inst).unwrap();
+        assert!(native::instance_quiesced(pool.inst));
+    }
+}
+
+#[test]
+fn retired_owned_sg_lists_keep_unique_addresses_without_consuming_the_driver_pool() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let mut io = IoManager::new(MockObjectPort::new());
+    let domain = io.register_hosted_domain();
+    MANAGER.with(|manager| manager.set(&mut io));
+    let _manager_scope = ManagerScope;
+    let pool = Pool::new(domain, 110, 0xf000);
+    let used_before = unsafe { hosted_pool_used(pool.inst.exec_pool_va) };
+    let frame_releases_before = DMA_ALIAS_RELEASES.with(Cell::get);
+    let fresh_frames_before = DMA_ALIAS_NEXT_FRAME.with(Cell::get);
+    let mut lists = Vec::new();
+    unsafe {
+        for request in 1..=64 {
+            let (_, _, list) = native::provision_dma_private_graph(
+                pool.inst, 997, request, native::DmaPrivateKind::ScatterGatherOwned, 0,
+            ).unwrap_or_else(|status| panic!(
+                "SG graph request {request} failed with {status:?}",
+            ));
+            assert!(!lists.contains(&list), "retired pointer-only list VA was reused");
+            native::retire_dma_private_graph(pool.inst, 997, list, true, |_| Ok(())).unwrap();
+            lists.push(list);
+            assert_eq!(hosted_pool_used(pool.inst.exec_pool_va), used_before,
+                "request {request} retained a completed graph in the driver pool");
+        }
+        assert!(native::instance_ready_to_drain_dma_tombstones(pool.inst),
+            "retired owned SG aliases must not block their own teardown drain");
+        native::drain_dma_private_tombstones(pool.inst).unwrap();
+    }
+    assert_eq!(DMA_ALIAS_RELEASES.with(Cell::get), frame_releases_before + 4);
+    assert_eq!(DMA_ALIAS_NEXT_FRAME.with(Cell::get), fresh_frames_before + 1,
+        "later alias pages should recycle the first exact retired frame");
+}
+
+#[test]
+fn retired_owned_sg_alias_allows_its_own_teardown_drain() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let mut io = IoManager::new(MockObjectPort::new());
+    let domain = io.register_hosted_domain();
+    MANAGER.with(|manager| manager.set(&mut io));
+    let _manager_scope = ManagerScope;
+    let pool = Pool::new(domain, 112, 0xf200);
+    unsafe {
+        let (_, _, list) = native::provision_dma_private_graph(
+            pool.inst, 999, 1, native::DmaPrivateKind::ScatterGatherOwned, 0,
+        ).unwrap();
+        assert!(!native::instance_ready_to_drain_dma_tombstones(pool.inst));
+        native::retire_dma_private_graph(pool.inst, 999, list, true, |_| Ok(())).unwrap();
+        assert!(native::instance_ready_to_drain_dma_tombstones(pool.inst),
+            "a retired alias arena must not block its own teardown drain");
+        native::drain_dma_private_tombstones(pool.inst).unwrap();
+        assert!(native::instance_quiesced(pool.inst));
+    }
+}
+
+#[test]
+fn definite_owned_sg_acquisition_refusal_is_drainable_without_a_native_page() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId::new(1901, 1), cookie: 1901,
+    };
+    let pool = Pool::new(domain, 113, 0xf300);
+    DMA_ALIAS_ACQUIRE_FAIL_ONCE.with(|fail| fail.set(true));
+    unsafe {
+        assert_eq!(native::provision_dma_private_graph(
+            pool.inst, 1000, 1, native::DmaPrivateKind::ScatterGatherOwned, 0,
+        ), Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES));
+        assert!(native::instance_ready_to_drain_dma_tombstones(pool.inst),
+            "a definite pre-acquisition refusal owns no native frame or cap");
+        native::drain_dma_private_tombstones(pool.inst).unwrap();
+        assert!(native::instance_quiesced(pool.inst));
+    }
+}
+
+#[test]
+fn uncertain_owned_sg_mapping_blocks_teardown_readiness() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId::new(1902, 1), cookie: 1902,
+    };
+    let pool = Pool::new(domain, 114, 0xf400);
+    DMA_ALIAS_MAP_FAIL_ONCE.with(|fail| fail.set(true));
+    unsafe {
+        assert_eq!(native::provision_dma_private_graph(
+            pool.inst, 1001, 1, native::DmaPrivateKind::ScatterGatherOwned, 0,
+        ), Err(nt_status::NtStatus::DEVICE_BUSY));
+        assert!(!native::instance_ready_to_drain_dma_tombstones(pool.inst));
+        assert!(!native::instance_quiesced(pool.inst));
+        assert_eq!(native::drain_dma_private_tombstones(pool.inst),
+            Err(nt_status::NtStatus::DEVICE_BUSY));
+    }
+}
+
+#[test]
+fn owned_sg_retry_finishes_retained_frame_and_pt_without_replaying_a_new_graph() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let mut io = IoManager::new(MockObjectPort::new());
+    let domain = io.register_hosted_domain();
+    MANAGER.with(|manager| manager.set(&mut io));
+    let _manager_scope = ManagerScope;
+    let pool = Pool::new(domain, 111, 0xf100);
+    let before = DMA_ALIAS_RELEASES.with(Cell::get);
+    let mut last_list = 0;
+    unsafe {
+        for request in 1..=16 {
+            let (_, _, list) = native::provision_dma_private_graph(
+                pool.inst, 998, request, native::DmaPrivateKind::ScatterGatherOwned, 0,
+            ).unwrap();
+            if request == 16 {
+                DMA_ALIAS_RELEASE_FAIL_ONCE.with(|fail| fail.set(true));
+                assert_eq!(native::retire_dma_private_graph(
+                    pool.inst, 998, list, true, |_| Ok(()),
+                ), Err(nt_status::NtStatus::DEVICE_BUSY));
+                last_list = list;
+            } else {
+                native::retire_dma_private_graph(pool.inst, 998, list, true, |_| Ok(())).unwrap();
+            }
+        }
+        assert_eq!(DMA_ALIAS_RELEASES.with(Cell::get), before);
+        native::retire_dma_private_graph(pool.inst, 998, last_list, true, |_| Ok(())).unwrap();
+        assert_eq!(DMA_ALIAS_RELEASES.with(Cell::get), before + 1);
+        DMA_ALIAS_PT_FAIL_ONCE.with(|fail| fail.set(true));
+        assert_eq!(native::drain_dma_private_tombstones(pool.inst),
+            Err(nt_status::NtStatus::DEVICE_BUSY));
+        assert!(!native::instance_quiesced(pool.inst));
         native::drain_dma_private_tombstones(pool.inst).unwrap();
         assert!(native::instance_quiesced(pool.inst));
     }
@@ -533,7 +737,7 @@ fn dma_private_retirement_replays_only_exact_tombstone_receipt() {
             pool.inst, 779, 1, native::DmaPrivateKind::Map, 0,
         ).unwrap();
         let (_, _, list) = native::provision_dma_private_graph(
-            pool.inst, 779, 2, native::DmaPrivateKind::ScatterGatherOwned, 0,
+            pool.inst, 779, 2, native::DmaPrivateKind::ScatterGatherBorrowed, ADDRESS,
         ).unwrap();
         let mut releases = 0;
         native::retire_dma_private_graph(pool.inst, 779, map, false,

@@ -12527,6 +12527,118 @@ unsafe fn trace_hosted_dma_private_pool_failure(inst: DriverInstance, size: u64)
     print_str(b"\n");
 }
 
+static HOSTED_DMA_ALIAS_FRAME_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) unsafe fn acquire_dma_alias_page(
+    inst: DriverInstance, domain: HostedDomainIdentity, component_va: u64,
+) -> Result<hosted_device_allocations::dma_owned_sg_alias::NativePage, nt_status::NtStatus> {
+    if component_va & 0xfff != 0 || inst.pml4 == 0
+        || inst.map_cap_bank.owner == 0 || instance_domain_identity(inst) != Some(domain) {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    let generation = HOSTED_DMA_ALIAS_FRAME_GENERATION
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current|
+            current.checked_add(1).filter(|next| *next != 0))
+        .ok().and_then(|previous| previous.checked_add(1))
+        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let frame = frame_acquisition::acquire(crate::SMSS_SCRATCH_BASE)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    Ok(hosted_device_allocations::dma_owned_sg_alias::NativePage {
+        component_va, pml4: inst.pml4, domain, owner: inst.map_cap_bank.owner,
+        frame, generation, map_cap: 0, mapped: false, recycled: false,
+        uncertain: false, pt_pending: false, leases: [0; 16],
+    })
+}
+
+pub(crate) unsafe fn map_dma_alias_page(
+    page: &mut hosted_device_allocations::dma_owned_sg_alias::NativePage,
+) -> Result<(), nt_status::NtStatus> {
+    if page.frame == 0 || page.map_cap != 0 || page.mapped || page.uncertain {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    // The native row already owns the frame before paging can install a fallible cap.
+    if !ensure_paging(page.component_va, page.pml4, page.domain) {
+        page.uncertain = true;
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    let (cap, copy_error) = copy_cap_r(page.frame);
+    page.map_cap = cap;
+    if copy_error != 0 || cap == 0 {
+        page.uncertain = true;
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    if !crate::spawn_hosts::component_map_cap_bank_tag(page.owner, cap) {
+        page.uncertain = true;
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    let error = page_map_r(cap, page.component_va, RW_NX, page.pml4);
+    if error != 0 {
+        page.uncertain = true;
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    page.mapped = true;
+    Ok(())
+}
+
+pub(crate) unsafe fn release_dma_alias_page(
+    page: &mut hosted_device_allocations::dma_owned_sg_alias::NativePage,
+) -> Result<(), nt_status::NtStatus> {
+    if page.uncertain || page.frame == 0 || page.recycled {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    frame_recycle::prepare(page.frame)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    if page.map_cap != 0 {
+        if !crate::spawn_hosts::component_map_cap_bank_release_page(page.owner, page.map_cap) {
+            page.uncertain = true;
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        page.map_cap = 0;
+        page.mapped = false;
+    }
+    // publish_reserved checks all failure conditions before changing the frame pool; a
+    // rejection keeps this exact frame in the native row for the next confirmed Put retry.
+    frame_recycle::publish(page.frame)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    page.frame = 0;
+    page.recycled = true;
+    Ok(())
+}
+
+pub(crate) unsafe fn copy_dma_alias_list(
+    page: &hosted_device_allocations::dma_owned_sg_alias::NativePage,
+    offset: u64, destination: u64, bytes: u64,
+) -> Result<(), nt_status::NtStatus> {
+    if page.uncertain || !page.mapped || page.frame == 0 || destination == 0
+        || offset.checked_add(bytes).is_none_or(|end| end > 0x1000) {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    temporary_frame_alias::with_scratch_range(
+        page.frame, crate::SMSS_SCRATCH_BASE,
+        offset as usize..(offset + bytes) as usize, false,
+        |source| copy_bytes(destination, source, bytes),
+    ).map_err(|_| nt_status::NtStatus::DEVICE_BUSY)
+}
+
+pub(crate) unsafe fn retire_dma_alias_pt_if_empty(
+    domain: HostedDomainIdentity, pml4: u64, component_va: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let base = hosted_paging_base(component_va, HOSTED_PAGING_PT_SPAN);
+    let mappings = hosted_paging_mappings_mut();
+    let Some(index) = mappings.iter().position(|row| row.domain == domain
+        && row.pml4 == pml4 && row.level == HOSTED_PAGING_LEVEL_PT && row.base == base)
+    else { return Ok(()); };
+    let cap = mappings[index].cap;
+    // rust-micro CNodeDelete validates before it finalizes the cap, with no fallible step
+    // after finalization. A nonzero label therefore leaves this exact slot owned by the row;
+    // cnode_delete_recycle_r recycles it only on acknowledged success.
+    if cap != 0 && cnode_delete_recycle_r(cap) != 0 {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    mappings.swap_remove(index);
+    Ok(())
+}
+
 unsafe fn dma_copy_bytes(dst: u64, src: u64, len: u64) {
     let mut offset = 0u64;
     while offset < len {
@@ -26054,8 +26166,12 @@ unsafe fn sync_ndis_packet_sg_to_dependent(
         provider_inst,
         provider_sg,
         HOSTED_SG_LIST_SIZE_ONE,
-    )
-    .ok_or(STATUS_INVALID_PARAMETER)?;
+    );
+    if provider_sg_exec.is_none()
+        && !hosted_device_allocations::dma_owned_sg_alias::contains(provider_sg)
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
     let mut dependent_sg = shadow.dependent_sg_component_va;
     let allocated_new = dependent_sg == 0;
     if dependent_sg == 0 {
@@ -26073,7 +26189,18 @@ unsafe fn sync_ndis_packet_sg_to_dependent(
         }
         return Err(STATUS_INVALID_PARAMETER);
     };
-    copy_bytes(dependent_sg_exec, provider_sg_exec, HOSTED_SG_LIST_SIZE_ONE);
+    if let Some(provider_sg_exec) = provider_sg_exec {
+        copy_bytes(dependent_sg_exec, provider_sg_exec, HOSTED_SG_LIST_SIZE_ONE);
+    } else {
+        if let Err(status) = hosted_device_allocations::copy_dma_private_sg_list(
+            provider_inst, provider_sg, dependent_sg_exec,
+        ) {
+            if allocated_new {
+                hosted_instance_pool_free(dependent_inst, dependent_sg);
+            }
+            return Err(status.raw());
+        }
+    }
     if !update_hosted_provider_ndis_packet_sg_shadow(
         shadow.owner,
         provider_instance,

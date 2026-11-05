@@ -80,6 +80,7 @@ mod hosted_filter_type;
 mod hosted_bus_pdo_publication;
 mod hosted_file_system_registry;
 pub mod hosted_pool_range;
+pub mod hosted_dma_alias;
 pub mod video_monitor_array_projection;
 pub mod hosted_kernel_read_delivery;
 pub mod inline_file_retirement;

@@ -9,6 +9,8 @@ use nt_io_manager::{
 mod dma_adapter_pair;
 #[path = "hosted_dma_private_graph.rs"]
 mod dma_private_graph;
+#[path = "hosted_dma_owned_sg_alias.rs"]
+pub(crate) mod dma_owned_sg_alias;
 pub(super) use dma_private_graph::Kind as DmaPrivateKind;
 pub(super) use dma_private_graph::DmaPrivateMappingId;
 use dma_private_graph::DmaPrivateMappingKind;
@@ -112,6 +114,9 @@ pub(super) unsafe fn provision_dma_private_graph(
     inst: DriverInstance, lease_id: u64, request_id: u64, kind: DmaPrivateKind,
     borrowed_list: u64,
 ) -> Result<(u64, u64, u64), nt_status::NtStatus> {
+    if kind == DmaPrivateKind::ScatterGatherOwned {
+        return dma_owned_sg_alias::provision(inst, lease_id, request_id);
+    }
     dma_private_graph::provision(inst, lease_id, request_id, kind, borrowed_list)
 }
 
@@ -120,9 +125,16 @@ pub(super) unsafe fn record_dma_private_mapping(
     backing: u64, length: u64,
     register: impl FnOnce() -> Result<u64, nt_status::NtStatus>,
 ) -> Result<u64, nt_status::NtStatus> {
-    match dma_private_graph::record_mapping(inst, lease_id, map, logical, backing, length,
-        DmaPrivateMappingKind::Transfer,
-        || register().map(DmaPrivateMappingId::Transfer))? {
+    let record = if dma_owned_sg_alias::contains(map) {
+        dma_owned_sg_alias::record_mapping(inst, lease_id, map, logical, backing, length,
+            DmaPrivateMappingKind::Transfer,
+            || register().map(DmaPrivateMappingId::Transfer))
+    } else {
+        dma_private_graph::record_mapping(inst, lease_id, map, logical, backing, length,
+            DmaPrivateMappingKind::Transfer,
+            || register().map(DmaPrivateMappingId::Transfer))
+    }?;
+    match record {
         DmaPrivateMappingId::Transfer(id) => Ok(id),
         DmaPrivateMappingId::Coherent(_) => Err(nt_status::NtStatus::INVALID_HANDLE),
     }
@@ -133,9 +145,16 @@ pub(super) unsafe fn record_dma_private_coherent_alias(
     backing: u64, length: u64,
     register: impl FnOnce() -> Result<nt_dma_manager::CoherentReservationAlias, nt_status::NtStatus>,
 ) -> Result<nt_dma_manager::CoherentReservationAlias, nt_status::NtStatus> {
-    match dma_private_graph::record_mapping(inst, lease_id, map, logical, backing, length,
-        DmaPrivateMappingKind::Coherent,
-        || register().map(DmaPrivateMappingId::Coherent))? {
+    let record = if dma_owned_sg_alias::contains(map) {
+        dma_owned_sg_alias::record_mapping(inst, lease_id, map, logical, backing, length,
+            DmaPrivateMappingKind::Coherent,
+            || register().map(DmaPrivateMappingId::Coherent))
+    } else {
+        dma_private_graph::record_mapping(inst, lease_id, map, logical, backing, length,
+            DmaPrivateMappingKind::Coherent,
+            || register().map(DmaPrivateMappingId::Coherent))
+    }?;
+    match record {
         DmaPrivateMappingId::Coherent(alias) => Ok(alias),
         DmaPrivateMappingId::Transfer(_) => Err(nt_status::NtStatus::INVALID_HANDLE),
     }
@@ -144,8 +163,14 @@ pub(super) unsafe fn record_dma_private_coherent_alias(
 pub(super) unsafe fn dma_private_mapping_receipt(
     inst: DriverInstance, map: u64, logical: u64, backing: u64, length: u64,
 ) -> Option<(u64, u64)> {
-    match dma_private_graph::mapping_receipt(inst, map, logical, backing, length,
-        DmaPrivateMappingKind::Transfer)? {
+    let receipt = if dma_owned_sg_alias::contains(map) {
+        dma_owned_sg_alias::mapping_receipt(inst, map, logical, backing, length,
+            DmaPrivateMappingKind::Transfer)
+    } else {
+        dma_private_graph::mapping_receipt(inst, map, logical, backing, length,
+            DmaPrivateMappingKind::Transfer)
+    }?;
+    match receipt {
         (lease, DmaPrivateMappingId::Transfer(id)) => Some((lease, id)),
         (_, DmaPrivateMappingId::Coherent(_)) => None,
     }
@@ -154,8 +179,14 @@ pub(super) unsafe fn dma_private_mapping_receipt(
 pub(super) unsafe fn dma_private_coherent_alias_receipt(
     inst: DriverInstance, map: u64, logical: u64, backing: u64, length: u64,
 ) -> Option<(u64, nt_dma_manager::CoherentReservationAlias)> {
-    match dma_private_graph::mapping_receipt(inst, map, logical, backing, length,
-        DmaPrivateMappingKind::Coherent)? {
+    let receipt = if dma_owned_sg_alias::contains(map) {
+        dma_owned_sg_alias::mapping_receipt(inst, map, logical, backing, length,
+            DmaPrivateMappingKind::Coherent)
+    } else {
+        dma_private_graph::mapping_receipt(inst, map, logical, backing, length,
+            DmaPrivateMappingKind::Coherent)
+    }?;
+    match receipt {
         (lease, DmaPrivateMappingId::Coherent(alias)) => Some((lease, alias)),
         (_, DmaPrivateMappingId::Transfer(_)) => None,
     }
@@ -166,23 +197,42 @@ pub(super) unsafe fn retire_dma_private_graph(
     release: impl FnMut(u64) -> Result<(), nt_status::NtStatus>,
 ) -> Result<(), nt_status::NtStatus> {
     let mut release = release;
-    dma_private_graph::retire(inst, lease_id, address, whole_graph, |id| match id {
+    let retire = |id| match id {
         DmaPrivateMappingId::Transfer(id) => release(id),
         DmaPrivateMappingId::Coherent(_) => Err(nt_status::NtStatus::INVALID_HANDLE),
-    })
+    };
+    if dma_owned_sg_alias::contains(address) {
+        dma_owned_sg_alias::retire(inst, lease_id, address, whole_graph, retire)
+    } else {
+        dma_private_graph::retire(inst, lease_id, address, whole_graph, retire)
+    }
 }
 
 pub(super) unsafe fn retire_dma_private_graph_typed(
     inst: DriverInstance, lease_id: u64, address: u64, whole_graph: bool,
     release: impl FnMut(DmaPrivateMappingId) -> Result<(), nt_status::NtStatus>,
 ) -> Result<(), nt_status::NtStatus> {
-    dma_private_graph::retire(inst, lease_id, address, whole_graph, release)
+    if dma_owned_sg_alias::contains(address) {
+        dma_owned_sg_alias::retire(inst, lease_id, address, whole_graph, release)
+    } else {
+        dma_private_graph::retire(inst, lease_id, address, whole_graph, release)
+    }
 }
 
 pub(super) unsafe fn dma_private_sg_members(
     inst: DriverInstance, lease_id: u64, list: u64,
 ) -> Result<(u64, u64), nt_status::NtStatus> {
-    dma_private_graph::sg_members(inst, lease_id, list)
+    if dma_owned_sg_alias::contains(list) {
+        dma_owned_sg_alias::sg_members(inst, lease_id, list)
+    } else {
+        dma_private_graph::sg_members(inst, lease_id, list)
+    }
+}
+
+pub(super) unsafe fn copy_dma_private_sg_list(
+    inst: DriverInstance, list: u64, destination: u64,
+) -> Result<(), nt_status::NtStatus> {
+    dma_owned_sg_alias::copy_list(inst, list, destination)
 }
 
 pub(super) unsafe fn retire_dma_private_lease(
@@ -190,6 +240,10 @@ pub(super) unsafe fn retire_dma_private_lease(
     release: impl FnMut(u64) -> Result<(), nt_status::NtStatus>,
 ) -> Result<(), nt_status::NtStatus> {
     let mut release = release;
+    dma_owned_sg_alias::retire_lease(inst, lease_id, |id| match id {
+        DmaPrivateMappingId::Transfer(id) => release(id),
+        DmaPrivateMappingId::Coherent(_) => Err(nt_status::NtStatus::INVALID_HANDLE),
+    })?;
     dma_private_graph::retire_lease(inst, lease_id, |id| match id {
         DmaPrivateMappingId::Transfer(id) => release(id),
         DmaPrivateMappingId::Coherent(_) => Err(nt_status::NtStatus::INVALID_HANDLE),
@@ -200,12 +254,15 @@ pub(super) unsafe fn retire_dma_private_lease_typed(
     inst: DriverInstance, lease_id: u64,
     release: impl FnMut(DmaPrivateMappingId) -> Result<(), nt_status::NtStatus>,
 ) -> Result<(), nt_status::NtStatus> {
+    let mut release = release;
+    dma_owned_sg_alias::retire_lease(inst, lease_id, &mut release)?;
     dma_private_graph::retire_lease(inst, lease_id, release)
 }
 
 pub(super) unsafe fn drain_dma_private_tombstones(
     inst: DriverInstance,
 ) -> Result<(), nt_status::NtStatus> {
+    dma_owned_sg_alias::drain(inst)?;
     dma_private_graph::drain_tombstones(inst)
 }
 
@@ -1633,6 +1690,7 @@ pub(super) fn instance_quiesced(inst: DriverInstance) -> bool {
     let _guard = lock();
     !dma_adapter_pair::owns_pool(inst)
         && !dma_private_graph::owns_pool(inst)
+        && !dma_owned_sg_alias::has_arena(inst)
         && !interrupt_projection::owns_pool(inst)
         && !file_rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
         && !rows()
@@ -1650,6 +1708,7 @@ pub(super) fn instance_ready_to_drain_dma_tombstones(inst: DriverInstance) -> bo
     let _guard = lock();
     !dma_adapter_pair::has_live_pair(inst)
         && !dma_private_graph::has_live_graph(inst)
+        && !dma_owned_sg_alias::has_pending_effects(inst)
         && !interrupt_projection::has_live(inst)
         && !file_rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
         && !rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))

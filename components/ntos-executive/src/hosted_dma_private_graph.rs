@@ -15,7 +15,7 @@ pub(crate) enum DmaPrivateMappingId {
 pub(super) enum DmaPrivateMappingKind { Transfer, Coherent }
 
 impl DmaPrivateMappingId {
-    fn kind(self) -> DmaPrivateMappingKind {
+    pub(super) fn kind(self) -> DmaPrivateMappingKind {
         match self {
             Self::Transfer(_) => DmaPrivateMappingKind::Transfer,
             Self::Coherent(_) => DmaPrivateMappingKind::Coherent,
