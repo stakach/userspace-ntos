@@ -469,13 +469,81 @@ def record_bootdisk_blockstats(reply, elapsed_seconds):
                                      "device": "bootdisk", "stats": sample}) + "\n")
 
 
-def parse_proc_stat(stat):
-    """Return process-group identity, CPU ticks, and RSS pages from /proc/PID/stat."""
+def proc_stat_fields(stat):
+    """Split Linux stat after the final parenthesized comm, even if comm contains ')'."""
     # comm is parenthesized and may itself contain spaces or closing parentheses.
-    fields = stat.rpartition(") ")[2].split()
+    head, separator, tail = stat.rpartition(") ")
+    if not separator:
+        raise ValueError("missing process stat command")
+    pid_text, prefix, _comm = head.partition(" (")
+    if not prefix:
+        raise ValueError("missing process stat pid")
+    fields = tail.split()
     if len(fields) < 22:
         raise ValueError("incomplete process stat")
+    return int(pid_text), fields
+
+
+def parse_proc_stat(stat):
+    """Return process-group identity, CPU ticks, and RSS pages from /proc/PID/stat."""
+    _pid, fields = proc_stat_fields(stat)
     return int(fields[2]), int(fields[11]) + int(fields[12]), int(fields[21])
+
+
+def parse_proc_task_cpu(stat, expected_pid):
+    """Return exact task group, CPU ticks, and start generation from Linux stat."""
+    pid, fields = proc_stat_fields(stat)
+    if pid != expected_pid:
+        raise ValueError("process stat pid changed")
+    return int(fields[2]), int(fields[11]) + int(fields[12]), int(fields[19])
+
+
+def read_vcpu_host_state(process_group, cpus, proc_root=Path("/proc")):
+    """Sample QMP vCPU threads after validating their QEMU process and generation."""
+    samples = {}
+    if not isinstance(cpus, list):
+        return samples
+    for cpu in cpus:
+        if not isinstance(cpu, dict):
+            continue
+        index = cpu.get("cpu-index")
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+            continue
+        key = str(index)
+        tid = cpu.get("thread-id")
+        if not isinstance(tid, int) or isinstance(tid, bool) or tid <= 0:
+            samples[key] = {"error": "QMP vCPU thread-id unavailable"}
+            continue
+        try:
+            status = (proc_root / str(tid) / "status").read_text()
+            tgid = next((int(match.group(1)) for line in status.splitlines()
+                         if (match := re.fullmatch(r"Tgid:\s*([0-9]+)", line))), None)
+            if tgid is None or tgid <= 0:
+                raise ValueError("vCPU Tgid unavailable")
+            owner = proc_root / str(tgid)
+            owner_group, _owner_ticks, owner_start = parse_proc_task_cpu(
+                (owner / "stat").read_text(), tgid)
+            if owner_group != process_group:
+                raise ValueError("vCPU process group changed")
+            if Path(os.readlink(owner / "exe")).name != "qemu-system-x86_64":
+                raise ValueError("vCPU thread does not belong to QEMU")
+            task_group, ticks, task_start = parse_proc_task_cpu(
+                (owner / "task" / str(tid) / "stat").read_text(), tid)
+            if task_group != process_group:
+                raise ValueError("vCPU task process group changed")
+            owner_group_after, _owner_ticks, owner_start_after = parse_proc_task_cpu(
+                (owner / "stat").read_text(), tgid)
+            if owner_group_after != process_group or owner_start_after != owner_start:
+                raise ValueError("QEMU process generation changed")
+            samples[key] = {
+                "tid": tid, "tgid": tgid,
+                "process_starttime_ticks": owner_start,
+                "thread_starttime_ticks": task_start,
+                "cpu_seconds": round(ticks / os.sysconf("SC_CLK_TCK"), 3),
+            }
+        except (OSError, ValueError) as error:
+            samples[key] = {"tid": tid, "error": str(error)}
+    return samples
 
 
 def read_host_state(process_group):
@@ -761,8 +829,10 @@ def main():
                     except OSError:
                         serial_bytes = None
                     serial = LOG.read_bytes()
+                    cpu_state = read_cpu_state()
                     sample = {"elapsed_seconds": round(time.monotonic() - started, 3),
-                              "state": read_cpu_state(),
+                              "state": cpu_state,
+                              "vcpu_host": read_vcpu_host_state(process.pid, cpu_state.get("cpus")),
                               "host": host, "serial_bytes": serial_bytes,
                               "boot_marker": b"boot: reading Simpleboot memory map" in serial,
                               "desktop_ready": b"PASS exec_explorer_shell_chrome_painted" in serial}
