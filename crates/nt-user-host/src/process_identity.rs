@@ -5,6 +5,18 @@ use core::sync::atomic::{AtomicU64, Ordering};
 static NEXT_TEMPORARY_GENERATION: AtomicU64 = AtomicU64::new(1);
 pub use nt_types::{ProcessGeneration, ProcessIdentity};
 
+/// A hosted identity admits new work only while its matching runtime layout is attached.
+/// Temporary claims have a separate authority and no hosted layout.
+pub fn hosted_runtime_attachment_matches(
+    process: ProcessIdentity,
+    attached_hosted_generation: Option<u64>,
+) -> bool {
+    match process.generation {
+        ProcessGeneration::Hosted(generation) => attached_hosted_generation == Some(generation),
+        ProcessGeneration::Temporary(_) => true,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TemporaryProcessClaim {
     pi: usize,

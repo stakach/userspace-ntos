@@ -140,6 +140,11 @@ unsafe fn submit_owned(
     let process = handler
         .capture_process_identity(pi)
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    let nt_user_host::process_identity::ProcessGeneration::Hosted(generation) =
+        process.generation else { return Err(nt_fs::STATUS_INVALID_HANDLE); };
+    if hosted_process_runtime_for_exact(pi, generation).is_none() {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
     if view.lifetime != nt_memory_manager::MemoryLifetime::Process(process) {
         return Err(nt_fs::STATUS_INVALID_HANDLE);
     }
@@ -254,9 +259,16 @@ pub(crate) fn wake_due(now: u64) -> u64 {
     u64::from(next_deadline().is_some_and(|deadline| now >= deadline))
 }
 
+fn exact_hosted_scratch(work: &Work) -> Option<u64> {
+    let nt_user_host::process_identity::ProcessGeneration::Hosted(generation) =
+        work.process.generation else { return None; };
+    hosted_process_runtime_for_exact(work.pi, generation).map(|runtime| runtime.scratch_base)
+}
+
 fn valid(handler: &ExecNtHandler, work: &Work) -> bool {
     if handler.capture_process_identity(work.pi) != Some(work.process)
         || !handler.validate_provider_logical_caller(work.logical)
+        || exact_hosted_scratch(work).is_none()
     {
         return false;
     }
@@ -284,6 +296,9 @@ fn valid(handler: &ExecNtHandler, work: &Work) -> bool {
 }
 
 unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
+    if exact_hosted_scratch(work).is_none() && work.failure.is_none() {
+        work.failure = Some(nt_fs::STATUS_INVALID_HANDLE);
+    }
     let cancelled = spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(work.reply)
         || handler
             .pm
@@ -666,6 +681,11 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                 work.phase = Phase::Cancel;
                 return false;
             }
+            let Some(scratch) = exact_hosted_scratch(work) else {
+                work.failure = Some(nt_fs::STATUS_INVALID_HANDLE);
+                work.phase = Phase::Cancel;
+                return false;
+            };
             let Phase::Publish(bytes) = &work.phase else {
                 unreachable!()
             };
@@ -677,7 +697,7 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                     work.section,
                     work.page_index + index as u64,
                     page,
-                    hosted_scratch_base_for_pi(work.pi),
+                    scratch,
                 ).is_err() {
                     if index == 0 {
                         work.phase = Phase::Cancel;
@@ -694,6 +714,11 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                 work.phase = Phase::Cancel;
                 return false;
             }
+            let Some(scratch) = exact_hosted_scratch(work) else {
+                work.failure = Some(nt_fs::STATUS_INVALID_HANDLE);
+                work.phase = Phase::Cancel;
+                return false;
+            };
             let ctx = handler.loop_ctx.unwrap();
             match service_generic_section_fault(
                 handler,
@@ -701,7 +726,7 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                 work.pi,
                 work.page,
                 ctx.pml4,
-                hosted_scratch_base_for_pi(work.pi),
+                scratch,
                 work.access,
                 false,
                 true,

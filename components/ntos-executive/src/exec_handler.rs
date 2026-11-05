@@ -8875,6 +8875,16 @@ impl ExecNtHandler {
             .get_by_badge(badge)
             .ok_or(ThreadIngressError::UnknownBadge)?;
         let current = self.capture_thread_process_identity(owner.pi, owner.tid);
+        let attached_generation = hosted_process_runtime_for_pi(owner.pi)
+            .map(|runtime| runtime.generation);
+        if !current.is_some_and(|process| {
+            nt_user_host::process_identity::hosted_runtime_attachment_matches(
+                process,
+                attached_generation,
+            )
+        }) {
+            return Err(ThreadIngressError::RuntimeRetired);
+        }
         self.thread_runtime.admit_ingress(badge, current)
     }
 
@@ -8937,7 +8947,7 @@ impl ExecNtHandler {
         Some(process)
     }
 
-    fn capture_thread_process_identity(
+    pub(crate) fn capture_thread_process_identity(
         &self,
         pi: usize,
         tid: u64,

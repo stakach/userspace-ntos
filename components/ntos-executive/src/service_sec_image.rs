@@ -7556,7 +7556,7 @@ unsafe fn spawn_requested_hosted_exe(
         child_pid as u64,
         child_tid as u64,
         initial_priority,
-    );
+    ).map_err(|_| HostedExeSpawnError::Unentered(nt_process::STATUS_INVALID_HANDLE))?;
     procs[pi].pid = child_pid as u64;
     procs[pi].pml4 = child_spawn.pml4;
     nt_handler.publish_hosted_process_vspace(pi, child_spawn.vspace_caps)
@@ -10055,7 +10055,20 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b" label=");
                 print_u64(mi >> 12);
                 print_str(b"\n");
-                assert!(drop_current_hosted_reply(), "cannot cancel rejected hosted ingress");
+                if !drop_current_hosted_reply()
+                    && !crate::root_reply_park::quarantine_current_hosted_reply()
+                {
+                    // Stop is uncertain. Keep the original Reply and its Call owned; another
+                    // receive would reuse that Reply and could complete the wrong caller.
+                    print_str(b"[service-loop] rejected ingress Reply retained badge=");
+                    print_u64(badge);
+                    print_str(b" reply=");
+                    print_u64(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    print_str(b"\n");
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    break 'service_loop;
+                }
                 let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                 badge = received.0;
                 mi = received.1;
@@ -10525,6 +10538,15 @@ pub(crate) unsafe fn service_sec_image(
             (Some(admitted), Ok(current)) if admitted.binding() == current.binding() => current,
             _ => reject_hosted_ingress!(),
         };
+        // An ETHREAD can outlive its image/runtime attachment during exact process retirement.
+        // Refuse that Call before selecting any scratch or mirror address from the old PI.
+        let event_layout = match event_runtime.process.generation {
+            nt_user_host::process_identity::ProcessGeneration::Hosted(generation) =>
+                hosted_process_runtime_for_exact(event_runtime.pi, generation),
+            nt_user_host::process_identity::ProcessGeneration::Temporary(_) =>
+                hosted_process_runtime_for_pi(event_runtime.pi),
+        };
+        let Some(event_layout) = event_layout else { reject_hosted_ingress!() };
         if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
             let observed = crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_observation(
                 event_runtime.binding(), REPLY_MAIN_SLOT.load(Ordering::Relaxed),
@@ -10789,11 +10811,11 @@ pub(crate) unsafe fn service_sec_image(
                     _ => WINLOGON_WORKER_STACK_MIRROR_VA,
                 }
             } else {
-                hosted_main_stack_mirror_for_pi(pi)
+                event_layout.stack_mirror_va
             },
             Ordering::Relaxed,
         );
-        ACTIVE_HEAP_MIRROR.store(hosted_heap_mirror_for_pi(pi), Ordering::Relaxed);
+        ACTIVE_HEAP_MIRROR.store(event_layout.heap_mirror_va, Ordering::Relaxed);
         let pml4 = procs[pi].pml4;
         let scratch_base = procs[pi].scratch_base;
         ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
@@ -14510,7 +14532,9 @@ pub(crate) unsafe fn service_sec_image(
                     // that stands in for Ctrl-Alt-Del), then let this GetMessage run — the queue is
                     // non-empty, so it returns instead of blocking win32k. When there is nothing
                     // left to type the blocking GetMessage is parked as before.
-                    let peb_mirror = hosted_peb_mirror_for_pi(pi);
+                    let Some(peb_mirror) = hosted_peb_mirror_for_pi(pi) else {
+                        reject_hosted_ingress!()
+                    };
                     let client_teb = nt_handler
                         .pm
                         .thread_teb(current_tid as nt_process::ThreadId)
@@ -17399,7 +17423,9 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 }
-                let dispatch_peb_mirror = hosted_peb_mirror_for_pi(pi);
+                let Some(dispatch_peb_mirror) = hosted_peb_mirror_for_pi(pi) else {
+                    reject_hosted_ingress!()
+                };
                 let dispatch_client_teb = nt_handler
                     .pm
                     .thread_teb(current_tid as nt_process::ThreadId)
@@ -18567,7 +18593,9 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 if callback_suspended {
-                    let peb_mirror = hosted_peb_mirror_for_pi(pi);
+                    let Some(peb_mirror) = hosted_peb_mirror_for_pi(pi) else {
+                        reject_hosted_ingress!()
+                    };
                     let client_teb = nt_handler
                         .pm
                         .thread_teb(current_tid as nt_process::ThreadId)
@@ -24871,7 +24899,13 @@ unsafe fn dump_hosted_thread_quiesce(
     }
     print_str(b"\n");
 
-    let (stack_base, stack_size, stack_mirror, _, _) = mirror_ctx_for(badge, pi);
+    let Some((stack_base, stack_size, stack_mirror, _, _)) =
+        mirror_ctx_for(nt_handler, badge, pi, tid)
+    else {
+        print_quiesce_tag(label, b"-runtime-retired");
+        print_str(b"\n");
+        return;
+    };
     let mirror_stack_end = stack_base.checked_add(stack_size);
     let hosted_stack_range = nt_handler.hosted_thread_user_stack_for_badge(badge, pi);
     let rsp_has_qword =
@@ -25510,7 +25544,16 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
 /// heap mirror, and its demand scratch window. This is the same selection the main service
 /// loop makes. Parked-I/O delivery temporarily switches to the parked thread's context.
 #[inline]
-fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64) {
+fn mirror_ctx_for(
+    handler: &ExecNtHandler, badge: u64, pi: usize, tid: u64,
+) -> Option<(u64, u64, u64, u64, u64)> {
+    let process = handler.capture_thread_process_identity(pi, tid)?;
+    let runtime = match process.generation {
+        nt_user_host::process_identity::ProcessGeneration::Hosted(generation) =>
+            hosted_process_runtime_for_exact(pi, generation)?,
+        nt_user_host::process_identity::ProcessGeneration::Temporary(_) =>
+            hosted_process_runtime_for_pi(pi)?,
+    };
     let (stack_base, stack_frames) =
         crate::hosted_thread_runtime::hosted_thread_fixed_stack_geometry(pi, badge);
     let stack_mirror =
@@ -25528,19 +25571,17 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64) {
                 WINLOGON_WORKER_BADGE => WINLOGON_WORKER_STACK_MIRROR_VA,
                 _ => {
                     // A top-level process MAIN thread — keyed by pi like the loop's default arm.
-                    hosted_main_stack_mirror_for_pi(pi)
+                    runtime.stack_mirror_va
                 }
             }
         };
-    let heap_mirror = hosted_heap_mirror_for_pi(pi);
-    let scratch_base = hosted_scratch_base_for_pi(pi);
-    (
+    Some((
         stack_base,
         stack_frames * 0x1000,
         stack_mirror,
-        heap_mirror,
-        scratch_base,
-    )
+        runtime.heap_mirror_va,
+        runtime.scratch_base,
+    ))
 }
 
 pub(crate) unsafe fn with_section_metadata_context<R>(
@@ -25590,7 +25631,7 @@ pub(crate) unsafe fn with_pagein_caller_target_context<R>(
         handler.current_native_call_transport, handler.current_service_number,
     );
     let (stack_base, stack_size, stack_mirror, heap_mirror, _scratch_base) =
-        mirror_ctx_for(badge, caller_pi);
+        mirror_ctx_for(handler, badge, caller_pi, tid)?;
     ACTIVE_STACK_BASE.store(stack_base, Ordering::Relaxed);
     ACTIVE_STACK_SIZE.store(stack_size, Ordering::Relaxed);
     ACTIVE_STACK_MIRROR.store(stack_mirror, Ordering::Relaxed);
@@ -25660,10 +25701,9 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
 
         let continuation = wait.continuation;
         let pi = continuation.pi as usize;
-        let status = if pi >= MAX_PI {
-            nt_status::NtStatus::UNSUCCESSFUL.raw() as u32
-        } else {
-            let (sb, ss, smv, hmv, scratch_base) = mirror_ctx_for(continuation.badge, pi);
+        let mirror = (pi < MAX_PI).then(||
+            mirror_ctx_for(nt_handler, continuation.badge, pi, continuation.tid)).flatten();
+        let status = if let Some((sb, ss, smv, hmv, scratch_base)) = mirror {
             ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
             ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
@@ -25683,6 +25723,8 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                     .unwrap_or_else(|status| status),
                 Err(status) => status,
             }
+        } else {
+            nt_status::NtStatus::INVALID_HANDLE.raw() as u32
         };
         let Some(completed) = (&mut *core::ptr::addr_of_mut!(LPC_RECEIVE_WAITS)).take(slot) else {
             continue;
@@ -25800,10 +25842,9 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                     )
                 })
             });
-        let status = if pi >= MAX_PI {
-            nt_status::NtStatus::UNSUCCESSFUL.raw() as u32
-        } else {
-            let (sb, ss, smv, hmv, scratch_base) = mirror_ctx_for(continuation.badge, pi);
+        let mirror = (pi < MAX_PI).then(||
+            mirror_ctx_for(nt_handler, continuation.badge, pi, continuation.tid)).flatten();
+        let status = if let Some((sb, ss, smv, hmv, scratch_base)) = mirror {
             ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
             ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
@@ -25826,6 +25867,8 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 ),
                 Err(status) => status,
             }
+        } else {
+            nt_status::NtStatus::INVALID_HANDLE.raw() as u32
         };
         let completed_csr_api_request = status == nt_syscall::STATUS_SUCCESS
             && pi < MAX_PI
@@ -25967,10 +26010,9 @@ unsafe fn lpc_connect_wait_complete(
             .is_some_and(|port| lpc_name_is(&port.name, b"\\Windows\\ApiPort"));
     let completed_lsa_auth_connect = completion.status == nt_syscall::STATUS_SUCCESS
         && lpc_name_is(connection_name, b"\\LsaAuthenticationPort");
-    let status = if pi >= MAX_PI {
-        nt_status::NtStatus::UNSUCCESSFUL.raw() as u32
-    } else {
-        let (sb, ss, smv, hmv, scratch_base) = mirror_ctx_for(continuation.badge, pi);
+    let mirror = (pi < MAX_PI).then(||
+        mirror_ctx_for(nt_handler, continuation.badge, pi, continuation.tid)).flatten();
+    let status = if let Some((sb, ss, smv, hmv, scratch_base)) = mirror {
         ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
         ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
         ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
@@ -25990,6 +26032,8 @@ unsafe fn lpc_connect_wait_complete(
             connection_name,
             &completion,
         )
+    } else {
+        nt_status::NtStatus::INVALID_HANDLE.raw() as u32
     };
 
     ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
@@ -26209,6 +26253,17 @@ unsafe fn io_completion_park(
 }
 
 unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
+    // Keep the wake tuple, including its exact Reply, until the original thread still has a
+    // live memory context. A retired process cannot accept the completion copyout.
+    let Some((waiting, _)) = nt_handler.io_completion_wake.as_ref() else {
+        return false;
+    };
+    let Some((stack_base, stack_size, stack_mirror, heap_mirror, scratch_base)) =
+        mirror_ctx_for(nt_handler, waiting.badge, waiting.process_index as usize,
+            waiting.thread_id)
+    else {
+        return false;
+    };
     let Some((waiter, packet)) = nt_handler.io_completion_wake.take() else {
         return false;
     };
@@ -26221,8 +26276,6 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
     let saved_pi = nt_handler.pi;
     let saved_ctx = nt_handler.loop_ctx;
 
-    let (stack_base, stack_size, stack_mirror, heap_mirror, scratch_base) =
-        mirror_ctx_for(waiter.badge, waiter.process_index as usize);
     ACTIVE_STACK_BASE.store(stack_base, Ordering::Relaxed);
     ACTIVE_STACK_SIZE.store(stack_size, Ordering::Relaxed);
     ACTIVE_STACK_MIRROR.store(stack_mirror, Ordering::Relaxed);
@@ -27556,8 +27609,13 @@ unsafe fn pending_file_io_redrive_pass(
             .get_exact(identity).filter(|live| live.irp_id == pending.irp_id)
         else { continue; };
         pending = live;
-        let (sb, ss, smv, hmv, scratch_base) =
-            mirror_ctx_for(pending.badge, pending.pi as usize);
+        let Some((sb, ss, smv, hmv, scratch_base)) =
+            mirror_ctx_for(nt_handler, pending.badge, pending.pi as usize, pending.tid)
+        else {
+            // Terminal provider output and the parked Reply remain owned by this exact row.
+            // Do not acknowledge or publish either into a retired caller's address space.
+            continue;
+        };
         ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
         ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
         ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
@@ -28501,8 +28559,12 @@ unsafe fn file_irp_drain_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             continue;
         }
 
-        let (sb, ss, smv, hmv, scratch_base) =
-            mirror_ctx_for(pending.badge, pending.pi as usize);
+        let Some((sb, ss, smv, hmv, scratch_base)) =
+            mirror_ctx_for(nt_handler, pending.badge, pending.pi as usize, pending.tid)
+        else {
+            // The drain row still owns the File reference and any unpublished Reply.
+            continue;
+        };
         ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
         ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
         ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);

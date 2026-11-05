@@ -352,29 +352,29 @@ pub(crate) fn register_hosted_process_runtime_for_image(
     register_hosted_process_runtime(runtime_for_image(image)?)
 }
 
-fn expect_hosted_process_runtime(pi: usize) -> HostedProcessRuntime {
-    hosted_process_runtime_for_pi(pi).expect("hosted process runtime layout must be registered")
+pub(crate) fn hosted_process_runtime_for_exact(
+    pi: usize,
+    generation: u64,
+) -> Option<HostedProcessRuntime> {
+    hosted_process_runtime_for_pi(pi).filter(|runtime| runtime.generation == generation)
 }
 
-pub(crate) fn hosted_main_stack_mirror_for_pi(pi: usize) -> u64 {
-    expect_hosted_process_runtime(pi).stack_mirror_va
+pub(crate) fn hosted_main_stack_mirror_for_pi(pi: usize) -> Option<u64> {
+    hosted_process_runtime_for_pi(pi).map(|runtime| runtime.stack_mirror_va)
 }
 
-pub(crate) fn hosted_env_scratch_base_for_pi(pi: usize) -> u64 {
-    expect_hosted_process_runtime(pi).env_scratch_va
+pub(crate) fn hosted_env_scratch_base_for_pi(pi: usize) -> Option<u64> {
+    hosted_process_runtime_for_pi(pi).map(|runtime| runtime.env_scratch_va)
 }
 
-pub(crate) fn hosted_peb_mirror_for_pi(pi: usize) -> u64 {
-    let env_scratch = hosted_env_scratch_base_for_pi(pi);
-    if env_scratch == 0 {
-        0
-    } else {
-        env_scratch + 0x1000
-    }
+pub(crate) fn hosted_peb_mirror_for_pi(pi: usize) -> Option<u64> {
+    hosted_env_scratch_base_for_pi(pi).map(|env_scratch| {
+        if env_scratch == 0 { 0 } else { env_scratch + 0x1000 }
+    })
 }
 
-pub(crate) fn hosted_heap_mirror_for_pi(pi: usize) -> u64 {
-    expect_hosted_process_runtime(pi).heap_mirror_va
+pub(crate) fn hosted_heap_mirror_for_pi(pi: usize) -> Option<u64> {
+    hosted_process_runtime_for_pi(pi).map(|runtime| runtime.heap_mirror_va)
 }
 
 pub(crate) unsafe fn spawn_hosted_sec_image_for_image(
@@ -390,9 +390,13 @@ pub(crate) unsafe fn spawn_hosted_sec_image_for_image(
     client_process_id: u64,
     client_thread_id: u64,
     initial_priority: u8,
-) -> img_spawn::SecImageSpawn {
-    let runtime = expect_hosted_process_runtime(image.pi);
-    spawn_sec_image(
+) -> Result<img_spawn::SecImageSpawn, HostedProcessRuntimeRegistrationError> {
+    let runtime = hosted_process_runtime_for_pi(image.pi)
+        .ok_or(HostedProcessRuntimeRegistrationError::NotFound)?;
+    if runtime.generation != image.generation {
+        return Err(HostedProcessRuntimeRegistrationError::StaleIdentity);
+    }
+    Ok(spawn_sec_image(
         image.pi as u64,
         image.generation,
         lifetime,
@@ -411,11 +415,11 @@ pub(crate) unsafe fn spawn_hosted_sec_image_for_image(
         image.command_line,
         start_immediately,
         ldrpinit_rva,
-    )
+    ))
 }
 
-pub(crate) fn hosted_scratch_base_for_pi(pi: usize) -> u64 {
-    expect_hosted_process_runtime(pi).scratch_base
+pub(crate) fn hosted_scratch_base_for_pi(pi: usize) -> Option<u64> {
+    hosted_process_runtime_for_pi(pi).map(|runtime| runtime.scratch_base)
 }
 
 pub(crate) fn hosted_process_pi_is_live(pi: usize) -> bool {

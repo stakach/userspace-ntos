@@ -1,5 +1,9 @@
 # Lessons
 
+## Recover From Retired Hosted Runtimes
+- A missing hosted-process runtime during asynchronous ingress or cleanup is a lifetime mismatch to reject or retain under its exact process and Reply owner. Do not add a panic-only diagnostic or synthetic fallback; make runtime lookup fallible at the boundary, record the missing identity, and return a real terminal status only when the effect is known.
+- Before changing admission, reproduce the stale-runtime path with a focused regression and trace the caller so cleanup and pending delivery cannot reuse a retired layout. A debug assertion may document an impossible internal state, but it must not be the guest-facing recovery policy.
+
 ## Delegate Bounded Boot Monitoring
 - One hour is an absolute safety ceiling, not a useful default run length. If a short probe shows unchanged substantive boot markers and no meaningful guest work, stop within minutes, capture the owner state, and investigate before another boot. Diagnostic serial output alone is not progress.
 - Treat an hour-long boot that is still in device installation as a performance defect even when counters and progress text move. Require measured throughput and a specific diagnostic question before another long run; use short bounded probes to localize the cost, then a RED regression and source fix before repeating full acceptance.

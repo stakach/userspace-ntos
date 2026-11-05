@@ -140,8 +140,6 @@ pub(crate) unsafe fn hosted_can_resume(tcb: u64) -> bool {
         .filter_map(Option::as_ref)
         .any(|row| {
             row.binding.tcb == tcb
-                && crate::service_sec_image::hosted_ingress_binding(row.binding.badge)
-                    == Some(row.binding)
                 && row.call.as_ref().is_some_and(ExternalIngress::stop_started)
         });
     let cancelled = (&*core::ptr::addr_of!(CANCELLATIONS)).iter().any(|row| {
@@ -725,15 +723,59 @@ pub(crate) unsafe fn take_outer_boundary() -> Result<Option<ReceiveSettlementBou
     Ok(None)
 }
 
+/// Stop one retained physical Call. The semantic process layout may already be retired, so
+/// authenticate its immutable admission key against the Reply still bound to the exact TCB.
+/// A refused query leaves the Call intact; an uncertain native Stop remains entered in the Call.
+unsafe fn stop_retained_hosted_call(
+    reply: u64,
+    tcb: u64,
+    invoke: impl FnOnce() -> u64,
+) -> Result<(), Error> {
+    let row = (&mut *core::ptr::addr_of_mut!(CALLS))
+        .iter_mut()
+        .filter_map(Option::as_mut)
+        .find(|row| row.call.as_ref().is_some_and(|call| call.reply() == reply))
+        .ok_or(Error::Reply)?;
+    let call = row.call.as_ref().ok_or(Error::Reply)?;
+    let admission = call.admission_key();
+    if row.binding.tcb != tcb
+        || admission.executor() != tcb
+        || admission.reply() != reply
+        || admission.admission_sequence() == 0
+    {
+        return Err(Error::PhysicalIdentity);
+    }
+    {
+        let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+        if crate::spawn_hosts::query_component_reply_binding(tcb, reply)
+            != Ok(ReplyBindingObservation::BoundToTarget)
+        {
+            return Err(Error::Reply);
+        }
+    }
+    row.call
+        .as_mut()
+        .ok_or(Error::Reply)?
+        .stop_owned(|executor| {
+            if executor != tcb {
+                return Err(u64::MAX);
+            }
+            let status = invoke();
+            if status == 0 { Ok(()) } else { Err(status) }
+        })
+        .map_err(|_| Error::Retirement)
+}
+
 pub(crate) unsafe fn stop_hosted_caller(
     tcb: u64,
     invoke: impl FnOnce() -> u64,
 ) -> Option<Result<(), Error>> {
-    let row = (&mut *core::ptr::addr_of_mut!(CALLS))
-        .iter_mut()
-        .filter_map(Option::as_mut)
-        .find(|row| row.binding.tcb == tcb && row.call.is_some());
-    let Some(row) = row else {
+    let reply = (&*core::ptr::addr_of!(CALLS))
+        .iter()
+        .filter_map(Option::as_ref)
+        .find(|row| row.binding.tcb == tcb && row.call.is_some())
+        .and_then(|row| row.call.as_ref().map(ExternalIngress::reply));
+    let Some(reply) = reply else {
         return (&*core::ptr::addr_of!(CANCELLATIONS))
             .iter()
             .any(|cancelled| {
@@ -743,25 +785,7 @@ pub(crate) unsafe fn stop_hosted_caller(
             })
             .then_some(Ok(()));
     };
-    if crate::service_sec_image::hosted_ingress_binding(row.binding.badge) != Some(row.binding) {
-        return Some(Err(Error::PhysicalIdentity));
-    }
-    let result = row
-        .call
-        .as_mut()
-        .expect("retained external Call")
-        .stop_owned(|executor| {
-            if executor != tcb {
-                return Err(u64::MAX);
-            }
-            let status = invoke();
-            if status == 0 {
-                Ok(())
-            } else {
-                Err(status)
-            }
-        });
-    Some(result.map_err(|_| Error::Retirement))
+    Some(stop_retained_hosted_call(reply, tcb, invoke))
 }
 
 /// Containment stops the exact retained sender before cancelling its Call, without destroying
@@ -776,11 +800,7 @@ pub(crate) unsafe fn stop_and_cancel_hosted(reply: u64) -> Result<(), Error> {
         .find(|row| row.call.as_ref().is_some_and(|call| call.reply() == reply))
         .map(|row| row.binding)
         .ok_or(Error::Reply)?;
-    if crate::service_sec_image::hosted_ingress_binding(binding.badge) != Some(binding) {
-        return Err(Error::PhysicalIdentity);
-    }
-    stop_hosted_caller(binding.tcb, || crate::tcb_suspend_raw_r(binding.tcb))
-        .ok_or(Error::PhysicalIdentity)??;
+    stop_retained_hosted_call(reply, binding.tcb, || crate::tcb_suspend_raw_r(binding.tcb))?;
     cancel_hosted(reply)
 }
 

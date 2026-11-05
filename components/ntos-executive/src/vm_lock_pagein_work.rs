@@ -113,6 +113,13 @@ fn valid(handler: &ExecNtHandler, work: &Work) -> bool {
         && handler.capture_process_identity(owner.target_pi()) == Some(owner.target())
 }
 
+fn exact_target_scratch(owner: VmLockInvocationOwner) -> Option<u64> {
+    let nt_user_host::process_identity::ProcessGeneration::Hosted(generation) =
+        owner.target().generation else { return None; };
+    hosted_process_runtime_for_exact(owner.target_pi(), generation)
+        .map(|runtime| runtime.scratch_base)
+}
+
 /// A page worker reports only after its own exact terminal/copy/ACK and target map proof.
 /// It never consumes or replies through the coordinator's original syscall Reply.
 pub(crate) unsafe fn page_completed(
@@ -165,6 +172,14 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) {
         Phase::Scan => {
             if cancelled { work.phase = Phase::Cancel; return; }
             let target_pi = owner.target_pi();
+            if let nt_user_host::process_identity::ProcessGeneration::Hosted(generation) =
+                owner.target().generation
+            {
+                if hosted_process_runtime_for_exact(target_pi, generation).is_none() {
+                    work.phase = Phase::ReadyReply(INVALID);
+                    return;
+                }
+            }
             let Some(page) = work.progress.next_page(owner) else {
                 if !work.progress.ready_to_commit(owner) { work.phase = Phase::Indeterminate; return; }
                 // The lock table is the sole publication point. Enter once before the effect.
@@ -192,10 +207,17 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) {
             let result = match plan.source {
                 VmResidencySource::Private => handler.ensure_residency_page(target_pi, plan),
                 VmResidencySource::Mapped => {
-                    let ctx = handler.loop_ctx.unwrap();
+                    let Some(target_scratch) = exact_target_scratch(owner) else {
+                        work.phase = Phase::ReadyReply(INVALID);
+                        return;
+                    };
+                    let Some(ctx) = handler.loop_ctx else {
+                        work.phase = Phase::ReadyReply(INVALID);
+                        return;
+                    };
                     let fault = crate::service_sec_image::service_generic_section_fault(
                         handler, ctx.generic_sections, target_pi, page, ctx.pml4,
-                        hosted_scratch_base_for_pi(target_pi), plan.access, true, false);
+                        target_scratch, plan.access, true, false);
                     match fault {
                         Ok(crate::service_sec_image::GenericSectionFaultResult::Mapped) => Ok(()),
                         Ok(crate::service_sec_image::GenericSectionFaultResult::RoutedPageIn) => {

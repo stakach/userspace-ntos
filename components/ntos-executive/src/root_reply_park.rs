@@ -51,3 +51,21 @@ impl RootReplyPark {
         }
     }
 }
+
+/// Keep a refused hosted Call's Reply in its existing shared owner while allowing the root
+/// receiver to accept a different Call. This does not cancel, reuse, or retry the old Reply.
+/// The used pool record stays unavailable until its exact retained owner settles it.
+pub(crate) unsafe fn quarantine_current_hosted_reply() -> bool {
+    let active = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let Some(index) = wait_reply_pool_find_cap(active) else {
+        return false;
+    };
+    if active == 0
+        || !wait_reply_pool_ref().get(index).is_some_and(|record| record.used)
+        || !runtime::owns_hosted_reply(active)
+    {
+        return false;
+    }
+    REPLY_MAIN_SLOT.store(0, Ordering::Relaxed);
+    true
+}

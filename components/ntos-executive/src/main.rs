@@ -10374,7 +10374,7 @@ pub(crate) static TEB_TAIL_CORRUPT_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TEB_TAIL_FIRST_BAD: AtomicU64 = AtomicU64::new(0xFFFF);
 
 /// Select the process's environment scratch base, distinct from its demand-fill window.
-pub(crate) fn env_scratch_base_for_pi(pi: usize) -> u64 {
+pub(crate) fn env_scratch_base_for_pi(pi: usize) -> Option<u64> {
     hosted_env_scratch_base_for_pi(pi)
 }
 
@@ -10557,8 +10557,11 @@ pub(crate) unsafe fn ke_gdi_flush_user_batch(
 
 /// Observe the real client's descriptor without repairing it or attributing the writer.
 pub(crate) unsafe fn observe_client_teb_tail(pi: usize) {
-    let env_scratch = env_scratch_base_for_pi(pi);
     let Some(live_row) = teb_tail_alias_live_row(pi) else {
+        note_teb_tail_row_miss();
+        return;
+    };
+    let Some(env_scratch) = env_scratch_base_for_pi(pi) else {
         note_teb_tail_row_miss();
         return;
     };
@@ -10832,7 +10835,10 @@ pub(crate) unsafe fn teb_tail_watch(pi: usize, tag: u64, aux: u64, aux2: u64) {
         note_teb_tail_row_miss();
         return;
     };
-    let env_scratch = env_scratch_base_for_pi(pi);
+    let Some(env_scratch) = env_scratch_base_for_pi(pi) else {
+        note_teb_tail_row_miss();
+        return;
+    };
     if env_scratch == 0 {
         return;
     }
@@ -12355,7 +12361,7 @@ unsafe fn process_user_page_tables_release(pi: usize, handler: &mut ExecNtHandle
     (released, failed)
 }
 
-fn heap_mirror_for_pi(pi: usize) -> u64 {
+fn heap_mirror_for_pi(pi: usize) -> Option<u64> {
     hosted_heap_mirror_for_pi(pi)
 }
 
@@ -29655,20 +29661,24 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             0,
             100, // isolated SEC_IMAGE diagnostic has no canonical PM thread
         );
-        if ensure_executive_paging(BOOT_SEC_IMAGE_SCRATCH_BASE) {
-            let (v, f) = sec_image_diagnostic::run(
-                si_fault,
-                spawn,
-                sec_image_test_image,
-                &pe,
-                BOOT_SEC_IMAGE_SCRATCH_BASE,
-            );
-            si_verdict = v;
-            si_faults = f;
+        if let Ok(spawn) = spawn {
+            if ensure_executive_paging(BOOT_SEC_IMAGE_SCRATCH_BASE) {
+                let (v, f) = sec_image_diagnostic::run(
+                    si_fault,
+                    spawn,
+                    sec_image_test_image,
+                    &pe,
+                    BOOT_SEC_IMAGE_SCRATCH_BASE,
+                );
+                si_verdict = v;
+                si_faults = f;
+            } else {
+                print_str(b"[ntos-exec] SEC_IMAGE scratch paging unavailable\n");
+            }
+            assert!(release_unpublished_sec_image_spawn(SEC_IMAGE_SELFTEST_PI, spawn));
         } else {
-            print_str(b"[ntos-exec] SEC_IMAGE scratch paging unavailable\n");
+            print_str(b"[ntos-exec] SEC_IMAGE runtime layout unavailable\n");
         }
-        assert!(release_unpublished_sec_image_spawn(SEC_IMAGE_SELFTEST_PI, spawn));
         assert_eq!(cnode_delete_recycle_r(si_fault_c), 0);
         assert_eq!(cnode_delete_recycle_r(si_fault), 0);
     }
@@ -32861,6 +32871,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         u64::from(smss_client_id.unique_thread),
                         smss_priority,
                     );
+                    if let Ok(spawn) = spawn {
                     print_str(b"[diag-smss] spawn returned pml4=0x");
                     print_hex((spawn.pml4 >> 32) as u32);
                     print_hex(spawn.pml4 as u32);
@@ -33840,6 +33851,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_str(b" badge-lookups=0x");
                     print_hex(PM_BADGE_LOOKUPS.load(Ordering::Relaxed) as u32);
                     print_str(b"\n");
+                    } else {
+                        print_str(b"[ntos-exec] SMSS runtime retired before SEC_IMAGE spawn\n");
+                        check(b"exec_reactos_smss_live_paged", false, &mut passed);
+                    }
                 } else {
                     check(b"exec_reactos_smss_live_paged", false, &mut passed);
                     check(b"exec_reactos_smss_calls_into_ntdll", false, &mut passed);
