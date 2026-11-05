@@ -66,6 +66,7 @@ fn foreign_copy_retains_reply_progress_and_exact_pending_page_owner() {
     assert!(copy.probe_page_completed(caller, target, 0x4ff0));
     assert!(copy.enter_probe_page(caller, target, 0x5000));
     assert!(copy.probe_page_completed(caller, target, 0x5000));
+    assert!(copy.enter_copy_write(caller, target, 0));
     assert!(copy.commit_copied(caller, target, 0, 0x10));
     assert_eq!(copy.next_offset(caller, target), Some(0x10));
     assert!(!copy.commit_copied(caller, target, 0, 0x10));
@@ -84,6 +85,7 @@ fn foreign_copy_retains_reply_progress_and_exact_pending_page_owner() {
     assert!(copy.resume_pending(caller, target, 0x10, section, 31));
     assert_eq!(copy.next_offset(caller, target), Some(0x10));
     assert!(copy.stage_source(caller, target, 0x10, &[0x5a; 0x20]));
+    assert!(copy.enter_copy_write(caller, target, 0x10));
     assert!(copy.commit_copied(caller, target, 0x10, 0x20));
     assert!(copy.finish(caller, target, 0));
     assert_eq!(copy.output_to_publish(caller, target), Some((count_pointer, 0x30)));
@@ -115,6 +117,7 @@ fn terminal_page_error_publishes_only_completed_prefix_once() {
     assert!(copy.probe_page_completed(caller, target, 0x4ff0));
     assert!(copy.enter_probe_page(caller, target, 0x5000));
     assert!(copy.probe_page_completed(caller, target, 0x5000));
+    assert!(copy.enter_copy_write(caller, target, 0));
     assert!(copy.commit_copied(caller, target, 0, 0x10));
     assert!(copy.begin_pending(caller, target, 0x10, section, 9));
     assert!(copy.acknowledge_pending(caller, target, 0x10, section, 9));
@@ -144,6 +147,7 @@ fn inline_copy_error_retains_completed_prefix_without_replaying_probe() {
     assert!(copy.probe_page_completed(caller, target, 0x4ff0));
     assert!(copy.enter_probe_page(caller, target, 0x5000));
     assert!(copy.probe_page_completed(caller, target, 0x5000));
+    assert!(copy.enter_copy_write(caller, target, 0));
     assert!(copy.commit_copied(caller, target, 0, 0x10));
     assert!(copy.fail(caller, target, STATUS_PARTIAL_COPY));
     assert!(!copy.fail(caller, target, STATUS_PARTIAL_COPY));

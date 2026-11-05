@@ -27,8 +27,10 @@ fn count_output_crosses_page_once_before_original_reply() {
     assert!(copy.stage_source(caller, target, 0, &[0xa5; 256]));
     assert!(copy.enter_probe_page(caller, target, 0x6000));
     assert!(copy.probe_page_completed(caller, target, 0x6000));
+    assert!(copy.enter_copy_write(caller, target, 0));
     assert!(copy.commit_copied(caller, target, 0, 256));
     assert!(copy.stage_source(caller, target, 256, &[0x5a; 0x23]));
+    assert!(copy.enter_copy_write(caller, target, 256));
     assert!(copy.commit_copied(caller, target, 256, 0x23));
     assert!(copy.finish(caller, target, 0));
 
@@ -81,4 +83,24 @@ fn null_count_pointer_has_no_write_and_still_replies_once() {
         transferred: 0,
     })));
     assert_eq!(copy.enter_reply(caller, target), None);
+}
+
+#[test]
+fn definitive_second_count_page_failure_keeps_original_copy_result() {
+    let caller = Caller { process_generation: 1, thread_generation: 2, reply: 3 };
+    let target = Target { process_generation: 4, address_space_generation: 5 };
+    let mut copy = VmCopyContinuation::<Caller, Target, u64, u64>::new(
+        caller, target, 0x4000, 0x6000, 0, 0x1ffd,
+    );
+    assert!(copy.finish(caller, target, 0));
+    assert!(copy.enter_output_page(caller, target, 0x1ffd));
+    assert!(!copy.output_failed(caller, target),
+        "an entered count write cannot be treated as a proven no-write failure");
+    assert!(copy.output_page_completed(caller, target, 0x1ffd));
+    assert!(copy.output_failed(caller, target));
+    assert!(!copy.output_failed(caller, target));
+    assert_eq!(copy.enter_reply(caller, target), Some((caller, CopyResult {
+        status: 0,
+        transferred: 0,
+    })));
 }

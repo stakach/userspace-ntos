@@ -34,6 +34,10 @@ fn pending_destination_probe_keeps_first_source_chunk_and_probe_cursor() {
     assert!(copy.probe_page_completed(caller, target, 0x3000));
     assert_eq!(copy.next_probe_address(caller, target), None);
     assert_eq!(copy.staged_source(caller, target, 0), Some(staged.as_slice()));
+    assert!(copy.enter_copy_write(caller, target, 0));
+    assert!(!copy.enter_copy_write(caller, target, 0),
+        "an uncertain destination write cannot be re-entered");
+    assert_eq!(copy.next_offset(caller, target), None);
     assert!(copy.commit_copied(caller, target, 0, 8));
     assert_eq!(copy.staged_source(caller, target, 0), None);
     assert_eq!(copy.next_offset(caller, target), Some(8));

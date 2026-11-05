@@ -36,6 +36,7 @@ pub struct VmCopyContinuation<Caller, Target, Source, Irp> {
     staged_bytes: [u8; COPY_CHUNK_SIZE],
     probe_cursor: Option<u64>,
     probe_entered: bool,
+    copy_write_entered: bool,
     output_offset: usize,
     output_entered: bool,
     output_bytes: [u8; 8],
@@ -66,6 +67,7 @@ impl<Caller: Copy + Eq, Target: Copy + Eq, Source: Copy + Eq, Irp: Copy + Eq>
             staged_bytes: [0; COPY_CHUNK_SIZE],
             probe_cursor: (length != 0).then_some(destination_address),
             probe_entered: false,
+            copy_write_entered: false,
             output_offset: 0,
             output_entered: false,
             output_bytes: [0; 8],
@@ -80,6 +82,7 @@ impl<Caller: Copy + Eq, Target: Copy + Eq, Source: Copy + Eq, Irp: Copy + Eq>
     pub fn next_offset(&self, caller: Caller, target: Target) -> Option<u64> {
         (self.exact_owner(caller, target)
             && self.transferred < self.length
+            && !self.copy_write_entered
             && matches!(self.phase, Phase::Ready))
         .then_some(self.transferred)
     }
@@ -177,8 +180,22 @@ impl<Caller: Copy + Eq, Target: Copy + Eq, Source: Copy + Eq, Irp: Copy + Eq>
         true
     }
 
-    pub fn commit_copied(&mut self, caller: Caller, target: Target, offset: u64, bytes: u64) -> bool {
+    /// Enter the staged destination write before physical effects. Its result must be proved
+    /// before another chunk can be read or the same bytes can be written again.
+    pub fn enter_copy_write(&mut self, caller: Caller, target: Target, offset: u64) -> bool {
         if self.next_offset(caller, target) != Some(offset)
+            || self.staged_offset != Some(offset)
+            || self.probe_cursor.is_some() || self.probe_entered
+        {
+            return false;
+        }
+        self.copy_write_entered = true;
+        true
+    }
+
+    pub fn commit_copied(&mut self, caller: Caller, target: Target, offset: u64, bytes: u64) -> bool {
+        if !self.exact_owner(caller, target) || self.transferred != offset
+            || !matches!(self.phase, Phase::Ready) || !self.copy_write_entered
             || bytes == 0
             || bytes > self.length - offset
             || self.staged_offset != Some(offset)
@@ -192,6 +209,7 @@ impl<Caller: Copy + Eq, Target: Copy + Eq, Source: Copy + Eq, Irp: Copy + Eq>
         self.transferred = offset + bytes;
         self.staged_offset = None;
         self.staged_length = 0;
+        self.copy_write_entered = false;
         true
     }
 
@@ -303,6 +321,7 @@ impl<Caller: Copy + Eq, Target: Copy + Eq, Source: Copy + Eq, Irp: Copy + Eq>
     pub fn fail(&mut self, caller: Caller, target: Target, status: u32) -> bool {
         if status == 0 || status == STATUS_PENDING || !self.exact_owner(caller, target)
             || !matches!(self.phase, Phase::Ready) || self.probe_entered
+            || self.copy_write_entered
         {
             return false;
         }
@@ -394,6 +413,23 @@ impl<Caller: Copy + Eq, Target: Copy + Eq, Source: Copy + Eq, Irp: Copy + Eq>
         }
         let Phase::OutputPublishing(result) = self.phase else {
             return false;
+        };
+        self.phase = Phase::ReplyReady(result);
+        true
+    }
+
+    /// The native count store may meet a definitive no-write failure after an earlier page was
+    /// published. Preserve the copy result and enter the original Reply once; an entered write
+    /// with uncertain effect must remain parked instead.
+    pub fn output_failed(&mut self, caller: Caller, target: Target) -> bool {
+        if !self.exact_owner(caller, target) || self.count_pointer == 0
+            || self.output_entered || self.output_offset >= self.output_bytes.len()
+        {
+            return false;
+        }
+        let result = match self.phase {
+            Phase::OutputReady(result) | Phase::OutputPublishing(result) => result,
+            _ => return false,
         };
         self.phase = Phase::ReplyReady(result);
         true
