@@ -12,6 +12,7 @@ extern crate alloc;
 
 pub mod commit_release;
 pub mod object_wait;
+pub mod startup_wait_observation;
 pub mod thread_alert;
 pub mod current_apc;
 pub mod dispatcher_state;
@@ -58,6 +59,7 @@ pub mod routed_section_owner;
 pub mod section_view_retirement;
 pub mod provider_section_unmap;
 pub mod provider_logical_caller;
+pub mod vm_lock_owner;
 pub mod provider_irp_requestor;
 pub mod provider_subject;
 pub mod ps_bootstrap;
