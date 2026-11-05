@@ -3,6 +3,10 @@
 use super::shared_ingress::owner::runtime;
 use super::file_pump_diagnostic::{Stage, StageScope};
 use super::*;
+use nt_component_suspension::{
+    InlineIrqCheckpoint, InlineIrqCheckpointError, InlineIrqCheckpointMismatch,
+    InlineIrqCheckpointObservation, IngressExecutionOwner,
+};
 use nt_component_suspension::peer_registry::PeerRoute;
 
 // Counts only entered receive scopes and observed IRQ notifications. Periodic census reads these
@@ -285,24 +289,91 @@ pub(super) fn file_receive_census() -> [u64; 9] {
 /// Run the established bounded IRQ/DPC scheduler while the exact dispatch remains parked.
 /// The scheduler owns its nested execution hold and restores it before this receiver can wait;
 /// neither this checkpoint nor its caller sends or replays the retained Reply.
+unsafe fn inline_irq_observation(
+    ch: &PumpChannel, route: PeerRoute,
+) -> InlineIrqCheckpointObservation {
+    InlineIrqCheckpointObservation {
+        route: runtime::channel_route(ch).ok().flatten(),
+        dispatch: runtime::dispatch(route).ok(),
+        reply: runtime::current_reply(route).ok(),
+        execution: runtime::receive_owner(route).ok(),
+    }
+}
+
+fn trace_inline_irq_checkpoint_failure(
+    error: InlineIrqCheckpointError,
+    expected_route: PeerRoute,
+    expected_dispatch: Option<nt_component_suspension::LaneDispatchIdentity>,
+    expected_reply: Option<u64>,
+    observed: InlineIrqCheckpointObservation,
+) {
+    let (phase, mismatch) = match error {
+        InlineIrqCheckpointError::Preflight(mismatch) => (b"preflight".as_slice(), mismatch),
+        InlineIrqCheckpointError::PostRestore(mismatch) => (b"post-restore".as_slice(), mismatch),
+        InlineIrqCheckpointError::Consumed => (b"consumed".as_slice(), InlineIrqCheckpointMismatch::ExecutionOwner),
+    };
+    let mismatch = match mismatch {
+        InlineIrqCheckpointMismatch::Route => b"route".as_slice(),
+        InlineIrqCheckpointMismatch::Dispatch => b"dispatch".as_slice(),
+        InlineIrqCheckpointMismatch::Reply => b"reply".as_slice(),
+        InlineIrqCheckpointMismatch::ExecutionOwner => b"execution-owner".as_slice(),
+    };
+    let (owner_kind, owner_epoch) = match observed.execution {
+        Some(IngressExecutionOwner::Dispatch(dispatch)) => (1, dispatch.epoch()),
+        Some(IngressExecutionOwner::Idle) => (2, 0),
+        Some(IngressExecutionOwner::Startup(_)) => (3, 0),
+        None => (0, 0),
+    };
+    crate::print_str(b"[inline-irq-checkpoint] phase=");
+    crate::print_str(phase);
+    crate::print_str(b" mismatch=");
+    crate::print_str(mismatch);
+    crate::print_str(b" expected-route/badge/domain/gen/tcb/dispatch/reply=");
+    crate::print_u64(expected_route.badge());
+    crate::print_str(b"/"); crate::print_u64(expected_route.identity().domain);
+    crate::print_str(b"/"); crate::print_u64(expected_route.identity().domain_generation);
+    crate::print_str(b"/"); crate::print_u64(expected_route.identity().executor);
+    crate::print_str(b"/"); crate::print_u64(expected_dispatch.map_or(0, |dispatch| dispatch.epoch()));
+    crate::print_str(b"/"); crate::print_u64(expected_reply.unwrap_or(0));
+    crate::print_str(b" actual-route/badge/domain/gen/tcb/dispatch/reply/owner-kind/owner-epoch=");
+    crate::print_u64(observed.route.map_or(0, |route| route.badge()));
+    crate::print_str(b"/"); crate::print_u64(observed.route.map_or(0, |route| route.identity().domain));
+    crate::print_str(b"/"); crate::print_u64(observed.route.map_or(0, |route| route.identity().domain_generation));
+    crate::print_str(b"/"); crate::print_u64(observed.route.map_or(0, |route| route.identity().executor));
+    crate::print_str(b"/"); crate::print_u64(observed.dispatch.map_or(0, |dispatch| dispatch.epoch()));
+    crate::print_str(b"/"); crate::print_u64(observed.reply.unwrap_or(0));
+    crate::print_str(b"/"); crate::print_u64(owner_kind);
+    crate::print_str(b"/"); crate::print_u64(owner_epoch);
+    crate::print_str(b"\n");
+}
+
 unsafe fn service_inline_irq_checkpoint(
     ch: &PumpChannel,
     route: PeerRoute,
 ) -> Result<(), runtime::Error> {
-    if runtime::channel_route(ch)? != Some(route)
-        || !matches!(runtime::receive_owner(route)?, nt_component_suspension::IngressExecutionOwner::Dispatch(_))
-    {
+    let before = inline_irq_observation(ch, route);
+    let Some(dispatch) = before.dispatch else {
+        trace_inline_irq_checkpoint_failure(InlineIrqCheckpointError::Preflight(
+            InlineIrqCheckpointMismatch::Dispatch), route, None, before.reply, before);
         return Err(runtime::Error::PhysicalIdentity);
-    }
-    let dispatch = runtime::dispatch(route)?;
-    let reply = runtime::current_reply(route)?;
+    };
+    let Some(reply) = before.reply else {
+        trace_inline_irq_checkpoint_failure(InlineIrqCheckpointError::Preflight(
+            InlineIrqCheckpointMismatch::Reply), route, Some(dispatch), None, before);
+        return Err(runtime::Error::PhysicalIdentity);
+    };
+    let mut checkpoint = match InlineIrqCheckpoint::begin(route, dispatch, reply, before) {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => {
+            trace_inline_irq_checkpoint_failure(error, route, Some(dispatch), Some(reply), before);
+            return Err(runtime::Error::PhysicalIdentity);
+        }
+    };
     let scope = crate::driver_launch::ComponentSchedulerScope::enter();
     scope.service_irq_yield(ch.shared_va);
-    if runtime::channel_route(ch)? != Some(route)
-        || runtime::dispatch(route)? != dispatch
-        || runtime::current_reply(route)? != reply
-        || !matches!(runtime::receive_owner(route)?, nt_component_suspension::IngressExecutionOwner::Dispatch(current) if current == dispatch)
-    {
+    let after = inline_irq_observation(ch, route);
+    if let Err(error) = checkpoint.verify_after(after) {
+        trace_inline_irq_checkpoint_failure(error, route, Some(dispatch), Some(reply), after);
         return Err(runtime::Error::PhysicalIdentity);
     }
     Ok(())

@@ -1,6 +1,8 @@
 use super::*;
 use crate::{IngressReplyObservation, LaneBinding};
 
+mod inline_irq_checkpoint;
+
 type Lanes = ComponentSuspensionLanes<u64, u32, ()>;
 
 fn child_settlement() -> crate::ExternalSettlement {

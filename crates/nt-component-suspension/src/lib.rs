@@ -26,6 +26,11 @@ pub use external_selection::{
     oldest_receive_external_ingress_matching, ExternalReceiveState,
 };
 mod ingress;
+mod inline_irq_checkpoint;
+pub use inline_irq_checkpoint::{
+    InlineIrqCheckpoint, InlineIrqCheckpointError, InlineIrqCheckpointMismatch,
+    InlineIrqCheckpointObservation,
+};
 pub mod badge;
 pub mod source_registry;
 mod message;
