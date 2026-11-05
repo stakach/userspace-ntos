@@ -19709,7 +19709,7 @@ pub(crate) unsafe fn service_sec_image(
                     let _ = reconcile_user_apc_file_wait(&mut nt_handler, published.tid);
                 }
                 if published.still_waiting() {
-                    published.trace_parked_mounted_create();
+                    published.trace_parked_mounted_create(&nt_handler);
                     trace_indefinite_wait_park(
                         &nt_handler,
                         badge,

@@ -1,9 +1,15 @@
 //! Observation-only bridge from an exact parked File CREATE to an atomic census sample.
 
 use super::*;
-use crate::mounted_create_owner_snapshot::{OwnerKey, OwnerSnapshot, Phase};
+use crate::mounted_create_owner_snapshot::{Observation, OwnerKey, OwnerSnapshot, Phase};
 
 static LAST: OwnerSnapshot = OwnerSnapshot::new();
+// The ordinary latest-owner sample is overwritten by SCM CREATEs before Winlogon reaches
+// GINA. Keep one observation-only, exact owner for its first msgina.dll open.
+static MSGINA: OwnerSnapshot = OwnerSnapshot::new();
+static MSGINA_PID: AtomicU64 = AtomicU64::new(0);
+static MSGINA_PROCESS_GENERATION: AtomicU64 = AtomicU64::new(0);
+static MSGINA_CENSUS_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static PARK_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static ACK_TIMING_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static LOOKUP_PROGRESS_SAMPLES: AtomicU64 = AtomicU64::new(0);
@@ -58,6 +64,50 @@ fn name_fingerprint(units: &[u16]) -> u64 {
     hash
 }
 
+fn is_msgina_name(units: &[u16]) -> bool {
+    const LEAF: &[u8] = b"msgina.dll";
+    units.len() >= LEAF.len()
+        && units[units.len() - LEAF.len()..].iter().zip(LEAF).all(|(&unit, &byte)| {
+            unit <= 0x7f && (unit as u8).eq_ignore_ascii_case(&byte)
+        })
+        && (units.len() == LEAF.len()
+            || matches!(units[units.len() - LEAF.len() - 1], 0x5c | 0x2f))
+}
+
+fn print_msgina_stage(stage: &[u8], sample: Observation) {
+    crate::print_str(b"[winlogon-msgina-create] stage=");
+    crate::print_str(stage);
+    crate::print_str(b" pid/gen/pi/tid/badge=");
+    crate::print_u64(MSGINA_PID.load(Ordering::Relaxed));
+    crate::print_str(b"/");
+    crate::print_u64(MSGINA_PROCESS_GENERATION.load(Ordering::Relaxed));
+    crate::print_str(b"/");
+    crate::print_u64(sample.pi);
+    crate::print_str(b"/");
+    crate::print_u64(sample.tid);
+    crate::print_str(b"/");
+    crate::print_u64(sample.badge);
+    crate::print_str(b" owner/table/slot/gen=");
+    crate::print_u64(sample.key.table);
+    crate::print_str(b"/");
+    crate::print_u64(sample.key.slot);
+    crate::print_str(b"/");
+    crate::print_u64(sample.key.generation);
+    crate::print_str(b" irp/file=");
+    crate::print_hex_u64(sample.key.irp);
+    crate::print_str(b"/");
+    crate::print_hex_u64(sample.key.file);
+    crate::print_str(b" phase/status/delivery=");
+    crate::print_u64(sample.phase as u64);
+    crate::print_str(b"/");
+    crate::print_hex_u64(sample.status);
+    crate::print_str(b"/");
+    crate::print_hex_u64(sample.delivery);
+    crate::print_str(b" t_ms=");
+    crate::print_u64(crate::monotonic_time_100ns() / 10_000);
+    crate::print_str(b"\n");
+}
+
 unsafe fn exact_pending(
     identity: nt_io_manager::PendingFileIoIdentity, irp: u64, file: u64,
 ) -> Option<nt_io_manager::PendingFileIo> {
@@ -69,12 +119,12 @@ unsafe fn exact_pending(
 }
 
 pub(super) unsafe fn park_exact(
-    identity: nt_io_manager::PendingFileIoIdentity, irp: u64,
+    handler: &ExecNtHandler, identity: nt_io_manager::PendingFileIoIdentity, irp: u64,
 ) {
     let Some(pending) = (&*core::ptr::addr_of!(PENDING_FILE_IO)).get_exact(identity) else { return; };
     let Some(file_id) = pending.route.hosted_file_id() else { return; };
     if exact_pending(identity, irp, file_id).is_none() || pending.reply_cap == 0 { return; }
-    let (device, hash, name_len) = {
+    let (device, hash, name_len, msgina_name) = {
         let manager = driver_launch::io_manager_mut();
         let Some(canonical_irp) = manager.irp(nt_io_manager::IrpId(irp)) else { return; };
         if canonical_irp.id.raw() != irp || canonical_irp.file_id.map(nt_io_manager::FileId::raw) != Some(file_id)
@@ -83,7 +133,8 @@ pub(super) unsafe fn park_exact(
         let Some(file) = manager.file(nt_io_manager::FileId(file_id)) else { return; };
         if file.device_id != canonical_irp.origin_device_id { return; }
         (file.device_id.raw(), name_fingerprint(file.file_name.as_units()),
-            file.file_name.as_units().len() as u64)
+            file.file_name.as_units().len() as u64,
+            is_msgina_name(file.file_name.as_units()))
     };
     let Some(physical) = fs_loader::exec_fs_mount_identity() else { return; };
     if mounted_volume::exec_volume_device() != Some(device) { return; }
@@ -100,6 +151,24 @@ pub(super) unsafe fn park_exact(
         physical: physical.value(), logical: logical.value(),
     };
     let parked_100ns = crate::monotonic_time_100ns();
+    if msgina_name && MSGINA.read().is_none()
+        && handler.hosted_process_role(pending.pi as usize)
+            == Some(nt_exe_image::HostedProcessRole::InteractiveLogon)
+    {
+        if let Some(process) = handler.capture_process_identity(pending.pi as usize) {
+            if let nt_types::ProcessGeneration::Hosted(generation) = process.generation {
+                if MSGINA.park(key, pending.pi as u64, pending.tid, pending.badge,
+                    hash, name_len, route, parked_100ns)
+                {
+                    MSGINA_PID.store(process.pid as u64, Ordering::Relaxed);
+                    MSGINA_PROCESS_GENERATION.store(generation, Ordering::Relaxed);
+                    if let Some(sample) = MSGINA.read() {
+                        print_msgina_stage(b"park", sample);
+                    }
+                }
+            }
+        }
+    }
     if !LAST.park(key, pending.pi as u64, pending.tid, pending.badge,
         hash, name_len, route, parked_100ns) { return; }
     let n = PARK_SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -144,6 +213,28 @@ unsafe fn advance_exact(
     phase: Phase, status: u32,
 ) {
     let Some(pending) = exact_pending(identity, irp, file) else { return; };
+    if let Some(sample) = MSGINA.read() {
+        if sample.key.table == identity.table()
+            && sample.key.slot == identity.slot() as u64
+            && sample.key.generation == identity.generation()
+            && sample.key.irp == irp && sample.key.file == file
+            && sample.pi == pending.pi as u64
+            && sample.tid == pending.tid && sample.badge == pending.badge
+            && (phase as u64) > sample.phase as u64
+            && MSGINA.advance(sample.key, phase, u64::from(status),
+                u64::from(pending.delivery_state), crate::monotonic_time_100ns())
+        {
+            if let Some(updated) = MSGINA.read() {
+                let stage: &[u8] = match phase {
+                    Phase::Parked => b"park",
+                    Phase::Terminal => b"terminal",
+                    Phase::ReplyPublished => b"reply",
+                    Phase::BackendAcked => b"ack",
+                };
+                print_msgina_stage(stage, updated);
+            }
+        }
+    }
     let Some(observation) = LAST.read() else { return; };
     let key = observation.key;
     if key.table != identity.table() || key.slot != identity.slot() as u64
@@ -226,5 +317,47 @@ pub(crate) fn print_snapshot() {
     crate::print_hex_u64(sample.name_hash);
     crate::print_str(b"/");
     crate::print_u64(sample.name_len);
+    crate::print_str(b"\n");
+
+    let Some(gina) = MSGINA.read() else { return; };
+    let n = MSGINA_CENSUS_SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 8 && !n.is_power_of_two() { return; }
+    let pending = unsafe {
+        let table = &*core::ptr::addr_of!(PENDING_FILE_IO);
+        usize::try_from(gina.key.slot).ok()
+            .and_then(|slot| table.identity(slot))
+            .filter(|identity| identity.table() == gina.key.table
+                && identity.generation() == gina.key.generation)
+            .and_then(|identity| table.get_exact(identity))
+            .filter(|pending| pending.irp_id == gina.key.irp
+                && pending.route.hosted_file_id() == Some(gina.key.file)
+                && pending.pi as u64 == gina.pi
+                && pending.tid == gina.tid && pending.badge == gina.badge)
+    };
+    crate::print_str(b"[winlogon-msgina-owner] phase/status/pending/parked/reply/abandoned=");
+    crate::print_u64(gina.phase as u64);
+    crate::print_str(b"/");
+    crate::print_hex_u64(gina.status);
+    crate::print_str(b"/");
+    crate::print_u64(pending.is_some() as u64);
+    crate::print_str(b"/");
+    crate::print_u64(crate::thread_wait_state_badge_parked(gina.badge) as u64);
+    crate::print_str(b"/");
+    crate::print_u64(pending.is_some_and(|row| row.reply_required && row.reply_cap != 0) as u64);
+    crate::print_str(b"/");
+    crate::print_u64(pending.is_some_and(|row| row.consumer_abandoned) as u64);
+    crate::print_str(b" deadline=none file-retry-global=");
+    match driver_launch::hosted_file_retry_deadline(crate::monotonic_time_100ns()) {
+        Some(deadline) => crate::print_u64(deadline),
+        None => crate::print_str(b"none"),
+    }
+    crate::print_str(b" sas/msgloop/wait/dialogs=");
+    crate::print_u64(crate::WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed));
+    crate::print_str(b"/");
+    crate::print_u64(crate::WINLOGON_MSGLOOP_MILESTONE.load(Ordering::Relaxed));
+    crate::print_str(b"/");
+    crate::print_u64(crate::WINLOGON_MAIN_EVENT_WAIT_PARKED.load(Ordering::Relaxed));
+    crate::print_str(b"/");
+    crate::print_u64(crate::WINLOGON_DIALOG_WINDOWS.load(Ordering::Relaxed));
     crate::print_str(b"\n");
 }
