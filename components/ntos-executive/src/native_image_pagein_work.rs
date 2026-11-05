@@ -1,4 +1,4 @@
-//! Retained routed SEC_IMAGE page faults. Provider reads outlive the fault ingress.
+//! Retained routed SEC_IMAGE page-ins for faults and syscall copy probes.
 
 use crate::*;
 use alloc::vec::Vec;
@@ -17,9 +17,23 @@ type ImageRead = RoutedImageRead<
 const RESOURCES: u32 = nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
 const INVALID: u32 = nt_fs::STATUS_INVALID_HANDLE;
 const RETRY_DELAY: u64 = 1_000_000;
+const COPY_FAULT: u32 = nt_address_space::STATUS_ACCESS_VIOLATION;
 
 #[derive(Clone, Copy)]
-enum Phase { Read, Publish, ReadyReply, ReplyEntered, ReplySent, Cancel, Cancelled, Indeterminate }
+struct SyscallCopy {
+    args: [u64; 4],
+    origin: nt_syscall::SyscallOrigin,
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+    native_call_transport: bool,
+}
+
+#[derive(Clone, Copy)]
+enum Purpose { Fault, NtQuerySystemInformation(SyscallCopy) }
+
+#[derive(Clone, Copy)]
+enum Phase { AwaitSource, Read, Publish, MapPage, ScanSyscall, DispatchSyscall, ReplyReady, ReadyError, ReplyEntered, ReplySent, Cancel, Cancelled, Indeterminate }
 
 struct Work {
     pi: usize,
@@ -43,6 +57,8 @@ struct Work {
     failure: Option<u32>,
     failure_logged: bool,
     cancel_requested: bool,
+    purpose: Purpose,
+    progress: nt_syscall::system_information::QueryOutputContinuation,
 }
 
 impl Work {
@@ -60,22 +76,36 @@ static EXECUTING_PI: AtomicU64 = AtomicU64::new(u64::MAX);
 static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
-/// Returns false for local images, protection faults, or a source page already owned by the
-/// canonical cache. No provider effect enters before the original fault Reply is parked.
-pub(crate) unsafe fn submit(
-    handler: &mut ExecNtHandler, pi: usize, page: u64,
-    access: FaultAccess, observation: ImageFaultObservation,
-) -> Result<bool, u32> {
-    if observation != ImageFaultObservation::NotPresent { return Ok(false); }
-    let Some(view) = handler.native_image_view_for_page(pi, page)? else { return Ok(false); };
+fn has_source_producer(area: ImageAreaId, rva: u32) -> bool {
+    unsafe { (&*core::ptr::addr_of!(WORK)).iter().flatten().any(|row|
+        row.view.view.area() == area && row.rva == rva
+            && matches!(row.phase, Phase::Read | Phase::Publish)) }
+}
+
+unsafe fn prepare_page(
+    handler: &mut ExecNtHandler, pi: usize, page: u64, access: FaultAccess,
+    observation: ImageFaultObservation, purpose: Purpose, reply: u64,
+    parked: bool,
+) -> Result<Option<Work>, u32> {
+    let Some(view) = handler.native_image_view_for_page(pi, page)? else { return Ok(None); };
     let Some(source) = handler.image_sections.source_for_view(view.view) else { return Err(INVALID); };
     if !matches!(source.contents, crate::native_image_sections::NativeImageContents::RetainedRouted) {
-        return Ok(false);
+        return Ok(None);
     }
     if !source.has_readable_image() { return Err(INVALID); }
     let rva = view.section_offset.checked_add(page - view.base)
         .and_then(|offset| u32::try_from(offset).ok()).ok_or(INVALID)?;
-    if crate::native_image_residency::has_source_row(view.view.area(), rva) { return Ok(false); }
+    let existing = crate::native_image_residency::has_source_row(view.view.area(), rva);
+    if matches!(purpose, Purpose::Fault) && existing { return Ok(None); }
+    if matches!(purpose, Purpose::NtQuerySystemInformation(_))
+        && (crate::native_image_residency::source_page_ready(view.view.area(), rva)
+            || crate::native_image_residency::has_private_page(view, page))
+    { return Ok(None); }
+    if existing && !parked && !has_source_producer(view.view.area(), rva) {
+        // A retained synchronous source initializer has no asynchronous producer here.
+        // The canonical probe owns its result; a second File READ would be a replay.
+        return Ok(None);
+    }
     let lease = source.backing.routed_lease.ok_or(INVALID)?;
     let plan = source.layout.image_page_fill_plan(rva, source.backing.file_extent)
         .map_err(|_| INVALID)?;
@@ -98,21 +128,83 @@ pub(crate) unsafe fn submit(
     if capture.fs_context() != context { return Err(INVALID); }
     let origin_driver = driver_launch::io_manager_mut().device(DeviceId(device))
         .ok_or(INVALID)?.driver_id.raw();
+    Ok(Some(Work {
+        pi, tid, badge: handler.current_badge, reply, logical, view, page, rva, access,
+        observation, info, lease, origin_driver, capture: Some(capture),
+        fill: ImagePageFillCapture::new(plan), span: None, read: None,
+        phase: if existing { Phase::AwaitSource } else { Phase::Read },
+        failure: None, failure_logged: false, cancel_requested: false,
+        purpose, progress: nt_syscall::system_information::QueryOutputContinuation::PageReady,
+    }))
+}
+
+unsafe fn install_work(work: Work) -> Result<(), u32> {
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
     let index = rows.iter().enumerate().find_map(|(index, row)|
         (row.is_none() && EXECUTING_INDEX.load(Ordering::Acquire) != index as u64).then_some(index));
     if index.is_none() && rows.try_reserve(1).is_err() { return Err(RESOURCES); }
     let Some(park) = root_reply_park::RootReplyPark::prepare() else { return Err(RESOURCES); };
-    let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    let work = Work {
-        pi, tid, badge: handler.current_badge, reply, logical, view, page, rva, access,
-        observation, info, lease, origin_driver, capture: Some(capture),
-        fill: ImagePageFillCapture::new(plan), span: None, read: None,
-        phase: Phase::Read, failure: None, failure_logged: false, cancel_requested: false,
-    };
     match index { Some(index) => rows[index] = Some(work), None => rows.push(Some(work)) }
     park.commit();
     NEXT.store(monotonic_time_100ns(), Ordering::Release);
+    Ok(())
+}
+
+/// Returns false for local images, protection faults, or a source page already owned by the
+/// canonical cache. No provider effect enters before the original fault Reply is parked.
+pub(crate) unsafe fn submit(
+    handler: &mut ExecNtHandler, pi: usize, page: u64,
+    access: FaultAccess, observation: ImageFaultObservation,
+) -> Result<bool, u32> {
+    if observation != ImageFaultObservation::NotPresent { return Ok(false); }
+    let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let Some(work) = prepare_page(handler, pi, page, access, observation, Purpose::Fault,
+        reply, false)?
+        else { return Ok(false); };
+    install_work(work)?;
+    Ok(true)
+}
+
+unsafe fn next_syscall_page(
+    handler: &mut ExecNtHandler, pi: usize, reply: u64, call: SyscallCopy,
+    parked: bool,
+) -> Result<Option<Work>, u32> {
+    let Ok(pages) = nt_syscall::system_information::QueryOutputPages::new(
+        call.args[0] as u32, call.args[1], call.args[2] as u32 as u64,
+        call.args[3], USER_ADDRESS_LIMIT,
+    ) else {
+        // Preserve the ordinary handler's class, alignment, and probe precedence.
+        return Ok(None);
+    };
+    for page in pages {
+        let prepared = prepare_page(handler, pi, page, FaultAccess::Write,
+            ImageFaultObservation::CopyAccess,
+            Purpose::NtQuerySystemInformation(call), reply, parked);
+        match prepared {
+            Ok(Some(work)) => return Ok(Some(work)),
+            Ok(None) => {}
+            Err(_) if !parked => {
+                // The handler owns semantic probe errors before Reply transfer.
+                return Ok(None);
+            }
+            Err(status) => return Err(status),
+        }
+    }
+    Ok(None)
+}
+
+/// Park a native Call before a routed image output probe can enter a pending File READ.
+/// No syscall handler or user-output probe runs until every required source is ready.
+pub(crate) unsafe fn submit_syscall_copy(
+    handler: &mut ExecNtHandler, pi: usize, args: [u64; 4],
+    origin: nt_syscall::SyscallOrigin, resume_ip: u64, sp: u64, flags: u64,
+    native_call_transport: bool,
+) -> Result<bool, u32> {
+    let call = SyscallCopy { args, origin, resume_ip, sp, flags, native_call_transport };
+    let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let Some(work) = next_syscall_page(handler, pi, reply, call, false)?
+        else { return Ok(false); };
+    install_work(work)?;
     Ok(true)
 }
 
@@ -172,7 +264,9 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
             Err(capture) => {
                 work.capture = Some(capture);
                 work.failure = Some(RESOURCES);
-                work.phase = Phase::Cancel;
+                work.phase = if matches!(work.purpose, Purpose::NtQuerySystemInformation(_)) {
+                    Phase::ReadyError
+                } else { Phase::Cancel };
                 return;
             }
         };
@@ -191,7 +285,12 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
                     return;
                 }
             }
-            (Err(status), _) => { work.failure = Some(status); work.phase = Phase::Cancel; }
+            (Err(status), _) => {
+                work.failure = Some(status);
+                work.phase = if !cancelled
+                    && matches!(work.purpose, Purpose::NtQuerySystemInformation(_))
+                { Phase::ReadyError } else { Phase::Cancel };
+            }
             _ => work.phase = Phase::Cancel,
         }
         return;
@@ -327,7 +426,9 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
     }
 }
 
-unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
+unsafe fn advance(
+    handler: &mut ExecNtHandler, dispatcher: &NativeSyscallDispatcher, work: &mut Work,
+) -> bool {
     let cancelled = spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(work.reply)
         || handler.pm.thread(work.logical.thread().thread_id())
             .is_some_and(|thread| thread.state == nt_process::ThreadState::Terminated)
@@ -335,6 +436,20 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
             .is_some_and(|process| process.state == nt_process::ProcessState::Terminated)
         || !valid(handler, work);
     match work.phase {
+        Phase::AwaitSource => {
+            if cancelled { work.phase = Phase::Cancel; }
+            else if crate::native_image_residency::source_page_ready(work.view.view.area(), work.rva) {
+                work.phase = Phase::MapPage;
+            } else if !crate::native_image_residency::has_source_row(work.view.view.area(), work.rva) {
+                work.phase = Phase::Read;
+            } else if !has_source_producer(work.view.view.area(), work.rva) {
+                // A retained or quarantined synchronous initializer has no known redriver.
+                // Keep both source and original Reply; never submit a duplicate File READ.
+                work.failure = Some(RESOURCES);
+                work.phase = Phase::Indeterminate;
+            }
+            false
+        }
         Phase::Read => { advance_read(work, cancelled); false }
         Phase::Publish => {
             if cancelled { work.phase = Phase::Cancel; return false; }
@@ -346,25 +461,120 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                 handler, work.view, work.rva, bytes,
             ) {
                 work.failure = Some(status);
-                work.phase = Phase::Cancel;
+                work.phase = if matches!(work.purpose, Purpose::Fault) {
+                    Phase::Cancel
+                } else {
+                    // The source owner can be retained or quarantined after a physical effect.
+                    Phase::Indeterminate
+                };
                 return false;
             }
-            work.phase = Phase::ReadyReply;
+            work.phase = Phase::MapPage;
             false
         }
-        Phase::ReadyReply => {
+        Phase::MapPage => {
             if cancelled { work.phase = Phase::Cancel; return false; }
-            match handler.service_native_image_page_residency(
+            if matches!(work.purpose, Purpose::NtQuerySystemInformation(_))
+                && !work.progress.enter_map()
+            { work.phase = Phase::Indeterminate; return false; }
+            let mapped = handler.service_native_image_page_residency(
                 work.pi, work.page, work.access, work.observation,
-            ) {
+            );
+            match mapped {
                 Ok(Some(())) if valid(handler, work) => {}
-                _ => { work.phase = Phase::Cancel; return false; }
+                other => {
+                    work.failure = Some(other.err().unwrap_or(INVALID));
+                    work.phase = if matches!(work.purpose, Purpose::Fault) {
+                        Phase::Cancel
+                    } else { Phase::Indeterminate };
+                    return false;
+                }
             }
+            if matches!(work.purpose, Purpose::NtQuerySystemInformation(_)) {
+                assert!(work.progress.map_completed());
+                work.phase = Phase::ScanSyscall;
+            } else {
+                work.phase = Phase::ReplyReady;
+            }
+            false
+        }
+        Phase::ScanSyscall => {
+            if cancelled { work.phase = Phase::Cancel; return false; }
+            let Purpose::NtQuerySystemInformation(call) = work.purpose else {
+                work.phase = Phase::Indeterminate;
+                return false;
+            };
+            match next_syscall_page(handler, work.pi, work.reply, call, true) {
+                Ok(Some(next)) => { *work = next; }
+                Err(RESOURCES) => {}
+                Err(status) => {
+                    work.failure = Some(status);
+                    assert!(work.progress.fail_before_dispatch(COPY_FAULT));
+                    work.phase = Phase::ReplyReady;
+                }
+                Ok(None) => work.phase = Phase::DispatchSyscall,
+            }
+            false
+        }
+        Phase::DispatchSyscall => {
+            if cancelled { work.phase = Phase::Cancel; return false; }
+            let Purpose::NtQuerySystemInformation(call) = work.purpose else {
+                work.phase = Phase::Indeterminate;
+                return false;
+            };
+            if !work.progress.enter_dispatch() { work.phase = Phase::Indeterminate; return false; }
+            // Entered before dispatch: even an uncertain handler effect cannot be replayed.
+            work.phase = Phase::Indeterminate;
+            let previous_memory = handler.current_user_memory;
+            let previous_post = handler.post_action;
+            let previous_stop = handler.stop;
+            let previous_writes = handler.out_writes_n;
+            handler.current_user_memory = SyscallUserMemory::CurrentProcess;
+            handler.post_action = ExecPostAction::None;
+            handler.stop = false;
+            handler.out_writes_n = 0;
+            crate::probe_reset();
+            let result = dispatcher.dispatch(SSN_NT_QUERY_SYSTEM_INFO as u32,
+                &call.args, &call.origin, handler);
+            assert_eq!(handler.post_action, ExecPostAction::None,
+                "query output continuation cannot transfer its Reply");
+            assert!(!handler.stop && handler.out_writes_n == 0
+                && handler.current_apc_handoff.is_none()
+                && handler.pending_synchronous_file_wait.is_none(),
+                "query output continuation cannot enter another async effect");
+            handler.current_user_memory = previous_memory;
+            handler.post_action = previous_post;
+            handler.stop = previous_stop;
+            handler.out_writes_n = previous_writes;
+            assert!(work.progress.dispatch_completed(result.status));
+            work.phase = Phase::ReplyReady;
+            false
+        }
+        Phase::ReplyReady => {
+            if cancelled { work.phase = Phase::Cancel; return false; }
             if parked_reply::validate_saved(work.reply).is_err() { return false; }
             work.phase = Phase::ReplyEntered;
-            if !client_reply_on(work.reply, 0, 0, 0, 0, 0) { return false; }
+            let sent = match work.purpose {
+                Purpose::Fault => client_reply_on(work.reply, 0, 0, 0, 0, 0),
+                Purpose::NtQuerySystemInformation(_) => {
+                    let status = work.progress.reply_status()
+                        .expect("retained query Reply has terminal status");
+                    assert!(work.progress.enter_reply());
+                    reply_parked_syscall(work.reply, u64::from(status))
+                }
+            };
+            if !sent { return false; }
             crate::note_boot_progress(crate::BootProgress::PageMappingPublished);
             work.phase = Phase::ReplySent;
+            false
+        }
+        Phase::ReadyError => {
+            if cancelled { work.phase = Phase::Cancel; return false; }
+            if !work.progress.fail_before_dispatch(COPY_FAULT) {
+                work.phase = Phase::Indeterminate;
+                return false;
+            }
+            work.phase = Phase::ReplyReady;
             false
         }
         Phase::ReplyEntered => {
@@ -405,11 +615,26 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
             if parked_reply::retype(work.reply).is_err() { return false; }
             true
         }
-        Phase::Indeterminate => false,
+        Phase::Indeterminate => {
+            if !work.failure_logged {
+                print_str(b"[native-image-pagein] retained uncertain owner pi=");
+                print_u64(work.pi as u64);
+                print_str(b" page=0x");
+                print_hex((work.page >> 32) as u32);
+                print_hex(work.page as u32);
+                print_str(b" status=0x");
+                print_hex(work.failure.unwrap_or(RESOURCES));
+                print_str(b"\n");
+                work.failure_logged = true;
+            }
+            false
+        }
     }
 }
 
-pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
+pub(crate) unsafe fn redrive(
+    handler: &mut ExecNtHandler, dispatcher: &NativeSyscallDispatcher,
+) {
     if next_deadline().is_none_or(|deadline| monotonic_time_100ns() < deadline)
         || ACTIVE.swap(true, Ordering::AcqRel)
     { return; }
@@ -420,11 +645,19 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         EXECUTING_INDEX.store(index as u64, Ordering::Release);
         EXECUTING_TID.store(work.tid, Ordering::Release);
         EXECUTING_PI.store(work.pi as u64, Ordering::Release);
+        let (resume_ip, sp, flags, transport, service) = match work.purpose {
+            Purpose::Fault => (0, 0, 0, false, 0),
+            Purpose::NtQuerySystemInformation(call) =>
+                (call.resume_ip, call.sp, call.flags, call.native_call_transport,
+                    SSN_NT_QUERY_SYSTEM_INFO as u32),
+        };
         let done = service_sec_image::with_section_metadata_context(
-            handler, work.pi, work.tid, work.badge, 0, 0, 0, false, 0,
-            |handler| advance(handler, &mut work),
+            handler, work.pi, work.tid, work.badge, resume_ip, sp, flags, transport, service,
+            |handler| advance(handler, dispatcher, &mut work),
         ).unwrap_or_else(|| {
             let stopped = spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(work.reply)
+                || handler.capture_process_identity(work.pi) != Some(work.view.process)
+                || !handler.validate_provider_logical_caller(work.logical)
                 || handler.pm.thread(work.logical.thread().thread_id())
                     .is_some_and(|thread| thread.state == nt_process::ThreadState::Terminated)
                 || handler.pm.process(work.logical.process().pid)
@@ -435,9 +668,13 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
                     advance_read(&mut work, true);
                     false
                 }
-                Phase::Publish | Phase::ReadyReply => { work.phase = Phase::Cancel; false }
+                Phase::AwaitSource | Phase::Publish | Phase::MapPage
+                    | Phase::ScanSyscall | Phase::DispatchSyscall | Phase::ReplyReady
+                    | Phase::ReadyError =>
+                    { work.phase = Phase::Cancel; false }
                 Phase::Read | Phase::ReplyEntered | Phase::ReplySent | Phase::Cancel
-                    | Phase::Cancelled | Phase::Indeterminate => advance(handler, &mut work),
+                    | Phase::Cancelled | Phase::Indeterminate =>
+                        advance(handler, dispatcher, &mut work),
             }
         });
         if !done { (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work); }

@@ -34818,17 +34818,14 @@ impl ExecNtHandler {
             // layer supplies the live machine/time facts and performs user-buffer probing/copyout.
             NativeService::NtQuerySystemInformation => unsafe {
                 use nt_syscall::system_information::{
-                    encode_system_module_information, query_plan,
+                    encode_system_module_information, query_plan, supports_query_output,
                     system_module_information_required_length, SystemFlagsInformation,
                     SystemInformationKind, SystemTimeOfDayInformation,
-                    RTL_PROCESS_MODULES_HEADER_SIZE, SYSTEM_BASIC_INFORMATION_CLASS,
-                    SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS, SYSTEM_FLAGS_INFORMATION_CLASS,
-                    SYSTEM_MODULE_INFORMATION_CLASS, SYSTEM_PROCESSOR_INFORMATION_CLASS,
-                    SYSTEM_TIME_OF_DAY_INFORMATION_CLASS,
+                    RTL_PROCESS_MODULES_HEADER_SIZE, STATUS_DATATYPE_MISALIGNMENT,
+                    SYSTEM_MODULE_INFORMATION_CLASS,
                 };
 
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-                const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
                 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 
                 let class = nt_ulong_arg(args[0]);
@@ -34836,15 +34833,7 @@ impl ExecNtHandler {
                 let len = nt_ulong_arg(args[2]) as usize;
                 let retlen_ptr = args[3];
 
-                if !matches!(
-                    class,
-                    SYSTEM_BASIC_INFORMATION_CLASS
-                        | SYSTEM_PROCESSOR_INFORMATION_CLASS
-                        | SYSTEM_TIME_OF_DAY_INFORMATION_CLASS
-                        | SYSTEM_MODULE_INFORMATION_CLASS
-                        | SYSTEM_FLAGS_INFORMATION_CLASS
-                        | SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS
-                ) {
+                if !supports_query_output(class) {
                     return STATUS_INVALID_INFO_CLASS;
                 }
                 if len != 0 && buf & 3 != 0 {

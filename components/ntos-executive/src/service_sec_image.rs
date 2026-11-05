@@ -10082,7 +10082,7 @@ pub(crate) unsafe fn service_sec_image(
                 ntdll, fault_ep, procs, exe_images, &*exe_image_catalog,
                 hosted_loaded_images_ptr);
             crate::section_pagein_work::redrive(&mut nt_handler);
-            crate::native_image_pagein_work::redrive(&mut nt_handler);
+            crate::native_image_pagein_work::redrive(&mut nt_handler, &nt_dispatcher);
             crate::provider_section_broker::redrive(nt_handler as *mut _);
             crate::provider_directory_broker::redrive(nt_handler as *mut _);
             crate::provider_mm_section_objects::redrive(nt_handler as *mut _);
@@ -11839,7 +11839,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_address_space::ImageFaultObservation::from_x86_error(m3),
             ) {
                 Ok(true) => {
-                    crate::native_image_pagein_work::redrive(&mut nt_handler);
+                    crate::native_image_pagein_work::redrive(&mut nt_handler, &nt_dispatcher);
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
@@ -13393,7 +13393,31 @@ pub(crate) unsafe fn service_sec_image(
                     panic!("previous syscall leaked an LPC request continuation reservation");
                 }
                 let _ = lpc_connect_completion_drain(&mut nt_handler);
-                if !stack_args_valid {
+                let copy_preflight = if stack_args_valid && m0 == SSN_NT_QUERY_SYSTEM_INFO {
+                    crate::native_image_pagein_work::submit_syscall_copy(
+                        &mut nt_handler, pi, [argv[0], argv[1], argv[2], argv[3]],
+                        origin, resume_ip, sp, flags, native_call_transport,
+                    )
+                } else { Ok(false) };
+                if matches!(copy_preflight, Ok(true)) {
+                    thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                    {
+                        let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                        crate::native_image_pagein_work::redrive(&mut nt_handler, &nt_dispatcher);
+                    }
+                    let _ = finalize_service_loop_state(&mut nt_handler);
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                    badge = nb;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
+                    continue;
+                } else if let Err(status) = copy_preflight {
+                    result = status as u64;
+                } else if !stack_args_valid {
                     if m0 as u32 == SSN_NT_QUERY_KEY as u32 {
                         let arguments = [argv[0], argv[1], argv[2], argv[3], argv[4]];
                         crate::registry_query_diagnostics::reject(

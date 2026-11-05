@@ -157,6 +157,33 @@ fn routed_dll_fault_retains_pending_read_until_page_and_reply_are_safe() {
 }
 
 #[test]
+fn syscall_output_copy_waits_for_routed_image_page_before_dispatch() {
+    let ingress = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/service_sec_image.rs"),
+    ).unwrap();
+    let preflight = ingress.find("native_image_pagein_work::submit_syscall_copy(")
+        .expect("syscall ingress must retain a routed CopyAccess page before dispatch");
+    let dispatch = ingress.find("nt_dispatcher.dispatch(m0 as u32, &argv[..n]")
+        .expect("real syscall dispatch");
+    assert!(preflight < dispatch, "output preflight must precede all syscall effects");
+
+    let worker = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/native_image_pagein_work.rs"),
+    ).expect("retained syscall CopyAccess owner");
+    for required in ["RootReplyPark", "RoutedImageRead", "ImagePageFillCapture",
+        "bind_pending", "completed_irp_exact", "copy_completed_irp_output_exact",
+        "acknowledge_completed_irp_strict", "accept_acknowledged_span",
+        "NtQuerySystemInformation", "dispatch", "reply_parked_syscall"] {
+        assert!(worker.contains(required),
+            "CopyAccess must retain source I/O through strict ACK before one dispatch: {required}");
+    }
+    assert!(worker.contains("CopyAccess"),
+        "CopyAccess continuation must be distinct from a hardware fault reply");
+}
+
+#[test]
 fn cancelled_dll_page_read_keeps_exact_key_through_copy_and_ack() {
     use nt_memory_manager::routed_image_read::RoutedImageRead;
 

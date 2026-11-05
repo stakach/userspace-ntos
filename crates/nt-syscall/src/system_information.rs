@@ -1,6 +1,8 @@
 //! Fixed-layout NT5 x64 system-information records and query-size policy.
 
-use crate::{STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_INFO_CLASS};
+use crate::{STATUS_ACCESS_VIOLATION, STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_INFO_CLASS};
+
+pub const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
 
 pub const SYSTEM_BASIC_INFORMATION_CLASS: u32 = 0;
 pub const SYSTEM_PROCESSOR_INFORMATION_CLASS: u32 = 1;
@@ -22,6 +24,165 @@ pub const RTL_PROCESS_MODULE_INFORMATION_SIZE: usize = 0x128;
 pub const RTL_PROCESS_MODULE_FULL_PATH_NAME_SIZE: usize = 256;
 pub const SYSTEM_CURRENT_TIME_ZONE_INFORMATION_SIZE: usize = 0xac;
 pub const SYSTEM_SESSION_ID_INFORMATION_SIZE: usize = 0x04;
+
+/// Classes whose query path performs the generic user-output probe.
+pub const fn supports_query_output(class: u32) -> bool {
+    matches!(class,
+        SYSTEM_BASIC_INFORMATION_CLASS | SYSTEM_PROCESSOR_INFORMATION_CLASS
+        | SYSTEM_TIME_OF_DAY_INFORMATION_CLASS | SYSTEM_MODULE_INFORMATION_CLASS
+        | SYSTEM_FLAGS_INFORMATION_CLASS | SYSTEM_CURRENT_TIME_ZONE_INFORMATION_CLASS)
+}
+
+#[cfg(test)]
+mod query_output_page_tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    const LIMIT: u64 = 0x20_000;
+
+    #[test]
+    fn enumerates_each_output_page_then_distinct_return_length_page() {
+        let pages: Vec<_> = QueryOutputPages::new(0, 0x1ff0, 0x2020, 0x8000, LIMIT)
+            .unwrap().collect();
+        assert_eq!(pages, [0x1000, 0x2000, 0x3000, 0x4000, 0x8000]);
+    }
+
+    #[test]
+    fn deduplicates_return_length_page_inside_buffer() {
+        let pages: Vec<_> = QueryOutputPages::new(0, 0x2000, 0x3000, 0x3000, LIMIT)
+            .unwrap().collect();
+        assert_eq!(pages, [0x2000, 0x3000, 0x4000]);
+    }
+
+    #[test]
+    fn zero_length_does_not_touch_buffer() {
+        let pages: Vec<_> = QueryOutputPages::new(0, u64::MAX, 0, 0x5000, LIMIT)
+            .unwrap().collect();
+        assert_eq!(pages, [0x5000]);
+    }
+
+    #[test]
+    fn checked_ranges_and_alignment_preserve_query_priority() {
+        assert!(matches!(QueryOutputPages::new(u32::MAX, 3, 8, 5, LIMIT),
+            Err(STATUS_INVALID_INFO_CLASS)));
+        assert!(matches!(QueryOutputPages::new(0, 3, u64::MAX, 5, LIMIT),
+            Err(0x8000_0002)));
+        assert!(matches!(QueryOutputPages::new(0, 4, u64::MAX, 0, LIMIT),
+            Err(0xC000_0005)));
+        assert!(matches!(QueryOutputPages::new(0, 4, 8, u64::MAX, LIMIT),
+            Err(0x8000_0002)));
+        assert!(matches!(QueryOutputPages::new(0, 4, 8, LIMIT, LIMIT),
+            Err(0xC000_0005)));
+    }
+
+    #[test]
+    fn retained_output_effects_are_one_shot_across_reply_retries() {
+        let mut owner = QueryOutputContinuation::PageReady;
+        assert!(owner.enter_map());
+        assert!(!owner.enter_map(), "uncertain map cannot be replayed");
+        assert!(owner.map_completed());
+        assert!(!owner.enter_map(), "post-map resource retry cannot remap");
+        assert!(owner.enter_dispatch());
+        assert!(!owner.enter_dispatch(), "entered syscall cannot be replayed");
+        assert!(owner.dispatch_completed(0x1234));
+        assert_eq!(owner.reply_status(), Some(0x1234));
+        // A refused Reply validation leaves the exact status ready; it cannot reopen dispatch.
+        assert!(!owner.enter_dispatch());
+        assert_eq!(owner.reply_status(), Some(0x1234));
+        assert!(owner.enter_reply());
+        assert!(!owner.enter_reply(), "uncertain Reply send cannot be repeated");
+    }
+}
+
+/// Pages the generic query output probes may touch, in probe order. This performs only the
+/// admission checks that precede the probe; the executive still probes and writes the bytes.
+pub struct QueryOutputPages {
+    next_buffer: Option<u64>,
+    last_buffer: u64,
+    ret_page: Option<u64>,
+}
+
+impl QueryOutputPages {
+    pub fn new(
+        class: u32, buffer: u64, length: u64, return_length: u64, user_limit: u64,
+    ) -> Result<Self, u32> {
+        if !supports_query_output(class) { return Err(STATUS_INVALID_INFO_CLASS); }
+        if length != 0 && buffer & 3 != 0 { return Err(STATUS_DATATYPE_MISALIGNMENT); }
+        let end = if length == 0 { buffer } else {
+            buffer.checked_add(length).filter(|end| *end <= user_limit)
+                .ok_or(STATUS_ACCESS_VIOLATION)?
+        };
+        if return_length != 0 {
+            if return_length & 3 != 0 { return Err(STATUS_DATATYPE_MISALIGNMENT); }
+            return_length.checked_add(4).filter(|end| *end <= user_limit)
+                .ok_or(STATUS_ACCESS_VIOLATION)?;
+        }
+        let first = (length != 0).then_some(buffer & !0xfff);
+        let last = if length == 0 { 0 } else { (end - 1) & !0xfff };
+        let ret_page = (return_length != 0).then_some(return_length & !0xfff)
+            .filter(|page| first.is_none_or(|first| *page < first || *page > last));
+        Ok(Self { next_buffer: first, last_buffer: last, ret_page })
+    }
+}
+
+impl Iterator for QueryOutputPages {
+    type Item = u64;
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(page) = self.next_buffer {
+            self.next_buffer = (page < self.last_buffer).then(|| page + 0x1000);
+            return Some(page);
+        }
+        self.ret_page.take()
+    }
+}
+
+/// Admission for the physical page map, one syscall dispatch and its terminal Reply. Entering
+/// an effect is durable; a refused or uncertain effect cannot authorize replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryOutputContinuation {
+    PageReady,
+    MapEntered,
+    Mapped,
+    DispatchEntered,
+    ReplyReady(u32),
+    ReplyEntered(u32),
+}
+
+impl QueryOutputContinuation {
+    pub fn enter_map(&mut self) -> bool {
+        if *self != Self::PageReady { return false; }
+        *self = Self::MapEntered;
+        true
+    }
+    pub fn map_completed(&mut self) -> bool {
+        if *self != Self::MapEntered { return false; }
+        *self = Self::Mapped;
+        true
+    }
+    pub fn enter_dispatch(&mut self) -> bool {
+        if *self != Self::Mapped { return false; }
+        *self = Self::DispatchEntered;
+        true
+    }
+    pub fn dispatch_completed(&mut self, status: u32) -> bool {
+        if *self != Self::DispatchEntered { return false; }
+        *self = Self::ReplyReady(status);
+        true
+    }
+    pub fn fail_before_dispatch(&mut self, status: u32) -> bool {
+        if !matches!(*self, Self::PageReady | Self::Mapped) { return false; }
+        *self = Self::ReplyReady(status);
+        true
+    }
+    pub const fn reply_status(self) -> Option<u32> {
+        match self { Self::ReplyReady(status) | Self::ReplyEntered(status) => Some(status), _ => None }
+    }
+    pub fn enter_reply(&mut self) -> bool {
+        let Self::ReplyReady(status) = *self else { return false; };
+        *self = Self::ReplyEntered(status);
+        true
+    }
+}
 
 pub const PROCESSOR_ARCHITECTURE_AMD64: u16 = 9;
 

@@ -173,6 +173,18 @@ pub(crate) unsafe fn has_source_row(area: ImageAreaId, rva: u32) -> bool {
         row.owner.descriptor() == SourceKey { area, rva })
 }
 
+pub(crate) unsafe fn source_page_ready(area: ImageAreaId, rva: u32) -> bool {
+    (&*core::ptr::addr_of!(SOURCES)).iter().any(|row|
+        row.owner.descriptor() == SourceKey { area, rva }
+            && !row.retiring && !row.revoke_acked && row.owner.ready_frame().is_some())
+}
+
+pub(crate) unsafe fn has_private_page(view: NativeImageViewDescriptor, page: u64) -> bool {
+    (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).get(view.pi as u64, page)
+        .is_some_and(|record| record.is_resident() && record.owns_frame
+            && record.lifetime == nt_memory_manager::MemoryLifetime::Process(view.process))
+}
+
 pub(crate) unsafe fn ensure_source_page_from_acknowledged_bytes(
     handler: &ExecNtHandler,
     view: NativeImageViewDescriptor,
