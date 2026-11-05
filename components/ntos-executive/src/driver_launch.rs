@@ -1818,6 +1818,10 @@ static HOSTED_IO_DEVICE_PROPERTY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_IO_DEVICE_PROPERTY_TRACE_CAP: u64 = 32;
 static HOSTED_DMA_SG_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_DMA_SG_TRACE_CAP: u64 = 16;
+static HOSTED_DMA_SG_FAILURE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const HOSTED_DMA_SG_FAILURE_TRACE_CAP: u64 = 16;
+static HOSTED_DMA_PRIVATE_POOL_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
+const HOSTED_DMA_PRIVATE_POOL_FAILURE_CAP: u64 = 4;
 static HOSTED_RESOURCE_GRANT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_RESOURCE_GRANT_TRACE_CAP: u64 = 96;
 static HOSTED_RESOURCE_GRANT_DETAIL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -11980,14 +11984,14 @@ const HOSTED_DMA_CONFLICT_RETRY_LIMIT: u32 = 64;
 /// before the provider writes or publishes it.
 unsafe fn dma_root_conflict_next(
     adapter: u64, logical: u64, length: u64,
-) -> Result<Option<u64>, ()> {
+) -> Result<Option<u64>, i32> {
     let (_label, status, next, _, _) = call_on5(
         (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
         adapter,
         HOSTED_DMA_SERVICE_CHECK_CONFLICT << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
         logical, length, 0,
     );
-    if status as u32 as i32 != STATUS_SUCCESS { return Err(()); }
+    if status as u32 as i32 != STATUS_SUCCESS { return Err(status as u32 as i32); }
     Ok((next != 0).then_some(next))
 }
 
@@ -12209,7 +12213,7 @@ extern "win64" fn s_dma_allocate_common_buffer(
                     continue;
                 }
                 Ok(None) => {}
-                Err(()) => return 0,
+                Err(_) => return 0,
             }
             let Some(va) = metadata.grant_va.checked_add(aligned) else { return 0; };
             let logical = candidate_logical;
@@ -12406,7 +12410,12 @@ unsafe fn trace_hosted_dma_sg(
     map_register: u64,
     logical: u64,
 ) {
-    if HOSTED_DMA_SG_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= HOSTED_DMA_SG_TRACE_CAP {
+    let (count, cap) = if status == STATUS_SUCCESS {
+        (&HOSTED_DMA_SG_TRACE_COUNT, HOSTED_DMA_SG_TRACE_CAP)
+    } else {
+        (&HOSTED_DMA_SG_FAILURE_TRACE_COUNT, HOSTED_DMA_SG_FAILURE_TRACE_CAP)
+    };
+    if count.fetch_add(1, Ordering::Relaxed) >= cap {
         return;
     }
     print_str(b"[hosted-sg] ");
@@ -12470,6 +12479,23 @@ unsafe fn trace_hosted_dma_sg(
     print_str(b"\n");
 }
 
+/// A root-provisioned DMA graph allocates from the same component pool as ExAllocatePool,
+/// but does not pass through the component-side pool exhaustion logger.
+unsafe fn trace_hosted_dma_private_pool_failure(inst: DriverInstance, size: u64) {
+    if HOSTED_DMA_PRIVATE_POOL_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed)
+        >= HOSTED_DMA_PRIVATE_POOL_FAILURE_CAP
+    {
+        return;
+    }
+    print_str(b"[hosted-dma-private-pool] allocation-failed size/used/cap=");
+    print_u64(size);
+    print_str(b"/");
+    print_u64(hosted_pool_used(inst.exec_pool_va));
+    print_str(b"/");
+    print_u64(FSD_POOL_FRAMES * 0x1000);
+    print_str(b"\n");
+}
+
 unsafe fn dma_copy_bytes(dst: u64, src: u64, len: u64) {
     let mut offset = 0u64;
     while offset < len {
@@ -12490,6 +12516,17 @@ unsafe fn dma_allocate_private_graph(
         operation << HOSTED_DMA_SERVICE_OPERATION_SHIFT,
         request_id, argument, size,
     );
+    if status as u32 as i32 != STATUS_SUCCESS || map == 0 {
+        trace_hosted_dma_sg(
+            b"private", b"private-graph-rejected",
+            if map == 0 && status as u32 as i32 == STATUS_SUCCESS {
+                STATUS_INSUFFICIENT_RESOURCES
+            } else {
+                status as u32 as i32
+            },
+            adapter, 0, 0, operation as u32, list, map, context,
+        );
+    }
     (status as u32 as i32 == STATUS_SUCCESS && map != 0).then_some((map, context, list))
 }
 
@@ -12764,6 +12801,10 @@ extern "win64" fn s_dma_map_transfer(
             None
         } else {
             write_unaligned(length, 0);
+            trace_hosted_dma_sg(
+                b"map", b"probe-source-failed", probe_status as u32 as i32,
+                adapter, mdl, current_va, requested as u32, 0, map_register_base, 0,
+            );
             return 0;
         };
         let Some(record) = first_free_dma_allocation_record(FSD_SHARED_VADDR) else {
@@ -12799,6 +12840,15 @@ extern "win64" fn s_dma_map_transfer(
             );
             if status as u32 as i32 != STATUS_SUCCESS || alias_id == 0 {
                 write_unaligned(length, 0);
+                trace_hosted_dma_sg(
+                    b"map", b"coherent-map-failed",
+                    if alias_id == 0 && status as u32 as i32 == STATUS_SUCCESS {
+                        STATUS_INSUFFICIENT_RESOURCES
+                    } else {
+                        status as u32 as i32
+                    },
+                    adapter, mdl, current_va, mapped_len as u32, 0, map_register_base, logical,
+                );
                 return 0;
             }
             // Software miniports and hardware DMA see the same grant bytes. PutSG must not
@@ -12897,7 +12947,15 @@ extern "win64" fn s_dma_map_transfer(
                     continue;
                 }
                 Ok(None) => {}
-                Err(()) => { write_unaligned(length, 0); return 0; }
+                Err(status) => {
+                    write_unaligned(length, 0);
+                    trace_hosted_dma_sg(
+                        b"map", b"root-conflict-failed", status,
+                        adapter, mdl, current_va, mapped_len as u32, 0, map_register_base,
+                        candidate_logical,
+                    );
+                    return 0;
+                }
             }
             let Some(bounce_va) = metadata.grant_va.checked_add(aligned) else {
                 write_unaligned(length, 0);
@@ -12927,6 +12985,16 @@ extern "win64" fn s_dma_map_transfer(
             }
             if mapped_status as u32 as i32 != STATUS_SUCCESS || mapping_id == 0 {
                 write_unaligned(length, 0);
+                trace_hosted_dma_sg(
+                    b"map", b"root-map-failed",
+                    if mapping_id == 0 && mapped_status as u32 as i32 == STATUS_SUCCESS {
+                        STATUS_INSUFFICIENT_RESOURCES
+                    } else {
+                        mapped_status as u32 as i32
+                    },
+                    adapter, mdl, current_va, mapped_len as u32, 0, map_register_base,
+                    candidate_logical,
+                );
                 return 0;
             }
             break (aligned, mapping_id);

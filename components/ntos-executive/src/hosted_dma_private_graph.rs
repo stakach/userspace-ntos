@@ -77,8 +77,13 @@ pub(super) fn has_live_graph(inst: DriverInstance) -> bool {
 unsafe fn allocate_member(inst: DriverInstance, size: u64)
     -> Result<SourcePoolAllocationIdentity, nt_status::NtStatus>
 {
-    let address = hosted_instance_pool_alloc_unlocked(inst, size)
-        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let address = match hosted_instance_pool_alloc_unlocked(inst, size) {
+        Some(address) => address,
+        None => {
+            trace_hosted_dma_private_pool_failure(inst, size);
+            return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+        }
+    };
     allocation(inst, address)
 }
 
