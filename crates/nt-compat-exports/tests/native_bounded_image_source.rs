@@ -184,6 +184,31 @@ fn syscall_output_copy_waits_for_routed_image_page_before_dispatch() {
 }
 
 #[test]
+fn query_default_locale_image_global_waits_for_routed_page_before_dispatch() {
+    let ingress = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/service_sec_image.rs"),
+    ).unwrap();
+    let preflight = ingress.find("let copy_preflight =")
+        .expect("native syscall CopyAccess preflight");
+    let dispatch = ingress[preflight..].find("nt_dispatcher.dispatch(m0 as u32, &argv[..n]")
+        .map(|offset| preflight + offset).expect("ordinary native syscall dispatch");
+    let admission = &ingress[preflight..dispatch];
+    assert!(admission.contains("SSN_NT_QUERY_DEFAULT_LOCALE")
+        && admission.contains("native_image_pagein_work::submit_syscall_copy("),
+        "NtQueryDefaultLocale must park its original Call before writing an image global");
+
+    let worker = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/native_image_pagein_work.rs"),
+    ).unwrap();
+    assert!(worker.contains("NtQueryDefaultLocale")
+        && worker.contains("CopyAccess")
+        && worker.contains("reply_parked_syscall"),
+        "the retained worker must page in the locale output before one dispatch and Reply");
+}
+
+#[test]
 fn routed_hardware_fault_does_not_fall_through_on_an_unready_source_row() {
     use nt_memory_manager::image_source_page::ImageSourcePage;
 

@@ -75,23 +75,6 @@ mod query_output_page_tests {
             Err(0xC000_0005)));
     }
 
-    #[test]
-    fn retained_output_effects_are_one_shot_across_reply_retries() {
-        let mut owner = QueryOutputContinuation::PageReady;
-        assert!(owner.enter_map());
-        assert!(!owner.enter_map(), "uncertain map cannot be replayed");
-        assert!(owner.map_completed());
-        assert!(!owner.enter_map(), "post-map resource retry cannot remap");
-        assert!(owner.enter_dispatch());
-        assert!(!owner.enter_dispatch(), "entered syscall cannot be replayed");
-        assert!(owner.dispatch_completed(0x1234));
-        assert_eq!(owner.reply_status(), Some(0x1234));
-        // A refused Reply validation leaves the exact status ready; it cannot reopen dispatch.
-        assert!(!owner.enter_dispatch());
-        assert_eq!(owner.reply_status(), Some(0x1234));
-        assert!(owner.enter_reply());
-        assert!(!owner.enter_reply(), "uncertain Reply send cannot be repeated");
-    }
 }
 
 /// Pages the generic query output probes may touch, in probe order. This performs only the
@@ -133,54 +116,6 @@ impl Iterator for QueryOutputPages {
             return Some(page);
         }
         self.ret_page.take()
-    }
-}
-
-/// Admission for the physical page map, one syscall dispatch and its terminal Reply. Entering
-/// an effect is durable; a refused or uncertain effect cannot authorize replay.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QueryOutputContinuation {
-    PageReady,
-    MapEntered,
-    Mapped,
-    DispatchEntered,
-    ReplyReady(u32),
-    ReplyEntered(u32),
-}
-
-impl QueryOutputContinuation {
-    pub fn enter_map(&mut self) -> bool {
-        if *self != Self::PageReady { return false; }
-        *self = Self::MapEntered;
-        true
-    }
-    pub fn map_completed(&mut self) -> bool {
-        if *self != Self::MapEntered { return false; }
-        *self = Self::Mapped;
-        true
-    }
-    pub fn enter_dispatch(&mut self) -> bool {
-        if *self != Self::Mapped { return false; }
-        *self = Self::DispatchEntered;
-        true
-    }
-    pub fn dispatch_completed(&mut self, status: u32) -> bool {
-        if *self != Self::DispatchEntered { return false; }
-        *self = Self::ReplyReady(status);
-        true
-    }
-    pub fn fail_before_dispatch(&mut self, status: u32) -> bool {
-        if !matches!(*self, Self::PageReady | Self::Mapped) { return false; }
-        *self = Self::ReplyReady(status);
-        true
-    }
-    pub const fn reply_status(self) -> Option<u32> {
-        match self { Self::ReplyReady(status) | Self::ReplyEntered(status) => Some(status), _ => None }
-    }
-    pub fn enter_reply(&mut self) -> bool {
-        let Self::ReplyReady(status) = *self else { return false; };
-        *self = Self::ReplyEntered(status);
-        true
     }
 }
 

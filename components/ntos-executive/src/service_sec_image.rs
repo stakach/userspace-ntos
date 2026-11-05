@@ -13393,9 +13393,12 @@ pub(crate) unsafe fn service_sec_image(
                     panic!("previous syscall leaked an LPC request continuation reservation");
                 }
                 let _ = lpc_connect_completion_drain(&mut nt_handler);
-                let copy_preflight = if stack_args_valid && m0 == SSN_NT_QUERY_SYSTEM_INFO {
+                let copy_preflight = if stack_args_valid
+                    && matches!(m0, SSN_NT_QUERY_SYSTEM_INFO | SSN_NT_QUERY_DEFAULT_LOCALE)
+                {
                     crate::native_image_pagein_work::submit_syscall_copy(
-                        &mut nt_handler, pi, [argv[0], argv[1], argv[2], argv[3]],
+                        &mut nt_handler, pi, m0 as u32,
+                        [argv[0], argv[1], argv[2], argv[3]],
                         origin, resume_ip, sp, flags, native_call_transport,
                     )
                 } else { Ok(false) };

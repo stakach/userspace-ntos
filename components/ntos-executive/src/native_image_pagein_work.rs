@@ -25,6 +25,7 @@ const COPY_FAULT: u32 = nt_address_space::STATUS_ACCESS_VIOLATION;
 
 #[derive(Clone, Copy)]
 struct SyscallCopy {
+    service: CopyService,
     args: [u64; 4],
     origin: nt_syscall::SyscallOrigin,
     resume_ip: u64,
@@ -34,7 +35,21 @@ struct SyscallCopy {
 }
 
 #[derive(Clone, Copy)]
-enum Purpose { Fault, NtQuerySystemInformation(SyscallCopy) }
+enum CopyService { NtQuerySystemInformation, NtQueryDefaultLocale }
+impl CopyService {
+    const fn number(self) -> u32 {
+        match self {
+            Self::NtQuerySystemInformation => SSN_NT_QUERY_SYSTEM_INFO as u32,
+            Self::NtQueryDefaultLocale => SSN_NT_QUERY_DEFAULT_LOCALE as u32,
+        }
+    }
+    const fn argument_count(self) -> usize {
+        match self { Self::NtQuerySystemInformation => 4, Self::NtQueryDefaultLocale => 2 }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Purpose { Fault, SyscallCopy(SyscallCopy) }
 
 #[derive(Clone, Copy)]
 enum Phase { AwaitSource, Read, Publish, MapPage, ScanSyscall, DispatchSyscall, ReplyReady, ReadyError, ReplyEntered, ReplySent, Cancel, Cancelled, Indeterminate }
@@ -62,7 +77,7 @@ struct Work {
     failure_logged: bool,
     cancel_requested: bool,
     purpose: Purpose,
-    progress: nt_syscall::system_information::QueryOutputContinuation,
+    progress: nt_syscall::copy_preflight::CopyOutputContinuation,
 }
 
 impl Work {
@@ -137,11 +152,11 @@ unsafe fn prepare_page(
     if matches!(purpose, Purpose::Fault)
         && decision == RoutedSourceReadDecision::Ready
     { return Ok(None); }
-    if matches!(purpose, Purpose::NtQuerySystemInformation(_))
+    if matches!(purpose, Purpose::SyscallCopy(_))
         && (source_ready
             || crate::native_image_residency::has_private_page(view, page))
     { return Ok(None); }
-    if existing && !parked && matches!(purpose, Purpose::NtQuerySystemInformation(_))
+    if existing && !parked && matches!(purpose, Purpose::SyscallCopy(_))
         && !producer
     {
         // A retained synchronous source initializer has no asynchronous producer here.
@@ -178,7 +193,7 @@ unsafe fn prepare_page(
             Phase::Read
         } else { Phase::AwaitSource },
         failure: None, failure_logged: false, cancel_requested: false,
-        purpose, progress: nt_syscall::system_information::QueryOutputContinuation::PageReady,
+        purpose, progress: nt_syscall::copy_preflight::CopyOutputContinuation::PageReady,
     }))
 }
 
@@ -213,25 +228,47 @@ unsafe fn next_syscall_page(
     handler: &mut ExecNtHandler, pi: usize, reply: u64, call: SyscallCopy,
     parked: bool,
 ) -> Result<Option<Work>, u32> {
-    let Ok(pages) = nt_syscall::system_information::QueryOutputPages::new(
-        call.args[0] as u32, call.args[1], call.args[2] as u32 as u64,
-        call.args[3], USER_ADDRESS_LIMIT,
-    ) else {
-        // Preserve the ordinary handler's class, alignment, and probe precedence.
-        return Ok(None);
-    };
-    for page in pages {
-        let prepared = prepare_page(handler, pi, page, FaultAccess::Write,
-            ImageFaultObservation::CopyAccess,
-            Purpose::NtQuerySystemInformation(call), reply, parked);
+    enum Prepared { NoImage, Work(Work), HandlerError }
+    let mut prepare = |page| {
+        let prepared = unsafe { prepare_page(handler, pi, page, FaultAccess::Write,
+            ImageFaultObservation::CopyAccess, Purpose::SyscallCopy(call), reply, parked) };
         match prepared {
-            Ok(Some(work)) => return Ok(Some(work)),
-            Ok(None) => {}
+            Ok(Some(work)) => Ok(Prepared::Work(work)),
+            Ok(None) => Ok(Prepared::NoImage),
             Err(_) if !parked => {
                 // The handler owns semantic probe errors before Reply transfer.
-                return Ok(None);
+                Ok(Prepared::HandlerError)
             }
-            Err(status) => return Err(status),
+            Err(status) => Err(status),
+        }
+    };
+    match call.service {
+        CopyService::NtQuerySystemInformation => {
+            let Ok(pages) = nt_syscall::system_information::QueryOutputPages::new(
+                call.args[0] as u32, call.args[1], call.args[2] as u32 as u64,
+                call.args[3], USER_ADDRESS_LIMIT,
+            ) else {
+                // Preserve the ordinary handler's class, alignment, and probe precedence.
+                return Ok(None);
+            };
+            for page in pages {
+                match prepare(page)? {
+                    Prepared::Work(work) => return Ok(Some(work)),
+                    Prepared::HandlerError => return Ok(None),
+                    Prepared::NoImage => {}
+                }
+            }
+        }
+        CopyService::NtQueryDefaultLocale => {
+            // The handler owns null, alignment and range errors before any user copyout.
+            if let Some(page) = nt_syscall::copy_preflight::query_default_locale_output_page(
+                call.args[1], USER_ADDRESS_LIMIT,
+            ) {
+                return match prepare(page)? {
+                    Prepared::Work(work) => Ok(Some(work)),
+                    Prepared::NoImage | Prepared::HandlerError => Ok(None),
+                };
+            }
         }
     }
     Ok(None)
@@ -240,11 +277,18 @@ unsafe fn next_syscall_page(
 /// Park a native Call before a routed image output probe can enter a pending File READ.
 /// No syscall handler or user-output probe runs until every required source is ready.
 pub(crate) unsafe fn submit_syscall_copy(
-    handler: &mut ExecNtHandler, pi: usize, args: [u64; 4],
+    handler: &mut ExecNtHandler, pi: usize, service_number: u32, args: [u64; 4],
     origin: nt_syscall::SyscallOrigin, resume_ip: u64, sp: u64, flags: u64,
     native_call_transport: bool,
 ) -> Result<bool, u32> {
-    let call = SyscallCopy { args, origin, resume_ip, sp, flags, native_call_transport };
+    let service = match service_number {
+        number if number == SSN_NT_QUERY_SYSTEM_INFO as u32 =>
+            CopyService::NtQuerySystemInformation,
+        number if number == SSN_NT_QUERY_DEFAULT_LOCALE as u32 =>
+            CopyService::NtQueryDefaultLocale,
+        _ => return Ok(false),
+    };
+    let call = SyscallCopy { service, args, origin, resume_ip, sp, flags, native_call_transport };
     let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     let Some(work) = next_syscall_page(handler, pi, reply, call, false)?
         else { return Ok(false); };
@@ -308,7 +352,7 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
             Err(capture) => {
                 work.capture = Some(capture);
                 work.failure = Some(RESOURCES);
-                work.phase = if matches!(work.purpose, Purpose::NtQuerySystemInformation(_)) {
+                work.phase = if matches!(work.purpose, Purpose::SyscallCopy(_)) {
                     Phase::ReadyError
                 } else { Phase::Cancel };
                 return;
@@ -332,7 +376,7 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
             (Err(status), _) => {
                 work.failure = Some(status);
                 work.phase = if !cancelled
-                    && matches!(work.purpose, Purpose::NtQuerySystemInformation(_))
+                    && matches!(work.purpose, Purpose::SyscallCopy(_))
                 { Phase::ReadyError } else { Phase::Cancel };
             }
             _ => work.phase = Phase::Cancel,
@@ -526,7 +570,7 @@ unsafe fn advance(
         }
         Phase::MapPage => {
             if cancelled { work.phase = Phase::Cancel; return false; }
-            if matches!(work.purpose, Purpose::NtQuerySystemInformation(_))
+            if matches!(work.purpose, Purpose::SyscallCopy(_))
                 && !work.progress.enter_map()
             { work.phase = Phase::Indeterminate; return false; }
             let mapped = handler.service_native_image_page_residency(
@@ -542,7 +586,7 @@ unsafe fn advance(
                     return false;
                 }
             }
-            if matches!(work.purpose, Purpose::NtQuerySystemInformation(_)) {
+            if matches!(work.purpose, Purpose::SyscallCopy(_)) {
                 assert!(work.progress.map_completed());
                 work.phase = Phase::ScanSyscall;
             } else {
@@ -552,7 +596,7 @@ unsafe fn advance(
         }
         Phase::ScanSyscall => {
             if cancelled { work.phase = Phase::Cancel; return false; }
-            let Purpose::NtQuerySystemInformation(call) = work.purpose else {
+            let Purpose::SyscallCopy(call) = work.purpose else {
                 work.phase = Phase::Indeterminate;
                 return false;
             };
@@ -570,7 +614,7 @@ unsafe fn advance(
         }
         Phase::DispatchSyscall => {
             if cancelled { work.phase = Phase::Cancel; return false; }
-            let Purpose::NtQuerySystemInformation(call) = work.purpose else {
+            let Purpose::SyscallCopy(call) = work.purpose else {
                 work.phase = Phase::Indeterminate;
                 return false;
             };
@@ -586,14 +630,14 @@ unsafe fn advance(
             handler.stop = false;
             handler.out_writes_n = 0;
             crate::probe_reset();
-            let result = dispatcher.dispatch(SSN_NT_QUERY_SYSTEM_INFO as u32,
-                &call.args, &call.origin, handler);
+            let result = dispatcher.dispatch(call.service.number(),
+                &call.args[..call.service.argument_count()], &call.origin, handler);
             assert_eq!(handler.post_action, ExecPostAction::None,
-                "query output continuation cannot transfer its Reply");
+                "copy output continuation cannot transfer its Reply");
             assert!(!handler.stop && handler.out_writes_n == 0
                 && handler.current_apc_handoff.is_none()
                 && handler.pending_synchronous_file_wait.is_none(),
-                "query output continuation cannot enter another async effect");
+                "copy output continuation cannot enter another async effect");
             handler.current_user_memory = previous_memory;
             handler.post_action = previous_post;
             handler.stop = previous_stop;
@@ -608,9 +652,9 @@ unsafe fn advance(
             work.phase = Phase::ReplyEntered;
             let sent = match work.purpose {
                 Purpose::Fault => client_reply_on(work.reply, 0, 0, 0, 0, 0),
-                Purpose::NtQuerySystemInformation(_) => {
+                Purpose::SyscallCopy(_) => {
                     let status = work.progress.reply_status()
-                        .expect("retained query Reply has terminal status");
+                        .expect("retained copy Reply has terminal status");
                     assert!(work.progress.enter_reply());
                     reply_parked_syscall(work.reply, u64::from(status))
                 }
@@ -701,9 +745,9 @@ pub(crate) unsafe fn redrive(
             Some((work.view.view.area(), work.rva, work.phase));
         let (resume_ip, sp, flags, transport, service) = match work.purpose {
             Purpose::Fault => (0, 0, 0, false, 0),
-            Purpose::NtQuerySystemInformation(call) =>
+            Purpose::SyscallCopy(call) =>
                 (call.resume_ip, call.sp, call.flags, call.native_call_transport,
-                    SSN_NT_QUERY_SYSTEM_INFO as u32),
+                    call.service.number()),
         };
         let done = service_sec_image::with_section_metadata_context(
             handler, work.pi, work.tid, work.badge, resume_ip, sp, flags, transport, service,
