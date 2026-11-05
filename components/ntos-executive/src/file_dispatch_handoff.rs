@@ -13,8 +13,8 @@ pub(super) struct PublishedFileIo {
 impl PublishedFileIo {
     /// Capture only the exact published mounted CREATE while this outer caller still owns its
     /// parked Reply. Periodic census reads the resulting atomics without borrowing the manager.
-    pub(super) unsafe fn trace_parked_mounted_create(&self, handler: &ExecNtHandler) {
-        super::mounted_create_owner_trace::park_exact(handler, self.identity, self.irp_id);
+    pub(super) unsafe fn trace_parked_mounted_create(&self) {
+        super::mounted_create_owner_trace::park_exact(self.identity, self.irp_id);
     }
 
     pub(super) unsafe fn still_waiting(&self) -> bool {
