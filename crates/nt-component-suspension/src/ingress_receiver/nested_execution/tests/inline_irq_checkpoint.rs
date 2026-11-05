@@ -22,6 +22,83 @@ fn observation(f: &Fixture, dispatch: LaneDispatchIdentity) -> InlineIrqCheckpoi
 }
 
 #[test]
+fn inline_irq_checkpoint_admits_idle_receiver_without_parent_or_reply_replay() {
+    let mut f = Fixture::new();
+    let call_reply = f.receiver.reply();
+    let (route, dispatch) = f.parent(1);
+    let reply = f.lanes.binding(dispatch.lane()).unwrap().reply_object;
+    let retained_reply_owner = f.receiver.retained_reply_owner(call_reply);
+    assert!(retained_reply_owner.is_some());
+    assert_eq!(f.receiver.stored_message(route, call_reply), Ok(&1));
+    assert_eq!(f.receiver.stored_reply_acknowledged(route, dispatch, call_reply), Ok(false));
+
+    // A suspended dispatch retains its exact route, epoch and Reply while the
+    // reusable receiver has no running parent for the IRQ scheduler to park.
+    f.lanes.suspend_running(dispatch.lane(), reply, 77).unwrap();
+    assert_eq!(f.lanes.running(), None);
+    assert!(!f.lanes.execution_busy());
+    let mut idle = observation(&f, dispatch);
+    assert_eq!(idle.route, Some(route));
+    assert_eq!(idle.dispatch, Some(dispatch));
+    assert_eq!(idle.reply, Some(reply));
+    idle.execution = Some(IngressExecutionOwner::Idle);
+
+    let mut checkpoint = InlineIrqCheckpoint::begin(route, dispatch, reply, idle).unwrap();
+    assert!(!checkpoint.is_complete());
+    // The no-parent scheduler pass returns the same idle receiver and cannot
+    // consume or replace the retained Call's Reply.
+    assert_eq!(checkpoint.verify_after(idle), Ok(()));
+    assert!(checkpoint.is_complete());
+    assert_eq!(checkpoint.verify_after(idle), Err(InlineIrqCheckpointError::Consumed));
+    assert_eq!(f.lanes.running(), None);
+    assert_eq!(f.lanes.peer_route(dispatch.lane()), Ok(Some(route)));
+    assert_eq!(f.lanes.active_dispatch_identity(dispatch.lane()), Ok(Some(dispatch)));
+    assert_eq!(f.lanes.binding(dispatch.lane()).unwrap().reply_object, reply);
+    assert_eq!(f.receiver.retained_reply_owner(call_reply), retained_reply_owner);
+    assert_eq!(f.receiver.stored_message(route, call_reply), Ok(&1));
+    assert_eq!(f.receiver.stored_reply_acknowledged(route, dispatch, call_reply), Ok(false));
+}
+
+#[test]
+fn inline_irq_checkpoint_rejects_unknown_or_changed_idle_owner() {
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let reply = f.lanes.binding(dispatch.lane()).unwrap().reply_object;
+    f.lanes.suspend_running(dispatch.lane(), reply, 77).unwrap();
+    let mut idle = observation(&f, dispatch);
+    idle.execution = Some(IngressExecutionOwner::Idle);
+
+    let mut unknown = idle;
+    unknown.execution = None;
+    assert!(matches!(
+        InlineIrqCheckpoint::begin(route, dispatch, reply, unknown),
+        Err(InlineIrqCheckpointError::Preflight(
+            InlineIrqCheckpointMismatch::ExecutionOwner,
+        ))
+    ));
+    let mut foreign = idle;
+    foreign.execution = Some(IngressExecutionOwner::Startup(route));
+    assert!(matches!(
+        InlineIrqCheckpoint::begin(route, dispatch, reply, foreign),
+        Err(InlineIrqCheckpointError::Preflight(
+            InlineIrqCheckpointMismatch::ExecutionOwner,
+        ))
+    ));
+
+    let mut checkpoint = InlineIrqCheckpoint::begin(route, dispatch, reply, idle).unwrap();
+    let mut changed = idle;
+    changed.execution = Some(IngressExecutionOwner::Dispatch(dispatch));
+    assert_eq!(
+        checkpoint.verify_after(changed),
+        Err(InlineIrqCheckpointError::PostRestore(
+            InlineIrqCheckpointMismatch::ExecutionOwner,
+        ))
+    );
+    assert!(!checkpoint.is_complete());
+    assert_eq!(checkpoint.verify_after(idle), Ok(()));
+}
+
+#[test]
 fn inline_irq_checkpoint_rejects_each_preflight_identity_before_scheduler_entry() {
     let mut f = Fixture::new();
     let (route, dispatch) = f.parent(1);

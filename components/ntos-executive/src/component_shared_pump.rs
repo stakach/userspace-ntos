@@ -286,9 +286,9 @@ pub(super) fn file_receive_census() -> [u64; 9] {
     ]
 }
 
-/// Run the established bounded IRQ/DPC scheduler while the exact dispatch remains parked.
-/// The scheduler owns its nested execution hold and restores it before this receiver can wait;
-/// neither this checkpoint nor its caller sends or replays the retained Reply.
+/// Run the established bounded IRQ/DPC scheduler for an exact dispatch or an idle receiver.
+/// A dispatch is parked and restored by the scheduler; an idle receiver has no parent to park.
+/// Neither case sends or replays the retained Reply.
 unsafe fn inline_irq_observation(
     ch: &PumpChannel, route: PeerRoute,
 ) -> InlineIrqCheckpointObservation {
@@ -400,6 +400,8 @@ unsafe fn service_inline_irq_checkpoint(
             return Err(runtime::Error::PhysicalIdentity);
         }
     };
+    // The ticket preserves whether this entry had a parent. In the idle case
+    // service_irq_yield parks nothing and must return the same idle receiver.
     let scope = crate::driver_launch::ComponentSchedulerScope::enter();
     scope.service_irq_yield(ch.shared_va);
     let after = inline_irq_observation(ch, route);

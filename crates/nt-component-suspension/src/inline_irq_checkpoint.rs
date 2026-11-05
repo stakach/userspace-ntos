@@ -1,6 +1,6 @@
-//! Exact parent observation around one inline IRQ scheduler pass.
+//! Exact receiver observation around one inline IRQ scheduler pass.
 //!
-//! A failed observation leaves the parent retained. It is never authority to
+//! A failed observation leaves any parent retained. It is never authority to
 //! replay the scheduler pass, wake the caller, or retire its Reply.
 
 use crate::{peer_registry::PeerRoute, IngressExecutionOwner, LaneDispatchIdentity};
@@ -28,14 +28,15 @@ pub enum InlineIrqCheckpointError {
     Consumed,
 }
 
-/// One observation ticket for the exact retained parent; the ticket contains
+/// One observation ticket for the exact receiver; the ticket contains
 /// no capability and does not authorize any scheduling or Reply effect.
-#[must_use = "retain this ticket until the parent is exactly observed after the scheduler pass"]
+#[must_use = "retain this ticket until the receiver is exactly observed after the scheduler pass"]
 #[derive(Debug)]
 pub struct InlineIrqCheckpoint {
     route: PeerRoute,
     dispatch: LaneDispatchIdentity,
     reply: u64,
+    entry_execution: Option<IngressExecutionOwner>,
     complete: bool,
 }
 
@@ -46,7 +47,13 @@ impl InlineIrqCheckpoint {
         reply: u64,
         before: InlineIrqCheckpointObservation,
     ) -> Result<Self, InlineIrqCheckpointError> {
-        let claim = Self { route, dispatch, reply, complete: false };
+        let claim = Self {
+            route,
+            dispatch,
+            reply,
+            entry_execution: before.execution,
+            complete: false,
+        };
         claim.check_before(before).map_err(InlineIrqCheckpointError::Preflight)?;
         Ok(claim)
     }
@@ -78,7 +85,10 @@ impl InlineIrqCheckpoint {
         if observed.reply != Some(self.reply) {
             return Err(InlineIrqCheckpointMismatch::Reply);
         }
-        if !matches!(observed.execution, Some(IngressExecutionOwner::Dispatch(_))) {
+        if !matches!(
+            observed.execution,
+            Some(IngressExecutionOwner::Dispatch(_) | IngressExecutionOwner::Idle)
+        ) {
             return Err(InlineIrqCheckpointMismatch::ExecutionOwner);
         }
         Ok(())
@@ -89,7 +99,14 @@ impl InlineIrqCheckpoint {
         observed: InlineIrqCheckpointObservation,
     ) -> Result<(), InlineIrqCheckpointMismatch> {
         self.check_before(observed)?;
-        if observed.execution != Some(IngressExecutionOwner::Dispatch(self.dispatch)) {
+        let expected = match self.entry_execution {
+            Some(IngressExecutionOwner::Idle) => IngressExecutionOwner::Idle,
+            Some(IngressExecutionOwner::Dispatch(_)) => {
+                IngressExecutionOwner::Dispatch(self.dispatch)
+            }
+            _ => return Err(InlineIrqCheckpointMismatch::ExecutionOwner),
+        };
+        if observed.execution != Some(expected) {
             return Err(InlineIrqCheckpointMismatch::ExecutionOwner);
         }
         Ok(())
