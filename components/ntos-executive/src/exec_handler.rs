@@ -9474,6 +9474,35 @@ impl ExecNtHandler {
         self.thread_runtime.tcb_for_main_pi(pi)
     }
 
+    /// Copied, current main-thread identity for read-only startup diagnostics.
+    /// The runtime publication, PM main TID/lifetime, and process generation
+    /// must still agree; this is not an execution or Reply owner.
+    pub(crate) fn hosted_main_thread_sample_owner(
+        &self,
+        pi: usize,
+    ) -> Option<(
+        nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+        nt_process::ThreadLifetime,
+    )> {
+        let runtime = self.thread_runtime.executable_by_role(pi, HostedThreadRole::Main)?;
+        let binding = runtime.binding();
+        let tid = self.pm_main_tid_for_pi(pi)?;
+        let process = self.capture_process_identity(pi)?;
+        let lifetime = self.pm.thread_lifetime(tid)?;
+        if binding.pi != pi
+            || binding.role != HostedThreadRole::Main
+            || binding.tid != u64::from(tid)
+            || binding.process != process
+            || binding.badge != self.hosted_process_top_badge(pi)?
+            || binding.tcb <= 1
+            || lifetime.process_id() != process.pid
+            || self.pm.thread(tid)?.state == nt_process::ThreadState::Terminated
+        {
+            return None;
+        }
+        Some((binding, lifetime))
+    }
+
     pub(crate) fn hosted_thread_tcb_for_role(
         &self,
         pi: usize,

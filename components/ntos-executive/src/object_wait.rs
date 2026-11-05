@@ -215,6 +215,25 @@ pub(super) fn object_waiter_oldest_unselected(now_100ns: u64)
     }
 }
 
+/// Copied wait age for one role-validated process generation. This is diagnostic only;
+/// it neither claims a Reply nor changes the dispatcher's selection order.
+pub(super) fn object_waiter_oldest_unselected_for_process(
+    pi: usize,
+    process: nt_user_host::process_identity::ProcessIdentity,
+    now_100ns: u64,
+) -> Option<(u64, u64, u64)> {
+    unsafe {
+        let table = &*core::ptr::addr_of!(OBJECT_WAITERS);
+        table.iter()
+            .filter(|(identity, record)| record.pi == pi
+                && record.caller.process() == process
+                && !table.is_claimed(*identity))
+            .filter_map(|(_, record)| record.latency.parked_age_100ns(now_100ns)
+                .map(|age| (record.sequence, record.objects[0].raw(), age)))
+            .max_by_key(|(sequence, _, age)| (*age, core::cmp::Reverse(*sequence)))
+    }
+}
+
 pub(super) fn object_waiter_park(record: ObjectWaiterRecord) -> bool {
     if !record.is_valid_for_park() {
         return false;

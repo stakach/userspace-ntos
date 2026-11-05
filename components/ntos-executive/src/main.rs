@@ -20,6 +20,7 @@ extern crate alloc;
 pub use sel4_rt::*;
 mod serial_records;
 mod ingress_observation;
+mod csrss_thread_probe;
 mod desktop_completion_marker;
 pub use serial_records::{debug_put_char, print_str, print_u64};
 
@@ -7378,6 +7379,7 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
 
 /// Dump the census if the period has elapsed, using the shared static clock.
 pub(crate) fn census_tick_static(now: u64) {
+    csrss_thread_probe::maybe_sample(now);
     let last = CENSUS_LAST_DUMP.load(Ordering::Relaxed);
     if now.wrapping_sub(last) < CENSUS_PERIOD_100NS {
         return;

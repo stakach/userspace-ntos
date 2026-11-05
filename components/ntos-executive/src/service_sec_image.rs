@@ -12599,6 +12599,9 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     _ => 0,
                 };
+                if trace_process_role == Some(nt_exe_image::HostedProcessRole::Win32Subsystem) {
+                    crate::csrss_thread_probe::record_syscall(ssn);
+                }
             }
             if is_lsa_worker {
                 LSA_WORKER_SYSCALLS.fetch_add(1, Ordering::Relaxed);
@@ -14542,6 +14545,11 @@ pub(crate) unsafe fn service_sec_image(
                             6 => EXPLORER_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
                             _ => 0,
                         };
+                        if nt_handler.hosted_process_observation_role(pi)
+                            == Some(nt_exe_image::HostedProcessRole::Win32Subsystem)
+                        {
+                            crate::csrss_thread_probe::record_syscall(m0);
+                        }
                         // …and the WALL-CLOCK, which is the whole point: this arm runs a nested
                         // pump, so the main loop's badge census cannot see any of the time spent
                         // here. It also ticks the periodic dump, so a non-quiescing boot reports.

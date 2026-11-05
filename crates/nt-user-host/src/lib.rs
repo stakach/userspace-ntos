@@ -13,6 +13,10 @@ extern crate alloc;
 pub mod commit_release;
 pub mod object_wait;
 pub mod startup_wait_observation;
+pub mod startup_thread_sample;
+#[cfg(test)]
+#[path = "startup_thread_sample_tests.rs"]
+mod startup_thread_sample_tests;
 pub mod thread_alert;
 pub mod current_apc;
 pub mod dispatcher_state;
