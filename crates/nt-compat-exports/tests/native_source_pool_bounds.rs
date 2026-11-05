@@ -374,6 +374,50 @@ fn executive_free_inserts_in_address_order_and_reuse_preserves_links() {
 }
 
 #[test]
+fn small_reuse_splits_a_freed_irp_block_without_losing_its_tail() {
+    let first = FSD_POOL_VADDR + POOL_DATA_OFF + 16;
+    let used = POOL_DATA_OFF + 16 + 280;
+    reset(used, 280, 7, true);
+    MEMORY.with(|memory| {
+        memory.borrow_mut().words.insert(instance().exec_pool_va + POOL_DATA_OFF + 8, 0);
+    });
+
+    assert_eq!(unsafe { hosted_instance_pool_alloc(instance(), 56) }, Some(first));
+    assert_eq!(unsafe { hosted_pool_allocation_exec_range(instance().exec_pool_va, first) },
+        Some((instance().exec_pool_va + POOL_DATA_OFF + 16, 64)),
+        "a 56-byte private graph member must not quarantine the whole 280-byte IRP block");
+    let tail = first + 64 + 16;
+    assert_eq!(unsafe { hosted_instance_pool_allocation_is_free_unlocked(instance(), tail) }, Some(true));
+    assert_eq!(unsafe { hosted_pool_allocation_exec_range(instance().exec_pool_va, tail) },
+        Some((instance().exec_pool_va + POOL_DATA_OFF + 96, 200)));
+    assert_eq!(unsafe { hosted_instance_pool_alloc(instance(), 32) }, Some(tail));
+    assert_eq!(unsafe { hosted_pool_used(instance().exec_pool_va) }, used,
+        "recycling must not consume another bump span");
+}
+
+#[test]
+fn small_reuse_of_a_page_aligned_block_preserves_a_page_aligned_large_tail() {
+    let first = FSD_POOL_VADDR + POOL_DATA_OFF + 16;
+    let aligned = FSD_POOL_VADDR + 0x2000;
+    let used = 0x2000 + 0x20000;
+    reset(used, 0xfe0, 7, false);
+    MEMORY.with(|memory| {
+        let mut memory = memory.borrow_mut();
+        memory.words.insert(instance().exec_pool_va + 8, aligned);
+        memory.words.insert(instance().exec_pool_va + 0x1ff0, 0x20000);
+        memory.words.insert(instance().exec_pool_va + 0x1ff8, 0);
+    });
+    assert_eq!(first + 0xfe0 + 16, aligned);
+
+    assert_eq!(unsafe { hosted_instance_pool_alloc(instance(), 56) }, Some(aligned));
+    let large_tail = aligned + 0x1000;
+    assert_eq!(unsafe { hosted_instance_pool_allocation_is_free_unlocked(instance(), large_tail) }, Some(true));
+    assert_eq!(unsafe { hosted_pool_allocation_exec_range(instance().exec_pool_va, large_tail) },
+        Some((instance().exec_pool_va + 0x3000, 0x1f000)));
+    assert_eq!(unsafe { hosted_pool_used(instance().exec_pool_va) }, used);
+}
+
+#[test]
 fn first_fit_cannot_unlink_before_a_corrupt_tail_is_validated() {
     let first = FSD_POOL_VADDR + POOL_DATA_OFF + 16;
     let third = first + 0x40;

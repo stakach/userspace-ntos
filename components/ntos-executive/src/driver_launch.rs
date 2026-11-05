@@ -4560,15 +4560,46 @@ unsafe fn hosted_pool_alloc_locked(pool_view_base: u64, size: u64) -> Option<u64
             None => head_slot,
         };
         let cur_view = pool_view_base.checked_add(candidate.base)?;
+        let reuse = nt_io_manager::hosted_pool_range::plan_hosted_pool_reuse(
+            nt_io_manager::hosted_pool_range::HostedPoolAllocation {
+                base: candidate.base,
+                capacity: candidate.capacity,
+            },
+            size,
+            large,
+        )?;
         let next = if candidate.next == 0 {
             0
         } else {
             FSD_POOL_VADDR.checked_add(candidate.next)?
         };
         let component_va = FSD_POOL_VADDR.checked_add(candidate.base)?;
+        let first_free = match reuse.first_free {
+            Some(free) => Some((free,
+                pool_view_base.checked_add(free.base)?.checked_sub(16)?,
+                FSD_POOL_VADDR.checked_add(free.base)?)),
+            None => None,
+        };
+        let second_free = match reuse.second_free {
+            Some(free) => Some((free,
+                pool_view_base.checked_add(free.base)?.checked_sub(16)?,
+                FSD_POOL_VADDR.checked_add(free.base)?)),
+            None => None,
+        };
         let generation = next_component_pool_generation(pool_view_base)?;
-        write_volatile(previous_next_slot as *mut u64, next);
+        if let Some((free, header, _)) = first_free {
+            write_volatile(header as *mut u64, free.capacity);
+            write_volatile((header + 8) as *mut u64,
+                second_free.map_or(next, |(_, _, address)| address));
+        }
+        if let Some((free, header, _)) = second_free {
+            write_volatile(header as *mut u64, free.capacity);
+            write_volatile((header + 8) as *mut u64, next);
+        }
+        write_volatile((cur_view - 16) as *mut u64, reuse.allocated_capacity);
         write_volatile((cur_view - 8) as *mut u64, generation);
+        write_volatile(previous_next_slot as *mut u64,
+            first_free.map_or(next, |(_, _, address)| address));
         return Some(component_va);
     }
     let mut off = hosted_pool_used(pool_view_base);

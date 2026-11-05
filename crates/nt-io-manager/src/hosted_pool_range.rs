@@ -95,8 +95,19 @@ impl HostedPoolChainCursor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostedPoolFreeNode {
     pub base: u64,
+    pub capacity: u64,
     pub next: u64,
     pub previous: Option<u64>,
+}
+
+/// A validated free block can be divided while keeping its original end and the
+/// allocation-header chain intact. `first_free` replaces the old free-list node;
+/// `second_free`, when present, follows it before the old successor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostedPoolReusePlan {
+    pub allocated_capacity: u64,
+    pub first_free: Option<HostedPoolAllocation>,
+    pub second_free: Option<HostedPoolAllocation>,
 }
 
 /// Results from validating a sorted free list against the current allocation-header chain.
@@ -148,7 +159,9 @@ pub fn scan_hosted_pool_free_list(
         let allocation = cursor.seek_exact_base(current, &mut read_capacity)?;
         let next = read_next(current)?;
         if first_fit.is_none() && fits(allocation) {
-            first_fit = Some(HostedPoolFreeNode { base: current, next, previous });
+            first_fit = Some(HostedPoolFreeNode {
+                base: current, capacity: allocation.capacity, next, previous,
+            });
         }
         previous = Some(current);
         current = next;
@@ -171,6 +184,60 @@ pub fn scan_hosted_pool_free_list(
         target_is_free,
         tail: previous,
         nodes: steps,
+    })
+}
+
+/// Split a first-fit free block only when the remainder can hold another valid
+/// 16-byte header and at least 16 payload bytes. A page-aligned large block
+/// keeps a page-aligned tail, with the intervening bytes represented by a real
+/// free allocation. Large requests round their captured capacity to pages.
+pub fn plan_hosted_pool_reuse(
+    allocation: HostedPoolAllocation,
+    requested: u64,
+    page_align_large: bool,
+) -> Option<HostedPoolReusePlan> {
+    let base = allocation.base;
+    let capacity = allocation.capacity;
+    if requested == 0 || requested > capacity { return None; }
+    let whole = || HostedPoolReusePlan {
+        allocated_capacity: capacity, first_free: None, second_free: None,
+    };
+    let allocated_capacity = if page_align_large {
+        requested.checked_add(0xfff)? & !0xfff
+    } else {
+        requested.checked_add(15)? & !15
+    };
+    if allocated_capacity > capacity { return Some(whole()); }
+    let end = base.checked_add(capacity)?;
+    let ordinary_tail = base.checked_add(allocated_capacity)?.checked_add(16)?;
+    if ordinary_tail.checked_add(16)? > end { return Some(whole()); }
+
+    // A freed large block may be the only page-aligned space left. Keep its
+    // trailing whole pages eligible for a later large request.
+    if base & 0xfff == 0 && capacity & 0xfff == 0 && capacity >= 0x10000 {
+        let aligned_tail = ordinary_tail.checked_add(16)?.checked_add(0xfff)? & !0xfff;
+        if aligned_tail.checked_add(0x1000).is_some_and(|limit| limit <= end) {
+            let padding_capacity = aligned_tail.checked_sub(16)?.checked_sub(ordinary_tail)?;
+            if padding_capacity >= 16 {
+                return Some(HostedPoolReusePlan {
+                    allocated_capacity,
+                    first_free: Some(HostedPoolAllocation {
+                        base: ordinary_tail, capacity: padding_capacity,
+                    }),
+                    second_free: Some(HostedPoolAllocation {
+                        base: aligned_tail, capacity: end - aligned_tail,
+                    }),
+                });
+            }
+        }
+    }
+
+    Some(HostedPoolReusePlan {
+        allocated_capacity,
+        first_free: Some(HostedPoolAllocation {
+            base: ordinary_tail, capacity: end - ordinary_tail,
+        }),
+        second_free: None,
     })
 }
 
@@ -263,6 +330,33 @@ pub fn walk_hosted_pool_allocation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reuse_plan_preserves_exact_chain_and_page_aligned_large_tail() {
+        let block = HostedPoolAllocation { base: 0x2000, capacity: 0x30000 };
+        let plan = plan_hosted_pool_reuse(block, 0x10001, true).unwrap();
+        assert_eq!(plan.allocated_capacity, 0x11000);
+        let padding = plan.first_free.unwrap();
+        let tail = plan.second_free.unwrap();
+        assert_eq!(padding.base, block.base + plan.allocated_capacity + 16);
+        assert_eq!(padding.base + padding.capacity, tail.base - 16);
+        assert_eq!(tail.base & 0xfff, 0);
+        assert_eq!(tail.capacity & 0xfff, 0);
+        assert_eq!(tail.base + tail.capacity, block.base + block.capacity);
+        assert!(tail.capacity >= 0x10000);
+    }
+
+    #[test]
+    fn reuse_plan_keeps_a_nearly_fitting_block_whole() {
+        let block = HostedPoolAllocation { base: 0x1010, capacity: 80 };
+        let plan = plan_hosted_pool_reuse(block, 56, false).unwrap();
+        assert_eq!(plan.allocated_capacity, 80);
+        assert_eq!(plan.first_free, None);
+        assert_eq!(plan.second_free, None);
+        assert_eq!(plan_hosted_pool_reuse(block, 81, false), None);
+        let unaligned = HostedPoolAllocation { base: 0x1010, capacity: 57 };
+        assert_eq!(plan_hosted_pool_reuse(unaligned, 56, false).unwrap().allocated_capacity, 57);
+    }
 
     #[test]
     fn large_bump_keeps_header_chain_and_grants_only_complete_pages() {
