@@ -193,10 +193,6 @@ pub(super) unsafe extern "win64" fn dispatch(device: u64, irp: u64) -> i32 {
     {
         return complete(irp, status as i32, 0);
     }
-    let start_io = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_START_IO) as *const u64);
-    if start_io == 0 {
-        return complete(irp, STATUS_INVALID_DEVICE_REQUEST, 0);
-    }
     if ioctl::method(code) != ioctl::METHOD_BUFFERED {
         return complete(irp, STATUS_INVALID_DEVICE_REQUEST, 0);
     }
@@ -215,6 +211,21 @@ pub(super) unsafe extern "win64" fn dispatch(device: u64, irp: u64) -> i32 {
             output_len as u64,
         );
         return complete(irp, status, information);
+    }
+    if code == nt_video_miniport::IOCTL_VIDEO_ENUM_MONITOR_PDO {
+        if output_len < core::mem::size_of::<u64>() as u32 {
+            return complete(irp, STATUS_BUFFER_TOO_SMALL, 0);
+        }
+        let (status, pointer) = match hosted_video_port_pnp::enumerate_monitor_pdos(device) {
+            Ok(pointer) => (STATUS_SUCCESS, pointer),
+            Err(status) => return complete(irp, status, 0),
+        };
+        write_unaligned(buffer as *mut u64, pointer);
+        return complete(irp, status, core::mem::size_of::<u64>() as u64);
+    }
+    let start_io = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_HW_START_IO) as *const u64);
+    if start_io == 0 {
+        return complete(irp, STATUS_INVALID_DEVICE_REQUEST, 0);
     }
 
     // NT5's VRP is transient; the real IRP owns both IoStatus and SystemBuffer through completion.
