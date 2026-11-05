@@ -154,11 +154,17 @@ pub const USER32_CALLBACK_SETWNDICONS: u32 = 11;
 pub const USER32_CALLBACK_SETOBM: u32 = 15;
 /// ReactOS `USER32_CALLBACK_LPK` / `apfnDispatch[16]`.
 pub const USER32_CALLBACK_LPK: u32 = 16;
+/// LiberNT `USER32_CALLBACK_GETCHARSETINFO` / `apfnDispatch[9]`.
+pub const USER32_CALLBACK_GETCHARSETINFO: u32 = 9;
+/// LiberNT `USER32_CALLBACK_IMMLOADLAYOUT` / `apfnDispatch[19]`.
+pub const USER32_CALLBACK_IMMLOADLAYOUT: u32 = 19;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UserCallbackContract {
     WindowProc,
     Lpk,
+    /// User32 returns the original 36-byte argument even when charset lookup fails.
+    CharsetInfo,
     Fixed {
         input_length: u32,
         result_length: u32,
@@ -185,7 +191,12 @@ impl UserCallbackContract {
                 input_length: 0x5d0,
                 result_length: 0x5d0,
             }),
+            USER32_CALLBACK_GETCHARSETINFO => Some(Self::CharsetInfo),
             USER32_CALLBACK_LPK => Some(Self::Lpk),
+            USER32_CALLBACK_IMMLOADLAYOUT => Some(Self::Fixed {
+                input_length: 8,
+                result_length: 360,
+            }),
             _ => None,
         }
     }
@@ -208,6 +219,11 @@ impl UserCallbackContract {
                     && output_capacity >= 4
                     && payload_reference_offset == NO_PAYLOAD_REFERENCE
             }
+            Self::CharsetInfo => {
+                input_length == 36
+                    && output_capacity >= 36
+                    && payload_reference_offset == NO_PAYLOAD_REFERENCE
+            }
             Self::Fixed {
                 input_length: expected_input,
                 result_length,
@@ -225,12 +241,13 @@ impl UserCallbackContract {
         result_length: u32,
         callback_status: i32,
     ) -> bool {
-        if callback_status < 0 {
+        if callback_status < 0 && !matches!(self, Self::CharsetInfo) {
             return result_length == 0;
         }
         match self {
             Self::WindowProc => result_length == input_length,
             Self::Lpk => result_length == 4,
+            Self::CharsetInfo => result_length == 36,
             Self::Fixed {
                 result_length: expected,
                 ..
@@ -248,6 +265,8 @@ impl UserCallbackContract {
             Self::WindowProc => None,
             Self::Lpk if input_length >= 0x3c => Some(4),
             Self::Lpk => None,
+            Self::CharsetInfo if input_length == 36 => Some(36),
+            Self::CharsetInfo => None,
             Self::Fixed {
                 input_length: expected_input,
                 result_length,
