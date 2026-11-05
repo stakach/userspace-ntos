@@ -18267,8 +18267,27 @@ unsafe fn drop_current_hosted_reply() -> bool {
         return false;
     }
     if spawn_hosts::shared_ingress::owner::runtime::owns_hosted_reply(active) {
-        return spawn_hosts::shared_ingress::owner::runtime::stop_and_cancel_hosted(active).is_ok()
-            && spawn_hosts::shared_ingress::owner::runtime::release_hosted_reply(active).is_ok();
+        if let Err(error) =
+            spawn_hosts::shared_ingress::owner::runtime::stop_and_cancel_hosted(active)
+        {
+            print_str(b"[hosted-reply] retained stop/cancel refused cap=0x");
+            print_hex_u64(active);
+            print_str(b" reason=");
+            print_str(match error {
+                spawn_hosts::shared_ingress::owner::runtime::Error::PhysicalIdentity => b"identity\n",
+                spawn_hosts::shared_ingress::owner::runtime::Error::Reply => b"reply-binding\n",
+                spawn_hosts::shared_ingress::owner::runtime::Error::Retirement => b"retirement\n",
+                _ => b"other\n",
+            });
+            return false;
+        }
+        if spawn_hosts::shared_ingress::owner::runtime::release_hosted_reply(active).is_err() {
+            print_str(b"[hosted-reply] retained semantic release refused cap=0x");
+            print_hex_u64(active);
+            print_str(b"\n");
+            return false;
+        }
+        return true;
     }
     let active_index = wait_reply_pool_find_cap(active);
     let fresh = wait_reply_pool_find_free();

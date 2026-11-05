@@ -10018,6 +10018,11 @@ pub(crate) unsafe fn service_sec_image(
                         receive_boundary = Some(boundary);
                         continue 'service_loop;
                     }
+                    crate::executive_ingress::ReceiveOutcome::RetainedFailure => {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        break 'service_loop;
+                    }
                 }
             }};
         }
@@ -10091,8 +10096,16 @@ pub(crate) unsafe fn service_sec_image(
                 component_resume::prepare_receive(&mut nt_handler);
             }
             let received = crate::executive_ingress::receive(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
-            let crate::executive_ingress::ReceiveOutcome::Message(received) = received else {
-                panic!("completed Receive cannot issue another settlement boundary");
+            let received = match received {
+                crate::executive_ingress::ReceiveOutcome::Message(received) => received,
+                crate::executive_ingress::ReceiveOutcome::RetainedFailure => {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    break 'service_loop;
+                }
+                crate::executive_ingress::ReceiveOutcome::OuterBoundary(_) => {
+                    panic!("completed Receive cannot issue another settlement boundary")
+                }
             };
             (badge, mi, m0, m1, m2, m3) = received;
         }
@@ -10581,6 +10594,11 @@ pub(crate) unsafe fn service_sec_image(
                 crate::executive_ingress::ReceiveOutcome::OuterBoundary(boundary) => {
                     receive_boundary = Some(boundary);
                     continue 'service_loop;
+                }
+                crate::executive_ingress::ReceiveOutcome::RetainedFailure => {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    break 'service_loop;
                 }
                 crate::executive_ingress::ReceiveOutcome::Message(_) => panic!("Receive ACK requires exact settlement boundary"),
             }
@@ -14065,6 +14083,8 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(tid);
                         print_str(b" reply-dropped=");
                         print_u64(reply_dropped as u64);
+                        print_str(b" apc-owned=");
+                        print_u64(apc_owned_terminating_reply as u64);
                         print_str(b" mechanism-deleted=");
                         print_u64(mechanism_deleted as u64);
                         print_str(b" -> recv without reply\n");
@@ -14150,6 +14170,8 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(drop_reply as u64);
                         print_str(b" reply-dropped=");
                         print_u64(reply_dropped as u64);
+                        print_str(b" apc-owned=");
+                        print_u64(apc_owned_terminating_reply as u64);
                         print_str(b" reclaimed=");
                         print_u64(reclaimed as u64);
                         print_str(b" current-deleted=");

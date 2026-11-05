@@ -10,6 +10,8 @@ const ROOT_THREAD_CAP: u64 = 1;
 pub(crate) enum ReceiveOutcome {
     Message((u64, u64, u64, u64, u64, u64)),
     OuterBoundary(runtime::ReceiveSettlementBoundary),
+    /// The current Reply remains owned after a refused or uncertain release.
+    RetainedFailure,
 }
 
 impl ReceiveOutcome {
@@ -19,6 +21,9 @@ impl ReceiveOutcome {
             Self::Message(message) => message,
             Self::OuterBoundary(_) => {
                 panic!("receive continuation requires the outer service boundary")
+            }
+            Self::RetainedFailure => {
+                panic!("retained ingress requires the outer service boundary")
             }
         }
     }
@@ -49,15 +54,20 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
     }
     if reply_cptr != 0 {
         if runtime::owns_hosted_reply(reply_cptr) {
-            runtime::release_hosted_reply(reply_cptr).expect(
-                "root receive retains a hosted Call until acknowledged semantic completion",
-            );
+            if runtime::release_hosted_reply(reply_cptr).is_err() {
+                // A terminating caller may still own its physical Call even after the
+                // semantic dispatch has ended. Keep that Reply unavailable and offer a
+                // fresh slot to the next receive; never replay or replace its old Call.
+                if !crate::root_reply_park::quarantine_current_hosted_reply() {
+                    return ReceiveOutcome::RetainedFailure;
+                }
+            }
         } else {
-            assert_eq!(
-                crate::spawn_hosts::query_component_reply_binding(ROOT_THREAD_CAP, reply_cptr),
-                Ok(ReplyBindingObservation::Free),
-                "root receive cannot replace a held hosted Reply"
-            );
+            if crate::spawn_hosts::query_component_reply_binding(ROOT_THREAD_CAP, reply_cptr)
+                != Ok(ReplyBindingObservation::Free)
+            {
+                return ReceiveOutcome::RetainedFailure;
+            }
         }
     }
     loop {
