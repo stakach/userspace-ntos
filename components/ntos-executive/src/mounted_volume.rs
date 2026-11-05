@@ -19,6 +19,30 @@ static mut MOUNT_CREATE_QUEUE: Option<MountedCreateQueue> = None;
 static mut MOUNT_OVERLAY_QUEUE: Option<MountedOverlayQueue> = None;
 static mut MOUNT_READ_QUEUE: Option<MountedReadQueue> = None;
 static mut MOUNT_DIRECTORY_QUEUE: Option<MountedDirectoryQueue> = None;
+
+/// Only unentered sector work warrants an autonomous wake. A physical IRP already owns its
+/// completion and must not be polled by the mounted-work timer.
+pub(crate) fn mounted_sector_claimable() -> Option<bool> {
+    unsafe {
+        let create = match (&*core::ptr::addr_of!(MOUNT_CREATE_QUEUE)).as_ref() {
+            Some(queue) => queue.try_borrow().ok()?.has_claimable_sector(),
+            None => false,
+        };
+        let overlay = match (&*core::ptr::addr_of!(MOUNT_OVERLAY_QUEUE)).as_ref() {
+            Some(queue) => queue.try_borrow().ok()?.has_claimable_sector(),
+            None => false,
+        };
+        let read = match (&*core::ptr::addr_of!(MOUNT_READ_QUEUE)).as_ref() {
+            Some(queue) => queue.try_borrow().ok()?.has_claimable_sector(),
+            None => false,
+        };
+        let directory = match (&*core::ptr::addr_of!(MOUNT_DIRECTORY_QUEUE)).as_ref() {
+            Some(queue) => queue.try_borrow().ok()?.has_claimable_sector(),
+            None => false,
+        };
+        Some(create || overlay || read || directory)
+    }
+}
 /// The published File device with both its physical FAT and logical File mount owners.
 static mut EXEC_VOLUME_DEVICE: Option<ExecVolumeDevice> = None;
 

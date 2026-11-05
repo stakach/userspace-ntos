@@ -37,6 +37,11 @@ impl<P> DirectoryLookupQueue<P> {
 
     pub fn has_outstanding(&self) -> bool { !self.entries.is_empty() }
 
+    pub fn has_claimable_sector(&self) -> bool {
+        self.entries.first().is_some_and(|entry| entry.claimed.is_none()
+            && entry.result.is_none() && entry.lookup.request().is_some())
+    }
+
     pub fn capture(&mut self, irp: u64, mount: u64, payload: P,
         lookup: FatDirectoryLookup) -> Result<(), DirectoryLookupError>
     {
@@ -150,16 +155,21 @@ mod tests {
             total_sectors: 1000, sectors_per_cluster: 1 };
         let mut queue = DirectoryLookupQueue::new();
         assert!(!queue.has_outstanding());
+        assert!(!queue.has_claimable_sector());
         queue.capture(0x294, 7, (), FatDirectoryLookup::new(geometry, 2).unwrap()).unwrap();
         // SMSS may park before the native block lane claims its first sector.
         assert!(queue.has_outstanding());
+        assert!(queue.has_claimable_sector());
         let claim = queue.claim_next().unwrap();
+        assert!(!queue.has_claimable_sector());
         assert!(queue.has_outstanding(), "physical entry does not retire the logical IRP");
         queue.release_unentered(claim).unwrap();
         assert!(queue.has_outstanding(), "an unentered claim still needs redrive");
+        assert!(queue.has_claimable_sector());
         let claim = queue.claim_next().unwrap();
         assert_eq!(queue.complete(claim, Ok(&[0; 512])), Ok(FatDirectoryProgress::Complete));
         assert!(queue.has_outstanding(), "resolved output remains owned until handoff");
+        assert!(!queue.has_claimable_sector());
         let resolved = queue.take_resolved().unwrap();
         assert!(!queue.has_outstanding());
         queue.restore_resolved(resolved).unwrap();

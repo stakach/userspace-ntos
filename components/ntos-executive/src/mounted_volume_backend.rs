@@ -315,6 +315,7 @@ impl MountedVolumeBackend {
                     irp.irp_id.raw(), physical_mount.value(), owner, lookup)
                     .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
             }
+            crate::service_sec_image::request_mounted_native_timer_rearm();
             return Ok(DispatchOutcome::Pending);
         }
         let installed = unsafe { fat_open_path_metadata_from(&self.fs, self.fs.root_cl, relative) };
@@ -522,6 +523,7 @@ impl MountedVolumeBackend {
                         .expect("pending CREATE retains its owner across route change");
                     self.pending_creates.borrow_mut().activate_deferred_boot(irp, mount, lookup)
                         .expect("restored deferred CREATE can activate only its exact lookup");
+                    crate::service_sec_image::request_mounted_native_timer_rearm();
                 }
                 return 1;
             }
@@ -631,6 +633,8 @@ impl MountedVolumeBackend {
                 if let Err((error, captured)) = result {
                     self.opens.cancel(context, file).expect("unpublished context");
                     self.complete_failed_create(captured.owner, overlay_prepare_status(error));
+                } else {
+                    crate::service_sec_image::request_mounted_native_timer_rearm();
                 }
                 return 1;
         }
@@ -1277,6 +1281,7 @@ impl MountedVolumeBackend {
             self.read_completions.borrow_mut().capture_range(irp.irp_id.raw(),
                 physical_mount.value(), file_id.raw(), geometry, first_cluster, offset,
                 expected, position).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+            crate::service_sec_image::request_mounted_native_timer_rearm();
             return Ok(DispatchOutcome::Pending);
         }
         let written = unsafe {

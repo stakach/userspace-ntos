@@ -60,6 +60,11 @@ impl<P> CreateLookupQueue<P> {
     /// CREATE. All retain a File IRP that can still wake its caller.
     pub fn has_outstanding(&self) -> bool { !self.entries.is_empty() }
 
+    pub fn has_claimable_sector(&self) -> bool {
+        self.entries.iter().find(|entry| entry.claimed.is_none() && entry.result.is_none())
+            .is_some_and(|entry| entry.lookup.as_ref().is_some_and(|lookup| lookup.request().is_some()))
+    }
+
     /// Read-only census of the oldest retained CREATE. A resolved or deferred entry has no
     /// claimable sector, even though it still owns a File IRP and can wake its caller.
     pub fn first_state(&self) -> Option<(u64, u64, &'static [u8])> {
@@ -308,6 +313,7 @@ mod tests {
     fn deferred_boot_create_never_claims_a_sector_before_route_activation() {
         let mut queue = CreateLookupQueue::new();
         queue.capture_deferred_boot(21, 7, b"msgina.dll".to_vec()).unwrap();
+        assert!(!queue.has_claimable_sector());
         assert!(queue.claim_next().is_none());
         let resolved = queue.take_resolved().unwrap();
         assert_eq!(resolved.result, Ok(CreateLookupFound::DeferredBoot));
@@ -316,7 +322,9 @@ mod tests {
         assert!(queue.claim_next().is_none());
         assert_eq!(queue.activate_deferred_boot(21, 8, lookup()), Err(CreateLookupError::WrongClaim));
         queue.activate_deferred_boot(21, 7, lookup()).unwrap();
+        assert!(queue.has_claimable_sector());
         let claim = queue.claim_next().unwrap();
+        assert!(!queue.has_claimable_sector());
         assert_eq!((claim.irp, claim.mount), (21, 7));
         assert!(queue.claim_next().is_none());
     }

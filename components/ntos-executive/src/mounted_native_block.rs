@@ -682,6 +682,18 @@ fn next_sector_claim() -> Option<WorkClaim> {
         .map(WorkClaim::Sector)
 }
 
+/// A queued mounted sector must wake the root Receive even when no unrelated IRQ arrives.
+/// The entered physical command owns its completion; only a vacant slot can be redriven.
+pub(super) fn next_deadline(now_100ns: u64) -> Option<u64> {
+    if unsafe { (&*core::ptr::addr_of!(PENDING)).is_some() }
+        || native_disk_relation::native_storage_route().is_none()
+        || crate::mounted_volume::mounted_sector_claimable() != Some(true)
+    {
+        return None;
+    }
+    Some(now_100ns.saturating_add(100_000))
+}
+
 unsafe fn next_claim() -> Option<WorkClaim> {
     let snapshot = || crate::writable_fs::native_snapshot_io::claim_next_native_snapshot_io()
         .map(WorkClaim::Snapshot);

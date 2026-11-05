@@ -3182,6 +3182,7 @@ fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
     let status = finalize_service_loop_work(nt_handler);
     // Include readiness created by any late post-action, on success and failure paths alike.
     unsafe { component_resume::reconcile(nt_handler) };
+    unsafe { rearm_requested_mounted_native_timer(nt_handler) };
     status
 }
 
@@ -4463,6 +4464,28 @@ pub(crate) unsafe fn rearm_registered_active_delay_timer_with_handler(handler: &
     let queue = SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) as *const nt_delay_execution::Queue;
     if !queue.is_null() {
         delay_timer_rearm(&*queue, handler);
+    }
+}
+
+/// Backend dispatch only publishes a request. The live handler is read at an outer boundary,
+/// after backend and mounted queue borrows have been released.
+static MOUNTED_NATIVE_TIMER_REARM_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn request_mounted_native_timer_rearm() {
+    MOUNTED_NATIVE_TIMER_REARM_REQUESTED.store(true, Ordering::Release);
+}
+
+unsafe fn rearm_requested_mounted_native_timer(handler: &ExecNtHandler) {
+    if !MOUNTED_NATIVE_TIMER_REARM_REQUESTED.load(Ordering::Acquire)
+        || DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0
+        || DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire) != DELAY_TIMER_IRQ_ACTIVE
+        || SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) == 0
+        || crate::mounted_volume::mounted_sector_claimable().is_none()
+    {
+        return;
+    }
+    if MOUNTED_NATIVE_TIMER_REARM_REQUESTED.swap(false, Ordering::AcqRel) {
+        rearm_registered_active_delay_timer_with_handler(handler);
     }
 }
 
@@ -26897,6 +26920,7 @@ unsafe fn pump_hosted_io_and_redrive_driver_starts(
     if progress != 0 {
         FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
     }
+    rearm_requested_mounted_native_timer(nt_handler);
     progress
 }
 

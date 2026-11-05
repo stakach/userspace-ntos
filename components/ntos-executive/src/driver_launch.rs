@@ -43404,6 +43404,10 @@ pub(crate) fn service_mounted_native_blocks() -> usize {
     unsafe { mounted_native_block::service() }
 }
 
+pub(crate) fn mounted_native_block_next_deadline(now_100ns: u64) -> Option<u64> {
+    mounted_native_block::next_deadline(now_100ns)
+}
+
 pub(crate) fn service_mounted_native_registry_recheck(id: u64) -> usize {
     unsafe { mounted_native_block::service_registry_recheck(id) }
 }

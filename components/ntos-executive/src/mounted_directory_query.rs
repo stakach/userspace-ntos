@@ -71,6 +71,7 @@ impl MountedVolumeBackend {
                         restart_scan: irp.flags.contains(nt_io_manager::StackFlags::RESTART_SCAN),
                         output,
                     }, lookup).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+                crate::service_sec_image::request_mounted_native_timer_rearm();
                 return Ok(DispatchOutcome::Pending);
             }
         }
