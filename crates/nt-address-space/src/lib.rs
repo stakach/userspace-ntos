@@ -26,6 +26,7 @@ pub mod protection;
 pub mod query;
 pub mod image_view_placement;
 pub mod scratch;
+pub mod vm_lock_continuation;
 
 use alloc::collections::BTreeMap;
 use alloc::vec;
