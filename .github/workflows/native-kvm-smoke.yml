@@ -122,6 +122,7 @@ jobs:
           set -o pipefail
           ./run.sh --build-only 2>&1 | tee native-kvm-build.log
           sha256sum rust-micro/.tmp/disk.img > native-kvm-image.sha256
+          sha256sum rust-micro/.tmp/rootserver.elf > native-kvm-rootserver.sha256
           cp rust-micro/vendor/libernt/manifest.txt native-kvm-libernt-manifest.txt
       - name: Save verified LiberNT archive cache
         if: steps.libernt-archive-cache.outputs.cache-hit != 'true'
@@ -194,7 +195,9 @@ jobs:
             native-kvm-image.sha256
             native-kvm-image-after-boot1.sha256
             native-kvm-image-after-boot2.sha256
+            native-kvm-rootserver.sha256
             native-kvm-qemu-stopped
             native-kvm-libernt-manifest.txt
             rust-micro/target/mykernel-x86/release/mykernel-rust
+            rust-micro/.tmp/rootserver.elf
           if-no-files-found: warn
