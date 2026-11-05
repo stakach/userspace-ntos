@@ -20,6 +20,49 @@ const CACHE_CLAIMS_PER_TURN: usize = 32;
 // counted only after the exact IRP terminal (and, for pending IRPs, acknowledgement).
 static NATIVE_FAT_CENSUS: nt_ahci::CommandCensus = nt_ahci::CommandCensus::new();
 static NATIVE_SNAPSHOT_CENSUS: nt_ahci::CommandCensus = nt_ahci::CommandCensus::new();
+// Count only installed-file READ claims accepted by the physical route. Metadata and snapshot
+// commands are excluded, so this shows whether the mounted READ sector ceiling binds in vivo.
+struct InstalledReadShapeCensus {
+    zero: AtomicU64,
+    one: AtomicU64,
+    two: AtomicU64,
+    three: AtomicU64,
+    four: AtomicU64,
+    more: AtomicU64,
+}
+
+impl InstalledReadShapeCensus {
+    const fn new() -> Self {
+        Self { zero: AtomicU64::new(0), one: AtomicU64::new(0), two: AtomicU64::new(0),
+            three: AtomicU64::new(0), four: AtomicU64::new(0),
+            more: AtomicU64::new(0) }
+    }
+
+    fn record(&self, sectors: u32) {
+        let bucket = match sectors {
+            0 => &self.zero,
+            1 => &self.one,
+            2 => &self.two,
+            3 => &self.three,
+            4 => &self.four,
+            _ => &self.more,
+        };
+        bucket.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn print(&self) {
+        print_str(b"[census] native-installed-read entered-sectors-0/1/2/3/4/gt4=");
+        for (index, bucket) in [&self.zero, &self.one, &self.two, &self.three, &self.four, &self.more]
+            .iter().enumerate()
+        {
+            if index != 0 { print_str(b"/"); }
+            print_u64(bucket.load(Ordering::Relaxed));
+        }
+        print_str(b"\n");
+    }
+}
+
+static NATIVE_INSTALLED_READ_SHAPE: InstalledReadShapeCensus = InstalledReadShapeCensus::new();
 // The census can run inside a nested completion pump, so it observes only atomics and never
 // borrows the mutable retained Pending owner.
 static NATIVE_PENDING_IRP: AtomicU64 = AtomicU64::new(0);
@@ -191,6 +234,7 @@ pub(super) fn print_census() {
         }
         print_str(b"\n");
     }
+    NATIVE_INSTALLED_READ_SHAPE.print();
     NATIVE_PREP_PHASE.print(b"claim-to-dispatch");
     NATIVE_DISPATCH_TERMINAL_PHASE.print(b"dispatch-to-terminal");
     NATIVE_DISPATCH_CALL_PHASE.print(b"dispatch-call");
@@ -319,6 +363,12 @@ impl SectorClaim {
 enum WorkClaim {
     Sector(SectorClaim),
     Snapshot(crate::writable_fs::native_snapshot_io::SnapshotClaim),
+}
+
+fn record_entered_installed_read(claim: &WorkClaim) {
+    if let WorkClaim::Sector(SectorClaim::Read(read)) = claim {
+        NATIVE_INSTALLED_READ_SHAPE.record(read.sectors);
+    }
 }
 
 impl WorkClaim {
@@ -1000,6 +1050,7 @@ unsafe fn dispatch_claim(
             record_inter_command_gap(claim_started_ticks);
             let terminal_ticks = crate::disk_census_ticks();
             NATIVE_DISPATCH_TERMINAL_PHASE.record(started_ticks, terminal_ticks);
+            record_entered_installed_read(&claim);
             claim.mark_entered();
             crate::fs_loader::mark_entered_exec_native_block(ticket)
                 .expect("returned native block ticket lost");
@@ -1015,6 +1066,7 @@ unsafe fn dispatch_claim(
             NATIVE_DISPATCH_CALL_PHASE.record(started_ticks, dispatch_returned_ticks);
             NATIVE_PREP_PHASE.record(claim_started_ticks, started_ticks);
             record_inter_command_gap(claim_started_ticks);
+            record_entered_installed_read(&claim);
             claim.mark_entered();
             crate::fs_loader::mark_entered_exec_native_block(ticket)
                 .expect("pending native block ticket lost");

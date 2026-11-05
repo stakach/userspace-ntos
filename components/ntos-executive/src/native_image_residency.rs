@@ -46,6 +46,7 @@ struct ResidentPage {
 }
 static mut REVALIDATION: Option<ResidentMappingRevalidation<ResidentPage>> = None;
 static BORROWED: AtomicBool = AtomicBool::new(false);
+static SOURCE_UNCERTAIN_TRACE: AtomicU64 = AtomicU64::new(0);
 struct Borrow;
 impl Borrow {
     fn acquire() -> Result<Self, u32> {
@@ -82,6 +83,31 @@ struct SourceIo<'a> {
     revoke_acked: &'a mut bool,
     acknowledged_page: Option<&'a [u8; 4096]>,
 }
+fn trace_source_uncertain(
+    handler: &ExecNtHandler,
+    view: NativeImageViewDescriptor,
+    key: SourceKey,
+    offset: Option<u64>,
+    status: u32,
+) {
+    let sequence = SOURCE_UNCERTAIN_TRACE.fetch_add(1, Ordering::Relaxed);
+    if sequence >= 16 && !sequence.is_power_of_two() {
+        return;
+    }
+    let mut record = nt_printf::record::RecordBuffer::<384>::new();
+    let _ = writeln!(
+        record,
+        "[native-image-source] uncertain area={:?} rva=0x{:x} view_pi={} base=0x{:x} section_offset=0x{:x} read_offset={:?} caller_pi={} tid={} badge={} ssn=0x{:x} status=0x{:x}",
+        key.area, key.rva, view.pi, view.base, view.section_offset, offset,
+        handler.pi, handler.current_tid, handler.current_badge,
+        handler.current_service_number, status,
+    );
+    sel4_rt::print_record(if record.overflowed() {
+        b"[native-image-source] uncertain trace truncated\n"
+    } else {
+        record.bytes()
+    });
+}
 impl ImageSourcePageIo<SourceKey> for SourceIo<'_> {
     fn acquire(&mut self, _: SourceKey) -> Result<InstallationCap, u32> {
         unsafe {
@@ -102,6 +128,7 @@ impl ImageSourcePageIo<SourceKey> for SourceIo<'_> {
             }
         } else { None };
         let mut wrote = false;
+        let mut read_offset = None;
         let result = unsafe {
             temporary_frame_alias::with_scratch_range(
                 frame.cap,
@@ -118,6 +145,7 @@ impl ImageSourcePageIo<SourceKey> for SourceIo<'_> {
                         Ok(())
                     } else {
                         plan.as_ref().unwrap().read_into_page(page, |offset, output| {
+                            read_offset = Some(offset);
                             source.read_exact(self.handler, key.area, offset, output)?;
                             Ok::<usize, u32>(output.len())
                         })
@@ -132,8 +160,12 @@ impl ImageSourcePageIo<SourceKey> for SourceIo<'_> {
         };
         match result {
             Ok(Ok(())) => InstallationEffect::Acknowledged,
-            Ok(Err(status)) => InstallationEffect::Uncertain(status),
+            Ok(Err(status)) => {
+                trace_source_uncertain(self.handler, self.view, key, read_offset, status);
+                InstallationEffect::Uncertain(status)
+            }
             Err(status) if wrote || !temporary_frame_alias::backing_release_available() => {
+                trace_source_uncertain(self.handler, self.view, key, read_offset, status);
                 InstallationEffect::Uncertain(status)
             }
             Err(status) => InstallationEffect::Refused(status),
