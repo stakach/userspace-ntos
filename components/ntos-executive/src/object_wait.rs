@@ -1,7 +1,7 @@
 //! Native dispatcher-wait records; storage identities are owned by nt-user-host.
 
 use super::{ExecNtHandler, WaitObject, HOSTED_THREAD_WAIT_INITIAL_RESERVE};
-use nt_user_host::object_wait::{ObjectWaiterIdentity, ObjectWaiterTable};
+use nt_user_host::object_wait::{ObjectWaitLatencyStamp, ObjectWaiterIdentity, ObjectWaiterTable};
 
 /// The waiter queue: each record parks one blocked caller.
 ///
@@ -19,6 +19,7 @@ pub(super) struct ObjectWaiterRecord {
     pub(super) reply_sent: bool,
     pub(super) reference_followup: Option<(usize, Option<nt_io_completion::FileReferenceRelease>)>,
     pub(super) sequence: u64,
+    pub(super) latency: ObjectWaitLatencyStamp,
     pub(super) objects: [WaitObject; WAITER_MAX_EVENTS],
     pub(super) event_leases: [nt_kernel_exec::EventLeaseId; WAITER_MAX_EVENTS],
     pub(super) result_indices: [u8; WAITER_MAX_EVENTS],
@@ -43,6 +44,7 @@ impl ObjectWaiterRecord {
             reply_sent: false,
             reference_followup: None,
             sequence: 0,
+            latency: ObjectWaitLatencyStamp::new(0),
             objects: [WaitObject::FREE; WAITER_MAX_EVENTS],
             event_leases: [nt_kernel_exec::EventLeaseId::NULL; WAITER_MAX_EVENTS],
             result_indices: [0; WAITER_MAX_EVENTS],
@@ -83,9 +85,11 @@ impl ObjectWaiterRecord {
         resume_flags: u64,
         native_call_transport: bool,
         deadline: nt_delay_execution::Deadline,
+        parked_at_100ns: u64,
     ) -> Self {
         let mut record = Self::empty(caller);
         record.sequence = sequence;
+        record.latency = ObjectWaitLatencyStamp::new(parked_at_100ns);
         for (index, object) in objects.iter().copied().enumerate() {
             record.objects[index] = object;
             record.event_leases[index] = event_leases[index];
@@ -193,6 +197,21 @@ pub(super) fn object_waiter_next_deadline(now: nt_delay_execution::TimeSnapshot)
             .filter(|(identity, _)| !(&*core::ptr::addr_of!(OBJECT_WAITERS)).is_claimed(*identity))
             .filter_map(|(_, record)| record.deadline.monotonic_target(now))
             .min()
+    }
+}
+
+/// A snapshot of the oldest unselected exact owner. Claimed Reply rows have
+/// already left the scheduling phase and are measured at final retirement.
+pub(super) fn object_waiter_oldest_unselected(now_100ns: u64)
+    -> Option<(ObjectWaiterRecord, u64)> {
+    unsafe {
+        let table = &*core::ptr::addr_of!(OBJECT_WAITERS);
+        table.iter()
+            .filter(|(identity, _)| !table.is_claimed(*identity))
+            .filter_map(|(_, record)| record.latency.parked_age_100ns(now_100ns)
+                .map(|age| (record, age)))
+            .max_by_key(|(record, age)| (*age, core::cmp::Reverse(record.sequence)))
+            .map(|(record, age)| (*record, age))
     }
 }
 

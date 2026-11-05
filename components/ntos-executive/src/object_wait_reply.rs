@@ -12,6 +12,7 @@ static RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 static TERMINATION_PENDING: AtomicBool = AtomicBool::new(false);
 static TERMINATION_ACTIVE: AtomicBool = AtomicBool::new(false);
 static FAILURES: AtomicU64 = AtomicU64::new(0);
+static LONG_WAIT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn owns_thread(tid: u64) -> bool {
     unsafe {
@@ -40,10 +41,16 @@ pub(crate) fn has_process(pi: usize, preserve_tid: Option<u64>) -> bool {
 /// Selection and claim run without callouts after dispatcher state has been consumed.
 pub(crate) unsafe fn select(identity: Identity, status: u64) {
     let table = &mut *core::ptr::addr_of_mut!(OBJECT_WAITERS);
+    let selected_at = monotonic_time_100ns();
     let count = table
         .get_exact(identity)
         .expect("wait selection lost its owner")
         .count;
+    // Sampling the exact unclaimed row precedes the existing terminal claim.
+    // A reply retry cannot change this first selection time.
+    let _ = table.update_exact(identity, |record| {
+        let _ = record.latency.mark_selected(selected_at);
+    });
     table
         .claim_reply(identity, count as usize, status)
         .expect("wait selection lost its exclusive terminal result");
@@ -162,11 +169,25 @@ unsafe fn finish(handler: &mut ExecNtHandler, id: Identity) -> u64 {
     let record = table
         .finish_reply(id)
         .expect("wait retirement lost its settled row");
+    let finished_at = monotonic_time_100ns();
     if !sent {
         return 0;
     }
     if handler.validate_provider_logical_caller(record.caller) {
         thread_wait_state_clear_badge_ready(handler, record.caller.badge());
+    }
+    if let Some((parked, reply)) = record.latency.ages_at_reply(finished_at) {
+        if parked.saturating_add(reply) >= WAIT_LATENCY_REPORT_THRESHOLD_100NS
+            && LONG_WAIT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 256 {
+            print_str(b"[wait-latency] pi/tid/seq/badge/first-object/status/park-ms/reply-ms=");
+            for (index, value) in [record.pi as u64, record.tid, record.sequence,
+                record.badge, record.objects[0].raw(), status,
+                parked / 10_000, reply / 10_000].into_iter().enumerate() {
+                if index != 0 { print_str(b"/"); }
+                print_u64(value);
+            }
+            print_str(b"\n");
+        }
     }
     let trace = WAIT_WAKE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
     if trace < 96 {

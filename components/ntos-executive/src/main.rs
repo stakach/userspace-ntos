@@ -2478,6 +2478,7 @@ static mut PARK_WAIT_INDEX_WORK: [u8; WAITER_MAX_EVENTS] = [0; WAITER_MAX_EVENTS
 static WAIT_PARKED_COUNT: AtomicU64 = AtomicU64::new(0);
 static WAIT_WOKEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static WAIT_WAKE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const WAIT_LATENCY_REPORT_THRESHOLD_100NS: u64 = 50_000_000;
 static WAIT_PARK_INVALID_SET: AtomicU64 = AtomicU64::new(0);
 static WAIT_PARK_NO_WAITER_SLOT: AtomicU64 = AtomicU64::new(0);
 static WAIT_PARK_NO_REPLY_CAP: AtomicU64 = AtomicU64::new(0);
@@ -7139,6 +7140,17 @@ fn print_timer_deadline_census() {
             print_u64(value);
         }
         print_str(b"\n");
+    }
+    if let Some((wait, age)) = object_waiter_oldest_unselected(monotonic_time_100ns()) {
+        if age >= WAIT_LATENCY_REPORT_THRESHOLD_100NS {
+            print_str(b"[census] oldest-object-wait pi/tid/seq/badge/first-object/age-ms=");
+            for (index, value) in [wait.pi as u64, wait.tid, wait.sequence, wait.badge,
+                wait.objects[0].raw(), age / 10_000].into_iter().enumerate() {
+                if index != 0 { print_str(b"/"); }
+                print_u64(value);
+            }
+            print_str(b"\n");
+        }
     }
     for (name, snapshot) in [
         (b"section-metadata".as_slice(), section_metadata_work::census_snapshot()),
@@ -18954,6 +18966,7 @@ unsafe fn wait_park_multi(
         handler.current_flags,
         handler.current_native_call_transport,
         deadline,
+        monotonic_time_100ns(),
     )) {
         for index in (0..objects.len()).rev() {
             handler
