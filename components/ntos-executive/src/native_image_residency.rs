@@ -426,8 +426,9 @@ pub(crate) unsafe fn service_native_image_page_residency(
     observation: ImageFaultObservation,
 ) -> Result<(), u32> {
     let mut stage = "borrow";
-    let result = service_page_residency(handler, view, page, access, observation, false, &mut stage)
-        .map(|_| ());
+    let admission = service_page_residency(handler, view, page, access, observation,
+        ImageCopyMode::Direct, &mut stage);
+    let result = admission.map(|_| ());
     if let Err(status) = result {
         if observation != ImageFaultObservation::CopyAccess {
             trace_image_fault_failure(handler, view, page, access, observation, stage, status);
@@ -447,7 +448,7 @@ pub(crate) unsafe fn admit_native_image_copy_page(
 ) -> Result<bool, u32> {
     let mut stage = "borrow";
     service_page_residency(
-        handler, view, page, access, ImageFaultObservation::CopyAccess, true, &mut stage,
+        handler, view, page, access, ImageFaultObservation::CopyAccess, ImageCopyMode::DeferRouted, &mut stage,
     )
     .map(|outcome| outcome == ImageCopyAdmission::NeedsRoutedPageIn)
 }
@@ -456,6 +457,12 @@ pub(crate) unsafe fn admit_native_image_copy_page(
 enum ImageCopyAdmission {
     Resident,
     NeedsRoutedPageIn,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ImageCopyMode {
+    Direct,
+    DeferRouted,
 }
 
 unsafe fn ready_source_frame(view: NativeImageViewDescriptor, rva: u32) -> Result<u64, u32> {
@@ -660,7 +667,7 @@ unsafe fn service_page_residency(
     page: u64,
     access: FaultAccess,
     observation: ImageFaultObservation,
-    defer_routed: bool,
+    mode: ImageCopyMode,
     stage: &mut &'static str,
 ) -> Result<ImageCopyAdmission, u32> {
     let _borrow = Borrow::acquire()?;
@@ -751,7 +758,8 @@ unsafe fn service_page_residency(
         return Ok(ImageCopyAdmission::Resident);
     }
     *stage = "source-page";
-    if defer_routed && routed_source && !source_page_ready(view.view.area(), rva)
+    if mode == ImageCopyMode::DeferRouted && routed_source
+        && !source_page_ready(view.view.area(), rva)
     {
         if !routed_source_readable {
             return Err(INVALID);

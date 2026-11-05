@@ -203,10 +203,20 @@ fn delayed_not_present_image_fault_revalidates_resident_before_any_fill() {
                 self.0 |= branch.then_branch.stmts.iter().any(|statement| {
                     matches!(statement,
                     syn::Stmt::Expr(syn::Expr::Return(returned), _)
-                    if returned.expr.as_ref().is_some_and(|expression| matches!(&**expression,
-                        syn::Expr::Call(call) if matches!(&*call.func,
+                    if returned.expr.as_ref().is_some_and(|expression| {
+                        let call = match &**expression {
+                            syn::Expr::Call(call) => Some(call),
+                            syn::Expr::MethodCall(method) if method.method == "map" =>
+                                match &*method.receiver {
+                                    syn::Expr::Call(call) => Some(call),
+                                    _ => None,
+                                },
+                            _ => None,
+                        };
+                        call.is_some_and(|call| matches!(&*call.func,
                             syn::Expr::Path(path) if path.path.segments.last().unwrap().ident
-                                == "revalidate_resident_image_page"))))
+                                == "revalidate_resident_image_page"))
+                    }))
                 });
             }
             syn::visit::visit_expr_if(self, branch);
