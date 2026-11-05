@@ -3,6 +3,9 @@
 const RESIDENT: &str = include_str!(
     "../../../components/ntos-executive/src/exec_virtual_memory_resident.rs"
 );
+const FRAME_COPY: &str = include_str!(
+    "../../../components/ntos-executive/src/img_spawn.rs"
+);
 
 fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
     let start = source.find(name).expect("missing resident-only function");
@@ -44,4 +47,14 @@ fn physical_one_page_copy_cannot_reenter_synchronous_residency() {
         assert!(!body.contains("service_native_image_page_residency("),
             "{name} can enter image I/O");
     }
+}
+
+#[test]
+fn resident_write_alias_preserves_exact_process_generation() {
+    let write = function_body(RESIDENT, "fn copy_write_resident_page(");
+    let exact_copyout = function_body(FRAME_COPY, "fn client_copyout_mapped_admitted_for(");
+    let frame_alias = function_body(FRAME_COPY, "fn recorded_frame_copyout_impl(");
+    assert!(write.contains("client_copyout_mapped_admitted_for("));
+    assert!(exact_copyout.contains("Some(process)"));
+    assert!(frame_alias.contains("with_recorded_frame_alias(pi, process,"));
 }
