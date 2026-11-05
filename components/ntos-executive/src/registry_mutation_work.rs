@@ -26,14 +26,17 @@ enum HostedCompletion {
         publication: HostedRegistryPublication,
         parent_owner: RegistryKeyHandlePublication,
         parent: KeyRef,
+        parent_target: CmSystemKeyTarget,
         leaf: String,
         grant: u32,
     },
     Existing {
         key_owner: RegistryKeyHandlePublication,
+        key: KeyRef,
+        target: CmSystemKeyTarget,
         kind: ExistingMutationKind,
     },
-    SystemLocale { lease: SystemHiveKeyLease, locale_id: u32 },
+    SystemLocale { lease: SystemHiveKeyLease, physical_path: String, locale_id: u32 },
 }
 
 #[derive(Clone, Copy)]
@@ -82,6 +85,9 @@ impl HostedExistingKey {
         }
     }
 }
+
+#[path = "registry_mutation_retry.rs"]
+mod retry;
 
 /// Bind a hidden PM reference before any CM query can reenter the executive.
 pub(crate) fn retain_hosted_existing(handler: &mut ExecNtHandler, key: KeyRef) -> Result<HostedExistingKey, u32> {
@@ -877,6 +883,12 @@ pub(crate) unsafe fn submit_hosted(
 ) -> Result<(), (u32, HostedRegistryPublication, RegistryKeyHandlePublication)> {
     let _durable = allocator::enter_durable();
     let admission = (|| {
+        let parent_target = registry_key_targets::system(parent).ok_or(0xC000_0008u32)?;
+        match &mutation {
+            SystemHiveMutation::CreateChildRelative { parent: lease, name, .. }
+                if *lease == parent_target.lease && *name == leaf.as_str() => {}
+            _ => return Err(0xC000_0008u32),
+        }
         let tcb = handler.hosted_thread_tcb(handler.current_tid).ok_or(0xC000_0008u32)?;
         let logical = handler.capture_provider_logical_caller(
             handler.pi, handler.current_tid, handler.current_badge, tcb,
@@ -905,14 +917,14 @@ pub(crate) unsafe fn submit_hosted(
                 return Err(status as u32);
             }
         };
-        Ok((park, attempt, logical, reference, index))
+        Ok((park, attempt, logical, reference, index, parent_target))
     })();
-    let (park, attempt, logical, reference, index) = match admission {
+    let (park, attempt, logical, reference, index, parent_target) = match admission {
         Ok(admission) => admission,
         Err(status) => return Err((status, publication, parent_owner)),
     };
     let caller = HostedCaller {
-        completion: HostedCompletion::Create { publication, parent_owner, parent, leaf, grant },
+        completion: HostedCompletion::Create { publication, parent_owner, parent, parent_target, leaf, grant },
         pi: handler.pi,
         tid: handler.current_tid,
         badge: handler.current_badge,
@@ -1000,16 +1012,22 @@ pub(crate) unsafe fn submit_hosted_existing(
     mutation: SystemHiveMutation<'_>,
 ) -> Result<(), u32> {
     let _durable = allocator::enter_durable();
-    let kind = match &mutation {
-        SystemHiveMutation::SetValue { .. } => ExistingMutationKind::SetValue,
-        SystemHiveMutation::DeleteValue { .. } => ExistingMutationKind::DeleteValue,
-        SystemHiveMutation::SetKeySecurity { .. } => ExistingMutationKind::SetSecurity,
-        SystemHiveMutation::DeleteKey { .. } => ExistingMutationKind::DeleteKey,
+    let (kind, mutation_path) = match &mutation {
+        SystemHiveMutation::SetValue { path, .. } => (ExistingMutationKind::SetValue, *path),
+        SystemHiveMutation::DeleteValue { path, .. } => (ExistingMutationKind::DeleteValue, *path),
+        SystemHiveMutation::SetKeySecurity { path, .. } => (ExistingMutationKind::SetSecurity, *path),
+        SystemHiveMutation::DeleteKey { path } => (ExistingMutationKind::DeleteKey, *path),
         _ => {
             retained.abort(handler);
             return Err(0xC000_000Du32);
         }
     };
+    if nt_hive_core::canon_path(mutation_path)
+        != nt_hive_core::canon_path(&retained.target.physical_path)
+    {
+        retained.abort(handler);
+        return Err(0xC000_0008u32);
+    }
     let (park, index, logical, reference, attempt) = match admit_hosted_mutation(
         handler, expected_generation, mutation,
     ) {
@@ -1021,7 +1039,7 @@ pub(crate) unsafe fn submit_hosted_existing(
     };
     let key_owner = retained.owner.take().expect("retained existing Key owner");
     let hosted = HostedCaller {
-        completion: HostedCompletion::Existing { key_owner, kind },
+        completion: HostedCompletion::Existing { key_owner, key: retained.key, target: retained.target, kind },
         pi: handler.pi,
         tid: handler.current_tid,
         badge: handler.current_badge,
@@ -1068,6 +1086,12 @@ pub(crate) unsafe fn submit_hosted_system_locale(
     locale_id: u32,
 ) -> Result<(), u32> {
     let _durable = allocator::enter_durable();
+    let mut physical_path = String::new();
+    if physical_path.try_reserve_exact(path.len()).is_err() {
+        let _ = config_manager_retire_system_hive_key(lease);
+        return Err(0xC000_009Au32);
+    }
+    physical_path.push_str(path);
     let mutation = SystemHiveMutation::SetValue { path, name, value_type: 1, data };
     let (park, index, logical, reference, attempt) = match admit_hosted_mutation(
         handler, expected_generation, mutation,
@@ -1079,7 +1103,7 @@ pub(crate) unsafe fn submit_hosted_system_locale(
         }
     };
     let caller = HostedCaller {
-        completion: HostedCompletion::SystemLocale { lease, locale_id },
+        completion: HostedCompletion::SystemLocale { lease, physical_path, locale_id },
         pi: handler.pi,
         tid: handler.current_tid,
         badge: handler.current_badge,
@@ -1277,6 +1301,44 @@ unsafe fn advance(
             if attempt.is_acknowledged() {
                 if attempt.outcome_status() == Some(0) {
                     work.phase = Phase::Prepare(attempts.take_upload(attempt)?.into_preparation());
+                } else if attempt.outcome_status() == Some(nt_status::NtStatus::DEVICE_BUSY.raw() as i32)
+                    && !work.cancelled
+                    && matches!(&work.caller, Caller::Hosted(_))
+                {
+                    // CM ACKed an exact no-token refusal. Keep the original caller, Reply,
+                    // mutation journal and mount while a prior writer releases its lease.
+                    attempts.retry_acknowledged_busy(attempt)?;
+                    return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as i32);
+                } else if attempt.outcome_status() == Some(0xC000_0059u32 as i32)
+                    && !work.cancelled
+                    && matches!(&work.caller, Caller::Hosted(_))
+                {
+                    let rebase = (|| {
+                        let generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+                        let mount = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT
+                            .ok_or(0xC000_00A3u32 as i32)?;
+                        if mount != attempt.mount() {
+                            return Err(0xC000_0008u32 as i32);
+                        }
+                        if generation <= attempt.expected_generation() {
+                            return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as i32);
+                        }
+                        let Caller::Hosted(caller) = &work.caller else { unreachable!() };
+                        retry::revalidate_hosted_revision(caller, mount, generation)?;
+                        attempts.retry_acknowledged_revision(attempt, mount, generation)
+                    })();
+                    match rebase {
+                        Ok(()) => return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as i32),
+                        // The durable writer may still be catching up. Keep the ACKed attempt;
+                        // its exact continuation remains available for the next revalidation.
+                        Err(status) if status == nt_status::NtStatus::DEVICE_BUSY.raw() as i32 =>
+                            return Err(status),
+                        Err(status) => {
+                            let _ = attempts.take_failure(attempt)?;
+                            work.status = status as u32;
+                            work.phase = Phase::Complete;
+                        }
+                    }
                 } else if attempt.outcome_status() == Some(0xC000_0059u32 as i32)
                     && !work.cancelled
                     && matches!(&work.caller, Caller::Provider(provider::ProviderCaller {
@@ -1588,7 +1650,7 @@ unsafe fn advance(
                                 handler.release_registry_key_target(target);
                             }
                         }
-                        HostedCompletion::Existing { key_owner, kind } => {
+                        HostedCompletion::Existing { key_owner, kind, .. } => {
                             if let Some(target) = key_owner.abort(&mut handler.pm)
                                 .expect("retained existing Key") {
                                 if matches!(*kind, ExistingMutationKind::SetValue) {

@@ -11,6 +11,56 @@ fn source(name: &str) -> String {
 }
 
 #[test]
+fn hosted_system_create_keeps_its_reply_through_acknowledged_writer_busy() {
+    // The CM protocol test `real_server_busy_retry_keeps_caller_until_previous_writer_releases`
+    // exercises BUSY -> ACK -> fresh request identity. This checks that the native owner uses
+    // that contract before its terminal-failure path can reply to a first-boot caller.
+    let owner = source("registry_mutation_work.rs");
+    let advance = owner.find("unsafe fn advance(").expect("native mutation advancement");
+    let begin = owner[advance..].find("        Phase::Begin(attempt) => {")
+        .expect("retained BEGIN phase") + advance;
+    let prepare = owner[begin..].find("        Phase::Prepare(").expect("next phase") + begin;
+    let branch = &owner[begin..prepare];
+    let acknowledged = branch.find("if attempt.is_acknowledged()").expect("exact ACK gate");
+    let retry = branch.find("attempts.retry_acknowledged_busy(attempt)")
+        .expect("acknowledged BUSY must retry the same retained hosted owner");
+    let terminal = branch.find("attempts.take_failure(attempt)")
+        .expect("terminal no-effect failure path");
+    assert!(acknowledged < retry && retry < terminal,
+        "BUSY retry must precede terminal reply only after CM acknowledged the outcome");
+    assert!(branch[acknowledged..retry].contains("Caller::Hosted")
+        && branch[acknowledged..retry].contains("DEVICE_BUSY"),
+        "only the hosted BUSY outcome may retry under this native caller policy");
+}
+
+#[test]
+fn hosted_revision_retry_revalidates_retained_key_before_rebasing() {
+    // Executable CM tests cover stale durable generations and replaced mounts; this
+    // integration check binds their authority contract to the native hosted caller.
+    let owner = source("registry_mutation_work.rs");
+    let advance = owner.find("unsafe fn advance(").expect("native mutation advancement");
+    let begin = owner[advance..].find("        Phase::Begin(attempt) => {")
+        .expect("retained BEGIN phase") + advance;
+    let prepare = owner[begin..].find("        Phase::Prepare(").expect("next phase") + begin;
+    let branch = &owner[begin..prepare];
+    let validate = branch.find("retry::revalidate_hosted_revision(caller, mount, generation)?")
+        .expect("retained hosted target validation");
+    let rebase = branch.find("attempts.retry_acknowledged_revision(attempt, mount, generation)")
+        .expect("revision rebase");
+    assert!(branch[..validate].contains("mount != attempt.mount()") && validate < rebase,
+        "the retained mount and target must be checked before changing BEGIN generation");
+    let authority = source("registry_mutation_retry.rs");
+    let target = authority.find("registry_key_targets::system(key).ok_or(INVALID_KEY)?")
+        .expect("retained PM KeyRef target");
+    let durable = authority.find("query_leased_system_hive_key_at_durable_mount")
+        .expect("durable same-mount CM key query");
+    let path = authority.find("canon_path(&information.path) != nt_hive_core::canon_path(physical_path)")
+        .expect("original physical path comparison");
+    assert!(target < durable && durable < path && authority[path..].contains("Err(INVALID_KEY)"),
+        "a stale target or changed physical path must refuse replay");
+}
+
+#[test]
 fn bootstrap_cm_owner_retains_preparation_storage_and_exact_commit_receipt() {
     let owner = source("boot_registry_mutation_work.rs");
     for contract in [

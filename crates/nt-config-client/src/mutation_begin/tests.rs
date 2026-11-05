@@ -926,6 +926,58 @@ fn real_server_busy_retry_keeps_caller_until_previous_writer_releases() {
 }
 
 #[test]
+fn real_server_busy_then_revision_retry_keeps_one_caller_and_journal() {
+    let mut client = client();
+    let mount = client.query_system_hive_mount(1).unwrap().mount();
+    let mut manager = CmMutationBeginAttempts::with_slot_limit(2).unwrap();
+    let mut first = reserve_on(&mut manager, &mut client, 1);
+    for op in [CmMutationBeginOperation::Query, CmMutationBeginOperation::Begin,
+        CmMutationBeginOperation::Acknowledge] {
+        exchange(&mut manager, &mut first, &mut client, op).unwrap();
+    }
+    let upload = manager.take_upload(&mut first).unwrap();
+    let mut waiting = reserve_on(&mut manager, &mut client, 2);
+    let journal = waiting.journal().to_vec();
+    let journal_ptr = waiting.journal().as_ptr();
+    let original = waiting.identity;
+    exchange(&mut manager, &mut waiting, &mut client, CmMutationBeginOperation::Begin).unwrap();
+    assert_eq!(waiting.outcome_status(), Some(BUSY));
+    exchange(&mut manager, &mut waiting, &mut client,
+        CmMutationBeginOperation::Acknowledge).unwrap();
+    manager.retry_acknowledged_busy(&mut waiting).unwrap();
+
+    let aborted = client.hive_mutation_call(hive_mutation_transfer::ABORT, 0,
+        upload.mutation_token, upload.expected_generation, 0,
+        upload.journal.len() as u32, &[]).unwrap();
+    assert_eq!(aborted.status, STATUS_SUCCESS);
+    let committed = client.prepare_system_hive_mutation(1, &[
+        SystemHiveMutation::CreateKey {
+            path: r"\Registry\Machine\System\ControlSet001\OtherWriter",
+        },
+    ]).unwrap();
+    assert_eq!(client.publish_system_hive_mutation(&committed).unwrap().generation, 2);
+
+    exchange(&mut manager, &mut waiting, &mut client, CmMutationBeginOperation::Begin).unwrap();
+    assert_eq!(waiting.outcome_status(), Some(REVISION_MISMATCH));
+    exchange(&mut manager, &mut waiting, &mut client,
+        CmMutationBeginOperation::Acknowledge).unwrap();
+    assert_eq!(waiting.identity.sequence, original.sequence + 1);
+    assert_eq!(waiting.journal().as_ptr(), journal_ptr);
+    assert_eq!(waiting.continuation(), Some(&2));
+    manager.retry_acknowledged_revision(&mut waiting, mount, 2).unwrap();
+    assert_eq!(waiting.identity.sequence, original.sequence + 2);
+    assert_eq!(waiting.journal(), journal);
+    exchange(&mut manager, &mut waiting, &mut client, CmMutationBeginOperation::Begin).unwrap();
+    assert_eq!(waiting.outcome_status(), Some(STATUS_SUCCESS));
+    exchange(&mut manager, &mut waiting, &mut client,
+        CmMutationBeginOperation::Acknowledge).unwrap();
+    let resumed = manager.take_upload(&mut waiting).unwrap();
+    assert_eq!(resumed.expected_generation(), 2);
+    assert_eq!(resumed.journal(), journal);
+    assert_eq!(resumed.continuation(), &2);
+}
+
+#[test]
 fn real_server_unwind_after_begin_keeps_epoch_busy_and_caller_owned() {
     let mut client = client();
     let mut manager = CmMutationBeginAttempts::new();
