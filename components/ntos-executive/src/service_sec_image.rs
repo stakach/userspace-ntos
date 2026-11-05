@@ -9934,6 +9934,7 @@ pub(crate) unsafe fn service_sec_image(
                 && crate::provider_section_map_work::next_deadline().is_none()
                 && crate::native_image_pagein_work::next_deadline().is_none()
                 && crate::vm_lock_pagein_work::next_deadline().is_none()
+                && crate::vm_copy_work::next_deadline().is_none()
                 && crate::provider_section_broker::next_deadline().is_none()
                 && !crate::gdi_routed_image_work::has_outstanding()
                 && !crate::native_directory_open_work::occupied()
@@ -10127,6 +10128,7 @@ pub(crate) unsafe fn service_sec_image(
             crate::provider_section_map_work::redrive(&mut nt_handler);
             crate::native_image_pagein_work::redrive(&mut nt_handler, &nt_dispatcher);
             crate::vm_lock_pagein_work::redrive(&mut nt_handler);
+            crate::vm_copy_work::redrive(&mut nt_handler);
             crate::provider_section_broker::redrive(nt_handler as *mut _);
             crate::gdi_routed_image_work::redrive(&mut nt_handler);
             crate::provider_directory_broker::redrive(nt_handler as *mut _);
@@ -13450,6 +13452,13 @@ pub(crate) unsafe fn service_sec_image(
                         &argv[..4], resume_ip, sp, flags, native_call_transport)
                         .map(|()| true)
                 } else { Ok(false) };
+                let vm_copy_preflight = if stack_args_valid
+                    && matches!(m0, SSN_NT_READ_VM | SSN_NT_WRITE_VM)
+                {
+                    crate::vm_copy_work::submit(&mut nt_handler, &argv[..5],
+                        m0 == SSN_NT_READ_VM, resume_ip, sp, flags,
+                        native_call_transport).map(|()| true)
+                } else { Ok(false) };
                 let copy_preflight = if stack_args_valid
                     && matches!(m0, SSN_NT_QUERY_SYSTEM_INFO | SSN_NT_QUERY_DEFAULT_LOCALE)
                 {
@@ -13464,6 +13473,22 @@ pub(crate) unsafe fn service_sec_image(
                     {
                         let _message = crate::ipc_message::SavedMessageBuffer::capture();
                         crate::vm_lock_pagein_work::redrive(&mut nt_handler);
+                    }
+                    let _ = finalize_service_loop_state(&mut nt_handler);
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                    badge = nb;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
+                    continue;
+                } else if matches!(vm_copy_preflight, Ok(true)) {
+                    thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                    {
+                        let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                        crate::vm_copy_work::redrive(&mut nt_handler);
                     }
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -13492,6 +13517,8 @@ pub(crate) unsafe fn service_sec_image(
                     m3 = nm3;
                     continue;
                 } else if let Err(status) = lock_preflight {
+                    result = status as u64;
+                } else if let Err(status) = vm_copy_preflight {
                     result = status as u64;
                 } else if let Err(status) = copy_preflight {
                     result = status as u64;

@@ -20,7 +20,11 @@ const RETRY_DELAY: u64 = 1_000_000;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xc000_009a;
 
 #[derive(Clone, Copy)]
-enum Purpose { Fault, VmLock { token: u64, caller_pi: usize } }
+enum Purpose {
+    Fault,
+    VmLock { token: u64, caller_pi: usize },
+    VmCopy { token: u64, caller_pi: usize },
+}
 
 enum Phase {
     QueryDispatch,
@@ -98,6 +102,16 @@ pub(crate) unsafe fn submit_for_vm_lock(
         Purpose::VmLock { token, caller_pi }, reply)
 }
 
+/// The VM-copy coordinator already parked the original syscall Reply. This row owns only the
+/// target Section page and its routed provider effects until terminal copy and strict ACK.
+pub(crate) unsafe fn submit_for_vm_copy(
+    handler: &mut ExecNtHandler, caller_pi: usize, target_pi: usize,
+    page: u64, access: nt_address_space::FaultAccess, reply: u64, token: u64,
+) -> Result<crate::routed_pagein_source::RoutedPageInSource, u32> {
+    submit_owned(handler, target_pi, page, access,
+        Purpose::VmCopy { token, caller_pi }, reply)
+}
+
 unsafe fn submit_owned(
     handler: &mut ExecNtHandler, pi: usize, page: u64,
     access: nt_address_space::FaultAccess, purpose: Purpose, reply: u64,
@@ -144,7 +158,10 @@ unsafe fn submit_owned(
     let tcb = handler
         .hosted_thread_tcb(tid)
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
-    let caller_pi = match purpose { Purpose::Fault => pi, Purpose::VmLock { caller_pi, .. } => caller_pi };
+    let caller_pi = match purpose {
+        Purpose::Fault => pi,
+        Purpose::VmLock { caller_pi, .. } | Purpose::VmCopy { caller_pi, .. } => caller_pi,
+    };
     let logical = handler
         .capture_provider_logical_caller(caller_pi, tid, handler.current_badge, tcb)
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
@@ -696,11 +713,18 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                     return false;
                 }
             }
-            if let Purpose::VmLock { token, .. } = work.purpose {
-                if crate::vm_lock_pagein_work::page_completed(token, work.pi, work.page,
-                    crate::routed_pagein_source::RoutedPageInSource::Mapped {
-                        section: work.section, view: work.view, lease: work.lease,
-                    }, 0) {
+            if matches!(work.purpose, Purpose::VmLock { .. } | Purpose::VmCopy { .. }) {
+                let source = crate::routed_pagein_source::RoutedPageInSource::Mapped {
+                    section: work.section, view: work.view, lease: work.lease,
+                };
+                let completed = match work.purpose {
+                    Purpose::VmLock { token, .. } => crate::vm_lock_pagein_work::page_completed(
+                        token, work.pi, work.page, source, 0),
+                    Purpose::VmCopy { token, .. } => crate::vm_copy_work::page_completed(
+                        token, work.pi, work.page, source, 0),
+                    Purpose::Fault => unreachable!(),
+                };
+                if completed {
                     return true;
                 }
                 work.phase = Phase::Indeterminate;
@@ -735,11 +759,19 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
             true
         }
         Phase::Cancel => {
-            if let Purpose::VmLock { token, .. } = work.purpose {
-                if crate::vm_lock_pagein_work::page_completed(token, work.pi, work.page,
-                    crate::routed_pagein_source::RoutedPageInSource::Mapped {
-                        section: work.section, view: work.view, lease: work.lease,
-                    }, work.failure.unwrap_or(nt_address_space::STATUS_ACCESS_VIOLATION)) {
+            if matches!(work.purpose, Purpose::VmLock { .. } | Purpose::VmCopy { .. }) {
+                let source = crate::routed_pagein_source::RoutedPageInSource::Mapped {
+                    section: work.section, view: work.view, lease: work.lease,
+                };
+                let status = work.failure.unwrap_or(nt_address_space::STATUS_ACCESS_VIOLATION);
+                let completed = match work.purpose {
+                    Purpose::VmLock { token, .. } => crate::vm_lock_pagein_work::page_completed(
+                        token, work.pi, work.page, source, status),
+                    Purpose::VmCopy { token, .. } => crate::vm_copy_work::page_completed(
+                        token, work.pi, work.page, source, status),
+                    Purpose::Fault => unreachable!(),
+                };
+                if completed {
                     return true;
                 }
                 work.phase = Phase::Indeterminate;
@@ -798,7 +830,7 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         EXECUTING_PI.store(work.pi as u64, Ordering::Release);
         let caller_pi = match work.purpose {
             Purpose::Fault => work.pi,
-            Purpose::VmLock { caller_pi, .. } => caller_pi,
+            Purpose::VmLock { caller_pi, .. } | Purpose::VmCopy { caller_pi, .. } => caller_pi,
         };
         EXECUTING_CALLER_PI.store(caller_pi as u64, Ordering::Release);
         let done = service_sec_image::with_pagein_caller_target_context(

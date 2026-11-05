@@ -153,6 +153,7 @@ mod provider_section_map_work;
 mod native_image_pagein_work;
 mod routed_pagein_source;
 mod vm_lock_pagein_work;
+mod vm_copy_work;
 pub(crate) use fs_loader::*;
 mod hosted_bootstrap;
 mod installed_layout;
@@ -17496,6 +17497,7 @@ unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
         + subdrain!(13, provider_section_map_work::wake_due(now_100ns))
         + subdrain!(25, native_image_pagein_work::wake_due(now_100ns))
         + subdrain!(25, vm_lock_pagein_work::wake_due(now_100ns))
+        + subdrain!(25, vm_copy_work::wake_due(now_100ns))
         + subdrain!(19, provider_section_broker::wake_due(now_100ns))
         + subdrain!(19, gdi_routed_image_work::wake_due(now_100ns))
         + subdrain!(21, provider_directory_broker::wake_due(now_100ns))
@@ -18695,6 +18697,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         || section_pagein_work::has_thread(tid)
         || native_image_pagein_work::has_thread(tid)
         || vm_lock_pagein_work::has_thread(tid)
+        || vm_copy_work::has_thread(tid)
     {
         return false;
     }
@@ -18741,6 +18744,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         || section_pagein_work::has_thread(tid)
         || native_image_pagein_work::has_thread(tid)
         || vm_lock_pagein_work::has_thread(tid)
+        || vm_copy_work::has_thread(tid)
     {
         return false;
     }
@@ -18868,6 +18872,7 @@ unsafe fn terminate_hosted_process_mechanisms(
         || section_pagein_work::has_process(process_index as usize, preserve_tid)
         || native_image_pagein_work::has_process(process_index as usize, preserve_tid)
         || vm_lock_pagein_work::has_process(process_index as usize, preserve_tid)
+        || vm_copy_work::has_process(process_index as usize, preserve_tid)
     {
         return 0;
     }

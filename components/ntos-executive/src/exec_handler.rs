@@ -263,6 +263,7 @@ mod disk_file;
 mod virtual_memory_copy;
 #[path = "exec_virtual_memory_resident.rs"]
 mod virtual_memory_resident;
+pub(crate) use virtual_memory_resident::CopyPageAdmission;
 
 #[path = "exec_private_residency.rs"]
 pub(crate) mod private_residency;

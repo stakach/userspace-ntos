@@ -49,7 +49,12 @@ impl CopyService {
 }
 
 #[derive(Clone, Copy)]
-enum Purpose { Fault, SyscallCopy(SyscallCopy), VmLock { token: u64, caller_pi: usize } }
+enum Purpose {
+    Fault,
+    SyscallCopy(SyscallCopy),
+    VmLock { token: u64, caller_pi: usize },
+    VmCopy { token: u64, caller_pi: usize, service_number: u32 },
+}
 
 #[derive(Clone, Copy)]
 enum Phase { AwaitSource, Read, Publish, MapPage, ScanSyscall, DispatchSyscall, ReplyReady, ReadyError, ReplyEntered, ReplySent, Cancel, Cancelled, Indeterminate }
@@ -153,11 +158,11 @@ unsafe fn prepare_page(
     if matches!(purpose, Purpose::Fault)
         && decision == RoutedSourceReadDecision::Ready
     { return Ok(None); }
-    if matches!(purpose, Purpose::SyscallCopy(_) | Purpose::VmLock { .. })
+    if matches!(purpose, Purpose::SyscallCopy(_) | Purpose::VmLock { .. } | Purpose::VmCopy { .. })
         && (source_ready
             || crate::native_image_residency::has_private_page(view, page))
     { return Ok(None); }
-    if existing && !parked && matches!(purpose, Purpose::SyscallCopy(_) | Purpose::VmLock { .. })
+    if existing && !parked && matches!(purpose, Purpose::SyscallCopy(_) | Purpose::VmLock { .. } | Purpose::VmCopy { .. })
         && !producer
     {
         // A retained synchronous source initializer has no asynchronous producer here.
@@ -180,7 +185,7 @@ unsafe fn prepare_page(
     let tid = handler.current_tid;
     let tcb = handler.hosted_thread_tcb(tid).ok_or(INVALID)?;
     let caller_pi = match purpose {
-        Purpose::VmLock { caller_pi, .. } => caller_pi,
+        Purpose::VmLock { caller_pi, .. } | Purpose::VmCopy { caller_pi, .. } => caller_pi,
         _ => pi,
     };
     let logical = handler.capture_provider_logical_caller(
@@ -311,6 +316,24 @@ pub(crate) unsafe fn submit_for_vm_lock(
 ) -> Result<Option<crate::routed_pagein_source::RoutedPageInSource>, u32> {
     let Some(work) = prepare_page(handler, target_pi, page, access,
         ImageFaultObservation::CopyAccess, Purpose::VmLock { token, caller_pi }, reply, true)?
+    else { return Ok(None); };
+    let source = crate::routed_pagein_source::RoutedPageInSource::Image {
+        view: work.view, lease: work.lease,
+    };
+    install_work(work, true)?;
+    Ok(Some(source))
+}
+
+/// The VM-copy coordinator owns the parked syscall Reply. This row owns only the exact routed
+/// image page and provider read until terminal copy, ACK and target map proof.
+pub(crate) unsafe fn submit_for_vm_copy(
+    handler: &mut ExecNtHandler, caller_pi: usize, target_pi: usize,
+    page: u64, access: FaultAccess, reply: u64, token: u64,
+) -> Result<Option<crate::routed_pagein_source::RoutedPageInSource>, u32> {
+    let service_number = handler.current_service_number;
+    let Some(work) = prepare_page(handler, target_pi, page, access,
+        ImageFaultObservation::CopyAccess,
+        Purpose::VmCopy { token, caller_pi, service_number }, reply, true)?
     else { return Ok(None); };
     let source = crate::routed_pagein_source::RoutedPageInSource::Image {
         view: work.view, lease: work.lease,
@@ -675,11 +698,18 @@ unsafe fn advance(
             if cancelled { work.phase = Phase::Cancel; return false; }
             if parked_reply::validate_saved(work.reply).is_err() { return false; }
             work.phase = Phase::ReplyEntered;
-            if let Purpose::VmLock { token, .. } = work.purpose {
-                if crate::vm_lock_pagein_work::page_completed(token, work.pi, work.page,
-                    crate::routed_pagein_source::RoutedPageInSource::Image {
-                        view: work.view, lease: work.lease,
-                    }, 0) {
+            if matches!(work.purpose, Purpose::VmLock { .. } | Purpose::VmCopy { .. }) {
+                let source = crate::routed_pagein_source::RoutedPageInSource::Image {
+                    view: work.view, lease: work.lease,
+                };
+                let completed = match work.purpose {
+                    Purpose::VmLock { token, .. } => crate::vm_lock_pagein_work::page_completed(
+                        token, work.pi, work.page, source, 0),
+                    Purpose::VmCopy { token, .. } => crate::vm_copy_work::page_completed(
+                        token, work.pi, work.page, source, 0),
+                    Purpose::Fault | Purpose::SyscallCopy(_) => unreachable!(),
+                };
+                if completed {
                     return true;
                 }
                 work.phase = Phase::Indeterminate;
@@ -693,7 +723,8 @@ unsafe fn advance(
                     assert!(work.progress.enter_reply());
                     reply_parked_syscall(work.reply, u64::from(status))
                 }
-                Purpose::VmLock { .. } => unreachable!("VM lock returns through its coordinator"),
+                Purpose::VmLock { .. } | Purpose::VmCopy { .. } =>
+                    unreachable!("retained VM operation returns through its coordinator"),
             };
             if !sent { return false; }
             crate::note_boot_progress(crate::BootProgress::PageMappingPublished);
@@ -725,11 +756,19 @@ unsafe fn advance(
             true
         }
         Phase::Cancel => {
-            if let Purpose::VmLock { token, .. } = work.purpose {
-                if crate::vm_lock_pagein_work::page_completed(token, work.pi, work.page,
-                    crate::routed_pagein_source::RoutedPageInSource::Image {
-                        view: work.view, lease: work.lease,
-                    }, work.failure.unwrap_or(INVALID)) {
+            if matches!(work.purpose, Purpose::VmLock { .. } | Purpose::VmCopy { .. }) {
+                let source = crate::routed_pagein_source::RoutedPageInSource::Image {
+                    view: work.view, lease: work.lease,
+                };
+                let status = work.failure.unwrap_or(INVALID);
+                let completed = match work.purpose {
+                    Purpose::VmLock { token, .. } => crate::vm_lock_pagein_work::page_completed(
+                        token, work.pi, work.page, source, status),
+                    Purpose::VmCopy { token, .. } => crate::vm_copy_work::page_completed(
+                        token, work.pi, work.page, source, status),
+                    Purpose::Fault | Purpose::SyscallCopy(_) => unreachable!(),
+                };
+                if completed {
                     return true;
                 }
                 work.phase = Phase::Indeterminate;
@@ -796,6 +835,8 @@ pub(crate) unsafe fn redrive(
                     call.service.number()),
             Purpose::VmLock { caller_pi, .. } =>
                 (caller_pi, 0, 0, 0, false, SSN_NT_LOCK_VM as u32),
+            Purpose::VmCopy { caller_pi, service_number, .. } =>
+                (caller_pi, 0, 0, 0, false, service_number),
         };
         EXECUTING_CALLER_PI.store(caller_pi as u64, Ordering::Release);
         let done = service_sec_image::with_pagein_caller_target_context(
