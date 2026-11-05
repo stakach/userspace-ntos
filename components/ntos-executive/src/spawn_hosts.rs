@@ -1554,6 +1554,10 @@ pub(crate) fn print_active_irp_receive_census() {
     shared_pump::print_active_irp_receive_census();
 }
 
+pub(crate) fn print_active_syscall_receive_census() {
+    shared_pump::print_active_syscall_receive_census();
+}
+
 pub(crate) fn file_receive_census() -> [u64; 9] {
     shared_pump::file_receive_census()
 }

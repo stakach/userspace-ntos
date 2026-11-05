@@ -56,6 +56,130 @@ impl ActiveIrpSnapshot {
 static ACTIVE_IRP_SNAPSHOTS: [ActiveIrpSnapshot; ACTIVE_IRP_SNAPSHOT_SLOTS] =
     [const { ActiveIrpSnapshot::new() }; ACTIVE_IRP_SNAPSHOT_SLOTS];
 
+// The nested Syscall receiver can hold the root service loop while timer notifications keep
+// arriving. Copy the exact entered owner and count only non-timer arrivals. The periodic reader
+// never follows a route, touches the shared mapping, or changes receive ownership.
+const ACTIVE_SYSCALL_SNAPSHOT_SLOTS: usize = 8;
+static NEXT_SYSCALL_SNAPSHOT: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_SYSCALL_SNAPSHOT_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+struct ActiveSyscallSnapshot {
+    sequence: AtomicU64,
+    started_100ns: AtomicU64,
+    domain: AtomicU64,
+    cookie: AtomicU64,
+    route: AtomicU64,
+    route_domain: AtomicU64,
+    route_generation: AtomicU64,
+    lane_index: AtomicU64,
+    lane_generation: AtomicU64,
+    tcb: AtomicU64,
+    reply: AtomicU64,
+    ssn: AtomicU64,
+    client_pi: AtomicU64,
+    client_generation: AtomicU64,
+    provider_arrivals: AtomicU64,
+    last_provider_at_100ns: AtomicU64,
+}
+
+impl ActiveSyscallSnapshot {
+    const fn new() -> Self {
+        Self {
+            sequence: AtomicU64::new(0),
+            started_100ns: AtomicU64::new(0),
+            domain: AtomicU64::new(0),
+            cookie: AtomicU64::new(0),
+            route: AtomicU64::new(0),
+            route_domain: AtomicU64::new(0),
+            route_generation: AtomicU64::new(0),
+            lane_index: AtomicU64::new(0),
+            lane_generation: AtomicU64::new(0),
+            tcb: AtomicU64::new(0),
+            reply: AtomicU64::new(0),
+            ssn: AtomicU64::new(0),
+            client_pi: AtomicU64::new(0),
+            client_generation: AtomicU64::new(0),
+            provider_arrivals: AtomicU64::new(0),
+            last_provider_at_100ns: AtomicU64::new(0),
+        }
+    }
+}
+
+static ACTIVE_SYSCALL_SNAPSHOTS: [ActiveSyscallSnapshot; ACTIVE_SYSCALL_SNAPSHOT_SLOTS] =
+    [const { ActiveSyscallSnapshot::new() }; ACTIVE_SYSCALL_SNAPSHOT_SLOTS];
+
+fn capture_active_syscall_snapshot(ch: &PumpChannel, route: PeerRoute) -> Option<(usize, u64)> {
+    let sequence = NEXT_SYSCALL_SNAPSHOT.fetch_add(1, Ordering::Relaxed);
+    if sequence == 0 || sequence == SNAPSHOT_CLAIMED {
+        ACTIVE_SYSCALL_SNAPSHOT_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let Some((index, slot)) = ACTIVE_SYSCALL_SNAPSHOTS.iter().enumerate().find(|(_, slot)| {
+        slot.sequence.compare_exchange(0, SNAPSHOT_CLAIMED,
+            Ordering::AcqRel, Ordering::Relaxed).is_ok()
+    }) else {
+        ACTIVE_SYSCALL_SNAPSHOT_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let domain = ch.physical_domain;
+    slot.started_100ns.store(crate::monotonic_time_100ns(), Ordering::Relaxed);
+    slot.domain.store(domain.map_or(0, |id| id.domain_id.raw()), Ordering::Relaxed);
+    slot.cookie.store(domain.map_or(0, |id| id.cookie), Ordering::Relaxed);
+    slot.route.store(route.badge(), Ordering::Relaxed);
+    let route_identity = route.identity();
+    slot.route_domain.store(route_identity.domain, Ordering::Relaxed);
+    slot.route_generation.store(route_identity.domain_generation, Ordering::Relaxed);
+    slot.lane_index.store(route_identity.lane.index as u64, Ordering::Relaxed);
+    slot.lane_generation.store(route_identity.lane.generation, Ordering::Relaxed);
+    slot.tcb.store(ch.tcb, Ordering::Relaxed);
+    slot.reply.store(unsafe { runtime::current_reply(route).unwrap_or(0) }, Ordering::Relaxed);
+    slot.ssn.store(if ch.shared_va == 0 { 0 } else {
+        unsafe { core::ptr::read_volatile((ch.shared_va + crate::win32k_subsystem::SH_REQ_SSN) as *const u64) }
+    }, Ordering::Relaxed);
+    slot.client_pi.store(ch.client_pi, Ordering::Relaxed);
+    slot.client_generation.store(ch.client_generation, Ordering::Relaxed);
+    slot.provider_arrivals.store(0, Ordering::Relaxed);
+    slot.last_provider_at_100ns.store(0, Ordering::Relaxed);
+    slot.sequence.store(sequence, Ordering::Release);
+    Some((index, sequence))
+}
+
+pub(super) fn print_active_syscall_receive_census() {
+    for (index, slot) in ACTIVE_SYSCALL_SNAPSHOTS.iter().enumerate() {
+        let sequence = slot.sequence.load(Ordering::Acquire);
+        if sequence == 0 || sequence == SNAPSHOT_CLAIMED { continue; }
+        let values = [
+            slot.started_100ns.load(Ordering::Relaxed),
+            slot.domain.load(Ordering::Relaxed), slot.cookie.load(Ordering::Relaxed),
+            slot.route.load(Ordering::Relaxed),
+            slot.route_domain.load(Ordering::Relaxed),
+            slot.route_generation.load(Ordering::Relaxed),
+            slot.lane_index.load(Ordering::Relaxed),
+            slot.lane_generation.load(Ordering::Relaxed),
+            slot.tcb.load(Ordering::Relaxed),
+            slot.reply.load(Ordering::Relaxed), slot.ssn.load(Ordering::Relaxed),
+            slot.client_pi.load(Ordering::Relaxed),
+            slot.client_generation.load(Ordering::Relaxed),
+            slot.provider_arrivals.load(Ordering::Relaxed),
+            slot.last_provider_at_100ns.load(Ordering::Relaxed),
+        ];
+        if slot.sequence.load(Ordering::Acquire) != sequence { continue; }
+        crate::print_str(b"[pump-active-syscall] slot/sequence/start-100ns/domain/cookie/route/route-domain/route-gen/lane/lane-gen/tcb/reply/ssn/client-pi/client-gen/provider-arrivals/last-provider-100ns=");
+        crate::print_u64(index as u64);
+        crate::print_str(b"/"); crate::print_u64(sequence);
+        for value in values {
+            crate::print_str(b"/"); crate::print_u64(value);
+        }
+        crate::print_str(b"\n");
+    }
+    let overflow = ACTIVE_SYSCALL_SNAPSHOT_OVERFLOW.load(Ordering::Relaxed);
+    if overflow != 0 {
+        crate::print_str(b"[pump-active-syscall] snapshot-overflow=");
+        crate::print_u64(overflow);
+        crate::print_str(b"\n");
+    }
+}
+
 fn capture_active_irp_snapshot(ch: &PumpChannel, route: PeerRoute) -> Option<(usize, u64)> {
     let sequence = NEXT_IRP_SNAPSHOT.fetch_add(1, Ordering::Relaxed);
     if sequence == 0 || sequence == SNAPSHOT_CLAIMED {
@@ -225,6 +349,7 @@ struct ReceiveCensusScope {
     kind: ReqKind,
     retained_seh: bool,
     irp_snapshot: Option<(usize, u64)>,
+    syscall_snapshot: Option<(usize, u64)>,
 }
 
 impl ReceiveCensusScope {
@@ -233,6 +358,9 @@ impl ReceiveCensusScope {
         let irp_snapshot = if kind == ReqKind::Irp {
             capture_active_irp_snapshot(ch, route)
         } else { None };
+        let syscall_snapshot = if kind == ReqKind::Syscall {
+            capture_active_syscall_snapshot(ch, route)
+        } else { None };
         match kind {
             ReqKind::Irp => { ACTIVE_IRP_RECEIVES.fetch_add(1, Ordering::Relaxed); }
             ReqKind::Syscall => { ACTIVE_SYSCALL_RECEIVES.fetch_add(1, Ordering::Relaxed); }
@@ -240,14 +368,27 @@ impl ReceiveCensusScope {
         if retained_seh {
             ACTIVE_RETAINED_SEH_RECEIVES.fetch_add(1, Ordering::Relaxed);
         }
-        Self { kind, retained_seh, irp_snapshot }
+        Self { kind, retained_seh, irp_snapshot, syscall_snapshot }
     }
+}
+
+fn record_active_syscall_provider_arrival(scope: &ReceiveCensusScope) {
+    let Some((index, sequence)) = scope.syscall_snapshot else { return; };
+    let slot = &ACTIVE_SYSCALL_SNAPSHOTS[index];
+    if slot.sequence.load(Ordering::Acquire) != sequence { return; }
+    slot.provider_arrivals.fetch_add(1, Ordering::Relaxed);
+    slot.last_provider_at_100ns.store(crate::monotonic_time_100ns(), Ordering::Relaxed);
 }
 
 impl Drop for ReceiveCensusScope {
     fn drop(&mut self) {
         if let Some((index, sequence)) = self.irp_snapshot {
             let _ = ACTIVE_IRP_SNAPSHOTS[index].sequence.compare_exchange(
+                sequence, 0, Ordering::AcqRel, Ordering::Relaxed,
+            );
+        }
+        if let Some((index, sequence)) = self.syscall_snapshot {
+            let _ = ACTIVE_SYSCALL_SNAPSHOTS[index].sequence.compare_exchange(
                 sequence, 0, Ordering::AcqRel, Ordering::Relaxed,
             );
         }
@@ -422,7 +563,7 @@ unsafe fn inline_irq_work_pending() -> bool {
 pub(super) unsafe fn receive(
     ch: &PumpChannel, route: PeerRoute, retained_seh: bool, serviced_scheduler_yield: bool,
 ) -> PumpMessage {
-    let _census_scope = ReceiveCensusScope::enter(ch, route, retained_seh);
+    let census_scope = ReceiveCensusScope::enter(ch, route, retained_seh);
     // A retained exception walk and an ordinary syscall channel without kernel IRQ yield cannot
     // return a scheduler continuation. Give already-latched work one isolated pass here instead.
     let inline_irq_checkpoint =
@@ -720,10 +861,12 @@ pub(super) unsafe fn receive(
         }
         match arrival {
             Ok(runtime::Arrival::Hosted) => {
+                record_active_syscall_provider_arrival(&census_scope);
                 trace_ps_create_receive(ch, b"hosted-arrival", Some(route));
                 trace_ps_create_event(b"hosted-arrival", route, 0, 0);
             }
             Ok(runtime::Arrival::Call { route: sender, reply }) => {
+                record_active_syscall_provider_arrival(&census_scope);
                 trace_ps_create_receive(ch, b"call-arrival", Some(sender));
                 trace_ps_create_event(b"call-arrival", sender, reply, 0);
                 // The coordinator retains unrelated Calls for their exact source. Inspect only
