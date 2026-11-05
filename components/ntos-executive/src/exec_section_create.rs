@@ -168,6 +168,11 @@ impl ExecNtHandler {
                         }
                         (admission.capture, admission.metadata)
                     } else {
+                        // All native-routed Section creators transfer retained metadata here.
+                        // The fallback may query synchronously only on the inline Boot route.
+                        if !crate::mounted_volume::boot_inline_read_admitted(mount) {
+                            return Err(STATUS_INVALID_FILE_FOR_SECTION);
+                        }
                         let capture = crate::driver_launch::hosted_file_capture::capture(
                             file_id, device_id, access,
                         )?;
