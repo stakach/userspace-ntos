@@ -65,20 +65,28 @@ impl<P> CreateLookupQueue<P> {
             .is_some_and(|entry| entry.lookup.as_ref().is_some_and(|lookup| lookup.request().is_some()))
     }
 
+    fn phase(entry: &Entry<P>) -> &'static [u8] {
+        if entry.claimed.is_some() {
+            b"sector-entered"
+        } else if matches!(&entry.result, Some(Ok(CreateLookupFound::DeferredBoot))) {
+            b"deferred-boot"
+        } else if entry.result.is_some() {
+            b"resolved"
+        } else {
+            b"sector-ready"
+        }
+    }
+
+    pub fn phase_for(&self, irp: u64, mount: u64) -> Option<&'static [u8]> {
+        self.entries.iter().find(|entry| entry.irp == irp && entry.mount == mount)
+            .map(Self::phase)
+    }
+
     /// Read-only census of the oldest retained CREATE. A resolved or deferred entry has no
     /// claimable sector, even though it still owns a File IRP and can wake its caller.
     pub fn first_state(&self) -> Option<(u64, u64, &'static [u8])> {
         let entry = self.entries.first()?;
-        let phase = if entry.claimed.is_some() {
-            b"sector-entered".as_slice()
-        } else if matches!(&entry.result, Some(Ok(CreateLookupFound::DeferredBoot))) {
-            b"deferred-boot".as_slice()
-        } else if entry.result.is_some() {
-            b"resolved".as_slice()
-        } else {
-            b"sector-ready".as_slice()
-        };
-        Some((entry.irp, entry.mount, phase))
+        Some((entry.irp, entry.mount, Self::phase(entry)))
     }
 
     pub fn capture(&mut self, irp: u64, mount: u64, payload: P, lookup: FatPathLookup) -> Result<(), CreateLookupError> {
@@ -301,6 +309,7 @@ mod tests {
     fn resolved_root_retains_busy_retry_without_a_sector_claim() {
         let mut queue = CreateLookupQueue::new();
         queue.capture_resolved_root(12, 4, 81).unwrap();
+        assert_eq!(queue.phase_for(12, 4), Some(b"resolved".as_slice()));
         assert!(queue.claim_next().is_none());
         let resolved = queue.take_resolved().unwrap();
         assert_eq!(resolved.result, Ok(CreateLookupFound::Root));
@@ -314,6 +323,7 @@ mod tests {
         let mut queue = CreateLookupQueue::new();
         queue.capture_deferred_boot(21, 7, b"msgina.dll".to_vec()).unwrap();
         assert!(!queue.has_claimable_sector());
+        assert_eq!(queue.phase_for(21, 7), Some(b"deferred-boot".as_slice()));
         assert!(queue.claim_next().is_none());
         let resolved = queue.take_resolved().unwrap();
         assert_eq!(resolved.result, Ok(CreateLookupFound::DeferredBoot));
@@ -323,8 +333,10 @@ mod tests {
         assert_eq!(queue.activate_deferred_boot(21, 8, lookup()), Err(CreateLookupError::WrongClaim));
         queue.activate_deferred_boot(21, 7, lookup()).unwrap();
         assert!(queue.has_claimable_sector());
+        assert_eq!(queue.phase_for(21, 7), Some(b"sector-ready".as_slice()));
         let claim = queue.claim_next().unwrap();
         assert!(!queue.has_claimable_sector());
+        assert_eq!(queue.phase_for(21, 7), Some(b"sector-entered".as_slice()));
         assert_eq!((claim.irp, claim.mount), (21, 7));
         assert!(queue.claim_next().is_none());
     }

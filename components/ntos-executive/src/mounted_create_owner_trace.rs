@@ -118,6 +118,9 @@ pub(super) unsafe fn park_exact(
         crate::print_u64(identity.generation());
         crate::print_str(b" route=");
         crate::print_u64(route);
+        crate::print_str(b" lookup-phase=");
+        crate::print_str(mounted_volume::mounted_create_phase(irp, physical.value())
+            .unwrap_or(b"unavailable"));
         crate::print_str(b" t_ms=");
         crate::print_u64(parked_100ns / 10_000);
         crate::print_str(b" name-hash=");

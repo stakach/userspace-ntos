@@ -10178,7 +10178,11 @@ pub(crate) unsafe fn service_sec_image(
                 // IRQ-owned DPCs can publish the exact native IRP terminal. Observe and
                 // ACK it before sleeping; otherwise each sector waits for a timer wakeup.
                 if driver_launch::mounted_native_physical_irp_pending() {
-                    let _ = driver_launch::service_mounted_native_blocks();
+                    if service_mounted_native_blocks_and_redrive_backends() != 0 {
+                        let _ = driver_launch::pump_hosted_io_completions();
+                        let _ = pending_file_io_redrive_all(&mut nt_handler);
+                        let _ = file_cleanup_redrive_all(&mut nt_handler);
+                    }
                 }
                 let irq_durable_status = finalize_service_loop_state(&mut nt_handler);
                 if irq_durable_status != nt_fs::STATUS_SUCCESS {
@@ -26877,6 +26881,14 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
     progress
 }
 
+/// An exact native settlement may resolve a mounted backend after its first service pass.
+/// Admit one follow-up backend pass while all queue and provider borrows are released.
+fn service_mounted_native_blocks_and_redrive_backends() -> u64 {
+    let native_blocks = driver_launch::service_mounted_native_blocks() as u64;
+    if native_blocks == 0 { return 0; }
+    native_blocks.saturating_add(driver_launch::service_pending_file_backends() as u64)
+}
+
 // Callers execute DPCs before borrowing the handler and pass only the completed work count.
 unsafe fn pump_hosted_io_and_redrive_driver_starts(
     activated: u64,
@@ -26885,7 +26897,7 @@ unsafe fn pump_hosted_io_and_redrive_driver_starts(
     let retired = driver_launch::drain_hosted_file_retirements();
     let video_retired = crate::video_device::drain_video_file_retirements();
     let serviced = driver_launch::service_pending_file_backends() as u64;
-    let native_blocks = driver_launch::service_mounted_native_blocks() as u64;
+    let native_blocks = service_mounted_native_blocks_and_redrive_backends();
     let pumped = driver_launch::pump_hosted_io_completions() as u64;
     if crate::config_manager_take_device_action_wake() {
         nt_handler.pnp_signal_pending_action();

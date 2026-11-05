@@ -161,6 +161,11 @@ pub(crate) fn mounted_create_outstanding() -> bool {
             .is_some_and(|queue| queue.borrow().has_outstanding()) }
 }
 
+pub(crate) fn mounted_create_phase(irp: u64, mount: u64) -> Option<&'static [u8]> {
+    unsafe { (&*core::ptr::addr_of!(MOUNT_CREATE_QUEUE)).as_ref()?
+        .try_borrow().ok()?.phase_for(irp, mount) }
+}
+
 pub(crate) fn mounted_overlay_outstanding() -> bool {
     unsafe { (&*core::ptr::addr_of!(MOUNT_OVERLAY_QUEUE)).as_ref()
         .is_some_and(|queue| queue.borrow().has_outstanding()) }

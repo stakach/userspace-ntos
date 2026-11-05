@@ -296,12 +296,17 @@ fn native_completion_irq_polls_exact_physical_slot_before_receiving_again() {
     let branch = &irq[pure_irq..];
     let pending = branch.find("driver_launch::mounted_native_physical_irp_pending()")
         .expect("only an entered native command needs an IRQ completion poll");
-    let poll = branch.find("driver_launch::service_mounted_native_blocks()")
+    let poll = branch.find("service_mounted_native_blocks_and_redrive_backends()")
         .expect("publish and ACK the exact native completion on its IRQ");
     let receive = branch.find("component_recv!(fault_ep")
         .expect("root receives after the IRQ checkpoint");
     assert!(drain < pure_irq && pending < poll && poll < receive,
         "DPC completion must reach the native slot before root sleeps for another timer");
+    let helper = service.split_once("fn service_mounted_native_blocks_and_redrive_backends()")
+        .expect("shared native settlement helper").1;
+    assert!(helper.split_once("\n}").expect("helper end").0
+        .contains("driver_launch::service_mounted_native_blocks()"),
+        "the IRQ helper must retain exact physical slot settlement");
 }
 
 #[test]
