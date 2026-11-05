@@ -151,6 +151,7 @@ mod hosted_spawn_uncertainty;
 mod section_pagein_work;
 mod provider_section_map_work;
 mod native_image_pagein_work;
+mod routed_pagein_source;
 mod vm_lock_pagein_work;
 pub(crate) use fs_loader::*;
 mod hosted_bootstrap;

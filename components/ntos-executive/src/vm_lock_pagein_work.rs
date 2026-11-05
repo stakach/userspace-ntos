@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use nt_address_space::{vm_lock_continuation::VmLockPageContinuation,
     VmResidencyRangePlan, VmResidencySource};
-use nt_memory_manager::{GenericSectionView, RoutedSectionLease, SectionIdentity};
+use crate::routed_pagein_source::RoutedPageInSource;
 use nt_user_host::vm_lock_owner::VmLockInvocationOwner;
 
 const RESOURCES: u32 = nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
@@ -15,18 +15,11 @@ const CANCELLED: u32 = 0xc000_0120;
 const RETRY_DELAY: u64 = 1_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum VmLockPageSource {
-    Mapped { section: SectionIdentity, view: GenericSectionView, lease: RoutedSectionLease },
-    Image { view: exec_handler::native_image_view::NativeImageViewDescriptor,
-        lease: RoutedSectionLease },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase { Scan, Waiting, ReadyReply(u32), ReplyEntered, ReplySent, Cancel, RetypeReply, Done, Indeterminate }
 
 struct Work {
     owner: VmLockInvocationOwner,
-    progress: VmLockPageContinuation<VmLockInvocationOwner, VmLockPageSource, u64>,
+    progress: VmLockPageContinuation<VmLockInvocationOwner, RoutedPageInSource, u64>,
     range: VmResidencyRangePlan,
     map_type: u32,
     base_pointer: u64,
@@ -123,7 +116,7 @@ fn valid(handler: &ExecNtHandler, work: &Work) -> bool {
 /// A page worker reports only after its own exact terminal/copy/ACK and target map proof.
 /// It never consumes or replies through the coordinator's original syscall Reply.
 pub(crate) unsafe fn page_completed(
-    token: u64, target_pi: usize, page: u64, source: VmLockPageSource, status: u32,
+    token: u64, target_pi: usize, page: u64, source: RoutedPageInSource, status: u32,
 ) -> bool {
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
     let mut found = None;

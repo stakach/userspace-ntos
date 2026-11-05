@@ -93,7 +93,7 @@ pub(crate) unsafe fn submit(
 pub(crate) unsafe fn submit_for_vm_lock(
     handler: &mut ExecNtHandler, caller_pi: usize, target_pi: usize,
     page: u64, access: nt_address_space::FaultAccess, reply: u64, token: u64,
-) -> Result<crate::vm_lock_pagein_work::VmLockPageSource, u32> {
+) -> Result<crate::routed_pagein_source::RoutedPageInSource, u32> {
     submit_owned(handler, target_pi, page, access,
         Purpose::VmLock { token, caller_pi }, reply)
 }
@@ -101,7 +101,7 @@ pub(crate) unsafe fn submit_for_vm_lock(
 unsafe fn submit_owned(
     handler: &mut ExecNtHandler, pi: usize, page: u64,
     access: nt_address_space::FaultAccess, purpose: Purpose, reply: u64,
-) -> Result<crate::vm_lock_pagein_work::VmLockPageSource, u32> {
+) -> Result<crate::routed_pagein_source::RoutedPageInSource, u32> {
     let _durable = allocator::enter_durable();
     let ctx = handler.loop_ctx.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
     let table = &*ctx.generic_sections;
@@ -201,7 +201,7 @@ unsafe fn submit_owned(
     }
     if let Some(park) = park { park.commit(); }
     NEXT.store(monotonic_time_100ns(), Ordering::Release);
-    Ok(crate::vm_lock_pagein_work::VmLockPageSource::Mapped { section, view, lease })
+    Ok(crate::routed_pagein_source::RoutedPageInSource::Mapped { section, view, lease })
 }
 
 pub(crate) fn has_thread(tid: u64) -> bool {
@@ -698,7 +698,7 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
             }
             if let Purpose::VmLock { token, .. } = work.purpose {
                 if crate::vm_lock_pagein_work::page_completed(token, work.pi, work.page,
-                    crate::vm_lock_pagein_work::VmLockPageSource::Mapped {
+                    crate::routed_pagein_source::RoutedPageInSource::Mapped {
                         section: work.section, view: work.view, lease: work.lease,
                     }, 0) {
                     return true;
@@ -737,7 +737,7 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
         Phase::Cancel => {
             if let Purpose::VmLock { token, .. } = work.purpose {
                 if crate::vm_lock_pagein_work::page_completed(token, work.pi, work.page,
-                    crate::vm_lock_pagein_work::VmLockPageSource::Mapped {
+                    crate::routed_pagein_source::RoutedPageInSource::Mapped {
                         section: work.section, view: work.view, lease: work.lease,
                     }, work.failure.unwrap_or(nt_address_space::STATUS_ACCESS_VIOLATION)) {
                     return true;

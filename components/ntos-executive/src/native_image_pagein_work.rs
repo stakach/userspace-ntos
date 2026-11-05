@@ -308,11 +308,11 @@ pub(crate) unsafe fn submit_syscall_copy(
 pub(crate) unsafe fn submit_for_vm_lock(
     handler: &mut ExecNtHandler, caller_pi: usize, target_pi: usize,
     page: u64, access: FaultAccess, reply: u64, token: u64,
-) -> Result<Option<crate::vm_lock_pagein_work::VmLockPageSource>, u32> {
+) -> Result<Option<crate::routed_pagein_source::RoutedPageInSource>, u32> {
     let Some(work) = prepare_page(handler, target_pi, page, access,
         ImageFaultObservation::CopyAccess, Purpose::VmLock { token, caller_pi }, reply, true)?
     else { return Ok(None); };
-    let source = crate::vm_lock_pagein_work::VmLockPageSource::Image {
+    let source = crate::routed_pagein_source::RoutedPageInSource::Image {
         view: work.view, lease: work.lease,
     };
     install_work(work, true)?;
@@ -677,7 +677,7 @@ unsafe fn advance(
             work.phase = Phase::ReplyEntered;
             if let Purpose::VmLock { token, .. } = work.purpose {
                 if crate::vm_lock_pagein_work::page_completed(token, work.pi, work.page,
-                    crate::vm_lock_pagein_work::VmLockPageSource::Image {
+                    crate::routed_pagein_source::RoutedPageInSource::Image {
                         view: work.view, lease: work.lease,
                     }, 0) {
                     return true;
@@ -727,7 +727,7 @@ unsafe fn advance(
         Phase::Cancel => {
             if let Purpose::VmLock { token, .. } = work.purpose {
                 if crate::vm_lock_pagein_work::page_completed(token, work.pi, work.page,
-                    crate::vm_lock_pagein_work::VmLockPageSource::Image {
+                    crate::routed_pagein_source::RoutedPageInSource::Image {
                         view: work.view, lease: work.lease,
                     }, work.failure.unwrap_or(INVALID)) {
                     return true;
