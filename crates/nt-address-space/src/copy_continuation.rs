@@ -16,7 +16,7 @@ enum Phase<Source, Irp> {
         acknowledged: bool,
     },
     OutputReady(CopyResult),
-    OutputEntered(CopyResult),
+    OutputPublishing(CopyResult),
     ReplyReady(CopyResult),
     ReplyEntered,
 }
@@ -36,6 +36,9 @@ pub struct VmCopyContinuation<Caller, Target, Source, Irp> {
     staged_bytes: [u8; COPY_CHUNK_SIZE],
     probe_cursor: Option<u64>,
     probe_entered: bool,
+    output_offset: usize,
+    output_entered: bool,
+    output_bytes: [u8; 8],
     phase: Phase<Source, Irp>,
 }
 
@@ -63,6 +66,9 @@ impl<Caller: Copy + Eq, Target: Copy + Eq, Source: Copy + Eq, Irp: Copy + Eq>
             staged_bytes: [0; COPY_CHUNK_SIZE],
             probe_cursor: (length != 0).then_some(destination_address),
             probe_entered: false,
+            output_offset: 0,
+            output_entered: false,
+            output_bytes: [0; 8],
             phase: Phase::Ready,
         }
     }
@@ -288,6 +294,7 @@ impl<Caller: Copy + Eq, Target: Copy + Eq, Source: Copy + Eq, Irp: Copy + Eq>
             status,
             transferred: self.transferred,
         });
+        self.output_bytes = self.transferred.to_le_bytes();
         true
     }
 
@@ -303,6 +310,7 @@ impl<Caller: Copy + Eq, Target: Copy + Eq, Source: Copy + Eq, Irp: Copy + Eq>
             status,
             transferred: self.transferred,
         });
+        self.output_bytes = self.transferred.to_le_bytes();
         true
     }
 
@@ -318,6 +326,7 @@ impl<Caller: Copy + Eq, Target: Copy + Eq, Source: Copy + Eq, Irp: Copy + Eq>
             status,
             transferred: self.transferred,
         });
+        self.output_bytes = self.transferred.to_le_bytes();
         true
     }
 
@@ -331,23 +340,70 @@ impl<Caller: Copy + Eq, Target: Copy + Eq, Source: Copy + Eq, Irp: Copy + Eq>
         Some((self.count_pointer, result.transferred))
     }
 
-    /// Once the count write may have entered, the same write must not be retried uncertainly.
-    pub fn enter_output(&mut self, caller: Caller, target: Target) -> bool {
-        if !self.exact_owner(caller, target) {
+    pub fn next_output_chunk(&self, caller: Caller, target: Target) -> Option<(u64, &[u8])> {
+        if !self.exact_owner(caller, target) || self.count_pointer == 0
+            || self.output_entered || self.output_offset >= self.output_bytes.len()
+            || !matches!(self.phase, Phase::OutputReady(_) | Phase::OutputPublishing(_))
+        {
+            return None;
+        }
+        let address = self.count_pointer.checked_add(self.output_offset as u64)?;
+        let length = (self.output_bytes.len() - self.output_offset)
+            .min((PAGE_SIZE - address % PAGE_SIZE) as usize);
+        address.checked_add(length as u64)?;
+        Some((address, &self.output_bytes[self.output_offset..self.output_offset + length]))
+    }
+
+    /// Enter a page-contained count write before the native effect. An uncertain write cannot
+    /// be replayed, including when a SIZE_T output straddles two pages.
+    pub fn enter_output_page(&mut self, caller: Caller, target: Target, address: u64) -> bool {
+        if self.next_output_chunk(caller, target).map(|(next, _)| next) != Some(address) {
             return false;
         }
-        let Phase::OutputReady(result) = self.phase else {
+        if let Phase::OutputReady(result) = self.phase {
+            self.phase = Phase::OutputPublishing(result);
+        }
+        self.output_entered = true;
+        true
+    }
+
+    pub fn output_page_completed(&mut self, caller: Caller, target: Target, address: u64) -> bool {
+        if !self.exact_owner(caller, target) || !self.output_entered
+            || !matches!(self.phase, Phase::OutputPublishing(_))
+        {
+            return false;
+        }
+        let Some(expected) = self.count_pointer.checked_add(self.output_offset as u64) else {
             return false;
         };
-        self.phase = Phase::OutputEntered(result);
+        if expected != address {
+            return false;
+        }
+        let length = (self.output_bytes.len() - self.output_offset)
+            .min((PAGE_SIZE - address % PAGE_SIZE) as usize);
+        self.output_offset += length;
+        self.output_entered = false;
         true
     }
 
     pub fn output_published(&mut self, caller: Caller, target: Target) -> bool {
-        if !self.exact_owner(caller, target) {
+        if !self.exact_owner(caller, target) || self.count_pointer == 0
+            || self.output_offset != self.output_bytes.len() || self.output_entered
+        {
             return false;
         }
-        let Phase::OutputEntered(result) = self.phase else {
+        let Phase::OutputPublishing(result) = self.phase else {
+            return false;
+        };
+        self.phase = Phase::ReplyReady(result);
+        true
+    }
+
+    pub fn skip_null_output(&mut self, caller: Caller, target: Target) -> bool {
+        if !self.exact_owner(caller, target) || self.count_pointer != 0 {
+            return false;
+        }
+        let Phase::OutputReady(result) = self.phase else {
             return false;
         };
         self.phase = Phase::ReplyReady(result);

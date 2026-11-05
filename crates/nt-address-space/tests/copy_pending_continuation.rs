@@ -89,9 +89,10 @@ fn foreign_copy_retains_reply_progress_and_exact_pending_page_owner() {
     assert_eq!(copy.output_to_publish(caller, target), Some((count_pointer, 0x30)));
     assert!(copy.enter_reply(caller, target).is_none(),
         "the count output must be published before replying");
-    assert!(copy.enter_output(caller, target));
-    assert!(!copy.enter_output(caller, target),
+    assert!(copy.enter_output_page(caller, target, count_pointer));
+    assert!(!copy.enter_output_page(caller, target, count_pointer),
         "an uncertain count write must not be replayed");
+    assert!(copy.output_page_completed(caller, target, count_pointer));
     assert!(copy.output_published(caller, target));
     assert_eq!(copy.enter_reply(caller, target), Some((caller, CopyResult {
         status: 0,
@@ -119,7 +120,8 @@ fn terminal_page_error_publishes_only_completed_prefix_once() {
     assert!(copy.acknowledge_pending(caller, target, 0x10, section, 9));
     assert!(copy.fail_pending(caller, target, 0x10, section, 9, STATUS_PARTIAL_COPY));
     assert_eq!(copy.output_to_publish(caller, target), Some((0x8ff8, 0x10)));
-    assert!(copy.enter_output(caller, target));
+    assert!(copy.enter_output_page(caller, target, 0x8ff8));
+    assert!(copy.output_page_completed(caller, target, 0x8ff8));
     assert!(copy.output_published(caller, target));
     assert_eq!(copy.enter_reply(caller, target), Some((caller, CopyResult {
         status: STATUS_PARTIAL_COPY,
