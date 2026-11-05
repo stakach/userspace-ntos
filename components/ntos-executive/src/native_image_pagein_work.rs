@@ -2,10 +2,14 @@
 
 use crate::*;
 use alloc::vec::Vec;
+use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use nt_address_space::{FaultAccess, ImageFaultObservation};
 use nt_io_manager::{DeviceId, ExternalDispatchResult, FileId, IoParameters, ReadWriteParameters};
 use nt_memory_manager::image_section::ImageAreaId;
+use nt_memory_manager::image_source_page::{
+    routed_source_read_decision, RoutedSourceReadDecision,
+};
 use nt_memory_manager::routed_image_read::RoutedImageRead;
 use nt_memory_manager::RoutedSectionLease;
 use nt_pe_loader::{ImagePageFileSpan, ImagePageFillCapture};
@@ -74,12 +78,28 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static EXECUTING_TID: AtomicU64 = AtomicU64::new(0);
 static EXECUTING_PI: AtomicU64 = AtomicU64::new(u64::MAX);
 static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
+// The active row is temporarily absent from WORK while redrive can pump a provider.
+// Keep its exact source key visible to a nested fault admission until it is reinserted.
+static mut EXECUTING_SOURCE: Option<(ImageAreaId, u32, Phase)> = None;
 static NEXT: AtomicU64 = AtomicU64::new(0);
+static UNREADY_FAULT_TRACE: AtomicU64 = AtomicU64::new(0);
 
 fn has_source_producer(area: ImageAreaId, rva: u32) -> bool {
+    unsafe {
+        (&*core::ptr::addr_of!(EXECUTING_SOURCE))
+            .is_some_and(|(active_area, active_rva, phase)|
+                active_area == area && active_rva == rva
+                    && matches!(phase, Phase::Read | Phase::Publish))
+            || (&*core::ptr::addr_of!(WORK)).iter().flatten().any(|row|
+                row.view.view.area() == area && row.rva == rva
+                    && matches!(row.phase, Phase::Read | Phase::Publish))
+    }
+}
+
+fn has_uncertain_source_owner(area: ImageAreaId, rva: u32) -> bool {
     unsafe { (&*core::ptr::addr_of!(WORK)).iter().flatten().any(|row|
         row.view.view.area() == area && row.rva == rva
-            && matches!(row.phase, Phase::Read | Phase::Publish)) }
+            && matches!(row.phase, Phase::Indeterminate)) }
 }
 
 unsafe fn prepare_page(
@@ -96,12 +116,34 @@ unsafe fn prepare_page(
     let rva = view.section_offset.checked_add(page - view.base)
         .and_then(|offset| u32::try_from(offset).ok()).ok_or(INVALID)?;
     let existing = crate::native_image_residency::has_source_row(view.view.area(), rva);
-    if matches!(purpose, Purpose::Fault) && existing { return Ok(None); }
+    let source_ready = crate::native_image_residency::source_page_ready(view.view.area(), rva);
+    let producer = has_source_producer(view.view.area(), rva);
+    let uncertain = has_uncertain_source_owner(view.view.area(), rva);
+    let decision = routed_source_read_decision(existing, source_ready, producer, uncertain);
+    if matches!(purpose, Purpose::Fault) && existing && !source_ready {
+        let sequence = UNREADY_FAULT_TRACE.fetch_add(1, Ordering::Relaxed);
+        if sequence < 16 || sequence.is_power_of_two() {
+            let mut record = nt_printf::record::RecordBuffer::<320>::new();
+            let _ = writeln!(record,
+                "[native-image-pagein] unready fault area={:?} rva=0x{:x} state={:?} producer={} page=0x{:x}",
+                view.view.area(), rva,
+                crate::native_image_residency::source_page_state(view.view.area(), rva),
+                producer, page);
+            sel4_rt::print_record(if record.overflowed() {
+                b"[native-image-pagein] unready fault trace truncated\n"
+            } else { record.bytes() });
+        }
+    }
+    if matches!(purpose, Purpose::Fault)
+        && decision == RoutedSourceReadDecision::Ready
+    { return Ok(None); }
     if matches!(purpose, Purpose::NtQuerySystemInformation(_))
-        && (crate::native_image_residency::source_page_ready(view.view.area(), rva)
+        && (source_ready
             || crate::native_image_residency::has_private_page(view, page))
     { return Ok(None); }
-    if existing && !parked && !has_source_producer(view.view.area(), rva) {
+    if existing && !parked && matches!(purpose, Purpose::NtQuerySystemInformation(_))
+        && !producer
+    {
         // A retained synchronous source initializer has no asynchronous producer here.
         // The canonical probe owns its result; a second File READ would be a replay.
         return Ok(None);
@@ -132,7 +174,9 @@ unsafe fn prepare_page(
         pi, tid, badge: handler.current_badge, reply, logical, view, page, rva, access,
         observation, info, lease, origin_driver, capture: Some(capture),
         fill: ImagePageFillCapture::new(plan), span: None, read: None,
-        phase: if existing { Phase::AwaitSource } else { Phase::Read },
+        phase: if decision == RoutedSourceReadDecision::EnterRead {
+            Phase::Read
+        } else { Phase::AwaitSource },
         failure: None, failure_logged: false, cancel_requested: false,
         purpose, progress: nt_syscall::system_information::QueryOutputContinuation::PageReady,
     }))
@@ -438,15 +482,23 @@ unsafe fn advance(
     match work.phase {
         Phase::AwaitSource => {
             if cancelled { work.phase = Phase::Cancel; }
-            else if crate::native_image_residency::source_page_ready(work.view.view.area(), work.rva) {
-                work.phase = Phase::MapPage;
-            } else if !crate::native_image_residency::has_source_row(work.view.view.area(), work.rva) {
-                work.phase = Phase::Read;
-            } else if !has_source_producer(work.view.view.area(), work.rva) {
-                // A retained or quarantined synchronous initializer has no known redriver.
-                // Keep both source and original Reply; never submit a duplicate File READ.
-                work.failure = Some(RESOURCES);
-                work.phase = Phase::Indeterminate;
+            else {
+                let area = work.view.view.area();
+                match routed_source_read_decision(
+                    crate::native_image_residency::has_source_row(area, work.rva),
+                    crate::native_image_residency::source_page_ready(area, work.rva),
+                    has_source_producer(area, work.rva),
+                    has_uncertain_source_owner(area, work.rva),
+                ) {
+                    RoutedSourceReadDecision::Ready => work.phase = Phase::MapPage,
+                    RoutedSourceReadDecision::EnterRead => work.phase = Phase::Read,
+                    RoutedSourceReadDecision::AwaitProducer => {},
+                    RoutedSourceReadDecision::RetainUncertain => {
+                        // No exact producer can complete the source. Keep the original Reply.
+                        work.failure = Some(RESOURCES);
+                        work.phase = Phase::Indeterminate;
+                    }
+                }
             }
             false
         }
@@ -645,6 +697,8 @@ pub(crate) unsafe fn redrive(
         EXECUTING_INDEX.store(index as u64, Ordering::Release);
         EXECUTING_TID.store(work.tid, Ordering::Release);
         EXECUTING_PI.store(work.pi as u64, Ordering::Release);
+        *core::ptr::addr_of_mut!(EXECUTING_SOURCE) =
+            Some((work.view.view.area(), work.rva, work.phase));
         let (resume_ip, sp, flags, transport, service) = match work.purpose {
             Purpose::Fault => (0, 0, 0, false, 0),
             Purpose::NtQuerySystemInformation(call) =>
@@ -678,6 +732,7 @@ pub(crate) unsafe fn redrive(
             }
         });
         if !done { (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work); }
+        *core::ptr::addr_of_mut!(EXECUTING_SOURCE) = None;
         EXECUTING_TID.store(0, Ordering::Release);
         EXECUTING_PI.store(u64::MAX, Ordering::Release);
         EXECUTING_INDEX.store(u64::MAX, Ordering::Release);

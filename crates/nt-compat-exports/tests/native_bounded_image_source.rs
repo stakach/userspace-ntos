@@ -184,6 +184,26 @@ fn syscall_output_copy_waits_for_routed_image_page_before_dispatch() {
 }
 
 #[test]
+fn routed_hardware_fault_does_not_fall_through_on_an_unready_source_row() {
+    use nt_memory_manager::image_source_page::ImageSourcePage;
+
+    let row = ImageSourcePage::new((7u64, 0x11000u32));
+    assert!(row.ready_frame().is_none(),
+        "a retained source row is not proof that its physical frame is ready");
+
+    let worker = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/ntos-executive/src/native_image_pagein_work.rs"),
+    ).unwrap();
+    assert!(!worker.contains("if matches!(purpose, Purpose::Fault) && existing { return Ok(None); }"),
+        "an unready routed row must stay retained; synchronous fallback can re-enter a pending File READ");
+    assert!(worker.contains("static mut EXECUTING_SOURCE")
+        && worker.contains("addr_of!(EXECUTING_SOURCE)")
+        && worker.contains("addr_of_mut!(EXECUTING_SOURCE)"),
+        "a producer removed from WORK during provider pumping must remain visible to a second fault");
+}
+
+#[test]
 fn cancelled_dll_page_read_keeps_exact_key_through_copy_and_ack() {
     use nt_memory_manager::routed_image_read::RoutedImageRead;
 

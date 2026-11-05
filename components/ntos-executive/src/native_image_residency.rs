@@ -179,6 +179,14 @@ pub(crate) unsafe fn source_page_ready(area: ImageAreaId, rva: u32) -> bool {
             && !row.retiring && !row.revoke_acked && row.owner.ready_frame().is_some())
 }
 
+pub(crate) unsafe fn source_page_state(
+    area: ImageAreaId, rva: u32,
+) -> Option<nt_memory_manager::image_source_page::ImageSourcePageState> {
+    (&*core::ptr::addr_of!(SOURCES)).iter()
+        .find(|row| row.owner.descriptor() == SourceKey { area, rva })
+        .map(|row| row.owner.state())
+}
+
 pub(crate) unsafe fn has_private_page(view: NativeImageViewDescriptor, page: u64) -> bool {
     (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).get(view.pi as u64, page)
         .is_some_and(|record| record.is_resident() && record.owns_frame
