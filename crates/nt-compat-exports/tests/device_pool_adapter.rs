@@ -32,6 +32,10 @@ unsafe fn hosted_pool_used(pool_view_base: u64) -> u64 {
     (&*(pool_view_base as *const AtomicU64)).load(Ordering::Acquire)
 }
 
+// The production allocator reports this through the executive's bounded serial trace.
+// This host fixture supplies the same boundary while exercising the native graph logic.
+unsafe fn trace_hosted_dma_private_pool_failure(_: DriverInstance, _: u64) {}
+
 #[derive(Clone, Copy)]
 struct DriverInstance {
     used: bool,
