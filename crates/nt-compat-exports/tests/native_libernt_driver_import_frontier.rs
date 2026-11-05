@@ -593,6 +593,24 @@ fn pinned_dxg_contiguous_release_uses_exact_physical_allocation_owner() {
 }
 
 #[test]
+fn pinned_virtual_context_retains_exact_provider_allocation_through_miniport_callback() {
+    let source = include_str!(
+        "../../../components/ntos-executive/src/hosted_dxg_registration/device/context.rs");
+    let compact: String = source.split_whitespace().collect();
+    assert!(compact.contains("runtime_guard:Option<StartOutputGuard>"),
+        "virtual runtime context needs a retained provider allocation owner");
+    assert!(compact.contains("StartOutputGuard::capture(provider_inst,record.provider_domain,")
+        && compact.contains("layout.runtime_context(),1,provider_fdo_allocation"),
+        "capture the exact runtime context before entering the miniport");
+    assert!(compact.contains("runtime_guard.as_ref().map_or(0,|guard|guard.allocation.pool_generation)"),
+        "the context key must use the captured provider allocation generation");
+    assert!(compact.contains("DxgContextAliasKey::new(device_key,layout.runtime_context(),runtime_generation,"),
+        "a virtual context cannot publish a numeric token with generation zero");
+    assert!(compact.contains("runtime_guard.as_ref().is_none_or(|guard|guard.live(provider_inst,record.provider_domain))"),
+        "revalidate provider context identity across the dependent callback");
+}
+
+#[test]
 fn pinned_gpuva_uncached_page_tables_keep_native_source_and_alias_uncached() {
     let component = include_str!(
         "../../../components/ntos-executive/src/hosted_driver_contiguous_memory.rs");

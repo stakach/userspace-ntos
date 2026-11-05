@@ -1,4 +1,4 @@
-//! Exact system-context cookie projection beneath a live miniport device.
+//! Exact system and virtual-context cookie projection beneath a live miniport device.
 
 use super::*;
 use nt_hosted_runtime::{DxgContextAliasKey, DxgContextCookieRetirement,
@@ -6,11 +6,20 @@ use nt_hosted_runtime::{DxgContextAliasKey, DxgContextCookieRetirement,
 
 pub(super) struct DxgContextAlias {
     request_guard: Option<DxgQueryOutputGuard>,
+    runtime_guard: Option<StartOutputGuard>,
     kmd_guard: Option<StartOutputGuard>,
     key: Option<DxgContextAliasKey>,
     free_route: Option<nt_component_suspension::peer_registry::PeerRoute>,
     retirement: Option<DxgContextCookieRetirement>,
     destroy_entered: bool,
+}
+
+impl DxgContextAlias {
+    fn retain_uncertain(&self) {
+        if let Some(guard) = self.request_guard.as_ref() { guard.retain_uncertain(); }
+        if let Some(guard) = self.runtime_guard.as_ref() { guard.retain_uncertain(); }
+        if let Some(guard) = self.kmd_guard.as_ref() { guard.retain_uncertain(); }
+    }
 }
 
 pub(crate) unsafe fn create(
@@ -56,6 +65,8 @@ pub(crate) unsafe fn create(
     let authority = alias.authority.ok_or(STATUS_INVALID_PARAMETER)?;
     let device_key = alias.devices[device_index].key.ok_or(STATUS_INVALID_PARAMETER)?;
     let device_guard = alias.devices[device_index].kmd_guard.as_ref().unwrap();
+    let provider_fdo_allocation = alias.provider_fdo_allocation;
+    let provider_fdo = alias.provider_fdo;
     if instance_domain_identity(provider_inst) != Some(record.provider_domain)
         || instance_domain_identity(dependent_inst) != Some(record.dependent_domain)
         || hosted_device_allocations::capture_allocation(dependent_inst, alias.context).ok()
@@ -71,7 +82,7 @@ pub(crate) unsafe fn create(
     { return Err(STATUS_INVALID_PARAMETER); }
     provider_callback_marshal_window(marshal_window, 0x48, 0)?;
     let request_guard = DxgQueryOutputGuard::capture(provider_inst, record.provider_domain,
-        provider_request, 0x48, alias.provider_fdo_allocation, alias.provider_fdo)?;
+        provider_request, 0x48, provider_fdo_allocation, provider_fdo)?;
     let request_exec = component_to_exec_va_for_instance(record.provider_instance,
         provider_inst, provider_request, 0x48).ok_or(STATUS_INVALID_PARAMETER)?;
     if !request_guard.live(provider_inst, record.provider_domain) {
@@ -80,6 +91,14 @@ pub(crate) unsafe fn create(
     let request = core::slice::from_raw_parts(request_exec as *const u8, 0x48);
     let layout = DxgCreateContextLayout::parse(record.callback_version,
         request, marshal_window.capacity).ok_or(STATUS_NOT_SUPPORTED)?;
+    // Reserve the retained owner before taking another pool pin. From capture to push there
+    // are no fallible operations that could drop a pin receipt without a row to retry it.
+    pdo_aliases_mut()[alias_index].devices[device_index].contexts.try_reserve(1)
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    let runtime_guard = if layout.runtime_context() != 0 {
+        Some(StartOutputGuard::capture(provider_inst, record.provider_domain,
+            layout.runtime_context(), 1, provider_fdo_allocation, provider_fdo)?)
+    } else { None };
     let mut original = [0u8; 0x48];
     original.copy_from_slice(request);
     copy_bytes(marshal_window.exec_base, request_exec, 0x48);
@@ -87,10 +106,8 @@ pub(crate) unsafe fn create(
         marshal_window.exec_base as *mut u8, 0x48);
     dependent_request[..8].fill(0);
     dependent_request[0x24..0x44].fill(0);
-    pdo_aliases_mut()[alias_index].devices[device_index].contexts.try_reserve(1)
-        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
     pdo_aliases_mut()[alias_index].devices[device_index].contexts.push(DxgContextAlias {
-        request_guard: Some(request_guard), kmd_guard: None, key: None,
+        request_guard: Some(request_guard), runtime_guard, kmd_guard: None, key: None,
         free_route: None, retirement: None, destroy_entered: false,
     });
     pdo_aliases_mut()[alias_index].blocked = true;
@@ -102,25 +119,50 @@ pub(crate) unsafe fn create(
         Ok(result) => result,
         Err(status) => {
             pdo_aliases_mut()[alias_index].devices[device_index].contexts[context_index]
-                .request_guard.as_ref().unwrap().retain_uncertain();
+                .retain_uncertain();
             return Err(status);
         }
     };
+    let context = &pdo_aliases_mut()[alias_index].devices[device_index]
+        .contexts[context_index];
+    if !context.runtime_guard.as_ref().is_none_or(|guard|
+            guard.live(provider_inst, record.provider_domain)) {
+        context.retain_uncertain();
+        return Err(STATUS_INVALID_PARAMETER);
+    }
     if (result as u32 as i32) < 0 {
         pdo_aliases_mut()[alias_index].devices[device_index].contexts[context_index]
-            .request_guard.as_ref().unwrap().retain_uncertain();
+            .retain_uncertain();
         return Ok(result);
     }
     let returned = core::slice::from_raw_parts(marshal_window.exec_base as *const u8, 0x48);
     let kmd_context = read_unaligned(marshal_window.exec_base as *const u64);
-    if kmd_context == 0 { return Err(STATUS_INVALID_PARAMETER); }
-    let kmd_guard = StartOutputGuard::capture(dependent_inst, record.dependent_domain,
-        kmd_context, 1, alias.provider_fdo_allocation, alias.provider_fdo)?;
-    let key = DxgContextAliasKey::new(device_key, layout.runtime_context(), 0,
-        kmd_context, kmd_guard.allocation.pool_generation)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+    if kmd_context == 0 {
+        pdo_aliases_mut()[alias_index].devices[device_index].contexts[context_index]
+            .retain_uncertain();
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let kmd_guard = match StartOutputGuard::capture(dependent_inst, record.dependent_domain,
+        kmd_context, 1, provider_fdo_allocation, provider_fdo) {
+        Ok(guard) => guard,
+        Err(status) => {
+            pdo_aliases_mut()[alias_index].devices[device_index].contexts[context_index]
+                .retain_uncertain();
+            return Err(status);
+        }
+    };
+    let runtime_generation = pdo_aliases_mut()[alias_index].devices[device_index]
+        .contexts[context_index].runtime_guard.as_ref().map_or(0, |guard| guard.allocation.pool_generation);
+    let key = DxgContextAliasKey::new(device_key, layout.runtime_context(),
+        runtime_generation,
+        kmd_context, kmd_guard.allocation.pool_generation);
     pdo_aliases_mut()[alias_index].devices[device_index].contexts[context_index]
         .kmd_guard = Some(kmd_guard);
+    let Some(key) = key else {
+        pdo_aliases_mut()[alias_index].devices[device_index].contexts[context_index]
+            .retain_uncertain();
+        return Err(STATUS_INVALID_PARAMETER);
+    };
     pdo_aliases_mut()[alias_index].devices[device_index].contexts[context_index]
         .key = Some(key);
     if pdo_aliases_mut().iter().enumerate().any(|(other_alias, alias)| {
@@ -135,19 +177,19 @@ pub(crate) unsafe fn create(
     }) {
         let context = &pdo_aliases_mut()[alias_index].devices[device_index]
             .contexts[context_index];
-        context.request_guard.as_ref().unwrap().retain_uncertain();
-        context.kmd_guard.as_ref().unwrap().retain_uncertain();
+        context.retain_uncertain();
         return Err(STATUS_INVALID_PARAMETER);
     }
     if !layout.copyback(&mut original, returned) {
+        pdo_aliases_mut()[alias_index].devices[device_index].contexts[context_index]
+            .retain_uncertain();
         return Err(STATUS_INVALID_PARAMETER);
     }
     let context = &mut pdo_aliases_mut()[alias_index].devices[device_index]
         .contexts[context_index];
     if let Err(status) = context.request_guard.as_ref().unwrap().write_bytes(
         record.provider_instance, provider_inst, record.provider_domain, &original) {
-        context.request_guard.as_ref().unwrap().retain_uncertain();
-        context.kmd_guard.as_ref().unwrap().retain_uncertain();
+        context.retain_uncertain();
         return Err(status);
     }
     context.request_guard.as_mut().unwrap().release()?;
@@ -216,6 +258,9 @@ pub(crate) unsafe fn destroy(
             .live(dependent_inst, record.dependent_domain)
         || !alias.devices[device_index].contexts[context_index]
             .kmd_guard.as_ref().unwrap().live(dependent_inst, record.dependent_domain)
+        || !alias.devices[device_index].contexts[context_index]
+            .runtime_guard.as_ref().is_none_or(|guard|
+                guard.live(provider_inst, record.provider_domain))
     { return Err(STATUS_INVALID_PARAMETER); }
     let route = hosted_ingress_sources::primary_route(record.dependent_instance)
         .ok_or(STATUS_DEVICE_NOT_READY)?;
@@ -239,8 +284,19 @@ pub(crate) unsafe fn destroy(
         [0; PROVIDER_CALLBACK_STACK_QWORDS]);
     pdo_aliases_mut()[alias_index].devices[device_index].contexts[context_index]
         .retirement.as_mut().unwrap().close_callback_interval();
-    let result = outcome?;
-    if (result as u32 as i32) < 0 { return Ok(result); }
+    let result = match outcome {
+        Ok(result) => result,
+        Err(status) => {
+            pdo_aliases_mut()[alias_index].devices[device_index].contexts[context_index]
+                .retain_uncertain();
+            return Err(status);
+        }
+    };
+    if (result as u32 as i32) < 0 {
+        pdo_aliases_mut()[alias_index].devices[device_index].contexts[context_index]
+            .retain_uncertain();
+        return Ok(result);
+    }
     let context = &mut pdo_aliases_mut()[alias_index].devices[device_index]
         .contexts[context_index];
     let retirement = context.retirement.as_mut().unwrap();
@@ -253,6 +309,9 @@ pub(crate) unsafe fn destroy(
             return Err(STATUS_INVALID_PARAMETER);
         }
         guard.release()?;
+    }
+    if let Some(runtime_guard) = context.runtime_guard.as_mut() {
+        runtime_guard.release()?;
     }
     pdo_aliases_mut()[alias_index].devices[device_index].contexts.remove(context_index);
     pdo_aliases_mut()[alias_index].blocked = false;

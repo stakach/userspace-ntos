@@ -750,8 +750,8 @@ impl DxgDestroyAllocationLayout {
     pub const fn marshal_bytes(self) -> u64 { 0x28 }
 }
 
-/// Pinned x64 WDDM system-context request. A private-data pointer requires
-/// its own nested marshal contract and is rejected here.
+/// Pinned x64 WDDM system and virtual-context requests. A private-data pointer
+/// requires its own nested marshal contract and is rejected here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DxgCreateContextLayout {
     runtime_context: u64,
@@ -761,13 +761,16 @@ impl DxgCreateContextLayout {
     pub fn parse(version: u32, bytes: &[u8], marshal_capacity: u64) -> Option<Self> {
         if DxgInitializationData::required_prefix_len(version).is_none()
             || bytes.len() < 0x48 || marshal_capacity < 0x48
-            || u64::from_le_bytes(bytes[..8].try_into().ok()?) != 0
             || u32::from_le_bytes(bytes[0x0c..0x10].try_into().ok()?) == 0
-            || u32::from_le_bytes(bytes[0x10..0x14].try_into().ok()?) != 1
             || bytes[0x14..0x18] != [0; 4]
             || bytes[0x18..0x24] != [0; 12]
         { return None; }
-        Some(Self { runtime_context: 0 })
+        let runtime_context = u64::from_le_bytes(bytes[..8].try_into().ok()?);
+        let flags = u32::from_le_bytes(bytes[0x10..0x14].try_into().ok()?);
+        if !matches!((runtime_context == 0, flags), (true, 1) | (false, 4 | 6)) {
+            return None;
+        }
+        Some(Self { runtime_context })
     }
 
     pub const fn bytes(self) -> u64 { 0x48 }

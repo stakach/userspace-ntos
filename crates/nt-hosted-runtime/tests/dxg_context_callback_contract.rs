@@ -71,6 +71,34 @@ fn system_context_has_exact_bounded_input_and_output_fields() {
 }
 
 #[test]
+fn virtual_context_preserves_the_pinned_runtime_identity_and_flags() {
+    // Pinned LiberNT context.c::DxgkCreateContextVirtual passes its live
+    // DXGKRNL_CONTEXT pointer in hContext and sets VirtualAddressing (bit 2).
+    // A GDI device may additionally set GdiContext (bit 1).
+    const RUNTIME_CONTEXT: u64 = 0x1200_4000;
+    for flags in [4u32, 6] {
+        let mut original = [0u8; 0x48];
+        original[..8].copy_from_slice(&RUNTIME_CONTEXT.to_le_bytes());
+        original[0x0c..0x10].copy_from_slice(&1u32.to_le_bytes());
+        original[0x10..0x14].copy_from_slice(&flags.to_le_bytes());
+        let layout = DxgCreateContextLayout::parse(0x11007, &original, 0x1000)
+            .expect("virtual CreateContext must be admitted with its exact runtime token");
+        assert_eq!(layout.runtime_context(), RUNTIME_CONTEXT);
+        let mut projected = original;
+        let mut returned = original;
+        returned[..8].copy_from_slice(&0x6000u64.to_le_bytes());
+        returned[0x24..0x44].fill(0x5a);
+        assert!(layout.copyback(&mut projected, &returned));
+        assert_eq!(&projected[8..0x24], &original[8..0x24]);
+        assert_eq!(&projected[..8], &returned[..8]);
+    }
+    let mut no_virtual_flag = [0u8; 0x48];
+    no_virtual_flag[..8].copy_from_slice(&RUNTIME_CONTEXT.to_le_bytes());
+    no_virtual_flag[0x0c..0x10].copy_from_slice(&1u32.to_le_bytes());
+    assert!(DxgCreateContextLayout::parse(0x11007, &no_virtual_flag, 0x1000).is_none());
+}
+
+#[test]
 fn context_destroy_requires_exact_device_and_context_cookie_generations() {
     let owner = HostedProviderObjectOwner::new(1, 11, 2, 22).unwrap();
     let adapter = DxgPdoAliasAuthority::new(owner, 33, 44,
