@@ -34734,6 +34734,28 @@ impl ExecNtHandler {
                                 ty,
                                 data,
                             );
+                            // GetComputerNameW's installed-name fallback requires a REG_SZ
+                            // ComputerName value. Report only a bad type, empty value, or failed
+                            // copyout; the ordinary successful query needs no boot-log traffic.
+                            if name_lc == "computername"
+                                && key_path.as_deref().is_some_and(|path| {
+                                    path.contains(r"\control\computername\")
+                                })
+                                && (status != 0 || ty != 1 || data.len() < 2)
+                            {
+                                static BAD_COMPUTER_NAME_QUERY_REPORTS: AtomicU64 = AtomicU64::new(0);
+                                if BAD_COMPUTER_NAME_QUERY_REPORTS.fetch_add(1, Ordering::Relaxed) < 8 {
+                                    print_str(b"[computer-name-query-error] path=");
+                                    print_ascii_str(key_path.as_deref().unwrap_or(""));
+                                    print_str(b" status=0x");
+                                    print_hex(status);
+                                    print_str(b" type=");
+                                    print_u64(ty as u64);
+                                    print_str(b" bytes=");
+                                    print_u64(data.len() as u64);
+                                    print_str(b"\n");
+                                }
+                            }
                             // A value COPIED OUT of the 4th mount, in full, to a hosted process.
                             // `ProfilesDirectory` is the one `userenv!GetProfilesDirectoryW`
                             // (`profile.c:1592`) reads — it is what makes winlogon's post-logon
@@ -34808,7 +34830,23 @@ impl ExecNtHandler {
                             );
                             0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND — smss uses defaults
                         }
-                        Err(status) => status,
+                        Err(status) => {
+                            if name_lc == "computername"
+                                && key_path.as_deref().is_some_and(|path| {
+                                    path.contains(r"\control\computername\")
+                                })
+                            {
+                                static FAILED_COMPUTER_NAME_QUERY_REPORTS: AtomicU64 = AtomicU64::new(0);
+                                if FAILED_COMPUTER_NAME_QUERY_REPORTS.fetch_add(1, Ordering::Relaxed) < 8 {
+                                    print_str(b"[computer-name-query-error] path=");
+                                    print_ascii_str(key_path.as_deref().unwrap_or(""));
+                                    print_str(b" status=0x");
+                                    print_hex(status);
+                                    print_str(b"\n");
+                                }
+                            }
+                            status
+                        },
                     }
                 };
                 query_status

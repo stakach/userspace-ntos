@@ -4,6 +4,29 @@ use super::*;
 use nt_process::RegistryKeyHandlePublication;
 use nt_user_host::registry_subject::RegistrySubject;
 
+static REGISTRY_CREATE_CAPTURE_ERROR_REPORTS: AtomicU64 = AtomicU64::new(0);
+static REGISTRY_OPEN_CAPTURE_ERROR_REPORTS: AtomicU64 = AtomicU64::new(0);
+
+fn note_registry_capture_error(operation: &[u8], status: u32, pi: usize, tid: u64) {
+    let reports = if operation == b"create" {
+        &REGISTRY_CREATE_CAPTURE_ERROR_REPORTS
+    } else {
+        &REGISTRY_OPEN_CAPTURE_ERROR_REPORTS
+    };
+    if reports.fetch_add(1, Ordering::Relaxed) >= 32 {
+        return;
+    }
+    print_str(b"[registry-capture-error] op=");
+    print_str(operation);
+    print_str(b" pi=");
+    print_u64(pi as u64);
+    print_str(b" tid=");
+    print_u64(tid);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b"\n");
+}
+
 /// Owned across CM work; no token/PM/namespace borrow survives an IPC boundary.
 pub(crate) struct HostedRegistryPublication {
     pub subject: RegistrySubject,
@@ -451,7 +474,10 @@ impl ExecNtHandler {
         let _durable = allocator::enter_durable();
         let (mut state, _) = match self.capture_hosted_registry_publication(args, false) {
             Ok(state) => state,
-            Err(status) => return status,
+            Err(status) => {
+                note_registry_capture_error(b"open", status, self.pi, self.current_tid);
+                return status;
+            }
         };
         let result = (|| {
             let target = self.acquire_hosted_registry_target(&state)?;
@@ -491,7 +517,10 @@ impl ExecNtHandler {
         let (mut state, creator_pointer) =
             match self.capture_hosted_registry_publication(args, true) {
                 Ok(state) => state,
-                Err(status) => return status,
+                Err(status) => {
+                    note_registry_capture_error(b"create", status, self.pi, self.current_tid);
+                    return status;
+                }
             };
         let mut parent_retention = None;
         let mut durable_create = None;
@@ -691,6 +720,9 @@ impl ExecNtHandler {
             ) {
                 Ok(()) => return 0x103,
                 Err((status, mut state, mut owner)) => {
+                    crate::registry_security_audit::admission_error(
+                        b"create-submit", &state.path, status, self.pi, self.current_tid,
+                    );
                     if let Some(target) = owner.abort(&mut self.pm).expect("unsubmitted parent") {
                         self.release_registry_key_target(target);
                     }
