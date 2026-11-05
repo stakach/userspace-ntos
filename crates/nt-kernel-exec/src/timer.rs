@@ -4,6 +4,7 @@
 //! at the API boundary are Windows 100ns intervals.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use nt_time::{AdjustableClock, Deadline, TimeSnapshot};
 
 /// Input frequency of the PC-compatible 8254 timer.
@@ -130,6 +131,63 @@ pub fn pit_oneshot_for_deadline(
         wake_deadline_100ns,
         chunked: wake_deadline_100ns < deadline_100ns,
     }
+}
+
+/// A live one-shot is sufficient when its physical wake is no later than the next
+/// selected deadline. An expired or delivered shot cannot cover new demand, even
+/// if its former wake time compares favourably with that deadline.
+pub const fn pit_oneshot_covers_deadline(
+    armed: bool,
+    physical_wake_100ns: u64,
+    now_100ns: u64,
+    selected_deadline_100ns: u64,
+) -> bool {
+    armed && now_100ns < physical_wake_100ns
+        && physical_wake_100ns <= selected_deadline_100ns
+}
+
+/// Authority to reuse one physical PIT shot. A timer notification or an idle
+/// selection retires it before any subsequent rearm decision. The wake target
+/// remains available for diagnostics after retirement.
+pub struct PitOneShotAuthority {
+    physical_wake_100ns: AtomicU64,
+    armed: AtomicBool,
+}
+
+impl PitOneShotAuthority {
+    pub const fn new() -> Self {
+        Self { physical_wake_100ns: AtomicU64::new(0), armed: AtomicBool::new(false) }
+    }
+
+    pub fn publish(&self, physical_wake_100ns: u64) {
+        self.physical_wake_100ns.store(physical_wake_100ns, Ordering::Relaxed);
+        self.armed.store(true, Ordering::Release);
+    }
+
+    pub fn invalidate(&self) {
+        self.armed.store(false, Ordering::Release);
+    }
+
+    pub fn covers(&self, now_100ns: u64, selected_deadline_100ns: u64) -> bool {
+        pit_oneshot_covers_deadline(
+            self.armed.load(Ordering::Acquire),
+            self.physical_wake_100ns.load(Ordering::Relaxed),
+            now_100ns,
+            selected_deadline_100ns,
+        )
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::Acquire)
+    }
+
+    pub fn physical_wake_100ns(&self) -> u64 {
+        self.physical_wake_100ns.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for PitOneShotAuthority {
+    fn default() -> Self { Self::new() }
 }
 
 fn div_ceil_u128(numerator: u128, denominator: u128) -> u128 {

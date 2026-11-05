@@ -2,6 +2,67 @@ use super::*;
 use crate::{HostedDpcOwner, HostedDpcQueueResult, HostedDpcTable};
 
 #[test]
+fn live_pit_shot_covers_a_later_deadline_without_reprogramming() {
+    let now = 1_000_000;
+    let shot = pit_oneshot_for_deadline(now, now + 100_000, 0);
+    assert!(pit_oneshot_covers_deadline(
+        true, shot.wake_deadline_100ns, now + 1, now + 200_000,
+    ));
+    assert!(pit_oneshot_covers_deadline(
+        true, shot.wake_deadline_100ns, now + 1, shot.wake_deadline_100ns,
+    ));
+    assert!(!pit_oneshot_covers_deadline(
+        true, shot.wake_deadline_100ns, now + 1, now + 50_000,
+    ));
+}
+
+#[test]
+fn delivered_or_expired_pit_shot_never_covers_new_demand() {
+    let now = 1_000_000;
+    let shot = pit_oneshot_for_deadline(now, now + 100_000, 0);
+    for (armed, observed_now) in [
+        (false, now + 1),
+        (true, shot.wake_deadline_100ns),
+        (true, shot.wake_deadline_100ns + 1),
+    ] {
+        assert!(!pit_oneshot_covers_deadline(
+            armed, shot.wake_deadline_100ns, observed_now, now + 200_000,
+        ));
+    }
+}
+
+#[test]
+fn chunked_pit_shot_is_retained_only_until_its_physical_wake() {
+    let now = 50;
+    let deadline = 10_000_000;
+    let shot = pit_oneshot_for_deadline(now, deadline, 0);
+    assert!(shot.chunked);
+    assert!(pit_oneshot_covers_deadline(
+        true, shot.wake_deadline_100ns, now + 1, deadline,
+    ));
+    assert!(!pit_oneshot_covers_deadline(
+        true, shot.wake_deadline_100ns, shot.wake_deadline_100ns, deadline,
+    ));
+}
+
+#[test]
+fn nested_timer_delivery_retires_the_fired_shot_before_rearm_or_ack() {
+    let authority = PitOneShotAuthority::new();
+    authority.publish(1_100);
+    assert!(authority.covers(1_000, 1_200));
+
+    // A nested pump can ACK without draining the executive's timer queue. The
+    // delivered one-shot must not authorize reuse while that work is deferred.
+    authority.invalidate();
+    assert!(!authority.covers(1_000, 1_200));
+
+    authority.publish(1_150);
+    assert!(authority.covers(1_100, 1_200));
+    authority.invalidate(); // no-deadline cancellation
+    assert!(!authority.covers(1_100, 1_200));
+}
+
+#[test]
 fn finite_wait_requires_programming_not_merely_an_available_owner() {
     for (outcome, available, programmed) in [
         (TimerRearmOutcome::Unavailable, false, false),

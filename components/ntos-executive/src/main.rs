@@ -3020,7 +3020,7 @@ unsafe fn watchdog_report(messages: u64) {
     print_str(b" woke-nothing=");
     print_u64(TIMER_TICKS_SPURIOUS.load(Ordering::Relaxed));
     print_str(b" last-rearm-armed=");
-    print_u64(LAST_REARM_ARMED.load(Ordering::Relaxed));
+    print_u64(u64::from(LAST_REARM_AUTHORITY.is_armed()));
     print_str(b" src=");
     print_u64(LAST_REARM_SOURCE.load(Ordering::Relaxed));
     print_str(b"\n[deadman] -> the service loop will QUIESCE and run the gate rather than hang\n");
@@ -3052,6 +3052,9 @@ pub(crate) unsafe fn watchdog_nested_rearm() {
 /// the service loop, so it records the pending tick and uses this helper only to prevent the
 /// one-shot IRQ from starving the component's real reply.
 pub(crate) unsafe fn delay_timer_nested_ack() {
+    // Every caller has observed the bound timer badge. Its one-shot has fired,
+    // even when this nested pump cannot yet drain the executive's wait queues.
+    LAST_REARM_AUTHORITY.invalidate();
     if DELAY_TIMER_TICKS_PENDING.load(Ordering::Relaxed) != 0 {
         // No bootstrap borrow survives into programming/ACK below. Runtime owns its own drain
         // after the seed has transferred; invalid canonical publication fails closed.
@@ -6910,6 +6913,8 @@ pub(crate) static TIMER_TICKS_EARLY_STALE: AtomicU64 = AtomicU64::new(0);
 /// Successful channel-0 one-shot programs. Unlike a fixed delivery ceiling, this directly proves
 /// that a long boot cannot manufacture an unbounded interrupt stream from one stale comparator.
 pub(crate) static TIMER_SHOTS_PROGRAMMED: AtomicU64 = AtomicU64::new(0);
+/// Rearm requests covered by a still-live physical one-shot, without another PIT program.
+pub(crate) static TIMER_SHOTS_RETAINED: AtomicU64 = AtomicU64::new(0);
 /// Rearm scans which found no live deadline. Channel 0 stops after each one-shot, so these scans
 /// deliberately leave it stopped instead of programming a sentinel or periodic fallback.
 pub(crate) static TIMER_IDLE_DISARMS: AtomicU64 = AtomicU64::new(0);
@@ -6928,9 +6933,9 @@ pub(crate) static TIMER_PAST_DEADLINE_REARMS: AtomicU64 = AtomicU64::new(0);
 /// What the last `delay_timer_rearm` actually programmed, so a spurious tick can be explained.
 pub(crate) static LAST_REARM_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
 pub(crate) static LAST_REARM_SOURCE: AtomicU64 = AtomicU64::new(0);
-pub(crate) static LAST_REARM_TARGET: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LAST_REARM_NOW: AtomicU64 = AtomicU64::new(0);
-pub(crate) static LAST_REARM_ARMED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LAST_REARM_AUTHORITY: nt_kernel_exec::PitOneShotAuthority =
+    nt_kernel_exec::PitOneShotAuthority::new();
 /// ═══ PERIODIC CENSUS (batch 58) ══════════════════════════════════════════════════════════════
 ///
 /// [`print_progress_census`] only ever ran AFTER the loop quiesced — which is exactly the boot that
@@ -7111,6 +7116,9 @@ fn print_timer_deadline_census() {
         if index != 0 { print_str(b"/"); }
         print_u64(value);
     }
+    print_str(b"\n");
+    print_str(b"[census] timer-shots-retained=");
+    print_u64(TIMER_SHOTS_RETAINED.load(Ordering::Relaxed));
     print_str(b"\n");
     let census = unsafe { *core::ptr::addr_of!(TIMER_DEADLINE_CENSUS) };
     for bucket in 0..TimerDeadlineCensus::BUCKETS {
@@ -17217,6 +17225,10 @@ unsafe fn delay_timer_program(deadline: u64, source: u64) -> bool {
         return false;
     }
     let now = monotonic_time_100ns();
+    if LAST_REARM_AUTHORITY.covers(now, deadline) {
+        TIMER_SHOTS_RETAINED.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
     if deadline <= now {
         TIMER_PAST_DEADLINE_REARMS.fetch_add(1, Ordering::Relaxed);
         TIMER_PAST_DEADLINE_SOURCE.store(source, Ordering::Relaxed);
@@ -17234,9 +17246,8 @@ unsafe fn delay_timer_program(deadline: u64, source: u64) -> bool {
     }
     LAST_REARM_DEADLINE.store(deadline, Ordering::Relaxed);
     LAST_REARM_SOURCE.store(source, Ordering::Relaxed);
-    LAST_REARM_TARGET.store(shot.wake_deadline_100ns, Ordering::Relaxed);
     LAST_REARM_NOW.store(now, Ordering::Relaxed);
-    LAST_REARM_ARMED.store(1, Ordering::Release);
+    LAST_REARM_AUTHORITY.publish(shot.wake_deadline_100ns);
     TIMER_SHOTS_PROGRAMMED.fetch_add(1, Ordering::Relaxed);
     if source == DELAY_TIMER_SOURCE_IO_COMPLETION
         && DELAY_TIMER_REARM_TRACE_N.fetch_add(1, Ordering::Relaxed) < 16
@@ -17277,7 +17288,7 @@ unsafe fn delay_timer_rearm(
         // Channel 0 is in hardware one-shot mode and therefore already stopped after its delivery.
         // A cancelled outstanding shot may still produce one bounded notification; the handler
         // acknowledges it without programming another shot.
-        LAST_REARM_ARMED.store(0, Ordering::Relaxed);
+        LAST_REARM_AUTHORITY.invalidate();
         TIMER_IDLE_DISARMS.fetch_add(1, Ordering::Relaxed);
         TimerRearmOutcome::Idle
     }
@@ -17543,7 +17554,7 @@ unsafe fn delay_timer_irq_fault(handler: u64, error: u64) {
         return;
     }
     DELAY_TIMER_IRQ_ACK_FAILURES.fetch_add(1, Ordering::Relaxed);
-    LAST_REARM_ARMED.store(0, Ordering::Release);
+    LAST_REARM_AUTHORITY.invalidate();
     print_str(b"[delay] FATAL IRQ acknowledgement error=");
     print_u64(error);
     print_str(b" handler=0x");
@@ -17719,6 +17730,9 @@ unsafe fn delay_timer_interrupt_claimed(
 ) {
     // Notifications may be coalesced, cancelled or deferred past another rearm. They request
     // a scan, never advance the clock or consume metadata belonging to a newer shot.
+    // A delivered notification cannot authorize reuse of the previous physical one-shot.
+    // A stale notification may invalidate a newer shot too; reprogramming is then conservative.
+    LAST_REARM_AUTHORITY.invalidate();
     let now = nt_time_snapshot();
     let now_100ns = now.monotonic_100ns;
     let selected = delay_timer_next_deadline(queue, handler, now);
@@ -17735,7 +17749,7 @@ unsafe fn delay_timer_interrupt_claimed(
             print_str(b"[timer-spurious] #");
             print_u64(n);
             print_str(b" armed=");
-            print_u64(LAST_REARM_ARMED.load(Ordering::Relaxed));
+            print_u64(u64::from(LAST_REARM_AUTHORITY.is_armed()));
             print_str(b" src=");
             print_u64(LAST_REARM_SOURCE.load(Ordering::Relaxed));
             print_str(b" deadline=");
@@ -17767,7 +17781,7 @@ unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue, handler: &Exec
     }
     // A channel-0 one-shot stops itself. Keep the executive event notification bound: a cancelled
     // shot may deliver once, and hosted hardware IRQs share this notification independently.
-    LAST_REARM_ARMED.store(0, Ordering::Release);
+    LAST_REARM_AUTHORITY.invalidate();
 }
 
 unsafe fn delay_cancel_thread(
