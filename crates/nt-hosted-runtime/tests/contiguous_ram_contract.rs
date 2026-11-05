@@ -1,8 +1,42 @@
 use nt_hosted_runtime::{ContiguousRamLayout, ContiguousRamOwner, ContiguousRamReceipt,
     ContiguousRamPrepareTable, ContiguousRamLeaseBank, ContiguousRamLeaseSource,
-    ContiguousRamPublishedMapping, ContiguousRamProjectedMapping};
+    ContiguousRamPublishedMapping, ContiguousRamProjectedMapping, ContiguousRamCachePolicy};
 
 const PAGE: u64 = 4096;
+
+#[test]
+fn uncached_gpu_page_table_uses_the_same_frame_attributes_for_source_and_alias() {
+    // LiberNT's GPUVA root has two 4 KiB pages and requests MmNonCached (0)
+    // when its miniport does not advertise CachedPageTables. Its physical
+    // projection must never acquire a writeback alias of those frames.
+    const RW_NX: u64 = 0b111;
+    // The compressed x86 map ABI uses one opt-in bit for strong UC: both
+    // page write-through and page cache-disable are set under the default PAT.
+    const STRONG_UC: u64 = 0b1000;
+    let cache = ContiguousRamCachePolicy::for_nt_type(0)
+        .expect("MmNonCached is a valid NT contiguous-memory cache type");
+    assert_eq!(cache.compressed_map_rights(RW_NX), RW_NX | STRONG_UC);
+    assert_eq!(ContiguousRamCachePolicy::for_nt_type(1)
+        .unwrap().compressed_map_rights(RW_NX), RW_NX);
+    assert!(ContiguousRamCachePolicy::for_nt_type(3).is_none());
+
+    let producer = ContiguousRamOwner { instance: 6, generation: 19, domain: 23 };
+    let consumer = ContiguousRamOwner { instance: 7, generation: 31, domain: 24 };
+    let physical = 0x2000_0000;
+    let source = ContiguousRamPublishedMapping::new(
+        producer, 0x103_0000_0000, physical, 2 * PAGE, 0).unwrap();
+    assert_eq!(source.virtual_address(producer, physical, 2 * PAGE, 0),
+        Some(0x103_0000_0000));
+    assert_eq!(source.virtual_address(producer, physical, 2 * PAGE, 1), None);
+    let alias_cache = ContiguousRamCachePolicy::for_nt_type(0).unwrap();
+    let alias = ContiguousRamProjectedMapping::new(source, producer, consumer,
+        0x104_0000_0000, physical, 2 * PAGE, 0).unwrap();
+    assert_eq!(alias.virtual_address(consumer, physical, 2 * PAGE, 0),
+        Some(0x104_0000_0000));
+    assert_eq!(alias.virtual_address(consumer, physical, 2 * PAGE, 1), None);
+    assert_eq!(alias_cache.compressed_map_rights(RW_NX),
+        cache.compressed_map_rights(RW_NX));
+}
 
 #[test]
 fn softgpu_request_uses_a_separate_64_mib_child_and_checked_aperture() {

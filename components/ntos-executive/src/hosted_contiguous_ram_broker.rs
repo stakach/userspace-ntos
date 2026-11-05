@@ -8,7 +8,8 @@
 use super::*;
 use nt_hosted_runtime::{ContiguousRamLayout, ContiguousRamOwner, ContiguousRamPrepareTable,
     ContiguousRamReceipt, ContiguousRamRequest, ContiguousRamLeaseBank,
-    ContiguousRamLeaseSource, ContiguousRamPublishedMapping, ContiguousRamProjectedMapping};
+    ContiguousRamLeaseSource, ContiguousRamPublishedMapping, ContiguousRamProjectedMapping,
+    ContiguousRamCachePolicy};
 
 const PAGE: u64 = 4096;
 const MAX_CHILD_BYTES: u64 = 64 << 20;
@@ -174,7 +175,7 @@ pub(super) fn service(ch: &crate::spawn_hosts::PumpChannel, op: u64, a1: u64, a2
 
 unsafe fn allocate(owner: ContiguousRamOwner, inst: DriverInstance,
     request: ContiguousRamRequest) -> Option<u64> {
-    if request.cache != nt_hal_abi::MM_CACHED { return None; }
+    let cache_policy = ContiguousRamCachePolicy::for_nt_type(request.cache)?;
     let ledger = &mut *core::ptr::addr_of_mut!(ALLOCATIONS);
     let plan = next_aperture(owner, ledger, request.length)?;
     if request.low > request.high { return None; }
@@ -203,7 +204,7 @@ unsafe fn allocate(owner: ContiguousRamOwner, inst: DriverInstance,
     row.quarantined = false;
     row.published = false;
     row.available = false;
-    let result = allocate_into(row, inst, plan, request, lease.source);
+    let result = allocate_into(row, inst, plan, request, cache_policy, lease.source);
     if result.is_none() {
         if row.quarantined || !cleanup_known_effects(row) {
             row.quarantined = true;
@@ -216,7 +217,8 @@ unsafe fn allocate(owner: ContiguousRamOwner, inst: DriverInstance,
 }
 
 unsafe fn allocate_into(row: &mut Allocation, inst: DriverInstance, plan: ContiguousRamLayout,
-    request: ContiguousRamRequest, source: ContiguousRamLeaseSource) -> Option<u64> {
+    request: ContiguousRamRequest, cache_policy: ContiguousRamCachePolicy,
+    source: ContiguousRamLeaseSource) -> Option<u64> {
     let owner = row.owner;
     print_str(b"[contiguous-broker] reserved aperture=0x");
     print_hex64(plan.base()); print_str(b" frames="); print_u64(plan.frames());
@@ -335,7 +337,8 @@ unsafe fn allocate_into(row: &mut Allocation, inst: DriverInstance, plan: Contig
             return None;
         }
         if receipt.begin_map(owner, index).is_err() { return None; }
-        let result = page_map_r(caps + index, va, RW_NX, inst.pml4);
+        let result = page_map_r(caps + index, va,
+            cache_policy.compressed_map_rights(RW_NX), inst.pml4);
         if receipt.record_map_result(owner, index, (result == 0).then_some(()).ok_or(())).is_err() {
             row.quarantined = true;
             print_str(b"[contiguous-broker] map uncertain frame=");
@@ -429,6 +432,7 @@ pub(super) unsafe fn release_video_projection_pin(pin: &mut VideoProjectionPin) 
 unsafe fn map_physical(consumer: ContiguousRamOwner, inst: DriverInstance,
     physical: u64, length: u64, cache: u32) -> Option<u64> {
     if length == 0 || inst.pml4 == 0 { return None; }
+    let cache_policy = ContiguousRamCachePolicy::for_nt_type(cache)?;
     let ledger = &*core::ptr::addr_of!(ALLOCATIONS);
     let mut selected = None;
     for source in ledger.iter() {
@@ -501,7 +505,9 @@ unsafe fn map_physical(consumer: ContiguousRamOwner, inst: DriverInstance,
                 return None;
             }
             rows[index].owner.as_mut()?.adopt_alias_cap(cap, true);
-            if page_map_r(cap, va, RW_NX, inst.pml4) != 0 { return None; }
+            if page_map_r(cap, va, cache_policy.compressed_map_rights(RW_NX), inst.pml4) != 0 {
+                return None;
+            }
         }
         Some(())
     })();

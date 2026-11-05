@@ -41,7 +41,7 @@ pub use win32k_bulk_stage::{
 };
 
 pub use driver_load_receipt::{DriverLoadPhase, RetainedEffectState};
-pub use contiguous_ram::{ContiguousRamError, ContiguousRamLayout, ContiguousRamOwner,
+pub use contiguous_ram::{ContiguousRamCachePolicy, ContiguousRamError, ContiguousRamLayout, ContiguousRamOwner,
     ContiguousRamPrepareTable, ContiguousRamReceipt, ContiguousRamRequest,
     ContiguousRamLeaseBank, ContiguousRamLease, ContiguousRamLeaseSource,
     ContiguousRamPublishedMapping, ContiguousRamProjectedMapping};

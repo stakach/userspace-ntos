@@ -8,6 +8,27 @@ const PAGE: u64 = 4096;
 const RETYPE_FAN_OUT: u64 = 256;
 const MAX_CHILD_BYTES: u64 = 64 << 20;
 
+/// NT cache contract for a contiguous RAM run and every projection of its frames.
+/// Write combining requires a separate PAT mapping and is rejected until supported.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContiguousRamCachePolicy { Uncached, Cached }
+
+impl ContiguousRamCachePolicy {
+    pub fn for_nt_type(cache: u32) -> Option<Self> {
+        match cache {
+            nt_hal_abi::MM_NON_CACHED => Some(Self::Uncached),
+            nt_hal_abi::MM_CACHED => Some(Self::Cached),
+            _ => None,
+        }
+    }
+
+    /// Bit 3 of rust-micro's compressed x86 frame-map rights requests PWT+PCD.
+    /// Under the default x86 PAT this selects strong UC for MmNonCached.
+    pub const fn compressed_map_rights(self, rights: u64) -> u64 {
+        rights | match self { Self::Uncached => 0b1000, Self::Cached => 0 }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContiguousRamLayout {
     base: u64,

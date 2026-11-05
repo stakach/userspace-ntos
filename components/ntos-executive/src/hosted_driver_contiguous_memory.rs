@@ -21,7 +21,8 @@ unsafe fn call(op: u64, a1: u64, a2: u64, a3: u64) -> (i32, u64, u64, u64) {
 pub(super) extern "win64" fn mm_allocate_contiguous_memory_specify_cache(
     length: u64, low: u64, high: u64, boundary: u64, cache: u32,
 ) -> u64 {
-    if length == 0 || low > high || cache != nt_hal_abi::MM_CACHED
+    if length == 0 || low > high
+        || nt_hosted_runtime::ContiguousRamCachePolicy::for_nt_type(cache).is_none()
         || boundary != 0 && (!boundary.is_power_of_two() || boundary < 4096) {
         print_str(b"[contiguous-component] rejected arguments len=");
         print_u64(length); print_str(b" cache="); print_u64(cache as u64);

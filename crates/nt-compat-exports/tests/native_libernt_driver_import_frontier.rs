@@ -593,6 +593,25 @@ fn pinned_dxg_contiguous_release_uses_exact_physical_allocation_owner() {
 }
 
 #[test]
+fn pinned_gpuva_uncached_page_tables_keep_native_source_and_alias_uncached() {
+    let component = include_str!(
+        "../../../components/ntos-executive/src/hosted_driver_contiguous_memory.rs");
+    let broker = include_str!(
+        "../../../components/ntos-executive/src/hosted_contiguous_ram_broker.rs");
+    let microkernel = include_str!(
+        "../../../rust-micro/src/arch/x86_64/vspace.rs");
+    assert!(component.contains("ContiguousRamCachePolicy::for_nt_type(cache)"),
+        "MmNonCached must pass component admission as an explicit cache policy");
+    assert!(broker.contains("ContiguousRamCachePolicy::for_nt_type(request.cache)"),
+        "the broker must independently validate the committed cache policy");
+    assert!(broker.matches("cache_policy.compressed_map_rights(RW_NX)").count() >= 2,
+        "source and projected aliases must use the same frame-map attributes");
+    assert!(microkernel.contains("write_through: rights & 0b1000 != 0")
+        && microkernel.contains("cache_disabled: rights & 0b1000 != 0"),
+        "compressed bit 3 must select strong UC through both PWT and PCD");
+}
+
+#[test]
 fn pinned_dxg_physical_memory_ranges_copy_boot_ram_and_terminate() {
     assert!(native_imports("dxgkrnl.sys").contains("MmGetPhysicalMemoryRanges"));
     let launch = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
