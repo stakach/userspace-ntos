@@ -1070,6 +1070,45 @@ pub struct DxgSegmentQueryLayout {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DxgDriverCapsLayout { output_bytes: u64 }
 
+/// The two WDDM 2.0 GPU MMU queries have only fixed POD input and output.
+/// Their output must never be interpreted as a nested segment descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DxgFixedQueryLayout {
+    input_bytes: u64,
+    output_bytes: u64,
+}
+
+impl DxgFixedQueryLayout {
+    pub const fn parse(prefix: DxgQueryAdapterInfoPrefix,
+        marshal_capacity: u64) -> Option<Self>
+    {
+        let (input_bytes, output_bytes) = match prefix.kind {
+            // DXGK_QUERYGPUMMUCAPSIN -> DXGK_GPUMMUCAPS.
+            13 => (4, 0x18),
+            // DXGK_QUERYPAGETABLELEVELDESCIN -> DXGK_PAGE_TABLE_LEVEL_DESC.
+            14 => (4, 0x14),
+            _ => return None,
+        };
+        if prefix.input.1 as u64 != input_bytes
+            || prefix.output.1 as u64 != output_bytes
+            || prefix.input.0 == 0 || prefix.output.0 == 0
+            || input_bytes > marshal_capacity || output_bytes > marshal_capacity
+            || prefix.input.0.checked_add(input_bytes).is_none()
+            || prefix.output.0.checked_add(output_bytes).is_none()
+        {
+            return None;
+        }
+        Some(Self { input_bytes, output_bytes })
+    }
+
+    pub const fn input_bytes(self) -> u64 { self.input_bytes }
+    pub const fn output_bytes(self) -> u64 { self.output_bytes }
+}
+
+#[cfg(test)]
+#[path = "dxg_registration_gpu_mmu_tests.rs"]
+mod gpu_mmu_tests;
+
 impl DxgDriverCapsLayout {
     pub const fn parse(prefix: DxgQueryAdapterInfoPrefix,
         marshal_capacity: u64) -> Option<Self>

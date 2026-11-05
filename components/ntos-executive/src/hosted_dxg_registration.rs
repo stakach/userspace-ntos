@@ -7,7 +7,8 @@
 use super::*;
 use nt_hosted_runtime::{
     DxgChildRelationsLayout, DxgEntryAuthority, DxgInitializationData, DxgPdoAliasAuthority,
-    DxgDriverCapsLayout, DxgQueryAdapterInfoPrefix, DxgSegmentQueryLayout,
+    DxgDriverCapsLayout, DxgFixedQueryLayout, DxgQueryAdapterInfoPrefix,
+    DxgSegmentQueryLayout,
     DxgStartInterface,
     DxgRegistrationKey, DxgSourceDriverObject,
     encode_hosted_dxg_registration_thunk,
@@ -1030,9 +1031,9 @@ pub(super) unsafe fn service_stop_device_callback(
     Ok(result)
 }
 
-/// Project only the three segment-query shapes implemented by the pinned
-/// miniport. DxgKrnl's header and fixed buffers are on its parked stack; the
-/// optional descriptor array may also reside in an independently pinned pool.
+/// Project the typed fixed and segment query shapes implemented by the pinned
+/// miniport. DxgKrnl's header and fixed input are on its parked stack; output
+/// and optional descriptor arrays retain their own physical ownership.
 pub(super) unsafe fn service_query_adapter_info_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     marshal_window: HostedProviderMarshalWindow,
@@ -1104,13 +1105,19 @@ pub(super) unsafe fn service_query_adapter_info_callback(
         .ok_or(STATUS_INVALID_PARAMETER)?;
     let output_bytes = core::slice::from_raw_parts(output_exec as *const u8,
         output_len as usize);
-    let (nested_address, nested_len) = if prefix.kind() == 1 {
-        DxgDriverCapsLayout::parse(prefix, marshal_window.capacity)
-            .ok_or(STATUS_NOT_SUPPORTED)?;
-        (0, 0)
-    } else {
-        DxgSegmentQueryLayout::parse(prefix, output_bytes,
-            marshal_window.capacity).ok_or(STATUS_NOT_SUPPORTED)?.descriptors()
+    let (nested_address, nested_len) = match prefix.kind() {
+        1 => {
+            DxgDriverCapsLayout::parse(prefix, marshal_window.capacity)
+                .ok_or(STATUS_NOT_SUPPORTED)?;
+            (0, 0)
+        }
+        13 | 14 => {
+            DxgFixedQueryLayout::parse(prefix, marshal_window.capacity)
+                .ok_or(STATUS_NOT_SUPPORTED)?;
+            (0, 0)
+        }
+        _ => DxgSegmentQueryLayout::parse(prefix, output_bytes,
+            marshal_window.capacity).ok_or(STATUS_NOT_SUPPORTED)?.descriptors(),
     };
     if !nt_hosted_runtime::dxg_query_output_regions_disjoint(
         output_address, output_len as u64, nested_address, nested_len) {

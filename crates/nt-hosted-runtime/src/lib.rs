@@ -65,7 +65,7 @@ pub use dxg_registration::{
     DxgDestroyAllocationLayout,
     DxgCreateProcessLayout, DxgDeviceAliasKey,
     DxgDeviceCookieRetirement,
-    DxgDriverCapsLayout, DxgNodeMetadataLayout, DxgStandardAllocationLayout,
+    DxgDriverCapsLayout, DxgFixedQueryLayout, DxgNodeMetadataLayout, DxgStandardAllocationLayout,
     DxgProcessAliasKey,
     DxgNullProcessCredits, DxgProcessCookieRetirement, DxgProcessFreeRoute,
     dxg_query_restores_nested_pointer,
