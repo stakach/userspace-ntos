@@ -27407,6 +27407,140 @@ unsafe fn pending_file_native_caller(
     handler.pm.capture_native_handle_caller(caller.thread(), nt_types::AccessMode::KernelMode)
 }
 
+static NEXT_FILE_MODE_INPUT_PAGE_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// A routed page worker returns only to the exact FileMode input owner which admitted it.
+/// The original Reply and File Busy remain in that row until normal terminal delivery.
+pub(crate) unsafe fn file_mode_input_page_completed(
+    identity: nt_io_manager::PendingFileIoIdentity, irp_id: u64, token: u64,
+    pi: usize, page: u64, status: u32,
+) -> bool {
+    let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
+    let exact = table.get_exact(identity).is_some_and(|pending| {
+        pending.irp_id == irp_id && pending.pi as usize == pi
+            && matches!(pending.operation,
+                nt_io_manager::PendingFileIoOperation::OwnedModeInputCapture(input)
+                if input.pending_token == token && input.pending_page == page)
+    });
+    if !exact || table.complete_mode_input_page_exact(identity, irp_id, page, token, status).is_none() {
+        return false;
+    }
+    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+    true
+}
+
+/// Return true only after input capture becomes terminal or mode precommit. The row was parked
+/// before this function can run; no routed source work is submitted by the native syscall entry.
+unsafe fn redrive_file_mode_input(
+    handler: &mut ExecNtHandler,
+    identity: nt_io_manager::PendingFileIoIdentity,
+    pending: nt_io_manager::PendingFileIo,
+) -> bool {
+    use nt_io_manager::PendingFileIoOperation::OwnedModeInputCapture;
+    let OwnedModeInputCapture(input) = pending.operation else { return true; };
+    macro_rules! table { () => { &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO) }; }
+    if input.pending_token != 0 { return false; }
+    if pending.consumer_abandoned || pending.reply_cap == 0 {
+        return table!().fail_mode_input_exact(identity, pending.irp_id, nt_fs::STATUS_CANCELLED).is_some();
+    }
+    let pi = pending.pi as usize;
+    let current = handler.capture_thread_process_identity(pi, pending.tid);
+    let caller_live = crate::pending_file_caller::caller(identity, pending)
+        .is_some_and(|caller| handler.validate_provider_logical_caller(caller));
+    if current.is_none() || !caller_live {
+        return table!().fail_mode_input_exact(identity, pending.irp_id, nt_fs::STATUS_INVALID_HANDLE).is_some();
+    }
+    let step = with_pagein_caller_target_context(
+        handler, pi, pi, pending.tid, pending.badge,
+        pending.resume_ip, pending.resume_sp, pending.resume_flags,
+        pending.native_call_transport, 0,
+        |handler| {
+            if !input.signal_reset {
+                let result = match pending.route {
+                    nt_io_manager::PendingFileRoute::Hosted(file_id) =>
+                        handler.file_completion.set_signaled(file_id, false),
+                    nt_io_manager::PendingFileRoute::Local(
+                        nt_io_manager::LocalFileObject::Overlay(file_object)) =>
+                        crate::writable_fs::set_file_signaled(file_object, false),
+                    _ => Err(nt_fs::STATUS_INVALID_HANDLE),
+                };
+                match result {
+                    Ok(()) => {
+                        if table!().mark_mode_input_signal_reset_exact(identity, pending.irp_id).is_none() {
+                            return false;
+                        }
+                        FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                        return false;
+                    }
+                    Err(status) => return table!().fail_mode_input_exact(identity, pending.irp_id, status).is_some(),
+                }
+            }
+            let Some(end) = input.input_va.checked_add(input.length as u64) else {
+                return table!().fail_mode_input_exact(identity, pending.irp_id,
+                    nt_address_space::STATUS_ACCESS_VIOLATION).is_some();
+            };
+            if input.next_page >= end {
+                let captured = handler.capture_file_mode_resident_input(input.input_va, input.length);
+                return match captured {
+                    Ok(requested_mode) => table!().finish_mode_input_capture_exact(
+                        identity, pending.irp_id, requested_mode).is_some(),
+                    Err(status) => table!().fail_mode_input_exact(identity, pending.irp_id, status).is_some(),
+                };
+            }
+            let page = input.next_page;
+            match handler.copy_page_admission(pi, page, nt_address_space::FaultAccess::Read) {
+                Ok(exec_handler::CopyPageAdmission::Resident) => {
+                    if table!().complete_mode_input_page_exact(identity, pending.irp_id, page, 0, 0).is_none() {
+                        return false;
+                    }
+                    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                    false
+                }
+                Err(status) => table!().fail_mode_input_exact(identity, pending.irp_id, status).is_some(),
+                Ok(exec_handler::CopyPageAdmission::NeedsRoutedPageIn) => {
+                    let Some(token) = NEXT_FILE_MODE_INPUT_PAGE_TOKEN.fetch_update(
+                        Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1)
+                    ).ok().filter(|token| *token != 0) else {
+                        return table!().fail_mode_input_exact(identity, pending.irp_id,
+                            nt_fs::STATUS_INSUFFICIENT_RESOURCES).is_some();
+                    };
+                    if table!().begin_mode_input_page_exact(identity, pending.irp_id, page, token).is_none() {
+                        return false;
+                    }
+                    let info = handler.query_memory_basic_information(pi, page);
+                    let result = match info.map(|info| info.type_) {
+                        Ok(nt_address_space::MEM_MAPPED) =>
+                            crate::section_pagein_work::submit_for_file_mode_input(
+                                handler, pi, page, pending.reply_cap, identity, pending.irp_id, token)
+                                .map(Some),
+                        Ok(nt_address_space::MEM_IMAGE) =>
+                            crate::native_image_pagein_work::submit_for_file_mode_input(
+                                handler, pi, page, pending.reply_cap, identity, pending.irp_id, token),
+                        Ok(_) => Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES),
+                        Err(status) => Err(status),
+                    };
+                    match result {
+                        Ok(Some(_)) => false,
+                        Ok(None) => {
+                            if table!().abort_unentered_mode_input_page_exact(identity, pending.irp_id, page, token).is_some() {
+                                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                            }
+                            false
+                        }
+                        Err(status) => {
+                            if table!().abort_unentered_mode_input_page_exact(identity, pending.irp_id, page, token).is_none() {
+                                return false;
+                            }
+                            table!().fail_mode_input_exact(identity, pending.irp_id, status).is_some()
+                        }
+                    }
+                }
+            }
+        });
+    step.unwrap_or_else(|| table!().fail_mode_input_exact(identity, pending.irp_id,
+        nt_fs::STATUS_INVALID_HANDLE).is_some())
+}
+
 /// Publish terminal results for general pending File IRPs in NT completion order. The backend
 /// completion remains retained until every required surface and synchronous reply is visible.
 unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
@@ -27484,6 +27618,17 @@ unsafe fn pending_file_io_redrive_pass(
             .get_exact(identity).filter(|live| live.irp_id == pending.irp_id)
         else { continue; };
         pending = live;
+        if matches!(pending.operation,
+            nt_io_manager::PendingFileIoOperation::OwnedModeInputCapture(_))
+        {
+            if !redrive_file_mode_input(nt_handler, identity, pending) {
+                continue;
+            }
+            let Some(live) = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+                .get_exact(identity).filter(|live| live.irp_id == pending.irp_id)
+            else { continue; };
+            pending = live;
+        }
         if let nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(operation) = pending.operation {
             // The original input, File reference, Busy and Reply already belong to this row.
             // Preparation is no-effect on Busy; never re-enter the syscall or read user input.
@@ -28425,7 +28570,7 @@ unsafe fn pending_file_io_redrive_pass(
                 .expect("released owned File reference lost its pending owner");
         }
         assert!(
-            !matches!(pending.operation, nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(_)),
+            !pending.operation.is_owned_mode_uncommitted(),
             "nonterminal mode preparation cannot retire its retained File owner",
         );
         if matches!(pending.operation, nt_io_manager::PendingFileIoOperation::AttributeQuery(_)) {
@@ -28497,7 +28642,8 @@ unsafe fn pending_file_io_redrive_pass(
             | nt_io_manager::PendingFileIoOperation::OwnedInline(_)
             | nt_io_manager::PendingFileIoOperation::LocalBuffered(_)
             | nt_io_manager::PendingFileIoOperation::LocalFlush(_) => {}
-            nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(_) => {
+            nt_io_manager::PendingFileIoOperation::OwnedModeInputCapture(_)
+            | nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(_) => {
                 unreachable!("finished File owner retained nonterminal mode preparation")
             }
         }

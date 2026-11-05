@@ -54,6 +54,11 @@ enum Purpose {
     SyscallCopy(SyscallCopy),
     VmLock { token: u64, caller_pi: usize },
     VmCopy { token: u64, caller_pi: usize, service_number: u32 },
+    RoutedFileModeInput {
+        identity: nt_io_manager::PendingFileIoIdentity,
+        irp_id: u64,
+        token: u64,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -158,11 +163,13 @@ unsafe fn prepare_page(
     if matches!(purpose, Purpose::Fault)
         && decision == RoutedSourceReadDecision::Ready
     { return Ok(None); }
-    if matches!(purpose, Purpose::SyscallCopy(_) | Purpose::VmLock { .. } | Purpose::VmCopy { .. })
+    if matches!(purpose, Purpose::SyscallCopy(_) | Purpose::VmLock { .. } | Purpose::VmCopy { .. }
+        | Purpose::RoutedFileModeInput { .. })
         && (source_ready
             || crate::native_image_residency::has_private_page(view, page))
     { return Ok(None); }
-    if existing && !parked && matches!(purpose, Purpose::SyscallCopy(_) | Purpose::VmLock { .. } | Purpose::VmCopy { .. })
+    if existing && !parked && matches!(purpose, Purpose::SyscallCopy(_) | Purpose::VmLock { .. }
+        | Purpose::VmCopy { .. } | Purpose::RoutedFileModeInput { .. })
         && !producer
     {
         // A retained synchronous source initializer has no asynchronous producer here.
@@ -334,6 +341,23 @@ pub(crate) unsafe fn submit_for_vm_copy(
     let Some(work) = prepare_page(handler, target_pi, page, access,
         ImageFaultObservation::CopyAccess,
         Purpose::VmCopy { token, caller_pi, service_number }, reply, true)?
+    else { return Ok(None); };
+    let source = crate::routed_pagein_source::RoutedPageInSource::Image {
+        view: work.view, lease: work.lease,
+    };
+    install_work(work, true)?;
+    Ok(Some(source))
+}
+
+/// The pending File row has already parked the original syscall Reply; this worker owns only
+/// its exact image source and maps the input page before returning a tokenized completion.
+pub(crate) unsafe fn submit_for_file_mode_input(
+    handler: &mut ExecNtHandler, pi: usize, page: u64, reply: u64,
+    identity: nt_io_manager::PendingFileIoIdentity, irp_id: u64, token: u64,
+) -> Result<Option<crate::routed_pagein_source::RoutedPageInSource>, u32> {
+    let Some(work) = prepare_page(handler, pi, page, FaultAccess::Read,
+        ImageFaultObservation::CopyAccess,
+        Purpose::RoutedFileModeInput { identity, irp_id, token }, reply, true)?
     else { return Ok(None); };
     let source = crate::routed_pagein_source::RoutedPageInSource::Image {
         view: work.view, lease: work.lease,
@@ -698,7 +722,8 @@ unsafe fn advance(
             if cancelled { work.phase = Phase::Cancel; return false; }
             if parked_reply::validate_saved(work.reply).is_err() { return false; }
             work.phase = Phase::ReplyEntered;
-            if matches!(work.purpose, Purpose::VmLock { .. } | Purpose::VmCopy { .. }) {
+            if matches!(work.purpose, Purpose::VmLock { .. } | Purpose::VmCopy { .. }
+                | Purpose::RoutedFileModeInput { .. }) {
                 let source = crate::routed_pagein_source::RoutedPageInSource::Image {
                     view: work.view, lease: work.lease,
                 };
@@ -707,6 +732,9 @@ unsafe fn advance(
                         token, work.pi, work.page, source, 0),
                     Purpose::VmCopy { token, .. } => crate::vm_copy_work::page_completed(
                         token, work.pi, work.page, source, 0),
+                    Purpose::RoutedFileModeInput { identity, irp_id, token } =>
+                        crate::service_sec_image::file_mode_input_page_completed(
+                            identity, irp_id, token, work.pi, work.page, 0),
                     Purpose::Fault | Purpose::SyscallCopy(_) => unreachable!(),
                 };
                 if completed {
@@ -723,7 +751,8 @@ unsafe fn advance(
                     assert!(work.progress.enter_reply());
                     reply_parked_syscall(work.reply, u64::from(status))
                 }
-                Purpose::VmLock { .. } | Purpose::VmCopy { .. } =>
+                Purpose::VmLock { .. } | Purpose::VmCopy { .. }
+                | Purpose::RoutedFileModeInput { .. } =>
                     unreachable!("retained VM operation returns through its coordinator"),
             };
             if !sent { return false; }
@@ -756,7 +785,8 @@ unsafe fn advance(
             true
         }
         Phase::Cancel => {
-            if matches!(work.purpose, Purpose::VmLock { .. } | Purpose::VmCopy { .. }) {
+            if matches!(work.purpose, Purpose::VmLock { .. } | Purpose::VmCopy { .. }
+                | Purpose::RoutedFileModeInput { .. }) {
                 let source = crate::routed_pagein_source::RoutedPageInSource::Image {
                     view: work.view, lease: work.lease,
                 };
@@ -766,6 +796,9 @@ unsafe fn advance(
                         token, work.pi, work.page, source, status),
                     Purpose::VmCopy { token, .. } => crate::vm_copy_work::page_completed(
                         token, work.pi, work.page, source, status),
+                    Purpose::RoutedFileModeInput { identity, irp_id, token } =>
+                        crate::service_sec_image::file_mode_input_page_completed(
+                            identity, irp_id, token, work.pi, work.page, status),
                     Purpose::Fault | Purpose::SyscallCopy(_) => unreachable!(),
                 };
                 if completed {
@@ -837,6 +870,7 @@ pub(crate) unsafe fn redrive(
                 (caller_pi, 0, 0, 0, false, SSN_NT_LOCK_VM as u32),
             Purpose::VmCopy { caller_pi, service_number, .. } =>
                 (caller_pi, 0, 0, 0, false, service_number),
+            Purpose::RoutedFileModeInput { .. } => (work.pi, 0, 0, 0, false, 0),
         };
         EXECUTING_CALLER_PI.store(caller_pi as u64, Ordering::Release);
         let done = service_sec_image::with_pagein_caller_target_context(

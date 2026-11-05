@@ -30,7 +30,7 @@ impl ExecNtHandler {
         if input & 3 != 0 {
             return Err(STATUS_DATATYPE_MISALIGNMENT);
         }
-        if input.checked_add(length as u64)
+        if input == 0 || input.checked_add(length as u64)
             .is_none_or(|end| end > USER_ADDRESS_LIMIT)
         {
             return Err(STATUS_ACCESS_VIOLATION);
@@ -38,24 +38,29 @@ impl ExecNtHandler {
         Ok(())
     }
 
-    unsafe fn capture_file_mode_input(&mut self, input: u64, length: usize) -> Result<u32, u32> {
+    /// The pending File owner has already admitted every page. This read cannot dispatch a
+    /// provider or consume a guard; a lost resident backing is a terminal capture fault.
+    pub(crate) unsafe fn capture_file_mode_resident_input(
+        &mut self, input: u64, length: usize,
+    ) -> Result<u32, u32> {
+        let process = self.capture_thread_process_identity(self.pi, self.current_tid)
+            .ok_or(STATUS_INVALID_HANDLE)?;
         let payload = nt_io_manager::capture_set_information_payload(length, |payload| {
             let chunks = nt_address_space::page_chunks(input, length)
                 .ok_or(nt_status::NtStatus::ACCESS_VIOLATION)?;
+            let mut copied = 0usize;
             for chunk in chunks {
-                self.prepare_copy_page(self.pi, chunk.page_base, nt_address_space::FaultAccess::Read)
+                self.copy_read_resident_page(self.pi, process,
+                    chunk.page_base + chunk.page_offset as u64,
+                    &mut payload[copied..copied + chunk.length])
                     .map_err(|status| nt_status::NtStatus(status as i32))?;
+                copied += chunk.length;
             }
-            self.read_file_mode_input_checked(input, payload)
-                .map_err(|status| nt_status::NtStatus(status as i32))
+            Ok(())
         }).map_err(|status| status.raw() as u32)?;
-        Ok(u32::from_le_bytes(payload[..4].try_into().unwrap()))
-    }
-
-    unsafe fn read_file_mode_input_checked(&self, input: u64, payload: &mut [u8]) -> Result<(), u32> {
-        // Page preparation above preserves the first GUARD/NOACCESS refusal. Once every
-        // page is admitted, failure to read its exact resident backing remains an AV.
-        if self.xas_read(input, payload) { Ok(()) } else { Err(STATUS_ACCESS_VIOLATION) }
+        let value = payload.get(..4).and_then(|bytes| bytes.try_into().ok())
+            .ok_or(nt_fs::STATUS_INFO_LENGTH_MISMATCH)?;
+        Ok(u32::from_le_bytes(value))
     }
 
     pub(super) unsafe fn try_set_file_mode_information(
@@ -116,51 +121,27 @@ impl ExecNtHandler {
             Ok(false) => return Some(STATUS_PENDING),
             Err(status) => return Some(status),
         }
-        let captured = (|| -> Result<u32, u32> {
-            match wait_route {
-                nt_io_manager::FileIoWaitRoute::Hosted { file_id, .. } => {
-                    self.file_completion.set_signaled(file_id, false)?;
-                }
-                nt_io_manager::FileIoWaitRoute::LocalOverlay { file_object } => {
-                    crate::writable_fs::set_file_signaled(file_object, false)?;
-                }
-            }
-            self.capture_file_mode_input(input, length)
-        })();
-        let capture_failed = captured.is_err();
-        let (operation, status) = match captured {
-            Ok(requested) => match self.commit_owned_file_mode_request(route, requested, self.current_tid) {
-                Err(driver_launch::FileModePreparationError::Busy) => (
-                    nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(
-                        nt_io_manager::PendingOwnedModePrecommit { requested_mode: requested }),
-                    STATUS_PENDING,
-                ),
-                result => {
-                    let status = match result {
-                        Ok(()) => nt_fs::STATUS_SUCCESS,
-                        Err(driver_launch::FileModePreparationError::Status(status)) => status,
-                        Err(driver_launch::FileModePreparationError::Busy) => unreachable!(),
-                    };
-                    (nt_io_manager::PendingFileIoOperation::OwnedInline(
-                        nt_io_manager::PendingOwnedInline { status, information: 0 }), status)
-                }
-            },
-            Err(status) => (nt_io_manager::PendingFileIoOperation::OwnedInline(
-                nt_io_manager::PendingOwnedInline { status, information: 0 }), status),
-        };
-        let policy = nt_io_manager::SetInformationCompletionPolicy::immediate_driver();
         assert!(self.pending_file_io_transfer.is_none());
-        // Publication precedes every user store. Its original result cannot replay the mutation.
+        // The first page admission and File signal reset run only after the post-action parks
+        // this exact Reply. No user read or mode mutation can escape the pending owner.
         self.pending_file_io_transfer = Some(nt_io_manager::PendingFileIo {
             route,
             irp_id: request_id,
             major: major::IRP_MJ_SET_INFORMATION,
-            operation,
+            operation: nt_io_manager::PendingFileIoOperation::OwnedModeInputCapture(
+                nt_io_manager::PendingOwnedModeInputCapture {
+                    input_va: input,
+                    length,
+                    next_page: input & !(nt_address_space::PAGE_SIZE - 1),
+                    pending_page: 0,
+                    pending_token: 0,
+                    signal_reset: false,
+                }),
             pi: self.pi as u32,
             tid: self.current_tid,
             badge: self.current_badge,
-            iosb_va: if !capture_failed && (status == STATUS_PENDING || policy.publishes_iosb(status)) { iosb } else { 0 },
-            signal_file: !capture_failed && (status == STATUS_PENDING || policy.signals_file(status)),
+            iosb_va: iosb,
+            signal_file: true,
             completion_port_suppressed: true,
             event_obj_idx: u64::MAX,
             ..nt_io_manager::PendingFileIo::default()

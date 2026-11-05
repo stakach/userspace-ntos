@@ -24,6 +24,11 @@ enum Purpose {
     Fault,
     VmLock { token: u64, caller_pi: usize },
     VmCopy { token: u64, caller_pi: usize },
+    RoutedFileModeInput {
+        identity: nt_io_manager::PendingFileIoIdentity,
+        irp_id: u64,
+        token: u64,
+    },
 }
 
 enum Phase {
@@ -112,6 +117,16 @@ pub(crate) unsafe fn submit_for_vm_copy(
         Purpose::VmCopy { token, caller_pi }, reply)
 }
 
+/// The pending File row already owns the original Reply. This worker owns only the exact
+/// routed input page until its provider read is acknowledged or definitively cancelled.
+pub(crate) unsafe fn submit_for_file_mode_input(
+    handler: &mut ExecNtHandler, pi: usize, page: u64, reply: u64,
+    identity: nt_io_manager::PendingFileIoIdentity, irp_id: u64, token: u64,
+) -> Result<crate::routed_pagein_source::RoutedPageInSource, u32> {
+    submit_owned(handler, pi, page, nt_address_space::FaultAccess::Read,
+        Purpose::RoutedFileModeInput { identity, irp_id, token }, reply)
+}
+
 unsafe fn submit_owned(
     handler: &mut ExecNtHandler, pi: usize, page: u64,
     access: nt_address_space::FaultAccess, purpose: Purpose, reply: u64,
@@ -166,6 +181,7 @@ unsafe fn submit_owned(
     let caller_pi = match purpose {
         Purpose::Fault => pi,
         Purpose::VmLock { caller_pi, .. } | Purpose::VmCopy { caller_pi, .. } => caller_pi,
+        Purpose::RoutedFileModeInput { .. } => pi,
     };
     let logical = handler
         .capture_provider_logical_caller(caller_pi, tid, handler.current_badge, tcb)
@@ -738,7 +754,8 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                     return false;
                 }
             }
-            if matches!(work.purpose, Purpose::VmLock { .. } | Purpose::VmCopy { .. }) {
+            if matches!(work.purpose, Purpose::VmLock { .. } | Purpose::VmCopy { .. }
+                | Purpose::RoutedFileModeInput { .. }) {
                 let source = crate::routed_pagein_source::RoutedPageInSource::Mapped {
                     section: work.section, view: work.view, lease: work.lease,
                 };
@@ -747,6 +764,9 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                         token, work.pi, work.page, source, 0),
                     Purpose::VmCopy { token, .. } => crate::vm_copy_work::page_completed(
                         token, work.pi, work.page, source, 0),
+                    Purpose::RoutedFileModeInput { identity, irp_id, token } =>
+                        crate::service_sec_image::file_mode_input_page_completed(
+                            identity, irp_id, token, work.pi, work.page, 0),
                     Purpose::Fault => unreachable!(),
                 };
                 if completed {
@@ -784,7 +804,8 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
             true
         }
         Phase::Cancel => {
-            if matches!(work.purpose, Purpose::VmLock { .. } | Purpose::VmCopy { .. }) {
+            if matches!(work.purpose, Purpose::VmLock { .. } | Purpose::VmCopy { .. }
+                | Purpose::RoutedFileModeInput { .. }) {
                 let source = crate::routed_pagein_source::RoutedPageInSource::Mapped {
                     section: work.section, view: work.view, lease: work.lease,
                 };
@@ -794,6 +815,9 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                         token, work.pi, work.page, source, status),
                     Purpose::VmCopy { token, .. } => crate::vm_copy_work::page_completed(
                         token, work.pi, work.page, source, status),
+                    Purpose::RoutedFileModeInput { identity, irp_id, token } =>
+                        crate::service_sec_image::file_mode_input_page_completed(
+                            identity, irp_id, token, work.pi, work.page, status),
                     Purpose::Fault => unreachable!(),
                 };
                 if completed {
@@ -856,6 +880,7 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         let caller_pi = match work.purpose {
             Purpose::Fault => work.pi,
             Purpose::VmLock { caller_pi, .. } | Purpose::VmCopy { caller_pi, .. } => caller_pi,
+            Purpose::RoutedFileModeInput { .. } => work.pi,
         };
         EXECUTING_CALLER_PI.store(caller_pi as u64, Ordering::Release);
         let done = service_sec_image::with_pagein_caller_target_context(
