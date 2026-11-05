@@ -300,7 +300,8 @@ unsafe fn inline_irq_observation(
     }
 }
 
-fn trace_inline_irq_checkpoint_failure(
+unsafe fn trace_inline_irq_checkpoint_failure(
+    ch: &PumpChannel,
     error: InlineIrqCheckpointError,
     expected_route: PeerRoute,
     expected_dispatch: Option<nt_component_suspension::LaneDispatchIdentity>,
@@ -328,7 +329,28 @@ fn trace_inline_irq_checkpoint_failure(
     crate::print_str(phase);
     crate::print_str(b" mismatch=");
     crate::print_str(mismatch);
-    crate::print_str(b" expected-route/badge/domain/gen/tcb/dispatch/reply=");
+    crate::print_str(b" route-status=");
+    let route_status: &[u8] = match runtime::channel_route(ch) {
+        Ok(Some(_)) => b"resolved",
+        Ok(None) => b"absent",
+        Err(runtime::Error::PhysicalIdentity) => b"physical-identity",
+        Err(runtime::Error::UnknownPeer) => b"unknown-peer",
+        Err(runtime::Error::Admission) => b"admission",
+        Err(runtime::Error::Initialization) => b"initialization",
+        Err(_) => b"other",
+    };
+    crate::print_str(route_status);
+    crate::print_str(b" raw-channel/badge/domain/gen/executor/tcb/pml4/physical-domain/cookie/fault-ep=");
+    crate::print_u64(ch.ingress_route.map_or(0, |route| route.badge()));
+    crate::print_str(b"/"); crate::print_u64(ch.ingress_route.map_or(0, |route| route.identity().domain));
+    crate::print_str(b"/"); crate::print_u64(ch.ingress_route.map_or(0, |route| route.identity().domain_generation));
+    crate::print_str(b"/"); crate::print_u64(ch.ingress_route.map_or(0, |route| route.identity().executor));
+    crate::print_str(b"/"); crate::print_u64(ch.tcb);
+    crate::print_str(b"/"); crate::print_u64(ch.pml4);
+    crate::print_str(b"/"); crate::print_u64(ch.physical_domain.map_or(0, |domain| domain.domain_id.raw()));
+    crate::print_str(b"/"); crate::print_u64(ch.physical_domain.map_or(0, |domain| domain.cookie));
+    crate::print_str(b"/"); crate::print_u64(ch.fault_ep);
+    crate::print_str(b" expected-badge/domain/gen/tcb/dispatch/reply=");
     crate::print_u64(expected_route.badge());
     crate::print_str(b"/"); crate::print_u64(expected_route.identity().domain);
     crate::print_str(b"/"); crate::print_u64(expected_route.identity().domain_generation);
@@ -344,6 +366,15 @@ fn trace_inline_irq_checkpoint_failure(
     crate::print_str(b"/"); crate::print_u64(observed.reply.unwrap_or(0));
     crate::print_str(b"/"); crate::print_u64(owner_kind);
     crate::print_str(b"/"); crate::print_u64(owner_epoch);
+    let running = runtime::hold_snapshot().running;
+    crate::print_str(b" running-lane/index/gen/badge/dispatch/reply/tcb/quarantined=");
+    crate::print_u64(running.map_or(0, |row| u64::from(row.lane.index)));
+    crate::print_str(b"/"); crate::print_u64(running.map_or(0, |row| row.lane.generation));
+    crate::print_str(b"/"); crate::print_u64(running.and_then(|row| row.route).map_or(0, |route| route.badge()));
+    crate::print_str(b"/"); crate::print_u64(running.and_then(|row| row.dispatch).map_or(0, |dispatch| dispatch.epoch()));
+    crate::print_str(b"/"); crate::print_u64(running.and_then(|row| row.binding).map_or(0, |binding| binding.reply_object));
+    crate::print_str(b"/"); crate::print_u64(running.and_then(|row| row.physical).map_or(0, |source| source.tcb));
+    crate::print_str(b"/"); crate::print_u64(running.and_then(|row| row.quarantined).map_or(2, u64::from));
     crate::print_str(b"\n");
 }
 
@@ -353,19 +384,19 @@ unsafe fn service_inline_irq_checkpoint(
 ) -> Result<(), runtime::Error> {
     let before = inline_irq_observation(ch, route);
     let Some(dispatch) = before.dispatch else {
-        trace_inline_irq_checkpoint_failure(InlineIrqCheckpointError::Preflight(
+        trace_inline_irq_checkpoint_failure(ch, InlineIrqCheckpointError::Preflight(
             InlineIrqCheckpointMismatch::Dispatch), route, None, before.reply, before);
         return Err(runtime::Error::PhysicalIdentity);
     };
     let Some(reply) = before.reply else {
-        trace_inline_irq_checkpoint_failure(InlineIrqCheckpointError::Preflight(
+        trace_inline_irq_checkpoint_failure(ch, InlineIrqCheckpointError::Preflight(
             InlineIrqCheckpointMismatch::Reply), route, Some(dispatch), None, before);
         return Err(runtime::Error::PhysicalIdentity);
     };
     let mut checkpoint = match InlineIrqCheckpoint::begin(route, dispatch, reply, before) {
         Ok(checkpoint) => checkpoint,
         Err(error) => {
-            trace_inline_irq_checkpoint_failure(error, route, Some(dispatch), Some(reply), before);
+            trace_inline_irq_checkpoint_failure(ch, error, route, Some(dispatch), Some(reply), before);
             return Err(runtime::Error::PhysicalIdentity);
         }
     };
@@ -373,7 +404,7 @@ unsafe fn service_inline_irq_checkpoint(
     scope.service_irq_yield(ch.shared_va);
     let after = inline_irq_observation(ch, route);
     if let Err(error) = checkpoint.verify_after(after) {
-        trace_inline_irq_checkpoint_failure(error, route, Some(dispatch), Some(reply), after);
+        trace_inline_irq_checkpoint_failure(ch, error, route, Some(dispatch), Some(reply), after);
         return Err(runtime::Error::PhysicalIdentity);
     }
     Ok(())
