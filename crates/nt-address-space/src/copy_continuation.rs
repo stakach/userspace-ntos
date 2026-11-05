@@ -291,6 +291,21 @@ impl<Caller: Copy + Eq, Target: Copy + Eq, Source: Copy + Eq, Irp: Copy + Eq>
         true
     }
 
+    /// A definitive inline read, probe, or write error ends the copy with its committed prefix.
+    /// An entered probe with uncertain self-write cannot be converted into a clean failure.
+    pub fn fail(&mut self, caller: Caller, target: Target, status: u32) -> bool {
+        if status == 0 || status == STATUS_PENDING || !self.exact_owner(caller, target)
+            || !matches!(self.phase, Phase::Ready) || self.probe_entered
+        {
+            return false;
+        }
+        self.phase = Phase::OutputReady(CopyResult {
+            status,
+            transferred: self.transferred,
+        });
+        true
+    }
+
     pub fn finish(&mut self, caller: Caller, target: Target, status: u32) -> bool {
         if !self.exact_owner(caller, target)
             || !matches!(self.phase, Phase::Ready)

@@ -127,3 +127,23 @@ fn terminal_page_error_publishes_only_completed_prefix_once() {
     })));
     assert!(!copy.fail_pending(caller, target, 0x10, section, 9, STATUS_PARTIAL_COPY));
 }
+
+#[test]
+fn inline_copy_error_retains_completed_prefix_without_replaying_probe() {
+    let caller = Caller { process_generation: 1, thread_generation: 2, reply: 3 };
+    let target = Target { process_generation: 4, address_space_generation: 5 };
+    let mut copy = VmCopyContinuation::<Caller, Target, Source, u64>::new(
+        caller, target, 0x1ff0, 0x4ff0, 0x30, 0x8ff8,
+    );
+    assert!(copy.stage_source(caller, target, 0, &[0xa5; 0x10]));
+    assert!(copy.enter_probe_page(caller, target, 0x4ff0));
+    assert!(!copy.fail(caller, target, STATUS_PARTIAL_COPY),
+        "an entered probe has an uncertain self-write until completion");
+    assert!(copy.probe_page_completed(caller, target, 0x4ff0));
+    assert!(copy.enter_probe_page(caller, target, 0x5000));
+    assert!(copy.probe_page_completed(caller, target, 0x5000));
+    assert!(copy.commit_copied(caller, target, 0, 0x10));
+    assert!(copy.fail(caller, target, STATUS_PARTIAL_COPY));
+    assert!(!copy.fail(caller, target, STATUS_PARTIAL_COPY));
+    assert_eq!(copy.output_to_publish(caller, target), Some((0x8ff8, 0x10)));
+}
