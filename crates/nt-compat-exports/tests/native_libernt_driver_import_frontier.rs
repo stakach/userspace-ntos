@@ -611,6 +611,36 @@ fn pinned_virtual_context_retains_exact_provider_allocation_through_miniport_cal
 }
 
 #[test]
+fn acknowledged_context_destroy_retries_receipts_without_replaying_miniport_or_free() {
+    let source = include_str!(
+        "../../../components/ntos-executive/src/hosted_dxg_registration/device/context.rs");
+    let compact: String = source.split_whitespace().collect();
+    assert!(compact.contains("settled_result:Option<u64>"),
+        "retain the acknowledged callback result while native cleanup is pending");
+    let start = source.find("fn finish_settled_context_cleanup(")
+        .expect("a separate post-ACK cleanup path must exist");
+    let helper = &source[start..source[start..].find("\npub(crate) unsafe fn destroy(")
+        .map(|end| start + end).expect("cleanup helper precedes Destroy callback entry")];
+    assert!(!helper.contains("dispatch_dependent_provider_callback"),
+        "cleanup retries cannot re-enter the miniport callback");
+    let helper: String = helper.split_whitespace().collect();
+    assert!(helper.contains("settled_for("),
+        "only the exact ACKed retirement may enter post-Destroy cleanup");
+    assert!(helper.contains("temporary_pool_pin_uncertain")
+        && helper.contains("complete_deferred_free"),
+        "an uncertain physical free must be quarantined, never replayed");
+    assert!(helper.contains("kmd_guard=None") && helper.contains("runtime_guard=None"),
+        "record each successful release before trying the next retained effect");
+    let destroy = &source[source.find("pub(crate) unsafe fn destroy(")
+        .expect("Destroy callback entry")..];
+    let retry = destroy.find("settled_result").expect("exact retry selection");
+    let dispatch = destroy.find("dispatch_dependent_provider_callback")
+        .expect("first entry into miniport");
+    assert!(retry < dispatch,
+        "an ACKed retry must settle retained receipts before any callback dispatch");
+}
+
+#[test]
 fn pinned_gpuva_uncached_page_tables_keep_native_source_and_alias_uncached() {
     let component = include_str!(
         "../../../components/ntos-executive/src/hosted_driver_contiguous_memory.rs");

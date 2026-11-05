@@ -1690,6 +1690,9 @@ pub(super) unsafe fn retire_pdo_aliases_for_instance(
                 pdo_aliases_mut()[index].blocked = false;
             }
         }
+        if domain_matches && pdo_aliases_mut()[index].blocked {
+            device::context::settle_for_instance_retirement(index);
+        }
         if !domain_matches || pdo_aliases_mut()[index].blocked || !callback_entered {
             failures += 1;
             index += 1;

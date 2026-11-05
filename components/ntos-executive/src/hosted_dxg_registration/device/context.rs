@@ -12,6 +12,7 @@ pub(super) struct DxgContextAlias {
     free_route: Option<nt_component_suspension::peer_registry::PeerRoute>,
     retirement: Option<DxgContextCookieRetirement>,
     destroy_entered: bool,
+    settled_result: Option<u64>,
 }
 
 impl DxgContextAlias {
@@ -108,7 +109,7 @@ pub(crate) unsafe fn create(
     dependent_request[0x24..0x44].fill(0);
     pdo_aliases_mut()[alias_index].devices[device_index].contexts.push(DxgContextAlias {
         request_guard: Some(request_guard), runtime_guard, kmd_guard: None, key: None,
-        free_route: None, retirement: None, destroy_entered: false,
+        free_route: None, retirement: None, destroy_entered: false, settled_result: None,
     });
     pdo_aliases_mut()[alias_index].blocked = true;
     let context_index = pdo_aliases_mut()[alias_index].devices[device_index].contexts.len() - 1;
@@ -198,6 +199,73 @@ pub(crate) unsafe fn create(
     Ok(result)
 }
 
+/// The miniport's Destroy and retained Reply have already completed. A later
+/// attempt may release only these exact receipts; it must never replay the DDI
+/// or an uncertain physical cookie free.
+pub(crate) unsafe fn finish_settled_context_cleanup(
+    alias_index: usize, device_index: usize, context_index: usize,
+    key: DxgContextAliasKey,
+    route: nt_component_suspension::peer_registry::PeerRoute,
+    route_identity: nt_hosted_runtime::DxgProcessFreeRoute,
+) -> Result<u64, i32> {
+    let result = {
+        let context = &mut pdo_aliases_mut()[alias_index].devices[device_index]
+            .contexts[context_index];
+        if !context.destroy_entered || context.key != Some(key)
+            || context.free_route != Some(route) || context.request_guard.is_some()
+            || !context.retirement.is_some_and(|held| held.settled_for(key, route_identity))
+        { return Err(STATUS_INVALID_PARAMETER); }
+        let result = context.settled_result.ok_or(STATUS_INVALID_PARAMETER)?;
+        if let Some(guard) = context.kmd_guard.as_mut() {
+            if guard.pin.as_ref().is_some_and(
+                hosted_device_allocations::temporary_pool_pin_uncertain) {
+                return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
+            }
+            if context.retirement.unwrap().free_requested() {
+                guard.complete_deferred_free()?;
+            } else {
+                guard.release()?;
+            }
+            context.kmd_guard = None;
+        }
+        if let Some(guard) = context.runtime_guard.as_mut() {
+            if guard.pin.as_ref().is_some_and(
+                hosted_device_allocations::temporary_pool_pin_uncertain) {
+                return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
+            }
+            guard.release()?;
+            context.runtime_guard = None;
+        }
+        result
+    };
+    pdo_aliases_mut()[alias_index].devices[device_index].contexts.remove(context_index);
+    pdo_aliases_mut()[alias_index].blocked = false;
+    Ok(result)
+}
+
+/// Domain retirement may finish only an already ACKed callback's retained
+/// receipts. An uncertain pin or physical free keeps the alias blocked.
+pub(crate) unsafe fn settle_for_instance_retirement(alias_index: usize) {
+    let mut device_index = 0;
+    while device_index < pdo_aliases_mut()[alias_index].devices.len() {
+        let mut context_index = 0;
+        while context_index < pdo_aliases_mut()[alias_index].devices[device_index].contexts.len() {
+            let alias = &pdo_aliases_mut()[alias_index];
+            let context = &alias.devices[device_index].contexts[context_index];
+            let (Some(key), Some(route), Some(_)) =
+                (context.key, context.free_route, context.settled_result)
+            else { context_index += 1; continue; };
+            let Some(route_identity) = process::free_route_identity(alias.dependent_domain, route)
+            else { context_index += 1; continue; };
+            if finish_settled_context_cleanup(alias_index, device_index,
+                context_index, key, route, route_identity).is_err() {
+                context_index += 1;
+            }
+        }
+        device_index += 1;
+    }
+}
+
 pub(crate) unsafe fn destroy(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_inst: DriverInstance,
@@ -209,6 +277,58 @@ pub(crate) unsafe fn destroy(
     if kmd_context == 0 { return Err(STATUS_INVALID_PARAMETER); }
     let owner = hosted_provider_object_owner_for_pair(
         record.provider_instance, record.dependent_instance).ok_or(STATUS_DEVICE_NOT_READY)?;
+    // A prior invocation may have ACKed Destroy but failed to release a pool
+    // pin. Find only that retained exact owner before ordinary DDI admission.
+    let mut settled = None;
+    for (alias_index, alias) in pdo_aliases_mut().iter().enumerate() {
+        if alias.provider_instance != record.provider_instance
+            || alias.dependent_instance != record.dependent_instance
+            || alias.provider_domain != record.provider_domain
+            || alias.dependent_domain != record.dependent_domain
+            || alias.provider_publication_cookie != record.provider_publication_cookie
+            || !alias.start_succeeded || !alias.blocked || alias.pointer_retired
+        { continue; }
+        for (device_index, device) in alias.devices.iter().enumerate() {
+            let Some(device_key) = device.key else { continue; };
+            for (context_index, context) in device.contexts.iter().enumerate() {
+                let Some(key) = context.key else { continue; };
+                if !context.destroy_entered || context.settled_result.is_none()
+                    || !key.matches_settled_destroy(device_key, kmd_context)
+                { continue; }
+                if settled.replace((alias_index, device_index, context_index, key)).is_some() {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+            }
+        }
+    }
+    if let Some((alias_index, device_index, context_index, key)) = settled {
+        let alias = &pdo_aliases_mut()[alias_index];
+        let dependent_pdo = alias.dependent_alias.ok_or(STATUS_INVALID_PARAMETER)?;
+        if instance_domain_identity(provider_inst) != Some(record.provider_domain)
+            || instance_domain_identity(dependent_inst) != Some(record.dependent_domain)
+            || hosted_device_allocations::capture_allocation(dependent_inst, alias.context).ok()
+                != alias.context_allocation
+            || io_manager_mut().hosted_device_pointer_registration(
+                record.provider_domain, alias.provider_pdo.address()) != Some(alias.provider_pdo)
+            || io_manager_mut().hosted_device_pointer_registration(
+                record.dependent_domain, dependent_pdo.address()) != Some(dependent_pdo)
+            || !alias.authority.is_some_and(|authority| authority.matches(owner,
+                record.provider_publication_cookie, alias.provider_pdo.device_id().raw(),
+                alias.provider_pdo.address(), alias.provider_pdo.generation(),
+                dependent_pdo.address(), dependent_pdo.generation()))
+            || !alias.devices[device_index].kmd_guard.as_ref().is_some_and(|guard|
+                guard.live(dependent_inst, record.dependent_domain))
+        { return Err(STATUS_INVALID_PARAMETER); }
+        let route = hosted_ingress_sources::primary_route(record.dependent_instance)
+            .ok_or(STATUS_DEVICE_NOT_READY)?;
+        if route.identity().executor != dependent_inst.tcb
+            || route.endpoint() != dependent_inst.fault_ep
+        { return Err(STATUS_INVALID_PARAMETER); }
+        let route_identity = process::free_route_identity(record.dependent_domain, route)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        return finish_settled_context_cleanup(alias_index, device_index,
+            context_index, key, route, route_identity);
+    }
     let (alias_index, device_index, context_index) = {
         let mut found = None;
         for (alias_index, alias) in pdo_aliases_mut().iter().enumerate() {
@@ -300,22 +420,16 @@ pub(crate) unsafe fn destroy(
     let context = &mut pdo_aliases_mut()[alias_index].devices[device_index]
         .contexts[context_index];
     let retirement = context.retirement.as_mut().unwrap();
-    let guard = context.kmd_guard.as_mut().unwrap();
     if retirement.free_requested() {
         if !retirement.complete(true, true) { return Err(STATUS_INVALID_PARAMETER); }
-        guard.complete_deferred_free()?;
     } else {
         if !retirement.release_without_free(true, true) {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        guard.release()?;
     }
-    if let Some(runtime_guard) = context.runtime_guard.as_mut() {
-        runtime_guard.release()?;
-    }
-    pdo_aliases_mut()[alias_index].devices[device_index].contexts.remove(context_index);
-    pdo_aliases_mut()[alias_index].blocked = false;
-    Ok(result)
+    context.settled_result = Some(result);
+    finish_settled_context_cleanup(alias_index, device_index,
+        context_index, key, route, route_identity)
 }
 
 pub(crate) unsafe fn defer_cookie_free(

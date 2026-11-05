@@ -35,6 +35,43 @@ fn context_cookie_retirement_requires_active_exact_route_and_ack() {
 }
 
 #[test]
+fn acknowledged_destroy_is_the_only_exact_cleanup_retry_authority() {
+    let owner = HostedProviderObjectOwner::new(1, 11, 2, 22).unwrap();
+    let adapter = DxgPdoAliasAuthority::new(owner, 33, 44,
+        0x1000, 55, 0x2000, 66).unwrap();
+    let device = DxgDeviceAliasKey::new(adapter, 0x3000, 77,
+        0x5000, 88, 0x6000, 99).unwrap();
+    let key = DxgContextAliasKey::new(device, 0x4000, 42, 0x7000, 100).unwrap();
+    let stale_key = DxgContextAliasKey::new(device, 0x4000, 43, 0x7000, 100).unwrap();
+    let route = DxgProcessFreeRoute::new(2, 22, 3, 4, 5, 6).unwrap();
+    let stale_route = DxgProcessFreeRoute::new(2, 22, 3, 4, 5, 7).unwrap();
+
+    // An entered callback, even one requesting a physical cookie free, is not
+    // permission to repeat that free or settle another domain's receipt.
+    let mut free = DxgContextCookieRetirement::new(key, route).unwrap();
+    assert!(free.request_free(key, route, 0x7000, 100));
+    assert!(!free.settled_for(key, route));
+    free.close_callback_interval();
+    assert!(!free.settled_for(key, route));
+    assert!(!free.complete(true, false));
+    assert!(free.complete(true, true));
+    assert!(free.settled_for(key, route));
+    assert!(!free.settled_for(stale_key, route));
+    assert!(!free.settled_for(key, stale_route));
+    assert!(!free.complete(true, true), "the callback/free ACK is one-shot");
+    assert!(!free.request_free(key, route, 0x7000, 100));
+
+    // The no-free path is separately ACKed; retry may release retained pins,
+    // while the miniport callback cannot be entered a second time.
+    let mut no_free = DxgContextCookieRetirement::new(key, route).unwrap();
+    no_free.close_callback_interval();
+    assert!(!no_free.settled_for(key, route));
+    assert!(no_free.release_without_free(true, true));
+    assert!(no_free.settled_for(key, route));
+    assert!(!no_free.release_without_free(true, true));
+}
+
+#[test]
 fn system_context_has_exact_bounded_input_and_output_fields() {
     for version in [0x5022, 0x5023, 0x11007] {
         assert_eq!(DxgDdiSignature::for_offset(version, 0x1d0),

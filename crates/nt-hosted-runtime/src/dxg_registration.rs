@@ -1387,6 +1387,15 @@ impl DxgContextAliasKey {
             && self.context_generation == context_generation
     }
 
+    /// Match a retry of an already ACKed Destroy after the KMD allocation may
+    /// have been freed. The retained retirement still checks its full key and
+    /// route; this address comparison alone never authorizes a native effect.
+    pub fn matches_settled_destroy(self, device: DxgDeviceAliasKey,
+        kmd_context: u64) -> bool
+    {
+        self.device == device && self.kmd_context == kmd_context
+    }
+
     pub const fn cookie_address_conflicts(self, other: Self) -> bool {
         self.kmd_context == other.kmd_context
     }
@@ -1672,6 +1681,14 @@ impl DxgContextCookieRetirement {
     }
 
     pub const fn free_requested(self) -> bool { self.free_requested }
+    /// A terminal callback and its Reply were acknowledged. This exact owner
+    /// may retry only retained receipt cleanup, never the miniport callback.
+    pub fn settled_for(self, key: DxgContextAliasKey,
+        route: DxgProcessFreeRoute) -> bool
+    {
+        self.completed && !self.callback_interval_open
+            && self.key == key && self.route == route
+    }
     pub fn close_callback_interval(&mut self) { self.callback_interval_open = false; }
 
     pub fn complete(&mut self, callback_completed: bool, reply_acknowledged: bool) -> bool {
