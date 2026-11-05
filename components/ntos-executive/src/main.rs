@@ -62,6 +62,7 @@ mod native_directory_open_work;
 mod native_file_target_open_work;
 mod native_directory_effect_work;
 mod provider_section_broker;
+mod gdi_routed_image_work;
 mod provider_service_ingress;
 mod process_information_bridge;
 mod process_information_capture;
@@ -140,6 +141,7 @@ mod mounted_volume_backend;
 mod mounted_create_owner_snapshot;
 mod mounted_volume_ingress_probe;
 mod mounted_section_probe;
+mod mounted_system_image_read;
 mod hosted_routed_section_capture;
 mod routed_section_io;
 mod section_metadata_work;
@@ -17412,6 +17414,7 @@ unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
         + subdrain!(20, section_pagein_work::wake_due(now_100ns))
         + subdrain!(25, native_image_pagein_work::wake_due(now_100ns))
         + subdrain!(19, provider_section_broker::wake_due(now_100ns))
+        + subdrain!(19, gdi_routed_image_work::wake_due(now_100ns))
         + subdrain!(21, provider_directory_broker::wake_due(now_100ns))
         + subdrain!(22, native_directory_open_work::wake_due(now_100ns))
         + subdrain!(22, native_file_target_open_work::wake_due(now_100ns))

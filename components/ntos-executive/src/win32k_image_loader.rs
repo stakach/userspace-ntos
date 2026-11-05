@@ -74,6 +74,22 @@ unsafe fn loaded_name(name: &str, pml4: u64) -> Option<(u64, u32)> {
         .map(|module| (module.image().base, module.image().size))
 }
 
+pub(crate) unsafe fn loaded_image(name: &str, pml4: u64) -> bool {
+    let Ok(name) = module_namespace::module_leaf(name) else { return false; };
+    loaded_name(&name, pml4).is_some()
+}
+
+pub(crate) unsafe fn loaded_exports(name: &str, pml4: u64) -> Option<ImageExports> {
+    let name = module_namespace::module_leaf(name).ok()?;
+    let provider = crate::current_win32k_provider_domain()?;
+    (&*core::ptr::addr_of!(LOADED)).iter().find(|module| {
+        module.backing().exports.name == name
+            && module.backing().pml4 == pml4
+            && module.backing().provider == provider
+            && crate::win32k_subsystem::provider_pool_packet_lease_live(module.backing().handle)
+    }).map(|module| module.backing().exports.clone())
+}
+
 /// Exact byte snapshots acquired before mapping. The routed GDI owner retains these until the
 /// whole dependency closure is mapped; a name alone never authorizes a fresh disk read.
 pub(crate) struct ImageSnapshot {
@@ -554,35 +570,45 @@ pub(crate) unsafe fn service_request(pointer: u64, length: u64,
                 Ok(image) => image,
                 Err(error) => return rejected(b"load-installed", error.ntstatus()),
             };
-            let Some(handle) = module_handle(base, size) else {
-                return rejected(b"module-handle", 0xc000_0008u32 as i32);
-            };
-            let Some(module) = (&*core::ptr::addr_of!(LOADED))
-                .iter()
-                .find(|record| record.handle().address == handle)
-            else {
-                return rejected(b"module-record", 0xc000_0008u32 as i32);
-            };
-            let image = module.image();
-            if !win32k_subsystem::register_gdi_driver_image(
-                name.as_bytes(),
-                base,
-                base + u64::from(image.entry_rva),
-                if image.export_rva == 0 {
-                    0
-                } else {
-                    base + u64::from(image.export_rva)
-                },
-                size,
-            ) {
-                return rejected(b"image-publication", 0xc000_009au32 as i32);
-            }
-            match acquire_load(handle) {
-                Ok(()) => (0, handle),
-                Err(status) => rejected(b"load-reference", status),
+            match publish_loaded_image(&name, base, size) {
+                Ok(handle) => (0, handle),
+                Err(status) => rejected(b"image-publication", status),
             }
         }
     }
+}
+
+pub(crate) unsafe fn load_catalog_and_publish(
+    name: &str, pml4: u64, catalog: &[ImageSnapshot],
+) -> (i32, u64) {
+    let (base, size) = match load_installed_from_catalog(name, pml4, catalog) {
+        Ok(image) => image,
+        Err(error) => return (error.ntstatus(), 0),
+    };
+    match publish_loaded_image(name, base, size) {
+        Ok(handle) => (0, handle),
+        Err(status) => (status, 0),
+    }
+}
+
+unsafe fn publish_loaded_image(name: &str, base: u64, size: u32) -> Result<u64, i32> {
+    let handle = module_handle(base, size).ok_or(0xc000_0008u32 as i32)?;
+    let module = (&*core::ptr::addr_of!(LOADED))
+        .iter()
+        .find(|record| record.handle().address == handle)
+        .ok_or(0xc000_0008u32 as i32)?;
+    let image = module.image();
+    if !win32k_subsystem::register_gdi_driver_image(
+        name.as_bytes(),
+        base,
+        base + u64::from(image.entry_rva),
+        if image.export_rva == 0 { 0 } else { base + u64::from(image.export_rva) },
+        size,
+    ) {
+        return Err(0xc000_009au32 as i32);
+    }
+    acquire_load(handle)?;
+    Ok(handle)
 }
 
 #[inline(never)]

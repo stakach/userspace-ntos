@@ -2818,14 +2818,28 @@ unsafe fn component_pump_loop(
         } else if label == crate::win32k_subsystem::W32_GDI_LOAD_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
-            let (status, module) = if shared_pump::authenticated_badge(ch, msg.badge) {
+            let result = if shared_pump::authenticated_badge(ch, msg.badge) {
                 crate::service_sec_image::service_win32k_gdi_image_request(
                     ch, *reply_cap, msg.badge, msg.mi, msg.m0, msg.m1, [msg.m2, msg.m3],
                 )
             } else {
-                (nt_process::STATUS_INVALID_PARAMETER as i32, 0)
+                crate::gdi_routed_image_work::SubmitResult::Ready(
+                    (nt_process::STATUS_INVALID_PARAMETER as i32, 0),
+                )
             };
-            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, module, 0, 0);
+            match result {
+                crate::gdi_routed_image_work::SubmitResult::Ready((status, module)) => {
+                    pump_reply_recv4_into!(ch, *reply_cap, msg, 2,
+                        status as u32 as u64, module, 0, 0);
+                }
+                crate::gdi_routed_image_work::SubmitResult::Deferred => {
+                    if shared_pump::service_wait_yields(ch) {
+                        outcome.provider_wait_suspended = true;
+                        break;
+                    }
+                    msg = pump_recv(ch, *reply_cap);
+                }
+            }
             continue;
         } else if label == crate::win32k_subsystem::W32_LPC_LABEL
             && ch.caps.kind == ReqKind::Syscall

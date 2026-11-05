@@ -29,7 +29,7 @@ pub(crate) use services::{
     retained_service_reply_not_entered, retained_service_resume_next_deadline,
     retire_stopped_acknowledged_retained_service, wake_file_create_service,
     wake_query_path_rejected_service, wake_query_path_service, wake_hosted_forward_service, wake_registry_service,
-    wake_directory_service, wake_section_create_service, wake_service,
+    wake_directory_service, wake_section_create_service, wake_gdi_image_service, wake_service,
 };
 
 #[path = "component_ingress_retirement.rs"]

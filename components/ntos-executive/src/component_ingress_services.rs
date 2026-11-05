@@ -78,6 +78,7 @@ enum ServiceCompletion {
         token: u64,
         handle: u64,
     },
+    GdiImage { status: i32, module: u64 },
 }
 
 impl ServiceCompletion {
@@ -103,6 +104,9 @@ impl ServiceCompletion {
                 token,
                 handle,
             } => (4, [status as u32 as u64, token, handle, 0]),
+            Self::GdiImage { status, module } => {
+                (2, [status as u32 as u64, if status == 0 { module } else { 0 }, 0, 0])
+            }
         }
     }
 }
@@ -296,6 +300,20 @@ pub(crate) unsafe fn wake_section_create_service(
             token: if status == 0 { token } else { 0 },
             handle: if status == 0 { handle } else { 0 },
         },
+    )
+}
+
+pub(crate) unsafe fn wake_gdi_image_service(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+    status: i32,
+    module: u64,
+) -> Result<(), Error> {
+    wake_with_completion(
+        route, dispatch, reply, token,
+        ServiceCompletion::GdiImage { status, module },
     )
 }
 

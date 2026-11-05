@@ -260,6 +260,7 @@ unsafe fn reconcile_runtime(handler: &mut ExecNtHandler) -> Option<nt_kernel_exe
         && crate::section_metadata_work::next_deadline().is_none()
         && crate::process_image_snapshot_work::next_deadline().is_none()
         && crate::provider_section_broker::next_deadline().is_none()
+        && crate::gdi_routed_image_work::next_deadline().is_none()
     {
         return None;
     }

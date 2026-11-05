@@ -69,7 +69,8 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
         (
             [section_metadata_work::next_deadline(),
                 process_image_snapshot_work::next_deadline(),
-                provider_section_broker::next_deadline()]
+                provider_section_broker::next_deadline(),
+                gdi_routed_image_work::next_deadline()]
                 .into_iter().flatten().min(),
             DELAY_TIMER_SOURCE_SECTION_METADATA,
         ),

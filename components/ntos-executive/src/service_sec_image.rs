@@ -5054,19 +5054,20 @@ pub(crate) unsafe fn service_win32k_gdi_image_request(
     packet: u64,
     length: u64,
     spare: [u64; 2],
-) -> (i32, u64) {
+) -> crate::gdi_routed_image_work::SubmitResult {
+    use crate::gdi_routed_image_work::SubmitResult;
     let rejected = |stage: &[u8], status: u32| {
         print_str(b"[gdi-image-ingress] rejected stage="); print_str(stage);
         print_str(b" status=0x"); print_hex(status);
         print_str(b" tcb=0x"); print_hex_u64(channel.tcb);
         print_str(b" packet=0x"); print_hex_u64(packet);
         print_str(b" length="); print_u64(length); print_str(b"\n");
-        (status as i32, 0)
+        SubmitResult::Ready((status as i32, 0))
     };
     if spare != [0; 2] {
         return rejected(b"spare", nt_process::STATUS_INVALID_PARAMETER);
     }
-    let (route, dispatch, _) = match authenticate_win32k_service_request(
+    let (route, dispatch, caller) = match authenticate_win32k_service_request(
         channel, reply_cap, badge, mi,
         (crate::win32k_subsystem::W32_GDI_LOAD_LABEL << 12) | 4,
     ) {
@@ -5099,7 +5100,19 @@ pub(crate) unsafe fn service_win32k_gdi_image_request(
     print_str(b"[gdi-image-ingress] admitted tcb=0x"); print_hex_u64(channel.tcb);
     print_str(b" packet=0x"); print_hex_u64(packet);
     print_str(b" length="); print_u64(length); print_str(b"\n");
-    crate::driver_launch::service_win32k_gdi_image_request(packet, length, source)
+    match crate::fs_loader::exec_fs_mount_identity().and_then(
+        crate::fs_loader::exec_block_route_kind,
+    ) {
+        Some(nt_fs::BlockSourceKind::Boot) => SubmitResult::Ready(
+            crate::driver_launch::service_win32k_gdi_image_request(packet, length, source),
+        ),
+        Some(nt_fs::BlockSourceKind::Native | nt_fs::BlockSourceKind::Draining) => {
+            crate::gdi_routed_image_work::submit_routed_gdi_image(
+                route, dispatch, reply_cap, caller, source, packet, length,
+            )
+        }
+        None => rejected(b"mount-route", nt_fs::STATUS_DEVICE_NOT_READY),
+    }
 }
 
 /// Directory-object requests carry only inline IPC words; all authority is reconstructed here.
@@ -9917,6 +9930,7 @@ pub(crate) unsafe fn service_sec_image(
                 && crate::section_pagein_work::next_deadline().is_none()
                 && crate::native_image_pagein_work::next_deadline().is_none()
                 && crate::provider_section_broker::next_deadline().is_none()
+                && !crate::gdi_routed_image_work::has_outstanding()
                 && !crate::native_directory_open_work::occupied()
                 && !crate::native_file_target_open_work::occupied()
                 && !crate::native_directory_effect_work::has_outstanding(&nt_handler)
@@ -10107,6 +10121,7 @@ pub(crate) unsafe fn service_sec_image(
             crate::section_pagein_work::redrive(&mut nt_handler);
             crate::native_image_pagein_work::redrive(&mut nt_handler, &nt_dispatcher);
             crate::provider_section_broker::redrive(nt_handler as *mut _);
+            crate::gdi_routed_image_work::redrive(&mut nt_handler);
             crate::provider_directory_broker::redrive(nt_handler as *mut _);
             crate::provider_mm_section_objects::redrive(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_driver_io_create_file(nt_handler as *mut _);
