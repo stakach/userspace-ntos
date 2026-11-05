@@ -300,7 +300,8 @@ pub(crate) unsafe fn refuse_unentered(ticket: FoldTicket, status: nt_status::NtS
 }
 
 pub(crate) unsafe fn complete(ticket: FoldTicket, result: Result<&[u8], nt_status::NtStatus>)
-    -> Result<(), u32> {
+    -> Result<super::super::native_snapshot_io::SnapshotCompletion, u32> {
+    use super::super::native_snapshot_io::SnapshotCompletion;
     let slot = &mut *core::ptr::addr_of_mut!(WORK);
     let Some(Work::Active(active)) = slot.as_mut()
         else { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); };
@@ -314,10 +315,10 @@ pub(crate) unsafe fn complete(ticket: FoldTicket, result: Result<&[u8], nt_statu
     };
     if completed.is_err() {
         active.failed = true;
-        return Err(block(nt_fs::STATUS_DEVICE_NOT_READY));
+        return Ok(SnapshotCompletion::Failed(block(nt_fs::STATUS_DEVICE_NOT_READY)));
     }
     active.entered = false;
-    if !active.cursor.as_ref().expect("active fold cursor").is_done() { return Ok(()); }
+    if !active.cursor.as_ref().expect("active fold cursor").is_done() { return Ok(SnapshotCompletion::Settled); }
     let Some(Work::Active(mut active)) = slot.take() else { unreachable!() };
     match active.cursor.take().expect("completed fold cursor") {
         Cursor::First(commit) => {
@@ -328,12 +329,12 @@ pub(crate) unsafe fn complete(ticket: FoldTicket, result: Result<&[u8], nt_statu
                     active.cursor = Some(Cursor::First(commit));
                     active.failed = true;
                     *slot = Some(Work::Active(active));
-                    return Err(block(nt_fs::STATUS_DATA_ERROR));
+                    return Ok(SnapshotCompletion::Failed(block(nt_fs::STATUS_DATA_ERROR)));
                 }
             };
             if pair.anchor() != active.token.anchor() {
-                return Err(stall_second_admission(slot, active, image, pair,
-                    nt_fs::STATUS_DATA_ERROR));
+                return Ok(SnapshotCompletion::Failed(stall_second_admission(slot, active, image, pair,
+                    nt_fs::STATUS_DATA_ERROR)));
             }
             WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
             WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);
@@ -343,8 +344,8 @@ pub(crate) unsafe fn complete(ticket: FoldTicket, result: Result<&[u8], nt_statu
                 active.lease.store(), image, fold_manifest(active.manifest),
                 active.lease.sector_size(), active.lease.sector_count(), pair) } {
                 Ok(second) => second,
-                Err((error, image, pair)) => return Err(stall_second_admission(
-                    slot, active, image, pair, snapshot_store_error_status(error))),
+                Err((error, image, pair)) => return Ok(SnapshotCompletion::Failed(stall_second_admission(
+                    slot, active, image, pair, snapshot_store_error_status(error)))),
             };
             active.cursor = Some(Cursor::Second(second));
             *slot = Some(Work::Active(active));
@@ -356,7 +357,7 @@ pub(crate) unsafe fn complete(ticket: FoldTicket, result: Result<&[u8], nt_statu
                     active.cursor = Some(Cursor::Second(commit));
                     active.failed = true;
                     *slot = Some(Work::Active(active));
-                    return Err(block(nt_fs::STATUS_DATA_ERROR));
+                    return Ok(SnapshotCompletion::Failed(block(nt_fs::STATUS_DATA_ERROR)));
                 }
             };
             WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
@@ -364,16 +365,16 @@ pub(crate) unsafe fn complete(ticket: FoldTicket, result: Result<&[u8], nt_statu
             WRITABLE_FS_SNAPSHOT_COMMIT_BYTES.store(active.bytes as u64, Ordering::Relaxed);
             if pair.anchor() != active.token.anchor() {
                 active.old_pair = Some(pair);
-                return Err(stall(slot, active, nt_fs::STATUS_DATA_ERROR));
+                return Ok(SnapshotCompletion::Failed(stall(slot, active, nt_fs::STATUS_DATA_ERROR)));
             }
             active.old_pair = Some(pair);
             let (start, sectors) = match snapshot_storage::wal_bounds(&active.lease) {
                 Ok(bounds) => bounds,
-                Err(status) => return Err(stall(slot, active, status)),
+                Err(status) => return Ok(SnapshotCompletion::Failed(stall(slot, active, status))),
             };
             if needs_epoch_rollover(active.manifest.high_water_end_lba, sectors) {
                 let Some(next) = active.manifest.incarnation.checked_add(1) else {
-                    return Err(stall(slot, active, nt_fs::STATUS_DATA_ERROR));
+                    return Ok(SnapshotCompletion::Failed(stall(slot, active, nt_fs::STATUS_DATA_ERROR)));
                 };
                 let pair = active.old_pair.take().expect("second folded pair retained");
                 let cursor = match AsyncWalEpochRollover::admit(active.lease.store(), pair,
@@ -381,7 +382,7 @@ pub(crate) unsafe fn complete(ticket: FoldTicket, result: Result<&[u8], nt_statu
                 { Ok(cursor) => cursor,
                     Err((error, pair)) => {
                         active.old_pair = Some(pair);
-                        return Err(stall(slot, active, snapshot_store_error_status(error)));
+                        return Ok(SnapshotCompletion::Failed(stall(slot, active, snapshot_store_error_status(error))));
                     }
                 };
                 active.cursor = Some(Cursor::Rollover(cursor));
@@ -398,13 +399,13 @@ pub(crate) unsafe fn complete(ticket: FoldTicket, result: Result<&[u8], nt_statu
                     active.cursor = Some(Cursor::Rollover(cursor));
                     active.failed = true;
                     *slot = Some(Work::Active(active));
-                    return Err(block(nt_fs::STATUS_DATA_ERROR));
+                    return Ok(SnapshotCompletion::Failed(block(nt_fs::STATUS_DATA_ERROR)));
                 }
             };
             publish_ready(active, Some(next), pair);
         }
     }
-    Ok(())
+    Ok(SnapshotCompletion::Settled)
 }
 
 fn stall(slot: &mut Option<Work>, active: Active, status: u32) -> u32 {

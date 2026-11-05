@@ -203,8 +203,9 @@ pub(crate) unsafe fn refuse_unentered_storage_io(
 }
 
 pub(crate) unsafe fn complete_storage_io(ticket: SnapshotStorageTicket,
-    result: Result<&[u8], nt_status::NtStatus>) -> Result<(), u32>
+    result: Result<&[u8], nt_status::NtStatus>) -> Result<crate::writable_fs::native_snapshot_io::SnapshotCompletion, u32>
 {
+    use crate::writable_fs::native_snapshot_io::SnapshotCompletion;
     let owner = (&mut *core::ptr::addr_of_mut!(PENDING_HEADER)).as_mut()
         .ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
     let HeaderState::Running(recheck) = &mut owner.state else { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); };
@@ -217,13 +218,13 @@ pub(crate) unsafe fn complete_storage_io(ticket: SnapshotStorageTicket,
         Err(_) => {
             owner.failed = Some(nt_fs::STATUS_DEVICE_NOT_READY);
             WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
-            return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+            return Ok(SnapshotCompletion::Failed(nt_fs::STATUS_DEVICE_NOT_READY));
         }
     };
     if recheck.complete_read(ticket.request, bytes).is_err() {
         owner.failed = Some(nt_fs::STATUS_DATA_ERROR);
         WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
-        return Err(nt_fs::STATUS_DATA_ERROR);
+        return Ok(SnapshotCompletion::Failed(nt_fs::STATUS_DATA_ERROR));
     }
     owner.entered = false;
     if recheck.is_done() {
@@ -235,7 +236,7 @@ pub(crate) unsafe fn complete_storage_io(ticket: SnapshotStorageTicket,
             Err(recheck) => HeaderState::Running(recheck),
         };
     }
-    Ok(())
+    Ok(SnapshotCompletion::Settled)
 }
 
 /// Transfer the exact lease and proof only after both authenticated native reads completed.

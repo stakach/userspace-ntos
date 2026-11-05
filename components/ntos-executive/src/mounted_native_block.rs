@@ -429,9 +429,26 @@ impl WorkClaim {
     fn complete(self, result: Result<&[u8], nt_status::NtStatus>) {
         match self {
             Self::Sector(claim) => claim.complete(result.map_err(|_| nt_fs::FatPathError::Corrupt)),
-            Self::Snapshot(claim) => unsafe {
-                crate::writable_fs::native_snapshot_io::complete_native_snapshot_io(claim, result)
-            }.expect("acknowledged snapshot claim lost"),
+            Self::Snapshot(claim) => {
+                use crate::writable_fs::native_snapshot_io::SnapshotCompletion;
+                let owner_kind = claim.owner_kind();
+                let provider_status = result.err().map(|status| status.raw() as u32);
+                match unsafe {
+                    crate::writable_fs::native_snapshot_io::complete_native_snapshot_io(claim, result)
+                } {
+                    Ok(SnapshotCompletion::Settled) => {},
+                    Ok(SnapshotCompletion::Failed(status)) => {
+                        print_str(b"[native-snapshot-terminal] owner=");
+                        print_str(owner_kind);
+                        print_str(b" provider-status=0x");
+                        print_hex64(provider_status.unwrap_or(0) as u64);
+                        print_str(b" owner-status=0x");
+                        print_hex64(status as u64);
+                        print_str(b"\n");
+                    }
+                    Err(_) => panic!("acknowledged snapshot owner identity lost"),
+                }
+            }
         }
     }
 

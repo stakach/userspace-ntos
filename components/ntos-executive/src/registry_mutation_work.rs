@@ -858,7 +858,7 @@ pub(crate) unsafe fn refuse_unentered_native_wal_io(
 
 pub(crate) unsafe fn complete_native_wal_io(
     id: u64, request: nt_fs::AsyncWalIoRequest, result: Result<&[u8], nt_status::NtStatus>,
-) -> Result<(), u32> {
+) -> Result<writable_fs::native_snapshot_io::SnapshotCompletion, u32> {
     let settled = native_wal_by_id(id)?.complete_native_io(request, result);
     NEXT.store(monotonic_time_100ns(), Ordering::Release);
     settled

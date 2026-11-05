@@ -202,8 +202,9 @@ pub(super) unsafe fn refuse_unentered(ticket: CheckpointTicket, status: nt_statu
 }
 
 pub(super) unsafe fn complete(ticket: CheckpointTicket,
-    result: Result<&[u8], nt_status::NtStatus>) -> Result<(), u32>
+    result: Result<&[u8], nt_status::NtStatus>) -> Result<super::native_snapshot_io::SnapshotCompletion, u32>
 {
+    use super::native_snapshot_io::SnapshotCompletion;
     let slot = &mut *core::ptr::addr_of_mut!(WORK);
     let Some(Work::Committing { id, commit, entered, failed, .. }) = slot.as_mut()
         else { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); };
@@ -218,10 +219,10 @@ pub(super) unsafe fn complete(ticket: CheckpointTicket,
     };
     if completed.is_err() {
         *failed = true;
-        return Err(block(nt_fs::STATUS_DEVICE_NOT_READY));
+        return Ok(SnapshotCompletion::Failed(block(nt_fs::STATUS_DEVICE_NOT_READY)));
     }
     *entered = false;
-    if !commit.is_done() { return Ok(()); }
+    if !commit.is_done() { return Ok(SnapshotCompletion::Settled); }
     let Some(Work::Committing { lease, token, old_proof, commit, bytes, .. }) = slot.take()
         else { unreachable!() };
     // Every cursor completion above came from exact native provider terminal + ACK.
@@ -232,7 +233,7 @@ pub(super) unsafe fn complete(ticket: CheckpointTicket,
             core::mem::forget(lease);
             core::mem::forget(token);
             core::mem::forget(old_proof);
-            return Err(block(nt_fs::STATUS_DATA_ERROR));
+            return Ok(SnapshotCompletion::Failed(block(nt_fs::STATUS_DATA_ERROR)));
         }
     };
     if pair.anchor() != token.anchor() {
@@ -240,16 +241,16 @@ pub(super) unsafe fn complete(ticket: CheckpointTicket,
         core::mem::forget(token);
         core::mem::forget(old_proof);
         core::mem::forget(pair);
-        return Err(block(nt_fs::STATUS_DATA_ERROR));
+        return Ok(SnapshotCompletion::Failed(block(nt_fs::STATUS_DATA_ERROR)));
     }
     drop(old_proof);
     if let Err((status, token, pair)) = snapshot_storage::install_wal_continuation(&lease, token, pair) {
         core::mem::forget(lease);
         core::mem::forget(token);
         core::mem::forget(pair);
-        return Err(block(status));
+        return Ok(SnapshotCompletion::Failed(block(status)));
     }
     drop(lease);
     *slot = Some(Work::Done { generation, bytes });
-    Ok(())
+    Ok(SnapshotCompletion::Settled)
 }

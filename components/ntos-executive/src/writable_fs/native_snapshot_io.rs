@@ -17,6 +17,13 @@ enum SnapshotOwnerToken {
     Fold(super::system_wal_fold::native::FoldTicket),
 }
 
+/// The exact provider terminal was consumed by the retained owner. A failed terminal leaves
+/// that owner blocked; only the outer `Err` means the claimed identity disappeared.
+pub(crate) enum SnapshotCompletion {
+    Settled,
+    Failed(u32),
+}
+
 #[must_use = "retain the native snapshot claim through exact provider terminal and ACK"]
 pub(crate) struct SnapshotClaim {
     pub mount: SectionMountId,
@@ -26,6 +33,16 @@ pub(crate) struct SnapshotClaim {
 }
 
 impl SnapshotClaim {
+    pub(crate) fn owner_kind(&self) -> &'static [u8] {
+        match &self.owner {
+            SnapshotOwnerToken::Mutation { .. } => b"mutation",
+            SnapshotOwnerToken::RelationWal { .. } => b"relation-wal",
+            SnapshotOwnerToken::Hive(_) => b"hive",
+            SnapshotOwnerToken::Storage(_) => b"storage",
+            SnapshotOwnerToken::Checkpoint(_) => b"checkpoint",
+            SnapshotOwnerToken::Fold(_) => b"fold",
+        }
+    }
     pub(crate) fn from_hive(
         mount: SectionMountId, operation: nt_fs::BlockOperation, input: Vec<u8>,
         ticket: super::hive_wal::HiveTicket,
@@ -169,7 +186,7 @@ pub(crate) unsafe fn refuse_unentered_native_snapshot_io(
 
 pub(crate) unsafe fn complete_native_snapshot_io(
     claim: SnapshotClaim, result: Result<&[u8], nt_status::NtStatus>,
-) -> Result<(), u32> {
+) -> Result<SnapshotCompletion, u32> {
     match claim.owner {
         SnapshotOwnerToken::Hive(ticket) => super::hive_wal::complete_native_hive_io(ticket, result),
         SnapshotOwnerToken::Mutation { work_id, request } =>

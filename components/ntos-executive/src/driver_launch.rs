@@ -54835,7 +54835,7 @@ pub(crate) unsafe fn refuse_unentered_native_relation_wal(
 pub(crate) unsafe fn complete_native_relation_wal_io(
     claim: nt_pnp_manager::DeviceRelationInvalidation, request: nt_fs::AsyncWalIoRequest,
     result: Result<&[u8], nt_status::NtStatus>,
-) -> Result<(), u32> {
+) -> Result<crate::writable_fs::native_snapshot_io::SnapshotCompletion, u32> {
     relation_wal_for(claim)?.complete_native_io(request, result)
 }
 

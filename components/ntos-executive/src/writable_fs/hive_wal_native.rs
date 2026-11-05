@@ -463,7 +463,8 @@ pub(crate) unsafe fn refuse_unentered_native_hive_io(
 
 pub(crate) unsafe fn complete_native_hive_io(
     ticket: HiveTicket, result: Result<&[u8], nt_status::NtStatus>,
-) -> Result<(), u32> {
+) -> Result<super::super::native_snapshot_io::SnapshotCompletion, u32> {
+    use super::super::native_snapshot_io::SnapshotCompletion;
     let _durable = crate::allocator::enter_durable();
     let journal = (&mut *core::ptr::addr_of_mut!(JOURNAL)).as_mut()
         .ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
@@ -475,17 +476,20 @@ pub(crate) unsafe fn complete_native_hive_io(
                 _ => Err(SnapshotBlockStoreError::Io),
             };
             if let Err(error) = wal.complete_async(request, effect) {
+                if error == nt_fs::RegistryWalError::InvalidState {
+                    return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+                }
                 journal.failed = Some(block(wal_status(error)));
-                return Err(journal.failed.unwrap());
+                return Ok(SnapshotCompletion::Failed(journal.failed.unwrap()));
             }
             *entered = false;
-            if wal.async_active() || wal.state() != RegistryWalState::Ready { return Ok(()); }
+            if wal.async_active() || wal.state() != RegistryWalState::Ready { return Ok(SnapshotCompletion::Settled); }
             let Phase::Wal { wal, proof, store, mount, snapshot_lba, .. } =
                 core::mem::replace(&mut journal.phase, Phase::Failed) else { unreachable!() };
             let verified = match wal.into_verified_device() {
                 Ok(verified) => verified.into_full_device(),
                 Err(wal) => { core::mem::forget(wal); core::mem::forget(proof);
-                    return Err(block(nt_fs::STATUS_DATA_ERROR)); }
+                    return Ok(SnapshotCompletion::Failed(block(nt_fs::STATUS_DATA_ERROR))); }
             };
             let update = match AsyncWalSnapshotAnchorUpdate::admit_verified_wal_pair(
                 store, verified, proof) {
@@ -493,36 +497,39 @@ pub(crate) unsafe fn complete_native_hive_io(
                 Err((error, verified, proof)) => {
                     core::mem::forget(verified);
                     core::mem::forget(proof);
-                    return Err(block(snapshot_store_error_status(error)));
+                    return Ok(SnapshotCompletion::Failed(block(snapshot_store_error_status(error))));
                 }
             };
             journal.phase = Phase::Anchor { update, mount,
                 base_lba: snapshot_lba, entered: false };
-            Ok(())
+            Ok(SnapshotCompletion::Settled)
         }
         (Phase::Anchor { update, entered, .. }, HiveRequest::Anchor(request)) if *entered => {
+            if update.pending() != Some(request) {
+                return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+            }
             let settled = matches!(result, Ok(bytes) if bytes.is_empty());
             if update.complete(request, settled).is_err() {
                 journal.failed = Some(block(nt_fs::STATUS_DEVICE_NOT_READY));
-                return Err(journal.failed.unwrap());
+                return Ok(SnapshotCompletion::Failed(journal.failed.unwrap()));
             }
             *entered = false;
-            if !update.is_done() { return Ok(()); }
+            if !update.is_done() { return Ok(SnapshotCompletion::Settled); }
             let Phase::Anchor { update, .. } =
                 core::mem::replace(&mut journal.phase, Phase::Failed) else { unreachable!() };
             let (lease, anchored) = match update.into_anchored_publication() {
                 Ok(parts) => parts,
                 Err(update) => { core::mem::forget(update);
-                    return Err(block(nt_fs::STATUS_DATA_ERROR)); }
+                    return Ok(SnapshotCompletion::Failed(block(nt_fs::STATUS_DATA_ERROR))); }
             };
             if let Err(status) = replay_anchored_record(&journal.path, &journal.record,
                 &journal.baseline, journal.new_log_len, ReplayMountError::NativeInvalidHandle) {
                 core::mem::forget(lease);
                 core::mem::forget(anchored);
-                return Err(status);
+                return Ok(SnapshotCompletion::Failed(status));
             }
             journal.phase = Phase::Ready { lease, anchored: Some(anchored) };
-            Ok(())
+            Ok(SnapshotCompletion::Settled)
         }
         _ => Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST),
     }

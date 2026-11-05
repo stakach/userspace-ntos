@@ -223,18 +223,21 @@ impl Journal {
     }
 
     pub(crate) fn complete_native_io(&mut self, request: nt_fs::AsyncWalIoRequest,
-        result: Result<&[u8], nt_status::NtStatus>) -> Result<(), u32> {
+        result: Result<&[u8], nt_status::NtStatus>) -> Result<super::native_snapshot_io::SnapshotCompletion, u32> {
+        use super::native_snapshot_io::SnapshotCompletion;
         if let Some(Stage::AsyncAnchoring(update)) = self.stage.as_mut() {
-            if !self.anchor_entered { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); }
+            if !self.anchor_entered || update.pending() != Some(anchor_request(request)) {
+                return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+            }
             let settled = matches!(result, Ok(bytes) if bytes.is_empty());
             // The outer native block executor invokes this only after exact terminal + ACK.
             let completed = unsafe { update.complete(anchor_request(request), settled) };
             if completed.is_err() {
                 WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
-                return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+                return Ok(SnapshotCompletion::Failed(nt_fs::STATUS_DEVICE_NOT_READY));
             }
             self.anchor_entered = false;
-            return Ok(());
+            return Ok(SnapshotCompletion::Settled);
         }
         let Some(Stage::Wal(wal)) = self.stage.as_mut() else { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); };
         let settled = match result {
@@ -242,10 +245,13 @@ impl Journal {
             _ => Err(nt_fs::SnapshotBlockStoreError::Io),
         };
         if let Err(error) = wal.complete_async(request, settled) {
+            if error == RegistryWalError::InvalidState {
+                return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+            }
             WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
-            return Err(status(error));
+            return Ok(SnapshotCompletion::Failed(status(error)));
         }
-        Ok(())
+        Ok(SnapshotCompletion::Settled)
     }
 
     /// Admit only the mounted v2 pair whose exact anchored WAL prefix was recovered.
