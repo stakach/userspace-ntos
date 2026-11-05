@@ -145,14 +145,31 @@ impl<Caller: Copy + Eq, Source: Copy + Eq, Irp: Copy + Eq>
         true
     }
 
-    /// Returns the exact page-contained self-write, entering it before native effects.
-    pub fn enter_write(&mut self, caller: Caller) -> Option<(u64, &[u8])> {
+    /// A definitive admission failure before the next count self-write may preserve an earlier
+    /// confirmed page. An entered write remains uncertain and cannot take this transition.
+    pub fn fail_before_write(&mut self, caller: Caller, status: u32) -> bool {
+        if status == 0 || status == 0x103 || !self.exact(caller)
+            || self.captured != COUNT_BYTES || self.written == COUNT_BYTES
+            || self.failure.is_some() || self.pending.is_some() || self.write_entered
+        {
+            return false;
+        }
+        self.failure = Some(status);
+        true
+    }
+
+    pub fn next_write(&self, caller: Caller) -> Option<(u64, usize)> {
         if !self.exact(caller) || self.captured != COUNT_BYTES || self.pending.is_some()
             || self.write_entered || self.failure.is_some()
         {
             return None;
         }
-        let (address, length) = self.chunk(self.written)?;
+        self.chunk(self.written)
+    }
+
+    /// Returns the exact page-contained self-write, entering it before native effects.
+    pub fn enter_write(&mut self, caller: Caller) -> Option<(u64, &[u8])> {
+        let (address, length) = self.next_write(caller)?;
         self.write_entered = true;
         Some((address, &self.original[self.written..self.written + length]))
     }
