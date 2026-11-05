@@ -22,6 +22,11 @@ fn uncached_gpu_page_table_uses_the_same_frame_attributes_for_source_and_alias()
 
     let producer = ContiguousRamOwner { instance: 6, generation: 19, domain: 23 };
     let consumer = ContiguousRamOwner { instance: 7, generation: 31, domain: 24 };
+    let mut prepared = ContiguousRamPrepareTable::new();
+    let ticket = prepared.prepare(producer, 0x445, 2 * PAGE, 0, u64::MAX).unwrap();
+    let request = prepared.commit(producer, 0x445, ticket, 0, 0).unwrap();
+    assert_eq!((request.length, request.boundary, request.cache), (2 * PAGE, 0, 0));
+    assert!(prepared.commit(producer, 0x445, ticket, 0, 1).is_err());
     let physical = 0x2000_0000;
     let source = ContiguousRamPublishedMapping::new(
         producer, 0x103_0000_0000, physical, 2 * PAGE, 0).unwrap();
@@ -29,13 +34,17 @@ fn uncached_gpu_page_table_uses_the_same_frame_attributes_for_source_and_alias()
         Some(0x103_0000_0000));
     assert_eq!(source.virtual_address(producer, physical, 2 * PAGE, 1), None);
     let alias_cache = ContiguousRamCachePolicy::for_nt_type(0).unwrap();
-    let alias = ContiguousRamProjectedMapping::new(source, producer, consumer,
+    let mut alias = ContiguousRamProjectedMapping::new(source, producer, consumer,
         0x104_0000_0000, physical, 2 * PAGE, 0).unwrap();
     assert_eq!(alias.virtual_address(consumer, physical, 2 * PAGE, 0),
         Some(0x104_0000_0000));
     assert_eq!(alias.virtual_address(consumer, physical, 2 * PAGE, 1), None);
     assert_eq!(alias_cache.compressed_map_rights(RW_NX),
         cache.compressed_map_rights(RW_NX));
+    assert!(alias.retire_exact(producer, 0x104_0000_0000, 2 * PAGE).is_err());
+    assert!(alias.retire_exact(consumer, 0x104_0000_0000, PAGE).is_err());
+    alias.retire_exact(consumer, 0x104_0000_0000, 2 * PAGE).unwrap();
+    assert_eq!(alias.virtual_address(consumer, physical, 2 * PAGE, 0), None);
 }
 
 #[test]
