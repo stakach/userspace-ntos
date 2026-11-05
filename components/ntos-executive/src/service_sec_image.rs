@@ -5229,10 +5229,13 @@ pub(crate) unsafe fn service_win32k_section_create_request(
             }
         };
         let handler = handler as *mut ExecNtHandler;
+        if op == mm_wire::OP_MAP {
+            return crate::provider_section_map_work::submit(
+                &mut *handler, channel, route, dispatch, caller, physical, first, second);
+        }
         let result = match op {
             mm_wire::OP_REFERENCE => crate::provider_mm_section_objects::reference(handler, first, physical)
                 .map(|count| (count, 0)),
-            mm_wire::OP_MAP => crate::provider_mm_section_objects::map(handler, first, physical, second, caller),
             mm_wire::OP_MAP_CLIENT => crate::provider_mm_section_objects::map_client(
                 handler, first, physical, second, third >> 8, (third & 0xff) as u32),
             _ => unreachable!(),
@@ -9928,6 +9931,7 @@ pub(crate) unsafe fn service_sec_image(
                 && crate::section_metadata_work::next_deadline().is_none()
                 && crate::process_image_snapshot_work::next_deadline().is_none()
                 && crate::section_pagein_work::next_deadline().is_none()
+                && crate::provider_section_map_work::next_deadline().is_none()
                 && crate::native_image_pagein_work::next_deadline().is_none()
                 && crate::provider_section_broker::next_deadline().is_none()
                 && !crate::gdi_routed_image_work::has_outstanding()
@@ -10119,6 +10123,7 @@ pub(crate) unsafe fn service_sec_image(
                 ntdll, fault_ep, procs, exe_images, &*exe_image_catalog,
                 hosted_loaded_images_ptr);
             crate::section_pagein_work::redrive(&mut nt_handler);
+            crate::provider_section_map_work::redrive(&mut nt_handler);
             crate::native_image_pagein_work::redrive(&mut nt_handler, &nt_dispatcher);
             crate::provider_section_broker::redrive(nt_handler as *mut _);
             crate::gdi_routed_image_work::redrive(&mut nt_handler);

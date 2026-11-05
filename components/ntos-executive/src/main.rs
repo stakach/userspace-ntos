@@ -148,6 +148,7 @@ mod section_metadata_work;
 mod process_image_snapshot_work;
 mod hosted_spawn_uncertainty;
 mod section_pagein_work;
+mod provider_section_map_work;
 mod native_image_pagein_work;
 pub(crate) use fs_loader::*;
 mod hosted_bootstrap;
@@ -17453,6 +17454,7 @@ unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
         + subdrain!(18, section_metadata_work::wake_due(now_100ns))
         + subdrain!(24, process_image_snapshot_work::wake_due(now_100ns))
         + subdrain!(20, section_pagein_work::wake_due(now_100ns))
+        + subdrain!(13, provider_section_map_work::wake_due(now_100ns))
         + subdrain!(25, native_image_pagein_work::wake_due(now_100ns))
         + subdrain!(19, provider_section_broker::wake_due(now_100ns))
         + subdrain!(19, gdi_routed_image_work::wake_due(now_100ns))

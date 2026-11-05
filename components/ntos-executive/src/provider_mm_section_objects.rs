@@ -90,6 +90,10 @@ unsafe fn table(handler: *mut ExecNtHandler) -> Result<*mut GenericSectionTable,
     }
 }
 
+pub(crate) unsafe fn table_for_map_validation(
+    handler: *mut ExecNtHandler,
+) -> Result<*mut GenericSectionTable, u32> { table(handler) }
+
 unsafe fn object(address: u64, physical: runtime::PhysicalSource) -> Result<*mut Object, u32> {
     (&mut *core::ptr::addr_of_mut!(OBJECTS)).iter_mut()
         .find(|row| address != 0 && row.address == address
@@ -307,10 +311,33 @@ fn rights(protection: u32) -> Result<u64, u32> {
     }
 }
 
-pub(crate) unsafe fn map(
-    handler: *mut ExecNtHandler, address: u64, physical: runtime::PhysicalSource, requested_size: u64,
-    caller: nt_process::native_handle::NativeHandleCaller,
-) -> Result<(u64, u64), u32> {
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedMap {
+    pub(crate) address: u64,
+    pub(crate) physical: runtime::PhysicalSource,
+    pub(crate) section: nt_memory_manager::SectionIdentity,
+    pub(crate) backing: GenericSection,
+    pub(crate) view: ProviderSectionView,
+    pub(crate) base: u64,
+    pub(crate) size: u64,
+    pub(crate) pages: usize,
+    rights: u64,
+}
+
+unsafe fn prepared_mapping(prepared: PreparedMap) -> Result<(*mut Object, *mut Mapping), u32> {
+    let row = object(prepared.address, prepared.physical)?;
+    if !(*row).published || (*row).retiring || (*row).uncertain { return Err(INVALID); }
+    let mapping = (*row).maps.iter_mut().find(|mapping| mapping.view == prepared.view
+        && !mapping.published && !mapping.retiring && !mapping.uncertain)
+        .map(|mapping| &mut **mapping as *mut Mapping).ok_or(INVALID)?;
+    Ok((row, mapping))
+}
+
+/// Reserve an unpublished provider view and all receipt storage before any page fill.
+pub(crate) unsafe fn prepare_map(
+    handler: *mut ExecNtHandler, address: u64, physical: runtime::PhysicalSource,
+    requested_size: u64, caller: nt_process::native_handle::NativeHandleCaller,
+) -> Result<PreparedMap, u32> {
     let _durable = crate::allocator::enter_durable();
     let row = object(address, physical).map_err(|status| map_failure(b"object-owner", address, status))?;
     if !(*row).published || (*row).retiring || (*row).uncertain {
@@ -342,64 +369,145 @@ pub(crate) unsafe fn map(
     tables.try_reserve_exact((span / TABLE_SIZE) as usize).map_err(|_| NO_MEMORY)?;
     tables.resize((span / TABLE_SIZE) as usize, Cap::default());
     (*row).maps.try_reserve(1).map_err(|_| NO_MEMORY)?;
-    // The canonical view fences source frames before any map capability or native effect exists.
     let view = (&mut *sections).map_provider_view(provider_identity(physical)?, identity, base, rounded, 0)
         .ok_or(NO_MEMORY)?;
     (*row).maps.push(Box::new(Mapping {
         view, provenance, span, frames, tables, published: false, retiring: false, uncertain: false,
     }));
-    let mapping = &mut **(*row).maps.last_mut().unwrap() as *mut Mapping;
-    let result = (|| -> Result<(), u32> {
-        for index in 0..(*mapping).tables.len() {
-            let slot = try_alloc_slot().ok_or(NO_MEMORY)?;
-            (&mut (*mapping).tables)[index].slot = slot;
-            (*mapping).uncertain = true;
-            if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, slot) != 0 { return Err(FAILED); }
-            (&mut (*mapping).tables)[index].created = true;
-            (*mapping).uncertain = false;
-            (*mapping).uncertain = true;
-            if paging_struct_map_r(slot, LBL_X86_PAGE_TABLE_MAP, base + index as u64 * TABLE_SIZE, (*row).vspace.slot) != 0 {
-                return Err(FAILED);
-            }
-            (&mut (*mapping).tables)[index].mapped = true;
-            (*mapping).uncertain = false;
+    let prepared = PreparedMap { address, physical, section: identity, backing: section,
+        view, base, size, pages: (rounded / 0x1000) as usize, rights };
+    Ok(prepared)
+}
+
+pub(crate) unsafe fn map_prepared_tables(
+    prepared: PreparedMap,
+) -> Result<(), u32> {
+    let (row, mapping) = prepared_mapping(prepared)?;
+    for index in 0..(*mapping).tables.len() {
+        let Some(slot) = try_alloc_slot() else { return Err(NO_MEMORY); };
+        (&mut (*mapping).tables)[index].slot = slot;
+        (*mapping).uncertain = true;
+        if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, slot) != 0 {
+            return Err(FAILED);
         }
-        for index in 0..(*mapping).frames.len() {
-            // No table, registry, or handler borrow spans routed file I/O/callbacks.
-            let frame = crate::service_sec_image::service_generic_section_frame(
-                sections, identity.index(), identity, section, index as u64,
-                EXECUTIVE_WIN32K_SCRATCH_BASE, false,
-            ).map_err(|status| map_failure(b"frame-fill", address, status))?;
-            if (&*sections).section_identity(identity.index()) != Some(identity)
-                || (&*sections).provider_view_for_page(view.owner, base + index as u64 * 0x1000) != Some(view) {
-                return Err(map_failure(b"frame-view-identity", address, INVALID));
-            }
-            let slot = try_alloc_slot().ok_or(NO_MEMORY)?;
-            (&mut (*mapping).frames)[index].slot = slot;
-            (*mapping).uncertain = true;
-            if copy_cap_into_r(frame, slot) != 0 { return Err(FAILED); }
-            (&mut (*mapping).frames)[index].created = true;
-            (*mapping).uncertain = false;
-            (*mapping).uncertain = true;
-            if page_map_r(slot, base + index as u64 * 0x1000, rights, (*row).vspace.slot) != 0 { return Err(FAILED); }
-            (&mut (*mapping).frames)[index].mapped = true;
-            (*mapping).uncertain = false;
+        (&mut (*mapping).tables)[index].created = true;
+        (*mapping).uncertain = false;
+        (*mapping).uncertain = true;
+        if paging_struct_map_r(slot, LBL_X86_PAGE_TABLE_MAP,
+            prepared.base + index as u64 * TABLE_SIZE, (*row).vspace.slot) != 0 { return Err(FAILED); }
+        (&mut (*mapping).tables)[index].mapped = true;
+        (*mapping).uncertain = false;
+    }
+    Ok(())
+}
+
+pub(crate) unsafe fn map_prepared_frame(
+    handler: *mut ExecNtHandler, prepared: PreparedMap, index: usize, frame: u64,
+) -> Result<(), u32> {
+    let sections = table(handler)?;
+    if index >= prepared.pages || (&*sections).section_identity(prepared.section.index()) != Some(prepared.section)
+        || (&*sections).provider_view_for_page(prepared.view.owner,
+            prepared.base + index as u64 * 0x1000) != Some(prepared.view)
+    { return Err(INVALID); }
+    let (row, mapping) = prepared_mapping(prepared)?;
+    if (&(*mapping).frames)[index].slot != 0 { return Err(INVALID); }
+    let slot = try_alloc_slot().ok_or(NO_MEMORY)?;
+    (&mut (*mapping).frames)[index].slot = slot;
+    (*mapping).uncertain = true;
+    if copy_cap_into_r(frame, slot) != 0 { return Err(FAILED); }
+    (&mut (*mapping).frames)[index].created = true;
+    (*mapping).uncertain = false;
+    (*mapping).uncertain = true;
+    if page_map_r(slot, prepared.base + index as u64 * 0x1000,
+        prepared.rights, (*row).vspace.slot) != 0 { return Err(FAILED); }
+    (&mut (*mapping).frames)[index].mapped = true;
+    (*mapping).uncertain = false;
+    Ok(())
+}
+
+pub(crate) unsafe fn publish_map(
+    handler: *mut ExecNtHandler, prepared: PreparedMap,
+) -> Result<(u64, u64), u32> {
+    let sections = table(handler)?;
+    if (&*sections).section_identity(prepared.section.index()) != Some(prepared.section)
+        || (*sections).provider_view_for_page(prepared.view.owner, prepared.base) != Some(prepared.view)
+    { return Err(INVALID); }
+    let (row, mapping) = prepared_mapping(prepared)?;
+    if (*mapping).frames.iter().any(|cap| !cap.mapped || cap.uncertain) { return Err(BUSY); }
+    (*mapping).published = true;
+    crate::provider_section_receipts::map_published(
+        capture_retirement(row, mapping), prepared.size, prepared.pages as u64);
+    Ok((prepared.base, prepared.size))
+}
+
+unsafe fn retire_prepared_map(
+    handler: *mut ExecNtHandler, prepared: PreparedMap, published: bool,
+) -> Result<(), u32> {
+    let sections = table(handler)?;
+    let row = match object(prepared.address, prepared.physical) {
+        Ok(row) => row,
+        Err(status) => {
+            // The autonomous retirement drain may have completed after a previous
+            // no-effect refusal. The exact view's absence proves its caps retired.
+            return if (&*sections).provider_view_for_page(prepared.view.owner, prepared.base)
+                != Some(prepared.view) { Ok(()) } else { Err(status) };
         }
-        Ok(())
-    })();
-    if let Err(status) = result {
-        (*mapping).retiring = true;
-        if retire_mapping(sections, mapping).is_ok() {
-            let index = (*row).maps.iter().position(|candidate| core::ptr::eq(&**candidate, mapping))
-                .expect("owned Section map rollback");
-            (*row).maps.swap_remove(index);
-            if (*row).retiring { let _ = retire_object(row); }
-        }
+    };
+    let Some(index) = (*row).maps.iter().position(|mapping| mapping.view == prepared.view) else {
+        return if (&*sections).provider_view_for_page(prepared.view.owner, prepared.base)
+            != Some(prepared.view) { Ok(()) } else { Err(INVALID) };
+    };
+    let mapping = &mut *(&mut (*row).maps)[index] as *mut Mapping;
+    if (*mapping).published != published || (*mapping).uncertain { return Err(BUSY); }
+    (*mapping).retiring = true;
+    let receipt = capture_retirement(row, mapping);
+    retire_mapping(sections, mapping)?;
+    if published { crate::provider_section_receipts::unmap_retired(receipt); }
+    (*row).maps.swap_remove(index);
+    if (*row).retiring { let _ = retire_object(row); }
+    Ok(())
+}
+
+pub(crate) unsafe fn abort_map(
+    handler: *mut ExecNtHandler, prepared: PreparedMap,
+) -> Result<(), u32> { retire_prepared_map(handler, prepared, false) }
+
+pub(crate) unsafe fn retire_cancelled_map(
+    handler: *mut ExecNtHandler, prepared: PreparedMap,
+) -> Result<(), u32> { retire_prepared_map(handler, prepared, true) }
+
+/// Synchronous provider maps are used only when every backing operation is proven inline.
+/// Routed maps use the retained `provider_section_map_work` continuation instead.
+pub(crate) unsafe fn map(
+    handler: *mut ExecNtHandler, address: u64, physical: runtime::PhysicalSource, requested_size: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> Result<(u64, u64), u32> {
+    let prepared = prepare_map(handler, address, physical, requested_size, caller)?;
+    // DriverEntry maps only its anonymous bootstrap Section. A routed backing
+    // needs the retained provider Reply/IRP continuation in the live service.
+    if prepared.backing.backing.routed_lease.is_some() {
+        let _ = abort_map(handler, prepared);
+        return Err(NOT_SUPPORTED);
+    }
+    if let Err(status) = map_prepared_tables(prepared) {
+        let _ = abort_map(handler, prepared);
         return Err(status);
     }
-    (*mapping).published = true;
-    crate::provider_section_receipts::map_published(capture_retirement(row, mapping), size, rounded / 0x1000);
-    Ok((base, size))
+    let sections = table(handler)?;
+    for index in 0..prepared.pages {
+        let frame = match crate::service_sec_image::service_generic_section_frame(
+            sections, prepared.section.index(), prepared.section, prepared.backing, index as u64,
+            EXECUTIVE_WIN32K_SCRATCH_BASE, false,
+        ) {
+            Ok(frame) => frame,
+            Err(status) => { let _ = abort_map(handler, prepared); return Err(status); }
+        };
+        if let Err(status) = map_prepared_frame(handler, prepared, index, frame) {
+            let _ = abort_map(handler, prepared);
+            return Err(status);
+        }
+    }
+    publish_map(handler, prepared)
 }
 
 /// Map the exact canonical provider Section pages into a live GUI process. This is a separate
