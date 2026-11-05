@@ -19,8 +19,8 @@ pub struct TimerDeadlineCensus {
 }
 
 impl TimerDeadlineCensus {
-    /// Bucket 0 has no live deadline; 1..=24 are the executive's current sources; 25 is overflow.
-    pub const SOURCE_LIMIT: usize = 24;
+    /// Bucket 0 has no live deadline; 1..=28 are the executive's current sources; 29 is overflow.
+    pub const SOURCE_LIMIT: usize = 28;
     pub const OVERFLOW: usize = Self::SOURCE_LIMIT + 1;
     pub const BUCKETS: usize = Self::OVERFLOW + 1;
 
@@ -89,12 +89,28 @@ mod tests {
         let mut census = TimerDeadlineCensus::new();
         census.observe(None, 100, 0);
         census.observe(Some((80, u64::MAX)), 100, 1);
-        census.observe(Some((70, 25)), 100, 2);
+        census.observe(Some((70, 29)), 100, 2);
         assert_eq!(census.sample(None).scans, 1);
         assert_eq!(census.sample(None).due, 0);
         assert_eq!(census.sample(Some(24)), TimerDeadlineSample::default());
         assert_eq!(census.sample(Some(u64::MAX)).scans, 2);
-        assert_eq!(census.sample(Some(25)).lateness_total_100ns, 50);
+        assert_eq!(census.sample(Some(29)).lateness_total_100ns, 50);
+    }
+
+    #[test]
+    fn section_retry_owners_have_distinct_live_deadline_buckets() {
+        // One section-metadata deadline currently covers all four retry owners. The live
+        // diagnostic must keep their due scans separate before changing retry policy.
+        let sources = [21, 26, 27, 28];
+        let mut census = TimerDeadlineCensus::new();
+        for source in sources {
+            census.observe(Some((100, source)), 120, 1);
+        }
+        for source in sources {
+            assert_eq!(census.sample(Some(source)).scans, 1, "source {source}");
+            assert_eq!(census.sample(Some(source)).due, 1, "source {source}");
+        }
+        assert_eq!(census.sample(Some(u64::MAX)).scans, 0);
     }
 
     #[test]

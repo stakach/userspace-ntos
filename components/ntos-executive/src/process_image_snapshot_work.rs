@@ -240,6 +240,13 @@ pub(crate) fn next_deadline() -> Option<u64> {
     }).then(|| NEXT.load(Ordering::Acquire))
 }
 
+/// Periodic read-only census at the serialized service-loop boundary.
+pub(crate) fn census_snapshot() -> (Option<u64>, bool, u64, usize) {
+    let pending = unsafe { (&*core::ptr::addr_of!(WORK)).iter().filter(|work| work.is_some()).count() };
+    (next_deadline(), ACTIVE.load(Ordering::Acquire),
+        EXECUTING_TID.load(Ordering::Acquire), pending)
+}
+
 pub(crate) fn wake_due(now: u64) -> u64 {
     u64::from(next_deadline().is_some_and(|deadline| now >= deadline))
 }

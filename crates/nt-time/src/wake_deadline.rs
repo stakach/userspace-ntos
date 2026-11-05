@@ -49,6 +49,16 @@ mod tests {
     }
 
     #[test]
+    fn section_retry_owner_ties_keep_existing_candidate_order() {
+        // The four section retry owners will have separate census IDs. Equal deadlines
+        // must retain their current order rather than choosing by numeric source ID.
+        let candidates = [(Some(100), 28), (Some(100), 21),
+            (Some(100), 27), (Some(100), 26)];
+        assert_eq!(earliest_deadline(candidates), Some((100, 28)));
+        assert_eq!(earliest_deadline(candidates.into_iter().skip(1)), Some((100, 21)));
+    }
+
+    #[test]
     fn absolute_and_relative_candidates_use_the_same_snapshot_without_consumption() {
         let relative = Deadline::Relative {
             monotonic_100ns: 150,

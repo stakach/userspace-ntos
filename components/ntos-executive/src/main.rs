@@ -3106,6 +3106,9 @@ const DELAY_TIMER_SOURCE_SYSTEM_WAL_FOLD: u64 = 22;
 const DELAY_TIMER_SOURCE_THREAD_ALERT: u64 = 23;
 const DELAY_TIMER_SOURCE_PROVIDER_DIRECTORY: u64 = 24;
 const DELAY_TIMER_SOURCE_MOUNTED_NATIVE_BLOCK: u64 = 25;
+const DELAY_TIMER_SOURCE_PROCESS_IMAGE_SNAPSHOT: u64 = 26;
+const DELAY_TIMER_SOURCE_PROVIDER_SECTION: u64 = 27;
+const DELAY_TIMER_SOURCE_GDI_ROUTED_IMAGE: u64 = 28;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -7132,6 +7135,21 @@ fn print_timer_deadline_census() {
         for (index, value) in [sample.scans, sample.due, sample.early, sample.work_units,
             sample.lateness_total_100ns / 10, sample.lateness_max_100ns / 10]
             .into_iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(value);
+        }
+        print_str(b"\n");
+    }
+    for (name, snapshot) in [
+        (b"section-metadata".as_slice(), section_metadata_work::census_snapshot()),
+        (b"process-image-snapshot".as_slice(), process_image_snapshot_work::census_snapshot()),
+    ] {
+        let (deadline, active, executing_tid, pending) = snapshot;
+        print_str(b"[census] timer-section-owner=");
+        print_str(name);
+        print_str(b" deadline-present/deadline-100ns/active/executing-tid/pending=");
+        for (index, value) in [u64::from(deadline.is_some()), deadline.unwrap_or(0),
+            u64::from(active), executing_tid, pending as u64].into_iter().enumerate() {
             if index != 0 { print_str(b"/"); }
             print_u64(value);
         }

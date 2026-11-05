@@ -66,14 +66,11 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
             registry_mutation_work::next_deadline(),
             DELAY_TIMER_SOURCE_REGISTRY_MUTATION,
         ),
-        (
-            [section_metadata_work::next_deadline(),
-                process_image_snapshot_work::next_deadline(),
-                provider_section_broker::next_deadline(),
-                gdi_routed_image_work::next_deadline()]
-                .into_iter().flatten().min(),
-            DELAY_TIMER_SOURCE_SECTION_METADATA,
-        ),
+        (section_metadata_work::next_deadline(), DELAY_TIMER_SOURCE_SECTION_METADATA),
+        (process_image_snapshot_work::next_deadline(),
+            DELAY_TIMER_SOURCE_PROCESS_IMAGE_SNAPSHOT),
+        (provider_section_broker::next_deadline(), DELAY_TIMER_SOURCE_PROVIDER_SECTION),
+        (gdi_routed_image_work::next_deadline(), DELAY_TIMER_SOURCE_GDI_ROUTED_IMAGE),
         (
             provider_directory_broker::next_deadline(),
             DELAY_TIMER_SOURCE_PROVIDER_DIRECTORY,
