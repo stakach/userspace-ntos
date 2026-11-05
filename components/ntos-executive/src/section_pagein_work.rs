@@ -19,6 +19,9 @@ use nt_user_host::provider_logical_caller::ProviderLogicalCaller;
 const RETRY_DELAY: u64 = 1_000_000;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xc000_009a;
 
+#[derive(Clone, Copy)]
+enum Purpose { Fault, VmLock { token: u64, caller_pi: usize } }
+
 enum Phase {
     QueryDispatch,
     QueryPending(IrpId),
@@ -39,6 +42,7 @@ enum Phase {
 }
 
 struct Work {
+    purpose: Purpose,
     pi: usize,
     tid: u64,
     badge: u64,
@@ -70,6 +74,7 @@ static mut READS: PendingSectionPageReads<(), u64> = PendingSectionPageReads::ne
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static EXECUTING_TID: AtomicU64 = AtomicU64::new(0);
 static EXECUTING_PI: AtomicU64 = AtomicU64::new(u64::MAX);
+static EXECUTING_CALLER_PI: AtomicU64 = AtomicU64::new(u64::MAX);
 static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -79,6 +84,24 @@ pub(crate) unsafe fn submit(
     page: u64,
     access: nt_address_space::FaultAccess,
 ) -> Result<(), u32> {
+    submit_owned(handler, pi, page, access, Purpose::Fault,
+        REPLY_MAIN_SLOT.load(Ordering::Relaxed)).map(|_| ())
+}
+
+/// The VM-lock coordinator already owns and parked the original syscall Reply.
+/// This worker owns only the exact target page and its routed IRPs.
+pub(crate) unsafe fn submit_for_vm_lock(
+    handler: &mut ExecNtHandler, caller_pi: usize, target_pi: usize,
+    page: u64, access: nt_address_space::FaultAccess, reply: u64, token: u64,
+) -> Result<crate::vm_lock_pagein_work::VmLockPageSource, u32> {
+    submit_owned(handler, target_pi, page, access,
+        Purpose::VmLock { token, caller_pi }, reply)
+}
+
+unsafe fn submit_owned(
+    handler: &mut ExecNtHandler, pi: usize, page: u64,
+    access: nt_address_space::FaultAccess, purpose: Purpose, reply: u64,
+) -> Result<crate::vm_lock_pagein_work::VmLockPageSource, u32> {
     let _durable = allocator::enter_durable();
     let ctx = handler.loop_ctx.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
     let table = &*ctx.generic_sections;
@@ -121,8 +144,9 @@ pub(crate) unsafe fn submit(
     let tcb = handler
         .hosted_thread_tcb(tid)
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    let caller_pi = match purpose { Purpose::Fault => pi, Purpose::VmLock { caller_pi, .. } => caller_pi };
     let logical = handler
-        .capture_provider_logical_caller(pi, tid, handler.current_badge, tcb)
+        .capture_provider_logical_caller(caller_pi, tid, handler.current_badge, tcb)
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
     let capture = driver_launch::hosted_file_capture::capture_owned(
         route.file_id,
@@ -141,12 +165,12 @@ pub(crate) unsafe fn submit(
     if index.is_none() && rows.try_reserve(1).is_err() {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
-    let Some(park) = root_reply_park::RootReplyPark::prepare() else {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    };
-    let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let park = if matches!(purpose, Purpose::Fault) {
+        Some(root_reply_park::RootReplyPark::prepare()
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?)
+    } else { None };
     let work = Work {
-        pi,
+        purpose, pi,
         tid,
         badge: handler.current_badge,
         reply,
@@ -175,9 +199,9 @@ pub(crate) unsafe fn submit(
         Some(index) => rows[index] = Some(work),
         None => rows.push(Some(work)),
     }
-    park.commit();
+    if let Some(park) = park { park.commit(); }
     NEXT.store(monotonic_time_100ns(), Ordering::Release);
-    Ok(())
+    Ok(crate::vm_lock_pagein_work::VmLockPageSource::Mapped { section, view, lease })
 }
 
 pub(crate) fn has_thread(tid: u64) -> bool {
@@ -191,13 +215,15 @@ pub(crate) fn has_thread(tid: u64) -> bool {
 }
 
 pub(crate) fn has_process(pi: usize, preserve_tid: Option<u64>) -> bool {
-    (EXECUTING_PI.load(Ordering::Acquire) == pi as u64
+    ((EXECUTING_PI.load(Ordering::Acquire) == pi as u64
+        || EXECUTING_CALLER_PI.load(Ordering::Acquire) == pi as u64)
         && preserve_tid != Some(EXECUTING_TID.load(Ordering::Acquire)))
         || unsafe {
             (&*core::ptr::addr_of!(WORK))
                 .iter()
                 .flatten()
-                .any(|work| work.pi == pi && preserve_tid != Some(work.tid))
+                .any(|work| (work.pi == pi || work.logical.pi() == pi)
+                    && preserve_tid != Some(work.tid))
         }
 }
 
@@ -670,6 +696,16 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                     return false;
                 }
             }
+            if let Purpose::VmLock { token, .. } = work.purpose {
+                if crate::vm_lock_pagein_work::page_completed(token, work.pi, work.page,
+                    crate::vm_lock_pagein_work::VmLockPageSource::Mapped {
+                        section: work.section, view: work.view, lease: work.lease,
+                    }, 0) {
+                    return true;
+                }
+                work.phase = Phase::Indeterminate;
+                return false;
+            }
             if parked_reply::validate_saved(work.reply).is_err() {
                 return false;
             }
@@ -699,6 +735,16 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
             true
         }
         Phase::Cancel => {
+            if let Purpose::VmLock { token, .. } = work.purpose {
+                if crate::vm_lock_pagein_work::page_completed(token, work.pi, work.page,
+                    crate::vm_lock_pagein_work::VmLockPageSource::Mapped {
+                        section: work.section, view: work.view, lease: work.lease,
+                    }, work.failure.unwrap_or(nt_address_space::STATUS_ACCESS_VIOLATION)) {
+                    return true;
+                }
+                work.phase = Phase::Indeterminate;
+                return false;
+            }
             if let Some(status) = work.failure.filter(|_| !work.failure_logged) {
                 print_str(b"[section] routed page-in failed pi=");
                 print_u64(work.pi as u64);
@@ -750,8 +796,14 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         EXECUTING_INDEX.store(index as u64, Ordering::Release);
         EXECUTING_TID.store(work.tid, Ordering::Release);
         EXECUTING_PI.store(work.pi as u64, Ordering::Release);
-        let done = service_sec_image::with_section_metadata_context(
+        let caller_pi = match work.purpose {
+            Purpose::Fault => work.pi,
+            Purpose::VmLock { caller_pi, .. } => caller_pi,
+        };
+        EXECUTING_CALLER_PI.store(caller_pi as u64, Ordering::Release);
+        let done = service_sec_image::with_pagein_caller_target_context(
             handler,
+            caller_pi,
             work.pi,
             work.tid,
             work.badge,
@@ -810,6 +862,7 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         }
         EXECUTING_TID.store(0, Ordering::Release);
         EXECUTING_PI.store(u64::MAX, Ordering::Release);
+        EXECUTING_CALLER_PI.store(u64::MAX, Ordering::Release);
         EXECUTING_INDEX.store(u64::MAX, Ordering::Release);
     }
     NEXT.store(

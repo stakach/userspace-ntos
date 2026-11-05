@@ -49,7 +49,7 @@ impl CopyService {
 }
 
 #[derive(Clone, Copy)]
-enum Purpose { Fault, SyscallCopy(SyscallCopy) }
+enum Purpose { Fault, SyscallCopy(SyscallCopy), VmLock { token: u64, caller_pi: usize } }
 
 #[derive(Clone, Copy)]
 enum Phase { AwaitSource, Read, Publish, MapPage, ScanSyscall, DispatchSyscall, ReplyReady, ReadyError, ReplyEntered, ReplySent, Cancel, Cancelled, Indeterminate }
@@ -92,6 +92,7 @@ static mut WORK: Vec<Option<Work>> = Vec::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static EXECUTING_TID: AtomicU64 = AtomicU64::new(0);
 static EXECUTING_PI: AtomicU64 = AtomicU64::new(u64::MAX);
+static EXECUTING_CALLER_PI: AtomicU64 = AtomicU64::new(u64::MAX);
 static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 // The active row is temporarily absent from WORK while redrive can pump a provider.
 // Keep its exact source key visible to a nested fault admission until it is reinserted.
@@ -152,11 +153,11 @@ unsafe fn prepare_page(
     if matches!(purpose, Purpose::Fault)
         && decision == RoutedSourceReadDecision::Ready
     { return Ok(None); }
-    if matches!(purpose, Purpose::SyscallCopy(_))
+    if matches!(purpose, Purpose::SyscallCopy(_) | Purpose::VmLock { .. })
         && (source_ready
             || crate::native_image_residency::has_private_page(view, page))
     { return Ok(None); }
-    if existing && !parked && matches!(purpose, Purpose::SyscallCopy(_))
+    if existing && !parked && matches!(purpose, Purpose::SyscallCopy(_) | Purpose::VmLock { .. })
         && !producer
     {
         // A retained synchronous source initializer has no asynchronous producer here.
@@ -178,8 +179,12 @@ unsafe fn prepare_page(
     nt_address_space::image_view_fault_access_status(info.protect, access)?;
     let tid = handler.current_tid;
     let tcb = handler.hosted_thread_tcb(tid).ok_or(INVALID)?;
+    let caller_pi = match purpose {
+        Purpose::VmLock { caller_pi, .. } => caller_pi,
+        _ => pi,
+    };
     let logical = handler.capture_provider_logical_caller(
-        pi, tid, handler.current_badge, tcb,
+        caller_pi, tid, handler.current_badge, tcb,
     ).ok_or(INVALID)?;
     let capture = driver_launch::hosted_file_capture::capture_owned(file, device, granted_access)?;
     if capture.fs_context() != context { return Err(INVALID); }
@@ -197,14 +202,16 @@ unsafe fn prepare_page(
     }))
 }
 
-unsafe fn install_work(work: Work) -> Result<(), u32> {
+unsafe fn install_work(work: Work, reply_already_parked: bool) -> Result<(), u32> {
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
     let index = rows.iter().enumerate().find_map(|(index, row)|
         (row.is_none() && EXECUTING_INDEX.load(Ordering::Acquire) != index as u64).then_some(index));
     if index.is_none() && rows.try_reserve(1).is_err() { return Err(RESOURCES); }
-    let Some(park) = root_reply_park::RootReplyPark::prepare() else { return Err(RESOURCES); };
+    let park = if reply_already_parked { None } else {
+        Some(root_reply_park::RootReplyPark::prepare().ok_or(RESOURCES)?)
+    };
     match index { Some(index) => rows[index] = Some(work), None => rows.push(Some(work)) }
-    park.commit();
+    if let Some(park) = park { park.commit(); }
     NEXT.store(monotonic_time_100ns(), Ordering::Release);
     Ok(())
 }
@@ -220,7 +227,7 @@ pub(crate) unsafe fn submit(
     let Some(work) = prepare_page(handler, pi, page, access, observation, Purpose::Fault,
         reply, false)?
         else { return Ok(false); };
-    install_work(work)?;
+    install_work(work, false)?;
     Ok(true)
 }
 
@@ -292,8 +299,24 @@ pub(crate) unsafe fn submit_syscall_copy(
     let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     let Some(work) = next_syscall_page(handler, pi, reply, call, false)?
         else { return Ok(false); };
-    install_work(work)?;
+    install_work(work, false)?;
     Ok(true)
+}
+
+/// The VM-lock coordinator owns the parked syscall Reply; this row owns only
+/// the target image source and page mapping. Foreign caller PI is retained separately.
+pub(crate) unsafe fn submit_for_vm_lock(
+    handler: &mut ExecNtHandler, caller_pi: usize, target_pi: usize,
+    page: u64, access: FaultAccess, reply: u64, token: u64,
+) -> Result<Option<crate::vm_lock_pagein_work::VmLockPageSource>, u32> {
+    let Some(work) = prepare_page(handler, target_pi, page, access,
+        ImageFaultObservation::CopyAccess, Purpose::VmLock { token, caller_pi }, reply, true)?
+    else { return Ok(None); };
+    let source = crate::vm_lock_pagein_work::VmLockPageSource::Image {
+        view: work.view, lease: work.lease,
+    };
+    install_work(work, true)?;
+    Ok(Some(source))
 }
 
 pub(crate) fn has_thread(tid: u64) -> bool {
@@ -302,10 +325,12 @@ pub(crate) fn has_thread(tid: u64) -> bool {
 }
 
 pub(crate) fn has_process(pi: usize, preserve_tid: Option<u64>) -> bool {
-    (EXECUTING_PI.load(Ordering::Acquire) == pi as u64
+    ((EXECUTING_PI.load(Ordering::Acquire) == pi as u64
+        || EXECUTING_CALLER_PI.load(Ordering::Acquire) == pi as u64)
         && preserve_tid != Some(EXECUTING_TID.load(Ordering::Acquire)))
         || unsafe { (&*core::ptr::addr_of!(WORK)).iter().flatten()
-            .any(|work| work.pi == pi && preserve_tid != Some(work.tid)) }
+            .any(|work| (work.pi == pi || work.logical.pi() == pi)
+                && preserve_tid != Some(work.tid)) }
 }
 
 pub(crate) fn next_deadline() -> Option<u64> {
@@ -650,6 +675,16 @@ unsafe fn advance(
             if cancelled { work.phase = Phase::Cancel; return false; }
             if parked_reply::validate_saved(work.reply).is_err() { return false; }
             work.phase = Phase::ReplyEntered;
+            if let Purpose::VmLock { token, .. } = work.purpose {
+                if crate::vm_lock_pagein_work::page_completed(token, work.pi, work.page,
+                    crate::vm_lock_pagein_work::VmLockPageSource::Image {
+                        view: work.view, lease: work.lease,
+                    }, 0) {
+                    return true;
+                }
+                work.phase = Phase::Indeterminate;
+                return false;
+            }
             let sent = match work.purpose {
                 Purpose::Fault => client_reply_on(work.reply, 0, 0, 0, 0, 0),
                 Purpose::SyscallCopy(_) => {
@@ -658,6 +693,7 @@ unsafe fn advance(
                     assert!(work.progress.enter_reply());
                     reply_parked_syscall(work.reply, u64::from(status))
                 }
+                Purpose::VmLock { .. } => unreachable!("VM lock returns through its coordinator"),
             };
             if !sent { return false; }
             crate::note_boot_progress(crate::BootProgress::PageMappingPublished);
@@ -689,6 +725,16 @@ unsafe fn advance(
             true
         }
         Phase::Cancel => {
+            if let Purpose::VmLock { token, .. } = work.purpose {
+                if crate::vm_lock_pagein_work::page_completed(token, work.pi, work.page,
+                    crate::vm_lock_pagein_work::VmLockPageSource::Image {
+                        view: work.view, lease: work.lease,
+                    }, work.failure.unwrap_or(INVALID)) {
+                    return true;
+                }
+                work.phase = Phase::Indeterminate;
+                return false;
+            }
             if let Some(status) = work.failure.filter(|_| !work.failure_logged) {
                 print_str(b"[native-image-pagein] failed pi="); print_u64(work.pi as u64);
                 print_str(b" page=0x");
@@ -743,14 +789,18 @@ pub(crate) unsafe fn redrive(
         EXECUTING_PI.store(work.pi as u64, Ordering::Release);
         *core::ptr::addr_of_mut!(EXECUTING_SOURCE) =
             Some((work.view.view.area(), work.rva, work.phase));
-        let (resume_ip, sp, flags, transport, service) = match work.purpose {
-            Purpose::Fault => (0, 0, 0, false, 0),
+        let (caller_pi, resume_ip, sp, flags, transport, service) = match work.purpose {
+            Purpose::Fault => (work.pi, 0, 0, 0, false, 0),
             Purpose::SyscallCopy(call) =>
-                (call.resume_ip, call.sp, call.flags, call.native_call_transport,
+                (work.pi, call.resume_ip, call.sp, call.flags, call.native_call_transport,
                     call.service.number()),
+            Purpose::VmLock { caller_pi, .. } =>
+                (caller_pi, 0, 0, 0, false, SSN_NT_LOCK_VM as u32),
         };
-        let done = service_sec_image::with_section_metadata_context(
-            handler, work.pi, work.tid, work.badge, resume_ip, sp, flags, transport, service,
+        EXECUTING_CALLER_PI.store(caller_pi as u64, Ordering::Release);
+        let done = service_sec_image::with_pagein_caller_target_context(
+            handler, caller_pi, work.pi, work.tid, work.badge,
+            resume_ip, sp, flags, transport, service,
             |handler| advance(handler, dispatcher, &mut work),
         ).unwrap_or_else(|| {
             let stopped = spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(work.reply)
@@ -779,6 +829,7 @@ pub(crate) unsafe fn redrive(
         *core::ptr::addr_of_mut!(EXECUTING_SOURCE) = None;
         EXECUTING_TID.store(0, Ordering::Release);
         EXECUTING_PI.store(u64::MAX, Ordering::Release);
+        EXECUTING_CALLER_PI.store(u64::MAX, Ordering::Release);
         EXECUTING_INDEX.store(u64::MAX, Ordering::Release);
     }
     NEXT.store(monotonic_time_100ns().saturating_add(RETRY_DELAY), Ordering::Release);

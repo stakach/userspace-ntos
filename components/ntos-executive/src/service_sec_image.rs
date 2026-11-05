@@ -9933,6 +9933,7 @@ pub(crate) unsafe fn service_sec_image(
                 && crate::section_pagein_work::next_deadline().is_none()
                 && crate::provider_section_map_work::next_deadline().is_none()
                 && crate::native_image_pagein_work::next_deadline().is_none()
+                && crate::vm_lock_pagein_work::next_deadline().is_none()
                 && crate::provider_section_broker::next_deadline().is_none()
                 && !crate::gdi_routed_image_work::has_outstanding()
                 && !crate::native_directory_open_work::occupied()
@@ -10125,6 +10126,7 @@ pub(crate) unsafe fn service_sec_image(
             crate::section_pagein_work::redrive(&mut nt_handler);
             crate::provider_section_map_work::redrive(&mut nt_handler);
             crate::native_image_pagein_work::redrive(&mut nt_handler, &nt_dispatcher);
+            crate::vm_lock_pagein_work::redrive(&mut nt_handler);
             crate::provider_section_broker::redrive(nt_handler as *mut _);
             crate::gdi_routed_image_work::redrive(&mut nt_handler);
             crate::provider_directory_broker::redrive(nt_handler as *mut _);
@@ -13440,6 +13442,11 @@ pub(crate) unsafe fn service_sec_image(
                     panic!("previous syscall leaked an LPC request continuation reservation");
                 }
                 let _ = lpc_connect_completion_drain(&mut nt_handler);
+                let lock_preflight = if stack_args_valid && m0 == SSN_NT_LOCK_VM {
+                    crate::vm_lock_pagein_work::submit(&mut nt_handler,
+                        &argv[..4], resume_ip, sp, flags, native_call_transport)
+                        .map(|()| true)
+                } else { Ok(false) };
                 let copy_preflight = if stack_args_valid
                     && matches!(m0, SSN_NT_QUERY_SYSTEM_INFO | SSN_NT_QUERY_DEFAULT_LOCALE)
                 {
@@ -13449,7 +13456,23 @@ pub(crate) unsafe fn service_sec_image(
                         origin, resume_ip, sp, flags, native_call_transport,
                     )
                 } else { Ok(false) };
-                if matches!(copy_preflight, Ok(true)) {
+                if matches!(lock_preflight, Ok(true)) {
+                    thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                    {
+                        let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                        crate::vm_lock_pagein_work::redrive(&mut nt_handler);
+                    }
+                    let _ = finalize_service_loop_state(&mut nt_handler);
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                    badge = nb;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
+                    continue;
+                } else if matches!(copy_preflight, Ok(true)) {
                     thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
                     {
                         let _message = crate::ipc_message::SavedMessageBuffer::capture();
@@ -13465,6 +13488,8 @@ pub(crate) unsafe fn service_sec_image(
                     m2 = nm2;
                     m3 = nm3;
                     continue;
+                } else if let Err(status) = lock_preflight {
+                    result = status as u64;
                 } else if let Err(status) = copy_preflight {
                     result = status as u64;
                 } else if !stack_args_valid {
@@ -25495,8 +25520,27 @@ pub(crate) unsafe fn with_section_metadata_context<R>(
     service_number: u32,
     run: impl FnOnce(&mut ExecNtHandler) -> R,
 ) -> Option<R> {
+    with_pagein_caller_target_context(handler, pi, pi, tid, badge, resume_ip, sp,
+        flags, native_call_transport, service_number, run)
+}
+
+/// A foreign VM-lock page-in uses the caller's stack and thread authority while mapping
+/// the independently captured target process. Never infer the caller from the target PI.
+pub(crate) unsafe fn with_pagein_caller_target_context<R>(
+    handler: &mut ExecNtHandler,
+    caller_pi: usize,
+    target_pi: usize,
+    tid: u64,
+    badge: u64,
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+    native_call_transport: bool,
+    service_number: u32,
+    run: impl FnOnce(&mut ExecNtHandler) -> R,
+) -> Option<R> {
     let saved_ctx = handler.loop_ctx;
-    let ctx = saved_ctx?.for_process(pi)?;
+    let ctx = saved_ctx?.for_process(target_pi)?;
     let saved_mirrors = (
         ACTIVE_STACK_BASE.load(Ordering::Relaxed),
         ACTIVE_STACK_SIZE.load(Ordering::Relaxed),
@@ -25510,16 +25554,16 @@ pub(crate) unsafe fn with_section_metadata_context<R>(
         handler.current_resume_ip, handler.current_sp, handler.current_flags,
         handler.current_native_call_transport, handler.current_service_number,
     );
-    let (stack_base, stack_size, stack_mirror, heap_mirror, scratch_base) =
-        mirror_ctx_for(badge, pi);
+    let (stack_base, stack_size, stack_mirror, heap_mirror, _scratch_base) =
+        mirror_ctx_for(badge, caller_pi);
     ACTIVE_STACK_BASE.store(stack_base, Ordering::Relaxed);
     ACTIVE_STACK_SIZE.store(stack_size, Ordering::Relaxed);
     ACTIVE_STACK_MIRROR.store(stack_mirror, Ordering::Relaxed);
     ACTIVE_HEAP_MIRROR.store(heap_mirror, Ordering::Relaxed);
-    ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
-    ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+    ACTIVE_CLIENT_PI.store(caller_pi as u64, Ordering::Relaxed);
+    ACTIVE_SCRATCH_BASE.store(ctx.scratch_base, Ordering::Relaxed);
     handler.loop_ctx = Some(ctx);
-    handler.pi = pi;
+    handler.pi = caller_pi;
     handler.current_tid = tid;
     handler.current_badge = badge;
     handler.current_resume_ip = resume_ip;

@@ -18252,7 +18252,7 @@ impl ExecNtHandler {
         0
     }
 
-    unsafe fn ensure_residency_page(
+    pub(crate) unsafe fn ensure_residency_page(
         &mut self,
         target_pi: usize,
         plan: nt_address_space::VmResidencyPagePlan,
@@ -18303,7 +18303,7 @@ impl ExecNtHandler {
         }
     }
 
-    unsafe fn capture_virtual_memory_lock_request(
+    pub(crate) unsafe fn capture_virtual_memory_lock_request(
         &mut self,
         args: &[u64],
         memory: SyscallUserMemory,
@@ -18450,7 +18450,7 @@ impl ExecNtHandler {
         .map_or_else(|fault| fault, |_| status)
     }
 
-    unsafe fn query_memory_basic_information(
+    pub(crate) unsafe fn query_memory_basic_information(
         &self,
         target_pi: usize,
         address: u64,

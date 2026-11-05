@@ -136,7 +136,7 @@ impl ExecNtHandler {
         )
     }
 
-    pub(super) unsafe fn publish_vm_range(
+    pub(crate) unsafe fn publish_vm_range(
         &mut self,
         memory: SyscallUserMemory,
         output: nt_address_space::native_output::VmRangeOutput,
