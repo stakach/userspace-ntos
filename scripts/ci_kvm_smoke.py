@@ -62,6 +62,15 @@ HOSTED_PROCESS_ALLOCATED = re.compile(
     rb"\[pm-dynamic\] allocated hosted process pi=[0-9]+ pid=([0-9]+) "
     rb"parent=[0-9]+ image=([^ ]+) token=[0-9]+ inherited"
 )
+FILE_BACKED_SECTION_MAP = re.compile(
+    rb"\[kernel-section-map\] .* section-index=[0-9]+ section-generation=[0-9]+ "
+    rb"backing-kind=4 file-present=1 file-mount=[0-9]+ file-id=([0-9]+) "
+    rb".* bytes=[1-9][0-9]* pages=[1-9][0-9]*"
+)
+FONT_BROKER_RETURN = re.compile(
+    rb"\[font-next-broker-return\] ordinal=[0-9]+ "
+    rb"reply-info=(?:0x){1,2}[0-9a-fA-F]+ status=(?:0x){1,2}([0-9a-fA-F]+)"
+)
 DESKTOP_SWITCH_PREFIX = b"[win32k-desktop-switch] pi/ret/"
 # QMP block statistics are sampled every ten seconds. A change observed after
 # more than two missed samples cannot prove when its disk work actually ran.
@@ -83,6 +92,7 @@ class BootProgressWatchdog:
         self.disk_sampled_at = None
         self.disk_changed_at = None
         self.seen = set()
+        self.pending_font_file_id = None
         self.pending = b""
 
     def observe_serial(self, chunk, now):
@@ -103,7 +113,15 @@ class BootProgressWatchdog:
             if not self.armed:
                 continue
             key = None
-            if match := SETUP_PHASE_COMPLETE.fullmatch(line):
+            if match := FILE_BACKED_SECTION_MAP.fullmatch(line):
+                # A map alone does not prove a font was accepted. Pair this
+                # file-backed result with the font broker's real completion.
+                self.pending_font_file_id = match.group(1).decode("ascii")
+            elif match := FONT_BROKER_RETURN.fullmatch(line):
+                if int(match.group(1), 16) == 0 and self.pending_font_file_id is not None:
+                    key = "font-section-map:" + self.pending_font_file_id
+                self.pending_font_file_id = None
+            elif match := SETUP_PHASE_COMPLETE.fullmatch(line):
                 key = "setup-provision:" + match.group(1).decode("ascii")
             elif match := DRIVER_START_COMPLETE.fullmatch(line):
                 key = ("driver-start:" + match.group(1).decode("ascii") + ":"

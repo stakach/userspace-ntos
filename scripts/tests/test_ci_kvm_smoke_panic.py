@@ -186,6 +186,48 @@ class BootProgressWatchdogTests(unittest.TestCase):
         self.assertIsNone(watchdog.idle_reason(349))
         self.assertIsNotNone(watchdog.idle_reason(350))
 
+    def test_unique_successful_file_backed_font_map_refreshes_boot_progress(self):
+        # KVM 42063049874 completed 29 file-backed font maps while the old
+        # watchdog exhausted two disk graces and stopped a progressing guest.
+        watchdog = self.watchdog()
+        watchdog.disk_extensions = 2
+        font_map = (
+            b"[kernel-section-map] pointer=0x000001000a020f20 native-generation=152 "
+            b"view-generation=3 provider-domain=1 provider-generation=1 "
+            b"base=0x0000010023c00000 section-index=6 section-generation=49 "
+            b"backing-kind=4 file-present=1 file-mount=3 file-id=5118939591868512 "
+            b"initiator=hosted initiator-pi=7 initiator-pid=80 initiator-generation=2 "
+            b"initiator-tid=84 initiator-thread-generation=1 bytes=78052 pages=20\n"
+        )
+        font_return = (
+            b"[font-next-broker-return] ordinal=1 reply-info=0x0x0000000000000004 "
+            b"status=0x0x0000000000000000\n"
+        )
+        self.assertEqual(watchdog.observe_serial(font_map, 500), [])
+        self.assertEqual(
+            watchdog.observe_serial(font_return, 501),
+            ["font-section-map:5118939591868512"],
+        )
+        self.assertEqual(watchdog.disk_extensions, 0)
+        self.assertIsNone(watchdog.idle_reason(680))
+        self.assertIsNotNone(watchdog.idle_reason(681))
+        self.assertEqual(watchdog.observe_serial(font_map + font_return, 700), [])
+        self.assertIsNotNone(watchdog.idle_reason(700))
+
+    def test_font_map_requires_successful_file_backing_and_real_broker_completion(self):
+        watchdog = self.watchdog()
+        font_return = (
+            b"[font-next-broker-return] ordinal=1 reply-info=0x0x0000000000000004 "
+            b"status=0x0x0000000000000000\n"
+        )
+        self.assertEqual(watchdog.observe_serial(font_return, 10), [])
+        self.assertEqual(watchdog.observe_serial(
+            b"[kernel-section-map] section-index=6 section-generation=49 "
+            b"backing-kind=1 file-present=0 bytes=78052 pages=20\n" + font_return,
+            20,
+        ), [])
+        self.assertIsNotNone(watchdog.idle_reason(180))
+
     def test_completed_bootdisk_bytes_allow_only_two_bounded_extensions(self):
         watchdog = self.watchdog()
         self.assertFalse(watchdog.observe_blockstats(self.blockstats(0, 0), 0))
