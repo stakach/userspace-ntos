@@ -73,12 +73,23 @@ pub fn timer_min_delta_ticks(min_delta_100ns: u64, period_fs: u64, floor_ticks: 
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WaitDiagnostic {
+    pub process_id: u64,
+    pub process_generation: u64,
+    pub thread_generation: u64,
+    pub process_index: usize,
+    pub parked_at_100ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Waiter {
     pub deadline: Deadline,
     pub sequence: u64,
     pub reply_cap: u64,
     pub thread_id: u64,
     pub badge: u64,
+    /// Copied timing only; queue ordering and wake admission never inspect it.
+    pub observation: Option<WaitDiagnostic>,
 }
 
 pub struct Queue {
@@ -214,6 +225,7 @@ mod tests {
             reply_cap: thread_id + 100,
             thread_id,
             badge: thread_id + 10,
+            observation: None,
         }
     }
 

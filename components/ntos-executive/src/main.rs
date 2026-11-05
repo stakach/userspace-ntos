@@ -150,6 +150,7 @@ mod hosted_spawn_uncertainty;
 mod section_pagein_work;
 mod provider_section_map_work;
 mod native_image_pagein_work;
+mod vm_lock_pagein_work;
 pub(crate) use fs_loader::*;
 mod hosted_bootstrap;
 mod installed_layout;
@@ -17333,6 +17334,26 @@ unsafe fn delay_timer_rearm_and_drain_overdue(
     delay_timer_drain_overdue_without_badge(queue, handler)
 }
 
+/// Copied timing from the exact waiter parked for the registered subsystem role.
+/// It never decides whether a timer is due or whether a Reply may be sent.
+fn trace_subsystem_delay_observation(
+    waiter: nt_delay_execution::Waiter, now_100ns: u64, cause: u64, reply_effect: bool,
+) {
+    static SAMPLES: AtomicU64 = AtomicU64::new(0);
+    let Some(observation) = waiter.observation else { return; };
+    let Some(age) = now_100ns.checked_sub(observation.parked_at_100ns) else { return; };
+    if age < 10_000_000 || SAMPLES.fetch_add(1, Ordering::Relaxed) >= 32 { return; }
+    print_str(b"[csrss-wait] kind=delay pi/pid/pgen/tid/tgen/badge/seq/reply/cause/effect/age-ms=");
+    for (index, value) in [observation.process_index as u64, observation.process_id,
+        observation.process_generation, waiter.thread_id, observation.thread_generation,
+        waiter.badge, waiter.sequence, waiter.reply_cap, cause, u64::from(reply_effect),
+        age / 10_000].into_iter().enumerate() {
+        if index != 0 { print_str(b"/"); }
+        print_u64(value);
+    }
+    print_str(b"\n");
+}
+
 unsafe fn delay_park(
     handler: &mut ExecNtHandler,
     queue: &mut nt_delay_execution::Queue,
@@ -17353,6 +17374,20 @@ unsafe fn delay_park(
         reply_cap,
         thread_id,
         badge,
+        observation: handler.hosted_thread_pi_for_badge(badge)
+            .filter(|pi| handler.hosted_thread_tid_for_badge(badge) == Some(thread_id)
+                && handler.hosted_process_observation_role(*pi)
+                    == Some(nt_exe_image::HostedProcessRole::Win32Subsystem))
+            .and_then(|pi| {
+                let process_id = handler.pm_pid_for_pi(pi)?;
+                let process_generation = handler.hosted_process_generation(pi)?;
+                let thread = handler.pm.thread_lifetime(u32::try_from(thread_id).ok()?)?;
+                (thread.process_id() == process_id).then_some(nt_delay_execution::WaitDiagnostic {
+                    process_id: u64::from(process_id), process_generation,
+                    thread_generation: thread.generation(), process_index: pi,
+                    parked_at_100ns: monotonic_time_100ns(),
+                })
+            }),
     };
     if queue.insert(waiter).is_err() {
         return false;
@@ -17379,7 +17414,8 @@ unsafe fn delay_wake_due(
         DELAY_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
         DELAY_WAKE_LAST_BADGE.store(waiter.badge, Ordering::Relaxed);
         let reply_started = disk_census_ticks();
-        reply_parked_syscall(waiter.reply_cap, 0);
+        let replied = reply_parked_syscall(waiter.reply_cap, 0);
+        trace_subsystem_delay_observation(waiter, now.monotonic_100ns, 1, replied);
         let reply_done = disk_census_ticks();
         DELAY_WAKE_REPLY_TICKS.fetch_add(reply_done.wrapping_sub(reply_started), Ordering::Relaxed);
         release_reply_pool_cap(waiter.reply_cap);
@@ -17456,6 +17492,7 @@ unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
         + subdrain!(20, section_pagein_work::wake_due(now_100ns))
         + subdrain!(13, provider_section_map_work::wake_due(now_100ns))
         + subdrain!(25, native_image_pagein_work::wake_due(now_100ns))
+        + subdrain!(25, vm_lock_pagein_work::wake_due(now_100ns))
         + subdrain!(19, provider_section_broker::wake_due(now_100ns))
         + subdrain!(19, gdi_routed_image_work::wake_due(now_100ns))
         + subdrain!(21, provider_directory_broker::wake_due(now_100ns))
@@ -17824,6 +17861,7 @@ unsafe fn delay_cancel_thread(
     while let Some(waiter) = queue.pop_thread(thread_id) {
         let cap = waiter.reply_cap;
         let cancelled = cancel_parked_reply_transport(cap);
+        trace_subsystem_delay_observation(waiter, monotonic_time_100ns(), 2, cancelled);
         if cancelled {
             release_reply_pool_cap(cap);
         }
@@ -18653,6 +18691,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         || hosted_spawn_uncertainty::has_thread(tid)
         || section_pagein_work::has_thread(tid)
         || native_image_pagein_work::has_thread(tid)
+        || vm_lock_pagein_work::has_thread(tid)
     {
         return false;
     }
@@ -18698,6 +18737,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         || hosted_spawn_uncertainty::has_thread(tid)
         || section_pagein_work::has_thread(tid)
         || native_image_pagein_work::has_thread(tid)
+        || vm_lock_pagein_work::has_thread(tid)
     {
         return false;
     }
@@ -18824,6 +18864,7 @@ unsafe fn terminate_hosted_process_mechanisms(
         || hosted_spawn_uncertainty::has_process(process_index as usize, preserve_tid)
         || section_pagein_work::has_process(process_index as usize, preserve_tid)
         || native_image_pagein_work::has_process(process_index as usize, preserve_tid)
+        || vm_lock_pagein_work::has_process(process_index as usize, preserve_tid)
     {
         return 0;
     }
@@ -33893,6 +33934,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             reply_cap: 1,
             thread_id: 7,
             badge: 3,
+            observation: None,
         };
         let inserted = q.insert(w).is_ok();
         let parked =
@@ -33920,6 +33962,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             reply_cap: 1,
             thread_id,
             badge,
+            observation: None,
         };
         // Multiplex property: waiters from DIFFERENT badges park concurrently, so while one badge
         // is parked the loop can still progress another. Wakes happen in deadline order regardless

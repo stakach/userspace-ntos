@@ -20,6 +20,22 @@ pub(crate) fn print_hold_snapshot(now: u64) {
     let (messages, info, op) = crate::spawn_hosts::ps_create_parent_progress();
     let _ = writeln!(record, "[ps-create-parent-progress] count={} label={} op={}",
         messages, info >> 12, op);
+    // Only copied, exact CSRSS-role ALPC ownership is sampled; this does not
+    // poll, select, cancel, or wake the retained native request.
+    static CSRSS_ALPC_SAMPLES: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    if CSRSS_ALPC_SAMPLES.load(core::sync::atomic::Ordering::Relaxed) < 16 {
+        if let Some(wait) = crate::native_alpc_send_receive_work::csrss_wait_census(now) {
+            if wait.parked_ms >= 1_000 {
+                CSRSS_ALPC_SAMPLES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                let _ = writeln!(record,
+                    "[csrss-wait-live] kind=alpc pi/tid/gen/badge/tcb/seq/port/reply/flight/age-ms={}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+                    wait.pi, wait.caller.thread, wait.caller.generation,
+                    wait.caller.badge, wait.caller.tcb, wait.sequence, wait.port,
+                    wait.reply, wait.flight, wait.parked_ms);
+            }
+        }
+    }
     sel4_rt::print_record(if record.overflowed() {
         b"[ingress-hold] record-truncated\n"
     } else {

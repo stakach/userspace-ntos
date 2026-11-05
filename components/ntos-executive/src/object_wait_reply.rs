@@ -173,10 +173,32 @@ unsafe fn finish(handler: &mut ExecNtHandler, id: Identity) -> u64 {
     if !sent {
         return 0;
     }
-    if handler.validate_provider_logical_caller(record.caller) {
+    let exact_caller_live = handler.validate_provider_logical_caller(record.caller);
+    if exact_caller_live {
         thread_wait_state_clear_badge_ready(handler, record.caller.badge());
     }
     if let Some((parked, reply)) = record.latency.ages_at_reply(finished_at) {
+        static CSRSS_OBJECT_WAIT_SAMPLES: AtomicU64 = AtomicU64::new(0);
+        if exact_caller_live
+            && handler.hosted_process_observation_role(record.pi)
+                == Some(nt_exe_image::HostedProcessRole::Win32Subsystem)
+            && parked.saturating_add(reply) >= 10_000_000
+            && CSRSS_OBJECT_WAIT_SAMPLES.fetch_add(1, Ordering::Relaxed) < 32
+        {
+            let generation = match record.caller.process().generation {
+                nt_types::ProcessGeneration::Hosted(value)
+                | nt_types::ProcessGeneration::Temporary(value) => value,
+            };
+            print_str(b"[csrss-wait] kind=object pi/tid/pgen/tgen/badge/seq/reply/object/status/park-ms/reply-ms=");
+            for (index, value) in [record.pi as u64, record.tid, generation,
+                record.caller.thread().generation(), record.badge, record.sequence,
+                record.reply_cap, record.objects[0].raw(), status,
+                parked / 10_000, reply / 10_000].into_iter().enumerate() {
+                if index != 0 { print_str(b"/"); }
+                print_u64(value);
+            }
+            print_str(b"\n");
+        }
         if parked.saturating_add(reply) >= WAIT_LATENCY_REPORT_THRESHOLD_100NS
             && LONG_WAIT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 256 {
             print_str(b"[wait-latency] pi/tid/seq/badge/first-object/status/park-ms/reply-ms=");

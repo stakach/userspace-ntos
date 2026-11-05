@@ -8,6 +8,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use nt_alpc_native_later::{NativeCaller, ReceiveTarget, RetainedLater, TerminalLater};
 use nt_alpc_native_later::redrive_selection::{select_redrive_owner, RedriveOwner, RedrivePhase};
 use nt_alpc_native_later::reply_commit::ReplyCommitGate;
+use nt_user_host::startup_wait_observation::{
+    StartupWaitKind, StartupWaitObservation, StartupWakeCause,
+};
 
 use crate::root_reply_park::RootReplyPark;
 use crate::*;
@@ -50,7 +53,44 @@ struct OwnedReceive {
     submitted_once: bool,
     reply_commit: ReplyCommitGate,
     trace_scm: bool,
+    trace_csrss: bool,
+    wait_observation: StartupWaitObservation<(NativeCaller, (u64, u64))>,
     logged_pending: bool,
+}
+
+/// Copied diagnostic data only; this cannot select or complete an ALPC request.
+#[derive(Clone, Copy)]
+pub(crate) struct CsrssAlpcWaitCensus {
+    pub(crate) pi: usize,
+    pub(crate) caller: NativeCaller,
+    pub(crate) sequence: u64,
+    pub(crate) port: u64,
+    pub(crate) reply: u64,
+    pub(crate) parked_ms: u64,
+    pub(crate) flight: u64,
+}
+
+pub(crate) fn csrss_wait_census(now_100ns: u64) -> Option<CsrssAlpcWaitCensus> {
+    let owners = unsafe { &*core::ptr::addr_of!(OWNERS) };
+    owners.iter().filter(|owner| owner.trace_csrss)
+        .filter_map(|owner| {
+            let caller = owner.caller();
+            let sequence = owner.retained.token().1;
+            let parked_ms = owner.wait_observation
+                .parked_age_100ns((caller, owner.retained.token()), now_100ns)? / 10_000;
+            Some(CsrssAlpcWaitCensus {
+                pi: owner.pi, caller, sequence,
+                port: owner.wait_observation.snapshot((caller, owner.retained.token()))?.target,
+                reply: owner.retained.reply_cap(), parked_ms,
+                flight: match owner.flight {
+                    Flight::Ready => 0, Flight::Submitted(_) => 1,
+                    Flight::AckReady => 2, Flight::AckSubmitted(_) => 3,
+                    Flight::ReplyReady => 4, Flight::ReplyIndeterminate => 5,
+                    Flight::InvalidTerminal => 6,
+                },
+            })
+        })
+        .max_by_key(|row| (row.parked_ms, core::cmp::Reverse(row.sequence)))
 }
 
 impl OwnedReceive {
@@ -155,6 +195,10 @@ pub(crate) unsafe fn begin(handler: &mut ExecNtHandler, args: [u64; 8]) -> Resul
         image.generation == generation
             && image.process_name.eq_ignore_ascii_case("services.exe")
     });
+    let trace_csrss = handler.hosted_process_image(pi).is_some_and(|image| {
+        image.generation == generation
+            && image.role == nt_exe_image::HostedProcessRole::Win32Subsystem
+    });
     let native_port = captured.port;
     let sequence = NEXT_INVOCATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
         |next| next.checked_add(1)).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
@@ -205,7 +249,11 @@ pub(crate) unsafe fn begin(handler: &mut ExecNtHandler, args: [u64; 8]) -> Resul
     };
     owners.push(OwnedReceive { pi, target, retained, output, ack,
         flight: Flight::Ready, reply_status: 0, copyout_done: false,
-        submitted_once: false, reply_commit, trace_scm, logged_pending: false });
+        submitted_once: false, reply_commit, trace_scm, trace_csrss,
+        wait_observation: StartupWaitObservation::new(
+            (caller, token), StartupWaitKind::Alpc, port.service_handle,
+            reply_cap, monotonic_time_100ns()),
+        logged_pending: false });
     park.commit();
     Ok(())
 }
@@ -238,8 +286,30 @@ fn selected_owner(owners: &[OwnedReceive], active: Option<u64>, cursor: usize) -
 }
 
 unsafe fn retire(owner: OwnedReceive, handler: &mut ExecNtHandler) {
+    let mut owner = owner;
     let cap = owner.retained.reply_cap();
     let thread = owner.caller().thread;
+    let observation_owner = (owner.caller(), owner.retained.token());
+    let _ = owner.wait_observation.mark_replied(observation_owner, monotonic_time_100ns());
+    static CSRSS_WAIT_FINAL_LOGS: AtomicU64 = AtomicU64::new(0);
+    if owner.trace_csrss {
+        if let Some((parked, reply)) = owner.wait_observation.phase_ages_100ns(observation_owner) {
+            if parked.saturating_add(reply) >= 10_000_000
+                && CSRSS_WAIT_FINAL_LOGS.fetch_add(1, Ordering::Relaxed) < 32
+            {
+                print_str(b"[csrss-wait] kind=alpc pi/tid/gen/badge/seq/port/reply/status/park-ms/reply-ms=");
+                for (index, value) in [owner.pi as u64, owner.caller().thread,
+                    owner.caller().generation, owner.caller().badge, owner.retained.token().1,
+                    owner.wait_observation.snapshot(observation_owner).unwrap().target,
+                    cap, owner.reply_status as u32 as u64, parked / 10_000, reply / 10_000]
+                    .into_iter().enumerate() {
+                    if index != 0 { print_str(b"/"); }
+                    print_u64(value);
+                }
+                print_str(b"\n");
+            }
+        }
+    }
     assert!(owner.retained.finish_after_reply(true).is_ok(),
         "acknowledged native ALPC Reply must be terminal");
     thread_wait_state_clear_tid_ready(handler, thread);
@@ -318,8 +388,13 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) -> Option<(u64, u64)> 
     match step {
         RingStep::Idle | RingStep::AckNoEffect => {}
         RingStep::NoEffect(request_id, status) => {
-            owner.flight = if owner.retained.no_effect(request_id, owner.caller(), status).is_ok()
-                { Flight::ReplyReady } else { Flight::InvalidTerminal };
+            let accepted = owner.retained.no_effect(request_id, owner.caller(), status).is_ok();
+            if accepted {
+                let _ = owner.wait_observation.mark_selected(
+                    (owner.caller(), owner.retained.token()), monotonic_time_100ns(),
+                    StartupWakeCause::AlpcTerminal);
+            }
+            owner.flight = if accepted { Flight::ReplyReady } else { Flight::InvalidTerminal };
             owner.reply_status = status;
         }
         RingStep::Exact(request_id, status, info, detail0, detail1) => {
@@ -355,9 +430,12 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) -> Option<(u64, u64)> 
                 } else {
                     let mut output = core::mem::take(&mut owner.output);
                     output.truncate(info as usize);
-                    owner.flight = if owner.retained.complete(request_id, caller,
-                        TerminalLater::service(status, info, detail0, detail1, output)).is_ok()
-                    {
+                    let accepted = owner.retained.complete(request_id, caller,
+                        TerminalLater::service(status, info, detail0, detail1, output)).is_ok();
+                    owner.flight = if accepted {
+                        let _ = owner.wait_observation.mark_selected(
+                            (caller, owner.retained.token()), monotonic_time_100ns(),
+                            StartupWakeCause::AlpcTerminal);
                         reply_committed = owner.reply_commit.service_exact(status);
                         Flight::AckReady
                     } else { Flight::InvalidTerminal };
