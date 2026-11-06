@@ -23395,10 +23395,10 @@ pub(crate) unsafe fn service_sec_image(
                     let private_reply = if debugger_runtime_registered
                         && REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
                     {
-                        wait_reply_pool_find_free().map(|(index, cap)| {
-                            wait_reply_pool_mark_used(index);
+                        wait_reply_pool_find_free().and_then(|(index, cap)| {
+                            if !wait_reply_pool_mark_used(index) { return None; }
                             REPLY_MAIN_SLOT.store(cap, Ordering::Relaxed);
-                            cap
+                            Some(cap)
                         })
                     } else {
                         None
@@ -23490,8 +23490,11 @@ pub(crate) unsafe fn service_sec_image(
                         let replacement = REPLY_MAIN_SLOT.swap(0, Ordering::Relaxed);
                         let index = wait_reply_pool_find_cap(replacement)
                             .expect("debugger proof lost its private Reply replacement");
-                        assert!(wait_reply_pool_ref()[index].used);
-                        wait_reply_pool_mark_free(index);
+                        let identity = wait_reply_pool_ref().at(index)
+                            .expect("debugger proof lost its private Reply identity");
+                        assert_eq!(wait_reply_pool_ref().state(identity),
+                            Ok(nt_component_suspension::RootReplySlotState::Used));
+                        assert!(wait_reply_pool_mark_free(index));
                     }
                     (
                         nt_handler.current_tid,

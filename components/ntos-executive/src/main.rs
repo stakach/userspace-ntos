@@ -2282,15 +2282,12 @@ const HOSTED_THREAD_RUNTIME_INITIAL_RESERVE: usize =
     MAX_PI * (1 + PM_RUNTIME_THREAD_SLOTS + TP_WORKER_SLOT_COUNT) + 16;
 const HOSTED_THREAD_WAIT_INITIAL_RESERVE: usize = HOSTED_THREAD_RUNTIME_INITIAL_RESERVE;
 const WAIT_REPLY_POOL_INITIAL_RESERVE: usize = HOSTED_THREAD_WAIT_INITIAL_RESERVE + 1;
-#[derive(Clone, Copy)]
-struct WaitReplyPoolRecord {
-    cap: u64,
-    used: bool,
-}
-
 /// Growable pool of MCS Reply objects. Index 0 is the active `REPLY_MAIN` object; later rows are
 /// spare or stolen reply caps held by parked waiters. Spare Reply objects are retyped lazily.
-static mut WAIT_REPLY_POOL: Vec<WaitReplyPoolRecord> = Vec::new();
+static mut WAIT_REPLY_POOL: nt_component_suspension::RootReplySlotTable =
+    nt_component_suspension::RootReplySlotTable::uninitialized();
+static mut UNCERTAIN_DROP_REPLY_LEASE:
+    Option<nt_component_suspension::RootReplyReplacementLease> = None;
 static WAIT_REPLY_POOL_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WAIT_REPLY_POOL_SLOT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WAIT_REPLY_POOL_RETYPE_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -16884,11 +16881,11 @@ fn print_hex_u64(value: u64) {
     print_str(record.bytes());
 }
 
-unsafe fn wait_reply_pool_mut() -> &'static mut Vec<WaitReplyPoolRecord> {
+unsafe fn wait_reply_pool_mut() -> &'static mut nt_component_suspension::RootReplySlotTable {
     &mut *core::ptr::addr_of_mut!(WAIT_REPLY_POOL)
 }
 
-unsafe fn wait_reply_pool_ref() -> &'static Vec<WaitReplyPoolRecord> {
+unsafe fn wait_reply_pool_ref() -> &'static nt_component_suspension::RootReplySlotTable {
     &*core::ptr::addr_of!(WAIT_REPLY_POOL)
 }
 
@@ -16897,22 +16894,19 @@ fn wait_reply_pool_initialize(active_reply_cap: u64, initial_reserve: usize) -> 
         WAIT_REPLY_POOL_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    unsafe {
-        let pool = wait_reply_pool_mut();
-        pool.clear();
-        if pool.capacity() < initial_reserve {
-            let additional = initial_reserve - pool.capacity();
-            if pool.try_reserve_exact(additional).is_err() {
-                WAIT_REPLY_POOL_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
-                WAIT_REPLY_POOL_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
-                return false;
-            }
+    let mut pool = match nt_component_suspension::RootReplySlotTable::new(initial_reserve) {
+        Ok(pool) => pool,
+        Err(_) => {
+            WAIT_REPLY_POOL_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+            WAIT_REPLY_POOL_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return false;
         }
-        pool.push(WaitReplyPoolRecord {
-            cap: active_reply_cap,
-            used: true,
-        });
+    };
+    if pool.insert_used(active_reply_cap).is_err() {
+        WAIT_REPLY_POOL_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
     }
+    unsafe { *core::ptr::addr_of_mut!(WAIT_REPLY_POOL) = pool; }
     true
 }
 
@@ -16921,19 +16915,16 @@ fn wait_reply_pool_insert_cap(cap: u64, used: bool) -> Option<usize> {
         WAIT_REPLY_POOL_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    unsafe {
+    let inserted = unsafe {
         let pool = wait_reply_pool_mut();
-        if let Some(index) = pool.iter().position(|record| record.cap == 0) {
-            pool[index] = WaitReplyPoolRecord { cap, used };
-            return Some(index);
-        }
-        if pool.len() == pool.capacity() && pool.try_reserve(1).is_err() {
-            WAIT_REPLY_POOL_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+        if used { pool.insert_used(cap) } else { pool.insert_free(cap) }
+    };
+    match inserted {
+        Ok(identity) => Some(identity.slot()),
+        Err(_) => {
             WAIT_REPLY_POOL_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
-            return None;
+            None
         }
-        pool.push(WaitReplyPoolRecord { cap, used });
-        Some(pool.len() - 1)
     }
 }
 
@@ -16965,13 +16956,11 @@ fn wait_reply_pool_allocate_spare() -> Option<(usize, u64)> {
 fn wait_reply_pool_find_free() -> Option<(usize, u64)> {
     unsafe {
         let pool = wait_reply_pool_ref();
-        if let Some((index, record)) = pool
-            .iter()
-            .enumerate()
-            .find(|(_, record)| record.cap != 0 && !record.used
-                && !spawn_hosts::shared_ingress::owner::runtime::owns_ingress_reply(record.cap))
+        if !pool.is_initialized() { return None; }
+        if let Some(identity) = pool.find_free(|cap|
+            !spawn_hosts::shared_ingress::owner::runtime::owns_ingress_reply(cap))
         {
-            return Some((index, record.cap));
+            return Some((identity.slot(), identity.cap()));
         }
     }
     wait_reply_pool_allocate_spare()
@@ -16985,56 +16974,45 @@ fn wait_reply_pool_find_cap(cap: u64) -> Option<usize> {
     if cap == 0 {
         return None;
     }
+    unsafe { wait_reply_pool_ref().find_cap(cap).map(|identity| identity.slot()) }
+}
+
+fn wait_reply_pool_mark_used(index: usize) -> bool {
     unsafe {
-        wait_reply_pool_ref()
-            .iter()
-            .position(|record| record.cap == cap)
+        let pool = wait_reply_pool_mut();
+        let Some(identity) = pool.at(index) else { return false; };
+        pool.mark_used(identity).is_ok()
     }
 }
 
-fn wait_reply_pool_mark_used(index: usize) {
+fn wait_reply_pool_mark_free(index: usize) -> bool {
     unsafe {
-        if let Some(record) = wait_reply_pool_mut().get_mut(index) {
-            if record.cap != 0 {
-                record.used = true;
-            }
-        }
+        let current = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+        let pool = wait_reply_pool_mut();
+        let Some(identity) = pool.at(index) else { return false; };
+        let main = pool.find_cap(current);
+        if current != 0 && main.is_none() { return false; }
+        pool.mark_free(identity, main).is_ok()
     }
 }
 
-fn wait_reply_pool_mark_free(index: usize) {
+fn wait_reply_pool_clear_cap(index: usize) -> bool {
     unsafe {
-        if let Some(record) = wait_reply_pool_mut().get_mut(index) {
-            record.used = false;
-        }
-    }
-}
-
-fn wait_reply_pool_clear_cap(index: usize) {
-    unsafe {
-        if let Some(record) = wait_reply_pool_mut().get_mut(index) {
-            record.cap = 0;
-            record.used = false;
-        }
+        let current = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+        let pool = wait_reply_pool_mut();
+        let Some(identity) = pool.at(index) else { return false; };
+        let main = pool.find_cap(current);
+        if current != 0 && main.is_none() { return false; }
+        pool.clear(identity, main).is_ok()
     }
 }
 
 fn wait_reply_pool_used_count() -> u64 {
-    unsafe {
-        wait_reply_pool_ref()
-            .iter()
-            .filter(|record| record.cap != 0 && record.used)
-            .count() as u64
-    }
+    unsafe { wait_reply_pool_ref().used_count() as u64 }
 }
 
 fn wait_reply_pool_live_count() -> u64 {
-    unsafe {
-        wait_reply_pool_ref()
-            .iter()
-            .filter(|record| record.cap != 0)
-            .count() as u64
-    }
+    unsafe { wait_reply_pool_ref().live_count() as u64 }
 }
 
 fn wait_reply_pool_record_count() -> u64 {
@@ -17070,7 +17048,11 @@ fn release_reply_pool_cap(cap: u64) {
         panic!("legacy pool cannot release a component ingress Reply");
     }
     if let Some(index) = wait_reply_pool_find_cap(cap) {
-        wait_reply_pool_mark_free(index);
+        if !wait_reply_pool_mark_free(index) {
+            print_str(b"[reply-pool] release retained cap=0x");
+            print_hex_u64(cap);
+            print_str(b"\n");
+        }
     }
 }
 
@@ -18390,14 +18372,39 @@ unsafe fn drop_current_hosted_reply() -> bool {
         }
         return true;
     }
+    if (*core::ptr::addr_of!(UNCERTAIN_DROP_REPLY_LEASE)).is_some() {
+        return false;
+    }
     let active_index = wait_reply_pool_find_cap(active);
     let fresh = wait_reply_pool_find_free();
     let (active_index, fresh_index, fresh) = match (active_index, fresh) {
         (Some(active_index), Some((fresh_index, fresh))) => (active_index, fresh_index, fresh),
         _ => return false,
     };
+    // Claim both exact pool incarnations before deleting the old native Reply. A nested or
+    // reentrant free-slot search cannot choose this replacement while the effect is in flight.
+    let lease = {
+        let pool = wait_reply_pool_mut();
+        let (Some(active_identity), Some(fresh_identity)) =
+            (pool.at(active_index), pool.at(fresh_index))
+        else { return false; };
+        if active_identity.cap() != active || fresh_identity.cap() != fresh
+            || REPLY_MAIN_SLOT.load(Ordering::Relaxed) != active
+        { return false; }
+        match pool.reserve(active_identity, fresh_identity) {
+            Ok(lease) => lease,
+            Err(_) => return false,
+        }
+    };
     let delete = cnode_delete_r(active);
     if delete != 0 {
+        if matches!(delete, 1..=10) {
+            if wait_reply_pool_mut().cancel_no_effects(lease).is_err() {
+                *core::ptr::addr_of_mut!(UNCERTAIN_DROP_REPLY_LEASE) = Some(lease);
+            }
+        } else {
+            *core::ptr::addr_of_mut!(UNCERTAIN_DROP_REPLY_LEASE) = Some(lease);
+        }
         print_str(b"[hosted-reply] drop cap=0x");
         print_hex(active as u32);
         print_str(b" delete=");
@@ -18405,13 +18412,20 @@ unsafe fn drop_current_hosted_reply() -> bool {
         print_str(b"\n");
         return false;
     }
-    wait_reply_pool_mark_free(active_index);
-    wait_reply_pool_mark_used(fresh_index);
-    REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     let retype = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, active);
-    if retype != 0 {
-        wait_reply_pool_clear_cap(active_index);
-    }
+    let retype_outcome = match retype {
+        0 => nt_component_suspension::RootReplyRetypeOutcome::Acknowledged,
+        1..=10 => nt_component_suspension::RootReplyRetypeOutcome::NoEffects,
+        _ => nt_component_suspension::RootReplyRetypeOutcome::Uncertain,
+    };
+    let replacement = match wait_reply_pool_mut().commit_retiring_active(lease, retype_outcome) {
+        Ok((replacement, _)) => replacement,
+        Err(_) => {
+            *core::ptr::addr_of_mut!(UNCERTAIN_DROP_REPLY_LEASE) = Some(lease);
+            return false;
+        }
+    };
+    REPLY_MAIN_SLOT.store(replacement.cap(), Ordering::Relaxed);
     print_str(b"[hosted-reply] drop cap=0x");
     print_hex(active as u32);
     print_str(b" next=0x");

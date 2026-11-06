@@ -62,8 +62,13 @@ unsafe fn invoke(effect: RetirementEffect, cap: u64) -> RetirementOutcome {
         ),
         RetirementEffect::ReleasePool => {
             // No callout separates this checked local publication from its frame receipt.
-            wait_reply_pool_mut()[slot].used = false;
-            RetirementOutcome::Acknowledged
+            if wait_reply_pool_mark_free(slot) {
+                RetirementOutcome::Acknowledged
+            } else {
+                RetirementOutcome::Indeterminate(
+                    nt_status::NtStatus::UNSUCCESSFUL.raw() as u32,
+                )
+            }
         }
     }
 }

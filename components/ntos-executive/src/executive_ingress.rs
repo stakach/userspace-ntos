@@ -102,13 +102,29 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
             // Allocation and admission precede the ownership transfer. Failure leaves the full
             // incoming Call in the ingress queue and the old root Reply unchanged.
             let _durable = crate::allocator::enter_durable();
-            if wait_reply_pool_insert_cap(reply, true).is_none() {
+            let Some(new_index) = wait_reply_pool_insert_cap(reply, true) else {
+                return false;
+            };
+            if REPLY_MAIN_SLOT.load(Ordering::Relaxed) != reply_cptr {
+                if let Some(new_identity) = wait_reply_pool_mut().at(new_index) {
+                    let _ = wait_reply_pool_mut().clear(new_identity, None);
+                }
                 return false;
             }
-            REPLY_MAIN_SLOT.store(reply, Ordering::Relaxed);
             if let Some(old_index) = old_index {
-                wait_reply_pool_mark_free(old_index);
+                let pool = wait_reply_pool_mut();
+                let Some(new_identity) = pool.at(new_index) else { return false; };
+                if new_identity.cap() != reply { return false; }
+                let Some(old_identity) = pool.at(old_index) else {
+                    let _ = pool.clear(new_identity, None);
+                    return false;
+                };
+                if pool.replace_main_after_free_observation(old_identity, new_identity).is_err() {
+                    let _ = pool.clear(new_identity, Some(old_identity));
+                    return false;
+                }
             }
+            REPLY_MAIN_SLOT.store(reply, Ordering::Relaxed);
             true
         }) {
             Ok(delivered) => delivered,

@@ -295,12 +295,16 @@ pub(crate) unsafe fn defer_hosted_delivery(reply: u64, badge: u64) -> Result<(),
     let park = crate::root_reply_park::RootReplyPark::prepare().ok_or(Error::Retain)?;
     // This is a memory-only ownership transfer. The ingress owner keeps the capability and its
     // exact caller; only the root semantic pool record is removed, never the physical Reply.
-    park.commit();
-    crate::wait_reply_pool_clear_cap(pool_index);
+    park.try_commit().map_err(|_| Error::Retain)?;
+    // The root selector is now clear. Publish the exact ingress row as retained before
+    // removing its pool record, so even a refused clear cannot lose the physical Call.
     (&mut *core::ptr::addr_of_mut!(CALLS))[index]
         .as_mut()
         .unwrap()
         .delivered = false;
+    if !crate::wait_reply_pool_clear_cap(pool_index) {
+        return Err(Error::Reply);
+    }
     Ok(())
 }
 
@@ -911,15 +915,17 @@ pub(super) unsafe fn recycle_completed() -> Result<(), Error> {
             continue;
         };
         let reply = ready.reply();
-        if let Some(index) = crate::wait_reply_pool_find_cap(reply) {
-            crate::wait_reply_pool_clear_cap(index);
-        }
         let _ = crate::REPLY_MAIN_SLOT.compare_exchange(
             reply,
             0,
             core::sync::atomic::Ordering::Relaxed,
             core::sync::atomic::Ordering::Relaxed,
         );
+        if let Some(index) = crate::wait_reply_pool_find_cap(reply) {
+            if !crate::wait_reply_pool_clear_cap(index) {
+                return Err(Error::Reply);
+            }
+        }
         owner
             .replacements
             .as_mut()

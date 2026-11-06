@@ -104,10 +104,10 @@ pub(super) unsafe fn deliver_file(nt_handler: &mut ExecNtHandler, key: FileIoWai
     let waiter = attempt.waiter();
     // The exact attempt stays owned by the table; no mutable global borrow crosses Reply.
     // Unknown capability ownership is a blocked invariant, not permission to send or recycle it.
-    let result = if !wait_reply_pool_ref()
-        .iter()
-        .any(|record| record.cap == waiter.reply_cap && record.used)
-    {
+    let reply_owned = wait_reply_pool_ref().find_cap(waiter.reply_cap)
+        .is_some_and(|identity| wait_reply_pool_ref().state(identity)
+            == Ok(nt_component_suspension::RootReplySlotState::Used));
+    let result = if !reply_owned {
         Err(0xC000_0008)
     } else if send(waiter) {
         Ok(())

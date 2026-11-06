@@ -11,8 +11,10 @@ pub(crate) struct RootReplyPark {
 impl RootReplyPark {
     pub(crate) unsafe fn prepare() -> Option<Self> {
         let active = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-        let index = wait_reply_pool_find_cap(active)?;
-        if !wait_reply_pool_ref().get(index)?.used {
+        let identity = wait_reply_pool_ref().find_cap(active)?;
+        if wait_reply_pool_ref().state(identity).ok() != Some(
+            nt_component_suspension::RootReplySlotState::Used)
+        {
             return None;
         }
         let replacement = if runtime::owns_ingress_reply(active) {
@@ -43,10 +45,12 @@ impl RootReplyPark {
         if REPLY_MAIN_SLOT.load(Ordering::Relaxed) != self.active {
             return Err(self);
         }
-        let Some(active_index) = wait_reply_pool_find_cap(self.active) else {
+        let Some(active_identity) = wait_reply_pool_ref().find_cap(self.active) else {
             return Err(self);
         };
-        if !wait_reply_pool_ref().get(active_index).is_some_and(|record| record.used) {
+        if wait_reply_pool_ref().state(active_identity).ok() != Some(
+            nt_component_suspension::RootReplySlotState::Used)
+        {
             return Err(self);
         }
         match self.replacement {
@@ -57,12 +61,13 @@ impl RootReplyPark {
                 REPLY_MAIN_SLOT.store(0, Ordering::Relaxed);
             }
             Some((index, cap)) => {
-                if !wait_reply_pool_ref().get(index).is_some_and(|record| {
-                    record.cap == cap && cap != 0 && !record.used
+                if !wait_reply_pool_ref().at(index).is_some_and(|identity| {
+                    identity.cap() == cap && wait_reply_pool_ref().state(identity).ok()
+                        == Some(nt_component_suspension::RootReplySlotState::Free)
                 }) || runtime::owns_ingress_reply(cap) {
                     return Err(self);
                 }
-                wait_reply_pool_mark_used(index);
+                if !wait_reply_pool_mark_used(index) { return Err(self); }
                 REPLY_MAIN_SLOT.store(cap, Ordering::Relaxed);
             }
         }
@@ -75,11 +80,12 @@ impl RootReplyPark {
 /// The used pool record stays unavailable until its exact retained owner settles it.
 pub(crate) unsafe fn quarantine_current_hosted_reply() -> bool {
     let active = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    let Some(index) = wait_reply_pool_find_cap(active) else {
+    let Some(identity) = wait_reply_pool_ref().find_cap(active) else {
         return false;
     };
     if active == 0
-        || !wait_reply_pool_ref().get(index).is_some_and(|record| record.used)
+        || wait_reply_pool_ref().state(identity).ok()
+            != Some(nt_component_suspension::RootReplySlotState::Used)
         || !runtime::owns_hosted_reply(active)
     {
         return false;
