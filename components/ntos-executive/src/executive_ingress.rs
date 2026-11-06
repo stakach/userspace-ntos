@@ -82,7 +82,7 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
                 return ReceiveOutcome::RetainedFailure;
             }
         }
-        let delivered = runtime::take_hosted_with(|reply, _message| {
+        let delivered = match runtime::take_hosted_with(|reply, _message| {
             if !runtime::receive_child_delivery_allowed(reply) {
                 return false;
             }
@@ -110,8 +110,15 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
                 wait_reply_pool_mark_free(old_index);
             }
             true
-        })
-        .expect("hosted ingress handoff retained after refusal");
+        }) {
+            Ok(delivered) => delivered,
+            Err(_) => {
+                // The hosted ingress row still owns the exact Call and Reply. Do not
+                // admit another receive until that owner can be reconciled.
+                print_str(b"[ingress-receive-error] hosted handoff retained\n");
+                return ReceiveOutcome::RetainedFailure;
+            }
+        };
         if let Some((_reply, message)) = delivered {
             return ReceiveOutcome::Message(materialize(message));
         }

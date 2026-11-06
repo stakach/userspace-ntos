@@ -61,3 +61,17 @@ fn receive_failure_retains_incomplete_ingress_without_panicking() {
     assert!(receive.contains("return ReceiveOutcome::RetainedFailure"),
         "an unclassified or unretained Call must stay owned at the service boundary");
 }
+
+#[test]
+fn retained_hosted_handoff_refusal_does_not_unwind_root_ingress() {
+    let receive = INGRESS
+        .split_once("pub(crate) unsafe fn receive(reply_cptr: u64)")
+        .expect("root receive")
+        .1
+        .split_once("pub(crate) unsafe fn reply_receive(")
+        .expect("root receive boundary")
+        .0;
+    assert!(receive.contains("match runtime::take_hosted_with("));
+    assert!(!receive.contains(".expect(\"hosted ingress handoff retained after refusal\")"));
+    assert!(receive.contains("return ReceiveOutcome::RetainedFailure"));
+}
