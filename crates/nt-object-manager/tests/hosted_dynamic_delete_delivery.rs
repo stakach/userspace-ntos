@@ -1,5 +1,6 @@
 use nt_object_manager::hosted_dynamic_type::{
-    DynamicHandleOwner, DynamicTypeDefinition, DynamicTypeOwner, HostedDynamicTypeRegistry,
+    DynamicDeleteClaimError, DynamicHandleOwner, DynamicTypeDefinition, DynamicTypeOwner,
+    HostedDynamicTypeRegistry,
 };
 
 fn type_owner() -> DynamicTypeOwner {
@@ -66,4 +67,34 @@ fn failed_insert_is_retained_until_definite_callback_return() {
     registry.complete_delete(ticket).unwrap();
     assert!(!registry.owns_live_body(ty, object.body()));
     assert_eq!(registry.next_ready_delete(), None);
+}
+
+#[test]
+fn delete_claim_requires_empty_durable_destination_before_in_flight_transition() {
+    let mut registry = HostedDynamicTypeRegistry::new();
+    let ty = registry.register(type_owner(), definition()).unwrap();
+    let stale_object = registry.publish_object(ty, 0x3000_0000).unwrap();
+    registry.fail_insert(stale_object).unwrap();
+    let stale_ticket = registry.take_delete(stale_object).unwrap();
+    registry.complete_delete(stale_ticket).unwrap();
+
+    let object = registry.publish_object(ty, 0x2000_0000).unwrap();
+    registry.fail_insert(object).unwrap();
+    let mut occupied = Some(stale_ticket);
+    assert_eq!(registry.take_delete_into(object, &mut occupied),
+        Err(DynamicDeleteClaimError::DestinationOccupied));
+    assert_eq!(occupied, Some(stale_ticket));
+    assert_eq!(registry.next_ready_delete(), Some(object));
+
+    let mut destination = None;
+    registry.take_delete_into(object, &mut destination).unwrap();
+    let exact = destination.expect("claimed callback ticket must be durable before the effect");
+    assert_eq!(exact.object, object.body());
+    assert_eq!(registry.next_ready_delete(), None);
+    assert_eq!(registry.take_delete(object), None);
+    assert_eq!(registry.complete_delete(stale_ticket), Err(nt_status::NtStatus::INVALID_PARAMETER));
+    assert!(registry.owns_live_body(ty, object.body()));
+    registry.complete_delete(exact).unwrap();
+    assert_eq!(registry.complete_delete(exact), Err(nt_status::NtStatus::INVALID_PARAMETER));
+    assert!(!registry.owns_live_body(ty, object.body()));
 }

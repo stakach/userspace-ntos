@@ -80,6 +80,12 @@ pub struct DynamicDeleteTicket {
     lease: DynamicObjectLease,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DynamicDeleteClaimError {
+    DestinationOccupied,
+    NotReady,
+}
+
 struct RegisteredType {
     id: DynamicTypeId,
     owner: DynamicTypeOwner,
@@ -294,6 +300,21 @@ impl HostedDynamicTypeRegistry {
             object: lease.body,
             lease,
         })
+    }
+
+    /// Claim only into a caller-owned durable destination. An occupied destination must
+    /// refuse before changing the registry, so a previous callback ticket cannot be lost.
+    pub fn take_delete_into(
+        &mut self,
+        lease: DynamicObjectLease,
+        destination: &mut Option<DynamicDeleteTicket>,
+    ) -> Result<(), DynamicDeleteClaimError> {
+        if destination.is_some() {
+            return Err(DynamicDeleteClaimError::DestinationOccupied);
+        }
+        let ticket = self.take_delete(lease).ok_or(DynamicDeleteClaimError::NotReady)?;
+        *destination = Some(ticket);
+        Ok(())
     }
 
     /// The object rows are the durable pending queue. Claim only after a delivery lane is ready.
