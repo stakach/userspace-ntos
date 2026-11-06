@@ -2,6 +2,10 @@
 
 mod wake_deadline;
 pub use wake_deadline::earliest_deadline;
+mod clock_callsite_sample;
+pub use clock_callsite_sample::{
+    ClockCallsiteSample, ClockCallsiteSampler, ClockCallsiteSnapshot,
+};
 mod delivery_gate;
 pub use delivery_gate::{DeferredTimerProgress, TimerDeliveryGate, TimerDeliveryGuard};
 mod deferred_work;
