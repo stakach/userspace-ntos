@@ -15,6 +15,8 @@ use nt_io_manager::{
 use nt_hosted_runtime::{drain_cached_claims, CacheClaimStep};
 
 const CACHE_CLAIMS_PER_TURN: usize = 32;
+const MOUNTED_RETRY_DELAY_100NS: u64 = 100_000;
+static WAKE: nt_time::CoalescedRetryWake = nt_time::CoalescedRetryWake::new();
 
 // Native mounted SCSI traffic is distinct from the direct boot AHCI census. Completion is
 // counted only after the exact IRP terminal (and, for pending IRPs, acknowledgement).
@@ -701,14 +703,25 @@ fn next_sector_claim() -> Option<WorkClaim> {
 
 /// A queued mounted sector must wake the root Receive even when no unrelated IRQ arrives.
 /// The entered physical command owns its completion; only a vacant slot can be redriven.
-pub(super) fn next_deadline(now_100ns: u64) -> Option<u64> {
-    if unsafe { (&*core::ptr::addr_of!(PENDING)).is_some() }
-        || native_disk_relation::native_storage_route().is_none()
-        || crate::mounted_volume::mounted_sector_claimable() != Some(true)
-    {
-        return None;
-    }
-    Some(now_100ns.saturating_add(100_000))
+fn queued_timer_work() -> bool {
+    native_disk_relation::native_storage_route().is_some()
+        && crate::mounted_volume::mounted_sector_claimable() == Some(true)
+}
+
+fn claimable_timer_work() -> bool {
+    (unsafe { (&*core::ptr::addr_of!(PENDING)).is_none() }) && queued_timer_work()
+}
+
+pub(super) fn publish_wake(now_100ns: u64) {
+    WAKE.publish(now_100ns.saturating_add(MOUNTED_RETRY_DELAY_100NS));
+}
+
+pub(super) fn wake_due(now_100ns: u64) -> u64 {
+    u64::from(WAKE.wake_due(now_100ns, claimable_timer_work()))
+}
+
+pub(super) fn next_deadline(_now_100ns: u64) -> Option<u64> {
+    WAKE.next_deadline(claimable_timer_work())
 }
 
 unsafe fn next_claim() -> Option<WorkClaim> {
@@ -836,17 +849,32 @@ unsafe fn poll_pending() -> usize {
 // the first command still owns its unreturned dispatch and physical ticket.
 static SERVICE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-struct NativeServiceGuard;
+struct NativeServiceGuard {
+    wake_attempt: Option<nt_time::RetryWakeAttempt<'static>>,
+}
 
 impl NativeServiceGuard {
     fn enter() -> Option<Self> {
         SERVICE_ACTIVE.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok().map(|_| Self)
+            .ok().map(|_| Self {
+                // Snapshot the published retry even while a physical command is pending.
+                // Settling it may expose another already-queued sector without a new publish.
+                wake_attempt: WAKE.begin_redrive(monotonic_time_100ns(), queued_timer_work()),
+            })
     }
 }
 
 impl Drop for NativeServiceGuard {
-    fn drop(&mut self) { SERVICE_ACTIVE.store(false, Ordering::Release); }
+    fn drop(&mut self) {
+        if let Some(attempt) = self.wake_attempt.take() {
+            if claimable_timer_work() && attempt.retry_at(
+                monotonic_time_100ns().saturating_add(MOUNTED_RETRY_DELAY_100NS))
+            {
+                crate::service_sec_image::request_mounted_native_timer_rearm_after_service();
+            }
+        }
+        SERVICE_ACTIVE.store(false, Ordering::Release);
+    }
 }
 
 /// Complete bounded cached claims and drive at most one physical command per service turn.

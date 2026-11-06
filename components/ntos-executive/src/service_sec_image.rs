@@ -4491,6 +4491,11 @@ pub(crate) unsafe fn rearm_registered_active_delay_timer_with_handler(handler: &
 static MOUNTED_NATIVE_TIMER_REARM_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn request_mounted_native_timer_rearm() {
+    crate::driver_launch::publish_mounted_native_block_wake(monotonic_time_100ns());
+    request_mounted_native_timer_rearm_after_service();
+}
+
+pub(crate) fn request_mounted_native_timer_rearm_after_service() {
     MOUNTED_NATIVE_TIMER_REARM_REQUESTED.store(true, Ordering::Release);
 }
 

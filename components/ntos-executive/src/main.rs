@@ -17503,7 +17503,8 @@ unsafe fn user_timer_wake_due(handler: &mut ExecNtHandler, now: nt_time::TimeSna
 
 /// Publish retry readiness only; cleanup and native execution stay at their outer boundaries.
 unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
-    subdrain!(14, cm_key_ownership::wake_due(now_100ns))
+    subdrain!(25, driver_launch::mounted_native_block_wake_due(now_100ns))
+        + subdrain!(14, cm_key_ownership::wake_due(now_100ns))
         + subdrain!(15, cm_snapshot_ownership::wake_due(now_100ns))
         + subdrain!(16, driver_launch::hosted_file_retry_wake_due(now_100ns))
         + subdrain!(17, registry_mutation_work::wake_due(now_100ns))
