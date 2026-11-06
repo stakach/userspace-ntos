@@ -4354,7 +4354,6 @@ impl ExecNtHandler {
         write_field!(io_completion_apc_out, 0);
         write_field!(io_completion_iosb_out, 0);
         write_field!(io_completion_timeout, PendingWaitTimeout::none());
-        write_field!(io_completion_wake, None);
         write_field!(io_signal_event, -1);
         write_field!(pending_file_io_transfer, None);
         write_field!(pending_file_io_wait, false);
@@ -12766,15 +12765,65 @@ impl ExecNtHandler {
         Ok(object_id)
     }
 
+    fn io_completion_dependents_quiescent_exact(
+        &self,
+        pi: usize,
+        pid: u32,
+        generation: u64,
+    ) -> bool {
+        let Ok(process_index) = u8::try_from(pi) else { return false; };
+        let process = nt_user_host::process_identity::ProcessIdentity {
+            pid,
+            generation: nt_user_host::process_identity::ProcessGeneration::Hosted(generation),
+        };
+        !unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)) }
+            .has_process_exact(process_index, process)
+    }
+
+    fn lpc_wait_dependents_quiescent_exact(
+        &self,
+        pi: usize,
+        pid: u32,
+        generation: u64,
+    ) -> bool {
+        let process = nt_user_host::process_identity::ProcessIdentity {
+            pid,
+            generation: nt_user_host::process_identity::ProcessGeneration::Hosted(generation),
+        };
+        unsafe { crate::service_sec_image::lpc_wait_dependents_quiescent_exact(pi, process) }
+    }
+
+    fn file_irp_drain_dependents_quiescent_exact(
+        &self,
+        pi: usize,
+        pid: u32,
+        generation: u64,
+    ) -> bool {
+        let Ok(pi) = u32::try_from(pi) else { return false; };
+        let process = nt_user_host::process_identity::ProcessIdentity {
+            pid,
+            generation: nt_user_host::process_identity::ProcessGeneration::Hosted(generation),
+        };
+        unsafe { crate::service_sec_image::file_irp_drain_dependents_quiescent_exact(pi, process) }
+    }
+
     pub(crate) fn post_io_completion_packet(
         &mut self,
         object_id: u32,
         packet: nt_io_completion::CompletionPacket,
     ) -> u32 {
+        unsafe { io_completion_redrive_returned_packets(self) };
         let trace_depth_before = self.io_completion_ports.depth(object_id).ok();
-        if let Some(waiter) =
-            unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_port(object_id) }
-        {
+        let returned_pending = unsafe {
+            (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS))
+                .requeue_for_port(object_id).is_some()
+        };
+        let selected = if returned_pending {
+            None
+        } else {
+            unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).newest_port_for_wake(object_id) }
+        };
+        if let Some(waiter) = selected {
             let wake_packet = match self
                 .io_completion_ports
                 .remove(object_id, nt_io_completion::RemoveMode::Poll)
@@ -12790,9 +12839,7 @@ impl ExecNtHandler {
                         queued,
                     );
                     if let Err(status) = self.io_completion_ports.enqueue(object_id, packet) {
-                        let _ = unsafe {
-                            (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).insert(waiter)
-                        };
+                        let _ = self.io_completion_ports.enqueue_front(object_id, queued);
                         return status;
                     }
                     queued
@@ -12810,24 +12857,15 @@ impl ExecNtHandler {
                     packet
                 }
                 Err(status) => {
-                    let _ = unsafe {
-                        (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).insert(waiter)
-                    };
                     return status;
                 }
             };
-            if self.io_completion_wake.is_some() {
-                trace_io_completion_packet(
-                    self.pi,
-                    b"wake-overwrite",
-                    object_id,
-                    self.io_completion_ports.depth(object_id).ok(),
-                    self.current_badge,
-                    waiter.badge,
-                    wake_packet,
-                );
+            if !unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)) }
+                .attach_packet_exact(waiter, wake_packet)
+            {
+                let _ = self.io_completion_ports.enqueue_front(object_id, wake_packet);
+                return nt_io_completion::STATUS_INVALID_HANDLE;
             }
-            self.io_completion_wake = Some((waiter, wake_packet));
             // A queued successor still signals object waits even though this remover
             // receives the oldest packet directly.
             if self.io_completion_ports.wait_ready(object_id).unwrap_or(false) {
@@ -13595,6 +13633,9 @@ impl ExecNtHandler {
             // The common case requires no continuation resource and cannot fail due to reply-pool
             // pressure merely because no I/O exists to drain.
             if !initial.is_drained() {
+                let Some(process) = self.capture_thread_process_identity(self.pi, self.current_tid) else {
+                    return STATUS_INVALID_HANDLE;
+                };
                 if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
                     return STATUS_INSUFFICIENT_RESOURCES;
                 }
@@ -13631,6 +13672,7 @@ impl ExecNtHandler {
                         nt_io_manager::PendingFileIrpDrain {
                             file_id,
                             pi: self.pi as u32,
+                            process: Some(process),
                             tid: self.current_tid,
                             badge: self.current_badge,
                             iosb_va: iosb,
@@ -21568,6 +21610,15 @@ impl ExecNtHandler {
         loop {
             match candidate.phase {
                 nt_user_host::ProcessDeletionPhase::AwaitingExecutionQuiescence => {
+                    if !self.io_completion_dependents_quiescent_exact(
+                        pi, pid, candidate.generation,
+                    ) || !self.lpc_wait_dependents_quiescent_exact(
+                        pi, pid, candidate.generation,
+                    ) || !self.file_irp_drain_dependents_quiescent_exact(
+                        pi, pid, candidate.generation,
+                    ) {
+                        return HostedProcessDeletionOutcome::Pending(candidate.phase);
+                    }
                     if self.pm.is_process_signaled(pid) && !candidate.lpc_rundown_acknowledged {
                         let process = nt_user_host::process_identity::ProcessIdentity {
                             pid,
@@ -21640,6 +21691,15 @@ impl ExecNtHandler {
                         .expect("reclaimed process VM must enter execution retirement exactly");
                 }
                 nt_user_host::ProcessDeletionPhase::RetiringExecution => {
+                    if !self.io_completion_dependents_quiescent_exact(
+                        pi, pid, candidate.generation,
+                    ) || !self.lpc_wait_dependents_quiescent_exact(
+                        pi, pid, candidate.generation,
+                    ) || !self.file_irp_drain_dependents_quiescent_exact(
+                        pi, pid, candidate.generation,
+                    ) {
+                        return HostedProcessDeletionOutcome::Pending(candidate.phase);
+                    }
                     let Some(process_mechanism) = self.process_mechanisms.get(pi) else {
                         return HostedProcessDeletionOutcome::Pending(candidate.phase);
                     };
@@ -40372,7 +40432,24 @@ impl ExecNtHandler {
                 } else {
                     nt_io_completion::RemoveMode::Wait
                 };
-                match self.io_completion_ports.remove(object_id, mode) {
+                // A cancelled waiter can return its selected packet while the bounded port
+                // queue is full. It precedes newer queued packets and carries its own port ref.
+                let returned = unsafe {
+                    (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS))
+                        .requeue_for_port(object_id)
+                };
+                let removed = if let Some((waiter, packet)) = returned {
+                    let settled = unsafe {
+                        (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS))
+                            .finish_exact(waiter, true)
+                    };
+                    if settled.is_none() { return nt_io_completion::STATUS_INVALID_HANDLE; }
+                    self.release_io_completion_reference(waiter.port_id);
+                    Ok(nt_io_completion::RemoveResult::Packet(packet))
+                } else {
+                    self.io_completion_ports.remove(object_id, mode)
+                };
+                match removed {
                     Ok(nt_io_completion::RemoveResult::Packet(packet)) => {
                         let copied = self
                             .xas_try_write_buf(args[2], &packet.apc_context.to_le_bytes())

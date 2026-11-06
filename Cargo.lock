@@ -449,6 +449,7 @@ name = "nt-io-completion"
 version = "0.1.0"
 dependencies = [
  "nt-time",
+ "nt-types",
 ]
 
 [[package]]

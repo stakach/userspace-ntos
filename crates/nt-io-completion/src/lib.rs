@@ -775,6 +775,7 @@ pub enum RemoveResult {
 pub struct CompletionWaiter {
     pub port_id: u32,
     pub process_index: u8,
+    pub process: Option<nt_types::ProcessIdentity>,
     pub _reserved: [u8; 3],
     pub reply_cap: u64,
     pub thread_id: u64,
@@ -784,6 +785,22 @@ pub struct CompletionWaiter {
     pub io_status_block_out: u64,
     pub deadline: nt_time::Deadline,
     sequence: u64,
+    phase: CompletionWaiterPhase,
+    packet: Option<CompletionPacket>,
+}
+
+impl CompletionWaiter {
+    pub fn sequence(self) -> u64 { self.sequence }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CompletionWaiterPhase {
+    #[default]
+    Waiting,
+    ReplyEntered,
+    CancelEntered,
+    WakeReady,
+    PacketRequeuePending,
 }
 
 /// Wait table shared by completion ports. Per-port release is LIFO, matching NT KQUEUE scheduling;
@@ -819,11 +836,13 @@ impl CompletionWaiterTable {
 
     pub fn insert(&mut self, mut waiter: CompletionWaiter) -> Result<(), u32> {
         if waiter.reply_cap == 0
+            || !waiter.process.is_some_and(nt_types::ProcessIdentity::is_valid)
             || self
                 .slots
                 .iter()
                 .flatten()
-                .any(|existing| existing.reply_cap == waiter.reply_cap)
+                .any(|existing| existing.reply_cap == waiter.reply_cap
+                    && existing.phase != CompletionWaiterPhase::PacketRequeuePending)
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
@@ -840,6 +859,8 @@ impl CompletionWaiterTable {
             index
         };
         waiter.sequence = self.next_sequence;
+        waiter.phase = CompletionWaiterPhase::Waiting;
+        waiter.packet = None;
         self.next_sequence = self.next_sequence.wrapping_add(1);
         self.slots[index] = Some(waiter);
         Ok(())
@@ -854,6 +875,7 @@ impl CompletionWaiterTable {
             .enumerate()
             .filter_map(|(index, waiter)| waiter.map(|waiter| (index, waiter)))
             .filter(|(_, waiter)| waiter.port_id == port_id)
+            .filter(|(_, waiter)| waiter.phase == CompletionWaiterPhase::Waiting)
             .max_by_key(|(_, waiter)| waiter.sequence)
             .map(|(index, _)| index)?;
         self.slots[index].take()
@@ -877,15 +899,220 @@ impl CompletionWaiterTable {
             .enumerate()
             .filter_map(|(index, waiter)| waiter.map(|waiter| (index, waiter)))
             .filter(|(_, waiter)| waiter.deadline.is_due(now))
+            .filter(|(_, waiter)| waiter.phase == CompletionWaiterPhase::Waiting)
             .min_by_key(|(_, waiter)| (waiter.deadline.ordering_key(now), waiter.sequence))
             .map(|(index, _)| index)?;
         self.slots[index].take()
+    }
+
+    /// Observe a cancellation candidate without surrendering its Reply or port reference.
+    pub fn oldest_thread_for_cancellation(&self, thread_id: u64) -> Option<CompletionWaiter> {
+        self.oldest_cancellable(|waiter| waiter.thread_id == thread_id)
+    }
+
+    pub fn oldest_process_for_cancellation(
+        &self,
+        process_index: u8,
+        process: nt_types::ProcessIdentity,
+    ) -> Option<CompletionWaiter> {
+        self.oldest_cancellable(|waiter| {
+            waiter.process_index == process_index && waiter.process == Some(process)
+        })
+    }
+
+    pub fn newest_port_for_wake(&self, port_id: u32) -> Option<CompletionWaiter> {
+        self.slots.iter().flatten()
+            .filter(|waiter| waiter.port_id == port_id
+                && waiter.phase == CompletionWaiterPhase::Waiting)
+            .max_by_key(|waiter| waiter.sequence)
+            .copied()
+    }
+
+    pub fn newest_waiting_if(&self, ready: impl Fn(u32) -> bool) -> Option<CompletionWaiter> {
+        self.slots.iter().flatten()
+            .filter(|waiter| waiter.phase == CompletionWaiterPhase::Waiting
+                && ready(waiter.port_id))
+            .max_by_key(|waiter| waiter.sequence)
+            .copied()
+    }
+
+    pub fn attach_packet_exact(
+        &mut self,
+        waiter: CompletionWaiter,
+        packet: CompletionPacket,
+    ) -> bool {
+        let Some(current) = self.exact_mut(waiter) else { return false; };
+        if current.phase != CompletionWaiterPhase::Waiting { return false; }
+        current.packet = Some(packet);
+        current.phase = CompletionWaiterPhase::WakeReady;
+        true
+    }
+
+    pub fn next_wake_from(&self, slot: usize) -> Option<(usize, CompletionWaiter, CompletionPacket)> {
+        self.slots.iter().enumerate().skip(slot).find_map(|(slot, row)| {
+            let waiter = row.as_ref()?;
+            if waiter.phase != CompletionWaiterPhase::WakeReady { return None; }
+            Some((slot, *waiter, waiter.packet?))
+        })
+    }
+
+    pub fn begin_wake_reply_exact(&mut self, waiter: CompletionWaiter) -> bool {
+        let Some(current) = self.exact_mut(waiter) else { return false; };
+        if current.phase != CompletionWaiterPhase::WakeReady { return false; }
+        current.phase = CompletionWaiterPhase::ReplyEntered;
+        true
+    }
+
+    /// Physical cancellation has completed. A selected packet still belongs to the port until
+    /// it is restored ahead of newer queued packets or claimed by another remover.
+    pub fn acknowledge_cancel_exact(
+        &mut self,
+        waiter: CompletionWaiter,
+    ) -> Option<Option<CompletionPacket>> {
+        let current = self.exact_mut(waiter)?;
+        if current.phase != CompletionWaiterPhase::CancelEntered { return None; }
+        if current.packet.is_some() {
+            current.phase = CompletionWaiterPhase::PacketRequeuePending;
+        }
+        Some(current.packet)
+    }
+
+    pub fn requeue_for_port(&self, port_id: u32) -> Option<(CompletionWaiter, CompletionPacket)> {
+        self.slots.iter().flatten()
+            .filter(|waiter| waiter.port_id == port_id
+                && waiter.phase == CompletionWaiterPhase::PacketRequeuePending)
+            .min_by_key(|waiter| waiter.sequence)
+            .and_then(|waiter| Some((*waiter, waiter.packet?)))
+    }
+
+    /// Move a cancelled caller's packet to another waiting caller in one table transition.
+    /// The returned row's port reference can then be released without a packet-loss window.
+    pub fn transfer_requeued_packet_exact(
+        &mut self,
+        returned: CompletionWaiter,
+        waiting: CompletionWaiter,
+    ) -> Option<CompletionWaiter> {
+        let old = self.slots.iter().position(|row| row.is_some_and(|row| {
+            row.reply_cap == returned.reply_cap && row.process == returned.process
+                && row.sequence == returned.sequence
+                && row.phase == CompletionWaiterPhase::PacketRequeuePending
+                && row.packet.is_some()
+        }))?;
+        let next = self.slots.iter().position(|row| row.is_some_and(|row| {
+            row.reply_cap == waiting.reply_cap && row.process == waiting.process
+                && row.sequence == waiting.sequence
+                && row.phase == CompletionWaiterPhase::Waiting
+        }))?;
+        if old == next { return None; }
+        let former = self.slots[old]?;
+        let current = self.slots[next].as_mut()?;
+        current.packet = former.packet;
+        current.phase = CompletionWaiterPhase::WakeReady;
+        self.slots[old] = None;
+        Some(former)
+    }
+
+    pub fn latest_requeue_before(
+        &self,
+        before: Option<u64>,
+    ) -> Option<(CompletionWaiter, CompletionPacket)> {
+        self.slots.iter().flatten()
+            .filter(|waiter| waiter.phase == CompletionWaiterPhase::PacketRequeuePending
+                && before.is_none_or(|sequence| waiter.sequence < sequence))
+            .max_by_key(|waiter| waiter.sequence)
+            .and_then(|waiter| Some((*waiter, waiter.packet?)))
+    }
+
+
+    pub fn earliest_due(&self, now: nt_time::TimeSnapshot) -> Option<CompletionWaiter> {
+        self.slots.iter().flatten()
+            .filter(|waiter| waiter.phase == CompletionWaiterPhase::Waiting
+                && waiter.deadline.is_due(now))
+            .min_by_key(|waiter| (waiter.deadline.ordering_key(now), waiter.sequence))
+            .copied()
+    }
+
+    pub fn begin_cancel_exact(&mut self, waiter: CompletionWaiter) -> bool {
+        let Some(current) = self.exact_mut(waiter) else { return false; };
+        if !matches!(current.phase,
+            CompletionWaiterPhase::Waiting
+                | CompletionWaiterPhase::WakeReady
+                | CompletionWaiterPhase::ReplyEntered)
+        {
+            return false;
+        }
+        current.phase = CompletionWaiterPhase::CancelEntered;
+        true
+    }
+
+    pub fn begin_reply_exact(&mut self, waiter: CompletionWaiter) -> bool {
+        self.begin_exact(waiter, CompletionWaiterPhase::ReplyEntered)
+    }
+
+    fn begin_exact(&mut self, waiter: CompletionWaiter, phase: CompletionWaiterPhase) -> bool {
+        let Some(current) = self.exact_mut(waiter) else { return false; };
+        if current.phase != CompletionWaiterPhase::Waiting { return false; }
+        current.phase = phase;
+        true
+    }
+
+    fn exact_mut(&mut self, waiter: CompletionWaiter) -> Option<&mut CompletionWaiter> {
+        self.slots.iter_mut().flatten().find(|current| {
+            current.reply_cap == waiter.reply_cap
+                && current.process == waiter.process
+                && current.sequence == waiter.sequence
+        })
+    }
+
+    /// Only an acknowledged Reply or physically proven cancellation can release this row.
+    pub fn finish_exact(&mut self, waiter: CompletionWaiter, proven: bool) -> Option<CompletionWaiter> {
+        if !proven { return None; }
+        let slot = self.slots.iter_mut().find(|slot| slot.is_some_and(|current| {
+            current.reply_cap == waiter.reply_cap
+                && current.process == waiter.process
+                && current.sequence == waiter.sequence
+                && current.phase != CompletionWaiterPhase::Waiting
+        }))?;
+        slot.take()
+    }
+
+    pub fn has_process_exact(
+        &self,
+        process_index: u8,
+        process: nt_types::ProcessIdentity,
+    ) -> bool {
+        self.slots.iter().flatten().any(|waiter| {
+            waiter.process_index == process_index && waiter.process == Some(process)
+                && waiter.phase != CompletionWaiterPhase::PacketRequeuePending
+        })
+    }
+
+    pub fn has_thread(&self, thread_id: u64) -> bool {
+        self.slots.iter().flatten().any(|waiter| {
+            waiter.thread_id == thread_id
+                && waiter.phase != CompletionWaiterPhase::PacketRequeuePending
+        })
+    }
+
+    fn oldest_cancellable(
+        &self,
+        predicate: impl Fn(&CompletionWaiter) -> bool,
+    ) -> Option<CompletionWaiter> {
+        self.slots.iter().flatten()
+            .filter(|waiter| matches!(waiter.phase,
+                CompletionWaiterPhase::Waiting
+                    | CompletionWaiterPhase::WakeReady
+                    | CompletionWaiterPhase::ReplyEntered)
+                && predicate(waiter))
+            .min_by_key(|waiter| waiter.sequence)
+            .copied()
     }
 
     pub fn next_deadline(&self, now: nt_time::TimeSnapshot) -> Option<u64> {
         self.slots
             .iter()
             .flatten()
+            .filter(|waiter| waiter.phase == CompletionWaiterPhase::Waiting)
             .filter_map(|waiter| waiter.deadline.monotonic_target(now))
             .min()
     }
@@ -1040,6 +1267,17 @@ impl<const PACKETS: usize> CompletionPortTable<PACKETS> {
         Ok(())
     }
 
+    /// Return a packet selected for a waiter that was cancelled before delivery. The packet
+    /// precedes completions queued after its original selection.
+    pub fn enqueue_front(&mut self, id: u32, packet: CompletionPacket) -> Result<(), u32> {
+        let port = self.port_mut(id)?;
+        if port.len == PACKETS { return Err(STATUS_QUOTA_EXCEEDED); }
+        port.head = (port.head + PACKETS - 1) % PACKETS;
+        port.packets[port.head] = packet;
+        port.len += 1;
+        Ok(())
+    }
+
     pub fn enqueue_transport(
         &mut self,
         id: u32,
@@ -1151,6 +1389,10 @@ mod tests {
         CompletionWaiter {
             port_id,
             process_index: value as u8,
+            process: Some(nt_types::ProcessIdentity {
+                pid: value as u32 + 1,
+                generation: nt_types::ProcessGeneration::Hosted(value + 1),
+            }),
             reply_cap: value,
             thread_id: value + 100,
             key_context_out: value + 200,
@@ -1228,6 +1470,26 @@ mod tests {
             Ok(RemoveResult::Packet(packet(20)))
         );
         assert_eq!(ports.depth(id), Ok(0));
+    }
+
+    #[test]
+    fn front_requeue_preserves_fifo_across_wrap_and_last_handle_close() {
+        let mut ports = Ports::new();
+        let id = ports.create(1).unwrap();
+        ports.retain(id).unwrap();
+        ports.release(id).unwrap();
+        ports.enqueue(id, packet(10)).unwrap();
+        ports.enqueue(id, packet(20)).unwrap();
+        assert_eq!(ports.remove(id, RemoveMode::Poll), Ok(RemoveResult::Packet(packet(10))));
+        ports.enqueue(id, packet(30)).unwrap();
+        assert_eq!(ports.enqueue_front(id, packet(10)), Err(STATUS_QUOTA_EXCEEDED));
+        assert_eq!(ports.remove(id, RemoveMode::Poll), Ok(RemoveResult::Packet(packet(20))));
+        ports.enqueue_front(id, packet(10)).unwrap();
+        assert_eq!(ports.depth(id), Ok(2));
+        assert_eq!(ports.remove(id, RemoveMode::Poll), Ok(RemoveResult::Packet(packet(10))));
+        assert_eq!(ports.remove(id, RemoveMode::Poll), Ok(RemoveResult::Packet(packet(30))));
+        ports.release(id).unwrap();
+        assert_eq!(ports.enqueue_front(id, packet(40)), Err(STATUS_INVALID_HANDLE));
     }
 
     #[test]
@@ -2025,5 +2287,136 @@ mod tests {
         assert_eq!(waiters.pop_process(2).unwrap().reply_cap, 3);
         assert_eq!(waiters.pop_process(2), None);
         assert_eq!(waiters.pop_port(2).unwrap().reply_cap, 2);
+    }
+
+    #[test]
+    fn uncertain_cancel_retains_exact_waiter_and_excludes_replay_or_port_selection() {
+        let mut table = CompletionWaiterTable::new();
+        let old = waiter(4, 11, nt_time::Deadline::Infinite);
+        table.insert(old).unwrap();
+        let selected = table.oldest_thread_for_cancellation(old.thread_id).unwrap();
+        assert!(table.begin_cancel_exact(selected));
+        assert!(!table.begin_cancel_exact(selected));
+        assert_eq!(table.pop_port(4), None);
+        assert_eq!(table.len(), 1);
+        assert!(table.has_thread(old.thread_id));
+        assert!(table.has_process_exact(old.process_index, old.process.unwrap()));
+        assert!(table.finish_exact(selected, false).is_none());
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.finish_exact(selected, true).unwrap().reply_cap, old.reply_cap);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn uncertain_timeout_keeps_reply_owner_and_ignores_reused_process_index() {
+        let mut table = CompletionWaiterTable::new();
+        let old = waiter(4, 11, nt_time::Deadline::Relative { monotonic_100ns: 5 });
+        table.insert(old).unwrap();
+        let selected = table.earliest_due(snapshot(6, 6)).unwrap();
+        assert!(table.begin_reply_exact(selected));
+        assert!(table.earliest_due(snapshot(7, 7)).is_none());
+        assert_eq!(table.next_deadline(snapshot(7, 7)), None);
+        assert_eq!(table.len(), 1);
+        let replacement = nt_types::ProcessIdentity {
+            pid: 12,
+            generation: nt_types::ProcessGeneration::Hosted(99),
+        };
+        assert!(!table.has_process_exact(old.process_index, replacement));
+        assert!(table.has_process_exact(old.process_index, old.process.unwrap()));
+    }
+
+    #[test]
+    fn uncertain_reply_can_enter_exact_physical_cancellation_once() {
+        let mut table = CompletionWaiterTable::new();
+        let old = waiter(4, 6, nt_time::Deadline::Infinite);
+        table.insert(old).unwrap();
+        let selected = table.newest_port_for_wake(4).unwrap();
+        assert!(table.attach_packet_exact(selected, packet(13)));
+        assert!(table.begin_wake_reply_exact(selected));
+        assert!(table.has_process_exact(selected.process_index, selected.process.unwrap()));
+        let selected = table.oldest_thread_for_cancellation(selected.thread_id).unwrap();
+        assert!(table.begin_cancel_exact(selected));
+        assert!(!table.begin_cancel_exact(selected));
+        assert!(table.has_process_exact(selected.process_index, selected.process.unwrap()));
+        assert_eq!(table.acknowledge_cancel_exact(selected), Some(Some(packet(13))));
+        assert!(!table.has_process_exact(selected.process_index, selected.process.unwrap()));
+        assert_eq!(table.requeue_for_port(4).unwrap().1, packet(13));
+    }
+
+    #[test]
+    fn uncertain_wake_does_not_block_another_waiter_or_port() {
+        let mut table = CompletionWaiterTable::new();
+        let first = waiter(1, 1, nt_time::Deadline::Infinite);
+        let second = waiter(2, 2, nt_time::Deadline::Infinite);
+        table.insert(first).unwrap();
+        table.insert(second).unwrap();
+        let packet1 = CompletionPacket { key_context: 11, apc_context: 0,
+            status: 0, information: 0 };
+        let packet2 = CompletionPacket { key_context: 22, apc_context: 0,
+            status: 0, information: 0 };
+        assert!(table.attach_packet_exact(table.newest_port_for_wake(1).unwrap(), packet1));
+        assert!(table.attach_packet_exact(table.newest_port_for_wake(2).unwrap(), packet2));
+        let (_, first_wake, _) = table.next_wake_from(0).unwrap();
+        assert!(table.begin_wake_reply_exact(first_wake));
+        let (_, next, packet) = table.next_wake_from(0).unwrap();
+        assert_eq!(next.port_id, 2);
+        assert_eq!(packet.key_context, 22);
+        assert_eq!(table.finish_exact(next, false), None);
+        assert_eq!(table.finish_exact(next, true).unwrap().reply_cap, second.reply_cap);
+        assert!(table.has_process_exact(first.process_index, first.process.unwrap()));
+    }
+
+    #[test]
+    fn cancelled_wake_keeps_packet_and_port_reference_until_fifo_return() {
+        let mut table = CompletionWaiterTable::new();
+        let selected = waiter(1, 1, nt_time::Deadline::Infinite);
+        table.insert(selected).unwrap();
+        let packet = CompletionPacket { key_context: 10, apc_context: 0,
+            status: 0, information: 0 };
+        let selected = table.newest_port_for_wake(1).unwrap();
+        assert!(table.attach_packet_exact(selected, packet));
+        assert!(table.begin_cancel_exact(selected));
+        assert_eq!(table.acknowledge_cancel_exact(selected), Some(Some(packet)));
+        assert!(!table.has_process_exact(selected.process_index, selected.process.unwrap()));
+        assert_eq!(table.requeue_for_port(1).unwrap().1, packet);
+        assert!(table.finish_exact(selected, false).is_none());
+
+        let mut full = CompletionPortTable::<1>::new();
+        let full_port = full.create(0).unwrap();
+        full.enqueue(full_port, CompletionPacket { key_context: 20, ..packet }).unwrap();
+        assert_eq!(full.enqueue_front(full_port, packet), Err(STATUS_QUOTA_EXCEEDED));
+        assert_eq!(table.requeue_for_port(1).unwrap().1, packet);
+
+        let mut ports = CompletionPortTable::<3>::new();
+        let port = ports.create(0).unwrap();
+        assert_eq!(port, 0);
+        ports.enqueue(port, CompletionPacket { key_context: 20, ..packet }).unwrap();
+        ports.enqueue_front(port, packet).unwrap();
+        assert_eq!(ports.remove(port, RemoveMode::Poll), Ok(RemoveResult::Packet(packet)));
+        assert_eq!(ports.remove(port, RemoveMode::Poll), Ok(RemoveResult::Packet(
+            CompletionPacket { key_context: 20, ..packet }
+        )));
+        assert_eq!(table.finish_exact(selected, true).unwrap().reply_cap, selected.reply_cap);
+    }
+
+    #[test]
+    fn cancelled_packet_can_transfer_to_another_waiter_while_port_queue_is_full() {
+        let mut table = CompletionWaiterTable::new();
+        let former = waiter(1, 1, nt_time::Deadline::Infinite);
+        let next = waiter(1, 2, nt_time::Deadline::Infinite);
+        table.insert(former).unwrap();
+        let former = table.newest_port_for_wake(1).unwrap();
+        let selected_packet = CompletionPacket { key_context: 10, ..CompletionPacket::default() };
+        assert!(table.attach_packet_exact(former, selected_packet));
+        assert!(table.begin_cancel_exact(former));
+        assert_eq!(table.acknowledge_cancel_exact(former), Some(Some(selected_packet)));
+        table.insert(next).unwrap();
+        let waiting = table.newest_waiting_if(|port| table.requeue_for_port(port).is_some()).unwrap();
+        assert_eq!(waiting.reply_cap, next.reply_cap);
+        let (cancelled, packet) = table.requeue_for_port(1).unwrap();
+        assert_eq!(packet, selected_packet);
+        assert_eq!(table.transfer_requeued_packet_exact(cancelled, waiting).unwrap().reply_cap,
+            former.reply_cap);
+        assert_eq!(table.next_wake_from(0).unwrap().2, selected_packet);
     }
 }

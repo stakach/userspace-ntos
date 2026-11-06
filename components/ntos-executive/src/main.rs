@@ -17444,9 +17444,7 @@ unsafe fn delay_wake_due(
 
 unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler, now: nt_time::TimeSnapshot) -> u64 {
     let mut woken = 0;
-    while let Some(waiter) =
-        unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_due(now) }
-    {
+    while let Some(waiter) = (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).earliest_due(now) {
         let trace = IO_COMPLETION_TIMEOUT_TRACE_N.fetch_add(1, Ordering::Relaxed);
         if trace < 32 {
             print_str(b"[io-completion] TIMEOUT pi=");
@@ -17468,10 +17466,20 @@ unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler, now: nt_time::Time
             print_u64(now.monotonic_100ns);
             print_str(b"\n");
         }
-        reply_parked_syscall(
+        if !(&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).begin_reply_exact(waiter) {
+            break;
+        }
+        let replied = reply_parked_syscall(
             waiter.reply_cap,
             nt_io_completion::STATUS_TIMEOUT as u64,
         );
+        if !replied {
+            // The physical effect was entered. Keep the exact Reply and port reference, and
+            // exclude this row from another deadline or packet selection until reconciled.
+            continue;
+        }
+        let Some(waiter) = (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS))
+            .finish_exact(waiter, replied) else { break; };
         release_reply_pool_cap(waiter.reply_cap);
         thread_wait_state_clear_badge_ready(handler, waiter.badge);
         handler.release_io_completion_reference(waiter.port_id);
@@ -17888,32 +17896,123 @@ unsafe fn delay_cancel_thread(
     delay_timer_rearm(queue, handler);
 }
 
-unsafe fn io_completion_cancel_thread(handler: &mut ExecNtHandler, thread_id: u64) {
-    while let Some(waiter) =
-        unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_thread(thread_id) }
-    {
-        let cap = waiter.reply_cap;
-        let cancelled = cancel_parked_reply_transport(cap);
-        if cancelled {
-            release_reply_pool_cap(cap);
+unsafe fn io_completion_cancel_thread(handler: &mut ExecNtHandler, thread_id: u64) -> bool {
+    while let Some(waiter) = (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS))
+        .oldest_thread_for_cancellation(thread_id) {
+        if !(&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).begin_cancel_exact(waiter) {
+            break;
         }
-        thread_wait_state_clear_badge(waiter.badge);
-        handler.release_io_completion_reference(waiter.port_id);
+        let cap = waiter.reply_cap;
+        let cancelled = cancel_io_completion_reply_transport(cap);
+        if !cancelled { continue; }
+        if !finish_cancelled_io_completion_waiter(handler, waiter) { break; }
     }
+    io_completion_redrive_returned_packets(handler);
+    !(&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).has_thread(thread_id)
 }
 
-unsafe fn io_completion_cancel_process(handler: &mut ExecNtHandler, process_index: u8) {
-    while let Some(waiter) =
-        unsafe { (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).pop_process(process_index) }
-    {
-        let cap = waiter.reply_cap;
-        let cancelled = cancel_parked_reply_transport(cap);
-        if cancelled {
-            release_reply_pool_cap(cap);
+unsafe fn io_completion_cancel_process(handler: &mut ExecNtHandler, process_index: u8) -> bool {
+    let Some(process) = handler.capture_process_identity(process_index as usize) else {
+        return false;
+    };
+    while let Some(waiter) = (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS))
+        .oldest_process_for_cancellation(process_index, process) {
+        if !(&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS)).begin_cancel_exact(waiter) {
+            break;
         }
-        thread_wait_state_clear_badge(waiter.badge);
-        handler.release_io_completion_reference(waiter.port_id);
+        let cap = waiter.reply_cap;
+        let cancelled = cancel_io_completion_reply_transport(cap);
+        if !cancelled { continue; }
+        if !finish_cancelled_io_completion_waiter(handler, waiter) { break; }
     }
+    io_completion_redrive_returned_packets(handler);
+    !(&*core::ptr::addr_of!(IO_COMPLETION_WAITERS))
+        .has_process_exact(process_index, process)
+}
+
+unsafe fn finish_cancelled_io_completion_waiter(
+    handler: &mut ExecNtHandler,
+    waiter: nt_io_completion::CompletionWaiter,
+) -> bool {
+    let Some(packet) = (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS))
+        .acknowledge_cancel_exact(waiter) else { return false; };
+    release_reply_pool_cap(waiter.reply_cap);
+    thread_wait_state_clear_badge(waiter.badge);
+    if packet.is_some() {
+        // The row is now port-owned. A later pass returns packets in reverse selection order.
+        return true;
+    }
+    let Some(waiter) = (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS))
+        .finish_exact(waiter, true) else { return false; };
+    handler.release_io_completion_reference(waiter.port_id);
+    true
+}
+
+/// Return cancelled handoff packets in reverse selection order so front insertion preserves
+/// their original FIFO order. A full port keeps its exact packet/reference row for later work.
+unsafe fn io_completion_redrive_returned_packets(handler: &mut ExecNtHandler) -> u64 {
+    let mut before = None;
+    let mut returned = 0;
+    while let Some((waiter, packet)) = (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS))
+        .latest_requeue_before(before)
+    {
+        before = Some(waiter.sequence());
+        if handler.io_completion_ports.enqueue_front(waiter.port_id, packet).is_err() {
+            continue;
+        }
+        let Some(waiter) = (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS))
+            .finish_exact(waiter, true) else { continue; };
+        handler.release_io_completion_reference(waiter.port_id);
+        wait_wake_dispatcher_set(handler);
+        returned += 1;
+    }
+    io_completion_dispatch_queued_waiters(handler);
+    returned
+}
+
+/// Wake parked removers from packets that survived a prior caller's cancellation. The waiter
+/// table itself retains each selected packet, so one uncertain Reply cannot obstruct another.
+unsafe fn io_completion_dispatch_queued_waiters(handler: &mut ExecNtHandler) -> u64 {
+    let mut selected = 0;
+    loop {
+        let candidate = (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS))
+            .newest_waiting_if(|port| {
+                (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS))
+                    .requeue_for_port(port).is_some()
+                    || handler.io_completion_ports.wait_ready(port).unwrap_or(false)
+            });
+        let Some(waiter) = candidate else { break; };
+        let returned = (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS))
+            .requeue_for_port(waiter.port_id);
+        if let Some((returned_owner, _packet)) = returned {
+            let Some(returned_owner) = (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS))
+                .transfer_requeued_packet_exact(returned_owner, waiter) else { break; };
+            handler.release_io_completion_reference(returned_owner.port_id);
+        } else {
+            let packet = match handler.io_completion_ports.remove(
+                waiter.port_id, nt_io_completion::RemoveMode::Poll,
+            ) {
+                Ok(nt_io_completion::RemoveResult::Packet(packet)) => packet,
+                _ => break,
+            };
+            if !(&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS))
+                .attach_packet_exact(waiter, packet)
+            {
+                let _ = handler.io_completion_ports.enqueue_front(waiter.port_id, packet);
+                break;
+            }
+        }
+        selected += 1;
+    }
+    selected
+}
+
+/// Only the physical retained Call may authorize cancellation after its process layout retires.
+unsafe fn cancel_io_completion_reply_transport(cap: u64) -> bool {
+    if spawn_hosts::shared_ingress::owner::runtime::owns_hosted_reply(cap) {
+        let _ = spawn_hosts::shared_ingress::owner::runtime::stop_and_cancel_hosted(cap);
+    }
+    cancel_parked_reply_transport(cap)
 }
 
 /// ═══ Checkpoint B park/wake helpers (real reply-cap parking) ═══
@@ -18741,7 +18840,7 @@ unsafe fn terminate_hosted_thread_mechanism(
     }
     delay_cancel_thread(delay_queue, handler, tid);
     if !thread_alert::cancel_thread(handler, tid) { return false; }
-    io_completion_cancel_thread(handler, tid);
+    if !io_completion_cancel_thread(handler, tid) { return false; }
     let _ = handler.user_timer_cancel_thread(tid);
     delay_timer_rearm(delay_queue, handler);
     wait_cancel_thread(handler, tid);
@@ -18935,7 +19034,7 @@ unsafe fn terminate_hosted_process_mechanisms(
         return reclaimed;
     }
     handler.clear_hosted_tp_worker_windows(process_index as usize);
-    io_completion_cancel_process(handler, process_index);
+    if !io_completion_cancel_process(handler, process_index) { return reclaimed; }
     delay_timer_rearm(delay_queue, handler);
     reclaimed
 }
@@ -23454,6 +23553,7 @@ struct PendingLpcReceivePark {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LpcReceiveContinuation {
     pi: u32,
+    process: nt_user_host::process_identity::ProcessIdentity,
     badge: u64,
     tid: u64,
     memory: SyscallUserMemory,
@@ -23513,6 +23613,7 @@ enum LpcRequestCompletion {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LpcRequestContinuation {
     pi: u32,
+    process: nt_user_host::process_identity::ProcessIdentity,
     badge: u64,
     tid: u64,
     memory: SyscallUserMemory,
@@ -23822,12 +23923,6 @@ struct ExecNtHandler {
     io_completion_apc_out: u64,
     io_completion_iosb_out: u64,
     io_completion_timeout: PendingWaitTimeout,
-    /// Direct packet handoff selected by NtSetIoCompletion. The loop owns cross-process copyout and
-    /// reply-cap wake, so the syscall handler only transfers this allocation-free pair.
-    io_completion_wake: Option<(
-        nt_io_completion::CompletionWaiter,
-        nt_io_completion::CompletionPacket,
-    )>,
     /// A synchronous file-I/O completion requested signaling this real executive event. The loop
     /// consumes it after dispatch so it can also wake reply-cap parked waiters.
     io_signal_event: i64,
@@ -24671,6 +24766,15 @@ impl ExecIoCompletionPorts {
     fn enqueue(&mut self, id: u32, packet: nt_io_completion::CompletionPacket) -> Result<(), u32> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).enqueue(id, packet) }
+    }
+
+    fn enqueue_front(
+        &mut self,
+        id: u32,
+        packet: nt_io_completion::CompletionPacket,
+    ) -> Result<(), u32> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).enqueue_front(id, packet) }
     }
 
     fn remove(

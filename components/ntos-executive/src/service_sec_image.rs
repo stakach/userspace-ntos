@@ -905,6 +905,7 @@ pub(crate) unsafe fn lpc_receive_wait_cancel_reservation(
 unsafe fn lpc_receive_wait_park(
     pending: PendingLpcReceivePark,
     pi: u32,
+    process: nt_user_host::process_identity::ProcessIdentity,
     badge: u64,
     tid: u64,
 ) -> bool {
@@ -924,6 +925,7 @@ unsafe fn lpc_receive_wait_park(
     }
     let continuation = LpcReceiveContinuation {
         pi,
+        process,
         badge,
         tid,
         memory: pending.memory,
@@ -1031,6 +1033,7 @@ unsafe fn lpc_connect_wait_park(
 unsafe fn lpc_request_wait_park(
     pending: PendingLpcRequestPark,
     pi: u32,
+    process: nt_user_host::process_identity::ProcessIdentity,
     badge: u64,
     tid: u64,
 ) -> bool {
@@ -1046,6 +1049,7 @@ unsafe fn lpc_request_wait_park(
     }
     let continuation = LpcRequestContinuation {
         pi,
+        process,
         badge,
         tid,
         memory: pending.memory,
@@ -2107,6 +2111,21 @@ pub(crate) unsafe fn client_has_vm_continuations(pi: u32) -> bool {
             .is_some_and(|wait| wait.continuation.pi == pi))
         || requests.occupied_slots().any(|slot| requests.get(slot)
             .is_some_and(|wait| wait.continuation.pi == pi))
+}
+
+/// A process layout cannot retire while a Receive or Request wait still owns its exact Reply.
+/// Indeterminate send/cancel phases remain visible in the same occupied rows.
+pub(crate) unsafe fn lpc_wait_dependents_quiescent_exact(
+    pi: usize,
+    process: nt_user_host::process_identity::ProcessIdentity,
+) -> bool {
+    let receives = &*core::ptr::addr_of!(LPC_RECEIVE_WAITS);
+    let requests = &*core::ptr::addr_of!(LPC_REQUEST_WAITS);
+    !receives.occupied_slots().any(|slot| receives.get(slot).is_some_and(|wait| {
+        wait.continuation.pi as usize == pi && wait.continuation.process == process
+    })) && !requests.occupied_slots().any(|slot| requests.get(slot).is_some_and(|wait| {
+        wait.continuation.pi as usize == pi && wait.continuation.process == process
+    }))
 }
 
 fn component_suspension_owns_hosted_dispatch(dispatch_id: u64) -> bool {
@@ -13437,7 +13456,6 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.io_completion_apc_out = 0;
                 nt_handler.io_completion_iosb_out = 0;
                 nt_handler.io_completion_timeout = PendingWaitTimeout::none();
-                nt_handler.io_completion_wake = None;
                 nt_handler.io_signal_event = -1;
                 assert!(
                     nt_handler.pending_file_io_reservation.is_none(),
@@ -14345,9 +14363,7 @@ pub(crate) unsafe fn service_sec_image(
                     park_io_completion_iosb_out = nt_handler.io_completion_iosb_out;
                     park_io_completion_deadline = nt_handler.io_completion_timeout.deadline();
                 }
-                if nt_handler.io_completion_wake.is_some() {
-                    let _ = unsafe { io_completion_deliver(&mut nt_handler) };
-                }
+                let _ = unsafe { io_completion_deliver(&mut nt_handler) };
                 if nt_handler.io_signal_event >= 0 {
                     let _ = wait_wake_dispatcher_set(&mut nt_handler);
                 }
@@ -19264,6 +19280,7 @@ pub(crate) unsafe fn service_sec_image(
                     && lpc_receive_wait_park(
                         pending,
                         pi as u32,
+                        event_runtime.process,
                         badge,
                         nt_handler.current_tid,
                     )
@@ -19353,6 +19370,7 @@ pub(crate) unsafe fn service_sec_image(
                     && lpc_request_wait_park(
                         pending,
                         pi as u32,
+                        event_runtime.process,
                         badge,
                         nt_handler.current_tid,
                     )
@@ -25705,7 +25723,7 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
 
     let mut generation = 0u64;
     while let Some((slot, current_generation, wait)) = (&*core::ptr::addr_of!(LPC_RECEIVE_WAITS))
-        .next_occupied_after(generation)
+        .next_waiting_after(generation)
         .map(|(slot, generation, wait)| (slot, generation, *wait))
     {
         generation = current_generation;
@@ -25723,7 +25741,9 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
 
         let continuation = wait.continuation;
         let pi = continuation.pi as usize;
-        let mirror = (pi < MAX_PI).then(||
+        let mirror = (pi < MAX_PI
+            && nt_handler.capture_thread_process_identity(pi, continuation.tid)
+                == Some(continuation.process)).then(||
             mirror_ctx_for(nt_handler, continuation.badge, pi, continuation.tid)).flatten();
         let status = if let Some((sb, ss, smv, hmv, scratch_base)) = mirror {
             ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
@@ -25748,29 +25768,32 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         } else {
             nt_status::NtStatus::INVALID_HANDLE.raw() as u32
         };
-        let Some(completed) = (&mut *core::ptr::addr_of_mut!(LPC_RECEIVE_WAITS)).take(slot) else {
+        let Ok(ticket) = (&mut *core::ptr::addr_of_mut!(LPC_RECEIVE_WAITS))
+            .begin_reply(slot, status) else {
             continue;
         };
         let replied = reply_parked_syscall(
-            completed.continuation.reply_cap,
+            wait.continuation.reply_cap,
             status as u64,
         );
-        release_reply_pool_cap(completed.continuation.reply_cap);
-        thread_wait_state_clear_badge_ready(nt_handler, completed.continuation.badge);
-        if replied {
+        let completed = (&mut *core::ptr::addr_of_mut!(LPC_RECEIVE_WAITS))
+            .finish_reply(ticket, replied);
+        if let Some(completed) = completed {
+            release_reply_pool_cap(completed.continuation.reply_cap);
+            thread_wait_state_clear_badge_ready(nt_handler, completed.continuation.badge);
             LPC_RECEIVE_WAIT_WOKEN.fetch_add(1, Ordering::Relaxed);
             woken += 1;
         } else {
             LPC_RECEIVE_WAIT_FAILURES.fetch_add(1, Ordering::Relaxed);
         }
         print_str(b"[lpc-recv] WAKE pi=");
-        print_u64(completed.continuation.pi as u64);
+        print_u64(wait.continuation.pi as u64);
         print_str(b" badge=");
-        print_u64(completed.continuation.badge);
+        print_u64(wait.continuation.badge);
         print_str(b" tid=");
-        print_u64(completed.continuation.tid);
+        print_u64(wait.continuation.tid);
         print_str(b" port=0x");
-        print_hex_u64(completed.request.port_handle);
+        print_hex_u64(wait.request.port_handle);
         print_str(b" status=0x");
         print_hex(status);
         print_str(b" replied=");
@@ -25820,7 +25843,7 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
 
     let mut generation = 0u64;
     while let Some((slot, current_generation, wait)) = (&*core::ptr::addr_of!(LPC_REQUEST_WAITS))
-        .next_occupied_after(generation)
+        .next_waiting_after(generation)
         .map(|(slot, generation, wait)| (slot, generation, *wait))
     {
         generation = current_generation;
@@ -25864,7 +25887,9 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                     )
                 })
             });
-        let mirror = (pi < MAX_PI).then(||
+        let mirror = (pi < MAX_PI
+            && nt_handler.capture_thread_process_identity(pi, continuation.tid)
+                == Some(continuation.process)).then(||
             mirror_ctx_for(nt_handler, continuation.badge, pi, continuation.tid)).flatten();
         let status = if let Some((sb, ss, smv, hmv, scratch_base)) = mirror {
             ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
@@ -25896,16 +25921,19 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             && pi < MAX_PI
             && nt_handler.lpc_connection_is(wait.request.port_handle, pi, b"\\windows\\apiport");
 
-        let Some(completed) = (&mut *core::ptr::addr_of_mut!(LPC_REQUEST_WAITS)).take(slot) else {
+        let Ok(ticket) = (&mut *core::ptr::addr_of_mut!(LPC_REQUEST_WAITS))
+            .begin_reply(slot, status) else {
             continue;
         };
         let replied = reply_parked_syscall(
-            completed.continuation.reply_cap,
+            wait.continuation.reply_cap,
             status as u64,
         );
-        release_reply_pool_cap(completed.continuation.reply_cap);
-        thread_wait_state_clear_badge_ready(nt_handler, completed.continuation.badge);
-        if replied {
+        let completed = (&mut *core::ptr::addr_of_mut!(LPC_REQUEST_WAITS))
+            .finish_reply(ticket, replied);
+        if let Some(completed) = completed {
+            release_reply_pool_cap(completed.continuation.reply_cap);
+            thread_wait_state_clear_badge_ready(nt_handler, completed.continuation.badge);
             LPC_REQUEST_WAIT_WOKEN.fetch_add(1, Ordering::Relaxed);
             if completed_csr_api_request {
                 CSR_API_REAL_REPLIES.fetch_add(1, Ordering::Relaxed);
@@ -25931,13 +25959,13 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             LPC_REQUEST_WAIT_FAILURES.fetch_add(1, Ordering::Relaxed);
         }
         print_str(b"[lpc-request-wait] WAKE pi=");
-        print_u64(completed.continuation.pi as u64);
+        print_u64(wait.continuation.pi as u64);
         print_str(b" badge=");
-        print_u64(completed.continuation.badge);
+        print_u64(wait.continuation.badge);
         print_str(b" tid=");
-        print_u64(completed.continuation.tid);
+        print_u64(wait.continuation.tid);
         print_str(b" msgid=");
-        print_u64(completed.request.message_id as u64);
+        print_u64(wait.request.message_id as u64);
         print_str(b" status=0x");
         print_hex(status);
         print_str(b" replied=");
@@ -26147,15 +26175,31 @@ pub(crate) unsafe fn lpc_receive_wait_abandon_thread(
         if wait.continuation.tid != tid {
             continue;
         }
-        let removed = table.take(slot).unwrap();
-        let cap = removed.continuation.reply_cap;
-        let cancelled = cancel_parked_reply_transport(cap);
-        if cancelled {
-            release_reply_pool_cap(cap);
-        }
+        let cap = wait.continuation.reply_cap;
+        let (ticket, reconcile_stop) = match table.begin_cancel(slot) {
+            Ok(ticket) => (ticket, false),
+            Err(_) if spawn_hosts::shared_ingress::owner::runtime::owns_hosted_reply(cap) => {
+                let Ok(ticket) = table.begin_reconcile_stop(slot) else { continue; };
+                (ticket, true)
+            }
+            Err(_) => continue,
+        };
+        let stopped = !reconcile_stop
+            || spawn_hosts::shared_ingress::owner::runtime::stop_and_cancel_hosted(cap).is_ok();
+        let cancelled = stopped && cancel_parked_reply_transport(cap);
+        let removed = if reconcile_stop {
+            table.finish_reconcile_stop(ticket, cancelled)
+        } else {
+            table.finish_cancel(ticket, cancelled)
+        };
+        let Some(removed) = removed else { continue; };
+        release_reply_pool_cap(removed.continuation.reply_cap);
         abandoned += 1;
     }
-    if abandoned != 0 {
+    let still_owned = (0..table.slot_count()).any(|slot| {
+        table.get(slot).is_some_and(|wait| wait.continuation.tid == tid)
+    });
+    if abandoned != 0 && !still_owned {
         thread_wait_state_clear_tid(nt_handler, tid);
     }
     abandoned
@@ -26213,23 +26257,41 @@ pub(crate) unsafe fn lpc_request_wait_abandon_thread(
         if wait.continuation.tid != tid {
             continue;
         }
-        let removed = table.take(slot).unwrap();
-        if let Some(client) = lpc_client() {
-            let _ = client.cancel_request(
-                removed.request.port_handle,
-                removed.request.client_process,
-                removed.request.client_thread,
-                removed.request.message_id,
-            );
-        }
-        let cap = removed.continuation.reply_cap;
-        let cancelled = cancel_parked_reply_transport(cap);
-        if cancelled {
-            release_reply_pool_cap(cap);
-        }
+        let cap = wait.continuation.reply_cap;
+        let (ticket, reconcile_stop) = match table.begin_cancel(slot) {
+            Ok(ticket) => (ticket, false),
+            Err(_) if spawn_hosts::shared_ingress::owner::runtime::owns_hosted_reply(cap) => {
+                let Ok(ticket) = table.begin_reconcile_stop(slot) else { continue; };
+                (ticket, true)
+            }
+            Err(_) => continue,
+        };
+        let broker_settled = lpc_client().is_some_and(|client| {
+            client.cancel_request(
+                wait.request.port_handle,
+                wait.request.client_process,
+                wait.request.client_thread,
+                wait.request.message_id,
+            ).is_ok()
+        });
+        let stopped = broker_settled && (!reconcile_stop
+            || spawn_hosts::shared_ingress::owner::runtime::stop_and_cancel_hosted(cap).is_ok());
+        let cancelled = stopped && cancel_parked_reply_transport(cap);
+        let removed = if reconcile_stop {
+            table.finish_reconcile_stop(ticket, cancelled)
+        } else {
+            table.finish_cancel(ticket, cancelled)
+        };
+        let Some(removed) = removed else {
+            continue;
+        };
+        release_reply_pool_cap(removed.continuation.reply_cap);
         abandoned += 1;
     }
-    if abandoned != 0 {
+    let still_owned = (0..table.slot_count()).any(|slot| {
+        table.get(slot).is_some_and(|wait| wait.continuation.tid == tid)
+    });
+    if abandoned != 0 && !still_owned {
         thread_wait_state_clear_tid(nt_handler, tid);
     }
     abandoned
@@ -26253,9 +26315,16 @@ unsafe fn io_completion_park(
     if nt_handler.io_completion_ports.retain(port_id).is_err() {
         return false;
     }
+    let Some(process) = nt_handler.capture_thread_process_identity(
+        nt_handler.pi, nt_handler.current_tid,
+    ) else {
+        nt_handler.release_io_completion_reference(port_id);
+        return false;
+    };
     let mut waiter = nt_io_completion::CompletionWaiter::default();
     waiter.port_id = port_id;
     waiter.process_index = nt_handler.pi as u8;
+    waiter.process = Some(process);
     waiter.reply_cap = stolen;
     waiter.thread_id = nt_handler.current_tid;
     waiter.badge = nt_handler.current_badge;
@@ -26275,19 +26344,25 @@ unsafe fn io_completion_park(
 }
 
 unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
-    // Keep the wake tuple, including its exact Reply, until the original thread still has a
-    // live memory context. A retired process cannot accept the completion copyout.
-    let Some((waiting, _)) = nt_handler.io_completion_wake.as_ref() else {
-        return false;
-    };
+    let _ = io_completion_redrive_returned_packets(nt_handler);
+    let mut delivered_any = false;
+    let mut cursor = 0;
+    while let Some((slot, waiter, packet)) =
+        (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_wake_from(cursor)
+    {
+    cursor = slot + 1;
+    if nt_handler.capture_thread_process_identity(
+        waiter.process_index as usize,
+        waiter.thread_id,
+    ) != waiter.process {
+        continue;
+    }
+    // A retired process cannot accept copyout. The row still owns its packet, Reply and port.
     let Some((stack_base, stack_size, stack_mirror, heap_mirror, scratch_base)) =
-        mirror_ctx_for(nt_handler, waiting.badge, waiting.process_index as usize,
-            waiting.thread_id)
+        mirror_ctx_for(nt_handler, waiter.badge, waiter.process_index as usize,
+            waiter.thread_id)
     else {
-        return false;
-    };
-    let Some((waiter, packet)) = nt_handler.io_completion_wake.take() else {
-        return false;
+        continue;
     };
     let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
     let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
@@ -26338,16 +26413,28 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
     nt_handler.pi = saved_pi;
     nt_handler.loop_ctx = saved_ctx;
 
+    if !(&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS))
+        .begin_wake_reply_exact(waiter)
+    {
+        continue;
+    }
     let delivered = reply_parked_syscall(
         waiter.reply_cap,
         if copied { 0 } else { 0xC000_0005 },
     );
-    assert!(delivered, "IO completion retains uncertain Reply completion");
+    if !delivered {
+        // The transport may have completed despite an uncertain receipt. Never replay it.
+        continue;
+    }
+    let Some(waiter) = (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS))
+        .finish_exact(waiter, delivered) else { continue; };
     release_reply_pool_cap(waiter.reply_cap);
     thread_wait_state_clear_badge_ready(nt_handler, waiter.badge);
     nt_handler.release_io_completion_reference(waiter.port_id);
     IO_COMPLETION_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
-    true
+    delivered_any = true;
+    }
+    delivered_any
 }
 
 
@@ -28464,9 +28551,7 @@ unsafe fn pending_file_io_redrive_pass(
                 restore_file_io_mirrors!();
                 continue;
             }
-            if nt_handler.io_completion_wake.is_some() {
-                let _ = io_completion_deliver(nt_handler);
-            }
+            let _ = io_completion_deliver(nt_handler);
             delivery_state = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                 .mark_delivery_exact(
                     slot,
@@ -28726,6 +28811,11 @@ unsafe fn file_irp_drain_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         if !driver_launch::file_thread_io_drain_state(pending.file_id, pending.tid).is_drained() {
             continue;
         }
+        if nt_handler.capture_thread_process_identity(pending.pi as usize, pending.tid)
+            != pending.process
+        {
+            continue;
+        }
 
         let Some((sb, ss, smv, hmv, scratch_base)) =
             mirror_ctx_for(nt_handler, pending.badge, pending.pi as usize, pending.tid)
@@ -28751,20 +28841,26 @@ unsafe fn file_irp_drain_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 .expect("File IRP drain IOSB owner disappeared");
         }
         if delivery_state & nt_io_manager::FILE_IRP_DRAIN_REPLY_PUBLISHED == 0 {
-            let cap = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
-                .claim_reply_cap_exact(slot, pending.file_id, pending.tid)
-                .expect("File IRP drain reply owner disappeared")
-                .expect("File IRP drain reply claimed without publication");
-            let _ = reply_parked_syscall(cap, 0);
-            release_reply_pool_cap(cap);
+            let Some(cap) = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
+                .begin_reply_exact(slot, pending.file_id, pending.tid)
+            else {
+                // An entered Reply has an uncertain effect and must never be replayed.
+                continue;
+            };
+            let replied = reply_parked_syscall(cap, 0);
+            if !replied {
+                // Keep the exact Reply and File owners until delivery can be reconciled.
+                continue;
+            }
             thread_wait_state_clear_badge_ready(nt_handler, pending.badge);
             (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
-                .mark_reply_published_exact(slot, pending.file_id, pending.tid)
+                .finish_reply_exact(slot, pending.file_id, pending.tid, true)
                 .expect("File IRP drain reply publication owner disappeared");
         }
         let finished = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
             .finish_exact(slot, pending.file_id, pending.tid)
             .expect("completed File IRP drain owner did not retire");
+        release_reply_pool_cap(finished.reply_cap);
         nt_handler.release_file_reference(finished.file_id);
         resumed += 1;
     }
@@ -28777,6 +28873,13 @@ unsafe fn file_irp_drain_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     nt_handler.pi = saved_pi;
     nt_handler.loop_ctx = saved_ctx;
     resumed
+}
+
+pub(crate) unsafe fn file_irp_drain_dependents_quiescent_exact(
+    pi: u32,
+    process: nt_user_host::process_identity::ProcessIdentity,
+) -> bool {
+    !(&*core::ptr::addr_of!(PENDING_FILE_IRP_DRAINS)).has_process_exact(pi, process)
 }
 
 unsafe fn ensure_client_copyin_dll_page(
