@@ -284,7 +284,10 @@ fn drive_retained(file_id: FileId, owner: RetainedFileLifecycle) -> bool {
 
 fn drive_payload(file_id: FileId, executor: NativeHandleCaller) -> bool {
     let slot = index(file_id).expect("lifecycle File owner missing");
-    if rows()[slot].executing || rows()[slot].retry_after > monotonic_time_100ns() {
+    if rows()[slot].executing
+        || (rows()[slot].retry_after != 0
+            && rows()[slot].retry_after > monotonic_time_100ns())
+    {
         return false;
     }
     let Some(payload) = rows()[slot].payload.take() else { return false };
@@ -326,7 +329,9 @@ fn queued_route_ready(file_id: FileId) -> bool {
 pub(super) fn nested_ready(file_id: FileId) -> bool {
     let Some(index) = index(file_id) else { return false; };
     let row = &rows()[index];
-    if row.executing || row.retry_after > monotonic_time_100ns() { return false; }
+    if row.executing || (row.retry_after != 0 && row.retry_after > monotonic_time_100ns()) {
+        return false;
+    }
     match row.payload.as_ref() {
         Some(Payload::Prepared(prepared)) => projection_ready(prepared.projection()),
         Some(Payload::Returned(_)) | Some(Payload::AckReturned(_)) => true,
