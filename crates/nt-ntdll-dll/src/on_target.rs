@@ -1324,9 +1324,7 @@ unsafe fn export_rva_by_name(base: u64, want: &[u8]) -> u32 {
         // executive's fault router to fill them from the dependency's parsed PE, so the walk sees the
         // real tables. This is the general fix — it makes EVERY export resolution robust against the
         // lazy per-process fill, not just this one symbol.
-        let mut export_timer = runtime_loader_trace::ExportLookupTimer::begin();
         touch_range(base + edir_rva as u64, edir_sz as u64);
-        export_timer.touched();
         let ed = base + edir_rva as u64;
         let number_of_functions = rd32(ed, 0x14);
         let number_of_names = rd32(ed, 0x18);
@@ -2169,7 +2167,6 @@ unsafe fn snap_descriptor_against(
     dep_base: u64,
     table: *mut ModuleTable,
     out: &mut SnapResult,
-    mut trace: Option<&mut runtime_loader_trace::SnapDescriptorTrace>,
     expansion: &mut nt_ntdll::loader::reference_graph::ReferenceExpansion<MODULE_TABLE_CAP>,
 ) {
     // SAFETY: caller contract — mapped images, writable IAT.
@@ -2177,9 +2174,6 @@ unsafe fn snap_descriptor_against(
         let mut ilt = image_base + ilt_rva as u64;
         let mut iat = image_base + iat_rva as u64;
         loop {
-            let started = trace
-                .as_ref()
-                .and_then(|_| runtime_loader_trace::counter_sample());
             touch_range(ilt, 8);
             touch_range(iat, 8);
             let thunk = core::ptr::read_unaligned(ilt as *const u64);
@@ -2191,22 +2185,16 @@ unsafe fn snap_descriptor_against(
             // would write the forwarder-STRING address into the IAT → an instruction-fetch fault into
             // the target's .rdata on the first call (the kernel32+0xa9954 map=8 wall).
             let by_ordinal = thunk & (1u64 << 63) != 0;
-            let mut namebuf = [0u8; 96];
-            let mut name_len = 0usize;
-            let mut ordinal = 0u32;
-            let resolve_started;
             let addr = if !by_ordinal {
                 // by name: IMAGE_IMPORT_BY_NAME RVA = thunk & 0x7fffffff; +2 skips the Hint.
                 let ibn_rva = (thunk & 0x7fff_ffff) as u32;
                 touch_rva_range(image_base, ibn_rva, 2);
-                name_len = read_cstr(image_base, ibn_rva + 2, &mut namebuf);
-                resolve_started = trace
-                    .as_ref()
-                    .and_then(|_| runtime_loader_trace::counter_sample());
+                let mut namebuf = [0u8; 96];
+                let nlen = read_cstr(image_base, ibn_rva + 2, &mut namebuf);
                 resolve_export_addr(
                     dep_base,
                     false,
-                    &namebuf[..name_len],
+                    &namebuf[..nlen],
                     0,
                     table,
                     &mut out.status,
@@ -2215,41 +2203,24 @@ unsafe fn snap_descriptor_against(
                 )
             } else {
                 // by ordinal.
-                ordinal = (thunk & 0xffff) as u32;
-                resolve_started = trace
-                    .as_ref()
-                    .and_then(|_| runtime_loader_trace::counter_sample());
+                let ord = (thunk & 0xffff) as u32;
                 resolve_export_addr(
                     dep_base,
                     true,
                     &[],
-                    ordinal,
+                    ord,
                     table,
                     &mut out.status,
                     0,
                     expansion,
                 )
             };
-            let resolve_done = trace
-                .as_ref()
-                .and_then(|_| runtime_loader_trace::counter_sample());
             if out.status != 0 {
                 core::ptr::write_unaligned(
                     iat as *mut u64,
                     nt_ntdll::loader::resolve::BAD_IAT_VALUE,
                 );
                 out.missing += 1;
-                if let Some(trace) = trace.as_deref_mut() {
-                    trace.record_thunk(
-                        started,
-                        resolve_started,
-                        resolve_done,
-                        runtime_loader_trace::counter_sample(),
-                        &namebuf[..name_len],
-                        ordinal,
-                        by_ordinal,
-                    );
-                }
                 return;
             }
             if addr == 0 {
@@ -2263,17 +2234,6 @@ unsafe fn snap_descriptor_against(
                 } else {
                     nt_ntdll::loader::resolve::STATUS_ENTRYPOINT_NOT_FOUND
                 };
-                if let Some(trace) = trace.as_deref_mut() {
-                    trace.record_thunk(
-                        started,
-                        resolve_started,
-                        resolve_done,
-                        runtime_loader_trace::counter_sample(),
-                        &namebuf[..name_len],
-                        ordinal,
-                        by_ordinal,
-                    );
-                }
                 return;
             }
             core::ptr::write_unaligned(iat as *mut u64, addr);
@@ -2281,17 +2241,6 @@ unsafe fn snap_descriptor_against(
             if out.spot_iat_value == 0 {
                 out.spot_iat_value = addr;
                 out.spot_iat_rva = (iat - image_base) as u32;
-            }
-            if let Some(trace) = trace.as_deref_mut() {
-                trace.record_thunk(
-                    started,
-                    resolve_started,
-                    resolve_done,
-                    runtime_loader_trace::counter_sample(),
-                    &namebuf[..name_len],
-                    ordinal,
-                    by_ordinal,
-                );
             }
             ilt += 8;
             iat += 8;
@@ -2312,9 +2261,7 @@ unsafe fn export_rva_by_ordinal(base: u64, ordinal: u32) -> u32 {
             return 0;
         }
         // Force-fault the export dir region first (same per-VSpace lazy-fill fix as export_rva_by_name).
-        let mut export_timer = runtime_loader_trace::ExportLookupTimer::begin();
         touch_range(base + edir_rva as u64, edir_sz as u64);
-        export_timer.touched();
         let ed = base + edir_rva as u64;
         let ordinal_base = rd32(ed, 0x10);
         let number_of_functions = rd32(ed, 0x14);
@@ -2396,7 +2343,6 @@ unsafe fn resolve_export_addr(
             // Concrete export — the common case.
             return dep_base + rva as u64;
         }
-        runtime_loader_trace::forwarder();
         // FORWARDER: the RVA points at an ASCII `"TARGETDLL.func"` / `"TARGETDLL.#ordinal"` string.
         // Split on the LAST '.' (api-set names can contain dots; ReactOS ones don't, but be exact).
         let mut fbuf = [0u8; 128];
@@ -3191,14 +3137,7 @@ unsafe fn snap_module(
                 }
                 if dep_base != 0 {
                     snap_descriptor_against(
-                        image_base,
-                        ilt_rva,
-                        ft,
-                        dep_base,
-                        table,
-                        out,
-                        snap_trace.as_mut(),
-                        expansion,
+                        image_base, ilt_rva, ft, dep_base, table, out, expansion,
                     );
                     if out.status != 0 {
                         if let Some(trace) = snap_trace.take() {

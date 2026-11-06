@@ -10,6 +10,7 @@ use nt_memory_manager::image_section::ImageAreaId;
 use nt_memory_manager::image_source_page::{
     routed_source_read_decision, RoutedSourceReadDecision,
 };
+use nt_memory_manager::local_pagein_drive::{DriveDecision, DriveStep, LocalDriveBudget};
 use nt_memory_manager::routed_image_read::RoutedImageRead;
 use nt_memory_manager::RoutedSectionLease;
 use nt_pe_loader::{ImagePageFileSpan, ImagePageFillCapture};
@@ -63,6 +64,7 @@ enum Purpose {
 
 #[derive(Clone, Copy)]
 enum Phase { AwaitSource, Read, Publish, MapPage, ScanSyscall, DispatchSyscall, ReplyReady, ReadyError, ReplyEntered, ReplySent, Cancel, Cancelled, Indeterminate }
+const LOCAL_FAULT_STEPS: usize = 16;
 
 struct Work {
     pi: usize,
@@ -88,6 +90,7 @@ struct Work {
     cancel_requested: bool,
     purpose: Purpose,
     progress: nt_syscall::copy_preflight::CopyOutputContinuation,
+    drive_progress: bool,
 }
 
 impl Work {
@@ -108,6 +111,7 @@ static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 // Keep its exact source key visible to a nested fault admission until it is reinserted.
 static mut EXECUTING_SOURCE: Option<(ImageAreaId, u32, Phase)> = None;
 static NEXT: AtomicU64 = AtomicU64::new(0);
+static ADMISSIONS: AtomicU64 = AtomicU64::new(0);
 static UNREADY_FAULT_TRACE: AtomicU64 = AtomicU64::new(0);
 
 fn has_source_producer(area: ImageAreaId, rva: u32) -> bool {
@@ -211,6 +215,7 @@ unsafe fn prepare_page(
         } else { Phase::AwaitSource },
         failure: None, failure_logged: false, cancel_requested: false,
         purpose, progress: nt_syscall::copy_preflight::CopyOutputContinuation::PageReady,
+        drive_progress: false,
     }))
 }
 
@@ -224,6 +229,7 @@ unsafe fn install_work(work: Work, reply_already_parked: bool) -> Result<(), u32
     };
     match index { Some(index) => rows[index] = Some(work), None => rows.push(Some(work)) }
     if let Some(park) = park { park.commit(); }
+    ADMISSIONS.fetch_add(1, Ordering::Release);
     NEXT.store(monotonic_time_100ns(), Ordering::Release);
     Ok(())
 }
@@ -444,6 +450,7 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
                     work.phase = Phase::Indeterminate;
                     return;
                 }
+                work.drive_progress = true;
             }
             (Err(status), _) => {
                 work.failure = Some(status);
@@ -473,6 +480,8 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
                 if !read.fail_copy(key, nt_memory_manager::routed_image_read::STATUS_IO_DEVICE_ERROR) {
                     read.quarantine();
                     work.phase = Phase::Indeterminate;
+                } else {
+                    work.drive_progress = true;
                 }
                 return;
             }
@@ -480,6 +489,8 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
                 if !read.fail_copy(key, status) {
                     read.quarantine();
                     work.phase = Phase::Indeterminate;
+                } else {
+                    work.drive_progress = true;
                 }
                 return;
             }
@@ -487,6 +498,8 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
         if !read.copy_fragment(key, offset, &bytes[..copied]) {
             read.quarantine();
             work.phase = Phase::Indeterminate;
+        } else {
+            work.drive_progress = true;
         }
         return;
     }
@@ -497,6 +510,7 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
         { return; }
         if !read.acknowledge(key) { read.quarantine(); return; }
         work.phase = Phase::Read;
+        work.drive_progress = true;
         return;
     }
     if let Some(key) = read.pending_key() {
@@ -522,6 +536,8 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
         if !read.terminal(key, completion.status, completion.information) {
             read.quarantine();
             work.phase = Phase::Indeterminate;
+        } else {
+            work.drive_progress = true;
         }
         return;
     }
@@ -535,6 +551,8 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
         if !read.reject_entry(INVALID) {
             read.quarantine();
             work.phase = Phase::Indeterminate;
+        } else {
+            work.drive_progress = true;
         }
         return;
     };
@@ -543,6 +561,8 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
         if !read.reject_entry(INVALID) {
             read.quarantine();
             work.phase = Phase::Indeterminate;
+        } else {
+            work.drive_progress = true;
         }
         return;
     }
@@ -552,6 +572,8 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
         if !read.reject_entry(RESOURCES) {
             read.quarantine();
             work.phase = Phase::Indeterminate;
+        } else {
+            work.drive_progress = true;
         }
         return;
     }
@@ -569,6 +591,8 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
             if !read.complete_inline(status.raw() as u32, information, &output) {
                 read.quarantine();
                 work.phase = Phase::Indeterminate;
+            } else {
+                work.drive_progress = true;
             }
         }
         Ok(ExternalDispatchResult::Pending { irp_id }) => {
@@ -581,6 +605,8 @@ unsafe fn advance_read(work: &mut Work, cancelled: bool) {
             if !read.reject_entry(status.raw() as u32) {
                 read.quarantine();
                 work.phase = Phase::Indeterminate;
+            } else {
+                work.drive_progress = true;
             }
         }
     }
@@ -853,6 +879,8 @@ pub(crate) unsafe fn redrive(
         || ACTIVE.swap(true, Ordering::AcqRel)
     { return; }
     let _durable = allocator::enter_durable();
+    let admissions_before = ADMISSIONS.load(Ordering::Acquire);
+    let mut immediate_followup = false;
     let count = (&*core::ptr::addr_of!(WORK)).len();
     for index in 0..count {
         let Some(mut work) = (&mut *core::ptr::addr_of_mut!(WORK))[index].take() else { continue; };
@@ -873,10 +901,36 @@ pub(crate) unsafe fn redrive(
             Purpose::RoutedFileModeInput { .. } => (work.pi, 0, 0, 0, false, 0),
         };
         EXECUTING_CALLER_PI.store(caller_pi as u64, Ordering::Release);
+        let is_fault = matches!(work.purpose, Purpose::Fault);
+        let mut budget = LocalDriveBudget::new(LOCAL_FAULT_STEPS);
         let done = service_sec_image::with_pagein_caller_target_context(
             handler, caller_pi, work.pi, work.tid, work.badge,
             resume_ip, sp, flags, transport, service,
-            |handler| advance(handler, dispatcher, &mut work),
+            |handler| loop {
+                // A nested admission can inspect this exact source while its row is absent.
+                *core::ptr::addr_of_mut!(EXECUTING_SOURCE) =
+                    Some((work.view.view.area(), work.rva, work.phase));
+                work.drive_progress = false;
+                let before = core::mem::discriminant(&work.phase);
+                let done = advance(handler, dispatcher, &mut work);
+                if !is_fault { break done; }
+                let step = if done { DriveStep::Done }
+                    else if matches!(work.phase, Phase::ReplyEntered | Phase::ReplySent) {
+                        DriveStep::ReplyEntered
+                    } else if work.drive_progress
+                        || core::mem::discriminant(&work.phase) != before {
+                        DriveStep::LocalProgress
+                    } else { DriveStep::AwaitExternal };
+                match budget.observe(step) {
+                    DriveDecision::Continue => {},
+                    DriveDecision::RetryNow => {
+                        immediate_followup = true;
+                        break false;
+                    }
+                    DriveDecision::RetryLater => break false,
+                    DriveDecision::Complete => break true,
+                }
+            },
         ).unwrap_or_else(|| {
             let stopped = spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(work.reply)
                 || handler.capture_process_identity(work.pi) != Some(work.view.process)
@@ -907,6 +961,10 @@ pub(crate) unsafe fn redrive(
         EXECUTING_CALLER_PI.store(u64::MAX, Ordering::Release);
         EXECUTING_INDEX.store(u64::MAX, Ordering::Release);
     }
-    NEXT.store(monotonic_time_100ns().saturating_add(RETRY_DELAY), Ordering::Release);
+    let now = monotonic_time_100ns();
+    NEXT.store(if immediate_followup
+        || ADMISSIONS.load(Ordering::Acquire) != admissions_before {
+        now
+    } else { now.saturating_add(RETRY_DELAY) }, Ordering::Release);
     ACTIVE.store(false, Ordering::Release);
 }
