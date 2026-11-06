@@ -141,6 +141,12 @@ impl<M> ComponentIngress<M> {
     pub(crate) fn held_receive_matches(&self, identity: u64) -> bool {
         identity != 0 && self.phase == Phase::Held && self.held_receive == identity
     }
+    pub(crate) fn receiving_matches(&self, identity: u64) -> bool {
+        identity != 0 && self.phase == Phase::Receiving(identity)
+    }
+    pub(crate) fn captured_receive_matches(&self, identity: u64) -> bool {
+        identity != 0 && self.phase == Phase::Unresolved(identity)
+    }
     /// Inspect retained data, including unresolved receives. Presence does not prove Call or Reply
     /// binding authority; classification requires separately established transport provenance.
     pub fn message(&self) -> Option<&M> {
