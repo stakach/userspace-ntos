@@ -1,5 +1,97 @@
 //! Retained timer readiness for work that must execute at an outer scheduling boundary.
 
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// One timer notification for retained work until its outer owner runs. Publication and retry
+/// scheduling are serialized with the backing work rows; the timer only observes readiness.
+pub struct CoalescedRetryWake {
+    deadline: AtomicU64,
+    notified: AtomicBool,
+    publication: AtomicU64,
+    writer: AtomicBool,
+}
+
+#[must_use = "the exact outer redrive must settle its retry decision"]
+pub struct RetryWakeAttempt<'a> {
+    owner: &'a CoalescedRetryWake,
+    publication: u64,
+}
+
+impl RetryWakeAttempt<'_> {
+    /// Consumes the attempt; a nested publication keeps its own earlier demand.
+    pub fn retry_at(self, deadline: u64) -> bool {
+        self.owner.retry_after(self.publication, deadline)
+    }
+}
+
+struct RetryWakeWriter<'a>(&'a AtomicBool);
+
+impl Drop for RetryWakeWriter<'_> {
+    fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+}
+
+impl CoalescedRetryWake {
+    pub const fn new() -> Self {
+        Self {
+            deadline: AtomicU64::new(0), notified: AtomicBool::new(false),
+            publication: AtomicU64::new(0), writer: AtomicBool::new(false),
+        }
+    }
+
+    fn writer(&self) -> RetryWakeWriter<'_> {
+        while self.writer.compare_exchange(false, true, Ordering::Acquire,
+            Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+        RetryWakeWriter(&self.writer)
+    }
+
+    /// A new retained work item or completed outer attempt may request another timer wake.
+    pub fn publish(&self, deadline: u64) {
+        let _writer = self.writer();
+        self.deadline.store(deadline, Ordering::Release);
+        self.publication.fetch_add(1, Ordering::Release);
+        self.notified.store(false, Ordering::Release);
+    }
+
+    pub fn next_deadline(&self, has_work: bool) -> Option<u64> {
+        (has_work && !self.notified.load(Ordering::Acquire))
+            .then(|| self.deadline.load(Ordering::Acquire))
+    }
+
+    /// The timer may announce due work once; it never claims or drops the retained owner.
+    pub fn wake_due(&self, now: u64, has_work: bool) -> bool {
+        let _writer = self.writer();
+        has_work && now >= self.deadline.load(Ordering::Acquire)
+            && !self.notified.swap(true, Ordering::AcqRel)
+    }
+
+    /// The outer owner can act on a delivered wake even after timer rearming is suppressed.
+    pub fn begin_redrive(&self, now: u64, has_work: bool) -> Option<RetryWakeAttempt<'_>> {
+        let _writer = self.writer();
+        (has_work && now >= self.deadline.load(Ordering::Acquire))
+            .then(|| RetryWakeAttempt {
+                owner: self,
+                publication: self.publication.load(Ordering::Acquire),
+            })
+    }
+
+    /// An attempted redrive may schedule a later retry only if no nested callback published
+    /// newer work. Both mutations are serialized; a newer earlier deadline remains authoritative.
+    fn retry_after(&self, publication: u64, deadline: u64) -> bool {
+        let _writer = self.writer();
+        if self.publication.load(Ordering::Acquire) != publication { return false; }
+        self.deadline.store(deadline, Ordering::Release);
+        self.publication.fetch_add(1, Ordering::Release);
+        self.notified.store(false, Ordering::Release);
+        true
+    }
+}
+
+impl Default for CoalescedRetryWake {
+    fn default() -> Self { Self::new() }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
     Waiting { deadline: u64 },
