@@ -59,6 +59,7 @@ static USER_CALLBACK_REAL_REDIRECTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_RETURNS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_RESUME_IP_REJECTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
+static USER_CALLBACK_WM_CREATE_GATE_TRACES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_RESOURCE_STARTED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CONTINUATION_PUSHES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CONTINUATION_UNWINDS: AtomicU64 = AtomicU64::new(0);
@@ -2065,6 +2066,61 @@ pub(crate) fn user_callback_stack_depths() -> (usize, usize) {
     }
 }
 
+/// Periodic, read-only owner census. Copy the pure snapshot before printing so diagnostics hold
+/// no borrow of either mutable callback stack across the serial writer.
+pub(crate) fn print_callback_owner_census() {
+    let owner = unsafe {
+        nt_user_callback::oldest_active_callback_owner(
+            &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE),
+            &*core::ptr::addr_of!(USER_CALLBACK_CONTINUATIONS),
+        )
+    };
+    let Some(owner) = owner else { return };
+    print_str(b"[user-callback-owner] dispatch=");
+    print_u64(owner.correlation.dispatch_id);
+    print_str(b" callback=");
+    print_u64(owner.correlation.callback_id as u64);
+    print_str(b" api=");
+    print_u64(owner.api_index as u64);
+    print_str(b" pi/tid/badge=");
+    print_u64(owner.correlation.client_pi as u64);
+    print_str(b"/");
+    print_u64(owner.correlation.client_tid);
+    print_str(b"/");
+    print_u64(owner.correlation.client_badge);
+    print_str(b" tcb=0x");
+    print_hex_u64(owner.client_tcb);
+    print_str(b" token=");
+    print_u64(owner.external_token);
+    print_str(b" lane=");
+    print_u64(owner.lane.index as u64);
+    print_str(b"/");
+    print_u64(owner.lane.generation);
+    print_str(b" redirected=");
+    print_u64(owner.redirected as u64);
+    print_str(b" client-depth=");
+    print_u64(owner.client_continuation_depth as u64);
+    if let Some(frame) = owner.client_continuation {
+        print_str(b" top-kind=");
+        print_str(match frame.kind {
+            nt_user_callback::ContinuationKind::Win32kDispatch => b"dispatch",
+            nt_user_callback::ContinuationKind::UserCallback => b"callback",
+        });
+        print_str(b" top-state=");
+        print_str(match frame.state {
+            nt_user_callback::ContinuationState::Running => b"running",
+            nt_user_callback::ContinuationState::Suspended => b"suspended",
+        });
+        print_str(b" top-dispatch=");
+        print_u64(frame.dispatch_id);
+        print_str(b" top-callback=");
+        print_u64(frame.callback_id as u64);
+    } else {
+        print_str(b" top=none");
+    }
+    print_str(b"\n");
+}
+
 unsafe fn callback_frame_can_resume(frame: &nt_user_callback::ActiveCallbackFrame) -> bool {
     crate::component_external_resume_ready(
         frame.dispatch_context().lane,
@@ -3428,6 +3484,32 @@ pub(crate) unsafe fn service_user_callback(
                 USER_CALLBACK_SAS_SEQUENCE_ACTIVE.store(request.dispatch_id, Ordering::Relaxed);
             }
             suspend_component = true;
+            if request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC
+                && window_message == 0x0001
+                && USER_CALLBACK_WM_CREATE_GATE_TRACES.fetch_add(1, Ordering::Relaxed) < 16
+            {
+                print_str(b"[user-callback] selected WM_CREATE dispatch/callback=");
+                print_u64(request.dispatch_id);
+                print_str(b"/");
+                print_u64(request.callback_id as u64);
+                print_str(b" hwnd=0x");
+                print_hex_u64(window_hwnd);
+                print_str(b" len/ref/session=");
+                print_u64(request.input_length as u64);
+                print_str(b"/");
+                print_u64(request.payload_reference_offset as u64);
+                print_str(b"/");
+                print_hex_u64(sas_session_before);
+                print_str(b" gates=session-zero/ref/length/first=");
+                print_u64((sas_session_before == 0) as u64);
+                print_str(b"/");
+                print_u64((request.payload_reference_offset == WINDOWPROC_PAYLOAD_OFFSET) as u64);
+                print_str(b"/");
+                print_u64((request.input_length >= 0x40 + 0x50) as u64);
+                print_str(b"/");
+                print_u64(first_sas_create as u64);
+                print_str(b"\n");
+            }
             if callback_trace {
                 print_str(b"[user-callback] selected real callback api=");
                 print_u64(request.api_index as u64);

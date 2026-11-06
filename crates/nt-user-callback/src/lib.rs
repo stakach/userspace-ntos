@@ -1627,6 +1627,44 @@ pub struct ActiveCallbackStack<const DEPTH: usize = MAX_ACTIVE_CALLBACK_DEPTH> {
     len: usize,
 }
 
+/// A copy of the oldest outstanding callback's owner and that exact client's innermost
+/// continuation. Observation does not advance either stack or infer completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallbackOwnerSnapshot {
+    pub correlation: CallbackCorrelation,
+    pub api_index: u32,
+    pub client_tcb: u64,
+    pub external_token: u64,
+    pub redirected: bool,
+    pub lane: nt_component_suspension::LaneHandle,
+    pub client_continuation_depth: usize,
+    pub client_continuation: Option<ContinuationFrame>,
+}
+
+pub fn oldest_active_callback_owner<const A: usize, const C: usize>(
+    active: &ActiveCallbackStack<A>,
+    continuations: &ContinuationStack<C>,
+) -> Option<CallbackOwnerSnapshot> {
+    let frame = active.frame(0)?;
+    let request = frame.request();
+    let correlation = CallbackCorrelation::from_request(request);
+    let client = ClientThreadIdentity::new(
+        correlation.client_pi,
+        correlation.client_tid,
+        correlation.client_badge,
+    );
+    Some(CallbackOwnerSnapshot {
+        correlation,
+        api_index: request.api_index,
+        client_tcb: frame.client_tcb(),
+        external_token: frame.external_token(),
+        redirected: frame.is_redirected(),
+        lane: frame.dispatch_context().lane,
+        client_continuation_depth: continuations.len_for(&client),
+        client_continuation: continuations.top_for(&client).copied(),
+    })
+}
+
 impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
     pub const fn new() -> Self {
         Self {
@@ -3473,6 +3511,66 @@ mod tests {
         assert_eq!(stack.return_callback(a_callback), Ok(()));
         assert_eq!(stack.complete_dispatch(a, a_callback.dispatch_id), Ok(()));
         assert!(stack.is_empty());
+    }
+
+    #[test]
+    fn oldest_active_callback_owner_uses_its_client_continuation() {
+        let a = ClientThreadIdentity::new(2, 6, 4);
+        let b = ClientThreadIdentity::new(2, 21, 13);
+        let mut a_request = CallbackHeader::idle(10, a.client_pi, a.client_tid, a.client_badge);
+        a_request.state = CallbackState::Request as u32;
+        a_request.callback_id = 1;
+        a_request.api_index = USER32_CALLBACK_WINDOWPROC;
+        let mut b_request = CallbackHeader::idle(20, b.client_pi, b.client_tid, b.client_badge);
+        b_request.state = CallbackState::Request as u32;
+        b_request.callback_id = 2;
+        b_request.api_index = USER32_CALLBACK_WINDOWPROC;
+        let a_correlation = CallbackCorrelation::from_request(&a_request);
+        let b_correlation = CallbackCorrelation::from_request(&b_request);
+        let mut active = ActiveCallbackStack::<4>::new();
+        let mut continuations = ContinuationStack::<8>::new();
+        continuations.push_dispatch(a, 10).unwrap();
+        continuations.push_callback(a_correlation).unwrap();
+        active.push(a_request, 0xaaa0).unwrap();
+        continuations.push_dispatch(a, 11).unwrap();
+        continuations.push_dispatch(b, 20).unwrap();
+        continuations.push_callback(b_correlation).unwrap();
+        active.push(b_request, 0xbbb0).unwrap();
+        for (correlation, index) in [(a_correlation, 0), (b_correlation, 1)] {
+            active.record_dispatch_context(correlation, DispatchContext {
+                lane: nt_component_suspension::LaneHandle { index, generation: 1 },
+                dispatch_id: correlation.dispatch_id,
+                ssn: 0x1267,
+                args: [0; 4],
+                caller_sp: 0x1000,
+                output_stage: None,
+                paint_output: None,
+            }).unwrap();
+            let mut context = [0; 20];
+            context[USER_CONTEXT_RIP] = 0x1000;
+            active.record_redirect(correlation, context).unwrap();
+        }
+
+        assert_eq!(continuations.top().unwrap().client, b);
+        let owner = oldest_active_callback_owner(&active, &continuations).unwrap();
+        assert_eq!(owner.correlation, a_correlation);
+        assert_eq!(owner.client_tcb, 0xaaa0);
+        assert_eq!(owner.client_continuation_depth, 3);
+        assert_eq!(owner.client_continuation.unwrap().client, a);
+        assert_eq!(owner.client_continuation.unwrap().kind, ContinuationKind::Win32kDispatch);
+        assert_eq!(owner.client_continuation.unwrap().dispatch_id, 11);
+
+        continuations.complete_dispatch(a, 11).unwrap();
+        let owner = oldest_active_callback_owner(&active, &continuations).unwrap();
+        assert_eq!(owner.client_continuation.unwrap().kind, ContinuationKind::UserCallback);
+        assert_eq!(owner.client_continuation.unwrap().dispatch_id, 10);
+        assert_eq!(owner.client_continuation.unwrap().state, ContinuationState::Running);
+        continuations.return_callback(a_correlation).unwrap();
+        active.pop(a_correlation).unwrap();
+        let owner = oldest_active_callback_owner(&active, &continuations).unwrap();
+        assert_eq!(owner.correlation, b_correlation);
+        assert_eq!(owner.client_continuation.unwrap().client, b);
+        assert_eq!(owner.client_continuation_depth, 2);
     }
 
     /// The interleaved ACTIVE stack: two threads redirected at once, each `NtCallbackReturn`
