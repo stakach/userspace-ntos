@@ -47,10 +47,13 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
         REPLY_MAIN_SLOT.load(Ordering::Relaxed),
         "shared root receive must own the current hosted Reply"
     );
-    if let Some(boundary) = runtime::take_outer_boundary()
-        .expect("settled child retains its exact parent restoration permit")
-    {
-        return ReceiveOutcome::OuterBoundary(boundary);
+    match runtime::take_outer_boundary() {
+        Ok(Some(boundary)) => return ReceiveOutcome::OuterBoundary(boundary),
+        Ok(None) => {}
+        Err(_) => {
+            print_str(b"[ingress-receive-error] child settlement retained\n");
+            return ReceiveOutcome::RetainedFailure;
+        }
     }
     if reply_cptr != 0 {
         if runtime::owns_hosted_reply(reply_cptr) {
@@ -71,10 +74,13 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
         }
     }
     loop {
-        if let Some(boundary) = runtime::take_outer_boundary()
-            .expect("settled child retains its exact parent restoration permit")
-        {
-            return ReceiveOutcome::OuterBoundary(boundary);
+        match runtime::take_outer_boundary() {
+            Ok(Some(boundary)) => return ReceiveOutcome::OuterBoundary(boundary),
+            Ok(None) => {}
+            Err(_) => {
+                print_str(b"[ingress-receive-error] child settlement retained\n");
+                return ReceiveOutcome::RetainedFailure;
+            }
         }
         let delivered = runtime::take_hosted_with(|reply, _message| {
             if !runtime::receive_child_delivery_allowed(reply) {
@@ -176,8 +182,15 @@ pub(crate) unsafe fn reply_receive(
     // One-way acknowledged reply separates outgoing ownership from receive admission. The
     // unified receiver retains arrivals between these operations, including hosted reentry.
     if !client_reply_on(reply_cptr, info, r0, r1, r2, r3) {
-        // A refused or indeterminate send still owns this exact Reply. The outer service
-        // boundary can exit without admitting another Call or replaying the old send.
+        // The retained hosted Call still owns its exact Reply after a refused or
+        // indeterminate send. Quarantine that pool slot before accepting another Call;
+        // never replay the old send. A non-hosted Reply has no such proved owner.
+        if runtime::owns_hosted_reply(reply_cptr)
+            && REPLY_MAIN_SLOT.load(Ordering::Relaxed) == reply_cptr
+            && crate::root_reply_park::quarantine_current_hosted_reply()
+        {
+            return receive(0);
+        }
         return ReceiveOutcome::RetainedFailure;
     }
     receive(REPLY_MAIN_SLOT.load(Ordering::Relaxed))

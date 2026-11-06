@@ -32,7 +32,7 @@ fn refusal_exits_the_service_loop_without_reusing_the_owned_reply() {
 }
 
 #[test]
-fn uncertain_root_reply_keeps_its_owner_and_skips_receive() {
+fn uncertain_root_reply_quarantines_exact_owner_before_fresh_receive() {
     let reply_receive = INGRESS
         .split_once("pub(crate) unsafe fn reply_receive(")
         .expect("root reply and receive")
@@ -40,8 +40,10 @@ fn uncertain_root_reply_keeps_its_owner_and_skips_receive() {
     assert!(!reply_receive.contains("assert!(\n        client_reply_on("),
         "a refused or uncertain Reply is a recoverable retained outcome");
     assert!(reply_receive.contains("if !client_reply_on(")
+        && reply_receive.contains("quarantine_current_hosted_reply()")
+        && reply_receive.contains("return receive(0)")
         && reply_receive.contains("return ReceiveOutcome::RetainedFailure"),
-        "the original Reply must remain owned without admitting another Call");
+        "an exact hosted Reply should be quarantined while root ingress recovers on a fresh slot");
 }
 
 #[test]
@@ -54,6 +56,8 @@ fn receive_failure_retains_incomplete_ingress_without_panicking() {
         .expect("root receive boundary")
         .0;
     assert!(!receive.contains("panic!(\"unified executive ingress retained after receive failure\")"));
+    assert!(!receive.contains(".expect(\"settled child retains its exact parent restoration permit\")"),
+        "a rejected child settlement must return a retained failure without unwinding root ingress");
     assert!(receive.contains("return ReceiveOutcome::RetainedFailure"),
         "an unclassified or unretained Call must stay owned at the service boundary");
 }
