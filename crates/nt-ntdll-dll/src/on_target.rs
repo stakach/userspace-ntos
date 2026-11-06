@@ -3103,6 +3103,8 @@ unsafe fn snap_module(
                 let mut base = [0u8; 32];
                 let bn = import_desc_basename(image_base, name_rva, &mut base);
                 let dep_name = &base[..bn];
+                let mut snap_trace =
+                    runtime_loader_trace::begin_snap_descriptor(image_base, depth, dep_name);
                 let mut dep_base = (&*table).find(dep_name);
                 let mut edge = DependencySnap {
                     base: dep_base,
@@ -3124,14 +3126,23 @@ unsafe fn snap_module(
                             nt_ntdll::loader::resolve::BAD_IAT_VALUE,
                         );
                         out.missing += 1;
+                        if let Some(trace) = snap_trace.take() {
+                            trace.finish(out.resolved, out.status);
+                        }
                         return;
                     }
+                }
+                if let Some(trace) = snap_trace.as_mut() {
+                    trace.dependency_ready(dep_base, out.resolved);
                 }
                 if dep_base != 0 {
                     snap_descriptor_against(
                         image_base, ilt_rva, ft, dep_base, table, out, expansion,
                     );
                     if out.status != 0 {
+                        if let Some(trace) = snap_trace.take() {
+                            trace.finish(out.resolved, out.status);
+                        }
                         return;
                     }
                     if !import_edges
@@ -3139,6 +3150,9 @@ unsafe fn snap_module(
                         .record(dep_base, edge.increment_existing_reference)
                     {
                         out.status = STATUS_NO_MEMORY as u32;
+                        if let Some(trace) = snap_trace.take() {
+                            trace.finish(out.resolved, out.status);
+                        }
                         return;
                     }
                 } else {
@@ -3151,7 +3165,13 @@ unsafe fn snap_module(
                     );
                     out.missing += 1;
                     out.status = nt_ntdll::loader::resolve::STATUS_DLL_NOT_FOUND;
+                    if let Some(trace) = snap_trace.take() {
+                        trace.finish(out.resolved, out.status);
+                    }
                     return;
+                }
+                if let Some(trace) = snap_trace {
+                    trace.finish(out.resolved, out.status);
                 }
                 desc += 20;
             }
