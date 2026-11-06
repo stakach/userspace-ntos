@@ -3,7 +3,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 static CALLS: AtomicU64 = AtomicU64::new(0);
-const FIRST_CALLS: u64 = 128;
+const FIRST_CALLS: u64 = 16;
 const TICKS_PER_MS: u64 = 10_000; // NtQueryPerformanceCounter now uses 100 ns units.
 
 pub(super) fn reset() {
@@ -43,21 +43,16 @@ fn append(buffer: &mut [u8], mut at: usize, bytes: &[u8]) -> usize {
     at
 }
 
-fn append_ms<const N: usize>(
-    buffer: &mut [u8; N],
-    at: usize,
-    first: Option<u64>,
-    last: Option<u64>,
-) -> usize {
-    match first
+fn elapsed_ms(first: Option<u64>, last: Option<u64>) -> Option<u32> {
+    first
         .zip(last)
         .and_then(|(first, last)| last.checked_sub(first))
-    {
-        Some(ticks) => crate::write_u32_dec(
-            buffer,
-            at,
-            (ticks / TICKS_PER_MS).min(u32::MAX as u64) as u32,
-        ),
+        .map(|ticks| (ticks / TICKS_PER_MS).min(u32::MAX as u64) as u32)
+}
+
+fn append_optional_ms<const N: usize>(buffer: &mut [u8; N], at: usize, ms: Option<u32>) -> usize {
+    match ms {
+        Some(ms) => crate::write_u32_dec(buffer, at, ms),
         None => append(buffer, at, b"-"),
     }
 }
@@ -66,10 +61,11 @@ pub(super) struct RuntimeLoadTrace {
     ordinal: u64,
     pid: u64,
     work_start: Option<u64>,
-    map_done: Option<u64>,
-    snap_done: Option<u64>,
-    bookkeeping_done: Option<u64>,
-    attach_done: Option<u64>,
+    phase_start: Option<u64>,
+    map_ms: Option<u32>,
+    snap_ms: Option<u32>,
+    bookkeeping_ms: Option<u32>,
+    attach_ms: Option<u32>,
 }
 
 impl RuntimeLoadTrace {
@@ -91,28 +87,53 @@ impl RuntimeLoadTrace {
             at = append(&mut message, at, b"\"\n");
             unsafe { crate::dbg_print_bytes(message.as_ptr(), at) };
         }
+        let work_start = entered.and_then(|_| counter());
         Self {
             ordinal,
             pid,
-            work_start: entered.and_then(|_| counter()),
-            map_done: None,
-            snap_done: None,
-            bookkeeping_done: None,
-            attach_done: None,
+            work_start,
+            phase_start: work_start,
+            map_ms: None,
+            snap_ms: None,
+            bookkeeping_ms: None,
+            attach_ms: None,
         }
     }
 
+    fn phase_done(&mut self, phase: &[u8]) -> Option<u32> {
+        let end = self.phase_start.and_then(|_| counter());
+        let duration = elapsed_ms(self.phase_start, end);
+        if let Some(tick) = end {
+            let mut message = [0u8; 128];
+            let mut at = append(&mut message, 0, b"[ldr-runtime] phase n=");
+            at = crate::write_u32_dec(&mut message, at, self.ordinal.min(u32::MAX as u64) as u32);
+            at = append(&mut message, at, b" pid=0x");
+            at = crate::write_u64_hex(&mut message, at, self.pid);
+            at = append(&mut message, at, b" qpc=0x");
+            at = crate::write_u64_hex(&mut message, at, tick);
+            at = append(&mut message, at, b" stage=");
+            at = append(&mut message, at, phase);
+            at = append(&mut message, at, b" phase-ms=");
+            at = append_optional_ms(&mut message, at, duration);
+            at = append(&mut message, at, b"\n");
+            unsafe { crate::dbg_print_bytes(message.as_ptr(), at) };
+        }
+        // The next phase starts after serial output, so no phase duration charges debug I/O.
+        self.phase_start = end.and_then(|_| counter());
+        duration
+    }
+
     pub(super) fn map_done(&mut self) {
-        self.map_done = self.work_start.and_then(|_| counter());
+        self.map_ms = self.phase_done(b"map");
     }
     pub(super) fn snap_done(&mut self) {
-        self.snap_done = self.work_start.and_then(|_| counter());
+        self.snap_ms = self.phase_done(b"snap");
     }
     pub(super) fn bookkeeping_done(&mut self) {
-        self.bookkeeping_done = self.work_start.and_then(|_| counter());
+        self.bookkeeping_ms = self.phase_done(b"book");
     }
     pub(super) fn attach_done(&mut self) {
-        self.attach_done = self.work_start.and_then(|_| counter());
+        self.attach_ms = self.phase_done(b"attach");
     }
 
     pub(super) fn finish(self, status: u32) {
@@ -129,16 +150,13 @@ impl RuntimeLoadTrace {
         at = crate::write_u64_hex(&mut message, at, finished.unwrap_or(0));
         at = append(&mut message, at, b" status=0x");
         at = crate::write_u64_hex(&mut message, at, status as u64);
-        at = append(&mut message, at, b" map/snap/book/attach/total-ms=");
-        for (index, (first, last)) in [
-            (Some(start), self.map_done),
-            (self.map_done, self.snap_done),
-            (
-                self.snap_done.or(self.map_done).or(Some(start)),
-                self.bookkeeping_done,
-            ),
-            (self.bookkeeping_done, self.attach_done),
-            (Some(start), finished),
+        at = append(&mut message, at, b" map/snap/book/attach/elapsed-ms=");
+        for (index, ms) in [
+            self.map_ms,
+            self.snap_ms,
+            self.bookkeeping_ms,
+            self.attach_ms,
+            elapsed_ms(Some(start), finished),
         ]
         .into_iter()
         .enumerate()
@@ -146,7 +164,7 @@ impl RuntimeLoadTrace {
             if index != 0 {
                 at = append(&mut message, at, b"/");
             }
-            at = append_ms(&mut message, at, first, last);
+            at = append_optional_ms(&mut message, at, ms);
         }
         at = append(&mut message, at, b"\n");
         unsafe { crate::dbg_print_bytes(message.as_ptr(), at) };
