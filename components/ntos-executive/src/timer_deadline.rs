@@ -58,6 +58,14 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
             DELAY_TIMER_SOURCE_HOSTED_PROVIDER_STARTUP_RESTORE,
         ),
         (
+            spawn_hosts::shared_ingress::owner::runtime::nested::next_abort_deadline(),
+            DELAY_TIMER_SOURCE_NESTED_ACQUIRE_ABORT,
+        ),
+        (
+            win32k_glue::win32k_startup_restore_next_deadline(),
+            DELAY_TIMER_SOURCE_WIN32K_STARTUP_RESTORE,
+        ),
+        (
             driver_launch::hosted_acpi_pci_route_recovery_next_deadline(now.monotonic_100ns),
             DELAY_TIMER_SOURCE_ACPI_PCI_ROUTE_RECOVERY,
         ),

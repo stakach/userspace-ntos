@@ -82,6 +82,9 @@ impl<R: Copy + Eq, D: Copy + Eq> PhysicalExecutionAcquire<R, D> {
 pub enum RestoreStep {
     Canonical,
     Projection,
+    /// Projection restoration may have entered. Only a certified no-effect refusal may
+    /// return to Projection; a lost acknowledgement must not replay the physical write.
+    ProjectionEntered,
     Release,
     UncertainRelease,
     Finalize,
@@ -124,9 +127,46 @@ impl<R: Copy + Eq, D: Copy + Eq> PhysicalExecutionRestore<R, D> {
         Ok(())
     }
 
-    pub fn acknowledge_projection(&mut self, route: R, dispatch: D) -> Result<(), RestoreError> {
+    /// A failed semantic scope left the canonical lane Running while the physical TCB is held.
+    /// Only that exact, fully acknowledged acquisition may skip canonical restoration and
+    /// begin cleanup of the projection and seL4 hold. The native owner also retains its hold
+    /// generation; this state machine cannot infer it from the route alone.
+    pub fn begin_abort_after_failed_scope(
+        &mut self,
+        acquire: &PhysicalExecutionAcquire<R, D>,
+        route: R,
+        dispatch: D,
+    ) -> Result<(), RestoreError> {
+        self.validate(route, dispatch)?;
+        if self.step != RestoreStep::Canonical
+            || acquire.next(route, dispatch)? != AcquireStep::ProjectionHeld
+        {
+            return Err(RestoreError::InvalidPhase);
+        }
+        self.step = RestoreStep::Projection;
+        Ok(())
+    }
+
+    pub fn enter_projection(&mut self, route: R, dispatch: D) -> Result<(), RestoreError> {
         self.validate(route, dispatch)?;
         if self.step != RestoreStep::Projection { return Err(RestoreError::InvalidPhase); }
+        self.step = RestoreStep::ProjectionEntered;
+        Ok(())
+    }
+
+    pub fn refuse_projection_no_effects(&mut self, route: R, dispatch: D)
+        -> Result<(), RestoreError> {
+        self.validate(route, dispatch)?;
+        if self.step != RestoreStep::ProjectionEntered {
+            return Err(RestoreError::InvalidPhase);
+        }
+        self.step = RestoreStep::Projection;
+        Ok(())
+    }
+
+    pub fn acknowledge_projection(&mut self, route: R, dispatch: D) -> Result<(), RestoreError> {
+        self.validate(route, dispatch)?;
+        if self.step != RestoreStep::ProjectionEntered { return Err(RestoreError::InvalidPhase); }
         self.step = RestoreStep::Release;
         Ok(())
     }
@@ -204,6 +244,10 @@ mod tests {
         // projection, without replaying the consumed canonical resume.
         assert_eq!(restore.next(7, 11), Ok(RestoreStep::Projection));
         assert_eq!(restore.next(7, 11), Ok(RestoreStep::Projection));
+        restore.enter_projection(7, 11).unwrap();
+        restore.refuse_projection_no_effects(7, 11).unwrap();
+        assert_eq!(restore.next(7, 11), Ok(RestoreStep::Projection));
+        restore.enter_projection(7, 11).unwrap();
         restore.acknowledge_projection(7, 11).unwrap();
         assert_eq!(restore.next(7, 11), Ok(RestoreStep::Release));
 
@@ -227,10 +271,60 @@ mod tests {
     fn uncertain_release_without_ack_keeps_the_owner_and_excludes_replay() {
         let mut restore = PhysicalExecutionRestore::new(3u64, 5u64);
         restore.acknowledge_canonical(3, 5).unwrap();
+        restore.enter_projection(3, 5).unwrap();
         restore.acknowledge_projection(3, 5).unwrap();
         restore.enter_release(3, 5).unwrap();
         assert_eq!(restore.next(3, 5), Ok(RestoreStep::UncertainRelease));
         assert_eq!(restore.enter_release(3, 5), Err(RestoreError::InvalidPhase));
         assert_eq!(restore.acknowledge_finalization(3, 5), Err(RestoreError::InvalidPhase));
+    }
+
+    #[test]
+    fn failed_scope_aborts_only_its_acknowledged_physical_hold() {
+        let mut acquire = PhysicalExecutionAcquire::new(3u64, 5u64);
+        let mut restore = PhysicalExecutionRestore::new(3u64, 5u64);
+        assert_eq!(restore.begin_abort_after_failed_scope(&acquire, 3, 5),
+            Err(RestoreError::InvalidPhase));
+        acquire.enter(3, 5).unwrap();
+        acquire.acknowledge_hold(3, 5).unwrap();
+        assert_eq!(restore.begin_abort_after_failed_scope(&acquire, 3, 5),
+            Err(RestoreError::InvalidPhase));
+        acquire.begin_projection(3, 5).unwrap();
+        acquire.acknowledge_projection(3, 5).unwrap();
+        assert_eq!(restore.begin_abort_after_failed_scope(&acquire, 3, 6),
+            Err(RestoreError::WrongOwner));
+        assert_eq!(restore.next(3, 5), Ok(RestoreStep::Canonical));
+
+        restore.begin_abort_after_failed_scope(&acquire, 3, 5).unwrap();
+        assert_eq!(restore.next(3, 5), Ok(RestoreStep::Projection));
+        assert_eq!(acquire.enter(3, 5), Err(RestoreError::InvalidPhase));
+        assert_eq!(restore.begin_abort_after_failed_scope(&acquire, 3, 5),
+            Err(RestoreError::InvalidPhase));
+        // A projection preflight refusal leaves this exact owner at Projection.
+        assert_eq!(restore.next(3, 5), Ok(RestoreStep::Projection));
+        restore.enter_projection(3, 5).unwrap();
+        restore.acknowledge_projection(3, 5).unwrap();
+        restore.enter_release(3, 5).unwrap();
+        assert_eq!(restore.enter_release(3, 5), Err(RestoreError::InvalidPhase));
+        restore.acknowledge_release(3, 5).unwrap();
+        restore.acknowledge_finalization(3, 5).unwrap();
+        assert_eq!(restore.next(3, 5), Ok(RestoreStep::Done));
+    }
+
+    #[test]
+    fn projection_ack_requires_an_entered_effect() {
+        let mut restore = PhysicalExecutionRestore::new(17u64, 19u64);
+        restore.acknowledge_canonical(17, 19).unwrap();
+        assert_eq!(restore.acknowledge_projection(17, 19),
+            Err(RestoreError::InvalidPhase));
+        assert_eq!(restore.next(17, 19), Ok(RestoreStep::Projection));
+        restore.enter_projection(17, 19).unwrap();
+        assert_eq!(restore.next(17, 19), Ok(RestoreStep::ProjectionEntered));
+        assert_eq!(restore.enter_projection(17, 19), Err(RestoreError::InvalidPhase));
+        assert_eq!(restore.refuse_projection_no_effects(17, 20),
+            Err(RestoreError::WrongOwner));
+        restore.refuse_projection_no_effects(17, 19).unwrap();
+        restore.enter_projection(17, 19).unwrap();
+        restore.acknowledge_projection(17, 19).unwrap();
     }
 }

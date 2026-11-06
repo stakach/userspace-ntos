@@ -3745,10 +3745,18 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
     // invokes DeleteProcedure on a separate PASSIVE worker.
     unsafe { driver_launch::hosted_driver_dynamic_delete::drain(); }
     unsafe { driver_launch::hosted_provider_export_lane::drain(); }
+    unsafe { spawn_hosts::shared_ingress::owner::runtime::nested::drain_abort(); }
+    unsafe { win32k_glue::drain_win32k_startup_restores(); }
     if unsafe { driver_launch::hosted_driver_dynamic_delete::next_deadline() }.is_some() {
         unsafe { rearm_registered_active_delay_timer_with_handler(nt_handler) };
     }
     if unsafe { driver_launch::hosted_provider_export_lane::next_deadline() }.is_some() {
+        unsafe { rearm_registered_active_delay_timer_with_handler(nt_handler) };
+    }
+    if spawn_hosts::shared_ingress::owner::runtime::nested::next_abort_deadline().is_some() {
+        unsafe { rearm_registered_active_delay_timer_with_handler(nt_handler) };
+    }
+    if unsafe { win32k_glue::win32k_startup_restore_next_deadline() }.is_some() {
         unsafe { rearm_registered_active_delay_timer_with_handler(nt_handler) };
     }
     // A completed physical fold can be waiting only for its exact CM ACK. It still owns the

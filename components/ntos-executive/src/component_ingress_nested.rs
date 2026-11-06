@@ -4,7 +4,13 @@ use super::*;
 use super::physical_hold::PhysicalExecutionHold;
 use nt_component_suspension::{NestedExecutionIdentity, NestedExecutionScope};
 use nt_user_host::physical_execution_restore::RestoreStep;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use nt_time::CoalescedRetryWake;
+use nt_component_suspension::{next_ready_pending_lane, PendingLaneReadiness};
+
+const ABORT_RETRY_100NS: u64 = 1_600_000;
+static ABORT_WAKE: CoalescedRetryWake = CoalescedRetryWake::new();
+static LAST_ABORT: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// The slot is storage, not authority. A recycled slot cannot restore a different parent scope.
 #[must_use = "retain the exact parked parent until restoration acknowledges"]
@@ -94,6 +100,10 @@ enum ParentPhase {
     RestorePending,
     /// A serialized owner is inside the staged restore. A scanner must not enter it twice.
     RestoreAttempt,
+    /// Scope admission refused after the physical hold acknowledged. The canonical lane is
+    /// still Running; only the retained physical projection and hold need release.
+    AbortPending,
+    AbortAttempt,
     /// Native entry or identity is uncertain. Retain all resources, never replay an effect.
     Quarantined,
 }
@@ -101,6 +111,13 @@ enum ParentPhase {
 // Records are never removed before both canonical restoration and physical release acknowledge.
 static mut PARENTS: Vec<Option<Parent>> = Vec::new();
 static NEXT_PARENT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Observe whether an exact physical executor is still fenced by any retained parent row.
+/// A failed child startup may retire its own route only after this parent hold is gone.
+pub(crate) unsafe fn has_retained_parent_for_executor(executor: u64) -> bool {
+    (&*core::ptr::addr_of!(PARENTS)).iter().flatten()
+        .any(|parent| parent.route.identity().executor == executor)
+}
 
 fn row_matches(handle: &ParkedParentHandle, parent: &Parent) -> bool {
     ticket_matches(handle.ticket(), parent)
@@ -184,7 +201,15 @@ pub(crate) unsafe fn park_current() -> Result<Option<ParkedParentHandle>, Error>
     let scope = match scope {
         Ok(scope) => scope,
         Err(_) => {
-            rows[index].as_mut().expect("retained parent").phase = ParentPhase::Quarantined;
+            let parent = rows[index].as_mut().expect("retained parent");
+            if parent.physical.begin_abort_after_failed_scope().is_ok() {
+                parent.phase = ParentPhase::AbortPending;
+                if attempt_abort(parent) {
+                    rows[index] = None;
+                }
+            } else {
+                parent.phase = ParentPhase::Quarantined;
+            }
             return Err(Error::Admission);
         }
     };
@@ -193,6 +218,76 @@ pub(crate) unsafe fn park_current() -> Result<Option<ParkedParentHandle>, Error>
     parent.scope = Some(scope);
     parent.phase = ParentPhase::Parked;
     Ok(Some(ParkedParentHandle { index, generation, identity }))
+}
+
+/// The exact parent row fences its executor until the physical release acknowledges. A failed
+/// pure stage is retried from this same row; an uncertain release is never entered twice.
+unsafe fn attempt_abort(parent: &mut Parent) -> bool {
+    if parent.phase != ParentPhase::AbortPending { return false; }
+    parent.phase = ParentPhase::AbortAttempt;
+    let result = parent.physical.abort_after_failed_scope();
+    if result.is_ok() {
+        return true;
+    }
+    parent.phase = if matches!(parent.physical.restore_step(),
+        Ok(RestoreStep::Projection | RestoreStep::Release | RestoreStep::Finalize)) {
+        ParentPhase::AbortPending
+    } else {
+        ParentPhase::Quarantined
+    };
+    if parent.phase == ParentPhase::AbortPending {
+        ABORT_WAKE.publish(
+            crate::monotonic_time_100ns().saturating_add(ABORT_RETRY_100NS),
+        );
+    }
+    false
+}
+
+unsafe fn drive_abort(index: usize, generation: u64) -> bool {
+    let rows = &mut *core::ptr::addr_of_mut!(PARENTS);
+    let Some(parent) = rows.get_mut(index).and_then(Option::as_mut) else { return false; };
+    if parent.generation != generation { return false; }
+    if attempt_abort(parent) {
+        rows[index] = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn has_pending_abort() -> bool {
+    unsafe { (&*core::ptr::addr_of!(PARENTS)).iter()
+        .any(|row| row.as_ref().is_some_and(|parent| parent.phase == ParentPhase::AbortPending)) }
+}
+
+pub(crate) fn next_abort_deadline() -> Option<u64> {
+    ABORT_WAKE.next_deadline(has_pending_abort())
+}
+
+pub(crate) fn wake_abort_due(now_100ns: u64) -> u64 {
+    u64::from(ABORT_WAKE.wake_due(now_100ns, has_pending_abort()))
+}
+
+/// Outer service redrive only; never call this inside a nested pump or an ACK path.
+pub(crate) unsafe fn drain_abort() -> usize {
+    let now = crate::monotonic_time_100ns();
+    let Some(attempt) = ABORT_WAKE.begin_redrive(now, has_pending_abort()) else { return 0; };
+    let _ = attempt.retry_at(now.saturating_add(ABORT_RETRY_100NS));
+    let selected = {
+        let rows = &*core::ptr::addr_of!(PARENTS);
+        let last = LAST_ABORT.load(Ordering::Relaxed);
+        let after = (last != usize::MAX).then_some(last);
+        next_ready_pending_lane(rows.len(), after, |index| {
+            if rows[index].as_ref().is_some_and(|row| row.phase == ParentPhase::AbortPending) {
+                PendingLaneReadiness::Ready
+            } else {
+                PendingLaneReadiness::Absent
+            }
+        }).map(|index| (index, rows[index].as_ref().expect("selected abort parent").generation))
+    };
+    let Some((index, generation)) = selected else { return 0; };
+    LAST_ABORT.store(index, Ordering::Relaxed);
+    usize::from(drive_abort(index, generation))
 }
 
 pub(crate) unsafe fn bind_receive_child(

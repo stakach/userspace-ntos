@@ -3116,6 +3116,8 @@ const DELAY_TIMER_SOURCE_PROVIDER_SECTION: u64 = 27;
 const DELAY_TIMER_SOURCE_GDI_ROUTED_IMAGE: u64 = 28;
 const DELAY_TIMER_SOURCE_HOSTED_DYNAMIC_DELETE: u64 = 29;
 const DELAY_TIMER_SOURCE_HOSTED_PROVIDER_STARTUP_RESTORE: u64 = 30;
+const DELAY_TIMER_SOURCE_NESTED_ACQUIRE_ABORT: u64 = 31;
+const DELAY_TIMER_SOURCE_WIN32K_STARTUP_RESTORE: u64 = 32;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -6716,7 +6718,7 @@ pub(crate) static DRAIN_DUE_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SCHED_RUNTIME_READ_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to independently timed wake paths;
 /// one of them owns the whole boot, so they are timed individually.
-pub(crate) const SUBDRAIN_N: usize = 28;
+pub(crate) const SUBDRAIN_N: usize = 30;
 pub(crate) static SUBDRAIN_TICKS: [AtomicU64; SUBDRAIN_N] =
     [const { AtomicU64::new(0) }; SUBDRAIN_N];
 pub(crate) static SUBDRAIN_WOKEN: [AtomicU64; SUBDRAIN_N] =
@@ -16699,7 +16701,12 @@ unsafe fn initialize_hpet_monotonic_epoch(period_fs: u64) {
     print_str(b"\n");
 }
 
+static MONOTONIC_CALLS: nt_time::ClockCallsiteSampler<256> =
+    nt_time::ClockCallsiteSampler::new();
+
+#[track_caller]
 fn monotonic_time_100ns() -> u64 {
+    MONOTONIC_CALLS.observe();
     let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
     if period != 0 && HPET_MONOTONIC_READY.load(Ordering::Acquire) {
         let offset = HPET_MONOTONIC_OFFSET_100NS.load(Ordering::Relaxed);
@@ -16712,6 +16719,7 @@ fn monotonic_time_100ns() -> u64 {
 }
 
 /// Optional diagnostic time: unavailable telemetry never uses the uncalibrated TSC fallback.
+#[track_caller]
 pub(crate) fn diagnostic_time_100ns() -> Option<u64> {
     if HPET_PERIOD_FS.load(Ordering::Relaxed) != 0
         && HPET_MONOTONIC_READY.load(Ordering::Acquire)
@@ -16733,6 +16741,7 @@ fn nt_time_snapshot_at(monotonic_100ns: u64) -> nt_delay_execution::TimeSnapshot
     unsafe { (&*core::ptr::addr_of!(NT_SYSTEM_CLOCK)).snapshot(monotonic_100ns) }
 }
 
+#[track_caller]
 fn nt_time_snapshot() -> nt_delay_execution::TimeSnapshot {
     nt_time_snapshot_at(monotonic_time_100ns())
 }
@@ -17538,6 +17547,8 @@ unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
     subdrain!(25, driver_launch::mounted_native_block_wake_due(now_100ns))
         + subdrain!(26, driver_launch::hosted_driver_dynamic_delete::wake_due(now_100ns))
         + subdrain!(27, driver_launch::hosted_provider_export_lane::wake_due(now_100ns))
+        + subdrain!(28, spawn_hosts::shared_ingress::owner::runtime::nested::wake_abort_due(now_100ns))
+        + subdrain!(29, unsafe { win32k_glue::win32k_startup_restore_wake_due(now_100ns) })
         + subdrain!(14, cm_key_ownership::wake_due(now_100ns))
         + subdrain!(15, cm_snapshot_ownership::wake_due(now_100ns))
         + subdrain!(16, driver_launch::hosted_file_retry_wake_due(now_100ns))

@@ -240,6 +240,12 @@ pub(crate) struct KernelJobCompletion {
     recipient: KernelJobRecipient,
 }
 
+pub(super) enum KernelJobInitialization {
+    Complete(bool),
+    Pending(KernelJobCompletion, win32k_glue::Win32kBootstrapPending),
+    Failed(KernelJobCompletion),
+}
+
 impl KernelJobCompletion {
     pub(super) fn new(status: u32, recipient: KernelJobRecipient) -> Self {
         Self {
@@ -249,8 +255,8 @@ impl KernelJobCompletion {
     }
 
     /// Readiness is the initiating bootstrap consumer's work, not a generic Reply effect.
-    pub(crate) unsafe fn initialize(self) -> bool {
-        let mut recipient = self.recipient;
+    pub(crate) unsafe fn initialize(mut self) -> KernelJobInitialization {
+        let recipient = &mut self.recipient;
         let executive_result = match &recipient.destination {
             KernelJobDestination::Executive(result) => Some(result.clone()),
             KernelJobDestination::DriverEntry => None,
@@ -268,17 +274,45 @@ impl KernelJobCompletion {
             // This destination receives the retained result only after the activation ACK
             // transferred the recipient and released its canonical requestor references.
             result.store((1u64 << 32) | u64::from(self.status as u32), Ordering::Release);
-            return true;
+            return KernelJobInitialization::Complete(true);
         }
         if self.status < 0 {
-            return false;
+            return KernelJobInitialization::Complete(false);
         }
         let channel = recipient.channel;
         WIN32K_FAULT_EP.store(channel.fault_ep, Ordering::Relaxed);
         WIN32K_HOST_PML4.store(channel.pml4, Ordering::Relaxed);
-        if !win32k_glue::initialize_win32k_physical_lane(channel.pml4) {
-            panic!("win32k secondary execution lane failed its ready handshake");
+        match win32k_glue::initialize_win32k_bootstrap_lane(channel.pml4) {
+            win32k_glue::Win32kBootstrapStartup::Ready => {}
+            win32k_glue::Win32kBootstrapStartup::Pending(ticket) => {
+                return KernelJobInitialization::Pending(self, ticket);
+            }
+            win32k_glue::Win32kBootstrapStartup::Failed => {
+                return KernelJobInitialization::Failed(self);
+            }
         }
+        report_win32k_bootstrap_display();
+        KernelJobInitialization::Complete(true)
+    }
+
+    pub(crate) unsafe fn resume(
+        self,
+        pending: win32k_glue::Win32kBootstrapPending,
+    ) -> KernelJobInitialization {
+        match win32k_glue::resume_win32k_bootstrap_lane(pending) {
+            win32k_glue::Win32kBootstrapStartup::Ready => {
+                report_win32k_bootstrap_display();
+                KernelJobInitialization::Complete(true)
+            }
+            win32k_glue::Win32kBootstrapStartup::Pending(ticket) => {
+                KernelJobInitialization::Pending(self, ticket)
+            }
+            win32k_glue::Win32kBootstrapStartup::Failed => KernelJobInitialization::Failed(self),
+        }
+    }
+}
+
+unsafe fn report_win32k_bootstrap_display() {
         // HARDWARE\\DEVICEMAP\\VIDEO is still published by the real started videoprt miniport.
         if let Some(display_spec) = system_hive_display_driver_spec() {
             let view = display_spec.win32k_spec();
@@ -300,6 +334,4 @@ impl KernelJobCompletion {
         } else {
             print_str(b"[win32k-svc] no loadable display Device0 in SYSTEM hive and ReactOS FS\n");
         }
-        true
-    }
 }

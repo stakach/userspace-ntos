@@ -179,6 +179,21 @@ pub(crate) fn print_hold_snapshot(now: u64) {
     } else {
         record.bytes()
     });
+    let calls = crate::MONOTONIC_CALLS.snapshot::<8>();
+    let mut callers = nt_printf::record::RecordBuffer::<2048>::new();
+    let _ = write!(callers, "[clock-callers] calls={} sampled={} overflow={}",
+        calls.calls, calls.sampled, calls.overflow);
+    for sample in calls.top.into_iter().flatten() {
+        let location = sample.location;
+        let _ = write!(callers, " {}:{}:{}={}", location.file(), location.line(),
+            location.column(), sample.samples);
+    }
+    let _ = writeln!(callers);
+    sel4_rt::print_record(if callers.overflowed() {
+        b"[clock-callers] record-truncated\n"
+    } else {
+        callers.bytes()
+    });
     unsafe {
         if let Some(oldest) = snapshot.oldest {
             crate::win32k_glue::trace_hosted_tcb_debug_state(

@@ -77,6 +77,18 @@ pub struct BootstrapCoordinator<T> {
     completion_taken: bool,
 }
 
+/// An already acknowledged result can be observed by a different bootstrap pass first.
+/// The receipt remains owned by this slot until its exact initiating target asks for it.
+pub fn take_matching_bootstrap_completion<T: Eq, R>(
+    slot: &mut Option<(T, R, bool)>,
+    target: &T,
+) -> Option<(R, bool)> {
+    if slot.as_ref().is_none_or(|(owner, _, _)| owner != target) {
+        return None;
+    }
+    slot.take().map(|(_, receipt, initialized)| (receipt, initialized))
+}
+
 impl<T: Copy + Eq> BootstrapCoordinator<T> {
     pub fn new(target: T) -> Result<Self, BootstrapReceiveError> {
         let owner = NEXT_OWNER

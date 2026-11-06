@@ -50,6 +50,35 @@ impl PhysicalExecutionHold {
         self.restore_step().is_ok_and(|step| step == RestoreStep::Canonical)
     }
 
+    /// Scope admission failed after the physical hold acknowledged. The semantic lane is still
+    /// Running, so there is no canonical nested scope to resume. Enter the checked abort path
+    /// before any projection or microkernel release is attempted.
+    pub(crate) fn begin_abort_after_failed_scope(&mut self) -> Result<(), Error> {
+        if self.hold.is_none() || self.projection_reservation.is_some() {
+            return Err(Error::Admission);
+        }
+        self.restore.begin_abort_after_failed_scope(
+            &self.acquire, self.route, self.dispatch,
+        ).map_err(|_| Error::Admission)
+    }
+
+    /// Retry only unentered cleanup stages. An uncertain seL4 release remains fenced.
+    pub(crate) unsafe fn abort_after_failed_scope(&mut self) -> Result<(), Error> {
+        match self.restore_step()? {
+            RestoreStep::Projection => self.restore_projection()?,
+            RestoreStep::Release | RestoreStep::Finalize | RestoreStep::Done => {},
+            _ => return Err(Error::Admission),
+        }
+        if self.restore_step()? == RestoreStep::Release {
+            self.release()?;
+        }
+        if self.restore_step()? == RestoreStep::Finalize {
+            self.projection_restored()?;
+        }
+        (self.restore_step()? == RestoreStep::Done)
+            .then_some(()).ok_or(Error::Admission)
+    }
+
     pub(crate) fn canonical_restored(&mut self) -> Result<(), Error> {
         self.restore.acknowledge_canonical(self.route, self.dispatch)
             .map_err(|_| Error::Admission)
@@ -126,8 +155,18 @@ impl PhysicalExecutionHold {
         if !self.held() || self.restore_step()? != RestoreStep::Projection {
             return Err(Error::Admission);
         }
-        crate::driver_launch::driver_thread_projection::restore(self.route, self.dispatch)
+        self.restore.enter_projection(self.route, self.dispatch)
             .map_err(|_| Error::Admission)?;
+        // This adapter returns Err only from owner preflight, before mutating its projection
+        // or writing KPCR bytes. An acknowledged call advances below; any later failure keeps
+        // ProjectionEntered fenced and forbids replay of the physical write.
+        if crate::driver_launch::driver_thread_projection::restore(self.route, self.dispatch)
+            .is_err()
+        {
+            self.restore.refuse_projection_no_effects(self.route, self.dispatch)
+                .map_err(|_| Error::Admission)?;
+            return Err(Error::Admission);
+        }
         self.restore.acknowledge_projection(self.route, self.dispatch)
             .map_err(|_| Error::Admission)
     }

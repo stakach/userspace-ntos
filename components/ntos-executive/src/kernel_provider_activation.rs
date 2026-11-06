@@ -18,7 +18,20 @@ mod terminal;
 #[path = "kernel_provider_wait_work.rs"]
 mod wait_work;
 pub(super) use wait_work::{publish_bootstrap_waits, publish_runtime_waits};
-use bootstrap::{KernelJobCompletion, KernelJobRecipient};
+use bootstrap::{KernelJobCompletion, KernelJobInitialization, KernelJobRecipient};
+
+struct PendingWin32kBootstrap {
+    receipt: KernelProviderCompletionReceipt,
+    completion: KernelJobCompletion,
+    parent: win32k_glue::Win32kBootstrapPending,
+}
+
+// The activation has already acknowledged when the worker's parent restore is pending.
+// Keep the exact recipient and result here until the original bootstrap consumer observes it.
+static mut PENDING_WIN32K_BOOTSTRAP: Option<PendingWin32kBootstrap> = None;
+static mut SETTLED_WIN32K_BOOTSTRAP:
+    Option<(KernelProviderCaller, KernelProviderCompletionReceipt, bool)> = None;
+static mut FAILED_WIN32K_BOOTSTRAPS: alloc::vec::Vec<KernelJobCompletion> = alloc::vec::Vec::new();
 
 static mut ACTIVATIONS: KernelProviderActivations<KernelJobRecipient> =
     KernelProviderActivations::new();
@@ -845,8 +858,15 @@ struct CompletionDeliveryPass {
 
 impl CompletionDeliveryPass {
     unsafe fn enter() -> Result<Self, u32> {
-        if component_execution_is_busy()
-            || DELIVERY_ACTIVE
+        if component_execution_is_busy() {
+            return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32);
+        }
+        Self::enter_observation()
+    }
+
+    /// Settling an already acknowledged result never enters a provider or resumes its lane.
+    unsafe fn enter_observation() -> Result<Self, u32> {
+        if DELIVERY_ACTIVE
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
         {
@@ -861,10 +881,21 @@ impl CompletionDeliveryPass {
         if component_execution_is_busy() {
             return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32);
         }
+        let driver_entry = (&*core::ptr::addr_of!(ACTIVATIONS))
+            .recipient(receipt.caller())?.is_driver_entry();
+        if driver_entry && ((&*core::ptr::addr_of!(PENDING_WIN32K_BOOTSTRAP)).is_some()
+            || (&*core::ptr::addr_of!(SETTLED_WIN32K_BOOTSTRAP)).is_some()) {
+            return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32);
+        }
+        // A failed acknowledged startup must still have a durable recipient slot.
+        if driver_entry {
+            (&mut *core::ptr::addr_of_mut!(FAILED_WIN32K_BOOTSTRAPS))
+                .try_reserve(1).map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
+        }
         // Cleanup of a failed DriverEntry needs no new execution. Successful delayed readiness
         // still requires the original live provider and idle physical lane before releasing refs.
         if (receipt.status() as i32) >= 0
-            && (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(receipt.caller())?.is_driver_entry()
+            && driver_entry
             && !(&*core::ptr::addr_of!(ACTIVATIONS))
                 .recipient(receipt.caller())?
                 .can_initialize(receipt.caller())
@@ -873,7 +904,19 @@ impl CompletionDeliveryPass {
         }
         let completion = accept_driver_entry_completion(receipt)?;
         // Neither an activation nor a Ps-manager borrow crosses readiness's nested IPC.
-        Ok(completion.initialize())
+        match completion.initialize() {
+            KernelJobInitialization::Complete(initialized) => Ok(initialized),
+            KernelJobInitialization::Pending(completion, parent) => {
+                *core::ptr::addr_of_mut!(PENDING_WIN32K_BOOTSTRAP) = Some(
+                    PendingWin32kBootstrap { receipt, completion, parent },
+                );
+                Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32)
+            }
+            KernelJobInitialization::Failed(completion) => {
+                (&mut *core::ptr::addr_of_mut!(FAILED_WIN32K_BOOTSTRAPS)).push(completion);
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -902,6 +945,11 @@ pub(crate) unsafe fn deliver_driver_entry_completion(
         Ok(pass) => {
             let result = pass.deliver(receipt);
             if let Err(status) = result {
+                if (&*core::ptr::addr_of!(PENDING_WIN32K_BOOTSTRAP)).as_ref()
+                    .is_some_and(|pending| pending.receipt == receipt)
+                {
+                    return result;
+                }
                 report_deferred(receipt, status);
             }
             result
@@ -913,18 +961,91 @@ pub(crate) unsafe fn deliver_driver_entry_completion(
 /// Observe canonical retry demand without acquiring a delivery attempt or releasing references.
 pub(super) unsafe fn has_ready_completions() -> bool {
     (&*core::ptr::addr_of!(ACTIVATIONS)).has_ready_completion() || terminal::has_ready()
+        || pending_win32k_bootstrap_is_settled()
+        || (&*core::ptr::addr_of!(SETTLED_WIN32K_BOOTSTRAP)).is_some()
+}
+
+unsafe fn pending_win32k_bootstrap_is_settled() -> bool {
+    (&*core::ptr::addr_of!(PENDING_WIN32K_BOOTSTRAP)).as_ref().is_some_and(|pending| {
+        !matches!(win32k_glue::resume_win32k_bootstrap_lane(pending.parent),
+            win32k_glue::Win32kBootstrapStartup::Pending(_))
+    })
+}
+
+unsafe fn redrive_pending_win32k_bootstrap(
+    acknowledged: &mut impl FnMut(KernelProviderCompletionReceipt, bool),
+) -> bool {
+    if !pending_win32k_bootstrap_is_settled() { return false; }
+    let Some(pending) = (&mut *core::ptr::addr_of_mut!(PENDING_WIN32K_BOOTSTRAP)).take()
+    else { return false; };
+    match pending.completion.resume(pending.parent) {
+        KernelJobInitialization::Complete(initialized) => {
+            acknowledged(pending.receipt, initialized);
+            true
+        }
+        KernelJobInitialization::Pending(completion, parent) => {
+            *core::ptr::addr_of_mut!(PENDING_WIN32K_BOOTSTRAP) = Some(
+                PendingWin32kBootstrap { receipt: pending.receipt, completion, parent },
+            );
+            false
+        }
+        KernelJobInitialization::Failed(completion) => {
+            (&mut *core::ptr::addr_of_mut!(FAILED_WIN32K_BOOTSTRAPS)).push(completion);
+            acknowledged(pending.receipt, false);
+            true
+        }
+    }
+}
+
+/// An acknowledged DriverEntry result can become ready while its canonical parent is Running.
+/// That busy lane blocks new provider execution, but cannot block delivery to its exact waiting
+/// bootstrap consumer. Only already retained completion ownership is touched here.
+pub(super) unsafe fn take_retained_bootstrap_result(
+    target: KernelProviderCaller,
+) -> Option<bool> {
+    let _pass = CompletionDeliveryPass::enter_observation().ok()?;
+    let _durable = allocator::enter_durable();
+    if let Some((_, initialized)) =
+        nt_user_host::bootstrap_receive::take_matching_bootstrap_completion(
+            &mut *core::ptr::addr_of_mut!(SETTLED_WIN32K_BOOTSTRAP), &target)
+    {
+        return Some(initialized);
+    }
+    if (&*core::ptr::addr_of!(SETTLED_WIN32K_BOOTSTRAP)).is_some() {
+        return None;
+    }
+    let mut result = None;
+    redrive_pending_win32k_bootstrap(&mut |receipt, initialized| {
+        if receipt.caller() == target {
+            result = Some(initialized);
+        } else {
+            unsafe {
+                *core::ptr::addr_of_mut!(SETTLED_WIN32K_BOOTSTRAP) =
+                    Some((receipt.caller(), receipt, initialized));
+            }
+        }
+    });
+    result
 }
 
 /// Deliver retained kernel terminals and genuine Ready receipts, once per bounded pass.
 /// Return acknowledged ownership progress, not DriverEntry success. Never invoke from a nested
 /// pump timer hook or with handler/PM borrows alive: initialization belongs to the outer scheduler.
 pub(super) unsafe fn redrive_ready_completions() -> bool {
-    redrive_ready_completions_observed(|_, _| {})
+    redrive_ready_completions_inner(None, |_, _| {})
 }
 
 /// Report only acknowledged deliveries, after initialization effects have returned. The observer
 /// receives copied identity/result data, never a borrowed recipient or permission to replay it.
 pub(super) unsafe fn redrive_ready_completions_observed(
+    target: KernelProviderCaller,
+    acknowledged: impl FnMut(KernelProviderCompletionReceipt, bool),
+) -> bool {
+    redrive_ready_completions_inner(Some(target), acknowledged)
+}
+
+unsafe fn redrive_ready_completions_inner(
+    observed_target: Option<KernelProviderCaller>,
     mut acknowledged: impl FnMut(KernelProviderCompletionReceipt, bool),
 ) -> bool {
     if !has_ready_completions() {
@@ -935,6 +1056,30 @@ pub(super) unsafe fn redrive_ready_completions_observed(
     };
     let _durable = allocator::enter_durable();
     let mut progressed = terminal::drain();
+    if let Some(target) = observed_target {
+        if let Some((receipt, initialized)) =
+            nt_user_host::bootstrap_receive::take_matching_bootstrap_completion(
+                &mut *core::ptr::addr_of_mut!(SETTLED_WIN32K_BOOTSTRAP), &target)
+        {
+            acknowledged(receipt, initialized);
+            progressed = true;
+        }
+        progressed |= redrive_pending_win32k_bootstrap(&mut |receipt, initialized| {
+            if receipt.caller() == target {
+                acknowledged(receipt, initialized);
+            } else {
+                *core::ptr::addr_of_mut!(SETTLED_WIN32K_BOOTSTRAP) =
+                    Some((receipt.caller(), receipt, initialized));
+            }
+        });
+    } else if (&*core::ptr::addr_of!(SETTLED_WIN32K_BOOTSTRAP)).is_none() {
+        progressed |= redrive_pending_win32k_bootstrap(&mut |receipt, initialized| {
+            unsafe {
+                *core::ptr::addr_of_mut!(SETTLED_WIN32K_BOOTSTRAP) =
+                    Some((receipt.caller(), receipt, initialized));
+            }
+        });
+    }
     // Terminal retirement can publish an older activation than the initial readiness probe.
     let mut cursor = (&*core::ptr::addr_of!(ACTIVATIONS)).completion_cursor();
     let Some(mut receipt) = (&*core::ptr::addr_of!(ACTIVATIONS)).next_ready_completion(&mut cursor)
@@ -942,12 +1087,30 @@ pub(super) unsafe fn redrive_ready_completions_observed(
         return progressed;
     };
     loop {
+        let driver_entry = (&*core::ptr::addr_of!(ACTIVATIONS))
+            .recipient(receipt.caller()).is_ok_and(KernelJobRecipient::is_driver_entry);
         match pass.deliver(receipt) {
-            Err(status) => report_deferred(receipt, status),
+            Err(status) => {
+                if (&*core::ptr::addr_of!(PENDING_WIN32K_BOOTSTRAP)).as_ref()
+                    .is_none_or(|pending| pending.receipt != receipt)
+                    && !(driver_entry
+                        && (&*core::ptr::addr_of!(SETTLED_WIN32K_BOOTSTRAP)).is_some())
+                {
+                    report_deferred(receipt, status);
+                }
+            }
             Ok(initialized) => {
                 // Ok(false) still acknowledged the result and released the canonical Ps pair.
                 progressed = true;
-                acknowledged(receipt, initialized);
+                if observed_target == Some(receipt.caller()) || !driver_entry {
+                    acknowledged(receipt, initialized);
+                } else if driver_entry {
+                    // A runtime pass may acknowledge DriverEntry before its bootstrap
+                    // consumer observes it. Keep that exact receipt and result for the
+                    // observed pass; Executive results already own their Arc publication.
+                    *core::ptr::addr_of_mut!(SETTLED_WIN32K_BOOTSTRAP) =
+                        Some((receipt.caller(), receipt, initialized));
+                }
             }
         }
         let Some(next) = (&*core::ptr::addr_of!(ACTIVATIONS)).next_ready_completion(&mut cursor)

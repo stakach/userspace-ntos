@@ -43,7 +43,7 @@ unsafe fn observe_kernel_demand(pm: &nt_process::ProcessManager) -> ResumeDemand
 }
 
 unsafe fn drain_completions(target: KernelProviderCaller, acknowledged: &mut Option<bool>) -> bool {
-    kernel_provider_activation::redrive_ready_completions_observed(|receipt, initialized| {
+    kernel_provider_activation::redrive_ready_completions_observed(target, |receipt, initialized| {
         if receipt.caller() == target {
             assert!(acknowledged.replace(initialized).is_none());
         }
@@ -80,6 +80,18 @@ pub(crate) unsafe fn run_bootstrap_outer(
     if is_running() {
         return Ok(BootstrapPassOutcome::PassActive);
     }
+    // Before the runtime handler exists, this bootstrap owner is the only outer boundary
+    // that can settle a retained nested parent. Drain it before deciding whether a
+    // DriverEntry completion is schedulable; timer/IRQ delivery only publishes readiness.
+    {
+        let _message = crate::ipc_message::SavedMessageBuffer::capture();
+        let _durable = allocator::enter_durable();
+        spawn_hosts::shared_ingress::owner::runtime::nested::drain_abort();
+        win32k_glue::drain_win32k_startup_restores();
+    if let Some(initialized) = kernel_provider_activation::take_retained_bootstrap_result(target) {
+        return Ok(BootstrapPassOutcome::TargetAcknowledged { initialized });
+    }
+    }
     let published = kernel_provider_activation::publish_bootstrap_waits()?;
     let can_schedule = ps_bootstrap::with_process_manager(|pm| {
         let demand = observe_kernel_demand(pm);
@@ -87,6 +99,12 @@ pub(crate) unsafe fn run_bootstrap_outer(
         Ok(demand.can_schedule())
     })?;
     if !can_schedule {
+        if let Some(deadline) = [
+            spawn_hosts::shared_ingress::owner::runtime::nested::next_abort_deadline(),
+            win32k_glue::win32k_startup_restore_next_deadline(),
+        ].into_iter().flatten().min() {
+            return Ok(BootstrapPassOutcome::Deferred { deadline });
+        }
         return Ok(BootstrapPassOutcome::PhysicalExecutionBlocked);
     }
     let _message = crate::ipc_message::SavedMessageBuffer::capture();

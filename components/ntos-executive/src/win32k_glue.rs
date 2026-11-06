@@ -5,6 +5,8 @@
 #![allow(clippy::all)]
 use crate::*;
 use alloc::vec::Vec;
+use nt_component_suspension::{NestedRestoreChain, NestedRestoreResultKey};
+use nt_time::CoalescedRetryWake;
 
 #[path = "win32k_pending_dispatch.rs"]
 mod pending_dispatch;
@@ -109,9 +111,39 @@ struct Win32kPhysicalLane {
     ipc_buffer_va: u64,
     kpcr_frame: Option<u64>,
     stack_publication: Option<nt_provider_wait::ProviderStackReadyReceipt>,
+    startup_restore: Option<Win32kStartupRestore>,
+    startup_retirement: Option<nt_component_suspension::peer_registry::PeerRoute>,
+    startup_retirement_attempting: bool,
+    startup_retirement_wait_parent: Option<u64>,
     stack_alias: Win32kStackAlias,
     // Allocation receipt only; canonical state owns live transport and mechanism retirement.
     worker: Option<crate::spawn_hosts::SpawnedComponentWorker>,
+}
+
+enum Win32kStartupRestorePayload {
+    Chain { key: NestedRestoreResultKey, chain: NestedRestoreChain<bool> },
+    Quarantined(bool),
+}
+
+struct Win32kStartupRestore {
+    ticket: crate::spawn_hosts::shared_ingress::owner::runtime::nested::NestedRestoreTicket,
+    payload: Win32kStartupRestorePayload,
+    retryable: bool,
+    attempting: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Win32kBootstrapPending {
+    index: usize,
+    tcb: u64,
+    route: nt_component_suspension::peer_registry::PeerRoute,
+    ticket: crate::spawn_hosts::shared_ingress::owner::runtime::nested::NestedRestoreTicket,
+}
+
+pub(crate) enum Win32kBootstrapStartup {
+    Ready,
+    Pending(Win32kBootstrapPending),
+    Failed,
 }
 
 const WIN32K_STACK_ALIAS_BASE: u64 = 0x0000_0100_4820_0000;
@@ -137,6 +169,8 @@ enum Win32kStackAlias {
 static mut WIN32K_PHYSICAL_LANES: Option<Vec<Win32kPhysicalLane>> = None;
 static mut WIN32K_PENDING_PRIMARY: Option<crate::spawn_hosts::SpawnedComponent> = None;
 static WIN32K_LANE_STARTUP_ACTIVE: AtomicU64 = AtomicU64::new(0);
+const WIN32K_STARTUP_RESTORE_RETRY_100NS: u64 = 1_600_000;
+static WIN32K_STARTUP_RESTORE_WAKE: CoalescedRetryWake = CoalescedRetryWake::new();
 /// The first failures contain the useful frontier; cap serial output across repeat syscalls.
 static WIN32K_LANE_FAILURE_DUMPS: AtomicU64 = AtomicU64::new(0);
 const WIN32K_LANE_FAILURE_DUMP_LIMIT: u64 = 3;
@@ -206,6 +240,10 @@ pub(crate) unsafe fn register_primary_win32k_physical_lane(
         kpcr_frame: None,
         worker: None,
         stack_publication: None,
+        startup_restore: None,
+        startup_retirement: None,
+        startup_retirement_attempting: false,
+        startup_retirement_wait_parent: None,
         stack_alias: Win32kStackAlias::Unmapped,
     });
     runtime::prepare(source.tcb).ok()?;
@@ -309,6 +347,7 @@ pub(crate) unsafe fn win32k_stack_alias_for_route(
         lane.route == Some(route)
             && lane.handle == Some(route.identity().lane)
             && lane.tcb == route.identity().executor
+            && lane.startup_restore.is_none()
     })?;
     if lane.stack_frames != win32k_subsystem::WIN32K_LANE_STACK_FRAMES
         || (lane.primary.is_none() && lane.stack_publication.is_none())
@@ -432,7 +471,7 @@ unsafe fn win32k_lane_channel(
 /// Startup retains the ready Call on shared ingress. The initial Free Reply stays canonical until
 /// ordinary dispatch admission atomically adopts that Call and recycles the displaced Reply.
 pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
-    if WIN32K_RETIRED.load(Ordering::Acquire) != 0 {
+    if WIN32K_RETIRED.load(Ordering::Acquire) != 0 || win32k_startup_restore_is_retained() {
         return false;
     }
     if WIN32K_LANE_STARTUP_ACTIVE
@@ -518,7 +557,6 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
         },
     };
     let tcb = worker.tcb;
-    let endpoint = worker.endpoint;
     let reply_cap = worker.reply_cap;
     // Retain the new page in the physical row before any paging or map effect can fail.
     let kpcr_frame = alloc_frame();
@@ -538,6 +576,10 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
             kpcr_frame: Some(kpcr_frame),
             worker: Some(worker),
             stack_publication: None,
+            startup_restore: None,
+            startup_retirement: None,
+            startup_retirement_attempting: false,
+            startup_retirement_wait_parent: None,
             stack_alias: Win32kStackAlias::Unmapped,
         });
         index
@@ -575,7 +617,24 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
         physical.handle = Some(route.identity().lane);
         physical.route = Some(route);
     }
-    let mut parent = runtime::nested::park_current().expect("retain parent before Win32k worker startup");
+    let parent_executor = {
+        let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
+        lanes.running().and_then(|lane| lanes.binding(lane).ok())
+            .map(|binding| binding.executor_id)
+    };
+    let mut parent = match runtime::nested::park_current() {
+        Ok(parent) => parent,
+        Err(_) => {
+            retain_failed_shared_win32k_lane(tcb, Some(route), b"parent-hold");
+            let lane = &mut win32k_physical_lanes_mut()[physical_index];
+            lane.startup_retirement = Some(route);
+            lane.startup_retirement_wait_parent = parent_executor;
+            WIN32K_STARTUP_RESTORE_WAKE.publish(
+                crate::monotonic_time_100ns().saturating_add(WIN32K_STARTUP_RESTORE_RETRY_100NS),
+            );
+            return false;
+        }
+    };
     let started = {
         let worker = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
             .as_ref().unwrap()[physical_index].worker.as_ref().unwrap();
@@ -583,9 +642,8 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     };
     if started.is_err() {
         retain_failed_shared_win32k_lane(tcb, Some(route), b"startup");
-        runtime::retire(route).expect("failed Win32k startup retains uncertain drain and parent");
-        runtime::nested::restore(&mut parent).expect("restore parent after canceled Win32k startup");
-        return false;
+        win32k_physical_lanes_mut()[physical_index].startup_retirement = Some(route);
+        return settle_win32k_startup_parent(physical_index, &mut parent, false);
     }
     // Keep the receipt locally owned through receive; publish it before any further native effect.
     // A mutable catalog borrow cannot cross the runtime's physical-source verifier.
@@ -605,19 +663,311 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     win32k_physical_lanes_mut()[physical_index].stack_publication = publication;
     if ready.is_err() || WIN32K_RETIRED.load(Ordering::Acquire) != 0 {
         retain_failed_shared_win32k_lane(tcb, Some(route), b"readiness");
-        runtime::retire(route).expect("failed Win32k readiness retains uncertain drain and parent");
-        runtime::nested::restore(&mut parent).expect("restore parent after canceled Win32k readiness");
+        win32k_physical_lanes_mut()[physical_index].startup_retirement = Some(route);
+        return settle_win32k_startup_parent(physical_index, &mut parent, false);
+    }
+    if !settle_win32k_startup_parent(physical_index, &mut parent, true) {
         return false;
     }
-    runtime::nested::restore(&mut parent).expect("restore parent after acknowledged Win32k readiness");
-    print_str(b"[win32k-lane] shared physical lane=");
-    print_u64(worker_index as u64 + 1);
-    print_str(b" tcb=0x");
-    print_hex(tcb as u32);
-    print_str(b" endpoint=0x");
-    print_hex(endpoint as u32);
-    print_str(b" ready=1\n");
+    trace_ready_win32k_physical_lane(physical_index);
     true
+}
+
+unsafe fn trace_ready_win32k_physical_lane(index: usize) {
+    let lane = &(&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES)).as_ref().unwrap()[index];
+    print_str(b"[win32k-lane] shared physical lane=");
+    print_u64(lane.worker_ordinal.unwrap_or(0));
+    print_str(b" tcb=0x");
+    print_hex(lane.tcb as u32);
+    print_str(b" endpoint=0x");
+    print_hex(lane.worker.as_ref().map_or(0, |worker| worker.endpoint) as u32);
+    print_str(b" ready=1\n");
+}
+
+/// The startup outcome belongs to the physical lane until its exact parent is restored.
+/// A refused restore cannot make a worker admissible or permit source retirement.
+unsafe fn settle_win32k_startup_parent(
+    index: usize,
+    parent: &mut Option<crate::spawn_hosts::shared_ingress::owner::runtime::nested::ParkedParentHandle>,
+    ready: bool,
+) -> bool {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    if let Some(handle) = parent.as_ref() {
+        let ticket = handle.ticket();
+        let key = runtime::nested::result_key(handle);
+        if runtime::nested::restore_or_retain(parent).is_err() {
+            retain_win32k_startup_restore(index, ticket, key, ready);
+            return false;
+        }
+    } else if runtime::nested::restore_or_retain(parent).is_err() {
+        return false;
+    }
+    if !ready {
+        let _ = try_retire_failed_win32k_startup(index);
+    }
+    ready
+}
+
+/// The quarantined source and exact route remain owned by the physical row until native
+/// retirement acknowledges. A refused drain is retried from the outer service boundary.
+unsafe fn try_retire_failed_win32k_startup(index: usize) -> bool {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let (route, wait_parent) = {
+        let lane = &mut win32k_physical_lanes_mut()[index];
+        if lane.startup_restore.is_some() || lane.startup_retirement_attempting {
+            return false;
+        }
+        let Some(route) = lane.startup_retirement else { return false; };
+        (route, lane.startup_retirement_wait_parent)
+    };
+    if let Some(executor) = wait_parent {
+        if runtime::nested::has_retained_parent_for_executor(executor) {
+            return false;
+        }
+    }
+    win32k_physical_lanes_mut()[index].startup_retirement_attempting = true;
+    let retired = runtime::retire(route).is_ok();
+    {
+        let lane = &mut win32k_physical_lanes_mut()[index];
+        lane.startup_retirement_attempting = false;
+        if retired {
+            lane.startup_retirement = None;
+            lane.startup_retirement_wait_parent = None;
+        }
+    }
+    if !retired {
+        WIN32K_STARTUP_RESTORE_WAKE.publish(
+            crate::monotonic_time_100ns().saturating_add(WIN32K_STARTUP_RESTORE_RETRY_100NS),
+        );
+    }
+    retired
+}
+
+unsafe fn retain_win32k_startup_restore(
+    index: usize,
+    ticket: crate::spawn_hosts::shared_ingress::owner::runtime::nested::NestedRestoreTicket,
+    key: Option<NestedRestoreResultKey>,
+    ready: bool,
+) {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let retryable = runtime::nested::pending_ticket(ticket);
+    let payload = match key.and_then(|key| {
+        let mut chain = NestedRestoreChain::retain(key, None, ready).ok()?;
+        chain.begin_inner(key).ok()?;
+        if retryable {
+            chain.refuse_inner_no_effects(key).ok()?;
+        } else {
+            chain.quarantine_inner(key).ok()?;
+        }
+        Some(Win32kStartupRestorePayload::Chain { key, chain })
+    }) {
+        Some(payload) => payload,
+        None => Win32kStartupRestorePayload::Quarantined(ready),
+    };
+    let retryable = retryable && matches!(&payload, Win32kStartupRestorePayload::Chain { .. });
+    win32k_physical_lanes_mut()[index].startup_restore = Some(Win32kStartupRestore {
+        ticket, payload, retryable, attempting: false,
+    });
+    if !retryable {
+        let (tcb, route) = {
+            let lane = &win32k_physical_lanes_mut()[index];
+            (lane.tcb, lane.route)
+        };
+        retain_failed_shared_win32k_lane(tcb, route, b"parent-restore-uncertain");
+    } else {
+        WIN32K_STARTUP_RESTORE_WAKE.publish(
+            crate::monotonic_time_100ns().saturating_add(WIN32K_STARTUP_RESTORE_RETRY_100NS),
+        );
+    }
+}
+
+unsafe fn win32k_startup_restore_is_retained() -> bool {
+    (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES)).as_ref().is_some_and(|lanes| {
+        lanes.iter().any(|lane| lane.startup_restore.is_some()
+            || lane.startup_retirement.is_some())
+    })
+}
+
+/// The bootstrap completion retains this exact physical worker while a parent restore is pending.
+pub(crate) unsafe fn initialize_win32k_bootstrap_lane(pml4: u64) -> Win32kBootstrapStartup {
+    if initialize_win32k_physical_lane(pml4) {
+        return Win32kBootstrapStartup::Ready;
+    }
+    let pending = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES)).as_ref()
+        .and_then(|lanes| lanes.iter().enumerate().find_map(|(index, lane)| {
+            let restore = lane.startup_restore.as_ref()?;
+            if !restore.retryable || WIN32K_RETIRED.load(Ordering::Acquire) != 0 {
+                return None;
+            }
+            Some(Win32kBootstrapPending {
+                index, tcb: lane.tcb, route: lane.route?, ticket: restore.ticket,
+            })
+        }));
+    pending.map_or(Win32kBootstrapStartup::Failed, Win32kBootstrapStartup::Pending)
+}
+
+pub(crate) unsafe fn resume_win32k_bootstrap_lane(
+    pending: Win32kBootstrapPending,
+) -> Win32kBootstrapStartup {
+    if WIN32K_RETIRED.load(Ordering::Acquire) != 0 {
+        return Win32kBootstrapStartup::Failed;
+    }
+    let Some(lane) = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES)).as_ref()
+        .and_then(|lanes| lanes.get(pending.index)) else {
+        return Win32kBootstrapStartup::Failed;
+    };
+    if lane.tcb != pending.tcb || lane.route != Some(pending.route)
+        || lane.startup_retirement.is_some()
+    {
+        return Win32kBootstrapStartup::Failed;
+    }
+    match &lane.startup_restore {
+        Some(restore) if restore.ticket == pending.ticket && restore.retryable => {
+            Win32kBootstrapStartup::Pending(pending)
+        }
+        Some(_) => Win32kBootstrapStartup::Failed,
+        None => Win32kBootstrapStartup::Ready,
+    }
+}
+
+unsafe fn win32k_startup_restore_is_retryable() -> bool {
+    (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES)).as_ref().is_some_and(|lanes| {
+        lanes.iter().any(|lane| lane.startup_restore.as_ref()
+            .is_some_and(|restore| restore.retryable && !restore.attempting)
+            || (lane.startup_restore.is_none() && lane.startup_retirement.is_some()
+                && !lane.startup_retirement_attempting))
+    })
+}
+
+pub(crate) unsafe fn win32k_startup_restore_next_deadline() -> Option<u64> {
+    WIN32K_STARTUP_RESTORE_WAKE.next_deadline(win32k_startup_restore_is_retryable())
+}
+
+pub(crate) unsafe fn win32k_startup_restore_wake_due(now_100ns: u64) -> u64 {
+    u64::from(WIN32K_STARTUP_RESTORE_WAKE.wake_due(
+        now_100ns, win32k_startup_restore_is_retryable(),
+    ))
+}
+
+/// Called only at the outer service boundary; startup itself is never replayed.
+pub(crate) unsafe fn drain_win32k_startup_restores() -> usize {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let now = crate::monotonic_time_100ns();
+    let Some(attempt) = WIN32K_STARTUP_RESTORE_WAKE.begin_redrive(
+        now, win32k_startup_restore_is_retryable(),
+    ) else { return 0; };
+    let _ = attempt.retry_at(now.saturating_add(WIN32K_STARTUP_RESTORE_RETRY_100NS));
+    if let Some(index) = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES)).as_ref()
+        .and_then(|lanes| lanes.iter().position(|lane| {
+            lane.startup_restore.is_none() && lane.startup_retirement.is_some()
+                && !lane.startup_retirement_attempting
+        }))
+    {
+        return usize::from(try_retire_failed_win32k_startup(index));
+    }
+    let candidate = {
+        let Some(lanes) = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES)).as_ref() else {
+            return 0;
+        };
+        lanes.iter().enumerate().find_map(|(index, lane)| {
+            let pending = lane.startup_restore.as_ref()?;
+            if !pending.retryable || pending.attempting { return None; }
+            let Win32kStartupRestorePayload::Chain { key, .. } = &pending.payload else {
+                return None;
+            };
+            Some((index, pending.ticket, *key))
+        })
+    };
+    let Some((index, ticket, key)) = candidate else { return 0; };
+    if !runtime::nested::ticket_matches_channel(ticket, key.scope().route(), key.parent_reply()) {
+        // The retained result can no longer authenticate the physical parent. Repeating the
+        // same ticket cannot fix a changed route or Reply and must not spin on the timer.
+        win32k_physical_lanes_mut()[index].startup_restore.as_mut().unwrap().retryable = false;
+        let (tcb, route) = {
+            let lane = &win32k_physical_lanes_mut()[index];
+            (lane.tcb, lane.route)
+        };
+        retain_failed_shared_win32k_lane(tcb, route, b"parent-identity-mismatch");
+        return 0;
+    }
+    let begin_ok = {
+        let pending = win32k_physical_lanes_mut()[index].startup_restore.as_mut().unwrap();
+        let Win32kStartupRestorePayload::Chain { key, chain } = &mut pending.payload else {
+            return 0;
+        };
+        if chain.begin_inner(*key).is_err() {
+            pending.retryable = false;
+            false
+        } else {
+            pending.attempting = true;
+            true
+        }
+    };
+    if !begin_ok {
+        let (tcb, route) = {
+            let lane = &win32k_physical_lanes_mut()[index];
+            (lane.tcb, lane.route)
+        };
+        retain_failed_shared_win32k_lane(tcb, route, b"parent-result-uncertain");
+        return 0;
+    }
+    let restored = runtime::nested::restore_pending_ticket(ticket);
+    let still_pending = restored.is_err() && runtime::nested::pending_ticket(ticket);
+    enum RestoreOutcome { Retry, Quarantined(&'static [u8]), Settled(bool) }
+    let outcome = {
+        let lane = &mut win32k_physical_lanes_mut()[index];
+        let pending = lane.startup_restore.as_mut().unwrap();
+        pending.attempting = false;
+        let outcome = match &mut pending.payload {
+            Win32kStartupRestorePayload::Chain { chain, .. } if restored.is_err() => {
+                if still_pending && chain.refuse_inner_no_effects(key).is_ok() {
+                    RestoreOutcome::Retry
+                } else {
+                    let _ = chain.quarantine_inner(key);
+                    pending.retryable = false;
+                    RestoreOutcome::Quarantined(b"parent-restore-uncertain")
+                }
+            }
+            Win32kStartupRestorePayload::Chain { chain, .. } => {
+                if chain.acknowledge_inner(key).is_err() {
+                    pending.retryable = false;
+                    RestoreOutcome::Quarantined(b"parent-result-uncertain")
+                } else if let Ok(ready) = chain.take(key, None) {
+                    RestoreOutcome::Settled(ready)
+                } else {
+                    pending.retryable = false;
+                    RestoreOutcome::Quarantined(b"parent-result-uncertain")
+                }
+            }
+            Win32kStartupRestorePayload::Quarantined(_) => {
+                pending.retryable = false;
+                RestoreOutcome::Quarantined(b"parent-result-uncertain")
+            }
+        };
+        if matches!(&outcome, RestoreOutcome::Settled(_)) {
+            lane.startup_restore = None;
+        }
+        outcome
+    };
+    match outcome {
+        RestoreOutcome::Retry => 0,
+        RestoreOutcome::Quarantined(stage) => {
+            let (tcb, route) = {
+                let lane = &win32k_physical_lanes_mut()[index];
+                (lane.tcb, lane.route)
+            };
+            retain_failed_shared_win32k_lane(tcb, route, stage);
+            0
+        }
+        RestoreOutcome::Settled(true) => {
+            trace_ready_win32k_physical_lane(index);
+            1
+        }
+        RestoreOutcome::Settled(false) => {
+            let _ = try_retire_failed_win32k_startup(index);
+            1
+        }
+    }
 }
 
 pub(crate) unsafe fn verify_win32k_worker_source(
@@ -681,13 +1031,14 @@ unsafe fn retain_failed_shared_win32k_lane(
 
 /// Readiness only: do not admit a lane or allocate worker resources during pump selection.
 pub(crate) unsafe fn source_terminal_dispatch_ready() -> bool {
-    if WIN32K_RETIRED.load(Ordering::Acquire) != 0 {
+    if WIN32K_RETIRED.load(Ordering::Acquire) != 0 || win32k_startup_restore_is_retained() {
         return false;
     }
     let Some(lanes) = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES)).as_ref() else {
         return false;
     };
     if lanes.iter().any(|row| {
+        if row.startup_restore.is_some() { return false; }
         let (Some(handle), Some(route)) = (row.handle, row.route) else { return false; };
         crate::service_sec_image::component_execution_lane_is_idle(handle)
             && win32k_physical_lane_binding(handle).is_some()
@@ -698,6 +1049,7 @@ pub(crate) unsafe fn source_terminal_dispatch_ready() -> bool {
     !lanes.is_empty()
         && WIN32K_HOST_PML4.load(Ordering::Acquire) != 0
         && WIN32K_LANE_STARTUP_ACTIVE.load(Ordering::Acquire) == 0
+        && !win32k_startup_restore_is_retained()
         && lanes.iter().filter(|lane| lane.worker.is_some()).count()
             < win32k_subsystem::WIN32K_LANE_CAPACITY
         && crate::service_sec_image::component_execution_lane_can_grow()
@@ -708,6 +1060,10 @@ unsafe fn acquire_or_provision_win32k_execution_lane(
 ) -> Option<nt_component_suspension::LaneHandle> {
     if WIN32K_RETIRED.load(Ordering::Acquire) != 0 {
         dump_win32k_lane_admission_failure(ssn, b"provider-retired");
+        return None;
+    }
+    if win32k_startup_restore_is_retained() {
+        dump_win32k_lane_admission_failure(ssn, b"startup-parent-restore");
         return None;
     }
     if let Some(lane) = acquire_idle_win32k_execution_lane() {
@@ -883,6 +1239,7 @@ unsafe fn dump_win32k_lane_admission_failure(ssn: u64, reason: &[u8]) {
 unsafe fn acquire_idle_win32k_execution_lane() -> Option<nt_component_suspension::LaneHandle> {
     let lanes = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES)).as_ref()?;
     for row in lanes {
+        if row.startup_restore.is_some() { continue; }
         let (Some(handle), Some(route)) = (row.handle, row.route) else {
             continue;
         };

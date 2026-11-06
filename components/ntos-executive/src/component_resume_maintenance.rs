@@ -83,6 +83,7 @@ fn restore_step_code(step: Option<Result<RestoreStep, runtime::Error>>) -> u64 {
     match step {
         Some(Ok(RestoreStep::Canonical)) => 1,
         Some(Ok(RestoreStep::Projection)) => 2,
+        Some(Ok(RestoreStep::ProjectionEntered)) => 7,
         Some(Ok(RestoreStep::Release)) => 3,
         Some(Ok(RestoreStep::UncertainRelease)) => 4,
         Some(Ok(RestoreStep::Finalize)) => 5,
