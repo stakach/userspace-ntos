@@ -21,6 +21,7 @@ pub(crate) use pending_dispatch::{
     PendingLpcWaitDispatch, PendingProviderWaitDispatch, ProviderWaitPumpCompletion,
     PendingReceiveDispatch, ReceiveYield, take_pending_receive_dispatch,
     PendingServiceWaitDispatch, ServiceWaitYield, take_pending_service_wait_dispatch,
+    PendingRootMaintenanceDispatch, RootMaintenanceYield, take_pending_root_maintenance_dispatch,
 };
 use pending_dispatch::{
     capture_initial_arg_snapshot, capture_lpc_wait_repark, capture_provider_wait_repark,
@@ -30,6 +31,7 @@ use pending_dispatch::{
     PROVIDER_WAIT_PENDING_DISPATCH,
     RECEIVE_PENDING_DISPATCH,
     SERVICE_WAIT_PENDING_DISPATCH,
+    ROOT_MAINTENANCE_PENDING_DISPATCH,
 };
 
 pub(crate) const WINDOWPROC_LPARAM_OFFSET: u64 = 0x28;
@@ -4069,6 +4071,7 @@ pub(crate) unsafe fn retire_bugchecked_vspace(vspace: u64, reporting_tcb: u64) {
 unsafe fn retire_win32k_on_wall(pr: &crate::spawn_hosts::PumpResult) {
     if pr.completed || pr.callback_suspended || pr.provider_wait_suspended || pr.lpc_wait_suspended
         || pr.receive_yield.is_some() || pr.service_wait_yield.is_some()
+        || pr.maintenance_yield.is_some()
     {
         return;
     }
@@ -7079,7 +7082,8 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             crate::service_sec_image::suspend_component_execution_lane_for_callback(lane, token)
         })
     } else if pr.provider_wait_suspended || pr.lpc_wait_suspended
-        || pr.receive_yield.is_some() || pr.service_wait_yield.is_some() {
+        || pr.receive_yield.is_some() || pr.service_wait_yield.is_some()
+        || pr.maintenance_yield.is_some() {
         true
     } else if pr.completed {
         if let Some((outer_lane, token)) = outer_callback {
@@ -7117,6 +7121,25 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         let (arg_snapshot_len, arg_snapshot) = capture_initial_arg_snapshot(ssn, completion_args);
         core::ptr::write(core::ptr::addr_of_mut!(SERVICE_WAIT_PENDING_DISPATCH),
             Some(PendingServiceWaitDispatch {
+                yielded,
+                snapshot: SuspendedPumpSnapshot {
+                    pump: pr, channel: ch,
+                    dispatch: UserCallbackDispatchContext { lane, dispatch_id, ssn,
+                        args: completion_args, caller_sp, output_stage, paint_output },
+                    shared_resume: capture_shared_resume_snapshot(
+                        UserCallbackDispatchContext { lane, dispatch_id, ssn,
+                            args: completion_args, caller_sp, output_stage, paint_output }, client),
+                    client, callback_token: None, arg_snapshot_len, arg_snapshot,
+                },
+            }));
+    }
+    if let Some(yielded) = pr.maintenance_yield {
+        assert!(!nested_user_callback && outer_callback.is_none(),
+            "root maintenance owns only an initial hosted dispatch");
+        assert!((*core::ptr::addr_of!(ROOT_MAINTENANCE_PENDING_DISPATCH)).is_none());
+        let (arg_snapshot_len, arg_snapshot) = capture_initial_arg_snapshot(ssn, completion_args);
+        core::ptr::write(core::ptr::addr_of_mut!(ROOT_MAINTENANCE_PENDING_DISPATCH),
+            Some(PendingRootMaintenanceDispatch {
                 yielded,
                 snapshot: SuspendedPumpSnapshot {
                     pump: pr, channel: ch,
@@ -7191,7 +7214,8 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             || pr.provider_wait_suspended
             || pr.lpc_wait_suspended
             || pr.receive_yield.is_some()
-            || pr.service_wait_yield.is_some();
+            || pr.service_wait_yield.is_some()
+            || pr.maintenance_yield.is_some();
     }
     if nested_user_callback {
         if pr.callback_suspended || pr.provider_wait_suspended || pr.lpc_wait_suspended {
@@ -7216,6 +7240,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         && !pr.lpc_wait_suspended
         && pr.receive_yield.is_none()
         && pr.service_wait_yield.is_none()
+        && pr.maintenance_yield.is_none()
     {
         unregister_win32k_dispatch_client(
             dispatch_id,

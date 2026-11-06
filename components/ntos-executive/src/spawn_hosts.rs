@@ -1614,6 +1614,7 @@ struct PumpMessage {
     scheduler_yield: bool,
     receive_yield: Option<crate::win32k_glue::ReceiveYield>,
     service_wait_yield: Option<crate::win32k_glue::ServiceWaitYield>,
+    maintenance_yield: Option<crate::win32k_glue::RootMaintenanceYield>,
 }
 
 impl PumpMessage {
@@ -1637,6 +1638,7 @@ impl PumpMessage {
             scheduler_yield: false,
             receive_yield: None,
             service_wait_yield: None,
+            maintenance_yield: None,
         }
     }
 
@@ -1668,6 +1670,7 @@ impl PumpMessage {
             scheduler_yield: false,
             receive_yield: None,
             service_wait_yield: None,
+            maintenance_yield: None,
         }
     }
 
@@ -1687,6 +1690,7 @@ impl PumpMessage {
             scheduler_yield: false,
             receive_yield: None,
             service_wait_yield: None,
+            maintenance_yield: None,
         }
     }
 
@@ -1706,6 +1710,7 @@ impl PumpMessage {
             scheduler_yield: true,
             receive_yield: None,
             service_wait_yield: None,
+            maintenance_yield: None,
         }
     }
 
@@ -1715,6 +1720,7 @@ impl PumpMessage {
             badge: 0, mi: 0, m0: 0, m1: 0, m2: 0, m3: 0, m4: 0,
             scheduler_yield: false, receive_yield: Some(yielded),
             service_wait_yield: None,
+            maintenance_yield: None,
         }
     }
 
@@ -1724,6 +1730,16 @@ impl PumpMessage {
             badge: 0, mi: 0, m0: 0, m1: 0, m2: 0, m3: 0, m4: 0,
             scheduler_yield: false, receive_yield: None,
             service_wait_yield: Some(yielded),
+            maintenance_yield: None,
+        }
+    }
+
+    fn hosted_root_maintenance_yield(yielded: crate::win32k_glue::RootMaintenanceYield) -> Self {
+        Self {
+            shared_reply: None, service_finished: false, received: None,
+            badge: 0, mi: 0, m0: 0, m1: 0, m2: 0, m3: 0, m4: 0,
+            scheduler_yield: false, receive_yield: None,
+            service_wait_yield: None, maintenance_yield: Some(yielded),
         }
     }
 }
@@ -1776,6 +1792,7 @@ struct PumpLoopOutcome {
     scheduler_yielded: bool,
     receive_yield: Option<crate::win32k_glue::ReceiveYield>,
     service_wait_yield: Option<crate::win32k_glue::ServiceWaitYield>,
+    maintenance_yield: Option<crate::win32k_glue::RootMaintenanceYield>,
     wall_ip: u64,
     wall_addr: u64,
     wall_label: u64,
@@ -1797,6 +1814,7 @@ impl PumpLoopOutcome {
             scheduler_yielded: false,
             receive_yield: None,
             service_wait_yield: None,
+            maintenance_yield: None,
             wall_ip: 0,
             wall_addr: 0,
             wall_label: 0,
@@ -1990,6 +2008,7 @@ pub(crate) struct PumpResult {
     pub scheduler_yielded: bool,
     pub receive_yield: Option<crate::win32k_glue::ReceiveYield>,
     pub service_wait_yield: Option<crate::win32k_glue::ServiceWaitYield>,
+    pub maintenance_yield: Option<crate::win32k_glue::RootMaintenanceYield>,
     /// Wall diagnostics (only meaningful when `!completed`).
     pub wall_ip: u64,
     pub wall_addr: u64,
@@ -2019,6 +2038,7 @@ impl PumpResult {
             scheduler_yielded: false,
             receive_yield: None,
             service_wait_yield: None,
+            maintenance_yield: None,
             wall_ip: 0,
             wall_addr: 0,
             wall_label: 0,
@@ -2035,6 +2055,7 @@ impl PumpResult {
         self.reply_cap != 0
             && (self.scheduler_yielded || self.receive_yield.is_some())
             && self.service_wait_yield.is_none()
+            && self.maintenance_yield.is_none()
             && !self.completed
             && !self.callback_suspended
             && !self.provider_wait_suspended
@@ -2045,6 +2066,7 @@ impl PumpResult {
         self.reply_cap != 0
             && self.service_wait_yield.is_some()
             && self.receive_yield.is_none()
+            && self.maintenance_yield.is_none()
             && !self.scheduler_yielded
             && !self.completed
             && !self.callback_suspended
@@ -2394,7 +2416,8 @@ unsafe fn component_pump_continue_receive_half(
     let mut outcome = component_pump_loop(ch, first, &mut reply_cap, previous.accounting, &mut seh.pump);
     let suspended = outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended;
     if !seh.finish(ch, reply_cap, suspended) {
-        assert!(outcome.receive_yield.is_none() && outcome.service_wait_yield.is_none(),
+        assert!(outcome.receive_yield.is_none() && outcome.service_wait_yield.is_none()
+            && outcome.maintenance_yield.is_none(),
             "receive yield retained with failed SEH retirement");
         outcome.callback_suspended = false;
         outcome.provider_wait_suspended = false;
@@ -2546,7 +2569,8 @@ unsafe fn component_pump_enter(
     let mut outcome = component_pump_loop(ch, first, &mut reply_cap, accounting, &mut seh.pump);
     let suspended = outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended;
     if !seh.finish(ch, reply_cap, suspended) {
-        assert!(outcome.receive_yield.is_none() && outcome.service_wait_yield.is_none(),
+        assert!(outcome.receive_yield.is_none() && outcome.service_wait_yield.is_none()
+            && outcome.maintenance_yield.is_none(),
             "receive yield retained with failed SEH retirement");
         outcome.callback_suspended = false;
         outcome.provider_wait_suspended = false;
@@ -2638,6 +2662,11 @@ unsafe fn component_pump_loop(
         if let Some(yielded) = msg.service_wait_yield {
             assert!(!seh.retained(), "retained exception cannot yield a service wait");
             outcome.service_wait_yield = Some(yielded);
+            break;
+        }
+        if let Some(yielded) = msg.maintenance_yield {
+            assert!(!seh.retained(), "retained exception cannot yield root maintenance");
+            outcome.maintenance_yield = Some(yielded);
             break;
         }
         if msg.scheduler_yield {
@@ -5670,7 +5699,8 @@ unsafe fn pump_finish_slice(
 ) -> PumpResult {
     use nt_user_host::component_pump::PumpDepthDisposition;
     match outcome.accounting.after_slice(
-        outcome.scheduler_yielded || outcome.receive_yield.is_some() || outcome.service_wait_yield.is_some(),
+        outcome.scheduler_yielded || outcome.receive_yield.is_some()
+            || outcome.service_wait_yield.is_some() || outcome.maintenance_yield.is_some(),
         outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended,
     ) {
         PumpDepthDisposition::None | PumpDepthDisposition::Retained => {}
@@ -5696,6 +5726,7 @@ unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutco
         && !outcome.scheduler_yielded
         && outcome.receive_yield.is_none()
         && outcome.service_wait_yield.is_none()
+        && outcome.maintenance_yield.is_none()
     {
         pump_wall_state_diag(ch, outcome);
         crate::print_str(b"[pump] WALL label=");
@@ -5775,6 +5806,7 @@ unsafe fn pump_result_from_outcome(
         || outcome.scheduler_yielded
         || outcome.receive_yield.is_some()
         || outcome.service_wait_yield.is_some()
+        || outcome.maintenance_yield.is_some()
     {
         let status = nt_user_callback::STATUS_PENDING;
         (status, status as u32 as u64)
@@ -5804,6 +5836,7 @@ unsafe fn pump_result_from_outcome(
         scheduler_yielded: outcome.scheduler_yielded,
         receive_yield: outcome.receive_yield,
         service_wait_yield: outcome.service_wait_yield,
+        maintenance_yield: outcome.maintenance_yield,
         wall_ip: outcome.wall_ip,
         wall_addr: outcome.wall_addr,
         wall_label: outcome.wall_label,

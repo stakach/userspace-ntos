@@ -24,6 +24,17 @@ pub(crate) struct ServiceWaitYield {
     pub token: u64,
 }
 
+/// An ordinary hosted syscall retained while the root runs an independent service pass.
+/// This is neither a provider completion nor a Receive child admission.
+#[derive(Clone, Copy)]
+pub(crate) struct RootMaintenanceYield {
+    pub route: nt_component_suspension::peer_registry::PeerRoute,
+    pub dispatch: nt_component_suspension::LaneDispatchIdentity,
+    pub reply: u64,
+    pub owner: nt_component_suspension::SuspensionOwner,
+    pub captured_pass: u64,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct SuspendedPumpSnapshot {
     pub pump: crate::spawn_hosts::PumpResult,
@@ -47,6 +58,18 @@ pub(super) static mut SERVICE_WAIT_PENDING_DISPATCH: Option<PendingServiceWaitDi
 
 pub(crate) unsafe fn take_pending_service_wait_dispatch() -> Option<PendingServiceWaitDispatch> {
     core::ptr::replace(core::ptr::addr_of_mut!(SERVICE_WAIT_PENDING_DISPATCH), None)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PendingRootMaintenanceDispatch {
+    pub yielded: RootMaintenanceYield,
+    pub snapshot: SuspendedPumpSnapshot,
+}
+
+pub(super) static mut ROOT_MAINTENANCE_PENDING_DISPATCH: Option<PendingRootMaintenanceDispatch> = None;
+
+pub(crate) unsafe fn take_pending_root_maintenance_dispatch() -> Option<PendingRootMaintenanceDispatch> {
+    core::ptr::replace(core::ptr::addr_of_mut!(ROOT_MAINTENANCE_PENDING_DISPATCH), None)
 }
 
 #[derive(Clone, Copy)]
