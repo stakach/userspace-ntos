@@ -32,6 +32,9 @@ mod dll_relocation;
 #[path = "csr_connect.rs"]
 mod csr_connect;
 #[cfg(target_arch = "x86_64")]
+#[path = "on_target_runtime_loader_trace.rs"]
+mod runtime_loader_trace;
+#[cfg(target_arch = "x86_64")]
 pub use csr_connect::csr_client_connect_to_server;
 
 use core::{
@@ -3846,6 +3849,22 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
     if !unsafe { unicode_dll_load_name(dll_name, &mut name) } {
         return 0xC000_000D; // STATUS_INVALID_PARAMETER
     }
+    let mut trace = runtime_loader_trace::RuntimeLoadTrace::begin(name.open_name());
+    let status = unsafe { ldr_load_dll_inner(&name, base_addr, &mut trace) };
+    trace.finish(status);
+    status
+}
+
+/// Run one loader transaction while its caller owns the loader lock.
+///
+/// # Safety
+/// `base_addr` is writable when non-null and `name` came from a valid UNICODE_STRING.
+#[cfg(target_arch = "x86_64")]
+unsafe fn ldr_load_dll_inner(
+    name: &DllLoadName,
+    base_addr: *mut *mut c_void,
+    trace: &mut runtime_loader_trace::RuntimeLoadTrace,
+) -> u32 {
     let dep = name.key();
     let open_name = name.open_name();
     // SAFETY: single-threaded loader; MODULE_TABLE touched only here + snap.
@@ -3877,6 +3896,7 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
                 retained
             } else {
                 let loaded = load_dependent_dll(open_name);
+                trace.map_done();
                 if loaded == 0 {
                     return 0xC000_0135; // STATUS_DLL_NOT_FOUND
                 }
@@ -3893,6 +3913,7 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
                 let mut out = SnapResult::default();
                 let mut expansion = nt_ntdll::loader::reference_graph::ReferenceExpansion::new();
                 snap_module(loaded, ntdll_base, table_ptr, &mut out, 0, &mut expansion);
+                trace.snap_done();
                 if out.status != 0 {
                     return out.status;
                 }
@@ -3919,7 +3940,9 @@ pub unsafe fn ldr_load_dll(dll_name: *const c_void, base_addr: *mut *mut c_void)
             }
             loaded
         };
+        trace.bookkeeping_done();
         let attach_status = run_process_attach_root(table_ptr, base);
+        trace.attach_done();
         if attach_status != 0 {
             if reference_added {
                 let rollback_status = ldr_release_dll_reference(base);
@@ -5755,6 +5778,7 @@ static mut WORK_POOL_FLEET: nt_rtl_work_item::WorkerFleet = nt_rtl_work_item::Wo
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn reset_process_runtime_state_for_new_process() {
+    runtime_loader_trace::reset();
     unsafe {
         CSR_API_PORT = 0;
         CSR_PORT_HEAP = 0;
