@@ -13,6 +13,11 @@ fn fixture() -> (PsBootstrapParts, NativeHandleCaller, ThreadProjection) {
         component_kpcr: 0x5000, executive_kpcr: 0x6000, thread_body: 0x4000 })
 }
 
+fn acknowledge_hold(owners: &mut ProjectionOwners<u64, u64>, route: u64, dispatch: u64) {
+    let reservation = owners.prepare_hold(route, dispatch).unwrap().unwrap();
+    owners.acknowledge_hold(reservation).unwrap();
+}
+
 #[test]
 fn bootstrap_binds_once_and_only_exact_completion_releases() {
     let (mut parts, caller, projection) = fixture();
@@ -35,7 +40,7 @@ fn uncertain_release_retains_identity_and_excludes_replay() {
     let (mut parts, caller, projection) = fixture();
     let mut owners = ProjectionOwners::new();
     owners.capture(&mut parts.pm, 1u64, Some(10u64), caller, projection).unwrap();
-    owners.hold(1, 10).unwrap();
+    acknowledge_hold(&mut owners, 1, 10);
     assert!(owners.completing(1, 10).is_err());
     assert!(owners.begin_restore(&parts.pm, 1, 11).is_err());
     assert_eq!(owners.begin_restore(&parts.pm, 1, 10), Ok(Some(projection)));
@@ -59,7 +64,7 @@ fn held_parent_allows_exact_nested_projection_on_same_executor() {
     let second_projection = ThreadProjection { thread_body: 0x8000, ..projection };
     let mut owners = ProjectionOwners::new();
     owners.capture(&mut parts.pm, 1u64, Some(10u64), caller, projection).unwrap();
-    assert_eq!(owners.hold(1, 10), Ok(true));
+    acknowledge_hold(&mut owners, 1, 10);
     owners.capture(&mut parts.pm, 1, Some(11), second_caller, second_projection).unwrap();
     assert_eq!(owners.completing(1, 11), Ok(Some(second_projection)));
     owners.retire(&mut parts.pm, 1, 11).unwrap();
@@ -79,7 +84,7 @@ fn different_executors_cannot_share_a_kpcr_in_one_address_space() {
     assert!(owners.capture(&mut parts.pm, 2, Some(11), caller, second).is_err());
     second.component_kpcr = 0x8000;
     owners.capture(&mut parts.pm, 2, Some(11), caller, second).unwrap();
-    owners.hold(1, 10).unwrap();
+    acknowledge_hold(&mut owners, 1, 10);
     assert_eq!(owners.completing(2, 11), Ok(Some(second)));
     owners.retire(&mut parts.pm, 2, 11).unwrap();
     assert!(owners.contains(1));
@@ -94,7 +99,7 @@ fn foreign_manager_and_forged_thread_body_cannot_project() {
     forged.thread_body += 0x1000;
     assert!(owners.capture(&mut parts.pm, 1u64, Some(10u64), caller, forged).is_err());
     owners.capture(&mut parts.pm, 1, Some(10), caller, projection).unwrap();
-    owners.hold(1, 10).unwrap();
+    acknowledge_hold(&mut owners, 1, 10);
     assert!(owners.begin_restore(&foreign.pm, 1, 10).is_err());
     assert_eq!(owners.begin_restore(&parts.pm, 1, 10), Ok(Some(projection)));
 }
@@ -105,11 +110,52 @@ fn confirmed_stop_can_retire_uncertain_projection_but_not_another_executor() {
     let (mut foreign, _, _) = fixture();
     let mut owners = ProjectionOwners::new();
     owners.capture(&mut parts.pm, 1u64, Some(10u64), caller, projection).unwrap();
-    owners.hold(1, 10).unwrap();
+    acknowledge_hold(&mut owners, 1, 10);
     owners.begin_restore(&parts.pm, 1, 10).unwrap();
     assert!(owners.retire_stopped(&mut parts.pm, 1, 2, projection.address_space).is_err());
     assert!(owners.retire_stopped(&mut foreign.pm, 1, projection.executor, projection.address_space).is_err());
     assert!(owners.contains(1));
     owners.retire_stopped(&mut parts.pm, 1, projection.executor, projection.address_space).unwrap();
     assert!(!owners.contains(1));
+}
+
+#[test]
+fn projection_reservation_is_not_an_acknowledged_physical_hold() {
+    let (mut parts, caller, projection) = fixture();
+    let mut owners = ProjectionOwners::new();
+    owners.capture(&mut parts.pm, 1u64, Some(10u64), caller, projection).unwrap();
+    assert!(owners.prepare_hold(1, 11).is_err());
+    assert_eq!(owners.prepare_hold(2, 10).unwrap().is_some(), false);
+    let reservation = owners.prepare_hold(1, 10).unwrap().unwrap();
+
+    // No native hold has been entered yet. In particular a restoration or a nested capture
+    // cannot treat this merely reserved row as a physically stopped parent.
+    assert!(owners.begin_restore(&parts.pm, 1, 10).is_err(),
+        "a pre-effect reservation must not impersonate an acknowledged physical hold");
+    assert!(owners.completing(1, 10).is_err());
+    assert!(owners.prepare_hold(1, 10).is_err());
+
+    owners.cancel_hold_no_effects(reservation).unwrap();
+    assert_eq!(owners.completing(1, 10), Ok(Some(projection)));
+    let reservation = owners.prepare_hold(1, 10).unwrap().unwrap();
+    owners.acknowledge_hold(reservation).unwrap();
+    assert_eq!(owners.begin_restore(&parts.pm, 1, 10), Ok(Some(projection)));
+}
+
+#[test]
+fn retired_reservation_cannot_settle_a_later_same_route_hold() {
+    let (mut parts, caller, projection) = fixture();
+    let mut owners = ProjectionOwners::new();
+    owners.capture(&mut parts.pm, 1u64, Some(10u64), caller, projection).unwrap();
+    let stale = owners.prepare_hold(1, 10).unwrap().unwrap();
+    owners.retire_stopped(&mut parts.pm, 1, projection.executor,
+        projection.address_space).unwrap();
+    owners.capture(&mut parts.pm, 1, Some(10), caller, projection).unwrap();
+    let live = owners.prepare_hold(1, 10).unwrap().unwrap();
+
+    let (_, stale) = owners.acknowledge_hold(stale).unwrap_err();
+    assert!(owners.begin_restore(&parts.pm, 1, 10).is_err());
+    assert!(owners.cancel_hold_no_effects(stale).is_err());
+    owners.cancel_hold_no_effects(live).unwrap();
+    assert_eq!(owners.completing(1, 10), Ok(Some(projection)));
 }

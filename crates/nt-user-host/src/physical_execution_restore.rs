@@ -67,17 +67,6 @@ impl<R: Copy + Eq, D: Copy + Eq> PhysicalExecutionAcquire<R, D> {
         Ok(())
     }
 
-    /// The projection adapter certifies that a refused preflight made no changes.
-    pub fn refuse_projection_no_effects(&mut self, route: R, dispatch: D)
-        -> Result<(), RestoreError> {
-        self.validate(route, dispatch)?;
-        if self.step != AcquireStep::ProjectionEntered {
-            return Err(RestoreError::InvalidPhase);
-        }
-        self.step = AcquireStep::Held;
-        Ok(())
-    }
-
     pub fn acknowledge_projection(&mut self, route: R, dispatch: D)
         -> Result<(), RestoreError> {
         self.validate(route, dispatch)?;
@@ -190,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_refusal_retries_without_reacquiring_physical_hold() {
+    fn admitted_projection_cannot_reacquire_physical_hold() {
         let mut acquire = PhysicalExecutionAcquire::new(3u64, 5u64);
         acquire.enter(3, 5).unwrap();
         acquire.acknowledge_hold(3, 5).unwrap();
@@ -198,9 +187,6 @@ mod tests {
         assert_eq!(acquire.enter(3, 5), Err(RestoreError::InvalidPhase));
         acquire.begin_projection(3, 5).unwrap();
         assert_eq!(acquire.next(3, 5), Ok(AcquireStep::ProjectionEntered));
-        acquire.refuse_projection_no_effects(3, 5).unwrap();
-        assert_eq!(acquire.next(3, 5), Ok(AcquireStep::Held));
-        acquire.begin_projection(3, 5).unwrap();
         acquire.acknowledge_projection(3, 5).unwrap();
         assert_eq!(acquire.next(3, 5), Ok(AcquireStep::ProjectionHeld));
         assert_eq!(acquire.enter(3, 5), Err(RestoreError::InvalidPhase));

@@ -9,6 +9,15 @@ pub(super) enum PendingComponentDispatch {
     Receive(win32k_glue::PendingReceiveDispatch),
     ServiceWait(win32k_glue::PendingServiceWaitDispatch),
     RootMaintenance(win32k_glue::PendingRootMaintenanceDispatch),
+    NestedRestore(PendingNestedTerminalDispatch),
+}
+
+/// A real returned receive half transferred from its independent nested parent owner. The
+/// owner keeps the original root Reply until terminal retirement acknowledges it.
+#[derive(Clone, Copy)]
+pub(super) struct PendingNestedTerminalDispatch {
+    pub(super) ticket: nested_restore_owner::NestedRestoreOwnerTicket,
+    pub(super) client: win32k_glue::Win32kClientContext,
 }
 
 impl PendingComponentDispatch {
@@ -19,6 +28,7 @@ impl PendingComponentDispatch {
             Self::Receive(pending) => pending.snapshot.client,
             Self::ServiceWait(pending) => pending.snapshot.client,
             Self::RootMaintenance(pending) => pending.snapshot.client,
+            Self::NestedRestore(pending) => pending.client,
         }
     }
 }

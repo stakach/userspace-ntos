@@ -66,6 +66,42 @@ pub(crate) struct PendingRootMaintenanceDispatch {
     pub snapshot: SuspendedPumpSnapshot,
 }
 
+/// A nested physical parent refused restoration after the pump entered. The snapshot owns the
+/// receive-half continuation; `origin` retains the callback stack and original lane return path.
+/// The root Reply is attached by the outer handoff before it is parked.
+#[derive(Clone, Copy)]
+pub(crate) struct PendingNestedRestoreDispatch {
+    pub snapshot: SuspendedPumpSnapshot,
+    pub origin: NestedRestoreOrigin,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct NestedRestoreOrigin {
+    pub nested_user_callback: bool,
+    pub outer_callback: Option<(nt_component_suspension::LaneHandle, u64)>,
+    pub registered_client: bool,
+    pub owner: Option<nt_component_suspension::SuspensionOwner>,
+}
+
+pub(super) static mut NESTED_RESTORE_PENDING_DISPATCH: Option<PendingNestedRestoreDispatch> = None;
+
+pub(crate) unsafe fn pending_nested_restore_dispatch_is_some() -> bool {
+    (&*core::ptr::addr_of!(NESTED_RESTORE_PENDING_DISPATCH)).is_some()
+}
+
+pub(crate) unsafe fn take_pending_nested_restore_dispatch() -> Option<PendingNestedRestoreDispatch> {
+    core::ptr::replace(core::ptr::addr_of_mut!(NESTED_RESTORE_PENDING_DISPATCH), None)
+}
+
+pub(crate) unsafe fn restore_pending_nested_restore_dispatch(
+    pending: PendingNestedRestoreDispatch,
+) -> bool {
+    let slot = &mut *core::ptr::addr_of_mut!(NESTED_RESTORE_PENDING_DISPATCH);
+    if slot.is_some() { return false; }
+    *slot = Some(pending);
+    true
+}
+
 pub(super) static mut ROOT_MAINTENANCE_PENDING_DISPATCH: Option<PendingRootMaintenanceDispatch> = None;
 
 pub(crate) unsafe fn pending_root_maintenance_dispatch_is_some() -> bool {

@@ -49,7 +49,8 @@ unsafe fn eligible(
 ) -> bool {
     match continuation {
         ComponentNativeContinuation::Hosted(hosted) => {
-            if matches!(hosted.pending, PendingComponentDispatch::RootMaintenance(_)) {
+            if matches!(hosted.pending, PendingComponentDispatch::RootMaintenance(_)
+                | PendingComponentDispatch::NestedRestore(_)) {
                 return false;
             }
             let reply_ready = hosted.return_target.can_resume();
@@ -193,12 +194,17 @@ fn runtime_ready(handler: *const ExecNtHandler) -> bool {
 
 /// Timer callbacks only query this demand; they never claim or execute a selected continuation.
 pub(crate) unsafe fn next_deadline(pm: &nt_process::ProcessManager) -> Option<u64> {
+    let nested = nested_restore_owner::next_deadline();
     if component_execution_is_busy()
         && !kernel_provider_activation::has_stopped_wait_work(pm)
     {
-        return None;
+        return nested;
     }
-    retained_deadline()
+    match (nested, retained_deadline()) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
 }
 
 /// Copy retained demand without runtime eligibility checks or claiming a continuation.
@@ -280,6 +286,7 @@ unsafe fn reconcile_runtime(handler: &mut ExecNtHandler) -> Option<nt_kernel_exe
     let acpi_deadline = driver_launch::hosted_acpi_pci_route_recovery_next_deadline(now);
     if previous.is_none()
         && (&*core::ptr::addr_of!(WAKE)).next_deadline().is_none()
+        && nested_restore_owner::next_deadline().is_none()
         && dpc_deadline.is_none()
         && acpi_deadline.is_none()
         && crate::registry_mutation_work::next_deadline().is_none()
@@ -328,6 +335,23 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
     // A hosted terminal may own the shared execution fence while awaiting the separately
     // retained final Call. Settle that exact return before the ordinary busy-lane gate.
     let _ = component_terminal::drain_shared_returns();
+    if let Some(ticket) = nested_restore_owner::next_retry() {
+        let _message = crate::ipc_message::SavedMessageBuffer::capture();
+        let _durable = allocator::enter_durable();
+        if nested_restore_owner::run_one(ticket)
+            == nested_restore_owner::NestedRestorePassOutcome::ResultRetained
+        {
+            let _ = nested_restore_owner::settle_result(ticket);
+            if !nested_restore_owner::transfer_nested_repark(ticket)
+                && !nested_restore_owner::transfer_genuine_wait(ticket, handler)
+                && nested_restore_owner::transfer_callback_terminal(ticket).is_none()
+            {
+                let _ = nested_restore_owner::transfer_completed_terminal(ticket);
+            }
+        }
+        nested_restore_owner::defer_retry(ticket);
+        let _ = drain_terminals(handler);
+    }
     if let Some(ticket) = root_maintenance_owner::next_returned_ticket() {
         let _message = crate::ipc_message::SavedMessageBuffer::capture();
         let _durable = allocator::enter_durable();

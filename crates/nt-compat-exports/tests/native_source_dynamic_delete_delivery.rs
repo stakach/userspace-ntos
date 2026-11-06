@@ -21,8 +21,11 @@ fn delete_callback_uses_ready_passive_worker_and_exact_ticket_once() {
     let lane = include_str!("../../../components/ntos-executive/src/hosted_class_irp_lane.rs");
     let types = include_str!("../../../components/ntos-executive/src/hosted_driver_dynamic_type.rs");
     assert!(adapter.contains("next_ready_delete"));
-    assert!(adapter.contains("take_delete"));
+    assert!(adapter.contains("claim_delete"));
+    assert!(lane.contains("take_delete_into"));
     assert!(adapter.contains("complete_delete"));
+    assert!(adapter.contains("completed_delete_ticket"));
+    assert!(lane.contains("restore_pending_ticket"));
     assert!(types.contains("published_image_for_callback"));
     assert!(adapter.contains("ready_for_admission"));
     assert!(adapter.contains("select_callback"));

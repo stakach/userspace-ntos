@@ -50,6 +50,14 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
             DELAY_TIMER_SOURCE_HOSTED_DRIVER,
         ),
         (
+            driver_launch::hosted_driver_dynamic_delete::next_deadline(),
+            DELAY_TIMER_SOURCE_HOSTED_DYNAMIC_DELETE,
+        ),
+        (
+            driver_launch::hosted_provider_export_lane::next_deadline(),
+            DELAY_TIMER_SOURCE_HOSTED_PROVIDER_STARTUP_RESTORE,
+        ),
+        (
             driver_launch::hosted_acpi_pci_route_recovery_next_deadline(now.monotonic_100ns),
             DELAY_TIMER_SOURCE_ACPI_PCI_ROUTE_RECOVERY,
         ),

@@ -20,6 +20,14 @@ pub(crate) struct NativeTerminal {
 }
 
 impl NativeTerminal {
+    pub(super) fn nested_callback(
+        callback: component_callback_transfer::CallbackTransfer,
+    ) -> Self {
+        let mut payload = Self::blocked(0);
+        payload.callback = Some(callback);
+        payload
+    }
+
     pub(super) const fn completed(dispatch: win32k_glue::CompletedWin32kDispatch) -> Self {
         Self {
             returned: NativeReturn::Hosted(dispatch),
@@ -166,14 +174,13 @@ static DELIVERY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static RETIRED: AtomicU64 = AtomicU64::new(0);
 static CALLBACK_HANDOFFS: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum SharedReturn {
     Complete,
     ContinueAndRepark(u64),
     Repark(u64),
 }
 
-#[derive(Clone, Copy)]
 struct PendingSharedReturn {
     route: PeerRoute,
     dispatch: LaneDispatchIdentity,
@@ -182,13 +189,41 @@ struct PendingSharedReturn {
     entered: bool,
     ready: bool,
     maintenance_ticket: Option<root_maintenance_owner::RootMaintenanceTicket>,
+    nested_ticket: Option<nested_restore_owner::NestedRestoreOwnerTicket>,
+    continue_repark: Option<nt_component_suspension::SharedContinueRepark>,
+}
+
+impl PendingSharedReturn {
+    /// Prepare the two-stage owner before semantic retirement can transfer its authority here.
+    fn new(
+        route: PeerRoute,
+        dispatch: LaneDispatchIdentity,
+        reply: u64,
+        action: SharedReturn,
+        ready: bool,
+        maintenance_ticket: Option<root_maintenance_owner::RootMaintenanceTicket>,
+        nested_ticket: Option<nested_restore_owner::NestedRestoreOwnerTicket>,
+    ) -> Option<Self> {
+        let continue_repark = match action {
+            SharedReturn::ContinueAndRepark(token) => Some(
+                nt_component_suspension::SharedContinueRepark::new(
+                    route, dispatch, reply, token,
+                ).ok()?,
+            ),
+            _ => None,
+        };
+        Some(Self {
+            route, dispatch, reply, action, entered: false, ready,
+            maintenance_ticket, nested_ticket, continue_repark,
+        })
+    }
 }
 
 // A successful semantic retirement transfers the exact physical dispatch to this row. A
 // refused final Call leaves it ready; an entered but failed completion remains owned and is never
 // replayed. Index alone is not authority: every attempt also carries its lane generation/epoch.
 static mut PENDING_SHARED_RETURNS: [Option<PendingSharedReturn>; COMPONENT_EXECUTION_LANE_CAPACITY] =
-    [None; COMPONENT_EXECUTION_LANE_CAPACITY];
+    [const { None }; COMPONENT_EXECUTION_LANE_CAPACITY];
 // Local Reply retirement may succeed before a later shared semantic finish refuses. Retain the
 // exact terminal identity so a retry cannot release the same Reply twice.
 static mut SHARED_RETIRED_REPLIES: [Option<TerminalIdentity>; COMPONENT_EXECUTION_LANE_CAPACITY] =
@@ -209,10 +244,33 @@ unsafe fn reserve_root_maintenance_shared_return(
     {
         return false;
     }
-    (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index] = Some(PendingSharedReturn {
-        route, dispatch, reply, action,
-        entered: false, ready: false, maintenance_ticket: Some(ticket),
-    });
+    let Some(pending) = PendingSharedReturn::new(
+        route, dispatch, reply, action, false, Some(ticket), None,
+    ) else { return false; };
+    (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index] = Some(pending);
+    true
+}
+
+unsafe fn reserve_nested_restore_shared_return(
+    identity: TerminalIdentity,
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    action: SharedReturn,
+    ticket: nested_restore_owner::NestedRestoreOwnerTicket,
+) -> bool {
+    let index = identity.lane().index as usize;
+    let key = ticket.key();
+    if index >= COMPONENT_EXECUTION_LANE_CAPACITY
+        || key.scope().route() != route || key.scope().dispatch() != dispatch
+        || key.parent_reply() != reply
+        || !nested_restore_owner::can_retire_terminal(ticket, identity)
+        || (&*core::ptr::addr_of!(PENDING_SHARED_RETURNS))[index].is_some()
+    { return false; }
+    let Some(pending) = PendingSharedReturn::new(
+        route, dispatch, reply, action, false, None, Some(ticket),
+    ) else { return false; };
+    (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index] = Some(pending);
     true
 }
 
@@ -221,8 +279,8 @@ unsafe fn publish_root_maintenance_shared_return(
     ticket: root_maintenance_owner::RootMaintenanceTicket,
 ) -> bool {
     let index = identity.lane().index as usize;
-    let Some(mut pending) = (&*core::ptr::addr_of!(PENDING_SHARED_RETURNS))
-        .get(index).copied().flatten() else { return false; };
+    let Some(pending) = (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))
+        .get_mut(index).and_then(Option::as_mut) else { return false; };
     if pending.ready || pending.entered || pending.maintenance_ticket != Some(ticket)
         || pending.route != ticket.route || pending.dispatch != ticket.dispatch
         || pending.reply != ticket.reply
@@ -231,70 +289,130 @@ unsafe fn publish_root_maintenance_shared_return(
     }
     pending.ready = true;
     pending.maintenance_ticket = None;
-    (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index] = Some(pending);
     true
 }
 
 pub(super) unsafe fn drain_shared_returns() -> u64 {
     let mut completed = 0;
     for index in 0..COMPONENT_EXECUTION_LANE_CAPACITY {
-        let Some(mut pending) = (&*core::ptr::addr_of!(PENDING_SHARED_RETURNS))[index] else { continue };
+        let Some(pending) = (&*core::ptr::addr_of!(PENDING_SHARED_RETURNS))[index].as_ref()
+        else { continue };
         if !pending.ready {
-            let Some(ticket) = pending.maintenance_ticket else { continue; };
-            // Pure terminal retirement may already have succeeded when a physical owner
-            // retirement refused. Keep this reservation fenced until the exact row retires.
-            if root_maintenance_owner::retire(ticket).is_none() { continue; }
+            let maintenance_ticket = pending.maintenance_ticket;
+            let nested_ticket = pending.nested_ticket;
+            if let Some(ticket) = maintenance_ticket {
+                // Pure terminal retirement may already have succeeded when a physical owner
+                // retirement refused. Keep this reservation fenced until the exact row retires.
+                if root_maintenance_owner::retire(ticket).is_none() { continue; }
+            } else if let Some(ticket) = nested_ticket {
+                if !nested_restore_owner::retire_terminal(ticket) { continue; }
+                (&mut *core::ptr::addr_of_mut!(SHARED_RETIRED_REPLIES))[index] = None;
+            } else { continue; }
+            let Some(pending) = (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index]
+                .as_mut() else { continue };
+            if pending.ready || pending.maintenance_ticket != maintenance_ticket
+                || pending.nested_ticket != nested_ticket
+            { continue; }
             pending.ready = true;
             pending.maintenance_ticket = None;
-            (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index] = Some(pending);
+            pending.nested_ticket = None;
         }
-        if pending.entered {
-            continue;
-        }
-        let needs_call = !matches!(pending.action, SharedReturn::Repark(_));
+        let Some(pending) = (&*core::ptr::addr_of!(PENDING_SHARED_RETURNS))[index].as_ref()
+        else { continue };
+        let (route, dispatch, reply, action, entered, continue_phase) = (
+            pending.route, pending.dispatch, pending.reply, pending.action, pending.entered,
+            pending.continue_repark.as_ref().map(|owner| owner.phase()),
+        );
+        if entered { continue; }
+        let needs_call = matches!(action, SharedReturn::Complete)
+            || matches!(continue_phase, Some(nt_component_suspension::ContinueReparkPhase::Ready));
         if needs_call {
-            let ready = spawn_hosts::shared_ingress::owner::runtime::next_message(pending.route)
+            let ready = spawn_hosts::shared_ingress::owner::runtime::next_message(route)
                 .ok()
                 .flatten()
                 .is_some_and(|(_, message)| {
-                    message.badge() == pending.route.badge()
+                    message.badge() == route.badge()
                         && message.info() == win32k_subsystem::W32_DISPATCH_LABEL << 12
                 });
-            if !ready {
-                continue;
-            }
+            if !ready { continue; }
         }
-        pending.entered = true;
-        (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index] = Some(pending);
-        let result = match pending.action {
+        let result = match action {
             SharedReturn::Complete => {
+                // Publish the entered fence before the native completion Call.
+                let Some(pending) = (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index]
+                    .as_mut() else { continue };
+                pending.entered = true;
                 spawn_hosts::shared_ingress::owner::runtime::complete(
-                    pending.route, pending.dispatch, pending.reply,
+                    route, dispatch, reply,
                     win32k_subsystem::W32_DISPATCH_LABEL,
                 ).is_ok()
             }
             SharedReturn::ContinueAndRepark(token) => {
-                spawn_hosts::shared_ingress::owner::runtime::continue_after_subcall(
-                    pending.route, pending.dispatch, pending.reply,
-                    win32k_subsystem::W32_DISPATCH_LABEL,
-                ).is_ok()
-                    && crate::service_sec_image::repark_external_component_execution_lane(
-                        pending.dispatch.lane(), token,
-                    )
+                use nt_component_suspension::{ContinueReparkOutcome, ContinueReparkPhase};
+                if continue_phase == Some(ContinueReparkPhase::Ready) {
+                    // The owner enters before the Call. An uncertain native result can never
+                    // retry this branch, while an acknowledged result may retry only repark.
+                    let attempt = (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index]
+                        .as_mut().and_then(|pending| pending.continue_repark.as_mut())
+                        .and_then(|owner| owner.begin_continue(route, dispatch, reply, token).ok());
+                    let Some(attempt) = attempt else { continue };
+                    let outcome = if spawn_hosts::shared_ingress::owner::runtime::continue_after_subcall(
+                        route, dispatch, reply, win32k_subsystem::W32_DISPATCH_LABEL,
+                    ).is_ok() {
+                        ContinueReparkOutcome::Acknowledged
+                    } else {
+                        ContinueReparkOutcome::Indeterminate
+                    };
+                    let recorded = (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index]
+                        .as_mut().and_then(|pending| pending.continue_repark.as_mut())
+                        .is_some_and(|owner| owner.record_continue(attempt, outcome).is_ok());
+                    if !recorded || outcome == ContinueReparkOutcome::Indeterminate {
+                        report_retained_failure(dispatch.lane(), b"shared-continue",
+                            None, None, false);
+                        continue;
+                    }
+                } else if continue_phase != Some(ContinueReparkPhase::ContinueAcknowledged) {
+                    continue;
+                }
+                (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index]
+                    .as_mut().and_then(|pending| pending.continue_repark.as_mut())
+                    .is_some_and(|owner| owner.repark_exact(
+                        route, dispatch, reply, token,
+                        &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS),
+                    ).is_ok())
             }
             SharedReturn::Repark(token) => {
                 crate::service_sec_image::repark_external_component_execution_lane(
-                    pending.dispatch.lane(), token,
+                    dispatch.lane(), token,
                 )
             }
         };
-        if result {
+        // A native Call may reenter the service. Never retire a replacement row merely because
+        // it reused the same lane index while this exact return was entered.
+        let exact_row = result && (&*core::ptr::addr_of!(PENDING_SHARED_RETURNS))[index]
+            .as_ref().is_some_and(|pending| {
+                pending.ready && pending.route == route && pending.dispatch == dispatch
+                    && pending.reply == reply && pending.action == action
+                    && match action {
+                        SharedReturn::Complete => pending.entered,
+                        SharedReturn::ContinueAndRepark(_) => pending.continue_repark.as_ref()
+                            .is_some_and(|owner| owner.phase()
+                                == nt_component_suspension::ContinueReparkPhase::Done),
+                        SharedReturn::Repark(_) => true,
+                    }
+            });
+        if exact_row {
             (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index] = None;
             completed += 1;
         } else {
+            let failure: &[u8] = if result {
+                b"shared-return-owner-changed"
+            } else {
+                b"shared-return"
+            };
             report_retained_failure(
-                pending.dispatch.lane(), b"shared-return", None, None,
-                matches!(pending.action, SharedReturn::Repark(_)),
+                dispatch.lane(), failure, None, None,
+                matches!(action, SharedReturn::Repark(_)),
             );
         }
     }
@@ -645,7 +763,16 @@ pub(super) unsafe fn drain(
                     lanes.peer_route(identity.lane()).ok().flatten().and_then(|route| {
                         let dispatch = lanes.active_dispatch_identity(identity.lane()).ok().flatten()?;
                         let action = if let Some(token) = identity.external_token() {
-                            SharedReturn::Repark(token)
+                            // A completed nested receive must first return its physical
+                            // subcall. A newly yielded callback has no completed subcall here.
+                            if matches!(continuation.pending,
+                                PendingComponentDispatch::NestedRestore(_))
+                                && matches!(payload.returned, NativeReturn::Hosted(_))
+                            {
+                                SharedReturn::ContinueAndRepark(token)
+                            } else {
+                                SharedReturn::Repark(token)
+                            }
                         } else if !matches!(payload.returned, NativeReturn::Hosted(_)) {
                             return None;
                         } else if let Some(token) = lanes.external_top(identity.lane()).ok().flatten() {
@@ -709,6 +836,10 @@ pub(super) unsafe fn drain(
                         root_maintenance_owner::ticket_for(pending),
                     _ => None,
                 };
+                let nested_ticket = match continuation.pending {
+                    PendingComponentDispatch::NestedRestore(pending) => Some(pending.ticket),
+                    _ => None,
+                };
                 if matches!(continuation.pending, PendingComponentDispatch::RootMaintenance(_))
                     && (!matches!(shared, Some((_, _, SharedReturn::Complete | SharedReturn::Repark(_))))
                         || !maintenance_ticket.is_some_and(|ticket| root_maintenance_owner::can_retire(ticket)))
@@ -720,6 +851,26 @@ pub(super) unsafe fn drain(
                 }
                 if let (Some(ticket), Some((route, dispatch, action))) = (maintenance_ticket, shared) {
                     if !reserve_root_maintenance_shared_return(
+                        identity, route, dispatch, reply_object, action, ticket,
+                    ) {
+                        cursor = Some(order);
+                        continue;
+                    }
+                }
+                if matches!(continuation.pending, PendingComponentDispatch::NestedRestore(_))
+                    && (!matches!(shared, Some((_, _, SharedReturn::Complete
+                        | SharedReturn::ContinueAndRepark(_) | SharedReturn::Repark(_))))
+                        || !nested_ticket.is_some_and(|ticket| {
+                            nested_restore_owner::can_retire_terminal(ticket, identity)
+                        }))
+                {
+                    report_retained_failure(identity.lane(), b"nested-owner-missing",
+                        None, Some(phase), callback_owned);
+                    cursor = Some(order);
+                    continue;
+                }
+                if let (Some(ticket), Some((route, dispatch, action))) = (nested_ticket, shared) {
+                    if !reserve_nested_restore_shared_return(
                         identity, route, dispatch, reply_object, action, ticket,
                     ) {
                         cursor = Some(order);
@@ -747,21 +898,51 @@ pub(super) unsafe fn drain(
                                 false
                             }
                         }
-                    } else {
-                    match (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                        .finish_shared_terminal(route, dispatch, identity, reply_object, local)
-                    {
-                        Ok(Some(_retired)) => {
-                            let index = identity.lane().index as usize;
-                            (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index] =
-                                Some(PendingSharedReturn {
-                                    route, dispatch, reply: reply_object, action,
-                                    entered: false, ready: true, maintenance_ticket: None,
-                                });
-                            (&mut *core::ptr::addr_of_mut!(SHARED_RETIRED_REPLIES))[index] = None;
-                            true
+                    } else if let Some(ticket) = nested_ticket {
+                        match (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                            .finish_shared_nested_restore_terminal(
+                                route, dispatch, identity, reply_object, local,
+                            ) {
+                            Ok(Some(_retired)) => {
+                                let owner_retired = nested_restore_owner::retire_terminal(ticket);
+                                if owner_retired {
+                                    let index = identity.lane().index as usize;
+                                    if let Some(pending) =
+                                        (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index]
+                                            .as_mut()
+                                    {
+                                        pending.ready = true;
+                                        pending.nested_ticket = None;
+                                    }
+                                    (&mut *core::ptr::addr_of_mut!(SHARED_RETIRED_REPLIES))
+                                        [identity.lane().index as usize] = None;
+                                }
+                                owner_retired
+                            }
+                            Ok(None) | Err(_) => {
+                                (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))
+                                    [identity.lane().index as usize] = None;
+                                false
+                            }
                         }
-                        Ok(None) | Err(_) => false,
+                    } else {
+                    if let Some(pending) = PendingSharedReturn::new(
+                        route, dispatch, reply_object, action, true, None, None,
+                    ) {
+                        match (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                            .finish_shared_terminal(route, dispatch, identity, reply_object, local)
+                        {
+                            Ok(Some(_retired)) => {
+                                let index = identity.lane().index as usize;
+                                (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index] =
+                                    Some(pending);
+                                (&mut *core::ptr::addr_of_mut!(SHARED_RETIRED_REPLIES))[index] = None;
+                                true
+                            }
+                            Ok(None) | Err(_) => false,
+                        }
+                    } else {
+                        false
                     }
                     }
                 } else {

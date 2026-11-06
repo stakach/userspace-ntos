@@ -3114,6 +3114,8 @@ const DELAY_TIMER_SOURCE_MOUNTED_NATIVE_BLOCK: u64 = 25;
 const DELAY_TIMER_SOURCE_PROCESS_IMAGE_SNAPSHOT: u64 = 26;
 const DELAY_TIMER_SOURCE_PROVIDER_SECTION: u64 = 27;
 const DELAY_TIMER_SOURCE_GDI_ROUTED_IMAGE: u64 = 28;
+const DELAY_TIMER_SOURCE_HOSTED_DYNAMIC_DELETE: u64 = 29;
+const DELAY_TIMER_SOURCE_HOSTED_PROVIDER_STARTUP_RESTORE: u64 = 30;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -6714,7 +6716,7 @@ pub(crate) static DRAIN_DUE_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SCHED_RUNTIME_READ_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to independently timed wake paths;
 /// one of them owns the whole boot, so they are timed individually.
-pub(crate) const SUBDRAIN_N: usize = 26;
+pub(crate) const SUBDRAIN_N: usize = 28;
 pub(crate) static SUBDRAIN_TICKS: [AtomicU64; SUBDRAIN_N] =
     [const { AtomicU64::new(0) }; SUBDRAIN_N];
 pub(crate) static SUBDRAIN_WOKEN: [AtomicU64; SUBDRAIN_N] =
@@ -17534,6 +17536,8 @@ unsafe fn user_timer_wake_due(handler: &mut ExecNtHandler, now: nt_time::TimeSna
 /// Publish retry readiness only; cleanup and native execution stay at their outer boundaries.
 unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
     subdrain!(25, driver_launch::mounted_native_block_wake_due(now_100ns))
+        + subdrain!(26, driver_launch::hosted_driver_dynamic_delete::wake_due(now_100ns))
+        + subdrain!(27, driver_launch::hosted_provider_export_lane::wake_due(now_100ns))
         + subdrain!(14, cm_key_ownership::wake_due(now_100ns))
         + subdrain!(15, cm_snapshot_ownership::wake_due(now_100ns))
         + subdrain!(16, driver_launch::hosted_file_retry_wake_due(now_100ns))

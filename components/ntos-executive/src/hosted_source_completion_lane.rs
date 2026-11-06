@@ -11,6 +11,7 @@ use nt_io_manager::source_irp_ledger::SourceIrpAllocation;
 use nt_io_manager::source_completion_preparation::{
     admit_existing, ExistingLanePhase, ExistingLanePreparation,
 };
+use nt_component_suspension::{NestedRestoreChain, NestedRestoreResultKey};
 
 const LABEL: u64 = 0x7bc;
 const SELECTOR: u64 = u64::MAX - LABEL;
@@ -32,6 +33,7 @@ enum Phase {
     Prepared,
     Entered,
     Suspended,
+    NestedRestore,
     Completed,
     Uncertain,
     Retiring,
@@ -53,6 +55,21 @@ struct SourceCompletionLane {
     pump: Option<crate::spawn_hosts::PumpResult>,
     dispatch: Option<nt_component_suspension::LaneDispatchIdentity>,
     startup_dispatch: Option<nt_component_suspension::LaneDispatchIdentity>,
+    nested_restore: Option<SourcePendingRestore>,
+}
+
+#[derive(Clone, Copy)]
+enum SourceResumeResult {
+    Pump(crate::spawn_hosts::PumpResult),
+    NotReady,
+    Failed,
+}
+
+struct SourcePendingRestore {
+    ticket: runtime::nested::NestedRestoreTicket,
+    key: NestedRestoreResultKey,
+    chain: NestedRestoreChain<SourceResumeResult>,
+    retryable: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -249,6 +266,7 @@ pub(super) unsafe fn prepare(
             pump: None,
             dispatch: None,
             startup_dispatch: None,
+            nested_restore: None,
         });
         index
     };
@@ -576,6 +594,15 @@ pub(super) unsafe fn dispatch(
     if phase == Phase::Suspended {
         return SourceCompletionDispatch::Suspended;
     }
+    if phase == Phase::NestedRestore {
+        return if (&*core::ptr::addr_of!(LANES))[index]
+            .nested_restore.as_ref().is_some_and(|pending| pending.retryable)
+        {
+            SourceCompletionDispatch::Suspended
+        } else {
+            SourceCompletionDispatch::Uncertain
+        };
+    }
     if phase == Phase::Entered || phase == Phase::Uncertain {
         return SourceCompletionDispatch::Uncertain;
     }
@@ -611,8 +638,18 @@ pub(super) unsafe fn dispatch(
         row.command = Some(command);
         row.phase = Phase::Entered;
     }
-    let pump = component_scheduler::hosted_component_pump_with_caller(&channel, caller);
-    finish_slice(index, pump)
+    match component_scheduler::hosted_component_pump_with_caller_retained(&channel, caller) {
+        component_scheduler::HostedPumpRestore::Restored(pump) => finish_slice(index, pump),
+        component_scheduler::HostedPumpRestore::Retained {
+            result, key, ticket, retryable,
+        } => retain_parent_result(index, ticket, key, SourceResumeResult::Pump(result), retryable),
+        component_scheduler::HostedPumpRestore::Unattributed(result) => {
+            let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+            row.pump = Some(result);
+            row.phase = Phase::Uncertain;
+            SourceCompletionDispatch::Uncertain
+        }
+    }
 }
 
 unsafe fn finish_slice(
@@ -652,6 +689,86 @@ unsafe fn finish_slice(
     SourceCompletionDispatch::Completed(outcome)
 }
 
+unsafe fn finish_resume_result(index: usize, result: SourceResumeResult) -> SourceCompletionDispatch {
+    match result {
+        SourceResumeResult::Pump(pump) => finish_slice(index, pump),
+        SourceResumeResult::NotReady => {
+            (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Suspended;
+            SourceCompletionDispatch::Suspended
+        }
+        SourceResumeResult::Failed => {
+            (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;
+            SourceCompletionDispatch::Uncertain
+        }
+    }
+}
+
+unsafe fn retain_parent_result(
+    index: usize,
+    ticket: runtime::nested::NestedRestoreTicket,
+    key: NestedRestoreResultKey,
+    result: SourceResumeResult,
+    retryable: bool,
+) -> SourceCompletionDispatch {
+    let Ok(mut chain) = NestedRestoreChain::retain(key, None, result) else {
+        (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;
+        return SourceCompletionDispatch::Uncertain;
+    };
+    if chain.begin_inner(key).is_err() {
+        (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;
+        return SourceCompletionDispatch::Uncertain;
+    }
+    if retryable {
+        let _ = chain.refuse_inner_no_effects(key);
+    } else {
+        let _ = chain.quarantine_inner(key);
+    }
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    row.nested_restore = Some(SourcePendingRestore { ticket, key, chain, retryable });
+    row.phase = Phase::NestedRestore;
+    if retryable { SourceCompletionDispatch::Suspended } else { SourceCompletionDispatch::Uncertain }
+}
+
+unsafe fn retry_parent_restore(index: usize) -> SourceCompletionDispatch {
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    let Some(pending) = row.nested_restore.as_mut() else {
+        row.phase = Phase::Uncertain;
+        return SourceCompletionDispatch::Uncertain;
+    };
+    if !pending.retryable || pending.chain.begin_inner(pending.key).is_err() {
+        row.phase = Phase::Uncertain;
+        return SourceCompletionDispatch::Uncertain;
+    }
+    let ticket = pending.ticket;
+    let key = pending.key;
+    if runtime::nested::restore_pending_ticket(ticket).is_err() {
+        let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+        let pending = row.nested_restore.as_mut().unwrap();
+        if runtime::nested::pending_ticket(ticket) {
+            let _ = pending.chain.refuse_inner_no_effects(key);
+            return SourceCompletionDispatch::Suspended;
+        }
+        let _ = pending.chain.quarantine_inner(key);
+        pending.retryable = false;
+        return SourceCompletionDispatch::Uncertain;
+    }
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    let mut pending = row.nested_restore.take().unwrap();
+    if pending.chain.acknowledge_inner(key).is_err() {
+        row.nested_restore = Some(pending);
+        row.phase = Phase::Uncertain;
+        return SourceCompletionDispatch::Uncertain;
+    }
+    match pending.chain.take(key, None) {
+        Ok(result) => finish_resume_result(index, result),
+        Err(_) => {
+            row.nested_restore = Some(pending);
+            row.phase = Phase::Uncertain;
+            SourceCompletionDispatch::Uncertain
+        }
+    }
+}
+
 pub(super) unsafe fn acknowledge(instance_index: usize, command: SourceCompletionCommand) -> bool {
     let Some(index) = row_for(instance_index, command) else {
         return false;
@@ -664,6 +781,7 @@ pub(super) unsafe fn acknowledge(instance_index: usize, command: SourceCompletio
     row.outcome = None;
     row.pump = None;
     row.dispatch = None;
+    row.nested_restore = None;
     row.phase = Phase::Ready;
     true
 }
@@ -696,6 +814,11 @@ pub(super) unsafe fn continuation_ready(
         return false;
     };
     let row = &(&*core::ptr::addr_of!(LANES))[index];
+    if row.phase == Phase::NestedRestore {
+        return row.nested_restore.as_ref().is_some_and(|pending| {
+            pending.retryable && runtime::nested::pending_ticket(pending.ticket)
+        });
+    }
     if row.phase != Phase::Suspended {
         return false;
     }
@@ -722,6 +845,9 @@ pub(super) unsafe fn poll(
     };
     if phase == Phase::Completed {
         return SourceCompletionDispatch::Completed(outcome.unwrap());
+    }
+    if phase == Phase::NestedRestore {
+        return retry_parent_restore(index);
     }
     if phase == Phase::Uncertain || phase == Phase::Entered {
         return SourceCompletionDispatch::Uncertain;
@@ -768,18 +894,59 @@ pub(super) unsafe fn poll(
         }
         Ok(Some(pump))
     })();
-    if runtime::nested::restore(&mut parent).is_err() {
+    let result = match resumed {
+        Ok(Some(pump)) => SourceResumeResult::Pump(pump),
+        Ok(None) => SourceResumeResult::NotReady,
+        Err(()) => SourceResumeResult::Failed,
+    };
+    let Some(handle) = parent.as_ref() else {
+        return finish_resume_result(index, result);
+    };
+    let ticket = handle.ticket();
+    let Some(key) = runtime::nested::result_key(handle) else {
+        let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+        if let SourceResumeResult::Pump(pump) = result { row.pump = Some(pump); }
+        row.phase = Phase::Uncertain;
+        return SourceCompletionDispatch::Uncertain;
+    };
+    let Ok(mut chain) = NestedRestoreChain::retain(key, None, result) else {
+        (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;
+        return SourceCompletionDispatch::Uncertain;
+    };
+    if chain.begin_inner(key).is_err() {
         (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;
         return SourceCompletionDispatch::Uncertain;
     }
-    match resumed {
-        Ok(Some(pump)) => finish_slice(index, pump),
-        Ok(None) => {
-            (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Suspended;
-            SourceCompletionDispatch::Suspended
+    // Own the result and exact retry selector before entering the physical restore.
+    {
+        let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+        row.nested_restore = Some(SourcePendingRestore { ticket, key, chain, retryable: false });
+        row.phase = Phase::NestedRestore;
+    }
+    if runtime::nested::restore(&mut parent).is_err() {
+        let retryable = runtime::nested::pending_ticket(ticket);
+        let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+        let pending = row.nested_restore.as_mut().unwrap();
+        pending.retryable = retryable;
+        if retryable {
+            let _ = pending.chain.refuse_inner_no_effects(key);
+            return SourceCompletionDispatch::Suspended;
         }
-        Err(()) => {
-            (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;
+        let _ = pending.chain.quarantine_inner(key);
+        return SourceCompletionDispatch::Uncertain;
+    }
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    let mut pending = row.nested_restore.take().unwrap();
+    if pending.chain.acknowledge_inner(key).is_err() {
+        row.nested_restore = Some(pending);
+        row.phase = Phase::Uncertain;
+        return SourceCompletionDispatch::Uncertain;
+    }
+    match pending.chain.take(key, None) {
+        Ok(result) => finish_resume_result(index, result),
+        Err(_) => {
+            row.nested_restore = Some(pending);
+            row.phase = Phase::Uncertain;
             SourceCompletionDispatch::Uncertain
         }
     }

@@ -18,7 +18,9 @@ pub(crate) use receive::{prepare_receive_yield, prepare_service_wait_yield,
     resume_suspended_receive_component, receive_continuation_is_current,
     resume_suspended_service_wait_component, service_wait_continuation_is_current,
     trace_receive_phase, ReceiveFaultCapture, ReceivePumpCompletion, ServiceWaitPumpCompletion,
-    RootMaintenancePumpCompletion, resume_suspended_root_maintenance_component};
+    RootMaintenancePumpCompletion, resume_suspended_root_maintenance_component,
+    resume_suspended_nested_restore_receive, NestedRestorePumpCompletion,
+    settle_nested_restore_result};
 pub(crate) use pending_dispatch::{
     take_pending_lpc_wait_dispatch, take_pending_provider_wait_dispatch, LpcWaitPumpCompletion,
     PendingLpcWaitDispatch, PendingProviderWaitDispatch, ProviderWaitPumpCompletion,
@@ -27,6 +29,8 @@ pub(crate) use pending_dispatch::{
     PendingRootMaintenanceDispatch, RootMaintenanceYield, take_pending_root_maintenance_dispatch,
     pending_root_maintenance_dispatch_is_some,
     restore_pending_root_maintenance_dispatch,
+    PendingNestedRestoreDispatch, NestedRestoreOrigin, take_pending_nested_restore_dispatch,
+    restore_pending_nested_restore_dispatch, pending_nested_restore_dispatch_is_some,
 };
 use pending_dispatch::{
     capture_initial_arg_snapshot, capture_lpc_wait_repark, capture_provider_wait_repark,
@@ -37,6 +41,7 @@ use pending_dispatch::{
     RECEIVE_PENDING_DISPATCH,
     SERVICE_WAIT_PENDING_DISPATCH,
     ROOT_MAINTENANCE_PENDING_DISPATCH,
+    NESTED_RESTORE_PENDING_DISPATCH,
 };
 
 pub(crate) const WINDOWPROC_LPARAM_OFFSET: u64 = 0x28;
@@ -2264,6 +2269,23 @@ unsafe fn active_callback_lane_and_token(
     (lane.is_valid() && token != 0).then_some((lane, token))
 }
 
+/// An in-callback nested syscall can lend its existing external token to a real wait. This
+/// observes the redirected callback frame; it does not assert that NtCallbackReturn completed or
+/// manufacture a staged TCB return context.
+pub(crate) unsafe fn in_callback_nested_wait_token_is_current(
+    client: Win32kClientContext,
+    lane: nt_component_suspension::LaneHandle,
+    token: u64,
+) -> bool {
+    if token == 0 || !lane.is_valid() { return false; }
+    let identity = nt_user_callback::ClientThreadIdentity::new(client.pi, client.tid, client.badge);
+    (&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE)).top_for(&identity)
+        .is_some_and(|frame| frame.is_redirected()
+            && frame.dispatch_context().lane == lane
+            && frame.external_token() == token
+            && frame.client_tcb() == client.tcb)
+}
+
 unsafe fn pending_callback_token_on_lane(
     client: Win32kClientContext,
     lane: nt_component_suspension::LaneHandle,
@@ -4076,7 +4098,8 @@ pub(crate) unsafe fn retire_bugchecked_vspace(vspace: u64, reporting_tcb: u64) {
 unsafe fn retire_win32k_on_wall(pr: &crate::spawn_hosts::PumpResult) {
     if pr.completed || pr.callback_suspended || pr.provider_wait_suspended || pr.lpc_wait_suspended
         || pr.receive_yield.is_some() || pr.service_wait_yield.is_some()
-        || pr.maintenance_yield.is_some()
+        || pr.maintenance_yield.is_some() || pr.nested_restore_yield.is_some()
+        || pr.nested_restore_quarantined.is_some()
     {
         return;
     }
@@ -7046,6 +7069,22 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     }
     ch.caps.hosted_receive_yield = request_kind == win32k_subsystem::WIN32K_REQUEST_SSDT
         && !nested_user_callback && outer_callback.is_none();
+    let nested_restore_owner = crate::current_win32k_provider_domain().and_then(|provider| {
+        let owner = nt_component_suspension::SuspensionOwner {
+            provider_domain: provider.domain,
+            provider_generation: provider.generation,
+            dispatch_id,
+            caller: nt_component_suspension::SuspensionCaller::Hosted(
+                nt_component_suspension::SuspensionHostedClient {
+                    client_pi: client.pi,
+                    client_generation: client.generation,
+                    client_tid: client.tid,
+                    client_badge: client.badge,
+                },
+            ),
+        };
+        owner.is_valid().then_some(owner)
+    });
     let mut pr = crate::spawn_hosts::component_pump(&ch);
     if request_kind == win32k_subsystem::WIN32K_REQUEST_PS_PROVIDER && client.pi >= 12 {
         print_str(b"[ps-callout-pump] pi/lane/complete/callback/provider/lpc/receive/service/wall=");
@@ -7088,7 +7127,8 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         })
     } else if pr.provider_wait_suspended || pr.lpc_wait_suspended
         || pr.receive_yield.is_some() || pr.service_wait_yield.is_some()
-        || pr.maintenance_yield.is_some() {
+        || pr.maintenance_yield.is_some() || pr.nested_restore_yield.is_some()
+        || pr.nested_restore_quarantined.is_some() {
         true
     } else if pr.completed {
         if let Some((outer_lane, token)) = outer_callback {
@@ -7157,6 +7197,28 @@ unsafe fn win32k_dispatch_wide_observed_inner(
                 },
             }));
     }
+    if pr.nested_restore_yield.is_some() || pr.nested_restore_quarantined.is_some() {
+        assert!((*core::ptr::addr_of!(NESTED_RESTORE_PENDING_DISPATCH)).is_none(),
+            "one root dispatch may publish only one retained nested restore");
+        let (arg_snapshot_len, arg_snapshot) = capture_initial_arg_snapshot(ssn, completion_args);
+        core::ptr::write(core::ptr::addr_of_mut!(NESTED_RESTORE_PENDING_DISPATCH),
+            Some(PendingNestedRestoreDispatch {
+                snapshot: SuspendedPumpSnapshot {
+                    pump: pr, channel: ch,
+                    dispatch: UserCallbackDispatchContext { lane, dispatch_id, ssn,
+                        args: completion_args, caller_sp, output_stage, paint_output },
+                    shared_resume: capture_shared_resume_snapshot(
+                        UserCallbackDispatchContext { lane, dispatch_id, ssn,
+                            args: completion_args, caller_sp, output_stage, paint_output }, client),
+                    client, callback_token: outer_callback.map(|(_, token)| token),
+                    arg_snapshot_len, arg_snapshot,
+                },
+                origin: NestedRestoreOrigin {
+                    nested_user_callback, outer_callback, registered_client,
+                    owner: nested_restore_owner,
+                },
+            }));
+    }
     if pr.callback_suspended {
         capture_suspended_published_win32k_context(callback_client);
     }
@@ -7220,10 +7282,14 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             || pr.lpc_wait_suspended
             || pr.receive_yield.is_some()
             || pr.service_wait_yield.is_some()
-            || pr.maintenance_yield.is_some();
+            || pr.maintenance_yield.is_some()
+            || pr.nested_restore_yield.is_some()
+            || pr.nested_restore_quarantined.is_some();
     }
     if nested_user_callback {
-        if pr.callback_suspended || pr.provider_wait_suspended || pr.lpc_wait_suspended {
+        if pr.callback_suspended || pr.provider_wait_suspended || pr.lpc_wait_suspended
+            || pr.nested_restore_yield.is_some() || pr.nested_restore_quarantined.is_some()
+        {
             return (pr.result, false);
         }
         if !pr.completed || !complete_nested_user_callback_dispatch(client, dispatch_id) {
@@ -7246,6 +7312,8 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         && pr.receive_yield.is_none()
         && pr.service_wait_yield.is_none()
         && pr.maintenance_yield.is_none()
+        && pr.nested_restore_yield.is_none()
+        && pr.nested_restore_quarantined.is_none()
     {
         unregister_win32k_dispatch_client(
             dispatch_id,

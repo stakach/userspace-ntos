@@ -14,13 +14,14 @@ pub(crate) struct PhysicalExecutionHold {
     route: PeerRoute,
     dispatch: LaneDispatchIdentity,
     hold: Option<u64>,
+    projection_reservation: Option<crate::driver_launch::driver_thread_projection::HoldReservation>,
     acquire: PhysicalExecutionAcquire<PeerRoute, LaneDispatchIdentity>,
     restore: PhysicalExecutionRestore<PeerRoute, LaneDispatchIdentity>,
 }
 
 impl PhysicalExecutionHold {
     pub(crate) const fn new(route: PeerRoute, dispatch: LaneDispatchIdentity) -> Self {
-        Self { route, dispatch, hold: None,
+        Self { route, dispatch, hold: None, projection_reservation: None,
             acquire: PhysicalExecutionAcquire::new(route, dispatch),
             restore: PhysicalExecutionRestore::new(route, dispatch) }
     }
@@ -34,6 +35,11 @@ impl PhysicalExecutionHold {
 
     pub(crate) fn acquire_step(&self) -> Result<AcquireStep, Error> {
         self.acquire.next(self.route, self.dispatch).map_err(|_| Error::Admission)
+    }
+
+    pub(crate) fn acquire_has_no_effects(&self) -> bool {
+        self.hold.is_none() && self.projection_reservation.is_none()
+            && self.acquire_step().is_ok_and(|step| step == AcquireStep::Ready)
     }
 
     pub(crate) fn restore_step(&self) -> Result<RestoreStep, Error> {
@@ -50,16 +56,28 @@ impl PhysicalExecutionHold {
     }
 
     /// The owner row must exist before this call. Record possible seL4 entry first and never
-    /// reacquire after a malformed result. A certified kernel refusal and projection preflight
-    /// refusal can retry the same exact row without replaying an entered effect.
+    /// reacquire after a malformed result. Projection admission happens before the native effect;
+    /// its exact move-only reservation remains in this owner until the result is settled.
     pub(crate) unsafe fn acquire(&mut self) -> Result<(), Error> {
         if self.restore_step()? != RestoreStep::Canonical {
             return Err(Error::Admission);
         }
         match self.acquire_step()? {
             AcquireStep::Ready => {
-                self.acquire.enter(self.route, self.dispatch)
-                    .map_err(|_| Error::Admission)?;
+                self.projection_reservation =
+                    crate::driver_launch::driver_thread_projection::prepare_hold(
+                        self.route, self.dispatch,
+                    ).map_err(|_| Error::Admission)?;
+                if self.acquire.enter(self.route, self.dispatch).is_err() {
+                    if let Some(reservation) = self.projection_reservation.take() {
+                        if let Err((_, reservation)) =
+                            crate::driver_launch::driver_thread_projection::cancel_hold_no_effects(reservation)
+                        {
+                            self.projection_reservation = Some(reservation);
+                        }
+                    }
+                    return Err(Error::Admission);
+                }
                 match sel4_rt::execution_hold::acquire(self.route.identity().executor) {
                     Ok(hold) => {
                         self.hold = Some(hold);
@@ -69,6 +87,14 @@ impl PhysicalExecutionHold {
                     // The rust-micro acquire invocation returns kernel errors only before it
                     // allocates a generation or sets execution_hold. This is a no-effects refusal.
                     Err(sel4_rt::execution_hold::Error::Kernel(_)) => {
+                        if let Some(reservation) = self.projection_reservation.take() {
+                            if let Err((_, reservation)) =
+                                crate::driver_launch::driver_thread_projection::cancel_hold_no_effects(reservation)
+                            {
+                                self.projection_reservation = Some(reservation);
+                                return Err(Error::Admission);
+                            }
+                        }
                         self.acquire.refuse_no_effects(self.route, self.dispatch)
                             .map_err(|_| Error::Admission)?;
                         return Err(Error::Admission);
@@ -81,18 +107,18 @@ impl PhysicalExecutionHold {
             AcquireStep::Held if self.hold.is_some() => {}
             _ => return Err(Error::Admission),
         }
-        self.acquire.begin_projection(self.route, self.dispatch)
-            .map_err(|_| Error::Admission)?;
-        match crate::driver_launch::driver_thread_projection::hold(self.route, self.dispatch) {
-            Ok(()) => self.acquire.acknowledge_projection(self.route, self.dispatch)
-                .map_err(|_| Error::Admission),
-            Err(_) => {
-                // Projection hold checks identity and phase before mutating its row.
-                self.acquire.refuse_projection_no_effects(self.route, self.dispatch)
-                    .map_err(|_| Error::Admission)?;
-                Err(Error::Admission)
+        if let Some(reservation) = self.projection_reservation.take() {
+            if let Err((_, reservation)) =
+                crate::driver_launch::driver_thread_projection::acknowledge_hold(reservation)
+            {
+                self.projection_reservation = Some(reservation);
+                return Err(Error::Admission);
             }
         }
+        self.acquire.begin_projection(self.route, self.dispatch)
+            .map_err(|_| Error::Admission)?;
+        self.acquire.acknowledge_projection(self.route, self.dispatch)
+            .map_err(|_| Error::Admission)
     }
 
     /// Called only after canonical restoration has acknowledged the exact dispatch.

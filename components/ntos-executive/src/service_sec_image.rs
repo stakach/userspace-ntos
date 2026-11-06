@@ -12,10 +12,13 @@ use hosted_quiesce::dump_all_hosted_thread_quiesce;
 
 #[path = "component_continuation.rs"]
 mod component_continuation;
-use component_continuation::{HostedContinuationDestination, HostedNativeContinuation, PendingComponentDispatch};
+use component_continuation::{HostedContinuationDestination, HostedNativeContinuation,
+    PendingComponentDispatch, PendingNestedTerminalDispatch};
 pub(crate) use component_continuation::{ComponentNativeContinuation, ComponentSuspensionCompletion};
 #[path = "root_maintenance_owner.rs"]
 pub(crate) mod root_maintenance_owner;
+#[path = "nested_restore_owner.rs"]
+pub(crate) mod nested_restore_owner;
 
 #[path = "bootstrap_wait_selftest.rs"]
 pub(crate) mod bootstrap_wait_selftest;
@@ -230,6 +233,58 @@ static SERVICE_DELAY_DRAIN_QUEUE: AtomicU64 = AtomicU64::new(0);
 struct ComponentCallbackTransfer {
     token: u64,
     context: win32k_glue::StagedUserCallbackContext,
+}
+
+/// A running callback's nested syscall transfers only its active external token. The staged
+/// context belongs to a *completed* NtCallbackReturn and is never inferred from that token.
+#[derive(Clone, Copy)]
+enum NestedWaitTransfer {
+    None,
+    CallbackReturn(ComponentCallbackTransfer),
+    InCallback { lane: nt_component_suspension::LaneHandle, token: u64 },
+}
+
+impl NestedWaitTransfer {
+    fn from_completed(transfer: Option<ComponentCallbackTransfer>) -> Self {
+        transfer.map(Self::CallbackReturn).unwrap_or(Self::None)
+    }
+
+    fn token(self) -> Option<u64> {
+        match self {
+            Self::None => None,
+            Self::CallbackReturn(transfer) => Some(transfer.token),
+            Self::InCallback { token, .. } => Some(token),
+        }
+    }
+
+    fn context(self) -> Option<win32k_glue::StagedUserCallbackContext> {
+        match self {
+            Self::CallbackReturn(transfer) => Some(transfer.context),
+            Self::None | Self::InCallback { .. } => None,
+        }
+    }
+
+    unsafe fn admits(self, client: win32k_glue::Win32kClientContext,
+        lane: nt_component_suspension::LaneHandle) -> bool
+    {
+        match self {
+            Self::None => true,
+            Self::CallbackReturn(transfer) => transfer.token != 0,
+            Self::InCallback { lane: captured, token } => captured == lane
+                && win32k_glue::in_callback_nested_wait_token_is_current(
+                    client, captured, token,
+                )
+                && (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+                    .external_top(lane).ok().flatten() == Some(token),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RetainedWaitAdmission {
+    Accepted,
+    RefusedNoEffect,
+    Indeterminate,
 }
 
 const COMPONENT_SUSPENSION_MAX_DEPTH: usize = 64;
@@ -1254,6 +1309,7 @@ fn component_expected_owner(
         PendingComponentDispatch::Receive(pending) => Some(pending.yielded.owner),
         PendingComponentDispatch::ServiceWait(pending) => service_wait_expected_owner(pending),
         PendingComponentDispatch::RootMaintenance(pending) => Some(pending.yielded.owner),
+        PendingComponentDispatch::NestedRestore(pending) => Some(pending.ticket.key().owner()),
     }
 }
 
@@ -1299,6 +1355,11 @@ fn component_suspension_key(
         }
         PendingComponentDispatch::RootMaintenance(pending) => {
             nt_component_suspension::SuspensionKey::root_maintenance(pending.yielded.dispatch.epoch())
+        }
+        PendingComponentDispatch::NestedRestore(pending) => {
+            nt_component_suspension::SuspensionKey::nested_restore(
+                pending.ticket.key().scope().sequence(),
+            )
         }
     }
 }
@@ -1569,6 +1630,23 @@ unsafe fn provider_wait_admit_retained(
     callback_transfer: Option<ComponentCallbackTransfer>,
     destination: HostedContinuationDestination,
 ) -> bool {
+    provider_wait_admit_with_transfer(
+        nt_handler, pending, reply_cap,
+        NestedWaitTransfer::from_completed(callback_transfer), destination,
+    ) == RetainedWaitAdmission::Accepted
+}
+
+unsafe fn provider_wait_admit_with_transfer(
+    nt_handler: &mut ExecNtHandler,
+    pending: win32k_glue::PendingProviderWaitDispatch,
+    reply_cap: u64,
+    transfer: NestedWaitTransfer,
+    destination: HostedContinuationDestination,
+) -> RetainedWaitAdmission {
+    let lane = pending.dispatch.lane;
+    if !transfer.admits(pending.client, lane) {
+        return RetainedWaitAdmission::RefusedNoEffect;
+    }
     let initial_target = matches!(destination, HostedContinuationDestination::InitialThread(_));
     if initial_target {
         print_str(b"[initial-provider-wait] stage=request pi/tid/wait/type/timeout-kind/timeout/count=");
@@ -1591,12 +1669,12 @@ unsafe fn provider_wait_admit_retained(
         }
     }
     let Ok(return_target) = HostedReturnTarget::new(
-        reply_cap, callback_transfer.map(|transfer| transfer.context),
+        reply_cap, transfer.context(),
     ) else {
-        return false;
+        return RetainedWaitAdmission::RefusedNoEffect;
     };
     let Some(owner) = provider_wait_expected_owner(pending) else {
-        return false;
+        return RetainedWaitAdmission::RefusedNoEffect;
     };
     let wait_id = pending.request.header.wait_id;
     let sequence = next_dispatcher_wait_sequence();
@@ -1605,16 +1683,15 @@ unsafe fn provider_wait_admit_retained(
         return_target,
         destination,
     });
-    let lane = pending.dispatch.lane;
     let Ok(binding) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).binding(lane) else {
-        return false;
+        return RetainedWaitAdmission::RefusedNoEffect;
     };
     let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-    let admitted = if let Some(transfer) = callback_transfer {
+    let admitted = if let Some(token) = transfer.token() {
         lanes.transfer_external_to_suspension_running(
             lane,
             binding.reply_object,
-            transfer.token,
+            token,
             provider_wait_key(wait_id),
             sequence,
             owner,
@@ -1631,7 +1708,7 @@ unsafe fn provider_wait_admit_retained(
         )
     };
     if admitted.is_err() {
-        return false;
+        return RetainedWaitAdmission::RefusedNoEffect;
     }
     PROVIDER_WAIT_DISPATCH_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
     COMPONENT_WAIT_DISPATCH_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
@@ -1708,7 +1785,7 @@ unsafe fn provider_wait_admit_retained(
             }
         }
     }
-    true
+    RetainedWaitAdmission::Accepted
 }
 
 unsafe fn provider_wait_admit_current(
@@ -1743,12 +1820,24 @@ unsafe fn receive_admit_retained(
     callback_transfer: Option<ComponentCallbackTransfer>,
     destination: HostedContinuationDestination,
 ) -> bool {
+    receive_admit_with_transfer(
+        pending, reply_cap, NestedWaitTransfer::from_completed(callback_transfer), destination,
+    ) == RetainedWaitAdmission::Accepted
+}
+
+unsafe fn receive_admit_with_transfer(
+    pending: win32k_glue::PendingReceiveDispatch,
+    reply_cap: u64,
+    transfer: NestedWaitTransfer,
+    destination: HostedContinuationDestination,
+) -> RetainedWaitAdmission {
     if pending.yielded.replaces.is_some()
-        || pending.snapshot.callback_token != callback_transfer.map(|transfer| transfer.token)
-    { return false; }
+        || pending.snapshot.callback_token != transfer.token()
+        || !transfer.admits(pending.snapshot.client, pending.snapshot.dispatch.lane)
+    { return RetainedWaitAdmission::RefusedNoEffect; }
     let Ok(return_target) = HostedReturnTarget::new(
-        reply_cap, callback_transfer.map(|transfer| transfer.context),
-    ) else { return false; };
+        reply_cap, transfer.context(),
+    ) else { return RetainedWaitAdmission::RefusedNoEffect; };
     let key = nt_component_suspension::SuspensionKey::receive(pending.yielded.child.admission_sequence());
     let sequence = next_dispatcher_wait_sequence();
     let continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
@@ -1757,9 +1846,9 @@ unsafe fn receive_admit_retained(
     let admitted = crate::spawn_hosts::shared_ingress::owner::runtime::with_bound_receive_scope(
         pending.yielded.parent, |scope| {
             let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-            let admitted = if let Some(transfer) = callback_transfer {
+            let admitted = if let Some(token) = transfer.token() {
                 lanes.transfer_callback_to_receive_owned(
-                    scope, transfer.token, key, sequence, pending.yielded.owner,
+                    scope, token, key, sequence, pending.yielded.owner,
                     pending.yielded.child, continuation,
                 )
             } else {
@@ -1772,7 +1861,8 @@ unsafe fn receive_admit_retained(
                 .map_err(|_| crate::spawn_hosts::shared_ingress::owner::runtime::Error::Protocol)
         },
     );
-    admitted.is_ok()
+    if admitted.is_ok() { RetainedWaitAdmission::Accepted }
+    else { RetainedWaitAdmission::RefusedNoEffect }
 }
 
 unsafe fn receive_admit_current(
@@ -1795,13 +1885,34 @@ unsafe fn service_wait_admit_retained(
     callback_transfer: Option<ComponentCallbackTransfer>,
     destination: HostedContinuationDestination,
 ) -> bool {
-    if pending.snapshot.callback_token != callback_transfer.map(|transfer| transfer.token) {
-        return false;
+    service_wait_admit_with_transfer(
+        pending, reply_cap, NestedWaitTransfer::from_completed(callback_transfer), destination,
+    ) == RetainedWaitAdmission::Accepted
+}
+
+unsafe fn service_wait_admit_with_transfer(
+    pending: win32k_glue::PendingServiceWaitDispatch,
+    reply_cap: u64,
+    transfer: NestedWaitTransfer,
+    destination: HostedContinuationDestination,
+) -> RetainedWaitAdmission {
+    let lane = pending.snapshot.dispatch.lane;
+    let origin_valid = match transfer {
+        NestedWaitTransfer::InCallback { lane: captured, token } => captured == lane
+            && win32k_glue::in_callback_nested_wait_token_is_current(
+                pending.snapshot.client, captured, token,
+            ),
+        _ => transfer.admits(pending.snapshot.client, lane),
+    };
+    if pending.snapshot.callback_token != transfer.token() || !origin_valid {
+        return RetainedWaitAdmission::RefusedNoEffect;
     }
     let Ok(return_target) = HostedReturnTarget::new(
-        reply_cap, callback_transfer.map(|transfer| transfer.context),
-    ) else { return false; };
-    let Some(owner) = service_wait_expected_owner(pending) else { return false; };
+        reply_cap, transfer.context(),
+    ) else { return RetainedWaitAdmission::RefusedNoEffect; };
+    let Some(owner) = service_wait_expected_owner(pending) else {
+        return RetainedWaitAdmission::RefusedNoEffect;
+    };
     let yielded = pending.yielded;
     let key = nt_component_suspension::SuspensionKey::service_wait(yielded.token);
     let sequence = next_dispatcher_wait_sequence();
@@ -1809,18 +1920,24 @@ unsafe fn service_wait_admit_retained(
         pending: PendingComponentDispatch::ServiceWait(pending), return_target, destination,
     });
     let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-    let admitted = if let Some(transfer) = callback_transfer {
-        lanes.transfer_callback_to_service_wait_external_owned(
-            yielded.route.identity().lane, yielded.reply, yielded.dispatch,
-            transfer.token, yielded.token, key, sequence, owner, continuation,
-        )
-    } else {
-        lanes.admit_service_wait_external_owned(
+    let admitted = match transfer {
+        NestedWaitTransfer::InCallback { token, .. } =>
+            lanes.admit_in_callback_service_wait_external_owned(
+                yielded.route.identity().lane, yielded.reply, yielded.dispatch,
+                token, yielded.token, key, sequence, owner, continuation,
+            ),
+        NestedWaitTransfer::CallbackReturn(completed) =>
+            lanes.transfer_callback_to_service_wait_external_owned(
+                yielded.route.identity().lane, yielded.reply, yielded.dispatch,
+                completed.token, yielded.token, key, sequence, owner, continuation,
+            ),
+        NestedWaitTransfer::None => lanes.admit_service_wait_external_owned(
             yielded.route.identity().lane, yielded.reply, yielded.dispatch,
             yielded.token, key, sequence, owner, continuation,
-        )
+        ),
     };
-    admitted.is_ok()
+    if admitted.is_ok() { RetainedWaitAdmission::Accepted }
+    else { RetainedWaitAdmission::RefusedNoEffect }
 }
 
 unsafe fn service_wait_admit_current(
@@ -1844,18 +1961,42 @@ unsafe fn lpc_wait_admit_retained(
     callback_transfer: Option<ComponentCallbackTransfer>,
     destination: HostedContinuationDestination,
 ) -> bool {
+    lpc_wait_admit_with_transfer(
+        nt_handler, pending, reply_cap,
+        NestedWaitTransfer::from_completed(callback_transfer), destination,
+    ) == RetainedWaitAdmission::Accepted
+}
+
+unsafe fn lpc_wait_admit_with_transfer(
+    nt_handler: &mut ExecNtHandler,
+    pending: win32k_glue::PendingLpcWaitDispatch,
+    reply_cap: u64,
+    transfer: NestedWaitTransfer,
+    destination: HostedContinuationDestination,
+) -> RetainedWaitAdmission {
+    let lane = pending.dispatch.lane;
+    if !transfer.admits(pending.client, lane) {
+        return RetainedWaitAdmission::RefusedNoEffect;
+    }
     let Ok(reservation) = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).reserve() else {
-        return false;
+        return RetainedWaitAdmission::RefusedNoEffect;
+    };
+    let cancel = || {
+        if (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation).is_ok() {
+            RetainedWaitAdmission::RefusedNoEffect
+        } else {
+            // A changed reservation may already belong to another effect owner. The caller
+            // must retain and quarantine its original result, not reinsert it for replay.
+            RetainedWaitAdmission::Indeterminate
+        }
     };
     let Ok(return_target) = HostedReturnTarget::new(
-        reply_cap, callback_transfer.map(|transfer| transfer.context),
+        reply_cap, transfer.context(),
     ) else {
-        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
-        return false;
+        return cancel();
     };
     let Some(owner) = lpc_wait_expected_owner(pending) else {
-        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
-        return false;
+        return cancel();
     };
     let key = nt_component_suspension::SuspensionKey::lpc_request(pending.request.generation);
     let sequence = next_dispatcher_wait_sequence();
@@ -1864,17 +2005,15 @@ unsafe fn lpc_wait_admit_retained(
         return_target,
         destination,
     });
-    let lane = pending.dispatch.lane;
     let Ok(binding) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).binding(lane) else {
-        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
-        return false;
+        return cancel();
     };
     let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-    let admitted = if let Some(transfer) = callback_transfer {
+    let admitted = if let Some(token) = transfer.token() {
         lanes.transfer_external_to_suspension_running(
             lane,
             binding.reply_object,
-            transfer.token,
+            token,
             key,
             sequence,
             owner,
@@ -1891,12 +2030,11 @@ unsafe fn lpc_wait_admit_retained(
         )
     };
     if admitted.is_err() {
-        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
-        return false;
+        return cancel();
     }
     COMPONENT_WAIT_DISPATCH_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
     let _ = lpc_wait_begin_after_stack_admission(nt_handler, pending, key, reservation);
-    true
+    RetainedWaitAdmission::Accepted
 }
 
 unsafe fn lpc_wait_admit_current(
@@ -1933,6 +2071,42 @@ struct PendingWin32kHandoff {
     retained_failure: bool,
 }
 
+/// The physical nested parent already owns its Reply. Retain the independent root Call before
+/// rotating the root Reply; no ordinary syscall result can be delivered from this handoff.
+unsafe fn admit_pending_nested_restore_dispatch(
+    destination: HostedContinuationDestination,
+) -> Result<u64, ()> {
+    let root_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    if root_reply == 0 { return Err(()); }
+    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
+        return Err(());
+    };
+    let Some(reservation) = nested_restore_owner::reserve_capacity() else {
+        return Err(());
+    };
+    let Some(pending) = win32k_glue::take_pending_nested_restore_dispatch() else {
+        return Err(());
+    };
+    let dispatch_id = pending.snapshot.dispatch.dispatch_id;
+    let ticket = match nested_restore_owner::retain(
+        reservation, pending, root_reply, destination, false,
+    ) {
+        Ok(ticket) => ticket,
+        Err(pending) => {
+            let _ = win32k_glue::restore_pending_nested_restore_dispatch(pending);
+            return Err(());
+        }
+    };
+    if nested_restore_owner::park_root(ticket, reply_park).is_err()
+        && !nested_restore_owner::retry_unparked_root(ticket)
+    {
+        // The retained frame still owns the original root Reply and physical parent. A refusal
+        // cannot become a synthetic provider result or let the root receive reuse this Reply.
+        return Err(());
+    }
+    Ok(dispatch_id)
+}
+
 /// One authoritative transfer from a returned native pump to the retained execution owner.
 /// Direct Win32k syscalls and early Ps process-create callouts use the same wait ordering.
 unsafe fn admit_pending_win32k_dispatch(
@@ -1944,6 +2118,25 @@ unsafe fn admit_pending_win32k_dispatch(
     let mut parked = false;
     let mut maintenance_ticket = None;
     let mut retained_failure = false;
+    if win32k_glue::pending_nested_restore_dispatch_is_some() {
+        if callback_suspended {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        }
+        match admit_pending_nested_restore_dispatch(destination) {
+            Ok(dispatch_id) => {
+                admitted_dispatch_id = dispatch_id;
+                parked = true;
+            }
+            Err(()) => retained_failure = true,
+        }
+        return PendingWin32kHandoff {
+            callback_suspended, admitted_dispatch_id, parked,
+            maintenance_ticket, retained_failure,
+        };
+    }
     if win32k_glue::pending_root_maintenance_dispatch_is_some() {
         // Initial-thread callouts cannot transfer this ordinary hosted syscall checkpoint.
         // Leave the pending snapshot in its global cell on every pre-effect refusal.
@@ -3551,6 +3744,13 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
     // the Reply. The dynamic delete drain waits for that primary's exact ready receipt, then
     // invokes DeleteProcedure on a separate PASSIVE worker.
     unsafe { driver_launch::hosted_driver_dynamic_delete::drain(); }
+    unsafe { driver_launch::hosted_provider_export_lane::drain(); }
+    if unsafe { driver_launch::hosted_driver_dynamic_delete::next_deadline() }.is_some() {
+        unsafe { rearm_registered_active_delay_timer_with_handler(nt_handler) };
+    }
+    if unsafe { driver_launch::hosted_provider_export_lane::next_deadline() }.is_some() {
+        unsafe { rearm_registered_active_delay_timer_with_handler(nt_handler) };
+    }
     // A completed physical fold can be waiting only for its exact CM ACK. It still owns the
     // reserve, so redrive that receipt before any ordinary snapshot tries to acquire it.
     if crate::writable_fs::system_wal_fold_ack_pending() {

@@ -131,6 +131,112 @@ pub(crate) enum RootMaintenancePumpCompletion {
     RetainedFailure(u32),
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum NestedRestorePumpCompletion {
+    Restored(ProviderWaitPumpCompletion),
+    NestedReparked(PendingNestedRestoreDispatch),
+    ReceiveReparked(PendingReceiveDispatch),
+    ServiceReparked(PendingServiceWaitDispatch),
+    RetainedFailure(u32),
+}
+
+/// Classify a real returned receive half exactly once. Output capture and callback-stack
+/// completion may have native or shared-memory effects; the outer owner records entry before
+/// calling this and retains the returned value for any pure transfer retry.
+pub(crate) unsafe fn settle_nested_restore_result(
+    pending: PendingNestedRestoreDispatch,
+) -> NestedRestorePumpCompletion {
+    let mut pump = pending.snapshot.pump;
+    let snapshot = pending.snapshot;
+    if pump.nested_restore_yield.is_some() || pump.nested_restore_quarantined.is_some() {
+        let mut next = pending;
+        next.snapshot.shared_resume = capture_shared_resume_snapshot(
+            snapshot.dispatch, snapshot.client,
+        );
+        return NestedRestorePumpCompletion::NestedReparked(next);
+    }
+    if let Some(yielded) = pump.receive_yield {
+        return NestedRestorePumpCompletion::ReceiveReparked(PendingReceiveDispatch {
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                shared_resume: yielded.shared_resume,
+                ..snapshot
+            },
+        });
+    }
+    if let Some(yielded) = pump.service_wait_yield {
+        return NestedRestorePumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                shared_resume: capture_shared_resume_snapshot(snapshot.dispatch, snapshot.client),
+                ..snapshot
+            },
+        });
+    }
+    pump.dispatch_return = capture_win32k_dispatch_return(
+        pump.dispatch_return_receipt,
+        snapshot.dispatch.dispatch_id,
+        snapshot.dispatch.ssn,
+        pump.result,
+        pump.completed,
+    );
+    retire_win32k_on_wall(&pump);
+    let result = if pump.provider_wait_suspended {
+        let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
+            as *const nt_provider_wait::ProviderWaitSharedPage;
+        ProviderWaitPumpCompletion::Reparked(PendingProviderWaitDispatch {
+            request: core::ptr::read_volatile(core::ptr::addr_of!((*page).request)),
+            dispatch: snapshot.dispatch,
+            client: snapshot.client,
+            nested_user_callback: pending.origin.nested_user_callback,
+            arg_snapshot_len: snapshot.arg_snapshot_len,
+            arg_snapshot: snapshot.arg_snapshot,
+        })
+    } else if pump.lpc_wait_suspended {
+        capture_lpc_wait_repark(
+            snapshot.dispatch, snapshot.client, pending.origin.nested_user_callback,
+            snapshot.arg_snapshot_len, snapshot.arg_snapshot,
+        ).map(ProviderWaitPumpCompletion::LpcReparked)
+            .unwrap_or(ProviderWaitPumpCompletion::Failed(nt_process::STATUS_UNSUCCESSFUL as i32))
+    } else if pump.callback_suspended {
+        ProviderWaitPumpCompletion::UserCallbackSuspended
+    } else if pump.completed {
+        return NestedRestorePumpCompletion::Restored(complete_resumed_dispatch(
+            snapshot.dispatch, snapshot.client, pending.origin.nested_user_callback,
+            snapshot.arg_snapshot_len, snapshot.arg_snapshot, pump,
+        ));
+    } else {
+        return NestedRestorePumpCompletion::RetainedFailure(pump.status as u32);
+    };
+    NestedRestorePumpCompletion::Restored(result)
+}
+
+/// Resume the already-entered receive half after the independent nested parent owner has
+/// acknowledged its physical restore. A refusal occurs before receiving another native message;
+/// the outer frame keeps the same snapshot and must retry only this function.
+pub(crate) unsafe fn resume_suspended_nested_restore_receive(
+    pending: PendingNestedRestoreDispatch,
+) -> Result<crate::spawn_hosts::PumpResult, u32> {
+    if !select_win32k_client_window(pending.snapshot.client)
+        || !restore_shared_resume_snapshot(
+            pending.snapshot.shared_resume,
+            pending.snapshot.dispatch,
+            pending.snapshot.client,
+        )
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    let previous = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    core::ptr::write(
+        core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), pending.snapshot.dispatch,
+    );
+    let result = crate::spawn_hosts::component_pump_continue_nested_restore_receive(
+        &pending.snapshot.channel, &pending.snapshot.pump,
+    );
+    core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous);
+    result
+}
+
 static RECEIVE_PHASE_TRACES: AtomicU64 = AtomicU64::new(0);
 static RECEIVE_FAILURE_TRACES: AtomicU64 = AtomicU64::new(0);
 

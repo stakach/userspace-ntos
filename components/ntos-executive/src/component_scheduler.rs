@@ -136,16 +136,45 @@ impl Drop for ComponentSchedulerScope {
     }
 }
 
+/// A component result remains owned by its physical parent on restore refusal. The retained
+/// ticket is a selector only; `runtime::nested` continues to own the stopped TCB and Reply.
+pub(super) enum HostedPumpRestore {
+    Restored(crate::spawn_hosts::PumpResult),
+    Unattributed(crate::spawn_hosts::PumpResult),
+    Retained {
+        result: crate::spawn_hosts::PumpResult,
+        key: nt_component_suspension::NestedRestoreResultKey,
+        ticket: crate::spawn_hosts::shared_ingress::owner::runtime::nested::NestedRestoreTicket,
+        retryable: bool,
+    },
+}
+
+impl HostedPumpRestore {
+    fn legacy(self) -> crate::spawn_hosts::PumpResult {
+        match self {
+            Self::Restored(result) => result,
+            Self::Retained { .. } | Self::Unattributed(_) => panic!("restore nested hosted parent"),
+        }
+    }
+}
+
 pub(super) unsafe fn hosted_component_pump(
     channel: &crate::spawn_hosts::PumpChannel,
 ) -> crate::spawn_hosts::PumpResult {
-    hosted_component_pump_inner(channel, None, None)
+    hosted_component_pump_inner(channel, None, None).legacy()
 }
 
 pub(super) unsafe fn hosted_component_pump_with_caller(
     channel: &crate::spawn_hosts::PumpChannel,
     caller: nt_process::native_handle::NativeHandleCaller,
 ) -> crate::spawn_hosts::PumpResult {
+    hosted_component_pump_inner(channel, Some(caller), None).legacy()
+}
+
+pub(super) unsafe fn hosted_component_pump_with_caller_retained(
+    channel: &crate::spawn_hosts::PumpChannel,
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> HostedPumpRestore {
     hosted_component_pump_inner(channel, Some(caller), None)
 }
 
@@ -154,14 +183,14 @@ pub(super) unsafe fn hosted_component_pump_observed(
     caller: Option<nt_process::native_handle::NativeHandleCaller>,
     owner: &scsi_srb_pump_owner::ScsiSrbPumpOwnerClaim<'_, SCSI_SRB_PUMP_OWNER_SLOTS>,
 ) -> crate::spawn_hosts::PumpResult {
-    hosted_component_pump_inner(channel, caller, Some(owner))
+    hosted_component_pump_inner(channel, caller, Some(owner)).legacy()
 }
 
 unsafe fn hosted_component_pump_inner(
     channel: &crate::spawn_hosts::PumpChannel,
     caller: Option<nt_process::native_handle::NativeHandleCaller>,
     observed_owner: Option<&scsi_srb_pump_owner::ScsiSrbPumpOwnerClaim<'_, SCSI_SRB_PUMP_OWNER_SLOTS>>,
-) -> crate::spawn_hosts::PumpResult {
+) -> HostedPumpRestore {
     use crate::spawn_hosts::shared_ingress::owner::runtime;
     let mut channel = *channel;
     let mut timeline = observed_owner.map(|owner|
@@ -271,11 +300,25 @@ unsafe fn hosted_component_pump_inner(
         timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::Restore,
             crate::disk_census_ticks());
     }
-    runtime::nested::restore(&mut parent).expect("restore nested hosted parent");
+    let restore_key = parent.as_ref().and_then(|handle| runtime::nested::result_key(handle));
+    let restore_ticket = parent.as_ref().map(|handle| handle.ticket());
+    if runtime::nested::restore(&mut parent).is_err() {
+        // An impossible missing key is still a retained refusal. The physical row remains
+        // discoverable in `runtime::nested`; never return an entered result as completed.
+        let (Some(key), Some(ticket)) = (restore_key, restore_ticket) else {
+            return HostedPumpRestore::Unattributed(result)
+        };
+        return HostedPumpRestore::Retained {
+            result,
+            key,
+            ticket,
+            retryable: runtime::nested::pending_ticket(ticket),
+        };
+    }
     trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 8, Some(&result));
     trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 8, Some(&result));
     if let Some(timeline) = timeline {
         timeline.finish(crate::disk_census_ticks());
     }
-    result
+    HostedPumpRestore::Restored(result)
 }

@@ -643,6 +643,19 @@ unsafe fn inline_irq_work_pending() -> bool {
         || crate::dispatcher_bootstrap::timer_work_pending()
 }
 
+unsafe fn nested_restore_refusal(
+    ticket: Option<runtime::nested::NestedRestoreTicket>,
+) -> PumpMessage {
+    let Some(ticket) = ticket else { return PumpMessage::transport_wall(); };
+    if runtime::nested::pending_ticket(ticket) {
+        PumpMessage::nested_restore_yield(ticket)
+    } else {
+        // The owner keeps an uncertain physical release fenced. It must never be retried or
+        // converted into an ordinary wall that panics the root pump.
+        PumpMessage::nested_restore_quarantined(ticket)
+    }
+}
+
 pub(super) unsafe fn receive(
     ch: &PumpChannel, route: PeerRoute, retained_seh: bool, serviced_scheduler_yield: bool,
 ) -> PumpMessage {
@@ -710,8 +723,9 @@ pub(super) unsafe fn receive(
                 Err(_) => return PumpMessage::transport_wall(),
             };
             let progressed = crate::writable_fs::redrive_retained_system_wal_fold_after_native_completion();
-            if runtime::nested::restore(&mut parent).is_err() {
-                return PumpMessage::transport_wall();
+            let ticket = parent.as_ref().map(|parent| parent.ticket());
+            if runtime::nested::restore_or_retain(&mut parent).is_err() {
+                return nested_restore_refusal(ticket);
             }
             if progressed { continue; }
         }
@@ -731,8 +745,9 @@ pub(super) unsafe fn receive(
             };
             let result = crate::service_sec_image::service_due_system_wal_fold();
             trace_ps_create_event(b"fold-service-return", route, 0, 0);
-            if runtime::nested::restore(&mut parent).is_err() {
-                return PumpMessage::transport_wall();
+            let ticket = parent.as_ref().map(|parent| parent.ticket());
+            if runtime::nested::restore_or_retain(&mut parent).is_err() {
+                return nested_restore_refusal(ticket);
             }
             trace_ps_create_event(b"fold-restore-return", route, 0, 0);
             match result {
@@ -762,8 +777,9 @@ pub(super) unsafe fn receive(
                 Err(_) => return PumpMessage::transport_wall(),
             };
             let serviced = crate::driver_launch::service_mounted_native_registry_recheck(id);
-            if runtime::nested::restore(&mut parent).is_err() {
-                return PumpMessage::transport_wall();
+            let ticket = parent.as_ref().map(|parent| parent.ticket());
+            if runtime::nested::restore_or_retain(&mut parent).is_err() {
+                return nested_restore_refusal(ticket);
             }
             if serviced != 0 { continue; }
         }
@@ -779,8 +795,9 @@ pub(super) unsafe fn receive(
                 Err(_) => return PumpMessage::transport_wall(),
             };
             let serviced = crate::driver_launch::service_mounted_native_registry_wal(id);
-            if runtime::nested::restore(&mut parent).is_err() {
-                return PumpMessage::transport_wall();
+            let ticket = parent.as_ref().map(|parent| parent.ticket());
+            if runtime::nested::restore_or_retain(&mut parent).is_err() {
+                return nested_restore_refusal(ticket);
             }
             if serviced != 0 { continue; }
         }
@@ -796,8 +813,9 @@ pub(super) unsafe fn receive(
                 Err(_) => return PumpMessage::transport_wall(),
             };
             let progressed = crate::service_sec_image::redrive_nested_hosted_file_work();
-            if runtime::nested::restore(&mut parent).is_err() {
-                return PumpMessage::transport_wall();
+            let ticket = parent.as_ref().map(|parent| parent.ticket());
+            if runtime::nested::restore_or_retain(&mut parent).is_err() {
+                return nested_restore_refusal(ticket);
             }
             if progressed { continue; }
         }

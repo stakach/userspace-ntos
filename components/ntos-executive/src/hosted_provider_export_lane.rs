@@ -4,6 +4,12 @@
 use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_component_suspension::peer_registry::PeerRoute;
+use nt_component_suspension::{
+    next_ready_pending_lane, NestedRestoreChain, NestedRestoreResultKey,
+    PendingLaneReadiness,
+};
+use nt_time::CoalescedRetryWake;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 // This lane's completion must use the ordinary dispatch label: the nested export may call
 // GOP and display-ownership services before it returns.
@@ -21,7 +27,19 @@ const _: () = assert!(ARG_OFFSET + FSD_ARG_FRAMES * 0x1000 <= FSD_WORKER_STRIDE)
 const _: () = assert!(JUMP_OFFSET + 3 * 8 <= 0x1000);
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum Phase { Preparing, Ready, Entered, Uncertain, Retiring, Retired }
+enum Phase { Preparing, StartupRestore, StartupRestoreAttempt, Ready, Entered, Uncertain,
+    Retiring, Retired }
+
+enum StartupRestorePayload {
+    Chain { key: NestedRestoreResultKey, chain: NestedRestoreChain<Result<(), u32>> },
+    Quarantined(Result<(), u32>),
+}
+
+struct PendingStartupRestore {
+    ticket: runtime::nested::NestedRestoreTicket,
+    payload: StartupRestorePayload,
+    retryable: bool,
+}
 
 struct Lane {
     provider: usize,
@@ -36,9 +54,13 @@ struct Lane {
     executive_shared: u64,
     phase: Phase,
     startup_dispatch: Option<nt_component_suspension::LaneDispatchIdentity>,
+    startup_restore: Option<PendingStartupRestore>,
 }
 
 static mut LANES: Vec<Lane> = Vec::new();
+static LAST_STARTUP_RESTORE: AtomicUsize = AtomicUsize::new(usize::MAX);
+const STARTUP_RESTORE_RETRY_100NS: u64 = 1_600_000;
+static STARTUP_RESTORE_WAKE: CoalescedRetryWake = CoalescedRetryWake::new();
 
 #[derive(Clone, Copy)]
 pub(super) struct Selection {
@@ -124,12 +146,14 @@ pub(super) unsafe fn prepare(
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
         rows.push(Lane { provider, domain, pml4: inst.pml4, owner, publication, ordinal,
             handle: 0, route: None, component_shared: 0, executive_shared: 0,
-            phase: Phase::Preparing, startup_dispatch: None });
+            phase: Phase::Preparing, startup_dispatch: None, startup_restore: None });
         rows.len() - 1
     };
     let result = construct(index, inst);
-    (&mut *core::ptr::addr_of_mut!(LANES))[index].phase =
-        if result.is_ok() { Phase::Ready } else { Phase::Uncertain };
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    if row.phase == Phase::Preparing {
+        row.phase = if result.is_ok() { Phase::Ready } else { Phase::Uncertain };
+    }
     result.map_err(|status| nt_status::NtStatus(status as i32))
 }
 
@@ -231,8 +255,164 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
         }
         Ok(())
     })();
-    runtime::nested::restore(&mut parent).map_err(|_| STATUS_INVALID_HANDLE as u32)?;
-    startup_result
+    let Some(handle) = parent.as_ref() else { return startup_result; };
+    let ticket = handle.ticket();
+    let key = runtime::nested::result_key(handle);
+    if runtime::nested::restore_or_retain(&mut parent).is_ok() {
+        return startup_result;
+    }
+    retain_startup_restore(index, ticket, key, startup_result);
+    Err(STATUS_INVALID_HANDLE as u32)
+}
+
+/// The exact parent and startup result survive a refused physical restore. A failed startup
+/// pump is never entered again; only its already retained parent can be retried.
+unsafe fn retain_startup_restore(
+    index: usize,
+    ticket: runtime::nested::NestedRestoreTicket,
+    key: Option<NestedRestoreResultKey>,
+    result: Result<(), u32>,
+) {
+    let retryable = runtime::nested::pending_ticket(ticket);
+    let payload = match key.and_then(|key| {
+        let mut chain = NestedRestoreChain::retain(key, None, result).ok()?;
+        chain.begin_inner(key).ok()?;
+        let settled = if retryable {
+            chain.refuse_inner_no_effects(key)
+        } else {
+            chain.quarantine_inner(key)
+        };
+        settled.ok()?;
+        Some(StartupRestorePayload::Chain { key, chain })
+    }) {
+        Some(payload) => payload,
+        None => StartupRestorePayload::Quarantined(result),
+    };
+    let retryable = retryable && matches!(&payload, StartupRestorePayload::Chain { .. });
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    row.startup_restore = Some(PendingStartupRestore { ticket, payload, retryable });
+    row.phase = Phase::StartupRestore;
+    if retryable {
+        STARTUP_RESTORE_WAKE.publish(
+            crate::monotonic_time_100ns().saturating_add(STARTUP_RESTORE_RETRY_100NS),
+        );
+    }
+}
+
+unsafe fn retry_startup_restore(index: usize) -> bool {
+    let (ticket, key) = {
+        let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+        if row.phase != Phase::StartupRestore { return false; }
+        let Some(pending) = row.startup_restore.as_mut() else {
+            row.phase = Phase::Uncertain;
+            return false;
+        };
+        if !pending.retryable { return false; }
+        let StartupRestorePayload::Chain { key, chain } = &mut pending.payload else {
+            pending.retryable = false;
+            return false;
+        };
+        let key = *key;
+        let ticket = pending.ticket;
+        if !runtime::nested::ticket_matches_channel(ticket, key.scope().route(),
+            key.parent_reply()) {
+            return false;
+        }
+        if chain.begin_inner(key).is_err() {
+            pending.retryable = false;
+            row.phase = Phase::Uncertain;
+            return false;
+        }
+        // A restore can enter nested component work. Fence a second retry before it does.
+        row.phase = Phase::StartupRestoreAttempt;
+        (ticket, key)
+    };
+    let restored = runtime::nested::restore_pending_ticket(ticket);
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    let Some(pending) = row.startup_restore.as_mut() else {
+        row.phase = Phase::Uncertain;
+        return false;
+    };
+    let StartupRestorePayload::Chain { chain, .. } = &mut pending.payload else {
+        pending.retryable = false;
+        row.phase = Phase::Uncertain;
+        return false;
+    };
+    if restored.is_err() {
+        if runtime::nested::pending_ticket(ticket)
+            && chain.refuse_inner_no_effects(key).is_ok()
+        {
+            row.phase = Phase::StartupRestore;
+            return false;
+        }
+        let _ = chain.quarantine_inner(key);
+        pending.retryable = false;
+        row.phase = Phase::Uncertain;
+        return false;
+    }
+    if chain.acknowledge_inner(key).is_err() {
+        pending.retryable = false;
+        row.phase = Phase::Uncertain;
+        return false;
+    }
+    let Ok(result) = chain.take(key, None) else {
+        pending.retryable = false;
+        row.phase = Phase::Uncertain;
+        return false;
+    };
+    row.startup_restore = None;
+    row.phase = if result.is_ok() { Phase::Ready } else { Phase::Uncertain };
+    result.is_ok()
+}
+
+unsafe fn has_pending_startup_restore() -> bool {
+    (&*core::ptr::addr_of!(LANES)).iter().any(|row| {
+        row.phase == Phase::StartupRestore && row.startup_restore.as_ref()
+            .is_some_and(|pending| pending.retryable)
+    })
+}
+
+pub(crate) unsafe fn next_deadline() -> Option<u64> {
+    STARTUP_RESTORE_WAKE.next_deadline(has_pending_startup_restore())
+}
+
+pub(crate) unsafe fn wake_due(now_100ns: u64) -> u64 {
+    u64::from(STARTUP_RESTORE_WAKE.wake_due(now_100ns, has_pending_startup_restore()))
+}
+
+/// Called at the outer service boundary, never from within the startup worker pump.
+pub(crate) unsafe fn drain() -> usize {
+    let now = crate::monotonic_time_100ns();
+    let Some(attempt) = STARTUP_RESTORE_WAKE.begin_redrive(now, has_pending_startup_restore())
+    else { return 0; };
+    // Publish the next cadence before a retry can enter another service turn.
+    let _ = attempt.retry_at(now.saturating_add(STARTUP_RESTORE_RETRY_100NS));
+    let index = {
+        let rows = &*core::ptr::addr_of!(LANES);
+        let last = LAST_STARTUP_RESTORE.load(Ordering::Relaxed);
+        let after = (last != usize::MAX).then_some(last);
+        next_ready_pending_lane(rows.len(), after, |index| {
+            let row = &rows[index];
+            if row.phase != Phase::StartupRestore || index_for(row.provider, row.owner,
+                row.publication) != Some(index) {
+                return PendingLaneReadiness::Absent;
+            }
+            let Some(pending) = row.startup_restore.as_ref().filter(|pending| pending.retryable)
+            else { return PendingLaneReadiness::Absent; };
+            let StartupRestorePayload::Chain { key, .. } = &pending.payload else {
+                return PendingLaneReadiness::Absent;
+            };
+            if runtime::nested::ticket_matches_channel(pending.ticket, key.scope().route(),
+                key.parent_reply()) {
+                PendingLaneReadiness::Ready
+            } else {
+                PendingLaneReadiness::Blocked
+            }
+        })
+    };
+    let Some(index) = index else { return 0; };
+    LAST_STARTUP_RESTORE.store(index, Ordering::Relaxed);
+    usize::from(retry_startup_restore(index))
 }
 
 unsafe fn channel(index: usize, worker: HostedDriverThreadRuntime,
