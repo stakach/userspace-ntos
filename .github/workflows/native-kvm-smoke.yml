@@ -7,7 +7,7 @@ on:
         description: Bounded guest runtime in seconds
         type: choice
         default: '300'
-        options: ['90', '180', '300', '1200', '1800', '3600']
+        options: ['90', '180', '300', '600', '1200', '1800', '3600']
       boot_runs:
         description: Sequential bounded boots on the same generated disk
         type: choice
