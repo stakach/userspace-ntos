@@ -21,6 +21,7 @@ pub use sel4_rt::*;
 mod serial_records;
 mod ingress_observation;
 mod hpet_read_observation;
+mod calibrated_tsc_clock;
 mod csrss_thread_probe;
 mod desktop_completion_marker;
 pub use serial_records::{debug_put_char, print_str, print_u64};
@@ -16674,6 +16675,14 @@ unsafe fn initialize_hpet_monotonic_epoch(period_fs: u64) {
     let offset = nt_delay_execution::counter_epoch_offset(fallback_now, counter_now);
     HPET_MONOTONIC_OFFSET_100NS.store(offset, Ordering::Relaxed);
     HPET_MONOTONIC_READY.store(true, Ordering::Release);
+    let _ = calibrated_tsc_clock::try_initialize(
+        PLATFORM_TSC_FREQUENCY_HZ.load(Ordering::Acquire),
+        || unsafe {
+            nt_delay_execution::epoch_time_from_counter(
+                hpet_counter_time_100ns(period_fs), offset,
+            )
+        },
+    );
     print_str(b"[hpet-clock] monotonic epoch fallback=");
     print_u64(fallback_now);
     print_str(b" counter=");
@@ -16692,9 +16701,9 @@ fn monotonic_time_100ns() -> u64 {
     let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
     if period != 0 && HPET_MONOTONIC_READY.load(Ordering::Acquire) {
         let offset = HPET_MONOTONIC_OFFSET_100NS.load(Ordering::Relaxed);
-        unsafe {
+        calibrated_tsc_clock::now_or_hpet(|| unsafe {
             nt_delay_execution::epoch_time_from_counter(hpet_counter_time_100ns(period), offset)
-        }
+        })
     } else {
         fallback_monotonic_time_100ns()
     }
