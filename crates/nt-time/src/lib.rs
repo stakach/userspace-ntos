@@ -5,7 +5,8 @@ pub use wake_deadline::earliest_deadline;
 mod delivery_gate;
 pub use delivery_gate::{DeferredTimerProgress, TimerDeliveryGate, TimerDeliveryGuard};
 mod deferred_work;
-pub use deferred_work::{CoalescedRetryWake, DeferredWorkWake, RetryWakeAttempt};
+pub use deferred_work::{CoalescedRetryWake, DeferredWorkWake, RetainedWakeLatency,
+    RetryWakeAttempt, WakeLatencySample, WakeLatencySnapshot};
 mod rearm_request;
 pub use rearm_request::{DeferredRearm, RearmRequest};
 mod rearm_checkpoint;

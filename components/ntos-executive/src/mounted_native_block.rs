@@ -17,6 +17,8 @@ use nt_hosted_runtime::{drain_cached_claims, CacheClaimStep};
 const CACHE_CLAIMS_PER_TURN: usize = 32;
 const MOUNTED_RETRY_DELAY_100NS: u64 = 100_000;
 static WAKE: nt_time::CoalescedRetryWake = nt_time::CoalescedRetryWake::new();
+static WAKE_LATENCY: nt_time::RetainedWakeLatency = nt_time::RetainedWakeLatency::new();
+static WAKE_UNSAMPLED: AtomicU64 = AtomicU64::new(0);
 
 // Native mounted SCSI traffic is distinct from the direct boot AHCI census. Completion is
 // counted only after the exact IRP terminal (and, for pending IRPs, acknowledgement).
@@ -180,6 +182,33 @@ fn record_inter_command_gap(claim_started_ticks: u64) {
 }
 
 pub(super) fn print_census() {
+    let w = WAKE_LATENCY.snapshot();
+    print_str(b"[census] mounted-wake samples/empty/nested/unknown/unsampled=");
+    for (i, n) in [w.samples, w.empty_epochs, w.coalesced_publications,
+        w.unknown_epochs, WAKE_UNSAMPLED.load(Ordering::Relaxed)].iter().enumerate() {
+        if i != 0 { print_str(b"/"); } print_u64(*n);
+    }
+    print_str(b" pub/follow/due/service-total-ms=");
+    for (i, n) in [w.published_total_100ns, w.follow_on_total_100ns,
+        w.due_total_100ns, w.service_total_100ns].iter().enumerate() {
+        if i != 0 { print_str(b"/"); } print_u64(*n / 10_000);
+    }
+    print_str(b" pub/follow-n="); print_u64(w.samples - w.follow_on_samples);
+    print_str(b"/"); print_u64(w.follow_on_samples);
+    for (name, bins, count) in [(b" pub".as_slice(), &w.published_buckets,
+        w.samples - w.follow_on_samples), (b" follow".as_slice(), &w.follow_on_buckets,
+        w.follow_on_samples)] {
+        print_str(name); print_str(b"-p50/p95-bucket-upper-ms=");
+        for p in [50, 95] {
+            if p == 95 { print_str(b"/"); }
+            match nt_time::WakeLatencySnapshot::percentile_bound(bins, count, p) {
+                Some(u64::MAX) => print_str(b"50+"),
+                Some(bound) => print_u64(bound / 10_000),
+                None => print_str(b"none"),
+            }
+        }
+    }
+    print_str(b"\n");
     crate::mounted_volume::print_mounted_create_census();
     // Census can run in a nested completion pump: only observe atomics here.
     METADATA_CREATE_SHADOW.print(b"create");
@@ -713,15 +742,25 @@ fn claimable_timer_work() -> bool {
 }
 
 pub(super) fn publish_wake(now_100ns: u64) {
-    WAKE.publish(now_100ns.saturating_add(MOUNTED_RETRY_DELAY_100NS));
+    let deadline = now_100ns.saturating_add(MOUNTED_RETRY_DELAY_100NS);
+    if claimable_timer_work() { WAKE_LATENCY.publish(now_100ns, deadline); }
+    else { WAKE_UNSAMPLED.fetch_add(1, Ordering::Relaxed); }
+    WAKE.publish(deadline);
 }
 
 pub(super) fn wake_due(now_100ns: u64) -> u64 {
-    u64::from(WAKE.wake_due(now_100ns, claimable_timer_work()))
+    let epoch = WAKE_LATENCY.current_epoch();
+    let due = WAKE.wake_due(now_100ns, claimable_timer_work());
+    if due { if let Some(epoch) = epoch { WAKE_LATENCY.due(epoch, now_100ns); } }
+    u64::from(due)
 }
 
 pub(super) fn next_deadline(_now_100ns: u64) -> Option<u64> {
-    WAKE.next_deadline(claimable_timer_work())
+    let claimable = claimable_timer_work();
+    if !claimable && crate::mounted_volume::mounted_sector_claimable() == Some(false) {
+        if let Some(epoch) = WAKE_LATENCY.current_epoch() { WAKE_LATENCY.empty(epoch); }
+    }
+    WAKE.next_deadline(claimable)
 }
 
 unsafe fn next_claim() -> Option<WorkClaim> {
@@ -856,10 +895,17 @@ struct NativeServiceGuard {
 impl NativeServiceGuard {
     fn enter() -> Option<Self> {
         SERVICE_ACTIVE.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok().map(|_| Self {
-                // Snapshot the published retry even while a physical command is pending.
-                // Settling it may expose another already-queued sector without a new publish.
-                wake_attempt: WAKE.begin_redrive(monotonic_time_100ns(), queued_timer_work()),
+            .ok().map(|_| {
+                if claimable_timer_work() {
+                    if let Some(epoch) = WAKE_LATENCY.current_epoch() {
+                        WAKE_LATENCY.service(epoch, monotonic_time_100ns());
+                    }
+                }
+                Self {
+                    // Snapshot the published retry even while a physical command is pending.
+                    // Settling it may expose another already-queued sector without a new publish.
+                    wake_attempt: WAKE.begin_redrive(monotonic_time_100ns(), queued_timer_work()),
+                }
             })
     }
 }
@@ -867,11 +913,17 @@ impl NativeServiceGuard {
 impl Drop for NativeServiceGuard {
     fn drop(&mut self) {
         if let Some(attempt) = self.wake_attempt.take() {
-            if claimable_timer_work() && attempt.retry_at(
-                monotonic_time_100ns().saturating_add(MOUNTED_RETRY_DELAY_100NS))
-            {
+            let now = monotonic_time_100ns();
+            let deadline = now.saturating_add(MOUNTED_RETRY_DELAY_100NS);
+            if claimable_timer_work() && attempt.retry_at(deadline) {
+                if let Some(epoch) = WAKE_LATENCY.current_epoch() {
+                    WAKE_LATENCY.reschedule(epoch, deadline);
+                } else { WAKE_LATENCY.follow_on(now, deadline); }
                 crate::service_sec_image::request_mounted_native_timer_rearm_after_service();
             }
+        }
+        if crate::mounted_volume::mounted_sector_claimable() == Some(false) {
+            if let Some(epoch) = WAKE_LATENCY.current_epoch() { WAKE_LATENCY.empty(epoch); }
         }
         SERVICE_ACTIVE.store(false, Ordering::Release);
     }
@@ -902,7 +954,11 @@ pub(super) unsafe fn service() -> usize {
             || {
                 let route = native_disk_relation::native_storage_route()?;
                 let search_started = crate::disk_census_ticks();
+                let epoch = WAKE_LATENCY.current_epoch();
                 let claim = next_claim();
+                if matches!(claim.as_ref(), Some(WorkClaim::Sector(_))) {
+                    if let Some(epoch) = epoch { WAKE_LATENCY.claim_sector(epoch, monotonic_time_100ns()); }
+                }
                 NATIVE_CLAIM_SEARCH_PHASE.record(search_started, crate::disk_census_ticks());
                 if first_claim {
                     if claim.is_some() {
