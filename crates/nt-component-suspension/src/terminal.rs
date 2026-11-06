@@ -131,6 +131,13 @@ pub(super) struct TerminalRecord<T> {
     payload: T,
     phase: TerminalPhase,
     next_attempt: u64,
+    pending_nested_callback: Option<PendingNestedCallback>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PendingNestedCallback {
+    outer_token: Option<u64>,
+    new_token: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -160,6 +167,37 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         &mut self,
         nested: NestedRestoreKey,
         outer_callback_token: Option<u64>,
+        admission_sequence: u64,
+        continuation: C,
+        payload: T,
+    ) -> Result<TerminalIdentity, (LaneError, C, T)> {
+        self.retain_nested_restored_terminal_with_callback_owned(
+            nested, outer_callback_token, None, admission_sequence, continuation, payload,
+        )
+    }
+
+    /// Retain a newly published callback above the optional still-running outer callback.
+    /// The new token becomes live in the lane only after all native terminal stages acknowledge.
+    pub fn retain_nested_restored_callback_terminal_owned(
+        &mut self,
+        nested: NestedRestoreKey,
+        outer_callback_token: Option<u64>,
+        new_callback_token: u64,
+        admission_sequence: u64,
+        continuation: C,
+        payload: T,
+    ) -> Result<TerminalIdentity, (LaneError, C, T)> {
+        self.retain_nested_restored_terminal_with_callback_owned(
+            nested, outer_callback_token, Some(new_callback_token), admission_sequence,
+            continuation, payload,
+        )
+    }
+
+    fn retain_nested_restored_terminal_with_callback_owned(
+        &mut self,
+        nested: NestedRestoreKey,
+        outer_callback_token: Option<u64>,
+        new_callback_token: Option<u64>,
         admission_sequence: u64,
         continuation: C,
         payload: T,
@@ -194,6 +232,14 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             {
                 return Err(LaneError::InvalidPhase);
             }
+            if let Some(token) = new_callback_token {
+                if token == 0 || lane.external_tokens.contains(&token) {
+                    return Err(LaneError::InvalidIdentity);
+                }
+                if lane.external_tokens.len() >= self.max_depth_per_lane {
+                    return Err(LaneError::Suspension(SuspensionError::Overflow));
+                }
+            }
             if lane.suspensions.frames.len() >= lane.suspensions.max_depth {
                 return Err(LaneError::Suspension(SuspensionError::Overflow));
             }
@@ -208,6 +254,10 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             let binding = lane.binding;
             self.lane_mut(handle)?.suspensions.frames.try_reserve(1)
                 .map_err(|_| LaneError::NoCapacity)?;
+            if new_callback_token.is_some() {
+                self.lane_mut(handle)?.external_tokens.try_reserve(1)
+                    .map_err(|_| LaneError::NoCapacity)?;
+            }
             Ok((next_epoch, binding))
         })();
         let (next_epoch, binding) = match preflight {
@@ -221,12 +271,15 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         });
         let identity = TerminalIdentity {
             dispatch, resume_epoch: next_epoch, binding, key, owner,
-            external_token: outer_callback_token,
+            external_token: new_callback_token.or(outer_callback_token),
         };
         lane.terminal = Some(TerminalRecord {
             identity, payload,
             phase: TerminalPhase::Ready { stage: TerminalStage::Output, last_error: None },
             next_attempt: 1,
+            pending_nested_callback: new_callback_token.map(|new_token| PendingNestedCallback {
+                outer_token: outer_callback_token, new_token,
+            }),
         });
         lane.resume_epoch = next_epoch;
         lane.phase = LanePhase::Terminal;
@@ -370,6 +423,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
                 last_error: None,
             },
             next_attempt: 1,
+            pending_nested_callback: None,
         });
         lane.phase = LanePhase::Terminal;
         self.running = None;

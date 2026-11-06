@@ -216,6 +216,38 @@ fn restored_nested_callback_transfers_exact_external_token_to_real_wait() {
 }
 
 #[test]
+fn resumed_nested_callback_terminal_must_retain_new_token_after_ack() {
+    use crate::{NestedRestoreKey, TerminalStage, TerminalStageOutcome};
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let lane = dispatch.lane();
+    let reply = f.lanes.binding(lane).unwrap().reply_object;
+    let owner = receive_owner(dispatch);
+    f.lanes.suspend_running(lane, reply, 77).unwrap();
+    f.lanes.resume_external(lane, reply, 77).unwrap();
+    let mut scope = f.receiver.suspend_for_nested_execution(
+        route, dispatch, &mut f.lanes, &f.peers, bound,
+    ).unwrap();
+    let key = NestedRestoreKey::new(scope.identity(), reply, 501, owner).unwrap();
+    f.receiver.resume_nested_execution(&mut scope, &mut f.lanes, &f.peers, bound).unwrap();
+    let terminal = f.lanes.retain_nested_restored_callback_terminal_owned(
+        key, Some(77), 88, 1, 123, (),
+    ).unwrap();
+    for stage in [TerminalStage::Output, TerminalStage::Context,
+        TerminalStage::Publication, TerminalStage::Reply] {
+        let mut attempt = f.lanes.begin_terminal_stage(terminal, reply, stage).unwrap();
+        f.lanes.record_terminal_stage(&mut attempt, reply, TerminalStageOutcome::Acknowledged)
+            .unwrap();
+    }
+    f.lanes.finish_shared_nested_restore_terminal(
+        route, dispatch, terminal, reply, Ok(()),
+    ).unwrap().unwrap();
+    // A genuine newly published callback token must be above the still-running outer token.
+    assert_eq!(f.lanes.external_depth(lane), Ok(2));
+    assert_eq!(f.lanes.external_top(lane), Ok(Some(88)));
+}
+
+#[test]
 fn restored_nested_continuation_moves_to_a_real_wait_only_after_admission() {
     use crate::{NestedRestoreFrame, NestedRestoreFrameError as Error, NestedRestoreKey,
         NestedRestorePhase as Phase, SuspensionKey};

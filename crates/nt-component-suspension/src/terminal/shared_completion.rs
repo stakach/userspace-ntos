@@ -63,9 +63,16 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             || lane.binding.executor_id != route.identity().executor
             || lane.binding.receive_endpoint != route.endpoint()
             || lane.suspensions.len() != 1
-            || match identity.external_token {
-                Some(token) => lane.external_tokens.last().copied() != Some(token),
-                None => !lane.external_tokens.is_empty(),
+            || match record.pending_nested_callback {
+                Some(callback) => {
+                    identity.external_token != Some(callback.new_token)
+                        || lane.external_tokens.last().copied() != callback.outer_token
+                        || (callback.outer_token.is_none() && !lane.external_tokens.is_empty())
+                }
+                None => match identity.external_token {
+                    Some(token) => lane.external_tokens.last().copied() != Some(token),
+                    None => !lane.external_tokens.is_empty(),
+                },
             }
             || !lane.suspensions.top().is_some_and(|frame| {
                 frame.key == identity.key && frame.owner == identity.owner
@@ -78,6 +85,11 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             return Err(LaneError::InvalidPhase);
         }
         if self.execution_busy() { return Err(LaneError::Busy); }
+        if record.pending_nested_callback.is_some()
+            && lane.external_tokens.len() >= lane.external_tokens.capacity()
+        {
+            return Err(LaneError::NoCapacity);
+        }
         let lane = self.lane_mut(identity.lane())?;
         if let Err(status) = local_retirement {
             lane.terminal.as_mut().unwrap().phase = TerminalPhase::Acknowledged {
@@ -87,6 +99,10 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         }
         let frame = lane.suspensions.frames.pop().unwrap();
         let terminal = lane.terminal.take().unwrap();
+        if let Some(callback) = terminal.pending_nested_callback {
+            // Retention reserved this slot and checked uniqueness before native effects.
+            lane.external_tokens.push(callback.new_token);
+        }
         lane.phase = LanePhase::Running;
         self.running = Some(identity.lane());
         Ok(Some(RetiredNestedRestore {

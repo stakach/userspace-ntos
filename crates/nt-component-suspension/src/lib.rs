@@ -1118,20 +1118,9 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         owner: SuspensionOwner,
         continuation: C,
     ) -> Result<(), (LaneError, C)> {
-        if callback_token == 0 || callback_token == service_token {
-            return Err((LaneError::InvalidIdentity, continuation));
-        }
-        if let Err(error) = self.validate_service_wait_external(
-            handle, reply_object, dispatch, service_token,
-        ) {
-            return Err((error, continuation));
-        }
-        let lane = self.lane(handle).expect("validated service wait lane");
-        if lane.external_tokens.len() < 2
-            || lane.external_tokens[lane.external_tokens.len() - 2] != callback_token
-        {
-            return Err((LaneError::InvalidPhase, continuation));
-        }
+        if let Err(error) = self.validate_callback_below_service(
+            handle, reply_object, dispatch, callback_token, service_token,
+        ) { return Err((error, continuation)); }
         self.admit_service_wait_external_owned(
             handle, reply_object, dispatch, service_token, key,
             admission_sequence, owner, continuation,
@@ -1139,6 +1128,50 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         let lane = self.lane_mut(handle).expect("admitted service wait lane");
         let callback_index = lane.external_tokens.len() - 2;
         lane.external_tokens.remove(callback_index);
+        Ok(())
+    }
+
+    /// Admit a service wait reached by a syscall while the lower callback is still running.
+    /// Unlike a completed NtCallbackReturn, the lower callback remains on the external stack.
+    pub fn admit_in_callback_service_wait_external_owned(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        dispatch: LaneDispatchIdentity,
+        callback_token: u64,
+        service_token: u64,
+        key: SuspensionKey,
+        admission_sequence: u64,
+        owner: SuspensionOwner,
+        continuation: C,
+    ) -> Result<(), (LaneError, C)> {
+        if let Err(error) = self.validate_callback_below_service(
+            handle, reply_object, dispatch, callback_token, service_token,
+        ) { return Err((error, continuation)); }
+        self.admit_service_wait_external_owned(
+            handle, reply_object, dispatch, service_token, key,
+            admission_sequence, owner, continuation,
+        )
+    }
+
+    fn validate_callback_below_service(
+        &self,
+        handle: LaneHandle,
+        reply_object: u64,
+        dispatch: LaneDispatchIdentity,
+        callback_token: u64,
+        service_token: u64,
+    ) -> Result<(), LaneError> {
+        if callback_token == 0 || callback_token == service_token {
+            return Err(LaneError::InvalidIdentity);
+        }
+        self.validate_service_wait_external(handle, reply_object, dispatch, service_token)?;
+        let lane = self.lane(handle).expect("validated service wait lane");
+        if lane.external_tokens.len() < 2
+            || lane.external_tokens[lane.external_tokens.len() - 2] != callback_token
+        {
+            return Err(LaneError::InvalidPhase);
+        }
         Ok(())
     }
 
