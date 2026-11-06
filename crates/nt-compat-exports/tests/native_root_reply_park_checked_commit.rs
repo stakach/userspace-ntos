@@ -9,7 +9,8 @@ fn checked_root_reply_park_validates_before_mutating_pool_or_main_slot() {
         .expect("checked park commit")
         .split("pub(crate) unsafe fn quarantine_current_hosted_reply").next().unwrap();
     assert!(body.contains("REPLY_MAIN_SLOT.load"));
-    assert!(body.contains("wait_reply_pool_find_cap"));
+    assert!(body.contains("wait_reply_pool_ref().find_cap"));
+    assert!(body.contains("RootReplySlotState::Used"));
     assert!(body.contains("can_park_hosted_reply"));
     assert!(body.contains("wait_reply_pool_mark_used"));
     assert!(body.contains("REPLY_MAIN_SLOT.store"));
