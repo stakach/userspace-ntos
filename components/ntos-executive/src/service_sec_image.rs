@@ -2139,7 +2139,8 @@ unsafe fn component_suspension_cancel_scope(
         let external_cancelled = match wait_key.kind {
             nt_component_suspension::SuspensionKind::Receive
             | nt_component_suspension::SuspensionKind::ServiceWait
-            | nt_component_suspension::SuspensionKind::RootMaintenance => return false,
+            | nt_component_suspension::SuspensionKind::RootMaintenance
+            | nt_component_suspension::SuspensionKind::NestedRestore => return false,
             nt_component_suspension::SuspensionKind::ProviderWait => {
                 (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER))
                     .cancel(nt_handler, wait_key.id, 0xC000_0120u32 as i32)

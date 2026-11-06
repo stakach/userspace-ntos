@@ -224,6 +224,7 @@ unsafe fn trace_receive_failure(
                 nt_component_suspension::SuspensionKind::ProviderWait => 3,
                 nt_component_suspension::SuspensionKind::LpcRequest => 4,
                 nt_component_suspension::SuspensionKind::RootMaintenance => 5,
+                nt_component_suspension::SuspensionKind::NestedRestore => 6,
             });
             print_str(b"/");
             print_u64(frame.key.id);
