@@ -89,6 +89,7 @@ pub use resume_pass::ResumePass;
 mod resume_wake;
 pub use resume_wake::{ResumeDemand, ResumeWake, ResumeWakeError, ResumeWakePass};
 pub use terminal::{
+    ContinueReparkOutcome, ContinueReparkPhase, SharedContinueRepark,
     RetiredNestedRestore, RetiredRootMaintenance, RetiredTerminal, TerminalAttempt, TerminalIdentity, TerminalPhase, TerminalStage,
     TerminalStageOutcome, TerminalView,
 };

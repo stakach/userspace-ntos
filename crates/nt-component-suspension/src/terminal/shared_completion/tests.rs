@@ -1,6 +1,8 @@
 use super::*;
 use crate::{IngressReceiveDisposition, IpcBufferSnapshot, ReceivedMessage};
 
+mod shared_continue_repark;
+
 type Lanes = ComponentSuspensionLanes<u64, u32, u64>;
 
 fn bound(_: u64, _: u64) -> Result<ReplyBindingObservation, u8> {

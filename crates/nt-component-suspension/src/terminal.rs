@@ -3,6 +3,8 @@
 use super::*;
 
 mod shared_completion;
+mod shared_continue_repark;
+pub use shared_continue_repark::{ContinueReparkOutcome, ContinueReparkPhase, SharedContinueRepark};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalIdentity {
