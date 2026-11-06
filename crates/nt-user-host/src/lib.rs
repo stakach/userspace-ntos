@@ -76,6 +76,7 @@ pub mod provider_directory_query;
 pub mod provider_named_event;
 pub mod provider_registry_callers;
 pub mod provider_thread_projection;
+pub mod physical_execution_restore;
 pub mod provider_dispatch_clients;
 mod services;
 pub mod sched_context;

@@ -15,6 +15,9 @@ pub(crate) use sources::{PhysicalDomain, PhysicalSource, PhysicalSourceKind};
 #[path = "component_ingress_nested.rs"]
 pub(crate) mod nested;
 
+#[path = "component_ingress_physical_hold.rs"]
+pub(crate) mod physical_hold;
+
 #[path = "component_ingress_services.rs"]
 mod services;
 pub(crate) use services::{
