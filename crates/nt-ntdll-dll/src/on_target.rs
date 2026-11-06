@@ -2169,8 +2169,8 @@ unsafe fn snap_descriptor_against(
     dep_base: u64,
     table: *mut ModuleTable,
     out: &mut SnapResult,
-    expansion: &mut nt_ntdll::loader::reference_graph::ReferenceExpansion<MODULE_TABLE_CAP>,
     mut trace: Option<&mut runtime_loader_trace::SnapDescriptorTrace>,
+    expansion: &mut nt_ntdll::loader::reference_graph::ReferenceExpansion<MODULE_TABLE_CAP>,
 ) {
     // SAFETY: caller contract — mapped images, writable IAT.
     unsafe {
@@ -3197,8 +3197,8 @@ unsafe fn snap_module(
                         dep_base,
                         table,
                         out,
-                        expansion,
                         snap_trace.as_mut(),
+                        expansion,
                     );
                     if out.status != 0 {
                         if let Some(trace) = snap_trace.take() {
