@@ -20,6 +20,7 @@ extern crate alloc;
 pub use sel4_rt::*;
 mod serial_records;
 mod ingress_observation;
+mod hpet_read_observation;
 mod csrss_thread_probe;
 mod desktop_completion_marker;
 pub use serial_records::{debug_put_char, print_str, print_u64};
@@ -16658,7 +16659,9 @@ fn fallback_monotonic_time_100ns() -> u64 {
 
 #[inline]
 unsafe fn hpet_counter_time_100ns(period_fs: u64) -> u64 {
-    let ticks = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
+    let ticks = hpet_read_observation::read_counter(
+        (HPET_VADDR + HPET_MAIN_COUNTER) as *const u64,
+    );
     nt_delay_execution::ticks_to_100ns(ticks, period_fs)
 }
 
@@ -16929,25 +16932,61 @@ fn wait_reply_pool_insert_cap(cap: u64, used: bool) -> Option<usize> {
 }
 
 fn wait_reply_pool_allocate_spare() -> Option<(usize, u64)> {
+    // Reserve table storage and the slot generation before any native allocation or retype.
+    // After retype acknowledgement publication cannot fail for heap or generation capacity.
+    let lease = match unsafe { wait_reply_pool_mut().prepare_spare() } {
+        Ok(lease) => lease,
+        Err(_) => {
+            WAIT_REPLY_POOL_ALLOCATION_FAILURES.fetch_add(1, Ordering::Relaxed);
+            WAIT_REPLY_POOL_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
     let cap = match try_alloc_slot() {
         Some(cap) => cap,
         None => {
+            let _ = unsafe { wait_reply_pool_mut().cancel_spare_no_effects(lease) };
             WAIT_REPLY_POOL_SLOT_FAILURES.fetch_add(1, Ordering::Relaxed);
             return None;
         }
     };
-    let retype = unsafe { untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap) };
-    if retype != 0 {
-        WAIT_REPLY_POOL_RETYPE_FAILURES.fetch_add(1, Ordering::Relaxed);
-        unsafe {
-            recycle_deleted_root_slot(cap);
-        }
+    if unsafe { wait_reply_pool_mut().bind_spare(&lease, cap) }.is_err() {
+        // The root slot allocator still owns this allocated slot. A duplicate or changed
+        // identity cannot be recycled from this Reply path, but no retype was entered.
+        let _ = unsafe { wait_reply_pool_mut().cancel_spare_no_effects(lease) };
+        WAIT_REPLY_POOL_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        print_str(b"[reply-pool] refused fresh spare binding cap=");
+        print_hex_u64(cap);
+        print_str(b"\n");
         return None;
     }
-    match wait_reply_pool_insert_cap(cap, false) {
-        Some(index) => Some((index, cap)),
-        None => {
-            let _ = unsafe { cnode_delete_recycle_r(cap) };
+    let retype = unsafe { untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap) };
+    match retype {
+        0 => match unsafe { wait_reply_pool_mut().publish_spare(lease) } {
+            Ok(identity) => Some((identity.slot(), cap)),
+            Err(_) => {
+                // The bound prepared slot remains non-free and owns the created Reply.
+                WAIT_REPLY_POOL_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        },
+        1..=10 => {
+            WAIT_REPLY_POOL_RETYPE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            if unsafe { wait_reply_pool_mut().cancel_spare_no_effects(lease) }.is_ok() {
+                unsafe { recycle_deleted_root_slot(cap); }
+            }
+            None
+        }
+        _ => {
+            WAIT_REPLY_POOL_RETYPE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            if unsafe { wait_reply_pool_mut().quarantine_spare(lease) }.is_err() {
+                WAIT_REPLY_POOL_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            }
+            print_str(b"[reply-pool] uncertain spare retype cap=");
+            print_hex_u64(cap);
+            print_str(b" label=");
+            print_u64(retype);
+            print_str(b"\n");
             None
         }
     }

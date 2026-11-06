@@ -156,6 +156,7 @@ pub(crate) fn print_hold_snapshot(now: u64) {
     let _ = writeln!(record, "[ps-create-parent-progress] count={} label={} op={}",
         messages, info >> 12, op);
     append_wait_latency_census(&mut record, now);
+    crate::hpet_read_observation::append_census(&mut record);
     // Only copied, exact CSRSS-role ALPC ownership is sampled; this does not
     // poll, select, cancel, or wake the retained native request.
     static CSRSS_ALPC_SAMPLES: core::sync::atomic::AtomicU64 =

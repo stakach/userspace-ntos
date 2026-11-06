@@ -55,6 +55,7 @@ pub use ingress_resources::{IngressResources, IngressResourceKind, IngressResour
 pub use reply_pool::{IngressReplyPool, ReplyAdmissionError, ReplyPoolError};
 pub use root_reply_replacement::{
     RootReplyIdentity, RootReplyReplacementError, RootReplyReplacementLease,
+    RootReplySpareLease,
     RootReplyRetypeOutcome,
     RootReplySlotState, RootReplySlotTable,
 };

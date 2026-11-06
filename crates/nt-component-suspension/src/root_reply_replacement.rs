@@ -35,6 +35,16 @@ pub struct RootReplyReplacementLease {
     retirement_generation: u64,
 }
 
+/// Pre-effect ownership of one future root Reply slot. A native cap must be bound to this
+/// exact reservation before its retype is entered.
+#[derive(Debug, Eq, PartialEq)]
+#[must_use = "retain this spare reservation through native allocation and retype"]
+pub struct RootReplySpareLease {
+    table_generation: u64,
+    slot: usize,
+    slot_generation: u64,
+}
+
 impl RootReplyReplacementLease {
     pub const fn active(self) -> RootReplyIdentity {
         self.active
@@ -49,6 +59,7 @@ pub enum RootReplySlotState {
     Vacant,
     Free,
     Reserved,
+    SparePrepared,
     Used,
     Quarantined,
 }
@@ -72,6 +83,7 @@ pub enum RootReplyReplacementError {
     NotFree,
     NotUsed,
     ReservedReply,
+    UnboundSpare,
     QuarantinedReply,
     ActiveReply,
 }
@@ -81,6 +93,7 @@ enum SlotState {
     Vacant,
     Free,
     Reserved { generation: u64 },
+    SparePrepared { generation: u64 },
     Used,
     Quarantined,
 }
@@ -145,7 +158,8 @@ impl RootReplySlotTable {
     pub fn used_count(&self) -> usize {
         self.slots
             .iter()
-            .filter(|slot| matches!(slot.state, SlotState::Used | SlotState::Quarantined))
+            .filter(|slot| matches!(slot.state, SlotState::Used | SlotState::Quarantined)
+                || (matches!(slot.state, SlotState::SparePrepared { .. }) && slot.cap != 0))
             .count()
     }
 
@@ -154,6 +168,7 @@ impl RootReplySlotTable {
             SlotState::Vacant => RootReplySlotState::Vacant,
             SlotState::Free => RootReplySlotState::Free,
             SlotState::Reserved { .. } => RootReplySlotState::Reserved,
+            SlotState::SparePrepared { .. } => RootReplySlotState::SparePrepared,
             SlotState::Used => RootReplySlotState::Used,
             SlotState::Quarantined => RootReplySlotState::Quarantined,
         })
@@ -168,6 +183,7 @@ impl RootReplySlotTable {
             SlotState::Vacant => RootReplySlotState::Vacant,
             SlotState::Free => RootReplySlotState::Free,
             SlotState::Reserved { .. } => RootReplySlotState::Reserved,
+            SlotState::SparePrepared { .. } => RootReplySlotState::SparePrepared,
             SlotState::Used => RootReplySlotState::Used,
             SlotState::Quarantined => RootReplySlotState::Quarantined,
         })
@@ -185,7 +201,8 @@ impl RootReplySlotTable {
 
     pub fn at(&self, index: usize) -> Option<RootReplyIdentity> {
         let slot = self.slots.get(index)?;
-        (!matches!(slot.state, SlotState::Vacant)).then(|| self.identity_at(index))
+        (slot.cap != 0 && !matches!(slot.state, SlotState::Vacant))
+            .then(|| self.identity_at(index))
     }
 
     /// The caller can exclude a free cap that is still owned by shared ingress. This observation
@@ -195,6 +212,96 @@ impl RootReplySlotTable {
             (matches!(slot.state, SlotState::Free) && eligible(slot.cap))
                 .then(|| self.identity_at(index))
         })
+    }
+
+    /// Establish the pure spare-allocation boundary before any native cap is allocated.
+    pub fn prepare_spare(&mut self) -> Result<RootReplySpareLease, RootReplyReplacementError> {
+        if self.generation == 0 {
+            return Err(RootReplyReplacementError::Uninitialized);
+        }
+        let next = self.next_generation.checked_add(1)
+            .ok_or(RootReplyReplacementError::NoCapacity)?;
+        let index = if let Some(index) = self.slots.iter()
+            .position(|slot| matches!(slot.state, SlotState::Vacant)) {
+            index
+        } else {
+            self.slots.try_reserve(1)
+                .map_err(|_| RootReplyReplacementError::NoCapacity)?;
+            self.slots.push(Slot { cap: 0, generation: 0, state: SlotState::Vacant });
+            self.slots.len() - 1
+        };
+        let generation = self.next_generation;
+        self.slots[index] = Slot {
+            cap: 0,
+            generation,
+            state: SlotState::SparePrepared { generation },
+        };
+        self.next_generation = next;
+        Ok(RootReplySpareLease {
+            table_generation: self.generation,
+            slot: index,
+            slot_generation: generation,
+        })
+    }
+
+    /// Record the allocated root CSpace slot before entering native retype. The native slot
+    /// allocator owns the allocation itself; this table excludes it from other Reply claims.
+    pub fn bind_spare(
+        &mut self,
+        lease: &RootReplySpareLease,
+        cap: u64,
+    ) -> Result<RootReplyIdentity, RootReplyReplacementError> {
+        self.exact_spare(lease)?;
+        if cap == 0 { return Err(RootReplyReplacementError::InvalidCap); }
+        if self.find_cap(cap).is_some() {
+            return Err(RootReplyReplacementError::DuplicateCap);
+        }
+        if self.slots[lease.slot].cap != 0 {
+            return Err(RootReplyReplacementError::StaleLease);
+        }
+        self.slots[lease.slot].cap = cap;
+        Ok(self.identity_at(lease.slot))
+    }
+
+    /// Acknowledged native retype has created one Reply in the previously bound cap. This
+    /// transition cannot allocate or consume a new generation after the native effect.
+    pub fn publish_spare(
+        &mut self,
+        lease: RootReplySpareLease,
+    ) -> Result<RootReplyIdentity, RootReplyReplacementError> {
+        self.exact_spare(&lease)?;
+        if self.slots[lease.slot].cap == 0 {
+            return Err(RootReplyReplacementError::UnboundSpare);
+        }
+        self.slots[lease.slot].state = SlotState::Free;
+        Ok(self.identity_at(lease.slot))
+    }
+
+    /// An unexpected native result leaves the bound cap unusable until independent proof of
+    /// its physical state. It cannot re-enter the free pool or be cleared by a numeric cap.
+    pub fn quarantine_spare(
+        &mut self,
+        lease: RootReplySpareLease,
+    ) -> Result<RootReplyIdentity, RootReplyReplacementError> {
+        self.exact_spare(&lease)?;
+        if self.slots[lease.slot].cap == 0 {
+            return Err(RootReplyReplacementError::UnboundSpare);
+        }
+        self.slots[lease.slot].state = SlotState::Quarantined;
+        Ok(self.identity_at(lease.slot))
+    }
+
+    /// Cancel only after a certified no-effect retype. The root allocator may then recycle
+    /// the allocated but empty CSpace slot; a stale lease cannot erase a reused Reply slot.
+    pub fn cancel_spare_no_effects(
+        &mut self,
+        lease: RootReplySpareLease,
+    ) -> Result<(), RootReplyReplacementError> {
+        self.exact_spare(&lease)?;
+        let slot = &mut self.slots[lease.slot];
+        slot.cap = 0;
+        slot.state = SlotState::Vacant;
+        Ok(())
     }
 
     /// Register a genuinely fresh cap after native allocation and retype acknowledge.
@@ -390,6 +497,7 @@ impl RootReplySlotTable {
             SlotState::Free => Ok(identity),
             SlotState::Used => self.retire_used(identity, current_main),
             SlotState::Reserved { .. } => Err(RootReplyReplacementError::ReservedReply),
+            SlotState::SparePrepared { .. } => Err(RootReplyReplacementError::ReservedReply),
             SlotState::Quarantined => Err(RootReplyReplacementError::QuarantinedReply),
             SlotState::Vacant => Err(RootReplyReplacementError::StaleIdentity),
         }
@@ -426,6 +534,7 @@ impl RootReplySlotTable {
             SlotState::Free => Ok(()),
             SlotState::Used => self.make_free(old_main).map(|_| ()),
             SlotState::Reserved { .. } => Err(RootReplyReplacementError::ReservedReply),
+            SlotState::SparePrepared { .. } => Err(RootReplyReplacementError::ReservedReply),
             SlotState::Quarantined => Err(RootReplyReplacementError::QuarantinedReply),
             SlotState::Vacant => Err(RootReplyReplacementError::StaleIdentity),
         }
@@ -443,6 +552,9 @@ impl RootReplySlotTable {
         }
         let state = self.exact(identity)?.state;
         if matches!(state, SlotState::Reserved { .. }) {
+            return Err(RootReplyReplacementError::ReservedReply);
+        }
+        if matches!(state, SlotState::SparePrepared { .. }) {
             return Err(RootReplyReplacementError::ReservedReply);
         }
         if matches!(state, SlotState::Quarantined) {
@@ -502,6 +614,21 @@ impl RootReplySlotTable {
             .map_err(|_| RootReplyReplacementError::StaleLease)?;
         if !matches!(slot.state, SlotState::Reserved { generation }
             if generation == lease.reservation_generation)
+        {
+            return Err(RootReplyReplacementError::StaleLease);
+        }
+        Ok(())
+    }
+
+    fn exact_spare(&self, lease: &RootReplySpareLease)
+        -> Result<(), RootReplyReplacementError>
+    {
+        let slot = self.slots.get(lease.slot)
+            .ok_or(RootReplyReplacementError::StaleLease)?;
+        if lease.table_generation != self.generation
+            || slot.generation != lease.slot_generation
+            || !matches!(slot.state, SlotState::SparePrepared { generation }
+                if generation == lease.slot_generation)
         {
             return Err(RootReplyReplacementError::StaleLease);
         }

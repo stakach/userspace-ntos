@@ -285,3 +285,80 @@ fn uninitialized_static_table_has_zero_stats_and_cannot_claim_a_reply() {
         Err(RootReplyReplacementError::Uninitialized)
     );
 }
+
+#[test]
+fn spare_preparation_refuses_exhausted_generation_before_native_allocation() {
+    let mut table = RootReplySlotTable::new(0).unwrap();
+    table.next_generation = u64::MAX;
+    let before = (table.len(), table.live_count(), table.used_count());
+    assert_eq!(table.prepare_spare(), Err(RootReplyReplacementError::NoCapacity));
+    assert_eq!((table.len(), table.live_count(), table.used_count()), before);
+}
+
+#[test]
+fn prepared_spare_excludes_reuse_until_exact_publication() {
+    let mut table = RootReplySlotTable::new(1).unwrap();
+    let lease = table.prepare_spare().unwrap();
+    assert_eq!(table.slot_state(0), Some(RootReplySlotState::SparePrepared));
+    assert_eq!(table.at(0), None);
+    assert_eq!(table.find_free(|_| true), None);
+    let independent = table.insert_free(20).unwrap();
+    assert_ne!(independent.slot(), 0);
+    let bound = table.bind_spare(&lease, 30).unwrap();
+    assert_eq!(table.state(bound), Ok(RootReplySlotState::SparePrepared));
+    assert_eq!(table.find_free(|_| true), Some(independent));
+    assert_eq!(table.publish_spare(lease), Ok(bound));
+    assert_eq!(table.state(bound), Ok(RootReplySlotState::Free));
+}
+
+#[test]
+fn spare_publication_needs_no_generation_after_native_retype() {
+    let mut table = RootReplySlotTable::new(0).unwrap();
+    let lease = table.prepare_spare().unwrap();
+    let bound = table.bind_spare(&lease, 30).unwrap();
+    table.next_generation = u64::MAX;
+    assert_eq!(table.publish_spare(lease), Ok(bound));
+    assert_eq!(table.state(bound), Ok(RootReplySlotState::Free));
+}
+
+#[test]
+fn uncertain_spare_retype_quarantines_exact_bound_cap() {
+    let mut table = RootReplySlotTable::new(0).unwrap();
+    let lease = table.prepare_spare().unwrap();
+    let bound = table.bind_spare(&lease, 30).unwrap();
+    assert_eq!(table.quarantine_spare(lease), Ok(bound));
+    assert_eq!(table.find_cap(30), Some(bound));
+    assert_eq!(table.state(bound), Ok(RootReplySlotState::Quarantined));
+    assert_eq!(table.find_free(|_| true), None);
+    assert_eq!(table.mark_free(bound, None), Err(RootReplyReplacementError::QuarantinedReply));
+    assert_eq!(table.clear(bound, None), Err(RootReplyReplacementError::QuarantinedReply));
+}
+
+#[test]
+fn certified_no_effect_spare_cancellation_invalidates_old_lease() {
+    let mut table = RootReplySlotTable::new(0).unwrap();
+    let lease = table.prepare_spare().unwrap();
+    let bound = table.bind_spare(&lease, 30).unwrap();
+    let stale = RootReplySpareLease {
+        table_generation: lease.table_generation,
+        slot: lease.slot,
+        slot_generation: lease.slot_generation,
+    };
+    assert_eq!(table.cancel_spare_no_effects(lease), Ok(()));
+    assert_eq!(table.find_cap(30), None);
+    let reused = table.insert_free(30).unwrap();
+    assert_eq!(reused.slot(), bound.slot());
+    assert_ne!(reused, bound);
+    assert_eq!(table.publish_spare(stale), Err(RootReplyReplacementError::StaleLease));
+}
+
+#[test]
+fn duplicate_spare_cap_cannot_displace_existing_reply() {
+    let mut table = RootReplySlotTable::new(0).unwrap();
+    let existing = table.insert_used(10).unwrap();
+    let lease = table.prepare_spare().unwrap();
+    assert_eq!(table.bind_spare(&lease, 10), Err(RootReplyReplacementError::DuplicateCap));
+    assert_eq!(table.find_cap(10), Some(existing));
+    assert_eq!(table.state(existing), Ok(RootReplySlotState::Used));
+    assert_eq!(table.cancel_spare_no_effects(lease), Ok(()));
+}
