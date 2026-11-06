@@ -165,6 +165,24 @@ fn accepted_or_indeterminate_transfer_cannot_reenter_returned_phase() {
 }
 
 #[test]
+fn entered_receive_keeps_its_owner_row_until_the_return_is_stored() {
+    let resuming = OWNER.split("pub(crate) unsafe fn mark_resuming(").nth(1)
+        .expect("receive entry keeps an admitted owner")
+        .split("pub(crate) unsafe fn ").next().unwrap();
+    assert!(resuming.contains("row.state = State::Resuming"));
+    let store = OWNER.split("pub(crate) unsafe fn store_result(").nth(1)
+        .expect("returned result is written into that owner")
+        .split("fn result_kind(").next().unwrap();
+    assert!(store.contains("row.state != State::Resuming || row.post_pump.is_some()"));
+    assert!(store.contains("row.post_pump = Some(PostPump { result"));
+    let retire = OWNER.split("pub(crate) unsafe fn can_retire(").nth(1)
+        .expect("retirement gate after native return")
+        .split("pub(crate) unsafe fn ").next().unwrap();
+    assert!(retire.contains("RootMaintenanceTransferPhase::Transferred"),
+        "the row cannot retire between receive entry and result storage");
+}
+
+#[test]
 fn repeated_same_frame_repark_prepares_one_generation_bound_owner_before_acquire() {
     let prepare = OWNER.split("pub(crate) unsafe fn prepare_next_repark(").nth(1)
         .expect("atomic fresh maintenance owner preparation")

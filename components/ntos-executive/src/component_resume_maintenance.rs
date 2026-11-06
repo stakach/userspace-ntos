@@ -552,8 +552,7 @@ unsafe fn repark_maintenance(
     {
         return RootMaintenanceResumeOutcome::RetainedFailure;
     }
-    let Some(new_ticket) = root_maintenance_owner::prepare_next_repark(ticket, next)
-        .or_else(|| root_maintenance_owner::next_repark_ticket(ticket)) else {
+    let Some(new_ticket) = root_maintenance_owner::prepare_next_repark(ticket, next) else {
         return RootMaintenanceResumeOutcome::DeferredRetry;
     };
     let needs_transfer = match need_pure_frame_transfer(ticket, TransferKind::RootMaintenance, key) {
