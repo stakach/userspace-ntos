@@ -21,6 +21,8 @@ fn nested_identity_sequence_matches_only_its_active_lane_epoch() {
         Ok(LanePhase::NestedExecution(identity.sequence() + 1)));
 }
 
+mod nested_restore_frame;
+
 fn child_settlement() -> crate::ExternalSettlement {
     let lanes = ComponentSuspensionLanes::<u64, u32>::new(1, 2);
     let mut receiver = IngressReceiver::new(20, 300, 1).unwrap();

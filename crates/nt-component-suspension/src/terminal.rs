@@ -117,6 +117,15 @@ pub struct RetiredRootMaintenance<C, T> {
     pub payload: T,
 }
 
+/// A nested restore has no provider completion value. The original continuation is released
+/// only after a real receive-half terminal and its ordinary Reply stages acknowledge.
+pub struct RetiredNestedRestore<C, T> {
+    pub key: SuspensionKey,
+    pub owner: SuspensionOwner,
+    pub continuation: C,
+    pub payload: T,
+}
+
 pub(super) struct TerminalRecord<T> {
     identity: TerminalIdentity,
     payload: T,
@@ -142,6 +151,82 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             slot.lane.as_ref().and_then(|lane| lane.terminal.as_ref())
                 .is_some_and(|record| matches!(record.phase, TerminalPhase::Invoking { .. }))
         })
+    }
+
+    /// Atomically retain a real terminal from a restored nested parent. The caller's physical
+    /// owner still holds the original root Reply; this pure transition does not synthesize `R`
+    /// or enter a native effect. Every refusal returns both owned values unchanged.
+    pub fn retain_nested_restored_terminal_owned(
+        &mut self,
+        nested: NestedRestoreKey,
+        admission_sequence: u64,
+        continuation: C,
+        payload: T,
+    ) -> Result<TerminalIdentity, (LaneError, C, T)> {
+        let scope = nested.scope();
+        let route = scope.route();
+        let dispatch = scope.dispatch();
+        let handle = dispatch.lane();
+        let reply = nested.parent_reply();
+        let owner = nested.owner();
+        let key = SuspensionKey::nested_restore(scope.sequence());
+        let preflight = (|| -> Result<(u64, LaneBinding), LaneError> {
+            if admission_sequence == 0 || !owner.is_valid() || !key.is_valid()
+                || route.identity().lane != handle || dispatch.lane() != handle
+            {
+                return Err(LaneError::InvalidIdentity);
+            }
+            self.validate_running(handle, reply)?;
+            self.validate_dispatch_owner(handle, owner)?;
+            let lane = self.lane(handle)?;
+            if lane.dispatch != Some(dispatch) || lane.shared_peer != Some(route)
+                || lane.binding.executor_id != route.identity().executor
+                || lane.binding.receive_endpoint != route.endpoint()
+            {
+                return Err(LaneError::InvalidIdentity);
+            }
+            if lane.terminal.is_some() || !lane.suspensions.is_empty()
+                || !lane.external_tokens.is_empty()
+            {
+                return Err(LaneError::InvalidPhase);
+            }
+            if lane.suspensions.frames.len() >= lane.suspensions.max_depth {
+                return Err(LaneError::Suspension(SuspensionError::Overflow));
+            }
+            if self.slots.iter().any(|slot| slot.lane.as_ref().is_some_and(|other| {
+                other.suspensions.frames.iter().any(|frame| {
+                    frame.key == key || frame.owner == owner
+                })
+            })) {
+                return Err(LaneError::Suspension(SuspensionError::DuplicateIdentity));
+            }
+            let next_epoch = lane.resume_epoch.checked_add(1).ok_or(LaneError::NoCapacity)?;
+            let binding = lane.binding;
+            self.lane_mut(handle)?.suspensions.frames.try_reserve(1)
+                .map_err(|_| LaneError::NoCapacity)?;
+            Ok((next_epoch, binding))
+        })();
+        let (next_epoch, binding) = match preflight {
+            Ok(value) => value,
+            Err(error) => return Err((error, continuation, payload)),
+        };
+        let lane = self.lane_mut(handle).expect("validated nested terminal lane");
+        lane.suspensions.frames.push(SuspensionFrame {
+            key, admission_sequence, owner, phase: SuspensionPhase::NestedTerminal,
+            continuation, receive: None,
+        });
+        let identity = TerminalIdentity {
+            dispatch, resume_epoch: next_epoch, binding, key, owner, external_token: None,
+        };
+        lane.terminal = Some(TerminalRecord {
+            identity, payload,
+            phase: TerminalPhase::Ready { stage: TerminalStage::Output, last_error: None },
+            next_attempt: 1,
+        });
+        lane.resume_epoch = next_epoch;
+        lane.phase = LanePhase::Terminal;
+        self.running = None;
+        Ok(identity)
     }
 
     /// Publish the returned result without releasing its original suspension or native authority.
@@ -537,7 +622,8 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             || frame.key != identity.key
             || frame.owner != identity.owner
             || !matches!(frame.phase, SuspensionPhase::Resuming { .. }
-                | SuspensionPhase::MaintenanceResuming { .. })
+                | SuspensionPhase::MaintenanceResuming { .. }
+                | SuspensionPhase::NestedTerminal)
         {
             return Err(LaneError::InvalidPhase);
         }

@@ -1,0 +1,215 @@
+//! A retained continuation for a nested physical-parent restoration.
+//!
+//! The native adapter owns the physical hold and both Replies. This record only gates transfer
+//! of the continuation after exact restoration; it never acknowledges a provider completion.
+
+use crate::{NestedExecutionIdentity, SuspensionOwner};
+
+/// The scope epoch, both Replies and caller must all agree before a continuation can move.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NestedRestoreKey {
+    scope: NestedExecutionIdentity,
+    parent_reply: u64,
+    root_reply: u64,
+    owner: SuspensionOwner,
+}
+
+impl NestedRestoreKey {
+    pub const fn new(
+        scope: NestedExecutionIdentity,
+        parent_reply: u64,
+        root_reply: u64,
+        owner: SuspensionOwner,
+    ) -> Option<Self> {
+        if parent_reply == 0 || root_reply == 0 || !owner.is_valid() {
+            None
+        } else {
+            Some(Self { scope, parent_reply, root_reply, owner })
+        }
+    }
+
+    pub const fn scope(self) -> NestedExecutionIdentity { self.scope }
+    pub const fn parent_reply(self) -> u64 { self.parent_reply }
+    pub const fn root_reply(self) -> u64 { self.root_reply }
+    pub const fn owner(self) -> SuspensionOwner { self.owner }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NestedRestorePhase {
+    Prepared,
+    Retained,
+    Retrying,
+    Quarantined,
+    Restored,
+    Receiving,
+    ResultRetained,
+    Consumed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NestedRestoreFrameError {
+    InvalidIdentity,
+    InvalidPhase,
+    RefusedNoEffects,
+}
+
+/// One-shot ownership of the exact pump and caller snapshot. Copyable keys are lookup witnesses,
+/// not another owner: only this frame can surrender `C` after a witnessed restoration.
+#[must_use = "retain the continuation until the physical parent and Reply are restored"]
+pub struct NestedRestoreFrame<C> {
+    key: NestedRestoreKey,
+    phase: NestedRestorePhase,
+    continuation: Option<C>,
+}
+
+impl<C> NestedRestoreFrame<C> {
+    pub fn prepare(key: NestedRestoreKey, continuation: C) -> Self {
+        Self { key, phase: NestedRestorePhase::Prepared, continuation: Some(continuation) }
+    }
+
+    pub const fn key(&self) -> NestedRestoreKey { self.key }
+    pub const fn phase(&self) -> NestedRestorePhase { self.phase }
+
+    /// Inspect the exact retained continuation without transferring its ownership. A caller
+    /// must revalidate this key at every native boundary because this reference is memory only.
+    pub fn continuation_ref(
+        &self, key: NestedRestoreKey,
+    ) -> Result<&C, NestedRestoreFrameError> {
+        self.exact(key)?;
+        self.continuation.as_ref().ok_or(NestedRestoreFrameError::InvalidPhase)
+    }
+
+    fn exact(&self, key: NestedRestoreKey) -> Result<(), NestedRestoreFrameError> {
+        if self.key == key { Ok(()) } else { Err(NestedRestoreFrameError::InvalidIdentity) }
+    }
+
+    /// Publish the durable frame before the root Reply park can enter a native effect.
+    pub fn retain(&mut self, key: NestedRestoreKey) -> Result<(), NestedRestoreFrameError> {
+        self.exact(key)?;
+        if self.phase != NestedRestorePhase::Prepared {
+            return Err(NestedRestoreFrameError::InvalidPhase);
+        }
+        self.phase = NestedRestorePhase::Retained;
+        Ok(())
+    }
+
+    pub fn begin_retry(&mut self, key: NestedRestoreKey) -> Result<(), NestedRestoreFrameError> {
+        self.exact(key)?;
+        if self.phase != NestedRestorePhase::Retained {
+            return Err(NestedRestoreFrameError::InvalidPhase);
+        }
+        self.phase = NestedRestorePhase::Retrying;
+        Ok(())
+    }
+
+    /// A certified preflight refusal has made no physical effect and keeps the same owner.
+    pub fn refuse_retry_no_effects(
+        &mut self, key: NestedRestoreKey,
+    ) -> Result<(), NestedRestoreFrameError> {
+        self.exact(key)?;
+        if self.phase != NestedRestorePhase::Retrying {
+            return Err(NestedRestoreFrameError::InvalidPhase);
+        }
+        self.phase = NestedRestorePhase::Retained;
+        Ok(())
+    }
+
+    /// An uncertain native effect is fenced permanently; no retry or terminal is fabricated.
+    pub fn quarantine(&mut self, key: NestedRestoreKey) -> Result<(), NestedRestoreFrameError> {
+        self.exact(key)?;
+        if !matches!(self.phase, NestedRestorePhase::Retained | NestedRestorePhase::Retrying) {
+            return Err(NestedRestoreFrameError::InvalidPhase);
+        }
+        self.phase = NestedRestorePhase::Quarantined;
+        Ok(())
+    }
+
+    /// Only the adapter's exact physical restoration acknowledgement permits handoff.
+    pub fn acknowledge_restored(
+        &mut self, key: NestedRestoreKey,
+    ) -> Result<(), NestedRestoreFrameError> {
+        self.exact(key)?;
+        if self.phase != NestedRestorePhase::Retrying {
+            return Err(NestedRestoreFrameError::InvalidPhase);
+        }
+        self.phase = NestedRestorePhase::Restored;
+        Ok(())
+    }
+
+    /// The physical parent is restored. Claim only its existing receive half; a second outer
+    /// turn cannot enter the same receive while this attempt is in progress.
+    pub fn begin_receive(&mut self, key: NestedRestoreKey) -> Result<(), NestedRestoreFrameError> {
+        self.exact(key)?;
+        if self.phase != NestedRestorePhase::Restored {
+            return Err(NestedRestoreFrameError::InvalidPhase);
+        }
+        self.phase = NestedRestorePhase::Receiving;
+        Ok(())
+    }
+
+    /// A refusal certified before receive entry keeps the restored parent and original snapshot.
+    pub fn refuse_receive_no_effects(
+        &mut self, key: NestedRestoreKey,
+    ) -> Result<(), NestedRestoreFrameError> {
+        self.exact(key)?;
+        if self.phase != NestedRestorePhase::Receiving {
+            return Err(NestedRestoreFrameError::InvalidPhase);
+        }
+        self.phase = NestedRestorePhase::Restored;
+        Ok(())
+    }
+
+    /// Receive-side setup may have entered native mapping effects before refusing. Keep the
+    /// original snapshot and both Reply identities fenced; never retry that receive half.
+    pub fn quarantine_receive(
+        &mut self, key: NestedRestoreKey,
+    ) -> Result<(), NestedRestoreFrameError> {
+        self.exact(key)?;
+        if self.phase != NestedRestorePhase::Receiving {
+            return Err(NestedRestoreFrameError::InvalidPhase);
+        }
+        self.phase = NestedRestorePhase::Quarantined;
+        Ok(())
+    }
+
+    /// Replace the pre-receive snapshot with the real returned pump result. The previous
+    /// snapshot is returned only after the new one is retained in this same frame.
+    pub fn record_receive_result(
+        &mut self, key: NestedRestoreKey, next: C,
+    ) -> Result<C, (NestedRestoreFrameError, C)> {
+        if let Err(error) = self.exact(key) { return Err((error, next)); }
+        if self.phase != NestedRestorePhase::Receiving {
+            return Err((NestedRestoreFrameError::InvalidPhase, next));
+        }
+        let old = core::mem::replace(self.continuation.as_mut()
+            .expect("receiving frame retains its prior snapshot"), next);
+        self.phase = NestedRestorePhase::ResultRetained;
+        Ok(old)
+    }
+
+    /// Transfer the real returned result only after the new owner certifies a no-effects
+    /// refusal by returning `C`.
+    /// The continuation remains here on refusal; an uncertain native handoff must instead use
+    /// its own retained effect owner and must not report `Err(C)` to this method.
+    pub fn transfer_result_no_effects<T>(
+        &mut self, key: NestedRestoreKey,
+        transfer: impl FnOnce(C) -> Result<T, C>,
+    ) -> Result<T, NestedRestoreFrameError> {
+        self.exact(key)?;
+        if self.phase != NestedRestorePhase::ResultRetained {
+            return Err(NestedRestoreFrameError::InvalidPhase);
+        }
+        let continuation = self.continuation.take().ok_or(NestedRestoreFrameError::InvalidPhase)?;
+        match transfer(continuation) {
+            Ok(value) => {
+                self.phase = NestedRestorePhase::Consumed;
+                Ok(value)
+            }
+            Err(continuation) => {
+                self.continuation = Some(continuation);
+                Err(NestedRestoreFrameError::RefusedNoEffects)
+            }
+        }
+    }
+
+}

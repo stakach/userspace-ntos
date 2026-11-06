@@ -34,6 +34,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
                 SuspensionKind::Receive => !frame.receive.is_some_and(|admission| admission.restored),
                 SuspensionKind::ServiceWait | SuspensionKind::ProviderWait
                     | SuspensionKind::LpcRequest | SuspensionKind::RootMaintenance => frame.receive.is_some(),
+                SuspensionKind::NestedRestore => true,
             }
             || !matches!(frame.phase, SuspensionPhase::Resuming { .. }
                 | SuspensionPhase::MaintenanceResuming { .. })
