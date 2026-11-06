@@ -41,7 +41,7 @@ pub(crate) enum ReceiveError {
     Reply(nt_component_suspension::StoredReplyError<sel4_rt::reply_binding::Error>),
     Probe(ReceiveProbeError<sel4_rt::reply_binding::Error>),
     Ownership(ReservedReceiveError<Infallible>),
-    Capture(ReservedReceiveError<Infallible>, ReceivedMessage),
+    Capture(ReservedReceiveError<Infallible>, ReceivedMessage, u64),
     Retain(ReplyPoolError<sel4_rt::reply_binding::Error>),
     Admit(nt_component_suspension::ReplyAdmissionError<sel4_rt::reply_binding::Error>),
 }
@@ -143,7 +143,7 @@ pub(crate) unsafe fn receive<C, R, T>(
     let message = crate::ipc_message::capture_received(badge, info, [m0, m1, m2, m3]);
     owner
         .capture(message)
-        .map_err(|(error, message)| ReceiveError::Capture(error, message))?;
+        .map_err(|(error, message)| ReceiveError::Capture(error, message, sequence))?;
     Ok(sequence)
 }
 

@@ -682,6 +682,50 @@ fn captured_receive_recovery_requires_its_exact_live_dispatch_owner() {
 }
 
 #[test]
+fn refused_query_reclassifies_the_same_captured_call_without_a_second_receive() {
+    use core::cell::Cell;
+    let (mut lanes, _, route, mut owner) = setup();
+    let dispatch = start(&mut lanes, route);
+    owner.begin_receive_for_owner(&lanes, IngressExecutionOwner::Dispatch(dispatch)).unwrap();
+    owner.capture(789).unwrap();
+    let queries = Cell::new(0);
+    let first = crate::classify_received_call(
+        1u64,
+        |_| {
+            queries.set(queries.get() + 1);
+            Err::<ReplyBindingObservation, u8>(7)
+        },
+        || panic!("a failed first query cannot resolve a caller"),
+    );
+    assert_eq!(first, Err(crate::ReceiveProbeError::Query(7)));
+    assert_eq!(queries.get(), 1);
+    assert_eq!(owner.phase(), Some(ReservedReceivePhase::Captured));
+    assert_eq!(owner.message(), Some(&789));
+    assert_eq!(owner.reply(), 40);
+    assert!(owner.recovery_for_owner(&lanes, IngressExecutionOwner::Dispatch(dispatch)).is_ok());
+
+    let second = crate::classify_received_call(
+        1u64,
+        |tcb| {
+            queries.set(queries.get() + 1);
+            Ok::<_, u8>(if tcb == route.identity().executor {
+                ReplyBindingObservation::BoundToTarget
+            } else {
+                ReplyBindingObservation::BoundElsewhere
+            })
+        },
+        || Some(route.identity().executor),
+    );
+    assert_eq!(second, Ok(true));
+    assert_eq!(queries.get(), 3);
+    assert_eq!(owner.resolve(IngressReceiveDisposition::Call), Ok(None));
+    assert_eq!(owner.phase(), Some(ReservedReceivePhase::Held));
+    assert_eq!(owner.message(), Some(&789));
+    assert_eq!(owner.reply(), 40);
+    assert!(owner.begin_receive_for_owner(&lanes, IngressExecutionOwner::Dispatch(dispatch)).is_err());
+}
+
+#[test]
 fn captured_receive_recovery_rejects_reused_reply_after_dispatch_epoch_change() {
     let (mut lanes, _, route, mut owner) = setup();
     let old = start(&mut lanes, route);

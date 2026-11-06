@@ -576,7 +576,7 @@ pub(crate) enum Arrival {
     Call { route: PeerRoute, reply: u64 },
 }
 
-fn log_receive_error_kind(error: super::super::ReceiveError) {
+fn log_receive_error_kind(error: &super::super::ReceiveError) {
     use nt_component_suspension::ReceiveProbeError;
     use super::super::ReceiveError;
     let kind: &[u8] = match error {
@@ -607,7 +607,7 @@ fn log_receive_error_kind(error: super::super::ReceiveError) {
             return print_str(detail);
         }
         ReceiveError::Ownership(_) => b"ownership-other\n",
-        ReceiveError::Capture(_, _) => b"capture\n",
+        ReceiveError::Capture(_, _, _) => b"capture\n",
         ReceiveError::Retain(_) => b"retain\n",
         _ => b"other\n",
     };
@@ -621,54 +621,125 @@ pub(crate) unsafe fn receive(
     probe_tcb: u64,
     blocking: bool,
 ) -> Result<Arrival, Error> {
-    hosted::recycle_completed()?;
+    // `recycle_completed` borrows this same ingress owner and lane table. Inspect the journal
+    // without retaining a reference, then finish recycling before taking either mutable borrow.
+    // Recheck the journal below: a nested effect during recycling may have published an arrival.
+    let fresh_before_recycle = (&*core::ptr::addr_of!(SHARED_INGRESS)).pending_receive.is_none();
+    if fresh_before_recycle {
+        hosted::recycle_completed()?;
+    }
     let owner = owner();
     let lanes = lanes();
-    let receive_sequence = owner
-        .receive(lanes, execution, probe_tcb, blocking)
-        .map_err(|error| {
-            print_str(b"[ingress-receive-error] stage=receive kind=");
-            log_receive_error_kind(error);
-            Error::Receive
-        })?;
-    let peers = owner.peers.as_ref().expect("ready peers");
-    let routes = peers;
-    let mut resolver = |badge| {
-        if nt_component_suspension::badge::valid_hosted_badge(badge) {
-            crate::service_sec_image::hosted_ingress_binding(badge).map(|binding| binding.tcb)
-        } else {
-            let route = routes
-                .resolve(badge)
-                .or_else(|| routes.resolve_retiring(badge))?;
-            resolve(route, true)
+    if let Some(pending) = owner.pending_receive.as_ref() {
+        let receiver = owner.receiver.as_ref().ok_or(Error::Initialization)?;
+        if pending.execution != execution
+            || pending.probe_tcb != probe_tcb
+            || pending.reply != receiver.reply()
+            || receiver.recovery_for_owner(lanes, execution).is_err()
+            || !pending.classify_retry_allowed
+        {
+            print_str(b"[ingress-receive-error] stage=recovery kind=owner-or-phase\n");
+            return Err(Error::Receive);
+        }
+        if let Some(message) = owner.pending_receive.as_mut().and_then(|row| row.returned_message.take()) {
+            match owner.receiver.as_mut().ok_or(Error::Initialization)?.capture(message) {
+                Ok(()) => {}
+                Err((error, message)) => {
+                    let pending = owner.pending_receive.as_mut().expect("retained capture owner");
+                    pending.returned_message = Some(message);
+                    pending.classify_retry_allowed = false;
+                    print_str(b"[ingress-receive-error] stage=recapture kind=");
+                    log_receive_error_kind(&super::super::ReceiveError::Ownership(error));
+                    return Err(Error::Receive);
+                }
+            }
+        }
+    } else {
+        let reply = owner.receiver.as_ref().ok_or(Error::Initialization)?.reply();
+        match owner.receive(lanes, execution, probe_tcb, blocking) {
+            Ok(sequence) => {
+                owner.pending_receive = Some(PendingNativeReceive {
+                    execution, probe_tcb, reply, sequence,
+                    returned_message: None, classify_retry_allowed: true,
+                });
+            }
+            Err(super::super::ReceiveError::Capture(error, message, sequence)) => {
+                owner.pending_receive = Some(PendingNativeReceive {
+                    execution, probe_tcb, reply, sequence,
+                    returned_message: Some(message), classify_retry_allowed: true,
+                });
+                print_str(b"[ingress-receive-error] stage=capture kind=");
+                log_receive_error_kind(&super::super::ReceiveError::Ownership(error));
+                return Err(Error::Receive);
+            }
+            Err(error) => {
+                print_str(b"[ingress-receive-error] stage=receive kind=");
+                log_receive_error_kind(&error);
+                return Err(Error::Receive);
+            }
+        }
+    }
+    // One read-only retry may resolve a transient kernel Reply query. Both classifications use
+    // the same captured receiver and original physical Reply; no second native receive occurs.
+    let notification = loop {
+        let routes = owner.peers.as_ref().expect("ready peers");
+        let result = super::super::classify(
+            owner.receiver.as_mut().expect("ready receiver"),
+            probe_tcb,
+            |badge| {
+                if nt_component_suspension::badge::valid_hosted_badge(badge) {
+                    crate::service_sec_image::hosted_ingress_binding(badge).map(|binding| binding.tcb)
+                } else {
+                    let route = routes.resolve(badge)
+                        .or_else(|| routes.resolve_retiring(badge))?;
+                    resolve(route, true)
+                }
+            },
+        );
+        match result {
+            Ok(notification) => break notification,
+            Err(super::super::ReceiveError::Probe(
+                nt_component_suspension::ReceiveProbeError::Query(_)
+            )) if owner.pending_receive.as_ref().is_some_and(|row| row.classify_retry_allowed) => {
+                let receiver = owner.receiver.as_ref().expect("ready receiver");
+                let pending = owner.pending_receive.as_mut().expect("captured receive owner");
+                pending.classify_retry_allowed = false;
+                if receiver.recovery_for_owner(lanes, execution).is_err()
+                    || receiver.reply() != pending.reply
+                {
+                    print_str(b"[ingress-receive-error] stage=classify kind=owner-mismatch\n");
+                    return Err(Error::Receive);
+                }
+                print_str(b"[ingress-receive-error] stage=classify kind=query-retry\n");
+            }
+            Err(error) => {
+                owner.pending_receive.as_mut().expect("captured receive owner")
+                    .classify_retry_allowed = false;
+                print_str(b"[ingress-receive-error] stage=classify kind=");
+                log_receive_error_kind(&error);
+                return Err(Error::Receive);
+            }
         }
     };
-    // Classification needs a mutable receiver but not a mutable registry.
-    let notification = super::super::classify(
-        owner.receiver.as_mut().expect("ready receiver"),
-        probe_tcb,
-        &mut resolver,
-    )
-    .map_err(|error| {
-        print_str(b"[ingress-receive-error] stage=classify kind=");
-        log_receive_error_kind(error);
-        Error::Receive
-    })?;
     let reason = match notification.as_ref() {
         Some(message) if crate::badge_has_delay_timer(message.badge()) =>
             nt_hosted_runtime::SharedReceiveReturn::Timer,
         Some(_) => nt_hosted_runtime::SharedReceiveReturn::OtherNotification,
         None => nt_hosted_runtime::SharedReceiveReturn::Call,
     };
-    super::super::classify_receive_census(receive_sequence, reason);
+    super::super::classify_receive_census(
+        owner.pending_receive.as_ref().expect("captured receive owner").sequence, reason);
     if let Some(message) = notification {
+        owner.pending_receive = None;
         return Ok(Arrival::Notification(message));
     }
+    owner.pending_receive.as_mut().expect("held receive owner").classify_retry_allowed = false;
     let receiver = owner.receiver.as_ref().expect("ready receiver");
     let badge = receiver.message().expect("classified Call").badge();
     let reply = receiver.reply();
     if nt_component_suspension::badge::valid_hosted_badge(badge) {
         hosted::retain(owner, lanes, badge, probe_tcb)?;
+        owner.pending_receive = None;
         return Ok(Arrival::Hosted);
     }
     let route = owner
@@ -687,6 +758,7 @@ pub(crate) unsafe fn receive(
     owner
         .retain(lanes, probe_tcb, |route| resolve(route, true))
         .map_err(|_| Error::Retain)?;
+    owner.pending_receive = None;
     Ok(Arrival::Call { route, reply })
 }
 
