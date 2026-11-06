@@ -17,6 +17,78 @@ pub(crate) enum RootMaintenanceResumeOutcome {
     Terminal,
 }
 
+static ROOT_REFUSAL_TRACES: AtomicU64 = AtomicU64::new(0);
+
+/// One bounded, read-only record at the first refusal. The ticket is printed even when its
+/// durable row can no longer be found; zero means an absent optional observation.
+unsafe fn trace_root_refusal(
+    ticket: root_maintenance_owner::RootMaintenanceTicket,
+    stage: &[u8],
+    detail: u64,
+) {
+    if ROOT_REFUSAL_TRACES.fetch_add(1, Ordering::Relaxed) >= 16 { return; }
+    let lane = ticket.dispatch.lane();
+    let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
+    let phase = match root_maintenance_owner::transfer_phase(ticket) {
+        Some(TransferPhase::Returned) => 1,
+        Some(TransferPhase::Entering { .. }) => 2,
+        Some(TransferPhase::Transferred { .. }) => 3,
+        Some(TransferPhase::Indeterminate) => 4,
+        None => 0,
+    };
+    let key = root_maintenance_owner::key(ticket);
+    let frame_exact = key.is_some_and(|key| lanes.frame(lane, key).ok().flatten()
+        .is_some_and(|frame| frame.key == key && frame.owner == ticket.owner
+            && matches!(&frame.phase,
+                nt_component_suspension::SuspensionPhase::MaintenanceResuming { .. })));
+    print_str(b"[root-resume-refusal] stage="); print_str(stage);
+    print_str(b" detail="); print_hex(detail as u32);
+    print_str(b" ticket="); print_u64(ticket.index as u64);
+    print_str(b"/"); print_u64(ticket.generation);
+    print_str(b" lane="); print_u64(lane.index as u64);
+    print_str(b"/"); print_u64(lane.generation);
+    print_str(b" epoch="); print_u64(ticket.dispatch.epoch());
+    print_str(b" owner="); print_u64(ticket.owner.provider_domain);
+    print_str(b"/"); print_u64(ticket.owner.provider_generation);
+    print_str(b"/"); print_u64(ticket.owner.dispatch_id);
+    print_str(b" reply="); print_u64(ticket.reply);
+    print_str(b" root-reply="); print_u64(ticket.root_reply);
+    print_str(b" phase="); print_u64(phase);
+    print_str(b" token="); print_u64(root_maintenance_owner::callback_token(ticket).unwrap_or(0));
+    print_str(b" key="); print_u64(key.map_or(0, |key| key.id));
+    print_str(b" lane-running=");
+    print_u64((lanes.phase(lane) == Ok(nt_component_suspension::LanePhase::Running)) as u64);
+    print_str(b" frame-exact="); print_u64(frame_exact as u64);
+    print_str(b" dispatch-exact=");
+    print_u64((lanes.active_dispatch_identity(lane) == Ok(Some(ticket.dispatch))) as u64);
+    print_str(b" binding-reply=");
+    print_u64(lanes.binding(lane).ok().map_or(0, |binding| binding.reply_object));
+    print_str(b"\n");
+}
+
+fn lane_error_code(error: nt_component_suspension::LaneError) -> u64 {
+    use nt_component_suspension::{LaneError, SuspensionError};
+    match error {
+        LaneError::InvalidIdentity => 1,
+        LaneError::DuplicateBinding => 2,
+        LaneError::NoCapacity => 3,
+        LaneError::NotFound => 4,
+        LaneError::StaleGeneration => 5,
+        LaneError::WrongBinding => 6,
+        LaneError::Busy => 7,
+        LaneError::InvalidPhase => 8,
+        LaneError::Suspension(inner) => 16 + match inner {
+            SuspensionError::InvalidIdentity => 1,
+            SuspensionError::DuplicateIdentity => 2,
+            SuspensionError::Overflow => 3,
+            SuspensionError::NoCapacity => 4,
+            SuspensionError::NotFound => 5,
+            SuspensionError::NotTop => 6,
+            SuspensionError::InvalidPhase => 7,
+        },
+    }
+}
+
 fn retryable_pure_refusal(error: nt_component_suspension::LaneError) -> bool {
     matches!(error,
         nt_component_suspension::LaneError::Busy
@@ -34,11 +106,13 @@ unsafe fn pure_transfer_refused(
     ticket: root_maintenance_owner::RootMaintenanceTicket,
     error: nt_component_suspension::LaneError,
 ) -> RootMaintenanceResumeOutcome {
-    if retryable_pure_refusal(error)
-        && root_maintenance_owner::refuse_result_transfer_no_effects(ticket)
-    {
+    let retryable = retryable_pure_refusal(error);
+    let no_effects = retryable
+        && root_maintenance_owner::refuse_result_transfer_no_effects(ticket);
+    if no_effects {
         RootMaintenanceResumeOutcome::DeferredRetry
     } else {
+        trace_root_refusal(ticket, b"pure-transfer", lane_error_code(error));
         let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
         RootMaintenanceResumeOutcome::RetainedFailure
     }
@@ -195,6 +269,7 @@ pub(crate) unsafe fn run_root_maintenance(
         }
         let returned = win32k_glue::resume_suspended_root_maintenance_component(pending);
         if root_maintenance_owner::store_result(ticket, returned).is_err() {
+            trace_root_refusal(ticket, b"store-pump-result", 0);
             return RootMaintenanceResumeOutcome::RetainedFailure;
         }
         returned
@@ -211,6 +286,7 @@ pub(crate) unsafe fn run_root_maintenance(
             return RootMaintenanceResumeOutcome::Terminal;
         }
         if root_maintenance_owner::transfer_phase(ticket) != Some(TransferPhase::Returned) {
+            trace_root_refusal(ticket, b"callback-phase", 0);
             return RootMaintenanceResumeOutcome::RetainedFailure;
         }
         let token = if let Some(token) = root_maintenance_owner::callback_token(ticket) {
@@ -221,10 +297,19 @@ pub(crate) unsafe fn run_root_maintenance(
                     pending.snapshot.client, ticket.dispatch.lane(), ticket.owner.dispatch_id,
                 )
             });
-            let Some(Ok(token)) = captured else {
-                return RootMaintenanceResumeOutcome::RetainedFailure;
+            let token = match captured {
+                Some(Ok(token)) => token,
+                Some(Err(status)) => {
+                    trace_root_refusal(ticket, b"callback-capture", status as u64);
+                    return RootMaintenanceResumeOutcome::RetainedFailure;
+                }
+                None => {
+                    trace_root_refusal(ticket, b"callback-owner", 0);
+                    return RootMaintenanceResumeOutcome::RetainedFailure;
+                }
             };
             if !root_maintenance_owner::store_callback_token(ticket, token) {
+                trace_root_refusal(ticket, b"callback-token-store", token);
                 return RootMaintenanceResumeOutcome::RetainedFailure;
             }
             token
@@ -232,6 +317,7 @@ pub(crate) unsafe fn run_root_maintenance(
         if !root_maintenance_owner::begin_result_transfer(
             ticket, TransferKind::CallbackTerminal, key,
         ) {
+            trace_root_refusal(ticket, b"callback-transfer-begin", 0);
             return RootMaintenanceResumeOutcome::RetainedFailure;
         }
         return match component_terminal::retain_maintenance_callback_transfer(ticket, key, token) {
@@ -240,6 +326,7 @@ pub(crate) unsafe fn run_root_maintenance(
                     ticket, AcceptedTransfer::Terminal(identity),
                 ) { RootMaintenanceResumeOutcome::Terminal }
                 else {
+                    trace_root_refusal(ticket, b"callback-transfer-accept", 0);
                     let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
                     RootMaintenanceResumeOutcome::RetainedFailure
                 }
@@ -296,15 +383,29 @@ pub(crate) unsafe fn run_root_maintenance(
             repark_receive(ticket, key, continuation, next),
         win32k_glue::RootMaintenancePumpCompletion::MaintenanceReparked(next) =>
             repark_maintenance(ticket, key, continuation, next),
-        win32k_glue::RootMaintenancePumpCompletion::RetainedFailure(_)
-        | win32k_glue::RootMaintenancePumpCompletion::Restored(
-            win32k_glue::ProviderWaitPumpCompletion::Failed(_)
-            | win32k_glue::ProviderWaitPumpCompletion::ReceiveReparked(_)
+        win32k_glue::RootMaintenancePumpCompletion::RetainedFailure(status) => {
+            trace_root_refusal(ticket, b"pump-retained", status as u64);
+            RootMaintenanceResumeOutcome::RetainedFailure
+        }
+        win32k_glue::RootMaintenancePumpCompletion::Restored(
+            win32k_glue::ProviderWaitPumpCompletion::Failed(status),
+        ) => {
+            trace_root_refusal(ticket, b"pump-failed", status as u32 as u64);
+            RootMaintenanceResumeOutcome::RetainedFailure
+        }
+        win32k_glue::RootMaintenancePumpCompletion::Restored(
+            win32k_glue::ProviderWaitPumpCompletion::ReceiveReparked(_)
             | win32k_glue::ProviderWaitPumpCompletion::ServiceReparked(_),
-        ) => RootMaintenanceResumeOutcome::RetainedFailure,
+        ) => {
+            trace_root_refusal(ticket, b"pump-unexpected-repark", 0);
+            RootMaintenanceResumeOutcome::RetainedFailure
+        }
         win32k_glue::RootMaintenancePumpCompletion::Restored(
             win32k_glue::ProviderWaitPumpCompletion::UserCallbackSuspended,
-        ) => RootMaintenanceResumeOutcome::RetainedFailure,
+        ) => {
+            trace_root_refusal(ticket, b"callback-unexpected", 0);
+            RootMaintenanceResumeOutcome::RetainedFailure
+        }
     }
 }
 
