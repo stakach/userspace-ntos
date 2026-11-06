@@ -997,7 +997,7 @@ pub(crate) fn wake_due(now: u64) -> u64 {
 }
 
 pub(crate) fn nested_work_ready() -> bool {
-    wake_due(crate::monotonic_time_100ns()) != 0
+    next_deadline().is_some_and(|deadline| crate::monotonic_time_100ns() >= deadline)
 }
 
 fn upload_status(error: DirectoryUploadError) -> u32 {
