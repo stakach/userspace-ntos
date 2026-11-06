@@ -760,6 +760,16 @@ pub(super) fn wake_due(now_100ns: u64) -> u64 {
     u64::from(due)
 }
 
+/// A nested timer may have marked the queued sector notified while the physical caller keeps
+/// the root loop unavailable. Only the outer service owner can claim the sector; yielding the
+/// exact nested frame lets that owner resume without sending another timer notification.
+pub(super) fn nested_ready() -> bool {
+    if NATIVE_PENDING_IRP.load(Ordering::Acquire) != 0 || !queued_timer_work() {
+        return false;
+    }
+    WAKE.due_for_outer(monotonic_time_100ns(), true)
+}
+
 pub(super) fn next_deadline(_now_100ns: u64) -> Option<u64> {
     let claimable = claimable_timer_work();
     if !claimable && crate::mounted_volume::mounted_sector_claimable() == Some(false) {

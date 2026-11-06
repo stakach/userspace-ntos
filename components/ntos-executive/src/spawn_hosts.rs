@@ -1596,6 +1596,7 @@ unsafe fn pump_scheduler_work_pending(ch: &PumpChannel, irq: bool) -> bool {
         && (irq
             || crate::driver_launch::hosted_irq_work_pending()
             || crate::driver_launch::hosted_driver_dpc_activation_pending()
+            || crate::driver_launch::mounted_native_block_nested_ready()
             || crate::dispatcher_bootstrap::timer_work_pending())
 }
 

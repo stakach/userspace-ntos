@@ -43642,6 +43642,10 @@ pub(crate) fn mounted_native_block_wake_due(now_100ns: u64) -> u64 {
     mounted_native_block::wake_due(now_100ns)
 }
 
+pub(crate) fn mounted_native_block_nested_ready() -> bool {
+    mounted_native_block::nested_ready()
+}
+
 pub(crate) fn service_mounted_native_registry_recheck(id: u64) -> usize {
     unsafe { mounted_native_block::service_registry_recheck(id) }
 }

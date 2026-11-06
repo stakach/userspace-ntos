@@ -7,6 +7,7 @@ use std::process::Command;
 const PUMP: &str = include_str!("../../../components/ntos-executive/src/spawn_hosts.rs");
 const RECEIVER: &str = include_str!("../../../components/ntos-executive/src/component_shared_pump.rs");
 const DRIVER: &str = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+const BLOCK: &str = include_str!("../../../components/ntos-executive/src/mounted_native_block.rs");
 
 #[test]
 fn deferred_actual_lock_irq_retries_on_timer_without_new_irq_badge() {
@@ -21,6 +22,13 @@ fn deferred_actual_lock_irq_retries_on_timer_without_new_irq_badge() {
         .expect("physical IRQ drain");
     assert!(drain.contains("HOSTED_IRQ_PENDING_EVENTS.fetch_or(deferred"),
         "busy delivery must retain its physical bit for the next checkpoint");
+    let nested = BLOCK.split("pub(super) fn nested_ready() -> bool").nth(1)
+        .and_then(|body| body.split("pub(super) fn next_deadline(").next())
+        .expect("mounted nested readiness boundary");
+    assert!(nested.contains("NATIVE_PENDING_IRP.load(Ordering::Acquire) != 0"));
+    assert!(nested.contains("WAKE.due_for_outer("),
+        "nested readiness must observe notified work without consuming another wake");
+    assert!(!nested.contains("WAKE.wake_due("));
 
     let source = format!("{MOCKS}\n{predicate}\n{CASES}");
     let directory = std::env::temp_dir().join(format!("nt-deferred-irq-retry-{}", std::process::id()));
@@ -40,6 +48,9 @@ fn deferred_actual_lock_irq_retries_on_timer_without_new_irq_badge() {
 
 const MOCKS: &str = r#"
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Copy, PartialEq, Eq)] enum ReqKind { Irp, Syscall }
 struct Caps { kind: ReqKind, kernel_irq_yield: bool }
@@ -48,9 +59,10 @@ struct PumpChannel { caps: Caps }
 mod driver_launch {
     use super::*;
     pub static PENDING_IRQ: AtomicBool = AtomicBool::new(false);
+    pub static MOUNTED_READY: AtomicBool = AtomicBool::new(false);
     pub fn hosted_irq_work_pending() -> bool { PENDING_IRQ.load(Ordering::Relaxed) }
     pub fn hosted_driver_dpc_activation_pending() -> bool { false }
-    pub fn mounted_native_block_nested_ready() -> bool { false }
+    pub fn mounted_native_block_nested_ready() -> bool { MOUNTED_READY.load(Ordering::Relaxed) }
 }
 mod dispatcher_bootstrap {
     pub fn timer_work_pending() -> bool { false }
@@ -60,6 +72,7 @@ mod dispatcher_bootstrap {
 const CASES: &str = r#"
 #[test]
 fn deferred_level_irq_uses_timer_arrival_to_retry_while_irp_reply_is_retained() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let irp = PumpChannel { caps: Caps { kind: ReqKind::Irp, kernel_irq_yield: false } };
     driver_launch::PENDING_IRQ.store(true, Ordering::Relaxed);
     assert!(unsafe { pump_scheduler_work_pending(&irp, false) },
@@ -71,10 +84,23 @@ fn deferred_level_irq_uses_timer_arrival_to_retry_while_irp_reply_is_retained() 
 
 #[test]
 fn exact_channel_still_controls_scheduler_authority() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let nonyielding = PumpChannel { caps: Caps { kind: ReqKind::Syscall, kernel_irq_yield: false } };
     let yielding = PumpChannel { caps: Caps { kind: ReqKind::Syscall, kernel_irq_yield: true } };
     driver_launch::PENDING_IRQ.store(true, Ordering::Relaxed);
     assert!(!unsafe { pump_scheduler_work_pending(&nonyielding, false) });
     assert!(unsafe { pump_scheduler_work_pending(&yielding, false) });
+}
+
+#[test]
+fn due_mounted_sector_yields_after_nested_timer_announces_it() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let irp = PumpChannel { caps: Caps { kind: ReqKind::Irp, kernel_irq_yield: false } };
+    driver_launch::PENDING_IRQ.store(false, Ordering::Relaxed);
+    driver_launch::MOUNTED_READY.store(true, Ordering::Relaxed);
+    assert!(unsafe { pump_scheduler_work_pending(&irp, false) },
+        "a nested timer may mark the exact mounted owner notified; its outer scheduler must run");
+    driver_launch::MOUNTED_READY.store(false, Ordering::Relaxed);
+    assert!(!unsafe { pump_scheduler_work_pending(&irp, false) });
 }
 "#;
