@@ -1,6 +1,7 @@
 //! Retained provider results and callback handoffs through client delivery and reply retirement.
 
 use super::*;
+use core::fmt::Write;
 use nt_component_suspension::{LaneDispatchIdentity, TerminalIdentity, TerminalPhase, TerminalStage, TerminalStageOutcome};
 use nt_component_suspension::peer_registry::PeerRoute;
 use nt_user_host::hosted_return_target::HostedReply;
@@ -171,10 +172,11 @@ pub(super) unsafe fn retain_incomplete_provider(
 }
 
 static DELIVERY_FAILURES: AtomicU64 = AtomicU64::new(0);
+static SHARED_RETURN_FAILURE_TRACES: AtomicU64 = AtomicU64::new(0);
 static RETIRED: AtomicU64 = AtomicU64::new(0);
 static CALLBACK_HANDOFFS: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SharedReturn {
     Complete,
     ContinueAndRepark(u64),
@@ -336,16 +338,20 @@ pub(super) unsafe fn drain_shared_returns() -> u64 {
                 });
             if !ready { continue; }
         }
+        let mut native_error = None;
+        let mut repark_error = None;
         let result = match action {
             SharedReturn::Complete => {
                 // Publish the entered fence before the native completion Call.
                 let Some(pending) = (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index]
                     .as_mut() else { continue };
                 pending.entered = true;
-                spawn_hosts::shared_ingress::owner::runtime::complete(
+                let completion = spawn_hosts::shared_ingress::owner::runtime::complete(
                     route, dispatch, reply,
                     win32k_subsystem::W32_DISPATCH_LABEL,
-                ).is_ok()
+                );
+                if let Err(error) = completion { native_error = Some(error); false }
+                else { true }
             }
             SharedReturn::ContinueAndRepark(token) => {
                 use nt_component_suspension::{ContinueReparkOutcome, ContinueReparkPhase};
@@ -356,17 +362,21 @@ pub(super) unsafe fn drain_shared_returns() -> u64 {
                         .as_mut().and_then(|pending| pending.continue_repark.as_mut())
                         .and_then(|owner| owner.begin_continue(route, dispatch, reply, token).ok());
                     let Some(attempt) = attempt else { continue };
-                    let outcome = if spawn_hosts::shared_ingress::owner::runtime::continue_after_subcall(
+                    let continued = spawn_hosts::shared_ingress::owner::runtime::continue_after_subcall(
                         route, dispatch, reply, win32k_subsystem::W32_DISPATCH_LABEL,
-                    ).is_ok() {
+                    );
+                    let outcome = if continued.is_ok() {
                         ContinueReparkOutcome::Acknowledged
                     } else {
+                        native_error = continued.err();
                         ContinueReparkOutcome::Indeterminate
                     };
                     let recorded = (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index]
                         .as_mut().and_then(|pending| pending.continue_repark.as_mut())
                         .is_some_and(|owner| owner.record_continue(attempt, outcome).is_ok());
                     if !recorded || outcome == ContinueReparkOutcome::Indeterminate {
+                        trace_failed_shared_return(route, dispatch, reply, action,
+                            continue_phase, native_error.as_ref(), None, false);
                         report_retained_failure(dispatch.lane(), b"shared-continue",
                             None, None, false);
                         continue;
@@ -374,12 +384,17 @@ pub(super) unsafe fn drain_shared_returns() -> u64 {
                 } else if continue_phase != Some(ContinueReparkPhase::ContinueAcknowledged) {
                     continue;
                 }
-                (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index]
+                let repark = (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index]
                     .as_mut().and_then(|pending| pending.continue_repark.as_mut())
-                    .is_some_and(|owner| owner.repark_exact(
+                    .map(|owner| owner.repark_exact(
                         route, dispatch, reply, token,
                         &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS),
-                    ).is_ok())
+                    ));
+                match repark {
+                    Some(Ok(())) => true,
+                    Some(Err(error)) => { repark_error = Some(error); false },
+                    None => false,
+                }
             }
             SharedReturn::Repark(token) => {
                 crate::service_sec_image::repark_external_component_execution_lane(
@@ -405,6 +420,8 @@ pub(super) unsafe fn drain_shared_returns() -> u64 {
             (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index] = None;
             completed += 1;
         } else {
+            trace_failed_shared_return(route, dispatch, reply, action, continue_phase,
+                native_error.as_ref(), repark_error, result);
             let failure: &[u8] = if result {
                 b"shared-return-owner-changed"
             } else {
@@ -417,6 +434,35 @@ pub(super) unsafe fn drain_shared_returns() -> u64 {
         }
     }
     completed
+}
+
+/// Failure-only evidence. Independent copied snapshots are diagnostic; they do not
+/// grant completion authority or change the retained shared-return row.
+unsafe fn trace_failed_shared_return(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    action: SharedReturn,
+    phase: Option<nt_component_suspension::ContinueReparkPhase>,
+    native_error: Option<&spawn_hosts::shared_ingress::owner::runtime::Error>,
+    repark_error: Option<nt_component_suspension::LaneError>,
+    native_succeeded: bool,
+) {
+    if SHARED_RETURN_FAILURE_TRACES.fetch_add(1, Ordering::Relaxed) >= 8 { return; }
+    let running = spawn_hosts::shared_ingress::owner::runtime::hold_snapshot().running;
+    let mut record = nt_printf::record::RecordBuffer::<512>::new();
+    let _ = writeln!(record,
+        "[shared-return-failure] action={:?} phase={:?} lane={}/{} epoch={} route={} reply={} native={:?} repark={:?} native-succeeded={} running={:?}",
+        action, phase, dispatch.lane().index, dispatch.lane().generation,
+        dispatch.epoch(), route.badge(), reply, native_error, repark_error,
+        native_succeeded,
+        running.map(|row| (row.lane.index, row.lane.generation,
+            row.dispatch.map(|dispatch| dispatch.epoch()),
+            row.route.map(|route| route.badge()), row.quarantined)),
+    );
+    sel4_rt::print_record(if record.overflowed() {
+        b"[shared-return-failure] trace truncated\n"
+    } else { record.bytes() });
 }
 
 #[derive(Clone, Copy, Default)]
