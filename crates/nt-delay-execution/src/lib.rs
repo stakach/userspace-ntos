@@ -6,6 +6,12 @@ use alloc::vec::Vec;
 
 pub use nt_time::{Deadline, TimeSnapshot};
 
+mod calibrated_tsc;
+pub use calibrated_tsc::{CalibratedTscEpoch, TscClockError, TscDrift};
+
+#[cfg(test)]
+mod calibrated_tsc_tests;
+
 pub fn due_time(interval: i64, monotonic_now: u64, system_now: u64) -> Deadline {
     Deadline::from_nt_timeout(
         Some(interval),
