@@ -18,6 +18,7 @@ pub(crate) enum RootMaintenanceResumeOutcome {
 }
 
 static ROOT_REFUSAL_TRACES: AtomicU64 = AtomicU64::new(0);
+static ROOT_REPARK_TRACES: AtomicU64 = AtomicU64::new(0);
 
 /// One bounded, read-only record at the first refusal. The ticket is printed even when its
 /// durable row can no longer be found; zero means an absent optional observation.
@@ -42,7 +43,7 @@ unsafe fn trace_root_refusal(
             && matches!(&frame.phase,
                 nt_component_suspension::SuspensionPhase::MaintenanceResuming { .. })));
     print_str(b"[root-resume-refusal] stage="); print_str(stage);
-    print_str(b" detail="); print_hex(detail as u32);
+    print_str(b" detail="); print_u64(detail);
     print_str(b" ticket="); print_u64(ticket.index as u64);
     print_str(b"/"); print_u64(ticket.generation);
     print_str(b" lane="); print_u64(lane.index as u64);
@@ -64,6 +65,50 @@ unsafe fn trace_root_refusal(
     print_str(b" binding-reply=");
     print_u64(lanes.binding(lane).ok().map_or(0, |binding| binding.reply_object));
     print_str(b"\n");
+}
+
+/// A bounded breadcrumb before a returned pump enters a repark path. A later refusal record
+/// identifies the exact guard; this record distinguishes it from a pre-pump refusal.
+fn trace_root_repark(ticket: root_maintenance_owner::RootMaintenanceTicket, kind: &[u8]) {
+    if ROOT_REPARK_TRACES.fetch_add(1, Ordering::Relaxed) >= 16 { return; }
+    print_str(b"[root-resume-repark] kind="); print_str(kind);
+    print_str(b" ticket="); print_u64(ticket.index as u64);
+    print_str(b"/"); print_u64(ticket.generation);
+    print_str(b" reply="); print_u64(ticket.reply);
+    print_str(b" root-reply="); print_u64(ticket.root_reply);
+    print_str(b"\n");
+}
+
+fn restore_step_code(step: Option<Result<RestoreStep, runtime::Error>>) -> u64 {
+    match step {
+        Some(Ok(RestoreStep::Canonical)) => 1,
+        Some(Ok(RestoreStep::Projection)) => 2,
+        Some(Ok(RestoreStep::Release)) => 3,
+        Some(Ok(RestoreStep::UncertainRelease)) => 4,
+        Some(Ok(RestoreStep::Finalize)) => 5,
+        Some(Ok(RestoreStep::Done)) => 6,
+        Some(Err(_)) => 7,
+        None => 0,
+    }
+}
+
+fn physical_error_code(error: runtime::Error) -> u64 {
+    match error {
+        runtime::Error::Initialization => 1,
+        runtime::Error::Source => 2,
+        runtime::Error::Capacity => 3,
+        runtime::Error::Publication => 4,
+        runtime::Error::UnknownPeer => 5,
+        runtime::Error::PhysicalIdentity => 6,
+        runtime::Error::Startup => 7,
+        runtime::Error::Receive => 8,
+        runtime::Error::Retain => 9,
+        runtime::Error::Protocol => 10,
+        runtime::Error::Fault => 11,
+        runtime::Error::Admission => 12,
+        runtime::Error::Reply => 13,
+        runtime::Error::Retirement => 14,
+    }
 }
 
 fn lane_error_code(error: nt_component_suspension::LaneError) -> u64 {
@@ -130,6 +175,7 @@ unsafe fn need_pure_frame_transfer(
             if root_maintenance_owner::begin_result_transfer(ticket, kind, next_key) {
                 Ok(true)
             } else {
+                trace_root_refusal(ticket, b"frame-transfer-begin", kind as u64);
                 Err(RootMaintenanceResumeOutcome::RetainedFailure)
             }
         }
@@ -137,7 +183,10 @@ unsafe fn need_pure_frame_transfer(
             kind: accepted_kind,
             accepted: AcceptedTransfer::Frame(accepted_key),
         }) if accepted_kind == kind && accepted_key == next_key => Ok(false),
-        _ => Err(RootMaintenanceResumeOutcome::RetainedFailure),
+        _ => {
+            trace_root_refusal(ticket, b"frame-transfer-phase", kind as u64);
+            Err(RootMaintenanceResumeOutcome::RetainedFailure)
+        }
     }
 }
 
@@ -149,39 +198,70 @@ unsafe fn exact_hosted(
     use nt_user_host::hosted_return_target::HostedReply;
     let lane = ticket.dispatch.lane();
     let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
-    let frame = lanes.frame(lane, key).ok()??;
-    let hosted = frame.continuation.hosted()?;
-    let PendingComponentDispatch::RootMaintenance(held) = hosted.pending else { return None; };
-    let reply = hosted.return_target.delivery()?;
-    if !matches!(reply, HostedReply::Syscall { reply_cap } if reply_cap == ticket.root_reply)
-        || hosted.destination != HostedContinuationDestination::Win32k
-        || frame.owner != ticket.owner || frame.key != key
-        || held.yielded.route != ticket.route
-        || held.yielded.dispatch != ticket.dispatch
-        || held.yielded.reply != ticket.reply
-        || held.yielded.owner != ticket.owner
-        || pending.yielded.route != held.yielded.route
+    let Some(frame) = lanes.frame(lane, key).ok().flatten() else {
+        trace_root_refusal(ticket, b"hosted-identity", 1 << 0);
+        return None;
+    };
+    let Some(hosted) = frame.continuation.hosted() else {
+        trace_root_refusal(ticket, b"hosted-identity", 1 << 1);
+        return None;
+    };
+    let PendingComponentDispatch::RootMaintenance(held) = hosted.pending else {
+        trace_root_refusal(ticket, b"hosted-identity", 1 << 2);
+        return None;
+    };
+    let Some(reply) = hosted.return_target.delivery() else {
+        trace_root_refusal(ticket, b"hosted-identity", 1 << 3);
+        return None;
+    };
+    // The first set bit identifies the failed contract. Keep the original guard order so a
+    // later predicate is not evaluated after an earlier identity disagreement.
+    let mut mismatch = 0u64;
+    if !matches!(reply, HostedReply::Syscall { reply_cap } if reply_cap == ticket.root_reply) {
+        mismatch |= 1 << 4;
+    }
+    if mismatch == 0 && hosted.destination != HostedContinuationDestination::Win32k {
+        mismatch |= 1 << 5;
+    }
+    if mismatch == 0 && (frame.owner != ticket.owner || frame.key != key) {
+        mismatch |= 1 << 6;
+    }
+    if mismatch == 0 && (held.yielded.route != ticket.route || held.yielded.dispatch != ticket.dispatch
+        || held.yielded.reply != ticket.reply || held.yielded.owner != ticket.owner
+    ) { mismatch |= 1 << 7; }
+    if mismatch == 0 && (pending.yielded.route != held.yielded.route
         || pending.yielded.dispatch != held.yielded.dispatch
         || pending.yielded.reply != held.yielded.reply
         || pending.yielded.owner != held.yielded.owner
-        || pending.snapshot.dispatch.dispatch_id != held.snapshot.dispatch.dispatch_id
+    ) { mismatch |= 1 << 8; }
+    if mismatch == 0 && (pending.snapshot.dispatch.dispatch_id != held.snapshot.dispatch.dispatch_id
         || pending.snapshot.dispatch.lane != held.snapshot.dispatch.lane
-        || pending.snapshot.client.pi != held.snapshot.client.pi
+    ) { mismatch |= 1 << 9; }
+    if mismatch == 0 && (pending.snapshot.client.pi != held.snapshot.client.pi
         || pending.snapshot.client.generation != held.snapshot.client.generation
         || pending.snapshot.client.tid != held.snapshot.client.tid
         || pending.snapshot.client.badge != held.snapshot.client.badge
         || pending.snapshot.client.tcb != held.snapshot.client.tcb
-        || pending.snapshot.channel.tcb != held.snapshot.channel.tcb
+    ) { mismatch |= 1 << 10; }
+    if mismatch == 0 && (pending.snapshot.channel.tcb != held.snapshot.channel.tcb
         || pending.snapshot.channel.fault_ep != held.snapshot.channel.fault_ep
-        || pending.snapshot.pump.reply_cap != ticket.reply
-        || lanes.active_dispatch_identity(lane).ok().flatten() != Some(ticket.dispatch)
-        || !lanes.binding(lane).is_ok_and(|binding| {
+    ) { mismatch |= 1 << 11; }
+    if mismatch == 0 && pending.snapshot.pump.reply_cap != ticket.reply {
+        mismatch |= 1 << 12;
+    }
+    if mismatch == 0 && lanes.active_dispatch_identity(lane).ok().flatten() != Some(ticket.dispatch) {
+        mismatch |= 1 << 13;
+    }
+    if mismatch == 0 && !lanes.binding(lane).is_ok_and(|binding| {
             binding.reply_object == ticket.reply
                 && binding.executor_id == pending.snapshot.channel.tcb
                 && binding.receive_endpoint == pending.snapshot.channel.fault_ep
-        })
-        || !win32k_glue::win32k_client_context_is_admitted(pending.snapshot.client)
-    {
+        }) { mismatch |= 1 << 14; }
+    if mismatch == 0 && !win32k_glue::win32k_client_context_is_admitted(pending.snapshot.client) {
+        mismatch |= 1 << 15;
+    }
+    if mismatch != 0 {
+        trace_root_refusal(ticket, b"hosted-identity", mismatch);
         return None;
     }
     Some(*hosted)
@@ -192,15 +272,25 @@ unsafe fn transferred_hosted(
     next_key: nt_component_suspension::SuspensionKey,
 ) -> Option<HostedNativeContinuation> {
     let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
-    let frame = lanes.frame(ticket.dispatch.lane(), next_key).ok()??;
+    let Some(frame) = lanes.frame(ticket.dispatch.lane(), next_key).ok().flatten() else {
+        trace_root_refusal(ticket, b"transferred-hosted", 1);
+        return None;
+    };
     if frame.owner != ticket.owner || frame.key != next_key
         || lanes.active_dispatch_identity(ticket.dispatch.lane()).ok().flatten()
             != Some(ticket.dispatch)
-    { return None; }
-    frame.continuation.hosted().copied()
+    {
+        trace_root_refusal(ticket, b"transferred-hosted", 2);
+        return None;
+    }
+    let hosted = frame.continuation.hosted().copied();
+    if hosted.is_none() { trace_root_refusal(ticket, b"transferred-hosted", 4); }
+    hosted
 }
 
-unsafe fn restore_physical(ticket: root_maintenance_owner::RootMaintenanceTicket) -> bool {
+unsafe fn restore_physical(
+    ticket: root_maintenance_owner::RootMaintenanceTicket,
+) -> Option<Result<(), runtime::Error>> {
     root_maintenance_owner::with_physical(ticket, |physical| {
         if physical.restore_step()? == RestoreStep::Canonical { physical.canonical_restored()?; }
         if physical.restore_step()? == RestoreStep::Projection { physical.restore_projection()?; }
@@ -208,7 +298,7 @@ unsafe fn restore_physical(ticket: root_maintenance_owner::RootMaintenanceTicket
         if physical.restore_step()? == RestoreStep::Finalize { physical.projection_restored()?; }
         if physical.restore_step()? == RestoreStep::Done { Ok(()) }
         else { Err(runtime::Error::Admission) }
-    }).is_some_and(|result: Result<(), runtime::Error>| result.is_ok())
+    })
 }
 
 /// Resume the original receive half after a strictly newer independent outer service pass.
@@ -218,9 +308,11 @@ pub(crate) unsafe fn run_root_maintenance(
     ticket: root_maintenance_owner::RootMaintenanceTicket,
 ) -> RootMaintenanceResumeOutcome {
     let Some(pending) = root_maintenance_owner::pending(ticket) else {
+        trace_root_refusal(ticket, b"pending-owner", 0);
         return RootMaintenanceResumeOutcome::RetainedFailure;
     };
     let Some(key) = root_maintenance_owner::key(ticket) else {
+        trace_root_refusal(ticket, b"pending-key", 0);
         return RootMaintenanceResumeOutcome::RetainedFailure;
     };
     let continuation = match root_maintenance_owner::transfer_phase(ticket) {
@@ -229,6 +321,7 @@ pub(crate) unsafe fn run_root_maintenance(
         _ => exact_hosted(ticket, pending, key),
     };
     let Some(continuation) = continuation else {
+        // exact_hosted/transferred_hosted emitted a reason mask at the failed predicate.
         return RootMaintenanceResumeOutcome::RetainedFailure;
     };
     let pump = if let Some(returned) = root_maintenance_owner::result(ticket) {
@@ -240,15 +333,18 @@ pub(crate) unsafe fn run_root_maintenance(
         // Capacity is a no-effect preflight. Own it while the pure frame is still Ready.
         if root_maintenance_owner::with_callback(ticket, |_| ()).is_none() {
             let Ok(callback_transfer) = component_callback_transfer::CallbackTransfer::reserve() else {
+                if was_resuming { trace_root_refusal(ticket, b"callback-reserve", 0); }
                 return if was_resuming { RootMaintenanceResumeOutcome::RetainedFailure }
                     else { RootMaintenanceResumeOutcome::DeferredRetry };
             };
             if root_maintenance_owner::store_callback(ticket, callback_transfer).is_err() {
+                trace_root_refusal(ticket, b"callback-reserve-store", 0);
                 return RootMaintenanceResumeOutcome::RetainedFailure;
             }
         }
         if !was_resuming {
             if !root_maintenance_owner::is_admitted(ticket) {
+                trace_root_refusal(ticket, b"owner-not-admitted", 0);
                 return RootMaintenanceResumeOutcome::RetainedFailure;
             }
             match (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
@@ -258,14 +354,30 @@ pub(crate) unsafe fn run_root_maintenance(
                 Ok(_) => {}
                 Err(nt_component_suspension::LaneError::Busy) =>
                     return RootMaintenanceResumeOutcome::DeferredRetry,
-                Err(_) => return RootMaintenanceResumeOutcome::RetainedFailure,
+                Err(error) => {
+                    trace_root_refusal(ticket, b"begin-resume", lane_error_code(error));
+                    return RootMaintenanceResumeOutcome::RetainedFailure;
+                }
             }
             if !root_maintenance_owner::mark_resuming(ticket) {
+                trace_root_refusal(ticket, b"mark-resuming", 0);
                 return RootMaintenanceResumeOutcome::RetainedFailure;
             }
         }
-        if !restore_physical(ticket) {
-            return RootMaintenanceResumeOutcome::RetainedFailure;
+        match restore_physical(ticket) {
+            Some(Ok(())) => {}
+            result => {
+                let error = match result {
+                    Some(Err(error)) => physical_error_code(error),
+                    _ => 0,
+                };
+                let step = root_maintenance_owner::with_physical(ticket, |physical| {
+                    physical.restore_step()
+                });
+                trace_root_refusal(ticket, b"physical-restore",
+                    (error << 8) | restore_step_code(step));
+                return RootMaintenanceResumeOutcome::RetainedFailure;
+            }
         }
         let returned = win32k_glue::resume_suspended_root_maintenance_component(pending);
         if root_maintenance_owner::store_result(ticket, returned).is_err() {
@@ -351,6 +463,7 @@ pub(crate) unsafe fn run_root_maintenance(
             if !root_maintenance_owner::begin_result_transfer(
                 ticket, TransferKind::Terminal, key,
             ) {
+                trace_root_refusal(ticket, b"terminal-transfer-begin", key.id);
                 return RootMaintenanceResumeOutcome::RetainedFailure;
             }
             let retained = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
@@ -364,6 +477,7 @@ pub(crate) unsafe fn run_root_maintenance(
                         ticket, AcceptedTransfer::Terminal(identity),
                     ) { RootMaintenanceResumeOutcome::Terminal }
                     else {
+                        trace_root_refusal(ticket, b"terminal-transfer-accept", key.id);
                         let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
                         RootMaintenanceResumeOutcome::RetainedFailure
                     }
@@ -373,16 +487,28 @@ pub(crate) unsafe fn run_root_maintenance(
         }
         win32k_glue::RootMaintenancePumpCompletion::Restored(
             win32k_glue::ProviderWaitPumpCompletion::Reparked(next),
-        ) => repark_provider(nt_handler, ticket, key, continuation, next),
+        ) => {
+            trace_root_repark(ticket, b"provider");
+            repark_provider(nt_handler, ticket, key, continuation, next)
+        }
         win32k_glue::RootMaintenancePumpCompletion::Restored(
             win32k_glue::ProviderWaitPumpCompletion::LpcReparked(next),
-        ) => repark_lpc(nt_handler, ticket, key, continuation, next),
-        win32k_glue::RootMaintenancePumpCompletion::ServiceReparked(next) =>
-            repark_service(ticket, key, continuation, next),
-        win32k_glue::RootMaintenancePumpCompletion::ReceiveReparked(next) =>
-            repark_receive(ticket, key, continuation, next),
-        win32k_glue::RootMaintenancePumpCompletion::MaintenanceReparked(next) =>
-            repark_maintenance(ticket, key, continuation, next),
+        ) => {
+            trace_root_repark(ticket, b"lpc");
+            repark_lpc(nt_handler, ticket, key, continuation, next)
+        }
+        win32k_glue::RootMaintenancePumpCompletion::ServiceReparked(next) => {
+            trace_root_repark(ticket, b"service");
+            repark_service(ticket, key, continuation, next)
+        }
+        win32k_glue::RootMaintenancePumpCompletion::ReceiveReparked(next) => {
+            trace_root_repark(ticket, b"receive");
+            repark_receive(ticket, key, continuation, next)
+        }
+        win32k_glue::RootMaintenancePumpCompletion::MaintenanceReparked(next) => {
+            trace_root_repark(ticket, b"maintenance");
+            repark_maintenance(ticket, key, continuation, next)
+        }
         win32k_glue::RootMaintenancePumpCompletion::RetainedFailure(status) => {
             trace_root_refusal(ticket, b"pump-retained", status as u64);
             RootMaintenanceResumeOutcome::RetainedFailure
@@ -416,9 +542,13 @@ unsafe fn repark_service(
     next: win32k_glue::PendingServiceWaitDispatch,
 ) -> RootMaintenanceResumeOutcome {
     let Some(owner) = service_wait_expected_owner(next) else {
+        trace_root_refusal(ticket, b"service-owner-missing", 0);
         return RootMaintenanceResumeOutcome::RetainedFailure;
     };
-    if owner != ticket.owner { return RootMaintenanceResumeOutcome::RetainedFailure; }
+    if owner != ticket.owner {
+        trace_root_refusal(ticket, b"service-owner-mismatch", 0);
+        return RootMaintenanceResumeOutcome::RetainedFailure;
+    }
     let pending = PendingComponentDispatch::ServiceWait(next);
     let next_key = component_suspension_key(pending);
     continuation.pending = pending;
@@ -439,6 +569,7 @@ unsafe fn repark_service(
                 if !root_maintenance_owner::accept_result_transfer(
                     ticket, AcceptedTransfer::Frame(next_key),
                 ) {
+                    trace_root_refusal(ticket, b"service-transfer-accept", next_key.id);
                     let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
                     return RootMaintenanceResumeOutcome::RetainedFailure;
                 }
@@ -447,6 +578,7 @@ unsafe fn repark_service(
         }
     }
     if root_maintenance_owner::retire_after_repark(ticket, next_key).is_none() {
+        trace_root_refusal(ticket, b"service-retire", next_key.id);
         return RootMaintenanceResumeOutcome::RetainedFailure;
     }
     RootMaintenanceResumeOutcome::Parked
@@ -461,6 +593,7 @@ unsafe fn repark_receive(
     let pending = PendingComponentDispatch::Receive(next);
     let next_key = component_suspension_key(pending);
     if next.yielded.replaces != Some(key) || next.yielded.owner != ticket.owner {
+        trace_root_refusal(ticket, b"receive-parent", next_key.id);
         return RootMaintenanceResumeOutcome::RetainedFailure;
     }
     continuation.pending = pending;
@@ -484,12 +617,14 @@ unsafe fn repark_receive(
                 if !root_maintenance_owner::accept_result_transfer(
                     ticket, AcceptedTransfer::Frame(next_key),
                 ) {
+                    trace_root_refusal(ticket, b"receive-transfer-accept", next_key.id);
                     let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
                     return RootMaintenanceResumeOutcome::RetainedFailure;
                 }
             }
             Ok(Err((error, _))) => return pure_transfer_refused(ticket, error),
             Err(_) => {
+                trace_root_refusal(ticket, b"receive-scope", next_key.id);
                 let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
                 return RootMaintenanceResumeOutcome::RetainedFailure;
             }
@@ -498,6 +633,7 @@ unsafe fn repark_receive(
     if root_maintenance_owner::retire_after_repark(ticket, next_key).is_some() {
         RootMaintenanceResumeOutcome::Parked
     } else {
+        trace_root_refusal(ticket, b"receive-retire", next_key.id);
         RootMaintenanceResumeOutcome::RetainedFailure
     }
 }
@@ -511,9 +647,13 @@ unsafe fn repark_provider(
 ) -> RootMaintenanceResumeOutcome {
     let pending = PendingComponentDispatch::Provider(next);
     let Some(owner) = component_expected_owner(pending) else {
+        trace_root_refusal(ticket, b"provider-owner-missing", 0);
         return RootMaintenanceResumeOutcome::RetainedFailure;
     };
-    if owner != ticket.owner { return RootMaintenanceResumeOutcome::RetainedFailure; }
+    if owner != ticket.owner {
+        trace_root_refusal(ticket, b"provider-owner-mismatch", 0);
+        return RootMaintenanceResumeOutcome::RetainedFailure;
+    }
     let next_key = component_suspension_key(pending);
     continuation.pending = pending;
     let needs_transfer = match need_pure_frame_transfer(ticket, TransferKind::Provider, next_key) {
@@ -531,6 +671,7 @@ unsafe fn repark_provider(
                 if !root_maintenance_owner::accept_result_transfer(
                     ticket, AcceptedTransfer::Frame(next_key),
                 ) {
+                    trace_root_refusal(ticket, b"provider-transfer-accept", next_key.id);
                     let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
                     return RootMaintenanceResumeOutcome::RetainedFailure;
                 }
@@ -541,9 +682,11 @@ unsafe fn repark_provider(
     let Some(sequence) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
         .frame(ticket.dispatch.lane(), next_key).ok().flatten()
         .map(|frame| frame.admission_sequence) else {
+        trace_root_refusal(ticket, b"provider-next-frame", next_key.id);
         return RootMaintenanceResumeOutcome::RetainedFailure;
     };
     if root_maintenance_owner::retire_after_repark(ticket, next_key).is_none() {
+        trace_root_refusal(ticket, b"provider-retire", next_key.id);
         return RootMaintenanceResumeOutcome::RetainedFailure;
     }
     admit_provider_after_transfer(handler, next, owner, next_key, sequence);
@@ -590,9 +733,13 @@ unsafe fn repark_lpc(
 ) -> RootMaintenanceResumeOutcome {
     let pending = PendingComponentDispatch::Lpc(next);
     let Some(owner) = component_expected_owner(pending) else {
+        trace_root_refusal(ticket, b"lpc-owner-missing", 0);
         return RootMaintenanceResumeOutcome::RetainedFailure;
     };
-    if owner != ticket.owner { return RootMaintenanceResumeOutcome::RetainedFailure; }
+    if owner != ticket.owner {
+        trace_root_refusal(ticket, b"lpc-owner-mismatch", 0);
+        return RootMaintenanceResumeOutcome::RetainedFailure;
+    }
     let next_key = component_suspension_key(pending);
     continuation.pending = pending;
     let needs_transfer = match need_pure_frame_transfer(ticket, TransferKind::Lpc, next_key) {
@@ -610,6 +757,7 @@ unsafe fn repark_lpc(
                 if !root_maintenance_owner::accept_result_transfer(
                     ticket, AcceptedTransfer::Frame(next_key),
                 ) {
+                    trace_root_refusal(ticket, b"lpc-transfer-accept", next_key.id);
                     let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
                     return RootMaintenanceResumeOutcome::RetainedFailure;
                 }
@@ -620,6 +768,7 @@ unsafe fn repark_lpc(
     let Some(sequence) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
         .frame(ticket.dispatch.lane(), next_key).ok().flatten()
         .map(|frame| frame.admission_sequence) else {
+        trace_root_refusal(ticket, b"lpc-next-frame", next_key.id);
         return RootMaintenanceResumeOutcome::RetainedFailure;
     };
     // Capacity can refuse after the pure transfer. The accepted frame remains durable, and
@@ -629,6 +778,7 @@ unsafe fn repark_lpc(
     };
     if root_maintenance_owner::retire_after_repark(ticket, next_key).is_none() {
         let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
+        trace_root_refusal(ticket, b"lpc-retire", next_key.id);
         return RootMaintenanceResumeOutcome::RetainedFailure;
     }
     if lpc_wait_begin_after_stack_admission(&mut *handler, next, next_key, reservation) {
@@ -651,6 +801,7 @@ unsafe fn repark_maintenance(
         || next.yielded.owner != ticket.owner
         || next.snapshot.pump.reply_cap != ticket.reply
     {
+        trace_root_refusal(ticket, b"maintenance-next-identity", 0);
         return RootMaintenanceResumeOutcome::RetainedFailure;
     }
     let Some(new_ticket) = root_maintenance_owner::prepare_next_repark(ticket, next) else {
@@ -673,6 +824,13 @@ unsafe fn repark_maintenance(
             {
                 return RootMaintenanceResumeOutcome::DeferredRetry;
             }
+            trace_root_refusal(ticket, b"maintenance-acquire", step.map_or(0, |step| match step {
+                AcquireStep::Ready => 1,
+                AcquireStep::EnteredUnknown => 2,
+                AcquireStep::Held => 3,
+                AcquireStep::ProjectionEntered => 4,
+                AcquireStep::ProjectionHeld => 5,
+            }));
             let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
             return RootMaintenanceResumeOutcome::RetainedFailure;
         }
@@ -690,6 +848,7 @@ unsafe fn repark_maintenance(
                 if !root_maintenance_owner::accept_result_transfer(
                     ticket, AcceptedTransfer::Frame(key),
                 ) {
+                    trace_root_refusal(ticket, b"maintenance-transfer-accept", key.id);
                     let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
                     return RootMaintenanceResumeOutcome::RetainedFailure;
                 }
@@ -700,11 +859,13 @@ unsafe fn repark_maintenance(
     if !root_maintenance_owner::is_admitted(new_ticket)
         && !root_maintenance_owner::mark_admitted(new_ticket, key)
     {
+        trace_root_refusal(ticket, b"maintenance-next-admit", new_ticket.generation);
         return RootMaintenanceResumeOutcome::RetainedFailure;
     }
     if root_maintenance_owner::retire_after_maintenance_repark(ticket, new_ticket).is_some() {
         RootMaintenanceResumeOutcome::Parked
     } else {
+        trace_root_refusal(ticket, b"maintenance-retire", new_ticket.generation);
         RootMaintenanceResumeOutcome::RetainedFailure
     }
 }
