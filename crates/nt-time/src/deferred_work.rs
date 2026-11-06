@@ -59,6 +59,13 @@ impl CoalescedRetryWake {
             .then(|| self.deadline.load(Ordering::Acquire))
     }
 
+    /// Readiness for an independent outer owner. Timer notification suppresses another IRQ,
+    /// but does not consume the retained work or its already-published deadline.
+    pub fn due_for_outer(&self, now: u64, has_work: bool) -> bool {
+        let _writer = self.writer();
+        has_work && now >= self.deadline.load(Ordering::Acquire)
+    }
+
     /// The timer may announce due work once; it never claims or drops the retained owner.
     pub fn wake_due(&self, now: u64, has_work: bool) -> bool {
         let _writer = self.writer();
@@ -201,6 +208,21 @@ mod tests {
         assert!(first.retry_at(200));
         assert_eq!(second.next_deadline(120, true), Some(120));
         assert_eq!(first.next_deadline(120, true), Some(200));
+    }
+
+    #[test]
+    fn delivered_timer_still_exposes_due_work_to_independent_outer_owner() {
+        let wake = CoalescedRetryWake::new();
+        wake.publish(100);
+        assert!(!wake.due_for_outer(99, true));
+        assert!(wake.wake_due(100, true));
+        assert_eq!(wake.next_deadline(true), None);
+        assert!(wake.due_for_outer(100, true));
+        assert!(wake.due_for_outer(100, true));
+        assert!(!wake.due_for_outer(100, false));
+        wake.publish(200);
+        assert!(!wake.due_for_outer(199, true));
+        assert!(wake.due_for_outer(200, true));
     }
 
     #[test]

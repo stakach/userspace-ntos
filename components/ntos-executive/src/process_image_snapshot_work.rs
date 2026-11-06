@@ -235,9 +235,19 @@ pub(crate) fn has_process(pi: usize, preserve_tid: Option<u64>) -> bool {
 }
 
 fn has_work() -> bool {
-    EXECUTING_TID.load(Ordering::Acquire) != 0 || unsafe {
-        (&*core::ptr::addr_of!(WORK)).iter().any(Option::is_some)
-    }
+    EXECUTING_TID.load(Ordering::Acquire) != 0 || has_queued_work()
+}
+
+fn has_queued_work() -> bool {
+    unsafe { (&*core::ptr::addr_of!(WORK)).iter().any(Option::is_some) }
+}
+
+/// A nested provider pump may yield to the outer service loop only when a retained image row
+/// is due and no image redrive is already executing. Querying does not claim the row, deliver
+/// another timer notification, or alter the original Reply owner.
+pub(crate) fn due_for_outer(now_100ns: u64) -> bool {
+    !ACTIVE.load(Ordering::Acquire)
+        && WAKE.due_for_outer(now_100ns, has_queued_work())
 }
 
 pub(crate) fn next_deadline() -> Option<u64> {
