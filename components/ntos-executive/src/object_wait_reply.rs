@@ -42,10 +42,10 @@ pub(crate) fn has_process(pi: usize, preserve_tid: Option<u64>) -> bool {
 pub(crate) unsafe fn select(identity: Identity, status: u64) {
     let table = &mut *core::ptr::addr_of_mut!(OBJECT_WAITERS);
     let selected_at = monotonic_time_100ns();
-    let count = table
+    let record = *table
         .get_exact(identity)
-        .expect("wait selection lost its owner")
-        .count;
+        .expect("wait selection lost its owner");
+    let count = record.count;
     // Sampling the exact unclaimed row precedes the existing terminal claim.
     // A reply retry cannot change this first selection time.
     let _ = table.update_exact(identity, |record| {
@@ -54,6 +54,7 @@ pub(crate) unsafe fn select(identity: Identity, status: u64) {
     table
         .claim_reply(identity, count as usize, status)
         .expect("wait selection lost its exclusive terminal result");
+    crate::ingress_observation::object_wait_selected(&record, selected_at);
     RETRY_PENDING.store(true, Ordering::Release);
 }
 
@@ -135,6 +136,7 @@ unsafe fn send(
     (&mut *core::ptr::addr_of_mut!(OBJECT_WAITERS))
         .update_reply_payload(attempt, |record| record.reply_sent = true)
         .expect("accepted wait reply lost its exact receipt");
+    crate::ingress_observation::object_wait_reply_delivered(&record, monotonic_time_100ns());
     Outcome::Completed(Effect::Send)
 }
 
@@ -171,6 +173,7 @@ unsafe fn finish(handler: &mut ExecNtHandler, id: Identity) -> u64 {
         .expect("wait retirement lost its settled row");
     let finished_at = monotonic_time_100ns();
     if !sent {
+        crate::ingress_observation::object_wait_retired_without_reply(&record);
         return 0;
     }
     let exact_caller_live = handler.validate_provider_logical_caller(record.caller);

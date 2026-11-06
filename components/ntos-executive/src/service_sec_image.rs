@@ -10745,6 +10745,26 @@ pub(crate) unsafe fn service_sec_image(
             (Some(admitted), Ok(current)) if admitted.binding() == current.binding() => current,
             _ => reject_hosted_ingress!(),
         };
+        // This is only a copied latency observation. The admitted runtime and
+        // canonical thread lifetime must still agree before matching a prior Reply.
+        if let Some(caller) = nt_handler.capture_provider_logical_caller(
+            event_runtime.pi, event_runtime.tid, badge, event_runtime.tcb,
+        ).filter(|caller| caller.process() == event_runtime.process) {
+            let process_generation = match caller.process().generation {
+                nt_user_host::process_identity::ProcessGeneration::Hosted(value)
+                | nt_user_host::process_identity::ProcessGeneration::Temporary(value) => value,
+            };
+            crate::ingress_observation::authenticated_thread_ingress(
+                nt_hosted_runtime::WaitLatencyThreadIdentity {
+                    process_index: caller.pi() as u64,
+                    process_generation,
+                    thread_id: u64::from(caller.thread().thread_id()),
+                    thread_generation: caller.thread().generation(),
+                    tcb: caller.tcb(),
+                },
+                monotonic_time_100ns(),
+            );
+        }
         // An ETHREAD can outlive its image/runtime attachment during exact process retirement.
         // Refuse that Call before selecting any scratch or mirror address from the old PI.
         let event_layout = match event_runtime.process.generation {

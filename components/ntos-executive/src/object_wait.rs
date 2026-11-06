@@ -234,15 +234,24 @@ pub(super) fn object_waiter_oldest_unselected_for_process(
     }
 }
 
-pub(super) fn object_waiter_park(record: ObjectWaiterRecord) -> bool {
+pub(super) fn object_waiter_park(
+    record: ObjectWaiterRecord,
+    role: Option<nt_exe_image::HostedProcessRole>,
+) -> bool {
     if !record.is_valid_for_park() {
         return false;
     }
-    unsafe {
+    let parked = unsafe {
         (&mut *core::ptr::addr_of_mut!(OBJECT_WAITERS))
             .insert(record)
             .is_ok()
+    };
+    if parked {
+        crate::ingress_observation::object_wait_parked(
+            &record, role, crate::monotonic_time_100ns(),
+        );
     }
+    parked
 }
 
 pub(super) fn object_waiter_next_after_sequence(

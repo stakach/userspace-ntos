@@ -19145,7 +19145,7 @@ unsafe fn wait_park_multi(
         handler.current_native_call_transport,
         deadline,
         monotonic_time_100ns(),
-    )) {
+    ), handler.hosted_process_observation_role(caller.pi())) {
         for index in (0..objects.len()).rev() {
             handler
                 .release_wait_object_reference(objects[index], event_leases[index])
