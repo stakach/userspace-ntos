@@ -33,6 +33,7 @@ mod hosted_event_projection;
 mod event_terminal_receipt;
 mod win32k_bulk_stage;
 mod rpc_op6_trace;
+mod wait_owner_latency;
 
 pub use win32k_bulk_stage::{
     Win32kBulkDispatchIdentity, Win32kBulkLayout, Win32kBulkLease, Win32kBulkLeaseState,
@@ -87,6 +88,11 @@ pub use hosted_event_projection::{HostedEventProjectionKey, HostedEventProjectio
     HostedEventWaitDelivery};
 pub use event_terminal_receipt::EventTerminalReceiptSampler;
 pub use rpc_op6_trace::{RpcOp6ExchangeTracker, RpcOp6TraceCounts};
+pub use wait_owner_latency::{
+    WaitLatencyCounters, WaitLatencyError, WaitLatencyInterval, WaitLatencyKey,
+    WaitLatencyLedger, WaitLatencyLive, WaitLatencyOwner, WaitLatencyPhase,
+    WaitLatencyRole, WaitLatencySample, WaitLatencyThreadIdentity,
+};
 
 pub use hosted_irq_arena::{
     decode_hosted_irq_transport_message, HostedIrqArena, HostedIrqArenaConfig,
