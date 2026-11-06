@@ -43670,6 +43670,10 @@ pub(crate) fn mounted_native_physical_irp_pending() -> bool {
     mounted_native_block::pending_physical_irp()
 }
 
+pub(crate) fn mounted_native_physical_irp_id() -> u64 {
+    mounted_native_block::pending_physical_irp_id()
+}
+
 /// Consume the manager's complete durable-allocation signal. Unlike the pump
 /// report, this includes canonical driver/device/File/IRP/domain records and
 /// their record-owned heap data regardless of which operation created them.

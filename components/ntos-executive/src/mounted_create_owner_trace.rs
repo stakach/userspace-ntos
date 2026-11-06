@@ -7,7 +7,39 @@ static LAST: OwnerSnapshot = OwnerSnapshot::new();
 static PARK_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static ACK_TIMING_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static LOOKUP_PROGRESS_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static RECEIVE_OWNER_IRP: AtomicU64 = AtomicU64::new(0);
+static RECEIVE_OWNER_SAMPLES: AtomicU64 = AtomicU64::new(0);
 const ACK_TIMING_SAMPLE_LIMIT: u64 = 64;
+
+/// Bounded observation after the timer receive barrier has reconciled. The parked File CREATE
+/// identity is only a filter; all physical and timer facts come from their existing owners.
+pub(crate) fn receive_boundary_snapshot() {
+    let Some(owner) = LAST.read().filter(|owner| owner.phase == Phase::Parked && owner.route == 3)
+        else { return; };
+    if RECEIVE_OWNER_IRP.swap(owner.key.irp, Ordering::AcqRel) != owner.key.irp {
+        RECEIVE_OWNER_SAMPLES.store(0, Ordering::Release);
+    }
+    let sample = RECEIVE_OWNER_SAMPLES.fetch_add(1, Ordering::AcqRel) + 1;
+    if sample > 32 && !sample.is_power_of_two() { return; }
+    let claimable = crate::mounted_volume::mounted_sector_claimable();
+    let now = crate::monotonic_time_100ns();
+    let retry = crate::driver_launch::mounted_native_block_next_deadline(now);
+    crate::print_str(b"[mounted-receive] irp/sample/physical/claimable/retry-ms/rearm-requested/pit-armed/pit-source/pit-deadline-ms/tick-pending=");
+    crate::print_hex_u64(owner.key.irp);
+    crate::print_str(b"/"); crate::print_u64(sample);
+    crate::print_str(b"/"); crate::print_hex_u64(crate::driver_launch::mounted_native_physical_irp_id());
+    crate::print_str(b"/");
+    match claimable { Some(value) => crate::print_u64(u64::from(value)), None => crate::print_str(b"?") }
+    crate::print_str(b"/");
+    match retry { Some(deadline) => crate::print_u64(deadline / 10_000), None => crate::print_str(b"-") }
+    crate::print_str(b"/");
+    crate::print_u64(u64::from(super::MOUNTED_NATIVE_TIMER_REARM_REQUESTED.load(Ordering::Acquire)));
+    crate::print_str(b"/"); crate::print_u64(u64::from(crate::LAST_REARM_AUTHORITY.is_armed()));
+    crate::print_str(b"/"); crate::print_u64(crate::LAST_REARM_SOURCE.load(Ordering::Relaxed));
+    crate::print_str(b"/"); crate::print_u64(crate::LAST_REARM_DEADLINE.load(Ordering::Relaxed) / 10_000);
+    crate::print_str(b"/"); crate::print_u64(crate::DELAY_TIMER_TICKS_PENDING.load(Ordering::Relaxed));
+    crate::print_str(b"\n");
+}
 
 /// Join one exact lookup's settled work to the already published File CREATE owner.
 /// Bounded samples reveal a slow lookup while it is still pending; they do not retain

@@ -699,6 +699,11 @@ pub(super) fn pending_physical_irp() -> bool {
         .is_some_and(|pending| pending.irp.raw() != 0) }
 }
 
+/// Atomic observation only: the receive boundary may run inside a completion pump.
+pub(super) fn pending_physical_irp_id() -> u64 {
+    NATIVE_PENDING_IRP.load(Ordering::Acquire)
+}
+
 pub(super) fn print_quiesce_snapshot() {
     print_str(b"[quiesce-native-block] mounted-create-outstanding=");
     print_u64(crate::mounted_volume::mounted_create_outstanding() as u64);

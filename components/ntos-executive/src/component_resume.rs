@@ -273,6 +273,7 @@ pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) {
     state
         .prepare(|| reconcile_runtime(handler))
         .expect("runtime timer ownership must permit blocking receive");
+    super::mounted_create_owner_trace::receive_boundary_snapshot();
 }
 
 unsafe fn reconcile_runtime(handler: &mut ExecNtHandler) -> Option<nt_kernel_exec::TimerRearmOutcome> {
