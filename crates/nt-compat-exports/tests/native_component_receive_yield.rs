@@ -486,7 +486,9 @@ fn receive_resume_consumes_settlement_before_parent_restore_and_never_replays_re
         "single-use permit stays in the actual Parent before outer-boundary delivery"
     );
     let restore_parent = audit(function(&nested, "restore"));
-    call_position(&restore_parent, "matches_scope");
+    call_position(&restore_parent, "restore_or_retain");
+    let restore_stages = audit(function(&nested, "restore_stages"));
+    call_position(&restore_stages, "matches_scope");
     let executor = syn::parse_file(RESUME).unwrap();
     let execute = audit(function(&executor, "run_receive"));
     assert!(

@@ -40,7 +40,7 @@ fn initial_wait_snapshot_capture_has_one_policy_and_reparks_keep_saved_bytes() {
                 }
                 fn visit_expr_struct(&mut self, expression: &'ast syn::ExprStruct) {
                     let name = expression.path.segments.last().unwrap().ident.to_string();
-                    if matches!(name.as_str(), "PendingProviderWaitDispatch" | "PendingLpcWaitDispatch" | "PendingReceiveDispatch" | "PendingServiceWaitDispatch" | "PendingRootMaintenanceDispatch") {
+                    if matches!(name.as_str(), "PendingProviderWaitDispatch" | "PendingLpcWaitDispatch" | "PendingReceiveDispatch" | "PendingServiceWaitDispatch" | "PendingRootMaintenanceDispatch" | "PendingNestedRestoreDispatch") {
                         self.constructor = Some(name);
                         let fields = expression.fields.iter().find_map(|field| {
                             if matches!(&field.member, syn::Member::Named(name) if name == "snapshot") {
@@ -79,17 +79,18 @@ fn initial_wait_snapshot_capture_has_one_policy_and_reparks_keep_saved_bytes() {
                         syn::visit::visit_expr_field(self, field);
                     }
                 }
-                let expected = match constructor.as_str() {
-                    "PendingProviderWaitDispatch" => "provider_wait_suspended",
-                    "PendingLpcWaitDispatch" => "lpc_wait_suspended",
-                    "PendingReceiveDispatch" => "receive_yield",
-                    "PendingServiceWaitDispatch" => "service_wait_yield",
-                    "PendingRootMaintenanceDispatch" => "maintenance_yield",
+                let expected: &[&str] = match constructor.as_str() {
+                    "PendingProviderWaitDispatch" => &["provider_wait_suspended"],
+                    "PendingLpcWaitDispatch" => &["lpc_wait_suspended"],
+                    "PendingReceiveDispatch" => &["receive_yield"],
+                    "PendingServiceWaitDispatch" => &["service_wait_yield"],
+                    "PendingRootMaintenanceDispatch" => &["maintenance_yield"],
+                    "PendingNestedRestoreDispatch" => &["nested_restore_yield", "nested_restore_quarantined"],
                     _ => unreachable!(),
                 };
                 let mut condition = Condition(Vec::new());
                 condition.visit_expr(&branch.cond);
-                assert!(condition.0.iter().any(|field| field == expected),
+                assert!(expected.iter().all(|expected| condition.0.iter().any(|field| field == expected)),
                     "{constructor} capture must belong to its actual initial suspension branch");
                 self.0.push(constructor);
             }
@@ -99,7 +100,7 @@ fn initial_wait_snapshot_capture_has_one_policy_and_reparks_keep_saved_bytes() {
     let mut initial = InitialBranches(Vec::new());
     initial.visit_file(&bridge);
     initial.0.sort();
-    assert_eq!(initial.0, ["PendingLpcWaitDispatch", "PendingProviderWaitDispatch", "PendingReceiveDispatch", "PendingRootMaintenanceDispatch", "PendingServiceWaitDispatch"],
+    assert_eq!(initial.0, ["PendingLpcWaitDispatch", "PendingNestedRestoreDispatch", "PendingProviderWaitDispatch", "PendingReceiveDispatch", "PendingRootMaintenanceDispatch", "PendingServiceWaitDispatch"],
         "each initial suspension must use the canonical capture policy");
 
     // Read at runtime so a missing module is a behavioral assertion, not a compile failure.

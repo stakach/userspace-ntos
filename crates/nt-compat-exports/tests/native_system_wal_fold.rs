@@ -154,8 +154,10 @@ fn completed_native_fold_can_advance_inside_the_active_irp_pump() {
         "the folded checkpoint must release CM's writer before a BUSY mutation retries or the active IRP pump waits");
     let narrow = &body[loop_start..mutation];
     assert!(narrow.contains("runtime::nested::park_current()")
-        && narrow.contains("runtime::nested::restore("),
-        "the exact fold continuation must preserve and restore its physical Receive parent");
+        && narrow.contains("parent.as_ref().map(|parent| parent.ticket())")
+        && narrow.contains("runtime::nested::restore_or_retain(&mut parent)")
+        && narrow.contains("nested_restore_refusal(ticket)"),
+        "the exact fold continuation must preserve its physical Receive parent across a refused restore");
     assert!(!narrow.contains("finalize_service_loop_state("),
         "the active IRP pump must not run the generic provider/filesystem finalizer");
 }
