@@ -63,7 +63,10 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             || lane.binding.executor_id != route.identity().executor
             || lane.binding.receive_endpoint != route.endpoint()
             || lane.suspensions.len() != 1
-            || !lane.external_tokens.is_empty()
+            || match identity.external_token {
+                Some(token) => lane.external_tokens.last().copied() != Some(token),
+                None => !lane.external_tokens.is_empty(),
+            }
             || !lane.suspensions.top().is_some_and(|frame| {
                 frame.key == identity.key && frame.owner == identity.owner
                     && matches!(frame.phase, SuspensionPhase::NestedTerminal)

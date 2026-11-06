@@ -43,6 +43,7 @@ pub enum NestedRestorePhase {
     Restored,
     Receiving,
     ResultRetained,
+    Transferring,
     Consumed,
 }
 
@@ -51,6 +52,13 @@ pub enum NestedRestoreFrameError {
     InvalidIdentity,
     InvalidPhase,
     RefusedNoEffects,
+    Indeterminate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NestedRestoreTransferRefusal {
+    NoEffects,
+    Indeterminate,
 }
 
 /// One-shot ownership of the exact pump and caller snapshot. Copyable keys are lookup witnesses,
@@ -208,6 +216,37 @@ impl<C> NestedRestoreFrame<C> {
             Err(continuation) => {
                 self.continuation = Some(continuation);
                 Err(NestedRestoreFrameError::RefusedNoEffects)
+            }
+        }
+    }
+
+    /// Keep the original result in this frame while a destination admission runs. A refusal
+    /// certified before effects may retry; an uncertain effect is fenced with the result still
+    /// retained. The `Transferring` phase prevents a reentrant owner from entering twice.
+    pub fn transfer_result_with<T>(
+        &mut self, key: NestedRestoreKey,
+        transfer: impl FnOnce(&C) -> Result<T, NestedRestoreTransferRefusal>,
+    ) -> Result<T, NestedRestoreFrameError> {
+        self.exact(key)?;
+        if self.phase != NestedRestorePhase::ResultRetained {
+            return Err(NestedRestoreFrameError::InvalidPhase);
+        }
+        self.phase = NestedRestorePhase::Transferring;
+        let result = transfer(self.continuation.as_ref()
+            .expect("result transfer retains its original continuation"));
+        match result {
+            Ok(value) => {
+                self.continuation = None;
+                self.phase = NestedRestorePhase::Consumed;
+                Ok(value)
+            }
+            Err(NestedRestoreTransferRefusal::NoEffects) => {
+                self.phase = NestedRestorePhase::ResultRetained;
+                Err(NestedRestoreFrameError::RefusedNoEffects)
+            }
+            Err(NestedRestoreTransferRefusal::Indeterminate) => {
+                self.phase = NestedRestorePhase::Quarantined;
+                Err(NestedRestoreFrameError::Indeterminate)
             }
         }
     }

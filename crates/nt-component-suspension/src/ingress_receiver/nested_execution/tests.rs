@@ -22,6 +22,7 @@ fn nested_identity_sequence_matches_only_its_active_lane_epoch() {
 }
 
 mod nested_restore_frame;
+mod nested_restore_result;
 
 fn child_settlement() -> crate::ExternalSettlement {
     let lanes = ComponentSuspensionLanes::<u64, u32>::new(1, 2);

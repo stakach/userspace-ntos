@@ -120,13 +120,13 @@ fn restored_nested_terminal_admission_is_exact_and_returns_both_values_on_refusa
     let identity = scope.identity();
     let key = NestedRestoreKey::new(identity, reply, 501, owner).unwrap();
     let stale = NestedRestoreKey::new(identity, reply + 1, 501, owner).unwrap();
-    assert!(matches!(f.lanes.retain_nested_restored_terminal_owned(key, 1, 123, ()),
+    assert!(matches!(f.lanes.retain_nested_restored_terminal_owned(key, None, 1, 123, ()),
         Err((_, 123, ()))));
     f.receiver.resume_nested_execution(&mut scope, &mut f.lanes, &f.peers, bound).unwrap();
-    assert!(matches!(f.lanes.retain_nested_restored_terminal_owned(stale, 1, 123, ()),
+    assert!(matches!(f.lanes.retain_nested_restored_terminal_owned(stale, None, 1, 123, ()),
         Err((_, 123, ()))));
     assert_eq!(f.lanes.suspension_count(dispatch.lane()), Ok(0));
-    let terminal = f.lanes.retain_nested_restored_terminal_owned(key, 1, 123, ()).unwrap();
+    let terminal = f.lanes.retain_nested_restored_terminal_owned(key, None, 1, 123, ()).unwrap();
     assert_eq!(terminal.key(), SuspensionKey::nested_restore(identity.sequence()));
     assert!(matches!(f.lanes.frame(dispatch.lane(), terminal.key()).unwrap().unwrap().phase,
         SuspensionPhase::NestedTerminal));
@@ -144,6 +144,75 @@ fn restored_nested_terminal_admission_is_exact_and_returns_both_values_on_refusa
     assert_eq!(retired.payload, ());
     assert_eq!(f.lanes.active_dispatch_identity(dispatch.lane()), Ok(Some(dispatch)));
     assert_eq!(f.lanes.suspension_count(dispatch.lane()), Ok(0));
+}
+
+#[test]
+fn nested_callback_terminal_preserves_its_existing_external_token_through_ack() {
+    use crate::{NestedRestoreKey, TerminalStage, TerminalStageOutcome};
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let lane = dispatch.lane();
+    let reply = f.lanes.binding(lane).unwrap().reply_object;
+    let owner = receive_owner(dispatch);
+    let callback = 77;
+    f.lanes.suspend_running(lane, reply, callback).unwrap();
+    f.lanes.resume_external(lane, reply, callback).unwrap();
+    let mut scope = f.receiver.suspend_for_nested_execution(
+        route, dispatch, &mut f.lanes, &f.peers, bound,
+    ).unwrap();
+    let key = NestedRestoreKey::new(scope.identity(), reply, 501, owner).unwrap();
+    f.receiver.resume_nested_execution(&mut scope, &mut f.lanes, &f.peers, bound).unwrap();
+    assert!(matches!(f.lanes.retain_nested_restored_terminal_owned(key, None, 1, 123, ()),
+        Err((_, 123, ()))));
+    assert!(matches!(f.lanes.retain_nested_restored_terminal_owned(key, Some(callback + 1),
+        1, 123, ()), Err((_, 123, ()))));
+    let terminal = f.lanes.retain_nested_restored_terminal_owned(
+        key, Some(callback), 1, 123, (),
+    ).unwrap();
+    assert_eq!(terminal.external_token(), Some(callback));
+    for stage in [TerminalStage::Output, TerminalStage::Context,
+        TerminalStage::Publication, TerminalStage::Reply] {
+        let mut attempt = f.lanes.begin_terminal_stage(terminal, reply, stage).unwrap();
+        f.lanes.record_terminal_stage(&mut attempt, reply, TerminalStageOutcome::Acknowledged)
+            .unwrap();
+    }
+    let retired = f.lanes.finish_shared_nested_restore_terminal(
+        route, dispatch, terminal, reply, Ok(())).unwrap().unwrap();
+    assert_eq!(retired.continuation, 123);
+    assert_eq!(f.lanes.phase(lane), Ok(LanePhase::Running));
+    assert_eq!(f.lanes.external_top(lane), Ok(Some(callback)));
+    f.lanes.repark_external(lane, reply, callback).unwrap();
+    assert_eq!(f.lanes.phase(lane), Ok(LanePhase::Suspended));
+}
+
+#[test]
+fn restored_nested_callback_transfers_exact_external_token_to_real_wait() {
+    use crate::{NestedRestoreKey, SuspensionKey};
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let lane = dispatch.lane();
+    let reply = f.lanes.binding(lane).unwrap().reply_object;
+    let owner = receive_owner(dispatch);
+    let callback = 77;
+    f.lanes.suspend_running(lane, reply, callback).unwrap();
+    f.lanes.resume_external(lane, reply, callback).unwrap();
+    let mut scope = f.receiver.suspend_for_nested_execution(
+        route, dispatch, &mut f.lanes, &f.peers, bound,
+    ).unwrap();
+    let nested = NestedRestoreKey::new(scope.identity(), reply, 501, owner).unwrap();
+    f.receiver.resume_nested_execution(&mut scope, &mut f.lanes, &f.peers, bound).unwrap();
+    assert_eq!(nested.owner(), owner);
+    let wait = SuspensionKey::provider_wait(91);
+    assert!(matches!(f.lanes.transfer_external_to_suspension_running_owned(
+        lane, reply, callback + 1, wait, 1, owner, 123,
+    ), Err((_, 123))));
+    assert_eq!(f.lanes.external_top(lane), Ok(Some(callback)));
+    assert_eq!(f.lanes.suspension_count(lane), Ok(0));
+    f.lanes.transfer_external_to_suspension_running_owned(
+        lane, reply, callback, wait, 1, owner, 123,
+    ).unwrap();
+    assert_eq!(f.lanes.external_top(lane), Ok(None));
+    assert_eq!(f.lanes.frame(lane, wait).unwrap().unwrap().continuation, 123);
 }
 
 #[test]
@@ -179,4 +248,46 @@ fn restored_nested_continuation_moves_to_a_real_wait_only_after_admission() {
     assert_eq!(frame.phase(), Phase::Consumed);
     assert_eq!(f.lanes.frame(dispatch.lane(), wait).unwrap().unwrap().continuation, 123);
     assert_eq!(frame.transfer_result_no_effects(key, Ok::<_, u64>), Err(Error::InvalidPhase));
+}
+
+#[test]
+fn uncertain_nested_wait_admission_retains_original_result_without_retry() {
+    use crate::{NestedRestoreFrame, NestedRestoreFrameError as Error, NestedRestoreKey,
+        NestedRestorePhase as Phase, NestedRestoreTransferRefusal as Refusal};
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let reply = f.lanes.binding(dispatch.lane()).unwrap().reply_object;
+    let owner = receive_owner(dispatch);
+    let mut scope = f.receiver.suspend_for_nested_execution(
+        route, dispatch, &mut f.lanes, &f.peers, bound,
+    ).unwrap();
+    let key = NestedRestoreKey::new(scope.identity(), reply, 501, owner).unwrap();
+    let mut frame = NestedRestoreFrame::prepare(key, 123_u64);
+    frame.retain(key).unwrap();
+    frame.begin_retry(key).unwrap();
+    f.receiver.resume_nested_execution(&mut scope, &mut f.lanes, &f.peers, bound).unwrap();
+    frame.acknowledge_restored(key).unwrap();
+    frame.begin_receive(key).unwrap();
+    assert_eq!(frame.record_receive_result(key, 456), Ok(123));
+    let mut attempts = 0;
+    assert_eq!(frame.transfer_result_with(key, |result| {
+        attempts += 1;
+        assert_eq!(*result, 456);
+        Err::<(), _>(Refusal::NoEffects)
+    }), Err(Error::RefusedNoEffects));
+    assert_eq!(frame.phase(), Phase::ResultRetained);
+    assert_eq!(*frame.continuation_ref(key).unwrap(), 456);
+    assert_eq!(frame.transfer_result_with(key, |result| {
+        attempts += 1;
+        assert_eq!(*result, 456);
+        Err::<(), _>(Refusal::Indeterminate)
+    }), Err(Error::Indeterminate));
+    assert_eq!(attempts, 2);
+    assert_eq!(frame.phase(), Phase::Quarantined);
+    assert_eq!(*frame.continuation_ref(key).unwrap(), 456);
+    assert_eq!(frame.transfer_result_with(key, |_| {
+        attempts += 1;
+        Ok(())
+    }), Err(Error::InvalidPhase));
+    assert_eq!(attempts, 2);
 }

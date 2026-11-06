@@ -159,6 +159,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
     pub fn retain_nested_restored_terminal_owned(
         &mut self,
         nested: NestedRestoreKey,
+        outer_callback_token: Option<u64>,
         admission_sequence: u64,
         continuation: C,
         payload: T,
@@ -186,7 +187,10 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
                 return Err(LaneError::InvalidIdentity);
             }
             if lane.terminal.is_some() || !lane.suspensions.is_empty()
-                || !lane.external_tokens.is_empty()
+                || match outer_callback_token {
+                    Some(token) => token == 0 || lane.external_tokens.last().copied() != Some(token),
+                    None => !lane.external_tokens.is_empty(),
+                }
             {
                 return Err(LaneError::InvalidPhase);
             }
@@ -216,7 +220,8 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             continuation, receive: None,
         });
         let identity = TerminalIdentity {
-            dispatch, resume_epoch: next_epoch, binding, key, owner, external_token: None,
+            dispatch, resume_epoch: next_epoch, binding, key, owner,
+            external_token: outer_callback_token,
         };
         lane.terminal = Some(TerminalRecord {
             identity, payload,

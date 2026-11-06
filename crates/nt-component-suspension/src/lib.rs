@@ -78,6 +78,12 @@ mod root_maintenance;
 mod nested_restore_frame;
 pub use nested_restore_frame::{
     NestedRestoreFrame, NestedRestoreFrameError, NestedRestoreKey, NestedRestorePhase,
+    NestedRestoreTransferRefusal,
+};
+mod nested_restore_result;
+pub use nested_restore_result::{
+    NestedRestoreResult, NestedRestoreResultError, NestedRestoreResultKey,
+    NestedRestoreResultPhase,
 };
 pub use resume_pass::ResumePass;
 mod resume_wake;
