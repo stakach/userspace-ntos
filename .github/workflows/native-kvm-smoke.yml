@@ -147,6 +147,7 @@ jobs:
           GRAPHICS: '1'
           QEMU_MEMORY: 3072M
           QEMU_CPUS: '4'
+          QEMU_CPU_MODEL: host
         run: |
           set -euo pipefail
           boot_status=0
