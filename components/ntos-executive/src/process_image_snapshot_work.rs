@@ -276,12 +276,13 @@ pub(crate) unsafe fn redrive(
     exe_images: &mut nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP>,
     catalog: &nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
     loaded_images: *mut HostedLoadedImageTable,
-) {
+) -> bool {
     let Some(wake_attempt) = WAKE.begin_redrive(monotonic_time_100ns(), has_work()) else {
-        return;
+        return false;
     };
-    if ACTIVE.swap(true, Ordering::AcqRel) { return; }
+    if ACTIVE.swap(true, Ordering::AcqRel) { return false; }
     let _durable = allocator::enter_durable();
+    let mut attempted = false;
     let selected = {
         let rows = &mut *core::ptr::addr_of_mut!(WORK);
         if rows.is_empty() { None } else {
@@ -304,6 +305,7 @@ pub(crate) unsafe fn redrive(
                 work.native_call_transport, work.service_number,
                 |handler| advance(handler, delay_queue, &mut work, ntdll, fault_ep,
                     procs, exe_images, catalog, loaded_images));
+            if step.is_some() { attempted = true; }
             match step {
                 Some(Step::Progress) => {},
                 Some(Step::Wait) | None => break,
@@ -321,6 +323,7 @@ pub(crate) unsafe fn redrive(
     }
     wake_attempt.retry_at(monotonic_time_100ns().saturating_add(RETRY_DELAY));
     ACTIVE.store(false, Ordering::Release);
+    attempted
 }
 
 unsafe fn advance(

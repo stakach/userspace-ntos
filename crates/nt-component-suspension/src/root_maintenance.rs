@@ -142,4 +142,55 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         Ok(observed_pass)
     }
 
+    /// Repark the same physical dispatch after its receive half encountered another overdue
+    /// independent outer task. No provider request or hosted Reply is replayed; the old
+    /// continuation is returned only after the new one has replaced it in the retained frame.
+    pub fn repark_root_maintenance_owned(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        dispatch: LaneDispatchIdentity,
+        key: SuspensionKey,
+        owner: SuspensionOwner,
+        captured_pass: u64,
+        admission_sequence: u64,
+        continuation: C,
+    ) -> Result<C, (LaneError, C)> {
+        if key.kind != SuspensionKind::RootMaintenance
+            || dispatch.lane() != handle
+            || !self.is_dispatch_identity_active(dispatch)
+            || admission_sequence == 0
+        {
+            return Err((LaneError::InvalidIdentity, continuation));
+        }
+        if let Err(error) = self.validate_running(handle, reply_object)
+            .and_then(|()| self.validate_dispatch_owner(handle, owner))
+        {
+            return Err((error, continuation));
+        }
+        let lane = self.lane_mut(handle).expect("validated maintenance lane");
+        if lane.suspensions.len() != 1 || !lane.external_tokens.is_empty() {
+            return Err((LaneError::InvalidPhase, continuation));
+        }
+        let Some(frame) = lane.suspensions.frames.last_mut() else {
+            return Err((LaneError::Suspension(SuspensionError::NotFound), continuation));
+        };
+        let observed_pass = match frame.phase {
+            SuspensionPhase::MaintenanceResuming { observed_pass } => observed_pass,
+            _ => return Err((LaneError::InvalidPhase, continuation)),
+        };
+        if frame.key != key || frame.owner != owner
+            || captured_pass < observed_pass
+            || admission_sequence <= frame.admission_sequence
+        {
+            return Err((LaneError::InvalidPhase, continuation));
+        }
+        let old = core::mem::replace(&mut frame.continuation, continuation);
+        frame.admission_sequence = admission_sequence;
+        frame.phase = SuspensionPhase::MaintenanceWaiting { captured_pass };
+        lane.phase = LanePhase::Suspended;
+        self.running = None;
+        Ok(old)
+    }
+
 }

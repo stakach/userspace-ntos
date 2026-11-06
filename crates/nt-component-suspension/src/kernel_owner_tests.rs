@@ -714,3 +714,34 @@ fn returned_root_maintenance_retains_original_reply_until_terminal_ack() {
     lanes.begin_dispatch(lane, reply).unwrap();
     assert_ne!(lanes.active_dispatch_identity(lane), Ok(Some(dispatch)));
 }
+
+#[test]
+fn resumed_root_maintenance_reparks_same_frame_for_later_outer_pass() {
+    let mut lanes = Lanes::new(1, 4);
+    let lane = lanes.allocate(binding(1)).unwrap();
+    let reply = binding(1).reply_object;
+    lanes.begin_dispatch(lane, reply).unwrap();
+    let dispatch = lanes.active_dispatch_identity(lane).unwrap().unwrap();
+    let owner = kernel(&lanes, lane);
+    let key = SuspensionKey::root_maintenance(11);
+    lanes.admit_root_maintenance_owned(lane, reply, dispatch, key, 1, owner, 8, 0x111).unwrap();
+    lanes.mark_root_maintenance_pass(lane, reply, dispatch, key, owner, 9).unwrap();
+    lanes.begin_root_maintenance_resume(lane, reply, dispatch, key, owner).unwrap();
+    assert_eq!(lanes.repark_root_maintenance_owned(
+        lane, binding(2).reply_object, dispatch, key, owner, 9, 2, 0x222,
+    ), Err((LaneError::WrongBinding, 0x222)));
+    assert_eq!(lanes.top(lane).unwrap().unwrap().continuation, 0x111);
+    assert_eq!(lanes.repark_root_maintenance_owned(
+        lane, reply, dispatch, key, owner, 9, 2, 0x222,
+    ), Ok(0x111));
+    assert_eq!(lanes.suspension_count(lane), Ok(1));
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::Suspended));
+    assert_eq!(lanes.active_dispatch_identity(lane), Ok(Some(dispatch)));
+    assert_eq!(lanes.top(lane).unwrap().unwrap().continuation, 0x222);
+    assert!(matches!(lanes.top(lane).unwrap().unwrap().phase,
+        SuspensionPhase::MaintenanceWaiting { captured_pass: 9 }));
+    assert_eq!(lanes.mark_root_maintenance_pass(lane, reply, dispatch, key, owner, 9),
+        Err(LaneError::InvalidPhase));
+    lanes.mark_root_maintenance_pass(lane, reply, dispatch, key, owner, 10).unwrap();
+    lanes.begin_root_maintenance_resume(lane, reply, dispatch, key, owner).unwrap();
+}

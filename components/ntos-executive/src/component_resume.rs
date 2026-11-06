@@ -7,6 +7,10 @@ use nt_component_suspension::{LaneResume, ResumeDemand, ResumePass, ResumeWake, 
 mod execute;
 pub(super) use execute::{run_hosted, run_receive};
 
+#[path = "component_resume_maintenance.rs"]
+mod maintenance;
+pub(crate) use maintenance::{run_root_maintenance, RootMaintenanceResumeOutcome};
+
 #[path = "component_resume_bootstrap.rs"]
 mod bootstrap;
 pub(crate) use bootstrap::{run_bootstrap_outer, BootstrapPassOutcome};
@@ -45,6 +49,9 @@ unsafe fn eligible(
 ) -> bool {
     match continuation {
         ComponentNativeContinuation::Hosted(hosted) => {
+            if matches!(hosted.pending, PendingComponentDispatch::RootMaintenance(_)) {
+                return false;
+            }
             let reply_ready = hosted.return_target.can_resume();
             let client_ready = win32k_glue::win32k_client_context_is_admitted(hosted.pending.client());
             if let HostedContinuationDestination::InitialThread(origin) = hosted.destination {
@@ -145,6 +152,15 @@ pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
         if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
             break;
         }
+        if let Some(ticket) = root_maintenance_owner::next_ready_ticket() {
+            match run_root_maintenance(handler, ticket) {
+                RootMaintenanceResumeOutcome::Parked | RootMaintenanceResumeOutcome::Terminal => {
+                    continue;
+                }
+                RootMaintenanceResumeOutcome::DeferredRetry
+                | RootMaintenanceResumeOutcome::RetainedFailure => break,
+            }
+        }
         let Some(candidate) = next_in_pass(&(*handler).pm, &mut pass) else {
             break;
         };
@@ -202,6 +218,14 @@ unsafe fn observe_demand(pm: &nt_process::ProcessManager) -> ResumeDemand {
         kernel_provider_activation::has_stopped_wait_work(pm),
         || {
             next_ready(pm).is_some()
+                || (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).frames().any(|(_, frame)| {
+                    frame.key.kind == nt_component_suspension::SuspensionKind::RootMaintenance
+                        && matches!(frame.phase,
+                            nt_component_suspension::SuspensionPhase::MaintenanceReady { .. })
+                        && frame.continuation.hosted().is_some_and(|hosted| {
+                            hosted.return_target.can_resume()
+                        })
+                })
                 || kernel_provider_activation::has_ready_completions()
                 || (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
                     .next_terminal_if(|_, terminal| {
@@ -326,6 +350,20 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
     loop {
         if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
             break;
+        }
+        if let Some(ticket) = root_maintenance_owner::next_ready_ticket() {
+            match run_root_maintenance(handler, ticket) {
+                RootMaintenanceResumeOutcome::Parked | RootMaintenanceResumeOutcome::Terminal => {
+                    progressed = true;
+                    progressed |= drain_terminals(handler);
+                    continue;
+                }
+                RootMaintenanceResumeOutcome::DeferredRetry => break,
+                RootMaintenanceResumeOutcome::RetainedFailure => {
+                    report_retained(nt_process::STATUS_UNSUCCESSFUL);
+                    break;
+                }
+            }
         }
         let Some(candidate) = next_in_pass(&(*handler).pm, &mut pass) else {
             break;

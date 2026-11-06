@@ -41,3 +41,35 @@ impl<C, R: Clone, T> ComponentSuspensionLanes<C, R, T> {
         self.finish_terminal_with_execution(identity, reply_object, local_retirement, true)
     }
 }
+
+impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
+    /// Retire an acknowledged maintenance Reply while preserving the exact shared dispatch.
+    /// The adapter must separately authenticate the provider's final completion Call.
+    pub fn finish_shared_root_maintenance_terminal(
+        &mut self,
+        route: peer_registry::PeerRoute,
+        dispatch: LaneDispatchIdentity,
+        identity: TerminalIdentity,
+        reply_object: u64,
+        local_retirement: Result<(), u32>,
+    ) -> Result<Option<RetiredRootMaintenance<C, T>>, LaneError> {
+        let record = self.terminal_record(identity, reply_object)?;
+        let lane = self.lane(identity.lane())?;
+        if route.identity().lane != identity.lane()
+            || lane.shared_peer != Some(route)
+            || dispatch != identity.dispatch
+            || lane.dispatch != Some(dispatch)
+            || lane.binding.executor_id != route.identity().executor
+            || lane.binding.receive_endpoint != route.endpoint()
+        {
+            return Err(LaneError::InvalidIdentity);
+        }
+        if !matches!(record.phase, TerminalPhase::Acknowledged { .. }) {
+            return Err(LaneError::InvalidPhase);
+        }
+        if self.execution_busy() { return Err(LaneError::Busy); }
+        self.finish_root_maintenance_terminal_with_execution(
+            identity, reply_object, local_retirement, true,
+        )
+    }
+}

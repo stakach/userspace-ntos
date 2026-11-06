@@ -13,15 +13,20 @@ mod receive;
 #[path = "win32k_lane_diagnostics.rs"]
 mod lane_diagnostics;
 pub(crate) use receive::{prepare_receive_yield, prepare_service_wait_yield,
+    prepare_root_maintenance_yield,
+    root_maintenance_continuation_is_current,
     resume_suspended_receive_component, receive_continuation_is_current,
     resume_suspended_service_wait_component, service_wait_continuation_is_current,
-    trace_receive_phase, ReceiveFaultCapture, ReceivePumpCompletion, ServiceWaitPumpCompletion};
+    trace_receive_phase, ReceiveFaultCapture, ReceivePumpCompletion, ServiceWaitPumpCompletion,
+    RootMaintenancePumpCompletion, resume_suspended_root_maintenance_component};
 pub(crate) use pending_dispatch::{
     take_pending_lpc_wait_dispatch, take_pending_provider_wait_dispatch, LpcWaitPumpCompletion,
     PendingLpcWaitDispatch, PendingProviderWaitDispatch, ProviderWaitPumpCompletion,
     PendingReceiveDispatch, ReceiveYield, take_pending_receive_dispatch,
     PendingServiceWaitDispatch, ServiceWaitYield, take_pending_service_wait_dispatch,
     PendingRootMaintenanceDispatch, RootMaintenanceYield, take_pending_root_maintenance_dispatch,
+    pending_root_maintenance_dispatch_is_some,
+    restore_pending_root_maintenance_dispatch,
 };
 use pending_dispatch::{
     capture_initial_arg_snapshot, capture_lpc_wait_repark, capture_provider_wait_repark,

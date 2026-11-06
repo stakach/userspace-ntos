@@ -124,6 +124,13 @@ pub(super) struct TerminalRecord<T> {
     next_attempt: u64,
 }
 
+#[derive(Clone, Copy)]
+enum TerminalRetentionMode {
+    Provider,
+    RootMaintenanceLocal,
+    RootMaintenanceShared(peer_registry::PeerRoute),
+}
+
 impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
     /// Provider execution and entered terminal mechanisms share the same execution fence.
     pub fn execution_busy(&self) -> bool {
@@ -148,7 +155,8 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         owner: SuspensionOwner,
         payload: T,
     ) -> Result<TerminalIdentity, (LaneError, T)> {
-        self.retain_running(handle, reply_object, key, owner, None, TerminalStage::Output, false, payload)
+        self.retain_running(handle, reply_object, key, owner, None, TerminalStage::Output,
+            TerminalRetentionMode::Provider, payload)
     }
 
     /// Retain a returned result whose sole mechanism is delivery to a local recipient.
@@ -161,7 +169,8 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         owner: SuspensionOwner,
         payload: T,
     ) -> Result<TerminalIdentity, (LaneError, T)> {
-        self.retain_running(handle, reply_object, key, owner, None, TerminalStage::LocalDelivery, false, payload)
+        self.retain_running(handle, reply_object, key, owner, None, TerminalStage::LocalDelivery,
+            TerminalRetentionMode::Provider, payload)
     }
 
     /// Retain a callback transfer without releasing its original native reply or suspension.
@@ -178,7 +187,8 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         if token == 0 {
             return Err((LaneError::InvalidIdentity, payload));
         }
-        self.retain_running(handle, reply_object, key, owner, Some(token), TerminalStage::Output, false, payload)
+        self.retain_running(handle, reply_object, key, owner, Some(token), TerminalStage::Output,
+            TerminalRetentionMode::Provider, payload)
     }
 
     /// Retain a normally returned root-maintenance continuation under the original dispatch.
@@ -198,7 +208,52 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         {
             return Err((LaneError::InvalidIdentity, payload));
         }
-        self.retain_running(handle, reply_object, key, owner, None, TerminalStage::Output, true, payload)
+        self.retain_running(handle, reply_object, key, owner, None, TerminalStage::Output,
+            TerminalRetentionMode::RootMaintenanceLocal, payload)
+    }
+
+    /// A shared peer keeps its physical dispatch after the user's Reply is acknowledged.
+    /// The exact route and dispatch are required before retaining the terminal payload.
+    pub fn retain_shared_root_maintenance_terminal_running(
+        &mut self,
+        route: peer_registry::PeerRoute,
+        dispatch: LaneDispatchIdentity,
+        handle: LaneHandle,
+        reply_object: u64,
+        key: SuspensionKey,
+        owner: SuspensionOwner,
+        payload: T,
+    ) -> Result<TerminalIdentity, (LaneError, T)> {
+        if key.kind != SuspensionKind::RootMaintenance
+            || dispatch.lane() != handle
+            || !self.is_dispatch_identity_active(dispatch)
+        {
+            return Err((LaneError::InvalidIdentity, payload));
+        }
+        self.retain_running(handle, reply_object, key, owner, None, TerminalStage::Output,
+            TerminalRetentionMode::RootMaintenanceShared(route), payload)
+    }
+
+    /// A maintenance receive half may yield a genuine user callback. Keep its external token
+    /// under the same typed maintenance terminal until callback restart is acknowledged.
+    pub fn retain_shared_root_maintenance_external_terminal_running(
+        &mut self,
+        route: peer_registry::PeerRoute,
+        dispatch: LaneDispatchIdentity,
+        handle: LaneHandle,
+        reply_object: u64,
+        key: SuspensionKey,
+        owner: SuspensionOwner,
+        token: u64,
+        payload: T,
+    ) -> Result<TerminalIdentity, (LaneError, T)> {
+        if token == 0 || key.kind != SuspensionKind::RootMaintenance
+            || dispatch.lane() != handle || !self.is_dispatch_identity_active(dispatch)
+        {
+            return Err((LaneError::InvalidIdentity, payload));
+        }
+        self.retain_running(handle, reply_object, key, owner, Some(token), TerminalStage::Output,
+            TerminalRetentionMode::RootMaintenanceShared(route), payload)
     }
 
     fn retain_running(
@@ -209,10 +264,10 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         owner: SuspensionOwner,
         external_token: Option<u64>,
         first_stage: TerminalStage,
-        root_maintenance: bool,
+        mode: TerminalRetentionMode,
         payload: T,
     ) -> Result<TerminalIdentity, (LaneError, T)> {
-        let identity = match self.validate_terminal_retention(handle, reply_object, key, owner, external_token, root_maintenance) {
+        let identity = match self.validate_terminal_retention(handle, reply_object, key, owner, external_token, mode) {
             Ok(identity) => identity,
             Err(error) => return Err((error, payload)),
         };
@@ -238,7 +293,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         key: SuspensionKey,
         owner: SuspensionOwner,
         external_token: Option<u64>,
-        root_maintenance: bool,
+        mode: TerminalRetentionMode,
     ) -> Result<TerminalIdentity, LaneError> {
         self.validate_running(handle, reply_object)?;
         let max_depth = self.max_depth_per_lane;
@@ -256,12 +311,21 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         if lane.terminal.is_some()
             || lane.resume_epoch == 0
             || frame.receive.is_some_and(|admission| !admission.restored)
-            || if root_maintenance {
+            || if !matches!(mode, TerminalRetentionMode::Provider) {
                 key.kind != SuspensionKind::RootMaintenance
                     || !matches!(frame.phase, SuspensionPhase::MaintenanceResuming { .. })
                     || lane.suspensions.len() != 1
                     || !lane.external_tokens.is_empty()
-                    || lane.shared_peer.is_some()
+                    || match mode {
+                        TerminalRetentionMode::RootMaintenanceLocal => lane.shared_peer.is_some(),
+                        TerminalRetentionMode::RootMaintenanceShared(route) => {
+                            lane.shared_peer != Some(route)
+                                || route.identity().lane != handle
+                                || lane.binding.executor_id != route.identity().executor
+                                || lane.binding.receive_endpoint != route.endpoint()
+                        }
+                        TerminalRetentionMode::Provider => false,
+                    }
             } else {
                 !matches!(frame.phase, SuspensionPhase::Resuming { .. })
             }
@@ -506,6 +570,23 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         reply_object: u64,
         local_retirement: Result<(), u32>,
     ) -> Result<Option<RetiredRootMaintenance<C, T>>, LaneError> {
+        // A shared peer still owns the physical dispatch after semantic Reply retirement.
+        // Its typed shared transition must retain the dispatch epoch for ingress completion.
+        if self.lane(identity.lane())?.shared_peer.is_some() {
+            return Err(LaneError::InvalidPhase);
+        }
+        self.finish_root_maintenance_terminal_with_execution(
+            identity, reply_object, local_retirement, false,
+        )
+    }
+
+    fn finish_root_maintenance_terminal_with_execution(
+        &mut self,
+        identity: TerminalIdentity,
+        reply_object: u64,
+        local_retirement: Result<(), u32>,
+        preserve_execution: bool,
+    ) -> Result<Option<RetiredRootMaintenance<C, T>>, LaneError> {
         let record = self.terminal_record(identity, reply_object)?;
         if identity.key.kind != SuspensionKind::RootMaintenance
             || !matches!(record.phase, TerminalPhase::Acknowledged { .. })
@@ -525,8 +606,9 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             .retire_root_maintenance(identity.key, identity.owner)
             .map_err(LaneError::Suspension)?;
         let record = lane.terminal.take().unwrap();
-        lane.phase = LanePhase::Idle;
-        lane.dispatch = None;
+        lane.phase = if preserve_execution { LanePhase::Running } else { LanePhase::Idle };
+        if !preserve_execution { lane.dispatch = None; }
+        if preserve_execution { self.running = Some(identity.lane()); }
         Ok(Some(RetiredRootMaintenance {
             key: identity.key,
             owner: identity.owner,

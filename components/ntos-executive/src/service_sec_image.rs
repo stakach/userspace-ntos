@@ -14,6 +14,8 @@ use hosted_quiesce::dump_all_hosted_thread_quiesce;
 mod component_continuation;
 use component_continuation::{HostedContinuationDestination, HostedNativeContinuation, PendingComponentDispatch};
 pub(crate) use component_continuation::{ComponentNativeContinuation, ComponentSuspensionCompletion};
+#[path = "root_maintenance_owner.rs"]
+pub(crate) mod root_maintenance_owner;
 
 #[path = "bootstrap_wait_selftest.rs"]
 pub(crate) mod bootstrap_wait_selftest;
@@ -244,6 +246,14 @@ pub(crate) static mut COMPONENT_SUSPENSIONS: ComponentLanes = nt_component_suspe
     COMPONENT_EXECUTION_LANE_CAPACITY,
     COMPONENT_SUSPENSION_MAX_DEPTH,
 );
+
+// Advances only after the independent outer worker has returned. A parked native syscall
+// captures this epoch; timer notification alone cannot authorize its resume.
+static ROOT_MAINTENANCE_PASS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn root_maintenance_pass() -> u64 {
+    ROOT_MAINTENANCE_PASS.load(Ordering::Acquire)
+}
 
 /// Identify a startup completion's protocol shape without changing its retained owner.
 pub(crate) unsafe fn component_execution_lane_is_starting(
@@ -1243,6 +1253,7 @@ fn component_expected_owner(
         PendingComponentDispatch::Lpc(pending) => lpc_wait_expected_owner(pending),
         PendingComponentDispatch::Receive(pending) => Some(pending.yielded.owner),
         PendingComponentDispatch::ServiceWait(pending) => service_wait_expected_owner(pending),
+        PendingComponentDispatch::RootMaintenance(pending) => Some(pending.yielded.owner),
     }
 }
 
@@ -1285,6 +1296,9 @@ fn component_suspension_key(
         }
         PendingComponentDispatch::ServiceWait(pending) => {
             nt_component_suspension::SuspensionKey::service_wait(pending.yielded.token)
+        }
+        PendingComponentDispatch::RootMaintenance(pending) => {
+            nt_component_suspension::SuspensionKey::root_maintenance(pending.yielded.dispatch.epoch())
         }
     }
 }
@@ -1915,6 +1929,8 @@ struct PendingWin32kHandoff {
     callback_suspended: bool,
     admitted_dispatch_id: u64,
     parked: bool,
+    maintenance_ticket: Option<root_maintenance_owner::RootMaintenanceTicket>,
+    retained_failure: bool,
 }
 
 /// One authoritative transfer from a returned native pump to the retained execution owner.
@@ -1926,6 +1942,153 @@ unsafe fn admit_pending_win32k_dispatch(
     let callback_suspended = win32k_glue::take_user_callback_pump_suspended();
     let mut admitted_dispatch_id = 0;
     let mut parked = false;
+    let mut maintenance_ticket = None;
+    let mut retained_failure = false;
+    if win32k_glue::pending_root_maintenance_dispatch_is_some() {
+        // Initial-thread callouts cannot transfer this ordinary hosted syscall checkpoint.
+        // Leave the pending snapshot in its global cell on every pre-effect refusal.
+        if destination != HostedContinuationDestination::Win32k || callback_suspended {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        }
+        let root_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+        if root_reply == 0 {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        }
+        let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        };
+        let Some(reservation) = root_maintenance_owner::reserve_capacity() else {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        };
+        let Some(pending) = win32k_glue::take_pending_root_maintenance_dispatch() else {
+            root_maintenance_owner::cancel_reservation(reservation);
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        };
+        // The reservation makes this memory-only transfer allocation free. A defensive refusal
+        // returns the snapshot to its pending cell before any physical effect can enter.
+        let ticket = match root_maintenance_owner::retain(reservation, pending, root_reply) {
+            Ok(ticket) => ticket,
+            Err(pending) => {
+                let _ = win32k_glue::restore_pending_root_maintenance_dispatch(pending);
+                root_maintenance_owner::cancel_reservation(reservation);
+                return PendingWin32kHandoff {
+                    callback_suspended, admitted_dispatch_id, parked,
+                    maintenance_ticket, retained_failure: true,
+                };
+            }
+        };
+        maintenance_ticket = Some(ticket);
+        admitted_dispatch_id = pending.snapshot.dispatch.dispatch_id;
+        let yielded = pending.yielded;
+        let lane = yielded.dispatch.lane();
+        let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
+        let exact = root_reply != 0
+            && pending.snapshot.callback_token.is_none()
+            && pending.snapshot.pump.reply_cap == yielded.reply
+            && pending.snapshot.dispatch.lane == lane
+            && pending.snapshot.dispatch.dispatch_id == yielded.owner.dispatch_id
+            && yielded.route.identity().lane == lane
+            && lanes.is_dispatch_identity_active(yielded.dispatch)
+            && lanes.phase(lane) == Ok(nt_component_suspension::LanePhase::Running)
+            && lanes.binding(lane).is_ok_and(|binding| {
+                binding.reply_object == yielded.reply
+                    && binding.executor_id == pending.snapshot.channel.tcb
+                    && binding.receive_endpoint == pending.snapshot.channel.fault_ep
+            })
+            && crate::spawn_hosts::shared_ingress::owner::runtime::dispatch(yielded.route)
+                .is_ok_and(|dispatch| dispatch == yielded.dispatch)
+            && crate::spawn_hosts::shared_ingress::owner::runtime::current_reply(yielded.route)
+                .is_ok_and(|reply| reply == yielded.reply)
+            && crate::spawn_hosts::shared_ingress::owner::runtime::channel_route(&pending.snapshot.channel)
+                .is_ok_and(|route| route == Some(yielded.route))
+            && win32k_glue::win32k_client_context_is_admitted(pending.snapshot.client)
+            && crate::current_win32k_provider_domain().is_some_and(|provider| {
+                provider.domain == yielded.owner.provider_domain
+                    && provider.generation == yielded.owner.provider_generation
+            });
+        if !exact {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        }
+        let Ok(return_target) = HostedReturnTarget::new(root_reply, None) else {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        };
+        let continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
+            pending: PendingComponentDispatch::RootMaintenance(pending),
+            return_target,
+            destination,
+        });
+        if !root_maintenance_owner::store_continuation(ticket, continuation) {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        }
+        let acquired = root_maintenance_owner::with_physical(ticket, |physical| physical.acquire())
+            .is_some_and(|result| result.is_ok());
+        if !acquired {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        }
+        let key = nt_component_suspension::SuspensionKey::root_maintenance(yielded.dispatch.epoch());
+        let sequence = next_dispatcher_wait_sequence();
+        let Some(continuation) = root_maintenance_owner::take_continuation(ticket) else {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        };
+        let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+        if let Err((_, continuation)) = lanes.admit_root_maintenance_owned(
+            lane, yielded.reply, yielded.dispatch, key, sequence, yielded.owner,
+            yielded.captured_pass, continuation,
+        ) {
+            let _ = root_maintenance_owner::restore_continuation(ticket, continuation);
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        }
+        if !root_maintenance_owner::mark_admitted(ticket, key) {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        }
+        if reply_park.try_commit().is_err() {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        }
+        parked = true;
+        return PendingWin32kHandoff {
+            callback_suspended, admitted_dispatch_id, parked,
+            maintenance_ticket, retained_failure,
+        };
+    }
     if let Some(pending) = win32k_glue::take_pending_receive_dispatch() {
         admitted_dispatch_id = pending.snapshot.dispatch.dispatch_id;
         parked = receive_admit_current(pending, destination);
@@ -1944,7 +2107,10 @@ unsafe fn admit_pending_win32k_dispatch(
         assert!(parked, "LPC wait could not reserve its native continuation");
     }
     assert!(!callback_suspended || !parked, "callback and provider wait cannot share one native yield");
-    PendingWin32kHandoff { callback_suspended, admitted_dispatch_id, parked }
+    PendingWin32kHandoff {
+        callback_suspended, admitted_dispatch_id, parked,
+        maintenance_ticket, retained_failure,
+    }
 }
 
 unsafe fn component_suspension_cancel_scope(
@@ -9947,6 +10113,7 @@ pub(crate) unsafe fn service_sec_image(
                 && !defer_quiesce_for_active_user_callbacks(b"all-live-waiting")
                 && !driver_launch::native_disk_proof_hardware_irp_pending()
                 && !driver_launch::active_relation_wal_retained()
+                && root_maintenance_owner::next_ready_ticket().is_none()
                 && !crate::mounted_volume::mounted_create_outstanding()
                 && !crate::mounted_volume::mounted_read_outstanding()
                 && !crate::mounted_volume::mounted_directory_outstanding()
@@ -13265,6 +13432,7 @@ pub(crate) unsafe fn service_sec_image(
             // is nothing left to steer. See the reply tail at the bottom of the syscall arm.)
             let mut redirected_user_callback = false;
             let mut component_suspension_park_request = false;
+            let mut component_root_maintenance_ticket = None;
             let mut component_suspension_admitted_dispatch_id = 0;
             let mut current_apc_handoff = None;
             let mut redirected_context_continue = false;
@@ -13832,6 +14000,17 @@ pub(crate) unsafe fn service_sec_image(
                                     ).expect("foreign initial Reply requires distinct valid owners"),
                                 ),
                             );
+                            if handoff.retained_failure {
+                                // The pending win32k snapshot and original Reply remain owned.
+                                // Never turn this refusal into a process-creation reply.
+                                procs[pi].faults = faults;
+                                procs[pi].first = first;
+                                procs[pi].ntfaults = ntfaults;
+                                pfilled[pi] = *filled_pages;
+                                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                                stop_ssn = m0;
+                                break 'service_loop;
+                            }
                             assert!(handoff.parked || handoff.callback_suspended,
                                 "suspended process callout lost its native yield owner");
                             assert!(!handoff.callback_suspended,
@@ -18519,9 +18698,21 @@ pub(crate) unsafe fn service_sec_image(
                 let handoff = admit_pending_win32k_dispatch(
                     &mut nt_handler, HostedContinuationDestination::Win32k,
                 );
+                if handoff.retained_failure {
+                    // A yielded pump has already transferred its pending snapshot. Preserve
+                    // both Replies and the durable owner; ordinary syscall output is forbidden.
+                    procs[pi].faults = faults;
+                    procs[pi].first = first;
+                    procs[pi].ntfaults = ntfaults;
+                    pfilled[pi] = *filled_pages;
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = m0;
+                    break 'service_loop;
+                }
                 let callback_suspended = handoff.callback_suspended;
                 component_suspension_admitted_dispatch_id = handoff.admitted_dispatch_id;
                 component_suspension_park_request = handoff.parked;
+                component_root_maintenance_ticket = handoff.maintenance_ticket;
                 if let Some(stage) = bulk_stage.take() {
                     let suspended = callback_suspended || handoff.parked;
                     let bound = if suspended {
@@ -19201,6 +19392,67 @@ pub(crate) unsafe fn service_sec_image(
                     // Drop pointers to this event's stack locals without executing a provider or
                     // filesystem finalizer while the physical GUI parent is held.
                     nt_handler.loop_ctx = nt_handler.loop_ctx.map(|ctx| ctx.checkpoint_live());
+                }
+                if let Some(maintenance_ticket) = component_root_maintenance_ticket {
+                    if receive_child_pending {
+                        // A prepared Receive child has physical priority over independent work.
+                        // Keep this checkpoint and both Replies retained for diagnosis.
+                        print_str(b"[root-maintenance] pending Receive child; checkpoint retained\n");
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = m0;
+                        break 'service_loop;
+                    }
+                    // The ordinary syscall has yielded with both Replies retained. Run this
+                    // independent worker only after all event-local state is checkpointed.
+                    let worker_attempted = {
+                        let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                        crate::process_image_snapshot_work::redrive(
+                            &mut nt_handler, &mut *delay_queue, ntdll, fault_ep, procs,
+                            exe_images, &*exe_image_catalog, hosted_loaded_images_ptr,
+                        )
+                    };
+                    if !worker_attempted {
+                        print_str(b"[root-maintenance] image worker did not enter; checkpoint retained\n");
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = m0;
+                        break 'service_loop;
+                    }
+                    let Some(observed_pass) = ROOT_MAINTENANCE_PASS.fetch_update(
+                        Ordering::AcqRel, Ordering::Acquire, |old| old.checked_add(1),
+                    ).ok().and_then(|old| old.checked_add(1)) else {
+                        print_str(b"[root-maintenance] outer pass epoch exhausted\n");
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = m0;
+                        break 'service_loop;
+                    };
+                    let Some(key) = root_maintenance_owner::key(maintenance_ticket) else {
+                        print_str(b"[root-maintenance] exact owner missing before pass grant\n");
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = m0;
+                        break 'service_loop;
+                    };
+                    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+                    if lanes.mark_root_maintenance_pass(
+                        maintenance_ticket.dispatch.lane(), maintenance_ticket.reply,
+                        maintenance_ticket.dispatch, key, maintenance_ticket.owner,
+                        observed_pass,
+                    ).is_err() {
+                        print_str(b"[root-maintenance] exact pass grant refused\n");
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = m0;
+                        break 'service_loop;
+                    }
+                    if matches!(
+                        component_resume::run_root_maintenance(
+                            core::ptr::from_mut(nt_handler), maintenance_ticket,
+                        ),
+                        component_resume::RootMaintenanceResumeOutcome::RetainedFailure,
+                    ) {
+                        print_str(b"[root-maintenance] exact resume retained after refusal\n");
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = m0;
+                        break 'service_loop;
+                    }
                 }
                 if !receive_child_pending {
                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));

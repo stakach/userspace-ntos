@@ -685,6 +685,16 @@ pub(super) unsafe fn receive(
                 Ok(None) => {}
                 Err(_) => panic!("service-wait yield lost its exact physical ownership"),
             }
+            match crate::win32k_glue::prepare_root_maintenance_yield(ch) {
+                Ok(Some(yielded)) => {
+                    trace_ps_create_receive(ch, b"root-maintenance-yield", Some(route));
+                    return PumpMessage::hosted_root_maintenance_yield(yielded);
+                }
+                Ok(None) => {}
+                // Maintenance is optional independent work. No native effects have entered at
+                // this preflight, so a refused checkpoint leaves the current Receive intact.
+                Err(_) => trace_ps_create_receive(ch, b"root-maintenance-refused", Some(route)),
+            }
         }
         // A native SYSTEM fold may finish its second physical slot while this IRP Receive
         // retains the parent Call. Release its exact CM checkpoint and reserve before a

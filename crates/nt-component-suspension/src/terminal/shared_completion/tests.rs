@@ -140,6 +140,95 @@ fn ack_all(lanes: &mut Lanes, terminal: TerminalIdentity) {
 }
 
 #[test]
+fn shared_root_maintenance_retires_only_after_reply_ack_and_keeps_dispatch_epoch() {
+    let mut lanes = Lanes::new(2, 4);
+    let mut peers = peer_registry::PeerRegistry::new(20, 2);
+    let binding = LaneBinding {
+        executor_id: 10,
+        receive_endpoint: 20,
+        reply_object: 30,
+    };
+    let (lane, mut registration) = lanes
+        .allocate_shared_staged(&mut peers, 1, 2, binding)
+        .unwrap();
+    let route = peers.publish_lane(&mut registration, 1, 2, &lanes).unwrap();
+    lanes.begin_startup(lane, 30, |_, _| Ok::<_, u8>(ReplyBindingObservation::Free)).unwrap();
+    lanes.complete_startup(lane, 30, bound).unwrap();
+    lanes.begin_dispatch(lane, 30).unwrap();
+    let dispatch = lanes.active_dispatch_identity(lane).unwrap().unwrap();
+    let key = SuspensionKey::root_maintenance(9);
+    let owner = SuspensionOwner {
+        provider_domain: 1,
+        provider_generation: 2,
+        caller: SuspensionCaller::Kernel { lane },
+        dispatch_id: dispatch.epoch(),
+    };
+    lanes.admit_root_maintenance_owned(lane, 30, dispatch, key, 1, owner, 8, 123).unwrap();
+    lanes.mark_root_maintenance_pass(lane, 30, dispatch, key, owner, 9).unwrap();
+    lanes.begin_root_maintenance_resume(lane, 30, dispatch, key, owner).unwrap();
+    let terminal = lanes
+        .retain_shared_root_maintenance_terminal_running(route, dispatch, lane, 30, key, owner, 789)
+        .unwrap();
+    for stage in [TerminalStage::Output, TerminalStage::Context,
+        TerminalStage::Publication, TerminalStage::Reply]
+    {
+        let mut attempt = lanes.begin_terminal_stage(terminal, 30, stage).unwrap();
+        lanes.record_terminal_stage(&mut attempt, 30, TerminalStageOutcome::Acknowledged).unwrap();
+    }
+    // A shared route still owns the physical provider dispatch after local Reply ACK.
+    assert!(lanes.finish_root_maintenance_terminal(terminal, 30, Ok(())).is_err());
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::Terminal));
+    assert_eq!(lanes.active_dispatch_identity(lane), Ok(Some(dispatch)));
+    assert_eq!(lanes.suspension_count(lane), Ok(1));
+    assert!(lanes.finish_shared_root_maintenance_terminal(route, dispatch, terminal, 31, Ok(())).is_err());
+    let retired = lanes
+        .finish_shared_root_maintenance_terminal(route, dispatch, terminal, 30, Ok(()))
+        .unwrap().unwrap();
+    assert_eq!(retired.continuation, 123);
+    assert_eq!(retired.payload, 789);
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::Running));
+    assert_eq!(lanes.running(), Some(lane));
+    assert_eq!(lanes.active_dispatch_identity(lane), Ok(Some(dispatch)));
+    assert_eq!(lanes.suspension_count(lane), Ok(0));
+    assert!(lanes.finish_shared_root_maintenance_terminal(route, dispatch, terminal, 30, Ok(())).is_err());
+}
+
+#[test]
+fn shared_root_maintenance_callback_retains_external_transfer_until_ack() {
+    let mut lanes = Lanes::new(2, 4);
+    let mut peers = peer_registry::PeerRegistry::new(20, 2);
+    let (lane, mut registration) = lanes.allocate_shared_staged(&mut peers, 1, 2,
+        LaneBinding { executor_id: 10, receive_endpoint: 20, reply_object: 30 }).unwrap();
+    let route = peers.publish_lane(&mut registration, 1, 2, &lanes).unwrap();
+    lanes.begin_startup(lane, 30, |_, _| Ok::<_, u8>(ReplyBindingObservation::Free)).unwrap();
+    lanes.complete_startup(lane, 30, bound).unwrap();
+    lanes.begin_dispatch(lane, 30).unwrap();
+    let dispatch = lanes.active_dispatch_identity(lane).unwrap().unwrap();
+    let key = SuspensionKey::root_maintenance(9);
+    let owner = SuspensionOwner { provider_domain: 1, provider_generation: 2,
+        caller: SuspensionCaller::Kernel { lane }, dispatch_id: dispatch.epoch() };
+    lanes.admit_root_maintenance_owned(lane, 30, dispatch, key, 1, owner, 8, 123).unwrap();
+    lanes.mark_root_maintenance_pass(lane, 30, dispatch, key, owner, 9).unwrap();
+    lanes.begin_root_maintenance_resume(lane, 30, dispatch, key, owner).unwrap();
+    let terminal = lanes.retain_shared_root_maintenance_external_terminal_running(
+        route, dispatch, lane, 30, key, owner, 77, 789,
+    ).unwrap();
+    assert_eq!(terminal.external_token(), Some(77));
+    assert!(lanes.finish_shared_root_maintenance_terminal(route, dispatch, terminal, 30, Ok(())).is_err());
+    for stage in [TerminalStage::Output, TerminalStage::Context,
+        TerminalStage::Publication, TerminalStage::Reply] {
+        let mut attempt = lanes.begin_terminal_stage(terminal, 30, stage).unwrap();
+        lanes.record_terminal_stage(&mut attempt, 30, TerminalStageOutcome::Acknowledged).unwrap();
+    }
+    let retired = lanes.finish_shared_root_maintenance_terminal(route, dispatch, terminal, 30, Ok(()))
+        .unwrap().unwrap();
+    assert_eq!(retired.continuation, 123);
+    assert_eq!(retired.payload, 789);
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::Running));
+    assert_eq!(lanes.active_dispatch_identity(lane), Ok(Some(dispatch)));
+}
+
+#[test]
 fn semantic_retirement_preserves_epoch_until_authenticated_receiver_completion() {
     let (mut lanes, mut peers, route, dispatch, terminal, mut receiver) = setup(false);
     ack_all(&mut lanes, terminal);

@@ -31,24 +31,42 @@ impl RootReplyPark {
 
     /// The semantic continuation (or the returned transfer value) must retain `active`.
     pub(crate) unsafe fn commit(self) {
-        assert_eq!(REPLY_MAIN_SLOT.load(Ordering::Relaxed), self.active);
-        let index = wait_reply_pool_find_cap(self.active)
-            .expect("parked root Call lost its semantic pool record");
-        assert!(wait_reply_pool_ref()[index].used);
+        if self.try_commit().is_err() {
+            panic!("parked root Call lost its prepared Reply ownership");
+        }
+    }
+
+    /// Park a Reply whose semantic owner is already retained after a native effect. Every
+    /// refusal is checked before touching the pool or main slot, so the owner can keep the
+    /// original Reply without a panic or an uncertain replacement.
+    pub(crate) unsafe fn try_commit(self) -> Result<(), Self> {
+        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) != self.active {
+            return Err(self);
+        }
+        let Some(active_index) = wait_reply_pool_find_cap(self.active) else {
+            return Err(self);
+        };
+        if !wait_reply_pool_ref().get(active_index).is_some_and(|record| record.used) {
+            return Err(self);
+        }
         match self.replacement {
             None => {
-                assert!(runtime::can_park_hosted_reply(self.active));
+                if !runtime::can_park_hosted_reply(self.active) {
+                    return Err(self);
+                }
                 REPLY_MAIN_SLOT.store(0, Ordering::Relaxed);
             }
             Some((index, cap)) => {
-                let record = &wait_reply_pool_ref()[index];
-                assert_eq!(record.cap, cap);
-                assert!(!record.used);
-                assert!(!runtime::owns_ingress_reply(cap));
+                if !wait_reply_pool_ref().get(index).is_some_and(|record| {
+                    record.cap == cap && cap != 0 && !record.used
+                }) || runtime::owns_ingress_reply(cap) {
+                    return Err(self);
+                }
                 wait_reply_pool_mark_used(index);
                 REPLY_MAIN_SLOT.store(cap, Ordering::Relaxed);
             }
         }
+        Ok(())
     }
 }
 

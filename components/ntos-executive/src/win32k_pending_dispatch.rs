@@ -68,8 +68,21 @@ pub(crate) struct PendingRootMaintenanceDispatch {
 
 pub(super) static mut ROOT_MAINTENANCE_PENDING_DISPATCH: Option<PendingRootMaintenanceDispatch> = None;
 
+pub(crate) unsafe fn pending_root_maintenance_dispatch_is_some() -> bool {
+    (&*core::ptr::addr_of!(ROOT_MAINTENANCE_PENDING_DISPATCH)).is_some()
+}
+
 pub(crate) unsafe fn take_pending_root_maintenance_dispatch() -> Option<PendingRootMaintenanceDispatch> {
     core::ptr::replace(core::ptr::addr_of_mut!(ROOT_MAINTENANCE_PENDING_DISPATCH), None)
+}
+
+pub(crate) unsafe fn restore_pending_root_maintenance_dispatch(
+    pending: PendingRootMaintenanceDispatch,
+) -> bool {
+    let slot = &mut *core::ptr::addr_of_mut!(ROOT_MAINTENANCE_PENDING_DISPATCH);
+    if slot.is_some() { return false; }
+    *slot = Some(pending);
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -316,6 +329,7 @@ pub(crate) struct PendingLpcWaitDispatch {
 
 pub(super) static mut LPC_WAIT_PENDING_DISPATCH: Option<PendingLpcWaitDispatch> = None;
 
+#[derive(Clone, Copy)]
 pub(crate) enum ProviderWaitPumpCompletion {
     Completed(CompletedWin32kDispatch),
     Reparked(PendingProviderWaitDispatch),

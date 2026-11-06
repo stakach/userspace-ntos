@@ -2384,6 +2384,26 @@ pub(crate) unsafe fn component_pump_continue_service_wait(
     component_pump_continue_receive_half(ch, previous, false)
 }
 
+/// Continue only the receive half of the exact maintenance-parked syscall. The root owns its
+/// original Reply and physical hold until its typed lane and shared snapshot are restored.
+pub(crate) unsafe fn component_pump_continue_root_maintenance(
+    ch: &PumpChannel,
+    previous: &PumpResult,
+) -> Result<PumpResult, u32> {
+    let current = previous.maintenance_yield.is_some_and(|yielded| {
+        previous.reply_cap == yielded.reply
+            && crate::win32k_glue::root_maintenance_continuation_is_current(ch, yielded)
+    });
+    if !current || previous.completed || previous.callback_suspended
+        || previous.provider_wait_suspended || previous.lpc_wait_suspended
+        || previous.receive_yield.is_some() || previous.service_wait_yield.is_some()
+        || previous.scheduler_yielded
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    component_pump_continue_receive_half(ch, previous, false)
+}
+
 unsafe fn component_pump_continue_receive_half(
     ch: &PumpChannel,
     previous: &PumpResult,

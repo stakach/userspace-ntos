@@ -23,6 +23,7 @@ fn trace_repark_failure(
         Some(PendingComponentDispatch::Lpc(_)) => b"lpc",
         Some(PendingComponentDispatch::Receive(_)) => b"receive",
         Some(PendingComponentDispatch::ServiceWait(_)) => b"service-wait",
+        Some(PendingComponentDispatch::RootMaintenance(_)) => b"root-maintenance",
     });
     print_str(b" error=");
     print_str(match error {
@@ -59,7 +60,7 @@ pub(crate) unsafe fn run_hosted(
         ComponentNativeContinuation::Hosted(hosted) => hosted,
         ComponentNativeContinuation::Kernel(_) => return None,
     };
-    if matches!(continuation.pending, PendingComponentDispatch::Receive(_)) {
+    if matches!(continuation.pending, PendingComponentDispatch::Receive(_) | PendingComponentDispatch::RootMaintenance(_)) {
         return None;
     }
     if !continuation.return_target.can_resume()
@@ -158,6 +159,7 @@ pub(crate) unsafe fn run_hosted(
         PendingComponentDispatch::Receive(_) => {
             unreachable!("Receive requires its sealed child boundary")
         }
+        PendingComponentDispatch::RootMaintenance(_) => return None,
         PendingComponentDispatch::ServiceWait(pending) => {
             match win32k_glue::resume_suspended_service_wait_component(pending) {
                 win32k_glue::ServiceWaitPumpCompletion::Restored(completion) => match completion {
@@ -627,7 +629,7 @@ unsafe fn finish_hosted_resume(
                         return Some(ComponentSuspensionRuntimeOutcome::Parked);
                     }
                 }
-                PendingComponentDispatch::Receive(_) | PendingComponentDispatch::ServiceWait(_) => {
+                PendingComponentDispatch::Receive(_) | PendingComponentDispatch::ServiceWait(_) | PendingComponentDispatch::RootMaintenance(_) => {
                     unreachable!("nested and service waits transfer before readiness admission")
                 }
             }

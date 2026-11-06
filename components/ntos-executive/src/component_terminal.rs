@@ -106,6 +106,31 @@ pub(super) unsafe fn retain_callback_transfer(
     }
 }
 
+/// Transfer a captured maintenance callback from its durable physical owner into a typed
+/// shared terminal. A rejected terminal admission restores the callback to the same ticket.
+pub(super) unsafe fn retain_maintenance_callback_transfer(
+    ticket: root_maintenance_owner::RootMaintenanceTicket,
+    key: nt_component_suspension::SuspensionKey,
+    token: u64,
+) -> bool {
+    let Some(callback) = root_maintenance_owner::take_callback(ticket) else { return false; };
+    let mut payload = NativeTerminal::blocked(0);
+    payload.callback = Some(callback);
+    match (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+        .retain_shared_root_maintenance_external_terminal_running(
+            ticket.route, ticket.dispatch, ticket.dispatch.lane(), ticket.reply,
+            key, ticket.owner, token, payload,
+        ) {
+        Ok(_) => true,
+        Err((_, mut payload)) => {
+            if let Some(callback) = payload.callback.take() {
+                let _ = root_maintenance_owner::store_callback(ticket, callback);
+            }
+            false
+        }
+    }
+}
+
 pub(super) unsafe fn retain_incomplete_provider(
     lane: nt_component_suspension::LaneHandle,
     reply_object: u64,
@@ -153,6 +178,8 @@ struct PendingSharedReturn {
     reply: u64,
     action: SharedReturn,
     entered: bool,
+    ready: bool,
+    maintenance_ticket: Option<root_maintenance_owner::RootMaintenanceTicket>,
 }
 
 // A successful semantic retirement transfers the exact physical dispatch to this row. A
@@ -165,10 +192,60 @@ static mut PENDING_SHARED_RETURNS: [Option<PendingSharedReturn>; COMPONENT_EXECU
 static mut SHARED_RETIRED_REPLIES: [Option<TerminalIdentity>; COMPONENT_EXECUTION_LANE_CAPACITY] =
     [None; COMPONENT_EXECUTION_LANE_CAPACITY];
 
+unsafe fn reserve_root_maintenance_shared_return(
+    identity: TerminalIdentity,
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    action: SharedReturn,
+    ticket: root_maintenance_owner::RootMaintenanceTicket,
+) -> bool {
+    let index = identity.lane().index as usize;
+    if index >= COMPONENT_EXECUTION_LANE_CAPACITY
+        || ticket.route != route || ticket.dispatch != dispatch || ticket.reply != reply
+        || (&*core::ptr::addr_of!(PENDING_SHARED_RETURNS))[index].is_some()
+    {
+        return false;
+    }
+    (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index] = Some(PendingSharedReturn {
+        route, dispatch, reply, action,
+        entered: false, ready: false, maintenance_ticket: Some(ticket),
+    });
+    true
+}
+
+unsafe fn publish_root_maintenance_shared_return(
+    identity: TerminalIdentity,
+    ticket: root_maintenance_owner::RootMaintenanceTicket,
+) -> bool {
+    let index = identity.lane().index as usize;
+    let Some(mut pending) = (&*core::ptr::addr_of!(PENDING_SHARED_RETURNS))
+        .get(index).copied().flatten() else { return false; };
+    if pending.ready || pending.entered || pending.maintenance_ticket != Some(ticket)
+        || pending.route != ticket.route || pending.dispatch != ticket.dispatch
+        || pending.reply != ticket.reply
+    {
+        return false;
+    }
+    pending.ready = true;
+    pending.maintenance_ticket = None;
+    (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index] = Some(pending);
+    true
+}
+
 pub(super) unsafe fn drain_shared_returns() -> u64 {
     let mut completed = 0;
     for index in 0..COMPONENT_EXECUTION_LANE_CAPACITY {
         let Some(mut pending) = (&*core::ptr::addr_of!(PENDING_SHARED_RETURNS))[index] else { continue };
+        if !pending.ready {
+            let Some(ticket) = pending.maintenance_ticket else { continue; };
+            // Pure terminal retirement may already have succeeded when a physical owner
+            // retirement refused. Keep this reservation fenced until the exact row retires.
+            if root_maintenance_owner::retire(ticket).is_none() { continue; }
+            pending.ready = true;
+            pending.maintenance_ticket = None;
+            (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index] = Some(pending);
+        }
         if pending.entered {
             continue;
         }
@@ -625,27 +702,72 @@ pub(super) unsafe fn drain(
                 } else {
                     retire_reply(continuation)
                 };
+                let maintenance_ticket = match continuation.pending {
+                    PendingComponentDispatch::RootMaintenance(pending) =>
+                        root_maintenance_owner::ticket_for(pending),
+                    _ => None,
+                };
+                if matches!(continuation.pending, PendingComponentDispatch::RootMaintenance(_))
+                    && (!matches!(shared, Some((_, _, SharedReturn::Complete | SharedReturn::Repark(_))))
+                        || !maintenance_ticket.is_some_and(|ticket| root_maintenance_owner::can_retire(ticket)))
+                {
+                    report_retained_failure(identity.lane(), b"maintenance-owner-missing",
+                        None, Some(phase), callback_owned);
+                    cursor = Some(order);
+                    continue;
+                }
+                if let (Some(ticket), Some((route, dispatch, action))) = (maintenance_ticket, shared) {
+                    if !reserve_root_maintenance_shared_return(
+                        identity, route, dispatch, reply_object, action, ticket,
+                    ) {
+                        cursor = Some(order);
+                        continue;
+                    }
+                }
                 let completed = if let Some((route, dispatch, action)) = shared {
+                    if let Some(ticket) = maintenance_ticket {
+                        match (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                            .finish_shared_root_maintenance_terminal(
+                                route, dispatch, identity, reply_object, local,
+                            ) {
+                            Ok(Some(_retired)) => {
+                                let owner_retired = root_maintenance_owner::retire(ticket).is_some();
+                                if owner_retired {
+                                    let _ = publish_root_maintenance_shared_return(identity, ticket);
+                                }
+                                (&mut *core::ptr::addr_of_mut!(SHARED_RETIRED_REPLIES))
+                                    [identity.lane().index as usize] = None;
+                                true
+                            }
+                            Ok(None) | Err(_) => {
+                                (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))
+                                    [identity.lane().index as usize] = None;
+                                false
+                            }
+                        }
+                    } else {
                     match (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                         .finish_shared_terminal(route, dispatch, identity, reply_object, local)
                     {
-                        Ok(Some(retired)) => {
+                        Ok(Some(_retired)) => {
                             let index = identity.lane().index as usize;
                             (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index] =
                                 Some(PendingSharedReturn {
-                                    route, dispatch, reply: reply_object, action, entered: false,
+                                    route, dispatch, reply: reply_object, action,
+                                    entered: false, ready: true, maintenance_ticket: None,
                                 });
                             (&mut *core::ptr::addr_of_mut!(SHARED_RETIRED_REPLIES))[index] = None;
-                            Some(retired)
+                            true
                         }
-                        Ok(None) | Err(_) => None,
+                        Ok(None) | Err(_) => false,
+                    }
                     }
                 } else {
                     (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                         .finish_terminal(identity, reply_object, local)
-                        .expect("acknowledged terminal retirement lost its owner")
+                        .expect("acknowledged terminal retirement lost its owner").is_some()
                 };
-                if completed.is_none() {
+                if !completed {
                     report_retained_failure(
                         identity.lane(),
                         if local.is_err() { b"reply-retirement" } else { b"semantic-retirement-refused" },
