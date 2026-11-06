@@ -122,8 +122,9 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
                 continue;
             }
         }
-        let arrival = runtime::receive(IngressExecutionOwner::Idle, ROOT_THREAD_CAP, true)
-            .unwrap_or_else(|error| {
+        let arrival = match runtime::receive(IngressExecutionOwner::Idle, ROOT_THREAD_CAP, true) {
+            Ok(arrival) => arrival,
+            Err(error) => {
                 print_str(b"[ingress-receive-error] root kind=");
                 let kind: &[u8] = match error {
                     runtime::Error::Receive => b"receive\n",
@@ -149,8 +150,12 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
                     };
                     print_str(source_kind);
                 }
-                panic!("unified executive ingress retained after receive failure")
-            });
+                // Receive/classification failed before a new Call was admitted to a handler.
+                // The receiver still owns any incomplete physical arrival; the outer loop
+                // must stop rather than replace it or make an uncertain effect again.
+                return ReceiveOutcome::RetainedFailure;
+            }
+        };
         match arrival {
             runtime::Arrival::Notification(message) => {
                 return ReceiveOutcome::Message(materialize(message))
@@ -170,9 +175,10 @@ pub(crate) unsafe fn reply_receive(
 ) -> ReceiveOutcome {
     // One-way acknowledged reply separates outgoing ownership from receive admission. The
     // unified receiver retains arrivals between these operations, including hosted reentry.
-    assert!(
-        client_reply_on(reply_cptr, info, r0, r1, r2, r3),
-        "uncertain hosted reply cannot be replayed or replaced"
-    );
+    if !client_reply_on(reply_cptr, info, r0, r1, r2, r3) {
+        // A refused or indeterminate send still owns this exact Reply. The outer service
+        // boundary can exit without admitting another Call or replaying the old send.
+        return ReceiveOutcome::RetainedFailure;
+    }
     receive(REPLY_MAIN_SLOT.load(Ordering::Relaxed))
 }
