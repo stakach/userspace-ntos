@@ -43,6 +43,14 @@ pub struct TimeSnapshot {
     pub clock_generation: u64,
 }
 
+impl TimeSnapshot {
+    /// NT performance counter units come from the same monotonic clock as relative waits.
+    /// Changing system time cannot change this counter or its reported frequency.
+    pub const fn performance_counter(self) -> (u64, u64) {
+        (self.monotonic_100ns, TICKS_PER_SECOND)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClockError {
     InvalidSystemTime,
@@ -450,6 +458,18 @@ mod tests {
 
         clock.set_system_time(600, 10).unwrap();
         assert!(deadline.is_due(clock.snapshot(600)));
+    }
+
+    #[test]
+    fn performance_counter_elapsed_seconds_match_its_frequency_across_clock_changes() {
+        let mut clock = AdjustableClock::try_new(1_000_000, 500_000_000).unwrap();
+        let (first, frequency) = clock.snapshot(1_000_000).performance_counter();
+        clock.set_system_time(1_100_000, 900_000_000).unwrap();
+        let (second, later_frequency) = clock.snapshot(1_250_000).performance_counter();
+
+        assert_eq!(frequency, TICKS_PER_SECOND);
+        assert_eq!(later_frequency, frequency);
+        assert_eq!(second - first, frequency / 40); // 25 ms of monotonic time.
     }
 
     #[test]

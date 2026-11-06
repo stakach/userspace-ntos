@@ -39027,8 +39027,7 @@ impl ExecNtHandler {
             NativeService::NtQueryPerformanceCounter => {
                 let ctr_ptr = args[0];
                 let freq_ptr = args[1];
-                let now = unsafe { core::arch::x86_64::_rdtsc() };
-                let freq = 1_000_000_000u64; // 1 GHz — plausible TSC frequency
+                let (now, freq) = nt_time_snapshot().performance_counter();
                 self.queue_write(ctr_ptr, now);
                 if freq_ptr != 0 {
                     self.queue_write(freq_ptr, freq);
