@@ -31504,6 +31504,15 @@ impl ExecNtHandler {
         }
     }
 
+    /// Read the current named-event state for startup diagnostics. The ever-set
+    /// trace counter is not an authority for an event that may later be reset.
+    pub(crate) fn lsa_rpc_server_active_state(&self) -> Option<bool> {
+        let index = self.obj_resolve(b"\\BaseNamedObjects\\lsa_rpc_server_active", 0)?;
+        let entry = self.obj_ns.get(index)?;
+        if !entry.is_live() || entry.kind != OBJ_KIND_EVENT { return None; }
+        self.events.query_existing(index as u64).map(|(_, signaled)| signaled)
+    }
+
     pub(crate) fn lpc_port_handle_for_name16(&self, name16: &[u16]) -> Option<u64> {
         let mut nbuf = [0u8; OBJ_NAME_CAP];
         let nlen = Self::fold_name(name16, &mut nbuf);

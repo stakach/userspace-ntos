@@ -2,7 +2,7 @@
 //! thread, at a bounded cadence. Observing it never grants execution rights.
 
 use crate::process_identity::{ProcessGeneration, ProcessIdentity};
-use crate::startup_thread_sample::StartupThreadSampleGate;
+use crate::startup_thread_sample::{StartupThreadSampleGate, StartupThreadSampleRoster};
 use crate::thread_binding::ThreadBinding;
 use nt_process::ProcessManager;
 
@@ -73,4 +73,24 @@ fn startup_tcb_sample_obeys_interval_and_finite_cap() {
     assert!(StartupThreadSampleGate::new(
         ThreadBinding { tcb: 1, ..binding }, lifetime, 100_000_000, 2
     ).is_none());
+}
+
+#[test]
+fn startup_roles_keep_independent_generation_exact_budgets() {
+    let (_, binding, lifetime) = captured();
+    let mut roster = StartupThreadSampleRoster::<(), 3>::new(100, 2).unwrap();
+    assert_eq!(roster.claim(0, Some(binding), Some(lifetime), 1000), Some(1));
+    assert_eq!(roster.claim(1, Some(binding), Some(lifetime), 1000), Some(1));
+    assert_eq!(roster.claim(0, Some(binding), Some(lifetime), 1050), None);
+    let recycled = ThreadBinding {
+        process: ProcessIdentity {
+            generation: ProcessGeneration::Hosted(8), ..binding.process
+        },
+        ..binding
+    };
+    assert_eq!(roster.claim(0, Some(recycled), Some(lifetime), 1100), Some(2));
+    assert_eq!(roster.claim(0, Some(recycled), Some(lifetime), 1200), None);
+    assert_eq!(roster.claim(1, Some(binding), Some(lifetime), 1100), Some(2));
+    assert_eq!(roster.claim(2, Some(binding), Some(lifetime), 1100), Some(1));
+    assert_eq!(roster.claim(3, Some(binding), Some(lifetime), 1100), None);
 }

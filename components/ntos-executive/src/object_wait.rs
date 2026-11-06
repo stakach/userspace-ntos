@@ -222,11 +222,32 @@ pub(super) fn object_waiter_oldest_unselected_for_process(
     process: nt_user_host::process_identity::ProcessIdentity,
     now_100ns: u64,
 ) -> Option<(u64, u64, u64)> {
+    object_waiter_oldest_unselected_for_owner(pi, process, None, now_100ns)
+}
+
+/// The same copied observation restricted to a published main thread. A worker
+/// wait cannot be reported as the main thread's startup dependency.
+pub(super) fn object_waiter_oldest_unselected_for_thread(
+    pi: usize,
+    process: nt_user_host::process_identity::ProcessIdentity,
+    tid: u64,
+    now_100ns: u64,
+) -> Option<(u64, u64, u64)> {
+    object_waiter_oldest_unselected_for_owner(pi, process, Some(tid), now_100ns)
+}
+
+fn object_waiter_oldest_unselected_for_owner(
+    pi: usize,
+    process: nt_user_host::process_identity::ProcessIdentity,
+    tid: Option<u64>,
+    now_100ns: u64,
+) -> Option<(u64, u64, u64)> {
     unsafe {
         let table = &*core::ptr::addr_of!(OBJECT_WAITERS);
         table.iter()
             .filter(|(identity, record)| record.pi == pi
                 && record.caller.process() == process
+                && tid.is_none_or(|tid| record.tid == tid)
                 && !table.is_claimed(*identity))
             .filter_map(|(_, record)| record.latency.parked_age_100ns(now_100ns)
                 .map(|age| (record.sequence, record.objects[0].raw(), age)))

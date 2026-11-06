@@ -23,6 +23,7 @@ mod ingress_observation;
 mod hpet_read_observation;
 mod calibrated_tsc_clock;
 mod csrss_thread_probe;
+mod startup_readiness_probe;
 mod desktop_completion_marker;
 pub use serial_records::{debug_put_char, print_str, print_u64};
 
@@ -7385,6 +7386,7 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
 /// Dump the census if the period has elapsed, using the shared static clock.
 pub(crate) fn census_tick_static(now: u64) {
     csrss_thread_probe::maybe_sample(now);
+    startup_readiness_probe::maybe_sample(now);
     let last = CENSUS_LAST_DUMP.load(Ordering::Relaxed);
     if now.wrapping_sub(last) < CENSUS_PERIOD_100NS {
         return;
