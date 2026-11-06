@@ -60,11 +60,19 @@ static ACTIVE_IRP_SNAPSHOTS: [ActiveIrpSnapshot; ACTIVE_IRP_SNAPSHOT_SLOTS] =
 // arriving. Copy the exact entered owner and count only non-timer arrivals. The periodic reader
 // never follows a route, touches the shared mapping, or changes receive ownership.
 const ACTIVE_SYSCALL_SNAPSHOT_SLOTS: usize = 8;
+// Phase values in the serial census: 1 pump work, 2 physical wait, 3 hosted arrival,
+// 4 Call arrival, 5 notification. Only phases 3 and 4 advance provider progress.
+const SYSCALL_PHASE_PUMP_WORK: u64 = 1;
+const SYSCALL_PHASE_PHYSICAL_WAIT: u64 = 2;
+const SYSCALL_PHASE_HOSTED: u64 = 3;
+const SYSCALL_PHASE_CALL: u64 = 4;
+const SYSCALL_PHASE_NOTIFICATION: u64 = 5;
 static NEXT_SYSCALL_SNAPSHOT: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_SYSCALL_SNAPSHOT_OVERFLOW: AtomicU64 = AtomicU64::new(0);
 
 struct ActiveSyscallSnapshot {
     sequence: AtomicU64,
+    observation_epoch: AtomicU64,
     started_100ns: AtomicU64,
     domain: AtomicU64,
     cookie: AtomicU64,
@@ -80,12 +88,17 @@ struct ActiveSyscallSnapshot {
     client_generation: AtomicU64,
     provider_arrivals: AtomicU64,
     last_provider_at_100ns: AtomicU64,
+    phase: AtomicU64,
+    last_transition_at_100ns: AtomicU64,
+    reply_binding: AtomicU64,
+    last_binding_at_100ns: AtomicU64,
 }
 
 impl ActiveSyscallSnapshot {
     const fn new() -> Self {
         Self {
             sequence: AtomicU64::new(0),
+            observation_epoch: AtomicU64::new(0),
             started_100ns: AtomicU64::new(0),
             domain: AtomicU64::new(0),
             cookie: AtomicU64::new(0),
@@ -101,8 +114,17 @@ impl ActiveSyscallSnapshot {
             client_generation: AtomicU64::new(0),
             provider_arrivals: AtomicU64::new(0),
             last_provider_at_100ns: AtomicU64::new(0),
+            phase: AtomicU64::new(0),
+            last_transition_at_100ns: AtomicU64::new(0),
+            reply_binding: AtomicU64::new(0),
+            last_binding_at_100ns: AtomicU64::new(0),
         }
     }
+
+    // Only the entered receive scope writes this slot. An odd epoch means a pair of diagnostic
+    // fields is being replaced; readers skip it rather than reporting a mixed observation.
+    fn begin_update(&self) { self.observation_epoch.fetch_add(1, Ordering::AcqRel); }
+    fn end_update(&self) { self.observation_epoch.fetch_add(1, Ordering::Release); }
 }
 
 static ACTIVE_SYSCALL_SNAPSHOTS: [ActiveSyscallSnapshot; ACTIVE_SYSCALL_SNAPSHOT_SLOTS] =
@@ -140,6 +162,11 @@ fn capture_active_syscall_snapshot(ch: &PumpChannel, route: PeerRoute) -> Option
     slot.client_generation.store(ch.client_generation, Ordering::Relaxed);
     slot.provider_arrivals.store(0, Ordering::Relaxed);
     slot.last_provider_at_100ns.store(0, Ordering::Relaxed);
+    slot.observation_epoch.store(0, Ordering::Relaxed);
+    slot.phase.store(SYSCALL_PHASE_PUMP_WORK, Ordering::Relaxed);
+    slot.last_transition_at_100ns.store(slot.started_100ns.load(Ordering::Relaxed), Ordering::Relaxed);
+    slot.reply_binding.store(0, Ordering::Relaxed);
+    slot.last_binding_at_100ns.store(0, Ordering::Relaxed);
     slot.sequence.store(sequence, Ordering::Release);
     Some((index, sequence))
 }
@@ -148,6 +175,8 @@ pub(super) fn print_active_syscall_receive_census() {
     for (index, slot) in ACTIVE_SYSCALL_SNAPSHOTS.iter().enumerate() {
         let sequence = slot.sequence.load(Ordering::Acquire);
         if sequence == 0 || sequence == SNAPSHOT_CLAIMED { continue; }
+        let epoch = slot.observation_epoch.load(Ordering::Acquire);
+        if epoch & 1 != 0 { continue; }
         let values = [
             slot.started_100ns.load(Ordering::Relaxed),
             slot.domain.load(Ordering::Relaxed), slot.cookie.load(Ordering::Relaxed),
@@ -162,9 +191,15 @@ pub(super) fn print_active_syscall_receive_census() {
             slot.client_generation.load(Ordering::Relaxed),
             slot.provider_arrivals.load(Ordering::Relaxed),
             slot.last_provider_at_100ns.load(Ordering::Relaxed),
+            slot.phase.load(Ordering::Relaxed),
+            slot.last_transition_at_100ns.load(Ordering::Relaxed),
+            slot.reply_binding.load(Ordering::Relaxed),
+            slot.last_binding_at_100ns.load(Ordering::Relaxed),
         ];
+        core::sync::atomic::fence(Ordering::Acquire);
+        if slot.observation_epoch.load(Ordering::Acquire) != epoch { continue; }
         if slot.sequence.load(Ordering::Acquire) != sequence { continue; }
-        crate::print_str(b"[pump-active-syscall] slot/sequence/start-100ns/domain/cookie/route/route-domain/route-gen/lane/lane-gen/tcb/reply/ssn/client-pi/client-gen/provider-arrivals/last-provider-100ns=");
+        crate::print_str(b"[pump-active-syscall] slot/sequence/start-100ns/domain/cookie/route/route-domain/route-gen/lane/lane-gen/tcb/reply/ssn/client-pi/client-gen/provider-arrivals/last-provider-100ns/phase/last-transition-100ns/pre-recv-reply-binding/pre-recv-binding-sampled-100ns=");
         crate::print_u64(index as u64);
         crate::print_str(b"/"); crate::print_u64(sequence);
         for value in values {
@@ -376,8 +411,56 @@ fn record_active_syscall_provider_arrival(scope: &ReceiveCensusScope) {
     let Some((index, sequence)) = scope.syscall_snapshot else { return; };
     let slot = &ACTIVE_SYSCALL_SNAPSHOTS[index];
     if slot.sequence.load(Ordering::Acquire) != sequence { return; }
+    slot.begin_update();
     slot.provider_arrivals.fetch_add(1, Ordering::Relaxed);
     slot.last_provider_at_100ns.store(crate::monotonic_time_100ns(), Ordering::Relaxed);
+    slot.end_update();
+}
+
+fn record_active_syscall_transition(scope: &ReceiveCensusScope, phase: u64) {
+    let Some((index, sequence)) = scope.syscall_snapshot else { return; };
+    let slot = &ACTIVE_SYSCALL_SNAPSHOTS[index];
+    if slot.sequence.load(Ordering::Acquire) != sequence { return; }
+    if slot.phase.load(Ordering::Relaxed) == phase { return; }
+    slot.begin_update();
+    slot.last_transition_at_100ns.store(crate::monotonic_time_100ns(), Ordering::Relaxed);
+    slot.phase.store(phase, Ordering::Release);
+    slot.end_update();
+}
+
+fn record_active_syscall_physical_owner(scope: &ReceiveCensusScope, route: PeerRoute, tcb: u64) {
+    let Some((index, sequence)) = scope.syscall_snapshot else { return; };
+    let slot = &ACTIVE_SYSCALL_SNAPSHOTS[index];
+    if slot.sequence.load(Ordering::Acquire) != sequence { return; }
+    let now = crate::monotonic_time_100ns();
+    let last = slot.last_binding_at_100ns.load(Ordering::Relaxed);
+    // This samples the binding before Recv; Recv can change it while blocked. The kernel query
+    // can be expensive, so refresh at most once per five seconds and print the sample's age.
+    if last != 0 && now.wrapping_sub(last) < 50_000_000 { return; }
+    let route_identity = route.identity();
+    let route_domain = slot.route_domain.load(Ordering::Relaxed);
+    let route_generation = slot.route_generation.load(Ordering::Relaxed);
+    let lane_index = slot.lane_index.load(Ordering::Relaxed);
+    let lane_generation = slot.lane_generation.load(Ordering::Relaxed);
+    let reply = slot.reply.load(Ordering::Relaxed);
+    let observation = if slot.route.load(Ordering::Relaxed) != route.badge()
+        || route_identity.domain != route_domain
+        || route_identity.domain_generation != route_generation
+        || route_identity.lane.index as u64 != lane_index
+        || route_identity.lane.generation != lane_generation
+        || route_identity.executor != tcb
+        || slot.tcb.load(Ordering::Relaxed) != tcb
+    {
+        runtime::ActiveReplyObservation::RouteMismatch
+    } else {
+        unsafe { runtime::observe_active_reply(
+            route, route_domain, route_generation, lane_index, lane_generation, tcb, reply,
+        ) }
+    };
+    slot.begin_update();
+    slot.reply_binding.store(observation as u64, Ordering::Relaxed);
+    slot.last_binding_at_100ns.store(crate::monotonic_time_100ns(), Ordering::Release);
+    slot.end_update();
 }
 
 impl Drop for ReceiveCensusScope {
@@ -571,6 +654,7 @@ pub(super) unsafe fn receive(
     let mut irq_checkpoint = inline_irq_checkpoint && inline_irq_work_pending();
     let mut timer_probe_consumed = false;
     loop {
+        record_active_syscall_transition(&census_scope, SYSCALL_PHASE_PUMP_WORK);
         trace_ps_create_receive(ch, b"loop", Some(route));
         if !retained_seh {
             let _stage = StageScope::enter(ch, Stage::YieldPreflight);
@@ -843,6 +927,8 @@ pub(super) unsafe fn receive(
         trace_ps_create_receive(ch, b"physical-receive", Some(route));
         let file_receive = crate::driver_launch::file_rpc_pump_for_diagnostic(ch);
         let receive_started = if file_receive { crate::disk_census_ticks() } else { 0 };
+        record_active_syscall_physical_owner(&census_scope, route, ch.tcb);
+        record_active_syscall_transition(&census_scope, SYSCALL_PHASE_PHYSICAL_WAIT);
         let arrival = runtime::receive(execution, ch.tcb,
             serviced_scheduler_yield || !timer_checkpoint);
         if file_receive {
@@ -861,11 +947,13 @@ pub(super) unsafe fn receive(
         }
         match arrival {
             Ok(runtime::Arrival::Hosted) => {
+                record_active_syscall_transition(&census_scope, SYSCALL_PHASE_HOSTED);
                 record_active_syscall_provider_arrival(&census_scope);
                 trace_ps_create_receive(ch, b"hosted-arrival", Some(route));
                 trace_ps_create_event(b"hosted-arrival", route, 0, 0);
             }
             Ok(runtime::Arrival::Call { route: sender, reply }) => {
+                record_active_syscall_transition(&census_scope, SYSCALL_PHASE_CALL);
                 record_active_syscall_provider_arrival(&census_scope);
                 trace_ps_create_receive(ch, b"call-arrival", Some(sender));
                 trace_ps_create_event(b"call-arrival", sender, reply, 0);
@@ -873,6 +961,7 @@ pub(super) unsafe fn receive(
                 // this invocation's stored arrival on the next pass.
             }
             Ok(runtime::Arrival::Notification(message)) => {
+                record_active_syscall_transition(&census_scope, SYSCALL_PHASE_NOTIFICATION);
                 trace_ps_create_receive(ch, b"notification", Some(route));
                 // The shared ingress has already proven NoCall with a free Reply. An empty
                 // nonblocking probe has no sender and must not count as watchdog progress.

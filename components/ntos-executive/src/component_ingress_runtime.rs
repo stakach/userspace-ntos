@@ -882,6 +882,67 @@ pub(crate) unsafe fn admission_readiness(route: PeerRoute) -> Result<AdmissionRe
     })
 }
 
+/// A diagnostic observation, never authority to reuse or complete a Reply. The caller samples
+/// this only at a serialized ingress boundary; each failure remains distinct from a binding.
+#[repr(u64)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ActiveReplyObservation {
+    RouteMismatch = 1,
+    LocalStateUnavailable = 2,
+    ReplyMismatch = 3,
+    QueryFailed = 4,
+    Free = 5,
+    Offered = 6,
+    BoundToTarget = 7,
+    BoundElsewhere = 8,
+    MissingReply = 9,
+}
+
+pub(crate) unsafe fn observe_active_reply(
+    route: PeerRoute,
+    route_domain: u64,
+    route_generation: u64,
+    lane_index: u64,
+    lane_generation: u64,
+    tcb: u64,
+    reply: u64,
+) -> ActiveReplyObservation {
+    let identity = route.identity();
+    if identity.domain != route_domain
+        || identity.domain_generation != route_generation
+        || identity.lane.index as u64 != lane_index
+        || identity.lane.generation != lane_generation
+        || identity.executor != tcb
+        || tcb == 0
+    {
+        return ActiveReplyObservation::RouteMismatch;
+    }
+    if reply == 0 {
+        return ActiveReplyObservation::MissingReply;
+    }
+    // Finish every ingress/lanes borrow before the kernel query. Readiness resolves the
+    // retained physical source and exact generation; neither a badge nor a copied Reply does.
+    match admission_readiness(route) {
+        Ok(_) => {}
+        Err(Error::PhysicalIdentity) => return ActiveReplyObservation::RouteMismatch,
+        Err(_) => return ActiveReplyObservation::LocalStateUnavailable,
+    }
+    match current_reply(route) {
+        Ok(current) if current == reply => {}
+        Ok(_) => return ActiveReplyObservation::ReplyMismatch,
+        Err(Error::PhysicalIdentity) => return ActiveReplyObservation::RouteMismatch,
+        Err(_) => return ActiveReplyObservation::LocalStateUnavailable,
+    }
+    let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+    match crate::spawn_hosts::query_component_reply_binding(tcb, reply) {
+        Ok(nt_component_suspension::ReplyBindingObservation::Free) => ActiveReplyObservation::Free,
+        Ok(nt_component_suspension::ReplyBindingObservation::Offered) => ActiveReplyObservation::Offered,
+        Ok(nt_component_suspension::ReplyBindingObservation::BoundToTarget) => ActiveReplyObservation::BoundToTarget,
+        Ok(nt_component_suspension::ReplyBindingObservation::BoundElsewhere) => ActiveReplyObservation::BoundElsewhere,
+        Err(_) => ActiveReplyObservation::QueryFailed,
+    }
+}
+
 /// Resolve a transport snapshot through its retained physical source, not its numeric badge.
 pub(crate) unsafe fn channel_route(
     channel: &crate::spawn_hosts::PumpChannel,
