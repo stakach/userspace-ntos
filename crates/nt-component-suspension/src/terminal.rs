@@ -108,6 +108,15 @@ pub struct RetiredTerminal<C, R, T> {
     pub payload: T,
 }
 
+/// A maintenance checkpoint has no provider completion value. Its native result and original
+/// continuation are released only after the ordinary terminal stages acknowledge the Reply.
+pub struct RetiredRootMaintenance<C, T> {
+    pub key: SuspensionKey,
+    pub owner: SuspensionOwner,
+    pub continuation: C,
+    pub payload: T,
+}
+
 pub(super) struct TerminalRecord<T> {
     identity: TerminalIdentity,
     payload: T,
@@ -139,7 +148,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         owner: SuspensionOwner,
         payload: T,
     ) -> Result<TerminalIdentity, (LaneError, T)> {
-        self.retain_running(handle, reply_object, key, owner, None, TerminalStage::Output, payload)
+        self.retain_running(handle, reply_object, key, owner, None, TerminalStage::Output, false, payload)
     }
 
     /// Retain a returned result whose sole mechanism is delivery to a local recipient.
@@ -152,7 +161,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         owner: SuspensionOwner,
         payload: T,
     ) -> Result<TerminalIdentity, (LaneError, T)> {
-        self.retain_running(handle, reply_object, key, owner, None, TerminalStage::LocalDelivery, payload)
+        self.retain_running(handle, reply_object, key, owner, None, TerminalStage::LocalDelivery, false, payload)
     }
 
     /// Retain a callback transfer without releasing its original native reply or suspension.
@@ -169,7 +178,27 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         if token == 0 {
             return Err((LaneError::InvalidIdentity, payload));
         }
-        self.retain_running(handle, reply_object, key, owner, Some(token), TerminalStage::Output, payload)
+        self.retain_running(handle, reply_object, key, owner, Some(token), TerminalStage::Output, false, payload)
+    }
+
+    /// Retain a normally returned root-maintenance continuation under the original dispatch.
+    /// The checkpoint does not manufacture a provider completion or release the native Reply.
+    pub fn retain_root_maintenance_terminal_running(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        dispatch: LaneDispatchIdentity,
+        key: SuspensionKey,
+        owner: SuspensionOwner,
+        payload: T,
+    ) -> Result<TerminalIdentity, (LaneError, T)> {
+        if key.kind != SuspensionKind::RootMaintenance
+            || dispatch.lane() != handle
+            || !self.is_dispatch_identity_active(dispatch)
+        {
+            return Err((LaneError::InvalidIdentity, payload));
+        }
+        self.retain_running(handle, reply_object, key, owner, None, TerminalStage::Output, true, payload)
     }
 
     fn retain_running(
@@ -180,9 +209,10 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         owner: SuspensionOwner,
         external_token: Option<u64>,
         first_stage: TerminalStage,
+        root_maintenance: bool,
         payload: T,
     ) -> Result<TerminalIdentity, (LaneError, T)> {
-        let identity = match self.validate_terminal_retention(handle, reply_object, key, owner, external_token) {
+        let identity = match self.validate_terminal_retention(handle, reply_object, key, owner, external_token, root_maintenance) {
             Ok(identity) => identity,
             Err(error) => return Err((error, payload)),
         };
@@ -208,6 +238,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         key: SuspensionKey,
         owner: SuspensionOwner,
         external_token: Option<u64>,
+        root_maintenance: bool,
     ) -> Result<TerminalIdentity, LaneError> {
         self.validate_running(handle, reply_object)?;
         let max_depth = self.max_depth_per_lane;
@@ -225,7 +256,15 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         if lane.terminal.is_some()
             || lane.resume_epoch == 0
             || frame.receive.is_some_and(|admission| !admission.restored)
-            || !matches!(frame.phase, SuspensionPhase::Resuming { .. })
+            || if root_maintenance {
+                key.kind != SuspensionKind::RootMaintenance
+                    || !matches!(frame.phase, SuspensionPhase::MaintenanceResuming { .. })
+                    || lane.suspensions.len() != 1
+                    || !lane.external_tokens.is_empty()
+                    || lane.shared_peer.is_some()
+            } else {
+                !matches!(frame.phase, SuspensionPhase::Resuming { .. })
+            }
         {
             return Err(LaneError::InvalidPhase);
         }
@@ -433,7 +472,8 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             || lane.dispatch != Some(identity.dispatch)
             || frame.key != identity.key
             || frame.owner != identity.owner
-            || !matches!(frame.phase, SuspensionPhase::Resuming { .. })
+            || !matches!(frame.phase, SuspensionPhase::Resuming { .. }
+                | SuspensionPhase::MaintenanceResuming { .. })
         {
             return Err(LaneError::InvalidPhase);
         }
@@ -456,6 +496,43 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             return Err(LaneError::InvalidPhase);
         }
         Ok(())
+    }
+
+    /// Retire a maintenance checkpoint only after every terminal mechanism has acknowledged.
+    /// A failed local retirement keeps the exact Reply, dispatch, continuation, and payload.
+    pub fn finish_root_maintenance_terminal(
+        &mut self,
+        identity: TerminalIdentity,
+        reply_object: u64,
+        local_retirement: Result<(), u32>,
+    ) -> Result<Option<RetiredRootMaintenance<C, T>>, LaneError> {
+        let record = self.terminal_record(identity, reply_object)?;
+        if identity.key.kind != SuspensionKind::RootMaintenance
+            || !matches!(record.phase, TerminalPhase::Acknowledged { .. })
+            || !self.lane(identity.lane())?.suspensions.top()
+                .is_some_and(|frame| matches!(frame.phase, SuspensionPhase::MaintenanceResuming { .. }))
+        {
+            return Err(LaneError::InvalidPhase);
+        }
+        let lane = self.lane_mut(identity.lane())?;
+        if let Err(status) = local_retirement {
+            lane.terminal.as_mut().unwrap().phase = TerminalPhase::Acknowledged {
+                local_error: Some(status),
+            };
+            return Ok(None);
+        }
+        let continuation = lane.suspensions
+            .retire_root_maintenance(identity.key, identity.owner)
+            .map_err(LaneError::Suspension)?;
+        let record = lane.terminal.take().unwrap();
+        lane.phase = LanePhase::Idle;
+        lane.dispatch = None;
+        Ok(Some(RetiredRootMaintenance {
+            key: identity.key,
+            owner: identity.owner,
+            continuation,
+            payload: record.payload,
+        }))
     }
 }
 
