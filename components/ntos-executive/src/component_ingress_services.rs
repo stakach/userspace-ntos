@@ -615,11 +615,9 @@ unsafe fn wake_service_inner(
 /// Complete one acknowledged autonomous semantic service by its retained route and token.
 /// A busy lane remains owned and is retried by the normal timer source.
 pub(crate) unsafe fn resume_acknowledged_retained_services() -> Result<bool, Error> {
-    if retained_service_resume_next_deadline().is_none() {
-        return Ok(false);
-    }
     let now = crate::monotonic_time_100ns();
-    let route = (&*core::ptr::addr_of!(WAITS)).iter()
+    let route = (&*core::ptr::addr_of!(WAITS))
+        .iter()
         .find(|wait| {
             wait.kind == WaitKind::RetainedSemantic
                 && wait.autonomous

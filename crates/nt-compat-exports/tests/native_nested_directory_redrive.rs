@@ -58,8 +58,8 @@ fn deferred_directory_publication_is_admitted_to_the_nested_redrive() {
     assert!(gate.iter().any(|call| call.ends_with("provider_directory_broker::nested_work_ready")),
         "a directory-only deferred PUBLISH must wake the nested runner");
     let readiness = calls_in(BROKER, "nested_work_ready");
-    assert!(readiness.iter().any(|call| call.ends_with("wake_due") || call.ends_with("next_deadline")),
-        "nested directory readiness must use the retry deadline");
+    assert!(readiness.iter().any(|call| call.ends_with("wake_due")),
+        "nested directory readiness must respect retry cadence");
     assert!(!readiness.iter().any(|call| call.ends_with("has_outstanding")),
         "uncertain or quarantined directory work must not hot-spin the pump");
 }
