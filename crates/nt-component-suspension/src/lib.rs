@@ -49,9 +49,15 @@ mod ingress_receiver;
 pub use ingress_receiver::{NestedExecutionError, NestedExecutionIdentity, NestedExecutionScope};
 pub use ingress_receiver::{CancelledStoppedCall, StoppedRouteError};
 mod reply_pool;
+mod root_reply_replacement;
 mod ingress_resources;
 pub use ingress_resources::{IngressResources, IngressResourceKind, IngressResourcePhase, IngressResourceRecord, IngressResourceError};
 pub use reply_pool::{IngressReplyPool, ReplyAdmissionError, ReplyPoolError};
+pub use root_reply_replacement::{
+    RootReplyIdentity, RootReplyReplacementError, RootReplyReplacementLease,
+    RootReplyRetypeOutcome,
+    RootReplySlotState, RootReplySlotTable,
+};
 pub use ingress_receiver::{BootstrapAdoptionError, CanonicalCompletionError, IngressReceiver, InterimAdoptionError, StartupFaultError, StartupReadyError, StoredCompletionError, StoredReplyError};
 pub use reserved_receive::{ReservedIngressReceive, ReservedReceiveError, ReservedReceivePhase};
 mod startup;
@@ -85,6 +91,8 @@ pub use nested_restore_result::{
     NestedRestoreResult, NestedRestoreResultError, NestedRestoreResultKey,
     NestedRestoreResultPhase,
 };
+mod nested_restore_chain;
+pub use nested_restore_chain::NestedRestoreChain;
 pub use resume_pass::ResumePass;
 mod resume_wake;
 pub use resume_wake::{ResumeDemand, ResumeWake, ResumeWakeError, ResumeWakePass};

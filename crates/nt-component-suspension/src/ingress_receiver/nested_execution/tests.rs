@@ -23,6 +23,7 @@ fn nested_identity_sequence_matches_only_its_active_lane_epoch() {
 
 mod nested_restore_frame;
 mod nested_restore_result;
+mod nested_restore_chain;
 mod nested_callback_terminal;
 
 fn child_settlement() -> crate::ExternalSettlement {
