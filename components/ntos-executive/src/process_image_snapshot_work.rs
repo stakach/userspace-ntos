@@ -73,7 +73,7 @@ impl Work {
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static TRANSFERRED: AtomicBool = AtomicBool::new(false);
-static NEXT: AtomicU64 = AtomicU64::new(0);
+static WAKE: nt_time::CoalescedRetryWake = nt_time::CoalescedRetryWake::new();
 static CURSOR: AtomicU64 = AtomicU64::new(0);
 static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 static EXECUTING_TID: AtomicU64 = AtomicU64::new(0);
@@ -211,7 +211,7 @@ pub(crate) unsafe fn submit_routed_process_image(
         status: 0, published_handle: None, cancel_requested: false, cancelled: false };
     match index { Some(index) => rows[index] = Some(work), None => rows.push(Some(work)) }
     park.commit();
-    NEXT.store(monotonic_time_100ns(), Ordering::Release);
+    WAKE.publish(monotonic_time_100ns());
     assert!(!TRANSFERRED.swap(true, Ordering::AcqRel));
     Ok(true)
 }
@@ -234,10 +234,14 @@ pub(crate) fn has_process(pi: usize, preserve_tid: Option<u64>) -> bool {
     }
 }
 
-pub(crate) fn next_deadline() -> Option<u64> {
-    (EXECUTING_TID.load(Ordering::Acquire) != 0 || unsafe {
+fn has_work() -> bool {
+    EXECUTING_TID.load(Ordering::Acquire) != 0 || unsafe {
         (&*core::ptr::addr_of!(WORK)).iter().any(Option::is_some)
-    }).then(|| NEXT.load(Ordering::Acquire))
+    }
+}
+
+pub(crate) fn next_deadline() -> Option<u64> {
+    WAKE.next_deadline(has_work())
 }
 
 /// Periodic read-only census at the serialized service-loop boundary.
@@ -248,7 +252,7 @@ pub(crate) fn census_snapshot() -> (Option<u64>, bool, u64, usize) {
 }
 
 pub(crate) fn wake_due(now: u64) -> u64 {
-    u64::from(next_deadline().is_some_and(|deadline| now >= deadline))
+    u64::from(WAKE.wake_due(now, has_work()))
 }
 
 enum Step { Progress, Wait, Done }
@@ -263,8 +267,10 @@ pub(crate) unsafe fn redrive(
     catalog: &nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
     loaded_images: *mut HostedLoadedImageTable,
 ) {
-    if next_deadline().is_none_or(|deadline| monotonic_time_100ns() < deadline)
-        || ACTIVE.swap(true, Ordering::AcqRel) { return; }
+    let Some(wake_attempt) = WAKE.begin_redrive(monotonic_time_100ns(), has_work()) else {
+        return;
+    };
+    if ACTIVE.swap(true, Ordering::AcqRel) { return; }
     let _durable = allocator::enter_durable();
     let selected = {
         let rows = &mut *core::ptr::addr_of_mut!(WORK);
@@ -303,7 +309,7 @@ pub(crate) unsafe fn redrive(
         EXECUTING_PI.store(u64::MAX, Ordering::Release);
         EXECUTING_INDEX.store(u64::MAX, Ordering::Release);
     }
-    NEXT.store(monotonic_time_100ns().saturating_add(RETRY_DELAY), Ordering::Release);
+    wake_attempt.retry_at(monotonic_time_100ns().saturating_add(RETRY_DELAY));
     ACTIVE.store(false, Ordering::Release);
 }
 
