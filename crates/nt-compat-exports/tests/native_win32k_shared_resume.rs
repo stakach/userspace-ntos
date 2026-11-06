@@ -79,7 +79,13 @@ fn receive_yield_retains_shared_publication_before_nested_settlement() {
         fn visit_expr_struct(&mut self, expr: &'ast syn::ExprStruct) {
             if expr.path.segments.last().is_some_and(|segment| segment.ident == "PendingReceiveDispatch") {
                 self.found += 1;
-                let shared = expr.fields.iter()
+                let snapshot = expr.fields.iter()
+                    .find(|field| matches!(&field.member, syn::Member::Named(name) if name == "snapshot"))
+                    .expect("pending Receive owns one pump snapshot");
+                let Expr::Struct(snapshot) = &snapshot.expr else {
+                    panic!("pending receive site {} must retain one pump snapshot", self.found);
+                };
+                let shared = snapshot.fields.iter()
                     .find(|field| matches!(&field.member, syn::Member::Named(name) if name == "shared_resume"))
                     .unwrap_or_else(|| panic!("pending receive site {} lost its shared publication", self.found));
                 let Expr::Field(from_yield) = &shared.expr else {
@@ -154,13 +160,19 @@ fn receive_and_service_wait_restore_their_own_shared_publication_before_receivin
         "../../../components/ntos-executive/src/win32k_pending_dispatch.rs"
     ))
     .unwrap();
+    let snapshot_fields = pending.items.iter().find_map(|item| match item {
+        Item::Struct(record) if record.ident == "SuspendedPumpSnapshot" => Some(&record.fields),
+        _ => None,
+    }).expect("shared pending pump snapshot");
+    assert!(has_field(snapshot_fields, "shared_resume"),
+        "the shared pump snapshot must retain its own callback publication");
     for name in ["PendingReceiveDispatch", "PendingServiceWaitDispatch"] {
         let fields = pending.items.iter().find_map(|item| match item {
             Item::Struct(record) if record.ident == name => Some(&record.fields),
             _ => None,
         }).unwrap_or_else(|| panic!("missing {name}"));
-        assert!(fields.iter().any(|field| field.ident.as_ref().is_some_and(|id| id == "shared_resume")),
-            "{name} must retain the callback header and selected context across a yield");
+        assert!(has_field(fields, "snapshot"),
+            "{name} must retain the common pump snapshot across a yield");
     }
 
     let bridge = syn::parse_file(include_str!(

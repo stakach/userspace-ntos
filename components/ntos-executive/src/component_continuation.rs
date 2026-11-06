@@ -15,8 +15,8 @@ impl PendingComponentDispatch {
         match self {
             Self::Provider(pending) => pending.client,
             Self::Lpc(pending) => pending.client,
-            Self::Receive(pending) => pending.client,
-            Self::ServiceWait(pending) => pending.client,
+            Self::Receive(pending) => pending.snapshot.client,
+            Self::ServiceWait(pending) => pending.snapshot.client,
         }
     }
 }

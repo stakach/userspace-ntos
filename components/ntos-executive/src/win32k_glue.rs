@@ -25,7 +25,7 @@ pub(crate) use pending_dispatch::{
 use pending_dispatch::{
     capture_initial_arg_snapshot, capture_lpc_wait_repark, capture_provider_wait_repark,
     capture_shared_resume_snapshot, restore_shared_resume_snapshot,
-    SharedResumeSnapshot,
+    SharedResumeSnapshot, SuspendedPumpSnapshot,
     LPC_WAIT_LAST_PUMP_SUSPENDED, LPC_WAIT_PENDING_DISPATCH, PROVIDER_WAIT_LAST_PUMP_SUSPENDED,
     PROVIDER_WAIT_PENDING_DISPATCH,
     RECEIVE_PENDING_DISPATCH,
@@ -4345,18 +4345,23 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
 
     if let Some(yielded) = pump.receive_yield {
         return ProviderWaitPumpCompletion::ReceiveReparked(PendingReceiveDispatch {
-            yielded, pump, channel, dispatch: pending.dispatch, client: pending.client,
-            shared_resume: yielded.shared_resume,
-            callback_token: None,
-            arg_snapshot_len: pending.arg_snapshot_len, arg_snapshot: pending.arg_snapshot,
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, channel, dispatch: pending.dispatch, client: pending.client,
+                shared_resume: yielded.shared_resume, callback_token: None,
+                arg_snapshot_len: pending.arg_snapshot_len, arg_snapshot: pending.arg_snapshot,
+            },
         });
     }
     if let Some(yielded) = pump.service_wait_yield {
         return ProviderWaitPumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
-            yielded, pump, channel, dispatch: pending.dispatch, client: pending.client,
-            shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
-            callback_token: None,
-            arg_snapshot_len: pending.arg_snapshot_len, arg_snapshot: pending.arg_snapshot,
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, channel, dispatch: pending.dispatch, client: pending.client,
+                shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
+                callback_token: None,
+                arg_snapshot_len: pending.arg_snapshot_len, arg_snapshot: pending.arg_snapshot,
+            },
         });
     }
     if pump.provider_wait_suspended {
@@ -4577,18 +4582,23 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
 
     if let Some(yielded) = pump.receive_yield {
         return LpcWaitPumpCompletion::ReceiveReparked(PendingReceiveDispatch {
-            yielded, pump, channel, dispatch: pending.dispatch, client: pending.client,
-            shared_resume: yielded.shared_resume,
-            callback_token: None,
-            arg_snapshot_len: pending.arg_snapshot_len, arg_snapshot: pending.arg_snapshot,
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, channel, dispatch: pending.dispatch, client: pending.client,
+                shared_resume: yielded.shared_resume, callback_token: None,
+                arg_snapshot_len: pending.arg_snapshot_len, arg_snapshot: pending.arg_snapshot,
+            },
         });
     }
     if let Some(yielded) = pump.service_wait_yield {
         return LpcWaitPumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
-            yielded, pump, channel, dispatch: pending.dispatch, client: pending.client,
-            shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
-            callback_token: None,
-            arg_snapshot_len: pending.arg_snapshot_len, arg_snapshot: pending.arg_snapshot,
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, channel, dispatch: pending.dispatch, client: pending.client,
+                shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
+                callback_token: None,
+                arg_snapshot_len: pending.arg_snapshot_len, arg_snapshot: pending.arg_snapshot,
+            },
         });
     }
     if pump.provider_wait_suspended {
@@ -5412,10 +5422,12 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         };
         let callback_token = completed_frame.external_token();
         let pending = PendingReceiveDispatch {
-            yielded, pump: component, channel, dispatch: dispatch_context,
-            client: completed_context, callback_token: Some(callback_token),
-            shared_resume: yielded.shared_resume,
-            arg_snapshot_len, arg_snapshot,
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump: component, channel, dispatch: dispatch_context,
+                client: completed_context, callback_token: Some(callback_token),
+                shared_resume: yielded.shared_resume, arg_snapshot_len, arg_snapshot,
+            },
         };
         let Some(callback_context) = stage_returned_user_callback_context(
             completed_frame, completed_context, request.api_index, component.result,
@@ -5440,10 +5452,13 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         };
         let callback_token = completed_frame.external_token();
         let pending = PendingServiceWaitDispatch {
-            yielded, pump: component, channel, dispatch: dispatch_context,
-            client: completed_context, callback_token: Some(callback_token),
-            shared_resume: capture_shared_resume_snapshot(dispatch_context, completed_context),
-            arg_snapshot_len, arg_snapshot,
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump: component, channel, dispatch: dispatch_context,
+                client: completed_context, callback_token: Some(callback_token),
+                shared_resume: capture_shared_resume_snapshot(dispatch_context, completed_context),
+                arg_snapshot_len, arg_snapshot,
+            },
         };
         let Some(callback_context) = stage_returned_user_callback_context(
             completed_frame, completed_context, request.api_index, component.result,
@@ -7085,11 +7100,14 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         assert!((*core::ptr::addr_of!(RECEIVE_PENDING_DISPATCH)).is_none());
         let (arg_snapshot_len, arg_snapshot) = capture_initial_arg_snapshot(ssn, completion_args);
         core::ptr::write(core::ptr::addr_of_mut!(RECEIVE_PENDING_DISPATCH), Some(PendingReceiveDispatch {
-            yielded, pump: pr, channel: ch,
-            dispatch: UserCallbackDispatchContext { lane, dispatch_id, ssn,
-                args: completion_args, caller_sp, output_stage, paint_output },
-            shared_resume: yielded.shared_resume,
-            client, callback_token: None, arg_snapshot_len, arg_snapshot,
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump: pr, channel: ch,
+                dispatch: UserCallbackDispatchContext { lane, dispatch_id, ssn,
+                    args: completion_args, caller_sp, output_stage, paint_output },
+                shared_resume: yielded.shared_resume,
+                client, callback_token: None, arg_snapshot_len, arg_snapshot,
+            },
         }));
     }
     if let Some(yielded) = pr.service_wait_yield {
@@ -7099,13 +7117,16 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         let (arg_snapshot_len, arg_snapshot) = capture_initial_arg_snapshot(ssn, completion_args);
         core::ptr::write(core::ptr::addr_of_mut!(SERVICE_WAIT_PENDING_DISPATCH),
             Some(PendingServiceWaitDispatch {
-                yielded, pump: pr, channel: ch,
-                dispatch: UserCallbackDispatchContext { lane, dispatch_id, ssn,
-                    args: completion_args, caller_sp, output_stage, paint_output },
-                shared_resume: capture_shared_resume_snapshot(
-                    UserCallbackDispatchContext { lane, dispatch_id, ssn,
-                        args: completion_args, caller_sp, output_stage, paint_output }, client),
-                client, callback_token: None, arg_snapshot_len, arg_snapshot,
+                yielded,
+                snapshot: SuspendedPumpSnapshot {
+                    pump: pr, channel: ch,
+                    dispatch: UserCallbackDispatchContext { lane, dispatch_id, ssn,
+                        args: completion_args, caller_sp, output_stage, paint_output },
+                    shared_resume: capture_shared_resume_snapshot(
+                        UserCallbackDispatchContext { lane, dispatch_id, ssn,
+                            args: completion_args, caller_sp, output_stage, paint_output }, client),
+                    client, callback_token: None, arg_snapshot_len, arg_snapshot,
+                },
             }));
     }
     if pr.callback_suspended {

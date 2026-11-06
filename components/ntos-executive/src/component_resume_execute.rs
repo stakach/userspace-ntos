@@ -229,7 +229,7 @@ pub(crate) unsafe fn run_receive(
                     || pending.yielded.child != permit.admission_key()
                     || pending.yielded.owner != frame.owner
                     || !continuation.return_target.can_resume()
-                    || !win32k_glue::win32k_client_context_is_admitted(pending.client)
+                    || !win32k_glue::win32k_client_context_is_admitted(pending.snapshot.client)
                 {
                     return Err(runtime::Error::Admission);
                 }

@@ -25,8 +25,7 @@ pub(crate) struct ServiceWaitYield {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct PendingServiceWaitDispatch {
-    pub yielded: ServiceWaitYield,
+pub(crate) struct SuspendedPumpSnapshot {
     pub pump: crate::spawn_hosts::PumpResult,
     pub channel: crate::spawn_hosts::PumpChannel,
     pub dispatch: nt_user_callback::DispatchContext,
@@ -38,6 +37,12 @@ pub(crate) struct PendingServiceWaitDispatch {
     pub arg_snapshot: [u8; COMPLETED_ARG_SNAPSHOT_BYTES],
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct PendingServiceWaitDispatch {
+    pub yielded: ServiceWaitYield,
+    pub snapshot: SuspendedPumpSnapshot,
+}
+
 pub(super) static mut SERVICE_WAIT_PENDING_DISPATCH: Option<PendingServiceWaitDispatch> = None;
 
 pub(crate) unsafe fn take_pending_service_wait_dispatch() -> Option<PendingServiceWaitDispatch> {
@@ -47,14 +52,7 @@ pub(crate) unsafe fn take_pending_service_wait_dispatch() -> Option<PendingServi
 #[derive(Clone, Copy)]
 pub(crate) struct PendingReceiveDispatch {
     pub yielded: ReceiveYield,
-    pub pump: crate::spawn_hosts::PumpResult,
-    pub channel: crate::spawn_hosts::PumpChannel,
-    pub dispatch: nt_user_callback::DispatchContext,
-    pub client: Win32kClientContext,
-    pub shared_resume: SharedResumeSnapshot,
-    pub callback_token: Option<u64>,
-    pub arg_snapshot_len: u32,
-    pub arg_snapshot: [u8; COMPLETED_ARG_SNAPSHOT_BYTES],
+    pub snapshot: SuspendedPumpSnapshot,
 }
 
 pub(super) static mut RECEIVE_PENDING_DISPATCH: Option<PendingReceiveDispatch> = None;

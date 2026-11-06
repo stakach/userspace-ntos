@@ -304,9 +304,19 @@ fn receive_continuation_is_distinct_from_provider_and_lpc_waits() {
     );
     let mut payload_types = Audit::default();
     payload_types.visit_item_struct(payload.unwrap());
+    assert!(
+        payload_types.types.iter().any(|name| name == "SuspendedPumpSnapshot"),
+        "receive continuation must own the suspended pump snapshot"
+    );
+    let snapshot = pending.items.iter().find_map(|item| match item {
+        Item::Struct(item) if item.ident == "SuspendedPumpSnapshot" => Some(item),
+        _ => None,
+    });
+    let mut snapshot_types = Audit::default();
+    snapshot_types.visit_item_struct(snapshot.expect("focused pump snapshot owner"));
     for required in ["PumpResult", "Win32kClientContext"] {
         assert!(
-            payload_types.types.iter().any(|name| name == required),
+            snapshot_types.types.iter().any(|name| name == required),
             "receive continuation must retain original pump/accounting and client: {required}"
         );
     }

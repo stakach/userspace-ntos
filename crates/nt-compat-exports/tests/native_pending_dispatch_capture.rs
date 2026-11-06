@@ -42,7 +42,15 @@ fn initial_wait_snapshot_capture_has_one_policy_and_reparks_keep_saved_bytes() {
                     let name = expression.path.segments.last().unwrap().ident.to_string();
                     if matches!(name.as_str(), "PendingProviderWaitDispatch" | "PendingLpcWaitDispatch" | "PendingReceiveDispatch" | "PendingServiceWaitDispatch") {
                         self.constructor = Some(name);
-                        for field in &expression.fields {
+                        let fields = expression.fields.iter().find_map(|field| {
+                            if matches!(&field.member, syn::Member::Named(name) if name == "snapshot") {
+                                if let syn::Expr::Struct(snapshot) = &field.expr {
+                                    return Some(&snapshot.fields);
+                                }
+                            }
+                            None
+                        }).unwrap_or(&expression.fields);
+                        for field in fields {
                             if let syn::Member::Named(name) = &field.member {
                                 if matches!(name.to_string().as_str(), "arg_snapshot_len" | "arg_snapshot") {
                                     let name = name.to_string();
@@ -130,18 +138,32 @@ fn initial_wait_snapshot_capture_has_one_policy_and_reparks_keep_saved_bytes() {
     assert!(!calls.0.iter().any(|call| call == "capture_initial_arg_snapshot" || call == "copy_nonoverlapping"),
         "Receive reparks must not reread original client aliases");
     fn saved_field(expression: &syn::Expr, name: &str) -> bool {
-        matches!(expression, syn::Expr::Field(field)
-            if matches!(&field.member, syn::Member::Named(member) if member == name)
-                && matches!(field.base.as_ref(), syn::Expr::Path(path) if path.path.is_ident("pending")))
+        let syn::Expr::Field(field) = expression else { return false; };
+        if !matches!(&field.member, syn::Member::Named(member) if member == name) {
+            return false;
+        }
+        matches!(field.base.as_ref(), syn::Expr::Path(path) if path.path.is_ident("pending"))
+            || matches!(field.base.as_ref(), syn::Expr::Field(snapshot)
+                if matches!(&snapshot.member, syn::Member::Named(member) if member == "snapshot")
+                    && matches!(snapshot.base.as_ref(), syn::Expr::Path(path)
+                        if path.path.is_ident("pending")))
     }
     #[derive(Default)]
     struct ReceiveReparks { receive: bool, provider: bool, lpc: bool }
     impl<'ast> Visit<'ast> for ReceiveReparks {
         fn visit_expr_struct(&mut self, expression: &'ast syn::ExprStruct) {
             if expression.path.is_ident("PendingReceiveDispatch") {
-                self.receive |= matches!(expression.rest.as_deref(), Some(syn::Expr::Path(path)) if path.path.is_ident("pending"))
-                    && !expression.fields.iter().any(|field| matches!(&field.member, syn::Member::Named(name)
-                        if name == "arg_snapshot_len" || name == "arg_snapshot"));
+                self.receive |= expression.fields.iter().any(|field| {
+                    if !matches!(&field.member, syn::Member::Named(name) if name == "snapshot") {
+                        return false;
+                    }
+                    let syn::Expr::Struct(snapshot) = &field.expr else { return false; };
+                    matches!(snapshot.rest.as_deref(), Some(syn::Expr::Field(source))
+                        if matches!(&source.member, syn::Member::Named(name) if name == "snapshot")
+                            && matches!(source.base.as_ref(), syn::Expr::Path(path) if path.path.is_ident("pending")))
+                        && !snapshot.fields.iter().any(|field| matches!(&field.member, syn::Member::Named(name)
+                            if name == "arg_snapshot_len" || name == "arg_snapshot"))
+                });
             }
             if expression.path.is_ident("PendingProviderWaitDispatch") {
                 self.provider |= ["arg_snapshot_len", "arg_snapshot"].iter().all(|name|

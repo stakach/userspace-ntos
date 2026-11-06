@@ -1255,13 +1255,13 @@ fn service_wait_expected_owner(
         provider_generation: identity.generation,
         caller: nt_component_suspension::SuspensionCaller::Hosted(
             nt_component_suspension::SuspensionHostedClient {
-                client_pi: pending.client.pi,
-                client_generation: pending.client.generation,
-                client_tid: pending.client.tid,
-                client_badge: pending.client.badge,
+                client_pi: pending.snapshot.client.pi,
+                client_generation: pending.snapshot.client.generation,
+                client_tid: pending.snapshot.client.tid,
+                client_badge: pending.snapshot.client.badge,
             },
         ),
-        dispatch_id: pending.dispatch.dispatch_id,
+        dispatch_id: pending.snapshot.dispatch.dispatch_id,
     };
     owner.is_valid().then_some(owner)
 }
@@ -1730,7 +1730,7 @@ unsafe fn receive_admit_retained(
     destination: HostedContinuationDestination,
 ) -> bool {
     if pending.yielded.replaces.is_some()
-        || pending.callback_token != callback_transfer.map(|transfer| transfer.token)
+        || pending.snapshot.callback_token != callback_transfer.map(|transfer| transfer.token)
     { return false; }
     let Ok(return_target) = HostedReturnTarget::new(
         reply_cap, callback_transfer.map(|transfer| transfer.context),
@@ -1766,7 +1766,7 @@ unsafe fn receive_admit_current(
     destination: HostedContinuationDestination,
 ) -> bool {
     let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else { return false; };
-    if pending.callback_token.is_some()
+    if pending.snapshot.callback_token.is_some()
         || !receive_admit_retained(pending, REPLY_MAIN_SLOT.load(Ordering::Relaxed), None, destination)
     {
         return false;
@@ -1781,7 +1781,7 @@ unsafe fn service_wait_admit_retained(
     callback_transfer: Option<ComponentCallbackTransfer>,
     destination: HostedContinuationDestination,
 ) -> bool {
-    if pending.callback_token != callback_transfer.map(|transfer| transfer.token) {
+    if pending.snapshot.callback_token != callback_transfer.map(|transfer| transfer.token) {
         return false;
     }
     let Ok(return_target) = HostedReturnTarget::new(
@@ -1814,7 +1814,7 @@ unsafe fn service_wait_admit_current(
     destination: HostedContinuationDestination,
 ) -> bool {
     let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else { return false; };
-    if pending.callback_token.is_some()
+    if pending.snapshot.callback_token.is_some()
         || !service_wait_admit_retained(pending, REPLY_MAIN_SLOT.load(Ordering::Relaxed), None, destination)
     {
         return false;
@@ -1927,11 +1927,11 @@ unsafe fn admit_pending_win32k_dispatch(
     let mut admitted_dispatch_id = 0;
     let mut parked = false;
     if let Some(pending) = win32k_glue::take_pending_receive_dispatch() {
-        admitted_dispatch_id = pending.dispatch.dispatch_id;
+        admitted_dispatch_id = pending.snapshot.dispatch.dispatch_id;
         parked = receive_admit_current(pending, destination);
         assert!(parked, "Receive retains parked parent and original client Reply");
     } else if let Some(pending) = win32k_glue::take_pending_service_wait_dispatch() {
-        admitted_dispatch_id = pending.dispatch.dispatch_id;
+        admitted_dispatch_id = pending.snapshot.dispatch.dispatch_id;
         parked = service_wait_admit_current(pending, destination);
         assert!(parked, "service wait retains exact external token and original client Reply");
     } else if let Some(pending) = win32k_glue::take_pending_provider_wait_dispatch() {
@@ -13077,7 +13077,7 @@ pub(crate) unsafe fn service_sec_image(
                                     callback_token,
                                     callback_context,
                                 } => {
-                                    let dispatch_id = pending.dispatch.dispatch_id;
+                                    let dispatch_id = pending.snapshot.dispatch.dispatch_id;
                                     let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
                                         panic!("callback Receive must retain its original Reply");
                                     };
@@ -13116,7 +13116,7 @@ pub(crate) unsafe fn service_sec_image(
                                     callback_token,
                                     callback_context,
                                 } => {
-                                    let dispatch_id = pending.dispatch.dispatch_id;
+                                    let dispatch_id = pending.snapshot.dispatch.dispatch_id;
                                     let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
                                         panic!("callback service wait must retain its original Reply");
                                     };

@@ -554,20 +554,20 @@ pub(crate) unsafe fn resume_suspended_receive_component(
         pending.yielded.child,
         pending.yielded.owner,
     );
-    if !select_win32k_client_window(pending.client)
-        || !restore_shared_resume_snapshot(pending.shared_resume, pending.dispatch, pending.client)
+    if !select_win32k_client_window(pending.snapshot.client)
+        || !restore_shared_resume_snapshot(pending.snapshot.shared_resume, pending.snapshot.dispatch, pending.snapshot.client)
     {
         return ReceivePumpCompletion::Restored(ProviderWaitPumpCompletion::Failed(
             nt_process::STATUS_INVALID_PARAMETER as i32,
         ));
     }
-    let channel = pending.channel;
+    let channel = pending.snapshot.channel;
     let previous = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
-        pending.dispatch,
+        pending.snapshot.dispatch,
     );
-    let result = crate::spawn_hosts::component_pump_continue_receive(&channel, &pending.pump);
+    let result = crate::spawn_hosts::component_pump_continue_receive(&channel, &pending.snapshot.pump);
     trace_receive_phase(
         b"receive-continued",
         pending.yielded.parent,
@@ -589,28 +589,31 @@ pub(crate) unsafe fn resume_suspended_receive_component(
     if let Some(yielded) = pump.receive_yield {
         return ReceivePumpCompletion::Reparked(PendingReceiveDispatch {
             yielded,
-            pump,
-            channel,
-            callback_token: None,
-            shared_resume: yielded.shared_resume,
-            ..pending
+            snapshot: SuspendedPumpSnapshot {
+                pump, channel, callback_token: None,
+                shared_resume: yielded.shared_resume,
+                ..pending.snapshot
+            },
         });
     }
     if let Some(yielded) = pump.service_wait_yield {
         return ReceivePumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
-            yielded, pump, channel,
-            dispatch: pending.dispatch,
-            client: pending.client,
-            callback_token: None,
-            shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
-            arg_snapshot_len: pending.arg_snapshot_len,
-            arg_snapshot: pending.arg_snapshot,
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, channel,
+                dispatch: pending.snapshot.dispatch,
+                client: pending.snapshot.client,
+                callback_token: None,
+                shared_resume: capture_shared_resume_snapshot(pending.snapshot.dispatch, pending.snapshot.client),
+                arg_snapshot_len: pending.snapshot.arg_snapshot_len,
+                arg_snapshot: pending.snapshot.arg_snapshot,
+            },
         });
     }
     pump.dispatch_return = capture_win32k_dispatch_return(
         pump.dispatch_return_receipt,
-        pending.dispatch.dispatch_id,
-        pending.dispatch.ssn,
+        pending.snapshot.dispatch.dispatch_id,
+        pending.snapshot.dispatch.ssn,
         pump.result,
         pump.completed,
     );
@@ -620,19 +623,19 @@ pub(crate) unsafe fn resume_suspended_receive_component(
             as *const nt_provider_wait::ProviderWaitSharedPage;
         ProviderWaitPumpCompletion::Reparked(PendingProviderWaitDispatch {
             request: core::ptr::read_volatile(core::ptr::addr_of!((*page).request)),
-            dispatch: pending.dispatch,
-            client: pending.client,
+            dispatch: pending.snapshot.dispatch,
+            client: pending.snapshot.client,
             nested_user_callback: false,
-            arg_snapshot_len: pending.arg_snapshot_len,
-            arg_snapshot: pending.arg_snapshot,
+            arg_snapshot_len: pending.snapshot.arg_snapshot_len,
+            arg_snapshot: pending.snapshot.arg_snapshot,
         })
     } else if pump.lpc_wait_suspended {
         capture_lpc_wait_repark(
-            pending.dispatch,
-            pending.client,
+            pending.snapshot.dispatch,
+            pending.snapshot.client,
             false,
-            pending.arg_snapshot_len,
-            pending.arg_snapshot,
+            pending.snapshot.arg_snapshot_len,
+            pending.snapshot.arg_snapshot,
         )
         .map(ProviderWaitPumpCompletion::LpcReparked)
         .unwrap_or(ProviderWaitPumpCompletion::Failed(0xC000_0001u32 as i32))
@@ -642,11 +645,11 @@ pub(crate) unsafe fn resume_suspended_receive_component(
         ProviderWaitPumpCompletion::Failed(pump.status)
     } else {
         complete_resumed_dispatch(
-            pending.dispatch,
-            pending.client,
+            pending.snapshot.dispatch,
+            pending.snapshot.client,
             false,
-            pending.arg_snapshot_len,
-            pending.arg_snapshot,
+            pending.snapshot.arg_snapshot_len,
+            pending.snapshot.arg_snapshot,
             pump,
         )
     };
@@ -658,31 +661,31 @@ pub(crate) unsafe fn resume_suspended_receive_component(
 pub(crate) unsafe fn resume_suspended_service_wait_component(
     pending: PendingServiceWaitDispatch,
 ) -> ServiceWaitPumpCompletion {
-    let selected = select_win32k_client_window(pending.client);
+    let selected = select_win32k_client_window(pending.snapshot.client);
     let restored = selected
-        && restore_shared_resume_snapshot(pending.shared_resume, pending.dispatch, pending.client);
+        && restore_shared_resume_snapshot(pending.snapshot.shared_resume, pending.snapshot.dispatch, pending.snapshot.client);
     if !restored {
         static SERVICE_RESTORE_FAILURES: AtomicU64 = AtomicU64::new(0);
         if SERVICE_RESTORE_FAILURES.fetch_add(1, Ordering::Relaxed) < 8 {
             print_str(b"[service-wait-resume] stage=restore selected/restored/pi/tid/dispatch=");
             print_u64(selected as u64); print_str(b"/"); print_u64(restored as u64);
-            print_str(b"/"); print_u64(pending.client.pi as u64);
-            print_str(b"/"); print_u64(pending.client.tid);
-            print_str(b"/"); print_u64(pending.dispatch.dispatch_id);
+            print_str(b"/"); print_u64(pending.snapshot.client.pi as u64);
+            print_str(b"/"); print_u64(pending.snapshot.client.tid);
+            print_str(b"/"); print_u64(pending.snapshot.dispatch.dispatch_id);
             print_str(b"\n");
         }
         return ServiceWaitPumpCompletion::Restored(ProviderWaitPumpCompletion::Failed(
             nt_process::STATUS_INVALID_PARAMETER as i32,
         ));
     }
-    let channel = pending.channel;
+    let channel = pending.snapshot.channel;
     let previous = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
-        pending.dispatch,
+        pending.snapshot.dispatch,
     );
     let result = crate::spawn_hosts::component_pump_continue_service_wait(
-        &channel, &pending.pump,
+        &channel, &pending.snapshot.pump,
     );
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
@@ -694,8 +697,8 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
             static SERVICE_CONTINUE_FAILURES: AtomicU64 = AtomicU64::new(0);
             if SERVICE_CONTINUE_FAILURES.fetch_add(1, Ordering::Relaxed) < 8 {
                 print_str(b"[service-wait-resume] stage=continue pi/tid/dispatch/status=");
-                print_u64(pending.client.pi as u64); print_str(b"/"); print_u64(pending.client.tid);
-                print_str(b"/"); print_u64(pending.dispatch.dispatch_id);
+                print_u64(pending.snapshot.client.pi as u64); print_str(b"/"); print_u64(pending.snapshot.client.tid);
+                print_str(b"/"); print_u64(pending.snapshot.dispatch.dispatch_id);
                 print_str(b"/0x"); print_hex(status);
                 print_str(b"\n");
             }
@@ -706,26 +709,32 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
     };
     if let Some(yielded) = pump.service_wait_yield {
         return ServiceWaitPumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
-            yielded, pump, channel, callback_token: None,
-            shared_resume: capture_shared_resume_snapshot(pending.dispatch, pending.client),
-            ..pending
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, channel, callback_token: None,
+                shared_resume: capture_shared_resume_snapshot(pending.snapshot.dispatch, pending.snapshot.client),
+                ..pending.snapshot
+            },
         });
     }
     if let Some(yielded) = pump.receive_yield {
         return ServiceWaitPumpCompletion::ReceiveReparked(PendingReceiveDispatch {
-            yielded, pump, channel,
-            dispatch: pending.dispatch,
-            client: pending.client,
-            callback_token: None,
-            shared_resume: yielded.shared_resume,
-            arg_snapshot_len: pending.arg_snapshot_len,
-            arg_snapshot: pending.arg_snapshot,
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, channel,
+                dispatch: pending.snapshot.dispatch,
+                client: pending.snapshot.client,
+                callback_token: None,
+                shared_resume: yielded.shared_resume,
+                arg_snapshot_len: pending.snapshot.arg_snapshot_len,
+                arg_snapshot: pending.snapshot.arg_snapshot,
+            },
         });
     }
     pump.dispatch_return = capture_win32k_dispatch_return(
         pump.dispatch_return_receipt,
-        pending.dispatch.dispatch_id,
-        pending.dispatch.ssn,
+        pending.snapshot.dispatch.dispatch_id,
+        pending.snapshot.dispatch.ssn,
         pump.result,
         pump.completed,
     );
@@ -735,19 +744,19 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
             as *const nt_provider_wait::ProviderWaitSharedPage;
         ProviderWaitPumpCompletion::Reparked(PendingProviderWaitDispatch {
             request: core::ptr::read_volatile(core::ptr::addr_of!((*page).request)),
-            dispatch: pending.dispatch,
-            client: pending.client,
+            dispatch: pending.snapshot.dispatch,
+            client: pending.snapshot.client,
             nested_user_callback: false,
-            arg_snapshot_len: pending.arg_snapshot_len,
-            arg_snapshot: pending.arg_snapshot,
+            arg_snapshot_len: pending.snapshot.arg_snapshot_len,
+            arg_snapshot: pending.snapshot.arg_snapshot,
         })
     } else if pump.lpc_wait_suspended {
         capture_lpc_wait_repark(
-            pending.dispatch,
-            pending.client,
+            pending.snapshot.dispatch,
+            pending.snapshot.client,
             false,
-            pending.arg_snapshot_len,
-            pending.arg_snapshot,
+            pending.snapshot.arg_snapshot_len,
+            pending.snapshot.arg_snapshot,
         )
         .map(ProviderWaitPumpCompletion::LpcReparked)
         .unwrap_or(ProviderWaitPumpCompletion::Failed(0xC000_0001u32 as i32))
@@ -757,11 +766,11 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
         ProviderWaitPumpCompletion::Failed(pump.status)
     } else {
         complete_resumed_dispatch(
-            pending.dispatch,
-            pending.client,
+            pending.snapshot.dispatch,
+            pending.snapshot.client,
             false,
-            pending.arg_snapshot_len,
-            pending.arg_snapshot,
+            pending.snapshot.arg_snapshot_len,
+            pending.snapshot.arg_snapshot,
             pump,
         )
     };
