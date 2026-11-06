@@ -62518,7 +62518,9 @@ static mut DRIVER_INSTANCE_THUNK_SLOTS: Option<
     Vec<HostedThunkSlotRegistry<HOSTED_EXECUTABLE_THUNK_SLOT_COUNT>>,
 > = None;
 
-#[derive(Clone, Copy)]
+#[path = "hosted_irp_banks.rs"]
+mod hosted_irp_banks;
+
 struct ActiveHostedIrpTransfer {
     shared_va: u64,
     transfer_id: u64,
@@ -62530,8 +62532,7 @@ struct ActiveHostedIrpTransfer {
     source_registered: bool,
     /// Executive-validated CREATE File and physical provider address space.
     file_create: Option<(FileId, HostedDomainIdentity)>,
-    input: u64,
-    output: u64,
+    banks: hosted_irp_banks::HostedIrpBanks,
     input_cursor: BankedTransferCursor,
     output_seed_cursor: BankedTransferCursor,
     output_cursor: BankedTransferCursor,
@@ -62558,6 +62559,19 @@ unsafe fn reserve_active_hosted_irp_transfer_slot() -> Result<(), nt_status::NtS
 
 struct ActiveHostedIrpTransferGuard {
     depth: usize,
+}
+
+impl ActiveHostedIrpTransferGuard {
+    /// Bank pushes write the owned buffer. Publish their bytes to the original caller while its
+    /// output slice is still live, including a partial write before an uncertain pump result.
+    unsafe fn copy_output_to(&self, output: &mut [u8]) {
+        let transfers = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
+            .as_ref()
+            .expect("active hosted IRP transfer stack disappeared");
+        assert_eq!(transfers.len(), self.depth + 1);
+        let active = transfers.last().expect("active hosted IRP transfer disappeared");
+        active.banks.copy_output_to(output);
+    }
 }
 
 impl Drop for ActiveHostedIrpTransferGuard {
@@ -62591,6 +62605,7 @@ unsafe fn enter_active_hosted_irp_transfer(
     if transfers.len() == transfers.capacity() {
         transfers.try_reserve(1).ok()?;
     }
+    let banks = hosted_irp_banks::HostedIrpBanks::new(input, output)?;
     transfers.push(ActiveHostedIrpTransfer {
         shared_va,
         transfer_id,
@@ -62599,8 +62614,7 @@ unsafe fn enter_active_hosted_irp_transfer(
         create_subject: None,
         source_registered: false,
         file_create,
-        input: input.as_ptr() as u64,
-        output: output.as_mut_ptr() as u64,
+        banks,
         input_cursor: BankedTransferCursor::new(input.len() as u64),
         output_seed_cursor: BankedTransferCursor::new(output.len() as u64),
         output_cursor: BankedTransferCursor::new(output.len() as u64),
@@ -66319,9 +66333,9 @@ fn service_hosted_irp_bank_pull(
         };
         let started = if active.measure_bank { crate::disk_census_ticks() } else { 0 };
         let (cursor, source) = if from_output {
-            (&mut active.output_seed_cursor, active.output)
+            (&mut active.output_seed_cursor, active.banks.output().as_ptr() as u64)
         } else {
-            (&mut active.input_cursor, active.input)
+            (&mut active.input_cursor, active.banks.input().as_ptr() as u64)
         };
         let Some(source_address) = source.checked_add(offset) else {
             return STATUS_INVALID_PARAMETER;
@@ -66383,7 +66397,7 @@ pub(crate) fn service_hosted_irp_output_push(
             return STATUS_INVALID_PARAMETER;
         };
         let started = if active.measure_bank { crate::disk_census_ticks() } else { 0 };
-        let Some(destination_address) = active.output.checked_add(offset) else {
+        let Some(destination_address) = (active.banks.output_mut().as_mut_ptr() as u64).checked_add(offset) else {
             return STATUS_INVALID_PARAMETER;
         };
         let range = match active.output_cursor.claim(offset, length, FSD_ARG_BYTES) {
@@ -73968,6 +73982,7 @@ unsafe fn dispatch_irp_for_instance_exact(
             },
         );
     }
+    transfer_guard.copy_output_to(out);
     drop(transfer_guard);
     drop(active_dispatch);
     if major == FSD_DISPATCH_ACK_COMPLETION

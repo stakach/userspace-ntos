@@ -160,19 +160,19 @@ pub(super) unsafe fn submit(
     if work_index(source_instance, source_irp_address).is_some() {
         return Some(BUSY);
     }
-    let Some(active) = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
+    let Some((shared_va, transfer_id, active_source_instance)) = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
         .as_ref()
         .and_then(|rows| rows.last())
-        .copied()
+        .map(|active| (active.shared_va, active.transfer_id, active.source_instance))
     else {
         return Some(INVALID);
     };
-    let source_irp = IrpId(active.transfer_id);
-    let mismatch = u64::from(active.shared_va != ch.shared_va)
-        | (u64::from(active.source_instance != source_index) << 1)
+    let source_irp = IrpId(transfer_id);
+    let mismatch = u64::from(shared_va != ch.shared_va)
+        | (u64::from(active_source_instance != source_index) << 1)
         | (u64::from(!hosted_source_irp_ledger::active_caller_projection_matches(
             source_index,
-            active.transfer_id,
+            transfer_id,
             source_irp_address,
             nt_pnp_abi::IRP_MN_START_DEVICE,
         )) << 2)

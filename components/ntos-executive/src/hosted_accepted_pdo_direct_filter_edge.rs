@@ -72,10 +72,11 @@ pub(super) unsafe fn consume(
     reply_cap: u64,
 ) -> Option<(i32, bool)> {
     let refused = (nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw(), false);
-    let Some(active) = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
-        .as_ref().and_then(|rows| rows.last()).copied()
+    let Some((shared_va, transfer_id, source_instance)) = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
+        .as_ref().and_then(|rows| rows.last())
+        .map(|active| (active.shared_va, active.transfer_id, active.source_instance))
     else { return None; };
-    let outer_irp = IrpId(active.transfer_id);
+    let outer_irp = IrpId(transfer_id);
     let rows = &mut *core::ptr::addr_of_mut!(ROWS);
     let Some(row) = rows.iter_mut().find(|row| {
         row.edge.original_identity().outer_irp == outer_irp
@@ -88,10 +89,10 @@ pub(super) unsafe fn consume(
     let Some(domain) = instance_domain_identity(inst) else { return Some(refused); };
     if row.source.is_some()
         || row.projection_instance != instance_index
-        || active.shared_va != ch.shared_va
-        || active.source_instance != instance_index
+        || shared_va != ch.shared_va
+        || source_instance != instance_index
         || !hosted_source_irp_ledger::active_caller_projection_matches(
-            instance_index, active.transfer_id, raw_irp,
+            instance_index, transfer_id, raw_irp,
             nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS,
         )
         || row.edge.original_identity().pdo != pdo
