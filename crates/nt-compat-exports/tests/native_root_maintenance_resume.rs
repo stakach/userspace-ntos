@@ -11,12 +11,16 @@ const SCHEDULER: &str = include_str!("../../../components/ntos-executive/src/com
 fn timer_only_outer_pass_retries_ready_maintenance_without_generic_provider_completion() {
     let outer = SCHEDULER.split("pub(super) unsafe fn run_outer(").nth(1)
         .expect("timer driven outer continuation pass");
+    let returned = outer.find("root_maintenance_owner::next_returned_ticket()")
+        .expect("timer pass revisits a retained returned pump result");
+    let returned_run = outer[returned..].find("run_root_maintenance(handler, ticket)")
+        .map(|offset| returned + offset).expect("returned result is reconciled");
     let scan = outer.find("root_maintenance_owner::next_ready_ticket()")
         .expect("timer pass scans exact ready maintenance owner");
-    let run = outer.find("run_root_maintenance(handler, ticket)")
-        .expect("timer pass runs the typed receive half");
+    let run = outer[scan..].find("run_root_maintenance(handler, ticket)")
+        .map(|offset| scan + offset).expect("ready owner runs the typed receive half");
     let generic = outer.find("next_in_pass(&(*handler).pm, &mut pass)").unwrap();
-    assert!(scan < run && run < generic,
+    assert!(returned < returned_run && returned_run < scan && scan < run && run < generic,
         "maintenance retries before generic provider candidate selection");
 }
 
@@ -128,4 +132,55 @@ fn callback_token_is_durable_before_typed_terminal_admission() {
     let terminal = run.find("retain_maintenance_callback_transfer(ticket")
         .expect("typed callback terminal admission");
     assert!(capture < store && store < terminal);
+}
+
+#[test]
+fn no_effect_terminal_and_repark_refusals_keep_returned_result_retryable() {
+    let terminal = RESUME.split("ProviderWaitPumpCompletion::Completed(dispatch)").nth(1)
+        .expect("real completed dispatch branch")
+        .split("ProviderWaitPumpCompletion::Reparked(next)").next().unwrap();
+    assert!(terminal.contains("begin_result_transfer"));
+    assert!(terminal.contains("pure_transfer_refused"));
+    let repark = RESUME.split("unsafe fn repark_service(").nth(1)
+        .expect("typed next-wait transfer");
+    assert!(repark.contains("need_pure_frame_transfer"));
+    assert!(repark.contains("pure_transfer_refused"));
+    assert!(RESUME.contains("root_maintenance_owner::refuse_result_transfer_no_effects(ticket)"));
+}
+
+#[test]
+fn accepted_transfer_retries_only_retirement_and_backend_work() {
+    let repark = RESUME.split("unsafe fn repark_provider(").nth(1)
+        .expect("provider repark")
+        .split("unsafe fn repark_lpc(").next().unwrap();
+    assert!(repark.contains("need_pure_frame_transfer(ticket"),
+        "accepted pure rearm must be discovered before attempting it again");
+    assert!(RESUME.contains("Some(TransferPhase::Transferred"));
+    assert!(repark.contains("retire_after_repark(ticket, next_key)"));
+    assert!(repark.contains("admit_provider_after_transfer"),
+        "backend effect follows durable accepted-transfer and owner retirement");
+}
+
+#[test]
+fn timer_selects_stored_returned_result_before_generic_busy_gate() {
+    let outer = SCHEDULER.split("pub(super) unsafe fn run_outer(").nth(1).unwrap();
+    let result = outer.find("next_returned_ticket()")
+        .expect("exact returned-result scanner");
+    let busy = outer.find("if component_execution_is_busy()")
+        .expect("generic busy-lane gate");
+    assert!(result < busy, "stored returned result must be considered before busy suppression");
+}
+
+#[test]
+fn captured_callback_token_is_reused_without_recapture_after_terminal_refusal() {
+    let branch = RESUME.split("if matches!(&pump, win32k_glue::RootMaintenancePumpCompletion::Restored(")
+        .nth(1).expect("maintenance callback branch")
+        .split("// No callback was yielded").next().unwrap();
+    let held = branch.find("root_maintenance_owner::callback_token(ticket)").unwrap();
+    let capture = branch.find("callback_transfer.capture(").unwrap();
+    let transfer = branch.find("retain_maintenance_callback_transfer(ticket").unwrap();
+    assert!(held < capture && capture < transfer);
+    assert!(branch.contains("begin_result_transfer"));
+    assert!(branch.contains("pure_transfer_refused"));
+    assert!(RESUME.contains("root_maintenance_owner::refuse_result_transfer_no_effects(ticket)"));
 }

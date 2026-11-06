@@ -3,6 +3,11 @@
 use super::*;
 use nt_user_host::physical_execution_restore::RestoreStep;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
+use crate::service_sec_image::root_maintenance_owner::{
+    RootMaintenanceAcceptedTransfer as AcceptedTransfer,
+    RootMaintenanceTransferKind as TransferKind,
+    RootMaintenanceTransferPhase as TransferPhase,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RootMaintenanceResumeOutcome {
@@ -10,6 +15,56 @@ pub(crate) enum RootMaintenanceResumeOutcome {
     RetainedFailure,
     Parked,
     Terminal,
+}
+
+fn retryable_pure_refusal(error: nt_component_suspension::LaneError) -> bool {
+    matches!(error,
+        nt_component_suspension::LaneError::Busy
+        | nt_component_suspension::LaneError::NoCapacity
+        | nt_component_suspension::LaneError::InvalidPhase
+        | nt_component_suspension::LaneError::Suspension(
+            nt_component_suspension::SuspensionError::NoCapacity
+            | nt_component_suspension::SuspensionError::Overflow
+            | nt_component_suspension::SuspensionError::InvalidPhase))
+}
+
+/// A pure refusal returns its offered value and leaves the old frame untouched. Exact old-frame
+/// proof permits capacity or phase retry; identity disagreement is quarantined.
+unsafe fn pure_transfer_refused(
+    ticket: root_maintenance_owner::RootMaintenanceTicket,
+    error: nt_component_suspension::LaneError,
+) -> RootMaintenanceResumeOutcome {
+    if retryable_pure_refusal(error)
+        && root_maintenance_owner::refuse_result_transfer_no_effects(ticket)
+    {
+        RootMaintenanceResumeOutcome::DeferredRetry
+    } else {
+        let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
+        RootMaintenanceResumeOutcome::RetainedFailure
+    }
+}
+
+/// Return true only when the exact pure transfer has yet to enter. A Transferred row may run
+/// only its remaining retirement/backend steps and never repeats the pure transition.
+unsafe fn need_pure_frame_transfer(
+    ticket: root_maintenance_owner::RootMaintenanceTicket,
+    kind: TransferKind,
+    next_key: nt_component_suspension::SuspensionKey,
+) -> Result<bool, RootMaintenanceResumeOutcome> {
+    match root_maintenance_owner::transfer_phase(ticket) {
+        Some(TransferPhase::Returned) => {
+            if root_maintenance_owner::begin_result_transfer(ticket, kind, next_key) {
+                Ok(true)
+            } else {
+                Err(RootMaintenanceResumeOutcome::RetainedFailure)
+            }
+        }
+        Some(TransferPhase::Transferred {
+            kind: accepted_kind,
+            accepted: AcceptedTransfer::Frame(accepted_key),
+        }) if accepted_kind == kind && accepted_key == next_key => Ok(false),
+        _ => Err(RootMaintenanceResumeOutcome::RetainedFailure),
+    }
 }
 
 unsafe fn exact_hosted(
@@ -58,6 +113,19 @@ unsafe fn exact_hosted(
     Some(*hosted)
 }
 
+unsafe fn transferred_hosted(
+    ticket: root_maintenance_owner::RootMaintenanceTicket,
+    next_key: nt_component_suspension::SuspensionKey,
+) -> Option<HostedNativeContinuation> {
+    let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
+    let frame = lanes.frame(ticket.dispatch.lane(), next_key).ok()??;
+    if frame.owner != ticket.owner || frame.key != next_key
+        || lanes.active_dispatch_identity(ticket.dispatch.lane()).ok().flatten()
+            != Some(ticket.dispatch)
+    { return None; }
+    frame.continuation.hosted().copied()
+}
+
 unsafe fn restore_physical(ticket: root_maintenance_owner::RootMaintenanceTicket) -> bool {
     root_maintenance_owner::with_physical(ticket, |physical| {
         if physical.restore_step()? == RestoreStep::Canonical { physical.canonical_restored()?; }
@@ -81,7 +149,12 @@ pub(crate) unsafe fn run_root_maintenance(
     let Some(key) = root_maintenance_owner::key(ticket) else {
         return RootMaintenanceResumeOutcome::RetainedFailure;
     };
-    let Some(continuation) = exact_hosted(ticket, pending, key) else {
+    let continuation = match root_maintenance_owner::transfer_phase(ticket) {
+        Some(TransferPhase::Transferred { accepted: AcceptedTransfer::Frame(next_key), .. }) =>
+            transferred_hosted(ticket, next_key),
+        _ => exact_hosted(ticket, pending, key),
+    };
+    let Some(continuation) = continuation else {
         return RootMaintenanceResumeOutcome::RetainedFailure;
     };
     let pump = if let Some(returned) = root_maintenance_owner::result(ticket) {
@@ -129,6 +202,17 @@ pub(crate) unsafe fn run_root_maintenance(
     if matches!(&pump, win32k_glue::RootMaintenancePumpCompletion::Restored(
         win32k_glue::ProviderWaitPumpCompletion::UserCallbackSuspended,
     )) {
+        if matches!(root_maintenance_owner::transfer_phase(ticket),
+            Some(TransferPhase::Transferred {
+                kind: TransferKind::CallbackTerminal,
+                accepted: AcceptedTransfer::Terminal(_),
+            }))
+        {
+            return RootMaintenanceResumeOutcome::Terminal;
+        }
+        if root_maintenance_owner::transfer_phase(ticket) != Some(TransferPhase::Returned) {
+            return RootMaintenanceResumeOutcome::RetainedFailure;
+        }
         let token = if let Some(token) = root_maintenance_owner::callback_token(ticket) {
             token
         } else {
@@ -145,10 +229,23 @@ pub(crate) unsafe fn run_root_maintenance(
             }
             token
         };
-        if component_terminal::retain_maintenance_callback_transfer(ticket, key, token) {
-            return RootMaintenanceResumeOutcome::Terminal;
+        if !root_maintenance_owner::begin_result_transfer(
+            ticket, TransferKind::CallbackTerminal, key,
+        ) {
+            return RootMaintenanceResumeOutcome::RetainedFailure;
         }
-        return RootMaintenanceResumeOutcome::RetainedFailure;
+        return match component_terminal::retain_maintenance_callback_transfer(ticket, key, token) {
+            Ok(identity) => {
+                if root_maintenance_owner::accept_result_transfer(
+                    ticket, AcceptedTransfer::Terminal(identity),
+                ) { RootMaintenanceResumeOutcome::Terminal }
+                else {
+                    let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
+                    RootMaintenanceResumeOutcome::RetainedFailure
+                }
+            }
+            Err(error) => pure_transfer_refused(ticket, error),
+        };
     }
     // No callback was yielded. The reserved payload has no native effect to retain.
     let _ = root_maintenance_owner::take_callback(ticket);
@@ -156,13 +253,36 @@ pub(crate) unsafe fn run_root_maintenance(
         win32k_glue::RootMaintenancePumpCompletion::Restored(
             win32k_glue::ProviderWaitPumpCompletion::Completed(dispatch),
         ) => {
+            if matches!(root_maintenance_owner::transfer_phase(ticket),
+                Some(TransferPhase::Transferred {
+                    kind: TransferKind::Terminal,
+                    accepted: AcceptedTransfer::Terminal(_),
+                }))
+            {
+                return RootMaintenanceResumeOutcome::Terminal;
+            }
+            if !root_maintenance_owner::begin_result_transfer(
+                ticket, TransferKind::Terminal, key,
+            ) {
+                return RootMaintenanceResumeOutcome::RetainedFailure;
+            }
             let retained = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                 .retain_shared_root_maintenance_terminal_running(
                     ticket.route, ticket.dispatch, ticket.dispatch.lane(), ticket.reply,
                     key, ticket.owner, component_terminal::NativeTerminal::completed(dispatch),
                 );
-            if retained.is_ok() { RootMaintenanceResumeOutcome::Terminal }
-            else { RootMaintenanceResumeOutcome::RetainedFailure }
+            match retained {
+                Ok(identity) => {
+                    if root_maintenance_owner::accept_result_transfer(
+                        ticket, AcceptedTransfer::Terminal(identity),
+                    ) { RootMaintenanceResumeOutcome::Terminal }
+                    else {
+                        let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
+                        RootMaintenanceResumeOutcome::RetainedFailure
+                    }
+                }
+                Err((error, _payload)) => pure_transfer_refused(ticket, error),
+            }
         }
         win32k_glue::RootMaintenancePumpCompletion::Restored(
             win32k_glue::ProviderWaitPumpCompletion::Reparked(next),
@@ -201,16 +321,29 @@ unsafe fn repark_service(
     let pending = PendingComponentDispatch::ServiceWait(next);
     let next_key = component_suspension_key(pending);
     continuation.pending = pending;
-    let sequence = next_dispatcher_wait_sequence();
-    let yielded = next.yielded;
-    if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-        .rearm_service_wait_external_owned(
-            ticket.dispatch.lane(), yielded.reply, yielded.dispatch, yielded.token,
-            key, next_key, sequence, owner,
-            ComponentNativeContinuation::Hosted(continuation),
-        ).is_err()
-    {
-        return RootMaintenanceResumeOutcome::RetainedFailure;
+    let needs_transfer = match need_pure_frame_transfer(ticket, TransferKind::ServiceWait, next_key) {
+        Ok(needs_transfer) => needs_transfer,
+        Err(outcome) => return outcome,
+    };
+    if needs_transfer {
+        let sequence = next_dispatcher_wait_sequence();
+        let yielded = next.yielded;
+        match (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+            .rearm_service_wait_external_owned(
+                ticket.dispatch.lane(), yielded.reply, yielded.dispatch, yielded.token,
+                key, next_key, sequence, owner,
+                ComponentNativeContinuation::Hosted(continuation),
+            ) {
+            Ok(_) => {
+                if !root_maintenance_owner::accept_result_transfer(
+                    ticket, AcceptedTransfer::Frame(next_key),
+                ) {
+                    let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
+                    return RootMaintenanceResumeOutcome::RetainedFailure;
+                }
+            }
+            Err((error, _)) => return pure_transfer_refused(ticket, error),
+        }
     }
     if root_maintenance_owner::retire_after_repark(ticket, next_key).is_none() {
         return RootMaintenanceResumeOutcome::RetainedFailure;
@@ -230,20 +363,42 @@ unsafe fn repark_receive(
         return RootMaintenanceResumeOutcome::RetainedFailure;
     }
     continuation.pending = pending;
-    let sequence = next_dispatcher_wait_sequence();
-    let parked = runtime::with_bound_receive_scope(next.yielded.parent, |scope| {
-        (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-            .rearm_receive_owned(
-                scope, key, next_key, sequence, ticket.owner, next.yielded.child,
-                ComponentNativeContinuation::Hosted(continuation),
+    let needs_transfer = match need_pure_frame_transfer(ticket, TransferKind::Receive, next_key) {
+        Ok(needs_transfer) => needs_transfer,
+        Err(outcome) => return outcome,
+    };
+    if needs_transfer {
+        let sequence = next_dispatcher_wait_sequence();
+        let parked = runtime::with_bound_receive_scope(next.yielded.parent, |scope| {
+            Ok::<_, runtime::Error>(
+                (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                    .rearm_receive_owned(
+                        scope, key, next_key, sequence, ticket.owner, next.yielded.child,
+                        ComponentNativeContinuation::Hosted(continuation),
+                    )
             )
-            .map(|_| ())
-            .map_err(|_| runtime::Error::Admission)
-    });
-    if parked.is_err() || root_maintenance_owner::retire_after_repark(ticket, next_key).is_none() {
-        return RootMaintenanceResumeOutcome::RetainedFailure;
+        });
+        match parked {
+            Ok(Ok(_)) => {
+                if !root_maintenance_owner::accept_result_transfer(
+                    ticket, AcceptedTransfer::Frame(next_key),
+                ) {
+                    let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
+                    return RootMaintenanceResumeOutcome::RetainedFailure;
+                }
+            }
+            Ok(Err((error, _))) => return pure_transfer_refused(ticket, error),
+            Err(_) => {
+                let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
+                return RootMaintenanceResumeOutcome::RetainedFailure;
+            }
+        }
     }
-    RootMaintenanceResumeOutcome::Parked
+    if root_maintenance_owner::retire_after_repark(ticket, next_key).is_some() {
+        RootMaintenanceResumeOutcome::Parked
+    } else {
+        RootMaintenanceResumeOutcome::RetainedFailure
+    }
 }
 
 unsafe fn repark_provider(
@@ -259,19 +414,48 @@ unsafe fn repark_provider(
     };
     if owner != ticket.owner { return RootMaintenanceResumeOutcome::RetainedFailure; }
     let next_key = component_suspension_key(pending);
-    let sequence = next_dispatcher_wait_sequence();
     continuation.pending = pending;
-    if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-        .rearm_running(
-            ticket.dispatch.lane(), ticket.reply, key, next_key, sequence, owner,
-            ComponentNativeContinuation::Hosted(continuation),
-        ).is_err()
-    {
-        return RootMaintenanceResumeOutcome::RetainedFailure;
+    let needs_transfer = match need_pure_frame_transfer(ticket, TransferKind::Provider, next_key) {
+        Ok(needs_transfer) => needs_transfer,
+        Err(outcome) => return outcome,
+    };
+    if needs_transfer {
+        let sequence = next_dispatcher_wait_sequence();
+        match (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+            .rearm_running_owned(
+                ticket.dispatch.lane(), ticket.reply, key, next_key, sequence, owner,
+                ComponentNativeContinuation::Hosted(continuation),
+            ) {
+            Ok(_) => {
+                if !root_maintenance_owner::accept_result_transfer(
+                    ticket, AcceptedTransfer::Frame(next_key),
+                ) {
+                    let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
+                    return RootMaintenanceResumeOutcome::RetainedFailure;
+                }
+            }
+            Err((error, _)) => return pure_transfer_refused(ticket, error),
+        }
     }
+    let Some(sequence) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+        .frame(ticket.dispatch.lane(), next_key).ok().flatten()
+        .map(|frame| frame.admission_sequence) else {
+        return RootMaintenanceResumeOutcome::RetainedFailure;
+    };
     if root_maintenance_owner::retire_after_repark(ticket, next_key).is_none() {
         return RootMaintenanceResumeOutcome::RetainedFailure;
     }
+    admit_provider_after_transfer(handler, next, owner, next_key, sequence);
+    RootMaintenanceResumeOutcome::Parked
+}
+
+unsafe fn admit_provider_after_transfer(
+    handler: *mut ExecNtHandler,
+    next: win32k_glue::PendingProviderWaitDispatch,
+    owner: nt_component_suspension::SuspensionOwner,
+    next_key: nt_component_suspension::SuspensionKey,
+    sequence: u64,
+) {
     // The typed wait now owns the Reply. Its real backend outcome selects readiness or keeps
     // the wait parked; neither path supplies a fabricated maintenance completion.
     match (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).admit(
@@ -294,7 +478,6 @@ unsafe fn repark_provider(
                 .cancel(next_key, ComponentSuspensionCompletion::provider(status));
         }
     }
-    RootMaintenanceResumeOutcome::Parked
 }
 
 unsafe fn repark_lpc(
@@ -309,22 +492,42 @@ unsafe fn repark_lpc(
         return RootMaintenanceResumeOutcome::RetainedFailure;
     };
     if owner != ticket.owner { return RootMaintenanceResumeOutcome::RetainedFailure; }
-    let Ok(reservation) = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).reserve() else {
+    let next_key = component_suspension_key(pending);
+    continuation.pending = pending;
+    let needs_transfer = match need_pure_frame_transfer(ticket, TransferKind::Lpc, next_key) {
+        Ok(needs_transfer) => needs_transfer,
+        Err(outcome) => return outcome,
+    };
+    if needs_transfer {
+        let sequence = next_dispatcher_wait_sequence();
+        match (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+            .rearm_running_owned(
+                ticket.dispatch.lane(), ticket.reply, key, next_key, sequence, owner,
+                ComponentNativeContinuation::Hosted(continuation),
+            ) {
+            Ok(_) => {
+                if !root_maintenance_owner::accept_result_transfer(
+                    ticket, AcceptedTransfer::Frame(next_key),
+                ) {
+                    let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
+                    return RootMaintenanceResumeOutcome::RetainedFailure;
+                }
+            }
+            Err((error, _)) => return pure_transfer_refused(ticket, error),
+        }
+    }
+    let Some(sequence) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+        .frame(ticket.dispatch.lane(), next_key).ok().flatten()
+        .map(|frame| frame.admission_sequence) else {
         return RootMaintenanceResumeOutcome::RetainedFailure;
     };
-    let next_key = component_suspension_key(pending);
-    let sequence = next_dispatcher_wait_sequence();
-    continuation.pending = pending;
-    if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-        .rearm_running(
-            ticket.dispatch.lane(), ticket.reply, key, next_key, sequence, owner,
-            ComponentNativeContinuation::Hosted(continuation),
-        ).is_err()
-    {
-        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
-        return RootMaintenanceResumeOutcome::RetainedFailure;
-    }
+    // Capacity can refuse after the pure transfer. The accepted frame remains durable, and
+    // a later outer pass reserves a fresh backend row without re-entering the pure rearm.
+    let Ok(reservation) = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).reserve() else {
+        return RootMaintenanceResumeOutcome::DeferredRetry;
+    };
     if root_maintenance_owner::retire_after_repark(ticket, next_key).is_none() {
+        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
         return RootMaintenanceResumeOutcome::RetainedFailure;
     }
     if lpc_wait_begin_after_stack_admission(&mut *handler, next, next_key, reservation) {
@@ -349,36 +552,59 @@ unsafe fn repark_maintenance(
     {
         return RootMaintenanceResumeOutcome::RetainedFailure;
     }
-    let Some(reservation) = root_maintenance_owner::reserve_capacity() else {
-        return RootMaintenanceResumeOutcome::RetainedFailure;
+    let Some(new_ticket) = root_maintenance_owner::prepare_next_repark(ticket, next)
+        .or_else(|| root_maintenance_owner::next_repark_ticket(ticket)) else {
+        return RootMaintenanceResumeOutcome::DeferredRetry;
     };
-    let new_ticket = match root_maintenance_owner::retain(reservation, next, ticket.root_reply) {
-        Ok(ticket) => ticket,
-        Err(_) => {
-            root_maintenance_owner::cancel_reservation(reservation);
+    let needs_transfer = match need_pure_frame_transfer(ticket, TransferKind::RootMaintenance, key) {
+        Ok(needs_transfer) => needs_transfer,
+        Err(outcome) => return outcome,
+    };
+    if needs_transfer {
+        let acquisition = root_maintenance_owner::with_physical(new_ticket, |hold| {
+            if hold.held() { Ok(()) } else { hold.acquire() }
+        });
+        if !acquisition.is_some_and(|result| result.is_ok()) {
+            use nt_user_host::physical_execution_restore::AcquireStep;
+            let step = root_maintenance_owner::with_physical(new_ticket, |hold| hold.acquire_step())
+                .and_then(Result::ok);
+            if matches!(step, Some(AcquireStep::Ready | AcquireStep::Held))
+                && root_maintenance_owner::refuse_result_transfer_no_effects(ticket)
+            {
+                return RootMaintenanceResumeOutcome::DeferredRetry;
+            }
+            let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
             return RootMaintenanceResumeOutcome::RetainedFailure;
-        },
-    };
-    if !root_maintenance_owner::with_physical(new_ticket, |hold| hold.acquire())
-        .is_some_and(|result| result.is_ok())
-    {
-        return RootMaintenanceResumeOutcome::RetainedFailure;
+        }
     }
     continuation.pending = PendingComponentDispatch::RootMaintenance(next);
-    let sequence = next_dispatcher_wait_sequence();
-    if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-        .repark_root_maintenance_owned(
-            ticket.dispatch.lane(), ticket.reply, ticket.dispatch, key, ticket.owner,
-            next.yielded.captured_pass, sequence,
-            ComponentNativeContinuation::Hosted(continuation),
-        ).is_err()
+    if needs_transfer {
+        let sequence = next_dispatcher_wait_sequence();
+        match (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+            .repark_root_maintenance_owned(
+                ticket.dispatch.lane(), ticket.reply, ticket.dispatch, key, ticket.owner,
+                next.yielded.captured_pass, sequence,
+                ComponentNativeContinuation::Hosted(continuation),
+            ) {
+            Ok(_) => {
+                if !root_maintenance_owner::accept_result_transfer(
+                    ticket, AcceptedTransfer::Frame(key),
+                ) {
+                    let _ = root_maintenance_owner::mark_result_transfer_indeterminate(ticket);
+                    return RootMaintenanceResumeOutcome::RetainedFailure;
+                }
+            }
+            Err((error, _)) => return pure_transfer_refused(ticket, error),
+        }
+    }
+    if !root_maintenance_owner::is_admitted(new_ticket)
+        && !root_maintenance_owner::mark_admitted(new_ticket, key)
     {
         return RootMaintenanceResumeOutcome::RetainedFailure;
     }
-    if !root_maintenance_owner::mark_admitted(new_ticket, key)
-        || root_maintenance_owner::retire_after_maintenance_repark(ticket, new_ticket).is_none()
-    {
-        return RootMaintenanceResumeOutcome::RetainedFailure;
+    if root_maintenance_owner::retire_after_maintenance_repark(ticket, new_ticket).is_some() {
+        RootMaintenanceResumeOutcome::Parked
+    } else {
+        RootMaintenanceResumeOutcome::RetainedFailure
     }
-    RootMaintenanceResumeOutcome::Parked
 }

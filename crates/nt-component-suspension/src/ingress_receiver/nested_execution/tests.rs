@@ -5,6 +5,22 @@ mod inline_irq_checkpoint;
 
 type Lanes = ComponentSuspensionLanes<u64, u32, ()>;
 
+#[test]
+fn nested_identity_sequence_matches_only_its_active_lane_epoch() {
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let scope = f.receiver.suspend_for_nested_execution(
+        route, dispatch, &mut f.lanes, &f.peers, bound,
+    ).unwrap();
+    let identity = scope.identity();
+    assert_eq!(identity.route(), route);
+    assert_eq!(identity.dispatch(), dispatch);
+    assert_eq!(f.lanes.phase(dispatch.lane()),
+        Ok(LanePhase::NestedExecution(identity.sequence())));
+    assert_ne!(f.lanes.phase(dispatch.lane()),
+        Ok(LanePhase::NestedExecution(identity.sequence() + 1)));
+}
+
 fn child_settlement() -> crate::ExternalSettlement {
     let lanes = ComponentSuspensionLanes::<u64, u32>::new(1, 2);
     let mut receiver = IngressReceiver::new(20, 300, 1).unwrap();

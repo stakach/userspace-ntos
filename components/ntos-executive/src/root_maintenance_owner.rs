@@ -6,11 +6,13 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use nt_component_suspension::peer_registry::PeerRoute;
-use nt_component_suspension::{LaneDispatchIdentity, SuspensionKey, SuspensionOwner};
+use nt_component_suspension::{LaneDispatchIdentity, SuspensionKey, SuspensionOwner,
+    SuspensionKind, SuspensionPhase, TerminalIdentity};
 
 use crate::spawn_hosts::shared_ingress::owner::runtime::physical_hold::PhysicalExecutionHold;
 use super::{component_callback_transfer::CallbackTransfer, ComponentNativeContinuation};
-use crate::win32k_glue::{PendingRootMaintenanceDispatch, RootMaintenancePumpCompletion};
+use crate::win32k_glue::{PendingRootMaintenanceDispatch, ProviderWaitPumpCompletion,
+    RootMaintenancePumpCompletion};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RootMaintenanceTicket {
@@ -35,6 +37,37 @@ enum State {
     Resuming,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RootMaintenanceTransferKind {
+    Terminal,
+    CallbackTerminal,
+    Provider,
+    Lpc,
+    Receive,
+    ServiceWait,
+    RootMaintenance,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RootMaintenanceAcceptedTransfer {
+    Terminal(TerminalIdentity),
+    Frame(SuspensionKey),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RootMaintenanceTransferPhase {
+    Returned,
+    Entering { kind: RootMaintenanceTransferKind, key: SuspensionKey },
+    Transferred { kind: RootMaintenanceTransferKind, accepted: RootMaintenanceAcceptedTransfer },
+    Indeterminate,
+}
+
+#[derive(Clone, Copy)]
+struct PostPump {
+    result: RootMaintenancePumpCompletion,
+    phase: RootMaintenanceTransferPhase,
+}
+
 struct Row {
     generation: u64,
     pending: PendingRootMaintenanceDispatch,
@@ -42,8 +75,9 @@ struct Row {
     physical: PhysicalExecutionHold,
     continuation: Option<ComponentNativeContinuation>,
     callback: Option<CallbackTransfer>,
-    result: Option<RootMaintenancePumpCompletion>,
+    post_pump: Option<PostPump>,
     callback_token: Option<u64>,
+    next_repark: Option<RootMaintenanceTicket>,
     key: Option<SuspensionKey>,
     state: State,
 }
@@ -109,8 +143,9 @@ pub(crate) unsafe fn retain(
         physical: PhysicalExecutionHold::new(yielded.route, yielded.dispatch),
         continuation: None,
         callback: None,
-        result: None,
+        post_pump: None,
         callback_token: None,
+        next_repark: None,
         key: None,
         state: State::Retained,
     }));
@@ -123,6 +158,7 @@ fn row_matches(ticket: RootMaintenanceTicket, row: &Row) -> bool {
         && yielded.route == ticket.route
         && yielded.dispatch == ticket.dispatch
         && yielded.reply == ticket.reply
+        && row.pending.snapshot.pump.reply_cap == ticket.reply
         && row.root_reply == ticket.root_reply
         && yielded.owner == ticket.owner
 }
@@ -247,6 +283,79 @@ pub(crate) unsafe fn next_ready_ticket() -> Option<RootMaintenanceTicket> {
     None
 }
 
+/// Return a stored native result for reconciliation. Entering and Indeterminate rows are not
+/// candidates: a pure effect may already have occurred and selecting them could replay it.
+pub(crate) unsafe fn next_returned_ticket() -> Option<RootMaintenanceTicket> {
+    let rows = &*core::ptr::addr_of!(ROWS);
+    if rows.is_empty() { return None; }
+    let start = (NEXT_READY_CURSOR.fetch_add(1, Ordering::Relaxed) as usize) % rows.len();
+    let lanes = &*core::ptr::addr_of!(super::COMPONENT_SUSPENSIONS);
+    for offset in 0..rows.len() {
+        let index = (start + offset) % rows.len();
+        let Some(Slot::Active(row)) = rows[index].as_ref() else { continue; };
+        if row.state != State::Resuming { continue; }
+        let Some(owned) = row.post_pump else { continue; };
+        if result_kind(owned.result).is_none() { continue; }
+        let Some(old_key) = row.key else { continue; };
+        let yielded = row.pending.yielded;
+        let lane = yielded.dispatch.lane();
+        let ticket = RootMaintenanceTicket {
+            index, generation: row.generation, route: yielded.route,
+            dispatch: yielded.dispatch, reply: yielded.reply,
+            root_reply: row.root_reply, owner: yielded.owner,
+        };
+        if lanes.active_dispatch_identity(lane) != Ok(Some(yielded.dispatch))
+            || !lanes.peer_route(lane).is_ok_and(|route| route == Some(yielded.route))
+            || !lanes.binding(lane).is_ok_and(|binding| binding.reply_object == yielded.reply)
+        { continue; }
+        let actionable = match owned.phase {
+            RootMaintenanceTransferPhase::Returned => match result_kind(owned.result) {
+                Some(RootMaintenanceTransferKind::ServiceWait) =>
+                    returned_service_wait_external_is_exact(ticket, owned.result),
+                Some(RootMaintenanceTransferKind::Receive) =>
+                    returned_receive_parent_is_exact(ticket, owned.result),
+                Some(_) => lanes.phase(lane) == Ok(nt_component_suspension::LanePhase::Running)
+                    && lanes.frame(lane, old_key).ok().flatten().is_some_and(|frame| {
+                        frame.key == old_key && frame.owner == yielded.owner
+                            && matches!(&frame.phase, SuspensionPhase::MaintenanceResuming { .. })
+                    }),
+                None => false,
+            },
+            RootMaintenanceTransferPhase::Transferred { kind, accepted } => match accepted {
+                RootMaintenanceAcceptedTransfer::Terminal(identity) =>
+                    result_kind(owned.result) == Some(kind)
+                        && matches!(kind, RootMaintenanceTransferKind::Terminal
+                            | RootMaintenanceTransferKind::CallbackTerminal)
+                        && identity.lane() == lane && identity.key() == old_key
+                        && identity.owner() == yielded.owner
+                        && lanes.terminal(identity, yielded.reply).is_ok_and(|terminal| {
+                            matches!(terminal.phase,
+                                nt_component_suspension::TerminalPhase::Ready { .. }
+                                | nt_component_suspension::TerminalPhase::Acknowledged { .. })
+                        }),
+                RootMaintenanceAcceptedTransfer::Frame(next_key) =>
+                    result_kind(owned.result) == Some(kind)
+                        && next_key.kind == expected_key_kind(kind)
+                        && !matches!(kind, RootMaintenanceTransferKind::Terminal
+                            | RootMaintenanceTransferKind::CallbackTerminal)
+                        && (if kind == RootMaintenanceTransferKind::Receive {
+                            transferred_receive_parent_is_exact(ticket, owned.result, next_key)
+                        } else {
+                            lanes.phase(lane) == Ok(nt_component_suspension::LanePhase::Suspended)
+                        })
+                        && lanes.frame(lane, next_key).ok().flatten().is_some_and(|frame| {
+                            frame.key == next_key && frame.owner == yielded.owner
+                        }),
+            },
+            RootMaintenanceTransferPhase::Entering { .. }
+            | RootMaintenanceTransferPhase::Indeterminate => false,
+        };
+        if !actionable { continue; }
+        return Some(ticket);
+    }
+    None
+}
+
 pub(crate) unsafe fn mark_resuming(ticket: RootMaintenanceTicket) -> bool {
     let Some(row) = row_mut(ticket) else { return false; };
     if row.state != State::Admitted { return false; }
@@ -263,7 +372,7 @@ pub(crate) unsafe fn is_resuming(ticket: RootMaintenanceTicket) -> bool {
 pub(crate) unsafe fn result(ticket: RootMaintenanceTicket) -> Option<RootMaintenancePumpCompletion> {
     let row = row(ticket)?;
     if row.state != State::Resuming { return None; }
-    row.result
+    row.post_pump.map(|owned| owned.result)
 }
 
 pub(crate) unsafe fn store_result(
@@ -271,9 +380,246 @@ pub(crate) unsafe fn store_result(
     result: RootMaintenancePumpCompletion,
 ) -> Result<(), RootMaintenancePumpCompletion> {
     let Some(row) = row_mut(ticket) else { return Err(result); };
-    if row.state != State::Resuming || row.result.is_some() { return Err(result); }
-    row.result = Some(result);
+    if row.state != State::Resuming || row.post_pump.is_some() { return Err(result); }
+    row.post_pump = Some(PostPump { result, phase: RootMaintenanceTransferPhase::Returned });
     Ok(())
+}
+
+fn result_kind(result: RootMaintenancePumpCompletion) -> Option<RootMaintenanceTransferKind> {
+    use RootMaintenancePumpCompletion as Pump;
+    use ProviderWaitPumpCompletion as Provider;
+    Some(match result {
+        Pump::Restored(Provider::Completed(_)) => RootMaintenanceTransferKind::Terminal,
+        Pump::Restored(Provider::UserCallbackSuspended) =>
+            RootMaintenanceTransferKind::CallbackTerminal,
+        Pump::Restored(Provider::Reparked(_)) => RootMaintenanceTransferKind::Provider,
+        Pump::Restored(Provider::LpcReparked(_)) => RootMaintenanceTransferKind::Lpc,
+        Pump::ReceiveReparked(_) => RootMaintenanceTransferKind::Receive,
+        Pump::ServiceReparked(_) => RootMaintenanceTransferKind::ServiceWait,
+        Pump::MaintenanceReparked(_) => RootMaintenanceTransferKind::RootMaintenance,
+        Pump::Restored(Provider::Failed(_) | Provider::ReceiveReparked(_)
+            | Provider::ServiceReparked(_)) | Pump::RetainedFailure(_) => return None,
+    })
+}
+
+fn expected_key_kind(kind: RootMaintenanceTransferKind) -> SuspensionKind {
+    match kind {
+        RootMaintenanceTransferKind::Terminal | RootMaintenanceTransferKind::CallbackTerminal
+        | RootMaintenanceTransferKind::RootMaintenance => SuspensionKind::RootMaintenance,
+        RootMaintenanceTransferKind::Provider => SuspensionKind::ProviderWait,
+        RootMaintenanceTransferKind::Lpc => SuspensionKind::LpcRequest,
+        RootMaintenanceTransferKind::Receive => SuspensionKind::Receive,
+        RootMaintenanceTransferKind::ServiceWait => SuspensionKind::ServiceWait,
+    }
+}
+
+fn returned_service_wait_external_is_exact(
+    ticket: RootMaintenanceTicket,
+    result: RootMaintenancePumpCompletion,
+) -> bool {
+    let RootMaintenancePumpCompletion::ServiceReparked(next) = result else { return false; };
+    let yielded = next.yielded;
+    let Some(old_key) = (unsafe { row(ticket) }).and_then(|row| row.key) else { return false; };
+    let lanes = unsafe { &*core::ptr::addr_of!(super::COMPONENT_SUSPENSIONS) };
+    let lane = ticket.dispatch.lane();
+    yielded.token != 0
+        && yielded.route == ticket.route
+        && yielded.dispatch == ticket.dispatch
+        && yielded.reply == ticket.reply
+        && lanes.phase(lane) == Ok(nt_component_suspension::LanePhase::Suspended)
+        && lanes.external_top(lane) == Ok(Some(yielded.token))
+        && lanes.frame(lane, old_key).ok().flatten().is_some_and(|frame| {
+            frame.key == old_key && frame.owner == ticket.owner
+                && matches!(&frame.phase, SuspensionPhase::MaintenanceResuming { .. })
+        })
+}
+
+fn returned_receive_parent_is_exact(
+    ticket: RootMaintenanceTicket,
+    result: RootMaintenancePumpCompletion,
+) -> bool {
+    let RootMaintenancePumpCompletion::ReceiveReparked(next) = result else { return false; };
+    let parent = next.yielded.parent;
+    let Some(old_key) = (unsafe { row(ticket) }).and_then(|row| row.key) else { return false; };
+    let lanes = unsafe { &*core::ptr::addr_of!(super::COMPONENT_SUSPENSIONS) };
+    let lane = ticket.dispatch.lane();
+    parent.route() == ticket.route && parent.dispatch() == ticket.dispatch
+        && next.yielded.owner == ticket.owner
+        && next.yielded.replaces == Some(old_key)
+        && next.snapshot.pump.reply_cap == ticket.reply
+        && lanes.phase(lane) == Ok(nt_component_suspension::LanePhase::NestedExecution(parent.sequence()))
+        && unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::with_bound_receive_scope(
+            parent, |scope| Ok(scope.identity() == parent && !scope.is_consumed()
+                && scope.route() == ticket.route && scope.dispatch() == ticket.dispatch),
+        ) }.ok() == Some(true)
+        && lanes.frame(lane, old_key).ok().flatten().is_some_and(|frame| {
+            frame.key == old_key && frame.owner == ticket.owner
+                && matches!(&frame.phase, SuspensionPhase::MaintenanceResuming { .. })
+        })
+}
+
+fn transferred_receive_parent_is_exact(
+    ticket: RootMaintenanceTicket,
+    result: RootMaintenancePumpCompletion,
+    next_key: SuspensionKey,
+) -> bool {
+    let RootMaintenancePumpCompletion::ReceiveReparked(next) = result else { return false; };
+    let parent = next.yielded.parent;
+    let lanes = unsafe { &*core::ptr::addr_of!(super::COMPONENT_SUSPENSIONS) };
+    let lane = ticket.dispatch.lane();
+    parent.route() == ticket.route && parent.dispatch() == ticket.dispatch
+        && next.yielded.owner == ticket.owner
+        && next.snapshot.pump.reply_cap == ticket.reply
+        && lanes.phase(lane) == Ok(nt_component_suspension::LanePhase::NestedExecution(parent.sequence()))
+        && unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::with_bound_receive_scope(
+            parent, |scope| Ok(scope.identity() == parent && !scope.is_consumed()),
+        ) }.ok() == Some(true)
+        && lanes.frame(lane, next_key).ok().flatten().is_some_and(|frame| {
+            frame.key == next_key && frame.owner == ticket.owner
+                && matches!(&frame.phase, SuspensionPhase::Waiting)
+        })
+}
+
+pub(crate) unsafe fn transfer_phase(
+    ticket: RootMaintenanceTicket,
+) -> Option<RootMaintenanceTransferPhase> {
+    let row = row(ticket)?;
+    if row.state != State::Resuming { return None; }
+    Some(row.post_pump?.phase)
+}
+
+/// Record exact intended kind and key before entering any pure terminal or repark operation.
+pub(crate) unsafe fn begin_result_transfer(
+    ticket: RootMaintenanceTicket,
+    kind: RootMaintenanceTransferKind,
+    next_key: SuspensionKey,
+) -> bool {
+    if !next_key.is_valid() { return false; }
+    let Some(row) = row(ticket) else { return false; };
+    let Some(owned) = row.post_pump else { return false; };
+    if row.state != State::Resuming || owned.phase != RootMaintenanceTransferPhase::Returned
+        || result_kind(owned.result) != Some(kind)
+    { return false; }
+    let expected = expected_key_kind(kind);
+    if next_key.kind != expected
+        || matches!(kind, RootMaintenanceTransferKind::Terminal
+            | RootMaintenanceTransferKind::CallbackTerminal
+            | RootMaintenanceTransferKind::RootMaintenance)
+            && row.key != Some(next_key)
+    { return false; }
+    let Some(old_key) = row.key else { return false; };
+    let lanes = &*core::ptr::addr_of!(super::COMPONENT_SUSPENSIONS);
+    let lane = ticket.dispatch.lane();
+    let old_phase_exact = match kind {
+        RootMaintenanceTransferKind::ServiceWait =>
+            returned_service_wait_external_is_exact(ticket, owned.result),
+        RootMaintenanceTransferKind::Receive =>
+            returned_receive_parent_is_exact(ticket, owned.result),
+        _ => lanes.phase(lane) == Ok(nt_component_suspension::LanePhase::Running),
+    };
+    if !old_phase_exact
+        || lanes.active_dispatch_identity(lane) != Ok(Some(ticket.dispatch))
+        || !lanes.peer_route(lane).is_ok_and(|route| route == Some(ticket.route))
+        || !lanes.binding(lane).is_ok_and(|binding| binding.reply_object == ticket.reply)
+        || !lanes.frame(lane, old_key).ok().flatten().is_some_and(|frame| {
+            frame.key == old_key && frame.owner == ticket.owner
+                && matches!(&frame.phase, SuspensionPhase::MaintenanceResuming { .. })
+        })
+    { return false; }
+    let Some(row) = row_mut(ticket) else { return false; };
+    let Some(owned) = row.post_pump.as_mut() else { return false; };
+    if owned.phase != RootMaintenanceTransferPhase::Returned { return false; }
+    owned.phase = RootMaintenanceTransferPhase::Entering { kind, key: next_key };
+    true
+}
+
+/// Only a proven pure no-effect refusal can return to the stored result for another attempt.
+pub(crate) unsafe fn refuse_result_transfer_no_effects(ticket: RootMaintenanceTicket) -> bool {
+    let Some(row) = row(ticket) else { return false; };
+    let Some(owned) = row.post_pump else { return false; };
+    if row.state != State::Resuming
+        || !matches!(owned.phase, RootMaintenanceTransferPhase::Entering { .. })
+    { return false; }
+    let Some(key) = row.key else { return false; };
+    let lanes = &*core::ptr::addr_of!(super::COMPONENT_SUSPENSIONS);
+    let lane = ticket.dispatch.lane();
+    let old_phase_exact = match result_kind(owned.result) {
+        Some(RootMaintenanceTransferKind::ServiceWait) =>
+            returned_service_wait_external_is_exact(ticket, owned.result),
+        Some(RootMaintenanceTransferKind::Receive) =>
+            returned_receive_parent_is_exact(ticket, owned.result),
+        Some(_) => lanes.phase(lane) == Ok(nt_component_suspension::LanePhase::Running),
+        None => false,
+    };
+    if !old_phase_exact
+        || lanes.active_dispatch_identity(lane) != Ok(Some(ticket.dispatch))
+        || !lanes.peer_route(lane).is_ok_and(|route| route == Some(ticket.route))
+        || !lanes.binding(lane).is_ok_and(|binding| binding.reply_object == ticket.reply)
+        || lanes.terminal_identities().any(|identity| identity.lane() == lane)
+        || !lanes.frame(lane, key).ok().flatten().is_some_and(|frame| {
+            frame.key == key && frame.owner == ticket.owner
+                && matches!(&frame.phase, SuspensionPhase::MaintenanceResuming { .. })
+        })
+    { return false; }
+    let Some(row) = row_mut(ticket) else { return false; };
+    let Some(owned) = row.post_pump.as_mut() else { return false; };
+    if !matches!(owned.phase, RootMaintenanceTransferPhase::Entering { .. }) { return false; }
+    owned.phase = RootMaintenanceTransferPhase::Returned;
+    true
+}
+
+/// The accepted identity is retained before subsequent owner retirement or backend admission.
+pub(crate) unsafe fn accept_result_transfer(
+    ticket: RootMaintenanceTicket,
+    accepted: RootMaintenanceAcceptedTransfer,
+) -> bool {
+    let Some(row) = row_mut(ticket) else { return false; };
+    let Some(owned) = row.post_pump.as_mut() else { return false; };
+    let RootMaintenanceTransferPhase::Entering { kind, key } = owned.phase else { return false; };
+    if row.state != State::Resuming { return false; }
+    let lanes = &*core::ptr::addr_of!(super::COMPONENT_SUSPENSIONS);
+    let lane = ticket.dispatch.lane();
+    if lanes.active_dispatch_identity(lane) != Ok(Some(ticket.dispatch))
+        || !lanes.peer_route(lane).is_ok_and(|route| route == Some(ticket.route))
+        || !lanes.binding(lane).is_ok_and(|binding| binding.reply_object == ticket.reply)
+    { return false; }
+    let accepted_exact = match accepted {
+        RootMaintenanceAcceptedTransfer::Terminal(identity) => {
+            matches!(kind, RootMaintenanceTransferKind::Terminal
+                | RootMaintenanceTransferKind::CallbackTerminal)
+                && identity.lane() == lane && identity.key() == key
+                && identity.owner() == ticket.owner
+                && lanes.terminal(identity, ticket.reply).is_ok()
+        }
+        RootMaintenanceAcceptedTransfer::Frame(next_key) => {
+            !matches!(kind, RootMaintenanceTransferKind::Terminal
+                | RootMaintenanceTransferKind::CallbackTerminal)
+                && next_key == key
+                && (if kind == RootMaintenanceTransferKind::Receive {
+                    transferred_receive_parent_is_exact(ticket, owned.result, next_key)
+                } else {
+                    lanes.phase(lane) == Ok(nt_component_suspension::LanePhase::Suspended)
+                })
+                && lanes.frame(lane, key).ok().flatten().is_some_and(|frame| {
+                    frame.key == key && frame.owner == ticket.owner
+                        && (kind != RootMaintenanceTransferKind::RootMaintenance
+                            || matches!(&frame.phase, SuspensionPhase::MaintenanceWaiting { .. }))
+                })
+        }
+    };
+    if !accepted_exact { return false; }
+    owned.phase = RootMaintenanceTransferPhase::Transferred { kind, accepted };
+    true
+}
+
+pub(crate) unsafe fn mark_result_transfer_indeterminate(ticket: RootMaintenanceTicket) -> bool {
+    let Some(row) = row_mut(ticket) else { return false; };
+    let Some(owned) = row.post_pump.as_mut() else { return false; };
+    if row.state != State::Resuming
+        || !matches!(owned.phase, RootMaintenanceTransferPhase::Entering { .. })
+    { return false; }
+    owned.phase = RootMaintenanceTransferPhase::Indeterminate;
+    true
 }
 
 /// Capturing a callback may consume native state. Retain its token across a typed terminal
@@ -291,6 +637,73 @@ pub(crate) unsafe fn store_callback_token(ticket: RootMaintenanceTicket, token: 
     }
     row.callback_token = Some(token);
     true
+}
+
+fn same_repark_pending(a: PendingRootMaintenanceDispatch, b: PendingRootMaintenanceDispatch) -> bool {
+    a.yielded.route == b.yielded.route
+        && a.yielded.dispatch == b.yielded.dispatch
+        && a.yielded.reply == b.yielded.reply
+        && a.yielded.owner == b.yielded.owner
+        && a.yielded.captured_pass == b.yielded.captured_pass
+        && a.snapshot.dispatch.lane == b.snapshot.dispatch.lane
+        && a.snapshot.dispatch.dispatch_id == b.snapshot.dispatch.dispatch_id
+        && a.snapshot.client.pi == b.snapshot.client.pi
+        && a.snapshot.client.generation == b.snapshot.client.generation
+        && a.snapshot.client.tid == b.snapshot.client.tid
+        && a.snapshot.client.badge == b.snapshot.client.badge
+        && a.snapshot.client.tcb == b.snapshot.client.tcb
+        && a.snapshot.channel.tcb == b.snapshot.channel.tcb
+        && a.snapshot.channel.fault_ep == b.snapshot.channel.fault_ep
+        && a.snapshot.pump.reply_cap == b.snapshot.pump.reply_cap
+}
+
+pub(crate) unsafe fn next_repark_ticket(old: RootMaintenanceTicket) -> Option<RootMaintenanceTicket> {
+    let old_row = row(old)?;
+    let next = old_row.next_repark?;
+    let new_row = row(next)?;
+    (old_row.state == State::Resuming
+        && matches!(new_row.state, State::Retained | State::Admitted)
+        && new_row.root_reply == old.root_reply
+        && next.route == old.route && next.dispatch == old.dispatch
+        && next.reply == old.reply && next.owner == old.owner).then_some(next)
+}
+
+/// Reserve and retain the next physical generation before its hold is acquired. A retry returns
+/// the same generation-bound ticket, including after a certified no-effects acquire refusal.
+pub(crate) unsafe fn prepare_next_repark(
+    old: RootMaintenanceTicket,
+    next: PendingRootMaintenanceDispatch,
+) -> Option<RootMaintenanceTicket> {
+    let old_row = row(old)?;
+    let Some(owned) = old_row.post_pump else { return None; };
+    let RootMaintenancePumpCompletion::MaintenanceReparked(expected) = owned.result else {
+        return None;
+    };
+    if old_row.state != State::Resuming
+        || owned.phase != RootMaintenanceTransferPhase::Returned
+        || !same_repark_pending(expected, next)
+        || next.yielded.route != old.route || next.yielded.dispatch != old.dispatch
+        || next.yielded.reply != old.reply || next.yielded.owner != old.owner
+    { return None; }
+    if let Some(ticket) = old_row.next_repark {
+        return (next_repark_ticket(old) == Some(ticket)
+            && row(ticket).is_some_and(|new_row| same_repark_pending(new_row.pending, next)))
+            .then_some(ticket);
+    }
+    let reservation = reserve_capacity()?;
+    let ticket = match retain(reservation, next, old.root_reply) {
+        Ok(ticket) => ticket,
+        Err(_) => {
+            cancel_reservation(reservation);
+            return None;
+        }
+    };
+    // The owner is serialized. Even if the old row unexpectedly disappears, retain the new
+    // row and refuse native acquisition; dropping the ticket cannot release a physical effect.
+    let Some(old_row) = row_mut(old) else { return None; };
+    if old_row.next_repark.is_some() { return None; }
+    old_row.next_repark = Some(ticket);
+    Some(ticket)
 }
 
 /// Store a callback before reading or mutating the shared callback bank. Refusal returns the
@@ -334,7 +747,11 @@ pub(crate) unsafe fn physical_restore_done(ticket: RootMaintenanceTicket) -> boo
 }
 
 pub(crate) unsafe fn can_retire(ticket: RootMaintenanceTicket) -> bool {
-    row(ticket).is_some_and(|row| row.state == State::Resuming && row.callback.is_none())
+    row(ticket).is_some_and(|row| row.state == State::Resuming
+        && row.callback.is_none()
+        && row.post_pump.is_some_and(|owned| {
+            matches!(owned.phase, RootMaintenanceTransferPhase::Transferred { .. })
+        }))
         && physical_restore_done(ticket)
 }
 
@@ -406,10 +823,22 @@ pub(crate) unsafe fn retire_after_repark(
     {
         return None;
     }
+    let old = row(ticket)?;
+    let owned = old.post_pump?;
+    if !matches!(owned.phase,
+        RootMaintenanceTransferPhase::Transferred {
+            accepted: RootMaintenanceAcceptedTransfer::Frame(key), ..
+        } if key == next_key)
+    { return None; }
     let lane = ticket.dispatch.lane();
     let lanes = &*core::ptr::addr_of!(super::COMPONENT_SUSPENSIONS);
-    if lanes.phase(lane) != Ok(nt_component_suspension::LanePhase::Suspended)
-        || lanes.active_dispatch_identity(lane) != Ok(Some(ticket.dispatch))
+    let phase_exact = if next_key.kind == SuspensionKind::Receive {
+        transferred_receive_parent_is_exact(ticket, owned.result, next_key)
+    } else {
+        lanes.phase(lane) == Ok(nt_component_suspension::LanePhase::Suspended)
+    };
+    if !phase_exact || lanes.active_dispatch_identity(lane) != Ok(Some(ticket.dispatch))
+        || !lanes.peer_route(lane).is_ok_and(|route| route == Some(ticket.route))
         || !lanes.binding(lane).is_ok_and(|binding| binding.reply_object == ticket.reply)
     {
         return None;
@@ -439,7 +868,13 @@ pub(crate) unsafe fn retire_after_maintenance_repark(
     }
     let old_row = row(old)?;
     let new_row = row(new)?;
-    if new_row.state != State::Admitted
+    if old_row.next_repark != Some(new)
+        || !matches!(old_row.post_pump?.phase,
+            RootMaintenanceTransferPhase::Transferred {
+                kind: RootMaintenanceTransferKind::RootMaintenance,
+                accepted: RootMaintenanceAcceptedTransfer::Frame(key),
+            } if Some(key) == new_row.key)
+        || new_row.state != State::Admitted
         || new_row.key.is_none()
         || new_row.key != old_row.key
         || new_row.continuation.is_some()

@@ -122,3 +122,137 @@ fn deferred_maintenance_retry_selects_only_an_exact_ready_owner() {
         assert!(scan.contains(required), "ready scan missing exact guard: {required}");
     }
 }
+
+#[test]
+fn returned_pump_has_one_typed_durable_transfer_phase() {
+    for required in [
+        "enum RootMaintenanceTransferPhase",
+        "Returned",
+        "Entering",
+        "Transferred",
+        "Indeterminate",
+        "fn begin_result_transfer(",
+        "fn refuse_result_transfer_no_effects(",
+        "fn accept_result_transfer(",
+        "fn mark_result_transfer_indeterminate(",
+        "fn transfer_phase(",
+    ] {
+        assert!(OWNER.contains(required), "missing post-pump phase contract: {required}");
+    }
+    let store = OWNER.split("pub(crate) unsafe fn store_result(").nth(1)
+        .expect("durable returned result").split("pub(crate) unsafe fn callback_token(")
+        .next().unwrap();
+    assert!(store.contains("RootMaintenanceTransferPhase::Returned"),
+        "the one retained result must enter Returned before any pure transfer");
+}
+
+#[test]
+fn accepted_or_indeterminate_transfer_cannot_reenter_returned_phase() {
+    let refusal = OWNER.split("pub(crate) unsafe fn refuse_result_transfer_no_effects(")
+        .nth(1).expect("typed no-effect refusal")
+        .split("pub(crate) unsafe fn accept_result_transfer(").next().unwrap();
+    assert!(refusal.contains("RootMaintenanceTransferPhase::Entering"));
+    assert!(refusal.contains("RootMaintenanceTransferPhase::Returned"));
+    let accepted = OWNER.split("pub(crate) unsafe fn accept_result_transfer(")
+        .nth(1).expect("accepted pure transfer")
+        .split("pub(crate) unsafe fn mark_result_transfer_indeterminate(").next().unwrap();
+    assert!(accepted.contains("RootMaintenanceTransferPhase::Entering"));
+    assert!(accepted.contains("RootMaintenanceTransferPhase::Transferred"));
+    let uncertain = OWNER.split("pub(crate) unsafe fn mark_result_transfer_indeterminate(")
+        .nth(1).expect("uncertain pure transfer")
+        .split("pub(crate) unsafe fn ").next().unwrap();
+    assert!(uncertain.contains("RootMaintenanceTransferPhase::Indeterminate"));
+}
+
+#[test]
+fn repeated_same_frame_repark_prepares_one_generation_bound_owner_before_acquire() {
+    let prepare = OWNER.split("pub(crate) unsafe fn prepare_next_repark(").nth(1)
+        .expect("atomic fresh maintenance owner preparation")
+        .split("pub(crate) unsafe fn ").next().unwrap();
+    for required in [
+        "next_repark",
+        "reserve_capacity()",
+        "retain(",
+        "root_reply",
+    ] {
+        assert!(prepare.contains(required), "fresh owner preparation missing {required}");
+    }
+    assert!(prepare.find("retain(").unwrap() < prepare.find("next_repark = Some(").unwrap(),
+        "new owner must be durable before old owner records its exact ticket");
+    assert!(!prepare.contains("physical.acquire()"),
+        "native acquisition must be attempted only after both durable owners agree");
+    assert!(OWNER.contains("generation: u64")
+        && OWNER.contains("generation = NEXT_GENERATION.fetch_update(")
+        && OWNER.contains("row.generation == ticket.generation"),
+        "the retained fresh ticket must be bound to its exact generation");
+}
+
+#[test]
+fn returned_result_is_selected_for_retry_without_reentering_native_receive() {
+    let scan = OWNER.split("pub(crate) unsafe fn next_returned_ticket(").nth(1)
+        .expect("single exact returned-result timer selector")
+        .split("pub(crate) unsafe fn ").next().unwrap();
+    assert!(scan.contains("State::Resuming"),
+        "timer must revisit a returned row after a no-effect transfer refusal");
+    assert!(scan.contains("RootMaintenanceTransferPhase::Returned"),
+        "only an owned, returned pump result is retryable");
+    assert!(scan.contains("RootMaintenanceTransferPhase::Transferred"),
+        "an accepted transfer may still need owner retirement or backend continuation");
+    assert!(scan.contains("RootMaintenanceTransferPhase::Indeterminate => false"),
+        "uncertain transfer effects are never selected for replay");
+}
+
+#[test]
+fn returned_service_wait_retries_only_with_exact_suspended_external_token() {
+    let guard = OWNER.split("fn returned_service_wait_external_is_exact(").nth(1)
+        .expect("service wait returned-result shape guard")
+        .split("pub(crate) unsafe fn ").next().unwrap();
+    for required in [
+        "RootMaintenancePumpCompletion::ServiceReparked",
+        "LanePhase::Suspended",
+        "external_top",
+        "yielded.token",
+        "yielded.route",
+        "yielded.dispatch",
+        "yielded.reply",
+    ] {
+        assert!(guard.contains(required), "service wait guard missing {required}");
+    }
+    for method in [
+        "pub(crate) unsafe fn next_returned_ticket(",
+        "pub(crate) unsafe fn begin_result_transfer(",
+        "pub(crate) unsafe fn refuse_result_transfer_no_effects(",
+    ] {
+        let body = OWNER.split(method).nth(1).expect("post-pump method")
+            .split("pub(crate) unsafe fn ").next().unwrap();
+        assert!(body.contains("returned_service_wait_external_is_exact"),
+            "{method} must use the exact external service-wait shape");
+    }
+}
+
+#[test]
+fn returned_receive_retries_only_with_exact_nested_parent() {
+    let guard = OWNER.split("fn returned_receive_parent_is_exact(").nth(1)
+        .expect("receive returned-result nested parent guard")
+        .split("pub(crate) unsafe fn ").next().unwrap();
+    for required in [
+        "RootMaintenancePumpCompletion::ReceiveReparked",
+        "LanePhase::NestedExecution",
+        "yielded.parent",
+        "parent.route()",
+        "parent.dispatch()",
+        "MaintenanceResuming",
+    ] {
+        assert!(guard.contains(required), "receive parent guard missing {required}");
+    }
+    for method in [
+        "pub(crate) unsafe fn next_returned_ticket(",
+        "pub(crate) unsafe fn begin_result_transfer(",
+        "pub(crate) unsafe fn refuse_result_transfer_no_effects(",
+    ] {
+        let body = OWNER.split(method).nth(1).expect("post-pump method")
+            .split("pub(crate) unsafe fn ").next().unwrap();
+        assert!(body.contains("returned_receive_parent_is_exact"),
+            "{method} must preserve the exact nested receive parent");
+    }
+}

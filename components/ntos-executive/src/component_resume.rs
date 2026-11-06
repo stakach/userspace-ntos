@@ -152,7 +152,8 @@ pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
         if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
             break;
         }
-        if let Some(ticket) = root_maintenance_owner::next_ready_ticket() {
+        if let Some(ticket) = root_maintenance_owner::next_returned_ticket()
+            .or_else(|| root_maintenance_owner::next_ready_ticket()) {
             match run_root_maintenance(handler, ticket) {
                 RootMaintenanceResumeOutcome::Parked | RootMaintenanceResumeOutcome::Terminal => {
                     continue;
@@ -218,6 +219,7 @@ unsafe fn observe_demand(pm: &nt_process::ProcessManager) -> ResumeDemand {
         kernel_provider_activation::has_stopped_wait_work(pm),
         || {
             next_ready(pm).is_some()
+                || root_maintenance_owner::next_returned_ticket().is_some()
                 || (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).frames().any(|(_, frame)| {
                     frame.key.kind == nt_component_suspension::SuspensionKind::RootMaintenance
                         && matches!(frame.phase,
@@ -326,6 +328,17 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
     // A hosted terminal may own the shared execution fence while awaiting the separately
     // retained final Call. Settle that exact return before the ordinary busy-lane gate.
     let _ = component_terminal::drain_shared_returns();
+    if let Some(ticket) = root_maintenance_owner::next_returned_ticket() {
+        let _message = crate::ipc_message::SavedMessageBuffer::capture();
+        let _durable = allocator::enter_durable();
+        match run_root_maintenance(handler, ticket) {
+            RootMaintenanceResumeOutcome::Terminal => { let _ = drain_terminals(handler); }
+            RootMaintenanceResumeOutcome::Parked => {}
+            RootMaintenanceResumeOutcome::DeferredRetry => {}
+            RootMaintenanceResumeOutcome::RetainedFailure =>
+                report_retained(nt_process::STATUS_UNSUCCESSFUL),
+        }
+    }
     if component_execution_is_busy()
         && !kernel_provider_activation::has_stopped_wait_work(&(*handler).pm)
     {

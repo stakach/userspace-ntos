@@ -112,8 +112,10 @@ pub(super) unsafe fn retain_maintenance_callback_transfer(
     ticket: root_maintenance_owner::RootMaintenanceTicket,
     key: nt_component_suspension::SuspensionKey,
     token: u64,
-) -> bool {
-    let Some(callback) = root_maintenance_owner::take_callback(ticket) else { return false; };
+) -> Result<TerminalIdentity, nt_component_suspension::LaneError> {
+    let Some(callback) = root_maintenance_owner::take_callback(ticket) else {
+        return Err(nt_component_suspension::LaneError::InvalidPhase);
+    };
     let mut payload = NativeTerminal::blocked(0);
     payload.callback = Some(callback);
     match (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
@@ -121,12 +123,12 @@ pub(super) unsafe fn retain_maintenance_callback_transfer(
             ticket.route, ticket.dispatch, ticket.dispatch.lane(), ticket.reply,
             key, ticket.owner, token, payload,
         ) {
-        Ok(_) => true,
-        Err((_, mut payload)) => {
+        Ok(identity) => Ok(identity),
+        Err((error, mut payload)) => {
             if let Some(callback) = payload.callback.take() {
                 let _ = root_maintenance_owner::store_callback(ticket, callback);
             }
-            false
+            Err(error)
         }
     }
 }
