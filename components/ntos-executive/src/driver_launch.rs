@@ -38775,10 +38775,13 @@ pub(crate) unsafe fn call_on4(
 static NEXT_FONT_BROKER_TRACE: AtomicU64 = AtomicU64::new(0);
 static FONT_BROKER_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn arm_next_font_broker_trace() {
+pub(crate) fn arm_next_font_broker_trace() -> u64 {
     let sequence = FONT_BROKER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if sequence <= 64 {
         NEXT_FONT_BROKER_TRACE.store(sequence, Ordering::Release);
+        sequence
+    } else {
+        0
     }
 }
 
@@ -38803,6 +38806,7 @@ pub(crate) unsafe fn call_on4_raw(
         print_str(b" arg1=0x"); print_hex64(arg1);
         print_str(b"\n");
     }
+    let call_started_tsc = (font_trace != 0).then(read_ordered_tsc);
     let reply_info: u64;
     let m0: u64;
     let m1: u64;
@@ -38837,10 +38841,15 @@ pub(crate) unsafe fn call_on4_raw(
         inlateout("rax") arg3 => m3,
         lateout("rcx") _, lateout("r11") _,
     );
+    let call_finished_tsc = (font_trace != 0).then(read_ordered_tsc);
     if font_trace != 0 {
         print_str(b"[font-next-broker-return] ordinal="); print_u64(font_trace);
         print_str(b" reply-info=0x"); print_hex64(reply_info);
         print_str(b" status=0x"); print_hex64(m0);
+        print_str(b" start-tsc="); print_u64(call_started_tsc.unwrap());
+        print_str(b" end-tsc="); print_u64(call_finished_tsc.unwrap());
+        print_str(b" tsc-hz=");
+        print_u64(read_volatile((FSD_SHARED_VADDR + SH_TSC_FREQUENCY_HZ) as *const u64));
         print_str(b"\n");
     }
     (reply_info, m0, m1, m2, m3)

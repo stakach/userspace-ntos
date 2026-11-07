@@ -5007,16 +5007,27 @@ extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
         print_str(b"[win32k-deref-file-enter] object=");
         print_hex_u64(object);
         print_str(b"\n");
+        let deref_started_tsc = crate::driver_launch::read_ordered_tsc();
         let (file_status, file_count, _, _) = unsafe {
             win32k_file_object_broker_call(W32_FILE_OBJECT_DEREFERENCE_POINTER, object, 0, 0)
         };
+        let deref_finished_tsc = crate::driver_launch::read_ordered_tsc();
+        let font_ordinal = (file_status == 0)
+            .then(crate::driver_launch::arm_next_font_broker_trace);
         print_str(b"[win32k-deref-file-result] object=");
         print_hex_u64(object);
         print_str(b" status=");
         print_hex_u64(u64::from(file_status as u32));
+        print_str(b" start-tsc=");
+        print_u64(deref_started_tsc);
+        print_str(b" end-tsc=");
+        print_u64(deref_finished_tsc);
+        if let Some(ordinal) = font_ordinal {
+            print_str(b" next-ordinal=");
+            print_u64(ordinal);
+        }
         print_str(b"\n");
         if file_status == 0 {
-            crate::driver_launch::arm_next_font_broker_trace();
             return file_count;
         }
         if file_status != STATUS_INVALID_HANDLE_I32 {
