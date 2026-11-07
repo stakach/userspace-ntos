@@ -27,6 +27,25 @@ pub(crate) struct NoEffectParkProof {
     admission: ExternalAdmissionKey,
 }
 
+/// A real parent park was physically restored before its selected child was delivered.
+/// This move-only receipt authorizes only cancellation of the exact untouched child Call.
+#[must_use = "retain until the matching undelivered child pass is cancelled"]
+pub(crate) struct RestoredBeforeChildProof {
+    parent: NestedExecutionIdentity,
+    token: nt_user_host::root_ingress_pass::UndeliveredRootIngress<crate::HostedThreadRole>,
+}
+
+impl RestoredBeforeChildProof {
+    pub(crate) fn parent(&self) -> NestedExecutionIdentity { self.parent }
+    pub(crate) fn admission_key(&self) -> ExternalAdmissionKey { self.token.admission_key() }
+    pub(crate) fn child(&self) -> nt_user_host::thread_binding::ThreadBinding<crate::HostedThreadRole> {
+        self.token.child()
+    }
+    pub(crate) fn token(&self) -> &nt_user_host::root_ingress_pass::UndeliveredRootIngress<crate::HostedThreadRole> {
+        &self.token
+    }
+}
+
 impl NoEffectParkProof {
     pub(crate) fn admission_key(&self) -> ExternalAdmissionKey { self.admission }
 }
@@ -118,6 +137,8 @@ struct Parent {
     root_ingress_restore:
         Option<nt_user_host::root_ingress_pass::RootIngressRestorePermit<crate::HostedThreadRole>>,
     root_lane_begun: bool,
+    undelivered_root:
+        Option<nt_user_host::root_ingress_pass::UndeliveredRootIngress<crate::HostedThreadRole>>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -147,6 +168,13 @@ enum ParentChild {
 enum RestoreOwner {
     Ordinary,
     RootIngress,
+    UndeliveredRoot,
+}
+
+enum RestoreReceipt {
+    Ordinary,
+    RootIngress(nt_user_host::root_ingress_pass::RootIngressRestorePermit<crate::HostedThreadRole>),
+    UndeliveredRoot(nt_user_host::root_ingress_pass::UndeliveredRootIngress<crate::HostedThreadRole>),
 }
 
 // Records are never removed before both canonical restoration and physical release acknowledge.
@@ -298,6 +326,7 @@ unsafe fn park_current_attempt(root_admission: Option<ExternalAdmissionKey>) -> 
         receive_restore: None,
         root_ingress_restore: None,
         root_lane_begun: false,
+        undelivered_root: None,
     });
     let _saved = crate::ipc_message::SavedMessageBuffer::capture();
     // Suspend cancels IPC in the microkernel. Execution holds preserve the held Call, donated
@@ -472,6 +501,50 @@ pub(crate) unsafe fn bind_root_ingress_child(
     Ok(())
 }
 
+/// Store the sealed, untouched child in its exact parent before any restoration effect. The
+/// parent remains discoverable if a later canonical query or physical release refuses.
+pub(crate) unsafe fn begin_undelivered_root_unwind(
+    handle: &ParkedParentHandle,
+    token: &mut Option<nt_user_host::root_ingress_pass::UndeliveredRootIngress<crate::HostedThreadRole>>,
+) -> Result<(), Error> {
+    let witness = token.as_ref().ok_or(Error::Admission)?;
+    let parent = (&mut *core::ptr::addr_of_mut!(PARENTS))
+        .get_mut(handle.index).and_then(Option::as_mut).ok_or(Error::Admission)?;
+    if !row_matches(handle, parent) || parent.phase != ParentPhase::Parked
+        || !parent.physical.canonical_pending() || !parent.physical.held()
+        || parent.root_admission != Some(witness.admission_key())
+        || witness.child().tcb != witness.admission_key().executor()
+        || parent.child.is_some() || parent.receive_restore.is_some()
+        || parent.root_ingress_restore.is_some() || parent.undelivered_root.is_some()
+    {
+        return Err(Error::Admission);
+    }
+    let scope = parent.scope.as_ref().ok_or(Error::Admission)?;
+    let key = nt_component_suspension::SuspensionKey::root_ingress(
+        witness.admission_key().admission_sequence(),
+    );
+    if lanes().frame(scope.dispatch().lane(), key)
+        .map_err(|_| Error::Admission)?.is_some()
+    {
+        return Err(Error::Admission);
+    }
+    parent.undelivered_root = token.take();
+    Ok(())
+}
+
+/// Read-only preflight for the parent identity before the child pass seals its Prepared phase.
+pub(crate) unsafe fn undelivered_root_parent_candidate(
+    handle: &ParkedParentHandle, admission: ExternalAdmissionKey,
+) -> bool {
+    (&*core::ptr::addr_of!(PARENTS)).get(handle.index).and_then(Option::as_ref)
+        .is_some_and(|parent| {
+            row_matches(handle, parent) && parent.phase == ParentPhase::Parked
+                && parent.root_admission == Some(admission)
+                && parent.child.is_none() && parent.undelivered_root.is_none()
+                && parent.physical.canonical_pending() && parent.physical.held()
+        })
+}
+
 /// Transfer the one-shot child receipt into the existing physical parent owner before returning
 /// any outer-boundary ticket. Failure never drops an entered permit or releases the parent hold.
 pub(crate) unsafe fn consume_receive_settlement(
@@ -574,10 +647,11 @@ pub(crate) unsafe fn begin_root_ingress_restore(
 
 unsafe fn restore_stages(
     handle: &mut Option<ParkedParentHandle>, restore_owner: RestoreOwner,
-) -> Result<Option<nt_user_host::root_ingress_pass::RootIngressRestorePermit<crate::HostedThreadRole>>, Error> {
-    let root = restore_owner == RestoreOwner::RootIngress;
+) -> Result<RestoreReceipt, Error> {
     let Some(ticket) = handle.as_ref() else {
-        return if root { Err(Error::Admission) } else { Ok(None) };
+        return if restore_owner == RestoreOwner::Ordinary {
+            Ok(RestoreReceipt::Ordinary)
+        } else { Err(Error::Admission) };
     };
     let index = ticket.index;
     let rows = &mut *core::ptr::addr_of_mut!(PARENTS);
@@ -588,15 +662,28 @@ unsafe fn restore_stages(
     if !row_matches(ticket, parent) || parent.phase != ParentPhase::RestoreAttempt {
         return Err(Error::Admission);
     }
-    if (parent.child == Some(ParentChild::RootIngress)) != root {
+    if restore_owner == RestoreOwner::Ordinary
+        && (parent.root_admission.is_some() || parent.child == Some(ParentChild::RootIngress))
+    {
         return Err(Error::Admission);
     }
-    if root && (!parent.root_lane_begun || parent.root_ingress_restore.as_ref().is_none_or(|permit| {
+    if restore_owner == RestoreOwner::RootIngress
+        && (parent.child != Some(ParentChild::RootIngress)
+        || !parent.root_lane_begun || parent.root_ingress_restore.as_ref().is_none_or(|permit| {
         permit.parent() != ticket.identity
             || Some(permit.admission_key()) != parent.root_admission
             || permit.checkpoint().parent() != ticket.identity
             || permit.checkpoint().child() != permit.admission_key()
     })) {
+        return Err(Error::Admission);
+    }
+    if restore_owner == RestoreOwner::UndeliveredRoot
+        && (parent.child.is_some() || parent.root_ingress_restore.is_some()
+            || parent.undelivered_root.as_ref().is_none_or(|token| {
+                Some(token.admission_key()) != parent.root_admission
+                    || token.child().tcb != token.admission_key().executor()
+            }))
+    {
         return Err(Error::Admission);
     }
     if parent.child == Some(ParentChild::Receive)
@@ -638,7 +725,13 @@ unsafe fn restore_stages(
     if parent.physical.restore_step()? != RestoreStep::Done {
         return Err(Error::Admission);
     }
-    let restored = parent.root_ingress_restore.take();
+    let restored = match restore_owner {
+        RestoreOwner::Ordinary => RestoreReceipt::Ordinary,
+        RestoreOwner::RootIngress => RestoreReceipt::RootIngress(
+            parent.root_ingress_restore.take().ok_or(Error::Admission)?),
+        RestoreOwner::UndeliveredRoot => RestoreReceipt::UndeliveredRoot(
+            parent.undelivered_root.take().ok_or(Error::Admission)?),
+    };
     rows[index] = None;
     *handle = None;
     Ok(restored)
@@ -654,7 +747,7 @@ pub(crate) unsafe fn mark_restore_pending(
         .get_mut(ticket.index)
         .and_then(Option::as_mut)
         .ok_or(Error::Admission)?;
-    if !row_matches(ticket, parent) || parent.child == Some(ParentChild::RootIngress)
+    if !row_matches(ticket, parent) || parent.root_admission.is_some()
         || !matches!(parent.phase, ParentPhase::Parked | ParentPhase::RestorePending)
     {
         return Err(Error::Admission);
@@ -662,6 +755,29 @@ pub(crate) unsafe fn mark_restore_pending(
     if !parent.physical.held() {
         // An exact row without its acknowledged hold cannot be retried. Keep it fenced even if
         // the stack handle disappears after this refusal.
+        parent.phase = ParentPhase::Quarantined;
+        return Err(Error::Admission);
+    }
+    parent.phase = ParentPhase::RestoreAttempt;
+    Ok(())
+}
+
+unsafe fn mark_undelivered_root_restore_pending(
+    handle: &Option<ParkedParentHandle>,
+) -> Result<(), Error> {
+    let ticket = handle.as_ref().ok_or(Error::Admission)?;
+    let parent = (&mut *core::ptr::addr_of_mut!(PARENTS))
+        .get_mut(ticket.index).and_then(Option::as_mut).ok_or(Error::Admission)?;
+    if !row_matches(ticket, parent) || parent.child.is_some()
+        || !matches!(parent.phase, ParentPhase::Parked | ParentPhase::RestorePending)
+        || parent.undelivered_root.as_ref().is_none_or(|token| {
+            Some(token.admission_key()) != parent.root_admission
+                || token.child().tcb != token.admission_key().executor()
+        })
+    {
+        return Err(Error::Admission);
+    }
+    if !parent.physical.held() {
         parent.phase = ParentPhase::Quarantined;
         return Err(Error::Admission);
     }
@@ -719,8 +835,20 @@ pub(crate) unsafe fn restore_root_ingress(
     if result.is_err() {
         retain_restore_refusal(handle);
     }
-    let permit = result?.ok_or(Error::Admission)?;
+    let RestoreReceipt::RootIngress(permit) = result? else { return Err(Error::Admission) };
     Ok(permit.acknowledge_restore())
+}
+
+/// Complete the actual parent restoration before granting cancellation of an untouched child.
+pub(crate) unsafe fn restore_undelivered_root(
+    handle: &mut Option<ParkedParentHandle>,
+) -> Result<RestoredBeforeChildProof, Error> {
+    let parent_identity = handle.as_ref().ok_or(Error::Admission)?.identity();
+    mark_undelivered_root_restore_pending(handle)?;
+    let result = restore_stages(handle, RestoreOwner::UndeliveredRoot);
+    if result.is_err() { retain_restore_refusal(handle); }
+    let RestoreReceipt::UndeliveredRoot(token) = result? else { return Err(Error::Admission) };
+    Ok(RestoredBeforeChildProof { parent: parent_identity, token })
 }
 
 unsafe fn retain_restore_refusal(handle: &Option<ParkedParentHandle>) {
@@ -753,10 +881,35 @@ pub(crate) unsafe fn pending_ticket(ticket: NestedRestoreTicket) -> bool {
         .and_then(Option::as_ref)
         .is_some_and(|parent| {
             parent.phase == ParentPhase::RestorePending
-                && parent.child != Some(ParentChild::RootIngress)
+                && parent.root_admission.is_none()
                 && ticket_matches(ticket, parent)
                 && restore_refusal_is_retryable(parent)
         })
+}
+
+pub(crate) unsafe fn pending_undelivered_root_ticket(ticket: NestedRestoreTicket) -> bool {
+    (&*core::ptr::addr_of!(PARENTS))
+        .get(ticket.index).and_then(Option::as_ref)
+        .is_some_and(|parent| {
+            parent.phase == ParentPhase::RestorePending
+                && ticket_matches(ticket, parent)
+                && parent.child.is_none()
+                && parent.undelivered_root.as_ref().is_some_and(|token| {
+                    Some(token.admission_key()) == parent.root_admission
+                        && token.child().tcb == token.admission_key().executor()
+                })
+                && restore_refusal_is_retryable(parent)
+        })
+}
+
+pub(crate) unsafe fn restore_pending_undelivered_root_ticket(
+    ticket: NestedRestoreTicket,
+) -> Result<RestoredBeforeChildProof, Error> {
+    if !pending_undelivered_root_ticket(ticket) { return Err(Error::Admission); }
+    let mut handle = Some(ParkedParentHandle {
+        index: ticket.index, generation: ticket.generation, identity: ticket.identity,
+    });
+    restore_undelivered_root(&mut handle)
 }
 
 /// A retained root refusal has a distinct typed redrive because success must return its

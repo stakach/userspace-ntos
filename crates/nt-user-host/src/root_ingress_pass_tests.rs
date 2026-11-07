@@ -106,6 +106,29 @@ fn new_parent() -> NestedExecutionScope {
 }
 
 #[test]
+fn undelivered_unwind_seals_exact_prepared_child_without_delivery() {
+    let child = Child::new(83);
+    let foreign = Child::new(93);
+    let call = child.call.as_ref().unwrap();
+    let mut pass = RootIngressPass::prepare(call, binding()).unwrap();
+    assert_eq!(
+        pass.begin_undelivered_unwind(binding(), foreign.call.as_ref().unwrap()).unwrap_err(),
+        PassError::WrongChild,
+    );
+    let mut foreign_binding = binding();
+    foreign_binding.tid += 1;
+    assert_eq!(pass.begin_undelivered_unwind(foreign_binding, call).unwrap_err(), PassError::WrongChild);
+    let token = pass.begin_undelivered_unwind(binding(), call).unwrap();
+    assert_eq!(token.child(), binding());
+    assert_eq!(token.admission_key(), call.admission_key());
+    let parent = new_parent();
+    assert_eq!(pass.bind_parent(&parent, parent.dispatch()).unwrap_err(), PassError::AlreadyBound);
+    assert!(pass.is_undelivered_unwind(&token));
+    assert_eq!(pass.deliver(binding(), call).unwrap_err(), PassError::InvalidPhase);
+    assert_eq!(pass.begin_undelivered_unwind(binding(), call).unwrap_err(), PassError::Consumed);
+}
+
+#[test]
 fn acknowledged_child_checkpoints_exact_parent_once() {
     let mut child = Child::new(30);
     let mut foreign_child = Child::new(60);

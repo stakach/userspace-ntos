@@ -22,6 +22,10 @@ struct ReceiveSettlement {
 struct RootIngressOwner {
     pass: nt_user_host::root_ingress_pass::RootIngressPass<crate::HostedThreadRole>,
     parent: Option<super::nested::ParkedParentHandle>,
+    /// The exact unbound physical parent, retained through pre-effect refusal and cancellation.
+    undelivered_parent: Option<nt_component_suspension::NestedExecutionIdentity>,
+    /// Sealed before parent unwind; moves into PARENTS before any restore effect.
+    undelivered: Option<nt_user_host::root_ingress_pass::UndeliveredRootIngress<crate::HostedThreadRole>>,
     /// Only a positive physical restore receipt clears the provider-selection exclusion.
     restored: Option<nt_user_host::root_ingress_pass::RootIngressRestored<crate::HostedThreadRole>>,
 }
@@ -645,7 +649,9 @@ pub(crate) unsafe fn prepare_root_ingress_pass(
     let pass = nt_user_host::root_ingress_pass::RootIngressPass::prepare(call, row.binding)
         .map_err(|_| Error::Admission)?;
     let admission = pass.admission_key();
-    row.root_ingress = Some(RootIngressOwner { pass, parent: None, restored: None });
+    row.root_ingress = Some(RootIngressOwner {
+        pass, parent: None, undelivered_parent: None, undelivered: None, restored: None,
+    });
     Ok(admission)
 }
 
@@ -680,8 +686,88 @@ pub(crate) unsafe fn cancel_unbound_root_ingress_pass(
     if !exact || row.delivered || row.released || row.completion.is_some()
         || row.receive_settlement.is_some()
         || row.root_ingress.as_ref().is_none_or(|root| {
-            root.parent.is_some() || root.restored.is_some()
+            root.parent.is_some() || root.undelivered_parent.is_some()
+                || root.undelivered.is_some() || root.restored.is_some()
                 || root.pass.admission_key() != admission
+        })
+    {
+        return Err((Error::Admission, proof));
+    }
+    row.root_ingress = None;
+    Ok(())
+}
+
+/// Seal the exact untouched child Call and transfer its one-shot unwind owner into the physical
+/// parent row. A pre-effect parent refusal retains the token in CALLS for this same retry.
+pub(crate) unsafe fn begin_undelivered_root_unwind(
+    snapshot: PendingSnapshot,
+    parent: &super::nested::ParkedParentHandle,
+) -> Result<(), Error> {
+    let row = (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten()
+        .find(|row| row.binding == snapshot.binding
+            && row.call.as_ref().is_some_and(|call| {
+                call.reply() == snapshot.reply
+                    && call.admission_sequence() == snapshot.admission_sequence
+            }))
+        .ok_or(Error::Admission)?;
+    let call = row.call.as_ref().ok_or(Error::Admission)?;
+    if row.delivered || row.released || row.completion.is_some()
+        || row.receive_settlement.is_some()
+        || call.executor() != snapshot.executor
+        || call.message().info() != snapshot.info
+        || call.message().registers() != snapshot.registers
+        || !call.can_park()
+    {
+        return Err(Error::Admission);
+    }
+    let root = row.root_ingress.as_mut().ok_or(Error::Admission)?;
+    if root.parent.is_some() || root.restored.is_some()
+        || root.pass.admission_key() != call.admission_key()
+        || root.pass.child() != row.binding
+        || root.undelivered_parent.is_some_and(|identity| identity != parent.identity())
+        || !super::nested::undelivered_root_parent_candidate(parent, call.admission_key())
+    {
+        return Err(Error::Admission);
+    }
+    root.undelivered_parent = Some(parent.identity());
+    if root.undelivered.is_none() {
+        root.undelivered = Some(root.pass.begin_undelivered_unwind(row.binding, call)
+            .map_err(|_| Error::Admission)?);
+    }
+    if !root.pass.is_undelivered_unwind(root.undelivered.as_ref().ok_or(Error::Admission)?) {
+        return Err(Error::Admission);
+    }
+    super::nested::begin_undelivered_root_unwind(parent, &mut root.undelivered)
+}
+
+/// Cancel only after a positive physical parent restore produced this move-only receipt.
+/// Every refusal returns the receipt to its caller; the original Call remains retained.
+pub(crate) unsafe fn cancel_restored_undelivered_root_pass(
+    snapshot: PendingSnapshot,
+    proof: super::nested::RestoredBeforeChildProof,
+) -> Result<(), (Error, super::nested::RestoredBeforeChildProof)> {
+    let row = (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten()
+        .find(|row| row.binding == snapshot.binding
+            && row.call.as_ref().is_some_and(|call| {
+                call.reply() == snapshot.reply
+                    && call.admission_sequence() == snapshot.admission_sequence
+            }));
+    let Some(row) = row else { return Err((Error::Admission, proof)) };
+    let exact = row.call.as_ref().is_some_and(|call| {
+        call.admission_key() == proof.admission_key()
+            && call.executor() == snapshot.executor
+            && call.message().info() == snapshot.info
+            && call.message().registers() == snapshot.registers
+            && call.can_park()
+    });
+    if !exact || proof.child() != snapshot.binding || row.delivered || row.released
+        || row.completion.is_some() || row.receive_settlement.is_some()
+        || row.root_ingress.as_ref().is_none_or(|root| {
+            root.parent.is_some() || root.restored.is_some()
+                || root.undelivered_parent != Some(proof.parent())
+                || root.undelivered.is_some()
+                || root.pass.child() != row.binding
+                || !root.pass.is_undelivered_unwind(proof.token())
         })
     {
         return Err((Error::Admission, proof));
@@ -715,7 +801,8 @@ pub(crate) unsafe fn bind_root_ingress_pass(
             return Err(Error::Admission);
         }
         let root = row.root_ingress.as_mut().ok_or(Error::Admission)?;
-        if root.parent.is_some() || root.restored.is_some()
+        if root.parent.is_some() || root.undelivered_parent.is_some()
+            || root.undelivered.is_some() || root.restored.is_some()
             || root.pass.admission_key()
                 != row.call.as_ref().ok_or(Error::Admission)?.admission_key()
             || row.call.as_ref().ok_or(Error::Admission)?.message().info() != snapshot.info

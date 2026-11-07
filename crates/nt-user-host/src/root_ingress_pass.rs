@@ -27,6 +27,8 @@ enum Phase {
     ParkEnteredUnknown,
     Checkpointed,
     RestoreEntered,
+    /// A route refusal sealed this prepared Call before any root child delivery.
+    UndeliveredUnwindEntered,
 }
 
 /// Exact one-event checkpoint. It never owns the child Reply or the physical parent hold.
@@ -40,6 +42,15 @@ pub struct RootIngressPass<R> {
     phase: Phase,
     settlement: Option<ExternalSettlement>,
     parked: bool,
+}
+
+/// One untouched child Call sealed against later binding or delivery. Native retains this in
+/// the exact physical parent row until restoration acknowledges or remains uncertain.
+#[must_use = "retain until the exact parent restoration positively completes"]
+#[derive(Debug)]
+pub struct UndeliveredRootIngress<R> {
+    child: ThreadBinding<R>,
+    admission: ExternalAdmissionKey,
 }
 
 /// One restoration attempt. A parked child remains independently owned by its ingress row.
@@ -95,6 +106,27 @@ impl<R: Copy + Eq> RootIngressPass<R> {
 
     pub fn child(&self) -> ThreadBinding<R> {
         self.child
+    }
+
+    /// Seal a prepared ordinary Call before its dependent route was admitted. This does not
+    /// restore its physical parent or grant cancellation of the retained Call.
+    pub fn begin_undelivered_unwind<M>(
+        &mut self, child: ThreadBinding<R>, call: &ExternalIngress<M>,
+    ) -> Result<UndeliveredRootIngress<R>, PassError> {
+        self.exact_child(child, call)?;
+        if self.phase == Phase::UndeliveredUnwindEntered {
+            return Err(PassError::Consumed);
+        }
+        if self.phase != Phase::Prepared || !call.can_park() {
+            return Err(PassError::InvalidPhase);
+        }
+        self.phase = Phase::UndeliveredUnwindEntered;
+        Ok(UndeliveredRootIngress { child, admission: self.admission })
+    }
+
+    pub fn is_undelivered_unwind(&self, token: &UndeliveredRootIngress<R>) -> bool {
+        self.phase == Phase::UndeliveredUnwindEntered
+            && self.child == token.child && self.admission == token.admission
     }
 
     pub fn bind_parent(
@@ -227,6 +259,11 @@ impl<R: Copy + Eq> RootIngressPass<R> {
             checkpoint,
         })
     }
+}
+
+impl<R: Copy> UndeliveredRootIngress<R> {
+    pub fn child(&self) -> ThreadBinding<R> { self.child }
+    pub fn admission_key(&self) -> ExternalAdmissionKey { self.admission }
 }
 
 impl<R: Copy> RootIngressRestorePermit<R> {

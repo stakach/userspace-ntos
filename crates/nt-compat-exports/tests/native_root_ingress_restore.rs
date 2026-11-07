@@ -44,7 +44,7 @@ fn exact_root_child_receipt_survives_until_physical_parent_restore() {
     assert!(root.find("restore_stages").unwrap() < root.find("acknowledge_restore").unwrap(),
         "the positive restored receipt must follow the physical stage result");
     let ordinary = function("mark_restore_pending");
-    assert!(ordinary.contains("ParentChild::RootIngress"),
+    assert!(ordinary.contains("parent.root_admission.is_some()"),
         "ordinary restore must not consume a root ingress permit");
     let root_mark = function("mark_root_restore_pending");
     assert!(root_mark.contains("parent.root_ingress_restore.is_none()")
@@ -52,7 +52,7 @@ fn exact_root_child_receipt_survives_until_physical_parent_restore() {
         "root restore entry requires both retained permit and admitted lane checkpoint");
     let ordinary_ticket = function("pending_ticket");
     let root_ticket = function("pending_root_ticket");
-    assert!(ordinary_ticket.contains("parent.child != Some(ParentChild::RootIngress)")
+    assert!(ordinary_ticket.contains("parent.root_admission.is_none()")
         && root_ticket.contains("parent.child == Some(ParentChild::RootIngress)")
         && root_ticket.contains("ticket_matches(ticket, parent)")
         && root_ticket.contains("ParentPhase::RestorePending")
