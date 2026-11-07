@@ -156,6 +156,26 @@ pub(crate) unsafe fn pending_root_ingress_dispatch_is_some() -> bool {
     (&*core::ptr::addr_of!(ROOT_INGRESS_PENDING_DISPATCH)).is_some()
 }
 
+/// Observe a selectable root child without moving its saved pump or physical parent. Retained
+/// and uncertain yields do not expose a selector; the later take rechecks both identities.
+pub(crate) unsafe fn pending_root_ingress_selector() -> Option<(
+    crate::spawn_hosts::shared_ingress::owner::runtime::nested::NestedRestoreTicket,
+    nt_component_suspension::ExternalAdmissionKey,
+)> {
+    let pending = (&*core::ptr::addr_of!(ROOT_INGRESS_PENDING_DISPATCH)).as_ref()?;
+    let RootIngressYield::ParkedUnbound { ticket, child, .. } = pending.yielded else {
+        return None;
+    };
+    if !crate::spawn_hosts::shared_ingress::owner::runtime
+        ::prepared_root_ingress_child_is_current(child)
+        || crate::spawn_hosts::shared_ingress::owner::runtime::nested
+            ::parked_unbound_root_parent(ticket, child).is_none()
+    {
+        return None;
+    }
+    Some((ticket, child))
+}
+
 /// The slot and the physical parent travel together across the serialized outer handoff.
 /// This bundle is intentionally move-only even though the saved pump snapshot is copyable.
 pub(crate) struct TakenRootIngressDispatch {

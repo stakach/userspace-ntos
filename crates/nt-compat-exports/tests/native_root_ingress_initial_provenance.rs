@@ -3,6 +3,18 @@
 const CHANNEL: &str = include_str!("../../../components/ntos-executive/src/spawn_hosts.rs");
 const GLUE: &str = include_str!("../../../components/ntos-executive/src/win32k_glue.rs");
 const RECEIVE: &str = include_str!("../../../components/ntos-executive/src/win32k_receive.rs");
+const PENDING: &str = include_str!("../../../components/ntos-executive/src/win32k_pending_dispatch.rs");
+
+#[test]
+fn root_selector_exposes_only_a_parked_exact_child() {
+    let selector = PENDING.split("fn pending_root_ingress_selector(").nth(1)
+        .expect("root ingress selector")
+        .split("pub(crate) struct TakenRootIngressDispatch").next().unwrap();
+    assert!(selector.contains("RootIngressYield::ParkedUnbound"));
+    assert!(selector.contains("prepared_root_ingress_child_is_current"));
+    assert!(selector.contains("parked_unbound_root_parent"));
+    assert!(!selector.contains("core::ptr::replace"), "selector must not take the pending owner");
+}
 
 #[test]
 fn only_initial_ssdt_dispatch_mints_root_provenance() {
