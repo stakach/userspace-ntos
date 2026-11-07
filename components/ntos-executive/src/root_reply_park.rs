@@ -37,6 +37,14 @@ impl RootReplyPark {
         })
     }
 
+    /// A selected held-parent pass may park only its exact hosted root Reply. It cannot
+    /// publish a replacement cap or borrow another caller's Reply pool generation.
+    pub(crate) unsafe fn prepare_exact_hosted(expected: u64) -> Option<Self> {
+        let prepared = Self::prepare()?;
+        (prepared.active == expected && prepared.replacement.is_none()
+            && runtime::can_park_hosted_reply(expected)).then_some(prepared)
+    }
+
     /// The semantic continuation (or the returned transfer value) must retain `active`.
     pub(crate) unsafe fn commit(self) {
         if self.try_commit().is_err() {

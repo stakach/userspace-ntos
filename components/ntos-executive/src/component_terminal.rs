@@ -678,6 +678,10 @@ pub(super) unsafe fn drain(
                 cursor = Some(order);
                 continue;
             }
+            ComponentNativeContinuation::RootIngress(_) => {
+                cursor = Some(order);
+                continue;
+            }
         };
         assert!(
             !matches!(payload.returned, NativeReturn::Kernel { .. }),

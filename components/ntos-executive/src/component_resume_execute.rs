@@ -63,6 +63,7 @@ pub(crate) unsafe fn run_hosted(
     let continuation = match frame.continuation {
         ComponentNativeContinuation::Hosted(hosted) => hosted,
         ComponentNativeContinuation::Kernel(_) => return None,
+        ComponentNativeContinuation::RootIngress(_) => return None,
     };
     if matches!(continuation.pending, PendingComponentDispatch::Receive(_)
         | PendingComponentDispatch::RootMaintenance(_)

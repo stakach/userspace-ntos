@@ -25,12 +25,25 @@ pub(crate) enum Bundle {
         taken: win32k_glue::TakenRootIngressDispatch,
         authority: RootReplyAuthority,
     },
-    BoundUnadmitted {
-        pending: win32k_glue::PendingRootIngressDispatch,
-        authority: RootReplyAuthority,
-        admission: nt_component_suspension::ExternalAdmissionKey,
-        parent: nt_component_suspension::NestedExecutionIdentity,
-    },
+    BoundUnadmitted(BoundRootIngress),
+    AdmittedUnparked(AdmittedRootIngress),
+    Parked(AdmittedRootIngress),
+}
+
+#[allow(dead_code)]
+pub(crate) struct BoundRootIngress {
+    pending: win32k_glue::PendingRootIngressDispatch,
+    authority: RootReplyAuthority,
+    admission: nt_component_suspension::ExternalAdmissionKey,
+    parent: nt_component_suspension::NestedExecutionIdentity,
+}
+
+#[allow(dead_code)]
+pub(crate) struct AdmittedRootIngress {
+    bound: BoundRootIngress,
+    key: nt_component_suspension::SuspensionKey,
+    sequence: u64,
+    owner: nt_component_suspension::SuspensionOwner,
 }
 
 static mut OWNERS: RootIngressHandoffTable<Bundle> = RootIngressHandoffTable::new();
@@ -107,7 +120,8 @@ pub(crate) unsafe fn retain(
         .retain(reservation, key, Bundle::Unbound { taken, authority })
         .map_err(|(_, bundle)| match bundle {
             Bundle::Unbound { taken, authority } => (taken, authority),
-            Bundle::BoundUnadmitted { .. } => unreachable!("fresh retention is unbound"),
+            Bundle::BoundUnadmitted(_) | Bundle::AdmittedUnparked(_) | Bundle::Parked(_) =>
+                unreachable!("fresh retention is unbound"),
         })
 }
 
@@ -149,9 +163,9 @@ pub(crate) unsafe fn bind_prepared(
         match crate::spawn_hosts::shared_ingress::owner::runtime::bind_root_ingress_pass(
             snapshot, parent, dispatch,
         ) {
-            Ok(()) => Ok(Bundle::BoundUnadmitted {
+            Ok(()) => Ok(Bundle::BoundUnadmitted(BoundRootIngress {
                 pending, authority, admission: child, parent: parent_identity,
-            }),
+            })),
             Err((error, parent)) => Err((error, Bundle::Unbound {
                 taken: win32k_glue::TakenRootIngressDispatch { pending, parent }, authority,
             })),
@@ -204,6 +218,104 @@ pub(crate) unsafe fn preflight_selected_read(
             }
         outcome => outcome,
     }
+}
+
+/// Admit the exact bound child once. A pure lane refusal returns its continuation before any
+/// frame mutation; BoundUnadmitted remains durable for a ticket-only retry after the old pending
+/// slot has been cleared. Successful admission records the exact frame before Reply effects.
+#[allow(dead_code)]
+pub(crate) unsafe fn admit_bound_root_ingress(
+    ticket: RootIngressHandoffTicket,
+) -> Result<(), crate::spawn_hosts::shared_ingress::owner::runtime::Error> {
+    use crate::spawn_hosts::shared_ingress::owner::runtime::{self, Error};
+    let result = (&mut *core::ptr::addr_of_mut!(OWNERS)).transition_held(ticket, |bundle| {
+        let Bundle::BoundUnadmitted(bound) = bundle else {
+            return Err((Error::Admission, bundle));
+        };
+        let win32k_glue::RootIngressYield::ParkedUnbound { child, owner, .. } = bound.pending.yielded
+        else { return Err((Error::Admission, Bundle::BoundUnadmitted(bound))) };
+        if ticket.key().child() != child || ticket.key().parent() != bound.parent
+            || ticket.key().root_reply() != bound.authority.reply
+            || bound.admission != child
+            || owner.dispatch_id != bound.pending.snapshot.dispatch.dispatch_id
+            || !root_reply_authority_is_live(&bound.authority)
+        {
+            return Err((Error::Admission, Bundle::BoundUnadmitted(bound)));
+        }
+        let key = nt_component_suspension::SuspensionKey::root_ingress(child.admission_sequence());
+        let sequence = crate::next_dispatcher_wait_sequence();
+        let continuation = ComponentNativeContinuation::RootIngress(ticket);
+        let admitted = runtime::with_bound_root_ingress_scope(child, bound.parent, |scope| {
+            let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+            Ok(lanes.admit_root_ingress_owned(
+                scope, key, sequence, owner, child, continuation,
+            ))
+        });
+        match admitted {
+            Ok(Ok(())) => Ok(Bundle::AdmittedUnparked(AdmittedRootIngress {
+                bound, key, sequence, owner,
+            })),
+            Ok(Err((_, ComponentNativeContinuation::RootIngress(returned))))
+                if returned == ticket => Err((Error::Admission, Bundle::BoundUnadmitted(bound))),
+            Ok(Err(_)) | Err(_) => Err((Error::Admission, Bundle::BoundUnadmitted(bound))),
+        }
+    });
+    result.map_err(|error| match error {
+        nt_user_host::root_ingress_handoff::RootIngressTransitionError::StaleTicket => Error::Admission,
+        nt_user_host::root_ingress_handoff::RootIngressTransitionError::Refused(error) => error,
+    })
+}
+
+/// A refusal retains the admitted frame and retries only this original root Reply park. The
+/// positive native commit is followed by an infallible in-row Parked transition in this turn.
+#[allow(dead_code)]
+pub(crate) unsafe fn park_admitted_root_reply(
+    ticket: RootIngressHandoffTicket,
+) -> Result<(), crate::spawn_hosts::shared_ingress::owner::runtime::Error> {
+    use crate::spawn_hosts::shared_ingress::owner::runtime::Error;
+    let result = (&mut *core::ptr::addr_of_mut!(OWNERS)).transition_held(ticket, |bundle| {
+        let Bundle::AdmittedUnparked(admitted) = bundle else {
+            return Err((Error::Admission, bundle));
+        };
+        let bound = &admitted.bound;
+        if crate::spawn_hosts::shared_ingress::owner::runtime
+            ::with_bound_root_ingress_scope(bound.admission, bound.parent, |_| Ok(())).is_err()
+        {
+            return Err((Error::Admission, Bundle::AdmittedUnparked(admitted)));
+        }
+        let lane = bound.parent.dispatch().lane();
+        let frame_is_exact = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+            .top(lane).ok().flatten().is_some_and(|frame| {
+                frame.key == admitted.key
+                    && frame.admission_sequence == admitted.sequence
+                    && frame.owner == admitted.owner
+                    && matches!(frame.phase, nt_component_suspension::SuspensionPhase::Waiting)
+                    && matches!(frame.continuation,
+                        ComponentNativeContinuation::RootIngress(retained) if retained == ticket)
+            });
+        if !frame_is_exact || ticket.key().child() != bound.admission
+            || ticket.key().parent() != bound.parent
+            || ticket.key().root_reply() != bound.authority.reply
+            || !root_reply_authority_is_live(&bound.authority)
+        {
+            return Err((Error::Admission, Bundle::AdmittedUnparked(admitted)));
+        }
+        let Some(park) = super::root_reply_park::RootReplyPark
+            ::prepare_exact_hosted(bound.authority.reply) else {
+            return Err((Error::Reply, Bundle::AdmittedUnparked(admitted)));
+        };
+        if !root_reply_authority_is_live(&bound.authority) {
+            return Err((Error::Reply, Bundle::AdmittedUnparked(admitted)));
+        }
+        match park.try_commit() {
+            Ok(()) => Ok(Bundle::Parked(admitted)),
+            Err(_) => Err((Error::Reply, Bundle::AdmittedUnparked(admitted))),
+        }
+    });
+    result.map_err(|error| match error {
+        nt_user_host::root_ingress_handoff::RootIngressTransitionError::StaleTicket => Error::Admission,
+        nt_user_host::root_ingress_handoff::RootIngressTransitionError::Refused(error) => error,
+    })
 }
 
 /// The exact ticket may lend its bundle to a later lane transfer. A refused transfer must

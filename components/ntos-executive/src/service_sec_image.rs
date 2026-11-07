@@ -630,6 +630,7 @@ pub(crate) fn provider_wait_runtime_stats() -> ProviderWaitRuntimeStats {
                             matches!(hosted.pending, PendingComponentDispatch::Provider(_))
                         }
                         ComponentNativeContinuation::Kernel(_) => true,
+                        ComponentNativeContinuation::RootIngress(_) => false,
                     }
                 })
                 .count(),

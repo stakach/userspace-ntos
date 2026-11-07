@@ -56,6 +56,34 @@ fn root_ingress_park_checkpoint_restores_parent_before_child_settlement() {
 }
 
 #[test]
+fn root_ingress_lane_refusal_returns_exact_continuation_for_bound_retry() {
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let owner = receive_owner(dispatch);
+    let reply = f.lanes.binding(dispatch.lane()).unwrap().reply_object;
+    let (_receiver, child_call) = pending_root_ingress_child();
+    let child = child_call.as_ref().unwrap().admission_key();
+    let key = crate::SuspensionKey::root_ingress(child.admission_sequence());
+    f.lanes.reserve_root_ingress_capacity(dispatch.lane(), reply, owner).unwrap();
+    let scope = f.receiver.suspend_for_nested_execution(
+        route, dispatch, &mut f.lanes, &f.peers, bound,
+    ).unwrap();
+    let mut wrong_owner = owner;
+    wrong_owner.dispatch_id += 1;
+    let (_, retained) = f.lanes.admit_root_ingress_owned(
+        &scope, key, 71, wrong_owner, child, 0x6a11,
+    ).unwrap_err();
+    assert_eq!(retained, 0x6a11);
+    assert!(f.lanes.frame(dispatch.lane(), key).unwrap().is_none());
+    f.lanes.admit_root_ingress_owned(&scope, key, 71, owner, child, retained).unwrap();
+    let frame = f.lanes.frame(dispatch.lane(), key).unwrap().unwrap();
+    assert_eq!(frame.admission_sequence, 71);
+    assert_eq!(frame.continuation, 0x6a11);
+    assert_eq!(frame.owner, owner);
+    assert!(f.lanes.admit_root_ingress_owned(&scope, key, 72, owner, child, 0x6a11).is_err());
+}
+
+#[test]
 fn root_ingress_checkpoint_rejects_wrong_scope_child_and_owner() {
     let mut f = Fixture::new();
     let (route, dispatch) = f.parent(1);

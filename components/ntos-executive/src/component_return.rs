@@ -103,13 +103,15 @@ pub(super) unsafe fn prepare_abandoned_initial_source_replies(scope: InitialSour
 unsafe fn prepare_abandoned_matching(
     matches: impl Fn(nt_component_suspension::SuspensionOwner, ComponentNativeContinuation) -> bool + Copy,
 ) -> bool {
-    // Kernel activations own a different return recipient. Keep them visible to scope quiescence,
-    // but never apply hosted Reply retirement or cancellation to their retained wait capture.
+    // Kernel activations and held RootIngress parents own different return recipients. Keep
+    // them visible to scope quiescence; neither can be retired through hosted Reply teardown.
     if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
         .frames()
         .any(|(_, frame)| {
             matches(frame.owner, frame.continuation)
-                && matches!(frame.continuation, ComponentNativeContinuation::Kernel(_))
+                && matches!(frame.continuation,
+                    ComponentNativeContinuation::Kernel(_)
+                        | ComponentNativeContinuation::RootIngress(_))
         })
     {
         return false;

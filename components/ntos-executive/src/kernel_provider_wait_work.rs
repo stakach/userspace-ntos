@@ -124,6 +124,9 @@ unsafe fn publish_waits(
                             ComponentNativeContinuation::Hosted(_) => {
                                 panic!("kernel wait replaced hosted continuation")
                             }
+                            ComponentNativeContinuation::RootIngress(_) => {
+                                panic!("kernel wait replaced held root ingress")
+                            }
                         }),
                         previous,
                     );

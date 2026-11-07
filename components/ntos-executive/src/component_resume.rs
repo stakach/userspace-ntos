@@ -73,6 +73,7 @@ unsafe fn eligible(
         ComponentNativeContinuation::Kernel(capture) => {
             kernel_provider_activation::wait_resume_is_eligible(pm, capture)
         }
+        ComponentNativeContinuation::RootIngress(_) => false,
     }
 }
 
@@ -171,7 +172,8 @@ pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
         let Some(candidate) = next_in_pass(&(*handler).pm, &mut pass) else {
             break;
         };
-        if matches!(candidate.continuation, ComponentNativeContinuation::Kernel(_)) {
+        if matches!(candidate.continuation,
+            ComponentNativeContinuation::Kernel(_) | ComponentNativeContinuation::RootIngress(_)) {
             break;
         }
         if run_hosted(handler, candidate).is_none() {
@@ -644,6 +646,7 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
                 // only after real lease acquisition. Refusal retains both original captures.
                 kernel_provider_activation::publish_runtime_waits(&mut *handler);
             }
+            ComponentNativeContinuation::RootIngress(_) => {}
         }
         if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
             || crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()

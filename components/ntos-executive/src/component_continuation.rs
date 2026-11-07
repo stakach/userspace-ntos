@@ -90,6 +90,8 @@ pub(super) enum HostedContinuationDestination {
 #[derive(Clone, Copy)]
 pub(crate) enum ComponentNativeContinuation {
     Hosted(HostedNativeContinuation),
+    /// Dedicated held-parent checkpoint; never a generic provider resume or terminal Reply.
+    RootIngress(nt_user_host::root_ingress_handoff::RootIngressHandoffTicket),
     // Native blocking admission still requires the stopped-job scheduler and receive ownership.
     Kernel(nt_user_host::provider_kernel_activation::KernelProviderWaitCapture),
 }
@@ -99,6 +101,7 @@ impl nt_user_host::provider_kernel_wait::KernelProviderWaitContinuation for Comp
         match self {
             Self::Kernel(capture) => Some(*capture),
             Self::Hosted(_) => None,
+            Self::RootIngress(_) => None,
         }
     }
 }
@@ -108,6 +111,7 @@ impl ComponentNativeContinuation {
         match self {
             Self::Hosted(hosted) => Some(hosted),
             Self::Kernel(_) => None,
+            Self::RootIngress(_) => None,
         }
     }
 
@@ -115,6 +119,7 @@ impl ComponentNativeContinuation {
         match self {
             Self::Hosted(hosted) => Some(hosted),
             Self::Kernel(_) => None,
+            Self::RootIngress(_) => None,
         }
     }
 }
