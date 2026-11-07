@@ -5,7 +5,8 @@ use nt_io_manager::detached_file_irp::{
     ExternalFileIrpBuffers, ExternalFileIrpCancelPhase, ExternalFileIrpCancelReturn,
     ExternalFileIrpCompletionInvocation, ExternalFileIrpCompletionReturn,
     ExternalFileIrpCopyReturn, ExternalFileIrpDispatchPolicy, ExternalFileIrpOutputCapture,
-    ExternalFileIrpRequest, ExternalFileIrpResult, ExternalFileIrpReturn, ExternalFileIrpTerminal,
+    ExternalFileIrpNoEntryReceipt, ExternalFileIrpOutcome, ExternalFileIrpRequest,
+    ExternalFileIrpResult, ExternalFileIrpReturn, ExternalFileIrpTerminal,
     ExternalFileIrpTerminalReceipt, PreparedExternalFileIrp, RetainedExternalFileIrp,
 };
 
@@ -23,6 +24,7 @@ enum Flight {
 
 enum Payload {
     Prepared(PreparedExternalFileIrp),
+    NoEntry(ExternalFileIrpNoEntryReceipt),
     Returned(ExternalFileIrpReturn),
     Retained(RetainedExternalFileIrp),
     Completion(ExternalFileIrpCompletionInvocation),
@@ -654,6 +656,32 @@ fn retry_later(id: u64, payload: Payload, status: nt_status::NtStatus) {
     row(id).retry_after = monotonic_time_100ns().saturating_add(1_000_000);
 }
 
+/// A definitive transport refusal owns its original preparation until the canonical failure
+/// completion is published. Retrying this step never enters a backend or repeats the dispatch.
+fn retry_no_entry(id: u64) -> Result<(), nt_status::NtStatus> {
+    if row(id).flight != Flight::Idle {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    let receipt = match row(id).payload.take() {
+        Some(Payload::NoEntry(receipt)) => receipt,
+        other => {
+            row(id).payload = other;
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+    };
+    match io_manager_mut().complete_external_file_irp_not_entered(receipt) {
+        Ok(retained) => {
+            keep(id, Payload::Retained(retained));
+            Ok(())
+        }
+        Err(rejection) => {
+            let (status, receipt) = rejection.into_parts();
+            retry_later(id, Payload::NoEntry(receipt), status);
+            Err(status)
+        }
+    }
+}
+
 fn discard(id: u64, prepared: PreparedExternalFileIrp) -> Result<(), nt_status::NtStatus> {
     match io_manager_mut().discard_prepared_external_file_irp(prepared) {
         Ok(buffers) => {
@@ -930,15 +958,6 @@ pub(super) fn redrive_queued_read(irp_id: IrpId) -> QueuedReadRedriveOutcome {
         row(id).blocked_status = Some(status);
         return QueuedReadRedriveOutcome::Retained(status);
     }
-    if !live_route(id)
-        && intent.cancel != nt_io_manager::detached_file_irp::ExternalFileIrpCancelPhase::Queued
-    {
-        // Activation gate: physical route loss needs a proof-bearing no-entry completion.
-        let status = nt_status::NtStatus::DEVICE_NOT_CONNECTED;
-        row(id).flight = Flight::Blocked;
-        row(id).blocked_status = Some(status);
-        return QueuedReadRedriveOutcome::Retained(status);
-    }
     let prepared = match row(id).payload.take() {
         Some(Payload::Prepared(prepared)) => prepared,
         other => {
@@ -994,10 +1013,18 @@ pub(super) fn redrive_queued_read(irp_id: IrpId) -> QueuedReadRedriveOutcome {
     phase.identity = Some(nt_hosted_runtime::HostedFileRpcIdentity {
         irp_id: irp_id.raw(), major: major::IRP_MJ_READ,
     });
-    phase.invoked = crate::disk_census_ticks();
-    let returned = hosted_file_dispatch::invoke(
-        invocation, row(id).caller, ExternalFileIrpDispatchPolicy::File.output_capture(),
-    );
+    let returned = if !live_route(id) {
+        // begin_prepared_external_file_irp transferred the exact manager owner, but the
+        // captured native authority/generation is no longer live. No provider has entered.
+        invocation.returned(ExternalFileIrpOutcome::NotEntered {
+            status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+        })
+    } else {
+        phase.invoked = crate::disk_census_ticks();
+        hosted_file_dispatch::invoke(
+            invocation, row(id).caller, ExternalFileIrpDispatchPolicy::File.output_capture(),
+        )
+    };
     phase.returned = crate::disk_census_ticks();
     phase.pump_ticks = row(id).phase_pump_ticks;
     phase.bank_ticks = row(id).phase_bank_ticks;
@@ -1009,10 +1036,19 @@ pub(super) fn redrive_queued_read(irp_id: IrpId) -> QueuedReadRedriveOutcome {
             return QueuedReadRedriveOutcome::Retained(status);
         }
     };
+    let result = match result.into_no_entry_receipt() {
+        Ok(receipt) => {
+            keep(id, Payload::NoEntry(receipt));
+            return match retry_no_entry(id) {
+                Ok(()) => QueuedReadRedriveOutcome::Progressed,
+                Err(status) => QueuedReadRedriveOutcome::Retained(status),
+            };
+        }
+        Err(result) => result,
+    };
     match result {
         ExternalFileIrpResult::NotEntered { status, prepared } => {
-            // The transport proved no entry, but an already parked caller still needs a
-            // canonical terminal. Retain the preparation until the no-entry receipt exists.
+            // An invalid success-shaped refusal has no terminal authority; retain it.
             block(id, Payload::Prepared(prepared), status);
             QueuedReadRedriveOutcome::Retained(status)
         }
@@ -1083,6 +1119,10 @@ fn ensure_completion(id: u64) -> Result<(), nt_status::NtStatus> {
                     Err(status)
                 }
             }
+        }
+        Payload::NoEntry(receipt) => {
+            row(id).payload = Some(Payload::NoEntry(receipt));
+            Err(nt_status::NtStatus::DEVICE_BUSY)
         }
         payload @ (Payload::Terminal(_) | Payload::Completion(_) | Payload::Copy(_)
             | Payload::Acknowledgement(_)) => {
@@ -1477,16 +1517,15 @@ pub(super) fn drain() -> usize {
         else {
             continue;
         };
-        entry.work_ready = intent.cancel == ExternalFileIrpCancelPhase::Queued
+        entry.work_ready = matches!(entry.payload, Some(Payload::NoEntry(_)))
+            || intent.cancel == ExternalFileIrpCancelPhase::Queued
             && matches!(entry.payload, Some(Payload::Retained(_)))
             || intent.abandoned && io_manager_mut().completed_irp(irp_id).is_some();
         if !entry.work_ready
             && entry.retry_after != 0
             && entry.retry_after <= now
-            && matches!(
-                entry.payload,
-                Some(Payload::Copy(_) | Payload::Acknowledgement(_))
-            )
+            && matches!(entry.payload, Some(Payload::Copy(_)
+                | Payload::Acknowledgement(_) | Payload::NoEntry(_)))
         {
             // Transfer a due retry to its delivery owner once, rather than rearming
             // an overdue timer while that owner is waiting for the outer loop.
@@ -1522,7 +1561,9 @@ pub(super) fn drain() -> usize {
         else {
             continue;
         };
-        if intent.abandoned && io_manager_mut().completed_irp(irp_id).is_some() {
+        if matches!(row(*id).payload.as_ref(), Some(Payload::NoEntry(_))) {
+            progress += usize::from(retry_no_entry(*id).is_ok());
+        } else if intent.abandoned && io_manager_mut().completed_irp(irp_id).is_some() {
             progress += usize::from(acknowledge(irp_id).is_ok());
         } else if intent.cancel == ExternalFileIrpCancelPhase::Queued {
             progress += usize::from(cancel_queued(*id));

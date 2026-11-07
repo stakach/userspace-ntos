@@ -54,3 +54,37 @@ fn queued_terminal_delivery_does_not_issue_an_extra_backend_ack() {
     assert!(!terminal.contains("hosted_file_dispatch::acknowledge"));
     assert!(completion.contains("retire_external_file_irp_completion_without_backend(completion)"));
 }
+
+#[test]
+fn queued_transport_no_entry_keeps_its_receipt_until_terminal_publication() {
+    let redrive = OWNERS
+        .split_once("pub(super) fn redrive_queued_read(")
+        .expect("queued READ redrive")
+        .1
+        .split_once("pub(super) fn contains(")
+        .expect("redrive boundary")
+        .0;
+    assert!(redrive.contains("into_no_entry_receipt()"));
+    assert!(redrive.contains("Payload::NoEntry(receipt)"));
+    let retry = OWNERS.split_once("fn retry_no_entry(").expect("no-entry retry").1
+        .split_once("fn discard(").expect("retry boundary").0;
+    assert!(retry.contains("complete_external_file_irp_not_entered(receipt)"));
+    assert!(retry.contains("retry_later(id, Payload::NoEntry(receipt), status)"));
+}
+
+#[test]
+fn invalid_physical_route_proves_no_entry_after_manager_begin() {
+    let redrive = OWNERS
+        .split_once("pub(super) fn redrive_queued_read(")
+        .expect("queued READ redrive")
+        .1
+        .split_once("pub(super) fn contains(")
+        .expect("redrive boundary")
+        .0;
+    let begin = redrive.find("begin_prepared_external_file_irp(prepared)").expect("manager begin");
+    let physical = redrive[begin..].find("if !live_route(id)").expect("physical recheck") + begin;
+    let no_entry = redrive[physical..].find("ExternalFileIrpOutcome::NotEntered")
+        .expect("native no-entry proof") + physical;
+    let invoke = redrive.find("hosted_file_dispatch::invoke").expect("provider invoke");
+    assert!(begin < physical && physical < no_entry && no_entry < invoke);
+}
