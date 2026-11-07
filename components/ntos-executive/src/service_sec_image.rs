@@ -3990,9 +3990,13 @@ pub(crate) unsafe fn finish_preparked_file_target_dispatch(
         pending.reply_required = true;
         pending.native_call_transport = native_call_transport;
     }
-    file_dispatch_handoff::before_post_action(
+    let handoff = file_dispatch_handoff::before_post_action(
         handler, ExecPostAction::None, native_call_transport, resume_ip, sp, flags,
-    ).is_some()
+    );
+    if handoff.inline_retirement_needs_redrive() {
+        inline_file_retirement::redrive(handler);
+    }
+    file_dispatch_handoff::finish_after_inline_retirement(handler, handoff).is_some()
 }
 
 fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
@@ -14559,8 +14563,14 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 }
-                published_file_io = file_dispatch_handoff::before_post_action(
+                let handoff = file_dispatch_handoff::before_post_action(
                     &mut nt_handler, post_action, native_call_transport, resume_ip, sp, flags,
+                );
+                if handoff.inline_retirement_needs_redrive() {
+                    inline_file_retirement::redrive(&mut nt_handler);
+                }
+                published_file_io = file_dispatch_handoff::finish_after_inline_retirement(
+                    &mut nt_handler, handoff,
                 );
                 let post_action_process = match post_action {
                     ExecPostAction::TerminateProcess { process_index, .. } => Some(process_index),

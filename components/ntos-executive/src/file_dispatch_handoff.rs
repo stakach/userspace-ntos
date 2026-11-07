@@ -33,6 +33,19 @@ impl PublishedFileIo {
     }
 }
 
+#[must_use = "finish the handoff to release its transfer event and settle terminating File ownership"]
+pub(super) struct EventLocalFileHandoff {
+    published: Option<PublishedFileIo>,
+    inline_retirement_needs_redrive: bool,
+    terminating: bool,
+}
+
+impl EventLocalFileHandoff {
+    pub(super) fn inline_retirement_needs_redrive(&self) -> bool {
+        self.inline_retirement_needs_redrive
+    }
+}
+
 pub(super) unsafe fn before_post_action(
     nt_handler: &mut ExecNtHandler,
     action: ExecPostAction,
@@ -40,7 +53,7 @@ pub(super) unsafe fn before_post_action(
     resume_ip: u64,
     sp: u64,
     flags: u64,
-) -> Option<PublishedFileIo> {
+) -> EventLocalFileHandoff {
     // NtContinue does not dispatch File I/O. Its context/reply replacement must not cross an
     // unrelated staged File operation, even when the context application is later refused.
     if matches!(action, ExecPostAction::ContinueCurrentThread { .. }) {
@@ -131,18 +144,27 @@ pub(super) unsafe fn before_post_action(
         None
     };
 
-    if let Some(identity) = nt_handler.current_synchronous_file.take() {
+    let inline_retirement_needs_redrive = if let Some(identity) = nt_handler.current_synchronous_file.take() {
         // No accepted pending IRP exists: inline completion (including dispatch refusal) has
         // already settled the operation. Retire its existing Busy/reference before any exit.
         inline_file_retirement::retire(identity);
-        inline_file_retirement::redrive(nt_handler);
-    }
+        true
+    } else {
+        false
+    };
+    EventLocalFileHandoff { published, inline_retirement_needs_redrive, terminating }
+}
+
+pub(super) unsafe fn finish_after_inline_retirement(
+    nt_handler: &mut ExecNtHandler,
+    handoff: EventLocalFileHandoff,
+) -> Option<PublishedFileIo> {
     nt_handler.release_current_transfer_event();
-    if let Some(owner) = published.as_ref().filter(|_| terminating) {
+    if let Some(owner) = handoff.published.as_ref().filter(|_| handoff.terminating) {
         // The current main Reply was never transferred. Post-action teardown deletes it; the
         // published File owner instead retains real cancellation/completion and Busy retirement.
         // CREATE deliberately continues through the existing specialized unpublished-handle path.
         nt_handler.abandon_new_file_io_exact(owner.identity, owner.irp_id);
     }
-    published
+    handoff.published
 }
