@@ -273,10 +273,49 @@ pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) {
     state
         .prepare(|| reconcile_runtime(handler))
         .expect("runtime timer ownership must permit blocking receive");
+    trace_iocp_receive_deadline();
     trace_registry_reply_receive();
     super::mounted_create_owner_trace::receive_boundary_snapshot();
     super::mounted_read_owner_trace::receive_boundary_snapshot();
     trace_retained_receive_owners();
+}
+
+/// A finite IOCP wait must retain a wake before the root blocks. Capture the
+/// selected physical shot when that wait's exact deadline changes; the regular
+/// timer trace has a small boot-wide budget that can expire before late startup.
+fn trace_iocp_receive_deadline() {
+    static LAST_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+    static PRINTS: AtomicU64 = AtomicU64::new(0);
+    let now = crate::nt_time_snapshot();
+    let waiters = unsafe { &*core::ptr::addr_of!(crate::IO_COMPLETION_WAITERS) };
+    let deadline = waiters.next_deadline(now);
+    let key = deadline.unwrap_or(u64::MAX);
+    if LAST_DEADLINE.swap(key, Ordering::Relaxed) == key || deadline.is_none() {
+        return;
+    }
+    let count = PRINTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if count > 128 { return; }
+    print_str(b"[iocp-receive] n/now/deadline/waiters=");
+    print_u64(count); print_str(b"/"); print_u64(now.monotonic_100ns);
+    print_str(b"/"); print_u64(key);
+    print_str(b"/"); print_u64(waiters.len() as u64);
+    print_str(b" timer-source/deadline/armed/irq/ticks=");
+    print_u64(LAST_REARM_SOURCE.load(Ordering::Relaxed)); print_str(b"/");
+    print_u64(LAST_REARM_DEADLINE.load(Ordering::Relaxed)); print_str(b"/");
+    print_u64(u64::from(LAST_REARM_AUTHORITY.is_armed())); print_str(b"/");
+    print_u64(DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire)); print_str(b"/");
+    print_u64(DELAY_TIMER_TICKS_PENDING.load(Ordering::Relaxed));
+    print_str(b" section/mounted-deadline=");
+    match crate::section_metadata_work::next_deadline() {
+        Some(deadline) => print_u64(deadline),
+        None => print_str(b"-"),
+    }
+    print_str(b"/");
+    match driver_launch::mounted_native_block_next_deadline(now.monotonic_100ns) {
+        Some(deadline) => print_u64(deadline),
+        None => print_str(b"-"),
+    }
+    print_str(b"\n");
 }
 
 /// Capture the first blocking receive after a hosted registry Reply transition.
