@@ -318,6 +318,52 @@ fn exact_pre_effect_refusal_reopens_only_its_own_park_attempt() {
 }
 
 #[test]
+fn acknowledged_child_after_positive_park_upgrades_parent_checkpoint() {
+    let mut child = Child::new(105);
+    let parent = new_parent();
+    let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }.unwrap();
+    let attempt = pass.begin_park(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe {
+        pass.acknowledge_park(
+            binding(), child.call.as_ref().unwrap(), attempt.after_positive_native_park(),
+        )
+    }.unwrap();
+    let settlement = child.settle();
+    pass.acknowledge_settlement(binding(), settlement).unwrap();
+    let permit = pass.begin_restore(&parent).unwrap();
+    assert!(permit.settlement().is_some());
+    assert!(!unsafe { permit.acknowledge_restore() }.parked_child());
+}
+
+#[test]
+fn settled_child_during_parent_restore_keeps_park_checkpoint_and_later_receipt_separate() {
+    let mut child = Child::new(115);
+    let parent = new_parent();
+    let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }.unwrap();
+    let attempt = pass.begin_park(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe {
+        pass.acknowledge_park(
+            binding(), child.call.as_ref().unwrap(), attempt.after_positive_native_park(),
+        )
+    }.unwrap();
+    let permit = pass.begin_restore(&parent).unwrap();
+    assert_eq!(
+        pass.settlement_disposition(binding(), child.call.as_ref().unwrap().admission_key()),
+        Ok((parent.identity(), RootIngressSettlementDisposition::RetainForResult)),
+    );
+    let (error, later) = pass.acknowledge_settlement(binding(), child.settle()).unwrap_err();
+    assert_eq!(error, PassError::InvalidPhase);
+    assert_eq!(later.admission_key(), permit.admission_key());
+    assert!(unsafe { permit.acknowledge_restore() }.parked_child());
+}
+
+#[test]
 fn foreign_parent_refusal_cannot_reopen_a_held_child() {
     let child = Child::new(95);
     let parent = new_parent();

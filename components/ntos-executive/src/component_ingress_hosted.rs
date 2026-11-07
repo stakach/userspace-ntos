@@ -614,6 +614,44 @@ pub(crate) unsafe fn restart_hosted(
     Ok(Ok(()))
 }
 
+/// Reject a wrong selected child before Reply send or checked Free can consume its physical
+/// authority. Ordinary hosted Calls have no RootIngress owner and keep their existing path.
+unsafe fn preflight_root_ingress_settlement(row: &HostedCall) -> Result<(), Error> {
+    let Some(root) = row.root_ingress.as_ref() else { return Ok(()) };
+    let call = row.call.as_ref().ok_or(Error::Admission)?;
+    let admission = call.admission_key();
+    if !row.delivered || row.released || row.completion.is_some()
+        || row.receive_settlement.is_some() || root.unconsumed_settlement.is_some()
+        || call.reply() != admission.reply() || call.executor() != row.binding.tcb
+        || call.message().badge() != row.binding.badge
+        || crate::service_sec_image::hosted_ingress_binding(row.binding.badge) != Some(row.binding)
+    {
+        return Err(Error::Admission);
+    }
+    let (parent_identity, disposition) = root.pass
+        .settlement_disposition(row.binding, admission)
+        .map_err(|_| Error::Admission)?;
+    if let Some(restored) = root.restored.as_ref() {
+        if root.parent.is_some()
+            || disposition != nt_user_host::root_ingress_pass::RootIngressSettlementDisposition::RetainForResult
+            || !restored.parked_child()
+            || restored.child() != row.binding
+            || restored.admission_key() != admission
+            || restored.parent() != parent_identity
+        {
+            return Err(Error::Admission);
+        }
+    } else {
+        let parent = root.parent.as_ref().ok_or(Error::Admission)?;
+        if parent.identity() != parent_identity
+            || !super::nested::root_ingress_parent_is_held(parent, admission)
+        {
+            return Err(Error::Admission);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) unsafe fn reply_hosted(reply: u64, info: u64, words: [u64; 4]) -> Result<(), Error> {
     let records = &mut *core::ptr::addr_of_mut!(CALLS);
     let index = records
@@ -633,6 +671,11 @@ pub(crate) unsafe fn reply_hosted(reply: u64, info: u64, words: [u64; 4]) -> Res
         if completion != Completion::Acknowledged {
             return Err(Error::Reply);
         }
+        if row.root_ingress.as_ref().is_some_and(|root| {
+            root.parent.is_some() && root.unconsumed_settlement.is_some()
+        }) {
+            return Err(Error::Retain);
+        }
         return Ok(());
     }
     if !row.delivered
@@ -640,6 +683,7 @@ pub(crate) unsafe fn reply_hosted(reply: u64, info: u64, words: [u64; 4]) -> Res
     {
         return Err(Error::PhysicalIdentity);
     }
+    preflight_root_ingress_settlement(row)?;
     if !row
         .call
         .as_ref()
@@ -686,6 +730,11 @@ pub(crate) unsafe fn finish_acknowledged_hosted_reply(reply: u64) -> Result<bool
         })
         .ok_or(Error::Reply)?;
     if row.completion == Some(Completion::Acknowledged) {
+        if row.root_ingress.as_ref().is_some_and(|root| {
+            root.parent.is_some() && root.unconsumed_settlement.is_some()
+        }) {
+            return Ok(false);
+        }
         return Ok(true);
     }
     if row.completion.is_some() {
@@ -703,9 +752,7 @@ pub(crate) unsafe fn finish_acknowledged_hosted_reply(reply: u64) -> Result<bool
 }
 
 unsafe fn finish_acknowledged(row: &mut HostedCall) -> Result<(), Error> {
-    if row.root_ingress.as_ref().is_some_and(|root| root.unconsumed_settlement.is_some()) {
-        return Err(Error::Retain);
-    }
+    preflight_root_ingress_settlement(row)?;
     let _saved = crate::ipc_message::SavedMessageBuffer::capture();
     let owner = owner();
     let (ready, _message, settlement) = owner
@@ -770,13 +817,21 @@ fn settle_root_ingress(
         root.unconsumed_settlement = Some(settlement);
         return Err(Error::Admission);
     }
-    if root.restored.is_some() {
-        root.unconsumed_settlement = Some(settlement);
-        return Ok(());
-    }
-    match root.pass.acknowledge_settlement(row.binding, settlement) {
-        Ok(()) => Ok(()),
-        Err((_, settlement)) => {
+    match root.pass.settlement_disposition(row.binding, settlement.admission_key()) {
+        Ok((_, nt_user_host::root_ingress_pass::RootIngressSettlementDisposition::Checkpoint)) => {
+            match root.pass.acknowledge_settlement(row.binding, settlement) {
+                Ok(()) => Ok(()),
+                Err((_, settlement)) => {
+                    root.unconsumed_settlement = Some(settlement);
+                    Err(Error::Admission)
+                }
+            }
+        }
+        Ok((_, nt_user_host::root_ingress_pass::RootIngressSettlementDisposition::RetainForResult)) => {
+            root.unconsumed_settlement = Some(settlement);
+            Ok(())
+        }
+        Err(_) => {
             root.unconsumed_settlement = Some(settlement);
             Err(Error::Admission)
         }

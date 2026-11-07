@@ -61,3 +61,25 @@ fn acknowledged_child_settlement_is_retained_by_root_pass_or_exact_future_owner(
     assert!(take.contains("root.pass.admission_key() == admission")
         && take.contains("root.unconsumed_settlement.take()"));
 }
+
+#[test]
+fn selected_child_is_preflighted_before_reply_send_and_checked_free() {
+    let reply = function("reply_hosted");
+    let preflight = function("preflight_root_ingress_settlement");
+    assert!(preflight.contains("call.admission_key()")
+        && preflight.contains("call.message().badge() != row.binding.badge")
+        && preflight.contains("root_ingress_parent_is_held")
+        && preflight.contains("restored.parent() != parent_identity"),
+        "preflight must bind the retained message and physical parent or restored receipt");
+    let gate = reply.find("preflight_root_ingress_settlement(row)").unwrap_or(usize::MAX);
+    let send = reply.find(".reply_owned(").unwrap();
+    assert!(gate < send, "selected child identity and settlement phase must be checked before send");
+    let finish = function("finish_acknowledged");
+    let gate = finish.find("preflight_root_ingress_settlement(row)").unwrap_or(usize::MAX);
+    let free = finish.find("finish_external_with_settlement").unwrap();
+    assert!(gate < free, "a wrong selected child must be refused before irreversible Free");
+    let reconcile = function("finish_acknowledged_hosted_reply");
+    assert!(reconcile.contains("root.unconsumed_settlement.is_some()")
+        && reconcile.contains("return Ok(false)"),
+        "a retained post-Free receipt cannot be reported as a new parent checkpoint");
+}

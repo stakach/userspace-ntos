@@ -18,6 +18,15 @@ pub enum PassError {
     Consumed,
 }
 
+/// Where a positively acknowledged and freed child Reply belongs at this exact phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootIngressSettlementDisposition {
+    /// The parent has not begun restoration; this receipt may become its checkpoint.
+    Checkpoint,
+    /// A positive park checkpoint already entered restoration; retain for the result owner.
+    RetainForResult,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
     Prepared,
@@ -234,22 +243,44 @@ impl<R: Copy + Eq> RootIngressPass<R> {
         Ok(())
     }
 
-    /// A positive Reply acknowledgement and checked Free produce this unforgeable settlement.
-    /// A rejected settlement is returned to its caller for retention.
+    /// Classify an exact positive Reply settlement before native send or checked Free.
+    pub fn settlement_disposition(
+        &self,
+        child: ThreadBinding<R>,
+        admission: ExternalAdmissionKey,
+    ) -> Result<(NestedExecutionIdentity, RootIngressSettlementDisposition), PassError> {
+        if child != self.child || admission != self.admission {
+            return Err(PassError::WrongChild);
+        }
+        let parent = self.parent.ok_or(PassError::Unbound)?;
+        let disposition = match self.phase {
+            Phase::Delivered | Phase::ParkEnteredUnknown => {
+                RootIngressSettlementDisposition::Checkpoint
+            }
+            Phase::Checkpointed if self.parked && self.settlement.is_none() => {
+                RootIngressSettlementDisposition::Checkpoint
+            }
+            Phase::RestoreEntered if self.parked && self.settlement.is_none() => {
+                RootIngressSettlementDisposition::RetainForResult
+            }
+            _ => return Err(PassError::InvalidPhase),
+        };
+        Ok((parent, disposition))
+    }
+
+    /// A positive Reply acknowledgement and checked Free can supersede an earlier positive
+    /// park checkpoint until parent restoration begins. A receipt after that stays native-owned.
     pub fn acknowledge_settlement(
         &mut self,
         child: ThreadBinding<R>,
         settlement: ExternalSettlement,
     ) -> Result<(), (PassError, ExternalSettlement)> {
-        let error = if child != self.child || settlement.admission_key() != self.admission {
-            Some(PassError::WrongChild)
-        } else if !matches!(self.phase, Phase::Delivered | Phase::ParkEnteredUnknown) {
-            Some(PassError::InvalidPhase)
-        } else {
-            None
-        };
-        if let Some(error) = error {
-            return Err((error, settlement));
+        match self.settlement_disposition(child, settlement.admission_key()) {
+            Ok((_, RootIngressSettlementDisposition::Checkpoint)) => {}
+            Ok((_, RootIngressSettlementDisposition::RetainForResult)) => {
+                return Err((PassError::InvalidPhase, settlement));
+            }
+            Err(error) => return Err((error, settlement)),
         }
         self.settlement = Some(settlement);
         self.phase = Phase::Checkpointed;
