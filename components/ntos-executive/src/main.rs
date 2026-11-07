@@ -3118,6 +3118,7 @@ const DELAY_TIMER_SOURCE_GDI_ROUTED_IMAGE: u64 = 28;
 const DELAY_TIMER_SOURCE_HOSTED_DYNAMIC_DELETE: u64 = 29;
 const DELAY_TIMER_SOURCE_HOSTED_PROVIDER_STARTUP_RESTORE: u64 = 30;
 const DELAY_TIMER_SOURCE_NESTED_ACQUIRE_ABORT: u64 = 31;
+const DELAY_TIMER_SOURCE_HOSTED_IRQ_RETRY: u64 = 33;
 const DELAY_TIMER_SOURCE_WIN32K_STARTUP_RESTORE: u64 = 32;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
@@ -17353,6 +17354,15 @@ unsafe fn delay_timer_program(deadline: u64, source: u64) -> bool {
         print_str(b"\n");
     }
     true
+}
+
+/// A retained component pump may block before the root handler can reconcile its timer owners.
+/// Program only this exact deferred level IRQ's published retry; the shared one-shot authority
+/// keeps an already earlier shot. Physical IRQ acknowledgment still belongs to the root drain.
+unsafe fn arm_hosted_irq_retry_before_nested_receive() {
+    if let Some(deadline) = driver_launch::hosted_irq_retry_next_deadline() {
+        let _ = delay_timer_program(deadline, DELAY_TIMER_SOURCE_HOSTED_IRQ_RETRY);
+    }
 }
 
 unsafe fn delay_timer_rearm(

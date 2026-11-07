@@ -109,5 +109,9 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
             driver_launch::hosted_dpc_next_deadline(now.monotonic_100ns),
             DELAY_TIMER_SOURCE_HOSTED_DPC,
         ),
+        (
+            driver_launch::hosted_irq_retry_next_deadline(),
+            DELAY_TIMER_SOURCE_HOSTED_IRQ_RETRY,
+        ),
     ])
 }

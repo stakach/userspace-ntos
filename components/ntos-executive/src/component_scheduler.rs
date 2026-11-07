@@ -84,6 +84,7 @@ impl ComponentSchedulerScope {
         let timer_work = crate::dispatcher_bootstrap::service_hosted_timer_work();
         clock.transition(SchedulerServicePhase::IrqDrain, crate::disk_census_ticks());
         let irq_lines = drain_pending_hosted_irqs_snapshot();
+        crate::arm_hosted_irq_retry_before_nested_receive();
         clock.transition(SchedulerServicePhase::DpcDrain, crate::disk_census_ticks());
         let dpcs = drain_hosted_driver_dpcs();
         clock.transition(SchedulerServicePhase::ReceivePrepare, crate::disk_census_ticks());

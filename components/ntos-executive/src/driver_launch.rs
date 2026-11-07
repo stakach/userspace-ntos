@@ -52088,6 +52088,10 @@ static mut HOSTED_IRQ_LINES: Option<Vec<HostedIrqLine>> = None;
 static mut HOSTED_IRQ_LANES: Option<Vec<HostedIrqLaneRuntime>> = None;
 static HOSTED_IRQ_LANE_GENERATION_NEXT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_IRQ_PENDING_EVENTS: AtomicU64 = AtomicU64::new(0);
+// A deferred level delivery cannot generate another physical notification until its exact
+// handler is acknowledged. Keep one timer deadline across scans until the next service attempt.
+static HOSTED_IRQ_RETRY_WAKE: nt_time::CoalescedRetryWake = nt_time::CoalescedRetryWake::new();
+const HOSTED_IRQ_RETRY_INTERVAL_100NS: u64 = 100_000;
 static HOSTED_IRQ_RETIRED_EVENT_BITS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_IRQ_NOTIFICATION_EPOCH: AtomicU64 = AtomicU64::new(0);
 static mut HOSTED_IRQ_EVENT_RETIREMENT_EPOCHS: [u64; crate::HOSTED_IRQ_EVENT_SLOT_COUNT as usize] =
@@ -58097,6 +58101,10 @@ pub(crate) fn hosted_irq_work_pending() -> bool {
     HOSTED_IRQ_PENDING_EVENTS.load(Ordering::Acquire) != 0
 }
 
+pub(crate) fn hosted_irq_retry_next_deadline() -> Option<u64> {
+    HOSTED_IRQ_RETRY_WAKE.next_deadline(hosted_irq_work_pending())
+}
+
 unsafe fn allocate_hosted_irq_event_bit() -> Option<u8> {
     let epoch = HOSTED_IRQ_NOTIFICATION_EPOCH.load(Ordering::Acquire);
     let retired = HOSTED_IRQ_RETIRED_EVENT_BITS.load(Ordering::Acquire);
@@ -59230,6 +59238,9 @@ unsafe fn drain_pending_hosted_irqs_snapshot() -> u64 {
     }
     if deferred != 0 {
         HOSTED_IRQ_PENDING_EVENTS.fetch_or(deferred, Ordering::AcqRel);
+        HOSTED_IRQ_RETRY_WAKE.publish(
+            crate::monotonic_time_100ns().saturating_add(HOSTED_IRQ_RETRY_INTERVAL_100NS),
+        );
     }
     serviced
 }
