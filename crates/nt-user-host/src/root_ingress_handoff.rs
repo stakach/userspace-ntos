@@ -48,6 +48,12 @@ pub enum RootIngressHandoffError {
     StaleReservation,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum RootIngressTransitionError<E> {
+    StaleTicket,
+    Refused(E),
+}
+
 enum Slot<B> {
     Reserved(u64),
     Held { generation: u64, key: RootIngressHandoffKey, bundle: B },
@@ -121,6 +127,30 @@ impl<B> RootIngressHandoffTable<B> {
                 if *generation == ticket.reservation.generation && *key == ticket.key => Some(bundle),
             _ => None,
         }
+    }
+
+    /// Run a serialized, move-only owner transition in its exact held row. A refusal must
+    /// return the original owner; the row is restored before the refusal reaches the caller.
+    pub fn transition_held<E>(
+        &mut self, ticket: RootIngressHandoffTicket,
+        transition: impl FnOnce(B) -> Result<B, (E, B)>,
+    ) -> Result<(), RootIngressTransitionError<E>> {
+        if self.get(ticket).is_none() {
+            return Err(RootIngressTransitionError::StaleTicket);
+        }
+        let Some(slot) = self.slots[ticket.reservation.slot].take() else {
+            return Err(RootIngressTransitionError::StaleTicket);
+        };
+        let Slot::Held { generation, key, bundle } = slot else {
+            self.slots[ticket.reservation.slot] = Some(slot);
+            return Err(RootIngressTransitionError::StaleTicket);
+        };
+        let (bundle, result) = match transition(bundle) {
+            Ok(next) => (next, Ok(())),
+            Err((error, original)) => (original, Err(RootIngressTransitionError::Refused(error))),
+        };
+        self.slots[ticket.reservation.slot] = Some(Slot::Held { generation, key, bundle });
+        result
     }
 
     /// Extract once for a checked transfer. A refused transfer must restore the same bundle.

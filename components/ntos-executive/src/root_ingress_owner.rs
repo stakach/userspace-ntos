@@ -19,14 +19,18 @@ pub(crate) struct RootReplyAuthority {
     binding: nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
 }
 
-pub(crate) struct Bundle {
-    pub(crate) taken: win32k_glue::TakenRootIngressDispatch,
-    authority: RootReplyAuthority,
-}
-
-impl Bundle {
-    #[allow(dead_code)]
-    pub(crate) fn authority(&self) -> &RootReplyAuthority { &self.authority }
+#[allow(dead_code)]
+pub(crate) enum Bundle {
+    Unbound {
+        taken: win32k_glue::TakenRootIngressDispatch,
+        authority: RootReplyAuthority,
+    },
+    BoundUnadmitted {
+        pending: win32k_glue::PendingRootIngressDispatch,
+        authority: RootReplyAuthority,
+        admission: nt_component_suspension::ExternalAdmissionKey,
+        parent: nt_component_suspension::NestedExecutionIdentity,
+    },
 }
 
 static mut OWNERS: RootIngressHandoffTable<Bundle> = RootIngressHandoffTable::new();
@@ -100,8 +104,63 @@ pub(crate) unsafe fn retain(
         return Err((taken, authority));
     };
     (&mut *core::ptr::addr_of_mut!(OWNERS))
-        .retain(reservation, key, Bundle { taken, authority })
-        .map_err(|(_, bundle)| (bundle.taken, bundle.authority))
+        .retain(reservation, key, Bundle::Unbound { taken, authority })
+        .map_err(|(_, bundle)| match bundle {
+            Bundle::Unbound { taken, authority } => (taken, authority),
+            Bundle::BoundUnadmitted { .. } => unreachable!("fresh retention is unbound"),
+        })
+}
+
+/// Memory-only one-shot bind. A refused bind returns the complete parent to this exact row;
+/// after a positive bind CALLS owns the parent and this row retains the saved pump and Reply
+/// authority for lane admission. No provider call or Reply park is allowed inside this step.
+#[allow(dead_code)]
+pub(crate) unsafe fn bind_prepared(
+    ticket: RootIngressHandoffTicket,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+) -> Result<(), crate::spawn_hosts::shared_ingress::owner::runtime::Error> {
+    use crate::spawn_hosts::shared_ingress::owner::runtime::Error;
+    let result = (&mut *core::ptr::addr_of_mut!(OWNERS)).transition_held(ticket, |bundle| {
+        let Bundle::Unbound { taken, authority } = bundle else {
+            return Err((Error::Admission, bundle));
+        };
+        let win32k_glue::TakenRootIngressDispatch { pending, parent } = taken;
+        let win32k_glue::RootIngressYield::ParkedUnbound { child, .. } = pending.yielded else {
+            return Err((Error::Admission, Bundle::Unbound {
+                taken: win32k_glue::TakenRootIngressDispatch { pending, parent }, authority,
+            }));
+        };
+        if ticket.key().parent() != parent.identity()
+            || ticket.key().child() != child
+            || ticket.key().root_reply() != authority.reply
+            || !root_reply_authority_is_live(&authority)
+        {
+            return Err((Error::Admission, Bundle::Unbound {
+                taken: win32k_glue::TakenRootIngressDispatch { pending, parent }, authority,
+            }));
+        }
+        let parent_identity = parent.identity();
+        let Some(snapshot) = crate::spawn_hosts::shared_ingress::owner::runtime
+            ::prepared_root_ingress_snapshot(child) else {
+            return Err((Error::Admission, Bundle::Unbound {
+                taken: win32k_glue::TakenRootIngressDispatch { pending, parent }, authority,
+            }));
+        };
+        match crate::spawn_hosts::shared_ingress::owner::runtime::bind_root_ingress_pass(
+            snapshot, parent, dispatch,
+        ) {
+            Ok(()) => Ok(Bundle::BoundUnadmitted {
+                pending, authority, admission: child, parent: parent_identity,
+            }),
+            Err((error, parent)) => Err((error, Bundle::Unbound {
+                taken: win32k_glue::TakenRootIngressDispatch { pending, parent }, authority,
+            })),
+        }
+    });
+    result.map_err(|error| match error {
+        nt_user_host::root_ingress_handoff::RootIngressTransitionError::StaleTicket => Error::Admission,
+        nt_user_host::root_ingress_handoff::RootIngressTransitionError::Refused(error) => error,
+    })
 }
 
 /// The exact ticket may lend its bundle to a later lane transfer. A refused transfer must

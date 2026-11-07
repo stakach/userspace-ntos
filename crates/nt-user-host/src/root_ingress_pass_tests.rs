@@ -488,3 +488,39 @@ fn root_ingress_handoff_refusal_returns_bundle_and_preserves_reserved_slot() {
     let fresh_ticket = foreign.retain(fresh, key, bundle).unwrap();
     assert_eq!(*foreign.take(fresh_ticket).unwrap(), 29);
 }
+
+#[test]
+fn root_ingress_handoff_transition_retains_exact_owner_on_refusal_and_moves_once() {
+    use crate::root_ingress_handoff::{RootIngressHandoffKey, RootIngressHandoffTable};
+    #[derive(Debug)]
+    enum Stage { Unbound(Box<u64>), Bound }
+    let child = Child::new(139);
+    let parent = new_parent();
+    let key = RootIngressHandoffKey::new(
+        parent.identity(), child.call.as_ref().unwrap().admission_key(), 903,
+    ).unwrap();
+    let mut table = RootIngressHandoffTable::new();
+    let reservation = table.reserve().unwrap();
+    let ticket = table.retain(reservation, key, Stage::Unbound(Box::new(31u64))).unwrap();
+    let mut foreign = RootIngressHandoffTable::new();
+    let foreign_reservation = foreign.reserve().unwrap();
+    let foreign_ticket = foreign.retain(foreign_reservation, key, Stage::Unbound(Box::new(37u64))).unwrap();
+    assert!(table.transition_held(foreign_ticket, |_| Ok::<_, ((), _)>(Stage::Bound)).is_err());
+    let retained = table.take(ticket).unwrap();
+    assert!(table.transition_held(ticket, |_| Ok::<_, ((), _)>(Stage::Bound)).is_err());
+    table.restore(ticket, retained).unwrap();
+    assert!(matches!(table.get(ticket), Some(Stage::Unbound(value)) if **value == 31));
+    assert!(table.transition_held(ticket, |owner| Err::<_, _>(((), owner))).is_err());
+    assert!(matches!(table.get(ticket), Some(Stage::Unbound(value)) if **value == 31));
+    table.transition_held(ticket, |owner| {
+        assert!(matches!(owner, Stage::Unbound(value) if *value == 31));
+        Ok::<_, ((), _)>(Stage::Bound)
+    }).unwrap();
+    assert!(matches!(table.get(ticket), Some(Stage::Bound)));
+    assert!(table.transition_held(ticket, |owner| {
+        assert!(matches!(owner, Stage::Bound));
+        Err::<Stage, _>(((), owner))
+    }).is_err());
+    assert!(matches!(table.get(ticket), Some(Stage::Bound)));
+    assert!(matches!(foreign.get(foreign_ticket), Some(Stage::Unbound(value)) if **value == 37));
+}
