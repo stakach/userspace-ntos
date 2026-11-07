@@ -185,6 +185,28 @@ fn already_free_main_reply_can_rotate_to_a_new_hosted_call() {
 }
 
 #[test]
+fn hosted_import_refusal_clears_only_exact_new_reply_or_retains_its_effect() {
+    let (mut table, original_main, reserved_main) = two_replies();
+    let _reservation = table.reserve(original_main, reserved_main).unwrap();
+    let incoming = table.insert_used(30).unwrap();
+    assert_eq!(
+        table.replace_main_after_free_observation(reserved_main, incoming),
+        Err(RootReplyReplacementError::ReservedReply)
+    );
+    assert_eq!(table.clear(incoming, Some(reserved_main)), Ok(()));
+    assert_eq!(table.state(reserved_main), Ok(RootReplySlotState::Reserved));
+    assert_eq!(table.find_cap(30), None);
+
+    let incoming = table.insert_used(30).unwrap();
+    assert_eq!(
+        table.clear(incoming, Some(incoming)),
+        Err(RootReplyReplacementError::ActiveReply)
+    );
+    assert_eq!(table.state(incoming), Ok(RootReplySlotState::Used));
+    assert_eq!(table.state(reserved_main), Ok(RootReplySlotState::Reserved));
+}
+
+#[test]
 fn hosted_main_rotation_checks_both_slots_before_releasing_old_main() {
     let (mut table, old_main, spare) = two_replies();
     assert_eq!(

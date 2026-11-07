@@ -46,3 +46,29 @@ fn exact_selected_child_retains_full_message_and_seals_before_import_effect() {
     assert!(!generic.contains("take_selected_root_hosted_with"),
         "the selected adapter remains dormant until the outer handoff is reviewed");
 }
+
+#[test]
+fn shared_reply_import_distinguishes_clean_refusal_from_retained_pool_effect() {
+    let import = function(ORDINARY, "install_hosted_reply");
+    assert!(import.contains("enum HostedReplyImport") || ORDINARY.contains("enum HostedReplyImport"));
+    assert!(import.contains("HostedReplyImport::RefusedNoEffect"));
+    assert!(import.contains("HostedReplyImport::Retained"));
+    assert!(import.contains("HostedReplyImport::Imported"));
+    let insert = import.find("wait_reply_pool_insert_cap(reply, true)").unwrap();
+    let publish = import.find("REPLY_MAIN_SLOT.store(reply, Ordering::Relaxed)").unwrap();
+    assert!(insert < publish && import.contains("rollback_hosted_reply_import("));
+    let rollback = function(ORDINARY, "rollback_hosted_reply_import");
+    assert!(rollback.contains("pool.clear(new_identity, old_identity)")
+        && rollback.contains("Err(_) => HostedReplyImport::Retained"));
+    let ordinary = function(ORDINARY, "receive");
+    assert!(ordinary.contains("install_hosted_reply(reply)"));
+    assert!(ordinary.contains("runtime::take_hosted_with"));
+    assert!(ordinary.contains("ReceiveOutcome::Message(materialize(message))"));
+    assert!(ordinary.contains("HostedReplyImport::Retained"));
+    let hosted = function(HOSTED, "take_hosted_with");
+    assert!(hosted.find("if !import(reply, &message)").unwrap()
+        < hosted.find("row.delivered = true").unwrap());
+    let selected = function(HOSTED, "take_selected_root_hosted_with");
+    assert!(selected.find("if !import(reply, &message)").unwrap()
+        < selected.find("row.delivered = true").unwrap());
+}

@@ -39,6 +39,86 @@ unsafe fn materialize(message: ReceivedMessage) -> (u64, u64, u64, u64, u64, u64
     (message.badge(), message.info(), r0, r1, r2, r3)
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HostedReplyImport {
+    Imported,
+    RefusedNoEffect,
+    /// A cap reached the pool but exact rollback could not be established.
+    Retained,
+}
+
+/// Roll back only the exact cap inserted by this import. A failed clear is an owned effect,
+/// never evidence that the incoming Call may be retried with another Reply slot.
+unsafe fn rollback_hosted_reply_import(
+    new_index: usize,
+    reply: u64,
+    old_main: u64,
+) -> HostedReplyImport {
+    if REPLY_MAIN_SLOT.load(Ordering::Relaxed) != old_main {
+        return HostedReplyImport::Retained;
+    }
+    let pool = wait_reply_pool_mut();
+    let Some(new_identity) = pool.at(new_index) else {
+        return HostedReplyImport::Retained;
+    };
+    if new_identity.cap() != reply {
+        return HostedReplyImport::Retained;
+    }
+    let old_identity = if old_main == 0 {
+        None
+    } else {
+        let Some(identity) = pool.find_cap(old_main) else {
+            return HostedReplyImport::Retained;
+        };
+        Some(identity)
+    };
+    match pool.clear(new_identity, old_identity) {
+        Ok(()) => HostedReplyImport::RefusedNoEffect,
+        Err(_) => HostedReplyImport::Retained,
+    }
+}
+
+/// Install the Reply before the hosted row is marked delivered. The caller retains its full
+/// ReceivedMessage and CALLS row on either refusal; only exact rollback proves no pool effect.
+unsafe fn install_hosted_reply(reply: u64) -> HostedReplyImport {
+    let reply_cptr = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    if wait_reply_pool_find_cap(reply).is_some() {
+        return HostedReplyImport::RefusedNoEffect;
+    }
+    let old_index = if reply_cptr == 0 {
+        None
+    } else {
+        let Some(index) = wait_reply_pool_find_cap(reply_cptr) else {
+            return HostedReplyImport::RefusedNoEffect;
+        };
+        Some(index)
+    };
+    let _durable = crate::allocator::enter_durable();
+    let Some(new_index) = wait_reply_pool_insert_cap(reply, true) else {
+        return HostedReplyImport::RefusedNoEffect;
+    };
+    if REPLY_MAIN_SLOT.load(Ordering::Relaxed) != reply_cptr {
+        return rollback_hosted_reply_import(new_index, reply, reply_cptr);
+    }
+    if let Some(old_index) = old_index {
+        let pool = wait_reply_pool_mut();
+        let Some(new_identity) = pool.at(new_index) else {
+            return HostedReplyImport::Retained;
+        };
+        if new_identity.cap() != reply {
+            return HostedReplyImport::Retained;
+        }
+        let Some(old_identity) = pool.at(old_index) else {
+            return rollback_hosted_reply_import(new_index, reply, reply_cptr);
+        };
+        if pool.replace_main_after_free_observation(old_identity, new_identity).is_err() {
+            return rollback_hosted_reply_import(new_index, reply, reply_cptr);
+        }
+    }
+    REPLY_MAIN_SLOT.store(reply, Ordering::Relaxed);
+    HostedReplyImport::Imported
+}
+
 /// This runs only at a root event boundary. Nested pumps enqueue hosted Calls without touching
 /// REPLY_MAIN_SLOT, which may still be the Reply of their outer blocked syscall.
 pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
@@ -82,59 +162,28 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
                 return ReceiveOutcome::RetainedFailure;
             }
         }
+        let mut import_outcome = HostedReplyImport::RefusedNoEffect;
         let delivered = match runtime::take_hosted_with(|reply, _message| {
             if !runtime::receive_child_delivery_allowed(reply) {
                 return false;
             }
-            // The pre-delivery sweep may have recycled the previous acknowledged root Reply.
-            let reply_cptr = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-            if wait_reply_pool_find_cap(reply).is_some() {
-                return false;
-            }
-            let old_index = if reply_cptr == 0 {
-                None
-            } else {
-                let Some(index) = wait_reply_pool_find_cap(reply_cptr) else {
-                    return false;
-                };
-                Some(index)
-            };
-            // Allocation and admission precede the ownership transfer. Failure leaves the full
-            // incoming Call in the ingress queue and the old root Reply unchanged.
-            let _durable = crate::allocator::enter_durable();
-            let Some(new_index) = wait_reply_pool_insert_cap(reply, true) else {
-                return false;
-            };
-            if REPLY_MAIN_SLOT.load(Ordering::Relaxed) != reply_cptr {
-                if let Some(new_identity) = wait_reply_pool_mut().at(new_index) {
-                    let _ = wait_reply_pool_mut().clear(new_identity, None);
-                }
-                return false;
-            }
-            if let Some(old_index) = old_index {
-                let pool = wait_reply_pool_mut();
-                let Some(new_identity) = pool.at(new_index) else { return false; };
-                if new_identity.cap() != reply { return false; }
-                let Some(old_identity) = pool.at(old_index) else {
-                    let _ = pool.clear(new_identity, None);
-                    return false;
-                };
-                if pool.replace_main_after_free_observation(old_identity, new_identity).is_err() {
-                    let _ = pool.clear(new_identity, Some(old_identity));
-                    return false;
-                }
-            }
-            REPLY_MAIN_SLOT.store(reply, Ordering::Relaxed);
-            true
+            import_outcome = install_hosted_reply(reply);
+            import_outcome == HostedReplyImport::Imported
         }) {
             Ok(delivered) => delivered,
             Err(_) => {
+                if import_outcome == HostedReplyImport::Retained {
+                    print_str(b"[ingress-receive-error] Reply pool import retained\n");
+                }
                 // The hosted ingress row still owns the exact Call and Reply. Do not
                 // admit another receive until that owner can be reconciled.
                 print_str(b"[ingress-receive-error] hosted handoff retained\n");
                 return ReceiveOutcome::RetainedFailure;
             }
         };
+        if import_outcome == HostedReplyImport::Retained {
+            return ReceiveOutcome::RetainedFailure;
+        }
         if let Some((_reply, message)) = delivered {
             return ReceiveOutcome::Message(materialize(message));
         }
