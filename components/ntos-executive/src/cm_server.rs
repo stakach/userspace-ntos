@@ -10,7 +10,6 @@ use crate::*;
 
 use alloc::rc::Rc;
 use core::num::NonZeroU32;
-use core::sync::atomic::{AtomicU64, Ordering};
 use nt_config_abi::{hive_mutation_commit_disposition, hive_mutation_commit_operation,
     mutation_begin, opcode, CmHiveMutationCommitReply, CmHiveMutationCommitRequest};
 use nt_config_server::{CmServer, CmIdentitySource};
@@ -18,13 +17,12 @@ use surt_sel4::surt_core::surt_abi::{SurtCqe, SurtSqe};
 use surt_sel4::surt_core::{Consumer, Producer};
 use surt_sel4::{drain_blocking, Sel4Notify};
 
-static SYSTEM_WRITER_OWNER_TRACES: AtomicU64 = AtomicU64::new(0);
-
 /// BEGIN names its request generation; ACK names its validated outcome receipt generation.
-fn trace_system_writer_owner(server: &CmServer, phase: &[u8], identity: u64) {
-    if SYSTEM_WRITER_OWNER_TRACES.fetch_add(1, Ordering::Relaxed) >= 512 {
+fn trace_system_writer_owner(server: &CmServer, phase: &[u8], identity: u64, trace_count: &mut u64) {
+    if *trace_count >= 512 {
         return;
     }
+    *trace_count += 1;
     let owner = server.system_mutation_busy_diagnostic();
     print_str(b"[cm-writer-owner] phase/generation/prepared/checkpoint/offset/length/outcome/lease/uploaded/total=");
     print_str(phase);
@@ -64,6 +62,8 @@ pub unsafe extern "C" fn cm_server_entry(launch_context: u64) -> ! {
     let identities = Rc::new(CmIdentitySource::new(incarnation));
     let mut server = CmServer::new_with_identity_source(identities);
 
+    // This service's shared executable image is read-only; its trace budget is private stack state.
+    let mut writer_trace_count = 0;
     let _ = drain_blocking(&mut submissions, &wait_requests, |sqe: &SurtSqe| {
         // SAFETY: single request in flight; the ring push/pop orders the client's
         // write to the request frame before this read.
@@ -86,7 +86,7 @@ pub unsafe extern "C" fn cm_server_entry(launch_context: u64) -> ! {
                 if reply.information as usize >= size {
                     if let Some(result) = mutation_begin::Reply::from_bytes(&out_buf[..size]) {
                         if result.outcome_status == nt_status::NtStatus::DEVICE_BUSY.raw() as i32 {
-                            trace_system_writer_owner(&server, b"begin-busy", request.request_generation);
+                            trace_system_writer_owner(&server, b"begin-busy", request.request_generation, &mut writer_trace_count);
                         }
                     }
                 }
@@ -96,7 +96,7 @@ pub unsafe extern "C" fn cm_server_entry(launch_context: u64) -> ! {
                 if reply.information as usize >= size {
                     if let Some(result) = CmHiveMutationCommitReply::from_bytes(&out_buf[..size]) {
                         if result.disposition == hive_mutation_commit_disposition::ACKNOWLEDGED {
-                            trace_system_writer_owner(&server, b"outcome-ack", request.receipt_generation);
+                            trace_system_writer_owner(&server, b"outcome-ack", request.receipt_generation, &mut writer_trace_count);
                         }
                     }
                 }
