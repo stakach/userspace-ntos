@@ -186,6 +186,24 @@ class BootProgressWatchdogTests(unittest.TestCase):
         self.assertIsNone(watchdog.idle_reason(349))
         self.assertIsNotNone(watchdog.idle_reason(350))
 
+    def test_unique_successful_install_pipe_open_is_finite_progress(self):
+        watchdog = self.watchdog()
+        opened = (
+            b'[pnp-install-pipe] stage=provider-result pi=22 generation=19 '
+            b'status=0x0x00000000 name="\\??\\pipe\\PNP_Device_Install_Pipe_0.'
+            b'{01D83B47-1730-444D-B08D-317F68C8205E}"\n'
+        )
+        failed = opened.replace(b'0x0x00000000', b'0x0xc0000034')
+        malformed = opened.replace(b'01D83B47-1730-444D-B08D-317F68C8205E', b'not-a-guid')
+        self.assertEqual(watchdog.observe_serial(failed + malformed, 100), [])
+        self.assertEqual(
+            watchdog.observe_serial(opened, 170),
+            ['install-pipe-open:22:19:01D83B47-1730-444D-B08D-317F68C8205E'],
+        )
+        self.assertEqual(watchdog.observe_serial(opened, 300), [])
+        self.assertIsNone(watchdog.idle_reason(349))
+        self.assertIsNotNone(watchdog.idle_reason(350))
+
     def test_unique_successful_file_backed_font_map_refreshes_boot_progress(self):
         # KVM 42063049874 completed 29 file-backed font maps while the old
         # watchdog exhausted two disk graces and stopped a progressing guest.

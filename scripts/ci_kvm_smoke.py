@@ -73,6 +73,13 @@ FONT_BROKER_RETURN = re.compile(
     rb"(?: start-tsc=[0-9]+ end-tsc=[0-9]+)?"
 )
 DESKTOP_SWITCH_PREFIX = b"[win32k-desktop-switch] pi/ret/"
+INSTALL_PIPE_OPEN = re.compile(
+    rb'\[pnp-install-pipe\] stage=provider-result pi=([1-9][0-9]*) '
+    rb'generation=([1-9][0-9]*) status=0x0x00000000 '
+    rb'name="\\\?\?\\pipe\\PNP_Device_Install_Pipe_0\.\{'
+    rb'([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-'
+    rb'[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\}"'
+)
 # QMP block statistics are sampled every ten seconds. A change observed after
 # more than two missed samples cannot prove when its disk work actually ran.
 RECENT_DISK_SAMPLE_SECONDS = 30
@@ -134,6 +141,12 @@ class BootProgressWatchdog:
             elif match := HOSTED_PROCESS_ALLOCATED.fullmatch(line):
                 key = ("process:" + match.group(1).decode("ascii") + ":"
                        + match.group(2).decode("ascii", "replace"))
+            elif match := INSTALL_PIPE_OPEN.fullmatch(line):
+                # One successful open per exact child/generation/pipe is real install progress.
+                # It does not imply payload transfer or device installation completed.
+                key = ("install-pipe-open:" + match.group(1).decode("ascii") + ":"
+                       + match.group(2).decode("ascii") + ":"
+                       + match.group(3).decode("ascii"))
             elif line.startswith(DESKTOP_SWITCH_PREFIX):
                 fields = line.partition(b"=")[2].split(b"/")
                 if len(fields) >= 3:
