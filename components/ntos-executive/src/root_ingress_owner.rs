@@ -29,6 +29,24 @@ pub(crate) enum Bundle {
     UnwindPrepared(UnwindRootIngress),
     RestoredProof(RestoredRouteProof),
     RestoredCancelled(RestoredRouteOwner),
+    UnwindReceiveEntering(RestoredRouteOwner),
+    UnwindReceiveReturnedRaw {
+        owner: RestoredRouteOwner,
+        pump: crate::spawn_hosts::PumpResult,
+    },
+    UnwindReceiveClassifying {
+        owner: RestoredRouteOwner,
+        pump: crate::spawn_hosts::PumpResult,
+    },
+    UnwindReceiveReturnedTyped {
+        owner: RestoredRouteOwner,
+        result: win32k_glue::RootIngressUnwindPumpCompletion,
+    },
+    UnwindReceiveQuarantined {
+        owner: RestoredRouteOwner,
+        pump: Option<crate::spawn_hosts::PumpResult>,
+        status: u32,
+    },
     BoundUnadmitted(BoundRootIngress),
     AdmittedUnparked(AdmittedRootIngress),
     Parked(AdmittedRootIngress),
@@ -77,6 +95,10 @@ pub(crate) struct AdmittedRootIngress {
 }
 
 static mut OWNERS: RootIngressHandoffTable<Bundle> = RootIngressHandoffTable::new();
+// These single-slot emergency owners are reserved before entry. They retain a returned native
+// result if an impossible stale-row refusal occurs after an effect; no replay is permitted.
+static mut UNWIND_RAW_FALLBACK: Option<(RootIngressHandoffTicket, crate::spawn_hosts::PumpResult)> = None;
+static mut UNWIND_TYPED_FALLBACK: Option<(RootIngressHandoffTicket, win32k_glue::RootIngressUnwindPumpCompletion)> = None;
 
 /// Capture before taking the selected pending slot. The child's Reply is separate from this
 /// delivered parent's Reply; a numeric match without pool generation and TCB binding is refused.
@@ -165,7 +187,12 @@ pub(crate) unsafe fn retain(
         .map_err(|(_, bundle)| match bundle {
             Bundle::Unbound { taken, authority, .. } => (taken, authority),
             Bundle::UnwindPrepared(_) | Bundle::RestoredProof(_)
-                | Bundle::RestoredCancelled(_) | Bundle::BoundUnadmitted(_)
+                | Bundle::RestoredCancelled(_) | Bundle::UnwindReceiveEntering(_)
+                | Bundle::UnwindReceiveReturnedRaw { .. }
+                | Bundle::UnwindReceiveClassifying { .. }
+                | Bundle::UnwindReceiveReturnedTyped { .. }
+                | Bundle::UnwindReceiveQuarantined { .. }
+                | Bundle::BoundUnadmitted(_)
                 | Bundle::AdmittedUnparked(_) | Bundle::Parked(_) =>
                 unreachable!("fresh retention is unbound"),
         })
@@ -424,6 +451,118 @@ pub(crate) unsafe fn unwind_unbound_route_refusal(
     } else {
         Err(Error::Admission)
     }
+}
+
+/// Continue the physically restored parent's saved receive half once. The child was cancelled
+/// before delivery, so no RootIngress lane frame or child Reply may be used by this path.
+/// Every native effect starts only after Entering is durable. A returned raw pump is retained
+/// before the effectful output classifier, and only a complete typed result is actionable.
+#[allow(dead_code)]
+pub(crate) unsafe fn continue_restored_cancelled_root_ingress(
+    ticket: RootIngressHandoffTicket,
+) -> Result<(), crate::spawn_hosts::shared_ingress::owner::runtime::Error> {
+    use crate::spawn_hosts::shared_ingress::owner::runtime::Error;
+    if (&*core::ptr::addr_of!(UNWIND_RAW_FALLBACK)).is_some()
+        || (&*core::ptr::addr_of!(UNWIND_TYPED_FALLBACK)).is_some()
+    {
+        return Err(Error::Admission);
+    }
+    let entered = (&mut *core::ptr::addr_of_mut!(OWNERS)).transition_held(ticket, |bundle| {
+        let Bundle::RestoredCancelled(owner) = bundle else {
+            return Err((Error::Admission, bundle));
+        };
+        let win32k_glue::RootIngressYield::ParkedUnbound {
+            ticket: parent_ticket, child, owner: yield_owner, ..
+        } =
+            owner.pending.yielded else {
+            return Err((Error::Admission, Bundle::RestoredCancelled(owner)));
+        };
+        if ticket.key().parent() != owner.parent || ticket.key().child() != owner.admission
+            || ticket.key().root_reply() != owner.authority.reply
+            || parent_ticket.identity() != owner.parent || child != owner.admission
+            || yield_owner.dispatch_id != owner.pending.snapshot.dispatch.dispatch_id
+            || owner.pending.snapshot.callback_token.is_some()
+            || owner.pending.snapshot.pump.reply_cap == 0
+            || !root_reply_authority_is_live(&owner.authority)
+        {
+            return Err((Error::Admission, Bundle::RestoredCancelled(owner)));
+        }
+        Ok(Bundle::UnwindReceiveEntering(owner))
+    });
+    if entered.is_err() { return Err(Error::Admission); }
+    let (pending, parent) = match (&*core::ptr::addr_of!(OWNERS)).get(ticket) {
+        Some(Bundle::UnwindReceiveEntering(owner)) => (owner.pending, owner.parent),
+        _ => return Err(Error::Admission),
+    };
+    let returned = win32k_glue::resume_root_ingress_after_unwind_receive(pending, parent);
+    let pump = match returned {
+        Ok(pump) => pump,
+        Err(status) => {
+            let _ = (&mut *core::ptr::addr_of_mut!(OWNERS)).transition_held(ticket, |bundle| {
+                let Bundle::UnwindReceiveEntering(owner) = bundle else {
+                    return Err((Error::Admission, bundle));
+                };
+                Ok(Bundle::UnwindReceiveQuarantined { owner, pump: None, status })
+            });
+            return Err(Error::Admission);
+        }
+    };
+    // A stale-row refusal cannot discard a returned receive: the fallback owns its full bank.
+    core::ptr::write(core::ptr::addr_of_mut!(UNWIND_RAW_FALLBACK), Some((ticket, pump)));
+    let raw_stored = (&mut *core::ptr::addr_of_mut!(OWNERS)).transition_held(ticket, |bundle| {
+        let Bundle::UnwindReceiveEntering(owner) = bundle else {
+            return Err((Error::Admission, bundle));
+        };
+        let Some((held_ticket, pump)) = core::ptr::replace(
+            core::ptr::addr_of_mut!(UNWIND_RAW_FALLBACK), None,
+        ) else { return Err((Error::Admission, Bundle::UnwindReceiveEntering(owner))) };
+        if held_ticket != ticket {
+            core::ptr::write(core::ptr::addr_of_mut!(UNWIND_RAW_FALLBACK), Some((held_ticket, pump)));
+            return Err((Error::Admission, Bundle::UnwindReceiveEntering(owner)));
+        }
+        Ok(Bundle::UnwindReceiveReturnedRaw { owner, pump })
+    });
+    if raw_stored.is_err() { return Err(Error::Admission); }
+    let classifying = (&mut *core::ptr::addr_of_mut!(OWNERS)).transition_held(ticket, |bundle| {
+        let Bundle::UnwindReceiveReturnedRaw { owner, pump } = bundle else {
+            return Err((Error::Admission, bundle));
+        };
+        Ok(Bundle::UnwindReceiveClassifying { owner, pump })
+    });
+    if classifying.is_err() { return Err(Error::Admission); }
+    let snapshot = match (&*core::ptr::addr_of!(OWNERS)).get(ticket) {
+        Some(Bundle::UnwindReceiveClassifying { owner, .. }) => owner.pending.snapshot,
+        _ => return Err(Error::Admission),
+    };
+    let classified = win32k_glue::classify_root_ingress_unwind_result(snapshot, pump);
+    let result = match classified {
+        Ok(result) => result,
+        Err(status) => {
+            let _ = (&mut *core::ptr::addr_of_mut!(OWNERS)).transition_held(ticket, |bundle| {
+                let Bundle::UnwindReceiveClassifying { owner, pump } = bundle else {
+                    return Err((Error::Admission, bundle));
+                };
+                Ok(Bundle::UnwindReceiveQuarantined { owner, pump: Some(pump), status })
+            });
+            return Err(Error::Admission);
+        }
+    };
+    core::ptr::write(core::ptr::addr_of_mut!(UNWIND_TYPED_FALLBACK), Some((ticket, result)));
+    let typed_stored = (&mut *core::ptr::addr_of_mut!(OWNERS)).transition_held(ticket, |bundle| {
+        let Bundle::UnwindReceiveClassifying { owner, pump: raw } = bundle else {
+            return Err((Error::Admission, bundle));
+        };
+        let Some((held_ticket, result)) = core::ptr::replace(
+            core::ptr::addr_of_mut!(UNWIND_TYPED_FALLBACK), None,
+        ) else { return Err((Error::Admission, Bundle::UnwindReceiveClassifying { owner, pump: raw })) };
+        if held_ticket != ticket {
+            core::ptr::write(core::ptr::addr_of_mut!(UNWIND_TYPED_FALLBACK), Some((held_ticket, result)));
+            return Err((Error::Admission, Bundle::UnwindReceiveClassifying { owner, pump: raw }));
+        }
+        Ok(Bundle::UnwindReceiveReturnedTyped { owner, result })
+    });
+    if typed_stored.is_err() { return Err(Error::Admission); }
+    Ok(())
 }
 
 /// Admit the exact bound child once. A pure lane refusal returns its continuation before any

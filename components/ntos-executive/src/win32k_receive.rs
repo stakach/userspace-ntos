@@ -132,6 +132,14 @@ pub(crate) enum RootMaintenancePumpCompletion {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) enum RootIngressUnwindPumpCompletion {
+    Restored(ProviderWaitPumpCompletion),
+    ReceiveReparked(PendingReceiveDispatch),
+    ServiceReparked(PendingServiceWaitDispatch),
+    MaintenanceReparked(PendingRootMaintenanceDispatch),
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum NestedRestorePumpCompletion {
     Restored(ProviderWaitPumpCompletion),
     NestedReparked(PendingNestedRestoreDispatch),
@@ -899,6 +907,50 @@ pub(crate) unsafe fn root_maintenance_continuation_is_current(
     }))
 }
 
+/// A route-refusal unwind restored the original physical parent and cancelled the undelivered
+/// child. Only that original Win32k receive half may run; no RootIngress frame was admitted.
+pub(crate) unsafe fn root_ingress_unwind_continuation_is_current(
+    channel: &crate::spawn_hosts::PumpChannel,
+    yielded: RootIngressYield,
+    parent: nt_component_suspension::NestedExecutionIdentity,
+    reply: u64,
+    expected_dispatch_id: u64,
+) -> bool {
+    let RootIngressYield::ParkedUnbound { ticket, child, owner, .. } = yielded else {
+        return false;
+    };
+    let route = parent.route();
+    let dispatch = parent.dispatch();
+    let lane = dispatch.lane();
+    if channel.caps.kind != crate::spawn_hosts::ReqKind::Syscall
+        || !channel.caps.hosted_receive_yield
+        || channel.kernel_caller.is_some()
+        || ticket.identity() != parent
+        || child.reply() == reply
+        || expected_dispatch_id == 0 || owner.dispatch_id != expected_dispatch_id
+        || !channel.initial_root_dispatch.is_some_and(|initial| {
+            initial.route() == route && initial.dispatch() == dispatch
+                && initial.tcb() == channel.tcb && initial.reply() == reply
+        })
+        || runtime::channel_route(channel).ok().flatten() != Some(route)
+        || runtime::dispatch(route).ok() != Some(dispatch)
+        || runtime::current_reply(route).ok() != Some(reply)
+        || !runtime::physical_source(route).is_ok_and(|source| {
+            source.tcb == channel.tcb && source.pml4 == channel.pml4
+        })
+    {
+        return false;
+    }
+    let lanes = &*core::ptr::addr_of!(crate::service_sec_image::COMPONENT_SUSPENSIONS);
+    lanes.running() == Some(lane)
+        && lanes.active_dispatch_identity(lane).ok().flatten() == Some(dispatch)
+        && lanes.binding(lane).is_ok_and(|binding| {
+            binding.executor_id == channel.tcb
+                && binding.receive_endpoint == channel.fault_ep
+                && binding.reply_object == reply
+        })
+}
+
 /// Resume only the receive half after the exact maintenance owner restored its physical hold.
 /// A refusal here is retained by that owner; it is never a completed provider or syscall result.
 pub(crate) unsafe fn resume_suspended_root_maintenance_component(
@@ -1008,6 +1060,78 @@ unsafe fn classify_returned_win32k_pump(
         )
     };
     Ok(completion)
+}
+
+/// Classify an entered root-unwind receive exactly once. Unsupported nested/root/scheduler
+/// yields remain in the caller's raw owner for quarantine, never a fabricated Failed result.
+pub(crate) unsafe fn classify_root_ingress_unwind_result(
+    snapshot: SuspendedPumpSnapshot,
+    pump: crate::spawn_hosts::PumpResult,
+) -> Result<RootIngressUnwindPumpCompletion, u32> {
+    if pump.root_ingress_yield.is_some() || pump.nested_restore_yield.is_some()
+        || pump.nested_restore_quarantined.is_some() || pump.scheduler_yielded
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    if let Some(yielded) = pump.maintenance_yield {
+        return Ok(RootIngressUnwindPumpCompletion::MaintenanceReparked(PendingRootMaintenanceDispatch {
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, callback_token: None,
+                shared_resume: capture_shared_resume_snapshot(snapshot.dispatch, snapshot.client),
+                ..snapshot
+            },
+        }));
+    }
+    if let Some(yielded) = pump.receive_yield {
+        return Ok(RootIngressUnwindPumpCompletion::ReceiveReparked(PendingReceiveDispatch {
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, callback_token: None, shared_resume: yielded.shared_resume, ..snapshot
+            },
+        }));
+    }
+    if let Some(yielded) = pump.service_wait_yield {
+        return Ok(RootIngressUnwindPumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, callback_token: None,
+                shared_resume: capture_shared_resume_snapshot(snapshot.dispatch, snapshot.client),
+                ..snapshot
+            },
+        }));
+    }
+    classify_returned_win32k_pump(snapshot, pump).map(RootIngressUnwindPumpCompletion::Restored)
+}
+
+/// The parent has been physically restored and its undelivered child cancelled. Restore the
+/// saved client window, then enter only the existing receive half; the owner records Entering
+/// before calling this function and retains every returned outcome.
+pub(crate) unsafe fn resume_root_ingress_after_unwind_receive(
+    pending: PendingRootIngressDispatch,
+    parent: nt_component_suspension::NestedExecutionIdentity,
+) -> Result<crate::spawn_hosts::PumpResult, u32> {
+    if !root_ingress_unwind_continuation_is_current(
+        &pending.snapshot.channel, pending.yielded, parent, pending.snapshot.pump.reply_cap,
+        pending.snapshot.dispatch.dispatch_id,
+    ) {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    if !select_win32k_client_window(pending.snapshot.client)
+        || !restore_shared_resume_snapshot(
+            pending.snapshot.shared_resume, pending.snapshot.dispatch, pending.snapshot.client,
+        )
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    let previous = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), pending.snapshot.dispatch);
+    let result = crate::spawn_hosts::component_pump_continue_root_ingress_after_unwind(
+        &pending.snapshot.channel, &pending.snapshot.pump, parent,
+        pending.snapshot.dispatch.dispatch_id,
+    );
+    core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous);
+    result
 }
 
 pub(crate) unsafe fn resume_suspended_receive_component(

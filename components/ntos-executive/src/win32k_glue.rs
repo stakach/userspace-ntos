@@ -17,10 +17,13 @@ mod lane_diagnostics;
 pub(crate) use receive::{prepare_receive_yield, prepare_root_ingress_yield, prepare_service_wait_yield,
     prepare_root_maintenance_yield,
     root_maintenance_continuation_is_current,
+    root_ingress_unwind_continuation_is_current,
     resume_suspended_receive_component, receive_continuation_is_current,
     resume_suspended_service_wait_component, service_wait_continuation_is_current,
     trace_receive_phase, ReceiveFaultCapture, ReceivePumpCompletion, ServiceWaitPumpCompletion,
     RootMaintenancePumpCompletion, resume_suspended_root_maintenance_component,
+    RootIngressUnwindPumpCompletion, classify_root_ingress_unwind_result,
+    resume_root_ingress_after_unwind_receive,
     resume_suspended_nested_restore_receive, NestedRestorePumpCompletion,
     settle_nested_restore_result};
 pub(crate) use pending_dispatch::{

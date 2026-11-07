@@ -2516,6 +2516,30 @@ pub(crate) unsafe fn component_pump_continue_root_maintenance(
     component_pump_continue_receive_half(ch, previous, false, false, false)
 }
 
+/// Continue only the original Win32k receive after a selected child was restored undelivered.
+/// A refused SEH lease is an error retained by the owner, never a synthetic guest exception.
+pub(crate) unsafe fn component_pump_continue_root_ingress_after_unwind(
+    ch: &PumpChannel,
+    previous: &PumpResult,
+    parent: nt_component_suspension::NestedExecutionIdentity,
+    expected_dispatch_id: u64,
+) -> Result<PumpResult, u32> {
+    let current = previous.root_ingress_yield.is_some_and(|yielded|
+        crate::win32k_glue::root_ingress_unwind_continuation_is_current(
+            ch, yielded, parent, previous.reply_cap, expected_dispatch_id,
+        ));
+    if !current || previous.reply_cap == 0 || previous.reply_cap != ch.reply_cap
+        || previous.completed || previous.callback_suspended
+        || previous.provider_wait_suspended || previous.lpc_wait_suspended
+        || previous.receive_yield.is_some() || previous.service_wait_yield.is_some()
+        || previous.maintenance_yield.is_some() || previous.nested_restore_yield.is_some()
+        || previous.nested_restore_quarantined.is_some() || previous.scheduler_yielded
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    component_pump_continue_receive_half(ch, previous, false, false, true)
+}
+
 /// The parent restore and receive continuation are separate acknowledged effects. A refused
 /// receive preflight must never cause another physical release attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
