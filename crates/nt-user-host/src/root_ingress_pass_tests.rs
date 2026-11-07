@@ -1,4 +1,5 @@
 use super::*;
+use alloc::boxed::Box;
 use crate::process_identity::{ProcessGeneration, ProcessIdentity};
 use crate::thread_binding::ThreadBinding;
 use nt_component_suspension::{
@@ -416,4 +417,52 @@ fn foreign_parent_refusal_cannot_reopen_a_held_child() {
     drop(foreign);
     let no_effect = unsafe { attempt.after_no_effect_native_refusal() };
     pass.abort_park_before_effect(binding(), child.call.as_ref().unwrap(), no_effect).unwrap();
+}
+
+#[test]
+fn root_ingress_handoff_keeps_exact_move_only_bundle_across_wrong_ticket_and_retry() {
+    use crate::root_ingress_handoff::{RootIngressHandoffKey, RootIngressHandoffTable};
+    let child = Child::new(127);
+    let parent = new_parent();
+    let key = RootIngressHandoffKey::new(
+        parent.identity(), child.call.as_ref().unwrap().admission_key(), 901,
+    ).unwrap();
+    let mut table = RootIngressHandoffTable::new();
+    let reservation = table.reserve().unwrap();
+    let ticket = table.retain(reservation, key, Box::new(17u64)).unwrap();
+    let mut foreign = RootIngressHandoffTable::new();
+    let foreign_reservation = foreign.reserve().unwrap();
+    let foreign_ticket = foreign.retain(foreign_reservation, key, Box::new(19u64)).unwrap();
+    assert!(table.take(foreign_ticket).is_none());
+    let bundle = table.take(ticket).unwrap();
+    assert!(table.take(ticket).is_none());
+    let bundle = table.restore(foreign_ticket, bundle).unwrap_err();
+    table.restore(ticket, bundle).unwrap();
+    assert_eq!(*table.take(ticket).unwrap(), 17);
+    assert_eq!(*foreign.take(foreign_ticket).unwrap(), 19);
+}
+
+#[test]
+fn root_ingress_handoff_refusal_returns_bundle_and_preserves_reserved_slot() {
+    use crate::root_ingress_handoff::{RootIngressHandoffKey, RootIngressHandoffTable};
+    let child = Child::new(137);
+    let parent = new_parent();
+    let key = RootIngressHandoffKey::new(
+        parent.identity(), child.call.as_ref().unwrap().admission_key(), 902,
+    ).unwrap();
+    let mut table = RootIngressHandoffTable::new();
+    let reservation = table.reserve().unwrap();
+    let mut foreign = RootIngressHandoffTable::<Box<u64>>::new();
+    let foreign_reservation = foreign.reserve().unwrap();
+    let (_, bundle) = table.retain(foreign_reservation, key, Box::new(23)).unwrap_err();
+    let ticket = table.retain(reservation, key, bundle).unwrap();
+    assert_eq!(*table.take(ticket).unwrap(), 23);
+
+    let stale = foreign_reservation;
+    assert!(foreign.cancel_reservation(stale));
+    let fresh = foreign.reserve().unwrap();
+    assert_ne!(stale, fresh);
+    let (_, bundle) = foreign.retain(stale, key, Box::new(29)).unwrap_err();
+    let fresh_ticket = foreign.retain(fresh, key, bundle).unwrap();
+    assert_eq!(*foreign.take(fresh_ticket).unwrap(), 29);
 }

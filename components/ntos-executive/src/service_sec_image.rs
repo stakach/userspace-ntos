@@ -17,6 +17,8 @@ use component_continuation::{HostedContinuationDestination, HostedNativeContinua
 pub(crate) use component_continuation::{ComponentNativeContinuation, ComponentSuspensionCompletion};
 #[path = "root_maintenance_owner.rs"]
 pub(crate) mod root_maintenance_owner;
+#[path = "root_ingress_owner.rs"]
+pub(crate) mod root_ingress_owner;
 #[path = "nested_restore_owner.rs"]
 pub(crate) mod nested_restore_owner;
 
