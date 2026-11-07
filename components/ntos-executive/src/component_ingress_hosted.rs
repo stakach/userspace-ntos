@@ -1620,7 +1620,8 @@ pub(crate) unsafe fn take_outer_boundary() -> Result<Option<ReceiveSettlementBou
 }
 
 /// Stop one retained physical Call. The semantic process layout may already be retired, so
-/// authenticate its immutable admission key against the Reply still bound to the exact TCB.
+/// Authenticate its immutable admission key. A new Stop also requires the Reply still bound
+/// to the exact TCB; a prior acknowledged Stop carries its own proof after Suspend unlinks it.
 /// A refused query leaves the Call intact; an uncertain native Stop remains entered in the Call.
 unsafe fn stop_retained_hosted_call(
     reply: u64,

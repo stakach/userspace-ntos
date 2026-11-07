@@ -88,6 +88,7 @@ static USER_CALLBACK_CONTINUATION_UNWINDS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CONTINUATION_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_NESTED_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_NESTED_SSN_1298: AtomicU64 = AtomicU64::new(0);
+static WIN32K_WINDOW_EXTRA_INGRESS_TRACES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_NESTED_SSN_126B: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_SEQUENCE_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 /// Bitmask of client `pi`s whose callback-running thread has DIED (crash-park / critical
@@ -7279,6 +7280,18 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     dispatch_context_out: Option<&mut Option<nt_user_callback::DispatchContext>>,
 ) -> (u64, bool) {
     // Reject before attachment or shared request writes, not only at later lane acquisition.
+    if ssn == nt_user_callback::NTUSER_SET_WINDOW_LONG_PTR_SSN
+        && a1 < 64
+        && WIN32K_WINDOW_EXTRA_INGRESS_TRACES.fetch_add(1, Ordering::Relaxed) < 256
+    {
+        print_str(b"[win32k-window-extra] ingress pi/tid/hwnd/index/value=");
+        for value in [client.pi as u64, client.tid, a0, a1, a2] {
+            print_str(b"/");
+            print_hex((value >> 32) as u32);
+            print_hex(value as u32);
+        }
+        print_str(b"\n");
+    }
     if crate::component_execution_is_busy()
         || !win32k_client_context_is_admitted(client)
         || !callback_client_can_enter_nested(client)

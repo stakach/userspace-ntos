@@ -1367,6 +1367,7 @@ const BROADCAST_QUERY_DENY: u64 = 1_112_363_332;
 const WM_USER: u32 = 0x0400;
 const REGISTERED_MESSAGE_FIRST: u32 = 0xC000;
 static WIN32K_EXPLORER_SETWNDPROC_CLIENT_CALLS: AtomicU64 = AtomicU64::new(0);
+static WIN32K_WINDOW_EXTRA_PROVIDER_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_GDI_HANDLE_MISMATCH_TRACES: AtomicU64 = AtomicU64::new(0);
 
 /// THREADINFO->rpdesk offset (win32.h: W32THREAD prefix 0x50, then ptl@0x50, ppi@0x58,
@@ -18743,6 +18744,17 @@ unsafe fn dispatch_ssn(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         print_str(b"\n");
     }
     let ret = call(handler, args.as_ptr(), nargs);
+    if ssn == SSN_NT_USER_SET_WINDOW_LONG_PTR
+        && a1 < 64
+        && WIN32K_WINDOW_EXTRA_PROVIDER_TRACES.fetch_add(1, Ordering::Relaxed) < 256
+    {
+        print_str(b"[win32k-window-extra] provider pi/dispatch/hwnd/index/value/previous=");
+        for value in [request_client_pi, dispatch_id, a0, a1, a2, ret] {
+            print_str(b"/");
+            print_win32k_hex64(value);
+        }
+        print_str(b"\n");
+    }
     if ssn == SSN_NT_USER_SWITCH_DESKTOP {
         let target = (*core::ptr::addr_of!(OBJ_TABLE)).lookup_body(a0);
         let info = if target != 0 { read_volatile((target + 8) as *const u64) } else { 0 };
