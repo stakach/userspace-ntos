@@ -28,6 +28,9 @@ struct RootIngressOwner {
     undelivered: Option<nt_user_host::root_ingress_pass::UndeliveredRootIngress<crate::HostedThreadRole>>,
     /// Only a positive physical restore receipt clears the provider-selection exclusion.
     restored: Option<nt_user_host::root_ingress_pass::RootIngressRestored<crate::HostedThreadRole>>,
+    /// A positive Free receipt that could not be consumed by the pre-restore pass. The later
+    /// result owner may take it only under the same physical child and admission.
+    unconsumed_settlement: Option<nt_component_suspension::ExternalSettlement>,
 }
 
 /// Single-use outer-loop delivery. The parent row already retains the sealed settlement permit.
@@ -326,6 +329,99 @@ pub(crate) unsafe fn take_selected_root_hosted_with(
     Ok((reply, message))
 }
 
+/// Seal one selected child's park attempt before the caller enters RootReplyPark::try_commit.
+/// A refusal after this point retains the exact Call and pass; the attempt cannot be replayed.
+pub(crate) unsafe fn begin_root_ingress_reply_park(
+    snapshot: PendingSnapshot,
+    admission: ExternalAdmissionKey,
+    parent_identity: nt_component_suspension::NestedExecutionIdentity,
+) -> Result<u64, Error> {
+    let row = (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten()
+        .find(|row| row.binding == snapshot.binding
+            && row.call.as_ref().is_some_and(|call| {
+                call.reply() == snapshot.reply
+                    && call.admission_sequence() == snapshot.admission_sequence
+            }))
+        .ok_or(Error::Admission)?;
+    let call = row.call.as_ref().ok_or(Error::Admission)?;
+    let root = row.root_ingress.as_mut().ok_or(Error::Admission)?;
+    let parent = root.parent.as_ref().ok_or(Error::Admission)?;
+    if !row.delivered || row.released || row.completion.is_some()
+        || row.receive_settlement.is_some() || root.restored.is_some()
+        || root.unconsumed_settlement.is_some()
+        || root.undelivered.is_some() || root.undelivered_parent.is_some()
+        || row.binding.tcb != snapshot.executor
+        || call.admission_key() != admission
+        || call.message().badge() != row.binding.badge
+        || call.message().info() != snapshot.info
+        || call.message().registers() != snapshot.registers
+        || root.pass.child() != row.binding
+        || root.pass.admission_key() != admission
+        || parent.identity() != parent_identity
+        || !super::nested::root_ingress_parent_is_held(parent, admission)
+        || !call.can_park()
+        || crate::REPLY_MAIN_SLOT.load(Ordering::Relaxed) != call.reply()
+        || crate::service_sec_image::hosted_ingress_binding(row.binding.badge) != Some(row.binding)
+    {
+        return Err(Error::Admission);
+    }
+    let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+    if crate::spawn_hosts::query_component_reply_binding(row.binding.tcb, call.reply())
+        != Ok(ReplyBindingObservation::BoundToTarget)
+    {
+        return Err(Error::Reply);
+    }
+    root.pass.begin_park(row.binding, call).map_err(|_| Error::Admission)?;
+    Ok(call.reply())
+}
+
+/// Record only a positive physical RootReplyPark::try_commit result for the sealed child.
+///
+/// # Safety
+/// The caller must have just observed `Ok(())` from the one native park attempt for this
+/// exact child. The retained Reply remains in CALLS; this receipt does not settle it.
+pub(crate) unsafe fn acknowledge_root_ingress_reply_park(
+    snapshot: PendingSnapshot,
+    admission: ExternalAdmissionKey,
+    parent_identity: nt_component_suspension::NestedExecutionIdentity,
+) -> Result<(), Error> {
+    let row = (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten()
+        .find(|row| row.binding == snapshot.binding
+            && row.call.as_ref().is_some_and(|call| {
+                call.reply() == snapshot.reply
+                    && call.admission_sequence() == snapshot.admission_sequence
+            }))
+        .ok_or(Error::Admission)?;
+    let call = row.call.as_ref().ok_or(Error::Admission)?;
+    let root = row.root_ingress.as_mut().ok_or(Error::Admission)?;
+    let parent = root.parent.as_ref().ok_or(Error::Admission)?;
+    if !row.delivered || row.released || row.completion.is_some()
+        || row.receive_settlement.is_some() || root.restored.is_some()
+        || root.unconsumed_settlement.is_some()
+        || row.binding.tcb != snapshot.executor
+        || call.admission_key() != admission
+        || call.message().badge() != row.binding.badge
+        || call.message().info() != snapshot.info
+        || call.message().registers() != snapshot.registers
+        || root.pass.child() != row.binding
+        || root.pass.admission_key() != admission
+        || parent.identity() != parent_identity
+        || !super::nested::root_ingress_parent_is_held(parent, admission)
+        || !call.can_park()
+        || crate::REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
+        || crate::service_sec_image::hosted_ingress_binding(row.binding.badge) != Some(row.binding)
+    {
+        return Err(Error::Admission);
+    }
+    let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+    if crate::spawn_hosts::query_component_reply_binding(row.binding.tcb, call.reply())
+        != Ok(ReplyBindingObservation::BoundToTarget)
+    {
+        return Err(Error::Reply);
+    }
+    root.pass.acknowledge_park(row.binding, call).map_err(|_| Error::Admission)
+}
+
 /// Return an unexecuted root delivery to its existing physical ingress owner. No syscall has
 /// been admitted yet, so replay restores the original full message rather than captured argv.
 pub(crate) unsafe fn defer_hosted_delivery(reply: u64, badge: u64) -> Result<(), Error> {
@@ -559,6 +655,9 @@ pub(crate) unsafe fn finish_acknowledged_hosted_reply(reply: u64) -> Result<bool
 }
 
 unsafe fn finish_acknowledged(row: &mut HostedCall) -> Result<(), Error> {
+    if row.root_ingress.as_ref().is_some_and(|root| root.unconsumed_settlement.is_some()) {
+        return Err(Error::Retain);
+    }
     let _saved = crate::ipc_message::SavedMessageBuffer::capture();
     let owner = owner();
     let (ready, _message, settlement) = owner
@@ -571,7 +670,11 @@ unsafe fn finish_acknowledged(row: &mut HostedCall) -> Result<(), Error> {
         .map_err(|_| Error::Reply)?;
     row.recycled = Some(ready);
     row.completion = Some(Completion::Acknowledged);
-    settle_receive(row, settlement)?;
+    if row.root_ingress.is_some() {
+        settle_root_ingress(row, settlement)?;
+    } else {
+        settle_receive(row, settlement)?;
+    }
     let trace = row.receive_settlement.as_ref().and_then(|receive| {
         receive
             .parent
@@ -604,6 +707,58 @@ fn settle_receive(
             Err(Error::Admission)
         }
     }
+}
+
+fn settle_root_ingress(
+    row: &mut HostedCall,
+    settlement: nt_component_suspension::ExternalSettlement,
+) -> Result<(), Error> {
+    let root = row.root_ingress.as_mut().ok_or(Error::Admission)?;
+    // finish_acknowledged excludes a second receipt before the irreversible Free. This
+    // private helper has no other caller, so the slot remains available for this receipt.
+    if settlement.admission_key() != root.pass.admission_key()
+        || root.pass.child() != row.binding
+    {
+        root.unconsumed_settlement = Some(settlement);
+        return Err(Error::Admission);
+    }
+    if root.restored.is_some() {
+        root.unconsumed_settlement = Some(settlement);
+        return Ok(());
+    }
+    match root.pass.acknowledge_settlement(row.binding, settlement) {
+        Ok(()) => Ok(()),
+        Err((_, settlement)) => {
+            root.unconsumed_settlement = Some(settlement);
+            Err(Error::Admission)
+        }
+    }
+}
+
+/// Transfer a post-restoration Free receipt to the exact later result owner. This does not
+/// recreate the parent checkpoint or authorize another Reply send.
+pub(crate) unsafe fn take_root_ingress_settlement(
+    binding: Binding,
+    admission: ExternalAdmissionKey,
+) -> Option<nt_component_suspension::ExternalSettlement> {
+    let row = (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten()
+        .find(|row| row.binding == binding
+            && row.root_ingress.as_ref().is_some_and(|root| {
+                root.pass.admission_key() == admission
+            }))?;
+    let root = row.root_ingress.as_mut()?;
+    if root.restored.as_ref().is_none_or(|restored| {
+        restored.child() != binding || restored.admission_key() != admission
+            || !restored.parked_child()
+    }) || row.completion != Some(Completion::Acknowledged)
+        || row.recycled.as_ref().is_none_or(|ready| ready.reply() != admission.reply())
+        || root.unconsumed_settlement.as_ref().is_none_or(|settlement| {
+            settlement.admission_key() != admission
+        })
+    {
+        return None;
+    }
+    root.unconsumed_settlement.take()
 }
 
 fn receive_settlement_consumed(row: &HostedCall) -> bool {
@@ -708,6 +863,7 @@ pub(crate) unsafe fn prepare_root_ingress_pass(
     let admission = pass.admission_key();
     row.root_ingress = Some(RootIngressOwner {
         pass, parent: None, undelivered_parent: None, undelivered: None, restored: None,
+        unconsumed_settlement: None,
     });
     Ok(admission)
 }
