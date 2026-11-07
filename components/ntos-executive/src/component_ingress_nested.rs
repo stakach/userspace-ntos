@@ -2,7 +2,7 @@
 
 use super::*;
 use super::physical_hold::PhysicalExecutionHold;
-use nt_component_suspension::{NestedExecutionIdentity, NestedExecutionScope};
+use nt_component_suspension::{ExternalAdmissionKey, NestedExecutionIdentity, NestedExecutionScope};
 use nt_user_host::physical_execution_restore::RestoreStep;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use nt_time::CoalescedRetryWake;
@@ -18,6 +18,31 @@ pub(crate) struct ParkedParentHandle {
     index: usize,
     generation: u64,
     identity: NestedExecutionIdentity,
+}
+
+/// Issued only when this park attempt made no physical change, or its abort fully acknowledged.
+/// It names the exact prepared child and cannot be constructed outside this owner module.
+#[must_use = "consume only while cancelling the matching unbound root ingress pass"]
+pub(crate) struct NoEffectParkProof {
+    admission: ExternalAdmissionKey,
+}
+
+impl NoEffectParkProof {
+    pub(crate) fn admission_key(&self) -> ExternalAdmissionKey { self.admission }
+}
+
+pub(crate) enum RootParkOutcome {
+    NoRunningLane(NoEffectParkProof),
+    Parked(ParkedParentHandle),
+    RefusedNoEffect(Error, NoEffectParkProof),
+    Retained(Error),
+}
+
+enum ParkAttemptOutcome {
+    NoRunningLane,
+    Parked(ParkedParentHandle),
+    RefusedNoEffect(Error),
+    Retained(Error),
 }
 
 /// A copyable lookup key for a retained restore. The row still owns every physical effect.
@@ -79,6 +104,7 @@ pub(crate) unsafe fn with_receive_scope<T>(
 
 struct Parent {
     generation: u64,
+    root_admission: Option<ExternalAdmissionKey>,
     route: PeerRoute,
     dispatch: nt_component_suspension::LaneDispatchIdentity,
     /// The physical lane Reply observed before acquisition and sealed into the nested scope.
@@ -137,36 +163,80 @@ fn ticket_matches(ticket: NestedRestoreTicket, parent: &Parent) -> bool {
 }
 
 pub(crate) unsafe fn park_current() -> Result<Option<ParkedParentHandle>, Error> {
+    match park_current_attempt(None) {
+        ParkAttemptOutcome::NoRunningLane => Ok(None),
+        ParkAttemptOutcome::Parked(handle) => Ok(Some(handle)),
+        ParkAttemptOutcome::RefusedNoEffect(error) | ParkAttemptOutcome::Retained(error) => {
+            Err(error)
+        }
+    }
+}
+
+/// Root ingress receives a move-only proof only when the exact park attempt has no effects.
+/// A retained or uncertain attempt never grants cancellation of its prepared child owner.
+pub(crate) unsafe fn park_current_for_root(admission: ExternalAdmissionKey) -> RootParkOutcome {
+    match park_current_attempt(Some(admission)) {
+        ParkAttemptOutcome::NoRunningLane => {
+            RootParkOutcome::NoRunningLane(NoEffectParkProof { admission })
+        }
+        ParkAttemptOutcome::Parked(handle) => RootParkOutcome::Parked(handle),
+        ParkAttemptOutcome::RefusedNoEffect(error) => {
+            RootParkOutcome::RefusedNoEffect(error, NoEffectParkProof { admission })
+        }
+        ParkAttemptOutcome::Retained(error) => RootParkOutcome::Retained(error),
+    }
+}
+
+unsafe fn park_current_attempt(root_admission: Option<ExternalAdmissionKey>) -> ParkAttemptOutcome {
+    // A previous uncertain park remains keyed to this exact child even if the route changed.
+    // Never issue a new no-effect proof after a retained attempt for the same admission.
+    if root_admission.is_some() && (&*core::ptr::addr_of!(PARENTS)).iter().flatten()
+        .any(|parent| parent.root_admission == root_admission)
+    {
+        return ParkAttemptOutcome::Retained(Error::Admission);
+    }
     let Some(lane) = lanes().running() else {
-        return Ok(None);
+        return ParkAttemptOutcome::NoRunningLane;
     };
-    let route = lanes()
-        .peer_route(lane)
-        .map_err(|_| Error::Admission)?
-        .ok_or(Error::Admission)?;
-    let dispatch = dispatch(route)?;
-    let reply = current_reply(route)?;
+    let preflight = (|| -> Result<_, Error> {
+        let route = lanes()
+            .peer_route(lane)
+            .map_err(|_| Error::Admission)?
+            .ok_or(Error::Admission)?;
+        Ok((route, dispatch(route)?, current_reply(route)?))
+    })();
+    let (route, dispatch, reply) = match preflight {
+        Ok(values) => values,
+        Err(error) => return ParkAttemptOutcome::RefusedNoEffect(error),
+    };
     let rows = &mut *core::ptr::addr_of_mut!(PARENTS);
     // A retained uncertain hold fences its physical TCB even if its old route was retired.
     // A new route generation may not acquire that TCB through a second row.
     if rows.iter().flatten().any(|parent| {
         parent.route.identity().executor == route.identity().executor
     }) {
-        return Err(Error::Admission);
+        return ParkAttemptOutcome::Retained(Error::Admission);
     }
-    let index = if let Some(index) = rows.iter().position(Option::is_none) {
-        index
-    } else {
-        let _durable = crate::allocator::enter_durable();
-        rows.try_reserve(1).map_err(|_| Error::Capacity)?;
-        rows.push(None);
-        rows.len() - 1
+    let index = match rows.iter().position(Option::is_none) {
+        Some(index) => index,
+        None => {
+            let _durable = crate::allocator::enter_durable();
+            if rows.try_reserve(1).is_err() {
+                return ParkAttemptOutcome::RefusedNoEffect(Error::Capacity);
+            }
+            rows.push(None);
+            rows.len() - 1
+        }
     };
-    let generation = NEXT_PARENT_GENERATION.fetch_update(
+    let generation = match NEXT_PARENT_GENERATION.fetch_update(
         Ordering::AcqRel, Ordering::Acquire, |next| next.checked_add(1),
-    ).map_err(|_| Error::Capacity)?;
+    ) {
+        Ok(generation) => generation,
+        Err(_) => return ParkAttemptOutcome::RefusedNoEffect(Error::Capacity),
+    };
     rows[index] = Some(Parent {
         generation,
+        root_admission,
         route,
         dispatch,
         reply,
@@ -190,7 +260,11 @@ pub(crate) unsafe fn park_current() -> Result<Option<ParkedParentHandle>, Error>
             // visible as quarantine; never reissue acquire through another generation.
             rows[index].as_mut().expect("retained parent").phase = ParentPhase::Quarantined;
         }
-        return Err(error);
+        return if certified_no_effect {
+            ParkAttemptOutcome::RefusedNoEffect(error)
+        } else {
+            ParkAttemptOutcome::Retained(error)
+        };
     }
     let owner = owner();
     let scope = owner
@@ -208,22 +282,28 @@ pub(crate) unsafe fn park_current() -> Result<Option<ParkedParentHandle>, Error>
         Ok(scope) => scope,
         Err(_) => {
             let parent = rows[index].as_mut().expect("retained parent");
+            let mut abort_acknowledged = false;
             if parent.physical.begin_abort_after_failed_scope().is_ok() {
                 parent.phase = ParentPhase::AbortPending;
                 if attempt_abort(parent) {
                     rows[index] = None;
+                    abort_acknowledged = true;
                 }
             } else {
                 parent.phase = ParentPhase::Quarantined;
             }
-            return Err(Error::Admission);
+            return if abort_acknowledged {
+                ParkAttemptOutcome::RefusedNoEffect(Error::Admission)
+            } else {
+                ParkAttemptOutcome::Retained(Error::Admission)
+            };
         }
     };
     let identity = scope.identity();
     let parent = rows[index].as_mut().expect("retained parent");
     parent.scope = Some(scope);
     parent.phase = ParentPhase::Parked;
-    Ok(Some(ParkedParentHandle { index, generation, identity }))
+    ParkAttemptOutcome::Parked(ParkedParentHandle { index, generation, identity })
 }
 
 /// The exact parent row fences its executor until the physical release acknowledges. A failed

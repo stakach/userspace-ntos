@@ -647,6 +647,46 @@ pub(crate) unsafe fn prepare_root_ingress_pass(
     Ok(admission)
 }
 
+/// Discard only an unbound root preparation after nested ownership proves that its park attempt
+/// made no physical change (or fully acknowledged the abort). A wrong snapshot returns the
+/// move-only proof to its caller; an uncertain attempt cannot create this proof.
+pub(crate) unsafe fn cancel_unbound_root_ingress_pass(
+    snapshot: PendingSnapshot,
+    admission: nt_component_suspension::ExternalAdmissionKey,
+    proof: super::nested::NoEffectParkProof,
+) -> Result<(), (Error, super::nested::NoEffectParkProof)> {
+    if proof.admission_key() != admission {
+        return Err((Error::Admission, proof));
+    }
+    let row = (&mut *core::ptr::addr_of_mut!(CALLS))
+        .iter_mut()
+        .flatten()
+        .find(|row| {
+            row.binding == snapshot.binding
+                && row.call.as_ref().is_some_and(|call| {
+                    call.reply() == snapshot.reply
+                        && call.admission_sequence() == snapshot.admission_sequence
+                })
+        });
+    let Some(row) = row else { return Err((Error::Admission, proof)); };
+    let exact = row.call.as_ref().is_some_and(|call| {
+        call.admission_key() == admission
+            && call.message().info() == snapshot.info
+            && call.message().registers() == snapshot.registers
+            && call.can_park()
+    });
+    if !exact || row.delivered || row.released || row.completion.is_some()
+        || row.receive_settlement.is_some()
+        || row.root_ingress.as_ref().is_none_or(|root| {
+            root.parent.is_some() || root.pass.admission_key() != admission
+        })
+    {
+        return Err((Error::Admission, proof));
+    }
+    row.root_ingress = None;
+    Ok(())
+}
+
 /// Transfer the exact physical parent handle to the prepared child row after park acknowledges.
 /// On refusal, return the handle to the caller; the PARENTS row retains its physical hold.
 pub(crate) unsafe fn bind_root_ingress_pass(
