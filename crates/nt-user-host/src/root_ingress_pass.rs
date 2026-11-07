@@ -93,6 +93,10 @@ impl<R: Copy + Eq> RootIngressPass<R> {
         self.admission
     }
 
+    pub fn child(&self) -> ThreadBinding<R> {
+        self.child
+    }
+
     pub fn bind_parent(
         &mut self,
         scope: &NestedExecutionScope,

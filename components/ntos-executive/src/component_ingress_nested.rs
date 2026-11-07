@@ -115,6 +115,9 @@ struct Parent {
     child: Option<ParentChild>,
     receive_restore:
         Option<nt_user_host::receive_child_barrier::ReceiveRestorePermit<crate::HostedThreadRole>>,
+    root_ingress_restore:
+        Option<nt_user_host::root_ingress_pass::RootIngressRestorePermit<crate::HostedThreadRole>>,
+    root_lane_begun: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -137,6 +140,12 @@ enum ParentPhase {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ParentChild {
     Receive,
+    RootIngress,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RestoreOwner {
+    Ordinary,
     RootIngress,
 }
 
@@ -245,6 +254,8 @@ unsafe fn park_current_attempt(root_admission: Option<ExternalAdmissionKey>) -> 
         scope: None,
         child: None,
         receive_restore: None,
+        root_ingress_restore: None,
+        root_lane_begun: false,
     });
     let _saved = crate::ipc_message::SavedMessageBuffer::capture();
     // Suspend cancels IPC in the microkernel. Execution holds preserve the held Call, donated
@@ -463,9 +474,68 @@ pub(crate) unsafe fn with_receive_restore<T>(
     use_permit(scope, permit)
 }
 
-unsafe fn restore_stages(handle: &mut Option<ParkedParentHandle>) -> Result<(), Error> {
+/// Seal the child's one-shot checkpoint in the physical parent before changing the lane or
+/// entering restoration. A refused lane transition leaves both owners in their retained rows.
+pub(crate) unsafe fn begin_root_ingress_restore(
+    handle: &ParkedParentHandle,
+    pass: &mut nt_user_host::root_ingress_pass::RootIngressPass<crate::HostedThreadRole>,
+) -> Result<(), Error> {
+    use nt_component_suspension::SuspensionKey;
+    let parent = (&mut *core::ptr::addr_of_mut!(PARENTS))
+        .get_mut(handle.index).and_then(Option::as_mut).ok_or(Error::Admission)?;
+    if !row_matches(handle, parent) || parent.phase != ParentPhase::Parked
+        || parent.child != Some(ParentChild::RootIngress)
+        || !parent.physical.canonical_pending()
+        || parent.root_admission != Some(pass.admission_key())
+        || pass.child().tcb != pass.admission_key().executor()
+    {
+        return Err(Error::Admission);
+    }
+    let scope = parent.scope.as_ref().ok_or(Error::Admission)?;
+    if parent.root_ingress_restore.is_none() {
+        let permit = pass.begin_restore(scope).map_err(|_| Error::Admission)?;
+        if permit.parent() != handle.identity || permit.child() != pass.child()
+            || permit.admission_key() != pass.admission_key()
+            || permit.checkpoint().parent() != handle.identity
+            || permit.checkpoint().child() != permit.admission_key()
+        {
+            // A successful begin_restore is one-shot. A mismatch is retained, never retried.
+            parent.root_ingress_restore = Some(permit);
+            parent.phase = ParentPhase::Quarantined;
+            return Err(Error::Admission);
+        }
+        parent.root_ingress_restore = Some(permit);
+    }
+    let permit = parent.root_ingress_restore.as_ref().ok_or(Error::Admission)?;
+    if permit.parent() != handle.identity || permit.child() != pass.child()
+        || permit.admission_key() != pass.admission_key()
+        || permit.checkpoint().parent() != handle.identity
+        || permit.checkpoint().child() != permit.admission_key()
+    {
+        return Err(Error::Admission);
+    }
+    if !parent.root_lane_begun {
+        let key = SuspensionKey::root_ingress(permit.admission_key().admission_sequence());
+        // The sealed lane frame is the owner authority: admission bound its owner to this
+        // exact scope and child key. The resume API rechecks that entire binding.
+        let frame = lanes().frame(scope.dispatch().lane(), key)
+            .map_err(|_| Error::Admission)?.ok_or(Error::Admission)?;
+        let frame_owner = frame.owner;
+        lanes().begin_root_ingress_restore(
+            scope, key, frame_owner, permit.checkpoint(),
+            crate::ComponentSuspensionCompletion::receive_ready(),
+        ).map_err(|_| Error::Admission)?;
+        parent.root_lane_begun = true;
+    }
+    Ok(())
+}
+
+unsafe fn restore_stages(
+    handle: &mut Option<ParkedParentHandle>, restore_owner: RestoreOwner,
+) -> Result<Option<nt_user_host::root_ingress_pass::RootIngressRestorePermit<crate::HostedThreadRole>>, Error> {
+    let root = restore_owner == RestoreOwner::RootIngress;
     let Some(ticket) = handle.as_ref() else {
-        return Ok(());
+        return if root { Err(Error::Admission) } else { Ok(None) };
     };
     let index = ticket.index;
     let rows = &mut *core::ptr::addr_of_mut!(PARENTS);
@@ -476,8 +546,15 @@ unsafe fn restore_stages(handle: &mut Option<ParkedParentHandle>) -> Result<(), 
     if !row_matches(ticket, parent) || parent.phase != ParentPhase::RestoreAttempt {
         return Err(Error::Admission);
     }
-    if parent.child == Some(ParentChild::RootIngress) {
-        // A later checkpoint must transfer the pass's one-shot restore permit first.
+    if (parent.child == Some(ParentChild::RootIngress)) != root {
+        return Err(Error::Admission);
+    }
+    if root && (!parent.root_lane_begun || parent.root_ingress_restore.as_ref().is_none_or(|permit| {
+        permit.parent() != ticket.identity
+            || Some(permit.admission_key()) != parent.root_admission
+            || permit.checkpoint().parent() != ticket.identity
+            || permit.checkpoint().child() != permit.admission_key()
+    })) {
         return Err(Error::Admission);
     }
     if parent.child == Some(ParentChild::Receive)
@@ -519,9 +596,10 @@ unsafe fn restore_stages(handle: &mut Option<ParkedParentHandle>) -> Result<(), 
     if parent.physical.restore_step()? != RestoreStep::Done {
         return Err(Error::Admission);
     }
+    let restored = parent.root_ingress_restore.take();
     rows[index] = None;
     *handle = None;
-    Ok(())
+    Ok(restored)
 }
 
 /// Persist recovery authority before a fallible restore. A stack handle can then disappear
@@ -534,7 +612,7 @@ pub(crate) unsafe fn mark_restore_pending(
         .get_mut(ticket.index)
         .and_then(Option::as_mut)
         .ok_or(Error::Admission)?;
-    if !row_matches(ticket, parent)
+    if !row_matches(ticket, parent) || parent.child == Some(ParentChild::RootIngress)
         || !matches!(parent.phase, ParentPhase::Parked | ParentPhase::RestorePending)
     {
         return Err(Error::Admission);
@@ -542,6 +620,24 @@ pub(crate) unsafe fn mark_restore_pending(
     if !parent.physical.held() {
         // An exact row without its acknowledged hold cannot be retried. Keep it fenced even if
         // the stack handle disappears after this refusal.
+        parent.phase = ParentPhase::Quarantined;
+        return Err(Error::Admission);
+    }
+    parent.phase = ParentPhase::RestoreAttempt;
+    Ok(())
+}
+
+unsafe fn mark_root_restore_pending(handle: &Option<ParkedParentHandle>) -> Result<(), Error> {
+    let ticket = handle.as_ref().ok_or(Error::Admission)?;
+    let parent = (&mut *core::ptr::addr_of_mut!(PARENTS))
+        .get_mut(ticket.index).and_then(Option::as_mut).ok_or(Error::Admission)?;
+    if !row_matches(ticket, parent) || parent.child != Some(ParentChild::RootIngress)
+        || !matches!(parent.phase, ParentPhase::Parked | ParentPhase::RestorePending)
+        || !parent.root_lane_begun || parent.root_ingress_restore.is_none()
+    {
+        return Err(Error::Admission);
+    }
+    if !parent.physical.held() {
         parent.phase = ParentPhase::Quarantined;
         return Err(Error::Admission);
     }
@@ -564,23 +660,41 @@ pub(crate) unsafe fn restore_or_retain(
     handle: &mut Option<ParkedParentHandle>,
 ) -> Result<(), Error> {
     mark_restore_pending(handle)?;
-    let result = restore_stages(handle);
+    let result = restore_stages(handle, RestoreOwner::Ordinary).map(|_| ());
     if result.is_err() {
-        if let Some(ticket) = handle.as_ref() {
-            if let Some(parent) = (&mut *core::ptr::addr_of_mut!(PARENTS))
-                .get_mut(ticket.index).and_then(Option::as_mut)
-            {
-                if row_matches(ticket, parent) && parent.phase == ParentPhase::RestoreAttempt {
-                    parent.phase = if restore_refusal_is_retryable(parent) {
-                        ParentPhase::RestorePending
-                    } else {
-                        ParentPhase::Quarantined
-                    };
-                }
+        retain_restore_refusal(handle);
+    }
+    result
+}
+
+/// A root child has a typed positive receipt. It is produced only after every physical parent
+/// stage acknowledges; on any refusal the exact permit remains in `PARENTS`.
+pub(crate) unsafe fn restore_root_ingress(
+    handle: &mut Option<ParkedParentHandle>,
+) -> Result<nt_user_host::root_ingress_pass::RootIngressRestored<crate::HostedThreadRole>, Error> {
+    mark_root_restore_pending(handle)?;
+    let result = restore_stages(handle, RestoreOwner::RootIngress);
+    if result.is_err() {
+        retain_restore_refusal(handle);
+    }
+    let permit = result?.ok_or(Error::Admission)?;
+    Ok(permit.acknowledge_restore())
+}
+
+unsafe fn retain_restore_refusal(handle: &Option<ParkedParentHandle>) {
+    if let Some(ticket) = handle.as_ref() {
+        if let Some(parent) = (&mut *core::ptr::addr_of_mut!(PARENTS))
+            .get_mut(ticket.index).and_then(Option::as_mut)
+        {
+            if row_matches(ticket, parent) && parent.phase == ParentPhase::RestoreAttempt {
+                parent.phase = if restore_refusal_is_retryable(parent) {
+                    ParentPhase::RestorePending
+                } else {
+                    ParentPhase::Quarantined
+                };
             }
         }
     }
-    result
 }
 
 /// Every existing nested restore caller enters through the durable owner, even when it cannot
@@ -597,9 +711,45 @@ pub(crate) unsafe fn pending_ticket(ticket: NestedRestoreTicket) -> bool {
         .and_then(Option::as_ref)
         .is_some_and(|parent| {
             parent.phase == ParentPhase::RestorePending
+                && parent.child != Some(ParentChild::RootIngress)
                 && ticket_matches(ticket, parent)
                 && restore_refusal_is_retryable(parent)
         })
+}
+
+/// A retained root refusal has a distinct typed redrive because success must return its
+/// one-shot child receipt. The ordinary ticket path cannot dispose of that receipt.
+pub(crate) unsafe fn pending_root_ticket(ticket: NestedRestoreTicket) -> bool {
+    (&*core::ptr::addr_of!(PARENTS))
+        .get(ticket.index)
+        .and_then(Option::as_ref)
+        .is_some_and(|parent| {
+            parent.phase == ParentPhase::RestorePending
+                && parent.child == Some(ParentChild::RootIngress)
+                && ticket_matches(ticket, parent)
+                && parent.root_lane_begun
+                && parent.root_ingress_restore.as_ref().is_some_and(|permit| {
+                    permit.parent() == ticket.identity
+                        && Some(permit.admission_key()) == parent.root_admission
+                        && permit.checkpoint().parent() == ticket.identity
+                        && permit.checkpoint().child() == permit.admission_key()
+                })
+                && restore_refusal_is_retryable(parent)
+        })
+}
+
+/// Redrive only the exact retained root parent. A successful physical restoration transfers
+/// the positive child receipt to the caller; an uncertain effect stays quarantined in PARENTS.
+pub(crate) unsafe fn restore_pending_root_ticket(
+    ticket: NestedRestoreTicket,
+) -> Result<nt_user_host::root_ingress_pass::RootIngressRestored<crate::HostedThreadRole>, Error> {
+    if !pending_root_ticket(ticket) { return Err(Error::Admission); }
+    let mut handle = Some(ParkedParentHandle {
+        index: ticket.index,
+        generation: ticket.generation,
+        identity: ticket.identity,
+    });
+    restore_root_ingress(&mut handle)
 }
 
 /// Match an already authenticated pump route and its Reply against this retained parent.

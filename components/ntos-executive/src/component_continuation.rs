@@ -43,7 +43,7 @@ pub(crate) struct ComponentSuspensionCompletion {
 
 impl ComponentSuspensionCompletion {
     /// Internal receive readiness, never supplied as a provider wait result or user Reply.
-    pub(super) const fn receive_ready() -> Self {
+    pub(crate) const fn receive_ready() -> Self {
         Self::provider(0)
     }
     pub(super) const fn provider(status: i32) -> Self {
