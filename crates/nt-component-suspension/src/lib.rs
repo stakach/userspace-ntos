@@ -83,6 +83,8 @@ pub use ingress::{
 };
 mod resume_pass;
 mod receive_suspension;
+mod root_ingress;
+pub use root_ingress::RootIngressCheckpoint;
 mod root_maintenance;
 mod nested_restore_frame;
 pub use nested_restore_frame::{
@@ -111,6 +113,8 @@ pub enum SuspensionKind {
     LpcRequest,
     ServiceWait,
     Receive,
+    /// One ordinary hosted root Call runs while its exact component parent is held.
+    RootIngress,
     /// A root service-loop pass, without a provider completion or user Reply.
     RootMaintenance,
     /// A restored nested parent whose receive half produced a real terminal result.
@@ -126,6 +130,9 @@ pub struct SuspensionKey {
 impl SuspensionKey {
     pub const fn receive(id: u64) -> Self {
         Self { kind: SuspensionKind::Receive, id }
+    }
+    pub const fn root_ingress(id: u64) -> Self {
+        Self { kind: SuspensionKind::RootIngress, id }
     }
     pub const fn provider_wait(id: u64) -> Self {
         Self {
@@ -180,7 +187,7 @@ pub struct SuspensionFrame<C, R> {
     pub owner: SuspensionOwner,
     pub phase: SuspensionPhase<R>,
     pub continuation: C,
-    receive: Option<receive_suspension::ReceiveAdmission>,
+    nested_child: Option<receive_suspension::NestedChildAdmission>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -412,8 +419,8 @@ impl<C, R> ComponentSuspensionStack<C, R> {
 
     pub fn get_mut(&mut self, key: SuspensionKey) -> Option<&mut SuspensionFrame<C, R>> {
         self.get_mut_internal(key).filter(|frame| {
-            !matches!(frame.key.kind, SuspensionKind::Receive | SuspensionKind::NestedRestore)
-                && frame.receive.is_none()
+            !matches!(frame.key.kind, SuspensionKind::Receive | SuspensionKind::RootIngress | SuspensionKind::NestedRestore)
+                && frame.nested_child.is_none()
         })
     }
 
@@ -431,8 +438,8 @@ impl<C, R> ComponentSuspensionStack<C, R> {
         }
         self.frames.iter().find_map(|frame| {
             (scope.matches(frame.owner)
-                && frame.key.kind != SuspensionKind::Receive
-                && frame.receive.is_none()
+                && !matches!(frame.key.kind, SuspensionKind::Receive | SuspensionKind::RootIngress)
+                && frame.nested_child.is_none()
                 && matches!(
                     frame.phase,
                     SuspensionPhase::Waiting | SuspensionPhase::Selected { .. }
@@ -462,7 +469,7 @@ impl<C, R> ComponentSuspensionStack<C, R> {
         owner: SuspensionOwner,
         continuation: C,
     ) -> Result<(), (SuspensionError, C)> {
-        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::RootMaintenance
+        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::RootIngress | SuspensionKind::RootMaintenance
             | SuspensionKind::NestedRestore) {
             return Err((SuspensionError::InvalidPhase, continuation));
         }
@@ -500,16 +507,16 @@ impl<C, R> ComponentSuspensionStack<C, R> {
             owner,
             phase: SuspensionPhase::Waiting,
             continuation,
-            receive: None,
+            nested_child: None,
         });
         Ok(())
     }
 
     pub fn rollback_admission(&mut self, key: SuspensionKey) -> Result<C, SuspensionError> {
-        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::NestedRestore) {
+        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::RootIngress | SuspensionKind::NestedRestore) {
             return Err(SuspensionError::InvalidPhase);
         }
-        if self.get(key).is_some_and(|frame| frame.receive.is_some()) { return Err(SuspensionError::InvalidPhase); }
+        if self.get(key).is_some_and(|frame| frame.nested_child.is_some()) { return Err(SuspensionError::InvalidPhase); }
         let frame = self.frames.last().ok_or(SuspensionError::NotFound)?;
         if frame.key != key {
             return Err(SuspensionError::NotTop);
@@ -522,11 +529,11 @@ impl<C, R> ComponentSuspensionStack<C, R> {
     }
 
     pub fn select(&mut self, key: SuspensionKey, completion: R) -> Result<(), SuspensionError> {
-        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::RootMaintenance
+        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::RootIngress | SuspensionKind::RootMaintenance
             | SuspensionKind::NestedRestore) {
             return Err(SuspensionError::InvalidPhase);
         }
-        if self.get(key).is_some_and(|frame| frame.receive.is_some()) { return Err(SuspensionError::InvalidPhase); }
+        if self.get(key).is_some_and(|frame| frame.nested_child.is_some()) { return Err(SuspensionError::InvalidPhase); }
         let frame = self
             .frames
             .iter_mut()
@@ -540,10 +547,10 @@ impl<C, R> ComponentSuspensionStack<C, R> {
     }
 
     pub fn cancel(&mut self, key: SuspensionKey, completion: R) -> Result<(), SuspensionError> {
-        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::NestedRestore) {
+        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::RootIngress | SuspensionKind::NestedRestore) {
             return Err(SuspensionError::InvalidPhase);
         }
-        if self.get(key).is_some_and(|frame| frame.receive.is_some()) { return Err(SuspensionError::InvalidPhase); }
+        if self.get(key).is_some_and(|frame| frame.nested_child.is_some()) { return Err(SuspensionError::InvalidPhase); }
         let frame = self
             .frames
             .iter_mut()
@@ -588,10 +595,10 @@ impl<C, R: Clone> ComponentSuspensionStack<C, R> {
         &mut self,
         key: SuspensionKey,
     ) -> Result<SuspensionResume<R>, SuspensionError> {
-        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::NestedRestore) {
+        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::RootIngress | SuspensionKind::NestedRestore) {
             return Err(SuspensionError::InvalidPhase);
         }
-        if self.get(key).is_some_and(|frame| frame.receive.is_some()) { return Err(SuspensionError::InvalidPhase); }
+        if self.get(key).is_some_and(|frame| frame.nested_child.is_some()) { return Err(SuspensionError::InvalidPhase); }
         let frame = self.frames.last_mut().ok_or(SuspensionError::NotFound)?;
         if frame.key != key {
             return Err(SuspensionError::NotTop);
@@ -644,7 +651,7 @@ impl<C, R: Clone> ComponentSuspensionStack<C, R> {
         owner: SuspensionOwner,
         continuation: C,
     ) -> Result<C, (SuspensionError, C)> {
-        if matches!(next_key.kind, SuspensionKind::Receive | SuspensionKind::RootMaintenance
+        if matches!(next_key.kind, SuspensionKind::Receive | SuspensionKind::RootIngress | SuspensionKind::RootMaintenance
             | SuspensionKind::NestedRestore) {
             return Err((SuspensionError::InvalidPhase, continuation));
         }
@@ -660,7 +667,7 @@ impl<C, R: Clone> ComponentSuspensionStack<C, R> {
         if frame.key != completed_key {
             return Err((SuspensionError::NotTop, continuation));
         }
-        if frame.receive.is_some_and(|admission| !admission.restored) {
+        if frame.nested_child.is_some_and(|admission| !admission.restored) {
             return Err((SuspensionError::InvalidPhase, continuation));
         }
         if !matches!(frame.phase, SuspensionPhase::Resuming { .. }
@@ -670,7 +677,7 @@ impl<C, R: Clone> ComponentSuspensionStack<C, R> {
         frame.key = next_key;
         frame.admission_sequence = admission_sequence;
         frame.phase = SuspensionPhase::Waiting;
-        frame.receive = None;
+        frame.nested_child = None;
         Ok(core::mem::replace(&mut frame.continuation, continuation))
     }
 
@@ -686,7 +693,7 @@ impl<C, R: Clone> ComponentSuspensionStack<C, R> {
         if frame.owner != owner {
             return Err(SuspensionError::InvalidIdentity);
         }
-        if frame.receive.is_some_and(|admission| !admission.restored) {
+        if frame.nested_child.is_some_and(|admission| !admission.restored) {
             return Err(SuspensionError::InvalidPhase);
         }
         let (completion, cancelled) = match &frame.phase {
@@ -960,7 +967,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         }
         let frame = lane.suspensions.get_mut_internal(key);
         if frame.as_ref().is_some_and(|frame| {
-            frame.key.kind == SuspensionKind::Receive || frame.receive.is_some()
+            matches!(frame.key.kind, SuspensionKind::Receive | SuspensionKind::RootIngress) || frame.nested_child.is_some()
         }) {
             return Err(LaneError::InvalidPhase);
         }
@@ -1219,11 +1226,11 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         })) {
             return Err((LaneError::Suspension(SuspensionError::DuplicateIdentity), continuation));
         }
-        if completed_key.kind == SuspensionKind::Receive {
+        if matches!(completed_key.kind, SuspensionKind::Receive | SuspensionKind::RootIngress) {
             let lane = self.lane(handle).expect("validated service wait lane");
             let restored_on_route = lane.suspensions.top()
                 .filter(|frame| frame.key == completed_key)
-                .and_then(|frame| frame.receive)
+                .and_then(|frame| frame.nested_child)
                 .is_some_and(|receive| receive.restored
                     && receive.scope.dispatch() == dispatch
                     && lane.shared_peer == Some(receive.scope.route()));
@@ -1451,7 +1458,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         owner: SuspensionOwner,
         continuation: C,
     ) -> Result<(), (LaneError, C)> {
-        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::ServiceWait
+        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::RootIngress | SuspensionKind::ServiceWait
             | SuspensionKind::RootMaintenance | SuspensionKind::NestedRestore) {
             return Err((LaneError::InvalidPhase, continuation));
         }
@@ -1537,7 +1544,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         continuation: C,
         root_maintenance: bool,
     ) -> Result<(), (LaneError, C)> {
-        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::ServiceWait
+        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::RootIngress | SuspensionKind::ServiceWait
             | SuspensionKind::NestedRestore)
             || (key.kind == SuspensionKind::RootMaintenance && !root_maintenance)
         {
@@ -1600,7 +1607,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
     }
 
     pub fn select(&mut self, key: SuspensionKey, completion: R) -> Result<(), LaneError> {
-        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::NestedRestore) {
+        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::RootIngress | SuspensionKind::NestedRestore) {
             return Err(LaneError::InvalidPhase);
         }
         let handle = self
@@ -1616,7 +1623,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
     }
 
     pub fn cancel(&mut self, key: SuspensionKey, completion: R) -> Result<(), LaneError> {
-        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::NestedRestore) {
+        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::RootIngress | SuspensionKind::NestedRestore) {
             return Err(LaneError::InvalidPhase);
         }
         let handle = self
@@ -1739,7 +1746,7 @@ impl<C, R: Clone, T> ComponentSuspensionLanes<C, R, T> {
         key: SuspensionKey,
         reserve: impl FnOnce(&mut Vec<u64>) -> Result<(), LaneError>,
     ) -> Result<SuspensionResume<R>, LaneError> {
-        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::NestedRestore) {
+        if matches!(key.kind, SuspensionKind::Receive | SuspensionKind::RootIngress | SuspensionKind::NestedRestore) {
             return Err(LaneError::InvalidPhase);
         }
         if self.execution_busy() {
@@ -1813,7 +1820,7 @@ impl<C, R: Clone, T> ComponentSuspensionLanes<C, R, T> {
         owner: SuspensionOwner,
         continuation: C,
     ) -> Result<C, (LaneError, C)> {
-        if matches!(next_key.kind, SuspensionKind::Receive | SuspensionKind::ServiceWait
+        if matches!(next_key.kind, SuspensionKind::Receive | SuspensionKind::RootIngress | SuspensionKind::ServiceWait
             | SuspensionKind::RootMaintenance | SuspensionKind::NestedRestore) {
             return Err((LaneError::InvalidPhase, continuation));
         }

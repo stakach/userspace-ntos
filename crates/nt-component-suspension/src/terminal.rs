@@ -269,7 +269,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         let lane = self.lane_mut(handle).expect("validated nested terminal lane");
         lane.suspensions.frames.push(SuspensionFrame {
             key, admission_sequence, owner, phase: SuspensionPhase::NestedTerminal,
-            continuation, receive: None,
+            continuation, nested_child: None,
         });
         let identity = TerminalIdentity {
             dispatch, resume_epoch: next_epoch, binding, key, owner,
@@ -456,7 +456,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         }
         if lane.terminal.is_some()
             || lane.resume_epoch == 0
-            || frame.receive.is_some_and(|admission| !admission.restored)
+            || frame.nested_child.is_some_and(|admission| !admission.restored)
             || if !matches!(mode, TerminalRetentionMode::Provider) {
                 key.kind != SuspensionKind::RootMaintenance
                     || !matches!(frame.phase, SuspensionPhase::MaintenanceResuming { .. })

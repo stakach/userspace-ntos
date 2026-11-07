@@ -3,9 +3,10 @@
 use crate::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ReceiveAdmission {
+pub(crate) struct NestedChildAdmission {
+    pub(crate) kind: SuspensionKind,
     pub(crate) scope: NestedExecutionIdentity,
-    child: ExternalAdmissionKey,
+    pub(crate) child: ExternalAdmissionKey,
     pub(crate) restored: bool,
 }
 
@@ -31,9 +32,12 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         }
         if frame.owner != owner
             || match completed_key.kind {
-                SuspensionKind::Receive => !frame.receive.is_some_and(|admission| admission.restored),
+                SuspensionKind::Receive | SuspensionKind::RootIngress =>
+                    !frame.nested_child.is_some_and(|admission| {
+                        admission.kind == completed_key.kind && admission.restored
+                    }),
                 SuspensionKind::ServiceWait | SuspensionKind::ProviderWait
-                    | SuspensionKind::LpcRequest | SuspensionKind::RootMaintenance => frame.receive.is_some(),
+                    | SuspensionKind::LpcRequest | SuspensionKind::RootMaintenance => frame.nested_child.is_some(),
                 SuspensionKind::NestedRestore => true,
             }
             || !matches!(frame.phase, SuspensionPhase::Resuming { .. }
@@ -107,9 +111,9 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         {
             return Err((LaneError::WrongBinding, continuation));
         }
-        match (completed_key.kind, frame.receive) {
-            (SuspensionKind::Receive, Some(previous))
-                if previous.restored
+        match (completed_key.kind, frame.nested_child) {
+            (SuspensionKind::Receive | SuspensionKind::RootIngress, Some(previous))
+                if previous.kind == completed_key.kind && previous.restored
                     && previous.scope.dispatch() == scope.dispatch()
                     && previous.scope.route() == scope.route()
                     && previous.scope.sequence() < scope.identity().sequence()
@@ -124,7 +128,8 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         frame.key = next_key;
         frame.admission_sequence = admission_sequence;
         frame.phase = SuspensionPhase::Waiting;
-        frame.receive = Some(ReceiveAdmission {
+        frame.nested_child = Some(NestedChildAdmission {
+            kind: SuspensionKind::Receive,
             scope: scope.identity(),
             child,
             restored: false,
@@ -158,7 +163,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             .map_err(|_| LaneError::NoCapacity)
     }
 
-    fn validate_receive_scope(&self, scope: &NestedExecutionScope) -> Result<(), LaneError> {
+    pub(crate) fn validate_receive_scope(&self, scope: &NestedExecutionScope) -> Result<(), LaneError> {
         if scope.is_consumed() {
             return Err(LaneError::InvalidPhase);
         }
@@ -225,7 +230,8 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         lane.suspensions
             .get_mut_internal(key)
             .expect("admitted receive")
-            .receive = Some(ReceiveAdmission {
+            .nested_child = Some(NestedChildAdmission {
+            kind: SuspensionKind::Receive,
             scope: scope.identity(),
             child,
             restored: false,
@@ -266,14 +272,17 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         let Ok(lane) = self.lane(scope.dispatch().lane()) else {
             return false;
         };
-        // A settled Receive frame outlives its physical parent scope while the component pump
-        // continues. A later ordinary nested scope may restore on the same dispatch; an
-        // unsettled child, another route, or a future scope must still fence restoration.
+        // A checkpointed nested child frame outlives its physical parent scope while the
+        // component pump continues. An uncheckpointed child, another route, or a future scope
+        // must still fence restoration.
         lane.suspensions.frames().iter().all(|frame| {
-            (frame.key.kind != SuspensionKind::Receive && frame.receive.is_none())
-                || (frame.key.kind == SuspensionKind::Receive
-                    && frame.receive.is_some_and(|admission| {
-                        admission.restored
+            (frame.key.kind != SuspensionKind::Receive
+                && frame.key.kind != SuspensionKind::RootIngress
+                && frame.nested_child.is_none())
+                || (matches!(frame.key.kind, SuspensionKind::Receive | SuspensionKind::RootIngress)
+                    && frame.nested_child.is_some_and(|admission| {
+                        admission.kind == frame.key.kind
+                            && admission.restored
                             && admission.scope.route() == scope.route()
                             && admission.scope.dispatch() == scope.dispatch()
                             && admission.scope.sequence() <= scope.identity().sequence()
@@ -316,8 +325,9 @@ impl<C, R: Clone, T> ComponentSuspensionLanes<C, R, T> {
         }
         if key.kind != SuspensionKind::Receive
             || frame.owner != owner
-            || frame.receive
-                != Some(ReceiveAdmission {
+            || frame.nested_child
+                != Some(NestedChildAdmission {
+                    kind: SuspensionKind::Receive,
                     scope: scope.identity(),
                     child: settlement.admission_key(),
                     restored: false,
@@ -337,7 +347,7 @@ impl<C, R: Clone, T> ComponentSuspensionLanes<C, R, T> {
             cancelled: false,
         };
         frame
-            .receive
+            .nested_child
             .as_mut()
             .expect("validated receive admission")
             .restored = true;

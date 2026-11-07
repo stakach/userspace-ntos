@@ -2399,6 +2399,7 @@ unsafe fn component_suspension_cancel_scope(
             .clone();
         let external_cancelled = match wait_key.kind {
             nt_component_suspension::SuspensionKind::Receive
+            | nt_component_suspension::SuspensionKind::RootIngress
             | nt_component_suspension::SuspensionKind::ServiceWait
             | nt_component_suspension::SuspensionKind::RootMaintenance
             | nt_component_suspension::SuspensionKind::NestedRestore => return false,

@@ -140,6 +140,8 @@ fn acknowledged_child_checkpoints_exact_parent_once() {
     assert_eq!(permit.parent(), parent.identity());
     assert_eq!(permit.child(), binding());
     assert_eq!(permit.admission_key(), key);
+    assert_eq!(permit.checkpoint().parent(), parent.identity());
+    assert_eq!(permit.checkpoint().child(), key);
     assert!(permit.settlement().is_some());
     // Native supplies the positive physical restore observation; the exact nonclone child
     // settlement must survive the transfer into the resulting receipt.
@@ -171,7 +173,7 @@ fn parked_child_restores_parent_but_keeps_its_reply_for_later_settlement() {
     let mut wrong = binding();
     wrong.tcb += 1;
     assert_eq!(
-        pass.acknowledge_park(wrong, child.call.as_ref().unwrap())
+        unsafe { pass.acknowledge_park(wrong, child.call.as_ref().unwrap()) }
             .unwrap_err(),
         PassError::WrongChild,
     );
@@ -180,10 +182,12 @@ fn parked_child_restores_parent_but_keeps_its_reply_for_later_settlement() {
         PassError::Unsettled
     );
     // Native calls acknowledge_park only after its RootReplyPark::commit succeeds.
-    pass.acknowledge_park(binding(), child.call.as_ref().unwrap())
+    unsafe { pass.acknowledge_park(binding(), child.call.as_ref().unwrap()) }
         .unwrap();
     let permit = pass.begin_restore(&parent).unwrap();
     assert_eq!(permit.parent(), parent.identity());
+    assert_eq!(permit.checkpoint().parent(), parent.identity());
+    assert_eq!(permit.checkpoint().child(), key);
     assert!(permit.settlement().is_none());
     assert_eq!(
         pass.begin_restore(&parent).unwrap_err(),

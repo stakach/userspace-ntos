@@ -4,7 +4,7 @@
 use crate::thread_binding::ThreadBinding;
 use nt_component_suspension::{
     ExternalAdmissionKey, ExternalIngress, ExternalSettlement, LaneDispatchIdentity,
-    NestedExecutionIdentity, NestedExecutionScope,
+    NestedExecutionIdentity, NestedExecutionScope, RootIngressCheckpoint,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,6 +39,7 @@ pub struct RootIngressPass<R> {
     parent: Option<NestedExecutionIdentity>,
     phase: Phase,
     settlement: Option<ExternalSettlement>,
+    parked: bool,
 }
 
 /// One restoration attempt. A parked child remains independently owned by its ingress row.
@@ -49,6 +50,7 @@ pub struct RootIngressRestorePermit<R> {
     admission: ExternalAdmissionKey,
     parent: NestedExecutionIdentity,
     settlement: Option<ExternalSettlement>,
+    checkpoint: RootIngressCheckpoint,
 }
 
 /// Native-issued positive observation after the exact parent restoration completed. The pure
@@ -83,6 +85,7 @@ impl<R: Copy + Eq> RootIngressPass<R> {
             parent: None,
             phase: Phase::Prepared,
             settlement: None,
+            parked: false,
         })
     }
 
@@ -170,7 +173,11 @@ impl<R: Copy + Eq> RootIngressPass<R> {
 
     /// Native supplies this observation only after its exact RootReplyPark commit succeeded.
     /// This is not a physical receipt: the native owner still holds and verifies the Reply.
-    pub fn acknowledge_park<M>(
+    ///
+    /// # Safety
+    /// The exact RootReplyPark must have positively committed. An uncertain effect cannot be
+    /// promoted to a checkpoint, even if the Reply capability still appears to be present.
+    pub unsafe fn acknowledge_park<M>(
         &mut self,
         child: ThreadBinding<R>,
         call: &ExternalIngress<M>,
@@ -179,6 +186,7 @@ impl<R: Copy + Eq> RootIngressPass<R> {
         if self.phase != Phase::ParkEnteredUnknown || !call.can_park() {
             return Err(PassError::InvalidPhase);
         }
+        self.parked = true;
         self.phase = Phase::Checkpointed;
         Ok(())
     }
@@ -198,12 +206,21 @@ impl<R: Copy + Eq> RootIngressPass<R> {
         if self.phase != Phase::Checkpointed {
             return Err(PassError::Unsettled);
         }
+        let checkpoint = if let Some(settlement) = self.settlement.as_ref() {
+            RootIngressCheckpoint::from_settlement(scope, settlement)
+        } else if self.parked {
+            // The only transition to `parked` is the native-only positive observation above.
+            unsafe { RootIngressCheckpoint::after_park(scope, self.admission) }
+        } else {
+            return Err(PassError::Unsettled);
+        };
         self.phase = Phase::RestoreEntered;
         Ok(RootIngressRestorePermit {
             child: self.child,
             admission: self.admission,
             parent,
             settlement: self.settlement.take(),
+            checkpoint,
         })
     }
 }
@@ -221,6 +238,7 @@ impl<R: Copy> RootIngressRestorePermit<R> {
     pub fn settlement(&self) -> Option<&ExternalSettlement> {
         self.settlement.as_ref()
     }
+    pub fn checkpoint(&self) -> &RootIngressCheckpoint { &self.checkpoint }
 
     /// # Safety
     /// The native owner must first positively complete the exact physical parent restoration.

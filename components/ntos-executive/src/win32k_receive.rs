@@ -326,6 +326,7 @@ unsafe fn trace_receive_failure(
             print_str(b" top=");
             print_u64(match frame.key.kind {
                 nt_component_suspension::SuspensionKind::Receive => 1,
+                nt_component_suspension::SuspensionKind::RootIngress => 7,
                 nt_component_suspension::SuspensionKind::ServiceWait => 2,
                 nt_component_suspension::SuspensionKind::ProviderWait => 3,
                 nt_component_suspension::SuspensionKind::LpcRequest => 4,
