@@ -221,7 +221,7 @@ unsafe fn submit_provider_inner(
         caller: Caller::Provider(caller), phase: Phase::ProviderAdmit,
         prepared: None, persistence: MutationPersistence::new(), receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
-        last_refusal: None, refusal_count: 0,
+        last_refusal: None, refusal_count: 0, retry_at: 0,
     });
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
     let index = match index {

@@ -454,6 +454,7 @@ struct Work {
     published: bool,
     last_refusal: Option<(&'static str, u32)>,
     refusal_count: u64,
+    retry_at: u64,
 }
 
 static mut ATTEMPTS: CmMutationBeginAttempts = CmMutationBeginAttempts::new();
@@ -757,6 +758,7 @@ struct HostedRowSample {
     commit_entered: bool,
     last_refusal: Option<(&'static str, u32)>,
     refusal_count: u64,
+    retry_at: u64,
 }
 
 pub(crate) unsafe fn census_snapshot() -> CensusSnapshot {
@@ -786,6 +788,7 @@ pub(crate) unsafe fn census_snapshot() -> CensusSnapshot {
                         commit_entered: work.commit_entered,
                         last_refusal: work.last_refusal,
                         refusal_count: work.refusal_count,
+                        retry_at: work.retry_at,
                     });
                 } else {
                     hosted_sample_overflow += 1;
@@ -821,6 +824,31 @@ fn persistence_name(owner: &PersistenceOwner) -> &'static str {
         PersistenceOwner::Legacy(_) => "legacy",
         PersistenceOwner::Wal(_) => "wal",
     }
+}
+
+/// Eligibility is value-only. The selected row is taken only after the exact caller kind and
+/// deadline have been checked, so an unrelated refusal cannot delay another retained owner.
+fn select_ready_mutation(
+    rows: &[Option<Work>], start: usize, now: u64, provider_only: bool,
+) -> Option<usize> {
+    nt_config_client::mutation_retry_schedule::select_ready_index(
+        rows.len(), start, now, |index| rows[index].as_ref().and_then(|work| {
+            (!provider_only || matches!(work.caller, Caller::Provider(_)))
+                .then_some(work.retry_at)
+        }),
+    )
+}
+
+fn earliest_mutation_retry(rows: &[Option<Work>]) -> Option<u64> {
+    nt_config_client::mutation_retry_schedule::earliest_retry_deadline(
+        rows.len(), |index| rows[index].as_ref().map(|work| work.retry_at),
+    )
+}
+
+fn wake_mutation_row(work: &mut Work) {
+    let now = monotonic_time_100ns();
+    work.retry_at = now;
+    NEXT.store(now, Ordering::Release);
 }
 
 pub(crate) fn redrive_active() -> bool {
@@ -878,7 +906,12 @@ pub(crate) unsafe fn mark_native_wal_io_entered(id: u64, request: nt_fs::AsyncWa
 }
 
 pub(crate) unsafe fn release_unentered_native_wal_io(id: u64, request: nt_fs::AsyncWalIoRequest) -> Result<(), u32> {
-    native_wal_by_id(id)?.release_unentered_native_io(request)
+    let work = (&mut *core::ptr::addr_of_mut!(WORK)).iter_mut().flatten()
+        .find(|work| work.id == id).ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
+    work.persistence.native_wal_mut().ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?
+        .release_unentered_native_io(request)?;
+    wake_mutation_row(work);
+    Ok(())
 }
 
 pub(crate) unsafe fn refuse_unentered_native_wal_io(
@@ -892,15 +925,18 @@ pub(crate) unsafe fn refuse_unentered_native_wal_io(
     if refusal == nt_fs::AsyncWalRefusal::NoEffect {
         work.phase = Phase::Rollback;
     }
-    NEXT.store(monotonic_time_100ns(), Ordering::Release);
+    wake_mutation_row(work);
     Ok(())
 }
 
 pub(crate) unsafe fn complete_native_wal_io(
     id: u64, request: nt_fs::AsyncWalIoRequest, result: Result<&[u8], nt_status::NtStatus>,
 ) -> Result<writable_fs::native_snapshot_io::SnapshotCompletion, u32> {
-    let settled = native_wal_by_id(id)?.complete_native_io(request, result);
-    NEXT.store(monotonic_time_100ns(), Ordering::Release);
+    let work = (&mut *core::ptr::addr_of_mut!(WORK)).iter_mut().flatten()
+        .find(|work| work.id == id).ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
+    let settled = work.persistence.native_wal_mut().ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?
+        .complete_native_io(request, result);
+    wake_mutation_row(work);
     settled
 }
 
@@ -981,7 +1017,7 @@ pub(crate) unsafe fn submit_hosted(
         caller: Caller::Hosted(caller), phase: Phase::Begin(attempt), prepared: None, persistence: MutationPersistence::new(),
         receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
-        last_refusal: None, refusal_count: 0,
+        last_refusal: None, refusal_count: 0, retry_at: 0,
     });
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
     match index {
@@ -1097,7 +1133,7 @@ pub(crate) unsafe fn submit_hosted_existing(
         caller: Caller::Hosted(hosted), phase: Phase::Begin(attempt), prepared: None, persistence: MutationPersistence::new(),
         receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
-        last_refusal: None, refusal_count: 0,
+        last_refusal: None, refusal_count: 0, retry_at: 0,
     });
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
     match index {
@@ -1162,7 +1198,7 @@ pub(crate) unsafe fn submit_hosted_system_locale(
         caller: Caller::Hosted(caller), phase: Phase::Begin(attempt), prepared: None, persistence: MutationPersistence::new(),
         receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
-        last_refusal: None, refusal_count: 0,
+        last_refusal: None, refusal_count: 0, retry_at: 0,
     });
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
     match index {
@@ -1253,15 +1289,9 @@ unsafe fn redrive_inner(mut context: HostedContext<'_>) -> bool {
     let selected = {
         let rows = &mut *core::ptr::addr_of_mut!(WORK);
         let count = rows.len();
-        let start = CURSOR.load(Ordering::Relaxed) as usize % count;
-        (0..count).find_map(|step| {
-            let index = (start + step) % count;
-            if context.is_none() && rows[index].as_ref()
-                .is_some_and(|work| matches!(work.caller, Caller::Hosted(_))) {
-                return None;
-            }
-            rows[index].take().map(|work| (index, work))
-        })
+        let start = CURSOR.load(Ordering::Relaxed) as usize;
+        select_ready_mutation(rows, start, monotonic_time_100ns(), context.is_none())
+            .and_then(|index| rows[index].take().map(|work| (index, work)))
     };
     if let Some((index, mut work)) = selected {
         EXECUTING_INDEX.store(index as u64, Ordering::Relaxed);
@@ -1292,12 +1322,16 @@ unsafe fn redrive_inner(mut context: HostedContext<'_>) -> bool {
         if completed {
             PENDING.fetch_sub(1, Ordering::Release);
         } else {
+            work.retry_at = if failed {
+                monotonic_time_100ns().saturating_add(RETRY_DELAY)
+            } else { 0 };
             (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
         }
         *core::ptr::addr_of_mut!(EXECUTING) = None;
         EXECUTING_INDEX.store(u64::MAX, Ordering::Relaxed);
     }
-    NEXT.store(monotonic_time_100ns().saturating_add(if failed { RETRY_DELAY } else { 0 }), Ordering::Release);
+    let next = earliest_mutation_retry(&*core::ptr::addr_of!(WORK)).unwrap_or(0);
+    NEXT.store(next, Ordering::Release);
     ACTIVE.store(false, Ordering::Release);
     if !completed && immediate_progress {
         return true;
