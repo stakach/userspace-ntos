@@ -8,6 +8,17 @@ pub(crate) struct RootReplyPark {
     replacement: Option<(usize, u64)>,
 }
 
+pub(crate) enum SelectedParkRefusal {
+    /// The prepared park belonged to another active Reply; no selected effect was attempted.
+    /// Retain both values until an exact native owner can prove a separate abort. This does
+    /// not mint the `try_commit`-specific no-effect receipt.
+    WrongReply {
+        park: RootReplyPark,
+        attempt: nt_user_host::root_ingress_pass::RootIngressParkAttempt<crate::HostedThreadRole>,
+    },
+    NoEffect(nt_user_host::root_ingress_pass::RootReplyParkNoEffect<crate::HostedThreadRole>),
+}
+
 impl RootReplyPark {
     pub(crate) unsafe fn prepare() -> Option<Self> {
         let active = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -72,6 +83,23 @@ impl RootReplyPark {
             }
         }
         Ok(())
+    }
+
+    /// Only this selected wrapper converts the original attempt's pre-effect Err to a
+    /// move-only refusal receipt. A wrong active Reply retains both owners separately.
+    pub(crate) unsafe fn try_commit_selected(
+        self,
+        attempt: nt_user_host::root_ingress_pass::RootIngressParkAttempt<crate::HostedThreadRole>,
+    ) -> Result<nt_user_host::root_ingress_pass::RootReplyParkCommitted<crate::HostedThreadRole>, SelectedParkRefusal> {
+        if self.active != attempt.reply() {
+            return Err(SelectedParkRefusal::WrongReply { park: self, attempt });
+        }
+        match self.try_commit() {
+            Ok(()) => Ok(attempt.after_positive_native_park()),
+            Err(_park) => Err(SelectedParkRefusal::NoEffect(
+                attempt.after_no_effect_native_refusal(),
+            )),
+        }
     }
 }
 

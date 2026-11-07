@@ -77,8 +77,8 @@ fn restored(child: &Child, child_binding: ThreadBinding<u8>, parent: &NestedExec
     pass.bind_parent(parent, parent.dispatch()).unwrap();
     pass.begin_import(child_binding, call).unwrap();
     unsafe { pass.deliver(child_binding, call) }.unwrap();
-    pass.begin_park(child_binding, call).unwrap();
-    unsafe { pass.acknowledge_park(child_binding, call) }.unwrap();
+    let attempt = pass.begin_park(child_binding, call).unwrap();
+    unsafe { pass.acknowledge_park(child_binding, call, attempt.after_positive_native_park()) }.unwrap();
     // The native test adapter supplies the positive physical restore observation.
     unsafe { pass.begin_restore(parent).unwrap().acknowledge_restore() }
 }

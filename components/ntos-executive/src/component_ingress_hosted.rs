@@ -330,12 +330,13 @@ pub(crate) unsafe fn take_selected_root_hosted_with(
 }
 
 /// Seal one selected child's park attempt before the caller enters RootReplyPark::try_commit.
-/// A refusal after this point retains the exact Call and pass; the attempt cannot be replayed.
+/// A refusal after this point retains the exact Call and pass. Only its certified no-effect
+/// receipt may reopen the pass for a fresh attempt.
 pub(crate) unsafe fn begin_root_ingress_reply_park(
     snapshot: PendingSnapshot,
     admission: ExternalAdmissionKey,
     parent_identity: nt_component_suspension::NestedExecutionIdentity,
-) -> Result<u64, Error> {
+) -> Result<nt_user_host::root_ingress_pass::RootIngressParkAttempt<crate::HostedThreadRole>, Error> {
     let row = (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten()
         .find(|row| row.binding == snapshot.binding
             && row.call.as_ref().is_some_and(|call| {
@@ -371,8 +372,7 @@ pub(crate) unsafe fn begin_root_ingress_reply_park(
     {
         return Err(Error::Reply);
     }
-    root.pass.begin_park(row.binding, call).map_err(|_| Error::Admission)?;
-    Ok(call.reply())
+    root.pass.begin_park(row.binding, call).map_err(|_| Error::Admission)
 }
 
 /// Record only a positive physical RootReplyPark::try_commit result for the sealed child.
@@ -384,17 +384,18 @@ pub(crate) unsafe fn acknowledge_root_ingress_reply_park(
     snapshot: PendingSnapshot,
     admission: ExternalAdmissionKey,
     parent_identity: nt_component_suspension::NestedExecutionIdentity,
-) -> Result<(), Error> {
-    let row = (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten()
+    committed: nt_user_host::root_ingress_pass::RootReplyParkCommitted<crate::HostedThreadRole>,
+) -> Result<(), (Error, nt_user_host::root_ingress_pass::RootReplyParkCommitted<crate::HostedThreadRole>)> {
+    macro_rules! refuse { ($error:expr) => { return Err(($error, committed)) }; }
+    let Some(row) = (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten()
         .find(|row| row.binding == snapshot.binding
             && row.call.as_ref().is_some_and(|call| {
                 call.reply() == snapshot.reply
                     && call.admission_sequence() == snapshot.admission_sequence
-            }))
-        .ok_or(Error::Admission)?;
-    let call = row.call.as_ref().ok_or(Error::Admission)?;
-    let root = row.root_ingress.as_mut().ok_or(Error::Admission)?;
-    let parent = root.parent.as_ref().ok_or(Error::Admission)?;
+            })) else { refuse!(Error::Admission) };
+    let Some(call) = row.call.as_ref() else { refuse!(Error::Admission) };
+    let Some(root) = row.root_ingress.as_mut() else { refuse!(Error::Admission) };
+    let Some(parent) = root.parent.as_ref() else { refuse!(Error::Admission) };
     if !row.delivered || row.released || row.completion.is_some()
         || row.receive_settlement.is_some() || root.restored.is_some()
         || root.unconsumed_settlement.is_some()
@@ -411,15 +412,62 @@ pub(crate) unsafe fn acknowledge_root_ingress_reply_park(
         || crate::REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
         || crate::service_sec_image::hosted_ingress_binding(row.binding.badge) != Some(row.binding)
     {
-        return Err(Error::Admission);
+        refuse!(Error::Admission);
     }
     let _saved = crate::ipc_message::SavedMessageBuffer::capture();
     if crate::spawn_hosts::query_component_reply_binding(row.binding.tcb, call.reply())
         != Ok(ReplyBindingObservation::BoundToTarget)
     {
-        return Err(Error::Reply);
+        refuse!(Error::Reply);
     }
-    root.pass.acknowledge_park(row.binding, call).map_err(|_| Error::Admission)
+    root.pass.acknowledge_park(row.binding, call, committed)
+        .map_err(|(_, committed)| (Error::Admission, committed))
+}
+
+/// Consume only the native pre-effect refusal for this exact selected child. A failed physical
+/// identity check returns the receipt unchanged and leaves the pass sealed.
+pub(crate) unsafe fn abort_root_ingress_reply_park(
+    snapshot: PendingSnapshot,
+    admission: ExternalAdmissionKey,
+    parent_identity: nt_component_suspension::NestedExecutionIdentity,
+    no_effect: nt_user_host::root_ingress_pass::RootReplyParkNoEffect<crate::HostedThreadRole>,
+) -> Result<(), (Error, nt_user_host::root_ingress_pass::RootReplyParkNoEffect<crate::HostedThreadRole>)> {
+    macro_rules! refuse { ($error:expr) => { return Err(($error, no_effect)) }; }
+    let Some(row) = (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten()
+        .find(|row| row.binding == snapshot.binding
+            && row.call.as_ref().is_some_and(|call| {
+                call.reply() == snapshot.reply
+                    && call.admission_sequence() == snapshot.admission_sequence
+            })) else { refuse!(Error::Admission) };
+    let Some(call) = row.call.as_ref() else { refuse!(Error::Admission) };
+    let Some(root) = row.root_ingress.as_mut() else { refuse!(Error::Admission) };
+    let Some(parent) = root.parent.as_ref() else { refuse!(Error::Admission) };
+    if !row.delivered || row.released || row.completion.is_some()
+        || row.receive_settlement.is_some() || root.restored.is_some()
+        || root.unconsumed_settlement.is_some()
+        || row.binding.tcb != snapshot.executor
+        || call.admission_key() != admission
+        || call.message().badge() != row.binding.badge
+        || call.message().info() != snapshot.info
+        || call.message().registers() != snapshot.registers
+        || root.pass.child() != row.binding
+        || root.pass.admission_key() != admission
+        || parent.identity() != parent_identity
+        || !super::nested::root_ingress_parent_is_held(parent, admission)
+        || !call.can_park()
+        || crate::REPLY_MAIN_SLOT.load(Ordering::Relaxed) != call.reply()
+        || crate::service_sec_image::hosted_ingress_binding(row.binding.badge) != Some(row.binding)
+    {
+        refuse!(Error::Admission);
+    }
+    let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+    if crate::spawn_hosts::query_component_reply_binding(row.binding.tcb, call.reply())
+        != Ok(ReplyBindingObservation::BoundToTarget)
+    {
+        refuse!(Error::Reply);
+    }
+    root.pass.abort_park_before_effect(row.binding, call, no_effect)
+        .map_err(|(_, no_effect)| (Error::Admission, no_effect))
 }
 
 /// Return an unexecuted root delivery to its existing physical ingress owner. No syscall has

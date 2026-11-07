@@ -25,7 +25,8 @@ enum Phase {
     /// Native may have entered Reply-pool import. No refusal can authorize a second attempt.
     ImportEnteredUnknown,
     Delivered,
-    /// Native may have entered the park effect. No refusal or timeout can reopen this attempt.
+    /// Native may have entered the park effect. Only the exact move-only pre-effect refusal
+    /// receipt can reopen this attempt; a timeout or uncertain result cannot.
     ParkEnteredUnknown,
     Checkpointed,
     RestoreEntered,
@@ -44,6 +45,43 @@ pub struct RootIngressPass<R> {
     phase: Phase,
     settlement: Option<ExternalSettlement>,
     parked: bool,
+    park_attempt_generation: u64,
+}
+
+/// The one physical park attempt authorized by this pass. Its generation prevents an older
+/// refusal from reopening a later attempt for the same retained Call.
+#[must_use = "transfer this attempt to the exact native park or retain it on uncertainty"]
+#[derive(Debug)]
+pub struct RootIngressParkAttempt<R> {
+    child: ThreadBinding<R>,
+    admission: ExternalAdmissionKey,
+    parent: NestedExecutionIdentity,
+    generation: u64,
+}
+
+#[must_use = "consume only to abort the matching pre-effect park attempt"]
+#[derive(Debug)]
+pub struct RootReplyParkNoEffect<R>(RootIngressParkAttempt<R>);
+
+#[must_use = "consume only to acknowledge the matching positive native park"]
+#[derive(Debug)]
+pub struct RootReplyParkCommitted<R>(RootIngressParkAttempt<R>);
+
+impl<R: Copy> RootIngressParkAttempt<R> {
+    pub fn reply(&self) -> u64 { self.admission.reply() }
+
+    /// # Safety
+    /// Native must have observed `Ok(())` from RootReplyPark::try_commit for this attempt.
+    pub unsafe fn after_positive_native_park(self) -> RootReplyParkCommitted<R> {
+        RootReplyParkCommitted(self)
+    }
+
+    /// # Safety
+    /// Native must have received `Err` from RootReplyPark::try_commit before any pool or main
+    /// selector mutation for this exact attempt.
+    pub unsafe fn after_no_effect_native_refusal(self) -> RootReplyParkNoEffect<R> {
+        RootReplyParkNoEffect(self)
+    }
 }
 
 /// One untouched child Call sealed against later binding or delivery. Native retains this in
@@ -99,6 +137,7 @@ impl<R: Copy + Eq> RootIngressPass<R> {
             phase: Phase::Prepared,
             settlement: None,
             parked: false,
+            park_attempt_generation: 0,
         })
     }
 
@@ -217,17 +256,46 @@ impl<R: Copy + Eq> RootIngressPass<R> {
     }
 
     /// Record entry before native RootReplyPark::try_commit. An unknown effect leaves this phase
-    /// sealed; the caller must retain the original Reply and must not replay the park operation.
+    /// sealed; only a certified no-effect refusal may authorize a new attempt.
     pub fn begin_park<M>(
         &mut self,
         child: ThreadBinding<R>,
         call: &ExternalIngress<M>,
-    ) -> Result<(), PassError> {
+    ) -> Result<RootIngressParkAttempt<R>, PassError> {
         self.exact_child(child, call)?;
         if self.phase != Phase::Delivered || !call.can_park() {
             return Err(PassError::InvalidPhase);
         }
+        let generation = self.park_attempt_generation.checked_add(1).ok_or(PassError::Consumed)?;
+        let parent = self.parent.ok_or(PassError::Unbound)?;
+        self.park_attempt_generation = generation;
         self.phase = Phase::ParkEnteredUnknown;
+        Ok(RootIngressParkAttempt {
+            child, admission: self.admission, parent, generation,
+        })
+    }
+
+    /// Reopen only the exact attempt for which native returned a pre-effect refusal receipt.
+    /// A wrong receipt is returned to its owner unchanged.
+    pub fn abort_park_before_effect<M>(
+        &mut self,
+        child: ThreadBinding<R>,
+        call: &ExternalIngress<M>,
+        no_effect: RootReplyParkNoEffect<R>,
+    ) -> Result<(), (PassError, RootReplyParkNoEffect<R>)> {
+        let attempt = &no_effect.0;
+        let error = if child != self.child || call.admission_key() != self.admission
+            || attempt.child != self.child || attempt.admission != self.admission {
+            Some(PassError::WrongChild)
+        } else if self.parent != Some(attempt.parent) {
+            Some(PassError::WrongParent)
+        } else if self.phase != Phase::ParkEnteredUnknown
+            || attempt.generation != self.park_attempt_generation
+            || self.settlement.is_some() || self.parked || !call.can_park() {
+            Some(PassError::InvalidPhase)
+        } else { None };
+        if let Some(error) = error { return Err((error, no_effect)); }
+        self.phase = Phase::Delivered;
         Ok(())
     }
 
@@ -241,11 +309,19 @@ impl<R: Copy + Eq> RootIngressPass<R> {
         &mut self,
         child: ThreadBinding<R>,
         call: &ExternalIngress<M>,
-    ) -> Result<(), PassError> {
-        self.exact_child(child, call)?;
-        if self.phase != Phase::ParkEnteredUnknown || !call.can_park() {
-            return Err(PassError::InvalidPhase);
-        }
+        committed: RootReplyParkCommitted<R>,
+    ) -> Result<(), (PassError, RootReplyParkCommitted<R>)> {
+        let attempt = &committed.0;
+        let error = if child != self.child || call.admission_key() != self.admission
+            || attempt.child != self.child || attempt.admission != self.admission {
+            Some(PassError::WrongChild)
+        } else if self.parent != Some(attempt.parent) {
+            Some(PassError::WrongParent)
+        } else if self.phase != Phase::ParkEnteredUnknown
+            || attempt.generation != self.park_attempt_generation || !call.can_park() {
+            Some(PassError::InvalidPhase)
+        } else { None };
+        if let Some(error) = error { return Err((error, committed)); }
         self.parked = true;
         self.phase = Phase::Checkpointed;
         Ok(())

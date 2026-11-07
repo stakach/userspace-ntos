@@ -1,6 +1,7 @@
 //! A selected root child keeps its Reply and settlement under exact ownership.
 
 const HOSTED: &str = include_str!("../../../components/ntos-executive/src/component_ingress_hosted.rs");
+const PARK: &str = include_str!("../../../components/ntos-executive/src/root_reply_park.rs");
 
 fn function(name: &str) -> &'static str {
     let start = HOSTED.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("missing {name}"));
@@ -15,6 +16,16 @@ fn function(name: &str) -> &'static str {
         }
     }
     panic!("unclosed {name}")
+}
+
+#[test]
+fn selected_park_refusal_receipt_is_issued_only_by_the_pre_effect_err_branch() {
+    let selected = PARK.split_once("fn try_commit_selected(").map(|(_, body)| body).unwrap_or("");
+    assert!(selected.contains("self.try_commit()")
+        && selected.contains("Err(_park) => Err(SelectedParkRefusal::NoEffect(")
+        && selected.contains("attempt.after_no_effect_native_refusal()")
+        && selected.contains("Ok(()) => Ok(attempt.after_positive_native_park())"),
+        "the selected wrapper must distinguish a positive park from the exact no-effect refusal");
 }
 
 #[test]

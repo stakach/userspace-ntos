@@ -208,7 +208,7 @@ fn parked_child_restores_parent_but_keeps_its_reply_for_later_settlement() {
     pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
     unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }
         .unwrap();
-    pass.begin_park(binding(), child.call.as_ref().unwrap())
+    let attempt = pass.begin_park(binding(), child.call.as_ref().unwrap())
         .unwrap();
     assert_eq!(
         pass.begin_restore(&parent).unwrap_err(),
@@ -216,17 +216,17 @@ fn parked_child_restores_parent_but_keeps_its_reply_for_later_settlement() {
     );
     let mut wrong = binding();
     wrong.tcb += 1;
-    assert_eq!(
-        unsafe { pass.acknowledge_park(wrong, child.call.as_ref().unwrap()) }
-            .unwrap_err(),
-        PassError::WrongChild,
-    );
+    let committed = unsafe { attempt.after_positive_native_park() };
+    let (error, committed) = unsafe {
+        pass.acknowledge_park(wrong, child.call.as_ref().unwrap(), committed)
+    }.unwrap_err();
+    assert_eq!(error, PassError::WrongChild);
     assert_eq!(
         pass.begin_restore(&parent).unwrap_err(),
         PassError::Unsettled
     );
     // Native calls acknowledge_park only after its RootReplyPark::commit succeeds.
-    unsafe { pass.acknowledge_park(binding(), child.call.as_ref().unwrap()) }
+    unsafe { pass.acknowledge_park(binding(), child.call.as_ref().unwrap(), committed) }
         .unwrap();
     let permit = pass.begin_restore(&parent).unwrap();
     assert_eq!(permit.parent(), parent.identity());
@@ -252,7 +252,7 @@ fn unknown_park_refuses_until_exact_later_settlement() {
     pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
     unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }
         .unwrap();
-    pass.begin_park(binding(), child.call.as_ref().unwrap())
+    let _attempt = pass.begin_park(binding(), child.call.as_ref().unwrap())
         .unwrap();
     assert_eq!(
         pass.begin_park(binding(), child.call.as_ref().unwrap())
@@ -279,4 +279,63 @@ fn unknown_park_refuses_until_exact_later_settlement() {
         pass.begin_restore(&parent).unwrap().parent(),
         parent.identity()
     );
+}
+
+#[test]
+fn park_entry_returns_a_move_only_attempt_instead_of_numeric_reply_authority() {
+    let child = Child::new(65);
+    let parent = new_parent();
+    let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }.unwrap();
+    let attempt = pass.begin_park(binding(), child.call.as_ref().unwrap()).unwrap();
+    assert!(core::any::type_name_of_val(&attempt).contains("RootIngressParkAttempt"));
+}
+
+#[test]
+fn exact_pre_effect_refusal_reopens_only_its_own_park_attempt() {
+    let child = Child::new(75);
+    let foreign = Child::new(85);
+    let parent = new_parent();
+    let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }.unwrap();
+    let attempt = pass.begin_park(binding(), child.call.as_ref().unwrap()).unwrap();
+    let no_effect = unsafe { attempt.after_no_effect_native_refusal() };
+    let (error, no_effect) = pass.abort_park_before_effect(
+        binding(), foreign.call.as_ref().unwrap(), no_effect,
+    ).unwrap_err();
+    assert_eq!(error, PassError::WrongChild);
+    assert_eq!(pass.begin_restore(&parent).unwrap_err(), PassError::Unsettled);
+    pass.abort_park_before_effect(binding(), child.call.as_ref().unwrap(), no_effect).unwrap();
+    let second = pass.begin_park(binding(), child.call.as_ref().unwrap()).unwrap();
+    assert_eq!(pass.begin_restore(&parent).unwrap_err(), PassError::Unsettled);
+    let positive = unsafe { second.after_positive_native_park() };
+    unsafe { pass.acknowledge_park(binding(), child.call.as_ref().unwrap(), positive) }.unwrap();
+    assert_eq!(pass.begin_restore(&parent).unwrap().parent(), parent.identity());
+}
+
+#[test]
+fn foreign_parent_refusal_cannot_reopen_a_held_child() {
+    let child = Child::new(95);
+    let parent = new_parent();
+    let foreign_parent = new_parent();
+    let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }.unwrap();
+    let attempt = pass.begin_park(binding(), child.call.as_ref().unwrap()).unwrap();
+    let foreign = RootReplyParkNoEffect(RootIngressParkAttempt {
+        child: binding(), admission: child.call.as_ref().unwrap().admission_key(),
+        parent: foreign_parent.identity(), generation: attempt.generation,
+    });
+    let (error, foreign) = pass.abort_park_before_effect(
+        binding(), child.call.as_ref().unwrap(), foreign,
+    ).unwrap_err();
+    assert_eq!(error, PassError::WrongParent);
+    drop(foreign);
+    let no_effect = unsafe { attempt.after_no_effect_native_refusal() };
+    pass.abort_park_before_effect(binding(), child.call.as_ref().unwrap(), no_effect).unwrap();
 }
