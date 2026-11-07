@@ -77,8 +77,9 @@ impl<R: Copy> RootIngressParkAttempt<R> {
     }
 
     /// # Safety
-    /// Native must have received `Err` from RootReplyPark::try_commit before any pool or main
-    /// selector mutation for this exact attempt.
+    /// Native must have either rejected a prepared park whose active Reply differs from this
+    /// attempt before calling `try_commit`, or received `Err` from `try_commit` before any pool
+    /// or main-selector mutation. A later attempt's refusal cannot certify this one.
     pub unsafe fn after_no_effect_native_refusal(self) -> RootReplyParkNoEffect<R> {
         RootReplyParkNoEffect(self)
     }

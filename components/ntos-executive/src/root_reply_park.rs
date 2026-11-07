@@ -9,13 +9,8 @@ pub(crate) struct RootReplyPark {
 }
 
 pub(crate) enum SelectedParkRefusal {
-    /// The prepared park belonged to another active Reply; no selected effect was attempted.
-    /// Retain both values until an exact native owner can prove a separate abort. This does
-    /// not mint the `try_commit`-specific no-effect receipt.
-    WrongReply {
-        park: RootReplyPark,
-        attempt: nt_user_host::root_ingress_pass::RootIngressParkAttempt<crate::HostedThreadRole>,
-    },
+    /// The selected attempt made no Reply-pool or main-selector change. The native child owner
+    /// must still recheck exact CALLS and physical binding before reopening its pure pass.
     NoEffect(nt_user_host::root_ingress_pass::RootReplyParkNoEffect<crate::HostedThreadRole>),
 }
 
@@ -85,14 +80,17 @@ impl RootReplyPark {
         Ok(())
     }
 
-    /// Only this selected wrapper converts the original attempt's pre-effect Err to a
-    /// move-only refusal receipt. A wrong active Reply retains both owners separately.
+    /// Only this selected wrapper converts a proven pre-effect refusal to a move-only receipt.
+    /// A mismatched prepared Reply is refused before try_commit can affect that other Reply.
     pub(crate) unsafe fn try_commit_selected(
         self,
         attempt: nt_user_host::root_ingress_pass::RootIngressParkAttempt<crate::HostedThreadRole>,
     ) -> Result<nt_user_host::root_ingress_pass::RootReplyParkCommitted<crate::HostedThreadRole>, SelectedParkRefusal> {
         if self.active != attempt.reply() {
-            return Err(SelectedParkRefusal::WrongReply { park: self, attempt });
+            // `self` is only a read-only prepared plan. No selected native effect was entered.
+            return Err(SelectedParkRefusal::NoEffect(
+                attempt.after_no_effect_native_refusal(),
+            ));
         }
         match self.try_commit() {
             Ok(()) => Ok(attempt.after_positive_native_park()),

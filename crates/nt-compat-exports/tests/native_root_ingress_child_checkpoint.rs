@@ -19,13 +19,17 @@ fn function(name: &str) -> &'static str {
 }
 
 #[test]
-fn selected_park_refusal_receipt_is_issued_only_by_the_pre_effect_err_branch() {
+fn selected_park_refusal_receipt_requires_a_pre_effect_proof() {
     let selected = PARK.split_once("fn try_commit_selected(").map(|(_, body)| body).unwrap_or("");
-    assert!(selected.contains("self.try_commit()")
+    let mismatch = selected.find("if self.active != attempt.reply()").unwrap();
+    let commit = selected.find("self.try_commit()").unwrap();
+    assert!(mismatch < commit
+        && selected.contains("return Err(SelectedParkRefusal::NoEffect(")
+        && !selected.contains("SelectedParkRefusal::WrongReply")
         && selected.contains("Err(_park) => Err(SelectedParkRefusal::NoEffect(")
         && selected.contains("attempt.after_no_effect_native_refusal()")
         && selected.contains("Ok(()) => Ok(attempt.after_positive_native_park())"),
-        "the selected wrapper must distinguish a positive park from the exact no-effect refusal");
+        "the selected wrapper may certify a mismatch only before entry, or exact try_commit Err");
 }
 
 #[test]
