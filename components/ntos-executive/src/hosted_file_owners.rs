@@ -1128,6 +1128,18 @@ pub(super) fn contains(irp_id: IrpId) -> bool {
     find(irp_id).is_some()
 }
 
+/// Observe the exact unentered READ owner without advancing its flight or borrowing a provider.
+#[allow(dead_code)]
+pub(super) fn queued_read_matches(irp_id: IrpId, file_id: FileId, tid: u64) -> bool {
+    let Some(id) = find(irp_id) else { return false };
+    let owner = row(id);
+    owner.flight == Flight::QueuedDispatch
+        && matches!(owner.payload.as_ref(), Some(Payload::Prepared(prepared))
+            if prepared.projection().major == major::IRP_MJ_READ
+                && prepared.projection().file_id == Some(file_id)
+                && prepared.projection().requestor_tid == tid)
+}
+
 /// The one canonical detached packet currently executing on an exact Device target. A
 /// concurrent same-target dispatch is ambiguous to a nested native lower-edge call and is
 /// refused until its own source identity can be selected independently.

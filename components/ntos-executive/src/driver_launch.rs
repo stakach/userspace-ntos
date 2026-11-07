@@ -74531,6 +74531,16 @@ pub(crate) fn redrive_queued_hosted_file_read_exact(
     hosted_file_owners::redrive_queued_read(irp_id)
 }
 
+/// Memory-only proof that an accepted READ is still queued and has not entered its provider.
+#[allow(dead_code)]
+pub(crate) fn queued_hosted_file_read_matches_exact(
+    irp_id: IrpId,
+    file_id: u64,
+    tid: u64,
+) -> bool {
+    hosted_file_owners::queued_read_matches(irp_id, FileId(file_id), tid)
+}
+
 /// Submit a typed directory query for an exact canonical File to a kernel-mounted provider.
 /// The peer transport does not yet encode this IRP shape.
 pub(crate) unsafe fn dispatch_hosted_file_directory_query_result_exact(
