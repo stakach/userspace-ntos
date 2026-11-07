@@ -299,7 +299,10 @@ fn detached_file_removal_follows_canonical_terminal_and_real_backend_ack() {
         .iter()
         .position(|call| call == "finish_external_file_irp_completion")
         .unwrap();
-    let remove = ack.calls.iter().position(|call| call == "remove").unwrap();
+    // Synchronous and no-backend terminals retire in earlier branches. Check the
+    // removal belonging to the entered backend ACK, after its own completion.
+    let remove = ack.calls.iter().enumerate().skip(retire + 1)
+        .find_map(|(index, call)| (call == "remove").then_some(index)).unwrap();
     assert!(retire < remove);
     assert!(has(&ack.calls[retire..remove], "backend_acknowledged"));
     assert!(
