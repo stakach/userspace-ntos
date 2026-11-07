@@ -511,7 +511,7 @@ unsafe fn reserve_file_cleanup_waiter() -> Option<nt_io_manager::PendingFileClea
     waiters.reserve()
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HostedFileRoute {
     /// Canonical generation-protected File identity.
     file_id: u64,
@@ -28970,9 +28970,16 @@ impl ExecNtHandler {
                 nt_io_manager::FileIoWaitRoute::LocalOverlay { .. } => None,
             };
         }
-        let Some(pid) = self.pm_pid_for_pi(self.pi) else {
-            return None;
-        };
+        self.hosted_file_route_for_pid(self.pm_pid_for_pi(self.pi)?, handle)
+    }
+
+    /// Shared process-local File route lookup. The caller supplies the authenticated PID;
+    /// selected root ingress must never borrow this handler's ambient `self.pi`.
+    fn hosted_file_route_for_pid(
+        &self,
+        pid: nt_process::ProcessId,
+        handle: u64,
+    ) -> Option<HostedFileRoute> {
         let (file_id, process_device_id) = match self
             .pm
             .lookup_handle(pid, handle as nt_process::Handle)
