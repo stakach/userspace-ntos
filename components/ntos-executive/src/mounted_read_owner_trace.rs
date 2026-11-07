@@ -54,7 +54,7 @@ pub(crate) fn receive_boundary_snapshot() {
         None => crate::print_str(b"-"),
     }
     crate::print_str(b"/");
-    crate::print_u64(u64::from(super::MOUNTED_NATIVE_TIMER_REARM_REQUESTED.load(Ordering::Acquire)));
+    crate::print_u64(u64::from(super::MOUNTED_NATIVE_TIMER_REARM_DEMAND.is_pending()));
     crate::print_str(b"/"); crate::print_u64(u64::from(crate::LAST_REARM_AUTHORITY.is_armed()));
     crate::print_str(b"/"); crate::print_u64(crate::LAST_REARM_SOURCE.load(Ordering::Relaxed));
     crate::print_str(b"/"); crate::print_u64(crate::LAST_REARM_DEADLINE.load(Ordering::Relaxed) / 10_000);

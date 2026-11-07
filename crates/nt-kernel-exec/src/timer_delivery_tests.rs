@@ -200,6 +200,47 @@ fn receive_preparation_never_acknowledges_retained_continuation_demand() {
 }
 
 #[test]
+fn mounted_rearm_demand_survives_unavailable_queue_and_failed_programming() {
+    let demand = TimerRearmDemand::new();
+    demand.publish();
+
+    // A queue borrow refusal supplies no reliable claimability observation.
+    assert!(demand.begin(None).is_none());
+    assert!(demand.is_pending());
+
+    for outcome in [TimerRearmOutcome::Failed, TimerRearmOutcome::Unavailable] {
+        demand.begin(Some(true)).unwrap().finish(outcome);
+        assert!(demand.is_pending(), "a failed attempt cannot consume the publication");
+    }
+    demand.begin(Some(true)).unwrap().finish(TimerRearmOutcome::Programmed);
+    assert!(!demand.is_pending());
+}
+
+#[test]
+fn mounted_rearm_idle_acknowledges_only_observed_absence_of_claimable_work() {
+    let demand = TimerRearmDemand::new();
+    demand.publish();
+    demand.begin(Some(true)).unwrap().finish(TimerRearmOutcome::Idle);
+    assert!(demand.is_pending(), "an idle result cannot strand a claimable sector");
+
+    demand.begin(Some(false)).unwrap().finish(TimerRearmOutcome::Idle);
+    assert!(!demand.is_pending());
+}
+
+#[test]
+fn mounted_rearm_success_cannot_acknowledge_a_newer_publication() {
+    let demand = TimerRearmDemand::new();
+    demand.publish();
+    let first = demand.begin(Some(true)).unwrap();
+    demand.publish();
+    first.finish(TimerRearmOutcome::Programmed);
+    assert!(demand.is_pending(), "the first shot cannot cover a later request");
+
+    demand.begin(Some(true)).unwrap().finish(TimerRearmOutcome::Programmed);
+    assert!(!demand.is_pending());
+}
+
+#[test]
 fn expired_timer_dpc_survives_until_a_separate_scheduler_claim() {
     let mut clock = FakeClock::new();
     let mut timers = TimerQueue::new();

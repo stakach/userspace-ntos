@@ -4866,7 +4866,8 @@ pub(crate) unsafe fn rearm_registered_active_delay_timer_with_handler(handler: &
 
 /// Backend dispatch only publishes a request. The live handler is read at an outer boundary,
 /// after backend and mounted queue borrows have been released.
-static MOUNTED_NATIVE_TIMER_REARM_REQUESTED: AtomicBool = AtomicBool::new(false);
+static MOUNTED_NATIVE_TIMER_REARM_DEMAND: nt_kernel_exec::TimerRearmDemand =
+    nt_kernel_exec::TimerRearmDemand::new();
 
 pub(crate) fn request_mounted_native_timer_rearm() {
     let now = monotonic_time_100ns();
@@ -4875,21 +4876,21 @@ pub(crate) fn request_mounted_native_timer_rearm() {
 }
 
 pub(crate) fn request_mounted_native_timer_rearm_after_service() {
-    MOUNTED_NATIVE_TIMER_REARM_REQUESTED.store(true, Ordering::Release);
+    MOUNTED_NATIVE_TIMER_REARM_DEMAND.publish();
 }
 
 unsafe fn rearm_requested_mounted_native_timer(handler: &ExecNtHandler) {
-    if !MOUNTED_NATIVE_TIMER_REARM_REQUESTED.load(Ordering::Acquire)
-        || DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0
+    if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0
         || DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire) != DELAY_TIMER_IRQ_ACTIVE
         || SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) == 0
-        || crate::mounted_volume::mounted_sector_claimable().is_none()
     {
         return;
     }
-    if MOUNTED_NATIVE_TIMER_REARM_REQUESTED.swap(false, Ordering::AcqRel) {
-        rearm_registered_active_delay_timer_with_handler(handler);
-    }
+    let Some(attempt) = MOUNTED_NATIVE_TIMER_REARM_DEMAND
+        .begin(crate::mounted_volume::mounted_sector_claimable()) else { return };
+    let queue = SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) as *const nt_delay_execution::Queue;
+    let outcome = delay_timer_rearm(&*queue, handler);
+    let _ = attempt.finish(outcome);
 }
 
 /// Resolve the active process handle table for a win32k Event handle operation.

@@ -31,6 +31,62 @@ impl TimerRearmOutcome {
     }
 }
 
+/// Retained demand for a physical timer shot. A nested publisher can add work
+/// while an earlier programming attempt is in flight; only that attempt's
+/// captured publication may be acknowledged.
+pub struct TimerRearmDemand {
+    publication: AtomicU64,
+    acknowledged: AtomicU64,
+}
+
+#[must_use = "finish the captured rearm attempt after timer programming"]
+pub struct TimerRearmAttempt<'a> {
+    demand: &'a TimerRearmDemand,
+    publication: u64,
+    claimable: bool,
+}
+
+impl TimerRearmDemand {
+    pub const fn new() -> Self {
+        Self { publication: AtomicU64::new(0), acknowledged: AtomicU64::new(0) }
+    }
+
+    pub fn publish(&self) {
+        self.publication.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.publication.load(Ordering::Acquire) != self.acknowledged.load(Ordering::Acquire)
+    }
+
+    /// An unavailable queue borrow cannot justify either programming or idle.
+    pub fn begin(&self, claimable: Option<bool>) -> Option<TimerRearmAttempt<'_>> {
+        let claimable = claimable?;
+        let publication = self.publication.load(Ordering::Acquire);
+        (publication != self.acknowledged.load(Ordering::Acquire)).then_some(TimerRearmAttempt {
+            demand: self, publication, claimable,
+        })
+    }
+}
+
+impl Default for TimerRearmDemand {
+    fn default() -> Self { Self::new() }
+}
+
+impl TimerRearmAttempt<'_> {
+    /// A successful shot covers the sampled work. Idle is conclusive only when
+    /// the sampled queue had no claimable sector. Failure retains the demand.
+    pub fn finish(self, outcome: TimerRearmOutcome) -> bool {
+        if matches!(outcome, TimerRearmOutcome::Programmed)
+            || (!self.claimable && matches!(outcome, TimerRearmOutcome::Idle))
+        {
+            self.demand.acknowledged.fetch_max(self.publication, Ordering::AcqRel);
+            return true;
+        }
+        false
+    }
+}
+
 /// Outer receive preconditions, sampled from the current timer and scheduler owners.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimerReceiveState {

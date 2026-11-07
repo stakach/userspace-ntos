@@ -111,8 +111,11 @@ fn native_publication_requests_outer_rearm_before_parking() {
         assert!(body[..next].contains("rearm_requested_mounted_native_timer(nt_handler)"),
             "{boundary} must consume mounted publication after backend borrows are released");
     }
-    assert!(SERVICE.contains("rearm_registered_active_delay_timer_with_handler(handler);"),
-        "outer rearm must use the existing handler reference");
+    let rearm = function_body(SERVICE, "unsafe fn rearm_requested_mounted_native_timer(");
+    assert!(rearm.contains("MOUNTED_NATIVE_TIMER_REARM_DEMAND")
+        && rearm.contains("delay_timer_rearm(&*queue, handler)")
+        && rearm.contains("attempt.finish(outcome)"),
+        "outer rearm must use the live handler and settle only the captured demand");
 }
 
 #[test]
