@@ -1641,6 +1641,11 @@ unsafe fn stop_retained_hosted_call(
     {
         return Err(Error::PhysicalIdentity);
     }
+    // A prior acknowledged Stop unlinks the Reply from its caller. Its retained admission
+    // key still identifies this physical Call, while a second native Stop would be replay.
+    if call.is_stopped() {
+        return Ok(());
+    }
     {
         let _saved = crate::ipc_message::SavedMessageBuffer::capture();
         if crate::spawn_hosts::query_component_reply_binding(tcb, reply)
