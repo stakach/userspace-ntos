@@ -769,9 +769,6 @@ pub(crate) unsafe fn prepare_root_ingress_yield(
     let (Some(child), Some(running)) = (snapshot.oldest, snapshot.running) else {
         return Ok(None);
     };
-    if child.admission_sequence != runtime::root_route_probe_admission() {
-        return Ok(None);
-    }
     if child.info >> 12 != nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL {
         return Ok(None);
     }

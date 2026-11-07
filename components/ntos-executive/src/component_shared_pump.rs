@@ -801,16 +801,6 @@ pub(super) unsafe fn receive(
                 // this preflight, so a refused checkpoint leaves the current Receive intact.
                 Err(_) => trace_ps_create_receive(ch, b"root-maintenance-refused", Some(route)),
             }
-            if crate::spawn_hosts::shared_ingress::owner::runtime::root_route_probe_admission() != 0 {
-                match crate::win32k_glue::prepare_root_ingress_yield(ch) {
-                    Ok(Some(yielded)) => return PumpMessage::hosted_root_ingress_yield(yielded),
-                    Ok(None) => {}
-                    Err(_) => {
-                        crate::print_str(b"[root-route-probe] preflight=refused\n");
-                        return PumpMessage::transport_wall();
-                    }
-                }
-            }
         }
         // A native SYSTEM fold may finish its second physical slot while this IRP Receive
         // retains the parent Call. Release its exact CM checkpoint and reserve before a

@@ -2183,7 +2183,6 @@ unsafe fn admit_pending_nested_restore_dispatch(
 unsafe fn admit_pending_win32k_dispatch(
     handler: &mut ExecNtHandler,
     destination: HostedContinuationDestination,
-    table: &nt_syscall::NativeServiceTable,
 ) -> PendingWin32kHandoff {
     let callback_suspended = win32k_glue::take_user_callback_pump_suspended();
     let mut admitted_dispatch_id = 0;
@@ -2210,27 +2209,9 @@ unsafe fn admit_pending_win32k_dispatch(
         };
     }
     if win32k_glue::pending_root_ingress_dispatch_is_some() {
-        if destination == HostedContinuationDestination::Win32k && !callback_suspended {
-            if let Some((_ticket, child)) = win32k_glue::pending_root_ingress_selector() {
-                use crate::spawn_hosts::shared_ingress::owner::runtime::{
-                    self, SelectedRootReadRequestOutcome,
-                };
-                match runtime::selected_root_read_request(child, table) {
-                    SelectedRootReadRequestOutcome::Accepted(request) => {
-                        handler.probe_root_ingress_read_route(request.binding, request.handle);
-                    }
-                    SelectedRootReadRequestOutcome::Unsupported => {
-                        print_str(b"[root-route-probe] selected=unsupported\n");
-                    }
-                    SelectedRootReadRequestOutcome::Changed => {
-                        print_str(b"[root-route-probe] selected=changed\n");
-                    }
-                }
-            } else {
-                print_str(b"[root-route-probe] selector=unavailable\n");
-            }
-        }
-        // The diagnostic does not transfer the pending snapshot, child Call or either Reply.
+        // The distinct owner is retained in the Win32k pending slot, CALLS and PARENTS. This
+        // dormant path must not import the child or rotate either Reply until the serialized
+        // route preflight and undelivered-parent unwind are implemented together.
         return PendingWin32kHandoff {
             callback_suspended, admitted_dispatch_id, parked,
             maintenance_ticket, retained_failure: true,
@@ -14391,7 +14372,7 @@ pub(crate) unsafe fn service_sec_image(
                                     nt_user_host::process_create_callout::InitialThreadReplyOrigin::new(
                                         caller.expect("suspended initial creation has exact caller"), target,
                                     ).expect("foreign initial Reply requires distinct valid owners"),
-                                ), nt_dispatcher.table(),
+                                ),
                             );
                             if handoff.retained_failure {
                                 // The pending win32k snapshot and original Reply remain owned.
@@ -19074,7 +19055,6 @@ pub(crate) unsafe fn service_sec_image(
                 };
                 let handoff = admit_pending_win32k_dispatch(
                     &mut nt_handler, HostedContinuationDestination::Win32k,
-                    nt_dispatcher.table(),
                 );
                 if handoff.retained_failure {
                     // A yielded pump has already transferred its pending snapshot. Preserve

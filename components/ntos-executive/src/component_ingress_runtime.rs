@@ -53,7 +53,7 @@ pub(crate) use hosted::{
     bind_receive_settlement, prepare_receive_settlement, take_outer_boundary,
     bind_root_ingress_pass, prepare_root_ingress_pass,
     begin_undelivered_root_unwind, cancel_restored_undelivered_root_pass,
-    prepared_root_ingress_snapshot, selected_root_read_request, root_route_probe_admission,
+    prepared_root_ingress_snapshot, selected_root_read_request,
     SelectedRootReadRequestOutcome, with_bound_root_ingress_scope,
     cancel_unbound_root_ingress_pass,
     root_ingress_parent_blocks_provider_resume,
