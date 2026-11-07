@@ -274,6 +274,7 @@ pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) {
         .prepare(|| reconcile_runtime(handler))
         .expect("runtime timer ownership must permit blocking receive");
     super::mounted_create_owner_trace::receive_boundary_snapshot();
+    super::mounted_read_owner_trace::receive_boundary_snapshot();
     trace_retained_receive_owners();
 }
 

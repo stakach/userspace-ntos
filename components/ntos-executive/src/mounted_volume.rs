@@ -135,6 +135,14 @@ pub(crate) fn mounted_read_outstanding() -> bool {
         .is_some_and(|queue| queue.borrow().has_outstanding()) }
 }
 
+/// Read-only inspection; a nested owner may temporarily hold the queue borrow.
+/// `Err(())` preserves that distinction from an empty queue.
+pub(crate) fn mounted_read_receive_snapshot() -> Result<Option<[u64; 9]>, ()> {
+    let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_READ_QUEUE)).as_ref() };
+    let Some(queue) = queue else { return Ok(None); };
+    Ok(queue.try_borrow().map_err(|_| ())?.receive_owner_snapshot())
+}
+
 pub(crate) fn complete_mounted_read_sectors(
     claim: crate::mounted_volume_backend::mounted_installed_read::ReadSectorClaim,
     sectors: Result<&[u8], nt_fs::FatPathError>,

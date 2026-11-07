@@ -51,6 +51,8 @@ mod pending_file_delivery;
 mod file_dispatch_handoff;
 #[path = "mounted_create_owner_trace.rs"]
 pub(crate) mod mounted_create_owner_trace;
+#[path = "mounted_read_owner_trace.rs"]
+pub(crate) mod mounted_read_owner_trace;
 #[path = "pending_pipe_read_trace.rs"]
 pub(crate) mod pending_pipe_read_trace;
 #[path = "inline_file_retirement.rs"]

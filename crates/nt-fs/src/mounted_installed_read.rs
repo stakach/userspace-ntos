@@ -93,6 +93,21 @@ impl ReadCompletions {
 
     pub fn has_outstanding(&self) -> bool { !self.entries.is_empty() }
 
+    /// Value-only observation of the oldest retained read; no claim or terminal
+    /// ownership changes. Used at the executive's final receive boundary.
+    pub fn receive_owner_snapshot(&self) -> Option<[u64; 9]> {
+        let entry = self.entries.iter().find(|entry| entry.terminal.is_none())
+            .or_else(|| self.entries.first())?;
+        Some([
+            entry.irp, entry.file, entry.mount, entry.expected as u64,
+            u64::from(entry.cursor.as_ref().is_some_and(|cursor| cursor.request().is_some())
+                && entry.claimed.is_none() && entry.terminal.is_none()),
+            entry.claimed.map_or(0, |claim| claim.generation),
+            u64::from(entry.terminal.is_some()),
+            u64::from(entry.published), self.entries.len() as u64,
+        ])
+    }
+
     pub fn has_claimable_sector(&self) -> bool {
         self.entries.iter().any(|entry| entry.cursor.as_ref().is_some_and(|cursor| cursor.request().is_some())
             && entry.claimed.is_none() && entry.terminal.is_none())
