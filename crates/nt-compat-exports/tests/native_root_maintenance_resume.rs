@@ -3,9 +3,40 @@
 
 const PUMP: &str = include_str!("../../../components/ntos-executive/src/spawn_hosts.rs");
 const RECEIVE: &str = include_str!("../../../components/ntos-executive/src/win32k_receive.rs");
+const GLUE: &str = include_str!("../../../components/ntos-executive/src/win32k_glue.rs");
 const RESUME: &str = include_str!("../../../components/ntos-executive/src/component_resume_maintenance.rs");
 const TERMINAL: &str = include_str!("../../../components/ntos-executive/src/component_terminal.rs");
 const SCHEDULER: &str = include_str!("../../../components/ntos-executive/src/component_resume.rs");
+
+#[test]
+fn returned_receive_half_classifies_and_captures_output_in_one_typed_tail() {
+    let runner = RECEIVE.split("pub(crate) unsafe fn resume_suspended_root_maintenance_component(")
+        .nth(1).expect("maintenance receive runner")
+        .split("pub(crate) unsafe fn resume_suspended_receive_component(").next().unwrap();
+    assert!(runner.contains("classify_returned_win32k_pump("),
+        "returned pump must enter the shared typed classifier");
+    let tail = RECEIVE.split("unsafe fn classify_returned_win32k_pump(")
+        .nth(1).expect("shared returned-pump classifier")
+        .split("pub(crate) unsafe fn resume_suspended_receive_component(").next().unwrap();
+    let capture = tail.find("capture_win32k_dispatch_return(").unwrap();
+    let wall = tail.find("retire_win32k_on_wall(&pump)").unwrap();
+    let provider = tail.find("pump.provider_wait_suspended").unwrap();
+    let lpc = tail.find("pump.lpc_wait_suspended").unwrap();
+    let callback = tail.find("pump.callback_suspended").unwrap();
+    let completed = tail.find("complete_resumed_dispatch(").unwrap();
+    assert!(capture < wall && wall < provider && provider < lpc
+        && lpc < callback && callback < completed);
+    assert!(tail.contains("capture_lpc_wait_repark(")
+        && tail.contains("ProviderWaitPumpCompletion::Reparked")
+        && tail.contains("ProviderWaitPumpCompletion::UserCallbackSuspended"));
+    let completed = GLUE.split("unsafe fn complete_resumed_dispatch(").nth(1)
+        .expect("typed dispatch completion")
+        .split("pub(crate) unsafe fn resume_suspended_lpc_wait_component(").next().unwrap();
+    for output in ["capture_paint_dispatch_output(", "published_win32k_output_length(",
+        "capture_resumed_userconnect_snapshot("] {
+        assert!(completed.contains(output), "completed result must retain {output}");
+    }
+}
 
 #[test]
 fn timer_only_outer_pass_retries_ready_maintenance_without_generic_provider_completion() {

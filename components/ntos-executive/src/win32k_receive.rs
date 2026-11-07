@@ -958,10 +958,22 @@ pub(crate) unsafe fn resume_suspended_root_maintenance_component(
             },
         });
     }
+    match classify_returned_win32k_pump(pending.snapshot, pump) {
+        Ok(completion) => RootMaintenancePumpCompletion::Restored(completion),
+        Err(status) => RootMaintenancePumpCompletion::RetainedFailure(status),
+    }
+}
+
+/// Capture the exact returned receive half before a later dispatch can reuse shared output.
+/// The caller owns entry into this effectful classifier and retains its typed result.
+unsafe fn classify_returned_win32k_pump(
+    snapshot: SuspendedPumpSnapshot,
+    mut pump: crate::spawn_hosts::PumpResult,
+) -> Result<ProviderWaitPumpCompletion, u32> {
     pump.dispatch_return = capture_win32k_dispatch_return(
         pump.dispatch_return_receipt,
-        pending.snapshot.dispatch.dispatch_id,
-        pending.snapshot.dispatch.ssn,
+        snapshot.dispatch.dispatch_id,
+        snapshot.dispatch.ssn,
         pump.result,
         pump.completed,
     );
@@ -971,31 +983,31 @@ pub(crate) unsafe fn resume_suspended_root_maintenance_component(
             as *const nt_provider_wait::ProviderWaitSharedPage;
         ProviderWaitPumpCompletion::Reparked(PendingProviderWaitDispatch {
             request: core::ptr::read_volatile(core::ptr::addr_of!((*page).request)),
-            dispatch: pending.snapshot.dispatch,
-            client: pending.snapshot.client,
+            dispatch: snapshot.dispatch,
+            client: snapshot.client,
             nested_user_callback: false,
-            arg_snapshot_len: pending.snapshot.arg_snapshot_len,
-            arg_snapshot: pending.snapshot.arg_snapshot,
+            arg_snapshot_len: snapshot.arg_snapshot_len,
+            arg_snapshot: snapshot.arg_snapshot,
         })
     } else if pump.lpc_wait_suspended {
         match capture_lpc_wait_repark(
-            pending.snapshot.dispatch, pending.snapshot.client, false,
-            pending.snapshot.arg_snapshot_len, pending.snapshot.arg_snapshot,
+            snapshot.dispatch, snapshot.client, false,
+            snapshot.arg_snapshot_len, snapshot.arg_snapshot,
         ) {
             Some(next) => ProviderWaitPumpCompletion::LpcReparked(next),
-            None => return RootMaintenancePumpCompletion::RetainedFailure(0xC000_0001),
+            None => return Err(0xC000_0001),
         }
     } else if pump.callback_suspended {
         ProviderWaitPumpCompletion::UserCallbackSuspended
     } else if !pump.completed {
-        return RootMaintenancePumpCompletion::RetainedFailure(pump.status as u32);
+        return Err(pump.status as u32);
     } else {
         complete_resumed_dispatch(
-            pending.snapshot.dispatch, pending.snapshot.client, false,
-            pending.snapshot.arg_snapshot_len, pending.snapshot.arg_snapshot, pump,
+            snapshot.dispatch, snapshot.client, false,
+            snapshot.arg_snapshot_len, snapshot.arg_snapshot, pump,
         )
     };
-    RootMaintenancePumpCompletion::Restored(completion)
+    Ok(completion)
 }
 
 pub(crate) unsafe fn resume_suspended_receive_component(
