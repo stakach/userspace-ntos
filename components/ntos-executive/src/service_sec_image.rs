@@ -2205,6 +2205,15 @@ unsafe fn admit_pending_win32k_dispatch(
             maintenance_ticket, retained_failure,
         };
     }
+    if win32k_glue::pending_root_ingress_dispatch_is_some() {
+        // The distinct owner is retained in the Win32k pending slot, CALLS and PARENTS. This
+        // dormant path must not import the child or rotate either Reply until the serialized
+        // route preflight and undelivered-parent unwind are implemented together.
+        return PendingWin32kHandoff {
+            callback_suspended, admitted_dispatch_id, parked,
+            maintenance_ticket, retained_failure: true,
+        };
+    }
     if win32k_glue::pending_root_maintenance_dispatch_is_some() {
         // Initial-thread callouts cannot transfer this ordinary hosted syscall checkpoint.
         // Leave the pending snapshot in its global cell on every pre-effect refusal.

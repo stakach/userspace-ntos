@@ -540,6 +540,93 @@ pub(crate) unsafe fn prepare_root_maintenance_yield(
     }))
 }
 
+/// The entered provider still borrows the executive handler. Only retained ingress and
+/// registered physical dispatch metadata may establish this nested parent identity.
+struct NestedYieldParent {
+    route: nt_component_suspension::peer_registry::PeerRoute,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+    binding: nt_component_suspension::LaneBinding,
+    owner: nt_component_suspension::SuspensionOwner,
+    shared_resume: SharedResumeSnapshot,
+}
+
+struct NestedYieldParentRoute {
+    route: nt_component_suspension::peer_registry::PeerRoute,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+    binding: nt_component_suspension::LaneBinding,
+    active: nt_user_callback::DispatchContext,
+    client: Win32kClientContext,
+    provider: nt_provider_wait::ProviderDomainIdentity,
+}
+
+unsafe fn validate_nested_yield_parent_route(
+    channel: &crate::spawn_hosts::PumpChannel,
+    running: runtime::RunningSnapshot,
+    caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+    generation: u64,
+) -> Result<Option<NestedYieldParentRoute>, runtime::Error> {
+    let Some(dispatch) = running.dispatch else { return Ok(None); };
+    let Some(binding) = running.binding else { return Ok(None); };
+    let route = runtime::channel_route(channel)
+        .map_err(|error| trace_receive_failure(b"channel-route", error, channel, None))?
+        .ok_or_else(|| trace_receive_failure(b"missing-route", runtime::Error::PhysicalIdentity, channel, None))?;
+    let active = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    let registered_client = (&*core::ptr::addr_of!(WIN32K_DISPATCH_CLIENT_REGISTRY))
+        .dispatch(active.dispatch_id);
+    if active.lane != running.lane
+        || binding.executor_id != channel.tcb
+        || binding.receive_endpoint != channel.fault_ep
+        || running.route != Some(route)
+        || route.identity().lane != active.lane
+        || !registered_client.is_some_and(|client| {
+                client.logical_caller == Some(caller)
+                    && client.tcb == caller.tcb()
+                    && client.generation == generation
+            })
+    {
+        return Err(trace_receive_failure(b"dispatch-identity", runtime::Error::PhysicalIdentity, channel, Some(route)));
+    }
+    let provider = crate::current_win32k_provider_domain().ok_or_else(||
+        trace_receive_failure(b"provider-domain", runtime::Error::PhysicalIdentity, channel, Some(route)))?;
+    if !running.physical.is_some_and(|physical| {
+        matches!(physical.domain, runtime::PhysicalDomain::Provider { domain, .. } if domain == provider)
+            && physical.pml4 == channel.pml4 && physical.tcb == channel.tcb
+    }) {
+        return Err(trace_receive_failure(b"physical-source", runtime::Error::PhysicalIdentity, channel, Some(route)));
+    }
+    let client = win32k_client_context_from_callback_client(registered_client.unwrap());
+    Ok(Some(NestedYieldParentRoute { route, dispatch, binding, active, client, provider }))
+}
+
+unsafe fn finish_nested_yield_parent(
+    channel: &crate::spawn_hosts::PumpChannel,
+    parent: NestedYieldParentRoute,
+    caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+    generation: u64,
+) -> Result<NestedYieldParent, runtime::Error> {
+    let NestedYieldParentRoute { route, dispatch, binding, active, client, provider } = parent;
+    let pi = u32::try_from(caller.pi()).map_err(|_| trace_receive_failure(
+        b"client-pi-width", runtime::Error::PhysicalIdentity, channel, Some(route)))?;
+    if u64::from(pi) != channel.client_pi || generation != channel.client_generation {
+        return Err(trace_receive_failure(b"client-generation", runtime::Error::PhysicalIdentity, channel, Some(route)));
+    }
+    let shared_resume = capture_shared_resume_snapshot(active, client);
+    let owner = nt_component_suspension::SuspensionOwner {
+        provider_domain: provider.domain,
+        provider_generation: provider.generation,
+        dispatch_id: active.dispatch_id,
+        caller: nt_component_suspension::SuspensionCaller::Hosted(
+            nt_component_suspension::SuspensionHostedClient {
+                client_pi: pi,
+                client_generation: generation,
+                client_tid: u64::from(caller.thread().thread_id()),
+                client_badge: caller.badge(),
+            },
+        ),
+    };
+    Ok(NestedYieldParent { route, dispatch, binding, owner, shared_resume })
+}
+
 /// Inspect only already-authenticated ingress and registered dispatch metadata. The outer
 /// executive handler is still borrowed by the entered provider; no handler reborrow is allowed.
 pub(crate) unsafe fn prepare_receive_yield(
@@ -586,40 +673,9 @@ pub(crate) unsafe fn prepare_receive_yield(
     let Some(running) = snapshot.running else {
         return Ok(None);
     };
-    let Some(dispatch) = running.dispatch else {
-        return Ok(None);
-    };
-    let Some(binding) = running.binding else {
-        return Ok(None);
-    };
-    let route = runtime::channel_route(channel)
-        .map_err(|error| trace_receive_failure(b"channel-route", error, channel, None))?
-        .ok_or_else(|| trace_receive_failure(b"missing-route", runtime::Error::PhysicalIdentity, channel, None))?;
-    let active = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
-    let registered_client = (&*core::ptr::addr_of!(WIN32K_DISPATCH_CLIENT_REGISTRY))
-        .dispatch(active.dispatch_id);
-    if active.lane != running.lane
-        || binding.executor_id != channel.tcb
-        || binding.receive_endpoint != channel.fault_ep
-        || running.route != Some(route)
-        || route.identity().lane != active.lane
-        || !registered_client.is_some_and(|client| {
-                client.logical_caller == Some(caller)
-                    && client.tcb == caller.tcb()
-                    && client.generation == generation
-            })
-    {
-        return Err(trace_receive_failure(b"dispatch-identity", runtime::Error::PhysicalIdentity, channel, Some(route)));
-    }
-    let provider =
-        crate::current_win32k_provider_domain().ok_or_else(||
-            trace_receive_failure(b"provider-domain", runtime::Error::PhysicalIdentity, channel, Some(route)))?;
-    if !running.physical.is_some_and(|physical| {
-        matches!(physical.domain, runtime::PhysicalDomain::Provider { domain, .. } if domain == provider)
-            && physical.pml4 == channel.pml4 && physical.tcb == channel.tcb
-    }) {
-        return Err(trace_receive_failure(b"physical-source", runtime::Error::PhysicalIdentity, channel, Some(route)));
-    }
+    let Some(parent_route) = validate_nested_yield_parent_route(
+        channel, running, caller, generation,
+    )? else { return Ok(None); };
     let Some(child_root) = crate::service_sec_image::receive_vspace::peek_root(child.binding)
     else {
         return Ok(None);
@@ -632,30 +688,12 @@ pub(crate) unsafe fn prepare_receive_yield(
     ) {
         return Ok(None);
     }
-    let pi = u32::try_from(caller.pi()).map_err(|_| trace_receive_failure(
-        b"client-pi-width", runtime::Error::PhysicalIdentity, channel, Some(route)))?;
-    if u64::from(pi) != channel.client_pi || generation != channel.client_generation {
-        return Err(trace_receive_failure(b"client-generation", runtime::Error::PhysicalIdentity, channel, Some(route)));
-    }
-    // The physical shared page may be reused by another dispatch as soon as this parent parks.
-    // Retain the authenticated client's publication while this dispatch still owns the page.
-    let shared_resume = capture_shared_resume_snapshot(
-        active,
-        win32k_client_context_from_callback_client(registered_client.unwrap()),
-    );
-    let owner = nt_component_suspension::SuspensionOwner {
-        provider_domain: provider.domain,
-        provider_generation: provider.generation,
-        dispatch_id: active.dispatch_id,
-        caller: nt_component_suspension::SuspensionCaller::Hosted(
-            nt_component_suspension::SuspensionHostedClient {
-                client_pi: pi,
-                client_generation: generation,
-                client_tid: u64::from(caller.thread().thread_id()),
-                client_badge: caller.badge(),
-            },
-        ),
-    };
+    let parent = finish_nested_yield_parent(channel, parent_route, caller, generation)?;
+    let dispatch = parent.dispatch;
+    let binding = parent.binding;
+    let route = parent.route;
+    let owner = parent.owner;
+    let shared_resume = parent.shared_resume;
     let replaces = {
         // Canonical lane storage outlives any transient arena inherited by this pump.
         let _durable = crate::allocator::enter_durable();
@@ -697,6 +735,72 @@ pub(crate) unsafe fn prepare_receive_yield(
         replaces,
         shared_resume,
     }))
+}
+
+/// Prepare one ordinary root Call without entering the borrowed executive handler. The parent
+/// is parked but deliberately left unbound: the serialized root owner must authenticate the
+/// child's File route before it may bind/deliver it, or perform an undelivered parent unwind.
+/// This entry is dormant until both outer outcomes have exact native checkpoints and an
+/// initial-dispatch provenance gate excludes resumed provider/callback receive halves.
+pub(crate) unsafe fn prepare_root_ingress_yield(
+    channel: &crate::spawn_hosts::PumpChannel,
+) -> Result<Option<RootIngressYield>, runtime::Error> {
+    if !channel.caps.hosted_receive_yield
+        || channel.kernel_caller.is_some()
+        || channel.caps.kind != crate::spawn_hosts::ReqKind::Syscall
+        || crate::writable_fs::registry_journal::owns_volume()
+    {
+        return Ok(None);
+    }
+    let Some(caller) = channel.logical_caller else { return Ok(None); };
+    let nt_user_host::process_identity::ProcessGeneration::Hosted(generation) =
+        caller.process().generation
+    else { return Ok(None); };
+    let snapshot = runtime::hold_snapshot();
+    let (Some(child), Some(running)) = (snapshot.oldest, snapshot.running) else {
+        return Ok(None);
+    };
+    if child.info >> 12 != nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL {
+        return Ok(None);
+    }
+    let Some(parent_route) = validate_nested_yield_parent_route(
+        channel, running, caller, generation,
+    )? else { return Ok(None); };
+    let Some(child_root) = crate::service_sec_image::receive_vspace::peek_root(child.binding)
+    else { return Ok(None); };
+    if !crate::service_sec_image::receive_vspace::validate_pair(
+        child.binding.tcb, child_root, channel.tcb, channel.pml4,
+    ) {
+        return Ok(None);
+    }
+    let parent = finish_nested_yield_parent(channel, parent_route, caller, generation)?;
+    {
+        let _durable = crate::allocator::enter_durable();
+        let lanes = &mut *core::ptr::addr_of_mut!(crate::service_sec_image::COMPONENT_SUSPENSIONS);
+        lanes.reserve_root_ingress_capacity(
+            running.lane, parent.binding.reply_object, parent.owner,
+        ).map_err(|_| runtime::Error::Capacity)?;
+    }
+    let admission = runtime::prepare_root_ingress_pass(child)?;
+    match runtime::nested::park_current_for_root(admission) {
+        runtime::nested::RootParkOutcome::NoRunningLane(proof)
+        | runtime::nested::RootParkOutcome::RefusedNoEffect(_, proof) => {
+            if runtime::cancel_unbound_root_ingress_pass(child, admission, proof).is_ok() {
+                Ok(None)
+            } else {
+                Ok(Some(RootIngressYield::Retained { child: admission }))
+            }
+        }
+        runtime::nested::RootParkOutcome::Retained(_) => {
+            Ok(Some(RootIngressYield::Retained { child: admission }))
+        }
+        runtime::nested::RootParkOutcome::Parked(handle) => {
+            Ok(Some(RootIngressYield::ParkedUnbound {
+                ticket: handle.ticket(), child: admission, owner: parent.owner,
+                shared_resume: parent.shared_resume,
+            }))
+        }
+    }
 }
 
 pub(crate) unsafe fn receive_continuation_is_current(

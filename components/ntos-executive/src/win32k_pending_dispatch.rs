@@ -14,6 +14,23 @@ pub(crate) struct ReceiveYield {
     pub shared_resume: SharedResumeSnapshot,
 }
 
+/// A selected ordinary root Call has not entered its handler. The physical parent remains in
+/// PARENTS; this copyable ticket is only a selector, never a replacement for its held Reply.
+#[derive(Clone, Copy)]
+pub(crate) enum RootIngressYield {
+    ParkedUnbound {
+        ticket: crate::spawn_hosts::shared_ingress::owner::runtime::nested::NestedRestoreTicket,
+        child: nt_component_suspension::ExternalAdmissionKey,
+        owner: nt_component_suspension::SuspensionOwner,
+        shared_resume: SharedResumeSnapshot,
+    },
+    /// A native park or cancellation was uncertain. CALLS and PARENTS retain their owners;
+    /// the outer handoff quarantines this admission until an exact reconciliation path exists.
+    Retained {
+        child: nt_component_suspension::ExternalAdmissionKey,
+    },
+}
+
 /// A dispatch worker's exact retained service wait while the win32k syscall pump yields its
 /// receive half to the root. This does not represent a nested parent or a provider completion.
 #[derive(Clone, Copy)]
@@ -125,6 +142,18 @@ pub(crate) unsafe fn restore_pending_root_maintenance_dispatch(
 pub(crate) struct PendingReceiveDispatch {
     pub yielded: ReceiveYield,
     pub snapshot: SuspendedPumpSnapshot,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PendingRootIngressDispatch {
+    pub yielded: RootIngressYield,
+    pub snapshot: SuspendedPumpSnapshot,
+}
+
+pub(super) static mut ROOT_INGRESS_PENDING_DISPATCH: Option<PendingRootIngressDispatch> = None;
+
+pub(crate) unsafe fn pending_root_ingress_dispatch_is_some() -> bool {
+    (&*core::ptr::addr_of!(ROOT_INGRESS_PENDING_DISPATCH)).is_some()
 }
 
 pub(super) static mut RECEIVE_PENDING_DISPATCH: Option<PendingReceiveDispatch> = None;

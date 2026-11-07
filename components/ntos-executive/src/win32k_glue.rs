@@ -14,7 +14,7 @@ mod pending_dispatch;
 mod receive;
 #[path = "win32k_lane_diagnostics.rs"]
 mod lane_diagnostics;
-pub(crate) use receive::{prepare_receive_yield, prepare_service_wait_yield,
+pub(crate) use receive::{prepare_receive_yield, prepare_root_ingress_yield, prepare_service_wait_yield,
     prepare_root_maintenance_yield,
     root_maintenance_continuation_is_current,
     resume_suspended_receive_component, receive_continuation_is_current,
@@ -27,6 +27,8 @@ pub(crate) use pending_dispatch::{
     take_pending_lpc_wait_dispatch, take_pending_provider_wait_dispatch, LpcWaitPumpCompletion,
     PendingLpcWaitDispatch, PendingProviderWaitDispatch, ProviderWaitPumpCompletion,
     PendingReceiveDispatch, ReceiveYield, take_pending_receive_dispatch,
+    PendingRootIngressDispatch, RootIngressYield,
+    pending_root_ingress_dispatch_is_some,
     PendingServiceWaitDispatch, ServiceWaitYield, take_pending_service_wait_dispatch,
     PendingRootMaintenanceDispatch, RootMaintenanceYield, take_pending_root_maintenance_dispatch,
     pending_root_maintenance_dispatch_is_some,
@@ -40,7 +42,7 @@ use pending_dispatch::{
     SharedResumeSnapshot, SuspendedPumpSnapshot,
     LPC_WAIT_LAST_PUMP_SUSPENDED, LPC_WAIT_PENDING_DISPATCH, PROVIDER_WAIT_LAST_PUMP_SUSPENDED,
     PROVIDER_WAIT_PENDING_DISPATCH,
-    RECEIVE_PENDING_DISPATCH,
+    RECEIVE_PENDING_DISPATCH, ROOT_INGRESS_PENDING_DISPATCH,
     SERVICE_WAIT_PENDING_DISPATCH,
     ROOT_MAINTENANCE_PENDING_DISPATCH,
     NESTED_RESTORE_PENDING_DISPATCH,
@@ -4562,7 +4564,8 @@ pub(crate) unsafe fn retire_bugchecked_vspace(vspace: u64, reporting_tcb: u64) {
 
 unsafe fn retire_win32k_on_wall(pr: &crate::spawn_hosts::PumpResult) {
     if pr.completed || pr.callback_suspended || pr.provider_wait_suspended || pr.lpc_wait_suspended
-        || pr.receive_yield.is_some() || pr.service_wait_yield.is_some()
+        || pr.receive_yield.is_some() || pr.root_ingress_yield.is_some()
+        || pr.service_wait_yield.is_some()
         || pr.maintenance_yield.is_some() || pr.nested_restore_yield.is_some()
         || pr.nested_restore_quarantined.is_some()
     {
@@ -7591,7 +7594,8 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             crate::service_sec_image::suspend_component_execution_lane_for_callback(lane, token)
         })
     } else if pr.provider_wait_suspended || pr.lpc_wait_suspended
-        || pr.receive_yield.is_some() || pr.service_wait_yield.is_some()
+        || pr.receive_yield.is_some() || pr.root_ingress_yield.is_some()
+        || pr.service_wait_yield.is_some()
         || pr.maintenance_yield.is_some() || pr.nested_restore_yield.is_some()
         || pr.nested_restore_quarantined.is_some() {
         true
@@ -7623,6 +7627,26 @@ unsafe fn win32k_dispatch_wide_observed_inner(
                 client, callback_token: None, arg_snapshot_len, arg_snapshot,
             },
         }));
+    }
+    if let Some(yielded) = pr.root_ingress_yield {
+        assert!(!nested_user_callback && outer_callback.is_none(),
+            "root ingress owns only an initial hosted dispatch");
+        assert!((*core::ptr::addr_of!(ROOT_INGRESS_PENDING_DISPATCH)).is_none());
+        let (arg_snapshot_len, arg_snapshot) = capture_initial_arg_snapshot(ssn, completion_args);
+        let dispatch = UserCallbackDispatchContext { lane, dispatch_id, ssn,
+            args: completion_args, caller_sp, output_stage, paint_output };
+        let shared_resume = match yielded {
+            RootIngressYield::ParkedUnbound { shared_resume, .. } => shared_resume,
+            RootIngressYield::Retained { .. } => capture_shared_resume_snapshot(dispatch, client),
+        };
+        core::ptr::write(core::ptr::addr_of_mut!(ROOT_INGRESS_PENDING_DISPATCH),
+            Some(PendingRootIngressDispatch {
+                yielded,
+                snapshot: SuspendedPumpSnapshot {
+                    pump: pr, channel: ch, dispatch, shared_resume,
+                    client, callback_token: None, arg_snapshot_len, arg_snapshot,
+                },
+            }));
     }
     if let Some(yielded) = pr.service_wait_yield {
         assert!(!nested_user_callback && outer_callback.is_none(),
@@ -7746,6 +7770,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             || pr.provider_wait_suspended
             || pr.lpc_wait_suspended
             || pr.receive_yield.is_some()
+            || pr.root_ingress_yield.is_some()
             || pr.service_wait_yield.is_some()
             || pr.maintenance_yield.is_some()
             || pr.nested_restore_yield.is_some()
@@ -7775,6 +7800,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         && !pr.provider_wait_suspended
         && !pr.lpc_wait_suspended
         && pr.receive_yield.is_none()
+        && pr.root_ingress_yield.is_none()
         && pr.service_wait_yield.is_none()
         && pr.maintenance_yield.is_none()
         && pr.nested_restore_yield.is_none()

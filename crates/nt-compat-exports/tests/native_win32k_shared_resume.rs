@@ -62,7 +62,10 @@ fn receive_yield_retains_shared_publication_before_nested_settlement() {
     let receive_source = include_str!("../../../components/ntos-executive/src/win32k_receive.rs");
     let receive = syn::parse_file(receive_source).unwrap();
     let prepare = function(&receive, "prepare_receive_yield");
-    let capture = call_position(prepare, "capture_shared_resume_snapshot")
+    let parent = function(&receive, "finish_nested_yield_parent");
+    assert!(call_position(parent, "capture_shared_resume_snapshot").is_some(),
+        "the authenticated parent must capture its shared publication");
+    let capture = call_position(prepare, "finish_nested_yield_parent")
         .expect("capture the dispatch publication at its authenticated yield boundary");
     let nested = call_position(prepare, "prepare_receive_settlement")
         .expect("receive settlement boundary");

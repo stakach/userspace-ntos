@@ -180,6 +180,28 @@ pub(crate) unsafe fn root_ingress_parent_is_held(
         })
 }
 
+/// Recover only the exact parked, still-unbound parent selector after the pump returned to the
+/// serialized root owner. No child admission or physical effect is performed by this lookup.
+pub(crate) unsafe fn parked_unbound_root_parent(
+    ticket: NestedRestoreTicket,
+    admission: ExternalAdmissionKey,
+) -> Option<ParkedParentHandle> {
+    let parent = (&*core::ptr::addr_of!(PARENTS)).get(ticket.index)?.as_ref()?;
+    if !ticket_matches(ticket, parent)
+        || parent.root_admission != Some(admission)
+        || parent.child.is_some()
+        || parent.phase != ParentPhase::Parked
+        || !parent.physical.held()
+    {
+        return None;
+    }
+    Some(ParkedParentHandle {
+        index: ticket.index,
+        generation: ticket.generation,
+        identity: ticket.identity,
+    })
+}
+
 fn row_matches(handle: &ParkedParentHandle, parent: &Parent) -> bool {
     ticket_matches(handle.ticket(), parent)
 }
