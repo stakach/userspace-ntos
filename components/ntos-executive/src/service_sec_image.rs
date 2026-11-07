@@ -14917,29 +14917,7 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.dbgk_block_request {
                     park_dbgk_reporter = true;
                 }
-                let _ = driver_launch::pump_hosted_file_lifecycle();
-                let hosted_io_progress = pump_hosted_io_and_redrive_driver_starts(
-                    driver_launch::drain_hosted_driver_dpcs(),
-                    &mut nt_handler,
-                );
-                if hosted_io_progress != 0
-                    || FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
-                {
-                    let _ = pending_file_io_redrive_all(&mut nt_handler);
-                    let _ = file_cleanup_redrive_all(&mut nt_handler);
-                    let _ = driver_launch::pump_hosted_file_lifecycle();
-                }
-                if nt_handler.pipe_endpoint_progress || hosted_io_progress != 0 {
-                    let _ = pending_file_io_redrive_all(&mut nt_handler);
-                }
-                // Cancellation drains are ordered after the original IRP owners. A waiter becomes
-                // runnable only once generic/LISTEN publication has ACKed and removed every exact
-                // manager IRP for its File and requestor thread.
-                let _ = file_irp_drain_redrive_all(&mut nt_handler);
-                if nt_handler.lpc_endpoint_progress {
-                    let _ = lpc_endpoint_redrive_all(&mut nt_handler);
-                }
-                let _ = lpc_connect_completion_drain(&mut nt_handler);
+                redrive_global_post_syscall_work(&mut nt_handler);
                 // The hosted-exe lane reserved a spawn after validating the owner-local file ->
                 // section -> process transition in `exe_images`. The remaining per-image policy is
                 // the address-space descriptor; handle publication and ProcessManager wiring are
@@ -27757,6 +27735,34 @@ fn service_mounted_native_blocks_and_redrive_backends() -> u64 {
     let native_blocks = driver_launch::service_mounted_native_blocks() as u64;
     if native_blocks == 0 { return 0; }
     native_blocks.saturating_add(driver_launch::service_pending_file_backends() as u64)
+}
+
+/// Advance hosted I/O, driver, File, and LPC owners after the current syscall.
+/// Keep the original ordering and retry-flag claim.
+unsafe fn redrive_global_post_syscall_work(nt_handler: &mut ExecNtHandler) {
+    let _ = driver_launch::pump_hosted_file_lifecycle();
+    let hosted_io_progress = pump_hosted_io_and_redrive_driver_starts(
+        driver_launch::drain_hosted_driver_dpcs(),
+        nt_handler,
+    );
+    if hosted_io_progress != 0
+        || FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
+    {
+        let _ = pending_file_io_redrive_all(nt_handler);
+        let _ = file_cleanup_redrive_all(nt_handler);
+        let _ = driver_launch::pump_hosted_file_lifecycle();
+    }
+    if nt_handler.pipe_endpoint_progress || hosted_io_progress != 0 {
+        let _ = pending_file_io_redrive_all(nt_handler);
+    }
+    // Cancellation drains are ordered after the original IRP owners. A waiter becomes
+    // runnable only once generic/LISTEN publication has ACKed and removed every exact
+    // manager IRP for its File and requestor thread.
+    let _ = file_irp_drain_redrive_all(nt_handler);
+    if nt_handler.lpc_endpoint_progress {
+        let _ = lpc_endpoint_redrive_all(nt_handler);
+    }
+    let _ = lpc_connect_completion_drain(nt_handler);
 }
 
 // Callers execute DPCs before borrowing the handler and pass only the completed work count.
