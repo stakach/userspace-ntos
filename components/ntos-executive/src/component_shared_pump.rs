@@ -89,6 +89,10 @@ struct ActiveSyscallSnapshot {
     client_generation: AtomicU64,
     provider_arrivals: AtomicU64,
     last_provider_at_100ns: AtomicU64,
+    last_arrival_kind: AtomicU64,
+    last_arrival_route: AtomicU64,
+    last_arrival_reply: AtomicU64,
+    last_arrival_info: AtomicU64,
     phase: AtomicU64,
     last_transition_at_100ns: AtomicU64,
     reply_binding: AtomicU64,
@@ -120,6 +124,10 @@ impl ActiveSyscallSnapshot {
             client_generation: AtomicU64::new(0),
             provider_arrivals: AtomicU64::new(0),
             last_provider_at_100ns: AtomicU64::new(0),
+            last_arrival_kind: AtomicU64::new(0),
+            last_arrival_route: AtomicU64::new(0),
+            last_arrival_reply: AtomicU64::new(0),
+            last_arrival_info: AtomicU64::new(0),
             phase: AtomicU64::new(0),
             last_transition_at_100ns: AtomicU64::new(0),
             reply_binding: AtomicU64::new(0),
@@ -173,6 +181,10 @@ fn capture_active_syscall_snapshot(ch: &PumpChannel, route: PeerRoute) -> Option
     slot.client_generation.store(ch.client_generation, Ordering::Relaxed);
     slot.provider_arrivals.store(0, Ordering::Relaxed);
     slot.last_provider_at_100ns.store(0, Ordering::Relaxed);
+    slot.last_arrival_kind.store(0, Ordering::Relaxed);
+    slot.last_arrival_route.store(0, Ordering::Relaxed);
+    slot.last_arrival_reply.store(0, Ordering::Relaxed);
+    slot.last_arrival_info.store(0, Ordering::Relaxed);
     slot.observation_epoch.store(0, Ordering::Relaxed);
     slot.phase.store(SYSCALL_PHASE_PUMP_WORK, Ordering::Relaxed);
     slot.last_transition_at_100ns.store(slot.started_100ns.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -216,6 +228,12 @@ pub(super) fn print_active_syscall_receive_census() {
             slot.notification_timer_probe.load(Ordering::Relaxed),
             slot.notification_at_100ns.load(Ordering::Relaxed),
         ];
+        let arrival = [
+            slot.last_arrival_kind.load(Ordering::Relaxed),
+            slot.last_arrival_route.load(Ordering::Relaxed),
+            slot.last_arrival_reply.load(Ordering::Relaxed),
+            slot.last_arrival_info.load(Ordering::Relaxed),
+        ];
         core::sync::atomic::fence(Ordering::Acquire);
         if slot.observation_epoch.load(Ordering::Acquire) != epoch { continue; }
         if slot.sequence.load(Ordering::Acquire) != sequence { continue; }
@@ -225,6 +243,12 @@ pub(super) fn print_active_syscall_receive_census() {
         for value in values {
             crate::print_str(b"/"); crate::print_u64(value);
         }
+        crate::print_str(b"\n");
+        crate::print_str(b"[pump-last-provider-arrival] kind/route/reply/info=");
+        crate::print_u64(arrival[0]);
+        crate::print_str(b"/"); crate::print_u64(arrival[1]);
+        crate::print_str(b"/"); crate::print_u64(arrival[2]);
+        crate::print_str(b"/"); crate::print_u64(arrival[3]);
         crate::print_str(b"\n");
         let last_provider = values[14].max(values[0]);
         let now = crate::monotonic_time_100ns();
@@ -243,6 +267,10 @@ pub(super) fn print_active_syscall_receive_census() {
             // message; this is an observation, never authority to reuse Reply.
             let _saved = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
             unsafe {
+                crate::service_sec_image::trace_stale_suspension_frames(values[6], values[7]);
+                crate::win32k_glue::trace_stale_callback_chain(
+                    values[11], values[6], values[7],
+                );
                 crate::win32k_glue::trace_hosted_tcb_debug_state(
                     b"pump-stale-provider", values[8], values[9],
                 );
@@ -452,13 +480,19 @@ impl ReceiveCensusScope {
     }
 }
 
-fn record_active_syscall_provider_arrival(scope: &ReceiveCensusScope) {
+fn record_active_syscall_provider_arrival(
+    scope: &ReceiveCensusScope, kind: u64, route: u64, reply: u64, info: u64,
+) {
     let Some((index, sequence)) = scope.syscall_snapshot else { return; };
     let slot = &ACTIVE_SYSCALL_SNAPSHOTS[index];
     if slot.sequence.load(Ordering::Acquire) != sequence { return; }
     slot.begin_update();
     slot.provider_arrivals.fetch_add(1, Ordering::Relaxed);
     slot.last_provider_at_100ns.store(crate::monotonic_time_100ns(), Ordering::Relaxed);
+    slot.last_arrival_kind.store(kind, Ordering::Relaxed);
+    slot.last_arrival_route.store(route, Ordering::Relaxed);
+    slot.last_arrival_reply.store(reply, Ordering::Relaxed);
+    slot.last_arrival_info.store(info, Ordering::Relaxed);
     slot.end_update();
 }
 
@@ -1035,13 +1069,18 @@ pub(super) unsafe fn receive(
         match arrival {
             Ok(runtime::Arrival::Hosted) => {
                 record_active_syscall_transition(&census_scope, SYSCALL_PHASE_HOSTED);
-                record_active_syscall_provider_arrival(&census_scope);
+                record_active_syscall_provider_arrival(&census_scope, 1, 0, 0, 0);
                 trace_ps_create_receive(ch, b"hosted-arrival", Some(route));
                 trace_ps_create_event(b"hosted-arrival", route, 0, 0);
             }
             Ok(runtime::Arrival::Call { route: sender, reply }) => {
                 record_active_syscall_transition(&census_scope, SYSCALL_PHASE_CALL);
-                record_active_syscall_provider_arrival(&census_scope);
+                let info = runtime::pending_route_snapshot(sender)
+                    .ok().flatten().filter(|(held_reply, _)| *held_reply == reply)
+                    .map_or(0, |(_, info)| info);
+                record_active_syscall_provider_arrival(
+                    &census_scope, 2, sender.badge(), reply, info,
+                );
                 trace_ps_create_receive(ch, b"call-arrival", Some(sender));
                 trace_ps_create_event(b"call-arrival", sender, reply, 0);
                 // The coordinator retains unrelated Calls for their exact source. Inspect only

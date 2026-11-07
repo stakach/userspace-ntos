@@ -1051,6 +1051,16 @@ impl<const DEPTH: usize> ContinuationStack<DEPTH> {
             .count()
     }
 
+    /// Observe one client's ordered continuation chain without exposing another thread's frames.
+    pub fn frames_for<'a>(
+        &'a self, client: &'a ClientThreadIdentity,
+    ) -> impl Iterator<Item = &'a ContinuationFrame> + 'a {
+        self.frames[..self.len]
+            .iter()
+            .filter_map(Option::as_ref)
+            .filter(move |frame| frame.client == *client)
+    }
+
     /// Does this client thread hold NO continuation? (The next dispatch it issues is a root one.)
     pub fn is_empty_for(&self, client: &ClientThreadIdentity) -> bool {
         self.top_index_for(client).is_none()

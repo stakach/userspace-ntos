@@ -2510,6 +2510,94 @@ pub(crate) unsafe fn active_callback_client_tcb(
     Some(owner.client_tcb)
 }
 
+/// One bounded observation after the exact syscall owner has stopped receiving provider work.
+/// Copy each frame before serial output; neither callback nor wait ownership changes here.
+pub(crate) unsafe fn trace_stale_callback_chain(
+    client_pi: u64, lane_index: u64, lane_generation: u64,
+) {
+    let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
+    let continuations = &*core::ptr::addr_of!(USER_CALLBACK_CONTINUATIONS);
+    let current = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    print_str(b"[pump-stale-callback-chain] current-dispatch/ssn/lane/gen/active-depth/continuation-depth=");
+    print_u64(current.dispatch_id);
+    print_str(b"/"); print_u64(current.ssn);
+    print_str(b"/"); print_u64(current.lane.index as u64);
+    print_str(b"/"); print_u64(current.lane.generation);
+    print_str(b"/"); print_u64(active.len() as u64);
+    print_str(b"/"); print_u64(continuations.len() as u64);
+    print_str(b"\n");
+    let mut traced_client = None;
+    for index in 0..active.len() {
+        let Some(frame) = active.frame(index) else { continue; };
+        let request = *frame.request();
+        let dispatch = *frame.dispatch_context();
+        if u64::from(request.client_pi) != client_pi
+            || dispatch.lane.index as u64 != lane_index
+            || dispatch.lane.generation != lane_generation
+        {
+            continue;
+        }
+        let client = nt_user_callback::ClientThreadIdentity::new(
+            request.client_pi, request.client_tid, request.client_badge,
+        );
+        if traced_client.is_none() { traced_client = Some(client); }
+        let top = continuations.top_for(&client).copied();
+        let token = frame.external_token();
+        let redirected = frame.is_redirected();
+        let continuation_depth = continuations.len_for(&client);
+        print_str(b"[pump-stale-callback-frame] index/dispatch/callback/api/tid/badge/token/redirected/frame-ssn/continuation-depth/top-dispatch/top-callback/top-state=");
+        print_u64(index as u64);
+        print_str(b"/"); print_u64(request.dispatch_id);
+        print_str(b"/"); print_u64(request.callback_id as u64);
+        print_str(b"/"); print_u64(request.api_index as u64);
+        print_str(b"/"); print_u64(request.client_tid);
+        print_str(b"/"); print_u64(request.client_badge);
+        print_str(b"/"); print_u64(token);
+        print_str(b"/"); print_u64(redirected as u64);
+        print_str(b"/"); print_u64(dispatch.ssn);
+        print_str(b"/"); print_u64(continuation_depth as u64);
+        print_str(b"/"); print_u64(top.map_or(0, |row| row.dispatch_id));
+        print_str(b"/"); print_u64(top.map_or(0, |row| row.callback_id as u64));
+        print_str(b"/"); print_u64(top.map_or(0, |row| row.state as u64));
+        print_str(b"\n");
+    }
+    if let Some(client) = traced_client {
+        for (index, frame) in continuations.frames_for(&client).enumerate() {
+            let frame = *frame;
+            print_str(b"[pump-stale-continuation] index/kind/state/dispatch/callback=");
+            print_u64(index as u64);
+            print_str(b"/"); print_u64(frame.kind as u64);
+            print_str(b"/"); print_u64(frame.state as u64);
+            print_str(b"/"); print_u64(frame.dispatch_id);
+            print_str(b"/"); print_u64(frame.callback_id as u64);
+            print_str(b"\n");
+        }
+    }
+    let provider = (&*core::ptr::addr_of!(PROVIDER_WAIT_PENDING_DISPATCH))
+        .as_ref().map(|pending| (
+            pending.dispatch.dispatch_id, pending.request.header.wait_id,
+            pending.request.header.client_pi, pending.request.header.client_tid,
+            pending.nested_user_callback,
+        ));
+    let lpc = (&*core::ptr::addr_of!(LPC_WAIT_PENDING_DISPATCH)).is_some();
+    let receive = (&*core::ptr::addr_of!(RECEIVE_PENDING_DISPATCH)).is_some();
+    let service = (&*core::ptr::addr_of!(SERVICE_WAIT_PENDING_DISPATCH)).is_some();
+    print_str(b"[pump-stale-pending-dispatch] provider/lpc/receive/service=");
+    print_u64(provider.is_some() as u64);
+    print_str(b"/"); print_u64(lpc as u64);
+    print_str(b"/"); print_u64(receive as u64);
+    print_str(b"/"); print_u64(service as u64);
+    if let Some((dispatch_id, wait_id, pi, tid, nested)) = provider {
+        print_str(b" provider-dispatch/wait-id/pi/tid/nested=");
+        print_u64(dispatch_id);
+        print_str(b"/"); print_u64(wait_id);
+        print_str(b"/"); print_u64(pi as u64);
+        print_str(b"/"); print_u64(tid);
+        print_str(b"/"); print_u64(nested as u64);
+    }
+    print_str(b"\n");
+}
+
 unsafe fn callback_frame_can_resume(frame: &nt_user_callback::ActiveCallbackFrame) -> bool {
     crate::component_external_resume_ready(
         frame.dispatch_context().lane,

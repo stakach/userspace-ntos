@@ -304,6 +304,72 @@ pub(crate) static mut COMPONENT_SUSPENSIONS: ComponentLanes = nt_component_suspe
     COMPONENT_SUSPENSION_MAX_DEPTH,
 );
 
+/// Copy the exact lane's retained frames before writing a one-time stall trace. These numeric
+/// observations cannot select, complete, or recycle any continuation or physical Reply.
+pub(crate) unsafe fn trace_stale_suspension_frames(lane_index: u64, lane_generation: u64) {
+    const CAP: usize = 16;
+    let mut rows = [[0u64; 12]; CAP];
+    let mut count = 0usize;
+    let mut overflow = 0u64;
+    {
+        let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
+        let arbiter = &*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER);
+        for (lane, frame) in lanes.frames() {
+            if lane.index as u64 != lane_index || lane.generation != lane_generation {
+                continue;
+            }
+            if count == CAP { overflow += 1; continue; }
+            let client = frame.owner.hosted_client();
+            let phase = match &frame.phase {
+                nt_component_suspension::SuspensionPhase::Waiting => 1,
+                nt_component_suspension::SuspensionPhase::Selected { .. } => 2,
+                nt_component_suspension::SuspensionPhase::Resuming { .. } => 3,
+                nt_component_suspension::SuspensionPhase::Cancelled { .. } => 4,
+                nt_component_suspension::SuspensionPhase::MaintenanceWaiting { .. } => 5,
+                nt_component_suspension::SuspensionPhase::MaintenanceReady { .. } => 6,
+                nt_component_suspension::SuspensionPhase::MaintenanceResuming { .. } => 7,
+                nt_component_suspension::SuspensionPhase::NestedTerminal => 8,
+            };
+            let (pending_kind, wait_id, pending_dispatch, pending_ssn, admitted) =
+                match frame.continuation.hosted().map(|hosted| &hosted.pending) {
+                    Some(component_continuation::PendingComponentDispatch::Provider(pending)) => (
+                        1, pending.request.header.wait_id, pending.dispatch.dispatch_id,
+                        pending.dispatch.ssn, arbiter.contains(pending.request.header.wait_id) as u64,
+                    ),
+                    Some(component_continuation::PendingComponentDispatch::Lpc(pending)) =>
+                        (2, 0, pending.dispatch.dispatch_id, pending.dispatch.ssn, 0),
+                    Some(component_continuation::PendingComponentDispatch::Receive(pending)) =>
+                        (3, 0, pending.snapshot.dispatch.dispatch_id, pending.snapshot.dispatch.ssn, 0),
+                    Some(component_continuation::PendingComponentDispatch::ServiceWait(pending)) =>
+                        (4, 0, pending.snapshot.dispatch.dispatch_id, pending.snapshot.dispatch.ssn, 0),
+                    Some(component_continuation::PendingComponentDispatch::RootMaintenance(pending)) =>
+                        (5, 0, pending.snapshot.dispatch.dispatch_id, pending.snapshot.dispatch.ssn, 0),
+                    Some(component_continuation::PendingComponentDispatch::NestedRestore(_)) =>
+                        (6, 0, 0, 0, 0),
+                    None => (7, 0, 0, 0, 0),
+                };
+            rows[count] = [
+                frame.key.kind as u64, frame.key.id, frame.admission_sequence, phase,
+                frame.owner.dispatch_id, client.map_or(0, |row| row.client_pi as u64),
+                client.map_or(0, |row| row.client_tid), pending_kind, wait_id,
+                pending_dispatch, pending_ssn, admitted,
+            ];
+            count += 1;
+        }
+    }
+    for row in &rows[..count] {
+        print_str(b"[pump-stale-suspension] kind/id/admission/phase/owner-dispatch/pi/tid/pending-kind/wait-id/pending-dispatch/ssn/arbiter=");
+        print_u64(row[0]);
+        for value in &row[1..] { print_str(b"/"); print_u64(*value); }
+        print_str(b"\n");
+    }
+    if overflow != 0 {
+        print_str(b"[pump-stale-suspension] overflow=");
+        print_u64(overflow);
+        print_str(b"\n");
+    }
+}
+
 // Advances only after the independent outer worker has returned. A parked native syscall
 // captures this epoch; timer notification alone cannot authorize its resume.
 static ROOT_MAINTENANCE_PASS: AtomicU64 = AtomicU64::new(0);
