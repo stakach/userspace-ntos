@@ -902,6 +902,23 @@ pub(crate) unsafe fn pending_undelivered_root_ticket(ticket: NestedRestoreTicket
         })
 }
 
+/// A pre-effect restore refusal may leave the sealed parent in Parked. Only the same held,
+/// canonical physical owner may retry; Quarantined and entered attempts are excluded.
+pub(crate) unsafe fn parked_undelivered_root_ticket(ticket: NestedRestoreTicket) -> bool {
+    (&*core::ptr::addr_of!(PARENTS))
+        .get(ticket.index).and_then(Option::as_ref)
+        .is_some_and(|parent| {
+            parent.phase == ParentPhase::Parked
+                && ticket_matches(ticket, parent)
+                && parent.child.is_none()
+                && parent.undelivered_root.as_ref().is_some_and(|token| {
+                    Some(token.admission_key()) == parent.root_admission
+                        && token.child().tcb == token.admission_key().executor()
+                })
+                && parent.physical.canonical_pending() && parent.physical.held()
+        })
+}
+
 pub(crate) unsafe fn restore_pending_undelivered_root_ticket(
     ticket: NestedRestoreTicket,
 ) -> Result<RestoredBeforeChildProof, Error> {

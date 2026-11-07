@@ -24,7 +24,11 @@ pub(crate) enum Bundle {
     Unbound {
         taken: win32k_glue::TakenRootIngressDispatch,
         authority: RootReplyAuthority,
+        child_snapshot: crate::spawn_hosts::shared_ingress::owner::runtime::PendingSnapshot,
     },
+    UnwindPrepared(UnwindRootIngress),
+    RestoredProof(RestoredRouteProof),
+    RestoredCancelled(RestoredRouteOwner),
     BoundUnadmitted(BoundRootIngress),
     AdmittedUnparked(AdmittedRootIngress),
     Parked(AdmittedRootIngress),
@@ -34,8 +38,34 @@ pub(crate) enum Bundle {
 pub(crate) struct BoundRootIngress {
     pending: win32k_glue::PendingRootIngressDispatch,
     authority: RootReplyAuthority,
+    child_snapshot: crate::spawn_hosts::shared_ingress::owner::runtime::PendingSnapshot,
     admission: nt_component_suspension::ExternalAdmissionKey,
     parent: nt_component_suspension::NestedExecutionIdentity,
+}
+
+#[allow(dead_code)]
+pub(crate) struct UnwindRootIngress {
+    pending: win32k_glue::PendingRootIngressDispatch,
+    authority: RootReplyAuthority,
+    child_snapshot: crate::spawn_hosts::shared_ingress::owner::runtime::PendingSnapshot,
+    admission: nt_component_suspension::ExternalAdmissionKey,
+    parent: Option<crate::spawn_hosts::shared_ingress::owner::runtime::nested::ParkedParentHandle>,
+    restore_entered: bool,
+}
+
+#[allow(dead_code)]
+pub(crate) struct RestoredRouteOwner {
+    pending: win32k_glue::PendingRootIngressDispatch,
+    authority: RootReplyAuthority,
+    child_snapshot: crate::spawn_hosts::shared_ingress::owner::runtime::PendingSnapshot,
+    admission: nt_component_suspension::ExternalAdmissionKey,
+    parent: nt_component_suspension::NestedExecutionIdentity,
+}
+
+#[allow(dead_code)]
+pub(crate) struct RestoredRouteProof {
+    owner: RestoredRouteOwner,
+    proof: crate::spawn_hosts::shared_ingress::owner::runtime::nested::RestoredBeforeChildProof,
 }
 
 #[allow(dead_code)]
@@ -73,6 +103,16 @@ pub(crate) unsafe fn root_reply_authority_is_live(authority: &RootReplyAuthority
     capture_root_reply_authority(authority.reply).is_some_and(|current| {
         current.identity == authority.identity && current.binding == authority.binding
     })
+}
+
+fn same_child_snapshot(
+    left: crate::spawn_hosts::shared_ingress::owner::runtime::PendingSnapshot,
+    right: crate::spawn_hosts::shared_ingress::owner::runtime::PendingSnapshot,
+) -> bool {
+    left.binding == right.binding && left.reply == right.reply
+        && left.executor == right.executor
+        && left.admission_sequence == right.admission_sequence
+        && left.info == right.info && left.registers == right.registers
 }
 
 #[allow(dead_code)]
@@ -116,11 +156,17 @@ pub(crate) unsafe fn retain(
     let Some(key) = RootIngressHandoffKey::new(parent_identity, child, authority.reply) else {
         return Err((taken, authority));
     };
+    let Some(child_snapshot) = crate::spawn_hosts::shared_ingress::owner::runtime
+        ::prepared_root_ingress_snapshot(child) else {
+        return Err((taken, authority));
+    };
     (&mut *core::ptr::addr_of_mut!(OWNERS))
-        .retain(reservation, key, Bundle::Unbound { taken, authority })
+        .retain(reservation, key, Bundle::Unbound { taken, authority, child_snapshot })
         .map_err(|(_, bundle)| match bundle {
-            Bundle::Unbound { taken, authority } => (taken, authority),
-            Bundle::BoundUnadmitted(_) | Bundle::AdmittedUnparked(_) | Bundle::Parked(_) =>
+            Bundle::Unbound { taken, authority, .. } => (taken, authority),
+            Bundle::UnwindPrepared(_) | Bundle::RestoredProof(_)
+                | Bundle::RestoredCancelled(_) | Bundle::BoundUnadmitted(_)
+                | Bundle::AdmittedUnparked(_) | Bundle::Parked(_) =>
                 unreachable!("fresh retention is unbound"),
         })
 }
@@ -135,13 +181,13 @@ pub(crate) unsafe fn bind_prepared(
 ) -> Result<(), crate::spawn_hosts::shared_ingress::owner::runtime::Error> {
     use crate::spawn_hosts::shared_ingress::owner::runtime::Error;
     let result = (&mut *core::ptr::addr_of_mut!(OWNERS)).transition_held(ticket, |bundle| {
-        let Bundle::Unbound { taken, authority } = bundle else {
+        let Bundle::Unbound { taken, authority, child_snapshot } = bundle else {
             return Err((Error::Admission, bundle));
         };
         let win32k_glue::TakenRootIngressDispatch { pending, parent } = taken;
         let win32k_glue::RootIngressYield::ParkedUnbound { child, .. } = pending.yielded else {
             return Err((Error::Admission, Bundle::Unbound {
-                taken: win32k_glue::TakenRootIngressDispatch { pending, parent }, authority,
+                taken: win32k_glue::TakenRootIngressDispatch { pending, parent }, authority, child_snapshot,
             }));
         };
         if ticket.key().parent() != parent.identity()
@@ -150,24 +196,30 @@ pub(crate) unsafe fn bind_prepared(
             || !root_reply_authority_is_live(&authority)
         {
             return Err((Error::Admission, Bundle::Unbound {
-                taken: win32k_glue::TakenRootIngressDispatch { pending, parent }, authority,
+                taken: win32k_glue::TakenRootIngressDispatch { pending, parent }, authority, child_snapshot,
             }));
         }
         let parent_identity = parent.identity();
         let Some(snapshot) = crate::spawn_hosts::shared_ingress::owner::runtime
             ::prepared_root_ingress_snapshot(child) else {
             return Err((Error::Admission, Bundle::Unbound {
-                taken: win32k_glue::TakenRootIngressDispatch { pending, parent }, authority,
+                taken: win32k_glue::TakenRootIngressDispatch { pending, parent }, authority, child_snapshot,
             }));
         };
+        if !same_child_snapshot(snapshot, child_snapshot) {
+            return Err((Error::Admission, Bundle::Unbound {
+                taken: win32k_glue::TakenRootIngressDispatch { pending, parent }, authority,
+                child_snapshot,
+            }));
+        }
         match crate::spawn_hosts::shared_ingress::owner::runtime::bind_root_ingress_pass(
             snapshot, parent, dispatch,
         ) {
             Ok(()) => Ok(Bundle::BoundUnadmitted(BoundRootIngress {
-                pending, authority, admission: child, parent: parent_identity,
+                pending, authority, child_snapshot, admission: child, parent: parent_identity,
             })),
             Err((error, parent)) => Err((error, Bundle::Unbound {
-                taken: win32k_glue::TakenRootIngressDispatch { pending, parent }, authority,
+                taken: win32k_glue::TakenRootIngressDispatch { pending, parent }, authority, child_snapshot,
             })),
         }
     });
@@ -187,7 +239,7 @@ pub(crate) unsafe fn preflight_selected_read(
     table: &nt_syscall::NativeServiceTable,
 ) -> crate::exec_handler::RootIngressReadPreflight {
     use crate::exec_handler::RootIngressReadPreflight;
-    let Some(Bundle::Unbound { taken, authority }) =
+    let Some(Bundle::Unbound { taken, authority, .. }) =
         (&*core::ptr::addr_of!(OWNERS)).get(ticket)
     else { return RootIngressReadPreflight::Changed };
     let win32k_glue::RootIngressYield::ParkedUnbound { child, .. } = taken.pending.yielded
@@ -217,6 +269,160 @@ pub(crate) unsafe fn preflight_selected_read(
                 RootIngressReadPreflight::Unsupported
             }
         outcome => outcome,
+    }
+}
+
+/// Seal a refused, still-undelivered child before any physical parent restore. A CALLS-side
+/// preflight refusal may have sealed the pass already; retrying this exact handoff is harmless.
+#[allow(dead_code)]
+pub(crate) unsafe fn begin_route_refusal_unwind(
+    ticket: RootIngressHandoffTicket,
+    handler: &crate::ExecNtHandler,
+    table: &nt_syscall::NativeServiceTable,
+) -> Result<(), crate::spawn_hosts::shared_ingress::owner::runtime::Error> {
+    use crate::exec_handler::RootIngressReadPreflight;
+    use crate::spawn_hosts::shared_ingress::owner::runtime::{self, Error};
+    if matches!(preflight_selected_read(ticket, handler, table), RootIngressReadPreflight::Accepted(_)) {
+        return Err(Error::Admission);
+    }
+    let result = (&mut *core::ptr::addr_of_mut!(OWNERS)).transition_held(ticket, |bundle| {
+        let Bundle::Unbound { taken, authority, child_snapshot } = bundle else {
+            return Err((Error::Admission, bundle));
+        };
+        let win32k_glue::TakenRootIngressDispatch { pending, parent } = taken;
+        let win32k_glue::RootIngressYield::ParkedUnbound { child, .. } = pending.yielded else {
+            return Err((Error::Admission, Bundle::Unbound {
+                taken: win32k_glue::TakenRootIngressDispatch { pending, parent },
+                authority, child_snapshot,
+            }));
+        };
+        if ticket.key().child() != child || ticket.key().parent() != parent.identity()
+            || ticket.key().root_reply() != authority.reply
+            || child_snapshot.reply != child.reply()
+            || child_snapshot.executor != child.executor()
+            || child_snapshot.admission_sequence != child.admission_sequence()
+            || !root_reply_authority_is_live(&authority)
+        {
+            return Err((Error::Admission, Bundle::Unbound {
+                taken: win32k_glue::TakenRootIngressDispatch { pending, parent },
+                authority, child_snapshot,
+            }));
+        }
+        match runtime::begin_undelivered_root_unwind(child_snapshot, &parent) {
+            Ok(()) => Ok(Bundle::UnwindPrepared(UnwindRootIngress {
+                pending, authority, child_snapshot, admission: child,
+                parent: Some(parent), restore_entered: false,
+            })),
+            Err(error) => Err((error, Bundle::Unbound {
+                taken: win32k_glue::TakenRootIngressDispatch { pending, parent },
+                authority, child_snapshot,
+            })),
+        }
+    });
+    result.map_err(|error| match error {
+        nt_user_host::root_ingress_handoff::RootIngressTransitionError::StaleTicket => Error::Admission,
+        nt_user_host::root_ingress_handoff::RootIngressTransitionError::Refused(error) => error,
+    })
+}
+
+/// PARENTS retains the exact scope and one-shot token on every physical refusal. An uncertain
+/// effect is never replayed: only a positive RestorePending ticket permits a later attempt.
+#[allow(dead_code)]
+pub(crate) unsafe fn restore_route_refusal_parent(
+    ticket: RootIngressHandoffTicket,
+) -> Result<(), crate::spawn_hosts::shared_ingress::owner::runtime::Error> {
+    use crate::spawn_hosts::shared_ingress::owner::runtime::{nested, Error};
+    let result = (&mut *core::ptr::addr_of_mut!(OWNERS)).transition_held(ticket, |bundle| {
+        let Bundle::UnwindPrepared(mut unwind) = bundle else {
+            return Err((Error::Admission, bundle));
+        };
+        let Some(parent) = unwind.parent.as_ref() else {
+            return Err((Error::Admission, Bundle::UnwindPrepared(unwind)));
+        };
+        if ticket.key().child() != unwind.admission
+            || ticket.key().parent() != parent.identity()
+            || ticket.key().root_reply() != unwind.authority.reply
+            || (unwind.restore_entered
+                && !nested::pending_undelivered_root_ticket(parent.ticket())
+                && !nested::parked_undelivered_root_ticket(parent.ticket()))
+        {
+            return Err((Error::Admission, Bundle::UnwindPrepared(unwind)));
+        }
+        let expected_parent = parent.identity();
+        unwind.restore_entered = true;
+        match nested::restore_undelivered_root(&mut unwind.parent) {
+            Ok(proof) => Ok(Bundle::RestoredProof(RestoredRouteProof {
+                owner: RestoredRouteOwner {
+                    pending: unwind.pending, authority: unwind.authority,
+                    child_snapshot: unwind.child_snapshot, admission: unwind.admission,
+                    parent: expected_parent,
+                },
+                proof,
+            })),
+            Err(error) => Err((error, Bundle::UnwindPrepared(unwind))),
+        }
+    });
+    result.map_err(|error| match error {
+        nt_user_host::root_ingress_handoff::RootIngressTransitionError::StaleTicket => Error::Admission,
+        nt_user_host::root_ingress_handoff::RootIngressTransitionError::Refused(error) => error,
+    })
+}
+
+/// Only the positive move-only restore receipt can cancel the prepared child pass. A refusal
+/// returns that receipt to this row, and the original child Call stays in CALLS.
+#[allow(dead_code)]
+pub(crate) unsafe fn cancel_route_refusal_child(
+    ticket: RootIngressHandoffTicket,
+) -> Result<(), crate::spawn_hosts::shared_ingress::owner::runtime::Error> {
+    use crate::spawn_hosts::shared_ingress::owner::runtime::{self, Error};
+    let result = (&mut *core::ptr::addr_of_mut!(OWNERS)).transition_held(ticket, |bundle| {
+        let Bundle::RestoredProof(restored) = bundle else {
+            return Err((Error::Admission, bundle));
+        };
+        let RestoredRouteProof { owner, proof } = restored;
+        if ticket.key().child() != owner.admission
+            || ticket.key().parent() != owner.parent
+            || ticket.key().root_reply() != owner.authority.reply
+            || proof.admission_key() != owner.admission
+            || proof.parent() != owner.parent
+            || proof.child() != owner.child_snapshot.binding
+        {
+            return Err((Error::Admission, Bundle::RestoredProof(RestoredRouteProof { owner, proof })));
+        }
+        match runtime::cancel_restored_undelivered_root_pass(owner.child_snapshot, proof) {
+            Ok(()) => Ok(Bundle::RestoredCancelled(owner)),
+            Err((error, proof)) => Err((error,
+                Bundle::RestoredProof(RestoredRouteProof { owner, proof }))),
+        }
+    });
+    result.map_err(|error| match error {
+        nt_user_host::root_ingress_handoff::RootIngressTransitionError::StaleTicket => Error::Admission,
+        nt_user_host::root_ingress_handoff::RootIngressTransitionError::Refused(error) => error,
+    })
+}
+
+/// One ticket advances the exact retained route refusal. After any refusal the caller may
+/// invoke this again; the row chooses the next stage and never replays an uncertain restore.
+#[allow(dead_code)]
+pub(crate) unsafe fn unwind_unbound_route_refusal(
+    ticket: RootIngressHandoffTicket,
+    handler: &crate::ExecNtHandler,
+    table: &nt_syscall::NativeServiceTable,
+) -> Result<(), crate::spawn_hosts::shared_ingress::owner::runtime::Error> {
+    use crate::spawn_hosts::shared_ingress::owner::runtime::Error;
+    if matches!((&*core::ptr::addr_of!(OWNERS)).get(ticket), Some(Bundle::Unbound { .. })) {
+        begin_route_refusal_unwind(ticket, handler, table)?;
+    }
+    if matches!((&*core::ptr::addr_of!(OWNERS)).get(ticket), Some(Bundle::UnwindPrepared(_))) {
+        restore_route_refusal_parent(ticket)?;
+    }
+    if matches!((&*core::ptr::addr_of!(OWNERS)).get(ticket), Some(Bundle::RestoredProof(_))) {
+        cancel_route_refusal_child(ticket)?;
+    }
+    if matches!((&*core::ptr::addr_of!(OWNERS)).get(ticket), Some(Bundle::RestoredCancelled(_))) {
+        Ok(())
+    } else {
+        Err(Error::Admission)
     }
 }
 
@@ -322,7 +528,9 @@ pub(crate) unsafe fn park_admitted_root_reply(
 /// return the same bundle to this row; neither operation changes a physical Reply.
 #[allow(dead_code)]
 pub(crate) unsafe fn take(ticket: RootIngressHandoffTicket) -> Option<Bundle> {
-    (&mut *core::ptr::addr_of_mut!(OWNERS)).take(ticket)
+    let owners = &mut *core::ptr::addr_of_mut!(OWNERS);
+    if !matches!(owners.get(ticket), Some(Bundle::Parked(_))) { return None; }
+    owners.take(ticket)
 }
 
 #[allow(dead_code)]

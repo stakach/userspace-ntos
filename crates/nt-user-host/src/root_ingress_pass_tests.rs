@@ -524,3 +524,37 @@ fn root_ingress_handoff_transition_retains_exact_owner_on_refusal_and_moves_once
     assert!(matches!(table.get(ticket), Some(Stage::Bound)));
     assert!(matches!(foreign.get(foreign_ticket), Some(Stage::Unbound(value)) if **value == 37));
 }
+
+#[test]
+fn undelivered_restore_proof_survives_cancel_refusal_in_exact_handoff_row() {
+    use crate::root_ingress_handoff::{RootIngressHandoffKey, RootIngressHandoffTable};
+    #[derive(Debug)]
+    enum Stage { Unbound(Box<u64>), RestoredProof(Box<u64>), Cancelled }
+    let child = Child::new(141);
+    let parent = new_parent();
+    let key = RootIngressHandoffKey::new(
+        parent.identity(), child.call.as_ref().unwrap().admission_key(), 904,
+    ).unwrap();
+    let mut table = RootIngressHandoffTable::new();
+    let reservation = table.reserve().unwrap();
+    let ticket = table.retain(reservation, key, Stage::Unbound(Box::new(0x6a11))).unwrap();
+    table.transition_held(ticket, |stage| match stage {
+        Stage::Unbound(owner) => Ok::<_, ((), _)>(Stage::RestoredProof(owner)),
+        other => Err(((), other)),
+    }).unwrap();
+    let proof_address = match table.get(ticket).unwrap() {
+        Stage::RestoredProof(proof) => &**proof as *const u64,
+        _ => panic!("positive restore proof lost"),
+    };
+    assert!(table.transition_held(ticket, |stage| match stage {
+        Stage::RestoredProof(proof) => Err::<Stage, _>(((), Stage::RestoredProof(proof))),
+        other => Err(((), other)),
+    }).is_err());
+    assert!(matches!(table.get(ticket), Some(Stage::RestoredProof(proof))
+        if core::ptr::eq(&**proof, proof_address)));
+    table.transition_held(ticket, |stage| match stage {
+        Stage::RestoredProof(proof) if *proof == 0x6a11 => Ok::<_, ((), _)>(Stage::Cancelled),
+        other => Err(((), other)),
+    }).unwrap();
+    assert!(matches!(table.get(ticket), Some(Stage::Cancelled)));
+}
