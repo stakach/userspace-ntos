@@ -274,6 +274,106 @@ pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) {
         .prepare(|| reconcile_runtime(handler))
         .expect("runtime timer ownership must permit blocking receive");
     super::mounted_create_owner_trace::receive_boundary_snapshot();
+    trace_retained_receive_owners();
+}
+
+/// The final root receive boundary is the last point that can explain an all-HLT
+/// guest. Keep separate budgets for changed and repeated states so early healthy
+/// progress cannot consume every later sample. No Reply or timer owner changes.
+fn trace_retained_receive_owners() {
+    static LAST_KEY: AtomicU64 = AtomicU64::new(0);
+    static REPEATS: AtomicU64 = AtomicU64::new(0);
+    static CHANGES: AtomicU64 = AtomicU64::new(0);
+    static CHANGE_PRINTS: AtomicU64 = AtomicU64::new(0);
+    static REPEAT_PRINTS: AtomicU64 = AtomicU64::new(0);
+    static URGENT_PRINTS: AtomicU64 = AtomicU64::new(0);
+    static PRINTS: AtomicU64 = AtomicU64::new(0);
+    let section = crate::section_metadata_work::receive_owner_snapshot();
+    let cleanup = crate::service_sec_image::file_cleanup_receive_owner_snapshot();
+    let lifecycle = driver_launch::hosted_file_lifecycle_receive_owner_snapshot();
+    if section.is_none() && cleanup.is_none() && lifecycle.is_none() {
+        return;
+    }
+    let mut key = 0xcbf2_9ce4_8422_2325u64;
+    for value in section.into_iter().flatten()
+        .chain(cleanup.into_iter().flatten())
+        .chain(lifecycle.into_iter().flatten())
+    {
+        key = (key ^ value).wrapping_mul(0x100_0000_01b3);
+    }
+    let previous = LAST_KEY.swap(key, Ordering::Relaxed);
+    let repeat = if previous == key {
+        REPEATS.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        REPEATS.store(0, Ordering::Relaxed);
+        0
+    };
+    let now = monotonic_time_100ns();
+    let armed = LAST_REARM_AUTHORITY.is_armed();
+    let urgent = !armed || LAST_REARM_DEADLINE.load(Ordering::Relaxed) <= now;
+    let urgent_selected = urgent && (repeat == 0 || repeat.is_power_of_two())
+        && URGENT_PRINTS.fetch_add(1, Ordering::Relaxed) < 16;
+    let selected = if urgent_selected {
+        true
+    } else if repeat == 0 {
+        let change = CHANGES.fetch_add(1, Ordering::Relaxed) + 1;
+        (change <= 8 || change.is_power_of_two() || change % 16 == 0)
+            && CHANGE_PRINTS.fetch_add(1, Ordering::Relaxed) < 32
+    } else {
+        repeat.is_power_of_two() && REPEAT_PRINTS.fetch_add(1, Ordering::Relaxed) < 16
+    };
+    if !selected {
+        return;
+    }
+    let sample = PRINTS.fetch_add(1, Ordering::Relaxed);
+    if sample >= 64 {
+        return;
+    }
+    print_str(b"[retained-receive] sample/repeat/now-ms=");
+    print_u64(sample + 1);
+    print_str(b"/"); print_u64(repeat);
+    print_str(b"/"); print_u64(now / 10_000);
+    print_str(b" section pi/tid/handle/file/phase/irp/reply/count=");
+    print_receive_owner_fields(section);
+    print_str(b" section-wake-ms=");
+    match crate::section_metadata_work::next_deadline() {
+        Some(deadline) => print_u64(deadline / 10_000),
+        None => print_str(b"-"),
+    }
+    print_str(b" cleanup file/pi/tid/badge/reply/count=");
+    print_receive_owner_fields(cleanup);
+    print_str(b" lifecycle file/payload/blocked/retry-after/executing/count=");
+    print_receive_owner_fields(lifecycle);
+    print_str(b" timer source/deadline-ms/rearm-now-ms/armed/irq-state/tick-pending=");
+    print_receive_owner_fields(Some([
+        LAST_REARM_SOURCE.load(Ordering::Relaxed),
+        LAST_REARM_DEADLINE.load(Ordering::Relaxed) / 10_000,
+        LAST_REARM_NOW.load(Ordering::Relaxed) / 10_000,
+        u64::from(LAST_REARM_AUTHORITY.is_armed()),
+        DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire),
+        DELAY_TIMER_TICKS_PENDING.load(Ordering::Relaxed),
+    ]));
+    print_str(b"\n");
+    if section.is_some_and(|owner| owner[7] > 1) {
+        crate::section_metadata_work::trace_receive_owner_rows();
+    }
+    if cleanup.is_some_and(|owner| owner[5] > 1) {
+        crate::service_sec_image::trace_file_cleanup_receive_owner_rows();
+    }
+    if lifecycle.is_some_and(|owner| owner[5] > 1) {
+        driver_launch::trace_hosted_file_lifecycle_receive_owner_rows();
+    }
+}
+
+fn print_receive_owner_fields<const N: usize>(fields: Option<[u64; N]>) {
+    let Some(fields) = fields else {
+        print_str(b"-");
+        return;
+    };
+    for (index, value) in fields.into_iter().enumerate() {
+        if index != 0 { print_str(b"/"); }
+        print_u64(value);
+    }
 }
 
 unsafe fn reconcile_runtime(handler: &mut ExecNtHandler) -> Option<nt_kernel_exec::TimerRearmOutcome> {

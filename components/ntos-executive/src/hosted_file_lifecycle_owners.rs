@@ -129,6 +129,41 @@ pub(super) fn retry_wake_due(now: u64) -> u64 {
     0
 }
 
+/// Inspect one exact retained File without changing driver or retry ownership.
+pub(super) fn receive_owner_snapshot() -> Option<[u64; 6]> {
+    let rows = rows();
+    let row = rows.iter().find(|row| row.payload.is_some() || row.retry_after != 0)?;
+    Some(receive_owner_fields(row, rows))
+}
+
+fn receive_owner_fields(row: &Row, rows: &[Row]) -> [u64; 6] {
+    let payload = match row.payload.as_ref() {
+        None => 0,
+        Some(Payload::Prepared(_)) => 1,
+        Some(Payload::Returned(_)) => 2,
+        Some(Payload::Retained(_)) => 3,
+        Some(Payload::AckReturned(_)) => 4,
+    };
+    [
+        row.file_id.raw(), payload,
+        row.blocked.map_or(0, |status| status.raw() as u64),
+        row.retry_after, u64::from(row.executing),
+        rows.iter().filter(|row| row.payload.is_some() || row.retry_after != 0).count() as u64,
+    ]
+}
+
+pub(super) fn trace_receive_owner_rows() {
+    let rows = rows();
+    for row in rows.iter().filter(|row| row.payload.is_some() || row.retry_after != 0).take(4) {
+        print_str(b"[retained-receive-lifecycle] file/payload/blocked/retry-after/executing/count=");
+        for (index, value) in receive_owner_fields(row, rows).into_iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(value);
+        }
+        print_str(b"\n");
+    }
+}
+
 fn route_live(projection: &IrpProjection) -> Option<usize> {
     let (index, _) = instance_by_driver_id(projection.driver_id.raw())?;
     let (physical, _, _) = hosted_driver_device_route_by_device_id(projection.device_id.raw())?;

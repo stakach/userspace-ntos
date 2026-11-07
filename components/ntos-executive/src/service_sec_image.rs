@@ -27060,6 +27060,29 @@ unsafe fn file_cleanup_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     completed
 }
 
+/// Read only the exact parked continuation; the caller never takes its Reply.
+pub(crate) fn file_cleanup_receive_owner_snapshot() -> Option<[u64; 6]> {
+    let table = unsafe { &*core::ptr::addr_of!(PENDING_FILE_CLEANUP_WAITS) };
+    let pending = table.parked().next()?;
+    Some([
+        pending.file_id, u64::from(pending.pi), pending.tid,
+        pending.badge, pending.reply_cap, table.parked().count() as u64,
+    ])
+}
+
+pub(crate) fn trace_file_cleanup_receive_owner_rows() {
+    let table = unsafe { &*core::ptr::addr_of!(PENDING_FILE_CLEANUP_WAITS) };
+    for pending in table.parked().take(4) {
+        print_str(b"[retained-receive-cleanup] file/pi/tid/badge/reply=");
+        for (index, value) in [pending.file_id, u64::from(pending.pi), pending.tid,
+            pending.badge, pending.reply_cap].into_iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(value);
+        }
+        print_str(b"\n");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn pending_driver_start_transfer(
     nt_handler: &mut ExecNtHandler,

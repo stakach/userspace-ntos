@@ -552,6 +552,53 @@ pub(crate) fn census_snapshot() -> (Option<u64>, bool, u64, usize) {
         EXECUTING_TID.load(Ordering::Acquire), pending)
 }
 
+/// One exact retained owner for bounded receive-boundary diagnostics. Zero means
+/// the corresponding File capture or IRP is not owned in this phase.
+pub(crate) fn receive_owner_snapshot() -> Option<[u64; 8]> {
+    let work = unsafe { (&*core::ptr::addr_of!(WORK)).iter().flatten().next()? };
+    Some(receive_owner_fields(work))
+}
+
+fn receive_owner_fields(work: &Work) -> [u64; 8] {
+    let (phase, irp) = match &work.phase {
+        Phase::Query => (1, 0),
+        Phase::Pending { irp, .. } => (2, irp.raw()),
+        Phase::Copying { irp, .. } => (3, irp.raw()),
+        Phase::AckPending { irp } => (4, irp.raw()),
+        Phase::HeaderDispatch => (5, 0),
+        Phase::HeaderPending { irp, .. } => (6, irp.raw()),
+        Phase::HeaderCopying { irp, .. } => (7, irp.raw()),
+        Phase::HeaderAckPending { irp } => (8, irp.raw()),
+        Phase::Publish => (9, 0),
+        Phase::CopyOut => (10, 0),
+        Phase::ReadyReply => (11, 0),
+        Phase::ReplyEntered => (12, 0),
+        Phase::ReplySent => (13, 0),
+        Phase::RevokeReply => (14, 0),
+        Phase::RetypeReply => (15, 0),
+        Phase::ReconcileRuntime => (16, 0),
+        Phase::Indeterminate => (17, 0),
+    };
+    [
+        work.pi as u64, work.tid, work.file_handle,
+        work.capture.as_ref().map_or(0, |capture| capture.file_id()),
+        phase, irp, work.reply,
+        unsafe { (&*core::ptr::addr_of!(WORK)).iter().flatten().count() } as u64,
+    ]
+}
+
+pub(crate) fn trace_receive_owner_rows() {
+    let rows = unsafe { &*core::ptr::addr_of!(WORK) };
+    for work in rows.iter().flatten().take(4) {
+        print_str(b"[retained-receive-section] pi/tid/handle/file/phase/irp/reply/count=");
+        for (index, value) in receive_owner_fields(work).into_iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(value);
+        }
+        print_str(b"\n");
+    }
+}
+
 pub(crate) fn wake_due(now: u64) -> u64 {
     u64::from(WAKE.wake_due(now, has_work()))
 }

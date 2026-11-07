@@ -48684,6 +48684,14 @@ pub(crate) fn hosted_file_retry_deadline(now: u64) -> Option<u64> {
         .min()
 }
 
+pub(crate) fn hosted_file_lifecycle_receive_owner_snapshot() -> Option<[u64; 6]> {
+    hosted_file_lifecycle_owners::receive_owner_snapshot()
+}
+
+pub(crate) fn trace_hosted_file_lifecycle_receive_owner_rows() {
+    hosted_file_lifecycle_owners::trace_receive_owner_rows()
+}
+
 pub(crate) unsafe fn drain_hosted_file_retirements() -> u64 {
     hosted_file_retirements::drain()
 }
