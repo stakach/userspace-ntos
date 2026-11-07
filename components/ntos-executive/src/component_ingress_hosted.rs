@@ -80,6 +80,19 @@ pub(crate) struct PendingSnapshot {
     pub registers: [u64; 4],
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct SelectedRootReadRequest {
+    pub binding: Binding,
+    pub handle: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SelectedRootReadRequestOutcome {
+    Accepted(SelectedRootReadRequest),
+    Unsupported,
+    Changed,
+}
+
 /// Native's observed effect of importing the selected child Reply into the root pool.
 /// Only the exact rollback path may report a no-effect refusal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1329,6 +1342,41 @@ pub(crate) unsafe fn prepared_root_ingress_snapshot(
         && snapshot.executor == admission.executor()
         && snapshot.admission_sequence == admission.admission_sequence()
         && prepared_root_ingress_child_is_current(admission)).then_some(snapshot)
+}
+
+/// Decode the undelivered child from its retained CALLS message, not the mutable root IPC
+/// buffer. A changed owner is distinct from a well-owned Call with an unsupported service.
+pub(crate) unsafe fn selected_root_read_request(
+    admission: ExternalAdmissionKey,
+    table: &nt_syscall::NativeServiceTable,
+) -> SelectedRootReadRequestOutcome {
+    let Some(snapshot) = prepared_root_ingress_snapshot(admission) else {
+        return SelectedRootReadRequestOutcome::Changed;
+    };
+    let mut matching = (&*core::ptr::addr_of!(CALLS)).iter().flatten()
+        .filter(|row| row.binding == snapshot.binding
+            && row.call.as_ref().is_some_and(|call| call.admission_key() == admission));
+    let Some(row) = matching.next() else { return SelectedRootReadRequestOutcome::Changed };
+    if matching.next().is_some() { return SelectedRootReadRequestOutcome::Changed; }
+    let Some(call) = row.call.as_ref() else { return SelectedRootReadRequestOutcome::Changed };
+    let message = call.message();
+    if row.delivered || row.released || row.completion.is_some()
+        || row.receive_settlement.is_some()
+        || row.binding.tcb != snapshot.executor
+        || message.badge() != row.binding.badge
+        || message.info() != snapshot.info
+        || message.registers() != snapshot.registers
+        || call.reply() != snapshot.reply
+        || call.admission_sequence() != snapshot.admission_sequence
+    {
+        return SelectedRootReadRequestOutcome::Changed;
+    }
+    match nt_user_host::root_ingress_read_request::SelectedRootReadRequest::parse(message, table) {
+        Some(request) => SelectedRootReadRequestOutcome::Accepted(SelectedRootReadRequest {
+            binding: row.binding, handle: request.handle(),
+        }),
+        None => SelectedRootReadRequestOutcome::Unsupported,
+    }
 }
 
 /// Borrow the physical scope only after CALLS owns this exact bound parent. The closure is

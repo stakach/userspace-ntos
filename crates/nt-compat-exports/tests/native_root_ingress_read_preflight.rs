@@ -2,6 +2,8 @@
 
 const FILE: &str = include_str!("../../../components/ntos-executive/src/exec_file_capture.rs");
 const HANDLER: &str = include_str!("../../../components/ntos-executive/src/exec_handler.rs");
+const HOSTED: &str = include_str!("../../../components/ntos-executive/src/component_ingress_hosted.rs");
+const OWNER: &str = include_str!("../../../components/ntos-executive/src/root_ingress_owner.rs");
 
 fn function<'a>(source: &'a str, name: &str) -> &'a str {
     let start = source.find(&format!("fn {name}(")).expect("native function");
@@ -46,4 +48,23 @@ fn ordinary_route_and_selected_preflight_share_one_process_local_lookup() {
     assert!(shared.contains("self.pm.lookup_handle") || shared.contains(".lookup_handle"));
     assert!(shared.contains("driver_launch::hosted_file_route"));
     assert!(FILE.contains("self.hosted_file_route_for_pid"));
+}
+
+#[test]
+fn selected_read_decode_precedes_route_and_keeps_both_owners_on_refusal() {
+    let decode = function(HOSTED, "selected_root_read_request");
+    for required in ["prepared_root_ingress_snapshot", "row.binding == snapshot.binding",
+        "call.admission_key() == admission", "message.badge() != row.binding.badge",
+        "message.info() != snapshot.info", "message.registers() != snapshot.registers",
+        "SelectedRootReadRequest::parse"] {
+        assert!(decode.contains(required), "missing selected Call proof: {required}");
+    }
+    let route = function(OWNER, "preflight_selected_read");
+    assert!(route.contains("selected_root_read_request(child, table)"));
+    assert!(route.contains("handler.root_ingress_read_preflight(request.binding, request.handle, None)"));
+    assert!(route.contains("FileIoMode::Asynchronous"));
+    for forbidden in ["bind_prepared(", "take_pending_root_ingress_dispatch(",
+        "take_selected_root_hosted_with(", "queue_hosted_file_read_exact("] {
+        assert!(!route.contains(forbidden), "preflight changed an owner: {forbidden}");
+    }
 }

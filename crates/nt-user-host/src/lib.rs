@@ -31,6 +31,7 @@ pub mod receive_child_barrier;
 pub mod root_ingress_pass;
 pub mod root_ingress_handoff;
 pub mod root_ingress_result;
+pub mod root_ingress_read_request;
 
 mod mechanism;
 mod ntdll;

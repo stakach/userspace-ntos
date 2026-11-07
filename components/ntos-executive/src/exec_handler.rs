@@ -210,6 +210,7 @@ mod user_hive_image;
 
 #[path = "exec_file_capture.rs"]
 mod file_capture;
+pub(crate) use file_capture::RootIngressReadPreflight;
 
 #[path = "exec_file_create.rs"]
 mod file_create;

@@ -163,6 +163,49 @@ pub(crate) unsafe fn bind_prepared(
     })
 }
 
+/// Observational route gate for the exact still-undelivered child. The runtime service table
+/// is supplied by the serialized outer dispatcher, so no SSN or process identity is copied
+/// into this owner. Unsupported and changed routes leave both retained owners untouched.
+#[allow(dead_code)]
+pub(crate) unsafe fn preflight_selected_read(
+    ticket: RootIngressHandoffTicket,
+    handler: &crate::ExecNtHandler,
+    table: &nt_syscall::NativeServiceTable,
+) -> crate::exec_handler::RootIngressReadPreflight {
+    use crate::exec_handler::RootIngressReadPreflight;
+    let Some(Bundle::Unbound { taken, authority }) =
+        (&*core::ptr::addr_of!(OWNERS)).get(ticket)
+    else { return RootIngressReadPreflight::Changed };
+    let win32k_glue::RootIngressYield::ParkedUnbound { child, .. } = taken.pending.yielded
+    else { return RootIngressReadPreflight::Changed };
+    if ticket.key().child() != child
+        || ticket.key().parent() != taken.parent.identity()
+        || ticket.key().root_reply() != authority.reply
+        || !root_reply_authority_is_live(authority)
+        || !crate::spawn_hosts::shared_ingress::owner::runtime::nested
+            ::undelivered_root_parent_candidate(&taken.parent, child)
+    {
+        return RootIngressReadPreflight::Changed;
+    }
+    let request = match crate::spawn_hosts::shared_ingress::owner::runtime
+        ::selected_root_read_request(child, table)
+    {
+        crate::spawn_hosts::shared_ingress::owner::runtime::SelectedRootReadRequestOutcome
+            ::Accepted(request) => request,
+        crate::spawn_hosts::shared_ingress::owner::runtime::SelectedRootReadRequestOutcome
+            ::Unsupported => return RootIngressReadPreflight::Unsupported,
+        crate::spawn_hosts::shared_ingress::owner::runtime::SelectedRootReadRequestOutcome
+            ::Changed => return RootIngressReadPreflight::Changed,
+    };
+    match handler.root_ingress_read_preflight(request.binding, request.handle, None) {
+        RootIngressReadPreflight::Accepted(observed)
+            if observed.mode == nt_io_completion::FileIoMode::Asynchronous => {
+                RootIngressReadPreflight::Unsupported
+            }
+        outcome => outcome,
+    }
+}
+
 /// The exact ticket may lend its bundle to a later lane transfer. A refused transfer must
 /// return the same bundle to this row; neither operation changes a physical Reply.
 #[allow(dead_code)]
