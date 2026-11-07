@@ -209,6 +209,38 @@ pub enum ExternalFileIrpResult {
     },
 }
 
+/// One definitive transport refusal after an exact detached invocation. The private fields
+/// preserve its manager-bound preparation and status without permitting a caller to relabel it.
+#[derive(Debug)]
+#[must_use = "complete or retain the exact no-entry File IRP owner"]
+pub struct ExternalFileIrpNoEntryReceipt {
+    status: NtStatus,
+    prepared: PreparedExternalFileIrp,
+}
+
+impl ExternalFileIrpNoEntryReceipt {
+    pub fn status(&self) -> NtStatus {
+        self.status
+    }
+
+    pub fn irp_id(&self) -> IrpId {
+        self.prepared.irp_id()
+    }
+}
+
+impl ExternalFileIrpResult {
+    /// Only a failed, manager-accepted NotEntered return can authorize a parked caller's
+    /// no-backend completion. All other results keep their original move-only owner.
+    pub fn into_no_entry_receipt(self) -> Result<ExternalFileIrpNoEntryReceipt, Self> {
+        match self {
+            Self::NotEntered { status, prepared } if status.is_error() => {
+                Ok(ExternalFileIrpNoEntryReceipt { status, prepared })
+            }
+            other => Err(other),
+        }
+    }
+}
+
 /// Only successful canonical retirement can mint this receipt.
 #[derive(Debug)]
 pub struct ExternalFileIrpTerminalReceipt {
@@ -739,12 +771,6 @@ impl<P: ObjectManagerPort> IoManager<P> {
         let status = (|| {
             self.validate_detached_owner(&prepared.0)?;
             let record = self.irp(prepared.irp_id()).ok_or(NtStatus::INVALID_HANDLE)?;
-            if record.state != IrpState::Initialized
-                || prepared.0.projection.major != major::IRP_MJ_READ
-                || self.file_irp_projection(prepared.irp_id())? != prepared.0.projection
-            {
-                return Err(NtStatus::INVALID_PARAMETER);
-            }
             match failure {
                 ExternalFileIrpPreEntryFailure::Cancelled
                     if record.detached_file_intent.cancel == ExternalFileIrpCancelPhase::Queued =>
@@ -769,6 +795,48 @@ impl<P: ObjectManagerPort> IoManager<P> {
             Ok(status) => status,
             Err(status) => return Err(ExternalFileIrpRejection { status, owner: prepared }),
         };
+        self.publish_prepared_external_file_irp_no_backend_failure(prepared, status)
+    }
+
+    /// Convert a transport-certified refusal into a canonical terminal for a parked READ.
+    /// The receipt's status came from `finish_external_file_irp`, never from this caller.
+    pub fn complete_external_file_irp_not_entered(
+        &mut self,
+        receipt: ExternalFileIrpNoEntryReceipt,
+    ) -> Result<RetainedExternalFileIrp, ExternalFileIrpRejection<ExternalFileIrpNoEntryReceipt>> {
+        let ExternalFileIrpNoEntryReceipt { status, prepared } = receipt;
+        match self.publish_prepared_external_file_irp_no_backend_failure(prepared, status) {
+            Ok(retained) => Ok(retained),
+            Err(rejection) => {
+                let (failure, prepared) = rejection.into_parts();
+                Err(ExternalFileIrpRejection {
+                    status: failure,
+                    owner: ExternalFileIrpNoEntryReceipt { status, prepared },
+                })
+            }
+        }
+    }
+
+    fn publish_prepared_external_file_irp_no_backend_failure(
+        &mut self,
+        prepared: PreparedExternalFileIrp,
+        status: NtStatus,
+    ) -> Result<RetainedExternalFileIrp, ExternalFileIrpRejection<PreparedExternalFileIrp>> {
+        let valid = (|| {
+            self.validate_detached_owner(&prepared.0)?;
+            let record = self.irp(prepared.irp_id()).ok_or(NtStatus::INVALID_HANDLE)?;
+            if !status.is_error()
+                || record.state != IrpState::Initialized
+                || prepared.0.projection.major != major::IRP_MJ_READ
+                || self.file_irp_projection(prepared.irp_id())? != prepared.0.projection
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            Ok(())
+        })();
+        if let Err(status) = valid {
+            return Err(ExternalFileIrpRejection { status, owner: prepared });
+        }
         if self.completed_irps.try_reserve(1).is_err() {
             return Err(ExternalFileIrpRejection {
                 status: NtStatus::INSUFFICIENT_RESOURCES,

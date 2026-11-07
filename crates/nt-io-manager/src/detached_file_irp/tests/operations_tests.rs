@@ -279,6 +279,75 @@ fn queued_read_live_route_cannot_forge_no_backend_completion() {
 }
 
 #[test]
+fn parked_read_not_entered_receipt_preserves_transport_status_and_buffers() {
+    let mut f = fixture();
+    let prepared = f.io.prepare_external_file_irp_owned(read(&f), buffers()).unwrap();
+    let id = prepared.irp_id();
+    let invocation = f.io.begin_prepared_external_file_irp(prepared).unwrap();
+    let result = f.io.finish_external_file_irp(invocation.returned(
+        ExternalFileIrpOutcome::NotEntered { status: NtStatus::DEVICE_BUSY },
+    )).unwrap();
+    let receipt = result.into_no_entry_receipt().unwrap();
+    assert_eq!(receipt.status(), NtStatus::DEVICE_BUSY);
+    assert_eq!(receipt.irp_id(), id);
+    assert_eq!(f.io.irp(id).unwrap().state, IrpState::Initialized);
+    let retained = f.io.complete_external_file_irp_not_entered(receipt).unwrap();
+    let completion = f.io.prepare_external_file_irp_completion(retained).unwrap();
+    assert_eq!(completion.completion().status, NtStatus::DEVICE_BUSY);
+    assert_eq!(completion.completion().completion_origin, IrpCompletionOrigin::NoBackendEntry);
+    assert_eq!(completion.capture_len(), 0);
+    let (retired, buffers) = f.io.retire_external_file_irp_completion_without_backend(completion).unwrap();
+    assert_eq!(retired.completion().status, NtStatus::DEVICE_BUSY);
+    assert!(!retired.backend_acknowledged());
+    assert_eq!(buffers.output(), &[7; 4]);
+    assert!(f.io.irp(id).is_none());
+    assert!(f.trace.borrow().calls.is_empty());
+    assert!(f.trace.borrow().acknowledgements.is_empty());
+}
+
+#[test]
+fn parked_read_not_entered_receipt_rejects_nonfailure_without_losing_owner() {
+    for status in [NtStatus::SUCCESS, NtStatus::PENDING] {
+        let mut f = fixture();
+        let prepared = f.io.prepare_external_file_irp_owned(read(&f), buffers()).unwrap();
+        let id = prepared.irp_id();
+        let invocation = f.io.begin_prepared_external_file_irp(prepared).unwrap();
+        let result = f.io.finish_external_file_irp(invocation.returned(
+            ExternalFileIrpOutcome::NotEntered { status },
+        )).unwrap();
+        let ExternalFileIrpResult::NotEntered { status: returned, prepared } =
+            result.into_no_entry_receipt().unwrap_err()
+        else { panic!("nonfailure must retain exact preparation") };
+        assert_eq!(returned, status);
+        assert_eq!(prepared.irp_id(), id);
+        assert_eq!(f.io.irp(id).unwrap().state, IrpState::Initialized);
+        f.io.discard_prepared_external_file_irp(prepared).unwrap();
+        assert!(f.io.irp(id).is_none());
+    }
+}
+
+#[test]
+fn parked_read_not_entered_wrong_manager_rejection_retains_receipt() {
+    let mut f = fixture();
+    let mut other = fixture();
+    let prepared = f.io.prepare_external_file_irp_owned(read(&f), buffers()).unwrap();
+    let id = prepared.irp_id();
+    let invocation = f.io.begin_prepared_external_file_irp(prepared).unwrap();
+    let result = f.io.finish_external_file_irp(invocation.returned(
+        ExternalFileIrpOutcome::NotEntered { status: NtStatus::DEVICE_NOT_CONNECTED },
+    )).unwrap();
+    let receipt = result.into_no_entry_receipt().unwrap();
+    let refusal = other.io.complete_external_file_irp_not_entered(receipt).unwrap_err();
+    assert_eq!(refusal.status(), NtStatus::INVALID_PARAMETER);
+    assert_eq!(f.io.irp(id).unwrap().state, IrpState::Initialized);
+    let retained = f.io.complete_external_file_irp_not_entered(refusal.into_owner()).unwrap();
+    let completion = f.io.prepare_external_file_irp_completion(retained).unwrap();
+    assert_eq!(completion.completion().status, NtStatus::DEVICE_NOT_CONNECTED);
+    f.io.retire_external_file_irp_completion_without_backend(completion).unwrap();
+    assert!(f.io.irp(id).is_none());
+}
+
+#[test]
 fn exact_thread_cancel_selection_terminates_with_owner_out_and_indeterminate() {
     let mut f = fixture();
     let selected = pending(&mut f, true);
