@@ -657,6 +657,22 @@ pub(crate) unsafe fn can_park_hosted_reply(reply: u64) -> bool {
         })
 }
 
+/// Identify the one delivered hosted Call that owns an original root Reply. This is only a
+/// memory-local observation; the caller must also query the physical Reply binding and pool
+/// generation before using it as a park authority.
+pub(crate) unsafe fn parkable_hosted_reply_binding(
+    reply: u64,
+) -> Option<nt_user_host::thread_binding::ThreadBinding<crate::HostedThreadRole>> {
+    let mut matching = (&*core::ptr::addr_of!(CALLS)).iter().flatten().filter(|row| {
+        row.delivered && !row.released && row.completion.is_none()
+            && row.call.as_ref().is_some_and(|call| call.reply() == reply && call.can_park())
+            && crate::service_sec_image::hosted_ingress_binding(row.binding.badge)
+                == Some(row.binding)
+    });
+    let binding = matching.next()?.binding;
+    matching.next().is_none().then_some(binding)
+}
+
 /// Only a known, mutation-free kernel rejection may become an ordinary NT failure Reply.
 /// Any ownership/query uncertainty retains the entered restart and stops the caller's adapter.
 pub(crate) unsafe fn restart_hosted(

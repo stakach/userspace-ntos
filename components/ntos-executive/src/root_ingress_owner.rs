@@ -9,10 +9,54 @@ use nt_user_host::root_ingress_handoff::{
     RootIngressHandoffKey, RootIngressHandoffReservation, RootIngressHandoffTable,
     RootIngressHandoffTicket,
 };
+use nt_component_suspension::{ReplyBindingObservation, RootReplyIdentity, RootReplySlotState};
 
-type Bundle = win32k_glue::TakenRootIngressDispatch;
+/// An observed original root Reply, authenticated again immediately before any park effect.
+#[allow(dead_code)]
+pub(crate) struct RootReplyAuthority {
+    reply: u64,
+    identity: RootReplyIdentity,
+    binding: nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+}
+
+pub(crate) struct Bundle {
+    pub(crate) taken: win32k_glue::TakenRootIngressDispatch,
+    authority: RootReplyAuthority,
+}
+
+impl Bundle {
+    #[allow(dead_code)]
+    pub(crate) fn authority(&self) -> &RootReplyAuthority { &self.authority }
+}
 
 static mut OWNERS: RootIngressHandoffTable<Bundle> = RootIngressHandoffTable::new();
+
+/// Capture before taking the selected pending slot. The child's Reply is separate from this
+/// delivered parent's Reply; a numeric match without pool generation and TCB binding is refused.
+#[allow(dead_code)]
+pub(crate) unsafe fn capture_root_reply_authority(reply: u64) -> Option<RootReplyAuthority> {
+    if reply == 0 || REPLY_MAIN_SLOT.load(Ordering::Relaxed) != reply { return None; }
+    let identity = wait_reply_pool_ref().find_cap(reply)?;
+    if wait_reply_pool_ref().state(identity).ok() != Some(RootReplySlotState::Used) {
+        return None;
+    }
+    let binding = crate::spawn_hosts::shared_ingress::owner::runtime
+        ::parkable_hosted_reply_binding(reply)?;
+    if crate::spawn_hosts::query_component_reply_binding(binding.tcb, reply)
+        != Ok(ReplyBindingObservation::BoundToTarget)
+    {
+        return None;
+    }
+    Some(RootReplyAuthority { reply, identity, binding })
+}
+
+/// A fresh observation must still identify the same pool incarnation and hosted caller.
+#[allow(dead_code)]
+pub(crate) unsafe fn root_reply_authority_is_live(authority: &RootReplyAuthority) -> bool {
+    capture_root_reply_authority(authority.reply).is_some_and(|current| {
+        current.identity == authority.identity && current.binding == authority.binding
+    })
+}
 
 #[allow(dead_code)]
 pub(crate) unsafe fn reserve_capacity() -> Option<RootIngressHandoffReservation> {
@@ -31,11 +75,11 @@ pub(crate) unsafe fn cancel_reservation(reservation: RootIngressHandoffReservati
 #[allow(dead_code)]
 pub(crate) unsafe fn retain(
     reservation: RootIngressHandoffReservation,
-    taken: Bundle,
-    root_reply: u64,
-) -> Result<RootIngressHandoffTicket, Bundle> {
+    taken: win32k_glue::TakenRootIngressDispatch,
+    authority: RootReplyAuthority,
+) -> Result<RootIngressHandoffTicket, (win32k_glue::TakenRootIngressDispatch, RootReplyAuthority)> {
     let win32k_glue::RootIngressYield::ParkedUnbound { ticket, child, owner, .. } = taken.pending.yielded
-    else { return Err(taken) };
+    else { return Err((taken, authority)) };
     let parent_identity = taken.parent.identity();
     let snapshot = taken.pending.snapshot;
     if ticket != taken.parent.ticket()
@@ -47,15 +91,17 @@ pub(crate) unsafe fn retain(
             ::undelivered_root_parent_candidate(&taken.parent, child)
         || !crate::spawn_hosts::shared_ingress::owner::runtime
             ::prepared_root_ingress_child_is_current(child)
+        || child.reply() == authority.reply
+        || !root_reply_authority_is_live(&authority)
     {
-        return Err(taken);
+        return Err((taken, authority));
     }
-    let Some(key) = RootIngressHandoffKey::new(parent_identity, child, root_reply) else {
-        return Err(taken);
+    let Some(key) = RootIngressHandoffKey::new(parent_identity, child, authority.reply) else {
+        return Err((taken, authority));
     };
     (&mut *core::ptr::addr_of_mut!(OWNERS))
-        .retain(reservation, key, taken)
-        .map_err(|(_, taken)| taken)
+        .retain(reservation, key, Bundle { taken, authority })
+        .map_err(|(_, bundle)| (bundle.taken, bundle.authority))
 }
 
 /// The exact ticket may lend its bundle to a later lane transfer. A refused transfer must

@@ -44,6 +44,7 @@ pub(crate) use retirement::retire;
 mod hosted;
 pub(crate) use hosted::{
     can_park_hosted_reply, cancel_hosted, cancel_hosted_caller, defer_hosted_delivery,
+    parkable_hosted_reply_binding,
     finish_acknowledged_hosted_reply, hosted_can_resume, hosted_cancellation_proven,
     hosted_reply_cancelled, owns_hosted_reply, release_hosted_reply, reply_hosted, restart_hosted,
     stop_and_cancel_hosted, stop_hosted_caller, take_hosted_with,
