@@ -287,14 +287,13 @@ fn trace_retained_receive_owners() {
     static CHANGE_PRINTS: AtomicU64 = AtomicU64::new(0);
     static REPEAT_PRINTS: AtomicU64 = AtomicU64::new(0);
     static URGENT_PRINTS: AtomicU64 = AtomicU64::new(0);
+    static EMPTY_PRINTS: AtomicU64 = AtomicU64::new(0);
     static PRINTS: AtomicU64 = AtomicU64::new(0);
     let section = crate::section_metadata_work::receive_owner_snapshot();
     let cleanup = crate::service_sec_image::file_cleanup_receive_owner_snapshot();
     let lifecycle = driver_launch::hosted_file_lifecycle_receive_owner_snapshot();
-    if section.is_none() && cleanup.is_none() && lifecycle.is_none() {
-        return;
-    }
-    let mut key = 0xcbf2_9ce4_8422_2325u64;
+    let empty = section.is_none() && cleanup.is_none() && lifecycle.is_none();
+    let mut key = if empty { 0 } else { 0xcbf2_9ce4_8422_2325u64 };
     for value in section.into_iter().flatten()
         .chain(cleanup.into_iter().flatten())
         .chain(lifecycle.into_iter().flatten())
@@ -302,6 +301,11 @@ fn trace_retained_receive_owners() {
         key = (key ^ value).wrapping_mul(0x100_0000_01b3);
     }
     let previous = LAST_KEY.swap(key, Ordering::Relaxed);
+    // A transition to no retained owner is still evidence at the receive
+    // boundary, but repeated empty receives need no serial output.
+    if empty && previous == 0 {
+        return;
+    }
     let repeat = if previous == key {
         REPEATS.fetch_add(1, Ordering::Relaxed) + 1
     } else {
@@ -311,16 +315,18 @@ fn trace_retained_receive_owners() {
     let now = monotonic_time_100ns();
     let armed = LAST_REARM_AUTHORITY.is_armed();
     let urgent = !armed || LAST_REARM_DEADLINE.load(Ordering::Relaxed) <= now;
-    let urgent_selected = urgent && (repeat == 0 || repeat.is_power_of_two())
-        && URGENT_PRINTS.fetch_add(1, Ordering::Relaxed) < 16;
-    let selected = if urgent_selected {
+    let urgent_selected = !empty && urgent && (repeat == 0 || repeat.is_power_of_two())
+        && URGENT_PRINTS.fetch_add(1, Ordering::Relaxed) < 12;
+    let selected = if empty {
+        EMPTY_PRINTS.fetch_add(1, Ordering::Relaxed) < 16
+    } else if urgent_selected {
         true
     } else if repeat == 0 {
         let change = CHANGES.fetch_add(1, Ordering::Relaxed) + 1;
         (change <= 8 || change.is_power_of_two() || change % 16 == 0)
-            && CHANGE_PRINTS.fetch_add(1, Ordering::Relaxed) < 32
+            && CHANGE_PRINTS.fetch_add(1, Ordering::Relaxed) < 24
     } else {
-        repeat.is_power_of_two() && REPEAT_PRINTS.fetch_add(1, Ordering::Relaxed) < 16
+        repeat.is_power_of_two() && REPEAT_PRINTS.fetch_add(1, Ordering::Relaxed) < 12
     };
     if !selected {
         return;
