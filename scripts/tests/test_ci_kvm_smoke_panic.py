@@ -228,6 +228,31 @@ class BootProgressWatchdogTests(unittest.TestCase):
         ), [])
         self.assertIsNotNone(watchdog.idle_reason(180))
 
+    def test_timed_font_broker_return_refreshes_real_completed_map(self):
+        # Boot 42348162454 completed font #16, but the watchdog missed its
+        # timing fields and stopped a guest that was still mapping fonts.
+        watchdog = self.watchdog()
+        watchdog.observe_serial(b"[pm-dynamic] allocated hosted process pi=8 pid=80 parent=24 image=csrss.exe token=3 inherited\n", 10)
+        mapped = (
+            b"[kernel-section-map] pointer=0x000001000a02e670 native-generation=696 "
+            b"view-generation=18 provider-domain=1 provider-generation=1 "
+            b"base=0x0000010025a00000 section-index=21 section-generation=64 "
+            b"backing-kind=4 file-present=1 file-mount=3 file-id=5122835127207008 "
+            b"initiator=hosted initiator-pi=8 initiator-pid=80 initiator-generation=2 "
+            b"initiator-tid=84 initiator-thread-generation=1 bytes=159032 pages=39\n"
+        )
+        completed = (
+            b"[font-next-broker-return] ordinal=16 reply-info=0x0x0000000000000004 "
+            b"status=0x0x0000000000000000 start-tsc=695632178448 "
+            b"end-tsc=695632683628\n"
+        )
+        self.assertEqual(watchdog.observe_serial(mapped, 340), [])
+        self.assertEqual(
+            watchdog.observe_serial(completed, 341),
+            ["font-section-map:5122835127207008"],
+        )
+        self.assertIsNone(watchdog.idle_reason(350))
+
     def test_completed_bootdisk_bytes_allow_only_two_bounded_extensions(self):
         watchdog = self.watchdog()
         self.assertFalse(watchdog.observe_blockstats(self.blockstats(0, 0), 0))

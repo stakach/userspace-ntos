@@ -70,6 +70,7 @@ FILE_BACKED_SECTION_MAP = re.compile(
 FONT_BROKER_RETURN = re.compile(
     rb"\[font-next-broker-return\] ordinal=[0-9]+ "
     rb"reply-info=(?:0x){1,2}[0-9a-fA-F]+ status=(?:0x){1,2}([0-9a-fA-F]+)"
+    rb"(?: start-tsc=[0-9]+ end-tsc=[0-9]+)?"
 )
 DESKTOP_SWITCH_PREFIX = b"[win32k-desktop-switch] pi/ret/"
 # QMP block statistics are sampled every ten seconds. A change observed after
