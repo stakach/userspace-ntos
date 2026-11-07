@@ -232,6 +232,28 @@ fn acknowledged_child_checkpoints_exact_parent_once() {
 }
 
 #[test]
+fn rejected_exact_free_receipt_remains_available_for_pre_restore_checkpoint() {
+    let mut child = Child::new(72);
+    let parent = new_parent();
+    let call = child.call.as_ref().unwrap();
+    let key = call.admission_key();
+    let mut pass = RootIngressPass::prepare(call, binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    let _attempt = pass.begin_import(binding(), call).unwrap();
+    unsafe { pass.deliver(binding(), call) }.unwrap();
+    let mut wrong_binding = binding();
+    wrong_binding.tid += 1;
+    let (error, receipt) = pass.acknowledge_settlement(wrong_binding, child.settle()).unwrap_err();
+    assert_eq!(error, PassError::WrongChild);
+    assert_eq!(receipt.admission_key(), key);
+    assert_eq!(pass.begin_restore(&parent).unwrap_err(), PassError::Unsettled);
+    assert_eq!(pass.settlement_disposition(binding(), key).unwrap(),
+        (parent.identity(), RootIngressSettlementDisposition::Checkpoint));
+    pass.acknowledge_settlement(binding(), receipt).unwrap();
+    assert_eq!(pass.begin_restore(&parent).unwrap().admission_key(), key);
+}
+
+#[test]
 fn parked_child_restores_parent_but_keeps_its_reply_for_later_settlement() {
     let mut child = Child::new(40);
     let parent = new_parent();

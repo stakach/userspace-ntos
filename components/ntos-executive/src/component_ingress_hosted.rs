@@ -935,6 +935,45 @@ fn settle_root_ingress(
     }
 }
 
+/// After checked Free, retry only the pure pre-restore checkpoint transition. The exact
+/// retained receipt stays in CALLS on every refusal; this never sends or frees a Reply again.
+pub(crate) unsafe fn reconcile_root_ingress_settlement_before_restore(
+    binding: Binding,
+    admission: ExternalAdmissionKey,
+    parent_identity: nt_component_suspension::NestedExecutionIdentity,
+) -> Result<(), Error> {
+    let row = (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten()
+        .find(|row| row.binding == binding
+            && row.root_ingress.as_ref().is_some_and(|root| {
+                root.pass.admission_key() == admission
+            }))
+        .ok_or(Error::Admission)?;
+    let root = row.root_ingress.as_mut().ok_or(Error::Admission)?;
+    let parent = root.parent.as_ref().ok_or(Error::Admission)?;
+    if row.completion != Some(Completion::Acknowledged)
+        || row.receive_settlement.is_some() || root.restored.is_some()
+        || root.pass.child() != binding
+        || row.recycled.as_ref().is_none_or(|ready| ready.reply() != admission.reply())
+        || root.unconsumed_settlement.as_ref().is_none_or(|settlement| {
+            settlement.admission_key() != admission
+        })
+        || parent.identity() != parent_identity
+        || !super::nested::root_ingress_parent_is_held(parent, admission)
+        || root.pass.settlement_disposition(binding, admission).ok() != Some((
+            parent_identity,
+            nt_user_host::root_ingress_pass::RootIngressSettlementDisposition::Checkpoint,
+        ))
+    {
+        return Err(Error::Admission);
+    }
+    let settlement = root.unconsumed_settlement.take().ok_or(Error::Admission)?;
+    if let Err((_, settlement)) = root.pass.acknowledge_settlement(binding, settlement) {
+        root.unconsumed_settlement = Some(settlement);
+        return Err(Error::Admission);
+    }
+    Ok(())
+}
+
 /// Transfer a post-restoration Free receipt to the exact later result owner. This does not
 /// recreate the parent checkpoint or authorize another Reply send.
 pub(crate) unsafe fn take_root_ingress_settlement(
@@ -947,10 +986,15 @@ pub(crate) unsafe fn take_root_ingress_settlement(
                 root.pass.admission_key() == admission
             }))?;
     let root = row.root_ingress.as_mut()?;
-    if root.restored.as_ref().is_none_or(|restored| {
-        restored.child() != binding || restored.admission_key() != admission
-            || !restored.parked_child()
-    }) || row.completion != Some(Completion::Acknowledged)
+    let restored = root.restored.as_ref()?;
+    if root.parent.is_some()
+        || restored.child() != binding || restored.admission_key() != admission
+        || !restored.parked_child()
+        || root.pass.settlement_disposition(binding, admission).ok() != Some((
+            restored.parent(),
+            nt_user_host::root_ingress_pass::RootIngressSettlementDisposition::RetainForResult,
+        ))
+        || row.completion != Some(Completion::Acknowledged)
         || row.recycled.as_ref().is_none_or(|ready| ready.reply() != admission.reply())
         || root.unconsumed_settlement.as_ref().is_none_or(|settlement| {
             settlement.admission_key() != admission

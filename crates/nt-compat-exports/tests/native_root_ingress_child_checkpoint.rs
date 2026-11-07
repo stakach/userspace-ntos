@@ -63,6 +63,25 @@ fn acknowledged_child_settlement_is_retained_by_root_pass_or_exact_future_owner(
 }
 
 #[test]
+fn post_free_receipt_has_distinct_exact_reconciliation_before_and_after_parent_restore() {
+    let before = function("reconcile_root_ingress_settlement_before_restore");
+    assert!(before.contains("Completion::Acknowledged")
+        && before.contains("root_ingress_parent_is_held")
+        && before.contains("RootIngressSettlementDisposition::Checkpoint")
+        && before.contains("root.unconsumed_settlement.take()")
+        && before.contains("root.pass.acknowledge_settlement")
+        && before.contains("root.unconsumed_settlement = Some(settlement)"),
+        "a pre-restore Free receipt must be checkpointed exactly or retained for retry");
+    let after = function("take_root_ingress_settlement");
+    assert!(after.contains("root.parent.is_some()")
+        && after.contains("restored.parent()")
+        && after.contains("RootIngressSettlementDisposition::RetainForResult")
+        && after.find("RootIngressSettlementDisposition::RetainForResult").unwrap()
+            < after.find("root.unconsumed_settlement.take()").unwrap(),
+        "post-restore transfer needs a fresh exact parent/disposition check");
+}
+
+#[test]
 fn selected_child_is_preflighted_before_reply_send_and_checked_free() {
     let reply = function("reply_hosted");
     let preflight = function("preflight_root_ingress_settlement");
