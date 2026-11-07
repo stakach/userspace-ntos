@@ -69,6 +69,7 @@ const SYSCALL_PHASE_CALL: u64 = 4;
 const SYSCALL_PHASE_NOTIFICATION: u64 = 5;
 static NEXT_SYSCALL_SNAPSHOT: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_SYSCALL_SNAPSHOT_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+static STALE_SYSCALL_TCB_DEBUG_SAMPLES: AtomicU64 = AtomicU64::new(0);
 
 struct ActiveSyscallSnapshot {
     sequence: AtomicU64,
@@ -92,6 +93,11 @@ struct ActiveSyscallSnapshot {
     last_transition_at_100ns: AtomicU64,
     reply_binding: AtomicU64,
     last_binding_at_100ns: AtomicU64,
+    notification_badge: AtomicU64,
+    notification_info: AtomicU64,
+    notification_timer_probe: AtomicU64,
+    notification_at_100ns: AtomicU64,
+    debugged_sequence: AtomicU64,
 }
 
 impl ActiveSyscallSnapshot {
@@ -118,6 +124,11 @@ impl ActiveSyscallSnapshot {
             last_transition_at_100ns: AtomicU64::new(0),
             reply_binding: AtomicU64::new(0),
             last_binding_at_100ns: AtomicU64::new(0),
+            notification_badge: AtomicU64::new(0),
+            notification_info: AtomicU64::new(0),
+            notification_timer_probe: AtomicU64::new(0),
+            notification_at_100ns: AtomicU64::new(0),
+            debugged_sequence: AtomicU64::new(0),
         }
     }
 
@@ -167,6 +178,11 @@ fn capture_active_syscall_snapshot(ch: &PumpChannel, route: PeerRoute) -> Option
     slot.last_transition_at_100ns.store(slot.started_100ns.load(Ordering::Relaxed), Ordering::Relaxed);
     slot.reply_binding.store(0, Ordering::Relaxed);
     slot.last_binding_at_100ns.store(0, Ordering::Relaxed);
+    slot.notification_badge.store(0, Ordering::Relaxed);
+    slot.notification_info.store(0, Ordering::Relaxed);
+    slot.notification_timer_probe.store(0, Ordering::Relaxed);
+    slot.notification_at_100ns.store(0, Ordering::Relaxed);
+    slot.debugged_sequence.store(0, Ordering::Relaxed);
     slot.sequence.store(sequence, Ordering::Release);
     Some((index, sequence))
 }
@@ -195,17 +211,46 @@ pub(super) fn print_active_syscall_receive_census() {
             slot.last_transition_at_100ns.load(Ordering::Relaxed),
             slot.reply_binding.load(Ordering::Relaxed),
             slot.last_binding_at_100ns.load(Ordering::Relaxed),
+            slot.notification_badge.load(Ordering::Relaxed),
+            slot.notification_info.load(Ordering::Relaxed),
+            slot.notification_timer_probe.load(Ordering::Relaxed),
+            slot.notification_at_100ns.load(Ordering::Relaxed),
         ];
         core::sync::atomic::fence(Ordering::Acquire);
         if slot.observation_epoch.load(Ordering::Acquire) != epoch { continue; }
         if slot.sequence.load(Ordering::Acquire) != sequence { continue; }
-        crate::print_str(b"[pump-active-syscall] slot/sequence/start-100ns/domain/cookie/route/route-domain/route-gen/lane/lane-gen/tcb/reply/ssn/client-pi/client-gen/provider-arrivals/last-provider-100ns/phase/last-transition-100ns/pre-recv-reply-binding/pre-recv-binding-sampled-100ns=");
+        crate::print_str(b"[pump-active-syscall] slot/sequence/start-100ns/domain/cookie/route/route-domain/route-gen/lane/lane-gen/tcb/reply/ssn/client-pi/client-gen/provider-arrivals/last-provider-100ns/phase/last-transition-100ns/pre-recv-reply-binding/pre-recv-binding-sampled-100ns/notification-badge/info/timer-probe/at-100ns=");
         crate::print_u64(index as u64);
         crate::print_str(b"/"); crate::print_u64(sequence);
         for value in values {
             crate::print_str(b"/"); crate::print_u64(value);
         }
         crate::print_str(b"\n");
+        let last_provider = values[14].max(values[0]);
+        let now = crate::monotonic_time_100ns();
+        let Some(client_tcb) = (unsafe { crate::win32k_glue::active_callback_client_tcb(
+            values[11], values[6], values[7],
+        ) }) else { continue; };
+        if values[8] != 0 && values[9] != 0
+            && now.saturating_sub(last_provider) >= 300_000_000
+            && slot.sequence.load(Ordering::Acquire) == sequence
+            && slot.debugged_sequence.compare_exchange(
+                0, sequence, Ordering::AcqRel, Ordering::Relaxed,
+            ).is_ok()
+            && STALE_SYSCALL_TCB_DEBUG_SAMPLES.fetch_add(1, Ordering::Relaxed) < 8
+        {
+            // The microkernel query overwrites IPC MRs. Preserve the in-flight
+            // message; this is an observation, never authority to reuse Reply.
+            let _saved = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
+            unsafe {
+                crate::win32k_glue::trace_hosted_tcb_debug_state(
+                    b"pump-stale-provider", values[8], values[9],
+                );
+                crate::win32k_glue::trace_hosted_tcb_debug_state(
+                    b"pump-stale-client", client_tcb, 0,
+                );
+            }
+        }
     }
     let overflow = ACTIVE_SYSCALL_SNAPSHOT_OVERFLOW.load(Ordering::Relaxed);
     if overflow != 0 {
@@ -414,6 +459,20 @@ fn record_active_syscall_provider_arrival(scope: &ReceiveCensusScope) {
     slot.begin_update();
     slot.provider_arrivals.fetch_add(1, Ordering::Relaxed);
     slot.last_provider_at_100ns.store(crate::monotonic_time_100ns(), Ordering::Relaxed);
+    slot.end_update();
+}
+
+fn record_active_syscall_notification(
+    scope: &ReceiveCensusScope, badge: u64, info: u64, timer_probe: bool,
+) {
+    let Some((index, sequence)) = scope.syscall_snapshot else { return; };
+    let slot = &ACTIVE_SYSCALL_SNAPSHOTS[index];
+    if slot.sequence.load(Ordering::Acquire) != sequence { return; }
+    slot.begin_update();
+    slot.notification_badge.store(badge, Ordering::Relaxed);
+    slot.notification_info.store(info, Ordering::Relaxed);
+    slot.notification_timer_probe.store(u64::from(timer_probe), Ordering::Relaxed);
+    slot.notification_at_100ns.store(crate::monotonic_time_100ns(), Ordering::Relaxed);
     slot.end_update();
 }
 
@@ -990,6 +1049,9 @@ pub(super) unsafe fn receive(
             }
             Ok(runtime::Arrival::Notification(message)) => {
                 record_active_syscall_transition(&census_scope, SYSCALL_PHASE_NOTIFICATION);
+                record_active_syscall_notification(
+                    &census_scope, message.badge(), message.info(), timer_checkpoint,
+                );
                 trace_ps_create_receive(ch, b"notification", Some(route));
                 // The shared ingress has already proven NoCall with a free Reply. An empty
                 // nonblocking probe has no sender and must not count as watchdog progress.

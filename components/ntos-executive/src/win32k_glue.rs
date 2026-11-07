@@ -2490,6 +2490,26 @@ pub(crate) fn print_callback_owner_census() {
     print_str(b"\n");
 }
 
+/// Match the copied callback owner to an exact active syscall before sampling
+/// physical TCB state. A different callback cannot justify a stall diagnosis.
+pub(crate) unsafe fn active_callback_client_tcb(
+    client_pi: u64, lane_index: u64, lane_generation: u64,
+) -> Option<u64> {
+    let owner = nt_user_callback::oldest_active_callback_owner(
+        &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE),
+        &*core::ptr::addr_of!(USER_CALLBACK_CONTINUATIONS),
+    );
+    let Some(owner) = owner else { return None; };
+    if owner.correlation.client_pi as u64 != client_pi
+        || owner.lane.index as u64 != lane_index
+        || owner.lane.generation != lane_generation
+        || owner.client_tcb == 0
+    {
+        return None;
+    }
+    Some(owner.client_tcb)
+}
+
 unsafe fn callback_frame_can_resume(frame: &nt_user_callback::ActiveCallbackFrame) -> bool {
     crate::component_external_resume_ready(
         frame.dispatch_context().lane,
