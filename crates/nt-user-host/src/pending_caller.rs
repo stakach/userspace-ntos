@@ -15,6 +15,7 @@ pub enum PendingCallerError {
     AllocationFailed,
     WrongKey,
     InvalidPhase,
+    CallerMismatch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +84,26 @@ impl<K: Copy + Eq> PendingCallerTable<K> {
         let entry = self.entry_mut(slot, key)?;
         if entry.phase != Phase::Reserved {
             return Err(PendingCallerError::InvalidPhase);
+        }
+        entry.phase = Phase::Published;
+        Ok(entry.caller)
+    }
+
+    /// Publish only the previously captured caller when the exact expected caller and the
+    /// adapter's record check both still agree. Refusal leaves the reservation untouched.
+    pub fn publish_checked(
+        &mut self,
+        slot: usize,
+        key: K,
+        expected: ProviderLogicalCaller,
+        accepts: impl FnOnce(ProviderLogicalCaller) -> bool,
+    ) -> Result<ProviderLogicalCaller, PendingCallerError> {
+        let entry = self.entry_mut(slot, key)?;
+        if entry.phase != Phase::Reserved {
+            return Err(PendingCallerError::InvalidPhase);
+        }
+        if entry.caller != expected || !accepts(entry.caller) {
+            return Err(PendingCallerError::CallerMismatch);
         }
         entry.phase = Phase::Published;
         Ok(entry.caller)
