@@ -452,6 +452,8 @@ struct Work {
     cancelled: bool,
     commit_entered: bool,
     published: bool,
+    last_refusal: Option<(&'static str, u32)>,
+    refusal_count: u64,
 }
 
 static mut ATTEMPTS: CmMutationBeginAttempts = CmMutationBeginAttempts::new();
@@ -736,42 +738,63 @@ pub(crate) struct CensusSnapshot {
     selected_index: u64,
     hosted_rows: usize,
     provider_rows: usize,
-    first_hosted: Option<(u64, &'static str, &'static str)>,
+    hosted_samples: [Option<HostedRowSample>; 4],
+    hosted_sample_overflow: usize,
     first_provider: Option<(u64, &'static str, &'static str)>,
+}
+
+/// Fixed-size copied evidence; no retained Reply, Key, journal, or table reference escapes.
+#[derive(Clone, Copy, Debug)]
+struct HostedRowSample {
+    id: u64,
+    pi: usize,
+    tid: u64,
+    phase: &'static str,
+    storage: &'static str,
+    recheck_id: Option<u64>,
+    wal_io_active: bool,
+    status: u32,
+    commit_entered: bool,
+    last_refusal: Option<(&'static str, u32)>,
+    refusal_count: u64,
 }
 
 pub(crate) unsafe fn census_snapshot() -> CensusSnapshot {
     let rows = &*core::ptr::addr_of!(WORK);
     let mut hosted_rows = 0;
     let mut provider_rows = 0;
-    let mut first_hosted = None;
+    let mut hosted_samples = [None; 4];
+    let mut hosted_sample_overflow = 0;
     let mut first_provider = None;
     for work in rows.iter().flatten() {
         match &work.caller {
-            Caller::Hosted(_) => {
+            Caller::Hosted(caller) => {
                 hosted_rows += 1;
-                if first_hosted.is_none() {
-                    let phase = phase_name(&work.phase);
-                    let storage = match work.persistence.owner {
-                        PersistenceOwner::Unadmitted => "unadmitted",
-                        PersistenceOwner::NoStorage => "no-storage",
-                        PersistenceOwner::Admitting { .. } => "admitting",
-                        PersistenceOwner::Legacy(_) => "legacy",
-                        PersistenceOwner::Wal(_) => "wal",
-                    };
-                    first_hosted = Some((work.id, phase, storage));
+                if let Some(slot) = hosted_samples.iter_mut().find(|slot| slot.is_none()) {
+                    *slot = Some(HostedRowSample {
+                        id: work.id,
+                        pi: caller.pi,
+                        tid: caller.tid,
+                        phase: phase_name(&work.phase),
+                        storage: persistence_name(&work.persistence.owner),
+                        recheck_id: work.persistence.admission_recheck_id(),
+                        wal_io_active: match &work.persistence.owner {
+                            PersistenceOwner::Wal(wal) => wal.native_io_active(),
+                            _ => false,
+                        },
+                        status: work.status,
+                        commit_entered: work.commit_entered,
+                        last_refusal: work.last_refusal,
+                        refusal_count: work.refusal_count,
+                    });
+                } else {
+                    hosted_sample_overflow += 1;
                 }
             }
             Caller::Provider(_) => {
                 provider_rows += 1;
                 if first_provider.is_none() {
-                    let storage = match work.persistence.owner {
-                        PersistenceOwner::Unadmitted => "unadmitted",
-                        PersistenceOwner::NoStorage => "no-storage",
-                        PersistenceOwner::Admitting { .. } => "admitting",
-                        PersistenceOwner::Legacy(_) => "legacy",
-                        PersistenceOwner::Wal(_) => "wal",
-                    };
+                    let storage = persistence_name(&work.persistence.owner);
                     first_provider = Some((work.id, phase_name(&work.phase), storage));
                 }
             }
@@ -784,8 +807,19 @@ pub(crate) unsafe fn census_snapshot() -> CensusSnapshot {
         selected_index: EXECUTING_INDEX.load(Ordering::Relaxed),
         hosted_rows,
         provider_rows,
-        first_hosted,
+        hosted_samples,
+        hosted_sample_overflow,
         first_provider,
+    }
+}
+
+fn persistence_name(owner: &PersistenceOwner) -> &'static str {
+    match owner {
+        PersistenceOwner::Unadmitted => "unadmitted",
+        PersistenceOwner::NoStorage => "no-storage",
+        PersistenceOwner::Admitting { .. } => "admitting",
+        PersistenceOwner::Legacy(_) => "legacy",
+        PersistenceOwner::Wal(_) => "wal",
     }
 }
 
@@ -947,6 +981,7 @@ pub(crate) unsafe fn submit_hosted(
         caller: Caller::Hosted(caller), phase: Phase::Begin(attempt), prepared: None, persistence: MutationPersistence::new(),
         receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
+        last_refusal: None, refusal_count: 0,
     });
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
     match index {
@@ -1062,6 +1097,7 @@ pub(crate) unsafe fn submit_hosted_existing(
         caller: Caller::Hosted(hosted), phase: Phase::Begin(attempt), prepared: None, persistence: MutationPersistence::new(),
         receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
+        last_refusal: None, refusal_count: 0,
     });
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
     match index {
@@ -1126,6 +1162,7 @@ pub(crate) unsafe fn submit_hosted_system_locale(
         caller: Caller::Hosted(caller), phase: Phase::Begin(attempt), prepared: None, persistence: MutationPersistence::new(),
         receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
+        last_refusal: None, refusal_count: 0,
     });
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
     match index {
@@ -1242,6 +1279,8 @@ unsafe fn redrive_inner(mut context: HostedContext<'_>) -> bool {
                     immediate_progress = previous_phase != phase_progress_fingerprint(&work.phase);
                 }
                 Err(status) => {
+                    work.last_refusal = Some((phase_name(&work.phase), status as u32));
+                    work.refusal_count = work.refusal_count.saturating_add(1);
                     trace_interface_retry(&work, status, admit_retry_substage);
                     trace_existing_provider_retry(&work, status, admit_retry_substage);
                     failed = true;
