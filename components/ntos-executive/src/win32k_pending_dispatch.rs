@@ -156,6 +156,57 @@ pub(crate) unsafe fn pending_root_ingress_dispatch_is_some() -> bool {
     (&*core::ptr::addr_of!(ROOT_INGRESS_PENDING_DISPATCH)).is_some()
 }
 
+/// The slot and the physical parent travel together across the serialized outer handoff.
+/// This bundle is intentionally move-only even though the saved pump snapshot is copyable.
+pub(crate) struct TakenRootIngressDispatch {
+    pub(crate) pending: PendingRootIngressDispatch,
+    pub(crate) parent: crate::spawn_hosts::shared_ingress::owner::runtime::nested::ParkedParentHandle,
+}
+
+/// Claim only the exact prepared child and parked physical parent. A retained/uncertain yield
+/// never grants a parent handle, and any failed check leaves the pending slot untouched.
+pub(crate) unsafe fn take_pending_root_ingress_dispatch(
+    ticket: crate::spawn_hosts::shared_ingress::owner::runtime::nested::NestedRestoreTicket,
+    child: nt_component_suspension::ExternalAdmissionKey,
+) -> Option<TakenRootIngressDispatch> {
+    let slot = &mut *core::ptr::addr_of_mut!(ROOT_INGRESS_PENDING_DISPATCH);
+    let pending = slot.as_ref()?;
+    let RootIngressYield::ParkedUnbound {
+        ticket: pending_ticket, child: pending_child, ..
+    } = pending.yielded else { return None };
+    if pending_ticket != ticket || pending_child != child
+        || !crate::spawn_hosts::shared_ingress::owner::runtime
+            ::prepared_root_ingress_child_is_current(child)
+    {
+        return None;
+    }
+    let parent = crate::spawn_hosts::shared_ingress::owner::runtime::nested
+        ::parked_unbound_root_parent(ticket, child)?;
+    let pending = core::ptr::replace(slot, None)?;
+    Some(TakenRootIngressDispatch { pending, parent })
+}
+
+/// A pre-effect refusal must return both the saved pump and its move-only parent selector.
+/// If identity or the destination slot changed, the caller retains the complete bundle.
+pub(crate) unsafe fn restore_pending_root_ingress_dispatch(
+    taken: TakenRootIngressDispatch,
+) -> Result<(), TakenRootIngressDispatch> {
+    let RootIngressYield::ParkedUnbound { ticket, child, .. } = taken.pending.yielded
+    else { return Err(taken) };
+    if taken.parent.ticket() != ticket
+        || !crate::spawn_hosts::shared_ingress::owner::runtime
+            ::prepared_root_ingress_child_is_current(child)
+        || crate::spawn_hosts::shared_ingress::owner::runtime::nested
+            ::parked_unbound_root_parent(ticket, child).is_none()
+    {
+        return Err(taken);
+    }
+    let slot = &mut *core::ptr::addr_of_mut!(ROOT_INGRESS_PENDING_DISPATCH);
+    if slot.is_some() { return Err(taken) }
+    *slot = Some(taken.pending);
+    Ok(())
+}
+
 pub(super) static mut RECEIVE_PENDING_DISPATCH: Option<PendingReceiveDispatch> = None;
 
 /// Dispatch-owned cells in the one physical win32k shared page. Global SSDT, SAS, font and

@@ -894,6 +894,29 @@ unsafe fn root_ingress_pending() -> bool {
         .any(|row| row.root_ingress.is_some())
 }
 
+/// Memory-only admission check for a pending outer RootIngress handoff. A numeric Reply or
+/// admission sequence alone cannot select a different CALLS row after slot reuse.
+pub(crate) unsafe fn prepared_root_ingress_child_is_current(
+    admission: ExternalAdmissionKey,
+) -> bool {
+    (&*core::ptr::addr_of!(CALLS)).iter().flatten().any(|row| {
+        let Some(root) = row.root_ingress.as_ref() else { return false };
+        let Some(call) = row.call.as_ref() else { return false };
+        !row.delivered && !row.released && row.completion.is_none()
+            && row.receive_settlement.is_none()
+            && root.parent.is_none() && root.undelivered_parent.is_none()
+            && root.undelivered.is_none() && root.restored.is_none()
+            && root.pass.child() == row.binding
+            && root.pass.admission_key() == admission
+            && call.admission_key() == admission
+            && call.reply() == admission.reply()
+            && call.executor() == admission.executor()
+            && call.can_park()
+            && crate::service_sec_image::hosted_ingress_binding(row.binding.badge)
+                == Some(row.binding)
+    })
+}
+
 fn root_child_admission_current(row: &HostedCall, admission: ExternalAdmissionKey) -> bool {
     match row.call.as_ref() {
         Some(call) => call.admission_key() == admission,
