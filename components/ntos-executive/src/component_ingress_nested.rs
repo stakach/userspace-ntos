@@ -86,7 +86,7 @@ struct Parent {
     phase: ParentPhase,
     physical: PhysicalExecutionHold,
     scope: Option<NestedExecutionScope>,
-    receive_bound: bool,
+    child: Option<ParentChild>,
     receive_restore:
         Option<nt_user_host::receive_child_barrier::ReceiveRestorePermit<crate::HostedThreadRole>>,
 }
@@ -106,6 +106,12 @@ enum ParentPhase {
     AbortAttempt,
     /// Native entry or identity is uncertain. Retain all resources, never replay an effect.
     Quarantined,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ParentChild {
+    Receive,
+    RootIngress,
 }
 
 // Records are never removed before both canonical restoration and physical release acknowledge.
@@ -167,7 +173,7 @@ pub(crate) unsafe fn park_current() -> Result<Option<ParkedParentHandle>, Error>
         phase: ParentPhase::Acquiring,
         physical: PhysicalExecutionHold::new(route, dispatch),
         scope: None,
-        receive_bound: false,
+        child: None,
         receive_restore: None,
     });
     let _saved = crate::ipc_message::SavedMessageBuffer::capture();
@@ -301,13 +307,35 @@ pub(crate) unsafe fn bind_receive_child(
         .ok_or(Error::Admission)?;
     let scope = parent.scope.as_ref().ok_or(Error::Admission)?;
     if !row_matches(handle, parent) || parent.phase != ParentPhase::Parked
-        || !parent.physical.canonical_pending() || parent.receive_bound {
+        || !parent.physical.canonical_pending() || parent.child.is_some() {
         return Err(Error::Admission);
     }
     barrier
         .bind_parent(scope, dispatch)
         .map_err(|_| Error::Admission)?;
-    parent.receive_bound = true;
+    parent.child = Some(ParentChild::Receive);
+    Ok(())
+}
+
+/// Bind a prepared ordinary root event to the exact physical parent after its hold acknowledges.
+/// The pass stays in the retained child row; this parent row remains the physical authority.
+pub(crate) unsafe fn bind_root_ingress_child(
+    handle: &ParkedParentHandle,
+    pass: &mut nt_user_host::root_ingress_pass::RootIngressPass<crate::HostedThreadRole>,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+) -> Result<(), Error> {
+    let parent = (&mut *core::ptr::addr_of_mut!(PARENTS))
+        .get_mut(handle.index)
+        .and_then(Option::as_mut)
+        .ok_or(Error::Admission)?;
+    let scope = parent.scope.as_ref().ok_or(Error::Admission)?;
+    if !row_matches(handle, parent) || parent.phase != ParentPhase::Parked
+        || !parent.physical.canonical_pending() || parent.child.is_some()
+    {
+        return Err(Error::Admission);
+    }
+    pass.bind_parent(scope, dispatch).map_err(|_| Error::Admission)?;
+    parent.child = Some(ParentChild::RootIngress);
     Ok(())
 }
 
@@ -368,7 +396,11 @@ unsafe fn restore_stages(handle: &mut Option<ParkedParentHandle>) -> Result<(), 
     if !row_matches(ticket, parent) || parent.phase != ParentPhase::RestoreAttempt {
         return Err(Error::Admission);
     }
-    if parent.receive_bound
+    if parent.child == Some(ParentChild::RootIngress) {
+        // A later checkpoint must transfer the pass's one-shot restore permit first.
+        return Err(Error::Admission);
+    }
+    if parent.child == Some(ParentChild::Receive)
         && parent.receive_restore.as_ref().is_none_or(|permit| {
             !permit.matches_scope(parent.scope.as_ref().expect("validated scope"))
         })

@@ -17,6 +17,13 @@ struct ReceiveSettlement {
     rejected: Option<nt_component_suspension::ExternalSettlement>,
 }
 
+/// Prepared before the physical hold, then bound to its exact retained parent after parking.
+/// This owner has no delivery or restore authority until the event checkpoint is installed.
+struct RootIngressOwner {
+    pass: nt_user_host::root_ingress_pass::RootIngressPass<crate::HostedThreadRole>,
+    parent: Option<super::nested::ParkedParentHandle>,
+}
+
 /// Single-use outer-loop delivery. The parent row already retains the sealed settlement permit.
 pub(crate) struct ReceiveSettlementBoundary {
     pub(crate) parent: Option<super::nested::ParkedParentHandle>,
@@ -47,6 +54,7 @@ struct HostedCall {
     completion: Option<Completion>,
     released: bool,
     receive_settlement: Option<ReceiveSettlement>,
+    root_ingress: Option<RootIngressOwner>,
 }
 static mut CALLS: Vec<Option<HostedCall>> = Vec::new();
 
@@ -191,6 +199,7 @@ pub(super) unsafe fn retain(
         completion: None,
         released: false,
         receive_settlement: None,
+        root_ingress: None,
     });
     Ok(())
 }
@@ -210,6 +219,9 @@ pub(crate) unsafe fn take_hosted_with(
             .filter_map(|(index, row)| {
                 let row = row.as_ref()?;
                 if row.delivered || row.released || row.completion.is_some() {
+                    return None;
+                }
+                if row.root_ingress.is_some() {
                     return None;
                 }
                 let call = row.call.as_ref().filter(|call| call.can_park())?;
@@ -544,6 +556,9 @@ pub(crate) unsafe fn prepare_receive_settlement(
     provider_pml4: u64,
     trace_owner: nt_component_suspension::SuspensionOwner,
 ) -> Result<nt_component_suspension::ExternalAdmissionKey, Error> {
+    if root_ingress_pending() {
+        return Err(Error::Admission);
+    }
     let oldest = oldest_pending_snapshot().ok_or(Error::Admission)?;
     if oldest.binding != snapshot.binding
         || oldest.reply != snapshot.reply
@@ -562,7 +577,8 @@ pub(crate) unsafe fn prepare_receive_settlement(
                 })
         })
         .ok_or(Error::Admission)?;
-    if row.receive_settlement.is_some() || row.delivered || row.released {
+    if row.receive_settlement.is_some() || row.root_ingress.is_some()
+        || row.delivered || row.released {
         return Err(Error::Admission);
     }
     let barrier = nt_user_host::receive_child_barrier::ReceiveChildBarrier::prepare(
@@ -582,6 +598,113 @@ pub(crate) unsafe fn prepare_receive_settlement(
         rejected: None,
     });
     Ok(admission)
+}
+
+/// Prepare the oldest exact hosted Call for one ordinary root event. This is memory-only and
+/// precedes the parent's physical park; the child Reply remains in its original CALLS row.
+pub(crate) unsafe fn prepare_root_ingress_pass(
+    snapshot: PendingSnapshot,
+) -> Result<nt_component_suspension::ExternalAdmissionKey, Error> {
+    if receive_child_pending() || root_ingress_pending() {
+        return Err(Error::Admission);
+    }
+    let oldest = oldest_pending_snapshot().ok_or(Error::Admission)?;
+    if oldest.binding != snapshot.binding
+        || oldest.reply != snapshot.reply
+        || oldest.admission_sequence != snapshot.admission_sequence
+        || oldest.info != snapshot.info
+        || oldest.registers != snapshot.registers
+        || (snapshot.info >> 12) != nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL
+    {
+        return Err(Error::Admission);
+    }
+    let row = (&mut *core::ptr::addr_of_mut!(CALLS))
+        .iter_mut()
+        .flatten()
+        .find(|row| {
+            row.binding == snapshot.binding
+                && row.call.as_ref().is_some_and(|call| {
+                    call.reply() == snapshot.reply
+                        && call.admission_sequence() == snapshot.admission_sequence
+                })
+        })
+        .ok_or(Error::Admission)?;
+    if row.receive_settlement.is_some() || row.root_ingress.is_some()
+        || row.delivered || row.released || row.completion.is_some()
+    {
+        return Err(Error::Admission);
+    }
+    let call = row.call.as_ref().ok_or(Error::Admission)?;
+    if call.message().info() != snapshot.info
+        || call.message().registers() != snapshot.registers
+    {
+        return Err(Error::Admission);
+    }
+    let pass = nt_user_host::root_ingress_pass::RootIngressPass::prepare(call, row.binding)
+        .map_err(|_| Error::Admission)?;
+    let admission = pass.admission_key();
+    row.root_ingress = Some(RootIngressOwner { pass, parent: None });
+    Ok(admission)
+}
+
+/// Transfer the exact physical parent handle to the prepared child row after park acknowledges.
+/// On refusal, return the handle to the caller; the PARENTS row retains its physical hold.
+pub(crate) unsafe fn bind_root_ingress_pass(
+    snapshot: PendingSnapshot,
+    parent: super::nested::ParkedParentHandle,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+) -> Result<(), (Error, super::nested::ParkedParentHandle)> {
+    let result = (|| {
+        let row = (&mut *core::ptr::addr_of_mut!(CALLS))
+            .iter_mut()
+            .flatten()
+            .find(|row| {
+                row.binding == snapshot.binding
+                    && row.call.as_ref().is_some_and(|call| {
+                        call.reply() == snapshot.reply
+                            && call.admission_sequence() == snapshot.admission_sequence
+                    })
+            })
+            .ok_or(Error::Admission)?;
+        if row.delivered || row.released || row.completion.is_some()
+            || row.receive_settlement.is_some()
+        {
+            return Err(Error::Admission);
+        }
+        let root = row.root_ingress.as_mut().ok_or(Error::Admission)?;
+        if root.parent.is_some()
+            || root.pass.admission_key()
+                != row.call.as_ref().ok_or(Error::Admission)?.admission_key()
+            || row.call.as_ref().ok_or(Error::Admission)?.message().info() != snapshot.info
+            || row.call.as_ref().ok_or(Error::Admission)?.message().registers()
+                != snapshot.registers
+        {
+            return Err(Error::Admission);
+        }
+        super::nested::bind_root_ingress_child(&parent, &mut root.pass, dispatch)
+    })();
+    if let Err(error) = result {
+        return Err((error, parent));
+    }
+    let root = (&mut *core::ptr::addr_of_mut!(CALLS))
+        .iter_mut()
+        .flatten()
+        .find(|row| {
+            row.binding == snapshot.binding
+                && row.call.as_ref().is_some_and(|call| {
+                    call.reply() == snapshot.reply
+                        && call.admission_sequence() == snapshot.admission_sequence
+                })
+        })
+        .and_then(|row| row.root_ingress.as_mut())
+        .expect("validated root ingress child retained");
+    root.parent = Some(parent);
+    Ok(())
+}
+
+unsafe fn root_ingress_pending() -> bool {
+    (&*core::ptr::addr_of!(CALLS)).iter().flatten()
+        .any(|row| row.root_ingress.is_some())
 }
 
 pub(crate) unsafe fn receive_child_pending() -> bool {
@@ -911,7 +1034,7 @@ pub(super) unsafe fn recycle_completed() -> Result<(), Error> {
         let Some(row) = record.as_mut() else {
             continue;
         };
-        if !row.released || !receive_settlement_consumed(row) {
+        if !row.released || !receive_settlement_consumed(row) || row.root_ingress.is_some() {
             continue;
         }
         let Some(ready) = row.recycled.as_ref() else {
