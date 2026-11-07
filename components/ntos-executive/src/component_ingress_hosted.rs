@@ -269,6 +269,63 @@ pub(crate) unsafe fn take_hosted_with(
     Ok(Some((reply, message)))
 }
 
+/// Import only the selected ordinary root child after its dependent route is authenticated.
+/// The callback may affect the root Reply pool, so this one attempt is sealed in the move-only
+/// pass before entry. A false or uncertain callback retains CALLS and the physical parent.
+/// The callback must not reenter CALLS or invoke a provider while this row is borrowed.
+pub(crate) unsafe fn take_selected_root_hosted_with(
+    snapshot: PendingSnapshot,
+    admission: ExternalAdmissionKey,
+    parent_identity: nt_component_suspension::NestedExecutionIdentity,
+    import: impl FnOnce(u64, &ReceivedMessage) -> bool,
+) -> Result<(u64, ReceivedMessage), Error> {
+    let row = (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten()
+        .find(|row| row.binding == snapshot.binding
+            && row.call.as_ref().is_some_and(|call| {
+                call.reply() == snapshot.reply
+                    && call.admission_sequence() == snapshot.admission_sequence
+            }))
+        .ok_or(Error::Admission)?;
+    let call = row.call.as_ref().ok_or(Error::Admission)?;
+    let root = row.root_ingress.as_mut().ok_or(Error::Admission)?;
+    let parent = root.parent.as_ref().ok_or(Error::Admission)?;
+    if row.delivered || row.released || row.completion.is_some()
+        || row.receive_settlement.is_some() || root.restored.is_some()
+        || root.undelivered_parent.is_some() || root.undelivered.is_some()
+        || row.binding.tcb != snapshot.executor
+        || call.admission_key() != admission
+        || call.reply() != admission.reply()
+        || call.executor() != admission.executor()
+        || call.message().badge() != row.binding.badge
+        || call.message().info() != snapshot.info
+        || call.message().registers() != snapshot.registers
+        || call.message().message_len().is_none()
+        || !call.can_park()
+        || root.pass.child() != row.binding
+        || root.pass.admission_key() != admission
+        || parent.identity() != parent_identity
+        || !super::nested::root_ingress_parent_is_held(parent, admission)
+        || crate::service_sec_image::hosted_ingress_binding(row.binding.badge) != Some(row.binding)
+    {
+        return Err(Error::Admission);
+    }
+    let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+    if crate::spawn_hosts::query_component_reply_binding(row.binding.tcb, call.reply())
+        != Ok(ReplyBindingObservation::BoundToTarget)
+    {
+        return Err(Error::Reply);
+    }
+    let message = call.message().clone();
+    let reply = call.reply();
+    root.pass.begin_import(row.binding, call).map_err(|_| Error::Admission)?;
+    if !import(reply, &message) {
+        return Err(Error::Retain);
+    }
+    root.pass.deliver(row.binding, call).map_err(|_| Error::Admission)?;
+    row.delivered = true;
+    Ok((reply, message))
+}
+
 /// Return an unexecuted root delivery to its existing physical ingress owner. No syscall has
 /// been admitted yet, so replay restores the original full message rather than captured argv.
 pub(crate) unsafe fn defer_hosted_delivery(reply: u64, badge: u64) -> Result<(), Error> {

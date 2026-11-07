@@ -75,7 +75,8 @@ fn restored(child: &Child, child_binding: ThreadBinding<u8>, parent: &NestedExec
     let call = child.call.as_ref().unwrap();
     let mut pass = RootIngressPass::prepare(call, child_binding).unwrap();
     pass.bind_parent(parent, parent.dispatch()).unwrap();
-    pass.deliver(child_binding, call).unwrap();
+    pass.begin_import(child_binding, call).unwrap();
+    unsafe { pass.deliver(child_binding, call) }.unwrap();
     pass.begin_park(child_binding, call).unwrap();
     unsafe { pass.acknowledge_park(child_binding, call) }.unwrap();
     // The native test adapter supplies the positive physical restore observation.

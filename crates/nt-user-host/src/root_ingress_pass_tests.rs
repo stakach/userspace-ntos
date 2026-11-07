@@ -124,8 +124,27 @@ fn undelivered_unwind_seals_exact_prepared_child_without_delivery() {
     let parent = new_parent();
     assert_eq!(pass.bind_parent(&parent, parent.dispatch()).unwrap_err(), PassError::AlreadyBound);
     assert!(pass.is_undelivered_unwind(&token));
-    assert_eq!(pass.deliver(binding(), call).unwrap_err(), PassError::InvalidPhase);
+    assert_eq!(unsafe { pass.deliver(binding(), call) }.unwrap_err(), PassError::InvalidPhase);
     assert_eq!(pass.begin_undelivered_unwind(binding(), call).unwrap_err(), PassError::Consumed);
+}
+
+#[test]
+fn selected_import_entry_seals_one_attempt_until_positive_delivery() {
+    let child = Child::new(113);
+    let parent = new_parent();
+    let call = child.call.as_ref().unwrap();
+    let mut pass = RootIngressPass::prepare(call, binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    let mut foreign_binding = binding();
+    foreign_binding.tid += 1;
+    assert_eq!(pass.begin_import(foreign_binding, call).unwrap_err(), PassError::WrongChild);
+    pass.begin_import(binding(), call).unwrap();
+    assert_eq!(pass.begin_import(binding(), call).unwrap_err(), PassError::Consumed);
+    assert_eq!(pass.begin_restore(&parent).unwrap_err(), PassError::Unsettled);
+    // A false/uncertain native callback leaves this phase sealed. Only a positive observation
+    // of that same attempt may make the child an ordinary delivered root event.
+    unsafe { pass.deliver(binding(), call) }.unwrap();
+    assert_eq!(pass.begin_import(binding(), call).unwrap_err(), PassError::Consumed);
 }
 
 #[test]
@@ -137,11 +156,12 @@ fn acknowledged_child_checkpoints_exact_parent_once() {
     let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
     pass.bind_parent(&parent, parent.dispatch()).unwrap();
     assert_eq!(
-        pass.deliver(binding(), foreign_child.call.as_ref().unwrap())
+        unsafe { pass.deliver(binding(), foreign_child.call.as_ref().unwrap()) }
             .unwrap_err(),
         PassError::WrongChild,
     );
-    pass.deliver(binding(), child.call.as_ref().unwrap())
+    pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }
         .unwrap();
     assert_eq!(
         pass.begin_restore(&parent).unwrap_err(),
@@ -185,7 +205,8 @@ fn parked_child_restores_parent_but_keeps_its_reply_for_later_settlement() {
     let key = child.call.as_ref().unwrap().admission_key();
     let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
     pass.bind_parent(&parent, parent.dispatch()).unwrap();
-    pass.deliver(binding(), child.call.as_ref().unwrap())
+    pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }
         .unwrap();
     pass.begin_park(binding(), child.call.as_ref().unwrap())
         .unwrap();
@@ -228,7 +249,8 @@ fn unknown_park_refuses_until_exact_later_settlement() {
     let foreign_parent = new_parent();
     let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
     pass.bind_parent(&parent, parent.dispatch()).unwrap();
-    pass.deliver(binding(), child.call.as_ref().unwrap())
+    pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }
         .unwrap();
     pass.begin_park(binding(), child.call.as_ref().unwrap())
         .unwrap();

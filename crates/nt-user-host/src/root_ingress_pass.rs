@@ -22,6 +22,8 @@ pub enum PassError {
 enum Phase {
     Prepared,
     Bound,
+    /// Native may have entered Reply-pool import. No refusal can authorize a second attempt.
+    ImportEnteredUnknown,
     Delivered,
     /// Native may have entered the park effect. No refusal or timeout can reopen this attempt.
     ParkEnteredUnknown,
@@ -156,14 +158,36 @@ impl<R: Copy + Eq> RootIngressPass<R> {
         Ok(())
     }
 
-    /// Native calls this only after the exact retained Call has become the root delivery.
-    pub fn deliver<M>(
+    /// Record one import attempt before the native Reply-pool effect. If the effect is refused
+    /// or uncertain, the pass remains sealed and the exact Call/Reply must stay retained.
+    pub fn begin_import<M>(
         &mut self,
         child: ThreadBinding<R>,
         call: &ExternalIngress<M>,
     ) -> Result<(), PassError> {
         self.exact_child(child, call)?;
+        if matches!(self.phase, Phase::ImportEnteredUnknown | Phase::Delivered) {
+            return Err(PassError::Consumed);
+        }
         if self.phase != Phase::Bound || !call.can_park() {
+            return Err(PassError::InvalidPhase);
+        }
+        self.phase = Phase::ImportEnteredUnknown;
+        Ok(())
+    }
+
+    /// Positive observation after the exact retained Call became the root delivery.
+    ///
+    /// # Safety
+    /// Native must have positively imported the child's physical Reply into the root owner.
+    /// A false or uncertain import callback cannot issue this observation.
+    pub unsafe fn deliver<M>(
+        &mut self,
+        child: ThreadBinding<R>,
+        call: &ExternalIngress<M>,
+    ) -> Result<(), PassError> {
+        self.exact_child(child, call)?;
+        if self.phase != Phase::ImportEnteredUnknown || !call.can_park() {
             return Err(PassError::InvalidPhase);
         }
         self.phase = Phase::Delivered;
