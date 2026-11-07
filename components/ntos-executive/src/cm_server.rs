@@ -10,10 +10,33 @@ use crate::*;
 
 use alloc::rc::Rc;
 use core::num::NonZeroU32;
+use core::sync::atomic::{AtomicU64, Ordering};
+use nt_config_abi::{hive_mutation_commit_disposition, hive_mutation_commit_operation,
+    mutation_begin, opcode, CmHiveMutationCommitReply, CmHiveMutationCommitRequest};
 use nt_config_server::{CmServer, CmIdentitySource};
 use surt_sel4::surt_core::surt_abi::{SurtCqe, SurtSqe};
 use surt_sel4::surt_core::{Consumer, Producer};
 use surt_sel4::{drain_blocking, Sel4Notify};
+
+static SYSTEM_WRITER_OWNER_TRACES: AtomicU64 = AtomicU64::new(0);
+
+/// BEGIN names its request generation; ACK names its validated outcome receipt generation.
+fn trace_system_writer_owner(server: &CmServer, phase: &[u8], identity: u64) {
+    if SYSTEM_WRITER_OWNER_TRACES.fetch_add(1, Ordering::Relaxed) >= 512 {
+        return;
+    }
+    let owner = server.system_mutation_busy_diagnostic();
+    print_str(b"[cm-writer-owner] phase/generation/prepared/checkpoint/offset/length/outcome/lease/uploaded/total=");
+    print_str(phase);
+    for value in [identity, owner.prepared_token, owner.checkpoint_token,
+        owner.checkpoint_offset as u64, owner.checkpoint_len as u64,
+        owner.outcome_receipt_generation, owner.lease_token,
+        owner.lease_uploaded as u64, owner.lease_total as u64] {
+        print_str(b"/");
+        print_u64(value);
+    }
+    print_str(b"\n");
+}
 
 #[no_mangle]
 #[link_section = ".text.cm_server_entry"]
@@ -52,7 +75,33 @@ pub unsafe extern "C" fn cm_server_entry(launch_context: u64) -> ! {
         };
         let out_buf =
             unsafe { core::slice::from_raw_parts_mut(REP_DATA_VADDR as *mut u8, REP_DATA_LEN) };
+        let begin = (sqe.opcode == opcode::CM_OP_SYSTEM_HIVE_MUTATION_BEGIN)
+            .then(|| mutation_begin::Request::from_bytes(in_buf)).flatten();
+        let commit = (sqe.opcode == opcode::CM_OP_SYSTEM_HIVE_MUTATION_COMMIT)
+            .then(|| CmHiveMutationCommitRequest::from_bytes(in_buf)).flatten();
         let reply = server.dispatch(sqe.opcode, in_buf, out_buf);
+        if reply.status == 0 {
+            if let Some(request) = begin.filter(|request| request.operation == mutation_begin::operation::BEGIN) {
+                let size = core::mem::size_of::<mutation_begin::Reply>();
+                if reply.information as usize >= size {
+                    if let Some(result) = mutation_begin::Reply::from_bytes(&out_buf[..size]) {
+                        if result.outcome_status == nt_status::NtStatus::DEVICE_BUSY.raw() as i32 {
+                            trace_system_writer_owner(&server, b"begin-busy", request.request_generation);
+                        }
+                    }
+                }
+            }
+            if let Some(request) = commit.filter(|request| request.operation == hive_mutation_commit_operation::ACKNOWLEDGE) {
+                let size = core::mem::size_of::<CmHiveMutationCommitReply>();
+                if reply.information as usize >= size {
+                    if let Some(result) = CmHiveMutationCommitReply::from_bytes(&out_buf[..size]) {
+                        if result.disposition == hive_mutation_commit_disposition::ACKNOWLEDGED {
+                            trace_system_writer_owner(&server, b"outcome-ack", request.receipt_generation);
+                        }
+                    }
+                }
+            }
+        }
         let cqe = SurtCqe {
             request_id: sqe.request_id,
             status: reply.status,
