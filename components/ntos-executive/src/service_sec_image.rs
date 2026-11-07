@@ -3899,6 +3899,23 @@ fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u3
 
 /// Claim dirty state and publish the mounted-volume checkpoint at the original service boundary.
 fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
+    let checkpoint_status = match publish_required_dirty_volume(nt_handler) {
+        Ok(status) => status,
+        Err(status) => return status,
+    };
+    if checkpoint_status == nt_fs::STATUS_SUCCESS {
+        if let Err(status) = fold_background_system_wal(nt_handler) {
+            return status;
+        }
+    }
+    if checkpoint_status != nt_fs::STATUS_SUCCESS {
+        return report_service_finalize_failure(b"volume-checkpoint", checkpoint_status);
+    }
+    checkpoint_status
+}
+
+/// Preserve dirty-state and commit requirements until the volume snapshot is durable.
+fn publish_required_dirty_volume(nt_handler: &mut ExecNtHandler) -> Result<u32, u32> {
     let writable_fs_mount_dirty = crate::writable_fs::take_mount_dirty();
     let writable_fs_runtime_dirty = crate::writable_fs::take_runtime_dirty();
     let writable_fs_touched =
@@ -3910,7 +3927,7 @@ fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
         if crate::writable_fs::snapshot_restore_seen() {
             if let Err(status) = nt_handler.refresh_boot_hive_checkpoints_from_writable_config() {
                 nt_handler.writable_fs_dirty = true;
-                return report_service_finalize_failure(b"hive-refresh", status);
+                return Err(report_service_finalize_failure(b"hive-refresh", status));
             }
         }
         if nt_handler.writable_fs_commit_required {
@@ -3940,17 +3957,18 @@ fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
         nt_handler.writable_fs_dirty = true;
         nt_handler.writable_fs_commit_required = true;
     }
-    if checkpoint_status == nt_fs::STATUS_SUCCESS {
-        if let Err(status) = maybe_fold_system_wal() {
-            nt_handler.writable_fs_dirty = true;
-            nt_handler.writable_fs_commit_required = true;
-            return report_service_finalize_failure(b"system-wal-fold", status);
-        }
+    Ok(checkpoint_status)
+}
+
+/// Background WAL folding follows a successful required checkpoint. Its current failure remains
+/// a service-boundary refusal and retains both dirty retry signals.
+fn fold_background_system_wal(nt_handler: &mut ExecNtHandler) -> Result<(), u32> {
+    if let Err(status) = maybe_fold_system_wal() {
+        nt_handler.writable_fs_dirty = true;
+        nt_handler.writable_fs_commit_required = true;
+        return Err(report_service_finalize_failure(b"system-wal-fold", status));
     }
-    if checkpoint_status != nt_fs::STATUS_SUCCESS {
-        return report_service_finalize_failure(b"volume-checkpoint", checkpoint_status);
-    }
-    checkpoint_status
+    Ok(())
 }
 
 /// The native lookup owner has already parked its original Reply. Publish a pending canonical
