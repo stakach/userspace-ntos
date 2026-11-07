@@ -252,6 +252,7 @@ unsafe fn channel(index: usize, worker: HostedDriverThreadRuntime,
     let inst = instance(row.instance).ok_or(STATUS_INVALID_HANDLE as u32)?;
     let window = ExecVaWindow::try_for_instance(row.instance).ok_or(STATUS_INVALID_HANDLE as u32)?;
     Ok(crate::spawn_hosts::PumpChannel {
+        initial_root_dispatch: None,
         fault_ep: route.endpoint(), pml4: row.pml4, physical_domain: Some(row.domain),
         ingress_route: Some(route), code_va: 0, image_frames: 0, exec_code_va: window.code_va,
         root_image_rights: 3, root_image_map_owner: inst.map_cap_bank.owner,

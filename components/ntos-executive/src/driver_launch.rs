@@ -33211,6 +33211,7 @@ unsafe fn dispatch_hosted_provider_export_legacy(
     write_volatile((provider_shared + SH_ACTIVE_FILE_OBJECT) as *mut u64, 0);
 
     let ch = crate::spawn_hosts::PumpChannel {
+        initial_root_dispatch: None,
         fault_ep: provider_inst.fault_ep,
         physical_domain: instance_domain_identity(provider_inst),
         ingress_route: hosted_ingress_sources::primary_route(singleton.instance),
@@ -33766,6 +33767,7 @@ unsafe fn dispatch_hosted_component_target(
     write_volatile((shared + SH_ACTIVE_FILE_OBJECT) as *mut u64, 0);
 
     let ch = crate::spawn_hosts::PumpChannel {
+        initial_root_dispatch: None,
         fault_ep: inst.fault_ep,
         physical_domain: instance_domain_identity(inst),
         ingress_route: hosted_ingress_sources::primary_route(instance_index),
@@ -42763,6 +42765,7 @@ unsafe fn load_driver_reserved(
     // `InitialAction::RecvFirst`: the component is mid-DriverEntry (blocked in a fault `Call`, or about
     // to issue its ready `Call`), so the pump must start by RECEIVING. Trace on for observability.
     let ch = crate::spawn_hosts::PumpChannel {
+        initial_root_dispatch: None,
         fault_ep,
         ingress_route: Some(route),
         physical_domain: instance_domain_identity(domain),
@@ -57621,6 +57624,7 @@ unsafe fn hosted_irq_lane_channel(
         return None;
     }
     Some(crate::spawn_hosts::PumpChannel {
+        initial_root_dispatch: None,
         fault_ep: lane.endpoint,
         ingress_route: Some(route),
         physical_domain: Some(lane.domain),
@@ -64395,6 +64399,7 @@ pub(crate) unsafe fn autonomous_pump_channel(
             instance_domain_identity(*inst) == Some(domain) && inst.pml4 == source.pml4
         })?;
     Some(crate::spawn_hosts::PumpChannel {
+        initial_root_dispatch: None,
         fault_ep: route.endpoint(), physical_domain: Some(domain), pml4: source.pml4,
         ingress_route: Some(route),
         code_va: FSD_CODE_VA, image_frames: inst.image_frames,
@@ -69262,6 +69267,7 @@ unsafe fn dispatch_driver_unload_for_instance(
     clear_video_registry_parameter_log_at(sh);
 
     let ch = crate::spawn_hosts::PumpChannel {
+        initial_root_dispatch: None,
         fault_ep: inst.fault_ep,
         pml4: inst.pml4,
         physical_domain: instance_domain_identity(inst),
@@ -69338,6 +69344,7 @@ unsafe fn dispatch_device_projection_control_for_instance(
     write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
 
     let ch = crate::spawn_hosts::PumpChannel {
+        initial_root_dispatch: None,
         fault_ep: inst.fault_ep,
         pml4: inst.pml4,
         physical_domain: instance_domain_identity(inst),
@@ -69476,6 +69483,7 @@ unsafe fn dispatch_video_add_device_for_instance(
     clear_shared_path_len_at(sh, SH_DEVICE_NAME_LEN);
 
     let ch = crate::spawn_hosts::PumpChannel {
+        initial_root_dispatch: None,
         fault_ep: inst.fault_ep,
         pml4: inst.pml4,
         physical_domain: instance_domain_identity(inst),
@@ -69555,6 +69563,7 @@ unsafe fn dispatch_provider_add_device_for_instance(
     clear_shared_path_len_at(sh, SH_DEVICE_NAME_LEN);
 
     let ch = crate::spawn_hosts::PumpChannel {
+        initial_root_dispatch: None,
         fault_ep: provider_inst.fault_ep,
         pml4: provider_inst.pml4,
         physical_domain: instance_domain_identity(provider_inst),
@@ -69640,6 +69649,7 @@ unsafe fn dispatch_add_device_for_instance(
     clear_shared_path_len_at(sh, SH_DEVICE_NAME_LEN);
 
     let ch = crate::spawn_hosts::PumpChannel {
+        initial_root_dispatch: None,
         fault_ep: inst.fault_ep,
         pml4: inst.pml4,
         physical_domain: instance_domain_identity(inst),
@@ -71495,6 +71505,7 @@ unsafe fn dispatch_video_find_adapter_pnp_for_instance(
         };
     };
     let ch = crate::spawn_hosts::PumpChannel {
+        initial_root_dispatch: None,
         fault_ep: inst.fault_ep,
         pml4: inst.pml4,
         physical_domain: instance_domain_identity(inst),
@@ -73790,6 +73801,7 @@ unsafe fn dispatch_irp_for_instance_exact(
     // `exec_fsd_on_shared_harness` proof). Status is read at SH_REQ_STATUS(0x70) by kind=Irp.
     let reply_cap = crate::spawn_hosts::shared_ingress::owner::runtime::current_reply(ingress_route).ok()?;
     let ch = crate::spawn_hosts::PumpChannel {
+        initial_root_dispatch: None,
         fault_ep: ep,
         ingress_route: Some(ingress_route),
         pml4,

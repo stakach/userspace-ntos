@@ -432,6 +432,7 @@ unsafe fn win32k_lane_channel(
     }
     let binding = win32k_physical_lane_binding(handle)?;
     Some(crate::spawn_hosts::PumpChannel {
+        initial_root_dispatch: None,
         ingress_route: Some(shared_win32k_lane_route(handle)?),
         fault_ep: binding.receive_endpoint,
         physical_domain: None,
@@ -531,6 +532,7 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
         shared_endpoint,
     );
     let mut channel = crate::spawn_hosts::PumpChannel {
+        initial_root_dispatch: None,
         ingress_route: None,
         fault_ep: worker.endpoint,
         physical_domain: None,
@@ -7537,6 +7539,9 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     }
     ch.caps.hosted_receive_yield = request_kind == win32k_subsystem::WIN32K_REQUEST_SSDT
         && !nested_user_callback && outer_callback.is_none();
+    ch.initial_root_dispatch = ch.caps.hosted_receive_yield.then(|| {
+        crate::spawn_hosts::InitialRootDispatchProvenance::capture(&ch)
+    }).flatten();
     let nested_restore_owner = crate::current_win32k_provider_domain().and_then(|provider| {
         let owner = nt_component_suspension::SuspensionOwner {
             provider_domain: provider.domain,

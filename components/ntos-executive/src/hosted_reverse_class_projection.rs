@@ -503,6 +503,7 @@ pub(super) unsafe fn dispatch_configure(
     write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
 
     let channel = crate::spawn_hosts::PumpChannel {
+        initial_root_dispatch: None,
         fault_ep: inst.fault_ep,
         pml4: inst.pml4,
         physical_domain: Some(port_domain),

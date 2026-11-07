@@ -32544,6 +32544,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // begin until this pump publishes its retained kernel caller through that handoff.
             let code_va = win32k_subsystem::WIN32K_CODE_VA;
             let init_ch = spawn_hosts::PumpChannel {
+                initial_root_dispatch: None,
                 ingress_route: Some(init_route),
                 fault_ep: w_fault,
                 physical_domain: None,

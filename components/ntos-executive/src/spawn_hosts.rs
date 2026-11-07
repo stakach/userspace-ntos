@@ -1228,6 +1228,45 @@ pub(crate) enum InitialAction {
     RecvFirst,
 }
 
+/// Observation of an initial hosted GUI dispatch, not authority to park or restore either Reply.
+/// Resumed callback/provider pumps do not receive one; every use rechecks the retained owner.
+#[derive(Clone, Copy)]
+pub(crate) struct InitialRootDispatchProvenance {
+    route: nt_component_suspension::peer_registry::PeerRoute,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+    tcb: u64,
+    reply: u64,
+}
+
+impl InitialRootDispatchProvenance {
+    pub(crate) unsafe fn capture(channel: &PumpChannel) -> Option<Self> {
+        let route = channel.ingress_route?;
+        use crate::spawn_hosts::shared_ingress::owner::runtime;
+        if runtime::channel_route(channel).ok()? != Some(route) {
+            return None;
+        }
+        let dispatch = runtime::dispatch(route).ok()?;
+        let reply = runtime::current_reply(route).ok()?;
+        let lanes = &*core::ptr::addr_of!(crate::service_sec_image::COMPONENT_SUSPENSIONS);
+        let binding = lanes.binding(dispatch.lane()).ok()?;
+        if channel.tcb == 0 || reply == 0 || reply != channel.reply_cap
+            || route.identity().lane != dispatch.lane()
+            || !lanes.is_dispatch_identity_active(dispatch)
+            || binding.executor_id != channel.tcb
+            || binding.receive_endpoint != channel.fault_ep
+            || binding.reply_object != reply
+        {
+            return None;
+        }
+        Some(Self { route, dispatch, tcb: channel.tcb, reply })
+    }
+
+    pub(crate) fn route(self) -> nt_component_suspension::peer_registry::PeerRoute { self.route }
+    pub(crate) fn dispatch(self) -> nt_component_suspension::LaneDispatchIdentity { self.dispatch }
+    pub(crate) fn tcb(self) -> u64 { self.tcb }
+    pub(crate) fn reply(self) -> u64 { self.reply }
+}
+
 /// The executive-side channel to one Family-A dispatch server. Carries the fault/dispatch EP, the
 /// component VSpace (for demand-map), the in-image wall bounds, the shared frame base, the DONE
 /// label, the component's MCS reply object and the per-server demand budget. `client_pi`/`caps`
@@ -1237,6 +1276,8 @@ pub(crate) enum InitialAction {
 pub(crate) struct PumpChannel {
     /// Exact generational ingress authority captured from the retained physical owner.
     pub ingress_route: Option<nt_component_suspension::peer_registry::PeerRoute>,
+    /// Present only on an initial hosted GUI SSDT dispatch. Revalidated before root preemption.
+    pub initial_root_dispatch: Option<InitialRootDispatchProvenance>,
     /// Captured physical address-space lifetime. Driver broker routing requires this exact domain;
     /// logical dependent-driver attribution never substitutes for it. Win32k uses its lane owner.
     pub physical_domain: Option<nt_io_manager::HostedDomainIdentity>,

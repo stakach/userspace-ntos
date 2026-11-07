@@ -73,6 +73,7 @@ unsafe fn channel(index: usize) -> PumpChannel {
         .map_cap_bank
         .owner;
     PumpChannel {
+        initial_root_dispatch: None,
         ingress_route: Some(route),
         physical_domain: None,
         fault_ep: route.endpoint(),

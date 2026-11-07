@@ -423,6 +423,7 @@ unsafe fn channel(
     let window =
         ExecVaWindow::try_for_instance(row.instance).ok_or(STATUS_INVALID_HANDLE as u32)?;
     Ok(crate::spawn_hosts::PumpChannel {
+        initial_root_dispatch: None,
         fault_ep: route.endpoint(),
         pml4: row.pml4,
         physical_domain: Some(row.domain),

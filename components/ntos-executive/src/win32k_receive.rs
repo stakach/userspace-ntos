@@ -752,6 +752,7 @@ pub(crate) unsafe fn prepare_root_ingress_yield(
     {
         return Ok(None);
     }
+    let Some(provenance) = channel.initial_root_dispatch else { return Ok(None); };
     let Some(caller) = channel.logical_caller else { return Ok(None); };
     let nt_user_host::process_identity::ProcessGeneration::Hosted(generation) =
         caller.process().generation
@@ -766,6 +767,13 @@ pub(crate) unsafe fn prepare_root_ingress_yield(
     let Some(parent_route) = validate_nested_yield_parent_route(
         channel, running, caller, generation,
     )? else { return Ok(None); };
+    if parent_route.route != provenance.route()
+        || parent_route.dispatch != provenance.dispatch()
+        || parent_route.binding.executor_id != provenance.tcb()
+        || parent_route.binding.reply_object != provenance.reply()
+    {
+        return Err(runtime::Error::PhysicalIdentity);
+    }
     let Some(child_root) = crate::service_sec_image::receive_vspace::peek_root(child.binding)
     else { return Ok(None); };
     if !crate::service_sec_image::receive_vspace::validate_pair(
