@@ -891,37 +891,92 @@ fn dispatch_with_port_connect(
 
 /// Prepare one ordinary hosted READ for a caller whose physical Reply must park before any
 /// provider entry. The returned IRP identity is backed by a retained, move-only preparation.
+#[must_use = "a retained preparation still owns its requestor and possibly a prepared IRP"]
+pub(super) enum QueuedReadPreparation {
+    Queued(IrpId),
+    RefusedNoOwner(nt_status::NtStatus),
+    Retained {
+        selector: RetainedQueuedReadSelector,
+        status: nt_status::NtStatus,
+    },
+}
+
+/// Selects the exact native row when cleanup retained an owner, including the case where
+/// manager preparation failed before an IRP ID existed. No numeric IRP ID can name that row.
+#[must_use = "the selected row remains owned until its cleanup is reconciled"]
+pub(super) struct RetainedQueuedReadSelector {
+    row_id: u64,
+}
+
+/// Retry only the cleanup that refused before the READ was queued. A selector names the native
+/// row even if manager preparation failed before an IRP ID existed; it never authorizes dispatch.
+pub(super) fn reconcile_retained_queued_read(
+    selector: RetainedQueuedReadSelector,
+) -> Result<(), (nt_status::NtStatus, RetainedQueuedReadSelector)> {
+    let _durable = crate::allocator::enter_durable();
+    let id = selector.row_id;
+    if !rows().iter().any(|row| row.id == id && row.flight == Flight::Blocked) {
+        return Err((nt_status::NtStatus::INVALID_PARAMETER, selector));
+    }
+    let payload = row(id).payload.take();
+    let result = match payload {
+        Some(Payload::Prepared(prepared)) => discard(id, prepared),
+        None if row(id).irp_id.is_none() || row(id).settled_buffers.is_some() => {
+            remove(id).map(|_| ())
+        }
+        other => {
+            row(id).payload = other;
+            Err(nt_status::NtStatus::INVALID_PARAMETER)
+        }
+    };
+    result.map_err(|status| (status, selector))
+}
+
 pub(super) fn queue_read(
     caller: nt_process::native_handle::NativeHandleCaller,
     request: ExternalFileIrpRequest,
     output_len: usize,
-) -> Result<IrpId, nt_status::NtStatus> {
+) -> QueuedReadPreparation {
     if request.major != major::IRP_MJ_READ {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        return QueuedReadPreparation::RefusedNoOwner(nt_status::NtStatus::INVALID_PARAMETER);
     }
     let _durable = crate::allocator::enter_durable();
     let mut output = Vec::new();
-    output.try_reserve_exact(output_len)
-        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    if output.try_reserve_exact(output_len).is_err() {
+        return QueuedReadPreparation::RefusedNoOwner(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    }
     output.resize(output_len, 0);
-    let id = reserve(caller, ExternalFileIrpDispatchPolicy::File.output_capture())?;
+    let id = match reserve(caller, ExternalFileIrpDispatchPolicy::File.output_capture()) {
+        Ok(id) => id,
+        Err(status) => return QueuedReadPreparation::RefusedNoOwner(status),
+    };
     let prepared = match ExternalFileIrpDispatchPolicy::File.prepare(
         io_manager_mut(), request, ExternalFileIrpBuffers::new(Vec::new(), output),
     ) {
         Ok(prepared) => prepared,
         Err(status) => {
-            remove(id)?;
-            return Err(status);
+            return match remove(id) {
+                Ok(_) => QueuedReadPreparation::RefusedNoOwner(status),
+                Err(cleanup_status) => QueuedReadPreparation::Retained {
+                    selector: RetainedQueuedReadSelector { row_id: id },
+                    status: cleanup_status,
+                },
+            };
         }
     };
     if let Err(status) = capture_route(id, &prepared) {
-        discard(id, prepared)?;
-        return Err(status);
+        return match discard(id, prepared) {
+            Ok(()) => QueuedReadPreparation::RefusedNoOwner(status),
+            Err(cleanup_status) => QueuedReadPreparation::Retained {
+                selector: RetainedQueuedReadSelector { row_id: id },
+                status: cleanup_status,
+            },
+        };
     }
     let irp_id = prepared.irp_id();
     row(id).payload = Some(Payload::Prepared(prepared));
     row(id).flight = Flight::QueuedDispatch;
-    Ok(irp_id)
+    QueuedReadPreparation::Queued(irp_id)
 }
 
 /// Enter the exact queued READ at most once. This must be called only after the parent Reply

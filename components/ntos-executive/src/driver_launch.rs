@@ -74452,23 +74452,41 @@ pub(crate) unsafe fn dispatch_hosted_file_irp_result_exact(
 
 /// Dormant preparation edge for an ordinary DriverPeer READ. The caller must publish and park
 /// its exact File delivery owner before invoking `redrive_queued_hosted_file_read_exact`.
+#[must_use = "a retained native owner cannot become an ordinary File failure reply"]
+pub(crate) enum QueuedHostedFileReadPreparation {
+    Queued(IrpId),
+    RefusedNoOwner(u32),
+    Retained {
+        selector: hosted_file_owners::RetainedQueuedReadSelector,
+        status: u32,
+    },
+}
+
 pub(crate) unsafe fn queue_hosted_file_read_exact(
     file_id: u64,
     caller: nt_process::native_handle::NativeHandleCaller,
     parameters: ReadWriteParameters,
-) -> Result<IrpId, u32> {
+) -> QueuedHostedFileReadPreparation {
     let canonical_file_id = FileId(file_id);
-    let device_id = io_manager_mut()
+    let Some(device_id) = io_manager_mut()
         .file(canonical_file_id)
         .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID))
         .map(|file| file.device_id.raw())
-        .ok_or(STATUS_INVALID_HANDLE as u32)?;
-    require_file_device_ready_for_dispatch(device_id)?;
-    if registered_file_target(device_id, major::IRP_MJ_READ)? != RegisteredFileTarget::DriverPeer {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw() as u32);
+    else {
+        return QueuedHostedFileReadPreparation::RefusedNoOwner(STATUS_INVALID_HANDLE as u32);
+    };
+    if let Err(status) = require_file_device_ready_for_dispatch(device_id) {
+        return QueuedHostedFileReadPreparation::RefusedNoOwner(status);
+    }
+    match registered_file_target(device_id, major::IRP_MJ_READ) {
+        Ok(RegisteredFileTarget::DriverPeer) => {}
+        Ok(_) => return QueuedHostedFileReadPreparation::RefusedNoOwner(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw() as u32,
+        ),
+        Err(status) => return QueuedHostedFileReadPreparation::RefusedNoOwner(status),
     }
     let output_len = parameters.length as usize;
-    hosted_file_owners::queue_read(
+    match hosted_file_owners::queue_read(
         caller,
         nt_io_manager::detached_file_irp::ExternalFileIrpRequest {
             client: ClientId(IO_MANAGER_COMPONENT_ID),
@@ -74482,7 +74500,29 @@ pub(crate) unsafe fn queue_hosted_file_read_exact(
             initial_information: 0,
         },
         output_len,
-    ).map_err(|status| status.raw() as u32)
+    ) {
+        hosted_file_owners::QueuedReadPreparation::Queued(irp_id) => {
+            QueuedHostedFileReadPreparation::Queued(irp_id)
+        }
+        hosted_file_owners::QueuedReadPreparation::RefusedNoOwner(status) => {
+            QueuedHostedFileReadPreparation::RefusedNoOwner(status.raw() as u32)
+        }
+        hosted_file_owners::QueuedReadPreparation::Retained { selector, status } => {
+            QueuedHostedFileReadPreparation::Retained {
+                selector,
+                status: status.raw() as u32,
+            }
+        }
+    }
+}
+
+/// Retry only the cleanup of an exact preparation that never reached queued dispatch.
+/// Refusal returns the same selector, so neither a requestor pin nor prepared IRP is lost.
+pub(crate) fn reconcile_retained_hosted_file_read_exact(
+    selector: hosted_file_owners::RetainedQueuedReadSelector,
+) -> Result<(), (u32, hosted_file_owners::RetainedQueuedReadSelector)> {
+    hosted_file_owners::reconcile_retained_queued_read(selector)
+        .map_err(|(status, selector)| (status.raw() as u32, selector))
 }
 
 pub(crate) fn redrive_queued_hosted_file_read_exact(

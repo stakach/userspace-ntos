@@ -1,6 +1,45 @@
 //! A parked hosted READ must retain its exact prepared owner until the parent is restored.
 
 const OWNERS: &str = include_str!("../../../components/ntos-executive/src/hosted_file_owners.rs");
+const DRIVER: &str = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+
+#[test]
+fn queued_read_preparation_distinguishes_no_owner_from_retained_cleanup() {
+    let preparation = OWNERS
+        .split_once("pub(super) fn queue_read(")
+        .expect("hosted READ queue entry")
+        .1
+        .split_once("pub(super) fn redrive_queued_read(")
+        .expect("queued READ redrive boundary")
+        .0;
+    assert!(OWNERS.contains("enum QueuedReadPreparation"));
+    assert!(OWNERS.contains("struct RetainedQueuedReadSelector"));
+    assert!(preparation.contains("QueuedReadPreparation::Queued(irp_id)"));
+    assert!(preparation.contains("QueuedReadPreparation::RefusedNoOwner"));
+    assert!(preparation.contains("QueuedReadPreparation::Retained"));
+    assert!(preparation.contains("match remove(id)"));
+    assert!(preparation.contains("match discard(id, prepared)"));
+    assert!(DRIVER.contains("QueuedHostedFileReadPreparation::RefusedNoOwner"));
+    assert!(DRIVER.contains("QueuedHostedFileReadPreparation::Retained"));
+}
+
+#[test]
+fn retained_preparation_has_exact_cleanup_without_provider_entry() {
+    let cleanup = OWNERS
+        .split_once("fn reconcile_retained_queued_read(")
+        .expect("exact retained queued READ cleanup")
+        .1
+        .split_once("pub(super) fn queue_read(")
+        .expect("queued READ preparation boundary")
+        .0;
+    assert!(cleanup.contains("selector.row_id"));
+    assert!(cleanup.contains("Flight::Blocked"));
+    assert!(cleanup.contains("Payload::Prepared(prepared)"));
+    assert!(cleanup.contains("discard(id, prepared)"));
+    assert!(cleanup.contains("remove(id)"));
+    assert!(!cleanup.contains("begin_prepared_external_file_irp"));
+    assert!(!cleanup.contains("hosted_file_dispatch::invoke"));
+}
 
 #[test]
 fn queued_read_cannot_enter_provider_during_preparation() {
