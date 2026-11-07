@@ -27,6 +27,7 @@ struct Row {
 }
 
 static mut ROWS: Vec<Row> = Vec::new();
+static RETRY_READY: AtomicBool = AtomicBool::new(false);
 
 fn rows() -> &'static mut Vec<Row> {
     // Executive work is serialized. No row borrow spans a hosted invocation.
@@ -104,6 +105,28 @@ fn retain(file_id: FileId, payload: Payload, status: nt_status::NtStatus) {
     rows()[index].payload = Some(payload);
     rows()[index].blocked = Some(status);
     rows()[index].retry_after = monotonic_time_100ns().saturating_add(1_000_000);
+}
+
+/// A refused lifecycle operation retains its exact File and IRP owner until an
+/// outer pump can retry it. Timer delivery only requests that pump.
+pub(super) fn retry_deadline() -> Option<u64> {
+    if RETRY_READY.load(Ordering::Acquire) {
+        return None;
+    }
+    rows()
+        .iter()
+        .filter(|row| !row.executing && row.payload.is_some() && row.retry_after != 0)
+        .map(|row| row.retry_after)
+        .min()
+}
+
+pub(super) fn retry_wake_due(now: u64) -> u64 {
+    if retry_deadline().is_some_and(|deadline| deadline <= now) {
+        RETRY_READY.store(true, Ordering::Release);
+        crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+        return 1;
+    }
+    0
 }
 
 fn route_live(projection: &IrpProjection) -> Option<usize> {
@@ -413,6 +436,7 @@ pub(super) fn nested_work_step(executor: NativeHandleCaller) -> bool {
 /// A pending or uncertain effect remains held by its exact File and generation.
 pub(super) fn pump(executor: NativeHandleCaller) -> usize {
     let _durable = crate::allocator::enter_durable();
+    RETRY_READY.store(false, Ordering::Release);
     let mut progress = 0;
     let mut ids = [FileId(0); 32];
     let count = rows().len().min(ids.len());

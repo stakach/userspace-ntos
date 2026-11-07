@@ -291,6 +291,7 @@ unsafe fn reconcile_runtime(handler: &mut ExecNtHandler) -> Option<nt_kernel_exe
         && dpc_deadline.is_none()
         && acpi_deadline.is_none()
         && driver_launch::hosted_irq_retry_next_deadline().is_none()
+        && driver_launch::hosted_file_retry_deadline(now).is_none()
         && crate::registry_mutation_work::next_deadline().is_none()
         && crate::section_metadata_work::next_deadline().is_none()
         && crate::process_image_snapshot_work::next_deadline().is_none()

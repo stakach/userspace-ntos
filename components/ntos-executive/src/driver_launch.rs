@@ -38806,6 +38806,8 @@ pub(crate) unsafe fn call_on4_raw(
         print_str(b" arg1=0x"); print_hex64(arg1);
         print_str(b"\n");
     }
+    // Compare phase proportions in raw cycles. This transport runs in multiple provider
+    // VSpaces, so a fixed FSD shared-page address is not a clock-frequency authority.
     let call_started_tsc = (font_trace != 0).then(read_ordered_tsc);
     let reply_info: u64;
     let m0: u64;
@@ -38848,8 +38850,6 @@ pub(crate) unsafe fn call_on4_raw(
         print_str(b" status=0x"); print_hex64(m0);
         print_str(b" start-tsc="); print_u64(call_started_tsc.unwrap());
         print_str(b" end-tsc="); print_u64(call_finished_tsc.unwrap());
-        print_str(b" tsc-hz=");
-        print_u64(read_volatile((FSD_SHARED_VADDR + SH_TSC_FREQUENCY_HZ) as *const u64));
         print_str(b"\n");
     }
     (reply_info, m0, m1, m2, m3)
@@ -48678,6 +48678,7 @@ pub(crate) fn pump_hosted_io_completions() -> usize {
 pub(crate) fn hosted_file_retry_deadline(now: u64) -> Option<u64> {
     hosted_file_owners::retry_deadline()
         .into_iter()
+        .chain(hosted_file_lifecycle_owners::retry_deadline())
         .chain(hosted_file_retirements::retry_deadline(now))
         .chain(crate::video_device::video_file_retirement_deadline(now))
         .min()
@@ -48693,6 +48694,7 @@ pub(crate) fn hosted_file_owner_stats() -> HostedFileOwnerStats {
 
 pub(crate) fn hosted_file_retry_wake_due(now_100ns: u64) -> u64 {
     hosted_file_owners::retry_wake_due(now_100ns)
+        .saturating_add(hosted_file_lifecycle_owners::retry_wake_due(now_100ns))
         .saturating_add(hosted_file_retirements::retry_wake_due(now_100ns))
         .saturating_add(crate::video_device::video_file_retirement_wake_due(
             now_100ns,

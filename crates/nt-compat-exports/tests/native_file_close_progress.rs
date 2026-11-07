@@ -145,3 +145,69 @@ fn independent_file_lifecycle_remains_reachable_after_close_request_retirement()
     assert!(calls(driver, "hosted_file_lifecycle_owners", "nested_work_ready"));
     assert!(calls(driver, "hosted_file_lifecycle_owners", "nested_work_step"));
 }
+
+#[test]
+fn retained_file_lifecycle_refusal_has_a_root_timer_and_outer_pump_demand() {
+    let lifecycle = include_str!(
+        "../../../components/ntos-executive/src/hosted_file_lifecycle_owners.rs"
+    );
+    let driver = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+    let deadline = lifecycle.split("fn retry_deadline(").nth(1).unwrap()
+        .split("fn retry_wake_due(").next().unwrap();
+    let due = lifecycle.split("fn retry_wake_due(").nth(1).unwrap()
+        .split("fn route_live(").next().unwrap();
+    let parsed = syn::parse_file(driver).expect("native driver source must parse");
+    let function = |name: &str| {
+        parsed.items.iter().find_map(|item| match item {
+            syn::Item::Fn(item) if item.sig.ident == name => Some(item),
+            _ => None,
+        }).unwrap_or_else(|| panic!("missing {name}"))
+    };
+    struct Calls<'a> { module: &'a str, function: &'a str, found: bool }
+    impl<'ast> Visit<'ast> for Calls<'_> {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = &*call.func {
+                let parts: Vec<_> = path.path.segments.iter().collect();
+                self.found |= parts.windows(2).any(|pair| {
+                    pair[0].ident == self.module && pair[1].ident == self.function
+                });
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+    let has_call = |owner: &syn::ItemFn, module: &str, target: &str| {
+        let mut visitor = Calls { module, function: target, found: false };
+        visitor.visit_item_fn(owner);
+        visitor.found
+    };
+    assert!(deadline.contains("row.payload.is_some()")
+        && deadline.contains("row.retry_after != 0")
+        && deadline.contains("RETRY_READY.load")
+        && deadline.contains(".min()"),
+        "the earliest retained refusal must define the lifecycle timer deadline");
+    assert!(due.contains("deadline <= now")
+        && due.contains("RETRY_READY.store(true")
+        && due.contains("FILE_IO_DELIVERY_RETRY_PENDING.store(true"),
+        "a due retained row must request the outer pump, without dispatching from the timer");
+    let pump = lifecycle.split("fn pump(").nth(1).unwrap()
+        .split("fn retire(").next().unwrap();
+    assert!(pump.contains("RETRY_READY.store(false"),
+        "the outer pump must reenable the timer if a refused row gets a new deadline");
+    assert!(has_call(function("hosted_file_retry_deadline"),
+        "hosted_file_lifecycle_owners", "retry_deadline"),
+        "the root timer must include a retained lifecycle refusal deadline");
+    assert!(has_call(function("hosted_file_retry_wake_due"),
+        "hosted_file_lifecycle_owners", "retry_wake_due"),
+        "a due lifecycle row must request the existing outer lifecycle pump");
+    let service = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
+    let finalize = service.split("fn finalize_service_loop_work(").nth(1).unwrap()
+        .split("fn ").next().unwrap();
+    assert!(finalize.contains("FILE_IO_DELIVERY_RETRY_PENDING.swap(false")
+        && finalize.contains("driver_launch::pump_hosted_file_lifecycle()"),
+        "the timer demand must reach the lifecycle owner at the outer finalization boundary");
+    let resume = include_str!("../../../components/ntos-executive/src/component_resume.rs");
+    let reconcile = resume.split("fn reconcile_runtime(").nth(1).unwrap()
+        .split("fn drain_terminals(").next().unwrap();
+    assert!(reconcile.contains("driver_launch::hosted_file_retry_deadline(now)"),
+        "component receive must rearm a retained lifecycle retry without another syscall");
+}
