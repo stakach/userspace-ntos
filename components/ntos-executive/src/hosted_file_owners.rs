@@ -12,6 +12,7 @@ use nt_io_manager::detached_file_irp::{
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Flight {
     Preparing,
+    QueuedDispatch,
     Dispatch,
     Copy,
     Cancel,
@@ -283,6 +284,7 @@ pub(super) fn print_rpc_phase() {
 pub(crate) struct Stats {
     pub live: usize,
     pub preparing: usize,
+    pub queued_dispatch: usize,
     pub dispatching: usize,
     pub copying: usize,
     pub cancelling: usize,
@@ -305,6 +307,7 @@ pub(super) fn stats() -> Stats {
         stats.live += 1;
         match row.flight {
             Flight::Preparing => stats.preparing += 1,
+            Flight::QueuedDispatch => stats.queued_dispatch += 1,
             Flight::Dispatch => stats.dispatching += 1,
             Flight::Copy => stats.copying += 1,
             Flight::Cancel => stats.cancelling += 1,
@@ -858,6 +861,178 @@ fn dispatch_with_port_connect(
     }
 }
 
+/// Prepare one ordinary hosted READ for a caller whose physical Reply must park before any
+/// provider entry. The returned IRP identity is backed by a retained, move-only preparation.
+pub(super) fn queue_read(
+    caller: nt_process::native_handle::NativeHandleCaller,
+    request: ExternalFileIrpRequest,
+    output_len: usize,
+) -> Result<IrpId, nt_status::NtStatus> {
+    if request.major != major::IRP_MJ_READ {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let _durable = crate::allocator::enter_durable();
+    let mut output = Vec::new();
+    output.try_reserve_exact(output_len)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    output.resize(output_len, 0);
+    let id = reserve(caller, ExternalFileIrpDispatchPolicy::File.output_capture())?;
+    let prepared = match ExternalFileIrpDispatchPolicy::File.prepare(
+        io_manager_mut(), request, ExternalFileIrpBuffers::new(Vec::new(), output),
+    ) {
+        Ok(prepared) => prepared,
+        Err(status) => {
+            remove(id)?;
+            return Err(status);
+        }
+    };
+    if let Err(status) = capture_route(id, &prepared) {
+        discard(id, prepared)?;
+        return Err(status);
+    }
+    let irp_id = prepared.irp_id();
+    row(id).payload = Some(Payload::Prepared(prepared));
+    row(id).flight = Flight::QueuedDispatch;
+    Ok(irp_id)
+}
+
+/// Enter the exact queued READ at most once. This must be called only after the parent Reply
+/// has a positive restoration receipt. A rejected or uncertain effect remains in this row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum QueuedReadRedriveOutcome {
+    NoWork,
+    Progressed,
+    Retained(nt_status::NtStatus),
+}
+
+pub(super) fn redrive_queued_read(irp_id: IrpId) -> QueuedReadRedriveOutcome {
+    let _durable = crate::allocator::enter_durable();
+    let Some(id) = find(irp_id) else { return QueuedReadRedriveOutcome::NoWork };
+    if row(id).flight != Flight::QueuedDispatch { return QueuedReadRedriveOutcome::NoWork }
+    // A queued caller may be cancelled or abandoned before this explicit redrive. The manager
+    // owns that intent; never infer a new provider call merely from a live native route.
+    let intent = match io_manager_mut()
+        .detached_file_irp_intent(ClientId(IO_MANAGER_COMPONENT_ID), irp_id)
+    {
+        Ok(intent) => intent,
+        Err(status) => {
+            row(id).flight = Flight::Blocked;
+            row(id).blocked_status = Some(status);
+            return QueuedReadRedriveOutcome::Retained(status);
+        }
+    };
+    if intent.abandoned
+        && intent.cancel != nt_io_manager::detached_file_irp::ExternalFileIrpCancelPhase::Queued
+    {
+        // Activation gate: abandoned preparation needs a manager-proven no-entry result.
+        let status = nt_status::NtStatus::CANCELLED;
+        row(id).flight = Flight::Blocked;
+        row(id).blocked_status = Some(status);
+        return QueuedReadRedriveOutcome::Retained(status);
+    }
+    if !live_route(id)
+        && intent.cancel != nt_io_manager::detached_file_irp::ExternalFileIrpCancelPhase::Queued
+    {
+        // Activation gate: physical route loss needs a proof-bearing no-entry completion.
+        let status = nt_status::NtStatus::DEVICE_NOT_CONNECTED;
+        row(id).flight = Flight::Blocked;
+        row(id).blocked_status = Some(status);
+        return QueuedReadRedriveOutcome::Retained(status);
+    }
+    let prepared = match row(id).payload.take() {
+        Some(Payload::Prepared(prepared)) => prepared,
+        other => {
+            row(id).payload = other;
+            row(id).flight = Flight::Blocked;
+            row(id).blocked_status = Some(nt_status::NtStatus::INVALID_PARAMETER);
+            return QueuedReadRedriveOutcome::Retained(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+    };
+    let mut phase = FileRpcPhaseGuard::new(major::IRP_MJ_READ);
+    let invocation = match io_manager_mut().begin_prepared_external_file_irp(prepared) {
+        Ok(invocation) => invocation,
+        Err(rejection) => {
+            let (status, prepared) = rejection.into_parts();
+            // A queued cancellation is a proven no-entry terminal; a failed physical or
+            // manager route remains retained if its exact cause cannot be terminalized.
+            if status == nt_status::NtStatus::CANCELLED {
+                match io_manager_mut().complete_prepared_external_file_irp_without_entry(
+                    prepared,
+                    nt_io_manager::detached_file_irp::ExternalFileIrpPreEntryFailure::Cancelled,
+                ) {
+                    Ok(retained) => {
+                        keep(id, Payload::Retained(retained));
+                        return QueuedReadRedriveOutcome::Progressed;
+                    }
+                    Err(rejection) => {
+                        let (error, prepared) = rejection.into_parts();
+                        block(id, Payload::Prepared(prepared), error);
+                        return QueuedReadRedriveOutcome::Retained(error);
+                    }
+                }
+            }
+            // A manager route refusal is terminal only when the manager validates its own
+            // route fault against this exact preparation. Other refusals remain retained.
+            let failure = nt_io_manager::detached_file_irp::ExternalFileIrpPreEntryFailure::ManagerRouteUnavailable;
+            match io_manager_mut().complete_prepared_external_file_irp_without_entry(prepared, failure) {
+                Ok(retained) => {
+                    keep(id, Payload::Retained(retained));
+                    return QueuedReadRedriveOutcome::Progressed;
+                }
+                Err(rejection) => {
+                    let (_, prepared) = rejection.into_parts();
+                    block(id, Payload::Prepared(prepared), status);
+                    return QueuedReadRedriveOutcome::Retained(status);
+                }
+            }
+        }
+    };
+    // The manager has transferred the owner to Dispatched; even an uncertain transport
+    // result may never send this invocation again.
+    row(id).flight = Flight::Dispatch;
+    row(id).phase_major = major::IRP_MJ_READ;
+    phase.identity = Some(nt_hosted_runtime::HostedFileRpcIdentity {
+        irp_id: irp_id.raw(), major: major::IRP_MJ_READ,
+    });
+    phase.invoked = crate::disk_census_ticks();
+    let returned = hosted_file_dispatch::invoke(
+        invocation, row(id).caller, ExternalFileIrpDispatchPolicy::File.output_capture(),
+    );
+    phase.returned = crate::disk_census_ticks();
+    phase.pump_ticks = row(id).phase_pump_ticks;
+    phase.bank_ticks = row(id).phase_bank_ticks;
+    let result = match io_manager_mut().finish_external_file_irp(returned) {
+        Ok(result) => result,
+        Err(rejection) => {
+            let (status, returned) = rejection.into_parts();
+            block(id, Payload::Returned(returned), status);
+            return QueuedReadRedriveOutcome::Retained(status);
+        }
+    };
+    match result {
+        ExternalFileIrpResult::NotEntered { status, prepared } => {
+            // The transport proved no entry, but an already parked caller still needs a
+            // canonical terminal. Retain the preparation until the no-entry receipt exists.
+            block(id, Payload::Prepared(prepared), status);
+            QueuedReadRedriveOutcome::Retained(status)
+        }
+        ExternalFileIrpResult::Returned(terminal) => {
+            row(id).completion = Some(*terminal.completion());
+            keep(id, Payload::Terminal(terminal));
+            QueuedReadRedriveOutcome::Progressed
+        }
+        ExternalFileIrpResult::Pending(retained) => {
+            keep(id, Payload::Retained(retained));
+            QueuedReadRedriveOutcome::Progressed
+        }
+        ExternalFileIrpResult::Indeterminate { transport_status, retained } => {
+            keep(id, Payload::Retained(retained));
+            row(id).blocked_status = Some(transport_status);
+            QueuedReadRedriveOutcome::Progressed
+        }
+    }
+}
+
 pub(super) fn contains(irp_id: IrpId) -> bool {
     find(irp_id).is_some()
 }
@@ -909,7 +1084,8 @@ fn ensure_completion(id: u64) -> Result<(), nt_status::NtStatus> {
                 }
             }
         }
-        payload @ (Payload::Completion(_) | Payload::Copy(_) | Payload::Acknowledgement(_)) => {
+        payload @ (Payload::Terminal(_) | Payload::Completion(_) | Payload::Copy(_)
+            | Payload::Acknowledgement(_)) => {
             row(id).payload = Some(payload);
             Ok(())
         }
@@ -1011,6 +1187,23 @@ fn copy_captured(
     let offset = usize::try_from(offset).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
     loop {
         match row(id).payload.as_ref() {
+            Some(Payload::Terminal(terminal)) => {
+                let captured = if mutable_input {
+                    terminal.buffers().input()
+                } else {
+                    terminal.buffers().output()
+                };
+                let length = output.len();
+                let end = offset.checked_add(length)
+                    .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+                let capture_len = usize::try_from(terminal.completion().information)
+                    .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+                if capture_len > captured.len() || end > capture_len {
+                    return Err(nt_status::NtStatus::INVALID_PARAMETER);
+                }
+                output.copy_from_slice(&captured[offset..end]);
+                return Ok(length);
+            }
             Some(Payload::Completion(completion)) => {
                 if offset > completion.capture_len() {
                     return Err(nt_status::NtStatus::INVALID_PARAMETER);
@@ -1055,6 +1248,37 @@ fn acknowledge_with_buffers(irp_id: IrpId) -> Result<ExternalFileIrpBuffers, nt_
     let _durable = crate::allocator::enter_durable();
     let id = find(irp_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
     ensure_completion(id)?;
+    if matches!(row(id).payload.as_ref(), Some(Payload::Terminal(_))) {
+        let terminal = match row(id).payload.take() {
+            Some(Payload::Terminal(terminal)) => terminal,
+            other => {
+                row(id).payload = other;
+                return Err(nt_status::NtStatus::DEVICE_BUSY);
+            }
+        };
+        match io_manager_mut().retire_external_file_irp_terminal(terminal) {
+            Ok((receipt, buffers)) => {
+                if receipt.backend_acknowledged()
+                    || !io_manager_mut().accepts_external_file_irp_receipt(&receipt)
+                {
+                    row(id).terminal_receipt = Some(receipt);
+                    row(id).settled_buffers = Some(buffers);
+                    quarantine_release(id, nt_status::NtStatus::INVALID_PARAMETER);
+                    return Err(nt_status::NtStatus::INVALID_PARAMETER);
+                }
+                row(id).terminal_receipt = Some(receipt);
+                row(id).settled_buffers = Some(buffers);
+                let mut retired = remove(id)?;
+                return retired.settled_buffers.take()
+                    .ok_or(nt_status::NtStatus::INVALID_PARAMETER);
+            }
+            Err(rejection) => {
+                let (status, terminal) = rejection.into_parts();
+                block(id, Payload::Terminal(terminal), status);
+                return Err(status);
+            }
+        }
+    }
     if monotonic_time_100ns() < row(id).retry_after {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
@@ -1080,6 +1304,37 @@ fn acknowledge_with_buffers(irp_id: IrpId) -> Result<ExternalFileIrpBuffers, nt_
             break;
         }
         copy_chunk(id)?;
+    }
+    if matches!(row(id).payload.as_ref(), Some(Payload::Completion(completion))
+        if completion.completion().completion_origin == nt_io_manager::IrpCompletionOrigin::NoBackendEntry)
+    {
+        let completion = match row(id).payload.take() {
+            Some(Payload::Completion(completion)) => completion,
+            other => {
+                row(id).payload = other;
+                return Err(nt_status::NtStatus::DEVICE_BUSY);
+            }
+        };
+        match io_manager_mut().retire_external_file_irp_completion_without_backend(completion) {
+            Ok((receipt, buffers)) => {
+                if receipt.backend_acknowledged() {
+                    row(id).terminal_receipt = Some(receipt);
+                    row(id).settled_buffers = Some(buffers);
+                    quarantine_release(id, nt_status::NtStatus::INVALID_PARAMETER);
+                    return Err(nt_status::NtStatus::INVALID_PARAMETER);
+                }
+                row(id).terminal_receipt = Some(receipt);
+                row(id).settled_buffers = Some(buffers);
+                let mut retired = remove(id)?;
+                return retired.settled_buffers.take()
+                    .ok_or(nt_status::NtStatus::INVALID_PARAMETER);
+            }
+            Err(rejection) => {
+                let (status, completion) = rejection.into_parts();
+                block(id, Payload::Completion(completion), status);
+                return Err(status);
+            }
+        }
     }
     if row(id).port_connect_control_storage.is_some() {
         if let Some(Payload::Completion(completion)) = row(id).payload.as_ref() {
@@ -1210,6 +1465,9 @@ pub(super) fn drain() -> usize {
     RETRY_READY.store(0, Ordering::Relaxed);
     for entry in rows().iter_mut() {
         entry.work_ready = false;
+        // Activation gate: a queued READ is owned by the parent-restore checkpoint, not this
+        // ordinary drain. Its cancel/abandon intent must be settled by redrive_queued_read before
+        // the service loop resumes unrestricted provider or maintenance work.
         if entry.flight != Flight::Idle {
             continue;
         }
