@@ -1,7 +1,7 @@
 //! Hosted-user Calls retain independent thread identity beside component dispatch ownership.
 
 use super::*;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 use nt_component_suspension::{ExternalAdmissionKey, ExternalIngress, ReplyBindingObservation};
 type Binding = nt_user_host::thread_binding::ThreadBinding<crate::HostedThreadRole>;
 
@@ -69,6 +69,14 @@ struct HostedCall {
     root_ingress: Option<RootIngressOwner>,
 }
 static mut CALLS: Vec<Option<HostedCall>> = Vec::new();
+
+// Temporary diagnostic hint, published by the serialized root when the archived services.exe
+// READ shape enters CALLS. It is a selector only; the full physical Call is checked again below.
+static ROOT_ROUTE_PROBE_ADMISSION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn root_route_probe_admission() -> u64 {
+    ROOT_ROUTE_PROBE_ADMISSION.load(Ordering::Acquire)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PendingSnapshot {
@@ -235,6 +243,16 @@ pub(super) unsafe fn retain(
     crate::registry_mutation_work::trace_next_hosted_call(
         binding, call.reply(), call.message().info(), call.message().registers()[0],
     );
+    let registers = call.message().registers();
+    let probe_admission = if binding.process.pid == 120
+        && binding.tid == 288
+        && matches!(binding.process.generation,
+            nt_user_host::process_identity::ProcessGeneration::Hosted(4))
+        && registers[0] == 191 && registers[2] == 388
+        && call.message().info() >> 12 == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL
+    {
+        call.admission_sequence()
+    } else { 0 };
     records[index] = Some(HostedCall {
         binding,
         call: Some(call),
@@ -245,6 +263,9 @@ pub(super) unsafe fn retain(
         receive_settlement: None,
         root_ingress: None,
     });
+    if probe_admission != 0 {
+        ROOT_ROUTE_PROBE_ADMISSION.store(probe_admission, Ordering::Release);
+    }
     Ok(())
 }
 
