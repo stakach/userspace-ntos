@@ -1,5 +1,11 @@
 # Lessons
 
+## Keep Independent Root Events Independent Of A Held Provider Reply
+- A queued hosted Call can be asynchronous even when it is selected to unblock a nested provider pump. Decode its actual syscall and trace its Reply owner before choosing a parent-child settlement barrier. `NtReadFile` can park with an independent Reply; holding a Win32k parent until that File Call settles can create a dependency cycle.
+- A bounded root-event preemption needs an exact event checkpoint: the selected Call has either acknowledged and freed its Reply or durably parked it with its own owner. Restore the provider parent only after that checkpoint. Do not treat a numeric Reply, a timeout, or an uncertain park as proof.
+- Audit work before the apparent receive boundary. Post-syscall redrives, finalizers, timers, and IRQ paths can enter providers before a receive macro runs. Separate event-local publication from global progress before admitting a root event under a held parent.
+- Give delegated code work the exact checkout and HEAD. Agents share the filesystem and default to the main checkout; verify their target before editing, then check both checkouts before committing.
+
 ## Recover From Retired Hosted Runtimes
 - A missing hosted-process runtime during asynchronous ingress or cleanup is a lifetime mismatch to reject or retain under its exact process and Reply owner. Do not add a panic-only diagnostic or synthetic fallback; make runtime lookup fallible at the boundary, record the missing identity, and return a real terminal status only when the effect is known.
 - Before changing admission, reproduce the stale-runtime path with a focused regression and trace the caller so cleanup and pending delivery cannot reuse a retired layout. A debug assertion may document an impossible internal state, but it must not be the guest-facing recovery policy.
