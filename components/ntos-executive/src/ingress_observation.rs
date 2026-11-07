@@ -179,6 +179,38 @@ pub(crate) fn print_hold_snapshot(now: u64) {
     } else {
         record.bytes()
     });
+    // The ordinary CALLS census alone cannot identify the suspended provider frame that
+    // prevents the outer loop from importing them. Observe the existing lane and WAITS owners
+    // without changing their state or constructing a second parent.
+    let lanes = unsafe { &*core::ptr::addr_of!(crate::service_sec_image::COMPONENT_SUSPENSIONS) };
+    let mut owners = nt_printf::record::RecordBuffer::<2048>::new();
+    let _ = writeln!(owners, "[checkpoint-frames] total={}", lanes.total_suspensions());
+    for (lane, frame) in lanes.frames().take(12) {
+        let phase = match &frame.phase {
+            nt_component_suspension::SuspensionPhase::Waiting => "waiting",
+            nt_component_suspension::SuspensionPhase::Selected { .. } => "selected",
+            nt_component_suspension::SuspensionPhase::Resuming { .. } => "resuming",
+            nt_component_suspension::SuspensionPhase::Cancelled { .. } => "cancelled",
+            nt_component_suspension::SuspensionPhase::MaintenanceWaiting { .. } => "maintenance-waiting",
+            nt_component_suspension::SuspensionPhase::MaintenanceReady { .. } => "maintenance-ready",
+            nt_component_suspension::SuspensionPhase::MaintenanceResuming { .. } => "maintenance-resuming",
+            nt_component_suspension::SuspensionPhase::NestedTerminal => "nested-terminal",
+        };
+        let _ = writeln!(owners,
+            "[checkpoint-frame] lane/gen={}/{} kind={:?} key={} dispatch={} phase={} external-top={:?}",
+            lane.index, lane.generation, frame.key.kind, frame.key.id,
+            frame.owner.dispatch_id, phase,
+            lanes.external_top(lane).ok().flatten());
+    }
+    unsafe {
+        crate::spawn_hosts::shared_ingress::owner::runtime
+            ::append_service_wait_owner_census(&mut owners);
+    }
+    sel4_rt::print_record(if owners.overflowed() {
+        b"[checkpoint-frames] record-truncated\n"
+    } else {
+        owners.bytes()
+    });
     let calls = crate::MONOTONIC_CALLS.snapshot::<8>();
     let mut callers = nt_printf::record::RecordBuffer::<2048>::new();
     let _ = write!(callers, "[clock-callers] calls={} sampled={} overflow={}",

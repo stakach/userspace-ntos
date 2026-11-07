@@ -21,6 +21,7 @@ pub(crate) mod physical_hold;
 #[path = "component_ingress_services.rs"]
 mod services;
 pub(crate) use services::{
+    append_service_wait_owner_census,
     acknowledge_hosted_forward_source_continuation, acknowledge_retained_service_cancellation,
     cancel_parked_service, finish_autonomous,
     next_service_wait_token, park_retained_service, park_service, reconcile_retained_service_reply,

@@ -115,6 +115,25 @@ impl ServiceCompletion {
 }
 static mut WAITS: Vec<Wait> = Vec::new();
 
+/// Diagnostic-only read of the retained wait owners at the periodic root census.
+pub(crate) unsafe fn append_service_wait_owner_census(
+    record: &mut nt_printf::record::RecordBuffer<2048>,
+) {
+    use core::fmt::Write;
+    let waits = &*core::ptr::addr_of!(WAITS);
+    let _ = writeln!(record, "[checkpoint-waits] total={}", waits.len());
+    for wait in waits.iter().take(12) {
+        let lane = wait.dispatch.lane();
+        let _ = writeln!(record,
+            "[checkpoint-wait] lane/gen={}/{} dispatch/reply/token={}/{}/{} phase={} parked={} kind={} current={} external-top={:?}",
+            lane.index, lane.generation, wait.dispatch.epoch(), wait.reply, wait.token,
+            wait.phase as u8, wait.phase == WaitPhase::Parked,
+            wait.kind == WaitKind::RetainedSemantic,
+            current_reply(wait.route).ok() == Some(wait.reply),
+            lanes().external_top(lane).ok().flatten());
+    }
+}
+
 unsafe fn wait_exact(
     route: PeerRoute,
     dispatch: LaneDispatchIdentity,
