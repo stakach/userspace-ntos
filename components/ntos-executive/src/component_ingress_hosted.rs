@@ -2,7 +2,7 @@
 
 use super::*;
 use core::sync::atomic::Ordering;
-use nt_component_suspension::{ExternalIngress, ReplyBindingObservation};
+use nt_component_suspension::{ExternalAdmissionKey, ExternalIngress, ReplyBindingObservation};
 type Binding = nt_user_host::thread_binding::ThreadBinding<crate::HostedThreadRole>;
 
 struct ReceiveSettlement {
@@ -22,6 +22,8 @@ struct ReceiveSettlement {
 struct RootIngressOwner {
     pass: nt_user_host::root_ingress_pass::RootIngressPass<crate::HostedThreadRole>,
     parent: Option<super::nested::ParkedParentHandle>,
+    /// Only a positive physical restore receipt clears the provider-selection exclusion.
+    restored: Option<nt_user_host::root_ingress_pass::RootIngressRestored<crate::HostedThreadRole>>,
 }
 
 /// Single-use outer-loop delivery. The parent row already retains the sealed settlement permit.
@@ -643,7 +645,7 @@ pub(crate) unsafe fn prepare_root_ingress_pass(
     let pass = nt_user_host::root_ingress_pass::RootIngressPass::prepare(call, row.binding)
         .map_err(|_| Error::Admission)?;
     let admission = pass.admission_key();
-    row.root_ingress = Some(RootIngressOwner { pass, parent: None });
+    row.root_ingress = Some(RootIngressOwner { pass, parent: None, restored: None });
     Ok(admission)
 }
 
@@ -678,7 +680,8 @@ pub(crate) unsafe fn cancel_unbound_root_ingress_pass(
     if !exact || row.delivered || row.released || row.completion.is_some()
         || row.receive_settlement.is_some()
         || row.root_ingress.as_ref().is_none_or(|root| {
-            root.parent.is_some() || root.pass.admission_key() != admission
+            root.parent.is_some() || root.restored.is_some()
+                || root.pass.admission_key() != admission
         })
     {
         return Err((Error::Admission, proof));
@@ -712,7 +715,7 @@ pub(crate) unsafe fn bind_root_ingress_pass(
             return Err(Error::Admission);
         }
         let root = row.root_ingress.as_mut().ok_or(Error::Admission)?;
-        if root.parent.is_some()
+        if root.parent.is_some() || root.restored.is_some()
             || root.pass.admission_key()
                 != row.call.as_ref().ok_or(Error::Admission)?.admission_key()
             || row.call.as_ref().ok_or(Error::Admission)?.message().info() != snapshot.info
@@ -745,6 +748,71 @@ pub(crate) unsafe fn bind_root_ingress_pass(
 unsafe fn root_ingress_pending() -> bool {
     (&*core::ptr::addr_of!(CALLS)).iter().flatten()
         .any(|row| row.root_ingress.is_some())
+}
+
+fn root_child_admission_current(row: &HostedCall, admission: ExternalAdmissionKey) -> bool {
+    match row.call.as_ref() {
+        Some(call) => call.admission_key() == admission,
+        None => row.completion.is_some() && row.recycled.as_ref().is_some_and(|ready| {
+            ready.reply() == admission.reply()
+        }),
+    }
+}
+
+/// Consume only the exact positive native parent-restoration receipt. An async child result may
+/// remain in this CALLS row, but it no longer excludes unrelated provider progress afterward.
+pub(crate) unsafe fn accept_root_ingress_parent_restored(
+    restored: nt_user_host::root_ingress_pass::RootIngressRestored<crate::HostedThreadRole>,
+) -> Result<(), (Error, nt_user_host::root_ingress_pass::RootIngressRestored<crate::HostedThreadRole>)> {
+    let row = (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten()
+        .find(|row| row.binding == restored.child()
+            && row.root_ingress.as_ref().is_some_and(|root| {
+                root.pass.admission_key() == restored.admission_key()
+            }));
+    let Some(row) = row else { return Err((Error::Admission, restored)) };
+    let child_current = root_child_admission_current(row, restored.admission_key());
+    let Some(root) = row.root_ingress.as_mut() else {
+        return Err((Error::Admission, restored));
+    };
+    if root.restored.is_some()
+        || root.pass.child() != row.binding
+        || root.pass.admission_key() != restored.admission_key()
+        || !child_current
+        || root.parent.as_ref().is_none_or(|parent| parent.identity() != restored.parent())
+    {
+        return Err((Error::Admission, restored));
+    }
+    root.restored = Some(restored);
+    root.parent = None;
+    Ok(())
+}
+
+/// A prepared or bound root child excludes all unrelated provider selection until its exact
+/// physical parent is restored. Inconsistent retained ownership also excludes selection.
+pub(crate) unsafe fn root_ingress_parent_blocks_provider_resume() -> bool {
+    for row in (&*core::ptr::addr_of!(CALLS)).iter().flatten() {
+        let Some(root) = row.root_ingress.as_ref() else { continue };
+        if root.pass.child() != row.binding
+            || !root_child_admission_current(row, root.pass.admission_key())
+        {
+            return true;
+        }
+        if let Some(restored) = root.restored.as_ref() {
+            if root.parent.is_some()
+                || restored.child() != row.binding
+                || restored.admission_key() != root.pass.admission_key()
+            {
+                return true;
+            }
+            continue;
+        }
+        let Some(parent) = root.parent.as_ref() else { return true };
+        if !super::nested::root_ingress_parent_is_held(parent, root.pass.admission_key()) {
+            return true;
+        }
+        return true;
+    }
+    false
 }
 
 pub(crate) unsafe fn receive_child_pending() -> bool {

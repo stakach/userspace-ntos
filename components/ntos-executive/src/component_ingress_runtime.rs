@@ -50,6 +50,8 @@ pub(crate) use hosted::{
     bind_receive_settlement, prepare_receive_settlement, take_outer_boundary,
     bind_root_ingress_pass, prepare_root_ingress_pass,
     cancel_unbound_root_ingress_pass,
+    root_ingress_parent_blocks_provider_resume,
+    accept_root_ingress_parent_restored,
     ReceiveSettlementBoundary, ReceiveChildObservation,
     receive_child_pending, receive_child_is_current, receive_child_observation,
     receive_child_delivery_allowed, with_bound_receive_scope,

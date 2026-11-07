@@ -134,6 +134,7 @@ unsafe fn select_ready_service_waits() {
 pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
     if is_running()
         || crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+        || crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
     {
         return 0;
     }
@@ -146,11 +147,15 @@ pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
     let mut pass = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).resume_pass();
     let mut drained = 0;
     loop {
-        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+            || crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
+        {
             break;
         }
         drained += component_terminal::drain(&mut *handler, &mut *ctx.procs, &mut *ctx.pfilled);
-        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+            || crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
+        {
             break;
         }
         if let Some(ticket) = root_maintenance_owner::next_returned_ticket()
@@ -174,6 +179,7 @@ pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
         }
     }
     if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+        && !crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
         && (*handler).lpc_endpoint_progress
     {
         let _ = lpc_endpoint_redrive_all(&mut *handler);
@@ -528,12 +534,16 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
     if !runtime_ready(handler)
         || is_running()
         || crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+        || crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
     {
         return;
     }
     // A hosted terminal may own the shared execution fence while awaiting the separately
     // retained final Call. Settle that exact return before the ordinary busy-lane gate.
     let _ = component_terminal::drain_shared_returns();
+    if crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume() {
+        return;
+    }
     if let Some(ticket) = nested_restore_owner::next_retry() {
         let _message = crate::ipc_message::SavedMessageBuffer::capture();
         let _durable = allocator::enter_durable();
@@ -551,6 +561,9 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
         nested_restore_owner::defer_retry(ticket);
         let _ = drain_terminals(handler);
     }
+    if crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume() {
+        return;
+    }
     if let Some(ticket) = root_maintenance_owner::next_returned_ticket() {
         let _message = crate::ipc_message::SavedMessageBuffer::capture();
         let _durable = allocator::enter_durable();
@@ -561,6 +574,9 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
             RootMaintenanceResumeOutcome::RetainedFailure =>
                 report_retained(nt_process::STATUS_UNSUCCESSFUL),
         }
+    }
+    if crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume() {
+        return;
     }
     if component_execution_is_busy()
         && !kernel_provider_activation::has_stopped_wait_work(&(*handler).pm)
@@ -584,7 +600,9 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
     let mut pass = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).resume_pass();
     let mut progressed = drain_terminals(handler);
     loop {
-        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+            || crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
+        {
             break;
         }
         if let Some(ticket) = root_maintenance_owner::next_ready_ticket() {
@@ -627,12 +645,15 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
                 kernel_provider_activation::publish_runtime_waits(&mut *handler);
             }
         }
-        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+            || crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
+        {
             break;
         }
         progressed |= drain_terminals(handler);
     }
     if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+        && !crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
         && (*handler).lpc_endpoint_progress
     {
         // Component-originated LPC work bypasses the ordinary syscall post-action.

@@ -46,6 +46,9 @@ pub(crate) unsafe fn run_hosted(
     nt_handler: *mut ExecNtHandler,
     candidate: Candidate,
 ) -> Option<ComponentSuspensionRuntimeOutcome> {
+    if crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume() {
+        return None;
+    }
     let lane_resume = candidate.resume;
     let lane = lane_resume.lane;
     let reply_object = lane_resume.binding.reply_object;

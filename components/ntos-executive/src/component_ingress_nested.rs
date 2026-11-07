@@ -160,6 +160,26 @@ pub(crate) unsafe fn has_retained_parent_for_executor(executor: u64) -> bool {
         .any(|parent| parent.route.identity().executor == executor)
 }
 
+/// Memory-only check for the physical parent of one retained ordinary root child. A failed
+/// check leaves the caller responsible for treating the child as a provider-selection barrier.
+pub(crate) unsafe fn root_ingress_parent_is_held(
+    handle: &ParkedParentHandle,
+    admission: ExternalAdmissionKey,
+) -> bool {
+    (&*core::ptr::addr_of!(PARENTS))
+        .get(handle.index)
+        .and_then(Option::as_ref)
+        .is_some_and(|parent| {
+            row_matches(handle, parent)
+                && parent.root_admission == Some(admission)
+                && parent.child == Some(ParentChild::RootIngress)
+                && matches!(parent.phase,
+                    ParentPhase::Parked | ParentPhase::RestorePending
+                        | ParentPhase::RestoreAttempt | ParentPhase::Quarantined)
+                && parent.physical.held()
+        })
+}
+
 fn row_matches(handle: &ParkedParentHandle, parent: &Parent) -> bool {
     ticket_matches(handle.ticket(), parent)
 }
