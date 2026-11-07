@@ -3797,6 +3797,15 @@ fn maybe_fold_system_wal() -> Result<(), u32> {
 }
 
 fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
+    if let Some(status) = redrive_service_loop_global_work(nt_handler) {
+        return status;
+    }
+    checkpoint_service_loop_volume(nt_handler)
+}
+
+/// Advance retained service owners before attempting a mounted-volume checkpoint.
+/// A pending fold ACK, journal volume owner, or section-retirement error can defer it.
+fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u32> {
     // A native directory caller owns its original Reply until the exact Object Manager
     // request and local handle publication settle. Redrive before WAL early returns.
     {
@@ -3840,13 +3849,13 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
             );
             SYSTEM_WAL_FOLD_DUE.store(true, Ordering::Release);
             unsafe { rearm_registered_active_delay_timer() };
-            return nt_fs::STATUS_SUCCESS;
+            return Some(nt_fs::STATUS_SUCCESS);
         }
     }
     // The journal owns the mounted volume, including all dirty state, until its terminal proof.
     // Leave maintenance flags untouched; an unavailable volume is neither clean nor absent.
     if crate::writable_fs::registry_journal::owns_volume() {
-        return nt_fs::STATUS_SUCCESS;
+        return Some(nt_fs::STATUS_SUCCESS);
     }
     unsafe { kernel_provider_activation::publish_runtime_waits(nt_handler) };
     unsafe { inline_file_retirement::redrive(nt_handler) };
@@ -3881,10 +3890,15 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
         if let Err(status) = unsafe {
             service_drain_section_retirement_for_handler(&mut *ctx.generic_sections, nt_handler)
         } {
-            return report_service_finalize_failure(b"section-retirement", status);
+            return Some(report_service_finalize_failure(b"section-retirement", status));
         }
     }
     unsafe { crate::writable_fs::redrive_file_cleanup_work() };
+    None
+}
+
+/// Claim dirty state and publish the mounted-volume checkpoint at the original service boundary.
+fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
     let writable_fs_mount_dirty = crate::writable_fs::take_mount_dirty();
     let writable_fs_runtime_dirty = crate::writable_fs::take_runtime_dirty();
     let writable_fs_touched =
