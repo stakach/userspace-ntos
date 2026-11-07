@@ -6531,6 +6531,26 @@ pub(crate) unsafe fn drain_nested_pump_timer_delivery() -> bool {
     true
 }
 
+/// A nested receive may ACK a one-shot while the root still owns the current
+/// hosted Reply. Settle that deferred tick in place before using the Reply for
+/// a new receive; the caller must not replay its current message or response.
+unsafe fn prepare_service_receive(
+    queue: &mut nt_delay_execution::Queue,
+    handler: &mut ExecNtHandler,
+) {
+    loop {
+        match component_resume::prepare_receive(handler) {
+            component_resume::ReceivePreparation::Ready => return,
+            component_resume::ReceivePreparation::PendingDelivery => {
+                let ticks = DELAY_TIMER_TICKS_PENDING.swap(0, Ordering::AcqRel);
+                if ticks == 0 { continue; }
+                PUMP_TIMER_TICKS_DRAINED.fetch_add(ticks, Ordering::Relaxed);
+                delay_timer_interrupt(queue, handler);
+            }
+        }
+    }
+}
+
 /// CONNECT and HOOK own their source Replies and provider projections directly. Their nested
 /// redrive does not borrow the File handler used by the other hosted work runners.
 unsafe fn redrive_nested_hosted_input_work() -> bool {
@@ -10065,19 +10085,19 @@ pub(crate) unsafe fn service_sec_image(
     // This barrier only programs wake demand; provider execution stays at the outer loop top.
     macro_rules! component_recv {
         ($($arg:expr),* $(,)?) => {{
-            component_resume::prepare_receive(&mut nt_handler);
+            prepare_service_receive(&mut *delay_queue, &mut nt_handler);
             recv_full_r12($($arg),*)
         }};
     }
     macro_rules! component_reply_recv {
         ($($arg:expr),* $(,)?) => {{
-            component_resume::prepare_receive(&mut nt_handler);
+            prepare_service_receive(&mut *delay_queue, &mut nt_handler);
             reply_recv_badge($($arg),*)
         }};
     }
     macro_rules! component_client_reply_recv {
         ($($arg:expr),* $(,)?) => {{
-            component_resume::prepare_receive(&mut nt_handler);
+            prepare_service_receive(&mut *delay_queue, &mut nt_handler);
             client_reply_recv_badge($($arg),*)
         }};
     }
@@ -10435,7 +10455,7 @@ pub(crate) unsafe fn service_sec_image(
             ($ep:expr, $reply:expr) => {{
                 assert!(crate::executive_ingress::handles($ep));
                 if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
-                    component_resume::prepare_receive(&mut nt_handler);
+                    prepare_service_receive(&mut *delay_queue, &mut nt_handler);
                 }
                 component_receive_outcome!(crate::executive_ingress::receive($reply))
             }};
@@ -10444,7 +10464,7 @@ pub(crate) unsafe fn service_sec_image(
             ($ep:expr, $reply:expr, $len:expr, $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {{
                 assert!(crate::executive_ingress::handles($ep));
                 if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
-                    component_resume::prepare_receive(&mut nt_handler);
+                    prepare_service_receive(&mut *delay_queue, &mut nt_handler);
                 }
                 component_receive_outcome!(crate::executive_ingress::reply_receive(
                     $reply, $len, $r0, $r1, $r2, $r3))
@@ -10498,7 +10518,7 @@ pub(crate) unsafe fn service_sec_image(
             }
             if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
                 component_resume::run_outer(core::ptr::from_mut(&mut *nt_handler));
-                component_resume::prepare_receive(&mut nt_handler);
+                prepare_service_receive(&mut *delay_queue, &mut nt_handler);
             }
             let received = crate::executive_ingress::receive(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
             let received = match received {

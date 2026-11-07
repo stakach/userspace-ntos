@@ -94,6 +94,7 @@ pub struct TimerReceiveState {
     pub active: bool,
     pub delivery_running: bool,
     pub continuation_running: bool,
+    pub pending_delivery: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,6 +103,7 @@ pub enum TimerReceiveError {
     UnavailableOwner,
     ActiveDelivery,
     ActiveContinuation,
+    PendingDelivery,
     Rearm(TimerRearmOutcome),
 }
 
@@ -125,6 +127,9 @@ impl TimerReceiveState {
         }
         if self.continuation_running {
             return Err(TimerReceiveError::ActiveContinuation);
+        }
+        if self.pending_delivery {
+            return Err(TimerReceiveError::PendingDelivery);
         }
         match rearm() {
             Some(outcome) if !outcome.owner_available() => Err(TimerReceiveError::Rearm(outcome)),

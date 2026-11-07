@@ -127,7 +127,22 @@ pub(crate) unsafe fn run_kernel_job(
         component_resume::run_outer(handler);
         redrive_ready_completions();
         if let Some(status) = result.returned() { return Ok((u64::from(status), true)); }
-        component_resume::prepare_receive(&mut *handler);
+        match component_resume::prepare_receive(&mut *handler) {
+            component_resume::ReceivePreparation::Ready => {}
+            component_resume::ReceivePreparation::PendingDelivery => {
+                // The nested pump may have ACKed the only physical wake. This
+                // boundary holds no handler or queue loan, so its registered
+                // delivery owner can settle the tick before we retry.
+                if drain_nested_pump_timer_delivery()
+                    || DELAY_TIMER_TICKS_PENDING.load(Ordering::Acquire) == 0
+                {
+                    continue;
+                }
+                // Another delivery owns the gate. Keep the activation and
+                // original caller held; a receive here could sleep forever.
+                return Ok((u64::from(nt_process::STATUS_PENDING), false));
+            }
+        }
         let arrival = ingress::receive(nt_component_suspension::IngressExecutionOwner::Idle, 1, true)
             .map_err(|_| nt_process::STATUS_UNSUCCESSFUL)?;
         if let ingress::Arrival::Notification(message) = arrival {

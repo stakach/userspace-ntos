@@ -87,6 +87,7 @@ fn receive_preflight_checks_every_owner_state_before_rearm_effects() {
                         active,
                         delivery_running,
                         continuation_running,
+                        pending_delivery: false,
                     };
                     let expected = if !registered {
                         Err(TimerReceiveError::UnregisteredOwner)
@@ -115,6 +116,26 @@ fn receive_preflight_checks_every_owner_state_before_rearm_effects() {
 }
 
 #[test]
+fn receive_refuses_deferred_tick_before_rearming_or_blocking() {
+    let state = TimerReceiveState {
+        registered: true,
+        active: true,
+        delivery_running: false,
+        continuation_running: false,
+        pending_delivery: true,
+    };
+    let mut rearm_effects = 0;
+    assert_eq!(
+        state.prepare(|| {
+            rearm_effects += 1;
+            Some(TimerRearmOutcome::Programmed)
+        }),
+        Err(TimerReceiveError::PendingDelivery),
+    );
+    assert_eq!(rearm_effects, 0);
+}
+
+#[test]
 fn receive_accepts_only_successful_or_unnecessary_rearm() {
     for (outcome, expected) in [
         (None, Ok(())),
@@ -135,6 +156,7 @@ fn receive_accepts_only_successful_or_unnecessary_rearm() {
             active: true,
             delivery_running: false,
             continuation_running: false,
+            pending_delivery: false,
         };
         assert_eq!(
             state.prepare(|| {
@@ -164,6 +186,7 @@ fn receive_preparation_never_acknowledges_retained_continuation_demand() {
             active: true,
             delivery_running: false,
             continuation_running: wake.is_running(),
+            pending_delivery: false,
         };
         let result = state.prepare(|| {
             effects += 1;
@@ -182,6 +205,7 @@ fn receive_preparation_never_acknowledges_retained_continuation_demand() {
         active: true,
         delivery_running: false,
         continuation_running: wake.is_running(),
+        pending_delivery: false,
     };
     assert_eq!(
         state.prepare(|| {

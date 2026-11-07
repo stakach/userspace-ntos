@@ -260,7 +260,7 @@ pub(super) unsafe fn reconcile(handler: &mut ExecNtHandler) {
 
 /// A failed source may not silently strand deadlines in a blocking receive. Do not initialize
 /// or replace hardware here: the existing fault path owns disabling and retiring that source.
-pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) {
+pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) -> ReceivePreparation {
     let state = nt_kernel_exec::TimerReceiveState {
         registered: SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire)
             == core::ptr::from_ref(handler) as u64
@@ -269,52 +269,30 @@ pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) {
             && DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire) == DELAY_TIMER_IRQ_ACTIVE,
         delivery_running: TIMER_DELIVERY_GATE.is_active(),
         continuation_running: is_running(),
+        pending_delivery: DELAY_TIMER_TICKS_PENDING.load(Ordering::Acquire) != 0,
     };
-    state
-        .prepare(|| reconcile_runtime(handler))
-        .expect("runtime timer ownership must permit blocking receive");
-    trace_pending_tick_receive();
+    match state.prepare(|| reconcile_runtime(handler)) {
+        Err(nt_kernel_exec::TimerReceiveError::PendingDelivery) =>
+            return ReceivePreparation::PendingDelivery,
+        other => other.expect("runtime timer ownership must permit blocking receive"),
+    }
+    // Reconciliation can itself enter a nested pump that ACKs a one-shot. The
+    // owner must drain its newly deferred tick before the blocking syscall.
+    if DELAY_TIMER_TICKS_PENDING.load(Ordering::Acquire) != 0 {
+        return ReceivePreparation::PendingDelivery;
+    }
     trace_iocp_receive_deadline();
     trace_registry_reply_receive();
     super::mounted_create_owner_trace::receive_boundary_snapshot();
     super::mounted_read_owner_trace::receive_boundary_snapshot();
     trace_retained_receive_owners();
+    ReceivePreparation::Ready
 }
 
-/// A nested pump may ACK a one-shot while leaving its delivery for the root
-/// queue owner. Observe that exact pending state before any blocking receive.
-fn trace_pending_tick_receive() {
-    static LAST_PRINT: AtomicU64 = AtomicU64::new(0);
-    static PRINTS: AtomicU64 = AtomicU64::new(0);
-    let ticks = DELAY_TIMER_TICKS_PENDING.load(Ordering::Acquire);
-    if ticks == 0 { return; }
-    let now = crate::nt_time_snapshot();
-    let previous = LAST_PRINT.load(Ordering::Relaxed);
-    if now.monotonic_100ns < previous.saturating_add(10_000_000) { return; }
-    LAST_PRINT.store(now.monotonic_100ns, Ordering::Relaxed);
-    let count = PRINTS.fetch_add(1, Ordering::Relaxed) + 1;
-    if count > 128 { return; }
-    let waiters = unsafe { &*core::ptr::addr_of!(crate::IO_COMPLETION_WAITERS) };
-    print_str(b"[pending-tick-receive] n/now/ticks=");
-    print_u64(count); print_str(b"/"); print_u64(now.monotonic_100ns);
-    print_str(b"/"); print_u64(ticks);
-    print_str(b" iocp/component-deadline=");
-    match waiters.next_deadline(now) {
-        Some(deadline) => print_u64(deadline),
-        None => print_str(b"-"),
-    }
-    print_str(b"/");
-    match unsafe { retained_deadline() } {
-        Some(deadline) => print_u64(deadline),
-        None => print_str(b"-"),
-    }
-    print_str(b" timer-source/deadline/physical-wake/armed/irq=");
-    print_u64(LAST_REARM_SOURCE.load(Ordering::Relaxed)); print_str(b"/");
-    print_u64(LAST_REARM_DEADLINE.load(Ordering::Relaxed)); print_str(b"/");
-    print_u64(LAST_REARM_AUTHORITY.physical_wake_100ns()); print_str(b"/");
-    print_u64(u64::from(LAST_REARM_AUTHORITY.is_armed())); print_str(b"/");
-    print_u64(DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire));
-    print_str(b"\n");
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReceivePreparation {
+    Ready,
+    PendingDelivery,
 }
 
 /// A finite IOCP wait must retain a wake before the root blocks. Capture the
