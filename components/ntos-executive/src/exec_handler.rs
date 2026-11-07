@@ -640,6 +640,7 @@ static NT_RAISE_EXCEPTION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EXPLORER_TP_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static IO_COMPLETION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WAIT_OBJECT_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static PROCESS_WAIT_REQUEST_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static SETUP_WAIT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static SETUP_WAIT_EVENT_INDEX: AtomicU64 = AtomicU64::new(0);
 static SETUP_WAIT_PROCESS_PI: AtomicU64 = AtomicU64::new(0);
@@ -1845,6 +1846,33 @@ fn trace_wait_object(
     timeout_ptr: u64,
     status: u32,
 ) {
+    if object.kind() == WaitObject::KIND_PROCESS {
+        if PROCESS_WAIT_REQUEST_TRACE_N.fetch_add(1, Ordering::Relaxed) < 64 {
+            let child_pid = object.id() as nt_process::ProcessId;
+            let child_pi = handler.pi_for_pid(child_pid);
+            print_str(b"[process-wait] phase=");
+            print_str(phase);
+            print_str(b" caller-pi/pid/gen/tid/child-pi-plus-one/pid/gen/handle/status/ready/timeout-ptr=");
+            for (index, value) in [
+                handler.pi as u64,
+                handler.pm_pid_for_pi(handler.pi).unwrap_or(0) as u64,
+                handler.hosted_process_generation(handler.pi).unwrap_or(0),
+                handler.current_tid,
+                child_pi.map_or(0, |pi| pi as u64 + 1),
+                child_pid as u64,
+                child_pi.and_then(|pi| handler.hosted_process_generation(pi)).unwrap_or(0),
+                handle,
+                status as u64,
+                handler.wait_object_ready(object) as u64,
+                timeout_ptr,
+            ].into_iter().enumerate() {
+                if index != 0 { print_str(b"/"); }
+                print_u64(value);
+            }
+            print_str(b"\n");
+        }
+        return;
+    }
     let trace_winlogon = handler.pi == 2
         && handler.current_badge == 4
         && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0

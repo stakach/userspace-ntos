@@ -19219,9 +19219,10 @@ unsafe fn wait_park_multi(
         retained += 1;
     }
     // Publish the semantic waiter before removing the Call from the current root slot.
+    let wait_sequence = next_dispatcher_wait_sequence();
     if !object_waiter_park(ObjectWaiterRecord::new(
         caller,
-        next_dispatcher_wait_sequence(),
+        wait_sequence,
         objects,
         &event_leases[..objects.len()],
         result_indices,
@@ -19245,6 +19246,33 @@ unsafe fn wait_park_multi(
     }
     reply_park.commit();
     WAIT_PARKED_COUNT.fetch_add(1, Ordering::Relaxed);
+    if let Some(object) = objects.first().filter(|object| object.kind() == WaitObject::KIND_PROCESS) {
+        static PROCESS_WAIT_PARK_TRACE_N: AtomicU64 = AtomicU64::new(0);
+        if PROCESS_WAIT_PARK_TRACE_N.fetch_add(1, Ordering::Relaxed) < 64 {
+            let child_pid = object.id() as nt_process::ProcessId;
+            let child_pi = handler.pi_for_pid(child_pid);
+            let caller_generation = match caller.process().generation {
+                nt_types::ProcessGeneration::Hosted(value)
+                | nt_types::ProcessGeneration::Temporary(value) => value,
+            };
+            print_str(b"[process-wait] phase=parked caller-pi/pid/gen/tid/child-pi-plus-one/pid/gen/seq/reply=");
+            for (index, value) in [
+                caller.pi() as u64,
+                caller.process().pid as u64,
+                caller_generation,
+                tid,
+                child_pi.map_or(0, |pi| pi as u64 + 1),
+                child_pid as u64,
+                child_pi.and_then(|pi| handler.hosted_process_generation(pi)).unwrap_or(0),
+                wait_sequence,
+                stolen,
+            ].into_iter().enumerate() {
+                if index != 0 { print_str(b"/"); }
+                print_u64(value);
+            }
+            print_str(b"\n");
+        }
+    }
     true
 }
 

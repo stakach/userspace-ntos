@@ -13,6 +13,7 @@ static TERMINATION_PENDING: AtomicBool = AtomicBool::new(false);
 static TERMINATION_ACTIVE: AtomicBool = AtomicBool::new(false);
 static FAILURES: AtomicU64 = AtomicU64::new(0);
 static LONG_WAIT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROCESS_WAIT_TERMINAL_TRACE_N: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn owns_thread(tid: u64) -> bool {
     unsafe {
@@ -179,6 +180,35 @@ unsafe fn finish(handler: &mut ExecNtHandler, id: Identity) -> u64 {
     let exact_caller_live = handler.validate_provider_logical_caller(record.caller);
     if exact_caller_live {
         thread_wait_state_clear_badge_ready(handler, record.caller.badge());
+    }
+    if record.count == 1 && record.objects[0].kind() == WaitObject::KIND_PROCESS
+        && PROCESS_WAIT_TERMINAL_TRACE_N.fetch_add(1, Ordering::Relaxed) < 64
+    {
+        let child_pid = record.objects[0].id() as nt_process::ProcessId;
+        let child_pi = handler.pi_for_pid(child_pid);
+        let caller_generation = match record.caller.process().generation {
+            nt_types::ProcessGeneration::Hosted(value)
+            | nt_types::ProcessGeneration::Temporary(value) => value,
+        };
+        let exit_status = handler.pm.wait_process(child_pid);
+        print_str(b"[process-wait] phase=reply caller-pi/pid/gen/tid/child-pi-plus-one/pid/gen/seq/status/exit-known/exit-status=");
+        for (index, value) in [
+            record.pi as u64,
+            record.caller.process().pid as u64,
+            caller_generation,
+            record.tid,
+            child_pi.map_or(0, |pi| pi as u64 + 1),
+            child_pid as u64,
+            child_pi.and_then(|pi| handler.hosted_process_generation(pi)).unwrap_or(0),
+            record.sequence,
+            status,
+            exit_status.is_some() as u64,
+            exit_status.unwrap_or(0) as u64,
+        ].into_iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(value);
+        }
+        print_str(b"\n");
     }
     if let Some((parked, reply)) = record.latency.ages_at_reply(finished_at) {
         static CSRSS_OBJECT_WAIT_SAMPLES: AtomicU64 = AtomicU64::new(0);
