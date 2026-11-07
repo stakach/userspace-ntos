@@ -466,6 +466,34 @@ static INTERFACE_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAST_EXISTING_RETRY_WORK_ID: AtomicU64 = AtomicU64::new(0);
 static LAST_EXISTING_RETRY_PHASE: AtomicU64 = AtomicU64::new(0);
 static EXISTING_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_REPLY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_REPLY_RECEIVE_WORK: AtomicU64 = AtomicU64::new(0);
+
+fn trace_hosted_reply(work: &Work, from: &'static str, effect_status: u32) {
+    let Caller::Hosted(caller) = &work.caller else { return; };
+    if from != "complete" && from != "ready-reply" && from != "reply-entered"
+        && from != "reply-sent" { return; }
+    HOSTED_REPLY_RECEIVE_WORK.store(work.id, Ordering::Release);
+    // Keep every transition through a bounded boot budget so a later caller is not sampled away.
+    let count = HOSTED_REPLY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count > 1024 { return; }
+    print_str(b"[registry-hosted-reply] n="); print_u64(count);
+    print_str(b" id="); print_u64(work.id);
+    print_str(b" pi/tid/reply="); print_u64(caller.pi as u64);
+    print_str(b"/"); print_u64(caller.tid);
+    print_str(b"/"); print_u64(caller.reply);
+    print_str(b" from="); print_str(from.as_bytes());
+    print_str(b" to="); print_str(phase_name(&work.phase).as_bytes());
+    print_str(b" status=0x"); print_hex(work.status);
+    print_str(b" effect=0x"); print_hex(effect_status);
+    print_str(b" cancelled="); print_u64(u64::from(work.cancelled));
+    print_str(b"\n");
+}
+
+/// One copied work identity for the first root receive after a hosted Reply phase transition.
+pub(crate) fn take_hosted_reply_receive_work() -> u64 {
+    HOSTED_REPLY_RECEIVE_WORK.swap(0, Ordering::AcqRel)
+}
 
 fn next_work_id() -> u64 {
     let id = NEXT_WORK_ID.fetch_add(1, Ordering::Relaxed);
@@ -1302,8 +1330,12 @@ unsafe fn redrive_inner(mut context: HostedContext<'_>) -> bool {
             *core::ptr::addr_of_mut!(EXECUTING) =
                 if matches!(work.phase, Phase::ReconcileRuntime) { None } else { work.caller.logical() };
             let previous_phase = phase_progress_fingerprint(&work.phase);
+            let previous_name = phase_name(&work.phase);
             let mut admit_retry_substage = AdmitRetrySubstage::None;
-            match advance(&mut context, &mut work, &mut admit_retry_substage) {
+            let result = advance(&mut context, &mut work, &mut admit_retry_substage);
+            trace_hosted_reply(&work, previous_name,
+                result.as_ref().err().copied().unwrap_or(0) as u32);
+            match result {
                 Ok(true) => { completed = true; immediate_progress = true; break; }
                 Ok(false) => {
                     immediate_progress = previous_phase != phase_progress_fingerprint(&work.phase);

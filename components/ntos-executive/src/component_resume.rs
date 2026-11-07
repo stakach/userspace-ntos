@@ -273,9 +273,38 @@ pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) {
     state
         .prepare(|| reconcile_runtime(handler))
         .expect("runtime timer ownership must permit blocking receive");
+    trace_registry_reply_receive();
     super::mounted_create_owner_trace::receive_boundary_snapshot();
     super::mounted_read_owner_trace::receive_boundary_snapshot();
     trace_retained_receive_owners();
+}
+
+/// Capture the first blocking receive after a hosted registry Reply transition.
+fn trace_registry_reply_receive() {
+    static PRINTS: AtomicU64 = AtomicU64::new(0);
+    let work = crate::registry_mutation_work::take_hosted_reply_receive_work();
+    if work == 0 { return; }
+    let count = PRINTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if count > 1024 { return; }
+    let now = monotonic_time_100ns();
+    print_str(b"[registry-reply-receive] n/id/now-ms=");
+    print_u64(count); print_str(b"/"); print_u64(work);
+    print_str(b"/"); print_u64(now / 10_000);
+    print_str(b" pending/next-ms=");
+    print_u64(crate::registry_mutation_work::pending_count());
+    print_str(b"/");
+    match crate::registry_mutation_work::next_deadline() {
+        Some(deadline) => print_u64(deadline / 10_000),
+        None => print_str(b"-"),
+    }
+    print_str(b" timer-source/deadline-ms/rearm-ms/armed/irq/ticks=");
+    print_u64(LAST_REARM_SOURCE.load(Ordering::Relaxed)); print_str(b"/");
+    print_u64(LAST_REARM_DEADLINE.load(Ordering::Relaxed) / 10_000); print_str(b"/");
+    print_u64(LAST_REARM_NOW.load(Ordering::Relaxed) / 10_000); print_str(b"/");
+    print_u64(u64::from(LAST_REARM_AUTHORITY.is_armed())); print_str(b"/");
+    print_u64(DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire)); print_str(b"/");
+    print_u64(DELAY_TIMER_TICKS_PENDING.load(Ordering::Relaxed));
+    print_str(b"\n");
 }
 
 /// The final root receive boundary is the last point that can explain an all-HLT
