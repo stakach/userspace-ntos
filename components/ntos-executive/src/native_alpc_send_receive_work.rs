@@ -26,7 +26,6 @@ const STATUS_PENDING: i32 = 0x0000_0103;
 const MAX_OWNERS: usize = 64;
 
 static NEXT_INVOCATION: AtomicU64 = AtomicU64::new(1);
-static DIAG_LSASS_PENDING: AtomicU64 = AtomicU64::new(0);
 static mut OWNERS: Vec<OwnedReceive> = Vec::new();
 static mut NEXT_OWNER: usize = 0;
 
@@ -408,16 +407,6 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) -> Option<(u64, u64)> 
                 print_str(b" detail1="); print_hex_u64(detail1);
                 print_str(b"\n");
                 if status == STATUS_PENDING { owner.logged_pending = true; }
-            }
-            if owner.pi == 10
-                && (status != STATUS_PENDING
-                    || DIAG_LSASS_PENDING.fetch_add(1, Ordering::Relaxed) < 16) {
-                print_str(b"[alpc-receive-diag] lsass tid="); print_u64(caller.thread);
-                print_str(b" status="); print_hex(status as u32);
-                print_str(b" info="); print_hex_u64(info);
-                print_str(b" d0="); print_hex_u64(detail0);
-                print_str(b" d1="); print_hex_u64(detail1);
-                print_str(b"\n");
             }
             if status == STATUS_PENDING {
                 owner.flight = if owner.retained.continue_pending(request_id, caller).is_ok() {
