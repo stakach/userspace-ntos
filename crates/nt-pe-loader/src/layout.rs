@@ -51,6 +51,32 @@ impl PeLayout {
         self.headers.size_of_image
     }
 
+    /// Resolve one contiguous RVA range to its raw File offset. This is the same
+    /// section/header lookup used by `PeFile::bytes_at_rva`, with the File extent
+    /// supplied independently of any resident image buffer.
+    pub fn file_span_at_rva(&self, rva: u32, len: usize, file_size: u64) -> Option<u64> {
+        let length = u32::try_from(len).ok()?;
+        let end_rva = rva.checked_add(length)?;
+        let offset = if rva < self.headers.size_of_headers
+            && end_rva <= self.headers.size_of_headers
+        {
+            u64::from(rva)
+        } else {
+            let section = self.sections().iter().find(|section| {
+                rva.checked_sub(section.virtual_address).is_some_and(|delta| {
+                    delta <= section.size_of_raw_data
+                        && length <= section.size_of_raw_data.saturating_sub(delta)
+                })
+            })?;
+            u64::from(section.pointer_to_raw_data)
+                .checked_add(u64::from(rva - section.virtual_address))?
+        };
+        offset
+            .checked_add(len as u64)
+            .filter(|end| *end <= file_size)
+            .map(|_| offset)
+    }
+
     /// NT SEC_IMAGE protection for a page, including private write-copy sections.
     pub fn image_protection_at(&self, rva: u32) -> ImageProtection {
         if rva < page_align_up(self.headers.size_of_headers) {

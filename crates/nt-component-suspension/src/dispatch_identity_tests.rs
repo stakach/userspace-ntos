@@ -188,6 +188,31 @@ fn callback_to_service_wait_transfers_only_the_exact_lower_external_token() {
 }
 
 #[test]
+fn nested_in_callback_service_wait_keeps_the_running_outer_callback() {
+    let mut lanes = Lanes::new(1, 4);
+    let lane = lanes.allocate(binding(1)).unwrap();
+    let reply = binding(1).reply_object;
+    lanes.begin_dispatch(lane, reply).unwrap();
+    let dispatch = identity(&lanes, lane);
+    lanes.suspend_running(lane, reply, 10).unwrap();
+    lanes.resume_external(lane, reply, 10).unwrap();
+    lanes.suspend_running(lane, reply, 41).unwrap();
+    let key = SuspensionKey::service_wait(71);
+    assert_eq!(lanes.admit_in_callback_service_wait_external_owned(
+        lane, reply, dispatch, 11, 41, key, 1, owner(1), 99,
+    ), Err((LaneError::InvalidPhase, 99)));
+    assert_eq!(lanes.external_depth(lane), Ok(2));
+    lanes.admit_in_callback_service_wait_external_owned(
+        lane, reply, dispatch, 10, 41, key, 1, owner(1), 99,
+    ).unwrap();
+    // This syscall yielded while callback 10 is still running. The service token 41 is now
+    // parked on top, and later completion must be able to resume callback 10 beneath it.
+    assert_eq!(lanes.external_top(lane), Ok(Some(41)));
+    assert_eq!(lanes.external_depth(lane), Ok(2));
+    assert_eq!(lanes.top(lane).unwrap().unwrap().key, key);
+}
+
+#[test]
 fn idle_completion_and_next_job_have_distinct_authority() {
     let mut lanes = Lanes::new(1, 4);
     let lane = lanes.allocate(binding(1)).unwrap();

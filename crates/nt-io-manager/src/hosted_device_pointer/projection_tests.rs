@@ -207,7 +207,7 @@ fn native_projection_retirement_retries_busy_before_freeing_projection() {
         .unwrap();
     let function = &function[..end];
     let retire = function
-        .find("retire_hosted_device_pointer(registration)")
+        .find("hosted_device_allocations::retire_canonical_pointer(io_manager_mut(), registration)")
         .unwrap();
     let free = function
         .find("retire_hosted_device_projection(")

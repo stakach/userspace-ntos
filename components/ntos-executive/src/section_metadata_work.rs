@@ -17,6 +17,8 @@ const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xc000_009a;
 const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xc000_007b;
 const RETRY_DELAY: u64 = 1_000_000;
 const IMAGE_HEADER_READ_SIZE: usize = 0x1000;
+const IMAGE_HEADER_WINDOW_SIZE: usize = 2 * IMAGE_HEADER_READ_SIZE;
+const IMAGE_TIMING_SAMPLE_LIMIT: u64 = 64;
 
 pub(crate) struct ImageObjectName {
     pub(crate) root_index: usize,
@@ -91,6 +93,10 @@ impl ReservedSection {
 }
 
 struct Work {
+    // Observation only: elapsed time for the first bounded set of routed image requests.
+    timing_started_100ns: u64,
+    timing_header_ready_100ns: Option<u64>,
+    timing_trace_pending: bool,
     caller: NativeHandleCaller,
     logical: ProviderLogicalCaller,
     reference: NativeThreadProcessReference,
@@ -118,8 +124,11 @@ struct Work {
     metadata_id: Option<PendingSectionMetadataId>,
     file_metadata: Option<nt_memory_manager::RoutedSectionMetadata>,
     image_header: Vec<u8>,
+    sparse_image: Option<nt_pe_loader::IncrementalImageLayoutCapture>,
+    image_layout: Option<nt_pe_loader::PeLayout>,
     image_path: Option<Vec<u8>>,
     observation_target: Option<nt_exe_image::CapturedImageObservation>,
+    registered_file: Option<nt_memory_manager::SectionFileIdentity>,
     reserved: Option<ReservedSection>,
     published_handle: Option<u64>,
     phase: Phase,
@@ -136,7 +145,66 @@ static EXECUTING_PI: AtomicU64 = AtomicU64::new(u64::MAX);
 static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 static EXECUTING_ADMISSION_RELEASED: AtomicBool = AtomicBool::new(false);
 static CURSOR: AtomicU64 = AtomicU64::new(0);
-static NEXT: AtomicU64 = AtomicU64::new(0);
+static WAKE: nt_time::CoalescedRetryWake = nt_time::CoalescedRetryWake::new();
+static ROUTED_OBSERVATION_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static IMAGE_NOT_SUPPORTED_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static IMAGE_TIMING_TRACE_N: AtomicU64 = AtomicU64::new(0);
+
+fn trace_image_timing(work: &mut Work) {
+    if !work.timing_trace_pending { return; }
+    work.timing_trace_pending = false;
+    let ready = monotonic_time_100ns();
+    print_str(b"[section-image-timing] tid/file/status/header-ms/after-header-ms/total-ms=");
+    print_u64(work.tid);
+    print_str(b"/");
+    print_hex_u64(work.file_handle);
+    print_str(b"/");
+    print_hex_u64(u64::from(work.status));
+    print_str(b"/");
+    if let Some(header) = work.timing_header_ready_100ns {
+        print_u64(header.saturating_sub(work.timing_started_100ns) / 10_000);
+        print_str(b"/");
+        print_u64(ready.saturating_sub(header) / 10_000);
+    } else {
+        print_str(b"-/-");
+    }
+    print_str(b"/");
+    print_u64(ready.saturating_sub(work.timing_started_100ns) / 10_000);
+    print_str(b"\n");
+}
+
+fn trace_image_not_supported(work: &Work, phase: &[u8], status: u32) {
+    if work.allocation_attrs & 0x0100_0000 == 0 || status != 0xc000_00bb
+        || IMAGE_NOT_SUPPORTED_TRACE_N.fetch_add(1, Ordering::Relaxed) >= 8
+    { return; }
+    print_str(b"[section-image-not-supported] phase=");
+    print_str(phase);
+    print_str(b" tid=");
+    print_u64(work.tid);
+    print_str(b" file=0x");
+    print_hex(work.file_handle as u32);
+    print_str(b"\n");
+}
+
+fn finish_sparse_header_window(work: &mut Work) {
+    let capture = work.sparse_image.as_mut().expect("sparse image header owner");
+    match capture.complete_window(&work.image_header) {
+        Ok(Some(layout)) => {
+            work.image_header.clear();
+            work.image_layout = Some(layout);
+            work.timing_header_ready_100ns = Some(monotonic_time_100ns());
+            work.phase = Phase::Publish;
+        }
+        Ok(None) => {
+            work.image_header.clear();
+            work.phase = Phase::HeaderDispatch;
+        }
+        Err(_) => {
+            work.status = STATUS_INVALID_IMAGE_FORMAT;
+            work.phase = Phase::ReadyReply;
+        }
+    }
+}
 
 struct Submission {
     output: u64,
@@ -382,7 +450,13 @@ unsafe fn retain_work(
     }
     let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     assert_ne!(reply, 0);
+    let timing_trace_pending = submission.allocation_attrs & 0x0100_0000 != 0
+        && submission.mount.is_some()
+        && IMAGE_TIMING_TRACE_N.fetch_add(1, Ordering::Relaxed) < IMAGE_TIMING_SAMPLE_LIMIT;
     let work = Work {
+        timing_started_100ns: monotonic_time_100ns(),
+        timing_header_ready_100ns: None,
+        timing_trace_pending,
         caller,
         logical,
         reference,
@@ -410,8 +484,11 @@ unsafe fn retain_work(
         metadata_id,
         file_metadata: None,
         image_header: Vec::new(),
+        sparse_image: None,
+        image_layout: None,
         image_path: submission.image_path,
         observation_target: submission.observation_target,
+        registered_file: None,
         reserved: reserved
             .and_then(|slot| slot.take())
             .map(ReservedSection::Data),
@@ -426,7 +503,7 @@ unsafe fn retain_work(
         None => rows.push(Some(work)),
     }
     park.commit();
-    NEXT.store(monotonic_time_100ns(), Ordering::Release);
+    WAKE.publish(monotonic_time_100ns());
     assert!(!TRANSFERRED.swap(true, Ordering::AcqRel));
     Ok(())
 }
@@ -459,14 +536,71 @@ pub(crate) fn has_process(pi: usize, preserve_tid: Option<u64>) -> bool {
         }
 }
 
+fn has_work() -> bool {
+    EXECUTING_TID.load(Ordering::Acquire) != 0
+        || unsafe { (&*core::ptr::addr_of!(WORK)).iter().any(Option::is_some) }
+}
+
 pub(crate) fn next_deadline() -> Option<u64> {
-    (EXECUTING_TID.load(Ordering::Acquire) != 0
-        || unsafe { (&*core::ptr::addr_of!(WORK)).iter().any(Option::is_some) })
-    .then(|| NEXT.load(Ordering::Acquire))
+    WAKE.next_deadline(has_work())
+}
+
+/// Periodic read-only census at the serialized service-loop boundary.
+pub(crate) fn census_snapshot() -> (Option<u64>, bool, u64, usize) {
+    let pending = unsafe { (&*core::ptr::addr_of!(WORK)).iter().filter(|work| work.is_some()).count() };
+    (next_deadline(), ACTIVE.load(Ordering::Acquire),
+        EXECUTING_TID.load(Ordering::Acquire), pending)
+}
+
+/// One exact retained owner for bounded receive-boundary diagnostics. Zero means
+/// the corresponding File capture or IRP is not owned in this phase.
+pub(crate) fn receive_owner_snapshot() -> Option<[u64; 8]> {
+    let work = unsafe { (&*core::ptr::addr_of!(WORK)).iter().flatten().next()? };
+    Some(receive_owner_fields(work))
+}
+
+fn receive_owner_fields(work: &Work) -> [u64; 8] {
+    let (phase, irp) = match &work.phase {
+        Phase::Query => (1, 0),
+        Phase::Pending { irp, .. } => (2, irp.raw()),
+        Phase::Copying { irp, .. } => (3, irp.raw()),
+        Phase::AckPending { irp } => (4, irp.raw()),
+        Phase::HeaderDispatch => (5, 0),
+        Phase::HeaderPending { irp, .. } => (6, irp.raw()),
+        Phase::HeaderCopying { irp, .. } => (7, irp.raw()),
+        Phase::HeaderAckPending { irp } => (8, irp.raw()),
+        Phase::Publish => (9, 0),
+        Phase::CopyOut => (10, 0),
+        Phase::ReadyReply => (11, 0),
+        Phase::ReplyEntered => (12, 0),
+        Phase::ReplySent => (13, 0),
+        Phase::RevokeReply => (14, 0),
+        Phase::RetypeReply => (15, 0),
+        Phase::ReconcileRuntime => (16, 0),
+        Phase::Indeterminate => (17, 0),
+    };
+    [
+        work.pi as u64, work.tid, work.file_handle,
+        work.capture.as_ref().map_or(0, |capture| capture.file_id()),
+        phase, irp, work.reply,
+        unsafe { (&*core::ptr::addr_of!(WORK)).iter().flatten().count() } as u64,
+    ]
+}
+
+pub(crate) fn trace_receive_owner_rows() {
+    let rows = unsafe { &*core::ptr::addr_of!(WORK) };
+    for work in rows.iter().flatten().take(4) {
+        print_str(b"[retained-receive-section] pi/tid/handle/file/phase/irp/reply/count=");
+        for (index, value) in receive_owner_fields(work).into_iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(value);
+        }
+        print_str(b"\n");
+    }
 }
 
 pub(crate) fn wake_due(now: u64) -> u64 {
-    u64::from(next_deadline().is_some_and(|deadline| now >= deadline))
+    u64::from(WAKE.wake_due(now, has_work()))
 }
 
 enum Step {
@@ -476,9 +610,10 @@ enum Step {
 }
 
 pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler, queue: &mut nt_delay_execution::Queue) {
-    if next_deadline().is_none_or(|deadline| monotonic_time_100ns() < deadline)
-        || ACTIVE.swap(true, Ordering::AcqRel)
-    {
+    let Some(wake_attempt) = WAKE.begin_redrive(monotonic_time_100ns(), has_work()) else {
+        return;
+    };
+    if ACTIVE.swap(true, Ordering::AcqRel) {
         return;
     }
     let _durable = allocator::enter_durable();
@@ -548,10 +683,7 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler, queue: &mut nt_delay_e
         EXECUTING_ADMISSION_RELEASED.store(false, Ordering::Release);
         EXECUTING_INDEX.store(u64::MAX, Ordering::Release);
     }
-    NEXT.store(
-        monotonic_time_100ns().saturating_add(RETRY_DELAY),
-        Ordering::Release,
-    );
+    wake_attempt.retry_at(monotonic_time_100ns().saturating_add(RETRY_DELAY));
     ACTIVE.store(false, Ordering::Release);
 }
 
@@ -722,6 +854,40 @@ unsafe fn advance(
                     .expect("Section metadata did not reach a terminal phase");
                 match result {
                     Ok(metadata) => {
+                        if work.allocation_attrs & 0x0100_0000 != 0 && !metadata.is_directory {
+                            let physical_file = work.capture.as_ref()
+                                .and_then(|capture| mounted_volume::physical_exec_file_alias(
+                                    capture.device_id(), metadata.file,
+                                ));
+                            let observation = physical_file
+                                .and_then(|file| handler.loop_ctx.and_then(|ctx| {
+                                    // The catalog is loop-owned and this metadata completion is
+                                    // serialized before image Section publication.
+                                    unsafe { (&*ctx.exe_image_catalog).observation_for_backing(file) }
+                                }));
+                            if let Some(observation) = observation {
+                                if work.observation_target.is_some_and(|existing| existing != observation) {
+                                    work.capture.take();
+                                    work.status = STATUS_INVALID_IMAGE_FORMAT;
+                                    work.phase = Phase::ReadyReply;
+                                    return Step::Progress;
+                                }
+                                work.observation_target = Some(observation);
+                                work.registered_file = physical_file;
+                                let n = ROUTED_OBSERVATION_TRACE_N.fetch_add(1, Ordering::Relaxed);
+                                if n < 8 {
+                                    print_str(b"[routed-image-observation] pi/role/target-pi/generation=");
+                                    print_u64(work.pi as u64);
+                                    print_str(b"/");
+                                    print_u64(observation.target().role as u64);
+                                    print_str(b"/");
+                                    print_u64(observation.target().pi as u64);
+                                    print_str(b"/");
+                                    print_u64(observation.target().generation);
+                                    print_str(b"\n");
+                                }
+                            }
+                        }
                         work.file_metadata = Some(metadata);
                         work.phase = if work.allocation_attrs & 0x0100_0000 != 0 {
                             Phase::HeaderDispatch
@@ -898,36 +1064,126 @@ unsafe fn advance(
                 return Step::Progress;
             }
             let metadata = work.file_metadata.expect("image file metadata");
-            let offset = work.image_header.len();
-            let Ok(file_size) = usize::try_from(metadata.end_of_file) else {
-                work.status = STATUS_INSUFFICIENT_RESOURCES;
-                work.phase = Phase::ReadyReply;
-                return Step::Progress;
+            // The installed File's exact immutable extent authorizes retained page reads
+            // after publication. Boot reads may finish inline; native mounted reads retain
+            // this Section owner and capture only the bounded PE header windows.
+            let boot_layout_reads = unsafe { crate::fs_loader::exec_fs_mount_identity() }
+                .and_then(crate::fs_loader::exec_block_route_kind)
+                == Some(nt_fs::BlockSourceKind::Boot);
+            if work.image_header.is_empty() && work.image_layout.is_none()
+                && work.sparse_image.is_none()
+            {
+                let capture = work.capture.as_ref().expect("image header File capture");
+                let immutable = driver_launch::io_manager_mut().immutable_file_extent(
+                    nt_types::ClientId(driver_launch::IO_MANAGER_COMPONENT_ID),
+                    FileId(capture.file_id()),
+                    DeviceId(capture.device_id()),
+                    capture.fs_context(),
+                );
+                match immutable {
+                    Ok(Some(extent)) if extent == metadata.end_of_file && !metadata.is_directory => {
+                        if boot_layout_reads {
+                            let layout = nt_pe_loader::capture_image_layout(extent, |offset, output| {
+                                let (status, read) = crate::routed_section_io::read_retained(
+                                    capture.file_id(), capture.device_id(), capture.fs_context(),
+                                    offset, output,
+                                );
+                                if status == 0 { Ok(read) } else { Err(status) }
+                            });
+                            match layout {
+                                Ok(layout) => {
+                                    work.image_layout = Some(layout);
+                                    work.timing_header_ready_100ns = Some(monotonic_time_100ns());
+                                    work.phase = Phase::Publish;
+                                }
+                                Err(nt_pe_loader::ImageHeaderCaptureError::Read(status)) => {
+                                    work.status = status;
+                                    work.phase = Phase::ReadyReply;
+                                }
+                                Err(nt_pe_loader::ImageHeaderCaptureError::ShortRead { .. }) => {
+                                    work.status = 0xc000_0185;
+                                    work.phase = Phase::ReadyReply;
+                                }
+                                Err(nt_pe_loader::ImageHeaderCaptureError::Parse(_)) => {
+                                    work.status = STATUS_INVALID_IMAGE_FORMAT;
+                                    work.phase = Phase::ReadyReply;
+                                }
+                            }
+                            return Step::Progress;
+                        }
+                        print_str(b"[section-image] retained sparse header extent=");
+                        print_u64(extent);
+                        print_str(b"\n");
+                        work.sparse_image = Some(nt_pe_loader::IncrementalImageLayoutCapture::new(extent));
+                    }
+                    Ok(Some(_)) => {
+                        work.status = STATUS_INVALID_IMAGE_FORMAT;
+                        work.phase = Phase::ReadyReply;
+                        return Step::Progress;
+                    }
+                    Ok(None) => {}
+                    Err(status) => {
+                        work.status = status.raw() as u32;
+                        work.phase = Phase::ReadyReply;
+                        return Step::Progress;
+                    }
+                }
+            }
+            let (offset, length) = if let Some(sparse) = work.sparse_image.as_ref() {
+                let Some(window) = sparse.next_window() else {
+                    work.status = STATUS_INVALID_IMAGE_FORMAT;
+                    work.phase = Phase::ReadyReply;
+                    return Step::Progress;
+                };
+                (window.offset, window.length)
+            } else {
+                let offset = work.image_header.len();
+                let Ok(file_size) = usize::try_from(metadata.end_of_file) else {
+                    work.status = STATUS_INSUFFICIENT_RESOURCES;
+                    work.phase = Phase::ReadyReply;
+                    return Step::Progress;
+                };
+                if metadata.is_directory || file_size == 0 || offset > file_size {
+                    work.status = STATUS_INVALID_IMAGE_FORMAT;
+                    work.phase = Phase::ReadyReply;
+                    return Step::Progress;
+                }
+                if offset == file_size {
+                    if nt_pe_loader::PeFile::parse(&work.image_header).is_ok() {
+                        work.phase = Phase::Publish;
+                    } else {
+                        work.status = STATUS_INVALID_IMAGE_FORMAT;
+                        work.phase = Phase::ReadyReply;
+                    }
+                    return Step::Progress;
+                }
+                if nt_pe_loader::reserve_file_snapshot_capacity(&mut work.image_header, file_size)
+                    .is_err()
+                {
+                    work.status = STATUS_INSUFFICIENT_RESOURCES;
+                    work.phase = Phase::ReadyReply;
+                    return Step::Progress;
+                }
+                (offset as u64, IMAGE_HEADER_READ_SIZE.min(file_size - offset))
             };
-            if metadata.is_directory || file_size == 0 || offset > file_size {
+            if length == 0 || length > IMAGE_HEADER_WINDOW_SIZE {
                 work.status = STATUS_INVALID_IMAGE_FORMAT;
                 work.phase = Phase::ReadyReply;
                 return Step::Progress;
             }
-            if offset as u64 == metadata.end_of_file {
-                if nt_pe_loader::PeFile::parse(&work.image_header).is_ok() {
-                    work.phase = Phase::Publish;
-                } else {
-                    work.status = STATUS_INVALID_IMAGE_FORMAT;
-                    work.phase = Phase::ReadyReply;
-                }
-                return Step::Progress;
-            }
-            let length = IMAGE_HEADER_READ_SIZE.min(file_size - offset);
-            if nt_pe_loader::reserve_file_snapshot_capacity(&mut work.image_header, file_size)
-                .is_err()
-            {
+            if work.image_header.try_reserve_exact(length).is_err() {
                 work.status = STATUS_INSUFFICIENT_RESOURCES;
                 work.phase = Phase::ReadyReply;
                 return Step::Progress;
             }
             let capture = work.capture.as_ref().expect("image header File capture");
-            let mut output = [0u8; IMAGE_HEADER_READ_SIZE];
+            let mut output = Vec::new();
+            if output.try_reserve_exact(length).is_err() {
+                work.status = STATUS_INSUFFICIENT_RESOURCES;
+                work.phase = Phase::ReadyReply;
+                return Step::Progress;
+            }
+            output.resize(length, 0);
             let result = driver_launch::io_manager_mut().build_and_dispatch_external_to_device(
                 nt_types::ClientId(driver_launch::IO_MANAGER_COMPONENT_ID),
                 DeviceId(capture.device_id()),
@@ -938,7 +1194,7 @@ unsafe fn advance(
                 IoParameters::Read(nt_io_manager::ReadWriteParameters {
                     length: length as u32,
                     key: 0,
-                    offset: offset as u64,
+                    offset,
                 }),
                 0,
                 length as u32,
@@ -954,6 +1210,9 @@ unsafe fn advance(
                     if !work.cancelled {
                         crate::note_boot_progress(crate::BootProgress::ImageSnapshotCaptured);
                     }
+                    if work.sparse_image.is_some() {
+                        finish_sparse_header_window(work);
+                    }
                 }
                 Ok(ExternalDispatchResult::Completed { status, .. }) => {
                     work.status = if status.raw() == 0 {
@@ -961,6 +1220,7 @@ unsafe fn advance(
                     } else {
                         status.raw() as u32
                     };
+                    trace_image_not_supported(work, b"header-inline", work.status);
                     work.phase = Phase::ReadyReply;
                 }
                 Ok(ExternalDispatchResult::Pending { irp_id }) => {
@@ -971,6 +1231,7 @@ unsafe fn advance(
                 }
                 Err(status) => {
                     work.status = status.raw() as u32;
+                    trace_image_not_supported(work, b"header-dispatch", work.status);
                     work.phase = Phase::ReadyReply;
                 }
             }
@@ -1010,6 +1271,7 @@ unsafe fn advance(
                 } else {
                     completion.status
                 };
+                trace_image_not_supported(work, b"header-terminal", work.status);
                 work.phase = Phase::HeaderAckPending { irp };
             }
             Step::Progress
@@ -1024,7 +1286,7 @@ unsafe fn advance(
             let copied = match driver_launch::copy_completed_irp_output_exact(
                 irp.raw(),
                 offset as u64,
-                &mut bytes[..remaining],
+                &mut bytes[..remaining.min(IMAGE_HEADER_READ_SIZE)],
             ) {
                 Ok(copied) if copied != 0 && copied <= remaining => copied,
                 _ => return Step::Wait,
@@ -1053,11 +1315,15 @@ unsafe fn advance(
             if work.status == 0 && !work.cancelled {
                 crate::note_boot_progress(crate::BootProgress::ImageSnapshotCaptured);
             }
-            work.phase = if work.status == 0 {
-                Phase::HeaderDispatch
+            if work.status == 0 && work.sparse_image.is_some() {
+                finish_sparse_header_window(work);
             } else {
-                Phase::ReadyReply
-            };
+                work.phase = if work.status == 0 {
+                    Phase::HeaderDispatch
+                } else {
+                    Phase::ReadyReply
+                };
+            }
             Step::Progress
         }
         Phase::Publish => {
@@ -1094,8 +1360,10 @@ unsafe fn advance(
                             capture,
                             metadata,
                             header: core::mem::take(&mut work.image_header),
+                            layout: work.image_layout.take(),
                             image_path: work.image_path.take().expect("captured image File name"),
                             observation_target: work.observation_target,
+                            registered_file: work.registered_file,
                             name: work.image_name.take(),
                         },
                     )
@@ -1127,6 +1395,7 @@ unsafe fn advance(
                     return Step::Progress;
                 }
                 Err(status) => {
+                    trace_image_not_supported(work, b"publish", status);
                     work.status = status;
                 }
             }
@@ -1194,6 +1463,8 @@ unsafe fn advance(
             }
         }
         Phase::ReadyReply => {
+            trace_image_timing(work);
+            trace_image_not_supported(work, b"reply", work.status);
             if work.cancelled {
                 if let Some(handle) = work
                     .published_handle

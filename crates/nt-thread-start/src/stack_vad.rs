@@ -179,14 +179,15 @@ pub fn prepare_initial_into<'a, const N: usize>(
     })
 }
 
-// Walk extents, not every page in a potentially large reservation. Protection overrides on
-// already usable stack pages are deliberately preserved; only the actual guard is consumed.
-fn check_allocation<const N: usize>(
+// A newly created user stack can have several committed guard pages below the INITIAL_TEB
+// StackLimit. Validate the whole committed prefix for both admission and later guard growth.
+// Protection overrides on usable pages are preserved; only the faulted guard is consumed.
+fn check_existing_allocation<const N: usize>(
     map: &VmRegionMap<N>,
     geometry: StackGeometry,
 ) -> Result<(), StackVadError> {
-    let committed_base = geometry.committed_base();
     let mut address = geometry.allocation_base;
+    let mut committed = false;
     while address < geometry.stack_base {
         let extent = map
             .extent_at(address)
@@ -195,25 +196,42 @@ fn check_allocation<const N: usize>(
             .base
             .checked_add(extent.size)
             .ok_or(StackVadError::AllocationChanged)?;
-        let expected_state = if address < committed_base {
-            VmExtentState::Reserved
-        } else {
-            VmExtentState::Committed
-        };
         if extent.allocation_base != geometry.allocation_base
             || extent.type_ != MEM_PRIVATE
-            || extent.state != expected_state
             || end <= address
             || end > geometry.stack_base
-            || (address < committed_base && end > committed_base)
         {
             return Err(StackVadError::AllocationChanged);
         }
+        match extent.state {
+            VmExtentState::Reserved if !committed && end <= geometry.stack_limit => {}
+            VmExtentState::Committed => {
+                committed = true;
+                let mut page = address;
+                while page < end.min(geometry.stack_limit) {
+                    let protection = map
+                        .protection_at(page)
+                        .ok_or(StackVadError::AllocationChanged)?;
+                    if protection & PAGE_GUARD == 0
+                        || check_protection(protection & !PAGE_GUARD).is_err()
+                    {
+                        return Err(StackVadError::AllocationChanged);
+                    }
+                    page += PAGE_SIZE;
+                }
+            }
+            _ => return Err(StackVadError::AllocationChanged),
+        }
         address = end;
     }
-    if map
-        .extent_at(geometry.stack_base)
-        .is_some_and(|extent| extent.allocation_base == geometry.allocation_base)
+    if !committed
+        || map.extent_at(geometry.stack_limit).is_none_or(|extent| {
+            extent.allocation_base != geometry.allocation_base
+                || extent.state != VmExtentState::Committed
+        })
+        || map
+            .extent_at(geometry.stack_base)
+            .is_some_and(|extent| extent.allocation_base == geometry.allocation_base)
     {
         return Err(StackVadError::AllocationChanged);
     }
@@ -223,10 +241,9 @@ fn check_allocation<const N: usize>(
 /// Validate a caller's existing private stack without changing its VAD, accounting or RSP.
 ///
 /// The supplied INITIAL_TEB must describe the complete allocation and its committed suffix.
-/// A guard is inferred only from the actual page immediately below StackLimit, within this
-/// allocation, and must use the managed growth model's RW or executable-RW protection. RSP
-/// must identify a writable, non-guard byte in [StackLimit, StackBase). Other committed-page
-/// protections are preserved, not normalized. This validates metadata in the supplied map;
+/// Each committed page below StackLimit must be a guard in the same allocation. The nearest
+/// guard is reported in the returned geometry. Initial RSP may equal StackBase before the first push, provided the top byte is
+/// writable. Other committed-page protections are preserved. This validates the supplied map;
 /// the caller still owns process identity, physical mapping and concurrent-mutation checks.
 pub fn validate_existing<const N: usize>(
     map: &VmRegionMap<N>,
@@ -249,8 +266,13 @@ pub fn validate_existing<const N: usize>(
             }
         }
     }
-    check_allocation(map, geometry)?;
-    if rsp < geometry.stack_limit || rsp >= geometry.stack_base || !map.permits_write(rsp) {
+    check_existing_allocation(map, geometry)?;
+    let rsp_byte = if rsp == geometry.stack_base {
+        rsp - 1
+    } else {
+        rsp
+    };
+    if rsp < geometry.stack_limit || rsp > geometry.stack_base || !map.permits_write(rsp_byte) {
         return Err(StackVadError::InvalidStackPointer);
     }
     Ok(geometry)
@@ -281,7 +303,7 @@ pub fn prepare_guard_growth_into<'a, const N: usize>(
     {
         return Err(StackVadError::NotStackGuard);
     }
-    check_allocation(before, geometry)?;
+    check_existing_allocation(before, geometry)?;
 
     let mut next = StackGeometry {
         guard_base: None,

@@ -113,25 +113,25 @@ pub(super) unsafe fn consume(
     let Some(domain) = instance_domain_identity(inst) else {
         return refused;
     };
-    let Some(active) = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
+    let Some((shared_va, transfer_id, source_instance)) = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
         .as_ref()
         .and_then(|rows| rows.last())
-        .copied()
+        .map(|active| (active.shared_va, active.transfer_id, active.source_instance))
     else {
         return refused;
     };
-    if active.shared_va != ch.shared_va
-        || active.source_instance != instance_index
+    if shared_va != ch.shared_va
+        || source_instance != instance_index
         || !hosted_source_irp_ledger::active_caller_projection_matches(
             instance_index,
-            active.transfer_id,
+            transfer_id,
             raw_irp,
             nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS,
         )
     {
         return refused;
     }
-    let nested_irp = IrpId(active.transfer_id);
+    let nested_irp = IrpId(transfer_id);
     let rows = &mut *core::ptr::addr_of_mut!(ROWS);
     let Some(row) = rows
         .iter_mut()

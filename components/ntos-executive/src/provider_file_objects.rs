@@ -122,7 +122,7 @@ pub(crate) unsafe fn service_win32k_file_object_request(
 ) -> (i32, u64, u64, u64) {
     use crate::win32k_subsystem::{
         W32_FILE_OBJECT_DEREFERENCE_POINTER, W32_FILE_OBJECT_DEVICE_NAME, W32_FILE_OBJECT_LABEL,
-        W32_FILE_OBJECT_OPEN_DEVICE, W32_FILE_OBJECT_REFERENCE_HANDLE,
+        W32_FILE_OBJECT_REFERENCE_HANDLE,
         W32_FILE_OBJECT_REFERENCE_POINTER, W32_FILE_OBJECT_RELATED_DEVICE,
         W32_FILE_OBJECT_RELEASE_WAIT, W32_FILE_OBJECT_WAIT_IDENTITY,
     };
@@ -161,30 +161,6 @@ pub(crate) unsafe fn service_win32k_file_object_request(
                     caller, object, access, mode,
                 );
             (status, pointer, granted as u64, attributes as u64)
-        }
-        W32_FILE_OBJECT_OPEN_DEVICE => {
-            let Ok(length) = usize::try_from(mode) else {
-                return (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0);
-            };
-            if access > u32::MAX as u64 || length == 0 || length & 1 != 0 {
-                return (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0);
-            }
-            let (_lease, packet) =
-                match crate::win32k_subsystem::capture_provider_pool_packet(object, length) {
-                    Ok(packet) => packet,
-                    Err(status) => return (status as i32, 0, 0, 0),
-                };
-            let mut name = Vec::new();
-            if name.try_reserve_exact(length / 2).is_err() {
-                return (nt_process::STATUS_INSUFFICIENT_RESOURCES as i32, 0, 0, 0);
-            }
-            for unit in packet.chunks_exact(2) {
-                name.push(u16::from_le_bytes([unit[0], unit[1]]));
-            }
-            match crate::video_device::video_get_device_object_pointer(&name, access as u32) {
-                Ok((file, device)) => (0, file, device, 0),
-                Err(status) => (status, 0, 0, 0),
-            }
         }
         W32_FILE_OBJECT_DEVICE_NAME => {
             let Ok(length) = usize::try_from(access) else {

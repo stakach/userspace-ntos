@@ -9,6 +9,10 @@ pub const OP_REFERENCE: u64 = 6;
 pub const OP_DEREFERENCE: u64 = 7;
 pub const OP_MAP: u64 = 8;
 pub const OP_UNMAP: u64 = 9;
+/// Project the exact canonical kernel Section pages into a published client process.
+pub const OP_MAP_CLIENT: u64 = 10;
+/// Retire the exact client projection before its Section backing can be released.
+pub const OP_UNMAP_CLIENT: u64 = 11;
 const HEADER_BYTES: usize = 16;
 const FILE_OBJECT_OFFSET: usize = HEADER_BYTES + base_wire::PACKET_BYTES;
 const MAGIC: u32 = u32::from_le_bytes(*b"WMSC");

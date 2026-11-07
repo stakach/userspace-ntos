@@ -80,7 +80,6 @@ fn retained_file_operations_are_selected_before_fresh_logical_caller_admission()
                     name.as_str(),
                     "W32_FILE_OBJECT_REFERENCE_HANDLE"
                         | "W32_FILE_OBJECT_DEVICE_NAME"
-                        | "W32_FILE_OBJECT_OPEN_DEVICE"
                 ) {
                     self.0.push(name);
                 }
@@ -94,7 +93,6 @@ fn retained_file_operations_are_selected_before_fresh_logical_caller_admission()
         fresh.0,
         [
             "W32_FILE_OBJECT_REFERENCE_HANDLE",
-            "W32_FILE_OBJECT_OPEN_DEVICE",
             "W32_FILE_OBJECT_DEVICE_NAME"
         ],
         "fresh operations remain in the caller-authorized service"
@@ -153,7 +151,6 @@ fn retained_file_pointer_wait_and_video_paths_receive_physical_consumer_domain()
     for fresh in [
         "W32_FILE_OBJECT_REFERENCE_HANDLE",
         "W32_FILE_OBJECT_DEVICE_NAME",
-        "W32_FILE_OBJECT_OPEN_DEVICE",
     ] {
         assert!(
             !patterns.0.iter().any(|name| name == fresh),

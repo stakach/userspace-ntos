@@ -31,20 +31,34 @@ impl DriverMemoryReader for DriverMemory {
     }
 }
 
-fn previous_mode() -> Result<AccessMode, u32> {
+pub(super) fn previous_mode() -> Result<AccessMode, u32> {
     let thread = current_ps_value(3);
     if thread == 0 {
         return Err(STATUS_INVALID_HANDLE as u32);
     }
     let mode = unsafe {
         read_unaligned(
-            (thread + nt_kernel_abi::ps_reactos_x64::KTHREAD_PREVIOUS_MODE as u64) as *const u8,
+            (thread + nt_kernel_abi::ps_hosted_x64::KTHREAD_PREVIOUS_MODE as u64) as *const u8,
         )
     };
     match mode {
         0 => Ok(AccessMode::KernelMode),
         1 => Ok(AccessMode::UserMode),
         _ => Err(STATUS_PROTOCOL_ERROR),
+    }
+}
+
+/// `KPROCESSOR_MODE ExGetPreviousMode()` uses the authenticated selected thread.
+pub(super) extern "win64" fn s_ex_get_previous_mode() -> u8 {
+    match previous_mode() {
+        Ok(AccessMode::KernelMode) => 0,
+        Ok(AccessMode::UserMode) => 1,
+        Err(status) => unsafe {
+            crate::provider_bugcheck::report(
+                0xc4,
+                [0x50524d44, current_ps_value(3), u64::from(status), 0],
+            );
+        },
     }
 }
 

@@ -37,6 +37,37 @@ fn publish(
 }
 
 #[test]
+fn committed_system_mutation_advances_boot_plan_and_key_snapshot_together() {
+    let mut client = client();
+    let before_plan = client
+        .query_driver_launch_plan(launch_plan_kind::BOOT_SYSTEM_DRIVERS)
+        .unwrap();
+    let before_key = client.query_system_hive_key(SERVICES).unwrap();
+    assert_eq!(before_plan.mount_generation, 1);
+    assert_eq!(before_key.mount_generation, before_plan.mount_generation);
+
+    // ACPI root publication uses this retained SYSTEM mutation protocol before boot preload.
+    let next = publish(
+        &mut client,
+        before_plan.mount_generation,
+        &[SystemHiveMutation::SetValue {
+            path: DEVICE,
+            name: "Value",
+            value_type: 4,
+            data: &2u32.to_le_bytes(),
+        }],
+    );
+    assert_eq!(next, 2);
+    let plan = client
+        .query_driver_launch_plan(launch_plan_kind::BOOT_SYSTEM_DRIVERS)
+        .unwrap();
+    let key = client.query_system_hive_key(SERVICES).unwrap();
+    assert_eq!(plan.mount_generation, next);
+    assert_eq!(key.mount_generation, plan.mount_generation);
+    assert_ne!(plan.mount_generation, before_plan.mount_generation);
+}
+
+#[test]
 fn stale_descriptor_decision_is_not_rebased_onto_a_new_generation() {
     let mut client = client();
     let opened = retained_test_keys::open(&mut client, DEVICE);

@@ -44,10 +44,13 @@ pub(crate) fn is_initial_system_process(body: u64) -> bool {
 unsafe fn publish_initial_objects(
     ps: &mut nt_user_host::ps_bootstrap::PsBootstrapState,
 ) -> Result<(), u32> {
-    use nt_kernel_abi::{ps_reactos_x64 as abi, GuestAddr};
+    use nt_kernel_abi::{ps_hosted_x64 as abi, GuestAddr};
 
     let (pm, _) = ps.managers_mut();
     let identity = pm.initial_system_identity().ok_or(0xc000_000du32)?;
+    let image_file_name = pm.kernel_process_export_state(identity.process_id())
+        .and_then(|state| state.eprocess_image_file_name())
+        .ok_or(0xc000_000du32)?;
     let process = core::ptr::addr_of_mut!(INITIAL_PROCESS);
     let thread = core::ptr::addr_of_mut!(INITIAL_THREAD);
     abi::initialize_process(
@@ -56,6 +59,7 @@ unsafe fn publish_initial_objects(
             body: GuestAddr(process as u64),
             process_id: u64::from(identity.process_id()),
             peb: GuestAddr(0),
+            image_file_name,
         },
     )
     .map_err(|_| 0xc000_000du32)?;

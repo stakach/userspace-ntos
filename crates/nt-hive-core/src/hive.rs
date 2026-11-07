@@ -8,11 +8,12 @@
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use nt_page_storage::PageSequence;
 
 #[path = "hive_set_value.rs"]
 mod set_value;
-pub use set_value::{PreparedSetValue, SetValueError};
+pub use set_value::{OwnedPreparedSetValue, PreparedSetValue, SetValueError};
 #[path = "hive_value_journal.rs"]
 mod value_journal;
 pub use value_journal::{HiveValueJournalPhase, RetainedHiveValueJournal};
@@ -20,7 +21,15 @@ use value_journal::PendingHiveValueJournal;
 
 #[path = "hive_create_child.rs"]
 mod create_child;
-pub use create_child::CreateChildError;
+pub use create_child::{CreateChildError, OwnedPreparedCreateChild};
+#[path = "hive_set_key_security.rs"]
+mod set_key_security;
+pub use set_key_security::{OwnedPreparedSetKeySecurity, SetKeySecurityError};
+#[path = "hive_delete.rs"]
+mod delete;
+pub use delete::{
+    DeleteKeyEditError, DeleteValueEditError, OwnedPreparedDeleteKey, OwnedPreparedDeleteValue,
+};
 
 pub use nt_config_manager::RegistryValueType;
 
@@ -490,7 +499,9 @@ fn compose_hive_overlay_inner(
         }
     }
 
-    composed.finish_clean_import();
+    // Overlay construction uses ordinary mutators, but it is part of boot import rather than
+    // a new durable mutation. Keep the persisted base's journal head for the next CM append.
+    composed.finish_clean_import_at_sequence(base.sequence);
     Ok(composed)
 }
 
@@ -920,13 +931,20 @@ impl Hive {
     /// the first journalled sequence numbers, and a later checkpoint should not report import-time
     /// construction as dirty runtime state.
     pub fn finish_clean_import(&mut self) {
+        self.finish_clean_import_at_sequence(0);
+    }
+
+    /// Mark an overlay composition clean without rewinding the persisted journal head.
+    /// Generated cells receive no independently durable sequence; their construction clocks
+    /// must not make the composed image dirty or advance its next log-record number.
+    fn finish_clean_import_at_sequence(&mut self, sequence: u64) {
         assert!(self.pending_value_journal.is_none(), "retained publication excludes import reset");
-        self.sequence = 0;
+        self.sequence = sequence;
         self.generation = 0;
         for cell in self.cells.iter_mut().filter_map(|cell| cell.as_mut()) {
             match cell {
-                Cell::Key(key) => key.last_write_sequence = 0,
-                Cell::Value(value) => value.last_write_sequence = 0,
+                Cell::Key(key) => key.last_write_sequence = key.last_write_sequence.min(sequence),
+                Cell::Value(value) => value.last_write_sequence = value.last_write_sequence.min(sequence),
             }
         }
         self.clear_dirty();
@@ -1519,14 +1537,26 @@ impl RegistryValueCopyProvenanceTable {
 pub struct MutableHiveSet {
     mounts: HiveMountTable,
     hives: Vec<(HiveId, Hive)>,
+    retained_value_owners: Vec<(HiveId, u64)>,
 }
+
+// A retained edit can move between sets before publication. An owner number must therefore
+// distinguish the exact preparation across sets, including independently constructed sets.
+static NEXT_RETAINED_OWNER: AtomicU64 = AtomicU64::new(1);
 
 impl MutableHiveSet {
     pub fn new() -> Self {
         Self {
             mounts: HiveMountTable::new(),
             hives: Vec::new(),
+            retained_value_owners: Vec::new(),
         }
+    }
+
+    fn reserve_retained_owner(&mut self) -> Option<u64> {
+        self.retained_value_owners.try_reserve(1).ok()?;
+        NEXT_RETAINED_OWNER.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |owner|
+            owner.checked_add(1)).ok()
     }
 
     /// Mount or replace a mutable hive atomically at the namespace level.
@@ -1545,7 +1575,12 @@ impl MutableHiveSet {
             .filter(|entry| entry.root.eq_ignore_ascii_case(root_path))
             .any(|entry| self.hive(entry.hive)
                 .is_some_and(|owned| owned.pending_value_journal.is_some()));
-        if retained_id || retained_root {
+        if retained_id || retained_root
+            || self.retained_value_owners.iter().any(|(id, _)| *id == hive_id)
+            || self.mounts.mounts.iter()
+                .filter(|entry| entry.root.eq_ignore_ascii_case(root_path))
+                .any(|entry| self.retained_value_owners.iter().any(|(id, _)| *id == entry.hive))
+        {
             return Err(CurrentControlSetError::RetainedPublication);
         }
         let current_control_set = if root_path.eq_ignore_ascii_case(SYSTEM_HIVE_PATH) {
@@ -1570,7 +1605,9 @@ impl MutableHiveSet {
         let hive_id = self.mounts.mounts.iter()
             .find(|entry| entry.root.eq_ignore_ascii_case(root_path))?.hive;
         let index = self.hives.iter().position(|(id, _)| *id == hive_id)?;
-        if self.hives[index].1.pending_value_journal.is_some() {
+        if self.hives[index].1.pending_value_journal.is_some()
+            || self.retained_value_owners.iter().any(|(id, _)| *id == hive_id)
+        {
             return None;
         }
         self.mounts.unmount(root_path)?;
@@ -1584,7 +1621,17 @@ impl MutableHiveSet {
             .map(|(_, hive)| hive)
     }
 
+    /// Whether a deferred edit must wait before consuming its owned input. A retained
+    /// publication pins the hive until the exact provider effect is resolved.
+    pub fn has_retained_publication(&self, hive_id: HiveId) -> bool {
+        self.retained_value_owners.iter().any(|(id, _)| *id == hive_id)
+            || self.hive(hive_id).is_some_and(|hive| hive.pending_value_journal.is_some())
+    }
+
     pub fn hive_mut(&mut self, hive_id: HiveId) -> Option<&mut Hive> {
+        if self.retained_value_owners.iter().any(|(id, _)| *id == hive_id) {
+            return None;
+        }
         self.hives
             .iter_mut()
             .find(|(id, _)| *id == hive_id)

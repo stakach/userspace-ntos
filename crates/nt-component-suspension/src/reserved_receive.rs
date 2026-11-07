@@ -113,12 +113,35 @@ impl ReservedIngressReceive {
         {
             return Err(ReservedReceiveError::Store(RetainedWorkError::WrongOwner));
         }
-        if self.phase == ReservedReceivePhase::Held
-            && !ingress.held_receive_matches(self.receive_identity)
-        {
+        let attempt_matches = match self.phase {
+            ReservedReceivePhase::Receiving => self.attempt.identity() == self.receive_identity
+                && ingress.receiving_matches(self.receive_identity),
+            ReservedReceivePhase::Captured => self.attempt.identity() == self.receive_identity
+                && ingress.captured_receive_matches(self.receive_identity),
+            ReservedReceivePhase::Held => ingress.held_receive_matches(self.receive_identity),
+            ReservedReceivePhase::Finished => false,
+        };
+        if !attempt_matches {
             return Err(ReservedReceiveError::Ingress(IngressError::WrongAttempt));
         }
         Ok(())
+    }
+
+    /// Re-enter only the original receive owner. This is a read-only proof for retrying capture
+    /// or classification of an already received message; it never authorizes another receive.
+    pub(crate) fn recovery_for_owner<M, C, R, T>(
+        &self,
+        store: &RetainedWork<M>,
+        ingress: &ComponentIngress<M>,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        owner: IngressExecutionOwner,
+    ) -> Result<ReservedReceivePhase, ReservedReceiveError<Infallible>> {
+        self.validate(store, ingress)?;
+        if owner != self.execution_owner {
+            return Err(ReservedReceiveError::Ingress(IngressError::ExecutionOwnerMismatch));
+        }
+        lanes.validate_ingress_execution(owner).map_err(ReservedReceiveError::Ingress)?;
+        Ok(self.phase)
     }
 
     pub fn capture<M>(

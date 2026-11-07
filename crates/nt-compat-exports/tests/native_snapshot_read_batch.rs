@@ -1,5 +1,25 @@
 use syn::{Expr, ImplItem, Item, visit::Visit};
 
+#[test]
+fn boot_ahci_dma_window_covers_batched_snapshot_io_and_stays_disjoint_from_native_dma() {
+    let executive = include_str!("../../../components/ntos-executive/src/main.rs");
+    let host = include_str!("../../../components/ntos-executive/src/spawn_hosts.rs");
+    let authority = include_str!("../../../components/ntos-executive/src/boot_storage_dma_handoff.rs");
+    assert!(executive.contains("AHCI_BOOT_DMA_PAGES: u64 = 5"));
+    assert!(executive.contains("alloc_frame_run(AHCI_BOOT_DMA_PAGES)"));
+    assert!(executive.contains("AHCI_IOVA + page * 0x1000"));
+    assert!(host.contains("count: AHCI_BOOT_DMA_PAGES"));
+    assert!(authority.contains("AHCI_IOVA + AHCI_BOOT_DMA_PAGES * 0x1000"));
+    assert!(authority.contains(".register(controller, io_space_cap, AHCI_IOVA, AHCI_BOOT_DMA_PAGES)"));
+    let transfer = device_method("max_transfer_sectors");
+    assert!(matches!(
+        transfer.block.stmts.as_slice(),
+        [syn::Stmt::Expr(Expr::Lit(lit), None)]
+            if matches!(&lit.lit, syn::Lit::Int(value)
+                if value.base10_parse::<usize>().ok() == Some(32))
+    ));
+}
+
 fn source() -> syn::File {
     syn::parse_file(include_str!(
         "../../../components/ntos-executive/src/writable_fs/snapshot_storage.rs"

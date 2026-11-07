@@ -74,6 +74,55 @@ unsafe fn loaded_name(name: &str, pml4: u64) -> Option<(u64, u32)> {
         .map(|module| (module.image().base, module.image().size))
 }
 
+pub(crate) unsafe fn loaded_image(name: &str, pml4: u64) -> bool {
+    let Ok(name) = module_namespace::module_leaf(name) else { return false; };
+    loaded_name(&name, pml4).is_some()
+}
+
+pub(crate) unsafe fn loaded_exports(name: &str, pml4: u64) -> Option<ImageExports> {
+    let name = module_namespace::module_leaf(name).ok()?;
+    let provider = crate::current_win32k_provider_domain()?;
+    (&*core::ptr::addr_of!(LOADED)).iter().find(|module| {
+        module.backing().exports.name == name
+            && module.backing().pml4 == pml4
+            && module.backing().provider == provider
+            && crate::win32k_subsystem::provider_pool_packet_lease_live(module.backing().handle)
+    }).map(|module| module.backing().exports.clone())
+}
+
+/// Exact byte snapshots acquired before mapping. The routed GDI owner retains these until the
+/// whole dependency closure is mapped; a name alone never authorizes a fresh disk read.
+pub(crate) struct ImageSnapshot {
+    pub name: alloc::string::String,
+    pub path: Vec<u8>,
+    pub bytes: Vec<u8>,
+}
+
+fn snapshot_for<'a>(catalog: &'a [ImageSnapshot], name: &str) -> Option<&'a ImageSnapshot> {
+    catalog.iter().find(|snapshot| snapshot.name == name)
+}
+
+/// Admit mutable static storage in an exact live helper image loaded for this provider.
+/// Provider pointer values are used only to locate the image; its retained mapping and
+/// per-page rights remain the storage authority.
+pub(crate) unsafe fn contains_loaded_writable_storage(body: u64, length: u64) -> bool {
+    let Some(provider) = crate::current_win32k_provider_domain() else { return false; };
+    let Some(end) = body.checked_add(length) else { return false; };
+    if length == 0 { return false; }
+    (&*core::ptr::addr_of!(LOADED)).iter().any(|module| {
+        let backing = module.backing();
+        let image = module.image();
+        if backing.provider != provider
+            || !crate::win32k_subsystem::provider_pool_packet_lease_live(backing.handle)
+            || body < image.base
+            || end > image.base + u64::from(image.size)
+        { return false; }
+        let first = ((body - image.base) / 0x1000) as usize;
+        let last = ((end - 1 - image.base) / 0x1000) as usize;
+        backing.rights.get(first..=last).is_some_and(|rights| rights.iter().all(|right| *right == RW_NX))
+    })
+}
+
 /// File discovery is shared FS policy, not a driver-name dispatch table.
 pub(crate) unsafe fn load_installed(name: &str, pml4: u64) -> Result<(u64, u32), LoadFailure> {
     let name = module_namespace::module_leaf(name).map_err(|_| LoadFailure::InvalidImage)?;
@@ -84,11 +133,11 @@ pub(crate) unsafe fn load_installed(name: &str, pml4: u64) -> Result<(u64, u32),
         return Err(LoadFailure::InvalidImage);
     }
     let fs = exec_fs().ok_or(LoadFailure::NativeFailure)?;
-    let mut path = b"reactos\\system32\\".to_vec();
+    let mut path = crate::installed_layout::SYSTEM32_PREFIX.to_vec();
     path.extend_from_slice(name.as_bytes());
     let location = fat_open_path(&fs, &path)
         .or_else(|| {
-            let mut driver_path = b"reactos\\system32\\drivers\\".to_vec();
+            let mut driver_path = crate::installed_layout::DRIVERS_PREFIX.to_vec();
             driver_path.extend_from_slice(name.as_bytes());
             fat_open_path(&fs, &driver_path)
         })
@@ -101,8 +150,27 @@ pub(crate) unsafe fn load_installed(name: &str, pml4: u64) -> Result<(u64, u32),
     if fat_read_file(&fs, location.0, location.1, source) != location.1 {
         return Err(LoadFailure::NativeFailure);
     }
-    let file = (source, location.1);
-    let bytes = core::slice::from_raw_parts(file.0 as *const u8, file.1 as usize);
+    load_snapshot(&name, &path, pml4, source, location.1, None)
+}
+
+/// Map only bytes retained by the routed owner; recursive imports and forwarders consult the
+/// same catalog. No path lookup or physical read is allowed from this entry point.
+pub(crate) unsafe fn load_installed_from_catalog(
+    name: &str, pml4: u64, catalog: &[ImageSnapshot],
+) -> Result<(u64, u32), LoadFailure> {
+    let name = module_namespace::module_leaf(name).map_err(|_| LoadFailure::InvalidImage)?;
+    if let Some(image) = loaded_name(&name, pml4) { return Ok(image); }
+    if module_namespace::core_role(&name).is_some() { return Err(LoadFailure::InvalidImage); }
+    let snapshot = snapshot_for(catalog, &name).ok_or(LoadFailure::FileMissing)?;
+    let length = u32::try_from(snapshot.bytes.len()).map_err(|_| LoadFailure::InvalidImage)?;
+    load_snapshot(&name, &snapshot.path, pml4, snapshot.bytes.as_ptr() as u64, length, Some(catalog))
+}
+
+unsafe fn load_snapshot(
+    name: &str, path: &[u8], pml4: u64, source: u64, length: u32,
+    catalog: Option<&[ImageSnapshot]>,
+) -> Result<(u64, u32), LoadFailure> {
+    let bytes = core::slice::from_raw_parts(source as *const u8, length as usize);
     let pe = nt_pe_loader::PeFile::parse(bytes).map_err(|_| LoadFailure::InvalidImage)?;
     let frames = (u64::from(pe.size_of_image()) + 0xfff) / 0x1000;
     let base = DEMAND_NEXT;
@@ -121,7 +189,9 @@ pub(crate) unsafe fn load_installed(name: &str, pml4: u64) -> Result<(u64, u32),
         .checked_add(0xfff)
         .ok_or(LoadFailure::InsufficientResources)?
         & !0xfff;
-    let result = load_one_driver_result(file.0, file.1, &name, base, frames, pml4)?;
+    let result = load_one_driver_result_with_catalog(
+        source, length, name, base, frames, pml4, catalog,
+    )?;
     let _ = register_system_module(&path, base, result.2);
     Ok((base, result.2))
 }
@@ -133,6 +203,7 @@ unsafe fn checked_image(
     base: u64,
     frames: u64,
     pml4: u64,
+    catalog: Option<&[ImageSnapshot]>,
 ) -> Result<(nt_pe_loader::MappedImage, ImageExports, Vec<u64>, u32), LoadFailure> {
     let bytes = core::slice::from_raw_parts(src as *const u8, length as usize);
     let pe = nt_pe_loader::PeFile::parse(bytes).map_err(|_| LoadFailure::InvalidImage)?;
@@ -149,7 +220,7 @@ unsafe fn checked_image(
         let name =
             module_namespace::module_leaf(&dll.name).map_err(|_| LoadFailure::InvalidImage)?;
         if module_namespace::core_role(&name).is_none() && name != "win32k.sys" {
-            load_installed(&name, pml4)?;
+            load_dependency(&name, pml4, catalog)?;
         }
     }
     for dll in imports {
@@ -158,7 +229,7 @@ unsafe fn checked_image(
                 nt_pe_loader::ImportRef::ByName { name, .. } => Symbol::Name(name.clone()),
                 nt_pe_loader::ImportRef::ByOrdinal { ordinal, .. } => Symbol::Ordinal(*ordinal),
             };
-            let address = resolve_import(&dll.name, symbol, pml4, &mut Vec::new())?;
+            let address = resolve_import(&dll.name, symbol, pml4, catalog, &mut Vec::new())?;
             mapped
                 .patch_iat(function.iat_slot_rva(), address)
                 .map_err(|_| LoadFailure::InvalidImage)?;
@@ -204,6 +275,7 @@ unsafe fn resolve_import(
     module: &str,
     symbol: Symbol,
     pml4: u64,
+    catalog: Option<&[ImageSnapshot]>,
     seen: &mut Vec<(alloc::string::String, Symbol)>,
 ) -> Result<u64, LoadFailure> {
     let module = module_namespace::module_leaf(module).map_err(|_| LoadFailure::InvalidImage)?;
@@ -227,7 +299,7 @@ unsafe fn resolve_import(
     let image = if module == "win32k.sys" {
         crate::win32k_seh_image::win32k_exports(pml4).ok_or(LoadFailure::NativeFailure)?
     } else {
-        load_installed(&module, pml4)?;
+        load_dependency(&module, pml4, catalog)?;
         let provider = crate::current_win32k_provider_domain().ok_or(LoadFailure::NativeFailure)?;
         (&*core::ptr::addr_of!(LOADED))
             .iter()
@@ -271,8 +343,17 @@ unsafe fn resolve_import(
             } else {
                 Symbol::Name(alloc::string::String::from(name))
             };
-            resolve_import(&module, symbol, pml4, seen)
+            resolve_import(&module, symbol, pml4, catalog, seen)
         }
+    }
+}
+
+unsafe fn load_dependency(
+    name: &str, pml4: u64, catalog: Option<&[ImageSnapshot]>,
+) -> Result<(u64, u32), LoadFailure> {
+    match catalog {
+        Some(catalog) => load_installed_from_catalog(name, pml4, catalog),
+        None => load_installed(name, pml4),
     }
 }
 
@@ -489,35 +570,45 @@ pub(crate) unsafe fn service_request(pointer: u64, length: u64,
                 Ok(image) => image,
                 Err(error) => return rejected(b"load-installed", error.ntstatus()),
             };
-            let Some(handle) = module_handle(base, size) else {
-                return rejected(b"module-handle", 0xc000_0008u32 as i32);
-            };
-            let Some(module) = (&*core::ptr::addr_of!(LOADED))
-                .iter()
-                .find(|record| record.handle().address == handle)
-            else {
-                return rejected(b"module-record", 0xc000_0008u32 as i32);
-            };
-            let image = module.image();
-            if !win32k_subsystem::register_gdi_driver_image(
-                name.as_bytes(),
-                base,
-                base + u64::from(image.entry_rva),
-                if image.export_rva == 0 {
-                    0
-                } else {
-                    base + u64::from(image.export_rva)
-                },
-                size,
-            ) {
-                return rejected(b"image-publication", 0xc000_009au32 as i32);
-            }
-            match acquire_load(handle) {
-                Ok(()) => (0, handle),
-                Err(status) => rejected(b"load-reference", status),
+            match publish_loaded_image(&name, base, size) {
+                Ok(handle) => (0, handle),
+                Err(status) => rejected(b"image-publication", status),
             }
         }
     }
+}
+
+pub(crate) unsafe fn load_catalog_and_publish(
+    name: &str, pml4: u64, catalog: &[ImageSnapshot],
+) -> (i32, u64) {
+    let (base, size) = match load_installed_from_catalog(name, pml4, catalog) {
+        Ok(image) => image,
+        Err(error) => return (error.ntstatus(), 0),
+    };
+    match publish_loaded_image(name, base, size) {
+        Ok(handle) => (0, handle),
+        Err(status) => (status, 0),
+    }
+}
+
+unsafe fn publish_loaded_image(name: &str, base: u64, size: u32) -> Result<u64, i32> {
+    let handle = module_handle(base, size).ok_or(0xc000_0008u32 as i32)?;
+    let module = (&*core::ptr::addr_of!(LOADED))
+        .iter()
+        .find(|record| record.handle().address == handle)
+        .ok_or(0xc000_0008u32 as i32)?;
+    let image = module.image();
+    if !win32k_subsystem::register_gdi_driver_image(
+        name.as_bytes(),
+        base,
+        base + u64::from(image.entry_rva),
+        if image.export_rva == 0 { 0 } else { base + u64::from(image.export_rva) },
+        size,
+    ) {
+        return Err(0xc000_009au32 as i32);
+    }
+    acquire_load(handle)?;
+    Ok(handle)
 }
 
 #[inline(never)]
@@ -677,6 +768,20 @@ pub(super) unsafe fn load_one_driver_result(
     frames: u64,
     host_pml4: u64,
 ) -> Result<(u32, u32, u32), LoadFailure> {
+    load_one_driver_result_with_catalog(
+        src_va, source_len, name, dst_va, frames, host_pml4, None,
+    )
+}
+
+unsafe fn load_one_driver_result_with_catalog(
+    src_va: u64,
+    source_len: u32,
+    name: &str,
+    dst_va: u64,
+    frames: u64,
+    host_pml4: u64,
+    catalog: Option<&[ImageSnapshot]>,
+) -> Result<(u32, u32, u32), LoadFailure> {
     let _durable = crate::allocator::enter_durable();
     let _dependency = enter_dependency(name).ok_or(LoadFailure::InvalidImage)?;
     let provider = crate::current_win32k_provider_domain().ok_or(LoadFailure::NativeFailure)?;
@@ -709,7 +814,7 @@ pub(super) unsafe fn load_one_driver_result(
         return Err(LoadFailure::NativeFailure);
     }
     let (mapped, exports, rights, export_rva) =
-        checked_image(src_va, source_len, name, dst_va, frames, host_pml4)?;
+        checked_image(src_va, source_len, name, dst_va, frames, host_pml4, catalog)?;
     let res = (
         mapped.entry_rva,
         export_rva,

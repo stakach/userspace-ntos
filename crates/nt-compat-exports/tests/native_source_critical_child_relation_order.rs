@@ -36,10 +36,29 @@ fn queued_initial_bus_relations_precede_new_critical_child_start() {
         .find("driver_launch::hosted_bus_relation_pending()")
         .expect("a queued PCI BusRelations request must defer new critical child STARTs");
     let claim = admission
-        .find("driver_launch::claim_hosted_critical_child_start(")
+        .find("driver_launch::claim_hosted_critical_child_start_ready(")
         .expect("missing critical child claim");
     assert!(
         relation_guard < claim,
         "relation admission must run before claiming and dispatching a child START"
     );
+}
+
+#[test]
+fn an_existing_exact_start_owner_is_skipped_before_claiming_the_child() {
+    let service = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
+    let admission = service
+        .split("unsafe fn start_committed_critical_children(")
+        .nth(1)
+        .unwrap();
+    let admission = &admission[..admission
+        .find("unsafe fn pump_hosted_io_and_redrive_driver_starts(")
+        .unwrap()];
+    let claim = admission.find("claim_hosted_critical_child_start_ready(")
+        .expect("pending START owner must be checked by the queue before minting a claim");
+    let owner = admission.find("owns_current_bus_child(")
+        .expect("exact pending bus child ownership must gate the claim");
+    let print = admission.find("[pnp-critical-start] instance=").unwrap();
+    assert!(claim < owner && owner < print);
+    assert!(!admission.contains("defer_hosted_critical_child_start(claim)"));
 }

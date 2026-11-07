@@ -32,6 +32,7 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
             DELAY_TIMER_SOURCE_IO_COMPLETION,
         ),
         (owner.user_timer, DELAY_TIMER_SOURCE_USER_TIMER),
+        (thread_alert::next_deadline(now), DELAY_TIMER_SOURCE_THREAD_ALERT),
         (
             service_sec_image::provider_wait_next_deadline(now),
             DELAY_TIMER_SOURCE_PROVIDER_WAIT,
@@ -47,6 +48,22 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
         (
             driver_launch::hosted_driver_wait_next_deadline(now),
             DELAY_TIMER_SOURCE_HOSTED_DRIVER,
+        ),
+        (
+            driver_launch::hosted_driver_dynamic_delete::next_deadline(),
+            DELAY_TIMER_SOURCE_HOSTED_DYNAMIC_DELETE,
+        ),
+        (
+            driver_launch::hosted_provider_export_lane::next_deadline(),
+            DELAY_TIMER_SOURCE_HOSTED_PROVIDER_STARTUP_RESTORE,
+        ),
+        (
+            spawn_hosts::shared_ingress::owner::runtime::nested::next_abort_deadline(),
+            DELAY_TIMER_SOURCE_NESTED_ACQUIRE_ABORT,
+        ),
+        (
+            win32k_glue::win32k_startup_restore_next_deadline(),
+            DELAY_TIMER_SOURCE_WIN32K_STARTUP_RESTORE,
         ),
         (
             driver_launch::hosted_acpi_pci_route_recovery_next_deadline(now.monotonic_100ns),
@@ -65,19 +82,22 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
             registry_mutation_work::next_deadline(),
             DELAY_TIMER_SOURCE_REGISTRY_MUTATION,
         ),
+        (section_metadata_work::next_deadline(), DELAY_TIMER_SOURCE_SECTION_METADATA),
+        (process_image_snapshot_work::next_deadline(),
+            DELAY_TIMER_SOURCE_PROCESS_IMAGE_SNAPSHOT),
+        (provider_section_broker::next_deadline(), DELAY_TIMER_SOURCE_PROVIDER_SECTION),
+        (gdi_routed_image_work::next_deadline(), DELAY_TIMER_SOURCE_GDI_ROUTED_IMAGE),
         (
-            match (
-                section_metadata_work::next_deadline(),
-                provider_section_broker::next_deadline(),
-            ) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            },
-            DELAY_TIMER_SOURCE_SECTION_METADATA,
+            provider_directory_broker::next_deadline(),
+            DELAY_TIMER_SOURCE_PROVIDER_DIRECTORY,
         ),
         (
             driver_launch::hosted_file_retry_deadline(now.monotonic_100ns),
             DELAY_TIMER_SOURCE_HOSTED_FILE_RETRY,
+        ),
+        (
+            driver_launch::mounted_native_block_next_deadline(now.monotonic_100ns),
+            DELAY_TIMER_SOURCE_MOUNTED_NATIVE_BLOCK,
         ),
         (owner.component_resume, DELAY_TIMER_SOURCE_COMPONENT_RESUME),
         (
@@ -88,6 +108,10 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
         (
             driver_launch::hosted_dpc_next_deadline(now.monotonic_100ns),
             DELAY_TIMER_SOURCE_HOSTED_DPC,
+        ),
+        (
+            driver_launch::hosted_irq_retry_next_deadline(),
+            DELAY_TIMER_SOURCE_HOSTED_IRQ_RETRY,
         ),
     ])
 }

@@ -1,11 +1,109 @@
 //! Component-side call and request packet lifecycle for file-less source IOCTLs.
 
 use super::*;
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicBool, AtomicU64};
 use nt_io_manager::source_terminal::{PreparedTerminal, TerminalPacketIdentity};
 use nt_io_manager::win32k_source_irp_ioctl_wire::{
     self as wire, SourceIrpIoctlRequest, SourceIrpIoctlResponse, TerminalPublication,
 };
+
+struct MonitorArrayAdmission {
+    address: u64,
+    allocation: shared_pool::AllocationIdentity,
+    provider: nt_provider_wait::ProviderDomainIdentity,
+    token: u64,
+    claimed: bool,
+}
+
+static MONITOR_ARRAY_ADMISSIONS_LOCK: AtomicBool = AtomicBool::new(false);
+static mut MONITOR_ARRAY_ADMISSIONS: Vec<MonitorArrayAdmission> = Vec::new();
+
+struct MonitorArrayAdmissionsGuard;
+
+impl MonitorArrayAdmissionsGuard {
+    fn acquire() -> Self {
+        while MONITOR_ARRAY_ADMISSIONS_LOCK
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            crate::yield_now();
+        }
+        Self
+    }
+}
+
+impl Drop for MonitorArrayAdmissionsGuard {
+    fn drop(&mut self) {
+        MONITOR_ARRAY_ADMISSIONS_LOCK.store(false, Ordering::Release);
+    }
+}
+
+/// Terminal handoff registers the exact root-created pointer before exposing it to native win32k.
+unsafe fn register_monitor_array_projection(pointer: u64, token: u64) -> bool {
+    if pointer == 0 || token == 0 || !provider_pool_contains(pointer) { return false; }
+    let _guard = MonitorArrayAdmissionsGuard::acquire();
+    let Some(provider) = registered_provider_wait_domain() else { return false };
+    let Some(allocation) = provider_pool_allocation_identity(pointer) else { return false };
+    if provider_pool_allocation_capacity(pointer)
+        .is_none_or(|capacity| capacity < VIDEO_MONITOR_ARRAY_PROJECTION_BYTES as u64)
+        || read_volatile((pointer + 24) as *const u64) != VIDEO_MONITOR_ARRAY_PROJECTION_MAGIC
+        || read_volatile((pointer + 32) as *const u64) != token
+        || read_volatile((pointer + 40) as *const u64) != 0
+    {
+        return false;
+    }
+    let admissions = &mut *core::ptr::addr_of_mut!(MONITOR_ARRAY_ADMISSIONS);
+    // A claimed row remains a tombstone until the root physically retires the pool block.
+    // Reap only rows whose exact generation is no longer live before admitting another array.
+    let mut index = 0;
+    while index < admissions.len() {
+        if admissions[index].provider == provider
+            && provider_pool_allocation_identity(admissions[index].address)
+                != Some(admissions[index].allocation)
+        {
+            admissions.swap_remove(index);
+        } else {
+            index += 1;
+        }
+    }
+    if admissions.iter().any(|row| row.address == pointer && row.allocation == allocation
+        && row.provider == provider)
+        || admissions.try_reserve(1).is_err()
+    {
+        return false;
+    }
+    admissions.push(MonitorArrayAdmission {
+        address: pointer, allocation, provider, token, claimed: false,
+    });
+    true
+}
+
+/// A marker alone never admits a free. The registered provider and physical generation must match.
+pub(super) unsafe fn claim_monitor_array_projection_free(pointer: u64) -> Option<bool> {
+    if !provider_pool_contains(pointer) { return None; }
+    let _guard = MonitorArrayAdmissionsGuard::acquire();
+    let provider = registered_provider_wait_domain()?;
+    let allocation = provider_pool_allocation_identity(pointer)?;
+    let admissions = &mut *core::ptr::addr_of_mut!(MONITOR_ARRAY_ADMISSIONS);
+    let index = admissions.iter().position(|row| {
+        row.address == pointer && row.allocation == allocation && row.provider == provider
+    })?;
+    if admissions[index].claimed { return Some(false); }
+    let token = admissions[index].token;
+    if provider_pool_allocation_capacity(pointer)
+            .is_none_or(|capacity| capacity < VIDEO_MONITOR_ARRAY_PROJECTION_BYTES as u64)
+        || read_volatile((pointer + 24) as *const u64) != VIDEO_MONITOR_ARRAY_PROJECTION_MAGIC
+        || read_volatile((pointer + 32) as *const u64) != token
+    {
+        return Some(false);
+    }
+    let released = &*((pointer + 40) as *const AtomicU64);
+    if released.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return Some(false);
+    }
+    admissions[index].claimed = true;
+    Some(true)
+}
 
 static NEXT_SOURCE_IOCTL_NONCE: AtomicU64 = AtomicU64::new(1);
 const STATUS_UNSUCCESSFUL_I32: i32 = 0xc000_0001u32 as i32;
@@ -292,6 +390,19 @@ pub(crate) unsafe fn complete_terminal(packet: u64, length: u64) -> i32 {
         return STATUS_INSUFFICIENT_RESOURCES_I32;
     }
     origin.prepared_packet.extend_from_slice(packet_bytes);
+    if handoff.code == nt_video_miniport::IOCTL_VIDEO_ENUM_MONITOR_PDO && status == 0 {
+        if information != 8 || handoff.output.len() != 8
+            || !register_monitor_array_projection(
+                u64::from_le_bytes(handoff.output.try_into().unwrap()), token,
+            )
+        {
+            replace_busy(index, nonce, OriginSlot::Live(origin));
+            let _ = wire::publish_terminal_ack(
+                packet_bytes, TerminalPublication::Failed(STATUS_INVALID_PARAMETER_I32 as u32),
+            );
+            return STATUS_INVALID_PARAMETER_I32;
+        }
+    }
     let prior_phase = origin.phase;
     origin.phase = OriginPhase::Indeterminate;
     if !origin.source.publish_terminal(

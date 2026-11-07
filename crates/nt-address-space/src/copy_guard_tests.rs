@@ -265,6 +265,15 @@ fn probe_touches_each_page_in_read_write_order_without_changing_bytes() {
 }
 
 #[test]
+fn unresident_routed_image_copy_access_requires_a_parked_page_read() {
+    // A native syscall output probe is a software copy, not a hardware not-present fault.
+    // It still needs a retained provider read before the image data page can be touched.
+    assert!(routed_image_pagein_required(ImageFaultObservation::CopyAccess));
+    assert!(routed_image_pagein_required(ImageFaultObservation::NotPresent));
+    assert!(!routed_image_pagein_required(ImageFaultObservation::Protection));
+}
+
+#[test]
 fn count_probe_reads_the_whole_value_before_any_write() {
     let mut memory = Memory::default();
     memory.add(0x1000, PAGE_READWRITE, false, 0x11);

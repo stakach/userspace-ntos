@@ -216,22 +216,22 @@ pub(super) unsafe fn submit(
     if work_index(source_instance, source_irp_address).is_some() {
         return Some(BUSY);
     }
-    let Some(active) = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
+    let Some((shared_va, transfer_id, active_source_instance)) = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
         .as_ref()
         .and_then(|rows| rows.last())
-        .copied()
+        .map(|active| (active.shared_va, active.transfer_id, active.source_instance))
     else {
         return Some(INVALID);
     };
-    let source_irp = IrpId(active.transfer_id);
-    if active.shared_va != ch.shared_va
-        || active.source_instance
+    let source_irp = IrpId(transfer_id);
+    if shared_va != ch.shared_va
+        || active_source_instance
             != instance_for_pump_channel(ch, reply_cap)
                 .map(|(index, _)| index)
                 .unwrap_or(usize::MAX)
         || !hosted_source_irp_ledger::active_caller_projection_matches(
-            active.source_instance,
-            active.transfer_id,
+            active_source_instance,
+            transfer_id,
             source_irp_address,
             nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS,
         )

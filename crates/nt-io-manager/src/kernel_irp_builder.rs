@@ -15,6 +15,7 @@ pub const DO_DIRECT_IO: u32 = 0x0000_0010;
 pub const IRP_BUFFERED_IO: u32 = 0x0000_0010;
 pub const IRP_DEALLOCATE_BUFFER: u32 = 0x0000_0020;
 pub const IRP_INPUT_OPERATION: u32 = 0x0000_0040;
+pub const SL_OVERRIDE_VERIFY_VOLUME: u8 = 0x02;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelIrpPlanError {
@@ -120,6 +121,75 @@ pub struct MdlPlan {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadWriteTransferMethod {
+    Buffered,
+    Direct,
+    Neither,
+}
+
+/// The device's transfer method is authoritative for both caller-built and
+/// provider-projected READ/WRITE IRPs. NT gives buffered I/O precedence when
+/// both bits are present.
+pub const fn read_write_transfer_method(device_flags: u32) -> ReadWriteTransferMethod {
+    if device_flags & DO_BUFFERED_IO != 0 {
+        ReadWriteTransferMethod::Buffered
+    } else if device_flags & DO_DIRECT_IO != 0 {
+        ReadWriteTransferMethod::Direct
+    } else {
+        ReadWriteTransferMethod::Neither
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderReadWriteBuffers {
+    pub system_buffer: u64,
+    pub user_buffer: u64,
+    pub irp_flags: u32,
+    pub mdl: Option<MdlPlan>,
+}
+
+/// Project the provider's already owned transfer allocation into its WDM IRP.
+/// The caller retains `data` and any MDL through terminal completion and ACK.
+pub fn plan_provider_read_write_buffers(
+    major: u8,
+    device_flags: u32,
+    data: u64,
+    length: u32,
+) -> Result<ProviderReadWriteBuffers, KernelIrpPlanError> {
+    if !matches!(major, major::IRP_MJ_READ | major::IRP_MJ_WRITE)
+        || length != 0 && data == 0
+    {
+        return Err(KernelIrpPlanError::InvalidIrpHeader);
+    }
+    let read = major == major::IRP_MJ_READ;
+    Ok(match read_write_transfer_method(device_flags) {
+        ReadWriteTransferMethod::Buffered => ProviderReadWriteBuffers {
+            system_buffer: data,
+            user_buffer: if read { data } else { 0 },
+            irp_flags: IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER
+                | if read { IRP_INPUT_OPERATION } else { 0 },
+            mdl: None,
+        },
+        ReadWriteTransferMethod::Direct => ProviderReadWriteBuffers {
+            system_buffer: 0,
+            user_buffer: 0,
+            irp_flags: 0,
+            mdl: (length != 0).then_some(MdlPlan {
+                buffer: data,
+                length,
+                access: if read { MdlAccess::Write } else { MdlAccess::Read },
+            }),
+        },
+        ReadWriteTransferMethod::Neither => ProviderReadWriteBuffers {
+            system_buffer: 0,
+            user_buffer: data,
+            irp_flags: 0,
+            mdl: None,
+        },
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KernelBuiltIrpPlan {
     pub packet_size: u16,
     pub stack_count: u8,
@@ -198,7 +268,7 @@ pub fn plan_synchronous_fsd_request(
                 byte_offset: offset,
             }
         };
-        if device_flags & DO_BUFFERED_IO != 0 {
+        if read_write_transfer_method(device_flags) == ReadWriteTransferMethod::Buffered {
             plan.system_buffer_len = length;
             plan.irp_flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER;
             if major == major::IRP_MJ_READ {
@@ -208,7 +278,7 @@ pub fn plan_synchronous_fsd_request(
                 plan.system_buffer_input = buffer;
                 plan.system_buffer_input_len = length;
             }
-        } else if device_flags & DO_DIRECT_IO != 0 {
+        } else if read_write_transfer_method(device_flags) == ReadWriteTransferMethod::Direct {
             if length != 0 {
                 plan.mdl = Some(MdlPlan {
                     buffer,
@@ -224,6 +294,77 @@ pub fn plan_synchronous_fsd_request(
             plan.user_buffer = buffer;
         }
     }
+    Ok(plan)
+}
+
+/// A kernel disk-metadata read must bypass a stale volume-verification gate so
+/// partition and signature discovery can inspect the device's real sectors.
+pub fn plan_disk_metadata_read(
+    stack_size: u8,
+    device_flags: u32,
+    device_object: u64,
+    buffer: u64,
+    length: u32,
+    byte_offset: u64,
+) -> Result<KernelBuiltIrpPlan, KernelIrpPlanError> {
+    let mut plan = plan_synchronous_fsd_request(
+        major::IRP_MJ_READ, stack_size, device_flags,
+        device_object, buffer, length, Some(byte_offset),
+    )?;
+    plan.stack.flags |= SL_OVERRIDE_VERIFY_VOLUME;
+    Ok(plan)
+}
+
+/// A partition-table write must carry the caller's exact sector bytes through
+/// the source IRP and bypass a stale volume-verification gate. The native
+/// materializer captures or pins that input before publishing the IRP.
+pub fn plan_disk_metadata_write(
+    stack_size: u8,
+    device_flags: u32,
+    device_object: u64,
+    buffer: u64,
+    length: u32,
+    byte_offset: u64,
+) -> Result<KernelBuiltIrpPlan, KernelIrpPlanError> {
+    if device_object == 0 || buffer == 0 || length == 0
+        || buffer.checked_add(u64::from(length)).is_none()
+    {
+        return Err(KernelIrpPlanError::InvalidIrpHeader);
+    }
+    let mut plan = plan_synchronous_fsd_request(
+        major::IRP_MJ_WRITE, stack_size, device_flags,
+        device_object, buffer, length, Some(byte_offset),
+    )?;
+    plan.stack.flags |= SL_OVERRIDE_VERIFY_VOLUME;
+    Ok(plan)
+}
+
+/// Plan a kernel-owned `IRP_MJ_SYSTEM_CONTROL / IRP_MN_REGINFO` request.
+/// The materializer allocates `system_buffer_len`, inserts that exact pointer
+/// into the WMI stack parameter, and registers both allocations in the source
+/// ledger before a driver dispatch can observe the packet.
+pub fn plan_wmi_reginfo_request(
+    stack_size: u8,
+    device_object: u64,
+    buffer_capacity: u32,
+) -> Result<KernelBuiltIrpPlan, KernelIrpPlanError> {
+    if device_object == 0 || buffer_capacity == 0 {
+        return Err(KernelIrpPlanError::InvalidIrpHeader);
+    }
+    let mut plan = KernelBuiltIrpPlan::empty(
+        stack_size,
+        major::IRP_MJ_SYSTEM_CONTROL,
+        device_object,
+    )?;
+    plan.stack.minor = 8; // IRP_MN_REGINFO
+    plan.stack.parameters = WdmIoStackParameters::Wmi {
+        provider_id: device_object,
+        data_path: 0,
+        buffer_size: buffer_capacity,
+        buffer: 0,
+    };
+    plan.system_buffer_len = buffer_capacity;
+    plan.irp_flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER;
     Ok(plan)
 }
 

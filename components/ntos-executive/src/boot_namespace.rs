@@ -12,7 +12,8 @@ struct Alias {
 
 fn parent_index(entries: &[ObjEntry], name: &[u8]) -> Option<usize> {
     entries.iter().position(|entry| {
-        entry.kind == OBJ_KIND_DIRECTORY && entry.parent == 0 && entry.name() == name
+        entry.kind == OBJ_KIND_DIRECTORY && entry.parent == 0
+            && entry.name().eq_ignore_ascii_case(name)
     })
 }
 
@@ -57,7 +58,7 @@ pub(crate) unsafe fn publish(
             if !entries.iter().any(|entry| {
                 entry.kind == OBJ_KIND_SYMBOLIC_LINK
                     && entry.parent == 0
-                    && entry.name() == b"dosdevices"
+                    && entry.name().eq_ignore_ascii_case(b"dosdevices")
                     && entry.target() == b"\\??"
             }) {
                 return Err(nt_status::NtStatus::OBJECT_PATH_NOT_FOUND);

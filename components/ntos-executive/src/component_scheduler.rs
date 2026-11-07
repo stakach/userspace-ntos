@@ -5,8 +5,53 @@ use super::*;
 static DEPTH: AtomicU64 = AtomicU64::new(0);
 static YIELDS: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy)]
+enum StartupKind { Source, Class }
+
+fn trace_worker_startup_pump(
+    kind: StartupKind,
+    ordinal: Option<u64>,
+    stage: u64,
+    result: Option<&crate::spawn_hosts::PumpResult>,
+) {
+    let Some(ordinal) = ordinal else { return };
+    static SOURCE_COUNT: AtomicU64 = AtomicU64::new(0);
+    static CLASS_COUNT: AtomicU64 = AtomicU64::new(0);
+    let count = match kind { StartupKind::Source => &SOURCE_COUNT, StartupKind::Class => &CLASS_COUNT };
+    if count.fetch_add(1, Ordering::Relaxed) >= 48 { return; }
+    let prefix: &[u8] = match kind {
+        StartupKind::Source => b"[source-startup-pump] ordinal/stage/completed/status/flags/wall-label/receipt=",
+        StartupKind::Class => b"[class-startup-pump] ordinal/stage/completed/status/flags/wall-label/receipt=",
+    };
+    print_str(prefix);
+    print_u64(ordinal); print_str(b"/");
+    print_u64(stage); print_str(b"/");
+    if let Some(result) = result {
+        let flags = u32::from(result.scheduler_yielded)
+            | (u32::from(result.receive_yield.is_some()) << 1)
+            | (u32::from(result.service_wait_yield.is_some()) << 2)
+            | (u32::from(result.callback_suspended) << 3)
+            | (u32::from(result.provider_wait_suspended) << 4)
+            | (u32::from(result.lpc_wait_suspended) << 5);
+        print_u64(u64::from(result.completed)); print_str(b"/");
+        print_hex(result.status as u32); print_str(b"/");
+        print_hex(flags); print_str(b"/");
+        print_u64(result.wall_label); print_str(b"/");
+        print_u64(u64::from(result.startup_stack_receipt.is_some()));
+    } else {
+        print_str(b"pending");
+    }
+    print_str(b"\n");
+}
+
 pub(super) fn is_active() -> bool {
     DEPTH.load(Ordering::Acquire) != 0
+}
+
+/// The retained physical route owns this TCB cap. A failed request means the worker is no
+/// longer runnable; the subsequent exact receive remains responsible for any completion.
+fn handoff_exact_component_once(tcb: u64) -> bool {
+    sel4_rt::tcb_yield_to(tcb) == 0
 }
 
 /// Keeps PASSIVE work and projection retirement outside the entire component invocation.
@@ -24,16 +69,25 @@ impl ComponentSchedulerScope {
 
     /// Caller has retained the exact yielded invocation before any scheduler effect. A kernel
     /// caller must also have claimed its canonical receive attempt and released coordinator borrows.
-    pub(crate) unsafe fn service_irq_yield(&self, shared_va: u64) {
+    pub(crate) unsafe fn service_irq_yield(
+        &self, shared_va: u64,
+    ) -> scsi_srb_scheduler_service::SchedulerServiceSample {
+        use scsi_srb_scheduler_service::{SchedulerServiceClock, SchedulerServicePhase};
+        let mut clock = SchedulerServiceClock::new(crate::disk_census_ticks());
         let _message = crate::ipc_message::SavedMessageBuffer::capture();
         let _durable = crate::allocator::enter_durable();
         let mut parent = crate::spawn_hosts::shared_ingress::owner::runtime::nested::park_current()
             .expect("IRQ scheduling must preserve its exact parent invocation");
         let yield_number = YIELDS.fetch_add(1, Ordering::Relaxed) + 1;
+        clock.transition(SchedulerServicePhase::TimerWork, crate::disk_census_ticks());
         crate::dispatcher_bootstrap::request_receive_checkpoint();
         let timer_work = crate::dispatcher_bootstrap::service_hosted_timer_work();
+        clock.transition(SchedulerServicePhase::IrqDrain, crate::disk_census_ticks());
         let irq_lines = drain_pending_hosted_irqs_snapshot();
+        crate::arm_hosted_irq_retry_before_nested_receive();
+        clock.transition(SchedulerServicePhase::DpcDrain, crate::disk_census_ticks());
         let dpcs = drain_hosted_driver_dpcs();
+        clock.transition(SchedulerServicePhase::ReceivePrepare, crate::disk_census_ticks());
         // Nested exchanges may reconcile earlier requests before these effects publish new demand.
         crate::dispatcher_bootstrap::request_receive_checkpoint();
         crate::dispatcher_bootstrap::prepare_receive()
@@ -66,8 +120,10 @@ impl ComponentSchedulerScope {
             }
             print_str(b"\n");
         }
+        clock.transition(SchedulerServicePhase::ParentRestore, crate::disk_census_ticks());
         crate::spawn_hosts::shared_ingress::owner::runtime::nested::restore(&mut parent)
             .expect("IRQ scheduling must restore its retained parent invocation");
+        clock.finish(crate::disk_census_ticks(), timer_work, irq_lines, dpcs)
     }
 }
 
@@ -81,35 +137,82 @@ impl Drop for ComponentSchedulerScope {
     }
 }
 
+/// A component result remains owned by its physical parent on restore refusal. The retained
+/// ticket is a selector only; `runtime::nested` continues to own the stopped TCB and Reply.
+pub(super) enum HostedPumpRestore {
+    Restored(crate::spawn_hosts::PumpResult),
+    Unattributed(crate::spawn_hosts::PumpResult),
+    Retained {
+        result: crate::spawn_hosts::PumpResult,
+        key: nt_component_suspension::NestedRestoreResultKey,
+        ticket: crate::spawn_hosts::shared_ingress::owner::runtime::nested::NestedRestoreTicket,
+        retryable: bool,
+    },
+}
+
+impl HostedPumpRestore {
+    fn legacy(self) -> crate::spawn_hosts::PumpResult {
+        match self {
+            Self::Restored(result) => result,
+            Self::Retained { .. } | Self::Unattributed(_) => panic!("restore nested hosted parent"),
+        }
+    }
+}
+
 pub(super) unsafe fn hosted_component_pump(
     channel: &crate::spawn_hosts::PumpChannel,
 ) -> crate::spawn_hosts::PumpResult {
-    hosted_component_pump_inner(channel, None)
+    hosted_component_pump_inner(channel, None, None).legacy()
 }
 
 pub(super) unsafe fn hosted_component_pump_with_caller(
     channel: &crate::spawn_hosts::PumpChannel,
     caller: nt_process::native_handle::NativeHandleCaller,
 ) -> crate::spawn_hosts::PumpResult {
-    hosted_component_pump_inner(channel, Some(caller))
+    hosted_component_pump_inner(channel, Some(caller), None).legacy()
+}
+
+pub(super) unsafe fn hosted_component_pump_with_caller_retained(
+    channel: &crate::spawn_hosts::PumpChannel,
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> HostedPumpRestore {
+    hosted_component_pump_inner(channel, Some(caller), None)
+}
+
+pub(super) unsafe fn hosted_component_pump_observed(
+    channel: &crate::spawn_hosts::PumpChannel,
+    caller: Option<nt_process::native_handle::NativeHandleCaller>,
+    owner: &scsi_srb_pump_owner::ScsiSrbPumpOwnerClaim<'_, SCSI_SRB_PUMP_OWNER_SLOTS>,
+) -> crate::spawn_hosts::PumpResult {
+    hosted_component_pump_inner(channel, caller, Some(owner)).legacy()
 }
 
 unsafe fn hosted_component_pump_inner(
     channel: &crate::spawn_hosts::PumpChannel,
     caller: Option<nt_process::native_handle::NativeHandleCaller>,
-) -> crate::spawn_hosts::PumpResult {
+    observed_owner: Option<&scsi_srb_pump_owner::ScsiSrbPumpOwnerClaim<'_, SCSI_SRB_PUMP_OWNER_SLOTS>>,
+) -> HostedPumpRestore {
     use crate::spawn_hosts::shared_ingress::owner::runtime;
     let mut channel = *channel;
+    let mut timeline = observed_owner.map(|owner|
+        scsi_srb_pump_owner::ScsiSrbPumpTimeline::new(owner, crate::disk_census_ticks()));
     let route = runtime::channel_route(&channel).expect("physical hosted ingress identity");
     let mut parent = if channel.initial == crate::spawn_hosts::InitialAction::ReplyRequest {
         let parent = runtime::nested::park_current().expect("retain nested hosted parent");
         let route = route.expect("hosted dispatch requires enrolled source");
         runtime::admit(route).expect("admit exact hosted dispatch Call");
         channel.reply_cap = runtime::current_reply(route).expect("admitted canonical Reply");
+        crate::driver_launch::trace_port_connect_pump_boundary(
+            0, &channel, channel.reply_cap, 0,
+        );
         parent
     } else {
         None
     };
+    if let Some(timeline) = timeline.as_mut() {
+        timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::Setup,
+            crate::disk_census_ticks());
+    }
     let channel = &mut channel;
     let _registry_caller = caller.map(|caller| {
         crate::provider_registry_caller::Scope::enter(channel, caller)
@@ -118,16 +221,57 @@ unsafe fn hosted_component_pump_inner(
     crate::driver_launch::driver_thread_projection::enter(channel, caller)
         .expect("driver execution requires its exact retained thread projection");
     let scope = ComponentSchedulerScope::enter();
+    let startup_ordinal =
+        crate::driver_launch::hosted_source_completion_lane::startup_expected(channel)
+            .map(|words| words[0]);
+    let class_startup_ordinal =
+        crate::driver_launch::hosted_class_irp_lane::startup_expected(channel)
+            .map(|words| words[0]);
+    trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 0, None);
+    trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 0, None);
+    if let Some(timeline) = timeline.as_mut() {
+        timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::ProviderPump,
+            crate::disk_census_ticks());
+    }
     let mut result = crate::spawn_hosts::component_pump(channel);
+    trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 1, Some(&result));
+    trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 1, Some(&result));
     while result.scheduler_yielded {
-        scope.service_irq_yield(channel.shared_va);
+        if let Some(timeline) = timeline.as_mut() {
+            timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::SchedulerService,
+                crate::disk_census_ticks());
+        }
+        trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 2, Some(&result));
+        trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 2, Some(&result));
+        let service_sample = scope.service_irq_yield(channel.shared_va);
+        if let Some(owner) = observed_owner {
+            owner.record_scheduler_service(service_sample);
+        }
+        trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 3, Some(&result));
+        trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 3, Some(&result));
+        if route.is_some() {
+            let _ = handoff_exact_component_once(channel.tcb);
+        }
         if let Some(route) = route {
             channel.reply_cap = runtime::current_reply(route).expect("retained canonical Reply");
         }
-        result = crate::spawn_hosts::component_pump_continue_receive(channel, &result)
+        if let Some(timeline) = timeline.as_mut() {
+            timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::ReceiveContinuation,
+                crate::disk_census_ticks());
+        }
+        result = crate::spawn_hosts::component_pump_continue_receive_after_scheduler_service(
+            channel, &result)
             .expect("hosted IRQ yield must retain its exact receive continuation");
+        trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 4, Some(&result));
+        trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 4, Some(&result));
     }
     if result.completed {
+        if let Some(timeline) = timeline.as_mut() {
+            timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::Completion,
+                crate::disk_census_ticks());
+        }
+        trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 5, Some(&result));
+        trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 5, Some(&result));
         let route = route.expect("hosted completion requires enrolled source");
         let dispatch = runtime::dispatch(route).expect("retained hosted dispatch epoch");
         if let Some(words) = result.startup_stack_receipt {
@@ -135,6 +279,8 @@ unsafe fn hosted_component_pump_inner(
                 crate::driver_launch::hosted_source_completion_lane::validate_startup_ready(
                     channel, words
                 ) || crate::driver_launch::hosted_class_irp_lane::validate_startup_ready(
+                    channel, words
+                ) || crate::driver_launch::hosted_provider_export_lane::validate_startup_ready(
                     channel, words
                 ),
                 "authenticate exact retained hosted worker READY"
@@ -146,7 +292,34 @@ unsafe fn hosted_component_pump_inner(
             runtime::complete(route, dispatch, result.reply_cap, channel.dispatch_label)
                 .expect("authenticate hosted final completion Call");
         }
+        trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 6, Some(&result));
+        trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 6, Some(&result));
     }
-    runtime::nested::restore(&mut parent).expect("restore nested hosted parent");
-    result
+    trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 7, Some(&result));
+    trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 7, Some(&result));
+    if let Some(timeline) = timeline.as_mut() {
+        timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::Restore,
+            crate::disk_census_ticks());
+    }
+    let restore_key = parent.as_ref().and_then(|handle| runtime::nested::result_key(handle));
+    let restore_ticket = parent.as_ref().map(|handle| handle.ticket());
+    if runtime::nested::restore(&mut parent).is_err() {
+        // An impossible missing key is still a retained refusal. The physical row remains
+        // discoverable in `runtime::nested`; never return an entered result as completed.
+        let (Some(key), Some(ticket)) = (restore_key, restore_ticket) else {
+            return HostedPumpRestore::Unattributed(result)
+        };
+        return HostedPumpRestore::Retained {
+            result,
+            key,
+            ticket,
+            retryable: runtime::nested::pending_ticket(ticket),
+        };
+    }
+    trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 8, Some(&result));
+    trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 8, Some(&result));
+    if let Some(timeline) = timeline {
+        timeline.finish(crate::disk_census_ticks());
+    }
+    HostedPumpRestore::Restored(result)
 }

@@ -217,6 +217,60 @@ fn retarget_preserves_owner_but_rejects_stale_irp_phase_and_foreign_identity() {
     assert_eq!(table.finish_apc_delivery(&mut lease), Ok(None));
 }
 
+fn attribute_create() -> PendingFileIo {
+    PendingFileIo {
+        route: PendingFileRoute::Hosted(7),
+        irp_id: 10,
+        major: nt_io_abi::major::IRP_MJ_CREATE,
+        operation: PendingFileIoOperation::AttributeQuery(PendingFileAttributeQuery {
+            information_class: nt_fs::FILE_BASIC_INFORMATION,
+            inline_terminal: None,
+        }),
+        pi: 1,
+        tid: 13,
+        badge: 14,
+        output_va: 0x1000,
+        output_len: 40,
+        event_obj_idx: u64::MAX,
+        reply_cap: 77,
+        reply_required: true,
+        ..PendingFileIo::default()
+    }
+}
+
+#[test]
+fn attribute_query_retargets_exact_create_owner_and_keeps_reply() {
+    let mut table = PendingFileIoTable::new();
+    let mut other = PendingFileIoTable::new();
+    let slot = table.park(attribute_create()).unwrap();
+    let identity = table.identity(slot).unwrap();
+    let foreign_slot = other.park(attribute_create()).unwrap();
+    let foreign = other.identity(foreign_slot).unwrap();
+    assert_eq!(table.retarget_attribute_query_owner_exact(foreign, 10, 11), None);
+    assert_eq!(table.retarget_attribute_query_owner_exact(identity, 9, 11), None);
+    table.retarget_attribute_query_owner_exact(identity, 10, 11).unwrap();
+    let pending = table.get_exact(identity).unwrap();
+    assert_eq!(pending.irp_id, 11);
+    assert_eq!(pending.major, nt_io_abi::major::IRP_MJ_QUERY_INFORMATION);
+    assert_eq!(pending.reply_cap, 77);
+    assert_eq!(pending.output_va, 0x1000);
+    assert_eq!(table.retarget_attribute_query_owner_exact(identity, 11, 12), None);
+}
+
+#[test]
+fn inline_attribute_terminal_cannot_replay_create_or_publish_query_bytes() {
+    let mut table = PendingFileIoTable::new();
+    let slot = table.park(attribute_create()).unwrap();
+    let identity = table.identity(slot).unwrap();
+    assert_eq!(table.complete_attribute_query_inline_owner_exact(identity, 9, 0, 40), None);
+    table.complete_attribute_query_inline_owner_exact(identity, 10, 0, 40).unwrap();
+    let pending = table.get_exact(identity).unwrap();
+    assert_eq!(pending.major, nt_io_abi::major::IRP_MJ_QUERY_INFORMATION);
+    assert_eq!(pending.delivery_state, IO_DELIVERY_BUFFER_PUBLISHED);
+    assert_eq!(pending.reply_cap, 77);
+    assert_eq!(table.complete_attribute_query_inline_owner_exact(identity, 10, 0, 40), None);
+}
+
 #[test]
 fn abandonment_keeps_identity_and_enforces_existing_reply_claim_policy() {
     let pending = PendingFileIo {

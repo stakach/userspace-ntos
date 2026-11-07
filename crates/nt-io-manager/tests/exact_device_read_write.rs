@@ -126,6 +126,8 @@ fn exact_read_and_write_use_the_target_transfer_model_without_a_file() {
                 status: NtStatus::SUCCESS,
                 information: 4,
                 file_context: None,
+                completion_driver_id: io.device(lower).unwrap().driver_id,
+                completion_device_id: lower,
             }
         );
         assert_eq!(&output[..4], b"data");
@@ -135,6 +137,8 @@ fn exact_read_and_write_use_the_target_transfer_model_without_a_file() {
                 status: NtStatus::SUCCESS,
                 information: 4,
                 file_context: None,
+                completion_driver_id: io.device(lower).unwrap().driver_id,
+                completion_device_id: lower,
             }
         );
         assert_eq!(lower_state.borrow().calls, vec![

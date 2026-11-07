@@ -14,8 +14,10 @@ pub(crate) struct RoutedImageAdmission {
     pub(crate) capture: crate::driver_launch::hosted_file_capture::Capture,
     pub(crate) metadata: nt_memory_manager::RoutedSectionMetadata,
     pub(crate) header: Vec<u8>,
+    pub(crate) layout: Option<nt_pe_loader::PeLayout>,
     pub(crate) image_path: Vec<u8>,
     pub(crate) observation_target: Option<nt_exe_image::CapturedImageObservation>,
+    pub(crate) registered_file: Option<nt_memory_manager::SectionFileIdentity>,
     pub(crate) name: Option<crate::section_metadata_work::ImageObjectName>,
 }
 
@@ -153,6 +155,11 @@ impl ExecNtHandler {
             .image_sections
             .reserve(admission.metadata.file)
             .map_err(map_image_error)?;
+        let contents = if admission.layout.is_some() {
+            NativeImageContents::RetainedRouted
+        } else {
+            NativeImageContents::Snapshot(admission.header)
+        };
         let result = self.reserve_image_section(
             caller,
             desired_access,
@@ -162,10 +169,11 @@ impl ExecNtHandler {
             allocation_attrs,
             admission.metadata.file,
             admission.metadata.end_of_file,
-            None,
-            NativeImageContents::Snapshot(admission.header),
+            admission.layout,
+            contents,
             admission.name,
             admission.observation_target,
+            admission.registered_file,
             ImageSourceAdmission::Routed {
                 capture: Some(admission.capture),
                 path: admission.image_path,
@@ -211,6 +219,7 @@ impl ExecNtHandler {
             contents,
             name,
             observation_target,
+            observation_target.map(|_| identity),
             ImageSourceAdmission::Local {
                 backing,
                 file,
@@ -234,6 +243,7 @@ impl ExecNtHandler {
         contents: NativeImageContents,
         name: Option<crate::section_metadata_work::ImageObjectName>,
         observation_target: Option<nt_exe_image::CapturedImageObservation>,
+        registered_file: Option<nt_memory_manager::SectionFileIdentity>,
         mut admission: ImageSourceAdmission<'_>,
         image: &mut NativeImageReservation,
     ) -> Result<ReservedNativeImageSection, u32> {
@@ -255,7 +265,9 @@ impl ExecNtHandler {
                 None => match &contents {
                     NativeImageContents::Snapshot(bytes) => nt_pe_loader::PeLayout::parse(bytes)
                         .map_err(|_| STATUS_INVALID_IMAGE_FORMAT)?,
-                    NativeImageContents::RetainedDisk => return Err(STATUS_INVALID_IMAGE_FORMAT),
+                    NativeImageContents::RetainedDisk | NativeImageContents::RetainedRouted => {
+                        return Err(STATUS_INVALID_IMAGE_FORMAT)
+                    }
                 },
             };
             validate_image_layout(&layout, file_size)?;
@@ -323,6 +335,7 @@ impl ExecNtHandler {
                 local_file,
                 image_path,
                 observation_target,
+                registered_file,
             });
         }
         let id = match self.image_sections.publish(image, &mut source) {

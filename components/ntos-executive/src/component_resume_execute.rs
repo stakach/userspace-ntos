@@ -2,6 +2,46 @@
 
 use super::*;
 
+static REPARK_FAILURE_TRACE: AtomicU64 = AtomicU64::new(0);
+
+fn trace_repark_failure(
+    branch: &'static [u8], lane: nt_component_suspension::LaneHandle,
+    key: nt_component_suspension::SuspensionKey, status: u32,
+    next: Option<PendingComponentDispatch>,
+    error: Option<nt_component_suspension::LaneError>,
+) {
+    if REPARK_FAILURE_TRACE.fetch_add(1, Ordering::Relaxed) >= 8 { return; }
+    print_str(b"[component-repark-failure] branch="); print_str(branch);
+    print_str(b" lane/generation/key-kind/key-id=");
+    print_u64(u64::from(lane.index)); print_str(b"/"); print_u64(lane.generation);
+    print_str(b"/"); print_u64(key.kind as u64); print_str(b"/"); print_u64(key.id);
+    print_str(b" status=0x"); print_hex(status);
+    print_str(b" next=");
+    print_str(match next {
+        None => b"none",
+        Some(PendingComponentDispatch::Provider(_)) => b"provider",
+        Some(PendingComponentDispatch::Lpc(_)) => b"lpc",
+        Some(PendingComponentDispatch::Receive(_)) => b"receive",
+        Some(PendingComponentDispatch::ServiceWait(_)) => b"service-wait",
+        Some(PendingComponentDispatch::RootMaintenance(_)) => b"root-maintenance",
+        Some(PendingComponentDispatch::NestedRestore(_)) => b"nested-restore",
+    });
+    print_str(b" error=");
+    print_str(match error {
+        None => b"none",
+        Some(nt_component_suspension::LaneError::InvalidIdentity) => b"invalid-identity",
+        Some(nt_component_suspension::LaneError::DuplicateBinding) => b"duplicate-binding",
+        Some(nt_component_suspension::LaneError::NoCapacity) => b"no-capacity",
+        Some(nt_component_suspension::LaneError::NotFound) => b"not-found",
+        Some(nt_component_suspension::LaneError::StaleGeneration) => b"stale-generation",
+        Some(nt_component_suspension::LaneError::WrongBinding) => b"wrong-binding",
+        Some(nt_component_suspension::LaneError::Busy) => b"busy",
+        Some(nt_component_suspension::LaneError::InvalidPhase) => b"invalid-phase",
+        Some(nt_component_suspension::LaneError::Suspension(_)) => b"suspension",
+    });
+    print_str(b"\n");
+}
+
 pub(crate) unsafe fn run_hosted(
     nt_handler: *mut ExecNtHandler,
     candidate: Candidate,
@@ -21,7 +61,9 @@ pub(crate) unsafe fn run_hosted(
         ComponentNativeContinuation::Hosted(hosted) => hosted,
         ComponentNativeContinuation::Kernel(_) => return None,
     };
-    if matches!(continuation.pending, PendingComponentDispatch::Receive(_)) {
+    if matches!(continuation.pending, PendingComponentDispatch::Receive(_)
+        | PendingComponentDispatch::RootMaintenance(_)
+        | PendingComponentDispatch::NestedRestore(_)) {
         return None;
     }
     if !continuation.return_target.can_resume()
@@ -120,6 +162,8 @@ pub(crate) unsafe fn run_hosted(
         PendingComponentDispatch::Receive(_) => {
             unreachable!("Receive requires its sealed child boundary")
         }
+        PendingComponentDispatch::RootMaintenance(_) => return None,
+        PendingComponentDispatch::NestedRestore(_) => return None,
         PendingComponentDispatch::ServiceWait(pending) => {
             match win32k_glue::resume_suspended_service_wait_component(pending) {
                 win32k_glue::ServiceWaitPumpCompletion::Restored(completion) => match completion {
@@ -191,7 +235,7 @@ pub(crate) unsafe fn run_receive(
                     || pending.yielded.child != permit.admission_key()
                     || pending.yielded.owner != frame.owner
                     || !continuation.return_target.can_resume()
-                    || !win32k_glue::win32k_client_context_is_admitted(pending.client)
+                    || !win32k_glue::win32k_client_context_is_admitted(pending.snapshot.client)
                 {
                     return Err(runtime::Error::Admission);
                 }
@@ -241,6 +285,7 @@ pub(crate) unsafe fn run_receive(
             let next_continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
                 pending: PendingComponentDispatch::Receive(next),
                 return_target: continuation.return_target,
+                destination: continuation.destination,
             });
             runtime::with_bound_receive_scope(next.yielded.parent, |scope| {
                 (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
@@ -269,6 +314,7 @@ pub(crate) unsafe fn run_receive(
             let next_continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
                 pending: PendingComponentDispatch::ServiceWait(next),
                 return_target: continuation.return_target,
+                destination: continuation.destination,
             });
             (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                 .rearm_service_wait_external_owned(
@@ -392,6 +438,7 @@ unsafe fn finish_hosted_resume(
         ComponentPumpCompletion::Failed(status) => {
             // Failed includes pre-entry rejection, a still-parked provider, and uncertain
             // post-entry cleanup. Only Completed carries proof of an actual provider return.
+            trace_repark_failure(b"pump-failed", lane, resume.key, status as u32, None, None);
             component_terminal::retain_incomplete_provider(
                 lane,
                 reply_object,
@@ -450,6 +497,7 @@ unsafe fn finish_hosted_resume(
                 PROVIDER_WAIT_REARMS.fetch_add(1, Ordering::Relaxed);
             }
             let Some(next_owner) = component_expected_owner(next) else {
+                trace_repark_failure(b"invalid-owner", lane, resume.key, 0xC000_000D, Some(next), None);
                 component_terminal::retain_incomplete_provider(
                     lane,
                     reply_object,
@@ -464,6 +512,7 @@ unsafe fn finish_hosted_resume(
                 match (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).reserve() {
                     Ok(reservation) => Some(reservation),
                     Err(_) => {
+                        trace_repark_failure(b"lpc-capacity", lane, resume.key, 0xC000_009A, Some(next), None);
                         component_terminal::retain_incomplete_provider(
                             lane,
                             reply_object,
@@ -482,7 +531,7 @@ unsafe fn finish_hosted_resume(
             let sequence = next_dispatcher_wait_sequence();
             let mut next_continuation = continuation;
             next_continuation.pending = next;
-            if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+            if let Err(error) = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                 .rearm_running(
                     lane,
                     reply_object,
@@ -492,8 +541,8 @@ unsafe fn finish_hosted_resume(
                     next_owner,
                     ComponentNativeContinuation::Hosted(next_continuation),
                 )
-                .is_err()
             {
+                trace_repark_failure(b"rearm", lane, resume.key, 0xC000_000D, Some(next), Some(error));
                 if let Some(reservation) = lpc_reservation {
                     let _ =
                         (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
@@ -584,7 +633,9 @@ unsafe fn finish_hosted_resume(
                         return Some(ComponentSuspensionRuntimeOutcome::Parked);
                     }
                 }
-                PendingComponentDispatch::Receive(_) | PendingComponentDispatch::ServiceWait(_) => {
+                PendingComponentDispatch::Receive(_) | PendingComponentDispatch::ServiceWait(_)
+                | PendingComponentDispatch::RootMaintenance(_)
+                | PendingComponentDispatch::NestedRestore(_) => {
                     unreachable!("nested and service waits transfer before readiness admission")
                 }
             }

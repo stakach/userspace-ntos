@@ -115,7 +115,7 @@ impl ClientFrameRegistry {
             let index = self
                 .index_for(record.pi, record.page)
                 .expect("prevalidated transfer row");
-            self.records.swap_remove(index);
+            self.swap_remove_index(index);
         }
         self.reclaiming -= transfer.records.len();
         Ok(())

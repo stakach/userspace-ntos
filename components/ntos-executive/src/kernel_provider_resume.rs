@@ -21,6 +21,7 @@ unsafe fn claim_driver_entry_wait_resume(
     if authenticated_channel_caller(&channel)? != caller {
         return Err(nt_process::STATUS_INVALID_HANDLE);
     }
+    restore_ps_retirement_window(caller, &channel)?;
     let ticket = with_provider_process_manager(|pm| {
         (&mut *core::ptr::addr_of_mut!(ACTIVATIONS))
             .begin_wait_resume(

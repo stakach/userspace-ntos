@@ -117,6 +117,33 @@ unsafe fn parent_update<T>(device: u64, update: impl FnOnce(&mut Parent) -> T) -
         .map(update)
 }
 
+/// ReactOS VideoPort returns an allocated, null-terminated monitor array even when the
+/// current child list is empty. The caller owns the returned pool allocation. A populated
+/// list needs counted PDO references and a cross-domain projection before publication.
+pub(super) unsafe fn enumerate_monitor_pdos(parent_device: u64) -> Result<u64, i32> {
+    let (driver, _) = opened_video_fdo(parent_device)?;
+    let child_count = {
+        let _guard = ParentsGuard::acquire();
+        (*core::ptr::addr_of!(PARENTS)).iter()
+            .find(|parent| parent.device == parent_device)
+            .map(|parent| {
+                (parent.driver == driver && parent.phase == Phase::Ready
+                    && parent.children.iter().all(|child| {
+                    child.phase == ChildPhase::Published && child.device != 0
+                })).then_some(parent.children.len())
+            })
+            .unwrap_or(Some(0))
+    }.ok_or(STATUS_DEVICE_BUSY)?;
+    if child_count != 0 {
+        return Err(0xc000_00bbu32 as i32); // Cross-domain reference transfer is required.
+    }
+    let allocation = pool_alloc(nt_io_manager::video_monitor_array_projection::VIDEO_MONITOR_DEVICE_X64_BYTES as u64);
+    if allocation == 0 { return Err(STATUS_INSUFFICIENT_RESOURCES); }
+    core::ptr::write_bytes(allocation as *mut u8, 0,
+        nt_io_manager::video_monitor_array_projection::VIDEO_MONITOR_DEVICE_X64_BYTES);
+    Ok(allocation)
+}
+
 unsafe fn complete(irp: u64, status: i32, information: u64) -> i32 {
     write_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32, status);
     write_unaligned((irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *mut u64, information);

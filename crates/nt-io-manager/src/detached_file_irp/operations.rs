@@ -26,6 +26,8 @@ pub enum ExternalFileIrpOutputCapture {
     /// The driver modified its METHOD_NEITHER Type3InputBuffer. Capture the exact input bytes
     /// independently of IoStatus.Information; output length must be zero.
     MethodNeitherInput,
+    /// Full authenticated SCSI completion packet, including SRB/data/sense on error status.
+    Scsi,
 }
 impl ExternalFileIrpOutputCapture {
     pub(super) fn required_len(
@@ -96,6 +98,12 @@ impl ExternalFileIrpOutputCapture {
                     }
                     _ => Err(NtStatus::INVALID_PARAMETER),
                 }
+            }
+            Self::Scsi => {
+                if owner.projection.major != major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                    || !matches!(owner.projection.parameters, IoParameters::Scsi(_))
+                { return Err(NtStatus::INVALID_PARAMETER); }
+                Ok(capacity)
             }
         }
     }

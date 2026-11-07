@@ -4,6 +4,7 @@
 //! identity. A forwarded IRP stays pinned until its source-domain completion has finished.
 
 use alloc::vec::Vec;
+use core::num::NonZeroU64;
 
 use crate::retained_query_path_forward::SourceIrpTicket;
 use crate::{HostedDomainId, HostedDomainIdentity};
@@ -62,6 +63,25 @@ impl SourceIrpForwardIdentity {
     }
 }
 
+/// One use of a physically registered IRP. A terminal use may remain owned
+/// through provider ACK while the same pool allocation starts a newer use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceIrpUseTicket {
+    registration: SourceIrpTicket,
+    epoch: NonZeroU64,
+}
+
+impl SourceIrpUseTicket {
+    pub fn new(registration: SourceIrpTicket, epoch: NonZeroU64) -> Option<Self> {
+        (registration.domain.domain_id != HostedDomainId::NULL
+            && registration.domain.cookie != 0)
+            .then_some(Self { registration, epoch })
+    }
+
+    pub fn registration(self) -> SourceIrpTicket { self.registration }
+    pub fn epoch(self) -> NonZeroU64 { self.epoch }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceIrpLedgerError {
     InvalidAllocation,
@@ -96,10 +116,20 @@ struct Row {
     retirement_started: bool,
     defer_free_armed: bool,
     free_requested: bool,
+    current_scsi_epoch: NonZeroU64,
+    scsi_epoch_used: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScsiUseRow {
+    ticket: SourceIrpUseTicket,
+    allocation: SourceIrpAllocation,
+    free_armed: bool,
 }
 
 pub struct SourceIrpLedger {
     rows: Vec<Row>,
+    scsi_uses: Vec<ScsiUseRow>,
     next_serial: u64,
     /// StartIo owns device/source lifetimes here; the WDM device queue alone selects packets.
     pub(crate) start_io_owners: Vec<crate::start_io_native_owner::StartIoAdmission>,
@@ -115,6 +145,7 @@ impl SourceIrpLedger {
     pub const fn new() -> Self {
         Self {
             rows: Vec::new(),
+            scsi_uses: Vec::new(),
             next_serial: 1,
             start_io_owners: Vec::new(),
         }
@@ -155,8 +186,188 @@ impl SourceIrpLedger {
             retirement_started: false,
             defer_free_armed: false,
             free_requested: false,
+            current_scsi_epoch: NonZeroU64::new(1).unwrap(),
+            scsi_epoch_used: false,
         });
         Ok(ticket)
+    }
+
+    /// Claim the current IRP header use without conflating it with another
+    /// submission retained against the same physical registration.
+    pub fn pin_scsi_use(
+        &mut self,
+        registration: SourceIrpTicket,
+        allocation: SourceIrpAllocation,
+    ) -> Result<SourceIrpUseTicket, SourceIrpLedgerError> {
+        if !matches!(allocation.owner, SourceIrpOwner::HostedDriver(_)) {
+            return Err(SourceIrpLedgerError::WrongIdentity);
+        }
+        let index = self.rows.iter().position(|row| {
+            row.ticket == registration && row.allocation == allocation
+        }).ok_or(SourceIrpLedgerError::WrongIdentity)?;
+        let row = &self.rows[index];
+        if row.retirement_started || row.free_requested || row.defer_free_armed {
+            return Err(SourceIrpLedgerError::RetirementStarted);
+        }
+        if row.scsi_epoch_used {
+            return Err(SourceIrpLedgerError::AlreadyLive);
+        }
+        let owned = self.scsi_uses.iter().filter(|use_row| {
+            use_row.ticket.registration == registration && use_row.allocation == allocation
+        }).count();
+        if Some(row.pins) != u32::try_from(owned).ok() {
+            return Err(SourceIrpLedgerError::Pinned);
+        }
+        let pins = row.pins.checked_add(1).ok_or(SourceIrpLedgerError::Exhausted)?;
+        let ticket = SourceIrpUseTicket { registration, epoch: row.current_scsi_epoch };
+        self.scsi_uses.try_reserve(1).map_err(|_| SourceIrpLedgerError::Exhausted)?;
+        self.rows[index].pins = pins;
+        self.rows[index].scsi_epoch_used = true;
+        self.scsi_uses.push(ScsiUseRow { ticket, allocation, free_armed: false });
+        Ok(ticket)
+    }
+
+    /// A completed use still consumes its epoch. The next IoReuseIrp must
+    /// advance it even when no prior provider acknowledgement remains pinned.
+    pub fn scsi_reuse_needed(
+        &self, registration: SourceIrpTicket, allocation: SourceIrpAllocation,
+    ) -> bool {
+        self.rows.iter().any(|row| row.ticket == registration
+            && row.allocation == allocation && row.scsi_epoch_used)
+    }
+
+    /// The source callback may request a deferred physical free only for its
+    /// exact use. This arm does not authorize an unrelated generic forward.
+    pub fn arm_scsi_deferred_free(
+        &mut self,
+        ticket: SourceIrpUseTicket,
+        allocation: SourceIrpAllocation,
+    ) -> Result<(), SourceIrpLedgerError> {
+        let row = self.rows.iter().find(|row| {
+            row.ticket == ticket.registration && row.allocation == allocation
+        }).ok_or(SourceIrpLedgerError::WrongIdentity)?;
+        if row.retirement_started || row.free_requested {
+            return Err(SourceIrpLedgerError::RetirementStarted);
+        }
+        let use_row = self.scsi_uses.iter_mut().find(|use_row| {
+            use_row.ticket == ticket && use_row.allocation == allocation
+        }).ok_or(SourceIrpLedgerError::WrongIdentity)?;
+        if use_row.free_armed {
+            return Ok(());
+        }
+        use_row.free_armed = true;
+        Ok(())
+    }
+
+    /// Admit `IoReuseIrp` only after every older exact SCSI use has committed
+    /// copyback and published its terminal result. The callback is an
+    /// observation of retained use authority, never an address-only token.
+    pub fn plan_scsi_reuse(
+        &mut self,
+        registration: SourceIrpTicket,
+        allocation: SourceIrpAllocation,
+        mut copyback_committed: impl FnMut(SourceIrpUseTicket) -> bool,
+    ) -> Result<SourceIrpUseTicket, SourceIrpLedgerError> {
+        let index = self.rows.iter().position(|row| {
+            row.ticket == registration && row.allocation == allocation
+        }).ok_or(SourceIrpLedgerError::WrongIdentity)?;
+        let row = &self.rows[index];
+        if !matches!(allocation.owner, SourceIrpOwner::HostedDriver(_)) {
+            return Err(SourceIrpLedgerError::WrongIdentity);
+        }
+        if row.retirement_started || row.free_requested || row.defer_free_armed {
+            return Err(SourceIrpLedgerError::RetirementStarted);
+        }
+        let owned = self.scsi_uses.iter().filter(|use_row| {
+            use_row.ticket.registration == registration && use_row.allocation == allocation
+        }).count();
+        if Some(row.pins) != u32::try_from(owned).ok() {
+            return Err(SourceIrpLedgerError::Pinned);
+        }
+        if self.scsi_uses.iter().filter(|use_row| {
+            use_row.ticket.registration == registration && use_row.allocation == allocation
+        }).any(|use_row| !use_row.free_armed
+            || !copyback_committed(use_row.ticket)) {
+            return Err(SourceIrpLedgerError::Pinned);
+        }
+        let epoch = row.current_scsi_epoch.get().checked_add(1)
+            .and_then(NonZeroU64::new).ok_or(SourceIrpLedgerError::Exhausted)?;
+        let ticket = SourceIrpUseTicket { registration, epoch };
+        self.rows[index].current_scsi_epoch = epoch;
+        self.rows[index].scsi_epoch_used = false;
+        Ok(ticket)
+    }
+
+    /// A proved-not-entered capture may drop only its own use, with no
+    /// provider effect to acknowledge or free arm to discharge.
+    pub fn abandon_scsi_use(
+        &mut self,
+        ticket: SourceIrpUseTicket,
+        allocation: SourceIrpAllocation,
+    ) -> Result<(), SourceIrpLedgerError> {
+        let index = self.rows.iter().position(|row| {
+            row.ticket == ticket.registration && row.allocation == allocation
+        }).ok_or(SourceIrpLedgerError::WrongIdentity)?;
+        let use_index = self.scsi_uses.iter().position(|use_row| {
+            use_row.ticket == ticket && use_row.allocation == allocation
+        }).ok_or(SourceIrpLedgerError::WrongIdentity)?;
+        if self.scsi_uses[use_index].free_armed || self.rows[index].free_requested
+            || self.rows[index].retirement_started || self.rows[index].pins == 0 {
+            return Err(SourceIrpLedgerError::RetirementStarted);
+        }
+        self.scsi_uses.swap_remove(use_index);
+        self.rows[index].pins -= 1;
+        Ok(())
+    }
+
+    /// A completed no-free callback releases one exact old use; another use
+    /// of the same allocation remains pinned and cannot be retired by its ACK.
+    pub fn complete_scsi_use(
+        &mut self,
+        ticket: SourceIrpUseTicket,
+        allocation: SourceIrpAllocation,
+    ) -> Result<(), SourceIrpLedgerError> {
+        let index = self.rows.iter().position(|row| {
+            row.ticket == ticket.registration && row.allocation == allocation
+        }).ok_or(SourceIrpLedgerError::WrongIdentity)?;
+        let use_index = self.scsi_uses.iter().position(|use_row| {
+            use_row.ticket == ticket && use_row.allocation == allocation
+        }).ok_or(SourceIrpLedgerError::WrongIdentity)?;
+        if self.rows[index].retirement_started || self.rows[index].free_requested
+            || !self.scsi_uses[use_index].free_armed || self.rows[index].pins == 0 {
+            return Err(SourceIrpLedgerError::RetirementStarted);
+        }
+        self.scsi_uses.swap_remove(use_index);
+        self.rows[index].pins -= 1;
+        Ok(())
+    }
+
+    /// Resolve a requested physical free only after this exact use and all
+    /// other owners have completed. A surviving use is never consumed by an
+    /// older ACK or physical-free acknowledgement.
+    pub fn begin_deferred_scsi_retirement(
+        &mut self,
+        ticket: SourceIrpUseTicket,
+        allocation: SourceIrpAllocation,
+    ) -> Result<SourceIrpRetirement, SourceIrpLedgerError> {
+        let index = self.rows.iter().position(|row| {
+            row.ticket == ticket.registration && row.allocation == allocation
+        }).ok_or(SourceIrpLedgerError::WrongIdentity)?;
+        let use_index = self.scsi_uses.iter().position(|use_row| {
+            use_row.ticket == ticket && use_row.allocation == allocation
+        }).ok_or(SourceIrpLedgerError::WrongIdentity)?;
+        if self.rows[index].retirement_started || !self.rows[index].free_requested
+            || !self.scsi_uses[use_index].free_armed || self.rows[index].pins == 0 {
+            return Err(SourceIrpLedgerError::WrongIdentity);
+        }
+        self.scsi_uses.swap_remove(use_index);
+        self.rows[index].pins -= 1;
+        if self.rows[index].pins == 0 {
+            self.rows[index].retirement_started = true;
+            Ok(SourceIrpRetirement::Retired(ticket.registration))
+        } else {
+            Ok(SourceIrpRetirement::Deferred(ticket.registration))
+        }
     }
 
     pub fn pin(
@@ -282,19 +493,71 @@ impl SourceIrpLedger {
         Ok(())
     }
 
+    /// Admit an in-place IRP header mutation while the caller holds both the source
+    /// ownership and physical pool locks. A pending free is distinct from an idle IRP.
+    pub fn mutation_ready(
+        &self,
+        ticket: SourceIrpTicket,
+        allocation: SourceIrpAllocation,
+    ) -> Result<(), SourceIrpLedgerError> {
+        let row = self.rows.iter().find(|row| row.ticket == ticket)
+            .ok_or(SourceIrpLedgerError::WrongIdentity)?;
+        if row.allocation != allocation {
+            return Err(SourceIrpLedgerError::WrongIdentity);
+        }
+        if row.retirement_started || row.defer_free_armed || row.free_requested {
+            return Err(SourceIrpLedgerError::RetirementStarted);
+        }
+        if row.pins != 0 {
+            return Err(SourceIrpLedgerError::Pinned);
+        }
+        Ok(())
+    }
+
     pub fn unpin(&mut self, ticket: SourceIrpTicket) -> Result<(), SourceIrpLedgerError> {
-        let row = self
-            .rows
-            .iter_mut()
-            .find(|row| row.ticket == ticket)
+        let scsi_pins = self.scsi_uses.iter()
+            .filter(|use_row| use_row.ticket.registration == ticket).count();
+        let row = self.rows.iter_mut().find(|row| row.ticket == ticket)
             .ok_or(SourceIrpLedgerError::WrongIdentity)?;
         if row.retirement_started {
             return Err(SourceIrpLedgerError::RetirementStarted);
         }
-        if row.pins == 0 {
+        if usize::try_from(row.pins).ok().is_none_or(|pins| pins <= scsi_pins) {
             return Err(SourceIrpLedgerError::WrongIdentity);
         }
         row.pins -= 1;
+        Ok(())
+    }
+
+    /// Release a completed driver forward whose callback did not request IRP free.
+    /// The terminal adapter calls this only after both source completion and
+    /// provider acknowledgement. An unused callback-free arm survives other
+    /// active pins and is cleared only when the last owner is released.
+    pub fn complete_driver_forward_without_free(
+        &mut self,
+        ticket: SourceIrpTicket,
+        allocation: SourceIrpAllocation,
+    ) -> Result<(), SourceIrpLedgerError> {
+        if !matches!(allocation.owner, SourceIrpOwner::HostedDriver(_)) {
+            return Err(SourceIrpLedgerError::WrongIdentity);
+        }
+        let scsi_pins = self.scsi_uses.iter().filter(|use_row| {
+            use_row.ticket.registration == ticket && use_row.allocation == allocation
+        }).count();
+        let row = self.rows.iter_mut()
+            .find(|row| row.ticket == ticket && row.allocation == allocation)
+            .ok_or(SourceIrpLedgerError::WrongIdentity)?;
+        if row.retirement_started || row.free_requested {
+            return Err(SourceIrpLedgerError::RetirementStarted);
+        }
+        if !row.defer_free_armed
+            || usize::try_from(row.pins).ok().is_none_or(|pins| pins <= scsi_pins) {
+            return Err(SourceIrpLedgerError::WrongIdentity);
+        }
+        row.pins -= 1;
+        if usize::try_from(row.pins).ok() == Some(scsi_pins) {
+            row.defer_free_armed = false;
+        }
         Ok(())
     }
 
@@ -309,11 +572,15 @@ impl SourceIrpLedger {
     pub fn begin_deferred_driver_retirement(
         &mut self, ticket: SourceIrpTicket, allocation: SourceIrpAllocation,
     ) -> Result<SourceIrpRetirement, SourceIrpLedgerError> {
+        let scsi_pins = self.scsi_uses.iter().filter(|use_row| {
+            use_row.ticket.registration == ticket && use_row.allocation == allocation
+        }).count();
         let row = self.rows.iter_mut().find(|row| row.ticket == ticket && row.allocation == allocation)
             .ok_or(SourceIrpLedgerError::WrongIdentity)?;
         if row.retirement_started { return Err(SourceIrpLedgerError::RetirementStarted); }
         if !matches!(allocation.owner, SourceIrpOwner::HostedDriver(_))
-            || !row.free_requested || row.pins == 0 {
+            || !row.free_requested
+            || usize::try_from(row.pins).ok().is_none_or(|pins| pins <= scsi_pins) {
             return Err(SourceIrpLedgerError::WrongIdentity);
         }
         row.pins -= 1;
@@ -343,12 +610,15 @@ impl SourceIrpLedger {
         &mut self,
         ticket: SourceIrpTicket,
     ) -> Result<(), SourceIrpLedgerError> {
+        let scsi_pins = self.scsi_uses.iter()
+            .filter(|use_row| use_row.ticket.registration == ticket).count();
         let row = self
             .rows
             .iter_mut()
             .find(|row| row.ticket == ticket)
             .ok_or(SourceIrpLedgerError::WrongIdentity)?;
-        if row.pins == 0 || row.retirement_started || row.defer_free_armed || row.free_requested {
+        if usize::try_from(row.pins).ok().is_none_or(|pins| pins <= scsi_pins)
+            || row.retirement_started || row.defer_free_armed || row.free_requested {
             return Err(SourceIrpLedgerError::WrongIdentity);
         }
         row.defer_free_armed = true;
@@ -433,7 +703,21 @@ impl SourceIrpLedger {
             return Err(SourceIrpLedgerError::RetirementStarted);
         }
         if self.rows[index].pins != 0 {
-            if !self.rows[index].defer_free_armed {
+            let exact_scsi_uses = self.scsi_uses.iter().filter(|use_row| {
+                use_row.ticket.registration == self.rows[index].ticket
+                    && use_row.allocation == self.rows[index].allocation
+            }).count();
+            let armed_scsi_uses = self.scsi_uses.iter().filter(|use_row| {
+                use_row.ticket.registration == self.rows[index].ticket
+                    && use_row.allocation == self.rows[index].allocation
+                    && use_row.free_armed
+            }).count();
+            let Some(generic_pins) = usize::try_from(self.rows[index].pins).ok()
+                .and_then(|pins| pins.checked_sub(exact_scsi_uses)) else {
+                return Err(SourceIrpLedgerError::WrongIdentity);
+            };
+            if armed_scsi_uses != exact_scsi_uses
+                || (generic_pins != 0 && !self.rows[index].defer_free_armed) {
                 return Err(SourceIrpLedgerError::Pinned);
             }
             if self.rows[index].free_requested {
@@ -509,6 +793,11 @@ impl SourceIrpLedger {
             .position(|row| row.ticket == ticket && row.allocation == allocation)
             .ok_or(SourceIrpLedgerError::WrongIdentity)?;
         if self.rows[index].pins != 0 {
+            return Err(SourceIrpLedgerError::Pinned);
+        }
+        if self.scsi_uses.iter().any(|use_row| {
+            use_row.ticket.registration == ticket && use_row.allocation == allocation
+        }) {
             return Err(SourceIrpLedgerError::Pinned);
         }
         self.rows.swap_remove(index);
@@ -866,6 +1155,50 @@ mod tests {
         assert!(ledger.matches(owner.owner, owner, ticket));
         ledger.retire(ticket, owner).unwrap();
         assert!(!ledger.deferred_free_requested(ticket));
+    }
+
+    #[test]
+    fn completed_pooled_driver_irp_without_free_can_be_reused_after_exact_release() {
+        let mut ledger = SourceIrpLedger::new();
+        let owner = allocation(0x5000, 44);
+        let ticket = ledger.register(owner).unwrap();
+        ledger.pin_hosted_forward(3, owner.domain, owner.component_address).unwrap();
+        ledger.arm_deferred_free(ticket).unwrap();
+        assert_eq!(ledger.mutation_ready(ticket, owner),
+            Err(SourceIrpLedgerError::RetirementStarted));
+
+        // The completion did not call IoFreeIrp. Only the exact ticket and
+        // physical allocation may release its arm after provider ACK and
+        // source completion; ClassPnP then reuses this transfer-packet IRP.
+        let stale = SourceIrpAllocation { pool_generation: 45, ..owner };
+        assert!(ledger.complete_driver_forward_without_free(ticket, stale).is_err());
+        ledger.complete_driver_forward_without_free(ticket, owner).unwrap();
+        assert_eq!(ledger.mutation_ready(ticket, owner), Ok(()));
+        assert!(ledger.complete_driver_forward_without_free(ticket, owner).is_err());
+
+        let freed = allocation(0x6000, 44);
+        let free_ticket = ledger.register(freed).unwrap();
+        ledger.pin_hosted_forward(3, freed.domain, freed.component_address).unwrap();
+        ledger.arm_deferred_free(free_ticket).unwrap();
+        assert_eq!(ledger.prepare_driver_free(3, freed.domain, freed.component_address),
+            Ok(SourceIrpRetirement::Deferred(free_ticket)));
+        assert!(ledger.complete_driver_forward_without_free(free_ticket, freed).is_err());
+        assert_eq!(ledger.mutation_ready(free_ticket, freed),
+            Err(SourceIrpLedgerError::RetirementStarted));
+        assert_eq!(ledger.begin_deferred_driver_retirement(free_ticket, freed),
+            Ok(SourceIrpRetirement::Retired(free_ticket)));
+        ledger.retire(free_ticket, freed).unwrap();
+
+        let shared = allocation(0x7000, 44);
+        let shared_ticket = ledger.register(shared).unwrap();
+        ledger.pin_hosted_forward(3, shared.domain, shared.component_address).unwrap();
+        ledger.pin_hosted_forward(3, shared.domain, shared.component_address).unwrap();
+        ledger.arm_deferred_free(shared_ticket).unwrap();
+        ledger.complete_driver_forward_without_free(shared_ticket, shared).unwrap();
+        assert!(ledger.mutation_ready(shared_ticket, shared).is_err(),
+            "one remaining forward still owns the reusable packet");
+        ledger.complete_driver_forward_without_free(shared_ticket, shared).unwrap();
+        assert_eq!(ledger.mutation_ready(shared_ticket, shared), Ok(()));
     }
 
     #[test]

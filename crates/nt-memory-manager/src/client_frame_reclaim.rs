@@ -230,7 +230,7 @@ impl ClientFrameRegistry {
         }
         terminal(expected).map_err(ClientFrameReclaimError::Backend)?;
         self.reclaiming -= 1;
-        Ok(self.records.swap_remove(index))
+        Ok(self.swap_remove_index(index))
     }
 
     /// Explicit terminal-VM teardown conversion, never ordinary working-set policy. The caller

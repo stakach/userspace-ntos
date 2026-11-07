@@ -10,6 +10,8 @@ const ROOT_THREAD_CAP: u64 = 1;
 pub(crate) enum ReceiveOutcome {
     Message((u64, u64, u64, u64, u64, u64)),
     OuterBoundary(runtime::ReceiveSettlementBoundary),
+    /// The current Reply remains owned after a refused or uncertain release.
+    RetainedFailure,
 }
 
 impl ReceiveOutcome {
@@ -19,6 +21,9 @@ impl ReceiveOutcome {
             Self::Message(message) => message,
             Self::OuterBoundary(_) => {
                 panic!("receive continuation requires the outer service boundary")
+            }
+            Self::RetainedFailure => {
+                panic!("retained ingress requires the outer service boundary")
             }
         }
     }
@@ -42,31 +47,42 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
         REPLY_MAIN_SLOT.load(Ordering::Relaxed),
         "shared root receive must own the current hosted Reply"
     );
-    if let Some(boundary) = runtime::take_outer_boundary()
-        .expect("settled child retains its exact parent restoration permit")
-    {
-        return ReceiveOutcome::OuterBoundary(boundary);
+    match runtime::take_outer_boundary() {
+        Ok(Some(boundary)) => return ReceiveOutcome::OuterBoundary(boundary),
+        Ok(None) => {}
+        Err(_) => {
+            print_str(b"[ingress-receive-error] child settlement retained\n");
+            return ReceiveOutcome::RetainedFailure;
+        }
     }
     if reply_cptr != 0 {
         if runtime::owns_hosted_reply(reply_cptr) {
-            runtime::release_hosted_reply(reply_cptr).expect(
-                "root receive retains a hosted Call until acknowledged semantic completion",
-            );
+            if runtime::release_hosted_reply(reply_cptr).is_err() {
+                // A terminating caller may still own its physical Call even after the
+                // semantic dispatch has ended. Keep that Reply unavailable and offer a
+                // fresh slot to the next receive; never replay or replace its old Call.
+                if !crate::root_reply_park::quarantine_current_hosted_reply() {
+                    return ReceiveOutcome::RetainedFailure;
+                }
+            }
         } else {
-            assert_eq!(
-                crate::spawn_hosts::query_component_reply_binding(ROOT_THREAD_CAP, reply_cptr),
-                Ok(ReplyBindingObservation::Free),
-                "root receive cannot replace a held hosted Reply"
-            );
+            if crate::spawn_hosts::query_component_reply_binding(ROOT_THREAD_CAP, reply_cptr)
+                != Ok(ReplyBindingObservation::Free)
+            {
+                return ReceiveOutcome::RetainedFailure;
+            }
         }
     }
     loop {
-        if let Some(boundary) = runtime::take_outer_boundary()
-            .expect("settled child retains its exact parent restoration permit")
-        {
-            return ReceiveOutcome::OuterBoundary(boundary);
+        match runtime::take_outer_boundary() {
+            Ok(Some(boundary)) => return ReceiveOutcome::OuterBoundary(boundary),
+            Ok(None) => {}
+            Err(_) => {
+                print_str(b"[ingress-receive-error] child settlement retained\n");
+                return ReceiveOutcome::RetainedFailure;
+            }
         }
-        let delivered = runtime::take_hosted_with(|reply, _message| {
+        let delivered = match runtime::take_hosted_with(|reply, _message| {
             if !runtime::receive_child_delivery_allowed(reply) {
                 return false;
             }
@@ -86,16 +102,39 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
             // Allocation and admission precede the ownership transfer. Failure leaves the full
             // incoming Call in the ingress queue and the old root Reply unchanged.
             let _durable = crate::allocator::enter_durable();
-            if wait_reply_pool_insert_cap(reply, true).is_none() {
+            let Some(new_index) = wait_reply_pool_insert_cap(reply, true) else {
+                return false;
+            };
+            if REPLY_MAIN_SLOT.load(Ordering::Relaxed) != reply_cptr {
+                if let Some(new_identity) = wait_reply_pool_mut().at(new_index) {
+                    let _ = wait_reply_pool_mut().clear(new_identity, None);
+                }
                 return false;
             }
-            REPLY_MAIN_SLOT.store(reply, Ordering::Relaxed);
             if let Some(old_index) = old_index {
-                wait_reply_pool_mark_free(old_index);
+                let pool = wait_reply_pool_mut();
+                let Some(new_identity) = pool.at(new_index) else { return false; };
+                if new_identity.cap() != reply { return false; }
+                let Some(old_identity) = pool.at(old_index) else {
+                    let _ = pool.clear(new_identity, None);
+                    return false;
+                };
+                if pool.replace_main_after_free_observation(old_identity, new_identity).is_err() {
+                    let _ = pool.clear(new_identity, Some(old_identity));
+                    return false;
+                }
             }
+            REPLY_MAIN_SLOT.store(reply, Ordering::Relaxed);
             true
-        })
-        .expect("hosted ingress handoff retained after refusal");
+        }) {
+            Ok(delivered) => delivered,
+            Err(_) => {
+                // The hosted ingress row still owns the exact Call and Reply. Do not
+                // admit another receive until that owner can be reconciled.
+                print_str(b"[ingress-receive-error] hosted handoff retained\n");
+                return ReceiveOutcome::RetainedFailure;
+            }
+        };
         if let Some((_reply, message)) = delivered {
             return ReceiveOutcome::Message(materialize(message));
         }
@@ -112,9 +151,41 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
                 continue;
             }
         }
-        match runtime::receive(IngressExecutionOwner::Idle, ROOT_THREAD_CAP, true)
-            .expect("unified executive ingress retained after receive failure")
-        {
+        let arrival = match runtime::receive(IngressExecutionOwner::Idle, ROOT_THREAD_CAP, true) {
+            Ok(arrival) => arrival,
+            Err(error) => {
+                print_str(b"[ingress-receive-error] root kind=");
+                let kind: &[u8] = match error {
+                    runtime::Error::Receive => b"receive\n",
+                    runtime::Error::Retain => b"retain\n",
+                    runtime::Error::UnknownPeer => b"unknown-peer\n",
+                    runtime::Error::Protocol => b"protocol\n",
+                    _ => b"other\n",
+                };
+                print_str(kind);
+                if let Some(running) = runtime::hold_snapshot().running {
+                    print_str(b"[ingress-receive-error] running lane/gen/route/kind=");
+                    print_u64(running.lane.index as u64);
+                    print_str(b"/");
+                    print_u64(running.lane.generation);
+                    print_str(b"/");
+                    print_u64(running.route.map_or(0, |route| route.badge()));
+                    print_str(b"/");
+                    let source_kind: &[u8] = match running.physical.map(|source| source.kind) {
+                        Some(runtime::PhysicalSourceKind::SystemThread { .. }) => b"system-thread\n",
+                        Some(runtime::PhysicalSourceKind::DispatchWorker { .. }) => b"dispatch-worker\n",
+                        Some(runtime::PhysicalSourceKind::Primary) => b"primary\n",
+                        _ => b"other\n",
+                    };
+                    print_str(source_kind);
+                }
+                // Receive/classification failed before a new Call was admitted to a handler.
+                // The receiver still owns any incomplete physical arrival; the outer loop
+                // must stop rather than replace it or make an uncertain effect again.
+                return ReceiveOutcome::RetainedFailure;
+            }
+        };
+        match arrival {
             runtime::Arrival::Notification(message) => {
                 return ReceiveOutcome::Message(materialize(message))
             }
@@ -133,9 +204,17 @@ pub(crate) unsafe fn reply_receive(
 ) -> ReceiveOutcome {
     // One-way acknowledged reply separates outgoing ownership from receive admission. The
     // unified receiver retains arrivals between these operations, including hosted reentry.
-    assert!(
-        client_reply_on(reply_cptr, info, r0, r1, r2, r3),
-        "uncertain hosted reply cannot be replayed or replaced"
-    );
+    if !client_reply_on(reply_cptr, info, r0, r1, r2, r3) {
+        // The retained hosted Call still owns its exact Reply after a refused or
+        // indeterminate send. Quarantine that pool slot before accepting another Call;
+        // never replay the old send. A non-hosted Reply has no such proved owner.
+        if runtime::owns_hosted_reply(reply_cptr)
+            && REPLY_MAIN_SLOT.load(Ordering::Relaxed) == reply_cptr
+            && crate::root_reply_park::quarantine_current_hosted_reply()
+        {
+            return receive(0);
+        }
+        return ReceiveOutcome::RetainedFailure;
+    }
     receive(REPLY_MAIN_SLOT.load(Ordering::Relaxed))
 }

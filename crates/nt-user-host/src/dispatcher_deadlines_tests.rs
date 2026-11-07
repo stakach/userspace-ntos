@@ -19,6 +19,7 @@ fn queue(deadline: Deadline) -> Queue {
             reply_cap: 17,
             thread_id: 23,
             badge: 29,
+            observation: None,
         })
         .unwrap();
     queue

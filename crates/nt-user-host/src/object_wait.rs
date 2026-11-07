@@ -32,6 +32,49 @@ impl ObjectWaiterIdentity {
     }
 }
 
+/// Monotonic timing of one exact parked wait. This is observation only: it does not
+/// own the Reply, select a result, or authorize a wake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectWaitLatencyStamp {
+    parked_at_100ns: u64,
+    selected_at_100ns: Option<u64>,
+}
+
+impl ObjectWaitLatencyStamp {
+    pub const fn new(parked_at_100ns: u64) -> Self {
+        Self { parked_at_100ns, selected_at_100ns: None }
+    }
+
+    pub const fn parked_age_100ns(self, now_100ns: u64) -> Option<u64> {
+        now_100ns.checked_sub(self.parked_at_100ns)
+    }
+
+    /// Preserve the first selected terminal result's time across later reply retries.
+    pub fn mark_selected(&mut self, now_100ns: u64) -> bool {
+        if self.selected_at_100ns.is_some() || now_100ns < self.parked_at_100ns {
+            return false;
+        }
+        self.selected_at_100ns = Some(now_100ns);
+        true
+    }
+
+    /// Separate scheduler wait from retained Reply delivery without changing either phase.
+    pub const fn ages_at_reply(self, now_100ns: u64) -> Option<(u64, u64)> {
+        let selected = match self.selected_at_100ns {
+            Some(selected) => selected,
+            None => return None,
+        };
+        let parked = match selected.checked_sub(self.parked_at_100ns) {
+            Some(parked) => parked,
+            None => return None,
+        };
+        match now_100ns.checked_sub(selected) {
+            Some(reply) => Some((parked, reply)),
+            None => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Owned<T> {
     generation: u64,

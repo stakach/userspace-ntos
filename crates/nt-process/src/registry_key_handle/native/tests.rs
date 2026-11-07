@@ -94,6 +94,34 @@ fn native_key_scope_grants_and_attributes_are_strict() {
 }
 
 #[test]
+fn registry_root_handle_is_owned_by_exact_calling_process() {
+    let (mut pm, first, _) = fixture();
+    let second_pid = pm.create_process("second-client", None, None);
+    let second_tid = pm.create_thread(second_pid, 0, 0, false).unwrap();
+    let second = pm
+        .capture_native_handle_caller(
+            pm.thread_lifetime(second_tid).unwrap(),
+            AccessMode::UserMode,
+        )
+        .unwrap();
+
+    let mut first_key = pm.reserve_native_registry_key_handle(first, 0).unwrap();
+    first_key.bind(&mut pm, 11, 1).unwrap();
+    let first_value = first_key.publish(&mut pm).unwrap();
+    assert_eq!(pm.lookup_native_registry_key_handle(first, first_value, 0), Ok(11));
+    assert_eq!(
+        pm.lookup_native_registry_key_handle(second, first_value, 0),
+        Err(STATUS_INVALID_HANDLE),
+    );
+
+    let mut second_key = pm.reserve_native_registry_key_handle(second, 0).unwrap();
+    second_key.bind(&mut pm, 22, 1).unwrap();
+    let second_value = second_key.publish(&mut pm).unwrap();
+    assert_eq!(pm.lookup_native_registry_key_handle(second, second_value, 0), Ok(22));
+    assert_eq!(pm.lookup_native_registry_key_handle(first, first_value, 0), Ok(11));
+}
+
+#[test]
 fn native_key_abort_retains_system_target_across_requestor_exit() {
     let (mut pm, _, kernel) = fixture();
     let mut key = pm

@@ -282,6 +282,26 @@ impl<P> IoManager<P> {
         })
     }
 
+    /// `ObReferenceObjectByPointer` for a hosted DEVICE_OBJECT projection. The caller's
+    /// authenticated domain and the exact registration generation must both be live before
+    /// the optional object type is checked or a canonical reference count changes.
+    pub fn reference_hosted_device_object_by_pointer(
+        &mut self,
+        caller_domain: HostedDomainIdentity,
+        registration: HostedDevicePointerRegistration,
+        requested_type: Option<u64>,
+        device_object_type: u64,
+    ) -> Result<u64, NtStatus> {
+        if registration.domain != caller_domain || device_object_type == 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        self.live_pointer_row_index(registration)?;
+        if requested_type.is_some_and(|object_type| object_type != device_object_type) {
+            return Err(NtStatus::OBJECT_TYPE_MISMATCH);
+        }
+        self.reference_hosted_device_pointer(registration)
+    }
+
     pub fn dereference_hosted_device_pointer(
         &mut self,
         registration: HostedDevicePointerRegistration,

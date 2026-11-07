@@ -1,0 +1,19 @@
+[package]
+name = "nt-alpc-native-capture"
+description = "Owned, bounded native NtAlpcCreatePort argument capture (no_std + alloc, host-testable)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-alpc-abi = { path = "../nt-alpc-abi" }
+nt-security = { path = "../nt-security" }
+bytemuck = { version = "1", default-features = false }
+
+[features]
+default = []
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

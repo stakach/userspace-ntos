@@ -152,8 +152,7 @@ unsafe fn retire(id: u64) -> Result<(), i32> {
         row(id).canonical_retired = true;
     } else if !row(id).canonical_retired {
         if let Some(registration) = row(id).registration {
-        io_manager_mut()
-            .retire_hosted_device_pointer(registration)
+        hosted_device_allocations::retire_canonical_pointer(io_manager_mut(), registration)
             .map_err(|status| status.raw())?;
         }
         row(id).canonical_retired = true;

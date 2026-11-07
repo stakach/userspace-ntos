@@ -217,6 +217,71 @@ fn window_output_is_invisible_until_exact_ack_and_pads_only_eof() {
 }
 
 #[test]
+fn acknowledged_window_selects_exact_pages_and_rejects_stale_owner() {
+    let plan = plan_data_section_read_window(3, 0x9000, 0x7180, 8).unwrap();
+    let section = section();
+    let lease = lease();
+    assert_eq!((plan.pages(), plan.length(), plan.capacity()), (5, 0x4180, 0x5000));
+    let mut reads = PendingSectionPageReads::<Box<u32>, u64>::new();
+    let id = reads.reserve_window(section, lease, 3, plan, Box::new(53)).unwrap();
+    assert!(reads.bind(id, 93));
+    assert!(reads.terminal(id, 93, 0, plan.length() as u64));
+    for offset in (0..plan.length()).step_by(DATA_PAGE_SIZE) {
+        let length = (plan.length() - offset).min(DATA_PAGE_SIZE);
+        assert!(reads.append(id, 93, offset, &vec![(offset / DATA_PAGE_SIZE) as u8 + 1; length]));
+    }
+    assert!(reads.take_acknowledged(id, 93).is_none());
+    assert!(reads.acknowledge_backend(id, 93));
+    // A rejected identity check cannot consume the staged bytes or owner.
+    assert!(reads.take_acknowledged_if(id, 93, |_, _, _, _| false).is_none());
+    assert_eq!(reads.identity(id), Some((section, lease, 3)));
+    let (_, result) = reads.take_acknowledged_if(id, 93, |_, identity, backing, first| {
+        identity == section && backing == lease && first == 3
+    }).unwrap();
+    let bytes = result.unwrap();
+    for page in 3..8 {
+        let expected = if page == 7 { 5 } else { page - 2 };
+        let page_bytes = plan.page_bytes(page, &bytes).unwrap();
+        let file_bytes = if page == 7 { 0x180 } else { DATA_PAGE_SIZE };
+        assert!(page_bytes[..file_bytes].iter().all(|byte| *byte == expected as u8));
+        assert!(page_bytes[file_bytes..].iter().all(|byte| *byte == 0));
+    }
+    assert!(plan.page_bytes(2, &bytes).is_none());
+    assert!(plan.page_bytes(8, &bytes).is_none());
+    assert!(plan.page_bytes(3, &bytes[..bytes.len() - 1]).is_none());
+}
+
+#[test]
+fn cancelled_window_has_no_publishable_page_after_terminal_ack() {
+    const CANCELLED: u32 = 0xc000_0120;
+    let plan = plan_data_section_read_window(0, 0x8000, 0x8000, 8).unwrap();
+    let mut reads = PendingSectionPageReads::<Box<u32>, u64>::new();
+    let id = reads.reserve_window(section(), lease(), 0, plan, Box::new(54)).unwrap();
+    assert!(reads.bind(id, 94));
+    assert!(reads.terminal(id, 94, CANCELLED, 0));
+    assert!(reads.ready_page(id, 94).is_none());
+    assert!(reads.take_acknowledged(id, 94).is_none());
+    assert!(reads.acknowledge_backend(id, 94));
+    let (owner, result) = reads.take_acknowledged(id, 94).unwrap();
+    assert_eq!(*owner, 54);
+    assert_eq!(result, Err(CANCELLED));
+}
+
+#[test]
+fn short_window_completion_rejects_all_pages_after_ack() {
+    let plan = plan_data_section_read_window(0, 0x8000, 0x8000, 8).unwrap();
+    let mut reads = PendingSectionPageReads::<Box<u32>, u64>::new();
+    let id = reads.reserve_window(section(), lease(), 0, plan, Box::new(55)).unwrap();
+    assert!(reads.bind(id, 95));
+    assert!(reads.terminal(id, 95, 0, (plan.length() - 1) as u64));
+    assert!(reads.ready_page(id, 95).is_none());
+    assert!(reads.acknowledge_backend(id, 95));
+    let (owner, result) = reads.take_acknowledged(id, 95).unwrap();
+    assert_eq!(*owner, 55);
+    assert_eq!(result, Err(STATUS_IO_DEVICE_ERROR));
+}
+
+#[test]
 fn acknowledged_read_cannot_publish_into_reused_section_or_view() {
     let mut table = GenericSectionTable::new();
     let mount = crate::SectionMountIds::new().allocate().unwrap();
@@ -291,4 +356,92 @@ fn acknowledged_read_cannot_publish_into_reused_section_or_view() {
         Err(crate::SectionPagePublicationError::StaleSection)
     );
     assert_eq!(table.page_frame(replacement, 0), None);
+}
+
+#[test]
+fn provider_map_page_fill_keeps_reply_and_owned_output_until_exact_ack() {
+    use crate::{ProviderSectionView, ProviderVspaceIdentity};
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct MapReply {
+        view: ProviderSectionView,
+        reply_cap: u64,
+        dispatch_epoch: u64,
+        wait_token: u64,
+    }
+
+    let section = section();
+    let lease = lease();
+    let view = ProviderSectionView {
+        generation: 11,
+        owner: ProviderVspaceIdentity { domain: 3, generation: 5 },
+        section,
+        base: 0x20_0000,
+        size: DATA_PAGE_SIZE as u64,
+        section_offset: 0,
+    };
+    let reply = MapReply {
+        view,
+        reply_cap: 0x91,
+        dispatch_epoch: 7,
+        wait_token: 0x43,
+    };
+    let plan = plan_data_section_page_read(0, DATA_PAGE_SIZE as u64, DATA_PAGE_SIZE as u64)
+        .unwrap();
+    let mut reads = PendingSectionPageReads::<MapReply, u64>::new();
+    let id = reads.reserve(section, lease, 0, plan, reply).unwrap();
+    let irp = 0x81;
+    assert!(reads.bind(id, irp));
+    assert!(reads.take_acknowledged_if(id, irp, |_, _, _, _| true).is_none());
+    assert!(!reads.terminal(id, irp + 1, 0, plan.length() as u64));
+    assert!(reads.terminal(id, irp, 0, plan.length() as u64));
+
+    let mut provider_output = vec![0x5a; DATA_PAGE_SIZE];
+    assert!(reads.append(id, irp, 0, &provider_output));
+    provider_output.fill(0);
+    assert!(reads.take_acknowledged_if(id, irp, |_, _, _, _| true).is_none());
+    assert!(reads.acknowledge_backend(id, irp));
+
+    let exact = |owner: &MapReply, actual_section, actual_lease, page_index| {
+        actual_section == section
+            && actual_lease == lease
+            && page_index == 0
+            && owner.view == view
+            && owner.reply_cap == 0x91
+            && owner.dispatch_epoch == 7
+            && owner.wait_token == 0x43
+    };
+    assert!(reads.take_acknowledged_if(id, irp + 1, exact).is_none());
+    assert!(reads.take_acknowledged_if(id, irp, |owner, actual_section, actual_lease, page| {
+        actual_section == section
+            && actual_lease == lease
+            && page == 0
+            && owner.view == view
+            && owner.reply_cap == 0x92 // A different Reply cannot consume this page.
+    }).is_none());
+    let mut other_sections = GenericSectionTable::new();
+    for control_area in [0x50, 0x51] {
+        other_sections.create(
+            2, control_area, DATA_PAGE_SIZE as u64, PAGE_READONLY,
+            SECTION_ATTR_SEC_COMMIT, GenericSectionBacking::anonymous(),
+        ).unwrap();
+    }
+    let different_section = other_sections.section_identity(1).unwrap();
+    assert_ne!(different_section, section);
+    assert!(reads.take_acknowledged_if(id, irp, |owner, actual_section, actual_lease, page| {
+        actual_section == different_section
+            && actual_lease == lease
+            && page == 0
+            && owner.view == view
+    }).is_none());
+    assert!(reads.take_acknowledged_if(id, irp, |owner, actual_section, actual_lease, page| {
+        actual_section == section
+            && actual_lease == RoutedSectionLease::new(8).unwrap()
+            && page == 0
+            && owner.view == view
+    }).is_none());
+    let (owner, bytes) = reads.take_acknowledged_if(id, irp, exact).unwrap();
+    assert_eq!(owner.reply_cap, 0x91);
+    assert_eq!(bytes.unwrap(), vec![0x5a; DATA_PAGE_SIZE]);
+    assert!(reads.identity(id).is_none());
 }

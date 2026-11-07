@@ -19,7 +19,7 @@ pub mod activation_redirection;
 pub mod activation_section;
 pub mod activation_settings;
 pub mod atom;
-pub mod avl_table;
+pub use nt_compat_exports::avl_table;
 pub mod bitmap;
 pub mod compression;
 pub mod convert;
@@ -64,6 +64,7 @@ pub mod timezone;
 pub mod trace_database;
 pub mod user_stack;
 pub mod vectored_handler;
+pub mod wait_address;
 
 // Re-export the counted-string type at the `rtl` root (used across the surface).
 pub use nt_compat_exports::rtl::UnicodeString;

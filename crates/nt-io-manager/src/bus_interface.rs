@@ -20,7 +20,38 @@ struct Lease {
     provider: HostedDevicePointerRegistration,
     target: HostedForwardTarget,
     references: u64,
-    uncertain: bool,
+    state: LeaseState,
+    origin: LeaseOrigin,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaseOrigin {
+    NativeProvider,
+    ExecutivePci,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaseState {
+    Prepared,
+    Active,
+    Uncertain,
+}
+
+/// Broker-only identity of a provider query whose target is already pinned. It must remain with
+/// the native query owner until a known terminal commits or aborts it, or an uncertain terminal
+/// retains it. Its identifier is never a usable consumer interface before commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "resolve the native provider query before discarding its retained authority"]
+pub struct PreparedBusInterfaceQuery {
+    id: u64,
+    consumer: HostedDomainIdentity,
+    provider: HostedDevicePointerRegistration,
+}
+
+impl PreparedBusInterfaceQuery {
+    pub const fn id(self) -> u64 {
+        self.id
+    }
 }
 
 /// The catalog is single-owner state, like `IoManager`. `next_id` never wraps or reuses an
@@ -39,15 +70,16 @@ impl BusInterfaceCatalog {
         }
     }
 
-    /// Take one independent canonical reference after the provider's successful QueryInterface
-    /// has acquired its initial native interface reference.
-    pub fn issue<P>(
+    /// Pin the exact provider and reserve a query identity before entering the native PDO.
+    /// The provider's initial InterfaceReference, if successful, is owned by this row until a
+    /// matching terminal commits, aborts, or quarantines it.
+    pub fn prepare<P>(
         &mut self,
         io: &mut IoManager<P>,
         consumer: HostedDomainIdentity,
         provider: HostedDevicePointerRegistration,
         request: BusInterfaceQueryRequest,
-    ) -> Result<BusInterfaceQueryReply, NtStatus> {
+    ) -> Result<PreparedBusInterfaceQuery, NtStatus> {
         request.validate().map_err(|_| NtStatus::INVALID_PARAMETER)?;
         if consumer.domain_id == provider.domain().domain_id
             || io.hosted_domain_identity(consumer.domain_id) != Some(consumer)
@@ -68,8 +100,102 @@ impl BusInterfaceCatalog {
             consumer,
             provider,
             target,
+            references: 0,
+            state: LeaseState::Prepared,
+            origin: LeaseOrigin::NativeProvider,
+        });
+        self.next_id = next;
+        Ok(PreparedBusInterfaceQuery { id, consumer, provider })
+    }
+
+    fn prepared_index(&self, prepared: PreparedBusInterfaceQuery) -> Result<usize, NtStatus> {
+        let index = self.leases.iter().position(|lease| lease.id == prepared.id)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let lease = &self.leases[index];
+        if lease.consumer != prepared.consumer || lease.provider != prepared.provider {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
+        match lease.state {
+            LeaseState::Prepared => Ok(index),
+            LeaseState::Active => Err(NtStatus::INVALID_PARAMETER),
+            LeaseState::Uncertain => Err(NtStatus::DEVICE_BUSY),
+        }
+    }
+
+    /// Return a provider-domain registration only to the broker driving this prepared query.
+    /// The registration and any native callback pointers must not enter a consumer reply.
+    pub fn prepared_provider<P>(
+        &self,
+        io: &IoManager<P>,
+        prepared: PreparedBusInterfaceQuery,
+    ) -> Result<HostedDevicePointerRegistration, NtStatus> {
+        let index = self.prepared_index(prepared)?;
+        let lease = &self.leases[index];
+        if io.hosted_domain_identity(lease.consumer.domain_id) != Some(lease.consumer)
+            || lease.target.validate(io)? != lease.provider.device_id()
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(lease.provider)
+    }
+
+    /// Publish a consumer-local lease only after the native provider returned success and its
+    /// initial InterfaceReference was observed. No allocation is allowed after that effect.
+    /// A stale validation result retains the row as uncertain for owner-specific recovery.
+    pub fn commit<P>(
+        &mut self,
+        io: &IoManager<P>,
+        prepared: PreparedBusInterfaceQuery,
+    ) -> Result<BusInterfaceQueryReply, NtStatus> {
+        let index = self.prepared_index(prepared)?;
+        let validation = self.prepared_provider(io, prepared);
+        if let Err(status) = validation {
+            self.leases[index].state = LeaseState::Uncertain;
+            return Err(status);
+        }
+        self.leases[index].references = 1;
+        self.leases[index].state = LeaseState::Active;
+        Ok(BusInterfaceQueryReply {
+            size: BUS_INTERFACE_STANDARD_X64_SIZE,
+            version: 1,
+            lease_id: prepared.id,
+            device_id: prepared.provider.device_id().raw(),
+        })
+    }
+
+    /// Publish an interface implemented by the executive PCI bus service itself. The exact
+    /// accepted PDO provider is pinned for identity and retirement safety, but no provider
+    /// QueryInterface or provider callback is claimed to have run.
+    pub fn issue_executive_pci<P>(
+        &mut self,
+        io: &mut IoManager<P>,
+        consumer: HostedDomainIdentity,
+        provider: HostedDevicePointerRegistration,
+        request: BusInterfaceQueryRequest,
+    ) -> Result<BusInterfaceQueryReply, NtStatus> {
+        request.validate().map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        if consumer.domain_id == provider.domain().domain_id
+            || io.hosted_domain_identity(consumer.domain_id) != Some(consumer)
+        {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
+        let next = self.next_id.checked_add(1).ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+        self.leases.try_reserve(1).map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        let target = HostedForwardTarget::capture(io, provider.domain(), provider.address())?;
+        if target.registration() != provider {
+            let mut target = target;
+            target.release(io).expect("captured stale PCI bus provider");
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let id = self.next_id;
+        self.leases.push(Lease {
+            id,
+            consumer,
+            provider,
+            target,
             references: 1,
-            uncertain: false,
+            state: LeaseState::Active,
+            origin: LeaseOrigin::ExecutivePci,
         });
         self.next_id = next;
         Ok(BusInterfaceQueryReply {
@@ -78,6 +204,33 @@ impl BusInterfaceCatalog {
             lease_id: id,
             device_id: provider.device_id().raw(),
         })
+    }
+
+    /// A known provider refusal acquired no initial interface reference. Release only the
+    /// canonical target pin reserved by prepare; an uncertain release retains the row.
+    pub fn abort<P>(
+        &mut self,
+        io: &mut IoManager<P>,
+        prepared: PreparedBusInterfaceQuery,
+    ) -> Result<(), NtStatus> {
+        let index = self.prepared_index(prepared)?;
+        if let Err(status) = self.leases[index].target.release(io) {
+            self.leases[index].state = LeaseState::Uncertain;
+            return Err(status);
+        }
+        self.leases.swap_remove(index);
+        Ok(())
+    }
+
+    /// A lost terminal may have taken the provider's initial reference. Keep its target pinned
+    /// and never retry the native query using this identity.
+    pub fn retain_uncertain(
+        &mut self,
+        prepared: PreparedBusInterfaceQuery,
+    ) -> Result<(), NtStatus> {
+        let index = self.prepared_index(prepared)?;
+        self.leases[index].state = LeaseState::Uncertain;
+        Ok(())
     }
 
     fn lease_index<P>(
@@ -94,6 +247,11 @@ impl BusInterfaceCatalog {
         let lease = &self.leases[index];
         if lease.consumer != consumer {
             return Err(NtStatus::ACCESS_DENIED);
+        }
+        match lease.state {
+            LeaseState::Prepared => return Err(NtStatus::DEVICE_NOT_READY),
+            LeaseState::Uncertain => return Err(NtStatus::DEVICE_BUSY),
+            LeaseState::Active => {}
         }
         if lease.target.validate(io)? != lease.provider.device_id() {
             return Err(NtStatus::INVALID_PARAMETER);
@@ -134,14 +292,14 @@ impl BusInterfaceCatalog {
     ) -> Result<(), NtStatus> {
         let index = self.lease_index(io, consumer, lease_id)?;
         let lease = &mut self.leases[index];
-        if lease.uncertain {
-            return Err(NtStatus::DEVICE_BUSY);
+        if lease.origin != LeaseOrigin::NativeProvider {
+            return Err(NtStatus::INVALID_DEVICE_REQUEST);
         }
         lease.references = lease.references.checked_add(1)
             .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
         let result = invoke(lease.provider);
         if result.is_err() {
-            lease.uncertain = true;
+            lease.state = LeaseState::Uncertain;
         }
         result
     }
@@ -156,12 +314,12 @@ impl BusInterfaceCatalog {
         invoke: impl FnOnce(HostedDevicePointerRegistration) -> Result<(), NtStatus>,
     ) -> Result<(), NtStatus> {
         let index = self.lease_index(io, consumer, lease_id)?;
-        if self.leases[index].uncertain {
-            return Err(NtStatus::DEVICE_BUSY);
+        if self.leases[index].origin != LeaseOrigin::NativeProvider {
+            return Err(NtStatus::INVALID_DEVICE_REQUEST);
         }
         let provider = self.leases[index].provider;
         if let Err(status) = invoke(provider) {
-            self.leases[index].uncertain = true;
+            self.leases[index].state = LeaseState::Uncertain;
             return Err(status);
         }
         if self.leases[index].references > 1 {
@@ -169,7 +327,48 @@ impl BusInterfaceCatalog {
             return Ok(());
         }
         if let Err(status) = self.leases[index].target.release(io) {
-            self.leases[index].uncertain = true;
+            self.leases[index].state = LeaseState::Uncertain;
+            return Err(status);
+        }
+        self.leases.swap_remove(index);
+        Ok(())
+    }
+
+    /// The executive PCI interface has no provider callback effect. Its canonical PDO pin
+    /// remains until the last consumer-local reference is released.
+    pub fn reference_executive_pci<P>(
+        &mut self,
+        io: &IoManager<P>,
+        consumer: HostedDomainIdentity,
+        lease_id: u64,
+    ) -> Result<(), NtStatus> {
+        let index = self.lease_index(io, consumer, lease_id)?;
+        let lease = &mut self.leases[index];
+        if lease.origin != LeaseOrigin::ExecutivePci {
+            return Err(NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        lease.references = lease.references.checked_add(1)
+            .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+        Ok(())
+    }
+
+    pub fn dereference_executive_pci<P>(
+        &mut self,
+        io: &mut IoManager<P>,
+        consumer: HostedDomainIdentity,
+        lease_id: u64,
+    ) -> Result<(), NtStatus> {
+        let index = self.lease_index(io, consumer, lease_id)?;
+        let lease = &mut self.leases[index];
+        if lease.origin != LeaseOrigin::ExecutivePci {
+            return Err(NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        if lease.references > 1 {
+            lease.references -= 1;
+            return Ok(());
+        }
+        if let Err(status) = lease.target.release(io) {
+            lease.state = LeaseState::Uncertain;
             return Err(status);
         }
         self.leases.swap_remove(index);
@@ -203,13 +402,76 @@ mod tests {
         (io, provider, consumer, registration)
     }
 
+    fn successful_query(
+        catalog: &mut BusInterfaceCatalog,
+        io: &mut IoManager<MockObjectPort>,
+        consumer: HostedDomainIdentity,
+        provider: HostedDevicePointerRegistration,
+    ) -> BusInterfaceQueryReply {
+        let prepared = catalog.prepare(io, consumer, provider,
+            BusInterfaceQueryRequest::standard()).unwrap();
+        catalog.commit(io, prepared).unwrap()
+    }
+
+    #[test]
+    fn query_preparation_pins_provider_before_native_effect() {
+        let (mut io, _, consumer, registration) = fixture();
+        let baseline = io.device_reference_count(registration.device_id());
+        let mut catalog = BusInterfaceCatalog::new();
+        let prepared = catalog.prepare(&mut io, consumer, registration,
+            BusInterfaceQueryRequest::standard()).unwrap();
+        assert_eq!(io.device_reference_count(registration.device_id()), baseline + 1);
+        assert_eq!(catalog.active_count(), 1);
+        assert_eq!(catalog.prepared_provider(&io, prepared), Ok(registration));
+        assert_eq!(catalog.provider(&io, consumer, prepared.id()),
+            Err(NtStatus::DEVICE_NOT_READY));
+        let reply = catalog.commit(&io, prepared).unwrap();
+        assert_eq!(reply.lease_id, prepared.id());
+        assert_eq!(catalog.provider(&io, consumer, reply.lease_id), Ok(registration));
+    }
+
+    #[test]
+    fn known_query_refusal_releases_pin_without_reusing_identity() {
+        let (mut io, _, consumer, registration) = fixture();
+        let baseline = io.device_reference_count(registration.device_id());
+        let mut catalog = BusInterfaceCatalog::new();
+        let refused = catalog.prepare(&mut io, consumer, registration,
+            BusInterfaceQueryRequest::standard()).unwrap();
+        catalog.abort(&mut io, refused).unwrap();
+        assert_eq!(catalog.active_count(), 0);
+        assert_eq!(io.device_reference_count(registration.device_id()), baseline);
+        let next = catalog.prepare(&mut io, consumer, registration,
+            BusInterfaceQueryRequest::standard()).unwrap();
+        assert_ne!(next.id(), refused.id());
+        assert_eq!(catalog.commit(&io, refused), Err(NtStatus::INVALID_PARAMETER));
+        catalog.abort(&mut io, next).unwrap();
+    }
+
+    #[test]
+    fn uncertain_query_retains_pin_and_never_replays_or_commits() {
+        let (mut io, _, consumer, registration) = fixture();
+        let baseline = io.device_reference_count(registration.device_id());
+        let mut catalog = BusInterfaceCatalog::new();
+        let prepared = catalog.prepare(&mut io, consumer, registration,
+            BusInterfaceQueryRequest::standard()).unwrap();
+        catalog.retain_uncertain(prepared).unwrap();
+        assert_eq!(catalog.commit(&io, prepared), Err(NtStatus::DEVICE_BUSY));
+        assert_eq!(catalog.abort(&mut io, prepared), Err(NtStatus::DEVICE_BUSY));
+        assert_eq!(catalog.prepared_provider(&io, prepared), Err(NtStatus::DEVICE_BUSY));
+        assert_eq!(catalog.reference(&io, consumer, prepared.id(), |_| {
+            panic!("uncertain query replayed")
+        }), Err(NtStatus::DEVICE_BUSY));
+        assert_eq!(catalog.active_count(), 1);
+        assert_eq!(io.device_reference_count(registration.device_id()), baseline + 1);
+        assert_eq!(io.retire_hosted_device_pointer(registration), Err(NtStatus::DEVICE_BUSY));
+    }
+
     #[test]
     fn retains_exact_provider_and_clears_only_after_dereference() {
         let (mut io, _provider, consumer, registration) = fixture();
         let baseline = io.device_reference_count(registration.device_id());
         let mut catalog = BusInterfaceCatalog::new();
-        let reply = catalog.issue(&mut io, consumer, registration,
-            BusInterfaceQueryRequest::standard()).unwrap();
+        let reply = successful_query(&mut catalog, &mut io, consumer, registration);
         assert_eq!(io.device_reference_count(registration.device_id()), baseline + 1);
         assert_eq!(catalog.device(&io, consumer, reply.lease_id), Ok(registration.device_id()));
         assert!(!reply.encode().windows(8).any(|bytes| bytes == 0x1000u64.to_le_bytes()));
@@ -228,8 +490,7 @@ mod tests {
         let (mut io, provider, consumer, registration) = fixture();
         let other = io.register_hosted_domain();
         let mut catalog = BusInterfaceCatalog::new();
-        let reply = catalog.issue(&mut io, consumer, registration,
-            BusInterfaceQueryRequest::standard()).unwrap();
+        let reply = successful_query(&mut catalog, &mut io, consumer, registration);
         assert_eq!(catalog.provider(&io, other, reply.lease_id), Err(NtStatus::ACCESS_DENIED));
         assert_eq!(catalog.provider(&io, provider, reply.lease_id), Err(NtStatus::ACCESS_DENIED));
         assert_eq!(io.retire_hosted_device_pointer(registration), Err(NtStatus::DEVICE_BUSY));
@@ -240,8 +501,7 @@ mod tests {
             provider, 0x1000, registration.device_id(),
         ).unwrap();
         assert_ne!(replacement, registration);
-        let fresh = catalog.issue(&mut io, consumer, replacement,
-            BusInterfaceQueryRequest::standard()).unwrap();
+        let fresh = successful_query(&mut catalog, &mut io, consumer, replacement);
         assert_ne!(fresh.lease_id, reply.lease_id);
         assert_eq!(catalog.provider(&io, consumer, reply.lease_id), Err(NtStatus::INVALID_PARAMETER));
     }
@@ -250,21 +510,62 @@ mod tests {
     fn uncertain_reference_and_dereference_never_release_or_replay() {
         let (mut io, _, consumer, registration) = fixture();
         let mut catalog = BusInterfaceCatalog::new();
-        let reply = catalog.issue(&mut io, consumer, registration,
-            BusInterfaceQueryRequest::standard()).unwrap();
+        let reply = successful_query(&mut catalog, &mut io, consumer, registration);
         let failure = NtStatus::DEVICE_NOT_CONNECTED;
         assert_eq!(catalog.reference(&io, consumer, reply.lease_id, |_| Err(failure)), Err(failure));
         assert_eq!(catalog.dereference(&mut io, consumer, reply.lease_id, |_| {
             panic!("uncertain provider callback replayed")
         }), Err(NtStatus::DEVICE_BUSY));
         assert_eq!(catalog.active_count(), 1);
-        assert_eq!(catalog.provider(&io, consumer, reply.lease_id), Ok(registration));
-        let second = catalog.issue(&mut io, consumer, registration,
-            BusInterfaceQueryRequest::standard()).unwrap();
+        assert_eq!(catalog.provider(&io, consumer, reply.lease_id), Err(NtStatus::DEVICE_BUSY));
+        let second = successful_query(&mut catalog, &mut io, consumer, registration);
         assert_eq!(catalog.dereference(&mut io, consumer, second.lease_id, |_| Err(failure)), Err(failure));
         assert_eq!(catalog.dereference(&mut io, consumer, second.lease_id, |_| {
             panic!("uncertain provider callback replayed")
         }), Err(NtStatus::DEVICE_BUSY));
         assert_eq!(catalog.active_count(), 2);
+    }
+
+    #[test]
+    fn executive_pci_lease_has_its_own_reference_lifetime() {
+        let (mut io, _, consumer, registration) = fixture();
+        let baseline = io.device_reference_count(registration.device_id());
+        let mut catalog = BusInterfaceCatalog::new();
+        let reply = catalog.issue_executive_pci(&mut io, consumer, registration,
+            BusInterfaceQueryRequest::standard()).unwrap();
+        assert_eq!(io.device_reference_count(registration.device_id()), baseline + 1);
+        assert_eq!(catalog.provider(&io, consumer, reply.lease_id), Ok(registration));
+        assert_eq!(catalog.reference(&io, consumer, reply.lease_id, |_| {
+            panic!("executive lease entered native provider")
+        }), Err(NtStatus::INVALID_DEVICE_REQUEST));
+        catalog.reference_executive_pci(&io, consumer, reply.lease_id).unwrap();
+        catalog.dereference_executive_pci(&mut io, consumer, reply.lease_id).unwrap();
+        assert_eq!(catalog.active_count(), 1);
+        catalog.dereference_executive_pci(&mut io, consumer, reply.lease_id).unwrap();
+        assert_eq!(catalog.active_count(), 0);
+        assert_eq!(io.device_reference_count(registration.device_id()), baseline);
+        assert_eq!(catalog.reference_executive_pci(&io, consumer, reply.lease_id),
+            Err(NtStatus::INVALID_PARAMETER));
+    }
+
+    #[test]
+    fn executive_pci_lease_cannot_be_reused_for_a_rebound_provider() {
+        let (mut io, provider, consumer, registration) = fixture();
+        let other = io.register_hosted_domain();
+        let mut catalog = BusInterfaceCatalog::new();
+        let first = catalog.issue_executive_pci(&mut io, consumer, registration,
+            BusInterfaceQueryRequest::standard()).unwrap();
+        assert_eq!(catalog.provider(&io, other, first.lease_id), Err(NtStatus::ACCESS_DENIED));
+        assert_eq!(io.retire_hosted_device_pointer(registration), Err(NtStatus::DEVICE_BUSY));
+        catalog.dereference_executive_pci(&mut io, consumer, first.lease_id).unwrap();
+        io.retire_hosted_device_pointer(registration).unwrap();
+        let rebound = io.bind_hosted_device_pointer(provider, 0x1000,
+            registration.device_id()).unwrap();
+        assert_ne!(rebound, registration);
+        let second = catalog.issue_executive_pci(&mut io, consumer, rebound,
+            BusInterfaceQueryRequest::standard()).unwrap();
+        assert_ne!(first.lease_id, second.lease_id);
+        assert_eq!(catalog.provider(&io, consumer, first.lease_id), Err(NtStatus::INVALID_PARAMETER));
+        catalog.dereference_executive_pci(&mut io, consumer, second.lease_id).unwrap();
     }
 }

@@ -79,6 +79,24 @@ fn selection_and_resume_have_no_teb_peb_capture_or_compatibility_initializer() {
 }
 
 #[test]
+fn thread_callout_reads_the_published_process_peb() {
+    let file = source("win32k_subsystem.rs");
+    let seed = effects(&body(&file, "seed_win32k_callout_teb"));
+    assert!(seed.identifiers.iter().any(|name| name == "EPROCESS_PEB"),
+        "thread callout must use the canonical published EPROCESS.Peb");
+    assert!(seed.calls.iter().any(|name| name == "process_ctx_eprocess"),
+        "read EPROCESS only after selecting the exact process context");
+    assert!(!seed.identifiers.iter().any(|name| name == "process_params"),
+        "a private zeroed parameter block loses the client's DesktopInfo");
+    assert!(!seed.identifiers.iter().any(|name| name == "PEB_PROCESS_PARAMETERS_OFF"),
+        "the client PEB owns the real process-parameter pointer");
+    let resume = effects(&body(&file, "restore_current_context_for_user_callback_resume_inner"));
+    assert!(position(&resume, "seed_win32k_callout_teb")
+        > position(&resume, "active_win32k_callout_phase"),
+        "resume must verify the retained callout before dereferencing EPROCESS");
+}
+
+#[test]
 fn gui_context_records_cannot_construct_private_ps_object_substitutes() {
     let file = source("win32k_subsystem.rs");
     let mut all = Effects::default();

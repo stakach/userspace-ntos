@@ -291,3 +291,48 @@ fn rejection_diagnostics_are_bounded_and_use_validated_resource_records() {
         "print the actual typed rejection"
     );
 }
+
+#[test]
+fn video_pool_alias_cannot_take_the_assigned_framebuffer_aperture() {
+    let layout = source("win32k_subsystem.rs");
+    for name in ["WIN32K_VIDEO_POOL_ALIAS_VA", "WIN32K_FTYP_VADDR"] {
+        assert!(
+            layout.items.iter().any(|item| matches!(item,
+                Item::Const(constant) if constant.ident == name)),
+            "missing explicit video alias boundary {name}"
+        );
+    }
+    let reserved = wiring(&function(&layout, "is_reserved_win32k_video_aperture"));
+    for name in [
+        "WIN32K_FB_VA",
+        "WIN32K_POOL_VADDR",
+        "WIN32K_VIDEO_POOL_ALIAS_VA",
+        "WIN32K_FTYP_VADDR",
+    ] {
+        assert!(
+            reserved.paths.iter().any(|path| path == name),
+            "unbacked faults must be excluded from the {name} reservation"
+        );
+    }
+    let map = source("hosted_video_pool_map.rs");
+    let publish = wiring(&function(&map, "publish_map"));
+    assert!(
+        publish.paths.iter().any(|path| path == "WIN32K_VIDEO_POOL_ALIAS_VA"),
+        "pool RAM must start after the fixed PCI framebuffer aperture"
+    );
+    assert!(
+        publish.paths.iter().any(|path| path == "WIN32K_FTYP_VADDR"),
+        "pool RAM alias must stop before the font arena"
+    );
+    assert!(
+        !publish.paths.iter().any(|path| path == "WIN32K_FB_VA"),
+        "pool RAM must never preempt the exact PCI BAR mapping"
+    );
+    let aperture = source("hosted_video_caller_aperture.rs");
+    let prepare = wiring(&function(&aperture, "prepare"));
+    assert!(
+        prepare.methods.iter().any(|method| method == "checked_add")
+            && prepare.paths.iter().any(|path| path == "WIN32K_POOL_VADDR"),
+        "the exact BAR span must fit below the win32k pool boundary"
+    );
+}

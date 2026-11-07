@@ -1,5 +1,35 @@
-use nt_address_space::image_view_placement::{plan_image_view_placement, ImageViewPlacementRequest};
+use nt_address_space::image_view_placement::{
+    plan_image_view_placement, x64_map_view_zero_bits_count, ImageViewPlacementRequest,
+};
 use nt_address_space::{STATUS_CONFLICTING_ADDRESSES, STATUS_INVALID_PARAMETER_4};
+
+#[test]
+fn csrss_shared_section_mask_yields_below_2g_top_down_generic_view() {
+    use nt_address_space::{
+        VmRegionMap, MEM_COMMIT, MEM_RESERVE, MEM_TOP_DOWN, PAGE_EXECUTE_READWRITE,
+    };
+
+    // Pinned LiberNT AMD64 CSRSRV passes 0x7fffffff to NtMapViewOfSection for its
+    // anonymous SEC_RESERVE shared Section. It is a bit mask, not 2,147,483,647 bits.
+    let count = x64_map_view_zero_bits_count(0x7fff_ffff).unwrap();
+    assert_eq!(count, 33);
+    let exclusive_limit = (u64::MAX >> count) + 1;
+    assert_eq!(exclusive_limit, 0x8000_0000);
+    let mut map = VmRegionMap::<4>::new(0x1_0000, 0x0000_0100_4000_0000);
+    let view = map
+        .allocate_below(
+            None,
+            0x10_0000,
+            MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN,
+            PAGE_EXECUTE_READWRITE,
+            exclusive_limit,
+        )
+        .unwrap();
+    assert!(view.base >= 0x1_0000);
+    assert!(view.base + view.size <= exclusive_limit);
+    assert_eq!(x64_map_view_zero_bits_count(0), Ok(0));
+    assert_eq!(x64_map_view_zero_bits_count(22), Err(STATUS_INVALID_PARAMETER_4));
+}
 
 fn request() -> ImageViewPlacementRequest {
     ImageViewPlacementRequest {

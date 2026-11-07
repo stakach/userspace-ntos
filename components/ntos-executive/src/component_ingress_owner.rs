@@ -60,6 +60,18 @@ pub(crate) struct WorkerReadyExpectation {
     pub slot_capacity: usize,
 }
 
+/// Adapter-only recovery policy for one native arrival. `IngressReceiver` remains the physical
+/// owner and authoritative phase machine; this journal keeps the returned payload and original
+/// census/Reply identity when the native adapter cannot finish capture or classification.
+pub(super) struct PendingNativeReceive {
+    pub execution: IngressExecutionOwner,
+    pub probe_tcb: u64,
+    pub reply: u64,
+    pub sequence: u64,
+    pub returned_message: Option<ReceivedMessage>,
+    pub classify_retry_allowed: bool,
+}
+
 /// Keep this owner alive even after initialization refusal. No failure deletes capabilities,
 /// returns root slots, or permits another initialization attempt. Native callers must serialize
 /// access and retain the physical domain owners used by the receive adapter.
@@ -76,6 +88,7 @@ pub(crate) struct NativeSharedIngress {
     peer_capacity: usize,
     pending_peer: Option<PendingPeer>,
     pending_reply: Option<ComponentIngress<ReceivedMessage>>,
+    pending_receive: Option<PendingNativeReceive>,
     creation_error: Option<u64>,
 }
 
@@ -93,6 +106,7 @@ impl NativeSharedIngress {
             peer_capacity: 0,
             pending_peer: None,
             pending_reply: None,
+            pending_receive: None,
             creation_error: None,
         }
     }
@@ -329,7 +343,7 @@ impl NativeSharedIngress {
         execution: IngressExecutionOwner,
         probe_tcb: u64,
         blocking: bool,
-    ) -> Result<(), super::ReceiveError> {
+    ) -> Result<u64, super::ReceiveError> {
         if !self.ready {
             return Err(super::ReceiveError::Ownership(
                 nt_component_suspension::ReservedReceiveError::InvalidPhase,

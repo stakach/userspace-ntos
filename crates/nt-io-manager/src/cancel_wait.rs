@@ -18,6 +18,7 @@ const DEFAULT_INITIAL_RESERVE: usize = 4;
 pub struct PendingFileIrpDrain {
     pub file_id: u64,
     pub pi: u32,
+    pub process: Option<nt_types::ProcessIdentity>,
     pub tid: u64,
     pub badge: u64,
     pub iosb_va: u64,
@@ -143,6 +144,7 @@ impl PendingFileIrpDrainTable {
         if self.reservations.get(reservation.slot).copied() != Some(reservation.generation)
             || self.slots.get(reservation.slot)?.is_some()
             || pending.file_id == 0
+            || !pending.process.is_some_and(nt_types::ProcessIdentity::is_valid)
             || pending.tid == 0
             || pending.iosb_va == 0
             || pending.reply_cap == 0
@@ -179,6 +181,12 @@ impl PendingFileIrpDrainTable {
         self.slots.get(slot).copied().flatten()
     }
 
+    pub fn has_process_exact(&self, pi: u32, process: nt_types::ProcessIdentity) -> bool {
+        self.slots.iter().flatten().any(|pending| {
+            pending.pi == pi && pending.process == Some(process)
+        })
+    }
+
     pub fn mark_iosb_published_exact(&mut self, slot: usize, file_id: u64, tid: u64) -> Option<u8> {
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         if pending.file_id != file_id || pending.tid != tid {
@@ -188,34 +196,38 @@ impl PendingFileIrpDrainTable {
         Some(pending.delivery_state)
     }
 
-    /// Transfer the reply capability once. `Some(None)` means it was already claimed.
-    pub fn claim_reply_cap_exact(
+    /// Enter delivery once while retaining the Reply until a proven terminal result.
+    pub fn begin_reply_exact(
         &mut self,
         slot: usize,
         file_id: u64,
         tid: u64,
-    ) -> Option<Option<u64>> {
+    ) -> Option<u64> {
         let pending = self.slots.get_mut(slot)?.as_mut()?;
-        if pending.file_id != file_id || pending.tid != tid {
+        if pending.file_id != file_id
+            || pending.tid != tid
+            || pending.reply_cap == 0
+            || pending.delivery_state & FILE_IRP_DRAIN_IOSB_PUBLISHED == 0
+            || pending.delivery_state & FILE_IRP_DRAIN_REPLY_CLAIMED != 0
+        {
             return None;
         }
-        if pending.delivery_state & FILE_IRP_DRAIN_REPLY_CLAIMED != 0 {
-            return Some(None);
-        }
-        let reply_cap = core::mem::replace(&mut pending.reply_cap, 0);
         pending.delivery_state |= FILE_IRP_DRAIN_REPLY_CLAIMED;
-        Some(Some(reply_cap))
+        Some(pending.reply_cap)
     }
 
-    pub fn mark_reply_published_exact(
+    pub fn finish_reply_exact(
         &mut self,
         slot: usize,
         file_id: u64,
         tid: u64,
+        proven: bool,
     ) -> Option<u8> {
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         if pending.file_id != file_id
             || pending.tid != tid
+            || !proven
+            || pending.reply_cap == 0
             || pending.delivery_state & FILE_IRP_DRAIN_REPLY_CLAIMED == 0
         {
             return None;
@@ -248,7 +260,9 @@ impl PendingFileIrpDrainTable {
     {
         let mut count = 0;
         for slot in self.slots.iter_mut() {
-            if slot.is_some_and(|pending| pending.tid == tid) {
+            if slot.is_some_and(|pending| {
+                pending.tid == tid && pending.delivery_state & FILE_IRP_DRAIN_REPLY_CLAIMED == 0
+            }) {
                 take(slot.take().unwrap());
                 count += 1;
             }
@@ -278,6 +292,10 @@ mod tests {
         PendingFileIrpDrain {
             file_id,
             pi: 2,
+            process: Some(nt_types::ProcessIdentity {
+                pid: 72,
+                generation: nt_types::ProcessGeneration::Hosted(1),
+            }),
             tid,
             badge: 4,
             iosb_va: 0x1000,
@@ -322,11 +340,11 @@ mod tests {
             .unwrap();
         assert!(table.finish_exact(slot, 10, 20).is_none());
         assert_eq!(table.mark_iosb_published_exact(slot, 10, 20), Some(1));
-        assert_eq!(table.claim_reply_cap_exact(slot, 10, 20), Some(Some(30)));
-        assert_eq!(table.claim_reply_cap_exact(slot, 10, 20), Some(None));
+        assert_eq!(table.begin_reply_exact(slot, 10, 20), Some(30));
+        assert_eq!(table.begin_reply_exact(slot, 10, 20), None);
         assert!(table.finish_exact(slot, 10, 20).is_none());
-        assert!(table.mark_reply_published_exact(slot, 10, 20).is_some());
-        assert_eq!(table.finish_exact(slot, 10, 20).unwrap().reply_cap, 0);
+        assert!(table.finish_reply_exact(slot, 10, 20, true).is_some());
+        assert_eq!(table.finish_exact(slot, 10, 20).unwrap().reply_cap, 30);
         assert!(table.is_empty());
     }
 

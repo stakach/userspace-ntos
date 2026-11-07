@@ -64,7 +64,7 @@ fn current_thread_process_id_uses_the_thread_owner_client_id() {
         fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
             for segment in &path.path.segments {
                 self.owner_offset |= segment.ident == "ETHREAD_CLIENT_ID_PROCESS";
-                self.routed_pid |= segment.ident == "WIN32K_CURRENT_PROCESS_ID";
+                self.routed_pid |= segment.ident == "current_lane_ids";
             }
             syn::visit::visit_expr_path(self, path);
         }

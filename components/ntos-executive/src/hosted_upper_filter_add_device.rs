@@ -151,13 +151,18 @@ unsafe fn attach_prepared(
         ) {
             return Err(nt_status::NtStatus::INVALID_HANDLE);
         }
-        validate_and_sync_hosted_device_projection(
+        validate_and_sync_hosted_upper_filter_device_projection(
             class_inst,
             prepared.class_domain,
             fdo_address,
             fdo,
             DriverId(claim.driver_id()),
             dispatch.driver_object,
+            HostedUpperFilterTypeProof {
+                source: registration,
+                pdo: prepared.pdo_registration,
+                lower: prepared.lower_registration,
+            },
         )?;
         hosted_upper_filter_projection::complete_add_device(owner_id, registration)?;
         transferred = true;
@@ -174,6 +179,9 @@ unsafe fn attach_prepared(
     match result {
         Ok(()) => {
             hosted_add_device_rollback::commit(rollback.take().unwrap());
+            // A filter with no DriverEntry device becomes dispatchable only after its exact
+            // attached FDO and retained ledger claim have both been committed.
+            register_instance_ready(index, true);
             Ok(())
         }
         Err(status) => {

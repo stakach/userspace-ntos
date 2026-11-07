@@ -304,6 +304,8 @@ fn explicit_unopened_handoff_retires_allocated_and_failed_create_after_binding_d
                     status: NtStatus::ACCESS_DENIED,
                     information: 0,
                     file_context: None,
+                    completion_driver_id: f.io.device(device).unwrap().driver_id,
+                    completion_device_id: device,
                 })
             );
         }

@@ -641,7 +641,7 @@ pub(crate) unsafe fn initialize_kuser_snapshot(scratch_va: u64, system_root: &[u
     let time = nt_time_snapshot_at(interrupt_time);
     let processor = exec_handler::native_processor_information();
     let page = unsafe { &mut *(scratch_va as *mut [u8; nt_ntdll_layout::kuser::PAGE_SIZE]) };
-    nt_ntdll_layout::kuser::initialize_page(
+    nt_ntdll_layout::kuser::initialize_page_with_active_console(
         page,
         nt_ntdll_layout::kuser::StaticInformation {
             nt_product_type: 1,
@@ -659,6 +659,7 @@ pub(crate) unsafe fn initialize_kuser_snapshot(scratch_va: u64, system_root: &[u
         interrupt_time,
         time.system_time_100ns,
         system_root,
+        kuser_active_console::current(),
     );
     nt_ntdll_layout::kuser::update_time_zone(
         page,
@@ -939,7 +940,6 @@ pub(crate) unsafe fn spawn_sec_image(
     client_thread_id: u64,
     image_path: &[u8],
     cmd_line: &[u8],
-    seed_gdi_shared_handle_table: bool,
     start_immediately: bool,
     // ntdll_plan.md Step 4.A: the RVA of ntdll's `LdrpInitialize` the trampoline calls. The REAL
     // ReactOS ntdll's is 0x8e70 (its build-fixed RVA); OUR Rust ntdll's is DIFFERENT + not stable
@@ -1326,31 +1326,8 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((scr + 0x1000 + 0x11c) as *mut u32, 1);
         core::ptr::write_volatile((scr + 0x1000 + 0x120) as *mut u16, 7601);
         core::ptr::write_volatile((scr + 0x1000 + 0x124) as *mut u32, 2);
-        // ★ DIALOG BATCH 3 — PEB->GdiSharedHandleTable (x64 PEB+0xf8). Client-side gdi32's
-        // GdiProcessSetup (gdi32 RVA 0x1100, run once from GdiDllInitialize/DllMain at process init)
-        // copies PEB+0xf8 into its cached global (gdi32 RVA 0x4e188); every later GDI-handle validity
-        // check indexes `GdiSharedHandleTable[handle & 0xffff]`. If PEB+0xf8 is NULL when GdiProcessSetup
-        // runs (as it was), gdi32 caches NULL → NULL-deref at RVA 0x535a on the logon dialog's DC/font
-        // setup. Seed it HERE (before the loader runs any DllMain) so GdiProcessSetup caches the real
-        // table base on its only run. The table is allocated inside win32k's USER heap, so the PEB
-        // value must be the USER-heap client alias of that server allocation; the committed heap
-        // prefix is projected when the process enters the Win32 client runtime.
-        if seed_gdi_shared_handle_table {
-            let gdi_server_base = core::ptr::read_volatile(
-                (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_GDI_TABLE_BASE)
-                    as *const u64,
-            );
-            if let Some(gdi_client_base) =
-                win32k_subsystem::win32k_heap_server_to_client(gdi_server_base)
-            {
-                core::ptr::write_volatile((scr + 0x1000 + 0xf8) as *mut u64, gdi_client_base);
-            } else {
-                print_str(b"[spawn-env] GDI shared handle table seed unavailable server=0x");
-                print_hex((gdi_server_base >> 32) as u32);
-                print_hex(gdi_server_base as u32);
-                print_str(b"\n");
-            }
-        }
+        // The genuine win32k process-create callout maps its canonical GDI Section into this
+        // suspended process and writes PEB->GdiSharedHandleTable before its loader runs.
         let peb_client = checked_spawn_copy_cap(peb, b"peb-target");
         let _ = checked_spawn_page_map(peb_client, SMSS_PEB_VA, RW_NX, pml4, b"peb-target");
         // Cross-process process creation finishes by writing Peb->ProcessParameters through
@@ -1880,10 +1857,10 @@ unsafe fn recorded_frame_copyin(
 }
 
 unsafe fn recorded_frame_copyout(pi: u64, va: u64, src: &[u8], scratch_base: u64) -> bool {
-    recorded_frame_copyout_impl(pi, va, src, scratch_base, false)
+    recorded_frame_copyout_impl(pi, None, va, src, scratch_base, false)
 }
 
-unsafe fn recorded_frame_copyout_impl(pi: u64, va: u64, src: &[u8], scratch_base: u64, admitted: bool) -> bool {
+unsafe fn recorded_frame_copyout_impl(pi: u64, process: Option<nt_memory_manager::ProcessIdentity>, va: u64, src: &[u8], scratch_base: u64, admitted: bool) -> bool {
     if crate::temporary_frame_alias::drain().is_err()
         || hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
         return false;
@@ -1896,7 +1873,7 @@ unsafe fn recorded_frame_copyout_impl(pi: u64, va: u64, src: &[u8], scratch_base
         if !admitted && crate::service_sec_image::service_admit_section_alias(pi, chunk.page_base, true, None).is_err() {
             return false;
         }
-        let ok = with_recorded_frame_alias(pi, None, chunk.page_base, scratch_base, true, |alias| {
+        let ok = with_recorded_frame_alias(pi, process, chunk.page_base, scratch_base, true, |alias| {
             core::ptr::copy_nonoverlapping(
                 src.as_ptr().add(copied),
                 (alias + chunk.page_offset as u64) as *mut u8,
@@ -2157,7 +2134,7 @@ pub(crate) unsafe fn client_copyout_mapped(
     src: &[u8],
     scratch_base: u64,
 ) -> bool {
-    client_copyout_mapped_impl(pi, va, src, scratch_base, false)
+    client_copyout_mapped_impl(pi, None, va, src, scratch_base, false)
 }
 
 /// Only for the checked native-copy engine, after its own protection/residency/COW admission.
@@ -2167,11 +2144,23 @@ pub(crate) unsafe fn client_copyout_mapped_admitted(
     src: &[u8],
     scratch_base: u64,
 ) -> bool {
-    client_copyout_mapped_impl(pi, va, src, scratch_base, true)
+    client_copyout_mapped_impl(pi, None, va, src, scratch_base, true)
+}
+
+/// Exact process-generation counterpart for a retained syscall after access admission.
+pub(crate) unsafe fn client_copyout_mapped_admitted_for(
+    pi: u64,
+    process: nt_memory_manager::ProcessIdentity,
+    va: u64,
+    src: &[u8],
+    scratch_base: u64,
+) -> bool {
+    client_copyout_mapped_impl(pi, Some(process), va, src, scratch_base, true)
 }
 
 unsafe fn client_copyout_mapped_impl(
     pi: u64,
+    process: Option<nt_memory_manager::ProcessIdentity>,
     va: u64,
     src: &[u8],
     scratch_base: u64,
@@ -2200,7 +2189,7 @@ unsafe fn client_copyout_mapped_impl(
             return false;
         }
         if csrss_frame_get_exact_record(pi, page).is_some() {
-            if !recorded_frame_copyout_impl(pi, current, &src[copied..copied + chunk], scratch_base, true) {
+            if !recorded_frame_copyout_impl(pi, process, current, &src[copied..copied + chunk], scratch_base, true) {
                 return false;
             }
             copied += chunk;

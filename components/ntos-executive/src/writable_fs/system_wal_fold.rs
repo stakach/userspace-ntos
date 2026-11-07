@@ -7,29 +7,66 @@
 use super::*;
 use nt_fs::SnapshotBlockDevice;
 
+#[path = "system_wal_fold/native.rs"]
+pub(crate) mod native;
+
 struct FoldWork {
     prepared: Option<nt_config_client::PreparedSystemHiveCheckpoint>,
     lease: snapshot_storage::Lease,
     old_continuation: Option<nt_fs::RegistryWalContinuation>,
+    // Keep the pre-fold proof private while either snapshot slot may be changing.
+    old_pair: Option<nt_fs::VerifiedPairedWalSnapshot>,
     next_continuation: Option<nt_fs::RegistryWalContinuation>,
+    next_pair: Option<nt_fs::VerifiedPairedWalSnapshot>,
+    publish_prepared_after_ack: bool,
     phase: Phase,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    Folding,
-    Acknowledging,
-    Installing,
-}
+type Phase = nt_hosted_runtime::RetainedSystemFoldPhase;
 
 // An uncertain physical fold remains here until restart and boot recovery. CM retains the exact
 // ACK result, so an uncertain ACK may be retried with this preparation and without replaying I/O.
 static mut FOLD_WORK: Option<FoldWork> = None;
 
+/// One terminal observation; do not enter CM or the physical reserve while Receive is gone.
+pub(crate) unsafe fn print_quiesce_owner() {
+    let work = (&*core::ptr::addr_of!(FOLD_WORK)).as_ref();
+    print_str(b"[quiesce-system-fold] phase=");
+    print_str(match work.map(|work| work.phase) {
+        None => b"absent",
+        Some(Phase::Folding) => b"folding",
+        Some(Phase::Acknowledging) => b"acknowledging",
+        Some(Phase::Installing) => b"installing",
+        Some(Phase::Failed) => b"failed",
+    });
+    print_str(b" lease="); print_u64(u64::from(work.is_some()));
+    print_str(b" ack-pending=");
+    print_u64(u64::from(work.is_some_and(|work| matches!(work.phase,
+        Phase::Acknowledging | Phase::Installing))));
+    print_str(b"\n");
+    native::print_quiesce_owner();
+}
+
 /// The service loop must redrive this exact CM ACK before trying another reserve owner.
 pub(crate) fn system_wal_fold_ack_pending() -> bool {
     unsafe { (*core::ptr::addr_of!(FOLD_WORK)).as_ref()
         .is_some_and(|work| matches!(work.phase, Phase::Acknowledging | Phase::Installing)) }
+}
+
+/// Advance only the exact fold owner after both native snapshot slots reached terminal ACK.
+/// The caller has parked its physical Receive parent; this is never a general filesystem sweep.
+pub(crate) unsafe fn redrive_retained_system_wal_fold_after_native_completion() -> bool {
+    let Some(phase) = (&*core::ptr::addr_of!(FOLD_WORK)).as_ref().map(|work| work.phase) else {
+        return false;
+    };
+    let cm_channel_idle = matches!(phase, Phase::Acknowledging)
+        && crate::config_manager_channel_idle();
+    if !phase.can_redrive(cm_channel_idle) {
+        return false;
+    }
+    // The retained checkpoint token and reserve remain installed on any uncertain CM receipt.
+    // A later pump pass may retry only that same acknowledgement and installation.
+    fold_system_wal_if_dirty().is_ok()
 }
 
 /// Borrow the retained physical lease without transferring it to a recover/rollover operation
@@ -69,6 +106,15 @@ fn needs_epoch_rollover(high_water_end_lba: u64, wal_sectors: u64) -> bool {
         && high_water_end_lba >= wal_sectors.saturating_sub(wal_sectors / 4)
 }
 
+fn report_fold_failure(stage: &[u8], status: u32) -> u32 {
+    print_str(b"[system-wal-fold] stage=");
+    print_str(stage);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b"\n");
+    status
+}
+
 /// Background/shutdown checkpoint boundary. A clean CM observation has no image to fold.
 /// An ambiguous ACK may be retried; an uncertain physical fold refuses reentry.
 pub(crate) unsafe fn fold_system_wal_if_dirty() -> Result<bool, u32> {
@@ -80,7 +126,16 @@ pub(crate) unsafe fn fold_system_wal_if_dirty() -> Result<bool, u32> {
             Phase::Acknowledging => acknowledge_retained(),
             Phase::Installing => install_retained(),
             Phase::Folding => Err(nt_fs::STATUS_DEVICE_NOT_READY),
+            Phase::Failed => Err(nt_fs::STATUS_DEVICE_NOT_READY),
         };
+    }
+    match crate::fs_loader::exec_fs_mount_identity()
+        .and_then(crate::fs_loader::exec_block_route_kind) {
+        Some(nt_fs::BlockSourceKind::Native) => return native::fold_system_wal_native(),
+        // Boot I/O is fenced during handoff. Preserve fold demand for the timer to retry
+        // after the native route commits; probing a snapshot header here would poison mount.
+        Some(nt_fs::BlockSourceKind::Draining) => return Err(nt_fs::STATUS_DEVICE_NOT_READY),
+        Some(nt_fs::BlockSourceKind::Boot) | None => {}
     }
     ensure_mounted()?;
     if legacy_snapshot_writes_allowed() || WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.load(Ordering::Acquire) {
@@ -88,10 +143,10 @@ pub(crate) unsafe fn fold_system_wal_if_dirty() -> Result<bool, u32> {
     }
     let mut lease = snapshot_storage::acquire()?;
     let store = lease.store();
-    let manifest = store.current_paired_wal_journal_manifest(&mut lease)
-        .map_err(|error| {
+    let manifest = snapshot_storage::peek_wal_continuation(&mut lease)
+        .map_err(|status| {
             WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
-            snapshot_store_error_status(error)
+            status
         })?;
     let prepared = match crate::config_manager_prepare_system_hive_checkpoint() {
         Ok(prepared) => prepared,
@@ -105,15 +160,22 @@ pub(crate) unsafe fn fold_system_wal_if_dirty() -> Result<bool, u32> {
     if prepared.is_none() && manifest.base_serial == manifest.high_water_serial {
         return Ok(false);
     }
-    let anchored = nt_fs::WalSnapshotAnchor {
-        incarnation: manifest.incarnation,
-        serial: manifest.high_water_serial,
-        end_lba: manifest.high_water_end_lba,
-    };
-    let old = snapshot_storage::take_wal_continuation(&lease, anchored);
+    let old = snapshot_storage::take_wal_continuation(&mut lease);
     let refused = old.as_ref().err().copied();
+    let (old_continuation, old_pair) = match old {
+        Ok((continuation, pair, observed)) if observed == manifest => (Some(continuation), Some(pair)),
+        Ok((continuation, pair, _)) => {
+            core::mem::forget(continuation);
+            core::mem::forget(pair);
+            WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+            core::mem::forget(lease);
+            return Err(nt_fs::STATUS_DATA_ERROR);
+        }
+        Err(_) => (None, None),
+    };
     *core::ptr::addr_of_mut!(FOLD_WORK) = Some(FoldWork {
-        prepared, lease, old_continuation: old.ok(), next_continuation: None,
+        prepared, lease, old_continuation, old_pair, next_continuation: None,
+        next_pair: None, publish_prepared_after_ack: false,
         phase: Phase::Folding,
     });
     if let Some(status) = refused {
@@ -123,7 +185,7 @@ pub(crate) unsafe fn fold_system_wal_if_dirty() -> Result<bool, u32> {
 
     let result = fold_retained(store, manifest);
     if let Err(status) = result {
-        return Err(block(status));
+        return Err(block(report_fold_failure(b"fold-retained", status)));
     }
     (&mut *core::ptr::addr_of_mut!(FOLD_WORK)).as_mut()
         .expect("retained fold owner").phase = Phase::Acknowledging;
@@ -141,17 +203,7 @@ unsafe fn fold_retained(
 
     // A CM preparation is the full post-WAL SYSTEM state. A non-SYSTEM-only epoch has no
     // SYSTEM image to replace; the frozen volume already holds its exact hive log appends.
-    if let Some(prepared) = work.prepared.as_mut() {
-        if nt_hive_core::image_len_if_valid(&prepared.image).ok()
-            != Some(prepared.image.len())
-        {
-            return Err(nt_fs::STATUS_DATA_ERROR);
-        }
-        let image = core::mem::take(&mut prepared.image);
-        replace_boot_file(fs, CONFIG_SYSTEM_HIVE_PATH, image)?;
-        let log_path = alloc::format!("{}.LOG", CONFIG_SYSTEM_HIVE_PATH);
-        replace_boot_file(fs, &log_path, alloc::vec::Vec::new())?;
-    }
+    apply_prepared_checkpoint(fs, &mut work.prepared)?;
 
     let folded = nt_fs::WalSnapshotManifest {
         incarnation: manifest.incarnation,
@@ -161,24 +213,24 @@ unsafe fn fold_retained(
     };
     // Both folded slots must contain the same CM image. Capture before the first disk write so
     // native I/O reentry cannot change the live tree between CRC and payload serialization.
-    let snapshot_bytes = fs.export_volume_snapshot().map_err(|error| match error {
-        nt_fs::MemFsSnapshotError::OutOfMemory => nt_fs::STATUS_INSUFFICIENT_RESOURCES,
-        _ => 0xC000_0001,
-    })?;
+    let snapshot = snapshot_capture::CapturedSnapshot::capture(&work.lease, fs)
+        .map_err(|status| report_fold_failure(b"capture", status))?;
+    let snapshot_bytes = snapshot.as_slice();
     let bytes = snapshot_bytes.len();
-    let generation = store.commit_next_with_wal_manifest(&mut work.lease, &snapshot_bytes, folded)
-        .map_err(snapshot_store_error_status)?;
+    let generation = store.commit_next_with_wal_manifest(&mut work.lease, snapshot_bytes, folded)
+        .map_err(|error| report_fold_failure(b"first-snapshot", snapshot_store_error_status(error)))?;
     WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
     WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);
     WRITABLE_FS_SNAPSHOT_COMMIT_BYTES.store(bytes as u64, Ordering::Relaxed);
     // The second commit replaces the other slot. Both must carry the folded base before the
     // rollover can publish a RESETTING header or erase any old WAL sectors.
-    let generation = store.commit_next_with_wal_manifest(&mut work.lease, &snapshot_bytes, folded)
-        .map_err(snapshot_store_error_status)?;
+    let generation = store.commit_next_with_wal_manifest(&mut work.lease, snapshot_bytes, folded)
+        .map_err(|error| report_fold_failure(b"second-snapshot", snapshot_store_error_status(error)))?;
     WRITABLE_FS_SNAPSHOT_COMMITS.fetch_add(1, Ordering::Relaxed);
     WRITABLE_FS_SNAPSHOT_COMMIT_GENERATION.store(generation, Ordering::Relaxed);
     WRITABLE_FS_SNAPSHOT_COMMIT_BYTES.store(bytes as u64, Ordering::Relaxed);
 
+    drop(snapshot);
     let (start, sectors) = snapshot_storage::wal_bounds(&work.lease)?;
     if needs_epoch_rollover(manifest.high_water_end_lba, sectors) {
         let expected = nt_fs::WalSnapshotAnchor {
@@ -225,7 +277,49 @@ unsafe fn fold_retained(
         // It stays private until the exact CM checkpoint ACK has been observed.
         work.next_continuation = Some(token);
     }
+    let pair = store.verify_paired_wal_snapshot(&mut work.lease)
+        .map_err(snapshot_store_error_status)?;
+    let token = work.next_continuation.as_ref().or(work.old_continuation.as_ref())
+        .ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    if pair.anchor() != token.anchor() {
+        return Err(nt_fs::STATUS_DATA_ERROR);
+    }
+    work.next_pair = Some(pair);
     Ok(())
+}
+
+fn apply_prepared_checkpoint(
+    fs: &mut nt_fs::FileSystem,
+    prepared: &mut Option<nt_config_client::PreparedSystemHiveCheckpoint>,
+) -> Result<(), u32> {
+    if let Some(prepared) = prepared.as_mut() {
+        if nt_hive_core::image_len_if_valid(&prepared.image).ok()
+            != Some(prepared.image.len()) { return Err(nt_fs::STATUS_DATA_ERROR); }
+        let image = core::mem::take(&mut prepared.image);
+        replace_boot_file(fs, CONFIG_SYSTEM_HIVE_PATH, image)?;
+        let log_path = alloc::format!("{}.LOG", CONFIG_SYSTEM_HIVE_PATH);
+        replace_boot_file(fs, &log_path, alloc::vec::Vec::new())?;
+    }
+    Ok(())
+}
+
+/// Prepare the exact post-CM volume privately while preserving the original image for the
+/// final shared-overlay publication after durable native I/O and CM acknowledgement.
+fn stage_prepared_checkpoint(
+    fs: &mut nt_fs::FileSystem,
+    prepared: &Option<nt_config_client::PreparedSystemHiveCheckpoint>,
+) -> Result<(), u32> {
+    let Some(prepared) = prepared.as_ref() else { return Ok(()); };
+    if nt_hive_core::image_len_if_valid(&prepared.image).ok() != Some(prepared.image.len()) {
+        return Err(nt_fs::STATUS_DATA_ERROR);
+    }
+    let mut image = alloc::vec::Vec::new();
+    image.try_reserve_exact(prepared.image.len())
+        .map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES)?;
+    image.extend_from_slice(&prepared.image);
+    replace_boot_file(fs, CONFIG_SYSTEM_HIVE_PATH, image)?;
+    let log_path = alloc::format!("{}.LOG", CONFIG_SYSTEM_HIVE_PATH);
+    replace_boot_file(fs, &log_path, alloc::vec::Vec::new())
 }
 
 unsafe fn acknowledge_retained() -> Result<bool, u32> {
@@ -246,29 +340,47 @@ unsafe fn install_retained() -> Result<bool, u32> {
     let work = (&mut *core::ptr::addr_of_mut!(FOLD_WORK)).as_mut()
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
     debug_assert!(work.phase == Phase::Installing);
+    if work.publish_prepared_after_ack {
+        let fs = (&mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS))
+            .as_mut().ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        // CM has acknowledged the durable fold. Protected log nodes may now accept the
+        // one shared-overlay replacement; this entire step runs in one outer service turn.
+        fs.release_wal_log_protection_after_fold();
+        if let Err(status) = apply_prepared_checkpoint(fs, &mut work.prepared) {
+            // Some in-memory replacement may have happened; never replay it with a consumed
+            // prepared image or release the physical lease to another writer.
+            work.phase = Phase::Failed;
+            return Err(block(status));
+        }
+        work.publish_prepared_after_ack = false;
+    }
     let rollover = work.next_continuation.is_some();
     let token = if rollover {
         work.next_continuation.take()
     } else {
         work.old_continuation.take()
     }.ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
-    if let Err((status, token)) = snapshot_storage::install_wal_continuation(&work.lease, token) {
+    let pair = work.next_pair.take().ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    if let Err((status, token, pair)) = snapshot_storage::install_wal_continuation(&work.lease, token, pair) {
         if rollover {
             work.next_continuation = Some(token);
         } else {
             work.old_continuation = Some(token);
         }
+        work.next_pair = Some(pair);
         return Err(block(status));
     }
-    // The two folded slots are already durable. Keep any unrelated mounted-volume dirty work
-    // visible to the ordinary snapshot checkpoint; a boolean cannot prove there was no writer
-    // while CM processed the ACK.
+    // The fold lease excluded native checkpoint admission, which is the only post-cutover path
+    // that clears the dirty bit. Ordinary overlay mutations during native I/O mark it and remain
+    // pending for a later checkpoint; journal-bearing CM mutations cannot acquire this lease.
+    // Keep all such work visible after installing the folded pair.
     (&mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS)).as_mut()
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
         .release_wal_log_protection_after_fold();
     hive_wal::note_volume_wal_folded();
     *core::ptr::addr_of_mut!(FOLD_WORK) = None;
     SYSTEM_WAL_FOLD_REQUIRED.store(false, Ordering::Release);
+    crate::service_sec_image::note_system_wal_fold_complete();
     WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(false, Ordering::Release);
     Ok(true)
 }

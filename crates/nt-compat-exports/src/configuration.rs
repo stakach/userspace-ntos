@@ -2,8 +2,13 @@
 
 pub const CM_PARTIAL_RESOURCE_LIST_HEADER_BYTES: usize = 8;
 pub const CM_PARTIAL_RESOURCE_DESCRIPTOR_BYTES: usize = 20;
-pub const ACPI_BIOS_MULTI_NODE_HEADER_BYTES: usize = 16;
+// Pinned LiberNT acpi.h includes RsdpAddress before RsdtAddress and Count.
+pub const ACPI_BIOS_MULTI_NODE_HEADER_BYTES: usize = 24;
 pub const ACPI_E820_ENTRY_BYTES: usize = 24;
+// Pinned LiberNT ARC CONFIGURATION_COMPONENT ordinals. Its released ACPI image searches this
+// exact pair; earlier ReactOS headers assign a different ordinal to MultiFunctionAdapter.
+pub const ARC_ADAPTER_CLASS: u32 = 3;
+pub const ARC_MULTIFUNCTION_ADAPTER: u32 = 12;
 pub const LOADER_ACPI_CONFIGURATION_FIXED_BYTES: usize = CM_PARTIAL_RESOURCE_LIST_HEADER_BYTES
     + CM_PARTIAL_RESOURCE_DESCRIPTOR_BYTES
     + ACPI_BIOS_MULTI_NODE_HEADER_BYTES;
@@ -14,6 +19,64 @@ pub struct LoaderFirmwareMemoryRange {
     pub length: u64,
     pub e820_type: u32,
     pub extended_attributes: u32,
+}
+
+/// NT's PHYSICAL_MEMORY_RANGE is two LARGE_INTEGER fields and ends with a zero pair.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PhysicalMemoryRange {
+    pub base_address: u64,
+    pub number_of_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalMemoryRangesError {
+    InvalidFirmwareMap,
+    BufferTooSmall,
+    NoRam,
+}
+
+pub fn physical_memory_ranges_from_firmware(
+    memory_map: &[LoaderFirmwareMemoryRange],
+    output: &mut [PhysicalMemoryRange],
+) -> Result<usize, PhysicalMemoryRangesError> {
+    let mut previous_end = 0u64;
+    let mut ram_count = 0usize;
+    for (index, entry) in memory_map.iter().enumerate() {
+        let end = entry
+            .base
+            .checked_add(entry.length)
+            .ok_or(PhysicalMemoryRangesError::InvalidFirmwareMap)?;
+        if entry.length == 0
+            || !(1..=4).contains(&entry.e820_type)
+            || entry.extended_attributes & 1 == 0
+            || (index != 0 && entry.base < previous_end)
+        {
+            return Err(PhysicalMemoryRangesError::InvalidFirmwareMap);
+        }
+        previous_end = end;
+        if entry.e820_type == 1 {
+            ram_count = ram_count
+                .checked_add(1)
+                .ok_or(PhysicalMemoryRangesError::InvalidFirmwareMap)?;
+        }
+    }
+    if ram_count == 0 {
+        return Err(PhysicalMemoryRangesError::NoRam);
+    }
+    if output.len() <= ram_count {
+        return Err(PhysicalMemoryRangesError::BufferTooSmall);
+    }
+    let mut written = 0usize;
+    for entry in memory_map.iter().filter(|entry| entry.e820_type == 1) {
+        output[written] = PhysicalMemoryRange {
+            base_address: entry.base,
+            number_of_bytes: entry.length,
+        };
+        written += 1;
+    }
+    output[written] = PhysicalMemoryRange::default();
+    Ok(written)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,14 +135,16 @@ pub fn encode_loader_acpi_configuration(
     output[12..16].copy_from_slice(&data_size.to_le_bytes());
 
     let node = CM_PARTIAL_RESOURCE_LIST_HEADER_BYTES + CM_PARTIAL_RESOURCE_DESCRIPTOR_BYTES;
-    output[node..node + 8].copy_from_slice(&root_table_paddr.to_le_bytes());
-    output[node + 8..node + 16].copy_from_slice(&(memory_map.len() as u64).to_le_bytes());
+    // No RSDP physical address is published by Simpleboot. The released ACPI driver constructs a
+    // checked RSDP from this real root table, so keep RsdpAddress absent and publish RsdtAddress.
+    output[node + 8..node + 16].copy_from_slice(&root_table_paddr.to_le_bytes());
+    output[node + 16..node + 24].copy_from_slice(&(memory_map.len() as u64).to_le_bytes());
     for (index, entry) in memory_map.iter().enumerate() {
         let offset = node + ACPI_BIOS_MULTI_NODE_HEADER_BYTES + index * ACPI_E820_ENTRY_BYTES;
         output[offset..offset + 8].copy_from_slice(&entry.base.to_le_bytes());
         output[offset + 8..offset + 16].copy_from_slice(&entry.length.to_le_bytes());
-        output[offset + 16..offset + 20].copy_from_slice(&entry.e820_type.to_le_bytes());
-        output[offset + 20..offset + 24].copy_from_slice(&entry.extended_attributes.to_le_bytes());
+        // LiberNT ACPI_E820_ENTRY has one 64-bit Type, not an E820 Type/Attributes pair.
+        output[offset + 16..offset + 24].copy_from_slice(&(entry.e820_type as u64).to_le_bytes());
     }
     Ok(required)
 }
@@ -102,6 +167,31 @@ pub fn component_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_memory_ranges_copy_ram_only_and_end_with_zero_pair() {
+        let firmware = [
+            LoaderFirmwareMemoryRange { base: 0, length: 0x1000, e820_type: 2, extended_attributes: 1 },
+            LoaderFirmwareMemoryRange { base: 0x1000, length: 0x2000, e820_type: 1, extended_attributes: 1 },
+            LoaderFirmwareMemoryRange { base: 0x3000, length: 0x1000, e820_type: 3, extended_attributes: 1 },
+        ];
+        let mut output = [PhysicalMemoryRange { base_address: u64::MAX, number_of_bytes: u64::MAX }; 2];
+        assert_eq!(physical_memory_ranges_from_firmware(&firmware, &mut output), Ok(1));
+        assert_eq!(output[0], PhysicalMemoryRange { base_address: 0x1000, number_of_bytes: 0x2000 });
+        assert_eq!(output[1], PhysicalMemoryRange::default());
+    }
+
+    #[test]
+    fn physical_memory_ranges_fail_closed_on_overlap_or_short_output() {
+        let firmware = [
+            LoaderFirmwareMemoryRange { base: 0x1000, length: 0x2000, e820_type: 1, extended_attributes: 1 },
+            LoaderFirmwareMemoryRange { base: 0x2000, length: 0x1000, e820_type: 1, extended_attributes: 1 },
+        ];
+        let mut output = [PhysicalMemoryRange::default(); 3];
+        assert_eq!(physical_memory_ranges_from_firmware(&firmware, &mut output), Err(PhysicalMemoryRangesError::InvalidFirmwareMap));
+        let mut short = [PhysicalMemoryRange::default(); 1];
+        assert_eq!(physical_memory_ranges_from_firmware(&firmware[..1], &mut short), Err(PhysicalMemoryRangesError::BufferTooSmall));
+    }
 
     #[test]
     fn optional_key_matches_the_nt_configuration_contract() {
@@ -128,25 +218,25 @@ mod tests {
                 extended_attributes: 1,
             },
         ];
-        let mut output = [0xa5; 96];
+        let mut output = [0xa5; 104];
         let used = encode_loader_acpi_configuration(&mut output, 0x7ffe_0040, &ranges).unwrap();
-        assert_eq!(used, 92);
+        assert_eq!(used, 100);
         assert_eq!(u32::from_le_bytes(output[4..8].try_into().unwrap()), 1);
         assert_eq!(output[8], 5);
-        assert_eq!(u32::from_le_bytes(output[12..16].try_into().unwrap()), 64);
+        assert_eq!(u32::from_le_bytes(output[12..16].try_into().unwrap()), 72);
+        assert_eq!(u64::from_le_bytes(output[28..36].try_into().unwrap()), 0);
         assert_eq!(
-            u64::from_le_bytes(output[28..36].try_into().unwrap()),
+            u64::from_le_bytes(output[36..44].try_into().unwrap()),
             0x7ffe_0040
         );
-        assert_eq!(u64::from_le_bytes(output[36..44].try_into().unwrap()), 2);
-        assert_eq!(u64::from_le_bytes(output[44..52].try_into().unwrap()), 0);
+        assert_eq!(u64::from_le_bytes(output[44..52].try_into().unwrap()), 2);
+        assert_eq!(u64::from_le_bytes(output[52..60].try_into().unwrap()), 0);
         assert_eq!(
-            u64::from_le_bytes(output[52..60].try_into().unwrap()),
+            u64::from_le_bytes(output[60..68].try_into().unwrap()),
             0x9f000
         );
-        assert_eq!(u32::from_le_bytes(output[60..64].try_into().unwrap()), 1);
-        assert_eq!(u32::from_le_bytes(output[64..68].try_into().unwrap()), 1);
-        assert_eq!(output[92..], [0xa5; 4]);
+        assert_eq!(u64::from_le_bytes(output[68..76].try_into().unwrap()), 1);
+        assert_eq!(output[100..], [0xa5; 4]);
     }
 
     #[test]

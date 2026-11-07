@@ -51,9 +51,18 @@ fn i8042prt_debug_import_has_an_explicit_native_handler() {
         .split("fn register_fsd_trampolines(")
         .nth(1)
         .expect("import registry");
-    assert!(registry.contains("\"KdSystemDebugControl\","),
+    assert!(registry.contains("bind_kd_debug_export(reg)"),
+        "the shared native Kd binder must be registered");
+    let binder = launch
+        .split("fn bind_kd_debug_export(")
+        .nth(1)
+        .expect("shared native Kd binder")
+        .split("\n}")
+        .next()
+        .unwrap();
+    assert!(binder.contains("\"KdSystemDebugControl\","),
         "i8042prt's strict PE import must resolve to a native handler");
-    assert!(registry.contains("hosted_kd_debug::s_kd_system_debug_control"),
+    assert!(binder.contains("hosted_kd_debug::s_kd_system_debug_control"),
         "debug-control behavior must have a focused native adapter");
 }
 

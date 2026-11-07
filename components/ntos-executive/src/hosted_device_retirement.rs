@@ -45,7 +45,7 @@ pub(super) unsafe fn retire_hosted_device_projection(
     if physical_registration != registration {
         return Err(nt_status::NtStatus::INVALID_HANDLE);
     }
-    let (retirement, (device_exec, next_device, target_link, rollback_pdo_exec)) =
+    let (retirement, (device_exec, next_device, target_link, rollback_pdo_exec, owned_vpb)) =
         hosted_device_allocations::admit_retirement_checked(
             inst, device_object, physical_registration, |preflight| {
                 let (device_exec, capacity) =
@@ -67,6 +67,15 @@ pub(super) unsafe fn retire_hosted_device_projection(
                     Some(pdo) => Some(preflight.related_allocation_exec(pdo)?),
                     None => None,
                 };
+                let owned_vpb = preflight.owned_vpb_for_retirement(inst)?;
+                if let Some(vpb) = owned_vpb {
+                    if vpb.component_address == device_object
+                        || vpb.capacity < nt_io_manager::WDM_X64_VPB_SIZE as u64
+                        || hosted_instance_pool_allocation_is_free_unlocked(inst, vpb.component_address) != Some(false)
+                    {
+                        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+                    }
+                }
                 let driver_object = read_unaligned((device_exec + 0x08) as *const u64);
                 // The projected header is writable by the provider. It cannot erase or
                 // redirect the list owner captured when its canonical bind was accepted.
@@ -75,6 +84,11 @@ pub(super) unsafe fn retire_hosted_device_projection(
                     return Err(nt_status::NtStatus::INVALID_PARAMETER);
                 }
                 let next_device = read_unaligned((device_exec + 0x10) as *const u64);
+                // An unlinked PDO has no driver list owner. Its provider-writable
+                // NextDevice field cannot introduce a link after publication.
+                if driver_object == 0 && next_device != 0 {
+                    return Err(nt_status::NtStatus::INVALID_PARAMETER);
+                }
                 let mut target_link = None;
                 if driver_object != 0 {
                     let (driver_exec, driver_capacity) =
@@ -117,9 +131,16 @@ pub(super) unsafe fn retire_hosted_device_projection(
                         return Err(nt_status::NtStatus::INVALID_PARAMETER);
                     }
                 }
-                Ok((device_exec, next_device, target_link, rollback_pdo_exec))
+                Ok((device_exec, next_device, target_link, rollback_pdo_exec, owned_vpb))
             },
         )?;
+    // The physical registration and pool retirement receipt remain held here. Clear only
+    // ETHREAD fields recorded against this exact registration generation before reuse.
+    if let Some(registration) = physical_registration {
+        crate::service_sec_image::with_provider_process_manager(|pm| {
+            crate::ps_object_backing::clear_device_to_verify_for_registration(pm, registration)
+        }).map_err(|_| nt_status::NtStatus::INVALID_HANDLE)?;
+    }
     let attached_pdo = rollback_pdo_exec.and_then(|pdo_exec| {
         (read_unaligned((pdo_exec + 0x18) as *const u64) == device_object)
             .then(|| (pdo_exec, read_unaligned((device_exec + 0x4c) as *const u8)))
@@ -145,6 +166,10 @@ pub(super) unsafe fn retire_hosted_device_projection(
             write_unaligned(target_link as *mut u64, device_object);
         }
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    if let Some(vpb) = owned_vpb {
+        assert!(hosted_instance_pool_free_unlocked(inst, vpb.component_address),
+            "preflighted exact VPB free failed after Device free");
     }
     hosted_device_allocations::finish_retirement(retirement)?;
     Ok(())

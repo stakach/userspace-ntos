@@ -3,16 +3,18 @@
 //! The message shape is not authority. The executive must additionally authenticate the exact
 //! physical route, dispatch, Reply, thread, driver domain, and writable packet stack lease.
 
-pub const RAISE_LABEL: u64 = 0x78f;
-pub const PREPARE_LABEL: u64 = 0x790;
-pub const HANDLER_RESULT_LABEL: u64 = 0x791;
-pub const PREPARE_COMMAND_LABEL: u64 = 0x792;
-pub const INVOKE_COMMAND_LABEL: u64 = 0x793;
-pub const RESTORE_COMMAND_LABEL: u64 = 0x794;
-pub const SECOND_CHANCE_COMMAND_LABEL: u64 = 0x795;
-pub const UNWIND_REQUEST_LABEL: u64 = 0x796;
-pub const BEGIN_UNWIND_LABEL: u64 = 0x797;
-pub const FAULT_BEGIN_LABEL: u64 = 0x798;
+// Shared hosted-driver and Win32k endpoint labels. Keep this range separate from the
+// native service labels: Win32k file calls occupy 0x790..=0x79f on the same endpoint.
+pub const RAISE_LABEL: u64 = 0x880;
+pub const PREPARE_LABEL: u64 = 0x881;
+pub const HANDLER_RESULT_LABEL: u64 = 0x882;
+pub const PREPARE_COMMAND_LABEL: u64 = 0x883;
+pub const INVOKE_COMMAND_LABEL: u64 = 0x884;
+pub const RESTORE_COMMAND_LABEL: u64 = 0x885;
+pub const SECOND_CHANCE_COMMAND_LABEL: u64 = 0x886;
+pub const UNWIND_REQUEST_LABEL: u64 = 0x887;
+pub const BEGIN_UNWIND_LABEL: u64 = 0x888;
+pub const FAULT_BEGIN_LABEL: u64 = 0x889;
 
 pub const fn message_info(label: u64, length: u64) -> u64 {
     (label << 12) | length

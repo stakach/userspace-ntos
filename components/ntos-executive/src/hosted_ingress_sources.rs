@@ -93,7 +93,8 @@ fn physical(instance_index: usize, kind: PhysicalSourceKind) -> Option<(Physical
         }
         PhysicalSourceKind::DispatchWorker { ordinal } => {
             let worker = unsafe { hosted_source_completion_lane::worker(instance_index, ordinal)
-                .or_else(|| hosted_class_irp_lane::worker(instance_index, ordinal))? };
+                .or_else(|| hosted_class_irp_lane::worker(instance_index, ordinal))
+                .or_else(|| hosted_provider_export_lane::worker(instance_index, ordinal))? };
             let thread = unsafe { (&*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_TABLES)) }
                 .as_ref()?.get(instance_index)?.get(worker.handle)?;
             if worker.domain != domain || worker.pml4 != inst.pml4 || thread.tcb != worker.tcb {
@@ -187,6 +188,7 @@ pub(crate) fn thread_enrollment(instance_index: usize, handle: u64) -> Option<En
                         || matches!(row.physical.kind, PhysicalSourceKind::DispatchWorker { ordinal }
                             if hosted_source_completion_lane::worker(instance_index, ordinal)
                                 .or_else(|| hosted_class_irp_lane::worker(instance_index, ordinal))
+                                .or_else(|| hosted_provider_export_lane::worker(instance_index, ordinal))
                                 .is_some_and(|worker| worker.handle == handle)))
                     && row.physical.domain == domain
                     && row.physical.pml4 == inst.pml4
@@ -294,11 +296,19 @@ pub(crate) unsafe fn enroll_system_thread(
     handle: u64,
     reply: u64,
 ) -> Result<PeerRoute, Error> {
-    enroll(
+    let route = enroll(
         instance_index,
         PhysicalSourceKind::SystemThread { handle },
         reply,
-    )
+    )?;
+    print_str(b"[system-thread-enroll] instance=");
+    print_u64(instance_index as u64);
+    print_str(b" handle=");
+    print_u64(handle);
+    print_str(b" route=");
+    print_u64(route.badge());
+    print_str(b"\n");
+    Ok(route)
 }
 
 /// A persistent initialized ordinary worker has its own startup/dispatch handshake.

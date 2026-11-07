@@ -17,6 +17,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 pub mod hard_error;
+pub mod copy_preflight;
 pub mod system_information;
 
 // NTSTATUS (spec §18)
@@ -91,6 +92,7 @@ pub enum NativeService {
     NtSetIoCompletion,
     // Registry (§16.3)
     NtOpenKey,
+    NtOpenKeyEx,
     NtCreateKey,
     NtQueryValueKey,
     NtSetValueKey,
@@ -154,7 +156,10 @@ pub enum NativeService {
     NtCreateToken,
     NtAccessCheck,
     NtAccessCheckByType,
+    NtAccessCheckByTypeAndAuditAlarm,
     NtAccessCheckByTypeResultList,
+    NtAccessCheckByTypeResultListAndAuditAlarm,
+    NtAccessCheckByTypeResultListAndAuditAlarmByHandle,
     // System information (§16.5, §7.1)
     NtQuerySystemInformation,
     NtQuerySystemTime,
@@ -233,6 +238,8 @@ pub enum NativeService {
     NtSetInformationThread,
     NtSetInformationProcess,
     NtTestAlert,
+    NtAlertThreadByThreadId,
+    NtWaitForAlertByThreadId,
     NtFlushInstructionCache,
     NtCreateKeyedEvent,
     NtReleaseKeyedEvent,
@@ -346,6 +353,7 @@ impl NativeService {
             NtRemoveIoCompletion => "NtRemoveIoCompletion",
             NtSetIoCompletion => "NtSetIoCompletion",
             NtOpenKey => "NtOpenKey",
+            NtOpenKeyEx => "NtOpenKeyEx",
             NtCreateKey => "NtCreateKey",
             NtQueryValueKey => "NtQueryValueKey",
             NtSetValueKey => "NtSetValueKey",
@@ -401,7 +409,10 @@ impl NativeService {
             NtCreateToken => "NtCreateToken",
             NtAccessCheck => "NtAccessCheck",
             NtAccessCheckByType => "NtAccessCheckByType",
+            NtAccessCheckByTypeAndAuditAlarm => "NtAccessCheckByTypeAndAuditAlarm",
             NtAccessCheckByTypeResultList => "NtAccessCheckByTypeResultList",
+            NtAccessCheckByTypeResultListAndAuditAlarm => "NtAccessCheckByTypeResultListAndAuditAlarm",
+            NtAccessCheckByTypeResultListAndAuditAlarmByHandle => "NtAccessCheckByTypeResultListAndAuditAlarmByHandle",
             NtQuerySystemInformation => "NtQuerySystemInformation",
             NtQuerySystemTime => "NtQuerySystemTime",
             NtSetSystemTime => "NtSetSystemTime",
@@ -456,6 +467,8 @@ impl NativeService {
             NtSetInformationThread => "NtSetInformationThread",
             NtSetInformationProcess => "NtSetInformationProcess",
             NtTestAlert => "NtTestAlert",
+            NtAlertThreadByThreadId => "NtAlertThreadByThreadId",
+            NtWaitForAlertByThreadId => "NtWaitForAlertByThreadId",
             NtFlushInstructionCache => "NtFlushInstructionCache",
             NtCreateKeyedEvent => "NtCreateKeyedEvent",
             NtReleaseKeyedEvent => "NtReleaseKeyedEvent",
@@ -545,6 +558,7 @@ impl NativeService {
         NativeService::NtRemoveIoCompletion,
         NativeService::NtSetIoCompletion,
         NativeService::NtOpenKey,
+        NativeService::NtOpenKeyEx,
         NativeService::NtCreateKey,
         NativeService::NtQueryValueKey,
         NativeService::NtSetValueKey,
@@ -721,6 +735,11 @@ impl NativeService {
         NativeService::NtCreateProcessEx,
         NativeService::NtQueryMutant,
         NativeService::NtQueryTimer,
+        NativeService::NtAlertThreadByThreadId,
+        NativeService::NtWaitForAlertByThreadId,
+        NativeService::NtAccessCheckByTypeAndAuditAlarm,
+        NativeService::NtAccessCheckByTypeResultListAndAuditAlarm,
+        NativeService::NtAccessCheckByTypeResultListAndAuditAlarmByHandle,
     ];
 }
 

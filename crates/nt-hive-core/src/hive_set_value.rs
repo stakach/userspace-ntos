@@ -1,6 +1,7 @@
 //! Exclusively borrowed, allocation-free publication of a prepared value edit.
 
-use super::{Cell, CellId, Hive, Rc, RegistryValueType, String, ValueCell, Vec};
+use super::{Cell, CellId, Hive, HiveId, MutableHiveSet, Rc, RegistryValueType, String, ValueCell, Vec};
+use crate::{try_encode_log_record, HiveLogOp};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetValueError {
@@ -35,6 +36,127 @@ pub struct PreparedSetValue<'a> {
     sequence: u64,
     blob: PreparedBlob,
     cell: PreparedCell,
+}
+
+/// Move-only value edit retained while the provider's WAL and anchor become durable.
+/// The mounted hive remains readable; its exact slot refuses mutation or replacement.
+#[must_use = "the retained value requires durable publication or pre-entry release"]
+pub struct OwnedPreparedSetValue {
+    hive_id: HiveId,
+    owner: u64,
+    key: CellId,
+    value_type: RegistryValueType,
+    sequence: u64,
+    blob: PreparedBlob,
+    cell: PreparedCell,
+    record: Vec<u8>,
+    entered: bool,
+}
+
+impl core::fmt::Debug for OwnedPreparedSetValue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OwnedPreparedSetValue")
+            .field("hive_id", &self.hive_id)
+            .field("owner", &self.owner)
+            .field("sequence", &self.sequence)
+            .field("entered", &self.entered)
+            .finish()
+    }
+}
+
+impl OwnedPreparedSetValue {
+    pub fn sequence(&self) -> u64 { self.sequence }
+    pub fn record(&self) -> &[u8] { &self.record }
+    pub fn hive_id(&self) -> HiveId { self.hive_id }
+    /// # Safety
+    /// The caller must own proof that this exact record entered its physical WAL route.
+    /// An uncertain effect must retain this owner and must never call pre-entry release.
+    pub unsafe fn mark_entered(&mut self) { self.entered = true; }
+}
+
+impl MutableHiveSet {
+    /// Reserve the exact mounted hive and every publication allocation before WAL entry.
+    pub fn prepare_owned_set_value(
+        &mut self,
+        hive_id: HiveId,
+        key: CellId,
+        path: &str,
+        name: &str,
+        value_type: RegistryValueType,
+        data: Vec<u8>,
+    ) -> Result<OwnedPreparedSetValue, SetValueError> {
+        if self.retained_value_owners.iter().any(|(id, _)| *id == hive_id) {
+            return Err(SetValueError::RetainedPublication);
+        }
+        let owner = self.reserve_retained_owner().ok_or(SetValueError::InsufficientResources)?;
+        let hive = self.hives.iter_mut().find(|(id, _)| *id == hive_id)
+            .map(|(_, hive)| hive).ok_or(SetValueError::KeyNotFound)?;
+        if hive.open_key(path) != Some(key) {
+            return Err(SetValueError::KeyNotFound);
+        }
+        let sequence = hive.sequence.checked_add(1).ok_or(SetValueError::InsufficientResources)?;
+        let record = try_encode_log_record(
+            &HiveLogOp::SetValue { path, name, value_type, data: &data }, sequence,
+        ).map_err(|_| SetValueError::InsufficientResources)?;
+        let prepared = hive.try_prepare_set_value(key, name, value_type, data)?;
+        let PreparedSetValue { hive: _, key, value_type, sequence: prepared_sequence, blob, cell } = prepared;
+        if prepared_sequence != sequence {
+            return Err(SetValueError::InsufficientResources);
+        }
+        self.retained_value_owners.push((hive_id, owner));
+        Ok(OwnedPreparedSetValue {
+            hive_id, owner, key, value_type, sequence, blob, cell, record, entered: false,
+        })
+    }
+
+    /// A pre-entry refusal can release the reservation. Entered effects remain pinned.
+    pub fn release_unentered_owned_set_value(
+        &mut self,
+        prepared: OwnedPreparedSetValue,
+    ) -> Result<(), (SetValueError, OwnedPreparedSetValue)> {
+        let Some(index) = self.retained_value_owners.iter().position(|(id, owner)|
+            *id == prepared.hive_id && *owner == prepared.owner) else {
+            return Err((SetValueError::RetainedPublication, prepared));
+        };
+        if prepared.entered {
+            return Err((SetValueError::RetainedPublication, prepared));
+        }
+        self.retained_value_owners.remove(index);
+        Ok(())
+    }
+
+    /// Publish after the exact native WAL marker and paired anchor are acknowledged.
+    ///
+    /// # Safety
+    /// `durable_sequence` alone is not proof. The caller must consume an opaque receipt
+    /// issued by the retained WAL owner after the exact marker and both header barriers
+    /// completed and were acknowledged. The receipt must bind `prepared.record()` and its
+    /// exact mounted hive/log identity. No replay or duplicate publication is permitted.
+    /// A wrong sequence or owner returns the same move-only edit without changing the hive.
+    pub unsafe fn publish_owned_set_value_unchecked(
+        &mut self,
+        prepared: OwnedPreparedSetValue,
+        durable_sequence: u64,
+    ) -> Result<CellId, (SetValueError, OwnedPreparedSetValue)> {
+        let Some(reservation) = self.retained_value_owners.iter().position(|(id, owner)|
+            *id == prepared.hive_id && *owner == prepared.owner) else {
+            return Err((SetValueError::RetainedPublication, prepared));
+        };
+        if !prepared.entered || prepared.sequence != durable_sequence {
+            return Err((SetValueError::RetainedPublication, prepared));
+        }
+        let Some(hive) = self.hives.iter_mut().find(|(id, _)| *id == prepared.hive_id)
+            .map(|(_, hive)| hive) else {
+            return Err((SetValueError::RetainedPublication, prepared));
+        };
+        if hive.sequence.checked_add(1) != Some(prepared.sequence) {
+            return Err((SetValueError::RetainedPublication, prepared));
+        }
+        let OwnedPreparedSetValue { key, value_type, sequence, blob, cell, .. } = prepared;
+        let value = PreparedSetValue { hive, key, value_type, sequence, blob, cell }.commit();
+        self.retained_value_owners.remove(reservation);
+        Ok(value)
+    }
 }
 
 impl Hive {

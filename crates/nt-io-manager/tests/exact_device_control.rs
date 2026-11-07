@@ -312,6 +312,8 @@ fn exact_controls_support_all_transfer_methods_without_file_access_or_upper_disp
                     status: NtStatus::SUCCESS,
                     information: 3,
                     file_context: None,
+                    completion_driver_id: f.io.device(f.lower).unwrap().driver_id,
+                    completion_device_id: f.lower,
                 })
             );
             assert_eq!(output, expected_output());
@@ -363,14 +365,22 @@ fn exact_controls_support_all_transfer_methods_without_file_access_or_upper_disp
 fn ordinary_device_controls_still_resolve_attached_top_instead_of_exact_lower() {
     for internal in [false, true] {
         let mut f = Fixture::new();
-        f.dispatch(
-            internal,
-            false,
-            f.lower,
-            ioctl::METHOD_BUFFERED,
-            &mut [0; CAPACITY],
-        )
-        .unwrap();
+        assert_eq!(
+            f.dispatch(
+                internal,
+                false,
+                f.lower,
+                ioctl::METHOD_BUFFERED,
+                &mut [0; CAPACITY],
+            ),
+            Ok(ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 3,
+                file_context: None,
+                completion_driver_id: f.io.device(f.upper).unwrap().driver_id,
+                completion_device_id: f.upper,
+            })
+        );
         assert!(f.lower_state.borrow().calls.is_empty());
         let state = f.upper_state.borrow();
         assert_eq!(state.calls.len(), 1);
@@ -402,6 +412,8 @@ fn raw_terminal_status_information_and_transfer_method_control_copyout() {
                             status,
                             information,
                             file_context: None,
+                            completion_driver_id: f.io.device(f.lower).unwrap().driver_id,
+                            completion_device_id: f.lower,
                         })
                     );
                     let mut expected = [0xa5; CAPACITY];

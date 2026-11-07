@@ -29,6 +29,9 @@ mod wait_capture;
 #[path = "provider_kernel_wait_resume_tests.rs"]
 mod wait_resume;
 
+#[path = "provider_ps_retirement_target_tests.rs"]
+mod ps_retirement_target;
+
 #[path = "provider_kernel_service_tests.rs"]
 mod service;
 

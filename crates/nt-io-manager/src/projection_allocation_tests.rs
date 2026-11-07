@@ -210,3 +210,123 @@ fn physical_publication_rejects_overlapping_ranges_but_not_foreign_pool_addresse
     assert!(ledger.stage(physical, adjacent).is_ok());
     assert!(ledger.stage(registration.domain(), allocation()).is_ok());
 }
+
+#[test]
+fn published_registration_resolves_its_exact_physical_allocation_across_reused_addresses() {
+    let mut io = IoManager::new(MockObjectPort::new());
+    let driver = io.register_driver(DriverRecord::new(
+        ObjectId::NULL,
+        NtPath::parse_str("\\Driver\\RelationChildren").unwrap(),
+        DriverBackendId(1),
+        MajorFunctionTable::new(),
+    ));
+    let first_device = io.add_device(DeviceRecord::new(
+        ObjectId::NULL,
+        driver,
+        None,
+        DeviceType::UNKNOWN,
+        DeviceCharacteristics::empty(),
+        DeviceFlags::empty(),
+        0,
+    ));
+    let second_device = io.add_device(DeviceRecord::new(
+        ObjectId::NULL,
+        driver,
+        None,
+        DeviceType::UNKNOWN,
+        DeviceCharacteristics::empty(),
+        DeviceFlags::empty(),
+        0,
+    ));
+    let first_physical = io.register_hosted_domain();
+    let second_physical = io.register_hosted_domain();
+    let first_logical = io.register_hosted_domain();
+    let second_logical = io.register_hosted_domain();
+    let first_registration = io
+        .bind_hosted_device_pointer(first_logical, 0x1000, first_device)
+        .unwrap();
+    let second_registration = io
+        .bind_hosted_device_pointer(second_logical, 0x1000, second_device)
+        .unwrap();
+    let first_allocation = allocation();
+    let second_allocation = SourcePoolAllocationIdentity {
+        pool_generation: 41,
+        ..allocation()
+    };
+    let mut ledger = ProjectionAllocationLedger::new();
+    let mut first_owner = ledger.stage(first_physical, first_allocation).unwrap();
+    let second_owner = ledger.stage(second_physical, second_allocation).unwrap();
+    ledger
+        .attach_registration(&first_owner, first_registration)
+        .unwrap();
+    ledger
+        .attach_registration(&second_owner, second_registration)
+        .unwrap();
+
+    assert_eq!(
+        ledger.physical_allocation_for_registration(first_registration),
+        Some((first_physical, first_allocation)),
+    );
+    assert_eq!(
+        ledger.physical_allocation_for_registration(second_registration),
+        Some((second_physical, second_allocation)),
+    );
+
+    ledger
+        .begin_retirement(
+            &first_owner,
+            first_physical,
+            first_allocation,
+            Some(first_registration),
+        )
+        .unwrap();
+    assert_eq!(
+        ledger.physical_allocation_for_registration(first_registration),
+        None,
+    );
+    ledger.acknowledge_free(&mut first_owner).unwrap();
+    io.retire_hosted_device_pointer(first_registration).unwrap();
+    let replacement_registration = io
+        .bind_hosted_device_pointer(first_logical, 0x1000, first_device)
+        .unwrap();
+    let replacement_allocation = SourcePoolAllocationIdentity {
+        pool_generation: first_allocation.pool_generation + 1,
+        ..first_allocation
+    };
+    let replacement_owner = ledger
+        .stage(first_physical, replacement_allocation)
+        .unwrap();
+    ledger
+        .attach_registration(&replacement_owner, replacement_registration)
+        .unwrap();
+    assert_eq!(
+        ledger.physical_allocation_for_registration(first_registration),
+        None,
+    );
+    assert_eq!(
+        ledger.physical_allocation_for_registration(replacement_registration),
+        Some((first_physical, replacement_allocation)),
+    );
+    assert_eq!(
+        ledger.physical_allocation_for_registration(second_registration),
+        Some((second_physical, second_allocation)),
+    );
+}
+
+#[test]
+fn one_canonical_registration_cannot_claim_two_physical_allocations() {
+    let (first_physical, registration) = setup();
+    let second_physical = registration.domain();
+    let mut ledger = ProjectionAllocationLedger::new();
+    let first = ledger.stage(first_physical, allocation()).unwrap();
+    let second = ledger.stage(second_physical, allocation()).unwrap();
+    ledger.attach_registration(&first, registration).unwrap();
+    assert_eq!(
+        ledger.attach_registration(&second, registration),
+        Err(NtStatus::INVALID_PARAMETER),
+    );
+    assert_eq!(
+        ledger.physical_allocation_for_registration(registration),
+        Some((first_physical, allocation())),
+    );
+}

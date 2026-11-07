@@ -559,6 +559,13 @@ pub(crate) unsafe fn retire_hosted_pnp_context_owner(
     retire_or_retain(owner)
 }
 
+/// A caller with its own generation row keeps the owner in that row if teardown is uncertain.
+pub(crate) unsafe fn try_retire_hosted_pnp_context_owner(
+    owner: HostedPnpContextOwner,
+) -> Result<(), HostedPnpContextOwner> {
+    owner.retire()
+}
+
 pub(crate) unsafe fn retry_hosted_pnp_context_retirements() -> usize {
     let pending_count = hosted_pnp_context_authority_mut().pending_retirements.len();
     let mut failures = Vec::new();
@@ -741,6 +748,7 @@ pub(crate) unsafe fn commit_hosted_pnp_pci_dma_window(
     func: u8,
     dma: HostedPciDmaWindow,
     staged_owner: HostedPnpContextOwner,
+    boot_controller: bool,
 ) -> Result<HostedPnpPciResourceDescriptor, nt_status::NtStatus> {
     let mut staged_owner = Some(staged_owner);
     let access = hosted_pnp_context_authority_mut()
@@ -777,7 +785,11 @@ pub(crate) unsafe fn commit_hosted_pnp_pci_dma_window(
         Ok(committed) => committed,
         Err(_) => {
             if let Some(owner) = staged_owner {
-                retire_or_retain(owner)?;
+                if boot_controller {
+                    boot_storage_dma_handoff::quarantine_hosted_boot_dma_owner(owner);
+                } else {
+                    retire_or_retain(owner)?;
+                }
             }
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
@@ -786,7 +798,11 @@ pub(crate) unsafe fn commit_hosted_pnp_pci_dma_window(
         Ok(window) => Ok(window),
         Err(status) => {
             if let Some(owner) = staged_owner {
-                retire_or_retain(owner)?;
+                if boot_controller {
+                    boot_storage_dma_handoff::quarantine_hosted_boot_dma_owner(owner);
+                } else {
+                    retire_or_retain(owner)?;
+                }
             }
             Err(status)
         }

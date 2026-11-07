@@ -17,8 +17,27 @@ fn exchange(call: SehCall) -> SehCommand {
     let (info, words) = call.encode();
     let (reply_info, m0, m1, m2, m3) =
         unsafe { call_on4_raw(info, words[0], words[1], words[2], words[3]) };
-    SehCommand::parse(reply_info, [m0, m1, m2, m3])
-        .expect("hosted SEH transport received an unexpected command")
+    let Some(command) = SehCommand::parse(reply_info, [m0, m1, m2, m3]) else {
+        crate::print_str(b"[seh-exchange] invalid command sent-info=");
+        crate::print_hex((info >> 32) as u32);
+        crate::print_hex(info as u32);
+        for word in words {
+            crate::print_str(b" sent-word=");
+            crate::print_hex((word >> 32) as u32);
+            crate::print_hex(word as u32);
+        }
+        crate::print_str(b" reply-info=");
+        crate::print_hex((reply_info >> 32) as u32);
+        crate::print_hex(reply_info as u32);
+        for word in [m0, m1, m2, m3] {
+            crate::print_str(b" word=");
+            crate::print_hex((word >> 32) as u32);
+            crate::print_hex(word as u32);
+        }
+        crate::print_str(b"\n");
+        panic!("hosted SEH transport received an unexpected command");
+    };
+    command
 }
 
 fn packet_field(packet_va: u64, offset: usize) -> u64 {

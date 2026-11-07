@@ -146,7 +146,9 @@ impl HostedForwardOrigin {
         };
         if matches!(
             prepared,
-            SourceCompletionPreparation::Ready | SourceCompletionPreparation::RetainedUncertain
+            SourceCompletionPreparation::Ready
+                | SourceCompletionPreparation::InProgress
+                | SourceCompletionPreparation::RetainedUncertain
         ) {
             self.terminal_command = Some(command);
         }

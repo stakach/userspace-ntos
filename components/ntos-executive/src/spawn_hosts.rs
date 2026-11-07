@@ -22,6 +22,8 @@ pub(crate) mod shared_ingress;
 
 #[path = "component_shared_pump.rs"]
 mod shared_pump;
+#[path = "hosted_file_pump_diagnostic.rs"]
+mod file_pump_diagnostic;
 #[path = "hosted_seh_pump.rs"]
 mod hosted_seh_pump;
 
@@ -313,6 +315,8 @@ const COMPONENT_MAP_CAP_BANK_RESERVED_SLOTS: u64 = 64;
 static COMPONENT_MAP_CAP_BANK_OWNER_NEXT: AtomicU64 = AtomicU64::new(1);
 static COMPONENT_MAP_CAP_ROOT_OWNER: [AtomicU16; ROOT_SLOT_TRACK_CAP] =
     [const { AtomicU16::new(0) }; ROOT_SLOT_TRACK_CAP];
+static COMPONENT_MAP_RELEASE_DENIAL_TRACES: AtomicU64 = AtomicU64::new(0);
+const COMPONENT_MAP_RELEASE_DENIAL_TRACE_LIMIT: u64 = 8;
 
 #[inline]
 fn component_heap_pt_count(frames: u64) -> u64 {
@@ -469,6 +473,55 @@ pub(crate) unsafe fn component_map_cap_bank_tag(owner: u16, root_cap: u64) -> bo
         return false;
     };
     COMPONENT_MAP_CAP_ROOT_OWNER[owner_slot].swap(owner, Ordering::Relaxed) == 0
+}
+
+/// Retire one demand-mapped leaf without leaving its owner tag on a recycled root slot.
+/// A failed unmap or delete leaves the cap tagged for bank teardown and must quarantine its VA.
+unsafe fn trace_component_page_release_denial(stage: u64, root_cap: u64,
+    owner: u16, observed: u16, error: u64)
+{
+    if COMPONENT_MAP_RELEASE_DENIAL_TRACES.fetch_add(1, Ordering::Relaxed)
+        >= COMPONENT_MAP_RELEASE_DENIAL_TRACE_LIMIT
+    { return; }
+    print_str(b"[component-bank] page release denied stage="); print_u64(stage);
+    print_str(b" cap="); crate::print_hex_u64(root_cap);
+    print_str(b" owner="); print_u64(owner as u64);
+    print_str(b" observed="); print_u64(observed as u64);
+    print_str(b" error="); print_u64(error);
+    print_str(b"\n");
+}
+
+pub(crate) unsafe fn component_map_cap_bank_release_page(owner: u16, root_cap: u64) -> bool {
+    let Some(owner_slot) = root_slot_index(root_cap) else {
+        trace_component_page_release_denial(1, root_cap, owner, 0, 0);
+        return false;
+    };
+    let observed = COMPONENT_MAP_CAP_ROOT_OWNER[owner_slot].load(Ordering::Acquire);
+    if owner == 0 || observed != owner {
+        trace_component_page_release_denial(2, root_cap, owner, observed, 0);
+        return false;
+    }
+    let error = crate::page_unmap_r(root_cap);
+    if error != 0 {
+        trace_component_page_release_denial(3, root_cap, owner, observed, error);
+        return false;
+    }
+    let error = crate::cnode_delete_r(root_cap);
+    if error != 0 {
+        trace_component_page_release_denial(4, root_cap, owner, observed, error);
+        return false;
+    }
+    if COMPONENT_MAP_CAP_ROOT_OWNER[owner_slot]
+        .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // The deleted slot is deliberately retained, never recycled under a foreign owner tag.
+        trace_component_page_release_denial(5, root_cap, owner,
+            COMPONENT_MAP_CAP_ROOT_OWNER[owner_slot].load(Ordering::Acquire), 0);
+        return false;
+    }
+    crate::recycle_deleted_root_slot(root_cap);
+    true
 }
 
 pub(crate) unsafe fn release_component_map_cap_bank(
@@ -976,7 +1029,7 @@ pub(crate) unsafe fn spawn_storage_host(
     hivebuf_start: u64,
     win32kbuf_start: u64,
     winlogonbuf_start: u64,
-) {
+) -> SpawnedComponent {
     // Granted device resources + staging buffers, in the EXACT map order of the old spawner.
     // Component heap, then device resources (cluster PT window, no dedicated PT): AHCI BAR, DMA
     // frame, shared run. Then the staging buffers, each with its own dedicated PT(s). NLS +
@@ -1008,7 +1061,7 @@ pub(crate) unsafe fn spawn_storage_host(
     regions[n] = Region {
         source: FrameSource::Alias(dma_frame),
         base_va: AHCI_DMA_VADDR,
-        count: 1,
+        count: AHCI_BOOT_DMA_PAGES,
         rights: Rights::Uniform(RW_NX),
         pts: 0,
     };
@@ -1079,12 +1132,11 @@ pub(crate) unsafe fn spawn_storage_host(
         };
         n += 1;
     }
-    // NLS + SYSTEM-hive buffers share one page table; the first descriptor creates it.
+    // NLS and the small hives share one page table; the first descriptor creates it.
     for (index, (start, vaddr, frames)) in [
         (nls_ansi_start, NLS_ANSI_VADDR, NLS_ANSI_FRAMES),
         (nls_oem_start, NLS_OEM_VADDR, NLS_OEM_FRAMES),
         (nls_case_start, NLS_CASE_VADDR, NLS_CASE_FRAMES),
-        (hivebuf_start, HIVEBUF_VADDR, HIVEBUF_FRAMES),
         (
             SECHIVEBUF_START.load(Ordering::Relaxed),
             SECHIVEBUF_VADDR,
@@ -1113,6 +1165,14 @@ pub(crate) unsafe fn spawn_storage_host(
         };
         n += 1;
     }
+    regions[n] = Region {
+        source: FrameSource::Alias(hivebuf_start),
+        base_va: HIVEBUF_VADDR,
+        count: HIVEBUF_FRAMES,
+        rights: Rights::Uniform(RW_NX),
+        pts: 1,
+    };
+    n += 1;
     // The SOFTWARE hive buffer (471040 B) — its own 2 MiB window + dedicated PT, mirroring the
     // executive-side mapping (it does not fit in the shared 0xA0-0xC0 input page table).
     regions[n] = Region {
@@ -1140,7 +1200,7 @@ pub(crate) unsafe fn spawn_storage_host(
         gs_base: None,
         caps: HostCaps::default(),
     };
-    let _ = spawn_component(&d);
+    spawn_component(&d)
 }
 
 // =============================================================================================
@@ -1490,6 +1550,26 @@ pub(crate) fn pump_receive_census() -> (u64, u64, u64, u64, u64, u64) {
     shared_pump::receive_census()
 }
 
+pub(crate) fn print_active_irp_receive_census() {
+    shared_pump::print_active_irp_receive_census();
+}
+
+pub(crate) fn print_active_syscall_receive_census() {
+    shared_pump::print_active_syscall_receive_census();
+}
+
+pub(crate) fn file_receive_census() -> [u64; 9] {
+    shared_pump::file_receive_census()
+}
+
+pub(crate) fn print_file_pump_census() {
+    file_pump_diagnostic::print_census();
+}
+
+pub(crate) fn ps_create_parent_progress() -> (u64, u64, u64) {
+    shared_pump::ps_create_parent_progress()
+}
+
 pub(crate) unsafe fn pump_handle_executive_event_badge(badge: u64) -> (bool, bool, bool) {
     let timer = crate::badge_has_delay_timer(badge);
     let irq_lines = crate::driver_launch::latch_hosted_irq_badge(badge);
@@ -1514,7 +1594,9 @@ pub(crate) unsafe fn pump_handle_executive_event_badge(badge: u64) -> (bool, boo
 unsafe fn pump_scheduler_work_pending(ch: &PumpChannel, irq: bool) -> bool {
     (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
         && (irq
+            || crate::driver_launch::hosted_irq_work_pending()
             || crate::driver_launch::hosted_driver_dpc_activation_pending()
+            || crate::driver_launch::mounted_native_block_nested_ready()
             || crate::dispatcher_bootstrap::timer_work_pending())
 }
 
@@ -1533,6 +1615,9 @@ struct PumpMessage {
     scheduler_yield: bool,
     receive_yield: Option<crate::win32k_glue::ReceiveYield>,
     service_wait_yield: Option<crate::win32k_glue::ServiceWaitYield>,
+    maintenance_yield: Option<crate::win32k_glue::RootMaintenanceYield>,
+    nested_restore_yield: Option<shared_ingress::owner::runtime::nested::NestedRestoreTicket>,
+    nested_restore_quarantined: Option<shared_ingress::owner::runtime::nested::NestedRestoreTicket>,
 }
 
 impl PumpMessage {
@@ -1556,6 +1641,9 @@ impl PumpMessage {
             scheduler_yield: false,
             receive_yield: None,
             service_wait_yield: None,
+            maintenance_yield: None,
+            nested_restore_yield: None,
+            nested_restore_quarantined: None,
         }
     }
 
@@ -1587,6 +1675,9 @@ impl PumpMessage {
             scheduler_yield: false,
             receive_yield: None,
             service_wait_yield: None,
+            maintenance_yield: None,
+            nested_restore_yield: None,
+            nested_restore_quarantined: None,
         }
     }
 
@@ -1606,6 +1697,9 @@ impl PumpMessage {
             scheduler_yield: false,
             receive_yield: None,
             service_wait_yield: None,
+            maintenance_yield: None,
+            nested_restore_yield: None,
+            nested_restore_quarantined: None,
         }
     }
 
@@ -1625,6 +1719,9 @@ impl PumpMessage {
             scheduler_yield: true,
             receive_yield: None,
             service_wait_yield: None,
+            maintenance_yield: None,
+            nested_restore_yield: None,
+            nested_restore_quarantined: None,
         }
     }
 
@@ -1634,6 +1731,9 @@ impl PumpMessage {
             badge: 0, mi: 0, m0: 0, m1: 0, m2: 0, m3: 0, m4: 0,
             scheduler_yield: false, receive_yield: Some(yielded),
             service_wait_yield: None,
+            maintenance_yield: None,
+            nested_restore_yield: None,
+            nested_restore_quarantined: None,
         }
     }
 
@@ -1643,7 +1743,35 @@ impl PumpMessage {
             badge: 0, mi: 0, m0: 0, m1: 0, m2: 0, m3: 0, m4: 0,
             scheduler_yield: false, receive_yield: None,
             service_wait_yield: Some(yielded),
+            maintenance_yield: None,
+            nested_restore_yield: None,
+            nested_restore_quarantined: None,
         }
+    }
+
+    fn hosted_root_maintenance_yield(yielded: crate::win32k_glue::RootMaintenanceYield) -> Self {
+        Self {
+            shared_reply: None, service_finished: false, received: None,
+            badge: 0, mi: 0, m0: 0, m1: 0, m2: 0, m3: 0, m4: 0,
+            scheduler_yield: false, receive_yield: None,
+            service_wait_yield: None, maintenance_yield: Some(yielded),
+            nested_restore_yield: None,
+            nested_restore_quarantined: None,
+        }
+    }
+
+    fn nested_restore_yield(ticket: shared_ingress::owner::runtime::nested::NestedRestoreTicket) -> Self {
+        let mut message = Self::transport_wall();
+        message.mi = 0;
+        message.nested_restore_yield = Some(ticket);
+        message
+    }
+
+    fn nested_restore_quarantined(ticket: shared_ingress::owner::runtime::nested::NestedRestoreTicket) -> Self {
+        let mut message = Self::transport_wall();
+        message.mi = 0;
+        message.nested_restore_quarantined = Some(ticket);
+        message
     }
 }
 
@@ -1695,6 +1823,10 @@ struct PumpLoopOutcome {
     scheduler_yielded: bool,
     receive_yield: Option<crate::win32k_glue::ReceiveYield>,
     service_wait_yield: Option<crate::win32k_glue::ServiceWaitYield>,
+    maintenance_yield: Option<crate::win32k_glue::RootMaintenanceYield>,
+    nested_restore_yield: Option<shared_ingress::owner::runtime::nested::NestedRestoreTicket>,
+    nested_restore_quarantined: Option<shared_ingress::owner::runtime::nested::NestedRestoreTicket>,
+    nested_restore_seh_retained: bool,
     wall_ip: u64,
     wall_addr: u64,
     wall_label: u64,
@@ -1716,6 +1848,10 @@ impl PumpLoopOutcome {
             scheduler_yielded: false,
             receive_yield: None,
             service_wait_yield: None,
+            maintenance_yield: None,
+            nested_restore_yield: None,
+            nested_restore_quarantined: None,
+            nested_restore_seh_retained: false,
             wall_ip: 0,
             wall_addr: 0,
             wall_label: 0,
@@ -1740,20 +1876,31 @@ impl PumpLoopOutcome {
 /// Receive only through the shared, retained ingress owner.
 #[inline(never)]
 unsafe fn pump_recv(ch: &PumpChannel, _reply_cap: u64) -> PumpMessage {
-    match shared_ingress::owner::runtime::channel_route(ch) {
-        Ok(Some(route)) => shared_pump::receive(ch, route, false),
+    pump_recv_with_scheduler_checkpoint(ch, false)
+}
+
+/// Scheduler work has already run for this retained receive half. A blocking receive gives
+/// lower-priority component workers a chance to publish READY even if timer demand renews.
+unsafe fn pump_recv_with_scheduler_checkpoint(
+    ch: &PumpChannel, serviced_scheduler_yield: bool,
+) -> PumpMessage {
+    let started = file_pump_diagnostic::start(ch);
+    let result = match shared_ingress::owner::runtime::channel_route(ch) {
+        Ok(Some(route)) => shared_pump::receive(ch, route, false, serviced_scheduler_yield),
         Err(_) | Ok(None) => {
             crate::print_str(b"[pump-ingress] channel route unavailable\n");
             PumpMessage::transport_wall()
         }
-    }
+    };
+    file_pump_diagnostic::record_receive(started);
+    result
 }
 
 /// A handler exchange cannot shed its one-shot walk or its parent IRP at a scheduler checkpoint.
 /// Continue receiving on the exact route until that exchange reaches a restore or a fault wall.
 unsafe fn pump_recv_retained_seh(ch: &PumpChannel) -> PumpMessage {
     match shared_ingress::owner::runtime::channel_route(ch) {
-        Ok(Some(route)) => shared_pump::receive(ch, route, true),
+        Ok(Some(route)) => shared_pump::receive(ch, route, true, false),
         Err(_) | Ok(None) => {
             crate::print_str(b"[pump-ingress] retained SEH route unavailable\n");
             PumpMessage::transport_wall()
@@ -1803,7 +1950,50 @@ unsafe fn pump_reply_recv4(
     reply_r2: u64,
     reply_r3: u64,
 ) -> PumpMessage {
-    if !shared_pump::reply(ch, reply_cap, reply_msginfo, [reply_r0, reply_r1, reply_r2, reply_r3]) {
+    pump_reply_recv4_traced(ch, reply_cap, reply_msginfo, reply_r0, reply_r1, reply_r2, reply_r3, None, false)
+}
+
+unsafe fn pump_reply_recv4_traced(
+    ch: &PumpChannel,
+    reply_cap: u64,
+    reply_msginfo: u64,
+    reply_r0: u64,
+    reply_r1: u64,
+    reply_r2: u64,
+    reply_r3: u64,
+    power_report_badge: Option<u64>,
+    trace_system_thread_reply: bool,
+) -> PumpMessage {
+    if let Some(badge) = power_report_badge {
+        crate::driver_launch::trace_report_rpc(b"reply-send", reply_cap, badge, reply_r0 as u32 as i32, reply_r1);
+    }
+    crate::driver_launch::trace_port_connect_pump_boundary(1, ch, reply_cap, reply_r0);
+    if trace_system_thread_reply {
+        shared_pump::begin_ps_create_receive_trace();
+        crate::print_str(b"[driver-thread-reply] enter tcb=");
+        crate::print_u64(ch.tcb);
+        crate::print_str(b" reply=");
+        crate::print_u64(reply_cap);
+        crate::print_str(b" status=0x");
+        crate::print_hex(reply_r0 as u32);
+        crate::print_str(b"\n");
+    }
+    let reply_started = file_pump_diagnostic::start(ch);
+    let sent = shared_pump::reply(ch, reply_cap, reply_msginfo, [reply_r0, reply_r1, reply_r2, reply_r3]);
+    file_pump_diagnostic::record_reply(reply_started);
+    if trace_system_thread_reply {
+        crate::print_str(b"[driver-thread-reply] sent=");
+        crate::print_u64(u64::from(sent));
+        crate::print_str(b"\n");
+    }
+    crate::driver_launch::trace_port_connect_pump_boundary(2, ch, reply_cap, u64::from(sent));
+    if let Some(badge) = power_report_badge {
+        crate::driver_launch::trace_report_rpc(
+            if sent { &b"reply-accepted"[..] } else { &b"reply-refused"[..] },
+            reply_cap, badge, reply_r0 as u32 as i32, reply_r1,
+        );
+    }
+    if !sent {
         return PumpMessage::transport_wall();
     }
     if shared_pump::autonomous(ch) {
@@ -1818,7 +2008,13 @@ unsafe fn pump_reply_recv4(
         && crate::dispatcher_bootstrap::request_receive_checkpoint()
         && crate::dispatcher_bootstrap::timer_work_pending()
     {
+        if trace_system_thread_reply {
+            crate::print_str(b"[driver-thread-reply] scheduler-checkpoint\n");
+        }
         return PumpMessage::scheduler_yield();
+    }
+    if trace_system_thread_reply {
+        crate::print_str(b"[driver-thread-reply] receive-next\n");
     }
     pump_recv(ch, reply_cap)
 }
@@ -1849,6 +2045,13 @@ pub(crate) struct PumpResult {
     pub scheduler_yielded: bool,
     pub receive_yield: Option<crate::win32k_glue::ReceiveYield>,
     pub service_wait_yield: Option<crate::win32k_glue::ServiceWaitYield>,
+    pub maintenance_yield: Option<crate::win32k_glue::RootMaintenanceYield>,
+    /// Exact parked-parent selector; the physical owner retains the Reply and restoration state.
+    pub nested_restore_yield: Option<shared_ingress::owner::runtime::nested::NestedRestoreTicket>,
+    /// An uncertain restore is fenced by its owner and must never be retried or redispatched.
+    pub nested_restore_quarantined: Option<shared_ingress::owner::runtime::nested::NestedRestoreTicket>,
+    /// The exact exception walk lease is retained with this receive half across parent restore.
+    pub nested_restore_seh_retained: bool,
     /// Wall diagnostics (only meaningful when `!completed`).
     pub wall_ip: u64,
     pub wall_addr: u64,
@@ -1878,6 +2081,10 @@ impl PumpResult {
             scheduler_yielded: false,
             receive_yield: None,
             service_wait_yield: None,
+            maintenance_yield: None,
+            nested_restore_yield: None,
+            nested_restore_quarantined: None,
+            nested_restore_seh_retained: false,
             wall_ip: 0,
             wall_addr: 0,
             wall_label: 0,
@@ -1894,6 +2101,9 @@ impl PumpResult {
         self.reply_cap != 0
             && (self.scheduler_yielded || self.receive_yield.is_some())
             && self.service_wait_yield.is_none()
+            && self.maintenance_yield.is_none()
+            && self.nested_restore_yield.is_none()
+            && self.nested_restore_quarantined.is_none()
             && !self.completed
             && !self.callback_suspended
             && !self.provider_wait_suspended
@@ -1904,6 +2114,9 @@ impl PumpResult {
         self.reply_cap != 0
             && self.service_wait_yield.is_some()
             && self.receive_yield.is_none()
+            && self.maintenance_yield.is_none()
+            && self.nested_restore_yield.is_none()
+            && self.nested_restore_quarantined.is_none()
             && !self.scheduler_yielded
             && !self.completed
             && !self.callback_suspended
@@ -2021,9 +2234,10 @@ unsafe fn hosted_irq_reply_recv(
 }
 
 /// Exchange one command with an enrolled hosted-interrupt lane. This protocol deliberately has a
-/// much smaller service surface than the normal component pump: completion, demand faults, and
-/// explicitly granted I/O faults only. An ordinary `FSD_SERVICE_*` request is a fatal protocol wall
-/// because servicing it could touch the parked component's fixed request bank.
+/// much smaller service surface than the normal component pump: completion, demand faults,
+/// authenticated inline CR8 reads, and explicitly granted I/O faults. An ordinary
+/// `FSD_SERVICE_*` request is a fatal protocol wall because servicing it could touch the parked
+/// component's fixed request bank.
 pub(crate) unsafe fn component_hosted_irq_exchange(
     ch: &PumpChannel,
     action: HostedIrqExchangeAction,
@@ -2100,11 +2314,26 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
             continue;
         }
         if label == 3 {
-            if let Some(next_ip) = pump_service_io_port_fault(ch, msg.m0, msg.m3) {
+            if let Some(next_ip) = pump_service_io_port_fault(ch, ch.reply_cap, msg.m0, msg.m3) {
                 msg = hosted_irq_reply_recv(
                     ch, ch.reply_cap, 1, [next_ip, 0, 0, 0], identity, expected_badge,
                 );
                 continue;
+            }
+            match crate::driver_launch::hosted_driver_cr8_fault::service(
+                ch, ch.reply_cap, msg.badge, [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4],
+            ) {
+                crate::driver_launch::hosted_driver_cr8_fault::Cr8FaultOutcome::Applied => {
+                    msg = hosted_irq_reply_recv(
+                        ch, ch.reply_cap, 0, [0; 4], identity, expected_badge,
+                    );
+                    continue;
+                }
+                crate::driver_launch::hosted_driver_cr8_fault::Cr8FaultOutcome::Rejected => {
+                    outcome.wall(msg);
+                    break;
+                }
+                crate::driver_launch::hosted_driver_cr8_fault::Cr8FaultOutcome::Unrelated => {}
             }
         }
         outcome.wall(msg);
@@ -2155,15 +2384,30 @@ pub(crate) unsafe fn component_pump_continue_receive(
     ch: &PumpChannel,
     previous: &PumpResult,
 ) -> Result<PumpResult, u32> {
-    if !previous.is_receive_yield()
-        || !(ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield
-            || previous.receive_yield.is_some_and(|yielded|
-                crate::win32k_glue::receive_continuation_is_current(ch, yielded)))
-        || (ch.caps.kernel_irq_yield && previous.reply_cap != ch.reply_cap)
-    {
+    if !receive_continuation_authorized(ch, previous) {
         return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
-    component_pump_continue_receive_half(ch, previous)
+    component_pump_continue_receive_half(ch, previous, false, false, false)
+}
+
+/// Continue only the receive half after this invocation's scheduler has serviced IRQ/timer
+/// demand. The service pass retains the physical Call and Reply; no request is sent again.
+pub(crate) unsafe fn component_pump_continue_receive_after_scheduler_service(
+    ch: &PumpChannel,
+    previous: &PumpResult,
+) -> Result<PumpResult, u32> {
+    if !previous.scheduler_yielded || !receive_continuation_authorized(ch, previous) {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    component_pump_continue_receive_half(ch, previous, true, false, false)
+}
+
+unsafe fn receive_continuation_authorized(ch: &PumpChannel, previous: &PumpResult) -> bool {
+    previous.is_receive_yield()
+        && (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield
+            || previous.receive_yield.is_some_and(|yielded|
+                crate::win32k_glue::receive_continuation_is_current(ch, yielded)))
+        && (!ch.caps.kernel_irq_yield || previous.reply_cap == ch.reply_cap)
 }
 
 /// Resume only the receive half after the exact external service wait has been ACKed and
@@ -2172,19 +2416,117 @@ pub(crate) unsafe fn component_pump_continue_service_wait(
     ch: &PumpChannel,
     previous: &PumpResult,
 ) -> Result<PumpResult, u32> {
-    if !previous.is_service_wait_yield()
-        || !previous.service_wait_yield.is_some_and(|yielded|
-            previous.reply_cap == yielded.reply
-                && crate::win32k_glue::service_wait_continuation_is_current(ch, yielded))
+    let yielded = previous.is_service_wait_yield();
+    let reply_matches = previous.service_wait_yield.is_some_and(|wait| previous.reply_cap == wait.reply);
+    let current = previous.service_wait_yield.is_some_and(|wait|
+        crate::win32k_glue::service_wait_continuation_is_current(ch, wait));
+    if !yielded || !reply_matches || !current {
+        static SERVICE_WAIT_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+        if SERVICE_WAIT_REJECTIONS.fetch_add(1, Ordering::Relaxed) < 8 {
+            print_str(b"[service-wait-resume] stage=authority yield/reply/current/channel-reply=");
+            print_u64(yielded as u64); print_str(b"/"); print_u64(reply_matches as u64);
+            print_str(b"/"); print_u64(current as u64);
+            print_str(b"/"); print_u64(ch.reply_cap);
+            print_str(b"\n");
+        }
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    component_pump_continue_receive_half(ch, previous, false, false, false)
+}
+
+/// Continue only the receive half of the exact maintenance-parked syscall. The root owns its
+/// original Reply and physical hold until its typed lane and shared snapshot are restored.
+pub(crate) unsafe fn component_pump_continue_root_maintenance(
+    ch: &PumpChannel,
+    previous: &PumpResult,
+) -> Result<PumpResult, u32> {
+    let current = previous.maintenance_yield.is_some_and(|yielded| {
+        previous.reply_cap == yielded.reply
+            && crate::win32k_glue::root_maintenance_continuation_is_current(ch, yielded)
+    });
+    if !current || previous.completed || previous.callback_suspended
+        || previous.provider_wait_suspended || previous.lpc_wait_suspended
+        || previous.receive_yield.is_some() || previous.service_wait_yield.is_some()
+        || previous.nested_restore_yield.is_some()
+        || previous.nested_restore_quarantined.is_some()
+        || previous.scheduler_yielded
     {
         return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
-    component_pump_continue_receive_half(ch, previous)
+    component_pump_continue_receive_half(ch, previous, false, false, false)
+}
+
+/// The parent restore and receive continuation are separate acknowledged effects. A refused
+/// receive preflight must never cause another physical release attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NestedParentRestoreOutcome {
+    Restored,
+    Retryable,
+    Quarantined,
+}
+
+/// Retry only an exact retained parent restoration. This stage performs no receive and never
+/// redelivers the original dispatch Call.
+pub(crate) unsafe fn component_pump_restore_nested_parent(
+    ch: &PumpChannel,
+    previous: &PumpResult,
+) -> Result<NestedParentRestoreOutcome, u32> {
+    use shared_ingress::owner::runtime;
+    let Some(ticket) = previous.nested_restore_yield else {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    };
+    let route = runtime::channel_route(ch)
+        .map_err(|_| nt_process::STATUS_INVALID_PARAMETER)?
+        .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+    if previous.reply_cap == 0 || previous.completed || previous.callback_suspended
+        || previous.provider_wait_suspended || previous.lpc_wait_suspended
+        || previous.scheduler_yielded || previous.receive_yield.is_some()
+        || previous.service_wait_yield.is_some() || previous.maintenance_yield.is_some()
+        || previous.nested_restore_quarantined.is_some()
+        || !runtime::nested::ticket_matches_channel(ticket, route, previous.reply_cap)
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    if runtime::nested::restore_pending_ticket(ticket).is_err() {
+        if runtime::nested::pending_ticket(ticket) {
+            // Pure preflight refusal: the same owner row still has exact retry authority.
+            return Ok(NestedParentRestoreOutcome::Retryable);
+        }
+        return Ok(NestedParentRestoreOutcome::Quarantined);
+    }
+    Ok(NestedParentRestoreOutcome::Restored)
+}
+
+/// The outer owner calls this only after it recorded the acknowledged parent restore. A refused
+/// SEH lease claim returns before receiving; any returned PumpResult owns the entered receive.
+pub(crate) unsafe fn component_pump_continue_nested_restore_receive(
+    ch: &PumpChannel,
+    previous: &PumpResult,
+) -> Result<PumpResult, u32> {
+    use shared_ingress::owner::runtime;
+    let Some(ticket) = previous.nested_restore_yield else {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    };
+    let route = runtime::channel_route(ch)
+        .map_err(|_| nt_process::STATUS_INVALID_PARAMETER)?
+        .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+    if route != ticket.identity().route()
+        || runtime::dispatch(route).ok() != Some(ticket.identity().dispatch())
+        || runtime::current_reply(route).ok() != Some(previous.reply_cap)
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    component_pump_continue_receive_half(
+        ch, previous, false, previous.nested_restore_seh_retained, true,
+    )
 }
 
 unsafe fn component_pump_continue_receive_half(
     ch: &PumpChannel,
     previous: &PumpResult,
+    serviced_scheduler_yield: bool,
+    resume_retained_seh: bool,
+    return_on_seh_refusal: bool,
 ) -> Result<PumpResult, u32> {
     if let Some(yielded) = previous.receive_yield {
         crate::win32k_glue::trace_receive_phase(
@@ -2193,7 +2535,10 @@ unsafe fn component_pump_continue_receive_half(
     }
     crate::provider_bugcheck::stop_if_pending();
     let mut reply_cap = previous.reply_cap;
-    let Some(mut seh) = hosted_seh_pump::SehLease::claim(ch, reply_cap, false) else {
+    let Some(mut seh) = hosted_seh_pump::SehLease::claim(ch, reply_cap, resume_retained_seh) else {
+        if return_on_seh_refusal {
+            return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
+        }
         let mut outcome = PumpLoopOutcome::new();
         outcome.accounting = previous.accounting;
         outcome.wall_label = nt_unwind::seh_transport::RAISE_LABEL;
@@ -2204,7 +2549,7 @@ unsafe fn component_pump_continue_receive_half(
             b"resume-before-recv", yielded.parent, yielded.child, yielded.owner,
         );
     }
-    let first = pump_recv(ch, reply_cap);
+    let first = pump_recv_with_scheduler_checkpoint(ch, serviced_scheduler_yield);
     if let Some(yielded) = previous.receive_yield {
         crate::win32k_glue::trace_receive_phase(
             b"resume-after-recv", yielded.parent, yielded.child, yielded.owner,
@@ -2213,8 +2558,13 @@ unsafe fn component_pump_continue_receive_half(
     let mut outcome = component_pump_loop(ch, first, &mut reply_cap, previous.accounting, &mut seh.pump);
     let suspended = outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended;
     if !seh.finish(ch, reply_cap, suspended) {
-        assert!(outcome.receive_yield.is_none() && outcome.service_wait_yield.is_none(),
+        assert!(outcome.receive_yield.is_none() && outcome.service_wait_yield.is_none()
+            && outcome.maintenance_yield.is_none(),
             "receive yield retained with failed SEH retirement");
+        if let Some(ticket) = outcome.nested_restore_yield.take() {
+            outcome.nested_restore_quarantined = Some(ticket);
+            outcome.nested_restore_seh_retained = false;
+        }
         outcome.callback_suspended = false;
         outcome.provider_wait_suspended = false;
         outcome.lpc_wait_suspended = false;
@@ -2241,8 +2591,8 @@ pub(crate) unsafe fn component_pump_resume_kernel_provider_wait(
     let caller = ch.kernel_caller.ok_or(nt_process::STATUS_INVALID_HANDLE)?;
     let binding = crate::service_sec_image::kernel_provider_current_binding(caller)?;
     if ch.logical_caller.is_some()
-        || ch.client_pi != 0
-        || ch.client_generation != 0
+        || crate::service_sec_image::kernel_provider_activation::authenticated_channel_caller(ch)
+            != Ok(caller)
         || ch.caps.kind != ReqKind::Syscall
         || !ch.caps.kernel_irq_yield
         || ch.initial != InitialAction::ReplyRequest
@@ -2365,8 +2715,13 @@ unsafe fn component_pump_enter(
     let mut outcome = component_pump_loop(ch, first, &mut reply_cap, accounting, &mut seh.pump);
     let suspended = outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended;
     if !seh.finish(ch, reply_cap, suspended) {
-        assert!(outcome.receive_yield.is_none() && outcome.service_wait_yield.is_none(),
+        assert!(outcome.receive_yield.is_none() && outcome.service_wait_yield.is_none()
+            && outcome.maintenance_yield.is_none(),
             "receive yield retained with failed SEH retirement");
+        if let Some(ticket) = outcome.nested_restore_yield.take() {
+            outcome.nested_restore_quarantined = Some(ticket);
+            outcome.nested_restore_seh_retained = false;
+        }
         outcome.callback_suspended = false;
         outcome.provider_wait_suspended = false;
         outcome.lpc_wait_suspended = false;
@@ -2459,6 +2814,20 @@ unsafe fn component_pump_loop(
             outcome.service_wait_yield = Some(yielded);
             break;
         }
+        if let Some(yielded) = msg.maintenance_yield {
+            assert!(!seh.retained(), "retained exception cannot yield root maintenance");
+            outcome.maintenance_yield = Some(yielded);
+            break;
+        }
+        if let Some(ticket) = msg.nested_restore_yield {
+            outcome.nested_restore_yield = Some(ticket);
+            outcome.nested_restore_seh_retained = seh.retained();
+            break;
+        }
+        if let Some(ticket) = msg.nested_restore_quarantined {
+            outcome.nested_restore_quarantined = Some(ticket);
+            break;
+        }
         if msg.scheduler_yield {
             if seh.retained() {
                 msg = pump_recv_retained_seh(ch);
@@ -2468,13 +2837,46 @@ unsafe fn component_pump_loop(
             break;
         }
         let label = msg.label();
+        let _file_cycle = file_pump_diagnostic::MessageCycle::enter(ch, label);
+        crate::driver_launch::trace_port_connect_worker_message(
+            ch.tcb, *reply_cap, msg.mi, msg.badge,
+            [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4], seh.retained(),
+        );
         // The current PDO may have no port resource while a live sibling PDO
         // in the same driver instance owns the controller port. The decoder
         // and exact hosted grant selector decide whether this GP is I/O.
         if label == 3 {
-            if let Some(next_ip) = pump_service_io_port_fault(ch, msg.m0, msg.m3) {
+            if let Some(next_ip) = pump_service_io_port_fault(ch, *reply_cap, msg.m0, msg.m3) {
                 pump_reply_recv_into!(ch, *reply_cap, msg, 1, next_ip);
                 continue;
+            }
+            match crate::driver_launch::hosted_driver_cr8_fault::service(
+                ch, *reply_cap, msg.badge, [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4],
+            ) {
+                crate::driver_launch::hosted_driver_cr8_fault::Cr8FaultOutcome::Applied => {
+                    pump_reply_recv_into!(ch, *reply_cap, msg, 0, 0);
+                    continue;
+                }
+                crate::driver_launch::hosted_driver_cr8_fault::Cr8FaultOutcome::Rejected => {
+                    outcome.wall(msg);
+                    break;
+                }
+                crate::driver_launch::hosted_driver_cr8_fault::Cr8FaultOutcome::Unrelated => {}
+            }
+            // This also covers win32k DriverEntry: it owns a root-issued kernel activation but
+            // deliberately does not enable the later checked-build assert-skip capability.
+            match crate::hosted_win32k_cr8_fault::service(
+                ch, *reply_cap, msg.badge, [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4],
+            ) {
+                crate::hosted_win32k_cr8_fault::Cr8FaultOutcome::Applied => {
+                    pump_reply_recv_into!(ch, *reply_cap, msg, 0, 0);
+                    continue;
+                }
+                crate::hosted_win32k_cr8_fault::Cr8FaultOutcome::Rejected => {
+                    outcome.wall(msg);
+                    break;
+                }
+                crate::hosted_win32k_cr8_fault::Cr8FaultOutcome::Unrelated => {}
             }
         }
         if label == crate::provider_bugcheck::BUGCHECK_LABEL {
@@ -2501,6 +2903,8 @@ unsafe fn component_pump_loop(
                 crate::driver_launch::hosted_source_completion_lane::startup_expected(ch).is_some();
             let class_starting =
                 crate::driver_launch::hosted_class_irp_lane::startup_expected(ch).is_some();
+            let provider_starting =
+                crate::driver_launch::hosted_provider_export_lane::startup_expected(ch).is_some();
             if hosted_starting
                 && !crate::driver_launch::hosted_source_completion_lane::validate_startup_ready(
                     ch,
@@ -2518,7 +2922,15 @@ unsafe fn component_pump_loop(
                 outcome.wall(msg);
                 break;
             }
-            let starting = hosted_starting || class_starting
+            if provider_starting
+                && !crate::driver_launch::hosted_provider_export_lane::validate_startup_ready(
+                    ch, [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4],
+                )
+            {
+                outcome.wall(msg);
+                break;
+            }
+            let starting = hosted_starting || class_starting || provider_starting
                 || (ch.caps.kind == ReqKind::Syscall
                     && ch.initial == InitialAction::RecvFirst
                     && crate::win32k_glue::win32k_physical_lane_for_channel(
@@ -2598,19 +3010,41 @@ unsafe fn component_pump_loop(
         } else if label == crate::win32k_subsystem::W32_GDI_LOAD_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
-            let (status, module) = if shared_pump::authenticated_badge(ch, msg.badge) {
+            let result = if shared_pump::authenticated_badge(ch, msg.badge) {
                 crate::service_sec_image::service_win32k_gdi_image_request(
                     ch, *reply_cap, msg.badge, msg.mi, msg.m0, msg.m1, [msg.m2, msg.m3],
                 )
             } else {
-                (nt_process::STATUS_INVALID_PARAMETER as i32, 0)
+                crate::gdi_routed_image_work::SubmitResult::Ready(
+                    (nt_process::STATUS_INVALID_PARAMETER as i32, 0),
+                )
             };
-            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, module, 0, 0);
+            match result {
+                crate::gdi_routed_image_work::SubmitResult::Ready((status, module)) => {
+                    pump_reply_recv4_into!(ch, *reply_cap, msg, 2,
+                        status as u32 as u64, module, 0, 0);
+                }
+                crate::gdi_routed_image_work::SubmitResult::Deferred => {
+                    if shared_pump::service_wait_yields(ch) {
+                        outcome.provider_wait_suspended = true;
+                        break;
+                    }
+                    msg = pump_recv(ch, *reply_cap);
+                }
+            }
             continue;
         } else if label == crate::win32k_subsystem::W32_LPC_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
-            let status = pump_service_lpc_request();
+            let status = if shared_pump::authenticated_badge(ch, msg.badge)
+                && crate::win32k_glue::win32k_physical_lane_for_channel(
+                    ch.tcb, ch.fault_ep, ch.reply_cap,
+                ).is_some()
+            {
+                pump_service_lpc_request()
+            } else {
+                nt_process::STATUS_INVALID_HANDLE as i32
+            };
             pump_reply_recv_into!(ch, *reply_cap, msg, REQUEST_TAG_LEN, status as u32 as u64);
             continue;
         } else if label == crate::win32k_subsystem::W32_REGISTRY_LABEL
@@ -2948,7 +3382,7 @@ unsafe fn component_pump_loop(
                         )
                             && shared_ingress::owner::runtime::dispatch(route).is_ok()
                 );
-            let (status, out1, out2, out3) = if admitted {
+            let result = if admitted {
                 crate::service_sec_image::service_win32k_directory_request(
                     ch,
                     *reply_cap,
@@ -2960,18 +3394,23 @@ unsafe fn component_pump_loop(
                     msg.m3,
                 )
             } else {
-                (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0)
+                crate::provider_directory_broker::SubmitResult::Ready((
+                    nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0,
+                ))
             };
-            pump_reply_recv4_into!(
-                ch,
-                *reply_cap,
-                msg,
-                4,
-                status as u32 as u64,
-                out1,
-                out2,
-                out3
-            );
+            match result {
+                crate::provider_directory_broker::SubmitResult::Ready((status, out1, out2, out3)) => {
+                    pump_reply_recv4_into!(ch, *reply_cap, msg, 4,
+                        status as u32 as u64, out1, out2, out3);
+                }
+                crate::provider_directory_broker::SubmitResult::Deferred => {
+                    if shared_pump::service_wait_yields(ch) {
+                        outcome.provider_wait_suspended = true;
+                        break;
+                    }
+                    msg = pump_recv(ch, *reply_cap);
+                }
+            }
             continue;
         } else if label == crate::win32k_subsystem::W32_SECTION_CREATE_LABEL
             && ch.caps.kind == ReqKind::Syscall
@@ -3119,6 +3558,22 @@ unsafe fn component_pump_loop(
             };
             pump_reply_recv4_into!(ch, *reply_cap, msg, 4, status as u32 as u64, current, saved, attached);
             continue;
+        } else if label == crate::win32k_subsystem::W32_LARGE_POOL_RETIRE_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let acknowledgement = if shared_pump::authenticated_badge(ch, msg.badge)
+                && msg.mi == ((crate::win32k_subsystem::W32_LARGE_POOL_RETIRE_LABEL << 12) | 4)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::win32k_subsystem::large_pool::service_retirement(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3,
+                )
+            } else {
+                [0; 4]
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 4,
+                acknowledgement[0], acknowledgement[1], acknowledgement[2], acknowledgement[3]);
+            continue;
         } else if label == crate::win32k_subsystem::W32_PS_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
@@ -3146,13 +3601,110 @@ unsafe fn component_pump_loop(
                 out3
             );
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_FRAME_CHAIN_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            if !shared_pump::authenticated_badge(ch, msg.badge)
+                || msg.mi != ((crate::driver_launch::FSD_SERVICE_FRAME_CHAIN_LABEL << 12) | 1)
+                || *reply_cap != ch.reply_cap
+            {
+                outcome.wall(msg);
+                break;
+            }
+            use crate::driver_launch::hosted_exception_stack::FrameChainBrokerError;
+            match crate::driver_launch::hosted_exception_stack::capture_hosted_driver_frame_chain(
+                ch, *reply_cap, msg.badge, msg.m0,
+            ) {
+                Ok(count) => {
+                    pump_reply_recv_into!(ch, *reply_cap, msg, 1, u64::from(count));
+                    continue;
+                }
+                Err(FrameChainBrokerError::Refused) => {
+                    pump_reply_recv_into!(ch, *reply_cap, msg, 1, 0);
+                    continue;
+                }
+                Err(FrameChainBrokerError::UnsupportedUserSource) => {
+                    crate::print_str(b"[driver-frame] unsupported user frame source; wall lane\n");
+                    outcome.wall(msg);
+                    break;
+                }
+                Err(FrameChainBrokerError::Uncertain) => {
+                    crate::print_str(b"[driver-frame] uncertain result publication; wall lane\n");
+                    outcome.wall(msg);
+                    break;
+                }
+            }
+        } else if label == crate::win32k_subsystem::W32_FRAME_CHAIN_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            if !shared_pump::authenticated_badge(ch, msg.badge)
+                || msg.mi != ((crate::win32k_subsystem::W32_FRAME_CHAIN_LABEL << 12) | 1)
+                || *reply_cap != ch.reply_cap
+            {
+                outcome.wall(msg);
+                break;
+            }
+            use crate::driver_launch::hosted_exception_stack::FrameChainBrokerError;
+            match crate::driver_launch::hosted_exception_stack::capture_win32k_frame_chain(
+                ch,
+                *reply_cap,
+                msg.badge,
+                msg.m0,
+            ) {
+                Ok(count) => {
+                    pump_reply_recv_into!(ch, *reply_cap, msg, 1, u64::from(count));
+                    continue;
+                }
+                Err(FrameChainBrokerError::Refused) => {
+                    pump_reply_recv_into!(ch, *reply_cap, msg, 1, 0);
+                    continue;
+                }
+                Err(FrameChainBrokerError::UnsupportedUserSource) => {
+                    crate::print_str(b"[win32k-frame] unsupported user frame source; wall lane\n");
+                    outcome.wall(msg);
+                    break;
+                }
+                Err(FrameChainBrokerError::Uncertain) => {
+                    crate::print_str(b"[win32k-frame] uncertain result publication; wall lane\n");
+                    outcome.wall(msg);
+                    break;
+                }
+            }
+        } else if label == crate::win32k_subsystem::W32_PROCESS_QUERY_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let status = if shared_pump::authenticated_badge(ch, msg.badge) {
+                crate::service_sec_image::service_win32k_process_query_request(
+                    ch, *reply_cap, msg.badge, msg.mi,
+                    msg.m0, msg.m1, msg.m2, msg.m3,
+                )
+            } else {
+                nt_process::STATUS_INVALID_PARAMETER as i32
+            };
+            pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+            continue;
+        } else if label == crate::win32k_subsystem::W32_ACTIVE_CONSOLE_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let status = if shared_pump::authenticated_badge(ch, msg.badge)
+                && msg.mi == ((crate::win32k_subsystem::W32_ACTIVE_CONSOLE_LABEL << 12) | 1)
+                && *reply_cap == ch.reply_cap
+            {
+                unsafe { crate::kuser_active_console::service(ch, msg.m0) }
+            } else {
+                nt_process::STATUS_INVALID_PARAMETER
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 4, status as u64, 0, 0, 0);
+            continue;
         } else if label == crate::win32k_subsystem::W32_ATOM_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
             let (status, atom) = unsafe {
                 crate::service_sec_image::service_win32k_atom_request(
-                    ch.client_pi,
-                    ch.client_generation,
+                    ch,
+                    *reply_cap,
+                    msg.badge,
+                    msg.mi,
                     msg.m0,
                     msg.m1,
                 )
@@ -3192,6 +3744,54 @@ unsafe fn component_pump_loop(
                 0
             );
             continue;
+        } else if label == crate::driver_launch::HOSTED_MM_QUERY_PAGE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, present) = if !shared_pump::authenticated_badge(ch, msg.badge)
+                || msg.mi != ((crate::driver_launch::HOSTED_MM_QUERY_PAGE_LABEL << 12) | 1)
+            {
+                (0xc000_000du32 as i32, false)
+            } else {
+                match crate::driver_launch::query_hosted_driver_page(ch, *reply_cap, msg.m0) {
+                    Ok(present) => (0, present),
+                    Err(status) => (status, false),
+                }
+            };
+            pump_reply_recv4_into!(
+                ch,
+                *reply_cap,
+                msg,
+                2,
+                status as u32 as u64,
+                present as u64,
+                0,
+                0
+            );
+            continue;
+        } else if label == crate::win32k_subsystem::W32_MM_QUERY_PAGE_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let (status, present) = if !shared_pump::authenticated_badge(ch, msg.badge)
+                || msg.mi != ((crate::win32k_subsystem::W32_MM_QUERY_PAGE_LABEL << 12) | 1)
+            {
+                (0xc000_000du32 as i32, false)
+            } else {
+                match crate::driver_launch::win32k_address_validity::service(ch, *reply_cap, msg.m0) {
+                    Ok(present) => (0, present),
+                    Err(status) => (status, false),
+                }
+            };
+            pump_reply_recv4_into!(
+                ch,
+                *reply_cap,
+                msg,
+                2,
+                status as u32 as u64,
+                present as u64,
+                0,
+                0
+            );
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
@@ -3199,7 +3799,9 @@ unsafe fn component_pump_loop(
                 crate::driver_launch::service_hosted_driver_ps_create_system_thread(
                     ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.m4, msg.badge, *reply_cap,
                 );
-            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, handle, 0, 0);
+            msg = pump_reply_recv4_traced(
+                ch, *reply_cap, 2, status as u32 as u64, handle, 0, 0, None, true,
+            );
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL
             && ch.caps.kind == ReqKind::Irp
@@ -3218,6 +3820,484 @@ unsafe fn component_pump_loop(
                 0,
                 0
             );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_KE_SET_PRIORITY_THREAD_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, previous) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_KE_SET_PRIORITY_THREAD_LABEL << 12) | 2)
+            {
+                crate::driver_launch::hosted_driver_thread_priority::service(
+                    ch, msg.m0, msg.m1 as u32 as i32, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 2,
+                status as u32 as u64, previous, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_KE_STACK_ATTACH_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, marker) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_KE_STACK_ATTACH_LABEL << 12) | 3)
+            {
+                crate::driver_launch::hosted_driver_process_attach::service(
+                    ch, msg.m0, msg.m1, msg.m2, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 2,
+                status as u32 as u64, marker, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PS_IDENTITY_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, result) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_PS_IDENTITY_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+                && msg.m2 == 0 && msg.m3 == 0
+            {
+                crate::driver_launch::hosted_driver_process_identity::service(
+                    ch, msg.m0, msg.m1, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, result, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PCI_ROOT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_PCI_ROOT_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+                && msg.m0 == 0 && msg.m1 == 0 && msg.m2 == 0 && msg.m3 == 0
+            {
+                crate::driver_launch::hosted_driver_pci_root::service(ch, msg.badge, *reply_cap)
+            } else {
+                STATUS_INVALID_PARAMETER_I32
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, 0, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PCI_ROUTE_QUERY_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_PCI_ROUTE_QUERY_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+                && msg.m1 == 0 && msg.m2 == 0 && msg.m3 == 0
+            {
+                crate::driver_launch::hosted_driver_pci_route_query::service(
+                    ch, msg.m0, msg.badge, *reply_cap,
+                )
+            } else {
+                STATUS_INVALID_PARAMETER_I32
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 4, status as u32 as u64, 0, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PCI_IPI_PREFLIGHT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, base, len, count) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_PCI_IPI_PREFLIGHT_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+                && msg.m1 == 0 && msg.m2 == 0 && msg.m3 == 0
+            {
+                crate::driver_launch::hosted_driver_pci_kernel::ipi_preflight(
+                    ch, msg.m0, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0, 0, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 4,
+                status as u32 as u64, base, len, count);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_HAL_PCI_ROUTED_INTERRUPT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (found, gsi) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_HAL_PCI_ROUTED_INTERRUPT_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::hosted_driver_hal_pci::service_routed_interrupt(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (0, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 4, found, gsi, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_DIRECTORY_OBJECT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            crate::print_str(b"[hosted-directory-request] op=");
+            crate::print_u64(msg.m0);
+            crate::print_str(b" reply=");
+            crate::print_u64(*reply_cap);
+            crate::print_str(b"\n");
+            let result = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_DIRECTORY_OBJECT_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::hosted_driver_directory_object::service(
+                    ch, *reply_cap, msg.m0, msg.m1, msg.m2, msg.m3,
+                )
+            } else {
+                crate::provider_directory_broker::SubmitResult::Ready((
+                    STATUS_INVALID_PARAMETER_I32, 0, 0, 0,
+                ))
+            };
+            match result {
+                crate::provider_directory_broker::SubmitResult::Ready((status, out1, out2, out3)) => {
+                    crate::print_str(b"[hosted-directory-result] ready status=");
+                    crate::print_u64(status as u32 as u64);
+                    crate::print_str(b"\n");
+                    pump_reply_recv4_into!(ch, *reply_cap, msg, 4,
+                        status as u32 as u64, out1, out2, out3);
+                }
+                crate::provider_directory_broker::SubmitResult::Deferred => {
+                    crate::print_str(b"[hosted-directory-result] deferred\n");
+                    let yields = shared_pump::service_wait_yields(ch);
+                    crate::print_str(b"[hosted-directory-wait] yields=");
+                    crate::print_u64(u64::from(yields));
+                    crate::print_str(b" tcb=");
+                    crate::print_u64(ch.tcb);
+                    crate::print_str(b"\n");
+                    if yields {
+                        outcome.provider_wait_suspended = true;
+                        break;
+                    }
+                    msg = pump_recv(ch, *reply_cap);
+                }
+            }
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_CREATE_EVENT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, handle) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_CREATE_EVENT_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+                && msg.m3 == 0
+            {
+                crate::driver_launch::hosted_driver_create_event::service(
+                    ch, msg.m0, msg.m1, msg.m2, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, handle, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_EVENT_REFERENCE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, out1, out2, out3) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_EVENT_REFERENCE_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::hosted_driver_event_reference::service(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0, 0, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, out1, out2, out3
+            );
+            continue;
+        } else if label == crate::driver_launch::hosted_driver_process_notify::LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_PROCESS_NOTIFY_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+                && msg.m2 == 0 && msg.m3 == 0
+            {
+                crate::driver_launch::hosted_driver_process_notify::service(
+                    ch, msg.m0, msg.m1, msg.badge, *reply_cap,
+                )
+            } else {
+                STATUS_INVALID_PARAMETER_I32
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, 0, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_DYNAMIC_TYPE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, index) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_DYNAMIC_TYPE_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::hosted_driver_dynamic_type::service(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, index, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_DYNAMIC_OBJECT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_DYNAMIC_OBJECT_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::hosted_driver_dynamic_object::service(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                STATUS_INVALID_PARAMETER_I32
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, 0, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_DYNAMIC_OBJECT_INSERT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, handle) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_DYNAMIC_OBJECT_INSERT_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::hosted_driver_dynamic_object::insert_service(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, handle, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_DYNAMIC_OBJECT_REFERENCE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, body, access, attributes) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_DYNAMIC_OBJECT_REFERENCE_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::hosted_driver_dynamic_object::reference_service(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0, 0, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, body, access, attributes
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_DYNAMIC_OBJECT_DEREFERENCE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, references) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_DYNAMIC_OBJECT_DEREFERENCE_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::hosted_driver_dynamic_delete::release_reference_service(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, references, 0, 0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PS_HANDLE_REFERENCE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, body, attributes, access) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_PS_HANDLE_REFERENCE_LABEL << 12) | 4)
+                && shared_pump::authenticated_badge(ch, msg.badge)
+                && *reply_cap == ch.reply_cap
+            {
+                crate::driver_launch::hosted_driver_ps_handle_reference::service(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0, 0, 0)
+            };
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4,
+                status as u32 as u64, body, attributes, access
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_UUID_CREATE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, low, high) = if msg.mi == (crate::driver_launch::FSD_SERVICE_UUID_CREATE_LABEL << 12) {
+                crate::driver_launch::service_hosted_driver_uuid_create(
+                    ch, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0, 0)
+            };
+            pump_reply_recv4_into!(
+                ch,
+                *reply_cap,
+                msg,
+                3,
+                status as u32 as u64,
+                low,
+                high,
+                0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_GOP_QUERY_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let result = if msg.mi == (crate::driver_launch::FSD_SERVICE_GOP_QUERY_LABEL << 12) {
+                crate::driver_launch::service_hosted_driver_gop_query(ch, msg.badge, *reply_cap)
+            } else if msg.mi == ((crate::driver_launch::FSD_SERVICE_GOP_QUERY_LABEL << 12) | 3) {
+                crate::driver_launch::service_hosted_driver_gop_map(
+                    ch, msg.badge, *reply_cap, msg.m0, msg.m1, msg.m2,
+                )
+            } else {
+                0
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 1, result, 0, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_DISPLAY_OWNERSHIP_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = if msg.mi == ((crate::driver_launch::FSD_SERVICE_DISPLAY_OWNERSHIP_LABEL << 12) | 1) {
+                crate::driver_launch::service_hosted_driver_display_ownership_lost(
+                    ch, msg.m0, msg.badge, *reply_cap,
+                )
+            } else {
+                STATUS_INVALID_PARAMETER_I32
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 1, status as u32 as u64, 0, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PNP_NOTIFICATION_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, cookie) = if msg.mi == ((crate::driver_launch::FSD_SERVICE_PNP_NOTIFICATION_LABEL << 12) | 4) {
+                crate::driver_launch::service_hosted_driver_pnp_notification(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, cookie, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_POFX_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, value) = if msg.mi == ((crate::driver_launch::FSD_SERVICE_POFX_LABEL << 12) | 4) {
+                crate::driver_launch::service_hosted_driver_pofx(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, value, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_POWER_SETTING_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, value) = if msg.mi == ((crate::driver_launch::FSD_SERVICE_POWER_SETTING_LABEL << 12) | 4) {
+                crate::driver_launch::service_hosted_driver_power_setting(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, value, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_LUID_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, value) = if msg.mi == (crate::driver_launch::FSD_SERVICE_LUID_LABEL << 12) {
+                crate::driver_launch::service_hosted_driver_luid(ch, msg.badge, *reply_cap)
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, value, 0, 0);
+        } else if label == crate::driver_launch::FSD_SERVICE_WMI_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, provider_id) = if msg.mi == ((crate::driver_launch::FSD_SERVICE_WMI_LABEL << 12) | 4) {
+                crate::driver_launch::service_hosted_driver_wmi(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, provider_id, 0, 0);
+            continue;
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_KMUTEX_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, value) = if msg.mi == ((crate::driver_launch::FSD_SERVICE_KMUTEX_LABEL << 12) | 2)
+                || msg.mi == ((crate::driver_launch::FSD_SERVICE_KMUTEX_LABEL << 12) | 3)
+            {
+                crate::driver_launch::service_hosted_driver_kmutex(
+                    ch, msg.m0, msg.m1, msg.m2, msg.badge, *reply_cap,
+                )
+            } else { (STATUS_INVALID_PARAMETER_I32, 0) };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, value, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PROPERTY_WRITE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = if msg.mi == ((crate::driver_launch::FSD_SERVICE_PROPERTY_WRITE_LABEL << 12) | 4) {
+                crate::driver_launch::service_hosted_driver_device_property_write(
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+                )
+            } else { STATUS_INVALID_PARAMETER_I32 };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 1, status as u32 as u64, 0, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_CREATE_DRIVER_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = if msg.mi == ((crate::driver_launch::FSD_SERVICE_CREATE_DRIVER_LABEL << 12) | 1) {
+                crate::driver_launch::service_hosted_driver_create_driver(
+                    ch, msg.m0, msg.badge, *reply_cap,
+                )
+            } else { STATUS_INVALID_PARAMETER_I32 };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 1, status as u32 as u64, 0, 0, 0);
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PCI_CONFIG_LABEL
             && ch.caps.kind == ReqKind::Irp
@@ -3382,6 +4462,14 @@ unsafe fn component_pump_loop(
                 0
             );
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_REMOVE_DPC_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, removed) = crate::driver_launch::service_hosted_driver_remove_dpc(
+                ch, msg.m0, *reply_cap, msg.badge,
+            );
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, removed, 0, 0);
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_FLUSH_DPCS_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
@@ -3432,6 +4520,21 @@ unsafe fn component_pump_loop(
                 0
             );
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_BUS_INTERFACE_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, value1, value2) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_BUS_INTERFACE_LABEL << 12) | 4)
+            {
+                crate::driver_launch::hosted_bus_interface::service(
+                    ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2, msg.m3,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 3,
+                status as u32 as u64, value1, value2, 0);
+            continue;
         } else if label == crate::win32k_subsystem::W32_DEVICE_POINTER_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
@@ -3473,6 +4576,38 @@ unsafe fn component_pump_loop(
                 status as u32 as u64, total, token, chunk
             );
             continue;
+        } else if label == crate::win32k_subsystem::W32_DEVICE_INTERFACES_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let mut bytes = [0u8; crate::driver_launch::device_property::PROPERTY_CHUNK_BYTES];
+            let (status, total, token, chunk) = if !shared_pump::authenticated_badge(ch, msg.badge)
+                || msg.mi != ((crate::win32k_subsystem::W32_DEVICE_INTERFACES_LABEL << 12) | 5)
+            {
+                (0xc000_000du32 as i32, 0, 0, 0)
+            } else {
+                let fifth = core::ptr::read_volatile(
+                    (crate::IPCBUF_VADDR + 8 + 4 * 8) as *const u64,
+                );
+                crate::driver_launch::win32k_device_interfaces::service(
+                    ch, *reply_cap, msg.m0, msg.m1, msg.m2, msg.m3, fifth, &mut bytes,
+                )
+            };
+            let words = (chunk as usize + 7) / 8;
+            for word in 0..words {
+                let mut value = [0u8; 8];
+                let start = word * 8;
+                let end = core::cmp::min(start + 8, chunk as usize);
+                value[..end - start].copy_from_slice(&bytes[start..end]);
+                core::ptr::write_volatile(
+                    (crate::IPCBUF_VADDR + 8 + (4 + word as u64) * 8) as *mut u64,
+                    u64::from_le_bytes(value),
+                );
+            }
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4 + words,
+                status as u32 as u64, total, token, chunk
+            );
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_FILE_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
@@ -3491,6 +4626,17 @@ unsafe fn component_pump_loop(
         } else if label == crate::driver_launch::FSD_SERVICE_DEVICE_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
+            static DEVICE_DEREFERENCE_TRACE: AtomicU64 = AtomicU64::new(0);
+            let trace = msg.m0 == crate::driver_launch::HOSTED_DEVICE_OP_DEREFERENCE_POINTER
+                && DEVICE_DEREFERENCE_TRACE.fetch_add(1, Ordering::Relaxed) < 16;
+            if trace {
+                crate::print_str(b"[device-dereference-request] reply="); crate::print_u64(*reply_cap);
+                crate::print_str(b" info=0x"); crate::print_hex_u64(msg.mi);
+                crate::print_str(b" object=0x"); crate::print_hex_u64(msg.m1);
+                crate::print_str(b" arg2=0x"); crate::print_hex_u64(msg.m2);
+                crate::print_str(b" arg3=0x"); crate::print_hex_u64(msg.m3);
+                crate::print_str(b"\n");
+            }
             let (status, required_len, transfer_token, chunk_len) =
                 if msg.mi != ((crate::driver_launch::FSD_SERVICE_DEVICE_LABEL << 12) | 4) {
                     (0xc000_000du32 as i32, 0, 0, 0)
@@ -3499,16 +4645,34 @@ unsafe fn component_pump_loop(
                         ch, msg.m0, msg.m1, msg.m2, msg.m3, *reply_cap, msg.badge,
                     )
                 };
-            pump_reply_recv4_into!(
-                ch,
-                *reply_cap,
-                msg,
-                4,
-                status as u32 as u64,
-                required_len,
-                transfer_token,
-                chunk_len
-            );
+            if msg.m0 == crate::driver_launch::HOSTED_DEVICE_OP_DEREFERENCE_POINTER
+                && (trace || status != 0)
+            {
+                crate::print_str(b"[device-dereference-decision] reply="); crate::print_u64(*reply_cap);
+                crate::print_str(b" info=0x"); crate::print_hex_u64(msg.mi);
+                crate::print_str(b" object=0x"); crate::print_hex_u64(msg.m1);
+                crate::print_str(b" arg2=0x"); crate::print_hex_u64(msg.m2);
+                crate::print_str(b" arg3=0x"); crate::print_hex_u64(msg.m3);
+                crate::print_str(b" status=0x"); crate::print_hex_u64(status as u32 as u64);
+                crate::print_str(b" count=0x"); crate::print_hex_u64(required_len);
+                crate::print_str(b" spare=0x"); crate::print_hex_u64(transfer_token);
+                crate::print_str(b"/0x"); crate::print_hex_u64(chunk_len);
+                crate::print_str(b" reply-info=0x4\n");
+            }
+            if msg.m0 == crate::driver_launch::HOSTED_DEVICE_OP_REPORT_POWER_STATE {
+                crate::driver_launch::trace_report_rpc(
+                    b"service-return", *reply_cap, msg.badge, status, required_len,
+                );
+                msg = pump_reply_recv4_traced(
+                    ch, *reply_cap, 4, status as u32 as u64,
+                    required_len, transfer_token, chunk_len, Some(msg.badge), false,
+                );
+            } else {
+                pump_reply_recv4_into!(
+                    ch, *reply_cap, msg, 4, status as u32 as u64,
+                    required_len, transfer_token, chunk_len
+                );
+            }
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_KE_PULSE_EVENT_LABEL
             && ch.caps.kind == ReqKind::Irp
@@ -3536,6 +4700,32 @@ unsafe fn component_pump_loop(
             match crate::driver_launch::service_hosted_driver_ke_wait_single(
                 ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
             ) {
+                crate::driver_launch::HostedDriverWaitServiceResult::Reply(status) => {
+                    pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+                }
+                crate::driver_launch::HostedDriverWaitServiceResult::SharedParked { .. } => {
+                    if shared_pump::service_wait_yields(ch) {
+                        outcome.provider_wait_suspended = true;
+                        break;
+                    }
+                    msg = pump_recv(ch, *reply_cap);
+                }
+            }
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_GUARDED_MUTEX_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let operation = msg.m0;
+            let valid = (1..=3).contains(&operation)
+                && msg.mi == ((crate::driver_launch::FSD_SERVICE_GUARDED_MUTEX_LABEL << 12) | 2);
+            let result = if valid {
+                crate::driver_launch::service_hosted_driver_guarded_mutex(
+                    ch, operation, msg.m1, msg.badge, *reply_cap,
+                )
+            } else {
+                crate::driver_launch::HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER_I32)
+            };
+            match result {
                 crate::driver_launch::HostedDriverWaitServiceResult::Reply(status) => {
                     pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
                 }
@@ -3617,6 +4807,23 @@ unsafe fn component_pump_loop(
             pump_reply_recv4_into!(ch, *reply_cap, msg, 3,
                 status as u32 as u64, ticket, generation, 0);
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PRIMARY_TOKEN_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, value) = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_PRIMARY_TOKEN_LABEL << 12) | 2)
+                && msg.m2 == 0
+                && msg.m3 == 0
+            {
+                crate::driver_launch::service_hosted_primary_token(
+                    ch, *reply_cap, msg.badge, msg.m0, msg.m1,
+                )
+            } else {
+                (STATUS_INVALID_PARAMETER_I32, 0)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2,
+                status as u32 as u64, value, 0, 0);
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_TOKEN_QUERY_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
@@ -3676,11 +4883,16 @@ unsafe fn component_pump_loop(
             }
             continue;
         } else if (label == crate::driver_launch::FSD_SERVICE_QUERY_PATH_FORWARD_LABEL
+            || label == crate::driver_launch::FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL
+            || label == crate::driver_launch::FSD_SERVICE_DEVICE_READ_FORWARD_LABEL
+            || label == crate::driver_launch::FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL
+            || label == crate::driver_launch::FSD_SERVICE_SCSI_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_WRITE_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_READ_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_FLUSH_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_QUERY_INFORMATION_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_LOWER_PNP_FORWARD_LABEL
+            || label == crate::driver_launch::FSD_SERVICE_LOWER_POWER_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_LOWER_FILE_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_CONNECT_FORWARD_LABEL
             || label == crate::driver_launch::FSD_SERVICE_HOOK_FORWARD_LABEL)
@@ -3693,6 +4905,22 @@ unsafe fn component_pump_loop(
                 unsafe {
                     if label == crate::driver_launch::FSD_SERVICE_QUERY_PATH_FORWARD_LABEL {
                         crate::driver_launch::service_hosted_query_path_forward(
+                            ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
+                        )
+                    } else if label == crate::driver_launch::FSD_SERVICE_BUFFERED_CONTROL_FORWARD_LABEL {
+                        crate::driver_launch::service_hosted_buffered_control_forward(
+                            ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
+                        )
+                    } else if label == crate::driver_launch::FSD_SERVICE_DEVICE_READ_FORWARD_LABEL {
+                        crate::driver_launch::service_hosted_device_read_forward(
+                            ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
+                        )
+                    } else if label == crate::driver_launch::FSD_SERVICE_INTERNAL_CONTROL_FORWARD_LABEL {
+                        crate::driver_launch::service_hosted_internal_control_forward(
+                            ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
+                        )
+                    } else if label == crate::driver_launch::FSD_SERVICE_SCSI_FORWARD_LABEL {
+                        crate::driver_launch::service_hosted_scsi_forward(
                             ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
                         )
                     } else if label == crate::driver_launch::FSD_SERVICE_WRITE_FORWARD_LABEL {
@@ -3709,6 +4937,10 @@ unsafe fn component_pump_loop(
                         )
                     } else if label == crate::driver_launch::FSD_SERVICE_LOWER_PNP_FORWARD_LABEL {
                         crate::driver_launch::service_hosted_lower_pnp_forward(
+                            ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
+                        )
+                    } else if label == crate::driver_launch::FSD_SERVICE_LOWER_POWER_FORWARD_LABEL {
+                        crate::driver_launch::service_hosted_lower_power_forward(
                             ch, *reply_cap, msg.badge, msg.m0, msg.m1, msg.m2,
                         )
                     } else if label == crate::driver_launch::FSD_SERVICE_LOWER_FILE_FORWARD_LABEL {
@@ -3862,6 +5094,22 @@ unsafe fn component_pump_loop(
             {
                 unsafe {
                     crate::driver_launch::service_hosted_driver_zw_load_driver(
+                        ch, msg.m0, msg.badge, *reply_cap,
+                    )
+                }
+            } else {
+                STATUS_INVALID_PARAMETER_I32
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 1, status as u32 as u64, 0, 0, 0);
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_ZW_UNLOAD_DRIVER_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = if msg.mi
+                == ((crate::driver_launch::FSD_SERVICE_ZW_UNLOAD_DRIVER_LABEL << 12) | 1)
+            {
+                unsafe {
+                    crate::driver_launch::service_hosted_driver_zw_unload_driver(
                         ch, msg.m0, msg.badge, *reply_cap,
                     )
                 }
@@ -4030,9 +5278,18 @@ unsafe fn component_pump_loop(
 unsafe fn pump_service_user_callback(
     ch: &PumpChannel,
 ) -> Option<crate::win32k_glue::UserCallbackDisposition> {
+    print_str(b"[callback-pump-stage] enter\n");
     let lane =
         crate::win32k_glue::win32k_physical_lane_for_channel(ch.tcb, ch.fault_ep, ch.reply_cap)?;
-    crate::win32k_glue::service_user_callback(lane)
+    let outcome = crate::win32k_glue::service_user_callback(lane);
+    print_str(b"[callback-pump-stage] return disposition=");
+    print_u64(match outcome {
+        Some(crate::win32k_glue::UserCallbackDisposition::SuspendComponent) => 1,
+        Some(crate::win32k_glue::UserCallbackDisposition::ReplyImmediately) => 2,
+        None => 0,
+    });
+    print_str(b"\n");
+    outcome
 }
 
 #[inline(never)]
@@ -4054,6 +5311,9 @@ pub(crate) unsafe fn pump_service_vm_fault(
         return mapped;
     }
     if let Some(mapped) = crate::component_heap::service_fault(ch, addr, fsr) { return mapped; }
+    if let Some(mapped) = crate::win32k_subsystem::large_pool::service_fault(ch, addr, fsr) {
+        return mapped;
+    }
     if crate::win32k_subsystem::is_reserved_win32k_video_aperture(addr) { return false; }
     // Ps storage is never generic demand-zero memory or an attached-client mapping. The
     // canonical owner must authenticate an exact provider alias before this branch can map it.
@@ -4329,6 +5589,7 @@ unsafe fn pump_service_generic_fault(
 #[inline(never)]
 unsafe fn pump_service_io_port_fault(
     ch: &PumpChannel,
+    active_reply_cap: u64,
     fault_ip: u64,
     exception_number: u64,
 ) -> Option<u64> {
@@ -4410,7 +5671,11 @@ unsafe fn pump_service_io_port_fault(
         nt_kernel_exec::x86_io::PortIoPort::Dx => (regs[6] & 0xFFFF) as u16,
         nt_kernel_exec::x86_io::PortIoPort::Immediate(port) => port as u16,
     };
-    let grant = crate::driver_launch::hosted_io_port_fault_grant(sh, port)?;
+    let grant = crate::driver_launch::hosted_io_port_fault_grant(sh, port).or_else(|| {
+        crate::driver_launch::hosted_legacy_vga_port_fault_grant(
+            ch, active_reply_cap, port, is_in, bits,
+        )
+    })?;
     let port_cap = grant.cap;
     let port_base = grant.base;
     let port_len = grant.len;
@@ -4593,7 +5858,10 @@ unsafe fn pump_finish_slice(
 ) -> PumpResult {
     use nt_user_host::component_pump::PumpDepthDisposition;
     match outcome.accounting.after_slice(
-        outcome.scheduler_yielded || outcome.receive_yield.is_some() || outcome.service_wait_yield.is_some(),
+        outcome.scheduler_yielded || outcome.receive_yield.is_some()
+            || outcome.service_wait_yield.is_some() || outcome.maintenance_yield.is_some()
+            || outcome.nested_restore_yield.is_some()
+            || outcome.nested_restore_quarantined.is_some(),
         outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended,
     ) {
         PumpDepthDisposition::None | PumpDepthDisposition::Retained => {}
@@ -4619,6 +5887,9 @@ unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutco
         && !outcome.scheduler_yielded
         && outcome.receive_yield.is_none()
         && outcome.service_wait_yield.is_none()
+        && outcome.maintenance_yield.is_none()
+        && outcome.nested_restore_yield.is_none()
+        && outcome.nested_restore_quarantined.is_none()
     {
         pump_wall_state_diag(ch, outcome);
         crate::print_str(b"[pump] WALL label=");
@@ -4698,6 +5969,8 @@ unsafe fn pump_result_from_outcome(
         || outcome.scheduler_yielded
         || outcome.receive_yield.is_some()
         || outcome.service_wait_yield.is_some()
+        || outcome.maintenance_yield.is_some()
+        || outcome.nested_restore_yield.is_some()
     {
         let status = nt_user_callback::STATUS_PENDING;
         (status, status as u32 as u64)
@@ -4727,6 +6000,10 @@ unsafe fn pump_result_from_outcome(
         scheduler_yielded: outcome.scheduler_yielded,
         receive_yield: outcome.receive_yield,
         service_wait_yield: outcome.service_wait_yield,
+        maintenance_yield: outcome.maintenance_yield,
+        nested_restore_yield: outcome.nested_restore_yield,
+        nested_restore_quarantined: outcome.nested_restore_quarantined,
+        nested_restore_seh_retained: outcome.nested_restore_seh_retained,
         wall_ip: outcome.wall_ip,
         wall_addr: outcome.wall_addr,
         wall_label: outcome.wall_label,

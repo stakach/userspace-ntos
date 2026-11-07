@@ -212,6 +212,9 @@ impl PortLocalConnect {
             return Err(nt_status::NtStatus::DEVICE_BUSY);
         }
         match self.phase {
+            // A nested ACK may retire this exact packet while an outer attempt is parked.
+            // The identity check above still applies; there is no provider replay.
+            PortConnectPhase::Acknowledged => Ok(()),
             PortConnectPhase::Terminal(_) => {
                 if let Some(irp_id) = self.pending_irp {
                     self.returned_input = Some(hosted_file_owners::acknowledge_port_connect(irp_id)?);

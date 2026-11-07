@@ -2,6 +2,36 @@
 
 use super::*;
 
+static PNP_INSTALL_PIPE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn is_pnp_install_pipe_name(name: &[u16]) -> bool {
+    const NEEDLE: &[u8] = b"pnp_device_install_pipe_0.";
+    name.windows(NEEDLE.len()).any(|window| {
+        window.iter().zip(NEEDLE).all(|(&unit, &letter)| {
+            unit <= 0x7f && (unit as u8).eq_ignore_ascii_case(&letter)
+        })
+    })
+}
+
+fn trace_pnp_install_pipe(stage: &[u8], pi: usize, generation: Option<u64>, status: Option<u32>, name: &[u16]) {
+    if PNP_INSTALL_PIPE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 32 {
+        return;
+    }
+    print_str(b"[pnp-install-pipe] stage=");
+    print_str(stage);
+    print_str(b" pi=");
+    print_u64(pi as u64);
+    print_str(b" generation=");
+    print_u64(generation.unwrap_or(0));
+    if let Some(status) = status {
+        print_str(b" status=0x");
+        print_hex(status);
+    }
+    print_str(b" name=\"");
+    print_sanitized_utf16_ascii(name, 96);
+    print_str(b"\"\n");
+}
+
 impl ExecNtHandler {
     pub(super) unsafe fn nt_create_file_service(&mut self, args: &[u64]) -> u32 {
         let file_handle_out = args[0];
@@ -76,6 +106,55 @@ impl ExecNtHandler {
             Ok(resolved) => resolved,
             Err(status) => return status,
         };
+        if matches!(parse_root, FileParseRoot::Absolute)
+            && !Self::is_named_pipe_root_path(name16)
+            && !nt_fs::is_named_pipe_path(name16)
+        {
+            let resolved = driver_launch::resolve_hosted_device_file_name(
+                name16, captured.attributes & 0x40 != 0,
+            );
+            if matches!(&resolved, Err(status) if *status == nt_status::NtStatus::DEVICE_BUSY.raw() as u32) {
+                return match crate::native_file_target_open_work::capture(
+                    self, crate::native_file_target_open_work::Kind::Create,
+                    args, captured.clone(), name16, ea,
+                ) {
+                    Ok(()) => STATUS_PENDING,
+                    Err(status) => status,
+                };
+            }
+            return self.nt_create_file_captured(
+                args, &captured, parse_root, name16, &ea, Some(&resolved),
+            );
+        }
+        self.nt_create_file_captured(
+            args, &captured, parse_root, name16, &ea, None,
+        )
+    }
+
+    /// Continue from validated, copied NtCreateFile inputs after an owned namespace lookup.
+    pub(crate) unsafe fn nt_create_file_captured(
+        &mut self,
+        args: &[u64],
+        captured: &CapturedFileObjectAttributes,
+        parse_root: FileParseRoot,
+        name16: &[u16],
+        ea: &[u8],
+        resolved: Option<&Result<(u64, alloc::vec::Vec<u16>), u32>>,
+    ) -> u32 {
+        let file_handle_out = args[0];
+        let desired_access = nt_ulong_arg(args[1]);
+        let file_attributes = nt_ulong_arg(args[5]);
+        let share_access = nt_ulong_arg(args[6]);
+        let create_disposition = nt_ulong_arg(args[7]);
+        let create_options = nt_ulong_arg(args[8]);
+        let iosb = args[3];
+        let pnp_install_pipe = is_pnp_install_pipe_name(name16);
+        if pnp_install_pipe {
+            trace_pnp_install_pipe(
+                b"request", self.pi, self.hosted_process_generation(self.pi),
+                None, name16,
+            );
+        }
         if !NT_CREATE_FILE_FRONTIER_TRACED.swap(true, Ordering::Relaxed) {
             print_str(b"[nt-create-file-frontier] pi=");
             print_u64(self.pi as u64);
@@ -121,6 +200,22 @@ impl ExecNtHandler {
                         iosb,
                     );
                 }
+                if let Some(status) = self.create_registered_driver_peer_relative_file(
+                    device_id,
+                    file_id,
+                    name16,
+                    captured.attributes,
+                    desired_access,
+                    share_access,
+                    create_disposition,
+                    file_attributes,
+                    create_options,
+                    &ea,
+                    file_handle_out,
+                    iosb,
+                ) {
+                    return status;
+                }
                 if driver_launch::device_id_by_name("\\Device\\NamedPipe")
                     != Some(device_id)
                 {
@@ -163,15 +258,44 @@ impl ExecNtHandler {
                     }),
                 };
                 let Some(publication) = publication else {
+                    if pnp_install_pipe {
+                        trace_pnp_install_pipe(b"pending", self.pi,
+                            self.hosted_process_generation(self.pi), Some(STATUS_PENDING), name16);
+                    }
                     return STATUS_PENDING;
                 };
                 self.pipe_endpoint_progress |= publication.wake_server_fid != 0;
+                if pnp_install_pipe {
+                    trace_pnp_install_pipe(b"provider-result", self.pi,
+                        self.hosted_process_generation(self.pi), Some(publication.status), name16);
+                }
                 return match self.publish_file_create_result(
                     file_handle_out, iosb, publication.handle, publication.status, publication.information,
                 ) {
                     Ok(()) => publication.status,
                     Err(status) => status,
                 };
+            }
+            if let FileParseRoot::FatDirectory { first_cluster, object_id } = parse_root {
+                let mut mounted_name = [0u16; nt_fs::DIRECTORY_OPEN_PATH_CAP];
+                match self.mounted_target_for_legacy_fat_child(
+                    parse_root, name16, &mut mounted_name,
+                ) {
+                    Ok(Some((device_id, length))) => {
+                        return self.create_registered_file_from_target(
+                            Ok((device_id, None, Some(&mounted_name[..length]))),
+                            name16, captured.attributes, desired_access, share_access,
+                            create_disposition, file_attributes, create_options, &ea,
+                            file_handle_out, iosb,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(status) => return status,
+                }
+                if let Ok(open) = self.directory_opens.get(object_id) {
+                    trace_sync_fat_after_handoff(0, b"relative-create-caller", self.pi,
+                        self.current_tid as u64, Some((object_id, first_cluster, open.volume_relative_path())), name16);
+                }
             }
             let (status, information, handle) = self.create_local_file_relative(
                 parse_root,
@@ -187,12 +311,58 @@ impl ExecNtHandler {
                 Err(status) => status,
             };
         }
+        if !Self::is_named_pipe_root_path(name16) && !nt_fs::is_named_pipe_path(name16) {
+            let owned_resolution = resolved.is_none().then(||
+                driver_launch::resolve_hosted_device_file_name(
+                    name16, captured.attributes & 0x40 != 0));
+            let resolved = resolved.unwrap_or_else(|| owned_resolution.as_ref().unwrap());
+            if let Some(status) = self.create_registered_driver_peer_file_from_resolved(
+                resolved,
+                name16,
+                captured.attributes,
+                desired_access,
+                share_access,
+                create_disposition,
+                file_attributes,
+                create_options,
+                &ea,
+                file_handle_out,
+                iosb,
+            ) {
+                return status;
+            }
+        }
         if create_options & nt_fs::FILE_DIRECTORY_FILE != 0
             && !Self::is_named_pipe_root_path(name16)
             && !nt_fs::is_named_pipe_path(name16)
         {
-            return self.create_registered_kernel_file(
-                parse_root,
+            let owned_resolution = resolved.is_none().then(||
+                driver_launch::resolve_hosted_device_file_name(
+                    name16, captured.attributes & 0x40 != 0));
+            return self.create_registered_kernel_file_from_resolved(
+                parse_root, resolved.or(owned_resolution.as_ref()),
+                name16,
+                captured.attributes,
+                desired_access,
+                share_access,
+                create_disposition,
+                file_attributes,
+                create_options,
+                &ea,
+                file_handle_out,
+                iosb,
+            );
+        }
+        let mount_route = unsafe { crate::fs_loader::exec_fs_mount_identity() }
+            .and_then(crate::fs_loader::exec_block_route_kind);
+        if create_options & nt_fs::FILE_DIRECTORY_FILE == 0
+            && Self::route_absolute_open_to_kernel_file(name16, create_options, mount_route, resolved)
+        {
+            let owned_resolution = resolved.is_none().then(||
+                driver_launch::resolve_hosted_device_file_name(
+                    name16, captured.attributes & 0x40 != 0));
+            return self.create_registered_kernel_file_from_resolved(
+                parse_root, resolved.or(owned_resolution.as_ref()),
                 name16,
                 captured.attributes,
                 desired_access,
@@ -486,7 +656,15 @@ impl ExecNtHandler {
             status = self.unserved_nt_create_file_namespace(name16);
         }
         if pending_pipe_create {
+            if pnp_install_pipe {
+                trace_pnp_install_pipe(b"pending", self.pi,
+                    self.hosted_process_generation(self.pi), Some(STATUS_PENDING), name16);
+            }
             return STATUS_PENDING;
+        }
+        if pnp_install_pipe {
+            trace_pnp_install_pipe(b"provider-result", self.pi,
+                self.hosted_process_generation(self.pi), Some(status), name16);
         }
         if let Err(status) = self.publish_file_create_result(file_handle_out, iosb, opened_handle, status, info) {
             return status;

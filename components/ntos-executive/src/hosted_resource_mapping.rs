@@ -195,6 +195,51 @@ pub(super) unsafe fn clear(
     }
 }
 
+/// Release only this owner's mappings inside one published resource window. A DMA setup
+/// rollback must not revoke the same device's already assigned BAR or interrupt mappings.
+pub(super) unsafe fn clear_range(
+    instance: usize,
+    domain: HostedDomainIdentity,
+    device_id: u64,
+    context_lease: nt_pnp_context::ContextLeaseIdentity,
+    start: u64,
+    pages: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let bytes = pages
+        .checked_mul(0x1000)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let end = start
+        .checked_add(bytes)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    if device_id == 0 || start == 0 || start & 0xfff != 0 || pages == 0 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    loop {
+        let candidate = table().iter().find_map(|row| {
+            let key = row.key();
+            if key.domain
+                != (MappingDomain {
+                    id: domain.domain_id.raw(),
+                    cookie: domain.cookie,
+                })
+                || key.virtual_page < start
+                || key.virtual_page >= end
+            {
+                return None;
+            }
+            row.owners().find(|(_, owner)| {
+                owner.instance == instance
+                    && owner.device_id == device_id
+                    && owner.context_lease == context_lease
+            })
+        });
+        let Some((receipt, _owner)) = candidate else {
+            return Ok(());
+        };
+        release(receipt)?;
+    }
+}
+
 pub(super) unsafe fn begin_remap(
     receipt: OwnerReceipt,
 ) -> Option<(u64, nt_pnp_context::resource_mapping::MapEffectReceipt)> {

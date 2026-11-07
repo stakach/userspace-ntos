@@ -1,0 +1,11 @@
+[package]
+name = "nt-srm-message"
+description = "Pure native LPC request/reply codec for the security reference monitor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-lpc-abi.workspace = true

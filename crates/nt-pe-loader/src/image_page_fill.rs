@@ -22,6 +22,52 @@ pub struct ImagePageFillPlan {
     span_count: usize,
 }
 
+/// Assemble one image page from exact File spans acknowledged by the caller's I/O owner.
+///
+/// Pending provider bytes must only be passed to `accept_acknowledged_span` after their
+/// terminal IRP has been strictly acknowledged. The page stays unavailable until every
+/// planned span has been accepted in order.
+pub struct ImagePageFillCapture {
+    plan: ImagePageFillPlan,
+    page: [u8; IMAGE_PAGE_SIZE],
+    next_span: usize,
+}
+
+impl ImagePageFillCapture {
+    pub fn new(plan: ImagePageFillPlan) -> Self {
+        Self {
+            plan,
+            page: [0; IMAGE_PAGE_SIZE],
+            next_span: 0,
+        }
+    }
+
+    pub fn next_span(&self) -> Option<ImagePageFileSpan> {
+        self.plan.spans().get(self.next_span).copied()
+    }
+
+    /// Accept only the next complete span. The caller owns terminal I/O validation and ACK.
+    pub fn accept_acknowledged_span(&mut self, span: ImagePageFileSpan, bytes: &[u8]) -> bool {
+        if self.next_span() != Some(span) || bytes.len() != usize::from(span.length) {
+            return false;
+        }
+        let start = usize::from(span.page_offset);
+        let Some(end) = start.checked_add(bytes.len()) else {
+            return false;
+        };
+        let Some(destination) = self.page.get_mut(start..end) else {
+            return false;
+        };
+        destination.copy_from_slice(bytes);
+        self.next_span += 1;
+        true
+    }
+
+    pub fn completed_page(&self) -> Option<&[u8; IMAGE_PAGE_SIZE]> {
+        (self.next_span == self.plan.spans().len()).then_some(&self.page)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImagePageReadError<E> {
     InvalidPageSize(usize),
@@ -171,6 +217,49 @@ mod tests {
         );
         assert_eq!(calls, 2);
         assert_eq!(&page[..4], &[1; 4]);
+    }
+
+    #[test]
+    fn pe_page_waits_for_each_acknowledged_span_before_publication() {
+        let mut page = ImagePageFillCapture::new(two_spans());
+        let first = page.next_span().expect("first PE file span");
+        assert_eq!((first.file_offset, first.page_offset, first.length), (0x400, 0, 4));
+        // A pending IRP may have copied bytes into a private buffer, but the caller only
+        // presents them here after the provider's strict terminal ACK succeeds.
+        assert_eq!(page.next_span(), Some(first));
+        assert!(page.completed_page().is_none());
+        assert!(page.accept_acknowledged_span(first, b"abcd"));
+
+        let second = page.next_span().expect("second PE file span");
+        assert_eq!((second.file_offset, second.page_offset, second.length), (0x900, 16, 8));
+        assert!(page.completed_page().is_none());
+        assert!(page.accept_acknowledged_span(second, b"12345678"));
+        let filled = page.completed_page().expect("every span completed");
+        assert_eq!(&filled[..4], b"abcd");
+        assert_eq!(&filled[16..24], b"12345678");
+        assert!(filled[4..16].iter().chain(filled[24..].iter()).all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn page_capture_rejects_short_or_out_of_order_spans_without_advancing() {
+        let mut page = ImagePageFillCapture::new(two_spans());
+        let spans = two_spans();
+        let first = spans.spans()[0];
+        let second = spans.spans()[1];
+        assert!(!page.accept_acknowledged_span(second, b"12345678"));
+        assert!(!page.accept_acknowledged_span(first, b"abc"));
+        assert_eq!(page.next_span(), Some(first));
+        assert!(page.accept_acknowledged_span(first, b"abcd"));
+        assert_eq!(page.next_span(), Some(second));
+    }
+
+    #[test]
+    fn zero_span_image_page_is_immediately_zero_filled() {
+        let mut plan = two_spans();
+        plan.span_count = 0;
+        let page = ImagePageFillCapture::new(plan);
+        assert_eq!(page.next_span(), None);
+        assert!(page.completed_page().unwrap().iter().all(|byte| *byte == 0));
     }
 }
 

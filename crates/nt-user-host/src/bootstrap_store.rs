@@ -146,4 +146,29 @@ mod tests {
         );
         assert_eq!(store.take(), Ok(7));
     }
+
+    #[test]
+    fn atom_owner_preserves_values_and_references_across_transfer() {
+        use nt_kernel_exec::rtl_atom::{OwnedAtomTable, status};
+
+        let mut store = BootstrapStore::new();
+        assert!(store.initialize(OwnedAtomTable::with_capacity(256).unwrap()).is_ok());
+        let first = store.with_mut(|table| table.add_name(&['A' as u16, 'B' as u16]))
+            .unwrap().unwrap();
+        let original_allocation = store.with_mut(|table| table.raw_table_address()).unwrap();
+        for i in 0..64u16 {
+            let name = ['P' as u16, i + 'A' as u16];
+            store.with_mut(|table| table.add_name(&name)).unwrap().unwrap();
+        }
+        let mut runtime = store.take().unwrap();
+        assert_eq!(runtime.raw_table_address(), original_allocation);
+        assert_eq!(runtime.find_name(&['a' as u16, 'b' as u16]), Ok(first));
+        assert_eq!(runtime.add_name(&['a' as u16, 'b' as u16]), Ok(first));
+        assert_eq!(runtime.delete(first), status::SUCCESS);
+        assert_eq!(runtime.find_name(&['A' as u16, 'B' as u16]), Ok(first));
+        assert_eq!(runtime.delete(first), status::SUCCESS);
+        assert_eq!(runtime.find_name(&['A' as u16, 'B' as u16]), Err(status::OBJECT_NAME_NOT_FOUND));
+        assert_eq!(store.with_mut(|_| panic!("bootstrap table reused")),
+            Err::<(), _>(BootstrapStoreError::Transferred));
+    }
 }

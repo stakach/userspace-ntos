@@ -211,22 +211,6 @@ pub(super) unsafe fn related_device_address(
         .map_err(NtStatus)
 }
 
-pub(super) unsafe fn reference_by_handle(id: u64, address: u64) -> Result<u64, NtStatus> {
-    let index = index_for(id).ok_or(NtStatus::INVALID_HANDLE)?;
-    let row = rows_mut()[index].as_mut().unwrap();
-    if row.retiring || row.handle == 0 || row.address != address {
-        return Err(NtStatus::INVALID_HANDLE);
-    }
-    let identity = row.identity.ok_or(NtStatus::INVALID_HANDLE)?;
-    let projection = row.projection.as_mut().ok_or(NtStatus::INVALID_HANDLE)?;
-    let pointer = crate::driver_launch::win32k_device_consumer::reference_file_by_handle(
-        projection, identity,
-    )
-    .map_err(NtStatus)?;
-    assert_eq!(pointer, address, "video File reference changed projection address");
-    Ok((projection.pointer_reference_count() as u64).saturating_add(1))
-}
-
 pub(super) unsafe fn reference_by_pointer(
     domain: HostedDomainIdentity, id: u64, address: u64,
 ) -> Result<u64, NtStatus> {

@@ -25,6 +25,7 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AcceptedPdoPnpIdentity {
+    /// FDO outer IRP for a lower edge; the provider IRP itself for a direct raw-PDO START.
     pub outer_irp: IrpId,
     pub pdo: DeviceId,
     pub minor: u8,
@@ -310,12 +311,37 @@ impl PreparedAcceptedPdoPnp {
             relations,
             providers,
             io,
-            outer_irp,
+            Some(outer_irp),
             pdo,
             client,
             requestor_tid,
             parameters,
             payload,
+        )
+    }
+
+    /// Prepare one canonical PDO START without a function-stack outer IRP.
+    /// The caller must begin the matching PnP dispatch with `provider_irp()` before entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_direct<P>(
+        pnp: &PnpManager,
+        relations: &BusRelationTable,
+        providers: &AcceptedPdoProviderCatalog,
+        io: &mut IoManager<P>,
+        pdo: DeviceId,
+        client: ClientId,
+        requestor_tid: u64,
+        raw_len: u32,
+        translated_len: u32,
+        payload: Vec<u8>,
+    ) -> Result<Self, AcceptedPdoPnpError> {
+        if !pnp.raw_pdo_start_admissible(relations, pdo.raw()) {
+            return Err(AcceptedPdoPnpError::Prepare(NtStatus::INVALID_DEVICE_REQUEST));
+        }
+        let parameters =
+            PnpParameters::start(raw_len, translated_len).map_err(AcceptedPdoPnpError::Prepare)?;
+        Self::prepare(
+            pnp, relations, providers, io, None, pdo, client, requestor_tid, parameters, payload,
         )
     }
 
@@ -340,7 +366,7 @@ impl PreparedAcceptedPdoPnp {
             relations,
             providers,
             io,
-            outer_irp,
+            Some(outer_irp),
             pdo,
             client,
             requestor_tid,
@@ -355,22 +381,26 @@ impl PreparedAcceptedPdoPnp {
         relations: &BusRelationTable,
         providers: &AcceptedPdoProviderCatalog,
         io: &mut IoManager<P>,
-        outer_irp: IrpId,
+        outer_irp: Option<IrpId>,
         pdo: DeviceId,
         client: ClientId,
         requestor_tid: u64,
         parameters: PnpParameters,
         payload: Vec<u8>,
     ) -> Result<Self, AcceptedPdoPnpError> {
-        let outer = io.irp(outer_irp).ok_or(AcceptedPdoPnpError::WrongOuter)?;
-        if outer.client_id != client
-            || outer.file_id.is_some()
-            || outer.origin_major != nt_pnp_abi::IRP_MJ_PNP
-            || outer.origin_minor != parameters.minor
-            || outer.origin_device_id != pdo
-            || payload.len() != parameters.payload_len() as usize
-        {
+        if payload.len() != parameters.payload_len() as usize {
             return Err(AcceptedPdoPnpError::WrongOuter);
+        }
+        if let Some(outer_irp) = outer_irp {
+            let outer = io.irp(outer_irp).ok_or(AcceptedPdoPnpError::WrongOuter)?;
+            if outer.client_id != client
+                || outer.file_id.is_some()
+                || outer.origin_major != nt_pnp_abi::IRP_MJ_PNP
+                || outer.origin_minor != parameters.minor
+                || outer.origin_device_id != pdo
+            {
+                return Err(AcceptedPdoPnpError::WrongOuter);
+            }
         }
         let authority = providers
             .resolve(pnp, relations, io, pdo.raw())
@@ -405,7 +435,7 @@ impl PreparedAcceptedPdoPnp {
         Ok(Self {
             owner: Owner {
                 identity: AcceptedPdoPnpIdentity {
-                    outer_irp,
+                    outer_irp: outer_irp.unwrap_or_else(|| provider_irp.irp_id()),
                     pdo,
                     minor: parameters.minor,
                     provider: authority,
@@ -836,15 +866,24 @@ impl TerminalAcceptedPdoPnp {
     }
 
     pub fn retire<P>(
-        mut self,
+        self,
         io: &mut IoManager<P>,
     ) -> Result<NtStatus, (AcceptedPdoPnpError, Self)> {
+        self.retire_with_receipt(io).map(|receipt| receipt.status())
+    }
+
+    /// Transfer the exact terminal receipt after provider ACK and target retirement.
+    /// Direct raw-PDO START uses this receipt as the sole authority for PnP lifecycle commit.
+    pub fn retire_with_receipt<P>(
+        mut self,
+        io: &mut IoManager<P>,
+    ) -> Result<ExternalPnpTerminalReceipt, (AcceptedPdoPnpError, Self)> {
         if !self.acknowledged {
             return Err((AcceptedPdoPnpError::ProviderAckRequired, self));
         }
         if let Err(error) = self.owner.release(io) {
             return Err((error, self));
         }
-        Ok(self.receipt.status())
+        Ok(self.receipt)
     }
 }

@@ -8,6 +8,16 @@ pub(super) enum PendingComponentDispatch {
     Lpc(win32k_glue::PendingLpcWaitDispatch),
     Receive(win32k_glue::PendingReceiveDispatch),
     ServiceWait(win32k_glue::PendingServiceWaitDispatch),
+    RootMaintenance(win32k_glue::PendingRootMaintenanceDispatch),
+    NestedRestore(PendingNestedTerminalDispatch),
+}
+
+/// A real returned receive half transferred from its independent nested parent owner. The
+/// owner keeps the original root Reply until terminal retirement acknowledges it.
+#[derive(Clone, Copy)]
+pub(super) struct PendingNestedTerminalDispatch {
+    pub(super) ticket: nested_restore_owner::NestedRestoreOwnerTicket,
+    pub(super) client: win32k_glue::Win32kClientContext,
 }
 
 impl PendingComponentDispatch {
@@ -15,8 +25,10 @@ impl PendingComponentDispatch {
         match self {
             Self::Provider(pending) => pending.client,
             Self::Lpc(pending) => pending.client,
-            Self::Receive(pending) => pending.client,
-            Self::ServiceWait(pending) => pending.client,
+            Self::Receive(pending) => pending.snapshot.client,
+            Self::ServiceWait(pending) => pending.snapshot.client,
+            Self::RootMaintenance(pending) => pending.snapshot.client,
+            Self::NestedRestore(pending) => pending.client,
         }
     }
 }
@@ -66,6 +78,13 @@ impl ComponentSuspensionCompletion {
 pub(super) struct HostedNativeContinuation {
     pub(super) pending: PendingComponentDispatch,
     pub(super) return_target: HostedReturnTarget<win32k_glue::StagedUserCallbackContext>,
+    pub(super) destination: HostedContinuationDestination,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HostedContinuationDestination {
+    Win32k,
+    InitialThread(nt_user_host::process_create_callout::InitialThreadReplyOrigin<HostedThreadRole>),
 }
 
 #[derive(Clone, Copy)]

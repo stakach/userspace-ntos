@@ -67,11 +67,11 @@ fn arbitrary_projection_preflight_busy_is_not_a_terminal_resource_failure() {
         "physical pool contention is no-effect Busy, not an allocation failure");
     assert!(names.paths.iter().any(|name| name == "Busy"),
         "arbitrary provider allocations require a typed precommit Busy disposition");
-    let (_, body) = function(&source("exec_file_mode.rs"), "try_set_file_mode_information");
+    let (_, body) = function(&source("service_sec_image.rs"), "pending_file_io_redrive_pass");
     let mut names = Names::default();
     names.visit_block(&body);
     assert!(names.paths.iter().any(|name| name == "Busy"),
-        "the mode adapter must retain precommit ownership instead of recording Busy as OwnedInline terminal status");
+        "the retained mode owner must retry precommit Busy instead of publishing a terminal status");
 }
 
 #[test]
@@ -82,12 +82,19 @@ fn mode_capture_consumes_full_supplied_length_after_file_busy_acquisition() {
         syn::FnArg::Typed(argument) if matches!(&*argument.pat,
             syn::Pat::Ident(name) if name.ident == "length"))),
         "FileMode scalar decoding must not discard the caller's full Length");
-    let mut names = Names::default();
-    names.visit_block(&body);
-    let position = |name: &str| names.calls.iter().position(|call| call == name)
-        .unwrap_or_else(|| panic!("missing {name}"));
-    assert!(position("prepare_owned_file_io") < position("capture_file_mode_input"));
-    let (_, capture) = function(&file, "capture_file_mode_input");
+    let mut entry_names = Names::default();
+    entry_names.visit_block(&body);
+    assert!(entry_names.calls.iter().any(|name| name == "prepare_owned_file_io"));
+    assert!(entry_names.paths.iter().any(|name| name == "OwnedModeInputCapture"),
+        "File Busy and the original Reply must be retained before input page admission");
+    assert!(!entry_names.calls.iter().any(|name| name == "capture_file_mode_resident_input"),
+        "the native entry must not read user input before the retained owner is parked");
+    let (_, redrive) = function(&source("service_sec_image.rs"), "redrive_file_mode_input");
+    let mut redrive_names = Names::default();
+    redrive_names.visit_block(&redrive);
+    assert!(redrive_names.calls.iter().any(|name| name == "capture_file_mode_resident_input"),
+        "the retained owner reads input only after exact page admission");
+    let (_, capture) = function(&file, "capture_file_mode_resident_input");
     let mut names = Names::default();
     names.visit_block(&capture);
     assert!(names.paths.iter().any(|name| name == "length"));

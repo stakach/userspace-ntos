@@ -12,6 +12,7 @@ pub struct DeviceType(pub u32);
 impl DeviceType {
     pub const BEEP: DeviceType = DeviceType(0x0000_0001);
     pub const DISK: DeviceType = DeviceType(0x0000_0007);
+    pub const MASS_STORAGE: DeviceType = DeviceType(0x0000_002d);
     pub const DISK_FILE_SYSTEM: DeviceType = DeviceType(0x0000_0008);
     pub const CD_ROM_FILE_SYSTEM: DeviceType = DeviceType(0x0000_0003);
     pub const NETWORK_FILE_SYSTEM: DeviceType = DeviceType(0x0000_0014);
@@ -61,6 +62,9 @@ pub struct DeviceRecord {
     pub object_id: ObjectId,
     pub driver_id: DriverId,
     pub name: Option<NtPath>,
+    /// Internal Object Manager name for an otherwise unnamed PnP device interface target.
+    /// This does not change the WDM DeviceObject name exposed to the driver.
+    pub(crate) interface_endpoint: Option<NtPath>,
     pub device_type: DeviceType,
     pub characteristics: DeviceCharacteristics,
     pub flags: DeviceFlags,
@@ -91,6 +95,7 @@ impl DeviceRecord {
             object_id,
             driver_id,
             name,
+            interface_endpoint: None,
             device_type,
             characteristics,
             flags,

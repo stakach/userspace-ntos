@@ -30,7 +30,7 @@ pub(crate) unsafe fn storage_probe(
     let ssts = core::ptr::read_volatile((ahci_vaddr + 0x100 + 0x28) as *const u32);
     let det = (ssts >> 8) & 0xF;
     // Read sector 0 via a real READ DMA EXT and validate the protective MBR.
-    let tfd = ahci_read_sector(ahci_vaddr, dma_vaddr, dma_paddr, 0);
+    let tfd = ahci_read_sector_isolated_storage_host(ahci_vaddr, dma_vaddr, dma_paddr, 0);
     let mbr = core::slice::from_raw_parts(
         (dma_vaddr + AHCI_DMA_DATA_OFFSET) as *const u8,
         nt_fs::DISK_SECTOR_BYTES,
@@ -47,7 +47,7 @@ pub(crate) unsafe fn storage_probe(
         verdict |= 1;
     }
     let (mut hive_size, mut smss_size, mut imports_size) = (0u32, 0u32, 0u32);
-    if let Some(fs) = fat32_mount_with_census(ahci_vaddr, dma_vaddr, dma_paddr, false) {
+    if let Some(fs) = fat32_mount_isolated_storage_host(ahci_vaddr, dma_vaddr, dma_paddr) {
         verdict |= 2;
         // P7-A: source every ReactOS binary BY PATH from the real \reactos\system32 tree (LFN-aware
         // fat_open_path), NOT from the flat root ::NAME files. Each read tries the real path first
@@ -157,7 +157,7 @@ pub(crate) unsafe fn storage_probe(
             print_str(b" read=");
             print_u64(got as u64);
             print_str(b"\n");
-            if got == want && ssize > 0 {
+            if nt_fs::published_file_size(ssize, cap, got).is_some() {
                 smss_size = ssize;
                 verdict |= 0x20;
             }
@@ -372,7 +372,7 @@ pub(crate) unsafe fn storage_probe(
                 print_str(b" read=");
                 print_u64(got as u64);
                 print_str(b"\n");
-                if got == want && sz > 0 {
+                if nt_fs::published_file_size(sz, cap, got).is_some() {
                     *out = sz;
                 }
             }
@@ -389,12 +389,12 @@ pub(crate) unsafe fn storage_probe(
             print_str(b" read=");
             print_u64(got as u64);
             print_str(b"\n");
-            if got == want && sz > 0 {
+            if nt_fs::published_file_size(sz, cap, got).is_some() {
                 core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x7c) as *mut u32, sz);
             }
         }
         for (path, short, dest, cap_frames, off) in [(
-            b"reactos\\Fonts\\arial.ttf".as_slice(),
+            crate::installed_layout::ARIAL,
             b"ARIAL   TTF",
             win32k_subsystem::FONTBUF_VADDR,
             win32k_subsystem::FONTBUF_FRAMES,
@@ -411,7 +411,7 @@ pub(crate) unsafe fn storage_probe(
                 print_str(b" read=");
                 print_u64(got as u64);
                 print_str(b"\n");
-                if got == want && sz > 0 {
+                if nt_fs::published_file_size(sz, cap, got).is_some() {
                     core::ptr::write_volatile((STORAGE_SHARED_VADDR + off) as *mut u32, sz);
                 }
             }
@@ -428,14 +428,14 @@ pub(crate) unsafe fn storage_probe(
             print_str(b" read=");
             print_u64(got as u64);
             print_str(b"\n");
-            if got == want && sz > 0 {
+            if nt_fs::published_file_size(sz, cap, got).is_some() {
                 core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x94) as *mut u32, sz);
             }
         }
         // The real ReactOS SYSTEM registry hive (::ROSSYS.HIV, regf) into HIVEBUF; report its
         // size at STORAGE_SHARED+0x38 so the executive can nt-hive-regf-parse it for smss.
         if let Some((c, sz, _)) =
-            open_or_path!(b"reactos\\system32\\config\\system", b"ROSSYS  HIV")
+            open_or_path!(crate::installed_layout::CONFIG_SYSTEM, b"ROSSYS  HIV")
         {
             let cap = (HIVEBUF_FRAMES * 0x1000) as u32;
             let want = if sz < cap { sz } else { cap };
@@ -445,7 +445,7 @@ pub(crate) unsafe fn storage_probe(
             print_str(b" read=");
             print_u64(got as u64);
             print_str(b"\n");
-            if got == want && sz > 0 {
+            if nt_fs::published_file_size(sz, cap, got).is_some() {
                 core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x38) as *mut u32, sz);
             }
         }
@@ -457,21 +457,21 @@ pub(crate) unsafe fn storage_probe(
         // mount them with nt-hive-regf at \Registry\Machine\{SECURITY,SAM,SOFTWARE}.
         for (path, short, dest, cap_frames, off) in [
             (
-                b"reactos\\system32\\config\\security".as_slice(),
+                crate::installed_layout::CONFIG_SECURITY,
                 b"SECURITY   ",
                 SECHIVEBUF_VADDR,
                 SECHIVEBUF_FRAMES,
                 0x98u64,
             ),
             (
-                b"reactos\\system32\\config\\sam".as_slice(),
+                crate::installed_layout::CONFIG_SAM,
                 b"SAM        ",
                 SAMHIVEBUF_VADDR,
                 SAMHIVEBUF_FRAMES,
                 0x9Cu64,
             ),
             (
-                b"reactos\\system32\\config\\software".as_slice(),
+                crate::installed_layout::CONFIG_SOFTWARE,
                 b"SOFTWARE   ",
                 SWHIVEBUF_VADDR,
                 SWHIVEBUF_FRAMES,
@@ -480,7 +480,7 @@ pub(crate) unsafe fn storage_probe(
             // The DEFAULT hive — HKEY_USERS\.DEFAULT's backing store AND the file setup copies to
             // become a new user's ntuser.dat. Size reported at STORAGE_SHARED+0xAC.
             (
-                b"reactos\\system32\\config\\default".as_slice(),
+                crate::installed_layout::CONFIG_DEFAULT,
                 b"DEFAULT    ",
                 DEFHIVEBUF_VADDR,
                 DEFHIVEBUF_FRAMES,
@@ -498,7 +498,7 @@ pub(crate) unsafe fn storage_probe(
                 print_str(b" read=");
                 print_u64(got as u64);
                 print_str(b"\n");
-                if got == want && sz > 0 {
+                if nt_fs::published_file_size(sz, cap, got).is_some() {
                     core::ptr::write_volatile((STORAGE_SHARED_VADDR + off) as *mut u32, sz);
                 }
             }

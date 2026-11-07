@@ -9,8 +9,8 @@ fn hosted_io_port_fault_grant_retains_same_instance_controller_authority() {
         .find("pub(crate) unsafe fn hosted_io_port_fault_grant(")
         .expect("native I/O-port GP grant selector");
     let end = source[start..]
-        .find("\npub(crate) unsafe fn refresh_hosted_resource_state_for_shared(")
-        .expect("next native function");
+        .find("\n}\n")
+        .expect("native grant selector closing brace") + 2;
     let selector = &source[start..start + end];
     syn::parse_str::<syn::ItemFn>(selector).expect("native grant selector is a complete function");
     let range_start = source

@@ -8,6 +8,10 @@ use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_component_suspension::peer_registry::PeerRoute;
 use nt_io_manager::retained_query_path_forward::SourceIrpTicket;
 use nt_io_manager::source_irp_ledger::SourceIrpAllocation;
+use nt_io_manager::source_completion_preparation::{
+    admit_existing, ExistingLanePhase, ExistingLanePreparation,
+};
+use nt_component_suspension::{NestedRestoreChain, NestedRestoreResultKey};
 
 const LABEL: u64 = 0x7bc;
 const SELECTOR: u64 = u64::MAX - LABEL;
@@ -29,6 +33,7 @@ enum Phase {
     Prepared,
     Entered,
     Suspended,
+    NestedRestore,
     Completed,
     Uncertain,
     Retiring,
@@ -50,6 +55,21 @@ struct SourceCompletionLane {
     pump: Option<crate::spawn_hosts::PumpResult>,
     dispatch: Option<nt_component_suspension::LaneDispatchIdentity>,
     startup_dispatch: Option<nt_component_suspension::LaneDispatchIdentity>,
+    nested_restore: Option<SourcePendingRestore>,
+}
+
+#[derive(Clone, Copy)]
+enum SourceResumeResult {
+    Pump(crate::spawn_hosts::PumpResult),
+    NotReady,
+    Failed,
+}
+
+struct SourcePendingRestore {
+    ticket: runtime::nested::NestedRestoreTicket,
+    key: NestedRestoreResultKey,
+    chain: NestedRestoreChain<SourceResumeResult>,
+    retryable: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -62,12 +82,15 @@ pub(super) enum SourceCompletionDispatch {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum SourceCompletionPreparation {
+    InProgress,
     Ready,
     KnownRejected(u32),
     RetainedUncertain,
 }
 
 static mut LANES: Vec<SourceCompletionLane> = Vec::new();
+static STARTUP_FAILURE_TRACE_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 unsafe fn row_for(instance_index: usize, command: SourceCompletionCommand) -> Option<usize> {
     let inst = instance(instance_index)?;
@@ -163,31 +186,40 @@ pub(super) unsafe fn preparation_ready(
     instance_index: usize,
     command: SourceCompletionCommand,
 ) -> bool {
-    if !command_is_current(instance_index, command) {
-        return false;
-    }
-    match row_for(instance_index, command) {
-        Some(_) => ready_for_source(instance_index, command),
-        None => true,
-    }
+    let phase = row_for(instance_index, command).map(|index| {
+        match (&*core::ptr::addr_of!(LANES))[index].phase {
+            Phase::Preparing => ExistingLanePhase::Preparing,
+            Phase::Prepared => ExistingLanePhase::Prepared,
+            _ => ExistingLanePhase::Other,
+        }
+    });
+    nt_io_manager::source_completion_preparation::nested_source_preparation_ready(
+        phase,
+        command_is_current(instance_index, command),
+        matches!(phase, Some(ExistingLanePhase::Prepared))
+            && ready_for_source(instance_index, command),
+    )
 }
 
 pub(super) unsafe fn prepare(
     instance_index: usize,
     command: SourceCompletionCommand,
 ) -> SourceCompletionPreparation {
-    use SourceCompletionPreparation::{KnownRejected, Ready, RetainedUncertain};
+    use SourceCompletionPreparation::{InProgress, KnownRejected, Ready, RetainedUncertain};
     // An old-domain construction remains owned even after current admission has disappeared.
     if let Some(index) = (&*core::ptr::addr_of!(LANES))
         .iter()
         .position(|row| row.instance == instance_index && row.command == Some(command))
     {
-        return if (&*core::ptr::addr_of!(LANES))[index].phase == Phase::Prepared
-            && command_is_current(instance_index, command)
-        {
-            Ready
-        } else {
-            RetainedUncertain
+        let phase = match (&*core::ptr::addr_of!(LANES))[index].phase {
+            Phase::Preparing => ExistingLanePhase::Preparing,
+            Phase::Prepared => ExistingLanePhase::Prepared,
+            _ => ExistingLanePhase::Other,
+        };
+        return match admit_existing(phase, command_is_current(instance_index, command)) {
+            ExistingLanePreparation::InProgress => InProgress,
+            ExistingLanePreparation::Ready => Ready,
+            ExistingLanePreparation::RetainedUncertain => RetainedUncertain,
         };
     }
     let domain = command.allocation.domain;
@@ -234,6 +266,7 @@ pub(super) unsafe fn prepare(
             pump: None,
             dispatch: None,
             startup_dispatch: None,
+            nested_restore: None,
         });
         index
     };
@@ -278,6 +311,7 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
         shared,
         Some(HostedWorkerSharedBankSpec {
             offset: BANK_OFFSET,
+            frames: 1,
             arg_offset: None,
         }),
     )
@@ -351,6 +385,27 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
                 handle,
             ])
     {
+        if STARTUP_FAILURE_TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+            print_str(b"[source-completion-startup] ordinal/completed/status/flags/wall-label/receipt=");
+            print_u64(ordinal);
+            print_str(b"/");
+            print_u64(pump.completed as u64);
+            print_str(b"/");
+            print_hex(pump.status as u32);
+            print_str(b"/");
+            let flags = (pump.scheduler_yielded as u64)
+                | ((pump.receive_yield.is_some() as u64) << 1)
+                | ((pump.service_wait_yield.is_some() as u64) << 2)
+                | ((pump.callback_suspended as u64) << 3)
+                | ((pump.provider_wait_suspended as u64) << 4)
+                | ((pump.lpc_wait_suspended as u64) << 5);
+            print_hex(flags as u32);
+            print_str(b"/");
+            print_u64(pump.wall_label);
+            print_str(b"/");
+            print_u64(pump.startup_stack_receipt.is_some() as u64);
+            print_str(b"\n");
+        }
         return Err(STATUS_INVALID_HANDLE as u32);
     }
     (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Ready;
@@ -539,6 +594,15 @@ pub(super) unsafe fn dispatch(
     if phase == Phase::Suspended {
         return SourceCompletionDispatch::Suspended;
     }
+    if phase == Phase::NestedRestore {
+        return if (&*core::ptr::addr_of!(LANES))[index]
+            .nested_restore.as_ref().is_some_and(|pending| pending.retryable)
+        {
+            SourceCompletionDispatch::Suspended
+        } else {
+            SourceCompletionDispatch::Uncertain
+        };
+    }
     if phase == Phase::Entered || phase == Phase::Uncertain {
         return SourceCompletionDispatch::Uncertain;
     }
@@ -574,8 +638,18 @@ pub(super) unsafe fn dispatch(
         row.command = Some(command);
         row.phase = Phase::Entered;
     }
-    let pump = component_scheduler::hosted_component_pump_with_caller(&channel, caller);
-    finish_slice(index, pump)
+    match component_scheduler::hosted_component_pump_with_caller_retained(&channel, caller) {
+        component_scheduler::HostedPumpRestore::Restored(pump) => finish_slice(index, pump),
+        component_scheduler::HostedPumpRestore::Retained {
+            result, key, ticket, retryable,
+        } => retain_parent_result(index, ticket, key, SourceResumeResult::Pump(result), retryable),
+        component_scheduler::HostedPumpRestore::Unattributed(result) => {
+            let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+            row.pump = Some(result);
+            row.phase = Phase::Uncertain;
+            SourceCompletionDispatch::Uncertain
+        }
+    }
 }
 
 unsafe fn finish_slice(
@@ -615,6 +689,86 @@ unsafe fn finish_slice(
     SourceCompletionDispatch::Completed(outcome)
 }
 
+unsafe fn finish_resume_result(index: usize, result: SourceResumeResult) -> SourceCompletionDispatch {
+    match result {
+        SourceResumeResult::Pump(pump) => finish_slice(index, pump),
+        SourceResumeResult::NotReady => {
+            (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Suspended;
+            SourceCompletionDispatch::Suspended
+        }
+        SourceResumeResult::Failed => {
+            (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;
+            SourceCompletionDispatch::Uncertain
+        }
+    }
+}
+
+unsafe fn retain_parent_result(
+    index: usize,
+    ticket: runtime::nested::NestedRestoreTicket,
+    key: NestedRestoreResultKey,
+    result: SourceResumeResult,
+    retryable: bool,
+) -> SourceCompletionDispatch {
+    let Ok(mut chain) = NestedRestoreChain::retain(key, None, result) else {
+        (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;
+        return SourceCompletionDispatch::Uncertain;
+    };
+    if chain.begin_inner(key).is_err() {
+        (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;
+        return SourceCompletionDispatch::Uncertain;
+    }
+    if retryable {
+        let _ = chain.refuse_inner_no_effects(key);
+    } else {
+        let _ = chain.quarantine_inner(key);
+    }
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    row.nested_restore = Some(SourcePendingRestore { ticket, key, chain, retryable });
+    row.phase = Phase::NestedRestore;
+    if retryable { SourceCompletionDispatch::Suspended } else { SourceCompletionDispatch::Uncertain }
+}
+
+unsafe fn retry_parent_restore(index: usize) -> SourceCompletionDispatch {
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    let Some(pending) = row.nested_restore.as_mut() else {
+        row.phase = Phase::Uncertain;
+        return SourceCompletionDispatch::Uncertain;
+    };
+    if !pending.retryable || pending.chain.begin_inner(pending.key).is_err() {
+        row.phase = Phase::Uncertain;
+        return SourceCompletionDispatch::Uncertain;
+    }
+    let ticket = pending.ticket;
+    let key = pending.key;
+    if runtime::nested::restore_pending_ticket(ticket).is_err() {
+        let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+        let pending = row.nested_restore.as_mut().unwrap();
+        if runtime::nested::pending_ticket(ticket) {
+            let _ = pending.chain.refuse_inner_no_effects(key);
+            return SourceCompletionDispatch::Suspended;
+        }
+        let _ = pending.chain.quarantine_inner(key);
+        pending.retryable = false;
+        return SourceCompletionDispatch::Uncertain;
+    }
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    let mut pending = row.nested_restore.take().unwrap();
+    if pending.chain.acknowledge_inner(key).is_err() {
+        row.nested_restore = Some(pending);
+        row.phase = Phase::Uncertain;
+        return SourceCompletionDispatch::Uncertain;
+    }
+    match pending.chain.take(key, None) {
+        Ok(result) => finish_resume_result(index, result),
+        Err(_) => {
+            row.nested_restore = Some(pending);
+            row.phase = Phase::Uncertain;
+            SourceCompletionDispatch::Uncertain
+        }
+    }
+}
+
 pub(super) unsafe fn acknowledge(instance_index: usize, command: SourceCompletionCommand) -> bool {
     let Some(index) = row_for(instance_index, command) else {
         return false;
@@ -627,6 +781,7 @@ pub(super) unsafe fn acknowledge(instance_index: usize, command: SourceCompletio
     row.outcome = None;
     row.pump = None;
     row.dispatch = None;
+    row.nested_restore = None;
     row.phase = Phase::Ready;
     true
 }
@@ -659,6 +814,11 @@ pub(super) unsafe fn continuation_ready(
         return false;
     };
     let row = &(&*core::ptr::addr_of!(LANES))[index];
+    if row.phase == Phase::NestedRestore {
+        return row.nested_restore.as_ref().is_some_and(|pending| {
+            pending.retryable && runtime::nested::pending_ticket(pending.ticket)
+        });
+    }
     if row.phase != Phase::Suspended {
         return false;
     }
@@ -685,6 +845,9 @@ pub(super) unsafe fn poll(
     };
     if phase == Phase::Completed {
         return SourceCompletionDispatch::Completed(outcome.unwrap());
+    }
+    if phase == Phase::NestedRestore {
+        return retry_parent_restore(index);
     }
     if phase == Phase::Uncertain || phase == Phase::Entered {
         return SourceCompletionDispatch::Uncertain;
@@ -721,7 +884,8 @@ pub(super) unsafe fn poll(
         while pump.scheduler_yielded {
             scope.service_irq_yield(channel.shared_va);
             channel.reply_cap = runtime::current_reply(route).map_err(|_| ())?;
-            pump = crate::spawn_hosts::component_pump_continue_receive(&channel, &pump)
+            pump = crate::spawn_hosts::component_pump_continue_receive_after_scheduler_service(
+                &channel, &pump)
                 .map_err(|_| ())?;
         }
         if pump.completed {
@@ -730,18 +894,59 @@ pub(super) unsafe fn poll(
         }
         Ok(Some(pump))
     })();
-    if runtime::nested::restore(&mut parent).is_err() {
+    let result = match resumed {
+        Ok(Some(pump)) => SourceResumeResult::Pump(pump),
+        Ok(None) => SourceResumeResult::NotReady,
+        Err(()) => SourceResumeResult::Failed,
+    };
+    let Some(handle) = parent.as_ref() else {
+        return finish_resume_result(index, result);
+    };
+    let ticket = handle.ticket();
+    let Some(key) = runtime::nested::result_key(handle) else {
+        let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+        if let SourceResumeResult::Pump(pump) = result { row.pump = Some(pump); }
+        row.phase = Phase::Uncertain;
+        return SourceCompletionDispatch::Uncertain;
+    };
+    let Ok(mut chain) = NestedRestoreChain::retain(key, None, result) else {
+        (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;
+        return SourceCompletionDispatch::Uncertain;
+    };
+    if chain.begin_inner(key).is_err() {
         (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;
         return SourceCompletionDispatch::Uncertain;
     }
-    match resumed {
-        Ok(Some(pump)) => finish_slice(index, pump),
-        Ok(None) => {
-            (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Suspended;
-            SourceCompletionDispatch::Suspended
+    // Own the result and exact retry selector before entering the physical restore.
+    {
+        let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+        row.nested_restore = Some(SourcePendingRestore { ticket, key, chain, retryable: false });
+        row.phase = Phase::NestedRestore;
+    }
+    if runtime::nested::restore(&mut parent).is_err() {
+        let retryable = runtime::nested::pending_ticket(ticket);
+        let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+        let pending = row.nested_restore.as_mut().unwrap();
+        pending.retryable = retryable;
+        if retryable {
+            let _ = pending.chain.refuse_inner_no_effects(key);
+            return SourceCompletionDispatch::Suspended;
         }
-        Err(()) => {
-            (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;
+        let _ = pending.chain.quarantine_inner(key);
+        return SourceCompletionDispatch::Uncertain;
+    }
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    let mut pending = row.nested_restore.take().unwrap();
+    if pending.chain.acknowledge_inner(key).is_err() {
+        row.nested_restore = Some(pending);
+        row.phase = Phase::Uncertain;
+        return SourceCompletionDispatch::Uncertain;
+    }
+    match pending.chain.take(key, None) {
+        Ok(result) => finish_resume_result(index, result),
+        Err(_) => {
+            row.nested_restore = Some(pending);
+            row.phase = Phase::Uncertain;
             SourceCompletionDispatch::Uncertain
         }
     }

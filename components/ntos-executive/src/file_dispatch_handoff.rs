@@ -11,6 +11,12 @@ pub(super) struct PublishedFileIo {
 }
 
 impl PublishedFileIo {
+    /// Capture only the exact published mounted CREATE while this outer caller still owns its
+    /// parked Reply. Periodic census reads the resulting atomics without borrowing the manager.
+    pub(super) unsafe fn trace_parked_mounted_create(&self) {
+        super::mounted_create_owner_trace::park_exact(self.identity, self.irp_id);
+    }
+
     pub(super) unsafe fn still_waiting(&self) -> bool {
         self.wait_for_completion
             && thread_wait_state_badge_parked(self.badge)
@@ -77,7 +83,7 @@ pub(super) unsafe fn before_post_action(
         // calls attach their reply in this same commit, never exposing an unarmed delivery row.
         let identity = reservation.identity();
         let local_terminal = pending.owned_terminal_result().is_some()
-            || matches!(pending.operation, nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(_));
+            || pending.operation.is_owned_mode_uncommitted();
         if let Some(event) = nt_handler.current_file_transfer_event.take() {
             assert!(pending.transfer_event.is_none());
             assert!(pending.event_obj_idx == u64::MAX || pending.event_obj_idx == event.native_identity);
@@ -104,6 +110,9 @@ pub(super) unsafe fn before_post_action(
             // Publish Waiting before any reentrant completion can make this thread Ready.
             thread_wait_state_park_badge_waiting(nt_handler, pending.badge);
         }
+        super::pending_pipe_read_trace::parked(
+            nt_handler, identity, pending, wait_for_completion,
+        );
         Some(PublishedFileIo {
             identity,
             irp_id: pending.irp_id,

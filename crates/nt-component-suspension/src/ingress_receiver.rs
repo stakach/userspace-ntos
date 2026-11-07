@@ -337,6 +337,18 @@ impl<M> IngressReceiver<M> {
         self.receive.as_ref().map(ReservedIngressReceive::phase)
     }
 
+    /// Check the retained receive against its original execution epoch and physical reservation
+    /// before retrying any read-only capture or classification step.
+    pub fn recovery_for_owner<C, R, T>(
+        &self,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        owner: IngressExecutionOwner,
+    ) -> Result<ReservedReceivePhase, ReservedReceiveError<Infallible>> {
+        self.receive.as_ref()
+            .ok_or(ReservedReceiveError::InvalidPhase)?
+            .recovery_for_owner(&self.store, &self.ingress, lanes, owner)
+    }
+
     pub fn begin_receive<C, R, T>(
         &mut self,
         lanes: &ComponentSuspensionLanes<C, R, T>,

@@ -128,6 +128,68 @@ pub fn validate_sbcs_code_page(
     Some(layout)
 }
 
+/// Borrow the validated installed ANSI SBCS page used by kernel RTL imports.
+///
+/// The page must be the complete CP1252 image, including its reverse table. Checking both
+/// directions of the Euro mapping distinguishes the installed table from a merely plausible
+/// header. Callers must keep the backing mapped pages alive and immutable while using this view.
+#[derive(Clone, Copy)]
+pub struct ValidatedAnsiSbcs<'a> {
+    byte_to_unicode: &'a [u16],
+}
+
+impl<'a> ValidatedAnsiSbcs<'a> {
+    pub fn from_cp1252_words(words: &'a [u16]) -> Option<Self> {
+        let layout = validate_sbcs_code_page(words, ANSI_CODE_PAGE)?;
+        let byte_to_unicode = words.get(layout.multi_byte_index..layout.multi_byte_index + 256)?;
+        if byte_to_unicode[0x80] != 0x20ac {
+            return None;
+        }
+        let wide_byte_offset = layout.wide_char_index.checked_mul(2)?.checked_add(0x20ac)?;
+        let wide_word = *words.get(wide_byte_offset / 2)?;
+        let euro_to_byte = if wide_byte_offset & 1 == 0 {
+            wide_word as u8
+        } else {
+            (wide_word >> 8) as u8
+        };
+        if euro_to_byte != 0x80 {
+            return None;
+        }
+        Some(Self { byte_to_unicode })
+    }
+
+    /// Decode one ANSI byte. The native ABI adapter advances its source pointer after this read.
+    pub fn ansi_char_to_unicode(&self, byte: u8) -> u16 {
+        self.byte_to_unicode[byte as usize]
+    }
+
+    /// Return UTF-16 bytes written, bounded by the caller's destination byte capacity.
+    pub fn multibyte_to_unicode_n(
+        &self,
+        source: &[u8],
+        destination_capacity_bytes: u32,
+        destination: &mut [u16],
+    ) -> Option<u32> {
+        let units = custom_cp_to_unicode_into(
+            self.byte_to_unicode,
+            destination_capacity_bytes as usize,
+            source,
+            destination,
+        )?;
+        u32::try_from(units.checked_mul(2)?).ok()
+    }
+
+    /// CP1252 is a single-byte page, so counted source bytes expand to twice as many UTF-16 bytes.
+    pub fn multibyte_to_unicode_size(&self, source_bytes: u32) -> Option<u32> {
+        source_bytes.checked_mul(2)
+    }
+
+    /// CP1252 encodes one byte per complete UTF-16 code unit, including default substitutions.
+    pub fn unicode_to_multibyte_size(&self, source_bytes: u32) -> u32 {
+        source_bytes / 2
+    }
+}
+
 /// Validate the native `l_intl.nls` header and every reachable three-level lookup.
 pub fn validate_case_table(table: &[u16]) -> Option<CaseTableLayout> {
     table.get(1)?;
@@ -177,6 +239,97 @@ pub fn custom_cp_to_unicode_into(
         .min(output.len());
     for (dst, byte) in output.iter_mut().zip(custom.iter()).take(count) {
         *dst = multi_byte_table[*byte as usize];
+    }
+    Some(count)
+}
+
+/// Required UTF-16 output bytes for a counted multibyte string.
+///
+/// `lead_byte_info` is the native 256-word lead-byte table for DBCS, or `None`
+/// for SBCS. A trailing lead byte consumes one replacement character, matching
+/// the RTL sizing pass. Malformed tables and overflowing output sizes fail.
+pub fn multibyte_to_unicode_size(bytes: &[u8], lead_byte_info: Option<&[u16]>) -> Option<u32> {
+    if let Some(leads) = lead_byte_info {
+        if leads.len() < 256 { return None; }
+    }
+    let mut source = 0usize;
+    let mut units = 0usize;
+    while source < bytes.len() {
+        let byte = bytes[source];
+        source += 1;
+        if let Some(leads) = lead_byte_info {
+            if byte >= 0x80 && leads[byte as usize] != 0 && source < bytes.len() {
+                source += 1;
+            }
+        }
+        units += 1;
+    }
+    units.checked_mul(2).and_then(|size| u32::try_from(size).ok())
+}
+
+/// Progress of one bounded Unicode-to-DBCS conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DbcsConversion {
+    pub bytes_written: usize,
+    pub units_consumed: usize,
+}
+
+/// Convert UTF-16 through the native 65,536-word Unicode-to-DBCS table.
+///
+/// An output buffer with one byte left never receives half of a two-byte
+/// character. ASCII uses the direct single-byte mapping, as ntdll does.
+pub fn unicode_to_multibyte_dbcs_mapped_into<F>(
+    unicode: &[u16],
+    unicode_to_dbcs: &[u16],
+    output: &mut [u8],
+    map: F,
+) -> Option<DbcsConversion>
+where
+    F: Fn(u16) -> u16,
+{
+    if unicode_to_dbcs.len() < 0x1_0000 { return None; }
+    let mut progress = DbcsConversion { bytes_written: 0, units_consumed: 0 };
+    for &source in unicode {
+        let unit = map(source);
+        let encoded = if unit < 0x80 { unit } else { unicode_to_dbcs[unit as usize] };
+        let width = if encoded >> 8 != 0 { 2 } else { 1 };
+        if output.len() - progress.bytes_written < width { break; }
+        if width == 2 {
+            output[progress.bytes_written] = (encoded >> 8) as u8;
+            progress.bytes_written += 1;
+        }
+        output[progress.bytes_written] = encoded as u8;
+        progress.bytes_written += 1;
+        progress.units_consumed += 1;
+    }
+    Some(progress)
+}
+
+/// Byte count for the win32k `RtlUnicodeToMultiByteN` import's DBCS core.
+pub fn unicode_to_multibyte_dbcs_into(
+    unicode: &[u16],
+    unicode_to_dbcs: &[u16],
+    output: &mut [u8],
+) -> Option<usize> {
+    unicode_to_multibyte_dbcs_mapped_into(unicode, unicode_to_dbcs, output, |unit| unit)
+        .map(|progress| progress.bytes_written)
+}
+
+/// Required byte count for a counted UTF-16 string encoded through a DBCS table.
+pub fn unicode_to_multibyte_dbcs_size<F>(
+    unicode: &[u16],
+    unicode_to_dbcs: &[u16],
+    map: F,
+) -> Option<u32>
+where
+    F: Fn(u16) -> u16,
+{
+    if unicode_to_dbcs.len() < 0x1_0000 { return None; }
+    let mut count = 0u32;
+    for &source in unicode {
+        let unit = map(source);
+        let encoded = if unit < 0x80 { unit } else { unicode_to_dbcs[unit as usize] };
+        count = count.checked_add(if encoded >> 8 != 0 { 2 } else { 1 })?;
     }
     Some(count)
 }

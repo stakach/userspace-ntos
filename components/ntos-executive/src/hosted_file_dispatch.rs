@@ -33,8 +33,32 @@ pub(super) fn invoke(
             status: nt_status::NtStatus::INVALID_PARAMETER,
         });
     }
-    let (input, output) = invocation.buffers_mut().split();
-    let result = execute(instance_index, Some(caller), &projection, input, output);
+    let trace_connect = capture == ExternalFileIrpOutputCapture::MethodNeitherInput;
+    if trace_connect {
+        trace_port_connect_execute(0, projection.irp_id, projection.device_id);
+    }
+    let result = {
+        let (input, output) = invocation.buffers_mut().split();
+        if let IoParameters::Scsi(parameters) = &projection.parameters {
+            match nt_io_manager::scsi_srb_wire::encode_scsi_dispatch_input(
+                parameters, projection.irp_id, input,
+            ) {
+                Ok(packet) => execute_with_capture(instance_index, Some(caller), &projection, &packet, output, capture),
+                Err(error) => HostedIrpTransportResult::NotDispatched {
+                    status: match error {
+                        nt_io_manager::scsi_srb_wire::ScsiWireError::NoCapacity =>
+                            nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+                        _ => nt_status::NtStatus::INVALID_PARAMETER,
+                    },
+                },
+            }
+        } else {
+            execute_with_capture(instance_index, Some(caller), &projection, input, output, capture)
+        }
+    };
+    if trace_connect {
+        trace_port_connect_execute(1, projection.irp_id, projection.device_id);
+    }
     let outcome = match result {
         HostedIrpTransportResult::NotDispatched { status } => {
             ExternalFileIrpOutcome::NotEntered { status }
@@ -112,6 +136,18 @@ pub(super) fn invoke(
         }
     };
     invocation.returned(outcome)
+}
+
+fn trace_port_connect_execute(stage: u64, irp: nt_io_manager::IrpId, device: nt_io_manager::DeviceId) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 16 { return; }
+    print_str(b"[port-connect-execute] stage/irp/device=");
+    print_u64(stage);
+    print_str(b"/");
+    print_hex_u64(irp.raw());
+    print_str(b"/");
+    print_hex_u64(device.raw());
+    print_str(b"\n");
 }
 
 pub(super) fn acknowledge(
@@ -399,18 +435,53 @@ pub(super) fn execute(
     input: &[u8],
     output: &mut [u8],
 ) -> HostedIrpTransportResult {
-    let request =
+    execute_with_capture(instance_index, caller, projection, input, output,
+        ExternalFileIrpOutputCapture::Information)
+}
+
+fn execute_with_capture(
+    instance_index: usize,
+    caller: Option<nt_process::native_handle::NativeHandleCaller>,
+    projection: &IrpProjection,
+    input: &[u8],
+    output: &mut [u8],
+    capture: ExternalFileIrpOutputCapture,
+) -> HostedIrpTransportResult {
+    let mut request =
         match hosted_irp_dispatch_request(instance_index, projection, input.len(), output.len()) {
             Ok(request) => request,
             Err(status) => return HostedIrpTransportResult::NotDispatched { status },
         };
+    if capture == ExternalFileIrpOutputCapture::BufferedDeviceControlCapacity {
+        request._reserved0 = nt_io_abi::IRP_DISPATCH_BUFFERED_OUTPUT_CAPACITY;
+        if !nt_io_abi::valid_buffered_output_capacity_dispatch(&request) {
+            return HostedIrpTransportResult::NotDispatched {
+                status: nt_status::NtStatus::INVALID_PARAMETER,
+            };
+        }
+    }
     let Some((route_instance, route_inst, device_object)) =
-        hosted_driver_device_route_by_device_id(projection.device_id.raw())
+        hosted_driver_device_route_by_device_id_for_irp(
+            projection.device_id.raw(), Some(projection.irp_id))
             .filter(|(index, _, _)| *index == instance_index)
     else {
         return HostedIrpTransportResult::NotDispatched {
             status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         };
+    };
+    let scsi_data = match &projection.parameters {
+        IoParameters::Scsi(parameters) if parameters.data_length != 0 => {
+            if let Err(status) = unsafe {
+                hosted_scsi_dma_reservation::reserve_for_dispatch(
+                    &request, parameters.route.provider_pdo,
+                    u64::from(parameters.data_length),
+                )
+            } {
+                return HostedIrpTransportResult::NotDispatched { status };
+            }
+            true
+        }
+        _ => false,
     };
     let result = unsafe {
         dispatch_irp_for_instance_exact(
@@ -429,6 +500,20 @@ pub(super) fn execute(
             caller,
         )
     };
+    if scsi_data {
+        match result {
+            Some(HostedIrpTransportResult::NotDispatched { .. }) => {
+                if unsafe { hosted_scsi_dma_reservation::release_after_ack(projection.irp_id.raw()) }
+                    .is_err()
+                {
+                    unsafe { hosted_scsi_dma_reservation::quarantine(projection.irp_id.raw()) };
+                }
+            }
+            None | Some(HostedIrpTransportResult::Indeterminate { .. }) =>
+                unsafe { hosted_scsi_dma_reservation::quarantine(projection.irp_id.raw()) },
+            Some(HostedIrpTransportResult::Returned { .. }) => {}
+        }
+    }
     if result.is_none() {
         print_str(b"[hosted-file] exact dispatch unavailable instance/device/irp=");
         print_u64(instance_index as u64);

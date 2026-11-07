@@ -3,8 +3,10 @@
 
 use crate::{
     encode_hive_mutation_journal, Backend, ConfigClient, SystemHiveMount, SystemHiveMutation,
-    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
+    STATUS_DEVICE_BUSY, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
 };
+
+const STATUS_INVALID_HANDLE: i32 = 0xC000_0008u32 as i32;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use nt_config_abi::mutation_begin::{disposition, operation, Reply, Request, MAX_SLOTS};
@@ -535,6 +537,91 @@ impl CmMutationBeginAttempts {
         self.slots[attempt.identity.slot as usize].active = false;
         attempt.released = true;
         Ok((status, continuation))
+    }
+
+    pub fn retry_acknowledged_busy<C>(
+        &mut self,
+        attempt: &mut CmMutationBeginAttempt<C>,
+    ) -> Result<(), i32> {
+        self.validate(attempt)?;
+        if attempt.inflight.is_some()
+            || !attempt.acknowledged
+            || attempt.outcome != Some(STATUS_DEVICE_BUSY)
+            || attempt.mutation_token != Some(0)
+            || attempt.continuation.is_none()
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let next = attempt.identity.sequence.checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let slot = &mut self.slots[attempt.identity.slot as usize];
+        slot.sequence = next;
+        attempt.identity.sequence = next;
+        attempt.epoch = 0;
+        attempt.submitted = false;
+        attempt.acknowledged = false;
+        attempt.outcome = None;
+        attempt.mutation_token = None;
+        Ok(())
+    }
+
+    /// Rebase an exact, acknowledged BEGIN that CM rejected before acquiring a writer.
+    /// A revision mismatch has no mutation token and therefore cannot have entered upload,
+    /// preparation, durable I/O, or publication. The caller must separately revalidate the
+    /// retained Key or parent identity before passing a newer observation of the same mount.
+    pub fn retry_acknowledged_revision<C>(
+        &mut self,
+        attempt: &mut CmMutationBeginAttempt<C>,
+        mount: SystemHiveMount,
+        current_generation: u64,
+    ) -> Result<(), i32> {
+        self.validate(attempt)?;
+        if attempt.inflight.is_some()
+            || !attempt.acknowledged
+            || attempt.outcome != Some(0xC000_0059u32 as i32)
+            || attempt.mutation_token != Some(0)
+            || attempt.continuation.is_none()
+            || current_generation <= attempt.expected_generation
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        if mount != attempt.mount {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let next = attempt.identity.sequence.checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let slot = &mut self.slots[attempt.identity.slot as usize];
+        slot.sequence = next;
+        attempt.identity.sequence = next;
+        attempt.expected_generation = current_generation;
+        attempt.epoch = 0;
+        attempt.submitted = false;
+        attempt.acknowledged = false;
+        attempt.outcome = None;
+        attempt.mutation_token = None;
+        Ok(())
+    }
+
+    /// Release a caller before BEGIN has entered CM. A QUERY may have granted the persistent
+    /// requester bank, but no writer outcome exists and no server slot needs acknowledgement.
+    pub fn cancel_unsubmitted<C>(
+        &mut self,
+        attempt: &mut CmMutationBeginAttempt<C>,
+    ) -> Result<C, i32> {
+        self.validate(attempt)?;
+        if attempt.inflight.is_some()
+            || attempt.submitted
+            || attempt.acknowledged
+            || attempt.outcome.is_some()
+            || attempt.mutation_token.is_some()
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let continuation = attempt.continuation.take().ok_or(STATUS_INVALID_PARAMETER)?;
+        attempt.journal.clear();
+        self.slots[attempt.identity.slot as usize].active = false;
+        attempt.released = true;
+        Ok(continuation)
     }
 }
 

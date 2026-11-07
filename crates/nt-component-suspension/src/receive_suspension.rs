@@ -32,9 +32,12 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         if frame.owner != owner
             || match completed_key.kind {
                 SuspensionKind::Receive => !frame.receive.is_some_and(|admission| admission.restored),
-                SuspensionKind::ServiceWait | SuspensionKind::ProviderWait | SuspensionKind::LpcRequest => frame.receive.is_some(),
+                SuspensionKind::ServiceWait | SuspensionKind::ProviderWait
+                    | SuspensionKind::LpcRequest | SuspensionKind::RootMaintenance => frame.receive.is_some(),
+                SuspensionKind::NestedRestore => true,
             }
-            || !matches!(frame.phase, SuspensionPhase::Resuming { .. })
+            || !matches!(frame.phase, SuspensionPhase::Resuming { .. }
+                | SuspensionPhase::MaintenanceResuming { .. })
         {
             return Err(LaneError::InvalidPhase);
         }
@@ -98,7 +101,8 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             return Err((LaneError::Suspension(SuspensionError::NotTop), continuation));
         }
         if frame.owner != owner
-            || !matches!(frame.phase, SuspensionPhase::Resuming { .. })
+            || !matches!(frame.phase, SuspensionPhase::Resuming { .. }
+                | SuspensionPhase::MaintenanceResuming { .. })
             || admission_sequence <= frame.admission_sequence
         {
             return Err((LaneError::WrongBinding, continuation));
@@ -110,7 +114,8 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
                     && previous.scope.route() == scope.route()
                     && previous.scope.sequence() < scope.identity().sequence()
                     && previous.child != child => {}
-            (SuspensionKind::ServiceWait | SuspensionKind::ProviderWait | SuspensionKind::LpcRequest, None) => {}
+            (SuspensionKind::ServiceWait | SuspensionKind::ProviderWait
+                | SuspensionKind::LpcRequest | SuspensionKind::RootMaintenance, None) => {}
             _ => return Err((LaneError::WrongBinding, continuation)),
         }
         if lane.external_tokens.len() >= lane.external_tokens.capacity() {

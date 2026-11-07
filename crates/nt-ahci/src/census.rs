@@ -171,6 +171,200 @@ impl Default for CommandCensus {
     }
 }
 
+/// Physical Executive read source; the isolated storage host is excluded by its caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectReadSource {
+    Fat,
+    Snapshot,
+}
+
+/// Origin of a physical one-sector FAT read attempt. The final boot snapshot is quiescent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FatOneSectorCallsite {
+    FatLink,
+    Directory,
+    PathDirectory,
+    CheckedDirectory,
+    LegacyDirectory,
+    ShortDirectory,
+    FilePayload,
+    Other,
+}
+
+impl FatOneSectorCallsite {
+    const fn index(self) -> usize {
+        match self {
+            Self::FatLink => 0,
+            Self::Directory | Self::PathDirectory | Self::CheckedDirectory
+                | Self::LegacyDirectory | Self::ShortDirectory => 1,
+            Self::FilePayload => 2,
+            Self::Other => 3,
+        }
+    }
+
+    const fn directory_index(self) -> Option<usize> {
+        match self {
+            Self::PathDirectory => Some(0),
+            Self::CheckedDirectory => Some(1),
+            Self::LegacyDirectory => Some(2),
+            Self::ShortDirectory => Some(3),
+            Self::Directory => Some(4),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectReadBucket {
+    One,
+    TwoToEight,
+    NineToThirtySix,
+    OverThirtySix,
+}
+
+impl DirectReadBucket {
+    const fn for_sectors(sectors: u64) -> Self {
+        match sectors {
+            1 => Self::One,
+            2..=8 => Self::TwoToEight,
+            9..=36 => Self::NineToThirtySix,
+            _ => Self::OverThirtySix,
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::One => 0,
+            Self::TwoToEight => 1,
+            Self::NineToThirtySix => 2,
+            Self::OverThirtySix => 3,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DirectReadSnapshot {
+    pub commands: u64,
+    pub sectors: u64,
+}
+
+struct DirectReadCounters {
+    commands: AtomicU64,
+    sectors: AtomicU64,
+}
+
+impl DirectReadCounters {
+    const fn new() -> Self {
+        Self {
+            commands: AtomicU64::new(0),
+            sectors: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> DirectReadSnapshot {
+        DirectReadSnapshot {
+            commands: self.commands.load(Ordering::Relaxed),
+            sectors: self.sectors.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Bounded 2-source by 4-size diagnostic totals, sampled independently.
+/// Recording is observation only, not an I/O admission or completion receipt.
+pub struct DirectReadCensus {
+    fat: [DirectReadCounters; 4],
+    snapshot: [DirectReadCounters; 4],
+    fat_one_sector: [AtomicU64; 4],
+    fat_directory: [AtomicU64; 5],
+}
+
+impl DirectReadCensus {
+    pub const fn new() -> Self {
+        Self {
+            fat: [
+                DirectReadCounters::new(),
+                DirectReadCounters::new(),
+                DirectReadCounters::new(),
+                DirectReadCounters::new(),
+            ],
+            snapshot: [
+                DirectReadCounters::new(),
+                DirectReadCounters::new(),
+                DirectReadCounters::new(),
+                DirectReadCounters::new(),
+            ],
+            fat_one_sector: [const { AtomicU64::new(0) }; 4],
+            fat_directory: [const { AtomicU64::new(0) }; 5],
+        }
+    }
+
+    fn counters(&self, source: DirectReadSource, bucket: DirectReadBucket) -> &DirectReadCounters {
+        match source {
+            DirectReadSource::Fat => &self.fat[bucket.index()],
+            DirectReadSource::Snapshot => &self.snapshot[bucket.index()],
+        }
+    }
+
+    pub fn record(&self, source: DirectReadSource, sectors: u64) {
+        if sectors == 0 {
+            return;
+        }
+        if source == DirectReadSource::Fat {
+            self.record_fat(FatOneSectorCallsite::Other, sectors);
+            return;
+        }
+        let counters = self.counters(source, DirectReadBucket::for_sectors(sectors));
+        counters.commands.fetch_add(1, Ordering::Relaxed);
+        counters.sectors.fetch_add(sectors, Ordering::Relaxed);
+    }
+
+    pub fn record_fat(&self, callsite: FatOneSectorCallsite, sectors: u64) {
+        if sectors == 0 {
+            return;
+        }
+        if sectors == 1 {
+            self.fat_one_sector[callsite.index()].fetch_add(1, Ordering::Relaxed);
+            if let Some(index) = callsite.directory_index() {
+                self.fat_directory[index].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let counters = self.counters(DirectReadSource::Fat, DirectReadBucket::for_sectors(sectors));
+        counters.commands.fetch_add(1, Ordering::Relaxed);
+        counters.sectors.fetch_add(sectors, Ordering::Relaxed);
+    }
+
+    pub fn fat_one_sector_calls(&self, callsite: FatOneSectorCallsite) -> u64 {
+        self.fat_one_sector[callsite.index()].load(Ordering::Relaxed)
+    }
+
+    pub fn fat_directory_calls(&self, callsite: FatOneSectorCallsite) -> u64 {
+        callsite.directory_index().map_or(0, |index| self.fat_directory[index].load(Ordering::Relaxed))
+    }
+
+    pub fn fat_directory_total(&self) -> u64 {
+        self.fat_directory.iter().map(|count| count.load(Ordering::Relaxed)).sum()
+    }
+
+    /// Exact after the native-start Ready drain; concurrent snapshots are advisory only.
+    pub fn fat_one_sector_total(&self) -> u64 {
+        self.fat_one_sector.iter().map(|count| count.load(Ordering::Relaxed)).sum()
+    }
+
+    pub fn snapshot(
+        &self,
+        source: DirectReadSource,
+        bucket: DirectReadBucket,
+    ) -> DirectReadSnapshot {
+        self.counters(source, bucket).snapshot()
+    }
+}
+
+impl Default for DirectReadCensus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 #[path = "census_tests.rs"]
 mod tests;

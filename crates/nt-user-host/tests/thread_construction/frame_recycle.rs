@@ -14,6 +14,7 @@ fn checked_frame_publication_and_rejection_allocate_nothing_or_release_pending_r
         pinned: &[0],
         retype_bytes: &[4096],
         free_slots: &[],
+        free_membership: &[0],
         free_slot_count: 0,
         live_bytes: 4096,
     };

@@ -156,6 +156,16 @@ pub struct IrpDispatchRequest {
     /// Initial scalar File-query byte count, bounded by `output_len`.
     /// PnP pointer-valued information stays in its separate typed transport.
     pub initial_information: u64,
+    /// Typed POWER union scalars. Zero for every other major function.
+    pub power_state_type: u32,
+    pub power_state: u32,
+    /// Raw `Parameters.Power.SystemContext`; zero for PoRequestPowerIrp.
+    pub power_system_context: u32,
+    /// Raw `Parameters.Power.ShutdownType`; zero for PoRequestPowerIrp.
+    pub power_shutdown_type: u32,
+    /// Exact accepted PDO relation generation for `_reserved0 == IRP_DISPATCH_SCSI_SRB`.
+    /// Zero for every other dispatch kind.
+    pub scsi_relation_generation: u64,
 }
 
 impl IrpDispatchRequest {
@@ -191,10 +201,14 @@ const _: () = {
     assert!(size_of::<IoDeviceControlRequest>() == 56);
     assert!(size_of::<IoFileRequest>() == 16);
     assert!(size_of::<IoCancelRequest>() == 16);
-    assert!(size_of::<IrpDispatchRequest>() == 256);
+    assert!(size_of::<IrpDispatchRequest>() == 280);
     assert!(core::mem::offset_of!(IrpDispatchRequest, file_create_options) == 228);
     assert!(core::mem::offset_of!(IrpDispatchRequest, create_case_sensitive) == 244);
     assert!(core::mem::offset_of!(IrpDispatchRequest, initial_information) == 248);
+    assert!(core::mem::offset_of!(IrpDispatchRequest, power_state_type) == 256);
+    assert!(core::mem::offset_of!(IrpDispatchRequest, power_state) == 260);
+    assert!(core::mem::offset_of!(IrpDispatchRequest, power_system_context) == 264);
+    assert!(core::mem::offset_of!(IrpDispatchRequest, power_shutdown_type) == 268);
     assert!(size_of::<IoReply>() == 32);
     assert!(align_of::<IoReadWriteRequest>() == 8);
     assert!(align_of::<IrpDispatchRequest>() == 8);

@@ -175,3 +175,12 @@ fn target_ack_invalidates_unentered_permit_but_keeps_entered_receive_owned() {
         assert_eq!(owner.take_completion(), Ok(true));
     }
 }
+
+#[test]
+fn settled_result_survives_a_different_bootstrap_targets_pass() {
+    let mut settled = Some((17u64, 91u64, true));
+    assert_eq!(take_matching_bootstrap_completion(&mut settled, &18), None);
+    assert_eq!(settled, Some((17, 91, true)));
+    assert_eq!(take_matching_bootstrap_completion(&mut settled, &17), Some((91, true)));
+    assert_eq!(settled, None);
+}

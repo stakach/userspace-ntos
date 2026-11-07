@@ -72,11 +72,14 @@ enum ServiceCompletion {
         handle: u64,
         disposition: u64,
     },
+    Directory { status: i32 },
     SectionCreate {
         status: i32,
         token: u64,
         handle: u64,
     },
+    SectionMap { status: i32, base: u64, size: u64 },
+    GdiImage { status: i32, module: u64 },
 }
 
 impl ServiceCompletion {
@@ -96,11 +99,17 @@ impl ServiceCompletion {
                 handle,
                 disposition,
             } => (4, [status as u32 as u64, handle, disposition, 0]),
+            Self::Directory { status } => (4, [status as u32 as u64, 0, 0, 0]),
             Self::SectionCreate {
                 status,
                 token,
                 handle,
             } => (4, [status as u32 as u64, token, handle, 0]),
+            Self::SectionMap { status, base, size } =>
+                (4, [status as u32 as u64, base, size, 0]),
+            Self::GdiImage { status, module } => {
+                (2, [status as u32 as u64, if status == 0 { module } else { 0 }, 0, 0])
+            }
         }
     }
 }
@@ -294,6 +303,47 @@ pub(crate) unsafe fn wake_section_create_service(
             token: if status == 0 { token } else { 0 },
             handle: if status == 0 { handle } else { 0 },
         },
+    )
+}
+
+pub(crate) unsafe fn wake_section_map_service(
+    route: PeerRoute, dispatch: LaneDispatchIdentity, reply: u64, token: u64,
+    status: i32, base: u64, size: u64,
+) -> Result<(), Error> {
+    wake_with_completion(route, dispatch, reply, token,
+        ServiceCompletion::SectionMap {
+            status, base: if status == 0 { base } else { 0 },
+            size: if status == 0 { size } else { 0 },
+        })
+}
+
+pub(crate) unsafe fn wake_gdi_image_service(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+    status: i32,
+    module: u64,
+) -> Result<(), Error> {
+    wake_with_completion(
+        route, dispatch, reply, token,
+        ServiceCompletion::GdiImage { status, module },
+    )
+}
+
+pub(crate) unsafe fn wake_directory_service(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+    status: i32,
+) -> Result<(), Error> {
+    wake_with_completion(
+        route,
+        dispatch,
+        reply,
+        token,
+        ServiceCompletion::Directory { status },
     )
 }
 

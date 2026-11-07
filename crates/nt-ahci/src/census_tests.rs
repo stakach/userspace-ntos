@@ -94,3 +94,92 @@ fn const_initialization_starts_all_categories_empty() {
         assert_eq!(census.snapshot(operation), IoSnapshot::default());
     }
 }
+
+#[test]
+fn direct_read_census_keeps_source_and_request_size_boundaries_separate() {
+    let census = DirectReadCensus::new();
+    for sectors in [1, 2, 8, 9, 36, 37] {
+        census.record(DirectReadSource::Fat, sectors);
+    }
+    census.record(DirectReadSource::Snapshot, 1);
+    census.record(DirectReadSource::Snapshot, 36);
+
+    for (bucket, commands, sectors) in [
+        (DirectReadBucket::One, 1, 1),
+        (DirectReadBucket::TwoToEight, 2, 10),
+        (DirectReadBucket::NineToThirtySix, 2, 45),
+        (DirectReadBucket::OverThirtySix, 1, 37),
+    ] {
+        assert_eq!(
+            census.snapshot(DirectReadSource::Fat, bucket),
+            DirectReadSnapshot { commands, sectors }
+        );
+    }
+    assert_eq!(
+        census.snapshot(DirectReadSource::Snapshot, DirectReadBucket::One),
+        DirectReadSnapshot {
+            commands: 1,
+            sectors: 1
+        }
+    );
+    assert_eq!(
+        census.snapshot(
+            DirectReadSource::Snapshot,
+            DirectReadBucket::NineToThirtySix
+        ),
+        DirectReadSnapshot {
+            commands: 1,
+            sectors: 36
+        }
+    );
+    assert_eq!(
+        census.snapshot(DirectReadSource::Snapshot, DirectReadBucket::OverThirtySix),
+        DirectReadSnapshot::default()
+    );
+}
+
+#[test]
+fn fat_one_sector_callsites_reconcile_with_the_existing_one_sector_bucket() {
+    let census = DirectReadCensus::new();
+    for kind in [
+        FatOneSectorCallsite::FatLink,
+        FatOneSectorCallsite::Directory,
+        FatOneSectorCallsite::FilePayload,
+        FatOneSectorCallsite::Other,
+    ] {
+        census.record_fat(kind, 1);
+    }
+    census.record_fat(FatOneSectorCallsite::FilePayload, 8);
+    census.record(DirectReadSource::Snapshot, 1);
+    assert_eq!(census.fat_one_sector_total(), 4);
+    assert_eq!(
+        census.snapshot(DirectReadSource::Fat, DirectReadBucket::One).commands,
+        census.fat_one_sector_total()
+    );
+    for kind in [
+        FatOneSectorCallsite::FatLink,
+        FatOneSectorCallsite::Directory,
+        FatOneSectorCallsite::FilePayload,
+        FatOneSectorCallsite::Other,
+    ] {
+        assert_eq!(census.fat_one_sector_calls(kind), 1);
+    }
+}
+
+#[test]
+fn directory_callsites_reconcile_with_the_existing_directory_bucket() {
+    let census = DirectReadCensus::new();
+    for site in [
+        FatOneSectorCallsite::PathDirectory,
+        FatOneSectorCallsite::CheckedDirectory,
+        FatOneSectorCallsite::LegacyDirectory,
+        FatOneSectorCallsite::ShortDirectory,
+        FatOneSectorCallsite::Directory,
+    ] {
+        census.record_fat(site, 1);
+        assert_eq!(census.fat_directory_calls(site), 1);
+        assert_eq!(census.fat_directory_total(), census.fat_one_sector_calls(FatOneSectorCallsite::Directory));
+    }
+    census.record_fat(FatOneSectorCallsite::PathDirectory, 2);
+    assert_eq!(census.fat_directory_total(), 5);
+}

@@ -15,23 +15,21 @@ fn largest_record_backing_bytes(registry: &ClientFrameRegistry) -> usize {
 fn populated(count: usize) -> ClientFrameRegistry {
     let mut registry = ClientFrameRegistry::new();
     assert!(registry.reserve_initial(count));
-    registry
-        .insert(3, LIFETIME, 0x1000, 0x40, 0, 0, 0, true)
-        .unwrap();
-    let template = registry.records[0];
-    // Seed valid distinct records directly: repeated public insert would make fixture setup O(n^2).
-    for index in 1..count {
-        registry.records.push(ClientFrameRecord {
-            record_id: allocate_record_id(&NEXT_RECORD_ID).unwrap(),
-            page: 0x1000 + index as u64 * 0x1000,
-            frame: 0x40 + index as u64,
-            owned_backing_cap: 0x40 + index as u64,
-            age: index as u64 + 1,
-            ..template
-        });
+    for index in 0..count {
+        registry
+            .insert_at_age(
+                3,
+                LIFETIME,
+                0x1000 + index as u64 * 0x1000,
+                0x40 + index as u64,
+                0,
+                0,
+                0,
+                true,
+                index as u64 + 1,
+            )
+            .unwrap();
     }
-    registry.next_age = count as u64 + 1;
-    registry.high_water = count;
     registry
 }
 

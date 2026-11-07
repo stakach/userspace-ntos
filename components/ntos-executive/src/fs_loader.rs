@@ -14,9 +14,93 @@ struct FatSectorCacheScratch {
 
 pub(crate) const FAT32_SCRATCH_OFFSET: u64 = 0xA00;
 const FAT32_FAT_CACHE_OFFSET: u64 = FAT32_SCRATCH_OFFSET;
+// The isolated storage host maps its image read-only and never uses this cache. The executive
+// owns one mounted FAT volume and serializes its native filesystem calls through the service loop.
+static mut EXEC_FAT_RANGE_CURSORS: nt_fs::FatRangeCursorSet<16> =
+    nt_fs::FatRangeCursorSet::new();
+static mut EXEC_FAT_SECTOR_CACHE: nt_fs::FatSectorCache = nt_fs::FatSectorCache::new();
+// Boot AHCI has one authenticated disk owner; its mount ID changes on publication/remount.
+// This copied Directory cache is fenced before installed writes and at Boot→Draining.
+const EXEC_FAT_DIRECTORY_CACHE_SECTORS: usize = 256;
+static mut EXEC_FAT_DIRECTORY_CACHE:
+    nt_fs::InstalledMetadataSectorCache<u64, EXEC_FAT_DIRECTORY_CACHE_SECTORS> =
+    nt_fs::InstalledMetadataSectorCache::new();
+const FAT_PATH_PARENT_CANDIDATES: usize = 8;
+static mut EXEC_FAT_PATH_LOOKUP_CENSUS: nt_fs::FatPathLookupCensus<FAT_PATH_PARENT_CANDIDATES> =
+    nt_fs::FatPathLookupCensus::new();
+static DIRECT_READ_CENSUS: nt_ahci::DirectReadCensus = nt_ahci::DirectReadCensus::new();
+static FAT_READ_FAILURE_REPORTS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+static DIRECT_READ_CENSUS_PRINTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 const _: () = assert!(
     FAT32_FAT_CACHE_OFFSET + core::mem::size_of::<FatSectorCacheScratch>() as u64 <= 0x1000
 );
+
+fn report_fat_read_failure(context: &[u8], sector: u64, count: u32, status: u32) {
+    use core::sync::atomic::Ordering;
+    let reported = FAT_READ_FAILURE_REPORTS.fetch_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |reported| Some(reported.saturating_add(1)),
+    ).unwrap_or(u32::MAX);
+    if reported >= 8 {
+        return;
+    }
+    print_str(context);
+    print_str(b" read failure sector=");
+    print_u64(sector);
+    print_str(b" count=");
+    print_u64(count as u64);
+    print_str(b" status=");
+    print_hex(status);
+    print_str(b"\n");
+}
+
+unsafe fn read_owner_sector(
+    owner: FatIoOwner,
+    ahci_vaddr: u64,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+    lba: u64,
+) -> u32 {
+    match owner {
+        FatIoOwner::Executive => {
+            if !admit_exec_mount_boot_io(nt_fs::BlockSource::Fat, nt_fs::BlockOperation::Read { lba, sectors: 1 }) {
+                return 0xff;
+            }
+            ahci_read_sector(ahci_vaddr, dma_vaddr, dma_paddr, lba)
+        }
+        FatIoOwner::IsolatedStorageHost => {
+            ahci_read_sector_isolated_storage_host(ahci_vaddr, dma_vaddr, dma_paddr, lba)
+        }
+    }
+}
+
+unsafe fn read_owner_sectors(
+    owner: FatIoOwner,
+    ahci_vaddr: u64,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+    lba: u64,
+    count: u32,
+) -> u32 {
+    match owner {
+        FatIoOwner::Executive => {
+            if !admit_exec_mount_boot_io(nt_fs::BlockSource::Fat, nt_fs::BlockOperation::Read { lba, sectors: count }) {
+                return 0xff;
+            }
+            ahci_read_sectors(ahci_vaddr, dma_vaddr, dma_paddr, lba, count)
+        }
+        FatIoOwner::IsolatedStorageHost => ahci_read_sectors_isolated_storage_host(
+            ahci_vaddr,
+            dma_vaddr,
+            dma_paddr,
+            lba,
+            count,
+        ),
+    }
+}
 
 const SYSTEM32_CACHE_NAME_CAP: usize = 96;
 
@@ -61,7 +145,7 @@ pub(crate) struct FatOpenMetadata {
 }
 
 impl FatOpenMetadata {
-    fn from_record(record: nt_fs::FatDirectoryRecord) -> Self {
+    pub(crate) fn from_record(record: nt_fs::FatDirectoryRecord) -> Self {
         let alternate_name = nt_fs::FatShortName::from_units(record.entry.short_name())
             .expect("FAT decoder bounds short names to its fixed 12-unit field");
         Self {
@@ -126,23 +210,26 @@ unsafe fn system32_cache_entries() -> Option<&'static [System32CacheEntry]> {
 
 /// Read `sector` off the disk (via AHCI) and return a pointer to its 512 bytes.
 pub(crate) unsafe fn fat_read_sector(fs: &Fat32, sector: u32) -> Option<*const u8> {
-    fat_read_sector_checked(fs, sector)
+    fat_read_sector_checked(fs, sector, nt_ahci::FatOneSectorCallsite::Other)
 }
 
-unsafe fn fat_read_sector_checked(fs: &Fat32, sector: u32) -> Option<*const u8> {
+unsafe fn fat_read_sector_checked(
+    fs: &Fat32,
+    sector: u32,
+    callsite: nt_ahci::FatOneSectorCallsite,
+) -> Option<*const u8> {
     let disk_lba = nt_fs::checked_partition_lba(fs.volume_start_lba, sector)?;
     let census_started = fs.census.then(disk_census_ticks);
-    let status = ahci_read_sector(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba);
+    let status = read_owner_sector(fs.io_owner, fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba);
     disk_census_record(
         nt_ahci::IoOperation::Read,
         census_started,
         1,
         status & nt_ahci::TASK_FILE_FAILURE != 0,
     );
-    if status == 0xFF {
-        print_str(b"[fat-sector] read timeout sector=");
-        print_u64(sector as u64);
-        print_str(b"\n");
+    fat_direct_read_census_record(census_started, 1, callsite);
+    if !nt_ahci::read_completion_ok(status) {
+        report_fat_read_failure(b"[fat-sector]", sector as u64, 1, status);
         return None;
     }
     Some((fs.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *const u8)
@@ -153,19 +240,20 @@ unsafe fn fat_read_sectors_checked(fs: &Fat32, sector: u32, count: u32) -> Optio
     let last = sector.checked_add(count.checked_sub(1)?)?;
     nt_fs::checked_partition_lba(fs.volume_start_lba, last)?;
     let census_started = fs.census.then(disk_census_ticks);
-    let status = ahci_read_sectors(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba, count);
+    let status = read_owner_sectors(fs.io_owner, fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba, count);
     disk_census_record(
         nt_ahci::IoOperation::Read,
         census_started,
         count as u64,
         status & nt_ahci::TASK_FILE_FAILURE != 0,
     );
-    if status == 0xFF {
-        print_str(b"[fat-sector] read timeout sector=");
-        print_u64(sector as u64);
-        print_str(b" count=");
-        print_u64(count as u64);
-        print_str(b"\n");
+    fat_direct_read_census_record(
+        census_started,
+        count as u64,
+        nt_ahci::FatOneSectorCallsite::FilePayload,
+    );
+    if !nt_ahci::read_completion_ok(status) {
+        report_fat_read_failure(b"[fat-sector]", sector as u64, count, status);
         return None;
     }
     Some((fs.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *const u8)
@@ -182,20 +270,152 @@ pub(crate) fn disk_census_record(
     AHCI_CENSUS.record(operation, started, disk_census_ticks(), sectors, failed);
 }
 
+/// Classify the same returned Executive read attempts as the aggregate disk census.
+pub(crate) fn direct_read_census_record(
+    source: nt_ahci::DirectReadSource,
+    started: Option<u64>,
+    sectors: u64,
+) {
+    if started.is_some() {
+        DIRECT_READ_CENSUS.record(source, sectors);
+    }
+}
+
+fn fat_direct_read_census_record(
+    started: Option<u64>,
+    sectors: u64,
+    callsite: nt_ahci::FatOneSectorCallsite,
+) {
+    if started.is_some() {
+        DIRECT_READ_CENSUS.record_fat(callsite, sectors);
+    }
+}
+
+/// Native-start Ready follows the exact boot-ticket drain, so these are final boot totals.
+pub(crate) fn print_direct_read_census_once() {
+    if DIRECT_READ_CENSUS_PRINTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    for (source, label) in [
+        (nt_ahci::DirectReadSource::Fat, b"fat".as_slice()),
+        (nt_ahci::DirectReadSource::Snapshot, b"snapshot".as_slice()),
+    ] {
+        print_str(b"[census] direct-read-source=");
+        print_str(label);
+        for (bucket, bucket_label) in [
+            (nt_ahci::DirectReadBucket::One, b" one=".as_slice()),
+            (nt_ahci::DirectReadBucket::TwoToEight, b" 2-8=".as_slice()),
+            (nt_ahci::DirectReadBucket::NineToThirtySix, b" 9-36=".as_slice()),
+            (nt_ahci::DirectReadBucket::OverThirtySix, b" over36=".as_slice()),
+        ] {
+            let sample = DIRECT_READ_CENSUS.snapshot(source, bucket);
+            print_str(bucket_label);
+            print_u64(sample.commands);
+            print_str(b"attempt/");
+            print_u64(sample.sectors);
+            print_str(b"sec");
+        }
+        print_str(b"\n");
+    }
+    print_str(b"[census] fat-one-sector-callsite");
+    for (callsite, label) in [
+        (nt_ahci::FatOneSectorCallsite::FatLink, b" link=".as_slice()),
+        (nt_ahci::FatOneSectorCallsite::Directory, b" directory=".as_slice()),
+        (nt_ahci::FatOneSectorCallsite::FilePayload, b" payload=".as_slice()),
+        (nt_ahci::FatOneSectorCallsite::Other, b" other=".as_slice()),
+    ] {
+        print_str(label);
+        print_u64(DIRECT_READ_CENSUS.fat_one_sector_calls(callsite));
+    }
+    print_str(b" total=");
+    print_u64(DIRECT_READ_CENSUS.fat_one_sector_total());
+    print_str(b" reconciled=");
+    print_u64(u64::from(
+        DIRECT_READ_CENSUS.fat_one_sector_total()
+            == DIRECT_READ_CENSUS
+                .snapshot(nt_ahci::DirectReadSource::Fat, nt_ahci::DirectReadBucket::One)
+                .commands,
+    ));
+    print_str(b"\n");
+    print_str(b"[census] fat-directory-callsites");
+    for (callsite, label) in [
+        (nt_ahci::FatOneSectorCallsite::PathDirectory, b" path=".as_slice()),
+        (nt_ahci::FatOneSectorCallsite::CheckedDirectory, b" checked=".as_slice()),
+        (nt_ahci::FatOneSectorCallsite::LegacyDirectory, b" legacy=".as_slice()),
+        (nt_ahci::FatOneSectorCallsite::ShortDirectory, b" short=".as_slice()),
+        (nt_ahci::FatOneSectorCallsite::Directory, b" other=".as_slice()),
+    ] {
+        print_str(label);
+        print_u64(DIRECT_READ_CENSUS.fat_directory_calls(callsite));
+    }
+    print_str(b" total=");
+    print_u64(DIRECT_READ_CENSUS.fat_directory_total());
+    print_str(b" reconciled=");
+    print_u64(u64::from(DIRECT_READ_CENSUS.fat_directory_total()
+        == DIRECT_READ_CENSUS.fat_one_sector_calls(nt_ahci::FatOneSectorCallsite::Directory)));
+    print_str(b"\n");
+    let path = unsafe { &*core::ptr::addr_of!(EXEC_FAT_PATH_LOOKUP_CENSUS) };
+    print_str(b"[census] fat-path-lookups=");
+    print_u64(path.lookups());
+    print_str(b" found=");
+    print_u64(path.found_count());
+    print_str(b" not-found=");
+    print_u64(path.not_found_count());
+    let path_attempts = DIRECT_READ_CENSUS
+        .fat_directory_calls(nt_ahci::FatOneSectorCallsite::PathDirectory);
+    print_str(b" physical-directory-attempts=");
+    print_u64(path_attempts);
+    print_str(b" successful-directory-sectors=");
+    print_u64(path.directory_sectors());
+    print_str(b" no-data-attempts=");
+    print_u64(path_attempts.saturating_sub(path.directory_sectors()));
+    print_str(b"\n");
+    for index in 0..FAT_PATH_PARENT_CANDIDATES {
+        if let Some((cluster, lower_bound)) = path.parent_candidate(index) {
+            print_str(b"[census] fat-path-parent cluster=");
+            print_u64(cluster as u64);
+            print_str(b" lower-bound-sectors=");
+            print_u64(lower_bound);
+            print_str(b"\n");
+        }
+    }
+}
+
 unsafe fn fat_cache_invalidate(fs: &Fat32) {
+    if fs.census {
+        return;
+    }
     let cache = &mut *((fs.dma_vaddr + FAT32_FAT_CACHE_OFFSET) as *mut FatSectorCacheScratch);
     cache.valid = 0;
+}
+
+unsafe fn fat_chain_cache_invalidate(fs: &Fat32) {
+    if fs.census {
+        (&mut *core::ptr::addr_of_mut!(EXEC_FAT_SECTOR_CACHE)).invalidate();
+        (&mut *core::ptr::addr_of_mut!(EXEC_FAT_DIRECTORY_CACHE)).invalidate();
+        (&mut *core::ptr::addr_of_mut!(EXEC_FAT_RANGE_CURSORS)).invalidate();
+    } else {
+        fat_cache_invalidate(fs);
+    }
 }
 
 /// Write one full FAT sector through the same AHCI DMA frame used by [`fat_read_sector`].
 #[allow(dead_code)]
 pub(crate) unsafe fn fat_write_sector(fs: &Fat32, sector: u32, data: &[u8]) -> u32 {
-    if fs.bps != 512 || data.len() != fs.bps as usize {
+    if !matches!(fs.io_owner, FatIoOwner::Executive)
+        || fs.bps != 512
+        || data.len() != fs.bps as usize
+    {
         return 0xff;
     }
     let Some(disk_lba) = nt_fs::checked_partition_lba(fs.volume_start_lba, sector) else {
         return 0xff;
     };
+    // A timed-out write may still have reached media, so invalidate before issuing it.
+    fat_chain_cache_invalidate(fs);
+    if !admit_exec_mount_boot_io(nt_fs::BlockSource::Fat, nt_fs::BlockOperation::Write { lba: disk_lba, sectors: 1 }) {
+        return 0xff;
+    }
     let started = fs.census.then(disk_census_ticks);
     let status = ahci_write_sectors(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba, data);
     disk_census_record(
@@ -209,7 +429,11 @@ pub(crate) unsafe fn fat_write_sector(fs: &Fat32, sector: u32, data: &[u8]) -> u
 
 #[allow(dead_code)]
 pub(crate) unsafe fn fat_write_sectors(fs: &Fat32, sector: u32, data: &[u8]) -> u32 {
-    if fs.bps != 512 || data.is_empty() || data.len() % fs.bps as usize != 0 {
+    if !matches!(fs.io_owner, FatIoOwner::Executive)
+        || fs.bps != 512
+        || data.is_empty()
+        || data.len() % fs.bps as usize != 0
+    {
         return 0xff;
     }
     let sectors = (data.len() / fs.bps as usize) as u32;
@@ -223,6 +447,10 @@ pub(crate) unsafe fn fat_write_sectors(fs: &Fat32, sector: u32, data: &[u8]) -> 
         return 0xff;
     };
     if nt_fs::checked_partition_lba(fs.volume_start_lba, last).is_none() {
+        return 0xff;
+    }
+    fat_chain_cache_invalidate(fs);
+    if !admit_exec_mount_boot_io(nt_fs::BlockSource::Fat, nt_fs::BlockOperation::Write { lba: disk_lba, sectors }) {
         return 0xff;
     }
     let started = fs.census.then(disk_census_ticks);
@@ -271,13 +499,27 @@ pub(crate) unsafe fn fat_volume_size(fs: &Fat32) -> Option<nt_fs::VolumeSizeInfo
         || fs.spc == 0
         || fs.total_sectors <= fs.data_start
         || fs.fs_info_sector == 0
-        || ahci_read_sector(
-            fs.ahci_vaddr,
-            fs.dma_vaddr,
-            fs.dma_paddr,
-            nt_fs::checked_partition_lba(fs.volume_start_lba, fs.fs_info_sector)?,
-        ) == 0xff
     {
+        return None;
+    }
+    let disk_lba = nt_fs::checked_partition_lba(fs.volume_start_lba, fs.fs_info_sector)?;
+    let census_started = fs.census.then(disk_census_ticks);
+    let status = read_owner_sector(
+        fs.io_owner,
+        fs.ahci_vaddr,
+        fs.dma_vaddr,
+        fs.dma_paddr,
+        disk_lba,
+    );
+    disk_census_record(
+        nt_ahci::IoOperation::Read,
+        census_started,
+        1,
+        status & nt_ahci::TASK_FILE_FAILURE != 0,
+    );
+    fat_direct_read_census_record(census_started, 1, nt_ahci::FatOneSectorCallsite::Other);
+    if !nt_ahci::read_completion_ok(status) {
+        report_fat_read_failure(b"[fat-fsinfo]", fs.fs_info_sector as u64, 1, status);
         return None;
     }
     let base = fs.dma_vaddr + AHCI_DMA_DATA_OFFSET;
@@ -321,10 +563,26 @@ unsafe fn fat_next_checked(fs: &Fat32, cluster: u32) -> Result<u32, u32> {
         .checked_add(byte / fs.bps)
         .filter(|sector| *sector < fs.data_start)
         .ok_or(nt_fs::STATUS_DATA_ERROR)?;
-    let off = (byte % fs.bps) as u64;
+    let off = byte % fs.bps;
+    if fs.census {
+        let mount = exec_fs_mount_identity().ok_or(nt_fs::STATUS_DATA_ERROR)?;
+        let value = (&mut *core::ptr::addr_of_mut!(EXEC_FAT_SECTOR_CACHE)).read_entry(
+            mount.value(),
+            sec,
+            off,
+            |sector, data| {
+                let p = fat_read_sector_checked(fs, sector, nt_ahci::FatOneSectorCallsite::FatLink)
+                    .ok_or(nt_fs::STATUS_DATA_ERROR)?;
+                core::ptr::copy_nonoverlapping(p, data.as_mut_ptr(), data.len());
+                Ok(())
+            },
+        )?;
+        return Ok(value & 0x0FFF_FFFF);
+    }
     let cache = &mut *((fs.dma_vaddr + FAT32_FAT_CACHE_OFFSET) as *mut FatSectorCacheScratch);
     if cache.valid != 1 || cache.sector != sec {
-        let p = fat_read_sector_checked(fs, sec).ok_or(nt_fs::STATUS_DATA_ERROR)?;
+        let p = fat_read_sector_checked(fs, sec, nt_ahci::FatOneSectorCallsite::FatLink)
+            .ok_or(nt_fs::STATUS_DATA_ERROR)?;
         core::ptr::copy_nonoverlapping(p, cache.data.as_mut_ptr(), cache.data.len());
         cache.sector = sec;
         cache.valid = 1;
@@ -351,7 +609,8 @@ pub(crate) unsafe fn fat_visit_directory_checked(
         },
         dir_cluster,
         |sector| {
-            let data = fat_read_sector_checked(fs, sector).ok_or(nt_fs::STATUS_DATA_ERROR)?;
+            let data = fat_read_sector_checked(fs, sector, nt_ahci::FatOneSectorCallsite::CheckedDirectory)
+                .ok_or(nt_fs::STATUS_DATA_ERROR)?;
             let mut bytes = [0; 512];
             core::ptr::copy_nonoverlapping(data, bytes.as_mut_ptr(), bytes.len());
             Ok(bytes)
@@ -387,7 +646,11 @@ pub(crate) unsafe fn fat_visit_directory(
         }
         clusters_seen += 1;
         for sector in 0..fs.spc {
-            let data = match fat_read_sector_checked(fs, fat_cluster_sector(fs, cluster) + sector) {
+            let data = match fat_read_sector_checked(
+                fs,
+                fat_cluster_sector(fs, cluster) + sector,
+                nt_ahci::FatOneSectorCallsite::LegacyDirectory,
+            ) {
                 Some(data) => data,
                 None => return,
             };
@@ -503,13 +766,13 @@ unsafe fn system32_cache_candidate_count(fs: &Fat32, system32_cluster: u32) -> u
 }
 
 unsafe fn system32_cache_build(fs: &Fat32) -> bool {
-    let Some(reactos) = fat_find_open_metadata(fs, fs.root_cl, b"reactos") else {
+    let Some(installed_root) = fat_lookup_metadata(fs, fs.root_cl, crate::installed_layout::ROOT) else {
         return false;
     };
-    if !reactos.metadata.is_directory {
+    if !installed_root.metadata.is_directory {
         return false;
     }
-    let Some(system32) = fat_find_open_metadata(fs, reactos.first_cluster, b"system32") else {
+    let Some(system32) = fat_lookup_metadata(fs, installed_root.first_cluster, b"system32") else {
         return false;
     };
     if !system32.metadata.is_directory {
@@ -595,8 +858,8 @@ unsafe fn system32_cache_lookup_metadata(fs: &Fat32, leaf: &[u8]) -> Option<FatO
 }
 
 fn system32_leaf_from_volume_path(path: &[u8]) -> Option<&[u8]> {
-    const PREFIX: &[u8] = b"reactos\\system32\\";
-    const ALT_PREFIX: &[u8] = b"reactos/system32/";
+    const PREFIX: &[u8] = crate::installed_layout::SYSTEM32_PREFIX;
+    const ALT_PREFIX: &[u8] = crate::installed_layout::SYSTEM32_SLASH_PREFIX;
     let leaf = if path.len() > PREFIX.len() && path[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
         &path[PREFIX.len()..]
     } else if path.len() > ALT_PREFIX.len()
@@ -620,7 +883,11 @@ pub(crate) unsafe fn dir_find(
     let mut cl = dir_cluster;
     while cl >= 2 && cl < 0x0FFF_FFF8 {
         for s in 0..fs.spc {
-            let p = fat_read_sector_checked(fs, fat_cluster_sector(fs, cl) + s)?;
+            let p = fat_read_sector_checked(
+                fs,
+                fat_cluster_sector(fs, cl) + s,
+                nt_ahci::FatOneSectorCallsite::ShortDirectory,
+            )?;
             for e in 0..(fs.bps as usize / 32) {
                 let ent = p.add(e * 32);
                 let first = *ent;
@@ -784,14 +1051,66 @@ pub(crate) unsafe fn fat_read_file_range(
     if cluster_bytes == 0 {
         return 0;
     }
-    let mut cluster = first_cluster;
-    let mut skip_clusters = offset / cluster_bytes;
-    while skip_clusters != 0 && cluster >= 2 && cluster < 0x0FFF_FFF8 {
-        cluster = fat_next(fs, cluster);
-        skip_clusters -= 1;
-    }
+    let target_index = offset / cluster_bytes;
+    let located = if fs.census {
+        let Some(mount) = exec_fs_mount_identity() else {
+            return 0;
+        };
+        (&mut *core::ptr::addr_of_mut!(EXEC_FAT_RANGE_CURSORS)).locate(
+            mount.value(),
+            first_cluster,
+            size,
+            target_index,
+            |cluster| fat_next(fs, cluster),
+        )
+    } else {
+        nt_fs::FatRangeCursor::new().locate(first_cluster, size, target_index, |cluster| {
+            fat_next(fs, cluster)
+        })
+    };
+    let Some(mut cluster) = located else {
+        return 0;
+    };
     let mut within_cluster = offset % cluster_bytes;
     let mut written = 0usize;
+    if fs.spc == 1 {
+        while written < wanted {
+            let Some(batch) = nt_fs::FatRangeBatch::plan(
+                cluster,
+                within_cluster,
+                wanted - written,
+                fs.bps,
+                AHCI_MAX_SECTORS_PER_READ,
+                |current| fat_next(fs, current),
+            ) else {
+                break;
+            };
+            let Some(data) = fat_read_sectors_checked(
+                fs,
+                fat_cluster_sector(fs, cluster),
+                batch.sectors,
+            ) else {
+                break;
+            };
+            core::ptr::copy_nonoverlapping(
+                data.add(batch.skip_bytes),
+                output.as_mut_ptr().add(written),
+                batch.copy_bytes,
+            );
+            if batch.sectors > 1 {
+                fat_cache_invalidate(fs);
+            }
+            written += batch.copy_bytes;
+            if written < wanted {
+                let Some(next) = batch.next_cluster else {
+                    break;
+                };
+                cluster = next;
+                within_cluster = 0;
+            }
+        }
+        return written;
+    }
     while cluster >= 2 && cluster < 0x0FFF_FFF8 && written < wanted {
         for sector in 0..fs.spc {
             let sector_start = sector * fs.bps;
@@ -799,7 +1118,11 @@ pub(crate) unsafe fn fat_read_file_range(
                 continue;
             }
             let start = within_cluster.saturating_sub(sector_start) as usize;
-            let Some(data) = fat_read_sector_checked(fs, fat_cluster_sector(fs, cluster) + sector)
+            let Some(data) = fat_read_sector_checked(
+                fs,
+                fat_cluster_sector(fs, cluster) + sector,
+                nt_ahci::FatOneSectorCallsite::FilePayload,
+            )
             else {
                 return written;
             };
@@ -823,35 +1146,90 @@ pub(crate) unsafe fn fat_read_file_range(
     written
 }
 
-fn fat_name_matches_ascii(name: &[u16], wanted: &[u8]) -> bool {
-    name.len() == wanted.len()
-        && name
-            .iter()
-            .zip(wanted)
-            .all(|(unit, byte)| *unit <= 0x7f && (*unit as u8).eq_ignore_ascii_case(byte))
-}
-
-unsafe fn fat_find_open_metadata(
+unsafe fn fat_lookup_metadata(
     fs: &Fat32,
-    directory_cluster: u32,
-    component: &[u8],
+    start_cluster: u32,
+    path: &[u8],
 ) -> Option<FatOpenMetadata> {
-    let mut found = None;
-    fat_visit_directory(fs, directory_cluster, |entry, first_cluster| {
-        let matches = fat_name_matches_ascii(entry.name(), component)
-            || (!entry.short_name().is_empty()
-                && fat_name_matches_ascii(entry.short_name(), component));
-        if matches {
-            found = Some(FatOpenMetadata::from_record(nt_fs::FatDirectoryRecord {
-                entry,
-                first_cluster,
-            }));
-            false
+    let geometry = nt_fs::FatPathGeometry {
+        fat_start_sector: fs.fat_start,
+        data_start_sector: fs.data_start,
+        total_sectors: fs.total_sectors,
+        sectors_per_cluster: fs.spc,
+    };
+    let mut lookup = nt_fs::FatPathLookup::new(geometry, start_cluster, path).ok()?;
+    if fs.census {
+        (&mut *core::ptr::addr_of_mut!(EXEC_FAT_PATH_LOOKUP_CENSUS)).begin();
+    }
+    loop {
+        let request = lookup.request()?;
+        let callsite = match request.kind {
+            nt_fs::FatPathRequestKind::Fat => nt_ahci::FatOneSectorCallsite::FatLink,
+            nt_fs::FatPathRequestKind::Directory => nt_ahci::FatOneSectorCallsite::PathDirectory,
+        };
+        let mut bytes = [0; 512];
+        if request.kind == nt_fs::FatPathRequestKind::Fat
+            && fs.census
+            && matches!(fs.io_owner, FatIoOwner::Executive)
+        {
+            let mount = exec_fs_mount_identity()?;
+            let sector = (&mut *core::ptr::addr_of_mut!(EXEC_FAT_SECTOR_CACHE))
+                .read_sector(mount.value(), request.sector, |sector, data| {
+                    let ptr = fat_read_sector_checked(fs, sector, callsite)
+                        .ok_or(nt_fs::STATUS_DATA_ERROR)?;
+                    core::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), data.len());
+                    Ok(())
+                })
+                .ok()?;
+            bytes.copy_from_slice(sector);
+        } else if request.kind == nt_fs::FatPathRequestKind::Directory
+            && fs.census
+            && matches!(fs.io_owner, FatIoOwner::Executive)
+            && matches!(
+                (&*core::ptr::addr_of!(EXEC_BLOCK_ROUTE)).as_ref().map(|route| route.source_kind()),
+                Some(nt_fs::BlockSourceKind::Boot)
+            )
+        {
+            let mount = exec_fs_mount_identity()?;
+            let route = (&*core::ptr::addr_of!(EXEC_BLOCK_ROUTE)).as_ref()?;
+            if route.mount() != mount.value() {
+                return None;
+            }
+            let parent = lookup.parent_cluster();
+            bytes = (&mut *core::ptr::addr_of_mut!(EXEC_FAT_DIRECTORY_CACHE))
+                .read_or_fetch(mount.value(), request.sector, |sector, data| {
+                    let ptr = fat_read_sector_checked(fs, sector, callsite)
+                        .ok_or(nt_fs::STATUS_DATA_ERROR)?;
+                    core::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), data.len());
+                    (&mut *core::ptr::addr_of_mut!(EXEC_FAT_PATH_LOOKUP_CENSUS))
+                        .directory_sector(parent);
+                    Ok::<(), u32>(())
+                })
+                .ok()?;
         } else {
-            true
+            let sector = fat_read_sector_checked(fs, request.sector, callsite)?;
+            core::ptr::copy_nonoverlapping(sector, bytes.as_mut_ptr(), bytes.len());
+            if request.kind == nt_fs::FatPathRequestKind::Directory && fs.census {
+                (&mut *core::ptr::addr_of_mut!(EXEC_FAT_PATH_LOOKUP_CENSUS))
+                    .directory_sector(lookup.parent_cluster());
+            }
         }
-    });
-    found
+        match lookup.feed(request, &bytes).ok()? {
+            nt_fs::FatPathProgress::Pending => {}
+            nt_fs::FatPathProgress::Found => {
+                if fs.census {
+                    (&mut *core::ptr::addr_of_mut!(EXEC_FAT_PATH_LOOKUP_CENSUS)).found();
+                }
+                return lookup.take_found().map(FatOpenMetadata::from_record);
+            }
+            nt_fs::FatPathProgress::NotFound => {
+                if fs.census {
+                    (&mut *core::ptr::addr_of_mut!(EXEC_FAT_PATH_LOOKUP_CENSUS)).not_found();
+                }
+                return None;
+            }
+        }
+    }
 }
 
 /// Find one native FAT directory entry by its long name or physical short alias.
@@ -861,7 +1239,7 @@ pub(crate) unsafe fn dir_find_lfn(
     directory_cluster: u32,
     component: &[u8],
 ) -> Option<(u32, u32, u8)> {
-    fat_find_open_metadata(fs, directory_cluster, component).map(FatOpenMetadata::entry_tuple)
+    fat_lookup_metadata(fs, directory_cluster, component).map(FatOpenMetadata::entry_tuple)
 }
 
 unsafe fn fat_open_path_metadata_inner(
@@ -877,29 +1255,7 @@ unsafe fn fat_open_path_metadata_inner(
             }
         }
     }
-    let mut current = start_cluster;
-    let mut start = 0usize;
-    let mut result = None;
-    let mut index = 0usize;
-    while index <= path.len() {
-        let separator = index == path.len() || path[index] == b'\\' || path[index] == b'/';
-        if separator {
-            if index > start {
-                let entry = fat_find_open_metadata(fs, current, &path[start..index])?;
-                if index == path.len() {
-                    result = Some(entry);
-                } else {
-                    if !entry.metadata.is_directory {
-                        return None;
-                    }
-                    current = entry.first_cluster;
-                }
-            }
-            start = index + 1;
-        }
-        index += 1;
-    }
-    result
+    fat_lookup_metadata(fs, start_cluster, path)
 }
 
 pub(crate) fn fat_root_metadata(fs: &Fat32) -> FatOpenMetadata {
@@ -981,7 +1337,7 @@ unsafe fn open_sys32_path(fs: &Fat32, leaf: &[u8], use_system32_cache: bool) -> 
     }
     let mut path = [0u8; 160];
     let mut n = 0usize;
-    for &c in b"reactos\\system32\\" {
+    for &c in crate::installed_layout::SYSTEM32_PREFIX {
         path[n] = c;
         n += 1;
     }
@@ -1035,7 +1391,7 @@ pub(crate) unsafe fn query_nt_path_metadata_into(
     folded: &mut [u8],
     relative: &mut [u8],
 ) -> Option<nt_fs::FileMetadata> {
-    let len = nt_fs::nt_path_to_volume_relative_into(name, b"reactos", folded, relative)?;
+    let len = nt_fs::nt_path_to_volume_relative_into(name, crate::installed_layout::ROOT, folded, relative)?;
     let fs = exec_fs()?;
     fat_open_path_metadata(&fs, &relative[..len]).map(|entry| entry.metadata)
 }
@@ -1054,15 +1410,186 @@ pub(crate) unsafe fn query_nt_path_metadata_into(
 /// executive's AHCI BAR + DMA-frame mappings). `None` until mounted. Read-only.
 static mut EXEC_FS: Option<Fat32> = None;
 static mut EXEC_FS_MOUNT_ID: Option<nt_memory_manager::SectionMountId> = None;
+static mut EXEC_BLOCK_ROUTE: Option<nt_fs::BlockRouteOwner> = None;
+static mut EXEC_EXPECTED_DISK: Option<nt_pnp_context::native_storage_handoff::ExpectedDisk> = None;
+
+/// All executive FAT copies and the snapshot reserve enter the same physical mount route.
+/// Before publication, only FAT bootstrap reads are allowed; the isolated host uses its
+/// separate address space and never touches this owner.
+pub(crate) fn admit_exec_mount_boot_io(
+    source: nt_fs::BlockSource,
+    operation: nt_fs::BlockOperation,
+) -> bool {
+    unsafe {
+        match (
+            *core::ptr::addr_of!(EXEC_FS_MOUNT_ID),
+            (&*core::ptr::addr_of!(EXEC_BLOCK_ROUTE)).as_ref(),
+        ) {
+            (Some(mount), Some(route)) => route.admit_boot(mount.value(), source, operation).is_ok(),
+            (None, None) => source == nt_fs::BlockSource::Fat,
+            _ => false,
+        }
+    }
+}
+
+/// The controller ledger owns exact boot command retirement; this mount owner fences both
+/// logical consumers before native START. Redrive keeps the same drain state.
+pub(crate) fn exec_mount_can_drain() -> bool {
+    unsafe {
+        let mount = *core::ptr::addr_of!(EXEC_FS_MOUNT_ID);
+        let route = (&*core::ptr::addr_of!(EXEC_BLOCK_ROUTE)).as_ref();
+        match (mount, route) {
+            (Some(_), Some(route)) => matches!(
+                route.source_kind(),
+                nt_fs::BlockSourceKind::Boot | nt_fs::BlockSourceKind::Draining
+            ),
+            _ => false,
+        }
+    }
+}
+
+/// Phase observation for a caller that already holds the exact physical mount identity.
+pub(crate) fn exec_block_route_kind(mount: nt_memory_manager::SectionMountId) -> Option<nt_fs::BlockSourceKind> {
+    unsafe {
+        if *core::ptr::addr_of!(EXEC_FS_MOUNT_ID) != Some(mount) { return None; }
+        (&*core::ptr::addr_of!(EXEC_BLOCK_ROUTE)).as_ref().map(|route| route.source_kind())
+    }
+}
+
+/// Commit the proven native PDO to the same physical mount shared by FAT and snapshot I/O.
+/// The caller must retain the exact `NativeStorageHandoff::MountCommit` across this effect.
+pub(crate) fn commit_exec_block_route(
+    mount: nt_memory_manager::SectionMountId,
+    pdo: nt_io_manager::DeviceId,
+) -> Result<(), nt_fs::BlockRouteError> {
+    unsafe {
+        if *core::ptr::addr_of!(EXEC_FS_MOUNT_ID) != Some(mount) {
+            return Err(nt_fs::BlockRouteError::WrongMount);
+        }
+        (&mut *core::ptr::addr_of_mut!(EXEC_BLOCK_ROUTE))
+            .as_mut()
+            .ok_or(nt_fs::BlockRouteError::InvalidMount)?
+            .commit_native(mount.value(), pdo.raw())
+    }
+}
+
+pub(crate) fn enter_exec_native_block(
+    mount: nt_memory_manager::SectionMountId,
+    source: nt_fs::BlockSource,
+    operation: nt_fs::BlockOperation,
+) -> Result<nt_fs::NativeBlockTicket, nt_fs::BlockRouteError> {
+    unsafe {
+        if *core::ptr::addr_of!(EXEC_FS_MOUNT_ID) != Some(mount) {
+            return Err(nt_fs::BlockRouteError::WrongMount);
+        }
+        (&mut *core::ptr::addr_of_mut!(EXEC_BLOCK_ROUTE))
+            .as_mut()
+            .ok_or(nt_fs::BlockRouteError::InvalidMount)?
+            .enter_native(mount.value(), source, operation)
+    }
+}
+
+pub(crate) fn exec_native_block_pending(
+    mount: nt_memory_manager::SectionMountId,
+) -> Option<nt_fs::NativeBlockTicket> {
+    unsafe {
+        if *core::ptr::addr_of!(EXEC_FS_MOUNT_ID) != Some(mount) { return None; }
+        (&*core::ptr::addr_of!(EXEC_BLOCK_ROUTE)).as_ref()?.pending_native()
+    }
+}
+
+pub(crate) fn cancel_unentered_exec_native_block(
+    ticket: nt_fs::NativeBlockTicket,
+) -> Result<(), nt_fs::BlockRouteError> {
+    unsafe {
+        let route = (&mut *core::ptr::addr_of_mut!(EXEC_BLOCK_ROUTE))
+            .as_mut().ok_or(nt_fs::BlockRouteError::InvalidMount)?;
+        route.cancel_unentered_native(ticket)
+    }
+}
+
+pub(crate) fn mark_entered_exec_native_block(
+    ticket: nt_fs::NativeBlockTicket,
+) -> Result<(), nt_fs::BlockRouteError> {
+    unsafe {
+        let route = (&mut *core::ptr::addr_of_mut!(EXEC_BLOCK_ROUTE))
+            .as_mut().ok_or(nt_fs::BlockRouteError::InvalidMount)?;
+        route.lose_native(ticket)
+    }
+}
+
+/// Only a canonical provider completion may settle an entered native block request.
+pub(crate) fn complete_exec_native_block(
+    ticket: nt_fs::NativeBlockTicket,
+    transferred_bytes: u64,
+) -> Result<(), nt_fs::BlockRouteError> {
+    unsafe {
+        let route = (&mut *core::ptr::addr_of_mut!(EXEC_BLOCK_ROUTE))
+            .as_mut().ok_or(nt_fs::BlockRouteError::InvalidMount)?;
+        route.complete_native(ticket, transferred_bytes)
+    }
+}
+
+/// An exact failed provider terminal still retires its block ticket after canonical ACK.
+pub(crate) fn complete_exec_native_block_failure(
+    ticket: nt_fs::NativeBlockTicket,
+) -> Result<(), nt_fs::BlockRouteError> {
+    unsafe {
+        let route = (&mut *core::ptr::addr_of_mut!(EXEC_BLOCK_ROUTE))
+            .as_mut().ok_or(nt_fs::BlockRouteError::InvalidMount)?;
+        route.complete_native_failure(ticket)
+    }
+}
+
+pub(crate) fn begin_exec_mount_drain() -> Result<(), nt_fs::BlockRouteError> {
+    unsafe {
+        let mount = (*core::ptr::addr_of!(EXEC_FS_MOUNT_ID))
+            .ok_or(nt_fs::BlockRouteError::InvalidMount)?;
+        let route = (&mut *core::ptr::addr_of_mut!(EXEC_BLOCK_ROUTE))
+            .as_mut()
+            .ok_or(nt_fs::BlockRouteError::InvalidMount)?;
+        match route.source_kind() {
+            nt_fs::BlockSourceKind::Boot => {
+                route.begin_drain(mount.value())?;
+                (&mut *core::ptr::addr_of_mut!(EXEC_FAT_SECTOR_CACHE)).invalidate();
+                (&mut *core::ptr::addr_of_mut!(EXEC_FAT_DIRECTORY_CACHE)).invalidate();
+                (&mut *core::ptr::addr_of_mut!(EXEC_FAT_RANGE_CURSORS)).invalidate();
+                Ok(())
+            }
+            nt_fs::BlockSourceKind::Draining => Ok(()),
+            nt_fs::BlockSourceKind::Native => Err(nt_fs::BlockRouteError::WrongPhase),
+        }
+    }
+}
 
 pub(crate) unsafe fn publish_exec_fs(fs: Fat32) -> Result<(), u32> {
     let slot = &mut *core::ptr::addr_of_mut!(EXEC_FS);
     if slot.is_some() { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); }
+    let physical_sectors = crate::ahci_maintenance::physical_sector_count(&fs)
+        .map_err(|_| nt_fs::STATUS_DEVICE_NOT_READY)?;
+    let expected_disk = crate::ahci_maintenance::expected_disk(&fs, physical_sectors)
+        .map_err(|_| nt_fs::STATUS_DEVICE_NOT_READY)?;
     let id = crate::mounted_volume::allocate_mount_id()?;
-    crate::writable_fs::snapshot_storage::publish(fs, id)?;
+    let route = nt_fs::BlockRouteOwner::new(id.value(), physical_sectors)
+        .map_err(|_| nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
+    crate::writable_fs::snapshot_storage::publish(fs, id, physical_sectors)?;
+    (&mut *core::ptr::addr_of_mut!(EXEC_FAT_SECTOR_CACHE)).invalidate();
+    (&mut *core::ptr::addr_of_mut!(EXEC_FAT_DIRECTORY_CACHE)).invalidate();
+    (&mut *core::ptr::addr_of_mut!(EXEC_FAT_RANGE_CURSORS)).invalidate();
     *core::ptr::addr_of_mut!(EXEC_FS_MOUNT_ID) = Some(id);
+    *core::ptr::addr_of_mut!(EXEC_BLOCK_ROUTE) = Some(route);
+    *core::ptr::addr_of_mut!(EXEC_EXPECTED_DISK) = Some(expected_disk);
     *slot = Some(fs);
     Ok(())
+}
+
+/// Immutable pre-drain media evidence for authenticating the replacement native LUN.
+pub(crate) unsafe fn exec_expected_disk(
+) -> Option<(nt_memory_manager::SectionMountId, nt_pnp_context::native_storage_handoff::ExpectedDisk)> {
+    Some((
+        (*core::ptr::addr_of!(EXEC_FS_MOUNT_ID))?,
+        (&*core::ptr::addr_of!(EXEC_EXPECTED_DISK)).as_ref()?.clone(),
+    ))
 }
 
 pub(crate) unsafe fn exec_fs_file_identity(file_id: u64) -> Option<nt_memory_manager::SectionFileIdentity> {
@@ -1135,16 +1662,16 @@ pub(crate) unsafe fn load_dll_from_fs(
 /// Discover the unique EFI System Partition through the protective MBR and primary GPT,
 /// validate its entry-array CRC, then mount the FAT32 volume inside that partition.
 unsafe fn read_disk_sector_into(
+    owner: FatIoOwner,
     ahci_vaddr: u64,
     dma_vaddr: u64,
     dma_paddr: u64,
     lba: u64,
     out: &mut [u8; nt_fs::DISK_SECTOR_BYTES],
 ) -> Option<()> {
-    if ahci_read_sector(ahci_vaddr, dma_vaddr, dma_paddr, lba) == 0xff {
-        print_str(b"[fat-mount] read timeout lba=");
-        print_u64(lba);
-        print_str(b"\n");
+    let status = read_owner_sector(owner, ahci_vaddr, dma_vaddr, dma_paddr, lba);
+    if !nt_ahci::read_completion_ok(status) {
+        report_fat_read_failure(b"[fat-mount]", lba, 1, status);
         return None;
     }
     core::ptr::copy_nonoverlapping(
@@ -1155,16 +1682,16 @@ unsafe fn read_disk_sector_into(
     Some(())
 }
 
-pub(crate) unsafe fn fat32_mount_with_census(
+unsafe fn fat32_mount_for_owner(
     ahci_vaddr: u64,
     dma_vaddr: u64,
     dma_paddr: u64,
-    census: bool,
+    owner: FatIoOwner,
 ) -> Option<Fat32> {
     let mut sector = [0u8; nt_fs::DISK_SECTOR_BYTES];
-    read_disk_sector_into(ahci_vaddr, dma_vaddr, dma_paddr, 0, &mut sector)?;
+    read_disk_sector_into(owner, ahci_vaddr, dma_vaddr, dma_paddr, 0, &mut sector)?;
     nt_fs::validate_protective_mbr(&sector).ok()?;
-    read_disk_sector_into(ahci_vaddr, dma_vaddr, dma_paddr, 1, &mut sector)?;
+    read_disk_sector_into(owner, ahci_vaddr, dma_vaddr, dma_paddr, 1, &mut sector)?;
     let header = nt_fs::parse_gpt_header(&sector, 1).ok()?;
     let table_bytes = usize::try_from(header.partition_entries_bytes()?).ok()?;
     let entry_size = header.partition_entry_size as usize;
@@ -1177,7 +1704,7 @@ pub(crate) unsafe fn fat32_mount_with_census(
         let lba = header
             .partition_entries_lba
             .checked_add((consumed / nt_fs::DISK_SECTOR_BYTES) as u64)?;
-        read_disk_sector_into(ahci_vaddr, dma_vaddr, dma_paddr, lba, &mut sector)?;
+        read_disk_sector_into(owner, ahci_vaddr, dma_vaddr, dma_paddr, lba, &mut sector)?;
         let take = (table_bytes - consumed).min(nt_fs::DISK_SECTOR_BYTES);
         crc.update(&sector[..take]);
         for byte in &sector[..take] {
@@ -1203,11 +1730,12 @@ pub(crate) unsafe fn fat32_mount_with_census(
     }
     let esp = esp?;
     let partition_sectors = esp.sector_count()?;
-    read_disk_sector_into(ahci_vaddr, dma_vaddr, dma_paddr, esp.first_lba, &mut sector)?;
+    read_disk_sector_into(owner, ahci_vaddr, dma_vaddr, dma_paddr, esp.first_lba, &mut sector)?;
     let geometry = nt_fs::Fat32Geometry::parse(&sector, partition_sectors).ok()?;
     let snapshot_start_lba = header.disk_sectors()?;
     let mounted = Fat32 {
-        census,
+        census: matches!(owner, FatIoOwner::Executive),
+        io_owner: owner,
         ahci_vaddr,
         dma_vaddr,
         dma_paddr,
@@ -1221,6 +1749,7 @@ pub(crate) unsafe fn fat32_mount_with_census(
         fs_info_sector: geometry.fs_info_sector,
         volume_serial: geometry.volume_serial,
         volume_label: geometry.volume_label,
+        volume_dirty: geometry.volume_dirty,
         fat_start: geometry.fat_start_sector,
         data_start: geometry.data_start_sector,
         root_cl: geometry.root_cluster,
@@ -1228,11 +1757,22 @@ pub(crate) unsafe fn fat32_mount_with_census(
     print_str(b"[fat-mount] partition-guid=");
     print_str(&nt_fs::format_gpt_guid(mounted.partition_guid));
     print_str(b"\n");
+    print_str(b"[fat-mount-bpb] dirty=");
+    print_u64(u64::from(sector[0x41] & 1));
+    print_str(b"\n");
     Some(mounted)
 }
 
 pub(crate) unsafe fn fat32_mount(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64) -> Option<Fat32> {
-    fat32_mount_with_census(ahci_vaddr, dma_vaddr, dma_paddr, true)
+    fat32_mount_for_owner(ahci_vaddr, dma_vaddr, dma_paddr, FatIoOwner::Executive)
+}
+
+pub(crate) unsafe fn fat32_mount_isolated_storage_host(
+    ahci_vaddr: u64,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+) -> Option<Fat32> {
+    fat32_mount_for_owner(ahci_vaddr, dma_vaddr, dma_paddr, FatIoOwner::IsolatedStorageHost)
 }
 
 /// The executive's on-demand file-buffer POOL: a fresh VA region whose frames are allocated + mapped
@@ -1243,6 +1783,9 @@ pub const POOL_VADDR: u64 = 0x0000_0100_1500_0000;
 pub const POOL_PTS: u64 = 24; // 48 MiB (24 * 2 MiB) — headroom for the whole stack + P5 binaries
 pub(crate) static POOL_NEXT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static POOL_INITED: AtomicU64 = AtomicU64::new(0);
+/// The file pool is bump-only and never resets or frees allocations in this executive lifetime.
+/// If a reset is ever introduced, it must advance this epoch before an address can be reused.
+pub(crate) static POOL_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 /// Reserve the pool's page tables in the executive's VSpace (once). Idempotent.
 pub(crate) unsafe fn pool_init() -> bool {

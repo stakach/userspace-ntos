@@ -4,6 +4,7 @@
 //! at the API boundary are Windows 100ns intervals.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use nt_time::{AdjustableClock, Deadline, TimeSnapshot};
 
 /// Input frequency of the PC-compatible 8254 timer.
@@ -30,6 +31,62 @@ impl TimerRearmOutcome {
     }
 }
 
+/// Retained demand for a physical timer shot. A nested publisher can add work
+/// while an earlier programming attempt is in flight; only that attempt's
+/// captured publication may be acknowledged.
+pub struct TimerRearmDemand {
+    publication: AtomicU64,
+    acknowledged: AtomicU64,
+}
+
+#[must_use = "finish the captured rearm attempt after timer programming"]
+pub struct TimerRearmAttempt<'a> {
+    demand: &'a TimerRearmDemand,
+    publication: u64,
+    claimable: bool,
+}
+
+impl TimerRearmDemand {
+    pub const fn new() -> Self {
+        Self { publication: AtomicU64::new(0), acknowledged: AtomicU64::new(0) }
+    }
+
+    pub fn publish(&self) {
+        self.publication.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.publication.load(Ordering::Acquire) != self.acknowledged.load(Ordering::Acquire)
+    }
+
+    /// An unavailable queue borrow cannot justify either programming or idle.
+    pub fn begin(&self, claimable: Option<bool>) -> Option<TimerRearmAttempt<'_>> {
+        let claimable = claimable?;
+        let publication = self.publication.load(Ordering::Acquire);
+        (publication != self.acknowledged.load(Ordering::Acquire)).then_some(TimerRearmAttempt {
+            demand: self, publication, claimable,
+        })
+    }
+}
+
+impl Default for TimerRearmDemand {
+    fn default() -> Self { Self::new() }
+}
+
+impl TimerRearmAttempt<'_> {
+    /// A successful shot covers the sampled work. Idle is conclusive only when
+    /// the sampled queue had no claimable sector. Failure retains the demand.
+    pub fn finish(self, outcome: TimerRearmOutcome) -> bool {
+        if matches!(outcome, TimerRearmOutcome::Programmed)
+            || (!self.claimable && matches!(outcome, TimerRearmOutcome::Idle))
+        {
+            self.demand.acknowledged.fetch_max(self.publication, Ordering::AcqRel);
+            return true;
+        }
+        false
+    }
+}
+
 /// Outer receive preconditions, sampled from the current timer and scheduler owners.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimerReceiveState {
@@ -37,6 +94,7 @@ pub struct TimerReceiveState {
     pub active: bool,
     pub delivery_running: bool,
     pub continuation_running: bool,
+    pub pending_delivery: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +103,7 @@ pub enum TimerReceiveError {
     UnavailableOwner,
     ActiveDelivery,
     ActiveContinuation,
+    PendingDelivery,
     Rearm(TimerRearmOutcome),
 }
 
@@ -68,6 +127,9 @@ impl TimerReceiveState {
         }
         if self.continuation_running {
             return Err(TimerReceiveError::ActiveContinuation);
+        }
+        if self.pending_delivery {
+            return Err(TimerReceiveError::PendingDelivery);
         }
         match rearm() {
             Some(outcome) if !outcome.owner_available() => Err(TimerReceiveError::Rearm(outcome)),
@@ -130,6 +192,63 @@ pub fn pit_oneshot_for_deadline(
         wake_deadline_100ns,
         chunked: wake_deadline_100ns < deadline_100ns,
     }
+}
+
+/// A live one-shot is sufficient when its physical wake is no later than the next
+/// selected deadline. An expired or delivered shot cannot cover new demand, even
+/// if its former wake time compares favourably with that deadline.
+pub const fn pit_oneshot_covers_deadline(
+    armed: bool,
+    physical_wake_100ns: u64,
+    now_100ns: u64,
+    selected_deadline_100ns: u64,
+) -> bool {
+    armed && now_100ns < physical_wake_100ns
+        && physical_wake_100ns <= selected_deadline_100ns
+}
+
+/// Authority to reuse one physical PIT shot. A timer notification or an idle
+/// selection retires it before any subsequent rearm decision. The wake target
+/// remains available for diagnostics after retirement.
+pub struct PitOneShotAuthority {
+    physical_wake_100ns: AtomicU64,
+    armed: AtomicBool,
+}
+
+impl PitOneShotAuthority {
+    pub const fn new() -> Self {
+        Self { physical_wake_100ns: AtomicU64::new(0), armed: AtomicBool::new(false) }
+    }
+
+    pub fn publish(&self, physical_wake_100ns: u64) {
+        self.physical_wake_100ns.store(physical_wake_100ns, Ordering::Relaxed);
+        self.armed.store(true, Ordering::Release);
+    }
+
+    pub fn invalidate(&self) {
+        self.armed.store(false, Ordering::Release);
+    }
+
+    pub fn covers(&self, now_100ns: u64, selected_deadline_100ns: u64) -> bool {
+        pit_oneshot_covers_deadline(
+            self.armed.load(Ordering::Acquire),
+            self.physical_wake_100ns.load(Ordering::Relaxed),
+            now_100ns,
+            selected_deadline_100ns,
+        )
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::Acquire)
+    }
+
+    pub fn physical_wake_100ns(&self) -> u64 {
+        self.physical_wake_100ns.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for PitOneShotAuthority {
+    fn default() -> Self { Self::new() }
 }
 
 fn div_ceil_u128(numerator: u128, denominator: u128) -> u128 {

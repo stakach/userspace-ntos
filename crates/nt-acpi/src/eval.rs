@@ -6,6 +6,8 @@ pub const ACPI_EVAL_INPUT_BUFFER_LEN: usize = 8;
 pub const ACPI_EVAL_INPUT_BUFFER_EX_LEN: usize = 260;
 /// Native `sizeof(ACPI_EVAL_OUTPUT_BUFFER)` for the shipped amd64 provider.
 pub const ACPI_EVAL_OUTPUT_PROBE_LEN: usize = 20;
+/// `IOCTL_ACPI_EVAL_METHOD_EX` returns a full-width ACPI integer in this exact size.
+pub const ACPI_EVAL_EXTENDED_INTEGER_LEN: usize = 24;
 
 const EVAL_INPUT_SIGNATURE: u32 = u32::from_be_bytes(*b"BieA");
 const EVAL_INPUT_EX_SIGNATURE: u32 = u32::from_be_bytes(*b"AieA");
@@ -53,8 +55,7 @@ pub fn eval_method_input_ex(
 
 /// Validate an overflow probe and return the provider's exact retry size.
 ///
-/// The ReactOS provider writes `Signature`, `Length`, and `Count`, then reports the same required
-/// length through `IoStatus.Information`. The executive validates both values independently.
+/// The provider writes `Signature`, required `Length`, and `Count` into the fixed header.
 pub fn eval_output_required_len(probe: &[u8], maximum: usize) -> Result<usize, AcpiEvalError> {
     if probe.len() < EVAL_OUTPUT_HEADER_LEN {
         return Err(AcpiEvalError::Truncated);
@@ -78,6 +79,24 @@ pub fn eval_output_required_len(probe: &[u8], maximum: usize) -> Result<usize, A
     Ok(required)
 }
 
+/// Decode the released LiberNT provider's `STATUS_BUFFER_OVERFLOW` result.
+///
+/// `IoStatus.Information` is the 20 valid header bytes, while `Length` inside that
+/// header is the exact retry size. This avoids a METHOD_BUFFERED completion copy
+/// beyond the caller's probe buffer.
+pub fn eval_output_overflow_retry_len(
+    information: u64,
+    probe: &[u8],
+    maximum: usize,
+) -> Result<usize, AcpiEvalError> {
+    if information != ACPI_EVAL_OUTPUT_PROBE_LEN as u64
+        || probe.len() != ACPI_EVAL_OUTPUT_PROBE_LEN
+    {
+        return Err(AcpiEvalError::InvalidRequiredLength);
+    }
+    eval_output_required_len(probe, maximum)
+}
+
 /// Decode one exact integer result, as used for `_SEG` and `_BBN`.
 pub fn parse_integer_evaluation(bytes: &[u8]) -> Result<u32, AcpiEvalError> {
     if bytes.len() < EVAL_OUTPUT_HEADER_LEN {
@@ -94,6 +113,20 @@ pub fn parse_integer_evaluation(bytes: &[u8]) -> Result<u32, AcpiEvalError> {
         return Err(AcpiEvalError::InvalidIntegerResult);
     }
     read_u32(bytes, 16).map_err(|_| AcpiEvalError::InvalidIntegerResult)
+}
+
+/// Decode the 64-bit integer returned by the released provider for an extended method.
+pub fn parse_extended_integer_evaluation(bytes: &[u8]) -> Result<u64, AcpiEvalError> {
+    if bytes.len() != ACPI_EVAL_EXTENDED_INTEGER_LEN
+        || read_u32(bytes, 0)? != EVAL_OUTPUT_SIGNATURE
+        || read_u32(bytes, 4)? as usize != bytes.len()
+        || read_u32(bytes, 8)? != 1
+        || read_u16(bytes, 12)? != METHOD_ARGUMENT_INTEGER
+        || read_u16(bytes, 14)? != 8
+    {
+        return Err(AcpiEvalError::InvalidIntegerResult);
+    }
+    Ok(u64::from_le_bytes(bytes[16..24].try_into().unwrap()))
 }
 
 fn valid_name_seg(method: [u8; 4]) -> bool {
@@ -184,6 +217,31 @@ mod tests {
             eval_output_required_len(&[0; ACPI_EVAL_OUTPUT_PROBE_LEN], 4096),
             Err(AcpiEvalError::InvalidOutput)
         );
+    }
+
+    #[test]
+    fn pinned_libernt_overflow_reports_header_bytes_not_required_size() {
+        // LiberNT acpi.sys at 8e478a22: EvalCreateOutputArguments writes the required
+        // length into OutputBuffer->Length, but IoStatus.Information is sizeof header
+        // (20) on STATUS_BUFFER_OVERFLOW so buffered completion cannot overcopy.
+        let probe = output_header(84, 4);
+        assert_eq!(eval_output_overflow_retry_len(20, &probe, 4096), Ok(84));
+        assert_eq!(eval_output_overflow_retry_len(84, &probe, 4096), Err(AcpiEvalError::InvalidRequiredLength));
+        assert_eq!(eval_output_overflow_retry_len(19, &probe, 4096), Err(AcpiEvalError::InvalidRequiredLength));
+        assert_eq!(eval_output_overflow_retry_len(20, &output_header(20, 1), 4096), Err(AcpiEvalError::InvalidRequiredLength));
+    }
+
+    #[test]
+    fn extended_integer_result_retains_full_adr_width() {
+        let mut bytes = [0u8; 24];
+        bytes[..4].copy_from_slice(&EVAL_OUTPUT_SIGNATURE.to_le_bytes());
+        bytes[4..8].copy_from_slice(&24u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        bytes[14..16].copy_from_slice(&8u16.to_le_bytes());
+        bytes[16..24].copy_from_slice(&0x1234_5678_9abc_def0u64.to_le_bytes());
+        assert_eq!(parse_extended_integer_evaluation(&bytes), Ok(0x1234_5678_9abc_def0));
+        bytes[14..16].copy_from_slice(&4u16.to_le_bytes());
+        assert_eq!(parse_extended_integer_evaluation(&bytes), Err(AcpiEvalError::InvalidIntegerResult));
     }
 
     #[test]

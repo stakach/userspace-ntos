@@ -19,8 +19,9 @@ mod io;
 mod namespace;
 #[cfg(test)]
 mod namespace_bootstrap_tests;
-pub use namespace::FilePathTarget;
+pub use namespace::{session_namespace_ownership, FilePathTarget, SessionNamespaceOwnership};
 pub mod directory;
+pub mod hosted_dynamic_type;
 pub mod object_security;
 pub mod object_type;
 mod store;

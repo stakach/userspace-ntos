@@ -10,3 +10,5 @@ mod local_inline_retirement;
 mod owned_inline_reference_receipt;
 #[path = "owned_file_completion/owned_mode_precommit.rs"]
 mod owned_mode_precommit;
+#[path = "owned_file_completion/owned_mode_input_capture.rs"]
+mod owned_mode_input_capture;

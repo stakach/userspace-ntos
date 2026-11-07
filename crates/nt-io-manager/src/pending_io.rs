@@ -90,6 +90,14 @@ pub struct PendingSetFileNameOperation {
     pub target_file_id: u64,
 }
 
+/// An internal, process-handle-free File CREATE followed by QUERY_INFORMATION for a
+/// name-based attribute syscall. The same File and caller own both exact IRPs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingFileAttributeQuery {
+    pub information_class: u32,
+    pub inline_terminal: Option<(u32, u64)>,
+}
+
 /// Terminal state for one local-filesystem byte-range lock wait. Provider-backed locks retain a
 /// canonical IRP and use [`PendingFileIoOperation::Transfer`]; this variant lets the same delivery
 /// owner publish local FSD completions without pretending that an executive IRP exists.
@@ -128,6 +136,19 @@ pub struct PendingOwnedModePrecommit {
     pub requested_mode: u32,
 }
 
+/// Original user input owned by a parked FileModeInformation call. A nonzero token identifies
+/// the one routed page worker allowed to advance this row. Neither this phase nor page admission
+/// publishes an IOSB or enters the mode mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingOwnedModeInputCapture {
+    pub input_va: u64,
+    pub length: usize,
+    pub next_page: u64,
+    pub pending_page: u64,
+    pub pending_token: u64,
+    pub signal_reset: bool,
+}
+
 /// An already-terminal local read or directory query with immutable table-owned output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct PendingLocalBuffered {
@@ -141,12 +162,20 @@ pub enum PendingFileIoOperation {
     Transfer,
     Create(PendingFileCreate),
     SetFileName(PendingSetFileNameOperation),
+    AttributeQuery(PendingFileAttributeQuery),
     LocalByteLock(PendingLocalByteLock),
     LocalDirectoryNotify(PendingLocalDirectoryNotify),
     OwnedInline(PendingOwnedInline),
+    OwnedModeInputCapture(PendingOwnedModeInputCapture),
     OwnedModePrecommit(PendingOwnedModePrecommit),
     LocalBuffered(PendingLocalBuffered),
     LocalFlush(PendingLocalFlush),
+}
+
+impl PendingFileIoOperation {
+    pub const fn is_owned_mode_uncommitted(self) -> bool {
+        matches!(self, Self::OwnedModeInputCapture(_) | Self::OwnedModePrecommit(_))
+    }
 }
 
 /// One pending File-bound operation and every completion surface owned by that exact IRP.
@@ -208,6 +237,12 @@ pub struct PendingFileIo {
 }
 
 impl PendingFileIo {
+    /// A live consumer needs its process mirrors for user delivery. A detached IRP retains
+    /// provider ownership only and must finish without entering the retired process VSpace.
+    pub const fn needs_consumer_context(&self) -> bool {
+        !self.consumer_abandoned
+    }
+
     fn reply_claim_in_flight(&self) -> bool {
         self.delivery_state & (IO_DELIVERY_REPLY_CLAIMED | IO_DELIVERY_REPLY_PUBLISHED)
             == IO_DELIVERY_REPLY_CLAIMED
@@ -271,8 +306,16 @@ pub struct PendingFileIoIdentity {
 }
 
 impl PendingFileIoIdentity {
+    pub const fn table(self) -> u64 {
+        self.table
+    }
+
     pub const fn slot(self) -> usize {
         self.slot
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
     }
 }
 
@@ -318,6 +361,133 @@ impl Default for PendingFileIoTable {
 }
 
 impl PendingFileIoTable {
+    pub fn mark_mode_input_signal_reset_exact(
+        &mut self, identity: PendingFileIoIdentity, irp_id: u64,
+    ) -> Option<()> {
+        if self.identity(identity.slot)? != identity { return None; }
+        let row = self.slots.get_mut(identity.slot)?.as_mut()?;
+        if row.irp_id != irp_id || row.delivery_state != 0 { return None; }
+        let PendingFileIoOperation::OwnedModeInputCapture(mut input) = row.operation else { return None; };
+        if input.signal_reset || input.pending_token != 0 { return None; }
+        input.signal_reset = true;
+        row.operation = PendingFileIoOperation::OwnedModeInputCapture(input);
+        Some(())
+    }
+
+    pub fn fail_mode_input_exact(
+        &mut self, identity: PendingFileIoIdentity, irp_id: u64, status: u32,
+    ) -> Option<()> {
+        if status == nt_status::NtStatus::PENDING.raw() as u32
+            || self.identity(identity.slot)? != identity { return None; }
+        let row = self.slots.get_mut(identity.slot)?.as_mut()?;
+        if row.irp_id != irp_id || row.delivery_state != 0 { return None; }
+        let PendingFileIoOperation::OwnedModeInputCapture(input) = row.operation else { return None; };
+        if input.pending_token != 0 { return None; }
+        row.iosb_va = 0;
+        row.signal_file = false;
+        row.operation = PendingFileIoOperation::OwnedInline(PendingOwnedInline { status, information: 0 });
+        Some(())
+    }
+
+    /// Record a page admission or an exact routed worker completion before advancing input.
+    /// A failed page terminates capture without mutating the File or publishing its IOSB.
+    pub fn complete_mode_input_page_exact(
+        &mut self, identity: PendingFileIoIdentity, irp_id: u64,
+        page: u64, token: u64, status: u32,
+    ) -> Option<()> {
+        if status == nt_status::NtStatus::PENDING.raw() as u32 { return None; }
+        let row = self.slots.get_mut(identity.slot)?.as_mut()?;
+        if identity.table != self.identity
+            || self.owner_generations.get(identity.slot).copied()? != identity.generation
+            || row.irp_id != irp_id || row.delivery_state != 0
+        { return None; }
+        let PendingFileIoOperation::OwnedModeInputCapture(mut input) = row.operation else {
+            return None;
+        };
+        if !input.signal_reset || input.next_page != page
+            || input.pending_page != (if token == 0 { 0 } else { page })
+            || input.pending_token != token
+        { return None; }
+        if status == 0 {
+            input.next_page = page.checked_add(4096)?;
+            input.pending_page = 0;
+            input.pending_token = 0;
+            row.operation = PendingFileIoOperation::OwnedModeInputCapture(input);
+        } else {
+            row.iosb_va = 0;
+            row.signal_file = false;
+            row.operation = PendingFileIoOperation::OwnedInline(PendingOwnedInline {
+                status, information: 0,
+            });
+        }
+        Some(())
+    }
+
+    /// Publish the token before submitting the routed worker. A definite pre-entry refusal may
+    /// clear this token; an entered or uncertain worker must retain it until its exact callback.
+    pub fn begin_mode_input_page_exact(
+        &mut self, identity: PendingFileIoIdentity, irp_id: u64, page: u64, token: u64,
+    ) -> Option<()> {
+        if token == 0 || identity.table != self.identity
+            || self.owner_generations.get(identity.slot).copied()? != identity.generation {
+            return None;
+        }
+        let row = self.slots.get_mut(identity.slot)?.as_mut()?;
+        if row.irp_id != irp_id || row.delivery_state != 0 || row.consumer_abandoned {
+            return None;
+        }
+        let PendingFileIoOperation::OwnedModeInputCapture(mut input) = row.operation else {
+            return None;
+        };
+        if !input.signal_reset || input.next_page != page || input.pending_token != 0 { return None; }
+        input.pending_page = page;
+        input.pending_token = token;
+        row.operation = PendingFileIoOperation::OwnedModeInputCapture(input);
+        Some(())
+    }
+
+    pub fn abort_unentered_mode_input_page_exact(
+        &mut self, identity: PendingFileIoIdentity, irp_id: u64, page: u64, token: u64,
+    ) -> Option<()> {
+        if token == 0 || identity.table != self.identity
+            || self.owner_generations.get(identity.slot).copied()? != identity.generation {
+            return None;
+        }
+        let row = self.slots.get_mut(identity.slot)?.as_mut()?;
+        if row.irp_id != irp_id { return None; }
+        let PendingFileIoOperation::OwnedModeInputCapture(mut input) = row.operation else {
+            return None;
+        };
+        if input.next_page != page || input.pending_page != page || input.pending_token != token {
+            return None;
+        }
+        input.pending_page = 0;
+        input.pending_token = 0;
+        row.operation = PendingFileIoOperation::OwnedModeInputCapture(input);
+        Some(())
+    }
+
+    /// The capture has no native mode effect; after this transition the existing precommit
+    /// owner can enter its single mode mutation and the normal terminal delivery path.
+    pub fn finish_mode_input_capture_exact(
+        &mut self, identity: PendingFileIoIdentity, irp_id: u64,
+        requested_mode: u32,
+    ) -> Option<()> {
+        if identity.table != self.identity
+            || self.owner_generations.get(identity.slot).copied()? != identity.generation { return None; }
+        let row = self.slots.get_mut(identity.slot)?.as_mut()?;
+        if row.irp_id != irp_id || row.delivery_state != 0 || row.consumer_abandoned { return None; }
+        let PendingFileIoOperation::OwnedModeInputCapture(input) = row.operation else { return None; };
+        if !input.signal_reset || input.pending_token != 0
+            || input.next_page < input.input_va.checked_add(input.length as u64)? {
+            return None;
+        }
+        row.operation = PendingFileIoOperation::OwnedModePrecommit(PendingOwnedModePrecommit {
+            requested_mode,
+        });
+        Some(())
+    }
+
     pub fn commit_owned_mode_exact(
         &mut self,
         identity: PendingFileIoIdentity,
@@ -537,6 +707,21 @@ impl PendingFileIoTable {
                     && !pending.publish_iocp
                     && pending.event_obj_idx == u64::MAX
             }
+            PendingFileIoOperation::AttributeQuery(operation) => {
+                matches!(pending.major,
+                    nt_io_abi::major::IRP_MJ_CREATE | nt_io_abi::major::IRP_MJ_QUERY_INFORMATION)
+                    && matches!(operation.information_class,
+                        nt_fs::FILE_BASIC_INFORMATION | nt_fs::FILE_NETWORK_OPEN_INFORMATION)
+                    && pending.output_va != 0
+                    && pending.output_len == if operation.information_class
+                        == nt_fs::FILE_BASIC_INFORMATION { 40 } else { 56 }
+                    && pending.iosb_va == 0
+                    && pending.apc_routine == 0
+                    && !pending.signal_file
+                    && !pending.publish_iocp
+                    && pending.event_obj_idx == u64::MAX
+                    && pending.busy.is_none()
+            }
             PendingFileIoOperation::LocalByteLock(operation) => {
                 pending.major == nt_io_abi::major::IRP_MJ_LOCK_CONTROL
                     && operation.wait_id != 0
@@ -560,6 +745,21 @@ impl PendingFileIoTable {
                     && pending.output_va == 0
                     && pending.output_len == 0
                     && !pending.publish_iocp
+            }
+            PendingFileIoOperation::OwnedModeInputCapture(input) => {
+                let end = input.input_va.checked_add(input.length as u64);
+                pending.major == nt_io_abi::major::IRP_MJ_SET_INFORMATION
+                    && input.input_va != 0 && input.length >= 4
+                    && end.is_some_and(|end| input.next_page <= (end.saturating_add(4095) & !4095))
+                    && input.next_page >= (input.input_va & !4095)
+                    && (input.next_page & 4095) == 0
+                    && (input.pending_token == 0) == (input.pending_page == 0)
+                    && (input.pending_page == 0 || input.pending_page == input.next_page)
+                    && (input.pending_token == 0 || input.signal_reset)
+                    && pending.output_va == 0 && pending.output_len == 0
+                    && pending.apc_routine == 0 && !pending.publish_iocp
+                    && pending.completion_port_suppressed
+                    && pending.event_obj_idx == u64::MAX
             }
             PendingFileIoOperation::OwnedModePrecommit(_) => {
                 pending.major == nt_io_abi::major::IRP_MJ_SET_INFORMATION
@@ -879,8 +1079,8 @@ impl PendingFileIoTable {
                 _ => source_file_id,
             };
             !pending.is_local()
-                && !matches!(pending.operation, PendingFileIoOperation::OwnedInline(_)
-                    | PendingFileIoOperation::OwnedModePrecommit(_))
+                && !matches!(pending.operation, PendingFileIoOperation::OwnedInline(_))
+                && !pending.operation.is_owned_mode_uncommitted()
                 && pending.irp_id == irp_id
                 && expected_file_id == file_id
                 && pending.tid == requestor_tid
@@ -911,6 +1111,47 @@ impl PendingFileIoTable {
         }
         pending.irp_id = new_irp_id;
         pending.major = nt_io_abi::major::IRP_MJ_SET_INFORMATION;
+        Some(())
+    }
+
+    /// Transfer a name-based attribute owner from an acknowledged CREATE to its query IRP.
+    pub fn retarget_attribute_query_exact(
+        &mut self,
+        slot: usize,
+        old_irp_id: u64,
+        new_irp_id: u64,
+    ) -> Option<()> {
+        if self.apc_owned_slot(slot) { return None; }
+        let pending = self.slots.get_mut(slot)?.as_mut()?;
+        if pending.irp_id != old_irp_id || new_irp_id == 0
+            || pending.major != nt_io_abi::major::IRP_MJ_CREATE
+            || !matches!(pending.operation,
+                PendingFileIoOperation::AttributeQuery(PendingFileAttributeQuery { inline_terminal: None, .. }))
+            || pending.delivery_state != 0
+            || pending.busy.is_some_and(|busy| !busy.release_unstarted())
+        { return None; }
+        pending.irp_id = new_irp_id;
+        pending.major = nt_io_abi::major::IRP_MJ_QUERY_INFORMATION;
+        Some(())
+    }
+
+    /// A successful CREATE may be followed by an inline QUERY. Its output has already been
+    /// copied by the executive; the row still owns the original reply and File retirement.
+    pub fn complete_attribute_query_inline_exact(
+        &mut self, slot: usize, create_irp_id: u64, status: u32, information: u64,
+    ) -> Option<()> {
+        let pending = self.slots.get_mut(slot)?.as_mut()?;
+        let PendingFileIoOperation::AttributeQuery(mut operation) = pending.operation else { return None; };
+        if pending.irp_id != create_irp_id
+            || pending.major != nt_io_abi::major::IRP_MJ_CREATE
+            || pending.delivery_state != 0
+            || operation.inline_terminal.is_some()
+            || status == nt_status::NtStatus::PENDING.raw() as u32
+        { return None; }
+        operation.inline_terminal = Some((status, information));
+        pending.operation = PendingFileIoOperation::AttributeQuery(operation);
+        pending.major = nt_io_abi::major::IRP_MJ_QUERY_INFORMATION;
+        pending.delivery_state = IO_DELIVERY_BUFFER_PUBLISHED;
         Some(())
     }
 
@@ -1081,7 +1322,7 @@ impl PendingFileIoTable {
         }
         self.get(slot).is_some_and(|pending| {
             pending.irp_id == irp_id
-                && !matches!(pending.operation, PendingFileIoOperation::OwnedModePrecommit(_))
+                && !pending.operation.is_owned_mode_uncommitted()
                 && pending.busy_is_settled()
                 && Self::create_output_is_settled(pending)
                 && pending.delivery_state
@@ -1152,7 +1393,7 @@ impl PendingFileIoTable {
         let entry = self.slots.get_mut(slot)?;
         let finished = if entry.is_some_and(|pending| {
             pending.irp_id == irp_id
-                && !matches!(pending.operation, PendingFileIoOperation::OwnedModePrecommit(_))
+                && !pending.operation.is_owned_mode_uncommitted()
                 && pending.busy_is_settled()
                 && Self::create_output_is_settled(pending)
                 && pending.delivery_state & Self::required_delivery_state(pending)
@@ -1186,7 +1427,7 @@ impl PendingFileIoTable {
         }
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         if pending.irp_id != irp_id
-            || matches!(pending.operation, PendingFileIoOperation::OwnedModePrecommit(_))
+            || pending.operation.is_owned_mode_uncommitted()
             || !Self::local_flush_delivery_flag_is_valid(*pending, flag)
             || (matches!(pending.operation, PendingFileIoOperation::LocalBuffered(_))
                 && (flag == IO_DELIVERY_BUFFER_PUBLISHED || !Self::local_output_settled(*pending)))
@@ -1215,6 +1456,7 @@ impl PendingFileIoTable {
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         if pending.irp_id != irp_id
             || matches!(pending.operation, PendingFileIoOperation::LocalFlush(_)
+                | PendingFileIoOperation::OwnedModeInputCapture(_)
                 | PendingFileIoOperation::OwnedModePrecommit(_) | PendingFileIoOperation::Create(_))
             || expected_iosb_va == 0
             || pending.iosb_va != expected_iosb_va
@@ -1259,7 +1501,8 @@ impl PendingFileIoTable {
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         if pending.irp_id != irp_id
             || matches!(pending.operation,
-                PendingFileIoOperation::OwnedInline(_) | PendingFileIoOperation::OwnedModePrecommit(_)
+                PendingFileIoOperation::OwnedInline(_) | PendingFileIoOperation::OwnedModeInputCapture(_)
+                    | PendingFileIoOperation::OwnedModePrecommit(_)
                     | PendingFileIoOperation::LocalFlush(_))
             || terminal_output_len > pending.output_len
             || pending.output_offset > terminal_output_len
@@ -1285,7 +1528,7 @@ impl PendingFileIoTable {
         }
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         if pending.irp_id != irp_id
-            || matches!(pending.operation, PendingFileIoOperation::OwnedModePrecommit(_))
+            || pending.operation.is_owned_mode_uncommitted()
             || !pending.reply_required
             || !Self::local_output_settled(*pending)
             || !Self::local_flush_reply_ready(*pending)
@@ -1346,7 +1589,7 @@ impl PendingFileIoTable {
         }
         let pending = self.slots.get_mut(slot)?.as_mut()?;
         if pending.irp_id != irp_id
-            || matches!(pending.operation, PendingFileIoOperation::OwnedModePrecommit(_))
+            || pending.operation.is_owned_mode_uncommitted()
             || !pending.busy_is_settled()
             || !Self::create_output_is_settled(*pending)
             || pending.delivery_state & IO_DELIVERY_BACKEND_ACKED != 0
@@ -2411,6 +2654,59 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn preparked_create_reply_keeps_exact_caller_until_verified_reply_and_backend_ack() {
+        let mut table = PendingFileIoTable::new();
+        let reservation = table.reserve().unwrap();
+        let caller = reservation.identity();
+        let mut request = pending(11, 0x294, 24);
+        request.major = nt_io_abi::major::IRP_MJ_CREATE;
+        request.operation = PendingFileIoOperation::Create(PendingFileCreate {
+            handle_va: 0x7000,
+            desired_access: 0x12019F,
+            provider_context: 0,
+            lifecycle_reserved: false,
+            reservation_pid: 12,
+            reserved_handle: 0x44,
+            reservation_generation: 7,
+            status: nt_status::NtStatus::PENDING.raw() as u32,
+            information: 0,
+            handle_value: 0,
+            output: PendingCreateOutput::default(),
+        });
+        request.output_va = 0;
+        request.output_len = 0;
+        request.iosb_va = 0x7100;
+        request.apc_routine = 0;
+        request.signal_file = false;
+        request.publish_iocp = false;
+        request.event_obj_idx = u64::MAX;
+        request.reply_cap = 0x50; // Already parked; never substitute the current main Reply.
+        request.reply_required = true;
+        request.native_call_transport = true;
+        let slot = table.park_reserved(reservation, request).unwrap();
+        assert_eq!(slot, caller.slot());
+        assert_eq!(table.get_exact(caller).unwrap().reply_cap, 0x50);
+
+        table.commit_create_exact(slot, 0x294, 0, 1, 0x44).unwrap();
+        table.settle_test_create(slot, 0x294);
+        assert_eq!(table.claim_reply_cap_exact(slot, 0x294), Some(Some(0x50)));
+        // An uncertain send cannot be replayed or used to retire the File/Reply owner.
+        assert_eq!(table.claim_reply_cap_exact(slot, 0x294), Some(None));
+        assert!(table.mark_backend_acked_exact(slot, 0x294).is_none());
+        assert!(table.finish_exact(slot, 0x294).is_none());
+        assert_eq!(table.get_exact(caller).unwrap().reply_cap, 0x50);
+
+        // Only a verified Reply receipt may advance delivery; backend ACK follows it.
+        table.mark_reply_published_exact(slot, 0x294).unwrap();
+        assert!(table.mark_backend_acked_exact(slot, 0x294).is_some());
+        assert_eq!(table.finish_exact(slot, 0x294).unwrap().irp_id, 0x294);
+        assert!(table.get_exact(caller).is_none());
+        let next = table.reserve().unwrap().identity();
+        assert_ne!(next, caller, "slot reuse must not reauthorize the old caller generation");
+        assert!(table.get_exact(caller).is_none());
     }
 
     #[test]

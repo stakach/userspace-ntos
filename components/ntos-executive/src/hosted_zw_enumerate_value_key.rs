@@ -2,8 +2,6 @@
 
 use super::*;
 
-pub(super) const HOSTED_REGISTRY_OP_ENUMERATE_VALUE: u64 = 16;
-
 /// The sync broker has already authenticated the physical ingress, Reply and registry caller.
 /// No value bytes or raw pointers cross the component boundary; only the encoded result is staged
 /// in the caller's ARG frame after the native handle's read access is checked.

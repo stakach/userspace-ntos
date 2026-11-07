@@ -18,7 +18,20 @@ mod terminal;
 #[path = "kernel_provider_wait_work.rs"]
 mod wait_work;
 pub(super) use wait_work::{publish_bootstrap_waits, publish_runtime_waits};
-use bootstrap::{KernelJobCompletion, KernelJobRecipient};
+use bootstrap::{KernelJobCompletion, KernelJobInitialization, KernelJobRecipient};
+
+struct PendingWin32kBootstrap {
+    receipt: KernelProviderCompletionReceipt,
+    completion: KernelJobCompletion,
+    parent: win32k_glue::Win32kBootstrapPending,
+}
+
+// The activation has already acknowledged when the worker's parent restore is pending.
+// Keep the exact recipient and result here until the original bootstrap consumer observes it.
+static mut PENDING_WIN32K_BOOTSTRAP: Option<PendingWin32kBootstrap> = None;
+static mut SETTLED_WIN32K_BOOTSTRAP:
+    Option<(KernelProviderCaller, KernelProviderCompletionReceipt, bool)> = None;
+static mut FAILED_WIN32K_BOOTSTRAPS: alloc::vec::Vec<KernelJobCompletion> = alloc::vec::Vec::new();
 
 static mut ACTIVATIONS: KernelProviderActivations<KernelJobRecipient> =
     KernelProviderActivations::new();
@@ -114,7 +127,22 @@ pub(crate) unsafe fn run_kernel_job(
         component_resume::run_outer(handler);
         redrive_ready_completions();
         if let Some(status) = result.returned() { return Ok((u64::from(status), true)); }
-        component_resume::prepare_receive(&mut *handler);
+        match component_resume::prepare_receive(&mut *handler) {
+            component_resume::ReceivePreparation::Ready => {}
+            component_resume::ReceivePreparation::PendingDelivery => {
+                // The nested pump may have ACKed the only physical wake. This
+                // boundary holds no handler or queue loan, so its registered
+                // delivery owner can settle the tick before we retry.
+                if drain_nested_pump_timer_delivery()
+                    || DELAY_TIMER_TICKS_PENDING.load(Ordering::Acquire) == 0
+                {
+                    continue;
+                }
+                // Another delivery owns the gate. Keep the activation and
+                // original caller held; a receive here could sleep forever.
+                return Ok((u64::from(nt_process::STATUS_PENDING), false));
+            }
+        }
         let arrival = ingress::receive(nt_component_suspension::IngressExecutionOwner::Idle, 1, true)
             .map_err(|_| nt_process::STATUS_UNSUCCESSFUL)?;
         if let ingress::Arrival::Notification(message) = arrival {
@@ -166,18 +194,105 @@ fn kernel_channel(channel: &spawn_hosts::PumpChannel) -> bool {
         && channel.caps.kind == spawn_hosts::ReqKind::Syscall
 }
 
-fn authenticated_channel_caller(
+fn ps_retirement_channel(channel: &spawn_hosts::PumpChannel, pi: u32, generation: u64) -> bool {
+    channel.logical_caller.is_none()
+        && channel.client_pi == u64::from(pi)
+        && pi != 0
+        && channel.client_generation == generation
+        && generation != 0
+        && channel.caps.kind == spawn_hosts::ReqKind::Syscall
+        && channel.caps.client_attach
+        && channel.caps.provider_wait
+        && !channel.caps.usermode_callback
+}
+
+unsafe fn ps_retirement_is_current(recipient: &KernelJobRecipient) -> bool {
+    let Some((pi, target)) = recipient.ps_retirement() else { return false; };
+    let Ok(handler) = crate::service_sec_image::registry_live_handler() else { return false; };
+    let process = target.process();
+    let current = nt_types::ProcessIdentity {
+        pid: process.pid,
+        generation: nt_types::ProcessGeneration::Hosted(
+            handler.hosted_process_generation(pi as usize).unwrap_or(0),
+        ),
+    };
+    handler.pm_pid_for_pi(pi as usize) == Some(process.pid)
+        && target.validate(&handler.pm, current).is_ok()
+}
+
+/// Root owns execution and completion; the terminated hosted thread is only a pinned Ps target.
+pub(crate) unsafe fn capture_ps_retirement_job(
+    channel: &spawn_hosts::PumpChannel,
+    lane: LaneHandle,
+    native: nt_process::native_handle::NativeHandleCaller,
+    result: &KernelJobResult,
+    client: crate::win32k_glue::Win32kClientContext,
+) -> Result<KernelProviderCaller, u32> {
+    let logical = client.logical_caller.ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let process = logical.process();
+    let thread = logical.thread();
+    if !ps_retirement_channel(channel, client.pi, client.generation)
+        || channel.kernel_caller.is_some()
+        || channel.initial != spawn_hosts::InitialAction::ReplyRequest
+        || process.pid as u64 != client.pid
+        || process.generation != nt_types::ProcessGeneration::Hosted(client.generation)
+        || thread.process_id() != process.pid
+        || u64::from(thread.thread_id()) != client.tid
+        || (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).binding(lane)
+            != Ok(channel_binding(channel))
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    let provider = current_win32k_provider_domain().ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    with_provider_process_manager(|pm| {
+        pm.validate_native_handle_caller(native)?;
+        let target = nt_user_host::provider_ps_retirement::PsRetirementTarget::capture(
+            pm, process, thread, client.eprocess, client.ethread,
+        )?;
+        let mut recipient = match KernelJobRecipient::executive(*channel, result.0.clone()) {
+            Ok(recipient) => recipient,
+            Err(status) => {
+                let mut target = target;
+                target.release(pm).expect("new Ps target reference disappeared");
+                return Err(status);
+            }
+        };
+        recipient.retain_ps_retirement(client.pi, target);
+        let _durable = allocator::enter_durable();
+        match (&mut *core::ptr::addr_of_mut!(ACTIVATIONS)).capture_with_recipient(
+            pm, &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+            &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS), provider, lane, native, recipient,
+        ) {
+            Ok(caller) => Ok(caller),
+            Err((status, mut recipient)) => {
+                recipient.release_ps_retirement(pm)
+                    .expect("unpublished Ps target reference disappeared");
+                Err(status)
+            }
+        }
+    })
+}
+
+pub(crate) fn authenticated_channel_caller(
     channel: &spawn_hosts::PumpChannel,
 ) -> Result<KernelProviderCaller, u32> {
     let caller = channel
         .kernel_caller
         .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-    if !kernel_channel(channel)
+    let recipient = unsafe { (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller) }
+        .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+    let allowed_shape = kernel_channel(channel)
+        || recipient.ps_retirement().is_some_and(|(pi, target)| {
+            ps_retirement_channel(channel, pi, match target.process().generation {
+                nt_types::ProcessGeneration::Hosted(generation) => generation,
+                _ => 0,
+            }) && unsafe { ps_retirement_is_current(recipient) }
+        });
+    if !allowed_shape
         || channel.shared_va != win32k_subsystem::WIN32K_SHARED_VADDR
         || channel.dispatch_label != win32k_subsystem::W32_DISPATCH_LABEL
         || unsafe { kernel_provider_current_binding(caller) } != Ok(channel_binding(channel))
-        || !unsafe { (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller) }
-            .is_ok_and(|recipient| recipient.matches(channel))
+        || !recipient.matches(channel)
         || current_win32k_provider_domain().is_none_or(|provider| {
             caller.owner().provider_domain != provider.domain
                 || caller.owner().provider_generation != provider.generation
@@ -186,6 +301,45 @@ fn authenticated_channel_caller(
         return Err(nt_process::STATUS_INVALID_HANDLE);
     }
     Ok(caller)
+}
+
+/// A parked kernel Ps callout retains its target, but the shared client alias window may have
+/// served another process while it waited. Restore the target's effective APC attachment before
+/// the physical lane can execute again; DriverEntry jobs have no client window to restore.
+unsafe fn restore_ps_retirement_window(
+    caller: KernelProviderCaller,
+    channel: &spawn_hosts::PumpChannel,
+) -> Result<(), u32> {
+    if authenticated_channel_caller(channel)? != caller {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    let recipient = (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller)?;
+    let Some((pi, target)) = recipient.ps_retirement() else {
+        return Ok(());
+    };
+    if !ps_retirement_is_current(recipient) {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    let owner = nt_user_host::client_alias_window::WindowOwner {
+        pi: pi as usize,
+        process: target.process(),
+        vspace: channel.pml4,
+    };
+    if !owner.is_valid() || channel.client_pi != u64::from(pi) {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    crate::win32k_glue::select_effective_kernel(caller, owner, target.eprocess())
+}
+
+/// Root-owned dispatch epoch for an exact stopped kernel-originated provider fault.
+pub(crate) unsafe fn fault_dispatch_id(
+    channel: &spawn_hosts::PumpChannel,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+) -> Option<u64> {
+    let caller = authenticated_channel_caller(channel).ok()?;
+    let owner = caller.owner();
+    (owner.dispatch_id == dispatch.epoch() && owner.dispatch_id != 0)
+        .then_some(owner.dispatch_id)
 }
 
 /// Recover native registry authority only from the exact retained, currently executing job.
@@ -369,7 +523,9 @@ unsafe fn receive_driver_entry_yields(
         let receiving = (&*core::ptr::addr_of!(ACTIVATIONS))
             .recipient(caller)?
             .execution_channel(caller)?;
-        result = spawn_hosts::component_pump_continue_receive(&receiving, &previous)?;
+        restore_ps_retirement_window(caller, &receiving)?;
+        result = spawn_hosts::component_pump_continue_receive_after_scheduler_service(
+            &receiving, &previous)?;
         observe_driver_entry_pump(&receiving, &mut receive_attempt, &result)?;
     }
     Ok(result)
@@ -389,6 +545,23 @@ pub(super) unsafe fn service_ps(
         Ok(target) => target,
         Err(status) => return (status as i32, 0, 0, 0),
     };
+    if native_thread_priority::is_priority_effect_op(op) {
+        let admitted = with_provider_process_manager(|pm| {
+            (&*core::ptr::addr_of!(ACTIVATIONS)).validate(
+                caller, pm,
+                &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
+                &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
+            )
+        });
+        if let Err(status) = admitted {
+            return (status as i32, 0, 0, 0);
+        }
+        let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+        if handler.is_null() {
+            return (0xc000_00a3u32 as i32, 0, 0, 0);
+        }
+        return native_thread_priority::dispatch(&mut *handler, op, object, value);
+    }
     match with_provider_process_manager(|pm| {
         (&*core::ptr::addr_of!(ACTIVATIONS)).validate(
             caller,
@@ -396,9 +569,14 @@ pub(super) unsafe fn service_ps(
             &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS),
             &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS),
         )?;
-        Ok(provider_ps::dispatch(pm, op, object, value, |pm, body| {
-            provider_ps_projection::grant(target, pm, body)
-        }))
+        Ok(provider_ps::dispatch(
+            pm,
+            op,
+            object,
+            value,
+            |pm, job| unsafe { crate::exec_handler::native_job_bodies::ensure(pm, job) },
+            |pm, body| provider_ps_projection::grant(target, pm, body),
+        ))
     }) {
         Ok(result) => result,
         Err(status) => (status as i32, 0, 0, 0),
@@ -430,6 +608,61 @@ pub(super) unsafe fn service_event(
             domain: owner.provider_domain,
             generation: owner.provider_generation,
         };
+        if op == win32k_subsystem::W32_EVENT_OP_CLOSE {
+            if !(arg2 == 0 && arg3 == 0) {
+                return Err(nt_process::STATUS_INVALID_PARAMETER);
+            }
+            // Win32k's thread-exit callout closes a handle in the exiting process.
+            // The kernel job owns the provider wait, but its System handle table is
+            // never authority for that target's Event handle.
+            let recipient = (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller)?;
+            let (pi, target) = recipient.ps_retirement()
+                .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+            if !ps_retirement_is_current(recipient) {
+                return Err(nt_process::STATUS_INVALID_HANDLE);
+            }
+            let handler = crate::service_sec_image::registry_live_handler()?;
+            if handler.capture_process_identity(pi as usize) != Some(target.process()) {
+                return Err(nt_process::STATUS_INVALID_HANDLE);
+            }
+            return Ok(handler.provider_close_event(pi as usize, arg1)
+                .map(|()| (0, 0, 0, 0))
+                .unwrap_or_else(|status| (status as i32, 0, 0, 0)));
+        }
+        if op == win32k_subsystem::W32_EVENT_OP_SET {
+            let handler = crate::service_sec_image::registry_live_handler()?;
+            return Ok(crate::service_sec_image::service_win32k_projected_event_set(
+                handler, arg1,
+            ));
+        }
+        if op == win32k_subsystem::W32_EVENT_OP_DEREFERENCE {
+            let handler = crate::service_sec_image::registry_live_handler()?;
+            return Ok(crate::service_sec_image::service_win32k_projected_event_dereference(
+                handler, arg1,
+            ));
+        }
+        if matches!(op,
+            win32k_subsystem::W32_EVENT_OP_DRAIN_RECLAIM
+                | win32k_subsystem::W32_EVENT_OP_ACK_RECLAIM
+        ) {
+            let handler = crate::service_sec_image::registry_live_handler()?;
+            return Ok(crate::service_sec_image::service_win32k_projected_event_reclaim(
+                handler, op, arg1, arg2,
+            ));
+        }
+        if matches!(
+            op,
+            win32k_subsystem::W32_SYNC_OP_PUBLISH
+                | win32k_subsystem::W32_SYNC_OP_RELEASE_SEMAPHORE
+                | win32k_subsystem::W32_SYNC_OP_RELEASE_MUTANT
+                | win32k_subsystem::W32_SYNC_OP_RETIRE
+                | win32k_subsystem::W32_SYNC_OP_ACK_RETIREMENT
+                | win32k_subsystem::W32_SYNC_OP_QUERY
+        ) {
+            return Ok(crate::service_sec_image::service_win32k_provider_sync_request(
+                provider, Some(owner), op, arg1, arg2, arg3,
+            ));
+        }
         if matches!(
             op,
             win32k_subsystem::W32_TIMER_OP_PUBLISH_LOCAL
@@ -640,8 +873,15 @@ struct CompletionDeliveryPass {
 
 impl CompletionDeliveryPass {
     unsafe fn enter() -> Result<Self, u32> {
-        if component_execution_is_busy()
-            || DELIVERY_ACTIVE
+        if component_execution_is_busy() {
+            return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32);
+        }
+        Self::enter_observation()
+    }
+
+    /// Settling an already acknowledged result never enters a provider or resumes its lane.
+    unsafe fn enter_observation() -> Result<Self, u32> {
+        if DELIVERY_ACTIVE
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
         {
@@ -656,10 +896,21 @@ impl CompletionDeliveryPass {
         if component_execution_is_busy() {
             return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32);
         }
+        let driver_entry = (&*core::ptr::addr_of!(ACTIVATIONS))
+            .recipient(receipt.caller())?.is_driver_entry();
+        if driver_entry && ((&*core::ptr::addr_of!(PENDING_WIN32K_BOOTSTRAP)).is_some()
+            || (&*core::ptr::addr_of!(SETTLED_WIN32K_BOOTSTRAP)).is_some()) {
+            return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32);
+        }
+        // A failed acknowledged startup must still have a durable recipient slot.
+        if driver_entry {
+            (&mut *core::ptr::addr_of_mut!(FAILED_WIN32K_BOOTSTRAPS))
+                .try_reserve(1).map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
+        }
         // Cleanup of a failed DriverEntry needs no new execution. Successful delayed readiness
         // still requires the original live provider and idle physical lane before releasing refs.
         if (receipt.status() as i32) >= 0
-            && (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(receipt.caller())?.is_driver_entry()
+            && driver_entry
             && !(&*core::ptr::addr_of!(ACTIVATIONS))
                 .recipient(receipt.caller())?
                 .can_initialize(receipt.caller())
@@ -668,7 +919,19 @@ impl CompletionDeliveryPass {
         }
         let completion = accept_driver_entry_completion(receipt)?;
         // Neither an activation nor a Ps-manager borrow crosses readiness's nested IPC.
-        Ok(completion.initialize())
+        match completion.initialize() {
+            KernelJobInitialization::Complete(initialized) => Ok(initialized),
+            KernelJobInitialization::Pending(completion, parent) => {
+                *core::ptr::addr_of_mut!(PENDING_WIN32K_BOOTSTRAP) = Some(
+                    PendingWin32kBootstrap { receipt, completion, parent },
+                );
+                Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32)
+            }
+            KernelJobInitialization::Failed(completion) => {
+                (&mut *core::ptr::addr_of_mut!(FAILED_WIN32K_BOOTSTRAPS)).push(completion);
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -697,6 +960,11 @@ pub(crate) unsafe fn deliver_driver_entry_completion(
         Ok(pass) => {
             let result = pass.deliver(receipt);
             if let Err(status) = result {
+                if (&*core::ptr::addr_of!(PENDING_WIN32K_BOOTSTRAP)).as_ref()
+                    .is_some_and(|pending| pending.receipt == receipt)
+                {
+                    return result;
+                }
                 report_deferred(receipt, status);
             }
             result
@@ -708,18 +976,91 @@ pub(crate) unsafe fn deliver_driver_entry_completion(
 /// Observe canonical retry demand without acquiring a delivery attempt or releasing references.
 pub(super) unsafe fn has_ready_completions() -> bool {
     (&*core::ptr::addr_of!(ACTIVATIONS)).has_ready_completion() || terminal::has_ready()
+        || pending_win32k_bootstrap_is_settled()
+        || (&*core::ptr::addr_of!(SETTLED_WIN32K_BOOTSTRAP)).is_some()
+}
+
+unsafe fn pending_win32k_bootstrap_is_settled() -> bool {
+    (&*core::ptr::addr_of!(PENDING_WIN32K_BOOTSTRAP)).as_ref().is_some_and(|pending| {
+        !matches!(win32k_glue::resume_win32k_bootstrap_lane(pending.parent),
+            win32k_glue::Win32kBootstrapStartup::Pending(_))
+    })
+}
+
+unsafe fn redrive_pending_win32k_bootstrap(
+    acknowledged: &mut impl FnMut(KernelProviderCompletionReceipt, bool),
+) -> bool {
+    if !pending_win32k_bootstrap_is_settled() { return false; }
+    let Some(pending) = (&mut *core::ptr::addr_of_mut!(PENDING_WIN32K_BOOTSTRAP)).take()
+    else { return false; };
+    match pending.completion.resume(pending.parent) {
+        KernelJobInitialization::Complete(initialized) => {
+            acknowledged(pending.receipt, initialized);
+            true
+        }
+        KernelJobInitialization::Pending(completion, parent) => {
+            *core::ptr::addr_of_mut!(PENDING_WIN32K_BOOTSTRAP) = Some(
+                PendingWin32kBootstrap { receipt: pending.receipt, completion, parent },
+            );
+            false
+        }
+        KernelJobInitialization::Failed(completion) => {
+            (&mut *core::ptr::addr_of_mut!(FAILED_WIN32K_BOOTSTRAPS)).push(completion);
+            acknowledged(pending.receipt, false);
+            true
+        }
+    }
+}
+
+/// An acknowledged DriverEntry result can become ready while its canonical parent is Running.
+/// That busy lane blocks new provider execution, but cannot block delivery to its exact waiting
+/// bootstrap consumer. Only already retained completion ownership is touched here.
+pub(super) unsafe fn take_retained_bootstrap_result(
+    target: KernelProviderCaller,
+) -> Option<bool> {
+    let _pass = CompletionDeliveryPass::enter_observation().ok()?;
+    let _durable = allocator::enter_durable();
+    if let Some((_, initialized)) =
+        nt_user_host::bootstrap_receive::take_matching_bootstrap_completion(
+            &mut *core::ptr::addr_of_mut!(SETTLED_WIN32K_BOOTSTRAP), &target)
+    {
+        return Some(initialized);
+    }
+    if (&*core::ptr::addr_of!(SETTLED_WIN32K_BOOTSTRAP)).is_some() {
+        return None;
+    }
+    let mut result = None;
+    redrive_pending_win32k_bootstrap(&mut |receipt, initialized| {
+        if receipt.caller() == target {
+            result = Some(initialized);
+        } else {
+            unsafe {
+                *core::ptr::addr_of_mut!(SETTLED_WIN32K_BOOTSTRAP) =
+                    Some((receipt.caller(), receipt, initialized));
+            }
+        }
+    });
+    result
 }
 
 /// Deliver retained kernel terminals and genuine Ready receipts, once per bounded pass.
 /// Return acknowledged ownership progress, not DriverEntry success. Never invoke from a nested
 /// pump timer hook or with handler/PM borrows alive: initialization belongs to the outer scheduler.
 pub(super) unsafe fn redrive_ready_completions() -> bool {
-    redrive_ready_completions_observed(|_, _| {})
+    redrive_ready_completions_inner(None, |_, _| {})
 }
 
 /// Report only acknowledged deliveries, after initialization effects have returned. The observer
 /// receives copied identity/result data, never a borrowed recipient or permission to replay it.
 pub(super) unsafe fn redrive_ready_completions_observed(
+    target: KernelProviderCaller,
+    acknowledged: impl FnMut(KernelProviderCompletionReceipt, bool),
+) -> bool {
+    redrive_ready_completions_inner(Some(target), acknowledged)
+}
+
+unsafe fn redrive_ready_completions_inner(
+    observed_target: Option<KernelProviderCaller>,
     mut acknowledged: impl FnMut(KernelProviderCompletionReceipt, bool),
 ) -> bool {
     if !has_ready_completions() {
@@ -730,6 +1071,30 @@ pub(super) unsafe fn redrive_ready_completions_observed(
     };
     let _durable = allocator::enter_durable();
     let mut progressed = terminal::drain();
+    if let Some(target) = observed_target {
+        if let Some((receipt, initialized)) =
+            nt_user_host::bootstrap_receive::take_matching_bootstrap_completion(
+                &mut *core::ptr::addr_of_mut!(SETTLED_WIN32K_BOOTSTRAP), &target)
+        {
+            acknowledged(receipt, initialized);
+            progressed = true;
+        }
+        progressed |= redrive_pending_win32k_bootstrap(&mut |receipt, initialized| {
+            if receipt.caller() == target {
+                acknowledged(receipt, initialized);
+            } else {
+                *core::ptr::addr_of_mut!(SETTLED_WIN32K_BOOTSTRAP) =
+                    Some((receipt.caller(), receipt, initialized));
+            }
+        });
+    } else if (&*core::ptr::addr_of!(SETTLED_WIN32K_BOOTSTRAP)).is_none() {
+        progressed |= redrive_pending_win32k_bootstrap(&mut |receipt, initialized| {
+            unsafe {
+                *core::ptr::addr_of_mut!(SETTLED_WIN32K_BOOTSTRAP) =
+                    Some((receipt.caller(), receipt, initialized));
+            }
+        });
+    }
     // Terminal retirement can publish an older activation than the initial readiness probe.
     let mut cursor = (&*core::ptr::addr_of!(ACTIVATIONS)).completion_cursor();
     let Some(mut receipt) = (&*core::ptr::addr_of!(ACTIVATIONS)).next_ready_completion(&mut cursor)
@@ -737,12 +1102,30 @@ pub(super) unsafe fn redrive_ready_completions_observed(
         return progressed;
     };
     loop {
+        let driver_entry = (&*core::ptr::addr_of!(ACTIVATIONS))
+            .recipient(receipt.caller()).is_ok_and(KernelJobRecipient::is_driver_entry);
         match pass.deliver(receipt) {
-            Err(status) => report_deferred(receipt, status),
+            Err(status) => {
+                if (&*core::ptr::addr_of!(PENDING_WIN32K_BOOTSTRAP)).as_ref()
+                    .is_none_or(|pending| pending.receipt != receipt)
+                    && !(driver_entry
+                        && (&*core::ptr::addr_of!(SETTLED_WIN32K_BOOTSTRAP)).is_some())
+                {
+                    report_deferred(receipt, status);
+                }
+            }
             Ok(initialized) => {
                 // Ok(false) still acknowledged the result and released the canonical Ps pair.
                 progressed = true;
-                acknowledged(receipt, initialized);
+                if observed_target == Some(receipt.caller()) || !driver_entry {
+                    acknowledged(receipt, initialized);
+                } else if driver_entry {
+                    // A runtime pass may acknowledge DriverEntry before its bootstrap
+                    // consumer observes it. Keep that exact receipt and result for the
+                    // observed pass; Executive results already own their Arc publication.
+                    *core::ptr::addr_of_mut!(SETTLED_WIN32K_BOOTSTRAP) =
+                        Some((receipt.caller(), receipt, initialized));
+                }
             }
         }
         let Some(next) = (&*core::ptr::addr_of!(ACTIVATIONS)).next_ready_completion(&mut cursor)

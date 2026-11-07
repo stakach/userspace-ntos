@@ -101,9 +101,17 @@ fn mapping_retains_copied_initiator_and_backing_before_native_effects() {
     }).expect("actual provider Mapping owner");
     assert!(mapping.fields.iter().any(|field|
         field.ident.as_ref().is_some_and(|name| name == "provenance")));
+    // Preparation retains the copied provenance and reserves an unpublished
+    // view before the worker can perform any native table or page-map effect.
+    let prepare = calls(&function(&file, "prepare_map"));
+    before(&prepare, "capture_mapping_provenance", "map_provider_view");
     let map = calls(&function(&file, "map"));
-    before(&map, "capture_mapping_provenance", "map_provider_view");
-    before(&map, "page_map_r", "map_published");
+    before(&map, "prepare_map", "map_prepared_tables");
+    before(&map, "map_prepared_frame", "publish_map");
+    let frame = calls(&function(&file, "map_prepared_frame"));
+    assert!(frame.iter().any(|call| call == "page_map_r"));
+    let publish = calls(&function(&file, "publish_map"));
+    assert!(publish.iter().any(|call| call == "map_published"));
     let receipts = source("provider_section_receipts.rs");
     let capture = function(&receipts, "capture_mapping_provenance");
     let mut fields = Fields::default();

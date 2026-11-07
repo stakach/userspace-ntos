@@ -3,7 +3,7 @@ use syn::{visit::Visit, Expr, Item};
 #[path = "../../../components/ntos-executive/src/provider_ps_lifecycle.rs"]
 mod provider_ps_lifecycle;
 
-use nt_kernel_abi::ps_reactos_x64 as abi;
+use nt_kernel_abi::ps_hosted_x64 as abi;
 
 #[repr(align(16))]
 struct Worker([u8; abi::ETHREAD_BODY_BYTES]);
@@ -133,8 +133,9 @@ impl<'ast> Visit<'ast> for CurrentThreadStores {
                 }
                 if matches!(address, Expr::Binary(binary)
                     if matches!(&binary.op, syn::BinOp::Add(_))
-                        && matches!(&*binary.left, Expr::Path(path)
-                            if path.path.is_ident("WIN32K_KPCR_VA"))
+                        && matches!(&*binary.left, Expr::Call(current)
+                            if matches!(&*current.func, Expr::Path(path)
+                                if path.path.is_ident("current_kpcr_va")))
                         && integer(&binary.right, 0x188))
                 {
                     self.stores += 1;

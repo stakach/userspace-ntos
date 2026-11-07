@@ -89,6 +89,7 @@ pub fn select_event_signal<B: EventSignalSelector>(backend: &mut B, mode: EventS
             DispatcherWaitSource::Native,
             DispatcherWaitSource::Gui,
             DispatcherWaitSource::Provider,
+            DispatcherWaitSource::HostedDriver,
         ]
         .into_iter()
         .filter_map(|source| {

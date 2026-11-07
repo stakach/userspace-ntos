@@ -143,6 +143,21 @@ fn synchronization_signal_has_one_consumer_in_either_mode() {
 }
 
 #[test]
+fn hosted_driver_wait_competes_by_global_sequence_and_consumes_once() {
+    use DispatcherWaitSource::*;
+    for mode in [EventSignalMode::Set, EventSignalMode::Pulse] {
+        for (older, newer) in [(HostedDriver, Native), (Provider, HostedDriver)] {
+            let mut b = Backend::new(EventKind::Synchronization);
+            b.add(newer, 20, &[DispatcherObject::Event(1)], false);
+            b.add(older, 10, &[DispatcherObject::Event(1)], false);
+            assert_eq!(select_event_signal(&mut b, mode), 1);
+            assert_eq!(b.order, [10]);
+            assert!(!b.events.read_state(1));
+        }
+    }
+}
+
+#[test]
 fn wait_all_recomputes_cross_family_competition_after_each_selection() {
     use DispatcherWaitSource::*;
     for mode in [EventSignalMode::Set, EventSignalMode::Pulse] {

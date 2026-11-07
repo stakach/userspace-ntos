@@ -11,8 +11,10 @@ pub(crate) struct RootReplyPark {
 impl RootReplyPark {
     pub(crate) unsafe fn prepare() -> Option<Self> {
         let active = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-        let index = wait_reply_pool_find_cap(active)?;
-        if !wait_reply_pool_ref().get(index)?.used {
+        let identity = wait_reply_pool_ref().find_cap(active)?;
+        if wait_reply_pool_ref().state(identity).ok() != Some(
+            nt_component_suspension::RootReplySlotState::Used)
+        {
             return None;
         }
         let replacement = if runtime::owns_ingress_reply(active) {
@@ -31,23 +33,63 @@ impl RootReplyPark {
 
     /// The semantic continuation (or the returned transfer value) must retain `active`.
     pub(crate) unsafe fn commit(self) {
-        assert_eq!(REPLY_MAIN_SLOT.load(Ordering::Relaxed), self.active);
-        let index = wait_reply_pool_find_cap(self.active)
-            .expect("parked root Call lost its semantic pool record");
-        assert!(wait_reply_pool_ref()[index].used);
+        if self.try_commit().is_err() {
+            panic!("parked root Call lost its prepared Reply ownership");
+        }
+    }
+
+    /// Park a Reply whose semantic owner is already retained after a native effect. Every
+    /// refusal is checked before touching the pool or main slot, so the owner can keep the
+    /// original Reply without a panic or an uncertain replacement.
+    pub(crate) unsafe fn try_commit(self) -> Result<(), Self> {
+        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) != self.active {
+            return Err(self);
+        }
+        let Some(active_identity) = wait_reply_pool_ref().find_cap(self.active) else {
+            return Err(self);
+        };
+        if wait_reply_pool_ref().state(active_identity).ok() != Some(
+            nt_component_suspension::RootReplySlotState::Used)
+        {
+            return Err(self);
+        }
         match self.replacement {
             None => {
-                assert!(runtime::can_park_hosted_reply(self.active));
+                if !runtime::can_park_hosted_reply(self.active) {
+                    return Err(self);
+                }
                 REPLY_MAIN_SLOT.store(0, Ordering::Relaxed);
             }
             Some((index, cap)) => {
-                let record = &wait_reply_pool_ref()[index];
-                assert_eq!(record.cap, cap);
-                assert!(!record.used);
-                assert!(!runtime::owns_ingress_reply(cap));
-                wait_reply_pool_mark_used(index);
+                if !wait_reply_pool_ref().at(index).is_some_and(|identity| {
+                    identity.cap() == cap && wait_reply_pool_ref().state(identity).ok()
+                        == Some(nt_component_suspension::RootReplySlotState::Free)
+                }) || runtime::owns_ingress_reply(cap) {
+                    return Err(self);
+                }
+                if !wait_reply_pool_mark_used(index) { return Err(self); }
                 REPLY_MAIN_SLOT.store(cap, Ordering::Relaxed);
             }
         }
+        Ok(())
     }
+}
+
+/// Keep a refused hosted Call's Reply in its existing shared owner while allowing the root
+/// receiver to accept a different Call. This does not cancel, reuse, or retry the old Reply.
+/// The used pool record stays unavailable until its exact retained owner settles it.
+pub(crate) unsafe fn quarantine_current_hosted_reply() -> bool {
+    let active = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let Some(identity) = wait_reply_pool_ref().find_cap(active) else {
+        return false;
+    };
+    if active == 0
+        || wait_reply_pool_ref().state(identity).ok()
+            != Some(nt_component_suspension::RootReplySlotState::Used)
+        || !runtime::owns_hosted_reply(active)
+    {
+        return false;
+    }
+    REPLY_MAIN_SLOT.store(0, Ordering::Relaxed);
+    true
 }

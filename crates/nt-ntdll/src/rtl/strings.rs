@@ -194,10 +194,7 @@ pub fn prefix_string(prefix: &[u8], s: &[u8], case_insensitive: bool) -> bool {
 
 /// `RtlPrefixUnicodeString`: `true` if `prefix` is a leading prefix of `s`.
 pub fn prefix_unicode_string(prefix: &[u16], s: &[u16], case_insensitive: bool) -> bool {
-    if prefix.len() > s.len() {
-        return false;
-    }
-    equal_unicode_string(prefix, &s[..prefix.len()], case_insensitive)
+    nt_compat_exports::rtl::prefix_unicode(prefix, s, case_insensitive)
 }
 
 /// The NetBIOS computer-name cap used by `RtlDnsHostNameToComputerName`.

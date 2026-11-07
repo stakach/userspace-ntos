@@ -431,9 +431,14 @@ pub(super) unsafe fn release(instance_index: usize, inst: DriverInstance) -> boo
     if driver_thread_projection::retire_stopped(route, inst).is_err() {
         return false;
     }
-    if driver_ps_context::retire(inst).is_err() {
+    if hosted_driver_ps_handle_reference::retire(inst).is_err()
+        || hosted_primary_token::retire(inst).is_err()
+        || hosted_driver_process_identity::retire(inst).is_err()
+        || driver_ps_context::retire(inst).is_err()
+    {
         return false;
     }
+    hosted_driver_pci_root::retire(inst);
     if !execute_effects(index) {
         return false;
     }

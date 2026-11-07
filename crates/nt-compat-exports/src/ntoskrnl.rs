@@ -22,6 +22,7 @@ pub const NTOSKRNL: &[ExportDescriptor] = &[
     e("memmove", Implemented, "overlap-safe native byte copy returns the destination"),
     e("memset", Implemented, "native byte fill returns the destination"),
     e("PsGetCurrentThreadProcessId", Implemented, "reads the selected canonical ETHREAD Cid.UniqueProcess, independent of APC process attachment"),
+    e("PsGetProcessSessionId", Implemented, "reads the exact published EPROCESS session through the authenticated hosted-driver Ps broker"),
     // --- device / symlink / IRP (implemented by the runtime, M6–M7) ---
     e("IoCreateDevice", Implemented, ""),
     e("IoDeleteDevice", Implemented, ""),
@@ -79,6 +80,12 @@ pub const NTOSKRNL: &[ExportDescriptor] = &[
         Partial,
         "component/level filter ignored; same format limits as DbgPrint",
     ),
+    // --- dispatcher synchronization ---
+    e("KeInitializeMutex", Partial, "caller-owned KMUTEX header with generation-bound provider ownership"),
+    e("KeReleaseMutex", Partial, "owner-checked recursive KMUTEX release and dispatcher wake"),
+    e("KeInitializeSemaphore", Partial, "caller-owned KSEMAPHORE header with bounded count"),
+    e("KeReleaseSemaphore", Partial, "bounded count update and dispatcher wake"),
+    e("RtlAssert", Implemented, "captures native assertion fields and terminates the provider"),
     // --- events (partial: local state, no real wait/wakeup) ---
     e(
         "KeInitializeEvent",
@@ -140,6 +147,11 @@ pub const NTOSKRNL: &[ExportDescriptor] = &[
         "MmGetPhysicalAddress",
         Implemented,
         "isolated VSpace mappings and assigned MMIO projections",
+    ),
+    e(
+        "MmGetPhysicalMemoryRanges",
+        Implemented,
+        "fresh caller-owned copy of boot-published usable physical RAM runs",
     ),
     e("IoAllocateMdl", Unsupported, ""),
     e("MmProbeAndLockPages", Unsupported, ""),

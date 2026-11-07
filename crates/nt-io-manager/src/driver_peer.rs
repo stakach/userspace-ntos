@@ -86,6 +86,23 @@ fn build_dispatch_request(
     if matches!(&irp.parameters, crate::irp::IoParameters::QueryDirectory(_)) {
         return Err(NtStatus::NOT_SUPPORTED);
     }
+    let scsi = match &irp.parameters {
+        crate::irp::IoParameters::Scsi(parameters) => {
+            let expected = 64usize.checked_add(0x58)
+                .and_then(|length| length.checked_add(parameters.data_length as usize))
+                .and_then(|length| length.checked_add(parameters.sense_length as usize))
+                .ok_or(NtStatus::INVALID_PARAMETER)?;
+            if irp.major != major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                || irp.file_id.is_some() || irp.device_id != parameters.route.pdo
+                || target != parameters.route.provider
+                || ctx.system_buffer.len() != expected
+                || ctx.direct_buffer.is_some() || ctx.type3_input_buffer.is_some()
+                || ctx.user_buffer.is_some()
+            { return Err(NtStatus::INVALID_PARAMETER); }
+            Some(parameters)
+        }
+        _ => None,
+    };
     let mut cursor = u32::try_from(core::mem::size_of::<IrpDispatchRequest>())
         .map_err(|_| NtStatus::INVALID_PARAMETER)?;
     let (buffer_offset, buffer_len) = segment(&mut cursor, ctx.system_buffer.len())?;
@@ -134,6 +151,12 @@ fn build_dispatch_request(
             0,
             0,
             0,
+        ),
+        crate::irp::IoParameters::Scsi(_) => (
+            0,
+            u32::try_from(ctx.system_buffer.len()).map_err(|_| NtStatus::INVALID_PARAMETER)?,
+            u32::try_from(ctx.system_buffer.len()).map_err(|_| NtStatus::INVALID_PARAMETER)?,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ),
         crate::irp::IoParameters::Create(p) => (
             0,
@@ -292,12 +315,28 @@ fn build_dispatch_request(
     if !nt_io_abi::valid_file_create_options(irp.major, irp.file_create_options) {
         return Err(NtStatus::INVALID_PARAMETER);
     }
+    let (power_state_type, power_state, power_system_context, power_shutdown_type) = match &irp.parameters {
+        crate::irp::IoParameters::Power(parameters)
+            if irp.major == major::IRP_MJ_POWER && irp.minor == parameters.minor() =>
+        {
+            (parameters.state_type(), parameters.state(),
+                parameters.system_context(), parameters.shutdown_type())
+        }
+        crate::irp::IoParameters::Power(_) => return Err(NtStatus::INVALID_PARAMETER),
+        _ => (0, 0, 0, 0),
+    };
+    if !nt_io_abi::power_dispatch::valid_power_dispatch(
+        irp.major, irp.minor, power_state_type, power_state,
+        power_system_context, power_shutdown_type, input_len, output_len,
+    ) {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
     Ok(IrpDispatchRequest {
         abi_version: IO_ABI_VERSION as u16,
         abi_size: core::mem::size_of::<IrpDispatchRequest>() as u16,
         major: irp.major,
         minor: irp.minor,
-        _reserved0: 0,
+        _reserved0: if scsi.is_some() { nt_io_abi::IRP_DISPATCH_SCSI_SRB } else { 0 },
         flags: irp.flags.bits() as u32 | ((irp.control.bits() as u32) << 8),
         set_information_control,
         target_domain_id: target.domain_id.raw(),
@@ -356,6 +395,11 @@ fn build_dispatch_request(
         read_write_key,
         create_case_sensitive,
         initial_information,
+        power_state_type,
+        power_state,
+        power_system_context,
+        power_shutdown_type,
+        scsi_relation_generation: scsi.map_or(0, |parameters| parameters.route.relation_generation),
     })
 }
 
@@ -404,6 +448,24 @@ impl<T: DriverPeerTransport> DriverDispatchBackend for DriverPeerBackend<T> {
             });
         }
         let request = build_dispatch_request(irp, &ctx, self.target, self.provider)?;
+        if let crate::irp::IoParameters::Scsi(parameters) = &irp.parameters {
+            let transfer = (parameters.data_length as usize)
+                .checked_add(parameters.sense_length as usize)
+                .ok_or(NtStatus::INVALID_PARAMETER)?;
+            let input = ctx.system_buffer.get(..transfer)
+                .ok_or(NtStatus::INVALID_PARAMETER)?.to_vec();
+            let packet = crate::scsi_srb_wire::encode_scsi_wire_request(
+                parameters.route,
+                irp.irp_id,
+                parameters.srb,
+                &input[..parameters.data_length as usize],
+                &input[parameters.data_length as usize..],
+            ).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+            if packet.len() != ctx.system_buffer.len() {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            ctx.system_buffer.copy_from_slice(&packet);
+        }
         Ok(self.transport.dispatch(
             &request,
             PeerTransferBuffers {
@@ -790,7 +852,8 @@ mod initial_information_tests {
         assert_eq!(request.initial_information, 88);
         assert_eq!(request.input_len, 0);
         assert_eq!(request.output_len, 104);
-        assert_eq!(request.buffer_offset, 256);
+        assert_eq!(request.buffer_offset as usize,
+            core::mem::size_of::<IrpDispatchRequest>());
         let mut output = [0x5a; 104];
         let before = output;
         let control = MockPeerControl::new();

@@ -53,12 +53,15 @@ fn function_calls(source: &str, name: &str) -> Vec<String> {
 fn port_connect_preparation_checks_publication_without_requiring_provider_entry() {
     let submit = function_calls(CONNECT, "submit");
     let redrive = function_calls(CONNECT, "redrive");
+    let redrive_inner = function_calls(CONNECT, "redrive_inner");
     let prepare = function_calls(PORT, "prepare");
     let irq = function_calls(THUNK, "admit_irq_request");
     let irq_reverse = function_calls(REVERSE, "validate_irq");
 
     assert!(submit.iter().any(|call| call == "prepare"));
-    assert!(redrive.iter().any(|call| call == "begin_provider_entry"));
+    assert!(redrive.iter().any(|call| call == "redrive_inner"));
+    assert!(redrive_inner.iter().any(|call| call == "begin_provider_entry"));
+    assert!(redrive_inner.iter().any(|call| call == "nested_ready"));
     assert!(irq_reverse.iter().any(|call| call == "published_identity_without_manager"));
     assert!(irq.iter().any(|call| call == "validate_irq"));
     assert!(

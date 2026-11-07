@@ -1,5 +1,5 @@
 use super::*;
-use crate::{OwnedBoundedBlockRange, RegistryWal, SnapshotReserve, WalSnapshotEpochRollover};
+use crate::{AsyncSnapshotIoKind, AsyncWalEpochRollover, OwnedBoundedBlockRange, RegistryWal, SnapshotReserve, WalSnapshotEpochRollover};
 
 struct BatchCountDisk {
     inner: CachedDisk,
@@ -100,6 +100,107 @@ fn old_epoch(folded: bool) -> (SnapshotBlockStore, SnapshotReserve<CachedDisk, u
     }
     drop(lease);
     (store, reserve)
+}
+
+#[test]
+fn native_rollover_acks_resetting_before_reverse_erase_and_ready_publication() {
+    let (store, reserve) = old_epoch(true);
+    let mut lease = reserve.try_acquire().unwrap();
+    let pair = store.verify_paired_wal_snapshot(&mut lease).unwrap();
+    let mut cursor = AsyncWalEpochRollover::admit(store, pair, 16, 16, 88,
+        lease.sector_size(), lease.sector_count()).ok().unwrap();
+    assert!(reserve.try_acquire().is_none());
+    let mut writes = Vec::new();
+    while let Some(request) = cursor.enter_next().unwrap() {
+        match request.kind {
+            AsyncSnapshotIoKind::Write => {
+                let bytes = cursor.write_bytes(request).unwrap();
+                lease.write_sectors(request.lba, bytes).unwrap();
+                writes.push(request.lba);
+            }
+            AsyncSnapshotIoKind::Flush => lease.flush().unwrap(),
+            AsyncSnapshotIoKind::Read => unreachable!(),
+        }
+        // Synthetic fixture performs the exact physical effect before acknowledging it.
+        unsafe { cursor.complete(request, true) }.unwrap();
+    }
+    assert_eq!(&writes[..2], &[0, 8]);
+    assert_eq!(&writes[writes.len() - 2..], &[0, 8]);
+    assert_eq!(writes[writes.len() - 3], 16);
+    let (token, pair) = cursor.finish().ok().unwrap();
+    assert_eq!(token.anchor(), WalSnapshotAnchor { incarnation: 88, serial: 0, end_lba: 0 });
+    assert_eq!(pair.anchor(), token.anchor());
+    lease.test_device_mut().power_cut();
+    assert_eq!(store.recheck_verified_paired_wal_snapshot(&mut lease, &pair), Ok(pair.manifest()));
+}
+
+#[test]
+fn native_rollover_releases_unentered_ticket_but_blocks_uncertain_effect() {
+    let (store, reserve) = old_epoch(true);
+    let mut lease = reserve.try_acquire().unwrap();
+    let pair = store.verify_paired_wal_snapshot(&mut lease).unwrap();
+    let mut cursor = AsyncWalEpochRollover::admit(store, pair, 16, 16, 88,
+        lease.sector_size(), lease.sector_count()).ok().unwrap();
+    assert_eq!(cursor.set_max_batch_sectors(0),
+        Err(crate::AsyncSnapshotCommitError::Store(SnapshotBlockStoreError::InvalidGeometry)));
+    let first = cursor.enter_next().unwrap().unwrap();
+    assert_eq!(cursor.set_max_batch_sectors(1),
+        Err(crate::AsyncSnapshotCommitError::Outstanding));
+    cursor.release_unentered(first).unwrap();
+    let retry = cursor.enter_next().unwrap().unwrap();
+    assert_ne!(first.sequence, retry.sequence);
+    assert_eq!(unsafe { cursor.complete(first, true) },
+        Err(crate::AsyncSnapshotCommitError::WrongTicket));
+    assert!(unsafe { cursor.complete(retry, false) }.is_err());
+    assert_eq!(cursor.pending(), Some(retry));
+    assert!(cursor.release_unentered(retry).is_err());
+    assert!(unsafe { cursor.complete(retry, true) }.is_err());
+    assert_eq!(cursor.pending(), Some(retry));
+    assert!(cursor.enter_next().is_err());
+    assert!(cursor.finish().is_err());
+}
+
+#[test]
+fn native_rollover_obeys_live_erase_ceiling_after_unentered_shrink() {
+    for ceiling in [1, 8] {
+        let (store, reserve) = old_epoch(true);
+        let mut lease = reserve.try_acquire().unwrap();
+        let pair = store.verify_paired_wal_snapshot(&mut lease).unwrap();
+        let mut cursor = AsyncWalEpochRollover::admit(store, pair, 16, 16, 88,
+            lease.sector_size(), lease.sector_count()).ok().unwrap();
+        cursor.set_max_batch_sectors(8).unwrap();
+        let mut erased_tail = 0;
+        let mut shrunk = false;
+        while let Some(mut request) = cursor.enter_next().unwrap() {
+            if !shrunk && request.kind == AsyncSnapshotIoKind::Write && request.lba >= 17 {
+                assert_eq!(request.bytes, 8 * lease.sector_size());
+                cursor.release_unentered(request).unwrap();
+                cursor.set_max_batch_sectors(ceiling).unwrap();
+                let retry = cursor.enter_next().unwrap().unwrap();
+                assert_ne!(retry.sequence, request.sequence);
+                assert_eq!(unsafe { cursor.complete(request, true) },
+                    Err(crate::AsyncSnapshotCommitError::WrongTicket));
+                request = retry;
+                shrunk = true;
+            }
+            match request.kind {
+                AsyncSnapshotIoKind::Write => {
+                    assert!(request.bytes <= ceiling as usize * lease.sector_size()
+                        || request.lba < 17);
+                    if request.lba >= 17 { erased_tail += request.bytes / lease.sector_size(); }
+                    lease.write_sectors(request.lba, cursor.write_bytes(request).unwrap()).unwrap();
+                }
+                AsyncSnapshotIoKind::Flush => lease.flush().unwrap(),
+                AsyncSnapshotIoKind::Read => unreachable!(),
+            }
+            unsafe { cursor.complete(request, true) }.unwrap();
+        }
+        assert_eq!(erased_tail, 15);
+        let (token, pair) = cursor.finish().ok().unwrap();
+        assert_eq!(token.anchor(), WalSnapshotAnchor { incarnation: 88, serial: 0, end_lba: 0 });
+        lease.test_device_mut().power_cut();
+        assert_eq!(store.recheck_verified_paired_wal_snapshot(&mut lease, &pair), Ok(pair.manifest()));
+    }
 }
 
 #[test]

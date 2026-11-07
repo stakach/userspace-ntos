@@ -41,9 +41,12 @@ impl<'ast> Visit<'ast> for PolicyWiring {
         let true_literal = |expression: Option<&Expr>| matches!(expression,
             Some(Expr::Lit(syn::ExprLit { lit: syn::Lit::Bool(value), .. })) if value.value);
         if self.create_overlay_depth != 0 && call.method == "create_overlay" {
-            assert_eq!(call.args.len(), 8, "retain the existing canonical overlay CREATE contract");
+            assert_eq!(call.args.len(), 9, "retain the canonical overlay CREATE and resident admission contract");
             assert!(true_literal(call.args.iter().nth(5)), "materialize the real installed parent");
             assert!(true_literal(call.args.iter().nth(6)), "publish a real directory open context");
+            assert!(matches!(call.args.iter().nth(8), Some(Expr::Path(path))
+                if path.path.is_ident("resident_only")),
+                "preserve resident-only admission on overlay creation");
             self.real_create = true;
         }
         syn::visit::visit_expr_method_call(self, call);

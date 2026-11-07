@@ -101,6 +101,18 @@ fn service_table_numbering() {
 }
 
 #[test]
+fn extended_key_open_routes_the_released_kernelbase_syscall() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtOpenKeyEx, 0x457)],
+    );
+    assert_eq!(nt_syscall_abi::ssn_of("NtOpenKeyEx"), Some(0x457));
+    assert_eq!(NativeService::NtOpenKeyEx.arg_count(), (4, 4));
+    assert_eq!(table.lookup(0x457).unwrap().service, NativeService::NtOpenKeyEx);
+    assert_eq!(table.number_of(NativeService::NtOpenKeyEx), Some(0x457));
+}
+
+#[test]
 fn create_named_pipe_keeps_native_fourteen_argument_contract() {
     let expected = nt_syscall_abi::argc_of("NtCreateNamedPipeFile");
     assert_eq!(expected, 14);
@@ -247,6 +259,35 @@ fn access_check_by_type_services_keep_native_identities() {
             NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &[(service, ssn)]);
         assert_eq!(table.lookup(ssn).map(|entry| entry.service), Some(service));
         assert_eq!(table.number_of(service), Some(ssn));
+    }
+}
+
+#[test]
+fn wide_audit_services_reject_short_vectors_without_truncating_argument_seventeen() {
+    struct Capture(Vec<u64>);
+    impl NativeSyscallHandler for Capture {
+        fn handle(&mut self, _: &NativeCallContext, args: &[u64], _: &mut Vec<u8>) -> u32 {
+            self.0.extend_from_slice(args);
+            STATUS_SUCCESS
+        }
+    }
+    for (service, ssn, argc) in [
+        (NativeService::NtAccessCheckByTypeAndAuditAlarm, 4, 16),
+        (NativeService::NtAccessCheckByTypeResultListAndAuditAlarm, 6, 16),
+        (NativeService::NtAccessCheckByTypeResultListAndAuditAlarmByHandle, 7, 17),
+    ] {
+        assert_eq!(service.arg_count(), (argc, argc));
+        let table = NativeServiceTable::from_numbers(UserlandAbiProfile::Windows7, &[(service, ssn)]);
+        let dispatcher = NativeSyscallDispatcher::new(table);
+        let args: Vec<u64> = (0..argc as u64).map(|i| 0x100 + i).collect();
+        let mut capture = Capture(Vec::new());
+        let result = dispatcher.dispatch(ssn, &args, &origin(ProcessorMode::UserMode), &mut capture);
+        assert_eq!(result.status, STATUS_SUCCESS);
+        assert_eq!(capture.0, args);
+        let mut capture = Capture(Vec::new());
+        let short = dispatcher.dispatch(ssn, &args[..args.len() - 1], &origin(ProcessorMode::UserMode), &mut capture);
+        assert_eq!(short.status, STATUS_INVALID_PARAMETER);
+        assert!(capture.0.is_empty());
     }
 }
 

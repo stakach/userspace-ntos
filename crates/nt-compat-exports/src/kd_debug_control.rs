@@ -8,6 +8,10 @@ pub const ROS_INTERNAL_COMMAND: u32 = u32::from_le_bytes(*b"Ros ");
 
 const STATUS_NOT_IMPLEMENTED: i32 = 0xc000_0002_u32 as i32;
 const STATUS_INVALID_INFO_CLASS: i32 = 0xc000_0003_u32 as i32;
+const STATUS_DEBUGGER_INACTIVE: i32 = 0xc000_0354_u32 as i32;
+
+/// An enable/disable request cannot change debugger state without a KD transport.
+pub const fn status_without_transport() -> i32 { STATUS_DEBUGGER_INACTIVE }
 
 /// Return the explicit failure for a debugger operation without a provider.
 ///

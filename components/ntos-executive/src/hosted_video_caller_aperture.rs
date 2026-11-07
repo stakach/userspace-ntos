@@ -44,15 +44,31 @@ static mut MODE_EVIDENCE: nt_video_miniport::mode_evidence::ModeEvidence<ModeIde
     nt_video_miniport::mode_evidence::ModeEvidence::new();
 
 pub(super) unsafe fn blocks_device_retirement(device: u64) -> bool {
-    (&*core::ptr::addr_of!(MAPPINGS)).iter().any(|row| {
+    super::hosted_video_pool_map::blocks_device_retirement(device)
+        || (&*core::ptr::addr_of!(MAPPINGS)).iter().any(|row| {
         row.transaction.phase() != AperturePhase::Retired
             && row.transaction.plan().identity().device == device
     })
 }
 pub(super) unsafe fn blocks_domain_retirement(domain: runtime::PhysicalDomain) -> bool {
-    (&*core::ptr::addr_of!(MAPPINGS)).iter().any(|row| {
+    super::hosted_video_pool_map::blocks_domain_retirement(domain)
+        || (&*core::ptr::addr_of!(MAPPINGS)).iter().any(|row| {
         row.transaction.phase() != AperturePhase::Retired
             && row.transaction.plan().identity().caller_authority.caller == domain
+    })
+}
+
+pub(super) unsafe fn occupies_caller_range(
+    caller: runtime::PhysicalDomain, start: u64, end: u64,
+) -> bool {
+    (&*core::ptr::addr_of!(MAPPINGS)).iter().any(|row| {
+        if row.transaction.phase() == AperturePhase::Retired
+            || row.transaction.plan().identity().caller_authority.caller != caller
+        { return false; }
+        let plan = row.transaction.plan();
+        let old_start = plan.identity().virtual_base;
+        let old_end = old_start + plan.pages() * 0x1000;
+        start < old_end && old_start < end
     })
 }
 
@@ -73,6 +89,33 @@ pub(super) unsafe fn observe_terminal(
     information: u64,
     output: &[u8],
 ) {
+    if matches!(code,
+        nt_video_miniport::IOCTL_VIDEO_QUERY_NUM_AVAIL_MODES
+        | nt_video_miniport::IOCTL_VIDEO_QUERY_AVAIL_MODES
+        | nt_video_miniport::IOCTL_VIDEO_SET_CURRENT_MODE
+        | nt_video_miniport::IOCTL_VIDEO_QUERY_CURRENT_MODE)
+    {
+        print_str(b"[video-mode-terminal] code="); print_hex_u64(u64::from(code));
+        print_str(b" status="); print_hex_u64(u64::from(status));
+        print_str(b" information="); print_u64(information);
+        print_str(b" output-bytes="); print_u64(output.len() as u64);
+        if code == nt_video_miniport::IOCTL_VIDEO_SET_CURRENT_MODE && input.len() >= 4 {
+            print_str(b" requested-index=");
+            print_u64(u64::from(u32::from_le_bytes(input[..4].try_into().unwrap())));
+        }
+        if code == nt_video_miniport::IOCTL_VIDEO_QUERY_NUM_AVAIL_MODES && output.len() >= 8 {
+            print_str(b" count=");
+            print_u64(u64::from(u32::from_le_bytes(output[..4].try_into().unwrap())));
+        }
+        if let Ok(mode) = nt_video_miniport::parse_video_mode_information(output) {
+            print_str(b" first-index=");
+            print_u64(u64::from(u32::from_le_bytes(output[4..8].try_into().unwrap())));
+            print_str(b" width="); print_u64(u64::from(mode.width));
+            print_str(b" height="); print_u64(u64::from(mode.height));
+            print_str(b" stride="); print_u64(u64::from(mode.stride));
+        }
+        print_str(b"\n");
+    }
     if status != 0 || !matches!(code,
         nt_video_miniport::IOCTL_VIDEO_QUERY_CURRENT_MODE
         | nt_video_miniport::IOCTL_VIDEO_QUERY_NUM_AVAIL_MODES
@@ -163,6 +206,10 @@ pub(super) unsafe fn prepare(
     if state.interface_type != HOSTED_INTERFACE_TYPE_PCIBUS
         || state.video_memory_len == 0
         || state.video_memory_caller_va == 0
+        || state
+            .video_memory_caller_va
+            .checked_add(state.video_memory_len)
+            .is_none_or(|end| end > crate::win32k_subsystem::WIN32K_POOL_VADDR)
     {
         return Err(nt_status::NtStatus::NOT_SUPPORTED);
     }

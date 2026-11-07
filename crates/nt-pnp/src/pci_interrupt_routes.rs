@@ -41,6 +41,7 @@ pub enum PciInterruptRouteError {
     ConflictingSharedGsi(u32),
     MissingRoute(PciLocation, u8),
     InvalidInventoryPin(PciLocation, u8),
+    InvalidQueryPin(u8),
     GenerationExhausted,
     Invalidated,
     StaleOwner,
@@ -349,34 +350,35 @@ impl PciInterruptRouteOwner {
         segment: u16,
         location: PciLocation,
     ) -> Result<Option<PciInterruptRouteClaim>, PciInterruptRouteError> {
-        if !self.accepted {
-            return Err(PciInterruptRouteError::Invalidated);
-        }
-        if self.inventory_generation != Some(inventory.generation())
-            || self.provider_scope_generation != Some(provider_scope_generation)
-            || self.segment != Some(segment)
-        {
-            return Err(
-                if self.provider_scope_generation != Some(provider_scope_generation) {
-                    PciInterruptRouteError::StaleProviderScopes
-                } else {
-                    PciInterruptRouteError::StaleInventory
-                },
-            );
-        }
+        self.validate_query_owner(inventory, provider_scope_generation, segment)?;
         let Some(device) = inventory.device(location) else {
             return Ok(None);
         };
         if device.irq_pin == 0 {
             return Ok(None);
         }
-        if device.irq_pin > 4 {
-            return Err(PciInterruptRouteError::InvalidInventoryPin(
-                location,
-                device.irq_pin,
-            ));
+        self.resolve_pin(inventory, provider_scope_generation, segment, location, device.irq_pin)
+    }
+
+    /// Resolve a caller-supplied PCI INTx pin (1 = INTA through 4 = INTD).
+    /// PCI bridge swizzling may ask for a pin other than the function's own
+    /// config-space InterruptPin. The accepted _PRT route remains the authority.
+    pub fn resolve_pin(
+        &self,
+        inventory: &PciInventory,
+        provider_scope_generation: u64,
+        segment: u16,
+        location: PciLocation,
+        pin: u8,
+    ) -> Result<Option<PciInterruptRouteClaim>, PciInterruptRouteError> {
+        self.validate_query_owner(inventory, provider_scope_generation, segment)?;
+        if !(1..=4).contains(&pin) {
+            return Err(PciInterruptRouteError::InvalidQueryPin(pin));
         }
-        let pin = device.irq_pin - 1;
+        let Some(_device) = inventory.device(location) else {
+            return Ok(None);
+        };
+        let pin = pin - 1;
         let exact = self.routes.iter().copied().find(|route| {
             route_matches(*route, segment, location, pin)
                 && matches!(route.function, PciRouteFunction::Exact(_))
@@ -393,6 +395,30 @@ impl PciInterruptRouteOwner {
             provider_scope_generation,
             route,
         }))
+    }
+
+    fn validate_query_owner(
+        &self,
+        inventory: &PciInventory,
+        provider_scope_generation: u64,
+        segment: u16,
+    ) -> Result<(), PciInterruptRouteError> {
+        if !self.accepted {
+            return Err(PciInterruptRouteError::Invalidated);
+        }
+        if self.inventory_generation != Some(inventory.generation())
+            || self.provider_scope_generation != Some(provider_scope_generation)
+            || self.segment != Some(segment)
+        {
+            return Err(
+                if self.provider_scope_generation != Some(provider_scope_generation) {
+                    PciInterruptRouteError::StaleProviderScopes
+                } else {
+                    PciInterruptRouteError::StaleInventory
+                },
+            );
+        }
+        Ok(())
     }
 
     /// Revalidate a retained claim immediately before resource publication or capability minting.
@@ -585,6 +611,43 @@ mod tests {
                 gsi
             );
         }
+    }
+
+    #[test]
+    fn explicit_pin_query_uses_accepted_route_for_bridge_swizzle() {
+        let location = PciLocation::new(0, 3, 0);
+        let inventory = PciInventory::try_from_initial(vec![device(0, 3, 0, 1)]).unwrap();
+        let mut owner = PciInterruptRouteOwner::default();
+        let prepared = owner.prepare_replace(
+            PROVIDER_RELATION_GENERATION,
+            0,
+            &inventory,
+            vec![
+                route(0, 3, PciRouteFunction::Any, 0, 17),
+                route(0, 3, PciRouteFunction::Any, 1, 33),
+            ],
+        ).unwrap();
+        owner.commit(prepared, &inventory, PROVIDER_RELATION_GENERATION).unwrap();
+
+        assert_eq!(owner.resolve(&inventory, PROVIDER_RELATION_GENERATION, 0, location)
+            .unwrap().unwrap().route().gsi, 17);
+        let swizzled = owner.resolve_pin(&inventory, PROVIDER_RELATION_GENERATION, 0, location, 2)
+            .unwrap().unwrap();
+        assert_eq!(swizzled.route().gsi, 33);
+        assert_eq!(owner.validate(&inventory, PROVIDER_RELATION_GENERATION, swizzled)
+            .unwrap().gsi, 33);
+        assert_eq!(owner.resolve_pin(&inventory, PROVIDER_RELATION_GENERATION, 0, location, 3)
+            .unwrap(), None);
+        assert_eq!(owner.resolve_pin(&inventory, PROVIDER_RELATION_GENERATION, 0, location, 0),
+            Err(PciInterruptRouteError::InvalidQueryPin(0)));
+        assert_eq!(owner.resolve_pin(&inventory, PROVIDER_RELATION_GENERATION, 0, location, 5),
+            Err(PciInterruptRouteError::InvalidQueryPin(5)));
+        assert_eq!(owner.resolve_pin(&inventory, PROVIDER_RELATION_GENERATION, 0,
+            PciLocation::new(0, 4, 0), 1).unwrap(), None);
+
+        owner.invalidate().unwrap();
+        assert_eq!(owner.resolve_pin(&inventory, PROVIDER_RELATION_GENERATION, 0, location, 2),
+            Err(PciInterruptRouteError::Invalidated));
     }
 
     #[test]

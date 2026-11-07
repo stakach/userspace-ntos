@@ -27,6 +27,22 @@ use super::{
     FSD_STACK_VADDR, FSD_WORKER_STACK_FRAMES,
 };
 
+#[path = "hosted_exception_frame_chain.rs"]
+mod frame_chain;
+pub(crate) use frame_chain::{
+    capture_hosted_driver_frame_chain, capture_win32k_frame_chain, FrameChainBrokerError,
+};
+
+#[path = "hosted_exception_user_source.rs"]
+mod user_source;
+pub(crate) use user_source::capture_attached_user_frame_snapshot;
+
+#[path = "hosted_exception_user_image.rs"]
+mod user_image;
+
+#[path = "hosted_exception_user_walk.rs"]
+mod user_walk;
+
 // Do not return this reader to a caller. Its executive alias is valid only while the authenticated
 // physical dispatch is paused and retains the mapped stack frames.
 struct HostedStackReader {
@@ -348,7 +364,7 @@ fn linkage_for_channel(
 fn with_catalog<R>(
     channel: &crate::spawn_hosts::PumpChannel,
     reply_cap: u64,
-    use_catalog: impl FnOnce(&dyn ExceptionImageReader) -> R,
+    use_catalog: impl FnOnce(&nt_unwind::exception_images::ExceptionImageCatalog) -> R,
 ) -> Option<R> {
     match channel.caps.kind {
         crate::spawn_hosts::ReqKind::Irp => {

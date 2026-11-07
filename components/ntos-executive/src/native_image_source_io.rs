@@ -4,10 +4,13 @@ use crate::native_image_sections::{NativeImageContents, NativeImageSource};
 use crate::ExecNtHandler;
 use alloc::vec::Vec;
 
+const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xc000_009a;
+
 impl NativeImageSource {
     pub(crate) fn read_exact(
         &self,
         handler: &ExecNtHandler,
+        area: nt_memory_manager::image_section::ImageAreaId,
         offset: u64,
         output: &mut [u8],
     ) -> Result<(), u32> {
@@ -24,6 +27,23 @@ impl NativeImageSource {
                 .as_ref()
                 .ok_or(nt_fs::STATUS_INVALID_HANDLE)?
                 .read_exact(handler, self.backing, offset, output),
+            NativeImageContents::RetainedRouted => {
+                let lease = self.backing.routed_lease.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                let (file_id, device_id, file_context, _) = unsafe {
+                    crate::hosted_routed_image_capture::route(lease, area)
+                }
+                .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+                let (status, read) = crate::routed_section_io::read_retained(
+                    file_id, device_id, file_context, offset, output,
+                );
+                if status != 0 {
+                    return Err(status);
+                }
+                if read != output.len() {
+                    return Err(0xc000_0185);
+                }
+                Ok(())
+            }
             NativeImageContents::Snapshot(bytes) => {
                 let start = usize::try_from(offset).map_err(|_| nt_fs::STATUS_INVALID_HANDLE)?;
                 let end = start
@@ -40,18 +60,19 @@ impl NativeImageSource {
     pub(crate) fn materialize_process_snapshot(
         &self,
         handler: &ExecNtHandler,
+        area: nt_memory_manager::image_section::ImageAreaId,
     ) -> Result<Vec<u8>, u32> {
         if !self.has_readable_image() {
             return Err(nt_fs::STATUS_INVALID_HANDLE);
         }
         let length = usize::try_from(self.backing.file_extent)
-            .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(length)
-            .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         bytes.resize(length, 0);
-        self.read_exact(handler, 0, &mut bytes)?;
+        self.read_exact(handler, area, 0, &mut bytes)?;
         Ok(bytes)
     }
 }

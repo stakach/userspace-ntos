@@ -19,6 +19,9 @@ mod property;
 mod registry;
 mod registry_security;
 mod filter_policy;
+mod key_open_options;
+#[cfg(test)]
+mod kernel_device_interface_tests;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -32,6 +35,7 @@ pub use registry::{
     RegistryValueType,
 };
 pub use filter_policy::{DeviceFilterPolicy, DeviceFilterPolicyError};
+pub use key_open_options::validate_key_open_options;
 pub use registry_security::{inherit_generated_key_security, validate_generated_key_security};
 
 /// The NT root-bus pseudo-devnode exposed through user-mode PnP relations.
@@ -64,6 +68,17 @@ pub const SERVICE_GROUP_ORDER_PATH: &str =
 pub const NETWORK_WRAPPER_LOAD_ORDER_GROUP: &str = "NDIS Wrapper";
 pub const NETWORK_PNP_TRANSPORT_LOAD_ORDER_GROUP: &str = "PNP_TDI";
 pub const NETWORK_TRANSPORT_LOAD_ORDER_GROUP: &str = "TDI";
+pub const BASE_LOAD_ORDER_GROUP: &str = "Base";
+
+/// Volatile HARDWARE parents published after mounting the live SYSTEM hive.
+/// Device-specific children such as `DeviceMap\Video` belong to their providers.
+pub const VOLATILE_HARDWARE_BOOTSTRAP_PATHS: [&str; 5] = [
+    r"\Registry\Machine\Hardware",
+    r"\Registry\Machine\Hardware\Description",
+    r"\Registry\Machine\Hardware\Description\System",
+    r"\Registry\Machine\Hardware\Description\System\CentralProcessor",
+    r"\Registry\Machine\Hardware\DeviceMap",
+];
 
 pub const SERVICE_KERNEL_DRIVER: u32 = 0x0000_0001;
 pub const SERVICE_FILE_SYSTEM_DRIVER: u32 = 0x0000_0002;
@@ -84,6 +99,19 @@ pub const SERVICE_SYSTEM_START: u32 = 1;
 pub const SERVICE_AUTO_START: u32 = 2;
 pub const SERVICE_DEMAND_START: u32 = 3;
 pub const SERVICE_DISABLED: u32 = 4;
+
+/// Registry groups whose no-devnode device services have a hosted boot path.
+/// Base services run at boot; the network wrapper and transports also run at system start.
+pub fn hosted_boot_legacy_device_group(start_type: u32, group: Option<&str>) -> bool {
+    let Some(group) = group else { return false };
+    if start_type == SERVICE_BOOT_START && group.eq_ignore_ascii_case(BASE_LOAD_ORDER_GROUP) {
+        return true;
+    }
+    (start_type == SERVICE_BOOT_START || start_type == SERVICE_SYSTEM_START)
+        && (group.eq_ignore_ascii_case(NETWORK_WRAPPER_LOAD_ORDER_GROUP)
+            || group.eq_ignore_ascii_case(NETWORK_PNP_TRANSPORT_LOAD_ORDER_GROUP)
+            || group.eq_ignore_ascii_case(NETWORK_TRANSPORT_LOAD_ORDER_GROUP))
+}
 
 pub type ServiceId = u64;
 pub type DevnodeId = u64;
@@ -820,6 +848,13 @@ pub enum InterfaceRegistrationError {
     InvalidReference,
 }
 
+/// Validation failures before an `IoGetDeviceInterfaces` query can inspect CM state.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeviceInterfaceQueryError {
+    UnknownDevnode,
+    InvalidGuid,
+}
+
 /// The Configuration Manager: the registry + the service/devnode/interface indices.
 pub struct ConfigManager {
     registry: Registry,
@@ -1111,23 +1146,17 @@ impl ConfigManager {
             .collect()
     }
 
-    /// Whether a boot/system driver service is a hosted legacy network-stack driver.
+    /// Whether a boot/system driver service has a hosted no-devnode boot path.
     ///
     /// The hosted boot-driver path can start PnP-bound device drivers from imported `Enum`
-    /// devnodes. The only no-devnode device drivers admitted here are the registry-declared NT5
-    /// network wrapper/transport groups; unrelated legacy boot drivers such as boot-bus extenders,
-    /// WDF framework loaders, debug/SAC services, and storage class drivers need their own kernel
-    /// mechanisms before they enter this path.
+    /// devnodes. Boot-start Base services and the registry-declared NT5 network
+    /// wrapper/transport groups are admitted. Boot-bus extenders, WDF framework loaders,
+    /// debug/SAC services, and storage class drivers need their own kernel mechanisms.
     pub fn is_boot_system_legacy_driver(&self, service: &ServiceMetadata) -> bool {
         service.has_launch_image()
             && service.driver_service_class() == Some(DriverServiceClass::Device)
-            && service
-                .start_type
-                .is_some_and(|start| start == SERVICE_BOOT_START || start == SERVICE_SYSTEM_START)
-            && service.load_order_group.as_deref().is_some_and(|group| {
-                group.eq_ignore_ascii_case(NETWORK_WRAPPER_LOAD_ORDER_GROUP)
-                    || group.eq_ignore_ascii_case(NETWORK_PNP_TRANSPORT_LOAD_ORDER_GROUP)
-                    || group.eq_ignore_ascii_case(NETWORK_TRANSPORT_LOAD_ORDER_GROUP)
+            && service.start_type.is_some_and(|start| {
+                hosted_boot_legacy_device_group(start, service.load_order_group.as_deref())
             })
             && !self.service_has_devnodes(&service.name)
     }
@@ -1881,7 +1910,7 @@ impl ConfigManager {
         }) {
             return Ok(existing.id);
         }
-        let symbolic_link = build_symbolic_link(guid, &instance, reference);
+        let symbolic_link = device_interface_symbolic_link(guid, &instance, reference);
         materialize_interface_registry(
             &mut self.registry,
             guid,
@@ -1977,6 +2006,36 @@ impl ConfigManager {
             .collect()
     }
 
+    /// `IoGetDeviceInterfaces`' kernel-path MULTI_SZ for one class and optional exact PDO
+    /// devnode identity. The native adapter owns GUID/PDO pointer validation and maps the PDO to
+    /// its canonical DevnodeId; this query never manufactures a device from a name or pointer.
+    /// The returned buffer contains one final NUL even when there are no matching interfaces.
+    pub fn kernel_device_interface_multi_sz(
+        &self,
+        guid: &str,
+        devnode: Option<DevnodeId>,
+        include_nonactive: bool,
+    ) -> Result<Vec<u16>, DeviceInterfaceQueryError> {
+        if guid_text_to_memory_bytes(guid).is_none() {
+            return Err(DeviceInterfaceQueryError::InvalidGuid);
+        }
+        if devnode.is_some_and(|id| !self.devnodes.iter().any(|record| record.id == id)) {
+            return Err(DeviceInterfaceQueryError::UnknownDevnode);
+        }
+        let mut result = Vec::new();
+        for interface in &self.interfaces {
+            if interface.guid.eq_ignore_ascii_case(guid)
+                && devnode.is_none_or(|id| interface.devnode == id)
+                && (include_nonactive || interface.enabled)
+            {
+                result.extend(interface.symbolic_link.encode_utf16());
+                result.push(0);
+            }
+        }
+        result.push(0);
+        Ok(result)
+    }
+
     /// Does user-mode PnP know this device instance? The CM device set includes the NT root-bus
     /// pseudo-devnode plus every indexed `Enum\<InstanceId>` devnode.
     pub fn pnp_device_exists(&self, instance_id: &str) -> bool {
@@ -2050,6 +2109,17 @@ impl ConfigManager {
         guid: &[u8; 16],
         instance_id: &str,
     ) -> Option<Vec<String>> {
+        self.pnp_interface_links_by_guid_bytes(guid, instance_id, false)
+    }
+
+    /// Configuration-service projection of `IoGetDeviceInterfaces` flags. A concrete instance
+    /// filters by its recorded devnode; the root instance addresses the complete class.
+    pub fn pnp_interface_links_by_guid_bytes(
+        &self,
+        guid: &[u8; 16],
+        instance_id: &str,
+        include_nonactive: bool,
+    ) -> Option<Vec<String>> {
         if !self.pnp_device_exists(instance_id) {
             return None;
         }
@@ -2062,7 +2132,7 @@ impl ConfigManager {
             self.interfaces
                 .iter()
                 .filter(|interface| {
-                    interface.enabled
+                    (include_nonactive || interface.enabled)
                         && guid_text_eq_memory(&interface.guid, guid)
                         && devnode_filter.is_none_or(|id| interface.devnode == id)
                 })
@@ -2172,7 +2242,9 @@ fn interface_registry_path(guid: &str, instance: &str) -> String {
     path
 }
 
-fn interface_reference_registry_path(guid: &str, instance: &str, reference: &str) -> String {
+/// Registry instance key belonging to a device-interface reference. The `Device Parameters`
+/// child is opened or created beneath this key by `IoOpenDeviceInterfaceRegistryKey`.
+pub fn interface_reference_registry_path(guid: &str, instance: &str, reference: &str) -> String {
     let mut path = interface_registry_path(guid, instance);
     path.push_str(r"\#");
     path.push_str(reference);
@@ -2218,7 +2290,7 @@ fn materialize_interface_registry(
 }
 
 /// The device-interface symbolic link name: `\??\<mangled-instance>#{GUID}\reference`.
-fn build_symbolic_link(guid: &str, instance: &str, reference: &str) -> String {
+pub fn device_interface_symbolic_link(guid: &str, instance: &str, reference: &str) -> String {
     let mut s = String::from(r"\??\");
     s.push_str(&mangled_device_instance(instance));
     s.push('#');
@@ -2372,6 +2444,21 @@ mod tests {
             .registry()
             .open_key(r"\registry\machine\system\currentcontrolset\services")
             .is_some());
+    }
+
+    #[test]
+    fn volatile_hardware_parent_allows_driver_owned_video_child() {
+        let mut registry = Registry::new();
+        let parent = r"\Registry\Machine\Hardware\DeviceMap";
+        let child = r"\Registry\Machine\Hardware\DeviceMap\Video";
+        assert!(registry.open_key(parent).is_none());
+        for path in VOLATILE_HARDWARE_BOOTSTRAP_PATHS {
+            registry.create_key(path);
+        }
+        assert!(registry.open_key(parent).is_some());
+        assert!(registry.open_key(child).is_none(), "the display driver owns Video creation");
+        registry.create_key(child);
+        assert!(registry.open_key(child).is_some());
     }
 
     #[test]
@@ -3472,6 +3559,29 @@ mod tests {
     }
 
     #[test]
+    fn boot_start_base_device_without_devnodes_is_a_hosted_legacy_driver() {
+        let mut cm = ConfigManager::new();
+        cm.register_typed_service(
+            "EntropyProvider",
+            r"system32\drivers\entropy.sys",
+            SERVICE_KERNEL_DRIVER,
+            None,
+            None,
+            SERVICE_BOOT_START,
+            1,
+        );
+        let key = cm.service_metadata("EntropyProvider").unwrap().service_key;
+        cm.registry_mut().set_string(key, "Group", "Base");
+
+        let service = cm.service_metadata("EntropyProvider").unwrap();
+        assert!(cm.is_boot_system_legacy_driver(&service));
+
+        cm.registry_mut().set_dword(key, "Start", SERVICE_SYSTEM_START);
+        let service = cm.service_metadata("EntropyProvider").unwrap();
+        assert!(!cm.is_boot_system_legacy_driver(&service));
+    }
+
+    #[test]
     fn demand_start_pnp_driver_candidates_require_enum_binding() {
         let mut cm = ConfigManager::new();
         cm.register_typed_service(
@@ -4230,6 +4340,7 @@ mod tests {
         let guid_bytes = guid_text_to_memory_bytes(guid).unwrap();
         cm.register_interface(dn1, guid, "", true).unwrap();
         let disabled = cm.register_interface(dn2, guid, "disabled", false).unwrap();
+        let disabled_link = cm.interface(disabled).unwrap().symbolic_link.clone();
         let other = cm
             .register_interface(dn2, "{9A7B0B24-6E57-4C51-AD3C-6D9F5F0E0002}", "", true)
             .unwrap();
@@ -4260,6 +4371,20 @@ mod tests {
         assert_eq!(device_links, root_links);
         assert!(cm
             .pnp_enabled_interface_links_by_guid_bytes(&guid_bytes, r"ROOT\MISSING\0000")
+            .is_none());
+        let all_links = cm
+            .pnp_interface_links_by_guid_bytes(&guid_bytes, PNP_ROOT_DEVICE_INSTANCE, true)
+            .expect("root interface query");
+        assert_eq!(all_links.len(), 2);
+        assert!(all_links.iter().any(|link| link.contains("ROOT#IFACE#0000")));
+        assert!(all_links.iter().any(|link| link.contains("ROOT#IFACE#0001")));
+        assert_eq!(
+            cm.pnp_interface_links_by_guid_bytes(&guid_bytes, r"ROOT\IFACE\0001", true)
+                .unwrap(),
+            alloc::vec![disabled_link]
+        );
+        assert!(cm
+            .pnp_interface_links_by_guid_bytes(&guid_bytes, r"ROOT\MISSING\0000", true)
             .is_none());
     }
 

@@ -19,6 +19,7 @@ struct Io {
     fail: Option<Call>,
     next: u64,
     copy_failure: Option<(u64, u32)>,
+    indeterminate_delete: bool,
     null_segment: bool,
     same_segments: bool,
 }
@@ -63,11 +64,15 @@ impl ProviderAliasIo for Io {
     fn recycle_empty_root(&mut self, root: u64) -> Result<(), u32> {
         self.call(Call::Recycle(root))
     }
-    fn delete_root(&mut self, root: u64) -> Result<(), u32> {
-        self.call(Call::DeleteRoot(root))
+    fn delete_root(&mut self, root: u64) -> Result<(), ProviderAliasDeleteError> {
+        self.call(Call::DeleteRoot(root)).map_err(|status| if self.indeterminate_delete {
+            ProviderAliasDeleteError::Indeterminate(status)
+        } else { ProviderAliasDeleteError::NoEffect(status) })
     }
-    fn delete_child(&mut self, child: ChildCap) -> Result<(), u32> {
-        self.call(Call::DeleteChild(child))
+    fn delete_child(&mut self, child: ChildCap) -> Result<(), ProviderAliasDeleteError> {
+        self.call(Call::DeleteChild(child)).map_err(|status| if self.indeterminate_delete {
+            ProviderAliasDeleteError::Indeterminate(status)
+        } else { ProviderAliasDeleteError::NoEffect(status) })
     }
 }
 
@@ -115,6 +120,47 @@ fn exact_request_is_idempotent_and_has_typed_child_ownership() {
     assert_eq!(snapshot.child, Some(child(0)));
     assert_eq!(snapshot.root, None);
     assert_eq!(bank.stats().mapped, 1);
+}
+
+#[test]
+fn exact_client_section_page_release_preserves_other_aliases_and_rejects_stale_owner() {
+    let mut bank = bank();
+    let mut io = Io::default();
+    let first = request(4096);
+    let second = request(8192);
+    let first_handle = bank.map(first, &mut io).unwrap();
+    let second_handle = bank.map(second, &mut io).unwrap();
+    let stale = ProviderAliasRequest {
+        process: ProcessIdentity {
+            generation: ProcessGeneration::Hosted(8),
+            ..first.process
+        },
+        ..first
+    };
+    io.calls.clear();
+    assert_eq!(bank.release_page_exact(stale, first_handle, &mut io), Err(BankError::OwnerChanged));
+    assert!(io.calls.is_empty());
+    assert_eq!(bank.release_page_exact(first, first_handle, &mut io), Ok(()));
+    assert!(bank.get(first_handle).is_none());
+    assert_eq!(bank.get(second_handle).unwrap().request, second);
+    assert_eq!(bank.release_page_exact(first, first_handle, &mut io), Err(BankError::StaleHandle));
+}
+
+#[test]
+fn indeterminate_exact_page_delete_quarantines_lease_without_replay() {
+    let mut bank = bank();
+    let mut io = Io { indeterminate_delete: true, ..Io::default() };
+    let request = request(4096);
+    let handle = bank.map(request, &mut io).unwrap();
+    let child = bank.get(handle).unwrap().child.unwrap();
+    io.fail = Some(Call::DeleteChild(child));
+    assert_eq!(bank.release_page_exact(request, handle, &mut io), Err(BankError::Backend(99)));
+    assert!(bank.get(handle).unwrap().releasing);
+    io.calls.clear();
+    assert_eq!(bank.release_page_exact(request, handle, &mut io), Err(BankError::Releasing));
+    assert_eq!(bank.release_process(request.pi, request.process, &mut io), Err(BankError::Releasing));
+    assert!(io.calls.is_empty());
+    assert!(bank.get(handle).is_some());
 }
 
 #[test]

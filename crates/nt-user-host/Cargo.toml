@@ -32,6 +32,9 @@ nt-user-callback = { workspace = true }
 undocumented_unsafe_blocks = "deny"
 
 [dev-dependencies]
+nt-object-client = { workspace = true }
+nt-object-abi = { workspace = true }
+nt-object-server = { workspace = true }
 nt-page-storage = { workspace = true, features = ["allocation-observation"] }
 nt-time = { workspace = true }
 nt-config-manager = { workspace = true }

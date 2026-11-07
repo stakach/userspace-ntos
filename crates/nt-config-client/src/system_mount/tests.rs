@@ -1,5 +1,5 @@
 use super::*;
-use crate::{SystemHiveMutation, STATUS_DEVICE_NOT_READY};
+use crate::{SystemHiveMutation, STATUS_DEVICE_BUSY, STATUS_DEVICE_NOT_READY};
 use alloc::{rc::Rc, vec::Vec};
 use core::num::NonZeroU32;
 use nt_config_abi::CmReply;
@@ -127,6 +127,41 @@ fn ordinary_publication_and_checkpoint_preserve_mount_identity() {
     assert_eq!(
         client.validate_system_hive_mount(first.mount(), 2),
         Ok(second)
+    );
+}
+
+#[test]
+fn leased_key_revalidation_accepts_new_revision_only_on_the_same_mount() {
+    let mut client = client(source());
+    client.import_system_hive(&image()).unwrap();
+    let first = client.query_system_hive_mount(1).unwrap();
+    let path = r"\Registry\Machine\System\ControlSet001\Services\Stable";
+    let lease = crate::retained_test_keys::open(&mut client, path).lease;
+    let prepared = client.prepare_system_hive_mutation(1, &[
+        SystemHiveMutation::SetValue {
+            path,
+            name: "Start",
+            value_type: RegistryValueType::Dword as u32,
+            data: &2u32.to_le_bytes(),
+        },
+    ]).unwrap();
+    assert_eq!(client.publish_system_hive_mutation(&prepared).unwrap().generation, 2);
+
+    assert_eq!(
+        client.query_leased_system_hive_key_at_durable_mount(lease, first.mount(), 1),
+        Err(STATUS_DEVICE_BUSY),
+    );
+    let rebased = client.query_leased_system_hive_key_at_durable_mount(
+        lease, first.mount(), 2,
+    ).unwrap();
+    assert_eq!(rebased.mount_generation, 2);
+    assert_eq!(rebased.path.to_ascii_lowercase(), path.to_ascii_lowercase());
+
+    assert_eq!(client.import_system_hive(&image()), Ok(3));
+    let replacement = crate::retained_test_keys::open(&mut client, path).lease;
+    assert_eq!(
+        client.query_leased_system_hive_key_at_durable_mount(replacement, first.mount(), 3),
+        Err(STALE),
     );
 }
 

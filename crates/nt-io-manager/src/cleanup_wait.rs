@@ -178,6 +178,11 @@ impl PendingFileCleanupWaitTable {
     pub fn is_empty(&self) -> bool {
         self.slots.iter().all(Option::is_none)
     }
+
+    /// Inspect parked continuations without transferring their Reply ownership.
+    pub fn parked(&self) -> impl Iterator<Item = PendingFileCleanupWait> + '_ {
+        self.slots.iter().flatten().copied()
+    }
 }
 
 #[cfg(test)]

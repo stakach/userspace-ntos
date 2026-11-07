@@ -18,6 +18,7 @@ pub(super) struct KernelJobRecipient {
     wait: KernelProviderWaitState,
     observation: Option<spawn_hosts::PumpResult>,
     destination: KernelJobDestination,
+    ps_retirement: Option<(u32, nt_user_host::provider_ps_retirement::PsRetirementTarget)>,
 }
 
 impl KernelProviderWaitRecipient for KernelJobRecipient {
@@ -42,6 +43,7 @@ impl KernelJobRecipient {
             channel,
             observation: None,
             destination: KernelJobDestination::DriverEntry,
+            ps_retirement: None,
         })
     }
 
@@ -58,6 +60,26 @@ impl KernelJobRecipient {
         matches!(self.destination, KernelJobDestination::DriverEntry)
     }
 
+    pub(super) fn retain_ps_retirement(
+        &mut self,
+        pi: u32,
+        target: nt_user_host::provider_ps_retirement::PsRetirementTarget,
+    ) {
+        self.ps_retirement = Some((pi, target));
+    }
+
+    pub(super) fn release_ps_retirement(&mut self, pm: &mut nt_process::ProcessManager) -> Result<(), u32> {
+        if let Some((_, target)) = self.ps_retirement.as_mut() {
+            target.release(pm)?;
+        }
+        self.ps_retirement = None;
+        Ok(())
+    }
+
+    pub(super) fn ps_retirement(&self) -> Option<(u32, &nt_user_host::provider_ps_retirement::PsRetirementTarget)> {
+        self.ps_retirement.as_ref().map(|(pi, target)| (*pi, target))
+    }
+
     pub(super) fn return_status_offset(&self) -> u64 {
         if self.is_driver_entry() { win32k_subsystem::SH_DE_STATUS }
         else { win32k_subsystem::SH_REQ_STATUS }
@@ -69,6 +91,9 @@ impl KernelJobRecipient {
             && self.channel.pml4 == channel.pml4
             && self.channel.shared_va == channel.shared_va
             && self.channel.dispatch_label == channel.dispatch_label
+            && self.channel.client_pi == channel.client_pi
+            && self.channel.client_generation == channel.client_generation
+            && self.channel.caps.client_attach == channel.caps.client_attach
     }
 
     pub(super) fn completion_label(&self) -> u64 {
@@ -215,6 +240,12 @@ pub(crate) struct KernelJobCompletion {
     recipient: KernelJobRecipient,
 }
 
+pub(super) enum KernelJobInitialization {
+    Complete(bool),
+    Pending(KernelJobCompletion, win32k_glue::Win32kBootstrapPending),
+    Failed(KernelJobCompletion),
+}
+
 impl KernelJobCompletion {
     pub(super) fn new(status: u32, recipient: KernelJobRecipient) -> Self {
         Self {
@@ -224,22 +255,64 @@ impl KernelJobCompletion {
     }
 
     /// Readiness is the initiating bootstrap consumer's work, not a generic Reply effect.
-    pub(crate) unsafe fn initialize(self) -> bool {
-        if let KernelJobDestination::Executive(result) = &self.recipient.destination {
+    pub(crate) unsafe fn initialize(mut self) -> KernelJobInitialization {
+        let recipient = &mut self.recipient;
+        let executive_result = match &recipient.destination {
+            KernelJobDestination::Executive(result) => Some(result.clone()),
+            KernelJobDestination::DriverEntry => None,
+        };
+        if let Some(result) = executive_result {
+            if recipient.ps_retirement.is_some() {
+                // The completion ACK transferred this exact recipient; target Ps references
+                // cannot be released on a mere provider return or reply observation.
+                if crate::service_sec_image::with_provider_process_manager(|pm| {
+                    recipient.release_ps_retirement(pm)
+                }).is_err() {
+                    crate::park();
+                }
+            }
             // This destination receives the retained result only after the activation ACK
             // transferred the recipient and released its canonical requestor references.
             result.store((1u64 << 32) | u64::from(self.status as u32), Ordering::Release);
-            return true;
+            return KernelJobInitialization::Complete(true);
         }
         if self.status < 0 {
-            return false;
+            return KernelJobInitialization::Complete(false);
         }
-        let channel = self.recipient.channel;
+        let channel = recipient.channel;
         WIN32K_FAULT_EP.store(channel.fault_ep, Ordering::Relaxed);
         WIN32K_HOST_PML4.store(channel.pml4, Ordering::Relaxed);
-        if !win32k_glue::initialize_win32k_physical_lane(channel.pml4) {
-            panic!("win32k secondary execution lane failed its ready handshake");
+        match win32k_glue::initialize_win32k_bootstrap_lane(channel.pml4) {
+            win32k_glue::Win32kBootstrapStartup::Ready => {}
+            win32k_glue::Win32kBootstrapStartup::Pending(ticket) => {
+                return KernelJobInitialization::Pending(self, ticket);
+            }
+            win32k_glue::Win32kBootstrapStartup::Failed => {
+                return KernelJobInitialization::Failed(self);
+            }
         }
+        report_win32k_bootstrap_display();
+        KernelJobInitialization::Complete(true)
+    }
+
+    pub(crate) unsafe fn resume(
+        self,
+        pending: win32k_glue::Win32kBootstrapPending,
+    ) -> KernelJobInitialization {
+        match win32k_glue::resume_win32k_bootstrap_lane(pending) {
+            win32k_glue::Win32kBootstrapStartup::Ready => {
+                report_win32k_bootstrap_display();
+                KernelJobInitialization::Complete(true)
+            }
+            win32k_glue::Win32kBootstrapStartup::Pending(ticket) => {
+                KernelJobInitialization::Pending(self, ticket)
+            }
+            win32k_glue::Win32kBootstrapStartup::Failed => KernelJobInitialization::Failed(self),
+        }
+    }
+}
+
+unsafe fn report_win32k_bootstrap_display() {
         // HARDWARE\\DEVICEMAP\\VIDEO is still published by the real started videoprt miniport.
         if let Some(display_spec) = system_hive_display_driver_spec() {
             let view = display_spec.win32k_spec();
@@ -261,6 +334,4 @@ impl KernelJobCompletion {
         } else {
             print_str(b"[win32k-svc] no loadable display Device0 in SYSTEM hive and ReactOS FS\n");
         }
-        true
-    }
 }

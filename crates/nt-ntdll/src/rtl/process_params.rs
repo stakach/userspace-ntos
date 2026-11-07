@@ -704,4 +704,35 @@ mod tests {
         // The header+string length must be <= the total (env is the tail).
         assert!(built.length as usize <= built.block.len());
     }
+
+    #[test]
+    fn explicit_desktop_survives_child_parameter_relocation() {
+        let desktop = u("WinSta0\\Default");
+        let mut input = ParamsInput::default();
+        input.image_path_name = ParamString::new(&u("C:\\Windows\\system32\\setup.exe"));
+        input.command_line = input.image_path_name.clone();
+        input.desktop_info = ParamString::new(&desktop);
+
+        let mut parent = create_process_parameters(&input).block;
+        const PARENT_BASE: u64 = 0x0000_0100_3000_0000;
+        const CHILD_BASE: u64 = 0x0000_0100_8000_0000;
+        normalize(&mut parent, PARENT_BASE);
+        denormalize(&mut parent, PARENT_BASE);
+        let mut child = parent.clone();
+        normalize(&mut child, CHILD_BASE);
+
+        let length = read_u16(&child, OFF_DESKTOP_INFO);
+        let maximum_length = read_u16(&child, OFF_DESKTOP_INFO + 2);
+        let buffer = read_u64(&child, OFF_DESKTOP_INFO + US_BUFFER);
+        assert_eq!(length as usize, desktop.len() * 2);
+        assert!(maximum_length >= length + 2);
+        assert!(buffer >= CHILD_BASE);
+        let offset = (buffer - CHILD_BASE) as usize;
+        assert!(offset + maximum_length as usize <= child.len());
+        let actual: Vec<u16> = (0..desktop.len())
+            .map(|index| read_u16(&child, offset + index * 2))
+            .collect();
+        assert_eq!(actual, desktop);
+        assert_eq!(read_u16(&child, offset + length as usize), 0);
+    }
 }

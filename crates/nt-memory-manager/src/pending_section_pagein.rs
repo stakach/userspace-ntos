@@ -309,8 +309,22 @@ impl<R, K: Copy + Eq> PendingSectionPageReads<R, K> {
         id: PendingSectionPageReadId,
         key: K,
     ) -> Option<(R, Result<Vec<u8>, u32>)> {
+        self.take_acknowledged_if(id, key, |_, _, _, _| true)
+    }
+
+    /// Check the current Section, backing lease, page, and retained continuation together
+    /// before consuming an acknowledged read. A failed check keeps its owner and bytes parked.
+    pub fn take_acknowledged_if(
+        &mut self,
+        id: PendingSectionPageReadId,
+        key: K,
+        current: impl FnOnce(&R, SectionIdentity, RoutedSectionLease, u64) -> bool,
+    ) -> Option<(R, Result<Vec<u8>, u32>)> {
         let row = self.row(id)?;
-        if row.key != Some(key) || !matches!(row.phase, Phase::AckedReady | Phase::AckedFailed(_)) {
+        if row.key != Some(key)
+            || !matches!(row.phase, Phase::AckedReady | Phase::AckedFailed(_))
+            || !current(&row.owner, row.section, row.lease, row.page_index)
+        {
             return None;
         }
         let row = self.rows[id.slot].take()?;

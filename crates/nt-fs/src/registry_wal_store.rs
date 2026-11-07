@@ -61,6 +61,7 @@ pub struct RegistryWalVerifiedDevice<D> {
     device: D,
     prefix: RegistryWalVerifiedPrefix,
     record_end_lbas: Vec<u64>,
+    newly_committed_payload: Option<Vec<u8>>,
 }
 
 /// Move-only proof of the settled WAL prefix for another use of the same physical reserve.
@@ -86,7 +87,7 @@ impl RegistryWalContinuation {
     }
 
     pub(crate) fn from_verified<D>(verified: RegistryWalVerifiedDevice<D>) -> (D, Self) {
-        let (device, prefix, record_end_lbas) = verified.into_parts();
+        let (device, prefix, record_end_lbas, _) = verified.into_parts();
         (device, Self { prefix, record_end_lbas })
     }
 }
@@ -97,20 +98,22 @@ impl<D> RegistryWalVerifiedDevice<D> {
 
     pub(crate) fn device_mut(&mut self) -> &mut D { &mut self.device }
 
-    pub(crate) fn into_parts(self) -> (D, RegistryWalVerifiedPrefix, Vec<u64>) {
-        (self.device, self.prefix, self.record_end_lbas)
+    pub(crate) fn into_parts(self) -> (D, RegistryWalVerifiedPrefix, Vec<u64>, Option<Vec<u8>>) {
+        (self.device, self.prefix, self.record_end_lbas, self.newly_committed_payload)
     }
 
-    pub(crate) fn from_parts(device: D, prefix: RegistryWalVerifiedPrefix, record_end_lbas: Vec<u64>) -> Self {
-        Self { device, prefix, record_end_lbas }
+    pub(crate) fn from_parts(device: D, prefix: RegistryWalVerifiedPrefix,
+        record_end_lbas: Vec<u64>, newly_committed_payload: Option<Vec<u8>>) -> Self {
+        Self { device, prefix, record_end_lbas, newly_committed_payload }
     }
 }
 
 impl<D: SnapshotBlockDevice> RegistryWalVerifiedDevice<OwnedBoundedBlockRange<D>> {
     /// Move from the bounded WAL view to its full parent without releasing the exact lease.
     pub fn into_full_device(self) -> RegistryWalVerifiedDevice<D> {
-        let (device, prefix, record_end_lbas) = self.into_parts();
-        RegistryWalVerifiedDevice::from_parts(device.into_device(), prefix, record_end_lbas)
+        let (device, prefix, record_end_lbas, newly_committed_payload) = self.into_parts();
+        RegistryWalVerifiedDevice::from_parts(device.into_device(), prefix, record_end_lbas,
+            newly_committed_payload)
     }
 }
 
@@ -142,6 +145,9 @@ pub struct RegistryWal<D: SnapshotBlockDevice> {
     pending: Option<Pending>,
     recovered_tail_sectors: Option<u64>,
     state: RegistryWalState,
+    async_effect: Option<async_io::AsyncWalEffect>,
+    async_sequence: u64,
+    newly_committed_serial: Option<u64>,
 }
 
 impl<D: SnapshotBlockDevice> Drop for RegistryWal<D> {
@@ -234,6 +240,19 @@ fn framed_sector(
     payload_crc: u32,
 ) -> Result<Vec<u8>, RegistryWalError> {
     let mut sector = sector_buffer(size)?;
+    encode_framed_sector(&mut sector, magic, incarnation, serial, payload_len, payload_crc);
+    Ok(sector)
+}
+
+fn encode_framed_sector(
+    sector: &mut [u8],
+    magic: [u8; 8],
+    incarnation: u64,
+    serial: u64,
+    payload_len: u32,
+    payload_crc: u32,
+) {
+    sector.fill(0);
     sector[..8].copy_from_slice(&magic);
     sector[8..16].copy_from_slice(&incarnation.to_le_bytes());
     sector[16..24].copy_from_slice(&serial.to_le_bytes());
@@ -241,7 +260,6 @@ fn framed_sector(
     sector[28..32].copy_from_slice(&payload_crc.to_le_bytes());
     let header_crc = crc32c(&sector[..32]);
     sector[32..HEADER_BYTES].copy_from_slice(&header_crc.to_le_bytes());
-    Ok(sector)
 }
 
 fn payload_sectors(len: usize, size: usize) -> Result<u64, RegistryWalError> {
@@ -296,6 +314,9 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
             pending: None,
             recovered_tail_sectors: None,
             state: RegistryWalState::Ready,
+            async_effect: None,
+            async_sequence: 1,
+            newly_committed_serial: None,
         })
     }
 
@@ -372,20 +393,21 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
                 return Err(RegistryWalError::Corrupt);
             }
             let mut payload = Vec::new();
+            let padded_len = usize::try_from(payload_count)
+                .ok()
+                .and_then(|sectors| sectors.checked_mul(size))
+                .ok_or(RegistryWalError::Corrupt)?;
             payload
-                .try_reserve_exact(len)
+                .try_reserve_exact(padded_len)
                 .map_err(|_| RegistryWalError::OutOfMemory)?;
-            for index in 0..payload_count {
-                device
-                    .read_sector(cursor + 1 + index, &mut sector)
-                    .map_err(RegistryWalError::Storage)?;
-                let remaining = len - payload.len();
-                let take = remaining.min(size);
-                payload.extend_from_slice(&sector[..take]);
-                if take < size && !sector_is_zero(&sector[take..]) {
-                    return Err(RegistryWalError::Corrupt);
-                }
+            payload.resize(padded_len, 0);
+            device
+                .read_sectors(cursor + 1, &mut payload)
+                .map_err(RegistryWalError::Storage)?;
+            if !sector_is_zero(&payload[len..]) {
+                return Err(RegistryWalError::Corrupt);
             }
+            payload.truncate(len);
             if crc32c(&payload) != payload_crc {
                 return Err(RegistryWalError::Corrupt);
             }
@@ -416,6 +438,9 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
             } else {
                 RegistryWalState::Ready
             },
+            async_effect: None,
+            async_sequence: 1,
+            newly_committed_serial: None,
         })
     }
 
@@ -463,6 +488,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
     /// Discard a verified but unmarked tail after reboot. This may write after recovery,
     /// so its owner and lease are retained if any clearing effect is uncertain.
     pub fn clear_recovered_tail(&mut self) -> Result<(), RegistryWalError> {
+        if self.async_effect.is_some() { return Err(RegistryWalError::InvalidState); }
         if self.state == RegistryWalState::Uncertain {
             return Err(RegistryWalError::Uncertain);
         }
@@ -516,6 +542,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
         self.record_end_lbas
             .try_reserve(1)
             .map_err(|_| RegistryWalError::OutOfMemory)?;
+        self.newly_committed_serial = None;
         self.pending = Some(Pending {
             serial: self.next_serial,
             sectors: count,
@@ -528,6 +555,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
     /// Cancel a reservation before PREPARE starts. No sector has been touched, so this
     /// is the only pending state that can release its device without a clearing barrier.
     pub fn cancel_pending(&mut self) -> Result<(), RegistryWalError> {
+        if self.async_effect.is_some() { return Err(RegistryWalError::InvalidState); }
         if self.state != RegistryWalState::PendingPrepare {
             return Err(RegistryWalError::InvalidState);
         }
@@ -538,6 +566,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
 
     /// Write PREPARE plus payload, then issue the first device durability barrier.
     pub fn prepare(&mut self) -> Result<(), RegistryWalError> {
+        if self.async_effect.is_some() { return Err(RegistryWalError::InvalidState); }
         if self.state == RegistryWalState::Uncertain {
             return Err(RegistryWalError::Uncertain);
         }
@@ -591,6 +620,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
     /// Call only after CM has entered COMMIT for the exact prepared journal. The marker's
     /// barrier is the proof required before CM ACK or any caller success reply.
     pub fn commit(&mut self) -> Result<(), RegistryWalError> {
+        if self.async_effect.is_some() { return Err(RegistryWalError::InvalidState); }
         if self.state == RegistryWalState::Uncertain {
             return Err(RegistryWalError::Uncertain);
         }
@@ -629,6 +659,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
             return Err(error);
         }
         let pending = self.pending.take().unwrap();
+        self.newly_committed_serial = Some(pending.serial);
         self.records.push(RegistryWalRecord {
             serial: pending.serial,
             payload: pending.payload,
@@ -643,6 +674,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
     /// Call only after CM confirms that the matching preparation was aborted before COMMIT.
     /// A failed clearing barrier retains the exact pending record and blocks reuse.
     pub fn abort_prepared(&mut self) -> Result<(), RegistryWalError> {
+        if self.async_effect.is_some() { return Err(RegistryWalError::InvalidState); }
         if self.state == RegistryWalState::Uncertain {
             return Err(RegistryWalError::Uncertain);
         }
@@ -666,7 +698,7 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
 
     /// The lease can leave only after all owned writes have a terminal durable result.
     pub fn into_device(mut self) -> Result<D, Self> {
-        if self.state == RegistryWalState::Ready {
+        if self.state == RegistryWalState::Ready && self.async_effect.is_none() {
             Ok(self.device.take().expect("retained WAL device"))
         } else {
             Err(self)
@@ -677,15 +709,20 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
     /// physical lease can then enter [`crate::WalSnapshotAnchorUpdate::admit_verified_wal`]
     /// without recreating storage authority or guessing the final frame boundary.
     pub fn into_verified_device(mut self) -> Result<RegistryWalVerifiedDevice<D>, Self> {
-        if self.state != RegistryWalState::Ready {
+        if self.state != RegistryWalState::Ready || self.async_effect.is_some() {
             return Err(self);
         }
         let (incarnation, serial, end_lba) = self.verified_prefix().expect("settled WAL prefix");
         let prefix = RegistryWalVerifiedPrefix { incarnation, serial, end_lba };
+        let newly_committed_payload = if self.newly_committed_serial == Some(serial) {
+            self.records.last_mut().and_then(|record|
+                (record.serial == serial).then(|| core::mem::take(&mut record.payload)))
+        } else { None };
         Ok(RegistryWalVerifiedDevice::from_parts(
             self.device.take().expect("retained WAL device"),
             prefix,
             core::mem::take(&mut self.record_end_lbas),
+            newly_committed_payload,
         ))
     }
 
@@ -711,3 +748,6 @@ impl<D: SnapshotBlockDevice> RegistryWal<D> {
 #[cfg(test)]
 #[path = "registry_wal_store/tests.rs"]
 mod tests;
+
+mod async_io;
+pub use async_io::{AsyncWalIoKind, AsyncWalIoRequest, AsyncWalRefusal};

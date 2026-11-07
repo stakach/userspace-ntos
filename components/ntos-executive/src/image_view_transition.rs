@@ -45,6 +45,10 @@ pub(super) fn emit_image_view_transition(
     kind: ImageViewTransitionKind,
     live_views: usize,
 ) {
+    static TRACE_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    if !crate::DEBUG_TRACE && !crate::bounded_trace_sample(&TRACE_COUNT, 4) {
+        return;
+    }
     let phase = match kind {
         ImageViewTransitionKind::Mapped => "mapped",
         ImageViewTransitionKind::Unmapped => "unmapped",

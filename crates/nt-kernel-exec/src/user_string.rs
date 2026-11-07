@@ -22,6 +22,26 @@ pub struct UnicodeStringInput {
     pub maximum: u64,
 }
 
+/// Read-only object names use the counted bytes in `Length`. `MaximumLength` describes the
+/// caller's buffer capacity and is not part of the input name captured by the object manager.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObjectNameInput {
+    pub buffer: u64,
+    pub length: usize,
+}
+
+pub fn object_name_input(raw: &[u8; 16]) -> Option<ObjectNameInput> {
+    let length = u16::from_le_bytes([raw[0], raw[1]]) as usize;
+    let buffer = u64::from_le_bytes(raw[8..16].try_into().ok()?);
+    if length & 1 != 0
+        || (length != 0 && buffer == 0)
+        || buffer.checked_add(length as u64).is_none()
+    {
+        return None;
+    }
+    Some(ObjectNameInput { buffer, length })
+}
+
 pub fn unicode_string_input(raw: &[u8; 16], capture_cap: u64) -> Option<UnicodeStringInput> {
     let length = u16::from_le_bytes([raw[0], raw[1]]) as u64;
     let maximum = u16::from_le_bytes([raw[2], raw[3]]) as u64;
@@ -203,6 +223,20 @@ mod tests {
         assert!(required_unicode_string(&descriptor(0x200, 0x200, 0x1000), 0x200).is_none());
         assert!(required_unicode_string(&descriptor(2, 2, 0), 0x200).is_none());
         assert!(required_unicode_string(&descriptor(2, 2, u64::MAX), 0x200).is_none());
+    }
+
+    #[test]
+    fn object_name_capture_uses_length_even_when_maximum_length_is_smaller() {
+        assert_eq!(
+            object_name_input(&descriptor(24, 0, 0x1000)),
+            Some(ObjectNameInput {
+                buffer: 0x1000,
+                length: 24,
+            })
+        );
+        assert!(object_name_input(&descriptor(3, 0, 0x1000)).is_none());
+        assert!(object_name_input(&descriptor(24, 0, 0)).is_none());
+        assert!(object_name_input(&descriptor(24, 0, u64::MAX - 8)).is_none());
     }
 
     #[test]

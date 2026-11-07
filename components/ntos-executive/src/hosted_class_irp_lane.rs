@@ -6,22 +6,46 @@
 
 use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
-use nt_component_suspension::peer_registry::PeerRoute;
+use nt_component_suspension::{peer_registry::PeerRoute, NestedRestoreChain,
+    NestedRestoreResultKey};
+use nt_object_manager::hosted_dynamic_type::{DynamicDeleteTicket, DynamicObjectLease};
+use nt_component_suspension::{next_ready_pending_lane, PendingLaneReadiness};
+use core::sync::atomic::AtomicUsize;
 
 const LABEL: u64 = 0x7bd;
+pub(super) const FSD_DISPATCH_DYNAMIC_DELETE: u64 = u64::MAX - 0x7bd;
 const BANK_OFFSET: u64 = FSD_WORKER_KPCR_OFFSET + 0x1000;
 const ARG_OFFSET: u64 = BANK_OFFSET + 0x1000;
 const REQUEST_OFFSET: u64 = 0x800;
-const JUMP_OFFSET: u64 = 0x900;
+const JUMP_OFFSET: u64 = align_up_u64(
+    REQUEST_OFFSET + core::mem::size_of::<IrpDispatchRequest>() as u64, 16,
+);
 const SCRATCH_BANK_OFFSET: u64 = 0xff0;
 const ORDINAL_BIT: u64 = 1 << 63;
 const _: () = assert!(REQUEST_OFFSET + core::mem::size_of::<IrpDispatchRequest>() as u64 <= JUMP_OFFSET);
-const _: () = assert!(JUMP_OFFSET + 3 * 8 <= 0x1000);
+const _: () = assert!(JUMP_OFFSET + 3 * 8 <= SCRATCH_BANK_OFFSET);
 const _: () = assert!(BANK_OFFSET + 0x1000 <= FSD_WORKER_STRIDE);
 const _: () = assert!(ARG_OFFSET + FSD_ARG_FRAMES * 0x1000 <= FSD_WORKER_STRIDE);
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum Phase { Preparing, Ready, Entered, Uncertain, Retiring, Retired }
+enum Phase { Preparing, Ready, DeletePrepared, Entered, NestedRestore,
+    DeleteCompleted, Uncertain, Retiring, Retired }
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum DeleteCallbackProgress { Completed, Retained, Uncertain }
+
+enum RestorePayload {
+    Chain(NestedRestoreChain<crate::spawn_hosts::PumpResult>),
+    // A rejected pure construction cannot erase the physical parent ticket or result.
+    Quarantined(crate::spawn_hosts::PumpResult),
+}
+
+struct PendingDeleteRestore {
+    ticket: runtime::nested::NestedRestoreTicket,
+    key: NestedRestoreResultKey,
+    payload: RestorePayload,
+    retryable: bool,
+}
 
 struct Lane {
     instance: usize,
@@ -35,9 +59,13 @@ struct Lane {
     phase: Phase,
     current_irp: Option<u64>,
     startup_dispatch: Option<nt_component_suspension::LaneDispatchIdentity>,
+    delete_ticket: Option<DynamicDeleteTicket>,
+    delete_restore: Option<PendingDeleteRestore>,
+    delete_unattributed_result: Option<crate::spawn_hosts::PumpResult>,
 }
 
 static mut LANES: Vec<Lane> = Vec::new();
+static LAST_PENDING_DELETE: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 pub(super) struct Selection {
     pub route: PeerRoute,
@@ -55,7 +83,7 @@ impl Selection {
 }
 
 #[derive(Clone, Copy)]
-enum SelectionPurpose { New, Control(u64) }
+enum SelectionPurpose { New, Control(u64), Callback }
 
 unsafe fn index_for(instance_index: usize) -> Option<usize> {
     let inst = instance(instance_index)?;
@@ -125,13 +153,25 @@ pub(super) unsafe fn prepare(instance_index: usize) -> Result<(), nt_status::NtS
             .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
         rows.push(Lane { instance: instance_index, domain, pml4: inst.pml4, ordinal, handle: 0,
             route: None, component_shared: 0, executive_shared: 0, phase: Phase::Preparing,
-            current_irp: None, startup_dispatch: None });
+            current_irp: None, startup_dispatch: None,
+            delete_ticket: None, delete_restore: None, delete_unattributed_result: None });
         rows.len() - 1
     };
     let result = construct(index, inst);
-    (&mut *core::ptr::addr_of_mut!(LANES))[index].phase =
-        if result.is_ok() { Phase::Ready } else { Phase::Uncertain };
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    row.phase = if result.is_ok() { Phase::Ready } else { Phase::Uncertain };
+    trace_startup_return(row, result.as_ref().err().copied().unwrap_or(0));
     result.map_err(|status| nt_status::NtStatus(status as i32))
+}
+
+fn trace_startup_return(row: &Lane, status: u32) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 16 { return; }
+    print_str(b"[class-startup-return] instance/ordinal/phase/status=");
+    print_u64(row.instance as u64); print_str(b"/");
+    print_u64(row.ordinal); print_str(b"/");
+    print_u64(match row.phase { Phase::Ready => 1, Phase::Uncertain => 2, _ => 0 });
+    print_str(b"/"); print_hex(status); print_str(b"\n");
 }
 
 unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
@@ -153,7 +193,8 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
     (&mut *core::ptr::addr_of_mut!(LANES))[index].handle = handle;
     let spawn = spawn_hosted_driver_worker_thread_with_shared_bank(
         instance_index, inst, handle, slot, entry as *const () as u64, shared,
-        Some(HostedWorkerSharedBankSpec { offset: BANK_OFFSET, arg_offset: Some(ARG_OFFSET) }),
+        Some(HostedWorkerSharedBankSpec { offset: BANK_OFFSET, frames: 1,
+            arg_offset: Some(ARG_OFFSET) }),
     ).ok_or(STATUS_INSUFFICIENT_RESOURCES as u32)?;
     let bank = spawn.shared_bank.ok_or(STATUS_INVALID_HANDLE as u32)?;
     if bank.component != shared || bank.arg_component
@@ -263,10 +304,17 @@ pub(crate) unsafe fn validate_startup_ready(ch: &crate::spawn_hosts::PumpChannel
 unsafe fn select(instance_index: usize, purpose: SelectionPurpose) -> Option<Selection> {
     let index = index_for(instance_index)?;
     let row = &(&*core::ptr::addr_of!(LANES))[index];
-    if row.phase != Phase::Ready { return None; }
+    if row.phase != Phase::Ready
+        && !(row.phase == Phase::DeletePrepared
+            && matches!(purpose, SelectionPurpose::Callback))
+    { return None; }
     match purpose {
         SelectionPurpose::New if row.current_irp.is_some() => return None,
         SelectionPurpose::Control(irp) if row.current_irp != Some(irp) => return None,
+        SelectionPurpose::Callback if row.current_irp.is_some()
+            || (row.phase == Phase::Ready && row.delete_ticket.is_some())
+            || (row.phase == Phase::DeletePrepared && row.delete_ticket.is_none())
+            => return None,
         _ => {}
     }
     let route = row.route?;
@@ -278,6 +326,272 @@ unsafe fn select(instance_index: usize, purpose: SelectionPurpose) -> Option<Sel
 
 pub(super) unsafe fn select_new(instance_index: usize) -> Option<Selection> {
     select(instance_index, SelectionPurpose::New)
+}
+
+pub(super) unsafe fn select_callback(instance_index: usize) -> Option<Selection> {
+    select(instance_index, SelectionPurpose::Callback)
+}
+
+/// The destination is already part of the durable class lane. The registry's claim and this
+/// store are one memory-only transition; no provider callback can start with a stack-only ticket.
+pub(super) unsafe fn claim_delete(
+    instance_index: usize, selection: &Selection, lease: DynamicObjectLease,
+) -> bool {
+    let Some(index) = index_for(instance_index) else { return false; };
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    if row.phase != Phase::Ready || !matches!(selection.purpose, SelectionPurpose::Callback)
+        || row.route != Some(selection.route) || row.executive_shared != selection.shared
+        || row.current_irp.is_some() || row.delete_ticket.is_some()
+    { return false; }
+    let Some(registry) = hosted_driver_dynamic_type::registry_mut() else { return false; };
+    if registry.take_delete_into(lease, &mut row.delete_ticket).is_err() { return false; }
+    row.phase = Phase::DeletePrepared;
+    true
+}
+
+/// Execute one PASSIVE_LEVEL callback on the worker's independent TCB, Reply, and bank. The
+/// claimed callback ticket is retained in this lane before entering the uncertain native effect.
+pub(super) unsafe fn dispatch_callback(
+    instance_index: usize, selection: &Selection,
+) -> DeleteCallbackProgress {
+    let Some(index) = index_for(instance_index) else { return DeleteCallbackProgress::Retained; };
+    let row = &(&*core::ptr::addr_of!(LANES))[index];
+    let Some(ticket) = row.delete_ticket else { return DeleteCallbackProgress::Uncertain; };
+    let callback = ticket.callback;
+    let object = ticket.object;
+    let Some(worker) = worker(instance_index, (&*core::ptr::addr_of!(LANES))[index].ordinal)
+    else { return DeleteCallbackProgress::Retained; };
+    let Some(inst) = instance(instance_index) else { return DeleteCallbackProgress::Retained; };
+    if row.phase != Phase::DeletePrepared || !matches!(selection.purpose, SelectionPurpose::Callback)
+        || row.route != Some(selection.route)
+        || selection.shared != row.executive_shared || selection.tcb != worker.tcb
+        || callback == 0 || object == 0
+    { return DeleteCallbackProgress::Retained; }
+    let Some(primary) = hosted_ingress_sources::primary_route(instance_index) else {
+        return DeleteCallbackProgress::Retained;
+    };
+    if !matches!(runtime::ready_for_admission(primary), Ok(true)) {
+        return DeleteCallbackProgress::Retained;
+    }
+    let Some(caller) = hosted_thread_resources::registry_caller(worker).ok() else {
+        return DeleteCallbackProgress::Retained;
+    };
+    let Ok(ch) = channel(index, worker, crate::spawn_hosts::InitialAction::ReplyRequest)
+    else { return DeleteCallbackProgress::Retained; };
+    write_volatile((selection.shared + SH_DRVOBJ) as *mut u64, selection.shared);
+    write_volatile((selection.shared + SH_REQ_MAJOR) as *mut u64, FSD_DISPATCH_DYNAMIC_DELETE);
+    write_volatile((selection.shared + SH_REQ_MINOR) as *mut u64, callback);
+    write_volatile((selection.shared + SH_REQ_FILEID) as *mut u64, object);
+    write_volatile((selection.shared + SH_REQ_STATUS) as *mut i32, 0);
+    write_volatile((selection.shared + SH_REQ_INFO) as *mut u64, 0);
+    if instance_domain_identity(inst) != Some((&*core::ptr::addr_of!(LANES))[index].domain)
+        || !mark_entered(instance_index, selection, None)
+    { return DeleteCallbackProgress::Retained; }
+    match component_scheduler::hosted_component_pump_with_caller_retained(&ch, caller) {
+        component_scheduler::HostedPumpRestore::Restored(result) => {
+            finish_delete_result(index, result)
+        }
+        component_scheduler::HostedPumpRestore::Retained {
+            result, key, ticket, retryable,
+        } => retain_delete_result(index, result, key, ticket, retryable),
+        component_scheduler::HostedPumpRestore::Unattributed(result) => {
+            let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+            row.delete_unattributed_result = Some(result);
+            row.phase = Phase::Uncertain;
+            DeleteCallbackProgress::Uncertain
+        }
+    }
+}
+
+unsafe fn finish_delete_result(
+    index: usize, result: crate::spawn_hosts::PumpResult,
+) -> DeleteCallbackProgress {
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    if row.phase != Phase::Entered || row.delete_ticket.is_none() {
+        row.phase = Phase::Uncertain;
+        return DeleteCallbackProgress::Uncertain;
+    }
+    if result.completed && result.status == STATUS_SUCCESS {
+        row.phase = Phase::DeleteCompleted;
+        DeleteCallbackProgress::Completed
+    } else {
+        // A returned failure is not proof that DeleteProcedure had no effect. Keep the
+        // claimed ticket and body in flight; no second callback is authorized.
+        row.phase = Phase::Uncertain;
+        DeleteCallbackProgress::Uncertain
+    }
+}
+
+unsafe fn retain_delete_result(
+    index: usize,
+    result: crate::spawn_hosts::PumpResult,
+    key: NestedRestoreResultKey,
+    ticket: runtime::nested::NestedRestoreTicket,
+    retryable: bool,
+) -> DeleteCallbackProgress {
+    let payload = match NestedRestoreChain::retain(key, None, result) {
+        Ok(mut chain) => {
+            if chain.begin_inner(key).is_err() {
+                RestorePayload::Quarantined(result)
+            } else if retryable {
+                if chain.refuse_inner_no_effects(key).is_ok() {
+                    RestorePayload::Chain(chain)
+                } else {
+                    RestorePayload::Quarantined(result)
+                }
+            } else if chain.quarantine_inner(key).is_ok() {
+                RestorePayload::Chain(chain)
+            } else {
+                RestorePayload::Quarantined(result)
+            }
+        }
+        Err(_) => RestorePayload::Quarantined(result),
+    };
+    let retryable = retryable && matches!(&payload, RestorePayload::Chain(_));
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    row.delete_restore = Some(PendingDeleteRestore { ticket, key, payload, retryable });
+    row.phase = Phase::NestedRestore;
+    if retryable { DeleteCallbackProgress::Retained }
+    else { DeleteCallbackProgress::Uncertain }
+}
+
+unsafe fn retry_delete_restore(index: usize) -> DeleteCallbackProgress {
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    let Some(pending) = row.delete_restore.as_mut() else {
+        row.phase = Phase::Uncertain;
+        return DeleteCallbackProgress::Uncertain;
+    };
+    if !pending.retryable {
+        return DeleteCallbackProgress::Uncertain;
+    }
+    let RestorePayload::Chain(chain) = &mut pending.payload else {
+        pending.retryable = false;
+        return DeleteCallbackProgress::Uncertain;
+    };
+    let ticket = pending.ticket;
+    let key = pending.key;
+    if chain.begin_inner(key).is_err() {
+        pending.retryable = false;
+        return DeleteCallbackProgress::Uncertain;
+    }
+    if runtime::nested::restore_pending_ticket(ticket).is_err() {
+        if runtime::nested::pending_ticket(ticket) {
+            if chain.refuse_inner_no_effects(key).is_ok() {
+                return DeleteCallbackProgress::Retained;
+            }
+        } else {
+            let _ = chain.quarantine_inner(key);
+        }
+        pending.retryable = false;
+        return DeleteCallbackProgress::Uncertain;
+    }
+    let Some(mut pending) = row.delete_restore.take() else {
+        row.phase = Phase::Uncertain;
+        return DeleteCallbackProgress::Uncertain;
+    };
+    let RestorePayload::Chain(ref mut chain) = pending.payload else {
+        row.delete_restore = Some(pending);
+        row.phase = Phase::Uncertain;
+        return DeleteCallbackProgress::Uncertain;
+    };
+    if chain.acknowledge_inner(key).is_err() {
+        row.delete_restore = Some(pending);
+        row.phase = Phase::Uncertain;
+        return DeleteCallbackProgress::Uncertain;
+    }
+    match chain.take(key, None) {
+        Ok(result) => {
+            row.phase = Phase::Entered;
+            finish_delete_result(index, result)
+        }
+        Err(_) => {
+            row.delete_restore = Some(pending);
+            row.phase = Phase::Uncertain;
+            DeleteCallbackProgress::Uncertain
+        }
+    }
+}
+
+/// The outer service boundary first drains the exact callback that already owns a ticket.
+/// Quarantined rows are excluded because neither callback replay nor physical restore retry
+/// has been authorized for them.
+pub(super) unsafe fn next_pending_delete() -> Option<usize> {
+    let rows = &*core::ptr::addr_of!(LANES);
+    let last = LAST_PENDING_DELETE.load(core::sync::atomic::Ordering::Relaxed);
+    let after = (last != usize::MAX).then_some(last);
+    let index = next_ready_pending_lane(rows.len(), after, |index| {
+        let row = &rows[index];
+        if index_for(row.instance) != Some(index) || row.delete_ticket.is_none() {
+            return PendingLaneReadiness::Absent;
+        }
+        match row.phase {
+            Phase::DeleteCompleted => PendingLaneReadiness::Ready,
+            Phase::NestedRestore if row.delete_restore.as_ref()
+                .is_some_and(|pending| pending.retryable) => PendingLaneReadiness::Ready,
+            Phase::DeletePrepared => {
+                let Some(primary) = hosted_ingress_sources::primary_route(row.instance) else {
+                    return PendingLaneReadiness::Blocked;
+                };
+                if matches!(runtime::ready_for_admission(primary), Ok(true)) {
+                    PendingLaneReadiness::Ready
+                } else {
+                    PendingLaneReadiness::Blocked
+                }
+            }
+            _ => PendingLaneReadiness::Absent,
+        }
+    })?;
+    LAST_PENDING_DELETE.store(index, core::sync::atomic::Ordering::Relaxed);
+    Some(rows[index].instance)
+}
+
+pub(super) unsafe fn has_pending_delete() -> bool {
+    (&*core::ptr::addr_of!(LANES)).iter().enumerate().any(|(index, row)| {
+        index_for(row.instance) == Some(index) && row.delete_ticket.is_some()
+            && match row.phase {
+            Phase::DeletePrepared | Phase::DeleteCompleted => true,
+            Phase::NestedRestore => row.delete_restore.as_ref()
+                .is_some_and(|pending| pending.retryable),
+            _ => false,
+        }
+    })
+}
+
+pub(super) unsafe fn poll_pending_delete(instance_index: usize) -> DeleteCallbackProgress {
+    let Some(index) = index_for(instance_index) else { return DeleteCallbackProgress::Uncertain; };
+    let row = &(&*core::ptr::addr_of!(LANES))[index];
+    if row.delete_ticket.is_none() { return DeleteCallbackProgress::Uncertain; }
+    match row.phase {
+        Phase::DeleteCompleted => DeleteCallbackProgress::Completed,
+        Phase::DeletePrepared => match select(instance_index, SelectionPurpose::Callback) {
+            Some(selection) => dispatch_callback(instance_index, &selection),
+            None => DeleteCallbackProgress::Retained,
+        },
+        Phase::NestedRestore => retry_delete_restore(index),
+        _ => DeleteCallbackProgress::Uncertain,
+    }
+}
+
+pub(super) unsafe fn completed_delete_ticket(instance_index: usize) -> Option<DynamicDeleteTicket> {
+    let row = &(&*core::ptr::addr_of!(LANES))[index_for(instance_index)?];
+    (row.phase == Phase::DeleteCompleted && row.delete_restore.is_none()
+        && row.delete_unattributed_result.is_none()).then_some(row.delete_ticket?)
+}
+
+/// Called only after exact Object Manager retirement. A refused final acknowledgement leaves
+/// the completed ticket in the class lane; pool reuse must not be inferred from a copied cap.
+pub(super) unsafe fn acknowledge_completed_delete(
+    instance_index: usize, ticket: DynamicDeleteTicket,
+) -> bool {
+    let Some(index) = index_for(instance_index) else { return false; };
+    let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+    if row.phase != Phase::DeleteCompleted || row.delete_ticket != Some(ticket)
+        || row.delete_restore.is_some() || row.delete_unattributed_result.is_some() {
+        return false;
+    }
+    row.delete_ticket = None;
+    row.phase = Phase::Ready;
+    true
 }
 
 pub(super) unsafe fn select_control(instance_index: usize, irp: u64) -> Option<Selection> {
@@ -305,12 +619,17 @@ pub(super) unsafe fn mark_entered(instance_index: usize, selection: &Selection,
     irp: Option<u64>) -> bool {
     let Some(index) = index_for(instance_index) else { return false; };
     let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
-    if row.phase != Phase::Ready || row.route != Some(selection.route)
+    if !matches!(row.phase, Phase::Ready | Phase::DeletePrepared)
+        || row.route != Some(selection.route)
         || row.executive_shared != selection.shared { return false; }
     match selection.purpose {
-        SelectionPurpose::New if irp.is_none() || row.current_irp.is_some() => return false,
-        SelectionPurpose::Control(expected) if irp.is_some()
+        SelectionPurpose::New if row.phase != Phase::Ready
+            || irp.is_none() || row.current_irp.is_some() => return false,
+        SelectionPurpose::Control(expected) if row.phase != Phase::Ready || irp.is_some()
             || row.current_irp != Some(expected) => return false,
+        SelectionPurpose::Callback if row.phase != Phase::DeletePrepared
+            || irp.is_some() || row.current_irp.is_some()
+            || row.delete_ticket.is_none() => return false,
         _ => {}
     }
     row.phase = Phase::Entered;
@@ -340,7 +659,8 @@ pub(super) unsafe fn begin_worker_retirement(instance_index: usize, handle: u64)
     let Some(row) = (&mut *core::ptr::addr_of_mut!(LANES)).iter_mut()
         .find(|row| row.instance == instance_index && row.handle == handle)
     else { return true; };
-    if !matches!(row.phase, Phase::Ready | Phase::Retiring) || row.current_irp.is_some() {
+    if !matches!(row.phase, Phase::Ready | Phase::Retiring) || row.current_irp.is_some()
+        || row.delete_ticket.is_some() {
         return false;
     }
     row.phase = Phase::Retiring;
@@ -390,6 +710,21 @@ unsafe extern "win64" fn entry(shared: u64) {
 unsafe fn execute(request: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
     let shared = request.drv;
     if current_component_bank() != Some(shared) { return (STATUS_INVALID_PARAMETER, 0); }
+    if request.sel == FSD_DISPATCH_DYNAMIC_DELETE {
+        let callback = read_volatile((shared + SH_REQ_MINOR) as *const u64);
+        let object = read_volatile((shared + SH_REQ_FILEID) as *const u64);
+        if callback == 0 || object == 0 { return (STATUS_INVALID_PARAMETER, 0); }
+        let Some(jb) = current_jump_buffer() else { return (STATUS_INVALID_HANDLE, 0); };
+        let boundary = read_volatile((FSD_SHARED_VADDR + SH_SEH_FOREIGN_CALL16_VA) as *const u64);
+        if boundary == 0 { return (STATUS_INVALID_DEVICE_REQUEST, 0); }
+        write_volatile(jb, 0);
+        write_volatile(jb.add(1), 0);
+        write_volatile(jb.add(2), 0);
+        let args = [object, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        fsd_guarded_call_vector(callback, args.as_ptr(), 12, jb, boundary);
+        if read_volatile(jb.add(2)) != 0 { return (STATUS_UNSUCCESSFUL, 0); }
+        return (STATUS_SUCCESS, 0);
+    }
     let irp = read_volatile((shared + SH_REQ_CONTROL_ID) as *const u64);
     if matches!(request.sel, FSD_DISPATCH_COPY_MUTABLE_INPUT | FSD_DISPATCH_COPY_COMPLETION
         | FSD_DISPATCH_ACK_COMPLETION | FSD_DISPATCH_CANCEL_IRP) {

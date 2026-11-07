@@ -1,7 +1,7 @@
 //! Reproduce native alias admission with reusable storage smaller than one old slot chunk.
 use nt_user_host::process_identity::{ProcessGeneration, ProcessIdentity};
 use nt_user_host::provider_alias_bank::{
-    BankError, ChildCap, ProviderAliasBank, ProviderAliasIo, ProviderAliasRequest,
+    BankError, ChildCap, ProviderAliasBank, ProviderAliasDeleteError, ProviderAliasIo, ProviderAliasRequest,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -117,11 +117,11 @@ impl ProviderAliasIo for Io {
         self.effects += 1;
         Ok(())
     }
-    fn delete_root(&mut self, _: u64) -> Result<(), u32> {
+    fn delete_root(&mut self, _: u64) -> Result<(), ProviderAliasDeleteError> {
         self.effects += 1;
         Ok(())
     }
-    fn delete_child(&mut self, _: ChildCap) -> Result<(), u32> {
+    fn delete_child(&mut self, _: ChildCap) -> Result<(), ProviderAliasDeleteError> {
         self.effects += 1;
         Ok(())
     }

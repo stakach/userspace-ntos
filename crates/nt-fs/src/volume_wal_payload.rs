@@ -4,6 +4,7 @@
 use alloc::vec::Vec;
 
 const SYSTEM_MAGIC: &[u8; 8] = b"CMWAL001";
+const SYSTEM_HIVE_LOG_MAGIC: &[u8; 4] = b"HLR1";
 const HIVE_LOG_MAGIC: &[u8; 8] = b"NTHLOG01";
 const HIVE_LOG_HEADER_BYTES: usize = 32;
 
@@ -45,7 +46,7 @@ pub struct HiveLogWalPayload<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VolumeWalPayload<'a> {
-    /// Existing v2 disks contain raw `CMWAL001` records; retain their exact bytes.
+    /// SYSTEM records retain their exact native hive-log bytes for semantic replay.
     System(&'a [u8]),
     HiveLog(HiveLogWalPayload<'a>),
 }
@@ -94,7 +95,7 @@ pub fn decode_volume_wal_payload(bytes: &[u8]) -> Result<VolumeWalPayload<'_>, V
     if bytes.is_empty() {
         return Err(VolumeWalPayloadError::Empty);
     }
-    if bytes.starts_with(SYSTEM_MAGIC) {
+    if bytes.starts_with(SYSTEM_MAGIC) || bytes.starts_with(SYSTEM_HIVE_LOG_MAGIC) {
         return Ok(VolumeWalPayload::System(bytes));
     }
     if !bytes.starts_with(HIVE_LOG_MAGIC) {

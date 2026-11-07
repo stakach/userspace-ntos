@@ -105,6 +105,9 @@ pub struct SourceIrpAuxiliary {
     pub system_buffer: Option<SourcePoolAllocationIdentity>,
     pub mdl: Option<SourceMdlAllocationIdentity>,
     pub transfer_buffer: Option<SourceMemoryIdentity>,
+    /// Only kernel-built buffered controls retain source-stack code/length for
+    /// pre-completion revalidation. Other auxiliary kinds use their existing paths.
+    pub buffered_control: Option<crate::source_irp_auxiliary_buffer::CapturedBufferedControlOutput>,
     pub completion: SourceIrpCompletionOwner,
 }
 
@@ -114,6 +117,16 @@ impl SourceIrpAuxiliary {
             && self.system_buffer.is_none_or(SourcePoolAllocationIdentity::valid)
             && self.mdl.is_none_or(SourceMdlAllocationIdentity::valid)
             && self.transfer_buffer.is_none_or(SourceMemoryIdentity::valid)
+            && self.buffered_control.is_none_or(|control| control.valid()
+                && self.system_buffer.is_some_and(|system| {
+                    system.capacity >= u64::from(control.output_length)
+                })
+                && self.mdl.is_none()
+                && self.transfer_buffer.is_some_and(|output| match output {
+                    SourceMemoryIdentity::Pool { bytes, .. }
+                    | SourceMemoryIdentity::MappedRange { bytes, .. } =>
+                        bytes == u64::from(control.output_length),
+                }))
             && self.completion.valid()
     }
 }
@@ -306,6 +319,7 @@ mod tests {
             }),
             mdl: None,
             transfer_buffer: None,
+            buffered_control: None,
             completion: SourceIrpCompletionOwner {
                 thread_handle: 9,
                 thread_object: 0x4000,
@@ -321,6 +335,37 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn buffered_control_retains_exact_output_extent() {
+        let mut auxiliary = auxiliary();
+        auxiliary.transfer_buffer = Some(SourceMemoryIdentity::MappedRange {
+            component_address: 0x9000,
+            bytes: 40,
+            exec_address: 0xa000,
+        });
+        auxiliary.buffered_control = Some(
+            crate::source_irp_auxiliary_buffer::CapturedBufferedControlOutput {
+                code: 0x0007_00a0,
+                output_length: 40,
+            },
+        );
+        let mut ledger = SourceIrpAuxiliaryLedger::new();
+        assert_eq!(ledger.register(auxiliary), Ok(()));
+        let (retained, phase) = ledger.snapshot(auxiliary.ticket, auxiliary.source).unwrap();
+        assert_eq!(phase, SourceIrpAuxiliaryPhase::Protected);
+        assert_eq!(retained.buffered_control, auxiliary.buffered_control);
+        assert_eq!(retained.transfer_buffer, auxiliary.transfer_buffer);
+
+        let mut malformed = auxiliary;
+        malformed.buffered_control.as_mut().unwrap().output_length = 41;
+        assert_eq!(SourceIrpAuxiliaryLedger::new().register(malformed),
+            Err(SourceIrpAuxiliaryError::Invalid));
+        malformed = auxiliary;
+        malformed.system_buffer.as_mut().unwrap().capacity = 39;
+        assert_eq!(SourceIrpAuxiliaryLedger::new().register(malformed),
+            Err(SourceIrpAuxiliaryError::Invalid));
     }
 
     #[test]

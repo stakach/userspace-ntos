@@ -15,7 +15,9 @@ pub(crate) unsafe fn service_win32k_section_cleanup_request(
     reserved1: u64,
 ) -> SubmitResult {
     let result = (|| {
-        if !matches!(op, wire::OP_DEREFERENCE | wire::OP_UNMAP) || reserved0 != 0 || reserved1 != 0
+        if !matches!(op, wire::OP_DEREFERENCE | wire::OP_UNMAP | wire::OP_UNMAP_CLIENT)
+            || reserved1 != 0
+            || (op != wire::OP_UNMAP_CLIENT && reserved0 != 0)
         {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
@@ -28,10 +30,21 @@ pub(crate) unsafe fn service_win32k_section_cleanup_request(
         )?;
         let physical =
             provider_service_ingress::physical_win32k_provider(channel, route, dispatch)?;
-        let handler = service_sec_image::registry_live_handler_pointer()?;
-        if (*handler).loop_ctx.is_none() {
-            return Err(0xc000_00a3);
-        }
+        let handler = match service_sec_image::registry_live_handler_pointer() {
+            Ok(handler) => {
+                service_sec_image::registered_section_table_for_handler(handler)?;
+                handler
+            }
+            Err(_) if op != wire::OP_UNMAP_CLIENT => {
+                service_sec_image::bootstrap_section_table()?;
+                let caller = provider_registry_caller::resolve(channel)?;
+                if !provider_section_broker::bootstrap_caller_admitted(caller) {
+                    return Err(nt_process::STATUS_INVALID_HANDLE);
+                }
+                core::ptr::null_mut()
+            }
+            Err(status) => return Err(status),
+        };
         // The canonical object/view ledger verifies exact provider ownership and records
         // retirement before effects. No logical process handle authority is acquired here.
         let mut retired_view = None;
@@ -45,11 +58,17 @@ pub(crate) unsafe fn service_win32k_section_cleanup_request(
                     0
                 })
             }
+            wire::OP_UNMAP_CLIENT => {
+                provider_mm_section_objects::unmap_client(handler, physical, address, reserved0)
+                    .map(|()| 0)
+            }
             _ => unreachable!(),
         };
-        provider_section_receipts::observe_cleanup_result(
-            handler, channel, physical, op, address, &result, retired_view,
-        );
+        if !handler.is_null() {
+            provider_section_receipts::observe_cleanup_result(
+                handler, channel, physical, op, address, &result, retired_view,
+            );
+        }
         result
     })();
     SubmitResult::Ready(match result {

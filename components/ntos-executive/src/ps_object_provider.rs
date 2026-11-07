@@ -57,6 +57,13 @@ impl ProviderRoot {
         self.source_pml4
     }
 
+    pub(crate) const fn catalog_domain(self) -> Option<ProviderDomainIdentity> {
+        match self.identity {
+            ProviderIdentity::Catalog(_, domain) => Some(domain),
+            ProviderIdentity::Hosted(_) => None,
+        }
+    }
+
     fn validate_current(self) -> Result<(), u32> {
         let catalog = unsafe { &*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS) };
         let live = match self.identity {

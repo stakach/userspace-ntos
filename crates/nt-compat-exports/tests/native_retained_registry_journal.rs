@@ -152,14 +152,16 @@ fn assert_zero_dirty_ack_guarded(name: &str, skip: bool) {
 }
 
 #[test]
-fn dynamic_unload_retains_uncertain_journal_before_mount_and_slot_release() {
+fn dynamic_unload_retains_uncertain_journal_before_mount_release() {
     let file = source();
     let unload = method(&file, "nt_unload_key_ex");
     let guard =
         unload.block.stmts.iter().position(retained_refusal).expect(
             "dynamic unload must refuse an uncertain entered journal before dropping its hive",
         );
-    for effect in ["remove", "fetch_and", "unmount"] {
+    // The slot bit is now released by HiveMount::drop, after the borrowed hive
+    // navigator is dropped. Unload must first remove and unmount the authority.
+    for effect in ["remove", "unmount"] {
         let position = unload
             .block
             .stmts
@@ -176,6 +178,35 @@ fn dynamic_unload_retains_uncertain_journal_before_mount_and_slot_release() {
             "journal refusal must precede dynamic unload {effect}"
         );
     }
+}
+
+#[test]
+fn dynamic_slot_release_follows_borrowed_hive_drop() {
+    let image = include_str!(
+        "../../../components/ntos-executive/src/exec_user_hive_image.rs"
+    );
+    let mount_drop = image
+        .split_once("impl Drop for HiveMount")
+        .expect("HiveMount must own slot release")
+        .1;
+    let drop_hive = mount_drop
+        .find("drop(self.hive.take())")
+        .expect("drop the borrowed hive navigator");
+    let release_slot = mount_drop
+        .find("release(slot)")
+        .expect("release the owned image slot");
+    assert!(drop_hive < release_slot);
+    let release = image
+        .split_once("unsafe fn release(slot: usize)")
+        .expect("slot release must be centralized")
+        .1;
+    let free_image = release
+        .find("USER_HIVE_BUF))[slot] = None")
+        .expect("release the image allocation");
+    let clear_slot = release
+        .find("USER_HIVE_SLOT_USED.fetch_and")
+        .expect("clear the slot claim");
+    assert!(free_image < clear_slot);
 }
 
 #[test]

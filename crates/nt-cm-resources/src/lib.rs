@@ -46,6 +46,8 @@ pub const CM_RESOURCE_TYPE_MF_CARD_CONFIG: u8 = 131;
 /// Interrupt `Flags` bits.
 pub const CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE: u16 = 0;
 pub const CM_RESOURCE_INTERRUPT_LATCHED: u16 = 1;
+pub const CM_RESOURCE_INTERRUPT_MESSAGE: u16 = 2;
+pub const CM_RESOURCE_INTERRUPT_MESSAGE_TOKEN: u32 = u32::MAX - 1;
 
 /// Memory `Flags` bits.
 pub const CM_RESOURCE_MEMORY_READ_WRITE: u16 = 0;
@@ -58,6 +60,7 @@ pub const CM_RESOURCE_PORT_MEMORY: u16 = 0;
 pub const CM_RESOURCE_PORT_IO: u16 = 1;
 pub const CM_RESOURCE_PORT_16_BIT_DECODE: u16 = 0x0010;
 pub const CM_RESOURCE_PORT_POSITIVE_DECODE: u16 = 0x0020;
+pub const CM_RESOURCE_PORT_WINDOW_DECODE: u16 = 0x0080;
 pub const CM_RESOURCE_PORT_BAR: u16 = 0x0100;
 
 /// `ShareDisposition` values.
@@ -239,6 +242,48 @@ pub fn decode_single_bus_number_resource(
         length: read_u32(buf, 28)?,
         reserved: read_u32(buf, 32)?,
     })
+}
+
+/// Select the one PCI-root BusNumber range containing `bus` from a complete mixed resource list.
+/// Other partial descriptors remain provider-owned; their extent and type are still validated.
+pub fn decode_pci_root_bus_number_resource(
+    buf: &[u8],
+    bus: u32,
+) -> Result<BusNumberResourceDescriptor, NativeResourceListError> {
+    if validate_cm_resource_list_extent(buf)? != buf.len() || read_u32(buf, 0)? != 1 {
+        return Err(NativeResourceListError::InvalidDescriptor);
+    }
+    let mut selected = None;
+    let count = read_u32(buf, 16)? as usize;
+    for index in 0..count {
+        let offset = 20 + index * PARTIAL_DESCRIPTOR_SIZE;
+        if buf[offset] != CM_RESOURCE_TYPE_BUS_NUMBER {
+            continue;
+        }
+        let start = read_u32(buf, offset + 4)?;
+        let length = read_u32(buf, offset + 8)?;
+        let end = start
+            .checked_add(length)
+            .ok_or(NativeResourceListError::InvalidDescriptor)?;
+        if length == 0 || !(start..end).contains(&bus) {
+            continue;
+        }
+        if selected.is_some() {
+            return Err(NativeResourceListError::InvalidDescriptor);
+        }
+        selected = Some(BusNumberResourceDescriptor {
+            interface_type: read_u32(buf, 4)? as i32,
+            bus_number: read_u32(buf, 8)?,
+            version: read_u16(buf, 12)?,
+            revision: read_u16(buf, 14)?,
+            share: buf[offset + 1],
+            flags: read_u16(buf, offset + 2)?,
+            start,
+            length,
+            reserved: read_u32(buf, offset + 12)?,
+        });
+    }
+    selected.ok_or(NativeResourceListError::InvalidDescriptor)
 }
 
 /// Return the exact self-described prefix of a native `IO_RESOURCE_REQUIREMENTS_LIST` allocation.
@@ -529,13 +574,45 @@ pub struct InterruptDescriptor {
     pub share: u8,
 }
 
+/// A bus-owned bus-number interval in a native partial resource list.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BusNumberDescriptor {
+    pub start: u32,
+    pub length: u32,
+    pub flags: u16,
+    pub share: u8,
+}
+
+/// Native scaled large-memory window (`CmResourceTypeMemoryLarge`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MemoryLargeDescriptor {
+    pub start: u64,
+    pub length: u64,
+    pub flags: u16,
+    pub share: u8,
+}
+
+fn memory_large_shift(flags: u16) -> Option<u32> {
+    match flags & 0x0e00 {
+        0x0200 => Some(8),
+        0x0400 => Some(16),
+        0x0800 => Some(32),
+        _ => None,
+    }
+}
+
 /// One native `CM_PARTIAL_RESOURCE_DESCRIPTOR` supported by the generic encoder.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CmResourceDescriptor {
     Memory(MemoryDescriptor),
     Port(PortDescriptor),
     Interrupt(InterruptDescriptor),
+    BusNumber(BusNumberDescriptor),
+    MemoryLarge(MemoryLargeDescriptor),
 }
+
+mod bus_owned_root;
+pub use bus_owned_root::{admit_bus_owned_root_resources, BusOwnedRootResourceError};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum IoResourceAssignmentError {
@@ -585,7 +662,37 @@ fn io_requirement_matches_candidate(
                 && candidate.flags == flags
                 && candidate.share == bytes[descriptor + 2])
         }
-        (CM_RESOURCE_TYPE_MEMORY | CM_RESOURCE_TYPE_PORT | CM_RESOURCE_TYPE_INTERRUPT, _) => {
+        (CM_RESOURCE_TYPE_BUS_NUMBER, CmResourceDescriptor::BusNumber(candidate)) => {
+            let length = read_u32(bytes, descriptor + 8).map_err(IoResourceAssignmentError::Malformed)?;
+            let minimum = read_u32(bytes, descriptor + 12).map_err(IoResourceAssignmentError::Malformed)?;
+            let maximum = read_u32(bytes, descriptor + 16).map_err(IoResourceAssignmentError::Malformed)?;
+            let flags = u16::from_le_bytes([bytes[descriptor + 4], bytes[descriptor + 5]]);
+            let end = candidate.start.checked_add(candidate.length.saturating_sub(1));
+            Ok(length != 0 && candidate.length == length && candidate.start >= minimum
+                && end.is_some_and(|end| end <= maximum) && candidate.flags == flags
+                && candidate.share == bytes[descriptor + 2])
+        }
+        (CM_RESOURCE_TYPE_MEMORY_LARGE, CmResourceDescriptor::MemoryLarge(candidate)) => {
+            let flags = u16::from_le_bytes([bytes[descriptor + 4], bytes[descriptor + 5]]);
+            let shift = memory_large_shift(flags)
+                .ok_or(IoResourceAssignmentError::UnsupportedDescriptor)?;
+            let length = u64::from(read_u32(bytes, descriptor + 8)
+                .map_err(IoResourceAssignmentError::Malformed)?) << shift;
+            let scaled_alignment = u64::from(read_u32(bytes, descriptor + 12)
+                .map_err(IoResourceAssignmentError::Malformed)?);
+            let alignment = if scaled_alignment == 0 { 1 } else { scaled_alignment << shift };
+            let minimum = read_u64(bytes, descriptor + 16)
+                .map_err(IoResourceAssignmentError::Malformed)?;
+            let maximum = read_u64(bytes, descriptor + 24)
+                .map_err(IoResourceAssignmentError::Malformed)?;
+            Ok(length != 0 && candidate.length == length && candidate.start >= minimum
+                && candidate.start % alignment == 0
+                && candidate.start.checked_add(length - 1)
+                    .is_some_and(|end| end <= maximum)
+                && candidate.flags == flags && candidate.share == bytes[descriptor + 2])
+        }
+        (CM_RESOURCE_TYPE_MEMORY | CM_RESOURCE_TYPE_PORT | CM_RESOURCE_TYPE_INTERRUPT
+            | CM_RESOURCE_TYPE_BUS_NUMBER | CM_RESOURCE_TYPE_MEMORY_LARGE, _) => {
             Ok(false)
         }
         _ => Err(IoResourceAssignmentError::UnsupportedDescriptor),
@@ -614,13 +721,19 @@ fn io_address_requirement_matches(
     } else {
         CM_RESOURCE_PORT_BAR
     };
+    // ACPI current resources can add WINDOW_DECODE to the raw root-port assignment while
+    // the matching possible-resource descriptor retains its decode flags without that bit.
+    // Keep the provider's raw flag; this comparison only admits its added metadata.
+    let port_window_metadata = bytes[descriptor + 1] == CM_RESOURCE_TYPE_PORT
+        && candidate_flags & CM_RESOURCE_PORT_WINDOW_DECODE != 0
+        && candidate_flags & !CM_RESOURCE_PORT_WINDOW_DECODE == flags;
     Ok(length != 0
         && alignment != 0
         && maximum >= minimum
         && candidate_length == length
         && candidate_start >= minimum
         && candidate_start % alignment as u64 == 0
-        && (candidate_flags == flags
+        && (candidate_flags == flags || port_window_metadata
             || (candidate_flags & marker != 0 && candidate_flags & !marker == flags))
         && candidate_share == bytes[descriptor + 2]
         && end.is_some_and(|end| end <= maximum))
@@ -668,6 +781,38 @@ fn validate_io_requirement_descriptor(
                 || affinity_policy != 0
                 || priority_policy != 0
                 || targeted_processors != 0
+            {
+                return Err(IoResourceAssignmentError::UnsupportedDescriptor);
+            }
+        }
+        CM_RESOURCE_TYPE_BUS_NUMBER => {
+            let length = read_u32(bytes, descriptor + 8).map_err(IoResourceAssignmentError::Malformed)?;
+            let minimum = read_u32(bytes, descriptor + 12).map_err(IoResourceAssignmentError::Malformed)?;
+            let maximum = read_u32(bytes, descriptor + 16).map_err(IoResourceAssignmentError::Malformed)?;
+            if length == 0 || minimum > maximum
+                || u64::from(maximum) - u64::from(minimum) + 1 < u64::from(length)
+                || read_u32(bytes, descriptor + 20).map_err(IoResourceAssignmentError::Malformed)? != 0
+                || read_u64(bytes, descriptor + 24).map_err(IoResourceAssignmentError::Malformed)? != 0
+            {
+                return Err(IoResourceAssignmentError::UnsupportedDescriptor);
+            }
+        }
+        CM_RESOURCE_TYPE_MEMORY_LARGE => {
+            let flags = u16::from_le_bytes([bytes[descriptor + 4], bytes[descriptor + 5]]);
+            let shift = memory_large_shift(flags)
+                .ok_or(IoResourceAssignmentError::UnsupportedDescriptor)?;
+            let length = u64::from(read_u32(bytes, descriptor + 8)
+                .map_err(IoResourceAssignmentError::Malformed)?) << shift;
+            let scaled_alignment = u64::from(read_u32(bytes, descriptor + 12)
+                .map_err(IoResourceAssignmentError::Malformed)?);
+            let alignment = if scaled_alignment == 0 { 1 } else { scaled_alignment << shift };
+            let minimum = read_u64(bytes, descriptor + 16)
+                .map_err(IoResourceAssignmentError::Malformed)?;
+            let maximum = read_u64(bytes, descriptor + 24)
+                .map_err(IoResourceAssignmentError::Malformed)?;
+            if length == 0 || maximum < minimum || alignment == 0
+                || maximum.checked_sub(minimum).and_then(|span| span.checked_add(1))
+                    .is_none_or(|span| span < length)
             {
                 return Err(IoResourceAssignmentError::UnsupportedDescriptor);
             }
@@ -850,6 +995,28 @@ fn select_io_resource_assignment_inner(
         while descriptor_index < descriptor_count {
             let first = descriptor_index;
             let descriptor = descriptor_base + first * IO_RESOURCE_DESCRIPTOR_SIZE;
+            if bytes[descriptor + 1] == CM_RESOURCE_TYPE_DEVICE_PRIVATE {
+                // PCI places a private BAR index after the address alternatives. It describes
+                // the preceding group; it is not another resource the host may grant.
+                let preceding_address = first > 0
+                    && matches!(
+                        bytes[descriptor - IO_RESOURCE_DESCRIPTOR_SIZE + 1],
+                        CM_RESOURCE_TYPE_MEMORY | CM_RESOURCE_TYPE_PORT,
+                    );
+                if !preceding_address
+                    || bytes[descriptor] != 0
+                    || bytes[descriptor + 2] != CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE
+                    || bytes[descriptor + 3..descriptor + 8] != [0; 5]
+                    || read_u32(bytes, descriptor + 8)
+                        .map_err(IoResourceAssignmentError::Malformed)?
+                        != 1
+                    || bytes[descriptor + 16..descriptor + IO_RESOURCE_DESCRIPTOR_SIZE] != [0; 16]
+                {
+                    return Err(IoResourceAssignmentError::UnsupportedDescriptor);
+                }
+                descriptor_index += 1;
+                continue;
+            }
             let option = bytes[descriptor];
             if option & IO_RESOURCE_ALTERNATIVE != 0 || !io_option_is_valid(option) {
                 return Err(IoResourceAssignmentError::UnsupportedDescriptor);
@@ -930,6 +1097,17 @@ pub fn build_cm_resource_list(
             // IRQ/vector zero is a valid raw bus interrupt. There is no empty interrupt
             // descriptor encoding analogous to a zero-length address descriptor.
             CmResourceDescriptor::Interrupt(_) => true,
+            CmResourceDescriptor::BusNumber(bus) => {
+                bus.length != 0 && bus.start.checked_add(bus.length - 1).is_some()
+            }
+            CmResourceDescriptor::MemoryLarge(memory) => {
+                memory_large_shift(memory.flags).is_some_and(|shift| {
+                    memory.length != 0
+                        && memory.length & ((1u64 << shift) - 1) == 0
+                        && memory.length >> shift <= u64::from(u32::MAX)
+                        && memory.start.checked_add(memory.length - 1).is_some()
+                })
+            }
         };
         if !valid {
             return Err(CmResourceListError::InvalidDescriptor);
@@ -955,6 +1133,23 @@ pub fn build_cm_resource_list(
             CmResourceDescriptor::Port(port) => write_port_descriptor(buf, offset, port),
             CmResourceDescriptor::Interrupt(interrupt) => {
                 write_interrupt_descriptor(buf, offset, interrupt)
+            }
+            CmResourceDescriptor::BusNumber(bus) => {
+                buf[offset] = CM_RESOURCE_TYPE_BUS_NUMBER;
+                buf[offset + 1] = bus.share;
+                w16(buf, offset + 2, bus.flags);
+                w32(buf, offset + 4, bus.start);
+                w32(buf, offset + 8, bus.length);
+                w32(buf, offset + 12, 0);
+            }
+            CmResourceDescriptor::MemoryLarge(memory) => {
+                let shift = memory_large_shift(memory.flags)
+                    .ok_or(CmResourceListError::InvalidDescriptor)?;
+                buf[offset] = CM_RESOURCE_TYPE_MEMORY_LARGE;
+                buf[offset + 1] = memory.share;
+                w16(buf, offset + 2, memory.flags);
+                w64(buf, offset + 4, memory.start);
+                w32(buf, offset + 12, (memory.length >> shift) as u32);
             }
         }
     }
@@ -1280,6 +1475,53 @@ mod tests {
         assert_eq!(
             decode_single_bus_number_resource(&bytes),
             Err(NativeResourceListError::InvalidDescriptor)
+        );
+    }
+
+    #[test]
+    fn pci_root_selects_exactly_one_matching_range_from_mixed_list() {
+        let mut bytes = [0u8; 80];
+        w32(&mut bytes, 0, 1);
+        w32(&mut bytes, 4, INTERFACE_TYPE_PCI_BUS as u32);
+        w32(&mut bytes, 8, 7);
+        w16(&mut bytes, 12, 1);
+        w16(&mut bytes, 14, 1);
+        w32(&mut bytes, 16, 3);
+        bytes[20] = CM_RESOURCE_TYPE_BUS_NUMBER;
+        bytes[21] = CM_RESOURCE_SHARE_SHARED;
+        w32(&mut bytes, 24, 7);
+        w32(&mut bytes, 28, 2);
+        bytes[40] = CM_RESOURCE_TYPE_DEVICE_PRIVATE;
+        bytes[60] = CM_RESOURCE_TYPE_BUS_NUMBER;
+        bytes[61] = CM_RESOURCE_SHARE_SHARED;
+        w32(&mut bytes, 64, 12);
+        w32(&mut bytes, 68, 2);
+
+        assert_eq!(
+            decode_pci_root_bus_number_resource(&bytes, 8)
+                .unwrap()
+                .start,
+            7
+        );
+        assert_eq!(
+            decode_pci_root_bus_number_resource(&bytes, 12)
+                .unwrap()
+                .start,
+            12
+        );
+        assert_eq!(
+            decode_pci_root_bus_number_resource(&bytes, 10),
+            Err(NativeResourceListError::InvalidDescriptor)
+        );
+        let mut ambiguous = bytes;
+        w32(&mut ambiguous, 64, 8);
+        assert_eq!(
+            decode_pci_root_bus_number_resource(&ambiguous, 8),
+            Err(NativeResourceListError::InvalidDescriptor)
+        );
+        assert_eq!(
+            decode_pci_root_bus_number_resource(&bytes[..79], 8),
+            Err(NativeResourceListError::Truncated)
         );
     }
 

@@ -40,9 +40,17 @@ fn initial_wait_snapshot_capture_has_one_policy_and_reparks_keep_saved_bytes() {
                 }
                 fn visit_expr_struct(&mut self, expression: &'ast syn::ExprStruct) {
                     let name = expression.path.segments.last().unwrap().ident.to_string();
-                    if matches!(name.as_str(), "PendingProviderWaitDispatch" | "PendingLpcWaitDispatch" | "PendingReceiveDispatch" | "PendingServiceWaitDispatch") {
+                    if matches!(name.as_str(), "PendingProviderWaitDispatch" | "PendingLpcWaitDispatch" | "PendingReceiveDispatch" | "PendingServiceWaitDispatch" | "PendingRootMaintenanceDispatch" | "PendingNestedRestoreDispatch") {
                         self.constructor = Some(name);
-                        for field in &expression.fields {
+                        let fields = expression.fields.iter().find_map(|field| {
+                            if matches!(&field.member, syn::Member::Named(name) if name == "snapshot") {
+                                if let syn::Expr::Struct(snapshot) = &field.expr {
+                                    return Some(&snapshot.fields);
+                                }
+                            }
+                            None
+                        }).unwrap_or(&expression.fields);
+                        for field in fields {
                             if let syn::Member::Named(name) = &field.member {
                                 if matches!(name.to_string().as_str(), "arg_snapshot_len" | "arg_snapshot") {
                                     let name = name.to_string();
@@ -71,16 +79,18 @@ fn initial_wait_snapshot_capture_has_one_policy_and_reparks_keep_saved_bytes() {
                         syn::visit::visit_expr_field(self, field);
                     }
                 }
-                let expected = match constructor.as_str() {
-                    "PendingProviderWaitDispatch" => "provider_wait_suspended",
-                    "PendingLpcWaitDispatch" => "lpc_wait_suspended",
-                    "PendingReceiveDispatch" => "receive_yield",
-                    "PendingServiceWaitDispatch" => "service_wait_yield",
+                let expected: &[&str] = match constructor.as_str() {
+                    "PendingProviderWaitDispatch" => &["provider_wait_suspended"],
+                    "PendingLpcWaitDispatch" => &["lpc_wait_suspended"],
+                    "PendingReceiveDispatch" => &["receive_yield"],
+                    "PendingServiceWaitDispatch" => &["service_wait_yield"],
+                    "PendingRootMaintenanceDispatch" => &["maintenance_yield"],
+                    "PendingNestedRestoreDispatch" => &["nested_restore_yield", "nested_restore_quarantined"],
                     _ => unreachable!(),
                 };
                 let mut condition = Condition(Vec::new());
                 condition.visit_expr(&branch.cond);
-                assert!(condition.0.iter().any(|field| field == expected),
+                assert!(expected.iter().all(|expected| condition.0.iter().any(|field| field == expected)),
                     "{constructor} capture must belong to its actual initial suspension branch");
                 self.0.push(constructor);
             }
@@ -90,8 +100,8 @@ fn initial_wait_snapshot_capture_has_one_policy_and_reparks_keep_saved_bytes() {
     let mut initial = InitialBranches(Vec::new());
     initial.visit_file(&bridge);
     initial.0.sort();
-    assert_eq!(initial.0, ["PendingLpcWaitDispatch", "PendingProviderWaitDispatch", "PendingReceiveDispatch", "PendingServiceWaitDispatch"],
-        "initial Provider/LPC/Receive/service wait suspension must each use the canonical capture policy");
+    assert_eq!(initial.0, ["PendingLpcWaitDispatch", "PendingNestedRestoreDispatch", "PendingProviderWaitDispatch", "PendingReceiveDispatch", "PendingRootMaintenanceDispatch", "PendingServiceWaitDispatch"],
+        "each initial suspension must use the canonical capture policy");
 
     // Read at runtime so a missing module is a behavioral assertion, not a compile failure.
     let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"),
@@ -130,18 +140,32 @@ fn initial_wait_snapshot_capture_has_one_policy_and_reparks_keep_saved_bytes() {
     assert!(!calls.0.iter().any(|call| call == "capture_initial_arg_snapshot" || call == "copy_nonoverlapping"),
         "Receive reparks must not reread original client aliases");
     fn saved_field(expression: &syn::Expr, name: &str) -> bool {
-        matches!(expression, syn::Expr::Field(field)
-            if matches!(&field.member, syn::Member::Named(member) if member == name)
-                && matches!(field.base.as_ref(), syn::Expr::Path(path) if path.path.is_ident("pending")))
+        let syn::Expr::Field(field) = expression else { return false; };
+        if !matches!(&field.member, syn::Member::Named(member) if member == name) {
+            return false;
+        }
+        matches!(field.base.as_ref(), syn::Expr::Path(path) if path.path.is_ident("pending"))
+            || matches!(field.base.as_ref(), syn::Expr::Field(snapshot)
+                if matches!(&snapshot.member, syn::Member::Named(member) if member == "snapshot")
+                    && matches!(snapshot.base.as_ref(), syn::Expr::Path(path)
+                        if path.path.is_ident("pending")))
     }
     #[derive(Default)]
     struct ReceiveReparks { receive: bool, provider: bool, lpc: bool }
     impl<'ast> Visit<'ast> for ReceiveReparks {
         fn visit_expr_struct(&mut self, expression: &'ast syn::ExprStruct) {
             if expression.path.is_ident("PendingReceiveDispatch") {
-                self.receive |= matches!(expression.rest.as_deref(), Some(syn::Expr::Path(path)) if path.path.is_ident("pending"))
-                    && !expression.fields.iter().any(|field| matches!(&field.member, syn::Member::Named(name)
-                        if name == "arg_snapshot_len" || name == "arg_snapshot"));
+                self.receive |= expression.fields.iter().any(|field| {
+                    if !matches!(&field.member, syn::Member::Named(name) if name == "snapshot") {
+                        return false;
+                    }
+                    let syn::Expr::Struct(snapshot) = &field.expr else { return false; };
+                    matches!(snapshot.rest.as_deref(), Some(syn::Expr::Field(source))
+                        if matches!(&source.member, syn::Member::Named(name) if name == "snapshot")
+                            && matches!(source.base.as_ref(), syn::Expr::Path(path) if path.path.is_ident("pending")))
+                        && !snapshot.fields.iter().any(|field| matches!(&field.member, syn::Member::Named(name)
+                            if name == "arg_snapshot_len" || name == "arg_snapshot"))
+                });
             }
             if expression.path.is_ident("PendingProviderWaitDispatch") {
                 self.provider |= ["arg_snapshot_len", "arg_snapshot"].iter().all(|name|

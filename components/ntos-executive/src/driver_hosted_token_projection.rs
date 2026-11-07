@@ -1,4 +1,4 @@
-//! Provider-local access-token projections for retained cross-domain CREATE subjects.
+//! Provider-local access-token projections for retained CREATE subjects and process primaries.
 //!
 //! This is a `driver_launch` child module. The caller supplies physical `DriverInstance`
 //! snapshots obtained from authenticated ingress, never from a driver pointer or badge alone.
@@ -58,6 +58,14 @@ pub(super) struct RetiringTokenProjection {
     address: u64,
 }
 
+#[must_use = "free the retired provider primary-token allocation"]
+pub(super) struct RetiringPrimaryTokenProjection {
+    provider_inst: DriverInstance,
+    address: u64,
+    process_body: u64,
+    process_sequence: u64,
+}
+
 struct Row {
     source_ticket: SourceCreateSecurityTicket,
     source_key: SourceCreateSecurityKey,
@@ -73,8 +81,21 @@ struct Row {
     address: u64,
 }
 
+struct PrimaryRow {
+    provider_domain: HostedTokenProjectionDomain,
+    provider_pml4: u64,
+    provider_pool: u64,
+    provider_driver_id: u64,
+    process_body: u64,
+    process_sequence: u64,
+    projection: Option<HostedTokenProjection>,
+    retiring: bool,
+    address: u64,
+}
+
 static mut REGISTRY: HostedTokenProjectionRegistry = HostedTokenProjectionRegistry::new();
 static mut ROWS: Vec<Row> = Vec::new();
+static mut PRIMARY_ROWS: Vec<PrimaryRow> = Vec::new();
 
 fn domain(inst: DriverInstance) -> Result<HostedTokenProjectionDomain, i32> {
     if inst.pml4 == 0 || inst.exec_pool_va == 0 || inst.driver_id == 0 {
@@ -96,6 +117,21 @@ fn provider_matches(row: &Row, inst: DriverInstance) -> bool {
         && row.provider_pml4 == inst.pml4
         && row.provider_pool == inst.exec_pool_va
         && row.provider_driver_id == inst.driver_id
+}
+
+fn primary_provider_matches(row: &PrimaryRow, inst: DriverInstance) -> bool {
+    domain(inst).ok() == Some(row.provider_domain)
+        && row.provider_pml4 == inst.pml4
+        && row.provider_pool == inst.exec_pool_va
+        && row.provider_driver_id == inst.driver_id
+}
+
+fn primary_row(inst: DriverInstance, address: u64) -> Option<usize> {
+    unsafe {
+        (&*core::ptr::addr_of!(PRIMARY_ROWS)).iter().position(|row| {
+            row.address == address && primary_provider_matches(row, inst)
+        })
+    }
 }
 
 fn retirement_row(
@@ -264,6 +300,61 @@ pub(super) unsafe fn bind(
     })
 }
 
+/// Bind one current process-primary token to a distinct provider-local pointer. The caller has
+/// already authenticated the provider and resolved `process_body` plus its creation sequence in
+/// ProcessManager. Each invocation retains its own token, so replacement of the process primary
+/// cannot change the identity of a pointer already returned to native code.
+pub(super) unsafe fn bind_primary(
+    reserved: ReservedTokenProjection,
+    process_body: u64,
+    process_sequence: u64,
+    token: TokenId,
+    tokens: &mut TokenStore,
+) -> Result<ProjectedToken, (i32, ReservedTokenProjection)> {
+    if process_body == 0 || process_sequence == 0 {
+        return Err((STATUS_INVALID_HANDLE_LOCAL, reserved));
+    }
+    let provider_inst = reserved.provider_inst;
+    if domain(provider_inst).ok() != Some(reserved.provider_domain) {
+        return Err((STATUS_INVALID_HANDLE_LOCAL, reserved));
+    }
+    let rows = &mut *core::ptr::addr_of_mut!(PRIMARY_ROWS);
+    if rows.try_reserve(1).is_err() {
+        return Err((STATUS_INSUFFICIENT_RESOURCES_LOCAL, reserved));
+    }
+    if rows.iter().any(|row| {
+        row.address == reserved.address && primary_provider_matches(row, provider_inst)
+    }) || (&*core::ptr::addr_of!(ROWS)).iter().any(|row| {
+        row.address == reserved.address && provider_matches(row, provider_inst)
+    }) {
+        return Err((STATUS_DEVICE_BUSY_LOCAL, reserved));
+    }
+    let projection = match (&mut *core::ptr::addr_of_mut!(REGISTRY)).bind(
+        tokens,
+        reserved.provider_domain,
+        reserved.address,
+        token,
+    ) {
+        Ok(projection) => projection,
+        Err(error) => return Err((projection_status(error), reserved)),
+    };
+    core::ptr::write_bytes(reserved.exec_va as *mut u8, 0, TOKEN_PROJECTION_BYTES as usize);
+    core::ptr::write_unaligned(reserved.exec_va as *mut u64, TOKEN_PROJECTION_MAGIC);
+    core::ptr::write_unaligned((reserved.exec_va + 8) as *mut u64, projection.generation());
+    rows.push(PrimaryRow {
+        provider_domain: reserved.provider_domain,
+        provider_pml4: provider_inst.pml4,
+        provider_pool: provider_inst.exec_pool_va,
+        provider_driver_id: provider_inst.driver_id,
+        process_body,
+        process_sequence,
+        projection: Some(projection),
+        retiring: false,
+        address: reserved.address,
+    });
+    Ok(ProjectedToken { address: reserved.address, receipt: projection })
+}
+
 /// Resolve a `PACCESS_TOKEN` query only inside the authenticated provider's physical VSpace.
 /// The pointer bytes and their diagnostic marker are never authority; the exact registry receipt
 /// and canonical TokenStore LUID are checked before returning either NT token field.
@@ -272,7 +363,7 @@ pub(super) unsafe fn query(
     address: u64,
     tokens: &TokenStore,
 ) -> Result<ProjectedTokenMetadata, i32> {
-    let row = (&*core::ptr::addr_of!(ROWS))
+    let source_projection = (&*core::ptr::addr_of!(ROWS))
         .iter()
         .find(|row| {
             row.address == address
@@ -280,10 +371,23 @@ pub(super) unsafe fn query(
                 && !row.retiring
                 && provider_matches(row, provider_inst)
         })
-        .ok_or(STATUS_INVALID_HANDLE_LOCAL)?;
-    let projection = row.projection.expect("live token projection");
+        .and_then(|row| row.projection);
+    let primary_projection = (&*core::ptr::addr_of!(PRIMARY_ROWS))
+        .iter()
+        .find(|row| {
+            row.address == address
+                && row.projection.is_some()
+                && !row.retiring
+                && primary_provider_matches(row, provider_inst)
+        })
+        .and_then(|row| row.projection);
+    let projection = match (source_projection, primary_projection) {
+        (Some(projection), None) | (None, Some(projection)) => projection,
+        _ => return Err(STATUS_INVALID_HANDLE_LOCAL),
+    };
+    let provider_domain = domain(provider_inst)?;
     let registry = &mut *core::ptr::addr_of_mut!(REGISTRY);
-    if registry.registration(row.provider_domain, address) != Some(projection) {
+    if registry.registration(provider_domain, address) != Some(projection) {
         return Err(STATUS_INVALID_HANDLE_LOCAL);
     }
     registry
@@ -473,5 +577,88 @@ pub(super) unsafe fn free_retired(
     )
     .expect("retiring projection row retained across pool free");
     (&mut *core::ptr::addr_of_mut!(ROWS)).swap_remove(index);
+    Ok(())
+}
+
+/// A process-primary pointer ceases to be queryable before its backing allocation is freed.
+/// A failed registry retirement leaves the live row intact for a retry; a failed free leaves a
+/// retiring row intact and never resurrects the token.
+pub(super) unsafe fn retire_primary(
+    provider_inst: DriverInstance,
+    address: u64,
+    tokens: &mut TokenStore,
+) -> Result<RetiringPrimaryTokenProjection, i32> {
+    let index = primary_row(provider_inst, address).ok_or(STATUS_INVALID_HANDLE_LOCAL)?;
+    let rows = &mut *core::ptr::addr_of_mut!(PRIMARY_ROWS);
+    let row = &mut rows[index];
+    if row.retiring {
+        return Err(STATUS_DEVICE_BUSY_LOCAL);
+    }
+    let projection = row.projection.ok_or(STATUS_INVALID_HANDLE_LOCAL)?;
+    (&mut *core::ptr::addr_of_mut!(REGISTRY))
+        .retire(tokens, projection)
+        .map_err(projection_status)?;
+    row.projection = None;
+    row.retiring = true;
+    Ok(RetiringPrimaryTokenProjection {
+        provider_inst,
+        address,
+        process_body: row.process_body,
+        process_sequence: row.process_sequence,
+    })
+}
+
+/// Return one outstanding process-primary allocation for an authenticated provider. Callers must
+/// first stop its native execution before using this to drain outstanding pointer references.
+pub(super) fn next_primary_for_provider(
+    provider_inst: DriverInstance,
+) -> Result<Option<(u64, bool)>, i32> {
+    domain(provider_inst)?;
+    Ok(unsafe {
+        (&*core::ptr::addr_of!(PRIMARY_ROWS))
+            .iter()
+            .find(|row| primary_provider_matches(row, provider_inst))
+            .map(|row| (row.address, row.retiring))
+    })
+}
+
+/// Recover the exact free receipt for a row whose token was already retired. This is used by
+/// provider teardown after an earlier pool-free failure, without consulting or reusing a token.
+pub(super) fn retiring_primary_receipt(
+    provider_inst: DriverInstance,
+    address: u64,
+) -> Result<RetiringPrimaryTokenProjection, i32> {
+    let index = primary_row(provider_inst, address).ok_or(STATUS_INVALID_HANDLE_LOCAL)?;
+    let row = unsafe { &(&*core::ptr::addr_of!(PRIMARY_ROWS))[index] };
+    if !row.retiring || row.projection.is_some() {
+        return Err(STATUS_INVALID_HANDLE_LOCAL);
+    }
+    Ok(RetiringPrimaryTokenProjection {
+        provider_inst,
+        address,
+        process_body: row.process_body,
+        process_sequence: row.process_sequence,
+    })
+}
+
+pub(super) unsafe fn free_retired_primary(
+    retiring: RetiringPrimaryTokenProjection,
+) -> Result<(), (i32, RetiringPrimaryTokenProjection)> {
+    let Some(index) = primary_row(retiring.provider_inst, retiring.address) else {
+        return Err((STATUS_INVALID_HANDLE_LOCAL, retiring));
+    };
+    let row = &(&*core::ptr::addr_of!(PRIMARY_ROWS))[index];
+    if !row.retiring || row.projection.is_some()
+        || row.process_body != retiring.process_body
+        || row.process_sequence != retiring.process_sequence
+    {
+        return Err((STATUS_INVALID_HANDLE_LOCAL, retiring));
+    }
+    if !free_hosted_instance_pool_allocation_exact(retiring.provider_inst, retiring.address) {
+        return Err((STATUS_DEVICE_BUSY_LOCAL, retiring));
+    }
+    let index = primary_row(retiring.provider_inst, retiring.address)
+        .expect("retiring primary row retained across pool free");
+    (&mut *core::ptr::addr_of_mut!(PRIMARY_ROWS)).swap_remove(index);
     Ok(())
 }

@@ -7,6 +7,10 @@
 
 use alloc::vec::Vec;
 
+mod guarded_mutex;
+pub use guarded_mutex::{guarded_mutex_layout, GuardedMutexStore, GuardedMutexWaitAdmission,
+    GuardedMutexWaitTicket};
+
 /// Native x64 `ERESOURCE` offsets (NT 5.x / ReactOS ABI).
 pub mod eresource_layout {
     pub const SYSTEM_RESOURCES_LIST: usize = 0x00;
@@ -67,6 +71,7 @@ pub enum ExecutiveSyncError {
     ApcDisableUnderflow,
     FastMutexCorrupt,
     FastMutexRecursiveAcquire,
+    GuardedMutexRecursiveAcquire,
     BlockingWaitRequired,
 }
 
@@ -106,10 +111,28 @@ struct ResourceOwner {
     recursion: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResourceWaitTicket(u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceWaitAdmission {
+    Acquired,
+    Queued(ResourceWaitTicket),
+}
+
+struct ResourceWaiter {
+    ticket: ResourceWaitTicket,
+    thread: u64,
+    event: u64,
+    mode: ResourceMode,
+    granted: bool,
+}
+
 struct ExecutiveResource {
     address: u64,
     exclusive: bool,
     owners: Vec<ResourceOwner>,
+    waiters: Vec<ResourceWaiter>,
     /// Entry zero is the native table header; actual secondary owners start at entry one.
     owner_table: Vec<NativeOwnerEntry>,
     contention_count: u32,
@@ -223,12 +246,14 @@ impl ExecutiveResource {
 #[derive(Default)]
 pub struct ExecutiveResourceStore {
     resources: Vec<ExecutiveResource>,
+    next_wait_ticket: u64,
 }
 
 impl ExecutiveResourceStore {
     pub const fn new() -> Self {
         Self {
             resources: Vec::new(),
+            next_wait_ticket: 1,
         }
     }
 
@@ -262,7 +287,7 @@ impl ExecutiveResourceStore {
         }
         let address = resource as u64;
         let index = if let Some(index) = self.index_of(address) {
-            if self.resources[index].is_active() {
+            if self.resources[index].is_active() || !self.resources[index].waiters.is_empty() {
                 return Err(ExecutiveSyncError::ResourceBusy);
             }
             index
@@ -274,6 +299,7 @@ impl ExecutiveResourceStore {
                 address,
                 exclusive: false,
                 owners: Vec::new(),
+                waiters: Vec::new(),
                 owner_table: Vec::new(),
                 contention_count: 0,
                 shared_waiters: 0,
@@ -289,6 +315,7 @@ impl ExecutiveResourceStore {
         let state = &mut self.resources[index];
         state.exclusive = false;
         state.owners.clear();
+        state.waiters.clear();
         state.owner_table.clear();
         state.contention_count = 0;
         state.shared_waiters = 0;
@@ -311,6 +338,7 @@ impl ExecutiveResourceStore {
         if self.resources[index].is_active()
             || self.resources[index].shared_waiters != 0
             || self.resources[index].exclusive_waiters != 0
+            || !self.resources[index].waiters.is_empty()
         {
             return Err(ExecutiveSyncError::ResourceBusy);
         }
@@ -371,6 +399,91 @@ impl ExecutiveResourceStore {
         Ok(AcquireResult::Acquired)
     }
 
+    /// Recheck ownership after the caller has published an Event, then acquire or queue.
+    /// No provider call may occur between this check and ticket insertion.
+    pub unsafe fn begin_wait(
+        &mut self,
+        resource: *mut u8,
+        thread: u64,
+        mode: ResourceMode,
+        event: u64,
+    ) -> Result<ResourceWaitAdmission, ExecutiveSyncError> {
+        if event == 0 { return Err(ExecutiveSyncError::InvalidAddress); }
+        match self.acquire(resource, thread, mode)? {
+            AcquireResult::Acquired => return Ok(ResourceWaitAdmission::Acquired),
+            AcquireResult::WouldBlock => {}
+        }
+        let index = self.index_of(resource as u64).ok_or(ExecutiveSyncError::NotInitialized)?;
+        let state = &mut self.resources[index];
+        if state.owner_index(thread).is_some() {
+            return Err(ExecutiveSyncError::InvalidOwner);
+        }
+        if state.waiters.iter().any(|waiter| waiter.thread == thread) {
+            return Err(ExecutiveSyncError::InvalidOwner);
+        }
+        let next_count = match mode {
+            ResourceMode::Shared => state.shared_waiters.checked_add(1),
+            ResourceMode::Exclusive => state.exclusive_waiters.checked_add(1),
+        }.ok_or(ExecutiveSyncError::AllocationFailed)?;
+        state.waiters.try_reserve(1).map_err(|_| ExecutiveSyncError::AllocationFailed)?;
+        let ticket = ResourceWaitTicket(self.next_wait_ticket.max(1));
+        self.next_wait_ticket = ticket.0.checked_add(1).ok_or(ExecutiveSyncError::AllocationFailed)?;
+        state.waiters.push(ResourceWaiter { ticket, thread, event, mode, granted: false });
+        match mode {
+            ResourceMode::Shared => state.shared_waiters = next_count,
+            ResourceMode::Exclusive => state.exclusive_waiters = next_count,
+        }
+        state.project_native()?;
+        Ok(ResourceWaitAdmission::Queued(ticket))
+    }
+
+    /// Complete a ticket whose ownership was transferred before its Event was signaled.
+    pub fn complete_wait(
+        &mut self,
+        resource: *mut u8,
+        thread: u64,
+        ticket: ResourceWaitTicket,
+    ) -> Result<(), ExecutiveSyncError> {
+        let index = self.index_of(resource as u64).ok_or(ExecutiveSyncError::NotInitialized)?;
+        let state = &mut self.resources[index];
+        let waiter_index = state.waiters.iter().position(|waiter| waiter.ticket == ticket && waiter.thread == thread)
+            .ok_or(ExecutiveSyncError::InvalidOwner)?;
+        if !state.waiters[waiter_index].granted || state.owner_index(thread).is_none() {
+            return Err(ExecutiveSyncError::NotOwned);
+        }
+        let waiter = state.waiters.remove(waiter_index);
+        match waiter.mode {
+            ResourceMode::Shared => state.shared_waiters -= 1,
+            ResourceMode::Exclusive => state.exclusive_waiters -= 1,
+        }
+        unsafe { state.project_native() }
+    }
+
+    /// Withdraw a wait after a known, validated cancellation result. A granted ticket owns
+    /// the resource already, so cancellation releases it and may hand off to the next waiter.
+    pub unsafe fn cancel_wait(
+        &mut self,
+        resource: *mut u8,
+        thread: u64,
+        ticket: ResourceWaitTicket,
+    ) -> Result<Option<u64>, ExecutiveSyncError> {
+        let index = self.index_of(resource as u64).ok_or(ExecutiveSyncError::NotInitialized)?;
+        let state = &mut self.resources[index];
+        let waiter_index = state.waiters.iter().position(|waiter| waiter.ticket == ticket && waiter.thread == thread)
+            .ok_or(ExecutiveSyncError::InvalidOwner)?;
+        let waiter = state.waiters.remove(waiter_index);
+        match waiter.mode {
+            ResourceMode::Shared => state.shared_waiters -= 1,
+            ResourceMode::Exclusive => state.exclusive_waiters -= 1,
+        }
+        if waiter.granted {
+            self.release_with_handoff(resource, thread)
+        } else {
+            state.project_native()?;
+            Ok(None)
+        }
+    }
+
     /// Releases one recursive acquisition held by `thread`.
     ///
     /// # Safety
@@ -380,6 +493,20 @@ impl ExecutiveResourceStore {
         resource: *mut u8,
         thread: u64,
     ) -> Result<(), ExecutiveSyncError> {
+        let index = self.index_of(resource as u64).ok_or(ExecutiveSyncError::NotInitialized)?;
+        if !self.resources[index].waiters.is_empty() {
+            return Err(ExecutiveSyncError::BlockingWaitRequired);
+        }
+        self.release_with_handoff(resource, thread).map(|_| ())
+    }
+
+    /// Transfer ownership before the caller signals the returned exact waiter Event.
+    /// The caller must drop its store borrow before entering the provider signal broker.
+    pub unsafe fn release_with_handoff(
+        &mut self,
+        resource: *mut u8,
+        thread: u64,
+    ) -> Result<Option<u64>, ExecutiveSyncError> {
         if resource.is_null() {
             return Err(ExecutiveSyncError::InvalidAddress);
         }
@@ -401,7 +528,18 @@ impl ExecutiveResourceStore {
                 state.exclusive = false;
             }
         }
-        state.project_native()
+        let mut wake = None;
+        if state.owners.is_empty() {
+            if let Some(waiter) = state.waiters.iter_mut().find(|waiter| !waiter.granted) {
+                state.owners.try_reserve(1).map_err(|_| ExecutiveSyncError::AllocationFailed)?;
+                state.owners.push(ResourceOwner { thread: waiter.thread, recursion: 1 });
+                state.exclusive = waiter.mode == ResourceMode::Exclusive;
+                waiter.granted = true;
+                wake = Some(waiter.event);
+            }
+        }
+        state.project_native()?;
+        Ok(wake)
     }
 
     pub fn is_acquired_exclusive(
@@ -691,6 +829,53 @@ mod tests {
                 Ok(AcquireResult::WouldBlock)
             );
             assert_eq!(store.acquired_count(resource as u64, 0x1000), Ok(1));
+        }
+    }
+
+    #[test]
+    fn contended_resource_wait_hands_off_exact_owner_before_wake() {
+        let mut bytes = Aligned([0u8; eresource_layout::SIZE_OF]);
+        let resource = bytes.0.as_mut_ptr();
+        let mut store = ExecutiveResourceStore::new();
+        unsafe {
+            store.initialize(resource).unwrap();
+            assert_eq!(store.acquire(resource, 0x1000, ResourceMode::Exclusive), Ok(AcquireResult::Acquired));
+            let first = match store.begin_wait(resource, 0x2000, ResourceMode::Exclusive, 0xabc0).unwrap() {
+                ResourceWaitAdmission::Queued(ticket) => ticket,
+                _ => panic!("contended waiter acquired early"),
+            };
+            let second = match store.begin_wait(resource, 0x3000, ResourceMode::Exclusive, 0xdef0).unwrap() {
+                ResourceWaitAdmission::Queued(ticket) => ticket,
+                _ => panic!("contended waiter acquired early"),
+            };
+            assert_eq!(store.release_with_handoff(resource, 0x1000).unwrap(), Some(0xabc0));
+            assert_eq!(store.is_acquired_exclusive(resource as u64, 0x2000), Ok(true));
+            assert_eq!(store.acquire(resource, 0x3000, ResourceMode::Exclusive), Ok(AcquireResult::WouldBlock));
+            assert_eq!(store.complete_wait(resource, 0x2000, first), Ok(()));
+            assert_eq!(store.release_with_handoff(resource, 0x2000).unwrap(), Some(0xdef0));
+            assert_eq!(store.complete_wait(resource, 0x3000, second), Ok(()));
+            assert_eq!(store.release_with_handoff(resource, 0x3000).unwrap(), None);
+            assert_eq!(store.acquired_count(resource as u64, 0x3000), Ok(0));
+        }
+    }
+
+    #[test]
+    fn cancelled_resource_wait_releases_ticket_and_preserves_owner() {
+        let mut bytes = Aligned([0u8; eresource_layout::SIZE_OF]);
+        let resource = bytes.0.as_mut_ptr();
+        let mut store = ExecutiveResourceStore::new();
+        unsafe {
+            store.initialize(resource).unwrap();
+            store.acquire(resource, 0x1000, ResourceMode::Exclusive).unwrap();
+            let ticket = match store.begin_wait(resource, 0x2000, ResourceMode::Exclusive, 0xabc0).unwrap() {
+                ResourceWaitAdmission::Queued(ticket) => ticket,
+                _ => panic!("expected contention"),
+            };
+            assert_eq!(store.delete(resource), Err(ExecutiveSyncError::ResourceBusy));
+            assert_eq!(store.cancel_wait(resource, 0x2000, ticket), Ok(None));
+            assert_eq!(store.release_with_handoff(resource, 0x1000), Ok(None));
+            assert_eq!(store.complete_wait(resource, 0x2000, ticket), Err(ExecutiveSyncError::InvalidOwner));
+            store.delete(resource).unwrap();
         }
     }
 

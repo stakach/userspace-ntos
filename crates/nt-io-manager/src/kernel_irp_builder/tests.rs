@@ -5,6 +5,86 @@ use crate::{
 };
 
 #[test]
+fn provider_read_projection_preserves_device_transfer_method() {
+    let data = 0x2000;
+    let direct = plan_provider_read_write_buffers(
+        major::IRP_MJ_READ, DO_DIRECT_IO, data, 512,
+    ).unwrap();
+    assert_eq!(direct.mdl, Some(MdlPlan { buffer: data, length: 512, access: MdlAccess::Write }));
+    assert_eq!((direct.system_buffer, direct.user_buffer, direct.irp_flags), (0, 0, 0));
+
+    let buffered = plan_provider_read_write_buffers(
+        major::IRP_MJ_READ, DO_BUFFERED_IO | DO_DIRECT_IO, data, 512,
+    ).unwrap();
+    assert_eq!(buffered.mdl, None);
+    assert_eq!((buffered.system_buffer, buffered.user_buffer, buffered.irp_flags),
+        (data, data, IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | IRP_INPUT_OPERATION));
+
+    let neither = plan_provider_read_write_buffers(
+        major::IRP_MJ_READ, 0, data, 512,
+    ).unwrap();
+    assert_eq!(neither.mdl, None);
+    assert_eq!((neither.system_buffer, neither.user_buffer, neither.irp_flags), (0, data, 0));
+}
+
+#[test]
+fn provider_write_projection_uses_read_access_for_direct_input() {
+    let data = 0x3000;
+    let direct = plan_provider_read_write_buffers(
+        major::IRP_MJ_WRITE, DO_DIRECT_IO, data, 512,
+    ).unwrap();
+    assert_eq!(direct.mdl, Some(MdlPlan { buffer: data, length: 512, access: MdlAccess::Read }));
+    assert_eq!((direct.system_buffer, direct.user_buffer, direct.irp_flags), (0, 0, 0));
+
+    let buffered = plan_provider_read_write_buffers(
+        major::IRP_MJ_WRITE, DO_BUFFERED_IO, data, 512,
+    ).unwrap();
+    assert_eq!(buffered.mdl, None);
+    assert_eq!((buffered.system_buffer, buffered.user_buffer, buffered.irp_flags),
+        (data, 0, IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER));
+}
+
+#[test]
+fn disk_metadata_read_overrides_verify_volume_without_changing_source_buffers() {
+    let ordinary = plan_synchronous_fsd_request(
+        major::IRP_MJ_READ, 2, DO_DIRECT_IO, 0x1000, 0x2000, 512, Some(0),
+    ).unwrap();
+    let metadata = plan_disk_metadata_read(
+        2, DO_DIRECT_IO, 0x1000, 0x2000, 512, 0,
+    ).unwrap();
+    assert_eq!(ordinary.stack.flags & 0x02, 0);
+    assert_eq!(metadata.stack.flags & 0x02, 0x02);
+    assert_eq!(metadata.stack.parameters, ordinary.stack.parameters);
+    assert_eq!(metadata.mdl, ordinary.mdl);
+    assert_eq!(metadata.user_buffer, ordinary.user_buffer);
+}
+
+#[test]
+fn disk_metadata_write_preserves_source_and_overrides_verify_volume() {
+    for flags in [DO_BUFFERED_IO, DO_DIRECT_IO, 0] {
+        let ordinary = plan_synchronous_fsd_request(
+            major::IRP_MJ_WRITE, 2, flags, 0x1000, 0x2000, 512, Some(1024),
+        ).unwrap();
+        let metadata = plan_disk_metadata_write(
+            2, flags, 0x1000, 0x2000, 512, 1024,
+        ).unwrap();
+        assert_eq!(ordinary.stack.flags & SL_OVERRIDE_VERIFY_VOLUME, 0);
+        assert_eq!(metadata.stack.flags & SL_OVERRIDE_VERIFY_VOLUME, SL_OVERRIDE_VERIFY_VOLUME);
+        assert_eq!(metadata.stack.parameters, ordinary.stack.parameters);
+        assert_eq!(metadata.mdl, ordinary.mdl);
+        assert_eq!(metadata.system_buffer_input, ordinary.system_buffer_input);
+        assert_eq!(metadata.system_buffer_input_len, ordinary.system_buffer_input_len);
+        assert_eq!(metadata.user_buffer, ordinary.user_buffer);
+    }
+    for (device, buffer, length) in [(0, 0x2000, 512), (0x1000, 0, 512), (0x1000, 0x2000, 0)] {
+        assert_eq!(
+            plan_disk_metadata_write(2, DO_DIRECT_IO, device, buffer, length, 0),
+            Err(KernelIrpPlanError::InvalidIrpHeader),
+        );
+    }
+}
+
+#[test]
 fn dispatch_cursor_stays_inside_the_exact_source_irp_stack() {
     let base = 0x1000_2000;
     let count = 2;

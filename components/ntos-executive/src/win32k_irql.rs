@@ -23,11 +23,6 @@ pub(super) extern "win64" fn get_current() -> u8 {
     }
 }
 
-/// The rewritten CR8 instruction originally defined all of RAX, not merely the KIRQL byte.
-pub(super) extern "win64" fn read_cr8() -> u64 {
-    u64::from(get_current())
-}
-
 pub(super) extern "win64" fn raise(new: u8) -> u8 {
     unsafe {
         let activation = active_provider_stack_event_activation()
@@ -38,7 +33,11 @@ pub(super) extern "win64" fn raise(new: u8) -> u8 {
                 .as_mut()
                 .and_then(|catalog| catalog.raise_irql(activation, new).ok())
         };
-        result.unwrap_or_else(|| protocol_fault(b"KfRaiseIrql"))
+        let old = result.unwrap_or_else(|| protocol_fault(b"KfRaiseIrql"));
+        if !crate::win32k_cr8_publication::publish(activation, new) {
+            protocol_fault(b"KfRaiseIrql publication");
+        }
+        old
     }
 }
 
@@ -53,6 +52,9 @@ pub(super) extern "win64" fn lower(new: u8) {
                 .and_then(|catalog| catalog.lower_irql(activation, new).ok())
         };
         result.unwrap_or_else(|| protocol_fault(b"KeLowerIrql"));
+        if !crate::win32k_cr8_publication::publish(activation, new) {
+            protocol_fault(b"KeLowerIrql publication");
+        }
     }
 }
 

@@ -926,7 +926,8 @@ impl Work {
                         self.dispatch_provider(handler),
                     hosted_source_completion_lane::SourceCompletionPreparation::KnownRejected(status) =>
                         self.initial_status = Some(status as i32),
-                    hosted_source_completion_lane::SourceCompletionPreparation::RetainedUncertain =>
+                    hosted_source_completion_lane::SourceCompletionPreparation::InProgress
+                    | hosted_source_completion_lane::SourceCompletionPreparation::RetainedUncertain =>
                         return false,
                 },
                 Err(error) => self.initial_status = Some(status_for_capture(error)),

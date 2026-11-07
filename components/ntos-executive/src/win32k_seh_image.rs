@@ -13,8 +13,15 @@ use crate::{driver_launch::hosted_seh_component, RO_NX};
 pub(crate) const IMAGE_VA: u64 = crate::win32k_subsystem::WIN32K_CODE_VA
     + crate::win32k_subsystem::WIN32K_IMAGE_FRAMES * 0x1000;
 pub(crate) const MAX_FRAMES: usize = 16;
+const _: () = assert!(
+    IMAGE_VA + MAX_FRAMES as u64 * 0x1000
+        <= crate::win32k_subsystem::WIN32K_CODE_VA + 2 * 0x20_0000
+);
+const _: () = assert!(
+    IMAGE_VA + MAX_FRAMES as u64 * 0x1000 <= crate::win32k_subsystem::WIN32K_AUX_PT_VADDR
+);
 const RX: u64 = 2;
-const SUPPORT_PATH: &[u8] = b"reactos\\system32\\nt-seh-linkage.dll";
+const SUPPORT_PATH: &[u8] = crate::installed_layout::SEH_LINKAGE;
 
 struct Published {
     pml4: u64,

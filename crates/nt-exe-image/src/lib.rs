@@ -8,6 +8,10 @@
 
 mod process_image_layout;
 pub use process_image_layout::ProcessImageLayout;
+pub mod service_group_launch;
+pub mod execution_role;
+mod process_image_source;
+pub use process_image_source::{ProcessImageSourceError, ProcessImageSourceEvidence};
 
 pub const MAX_EXE_LEAF: usize = 64;
 pub const MAX_NT_IMAGE_PATH: usize = 192;
@@ -178,6 +182,12 @@ pub struct HostedProcessImageRef<'a> {
 }
 
 impl HostedProcessImageRef<'_> {
+    /// Installer service ownership requires a registered execution role. A captured image
+    /// observation remains historical attribution and cannot grant this policy capability.
+    pub fn can_own_installer_service_work(&self) -> bool {
+        self.role.is_noninteractive_service_class()
+    }
+
     pub fn observation_role(&self) -> HostedProcessRole {
         self.observation.map_or(self.role, |proof| proof.target.role)
     }
@@ -198,6 +208,21 @@ pub enum HostedImageRegistrationError {
     Full,
     InvalidGeneration,
     GenerationExhausted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisteredImageBackingError {
+    InvalidIdentity,
+    StaleTarget,
+    AlreadyBound,
+    BackingCollision,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisteredLaunchPolicyError {
+    StaleTarget,
+    MissingBacking,
+    AlreadyBound,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -521,6 +546,8 @@ impl OwnedHostedProcessImage {
 pub struct OwnedHostedImageCatalog<const N: usize> {
     entries: [OwnedHostedProcessImage; N],
     used: [bool; N],
+    backings: [Option<nt_memory_manager::SectionFileIdentity>; N],
+    launch_creators: [Option<HostedProcessRole>; N],
     next_dynamic_generation: u64,
 }
 
@@ -535,12 +562,16 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
         Self {
             entries: [OwnedHostedProcessImage::empty(); N],
             used: [false; N],
+            backings: [None; N],
+            launch_creators: [None; N],
             next_dynamic_generation: 1,
         }
     }
 
     pub fn clear(&mut self) {
         self.used.fill(false);
+        self.backings.fill(None);
+        self.launch_creators.fill(None);
         self.next_dynamic_generation = 1;
     }
 
@@ -565,6 +596,8 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
             .ok_or(HostedImageRegistrationError::Full)?;
         self.entries[index] = image;
         self.used[index] = true;
+        self.backings[index] = None;
+        self.launch_creators[index] = None;
         Ok(index)
     }
 
@@ -589,6 +622,8 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
             .ok_or(HostedImageRegistrationError::Full)?;
         self.entries[index].copy_from_ref(image)?;
         self.used[index] = true;
+        self.backings[index] = None;
+        self.launch_creators[index] = None;
         Ok(index)
     }
 
@@ -655,6 +690,80 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
             .then_some(CapturedImageObservation { target })
     }
 
+    /// Associate a registered image with its canonical mounted File. This is historical image
+    /// provenance for native File/Section capture, never process or service authority.
+    pub fn bind_registered_backing(
+        &mut self,
+        target: SpawnTarget,
+        backing: nt_memory_manager::SectionFileIdentity,
+    ) -> Result<(), RegisteredImageBackingError> {
+        if backing.file_id == 0 || backing.mount.value() == 0 {
+            return Err(RegisteredImageBackingError::InvalidIdentity);
+        }
+        let index = self.entries.iter().zip(self.used.iter())
+            .position(|(image, used)| *used && image.pi == target.pi
+                && SpawnTarget::from_image(image.as_ref()) == target)
+            .ok_or(RegisteredImageBackingError::StaleTarget)?;
+        if self.backings.iter().enumerate().any(|(other, value)|
+            other != index && *value == Some(backing)) {
+            return Err(RegisteredImageBackingError::BackingCollision);
+        }
+        match self.backings[index] {
+            Some(existing) if existing == backing => Ok(()),
+            Some(_) => Err(RegisteredImageBackingError::AlreadyBound),
+            None => {
+                self.backings[index] = Some(backing);
+                Ok(())
+            }
+        }
+    }
+
+    /// Bootstrap-owned creator policy for an exact registered image generation. Image
+    /// observations can carry this identity but cannot themselves confer execution authority.
+    pub fn bind_registered_launch_policy(
+        &mut self,
+        target: SpawnTarget,
+        creator: HostedProcessRole,
+    ) -> Result<(), RegisteredLaunchPolicyError> {
+        let index = self.entries.iter().zip(self.used.iter())
+            .position(|(image, used)| *used && image.pi == target.pi
+                && SpawnTarget::from_image(image.as_ref()) == target)
+            .ok_or(RegisteredLaunchPolicyError::StaleTarget)?;
+        if self.backings[index].is_none() {
+            return Err(RegisteredLaunchPolicyError::MissingBacking);
+        }
+        if self.launch_creators[index].is_some() {
+            return Err(RegisteredLaunchPolicyError::AlreadyBound);
+        }
+        self.launch_creators[index] = Some(creator);
+        Ok(())
+    }
+
+    pub fn registered_launch_policy(
+        &self,
+        target: SpawnTarget,
+    ) -> Option<(nt_memory_manager::SectionFileIdentity, HostedProcessRole)> {
+        self.entries.iter().zip(self.used.iter()).enumerate()
+            .find(|(_, (image, used))| **used && image.pi == target.pi
+                && SpawnTarget::from_image(image.as_ref()) == target)
+            .and_then(|(index, _)| Some((self.backings[index]?, self.launch_creators[index]?)))
+    }
+
+    /// Resolve only an exact mounted File identity to a still-registered image generation.
+    pub fn observation_for_backing(
+        &self,
+        backing: nt_memory_manager::SectionFileIdentity,
+    ) -> Option<CapturedImageObservation> {
+        if backing.file_id == 0 || backing.mount.value() == 0 {
+            return None;
+        }
+        self.backings.iter().zip(self.entries.iter()).zip(self.used.iter())
+            .find_map(|((bound, image), used)| (*used && *bound == Some(backing))
+                .then(|| CapturedImageObservation {
+                    target: SpawnTarget::from_image(image.as_ref()),
+                }))
+    }
+
     /// Retire an exact dynamic process-image identity after all process-instance owners have been
     /// removed. Generation matching prevents a delayed cleanup from clearing a replacement that
     /// reused the same PI and top-level fault badge.
@@ -677,6 +786,8 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
         let retired = self.entries[index];
         self.entries[index] = OwnedHostedProcessImage::empty();
         self.used[index] = false;
+        self.backings[index] = None;
+        self.launch_creators[index] = None;
         Ok(retired)
     }
 
@@ -698,6 +809,8 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
             .ok_or(HostedImageRegistrationError::Full)?;
         self.entries[index] = image;
         self.used[index] = true;
+        self.backings[index] = None;
+        self.launch_creators[index] = None;
         Ok(index)
     }
 
@@ -1336,6 +1449,48 @@ pub fn canonical_exe_leaf(path: &[u8]) -> Option<&[u8]> {
     Some(leaf)
 }
 
+/// Derive process display metadata from an already selected mounted File name. The caller
+/// retains the File/Section as image authority; this path is never used to reopen the image.
+/// Mounted File names may have one leading device-relative separator or none.
+pub fn canonical_hosted_nt_image_path(
+    file_name: &[u8],
+    installed_root: &[u8],
+    out: &mut [u8; MAX_NT_IMAGE_PATH],
+) -> Option<(usize, HostedImageRoot)> {
+    if installed_root.is_empty()
+        || !installed_root.iter().all(|byte| byte.is_ascii()
+            && !matches!(byte, b'\\' | b'/' | b':' | 0))
+    {
+        return None;
+    }
+    let relative = file_name.strip_prefix(b"\\").unwrap_or(file_name);
+    let root = relative.get(..installed_root.len())?;
+    let tail = relative.get(installed_root.len()..)?;
+    if !root.eq_ignore_ascii_case(installed_root) || !tail.starts_with(b"\\") {
+        return None;
+    }
+    let tail = &tail[1..];
+    let system32 = b"system32\\";
+    let (prefix, root, leaf) = if tail.len() >= system32.len()
+        && tail[..system32.len()].eq_ignore_ascii_case(system32)
+    {
+        (b"\\SystemRoot\\System32\\" as &[u8], HostedImageRoot::System32,
+            &tail[system32.len()..])
+    } else {
+        (b"\\SystemRoot\\" as &[u8], HostedImageRoot::SystemRoot, tail)
+    };
+    if canonical_exe_leaf(leaf)? != leaf {
+        return None;
+    }
+    let len = prefix.len().checked_add(leaf.len())?;
+    if len > out.len() {
+        return None;
+    }
+    out[..prefix.len()].copy_from_slice(prefix);
+    out[prefix.len()..len].copy_from_slice(leaf);
+    Some((len, root))
+}
+
 fn contains_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|window| {
         window
@@ -1832,6 +1987,47 @@ mod tests {
             catalog.probe_leaf(br"\SystemRoot\System32\cmd.exe", false),
             Some(b"cmd.exe" as &[u8])
         );
+    }
+
+    #[test]
+    fn dynamic_service_observation_preserves_registered_role() {
+        let boot = boot_owned_catalog();
+        let mut catalog = OwnedHostedImageCatalog::<9>::new();
+        for image in boot.entries {
+            if !image.leaf().is_empty() {
+                catalog.register(image).unwrap();
+            }
+        }
+        let target = SpawnTarget::from_image(catalog.get_by_pi(3).unwrap());
+        let observation = catalog.capture_image_observation(target).unwrap();
+        let service_pi = catalog
+            .admit_dynamic_executable_observed(
+                b"services.exe",
+                HostedProcessRole::Application,
+                b"\\SystemRoot\\System32\\services.exe",
+                b"\\SystemRoot\\System32\\services.exe",
+                HostedImageRoot::System32,
+                Some(observation),
+                DYNAMIC_PROCESS_FIRST_PI + 2,
+            )
+            .unwrap();
+        let service = catalog.get_by_pi(service_pi).unwrap();
+        assert_eq!(service.role, HostedProcessRole::Application);
+        assert_eq!(service.observation_role(), HostedProcessRole::ServiceControlManager);
+        assert!(service.observation_role().is_noninteractive_service_class());
+
+        let ordinary_pi = catalog
+            .admit_dynamic_executable(
+                b"ordinary.exe",
+                HostedProcessRole::Application,
+                b"\\SystemRoot\\System32\\ordinary.exe",
+                b"\\SystemRoot\\System32\\ordinary.exe",
+                HostedImageRoot::System32,
+                DYNAMIC_PROCESS_FIRST_PI + 2,
+            )
+            .unwrap();
+        let ordinary = catalog.get_by_pi(ordinary_pi).unwrap();
+        assert!(!ordinary.observation_role().is_noninteractive_service_class());
     }
 
     #[test]

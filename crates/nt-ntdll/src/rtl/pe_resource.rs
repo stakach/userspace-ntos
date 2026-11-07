@@ -83,30 +83,39 @@ impl DirEntry {
     }
 }
 
-#[inline]
-fn rd_u16(buf: &[u8], off: usize) -> Option<u16> {
-    buf.get(off..off + 2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+pub trait ResourceBytes {
+    fn len(&self) -> usize;
+    fn read_u16(&mut self, offset: usize) -> Option<u16>;
+    fn read_u32(&mut self, offset: usize) -> Option<u32>;
 }
-#[inline]
-fn rd_u32(buf: &[u8], off: usize) -> Option<u32> {
-    buf.get(off..off + 4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+
+struct SliceBytes<'a>(&'a [u8]);
+
+impl ResourceBytes for SliceBytes<'_> {
+    fn len(&self) -> usize { self.0.len() }
+    fn read_u16(&mut self, offset: usize) -> Option<u16> {
+        self.0.get(offset..offset.checked_add(2)?)
+            .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()))
+    }
+    fn read_u32(&mut self, offset: usize) -> Option<u32> {
+        self.0.get(offset..offset.checked_add(4)?)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+    }
 }
 
 /// Read the `(named, id)` entry counts of the directory at `dir_off`.
-fn dir_counts(rsrc: &[u8], dir_off: usize) -> Option<(usize, usize)> {
-    let named = rd_u16(rsrc, dir_off + OFF_NUM_NAMED)? as usize;
-    let id = rd_u16(rsrc, dir_off + OFF_NUM_ID)? as usize;
+fn dir_counts(rsrc: &mut impl ResourceBytes, dir_off: usize) -> Option<(usize, usize)> {
+    let named = rsrc.read_u16(dir_off.checked_add(OFF_NUM_NAMED)?)? as usize;
+    let id = rsrc.read_u16(dir_off.checked_add(OFF_NUM_ID)?)? as usize;
     Some((named, id))
 }
 
 /// Decode the `i`-th entry of the directory at `dir_off` (entries start right after the 16-byte header).
-fn dir_entry(rsrc: &[u8], dir_off: usize, i: usize) -> Option<DirEntry> {
-    let base = dir_off + DIR_SIZE + i * ENTRY_SIZE;
+fn dir_entry(rsrc: &mut impl ResourceBytes, dir_off: usize, i: usize) -> Option<DirEntry> {
+    let base = dir_off.checked_add(DIR_SIZE)?.checked_add(i.checked_mul(ENTRY_SIZE)?)?;
     Some(DirEntry {
-        name: rd_u32(rsrc, base)?,
-        offset: rd_u32(rsrc, base + 4)?,
+        name: rsrc.read_u32(base)?,
+        offset: rsrc.read_u32(base.checked_add(4)?)?,
     })
 }
 
@@ -114,11 +123,11 @@ fn dir_entry(rsrc: &[u8], dir_off: usize, i: usize) -> Option<DirEntry> {
 /// against an `IMAGE_RESOURCE_DIR_STRING_U` at `str_off` (USHORT Length; WCHAR NameString[Length]).
 /// Returns 0 on equal, matching ReactOS semantics (search string must end exactly at the resource
 /// string's end).
-fn compare_resource_string(rsrc: &[u8], str_off: usize, search: &[u16]) -> Option<i32> {
-    let len = rd_u16(rsrc, str_off)? as usize;
+fn compare_resource_string(rsrc: &mut impl ResourceBytes, str_off: usize, search: &[u16]) -> Option<i32> {
+    let len = rsrc.read_u16(str_off)? as usize;
     let mut si = 0usize;
     for k in 0..len {
-        let c2 = rd_u16(rsrc, str_off + 2 + k * 2)?;
+        let c2 = rsrc.read_u16(str_off.checked_add(2)?.checked_add(k.checked_mul(2)?)?)?;
         // The search string is NUL-terminated; treat missing chars as 0.
         let c1 = search.get(si).copied().unwrap_or(0);
         si += 1;
@@ -149,7 +158,7 @@ fn upcase(c: u16) -> u16 {
 
 /// `find_entry_by_id` — binary-search the id entries for `id`, returning the child offset if the
 /// entry's directory-ness matches `want_dir`.
-fn find_entry_by_id(rsrc: &[u8], dir_off: usize, id: u16, want_dir: bool) -> Option<usize> {
+fn find_entry_by_id(rsrc: &mut impl ResourceBytes, dir_off: usize, id: u16, want_dir: bool) -> Option<usize> {
     let (named, ids) = dir_counts(rsrc, dir_off)?;
     if ids == 0 {
         return None;
@@ -177,7 +186,7 @@ fn find_entry_by_id(rsrc: &[u8], dir_off: usize, id: u16, want_dir: bool) -> Opt
 /// `find_entry_by_name` — for an integer name, defer to `find_entry_by_id`; for a string name,
 /// binary-search the named entries (case-insensitive compare).
 fn find_entry_by_name(
-    rsrc: &[u8],
+    rsrc: &mut impl ResourceBytes,
     dir_off: usize,
     name: &ResName,
     want_dir: bool,
@@ -216,6 +225,10 @@ fn find_entry_by_name(
 /// `find_first_entry` — the first entry whose directory-ness matches `want_dir` (used for the
 /// LANG_NEUTRAL "just take the first language" fallback).
 pub fn find_first_entry(rsrc: &[u8], dir_off: usize, want_dir: bool) -> Option<usize> {
+    find_first_entry_in(&mut SliceBytes(rsrc), dir_off, want_dir)
+}
+
+pub fn find_first_entry_in(rsrc: &mut impl ResourceBytes, dir_off: usize, want_dir: bool) -> Option<usize> {
     let (named, ids) = dir_counts(rsrc, dir_off)?;
     for pos in 0..(named + ids) {
         let e = dir_entry(rsrc, dir_off, pos)?;
@@ -228,6 +241,10 @@ pub fn find_first_entry(rsrc: &[u8], dir_off: usize, want_dir: bool) -> Option<u
 
 /// Return the first numeric-id entry whose directory-ness matches `want_dir`.
 pub fn find_first_id_entry(rsrc: &[u8], dir_off: usize, want_dir: bool) -> Option<usize> {
+    find_first_id_entry_in(&mut SliceBytes(rsrc), dir_off, want_dir)
+}
+
+pub fn find_first_id_entry_in(rsrc: &mut impl ResourceBytes, dir_off: usize, want_dir: bool) -> Option<usize> {
     let (named, ids) = dir_counts(rsrc, dir_off)?;
     for pos in named..named.checked_add(ids)? {
         let entry = dir_entry(rsrc, dir_off, pos)?;
@@ -286,6 +303,18 @@ pub fn find_entry(
     level: u32,
     want_dir: bool,
 ) -> Result<FindResult, FindStatus> {
+    find_entry_in(&mut SliceBytes(rsrc), type_name, res_name, languages, neutral_first_fallback, level, want_dir)
+}
+
+pub fn find_entry_in(
+    rsrc: &mut impl ResourceBytes,
+    type_name: &ResName,
+    res_name: &ResName,
+    languages: &[u16],
+    neutral_first_fallback: bool,
+    level: u32,
+    want_dir: bool,
+) -> Result<FindResult, FindStatus> {
     if rsrc.len() < DIR_SIZE {
         return Err(FindStatus::DataNotFound);
     }
@@ -320,7 +349,7 @@ pub fn find_entry(
         }
     }
     if neutral_first_fallback {
-        if let Some(off) = find_first_entry(rsrc, name_off, want_dir) {
+        if let Some(off) = find_first_entry_in(rsrc, name_off, want_dir) {
             return Ok(FindResult { offset: off });
         }
     }
@@ -330,8 +359,12 @@ pub fn find_entry(
 /// Decode the `(OffsetToData, Size)` of an `IMAGE_RESOURCE_DATA_ENTRY` at `data_off` within the
 /// section. `OffsetToData` here is an **image RVA** (relative to the image base, not the section).
 pub fn data_entry(rsrc: &[u8], data_off: usize) -> Option<(u32, u32)> {
-    let rva = rd_u32(rsrc, data_off)?;
-    let size = rd_u32(rsrc, data_off + 4)?;
+    data_entry_in(&mut SliceBytes(rsrc), data_off)
+}
+
+pub fn data_entry_in(rsrc: &mut impl ResourceBytes, data_off: usize) -> Option<(u32, u32)> {
+    let rva = rsrc.read_u32(data_off)?;
+    let size = rsrc.read_u32(data_off.checked_add(4)?)?;
     Some((rva, size))
 }
 

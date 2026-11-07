@@ -126,13 +126,21 @@ impl<P: ObjectManagerPort> IoManager<P> {
         client: ClientId,
         file_id: FileId,
     ) -> Result<(), NtStatus> {
-        let state = {
+        let (state, close_deferred, close_retry_queued) = {
             let file = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
             if file.client_id != client {
                 return Err(NtStatus::INVALID_HANDLE);
             }
-            file.state
+            (file.state, file.close_deferred, file.close_retry_queued)
         };
+        // A queued retry or exact detached lifecycle already owns release. A
+        // discarded, unentered preparation owns neither, so a later call must
+        // restore its retry even though the final handle was transferred earlier.
+        if close_deferred
+            && (close_retry_queued || self.has_detached_file_lifecycle(file_id))
+        {
+            return Ok(());
+        }
         if state == FileState::CreateIrpDispatched {
             let create_irp = self
                 .irps

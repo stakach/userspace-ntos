@@ -77,6 +77,12 @@ pub(crate) struct MutationLeaseBank {
 }
 
 impl MutationLeaseBank {
+    pub(crate) fn diagnostic_owner(&self) -> Option<(u64, usize, usize)> {
+        self.lease
+            .as_ref()
+            .map(|lease| (lease.token, lease.journal.len(), lease.total_len))
+    }
+
     pub(crate) fn new(identities: Rc<CmIdentitySource>) -> Self {
         Self {
             lease: None,

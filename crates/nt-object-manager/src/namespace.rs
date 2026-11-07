@@ -54,7 +54,106 @@ pub struct FilePathTarget {
     pub remaining_name: Vec<u16>,
 }
 
+/// Session zero is a kernel-bootstrap namespace. SMSS briefly attaches to it
+/// through SystemSessionCreate/Detach to reserve the ID; that operation does
+/// not create or retire its existing `\\Sessions\\0` directory and links.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionNamespaceOwnership {
+    Bootstrap,
+    Numbered,
+}
+
+pub const fn session_namespace_ownership(session_id: u32) -> SessionNamespaceOwnership {
+    if session_id == 0 {
+        SessionNamespaceOwnership::Bootstrap
+    } else {
+        SessionNamespaceOwnership::Numbered
+    }
+}
+
 impl ObjectManager {
+    /// Publish the numbered Object Manager parents required by a new GUI session.
+    /// Both children are committed before any identity is returned.
+    pub fn create_session_namespace(
+        &mut self,
+        session_id: u32,
+    ) -> Result<(ObjectId, ObjectId, ObjectId), NtStatus> {
+        let sessions = self.lookup_path(
+            &NtPath::parse_str("\\Sessions")?, CaseSensitivity::CaseInsensitive,
+        )?;
+        let name = UnicodeString::from_str(&alloc::format!("{session_id}"));
+        let session = self.create_directory(&sessions, &name, true)?;
+        let windows_name = UnicodeString::from_str("Windows");
+        let windows = match self.create_directory(&session, &windows_name, true) {
+            Ok(windows) => windows,
+            Err(status) => {
+                self.remove_named_object(&sessions, &name, CaseSensitivity::CaseInsensitive)
+                    .expect("new session has no published child after failed Windows insert");
+                return Err(status);
+            }
+        };
+        let bno_name = UnicodeString::from_str("BaseNamedObjects");
+        let bno = match self.create_directory(&session, &bno_name, true) {
+            Ok(bno) => bno,
+            Err(status) => {
+                self.remove_named_object(&session, &windows_name, CaseSensitivity::CaseInsensitive)
+                    .expect("new Windows child has no external references");
+                self.remove_named_object(&sessions, &name, CaseSensitivity::CaseInsensitive)
+                    .expect("new session has no published child after rollback");
+                return Err(status);
+            }
+        };
+        Ok((session.id(), windows.id(), bno.id()))
+    }
+
+    /// Unlink only the empty numbered namespace whose exact identities were returned at create.
+    /// Existing children and open handles retain their names and require their own owner cleanup.
+    pub fn retire_session_namespace_exact(
+        &mut self,
+        session_id: u32,
+        session_id_exact: ObjectId,
+        windows_id_exact: ObjectId,
+        bno_id_exact: ObjectId,
+    ) -> Result<(), NtStatus> {
+        let sessions = self.lookup_path(
+            &NtPath::parse_str("\\Sessions")?, CaseSensitivity::CaseInsensitive,
+        )?;
+        let name = UnicodeString::from_str(&alloc::format!("{session_id}"));
+        let session = sessions.with_body(|body| match body {
+            ObjectBody::Directory(directory) => directory.lookup(&name, CaseSensitivity::CaseInsensitive),
+            _ => None,
+        }).ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
+        if session.id() != session_id_exact { return Err(NtStatus::INVALID_HANDLE); }
+        let windows_name = UnicodeString::from_str("Windows");
+        let windows = session.with_body(|body| match body {
+            ObjectBody::Directory(directory) => directory.lookup(&windows_name, CaseSensitivity::CaseInsensitive),
+            _ => None,
+        }).ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
+        if windows.id() != windows_id_exact { return Err(NtStatus::INVALID_HANDLE); }
+        let bno_name = UnicodeString::from_str("BaseNamedObjects");
+        let bno = session.with_body(|body| match body {
+            ObjectBody::Directory(directory) => directory.lookup(&bno_name, CaseSensitivity::CaseInsensitive),
+            _ => None,
+        }).ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
+        if bno.id() != bno_id_exact { return Err(NtStatus::INVALID_HANDLE); }
+        if windows.handle_count() != 0 || bno.handle_count() != 0 || session.handle_count() != 0 {
+            return Err(NtStatus::DEVICE_BUSY);
+        }
+        if windows.with_body(|body| !matches!(body, ObjectBody::Directory(directory) if directory.children().next().is_none())) {
+            return Err(NtStatus::DIRECTORY_NOT_EMPTY);
+        }
+        if bno.with_body(|body| !matches!(body, ObjectBody::Directory(directory) if directory.children().next().is_none())) {
+            return Err(NtStatus::DIRECTORY_NOT_EMPTY);
+        }
+        if session.with_body(|body| !matches!(body, ObjectBody::Directory(directory)
+            if directory.children().count() == 2)) {
+            return Err(NtStatus::DIRECTORY_NOT_EMPTY);
+        }
+        self.remove_named_object(&session, &bno_name, CaseSensitivity::CaseInsensitive)?;
+        self.remove_named_object(&session, &windows_name, CaseSensitivity::CaseInsensitive)?;
+        self.remove_named_object(&sessions, &name, CaseSensitivity::CaseInsensitive)
+    }
+
     /// Register the Directory type (idempotent), returning its id.
     fn ensure_directory_type(&mut self) -> Result<ObjectTypeId, NtStatus> {
         if let Some(id) = self.directory_type {

@@ -145,6 +145,8 @@ fn kernel_file_all_receives_complete_seed_and_initial_information() {
     assert_eq!(f.dispatch(&mut output, major::IRP_MJ_QUERY_INFORMATION, 12),
         Ok(ExternalDispatchResult::Completed {
             status: NtStatus::SUCCESS, information: 104, file_context: None,
+            completion_driver_id: f.io.device(f.device).unwrap().driver_id,
+            completion_device_id: f.device,
         }));
     assert_manager_fields(&output);
     assert_eq!(u64::from_le_bytes(output[80..88].try_into().unwrap()), 16);

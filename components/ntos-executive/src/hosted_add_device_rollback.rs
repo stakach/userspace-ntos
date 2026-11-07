@@ -220,6 +220,68 @@ pub(super) unsafe fn begin_dispatch(reservation: &Reservation) {
     row.dispatch_context_held = true;
 }
 
+/// The provider's nested reverse callback may refer only to the PDO owned by
+/// the currently entered AddDevice attempt. This observation retains its exact
+/// registration generation; callers must keep their own alias owner afterward.
+pub(super) unsafe fn active_pdo_registration(
+    provider_instance: usize,
+    domain: HostedDomainIdentity,
+    address: u64,
+) -> Option<nt_io_manager::HostedDevicePointerRegistration> {
+    let row = owners().iter().find(|row| {
+        row.phase == Phase::Dispatching && row.dispatch_context_held
+            && row.instance == provider_instance && row.domain == domain
+            && row.pdo == address
+    })?;
+    let registration = row.pdo_registration?;
+    (registration.domain() == domain
+        && registration.address() == address
+        && registration.device_id().raw() == row.pdo_id
+        && io_manager_mut().hosted_device_pointer_registration(domain, address)
+            == Some(registration))
+        .then_some(registration)
+}
+
+/// Validate DxgKrnl's AddDevice out cell against an FDO created by this same
+/// retained attempt. The FDO publication keeps its allocation live while the
+/// provider is parked in the nested callback.
+pub(super) unsafe fn active_created_output(
+    provider_instance: usize,
+    domain: HostedDomainIdentity,
+    pdo: nt_io_manager::HostedDevicePointerRegistration,
+    address: u64,
+) -> Option<(u64, nt_io_manager::source_irp_auxiliary::SourcePoolAllocationIdentity,
+    nt_io_manager::HostedDevicePointerRegistration)> {
+    if active_pdo_registration(provider_instance, domain, pdo.address()) != Some(pdo) {
+        return None;
+    }
+    let inst = instance(provider_instance)?;
+    let row = owners().iter().find(|row| {
+        row.phase == Phase::Dispatching && row.instance == provider_instance
+            && row.domain == domain && row.pdo_registration == Some(pdo)
+    })?;
+    for created in &row.created {
+        let registration = created.registration;
+        if created.pointer_retired || created.destroyed || created.projection_retired
+            || io_manager_mut().hosted_device_pointer_registration(
+                domain, registration.address()) != Some(registration)
+        {
+            continue;
+        }
+        let Ok(allocation) = hosted_device_allocations::capture_allocation(
+            inst, registration.address()) else { continue; };
+        let Some(offset) = address.checked_sub(registration.address()) else { continue; };
+        if offset < WDM_X64_DEVICE_OBJECT_SIZE as u64
+            || offset.checked_add(8).is_none_or(|end| end > allocation.capacity)
+        {
+            continue;
+        }
+        let exec = component_pool_to_exec_va(inst.exec_pool_va, address, 8)?;
+        return Some((exec, allocation, registration));
+    }
+    None
+}
+
 pub(super) unsafe fn admit_mutation(
     domain: HostedDomainIdentity,
     ch: &crate::spawn_hosts::PumpChannel,
@@ -529,7 +591,7 @@ unsafe fn advance_inner(id: u64) -> Result<(), nt_status::NtStatus> {
             return Err(nt_status::NtStatus::DEVICE_BUSY);
         }
         if !device.pointer_retired {
-            io_manager_mut().retire_hosted_device_pointer(device.registration)?;
+            hosted_device_allocations::retire_canonical_pointer(io_manager_mut(), device.registration)?;
             owner(id).created[index].pointer_retired = true;
         }
         if !device.destroyed {
@@ -549,7 +611,7 @@ unsafe fn advance_inner(id: u64) -> Result<(), nt_status::NtStatus> {
     }
     if let Some(registration) = owner(id).pdo_registration {
         if owner(id).pdo_created && !owner(id).pdo_canonical_retired {
-            io_manager_mut().retire_hosted_device_pointer(registration)?;
+            hosted_device_allocations::retire_canonical_pointer(io_manager_mut(), registration)?;
             owner(id).pdo_canonical_retired = true;
         }
     }

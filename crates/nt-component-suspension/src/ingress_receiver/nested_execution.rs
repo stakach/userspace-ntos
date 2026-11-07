@@ -40,7 +40,9 @@ pub struct NestedExecutionIdentity {
 }
 
 impl NestedExecutionIdentity {
-    pub(crate) const fn sequence(self) -> u64 { self.sequence }
+    /// The exact nested lane epoch. Callers must compare it with the active lane phase before
+    /// transferring a retained continuation; route and dispatch alone can outlive this epoch.
+    pub const fn sequence(self) -> u64 { self.sequence }
     pub const fn dispatch(self) -> LaneDispatchIdentity {
         self.dispatch
     }

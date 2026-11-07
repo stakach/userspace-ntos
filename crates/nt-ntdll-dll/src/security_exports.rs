@@ -782,7 +782,7 @@ pub unsafe extern "system" fn rtl_sid_equal_level(
 /// `RtlLengthRequiredSid(ULONG SubAuthorityCount) -> ULONG` = `8 + 4*count`. Ported from `sid.c:54`.
 #[export_name = "RtlLengthRequiredSid"]
 pub extern "system" fn rtl_length_required_sid(sub_authority_count: u32) -> u32 {
-    8 + 4 * sub_authority_count
+    nt_security::raw_rtl::required_sid_length(sub_authority_count)
 }
 
 /// `RtlInitializeSid(PSID, PSID_IDENTIFIER_AUTHORITY, UCHAR SubAuthorityCount) -> NTSTATUS`.
@@ -800,12 +800,13 @@ pub unsafe extern "system" fn rtl_initialize_sid(
     if sid.is_null() || identifier_authority.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    // SAFETY: sid is writable per the contract; identifier_authority is a 6-byte authority.
-    unsafe {
-        let p = sid as *mut u8;
-        *p = SID_REVISION;
-        *p.add(1) = sub_authority_count;
-        core::ptr::copy_nonoverlapping(identifier_authority as *const u8, p.add(2), 6);
+    // SAFETY: both pointers satisfy the native contract above.
+    let sid_header = unsafe { core::slice::from_raw_parts_mut(sid as *mut u8, 8) };
+    let authority = unsafe { &*(identifier_authority as *const [u8; 6]) };
+    if nt_security::raw_rtl::initialize_sid_header(sid_header, authority, sub_authority_count)
+        .is_err()
+    {
+        return STATUS_INVALID_PARAMETER;
     }
     STATUS_SUCCESS
 }
@@ -834,8 +835,11 @@ pub unsafe extern "system" fn rtl_sub_authority_sid(sid: *mut c_void, index: u32
     if sid.is_null() {
         return core::ptr::null_mut();
     }
-    // SAFETY: SubAuthority[i] is at offset 8 + 4*i (may be unaligned; a raw ptr is fine).
-    unsafe { (sid as *mut u8).add(8 + 4 * index as usize) as *mut u32 }
+    let Some(offset) = nt_security::raw_rtl::sub_authority_offset(index) else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: a valid SID contains the requested sub-authority; the result may be unaligned.
+    unsafe { (sid as *mut u8).add(offset) as *mut u32 }
 }
 
 /// `RtlSubAuthorityCountSid(PSID) -> PUCHAR` — &SID->SubAuthorityCount (@1). Ported from `sid.c:104`.
@@ -2136,31 +2140,18 @@ pub unsafe extern "system" fn rtl_set_sacl_security_descriptor(
     sacl: *mut c_void,
     defaulted: u8,
 ) -> NtStatus {
-    if sd.is_null() {
-        return STATUS_INVALID_PARAMETER;
+    if sd.is_null() { return STATUS_INVALID_PARAMETER; }
+    // SAFETY: caller supplies the complete writable x64 absolute descriptor.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(sd as *mut u8, 0x28) };
+    match nt_security::raw_rtl::set_absolute_sacl(
+        bytes,
+        sacl_present != 0,
+        sacl as u64,
+        defaulted != 0,
+    ) {
+        Ok(()) => STATUS_SUCCESS,
+        Err(status) => status,
     }
-    // SAFETY: sd a valid writable SD; Sacl ptr @0x18 (absolute layout).
-    unsafe {
-        let p = sd as *mut u8;
-        if *p != SECURITY_DESCRIPTOR_REVISION {
-            return STATUS_UNKNOWN_REVISION;
-        }
-        if sd_control(p) & SE_SELF_RELATIVE != 0 {
-            return STATUS_INVALID_SECURITY_DESCR;
-        }
-        let ctrl = p.add(0x02) as *mut u16;
-        if sacl_present == 0 {
-            *ctrl &= !SE_SACL_PRESENT;
-            return STATUS_SUCCESS;
-        }
-        *(p.add(0x18) as *mut *mut c_void) = sacl;
-        *ctrl |= SE_SACL_PRESENT;
-        *ctrl &= !SE_SACL_DEFAULTED;
-        if defaulted != 0 {
-            *ctrl |= SE_SACL_DEFAULTED;
-        }
-    }
-    STATUS_SUCCESS
 }
 
 /// `RtlGetSecurityDescriptorRMControl(PSD, PUCHAR RMControl) -> BOOLEAN`. Ported from `sd.c:500`.

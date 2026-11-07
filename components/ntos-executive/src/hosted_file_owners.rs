@@ -84,12 +84,199 @@ struct Row {
     output_capture: ExternalFileIrpOutputCapture,
     retry_after: u64,
     work_ready: bool,
+    /// Observation only; the canonical IRP and Flight still govern every native effect.
+    phase_pump_ticks: u64,
+    phase_bank_ticks: u64,
+    phase_major: u8,
 }
 
 static mut ROWS: Vec<Row> = Vec::new();
 static mut NEXT_ID: u64 = 1;
 static mut NEXT_DRAIN_ID: u64 = 1;
 static RETRY_READY: AtomicU64 = AtomicU64::new(0);
+
+struct FileRpcTotals {
+    calls: AtomicU64,
+    prepare: AtomicU64,
+    pump: AtomicU64,
+    invoke_other: AtomicU64,
+    terminal: AtomicU64,
+    bank: AtomicU64,
+    total: AtomicU64,
+}
+
+impl FileRpcTotals {
+    const fn new() -> Self {
+        Self { calls: AtomicU64::new(0), prepare: AtomicU64::new(0),
+            pump: AtomicU64::new(0), invoke_other: AtomicU64::new(0),
+            terminal: AtomicU64::new(0), bank: AtomicU64::new(0), total: AtomicU64::new(0) }
+    }
+
+    fn add(&self, phase: nt_hosted_runtime::HostedFileRpcDurations) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.prepare.fetch_add(phase.prepare, Ordering::Relaxed);
+        self.pump.fetch_add(phase.pump, Ordering::Relaxed);
+        self.invoke_other.fetch_add(phase.invoke_other, Ordering::Relaxed);
+        self.terminal.fetch_add(phase.terminal, Ordering::Relaxed);
+        self.bank.fetch_add(phase.bank, Ordering::Relaxed);
+        self.total.fetch_add(phase.total, Ordering::Relaxed);
+    }
+}
+
+static FILE_RPC_TOTALS: [FileRpcTotals; 2] = [FileRpcTotals::new(), FileRpcTotals::new()];
+static FILE_RPC_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+// Mounted FAT uses INTERNAL_DEVICE_CONTROL, which does not enter the File READ/WRITE phase
+// census. Keep these three spans exclusive and record early preparation refusals as well.
+struct ScsiRpcTotals {
+    calls: AtomicU64,
+    uninvoked: AtomicU64,
+    prepare_ticks: AtomicU64,
+    invoke_ticks: AtomicU64,
+    finish_ticks: AtomicU64,
+}
+
+static SCSI_RPC_TOTALS: ScsiRpcTotals = ScsiRpcTotals {
+    calls: AtomicU64::new(0), uninvoked: AtomicU64::new(0),
+    prepare_ticks: AtomicU64::new(0), invoke_ticks: AtomicU64::new(0),
+    finish_ticks: AtomicU64::new(0),
+};
+
+struct ScsiRpcPhaseGuard {
+    started: Option<u64>,
+    invoked: Option<u64>,
+    returned: Option<u64>,
+}
+
+impl ScsiRpcPhaseGuard {
+    fn new(major: u8, policy: ExternalFileIrpDispatchPolicy) -> Self {
+        Self {
+            started: (major == major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                && policy == ExternalFileIrpDispatchPolicy::ScsiAtDevice)
+                .then(crate::disk_census_ticks),
+            invoked: None,
+            returned: None,
+        }
+    }
+}
+
+impl Drop for ScsiRpcPhaseGuard {
+    fn drop(&mut self) {
+        let Some(started) = self.started else { return; };
+        SCSI_RPC_TOTALS.calls.fetch_add(1, Ordering::Relaxed);
+        let Some(invoked) = self.invoked else {
+            SCSI_RPC_TOTALS.uninvoked.fetch_add(1, Ordering::Relaxed);
+            SCSI_RPC_TOTALS.prepare_ticks.fetch_add(
+                crate::disk_census_ticks().wrapping_sub(started), Ordering::Relaxed);
+            return;
+        };
+        SCSI_RPC_TOTALS.prepare_ticks.fetch_add(
+            invoked.wrapping_sub(started), Ordering::Relaxed);
+        let Some(returned) = self.returned else { return; };
+        SCSI_RPC_TOTALS.invoke_ticks.fetch_add(
+            returned.wrapping_sub(invoked), Ordering::Relaxed);
+        SCSI_RPC_TOTALS.finish_ticks.fetch_add(
+            crate::disk_census_ticks().wrapping_sub(returned), Ordering::Relaxed);
+    }
+}
+
+struct FileRpcPhaseGuard {
+    entered: u64,
+    identity: Option<nt_hosted_runtime::HostedFileRpcIdentity>,
+    invoked: u64,
+    returned: u64,
+    pump_ticks: u64,
+    bank_ticks: u64,
+}
+
+impl FileRpcPhaseGuard {
+    fn new(major: u8) -> Self {
+        Self { entered: if matches!(major, major::IRP_MJ_READ | major::IRP_MJ_WRITE) {
+            crate::disk_census_ticks()
+        } else { 0 }, identity: None, invoked: 0, returned: 0,
+            pump_ticks: 0, bank_ticks: 0 }
+    }
+}
+
+impl Drop for FileRpcPhaseGuard {
+    fn drop(&mut self) {
+        let Some(identity) = self.identity else { return; };
+        if self.invoked == 0 || self.returned == 0 { return; }
+        let marks = nt_hosted_runtime::HostedFileRpcMarks {
+            entered: self.entered, invoked: self.invoked, returned: self.returned,
+            terminal: crate::disk_census_ticks(), pump_ticks: self.pump_ticks,
+            bank_ticks: self.bank_ticks,
+        };
+        let mut diagnostic = nt_hosted_runtime::HostedFileRpcDiagnostic::new();
+        if let Some(phase) = diagnostic.record(identity, identity, marks) {
+            let slot = if identity.major == major::IRP_MJ_READ { 0 } else { 1 };
+            FILE_RPC_TOTALS[slot].add(phase);
+        } else {
+            FILE_RPC_REJECTED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Match only the executing retained File IRP; a numeric ID without its live owner is ignored.
+pub(super) fn record_dispatch_pump(
+    irp_id: IrpId, major: u8, pump_ticks: u64, bank_ticks: u64,
+) {
+    if !matches!(major, major::IRP_MJ_READ | major::IRP_MJ_WRITE) { return; }
+    let Some(id) = find(irp_id) else { return; };
+    let owner = row(id);
+    if owner.flight == Flight::Dispatch && owner.irp_id == Some(irp_id)
+        && owner.phase_major == major
+    {
+        owner.phase_pump_ticks = owner.phase_pump_ticks.saturating_add(pump_ticks);
+        owner.phase_bank_ticks = owner.phase_bank_ticks.saturating_add(bank_ticks);
+    }
+}
+
+/// Observation only: the physical dispatch must still own this File READ/WRITE IRP.
+pub(super) fn file_read_write_dispatch_for_diagnostic(irp_id: IrpId) -> bool {
+    let Some(id) = find(irp_id) else { return false; };
+    let owner = row(id);
+    owner.flight == Flight::Dispatch
+        && owner.irp_id == Some(irp_id)
+        && matches!(owner.phase_major, major::IRP_MJ_READ | major::IRP_MJ_WRITE)
+}
+
+pub(super) fn print_rpc_phase() {
+    let scsi_calls = SCSI_RPC_TOTALS.calls.load(Ordering::Relaxed);
+    if scsi_calls != 0 {
+        print_str(b"[scsi-rpc-phase] calls/uninvoked/prepare/invoke/finish_Mtick=");
+        print_u64(scsi_calls);
+        print_str(b"/");
+        print_u64(SCSI_RPC_TOTALS.uninvoked.load(Ordering::Relaxed));
+        for ticks in [&SCSI_RPC_TOTALS.prepare_ticks, &SCSI_RPC_TOTALS.invoke_ticks,
+            &SCSI_RPC_TOTALS.finish_ticks] {
+            print_str(b"/");
+            print_u64(ticks.load(Ordering::Relaxed) / 1_000_000);
+        }
+        print_str(b"\n");
+    }
+    for (index, label) in [b"read".as_slice(), b"write".as_slice()].iter().enumerate() {
+        let total = &FILE_RPC_TOTALS[index];
+        let calls = total.calls.load(Ordering::Relaxed);
+        if calls == 0 { continue; }
+        print_str(b"[file-rpc-phase] ");
+        print_str(label);
+        print_str(b" calls/prepare/pump/invoke-other/terminal/bank/total_Mtick=");
+        print_u64(calls);
+        for field in [&total.prepare, &total.pump, &total.invoke_other,
+            &total.terminal, &total.bank, &total.total] {
+            print_str(b"/");
+            print_u64(field.load(Ordering::Relaxed) / 1_000_000);
+        }
+        print_str(b"\n");
+    }
+    let rejected = FILE_RPC_REJECTED.load(Ordering::Relaxed);
+    if rejected != 0 {
+        print_str(b"[file-rpc-phase] rejected=");
+        print_u64(rejected);
+        print_str(b"\n");
+    }
+}
 
 /// Current retained owners, not cumulative outcomes or proof of provider readiness.
 #[derive(Clone, Copy, Default)]
@@ -193,6 +380,17 @@ pub(super) unsafe fn active_port_connect_control(storage: usize, irp: IrpId, ope
         && owner.authorities.iter().all(|authority| authority.live())
 }
 
+/// Read-only trace discriminator for the exact retained CONNECT dispatch owner.
+pub(super) fn port_connect_dispatch_for_trace(irp: IrpId, device: nt_io_manager::DeviceId) -> bool {
+    let Some(id) = find(irp) else { return false; };
+    let owner = row(id);
+    owner.flight == Flight::Dispatch
+        && owner.irp_id == Some(irp)
+        && owner.primary_device == Some(device)
+        && owner.port_connect_control_storage.is_some()
+        && owner.authorities.iter().all(|authority| authority.live())
+}
+
 fn release_projection_owners(id: u64) -> Result<(), nt_status::NtStatus> {
     for owner in &mut row(id).projection_owners {
         if owner.is_held() {
@@ -265,6 +463,9 @@ fn reserve(
         output_capture,
         retry_after: 0,
         work_ready: false,
+        phase_pump_ticks: 0,
+        phase_bank_ticks: 0,
+        phase_major: 0,
     });
     Ok(id)
 }
@@ -338,6 +539,7 @@ fn capture_route(id: u64, prepared: &PreparedExternalFileIrp) -> Result<(), nt_s
             dependent,
             physical,
             provider_route.is_some(),
+            prepared.irp_id(),
         )?;
         if !registrations.contains(&registration) {
             registrations.push(registration);
@@ -369,6 +571,7 @@ fn capture_projection_registration(
     dependent: Authority,
     physical: Authority,
     provider_hosted: bool,
+    exact_irp: IrpId,
 ) -> Result<nt_io_manager::HostedDevicePointerRegistration, nt_status::NtStatus> {
     if dependent.driver_id != driver.raw()
         || io_manager_mut()
@@ -388,12 +591,21 @@ fn capture_projection_registration(
         binding.device_object
     } else {
         if provider_hosted {
-            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            // A retained BusRelations query may authorize its exact child PDO before the
+            // accepted-provider catalog is committed. The pending query checks its parent,
+            // provider domain, physical pointer registration, and current invalidation owner;
+            // the allocation check below still pins that same provider object.
+            unsafe { hosted_provider_child_registration(device, physical.domain,
+                Some(exact_irp)) }
+                .filter(|registration| registration.device_id() == device)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+                .address()
+        } else {
+            // Direct hosted devices use the canonical domain/address publication, not a guessed PDO.
+            io_manager_mut()
+                .hosted_device_address_by_identity(physical.domain, device)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
         }
-        // Direct hosted devices use the canonical domain/address publication, not a guessed PDO.
-        io_manager_mut()
-            .hosted_device_address_by_identity(physical.domain, device)
-            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
     };
     let registration = io_manager_mut()
         .hosted_device_pointer_registration(physical.domain, address)
@@ -455,6 +667,7 @@ fn discard(id: u64, prepared: PreparedExternalFileIrp) -> Result<(), nt_status::
 
 pub(super) enum DispatchResult {
     Returned {
+        irp_id: IrpId,
         status: nt_status::NtStatus,
         information: u64,
         file_context: Option<u64>,
@@ -489,6 +702,18 @@ pub(super) fn dispatch_port_connect(
     )
 }
 
+fn trace_port_connect_dispatch(stage: u64, irp: IrpId, device: nt_io_manager::DeviceId) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 16 { return; }
+    print_str(b"[port-connect-dispatch] stage/irp/device=");
+    print_u64(stage);
+    print_str(b"/");
+    print_hex_u64(irp.raw());
+    print_str(b"/");
+    print_hex_u64(device.raw());
+    print_str(b"\n");
+}
+
 fn dispatch_with_port_connect(
     caller: nt_process::native_handle::NativeHandleCaller,
     request: ExternalFileIrpRequest,
@@ -497,6 +722,9 @@ fn dispatch_with_port_connect(
     policy: ExternalFileIrpDispatchPolicy,
     port_connect_device: Option<nt_io_manager::DeviceId>,
 ) -> Result<DispatchResult, nt_status::NtStatus> {
+    let major = request.major;
+    let mut phase = FileRpcPhaseGuard::new(major);
+    let mut scsi_phase = ScsiRpcPhaseGuard::new(major, policy);
     let _durable = crate::allocator::enter_durable();
     let copy = |source: &[u8]| -> Result<Vec<u8>, nt_status::NtStatus> {
         let mut bytes = Vec::new();
@@ -508,6 +736,9 @@ fn dispatch_with_port_connect(
     };
     let buffers = ExternalFileIrpBuffers::new(copy(input)?, copy(initial_output)?);
     let id = reserve(caller, policy.output_capture())?;
+    if let Some(device) = port_connect_device {
+        trace_port_connect_dispatch(0, IrpId(0), device);
+    }
     let preparation = policy.prepare(io_manager_mut(), request, buffers);
     let prepared = match preparation {
         Ok(prepared) => prepared,
@@ -516,11 +747,21 @@ fn dispatch_with_port_connect(
             return Err(status);
         }
     };
+    if let Err(status) = unsafe { bind_pending_scsi_proof_irp(policy, &prepared) } {
+        discard(id, prepared)?;
+        return Err(status);
+    }
     if let Err(status) = capture_route(id, &prepared) {
         discard(id, prepared)?;
         return Err(status);
     }
+    // This exact retained stack is the last Executive-side point before a disk provider may
+    // enter. A possible installed-media mutation permanently disables metadata read-through.
+    unsafe { mounted_native_block::before_external_scsi_effect(&prepared, &row(id).stack) };
     let irp_id = prepared.irp_id();
+    if let Some(device) = port_connect_device {
+        trace_port_connect_dispatch(1, irp_id, device);
+    }
     if let Some(device) = port_connect_device {
         if let Err(status) = mark_port_connect_control(irp_id, device) {
             discard(id, prepared)?;
@@ -536,8 +777,28 @@ fn dispatch_with_port_connect(
         }
     };
     row(id).flight = Flight::Dispatch;
+    if phase.entered != 0 {
+        row(id).phase_major = major;
+        phase.identity = Some(nt_hosted_runtime::HostedFileRpcIdentity {
+            irp_id: irp_id.raw(), major,
+        });
+    }
+    if let Some(device) = port_connect_device {
+        trace_port_connect_dispatch(2, irp_id, device);
+    }
+    if phase.entered != 0 { phase.invoked = crate::disk_census_ticks(); }
+    if scsi_phase.started.is_some() { scsi_phase.invoked = Some(crate::disk_census_ticks()); }
     let returned =
         hosted_file_dispatch::invoke(invocation, row(id).caller, policy.output_capture());
+    if scsi_phase.started.is_some() { scsi_phase.returned = Some(crate::disk_census_ticks()); }
+    if phase.entered != 0 {
+        phase.returned = crate::disk_census_ticks();
+        phase.pump_ticks = row(id).phase_pump_ticks;
+        phase.bank_ticks = row(id).phase_bank_ticks;
+    }
+    if let Some(device) = port_connect_device {
+        trace_port_connect_dispatch(3, irp_id, device);
+    }
     let result = match io_manager_mut().finish_external_file_irp(returned) {
         Ok(result) => result,
         Err(rejection) => {
@@ -565,6 +826,7 @@ fn dispatch_with_port_connect(
                         Err(_) => return Ok(DispatchResult::Outstanding { irp_id }),
                     };
                     Ok(DispatchResult::Returned {
+                        irp_id,
                         status: completion.status,
                         information: completion.information,
                         file_context: completion.file_context,

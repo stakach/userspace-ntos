@@ -55,6 +55,9 @@ impl<'ast> Visit<'ast> for Extent {
     }
     fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
         self.captured |= path.path.is_ident("offset");
+        // The full-capture path first converts metadata.end_of_file into file_size,
+        // then compares the accumulated offset with that checked value.
+        self.eof |= path.path.is_ident("file_size");
         syn::visit::visit_expr_path(self, path);
     }
     fn visit_expr_binary(&mut self, binary: &'ast syn::ExprBinary) {
@@ -64,9 +67,46 @@ impl<'ast> Visit<'ast> for Extent {
 }
 
 #[test]
-fn routed_image_publishes_only_after_exact_eof_not_first_parseable_header() {
+fn routed_image_publishes_only_after_exact_eof_or_immutable_extent() {
+    struct FileSizeFromEof(bool);
+    impl<'ast> Visit<'ast> for FileSizeFromEof {
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            struct Binding(bool);
+            impl<'a> Visit<'a> for Binding {
+                fn visit_pat_ident(&mut self, pat: &'a syn::PatIdent) {
+                    self.0 |= pat.ident == "file_size";
+                    syn::visit::visit_pat_ident(self, pat);
+                }
+            }
+            let mut binding = Binding(false);
+            binding.visit_pat(&local.pat);
+            if binding.0 {
+                let mut extent = Extent::default();
+                if let Some(init) = &local.init { extent.visit_expr(&init.expr); }
+                self.0 |= extent.eof;
+            }
+            syn::visit::visit_local(self, local);
+        }
+    }
+    let mut file_size = FileSizeFromEof(false);
+    file_size.visit_arm(&phase("HeaderDispatch"));
+    assert!(file_size.0, "the exact full-capture comparison must use metadata EOF");
     struct Publication { exact: bool, guarded: bool, count: usize }
     impl<'ast> Visit<'ast> for Publication {
+        fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+            let previous = self.exact;
+            if let Some((_, guard)) = &arm.guard {
+                let mut extent = Extent::default();
+                extent.visit_expr(guard);
+                let mut calls = Calls::default();
+                calls.visit_expr(&arm.body);
+                self.exact |= extent.eof && extent.equality
+                    && calls.0.iter().any(|name| name == "capture_image_layout")
+                    && calls.0.iter().any(|name| name == "read_retained");
+            }
+            self.visit_expr(&arm.body);
+            self.exact = previous;
+        }
         fn visit_expr_if(&mut self, branch: &'ast syn::ExprIf) {
             let mut extent = Extent::default();
             extent.visit_expr(&branch.cond);
@@ -88,15 +128,59 @@ fn routed_image_publishes_only_after_exact_eof_not_first_parseable_header() {
     let mut publication = Publication { exact: false, guarded: true, count: 0 };
     publication.visit_arm(&phase("HeaderDispatch"));
     assert!(publication.count != 0 && publication.guarded,
-        "parseable headers are not a process image snapshot: retained capture must reach exact canonical EOF before Publish");
+        "publication requires exact canonical EOF or an identity-bound immutable extent with a retained layout read");
     let mut calls = Calls::default();
     calls.visit_arm(&phase("HeaderDispatch"));
+    assert!(calls.0.iter().any(|name| name == "immutable_file_extent"),
+        "the layout-only path needs an attested immutable File extent");
     let reserve = calls.0.iter().position(|name| name == "reserve_file_snapshot_capacity")
         .expect("fallible capture storage admission remains required");
     let read = calls.0.iter().position(|name| name == "build_and_dispatch_external_to_device")
         .expect("exact retained File read");
     assert!(reserve < read, "storage admission precedes any provider read effect");
     assert!(calls.0.iter().any(|name| name == "build_and_dispatch_external_to_device"), "capture reads the exact retained File through its driver");
+}
+
+#[test]
+fn sparse_capture_publishes_only_after_layout_completion() {
+    let file = source("section_metadata_work.rs");
+    let finish = file.items.iter().find_map(|item| match item {
+        Item::Fn(value) if value.sig.ident == "finish_sparse_header_window" => Some(value),
+        _ => None,
+    }).expect("retained sparse layout completion");
+    struct Publication { complete: bool, count: usize }
+    impl<'ast> Visit<'ast> for Publication {
+        fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+            let previous = self.complete;
+            struct SomeLayout(bool);
+            impl<'a> Visit<'a> for SomeLayout {
+                fn visit_pat_tuple_struct(&mut self, pat: &'a syn::PatTupleStruct) {
+                    self.0 |= pat.path.is_ident("Some");
+                    syn::visit::visit_pat_tuple_struct(self, pat);
+                }
+            }
+            let mut layout = SomeLayout(false);
+            layout.visit_pat(&arm.pat);
+            self.complete |= layout.0;
+            self.visit_expr(&arm.body);
+            self.complete = previous;
+        }
+        fn visit_expr_assign(&mut self, assign: &'ast syn::ExprAssign) {
+            if matches!(&*assign.right, Expr::Path(path)
+                if path.path.segments.last().unwrap().ident == "Publish") {
+                assert!(self.complete, "sparse publication requires a complete PE layout");
+                self.count += 1;
+            }
+            syn::visit::visit_expr_assign(self, assign);
+        }
+    }
+    let mut publication = Publication { complete: false, count: 0 };
+    publication.visit_block(&finish.block);
+    assert_eq!(publication.count, 1);
+    let mut calls = Calls::default();
+    calls.visit_block(&finish.block);
+    assert!(calls.0.iter().any(|name| name == "complete_window"),
+        "the exact read window must complete before sparse layout publication");
 }
 
 #[test]

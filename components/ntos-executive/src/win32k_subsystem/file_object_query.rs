@@ -50,8 +50,8 @@ unsafe fn format_name(
     }
 }
 
-/// `ZwQueryObject` for File ObjectNameInformation. Other object classes are not yet backed by
-/// this provider adapter and fail explicitly rather than returning an invented object record.
+/// `ZwQueryObject` routes handle flags and File ObjectNameInformation to their exact owners.
+/// Other classes fail explicitly rather than returning an invented object record.
 pub(super) extern "win64" fn query_object(
     handle: u64,
     class: u32,
@@ -59,6 +59,9 @@ pub(super) extern "win64" fn query_object(
     length: u32,
     return_length: u64,
 ) -> i32 {
+    if class == 4 {
+        return object_handle_flags::query_information(handle, information, length, return_length);
+    }
     if class != 1 {
         return STATUS_NOT_SUPPORTED_LOCAL;
     }

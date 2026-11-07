@@ -135,7 +135,6 @@ pub enum BusQueryIdCopyError {
     IdTooLong,
     InvalidCharacter,
     InvalidSeparators,
-    DuplicateId,
     InsufficientResources,
 }
 
@@ -231,12 +230,6 @@ fn copy_query_id_multi_sz(bytes: &[u8]) -> Result<BusQueryIdValue, BusQueryIdCop
             return Ok(BusQueryIdValue::Multi(values));
         }
         let (value, _separators, next) = copy_query_id_entry(bytes, cursor)?;
-        if values
-            .iter()
-            .any(|existing: &String| existing.eq_ignore_ascii_case(&value))
-        {
-            return Err(BusQueryIdCopyError::DuplicateId);
-        }
         values
             .try_reserve(1)
             .map_err(|_| BusQueryIdCopyError::InsufficientResources)?;
@@ -534,11 +527,29 @@ impl DeviceRelationInvalidationQueue {
     }
 
     pub fn claim_front(&mut self) -> Option<DeviceRelationInvalidation> {
+        self.claim_pending_where(|_| true)
+    }
+
+    /// Claim the oldest pending action for one exact started parent and relation type.
+    /// Other pending rows retain their sequence and ownership while a physical dependency runs.
+    pub fn claim_parent(
+        &mut self,
+        parent: crate::DevnodeIdentity,
+        relation_type: u32,
+    ) -> Option<DeviceRelationInvalidation> {
+        self.claim_pending_where(|row| row.parent == parent && row.relation_type == relation_type)
+    }
+
+    fn claim_pending_where(
+        &mut self,
+        predicate: impl Fn(&DeviceRelationInvalidationRow) -> bool,
+    ) -> Option<DeviceRelationInvalidation> {
         let (index, sequence) = self
             .rows
             .iter()
             .enumerate()
             .filter_map(|(index, row)| match row.state {
+                _ if !predicate(row) => None,
                 DeviceRelationInvalidationState::Pending { sequence } => Some((index, sequence)),
                 DeviceRelationInvalidationState::Claimed { .. } => None,
             })
@@ -1532,7 +1543,27 @@ mod tests {
     }
 
     #[test]
-    fn native_query_id_rejects_malformed_and_duplicate_values() {
+    fn native_query_id_preserves_duplicate_hardware_ids_in_bus_order() {
+        let duplicate: Vec<u16> = r"ACPI\VEN_ACPI&DEV_0007"
+            .encode_utf16()
+            .chain([0])
+            .chain(r"acpi\ven_acpi&dev_0007".encode_utf16())
+            .chain([0, 0])
+            .collect();
+        assert_eq!(
+            copy_bus_query_id_x64(
+                &native_query_id(&duplicate, 0),
+                nt_pnp_abi::BUS_QUERY_HARDWARE_IDS
+            ),
+            Ok(BusQueryIdValue::Multi(vec![
+                r"ACPI\VEN_ACPI&DEV_0007".into(),
+                r"acpi\ven_acpi&dev_0007".into(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn native_query_id_rejects_malformed_values() {
         assert_eq!(
             copy_bus_query_id_x64(&native_query_id(&[0], 0), nt_pnp_abi::BUS_QUERY_DEVICE_ID),
             Err(BusQueryIdCopyError::EmptyId)
@@ -1550,19 +1581,6 @@ mod tests {
                 nt_pnp_abi::BUS_QUERY_INSTANCE_ID
             ),
             Err(BusQueryIdCopyError::InvalidCharacter)
-        );
-        let duplicate: Vec<u16> = r"PCI\VEN_1234"
-            .encode_utf16()
-            .chain([0])
-            .chain(r"pci\ven_1234".encode_utf16())
-            .chain([0, 0])
-            .collect();
-        assert_eq!(
-            copy_bus_query_id_x64(
-                &native_query_id(&duplicate, 0),
-                nt_pnp_abi::BUS_QUERY_HARDWARE_IDS
-            ),
-            Err(BusQueryIdCopyError::DuplicateId)
         );
         let unterminated = native_query_id(&query_units(r"PCI\VEN_1234")[..12], 0);
         assert_eq!(
@@ -2141,6 +2159,24 @@ mod tests {
         assert_eq!(queue.claim_front(), Some(third));
         queue.complete(first).unwrap();
         queue.complete(third).unwrap();
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn exact_parent_claim_can_advance_storage_without_consuming_earlier_relations() {
+        let mut queue = DeviceRelationInvalidationQueue::new();
+        let earlier = queue.enqueue(parent(20), 0).unwrap().invalidation;
+        let storage = queue.enqueue(parent(10), 0).unwrap().invalidation;
+        let other_type = queue.enqueue(parent(10), 1).unwrap().invalidation;
+        assert_eq!(queue.claim_parent(parent(10), 0), Some(storage));
+        assert_eq!(queue.claim_parent(parent(10), 0), None);
+        assert!(queue.contains(earlier));
+        assert!(queue.contains(other_type));
+        queue.complete(storage).unwrap();
+        assert_eq!(queue.claim_front(), Some(earlier));
+        queue.complete(earlier).unwrap();
+        assert_eq!(queue.claim_front(), Some(other_type));
+        queue.complete(other_type).unwrap();
         assert!(queue.is_empty());
     }
 

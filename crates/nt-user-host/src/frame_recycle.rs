@@ -1,5 +1,14 @@
 //! Checked publication of a retained, unmapped 4 KiB frame into the reusable frame pool.
+use crate::slot_recycle::recycled_slot_bit;
 use nt_address_space::{FramePoolError, RecycledFramePool, PAGE_SIZE};
+
+#[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
+std::thread_local! {
+    static FREE_SLOT_INSPECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameRecycleError {
@@ -17,6 +26,8 @@ pub enum FrameRecycleError {
 /// Read-only allocator view, never an independent frame owner. Exact frame provenance, removal
 /// of external aliases, and successful unmap/revoke come from the caller's retained cleanup phases.
 /// In particular, 4096-byte accounting alone does not distinguish a frame from a page table.
+/// `free_membership` must be kept equal to the active prefix of `free_slots` by the serialized
+/// root-slot allocator; it is an index of publication, not a substitute for frame provenance.
 /// No allocator mutation/reentrancy may occur between validation, publication and acknowledgement.
 pub struct FrameRecycleState<'a> {
     pub start: u64,
@@ -25,6 +36,7 @@ pub struct FrameRecycleState<'a> {
     pub pinned: &'a [u64],
     pub retype_bytes: &'a [u32],
     pub free_slots: &'a [u64],
+    pub free_membership: &'a [u64],
     pub free_slot_count: u64,
     pub live_bytes: u64,
 }
@@ -64,11 +76,15 @@ impl FrameRecycleState<'_> {
         }
         let count = usize::try_from(self.free_slot_count)
             .map_err(|_| FrameRecycleError::CorruptSlotCount)?;
-        let published = self
-            .free_slots
+        self.free_slots
             .get(..count)
             .ok_or(FrameRecycleError::CorruptSlotCount)?;
-        if published.contains(&frame) {
+        let (word, bit) = recycled_slot_bit(self.start, self.end, self.free_membership, frame)
+            .map_err(|_| FrameRecycleError::UntrackedSlot)?;
+        #[cfg(test)]
+        FREE_SLOT_INSPECTIONS.with(|inspections| inspections.set(inspections.get() + 1));
+        let duplicate = self.free_membership[word] & bit != 0;
+        if duplicate {
             return Err(FrameRecycleError::EmptySlotPublished);
         }
         Ok(())

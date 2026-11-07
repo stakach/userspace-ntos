@@ -57,13 +57,28 @@ fn sid_prefix(bytes: &[u8]) -> Result<&[u8], u32> {
 
 fn parse_ace(bytes: &[u8], revision: u8) -> Result<ParsedAce<'_>, u32> {
     let kind = bytes[0];
-    if kind > 8 {
+    if kind > 8 && kind != 0x11 {
         return Err(STATUS_NOT_SUPPORTED);
     }
     if bytes.len() < 8 || bytes.len() & 3 != 0 {
         return Err(STATUS_INVALID_ACL);
     }
     let mask = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    if kind == 0x11 {
+        // SYSTEM_MANDATORY_LABEL_ACE uses an integrity SID and policy bits,
+        // not an object access mask. Neither creator substitution nor generic
+        // rights mapping may change its bytes.
+        if bytes.len() != 20 || mask & !7 != 0
+            || bytes[8..16] != [1, 1, 0, 0, 0, 0, 0, 16]
+        {
+            return Err(STATUS_INVALID_ACL);
+        }
+        return Ok(ParsedAce {
+            bytes, mask, prefix: &bytes[..8], server_sid: None,
+            sid: &bytes[8..20], trailer: &[], object_guid: None,
+            inherited_guid: None,
+        });
+    }
     let mut prefix_len = 8;
     let mut object_guid = None;
     let mut inherited_guid = None;
@@ -194,6 +209,14 @@ fn effective_ace(
         }
     }
     let kind = ace.bytes[0];
+    if kind == 0x11 {
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(ace.bytes.len()).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        copy.extend_from_slice(ace.bytes);
+        copy[1] = (ace.bytes[1] & !INHERIT_FLAGS)
+            | if options.auto_inherit { INHERITED } else { 0 };
+        return Ok(Some((copy, false)));
+    }
     let audit = matches!(kind, 2 | 3 | 7 | 8);
     let mask = options.mapping.map(ace.mask)
         & (options.mapping.generic_all | if audit { ACCESS_SYSTEM_SECURITY } else { 0 })
@@ -351,7 +374,7 @@ pub(crate) fn copy_explicit_native_acl(source: &NativeAcl, options: &NativeAclIn
         if !map_creators {
             let start = output.len();
             append_ace(&mut output, &mut count, ace.bytes, ace.bytes[1] & !reset)?;
-            if ace.bytes[1] & IO == 0 {
+            if ace.bytes[1] & IO == 0 && ace.bytes[0] != 0x11 {
                 let audit = matches!(ace.bytes[0], 2 | 3 | 7 | 8);
                 let mask = options.mapping.map(ace.mask)
                     & (options.mapping.generic_all | if audit { ACCESS_SYSTEM_SECURITY } else { 0 });
