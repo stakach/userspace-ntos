@@ -538,8 +538,34 @@ fn directory_body_retirement_converges_at_service_cleanup_after_exact_owner_fenc
             _ => None,
         })
         .unwrap();
+    let mut finalizer_calls = Calls::default();
+    finalizer_calls.visit_block(&finalize.block);
+    let redrive = finalizer_calls
+        .0
+        .iter()
+        .position(|name| name == "redrive_service_loop_global_work")
+        .expect("outer finalization must enter retained-owner redrive");
+    let checkpoint = finalizer_calls
+        .0
+        .iter()
+        .position(|name| name == "checkpoint_service_loop_volume")
+        .expect("outer finalization must reach the volume checkpoint");
+    assert!(
+        redrive < checkpoint,
+        "global owner redrive must precede the volume checkpoint"
+    );
+    let global_work = service
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == "redrive_service_loop_global_work" => {
+                Some(function)
+            }
+            _ => None,
+        })
+        .unwrap();
     let mut calls = Calls::default();
-    calls.visit_block(&finalize.block);
+    calls.visit_block(&global_work.block);
     let sweep = calls
         .0
         .iter()

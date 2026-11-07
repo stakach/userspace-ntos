@@ -202,8 +202,12 @@ fn retained_file_lifecycle_refusal_has_a_root_timer_and_outer_pump_demand() {
     let service = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
     let finalize = service.split("fn finalize_service_loop_work(").nth(1).unwrap()
         .split("fn ").next().unwrap();
-    assert!(finalize.contains("FILE_IO_DELIVERY_RETRY_PENDING.swap(false")
-        && finalize.contains("driver_launch::pump_hosted_file_lifecycle()"),
+    let global_work = service.split("fn redrive_service_loop_global_work(").nth(1).unwrap()
+        .split("fn ").next().unwrap();
+    assert!(finalize.contains("redrive_service_loop_global_work(nt_handler)")
+        && finalize.contains("checkpoint_service_loop_volume(nt_handler)")
+        && global_work.contains("FILE_IO_DELIVERY_RETRY_PENDING.swap(false")
+        && global_work.contains("driver_launch::pump_hosted_file_lifecycle()"),
         "the timer demand must reach the lifecycle owner at the outer finalization boundary");
     let resume = include_str!("../../../components/ntos-executive/src/component_resume.rs");
     let reconcile = resume.split("fn reconcile_runtime(").nth(1).unwrap()

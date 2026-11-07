@@ -124,8 +124,22 @@ fn all_native_connect_terminal_producers_share_reserved_fifo_storage() {
             (function.sig.ident == "finalize_service_loop_work").then_some(function)
         })
         .unwrap();
+    let mut finalizer_calls = Calls::default();
+    finalizer_calls.visit_block(&finalizer.block);
+    assert!(finalizer_calls.0.iter().any(|name| name == "redrive_service_loop_global_work"),
+        "outer finalization must enter the global retained-owner redrive");
+    let global_work = service
+        .items
+        .iter()
+        .find_map(|item| {
+            let syn::Item::Fn(function) = item else {
+                return None;
+            };
+            (function.sig.ident == "redrive_service_loop_global_work").then_some(function)
+        })
+        .unwrap();
     let mut maintenance = Calls::default();
-    maintenance.visit_block(&finalizer.block);
+    maintenance.visit_block(&global_work.block);
     let candidates = maintenance
         .0
         .iter()
