@@ -13,7 +13,7 @@ pub enum ContinueReparkPhase {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContinueReparkOutcome {
-    Acknowledged,
+    Acknowledged { next_reply: u64 },
     /// The native adapter certifies that the Call was not entered.
     NoEffects,
     /// The Call may have entered; neither effect may be replayed.
@@ -36,6 +36,7 @@ pub struct SharedContinueRepark {
     reply: u64,
     token: u64,
     phase: ContinueReparkPhase,
+    repark_reply: Option<u64>,
 }
 
 impl SharedContinueRepark {
@@ -50,7 +51,8 @@ impl SharedContinueRepark {
         {
             return Err(LaneError::InvalidIdentity);
         }
-        Ok(Self { route, dispatch, reply, token, phase: ContinueReparkPhase::Ready })
+        Ok(Self { route, dispatch, reply, token, phase: ContinueReparkPhase::Ready,
+            repark_reply: None })
     }
 
     pub const fn phase(&self) -> ContinueReparkPhase { self.phase }
@@ -94,8 +96,16 @@ impl SharedContinueRepark {
         if self.phase != ContinueReparkPhase::ContinueEntered {
             return Err(LaneError::InvalidPhase);
         }
+        if matches!(outcome, ContinueReparkOutcome::Acknowledged { next_reply }
+            if next_reply == 0 || next_reply == self.reply) {
+            return Err(LaneError::InvalidIdentity);
+        }
+        self.repark_reply = match outcome {
+            ContinueReparkOutcome::Acknowledged { next_reply } => Some(next_reply),
+            ContinueReparkOutcome::NoEffects | ContinueReparkOutcome::Indeterminate => None,
+        };
         self.phase = match outcome {
-            ContinueReparkOutcome::Acknowledged => ContinueReparkPhase::ContinueAcknowledged,
+            ContinueReparkOutcome::Acknowledged { .. } => ContinueReparkPhase::ContinueAcknowledged,
             ContinueReparkOutcome::NoEffects => ContinueReparkPhase::Ready,
             ContinueReparkOutcome::Indeterminate => ContinueReparkPhase::Indeterminate,
         };
@@ -116,7 +126,10 @@ impl SharedContinueRepark {
         if self.phase != ContinueReparkPhase::ContinueAcknowledged {
             return Err(LaneError::InvalidPhase);
         }
-        lanes.repark_external(dispatch.lane(), reply, token)?;
+        // The acknowledged continue adopted a new physical Call. Its Reply is
+        // distinct from the consumed Reply that authorized the continue.
+        let repark_reply = self.repark_reply.ok_or(LaneError::InvalidPhase)?;
+        lanes.repark_external(dispatch.lane(), repark_reply, token)?;
         self.phase = ContinueReparkPhase::Done;
         Ok(())
     }

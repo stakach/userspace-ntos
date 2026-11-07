@@ -365,16 +365,17 @@ pub(super) unsafe fn drain_shared_returns() -> u64 {
                     let continued = spawn_hosts::shared_ingress::owner::runtime::continue_after_subcall(
                         route, dispatch, reply, win32k_subsystem::W32_DISPATCH_LABEL,
                     );
-                    let outcome = if continued.is_ok() {
-                        ContinueReparkOutcome::Acknowledged
-                    } else {
-                        native_error = continued.err();
-                        ContinueReparkOutcome::Indeterminate
+                    let outcome = match continued {
+                        Ok(next_reply) => ContinueReparkOutcome::Acknowledged { next_reply },
+                        Err(error) => {
+                            native_error = Some(error);
+                            ContinueReparkOutcome::Indeterminate
+                        }
                     };
                     let recorded = (&mut *core::ptr::addr_of_mut!(PENDING_SHARED_RETURNS))[index]
                         .as_mut().and_then(|pending| pending.continue_repark.as_mut())
                         .is_some_and(|owner| owner.record_continue(attempt, outcome).is_ok());
-                    if !recorded || outcome == ContinueReparkOutcome::Indeterminate {
+                    if !recorded || matches!(outcome, ContinueReparkOutcome::Indeterminate) {
                         trace_failed_shared_return(route, dispatch, reply, action,
                             continue_phase, native_error.as_ref(), None, false);
                         report_retained_failure(dispatch.lane(), b"shared-continue",

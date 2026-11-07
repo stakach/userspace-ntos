@@ -1266,12 +1266,13 @@ pub(crate) unsafe fn continue_after_subcall(
     dispatch: LaneDispatchIdentity,
     reply: u64,
     label: u64,
-) -> Result<(), Error> {
+) -> Result<u64, Error> {
     if self::dispatch(route)? != dispatch || current_reply(route)? != reply {
         return Err(Error::Admission);
     }
     let incoming = completion_reply(route, label)?;
-    adopt(route, incoming)
+    adopt(route, incoming)?;
+    Ok(incoming)
 }
 
 pub(crate) unsafe fn complete_protocol(
