@@ -848,7 +848,7 @@ pub(crate) unsafe fn service_wait_continuation_is_current(
     yielded: ServiceWaitYield,
 ) -> bool {
     if channel.caps.kind != crate::spawn_hosts::ReqKind::Syscall
-        || !channel.caps.hosted_receive_yield
+        || !(channel.caps.hosted_receive_yield || channel.caps.nested_service_wait_yield)
         || channel.kernel_caller.is_some()
         || yielded.route.identity().lane != yielded.dispatch.lane()
         || runtime::channel_route(channel).ok().flatten() != Some(yielded.route)
@@ -1257,6 +1257,7 @@ pub(crate) unsafe fn resume_suspended_receive_component(
 pub(crate) unsafe fn resume_suspended_service_wait_component(
     pending: PendingServiceWaitDispatch,
 ) -> ServiceWaitPumpCompletion {
+    let nested = pending.snapshot.callback_token.is_some();
     let selected = select_win32k_client_window(pending.snapshot.client);
     let restored = selected
         && restore_shared_resume_snapshot(pending.snapshot.shared_resume, pending.snapshot.dispatch, pending.snapshot.client);
@@ -1307,7 +1308,7 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
         return ServiceWaitPumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
             yielded,
             snapshot: SuspendedPumpSnapshot {
-                pump, channel, callback_token: None,
+                pump, channel, callback_token: pending.snapshot.callback_token,
                 shared_resume: capture_shared_resume_snapshot(pending.snapshot.dispatch, pending.snapshot.client),
                 ..pending.snapshot
             },
@@ -1320,7 +1321,7 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
                 pump, channel,
                 dispatch: pending.snapshot.dispatch,
                 client: pending.snapshot.client,
-                callback_token: None,
+                callback_token: pending.snapshot.callback_token,
                 shared_resume: yielded.shared_resume,
                 arg_snapshot_len: pending.snapshot.arg_snapshot_len,
                 arg_snapshot: pending.snapshot.arg_snapshot,
@@ -1342,7 +1343,7 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
             request: core::ptr::read_volatile(core::ptr::addr_of!((*page).request)),
             dispatch: pending.snapshot.dispatch,
             client: pending.snapshot.client,
-            nested_user_callback: false,
+            nested_user_callback: nested,
             arg_snapshot_len: pending.snapshot.arg_snapshot_len,
             arg_snapshot: pending.snapshot.arg_snapshot,
         })
@@ -1350,7 +1351,7 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
         capture_lpc_wait_repark(
             pending.snapshot.dispatch,
             pending.snapshot.client,
-            false,
+            nested,
             pending.snapshot.arg_snapshot_len,
             pending.snapshot.arg_snapshot,
         )
@@ -1364,7 +1365,7 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
         complete_resumed_dispatch(
             pending.snapshot.dispatch,
             pending.snapshot.client,
-            false,
+            nested,
             pending.snapshot.arg_snapshot_len,
             pending.snapshot.arg_snapshot,
             pump,

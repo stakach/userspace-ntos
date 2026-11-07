@@ -68,3 +68,33 @@ fn nested_service_wait_keeps_callback_and_root_reply_owned() {
     assert!(handoff.contains("restore_pending_service_wait_dispatch(pending)"));
     assert!(handoff.contains("RetainedWaitAdmission::Indeterminate => retained_failure = true"));
 }
+
+#[test]
+fn resumed_nested_wait_keeps_its_exact_callback_origin() {
+    let authority = RECEIVE
+        .split("pub(crate) unsafe fn service_wait_continuation_is_current(")
+        .nth(1)
+        .unwrap()
+        .split("pub(crate) unsafe fn ")
+        .next()
+        .unwrap();
+    assert!(authority.contains("channel.caps.nested_service_wait_yield"));
+    assert!(authority.contains("runtime::service_wait_resume_completed_exact("));
+    let resume = RECEIVE
+        .split("pub(crate) unsafe fn resume_suspended_service_wait_component(")
+        .nth(1)
+        .unwrap()
+        .split("pub(crate) unsafe fn ")
+        .next()
+        .unwrap();
+    assert!(resume.contains("let nested = pending.snapshot.callback_token.is_some()"));
+    assert!(resume.contains("callback_token: pending.snapshot.callback_token"));
+    assert!(resume.contains("nested_user_callback: nested"));
+    for call in ["capture_lpc_wait_repark(", "complete_resumed_dispatch("] {
+        let argument = resume.split(call).nth(1).unwrap();
+        assert!(
+            argument.contains("pending.snapshot.client,\n            nested,"),
+            "{call} must preserve the nested callback origin"
+        );
+    }
+}
