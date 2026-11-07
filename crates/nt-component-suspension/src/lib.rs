@@ -24,8 +24,9 @@ mod external_selection;
 mod pending_lane_selection;
 pub use pending_lane_selection::{next_ready_pending_lane, PendingLaneReadiness};
 pub use external_selection::{
-    oldest_external_ingress, oldest_receive_external_ingress,
-    oldest_receive_external_ingress_matching, ExternalReceiveState,
+    oldest_external_ingress, oldest_external_ingress_during_receive,
+    oldest_receive_external_ingress, oldest_receive_external_ingress_matching,
+    ExternalReceiveState, HeldReceiveChild,
 };
 mod ingress;
 mod inline_irq_checkpoint;

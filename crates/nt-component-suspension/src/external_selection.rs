@@ -1,6 +1,44 @@
 //! Memory-only selection among independently authenticated, eligible hosted Calls.
 
-use crate::ExternalIngress;
+use crate::{ExternalAdmissionKey, ExternalIngress};
+
+/// Selection policy while one exact external Call owns a parked parent receive.
+/// The native owner retains the Call, Reply, and parent; this value confers no authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeldReceiveChild {
+    admission: ExternalAdmissionKey,
+    delivered: bool,
+}
+
+impl HeldReceiveChild {
+    pub const fn new(admission: ExternalAdmissionKey) -> Self {
+        Self { admission, delivered: false }
+    }
+
+    pub fn delivered(self, admission: ExternalAdmissionKey) -> Result<Self, ()> {
+        if admission != self.admission || self.delivered {
+            return Err(());
+        }
+        Ok(Self { delivered: true, ..self })
+    }
+}
+
+/// Until the selected child is delivered, no unrelated Call may overtake it. Once delivered,
+/// other unsealed Calls may run while its Reply and parent remain retained for settlement.
+pub fn oldest_external_ingress_during_receive<'a, M: 'a>(
+    calls: impl IntoIterator<Item = (usize, &'a ExternalIngress<M>, ExternalReceiveState)>,
+    child: HeldReceiveChild,
+) -> Option<usize> {
+    oldest_external_ingress(calls.into_iter().filter_map(|(index, call, state)| {
+        let eligible = if child.delivered {
+            !state.settlement_prepared
+        } else {
+            state.settlement_prepared && call.admission_key() == child.admission
+        };
+        (!state.delivered && !state.released && call.can_park() && eligible)
+            .then_some((index, call))
+    }))
+}
 
 /// Return an eligible queue index without mutating a Call, checking native capabilities, or
 /// transferring its retained Reply. The caller supplies only eligible entries. The admission

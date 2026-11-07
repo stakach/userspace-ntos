@@ -253,3 +253,45 @@ fn receive_fault_selection_skips_sealed_and_stop_entered_older_faults() {
     assert!(receiver.excludes_reply(stopped.reply()));
     assert!(receiver.excludes_reply(eligible.reply()));
 }
+
+#[test]
+fn held_receive_delivers_exact_child_then_allows_unrelated_call() {
+    let lanes = Lanes::new(1, 2);
+    let mut receiver = IngressReceiver::new(20, 30, 3).unwrap();
+    let older = retain(&mut receiver, &lanes, ComponentIngress::new(20, 31).unwrap(), 7);
+    let child = retain(&mut receiver, &lanes, ComponentIngress::new(20, 32).unwrap(), 8);
+    let younger = retain(&mut receiver, &lanes, ComponentIngress::new(20, 33).unwrap(), 9);
+    let gate = HeldReceiveChild::new(child.admission_key());
+    let child_key = child.admission_key();
+
+    assert_eq!(
+        oldest_external_ingress_during_receive(
+            [
+                (0, &older, ExternalReceiveState::default()),
+                (1, &child, ExternalReceiveState { settlement_prepared: true, ..Default::default() }),
+                (2, &younger, ExternalReceiveState::default()),
+            ],
+            gate,
+        ),
+        Some(1),
+        "the selected child must be delivered before an older unrelated Call"
+    );
+    assert!(gate.delivered(older.admission_key()).is_err());
+
+    let delivered = gate.delivered(child_key).unwrap();
+    assert_eq!(
+        oldest_external_ingress_during_receive(
+            [
+                (0, &older, ExternalReceiveState::default()),
+                (1, &child, ExternalReceiveState { delivered: true, settlement_prepared: true, ..Default::default() }),
+                (2, &younger, ExternalReceiveState::default()),
+            ],
+            delivered,
+        ),
+        Some(0),
+        "a parked child cannot monopolize root ingress while its Reply is retained"
+    );
+    assert!(receiver.excludes_reply(child.reply()));
+    assert!(child.can_park());
+    assert!(delivered.delivered(child_key).is_err(), "one child delivery only");
+}
