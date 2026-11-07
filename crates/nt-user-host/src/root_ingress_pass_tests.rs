@@ -81,8 +81,12 @@ impl Child {
 }
 
 fn new_parent() -> NestedExecutionScope {
+    new_parent_at(50)
+}
+
+fn new_parent_at(endpoint: u64) -> NestedExecutionScope {
     let mut lanes = ComponentSuspensionLanes::<(), (), ()>::new(1, 1);
-    let mut peers = PeerRegistry::new(50, 1);
+    let mut peers = PeerRegistry::new(endpoint, 1);
     let (_, mut registration) = lanes
         .allocate_shared_staged(
             &mut peers,
@@ -90,7 +94,7 @@ fn new_parent() -> NestedExecutionScope {
             1,
             LaneBinding {
                 executor_id: 100,
-                receive_endpoint: 50,
+                receive_endpoint: endpoint,
                 reply_object: 200,
             },
         )
@@ -99,7 +103,7 @@ fn new_parent() -> NestedExecutionScope {
         .publish_lane(&mut registration, 17, 1, &lanes)
         .unwrap();
     let dispatch = lanes.begin_bootstrap_dispatch(route, &peers, free).unwrap();
-    let mut receiver = IngressReceiver::<u64>::new(50, 60, 1).unwrap();
+    let mut receiver = IngressReceiver::<u64>::new(endpoint, 60, 1).unwrap();
     receiver
         .suspend_for_nested_execution(route, dispatch, &mut lanes, &peers, free)
         .unwrap()
@@ -138,12 +142,40 @@ fn selected_import_entry_seals_one_attempt_until_positive_delivery() {
     let mut foreign_binding = binding();
     foreign_binding.tid += 1;
     assert_eq!(pass.begin_import(foreign_binding, call).unwrap_err(), PassError::WrongChild);
-    pass.begin_import(binding(), call).unwrap();
+    let _attempt = pass.begin_import(binding(), call).unwrap();
     assert_eq!(pass.begin_import(binding(), call).unwrap_err(), PassError::Consumed);
     assert_eq!(pass.begin_restore(&parent).unwrap_err(), PassError::Unsettled);
     // A false/uncertain native callback leaves this phase sealed. Only a positive observation
     // of that same attempt may make the child an ordinary delivered root event.
     unsafe { pass.deliver(binding(), call) }.unwrap();
+    assert_eq!(pass.begin_import(binding(), call).unwrap_err(), PassError::Consumed);
+}
+
+#[test]
+fn exact_no_effect_import_refusal_reopens_only_its_own_attempt() {
+    let child = Child::new(114);
+    let foreign = Child::new(115);
+    let parent = new_parent();
+    let call = child.call.as_ref().unwrap();
+    let mut pass = RootIngressPass::prepare(call, binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    let attempt = pass.begin_import(binding(), call).unwrap();
+    let refusal = unsafe { attempt.after_no_effect_native_refusal() };
+    let (error, refusal) = pass.abort_import_before_effect(
+        binding(), foreign.call.as_ref().unwrap(), parent.identity(), refusal,
+    ).unwrap_err();
+    assert_eq!(error, PassError::WrongChild);
+    assert_eq!(pass.begin_import(binding(), call).unwrap_err(), PassError::Consumed);
+    let foreign_parent = new_parent_at(51);
+    let (error, refusal) = pass.abort_import_before_effect(
+        binding(), call, foreign_parent.identity(), refusal,
+    ).unwrap_err();
+    assert_eq!(error, PassError::WrongParent);
+    pass.abort_import_before_effect(binding(), call, parent.identity(), refusal).unwrap();
+    let later = pass.begin_import(binding(), call).unwrap();
+    assert_eq!(pass.begin_import(binding(), call).unwrap_err(), PassError::Consumed);
+    // A later uncertain native import has no certified refusal and cannot be replayed.
+    drop(later);
     assert_eq!(pass.begin_import(binding(), call).unwrap_err(), PassError::Consumed);
 }
 
@@ -160,7 +192,7 @@ fn acknowledged_child_checkpoints_exact_parent_once() {
             .unwrap_err(),
         PassError::WrongChild,
     );
-    pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    let _attempt = pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
     unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }
         .unwrap();
     assert_eq!(
@@ -205,7 +237,7 @@ fn parked_child_restores_parent_but_keeps_its_reply_for_later_settlement() {
     let key = child.call.as_ref().unwrap().admission_key();
     let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
     pass.bind_parent(&parent, parent.dispatch()).unwrap();
-    pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    let _attempt = pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
     unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }
         .unwrap();
     let attempt = pass.begin_park(binding(), child.call.as_ref().unwrap())
@@ -249,7 +281,7 @@ fn unknown_park_refuses_until_exact_later_settlement() {
     let foreign_parent = new_parent();
     let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
     pass.bind_parent(&parent, parent.dispatch()).unwrap();
-    pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    let _attempt = pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
     unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }
         .unwrap();
     let _attempt = pass.begin_park(binding(), child.call.as_ref().unwrap())
@@ -287,7 +319,7 @@ fn park_entry_returns_a_move_only_attempt_instead_of_numeric_reply_authority() {
     let parent = new_parent();
     let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
     pass.bind_parent(&parent, parent.dispatch()).unwrap();
-    pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    let _attempt = pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
     unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }.unwrap();
     let attempt = pass.begin_park(binding(), child.call.as_ref().unwrap()).unwrap();
     assert!(core::any::type_name_of_val(&attempt).contains("RootIngressParkAttempt"));
@@ -300,7 +332,7 @@ fn exact_pre_effect_refusal_reopens_only_its_own_park_attempt() {
     let parent = new_parent();
     let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
     pass.bind_parent(&parent, parent.dispatch()).unwrap();
-    pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    let _attempt = pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
     unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }.unwrap();
     let attempt = pass.begin_park(binding(), child.call.as_ref().unwrap()).unwrap();
     let no_effect = unsafe { attempt.after_no_effect_native_refusal() };
@@ -323,7 +355,7 @@ fn acknowledged_child_after_positive_park_upgrades_parent_checkpoint() {
     let parent = new_parent();
     let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
     pass.bind_parent(&parent, parent.dispatch()).unwrap();
-    pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    let _attempt = pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
     unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }.unwrap();
     let attempt = pass.begin_park(binding(), child.call.as_ref().unwrap()).unwrap();
     unsafe {
@@ -344,7 +376,7 @@ fn settled_child_during_parent_restore_keeps_park_checkpoint_and_later_receipt_s
     let parent = new_parent();
     let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
     pass.bind_parent(&parent, parent.dispatch()).unwrap();
-    pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    let _attempt = pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
     unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }.unwrap();
     let attempt = pass.begin_park(binding(), child.call.as_ref().unwrap()).unwrap();
     unsafe {
@@ -370,7 +402,7 @@ fn foreign_parent_refusal_cannot_reopen_a_held_child() {
     let foreign_parent = new_parent();
     let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
     pass.bind_parent(&parent, parent.dispatch()).unwrap();
-    pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    let _attempt = pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
     unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }.unwrap();
     let attempt = pass.begin_park(binding(), child.call.as_ref().unwrap()).unwrap();
     let foreign = RootReplyParkNoEffect(RootIngressParkAttempt {

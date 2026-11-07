@@ -54,7 +54,31 @@ pub struct RootIngressPass<R> {
     phase: Phase,
     settlement: Option<ExternalSettlement>,
     parked: bool,
+    import_attempt_generation: u64,
     park_attempt_generation: u64,
+}
+
+/// One selected Reply import attempt. An uncertain effect leaves the pass sealed.
+#[must_use = "retain until the native import has a positive or certified no-effect outcome"]
+#[derive(Debug)]
+pub struct RootIngressImportAttempt<R> {
+    child: ThreadBinding<R>,
+    admission: ExternalAdmissionKey,
+    parent: NestedExecutionIdentity,
+    generation: u64,
+}
+
+#[must_use = "consume only to abort the matching pre-effect import attempt"]
+#[derive(Debug)]
+pub struct RootReplyImportNoEffect<R>(RootIngressImportAttempt<R>);
+
+impl<R> RootIngressImportAttempt<R> {
+    /// # Safety
+    /// Native must have received an exact no-effect import refusal, including completed
+    /// rollback of any inserted Reply-pool cap, before issuing this receipt.
+    pub unsafe fn after_no_effect_native_refusal(self) -> RootReplyImportNoEffect<R> {
+        RootReplyImportNoEffect(self)
+    }
 }
 
 /// The one physical park attempt authorized by this pass. Its generation prevents an older
@@ -147,6 +171,7 @@ impl<R: Copy + Eq> RootIngressPass<R> {
             phase: Phase::Prepared,
             settlement: None,
             parked: false,
+            import_attempt_generation: 0,
             park_attempt_generation: 0,
         })
     }
@@ -208,12 +233,12 @@ impl<R: Copy + Eq> RootIngressPass<R> {
     }
 
     /// Record one import attempt before the native Reply-pool effect. If the effect is refused
-    /// or uncertain, the pass remains sealed and the exact Call/Reply must stay retained.
+    /// or uncertain, the pass remains sealed unless an exact no-effect receipt reopens it.
     pub fn begin_import<M>(
         &mut self,
         child: ThreadBinding<R>,
         call: &ExternalIngress<M>,
-    ) -> Result<(), PassError> {
+    ) -> Result<RootIngressImportAttempt<R>, PassError> {
         self.exact_child(child, call)?;
         if matches!(self.phase, Phase::ImportEnteredUnknown | Phase::Delivered) {
             return Err(PassError::Consumed);
@@ -221,7 +246,41 @@ impl<R: Copy + Eq> RootIngressPass<R> {
         if self.phase != Phase::Bound || !call.can_park() {
             return Err(PassError::InvalidPhase);
         }
+        let generation = self.import_attempt_generation.checked_add(1)
+            .ok_or(PassError::Consumed)?;
+        let parent = self.parent.ok_or(PassError::Unbound)?;
+        self.import_attempt_generation = generation;
         self.phase = Phase::ImportEnteredUnknown;
+        Ok(RootIngressImportAttempt {
+            child, admission: self.admission, parent, generation,
+        })
+    }
+
+    /// Reopen only the exact selected attempt whose native import was proved to have no effect.
+    /// Wrong identity returns the receipt so the native owner cannot accidentally lose it.
+    pub fn abort_import_before_effect<M>(
+        &mut self,
+        child: ThreadBinding<R>,
+        call: &ExternalIngress<M>,
+        parent: NestedExecutionIdentity,
+        no_effect: RootReplyImportNoEffect<R>,
+    ) -> Result<(), (PassError, RootReplyImportNoEffect<R>)> {
+        let attempt = &no_effect.0;
+        let error = if child != self.child || call.admission_key() != self.admission
+            || attempt.child != child || attempt.admission != self.admission
+        {
+            Some(PassError::WrongChild)
+        } else if self.parent != Some(parent) || attempt.parent != parent {
+            Some(PassError::WrongParent)
+        } else if self.phase != Phase::ImportEnteredUnknown
+            || self.import_attempt_generation != attempt.generation || !call.can_park()
+        {
+            Some(PassError::InvalidPhase)
+        } else {
+            None
+        };
+        if let Some(error) = error { return Err((error, no_effect)); }
+        self.phase = Phase::Bound;
         Ok(())
     }
 

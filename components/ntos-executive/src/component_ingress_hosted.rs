@@ -21,6 +21,9 @@ struct ReceiveSettlement {
 /// This owner has no delivery or restore authority until the event checkpoint is installed.
 struct RootIngressOwner {
     pass: nt_user_host::root_ingress_pass::RootIngressPass<crate::HostedThreadRole>,
+    /// A certified no-effect receipt that failed an independent exact identity check.
+    /// Retain it beside the sealed pass; it cannot authorize an implicit retry.
+    import_no_effect: Option<nt_user_host::root_ingress_pass::RootReplyImportNoEffect<crate::HostedThreadRole>>,
     parent: Option<super::nested::ParkedParentHandle>,
     /// The exact unbound physical parent, retained through pre-effect refusal and cancellation.
     undelivered_parent: Option<nt_component_suspension::NestedExecutionIdentity>,
@@ -75,6 +78,25 @@ pub(crate) struct PendingSnapshot {
     pub admission_sequence: u64,
     pub info: u64,
     pub registers: [u64; 4],
+}
+
+/// Native's observed effect of importing the selected child Reply into the root pool.
+/// Only the exact rollback path may report a no-effect refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SelectedRootImportOutcome {
+    Imported,
+    RefusedNoEffect,
+    Retained,
+}
+
+#[derive(Debug)]
+pub(crate) enum SelectedRootImportFailure {
+    RefusedNoEffect,
+    Retained(Error),
+}
+
+impl From<Error> for SelectedRootImportFailure {
+    fn from(error: Error) -> Self { Self::Retained(error) }
 }
 
 pub(super) unsafe fn oldest_pending_snapshot() -> Option<PendingSnapshot> {
@@ -280,8 +302,8 @@ pub(crate) unsafe fn take_selected_root_hosted_with(
     snapshot: PendingSnapshot,
     admission: ExternalAdmissionKey,
     parent_identity: nt_component_suspension::NestedExecutionIdentity,
-    import: impl FnOnce(u64, &ReceivedMessage) -> bool,
-) -> Result<(u64, ReceivedMessage), Error> {
+    import: impl FnOnce(u64, &ReceivedMessage) -> SelectedRootImportOutcome,
+) -> Result<(u64, ReceivedMessage), SelectedRootImportFailure> {
     let row = (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten()
         .find(|row| row.binding == snapshot.binding
             && row.call.as_ref().is_some_and(|call| {
@@ -295,6 +317,7 @@ pub(crate) unsafe fn take_selected_root_hosted_with(
     if row.delivered || row.released || row.completion.is_some()
         || row.receive_settlement.is_some() || root.restored.is_some()
         || root.undelivered_parent.is_some() || root.undelivered.is_some()
+        || root.import_no_effect.is_some()
         || row.binding.tcb != snapshot.executor
         || call.admission_key() != admission
         || call.reply() != admission.reply()
@@ -310,23 +333,97 @@ pub(crate) unsafe fn take_selected_root_hosted_with(
         || !super::nested::root_ingress_parent_is_held(parent, admission)
         || crate::service_sec_image::hosted_ingress_binding(row.binding.badge) != Some(row.binding)
     {
-        return Err(Error::Admission);
+        return Err(Error::Admission.into());
     }
     let _saved = crate::ipc_message::SavedMessageBuffer::capture();
     if crate::spawn_hosts::query_component_reply_binding(row.binding.tcb, call.reply())
         != Ok(ReplyBindingObservation::BoundToTarget)
     {
-        return Err(Error::Reply);
+        return Err(Error::Reply.into());
     }
     let message = call.message().clone();
     let reply = call.reply();
-    root.pass.begin_import(row.binding, call).map_err(|_| Error::Admission)?;
-    if !import(reply, &message) {
-        return Err(Error::Retain);
+    let attempt = root.pass.begin_import(row.binding, call).map_err(|_| Error::Admission)?;
+    match import(reply, &message) {
+        SelectedRootImportOutcome::Imported => {}
+        SelectedRootImportOutcome::Retained => return Err(Error::Retain.into()),
+        SelectedRootImportOutcome::RefusedNoEffect => {
+            let no_effect = attempt.after_no_effect_native_refusal();
+            // The native importer certified no pool/main effect. Recheck the independent
+            // Call, physical Reply and parent before consuming that one-shot receipt.
+            if row.delivered || row.released || row.completion.is_some()
+                || row.receive_settlement.is_some() || root.restored.is_some()
+                || root.undelivered.is_some() || root.undelivered_parent.is_some()
+                || row.binding != snapshot.binding || call.admission_key() != admission
+                || call.reply() != reply || root.pass.admission_key() != admission
+                || parent.identity() != parent_identity
+                || !super::nested::root_ingress_parent_is_held(parent, admission)
+                || crate::service_sec_image::hosted_ingress_binding(row.binding.badge)
+                    != Some(row.binding)
+                || crate::spawn_hosts::query_component_reply_binding(row.binding.tcb, reply)
+                    != Ok(ReplyBindingObservation::BoundToTarget)
+            {
+                root.import_no_effect = Some(no_effect);
+                return Err(Error::Retain.into());
+            }
+            if let Err((_, no_effect)) = root.pass.abort_import_before_effect(
+                row.binding, call, parent_identity, no_effect,
+            ) {
+                root.import_no_effect = Some(no_effect);
+                return Err(Error::Retain.into());
+            }
+            return Err(SelectedRootImportFailure::RefusedNoEffect);
+        }
     }
     root.pass.deliver(row.binding, call).map_err(|_| Error::Admission)?;
     row.delivered = true;
     Ok((reply, message))
+}
+
+/// Retry only the pure rollback after native already certified a no-effect import but the
+/// immediate identity check could not consume its receipt. This never enters the Reply pool.
+pub(crate) unsafe fn reconcile_root_ingress_import_no_effect(
+    snapshot: PendingSnapshot,
+    admission: ExternalAdmissionKey,
+    parent_identity: nt_component_suspension::NestedExecutionIdentity,
+) -> Result<(), Error> {
+    let row = (&mut *core::ptr::addr_of_mut!(CALLS)).iter_mut().flatten()
+        .find(|row| row.binding == snapshot.binding
+            && row.call.as_ref().is_some_and(|call| {
+                call.reply() == snapshot.reply
+                    && call.admission_sequence() == snapshot.admission_sequence
+            }))
+        .ok_or(Error::Admission)?;
+    let call = row.call.as_ref().ok_or(Error::Admission)?;
+    let root = row.root_ingress.as_mut().ok_or(Error::Admission)?;
+    let parent = root.parent.as_ref().ok_or(Error::Admission)?;
+    if row.delivered || row.released || row.completion.is_some()
+        || row.receive_settlement.is_some() || root.restored.is_some()
+        || root.undelivered.is_some() || root.undelivered_parent.is_some()
+        || call.admission_key() != admission || call.reply() != snapshot.reply
+        || call.executor() != snapshot.executor
+        || call.message().badge() != row.binding.badge
+        || call.message().info() != snapshot.info
+        || call.message().registers() != snapshot.registers
+        || !call.can_park() || root.pass.child() != row.binding
+        || root.pass.admission_key() != admission
+        || parent.identity() != parent_identity
+        || !super::nested::root_ingress_parent_is_held(parent, admission)
+        || crate::service_sec_image::hosted_ingress_binding(row.binding.badge)
+            != Some(row.binding)
+        || crate::spawn_hosts::query_component_reply_binding(row.binding.tcb, call.reply())
+            != Ok(ReplyBindingObservation::BoundToTarget)
+    {
+        return Err(Error::Admission);
+    }
+    let no_effect = root.import_no_effect.take().ok_or(Error::Admission)?;
+    if let Err((_, no_effect)) = root.pass.abort_import_before_effect(
+        row.binding, call, parent_identity, no_effect,
+    ) {
+        root.import_no_effect = Some(no_effect);
+        return Err(Error::Retain);
+    }
+    Ok(())
 }
 
 /// Seal one selected child's park attempt before the caller enters RootReplyPark::try_commit.
@@ -965,7 +1062,8 @@ pub(crate) unsafe fn prepare_root_ingress_pass(
         .map_err(|_| Error::Admission)?;
     let admission = pass.admission_key();
     row.root_ingress = Some(RootIngressOwner {
-        pass, parent: None, undelivered_parent: None, undelivered: None, restored: None,
+        pass, import_no_effect: None, parent: None, undelivered_parent: None,
+        undelivered: None, restored: None,
         unconsumed_settlement: None,
     });
     Ok(admission)

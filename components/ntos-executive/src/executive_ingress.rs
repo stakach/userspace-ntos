@@ -119,6 +119,37 @@ unsafe fn install_hosted_reply(reply: u64) -> HostedReplyImport {
     HostedReplyImport::Imported
 }
 
+/// Selected ordinary child import. The native importer alone classifies a completed rollback
+/// as no effect; CALLS independently verifies its exact Reply and held parent before reopening
+/// the pure pass. This adapter remains dormant until the outer RootIngress route is admitted.
+pub(crate) enum SelectedRootImportResult {
+    Message((u64, u64, u64, u64, u64, u64)),
+    RefusedNoEffect,
+    Retained,
+}
+
+pub(crate) unsafe fn import_selected_root_child(
+    snapshot: runtime::PendingSnapshot,
+    admission: nt_component_suspension::ExternalAdmissionKey,
+    parent: nt_component_suspension::NestedExecutionIdentity,
+) -> SelectedRootImportResult {
+    let imported = runtime::take_selected_root_hosted_with(
+        snapshot, admission, parent, |reply, _message| match install_hosted_reply(reply) {
+            HostedReplyImport::Imported => runtime::SelectedRootImportOutcome::Imported,
+            HostedReplyImport::RefusedNoEffect =>
+                runtime::SelectedRootImportOutcome::RefusedNoEffect,
+            HostedReplyImport::Retained => runtime::SelectedRootImportOutcome::Retained,
+        },
+    );
+    match imported {
+        Ok((_reply, message)) => SelectedRootImportResult::Message(materialize(message)),
+        Err(runtime::SelectedRootImportFailure::RefusedNoEffect) =>
+            SelectedRootImportResult::RefusedNoEffect,
+        Err(runtime::SelectedRootImportFailure::Retained(_)) =>
+            SelectedRootImportResult::Retained,
+    }
+}
+
 /// This runs only at a root event boundary. Nested pumps enqueue hosted Calls without touching
 /// REPLY_MAIN_SLOT, which may still be the Reply of their outer blocked syscall.
 pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
