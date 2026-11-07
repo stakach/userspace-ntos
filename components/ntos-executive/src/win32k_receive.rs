@@ -408,7 +408,7 @@ pub(crate) fn trace_receive_phase(
 pub(crate) unsafe fn prepare_service_wait_yield(
     channel: &crate::spawn_hosts::PumpChannel,
 ) -> Result<Option<ServiceWaitYield>, runtime::Error> {
-    if !channel.caps.hosted_receive_yield
+    if !(channel.caps.hosted_receive_yield || channel.caps.nested_service_wait_yield)
         || channel.kernel_caller.is_some()
         || channel.caps.kind != crate::spawn_hosts::ReqKind::Syscall
         || crate::writable_fs::registry_journal::owns_volume()

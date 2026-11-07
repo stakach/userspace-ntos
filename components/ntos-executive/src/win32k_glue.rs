@@ -35,6 +35,7 @@ pub(crate) use pending_dispatch::{
     TakenRootIngressDispatch,
     take_pending_root_ingress_dispatch, restore_pending_root_ingress_dispatch,
     PendingServiceWaitDispatch, ServiceWaitYield, take_pending_service_wait_dispatch,
+    restore_pending_service_wait_dispatch,
     PendingRootMaintenanceDispatch, RootMaintenanceYield, take_pending_root_maintenance_dispatch,
     pending_root_maintenance_dispatch_is_some,
     restore_pending_root_maintenance_dispatch,
@@ -466,6 +467,7 @@ unsafe fn win32k_lane_channel(
             provider_wait,
             kernel_irq_yield: false,
             hosted_receive_yield: false,
+            nested_service_wait_yield: false,
             wide_arg_marshal: true,
             assert_skip: true,
             sparse_vspace: true,
@@ -7544,6 +7546,8 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     }
     ch.caps.hosted_receive_yield = request_kind == win32k_subsystem::WIN32K_REQUEST_SSDT
         && !nested_user_callback && outer_callback.is_none();
+    ch.caps.nested_service_wait_yield = request_kind == win32k_subsystem::WIN32K_REQUEST_SSDT
+        && nested_user_callback && outer_callback.is_some();
     ch.initial_root_dispatch = ch.caps.hosted_receive_yield.then(|| {
         crate::spawn_hosts::InitialRootDispatchProvenance::capture(&ch)
     }).flatten();
@@ -7659,8 +7663,8 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             }));
     }
     if let Some(yielded) = pr.service_wait_yield {
-        assert!(!nested_user_callback && outer_callback.is_none(),
-            "service-wait yield owns only an initial hosted dispatch");
+        assert!(!nested_user_callback || outer_callback.is_some(),
+            "nested service-wait yield retains its exact callback token");
         assert!((*core::ptr::addr_of!(SERVICE_WAIT_PENDING_DISPATCH)).is_none());
         let (arg_snapshot_len, arg_snapshot) = capture_initial_arg_snapshot(ssn, completion_args);
         core::ptr::write(core::ptr::addr_of_mut!(SERVICE_WAIT_PENDING_DISPATCH),
@@ -7673,7 +7677,8 @@ unsafe fn win32k_dispatch_wide_observed_inner(
                     shared_resume: capture_shared_resume_snapshot(
                         UserCallbackDispatchContext { lane, dispatch_id, ssn,
                             args: completion_args, caller_sp, output_stage, paint_output }, client),
-                    client, callback_token: None, arg_snapshot_len, arg_snapshot,
+                    client, callback_token: outer_callback.map(|(_, token)| token),
+                    arg_snapshot_len, arg_snapshot,
                 },
             }));
     }
@@ -7788,6 +7793,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     }
     if nested_user_callback {
         if pr.callback_suspended || pr.provider_wait_suspended || pr.lpc_wait_suspended
+            || pr.service_wait_yield.is_some()
             || pr.nested_restore_yield.is_some() || pr.nested_restore_quarantined.is_some()
         {
             return (pr.result, false);

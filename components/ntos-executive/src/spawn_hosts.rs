@@ -148,6 +148,8 @@ pub(crate) struct HostCaps {
     pub kernel_irq_yield: bool,
     /// The initial hosted GUI dispatch permits an authenticated child-fault receive boundary.
     pub hosted_receive_yield: bool,
+    /// A nested GUI SSDT may yield only its exact parked service wait to root ingress.
+    pub nested_service_wait_yield: bool,
     /// win32k: carry wide (>4) stack args through caller RSP or explicit `SH_REQ_A4..` staging.
     // Capability-surface documentation (§2.3) — see `usermode_callback`; not read by the pump.
     #[allow(dead_code)]

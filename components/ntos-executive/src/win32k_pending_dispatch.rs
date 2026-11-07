@@ -77,6 +77,15 @@ pub(crate) unsafe fn take_pending_service_wait_dispatch() -> Option<PendingServi
     core::ptr::replace(core::ptr::addr_of_mut!(SERVICE_WAIT_PENDING_DISPATCH), None)
 }
 
+pub(crate) unsafe fn restore_pending_service_wait_dispatch(
+    pending: PendingServiceWaitDispatch,
+) -> bool {
+    let slot = &mut *core::ptr::addr_of_mut!(SERVICE_WAIT_PENDING_DISPATCH);
+    if slot.is_some() { return false; }
+    *slot = Some(pending);
+    true
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct PendingRootMaintenanceDispatch {
     pub yielded: RootMaintenanceYield,

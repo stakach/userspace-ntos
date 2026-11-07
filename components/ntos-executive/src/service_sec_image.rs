@@ -2014,15 +2014,26 @@ unsafe fn service_wait_admit_with_transfer(
 unsafe fn service_wait_admit_current(
     pending: win32k_glue::PendingServiceWaitDispatch,
     destination: HostedContinuationDestination,
-) -> bool {
-    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else { return false; };
-    if pending.snapshot.callback_token.is_some()
-        || !service_wait_admit_retained(pending, REPLY_MAIN_SLOT.load(Ordering::Relaxed), None, destination)
-    {
-        return false;
-    }
-    reply_park.commit();
-    true
+) -> RetainedWaitAdmission {
+    let root_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let reply_park = if pending.snapshot.callback_token.is_some() {
+        root_reply_park::RootReplyPark::prepare_exact_hosted(root_reply)
+    } else {
+        root_reply_park::RootReplyPark::prepare()
+    };
+    let Some(reply_park) = reply_park else { return RetainedWaitAdmission::RefusedNoEffect; };
+    let transfer = match pending.snapshot.callback_token {
+        Some(token) => NestedWaitTransfer::InCallback {
+            lane: pending.snapshot.dispatch.lane, token,
+        },
+        None => NestedWaitTransfer::None,
+    };
+    let admitted = service_wait_admit_with_transfer(
+        pending, root_reply, transfer, destination,
+    );
+    if admitted != RetainedWaitAdmission::Accepted { return admitted; }
+    if reply_park.try_commit().is_err() { RetainedWaitAdmission::Indeterminate }
+    else { RetainedWaitAdmission::Accepted }
 }
 
 unsafe fn lpc_wait_admit_retained(
@@ -2368,8 +2379,14 @@ unsafe fn admit_pending_win32k_dispatch(
         assert!(parked, "Receive retains parked parent and original client Reply");
     } else if let Some(pending) = win32k_glue::take_pending_service_wait_dispatch() {
         admitted_dispatch_id = pending.snapshot.dispatch.dispatch_id;
-        parked = service_wait_admit_current(pending, destination);
-        assert!(parked, "service wait retains exact external token and original client Reply");
+        match service_wait_admit_current(pending, destination) {
+            RetainedWaitAdmission::Accepted => parked = true,
+            RetainedWaitAdmission::RefusedNoEffect => {
+                let _ = win32k_glue::restore_pending_service_wait_dispatch(pending);
+                retained_failure = true;
+            }
+            RetainedWaitAdmission::Indeterminate => retained_failure = true,
+        }
     } else if let Some(pending) = win32k_glue::take_pending_provider_wait_dispatch() {
         admitted_dispatch_id = pending.dispatch.dispatch_id;
         parked = provider_wait_admit_current(handler, pending, None, destination);
