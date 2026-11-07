@@ -51,6 +51,19 @@ pub struct RootIngressRestorePermit<R> {
     settlement: Option<ExternalSettlement>,
 }
 
+/// Native-issued positive observation after the exact parent restoration completed. The pure
+/// contract cannot observe the physical effect; only the retained native parent owner may issue
+/// this token after `restore_or_retain` acknowledges success.
+#[must_use = "retain this receipt until the parked child's result is delivered"]
+#[derive(Debug)]
+pub struct RootIngressRestored<R> {
+    child: ThreadBinding<R>,
+    admission: ExternalAdmissionKey,
+    parent: NestedExecutionIdentity,
+    parked_child: bool,
+    settlement: Option<ExternalSettlement>,
+}
+
 impl<R: Copy + Eq> RootIngressPass<R> {
     pub fn prepare<M>(
         call: &ExternalIngress<M>,
@@ -207,6 +220,30 @@ impl<R: Copy> RootIngressRestorePermit<R> {
     }
     pub fn settlement(&self) -> Option<&ExternalSettlement> {
         self.settlement.as_ref()
+    }
+
+    /// # Safety
+    /// The native owner must first positively complete the exact physical parent restoration.
+    /// A refused or uncertain restoration keeps this permit in its retained parent row.
+    pub unsafe fn acknowledge_restore(self) -> RootIngressRestored<R> {
+        RootIngressRestored {
+            child: self.child,
+            admission: self.admission,
+            parent: self.parent,
+            parked_child: self.settlement.is_none(),
+            settlement: self.settlement,
+        }
+    }
+}
+
+impl<R: Copy> RootIngressRestored<R> {
+    pub fn child(&self) -> ThreadBinding<R> { self.child }
+    pub fn admission_key(&self) -> ExternalAdmissionKey { self.admission }
+    pub fn parent(&self) -> NestedExecutionIdentity { self.parent }
+    pub fn parked_child(&self) -> bool { self.parked_child }
+    pub fn settlement(&self) -> Option<&ExternalSettlement> { self.settlement.as_ref() }
+    pub fn take_settlement(&mut self) -> Option<ExternalSettlement> {
+        self.settlement.take()
     }
 }
 

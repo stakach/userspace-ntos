@@ -141,6 +141,12 @@ fn acknowledged_child_checkpoints_exact_parent_once() {
     assert_eq!(permit.child(), binding());
     assert_eq!(permit.admission_key(), key);
     assert!(permit.settlement().is_some());
+    // Native supplies the positive physical restore observation; the exact nonclone child
+    // settlement must survive the transfer into the resulting receipt.
+    let mut restored = unsafe { permit.acknowledge_restore() };
+    assert!(!restored.parked_child());
+    assert_eq!(restored.take_settlement().unwrap().admission_key(), key);
+    assert!(!restored.parked_child());
     assert_eq!(
         pass.begin_restore(&parent).unwrap_err(),
         PassError::Consumed
