@@ -523,7 +523,7 @@ impl IrpState {
         matches!(
             (self, next),
             (Allocated, Initialized)
-                | (Initialized, Queued | Dispatched | Cancelled | Failed)
+                | (Initialized, Queued | Dispatched | Completing | Cancelled | Failed)
                 | (Queued, Dispatched | Cancelled | Failed)
                 | (
                     Dispatched,
@@ -555,6 +555,8 @@ pub enum IrpCompletionOrigin {
     Driver,
     /// The I/O manager synthesized failure after losing the driver transport.
     TransportFault,
+    /// The detached owner proved the backend was never entered and completed with a failure.
+    NoBackendEntry,
 }
 
 /// Immutable identity of the request bytes copied into an IRP's system buffer before dispatch.

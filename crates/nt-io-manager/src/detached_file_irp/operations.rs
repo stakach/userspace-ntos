@@ -404,6 +404,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
     > {
         let result = (|| {
             self.validate_detached_completion_operation(&completion)?;
+            if completion.completion.completion_origin == crate::IrpCompletionOrigin::NoBackendEntry {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
             if max_bytes == 0 || completion.capture_complete() {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
@@ -480,6 +483,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
         let valid = self
             .validate_detached_completion_operation(&completion)
             .and_then(|_| {
+                if completion.completion.completion_origin != crate::IrpCompletionOrigin::Driver {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
                 if !completion.capture_complete()
                     && !self
                         .irp(completion.irp_id())

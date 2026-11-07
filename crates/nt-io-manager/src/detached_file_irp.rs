@@ -187,6 +187,14 @@ pub enum ExternalFileIrpOutcome {
     },
 }
 
+/// A prepared IRP is still owned by the caller and has never entered a backend.
+/// Only manager-observable failures may complete it for an already parked caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalFileIrpPreEntryFailure {
+    Cancelled,
+    ManagerRouteUnavailable,
+}
+
 #[derive(Debug)]
 pub enum ExternalFileIrpResult {
     NotEntered {
@@ -721,6 +729,64 @@ impl<P: ObjectManagerPort> IoManager<P> {
         Ok(ExternalFileIrpInvocation(prepared.0))
     }
 
+    /// Publish an exact failed completion after the caller has already transferred delivery.
+    /// The move-only preparation proves no backend dispatch or ACK obligation exists.
+    pub fn complete_prepared_external_file_irp_without_entry(
+        &mut self,
+        prepared: PreparedExternalFileIrp,
+        failure: ExternalFileIrpPreEntryFailure,
+    ) -> Result<RetainedExternalFileIrp, ExternalFileIrpRejection<PreparedExternalFileIrp>> {
+        let status = (|| {
+            self.validate_detached_owner(&prepared.0)?;
+            let record = self.irp(prepared.irp_id()).ok_or(NtStatus::INVALID_HANDLE)?;
+            if record.state != IrpState::Initialized
+                || prepared.0.projection.major != major::IRP_MJ_READ
+                || self.file_irp_projection(prepared.irp_id())? != prepared.0.projection
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            match failure {
+                ExternalFileIrpPreEntryFailure::Cancelled
+                    if record.detached_file_intent.cancel == ExternalFileIrpCancelPhase::Queued =>
+                {
+                    Ok(NtStatus::CANCELLED)
+                }
+                ExternalFileIrpPreEntryFailure::ManagerRouteUnavailable => {
+                    if self.driver(prepared.0.route.driver_id)
+                        .is_some_and(|driver| driver.flags.contains(crate::DriverFlags::FAULTED))
+                    {
+                        Ok(NtStatus::DEVICE_NOT_CONNECTED)
+                    } else {
+                        self.validate_detached_route(&prepared.0)
+                            .err()
+                            .ok_or(NtStatus::INVALID_PARAMETER)
+                    }
+                }
+                _ => Err(NtStatus::INVALID_PARAMETER),
+            }
+        })();
+        let status = match status {
+            Ok(status) => status,
+            Err(status) => return Err(ExternalFileIrpRejection { status, owner: prepared }),
+        };
+        if self.completed_irps.try_reserve(1).is_err() {
+            return Err(ExternalFileIrpRejection {
+                status: NtStatus::INSUFFICIENT_RESOURCES,
+                owner: prepared,
+            });
+        }
+        let id = prepared.irp_id();
+        let record = self.irp_mut(id).expect("validated detached IRP");
+        record.status = status;
+        record.information = 0;
+        record.completion_file_context = None;
+        record.completion_origin = Some(IrpCompletionOrigin::NoBackendEntry);
+        assert!(record.transition(IrpState::Completing));
+        assert!(record.transition(IrpState::Completed));
+        self.completed_irps.push_back(id);
+        Ok(RetainedExternalFileIrp { owner: prepared.0, indeterminate: false })
+    }
+
     pub fn discard_prepared_external_file_irp(
         &mut self,
         prepared: PreparedExternalFileIrp,
@@ -965,8 +1031,14 @@ impl<P: ObjectManagerPort> IoManager<P> {
             let completed = self
                 .completed_irp_snapshot(retained.irp_id())
                 .ok_or(NtStatus::PENDING)?;
+            if completed.completion_origin == IrpCompletionOrigin::NoBackendEntry
+                && capture != ExternalFileIrpOutputCapture::Information
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
             if !self.completed_irps.contains(&completed.id)
-                || completed.completion_origin != IrpCompletionOrigin::Driver
+                || !matches!(completed.completion_origin,
+                    IrpCompletionOrigin::Driver | IrpCompletionOrigin::NoBackendEntry)
             {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
@@ -1004,6 +1076,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
                     .as_ref()
                     != Some(&invocation.completion)
                     || !self.completed_irps.contains(&invocation.completion.id)
+                    || invocation.completion.completion_origin != IrpCompletionOrigin::Driver
                 {
                     return Err(NtStatus::INVALID_PARAMETER);
                 }
@@ -1036,6 +1109,47 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 backend_acknowledged: true,
             },
             owner.buffers,
+        ))
+    }
+
+    /// Retire a failed preparation without issuing an ACK to a backend that was never entered.
+    pub fn retire_external_file_irp_completion_without_backend(
+        &mut self,
+        completion: ExternalFileIrpCompletionInvocation,
+    ) -> Result<
+        (ExternalFileIrpTerminalReceipt, ExternalFileIrpBuffers),
+        ExternalFileIrpRejection<ExternalFileIrpCompletionInvocation>,
+    > {
+        let valid = self.validate_detached_owner(&completion.owner).and_then(|_| {
+            if self.completed_irp_snapshot(completion.completion.id).as_ref()
+                != Some(&completion.completion)
+                || !self.completed_irps.contains(&completion.completion.id)
+                || completion.completion.completion_origin != IrpCompletionOrigin::NoBackendEntry
+                || !completion.capture_complete()
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            Ok(())
+        });
+        if let Err(status) = valid {
+            return Err(ExternalFileIrpRejection { status, owner: completion });
+        }
+        let id = completion.completion.id;
+        let index = self.completed_irps.iter().position(|current| *current == id)
+            .expect("validated no-backend completion queue");
+        self.completed_irps.remove(index);
+        self.irp_mut(id).unwrap().detached_file_owner = false;
+        self.free_irp(id).expect("validated no-backend retirement");
+        if let Some(file) = completion.completion.file_id {
+            self.schedule_deferred_file_close(file);
+        }
+        Ok((
+            ExternalFileIrpTerminalReceipt {
+                manager: completion.owner.manager,
+                completion: completion.completion,
+                backend_acknowledged: false,
+            },
+            completion.owner.buffers,
         ))
     }
 
