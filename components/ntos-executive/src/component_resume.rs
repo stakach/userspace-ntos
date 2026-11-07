@@ -273,6 +273,7 @@ pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) {
     state
         .prepare(|| reconcile_runtime(handler))
         .expect("runtime timer ownership must permit blocking receive");
+    trace_pending_tick_receive();
     trace_iocp_receive_deadline();
     trace_registry_reply_receive();
     super::mounted_create_owner_trace::receive_boundary_snapshot();
@@ -280,28 +281,68 @@ pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) {
     trace_retained_receive_owners();
 }
 
+/// A nested pump may ACK a one-shot while leaving its delivery for the root
+/// queue owner. Observe that exact pending state before any blocking receive.
+fn trace_pending_tick_receive() {
+    static LAST_PRINT: AtomicU64 = AtomicU64::new(0);
+    static PRINTS: AtomicU64 = AtomicU64::new(0);
+    let ticks = DELAY_TIMER_TICKS_PENDING.load(Ordering::Acquire);
+    if ticks == 0 { return; }
+    let now = crate::nt_time_snapshot();
+    let previous = LAST_PRINT.load(Ordering::Relaxed);
+    if now.monotonic_100ns < previous.saturating_add(10_000_000) { return; }
+    LAST_PRINT.store(now.monotonic_100ns, Ordering::Relaxed);
+    let count = PRINTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if count > 128 { return; }
+    let waiters = unsafe { &*core::ptr::addr_of!(crate::IO_COMPLETION_WAITERS) };
+    print_str(b"[pending-tick-receive] n/now/ticks=");
+    print_u64(count); print_str(b"/"); print_u64(now.monotonic_100ns);
+    print_str(b"/"); print_u64(ticks);
+    print_str(b" iocp/component-deadline=");
+    match waiters.next_deadline(now) {
+        Some(deadline) => print_u64(deadline),
+        None => print_str(b"-"),
+    }
+    print_str(b"/");
+    match unsafe { retained_deadline() } {
+        Some(deadline) => print_u64(deadline),
+        None => print_str(b"-"),
+    }
+    print_str(b" timer-source/deadline/physical-wake/armed/irq=");
+    print_u64(LAST_REARM_SOURCE.load(Ordering::Relaxed)); print_str(b"/");
+    print_u64(LAST_REARM_DEADLINE.load(Ordering::Relaxed)); print_str(b"/");
+    print_u64(LAST_REARM_AUTHORITY.physical_wake_100ns()); print_str(b"/");
+    print_u64(u64::from(LAST_REARM_AUTHORITY.is_armed())); print_str(b"/");
+    print_u64(DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire));
+    print_str(b"\n");
+}
+
 /// A finite IOCP wait must retain a wake before the root blocks. Capture the
-/// selected physical shot when that wait's exact deadline changes; the regular
-/// timer trace has a small boot-wide budget that can expire before late startup.
+/// selected physical shot when that wait's exact deadline changes or after a
+/// guest second of the same wait; the regular timer trace can expire early.
 fn trace_iocp_receive_deadline() {
     static LAST_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+    static LAST_SAMPLE: AtomicU64 = AtomicU64::new(0);
     static PRINTS: AtomicU64 = AtomicU64::new(0);
     let now = crate::nt_time_snapshot();
     let waiters = unsafe { &*core::ptr::addr_of!(crate::IO_COMPLETION_WAITERS) };
     let deadline = waiters.next_deadline(now);
     let key = deadline.unwrap_or(u64::MAX);
-    if LAST_DEADLINE.swap(key, Ordering::Relaxed) == key || deadline.is_none() {
-        return;
-    }
+    let changed = LAST_DEADLINE.swap(key, Ordering::Relaxed) != key;
+    if deadline.is_none() { return; }
+    let previous = LAST_SAMPLE.load(Ordering::Relaxed);
+    if !changed && now.monotonic_100ns < previous.saturating_add(10_000_000) { return; }
+    LAST_SAMPLE.store(now.monotonic_100ns, Ordering::Relaxed);
     let count = PRINTS.fetch_add(1, Ordering::Relaxed) + 1;
     if count > 128 { return; }
     print_str(b"[iocp-receive] n/now/deadline/waiters=");
     print_u64(count); print_str(b"/"); print_u64(now.monotonic_100ns);
     print_str(b"/"); print_u64(key);
     print_str(b"/"); print_u64(waiters.len() as u64);
-    print_str(b" timer-source/deadline/armed/irq/ticks=");
+    print_str(b" timer-source/deadline/physical-wake/armed/irq/ticks=");
     print_u64(LAST_REARM_SOURCE.load(Ordering::Relaxed)); print_str(b"/");
     print_u64(LAST_REARM_DEADLINE.load(Ordering::Relaxed)); print_str(b"/");
+    print_u64(LAST_REARM_AUTHORITY.physical_wake_100ns()); print_str(b"/");
     print_u64(u64::from(LAST_REARM_AUTHORITY.is_armed())); print_str(b"/");
     print_u64(DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire)); print_str(b"/");
     print_u64(DELAY_TIMER_TICKS_PENDING.load(Ordering::Relaxed));
