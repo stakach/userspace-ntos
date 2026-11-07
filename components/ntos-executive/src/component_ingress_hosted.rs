@@ -180,6 +180,9 @@ pub(super) unsafe fn retain(
             |tcb, reply| crate::spawn_hosts::query_component_reply_binding(tcb, reply),
         )
         .map_err(|_| Error::Retain)?;
+    crate::registry_mutation_work::trace_next_hosted_call(
+        binding, call.reply(), call.message().info(), call.message().registers()[0],
+    );
     records[index] = Some(HostedCall {
         binding,
         call: Some(call),

@@ -468,6 +468,79 @@ static LAST_EXISTING_RETRY_PHASE: AtomicU64 = AtomicU64::new(0);
 static EXISTING_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_REPLY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_REPLY_RECEIVE_WORK: AtomicU64 = AtomicU64::new(0);
+type WatchedBinding = nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>;
+#[derive(Clone, Copy)]
+struct HostedReplyWatch {
+    binding: WatchedBinding,
+    work_id: u64,
+    old_reply: u64,
+    call_seen: bool,
+    syscall_seen: bool,
+}
+static mut HOSTED_REPLY_WATCHES: [Option<HostedReplyWatch>; 16] = [None; 16];
+static HOSTED_REPLY_WATCH_NEXT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_REPLY_WATCH_PRINTS: AtomicU64 = AtomicU64::new(0);
+
+fn trace_reply_watch(stage: &[u8], watch: HostedReplyWatch, reply: u64,
+    label: u64, raw_ssn: u64, normalized_ssn: u64,
+) {
+    if HOSTED_REPLY_WATCH_PRINTS.fetch_add(1, Ordering::Relaxed) >= 1024 { return; }
+    print_str(b"[registry-reply-watch] stage="); print_str(stage);
+    print_str(b" id/pi/tid/badge/tcb/old-reply/new-reply=");
+    print_u64(watch.work_id); print_str(b"/");
+    print_u64(watch.binding.pi as u64); print_str(b"/");
+    print_u64(watch.binding.tid); print_str(b"/");
+    print_u64(watch.binding.badge); print_str(b"/");
+    print_u64(watch.binding.tcb); print_str(b"/");
+    print_u64(watch.old_reply); print_str(b"/"); print_u64(reply);
+    print_str(b" label/raw-ssn/normalized-ssn=");
+    print_u64(label); print_str(b"/"); print_u64(raw_ssn);
+    print_str(b"/"); print_u64(normalized_ssn);
+    print_str(b"\n");
+}
+
+/// Publish before the native Reply effect: a promptly resumed caller may reenter immediately.
+unsafe fn watch_hosted_reply(work_id: u64, caller: &HostedCaller) {
+    let Some(binding) = crate::service_sec_image::hosted_ingress_binding(caller.badge)
+        .filter(|binding| binding.pi == caller.pi && binding.tid == caller.tid
+            && binding.badge == caller.logical.badge()
+            && binding.process == caller.logical.process()
+            && binding.tcb == caller.logical.tcb())
+        else { return; };
+    let watch = HostedReplyWatch {
+        binding, work_id, old_reply: caller.reply, call_seen: false, syscall_seen: false,
+    };
+    let watches = &mut *core::ptr::addr_of_mut!(HOSTED_REPLY_WATCHES);
+    let index = watches.iter().position(|slot| slot.is_some_and(|row| row.binding == binding))
+        .or_else(|| watches.iter().position(Option::is_none))
+        .unwrap_or_else(|| HOSTED_REPLY_WATCH_NEXT.fetch_add(1, Ordering::Relaxed) as usize % watches.len());
+    watches[index] = Some(watch);
+    trace_reply_watch(b"published", watch, 0, 0, 0, 0);
+}
+
+/// Observe the first physical Call for each exact watched binding, even during Reply send.
+pub(crate) unsafe fn trace_next_hosted_call(binding: WatchedBinding, reply: u64, info: u64, mr0: u64) {
+    for slot in (&mut *core::ptr::addr_of_mut!(HOSTED_REPLY_WATCHES)).iter_mut() {
+        let Some(watch) = slot.as_mut().filter(|watch| watch.binding == binding && !watch.call_seen)
+            else { continue; };
+        watch.call_seen = true;
+        trace_reply_watch(b"next-call", *watch, reply, info >> 12, mr0, 0);
+        break;
+    }
+}
+
+/// Observe the first normalized root syscall independently of the Call observation.
+pub(crate) unsafe fn trace_next_hosted_syscall(
+    binding: WatchedBinding, raw_ssn: u64, normalized_ssn: u64,
+) {
+    for slot in (&mut *core::ptr::addr_of_mut!(HOSTED_REPLY_WATCHES)).iter_mut() {
+        let Some(watch) = slot.as_mut().filter(|watch| watch.binding == binding && !watch.syscall_seen)
+            else { continue; };
+        watch.syscall_seen = true;
+        trace_reply_watch(b"next-syscall", *watch, 0, 2, raw_ssn, normalized_ssn);
+        break;
+    }
+}
 
 fn trace_hosted_reply(work: &Work, from: &'static str, effect_status: u32) {
     let Caller::Hosted(caller) = &work.caller else { return; };
@@ -1798,6 +1871,7 @@ unsafe fn advance(
             work.phase = Phase::ReadyReply;
         }
         Phase::ReadyReply => {
+            let work_id = work.id;
             let Caller::Hosted(caller) = &mut work.caller else { unreachable!() };
             let handler = &mut *context.as_mut().unwrap().0;
             if work.cancelled {
@@ -1805,6 +1879,7 @@ unsafe fn advance(
                 return Ok(false);
             }
             parked_reply::validate_saved(caller.reply).map_err(|status| status as i32)?;
+            watch_hosted_reply(work_id, caller);
             // An uncertain send cannot repeat cleanup or issue a second reply to this owner.
             work.phase = Phase::ReplyEntered;
             let delivered = crate::service_sec_image::complete_registry_mutation_reply(

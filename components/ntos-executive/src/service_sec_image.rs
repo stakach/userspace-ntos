@@ -13159,6 +13159,7 @@ pub(crate) unsafe fn service_sec_image(
             // Released LiberNT compatibility DLLs can issue raw syscall numbers that differ
             // from the source-built ntdll's private table. Resolve the observed external ABI
             // before admission and dispatch, after preserving the original fault/reply frame.
+            let raw_external_ssn = m0;
             m0 = nt_syscall_abi::normalize_external_raw_ssn(m0, native_call_transport);
             let current_tid = nt_handler
                 .hosted_thread_tid_for_badge(badge)
@@ -13170,6 +13171,11 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                     0
                 });
+            if current_tid == event_runtime.tid {
+                crate::registry_mutation_work::trace_next_hosted_syscall(
+                    event_runtime.binding(), raw_external_ssn, m0,
+                );
+            }
             if {
                 let waiters = &*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS);
                 waiters.has_retry_delivery_for_thread(current_tid)
