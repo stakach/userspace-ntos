@@ -15679,7 +15679,8 @@ impl ExecNtHandler {
                 self.pm.set_thread_priority(tid, priority)
             }
             3 => self.pm.set_thread_base_priority(tid, value as u32 as i32),
-            4 => self.pm.set_thread_affinity_mask(tid, value),
+            4 => thread_sched_context::validate_guest_affinity(value)
+                .and_then(|()| self.pm.set_thread_affinity_mask(tid, value)),
             9 => self.pm.set_thread_win32_start_address(tid, value),
             13 => {
                 let update = self.pm.set_thread_ideal_processor(tid, value);
@@ -16985,6 +16986,9 @@ impl ExecNtHandler {
         id: nt_process::job::JobId,
         limits: nt_process::job::JobExtendedLimits,
     ) -> Result<(), u32> {
+        if limits.basic.limit_flags & nt_process::job::JOB_OBJECT_LIMIT_AFFINITY != 0 {
+            thread_sched_context::validate_guest_affinity(limits.basic.affinity)?;
+        }
         let ps_plan = self.pm.prepare_job_extended_limits(id, limits)?;
         let previous = self.pm.job_extended_limits(id)?;
         let process_ids = self.pm.job_active_process_ids_owned(id)?;

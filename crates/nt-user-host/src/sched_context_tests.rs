@@ -1,6 +1,28 @@
 use super::*;
 use alloc::vec::Vec;
 
+#[test]
+fn hosted_affinity_requires_the_target_bound_core_in_requested_mask() {
+    assert_eq!(validate_hosted_thread_affinity(2, 4, 0), Err(STATUS_NOT_SUPPORTED));
+    assert_eq!(validate_hosted_thread_affinity(1, 4, 0), Ok(()));
+    assert_eq!(validate_hosted_thread_affinity(3, 4, 0), Ok(()));
+    assert_eq!(validate_hosted_thread_affinity(2, 4, 1), Ok(()));
+    assert_eq!(validate_hosted_thread_affinity(1, 4, 4), Err(STATUS_NOT_SUPPORTED));
+    assert_eq!(validate_hosted_thread_affinity(1u64 << 63, 64, 63), Ok(()));
+    for invalid_mask in [0, 0b1_0000] {
+        assert_eq!(
+            validate_hosted_thread_affinity(invalid_mask, 4, 0),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+    }
+    for invalid_count in [0, 65, u64::MAX] {
+        assert_eq!(
+            validate_hosted_thread_affinity(1, invalid_count, 0),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+    }
+}
+
 struct Backend {
     calls: Vec<Stage>,
     fail: Option<Stage>,

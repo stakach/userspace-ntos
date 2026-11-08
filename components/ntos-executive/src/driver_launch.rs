@@ -57275,7 +57275,7 @@ unsafe fn attach_hosted_irq_lane_sched_context(lane: &mut HostedIrqLaneRuntime) 
     // Publish ownership before either fallible operation. A failed configure or bind leaves the
     // live cap in the lane tombstone so ordered teardown can retry its deletion.
     lane.sched_context = sc;
-    let configure_error = sched_control_configure_r(sc, 10, 10);
+    let configure_error = sched_control_configure_r(SLOT_SCHED_CONTROL, sc, 10, 10);
     if configure_error != 0 {
         return Err(configure_error);
     }

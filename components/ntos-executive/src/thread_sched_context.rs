@@ -5,6 +5,18 @@ use nt_user_host::sched_context::{Error, SchedContextConstruction, SchedContextI
 // have deleted the failed target TCB. Rows are allocated before any capability is acquired.
 static mut CONSTRUCTIONS: Vec<SchedContextConstruction> = Vec::new();
 
+// All hosted guest SCs currently bind through this one boot SchedControl. The admission gate
+// uses the same core until exact TCB migration to another configured SC is implemented.
+const GUEST_SCHED_CONTROL_CORE: u8 = 0;
+
+pub(crate) fn validate_guest_affinity(requested_mask: u64) -> Result<(), u32> {
+    nt_user_host::sched_context::validate_hosted_thread_affinity(
+        requested_mask,
+        SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed),
+        GUEST_SCHED_CONTROL_CORE,
+    )
+}
+
 struct Backend;
 
 fn checked(status: u64) -> Result<(), u64> {
@@ -31,7 +43,12 @@ impl SchedContextIo for Backend {
         })
     }
     fn configure(&mut self, cap: u64, budget: u64, period: u64) -> Result<(), u64> {
-        checked(unsafe { sched_control_configure_r(cap, budget, period) })
+        checked(unsafe { sched_control_configure_r(
+            SLOT_SCHED_CONTROL + u64::from(GUEST_SCHED_CONTROL_CORE),
+            cap,
+            budget,
+            period,
+        ) })
     }
     fn bind(&mut self, cap: u64, tcb: u64) -> Result<(), u64> {
         checked(unsafe { sched_context_bind_r(cap, tcb) })

@@ -1,5 +1,31 @@
 //! Retained scheduling-context construction and retirement, independent of thread publication.
 
+use nt_process::STATUS_INVALID_PARAMETER;
+
+pub const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
+
+/// Validate a requested NT affinity against the boot topology and the target thread's actual
+/// bound SC core before a native affinity setter changes Ps policy. This does not migrate the SC.
+pub fn validate_hosted_thread_affinity(
+    requested_mask: u64,
+    active_processor_count: u64,
+    bound_core: u8,
+) -> Result<(), u32> {
+    if !(1..=64).contains(&active_processor_count) {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let active_mask = u64::MAX >> (64 - active_processor_count);
+    if requested_mask == 0 || requested_mask & !active_mask != 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if u64::from(bound_core) >= active_processor_count
+        || requested_mask & (1u64 << bound_core) == 0
+    {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     Allocate,

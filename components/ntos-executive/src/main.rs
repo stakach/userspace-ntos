@@ -14608,12 +14608,12 @@ unsafe fn untyped_retype_from_r(untyped: u64, obj: u64, bits: u32, num: u32, des
     label
 }
 
-unsafe fn sched_control_configure_r(sc: u64, budget: u64, period: u64) -> u64 {
+unsafe fn sched_control_configure_r(control_cap: u64, sc: u64, budget: u64, period: u64) -> u64 {
     let reply: u64;
     core::arch::asm!(
         "syscall",
         inout("rdx") SYS_CALL as u64 => _,
-        inout("rdi") SLOT_SCHED_CONTROL => _,
+        inout("rdi") control_cap => _,
         inout("rsi") LBL_SCHED_CONTROL_CONFIGURE << 12 => reply,
         inout("r10") sc => _,
         inout("r8") budget => _,
