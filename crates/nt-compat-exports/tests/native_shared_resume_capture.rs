@@ -40,7 +40,8 @@ fn native_capture_reads_stable_header_and_request_before_building_snapshot() {
     assert!(body.contains("request != confirm_request"));
     assert!(body.contains("confirm_published"));
     assert!(body.contains("shared_request_owner::matches(&request, owner)"));
-    assert!(body.contains("SharedPageSnapshot"));
+    assert!(body.contains("snapshot.lease_snapshot(client)"));
+    assert!(source.contains("pub(crate) fn lease_snapshot("));
     assert!(!body.contains("canonicalize("), "capture cannot invent request identity");
     assert!(!body.contains("assert!("), "uncertain capture must be fallible");
 }

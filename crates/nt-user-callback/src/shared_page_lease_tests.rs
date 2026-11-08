@@ -130,3 +130,19 @@ fn uncertain_restore_quarantines_displaced_publication_without_replay() {
     assert_eq!(leases.acknowledge_restore(outer, SharedPageRestoreEffect::Applied(snapshot(outer, 1))),
         Err(SharedPageLeaseError::Uncertain));
 }
+
+#[test]
+fn only_live_exact_terminal_child_can_finish_without_publication() {
+    let outer = identity(91, 1);
+    let inner = identity(92, 1);
+    let saved = snapshot(outer, 4655);
+    let mut leases = SharedPageLeaseStack::<2>::new();
+    assert_eq!(leases.begin(outer), Ok(()));
+    assert_eq!(leases.displace(outer, saved), Ok(()));
+    assert_eq!(leases.begin(inner), Ok(()));
+    assert_eq!(leases.finish(inner, None), Err(SharedPageLeaseError::MissingSnapshot));
+    assert_eq!(leases.finish_terminal(outer), Err(SharedPageLeaseError::NotTop));
+    assert_eq!(leases.finish_terminal(inner), Ok(()));
+    assert_eq!(leases.finish_terminal(outer), Err(SharedPageLeaseError::AlreadyDisplaced));
+    assert_eq!(leases.finish(outer, None), Ok(saved));
+}

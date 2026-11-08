@@ -34,6 +34,18 @@ struct Row {
     callback_failure: Option<u32>,
     terminal: Option<nt_component_suspension::TerminalIdentity>,
     due_at: u64,
+    shared_leases: nt_user_callback::SharedPageLeaseStack<2>,
+    displaced_shared_resume: Option<win32k_glue::SharedResumeSnapshot>,
+    quarantined_parent_pump: Option<crate::spawn_hosts::PumpResult>,
+    quarantined_child_pump: Option<QuarantinedChildPump>,
+}
+
+#[allow(dead_code)] // Retained for owner diagnostics and explicit recovery, never replayed.
+struct QuarantinedChildPump {
+    pump: crate::spawn_hosts::PumpResult,
+    channel: crate::spawn_hosts::PumpChannel,
+    dispatch: nt_user_callback::DispatchContext,
+    client: win32k_glue::Win32kClientContext,
 }
 
 static mut ROWS: Vec<Option<Row>> = Vec::new();
@@ -180,6 +192,10 @@ unsafe fn prepare_row(
         callback_terminal_payload: None, callback_failure: None,
         terminal: None,
         due_at: if root_already_parked { monotonic_time_100ns() } else { 0 },
+        shared_leases: nt_user_callback::SharedPageLeaseStack::new(),
+        displaced_shared_resume: None,
+        quarantined_parent_pump: None,
+        quarantined_child_pump: None,
     };
     Ok((row, key))
 }
@@ -271,6 +287,192 @@ pub(crate) unsafe fn pending(
     row.frame.continuation_ref(ticket.key).ok().copied()
 }
 
+/// The receiving row is the durable owner of the parent pump and both Replies. A child may
+/// overwrite its singleton shared page only after this exact row retains a stable full copy.
+/// `None` means no receiving parent; `Some(Err(()))` fences a matched parent on uncertainty.
+pub(crate) unsafe fn capture_displaced_shared_resume(
+    active: nt_user_callback::DispatchContext,
+) -> Option<Result<NestedRestoreOwnerTicket, ()>> {
+    if active.dispatch_id == 0 { return None; }
+    let rows = &mut *core::ptr::addr_of_mut!(ROWS);
+    for (index, row) in rows.iter_mut().enumerate() {
+        let Some(row) = row.as_mut() else { continue };
+        if row.frame.phase() != NestedRestorePhase::Receiving { continue }
+        let key = row.frame.key();
+        let Some(pending) = row.frame.continuation_ref(key).ok().copied() else { continue };
+        // A grandchild would overwrite the live child page. Refuse it before any write until
+        // that child has its own durable nested owner; the parent row remains retryable.
+        if row.shared_leases.len() > 1 { return Some(Err(())); }
+        if pending.snapshot.dispatch.dispatch_id != active.dispatch_id { continue }
+        if pending.snapshot.dispatch != active {
+            let _ = row.frame.quarantine_receive(key);
+            return Some(Err(()));
+        }
+        let ticket = NestedRestoreOwnerTicket { index, generation: row.generation, key };
+        let identity = nt_user_callback::SharedPageLeaseIdentity {
+            dispatch: active,
+            client: win32k_glue::shared_page_client_identity(pending.snapshot.client),
+        };
+        let Some(snapshot) = win32k_glue::try_capture_exact_shared_resume_snapshot(
+            active, pending.snapshot.client,
+        ) else {
+            let _ = row.frame.quarantine_receive(key);
+            return Some(Err(()));
+        };
+        if row.shared_leases.begin(identity).is_err()
+            || row.shared_leases.displace(identity,
+                snapshot.lease_snapshot(pending.snapshot.client)).is_err()
+        {
+            let _ = row.frame.quarantine_receive(key);
+            return Some(Err(()));
+        }
+        row.displaced_shared_resume = Some(snapshot);
+        return Some(Ok(ticket));
+    }
+    None
+}
+
+pub(crate) unsafe fn begin_displacing_child(
+    ticket: NestedRestoreOwnerTicket,
+    dispatch: nt_user_callback::DispatchContext,
+    client: win32k_glue::Win32kClientContext,
+) -> bool {
+    let Some(row) = (&mut *core::ptr::addr_of_mut!(ROWS))
+        .get_mut(ticket.index).and_then(Option::as_mut) else { return false };
+    if !exact(row, ticket) || row.frame.phase() != NestedRestorePhase::Receiving
+        || row.displaced_shared_resume.is_none()
+    { return false }
+    let identity = nt_user_callback::SharedPageLeaseIdentity {
+        dispatch, client: win32k_glue::shared_page_client_identity(client),
+    };
+    row.shared_leases.begin(identity).is_ok()
+}
+
+/// The new dispatch refused before its first shared write. The old publication remains owned
+/// by this row even if client-window re-selection or the exact restoration refuses.
+pub(crate) unsafe fn abort_displaced_shared_resume(
+    ticket: NestedRestoreOwnerTicket,
+) -> bool {
+    let Some(row) = (&mut *core::ptr::addr_of_mut!(ROWS))
+        .get_mut(ticket.index).and_then(Option::as_mut) else { return false };
+    if !exact(row, ticket) || row.frame.phase() != NestedRestorePhase::Receiving {
+        return false;
+    }
+    let Some(parent) = row.frame.continuation_ref(ticket.key).ok().copied() else {
+        let _ = row.frame.quarantine_receive(ticket.key);
+        return false;
+    };
+    let Some(snapshot) = row.displaced_shared_resume else {
+        let _ = row.frame.quarantine_receive(ticket.key);
+        return false;
+    };
+    let identity = nt_user_callback::SharedPageLeaseIdentity {
+        dispatch: parent.snapshot.dispatch,
+        client: win32k_glue::shared_page_client_identity(parent.snapshot.client),
+    };
+    let page = snapshot.lease_snapshot(parent.snapshot.client);
+    if !win32k_glue::select_win32k_client_window(parent.snapshot.client)
+        || !win32k_glue::restore_shared_resume_snapshot(
+            snapshot, parent.snapshot.dispatch, parent.snapshot.client,
+        )
+    {
+        let _ = row.shared_leases.acknowledge_restore(
+            identity, nt_user_callback::SharedPageRestoreEffect::Uncertain,
+        );
+        let _ = row.frame.quarantine_receive(ticket.key);
+        return false;
+    }
+    if row.shared_leases.acknowledge_restore(
+        identity, nt_user_callback::SharedPageRestoreEffect::Applied(page),
+    ).is_err() || row.shared_leases.finish(identity, Some(page)).is_err() {
+        let _ = row.frame.quarantine_receive(ticket.key);
+        return false;
+    }
+    row.displaced_shared_resume = None;
+    true
+}
+
+/// A completed child releases only its live lease. A yielded child must supply its full exact
+/// page after the pending pump/Reply owner is retained. Restore then acknowledges the old page.
+pub(crate) unsafe fn finish_displacing_child(
+    ticket: NestedRestoreOwnerTicket,
+    dispatch: nt_user_callback::DispatchContext,
+    client: win32k_glue::Win32kClientContext,
+    terminal: bool,
+    yielded: Option<win32k_glue::SharedResumeSnapshot>,
+) -> bool {
+    let Some(row) = (&mut *core::ptr::addr_of_mut!(ROWS))
+        .get_mut(ticket.index).and_then(Option::as_mut) else { return false };
+    if !exact(row, ticket) || row.frame.phase() != NestedRestorePhase::Receiving {
+        return false;
+    }
+    let child = nt_user_callback::SharedPageLeaseIdentity {
+        dispatch, client: win32k_glue::shared_page_client_identity(client),
+    };
+    let finished = if terminal && yielded.is_none() {
+        row.shared_leases.finish_terminal(child).is_ok()
+    } else if !terminal {
+        yielded.is_some_and(|snapshot| row.shared_leases.finish(
+            child, Some(snapshot.lease_snapshot(client)),
+        ).is_ok())
+    } else { false };
+    if !finished {
+        let _ = row.frame.quarantine_receive(ticket.key);
+        return false;
+    }
+    let Some(parent_snapshot) = row.displaced_shared_resume else {
+        let _ = row.frame.quarantine_receive(ticket.key);
+        return false;
+    };
+    let Some(parent) = row.frame.continuation_ref(ticket.key).ok().copied() else {
+        let _ = row.frame.quarantine_receive(ticket.key);
+        return false;
+    };
+    let identity = nt_user_callback::SharedPageLeaseIdentity {
+        dispatch: parent.snapshot.dispatch,
+        client: win32k_glue::shared_page_client_identity(parent.snapshot.client),
+    };
+    let page = parent_snapshot.lease_snapshot(parent.snapshot.client);
+    if !win32k_glue::select_win32k_client_window(parent.snapshot.client)
+        || !win32k_glue::restore_shared_resume_snapshot(
+            parent_snapshot, parent.snapshot.dispatch, parent.snapshot.client,
+        )
+    {
+        let _ = row.shared_leases.acknowledge_restore(
+            identity, nt_user_callback::SharedPageRestoreEffect::Uncertain,
+        );
+        let _ = row.frame.quarantine_receive(ticket.key);
+        return false;
+    }
+    if row.shared_leases.acknowledge_restore(
+        identity, nt_user_callback::SharedPageRestoreEffect::Applied(page),
+    ).is_err() || row.shared_leases.finish(identity, Some(page)).is_err() {
+        let _ = row.frame.quarantine_receive(ticket.key);
+        return false;
+    }
+    true
+}
+
+/// Keep a nonterminal child pump whose outcome has no other durable pending owner. Neither its
+/// Reply nor its channel may be reused while the parent's displaced page remains uncertain.
+pub(crate) unsafe fn retain_quarantined_child_pump(
+    ticket: NestedRestoreOwnerTicket,
+    pump: crate::spawn_hosts::PumpResult,
+    channel: crate::spawn_hosts::PumpChannel,
+    dispatch: nt_user_callback::DispatchContext,
+    client: win32k_glue::Win32kClientContext,
+) {
+    if let Some(row) = (&mut *core::ptr::addr_of_mut!(ROWS))
+        .get_mut(ticket.index).and_then(Option::as_mut)
+    {
+        if exact(row, ticket) && row.quarantined_child_pump.is_none() {
+            row.quarantined_child_pump = Some(QuarantinedChildPump {
+                pump, channel, dispatch, client,
+            });
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NestedRestorePassOutcome {
     Refused,
@@ -340,6 +542,10 @@ pub(crate) unsafe fn run_one(
         .get_mut(ticket.index).and_then(Option::as_mut);
     let Some(row) = row else { return NestedRestorePassOutcome::Quarantined; };
     if !exact(row, ticket) { return NestedRestorePassOutcome::Quarantined; }
+    if row.frame.phase() != NestedRestorePhase::Receiving {
+        row.quarantined_parent_pump = result.ok();
+        return NestedRestorePassOutcome::Quarantined;
+    }
     let pump = match result {
         Ok(pump) => pump,
         Err(_) => {
@@ -351,7 +557,17 @@ pub(crate) unsafe fn run_one(
     };
     let mut next = pending;
     next.snapshot.pump = pump;
-    if row.frame.record_receive_result(ticket.key, next).is_err() {
+    let Some(shared_resume) = win32k_glue::try_capture_exact_shared_resume_snapshot(
+        pending.snapshot.dispatch, pending.snapshot.client,
+    ) else {
+        row.quarantined_parent_pump = Some(pump);
+        let _ = row.frame.quarantine_receive(ticket.key);
+        return NestedRestorePassOutcome::Quarantined;
+    };
+    next.snapshot.shared_resume = shared_resume;
+    row.displaced_shared_resume = None;
+    if let Err((_, retained)) = row.frame.record_receive_result(ticket.key, next) {
+        row.quarantined_parent_pump = Some(retained.snapshot.pump);
         return NestedRestorePassOutcome::Quarantined;
     }
     NestedRestorePassOutcome::ResultRetained

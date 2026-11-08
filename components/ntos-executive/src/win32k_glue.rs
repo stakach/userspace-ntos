@@ -28,6 +28,8 @@ pub(crate) use receive::{prepare_receive_yield, prepare_root_ingress_yield, prep
     resume_suspended_nested_restore_receive, NestedRestorePumpCompletion,
     settle_nested_restore_result};
 pub(crate) use pending_dispatch::{
+    shared_page_client_identity, try_capture_exact_shared_resume_snapshot,
+    restore_shared_resume_snapshot, SharedResumeSnapshot,
     take_pending_lpc_wait_dispatch, take_pending_provider_wait_dispatch, LpcWaitPumpCompletion,
     PendingLpcWaitDispatch, PendingProviderWaitDispatch, ProviderWaitPumpCompletion,
     PendingReceiveDispatch, ReceiveYield, take_pending_receive_dispatch,
@@ -45,8 +47,8 @@ pub(crate) use pending_dispatch::{
 };
 use pending_dispatch::{
     capture_initial_arg_snapshot, capture_lpc_wait_repark, capture_provider_wait_repark,
-    capture_shared_resume_snapshot, restore_shared_resume_snapshot,
-    SharedResumeSnapshot, SuspendedPumpSnapshot,
+    capture_shared_resume_snapshot,
+    SuspendedPumpSnapshot,
     LPC_WAIT_LAST_PUMP_SUSPENDED, LPC_WAIT_PENDING_DISPATCH, PROVIDER_WAIT_LAST_PUMP_SUSPENDED,
     PROVIDER_WAIT_PENDING_DISPATCH,
     RECEIVE_PENDING_DISPATCH, ROOT_INGRESS_PENDING_DISPATCH,
@@ -1973,7 +1975,7 @@ fn authenticated_client_window_owner(
     owner.is_valid().then_some(owner)
 }
 
-unsafe fn select_win32k_client_window(client: Win32kClientContext) -> bool {
+pub(crate) unsafe fn select_win32k_client_window(client: Win32kClientContext) -> bool {
     let Some(owner) = authenticated_client_window_owner(client) else {
         return false;
     };
@@ -7277,7 +7279,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         crate::spawn_hosts::PumpChannel, nt_component_suspension::LaneHandle,
     ) -> Result<(u64, bool), u32>>,
     dispatch_return_out: Option<&mut Option<nt_user_callback::DispatchReturn>>,
-    suspended_out: Option<&mut bool>,
+    mut suspended_out: Option<&mut bool>,
     dispatch_context_out: Option<&mut Option<nt_user_callback::DispatchContext>>,
 ) -> (u64, bool) {
     // Reject before attachment or shared request writes, not only at later lane acquisition.
@@ -7302,6 +7304,15 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     if WIN32K_RETIRED.load(Ordering::Relaxed) != 0 {
         return (0xC000_0001u64, false);
     }
+    let active_parent = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    let displaced_parent = match crate::nested_restore_owner::capture_displaced_shared_resume(
+        active_parent,
+    ) {
+        None if active_parent.dispatch_id == 0 => None,
+        None => return (nt_process::STATUS_INVALID_PARAMETER as u64, false),
+        Some(Ok(ticket)) => Some(ticket),
+        Some(Err(())) => return (nt_process::STATUS_INVALID_PARAMETER as u64, false),
+    };
     // ── REQUEST FILL (caller-owned, exactly as the FSD `dispatch_irp` fills the IRP before the pump).
     // Attach win32k's client window to the CURRENT dispatch client (KeStackAttachProcess). If this is
     // a different client than last time, the previous client's leaf pages are Unmapped so the new
@@ -7315,13 +7326,18 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         }
     }
     if attach_client && !select_win32k_client_window(client) {
+        if let Some(ticket) = displaced_parent {
+            let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
+        }
         return (0xC000_0001u64, false);
     }
     if grant_win32k_client_ps_bodies(client).is_err() {
+        if let Some(ticket) = displaced_parent {
+            let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
+        }
         return (nt_process::STATUS_INVALID_PARAMETER as u64, false);
     }
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
-    clear_published_win32k_context();
     let dispatch_id = USER_CALLBACK_DISPATCH_IDS.fetch_add(1, Ordering::Relaxed) + 1;
     let callback_client = client.callback_client();
     let registered_client = client.logical_caller.is_some()
@@ -7331,6 +7347,9 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     if registered_client && !register_win32k_dispatch_client(dispatch_id, callback_client)
     {
         print_str(b"[user-callback] callback client registry full for dispatch\n");
+        if let Some(ticket) = displaced_parent {
+            let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
+        }
         return (0xC000_009Au64, false);
     }
     let nested_user_callback = match begin_nested_user_callback_dispatch(client, dispatch_id, ssn) {
@@ -7359,6 +7378,9 @@ unsafe fn win32k_dispatch_wide_observed_inner(
                     client.badge,
                 );
             }
+            if let Some(ticket) = displaced_parent {
+                let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
+            }
             return (0xC000_000Du64, false);
         }
     };
@@ -7385,8 +7407,25 @@ unsafe fn win32k_dispatch_wide_observed_inner(
                 client.badge,
             );
         }
+        if let Some(ticket) = displaced_parent {
+            let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
+        }
         return (0xC000_009Au64, false);
     };
+    let dispatch = UserCallbackDispatchContext {
+        lane, dispatch_id, ssn, args: completion_args, caller_sp,
+        output_stage, paint_output,
+    };
+    if let Some(ticket) = displaced_parent {
+        if !crate::nested_restore_owner::begin_displacing_child(ticket, dispatch, client) {
+            let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
+            if registered_client {
+                unregister_win32k_dispatch_client(dispatch_id, client.pi, client.tid, client.badge);
+            }
+            return (nt_process::STATUS_INVALID_PARAMETER as u64, false);
+        }
+    }
+    clear_published_win32k_context();
     if let Some(out) = dispatch_context_out {
         *out = Some(UserCallbackDispatchContext {
             lane, dispatch_id, ssn, args: completion_args, caller_sp,
@@ -7554,6 +7593,14 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         core::ptr::write(
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous_dispatch,
         );
+        if let Some(ticket) = displaced_parent {
+            let terminal = result.as_ref().is_ok_and(|(_, completed)| *completed);
+            if !crate::nested_restore_owner::finish_displacing_child(
+                ticket, dispatch, client, terminal, None,
+            ) {
+                return (nt_process::STATUS_UNSUCCESSFUL as u64, false);
+            }
+        }
         // Canonical kernel completion already retired this exact physical dispatch. Hosted
         // finish_win32k_lane_return must not repeat it. Failed/unknown work stays owned.
         return result.unwrap_or_else(|status| (u64::from(status), false));
@@ -7768,6 +7815,11 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     }
     if pr.lpc_wait_suspended {
         let Some(request) = win32k_subsystem::capture_lpc_wait_request() else {
+            if let Some(ticket) = displaced_parent {
+                let _ = crate::nested_restore_owner::finish_displacing_child(
+                    ticket, dispatch, client, false, None,
+                );
+            }
             return (0xC000_000Du32 as u64, false);
         };
         let (arg_snapshot_len, arg_snapshot) = capture_initial_arg_snapshot(ssn, completion_args);
@@ -7792,7 +7844,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         );
         LPC_WAIT_LAST_PUMP_SUSPENDED.store(1, Ordering::Release);
     }
-    if let Some(suspended) = suspended_out {
+    if let Some(suspended) = suspended_out.as_deref_mut() {
         // Report only this invocation's authenticated pump outcome. Pending dispatch slots and
         // callback flags belong to the caller's handoff path and must remain untouched here.
         *suspended = pr.callback_suspended
@@ -7804,6 +7856,28 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             || pr.maintenance_yield.is_some()
             || pr.nested_restore_yield.is_some()
             || pr.nested_restore_quarantined.is_some();
+    }
+    if let Some(ticket) = displaced_parent {
+        let child_suspended = pr.callback_suspended || pr.provider_wait_suspended
+            || pr.lpc_wait_suspended || pr.receive_yield.is_some()
+            || pr.root_ingress_yield.is_some() || pr.service_wait_yield.is_some()
+            || pr.maintenance_yield.is_some() || pr.nested_restore_yield.is_some()
+            || pr.nested_restore_quarantined.is_some();
+        let terminal = pr.completed && lane_transition_ok && !child_suspended;
+        let yielded = child_suspended.then(||
+            try_capture_exact_shared_resume_snapshot(dispatch, client)
+        ).flatten();
+        if !crate::nested_restore_owner::finish_displacing_child(
+            ticket, dispatch, client, terminal, yielded,
+        ) {
+            if !terminal && !child_suspended {
+                crate::nested_restore_owner::retain_quarantined_child_pump(
+                    ticket, pr, ch, dispatch, client,
+                );
+            }
+            if let Some(suspended) = suspended_out.as_deref_mut() { *suspended = false; }
+            return (nt_process::STATUS_UNSUCCESSFUL as u64, false);
+        }
     }
     if nested_user_callback {
         if pr.callback_suspended || pr.provider_wait_suspended || pr.lpc_wait_suspended

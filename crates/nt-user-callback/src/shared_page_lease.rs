@@ -213,6 +213,26 @@ impl<const N: usize> SharedPageLeaseStack<N> {
         self.frames[self.len] = None;
         Ok(snapshot)
     }
+
+    /// Release a child only after the native pump certified terminal completion and retained
+    /// its Reply/output effects. A yielded child must use `finish` with its full publication.
+    pub fn finish_terminal(
+        &mut self,
+        identity: SharedPageLeaseIdentity,
+    ) -> Result<(), SharedPageLeaseError> {
+        let Some(frame) = self.frames[..self.len].last().and_then(Option::as_ref) else {
+            return Err(SharedPageLeaseError::Empty);
+        };
+        if frame.identity != identity { return Err(SharedPageLeaseError::NotTop); }
+        match frame.state {
+            LeaseState::Live => {}
+            LeaseState::Displaced(_) => return Err(SharedPageLeaseError::AlreadyDisplaced),
+            LeaseState::Uncertain(_) => return Err(SharedPageLeaseError::Uncertain),
+        }
+        self.len -= 1;
+        self.frames[self.len] = None;
+        Ok(())
+    }
 }
 
 impl<const N: usize> Default for SharedPageLeaseStack<N> {

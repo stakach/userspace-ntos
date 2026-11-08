@@ -248,6 +248,17 @@ pub(crate) struct SharedResumeSnapshot {
 }
 
 impl SharedResumeSnapshot {
+    pub(crate) fn lease_snapshot(
+        &self, client: Win32kClientContext,
+    ) -> nt_user_callback::SharedPageSnapshot {
+        nt_user_callback::SharedPageSnapshot {
+            header: self.header,
+            publication: self.callback_publication(),
+            request_owner: shared_page_client_identity(client),
+            request_ssn: self.request[0],
+        }
+    }
+
     pub(crate) fn callback_publication(&self) -> nt_user_callback::SharedCallbackPublication {
         nt_user_callback::SharedCallbackPublication::new(self.request, [
             self.published.pid,
@@ -273,6 +284,15 @@ impl SharedResumeSnapshot {
                 w32process: context[4], w32thread: context[5],
             },
         }
+    }
+}
+
+pub(crate) fn shared_page_client_identity(
+    client: Win32kClientContext,
+) -> nt_user_callback::SharedPageClientIdentity {
+    nt_user_callback::SharedPageClientIdentity {
+        pi: client.pi, pid: client.pid, generation: client.generation,
+        tid: client.tid, badge: client.badge, tcb: client.tcb,
     }
 }
 
@@ -390,15 +410,7 @@ pub(crate) unsafe fn try_capture_exact_shared_resume_snapshot(
         return None;
     }
     let snapshot = SharedResumeSnapshot { header: header_before, published, request };
-    let page = nt_user_callback::SharedPageSnapshot {
-        header: header_before,
-        publication: snapshot.callback_publication(),
-        request_owner: nt_user_callback::SharedPageClientIdentity {
-            pi: client.pi, pid: client.pid, generation: client.generation,
-            tid: client.tid, badge: client.badge, tcb: client.tcb,
-        },
-        request_ssn: request[0],
-    };
+    let page = snapshot.lease_snapshot(client);
     if !page.matches(nt_user_callback::SharedPageLeaseIdentity {
         dispatch,
         client: page.request_owner,

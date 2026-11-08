@@ -166,9 +166,7 @@ pub(crate) unsafe fn settle_nested_restore_result(
     let snapshot = pending.snapshot;
     if pump.nested_restore_yield.is_some() || pump.nested_restore_quarantined.is_some() {
         let mut next = pending;
-        next.snapshot.shared_resume = capture_shared_resume_snapshot(
-            snapshot.dispatch, snapshot.client,
-        );
+        next.snapshot.shared_resume = snapshot.shared_resume;
         return NestedRestorePumpCompletion::NestedReparked(next);
     }
     if let Some(yielded) = pump.receive_yield {
@@ -184,7 +182,7 @@ pub(crate) unsafe fn settle_nested_restore_result(
         return NestedRestorePumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
             yielded,
             snapshot: SuspendedPumpSnapshot {
-                shared_resume: capture_shared_resume_snapshot(snapshot.dispatch, snapshot.client),
+                shared_resume: snapshot.shared_resume,
                 ..snapshot
             },
         });
