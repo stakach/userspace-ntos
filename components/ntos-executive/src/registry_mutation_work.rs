@@ -467,7 +467,6 @@ static LAST_EXISTING_RETRY_WORK_ID: AtomicU64 = AtomicU64::new(0);
 static LAST_EXISTING_RETRY_PHASE: AtomicU64 = AtomicU64::new(0);
 static EXISTING_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_REPLY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
-static SYSTEM_WRITER_TIMING_TRACES: AtomicU64 = AtomicU64::new(0);
 static HOSTED_REPLY_RECEIVE_WORK: AtomicU64 = AtomicU64::new(0);
 type WatchedBinding = nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>;
 #[derive(Clone, Copy)]
@@ -583,21 +582,6 @@ static TRANSFERRED: AtomicBool = AtomicBool::new(false);
 static mut EXECUTING: Option<ProviderLogicalCaller> = None;
 static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 const RETRY_DELAY: u64 = 10_000_000;
-
-fn trace_system_writer_timing(work_id: u64, phase: &[u8], receipt: u64) {
-    if SYSTEM_WRITER_TIMING_TRACES.fetch_add(1, Ordering::Relaxed) >= 512 {
-        return;
-    }
-    print_str(b"[registry-writer-timing] time-100ns/id/phase/detail=");
-    print_u64(monotonic_time_100ns());
-    print_str(b"/");
-    print_u64(work_id);
-    print_str(b"/");
-    print_str(phase);
-    print_str(b"/");
-    print_u64(receipt);
-    print_str(b"\n");
-}
 
 #[derive(Eq, PartialEq)]
 enum PhaseProgressFingerprint {
@@ -1494,19 +1478,14 @@ unsafe fn advance(
             let attempts = &mut *core::ptr::addr_of_mut!(ATTEMPTS);
             if attempt.is_acknowledged() {
                 if attempt.outcome_status() == Some(0) {
-                    let nonce = attempt.server_nonce().unwrap_or(0);
-                    let upload = attempts.take_upload(attempt)?;
-                    trace_system_writer_timing(work.id, b"begin-acquired", nonce);
-                    work.phase = Phase::Prepare(upload.into_preparation());
+                    work.phase = Phase::Prepare(attempts.take_upload(attempt)?.into_preparation());
                 } else if attempt.outcome_status() == Some(nt_status::NtStatus::DEVICE_BUSY.raw() as i32)
                     && !work.cancelled
                     && matches!(&work.caller, Caller::Hosted(_))
                 {
                     // CM ACKed an exact no-token refusal. Keep the original caller, Reply,
                     // mutation journal and mount while a prior writer releases its lease.
-                    let nonce = attempt.server_nonce().unwrap_or(0);
                     attempts.retry_acknowledged_busy(attempt)?;
-                    trace_system_writer_timing(work.id, b"begin-busy-ack", nonce);
                     return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as i32);
                 } else if attempt.outcome_status() == Some(0xC000_0059u32 as i32)
                     && !work.cancelled
@@ -1794,12 +1773,6 @@ unsafe fn advance(
         }
         Phase::Acknowledge => {
             let ack = cm_mutation_transport::acknowledge(work.receipt.unwrap())?;
-            let phase: &[u8] = if matches!(ack.disposition(), SystemHiveMutationAcknowledgementDisposition::Acknowledged) {
-                b"commit-outcome-ack"
-            } else {
-                b"commit-ack-replay"
-            };
-            trace_system_writer_timing(work.id, phase, 0);
             work.phase = Phase::ReleasePublication(ack);
         }
         Phase::ReleasePublication(ack) => {
@@ -1827,12 +1800,6 @@ unsafe fn advance(
         }
         Phase::AcknowledgeAbort(receipt) => {
             let ack = cm_mutation_transport::acknowledge_abort(*receipt)?;
-            let phase: &[u8] = if matches!(ack.disposition(), SystemHiveMutationAcknowledgementDisposition::Acknowledged) {
-                b"abort-outcome-ack"
-            } else {
-                b"abort-ack-replay"
-            };
-            trace_system_writer_timing(work.id, phase, 0);
             work.phase = Phase::ReleaseRollback(ack);
         }
         Phase::ReleaseRollback(ack) => {
