@@ -38,12 +38,20 @@ struct Row {
     displaced_shared_resume: Option<win32k_glue::SharedResumeSnapshot>,
     quarantined_parent_pump: Option<crate::spawn_hosts::PumpResult>,
     quarantined_child_pump: Option<QuarantinedChildPump>,
+    quarantined_child_job_result: Option<QuarantinedChildJobResult>,
 }
 
 #[allow(dead_code)] // Retained for owner diagnostics and explicit recovery, never replayed.
 struct QuarantinedChildPump {
     pump: crate::spawn_hosts::PumpResult,
     channel: crate::spawn_hosts::PumpChannel,
+    dispatch: nt_user_callback::DispatchContext,
+    client: win32k_glue::Win32kClientContext,
+}
+
+#[allow(dead_code)] // A restore refusal retains this completed effect; it is never replayed.
+struct QuarantinedChildJobResult {
+    result: Result<(u64, bool), u32>,
     dispatch: nt_user_callback::DispatchContext,
     client: win32k_glue::Win32kClientContext,
 }
@@ -196,6 +204,7 @@ unsafe fn prepare_row(
         displaced_shared_resume: None,
         quarantined_parent_pump: None,
         quarantined_child_pump: None,
+        quarantined_child_job_result: None,
     };
     Ok((row, key))
 }
@@ -468,6 +477,25 @@ pub(crate) unsafe fn retain_quarantined_child_pump(
         if exact(row, ticket) && row.quarantined_child_pump.is_none() {
             row.quarantined_child_pump = Some(QuarantinedChildPump {
                 pump, channel, dispatch, client,
+            });
+        }
+    }
+}
+
+/// The early kernel-job path has no PumpResult or pending child slot. Preserve its exact
+/// completed/failed effect when the parent page cannot be restored after the job returned.
+pub(crate) unsafe fn retain_quarantined_child_job_result(
+    ticket: NestedRestoreOwnerTicket,
+    result: Result<(u64, bool), u32>,
+    dispatch: nt_user_callback::DispatchContext,
+    client: win32k_glue::Win32kClientContext,
+) {
+    if let Some(row) = (&mut *core::ptr::addr_of_mut!(ROWS))
+        .get_mut(ticket.index).and_then(Option::as_mut)
+    {
+        if exact(row, ticket) && row.quarantined_child_job_result.is_none() {
+            row.quarantined_child_job_result = Some(QuarantinedChildJobResult {
+                result, dispatch, client,
             });
         }
     }

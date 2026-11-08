@@ -44,3 +44,32 @@ fn nested_restore_settlement_does_not_recapture_mutable_shared_page() {
     assert!(!receive[start..end].contains("capture_shared_resume_snapshot("),
         "settlement after nested dispatch may only use the exact retained snapshot");
 }
+
+#[test]
+fn uncertain_parent_restore_retains_child_without_a_pending_pump_owner() {
+    let dispatch = source("win32k_glue.rs");
+    let scope = dispatch.find("if let Some(ticket) = displaced_parent {\n        let child_suspended")
+        .expect("child handoff follows all durable pending publications");
+    let end = dispatch[scope..].find("if nested_user_callback {").unwrap() + scope;
+    let handoff = &dispatch[scope..end];
+    assert!(handoff.contains("let child_has_durable_pump ="),
+        "only yield paths with a full pending PumpResult can own it outside the row");
+    assert!(handoff.contains("if !child_has_durable_pump {\n                crate::nested_restore_owner::retain_quarantined_child_pump("),
+        "terminal, callback, provider-wait and LPC-wait children need a retained receipt");
+    assert!(!handoff.contains("if !terminal && !child_suspended"),
+        "terminal does not mean its returned pump receipt may be dropped");
+}
+
+#[test]
+fn uncertain_parent_restore_retains_early_kernel_job_result() {
+    let dispatch = source("win32k_glue.rs");
+    let start = dispatch.find("if let Some(execute) = kernel_job {").unwrap();
+    let end = dispatch[start..].find("ch.caps.hosted_receive_yield").unwrap() + start;
+    let job = &dispatch[start..end];
+    let compact: String = job.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert!(compact.contains("retain_quarantined_child_job_result(ticket,result,dispatch,client,)"),
+        "a completed kernel job has no PumpResult pending slot if parent restore refuses");
+
+    let owner = source("nested_restore_owner.rs");
+    assert!(owner.contains("quarantined_child_job_result: Option<QuarantinedChildJobResult>"));
+}

@@ -7598,6 +7598,9 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             if !crate::nested_restore_owner::finish_displacing_child(
                 ticket, dispatch, client, terminal, None,
             ) {
+                crate::nested_restore_owner::retain_quarantined_child_job_result(
+                    ticket, result, dispatch, client,
+                );
                 return (nt_process::STATUS_UNSUCCESSFUL as u64, false);
             }
         }
@@ -7863,6 +7866,12 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             || pr.root_ingress_yield.is_some() || pr.service_wait_yield.is_some()
             || pr.maintenance_yield.is_some() || pr.nested_restore_yield.is_some()
             || pr.nested_restore_quarantined.is_some();
+        // These paths published a full PumpResult into a pending owner above. Callback,
+        // provider-wait and LPC-wait records retain a lane/request but no returned pump.
+        let child_has_durable_pump = pr.receive_yield.is_some()
+            || pr.root_ingress_yield.is_some() || pr.service_wait_yield.is_some()
+            || pr.maintenance_yield.is_some() || pr.nested_restore_yield.is_some()
+            || pr.nested_restore_quarantined.is_some();
         let terminal = pr.completed && lane_transition_ok && !child_suspended;
         let yielded = child_suspended.then(||
             try_capture_exact_shared_resume_snapshot(dispatch, client)
@@ -7870,7 +7879,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         if !crate::nested_restore_owner::finish_displacing_child(
             ticket, dispatch, client, terminal, yielded,
         ) {
-            if !terminal && !child_suspended {
+            if !child_has_durable_pump {
                 crate::nested_restore_owner::retain_quarantined_child_pump(
                     ticket, pr, ch, dispatch, client,
                 );
