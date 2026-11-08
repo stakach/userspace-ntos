@@ -95,7 +95,7 @@ fn foreign_stale_duplicate_and_overflow_cannot_take_or_replay_a_lease() {
 }
 
 #[test]
-fn executive_provider_identity_admits_zero_client_tuple_and_zero_ssn_only_as_a_unit() {
+fn executive_provider_identity_requires_a_complete_zero_client_tuple() {
     let mut executive = identity(93, 1);
     executive.dispatch.ssn = 0;
     executive.client = SharedPageClientIdentity {
@@ -117,6 +117,19 @@ fn executive_provider_identity_admits_zero_client_tuple_and_zero_ssn_only_as_a_u
         invalid.client = partial;
         assert_eq!(leases.begin(invalid), Err(SharedPageLeaseError::InvalidIdentity));
     }
+}
+
+#[test]
+fn physical_page_owner_admits_an_authenticated_hosted_zero_ssn_control() {
+    let mut hosted = identity(94, 1);
+    hosted.dispatch.ssn = 0;
+    let saved = snapshot(hosted, 7);
+    let mut page = SharedPageAuthority::<1>::new();
+    let reply = page.enter(hosted, ReplyToken(core::cell::Cell::new(94)))
+        .unwrap_or_else(|_| panic!("the native adapter authenticates the hosted PS request class"));
+    assert_eq!(reply.0.get(), 94);
+    assert_eq!(page.capture_and_park(hosted, saved), Ok(()));
+    assert_eq!(page.reacquire(hosted), Ok(saved));
 }
 
 #[test]

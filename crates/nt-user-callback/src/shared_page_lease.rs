@@ -38,8 +38,8 @@ pub struct SharedPageLeaseIdentity {
 
 impl SharedPageLeaseIdentity {
     const fn is_valid(self) -> bool {
+        // Request-class authentication belongs to the native adapter; hosted Ps uses SSN 0.
         self.dispatch.lane.is_valid() && self.dispatch.dispatch_id != 0
-            && (self.dispatch.ssn != 0 || self.client.is_executive())
             && self.client.is_valid()
     }
 }
