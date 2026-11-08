@@ -456,6 +456,10 @@ pub(crate) unsafe fn component_execution_is_busy() -> bool {
     (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).execution_busy()
 }
 
+pub(crate) unsafe fn component_shared_publication_is_busy() -> bool {
+    (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).fresh_dispatch_busy()
+}
+
 pub(crate) unsafe fn component_has_retained_terminal() -> bool {
     (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
         .terminal_identities()

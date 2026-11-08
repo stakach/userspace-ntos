@@ -155,6 +155,22 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         self.running.is_some() || self.terminal_execution_busy()
     }
 
+    /// Fresh component publication must wait until a returned pump's Reply and shared page
+    /// have moved to their next durable owner. Internal parent restoration may still proceed.
+    pub fn fresh_dispatch_busy(&self) -> bool {
+        self.execution_busy() || self.returning_pump_is_unsettled()
+    }
+
+    /// A physical lane can park before its returned pump, Reply and shared publication have
+    /// been transferred to the next wait or terminal owner. A fresh dispatch cannot borrow
+    /// that publication during this interval.
+    fn returning_pump_is_unsettled(&self) -> bool {
+        self.slots.iter().any(|slot| slot.lane.as_ref().is_some_and(|lane| {
+            lane.suspensions.frames().iter().any(|frame| matches!(frame.phase,
+                SuspensionPhase::Resuming { .. } | SuspensionPhase::MaintenanceResuming { .. }))
+        }))
+    }
+
     pub(super) fn terminal_execution_busy(&self) -> bool {
         self.slots.iter().any(|slot| {
             slot.lane.as_ref().and_then(|lane| lane.terminal.as_ref())

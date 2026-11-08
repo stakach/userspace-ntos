@@ -244,6 +244,43 @@ fn receive_can_repark_as_exact_service_wait() {
 }
 
 #[test]
+fn receive_return_keeps_fresh_dispatch_fenced_until_its_repark_is_retained() {
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let owner = receive_owner(dispatch);
+    let lane = dispatch.lane();
+    let reply = f.lanes.binding(lane).unwrap().reply_object;
+    f.lanes.reserve_receive_capacity(lane, reply, owner).unwrap();
+    let mut receive = f.receiver
+        .suspend_for_nested_execution(route, dispatch, &mut f.lanes, &f.peers, bound)
+        .unwrap();
+    let settled = child_settlement();
+    let key = crate::SuspensionKey::receive(settled.admission_key().admission_sequence());
+    f.lanes.admit_receive_owned(&receive, key, 1, owner, settled.admission_key(), 123).unwrap();
+    f.lanes.begin_receive_restore(&receive, key, owner, &settled, 0).unwrap();
+    f.receiver.resume_nested_execution(&mut receive, &mut f.lanes, &f.peers, bound).unwrap();
+
+    // The native pump has returned and parked its physical lane, but the exact Receive
+    // continuation has not yet retained the new wait and its shared-page snapshot.
+    f.lanes.suspend_running(lane, reply, 41).unwrap();
+    assert_eq!(f.lanes.running(), None);
+    assert_eq!(f.lanes.frame(lane, key).unwrap().unwrap().phase,
+        crate::SuspensionPhase::Resuming { completion: 0, cancelled: false });
+    assert!(f.lanes.fresh_dispatch_busy(),
+        "an unsettled Receive return must fence fresh shared-page publication");
+    assert!(!f.lanes.can_add_lane());
+
+    let next = crate::SuspensionKey::service_wait(2);
+    f.lanes.rearm_service_wait_external_owned(
+        lane, reply, dispatch, 41, key, next, 2, owner, 456,
+    ).unwrap();
+    assert_eq!(f.lanes.frame(lane, next).unwrap().unwrap().phase,
+        crate::SuspensionPhase::Waiting);
+    assert!(!f.lanes.fresh_dispatch_busy(),
+        "the fresh-dispatch fence ends after exact repark ownership is retained");
+}
+
+#[test]
 fn resumed_service_wait_can_reuse_its_frame_for_sealed_receive_child() {
     let mut f = Fixture::new();
     let (route, dispatch) = f.parent(1);

@@ -759,13 +759,13 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
     /// A fresh root dispatch may add a physical lane only when the component is not executing,
     /// every registered lane is retained, and the configured lane bound has not been reached.
     pub fn needs_idle_lane(&self) -> bool {
-        !self.execution_busy() && self.next_idle().is_none() && self.len() < self.max_lanes
+        !self.fresh_dispatch_busy() && self.next_idle().is_none() && self.len() < self.max_lanes
     }
 
     /// A provider that has already checked its own idle lanes may grow while unrelated
     /// providers still have idle workers in this shared catalog.
     pub fn can_add_lane(&self) -> bool {
-        !self.execution_busy() && self.len() < self.max_lanes
+        !self.fresh_dispatch_busy() && self.len() < self.max_lanes
     }
 
     pub fn allocate(&mut self, binding: LaneBinding) -> Result<LaneHandle, LaneError> {

@@ -7295,7 +7295,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         }
         print_str(b"\n");
     }
-    if crate::component_execution_is_busy()
+    if crate::service_sec_image::component_shared_publication_is_busy()
         || !win32k_client_context_is_admitted(client)
         || !callback_client_can_enter_nested(client)
     {

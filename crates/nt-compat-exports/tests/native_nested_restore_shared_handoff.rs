@@ -73,3 +73,16 @@ fn uncertain_parent_restore_retains_early_kernel_job_result() {
     let owner = source("nested_restore_owner.rs");
     assert!(owner.contains("quarantined_child_job_result: Option<QuarantinedChildJobResult>"));
 }
+
+#[test]
+fn fresh_win32k_dispatch_waits_for_returned_receive_page_capture() {
+    let dispatch = source("win32k_glue.rs");
+    let start = dispatch.find("unsafe fn win32k_dispatch_wide_observed_inner(").unwrap();
+    let end = dispatch[start..].find("let active_parent =").unwrap() + start;
+    assert!(dispatch[start..end].contains("component_shared_publication_is_busy()"),
+        "a parked physical lane can still have an unsettled Receive page and Reply");
+
+    let service = source("service_sec_image.rs");
+    assert!(service.contains("fn component_shared_publication_is_busy()"));
+    assert!(service.contains(".fresh_dispatch_busy()"));
+}
