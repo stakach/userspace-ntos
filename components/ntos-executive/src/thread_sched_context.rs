@@ -7,7 +7,7 @@ static mut CONSTRUCTIONS: Vec<SchedContextConstruction> = Vec::new();
 
 // All hosted guest SCs currently bind through this one boot SchedControl. The admission gate
 // uses the same core until exact TCB migration to another configured SC is implemented.
-const GUEST_SCHED_CONTROL_CORE: u8 = 0;
+pub(crate) const GUEST_SCHED_CONTROL_CORE: u8 = 0;
 
 pub(crate) fn validate_guest_affinity(requested_mask: u64) -> Result<(), u32> {
     nt_user_host::sched_context::validate_hosted_thread_affinity(

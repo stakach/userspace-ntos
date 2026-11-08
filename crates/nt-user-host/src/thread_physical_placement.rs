@@ -68,6 +68,7 @@ enum State {
 }
 
 /// The only authoritative core for this exact published runtime and mechanism pair.
+#[derive(Debug)]
 pub struct PhysicalPlacementOwner {
     identity: PlacementIdentity,
     state: State,

@@ -8881,6 +8881,18 @@ impl ExecNtHandler {
         publish_hosted_thread_runtime_gate(pi, role);
     }
 
+    /// Resolve the exact published ingress runtime against the retained TCB/SC placement owner.
+    /// Native syscall services may use this only for a captured caller runtime, never CPUID on
+    /// the executive service thread.
+    pub(crate) fn known_hosted_thread_physical_core(
+        &self,
+        caller: HostedThreadRuntime,
+    ) -> Result<u8, nt_user_host::thread_physical_placement::PlacementError> {
+        self.thread_runtime.known_physical_core(
+            caller.binding(), caller.mechanism.sched_context,
+        )
+    }
+
     pub(crate) fn reserve_hosted_thread_runtime(
         &mut self,
         pi: usize,

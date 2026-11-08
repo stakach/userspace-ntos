@@ -12,6 +12,8 @@ mod memory_retirement;
 pub(crate) struct HostedThreadRuntimeOwner {
     runtime: HostedThreadRuntime,
     pub(crate) suspension: crate::thread_suspend::HostedThreadSuspend,
+    /// Exact published TCB/SC ownership; copied runtime metadata is never core authority.
+    physical_placement: Option<nt_user_host::thread_physical_placement::PhysicalPlacementOwner>,
     /// Physical priority work pins this exact runtime until canonical PM commit.
     priority_transition_pending: core::cell::Cell<bool>,
     pub(crate) initial_creation: core::cell::RefCell<
@@ -36,6 +38,7 @@ impl HostedThreadRuntimeOwner {
         Self {
             runtime,
             suspension: crate::thread_suspend::HostedThreadSuspend::new(),
+            physical_placement: None,
             priority_transition_pending: core::cell::Cell::new(false),
             initial_creation: core::cell::RefCell::new(None),
             process_create_callout: core::cell::RefCell::new(None),
@@ -53,6 +56,9 @@ impl HostedThreadRuntimeOwner {
 
     fn construction_is_empty(&self) -> bool {
         self.suspension.is_empty()
+            && self.physical_placement.as_ref().is_none_or(
+                nt_user_host::thread_physical_placement::PhysicalPlacementOwner::transition_is_settled,
+            )
             && !self.priority_transition_pending.get()
             && self.initial_creation.try_borrow().is_ok_and(|owner| owner.is_none())
             && self.process_create_callout.try_borrow().is_ok_and(|owner| {
@@ -153,6 +159,11 @@ pub(crate) struct HostedThreadRuntimeTable {
 }
 
 impl HostedThreadRuntimeTable {
+    fn placement_topology() -> Option<u8> {
+        let count = u8::try_from(SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed)).ok()?;
+        (count > thread_sched_context::GUEST_SCHED_CONTROL_CORE && count <= 64).then_some(count)
+    }
+
     pub(crate) const fn new() -> Self {
         Self {
             entries: Vec::new(),
@@ -199,7 +210,9 @@ impl HostedThreadRuntimeTable {
         mechanism: HostedThreadMechanismCaps,
         teb_alias: u64,
     ) -> Option<HostedThreadRuntime> {
-        if tcb <= 1 || !mechanism.is_live() || teb_alias == 0 || teb_alias & 0xfff != 0 {
+        if tcb <= 1 || mechanism.sched_context <= 1 || !mechanism.is_live()
+            || !process.is_valid() || tid == 0 || Self::placement_topology().is_none()
+            || teb_alias == 0 || teb_alias & 0xfff != 0 {
             return None;
         }
         if self.get_by_tid(tid).is_some_and(|entry| {
@@ -227,8 +240,28 @@ impl HostedThreadRuntimeTable {
             .iter_mut()
             .filter_map(RuntimeSlot::ordinary_mut)
             .find(|entry| entry.is_live() && entry.tid == tid)?;
+        let identity = nt_user_host::thread_physical_placement::PlacementIdentity {
+            process, tid, tcb, sched_context: mechanism.sched_context,
+        };
+        if entry.physical_placement.as_ref().is_some_and(|owner| {
+            owner.current_core(identity).is_err()
+        }) {
+            return None;
+        }
+        let placement = if entry.physical_placement.is_none() {
+            Some(nt_user_host::thread_physical_placement::PhysicalPlacementOwner::new(
+                identity,
+                thread_sched_context::GUEST_SCHED_CONTROL_CORE,
+                Self::placement_topology()?,
+            ).ok()?)
+        } else {
+            None
+        };
         entry.runtime.mechanism = mechanism;
         entry.runtime.teb_alias = teb_alias;
+        if let Some(placement) = placement {
+            entry.physical_placement = Some(placement);
+        }
         Some(HostedThreadRuntime {
             mechanism,
             teb_alias,
@@ -535,10 +568,20 @@ impl HostedThreadRuntimeTable {
         let Some(entry) = self.entries.get_mut(prepared.index)
             .and_then(|slot| slot.publishing_mut(&prepared.ticket)) else { return false; };
         let key = entry.binding();
+        let placement = nt_user_host::thread_physical_placement::PhysicalPlacementOwner::new(
+            nt_user_host::thread_physical_placement::PlacementIdentity {
+                process: key.process, tid: key.tid, tcb: spawn.tcb(),
+                sched_context: spawn.mechanism().sched_context,
+            },
+            thread_sched_context::GUEST_SCHED_CONTROL_CORE,
+            Self::placement_topology().unwrap_or(0),
+        );
         entry.construction_is_empty() && !entry.resources.is_live() && !entry.mechanism.is_live()
             && entry.tcb == 1 && entry.teb_alias == 0 && key == spawn.binding()
             && key == *prepared.ticket.owner() && spawn.resources().client_pi == key.pi
-            && spawn.tcb() > 1 && spawn.mechanism().is_live() && spawn.resources().is_live()
+            && spawn.tcb() > 1 && spawn.mechanism().sched_context > 1
+            && placement.is_ok() && spawn.mechanism().is_live()
+            && spawn.resources().is_live()
             && spawn.registered_memory().is_ok()
     }
 
@@ -552,6 +595,15 @@ impl HostedThreadRuntimeTable {
             .publishing_mut(&prepared.ticket)
             .expect("construction ticket retains its runtime slot");
         let key = entry.binding();
+        let identity = nt_user_host::thread_physical_placement::PlacementIdentity {
+            process: key.process, tid: key.tid, tcb: spawn.tcb(),
+            sched_context: spawn.mechanism().sched_context,
+        };
+        let placement = nt_user_host::thread_physical_placement::PhysicalPlacementOwner::new(
+            identity,
+            thread_sched_context::GUEST_SCHED_CONTROL_CORE,
+            Self::placement_topology().expect("prevalidated physical topology"),
+        ).expect("prevalidated placement identity");
         assert!(
             entry.construction_is_empty(),
             "publication cannot overwrite construction slots"
@@ -569,6 +621,7 @@ impl HostedThreadRuntimeTable {
         entry.runtime.teb_alias = spawn.teb_alias();
         entry.runtime.resources = spawn.resources();
         entry.registered_memory = Some(registered);
+        entry.physical_placement = Some(placement);
     }
 
     pub(crate) fn reserve(
@@ -712,6 +765,31 @@ impl HostedThreadRuntimeTable {
             .filter_map(RuntimeSlot::executable)
             .map(|entry| entry.runtime)
             .find(|entry| entry.tid == tid)
+    }
+
+    /// The copied ingress runtime is only a lookup key. The published owner retains core authority.
+    pub(crate) fn known_physical_core(
+        &self,
+        binding: nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+        sched_context: u64,
+    ) -> Result<u8, nt_user_host::thread_physical_placement::PlacementError> {
+        use nt_user_host::thread_physical_placement::{PlacementError, PlacementIdentity};
+        let slot = self.entries.iter()
+            .find(|slot| slot.owner().is_some_and(|owner| owner.binding() == binding))
+            .ok_or(PlacementError::WrongIdentity)?;
+        let owner = slot.executable().ok_or(PlacementError::Busy)?;
+        if owner.binding() != binding || owner.mechanism.sched_context != sched_context {
+            return Err(PlacementError::WrongIdentity);
+        }
+        let identity = PlacementIdentity {
+            process: binding.process,
+            tid: binding.tid,
+            tcb: binding.tcb,
+            sched_context,
+        };
+        owner.physical_placement.as_ref()
+            .ok_or(PlacementError::InvalidIdentity)?
+            .current_core(identity)
     }
 
     pub(crate) fn reserve_priority_effects(
@@ -1048,6 +1126,14 @@ impl HostedThreadRuntimes {
         unsafe { (&*self.table).executable_by_tid(tid) }
     }
 
+    pub(crate) fn known_physical_core(
+        &self,
+        binding: nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+        sched_context: u64,
+    ) -> Result<u8, nt_user_host::thread_physical_placement::PlacementError> {
+        unsafe { (&*self.table).known_physical_core(binding, sched_context) }
+    }
+
     pub(crate) fn reserve_priority_effects(
         &self,
         effects: &[nt_user_host::thread_priority_transition::PriorityEffect<HostedThreadRole>],
@@ -1354,6 +1440,7 @@ impl RuntimeIdentity for HostedThreadRuntimeOwner {
     fn control_busy(&self) -> bool {
         self.suspension.is_pending()
             || self.priority_transition_pending.get()
+            || self.physical_placement.as_ref().is_some_and(|owner| !owner.transition_is_settled())
             || self.initial_creation.try_borrow().map_or(true, |owner| owner.is_some())
     }
 }
@@ -1394,7 +1481,8 @@ pub(crate) fn check_user_stack_retirement_access(
 
 impl RuntimeTcbProjection for HostedThreadRuntimeOwner {
     fn clear_retired_tcb_projection(&mut self, expected_cap: u64) -> Result<(), u32> {
-        if self.initial_creation.try_borrow().map_or(true, |owner| owner.is_some())
+        if self.physical_placement.as_ref().is_some_and(|owner| !owner.transition_is_settled())
+            || self.initial_creation.try_borrow().map_or(true, |owner| owner.is_some())
             || self.process_create_callout.try_borrow().map_or(true, |owner| {
                 owner.as_ref().is_some_and(|owner| !owner.may_retire())
             })
@@ -1414,6 +1502,9 @@ impl RuntimeTcbProjection for HostedThreadRuntimeOwner {
 
 impl nt_user_host::thread_slot::RuntimeMechanismHandoff for HostedThreadRuntimeOwner {
     fn registered_mechanism_slots(&self) -> Result<[u64; 4], u32> {
+        if self.physical_placement.as_ref().is_some_and(|owner| !owner.transition_is_settled()) {
+            return Err(nt_process::STATUS_DEVICE_BUSY);
+        }
         if self.runtime.tcb <= 1 || !self.runtime.mechanism.is_live() {
             return Err(nt_address_space::STATUS_INVALID_PARAMETER);
         }
@@ -1430,6 +1521,9 @@ impl nt_user_host::thread_slot::RuntimeMechanismHandoff for HostedThreadRuntimeO
     ) -> Result<(), u32> {
         // The enclosing pending owner validates the opaque attempt and reservation tuple before
         // this callback. Recheck every locally held identity and source slot before the first clear.
+        if self.physical_placement.as_ref().is_some_and(|owner| !owner.transition_is_settled()) {
+            return Err(nt_process::STATUS_DEVICE_BUSY);
+        }
         let identity = id.identity();
         if self.runtime.pi != identity.pi || self.runtime.process.pid != identity.pid
             || self.runtime.process.generation != identity.process_generation
