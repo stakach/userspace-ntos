@@ -239,6 +239,8 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
         print_str(b"[dxg-worker] caller\n");
         let ch = channel(index, worker, crate::spawn_hosts::InitialAction::RecvFirst)?;
         print_str(b"[dxg-worker] channel\n");
+        crate::spawn_hosts::trace_root_stack_rsp(
+            crate::spawn_hosts::RootStackProbe::DxgWorkerChannel);
         let pump = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
         print_str(b"[dxg-worker] startup-pump\n");
         if !pump.completed || pump.status != STATUS_SUCCESS

@@ -38,6 +38,8 @@ pub(crate) enum Error {
 static mut ENROLLMENTS: Vec<Enrollment> = Vec::new();
 
 fn physical(instance_index: usize, kind: PhysicalSourceKind) -> Option<(PhysicalSource, u64)> {
+    unsafe { crate::spawn_hosts::trace_root_stack_rsp(
+        crate::spawn_hosts::RootStackProbe::IngressPhysical); }
     let inst = instance(instance_index)?;
     let domain = instance_domain_identity(inst)?;
     if inst.pml4 == 0 {

@@ -10,7 +10,7 @@
 //! caps). Behaviour is byte-identical to the old bespoke spawners.
 #![allow(clippy::all)]
 use crate::*;
-use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use nt_io_manager::{write_wdm_driver_object, WdmDriverObjectInit};
 
 #[path = "component_reply_binding.rs"]
@@ -263,6 +263,53 @@ pub(crate) struct SpawnedComponentWorker {
 
 static COMPONENT_HANDOFF_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const COMPONENT_HANDOFF_TRACE_CAP: u64 = 48;
+static ROOT_STACK_PHYSICAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static ROOT_STACK_DXG_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static ROOT_STACK_PUMP_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static ROOT_STACK_DXG_ARMED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) enum RootStackProbe {
+    IngressPhysical,
+    DxgWorkerChannel,
+    PumpRecvFirst,
+}
+
+// Temporary bounded stack-depth evidence at nested provider handoff boundaries.
+// Capture RSP at the call site so the printing frame does not hide the caller's depth.
+#[inline(always)]
+pub(crate) unsafe fn trace_root_stack_rsp(probe: RootStackProbe) {
+    let rsp: u64;
+    core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, nomem, preserves_flags));
+    trace_root_stack_rsp_value(probe, rsp);
+}
+
+#[inline(never)]
+unsafe fn trace_root_stack_rsp_value(probe: RootStackProbe, rsp: u64) {
+    if matches!(probe, RootStackProbe::IngressPhysical)
+        && !ROOT_STACK_DXG_ARMED.load(Ordering::Relaxed)
+    {
+        return;
+    }
+    if matches!(probe, RootStackProbe::DxgWorkerChannel) {
+        ROOT_STACK_DXG_ARMED.store(true, Ordering::Relaxed);
+    }
+    let (stage, counter, cap): (&[u8], &AtomicU64, u64) = match probe {
+        RootStackProbe::IngressPhysical =>
+            (b"ingress-physical-enter", &ROOT_STACK_PHYSICAL_TRACE_COUNT, 32),
+        RootStackProbe::DxgWorkerChannel =>
+            (b"dxg-worker-channel", &ROOT_STACK_DXG_TRACE_COUNT, 16),
+        RootStackProbe::PumpRecvFirst =>
+            (b"pump-recvfirst-enter", &ROOT_STACK_PUMP_TRACE_COUNT, 256),
+    };
+    if counter.fetch_add(1, Ordering::Relaxed) >= cap {
+        return;
+    }
+    crate::print_str(b"[root-stack] stage=");
+    crate::print_str(stage);
+    crate::print_str(b" rsp=");
+    crate::print_u64(rsp);
+    crate::print_str(b"\n");
+}
 static COMPONENT_SPAWN_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const COMPONENT_SPAWN_TRACE_CAP: u64 = 256;
 static COMPONENT_ROOT_IMAGE_DEMAND_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -2794,6 +2841,7 @@ unsafe fn component_pump_enter(
     };
     if ch.initial == InitialAction::RecvFirst {
         trace_component_handoff(b"pump-recvfirst-enter", ch.tcb, reply_cap, request_tag);
+        trace_root_stack_rsp(RootStackProbe::PumpRecvFirst);
     }
     let first = if let Some(msg) = pump_deliver_initial_request(ch, reply_cap, request_tag) {
         msg
