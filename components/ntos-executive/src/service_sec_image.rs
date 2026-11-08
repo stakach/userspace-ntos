@@ -10779,11 +10779,17 @@ pub(crate) unsafe fn service_sec_image(
         // pumps only latch these bits; the root loop is the sole dispatcher and therefore the sole
         // owner of ISR ordering and handler acknowledgement.
         let current_irq_lines = driver_launch::latch_hosted_irq_badge(badge);
-        let _ = driver_launch::drain_pending_hosted_irqs();
+        let serviced_irq_lines = driver_launch::drain_pending_hosted_irqs();
+        if current_irq_lines != 0 || serviced_irq_lines != 0 {
+            // A hosted SCSI terminal can arrive during the IRQ/DPC drain, after the
+            // ordinary source poll. Service its retained owner even when a deferred
+            // IRQ is drained on a later timer or ordinary ingress badge.
+            let _message = crate::ipc_message::SavedMessageBuffer::capture();
+            let _ = driver_launch::redrive_irq_ready_hosted_scsi(nt_handler as *mut _);
+        }
         if current_irq_lines != 0 {
-            if badge_has_delay_timer(badge) {
-                badge = DELAY_TIMER_BADGE;
-            } else {
+            let has_delay_timer = badge_has_delay_timer(badge);
+            if !has_delay_timer {
                 // IRQ-owned DPCs can publish the exact native IRP terminal. Observe and
                 // ACK it before sleeping; otherwise each sector waits for a timer wakeup.
                 if driver_launch::mounted_native_physical_irp_pending() {
@@ -10793,6 +10799,10 @@ pub(crate) unsafe fn service_sec_image(
                         let _ = file_cleanup_redrive_all(&mut nt_handler);
                     }
                 }
+            }
+            if has_delay_timer {
+                badge = DELAY_TIMER_BADGE;
+            } else {
                 let irq_durable_status = finalize_service_loop_state(&mut nt_handler);
                 if irq_durable_status != nt_fs::STATUS_SUCCESS {
                     print_str(b"[service-loop] IRQ checkpoint failure=0x");

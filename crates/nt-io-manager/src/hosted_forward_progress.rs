@@ -94,6 +94,25 @@ pub fn redrive_ready_pass(attempts: usize, mut redrive: impl FnMut() -> bool) ->
     false
 }
 
+/// Drain work that became ready after an IRQ within a caller-proven phase bound.
+/// Each pass searches the exact retained rows and reports an actual phase transition.
+pub fn drain_irq_ready_rounds(
+    max_progress_rounds: usize,
+    mut redrive_ready_pass: impl FnMut() -> bool,
+) -> usize {
+    let mut progressed = 0;
+    for _ in 0..max_progress_rounds {
+        if !redrive_ready_pass() { break; }
+        progressed += 1;
+    }
+    progressed
+}
+
+/// IRQ completion service may advance only work whose provider was already entered.
+pub fn irq_owned_ready(entered_provider: bool, ready: impl FnOnce() -> bool) -> bool {
+    entered_provider && ready()
+}
+
 /// Value-only progress. Native owners authenticate the token and completion/stop proof.
 #[derive(Debug)]
 pub struct HostedForwardInlineHold {
@@ -277,5 +296,78 @@ mod tests {
             HostedForwardWorkProgress::advanced(before, before, false)
         }));
         assert_eq!(calls, 3, "no extra attempt or replay after an unchanged pass");
+    }
+
+    #[test]
+    fn post_irq_terminal_drains_exact_sources_without_replay_or_uncertain_retirement() {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        struct Key { source: u64, use_epoch: u64, provider_irp: u64 }
+        struct Source { key: Key, published: bool, provider_acked: bool }
+        let mut sources = [
+            Source { key: Key { source: 4, use_epoch: 7, provider_irp: 31 },
+                published: false, provider_acked: false },
+            Source { key: Key { source: 4, use_epoch: 8, provider_irp: 32 },
+                published: false, provider_acked: false },
+            Source { key: Key { source: 5, use_epoch: 1, provider_irp: 33 },
+                published: false, provider_acked: false },
+        ];
+        let mut cursor = 0;
+        // The pre-IRQ poll had no provider terminal. Later IRQ/DPC publication makes
+        // two exact rows ready; a stale use-epoch and an uncertain effect do not.
+        let before_irq: [Option<Key>; 3] = [None, None, None];
+        assert!(!redrive_ready_pass(sources.len(), || {
+            let index = cursor % sources.len(); cursor += 1;
+            before_irq[index].is_some()
+        }));
+        let after_irq = [
+            Some(sources[0].key),
+            Some(Key { use_epoch: 7, ..sources[1].key }),
+            Some(sources[2].key),
+        ];
+        let rounds = drain_irq_ready_rounds(sources.len() * 2, || {
+            redrive_ready_pass(sources.len(), || {
+                let index = cursor % sources.len(); cursor += 1;
+                let source = &mut sources[index];
+                if source.published || after_irq[index] != Some(source.key) { return false; }
+                source.published = true;
+                true
+            })
+        });
+        assert_eq!(rounds, 2, "both exact terminals must reach source publication before receive");
+        assert!(sources[0].published && sources[2].published);
+        assert!(!sources[1].published, "a stale generation cannot publish or replay a source");
+        assert!(sources.iter().all(|source| !source.provider_acked),
+            "source publication cannot claim the later provider ACK");
+        assert_eq!(drain_irq_ready_rounds(sources.len() * 2, || {
+            redrive_ready_pass(sources.len(), || {
+                let index = cursor % sources.len(); cursor += 1;
+                let source = &mut sources[index];
+                after_irq[index] == Some(source.key) && !source.published
+            })
+        }), 0, "duplicate terminal observation cannot replay a published source");
+    }
+
+    #[test]
+    fn post_irq_drain_is_bounded_even_if_a_candidate_keeps_claiming_progress() {
+        let mut calls = 0;
+        assert_eq!(drain_irq_ready_rounds(3, || { calls += 1; true }), 3);
+        assert_eq!(calls, 3);
+        assert_eq!(drain_irq_ready_rounds(0, || panic!("no owner")), 0);
+    }
+
+    #[test]
+    fn irq_ready_scan_skips_unentered_provider_before_exact_completed_owner() {
+        let mut rows = [(false, true, false), (true, true, false)];
+        let mut cursor = 0;
+        assert!(redrive_ready_pass(rows.len(), || {
+            let index = cursor % rows.len(); cursor += 1;
+            let row = &mut rows[index];
+            if !irq_owned_ready(row.0, || row.1) || row.2 { return false; }
+            row.2 = true;
+            true
+        }));
+        assert!(!rows[0].2, "IRQ completion cannot enter a new provider");
+        assert!(rows[1].2, "the later completed owner still advances");
+        assert!(!irq_owned_ready(false, || panic!("unentered provider must not be polled")));
     }
 }

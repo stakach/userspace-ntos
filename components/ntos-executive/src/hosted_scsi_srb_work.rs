@@ -93,6 +93,8 @@ static CLAIM_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static SCSI_CAPTURE_REFUSAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static SCSI_PROGRESS_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static SCSI_HELD_REFUSAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static SCSI_IRQ_BOUNDARY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static mut SCSI_IRQ_BOUNDARY_SEEN: [Option<(u64, u64, u64, bool, bool)>; 128] = [None; 128];
 
 fn trace_scsi_held_refusal(stage: u64, source_irp: u64, token: u64, detail: u64) {
     if SCSI_HELD_REFUSAL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 4 { return; }
@@ -669,6 +671,12 @@ impl Work {
             .is_some_and(|irp| completed_device_control_irp_exact(irp.raw()).is_some())
     }
 
+    unsafe fn ready_for_irq_step(&self) -> bool {
+        nt_io_manager::hosted_forward_progress::irq_owned_ready(self.entered_provider, || {
+            unsafe { self.ready_for_nested_step() }
+        })
+    }
+
     unsafe fn advance(&mut self, handler: *mut ExecNtHandler) -> bool {
         if let Some(ack) = self.ack.as_ref() {
             let (route, dispatch, reply, token, reply_entered) = (
@@ -804,7 +812,10 @@ impl Work {
     }
 }
 
-unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> bool {
+#[derive(Clone, Copy)]
+enum ReadyScope { Any, Nested, IrqOwned }
+
+unsafe fn redrive_one(handler: *mut ExecNtHandler, scope: ReadyScope) -> bool {
     let _durable = crate::allocator::enter_durable();
     let count = (&*core::ptr::addr_of!(WORK)).len();
     if count == 0 {
@@ -819,11 +830,14 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
         {
             return None;
         }
-        if nested_ready_only
-            && !(&*core::ptr::addr_of!(WORK))[index]
-                .as_ref()
-                .is_some_and(|work| work.ready_for_nested_step())
-        {
+        let ready = (&*core::ptr::addr_of!(WORK))[index].as_ref().is_some_and(|work| {
+            match scope {
+                ReadyScope::Any => true,
+                ReadyScope::Nested => work.ready_for_nested_step(),
+                ReadyScope::IrqOwned => work.ready_for_irq_step(),
+            }
+        });
+        if !ready {
             return None;
         }
         (&mut *core::ptr::addr_of_mut!(WORK))[index]
@@ -881,7 +895,7 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
 }
 
 pub(super) unsafe fn redrive(handler: *mut ExecNtHandler) {
-    let _ = redrive_one(handler, false);
+    let _ = redrive_one(handler, ReadyScope::Any);
 }
 
 pub(super) unsafe fn nested_work_ready() -> bool {
@@ -901,8 +915,59 @@ pub(super) unsafe fn nested_work_ready() -> bool {
 pub(super) unsafe fn redrive_nested_ready(handler: *mut ExecNtHandler) -> bool {
     let attempts = (&*core::ptr::addr_of!(WORK)).len();
     nt_io_manager::hosted_forward_progress::redrive_ready_pass(attempts, || {
-        redrive_one(handler, true)
+        redrive_one(handler, ReadyScope::Nested)
     })
+}
+
+unsafe fn redrive_irq_ready_pass(handler: *mut ExecNtHandler) -> bool {
+    let attempts = (&*core::ptr::addr_of!(WORK)).len();
+    nt_io_manager::hosted_forward_progress::redrive_ready_pass(attempts, || {
+        redrive_one(handler, ReadyScope::IrqOwned)
+    })
+}
+
+/// DPC publication can make several retained SCSI sources ready in one IRQ turn.
+/// A nested pass advances at most one row. Its progress snapshot has six monotonic
+/// fields plus retirement, so eight rounds per initial owner cover every ready phase.
+pub(super) unsafe fn redrive_irq_ready(handler: *mut ExecNtHandler) -> usize {
+    let owners = (&*core::ptr::addr_of!(WORK)).len();
+    nt_io_manager::hosted_forward_progress::drain_irq_ready_rounds(
+        owners.saturating_mul(8),
+        || redrive_irq_ready_pass(handler),
+    )
+}
+
+/// Observation only: inspect the exact retained provider before a post-DPC poll.
+/// This does not pump an IRP, claim a pending owner, or change a Reply.
+pub(super) unsafe fn trace_irq_boundary() {
+    for work in (&*core::ptr::addr_of!(WORK)).iter().flatten() {
+        if !work.entered_provider || work.source_published { continue; }
+        let Some(irp) = work.canonical_irp else { continue; };
+        let terminal = io_manager_mut().completed_irp(irp).is_some();
+        let ready = nested_device_control_completion_ready_exact(irp.raw());
+        let observation = (
+            work.source.source_irp_address(),
+            work.source.scsi_identity().use_ticket().epoch().get(),
+            irp.raw(), terminal, ready,
+        );
+        let seen = &mut *core::ptr::addr_of_mut!(SCSI_IRQ_BOUNDARY_SEEN);
+        if seen.contains(&Some(observation)) { continue; }
+        let sequence = SCSI_IRQ_BOUNDARY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        seen[sequence as usize % seen.len()] = Some(observation);
+        if sequence >= 64 && !sequence.is_power_of_two() { continue; }
+        print_str(b"[scsi-irq-boundary] source/use/provider/terminal/ready=");
+        print_u64(observation.0);
+        print_str(b"/");
+        print_u64(observation.1);
+        print_str(b"/");
+        print_u64(observation.2);
+        print_str(b"/");
+        print_u64(u64::from(observation.3));
+        print_str(b"/");
+        print_u64(u64::from(observation.4));
+        print_str(b"\n");
+        return;
+    }
 }
 
 pub(super) unsafe fn acknowledge(
