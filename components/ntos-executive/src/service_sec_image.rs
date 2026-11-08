@@ -2041,8 +2041,8 @@ unsafe fn service_wait_admit_current(
         pending, root_reply, transfer, destination,
     );
     if admitted != RetainedWaitAdmission::Accepted { return admitted; }
-    reply_park.commit();
-    RetainedWaitAdmission::Accepted
+    if reply_park.try_commit().is_err() { RetainedWaitAdmission::Indeterminate }
+    else { RetainedWaitAdmission::Accepted }
 }
 
 unsafe fn lpc_wait_admit_retained(
