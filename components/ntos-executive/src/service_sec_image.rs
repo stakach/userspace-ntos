@@ -10568,9 +10568,6 @@ pub(crate) unsafe fn service_sec_image(
     nt_handler.loop_ctx = Some(memory_context);
     receive_vspace::install(nt_handler.hosted_vspace_observer());
     let mut receive_boundary = None;
-    // Diagnostic-only, allocation-free caller history. The service loop serializes its access.
-    let mut legacy_thread_sequence_probe =
-        nt_user_host::legacy_thread_sequence_probe::LegacyThreadSequenceProbe::new();
     'service_loop: loop {
         macro_rules! component_receive_outcome {
             ($outcome:expr) => {{
@@ -13338,47 +13335,6 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                     0
                 });
-            let legacy_thread_probe_owner =
-                nt_user_host::legacy_thread_sequence_probe::Caller {
-                    process: event_runtime.process,
-                    tid: event_runtime.tid,
-                    tcb: event_runtime.tcb,
-                };
-            use nt_user_host::legacy_thread_sequence_probe::ObservedService;
-            let legacy_thread_probe_service = if native_call_transport {
-                match m0 {
-                    SSN_NT_CREATE_THREAD => Some(ObservedService::CreateThread),
-                    SSN_NT_RESUME_THREAD => Some(ObservedService::ResumeThread),
-                    SSN_NT_CREATE_EVENT => Some(ObservedService::CreateEvent),
-                    _ => None,
-                }
-            } else { None };
-            let legacy_thread_probe_observation = legacy_thread_probe_service
-                .and_then(|service| legacy_thread_sequence_probe.ingress(legacy_thread_probe_owner, service));
-            if let Some(observation) = legacy_thread_probe_observation.filter(|item| item.trace) {
-                let process_generation = match legacy_thread_probe_owner.process.generation {
-                    nt_types::ProcessGeneration::Hosted(value)
-                    | nt_types::ProcessGeneration::Temporary(value) => value,
-                };
-                print_str(b"[legacy-thread-sequence] ingress pi/pid/pgen/tid/tcb/ssn/ordinal=");
-                print_u64(event_runtime.pi as u64);
-                print_str(b"/"); print_u64(u64::from(legacy_thread_probe_owner.process.pid));
-                print_str(b"/"); print_u64(process_generation);
-                print_str(b"/"); print_u64(event_runtime.tid);
-                print_str(b"/"); print_u64(event_runtime.tcb);
-                print_str(b"/"); print_u64(m0);
-                print_str(b"/"); print_u64(observation.create_ordinal);
-                print_str(b" prior-status/delivered=");
-                for prior in observation.earlier {
-                    print_hex_u64(prior.status.unwrap_or(u32::MAX) as u64);
-                    print_str(b"/");
-                    print_u64(prior.delivered.map_or(2, u64::from));
-                    print_str(b";");
-                }
-                print_str(b" reply=");
-                print_hex_u64(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
-                print_str(b"\n");
-            }
             if current_tid == event_runtime.tid {
                 crate::registry_mutation_work::trace_next_hosted_syscall(
                     event_runtime.binding(), raw_external_ssn, m0,
@@ -14411,14 +14367,6 @@ pub(crate) unsafe fn service_sec_image(
                         crate::disk_census_ticks().wrapping_sub(dispatch_started),
                     );
                     result = res.status as u64;
-                    if legacy_thread_probe_observation.is_some_and(|item| item.trace) {
-                        print_str(b"[legacy-thread-sequence] dispatch pi/tid/ssn/status=");
-                        print_u64(event_runtime.pi as u64);
-                        print_str(b"/"); print_u64(event_runtime.tid);
-                        print_str(b"/"); print_u64(m0);
-                        print_str(b"/"); print_hex_u64(result);
-                        print_str(b"\n");
-                    }
                     if m0 == SSN_NT_CREATE_THREAD {
                         let caller = nt_handler.thread_runtime.executable_by_tid(current_tid)
                             .filter(|runtime| runtime.pi == pi && runtime.badge == badge)
@@ -14971,14 +14919,6 @@ pub(crate) unsafe fn service_sec_image(
                         print_hex(ptr as u32);
                         print_str(b"\n");
                     }
-                }
-                if legacy_thread_probe_observation.is_some_and(|item| item.trace) {
-                    print_str(b"[legacy-thread-sequence] after-spawn pi/tid/ssn/status=");
-                    print_u64(event_runtime.pi as u64);
-                    print_str(b"/"); print_u64(event_runtime.tid);
-                    print_str(b"/"); print_u64(m0);
-                    print_str(b"/"); print_hex_u64(result);
-                    print_str(b"\n");
                 }
                 // Checkpoint B: NtWaitForSingleObject on an unsignaled real event asked to PARK this
                 // caller. Latch it for the reply site (the actual reply-cap steal happens there where
@@ -20755,15 +20695,6 @@ pub(crate) unsafe fn service_sec_image(
             // restart without IPC register fanout. NtContinue already bypassed this tail.
             let len = 1;
             let r0 = result;
-            if legacy_thread_probe_observation.is_some_and(|item| item.trace) {
-                print_str(b"[legacy-thread-sequence] reply-attempt pi/tid/ssn/status/reply=");
-                print_u64(event_runtime.pi as u64);
-                print_str(b"/"); print_u64(event_runtime.tid);
-                print_str(b"/"); print_u64(m0);
-                print_str(b"/"); print_hex_u64(r0);
-                print_str(b"/"); print_hex_u64(reply_main);
-                print_str(b"\n");
-            }
             if let Some(n) = lsa_logon_trace_seq {
                 LSA_LOGON_LAST_STATUS.store(r0, Ordering::Relaxed);
                 if n < 128 {
@@ -20829,19 +20760,6 @@ pub(crate) unsafe fn service_sec_image(
                     (received, delivered)
                 }
             };
-            if let Some(service) = legacy_thread_probe_service {
-                let _ = legacy_thread_sequence_probe.replied(
-                    legacy_thread_probe_owner, service, r0 as u32, native_reply_delivered);
-            }
-            if legacy_thread_probe_observation.is_some_and(|item| item.trace) {
-                print_str(b"[legacy-thread-sequence] reply-result pi/tid/ssn/delivered/next-badge=");
-                print_u64(event_runtime.pi as u64);
-                print_str(b"/"); print_u64(event_runtime.tid);
-                print_str(b"/"); print_u64(m0);
-                print_str(b"/"); print_u64(native_reply_delivered as u64);
-                print_str(b"/"); print_u64(nb);
-                print_str(b"\n");
-            }
             if trace_csrss_resume_reply {
                 print_str(b"[csrss-resume-reply] received badge=");
                 print_u64(nb);
