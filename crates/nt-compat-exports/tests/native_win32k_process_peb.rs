@@ -169,9 +169,10 @@ fn root_maps_exact_published_ps_objects_before_gui_request_publication() {
     assert!(position(&dispatch, "win32k_client_context_is_admitted")
         < position(&dispatch, "grant_win32k_client_ps_bodies"));
     assert!(position(&dispatch, "grant_win32k_client_ps_bodies")
-        < position(&dispatch, "clear_published_win32k_context"));
-    assert!(position(&dispatch, "grant_win32k_client_ps_bodies")
-        < position(&dispatch, "write_volatile"));
+        < position(&dispatch, "publish_initial_win32k_request"));
+    let publication = effects(&body(&file, "publish_initial_win32k_request"));
+    assert!(position(&publication, "clear_published_win32k_context")
+        < position(&publication, "write_volatile"));
     let backing = effects(&body(&source("ps_object_backing.rs"), "grant_published_body"));
     for required in ["thread_lifetime", "process_kernel_object", "thread_kernel_object"] {
         assert!(position(&backing, required) < position(&backing, "map_published_row"));

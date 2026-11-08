@@ -7253,213 +7253,31 @@ unsafe fn win32k_dispatch_kernel_job_observed(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-unsafe fn win32k_dispatch_wide_observed_inner(
-    ssn: u64,
-    a0: u64,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-    caller_sp: u64,
-    stack_args: &[u64],
-    completion_args: [u64; 4],
-    output_stage: Option<nt_user_callback::DispatchOutputStage>,
-    paint_output: Option<nt_user_callback::PaintOutputClaim>,
-    client: Win32kClientContext,
+/// Publish one fresh dispatch to the singleton win32k request and callback page. The caller
+/// must retain any displaced parent and acquire the physical lane before this first write.
+unsafe fn publish_initial_win32k_request(
+    dispatch: UserCallbackDispatchContext,
     request_kind: u64,
-    attach_client: bool,
-    entered: Option<&mut bool>,
-    kernel_job: Option<&mut dyn FnMut(
-        crate::spawn_hosts::PumpChannel, nt_component_suspension::LaneHandle,
-    ) -> Result<(u64, bool), u32>>,
-    dispatch_return_out: Option<&mut Option<nt_user_callback::DispatchReturn>>,
-    mut suspended_out: Option<&mut bool>,
+    client: Win32kClientContext,
+    arguments: [u64; 4],
+    stack_args: &[u64],
+    nested_user_callback: bool,
     dispatch_context_out: Option<&mut Option<nt_user_callback::DispatchContext>>,
-    mut mode: DispatchMode<'_>,
-) -> Win32kDispatchOutcome {
-    let source_kind = matches!(request_kind,
-        win32k_subsystem::WIN32K_REQUEST_SOURCE_PNP_TERMINAL
-        | win32k_subsystem::WIN32K_REQUEST_SOURCE_FSD_TERMINAL
-        | win32k_subsystem::WIN32K_REQUEST_SOURCE_IOCTL_TERMINAL);
-    if source_kind != matches!(&mode, DispatchMode::Source(_)) {
-        return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into();
-    }
-    // Reject before attachment or shared request writes, not only at later lane acquisition.
-    if ssn == nt_user_callback::NTUSER_SET_WINDOW_LONG_PTR_SSN
-        && a1 < 64
-        && WIN32K_WINDOW_EXTRA_INGRESS_TRACES.fetch_add(1, Ordering::Relaxed) < 256
-    {
-        print_str(b"[win32k-window-extra] ingress pi/tid/hwnd/index/value=");
-        for value in [client.pi as u64, client.tid, a0, a1, a2] {
-            print_str(b"/");
-            print_hex((value >> 32) as u32);
-            print_hex(value as u32);
-        }
-        print_str(b"\n");
-    }
-    let shared_busy = crate::service_sec_image::component_shared_publication_is_busy();
-    let busy_count = shared_busy.then(||
-        WIN32K_BUSY_INGRESS_TRACES.fetch_add(1, Ordering::Relaxed) + 1
-    );
-    if busy_count.is_some_and(|count| count <= 8 || count.is_power_of_two()) {
-        print_str(b"[win32k-busy-ingress] count/pi/tid/ssn/kind/a0/a1/active=");
-        for value in [busy_count.unwrap(), client.pi as u64, client.tid, ssn,
-            request_kind, a0, a1,
-            core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH)).dispatch_id] {
-            print_str(b"/");
-            print_hex_u64(value);
-        }
-        print_str(b"\n");
-    }
-    if shared_busy || !win32k_client_context_is_admitted(client)
-        || !callback_client_can_enter_nested(client) {
-        return (0xC000_000Du64, false).into();
-    }
-    if WIN32K_RETIRED.load(Ordering::Relaxed) != 0 {
-        return (0xC000_0001u64, false).into();
-    }
-    let active_parent = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
-    let displaced_parent = match crate::nested_restore_owner::capture_displaced_shared_resume(
-        active_parent,
-    ) {
-        None if active_parent.dispatch_id == 0 => None,
-        None => return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into(),
-        Some(Ok(ticket)) => Some(ticket),
-        Some(Err(())) => return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into(),
-    };
-    // ── REQUEST FILL (caller-owned, exactly as the FSD `dispatch_irp` fills the IRP before the pump).
-    // Attach win32k's client window to the CURRENT dispatch client (KeStackAttachProcess). If this is
-    // a different client than last time, the previous client's leaf pages are Unmapped so the new
-    // client's identical VAs re-fault to THIS client's frames (per-client cross-AS client memory).
-    let client_pi = client.pi as u64;
-    // TAIL WATCH tag 4/5 — sample EVERY hosted process' TEB tail immediately before and after every
-    // win32k dispatch (this is the single funnel all dispatch sites go through, nested ones too).
-    if attach_client {
-        for watch_pi in 1..5usize {
-            crate::teb_tail_watch(watch_pi, 4, ssn, client_pi);
-        }
-    }
-    if attach_client && !select_win32k_client_window(client) {
-        if let Some(ticket) = displaced_parent {
-            let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
-        }
-        return (0xC000_0001u64, false).into();
-    }
-    if grant_win32k_client_ps_bodies(client).is_err() {
-        if let Some(ticket) = displaced_parent {
-            let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
-        }
-        return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into();
-    }
+) -> UserCallbackDispatchContext {
+    let UserCallbackDispatchContext {
+        lane: _, dispatch_id, ssn, args: _, caller_sp, output_stage: _, paint_output: _,
+    } = dispatch;
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
-    let dispatch_id = USER_CALLBACK_DISPATCH_IDS.fetch_add(1, Ordering::Relaxed) + 1;
-    let callback_client = client.callback_client();
-    let registered_client = client.logical_caller.is_some()
-        && user_callback_client_can_register(callback_client);
-    let callback_capable = request_kind == win32k_subsystem::WIN32K_REQUEST_SSDT
-        && registered_client;
-    if registered_client && !register_win32k_dispatch_client(dispatch_id, callback_client)
-    {
-        print_str(b"[user-callback] callback client registry full for dispatch\n");
-        if let Some(ticket) = displaced_parent {
-            let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
-        }
-        return (0xC000_009Au64, false).into();
-    }
-    let nested_user_callback = match begin_nested_user_callback_dispatch(client, dispatch_id, ssn) {
-        Ok(nested) => nested,
-        Err(error) => {
-            if error == nt_user_callback::ContinuationError::Overflow {
-                USER_CALLBACK_CONTINUATION_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
-            }
-            print_str(b"[user-callback] rejected nested win32k dispatch: ");
-            print_str(match error {
-                nt_user_callback::ContinuationError::Overflow => b"continuation stack overflow\n",
-                nt_user_callback::ContinuationError::Underflow => b"continuation stack underflow\n",
-                nt_user_callback::ContinuationError::Sequence => b"invalid sequence\n",
-                nt_user_callback::ContinuationError::Kind => b"invalid continuation kind\n",
-                nt_user_callback::ContinuationError::State => b"invalid continuation state\n",
-                nt_user_callback::ContinuationError::Client => b"client identity mismatch\n",
-                nt_user_callback::ContinuationError::Correlation => {
-                    b"dispatch correlation mismatch\n"
-                }
-            });
-            if registered_client {
-                unregister_win32k_dispatch_client(
-                    dispatch_id,
-                    client.pi,
-                    client.tid,
-                    client.badge,
-                );
-            }
-            if let Some(ticket) = displaced_parent {
-                let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
-            }
-            return (0xC000_000Du64, false).into();
-        }
-    };
-    let outer_callback = nested_user_callback
-        .then(|| active_callback_lane_and_token(client))
-        .flatten();
-    let lane = if let Some((lane, token)) = outer_callback {
-        crate::service_sec_image::resume_external_component_execution_lane(lane, token)
-            .then_some(lane)
-    } else if nested_user_callback {
-        None
-    } else {
-        acquire_or_provision_win32k_execution_lane(ssn)
-    };
-    let Some(lane) = lane else {
-        if nested_user_callback {
-            let _ = complete_nested_user_callback_dispatch(client, dispatch_id);
-        }
-        if registered_client {
-            unregister_win32k_dispatch_client(
-                dispatch_id,
-                client.pi,
-                client.tid,
-                client.badge,
-            );
-        }
-        if let Some(ticket) = displaced_parent {
-            let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
-        }
-        return (0xC000_009Au64, false).into();
-    };
-    let dispatch = UserCallbackDispatchContext {
-        lane, dispatch_id, ssn, args: completion_args, caller_sp,
-        output_stage, paint_output,
-    };
-    if let Some(ticket) = displaced_parent {
-        if !crate::nested_restore_owner::begin_displacing_child(ticket, dispatch, client) {
-            let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
-            if registered_client {
-                unregister_win32k_dispatch_client(dispatch_id, client.pi, client.tid, client.badge);
-            }
-            return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into();
-        }
-    }
     clear_published_win32k_context();
     if let Some(out) = dispatch_context_out {
-        *out = Some(UserCallbackDispatchContext {
-            lane, dispatch_id, ssn, args: completion_args, caller_sp,
-            output_stage, paint_output,
-        });
+        *out = Some(dispatch);
     }
     let callback_frame =
         (sh + win32k_subsystem::SH_USER_CALLBACK) as *mut nt_user_callback::CallbackFrame;
     let previous_dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
-        UserCallbackDispatchContext {
-            lane,
-            dispatch_id,
-            ssn,
-            args: completion_args,
-            caller_sp,
-            output_stage,
-            paint_output,
-        },
+        dispatch,
     );
     core::ptr::write_volatile(
         core::ptr::addr_of_mut!((*callback_frame).header),
@@ -7476,10 +7294,10 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             win32k_subsystem::WIN32K_REQUEST_HOSTED_PS_OWNER
         } else { 0 },
     );
-    core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A0) as *mut u64, a0);
-    core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A1) as *mut u64, a1);
-    core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A2) as *mut u64, a2);
-    core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A3) as *mut u64, a3);
+    core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A0) as *mut u64, arguments[0]);
+    core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A1) as *mut u64, arguments[1]);
+    core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A2) as *mut u64, arguments[2]);
+    core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A3) as *mut u64, arguments[3]);
     core::ptr::write_volatile(
         (sh + win32k_subsystem::SH_REQ_PROCESS_ID) as *mut u64,
         client.pid,
@@ -7582,6 +7400,198 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     for index in 0..4 {
         core::ptr::write_volatile((sh + win32k_subsystem::SH_DISPATCH_RETURN + index * 8) as *mut u64, 0);
     }
+    previous_dispatch
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn win32k_dispatch_wide_observed_inner(
+    ssn: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    caller_sp: u64,
+    stack_args: &[u64],
+    completion_args: [u64; 4],
+    output_stage: Option<nt_user_callback::DispatchOutputStage>,
+    paint_output: Option<nt_user_callback::PaintOutputClaim>,
+    client: Win32kClientContext,
+    request_kind: u64,
+    attach_client: bool,
+    entered: Option<&mut bool>,
+    kernel_job: Option<&mut dyn FnMut(
+        crate::spawn_hosts::PumpChannel, nt_component_suspension::LaneHandle,
+    ) -> Result<(u64, bool), u32>>,
+    dispatch_return_out: Option<&mut Option<nt_user_callback::DispatchReturn>>,
+    mut suspended_out: Option<&mut bool>,
+    dispatch_context_out: Option<&mut Option<nt_user_callback::DispatchContext>>,
+    mut mode: DispatchMode<'_>,
+) -> Win32kDispatchOutcome {
+    let source_kind = matches!(request_kind,
+        win32k_subsystem::WIN32K_REQUEST_SOURCE_PNP_TERMINAL
+        | win32k_subsystem::WIN32K_REQUEST_SOURCE_FSD_TERMINAL
+        | win32k_subsystem::WIN32K_REQUEST_SOURCE_IOCTL_TERMINAL);
+    if source_kind != matches!(&mode, DispatchMode::Source(_)) {
+        return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into();
+    }
+    // Reject before attachment or shared request writes, not only at later lane acquisition.
+    if ssn == nt_user_callback::NTUSER_SET_WINDOW_LONG_PTR_SSN
+        && a1 < 64
+        && WIN32K_WINDOW_EXTRA_INGRESS_TRACES.fetch_add(1, Ordering::Relaxed) < 256
+    {
+        print_str(b"[win32k-window-extra] ingress pi/tid/hwnd/index/value=");
+        for value in [client.pi as u64, client.tid, a0, a1, a2] {
+            print_str(b"/");
+            print_hex((value >> 32) as u32);
+            print_hex(value as u32);
+        }
+        print_str(b"\n");
+    }
+    let shared_busy = crate::service_sec_image::component_shared_publication_is_busy();
+    let busy_count = shared_busy.then(||
+        WIN32K_BUSY_INGRESS_TRACES.fetch_add(1, Ordering::Relaxed) + 1
+    );
+    if busy_count.is_some_and(|count| count <= 8 || count.is_power_of_two()) {
+        print_str(b"[win32k-busy-ingress] count/pi/tid/ssn/kind/a0/a1/active=");
+        for value in [busy_count.unwrap(), client.pi as u64, client.tid, ssn,
+            request_kind, a0, a1,
+            core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH)).dispatch_id] {
+            print_str(b"/");
+            print_hex_u64(value);
+        }
+        print_str(b"\n");
+    }
+    if shared_busy || !win32k_client_context_is_admitted(client)
+        || !callback_client_can_enter_nested(client) {
+        return (0xC000_000Du64, false).into();
+    }
+    if WIN32K_RETIRED.load(Ordering::Relaxed) != 0 {
+        return (0xC000_0001u64, false).into();
+    }
+    let active_parent = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    let displaced_parent = match crate::nested_restore_owner::capture_displaced_shared_resume(
+        active_parent,
+    ) {
+        None if active_parent.dispatch_id == 0 => None,
+        None => return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into(),
+        Some(Ok(ticket)) => Some(ticket),
+        Some(Err(())) => return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into(),
+    };
+    // ── REQUEST FILL (caller-owned, exactly as the FSD `dispatch_irp` fills the IRP before the pump).
+    // Attach win32k's client window to the CURRENT dispatch client (KeStackAttachProcess). If this is
+    // a different client than last time, the previous client's leaf pages are Unmapped so the new
+    // client's identical VAs re-fault to THIS client's frames (per-client cross-AS client memory).
+    let client_pi = client.pi as u64;
+    // TAIL WATCH tag 4/5 — sample EVERY hosted process' TEB tail immediately before and after every
+    // win32k dispatch (this is the single funnel all dispatch sites go through, nested ones too).
+    if attach_client {
+        for watch_pi in 1..5usize {
+            crate::teb_tail_watch(watch_pi, 4, ssn, client_pi);
+        }
+    }
+    if attach_client && !select_win32k_client_window(client) {
+        if let Some(ticket) = displaced_parent {
+            let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
+        }
+        return (0xC000_0001u64, false).into();
+    }
+    if grant_win32k_client_ps_bodies(client).is_err() {
+        if let Some(ticket) = displaced_parent {
+            let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
+        }
+        return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into();
+    }
+    let dispatch_id = USER_CALLBACK_DISPATCH_IDS.fetch_add(1, Ordering::Relaxed) + 1;
+    let callback_client = client.callback_client();
+    let registered_client = client.logical_caller.is_some()
+        && user_callback_client_can_register(callback_client);
+    let callback_capable = request_kind == win32k_subsystem::WIN32K_REQUEST_SSDT
+        && registered_client;
+    if registered_client && !register_win32k_dispatch_client(dispatch_id, callback_client)
+    {
+        print_str(b"[user-callback] callback client registry full for dispatch\n");
+        if let Some(ticket) = displaced_parent {
+            let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
+        }
+        return (0xC000_009Au64, false).into();
+    }
+    let nested_user_callback = match begin_nested_user_callback_dispatch(client, dispatch_id, ssn) {
+        Ok(nested) => nested,
+        Err(error) => {
+            if error == nt_user_callback::ContinuationError::Overflow {
+                USER_CALLBACK_CONTINUATION_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+            }
+            print_str(b"[user-callback] rejected nested win32k dispatch: ");
+            print_str(match error {
+                nt_user_callback::ContinuationError::Overflow => b"continuation stack overflow\n",
+                nt_user_callback::ContinuationError::Underflow => b"continuation stack underflow\n",
+                nt_user_callback::ContinuationError::Sequence => b"invalid sequence\n",
+                nt_user_callback::ContinuationError::Kind => b"invalid continuation kind\n",
+                nt_user_callback::ContinuationError::State => b"invalid continuation state\n",
+                nt_user_callback::ContinuationError::Client => b"client identity mismatch\n",
+                nt_user_callback::ContinuationError::Correlation => {
+                    b"dispatch correlation mismatch\n"
+                }
+            });
+            if registered_client {
+                unregister_win32k_dispatch_client(
+                    dispatch_id,
+                    client.pi,
+                    client.tid,
+                    client.badge,
+                );
+            }
+            if let Some(ticket) = displaced_parent {
+                let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
+            }
+            return (0xC000_000Du64, false).into();
+        }
+    };
+    let outer_callback = nested_user_callback
+        .then(|| active_callback_lane_and_token(client))
+        .flatten();
+    let lane = if let Some((lane, token)) = outer_callback {
+        crate::service_sec_image::resume_external_component_execution_lane(lane, token)
+            .then_some(lane)
+    } else if nested_user_callback {
+        None
+    } else {
+        acquire_or_provision_win32k_execution_lane(ssn)
+    };
+    let Some(lane) = lane else {
+        if nested_user_callback {
+            let _ = complete_nested_user_callback_dispatch(client, dispatch_id);
+        }
+        if registered_client {
+            unregister_win32k_dispatch_client(
+                dispatch_id,
+                client.pi,
+                client.tid,
+                client.badge,
+            );
+        }
+        if let Some(ticket) = displaced_parent {
+            let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
+        }
+        return (0xC000_009Au64, false).into();
+    };
+    let dispatch = UserCallbackDispatchContext {
+        lane, dispatch_id, ssn, args: completion_args, caller_sp,
+        output_stage, paint_output,
+    };
+    if let Some(ticket) = displaced_parent {
+        if !crate::nested_restore_owner::begin_displacing_child(ticket, dispatch, client) {
+            let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
+            if registered_client {
+                unregister_win32k_dispatch_client(dispatch_id, client.pi, client.tid, client.badge);
+            }
+            return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into();
+        }
+    }
+    let previous_dispatch = publish_initial_win32k_request(
+        dispatch, request_kind, client, [a0, a1, a2, a3], stack_args,
+        nested_user_callback, dispatch_context_out,
+    );
     // ── FAULT LOOP (shared): drive win32k's dispatch through the unified `component_pump`, all win32k
     // capability gates TRUE. Fix (A) [DONE via a plain Send, distinguished by label] + Fix (B) [nested
     // faults answered through the per-caller REPLY_W32 cap so REPLY_MAIN's binding to the outer csrss
