@@ -68,11 +68,13 @@ impl SharedPageLeaseIdentity {
     }
 }
 
-/// A complete shared-page capture, including request ownership independent of the header.
-/// The native adapter must read a stable header both before and after the request/context cells.
+/// Dispatch-owned publication in the shared page. Global SAS, GDI, SSDT, and callout cells are
+/// independent publications and must not be rewound when a parked dispatch reacquires the page.
+/// The native adapter must read a stable header, request/context cells, and callback payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SharedPageSnapshot {
     pub header: CallbackHeader,
+    pub callback_payload: [u8; crate::CALLBACK_PAYLOAD_MAX],
     pub publication: SharedCallbackPublication,
     pub request_owner: SharedPageClientIdentity,
     pub request_ssn: u64,

@@ -253,13 +253,14 @@ pub(crate) struct SharedResumeSnapshot {
 impl SharedResumeSnapshot {
     pub(crate) fn lease_snapshot(
         &self, client: Win32kClientContext,
-    ) -> nt_user_callback::SharedPageSnapshot {
-        nt_user_callback::SharedPageSnapshot {
+    ) -> Option<nt_user_callback::SharedPageSnapshot> {
+        Some(nt_user_callback::SharedPageSnapshot {
             header: self.header,
+            callback_payload: self.payload?,
             publication: self.callback_publication(),
             request_owner: shared_page_client_identity(client),
             request_ssn: self.request[0],
-        }
+        })
     }
 
     pub(crate) fn callback_publication(&self) -> nt_user_callback::SharedCallbackPublication {
@@ -442,7 +443,7 @@ pub(crate) unsafe fn try_capture_exact_shared_resume_snapshot(
     let snapshot = SharedResumeSnapshot {
         header: header_before, payload: Some(payload), published, request,
     };
-    let page = snapshot.lease_snapshot(client);
+    let page = snapshot.lease_snapshot(client)?;
     if !page.matches(nt_user_callback::SharedPageLeaseIdentity {
         dispatch,
         client: page.request_owner,

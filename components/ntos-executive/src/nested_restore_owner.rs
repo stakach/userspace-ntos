@@ -328,9 +328,12 @@ pub(crate) unsafe fn capture_displaced_shared_resume(
             let _ = row.frame.quarantine_receive(key);
             return Some(Err(()));
         };
+        let Some(page) = snapshot.lease_snapshot(pending.snapshot.client) else {
+            let _ = row.frame.quarantine_receive(key);
+            return Some(Err(()));
+        };
         if row.shared_leases.begin(identity).is_err()
-            || row.shared_leases.displace(identity,
-                snapshot.lease_snapshot(pending.snapshot.client)).is_err()
+            || row.shared_leases.displace(identity, page).is_err()
         {
             let _ = row.frame.quarantine_receive(key);
             return Some(Err(()));
@@ -379,7 +382,10 @@ pub(crate) unsafe fn abort_displaced_shared_resume(
         dispatch: parent.snapshot.dispatch,
         client: win32k_glue::shared_page_client_identity(parent.snapshot.client),
     };
-    let page = snapshot.lease_snapshot(parent.snapshot.client);
+    let Some(page) = snapshot.lease_snapshot(parent.snapshot.client) else {
+        let _ = row.frame.quarantine_receive(ticket.key);
+        return false;
+    };
     if !win32k_glue::select_and_restore_shared_resume_snapshot(
         snapshot, parent.snapshot.dispatch, parent.snapshot.client,
     ).1
@@ -420,9 +426,8 @@ pub(crate) unsafe fn finish_displacing_child(
     let finished = if terminal && yielded.is_none() {
         row.shared_leases.finish_terminal(child).is_ok()
     } else if !terminal {
-        yielded.is_some_and(|snapshot| row.shared_leases.finish(
-            child, Some(snapshot.lease_snapshot(client)),
-        ).is_ok())
+        yielded.is_some_and(|snapshot| snapshot.lease_snapshot(client)
+            .is_some_and(|page| row.shared_leases.finish(child, Some(page)).is_ok()))
     } else { false };
     if !finished {
         let _ = row.frame.quarantine_receive(ticket.key);
@@ -440,7 +445,10 @@ pub(crate) unsafe fn finish_displacing_child(
         dispatch: parent.snapshot.dispatch,
         client: win32k_glue::shared_page_client_identity(parent.snapshot.client),
     };
-    let page = parent_snapshot.lease_snapshot(parent.snapshot.client);
+    let Some(page) = parent_snapshot.lease_snapshot(parent.snapshot.client) else {
+        let _ = row.frame.quarantine_receive(ticket.key);
+        return false;
+    };
     if !win32k_glue::select_and_restore_shared_resume_snapshot(
         parent_snapshot, parent.snapshot.dispatch, parent.snapshot.client,
     ).1

@@ -27,10 +27,33 @@ fn snapshot(owner: SharedPageLeaseIdentity, marker: u64) -> SharedPageSnapshot {
         header: CallbackHeader::idle(
             owner.dispatch.dispatch_id, owner.client.pi, owner.client.tid, owner.client.badge,
         ),
+        callback_payload: {
+            let mut payload = [0; CALLBACK_PAYLOAD_MAX];
+            payload[..8].copy_from_slice(&marker.to_le_bytes());
+            payload
+        },
         publication: SharedCallbackPublication::new(request, [marker; 6]),
         request_owner: owner.client,
         request_ssn: owner.dispatch.ssn,
     }
+}
+
+#[test]
+fn parked_page_restores_outer_callback_payload_after_nested_overwrite() {
+    let outer = identity(91, 1);
+    let inner = identity(92, 1);
+    let outer_page = snapshot(outer, 0x1234);
+    let inner_page = snapshot(inner, 0x5678);
+    let mut authority = SharedPageAuthority::<2>::new();
+    authority.enter(outer, ReplyToken(core::cell::Cell::new(7))).unwrap();
+    assert_eq!(authority.capture_and_park(outer, outer_page), Ok(()));
+    authority.enter(inner, ReplyToken(core::cell::Cell::new(8))).unwrap();
+    assert_eq!(authority.capture_and_park(inner, inner_page), Ok(()));
+    let restored = authority.reacquire(outer).unwrap();
+    assert_eq!(&restored.callback_payload[..8], &0x1234u64.to_le_bytes());
+    assert_ne!(restored.callback_payload, inner_page.callback_payload);
+    assert_eq!(authority.acknowledge_restore(outer,
+        SharedPageRestoreEffect::Applied(restored)), Ok(()));
 }
 
 #[test]
