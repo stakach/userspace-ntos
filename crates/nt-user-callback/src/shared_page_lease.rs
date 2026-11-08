@@ -184,7 +184,8 @@ impl<const N: usize> SharedPageLeaseStack<N> {
     }
 
     /// Clear a displaced lease only after the exact old publication was physically restored.
-    /// A refusal retains it; an uncertain restore quarantines it without a replay path.
+    /// A no-effect refusal retains it; uncertain or mismatched applied evidence quarantines it
+    /// without a replay path.
     pub fn acknowledge_restore(
         &mut self,
         identity: SharedPageLeaseIdentity,
@@ -205,7 +206,10 @@ impl<const N: usize> SharedPageLeaseStack<N> {
                 frame.state = LeaseState::Live;
                 Ok(())
             }
-            SharedPageRestoreEffect::Applied(_) => Err(SharedPageLeaseError::WrongSnapshot),
+            SharedPageRestoreEffect::Applied(_) => {
+                frame.state = LeaseState::Uncertain(saved);
+                Err(SharedPageLeaseError::WrongSnapshot)
+            }
             SharedPageRestoreEffect::NoEffect => Err(SharedPageLeaseError::RestoreNotApplied),
             SharedPageRestoreEffect::Uncertain => {
                 frame.state = LeaseState::Uncertain(saved);
@@ -430,7 +434,8 @@ impl<const N: usize> SharedPageAuthority<N> {
     }
 
     /// Only an exact, physically applied restoration makes the parked owner active again.
-    /// Uncertain native writes pin the saved publication and cannot be replayed.
+    /// Uncertain native writes or mismatched applied evidence pin the saved publication and
+    /// cannot be replayed.
     pub fn acknowledge_restore(
         &mut self, identity: SharedPageLeaseIdentity, effect: SharedPageRestoreEffect,
     ) -> Result<(), SharedPageLeaseError> {
@@ -447,7 +452,10 @@ impl<const N: usize> SharedPageAuthority<N> {
                 self.current = Some(PageAuthorityState::Active(identity));
                 Ok(())
             }
-            SharedPageRestoreEffect::Applied(_) => Err(SharedPageLeaseError::WrongSnapshot),
+            SharedPageRestoreEffect::Applied(_) => {
+                self.current = Some(PageAuthorityState::Uncertain(identity, Some(saved)));
+                Err(SharedPageLeaseError::WrongSnapshot)
+            }
             SharedPageRestoreEffect::NoEffect => Err(SharedPageLeaseError::RestoreNotApplied),
             SharedPageRestoreEffect::Uncertain => {
                 self.current = Some(PageAuthorityState::Uncertain(identity, Some(saved)));

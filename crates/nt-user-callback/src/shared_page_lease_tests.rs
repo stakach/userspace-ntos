@@ -338,3 +338,34 @@ fn global_page_owner_refuses_stale_reacquire_and_pins_uncertain_effects() {
     assert!(page.finish_active(current).is_err(), "uncertain owner cannot be released or replayed");
     assert!(page.reacquire(current).is_err(), "uncertain restoration cannot be retried");
 }
+
+#[test]
+fn wrong_applied_restore_quarantines_both_page_owners() {
+    let outer = identity(91, 1);
+    let other = identity(92, 1);
+    let saved = snapshot(outer, 4655);
+    let wrong = snapshot(outer, 9999);
+
+    let mut leases = SharedPageLeaseStack::<1>::new();
+    leases.begin(outer).unwrap();
+    leases.displace(outer, saved).unwrap();
+    assert_eq!(leases.acknowledge_restore(outer, SharedPageRestoreEffect::Applied(wrong)),
+        Err(SharedPageLeaseError::WrongSnapshot));
+    assert_eq!(leases.acknowledge_restore(outer, SharedPageRestoreEffect::Applied(saved)),
+        Err(SharedPageLeaseError::Uncertain),
+        "an applied foreign publication cannot be retried as the saved page");
+    assert_eq!(leases.finish(outer, None), Err(SharedPageLeaseError::Uncertain));
+
+    let mut page = SharedPageAuthority::<1>::new();
+    page.enter(outer, ReplyToken(core::cell::Cell::new(91))).unwrap();
+    page.capture_and_park(outer, saved).unwrap();
+    assert_eq!(page.reacquire(outer), Ok(saved));
+    assert_eq!(page.acknowledge_restore(outer, SharedPageRestoreEffect::Applied(wrong)),
+        Err(SharedPageLeaseError::WrongSnapshot));
+    assert_eq!(page.acknowledge_restore(outer, SharedPageRestoreEffect::Applied(saved)),
+        Err(SharedPageLeaseError::Uncertain));
+    assert_eq!(page.finish_active(outer), Err(SharedPageLeaseError::Uncertain));
+    let (_, reply) = page.enter(other, ReplyToken(core::cell::Cell::new(92)))
+        .err().expect("wrong applied bytes fence all future publication");
+    assert_eq!(reply.0.get(), 92);
+}
