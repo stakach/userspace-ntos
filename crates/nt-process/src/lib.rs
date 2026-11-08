@@ -1218,6 +1218,9 @@ pub struct Win32Callouts {
 /// The Process Manager: processes, threads, and image sections (spec §5, §9-§13).
 #[derive(Default)]
 pub struct ProcessManager {
+    /// Active virtual processor mask for a newly admitted root process. `None` keeps the
+    /// historical one-processor default for a directly default-constructed manager.
+    active_affinity_mask: Option<u64>,
     /// Move-stable owner identity for prepared process scheduler transitions.
     priority_plan_manager_identity: u64,
     /// Lazily assigned, move-stable identity for suspend-control plans.
@@ -1274,6 +1277,18 @@ impl ProcessManager {
             module_limit: DEFAULT_TRACKED_MODULES,
             ..Default::default()
         }
+    }
+
+    /// Construct Ps policy for a boot topology. Invalid processor counts are rejected before
+    /// any process is admitted.
+    pub fn new_with_active_processor_count(count: u64) -> Option<Self> {
+        if !(1..=64).contains(&count) {
+            return None;
+        }
+        Some(Self {
+            active_affinity_mask: Some(u64::MAX >> (64 - count)),
+            ..Self::new()
+        })
     }
 
     /// Whether any provider process-exit callback is currently registered.
@@ -1439,7 +1454,7 @@ impl ProcessManager {
         let affinity_mask = parent
             .and_then(|pid| self.processes.get(&pid))
             .map(|process| process.affinity_mask)
-            .unwrap_or(1);
+            .unwrap_or(self.active_affinity_mask.unwrap_or(1));
         let base_priority = parent
             .and_then(|pid| self.processes.get(&pid))
             .map(|process| process.base_priority)

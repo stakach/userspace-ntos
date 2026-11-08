@@ -145,7 +145,12 @@ pub(crate) unsafe fn with_security_managers<R>(
 
 #[inline(never)]
 fn seed_processes(entry: u64, parameter: u64) -> Result<PsBootstrapSeed, u32> {
-    let mut ps = nt_user_host::ps_bootstrap::PsBootstrapState::try_new(entry, parameter)?;
+    let processor_count = SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed);
+    let mut ps = nt_user_host::ps_bootstrap::PsBootstrapState::try_new_with_active_processor_count(
+        entry,
+        parameter,
+        processor_count,
+    )?;
     let (pm, tokens) = ps.managers_mut();
     let system = pm
         .initial_system_identity()

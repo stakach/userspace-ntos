@@ -3,6 +3,49 @@ use alloc::format;
 use nt_driver_test_fixtures::{minimal_pe, DEFAULT_IMAGE_BASE};
 
 #[test]
+fn boot_topology_sets_root_process_and_inherited_thread_affinity() {
+    let mut pm = ProcessManager::new_with_active_processor_count(4).unwrap();
+    let system = pm.create_process("System", None, None);
+    let system_thread = pm.create_thread(system, 0x1000, 0, true).unwrap();
+    let child = pm.create_process("child.exe", Some(system), None);
+    let child_thread = pm.create_thread(child, 0x2000, 0, false).unwrap();
+    for pid in [system, child] {
+        assert_eq!(
+            pm.query_process_basic(pid, u64::MAX).unwrap().affinity_mask,
+            0b1111
+        );
+    }
+    for (pid, tid) in [(system, system_thread), (child, child_thread)] {
+        assert_eq!(
+            pm.query_thread_basic(pid, tid, u64::MAX - 1)
+                .unwrap()
+                .affinity_mask,
+            0b1111
+        );
+    }
+    assert!(ProcessManager::new_with_active_processor_count(0).is_none());
+    assert!(ProcessManager::new_with_active_processor_count(65).is_none());
+    let mut max_pm = ProcessManager::new_with_active_processor_count(64).unwrap();
+    let max_pid = max_pm.create_process("max.exe", None, None);
+    assert_eq!(
+        max_pm
+            .query_process_basic(max_pid, u64::MAX)
+            .unwrap()
+            .affinity_mask,
+        u64::MAX
+    );
+    let mut legacy_pm = ProcessManager::new();
+    let legacy_pid = legacy_pm.create_process("legacy.exe", None, None);
+    assert_eq!(
+        legacy_pm
+            .query_process_basic(legacy_pid, u64::MAX)
+            .unwrap()
+            .affinity_mask,
+        1
+    );
+}
+
+#[test]
 fn client_ids_are_handle_shaped_and_globally_unique() {
     let mut pm = ProcessManager::new();
     let first_pid = pm.create_process("first.exe", None, None);

@@ -23,10 +23,20 @@ impl PsBootstrapState {
     /// allocation. Checked policy failures leave no published aggregate. The underlying process
     /// and token constructors retain their existing infallible allocation behavior.
     pub fn try_new(start_address: u64, parameter: u64) -> Result<Self, u32> {
+        Self::try_new_with_active_processor_count(start_address, parameter, 1)
+    }
+
+    /// Seed System under the boot processor topology before handing Ps ownership to the host.
+    pub fn try_new_with_active_processor_count(
+        start_address: u64,
+        parameter: u64,
+        active_processor_count: u64,
+    ) -> Result<Self, u32> {
         if start_address == 0 {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let mut pm = ProcessManager::new();
+        let mut pm = ProcessManager::new_with_active_processor_count(active_processor_count)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
         let mut token_store = TokenStore::new();
         let pid = pm.create_process("System", None, None);
         let primary = token_store.insert(AccessToken::system());

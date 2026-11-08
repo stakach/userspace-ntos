@@ -2,6 +2,50 @@ use super::*;
 use nt_security::{CapturedSubjectContext, TokenType};
 
 #[test]
+fn topology_affinity_survives_system_seed_child_creation_and_handoff() {
+    let mut state = PsBootstrapState::try_new_with_active_processor_count(0x1000, 0, 4).unwrap();
+    let identity = state.process_manager().initial_system_identity().unwrap();
+    let (pm, _) = state.managers_mut();
+    let child = pm.create_process("smss.exe", Some(identity.process_id()), None);
+    let child_thread = pm.create_thread(child, 0x4000, 0, false).unwrap();
+    let parts = state.into_parts();
+    for pid in [identity.process_id(), child] {
+        assert_eq!(
+            parts.pm.query_process_basic(pid, u64::MAX).unwrap().affinity_mask,
+            0b1111
+        );
+    }
+    for (pid, tid) in [(identity.process_id(), identity.thread_id()), (child, child_thread)] {
+        assert_eq!(
+            parts.pm
+                .query_thread_basic(pid, tid, u64::MAX - 1)
+                .unwrap()
+                .affinity_mask,
+            0b1111
+        );
+    }
+    for invalid in [0, 65, u64::MAX] {
+        assert!(matches!(
+            PsBootstrapState::try_new_with_active_processor_count(0x1000, 0, invalid),
+            Err(STATUS_INVALID_PARAMETER)
+        ));
+    }
+    let max = PsBootstrapState::try_new_with_active_processor_count(0x1000, 0, 64).unwrap();
+    let max_pid = max
+        .process_manager()
+        .initial_system_identity()
+        .unwrap()
+        .process_id();
+    assert_eq!(
+        max.process_manager()
+            .query_process_basic(max_pid, u64::MAX)
+            .unwrap()
+            .affinity_mask,
+        u64::MAX
+    );
+}
+
+#[test]
 fn creates_real_running_system_objects_without_native_projections() {
     let state = PsBootstrapState::try_new(0x1000, 0x55).unwrap();
     let pm = state.process_manager();
