@@ -382,8 +382,10 @@ pub(crate) unsafe fn wake_due(now_100ns: u64) -> u64 {
 
 /// Called at the outer service boundary, never from within the startup worker pump.
 pub(crate) unsafe fn drain() -> usize {
-    let now = crate::monotonic_time_100ns();
-    let Some(attempt) = STARTUP_RESTORE_WAKE.begin_redrive(now, has_pending_startup_restore())
+    let Some((attempt, now)) = STARTUP_RESTORE_WAKE.begin_redrive_with_clock(
+        has_pending_startup_restore(),
+        crate::monotonic_time_100ns,
+    )
     else { return 0; };
     // Publish the next cadence before a retry can enter another service turn.
     let _ = attempt.retry_at(now.saturating_add(STARTUP_RESTORE_RETRY_100NS));

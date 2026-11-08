@@ -114,8 +114,10 @@ pub(crate) unsafe fn wake_due(now_100ns: u64) -> u64 {
 /// lane and delete ticket; the timer merely schedules another exact restore attempt.
 pub(crate) unsafe fn drain() -> usize {
     let mut completed = 0;
-    let now = monotonic_time_100ns();
-    if let Some(attempt) = WAKE.begin_redrive(now, hosted_class_irp_lane::has_pending_delete()) {
+    if let Some((attempt, now)) = WAKE.begin_redrive_with_clock(
+        hosted_class_irp_lane::has_pending_delete(),
+        monotonic_time_100ns,
+    ) {
         // Redrive can nest through a provider callback. Move the next wake before entering
         // any native effect so an inner service turn cannot select the same due attempt.
         let _ = attempt.retry_at(now.saturating_add(DELETE_RETRY_INTERVAL_100NS));

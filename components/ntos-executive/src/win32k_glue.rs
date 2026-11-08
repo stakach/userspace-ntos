@@ -865,9 +865,9 @@ pub(crate) unsafe fn win32k_startup_restore_wake_due(now_100ns: u64) -> u64 {
 /// Called only at the outer service boundary; startup itself is never replayed.
 pub(crate) unsafe fn drain_win32k_startup_restores() -> usize {
     use crate::spawn_hosts::shared_ingress::owner::runtime;
-    let now = crate::monotonic_time_100ns();
-    let Some(attempt) = WIN32K_STARTUP_RESTORE_WAKE.begin_redrive(
-        now, win32k_startup_restore_is_retryable(),
+    let Some((attempt, now)) = WIN32K_STARTUP_RESTORE_WAKE.begin_redrive_with_clock(
+        win32k_startup_restore_is_retryable(),
+        crate::monotonic_time_100ns,
     ) else { return 0; };
     let _ = attempt.retry_at(now.saturating_add(WIN32K_STARTUP_RESTORE_RETRY_100NS));
     if let Some(index) = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES)).as_ref()

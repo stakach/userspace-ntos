@@ -83,6 +83,17 @@ impl CoalescedRetryWake {
             })
     }
 
+    /// Preserve the same time sample for the due decision and the next retry deadline.
+    pub fn begin_redrive_with_clock(
+        &self,
+        has_work: bool,
+        clock: impl FnOnce() -> u64,
+    ) -> Option<(RetryWakeAttempt<'_>, u64)> {
+        if !has_work { return None; }
+        let now = clock();
+        self.begin_redrive(now, has_work).map(|attempt| (attempt, now))
+    }
+
     /// An attempted redrive may schedule a later retry only if no nested callback published
     /// newer work. Both mutations are serialized; a newer earlier deadline remains authoritative.
     fn retry_after(&self, publication: u64, deadline: u64) -> bool {
@@ -366,6 +377,30 @@ mod tests {
         wake.publish(200);
         assert!(!wake.due_for_outer(199, true));
         assert!(wake.due_for_outer(200, true));
+    }
+
+    #[test]
+    fn empty_outer_redrive_does_not_read_clock_and_retains_new_publication() {
+        use core::cell::Cell;
+
+        let wake = CoalescedRetryWake::new();
+        let reads = Cell::new(0);
+        let clock = || { reads.set(reads.get() + 1); 100 };
+        assert!(wake.begin_redrive_with_clock(false, clock).is_none());
+        assert_eq!(reads.get(), 0);
+
+        wake.publish(100);
+        assert!(wake.begin_redrive_with_clock(true, || 99).is_none());
+        let (attempt, now) = wake.begin_redrive_with_clock(true, || 100).unwrap();
+        assert_eq!(now, 100);
+        wake.publish(150);
+        assert!(!attempt.retry_at(now + 50));
+        assert_eq!(wake.next_deadline(true), Some(150));
+
+        // A producer can publish while the clock callback runs. The due decision must observe
+        // the later authoritative deadline rather than claim the older work.
+        assert!(wake.begin_redrive_with_clock(true, || { wake.publish(300); 200 }).is_none());
+        assert_eq!(wake.next_deadline(true), Some(300));
     }
 
     #[test]
