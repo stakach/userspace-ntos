@@ -207,6 +207,8 @@ pub(crate) unsafe fn run_hosted(
 }
 
 /// Resume only the exact Receive child boundary retained by the physical parent owner.
+/// Keep its large retained frame and pending-dispatch copies off the outer service loop stack.
+#[inline(never)]
 pub(crate) unsafe fn run_receive(
     nt_handler: *mut ExecNtHandler,
     boundary: crate::spawn_hosts::shared_ingress::owner::runtime::ReceiveSettlementBoundary,
