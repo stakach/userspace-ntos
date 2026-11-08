@@ -284,6 +284,21 @@ class BootProgressWatchdogTests(unittest.TestCase):
         self.assertFalse(watchdog.observe_blockstats(self.blockstats(12288, 0), 540))
         self.assertIsNotNone(watchdog.idle_reason(540))
 
+    def test_fresh_substantial_disk_work_is_not_stationary_after_two_small_graces(self):
+        # Boot 42452498180 stopped at 1,563s with 1.42 MiB newly completed in its final
+        # ten seconds. The outer boot deadline remains the absolute run bound.
+        watchdog = self.watchdog()
+        watchdog.observe_blockstats(self.blockstats(0, 0), 0)
+        watchdog.observe_blockstats(self.blockstats(0, 0), 170)
+        self.assertTrue(watchdog.observe_blockstats(self.blockstats(4096, 0), 180))
+        watchdog.observe_blockstats(self.blockstats(4096, 0), 350)
+        self.assertTrue(watchdog.observe_blockstats(self.blockstats(8192, 0), 360))
+        watchdog.observe_blockstats(self.blockstats(8192, 0), 530)
+        self.assertTrue(watchdog.observe_blockstats(self.blockstats(8192 + 2 * 1024 * 1024, 0), 540))
+        self.assertIsNone(watchdog.idle_reason(540))
+        watchdog.observe_blockstats(self.blockstats(8192 + 2 * 1024 * 1024, 0), 710)
+        self.assertIsNotNone(watchdog.idle_reason(720), "old bytes cannot keep a flat guest alive")
+
     def test_old_disk_bytes_cannot_extend_a_stationary_boot(self):
         # KVM 41608161520: a 36 s driver milestone was followed by a final write
         # near 40 s. The 210 s sample was flat, yet the old watchdog credited

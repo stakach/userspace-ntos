@@ -83,10 +83,11 @@ INSTALL_PIPE_OPEN = re.compile(
 # QMP block statistics are sampled every ten seconds. A change observed after
 # more than two missed samples cannot prove when its disk work actually ran.
 RECENT_DISK_SAMPLE_SECONDS = 30
+SUSTAINED_DISK_PROGRESS_BYTES = 1024 * 1024
 
 
 class BootProgressWatchdog:
-    """Bound a boot by finite milestones and two real disk-I/O graces per epoch."""
+    """Bound a boot by finite milestones, small disk graces, and fresh sustained I/O."""
 
     def __init__(self, started, idle_seconds=180, max_disk_extensions=2):
         self.idle_seconds = idle_seconds
@@ -200,17 +201,24 @@ class BootProgressWatchdog:
         if previous is None or self.disk_checkpoint is None:
             self.disk_checkpoint = total
             return False
-        if (now - self.last_progress < self.idle_seconds
-                or total <= self.disk_checkpoint
-                or self.disk_changed_at is None
-                or now - self.disk_changed_at > RECENT_DISK_SAMPLE_SECONDS
-                or self.disk_extensions >= self.max_disk_extensions):
+        if not self._disk_progress_is_fresh(total, now):
             return False
         self.disk_extensions += 1
         self.disk_checkpoint = total
         self.last_progress = now
         self.last_milestone = f"bootdisk completed bytes={total}"
         return True
+
+    def _disk_progress_is_fresh(self, total, now):
+        if (now - self.last_progress < self.idle_seconds
+                or total <= self.disk_checkpoint
+                or self.disk_changed_at is None
+                or now - self.disk_changed_at > RECENT_DISK_SAMPLE_SECONDS):
+            return False
+        # Tiny repeated I/O earns only finite grace. Substantial freshly sampled work is
+        # active progress, still bounded by the runner's absolute boot deadline.
+        return (self.disk_extensions < self.max_disk_extensions
+                or total - self.disk_checkpoint >= SUSTAINED_DISK_PROGRESS_BYTES)
 
     def idle_reason(self, now):
         if not self.armed or now - self.last_progress < self.idle_seconds:
