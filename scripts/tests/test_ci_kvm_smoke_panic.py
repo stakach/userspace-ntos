@@ -61,6 +61,35 @@ class SerialPanicDetectorTests(unittest.TestCase):
 
 
 class SerialTerminalDetectorTests(unittest.TestCase):
+    def test_unhandled_rootserver_page_fault_is_terminal_across_split_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "serial.log"
+            log.write_bytes(
+                b"[user #PF: tcb=1 cr2=0x00000100014e8eb0 "
+                b"err=0x0000000000000006 rip=0x0000010000a9c6cd]\n"
+                b"[no fault handler \xe2\x80\x94 suspending"
+            )
+            detector = terminal_detector(log)
+            self.assertIsNone(detector.poll())
+
+            with log.open("ab") as stream:
+                stream.write(b" thread]\n")
+            self.assertEqual(detector.poll(), "rootserver-page-fault")
+            self.assertIsNone(detector.poll())
+
+    def test_handled_or_non_root_page_fault_does_not_stop_smoke(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "serial.log"
+            log.write_bytes(
+                b"[user #PF: tcb=1 cr2=0x0000000000001000 "
+                b"err=0x0000000000000004 rip=0x0000010000001000]\n"
+                b"[fault delivered to handler]\n"
+                b"[user #PF: tcb=12 cr2=0x0000000000001000 "
+                b"err=0x0000000000000004 rip=0x0000010000001000]\n"
+                b"[no fault handler \xe2\x80\x94 suspending thread]\n"
+            )
+            self.assertIsNone(terminal_detector(log).poll())
+
     def test_provider_bugcheck_is_terminal_across_split_serial_writes(self):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "serial.log"
