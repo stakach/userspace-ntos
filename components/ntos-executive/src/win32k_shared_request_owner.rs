@@ -14,6 +14,19 @@ pub struct RequestOwner {
     pub token_sid_ptr: u64,
 }
 
+/// Verify the physical request still belongs to the retained dispatch before copying it.
+/// Canonicalization is only safe after this check; it must not create missing authority.
+pub fn matches(words: &[u64; WORDS], owner: RequestOwner) -> bool {
+    words[0] == owner.ssn
+        && words[20] == owner.pid
+        && words[22] == owner.pi
+        && words[25] == owner.tid
+        && words[29] == owner.token_auth
+        && words[30] == owner.token_sid_len
+        && words[31] == owner.token_sid_ptr
+        && words[37] == owner.generation
+}
+
 /// The callback header and retained dispatch/client authenticate these fields. The component
 /// may clear or overwrite the physical page while a callback is parked. Its remaining words
 /// are component-owned mutable state and stay exactly as observed.

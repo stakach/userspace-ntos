@@ -335,6 +335,79 @@ fn shared_resume_request_word(snapshot: &SharedResumeSnapshot, offset: u64) -> u
     snapshot.request[index]
 }
 
+/// Capture the physical shared page only while it still belongs to this exact dispatch.
+/// A displaced or concurrently changing publication is uncertain, so its caller must retain
+/// the pending owner rather than reconstructing its request from retained identity fields.
+pub(crate) unsafe fn try_capture_exact_shared_resume_snapshot(
+    dispatch: nt_user_callback::DispatchContext,
+    client: Win32kClientContext,
+) -> Option<SharedResumeSnapshot> {
+    if !win32k_client_context_is_admitted(client)
+        || client.token_user_sid_len as usize > client.token_user_sid.len()
+    {
+        return None;
+    }
+    let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
+    let frame = (sh + win32k_subsystem::SH_USER_CALLBACK)
+        as *const nt_user_callback::CallbackFrame;
+    let header_before = core::ptr::read_volatile(core::ptr::addr_of!((*frame).header));
+    if !header_before.matches_dispatch_identity(
+        dispatch.dispatch_id, client.pi, client.tid, client.badge,
+    ) {
+        return None;
+    }
+    let mut request = [0u64; SHARED_RESUME_REQUEST_OFFSETS.len()];
+    for (value, offset) in request.iter_mut().zip(SHARED_RESUME_REQUEST_OFFSETS) {
+        *value = core::ptr::read_volatile((sh + offset) as *const u64);
+    }
+    let published = published_win32k_context();
+    let mut confirm_request = [0u64; SHARED_RESUME_REQUEST_OFFSETS.len()];
+    for (value, offset) in confirm_request.iter_mut().zip(SHARED_RESUME_REQUEST_OFFSETS) {
+        *value = core::ptr::read_volatile((sh + offset) as *const u64);
+    }
+    let confirm_published = published_win32k_context();
+    let header_after = core::ptr::read_volatile(core::ptr::addr_of!((*frame).header));
+    if header_before != header_after || request != confirm_request
+        || [published.pid, published.tid, published.eprocess, published.ethread,
+            published.w32process, published.w32thread]
+            != [confirm_published.pid, confirm_published.tid,
+                confirm_published.eprocess, confirm_published.ethread,
+                confirm_published.w32process, confirm_published.w32thread]
+    {
+        return None;
+    }
+    let owner = shared_request_owner::RequestOwner {
+        ssn: dispatch.ssn,
+        pid: client.pid,
+        pi: client.pi as u64,
+        tid: client.tid,
+        generation: client.generation,
+        token_auth: client.token_authentication_id,
+        token_sid_len: client.token_user_sid_len as u64,
+        token_sid_ptr: win32k_subsystem::WIN32K_TOKEN_USER_SID_VADDR,
+    };
+    if !shared_request_owner::matches(&request, owner) {
+        return None;
+    }
+    let snapshot = SharedResumeSnapshot { header: header_before, published, request };
+    let page = nt_user_callback::SharedPageSnapshot {
+        header: header_before,
+        publication: snapshot.callback_publication(),
+        request_owner: nt_user_callback::SharedPageClientIdentity {
+            pi: client.pi, pid: client.pid, generation: client.generation,
+            tid: client.tid, badge: client.badge, tcb: client.tcb,
+        },
+        request_ssn: request[0],
+    };
+    if !page.matches(nt_user_callback::SharedPageLeaseIdentity {
+        dispatch,
+        client: page.request_owner,
+    }) {
+        return None;
+    }
+    Some(snapshot)
+}
+
 pub(crate) unsafe fn capture_shared_resume_snapshot(
     dispatch: nt_user_callback::DispatchContext,
     client: Win32kClientContext,
