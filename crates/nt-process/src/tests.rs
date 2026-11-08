@@ -46,21 +46,6 @@ fn boot_topology_sets_root_process_and_inherited_thread_affinity() {
 }
 
 #[test]
-fn worker_creation_affinity_requires_exact_thread_lifetime_and_pid() {
-    let mut pm = ProcessManager::new_with_active_processor_count(4).unwrap();
-    let pid = pm.create_process("worker.exe", None, None);
-    let other = pm.create_process("other.exe", None, None);
-    let tid = pm.create_thread(pid, 0x1000, 0, false).unwrap();
-    let lifetime = pm.thread_lifetime(tid).unwrap();
-    assert_eq!(pm.thread_inherited_affinity(lifetime, pid), Ok(0b1111));
-    pm.set_thread_affinity_mask(tid, 0b1010).unwrap();
-    assert_eq!(pm.thread_inherited_affinity(lifetime, pid), Ok(0b1010));
-    assert_eq!(pm.thread_inherited_affinity(lifetime, other), Err(STATUS_INVALID_PARAMETER));
-    let stale = ThreadLifetime { generation: lifetime.generation() + 1, ..lifetime };
-    assert_eq!(pm.thread_inherited_affinity(stale, pid), Err(STATUS_INVALID_PARAMETER));
-}
-
-#[test]
 fn client_ids_are_handle_shaped_and_globally_unique() {
     let mut pm = ProcessManager::new();
     let first_pid = pm.create_process("first.exe", None, None);

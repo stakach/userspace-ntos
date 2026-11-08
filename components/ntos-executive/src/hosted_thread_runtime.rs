@@ -573,7 +573,7 @@ impl HostedThreadRuntimeTable {
                 process: key.process, tid: key.tid, tcb: spawn.tcb(),
                 sched_context: spawn.mechanism().sched_context,
             },
-            spawn.physical_core(),
+            thread_sched_context::GUEST_SCHED_CONTROL_CORE,
             Self::placement_topology().unwrap_or(0),
         );
         entry.construction_is_empty() && !entry.resources.is_live() && !entry.mechanism.is_live()
@@ -601,7 +601,7 @@ impl HostedThreadRuntimeTable {
         };
         let placement = nt_user_host::thread_physical_placement::PhysicalPlacementOwner::new(
             identity,
-            spawn.physical_core(),
+            thread_sched_context::GUEST_SCHED_CONTROL_CORE,
             Self::placement_topology().expect("prevalidated physical topology"),
         ).expect("prevalidated placement identity");
         assert!(
