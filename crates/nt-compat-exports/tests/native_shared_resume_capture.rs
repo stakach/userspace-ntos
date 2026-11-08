@@ -40,8 +40,12 @@ fn native_capture_reads_stable_header_and_request_before_building_snapshot() {
     assert!(body.contains("request != confirm_request"));
     assert!(body.contains("confirm_published"));
     assert!(body.contains("read_shared_callback_payload()"));
-    assert!(body.contains("shared_callback_payload_matches(&payload)"),
-        "the callback payload must still match before the parent releases its page");
+    let payload_confirm = body.find("shared_callback_payload_matches(&payload)")
+        .expect("the callback payload must still match before the parent releases its page");
+    let final_header = body.find("let header_after =")
+        .expect("the final header must bracket every dispatch-owned payload read");
+    assert!(payload_confirm < final_header,
+        "a new writer must not start during the payload confirmation without detection");
     assert!(body.contains("shared_request_owner::matches(&request, owner)"));
     assert!(body.contains("snapshot.lease_snapshot(client)"));
     assert!(source.contains("pub(crate) fn lease_snapshot("));

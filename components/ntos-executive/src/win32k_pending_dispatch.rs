@@ -416,9 +416,10 @@ pub(crate) unsafe fn try_capture_exact_shared_resume_snapshot(
     let payload = read_shared_callback_payload();
     let confirm_request = read_shared_resume_request();
     let confirm_published = published_win32k_context();
+    let payload_stable = shared_callback_payload_matches(&payload);
     let header_after = core::ptr::read_volatile(core::ptr::addr_of!((*frame).header));
     if header_before != header_after || request != confirm_request
-        || !shared_callback_payload_matches(&payload)
+        || !payload_stable
         || [published.pid, published.tid, published.eprocess, published.ethread,
             published.w32process, published.w32thread]
             != [confirm_published.pid, confirm_published.tid,
