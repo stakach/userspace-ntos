@@ -31,6 +31,9 @@ pub mod receive_child_barrier;
 pub mod root_ingress_pass;
 pub mod retained_owner_table;
 pub mod returned_pump_owner;
+pub mod win32k_dispatch_outcome;
+#[cfg(test)]
+mod win32k_dispatch_outcome_tests;
 #[cfg(test)]
 mod returned_pump_owner_tests;
 #[cfg(test)]

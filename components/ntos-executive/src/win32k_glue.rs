@@ -7,6 +7,9 @@ use crate::*;
 use alloc::vec::Vec;
 use nt_component_suspension::{NestedRestoreChain, NestedRestoreResultKey};
 use nt_time::CoalescedRetryWake;
+pub(crate) use nt_user_host::win32k_dispatch_outcome::{
+    Win32kDispatchOutcome, Win32kDispatchWithReceipt, Win32kProcessCreateResult,
+};
 
 #[path = "win32k_pending_dispatch.rs"]
 mod pending_dispatch;
@@ -6863,8 +6866,8 @@ fn executive_win32k_client() -> Win32kClientContext {
 }
 
 /// Dispatch one win32k SSN (>= 0x1000) into the parked win32k component and run its fault-service
-/// loop until the handler completes. Returns `(status, completed)`.
-pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> (u64, bool) {
+/// loop until the handler completes. The typed outcome preserves the result and completion bit.
+pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> Win32kDispatchOutcome {
     win32k_dispatch_wide_with_completion_args_and_kind(
         ssn,
         a0,
@@ -6924,7 +6927,7 @@ unsafe fn dispatch_source_terminal(
     request_kind: u64,
 ) -> SourcePnpTerminalDispatch {
     let mut entered = false;
-    let (result, completed) = win32k_dispatch_wide_observed(
+    let Win32kDispatchOutcome::Known { value: result, completed } = win32k_dispatch_wide_observed(
         0, packet_va, len, 0, 0, 0, &[], [packet_va, len, 0, 0],
         None, None, executive_win32k_client(), request_kind,
         false, Some(&mut entered),
@@ -6952,7 +6955,7 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     caller_sp: u64,
     stack_args: &[u64],
     client: Win32kClientContext,
-) -> (u64, bool) {
+) -> Win32kDispatchOutcome {
     win32k_dispatch_wide_with_completion_args(
         ssn,
         a0,
@@ -6968,11 +6971,11 @@ pub(crate) unsafe fn win32k_dispatch_wide(
     )
 }
 
-pub(crate) unsafe fn win32k_flush_user_gdi_batch(client: Win32kClientContext) -> (u64, bool) {
+pub(crate) unsafe fn win32k_flush_user_gdi_batch(client: Win32kClientContext) -> Win32kDispatchOutcome {
     const STATUS_INVALID_PARAMETER: u64 = 0xC000_000Du32 as u64;
 
     if client.pi == 0 || client.teb == 0 {
-        return (STATUS_INVALID_PARAMETER, true);
+        return Win32kDispatchOutcome::Known { value: STATUS_INVALID_PARAMETER, completed: true };
     }
 
     win32k_dispatch_wide(
@@ -6999,7 +7002,7 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
     output_stage: Option<nt_user_callback::DispatchOutputStage>,
     paint_output: Option<nt_user_callback::PaintOutputClaim>,
     client: Win32kClientContext,
-) -> (u64, bool) {
+) -> Win32kDispatchOutcome {
     win32k_dispatch_wide_with_completion_args_and_kind(
         ssn,
         a0,
@@ -7025,14 +7028,14 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_return_receipt(
     client: Win32kClientContext,
     entered: &mut bool,
     dispatch_context: &mut Option<nt_user_callback::DispatchContext>,
-) -> (u64, bool, Option<nt_user_callback::DispatchReturn>) {
+) -> Win32kDispatchWithReceipt {
     let mut dispatch_return = None;
-    let (value, completed) = win32k_dispatch_wide_observed_inner(
+    let outcome = win32k_dispatch_wide_observed_inner(
         ssn, a0, a1, a2, a3, caller_sp, stack_args, completion_args, output_stage,
         paint_output, client, win32k_subsystem::WIN32K_REQUEST_SSDT, true,
         Some(entered), None, Some(&mut dispatch_return), None, Some(dispatch_context),
     );
-    (value, completed, dispatch_return)
+    Win32kDispatchWithReceipt { outcome, dispatch_return }
 }
 
 fn capture_win32k_dispatch_return(
@@ -7063,7 +7066,7 @@ pub(crate) unsafe fn win32k_dispatch_ps_provider_command(
     expected_provider_state: u64,
     flags: u64,
     client: Win32kClientContext,
-) -> (u64, bool) {
+) -> Win32kDispatchOutcome {
     if matches!(
         command,
         win32k_subsystem::PS_WIN32_PROVIDER_THREAD_EXIT
@@ -7119,29 +7122,12 @@ pub(crate) unsafe fn win32k_create_process_before_loader(
     let command = win32k_subsystem::PS_WIN32_PROVIDER_PROCESS_CREATE;
     let mut entered = false;
     let mut suspended = false;
-    let (status, completed) = win32k_dispatch_wide_observed_inner(
+    let outcome = win32k_dispatch_wide_observed_inner(
         0, command, 0, 0, 0, 0, &[], [command, 0, 0, 0], None, None,
         client, win32k_subsystem::WIN32K_REQUEST_PS_PROVIDER, true, Some(&mut entered),
         None, None, Some(&mut suspended), None,
     );
-    if completed {
-        Win32kProcessCreateResult::Returned(status as u32)
-    } else if suspended {
-        Win32kProcessCreateResult::Suspended
-    } else if entered {
-        Win32kProcessCreateResult::Indeterminate(status as u32)
-    } else {
-        Win32kProcessCreateResult::NotEntered(status as u32)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Win32kProcessCreateResult {
-    NotEntered(u32),
-    Returned(u32),
-    /// The physical dispatch has a retained callback or wait; its owner must resume creation.
-    Suspended,
-    Indeterminate(u32),
+    outcome.process_create(entered, suspended)
 }
 
 pub(crate) use nt_user_host::provider_finalization::ProviderFinalizationResult as PsProviderFinalization;
@@ -7154,7 +7140,7 @@ pub(crate) unsafe fn win32k_finalize_ps_provider_process_objects(
 ) -> PsProviderFinalization {
     let command = win32k_subsystem::PS_WIN32_PROVIDER_FINALIZE_PROCESS_OBJECTS;
     let mut entered = false;
-    let (status, completed) = win32k_dispatch_wide_observed(
+    let Win32kDispatchOutcome::Known { value: status, completed } = win32k_dispatch_wide_observed(
         0,
         command,
         0,
@@ -7193,7 +7179,7 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
     client: Win32kClientContext,
     request_kind: u64,
     attach_client: bool,
-) -> (u64, bool) {
+) -> Win32kDispatchOutcome {
     win32k_dispatch_wide_observed(
         ssn, a0, a1, a2, a3, caller_sp, stack_args, completion_args,
         output_stage, paint_output, client, request_kind, attach_client, None,
@@ -7215,7 +7201,7 @@ unsafe fn win32k_dispatch_wide_observed(
     request_kind: u64,
     attach_client: bool,
     entered: Option<&mut bool>,
-) -> (u64, bool) {
+) -> Win32kDispatchOutcome {
     win32k_dispatch_wide_observed_inner(
         ssn, a0, a1, a2, a3, caller_sp, stack_args, completion_args, output_stage,
         paint_output, client, request_kind, attach_client, entered, None, None, None, None,
@@ -7228,7 +7214,7 @@ unsafe fn win32k_dispatch_kernel_job_observed(
     request_kind: u64,
     arguments: [u64; 4],
     entered: &mut bool,
-) -> (u64, bool) {
+) -> Win32kDispatchOutcome {
     use crate::service_sec_image::kernel_provider_activation::{
         capture_kernel_job, run_kernel_job, KernelJobResult,
     };
@@ -7273,7 +7259,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     dispatch_return_out: Option<&mut Option<nt_user_callback::DispatchReturn>>,
     mut suspended_out: Option<&mut bool>,
     dispatch_context_out: Option<&mut Option<nt_user_callback::DispatchContext>>,
-) -> (u64, bool) {
+) -> Win32kDispatchOutcome {
     // Reject before attachment or shared request writes, not only at later lane acquisition.
     if ssn == nt_user_callback::NTUSER_SET_WINDOW_LONG_PTR_SSN
         && a1 < 64
@@ -7303,19 +7289,19 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     }
     if shared_busy || !win32k_client_context_is_admitted(client)
         || !callback_client_can_enter_nested(client) {
-        return (0xC000_000Du64, false);
+        return (0xC000_000Du64, false).into();
     }
     if WIN32K_RETIRED.load(Ordering::Relaxed) != 0 {
-        return (0xC000_0001u64, false);
+        return (0xC000_0001u64, false).into();
     }
     let active_parent = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
     let displaced_parent = match crate::nested_restore_owner::capture_displaced_shared_resume(
         active_parent,
     ) {
         None if active_parent.dispatch_id == 0 => None,
-        None => return (nt_process::STATUS_INVALID_PARAMETER as u64, false),
+        None => return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into(),
         Some(Ok(ticket)) => Some(ticket),
-        Some(Err(())) => return (nt_process::STATUS_INVALID_PARAMETER as u64, false),
+        Some(Err(())) => return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into(),
     };
     // ── REQUEST FILL (caller-owned, exactly as the FSD `dispatch_irp` fills the IRP before the pump).
     // Attach win32k's client window to the CURRENT dispatch client (KeStackAttachProcess). If this is
@@ -7333,13 +7319,13 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         if let Some(ticket) = displaced_parent {
             let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
         }
-        return (0xC000_0001u64, false);
+        return (0xC000_0001u64, false).into();
     }
     if grant_win32k_client_ps_bodies(client).is_err() {
         if let Some(ticket) = displaced_parent {
             let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
         }
-        return (nt_process::STATUS_INVALID_PARAMETER as u64, false);
+        return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into();
     }
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
     let dispatch_id = USER_CALLBACK_DISPATCH_IDS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -7354,7 +7340,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         if let Some(ticket) = displaced_parent {
             let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
         }
-        return (0xC000_009Au64, false);
+        return (0xC000_009Au64, false).into();
     }
     let nested_user_callback = match begin_nested_user_callback_dispatch(client, dispatch_id, ssn) {
         Ok(nested) => nested,
@@ -7385,7 +7371,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             if let Some(ticket) = displaced_parent {
                 let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
             }
-            return (0xC000_000Du64, false);
+            return (0xC000_000Du64, false).into();
         }
     };
     let outer_callback = nested_user_callback
@@ -7414,7 +7400,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         if let Some(ticket) = displaced_parent {
             let _ = crate::nested_restore_owner::abort_displaced_shared_resume(ticket);
         }
-        return (0xC000_009Au64, false);
+        return (0xC000_009Au64, false).into();
     };
     let dispatch = UserCallbackDispatchContext {
         lane, dispatch_id, ssn, args: completion_args, caller_sp,
@@ -7426,7 +7412,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             if registered_client {
                 unregister_win32k_dispatch_client(dispatch_id, client.pi, client.tid, client.badge);
             }
-            return (nt_process::STATUS_INVALID_PARAMETER as u64, false);
+            return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into();
         }
     }
     clear_published_win32k_context();
@@ -7605,12 +7591,12 @@ unsafe fn win32k_dispatch_wide_observed_inner(
                 crate::nested_restore_owner::retain_quarantined_child_job_result(
                     ticket, result, dispatch, client,
                 );
-                return (nt_process::STATUS_UNSUCCESSFUL as u64, false);
+                return (nt_process::STATUS_UNSUCCESSFUL as u64, false).into();
             }
         }
         // Canonical kernel completion already retired this exact physical dispatch. Hosted
         // finish_win32k_lane_return must not repeat it. Failed/unknown work stays owned.
-        return result.unwrap_or_else(|status| (u64::from(status), false));
+        return result.unwrap_or_else(|status| (u64::from(status), false)).into();
     }
     ch.caps.hosted_receive_yield = request_kind == win32k_subsystem::WIN32K_REQUEST_SSDT
         && !nested_user_callback && outer_callback.is_none();
@@ -7827,7 +7813,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
                     ticket, dispatch, client, false, None,
                 );
             }
-            return (0xC000_000Du32 as u64, false);
+            return (0xC000_000Du32 as u64, false).into();
         };
         let (arg_snapshot_len, arg_snapshot) = capture_initial_arg_snapshot(ssn, completion_args);
         core::ptr::write(
@@ -7889,7 +7875,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
                 );
             }
             if let Some(suspended) = suspended_out.as_deref_mut() { *suspended = false; }
-            return (nt_process::STATUS_UNSUCCESSFUL as u64, false);
+            return (nt_process::STATUS_UNSUCCESSFUL as u64, false).into();
         }
     }
     if nested_user_callback {
@@ -7897,7 +7883,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             || pr.service_wait_yield.is_some()
             || pr.nested_restore_yield.is_some() || pr.nested_restore_quarantined.is_some()
         {
-            return (pr.result, false);
+            return (pr.result, false).into();
         }
         if !pr.completed || !complete_nested_user_callback_dispatch(client, dispatch_id) {
             print_str(b"[user-callback] nested win32k dispatch failed to unwind\n");
@@ -7909,7 +7895,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
                     client.badge,
                 );
             }
-            return (pr.result, false);
+            return (pr.result, false).into();
         }
     }
     if registered_client
@@ -7930,7 +7916,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             client.badge,
         );
     }
-    (pr.result, pr.completed)
+    (pr.result, pr.completed).into()
 }
 
 /// `seL4_TCB_ReadRegisters` (label 2, legacy length-0 form) → the target's `(rip, rsp, rax)`.

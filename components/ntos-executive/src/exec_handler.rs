@@ -3777,7 +3777,7 @@ fn dispatch_win32_job_callout_for_manager(
     if callouts.job_callout == 0 {
         return Err(STATUS_DEVICE_NOT_READY);
     }
-    let (status, completed) = unsafe {
+    let win32k_glue::Win32kDispatchOutcome::Known { value: status, completed } = unsafe {
         win32k_glue::win32k_dispatch(
             win32k_subsystem::SSN_WIN32_JOB_CALLOUT,
             id as u64,
@@ -3808,7 +3808,7 @@ fn dispatch_win32_job_atom_for_manager(
     if callouts.job_callout == 0 {
         return STATUS_DEVICE_NOT_READY;
     }
-    let (status, completed) = unsafe {
+    let win32k_glue::Win32kDispatchOutcome::Known { value: status, completed } = unsafe {
         win32k_glue::win32k_dispatch(
             win32k_subsystem::SSN_WIN32_JOB_ATOM,
             job as u64,

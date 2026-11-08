@@ -3527,7 +3527,7 @@ pub(crate) unsafe fn winlogon_credential_injection_route(
         print_hex(username as u32);
         print_str(b" through NtUserPostMessage(WM_CHAR)\n");
         for (index, unit) in nt_user_callback::LOGON_USERNAME.iter().enumerate() {
-            let post = win32k_glue::win32k_dispatch_wide(
+            let win32k_glue::Win32kDispatchOutcome::Known { value: post_value, completed: post_completed } = win32k_glue::win32k_dispatch_wide(
                 nt_user_callback::NTUSER_POST_MESSAGE_SSN,
                 username,
                 nt_user_callback::WM_CHAR as u64,
@@ -3537,11 +3537,11 @@ pub(crate) unsafe fn winlogon_credential_injection_route(
                 &[],
                 client,
             );
-            if !post.1 || post.0 == 0 || state.record_char_post(username, index).is_err() {
+            if !post_completed || post_value == 0 || state.record_char_post(username, index).is_err() {
                 print_str(b"[cred-inject] WM_CHAR post rejected at index ");
                 print_u64(index as u64);
                 print_str(b" ret=0x");
-                print_hex(post.0 as u32);
+                print_hex(post_value as u32);
                 print_str(b"\n");
                 WINLOGON_CRED_ERRORS.fetch_add(1, Ordering::Relaxed);
                 winlogon_credential_store(state);
@@ -3553,7 +3553,7 @@ pub(crate) unsafe fn winlogon_credential_injection_route(
         // ── PHASE 2: the real edit control has the user name; press RETURN so the REAL
         // IsDialogMessageW drives WM_COMMAND(IDOK) into LogonDialogProc.
         let username = state.username_hwnd();
-        let post = win32k_glue::win32k_dispatch_wide(
+        let win32k_glue::Win32kDispatchOutcome::Known { value: post_value, completed: post_completed } = win32k_glue::win32k_dispatch_wide(
             nt_user_callback::NTUSER_POST_MESSAGE_SSN,
             username,
             nt_user_callback::WM_KEYDOWN as u64,
@@ -3563,9 +3563,9 @@ pub(crate) unsafe fn winlogon_credential_injection_route(
             &[],
             client,
         );
-        if !post.1 || post.0 == 0 || state.record_return_post(username).is_err() {
+        if !post_completed || post_value == 0 || state.record_return_post(username).is_err() {
             print_str(b"[cred-inject] VK_RETURN post rejected ret=0x");
-            print_hex(post.0 as u32);
+            print_hex(post_value as u32);
             print_str(b" retrieved-chars=");
             print_u64(state.retrieved_chars() as u64);
             print_str(b"\n");
@@ -10515,7 +10515,8 @@ pub(crate) unsafe fn ke_gdi_flush_user_batch(
         return;
     }
     let original_caller = client.logical_caller;
-    let (status, completed) = win32k_glue::win32k_flush_user_gdi_batch(client);
+    let win32k_glue::Win32kDispatchOutcome::Known { value: status, completed } =
+        win32k_glue::win32k_flush_user_gdi_batch(client);
     if completed && status as u32 == 0 {
         GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);
         GDI_BATCH_RECORDS_FLUSHED.fetch_add(u64::from(count), Ordering::Relaxed);
@@ -18819,7 +18820,7 @@ unsafe fn release_hosted_thread_win32_context(
         } else {
             0
         };
-        let (status, completed) = win32k_glue::win32k_dispatch_ps_provider_command(
+        let win32k_glue::Win32kDispatchOutcome::Known { value: status, completed } = win32k_glue::win32k_dispatch_ps_provider_command(
             win32k_subsystem::PS_WIN32_PROVIDER_THREAD_EXIT,
             expected,
             flags,
@@ -18848,7 +18849,7 @@ unsafe fn release_hosted_thread_win32_context(
         {
             return false;
         }
-        let (status, completed) = win32k_glue::win32k_dispatch_ps_provider_command(
+        let win32k_glue::Win32kDispatchOutcome::Known { value: status, completed } = win32k_glue::win32k_dispatch_ps_provider_command(
             win32k_subsystem::PS_WIN32_PROVIDER_PROCESS_EXIT,
             expected,
             0,
@@ -32874,7 +32875,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 // it through its owned Reply and resumes win32k, which returns the
                 // sentinel. A clean round-trip means the dispatch fault path no longer depends on
                 // reply_to — so a nested faulting SSN can't clobber an outer caller's pending reply.
-                let (fst, fok) = win32k_dispatch(win32k_subsystem::SSN_TEST_FAULT, 0, 0, 0, 0);
+                let win32k_glue::Win32kDispatchOutcome::Known { value: fst, completed: fok } =
+                    win32k_dispatch(win32k_subsystem::SSN_TEST_FAULT, 0, 0, 0, 0);
                 let fseq = spawn_hosts::pump_call_dispatches(spawn_hosts::ReqKind::Syscall);
                 print_str(b"[win32k-svc] FAULTING dispatch (reply-cap path): status=0x");
                 print_hex(fst as u32);

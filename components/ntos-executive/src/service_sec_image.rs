@@ -7173,7 +7173,7 @@ unsafe fn dispatch_win32k_for_client(
     stack_args: &[u64],
     client: win32k_glue::Win32kClientContext,
 ) -> (u64, bool) {
-    let result =
+    let win32k_glue::Win32kDispatchOutcome::Known { value, completed } =
         win32k_glue::win32k_dispatch_wide(ssn, a0, a1, a2, a3, caller_sp, stack_args, client);
     if sync_win32k_context_to_process_manager(
         nt_handler,
@@ -7181,7 +7181,7 @@ unsafe fn dispatch_win32k_for_client(
         client.pid,
         client.tid,
     ) {
-        result
+        (value, completed)
     } else {
         (0xC000_00A3u32 as u64, false)
     }
@@ -7219,14 +7219,15 @@ unsafe fn dispatch_win32k_for_client_with_completion_args(
         dispatch_entered,
         dispatch_context,
     );
-    *dispatch_return = result.2;
+    *dispatch_return = result.dispatch_return;
+    let win32k_glue::Win32kDispatchOutcome::Known { value, completed } = result.outcome;
     if sync_win32k_context_to_process_manager(
         nt_handler,
         client.pi as usize,
         client.pid,
         client.tid,
     ) {
-        (result.0, result.1)
+        (value, completed)
     } else {
         (0xC000_00A3u32 as u64, false)
     }
@@ -7308,7 +7309,7 @@ unsafe fn post_winlogon_second_sas_after_welcome_drain(
     print_str(b"[wl-main] posting simulated Ctrl-Alt-Del through real NtUserPostMessage hwnd=0x");
     print_hex(hwnd as u32);
     print_str(b"\n");
-    let post = win32k_glue::win32k_dispatch_wide(
+    let win32k_glue::Win32kDispatchOutcome::Known { value: post_value, completed: post_completed } = win32k_glue::win32k_dispatch_wide(
         0x100e,
         hwnd,
         nt_user_callback::WLX_WM_SAS as u64,
@@ -7338,9 +7339,9 @@ unsafe fn post_winlogon_second_sas_after_welcome_drain(
         },
     );
     print_str(b"[wl-main] NtUserPostMessage(WLX_WM_SAS) -> ret=0x");
-    print_hex(post.0 as u32);
+    print_hex(post_value as u32);
     print_str(b"\n");
-    if post.1 && post.0 != 0 {
+    if post_completed && post_value != 0 {
         WINLOGON_SAS2_INJECTED.store(1, Ordering::Relaxed);
         true
     } else {
