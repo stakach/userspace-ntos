@@ -3666,6 +3666,10 @@ fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
     let status = finalize_service_loop_work(nt_handler);
     // Include readiness created by any late post-action, on success and failure paths alike.
     unsafe { component_resume::reconcile(nt_handler) };
+    if unsafe { driver_launch::hosted_scsi_receive_boundary_probe_due() } {
+        let _message = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
+        unsafe { driver_launch::trace_hosted_scsi_receive_boundary() };
+    }
     unsafe { rearm_requested_mounted_native_timer(nt_handler) };
     status
 }

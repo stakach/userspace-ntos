@@ -95,6 +95,30 @@ static SCSI_PROGRESS_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static SCSI_HELD_REFUSAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static SCSI_IRQ_BOUNDARY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static mut SCSI_IRQ_BOUNDARY_SEEN: [Option<(u64, u64, u64, bool, bool)>; 128] = [None; 128];
+static SCSI_RECEIVE_BOUNDARY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ReceiveBoundaryObservation {
+    source: u64,
+    use_epoch: u64,
+    provider_irp: u64,
+    terminal: bool,
+    ready: bool,
+    terminal_status: Option<i32>,
+    pending_wake: bool,
+    reply_entered: bool,
+    cancelled: bool,
+    provider_terminal: bool,
+    provider_acknowledged: bool,
+    route_endpoint: u64,
+    route_badge: u64,
+    dispatch_epoch: u64,
+    dispatch_lane_generation: u64,
+    reply: u64,
+    token: u64,
+}
+
+static mut SCSI_RECEIVE_BOUNDARY_SEEN: [Option<ReceiveBoundaryObservation>; 64] = [None; 64];
 
 fn trace_scsi_held_refusal(stage: u64, source_irp: u64, token: u64, detail: u64) {
     if SCSI_HELD_REFUSAL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 4 { return; }
@@ -965,6 +989,73 @@ pub(super) unsafe fn trace_irq_boundary() {
         print_u64(u64::from(observation.3));
         print_str(b"/");
         print_u64(u64::from(observation.4));
+        print_str(b"\n");
+        return;
+    }
+}
+
+/// Observation only, after ordinary redrive and before the root may sleep. A canonical
+/// terminal here distinguishes a missed final redrive from a provider that never completed.
+/// This never claims a completion, wakes a source, or touches a retained Reply.
+pub(super) unsafe fn receive_boundary_probe_due() -> bool {
+    SCSI_RECEIVE_BOUNDARY_TRACE_COUNT.load(Ordering::Relaxed) < 64
+        && (&*core::ptr::addr_of!(WORK)).iter().flatten().any(|work| {
+            work.entered_provider && !work.source_published && work.canonical_irp.is_some()
+        })
+}
+
+pub(super) unsafe fn trace_receive_boundary() {
+    if SCSI_RECEIVE_BOUNDARY_TRACE_COUNT.load(Ordering::Relaxed) >= 64 { return; }
+    for work in (&*core::ptr::addr_of!(WORK)).iter().flatten() {
+        if !work.entered_provider || work.source_published { continue; }
+        let Some(irp) = work.canonical_irp else { continue; };
+        let observation = ReceiveBoundaryObservation {
+            source: work.source.source_irp_address(),
+            use_epoch: work.source.scsi_identity().use_ticket().epoch().get(),
+            provider_irp: irp.raw(),
+            terminal: io_manager_mut().completed_irp(irp).is_some(),
+            ready: nested_device_control_completion_ready_exact(irp.raw()),
+            terminal_status: work.terminal_status,
+            pending_wake: work.pending_wake.is_some(),
+            reply_entered: work.reply_entered,
+            cancelled: work.cancel_requested,
+            provider_terminal: work.provider_terminal,
+            provider_acknowledged: work.provider_acknowledged,
+            route_endpoint: work.route.endpoint(),
+            route_badge: work.route.badge(),
+            dispatch_epoch: work.dispatch.epoch(),
+            dispatch_lane_generation: work.dispatch.lane().generation,
+            reply: work.reply,
+            token: work.token,
+        };
+        let seen = &mut *core::ptr::addr_of_mut!(SCSI_RECEIVE_BOUNDARY_SEEN);
+        if seen.contains(&Some(observation)) { continue; }
+        let sequence = SCSI_RECEIVE_BOUNDARY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if sequence >= 64 { return; }
+        seen[sequence as usize % seen.len()] = Some(observation);
+        print_str(b"[scsi-receive-boundary] source/use/provider/terminal/ready/status/wake/reply-entered/cancel/provider-terminal/ack/route/badge/dispatch/lane-generation/reply-cap/token=");
+        for value in [
+            observation.source,
+            observation.use_epoch,
+            observation.provider_irp,
+            u64::from(observation.terminal),
+            u64::from(observation.ready),
+            observation.terminal_status.map_or(u64::MAX, |status| status as u32 as u64),
+            u64::from(observation.pending_wake),
+            u64::from(observation.reply_entered),
+            u64::from(observation.cancelled),
+            u64::from(observation.provider_terminal),
+            u64::from(observation.provider_acknowledged),
+            observation.route_endpoint,
+            observation.route_badge,
+            observation.dispatch_epoch,
+            observation.dispatch_lane_generation,
+            observation.reply,
+            observation.token,
+        ] {
+            print_str(b"/");
+            print_u64(value);
+        }
         print_str(b"\n");
         return;
     }

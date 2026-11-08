@@ -67057,6 +67057,14 @@ pub(crate) unsafe fn redrive_irq_ready_hosted_scsi(handler: *mut ExecNtHandler) 
     hosted_scsi_srb_work::redrive_irq_ready(handler)
 }
 
+pub(crate) unsafe fn hosted_scsi_receive_boundary_probe_due() -> bool {
+    hosted_scsi_srb_work::receive_boundary_probe_due()
+}
+
+pub(crate) unsafe fn trace_hosted_scsi_receive_boundary() {
+    hosted_scsi_srb_work::trace_receive_boundary();
+}
+
 pub(crate) unsafe fn redrive_hosted_query_path_forward(handler: *mut ExecNtHandler) {
     hosted_query_path_work::redrive(handler);
     hosted_create_subject_registration::redrive_terminal();
