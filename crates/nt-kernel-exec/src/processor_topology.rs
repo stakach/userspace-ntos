@@ -15,6 +15,50 @@ pub const fn active_processor_count_for_group(count: u64, group: u16) -> u32 {
     if group == 0 || group == u16::MAX { active_processor_count(count) } else { 0 }
 }
 
+/// Explicit physical APIC identities in logical processor order. The occupied prefix is
+/// authoritative; every possible `u32` is a valid APIC identity, including `u32::MAX`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessorIdentityMap {
+    apic_ids: [u32; 64],
+    count: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessorIdentityError {
+    InvalidCount,
+    DuplicateApicId,
+}
+
+impl ProcessorIdentityMap {
+    pub fn new(apic_ids: &[u32]) -> Result<Self, ProcessorIdentityError> {
+        if !(1..=64).contains(&apic_ids.len()) {
+            return Err(ProcessorIdentityError::InvalidCount);
+        }
+        for (index, &id) in apic_ids.iter().enumerate() {
+            if apic_ids[..index].contains(&id) {
+                return Err(ProcessorIdentityError::DuplicateApicId);
+            }
+        }
+        let mut stored = [0; 64];
+        stored[..apic_ids.len()].copy_from_slice(apic_ids);
+        Ok(Self { apic_ids: stored, count: apic_ids.len() as u8 })
+    }
+
+    pub const fn count(&self) -> u8 { self.count }
+
+    pub fn apic_id(&self, logical_index: u32) -> Option<u32> {
+        self.apic_ids.get(logical_index as usize).copied()
+            .filter(|_| logical_index < u32::from(self.count))
+    }
+
+    pub fn logical_index(&self, apic_id: u32) -> Option<u32> {
+        self.apic_ids[..usize::from(self.count)]
+            .iter()
+            .position(|&id| id == apic_id)
+            .map(|index| index as u32)
+    }
+}
+
 /// Map a hosted callback to the boot node only while its observed physical APIC identity
 /// still matches the node on which the executive captured that identity. A migrated callback
 /// needs an independently discovered APIC-to-node map and cannot borrow the boot node's index.
