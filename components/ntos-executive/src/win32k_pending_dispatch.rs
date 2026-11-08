@@ -243,6 +243,9 @@ pub(super) static mut RECEIVE_PENDING_DISPATCH: Option<PendingReceiveDispatch> =
 #[derive(Clone, Copy)]
 pub(crate) struct SharedResumeSnapshot {
     header: nt_user_callback::CallbackHeader,
+    // Nested callbacks reuse this physical frame. Retain its dispatch-owned bytes along with
+    // the header; the header alone cannot reconstruct an in-flight callback request or reply.
+    payload: Option<[u8; nt_user_callback::CALLBACK_PAYLOAD_MAX]>,
     published: Win32kPublishedContext,
     request: [u64; SHARED_RESUME_REQUEST_OFFSETS.len()],
 }
@@ -277,6 +280,9 @@ impl SharedResumeSnapshot {
         let context = publication.context();
         Self {
             header,
+            // This constructor is used by callback reply publication, which copies the result
+            // into the frame after restoring the request/context cells below.
+            payload: None,
             request: *publication.request(),
             published: Win32kPublishedContext {
                 pid: context[0], tid: context[1],
@@ -364,6 +370,25 @@ unsafe fn read_shared_resume_request() -> [u64; SHARED_RESUME_REQUEST_OFFSETS.le
     request
 }
 
+unsafe fn read_shared_callback_payload() -> [u8; nt_user_callback::CALLBACK_PAYLOAD_MAX] {
+    let frame = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
+        as *const nt_user_callback::CallbackFrame;
+    let mut payload = [0u8; nt_user_callback::CALLBACK_PAYLOAD_MAX];
+    for (index, byte) in payload.iter_mut().enumerate() {
+        *byte = core::ptr::read_volatile(core::ptr::addr_of!((*frame).payload[index]));
+    }
+    payload
+}
+
+unsafe fn shared_callback_payload_matches(
+    expected: &[u8; nt_user_callback::CALLBACK_PAYLOAD_MAX],
+) -> bool {
+    let frame = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
+        as *const nt_user_callback::CallbackFrame;
+    expected.iter().enumerate().all(|(index, byte)|
+        core::ptr::read_volatile(core::ptr::addr_of!((*frame).payload[index])) == *byte)
+}
+
 /// Capture the physical shared page only while it still belongs to this exact dispatch.
 /// A displaced or concurrently changing publication is uncertain, so its caller must retain
 /// the pending owner rather than reconstructing its request from retained identity fields.
@@ -387,10 +412,12 @@ pub(crate) unsafe fn try_capture_exact_shared_resume_snapshot(
     }
     let request = read_shared_resume_request();
     let published = published_win32k_context();
+    let payload = read_shared_callback_payload();
     let confirm_request = read_shared_resume_request();
     let confirm_published = published_win32k_context();
     let header_after = core::ptr::read_volatile(core::ptr::addr_of!((*frame).header));
     if header_before != header_after || request != confirm_request
+        || !shared_callback_payload_matches(&payload)
         || [published.pid, published.tid, published.eprocess, published.ethread,
             published.w32process, published.w32thread]
             != [confirm_published.pid, confirm_published.tid,
@@ -412,7 +439,9 @@ pub(crate) unsafe fn try_capture_exact_shared_resume_snapshot(
     if !shared_request_owner::matches(&request, owner) {
         return None;
     }
-    let snapshot = SharedResumeSnapshot { header: header_before, published, request };
+    let snapshot = SharedResumeSnapshot {
+        header: header_before, payload: Some(payload), published, request,
+    };
     let page = snapshot.lease_snapshot(client);
     if !page.matches(nt_user_callback::SharedPageLeaseIdentity {
         dispatch,
@@ -473,7 +502,10 @@ pub(crate) unsafe fn capture_shared_resume_snapshot(
         token_sid_len: client.token_user_sid_len as u64,
         token_sid_ptr: win32k_subsystem::WIN32K_TOKEN_USER_SID_VADDR,
     });
-    SharedResumeSnapshot { header, published: published_win32k_context(), request }
+    SharedResumeSnapshot {
+        header, payload: Some(read_shared_callback_payload()),
+        published: published_win32k_context(), request,
+    }
 }
 
 pub(crate) unsafe fn restore_shared_resume_snapshot(
@@ -533,6 +565,11 @@ pub(crate) unsafe fn restore_shared_resume_snapshot(
     }
     let frame = (sh + win32k_subsystem::SH_USER_CALLBACK)
         as *mut nt_user_callback::CallbackFrame;
+    if let Some(payload) = snapshot.payload {
+        for (index, byte) in payload.iter().enumerate() {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).payload[index]), *byte);
+        }
+    }
     core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).header), snapshot.header);
     true
 }

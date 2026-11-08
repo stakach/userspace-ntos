@@ -39,9 +39,22 @@ fn native_capture_reads_stable_header_and_request_before_building_snapshot() {
     assert!(body.contains("header_before") && body.contains("header_after"));
     assert!(body.contains("request != confirm_request"));
     assert!(body.contains("confirm_published"));
+    assert!(body.contains("read_shared_callback_payload()"));
+    assert!(body.contains("shared_callback_payload_matches(&payload)"),
+        "the callback payload must still match before the parent releases its page");
     assert!(body.contains("shared_request_owner::matches(&request, owner)"));
     assert!(body.contains("snapshot.lease_snapshot(client)"));
     assert!(source.contains("pub(crate) fn lease_snapshot("));
     assert!(!body.contains("canonicalize("), "capture cannot invent request identity");
     assert!(!body.contains("assert!("), "uncertain capture must be fallible");
+    let restore = source.find("pub(crate) unsafe fn restore_shared_resume_snapshot(")
+        .expect("native restore exists");
+    let restore_end = source[restore..].find("pub(crate) unsafe fn select_and_restore_shared_resume_snapshot(")
+        .expect("native restore ends before select") + restore;
+    let restore = &source[restore..restore_end];
+    let payload = restore.find("if let Some(payload) = snapshot.payload")
+        .expect("a nested child cannot permanently replace the parent's callback payload");
+    let header = restore.find("write_volatile(core::ptr::addr_of_mut!((*frame).header), snapshot.header)")
+        .expect("restored header publication exists");
+    assert!(payload < header, "publish the header only after restoring the payload");
 }
