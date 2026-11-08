@@ -10731,6 +10731,12 @@ pub(crate) unsafe fn service_sec_image(
             crate::driver_launch::redrive_hosted_internal_control_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_buffered_control_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_scsi_forward(nt_handler as *mut _);
+            // Observe the retained source immediately after its first provider poll. Later
+            // redrives can enter another provider before finalize_service_loop_state runs.
+            if crate::driver_launch::hosted_scsi_receive_boundary_probe_due() {
+                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                crate::driver_launch::trace_hosted_scsi_receive_boundary();
+            }
             crate::driver_launch::redrive_hosted_write_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_read_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_flush_forward(nt_handler as *mut _);
