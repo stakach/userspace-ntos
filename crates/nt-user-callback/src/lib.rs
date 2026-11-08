@@ -2,6 +2,11 @@
 
 mod message_output;
 mod dispatch_return;
+mod shared_page_lease;
+pub use shared_page_lease::{
+    SharedPageClientIdentity, SharedPageLeaseError, SharedPageLeaseIdentity,
+    SharedPageLeaseStack, SharedPageRestoreEffect, SharedPageSnapshot,
+};
 pub use dispatch_return::{DispatchReturn, DispatchReturnError, DispatchReturnReceipt};
 mod windowproc;
 pub use message_output::{
@@ -9,6 +14,10 @@ pub use message_output::{
     message_dispatch_returned_message,
 };
 pub use windowproc::windowproc_lparam_span;
+
+#[cfg(test)]
+#[path = "shared_page_lease_tests.rs"]
+mod shared_page_lease_tests;
 
 pub const CALLBACK_MAGIC: u32 = u32::from_le_bytes(*b"UCBK");
 pub const CALLBACK_VERSION: u16 = 1;
