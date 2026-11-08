@@ -231,12 +231,11 @@ pub(crate) unsafe fn settle_nested_restore_result(
 pub(crate) unsafe fn resume_suspended_nested_restore_receive(
     pending: PendingNestedRestoreDispatch,
 ) -> Result<crate::spawn_hosts::PumpResult, u32> {
-    if !select_win32k_client_window(pending.snapshot.client)
-        || !restore_shared_resume_snapshot(
-            pending.snapshot.shared_resume,
-            pending.snapshot.dispatch,
-            pending.snapshot.client,
-        )
+    if !select_and_restore_shared_resume_snapshot(
+        pending.snapshot.shared_resume,
+        pending.snapshot.dispatch,
+        pending.snapshot.client,
+    ).1
     {
         return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
@@ -963,10 +962,9 @@ pub(crate) unsafe fn resume_suspended_root_maintenance_component(
     pending: PendingRootMaintenanceDispatch,
 ) -> RootMaintenancePumpReturn {
     let original_reply = pending.snapshot.pump.reply_cap;
-    if !select_win32k_client_window(pending.snapshot.client)
-        || !restore_shared_resume_snapshot(
-            pending.snapshot.shared_resume, pending.snapshot.dispatch, pending.snapshot.client,
-        )
+    if !select_and_restore_shared_resume_snapshot(
+        pending.snapshot.shared_resume, pending.snapshot.dispatch, pending.snapshot.client,
+    ).1
     {
         return RootMaintenancePumpReturn { completion: RootMaintenancePumpCompletion::RetainedFailure(
             nt_process::STATUS_INVALID_PARAMETER), reply_cap: original_reply };
@@ -1132,10 +1130,9 @@ pub(crate) unsafe fn resume_root_ingress_after_unwind_receive(
     ) {
         return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
-    if !select_win32k_client_window(pending.snapshot.client)
-        || !restore_shared_resume_snapshot(
-            pending.snapshot.shared_resume, pending.snapshot.dispatch, pending.snapshot.client,
-        )
+    if !select_and_restore_shared_resume_snapshot(
+        pending.snapshot.shared_resume, pending.snapshot.dispatch, pending.snapshot.client,
+    ).1
     {
         return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
@@ -1165,8 +1162,9 @@ pub(crate) unsafe fn resume_suspended_receive_component(
         pending.yielded.child,
         pending.yielded.owner,
     );
-    if !select_win32k_client_window(pending.snapshot.client)
-        || !restore_shared_resume_snapshot(pending.snapshot.shared_resume, pending.snapshot.dispatch, pending.snapshot.client)
+    if !select_and_restore_shared_resume_snapshot(
+        pending.snapshot.shared_resume, pending.snapshot.dispatch, pending.snapshot.client,
+    ).1
     {
         return ReceivePumpCompletion::Restored(ProviderWaitPumpCompletion::Failed(
             nt_process::STATUS_INVALID_PARAMETER as i32,
@@ -1273,9 +1271,9 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
     pending: PendingServiceWaitDispatch,
 ) -> ServiceWaitPumpCompletion {
     let nested = pending.snapshot.callback_token.is_some();
-    let selected = select_win32k_client_window(pending.snapshot.client);
-    let restored = selected
-        && restore_shared_resume_snapshot(pending.snapshot.shared_resume, pending.snapshot.dispatch, pending.snapshot.client);
+    let (selected, restored) = select_and_restore_shared_resume_snapshot(
+        pending.snapshot.shared_resume, pending.snapshot.dispatch, pending.snapshot.client,
+    );
     if !restored {
         static SERVICE_RESTORE_FAILURES: AtomicU64 = AtomicU64::new(0);
         if SERVICE_RESTORE_FAILURES.fetch_add(1, Ordering::Relaxed) < 8 {

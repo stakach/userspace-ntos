@@ -380,10 +380,9 @@ pub(crate) unsafe fn abort_displaced_shared_resume(
         client: win32k_glue::shared_page_client_identity(parent.snapshot.client),
     };
     let page = snapshot.lease_snapshot(parent.snapshot.client);
-    if !win32k_glue::select_win32k_client_window(parent.snapshot.client)
-        || !win32k_glue::restore_shared_resume_snapshot(
-            snapshot, parent.snapshot.dispatch, parent.snapshot.client,
-        )
+    if !win32k_glue::select_and_restore_shared_resume_snapshot(
+        snapshot, parent.snapshot.dispatch, parent.snapshot.client,
+    ).1
     {
         let _ = row.shared_leases.acknowledge_restore(
             identity, nt_user_callback::SharedPageRestoreEffect::Uncertain,
@@ -442,10 +441,9 @@ pub(crate) unsafe fn finish_displacing_child(
         client: win32k_glue::shared_page_client_identity(parent.snapshot.client),
     };
     let page = parent_snapshot.lease_snapshot(parent.snapshot.client);
-    if !win32k_glue::select_win32k_client_window(parent.snapshot.client)
-        || !win32k_glue::restore_shared_resume_snapshot(
-            parent_snapshot, parent.snapshot.dispatch, parent.snapshot.client,
-        )
+    if !win32k_glue::select_and_restore_shared_resume_snapshot(
+        parent_snapshot, parent.snapshot.dispatch, parent.snapshot.client,
+    ).1
     {
         let _ = row.shared_leases.acknowledge_restore(
             identity, nt_user_callback::SharedPageRestoreEffect::Uncertain,

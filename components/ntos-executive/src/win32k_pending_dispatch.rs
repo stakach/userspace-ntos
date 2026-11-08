@@ -537,6 +537,18 @@ pub(crate) unsafe fn restore_shared_resume_snapshot(
     true
 }
 
+/// Select the exact client window before restoring its retained shared publication.
+/// Return both effects so callers that diagnose selection separately keep that evidence.
+pub(crate) unsafe fn select_and_restore_shared_resume_snapshot(
+    snapshot: SharedResumeSnapshot,
+    dispatch: nt_user_callback::DispatchContext,
+    client: Win32kClientContext,
+) -> (bool, bool) {
+    let selected = super::select_win32k_client_window(client);
+    let restored = selected && restore_shared_resume_snapshot(snapshot, dispatch, client);
+    (selected, restored)
+}
+
 pub(crate) unsafe fn take_pending_receive_dispatch() -> Option<PendingReceiveDispatch> {
     core::ptr::replace(core::ptr::addr_of_mut!(RECEIVE_PENDING_DISPATCH), None)
 }

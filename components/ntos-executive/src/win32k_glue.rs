@@ -29,7 +29,8 @@ pub(crate) use receive::{prepare_receive_yield, prepare_root_ingress_yield, prep
     settle_nested_restore_result};
 pub(crate) use pending_dispatch::{
     shared_page_client_identity, try_capture_exact_shared_resume_snapshot,
-    restore_shared_resume_snapshot, SharedResumeSnapshot,
+    select_and_restore_shared_resume_snapshot,
+    SharedResumeSnapshot,
     take_pending_lpc_wait_dispatch, take_pending_provider_wait_dispatch, LpcWaitPumpCompletion,
     PendingLpcWaitDispatch, PendingProviderWaitDispatch, ProviderWaitPumpCompletion,
     PendingReceiveDispatch, ReceiveYield, take_pending_receive_dispatch,
@@ -5778,11 +5779,10 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     let completed_client = callback_client_from_frame(request, active_frame)?;
     let saved_publication = active_frame.shared_publication()?;
     let completed_context = win32k_client_context_from_callback_client(completed_client);
-    if !select_win32k_client_window(completed_context)
-        || !restore_shared_resume_snapshot(
-            SharedResumeSnapshot::from_callback_publication(request, saved_publication),
-            *active_frame.dispatch_context(), completed_context,
-        )
+    if !select_and_restore_shared_resume_snapshot(
+        SharedResumeSnapshot::from_callback_publication(request, saved_publication),
+        *active_frame.dispatch_context(), completed_context,
+    ).1
     {
         abort_controlled_user_callbacks();
         return None;
