@@ -4749,6 +4749,56 @@ unsafe fn resume_suspended_user_callback_component(
     pr
 }
 
+/// Republish the retained request cells after either kind of service wait completes.
+/// Both callers select the client window and publish their service result first.
+unsafe fn restore_wait_dispatch_cells(
+    dispatch: nt_user_callback::DispatchContext,
+    client: Win32kClientContext,
+    nested_user_callback: bool,
+    arg_snapshot: &[u8; COMPLETED_ARG_SNAPSHOT_BYTES],
+    arg_snapshot_len: u32,
+) -> bool {
+    let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
+    for (offset, value) in [
+        (win32k_subsystem::SH_REQ_SSN, dispatch.ssn),
+        (win32k_subsystem::SH_REQ_A0, dispatch.args[0]),
+        (win32k_subsystem::SH_REQ_A1, dispatch.args[1]),
+        (win32k_subsystem::SH_REQ_A2, dispatch.args[2]),
+        (win32k_subsystem::SH_REQ_A3, dispatch.args[3]),
+        (win32k_subsystem::SH_REQ_CALLER_SP, dispatch.caller_sp),
+        (win32k_subsystem::SH_REQ_NESTED_CALLBACK, nested_user_callback as u64),
+    ] {
+        core::ptr::write_volatile((sh + offset) as *mut u64, value);
+    }
+    let arg_snapshot_len = arg_snapshot_len as usize;
+    if arg_snapshot_len > arg_snapshot.len() {
+        return false;
+    }
+    if arg_snapshot_len != 0 {
+        core::ptr::copy_nonoverlapping(
+            arg_snapshot.as_ptr(),
+            win32k_subsystem::WIN32K_ARG_VADDR as *mut u8,
+            arg_snapshot_len,
+        );
+    }
+    for (offset, value) in [
+        (win32k_subsystem::SH_REQ_PROCESS_ID, client.pid),
+        (win32k_subsystem::SH_REQ_CLIENT_PI, client.pi as u64),
+        (win32k_subsystem::SH_REQ_GENERATION, client.generation),
+        (win32k_subsystem::SH_REQ_CLIENT_TEB, client.teb),
+        (win32k_subsystem::SH_REQ_THREAD_ID, client.tid),
+        (win32k_subsystem::SH_REQ_EPROCESS, client.eprocess),
+        (win32k_subsystem::SH_REQ_ETHREAD, client.ethread),
+        (
+            win32k_subsystem::SH_REQ_PROCESS_ROLE,
+            callback_process_role_code(client.process_role) as u64,
+        ),
+    ] {
+        core::ptr::write_volatile((sh + offset) as *mut u64, value);
+    }
+    true
+}
+
 pub(crate) unsafe fn resume_suspended_provider_wait_component(
     pending: PendingProviderWaitDispatch,
     wait_id: u64,
@@ -4788,7 +4838,6 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
     if !select_win32k_client_window(pending.client) {
         return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     }
-    let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
     let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
         as *mut nt_provider_wait::ProviderWaitSharedPage;
     core::ptr::write_volatile(
@@ -4796,50 +4845,13 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         nt_provider_wait::ProviderWaitResult::completed(wait_id, status),
     );
 
-    let client = pending.client;
-    for (offset, value) in [
-        (win32k_subsystem::SH_REQ_SSN, pending.dispatch.ssn),
-        (win32k_subsystem::SH_REQ_A0, pending.dispatch.args[0]),
-        (win32k_subsystem::SH_REQ_A1, pending.dispatch.args[1]),
-        (win32k_subsystem::SH_REQ_A2, pending.dispatch.args[2]),
-        (win32k_subsystem::SH_REQ_A3, pending.dispatch.args[3]),
-        (
-            win32k_subsystem::SH_REQ_CALLER_SP,
-            pending.dispatch.caller_sp,
-        ),
-        (
-            win32k_subsystem::SH_REQ_NESTED_CALLBACK,
-            pending.nested_user_callback as u64,
-        ),
-    ] {
-        core::ptr::write_volatile((sh + offset) as *mut u64, value);
-    }
-    let arg_snapshot_len = pending.arg_snapshot_len as usize;
-    if arg_snapshot_len > pending.arg_snapshot.len() {
+    if !restore_wait_dispatch_cells(
+        pending.dispatch, pending.client, pending.nested_user_callback,
+        &pending.arg_snapshot, pending.arg_snapshot_len,
+    ) {
         return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     }
-    if arg_snapshot_len != 0 {
-        core::ptr::copy_nonoverlapping(
-            pending.arg_snapshot.as_ptr(),
-            win32k_subsystem::WIN32K_ARG_VADDR as *mut u8,
-            arg_snapshot_len,
-        );
-    }
-    for (offset, value) in [
-        (win32k_subsystem::SH_REQ_PROCESS_ID, client.pid),
-        (win32k_subsystem::SH_REQ_CLIENT_PI, client.pi as u64),
-        (win32k_subsystem::SH_REQ_GENERATION, client.generation),
-        (win32k_subsystem::SH_REQ_CLIENT_TEB, client.teb),
-        (win32k_subsystem::SH_REQ_THREAD_ID, client.tid),
-        (win32k_subsystem::SH_REQ_EPROCESS, client.eprocess),
-        (win32k_subsystem::SH_REQ_ETHREAD, client.ethread),
-        (
-            win32k_subsystem::SH_REQ_PROCESS_ROLE,
-            callback_process_role_code(client.process_role) as u64,
-        ),
-    ] {
-        core::ptr::write_volatile((sh + offset) as *mut u64, value);
-    }
+    let client = pending.client;
     let previous_dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
@@ -5032,51 +5044,13 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
         pending.request.generation,
     );
 
-    let client = pending.client;
-    let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
-    for (offset, value) in [
-        (win32k_subsystem::SH_REQ_SSN, pending.dispatch.ssn),
-        (win32k_subsystem::SH_REQ_A0, pending.dispatch.args[0]),
-        (win32k_subsystem::SH_REQ_A1, pending.dispatch.args[1]),
-        (win32k_subsystem::SH_REQ_A2, pending.dispatch.args[2]),
-        (win32k_subsystem::SH_REQ_A3, pending.dispatch.args[3]),
-        (
-            win32k_subsystem::SH_REQ_CALLER_SP,
-            pending.dispatch.caller_sp,
-        ),
-        (
-            win32k_subsystem::SH_REQ_NESTED_CALLBACK,
-            pending.nested_user_callback as u64,
-        ),
-    ] {
-        core::ptr::write_volatile((sh + offset) as *mut u64, value);
-    }
-    let arg_snapshot_len = pending.arg_snapshot_len as usize;
-    if arg_snapshot_len > pending.arg_snapshot.len() {
+    if !restore_wait_dispatch_cells(
+        pending.dispatch, pending.client, pending.nested_user_callback,
+        &pending.arg_snapshot, pending.arg_snapshot_len,
+    ) {
         return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     }
-    if arg_snapshot_len != 0 {
-        core::ptr::copy_nonoverlapping(
-            pending.arg_snapshot.as_ptr(),
-            win32k_subsystem::WIN32K_ARG_VADDR as *mut u8,
-            arg_snapshot_len,
-        );
-    }
-    for (offset, value) in [
-        (win32k_subsystem::SH_REQ_PROCESS_ID, client.pid),
-        (win32k_subsystem::SH_REQ_CLIENT_PI, client.pi as u64),
-        (win32k_subsystem::SH_REQ_GENERATION, client.generation),
-        (win32k_subsystem::SH_REQ_CLIENT_TEB, client.teb),
-        (win32k_subsystem::SH_REQ_THREAD_ID, client.tid),
-        (win32k_subsystem::SH_REQ_EPROCESS, client.eprocess),
-        (win32k_subsystem::SH_REQ_ETHREAD, client.ethread),
-        (
-            win32k_subsystem::SH_REQ_PROCESS_ROLE,
-            callback_process_role_code(client.process_role) as u64,
-        ),
-    ] {
-        core::ptr::write_volatile((sh + offset) as *mut u64, value);
-    }
+    let client = pending.client;
     let previous_dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),

@@ -355,6 +355,15 @@ fn shared_resume_request_word(snapshot: &SharedResumeSnapshot, offset: u64) -> u
     snapshot.request[index]
 }
 
+unsafe fn read_shared_resume_request() -> [u64; SHARED_RESUME_REQUEST_OFFSETS.len()] {
+    let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
+    let mut request = [0u64; SHARED_RESUME_REQUEST_OFFSETS.len()];
+    for (value, offset) in request.iter_mut().zip(SHARED_RESUME_REQUEST_OFFSETS) {
+        *value = core::ptr::read_volatile((sh + offset) as *const u64);
+    }
+    request
+}
+
 /// Capture the physical shared page only while it still belongs to this exact dispatch.
 /// A displaced or concurrently changing publication is uncertain, so its caller must retain
 /// the pending owner rather than reconstructing its request from retained identity fields.
@@ -376,15 +385,9 @@ pub(crate) unsafe fn try_capture_exact_shared_resume_snapshot(
     ) {
         return None;
     }
-    let mut request = [0u64; SHARED_RESUME_REQUEST_OFFSETS.len()];
-    for (value, offset) in request.iter_mut().zip(SHARED_RESUME_REQUEST_OFFSETS) {
-        *value = core::ptr::read_volatile((sh + offset) as *const u64);
-    }
+    let request = read_shared_resume_request();
     let published = published_win32k_context();
-    let mut confirm_request = [0u64; SHARED_RESUME_REQUEST_OFFSETS.len()];
-    for (value, offset) in confirm_request.iter_mut().zip(SHARED_RESUME_REQUEST_OFFSETS) {
-        *value = core::ptr::read_volatile((sh + offset) as *const u64);
-    }
+    let confirm_request = read_shared_resume_request();
     let confirm_published = published_win32k_context();
     let header_after = core::ptr::read_volatile(core::ptr::addr_of!((*frame).header));
     if header_before != header_after || request != confirm_request
@@ -459,10 +462,7 @@ pub(crate) unsafe fn capture_shared_resume_snapshot(
     assert!(header.matches_dispatch_identity(
         dispatch.dispatch_id, client.pi, client.tid, client.badge,
     ), "yielded win32k shared callback belongs to another dispatch");
-    let mut request = [0u64; SHARED_RESUME_REQUEST_OFFSETS.len()];
-    for (value, offset) in request.iter_mut().zip(SHARED_RESUME_REQUEST_OFFSETS) {
-        *value = core::ptr::read_volatile((sh + offset) as *const u64);
-    }
+    let mut request = read_shared_resume_request();
     shared_request_owner::canonicalize(&mut request, shared_request_owner::RequestOwner {
         ssn: dispatch.ssn,
         pid: client.pid,
