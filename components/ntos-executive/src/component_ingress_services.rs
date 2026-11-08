@@ -55,6 +55,14 @@ struct Wait {
     semantic_retired: bool,
 }
 
+impl Wait {
+    fn resume_eligible(&self) -> bool {
+        self.kind == WaitKind::RetainedSemantic
+            && self.autonomous
+            && matches!(self.phase, WaitPhase::Acknowledged | WaitPhase::Resumed)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ServiceCompletion {
     Status(i32),
@@ -615,17 +623,12 @@ unsafe fn wake_service_inner(
 /// Complete one acknowledged autonomous semantic service by its retained route and token.
 /// A busy lane remains owned and is retried by the normal timer source.
 pub(crate) unsafe fn resume_acknowledged_retained_services() -> Result<bool, Error> {
-    let now = crate::monotonic_time_100ns();
-    let route = (&*core::ptr::addr_of!(WAITS))
-        .iter()
-        .find(|wait| {
-            wait.kind == WaitKind::RetainedSemantic
-                && wait.autonomous
-                && matches!(wait.phase, WaitPhase::Acknowledged | WaitPhase::Resumed)
-                && wait.resume_retry_at <= now
-        })
-        .map(|wait| wait.route);
-    let Some(route) = route else {
+    let Some((route, now)) = nt_time::first_due(
+        (&*core::ptr::addr_of!(WAITS)).iter().map(|wait| {
+            (wait.resume_eligible().then_some(wait.resume_retry_at), wait.route)
+        }),
+        crate::monotonic_time_100ns,
+    ) else {
         return Ok(false);
     };
     match resume_service(route) {
@@ -635,8 +638,7 @@ pub(crate) unsafe fn resume_acknowledged_retained_services() -> Result<bool, Err
             // The external token is already retired. Retain the acknowledged Call and retry
             // only its physical completion after the query becomes available.
             if !(&*core::ptr::addr_of!(WAITS)).iter().any(|wait| {
-                wait.kind == WaitKind::RetainedSemantic
-                    && wait.autonomous
+                wait.resume_eligible()
                     && wait.route == route
                     && wait.phase == WaitPhase::Resumed
             }) {
@@ -646,12 +648,7 @@ pub(crate) unsafe fn resume_acknowledged_retained_services() -> Result<bool, Err
     }
     let wait = (&mut *core::ptr::addr_of_mut!(WAITS))
         .iter_mut()
-        .find(|wait| {
-            wait.kind == WaitKind::RetainedSemantic
-                && wait.autonomous
-                && wait.route == route
-                && matches!(wait.phase, WaitPhase::Acknowledged | WaitPhase::Resumed)
-        })
+        .find(|wait| wait.resume_eligible() && wait.route == route)
         .ok_or(Error::Retirement)?;
     wait.resume_retry_at = now.saturating_add(1_000_000);
     Ok(false)
@@ -660,11 +657,7 @@ pub(crate) unsafe fn resume_acknowledged_retained_services() -> Result<bool, Err
 pub(crate) unsafe fn retained_service_resume_next_deadline() -> Option<u64> {
     (&*core::ptr::addr_of!(WAITS))
         .iter()
-        .filter(|wait| {
-            wait.kind == WaitKind::RetainedSemantic
-                && wait.autonomous
-                && matches!(wait.phase, WaitPhase::Acknowledged | WaitPhase::Resumed)
-        })
+        .filter(|wait| wait.resume_eligible())
         .map(|wait| wait.resume_retry_at)
         .min()
 }

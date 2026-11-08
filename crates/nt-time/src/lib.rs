@@ -1,7 +1,7 @@
 #![no_std]
 
 mod wake_deadline;
-pub use wake_deadline::earliest_deadline;
+pub use wake_deadline::{earliest_deadline, first_due};
 mod clock_callsite_sample;
 pub use clock_callsite_sample::{
     ClockCallsiteSample, ClockCallsiteSampler, ClockCallsiteSnapshot,
