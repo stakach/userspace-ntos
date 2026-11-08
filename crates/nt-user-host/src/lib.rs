@@ -89,6 +89,7 @@ pub mod frame_recycle;
 pub mod thread_binding;
 pub mod hosted_priority;
 pub mod thread_priority_transition;
+pub mod thread_physical_placement;
 pub mod one_shot_thread_retirement;
 pub mod thread_alias_journal;
 pub mod client_alias_window;

@@ -1,5 +1,9 @@
 # Lessons
 
+## Project The Caller Core, Not The Service Core
+- A native syscall handled by the executive observes the executive TCB if it executes CPUID there. `NtGetCurrentProcessorNumber{Ex}` must use the exact guest caller's generation-checked TCB and SC placement; an executive-local APIC read cannot report a migrated caller's CPU.
+- Keep a physical placement owner with the published runtime. Record an attempted SC migration before invocation, expose a core only when its effect is known, and retain uncertain effects without replay or retirement. A driver callback may observe its own executing core, but that does not identify an unrelated user caller.
+
 ## Trace The Executed Thread API Path
 - An application call to `CreateThread` does not identify which NT thread syscall the staged `ntdll.dll` uses. Reconcile the exact serial trace, ntdll export and service number, and native dispatch before designing a diagnostic or regression. In the pinned LiberNT installer, `CreateThread` reaches legacy `NtCreateThread` (SSN 55), not `NtCreateThreadEx`.
 - Match the source call shape before writing a reproduction. The installer creates three workers with flags 0 and then runs shard 0 inline; it does not explicitly call `ResumeThread`. Observe each creation's terminal result and the original caller's retained Reply before attributing a missing inline shard to lost continuation.
