@@ -2135,6 +2135,25 @@ impl ProcessManager {
         self.thread_lifetime(lifetime.thread_id) == Some(lifetime)
     }
 
+    /// Capture the exact worker's inherited KTHREAD affinity before native SC construction.
+    /// A recycled TID or a thread from another process cannot supply creation policy.
+    pub fn thread_inherited_affinity(
+        &self,
+        lifetime: ThreadLifetime,
+        expected_pid: ProcessId,
+    ) -> Result<u64, u32> {
+        if lifetime.process_id != expected_pid || !self.validate_thread_lifetime(lifetime) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let thread = self.thread(lifetime.thread_id).ok_or(STATUS_INVALID_HANDLE)?;
+        let process = self.process(expected_pid).ok_or(STATUS_INVALID_HANDLE)?;
+        let mask = thread.affinity_mask;
+        if mask == 0 || mask & !process.affinity_mask != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(mask)
+    }
+
     /// Replace a process primary-token reference and return the prior identity to its owner.
     pub fn replace_process_primary_token(
         &mut self,

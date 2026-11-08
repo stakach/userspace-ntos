@@ -27,6 +27,7 @@ impl HostedThreadSpawn {
             .construction
             .live_slots()
             .expect("completed construction retains every live slot");
+        assert!(construction.physical_core.is_some(), "completed worker has an acknowledged SC core");
         assert!(construction.resources.is_live());
         Self {
             construction,
@@ -47,6 +48,9 @@ impl HostedThreadSpawn {
             .live_slots()
             .expect("unpublished completed inventory");
         HostedThreadMechanismCaps::new(raw, cnode, sc)
+    }
+    pub(crate) fn physical_core(&self) -> u8 {
+        self.construction.physical_core.expect("successful worker retains its configured core")
     }
     pub(crate) const fn teb_alias(&self) -> u64 {
         self.construction.teb_alias

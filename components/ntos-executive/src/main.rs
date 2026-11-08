@@ -14662,7 +14662,7 @@ mod client_frame_cleanup;
 mod retirement_memory_access;
 mod provider_bugcheck;
 mod pagefile_retirement;
-use thread_sched_context::attach_sched_context;
+use thread_sched_context::{attach_sched_context, attach_sched_context_on_core};
 
 /// Build the page table for the relocated shared "cluster" region (rings, stack, IPC buffer,
 /// sysarg, device MMIO, driver code/arena) at `WORK_CLUSTER_BASE` in `pml4`. The cluster used to
@@ -26663,6 +26663,13 @@ unsafe fn spawn_hosted_thread(
         Ok(priority) => priority,
         Err(_) => return Err(HostedThreadSpawnFailure::Unstarted),
     };
+    let physical_core = u32::try_from(t.cid_thread).ok()
+        .and_then(|tid| handler.pm.thread_lifetime(tid))
+        .and_then(|lifetime| handler.pm.thread_inherited_affinity(lifetime, binding.process.pid).ok())
+        .and_then(|mask| nt_user_host::sched_context::select_guest_worker_core(
+            mask, SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed), t.cid_thread,
+        ).ok())
+        .ok_or(HostedThreadSpawnFailure::Unstarted)?;
     if !hosted_thread_client_frame_keys_available(t, layout) {
         return Err(HostedThreadSpawnFailure::Unstarted);
     }
@@ -26673,7 +26680,9 @@ unsafe fn spawn_hosted_thread(
         Ok(prepared) => prepared,
         Err(_) => return Err(HostedThreadSpawnFailure::Unstarted),
     };
-    let mut spawned = spawn_hosted_thread_mechanism(t, resources, binding, initial_priority)?;
+    let mut spawned = spawn_hosted_thread_mechanism(
+        t, resources, binding, initial_priority, physical_core,
+    )?;
     spawned.attach_commitment(prepared);
     Ok(spawned)
 }
@@ -26683,6 +26692,7 @@ unsafe fn spawn_hosted_thread_mechanism(
     mut resources: HostedThreadResources,
     binding: nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
     initial_priority: u8,
+    physical_core: u8,
 ) -> HostedThreadSpawnResult {
     use nt_user_host::thread_construction::{MemoryConstructionProgress, Role, ThreadConstructionInventory};
     let mut construction = ThreadConstructionInventory::empty();
@@ -26693,6 +26703,7 @@ unsafe fn spawn_hosted_thread_mechanism(
             record_hosted_thread_construction_failure(&binding, $phase, $error, $target);
             Err(HostedThreadSpawnFailure::Retained(RetainedHostedThreadConstruction {
                 binding, resources, construction, memory_progress, teb_alias: retained_teb_alias,
+                physical_core: None,
             }))
         }};
     }
@@ -27153,7 +27164,7 @@ unsafe fn spawn_hosted_thread_mechanism(
     let _native_transport = t.native;
     let e_syscalls = tcb_set_hosted_syscalls_r(tcb);
     if e_syscalls != 0 { return failed!(b"tcb-hosted-syscalls", ThreadConstructionError::Native(e_syscalls), tcb); }
-    let sched_context = match attach_sched_context(tcb) {
+    let sched_context = match attach_sched_context_on_core(tcb, physical_core) {
         Ok(sc) => sc,
         Err(e_sc) => {
             print_str(b"[thread-life] hosted SC attach failed tcb=0x");
@@ -27174,6 +27185,7 @@ unsafe fn spawn_hosted_thread_mechanism(
         resources,
         construction,
         memory_progress,
+        physical_core: Some(physical_core),
         teb_alias: if teb_live_alias != 0 && teb_live_map == 0 && teb2_live_map == 0 {
             teb_live_alias
         } else {

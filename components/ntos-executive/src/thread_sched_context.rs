@@ -5,7 +5,7 @@ use nt_user_host::sched_context::{Error, SchedContextConstruction, SchedContextI
 // have deleted the failed target TCB. Rows are allocated before any capability is acquired.
 static mut CONSTRUCTIONS: Vec<SchedContextConstruction> = Vec::new();
 
-// Current callers keep core zero until their published runtime can carry an exact selected core.
+// SEC_IMAGE main threads use core zero; worker construction selects an allowed core.
 pub(crate) const GUEST_SCHED_CONTROL_CORE: u8 = 0;
 
 pub(crate) fn validate_guest_affinity(requested_mask: u64) -> Result<(), u32> {
