@@ -144,6 +144,7 @@ pub(super) unsafe fn publish_selected_queued_read(
     nt_handler.current_file_transfer_event = None;
     nt_handler.current_synchronous_file = None;
     thread_wait_state_park_badge_waiting(nt_handler, pending.badge);
+    super::mounted_read_lifetime_trace::parked(nt_handler, identity, pending);
     if let Err(error) = inline_file_retirement::try_transfer_to_pending(active) {
         return Outcome::PublishedCallerRefused(SelectedFileTransferRetained {
             identity,
@@ -289,6 +290,7 @@ pub(super) unsafe fn before_post_action(
         super::pending_pipe_read_trace::parked(
             nt_handler, identity, pending, wait_for_completion,
         );
+        super::mounted_read_lifetime_trace::parked(nt_handler, identity, pending);
         Some(PublishedFileIo {
             identity,
             irp_id: pending.irp_id,

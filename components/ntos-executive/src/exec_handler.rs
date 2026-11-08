@@ -41530,7 +41530,8 @@ impl ExecNtHandler {
                                     Err(status) => status,
                                     Ok(()) => {
                                         operation_started = true;
-                                        match self.dispatch_hosted_file_read_write_for(
+                                        let read_started = diagnostic_time_100ns();
+                                        let dispatched = self.dispatch_hosted_file_read_write_for(
                                             route,
                                             major::IRP_MJ_READ,
                                             nt_io_manager::ReadWriteParameters {
@@ -41540,7 +41541,13 @@ impl ExecNtHandler {
                                             },
                                             &[],
                                             &mut output,
-                                        ) {
+                                        );
+                                        crate::service_sec_image::mounted_read_lifetime_trace::dispatched(
+                                            route.device_id, route.file_id, self.pi,
+                                            self.hosted_process_generation(self.pi).unwrap_or(0),
+                                            len as u32, read_started, dispatched,
+                                        );
+                                        match dispatched {
                                             Ok((
                                                 driver_status,
                                                 completed,
