@@ -276,7 +276,9 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         // component pump continues. An uncheckpointed child, another route, or a future scope
         // must still fence restoration.
         lane.suspensions.frames().iter().all(|frame| {
-            (frame.key.kind != SuspensionKind::Receive
+            (!matches!(frame.phase, SuspensionPhase::ResumingChildParked { .. }
+                | SuspensionPhase::ResumingChildQuarantined { .. })
+                && frame.key.kind != SuspensionKind::Receive
                 && frame.key.kind != SuspensionKind::RootIngress
                 && frame.nested_child.is_none())
                 || (matches!(frame.key.kind, SuspensionKind::Receive | SuspensionKind::RootIngress)

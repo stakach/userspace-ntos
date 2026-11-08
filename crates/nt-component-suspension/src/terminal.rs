@@ -167,7 +167,9 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
     fn returning_pump_is_unsettled(&self) -> bool {
         self.slots.iter().any(|slot| slot.lane.as_ref().is_some_and(|lane| {
             lane.suspensions.frames().iter().any(|frame| matches!(frame.phase,
-                SuspensionPhase::Resuming { .. } | SuspensionPhase::MaintenanceResuming { .. }))
+                SuspensionPhase::Resuming { .. }
+                    | SuspensionPhase::ResumingChildQuarantined { .. }
+                    | SuspensionPhase::MaintenanceResuming { .. }))
         }))
     }
 

@@ -2,6 +2,7 @@ use super::*;
 use crate::{IngressReplyObservation, LaneBinding};
 
 mod inline_irq_checkpoint;
+mod nested_pre_entry_checkpoint;
 
 type Lanes = ComponentSuspensionLanes<u64, u32, ()>;
 

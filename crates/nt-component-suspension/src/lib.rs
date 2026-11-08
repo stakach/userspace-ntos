@@ -29,6 +29,12 @@ pub use external_selection::{
 };
 mod ingress;
 mod inline_irq_checkpoint;
+mod nested_pre_entry_checkpoint;
+pub use nested_pre_entry_checkpoint::{
+    NestedPreEntryCheckpoint, NestedPreEntryChildReceipt, NestedPreEntryError,
+    NestedPreEntryPhase, NestedPreEntryRestoreEffect,
+    NestedPreEntryParentParkReceipt, NestedPreEntryParentRestoreReceipt,
+};
 pub use inline_irq_checkpoint::{
     InlineIrqCheckpoint, InlineIrqCheckpointError, InlineIrqCheckpointMismatch,
     InlineIrqCheckpointObservation,
@@ -173,6 +179,11 @@ pub enum SuspensionPhase<R> {
     Waiting,
     Selected { completion: R },
     Resuming { completion: R, cancelled: bool },
+    /// The exact resuming pump is stopped while its full publication is owned by a
+    /// nested checkpoint. Its continuation and completion remain in this frame.
+    ResumingChildParked { completion: R, cancelled: bool, scope: NestedExecutionIdentity },
+    /// An uncertain child or restore permanently fences this parent epoch.
+    ResumingChildQuarantined { completion: R, cancelled: bool, scope: NestedExecutionIdentity },
     Cancelled { completion: R },
     MaintenanceWaiting { captured_pass: u64 },
     MaintenanceReady { observed_pass: u64 },
@@ -584,6 +595,8 @@ impl<C, R: Clone> ComponentSuspensionStack<C, R> {
                 cancelled: true,
             }),
             SuspensionPhase::Waiting | SuspensionPhase::Resuming { .. }
+            | SuspensionPhase::ResumingChildParked { .. }
+            | SuspensionPhase::ResumingChildQuarantined { .. }
             | SuspensionPhase::MaintenanceWaiting { .. }
             | SuspensionPhase::MaintenanceReady { .. }
             | SuspensionPhase::MaintenanceResuming { .. }

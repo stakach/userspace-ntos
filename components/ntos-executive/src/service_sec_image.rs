@@ -328,6 +328,8 @@ pub(crate) unsafe fn trace_stale_suspension_frames(lane_index: u64, lane_generat
                 nt_component_suspension::SuspensionPhase::Waiting => 1,
                 nt_component_suspension::SuspensionPhase::Selected { .. } => 2,
                 nt_component_suspension::SuspensionPhase::Resuming { .. } => 3,
+                nt_component_suspension::SuspensionPhase::ResumingChildParked { .. } => 9,
+                nt_component_suspension::SuspensionPhase::ResumingChildQuarantined { .. } => 10,
                 nt_component_suspension::SuspensionPhase::Cancelled { .. } => 4,
                 nt_component_suspension::SuspensionPhase::MaintenanceWaiting { .. } => 5,
                 nt_component_suspension::SuspensionPhase::MaintenanceReady { .. } => 6,
