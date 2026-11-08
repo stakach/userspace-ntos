@@ -4599,7 +4599,7 @@ pub(crate) unsafe fn retire_bugchecked_vspace(vspace: u64, reporting_tcb: u64) {
 
 unsafe fn retire_win32k_on_wall(pr: &crate::spawn_hosts::PumpResult) {
     if pr.completed || pr.callback_suspended || pr.provider_wait_suspended || pr.lpc_wait_suspended
-        || pr.receive_yield.is_some() || pr.root_ingress_yield.is_some()
+        || pr.receive_yield().is_some() || pr.root_ingress_yield().is_some()
         || pr.service_wait_yield.is_some()
         || pr.maintenance_yield.is_some() || pr.nested_restore_yield.is_some()
         || pr.nested_restore_quarantined.is_some()
@@ -4741,7 +4741,7 @@ unsafe fn resume_suspended_user_callback_component(
         pr.dispatch_return_receipt, request.dispatch_id, dispatch.ssn, pr.result, pr.completed,
     );
     retire_win32k_on_wall(&pr);
-    if pr.receive_yield.is_some() || pr.service_wait_yield.is_some() {
+    if pr.receive_yield().is_some() || pr.service_wait_yield.is_some() {
         assert!((*core::ptr::addr_of!(USER_CALLBACK_YIELDED_CHANNEL)).is_none());
         core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_YIELDED_CHANNEL), Some(channel));
     }
@@ -4755,7 +4755,7 @@ unsafe fn resume_suspended_user_callback_component(
                 )
             })
     } else if pr.provider_wait_suspended || pr.lpc_wait_suspended
-        || pr.receive_yield.is_some() || pr.service_wait_yield.is_some() {
+        || pr.receive_yield().is_some() || pr.service_wait_yield.is_some() {
         // The native NtCallbackReturn continuation must be attached before this callback token is
         // removed. Its service-loop consumer performs one atomic token-to-wait transfer.
         true
@@ -4889,7 +4889,7 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
     );
     retire_win32k_on_wall(&pump);
 
-    if let Some(yielded) = pump.receive_yield {
+    if let Some(yielded) = pump.receive_yield() {
         return ProviderWaitPumpCompletion::ReceiveReparked(PendingReceiveDispatch {
             yielded,
             snapshot: SuspendedPumpSnapshot {
@@ -5088,7 +5088,7 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
     );
     retire_win32k_on_wall(&pump);
 
-    if let Some(yielded) = pump.receive_yield {
+    if let Some(yielded) = pump.receive_yield() {
         return LpcWaitPumpCompletion::ReceiveReparked(PendingReceiveDispatch {
             yielded,
             snapshot: SuspendedPumpSnapshot {
@@ -5920,7 +5920,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         arg_snapshot[..arg_snapshot_len as usize]
             .copy_from_slice(&completed_frame.arg_snapshot()[..arg_snapshot_len as usize]);
     }
-    if let Some(yielded) = component.receive_yield {
+    if let Some(yielded) = component.receive_yield() {
         assert!(!nested_user_callback, "nested callback cannot yield Receive ownership");
         let Some(channel) = core::ptr::replace(
             core::ptr::addr_of_mut!(USER_CALLBACK_YIELDED_CHANNEL), None,
@@ -7728,7 +7728,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         print_str(b"/");
         print_u64(pr.lpc_wait_suspended as u64);
         print_str(b"/");
-        print_u64(pr.receive_yield.is_some() as u64);
+        print_u64(pr.receive_yield().is_some() as u64);
         print_str(b"/");
         print_u64(pr.service_wait_yield.is_some() as u64);
         print_str(b"/");
@@ -7754,7 +7754,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             crate::service_sec_image::suspend_component_execution_lane_for_callback(lane, token)
         })
     } else if pr.provider_wait_suspended || pr.lpc_wait_suspended
-        || pr.receive_yield.is_some() || pr.root_ingress_yield.is_some()
+        || pr.receive_yield().is_some() || pr.root_ingress_yield().is_some()
         || pr.service_wait_yield.is_some()
         || pr.maintenance_yield.is_some() || pr.nested_restore_yield.is_some()
         || pr.nested_restore_quarantined.is_some() {
@@ -7782,7 +7782,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         panic!("win32k dispatch violated execution-lane ownership");
     }
     USER_CALLBACK_LAST_PUMP_SUSPENDED.store(pr.callback_suspended as u64, Ordering::Release);
-    if let Some(yielded) = pr.receive_yield {
+    if let Some(yielded) = pr.receive_yield() {
         assert!(!nested_user_callback && outer_callback.is_none(), "Receive owns only an initial hosted dispatch");
         assert!((*core::ptr::addr_of!(RECEIVE_PENDING_DISPATCH)).is_none());
         let (arg_snapshot_len, arg_snapshot) = capture_initial_arg_snapshot(ssn, completion_args);
@@ -7797,7 +7797,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             },
         }));
     }
-    if let Some(yielded) = pr.root_ingress_yield {
+    if let Some(yielded) = pr.root_ingress_yield() {
         assert!(!nested_user_callback && outer_callback.is_none(),
             "root ingress owns only an initial hosted dispatch");
         assert!((*core::ptr::addr_of!(ROOT_INGRESS_PENDING_DISPATCH)).is_none());
@@ -7944,8 +7944,8 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         *suspended = pr.callback_suspended
             || pr.provider_wait_suspended
             || pr.lpc_wait_suspended
-            || pr.receive_yield.is_some()
-            || pr.root_ingress_yield.is_some()
+            || pr.receive_yield().is_some()
+            || pr.root_ingress_yield().is_some()
             || pr.service_wait_yield.is_some()
             || pr.maintenance_yield.is_some()
             || pr.nested_restore_yield.is_some()
@@ -7953,14 +7953,14 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     }
     if let Some(ticket) = displaced_parent {
         let child_suspended = pr.callback_suspended || pr.provider_wait_suspended
-            || pr.lpc_wait_suspended || pr.receive_yield.is_some()
-            || pr.root_ingress_yield.is_some() || pr.service_wait_yield.is_some()
+            || pr.lpc_wait_suspended || pr.receive_yield().is_some()
+            || pr.root_ingress_yield().is_some() || pr.service_wait_yield.is_some()
             || pr.maintenance_yield.is_some() || pr.nested_restore_yield.is_some()
             || pr.nested_restore_quarantined.is_some();
         // These paths published a full PumpResult into a pending owner above. Callback,
         // provider-wait and LPC-wait records retain a lane/request but no returned pump.
-        let child_has_durable_pump = pr.receive_yield.is_some()
-            || pr.root_ingress_yield.is_some() || pr.service_wait_yield.is_some()
+        let child_has_durable_pump = pr.receive_yield().is_some()
+            || pr.root_ingress_yield().is_some() || pr.service_wait_yield.is_some()
             || pr.maintenance_yield.is_some() || pr.nested_restore_yield.is_some()
             || pr.nested_restore_quarantined.is_some() || source_claim.is_some();
         let terminal = pr.completed && lane_transition_ok && !child_suspended;
@@ -8015,8 +8015,8 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         && !pr.callback_suspended
         && !pr.provider_wait_suspended
         && !pr.lpc_wait_suspended
-        && pr.receive_yield.is_none()
-        && pr.root_ingress_yield.is_none()
+        && pr.receive_yield().is_none()
+        && pr.root_ingress_yield().is_none()
         && pr.service_wait_yield.is_none()
         && pr.maintenance_yield.is_none()
         && pr.nested_restore_yield.is_none()

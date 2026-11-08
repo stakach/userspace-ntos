@@ -394,7 +394,7 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
             print_hex(pump.status as u32);
             print_str(b"/");
             let flags = (pump.scheduler_yielded as u64)
-                | ((pump.receive_yield.is_some() as u64) << 1)
+                | ((pump.receive_yield().is_some() as u64) << 1)
                 | ((pump.service_wait_yield.is_some() as u64) << 2)
                 | ((pump.callback_suspended as u64) << 3)
                 | ((pump.provider_wait_suspended as u64) << 4)

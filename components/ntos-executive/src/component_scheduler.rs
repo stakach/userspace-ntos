@@ -28,7 +28,7 @@ fn trace_worker_startup_pump(
     print_u64(stage); print_str(b"/");
     if let Some(result) = result {
         let flags = u32::from(result.scheduler_yielded)
-            | (u32::from(result.receive_yield.is_some()) << 1)
+            | (u32::from(result.receive_yield().is_some()) << 1)
             | (u32::from(result.service_wait_yield.is_some()) << 2)
             | (u32::from(result.callback_suspended) << 3)
             | (u32::from(result.provider_wait_suspended) << 4)

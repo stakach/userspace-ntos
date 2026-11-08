@@ -206,8 +206,8 @@ pub(crate) fn classify_source_terminal(
         let classified = owner.capture_or_quarantine(|_, pump| {
             (pump.completed
                 && !pump.callback_suspended && !pump.provider_wait_suspended
-                && !pump.lpc_wait_suspended && pump.receive_yield.is_none()
-                && pump.root_ingress_yield.is_none() && pump.service_wait_yield.is_none()
+                && !pump.lpc_wait_suspended && pump.receive_yield().is_none()
+                && pump.root_ingress_yield().is_none() && pump.service_wait_yield.is_none()
                 && pump.maintenance_yield.is_none() && pump.nested_restore_yield.is_none()
                 && pump.nested_restore_quarantined.is_none()).then_some(())
         });

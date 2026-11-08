@@ -1691,6 +1691,24 @@ unsafe fn pump_scheduler_work_pending(ch: &PumpChannel, irq: bool) -> bool {
 }
 
 
+/// The receive half yields one physical handoff at a time. Keeping these alternatives in one
+/// value also prevents a result from claiming two different retained ingress owners.
+#[derive(Clone, Copy)]
+enum PumpIngressYield {
+    Receive(crate::win32k_glue::ReceiveYield),
+    RootIngress(crate::win32k_glue::RootIngressYield),
+}
+
+impl PumpIngressYield {
+    fn receive(self) -> Option<crate::win32k_glue::ReceiveYield> {
+        match self { Self::Receive(yielded) => Some(yielded), Self::RootIngress(_) => None }
+    }
+
+    fn root_ingress(self) -> Option<crate::win32k_glue::RootIngressYield> {
+        match self { Self::RootIngress(yielded) => Some(yielded), Self::Receive(_) => None }
+    }
+}
+
 struct PumpMessage {
     shared_reply: Option<u64>,
     service_finished: bool,
@@ -1703,8 +1721,7 @@ struct PumpMessage {
     m3: u64,
     m4: u64,
     scheduler_yield: bool,
-    receive_yield: Option<crate::win32k_glue::ReceiveYield>,
-    root_ingress_yield: Option<crate::win32k_glue::RootIngressYield>,
+    ingress_yield: Option<PumpIngressYield>,
     service_wait_yield: Option<crate::win32k_glue::ServiceWaitYield>,
     maintenance_yield: Option<crate::win32k_glue::RootMaintenanceYield>,
     nested_restore_yield: Option<shared_ingress::owner::runtime::nested::NestedRestoreTicket>,
@@ -1712,6 +1729,14 @@ struct PumpMessage {
 }
 
 impl PumpMessage {
+    fn receive_yield(&self) -> Option<crate::win32k_glue::ReceiveYield> {
+        self.ingress_yield.and_then(PumpIngressYield::receive)
+    }
+
+    fn root_ingress_yield(&self) -> Option<crate::win32k_glue::RootIngressYield> {
+        self.ingress_yield.and_then(PumpIngressYield::root_ingress)
+    }
+
     fn from_received(received: nt_component_suspension::ReceivedMessage) -> Self {
         assert!(
             received.message_len().is_some(),
@@ -1730,8 +1755,7 @@ impl PumpMessage {
             m4: received.word(4).unwrap_or(0),
             received: Some(received),
             scheduler_yield: false,
-            receive_yield: None,
-            root_ingress_yield: None,
+            ingress_yield: None,
             service_wait_yield: None,
             maintenance_yield: None,
             nested_restore_yield: None,
@@ -1765,8 +1789,7 @@ impl PumpMessage {
             m3: 0,
             m4: 0,
             scheduler_yield: false,
-            receive_yield: None,
-            root_ingress_yield: None,
+            ingress_yield: None,
             service_wait_yield: None,
             maintenance_yield: None,
             nested_restore_yield: None,
@@ -1788,8 +1811,7 @@ impl PumpMessage {
             m3: 0,
             m4: 0,
             scheduler_yield: false,
-            receive_yield: None,
-            root_ingress_yield: None,
+            ingress_yield: None,
             service_wait_yield: None,
             maintenance_yield: None,
             nested_restore_yield: None,
@@ -1811,8 +1833,7 @@ impl PumpMessage {
             m3: 0,
             m4: 0,
             scheduler_yield: true,
-            receive_yield: None,
-            root_ingress_yield: None,
+            ingress_yield: None,
             service_wait_yield: None,
             maintenance_yield: None,
             nested_restore_yield: None,
@@ -1824,7 +1845,7 @@ impl PumpMessage {
         Self {
             shared_reply: None, service_finished: false, received: None,
             badge: 0, mi: 0, m0: 0, m1: 0, m2: 0, m3: 0, m4: 0,
-            scheduler_yield: false, receive_yield: Some(yielded), root_ingress_yield: None,
+            scheduler_yield: false, ingress_yield: Some(PumpIngressYield::Receive(yielded)),
             service_wait_yield: None,
             maintenance_yield: None,
             nested_restore_yield: None,
@@ -1835,7 +1856,7 @@ impl PumpMessage {
     fn hosted_root_ingress_yield(yielded: crate::win32k_glue::RootIngressYield) -> Self {
         let mut message = Self::transport_wall();
         message.mi = 0;
-        message.root_ingress_yield = Some(yielded);
+        message.ingress_yield = Some(PumpIngressYield::RootIngress(yielded));
         message
     }
 
@@ -1843,7 +1864,7 @@ impl PumpMessage {
         Self {
             shared_reply: None, service_finished: false, received: None,
             badge: 0, mi: 0, m0: 0, m1: 0, m2: 0, m3: 0, m4: 0,
-            scheduler_yield: false, receive_yield: None, root_ingress_yield: None,
+            scheduler_yield: false, ingress_yield: None,
             service_wait_yield: Some(yielded),
             maintenance_yield: None,
             nested_restore_yield: None,
@@ -1855,7 +1876,7 @@ impl PumpMessage {
         Self {
             shared_reply: None, service_finished: false, received: None,
             badge: 0, mi: 0, m0: 0, m1: 0, m2: 0, m3: 0, m4: 0,
-            scheduler_yield: false, receive_yield: None, root_ingress_yield: None,
+            scheduler_yield: false, ingress_yield: None,
             service_wait_yield: None, maintenance_yield: Some(yielded),
             nested_restore_yield: None,
             nested_restore_quarantined: None,
@@ -1923,8 +1944,7 @@ struct PumpLoopOutcome {
     provider_wait_suspended: bool,
     lpc_wait_suspended: bool,
     scheduler_yielded: bool,
-    receive_yield: Option<crate::win32k_glue::ReceiveYield>,
-    root_ingress_yield: Option<crate::win32k_glue::RootIngressYield>,
+    ingress_yield: Option<PumpIngressYield>,
     service_wait_yield: Option<crate::win32k_glue::ServiceWaitYield>,
     maintenance_yield: Option<crate::win32k_glue::RootMaintenanceYield>,
     nested_restore_yield: Option<shared_ingress::owner::runtime::nested::NestedRestoreTicket>,
@@ -1940,6 +1960,14 @@ struct PumpLoopOutcome {
 }
 
 impl PumpLoopOutcome {
+    fn receive_yield(&self) -> Option<crate::win32k_glue::ReceiveYield> {
+        self.ingress_yield.and_then(PumpIngressYield::receive)
+    }
+
+    fn root_ingress_yield(&self) -> Option<crate::win32k_glue::RootIngressYield> {
+        self.ingress_yield.and_then(PumpIngressYield::root_ingress)
+    }
+
     #[inline]
     const fn new() -> Self {
         Self {
@@ -1949,8 +1977,7 @@ impl PumpLoopOutcome {
             provider_wait_suspended: false,
             lpc_wait_suspended: false,
             scheduler_yielded: false,
-            receive_yield: None,
-            root_ingress_yield: None,
+            ingress_yield: None,
             service_wait_yield: None,
             maintenance_yield: None,
             nested_restore_yield: None,
@@ -2147,8 +2174,7 @@ pub(crate) struct PumpResult {
     /// The request remains live while IRQ scheduler work runs. Continue its receive half on this
     /// reply object with the same accounting; do not replay an initial request or callback resume.
     pub scheduler_yielded: bool,
-    pub receive_yield: Option<crate::win32k_glue::ReceiveYield>,
-    pub root_ingress_yield: Option<crate::win32k_glue::RootIngressYield>,
+    ingress_yield: Option<PumpIngressYield>,
     pub service_wait_yield: Option<crate::win32k_glue::ServiceWaitYield>,
     pub maintenance_yield: Option<crate::win32k_glue::RootMaintenanceYield>,
     /// Exact parked-parent selector; the physical owner retains the Reply and restoration state.
@@ -2170,6 +2196,14 @@ pub(crate) struct PumpResult {
 }
 
 impl PumpResult {
+    pub(crate) fn receive_yield(&self) -> Option<crate::win32k_glue::ReceiveYield> {
+        self.ingress_yield.and_then(PumpIngressYield::receive)
+    }
+
+    pub(crate) fn root_ingress_yield(&self) -> Option<crate::win32k_glue::RootIngressYield> {
+        self.ingress_yield.and_then(PumpIngressYield::root_ingress)
+    }
+
     /// An adapter's genuine admission failure, never a provider completion or resumable yield.
     pub(crate) fn refused(status: i32, reply_cap: u64) -> Self {
         Self {
@@ -2184,8 +2218,7 @@ impl PumpResult {
             provider_wait_suspended: false,
             lpc_wait_suspended: false,
             scheduler_yielded: false,
-            receive_yield: None,
-            root_ingress_yield: None,
+            ingress_yield: None,
             service_wait_yield: None,
             maintenance_yield: None,
             nested_restore_yield: None,
@@ -2205,8 +2238,8 @@ impl PumpResult {
 
     fn is_receive_yield(&self) -> bool {
         self.reply_cap != 0
-            && (self.scheduler_yielded || self.receive_yield.is_some())
-            && self.root_ingress_yield.is_none()
+            && (self.scheduler_yielded || self.receive_yield().is_some())
+            && self.root_ingress_yield().is_none()
             && self.service_wait_yield.is_none()
             && self.maintenance_yield.is_none()
             && self.nested_restore_yield.is_none()
@@ -2220,8 +2253,8 @@ impl PumpResult {
     fn is_service_wait_yield(&self) -> bool {
         self.reply_cap != 0
             && self.service_wait_yield.is_some()
-            && self.receive_yield.is_none()
-            && self.root_ingress_yield.is_none()
+            && self.receive_yield().is_none()
+            && self.root_ingress_yield().is_none()
             && self.maintenance_yield.is_none()
             && self.nested_restore_yield.is_none()
             && self.nested_restore_quarantined.is_none()
@@ -2513,7 +2546,7 @@ pub(crate) unsafe fn component_pump_continue_receive_after_scheduler_service(
 unsafe fn receive_continuation_authorized(ch: &PumpChannel, previous: &PumpResult) -> bool {
     previous.is_receive_yield()
         && (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield
-            || previous.receive_yield.is_some_and(|yielded|
+            || previous.receive_yield().is_some_and(|yielded|
                 crate::win32k_glue::receive_continuation_is_current(ch, yielded)))
         && (!ch.caps.kernel_irq_yield || previous.reply_cap == ch.reply_cap)
 }
@@ -2554,7 +2587,7 @@ pub(crate) unsafe fn component_pump_continue_root_maintenance(
     });
     if !current || previous.completed || previous.callback_suspended
         || previous.provider_wait_suspended || previous.lpc_wait_suspended
-        || previous.receive_yield.is_some() || previous.root_ingress_yield.is_some()
+        || previous.receive_yield().is_some() || previous.root_ingress_yield().is_some()
         || previous.service_wait_yield.is_some()
         || previous.nested_restore_yield.is_some()
         || previous.nested_restore_quarantined.is_some()
@@ -2573,14 +2606,14 @@ pub(crate) unsafe fn component_pump_continue_root_ingress_after_unwind(
     parent: nt_component_suspension::NestedExecutionIdentity,
     expected_dispatch_id: u64,
 ) -> Result<PumpResult, u32> {
-    let current = previous.root_ingress_yield.is_some_and(|yielded|
+    let current = previous.root_ingress_yield().is_some_and(|yielded|
         crate::win32k_glue::root_ingress_unwind_continuation_is_current(
             ch, yielded, parent, previous.reply_cap, expected_dispatch_id,
         ));
     if !current || previous.reply_cap == 0 || previous.reply_cap != ch.reply_cap
         || previous.completed || previous.callback_suspended
         || previous.provider_wait_suspended || previous.lpc_wait_suspended
-        || previous.receive_yield.is_some() || previous.service_wait_yield.is_some()
+        || previous.receive_yield().is_some() || previous.service_wait_yield.is_some()
         || previous.maintenance_yield.is_some() || previous.nested_restore_yield.is_some()
         || previous.nested_restore_quarantined.is_some() || previous.scheduler_yielded
     {
@@ -2613,8 +2646,8 @@ pub(crate) unsafe fn component_pump_restore_nested_parent(
         .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
     if previous.reply_cap == 0 || previous.completed || previous.callback_suspended
         || previous.provider_wait_suspended || previous.lpc_wait_suspended
-        || previous.scheduler_yielded || previous.receive_yield.is_some()
-        || previous.root_ingress_yield.is_some()
+        || previous.scheduler_yielded || previous.receive_yield().is_some()
+        || previous.root_ingress_yield().is_some()
         || previous.service_wait_yield.is_some() || previous.maintenance_yield.is_some()
         || previous.nested_restore_quarantined.is_some()
         || !runtime::nested::ticket_matches_channel(ticket, route, previous.reply_cap)
@@ -2662,7 +2695,7 @@ unsafe fn component_pump_continue_receive_half(
     resume_retained_seh: bool,
     return_on_seh_refusal: bool,
 ) -> Result<PumpResult, u32> {
-    if let Some(yielded) = previous.receive_yield {
+    if let Some(yielded) = previous.receive_yield() {
         crate::win32k_glue::trace_receive_phase(
             b"resume-enter", yielded.parent, yielded.child, yielded.owner,
         );
@@ -2678,13 +2711,13 @@ unsafe fn component_pump_continue_receive_half(
         outcome.wall_label = nt_unwind::seh_transport::RAISE_LABEL;
         return Ok(pump_finish_slice(ch, outcome, reply_cap));
     };
-    if let Some(yielded) = previous.receive_yield {
+    if let Some(yielded) = previous.receive_yield() {
         crate::win32k_glue::trace_receive_phase(
             b"resume-before-recv", yielded.parent, yielded.child, yielded.owner,
         );
     }
     let first = pump_recv_with_scheduler_checkpoint(ch, serviced_scheduler_yield);
-    if let Some(yielded) = previous.receive_yield {
+    if let Some(yielded) = previous.receive_yield() {
         crate::win32k_glue::trace_receive_phase(
             b"resume-after-recv", yielded.parent, yielded.child, yielded.owner,
         );
@@ -2692,7 +2725,7 @@ unsafe fn component_pump_continue_receive_half(
     let mut outcome = component_pump_loop(ch, first, &mut reply_cap, previous.accounting, &mut seh.pump);
     let suspended = outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended;
     if !seh.finish(ch, reply_cap, suspended) {
-        assert!(outcome.receive_yield.is_none() && outcome.root_ingress_yield.is_none()
+        assert!(outcome.receive_yield().is_none() && outcome.root_ingress_yield().is_none()
             && outcome.service_wait_yield.is_none()
             && outcome.maintenance_yield.is_none(),
             "receive yield retained with failed SEH retirement");
@@ -2851,7 +2884,7 @@ unsafe fn component_pump_enter(
     let mut outcome = component_pump_loop(ch, first, &mut reply_cap, accounting, &mut seh.pump);
     let suspended = outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended;
     if !seh.finish(ch, reply_cap, suspended) {
-        assert!(outcome.receive_yield.is_none() && outcome.root_ingress_yield.is_none()
+        assert!(outcome.receive_yield().is_none() && outcome.root_ingress_yield().is_none()
             && outcome.service_wait_yield.is_none()
             && outcome.maintenance_yield.is_none(),
             "receive yield retained with failed SEH retirement");
@@ -2941,14 +2974,14 @@ unsafe fn component_pump_loop(
             break;
         }
         msg.restore_received();
-        if let Some(yielded) = msg.receive_yield {
+        if let Some(yielded) = msg.receive_yield() {
             assert!(!seh.retained(), "retained exception cannot yield its receive ownership");
-            outcome.receive_yield = Some(yielded);
+            outcome.ingress_yield = Some(PumpIngressYield::Receive(yielded));
             break;
         }
-        if let Some(yielded) = msg.root_ingress_yield {
+        if let Some(yielded) = msg.root_ingress_yield() {
             assert!(!seh.retained(), "retained exception cannot yield root ingress");
-            outcome.root_ingress_yield = Some(yielded);
+            outcome.ingress_yield = Some(PumpIngressYield::RootIngress(yielded));
             break;
         }
         if let Some(yielded) = msg.service_wait_yield {
@@ -6000,8 +6033,8 @@ unsafe fn pump_finish_slice(
 ) -> PumpResult {
     use nt_user_host::component_pump::PumpDepthDisposition;
     match outcome.accounting.after_slice(
-        outcome.scheduler_yielded || outcome.receive_yield.is_some()
-            || outcome.root_ingress_yield.is_some()
+        outcome.scheduler_yielded || outcome.receive_yield().is_some()
+            || outcome.root_ingress_yield().is_some()
             || outcome.service_wait_yield.is_some() || outcome.maintenance_yield.is_some()
             || outcome.nested_restore_yield.is_some()
             || outcome.nested_restore_quarantined.is_some(),
@@ -6028,8 +6061,8 @@ unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutco
         && !outcome.provider_wait_suspended
         && !outcome.lpc_wait_suspended
         && !outcome.scheduler_yielded
-        && outcome.receive_yield.is_none()
-        && outcome.root_ingress_yield.is_none()
+        && outcome.receive_yield().is_none()
+        && outcome.root_ingress_yield().is_none()
         && outcome.service_wait_yield.is_none()
         && outcome.maintenance_yield.is_none()
         && outcome.nested_restore_yield.is_none()
@@ -6111,8 +6144,8 @@ unsafe fn pump_result_from_outcome(
         || outcome.provider_wait_suspended
         || outcome.lpc_wait_suspended
         || outcome.scheduler_yielded
-        || outcome.receive_yield.is_some()
-        || outcome.root_ingress_yield.is_some()
+        || outcome.receive_yield().is_some()
+        || outcome.root_ingress_yield().is_some()
         || outcome.service_wait_yield.is_some()
         || outcome.maintenance_yield.is_some()
         || outcome.nested_restore_yield.is_some()
@@ -6143,8 +6176,7 @@ unsafe fn pump_result_from_outcome(
         provider_wait_suspended: outcome.provider_wait_suspended,
         lpc_wait_suspended: outcome.lpc_wait_suspended,
         scheduler_yielded: outcome.scheduler_yielded,
-        receive_yield: outcome.receive_yield,
-        root_ingress_yield: outcome.root_ingress_yield,
+        ingress_yield: outcome.ingress_yield,
         service_wait_yield: outcome.service_wait_yield,
         maintenance_yield: outcome.maintenance_yield,
         nested_restore_yield: outcome.nested_restore_yield,

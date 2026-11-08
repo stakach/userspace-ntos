@@ -169,7 +169,7 @@ pub(crate) unsafe fn settle_nested_restore_result(
         next.snapshot.shared_resume = snapshot.shared_resume;
         return NestedRestorePumpCompletion::NestedReparked(next);
     }
-    if let Some(yielded) = pump.receive_yield {
+    if let Some(yielded) = pump.receive_yield() {
         return NestedRestorePumpCompletion::ReceiveReparked(PendingReceiveDispatch {
             yielded,
             snapshot: SuspendedPumpSnapshot {
@@ -998,7 +998,7 @@ pub(crate) unsafe fn resume_suspended_root_maintenance_component(
             },
         }) };
     }
-    if let Some(yielded) = pump.receive_yield {
+    if let Some(yielded) = pump.receive_yield() {
         return RootMaintenancePumpReturn { reply_cap, completion:
             RootMaintenancePumpCompletion::ReceiveReparked(PendingReceiveDispatch {
             yielded,
@@ -1081,7 +1081,7 @@ pub(crate) unsafe fn classify_root_ingress_unwind_result(
     snapshot: SuspendedPumpSnapshot,
     pump: crate::spawn_hosts::PumpResult,
 ) -> Result<RootIngressUnwindPumpCompletion, u32> {
-    if pump.root_ingress_yield.is_some() || pump.nested_restore_yield.is_some()
+    if pump.root_ingress_yield().is_some() || pump.nested_restore_yield.is_some()
         || pump.nested_restore_quarantined.is_some() || pump.scheduler_yielded
     {
         return Err(nt_process::STATUS_INVALID_PARAMETER);
@@ -1096,7 +1096,7 @@ pub(crate) unsafe fn classify_root_ingress_unwind_result(
             },
         }));
     }
-    if let Some(yielded) = pump.receive_yield {
+    if let Some(yielded) = pump.receive_yield() {
         return Ok(RootIngressUnwindPumpCompletion::ReceiveReparked(PendingReceiveDispatch {
             yielded,
             snapshot: SuspendedPumpSnapshot {
@@ -1195,7 +1195,7 @@ pub(crate) unsafe fn resume_suspended_receive_component(
             ))
         }
     };
-    if let Some(yielded) = pump.receive_yield {
+    if let Some(yielded) = pump.receive_yield() {
         return ReceivePumpCompletion::Reparked(PendingReceiveDispatch {
             yielded,
             snapshot: SuspendedPumpSnapshot {
@@ -1327,7 +1327,7 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
             },
         });
     }
-    if let Some(yielded) = pump.receive_yield {
+    if let Some(yielded) = pump.receive_yield() {
         return ServiceWaitPumpCompletion::ReceiveReparked(PendingReceiveDispatch {
             yielded,
             snapshot: SuspendedPumpSnapshot {
