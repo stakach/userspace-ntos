@@ -171,8 +171,7 @@ pub(crate) unsafe fn abandon_detached_thread(handler: &mut ExecNtHandler, tid: u
 }
 
 pub(crate) unsafe fn redrive_detached(handler: &mut ExecNtHandler) -> bool {
-    if monotonic_time_100ns() < DETACHED_RETRY.load(Ordering::Acquire)
-        || ACTIVE.swap(true, Ordering::AcqRel) {
+    if ACTIVE.swap(true, Ordering::AcqRel) {
         return false;
     }
     let len = handler.directory_cleanup.detached_len();
@@ -181,7 +180,7 @@ pub(crate) unsafe fn redrive_detached(handler: &mut ExecNtHandler) -> bool {
         ACTIVE.store(false, Ordering::Release);
         return false;
     }
-    let start = (DETACHED_SCAN.fetch_add(1, Ordering::Relaxed) as usize) % len;
+    let start = (DETACHED_SCAN.load(Ordering::Relaxed) as usize) % len;
     let Some(index) = (0..len).map(|offset| (start + offset) % len)
         .find(|&index| handler.directory_cleanup.get_mut(index)
             .is_some_and(|row| !row.quarantined)) else {
@@ -189,6 +188,11 @@ pub(crate) unsafe fn redrive_detached(handler: &mut ExecNtHandler) -> bool {
         ACTIVE.store(false, Ordering::Release);
         return false;
     };
+    if monotonic_time_100ns() < DETACHED_RETRY.load(Ordering::Acquire) {
+        ACTIVE.store(false, Ordering::Release);
+        return false;
+    }
+    DETACHED_SCAN.fetch_add(1, Ordering::Relaxed);
     let canonical_done = handler.directory_cleanup.get_mut(index).unwrap().canonical_done;
     if canonical_done {
         let reply_complete = if let Some(mut reply) = handler.directory_cleanup.get_mut(index).unwrap().reply.take() {
@@ -413,20 +417,24 @@ unsafe fn step_effect(handler: &mut ExecNtHandler, work: &mut PendingNativeDirec
 }
 
 pub(crate) unsafe fn redrive_effects(handler: &mut ExecNtHandler) -> bool {
-    if monotonic_time_100ns() < EFFECT_RETRY.load(Ordering::Acquire)
-        || ACTIVE.swap(true, Ordering::AcqRel) { return false; }
+    if ACTIVE.swap(true, Ordering::AcqRel) { return false; }
     let queue = &mut *core::ptr::addr_of_mut!(EFFECTS);
     let len = queue.len();
     if len == 0 {
         ACTIVE.store(false, Ordering::Release);
         return false;
     }
-    let start = (EFFECT_SCAN.fetch_add(1, Ordering::Relaxed) as usize) % len;
+    let start = (EFFECT_SCAN.load(Ordering::Relaxed) as usize) % len;
     let Some(index) = (0..len).map(|offset| (start + offset) % len)
         .find(|&index| queue[index].phase != EffectPhase::Quarantined) else {
         ACTIVE.store(false, Ordering::Release);
         return false;
     };
+    if monotonic_time_100ns() < EFFECT_RETRY.load(Ordering::Acquire) {
+        ACTIVE.store(false, Ordering::Release);
+        return false;
+    }
+    EFFECT_SCAN.fetch_add(1, Ordering::Relaxed);
     let advanced = step_effect(handler, &mut queue[index]);
     if queue[index].phase == EffectPhase::Done { queue.swap_remove(index); }
     schedule_effects(queue);

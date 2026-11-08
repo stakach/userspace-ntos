@@ -337,22 +337,25 @@ unsafe fn step(handler: &mut ExecNtHandler, work: &mut PendingNativeFileTargetOp
 }
 
 pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) -> bool {
-    if monotonic_time_100ns() < NEXT_RETRY.load(Ordering::Acquire)
-        || ACTIVE.swap(true, Ordering::AcqRel)
-    { return false; }
+    if ACTIVE.swap(true, Ordering::AcqRel) { return false; }
     let queue = &mut *core::ptr::addr_of_mut!(PENDING);
     if queue.is_empty() {
         ACTIVE.store(false, Ordering::Release);
         return false;
     }
     let len = queue.len();
-    let start = (CURSOR.fetch_add(1, Ordering::Relaxed) as usize) % len;
+    let start = (CURSOR.load(Ordering::Relaxed) as usize) % len;
     let Some(index) = (0..len).map(|offset| (start + offset) % len)
         .find(|&index| !matches!(queue[index].phase, Phase::Quarantined | Phase::Done))
     else {
         ACTIVE.store(false, Ordering::Release);
         return false;
     };
+    if monotonic_time_100ns() < NEXT_RETRY.load(Ordering::Acquire) {
+        ACTIVE.store(false, Ordering::Release);
+        return false;
+    }
+    CURSOR.fetch_add(1, Ordering::Relaxed);
     let mut work = queue.swap_remove(index);
     *core::ptr::addr_of_mut!(SELECTED) = &mut work;
     let mut progress = false;

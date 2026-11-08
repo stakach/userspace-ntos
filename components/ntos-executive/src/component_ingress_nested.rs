@@ -438,8 +438,10 @@ pub(crate) fn wake_abort_due(now_100ns: u64) -> u64 {
 
 /// Outer service redrive only; never call this inside a nested pump or an ACK path.
 pub(crate) unsafe fn drain_abort() -> usize {
+    let has_work = has_pending_abort();
+    if !has_work { return 0; }
     let now = crate::monotonic_time_100ns();
-    let Some(attempt) = ABORT_WAKE.begin_redrive(now, has_pending_abort()) else { return 0; };
+    let Some(attempt) = ABORT_WAKE.begin_redrive(now, has_work) else { return 0; };
     let _ = attempt.retry_at(now.saturating_add(ABORT_RETRY_100NS));
     let selected = {
         let rows = &*core::ptr::addr_of!(PARENTS);
