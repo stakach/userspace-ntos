@@ -131,6 +131,14 @@ pub(crate) enum RootMaintenancePumpCompletion {
     RetainedFailure(u32),
 }
 
+/// The returned receive half owns the canonical Reply after any authenticated interim Call.
+/// Its completion and Reply receipt must be retained together before a pure lane transition.
+#[derive(Clone, Copy)]
+pub(crate) struct RootMaintenancePumpReturn {
+    pub(crate) completion: RootMaintenancePumpCompletion,
+    pub(crate) reply_cap: u64,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum RootIngressUnwindPumpCompletion {
     Restored(ProviderWaitPumpCompletion),
@@ -955,13 +963,15 @@ pub(crate) unsafe fn root_ingress_unwind_continuation_is_current(
 /// A refusal here is retained by that owner; it is never a completed provider or syscall result.
 pub(crate) unsafe fn resume_suspended_root_maintenance_component(
     pending: PendingRootMaintenanceDispatch,
-) -> RootMaintenancePumpCompletion {
+) -> RootMaintenancePumpReturn {
+    let original_reply = pending.snapshot.pump.reply_cap;
     if !select_win32k_client_window(pending.snapshot.client)
         || !restore_shared_resume_snapshot(
             pending.snapshot.shared_resume, pending.snapshot.dispatch, pending.snapshot.client,
         )
     {
-        return RootMaintenancePumpCompletion::RetainedFailure(nt_process::STATUS_INVALID_PARAMETER);
+        return RootMaintenancePumpReturn { completion: RootMaintenancePumpCompletion::RetainedFailure(
+            nt_process::STATUS_INVALID_PARAMETER), reply_cap: original_reply };
     }
     let channel = pending.snapshot.channel;
     let previous = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
@@ -974,10 +984,14 @@ pub(crate) unsafe fn resume_suspended_root_maintenance_component(
     core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous);
     let mut pump = match result {
         Ok(pump) => pump,
-        Err(status) => return RootMaintenancePumpCompletion::RetainedFailure(status),
+        Err(status) => return RootMaintenancePumpReturn {
+            completion: RootMaintenancePumpCompletion::RetainedFailure(status), reply_cap: original_reply,
+        },
     };
+    let reply_cap = pump.reply_cap;
     if let Some(yielded) = pump.maintenance_yield {
-        return RootMaintenancePumpCompletion::MaintenanceReparked(PendingRootMaintenanceDispatch {
+        return RootMaintenancePumpReturn { reply_cap, completion:
+            RootMaintenancePumpCompletion::MaintenanceReparked(PendingRootMaintenanceDispatch {
             yielded,
             snapshot: SuspendedPumpSnapshot {
                 pump, channel, callback_token: None,
@@ -986,20 +1000,22 @@ pub(crate) unsafe fn resume_suspended_root_maintenance_component(
                 ),
                 ..pending.snapshot
             },
-        });
+        }) };
     }
     if let Some(yielded) = pump.receive_yield {
-        return RootMaintenancePumpCompletion::ReceiveReparked(PendingReceiveDispatch {
+        return RootMaintenancePumpReturn { reply_cap, completion:
+            RootMaintenancePumpCompletion::ReceiveReparked(PendingReceiveDispatch {
             yielded,
             snapshot: SuspendedPumpSnapshot {
                 pump, channel, callback_token: None,
                 shared_resume: yielded.shared_resume,
                 ..pending.snapshot
             },
-        });
+        }) };
     }
     if let Some(yielded) = pump.service_wait_yield {
-        return RootMaintenancePumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
+        return RootMaintenancePumpReturn { reply_cap, completion:
+            RootMaintenancePumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
             yielded,
             snapshot: SuspendedPumpSnapshot {
                 pump, channel, callback_token: None,
@@ -1008,12 +1024,13 @@ pub(crate) unsafe fn resume_suspended_root_maintenance_component(
                 ),
                 ..pending.snapshot
             },
-        });
+        }) };
     }
-    match classify_returned_win32k_pump(pending.snapshot, pump) {
+    let completion = match classify_returned_win32k_pump(pending.snapshot, pump) {
         Ok(completion) => RootMaintenancePumpCompletion::Restored(completion),
         Err(status) => RootMaintenancePumpCompletion::RetainedFailure(status),
-    }
+    };
+    RootMaintenancePumpReturn { completion, reply_cap }
 }
 
 /// Capture the exact returned receive half before a later dispatch can reuse shared output.

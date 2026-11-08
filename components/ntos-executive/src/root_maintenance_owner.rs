@@ -12,7 +12,7 @@ use nt_component_suspension::{LaneDispatchIdentity, SuspensionKey, SuspensionOwn
 use crate::spawn_hosts::shared_ingress::owner::runtime::physical_hold::PhysicalExecutionHold;
 use super::{component_callback_transfer::CallbackTransfer, ComponentNativeContinuation};
 use crate::win32k_glue::{PendingRootMaintenanceDispatch, ProviderWaitPumpCompletion,
-    RootMaintenancePumpCompletion};
+    RootMaintenancePumpCompletion, RootMaintenancePumpReturn};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RootMaintenanceTicket {
@@ -20,8 +20,10 @@ pub(crate) struct RootMaintenanceTicket {
     pub(crate) generation: u64,
     pub(crate) route: PeerRoute,
     pub(crate) dispatch: LaneDispatchIdentity,
-    /// The provider lane's physical Reply object.
+    /// The current authenticated provider Reply after any interim Call adoption.
     pub(crate) reply: u64,
+    /// Immutable Reply captured with the original receive-half continuation.
+    pub(crate) origin_reply: u64,
     /// The original hosted syscall Reply held by the root's return target.
     pub(crate) root_reply: u64,
     pub(crate) owner: SuspensionOwner,
@@ -71,6 +73,7 @@ struct PostPump {
 struct Row {
     generation: u64,
     pending: PendingRootMaintenanceDispatch,
+    active_reply: u64,
     root_reply: u64,
     physical: PhysicalExecutionHold,
     continuation: Option<ComponentNativeContinuation>,
@@ -133,12 +136,14 @@ pub(crate) unsafe fn retain(
         route: yielded.route,
         dispatch: yielded.dispatch,
         reply: yielded.reply,
+        origin_reply: yielded.reply,
         root_reply,
         owner: yielded.owner,
     };
     *slot = Some(Slot::Active(Row {
         generation,
         pending,
+        active_reply: yielded.reply,
         root_reply,
         physical: PhysicalExecutionHold::new(yielded.route, yielded.dispatch),
         continuation: None,
@@ -157,8 +162,9 @@ fn row_matches(ticket: RootMaintenanceTicket, row: &Row) -> bool {
     row.generation == ticket.generation
         && yielded.route == ticket.route
         && yielded.dispatch == ticket.dispatch
-        && yielded.reply == ticket.reply
-        && row.pending.snapshot.pump.reply_cap == ticket.reply
+        && yielded.reply == ticket.origin_reply
+        && row.pending.snapshot.pump.reply_cap == ticket.origin_reply
+        && row.active_reply == ticket.reply
         && row.root_reply == ticket.root_reply
         && yielded.owner == ticket.owner
 }
@@ -275,7 +281,8 @@ pub(crate) unsafe fn next_ready_ticket() -> Option<RootMaintenanceTicket> {
             generation: row.generation,
             route: yielded.route,
             dispatch: yielded.dispatch,
-            reply: yielded.reply,
+            reply: row.active_reply,
+            origin_reply: yielded.reply,
             root_reply: row.root_reply,
             owner: yielded.owner,
         });
@@ -301,12 +308,13 @@ pub(crate) unsafe fn next_returned_ticket() -> Option<RootMaintenanceTicket> {
         let lane = yielded.dispatch.lane();
         let ticket = RootMaintenanceTicket {
             index, generation: row.generation, route: yielded.route,
-            dispatch: yielded.dispatch, reply: yielded.reply,
+            dispatch: yielded.dispatch, reply: row.active_reply,
+            origin_reply: yielded.reply,
             root_reply: row.root_reply, owner: yielded.owner,
         };
         if lanes.active_dispatch_identity(lane) != Ok(Some(yielded.dispatch))
             || !lanes.peer_route(lane).is_ok_and(|route| route == Some(yielded.route))
-            || !lanes.binding(lane).is_ok_and(|binding| binding.reply_object == yielded.reply)
+            || !lanes.binding(lane).is_ok_and(|binding| binding.reply_object == row.active_reply)
         { continue; }
         let actionable = match owned.phase {
             RootMaintenanceTransferPhase::Returned => match result_kind(owned.result) {
@@ -328,7 +336,7 @@ pub(crate) unsafe fn next_returned_ticket() -> Option<RootMaintenanceTicket> {
                             | RootMaintenanceTransferKind::CallbackTerminal)
                         && identity.lane() == lane && identity.key() == old_key
                         && identity.owner() == yielded.owner
-                        && lanes.terminal(identity, yielded.reply).is_ok_and(|terminal| {
+                        && lanes.terminal(identity, row.active_reply).is_ok_and(|terminal| {
                             matches!(terminal.phase,
                                 nt_component_suspension::TerminalPhase::Ready { .. }
                                 | nt_component_suspension::TerminalPhase::Acknowledged { .. })
@@ -377,12 +385,46 @@ pub(crate) unsafe fn result(ticket: RootMaintenanceTicket) -> Option<RootMainten
 
 pub(crate) unsafe fn store_result(
     ticket: RootMaintenanceTicket,
-    result: RootMaintenancePumpCompletion,
-) -> Result<(), RootMaintenancePumpCompletion> {
-    let Some(row) = row_mut(ticket) else { return Err(result); };
-    if row.state != State::Resuming || row.post_pump.is_some() { return Err(result); }
-    row.post_pump = Some(PostPump { result, phase: RootMaintenanceTransferPhase::Returned });
-    Ok(())
+    returned: RootMaintenancePumpReturn,
+) -> Result<RootMaintenanceTicket, RootMaintenancePumpReturn> {
+    let Some(row) = row(ticket) else { return Err(returned); };
+    if row.state != State::Resuming || row.post_pump.is_some() || returned.reply_cap == 0 {
+        return Err(returned);
+    }
+    let Some(key) = row.key else { return Err(returned); };
+    let lanes = &*core::ptr::addr_of!(super::COMPONENT_SUSPENSIONS);
+    let lane = ticket.dispatch.lane();
+    if lanes.active_dispatch_identity(lane) != Ok(Some(ticket.dispatch))
+        || !lanes.peer_route(lane).is_ok_and(|route| route == Some(ticket.route))
+        || !lanes.binding(lane).is_ok_and(|binding| binding.reply_object == returned.reply_cap)
+    { return Err(returned); }
+    let exact = match returned.completion {
+        RootMaintenancePumpCompletion::Restored(_)
+        | RootMaintenancePumpCompletion::MaintenanceReparked(_)
+        | RootMaintenancePumpCompletion::RetainedFailure(_) =>
+            lanes.validate_root_maintenance_return_reply(
+                ticket.route, ticket.dispatch, key, ticket.owner, returned.reply_cap,
+            ).is_ok(),
+        RootMaintenancePumpCompletion::ServiceReparked(next) =>
+            next.yielded.route == ticket.route
+                && next.yielded.dispatch == ticket.dispatch
+                && next.yielded.token != 0
+                && next.yielded.reply == returned.reply_cap
+                && next.snapshot.pump.reply_cap == returned.reply_cap,
+        RootMaintenancePumpCompletion::ReceiveReparked(next) =>
+            next.yielded.parent.route() == ticket.route
+                && next.yielded.parent.dispatch() == ticket.dispatch
+                && next.yielded.owner == ticket.owner
+                && next.snapshot.pump.reply_cap == returned.reply_cap,
+    };
+    if !exact { return Err(returned); }
+    // The captured continuation and its original Reply remain immutable provenance. Publish
+    // the authenticated current Reply and returned result in one no-effect owner transition.
+    let Some(row) = row_mut(ticket) else { return Err(returned); };
+    row.active_reply = returned.reply_cap;
+    row.post_pump = Some(PostPump { result: returned.completion,
+        phase: RootMaintenanceTransferPhase::Returned });
+    Ok(RootMaintenanceTicket { reply: returned.reply_cap, ..ticket })
 }
 
 fn result_kind(result: RootMaintenancePumpCompletion) -> Option<RootMaintenanceTransferKind> {
@@ -789,7 +831,8 @@ pub(crate) unsafe fn ticket_for(
             generation: row.generation,
             route: held.yielded.route,
             dispatch: held.yielded.dispatch,
-            reply: held.yielded.reply,
+            reply: row.active_reply,
+            origin_reply: held.yielded.reply,
             root_reply: row.root_reply,
             owner: held.yielded.owner,
         };

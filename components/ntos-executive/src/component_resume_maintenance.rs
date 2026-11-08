@@ -53,6 +53,7 @@ unsafe fn trace_root_refusal(
     print_str(b"/"); print_u64(ticket.owner.provider_generation);
     print_str(b"/"); print_u64(ticket.owner.dispatch_id);
     print_str(b" reply="); print_u64(ticket.reply);
+    print_str(b" origin-reply="); print_u64(ticket.origin_reply);
     print_str(b" root-reply="); print_u64(ticket.root_reply);
     print_str(b" phase="); print_u64(phase);
     print_str(b" token="); print_u64(root_maintenance_owner::callback_token(ticket).unwrap_or(0));
@@ -228,7 +229,7 @@ unsafe fn exact_hosted(
         mismatch |= 1 << 6;
     }
     if mismatch == 0 && (held.yielded.route != ticket.route || held.yielded.dispatch != ticket.dispatch
-        || held.yielded.reply != ticket.reply || held.yielded.owner != ticket.owner
+        || held.yielded.reply != ticket.origin_reply || held.yielded.owner != ticket.owner
     ) { mismatch |= 1 << 7; }
     if mismatch == 0 && (pending.yielded.route != held.yielded.route
         || pending.yielded.dispatch != held.yielded.dispatch
@@ -247,7 +248,7 @@ unsafe fn exact_hosted(
     if mismatch == 0 && (pending.snapshot.channel.tcb != held.snapshot.channel.tcb
         || pending.snapshot.channel.fault_ep != held.snapshot.channel.fault_ep
     ) { mismatch |= 1 << 11; }
-    if mismatch == 0 && pending.snapshot.pump.reply_cap != ticket.reply {
+    if mismatch == 0 && pending.snapshot.pump.reply_cap != ticket.origin_reply {
         mismatch |= 1 << 12;
     }
     if mismatch == 0 && lanes.active_dispatch_identity(lane).ok().flatten() != Some(ticket.dispatch) {
@@ -306,7 +307,7 @@ unsafe fn restore_physical(
 /// A native refusal retains the durable row and both Replies; it is never a provider result.
 pub(crate) unsafe fn run_root_maintenance(
     nt_handler: *mut ExecNtHandler,
-    ticket: root_maintenance_owner::RootMaintenanceTicket,
+    mut ticket: root_maintenance_owner::RootMaintenanceTicket,
 ) -> RootMaintenanceResumeOutcome {
     let Some(pending) = root_maintenance_owner::pending(ticket) else {
         trace_root_refusal(ticket, b"pending-owner", 0);
@@ -381,11 +382,14 @@ pub(crate) unsafe fn run_root_maintenance(
             }
         }
         let returned = win32k_glue::resume_suspended_root_maintenance_component(pending);
-        if root_maintenance_owner::store_result(ticket, returned).is_err() {
-            trace_root_refusal(ticket, b"store-pump-result", 0);
-            return RootMaintenanceResumeOutcome::RetainedFailure;
-        }
-        returned
+        ticket = match root_maintenance_owner::store_result(ticket, returned) {
+            Ok(rebased) => rebased,
+            Err(_) => {
+                trace_root_refusal(ticket, b"store-pump-result", returned.reply_cap);
+                return RootMaintenanceResumeOutcome::RetainedFailure;
+            }
+        };
+        returned.completion
     };
     if matches!(&pump, win32k_glue::RootMaintenancePumpCompletion::Restored(
         win32k_glue::ProviderWaitPumpCompletion::UserCallbackSuspended,

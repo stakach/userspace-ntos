@@ -483,3 +483,36 @@ fn nonheld_incoming_is_not_adopted() {
     assert!(pending.is_none());
     unchanged(&lanes, &peers, route, dispatch, &receiver);
 }
+
+#[test]
+fn root_maintenance_return_uses_the_acknowledged_interim_reply() {
+    let (mut lanes, mut peers, route, dispatch, mut receiver) = setup(true);
+    let lane = route.identity().lane;
+    let original = 40;
+    let incoming = 41;
+    let key = SuspensionKey::root_maintenance(77);
+    let owner = SuspensionOwner {
+        provider_domain: 1,
+        provider_generation: 2,
+        dispatch_id: dispatch.epoch(),
+        caller: SuspensionCaller::Kernel { lane },
+    };
+    lanes.admit_root_maintenance_owned(lane, original, dispatch, key, 1, owner, 8, 0x111).unwrap();
+    lanes.mark_root_maintenance_pass(lane, original, dispatch, key, owner, 9).unwrap();
+    lanes.begin_root_maintenance_resume(lane, original, dispatch, key, owner).unwrap();
+
+    let mut pending = None;
+    assert_eq!(receiver.adopt_interim_call(route, dispatch, incoming, &mut lanes, &mut peers,
+        &mut pending, proof), Ok(100));
+    assert_eq!(pending.as_ref().map(|call| call.reply()), Some(original));
+    assert!(lanes.validate_root_maintenance_return_reply(route, dispatch, key, owner, original).is_err());
+    assert!(lanes.validate_root_maintenance_return_reply(route,
+        crate::LaneDispatchIdentity { epoch: dispatch.epoch() + 1, ..dispatch }, key, owner,
+        incoming).is_err());
+    assert_eq!(lanes.validate_root_maintenance_return_reply(route, dispatch, key, owner, incoming),
+        Ok(()));
+    assert!(lanes.retain_shared_root_maintenance_terminal_running(route, dispatch, lane,
+        original, key, owner, ()).is_err());
+    assert!(lanes.retain_shared_root_maintenance_terminal_running(route, dispatch, lane,
+        incoming, key, owner, ()).is_ok());
+}

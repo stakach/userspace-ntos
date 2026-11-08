@@ -27,6 +27,45 @@ impl<C, R> ComponentSuspensionStack<C, R> {
 }
 
 impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
+    /// Authenticate the canonical Reply returned by a resumed maintenance pump. An acknowledged
+    /// interim Call may have replaced the Reply bound when the checkpoint was first parked, but
+    /// it cannot change the route, dispatch, frame, or owner that will receive the terminal.
+    pub fn validate_root_maintenance_return_reply(
+        &self,
+        route: peer_registry::PeerRoute,
+        dispatch: LaneDispatchIdentity,
+        key: SuspensionKey,
+        owner: SuspensionOwner,
+        reply_object: u64,
+    ) -> Result<(), LaneError> {
+        let handle = route.identity().lane;
+        if reply_object == 0 || dispatch.lane() != handle
+            || key.kind != SuspensionKind::RootMaintenance
+            || !self.is_dispatch_identity_active(dispatch)
+        {
+            return Err(LaneError::InvalidIdentity);
+        }
+        self.validate_running(handle, reply_object)?;
+        let lane = self.lane(handle)?;
+        if lane.shared_peer != Some(route)
+            || lane.binding.executor_id != route.identity().executor
+            || lane.binding.receive_endpoint != route.endpoint()
+        {
+            return Err(LaneError::InvalidIdentity);
+        }
+        if lane.terminal.is_some() || lane.suspensions.len() != 1 {
+            return Err(LaneError::InvalidPhase);
+        }
+        let frame = lane.suspensions.top().ok_or(LaneError::InvalidPhase)?;
+        if frame.key != key || frame.owner != owner {
+            return Err(LaneError::InvalidIdentity);
+        }
+        if !matches!(frame.phase, SuspensionPhase::MaintenanceResuming { .. }) {
+            return Err(LaneError::InvalidPhase);
+        }
+        Ok(())
+    }
+
     /// Park the current dispatch until a later completed outer service-loop pass. Rejection
     /// returns the original continuation, so the caller can retain its physical Reply.
     pub fn admit_root_maintenance_owned(
