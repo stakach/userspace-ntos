@@ -312,7 +312,7 @@ pub(crate) static mut COMPONENT_SUSPENSIONS: ComponentLanes = nt_component_suspe
 /// observations cannot select, complete, or recycle any continuation or physical Reply.
 pub(crate) unsafe fn trace_stale_suspension_frames(lane_index: u64, lane_generation: u64) {
     const CAP: usize = 16;
-    let mut rows = [[0u64; 12]; CAP];
+    let mut rows = [[0u64; 19]; CAP];
     let mut count = 0usize;
     let mut overflow = 0u64;
     {
@@ -336,35 +336,46 @@ pub(crate) unsafe fn trace_stale_suspension_frames(lane_index: u64, lane_generat
                 nt_component_suspension::SuspensionPhase::MaintenanceResuming { .. } => 7,
                 nt_component_suspension::SuspensionPhase::NestedTerminal => 8,
             };
-            let (pending_kind, wait_id, pending_dispatch, pending_ssn, admitted) =
+            let no_wait_details = [0u64; 7];
+            let (pending_kind, wait_id, pending_dispatch, pending_ssn, admitted, wait_details) =
                 match frame.continuation.hosted().map(|hosted| &hosted.pending) {
-                    Some(component_continuation::PendingComponentDispatch::Provider(pending)) => (
-                        1, pending.request.header.wait_id, pending.dispatch.dispatch_id,
-                        pending.dispatch.ssn, arbiter.contains(pending.request.header.wait_id) as u64,
-                    ),
+                    Some(component_continuation::PendingComponentDispatch::Provider(pending)) => {
+                        let first = (pending.request.header.object_count != 0)
+                            .then(|| pending.request.objects.first()).flatten();
+                        (1, pending.request.header.wait_id, pending.dispatch.dispatch_id,
+                            pending.dispatch.ssn, arbiter.contains(pending.request.header.wait_id) as u64,
+                            [pending.request.header.wait_type as u64,
+                                pending.request.header.timeout_kind as u64,
+                                pending.request.header.timeout_100ns as u64,
+                                pending.request.header.object_count as u64,
+                                first.map_or(0, |object| object.object_type as u64),
+                                first.map_or(0, |object| object.object_id),
+                                first.map_or(0, |object| object.object_generation)])
+                    },
                     Some(component_continuation::PendingComponentDispatch::Lpc(pending)) =>
-                        (2, 0, pending.dispatch.dispatch_id, pending.dispatch.ssn, 0),
+                        (2, 0, pending.dispatch.dispatch_id, pending.dispatch.ssn, 0, no_wait_details),
                     Some(component_continuation::PendingComponentDispatch::Receive(pending)) =>
-                        (3, 0, pending.snapshot.dispatch.dispatch_id, pending.snapshot.dispatch.ssn, 0),
+                        (3, 0, pending.snapshot.dispatch.dispatch_id, pending.snapshot.dispatch.ssn, 0, no_wait_details),
                     Some(component_continuation::PendingComponentDispatch::ServiceWait(pending)) =>
-                        (4, 0, pending.snapshot.dispatch.dispatch_id, pending.snapshot.dispatch.ssn, 0),
+                        (4, 0, pending.snapshot.dispatch.dispatch_id, pending.snapshot.dispatch.ssn, 0, no_wait_details),
                     Some(component_continuation::PendingComponentDispatch::RootMaintenance(pending)) =>
-                        (5, 0, pending.snapshot.dispatch.dispatch_id, pending.snapshot.dispatch.ssn, 0),
+                        (5, 0, pending.snapshot.dispatch.dispatch_id, pending.snapshot.dispatch.ssn, 0, no_wait_details),
                     Some(component_continuation::PendingComponentDispatch::NestedRestore(_)) =>
-                        (6, 0, 0, 0, 0),
-                    None => (7, 0, 0, 0, 0),
+                        (6, 0, 0, 0, 0, no_wait_details),
+                    None => (7, 0, 0, 0, 0, no_wait_details),
                 };
-            rows[count] = [
+            rows[count][..12].copy_from_slice(&[
                 frame.key.kind as u64, frame.key.id, frame.admission_sequence, phase,
                 frame.owner.dispatch_id, client.map_or(0, |row| row.client_pi as u64),
                 client.map_or(0, |row| row.client_tid), pending_kind, wait_id,
                 pending_dispatch, pending_ssn, admitted,
-            ];
+            ]);
+            rows[count][12..].copy_from_slice(&wait_details);
             count += 1;
         }
     }
     for row in &rows[..count] {
-        print_str(b"[pump-stale-suspension] kind/id/admission/phase/owner-dispatch/pi/tid/pending-kind/wait-id/pending-dispatch/ssn/arbiter=");
+        print_str(b"[pump-stale-suspension] kind/id/admission/phase/owner-dispatch/pi/tid/pending-kind/wait-id/pending-dispatch/ssn/arbiter/wait-type/timeout-kind/timeout-raw-100ns/object-count/first-type/first-id/first-generation=");
         print_u64(row[0]);
         for value in &row[1..] { print_str(b"/"); print_u64(*value); }
         print_str(b"\n");
