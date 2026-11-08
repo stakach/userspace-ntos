@@ -194,12 +194,16 @@ fn receive_and_service_wait_restore_their_own_shared_publication_before_receivin
         "../../../components/ntos-executive/src/win32k_receive.rs"
     ))
     .unwrap();
+    let helper = function(&pending, "select_and_restore_shared_resume_snapshot");
+    assert!(call_position(helper, "select_win32k_client_window").unwrap()
+        < call_position(helper, "restore_shared_resume_snapshot").unwrap(),
+        "the selected client must own the page before its publication is restored");
     for (name, continuation) in [
         ("resume_suspended_receive_component", "component_pump_continue_receive"),
         ("resume_suspended_service_wait_component", "component_pump_continue_service_wait"),
     ] {
         let function = function(&resume, name);
-        let restore = call_position(function, "restore_shared_resume_snapshot")
+        let restore = call_position(function, "select_and_restore_shared_resume_snapshot")
             .unwrap_or_else(|| panic!("{name} must restore its exact shared publication"));
         let receive = call_position(function, continuation)
             .unwrap_or_else(|| panic!("{name} must continue the retained receive half"));

@@ -3,6 +3,7 @@
 const OWNER: &str = include_str!("../../../components/ntos-executive/src/root_ingress_owner.rs");
 const PUMP: &str = include_str!("../../../components/ntos-executive/src/spawn_hosts.rs");
 const RECEIVE: &str = include_str!("../../../components/ntos-executive/src/win32k_receive.rs");
+const PENDING: &str = include_str!("../../../components/ntos-executive/src/win32k_pending_dispatch.rs");
 
 #[test]
 fn unwind_receive_is_one_shot_and_retains_typed_output() {
@@ -37,6 +38,11 @@ fn distinct_receive_half_checks_physical_identity_and_never_resends() {
     let resume = RECEIVE.split("fn resume_root_ingress_after_unwind_receive(").nth(1)
         .expect("saved pump continuation");
     assert!(resume.find("root_ingress_unwind_continuation_is_current(").unwrap()
-        < resume.find("select_win32k_client_window(").unwrap(),
+        < resume.find("select_and_restore_shared_resume_snapshot(").unwrap(),
         "physical identity must be checked before shared-client effects");
+    let select_and_restore = PENDING.split("fn select_and_restore_shared_resume_snapshot(").nth(1)
+        .expect("selected shared-page restore boundary");
+    assert!(select_and_restore.find("select_win32k_client_window(").unwrap()
+        < select_and_restore.find("restore_shared_resume_snapshot(").unwrap(),
+        "the shared page may be restored only after selecting its exact client");
 }
