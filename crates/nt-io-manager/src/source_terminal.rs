@@ -203,6 +203,27 @@ impl NestedSourceDispatchEffect {
     }
 }
 
+/// A source terminal pump return. A retained physical owner has no status that the work
+/// owner may classify as retryable; its exact ticket must move to the work record.
+#[derive(Debug)]
+pub enum SourceTerminalDispatch<Ticket> {
+    NotEntered(i32),
+    Indeterminate(i32),
+    Returned(i32),
+    Retained(Ticket),
+}
+
+impl<Ticket> SourceTerminalDispatch<Ticket> {
+    pub fn into_effect(self) -> Result<NestedSourceDispatchEffect, Ticket> {
+        match self {
+            Self::NotEntered(_) => Ok(NestedSourceDispatchEffect::NotEntered),
+            Self::Indeterminate(_) => Ok(NestedSourceDispatchEffect::Indeterminate),
+            Self::Returned(status) => Ok(NestedSourceDispatchEffect::from_returned(status)),
+            Self::Retained(ticket) => Err(ticket),
+        }
+    }
+}
+
 impl PreparedTerminal {
     pub fn matches(
         self,
@@ -303,6 +324,20 @@ mod tests {
         assert_ne!(NestedSourceDispatchEffect::NotEntered,
             NestedSourceDispatchEffect::ReturnedNotReady);
         assert!(NestedSourceWorkKey::new(11u64, 21u64, 0, 41, 51, 61, 71, 81).is_none());
+    }
+
+    #[test]
+    fn retained_source_dispatch_moves_exact_owner_without_retry_classification() {
+        #[derive(Debug)]
+        struct Ticket { attempt: u64 }
+        let ticket = Ticket { attempt: 37 };
+        let observed = SourceTerminalDispatch::Retained(ticket);
+        let retained = observed.into_effect().expect_err("retained pump has no status effect");
+        assert_eq!(retained.attempt, 37);
+        assert_eq!(SourceTerminalDispatch::<Ticket>::NotEntered(0xc000_0001u32 as i32)
+            .into_effect().unwrap(), NestedSourceDispatchEffect::NotEntered);
+        assert_eq!(SourceTerminalDispatch::<Ticket>::Returned(TERMINAL_NOT_READY)
+            .into_effect().unwrap(), NestedSourceDispatchEffect::ReturnedNotReady);
     }
 
     #[test]
