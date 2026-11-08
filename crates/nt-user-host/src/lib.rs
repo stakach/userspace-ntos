@@ -29,6 +29,9 @@ pub mod pending_caller;
 pub mod hosted_return_target;
 pub mod receive_child_barrier;
 pub mod root_ingress_pass;
+pub mod retained_owner_table;
+#[cfg(test)]
+mod retained_owner_table_tests;
 pub mod root_ingress_handoff;
 pub mod root_ingress_result;
 pub mod root_ingress_read_request;
