@@ -118,3 +118,19 @@ fn duplicate_return_preserves_the_offered_pump() {
     assert_eq!(*offered, 125);
     assert_eq!(**owner.pump().unwrap(), 123);
 }
+
+#[test]
+fn failed_source_observation_quarantines_the_physical_return_before_retirement() {
+    let key = key();
+    let mut owner = ReturnedPumpOwner::active(key, Box::new(301u64));
+    assert!(matches!(owner.record_return(key, 302, 302, Box::new(303u64)),
+        ReturnedPumpObservation::Accepted));
+    assert_eq!(owner.capture_or_quarantine(|_, _| None::<u64>),
+        Err(ReturnedPumpError::Quarantined));
+    assert_eq!(owner.phase(), ReturnedPumpPhase::Quarantined);
+    assert_eq!(**owner.continuation(), 301);
+    assert_eq!(**owner.pump().unwrap(), 303);
+    assert_eq!(owner.replies().unwrap().current, 302);
+    assert_eq!(owner.replies().unwrap().returned, 302);
+    assert!(owner.into_returned(key).is_err(), "an uncertain source return cannot retire");
+}

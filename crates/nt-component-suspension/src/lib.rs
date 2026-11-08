@@ -48,7 +48,7 @@ mod receive_probe;
 pub mod peer_registry;
 mod lane_peer;
 mod peer_installation;
-pub use peer_installation::{PeerCapabilityDestination, PeerSpaceBinding, PeerInstallation, PeerInstallationError, PeerInstallationPhase, PeerStartupError, PeerRetirementEffect, PeerRetirementError, PeerRetirementPhase};
+pub use peer_installation::{PeerAdmissionFence, PeerCapabilityDestination, PeerSpaceBinding, PeerInstallation, PeerInstallationError, PeerInstallationPhase, PeerStartupError, PeerRetirementEffect, PeerRetirementError, PeerRetirementPhase};
 mod retained_ingress;
 mod retained_dispatch;
 mod retained_work;

@@ -6885,10 +6885,18 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
     )
 }
 
-pub(crate) enum SourcePnpTerminalDispatch {
-    NotEntered(i32),
-    Indeterminate(i32),
-    Returned(i32),
+pub(crate) type SourcePnpTerminalDispatch =
+    nt_io_manager::source_terminal::SourceTerminalDispatch<crate::win32k_pump_owner::SourcePumpRetained>;
+
+enum DispatchMode<'a> {
+    Standard,
+    Source(&'a mut Option<crate::win32k_pump_owner::SourcePumpRetained>),
+}
+
+struct SourceReturnClaim<'a> {
+    ticket: crate::win32k_pump_owner::PumpTicket,
+    context: crate::win32k_pump_owner::PumpContext,
+    out: &'a mut Option<crate::win32k_pump_owner::SourcePumpRetained>,
 }
 
 pub(crate) unsafe fn dispatch_source_pnp_terminal(
@@ -6927,11 +6935,13 @@ unsafe fn dispatch_source_terminal(
     request_kind: u64,
 ) -> SourcePnpTerminalDispatch {
     let mut entered = false;
-    let Win32kDispatchOutcome::Known { value: result, completed } = win32k_dispatch_wide_observed(
+    let mut retained = None;
+    let Win32kDispatchOutcome::Known { value: result, completed } = win32k_dispatch_wide_observed_inner(
         0, packet_va, len, 0, 0, 0, &[], [packet_va, len, 0, 0],
         None, None, executive_win32k_client(), request_kind,
-        false, Some(&mut entered),
+        false, Some(&mut entered), None, None, None, None, DispatchMode::Source(&mut retained),
     );
+    if let Some(owner) = retained { return SourcePnpTerminalDispatch::Retained(owner); }
     let status = result as u32 as i32;
     if completed {
         SourcePnpTerminalDispatch::Returned(status)
@@ -6939,6 +6949,12 @@ unsafe fn dispatch_source_terminal(
         SourcePnpTerminalDispatch::Indeterminate(status)
     } else {
         SourcePnpTerminalDispatch::NotEntered(status)
+    }
+}
+
+unsafe fn quarantine_source_terminal_route(channel: &crate::spawn_hosts::PumpChannel) {
+    if let Some(route) = channel.ingress_route {
+        let _ = crate::spawn_hosts::shared_ingress::owner::runtime::quarantine(route);
     }
 }
 
@@ -7033,7 +7049,7 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_return_receipt(
     let outcome = win32k_dispatch_wide_observed_inner(
         ssn, a0, a1, a2, a3, caller_sp, stack_args, completion_args, output_stage,
         paint_output, client, win32k_subsystem::WIN32K_REQUEST_SSDT, true,
-        Some(entered), None, Some(&mut dispatch_return), None, Some(dispatch_context),
+        Some(entered), None, Some(&mut dispatch_return), None, Some(dispatch_context), DispatchMode::Standard,
     );
     Win32kDispatchWithReceipt { outcome, dispatch_return }
 }
@@ -7093,7 +7109,7 @@ pub(crate) unsafe fn win32k_dispatch_ps_provider_command(
             0, command, expected_provider_state, flags, 0, 0, &[],
             [command, expected_provider_state, flags, 0], None, None,
             client, win32k_subsystem::WIN32K_REQUEST_PS_RETIREMENT, true,
-            Some(&mut entered), Some(&mut execute), None, None, None,
+            Some(&mut entered), Some(&mut execute), None, None, None, DispatchMode::Standard,
         );
     }
     win32k_dispatch_wide_with_completion_args_and_kind(
@@ -7125,7 +7141,7 @@ pub(crate) unsafe fn win32k_create_process_before_loader(
     let outcome = win32k_dispatch_wide_observed_inner(
         0, command, 0, 0, 0, 0, &[], [command, 0, 0, 0], None, None,
         client, win32k_subsystem::WIN32K_REQUEST_PS_PROVIDER, true, Some(&mut entered),
-        None, None, Some(&mut suspended), None,
+        None, None, Some(&mut suspended), None, DispatchMode::Standard,
     );
     outcome.process_create(entered, suspended)
 }
@@ -7204,7 +7220,7 @@ unsafe fn win32k_dispatch_wide_observed(
 ) -> Win32kDispatchOutcome {
     win32k_dispatch_wide_observed_inner(
         ssn, a0, a1, a2, a3, caller_sp, stack_args, completion_args, output_stage,
-        paint_output, client, request_kind, attach_client, entered, None, None, None, None,
+        paint_output, client, request_kind, attach_client, entered, None, None, None, None, DispatchMode::Standard,
     )
 }
 
@@ -7233,7 +7249,7 @@ unsafe fn win32k_dispatch_kernel_job_observed(
     win32k_dispatch_wide_observed_inner(
         0, arguments[0], arguments[1], arguments[2], arguments[3], 0, &[],
         [0; 4], None, None, client, request_kind, false, Some(entered),
-        Some(&mut execute), None, None, None,
+        Some(&mut execute), None, None, None, DispatchMode::Standard,
     )
 }
 
@@ -7259,7 +7275,15 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     dispatch_return_out: Option<&mut Option<nt_user_callback::DispatchReturn>>,
     mut suspended_out: Option<&mut bool>,
     dispatch_context_out: Option<&mut Option<nt_user_callback::DispatchContext>>,
+    mut mode: DispatchMode<'_>,
 ) -> Win32kDispatchOutcome {
+    let source_kind = matches!(request_kind,
+        win32k_subsystem::WIN32K_REQUEST_SOURCE_PNP_TERMINAL
+        | win32k_subsystem::WIN32K_REQUEST_SOURCE_FSD_TERMINAL
+        | win32k_subsystem::WIN32K_REQUEST_SOURCE_IOCTL_TERMINAL);
+    if source_kind != matches!(&mode, DispatchMode::Source(_)) {
+        return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into();
+    }
     // Reject before attachment or shared request writes, not only at later lane acquisition.
     if ssn == nt_user_callback::NTUSER_SET_WINDOW_LONG_PTR_SSN
         && a1 < 64
@@ -7621,7 +7645,65 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         };
         owner.is_valid().then_some(owner)
     });
+    let mut source_claim = match &mut mode {
+        DispatchMode::Standard => None,
+        DispatchMode::Source(out) => {
+            let context = crate::win32k_pump_owner::PumpContext { channel: ch, dispatch, client };
+            match crate::win32k_pump_owner::begin_source_terminal(context, displaced_parent) {
+                Ok(ticket) => Some(SourceReturnClaim { ticket, context, out: &mut **out }),
+                Err(_) => {
+                    quarantine_source_terminal_route(&ch);
+                    **out = Some(crate::win32k_pump_owner::SourcePumpRetained::PreEntry {
+                        context, displaced_parent,
+                    });
+                    if let Some(parent) = displaced_parent {
+                        let _ = crate::nested_restore_owner::quarantine_displaced_child(parent);
+                    }
+                    core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous_dispatch);
+                    return (nt_process::STATUS_UNSUCCESSFUL as u64, false).into();
+                }
+            }
+        }
+    };
     let mut pr = crate::spawn_hosts::component_pump(&ch);
+    if let Some(claim) = source_claim.as_mut() {
+        let recorded = crate::win32k_pump_owner::record_return(claim.ticket, pr);
+        match recorded {
+            Ok(crate::win32k_pump_owner::ReturnDisposition::Returned) => {}
+            Ok(crate::win32k_pump_owner::ReturnDisposition::Quarantined(_)) => {
+                quarantine_source_terminal_route(&ch);
+                *claim.out = Some(crate::win32k_pump_owner::SourcePumpRetained::Ticket(claim.ticket));
+                if let Some(parent) = displaced_parent {
+                    let _ = crate::nested_restore_owner::quarantine_displaced_child(parent);
+                }
+                core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous_dispatch);
+                return (nt_process::STATUS_UNSUCCESSFUL as u64, false).into();
+            }
+            Err((_error, offered)) => {
+                let current_reply = ch.ingress_route.and_then(|route|
+                    crate::spawn_hosts::shared_ingress::owner::runtime::current_reply(route).ok()
+                ).unwrap_or(0);
+                quarantine_source_terminal_route(&ch);
+                *claim.out = Some(crate::win32k_pump_owner::SourcePumpRetained::Offered {
+                    context: claim.context, displaced_parent, pump: offered, current_reply,
+                });
+                if let Some(parent) = displaced_parent {
+                    let _ = crate::nested_restore_owner::quarantine_displaced_child(parent);
+                }
+                core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous_dispatch);
+                return (nt_process::STATUS_UNSUCCESSFUL as u64, false).into();
+            }
+        }
+        if crate::win32k_pump_owner::classify_source_terminal(claim.ticket).is_err() {
+            quarantine_source_terminal_route(&ch);
+            *claim.out = Some(crate::win32k_pump_owner::SourcePumpRetained::Ticket(claim.ticket));
+            if let Some(parent) = displaced_parent {
+                let _ = crate::nested_restore_owner::quarantine_displaced_child(parent);
+            }
+            core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous_dispatch);
+            return (nt_process::STATUS_UNSUCCESSFUL as u64, false).into();
+        }
+    }
     if request_kind == win32k_subsystem::WIN32K_REQUEST_PS_PROVIDER && client.pi >= 12 {
         print_str(b"[ps-callout-pump] pi/lane/complete/callback/provider/lpc/receive/service/wall=");
         print_u64(client.pi as u64);
@@ -7678,6 +7760,15 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         false
     };
     if !lane_transition_ok {
+        if let Some(claim) = source_claim.as_mut() {
+            let _ = crate::win32k_pump_owner::quarantine_capture(claim.ticket);
+            quarantine_source_terminal_route(&ch);
+            *claim.out = Some(crate::win32k_pump_owner::SourcePumpRetained::Ticket(claim.ticket));
+            if let Some(parent) = displaced_parent {
+                let _ = crate::nested_restore_owner::quarantine_displaced_child(parent);
+            }
+            return (nt_process::STATUS_UNSUCCESSFUL as u64, false).into();
+        }
         panic!("win32k dispatch violated execution-lane ownership");
     }
     USER_CALLBACK_LAST_PUMP_SUSPENDED.store(pr.callback_suspended as u64, Ordering::Release);
@@ -7861,7 +7952,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         let child_has_durable_pump = pr.receive_yield.is_some()
             || pr.root_ingress_yield.is_some() || pr.service_wait_yield.is_some()
             || pr.maintenance_yield.is_some() || pr.nested_restore_yield.is_some()
-            || pr.nested_restore_quarantined.is_some();
+            || pr.nested_restore_quarantined.is_some() || source_claim.is_some();
         let terminal = pr.completed && lane_transition_ok && !child_suspended;
         let yielded = child_suspended.then(||
             try_capture_exact_shared_resume_snapshot(dispatch, client)
@@ -7869,6 +7960,12 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         if !crate::nested_restore_owner::finish_displacing_child(
             ticket, dispatch, client, terminal, yielded,
         ) {
+            if let Some(claim) = source_claim.as_mut() {
+                let _ = crate::win32k_pump_owner::quarantine_capture(claim.ticket);
+                quarantine_source_terminal_route(&ch);
+                *claim.out = Some(crate::win32k_pump_owner::SourcePumpRetained::Ticket(claim.ticket));
+                return (nt_process::STATUS_UNSUCCESSFUL as u64, false).into();
+            }
             if !child_has_durable_pump {
                 crate::nested_restore_owner::retain_quarantined_child_pump(
                     ticket, pr, ch, dispatch, client,
@@ -7886,6 +7983,12 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             return (pr.result, false).into();
         }
         if !pr.completed || !complete_nested_user_callback_dispatch(client, dispatch_id) {
+            if let Some(claim) = source_claim.as_mut() {
+                let _ = crate::win32k_pump_owner::quarantine_capture(claim.ticket);
+                quarantine_source_terminal_route(&ch);
+                *claim.out = Some(crate::win32k_pump_owner::SourcePumpRetained::Ticket(claim.ticket));
+                return (nt_process::STATUS_UNSUCCESSFUL as u64, false).into();
+            }
             print_str(b"[user-callback] nested win32k dispatch failed to unwind\n");
             if registered_client {
                 unregister_win32k_dispatch_client(
@@ -7915,6 +8018,14 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             client.tid,
             client.badge,
         );
+    }
+    if let Some(claim) = source_claim.as_mut() {
+        if !crate::win32k_pump_owner::acknowledge_terminal(claim.ticket) {
+            let _ = crate::win32k_pump_owner::quarantine_capture(claim.ticket);
+            quarantine_source_terminal_route(&ch);
+            *claim.out = Some(crate::win32k_pump_owner::SourcePumpRetained::Ticket(claim.ticket));
+            return (nt_process::STATUS_UNSUCCESSFUL as u64, false).into();
+        }
     }
     (pr.result, pr.completed).into()
 }

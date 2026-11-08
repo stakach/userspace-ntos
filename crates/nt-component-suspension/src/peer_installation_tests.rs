@@ -3,6 +3,18 @@ use crate::peer_registry::PeerPhase;
 use crate::{LaneBinding, LaneError, LaneHandle};
 
 #[test]
+fn failed_peer_retirement_cannot_reopen_source_admission() {
+    let mut fence = PeerAdmissionFence::new();
+    assert!(fence.allows_admission());
+    let first = fence.attempt_retirement(|| Err::<(), _>("peer phase not ready"));
+    assert_eq!(first, Err("peer phase not ready"));
+    assert!(!fence.allows_admission());
+    // The same retained owner can reconcile retirement without reopening admission.
+    assert_eq!(fence.attempt_retirement(|| Ok::<(), &str>(())), Ok(()));
+    assert!(!fence.allows_admission());
+}
+
+#[test]
 fn staged_worker_export_does_not_start_execution_or_release_aliases() {
     let mut lanes = Lanes::new(1, 1);
     let lane = lanes

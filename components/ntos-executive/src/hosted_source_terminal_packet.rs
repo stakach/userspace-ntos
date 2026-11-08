@@ -4,13 +4,13 @@ use super::*;
 use crate::win32k_subsystem::{RootPoolError, RootProviderPoolAllocation};
 use nt_io_manager::source_terminal::{
     same_terminal_packet, OriginCommitObservation as Observation, OriginCommitPhase as Phase,
-    NestedSourceDispatchEffect, TerminalPacketIdentity, TerminalPublication,
+    NestedSourceDispatchEffect, TerminalPacketIdentity, TerminalPreparePhase,
+    TerminalPublication,
 };
 
 type Dispatch = unsafe fn(u64, u64) -> crate::win32k_glue::SourcePnpTerminalDispatch;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PreparePhase { Publish, Dispatch, ReadAck, Published, Indeterminate }
+type PreparePhase = TerminalPreparePhase<crate::win32k_pump_owner::SourcePumpRetained>;
 
 /// Issued once by the retained transport only after the source owner validates the exact ACK.
 /// The transport continues to own its pinned packet until origin retirement acknowledges.
@@ -41,7 +41,7 @@ impl RetainedTerminalPacket {
     }
 
     pub(super) fn indeterminate(&self) -> bool {
-        self.prepare == PreparePhase::Indeterminate || self.commit == Phase::Indeterminate
+        self.prepare.is_indeterminate() || self.commit == Phase::Indeterminate
     }
 
     pub(super) fn packet_address(&self) -> Option<u64> {
@@ -53,7 +53,7 @@ impl RetainedTerminalPacket {
     }
 
     pub(super) fn awaiting_prepare_ack(&self) -> bool {
-        self.prepare == PreparePhase::ReadAck
+        self.prepare.is_read_ack()
     }
 
     fn packet_identity(&self) -> Option<TerminalPacketIdentity> {
@@ -67,13 +67,13 @@ impl RetainedTerminalPacket {
     }
 
     pub(super) fn progress(&self) -> u64 {
-        1 + (self.prepare as u64) + ((self.commit as u64) << 8)
+        1 + self.prepare.progress_code() + ((self.commit as u64) << 8)
             + ((self.allocation.is_some() as u64) << 16)
     }
 
     pub(super) fn needs_lane(&self, finishing: bool) -> bool {
         if finishing { self.commit == Phase::DispatchOrigin }
-        else { self.prepare == PreparePhase::Dispatch }
+        else { self.prepare.needs_lane() }
     }
 
     fn failed(&mut self, error: RootPoolError) -> bool {
@@ -85,7 +85,7 @@ impl RetainedTerminalPacket {
 
     pub(super) unsafe fn publish(&mut self) -> bool {
         if self.indeterminate() { return false; }
-        if self.prepare != PreparePhase::Publish { return true; }
+        if !self.prepare.is_publish() { return true; }
         if self.allocation.is_none() {
             match crate::win32k_subsystem::try_allocate_root_provider_pool_allocation(self.encoded.len() as u64) {
                 Ok(allocation) => self.allocation = Some(allocation),
@@ -103,7 +103,7 @@ impl RetainedTerminalPacket {
     pub(super) unsafe fn prepare(&mut self, dispatch: Dispatch) -> bool {
         if !self.publish() { return false; }
         let lease = self.allocation.expect("owned terminal packet").packet_lease();
-        if self.prepare == PreparePhase::Dispatch {
+        if self.prepare.needs_lane() {
             if !crate::win32k_glue::source_terminal_dispatch_ready() { return false; }
             let Some(attempt) = self.dispatch_attempts.checked_add(1) else {
                 self.prepare = PreparePhase::Indeterminate;
@@ -111,13 +111,12 @@ impl RetainedTerminalPacket {
             };
             self.dispatch_attempts = attempt;
             let observed = dispatch(lease.address(), self.encoded.len() as u64);
-            self.last_dispatch = match observed {
-                crate::win32k_glue::SourcePnpTerminalDispatch::NotEntered(_) =>
-                    NestedSourceDispatchEffect::NotEntered,
-                crate::win32k_glue::SourcePnpTerminalDispatch::Indeterminate(_) =>
-                    NestedSourceDispatchEffect::Indeterminate,
-                crate::win32k_glue::SourcePnpTerminalDispatch::Returned(status) =>
-                    NestedSourceDispatchEffect::from_returned(status),
+            self.last_dispatch = match observed.into_effect() {
+                Ok(effect) => effect,
+                Err(owner) => {
+                    self.prepare = PreparePhase::Retained(owner);
+                    return false;
+                }
             };
             match self.last_dispatch {
                 NestedSourceDispatchEffect::NotEntered
@@ -131,7 +130,7 @@ impl RetainedTerminalPacket {
                 }
             }
         }
-        if self.prepare == PreparePhase::ReadAck && self.ack.is_none() {
+        if self.prepare.is_read_ack() && self.ack.is_none() {
             match crate::win32k_subsystem::try_capture_root_provider_pool_packet(lease) {
                 Ok(bytes) => self.ack = Some(bytes),
                 Err(error) => return self.failed(error),
@@ -143,8 +142,8 @@ impl RetainedTerminalPacket {
     pub(super) fn ack(&self) -> &[u8] { self.ack.as_deref().expect("captured terminal ACK") }
 
     pub(super) fn acknowledge_prepare(&mut self, valid: bool) -> bool {
+        if !self.prepare.is_read_ack() { return false; }
         if !valid { self.prepare = PreparePhase::Indeterminate; return false; }
-        assert!(self.prepare == PreparePhase::ReadAck);
         self.prepare = PreparePhase::Published;
         self.ack = None;
         true
@@ -192,7 +191,7 @@ impl RetainedTerminalPacket {
                     if !same_terminal_packet(&self.encoded, &before, offset)
                         || ((stage != 0 || status != 0) && previous.is_none())
                         || !command.can_follow(previous)
-                        || (!discard && self.prepare != PreparePhase::Published)
+                        || (!discard && !self.prepare.can_retire())
                     { self.commit = Phase::Indeterminate; return false; }
                     let (stage, status) = command.words();
                     before[offset..offset + 4].copy_from_slice(&stage.to_le_bytes());
@@ -217,6 +216,10 @@ impl RetainedTerminalPacket {
                     }
                     crate::win32k_glue::SourcePnpTerminalDispatch::Returned(0) => {
                         self.observe(Observation::ReturnedSuccess);
+                    }
+                    crate::win32k_glue::SourcePnpTerminalDispatch::Retained(owner) => {
+                        self.prepare = PreparePhase::Retained(owner);
+                        self.observe(Observation::Uncertain); return false;
                     }
                     _ => { self.observe(Observation::Uncertain); return false; }
                     }

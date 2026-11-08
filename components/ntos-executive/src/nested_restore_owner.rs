@@ -360,6 +360,17 @@ pub(crate) unsafe fn begin_displacing_child(
     row.shared_leases.begin(identity).is_ok()
 }
 
+/// A child source pump returned without a certified terminal handoff. Keep the parent's
+/// original Reply, publication, and child lease in this exact row, with no receive retry.
+pub(crate) unsafe fn quarantine_displaced_child(ticket: NestedRestoreOwnerTicket) -> bool {
+    let Some(row) = (&mut *core::ptr::addr_of_mut!(ROWS))
+        .get_mut(ticket.index).and_then(Option::as_mut) else { return false };
+    if !exact(row, ticket) || row.frame.phase() != NestedRestorePhase::Receiving {
+        return false;
+    }
+    row.frame.quarantine_receive(ticket.key).is_ok()
+}
+
 /// The new dispatch refused before its first shared write. The old publication remains owned
 /// by this row even if client-window re-selection or the exact restoration refuses.
 pub(crate) unsafe fn abort_displaced_shared_resume(

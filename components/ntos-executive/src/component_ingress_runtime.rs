@@ -4,7 +4,8 @@ use super::*;
 use crate::print_str;
 use crate::service_sec_image::{ComponentLanes, COMPONENT_SUSPENSIONS};
 use nt_component_suspension::{
-    IngressReplyObservation, LaneDispatchIdentity, PeerRetirementEffect,
+    IngressReplyObservation, LaneDispatchIdentity, PeerAdmissionFence, PeerInstallationPhase,
+    PeerRetirementEffect,
 };
 
 #[path = "component_ingress_sources.rs"]
@@ -94,6 +95,7 @@ struct NativePeer {
     physical: PhysicalSource,
     verify: unsafe fn(PhysicalSource) -> bool,
     route: Option<PeerRoute>,
+    admission_fence: PeerAdmissionFence,
     quarantined: bool,
     bootstrap: bool,
 }
@@ -131,7 +133,7 @@ pub(crate) unsafe fn hold_snapshot() -> HoldSnapshot {
             dispatch: lanes.active_dispatch_identity(lane).ok().flatten(),
             route,
             physical: peer.map(|peer| peer.physical),
-            quarantined: peer.map(|peer| peer.quarantined),
+            quarantined: peer.map(|peer| peer.quarantined || !peer.admission_fence.allows_admission()),
         }
     });
     HoldSnapshot { running, oldest: hosted::oldest_pending_snapshot() }
@@ -153,7 +155,7 @@ unsafe fn resolve(route: PeerRoute, allow_retiring: bool) -> Option<u64> {
     if record.source.domain() != route.identity().domain
         || record.source.generation() != route.identity().domain_generation
         || record.physical.tcb != route.identity().executor
-        || (!allow_retiring && record.quarantined)
+        || (!allow_retiring && (record.quarantined || !record.admission_fence.allows_admission()))
     {
         return None;
     }
@@ -278,6 +280,7 @@ pub(crate) unsafe fn register(
         physical,
         verify,
         route: None,
+        admission_fence: PeerAdmissionFence::new(),
         quarantined: false,
         bootstrap: false,
     });
@@ -1093,7 +1096,8 @@ pub(crate) unsafe fn stored_current_message(route: PeerRoute) -> Result<Received
 
 pub(crate) unsafe fn next_autonomous() -> Result<Option<PeerRoute>, Error> {
     for row in &*core::ptr::addr_of!(NATIVE_PEERS) {
-        if row.quarantined || !matches!(row.physical.kind, PhysicalSourceKind::SystemThread { .. })
+        if row.quarantined || !row.admission_fence.allows_admission()
+            || !matches!(row.physical.kind, PhysicalSourceKind::SystemThread { .. })
         {
             continue;
         }
@@ -1358,26 +1362,39 @@ pub(crate) unsafe fn quarantine(route: PeerRoute) -> Result<(), Error> {
     if (&*core::ptr::addr_of!(NATIVE_PEERS))[index].quarantined {
         return Err(Error::Retirement);
     }
+    let row = &mut (&mut *core::ptr::addr_of_mut!(NATIVE_PEERS))[index];
+    let source = row.source;
+    let verify = row.verify;
+    row.admission_fence.attempt_retirement(|| {
+        let owner = owner();
+        let installation = owner
+            .installations
+            .iter_mut()
+            .find(|row| row.route() == route)
+            .ok_or(Error::UnknownPeer)?;
+        if !matches!(installation.phase(), PeerInstallationPhase::Retiring(_)) {
+            installation
+                .begin_retirement(
+                    owner.peers.as_mut().expect("ready peers"),
+                    route.identity().domain,
+                    route.identity().domain_generation,
+                    lanes(),
+                )
+                .map_err(|error| retirement::failure("begin-peer", error))?;
+        }
+        (&mut *core::ptr::addr_of_mut!(SOURCES))
+            .begin_retirement(source, |physical| verify(physical))
+            .map_err(|error| retirement::failure("begin-source", error))?;
+        Ok(())
+    })?;
+    row.quarantined = true;
     let owner = owner();
-    let lanes = lanes();
     let installation = owner
         .installations
         .iter_mut()
         .find(|row| row.route() == route)
         .ok_or(Error::UnknownPeer)?;
-    installation
-        .begin_retirement(
-            owner.peers.as_mut().expect("ready peers"),
-            route.identity().domain,
-            route.identity().domain_generation,
-            lanes,
-        )
-        .map_err(|error| retirement::failure("begin-peer", error))?;
-    let row = &mut (&mut *core::ptr::addr_of_mut!(NATIVE_PEERS))[index];
-    (&mut *core::ptr::addr_of_mut!(SOURCES))
-        .begin_retirement(row.source, |physical| (row.verify)(physical))
-        .map_err(|error| retirement::failure("begin-source", error))?;
-    row.quarantined = true;
+    let lanes = lanes();
     let _saved = crate::ipc_message::SavedMessageBuffer::capture();
     installation
         .retire_effect(

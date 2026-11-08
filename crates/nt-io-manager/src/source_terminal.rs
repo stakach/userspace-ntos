@@ -224,6 +224,36 @@ impl<Ticket> SourceTerminalDispatch<Ticket> {
     }
 }
 
+/// The source Work owns an uncertain physical return in its preparation state. Once retained,
+/// neither dispatch retry nor packet retirement can run, and a second return cannot replace it.
+pub enum TerminalPreparePhase<Owner> {
+    Publish,
+    Dispatch,
+    ReadAck,
+    Published,
+    Indeterminate,
+    Retained(Owner),
+}
+
+impl<Owner> TerminalPreparePhase<Owner> {
+    pub fn is_publish(&self) -> bool { matches!(self, Self::Publish) }
+    pub fn needs_lane(&self) -> bool { matches!(self, Self::Dispatch) }
+    pub fn is_read_ack(&self) -> bool { matches!(self, Self::ReadAck) }
+    pub fn can_retire(&self) -> bool { matches!(self, Self::Published) }
+    pub fn is_indeterminate(&self) -> bool {
+        matches!(self, Self::Indeterminate | Self::Retained(_))
+    }
+    pub fn retained(&self) -> Option<&Owner> {
+        match self { Self::Retained(owner) => Some(owner), _ => None }
+    }
+    pub fn progress_code(&self) -> u64 {
+        match self {
+            Self::Publish => 0, Self::Dispatch => 1, Self::ReadAck => 2,
+            Self::Published => 3, Self::Indeterminate => 4, Self::Retained(_) => 5,
+        }
+    }
+}
+
 impl PreparedTerminal {
     pub fn matches(
         self,
@@ -338,6 +368,18 @@ mod tests {
             .into_effect().unwrap(), NestedSourceDispatchEffect::NotEntered);
         assert_eq!(SourceTerminalDispatch::<Ticket>::Returned(TERMINAL_NOT_READY)
             .into_effect().unwrap(), NestedSourceDispatchEffect::ReturnedNotReady);
+    }
+
+    #[test]
+    fn source_work_retains_uncertain_return_and_blocks_retry_and_retirement() {
+        let owner = alloc::boxed::Box::new(0xabcdu64);
+        let address = &*owner as *const u64;
+        let phase = TerminalPreparePhase::Retained(owner);
+        assert!(phase.is_indeterminate());
+        assert!(!phase.needs_lane());
+        assert!(!phase.can_retire());
+        assert!(core::ptr::eq(&**phase.retained().unwrap(), address));
+        assert!(core::ptr::eq(&**phase.retained().unwrap(), address));
     }
 
     #[test]

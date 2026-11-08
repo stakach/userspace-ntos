@@ -28,7 +28,7 @@ impl ReturnedPumpKey {
             && win32k_dispatch.dispatch_id != 0
             && initial_reply != 0 && attempt != 0)
             .then_some(Self { route, physical_dispatch, win32k_dispatch, client,
-                initial_reply, attempt })
+            initial_reply, attempt })
     }
 
     pub const fn route(self) -> PeerRoute { self.route }
@@ -150,6 +150,26 @@ impl<C, P> ReturnedPumpOwner<C, P> {
         }
     }
 
+    /// Run one fallible post-pump observation while retaining the returned bundle. A refusal
+    /// quarantines the same pump and Reply before the caller can classify or transfer it.
+    pub fn capture_or_quarantine<T>(
+        &mut self,
+        capture: impl FnOnce(&C, &P) -> Option<T>,
+    ) -> Result<T, ReturnedPumpError> {
+        let observed = match &self.state {
+            State::Returned { pump, .. } => capture(&self.continuation, pump),
+            State::Quarantined { .. } => return Err(ReturnedPumpError::Quarantined),
+            State::Active => return Err(ReturnedPumpError::InvalidPhase),
+        };
+        match observed {
+            Some(value) => Ok(value),
+            None => {
+                self.quarantine_capture()?;
+                Err(ReturnedPumpError::Quarantined)
+            }
+        }
+    }
+
     /// The caller must transfer the returned pair into an exact pending/terminal owner before
     /// acknowledging its RetainedOwnerTable checkout. A refusal returns `self` unchanged.
     pub fn into_returned(self, expected: ReturnedPumpKey)
@@ -166,4 +186,5 @@ impl<C, P> ReturnedPumpOwner<C, P> {
             }
         }
     }
+
 }

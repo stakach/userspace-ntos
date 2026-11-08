@@ -97,6 +97,10 @@ fn uncertain_receive_setup_quarantines_the_restored_parent_and_keeps_its_snapsho
     frame.begin_retry(key).unwrap();
     frame.acknowledge_restored(key).unwrap();
     frame.begin_receive(key).unwrap();
+    let wrong_reply = NestedRestoreKey::new(scope.identity(), reply + 1, 501,
+        receive_owner(dispatch)).unwrap();
+    assert_eq!(frame.quarantine_receive(wrong_reply), Err(Error::InvalidIdentity));
+    assert_eq!(frame.phase(), Phase::Receiving);
     frame.quarantine_receive(key).unwrap();
     assert_eq!(frame.phase(), Phase::Quarantined);
     assert_eq!(frame.continuation_ref(key), Ok(&0xABCD));
