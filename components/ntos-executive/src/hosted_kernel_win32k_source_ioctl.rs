@@ -817,11 +817,15 @@ impl Work {
         if !self.terminal_traced {
             if let Some(address) = transport.packet_address() {
                 self.terminal_traced = true;
-                if TERMINAL_OWNER_TRACES.fetch_add(1, Ordering::Relaxed) < 512 {
-                    print_str(b"[source-ioctl-terminal-owner] packet/nonce/token/source/ticket/gen/code/lane/epoch/reply/status/info=");
+                if TERMINAL_OWNER_TRACES.fetch_add(1, Ordering::Relaxed) < 128 {
+                    let owner = self.route.identity();
+                    print_str(b"[source-ioctl-terminal-owner] packet/nonce/token/source/ticket/gen/code/route-domain/route-gen/executor/lane/lane-gen/epoch/reply/pending/reply-entered/status/info=");
                     for value in [address, self.nonce, self.token, self.source_address,
                         self.source_ticket, self.source_generation, u64::from(self.code),
-                        self.dispatch.lane().index as u64, self.dispatch.epoch(), self.reply,
+                        owner.domain, owner.domain_generation, owner.executor,
+                        self.dispatch.lane().index as u64,
+                        self.dispatch.lane().generation, self.dispatch.epoch(), self.reply,
+                        u64::from(self.pending), u64::from(self.reply_entered),
                         u64::from(status), information] {
                         print_str(b"/");
                         print_hex_u64(value);
