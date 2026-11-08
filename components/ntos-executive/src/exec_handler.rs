@@ -273,6 +273,8 @@ pub(crate) mod private_residency;
 mod registry_value_name;
 #[path = "exec_installer_progress.rs"]
 mod installer_progress;
+#[path = "exec_install_pipe_diagnostic.rs"]
+mod install_pipe_diagnostic;
 #[path = "exec_native_io_attribution.rs"]
 pub(crate) mod native_io_attribution;
 
@@ -4288,6 +4290,7 @@ impl ExecNtHandler {
             RegistryValueCopyProvenanceTable::with_capacity(64)
         );
         write_field!(installer_progress, None);
+        write_field!(install_pipe_diagnostic, nt_hosted_runtime::InstallPipeDiagnostic::new());
         write_field!(registry_machine_root_security_descriptor, root_security.machine);
         write_field!(registry_user_root_security_descriptor, root_security.user);
         write_field!(time_zone_information, time_zone_information);
@@ -13175,6 +13178,7 @@ impl ExecNtHandler {
         release: nt_io_completion::FileReferenceRelease,
     ) {
         if release.cleanup_required {
+            let _ = self.install_pipe_diagnostic.retire_server_file(file_id);
             match self
                 .file_completion
                 .begin_cleanup(file_id)
@@ -34485,6 +34489,9 @@ impl ExecNtHandler {
                 if (publication.status as i32) < 0 {
                     return publication.status;
                 }
+                if publication.handle != 0 {
+                    let _ = self.observe_install_pipe_server_handle(self.pi, publication.handle);
+                }
                 NAMED_PIPE_CREATED.fetch_add(1, Ordering::Relaxed);
                 publication.status
             },
@@ -41031,6 +41038,17 @@ impl ExecNtHandler {
                         resume_flags: 0,
                     });
                     self.pending_file_io_wait = synchronous;
+                }
+                if routed && payload_ok && completion_file_id != 0 {
+                    if status == STATUS_PENDING && pending_write_irp_id != 0 {
+                        let _ = self.stage_install_pipe_write(
+                            self.pi, completion_file_id, pending_write_irp_id, &payload,
+                        );
+                    } else if status != STATUS_PENDING {
+                        let _ = self.observe_install_pipe_write(
+                            self.pi, completion_file_id, &payload, status, information,
+                        );
+                    }
                 }
                 let event_obj_idx = completion_event_index.map_or(u64::MAX, |index| index as u64);
                 let terminal_file_owned = file_retained && status != STATUS_PENDING;

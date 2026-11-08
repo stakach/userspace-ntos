@@ -269,9 +269,14 @@ impl ExecNtHandler {
                     trace_pnp_install_pipe(b"provider-result", self.pi,
                         self.hosted_process_generation(self.pi), Some(publication.status), name16);
                 }
-                return match self.publish_file_create_result(
+                let delivered = self.publish_file_create_result(
                     file_handle_out, iosb, publication.handle, publication.status, publication.information,
-                ) {
+                );
+                if delivered.is_ok() && pnp_install_pipe
+                    && (publication.status as i32) >= 0 && publication.handle != 0 {
+                    let _ = self.observe_install_pipe_child_handle(self.pi, publication.handle);
+                }
+                return match delivered {
                     Ok(()) => publication.status,
                     Err(status) => status,
                 };
@@ -668,6 +673,9 @@ impl ExecNtHandler {
         }
         if let Err(status) = self.publish_file_create_result(file_handle_out, iosb, opened_handle, status, info) {
             return status;
+        }
+        if pnp_install_pipe && (status as i32) >= 0 && opened_handle != 0 {
+            let _ = self.observe_install_pipe_child_handle(self.pi, opened_handle);
         }
         if nt_fs::is_named_pipe_path(name16)
             && (self.pi == 2 || self.pi == 3 || self.pi == 7)

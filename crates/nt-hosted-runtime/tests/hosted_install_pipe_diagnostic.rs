@@ -149,3 +149,20 @@ fn invalid_batch_count_and_partial_terminal_preserve_the_next_device_slot() {
     assert_eq!(&observation.device[..observation.device_len], device.as_slice());
     assert_eq!(trace.counts().rejected, 1);
 }
+
+#[test]
+fn same_named_instances_select_the_exact_server_and_retire_on_close() {
+    let mut trace = InstallPipeDiagnostic::<2>::new();
+    let name = pipe_name("af990c70-ff1e-416f-b1aa-57a14d8ab3fa");
+    let differently_cased = utf16("pnp_device_install_pipe_0.{af990c70-ff1e-416f-b1aa-57a14d8ab3fa}");
+    let other_server = InstallPipeIdentity { file_id: PIPE.file_id + 1, ..PIPE };
+    assert!(trace.register_server(PIPE, &name));
+    assert!(trace.register_server(other_server, &name));
+    assert_eq!(trace.server_for_name_with(&differently_cased, |pipe| pipe == other_server),
+        Some(other_server), "case-insensitive name verifies, exact endpoint selects");
+    assert!(trace.attach_child(other_server, &differently_cased, CHILD, CLIENT_FILE));
+    assert!(trace.retire_server_file(PIPE.file_id));
+    let replacement = InstallPipeIdentity { file_id: PIPE.file_id + 2, ..PIPE };
+    assert!(trace.register_server(replacement, &name), "closed unpaired slot must be reusable");
+    assert_eq!(trace.server_for_name_with(&name, |pipe| pipe == other_server), Some(other_server));
+}

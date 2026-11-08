@@ -80,9 +80,23 @@ fn matches_prefix(name: &[u16], prefix: &[u8]) -> bool {
     name.len() >= prefix.len() && name.iter().zip(prefix).all(|(unit, byte)| *unit == u16::from(*byte))
 }
 
+fn same_ascii_name(left: &[u16], right: &[u16]) -> bool {
+    left.len() == right.len() && left.iter().zip(right).all(|(a, b)| {
+        let lower = |unit: u16| if (b'A' as u16..=b'Z' as u16).contains(&unit) {
+            unit + u16::from(b'a' - b'A')
+        } else { unit };
+        lower(*a) == lower(*b)
+    })
+}
+
 pub fn is_install_pipe_name(name: &[u16]) -> bool {
     let name = name.strip_prefix(&[b'\\' as u16]).unwrap_or(name);
-    matches_prefix(name, PIPE_PREFIX)
+    name.len() >= PIPE_PREFIX.len() && name.iter().zip(PIPE_PREFIX).all(|(unit, byte)| {
+        let lower = if (b'A' as u16..=b'Z' as u16).contains(unit) {
+            unit + u16::from(b'a' - b'A')
+        } else { *unit };
+        lower == u16::from(byte.to_ascii_lowercase())
+    })
 }
 
 fn u32_payload(payload: &[u8]) -> Option<u32> {
@@ -134,10 +148,23 @@ impl<const N: usize> InstallPipeDiagnostic<N> {
         true
     }
 
-    pub fn server_for_name(&self, name: &[u16]) -> Option<InstallPipeIdentity> {
+    /// The name verifies a candidate; the caller must select its exact provider endpoint.
+    pub fn server_for_name_with(&self, name: &[u16], mut same_endpoint: impl FnMut(InstallPipeIdentity) -> bool)
+        -> Option<InstallPipeIdentity> {
         let name = name.strip_prefix(&[b'\\' as u16]).unwrap_or(name);
         self.slots.iter().flatten().find(|slot| slot.name_len == name.len()
-            && &slot.name[..slot.name_len] == name).map(|slot| slot.pipe)
+            && same_ascii_name(&slot.name[..slot.name_len], name)
+            && same_endpoint(slot.pipe)).map(|slot| slot.pipe)
+    }
+
+    /// The canonical server File's final handle close frees an unpaired observation slot.
+    pub fn retire_server_file(&mut self, file_id: u64) -> bool {
+        let Some(slot) = self.slots.iter_mut().find(|slot| slot.is_some_and(|slot| {
+            slot.pipe.file_id == file_id && slot.child.is_none()
+        }))
+            else { return false; };
+        *slot = None;
+        true
     }
 
     pub fn server_for_file(&self, owner_pid: u32, owner_generation: u64, file_id: u64)
@@ -164,7 +191,7 @@ impl<const N: usize> InstallPipeDiagnostic<N> {
         };
         if child.pid == 0 || child.generation == 0 || client_file_id == 0
             || client_file_id == pipe.file_id || slot.child.is_some()
-            || slot.name_len != name.len() || &slot.name[..slot.name_len] != name {
+            || slot.name_len != name.len() || !same_ascii_name(&slot.name[..slot.name_len], name) {
             self.reject(); return false;
         }
         slot.child = Some(child);

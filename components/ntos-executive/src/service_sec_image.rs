@@ -14745,6 +14745,16 @@ pub(crate) unsafe fn service_sec_image(
                         } else {
                             false
                         };
+                        if let Some(pid) = nt_handler.pm_pid_for_pi(process_index as usize) {
+                            if nt_handler.pm.is_process_signaled(pid) {
+                                if let Some(status) = nt_handler.pm.process(pid)
+                                    .and_then(|process| process.exit_status) {
+                                    let _ = nt_handler.observe_install_pipe_child_terminal(
+                                        process_index as usize, status,
+                                    );
+                                }
+                            }
+                        }
                         let reclaimed = terminate_hosted_process_mechanisms(
                             process_index,
                             preserve_tid,
@@ -28534,6 +28544,14 @@ unsafe fn pending_file_io_redrive_pass(
             ) {
                 panic!("pending File completion identity mismatch");
             }
+            if pending.major == nt_io_abi::major::IRP_MJ_WRITE {
+                if let Some(file_id) = hosted_file_id {
+                    let _ = nt_handler.complete_install_pipe_write(
+                        pending.pi as usize, file_id, pending.irp_id,
+                        completed.status, completed.information,
+                    );
+                }
+            }
             pending_pipe_read_trace::terminal_observed(identity, pending.irp_id, completed.status);
             mounted_read_lifetime_trace::terminal_observed(identity, pending.irp_id,
                 completed.status, completed.information);
@@ -29015,6 +29033,17 @@ unsafe fn pending_file_io_redrive_pass(
                         publication.handle,
                     )
                     .expect("pending CREATE result could not be committed");
+                if (publication.status as i32) >= 0 && publication.handle != 0 {
+                    match pending.major {
+                        nt_io_abi::major::IRP_MJ_CREATE_NAMED_PIPE => {
+                            let _ = nt_handler.observe_install_pipe_server(pending.pi as usize, file_id);
+                        }
+                        nt_io_abi::major::IRP_MJ_CREATE => {
+                            let _ = nt_handler.observe_install_pipe_child(pending.pi as usize, file_id);
+                        }
+                        _ => {}
+                    }
+                }
                 if publication.wake_server_fid != 0 {
                     nt_handler.pipe_endpoint_progress = true;
                 }

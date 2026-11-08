@@ -23838,6 +23838,9 @@ struct ExecNtHandler {
     installer_progress: Option<nt_hosted_runtime::InstallerProgressDeferral<
         nt_user_host::process_identity::ProcessIdentity,
     >>,
+    /// Root-owned, bounded observation of exact native install-pipe Files and children.
+    /// The File and Process managers remain the only authorities for those identities.
+    install_pipe_diagnostic: nt_hosted_runtime::InstallPipeDiagnostic<8>,
     /// Security descriptors for virtual registry namespace roots. `\Registry\Machine` and
     /// `\Registry\User` are CM namespace sentinels, not hive cells and not overlay keys, but
     /// security queries/updates still target their handle identity.
