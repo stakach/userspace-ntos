@@ -3,6 +3,8 @@
 
 const PIPE_NAME_CAP: usize = 96;
 const DEVICE_UNIT_CAP: usize = 200;
+const BATCH_MARKER: u32 = 0x4843_5442;
+const BATCH_MAX_DEVICES: u32 = 65_536;
 const PIPE_PREFIX: &[u8] = b"PNP_Device_Install_Pipe_0.";
 const EVENT_PREFIX: &[u8] = b"Global\\PNP_Device_Install_Event_0.";
 
@@ -24,6 +26,9 @@ pub struct InstallPipeObservation {
     pub client_file_id: u64,
     pub device: [u16; DEVICE_UNIT_CAP],
     pub device_len: usize,
+    /// One-based position in the child's batch; legacy single-device writes use 1/1.
+    pub device_ordinal: u32,
+    pub device_total: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,16 +43,26 @@ pub struct InstallPipeTerminal {
 pub struct InstallPipeCounts { pub published: u64, pub terminal: u64, pub rejected: u64, pub overflow: u64 }
 
 #[derive(Clone, Copy)]
+enum WritePhase {
+    EventLength,
+    EventName { bytes: usize },
+    ShowWizard,
+    DeviceLengthOrMarker,
+    BatchCount,
+    DeviceLength { total: u32, ordinal: u32 },
+    DeviceName { bytes: usize, total: u32, ordinal: u32 },
+    Done,
+}
+
+#[derive(Clone, Copy)]
 struct Slot {
     pipe: InstallPipeIdentity,
     name: [u16; PIPE_NAME_CAP],
     name_len: usize,
     child: Option<InstallChildIdentity>,
     client_file_id: u64,
-    step: u8,
-    expected_bytes: usize,
+    phase: WritePhase,
     staged: Option<(u64, usize, [u8; DEVICE_UNIT_CAP * 2])>,
-    observation: Option<InstallPipeObservation>,
 }
 
 pub struct InstallPipeDiagnostic<const N: usize> {
@@ -74,6 +89,29 @@ fn u32_payload(payload: &[u8]) -> Option<u32> {
     Some(u32::from_le_bytes(payload.try_into().ok()?))
 }
 
+fn device_name_bytes(payload: &[u8]) -> Option<usize> {
+    let bytes = u32_payload(payload)? as usize;
+    (bytes >= 2 && bytes <= DEVICE_UNIT_CAP * 2 && bytes % 2 == 0).then_some(bytes)
+}
+
+fn event_name_matches(slot: &Slot, payload: &[u8], expected_bytes: usize) -> bool {
+    if payload.len() != expected_bytes { return false; }
+    let mut event = [0u16; PIPE_NAME_CAP];
+    for (index, bytes) in payload.chunks_exact(2).enumerate() {
+        event[index] = u16::from_le_bytes([bytes[0], bytes[1]]);
+    }
+    let event_len = payload.len() / 2;
+    let suffix = &slot.name[PIPE_PREFIX.len()..slot.name_len];
+    matches_prefix(&event[..event_len], EVENT_PREFIX)
+        && event_len == EVENT_PREFIX.len() + suffix.len()
+        && &event[EVENT_PREFIX.len()..event_len] == suffix
+}
+
+fn device_name_matches(payload: &[u8], expected_bytes: usize) -> bool {
+    payload.len() == expected_bytes && payload.len() >= 2
+        && payload.len() % 2 == 0 && payload[payload.len() - 2..] == [0, 0]
+}
+
 impl<const N: usize> InstallPipeDiagnostic<N> {
     pub const fn new() -> Self {
         Self { slots: [None; N], counts: InstallPipeCounts { published: 0, terminal: 0, rejected: 0, overflow: 0 } }
@@ -92,8 +130,7 @@ impl<const N: usize> InstallPipeDiagnostic<N> {
         let mut copied = [0u16; PIPE_NAME_CAP];
         copied[..name.len()].copy_from_slice(name);
         *target = Some(Slot { pipe, name: copied, name_len: name.len(), child: None,
-            client_file_id: 0, step: 0, expected_bytes: 0, staged: None,
-            observation: None });
+            client_file_id: 0, phase: WritePhase::EventLength, staged: None });
         true
     }
 
@@ -174,40 +211,40 @@ impl<const N: usize> InstallPipeDiagnostic<N> {
         let Some(slot) = self.slots.iter_mut().flatten().find(|slot| slot.pipe == pipe) else {
             self.reject(); return None;
         };
-        let valid = match slot.step {
-            0 => u32_payload(payload).is_some_and(|len| {
-                len >= 4 && len <= 2 * PIPE_NAME_CAP as u32 && len % 2 == 0
-            }),
-            1 => payload.len() == slot.expected_bytes && {
-                let units = payload.chunks_exact(2).map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
-                let event: [u16; PIPE_NAME_CAP] = {
-                    let mut out = [0; PIPE_NAME_CAP];
-                    for (index, unit) in units.enumerate() { out[index] = unit; }
-                    out
-                };
-                let event_len = payload.len() / 2;
-                let suffix = &slot.name[PIPE_PREFIX.len()..slot.name_len];
-                matches_prefix(&event[..event_len], EVENT_PREFIX)
-                    && event_len == EVENT_PREFIX.len() + suffix.len()
-                    && &event[EVENT_PREFIX.len()..event_len] == suffix
+        let parsed = match slot.phase {
+            WritePhase::EventLength => u32_payload(payload)
+                .filter(|len| *len >= 4 && *len <= 2 * PIPE_NAME_CAP as u32 && *len % 2 == 0)
+                .map(|bytes| (WritePhase::EventName { bytes: bytes as usize }, None)),
+            WritePhase::EventName { bytes } if event_name_matches(slot, payload, bytes) =>
+                Some((WritePhase::ShowWizard, None)),
+            WritePhase::ShowWizard if u32_payload(payload).is_some_and(|show| show <= 1) =>
+                Some((WritePhase::DeviceLengthOrMarker, None)),
+            WritePhase::DeviceLengthOrMarker => match u32_payload(payload) {
+                Some(BATCH_MARKER) => Some((WritePhase::BatchCount, None)),
+                _ => device_name_bytes(payload).map(|bytes| (
+                    WritePhase::DeviceName { bytes, total: 1, ordinal: 1 }, None,
+                )),
             },
-            2 => u32_payload(payload).is_some_and(|show| show <= 1),
-            3 => u32_payload(payload).is_some_and(|len| {
-                len >= 2 && len <= 2 * DEVICE_UNIT_CAP as u32 && len % 2 == 0
-            }),
-            4 => payload.len() == slot.expected_bytes && payload.len() % 2 == 0
-                && payload.len() >= 2 && payload[payload.len() - 2..] == [0, 0],
-            _ => false,
+            WritePhase::BatchCount => u32_payload(payload)
+                .filter(|count| *count <= BATCH_MAX_DEVICES)
+                .map(|count| (if count == 0 { WritePhase::Done }
+                    else { WritePhase::DeviceLength { total: count, ordinal: 1 } }, None)),
+            WritePhase::DeviceLength { total, ordinal } => device_name_bytes(payload)
+                .map(|bytes| (WritePhase::DeviceName { bytes, total, ordinal }, None)),
+            WritePhase::DeviceName { bytes, total, ordinal }
+                if device_name_matches(payload, bytes) => {
+                    let next = if ordinal == total { WritePhase::Done }
+                        else { WritePhase::DeviceLength { total, ordinal: ordinal + 1 } };
+                    Some((next, Some((ordinal, total))))
+                }
+            _ => None,
         };
-        if !valid {
+        let Some((next, published)) = parsed else {
             self.counts.rejected = self.counts.rejected.saturating_add(1);
             return None;
-        }
-        if slot.step == 0 || slot.step == 3 {
-            slot.expected_bytes = u32_payload(payload).unwrap_or(0) as usize;
-        }
-        slot.step += 1;
-        if slot.step != 5 { return None; }
+        };
+        slot.phase = next;
+        let Some((device_ordinal, device_total)) = published else { return None; };
         let Some(child) = slot.child else {
             self.counts.rejected = self.counts.rejected.saturating_add(1);
             return None;
@@ -218,8 +255,7 @@ impl<const N: usize> InstallPipeDiagnostic<N> {
             device[index] = u16::from_le_bytes([bytes[0], bytes[1]]);
         }
         let observation = InstallPipeObservation { pipe, child, client_file_id: slot.client_file_id,
-            device, device_len };
-        slot.observation = Some(observation);
+            device, device_len, device_ordinal, device_total };
         self.counts.published = self.counts.published.saturating_add(1);
         Some(observation)
     }

@@ -79,3 +79,73 @@ fn staged_write_advances_only_after_exact_successful_irp_terminal() {
     assert!(trace.complete_server_write(PIPE, irp + 1, 0, 4).is_none());
     assert_eq!(trace.counts().published, 0, "only the fifth write may publish a device");
 }
+
+#[test]
+fn libernt_batch_publishes_each_exact_device_after_its_full_write() {
+    const BATCH_MARKER: u32 = 0x4843_5442;
+    let mut trace = InstallPipeDiagnostic::<1>::new();
+    let name = pipe_name("af990c70-ff1e-416f-b1aa-57a14d8ab3fa");
+    let event = utf16("Global\\PNP_Device_Install_Event_0.{af990c70-ff1e-416f-b1aa-57a14d8ab3fa}");
+    let first = utf16(r"ACPI\QEMU0002\0");
+    let second = utf16(r"ACPI\PNP0501\1");
+    assert!(trace.register_server(PIPE, &name));
+    assert!(trace.attach_child(PIPE, &name, CHILD, CLIENT_FILE));
+    for payload in [
+        ((event.len() * 2) as u32).to_le_bytes().to_vec(),
+        bytes(&event),
+        0u32.to_le_bytes().to_vec(),
+        BATCH_MARKER.to_le_bytes().to_vec(),
+        2u32.to_le_bytes().to_vec(),
+        ((first.len() * 2) as u32).to_le_bytes().to_vec(),
+    ] {
+        assert!(trace.record_server_write(PIPE, &payload).is_none());
+    }
+    let first_observation = trace.record_server_write(PIPE, &bytes(&first))
+        .expect("first exact batch device write");
+    assert_eq!(&first_observation.device[..first_observation.device_len], first.as_slice());
+    assert_eq!(first_observation.child, CHILD);
+    assert_eq!((first_observation.device_ordinal, first_observation.device_total), (1, 2));
+
+    assert!(trace.record_server_write(PIPE, &((second.len() * 2) as u32).to_le_bytes()).is_none());
+    let second_bytes = bytes(&second);
+    let irp = (7u64 << 40) | 0x52;
+    assert!(trace.stage_server_write(PIPE, irp, &second_bytes));
+    assert!(trace.complete_server_write(PIPE, irp + (1u64 << 40), 0, second_bytes.len() as u64).is_none(),
+        "wrong IRP generation cannot publish a device");
+    let second_observation = trace.complete_server_write(PIPE, irp, 0, second_bytes.len() as u64)
+        .expect("full exact pending batch device write");
+    assert_eq!(&second_observation.device[..second_observation.device_len], second.as_slice());
+    assert_eq!((second_observation.device_ordinal, second_observation.device_total), (2, 2));
+    assert_eq!(trace.counts().published, 2);
+    assert!(trace.record_child_terminal(CHILD, 0).is_some());
+}
+
+#[test]
+fn invalid_batch_count_and_partial_terminal_preserve_the_next_device_slot() {
+    let mut trace = InstallPipeDiagnostic::<1>::new();
+    let name = pipe_name("af990c70-ff1e-416f-b1aa-57a14d8ab3fa");
+    let event = utf16("Global\\PNP_Device_Install_Event_0.{af990c70-ff1e-416f-b1aa-57a14d8ab3fa}");
+    let device = utf16(r"ACPI\PNP0303\0");
+    assert!(trace.register_server(PIPE, &name));
+    assert!(trace.attach_child(PIPE, &name, CHILD, CLIENT_FILE));
+    for payload in [
+        ((event.len() * 2) as u32).to_le_bytes().to_vec(), bytes(&event),
+        0u32.to_le_bytes().to_vec(), 0x4843_5442u32.to_le_bytes().to_vec(),
+    ] {
+        assert!(trace.record_server_write(PIPE, &payload).is_none());
+    }
+    assert!(trace.record_server_write(PIPE, &65_537u32.to_le_bytes()).is_none());
+    assert!(trace.record_server_write(PIPE, &1u32.to_le_bytes()).is_none());
+    assert!(trace.record_server_write(PIPE, &((device.len() * 2) as u32).to_le_bytes()).is_none());
+    let payload = bytes(&device);
+    let irp = (7u64 << 40) | 0x53;
+    assert!(trace.stage_server_write(PIPE, irp, &payload));
+    assert!(trace.complete_server_write(PIPE, irp, 0, payload.len() as u64 - 2).is_none());
+    assert_eq!(trace.counts().published, 0);
+    assert!(trace.stage_server_write(PIPE, irp + 1, &payload));
+    let observation = trace.complete_server_write(PIPE, irp + 1, 0, payload.len() as u64)
+        .expect("only full terminal publishes the retained device");
+    assert_eq!((observation.device_ordinal, observation.device_total), (1, 1));
+    assert_eq!(&observation.device[..observation.device_len], device.as_slice());
+    assert_eq!(trace.counts().rejected, 1);
+}
