@@ -420,6 +420,7 @@ pub(crate) unsafe fn try_capture_exact_shared_resume_snapshot(
     Some(snapshot)
 }
 
+#[track_caller]
 pub(crate) unsafe fn capture_shared_resume_snapshot(
     dispatch: nt_user_callback::DispatchContext,
     client: Win32kClientContext,
@@ -429,6 +430,14 @@ pub(crate) unsafe fn capture_shared_resume_snapshot(
         as *const nt_user_callback::CallbackFrame;
     let header = core::ptr::read_volatile(core::ptr::addr_of!((*frame).header));
     if !header.matches_dispatch_identity(dispatch.dispatch_id, client.pi, client.tid, client.badge) {
+        let caller = core::panic::Location::caller();
+        print_str(b"[win32k-shared-capture-site] ");
+        print_str(caller.file().as_bytes());
+        print_str(b":");
+        print_u64(caller.line() as u64);
+        print_str(b" active-dispatch=");
+        print_u64(core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH)).dispatch_id);
+        print_str(b"\n");
         print_str(b"[win32k-shared-header-mismatch] expected dispatch/pi/tid/badge=");
         print_u64(dispatch.dispatch_id); print_str(b"/"); print_u64(client.pi as u64);
         print_str(b"/"); print_u64(client.tid); print_str(b"/"); print_u64(client.badge);
