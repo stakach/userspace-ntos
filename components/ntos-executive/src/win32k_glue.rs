@@ -7301,8 +7301,9 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         WIN32K_BUSY_INGRESS_TRACES.fetch_add(1, Ordering::Relaxed) + 1
     );
     if busy_count.is_some_and(|count| count <= 8 || count.is_power_of_two()) {
-        print_str(b"[win32k-busy-ingress] count/pi/tid/ssn/active=");
+        print_str(b"[win32k-busy-ingress] count/pi/tid/ssn/kind/a0/a1/active=");
         for value in [busy_count.unwrap(), client.pi as u64, client.tid, ssn,
+            request_kind, a0, a1,
             core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH)).dispatch_id] {
             print_str(b"/");
             print_hex_u64(value);

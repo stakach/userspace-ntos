@@ -179,6 +179,34 @@ pub(crate) fn print_hold_snapshot(now: u64) {
     } else {
         record.bytes()
     });
+    static HOSTED_CALL_CENSUS_SAMPLES: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    if (gate.retained.iter().any(Option::is_some) || gate.retained_overflow != 0)
+        && HOSTED_CALL_CENSUS_SAMPLES.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 64
+    {
+        let mut calls_record = nt_printf::record::RecordBuffer::<4096>::new();
+        let _ = writeln!(calls_record, "[ingress-calls] t_ms={} overflow={}",
+            now / 10_000, gate.retained_overflow);
+        for call in gate.retained.into_iter().flatten() {
+            let (generation_kind, generation) = match call.binding.process.generation {
+                nt_user_host::process_identity::ProcessGeneration::Hosted(value) =>
+                    ("hosted", value),
+                nt_user_host::process_identity::ProcessGeneration::Temporary(value) =>
+                    ("temporary", value),
+            };
+            let _ = writeln!(calls_record,
+                "[ingress-call] pi/pid/pgen/tid/badge/tcb/seq/reply/label/ssn/delivered/settlement={}/{}/{}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+                call.binding.pi, call.binding.process.pid, generation_kind, generation,
+                call.binding.tid, call.binding.badge, call.binding.tcb,
+                call.admission_sequence, call.reply, call.label, call.ssn,
+                u8::from(call.delivered), u8::from(call.settlement_prepared));
+        }
+        sel4_rt::print_record(if calls_record.overflowed() {
+            b"[ingress-calls] record-truncated\n"
+        } else {
+            calls_record.bytes()
+        });
+    }
     let calls = crate::MONOTONIC_CALLS.snapshot::<8>();
     let mut callers = nt_printf::record::RecordBuffer::<2048>::new();
     let _ = write!(callers, "[clock-callers] calls={} sampled={} overflow={}",

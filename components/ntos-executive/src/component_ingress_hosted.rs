@@ -160,14 +160,41 @@ pub(super) unsafe fn oldest_pending_snapshot() -> Option<PendingSnapshot> {
     })
 }
 
-/// Read-only gate state for a retained hosted Call at a periodic boot census.
-#[derive(Clone, Copy, Debug)]
+/// Read-only identity of one original hosted Call, never a delivery or Reply authority.
+#[derive(Clone, Copy)]
+pub(crate) struct RetainedCallSample {
+    pub binding: Binding,
+    pub reply: u64,
+    pub admission_sequence: u64,
+    pub label: u64,
+    pub ssn: u64,
+    pub delivered: bool,
+    pub settlement_prepared: bool,
+}
+
+/// Read-only gate state for retained hosted Calls at a periodic root census.
+#[derive(Clone, Copy)]
 pub(crate) struct DeliveryGateSnapshot {
     pub journal_owned: bool,
     pub receive_child_pending: bool,
     pub oldest_can_park: Option<bool>,
     pub oldest_settlement_prepared: Option<bool>,
     pub pending_calls: usize,
+    pub retained: [Option<RetainedCallSample>; 8],
+    pub retained_overflow: usize,
+}
+
+impl core::fmt::Debug for DeliveryGateSnapshot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DeliveryGateSnapshot")
+            .field("journal_owned", &self.journal_owned)
+            .field("receive_child_pending", &self.receive_child_pending)
+            .field("oldest_can_park", &self.oldest_can_park)
+            .field("oldest_settlement_prepared", &self.oldest_settlement_prepared)
+            .field("pending_calls", &self.pending_calls)
+            .field("retained_overflow", &self.retained_overflow)
+            .finish()
+    }
 }
 
 pub(crate) unsafe fn delivery_gate_snapshot() -> DeliveryGateSnapshot {
@@ -182,6 +209,27 @@ pub(crate) unsafe fn delivery_gate_snapshot() -> DeliveryGateSnapshot {
                 })
         })
     });
+    let mut retained = [None; 8];
+    let mut retained_count = 0usize;
+    let mut retained_overflow = 0usize;
+    for row in rows.iter().flatten() {
+        if row.released || row.completion.is_some() { continue; }
+        let Some(call) = row.call.as_ref() else { continue; };
+        if retained_count == retained.len() {
+            retained_overflow += 1;
+            continue;
+        }
+        retained[retained_count] = Some(RetainedCallSample {
+            binding: row.binding,
+            reply: call.reply(),
+            admission_sequence: call.admission_sequence(),
+            label: call.message().info() >> 12,
+            ssn: call.message().registers()[0],
+            delivered: row.delivered,
+            settlement_prepared: row.receive_settlement.is_some(),
+        });
+        retained_count += 1;
+    }
     DeliveryGateSnapshot {
         journal_owned: crate::writable_fs::registry_journal::owns_volume(),
         receive_child_pending: receive_child_pending(),
@@ -190,6 +238,8 @@ pub(crate) unsafe fn delivery_gate_snapshot() -> DeliveryGateSnapshot {
         pending_calls: rows.iter().flatten().filter(|row| {
             !row.delivered && !row.released && row.completion.is_none()
         }).count(),
+        retained,
+        retained_overflow,
     }
 }
 struct Cancellation {
