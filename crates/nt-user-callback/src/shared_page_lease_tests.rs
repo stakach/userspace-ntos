@@ -146,3 +146,58 @@ fn only_live_exact_terminal_child_can_finish_without_publication() {
     assert_eq!(leases.finish_terminal(outer), Err(SharedPageLeaseError::AlreadyDisplaced));
     assert_eq!(leases.finish(outer, None), Ok(saved));
 }
+
+struct ReplyToken(core::cell::Cell<u64>);
+
+#[test]
+fn global_page_owner_parks_a_full_publication_before_foreign_header_write() {
+    let winlogon = identity(91, 1);
+    let mut csrss = identity(92, 1);
+    csrss.client.pi = 7;
+    csrss.client.pid = 80;
+    csrss.client.tid = 108;
+    csrss.client.badge = 729;
+    csrss.client.tcb = 0x500;
+    let saved = snapshot(winlogon, 4655);
+    let mut page = SharedPageAuthority::<4>::new();
+
+    let reply = page.enter(winlogon, ReplyToken(core::cell::Cell::new(91)))
+        .unwrap_or_else(|_| panic!("Winlogon must enter an empty page"));
+    assert_eq!(reply.0.get(), 91);
+    let blocked = page.enter(csrss, ReplyToken(core::cell::Cell::new(92)));
+    let (_, reply) = blocked.err().expect("active Winlogon must fence CSRSS publication");
+    assert_eq!(reply.0.get(), 92, "Busy preserves the non-Copy incoming Reply");
+
+    page.capture_and_park(winlogon, saved).expect("full exact page is durable before release");
+    let reply = page.enter(csrss, reply)
+        .unwrap_or_else(|_| panic!("CSRSS may enter after Winlogon is durably parked"));
+    assert_eq!(reply.0.get(), 92);
+    assert!(page.reacquire(winlogon).is_err(), "a parked owner cannot overwrite an active child");
+    page.finish_active(csrss).expect("only terminal child releases its active publication");
+    assert_eq!(page.reacquire(winlogon), Ok(saved));
+    assert_eq!(page.acknowledge_restore(winlogon, SharedPageRestoreEffect::Applied(saved)), Ok(()));
+    page.finish_active(winlogon).expect("restored parent retires once");
+}
+
+#[test]
+fn global_page_owner_refuses_stale_reacquire_and_pins_uncertain_effects() {
+    let current = identity(91, 1);
+    let stale = identity(91, 2);
+    let other = identity(92, 1);
+    let saved = snapshot(current, 4655);
+    let mut page = SharedPageAuthority::<2>::new();
+    page.enter(current, ReplyToken(core::cell::Cell::new(91)))
+        .unwrap_or_else(|_| panic!("initial owner enters"));
+    assert!(page.capture_and_park(stale, saved).is_err(), "wrong generation cannot park");
+    page.capture_and_park(current, saved).expect("exact owner parks");
+    assert!(page.reacquire(stale).is_err(), "recycled identity cannot restore an old page");
+    assert!(page.reacquire(other).is_err(), "foreign dispatch cannot restore the old page");
+    assert_eq!(page.reacquire(current), Ok(saved));
+    assert_eq!(page.acknowledge_restore(current, SharedPageRestoreEffect::Uncertain),
+        Err(SharedPageLeaseError::Uncertain));
+    let (_, retained) = page.enter(other, ReplyToken(core::cell::Cell::new(92)))
+        .err().expect("uncertain restoration fences all new writers");
+    assert_eq!(retained.0.get(), 92);
+    assert!(page.finish_active(current).is_err(), "uncertain owner cannot be released or replayed");
+    assert!(page.reacquire(current).is_err(), "uncertain restoration cannot be retried");
+}

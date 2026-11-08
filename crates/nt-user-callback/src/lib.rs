@@ -5,7 +5,7 @@ mod dispatch_return;
 mod shared_page_lease;
 pub use shared_page_lease::{
     SharedPageClientIdentity, SharedPageLeaseError, SharedPageLeaseIdentity,
-    SharedPageLeaseStack, SharedPageRestoreEffect, SharedPageSnapshot,
+    SharedPageAuthority, SharedPageLeaseStack, SharedPageRestoreEffect, SharedPageSnapshot,
 };
 pub use dispatch_return::{DispatchReturn, DispatchReturnError, DispatchReturnReceipt};
 mod windowproc;

@@ -238,3 +238,142 @@ impl<const N: usize> SharedPageLeaseStack<N> {
 impl<const N: usize> Default for SharedPageLeaseStack<N> {
     fn default() -> Self { Self::new() }
 }
+
+#[derive(Clone, Copy)]
+enum PageAuthorityState {
+    Active(SharedPageLeaseIdentity),
+    Restoring(SharedPageLeaseIdentity, SharedPageSnapshot),
+    Uncertain(SharedPageLeaseIdentity, Option<SharedPageSnapshot>),
+}
+
+/// The singleton physical page has at most one writer. A parked dispatch retains its checked
+/// publication until it reacquires the page; another dispatch may enter only after that park.
+/// Native code must retain Replies and continuations separately before entering an effect.
+pub struct SharedPageAuthority<const N: usize> {
+    current: Option<PageAuthorityState>,
+    parked: [Option<(SharedPageLeaseIdentity, SharedPageSnapshot)>; N],
+}
+
+impl<const N: usize> SharedPageAuthority<N> {
+    pub const fn new() -> Self {
+        Self { current: None, parked: [None; N] }
+    }
+
+    /// Admission returns the incoming non-Copy Reply unchanged on every refusal. A caller must
+    /// retain it and defer rather than manufacture a completed NT status while the page is busy.
+    pub fn enter<R>(
+        &mut self, identity: SharedPageLeaseIdentity, reply: R,
+    ) -> Result<R, (SharedPageLeaseError, R)> {
+        if !identity.is_valid() { return Err((SharedPageLeaseError::InvalidIdentity, reply)); }
+        if matches!(self.current, Some(PageAuthorityState::Uncertain(..))) {
+            return Err((SharedPageLeaseError::Uncertain, reply));
+        }
+        if self.current.is_some() { return Err((SharedPageLeaseError::NotTop, reply)); }
+        if self.parked.iter().flatten().any(|(owner, _)|
+            owner.dispatch.dispatch_id == identity.dispatch.dispatch_id
+        ) {
+            return Err((SharedPageLeaseError::Duplicate, reply));
+        }
+        self.current = Some(PageAuthorityState::Active(identity));
+        Ok(reply)
+    }
+
+    /// Transfer a stable, full publication into the exact parked owner before any foreign
+    /// header or request write. On refusal the active owner remains in place.
+    pub fn capture_and_park(
+        &mut self, identity: SharedPageLeaseIdentity, snapshot: SharedPageSnapshot,
+    ) -> Result<(), SharedPageLeaseError> {
+        match self.current {
+            Some(PageAuthorityState::Active(owner)) if owner == identity => {}
+            Some(PageAuthorityState::Uncertain(..)) => return Err(SharedPageLeaseError::Uncertain),
+            Some(_) => return Err(SharedPageLeaseError::NotTop),
+            None => return Err(SharedPageLeaseError::Empty),
+        }
+        if !snapshot.matches(identity) { return Err(SharedPageLeaseError::WrongSnapshot); }
+        let Some(slot) = self.parked.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(SharedPageLeaseError::Capacity);
+        };
+        *slot = Some((identity, snapshot));
+        self.current = None;
+        Ok(())
+    }
+
+    /// A capture whose native effect cannot be certified pins the active identity and blocks
+    /// all new writers. This state has no retry or release path.
+    pub fn quarantine_active(
+        &mut self, identity: SharedPageLeaseIdentity,
+    ) -> Result<(), SharedPageLeaseError> {
+        match self.current {
+            Some(PageAuthorityState::Active(owner)) if owner == identity => {
+                self.current = Some(PageAuthorityState::Uncertain(identity, None));
+                Ok(())
+            }
+            Some(PageAuthorityState::Uncertain(..)) => Err(SharedPageLeaseError::Uncertain),
+            Some(_) => Err(SharedPageLeaseError::NotTop),
+            None => Err(SharedPageLeaseError::Empty),
+        }
+    }
+
+    /// Reacquisition moves the saved publication into an exclusive restoring state. No other
+    /// dispatch may write while the native adapter reselects the client window and restores it.
+    pub fn reacquire(
+        &mut self, identity: SharedPageLeaseIdentity,
+    ) -> Result<SharedPageSnapshot, SharedPageLeaseError> {
+        if !identity.is_valid() { return Err(SharedPageLeaseError::InvalidIdentity); }
+        if matches!(self.current, Some(PageAuthorityState::Uncertain(..))) {
+            return Err(SharedPageLeaseError::Uncertain);
+        }
+        if self.current.is_some() { return Err(SharedPageLeaseError::NotTop); }
+        let Some(slot) = self.parked.iter_mut().find(|slot|
+            slot.as_ref().is_some_and(|(owner, _)| *owner == identity)
+        ) else { return Err(SharedPageLeaseError::Empty) };
+        let (_, snapshot) = slot.take().expect("exact parked entry was found");
+        self.current = Some(PageAuthorityState::Restoring(identity, snapshot));
+        Ok(snapshot)
+    }
+
+    /// Only an exact, physically applied restoration makes the parked owner active again.
+    /// Uncertain native writes pin the saved publication and cannot be replayed.
+    pub fn acknowledge_restore(
+        &mut self, identity: SharedPageLeaseIdentity, effect: SharedPageRestoreEffect,
+    ) -> Result<(), SharedPageLeaseError> {
+        let saved = match self.current {
+            Some(PageAuthorityState::Restoring(owner, saved)) if owner == identity => saved,
+            Some(PageAuthorityState::Uncertain(..)) => return Err(SharedPageLeaseError::Uncertain),
+            Some(_) => return Err(SharedPageLeaseError::NotDisplaced),
+            None => return Err(SharedPageLeaseError::Empty),
+        };
+        match effect {
+            SharedPageRestoreEffect::Applied(restored) if restored == saved
+                && restored.matches(identity) => {
+                self.current = Some(PageAuthorityState::Active(identity));
+                Ok(())
+            }
+            SharedPageRestoreEffect::Applied(_) => Err(SharedPageLeaseError::WrongSnapshot),
+            SharedPageRestoreEffect::NoEffect => Err(SharedPageLeaseError::RestoreNotApplied),
+            SharedPageRestoreEffect::Uncertain => {
+                self.current = Some(PageAuthorityState::Uncertain(identity, Some(saved)));
+                Err(SharedPageLeaseError::Uncertain)
+            }
+        }
+    }
+
+    /// The native owner calls this only after terminal completion and output/Reply retention.
+    pub fn finish_active(
+        &mut self, identity: SharedPageLeaseIdentity,
+    ) -> Result<(), SharedPageLeaseError> {
+        match self.current {
+            Some(PageAuthorityState::Active(owner)) if owner == identity => {
+                self.current = None;
+                Ok(())
+            }
+            Some(PageAuthorityState::Uncertain(..)) => Err(SharedPageLeaseError::Uncertain),
+            Some(_) => Err(SharedPageLeaseError::NotTop),
+            None => Err(SharedPageLeaseError::Empty),
+        }
+    }
+}
+
+impl<const N: usize> Default for SharedPageAuthority<N> {
+    fn default() -> Self { Self::new() }
+}
