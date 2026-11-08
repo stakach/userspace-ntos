@@ -87,6 +87,7 @@ pub mod sched_context;
 pub mod slot_recycle;
 pub mod frame_recycle;
 pub mod thread_binding;
+pub mod legacy_thread_sequence_probe;
 pub mod hosted_priority;
 pub mod thread_priority_transition;
 pub mod one_shot_thread_retirement;

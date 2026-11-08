@@ -1,5 +1,9 @@
 # Lessons
 
+## Trace The Executed Thread API Path
+- An application call to `CreateThread` does not identify which NT thread syscall the staged `ntdll.dll` uses. Reconcile the exact serial trace, ntdll export and service number, and native dispatch before designing a diagnostic or regression. In the pinned LiberNT installer, `CreateThread` reaches legacy `NtCreateThread` (SSN 55), not `NtCreateThreadEx`.
+- Match the source call shape before writing a reproduction. The installer creates three workers with flags 0 and then runs shard 0 inline; it does not explicitly call `ResumeThread`. Observe each creation's terminal result and the original caller's retained Reply before attributing a missing inline shard to lost continuation.
+
 ## Keep Independent Root Events Independent Of A Held Provider Reply
 - A queued hosted Call can be asynchronous even when it is selected to unblock a nested provider pump. Decode its actual syscall and trace its Reply owner before choosing a parent-child settlement barrier. `NtReadFile` can park with an independent Reply; holding a Win32k parent until that File Call settles can create a dependency cycle.
 - A bounded root-event preemption needs an exact event checkpoint: the selected Call has either acknowledged and freed its Reply or durably parked it with its own owner. Restore the provider parent only after that checkpoint. Do not treat a numeric Reply, a timeout, or an uncertain park as proof.

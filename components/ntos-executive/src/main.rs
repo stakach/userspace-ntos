@@ -1071,6 +1071,7 @@ pub const SSN_NT_WAIT_FOR_KEYED_EVENT: u64 = 292;
 pub const SSN_NT_CREATE_PORT: u64 = 48;
 pub const SSN_NT_CREATE_THREAD: u64 = 55;
 pub const SSN_NT_CREATE_EVENT: u64 = 37;
+pub const SSN_NT_RESUME_THREAD: u64 = 214;
 pub const SSN_NT_CLEAR_EVENT: u64 = 26;
 pub const SSN_NT_PULSE_EVENT: u64 = 144;
 pub const SSN_NT_QUERY_EVENT: u64 = 155;
@@ -26117,7 +26118,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtUnmapViewOfSection, 277),
             (NativeService::NtQuerySecurityObject, 176),
             (NativeService::NtSetSecurityObject, 246),
-            (NativeService::NtResumeThread, 214),
+            (NativeService::NtResumeThread, SSN_NT_RESUME_THREAD as u32),
             (NativeService::NtSuspendThread, SSN_NT_SUSPEND_THREAD as u32),
             (NativeService::NtSetInformationObject, 236),
             // Workstream A batch 3 (group B1): query + object-namespace services.
