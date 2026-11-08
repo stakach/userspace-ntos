@@ -217,6 +217,7 @@ mod img_spawn;
 mod temporary_frame_alias;
 pub(crate) use img_spawn::*;
 mod win32k_glue;
+mod win32k_shared_page_authority;
 pub(crate) use win32k_glue::*;
 pub(crate) use win32k_session_runtime::*;
 mod driver_launch;

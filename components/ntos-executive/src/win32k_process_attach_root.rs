@@ -3,7 +3,7 @@
 use super::*;
 use core::ptr::read_volatile;
 use nt_kernel_exec::process_attach::{ProcessAttachState, SavedAttachState};
-use nt_user_host::{client_alias_window::WindowOwner, process_identity::ProcessGeneration};
+use nt_user_host::{client_alias_window::{WindowOwner, WindowSelectionEffect}, process_identity::ProcessGeneration};
 use nt_user_host::provider_kernel_activation::{KernelProviderCaller, KernelProviderServiceEnvelope};
 use nt_user_host::provider_logical_caller::ProviderLogicalCaller;
 
@@ -46,18 +46,26 @@ struct AttachIntent {
 
 static mut THREAD_ATTACHMENTS: Vec<ThreadAttach> = Vec::new();
 
-pub(super) unsafe fn select_effective_client(
+pub(super) unsafe fn select_effective_client_effect(
     caller: ProviderLogicalCaller,
     original: WindowOwner,
-) -> bool {
+) -> WindowSelectionEffect {
     let records = &*core::ptr::addr_of!(THREAD_ATTACHMENTS);
     let Some(record) = records.iter().find(|record| record.caller == AttachCaller::Logical(caller)) else {
-        return w32_client_attach(original);
+        return w32_client_attach_effect(original);
     };
     if record.state.original().owner != Some(original) {
-        return false;
+        return WindowSelectionEffect::RefusedNoEffect;
     }
-    select(record.state.current()).is_ok()
+    let current = record.state.current();
+    match current.owner {
+        Some(owner) => w32_client_attach_effect(owner),
+        None => match select(current) {
+            Ok(()) => WindowSelectionEffect::Applied,
+            // Process detachment may have removed an earlier alias before returning an error.
+            Err(()) => WindowSelectionEffect::Uncertain,
+        },
+    }
 }
 
 /// Rebind a retained kernel Ps callout after a provider wait or scheduler yield. The native

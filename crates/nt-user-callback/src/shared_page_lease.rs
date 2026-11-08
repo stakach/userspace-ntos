@@ -36,6 +36,30 @@ pub struct SharedPageLeaseIdentity {
     pub client: SharedPageClientIdentity,
 }
 
+/// Identity known before lane admission or client-window effects. The native adapter
+/// authenticates the request kind and retains the ingress Reply outside this copyable key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SharedPageProvisionalIdentity {
+    pub dispatch_id: u64,
+    pub client: SharedPageClientIdentity,
+    pub request_ssn: u64,
+    pub request_kind: u64,
+}
+
+impl SharedPageProvisionalIdentity {
+    const fn is_valid(self) -> bool {
+        self.dispatch_id != 0 && self.client.is_valid()
+    }
+}
+
+/// Report the aggregate effect of pre-lane selection and grants on cancellation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SharedPageReservationEffect {
+    NoEffect,
+    Applied,
+    Uncertain,
+}
+
 impl SharedPageLeaseIdentity {
     const fn is_valid(self) -> bool {
         // Request-class authentication belongs to the native adapter; hosted Ps uses SSN 0.
@@ -242,9 +266,11 @@ impl<const N: usize> Default for SharedPageLeaseStack<N> {
 
 #[derive(Clone, Copy)]
 enum PageAuthorityState {
+    Reserved(SharedPageProvisionalIdentity),
     Active(SharedPageLeaseIdentity),
     Restoring(SharedPageLeaseIdentity, SharedPageSnapshot),
     Uncertain(SharedPageLeaseIdentity, Option<SharedPageSnapshot>),
+    UncertainReservation(SharedPageProvisionalIdentity),
 }
 
 /// The singleton physical page has at most one writer. A parked dispatch retains its checked
@@ -260,13 +286,78 @@ impl<const N: usize> SharedPageAuthority<N> {
         Self { current: None, parked: [None; N] }
     }
 
+    /// Reserve the physical page before selecting a client or granting its Ps bodies.
+    pub fn reserve<R>(
+        &mut self, identity: SharedPageProvisionalIdentity, reply: R,
+    ) -> Result<R, (SharedPageLeaseError, R)> {
+        if !identity.is_valid() { return Err((SharedPageLeaseError::InvalidIdentity, reply)); }
+        if matches!(self.current, Some(PageAuthorityState::Uncertain(..)
+            | PageAuthorityState::UncertainReservation(..))) {
+            return Err((SharedPageLeaseError::Uncertain, reply));
+        }
+        if self.current.is_some() { return Err((SharedPageLeaseError::NotTop, reply)); }
+        if self.parked.iter().flatten().any(|(owner, _)|
+            owner.dispatch.dispatch_id == identity.dispatch_id
+        ) {
+            return Err((SharedPageLeaseError::Duplicate, reply));
+        }
+        self.current = Some(PageAuthorityState::Reserved(identity));
+        Ok(reply)
+    }
+
+    /// Only a certified no-effect cancellation may release a pre-lane reservation.
+    pub fn cancel_reservation(
+        &mut self, identity: SharedPageProvisionalIdentity, effect: SharedPageReservationEffect,
+    ) -> Result<(), SharedPageLeaseError> {
+        match self.current {
+            Some(PageAuthorityState::Reserved(owner)) if owner == identity => match effect {
+                SharedPageReservationEffect::NoEffect => {
+                    self.current = None;
+                    Ok(())
+                }
+                SharedPageReservationEffect::Applied | SharedPageReservationEffect::Uncertain => {
+                    self.current = Some(PageAuthorityState::UncertainReservation(identity));
+                    Err(SharedPageLeaseError::Uncertain)
+                }
+            },
+            Some(PageAuthorityState::Uncertain(..)
+                | PageAuthorityState::UncertainReservation(..)) => Err(SharedPageLeaseError::Uncertain),
+            Some(_) => Err(SharedPageLeaseError::NotTop),
+            None => Err(SharedPageLeaseError::Empty),
+        }
+    }
+
+    /// Bind the reservation to the exact admitted physical lane before first page write.
+    pub fn promote(
+        &mut self, identity: SharedPageProvisionalIdentity, admitted: SharedPageLeaseIdentity,
+    ) -> Result<(), SharedPageLeaseError> {
+        match self.current {
+            Some(PageAuthorityState::Reserved(owner)) if owner == identity => {
+                if !admitted.is_valid()
+                    || admitted.dispatch.dispatch_id != identity.dispatch_id
+                    || admitted.dispatch.ssn != identity.request_ssn
+                    || admitted.client != identity.client
+                {
+                    return Err(SharedPageLeaseError::InvalidIdentity);
+                }
+                self.current = Some(PageAuthorityState::Active(admitted));
+                Ok(())
+            }
+            Some(PageAuthorityState::Uncertain(..)
+                | PageAuthorityState::UncertainReservation(..)) => Err(SharedPageLeaseError::Uncertain),
+            Some(_) => Err(SharedPageLeaseError::NotTop),
+            None => Err(SharedPageLeaseError::Empty),
+        }
+    }
+
     /// Admission returns the incoming non-Copy Reply unchanged on every refusal. A caller must
     /// retain it and defer rather than manufacture a completed NT status while the page is busy.
     pub fn enter<R>(
         &mut self, identity: SharedPageLeaseIdentity, reply: R,
     ) -> Result<R, (SharedPageLeaseError, R)> {
         if !identity.is_valid() { return Err((SharedPageLeaseError::InvalidIdentity, reply)); }
-        if matches!(self.current, Some(PageAuthorityState::Uncertain(..))) {
+        if matches!(self.current, Some(PageAuthorityState::Uncertain(..)
+            | PageAuthorityState::UncertainReservation(..))) {
             return Err((SharedPageLeaseError::Uncertain, reply));
         }
         if self.current.is_some() { return Err((SharedPageLeaseError::NotTop, reply)); }
@@ -286,7 +377,8 @@ impl<const N: usize> SharedPageAuthority<N> {
     ) -> Result<(), SharedPageLeaseError> {
         match self.current {
             Some(PageAuthorityState::Active(owner)) if owner == identity => {}
-            Some(PageAuthorityState::Uncertain(..)) => return Err(SharedPageLeaseError::Uncertain),
+            Some(PageAuthorityState::Uncertain(..)
+                | PageAuthorityState::UncertainReservation(..)) => return Err(SharedPageLeaseError::Uncertain),
             Some(_) => return Err(SharedPageLeaseError::NotTop),
             None => return Err(SharedPageLeaseError::Empty),
         }
@@ -309,7 +401,8 @@ impl<const N: usize> SharedPageAuthority<N> {
                 self.current = Some(PageAuthorityState::Uncertain(identity, None));
                 Ok(())
             }
-            Some(PageAuthorityState::Uncertain(..)) => Err(SharedPageLeaseError::Uncertain),
+            Some(PageAuthorityState::Uncertain(..)
+                | PageAuthorityState::UncertainReservation(..)) => Err(SharedPageLeaseError::Uncertain),
             Some(_) => Err(SharedPageLeaseError::NotTop),
             None => Err(SharedPageLeaseError::Empty),
         }
@@ -321,7 +414,8 @@ impl<const N: usize> SharedPageAuthority<N> {
         &mut self, identity: SharedPageLeaseIdentity,
     ) -> Result<SharedPageSnapshot, SharedPageLeaseError> {
         if !identity.is_valid() { return Err(SharedPageLeaseError::InvalidIdentity); }
-        if matches!(self.current, Some(PageAuthorityState::Uncertain(..))) {
+        if matches!(self.current, Some(PageAuthorityState::Uncertain(..)
+            | PageAuthorityState::UncertainReservation(..))) {
             return Err(SharedPageLeaseError::Uncertain);
         }
         if self.current.is_some() { return Err(SharedPageLeaseError::NotTop); }
@@ -340,7 +434,8 @@ impl<const N: usize> SharedPageAuthority<N> {
     ) -> Result<(), SharedPageLeaseError> {
         let saved = match self.current {
             Some(PageAuthorityState::Restoring(owner, saved)) if owner == identity => saved,
-            Some(PageAuthorityState::Uncertain(..)) => return Err(SharedPageLeaseError::Uncertain),
+            Some(PageAuthorityState::Uncertain(..)
+                | PageAuthorityState::UncertainReservation(..)) => return Err(SharedPageLeaseError::Uncertain),
             Some(_) => return Err(SharedPageLeaseError::NotDisplaced),
             None => return Err(SharedPageLeaseError::Empty),
         };
@@ -368,7 +463,8 @@ impl<const N: usize> SharedPageAuthority<N> {
                 self.current = None;
                 Ok(())
             }
-            Some(PageAuthorityState::Uncertain(..)) => Err(SharedPageLeaseError::Uncertain),
+            Some(PageAuthorityState::Uncertain(..)
+                | PageAuthorityState::UncertainReservation(..)) => Err(SharedPageLeaseError::Uncertain),
             Some(_) => Err(SharedPageLeaseError::NotTop),
             None => Err(SharedPageLeaseError::Empty),
         }

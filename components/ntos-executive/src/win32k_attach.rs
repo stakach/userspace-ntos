@@ -2,7 +2,7 @@
 use super::*;
 use nt_memory_manager::alias_transition::AliasTransitionIo;
 use nt_memory_manager::retained_alias::AliasRetirementIo;
-use nt_user_host::client_alias_window::WindowOwner;
+use nt_user_host::client_alias_window::{WindowOwner, WindowSelectionEffect};
 use nt_user_host::process_identity::ProcessGeneration;
 use nt_user_host::thread_alias_journal::ThreadAliasMapping as Mapping;
 
@@ -218,13 +218,17 @@ pub(crate) unsafe fn detach_attached_client_process(owner: WindowOwner) -> Resul
 }
 
 pub(crate) unsafe fn w32_client_attach(owner: WindowOwner) -> bool {
+    w32_client_attach_effect(owner).is_applied()
+}
+
+pub(crate) unsafe fn w32_client_attach_effect(owner: WindowOwner) -> WindowSelectionEffect {
     if !owner.is_valid() || owner.vspace != WIN32K_HOST_PML4.load(Ordering::Acquire) {
-        return false;
+        return WindowSelectionEffect::RefusedNoEffect;
     }
     let prev = attached_owner();
     let mappings = &*core::ptr::addr_of!(MAPPINGS);
     if prev.is_none() && !mappings.is_empty() {
-        return false;
+        return WindowSelectionEffect::RefusedNoEffect;
     }
     if mappings.iter().any(|mapping| {
         mapping.is_claimed()
@@ -232,7 +236,7 @@ pub(crate) unsafe fn w32_client_attach(owner: WindowOwner) -> bool {
                 hosted_thread_memory_access(old.pi as u64, mapping.page(), 4096).is_err()
             })
     }) {
-        return false;
+        return WindowSelectionEffect::RefusedNoEffect;
     }
     #[cfg(feature = "debug-trace")]
     let detached = mappings.len();
@@ -249,7 +253,7 @@ pub(crate) unsafe fn w32_client_attach(owner: WindowOwner) -> bool {
                 })
                 .is_err()
             {
-                return false;
+                return WindowSelectionEffect::Uncertain;
             }
             if mappings[index].is_empty() {
                 mappings.swap_remove(index);
@@ -257,11 +261,15 @@ pub(crate) unsafe fn w32_client_attach(owner: WindowOwner) -> bool {
                 index += 1;
             }
         }
-        return true;
+        return WindowSelectionEffect::Applied;
     }
     if let Some(old) = prev {
-        if old.pi == owner.pi || detach_attached_client_process(old).is_err() {
-            return false;
+        if old.pi == owner.pi {
+            return WindowSelectionEffect::RefusedNoEffect;
+        }
+        if detach_attached_client_process(old).is_err() {
+            // A prior page may already have been detached. The retained journal decides recovery.
+            return WindowSelectionEffect::Uncertain;
         }
     }
     #[cfg(feature = "debug-trace")]
@@ -276,7 +284,7 @@ pub(crate) unsafe fn w32_client_attach(owner: WindowOwner) -> bool {
     }
     *core::ptr::addr_of_mut!(ATTACHED_OWNER) = Some(owner);
     ATTACH_SWITCHES.fetch_add(1, Ordering::Relaxed);
-    true
+    WindowSelectionEffect::Applied
 }
 
 pub(crate) unsafe fn map_csrss_page_into_win32k(

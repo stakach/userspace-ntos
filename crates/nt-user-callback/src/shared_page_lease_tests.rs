@@ -179,7 +179,89 @@ fn only_live_exact_terminal_child_can_finish_without_publication() {
     assert_eq!(leases.finish(outer, None), Ok(saved));
 }
 
+#[derive(Debug)]
 struct ReplyToken(core::cell::Cell<u64>);
+
+fn provisional(owner: SharedPageLeaseIdentity, request_kind: u64) -> SharedPageProvisionalIdentity {
+    SharedPageProvisionalIdentity {
+        dispatch_id: owner.dispatch.dispatch_id,
+        client: owner.client,
+        request_ssn: owner.dispatch.ssn,
+        request_kind,
+    }
+}
+
+#[test]
+fn provisional_owner_fences_writes_before_a_physical_lane_exists() {
+    let parent = identity(91, 1);
+    let child = identity(92, 1);
+    let saved = snapshot(parent, 4655);
+    let candidate = provisional(child, 0);
+    let mut page = SharedPageAuthority::<2>::new();
+    page.enter(parent, ReplyToken(core::cell::Cell::new(91))).unwrap();
+    page.capture_and_park(parent, saved).unwrap();
+
+    let reply = page.reserve(candidate, ReplyToken(core::cell::Cell::new(92))).unwrap();
+    assert_eq!(reply.0.get(), 92);
+    let (_, refused) = page.enter(identity(93, 1), ReplyToken(core::cell::Cell::new(93)))
+        .err().expect("no writer can enter during pre-lane effects");
+    assert_eq!(refused.0.get(), 93);
+    assert_eq!(page.reacquire(parent), Err(SharedPageLeaseError::NotTop));
+
+    let mut wrong_lane_owner = child;
+    wrong_lane_owner.client.generation = 2;
+    assert_eq!(page.promote(candidate, wrong_lane_owner),
+        Err(SharedPageLeaseError::InvalidIdentity));
+    assert_eq!(page.promote(candidate, child), Ok(()));
+    assert_eq!(page.finish_active(child), Ok(()));
+    assert_eq!(page.reacquire(parent), Ok(saved));
+}
+
+#[test]
+fn provisional_cancellation_requires_certified_no_effect_and_preserves_reply() {
+    let first = provisional(identity(91, 1), 0);
+    let second = provisional(identity(92, 1), 0);
+    let mut page = SharedPageAuthority::<1>::new();
+    page.reserve(first, ReplyToken(core::cell::Cell::new(91))).unwrap();
+    assert_eq!(page.cancel_reservation(second, SharedPageReservationEffect::NoEffect),
+        Err(SharedPageLeaseError::NotTop));
+    let (_, reply) = page.reserve(second, ReplyToken(core::cell::Cell::new(92)))
+        .err().expect("the first reservation retains the physical page");
+    assert_eq!(reply.0.get(), 92);
+    assert_eq!(page.cancel_reservation(first, SharedPageReservationEffect::NoEffect), Ok(()));
+    assert_eq!(page.reserve(second, reply).unwrap().0.get(), 92);
+    assert_eq!(page.cancel_reservation(second, SharedPageReservationEffect::Applied),
+        Err(SharedPageLeaseError::Uncertain));
+    assert_eq!(page.promote(second, identity(92, 1)), Err(SharedPageLeaseError::Uncertain));
+    assert_eq!(page.cancel_reservation(second, SharedPageReservationEffect::NoEffect),
+        Err(SharedPageLeaseError::Uncertain));
+    assert_eq!(page.reserve(first, ReplyToken(core::cell::Cell::new(91))).err().unwrap().1.0.get(), 91);
+}
+
+#[test]
+fn provisional_promotion_requires_exact_request_and_dispatch_identity() {
+    let owner = identity(91, 1);
+    let candidate = provisional(owner, 0);
+    let mut page = SharedPageAuthority::<1>::new();
+    page.reserve(candidate, ReplyToken(core::cell::Cell::new(91))).unwrap();
+    let mut wrong_kind = candidate;
+    wrong_kind.request_kind += 1;
+    assert_eq!(page.promote(wrong_kind, owner), Err(SharedPageLeaseError::NotTop));
+    let mut wrong_ssn = owner;
+    wrong_ssn.dispatch.ssn += 1;
+    assert_eq!(page.promote(candidate, wrong_ssn), Err(SharedPageLeaseError::InvalidIdentity));
+    let mut wrong_dispatch = owner;
+    wrong_dispatch.dispatch.dispatch_id += 1;
+    assert_eq!(page.promote(candidate, wrong_dispatch), Err(SharedPageLeaseError::InvalidIdentity));
+    assert_eq!(page.promote(candidate, owner), Ok(()));
+    assert_eq!(page.finish_active(owner), Ok(()));
+
+    let mut invalid = candidate;
+    invalid.dispatch_id = 0;
+    let (_, reply) = page.reserve(invalid, ReplyToken(core::cell::Cell::new(92)))
+        .err().expect("zero dispatch identity cannot reserve the page");
+    assert_eq!(reply.0.get(), 92);
+}
 
 #[test]
 fn global_page_owner_parks_a_full_publication_before_foreign_header_write() {

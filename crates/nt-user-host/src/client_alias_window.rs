@@ -24,6 +24,21 @@ pub enum WindowState {
     Blocked,
 }
 
+/// What a client-window selection established. An uncertain native transition must retain its
+/// mapping authority until the caller can recover the exact retained aliases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowSelectionEffect {
+    Applied,
+    RefusedNoEffect,
+    Uncertain,
+}
+
+impl WindowSelectionEffect {
+    pub const fn is_applied(self) -> bool {
+        matches!(self, Self::Applied)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowError {
     InvalidOwner,

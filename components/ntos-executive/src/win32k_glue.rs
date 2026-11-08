@@ -1978,34 +1978,47 @@ fn authenticated_client_window_owner(
 }
 
 pub(crate) unsafe fn select_win32k_client_window(client: Win32kClientContext) -> bool {
+    select_win32k_client_window_effect(client).is_applied()
+}
+
+/// Preserve the transition outcome until a caller has decided how to retain an uncertain window.
+pub(crate) unsafe fn select_win32k_client_window_effect(
+    client: Win32kClientContext,
+) -> nt_user_host::client_alias_window::WindowSelectionEffect {
+    use nt_user_host::client_alias_window::WindowSelectionEffect;
     let Some(owner) = authenticated_client_window_owner(client) else {
-        return false;
+        return WindowSelectionEffect::RefusedNoEffect;
     };
     match client.logical_caller {
-        Some(caller) => process_attach_root::select_effective_client(caller, owner),
-        None => w32_client_attach(owner),
+        Some(caller) => process_attach_root::select_effective_client_effect(caller, owner),
+        None => w32_client_attach_effect(owner),
     }
 }
 
-unsafe fn grant_win32k_client_ps_bodies(client: Win32kClientContext) -> Result<(), u32> {
+unsafe fn grant_win32k_client_ps_bodies(
+    client: Win32kClientContext,
+) -> Result<nt_user_callback::SharedPageReservationEffect,
+    (u32, nt_user_callback::SharedPageReservationEffect)> {
+    use nt_user_callback::SharedPageReservationEffect;
+    let mut effect = SharedPageReservationEffect::NoEffect;
     let Some(caller) = client.logical_caller else {
         return if client.tid == 0 && client.tcb == 0 {
-            Ok(())
+            Ok(effect)
         } else {
-            Err(nt_process::STATUS_INVALID_PARAMETER)
+            Err((nt_process::STATUS_INVALID_PARAMETER, effect))
         };
     };
     let catalog = (&*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS))
         .identity()
-        .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        .ok_or((nt_process::STATUS_INVALID_PARAMETER, effect))?;
     let domain = crate::current_win32k_provider_domain()
-        .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        .ok_or((nt_process::STATUS_INVALID_PARAMETER, effect))?;
     let provider = crate::ps_object_provider::ProviderRoot::new(
         catalog,
         domain,
         WIN32K_HOST_PML4.load(Ordering::Acquire),
-    )?;
-    crate::service_sec_image::with_provider_process_manager(|pm| {
+    ).map_err(|status| (status, effect))?;
+    let result = crate::service_sec_image::with_provider_process_manager(|pm| {
         let lifetime = caller.thread();
         if pm.thread_lifetime(lifetime.thread_id()) != Some(lifetime)
             || pm.process_kernel_object(lifetime.process_id()) != Some(client.eprocess)
@@ -2015,6 +2028,8 @@ unsafe fn grant_win32k_client_ps_bodies(client: Win32kClientContext) -> Result<(
         }
         use crate::ps_object_backing::PublishedBody;
         for body in [PublishedBody::Process, PublishedBody::Thread] {
+            // map_alias may retain a partial alias or newly built paging tables on failure.
+            effect = SharedPageReservationEffect::Uncertain;
             crate::ps_object_backing::grant_published_body(
                 pm,
                 lifetime,
@@ -2022,9 +2037,11 @@ unsafe fn grant_win32k_client_ps_bodies(client: Win32kClientContext) -> Result<(
                 provider,
                 crate::ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
             )?;
+            effect = SharedPageReservationEffect::Applied;
         }
         Ok(())
-    })
+    });
+    result.map(|()| effect).map_err(|status| (status, effect))
 }
 
 fn win32k_dispatch_client_identity(
