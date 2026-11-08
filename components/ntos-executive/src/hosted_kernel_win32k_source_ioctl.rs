@@ -214,6 +214,7 @@ struct Work {
     terminal_claimed: bool,
     terminal_published: bool,
     terminal_packet: Option<super::hosted_source_terminal_packet::RetainedTerminalPacket>,
+    terminal_traced: bool,
     terminal_acknowledged: bool,
     origin_committed: bool,
     discarding: bool,
@@ -231,6 +232,7 @@ struct Work {
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static mut EXECUTING: Vec<usize> = Vec::new();
 static CURSOR: AtomicU64 = AtomicU64::new(0);
+static TERMINAL_OWNER_TRACES: AtomicU64 = AtomicU64::new(0);
 
 struct MonitorArrayRow {
     token: u64,
@@ -445,7 +447,8 @@ pub(crate) unsafe fn submit(
         pool_map_handled: false,
         monitor_source: None, monitor_projected: None,
         terminal_claimed: false, terminal_published: false,
-        terminal_packet: None, terminal_acknowledged: false, origin_committed: false, discarding: false,
+        terminal_packet: None, terminal_traced: false,
+        terminal_acknowledged: false, origin_committed: false, discarding: false,
         event_claimed: false, event_signaled: false, event_barrier: None, ack_claimed: false,
         cancel_requested: false, cancellation_terminal: false,
         resources_claimed: false, resources_committed: false, indeterminate: false,
@@ -811,6 +814,22 @@ impl Work {
         let transport = self.terminal_packet.as_mut().expect("retained IOCTL terminal transport");
         let ready = if self.discarding { transport.publish() }
             else { transport.prepare(crate::win32k_glue::dispatch_source_ioctl_terminal) };
+        if !self.terminal_traced {
+            if let Some(address) = transport.packet_address() {
+                self.terminal_traced = true;
+                if TERMINAL_OWNER_TRACES.fetch_add(1, Ordering::Relaxed) < 512 {
+                    print_str(b"[source-ioctl-terminal-owner] packet/nonce/token/source/ticket/gen/code/lane/epoch/reply/status/info=");
+                    for value in [address, self.nonce, self.token, self.source_address,
+                        self.source_ticket, self.source_generation, u64::from(self.code),
+                        self.dispatch.lane().index as u64, self.dispatch.epoch(), self.reply,
+                        u64::from(status), information] {
+                        print_str(b"/");
+                        print_hex_u64(value);
+                    }
+                    print_str(b"\n");
+                }
+            }
+        }
         if !ready { self.indeterminate |= transport.indeterminate(); return false; }
         if self.discarding { return true; }
         let expected = wire::SourceIoctlTerminalHandoff {

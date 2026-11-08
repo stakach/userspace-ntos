@@ -31,6 +31,10 @@ impl RetainedTerminalPacket {
         self.prepare == PreparePhase::Indeterminate || self.commit == Phase::Indeterminate
     }
 
+    pub(super) fn packet_address(&self) -> Option<u64> {
+        self.allocation.map(|allocation| allocation.packet_lease().address())
+    }
+
     pub(super) fn progress(&self) -> u64 {
         1 + (self.prepare as u64) + ((self.commit as u64) << 8)
             + ((self.allocation.is_some() as u64) << 16)
