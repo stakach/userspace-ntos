@@ -10772,6 +10772,22 @@ pub(crate) unsafe fn service_sec_image(
             m3 = received.5;
             continue;
         }
+        if badge != DELAY_TIMER_BADGE
+            && hosted_irq_lines_from_badge(badge) == 0
+            && !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+            && crate::spawn_hosts::shared_ingress::owner::runtime::is_win32k_native_call(mi, m0)
+            && component_shared_publication_is_busy()
+        {
+            // Maintenance above may have selected a returned Receive owner after this Call was
+            // imported. Move the still-unexecuted original Call and Reply back to its ingress
+            // row before fault-frame or win32k shared-page staging can overwrite either owner.
+            crate::spawn_hosts::shared_ingress::owner::runtime::defer_hosted_delivery(
+                REPLY_MAIN_SLOT.load(Ordering::Relaxed), badge,
+            ).expect("busy win32k Call retains its original physical ingress owner");
+            let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+            (badge, mi, m0, m1, m2, m3) = received;
+            continue 'service_loop;
+        }
         ingress = if badge == DELAY_TIMER_BADGE || hosted_irq_lines_from_badge(badge) != 0 {
             None
         } else {

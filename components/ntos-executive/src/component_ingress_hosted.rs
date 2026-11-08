@@ -1,7 +1,7 @@
 //! Hosted-user Calls retain independent thread identity beside component dispatch ownership.
 
 use super::*;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 use nt_component_suspension::{ExternalAdmissionKey, ExternalIngress, ReplyBindingObservation};
 type Binding = nt_user_host::thread_binding::ThreadBinding<crate::HostedThreadRole>;
 
@@ -69,6 +69,27 @@ struct HostedCall {
     root_ingress: Option<RootIngressOwner>,
 }
 static mut CALLS: Vec<Option<HostedCall>> = Vec::new();
+static BUSY_WIN32K_RETAIN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn trace_busy_win32k_retention(stage: &[u8], call: &ExternalIngress<ReceivedMessage>) {
+    let count = BUSY_WIN32K_RETAIN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 8 || count.is_power_of_two() {
+        print_str(b"[win32k-busy-retain] stage/count/reply/ssn=");
+        print_str(stage);
+        for value in [count, call.reply(), call.message().registers()[0]] {
+            print_str(b"/");
+            crate::print_hex_u64(value);
+        }
+        print_str(b"\n");
+    }
+}
+
+/// The native syscall transport carries the original shadow-table number in MR0. Classify
+/// before staging mutable fault-frame or shared-page words, using the retained Call message.
+pub(crate) fn is_win32k_native_call(info: u64, ssn: u64) -> bool {
+    (info >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL
+        && ssn >= crate::win32k_subsystem::WIN32K_SERVICE_BASE
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PendingSnapshot {
@@ -269,6 +290,17 @@ pub(crate) unsafe fn take_hosted_with(
                     return None;
                 }
                 let call = row.call.as_ref().filter(|call| call.can_park())?;
+                if !pending_receive
+                    && crate::service_sec_image::component_shared_publication_is_busy()
+                    && is_win32k_native_call(
+                        call.message().info(), call.message().registers()[0],
+                    )
+                {
+                    // The original Call and Reply stay in this undelivered row. Other hosted
+                    // work can still run while the shared publication is being settled.
+                    trace_busy_win32k_retention(b"undelivered", call);
+                    return None;
+                }
                 if pending_receive {
                     let receive = row.receive_settlement.as_ref()?;
                     if receive.transferred
@@ -605,10 +637,18 @@ pub(crate) unsafe fn defer_hosted_delivery(reply: u64, badge: u64) -> Result<(),
         .as_ref()
         .unwrap()
         .binding;
+    let busy_win32k = crate::service_sec_image::component_shared_publication_is_busy()
+        && (&*core::ptr::addr_of!(CALLS))[index]
+            .as_ref()
+            .and_then(|row| row.call.as_ref())
+            .is_some_and(|call| is_win32k_native_call(
+                call.message().info(), call.message().registers()[0],
+            ));
     // A Receive child can become selected while root redrives an already delivered,
     // unrelated Call. Return that untouched Call to its exact ingress owner first.
     if !crate::writable_fs::registry_journal::owns_volume()
         && (!receive_child_pending() || receive_child_is_current(binding, reply))
+        && !busy_win32k
     {
         return Err(Error::PhysicalIdentity);
     }
@@ -634,6 +674,12 @@ pub(crate) unsafe fn defer_hosted_delivery(reply: u64, badge: u64) -> Result<(),
         .as_mut()
         .unwrap()
         .delivered = false;
+    if busy_win32k {
+        if let Some(call) = (&*core::ptr::addr_of!(CALLS))[index]
+            .as_ref().and_then(|row| row.call.as_ref()) {
+            trace_busy_win32k_retention(b"returned", call);
+        }
+    }
     if !crate::wait_reply_pool_clear_cap(pool_index) {
         return Err(Error::Reply);
     }

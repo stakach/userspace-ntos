@@ -92,6 +92,7 @@ static USER_CALLBACK_CONTINUATION_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_NESTED_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_NESTED_SSN_1298: AtomicU64 = AtomicU64::new(0);
 static WIN32K_WINDOW_EXTRA_INGRESS_TRACES: AtomicU64 = AtomicU64::new(0);
+static WIN32K_BUSY_INGRESS_TRACES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_NESTED_SSN_126B: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_SEQUENCE_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 /// Bitmask of client `pi`s whose callback-running thread has DIED (crash-park / critical
@@ -7295,10 +7296,21 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         }
         print_str(b"\n");
     }
-    if crate::service_sec_image::component_shared_publication_is_busy()
-        || !win32k_client_context_is_admitted(client)
-        || !callback_client_can_enter_nested(client)
-    {
+    let shared_busy = crate::service_sec_image::component_shared_publication_is_busy();
+    let busy_count = shared_busy.then(||
+        WIN32K_BUSY_INGRESS_TRACES.fetch_add(1, Ordering::Relaxed) + 1
+    );
+    if busy_count.is_some_and(|count| count <= 8 || count.is_power_of_two()) {
+        print_str(b"[win32k-busy-ingress] count/pi/tid/ssn/active=");
+        for value in [busy_count.unwrap(), client.pi as u64, client.tid, ssn,
+            core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH)).dispatch_id] {
+            print_str(b"/");
+            print_hex_u64(value);
+        }
+        print_str(b"\n");
+    }
+    if shared_busy || !win32k_client_context_is_admitted(client)
+        || !callback_client_can_enter_nested(client) {
         return (0xC000_000Du64, false);
     }
     if WIN32K_RETIRED.load(Ordering::Relaxed) != 0 {
