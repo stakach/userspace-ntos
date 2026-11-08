@@ -8893,6 +8893,21 @@ impl ExecNtHandler {
         )
     }
 
+    /// Re-admit the syscall's captured ingress badge before reading its retained placement.
+    /// `NativeCallContext` still carries synthetic process/thread IDs for legacy table calls.
+    fn known_current_caller_physical_core(&self) -> Result<u8, u32> {
+        use nt_user_host::thread_physical_placement::PlacementError;
+        let caller = self.admit_hosted_thread_ingress(self.current_badge)
+            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+        if caller.pi != self.pi || caller.tid != self.current_tid {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        self.known_hosted_thread_physical_core(caller).map_err(|error| match error {
+            PlacementError::Busy | PlacementError::Uncertain => nt_process::STATUS_DEVICE_BUSY,
+            _ => nt_process::STATUS_INVALID_HANDLE,
+        })
+    }
+
     pub(crate) fn reserve_hosted_thread_runtime(
         &mut self,
         pi: usize,
@@ -33429,6 +33444,24 @@ impl ExecNtHandler {
         _out: &mut alloc::vec::Vec<u8>,
     ) -> u32 {
         match ctx.service {
+            NativeService::NtGetCurrentProcessorNumber => {
+                self.known_current_caller_physical_core().map_or_else(|status| status, u32::from)
+            }
+            NativeService::NtGetCurrentProcessorNumberEx => {
+                let core = match self.known_current_caller_physical_core() {
+                    Ok(core) => core,
+                    Err(status) => return status,
+                };
+                let Some(number) = nt_kernel_exec::processor_topology::processor_number_for_index(
+                    SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed), u32::from(core),
+                ) else {
+                    return nt_process::STATUS_INVALID_PARAMETER;
+                };
+                if !unsafe { self.xas_try_write_buf(args[0], &number.to_le_bytes()) } {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                nt_process::STATUS_SUCCESS
+            }
             // Close the caller's canonical table entry, or a separately owned LPC/USER handle.
             // Image bookkeeping is also consulted for a stale table handle because it retains
             // the original File/Section identity until the matching close is observed.

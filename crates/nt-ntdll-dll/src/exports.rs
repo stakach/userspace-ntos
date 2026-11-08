@@ -22847,13 +22847,20 @@ pub unsafe extern "system" fn rtl_verify_version_info(
     rtl::status::verify_version_info(&have, &want, type_mask, condition_mask)
 }
 
-/// `RtlGetCurrentProcessorNumber() -> ULONG` — always CPU 0 (single-CPU boot).
+/// `RtlGetCurrentProcessorNumber() -> ULONG` forwards the current caller placement.
 ///
 /// # Safety
 /// Reads no memory.
 #[export_name = "RtlGetCurrentProcessorNumber"]
 pub unsafe extern "system" fn rtl_get_current_processor_number() -> u32 {
-    0
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { nt_ntdll::trap_stubs::nt_get_current_processor_number() as u32 }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        u32::MAX
+    }
 }
 
 /// `RtlGetCurrentProcessorNumberEx(PPROCESSOR_NUMBER)`.
@@ -22862,11 +22869,16 @@ pub unsafe extern "system" fn rtl_get_current_processor_number() -> u32 {
 /// `processor_number` may be null or point to a writable 4-byte `PROCESSOR_NUMBER`.
 #[export_name = "RtlGetCurrentProcessorNumberEx"]
 pub unsafe extern "system" fn rtl_get_current_processor_number_ex(processor_number: *mut c_void) {
-    if processor_number.is_null() {
-        return;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = unsafe {
+            nt_ntdll::trap_stubs::nt_get_current_processor_number_ex(processor_number as u64)
+        };
     }
-    // PROCESSOR_NUMBER = { USHORT Group; UCHAR Number; UCHAR Reserved }. Single-CPU boot => 0/0.
-    unsafe { core::ptr::write_unaligned(processor_number as *mut u32, 0) };
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = processor_number;
+    }
 }
 
 /// `RtlIsProcessorFeaturePresent(ULONG) -> BOOLEAN`.

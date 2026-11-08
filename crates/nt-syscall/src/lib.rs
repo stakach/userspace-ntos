@@ -301,6 +301,10 @@ pub enum NativeService {
     NtWaitForDebugEvent,
     /// Query the Power Manager record for the PDO related to a typed File handle.
     NtGetDevicePowerState,
+    /// Return the physical processor of the authenticated calling thread.
+    NtGetCurrentProcessorNumber,
+    /// Write the calling thread's physical group and processor number.
+    NtGetCurrentProcessorNumberEx,
     /// Track persistent and one-shot execution-state assertions for the current thread.
     NtSetThreadExecutionState,
     /// Track the calling process's contribution to the global wakeup-latency policy.
@@ -517,6 +521,8 @@ impl NativeService {
             NtSetInformationDebugObject => "NtSetInformationDebugObject",
             NtWaitForDebugEvent => "NtWaitForDebugEvent",
             NtGetDevicePowerState => "NtGetDevicePowerState",
+            NtGetCurrentProcessorNumber => "NtGetCurrentProcessorNumber",
+            NtGetCurrentProcessorNumberEx => "NtGetCurrentProcessorNumberEx",
             NtSetThreadExecutionState => "NtSetThreadExecutionState",
             NtRequestWakeupLatency => "NtRequestWakeupLatency",
             NtSetDefaultHardErrorPort => "NtSetDefaultHardErrorPort",
@@ -740,6 +746,8 @@ impl NativeService {
         NativeService::NtAccessCheckByTypeAndAuditAlarm,
         NativeService::NtAccessCheckByTypeResultListAndAuditAlarm,
         NativeService::NtAccessCheckByTypeResultListAndAuditAlarmByHandle,
+        NativeService::NtGetCurrentProcessorNumber,
+        NativeService::NtGetCurrentProcessorNumberEx,
     ];
 }
 
