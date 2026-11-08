@@ -4,13 +4,7 @@ use nt_process::STATUS_INVALID_PARAMETER;
 
 pub const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 
-/// Validate a requested NT affinity against the boot topology and the target thread's actual
-/// bound SC core before a native affinity setter changes Ps policy. This does not migrate the SC.
-pub fn validate_hosted_thread_affinity(
-    requested_mask: u64,
-    active_processor_count: u64,
-    bound_core: u8,
-) -> Result<(), u32> {
+fn validate_online_affinity(requested_mask: u64, active_processor_count: u64) -> Result<(), u32> {
     if !(1..=64).contains(&active_processor_count) {
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -18,12 +12,46 @@ pub fn validate_hosted_thread_affinity(
     if requested_mask == 0 || requested_mask & !active_mask != 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
+    Ok(())
+}
+
+/// Validate a requested NT affinity against the boot topology and the target thread's actual
+/// bound SC core before a native affinity setter changes Ps policy. This does not migrate the SC.
+pub fn validate_hosted_thread_affinity(
+    requested_mask: u64,
+    active_processor_count: u64,
+    bound_core: u8,
+) -> Result<(), u32> {
+    validate_online_affinity(requested_mask, active_processor_count)?;
     if u64::from(bound_core) >= active_processor_count
         || requested_mask & (1u64 << bound_core) == 0
     {
         return Err(STATUS_NOT_SUPPORTED);
     }
     Ok(())
+}
+
+/// Select a configured core from the thread's inherited online affinity before creating its SC.
+/// NT client IDs advance by `CLIENT_ID_GRANULARITY`, so the ordinal must remove that stride
+/// before cycling through the allowed cores. The returned core is only a proposal until native
+/// SchedControl configuration succeeds and the exact runtime owner publishes it.
+pub fn select_guest_worker_core(
+    inherited_mask: u64,
+    active_processor_count: u64,
+    tid: u64,
+) -> Result<u8, u32> {
+    validate_online_affinity(inherited_mask, active_processor_count)?;
+    let granularity = u64::from(nt_process::CLIENT_ID_GRANULARITY);
+    if tid == 0 || tid % granularity != 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let ordinal = tid / granularity - 1;
+    let rank = ordinal % u64::from(inherited_mask.count_ones());
+    let mut eligible = inherited_mask;
+    for _ in 0..rank {
+        eligible &= eligible - 1;
+    }
+    Ok(eligible.trailing_zeros() as u8)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
