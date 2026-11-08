@@ -4,6 +4,9 @@ use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_io_manager::hosted_forward_target::HostedForwardTarget;
 use nt_io_manager::win32k_source_irp_ioctl_wire as wire;
+use nt_io_manager::source_terminal::{
+    NestedSourceDispatchEffect, NestedSourceSelection, NestedSourceWorkKey,
+};
 use nt_io_manager::kernel_irp_builder::{
     validate_kernel_irp_dispatch_cursor, KernelIrpDispatchHeader,
 };
@@ -11,6 +14,42 @@ use nt_io_manager::{WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IRP_SIZE};
 use nt_kernel_exec::{EventLeaseId, EventLeaseKind, EventObjectId, EventSignalMode};
 
 type Route = nt_component_suspension::peer_registry::PeerRoute;
+type NestedIoctlKey = NestedSourceWorkKey<Route, nt_component_suspension::LaneDispatchIdentity>;
+pub(crate) type NestedIoctlSelection =
+    NestedSourceSelection<Route, nt_component_suspension::LaneDispatchIdentity>;
+
+pub(crate) enum NestedIoctlTerminalStep {
+    PreEntryRetained,
+    ReturnedNotReady,
+    ReturnedAwaitingAck,
+    PacketAckRetained,
+    Settled(SettledIoctlTerminal),
+    Indeterminate,
+}
+
+/// The source Work retired its Reply and resource owners after a validated terminal ACK.
+/// Only this move-only result can be considered a completed local child by a parent checkpoint.
+pub(crate) struct SettledIoctlTerminal {
+    key: NestedIoctlKey,
+    ack: super::hosted_source_terminal_packet::ValidatedTerminalAck,
+}
+
+impl SettledIoctlTerminal {
+    pub(crate) fn key(&self) -> NestedIoctlKey { self.key }
+    pub(crate) fn packet(&self) -> nt_io_manager::source_terminal::TerminalPacketIdentity {
+        self.ack.packet()
+    }
+}
+
+// SAFETY: the only constructor is in exact redrive after `Work::advance` returns done. For an
+// inline IOCTL, that requires a decoded matching terminal ACK, origin commit, Reply ACK, resource
+// release, and retirement of the same route/dispatch/Reply/token/source ticket. The ACK alone
+// never implements this trait and cannot authorize parent restoration.
+unsafe impl nt_component_suspension::NestedPreEntryChildReceipt<NestedIoctlKey>
+    for SettledIoctlTerminal
+{
+    fn child_key(&self) -> NestedIoctlKey { self.key }
+}
 const STATUS_CANCELLED: u32 = 0xc000_0120;
 
 struct RootSource {
@@ -216,6 +255,7 @@ struct Work {
     terminal_packet: Option<super::hosted_source_terminal_packet::RetainedTerminalPacket>,
     terminal_traced: bool,
     terminal_acknowledged: bool,
+    terminal_ack_receipt: Option<super::hosted_source_terminal_packet::ValidatedTerminalAck>,
     origin_committed: bool,
     discarding: bool,
     event_claimed: bool,
@@ -448,7 +488,8 @@ pub(crate) unsafe fn submit(
         monitor_source: None, monitor_projected: None,
         terminal_claimed: false, terminal_published: false,
         terminal_packet: None, terminal_traced: false,
-        terminal_acknowledged: false, origin_committed: false, discarding: false,
+        terminal_acknowledged: false, terminal_ack_receipt: None,
+        origin_committed: false, discarding: false,
         event_claimed: false, event_signaled: false, event_barrier: None, ack_claimed: false,
         cancel_requested: false, cancellation_terminal: false,
         resources_claimed: false, resources_committed: false, indeterminate: false,
@@ -510,6 +551,12 @@ pub(super) unsafe fn arm_pending(
 }
 
 impl Work {
+    fn nested_terminal_key(&self) -> Option<NestedIoctlKey> {
+        NestedSourceWorkKey::new(
+            self.route, self.dispatch, self.reply, self.nonce, self.token,
+            self.source_address, self.source_ticket, self.source_generation,
+        )
+    }
     unsafe fn project_monitor_array(&mut self, length: usize) -> bool {
         use nt_io_manager::source_irp_auxiliary::SourcePoolAllocationIdentity;
         use nt_io_manager::video_monitor_array_projection::{
@@ -845,9 +892,11 @@ impl Work {
         };
         let valid = matches!(wire::decode_terminal_ack(self.terminal_packet.as_ref().unwrap().ack()),
             Ok(ack) if ack.handoff == expected && ack.publication == wire::TerminalPublication::Published);
-        if !self.terminal_packet.as_mut().unwrap().acknowledge_prepare(valid) {
-            self.indeterminate = true; return false;
-        }
+        let Some(receipt) = self.terminal_packet.as_mut().unwrap()
+            .acknowledge_prepare_receipt(valid) else {
+                self.indeterminate = true; return false;
+            };
+        self.terminal_ack_receipt = Some(receipt);
         self.terminal_acknowledged = true;
         true
     }
@@ -1153,6 +1202,85 @@ impl Work {
         }
         self.retire()
     }
+}
+
+/// Select the exact retained inline terminal before lending the parent's shared page. The
+/// selection owns Work identity, not a Vec index that can be recycled while the parent parks.
+pub(crate) unsafe fn next_nested_terminal_selection(
+    route: Route,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+    reply: u64,
+) -> Option<NestedIoctlSelection> {
+    (&*core::ptr::addr_of!(WORK)).iter().enumerate().find_map(|(index, row)| {
+        if (&*core::ptr::addr_of!(EXECUTING)).contains(&index) { return None; }
+        let work = row.as_ref()?;
+        if work.route != route || work.dispatch != dispatch || work.reply != reply
+            || work.pending || work.discarding || work.indeterminate
+            || work.terminal.is_none() || work.terminal_acknowledged
+            || !work.ready_for_nested_step()
+        { return None; }
+        work.nested_terminal_key().map(NestedSourceSelection::new)
+    })
+}
+
+/// Drive only the selected Work. The caller retains `selection` on every outcome and may settle
+/// the child only with the move-only receipt issued after Work retirement.
+pub(crate) unsafe fn redrive_selected_nested_terminal(
+    handler: *mut ExecNtHandler,
+    selection: NestedIoctlSelection,
+) -> (NestedIoctlSelection, NestedIoctlTerminalStep) {
+    let _durable = crate::allocator::enter_durable();
+    let index = (&*core::ptr::addr_of!(WORK)).iter().position(|row|
+        row.as_ref().is_some_and(|work| work.nested_terminal_key()
+            .is_some_and(|key| selection.matches(key))));
+    let Some(index) = index else {
+        return (selection, NestedIoctlTerminalStep::Indeterminate);
+    };
+    if (&*core::ptr::addr_of!(EXECUTING)).contains(&index) {
+        return (selection, NestedIoctlTerminalStep::Indeterminate);
+    }
+    if !(&*core::ptr::addr_of!(WORK))[index].as_ref()
+        .is_some_and(|work| work.ready_for_nested_step()) {
+        return (selection, NestedIoctlTerminalStep::PreEntryRetained);
+    }
+    if (&mut *core::ptr::addr_of_mut!(EXECUTING)).try_reserve(1).is_err() {
+        return (selection, NestedIoctlTerminalStep::PreEntryRetained);
+    }
+    let Some(mut work) = (&mut *core::ptr::addr_of_mut!(WORK))[index].take() else {
+        return (selection, NestedIoctlTerminalStep::Indeterminate);
+    };
+    (&mut *core::ptr::addr_of_mut!(EXECUTING)).push(index);
+    let before_attempt = work.terminal_packet.as_ref()
+        .map_or(0, |packet| packet.dispatch_observation().0);
+    let done = work.advance(handler);
+    let observation = work.terminal_packet.as_ref().map(|packet| packet.dispatch_observation());
+    let step = if work.indeterminate
+        || work.terminal_packet.as_ref().is_some_and(|packet| packet.indeterminate()) {
+        NestedIoctlTerminalStep::Indeterminate
+    } else if done {
+        match (work.nested_terminal_key(), work.terminal_ack_receipt.take()) {
+            (Some(key), Some(ack)) => NestedIoctlTerminalStep::Settled(
+                SettledIoctlTerminal { key, ack }),
+            _ => NestedIoctlTerminalStep::Indeterminate,
+        }
+    } else if work.terminal_ack_receipt.is_some() {
+        NestedIoctlTerminalStep::PacketAckRetained
+    } else if let Some((_, effect)) = observation.filter(|(attempt, _)| *attempt > before_attempt) {
+        match effect {
+            NestedSourceDispatchEffect::NotEntered => NestedIoctlTerminalStep::PreEntryRetained,
+            NestedSourceDispatchEffect::ReturnedNotReady => NestedIoctlTerminalStep::ReturnedNotReady,
+            NestedSourceDispatchEffect::ReturnedSuccessNeedsAck =>
+                NestedIoctlTerminalStep::ReturnedAwaitingAck,
+            NestedSourceDispatchEffect::Indeterminate => NestedIoctlTerminalStep::Indeterminate,
+        }
+    } else if work.terminal_packet.as_ref().is_some_and(|packet| packet.awaiting_prepare_ack()) {
+        NestedIoctlTerminalStep::ReturnedAwaitingAck
+    } else {
+        NestedIoctlTerminalStep::PreEntryRetained
+    };
+    if !done { (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work); }
+    assert_eq!((&mut *core::ptr::addr_of_mut!(EXECUTING)).pop(), Some(index));
+    (selection, step)
 }
 
 unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> bool {

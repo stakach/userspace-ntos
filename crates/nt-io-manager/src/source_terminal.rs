@@ -144,6 +144,65 @@ pub struct PreparedTerminal {
     pub inline: bool,
 }
 
+/// The retained source Work row, including its physical provider route and allocation epoch.
+/// A Vec slot or packet address alone can be reused and is not a child identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NestedSourceWorkKey<R, D> {
+    pub route: R,
+    pub dispatch: D,
+    pub reply: u64,
+    pub nonce: u64,
+    pub token: u64,
+    pub source_address: u64,
+    pub source_ticket: u64,
+    pub source_generation: u64,
+}
+
+impl<R, D> NestedSourceWorkKey<R, D> {
+    pub fn new(
+        route: R, dispatch: D, reply: u64, nonce: u64, token: u64,
+        source_address: u64, source_ticket: u64, source_generation: u64,
+    ) -> Option<Self> {
+        if reply == 0 || nonce == 0 || token == 0 || source_address == 0
+            || source_ticket == 0 || source_generation == 0
+        { return None; }
+        Some(Self { route, dispatch, reply, nonce, token, source_address,
+            source_ticket, source_generation })
+    }
+}
+
+/// Move-only preselection. The native owner must redrive this exact row after parking its parent.
+#[must_use = "redrive only the exact retained source child or keep the selection"]
+pub struct NestedSourceSelection<R, D> {
+    key: NestedSourceWorkKey<R, D>,
+}
+
+impl<R: Copy + Eq, D: Copy + Eq> NestedSourceSelection<R, D> {
+    pub fn new(key: NestedSourceWorkKey<R, D>) -> Self { Self { key } }
+    pub fn key(&self) -> NestedSourceWorkKey<R, D> { self.key }
+    pub fn matches(&self, actual: NestedSourceWorkKey<R, D>) -> bool { self.key == actual }
+}
+
+/// This describes only native dispatch entry. `ReturnedSuccessNeedsAck` is not a terminal
+/// completion receipt; the source owner must validate the exact packet ACK separately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NestedSourceDispatchEffect {
+    NotEntered,
+    ReturnedNotReady,
+    ReturnedSuccessNeedsAck,
+    Indeterminate,
+}
+
+impl NestedSourceDispatchEffect {
+    pub fn from_returned(status: i32) -> Self {
+        match status {
+            TERMINAL_NOT_READY => Self::ReturnedNotReady,
+            0 => Self::ReturnedSuccessNeedsAck,
+            _ => Self::Indeterminate,
+        }
+    }
+}
+
 impl PreparedTerminal {
     pub fn matches(
         self,
@@ -219,6 +278,31 @@ mod tests {
         );
         assert!(!TerminalPublication::Discarded.can_follow(Some(TerminalPublication::Published)));
         assert_eq!(TerminalPublication::decode(2, 0), None);
+    }
+
+    #[test]
+    fn nested_source_selection_keeps_exact_child_across_cursor_changes() {
+        let first = NestedSourceWorkKey::new(11u64, 21u64, 31, 41, 51, 61, 71, 81).unwrap();
+        let reused_row = NestedSourceWorkKey::new(11u64, 21u64, 31, 41, 51, 61, 71, 82).unwrap();
+        let other_child = NestedSourceWorkKey::new(12u64, 22u64, 32, 42, 52, 62, 72, 83).unwrap();
+        let selected = NestedSourceSelection::new(first);
+        assert!(selected.matches(first));
+        assert!(!selected.matches(reused_row));
+        assert!(!selected.matches(other_child));
+        assert_eq!(selected.key(), first);
+    }
+
+    #[test]
+    fn nested_source_dispatch_distinguishes_no_entry_returned_retry_and_uncertain() {
+        assert_eq!(NestedSourceDispatchEffect::from_returned(TERMINAL_NOT_READY),
+            NestedSourceDispatchEffect::ReturnedNotReady);
+        assert_eq!(NestedSourceDispatchEffect::from_returned(0),
+            NestedSourceDispatchEffect::ReturnedSuccessNeedsAck);
+        assert_eq!(NestedSourceDispatchEffect::from_returned(0xc000_0001u32 as i32),
+            NestedSourceDispatchEffect::Indeterminate);
+        assert_ne!(NestedSourceDispatchEffect::NotEntered,
+            NestedSourceDispatchEffect::ReturnedNotReady);
+        assert!(NestedSourceWorkKey::new(11u64, 21u64, 0, 41, 51, 61, 71, 81).is_none());
     }
 
     #[test]

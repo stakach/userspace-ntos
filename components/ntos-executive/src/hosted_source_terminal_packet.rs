@@ -4,13 +4,23 @@ use super::*;
 use crate::win32k_subsystem::{RootPoolError, RootProviderPoolAllocation};
 use nt_io_manager::source_terminal::{
     same_terminal_packet, OriginCommitObservation as Observation, OriginCommitPhase as Phase,
-    TerminalPublication, TERMINAL_NOT_READY,
+    NestedSourceDispatchEffect, TerminalPacketIdentity, TerminalPublication,
 };
 
 type Dispatch = unsafe fn(u64, u64) -> crate::win32k_glue::SourcePnpTerminalDispatch;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PreparePhase { Publish, Dispatch, ReadAck, Published, Indeterminate }
+
+/// Issued once by the retained transport only after the source owner validates the exact ACK.
+/// The transport continues to own its pinned packet until origin retirement acknowledges.
+pub(super) struct ValidatedTerminalAck {
+    packet: TerminalPacketIdentity,
+}
+
+impl ValidatedTerminalAck {
+    pub(super) fn packet(&self) -> TerminalPacketIdentity { self.packet }
+}
 
 pub(super) struct RetainedTerminalPacket {
     allocation: Option<RootProviderPoolAllocation>,
@@ -19,12 +29,15 @@ pub(super) struct RetainedTerminalPacket {
     commit: Phase,
     command: Option<(bool, u64, usize, Vec<u8>)>,
     ack: Option<Vec<u8>>,
+    dispatch_attempts: u64,
+    last_dispatch: NestedSourceDispatchEffect,
 }
 
 impl RetainedTerminalPacket {
     pub(super) fn new(encoded: Vec<u8>) -> Self {
         Self { allocation: None, encoded, prepare: PreparePhase::Publish,
-            commit: Phase::CaptureBefore, command: None, ack: None }
+            commit: Phase::CaptureBefore, command: None, ack: None,
+            dispatch_attempts: 0, last_dispatch: NestedSourceDispatchEffect::NotEntered }
     }
 
     pub(super) fn indeterminate(&self) -> bool {
@@ -33,6 +46,24 @@ impl RetainedTerminalPacket {
 
     pub(super) fn packet_address(&self) -> Option<u64> {
         self.allocation.map(|allocation| allocation.packet_lease().address())
+    }
+
+    pub(super) fn dispatch_observation(&self) -> (u64, NestedSourceDispatchEffect) {
+        (self.dispatch_attempts, self.last_dispatch)
+    }
+
+    pub(super) fn awaiting_prepare_ack(&self) -> bool {
+        self.prepare == PreparePhase::ReadAck
+    }
+
+    fn packet_identity(&self) -> Option<TerminalPacketIdentity> {
+        let lease = self.allocation?.packet_lease();
+        let allocation = lease.native_identity();
+        Some(TerminalPacketIdentity {
+            address: lease.address(), length: self.encoded.len() as u64,
+            allocation_id: allocation.allocation_id,
+            allocation_generation: allocation.allocation_generation,
+        })
     }
 
     pub(super) fn progress(&self) -> u64 {
@@ -74,15 +105,30 @@ impl RetainedTerminalPacket {
         let lease = self.allocation.expect("owned terminal packet").packet_lease();
         if self.prepare == PreparePhase::Dispatch {
             if !crate::win32k_glue::source_terminal_dispatch_ready() { return false; }
-            match dispatch(lease.address(), self.encoded.len() as u64) {
-                crate::win32k_glue::SourcePnpTerminalDispatch::NotEntered(_) => return false,
-                crate::win32k_glue::SourcePnpTerminalDispatch::Returned(status)
-                    if status == TERMINAL_NOT_READY => return false,
-                crate::win32k_glue::SourcePnpTerminalDispatch::Returned(0) => {
+            let Some(attempt) = self.dispatch_attempts.checked_add(1) else {
+                self.prepare = PreparePhase::Indeterminate;
+                return false;
+            };
+            self.dispatch_attempts = attempt;
+            let observed = dispatch(lease.address(), self.encoded.len() as u64);
+            self.last_dispatch = match observed {
+                crate::win32k_glue::SourcePnpTerminalDispatch::NotEntered(_) =>
+                    NestedSourceDispatchEffect::NotEntered,
+                crate::win32k_glue::SourcePnpTerminalDispatch::Indeterminate(_) =>
+                    NestedSourceDispatchEffect::Indeterminate,
+                crate::win32k_glue::SourcePnpTerminalDispatch::Returned(status) =>
+                    NestedSourceDispatchEffect::from_returned(status),
+            };
+            match self.last_dispatch {
+                NestedSourceDispatchEffect::NotEntered
+                    | NestedSourceDispatchEffect::ReturnedNotReady => return false,
+                NestedSourceDispatchEffect::ReturnedSuccessNeedsAck => {
                     // Record native success BEFORE any fallible local pool readback.
                     self.prepare = PreparePhase::ReadAck;
                 }
-                _ => { self.prepare = PreparePhase::Indeterminate; return false; }
+                NestedSourceDispatchEffect::Indeterminate => {
+                    self.prepare = PreparePhase::Indeterminate; return false;
+                }
             }
         }
         if self.prepare == PreparePhase::ReadAck && self.ack.is_none() {
@@ -102,6 +148,14 @@ impl RetainedTerminalPacket {
         self.prepare = PreparePhase::Published;
         self.ack = None;
         true
+    }
+
+    pub(super) fn acknowledge_prepare_receipt(&mut self, valid: bool)
+        -> Option<ValidatedTerminalAck>
+    {
+        let packet = self.packet_identity()?;
+        self.acknowledge_prepare(valid)
+            .then_some(ValidatedTerminalAck { packet })
     }
 
     fn observe(&mut self, observation: Observation) {

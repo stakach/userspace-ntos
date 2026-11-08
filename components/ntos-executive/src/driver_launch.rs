@@ -66914,6 +66914,22 @@ pub(crate) unsafe fn redrive_nested_win32k_source_work(handler: *mut ExecNtHandl
     ioctl || pnp || fsd
 }
 
+pub(crate) unsafe fn select_nested_win32k_source_ioctl_terminal(
+    route: nt_component_suspension::peer_registry::PeerRoute,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+    reply: u64,
+) -> Option<hosted_kernel_win32k_source_ioctl::NestedIoctlSelection> {
+    hosted_kernel_win32k_source_ioctl::next_nested_terminal_selection(route, dispatch, reply)
+}
+
+pub(crate) unsafe fn redrive_selected_win32k_source_ioctl_terminal(
+    handler: *mut ExecNtHandler,
+    selection: hosted_kernel_win32k_source_ioctl::NestedIoctlSelection,
+) -> (hosted_kernel_win32k_source_ioctl::NestedIoctlSelection,
+      hosted_kernel_win32k_source_ioctl::NestedIoctlTerminalStep) {
+    hosted_kernel_win32k_source_ioctl::redrive_selected_nested_terminal(handler, selection)
+}
+
 pub(crate) unsafe fn redrive_nested_hosted_kernel_file_read_query(
     handler: *mut ExecNtHandler,
 ) -> bool {
