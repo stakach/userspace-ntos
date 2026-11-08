@@ -15672,6 +15672,51 @@ impl ExecNtHandler {
         }
     }
 
+    /// Admit the target ETHREAD's actual SC placement before changing its Ps affinity mask.
+    /// A dormant thread has no physical owner yet; a live or unsettled runtime must never be
+    /// treated as dormant merely because its placement cannot currently be queried.
+    fn validate_thread_physical_affinity(
+        &self,
+        tid: nt_process::ThreadId,
+        requested_mask: u64,
+    ) -> Result<(), u32> {
+        use nt_user_host::thread_physical_placement::PlacementError;
+        let active_count = SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed);
+        nt_user_host::sched_context::validate_online_affinity(requested_mask, active_count)?;
+        let lifetime = self.pm.thread_lifetime(tid).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let pi = self.pi_for_pid(lifetime.process_id())
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let process = self.capture_thread_process_identity(pi, u64::from(tid))
+            .filter(|process| process.pid == lifetime.process_id())
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let mechanism = self.hosted_thread_mechanism_for_tid(u64::from(tid));
+        let Some(runtime) = self.thread_runtime.get_by_tid(u64::from(tid)) else {
+            let thread = self.pm.thread(tid).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+            if mechanism.is_some()
+                || !matches!(thread.state,
+                    nt_process::ThreadState::Initialized | nt_process::ThreadState::Terminated)
+            {
+                return Err(nt_process::STATUS_DEVICE_BUSY);
+            }
+            return Ok(());
+        };
+        if runtime.pi != pi || runtime.process != process
+            || mechanism.is_none_or(|mechanism| mechanism.pi != pi)
+            || !self.pm.validate_thread_lifetime(lifetime)
+        {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        let core = self.thread_runtime
+            .known_physical_core(runtime.binding(), runtime.mechanism.sched_context)
+            .map_err(|error| match error {
+                PlacementError::Busy | PlacementError::Uncertain => nt_process::STATUS_DEVICE_BUSY,
+                _ => nt_process::STATUS_INVALID_HANDLE,
+            })?;
+        nt_user_host::sched_context::validate_hosted_thread_affinity(
+            requested_mask, active_count, core,
+        )
+    }
+
     pub(crate) fn set_thread_information_captured(
         &mut self,
         handle: u64,
@@ -15706,7 +15751,7 @@ impl ExecNtHandler {
                 self.pm.set_thread_priority(tid, priority)
             }
             3 => self.pm.set_thread_base_priority(tid, value as u32 as i32),
-            4 => thread_sched_context::validate_guest_affinity(value)
+            4 => self.validate_thread_physical_affinity(tid, value)
                 .and_then(|()| self.pm.set_thread_affinity_mask(tid, value)),
             9 => self.pm.set_thread_win32_start_address(tid, value),
             13 => {
@@ -26565,6 +26610,35 @@ impl ExecNtHandler {
             .unwrap_or_else(|status| status)
     }
 
+    /// Job assignment rewrites every member thread's affinity in Ps. Check each exact hosted
+    /// placement before the job commit can exclude its physical core.
+    fn preflight_process_job_physical_affinity(
+        &self,
+        id: nt_process::job::JobId,
+        pid: nt_process::ProcessId,
+        pi: usize,
+    ) -> Result<(), u32> {
+        let limits = self.pm.job_extended_limits(id)?;
+        if limits.basic.limit_flags & nt_process::job::JOB_OBJECT_LIMIT_AFFINITY == 0 {
+            return Ok(());
+        }
+        let mask = limits.basic.affinity;
+        nt_user_host::sched_context::validate_online_affinity(
+            mask, SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed),
+        )?;
+        if self.capture_process_identity(pi).is_none_or(|process| process.pid != pid) {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        let process = self.pm.process(pid).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        for tid in &process.threads {
+            let lifetime = self.pm.thread_lifetime(*tid)
+                .filter(|lifetime| lifetime.process_id() == pid)
+                .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+            self.validate_thread_physical_affinity(lifetime.thread_id(), mask)?;
+        }
+        Ok(())
+    }
+
     fn nt_assign_process_to_job_object(&mut self, args: &[u64]) -> u32 {
         let id = match self.job_id_for_handle(args[0], nt_process::job::JOB_OBJECT_ASSIGN_PROCESS) {
             Ok(id) => id,
@@ -26614,6 +26688,11 @@ impl ExecNtHandler {
             Ok(assignment) => assignment,
             Err(status) => return status,
         };
+        if assignment.status() == 0 {
+            if let Err(status) = self.preflight_process_job_physical_affinity(id, pid, target_pi) {
+                return status;
+            }
+        }
         let working_set_plan = if assignment.status() == 0 {
             let limits = match self.pm.job_extended_limits(id) {
                 Ok(limits) => limits,

@@ -4,7 +4,9 @@ use nt_process::STATUS_INVALID_PARAMETER;
 
 pub const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 
-fn validate_online_affinity(requested_mask: u64, active_processor_count: u64) -> Result<(), u32> {
+/// Validate an affinity mask against configured online processors before a dormant thread has
+/// an SC placement. No physical-core admission is implied until a runtime is published.
+pub fn validate_online_affinity(requested_mask: u64, active_processor_count: u64) -> Result<(), u32> {
     if !(1..=64).contains(&active_processor_count) {
         return Err(STATUS_INVALID_PARAMETER);
     }

@@ -24,6 +24,14 @@ fn hosted_affinity_requires_the_target_bound_core_in_requested_mask() {
 }
 
 #[test]
+fn dormant_thread_affinity_accepts_any_online_core_without_claiming_placement() {
+    assert_eq!(validate_online_affinity(0b10, 4), Ok(()));
+    assert_eq!(validate_online_affinity(0b1000, 4), Ok(()));
+    assert_eq!(validate_online_affinity(0, 4), Err(STATUS_INVALID_PARAMETER));
+    assert_eq!(validate_online_affinity(0b1_0000, 4), Err(STATUS_INVALID_PARAMETER));
+}
+
+#[test]
 fn guest_worker_selection_spreads_four_granular_thread_ids() {
     let selected: Vec<_> = [4, 8, 12, 16]
         .into_iter()
