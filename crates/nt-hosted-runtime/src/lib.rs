@@ -6,6 +6,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 mod hosted_irq_arena;
 mod hosted_irq_cr8_source;
 mod hosted_irq_call_stack;
@@ -124,7 +126,7 @@ pub use setup_read_stage_sample::SetupReadStageSampler;
 pub use hosted_file_phase_diagnostic::{FilePhaseIdentity, FilePhaseCounts, HostedFilePhaseDiagnostic, LocalFilePhaseDurations, LocalFilePhaseMarks, NpfsDispatchDurations, NpfsDispatchMarks, NpfsCallbackDiagnostic, NpfsCallbackIdentity, NpfsCallbackCounts, NpfsMajor, NpfsPoolRetireDurations, NpfsPoolRetireMarks};
 pub use hosted_file_rpc_phase::{HostedFileRpcCounts, HostedFileRpcDiagnostic,
     HostedFileRpcDurations, HostedFileRpcIdentity, HostedFileRpcMarks};
-pub use hosted_install_pipe_diagnostic::{is_install_pipe_name, InstallChildIdentity, InstallPipeCounts, InstallPipeDiagnostic, InstallPipeIdentity, InstallPipeObservation, InstallPipeTerminal};
+pub use hosted_install_pipe_diagnostic::{is_install_pipe_name, InstallChildIdentity, InstallDeviceEnumOpen, InstallPipeCounts, InstallPipeDiagnostic, InstallPipeIdentity, InstallPipeObservation, InstallPipeTerminal};
 pub use native_block_stage_sample::{NativeBlockStageObservation, NativeBlockStageOwner, NativeBlockStageSample,
     NativeBlockStageSampler};
 pub use native_cache_claim_drain::{drain_cached_claims, CacheClaimStep};

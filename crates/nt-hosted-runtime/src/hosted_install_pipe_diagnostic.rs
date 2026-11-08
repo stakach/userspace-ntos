@@ -1,10 +1,13 @@
 //! Temporary, bounded observation of the umpnpmgr install-pipe exchange.
 //! Keys label measurements only; the File and Process managers retain all authority.
 
+use alloc::vec::Vec;
+
 const PIPE_NAME_CAP: usize = 96;
 const DEVICE_UNIT_CAP: usize = 200;
 const BATCH_MARKER: u32 = 0x4843_5442;
 const BATCH_MAX_DEVICES: u32 = 65_536;
+const TRACKED_DEVICE_CAP: usize = 64;
 const PIPE_PREFIX: &[u8] = b"PNP_Device_Install_Pipe_0.";
 const EVENT_PREFIX: &[u8] = b"Global\\PNP_Device_Install_Event_0.";
 
@@ -39,6 +42,14 @@ pub struct InstallPipeTerminal {
     pub exit_status: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstallDeviceEnumOpen {
+    pub pipe: InstallPipeIdentity,
+    pub child: InstallChildIdentity,
+    pub device_ordinal: u32,
+    pub status: u32,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InstallPipeCounts { pub published: u64, pub terminal: u64, pub rejected: u64, pub overflow: u64 }
 
@@ -55,6 +66,13 @@ enum WritePhase {
 }
 
 #[derive(Clone, Copy)]
+struct AssignedDevice {
+    name: [u16; DEVICE_UNIT_CAP],
+    len: usize,
+    ordinal: u32,
+    observed: bool,
+}
+
 struct Slot {
     pipe: InstallPipeIdentity,
     name: [u16; PIPE_NAME_CAP],
@@ -63,6 +81,7 @@ struct Slot {
     client_file_id: u64,
     phase: WritePhase,
     staged: Option<(u64, usize, [u8; DEVICE_UNIT_CAP * 2])>,
+    assigned: Vec<AssignedDevice>,
 }
 
 pub struct InstallPipeDiagnostic<const N: usize> {
@@ -86,6 +105,20 @@ fn same_ascii_name(left: &[u16], right: &[u16]) -> bool {
             unit + u16::from(b'a' - b'A')
         } else { unit };
         lower(*a) == lower(*b)
+    })
+}
+
+fn assigned_enum_suffix(path: &str) -> Option<&str> {
+    let prefix = r"\registry\machine\system\controlset";
+    let path = path.strip_prefix(prefix)?;
+    let (set, suffix) = path.split_once(r"\enum\")?;
+    (set.len() == 3 && set.bytes().all(|byte| byte.is_ascii_digit())
+        && !suffix.is_empty() && !suffix.ends_with('\\')).then_some(suffix)
+}
+
+fn matches_assigned_path(name: &[u16], path: &str) -> bool {
+    name.len() == path.len() && name.iter().zip(path.bytes()).all(|(unit, byte)| {
+        u8::try_from(*unit).is_ok_and(|unit| unit.eq_ignore_ascii_case(&byte))
     })
 }
 
@@ -127,8 +160,8 @@ fn device_name_matches(payload: &[u8], expected_bytes: usize) -> bool {
 }
 
 impl<const N: usize> InstallPipeDiagnostic<N> {
-    pub const fn new() -> Self {
-        Self { slots: [None; N], counts: InstallPipeCounts { published: 0, terminal: 0, rejected: 0, overflow: 0 } }
+    pub fn new() -> Self {
+        Self { slots: core::array::from_fn(|_| None), counts: InstallPipeCounts { published: 0, terminal: 0, rejected: 0, overflow: 0 } }
     }
 
     pub fn register_server(&mut self, pipe: InstallPipeIdentity, name: &[u16]) -> bool {
@@ -144,7 +177,8 @@ impl<const N: usize> InstallPipeDiagnostic<N> {
         let mut copied = [0u16; PIPE_NAME_CAP];
         copied[..name.len()].copy_from_slice(name);
         *target = Some(Slot { pipe, name: copied, name_len: name.len(), child: None,
-            client_file_id: 0, phase: WritePhase::EventLength, staged: None });
+            client_file_id: 0, phase: WritePhase::EventLength, staged: None,
+            assigned: Vec::new() });
         true
     }
 
@@ -159,7 +193,7 @@ impl<const N: usize> InstallPipeDiagnostic<N> {
 
     /// The canonical server File's final handle close frees an unpaired observation slot.
     pub fn retire_server_file(&mut self, file_id: u64) -> bool {
-        let Some(slot) = self.slots.iter_mut().find(|slot| slot.is_some_and(|slot| {
+        let Some(slot) = self.slots.iter_mut().find(|slot| slot.as_ref().is_some_and(|slot| {
             slot.pipe.file_id == file_id && slot.child.is_none()
         }))
             else { return false; };
@@ -283,13 +317,20 @@ impl<const N: usize> InstallPipeDiagnostic<N> {
         }
         let observation = InstallPipeObservation { pipe, child, client_file_id: slot.client_file_id,
             device, device_len, device_ordinal, device_total };
+        if slot.assigned.len() < TRACKED_DEVICE_CAP && slot.assigned.try_reserve(1).is_ok() {
+            slot.assigned.push(AssignedDevice {
+                name: device, len: device_len - 1, ordinal: device_ordinal, observed: false,
+            });
+        } else {
+            self.counts.overflow = self.counts.overflow.saturating_add(1);
+        }
         self.counts.published = self.counts.published.saturating_add(1);
         Some(observation)
     }
 
     pub fn record_child_terminal(&mut self, child: InstallChildIdentity, exit_status: u32)
         -> Option<InstallPipeTerminal> {
-        let Some(slot) = self.slots.iter_mut().find(|slot| slot.is_some_and(|slot| {
+        let Some(slot) = self.slots.iter_mut().find(|slot| slot.as_ref().is_some_and(|slot| {
             slot.child == Some(child)
         })) else { self.reject(); return None; };
         let slot = slot.take()?;
@@ -299,6 +340,20 @@ impl<const N: usize> InstallPipeDiagnostic<N> {
     }
 
     pub fn counts(&self) -> InstallPipeCounts { self.counts }
+
+    /// First completed Enum open for an assigned instance by its exact attached child.
+    /// This is a work-position sample; neither a successful open nor an advance proves install.
+    pub fn observe_enum_open(&mut self, child: InstallChildIdentity, path: &str, status: u32)
+        -> Option<InstallDeviceEnumOpen> {
+        let suffix = assigned_enum_suffix(path)?;
+        let slot = self.slots.iter_mut().flatten().find(|slot| slot.child == Some(child))?;
+        let device = slot.assigned.iter_mut().find(|device| !device.observed
+            && matches_assigned_path(&device.name[..device.len], suffix))?;
+        device.observed = true;
+        Some(InstallDeviceEnumOpen {
+            pipe: slot.pipe, child, device_ordinal: device.ordinal, status,
+        })
+    }
 
     fn reject(&mut self) { self.counts.rejected = self.counts.rejected.saturating_add(1); }
 }

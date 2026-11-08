@@ -519,6 +519,7 @@ impl ExecNtHandler {
         match result {
             Ok(()) => {
                 trace_computer_name_registry(b"open-return", &state.path, 0, self.pi, self.current_tid);
+                self.observe_install_pipe_enum_open(self.pi, &state.path, 0);
                 0
             },
             Err(status) => {
@@ -531,6 +532,7 @@ impl ExecNtHandler {
                     b"open", &state.path, status, self.pi, self.current_tid,
                 );
                 self.abort_hosted_registry_publication(&mut state);
+                self.observe_install_pipe_enum_open(self.pi, &state.path, status);
                 status
             }
         }

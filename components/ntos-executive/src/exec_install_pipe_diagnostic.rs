@@ -34,6 +34,27 @@ fn trace_device(observation: &nt_hosted_runtime::InstallPipeObservation) {
 }
 
 impl ExecNtHandler {
+    /// Observe only a completed native registry open by a live, attached child generation.
+    pub(crate) fn observe_install_pipe_enum_open(&mut self, pi: usize, path: &str, status: u32) {
+        let Some(pid) = self.pm_pid_for_pi(pi) else { return; };
+        let Some(generation) = self.hosted_process_generation(pi) else { return; };
+        let child = nt_hosted_runtime::InstallChildIdentity { pid, generation };
+        if !self.install_pipe_diagnostic.child_is_tracked(child) { return; }
+        let Some(open) = self.install_pipe_diagnostic.observe_enum_open(child, path, status)
+            else { return; };
+        print_str(b"[pnp-install-enum-open] child-pid/gen/server-file/ordinal/status=");
+        print_u64(u64::from(pid));
+        print_str(b"/");
+        print_u64(generation);
+        print_str(b"/");
+        print_hex_u64(open.pipe.file_id);
+        print_str(b"/");
+        print_u64(u64::from(open.device_ordinal));
+        print_str(b"/0x");
+        print_hex(status);
+        print_str(b"\n");
+    }
+
     fn install_pipe_published_file(&self, pi: usize, handle: u64) -> Option<u64> {
         let pid = self.pm_pid_for_pi(pi)?;
         self.hosted_file_route_for_pid(pid, handle).map(|route| route.file_id)

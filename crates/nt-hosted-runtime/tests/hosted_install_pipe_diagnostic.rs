@@ -166,3 +166,43 @@ fn same_named_instances_select_the_exact_server_and_retire_on_close() {
     assert!(trace.register_server(replacement, &name), "closed unpaired slot must be reusable");
     assert_eq!(trace.server_for_name_with(&name, |pipe| pipe == other_server), Some(other_server));
 }
+
+#[test]
+fn completed_enum_open_identifies_only_an_assigned_child_device_once() {
+    let mut trace = InstallPipeDiagnostic::<1>::new();
+    let name = pipe_name("af990c70-ff1e-416f-b1aa-57a14d8ab3fa");
+    let event = utf16("Global\\PNP_Device_Install_Event_0.{af990c70-ff1e-416f-b1aa-57a14d8ab3fa}");
+    let first = utf16(r"ACPI\QEMU0002\0");
+    let second = utf16(r"ACPI\PNP0501\1");
+    assert!(trace.register_server(PIPE, &name));
+    assert!(trace.attach_child(PIPE, &name, CHILD, CLIENT_FILE));
+    for payload in [
+        ((event.len() * 2) as u32).to_le_bytes().to_vec(), bytes(&event),
+        0u32.to_le_bytes().to_vec(), 0x4843_5442u32.to_le_bytes().to_vec(),
+        2u32.to_le_bytes().to_vec(),
+        ((first.len() * 2) as u32).to_le_bytes().to_vec(), bytes(&first),
+        ((second.len() * 2) as u32).to_le_bytes().to_vec(), bytes(&second),
+    ] {
+        let _ = trace.record_server_write(PIPE, &payload);
+    }
+    let path = r"\registry\machine\system\controlset001\enum\acpi\qemu0002\0";
+    assert!(trace.observe_enum_open(InstallChildIdentity { generation: CHILD.generation + 1, ..CHILD }, path, 0).is_none());
+    assert!(trace.observe_enum_open(CHILD, r"\registry\machine\system\controlset001\enum\acpi\unassigned\0", 0).is_none());
+    assert!(trace.observe_enum_open(CHILD, r"\registry\machine\system\controlset001\services\acpi\qemu0002\0", 0).is_none());
+    assert!(trace.observe_enum_open(CHILD, r"\registry\machine\system\controlset001\enum\acpi\qemu0002\0\parameters", 0).is_none());
+    assert!(trace.observe_enum_open(CHILD, r"\registry\machine\system\controlsetabc\enum\acpi\qemu0002\0", 0).is_none());
+    let entered = trace.observe_enum_open(CHILD, path, 0xc0000034)
+        .expect("exact completed failed open is still a device work position");
+    assert_eq!(entered.pipe, PIPE);
+    assert_eq!(entered.child, CHILD);
+    assert_eq!(entered.device_ordinal, 1);
+    assert_eq!(entered.status, 0xc0000034);
+    assert!(trace.observe_enum_open(CHILD, path, 0).is_none(), "repeat is not a new device");
+    let entered = trace.observe_enum_open(CHILD,
+        r"\registry\machine\system\controlset001\enum\ACPI\PNP0501\1", 0)
+        .expect("second exact assigned instance");
+    assert_eq!(entered.device_ordinal, 2);
+    assert_eq!(entered.status, 0);
+    assert!(trace.record_child_terminal(CHILD, 0).is_some());
+    assert!(trace.observe_enum_open(CHILD, path, 0).is_none(), "retired child cannot be reused");
+}
