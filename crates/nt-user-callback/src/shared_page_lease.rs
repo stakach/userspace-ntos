@@ -63,6 +63,7 @@ impl SharedPageSnapshot {
             identity.client.badge,
         ) && self.request_owner == identity.client
             && self.request_ssn == identity.dispatch.ssn
+            && self.publication.request()[0] == self.request_ssn
     }
 }
 

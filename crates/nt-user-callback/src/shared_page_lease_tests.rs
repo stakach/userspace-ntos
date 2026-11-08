@@ -21,7 +21,8 @@ fn identity(dispatch_id: u64, generation: u64) -> SharedPageLeaseIdentity {
 
 fn snapshot(owner: SharedPageLeaseIdentity, marker: u64) -> SharedPageSnapshot {
     let mut request = [0; SHARED_CALLBACK_REQUEST_WORDS];
-    request[0] = marker;
+    request[0] = owner.dispatch.ssn;
+    request[1] = marker;
     SharedPageSnapshot {
         header: CallbackHeader::idle(
             owner.dispatch.dispatch_id, owner.client.pi, owner.client.tid, owner.client.badge,
@@ -30,6 +31,24 @@ fn snapshot(owner: SharedPageLeaseIdentity, marker: u64) -> SharedPageSnapshot {
         request_owner: owner.client,
         request_ssn: owner.dispatch.ssn,
     }
+}
+
+#[test]
+fn global_page_owner_refuses_a_foreign_request_word_even_with_matching_metadata() {
+    let parent = identity(91, 1);
+    let mut foreign = snapshot(parent, 4655);
+    let mut words = *foreign.publication.request();
+    words[0] = 4098;
+    foreign.publication = SharedCallbackPublication::new(
+        words, *foreign.publication.context(),
+    );
+    let mut page = SharedPageAuthority::<2>::new();
+    page.enter(parent, ReplyToken(core::cell::Cell::new(67220)))
+        .unwrap_or_else(|_| panic!("parent owns the physical page"));
+    assert_eq!(page.capture_and_park(parent, foreign),
+        Err(SharedPageLeaseError::WrongSnapshot));
+    assert_eq!(page.capture_and_park(parent, snapshot(parent, 4655)), Ok(()),
+        "refused capture must keep the original active owner");
 }
 
 #[test]
