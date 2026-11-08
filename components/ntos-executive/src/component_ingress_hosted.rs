@@ -181,6 +181,8 @@ pub(crate) struct DeliveryGateSnapshot {
     pub oldest_settlement_prepared: Option<bool>,
     pub pending_calls: usize,
     pub retained: [Option<RetainedCallSample>; 8],
+    pub retained_start: usize,
+    pub retained_total: usize,
     pub retained_overflow: usize,
 }
 
@@ -192,12 +194,14 @@ impl core::fmt::Debug for DeliveryGateSnapshot {
             .field("oldest_can_park", &self.oldest_can_park)
             .field("oldest_settlement_prepared", &self.oldest_settlement_prepared)
             .field("pending_calls", &self.pending_calls)
+            .field("retained_start", &self.retained_start)
+            .field("retained_total", &self.retained_total)
             .field("retained_overflow", &self.retained_overflow)
             .finish()
     }
 }
 
-pub(crate) unsafe fn delivery_gate_snapshot() -> DeliveryGateSnapshot {
+pub(crate) unsafe fn delivery_gate_snapshot(sample_page: usize) -> DeliveryGateSnapshot {
     let rows = &*core::ptr::addr_of!(CALLS);
     let oldest = oldest_pending_snapshot();
     let oldest_row = oldest.and_then(|snapshot| {
@@ -209,17 +213,18 @@ pub(crate) unsafe fn delivery_gate_snapshot() -> DeliveryGateSnapshot {
                 })
         })
     });
+    let eligible = || rows.iter().flatten().filter(|row| {
+        !row.released && row.completion.is_none() && row.call.is_some()
+    });
+    let retained_total = eligible().count();
+    let retained_start = if retained_total == 0 { 0 }
+        else { sample_page.wrapping_mul(8) % retained_total };
     let mut retained = [None; 8];
-    let mut retained_count = 0usize;
-    let mut retained_overflow = 0usize;
-    for row in rows.iter().flatten() {
-        if row.released || row.completion.is_some() { continue; }
-        let Some(call) = row.call.as_ref() else { continue; };
-        if retained_count == retained.len() {
-            retained_overflow += 1;
-            continue;
-        }
-        retained[retained_count] = Some(RetainedCallSample {
+    for (slot, row) in eligible().skip(retained_start)
+        .chain(eligible().take(retained_start)).take(retained.len()).enumerate()
+    {
+        let call = row.call.as_ref().expect("eligible retained Call");
+        retained[slot] = Some(RetainedCallSample {
             binding: row.binding,
             reply: call.reply(),
             admission_sequence: call.admission_sequence(),
@@ -228,7 +233,6 @@ pub(crate) unsafe fn delivery_gate_snapshot() -> DeliveryGateSnapshot {
             delivered: row.delivered,
             settlement_prepared: row.receive_settlement.is_some(),
         });
-        retained_count += 1;
     }
     DeliveryGateSnapshot {
         journal_owned: crate::writable_fs::registry_journal::owns_volume(),
@@ -239,7 +243,9 @@ pub(crate) unsafe fn delivery_gate_snapshot() -> DeliveryGateSnapshot {
             !row.delivered && !row.released && row.completion.is_none()
         }).count(),
         retained,
-        retained_overflow,
+        retained_start,
+        retained_total,
+        retained_overflow: retained_total.saturating_sub(retained.len()),
     }
 }
 struct Cancellation {

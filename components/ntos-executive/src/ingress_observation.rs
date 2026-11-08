@@ -137,11 +137,15 @@ fn append_wait_latency_census(record: &mut nt_printf::record::RecordBuffer<4096>
 
 pub(crate) fn print_hold_snapshot(now: u64) {
     use core::fmt::Write;
+    static HOSTED_CALL_CENSUS_SAMPLES: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    let sample_page = HOSTED_CALL_CENSUS_SAMPLES
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let snapshot = unsafe {
         crate::spawn_hosts::shared_ingress::owner::runtime::hold_snapshot()
     };
     let gate = unsafe {
-        crate::spawn_hosts::shared_ingress::owner::runtime::delivery_gate_snapshot()
+        crate::spawn_hosts::shared_ingress::owner::runtime::delivery_gate_snapshot(sample_page as usize)
     };
     let logical = snapshot.running.and_then(|running| unsafe {
         crate::win32k_glue::dispatch_observation_snapshot(running.lane)
@@ -179,14 +183,12 @@ pub(crate) fn print_hold_snapshot(now: u64) {
     } else {
         record.bytes()
     });
-    static HOSTED_CALL_CENSUS_SAMPLES: core::sync::atomic::AtomicU64 =
-        core::sync::atomic::AtomicU64::new(0);
     if (gate.retained.iter().any(Option::is_some) || gate.retained_overflow != 0)
-        && HOSTED_CALL_CENSUS_SAMPLES.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 64
+        && sample_page < 64
     {
         let mut calls_record = nt_printf::record::RecordBuffer::<4096>::new();
-        let _ = writeln!(calls_record, "[ingress-calls] t_ms={} overflow={}",
-            now / 10_000, gate.retained_overflow);
+        let _ = writeln!(calls_record, "[ingress-calls] t_ms={} start={} total={} overflow={}",
+            now / 10_000, gate.retained_start, gate.retained_total, gate.retained_overflow);
         for call in gate.retained.into_iter().flatten() {
             let (generation_kind, generation) = match call.binding.process.generation {
                 nt_user_host::process_identity::ProcessGeneration::Hosted(value) =>
