@@ -798,3 +798,7 @@ diagnosis-free failure.
 ## Keep Isolated Service Diagnostics Off Shared Image Statics
 - Object and Configuration Manager services map the shared root image read-only. A new atomic trace counter in `.bss` can pass a native build yet fault on its first isolated-service write. Keep per-service diagnostic budgets on private stack or owned heap state, and use a focused read-only-image regression before a boot.
 - A successful ELF PT_LOAD write flag does not prove that an isolated service maps that shared page writable. Identify the executing VSpace and its actual mapping policy before changing the rootserver loader.
+
+## Treat Partial Receipts As Samples, Not Complete Retry Histories
+- A gap between two traced CM acknowledged-BUSY outcomes is not a gap between all registry retries. Cross-check the work-row refusal census, transport phases, and checkpoint owner before claiming a missed wake or avoidable latency.
+- A missing process-wait trace does not prove the caller never waited when another native wait route may exist. Correlate the exact pipe payload, child work, event signal, and process retirement before assigning a blocked owner.
