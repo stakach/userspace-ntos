@@ -77,22 +77,32 @@ pub(super) extern "win64" fn set_target_processor_dpc_ex(dpc: u64, number: u64) 
 
 /// `ULONG KeGetCurrentProcessorNumberEx(PPROCESSOR_NUMBER)`.
 pub(super) extern "win64" fn current_processor_number_ex(number: u64) -> u32 {
+    if !crate::SYSTEM_PROCESSOR_TOPOLOGY_READY.load(Ordering::Acquire) {
+        unsafe { crate::provider_bugcheck::report(0xc4, [0, number, 0, 0]); }
+    }
     let count = crate::SYSTEM_PROCESSOR_COUNT.load(Ordering::Acquire);
-    let boot_node = crate::SYSTEM_BOOT_NODE_ID.load(Ordering::Acquire);
-    let boot_apic = crate::SYSTEM_BOOT_APIC_ID.load(Ordering::Acquire);
+    if count == 0 || count > crate::SYSTEM_PROCESSOR_APIC_IDS.len() as u64 {
+        unsafe { crate::provider_bugcheck::report(0xc4, [count, number, 0, 0]); }
+    }
+    let mut apic_ids = [0u32; 4];
+    for index in 0..count as usize {
+        apic_ids[index] = crate::SYSTEM_PROCESSOR_APIC_IDS[index].load(Ordering::Relaxed);
+    }
+    let Ok(identity_map) = nt_kernel_exec::processor_topology::ProcessorIdentityMap::new(&apic_ids[..count as usize]) else {
+        unsafe { crate::provider_bugcheck::report(0xc4, [count, number, 0, 1]); }
+    };
     let current_apic = unsafe { (core::arch::x86_64::__cpuid(1).ebx >> 24) as u64 };
-    let Some(index) = nt_kernel_exec::processor_topology::local_processor_index(
-        count, boot_node, boot_apic as u32, current_apic as u32,
-    ) else {
-        unsafe { crate::provider_bugcheck::report(0xc4, [count, boot_node, boot_apic, current_apic]); }
+    let Some(index) = identity_map.logical_index(current_apic as u32) else {
+        unsafe { crate::provider_bugcheck::report(0xc4, [count, number, current_apic, 0]); }
     };
     if number != 0 {
         if number.checked_add(4).is_none() {
-            unsafe { crate::provider_bugcheck::report(0xc4, [count, number, boot_apic, 1]); }
+            unsafe { crate::provider_bugcheck::report(0xc4, [count, number, current_apic, 1]); }
         }
         // PROCESSOR_NUMBER: USHORT Group, UCHAR Number, UCHAR Reserved.
-        let encoded = nt_kernel_exec::processor_topology::processor_number_for_index(count, index)
-            .expect("validated boot node lost its processor topology");
+        let Some(encoded) = nt_kernel_exec::processor_topology::processor_number_for_index(count, index) else {
+            unsafe { crate::provider_bugcheck::report(0xc4, [count, u64::from(index), current_apic, 2]); }
+        };
         unsafe { write_unaligned(number as *mut u32, encoded); }
     }
     index

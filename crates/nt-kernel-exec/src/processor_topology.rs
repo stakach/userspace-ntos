@@ -59,25 +59,6 @@ impl ProcessorIdentityMap {
     }
 }
 
-/// Map a hosted callback to the boot node only while its observed physical APIC identity
-/// still matches the node on which the executive captured that identity. A migrated callback
-/// needs an independently discovered APIC-to-node map and cannot borrow the boot node's index.
-pub const fn local_processor_index(
-    count: u64,
-    boot_node: u64,
-    boot_apic_id: u32,
-    current_apic_id: u32,
-) -> Option<u32> {
-    if count == 0
-        || boot_node >= active_processor_count(count) as u64
-        || current_apic_id != boot_apic_id
-    {
-        None
-    } else {
-        Some(boot_node as u32)
-    }
-}
-
 /// Encode a group-zero `PROCESSOR_NUMBER` for a real boot processor index.
 pub const fn processor_number_for_index(count: u64, index: u32) -> Option<u32> {
     if count == 0 || index >= active_processor_count(count) {

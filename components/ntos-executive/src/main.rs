@@ -2256,8 +2256,10 @@ static SYSTEM_PHYSICAL_PAGES: AtomicU64 = AtomicU64::new(0);
 static SYSTEM_LOWEST_PHYSICAL_PAGE: AtomicU64 = AtomicU64::new(0);
 static SYSTEM_HIGHEST_PHYSICAL_PAGE: AtomicU64 = AtomicU64::new(0);
 static SYSTEM_PROCESSOR_COUNT: AtomicU64 = AtomicU64::new(1);
-static SYSTEM_BOOT_NODE_ID: AtomicU64 = AtomicU64::new(u64::MAX);
-static SYSTEM_BOOT_APIC_ID: AtomicU64 = AtomicU64::new(u64::MAX);
+static SYSTEM_PROCESSOR_APIC_IDS: [AtomicU32; 4] = [
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+];
+static SYSTEM_PROCESSOR_TOPOLOGY_READY: AtomicBool = AtomicBool::new(false);
 
 /// Fix (B) — per-caller MCS reply objects so the executive's dispatch composes with nested service.
 /// The kernel has a SINGLE per-TCB `reply_to` stash; `finish_call` (endpoint.rs) UNCONDITIONALLY
@@ -29235,12 +29237,24 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         Ordering::Relaxed,
     );
     SYSTEM_HIGHEST_PHYSICAL_PAGE.store(highest_page, Ordering::Relaxed);
-    SYSTEM_PROCESSOR_COUNT.store(bi.num_nodes.clamp(1, 64), Ordering::Relaxed);
-    SYSTEM_BOOT_NODE_ID.store(bi.node_id, Ordering::Relaxed);
-    SYSTEM_BOOT_APIC_ID.store(
-        unsafe { (core::arch::x86_64::__cpuid(1).ebx >> 24) as u64 },
-        Ordering::Relaxed,
-    );
+    let Some(started_apic_ids) = bi.started_processor_apic_ids() else {
+        print_str(b"[boot] invalid started APIC identity topology\n");
+        park();
+    };
+    let Ok(identity_map) = nt_kernel_exec::processor_topology::ProcessorIdentityMap::new(started_apic_ids) else {
+        print_str(b"[boot] duplicate or invalid started APIC identity\n");
+        park();
+    };
+    let current_apic = unsafe { (core::arch::x86_64::__cpuid(1).ebx >> 24) as u32 };
+    if identity_map.logical_index(current_apic) != Some(bi.node_id as u32) {
+        print_str(b"[boot] initial task APIC identity disagrees with boot node\n");
+        park();
+    }
+    for (index, &apic_id) in started_apic_ids.iter().enumerate() {
+        SYSTEM_PROCESSOR_APIC_IDS[index].store(apic_id, Ordering::Relaxed);
+    }
+    SYSTEM_PROCESSOR_COUNT.store(u64::from(identity_map.count()), Ordering::Relaxed);
+    SYSTEM_PROCESSOR_TOPOLOGY_READY.store(true, Ordering::Release);
 
     // Fix (B): retype two MCS Reply objects (OBJ_REPLY=6, fixed size, size_bits=0) into the
     // executive's root cspace — one for the main service loop (csrss/smss), one for win32k's

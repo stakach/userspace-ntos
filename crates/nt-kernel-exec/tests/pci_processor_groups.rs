@@ -3,17 +3,6 @@
 use nt_kernel_exec::processor_topology::{active_processor_count_for_group, active_processor_mask, processor_number_for_index};
 
 #[test]
-fn local_processor_requires_exact_boot_apic_identity() {
-    use nt_kernel_exec::processor_topology::local_processor_index;
-    assert_eq!(local_processor_index(4, 0, 7, 7), Some(0));
-    assert_eq!(local_processor_index(4, 2, 21, 21), Some(2));
-    assert_eq!(local_processor_index(4, 0, 7, 8), None);
-    assert_eq!(local_processor_index(4, 4, 7, 7), None);
-    assert_eq!(local_processor_index(65, 64, 7, 7), None);
-    assert_eq!(local_processor_index(u64::MAX, u32::MAX as u64 + 1, 7, 7), None);
-}
-
-#[test]
 fn processor_index_projects_only_installed_group_zero_cpus() {
     assert_eq!(processor_number_for_index(1, 0), Some(0));
     assert_eq!(processor_number_for_index(2, 1), Some(1 << 16));
