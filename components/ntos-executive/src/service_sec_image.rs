@@ -1708,11 +1708,11 @@ unsafe fn provider_wait_admit_retained(
     reply_cap: u64,
     callback_transfer: Option<ComponentCallbackTransfer>,
     destination: HostedContinuationDestination,
-) -> bool {
+) -> RetainedWaitAdmission {
     provider_wait_admit_with_transfer(
         nt_handler, pending, reply_cap,
         NestedWaitTransfer::from_completed(callback_transfer), destination,
-    ) == RetainedWaitAdmission::Accepted
+    )
 }
 
 unsafe fn provider_wait_admit_with_transfer(
@@ -1872,25 +1872,26 @@ unsafe fn provider_wait_admit_current(
     pending: win32k_glue::PendingProviderWaitDispatch,
     callback_transfer: Option<ComponentCallbackTransfer>,
     destination: HostedContinuationDestination,
-) -> bool {
+) -> RetainedWaitAdmission {
     let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
-        return false;
+        return RetainedWaitAdmission::RefusedNoEffect;
     };
     if active_reply == 0 {
-        return false;
+        return RetainedWaitAdmission::RefusedNoEffect;
     }
-    if !provider_wait_admit_retained(
+    let admitted = provider_wait_admit_retained(
         nt_handler,
         pending,
         active_reply,
         callback_transfer,
         destination,
-    ) {
-        return false;
+    );
+    if admitted != RetainedWaitAdmission::Accepted {
+        return admitted;
     }
     reply_park.commit();
-    true
+    RetainedWaitAdmission::Accepted
 }
 
 unsafe fn receive_admit_retained(
@@ -2040,8 +2041,8 @@ unsafe fn service_wait_admit_current(
         pending, root_reply, transfer, destination,
     );
     if admitted != RetainedWaitAdmission::Accepted { return admitted; }
-    if reply_park.try_commit().is_err() { RetainedWaitAdmission::Indeterminate }
-    else { RetainedWaitAdmission::Accepted }
+    reply_park.commit();
+    RetainedWaitAdmission::Accepted
 }
 
 unsafe fn lpc_wait_admit_retained(
@@ -2050,11 +2051,11 @@ unsafe fn lpc_wait_admit_retained(
     reply_cap: u64,
     callback_transfer: Option<ComponentCallbackTransfer>,
     destination: HostedContinuationDestination,
-) -> bool {
+) -> RetainedWaitAdmission {
     lpc_wait_admit_with_transfer(
         nt_handler, pending, reply_cap,
         NestedWaitTransfer::from_completed(callback_transfer), destination,
-    ) == RetainedWaitAdmission::Accepted
+    )
 }
 
 unsafe fn lpc_wait_admit_with_transfer(
@@ -2132,25 +2133,26 @@ unsafe fn lpc_wait_admit_current(
     pending: win32k_glue::PendingLpcWaitDispatch,
     callback_transfer: Option<ComponentCallbackTransfer>,
     destination: HostedContinuationDestination,
-) -> bool {
+) -> RetainedWaitAdmission {
     let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
-        return false;
+        return RetainedWaitAdmission::RefusedNoEffect;
     };
     if active_reply == 0 {
-        return false;
+        return RetainedWaitAdmission::RefusedNoEffect;
     }
-    if !lpc_wait_admit_retained(
+    let admitted = lpc_wait_admit_retained(
         nt_handler,
         pending,
         active_reply,
         callback_transfer,
         destination,
-    ) {
-        return false;
+    );
+    if admitted != RetainedWaitAdmission::Accepted {
+        return admitted;
     }
-    reply_park.commit();
-    true
+    if reply_park.try_commit().is_err() { RetainedWaitAdmission::Indeterminate }
+    else { RetainedWaitAdmission::Accepted }
 }
 
 struct PendingWin32kHandoff {
@@ -2397,11 +2399,13 @@ unsafe fn admit_pending_win32k_dispatch(
         }
     } else if let Some(pending) = win32k_glue::take_pending_provider_wait_dispatch() {
         admitted_dispatch_id = pending.dispatch.dispatch_id;
-        parked = provider_wait_admit_current(handler, pending, None, destination);
+        parked = provider_wait_admit_current(handler, pending, None, destination)
+            == RetainedWaitAdmission::Accepted;
         assert!(parked, "provider wait could not reserve its native continuation");
     } else if let Some(pending) = win32k_glue::take_pending_lpc_wait_dispatch() {
         admitted_dispatch_id = pending.dispatch.dispatch_id;
-        parked = lpc_wait_admit_current(handler, pending, None, destination);
+        parked = lpc_wait_admit_current(handler, pending, None, destination)
+            == RetainedWaitAdmission::Accepted;
         assert!(parked, "LPC wait could not reserve its native continuation");
     }
     assert!(!callback_suspended || !parked, "callback and provider wait cannot share one native yield");
@@ -3048,7 +3052,7 @@ unsafe fn drain_deferred_user_callback_returns(
                             context: callback_context,
                         }),
                         HostedContinuationDestination::Win32k,
-                    ));
+                    ) == RetainedWaitAdmission::Accepted);
                     retained_reply = true;
                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                 }
@@ -3066,7 +3070,7 @@ unsafe fn drain_deferred_user_callback_returns(
                             context: callback_context,
                         }),
                         HostedContinuationDestination::Win32k,
-                    ));
+                    ) == RetainedWaitAdmission::Accepted);
                     retained_reply = true;
                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                 }
@@ -13625,7 +13629,7 @@ pub(crate) unsafe fn service_sec_image(
                                             context: callback_context,
                                         }),
                                         HostedContinuationDestination::Win32k,
-                                    ));
+                                    ) == RetainedWaitAdmission::Accepted);
                                     procs[pi].faults = faults;
                                     procs[pi].first = first;
                                     procs[pi].ntfaults = ntfaults;
@@ -13660,7 +13664,7 @@ pub(crate) unsafe fn service_sec_image(
                                             context: callback_context,
                                         }),
                                         HostedContinuationDestination::Win32k,
-                                    ));
+                                    ) == RetainedWaitAdmission::Accepted);
                                     procs[pi].faults = faults;
                                     procs[pi].first = first;
                                     procs[pi].ntfaults = ntfaults;
