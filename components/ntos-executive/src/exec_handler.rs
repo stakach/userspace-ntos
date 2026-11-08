@@ -41186,6 +41186,7 @@ impl ExecNtHandler {
             // ByteOffset=args[7], Key=args[8]. Route a typed pipe through npfs with output capacity
             // (not input bytes), then copy synchronous data back.
             NativeService::NtReadFile => unsafe {
+                let read_entered = diagnostic_time_100ns();
                 let iosb = args[4];
                 let buffer = args[5];
                 let len = nt_ulong_arg(args[6]) as usize;
@@ -41491,6 +41492,7 @@ impl ExecNtHandler {
                                 npfs_route_fid = route.fs_context;
                                 completion_file_id = file_id;
                                 let synchronous = mode.is_synchronous();
+                                let prepare_started = diagnostic_time_100ns();
                                 let sync_reply_capacity = if synchronous {
                                     REPLY_MAIN_SLOT.load(Ordering::Relaxed) != 0
                                         && wait_reply_pool_has_free()
@@ -41509,7 +41511,14 @@ impl ExecNtHandler {
                                         route, fh, capture.granted_access,
                                     ) {
                                         Err(status) => Err(status),
-                                        Ok(false) => return STATUS_PENDING,
+                                        Ok(false) => {
+                                            crate::service_sec_image::mounted_read_lifetime_trace::waited_for_file(
+                                                route.device_id, route.file_id, self.pi,
+                                                self.hosted_process_generation(self.pi).unwrap_or(0),
+                                                len as u32, read_entered, prepare_started,
+                                            );
+                                            return STATUS_PENDING;
+                                        }
                                         Ok(true) => {
                                             file_retained = true;
                                             match self
@@ -41529,6 +41538,7 @@ impl ExecNtHandler {
                                 match prepared {
                                     Err(status) => status,
                                     Ok(()) => {
+                                        let prepared_at = diagnostic_time_100ns();
                                         operation_started = true;
                                         let read_started = diagnostic_time_100ns();
                                         let dispatched = self.dispatch_hosted_file_read_write_for(
@@ -41545,7 +41555,14 @@ impl ExecNtHandler {
                                         crate::service_sec_image::mounted_read_lifetime_trace::dispatched(
                                             route.device_id, route.file_id, self.pi,
                                             self.hosted_process_generation(self.pi).unwrap_or(0),
-                                            len as u32, read_started, dispatched,
+                                            len as u32,
+                                            crate::service_sec_image::mounted_read_lifetime_trace::ReadPhaseTimes {
+                                                entered: read_entered,
+                                                preparing: prepare_started,
+                                                prepared: prepared_at,
+                                                dispatched: read_started,
+                                            },
+                                            dispatched,
                                         );
                                         match dispatched {
                                             Ok((

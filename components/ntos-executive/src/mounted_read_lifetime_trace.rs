@@ -28,6 +28,7 @@ struct Sample {
 static mut SAMPLES: [Option<Sample>; CAPACITY] = [None; CAPACITY];
 static mut PROCESS_GENERATIONS: [u64; MAX_PI] = [0; MAX_PI];
 static mut PROCESS_READS: [u64; MAX_PI] = [0; MAX_PI];
+static mut PROCESS_WAITS: [u64; MAX_PI] = [0; MAX_PI];
 static mut OVERFLOW: u64 = 0;
 static mut SLOW_TERMINALS: u64 = 0;
 
@@ -39,6 +40,89 @@ fn elapsed_ms(start: Option<u64>, end: Option<u64>) {
         Some(ticks) => print_u64(ticks / 10_000),
         None => print_str(b"?"),
     }
+}
+
+pub(crate) struct ReadPhaseTimes {
+    pub entered: Option<u64>,
+    pub preparing: Option<u64>,
+    pub prepared: Option<u64>,
+    pub dispatched: Option<u64>,
+}
+
+fn mounted_route(device: u64) -> Option<(u64, u8)> {
+    if crate::mounted_volume::exec_volume_device() != Some(device) {
+        return None;
+    }
+    let mount = crate::mounted_volume::mount_id_for_live_device(device)?.value();
+    let route = unsafe { crate::fs_loader::exec_fs_mount_identity() }
+        .and_then(crate::fs_loader::exec_block_route_kind)
+        .map_or(0, |kind| match kind {
+            nt_fs::BlockSourceKind::Boot => 1,
+            nt_fs::BlockSourceKind::Draining => 2,
+            nt_fs::BlockSourceKind::Native => 3,
+        });
+    Some((mount, route))
+}
+
+fn next_ordinal(pi: usize, generation: u64, wait: bool) -> u64 {
+    let generations = unsafe { &mut *core::ptr::addr_of_mut!(PROCESS_GENERATIONS) };
+    let reads = unsafe { &mut *core::ptr::addr_of_mut!(PROCESS_READS) };
+    let waits = unsafe { &mut *core::ptr::addr_of_mut!(PROCESS_WAITS) };
+    if generations[pi] != generation {
+        generations[pi] = generation;
+        reads[pi] = 0;
+        waits[pi] = 0;
+    }
+    let count = if wait { &mut waits[pi] } else { &mut reads[pi] };
+    *count = count.saturating_add(1);
+    *count
+}
+
+fn print_ordinal(ordinal: u64) -> bool {
+    ordinal <= 8 || ordinal.is_power_of_two()
+}
+
+/// A synchronous File acquisition parked before any provider IRP was dispatched.
+/// A promoted retry is a separate invocation and must not inherit this attempt's clock.
+pub(crate) fn waited_for_file(
+    device: u64,
+    file: u64,
+    pi: usize,
+    generation: u64,
+    requested: u32,
+    entered: Option<u64>,
+    preparing: Option<u64>,
+) {
+    if pi >= MAX_PI || generation == 0 {
+        return;
+    }
+    let Some((mount, route)) = mounted_route(device) else {
+        return;
+    };
+    let ordinal = next_ordinal(pi, generation, true);
+    if !print_ordinal(ordinal) {
+        return;
+    }
+    let now = diagnostic_time_100ns();
+    print_str(b"[mounted-read-lifetime] stage=file-wait pi/gen/ordinal/file/mount/route/bytes=");
+    print_u64(pi as u64);
+    print_str(b"/");
+    print_u64(generation);
+    print_str(b"/");
+    print_u64(ordinal);
+    print_str(b"/0x");
+    print_hex_u64(file);
+    print_str(b"/");
+    print_u64(mount);
+    print_str(b"/");
+    print_u64(route as u64);
+    print_str(b"/");
+    print_u64(requested as u64);
+    print_str(b" entry-to-wait-ms=");
+    elapsed_ms(entered, now);
+    print_str(b" prepare-to-wait-ms=");
+    elapsed_ms(preparing, now);
+    print_str(b"\n");
 }
 
 fn print_key(sample: Sample) {
@@ -94,35 +178,18 @@ pub(crate) fn dispatched(
     pi: usize,
     generation: u64,
     requested: u32,
-    started: Option<u64>,
+    times: ReadPhaseTimes,
     result: Result<(i32, u64, u64), u32>,
 ) {
-    if pi >= MAX_PI
-        || generation == 0
-        || crate::mounted_volume::exec_volume_device() != Some(device)
-    {
+    if pi >= MAX_PI || generation == 0 {
         return;
     }
-    let Some(mount) = crate::mounted_volume::mount_id_for_live_device(device) else {
+    let Some((mount, route)) = mounted_route(device) else {
         return;
     };
-    let route = unsafe { crate::fs_loader::exec_fs_mount_identity() }
-        .and_then(crate::fs_loader::exec_block_route_kind)
-        .map_or(0, |kind| match kind {
-            nt_fs::BlockSourceKind::Boot => 1,
-            nt_fs::BlockSourceKind::Draining => 2,
-            nt_fs::BlockSourceKind::Native => 3,
-        });
     let now = diagnostic_time_100ns();
-    let generations = unsafe { &mut *core::ptr::addr_of_mut!(PROCESS_GENERATIONS) };
-    let reads = unsafe { &mut *core::ptr::addr_of_mut!(PROCESS_READS) };
-    if generations[pi] != generation {
-        generations[pi] = generation;
-        reads[pi] = 0;
-    }
-    reads[pi] = reads[pi].saturating_add(1);
-    let ordinal = reads[pi];
-    let print_normal = ordinal <= 8 || ordinal.is_power_of_two();
+    let ordinal = next_ordinal(pi, generation, false);
+    let print_normal = print_ordinal(ordinal);
     let (status, transferred, irp) = match result {
         Ok((status, transferred, irp)) => (status as u32, transferred, irp),
         Err(status) => (status, 0, 0),
@@ -131,13 +198,13 @@ pub(crate) fn dispatched(
         owner: None,
         irp,
         file,
-        mount: mount.value(),
+        mount,
         route,
         pi: pi as u32,
         generation,
         ordinal,
         requested,
-        started,
+        started: times.dispatched,
         dispatched: now,
         terminal: None,
         print_normal,
@@ -163,8 +230,14 @@ pub(crate) fn dispatched(
     print_hex(status);
     print_str(b" transferred=");
     print_u64(transferred);
+    print_str(b" entry-to-prepare-ms=");
+    elapsed_ms(times.entered, times.preparing);
+    print_str(b" prepare-ms=");
+    elapsed_ms(times.preparing, times.prepared);
+    print_str(b" prepare-to-dispatch-ms=");
+    elapsed_ms(times.prepared, times.dispatched);
     print_str(b" dispatch-ms=");
-    elapsed_ms(started, now);
+    elapsed_ms(times.dispatched, now);
     print_str(b"\n");
 }
 
