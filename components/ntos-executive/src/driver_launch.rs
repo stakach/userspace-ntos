@@ -14160,9 +14160,16 @@ unsafe fn acknowledge_held_pnp_if_terminal(irp: u64) {
 
 extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
     unsafe {
+        let post_hook_connect = CONNECT_DPC_PROBE_ARMED.load(Ordering::Acquire);
+        if post_hook_connect {
+            trace_post_hook_connect_completion(1, irp, 0, 0);
+        }
         trace_hook_source_completion_probe(irp, 1, 0, 0);
         let outcome = complete_hosted_irp(irp);
         trace_hook_source_completion_probe(irp, 4, 0, outcome as i32);
+        if post_hook_connect {
+            trace_post_hook_connect_completion(4, irp, 0, outcome as u64);
+        }
         if outcome == HostedIrpUnwindOutcome::Terminal {
             acknowledge_held_pnp_if_terminal(irp);
             if let Some(identity) = observe_held_scsi_terminal(irp) {
@@ -14170,6 +14177,14 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
             }
         }
     }
+}
+
+fn trace_post_hook_connect_completion(stage: u64, irp: u64, canonical: u64, detail: u64) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 64 { return; }
+    print_str(b"[post-hook-connect-completion] stage/raw/canonical/detail=");
+    print_u64(stage); print_str(b"/"); print_hex64(irp); print_str(b"/");
+    print_hex64(canonical); print_str(b"/"); print_hex64(detail); print_str(b"\n");
 }
 
 unsafe fn complete_hosted_irp(irp: u64) -> HostedIrpUnwindOutcome {
@@ -14190,6 +14205,12 @@ struct HostedIrpCompletionReceipt {
 unsafe fn complete_hosted_irp_with_owner(irp: u64) -> HostedIrpCompletionReceipt {
     unsafe {
         let claim = claim_pending_irp_completion(irp);
+        if CONNECT_DPC_PROBE_ARMED.load(Ordering::Acquire) {
+            trace_post_hook_connect_completion(2, irp,
+                claim.as_ref().map_or(0, |claim| pending_irp_canonical_id(claim.node)
+                    .load(Ordering::Acquire)),
+                u64::from(claim.is_some()));
+        }
         if claim.is_none() && pending_irp_raw_identity_exists(irp) {
             panic!("IoCompleteRequest attempted to complete an owned IRP twice");
         }
