@@ -968,9 +968,24 @@ pub(super) unsafe fn redrive() {
     for index in 0..port_count {
         let ptr = port_sources()[index].as_mut() as *mut PortSource;
         if (*ptr).entered && !(*ptr).published {
+            // State: 0 no pending/key pair, 1 suspended, 2 returned,
+            // 3 provider pending, 4 blocked, 5 exact owner/key refusal.
+            let state = match ((*ptr).pending, (*ptr).pump_key) {
+                (Some(irp_id), Some(key)) => match hosted_file_owners::hook_pump_state(
+                    irp_id, key, (*ptr).owner_id,
+                    (*ptr).source.class_target_registration().device_id(),
+                ) {
+                    Ok(hosted_file_owners::HookPumpState::Suspended) => 1,
+                    Ok(hosted_file_owners::HookPumpState::Returned) => 2,
+                    Ok(hosted_file_owners::HookPumpState::Pending) => 3,
+                    Ok(hosted_file_owners::HookPumpState::Blocked) => 4,
+                    Err(_) => 5,
+                },
+                _ => 0,
+            };
             trace_port_dispatch(80, &*ptr, 0,
                 (*ptr).pending.map_or(0, |id| id.raw()), (*ptr).pump_key.is_some(),
-                u64::from((*ptr).unowned_yield.is_some()), 0);
+                u64::from((*ptr).unowned_yield.is_some()), state);
         }
         if (*ptr).pump_key.is_some() || (*ptr).unowned_yield.is_some() { continue; }
         if (*ptr).entered && !(*ptr).published {
@@ -991,6 +1006,12 @@ pub(super) unsafe fn nested_work_ready() -> bool {
             || (row.terminal_status.is_some() && !row.published)
             || row.pending.is_some_and(|id| completed_irp_exact(id.raw()).is_some()))
     })
+}
+
+pub(super) fn entered_port_with_published_class() -> bool {
+    port_sources().iter().any(|port| port.entered && !port.published
+        && class_sources().iter().any(|class| class.owner_id == port.owner_id
+            && class.published))
 }
 
 fn returned_hook_state(

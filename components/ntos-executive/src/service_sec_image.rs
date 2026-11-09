@@ -28120,8 +28120,8 @@ unsafe fn settle_suspended_file_pumps() -> ConnectPumpSettlement {
         let returned = crate::driver_launch::returned_hook_pump_ready();
         let generic = crate::driver_launch::generic_file_pump_unsettled();
         let source = crate::driver_launch::hook_source_unsettled();
-        if (returned || generic || source)
-            && COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 32
+        if crate::driver_launch::hosted_hook_port_waiting()
+            && COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 16
         {
             print_str(b"[hook-root-settle] returned/generic/source=");
             print_u64(u64::from(returned)); print_str(b"/");

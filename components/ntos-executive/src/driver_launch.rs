@@ -67484,6 +67484,10 @@ pub(crate) unsafe fn redrive_hosted_hook_forward() {
     hosted_input_hook_live::redrive();
 }
 
+pub(crate) fn hosted_hook_port_waiting() -> bool {
+    hosted_input_hook_live::entered_port_with_published_class()
+}
+
 pub(crate) unsafe fn nested_hosted_hook_forward_ready() -> bool {
     hosted_input_hook_live::nested_work_ready()
 }

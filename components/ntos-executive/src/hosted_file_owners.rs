@@ -1010,6 +1010,28 @@ fn trace_generic_file_selector(
     print_u64(u64::from(selected)); print_str(b"\n");
 }
 
+fn trace_generic_file_no_candidate() {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if !hosted_input_hook_live::entered_port_with_published_class() { return; }
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 32 { return; }
+    print_str(b"[hook-file-selector-none] hook-row-count=");
+    let count = rows().iter().filter(|owner| owner.hook_pump.is_some()).count();
+    print_u64(count as u64); print_str(b"\n");
+    for owner in rows().iter().filter(|owner| owner.hook_pump.is_some()).take(8) {
+        let flight = match owner.flight {
+            Flight::Preparing => 1, Flight::QueuedDispatch => 2, Flight::Dispatch => 3,
+            Flight::PumpSuspended => 4, Flight::PumpReturned => 5, Flight::Copy => 6,
+            Flight::Cancel => 7, Flight::Acknowledge => 8, Flight::Idle => 9,
+            Flight::Blocked => 10,
+        };
+        print_str(b"[hook-file-selector-row] row/irp/flight/claimed=");
+        print_u64(owner.id); print_str(b"/0x");
+        print_hex_u64(owner.irp_id.map_or(0, |id| id.raw())); print_str(b"/");
+        print_u64(flight); print_str(b"/");
+        print_u64(u64::from(owner.hook_pump_claimed)); print_str(b"\n");
+    }
+}
+
 pub(super) fn generic_file_pump_unsettled() -> bool {
     !generic_orphans().is_empty() || rows().iter().any(|owner| {
         owner.hook_pump.is_some()
@@ -1027,7 +1049,11 @@ pub(super) fn claim_suspended_generic_file_pump() -> Option<GenericFilePumpSelec
         .filter(|(_, owner)| owner.hook_pump.is_some()
             && matches!(owner.flight,
                 Flight::PumpSuspended | Flight::PumpReturned | Flight::Blocked))
-        .max_by_key(|(_, owner)| owner.id)?.0;
+        .max_by_key(|(_, owner)| owner.id).map(|(index, _)| index);
+    let Some(index) = index else {
+        trace_generic_file_no_candidate();
+        return None;
+    };
     let owner = rows().get_mut(index)?;
         let identity = owner.hook_pump?;
         let authorities_live = owner.authorities.iter().all(|a| a.live());
