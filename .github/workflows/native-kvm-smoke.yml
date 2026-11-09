@@ -108,6 +108,10 @@ jobs:
         with:
           path: rust-micro/.tmp/libernt/*.zip
           key: libernt-amd64-archive-${{ hashFiles('rust-micro/vendor/libernt/manifest.txt') }}
+      - name: Resolve native build cache identity
+        id: native-cache-identity
+        run: |
+          printf 'prefix=native-kvm-build-v3-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'components/ntos-executive/triplet.json', 'rust-micro/Cargo.lock', 'rust-micro/rust-toolchain') }}\n' >> "$GITHUB_OUTPUT"
       - name: Restore native build cache
         id: native-build-cache
         uses: actions/cache/restore@v4
@@ -117,9 +121,9 @@ jobs:
             components/ntos-executive/target
             crates/nt-ntdll-dll/target
             rust-micro/target
-          key: native-kvm-build-v3-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'components/ntos-executive/triplet.json', 'rust-micro/Cargo.lock', 'rust-micro/rust-toolchain') }}-${{ github.sha }}
+          key: ${{ steps.native-cache-identity.outputs.prefix }}-${{ github.sha }}
           restore-keys: |
-            native-kvm-build-v3-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'components/ntos-executive/triplet.json', 'rust-micro/Cargo.lock', 'rust-micro/rust-toolchain') }}-
+            ${{ steps.native-cache-identity.outputs.prefix }}-
             native-kvm-build-v2-${{ runner.os }}-
       - name: Build native image from verified pinned LiberNT release
         run: |
@@ -144,7 +148,7 @@ jobs:
             components/ntos-executive/target
             crates/nt-ntdll-dll/target
             rust-micro/target
-          key: native-kvm-build-v3-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'components/ntos-executive/triplet.json', 'rust-micro/Cargo.lock', 'rust-micro/rust-toolchain') }}-${{ github.sha }}
+          key: ${{ steps.native-cache-identity.outputs.prefix }}-${{ github.sha }}
       - name: Run bounded KVM startup and capture QMP framebuffer
         env:
           QEMU_ACCEL: kvm
