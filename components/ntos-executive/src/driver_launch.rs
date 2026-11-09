@@ -13825,6 +13825,9 @@ fn trace_hook_source_completion_probe(irp: u64, stage: u64, event: u64, status: 
     print_u64(kind); print_str(b"/"); print_u64(stage); print_str(b"/");
     print_hex64(irp); print_str(b"/");
     print_hex64(event); print_str(b"/"); print_hex(status as u32); print_str(b"\n");
+    if kind == 1 && stage == 3 {
+        CONNECT_DPC_PROBE_ARMED.store(true, Ordering::Release);
+    }
 }
 
 unsafe fn finish_driver_local_irp(irp: u64) {
@@ -16433,7 +16436,7 @@ static CONNECT_DPC_PROBE_ARMED: AtomicBool = AtomicBool::new(false);
 fn trace_connect_dpc_probe(stage: u64, first: u64, second: u64, third: u64) {
     static COUNT: AtomicU64 = AtomicU64::new(0);
     if !CONNECT_DPC_PROBE_ARMED.load(Ordering::Acquire)
-        || COUNT.fetch_add(1, Ordering::Relaxed) >= 48
+        || COUNT.fetch_add(1, Ordering::Relaxed) >= 96
     { return; }
     print_str(b"[connect-dpc-probe] stage/first/second/third=");
     print_u64(stage); print_str(b"/"); print_u64(first); print_str(b"/");
@@ -67786,7 +67789,6 @@ pub(crate) fn trace_connect_child_receive_yield(
     reply: u64, reason: u64, timer_checkpoint: bool, serviced: bool,
     badge: u64, info: u64, demand: u64,
 ) {
-    if demand & 4 != 0 { CONNECT_DPC_PROBE_ARMED.store(true, Ordering::Release); }
     component_scheduler::trace_connect_child_receive_yield(
         reply, reason, timer_checkpoint, serviced, badge, info, demand,
     );

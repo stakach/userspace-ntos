@@ -2285,6 +2285,13 @@ unsafe fn dispatch_next_dpc(
         Err(nt_hosted_runtime::HostedIrqArenaError::Busy) => {
             super::trace_connect_dpc_probe(13, owner.domain_id,
                 owner.domain_cookie, owner.lane_generation);
+            if let Ok(snapshot) = arena.control.root_contention_snapshot(lane.identity) {
+                super::trace_connect_dpc_probe(14, snapshot.active_raw,
+                    u64::from(snapshot.class_raw), u64::from(snapshot.current_irql));
+                super::trace_connect_dpc_probe(15, u64::from(snapshot.dispatch_mask),
+                    u64::from(snapshot.service_mask),
+                    u64::from(snapshot.dispatch_running_mask));
+            }
             return Ok(HostedDpcRootDispatchOutcome::DeferredBusy)
         }
         Err(error) => {
