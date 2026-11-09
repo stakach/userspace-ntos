@@ -14919,7 +14919,6 @@ unsafe fn hosted_raise_irql(irql: u8) -> u8 {
                 .control
                 .worker_raise_irql(identity, transaction, old, irql)
                 .unwrap_or_else(|_| hosted_irq_lane_protocol_fault(0));
-            write_volatile((FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL) as *mut u8, irql);
         } else {
             write_volatile((FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL) as *mut u8, irql);
         }
@@ -14938,7 +14937,6 @@ unsafe fn hosted_lower_irql(irql: u8) {
             .control
             .worker_lower_irql(identity, transaction, current, irql)
             .unwrap_or_else(|_| hosted_irq_lane_protocol_fault(0));
-        write_volatile((FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL) as *mut u8, irql);
     } else {
         write_volatile((FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL) as *mut u8, irql);
     }
@@ -15205,7 +15203,6 @@ unsafe fn hosted_irq_lane_execute_dispatch(
         command.grant,
     );
     let execution_irql = command.execution_irql();
-    let mirrored_entry_irql = read_volatile((FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL) as *const u8);
     if execution_irql < entry_irql
         || (execution_irql != entry_irql
             && arena
@@ -15217,10 +15214,6 @@ unsafe fn hosted_irq_lane_execute_dispatch(
         hosted_irq_lane_record_protocol_fault(arena, identity, token, 3);
         hosted_irq_lane_protocol_fault(sequence);
     }
-    write_volatile(
-        (FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL) as *mut u8,
-        execution_irql,
-    );
     let result = hosted_irq_lane_invoke(command);
     let current_irql = arena
         .control
@@ -15237,10 +15230,6 @@ unsafe fn hosted_irq_lane_execute_dispatch(
         hosted_irq_lane_record_protocol_fault(arena, identity, token, 4);
         hosted_irq_lane_protocol_fault(sequence);
     }
-    write_volatile(
-        (FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL) as *mut u8,
-        mirrored_entry_irql,
-    );
     if let Some((_, parent_identity, parent_transaction, parent_depth, parent_grant)) = parent_context
     {
         hosted_irq_lane_publish_context(
