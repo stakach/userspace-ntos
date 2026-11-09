@@ -681,6 +681,23 @@ fn trace_connect_child_restore(reason: u64, pending: &PendingChildWorkRestore) {
     print_str(b"\n");
 }
 
+fn trace_connect_child_result(stage: u64, result: &crate::spawn_hosts::PumpResult) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if !crate::driver_launch::hosted_connect_pending_reply_published()
+        || COUNT.fetch_add(1, Ordering::Relaxed) >= 48 { return; }
+    print_str(b"[connect-child-result] stage/reply/flags/label=");
+    print_u64(stage); print_str(b"/");
+    print_u64(result.reply_cap); print_str(b"/");
+    let flags = u64::from(result.scheduler_yielded)
+        | (u64::from(result.provider_wait_suspended) << 1)
+        | (u64::from(result.completed) << 2)
+        | (u64::from(result.nested_child_work.is_some()) << 3)
+        | (u64::from(result.nested_restore_yield.is_some()) << 4)
+        | (u64::from(result.nested_restore_quarantined.is_some()) << 5);
+    print_u64(flags); print_str(b"/");
+    print_u64(result.wall_label); print_str(b"\n");
+}
+
 unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> HostedPumpRestore {
     use crate::spawn_hosts::shared_ingress::owner::runtime;
     trace_connect_child_restore(20, &pending);
@@ -768,21 +785,26 @@ unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> Hos
             return HostedPumpRestore::ChildWorkPending(pending);
         }
     };
+    trace_connect_child_result(0, &result);
     let mut channel = pending.channel;
     while result.scheduler_yielded {
+        trace_connect_child_result(1, &result);
         scope.service_irq_yield(channel.shared_va);
+        trace_connect_child_result(2, &result);
         let _ = handoff_exact_component_once(channel.tcb);
         let reply = match runtime::current_reply(route) {
             Ok(reply) if reply != 0 => reply,
             _ => return retain_uncertain_receive(pending, result, channel, 9),
         };
         channel.reply_cap = reply;
+        trace_connect_child_result(3, &result);
         result = match crate::spawn_hosts::component_pump_continue_receive_after_scheduler_service(
             &channel, &result,
         ) {
             Ok(result) => result,
             Err(_) => return retain_uncertain_receive(pending, result, channel, 10),
         };
+        trace_connect_child_result(4, &result);
     }
     if let Some(crate::spawn_hosts::NestedChildWorkState::Ready(_)) = result.nested_child_work {
         if runtime::dispatch(route).ok() != Some(pending.dispatch) {
