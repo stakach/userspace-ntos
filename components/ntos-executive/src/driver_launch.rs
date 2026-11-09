@@ -62969,6 +62969,7 @@ type ActiveHostedIrpTransferLeases = nt_user_host::durable_context_lease::Durabl
 >;
 
 static mut ACTIVE_HOSTED_IRP_TRANSFERS: Option<ActiveHostedIrpTransferLeases> = None;
+static HOSTED_IRQ_BANK_CONFLICT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn active_hosted_irp_transfers_mut() -> &'static mut ActiveHostedIrpTransferLeases {
     let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_HOSTED_IRP_TRANSFERS);
@@ -62984,11 +62985,30 @@ unsafe fn reserve_active_hosted_irp_transfer_slot() -> Result<(), nt_status::NtS
 /// An unbound AddDevice owner still holds both pages. IRQ projection and ISR dispatch must
 /// defer before writing either page, while unrelated drivers retain their independent lanes.
 unsafe fn retained_hosted_irp_bank_conflicts(shared_va: u64) -> bool {
-    (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
+    let mut conflicting_owner = None;
+    let held = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
         .as_ref()
-        .is_some_and(|transfers| transfers.any_held(|held| {
-            held.shared_va == shared_va || held.secondary_shared_va == Some(shared_va)
-        }))
+        .is_some_and(|transfers| transfers.any_held(|row| {
+            let conflict = row.shared_va == shared_va || row.secondary_shared_va == Some(shared_va);
+            if conflict {
+                conflicting_owner = Some((row.shared_va, row.transfer_id, row.source_instance));
+            }
+            conflict
+        }));
+    if let Some((owner_bank, transfer_id, source_instance)) = conflicting_owner {
+        if HOSTED_IRQ_BANK_CONFLICT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
+            print_str(b"[hosted-irq-bank-conflict] irq-bank/owner-bank/transfer/source-instance=");
+            print_u64(shared_va);
+            print_str(b"/");
+            print_u64(owner_bank);
+            print_str(b"/");
+            print_u64(transfer_id);
+            print_str(b"/");
+            print_u64(source_instance as u64);
+            print_str(b"\n");
+        }
+    }
+    held
 }
 
 #[must_use = "resume or retain this exact hosted IRP transfer"]
