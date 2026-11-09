@@ -228,7 +228,14 @@ fn finish_invoke_result(
             ExternalFileIrpOutcome::Indeterminate { transport_status }
         }
     };
-    invocation.returned(outcome)
+    if trace_connect {
+        trace_port_connect_execute(2, projection.irp_id, projection.device_id);
+    }
+    let returned = invocation.returned(outcome);
+    if trace_connect {
+        trace_port_connect_execute(3, projection.irp_id, projection.device_id);
+    }
+    returned
 }
 
 /// Bounded observation of an exact METHOD_NEITHER terminal's copy and ACK handoff.

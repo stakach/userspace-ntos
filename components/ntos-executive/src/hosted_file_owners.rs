@@ -1060,11 +1060,15 @@ unsafe fn resume_generic_file_pump(
     };
     let (invocation, next_key, continuation, child_ready, retryable) = match progress {
         Ok(hosted_file_dispatch::InvokeResult::Returned(returned)) => {
+            trace_file_return_probe(60, selector.irp_id);
             let Some(id) = find(selector.irp_id) else {
                 generic_orphans().push(OrphanedGenericFilePump::Return(selector, returned));
+                trace_file_return_probe(61, selector.irp_id);
                 return GenericFilePumpDrive::Blocked;
             };
-            return match settle_returned_dispatch(id, selector.irp_id, returned) {
+            let settled = settle_returned_dispatch(id, selector.irp_id, returned);
+            trace_file_return_probe(62, selector.irp_id);
+            return match settled {
                 Ok(DispatchResult::Outstanding { .. }) if row(id).flight == Flight::PumpReturned =>
                     GenericFilePumpDrive::Returned,
                 Ok(DispatchResult::Outstanding { .. }) if row(id).flight == Flight::Idle =>
@@ -1490,6 +1494,48 @@ fn trace_port_connect_dispatch(stage: u64, irp: IrpId, device: nt_io_manager::De
     print_str(b"\n");
 }
 
+/// Bounded, read-only owner transition probe for mutable METHOD_NEITHER returns.
+fn trace_file_return_probe(stage: u64, irp: IrpId) {
+    let owner = rows().iter().find(|owner| owner.irp_id == Some(irp));
+    if owner.is_some_and(|owner| owner.output_capture
+        != ExternalFileIrpOutputCapture::MethodNeitherInput) {
+        return;
+    }
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 512 { return; }
+    let (row_id, flight, hook, payload) = owner.map_or((0, u64::MAX, 0, 0), |owner| {
+        let flight = match owner.flight {
+            Flight::Preparing => 1,
+            Flight::QueuedDispatch => 2,
+            Flight::Dispatch => 3,
+            Flight::PumpSuspended => 4,
+            Flight::PumpReturned => 5,
+            Flight::Copy => 6,
+            Flight::Cancel => 7,
+            Flight::Acknowledge => 8,
+            Flight::Idle => 9,
+            Flight::Blocked => 10,
+        };
+        let payload = match owner.payload.as_ref() {
+            None => 0,
+            Some(Payload::Returned(_)) => 1,
+            Some(Payload::PumpSuspended(_)) => 2,
+            Some(Payload::HookReturned(_)) => 3,
+            Some(Payload::Retained(_)) => 4,
+            Some(Payload::Terminal(_)) => 5,
+            Some(_) => 6,
+        };
+        (owner.id, flight, u64::from(owner.hook_pump.is_some()), payload)
+    });
+    print_str(b"[file-return-probe] stage/irp/row/flight/hook/payload=");
+    print_u64(stage); print_str(b"/");
+    print_hex_u64(irp.raw()); print_str(b"/");
+    print_u64(row_id); print_str(b"/");
+    print_u64(flight); print_str(b"/");
+    print_u64(hook); print_str(b"/");
+    print_u64(payload); print_str(b"\n");
+}
+
 fn dispatch_with_port_connect<Yield>(
     caller: nt_process::native_handle::NativeHandleCaller,
     request: ExternalFileIrpRequest,
@@ -1590,22 +1636,29 @@ fn settle_returned_dispatch(
     irp_id: IrpId,
     returned: ExternalFileIrpReturn,
 ) -> Result<DispatchResult, nt_status::NtStatus> {
+    trace_file_return_probe(70, irp_id);
     let result = match io_manager_mut().finish_external_file_irp(returned) {
-        Ok(result) => result,
+        Ok(result) => {
+            trace_file_return_probe(71, irp_id);
+            result
+        }
         Err(rejection) => {
             let (status, returned) = rejection.into_parts();
             block(id, Payload::Returned(returned), status);
+            trace_file_return_probe(72, irp_id);
             return Ok(DispatchResult::Outstanding { irp_id });
         }
     };
     match result {
         ExternalFileIrpResult::NotEntered { status, prepared } => {
+            trace_file_return_probe(73, irp_id);
             if discard(id, prepared).is_err() {
                 return Ok(DispatchResult::Outstanding { irp_id });
             }
             Err(status)
         }
         ExternalFileIrpResult::Returned(terminal) => {
+            trace_file_return_probe(74, irp_id);
             if row(id).hook_pump.is_some() {
                 let owner = row(id);
                 owner.payload = Some(Payload::HookReturned(HookReturned {
@@ -1613,6 +1666,7 @@ fn settle_returned_dispatch(
                 }));
                 owner.flight = Flight::PumpReturned;
                 owner.hook_pump_claimed = false;
+                trace_file_return_probe(75, irp_id);
                 return Ok(DispatchResult::Outstanding { irp_id });
             }
             let completion = *terminal.completion();
@@ -1645,6 +1699,7 @@ fn settle_returned_dispatch(
         }
         ExternalFileIrpResult::Pending(retained) => {
             keep(id, Payload::Retained(retained));
+            trace_file_return_probe(76, irp_id);
             Ok(DispatchResult::Outstanding { irp_id })
         }
         ExternalFileIrpResult::Indeterminate {
@@ -1653,6 +1708,7 @@ fn settle_returned_dispatch(
         } => {
             keep(id, Payload::Retained(retained));
             row(id).blocked_status = Some(transport_status);
+            trace_file_return_probe(77, irp_id);
             Ok(DispatchResult::Outstanding { irp_id })
         }
     }

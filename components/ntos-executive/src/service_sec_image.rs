@@ -28070,6 +28070,7 @@ unsafe fn settle_suspended_connect_pumps() -> ConnectPumpSettlement {
         crate::driver_launch::trace_port_connect_root_probe(81, 1);
         let step = drive_one_nested_file_child_step();
         let ran_child = step.ran_child();
+        crate::driver_launch::trace_port_connect_root_probe(82, u64::from(ran_child));
         // The child receipt is move-only. The CONNECT Work must own it before any
         // inner Hook settlement can yield or refuse a root turn.
         match crate::driver_launch::record_suspended_connect_pump_child_step(selector, step) {
@@ -28080,7 +28081,14 @@ unsafe fn settle_suspended_connect_pumps() -> ConnectPumpSettlement {
         // A reverse Hook can itself yield a nested File pump. Its exact invocation and
         // mutable Type3 input belong to that Hook owner, so settle it at the flat root
         // before restoring this CONNECT parent's physical Reply.
-        match settle_suspended_file_pumps() {
+        let inner_settlement = settle_suspended_file_pumps();
+        crate::driver_launch::trace_port_connect_root_probe(83, match inner_settlement {
+            ConnectPumpSettlement::Settled => 0,
+            ConnectPumpSettlement::AwaitingLocalChild => 1,
+            ConnectPumpSettlement::Retained => 2,
+            ConnectPumpSettlement::Blocked => 3,
+        });
+        match inner_settlement {
             ConnectPumpSettlement::Settled => {}
             ConnectPumpSettlement::AwaitingLocalChild =>
                 return ConnectPumpSettlement::AwaitingLocalChild,
