@@ -130,6 +130,13 @@ impl PortLocalConnect {
         self.child_steps.push(step);
     }
 
+    pub(super) fn recorded_pump_selector(
+        &self,
+    ) -> Option<(nt_io_manager::IrpId, ExternalFileIrpPumpKey)> {
+        let PortConnectPhase::PumpStepClaimed(irp, key) = self.phase else { return None; };
+        (self.child_steps.len() == 1).then_some((irp, key))
+    }
+
     pub(super) fn restore_retryable_selector(
         &self,
     ) -> Option<(nt_io_manager::IrpId, ExternalFileIrpPumpKey)> {

@@ -67475,6 +67475,14 @@ pub(crate) unsafe fn redrive_nested_hosted_hook_forward() -> bool {
     hosted_input_hook_live::redrive_nested_ready()
 }
 
+pub(crate) fn returned_hook_pump_ready() -> bool {
+    hosted_input_hook_live::returned_hook_pump_ready()
+}
+
+pub(crate) unsafe fn redrive_returned_hook_pump() -> bool {
+    hosted_input_hook_live::redrive_returned_hook_pump()
+}
+
 pub(crate) unsafe fn redrive_hosted_connect_forward() {
     hosted_connect_live::redrive();
 }
@@ -73502,11 +73510,22 @@ pub(crate) fn claim_suspended_port_connect_pump(
     hosted_connect_live::claim_suspended_port_connect_pump()
 }
 
-pub(crate) unsafe fn redrive_suspended_connect_pump(
+pub(crate) fn recorded_suspended_connect_pump(
+) -> Option<hosted_connect_live::PortConnectPumpSelector> {
+    hosted_connect_live::recorded_suspended_connect_pump()
+}
+
+pub(crate) unsafe fn record_suspended_connect_pump_child_step(
     selector: hosted_connect_live::PortConnectPumpSelector,
     step: crate::service_sec_image::NestedChildStep,
 ) -> hosted_connect_live::PortConnectPumpProgress {
-    hosted_connect_live::redrive_suspended_connect_pump(selector, step)
+    hosted_connect_live::record_suspended_connect_pump_child_step(selector, step)
+}
+
+pub(crate) unsafe fn redrive_recorded_connect_pump(
+    selector: hosted_connect_live::PortConnectPumpSelector,
+) -> hosted_connect_live::PortConnectPumpProgress {
+    hosted_connect_live::redrive_recorded_connect_pump(selector)
 }
 
 pub(crate) unsafe fn redrive_retryable_connect_pump(
@@ -73516,6 +73535,35 @@ pub(crate) unsafe fn redrive_retryable_connect_pump(
 
 pub(crate) fn unsettled_suspended_connect_pump() -> bool {
     hosted_connect_live::unsettled_suspended_connect_pump()
+}
+
+/// A reverse Hook's mutable METHOD_NEITHER File pump has its own durable row. The root
+/// selects its exact child after the provider stack has unwound, before restoring CONNECT.
+pub(crate) use hosted_file_owners::GenericFilePumpDrive;
+
+pub(crate) fn claim_suspended_generic_file_pump(
+) -> Option<hosted_file_owners::GenericFilePumpSelector> {
+    hosted_file_owners::claim_suspended_generic_file_pump()
+}
+
+pub(crate) unsafe fn redrive_suspended_generic_file_pump(
+    selector: hosted_file_owners::GenericFilePumpSelector,
+    step: crate::service_sec_image::NestedChildStep,
+) -> hosted_file_owners::GenericFilePumpDrive {
+    hosted_file_owners::redrive_suspended_generic_file_pump(selector, step)
+}
+
+pub(crate) unsafe fn redrive_retryable_generic_file_pump(
+) -> hosted_file_owners::GenericFilePumpDrive {
+    hosted_file_owners::redrive_retryable_generic_file_pump()
+}
+
+pub(crate) fn generic_file_pump_unsettled() -> bool {
+    hosted_file_owners::generic_file_pump_unsettled()
+}
+
+pub(crate) fn hook_source_unsettled() -> bool {
+    hosted_input_hook_live::hook_source_unsettled()
 }
 
 enum FileTransferOwner {

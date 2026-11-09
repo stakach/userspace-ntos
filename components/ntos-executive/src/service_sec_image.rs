@@ -11075,6 +11075,17 @@ pub(crate) unsafe fn service_sec_image(
                 break 'service_loop;
             }
             crate::driver_launch::redrive_hosted_hook_forward();
+            let hook_pump_settlement = {
+                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                settle_suspended_file_pumps()
+            };
+            if !matches!(hook_pump_settlement, ConnectPumpSettlement::Settled) {
+                // The exact Hook File owner still holds a physical Reply. Do not enter the
+                // next unrelated provider or publish a synthetic Hook completion.
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                break 'service_loop;
+            }
             crate::driver_launch::redrive_hosted_lower_pnp_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_lower_file_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_accepted_pdo_provider_retirement();
@@ -28038,6 +28049,17 @@ unsafe fn settle_suspended_connect_pumps() -> ConnectPumpSettlement {
     use crate::driver_launch::PortConnectPumpProgress as Progress;
     crate::driver_launch::trace_port_connect_root_probe(80, 0);
     loop {
+        if let Some(selector) = crate::driver_launch::recorded_suspended_connect_pump() {
+            match settle_suspended_file_pumps() {
+                ConnectPumpSettlement::Settled => {}
+                other => return other,
+            }
+            match crate::driver_launch::redrive_recorded_connect_pump(selector) {
+                Progress::Blocked => return ConnectPumpSettlement::Blocked,
+                Progress::Retained => return ConnectPumpSettlement::Retained,
+                Progress::NoWork | Progress::Returned | Progress::Yielded => continue,
+            }
+        }
         match crate::driver_launch::redrive_retryable_connect_pump() {
             Progress::Blocked => return ConnectPumpSettlement::Blocked,
             Progress::Retained => return ConnectPumpSettlement::Retained,
@@ -28048,7 +28070,24 @@ unsafe fn settle_suspended_connect_pumps() -> ConnectPumpSettlement {
         crate::driver_launch::trace_port_connect_root_probe(81, 1);
         let step = drive_one_nested_file_child_step();
         let ran_child = step.ran_child();
-        match crate::driver_launch::redrive_suspended_connect_pump(selector, step) {
+        // The child receipt is move-only. The CONNECT Work must own it before any
+        // inner Hook settlement can yield or refuse a root turn.
+        match crate::driver_launch::record_suspended_connect_pump_child_step(selector, step) {
+            Progress::Retained => {}
+            Progress::Blocked => return ConnectPumpSettlement::Blocked,
+            _ => return ConnectPumpSettlement::Retained,
+        }
+        // A reverse Hook can itself yield a nested File pump. Its exact invocation and
+        // mutable Type3 input belong to that Hook owner, so settle it at the flat root
+        // before restoring this CONNECT parent's physical Reply.
+        match settle_suspended_file_pumps() {
+            ConnectPumpSettlement::Settled => {}
+            ConnectPumpSettlement::AwaitingLocalChild =>
+                return ConnectPumpSettlement::AwaitingLocalChild,
+            ConnectPumpSettlement::Retained => return ConnectPumpSettlement::Retained,
+            ConnectPumpSettlement::Blocked => return ConnectPumpSettlement::Blocked,
+        }
+        match crate::driver_launch::redrive_recorded_connect_pump(selector) {
             Progress::Blocked => return ConnectPumpSettlement::Blocked,
             Progress::Retained => return ConnectPumpSettlement::Retained,
             Progress::Yielded if !ran_child => return ConnectPumpSettlement::AwaitingLocalChild,
@@ -28056,6 +28095,48 @@ unsafe fn settle_suspended_connect_pumps() -> ConnectPumpSettlement {
         }
     }
     if crate::driver_launch::unsettled_suspended_connect_pump() {
+        ConnectPumpSettlement::Retained
+    } else {
+        ConnectPumpSettlement::Settled
+    }
+}
+
+/// Run every nested Hook File child after its caller's stack has unwound. A claimed parent
+/// retains its one-use child observation while a newer Hook pump settles; retry resumes only
+/// that recorded parent and never redispatches its original IRP.
+unsafe fn settle_suspended_file_pumps() -> ConnectPumpSettlement {
+    use crate::driver_launch::GenericFilePumpDrive as Progress;
+    loop {
+        if crate::driver_launch::returned_hook_pump_ready() {
+            if !crate::driver_launch::redrive_returned_hook_pump() {
+                return ConnectPumpSettlement::Retained;
+            }
+            continue;
+        }
+        let progress = if let Some(selector) =
+            crate::driver_launch::claim_suspended_generic_file_pump()
+        {
+            let step = drive_one_nested_file_child_step();
+            let ran_child = step.ran_child();
+            match crate::driver_launch::redrive_suspended_generic_file_pump(selector, step) {
+                Progress::Yielded if !ran_child =>
+                    return ConnectPumpSettlement::AwaitingLocalChild,
+                other => other,
+            }
+        } else {
+            crate::driver_launch::redrive_retryable_generic_file_pump()
+        };
+        match progress {
+            Progress::NoWork => break,
+            Progress::Returned | Progress::Pending | Progress::Yielded => continue,
+            Progress::AwaitingLocalChild => return ConnectPumpSettlement::AwaitingLocalChild,
+            Progress::Retained => return ConnectPumpSettlement::Retained,
+            Progress::Blocked => return ConnectPumpSettlement::Blocked,
+        }
+    }
+    if crate::driver_launch::generic_file_pump_unsettled()
+        || crate::driver_launch::hook_source_unsettled()
+    {
         ConnectPumpSettlement::Retained
     } else {
         ConnectPumpSettlement::Settled

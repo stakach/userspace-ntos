@@ -78,16 +78,18 @@ fn root_selects_only_an_exact_retained_port_connect_pump() {
 
 #[test]
 fn root_deposits_one_use_child_step_before_native_resume() {
-    let resume = LIVE
-        .split_once("fn redrive_suspended_connect_pump(")
-        .expect("root suspended CONNECT redrive")
+    let deposit = LIVE
+        .split_once("fn record_suspended_connect_pump_child_step(")
+        .expect("root suspended CONNECT receipt deposit")
         .1
         .split_once("fn ")
-        .expect("redrive boundary")
+        .expect("deposit boundary")
         .0;
-    let deposit = resume.find("retain_child_step(step)").expect("durable child step deposit");
-    let native = resume.find("resume_pump_after_child").expect("native resume");
-    assert!(deposit < native);
+    assert!(deposit.contains("retain_child_step(step)"));
+    let resume = LIVE.split_once("fn redrive_recorded_connect_pump(")
+        .expect("resume after receipt deposit").1
+        .split_once("fn ").expect("resume boundary").0;
+    assert!(resume.contains("resume_pump_after_child"));
 }
 
 #[test]

@@ -18,6 +18,7 @@ enum Flight {
     QueuedDispatch,
     Dispatch,
     PumpSuspended,
+    PumpReturned,
     Copy,
     Cancel,
     Acknowledge,
@@ -30,6 +31,7 @@ enum Payload {
     NoEntry(ExternalFileIrpNoEntryReceipt),
     Returned(ExternalFileIrpReturn),
     PumpSuspended(SuspendedFilePumpOwner),
+    HookReturned(HookReturned),
     Retained(RetainedExternalFileIrp),
     Completion(ExternalFileIrpCompletionInvocation),
     Acknowledgement(ExternalFileIrpCompletionReturn),
@@ -42,6 +44,27 @@ enum Payload {
 struct SuspendedFilePumpOwner {
     invocation: SuspendedExternalFileIrpInvocation,
     continuation: FileDispatchContinuation,
+}
+
+struct HookReturned {
+    state: HookReturnedState,
+    observed: bool,
+}
+
+enum HookReturnedState {
+    Terminal(ExternalFileIrpTerminal),
+    Retired {
+        completion: nt_io_manager::CompletedIrp,
+        buffers: ExternalFileIrpBuffers,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HookPumpIdentity {
+    owner_id: u64,
+    device: nt_io_manager::DeviceId,
+    initial_key: ExternalFileIrpPumpKey,
+    current_key: ExternalFileIrpPumpKey,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -89,6 +112,8 @@ struct Row {
     settled_buffers: Option<ExternalFileIrpBuffers>,
     completion_storage: Option<(usize, usize)>,
     port_connect_control_storage: Option<usize>,
+    hook_pump: Option<HookPumpIdentity>,
+    hook_pump_claimed: bool,
     flight: Flight,
     payload: Option<Payload>,
     blocked_status: Option<nt_status::NtStatus>,
@@ -299,6 +324,7 @@ pub(crate) struct Stats {
     pub queued_dispatch: usize,
     pub dispatching: usize,
     pub pump_suspended: usize,
+    pub pump_returned: usize,
     pub copying: usize,
     pub cancelling: usize,
     pub acknowledging: usize,
@@ -323,6 +349,7 @@ pub(super) fn stats() -> Stats {
             Flight::QueuedDispatch => stats.queued_dispatch += 1,
             Flight::Dispatch => stats.dispatching += 1,
             Flight::PumpSuspended => stats.pump_suspended += 1,
+            Flight::PumpReturned => stats.pump_returned += 1,
             Flight::Copy => stats.copying += 1,
             Flight::Cancel => stats.cancelling += 1,
             Flight::Acknowledge => stats.acknowledging += 1,
@@ -473,6 +500,8 @@ fn reserve(
         settled_buffers: None,
         completion_storage: None,
         port_connect_control_storage: None,
+        hook_pump: None,
+        hook_pump_claimed: false,
         flight: Flight::Preparing,
         payload: None,
         blocked_status: None,
@@ -715,6 +744,7 @@ pub(super) fn suspend_dispatch_for_pump(
     invocation: ExternalFileIrpInvocation,
     key: ExternalFileIrpPumpKey,
     continuation: FileDispatchContinuation,
+    hook: Option<(u64, nt_io_manager::DeviceId)>,
 ) -> Result<(), (nt_status::NtStatus, ExternalFileIrpInvocation,
     FileDispatchContinuation)> {
     let Some(id) = find(irp_id) else {
@@ -735,7 +765,15 @@ pub(super) fn suspend_dispatch_for_pump(
     owner.payload = Some(Payload::PumpSuspended(SuspendedFilePumpOwner {
         invocation: suspended, continuation,
     }));
+    if let Some((owner_id, device)) = hook {
+        owner.hook_pump = Some(HookPumpIdentity {
+            owner_id, device, initial_key: key, current_key: key,
+        });
+    } else if let Some(identity) = owner.hook_pump.as_mut() {
+        identity.current_key = key;
+    }
     owner.flight = Flight::PumpSuspended;
+    if owner.hook_pump.is_some() { owner.hook_pump_claimed = false; }
     crate::driver_launch::trace_port_connect_root_probe(70, irp_id.raw());
     Ok(())
 }
@@ -894,7 +932,7 @@ pub(super) unsafe fn resume_suspended_port_connect_pump(
             },
         );
     };
-    match suspend_dispatch_for_pump(irp_id, invocation, next_key, continuation) {
+    match suspend_dispatch_for_pump(irp_id, invocation, next_key, continuation, None) {
         Ok(()) if child_ready => PortConnectPumpDrive::Yielded { irp_id, key: next_key },
         Ok(()) if retryable => PortConnectPumpDrive::Retained,
         Ok(()) => {
@@ -909,6 +947,214 @@ pub(super) unsafe fn resume_suspended_port_connect_pump(
             })
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GenericFilePumpSelector {
+    pub(super) row_id: u64,
+    pub(super) irp_id: IrpId,
+    pub(super) key: ExternalFileIrpPumpKey,
+    pub(super) hook_owner_id: u64,
+    pub(super) device: nt_io_manager::DeviceId,
+}
+
+pub(crate) enum GenericFilePumpDrive {
+    NoWork,
+    Returned,
+    Pending,
+    Yielded,
+    AwaitingLocalChild,
+    Retained,
+    Blocked,
+}
+
+/// A refused post-child handoff still owns the one-use receipt or both physical owners.
+enum OrphanedGenericFilePump {
+    Step(GenericFilePumpSelector, crate::service_sec_image::NestedChildStep),
+    Yield(GenericFilePumpSelector, ExternalFileIrpInvocation, FileDispatchContinuation),
+    Return(GenericFilePumpSelector, ExternalFileIrpReturn),
+}
+
+static mut ORPHANED_GENERIC_FILE_PUMPS: Vec<OrphanedGenericFilePump> = Vec::new();
+
+fn generic_orphans() -> &'static mut Vec<OrphanedGenericFilePump> {
+    unsafe { &mut *core::ptr::addr_of_mut!(ORPHANED_GENERIC_FILE_PUMPS) }
+}
+
+pub(super) fn generic_file_pump_unsettled() -> bool {
+    !generic_orphans().is_empty() || rows().iter().any(|owner| {
+        owner.hook_pump.is_some()
+            && matches!(owner.flight,
+                Flight::PumpSuspended | Flight::PumpReturned | Flight::Blocked)
+    })
+}
+
+/// Claim the most recently created ready File child. A claimed parent cannot run a second
+/// child; the sealed receipt is kept until any inner File child has settled.
+pub(super) fn claim_suspended_generic_file_pump() -> Option<GenericFilePumpSelector> {
+    if !generic_orphans().is_empty() || generic_orphans().try_reserve(1).is_err() {
+        return None;
+    }
+    let index = rows().iter().enumerate()
+        .filter(|(_, owner)| owner.hook_pump.is_some()
+            && matches!(owner.flight,
+                Flight::PumpSuspended | Flight::PumpReturned | Flight::Blocked))
+        .max_by_key(|(_, owner)| owner.id)?.0;
+    let owner = rows().get_mut(index)?;
+        let identity = owner.hook_pump?;
+        if owner.flight != Flight::PumpSuspended || owner.hook_pump_claimed
+            || owner.irp_id.is_none() || !owner.authorities.iter().all(|a| a.live())
+            || !matches!(owner.payload.as_ref(), Some(Payload::PumpSuspended(pump))
+                if pump.invocation.key() == identity.current_key
+                    && pump.continuation.child_work_ready())
+        {
+            return None;
+        }
+        owner.hook_pump_claimed = true;
+        Some(GenericFilePumpSelector {
+            row_id: owner.id,
+            irp_id: owner.irp_id?,
+            key: identity.current_key,
+            hook_owner_id: identity.owner_id,
+            device: identity.device,
+        })
+}
+
+fn exact_generic_pump(selector: GenericFilePumpSelector) -> bool {
+    rows().iter().any(|owner| {
+        owner.id == selector.row_id && owner.irp_id == Some(selector.irp_id)
+            && owner.hook_pump == Some(HookPumpIdentity {
+                owner_id: selector.hook_owner_id,
+                device: selector.device,
+                initial_key: owner.hook_pump.map(|h| h.initial_key).unwrap_or(selector.key),
+                current_key: selector.key,
+            }) && owner.primary_device == Some(selector.device)
+            && owner.flight == Flight::PumpSuspended && owner.hook_pump_claimed
+    })
+}
+
+unsafe fn resume_generic_file_pump(
+    selector: GenericFilePumpSelector,
+) -> GenericFilePumpDrive {
+    if !exact_generic_pump(selector) { return GenericFilePumpDrive::Blocked; }
+    let (invocation, continuation) = match resume_dispatch_from_pump(selector.irp_id, selector.key) {
+        Ok(owners) => owners,
+        Err(status) => {
+            let _ = quarantine_dispatch_pump(selector.irp_id, selector.key, status);
+            return GenericFilePumpDrive::Blocked;
+        }
+    };
+    let mut owners = Some((invocation, continuation));
+    let progress = hosted_input_hook_live::with_suspended_hook_alias(
+        selector.irp_id,
+        row(selector.row_id).hook_pump.map(|h| h.initial_key).unwrap_or(selector.key),
+        selector.hook_owner_id, selector.device,
+        || {
+            let (invocation, continuation) = owners.take().expect("validated Hook pump owners");
+            continuation.resume_after_child(invocation)
+        },
+    );
+    let progress = match progress {
+        Ok(progress) => progress,
+        Err(_) => Err(owners.take().expect("refused alias preserved Hook pump owners")),
+    };
+    let (invocation, next_key, continuation, child_ready, retryable) = match progress {
+        Ok(hosted_file_dispatch::InvokeResult::Returned(returned)) => {
+            let Some(id) = find(selector.irp_id) else {
+                generic_orphans().push(OrphanedGenericFilePump::Return(selector, returned));
+                return GenericFilePumpDrive::Blocked;
+            };
+            return match settle_returned_dispatch(id, selector.irp_id, returned) {
+                Ok(DispatchResult::Outstanding { .. }) if row(id).flight == Flight::PumpReturned =>
+                    GenericFilePumpDrive::Returned,
+                Ok(DispatchResult::Outstanding { .. }) if row(id).flight == Flight::Idle =>
+                    GenericFilePumpDrive::Pending,
+                Ok(_) | Err(_) => GenericFilePumpDrive::Blocked,
+            };
+        }
+        Ok(hosted_file_dispatch::InvokeResult::ChildWorkYield {
+            invocation, key, continuation,
+        }) => (invocation, key, continuation, true, false),
+        Ok(hosted_file_dispatch::InvokeResult::UnkeyedChildWorkYield {
+            invocation, continuation,
+        }) => {
+            generic_orphans().push(OrphanedGenericFilePump::Yield(
+                selector, invocation, continuation,
+            ));
+            return GenericFilePumpDrive::Blocked;
+        }
+        Err((invocation, continuation)) => {
+            let retryable = continuation.retry_without_new_child();
+            (invocation, selector.key, continuation, false, retryable)
+        }
+    };
+    match suspend_dispatch_for_pump(selector.irp_id, invocation, next_key, continuation, None) {
+        Ok(()) if child_ready => GenericFilePumpDrive::Yielded,
+        Ok(()) if retryable => {
+            if let Some(id) = find(selector.irp_id) { row(id).hook_pump_claimed = true; }
+            GenericFilePumpDrive::Retained
+        }
+        Ok(()) => {
+            let _ = quarantine_dispatch_pump(
+                selector.irp_id, next_key, nt_status::NtStatus::UNSUCCESSFUL,
+            );
+            GenericFilePumpDrive::Blocked
+        }
+        Err((_, invocation, continuation)) => {
+            generic_orphans().push(OrphanedGenericFilePump::Yield(
+                selector, invocation, continuation,
+            ));
+            GenericFilePumpDrive::Blocked
+        }
+    }
+}
+
+pub(super) unsafe fn redrive_suspended_generic_file_pump(
+    selector: GenericFilePumpSelector,
+    step: crate::service_sec_image::NestedChildStep,
+) -> GenericFilePumpDrive {
+    let ran_child = step.ran_child();
+    generic_orphans().push(OrphanedGenericFilePump::Step(selector, step));
+    if !exact_generic_pump(selector) { return GenericFilePumpDrive::Blocked; }
+    let Some(OrphanedGenericFilePump::Step(_, step)) = generic_orphans().pop() else {
+        return GenericFilePumpDrive::Blocked;
+    };
+    if let Err(step) = record_suspended_pump_child_step(selector.irp_id, selector.key, step) {
+        generic_orphans().push(OrphanedGenericFilePump::Step(selector, step));
+        return GenericFilePumpDrive::Blocked;
+    }
+    if rows().iter().any(|owner| owner.id > selector.row_id
+        && owner.hook_pump.is_some()
+        && matches!(owner.flight,
+            Flight::PumpSuspended | Flight::PumpReturned | Flight::Blocked))
+    {
+        return GenericFilePumpDrive::Yielded;
+    }
+    match resume_generic_file_pump(selector) {
+        GenericFilePumpDrive::Yielded if !ran_child =>
+            GenericFilePumpDrive::AwaitingLocalChild,
+        progress => progress,
+    }
+}
+
+/// Retry only a sealed child receipt or a certified no-effect restore refusal.
+pub(super) unsafe fn redrive_retryable_generic_file_pump() -> GenericFilePumpDrive {
+    let selected = rows().iter().rev().find_map(|owner| {
+        let identity = owner.hook_pump?;
+        if owner.flight != Flight::PumpSuspended || !owner.hook_pump_claimed
+            || rows().iter().any(|inner| inner.id > owner.id
+                && inner.hook_pump.is_some()
+                && matches!(inner.flight,
+                    Flight::PumpSuspended | Flight::PumpReturned | Flight::Blocked))
+            || !matches!(owner.payload.as_ref(), Some(Payload::PumpSuspended(pump))
+                if pump.continuation.retry_without_new_child())
+        { return None; }
+        Some(GenericFilePumpSelector {
+            row_id: owner.id, irp_id: owner.irp_id?, key: identity.current_key,
+            hook_owner_id: identity.owner_id, device: identity.device,
+        })
+    });
+    selected.map_or(GenericFilePumpDrive::NoWork, |selector| resume_generic_file_pump(selector))
 }
 
 pub(super) enum DispatchResult {
@@ -948,6 +1194,209 @@ enum PortConnectYield {
 pub(super) enum PortConnectDispatchResult {
     Returned(DispatchResult),
     PumpSuspended { irp_id: IrpId, key: ExternalFileIrpPumpKey },
+}
+
+pub(super) enum HookDispatchResult {
+    Returned(DispatchResult),
+    PumpSuspended { irp_id: IrpId, key: ExternalFileIrpPumpKey },
+}
+
+/// A refusal after native entry still owns both the manager invocation and physical pump.
+pub(super) type HookDispatchFailure = PortConnectDispatchFailure;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum HookPumpState {
+    Suspended,
+    Returned,
+    Pending,
+    Blocked,
+}
+
+pub(super) fn hook_pump_state(
+    irp_id: IrpId,
+    key: ExternalFileIrpPumpKey,
+    hook_owner_id: u64,
+    device: nt_io_manager::DeviceId,
+) -> Result<HookPumpState, nt_status::NtStatus> {
+    let id = find(irp_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if !exact_hook_owner(id, hook_owner_id, device, key) {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    if matches!(row(id).payload.as_ref(), Some(Payload::HookReturned(_))) {
+        return Ok(HookPumpState::Returned);
+    }
+    Ok(match row(id).flight {
+        Flight::PumpSuspended => HookPumpState::Suspended,
+        Flight::PumpReturned => HookPumpState::Returned,
+        Flight::Blocked => HookPumpState::Blocked,
+        _ => HookPumpState::Pending,
+    })
+}
+
+fn exact_hook_owner(
+    id: u64, owner_id: u64, device: nt_io_manager::DeviceId,
+    initial_key: ExternalFileIrpPumpKey,
+) -> bool {
+    row(id).primary_device == Some(device)
+        && row(id).hook_pump.is_some_and(|identity| {
+            identity.owner_id == owner_id && identity.device == device
+                && identity.initial_key == initial_key
+        })
+}
+
+/// Read the provider's real terminal while its canonical IRP remains available for Hook's
+/// separate source observation. No manager owner or File row is consumed by this copy.
+pub(super) fn peek_returned_hook_pump(
+    irp_id: IrpId,
+    key: ExternalFileIrpPumpKey,
+    hook_owner_id: u64,
+    device: nt_io_manager::DeviceId,
+    updated: &mut [u8],
+) -> Result<Option<(nt_status::NtStatus, u64, Option<u64>)>, nt_status::NtStatus> {
+    let id = find(irp_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if !exact_hook_owner(id, hook_owner_id, device, key) {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    let Some(Payload::HookReturned(returned)) = row(id).payload.as_ref() else {
+        return Ok(None);
+    };
+    let HookReturnedState::Terminal(terminal) = &returned.state else {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    };
+    let input = terminal.buffers().input();
+    if updated.len() != input.len() {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    updated.copy_from_slice(input);
+    let completion = terminal.completion();
+    Ok(Some((completion.status, completion.information, completion.file_context)))
+}
+
+/// Hook records this only after it validates the canonical completion against its own source.
+pub(super) fn mark_returned_hook_pump_observed(
+    irp_id: IrpId,
+    key: ExternalFileIrpPumpKey,
+    hook_owner_id: u64,
+    device: nt_io_manager::DeviceId,
+) -> Result<(), nt_status::NtStatus> {
+    let id = find(irp_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if !exact_hook_owner(id, hook_owner_id, device, key) {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    let Some(Payload::HookReturned(returned)) = row(id).payload.as_mut() else {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    };
+    returned.observed = true;
+    Ok(())
+}
+
+/// Return the actual Type3 input only to its exact Hook source. Failed retirement leaves the
+/// terminal and buffers in this File row for a later no-replay retry.
+pub(super) fn take_returned_hook_pump(
+    irp_id: IrpId,
+    key: ExternalFileIrpPumpKey,
+    hook_owner_id: u64,
+    device: nt_io_manager::DeviceId,
+) -> Result<Option<DispatchResult>, nt_status::NtStatus> {
+    let id = find(irp_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if !exact_hook_owner(id, hook_owner_id, device, key) {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    if !matches!(row(id).payload.as_ref(), Some(Payload::HookReturned(_))) {
+        return Ok(None);
+    }
+    if !matches!(row(id).payload.as_ref(), Some(Payload::HookReturned(returned)) if returned.observed) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    let Some(Payload::HookReturned(returned)) = row(id).payload.take() else {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    };
+    let state = match returned.state {
+        HookReturnedState::Terminal(terminal) => {
+            let completion = *terminal.completion();
+            match io_manager_mut().retire_external_file_irp_terminal(terminal) {
+                Ok((receipt, buffers)) => {
+                    row(id).terminal_receipt = Some(receipt);
+                    HookReturnedState::Retired { completion, buffers }
+                }
+                Err(rejection) => {
+                    let (status, terminal) = rejection.into_parts();
+                    row(id).payload = Some(Payload::HookReturned(HookReturned {
+                        state: HookReturnedState::Terminal(terminal), observed: returned.observed,
+                    }));
+                    row(id).blocked_status = Some(status);
+                    return Err(status);
+                }
+            }
+        }
+        retired @ HookReturnedState::Retired { .. } => retired,
+    };
+    row(id).payload = Some(Payload::HookReturned(HookReturned {
+        state, observed: returned.observed,
+    }));
+    let mut retired = remove(id)?;
+    let Some(Payload::HookReturned(returned)) = retired.payload.take() else {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    };
+    let HookReturnedState::Retired { completion, buffers } = returned.state else {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    };
+    Ok(Some(DispatchResult::Returned {
+        irp_id,
+        status: completion.status,
+        information: completion.information,
+        file_context: completion.file_context,
+        buffers,
+    }))
+}
+
+/// Only the mutable METHOD_NEITHER hook path has a native continuation for nested work.
+/// Other File policies keep their existing dispatch contract.
+pub(super) fn dispatch_mutable_method_neither_suspend_aware(
+    caller: nt_process::native_handle::NativeHandleCaller,
+    request: ExternalFileIrpRequest,
+    input: &[u8],
+    device: nt_io_manager::DeviceId,
+    hook_owner_id: u64,
+) -> Result<HookDispatchResult, HookDispatchFailure> {
+    let result = dispatch_with_port_connect(
+        caller, request, input, &[],
+        ExternalFileIrpDispatchPolicy::MutableMethodNeitherInputAtDevice,
+        None,
+        |invocation, caller, capture| {
+            match hosted_file_dispatch::invoke_suspend_aware(invocation, caller, capture) {
+                hosted_file_dispatch::InvokeResult::Returned(returned) => Ok(returned),
+                hosted_file_dispatch::InvokeResult::ChildWorkYield {
+                    invocation, key, continuation,
+                } => Err(PortConnectYield::Keyed { invocation, key, continuation }),
+                hosted_file_dispatch::InvokeResult::UnkeyedChildWorkYield {
+                    invocation, continuation,
+                } => Err(PortConnectYield::Unkeyed { invocation, continuation }),
+            }
+        },
+    );
+    match result {
+        Ok(returned) => Ok(HookDispatchResult::Returned(returned)),
+        Err(DispatchFailure::Status(status)) => Err(HookDispatchFailure::Status(status)),
+        Err(DispatchFailure::Yield(PortConnectYield::Keyed {
+            invocation, key, continuation,
+        })) => {
+            let irp_id = invocation.irp_id();
+            match suspend_dispatch_for_pump(
+                irp_id, invocation, key, continuation, Some((hook_owner_id, device)),
+            ) {
+                Ok(()) => Ok(HookDispatchResult::PumpSuspended { irp_id, key }),
+                Err((status, invocation, continuation)) =>
+                    Err(HookDispatchFailure::UnownedYield { status, invocation, continuation }),
+            }
+        }
+        Err(DispatchFailure::Yield(PortConnectYield::Unkeyed {
+            invocation, continuation,
+        })) => Err(HookDispatchFailure::UnownedYield {
+            status: nt_status::NtStatus::INVALID_PARAMETER,
+            invocation, continuation,
+        }),
+    }
 }
 
 #[must_use = "retain an unowned native yield; it cannot be mapped to a status"]
@@ -1011,7 +1460,7 @@ pub(super) fn dispatch_port_connect(
             invocation, key, continuation,
         })) => {
             let irp_id = invocation.irp_id();
-            match suspend_dispatch_for_pump(irp_id, invocation, key, continuation) {
+            match suspend_dispatch_for_pump(irp_id, invocation, key, continuation, None) {
                 Ok(()) => Ok(PortConnectDispatchResult::PumpSuspended { irp_id, key }),
                 Err((status, invocation, continuation)) => {
                     Err(PortConnectDispatchFailure::UnownedYield {
@@ -1157,6 +1606,15 @@ fn settle_returned_dispatch(
             Err(status)
         }
         ExternalFileIrpResult::Returned(terminal) => {
+            if row(id).hook_pump.is_some() {
+                let owner = row(id);
+                owner.payload = Some(Payload::HookReturned(HookReturned {
+                    state: HookReturnedState::Terminal(terminal), observed: false,
+                }));
+                owner.flight = Flight::PumpReturned;
+                owner.hook_pump_claimed = false;
+                return Ok(DispatchResult::Outstanding { irp_id });
+            }
             let completion = *terminal.completion();
             match io_manager_mut().retire_external_file_irp_terminal(terminal) {
                 Ok((receipt, buffers)) => {
@@ -1518,6 +1976,11 @@ pub(super) fn completion(
     irp_id: IrpId,
 ) -> Result<nt_io_manager::CompletedIrp, nt_status::NtStatus> {
     let id = find(irp_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if let Some(Payload::HookReturned(HookReturned {
+        state: HookReturnedState::Terminal(terminal), ..
+    })) = row(id).payload.as_ref() {
+        return Ok(*terminal.completion());
+    }
     ensure_completion(id)?;
     row(id)
         .completion

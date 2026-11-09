@@ -436,6 +436,7 @@ pub(super) unsafe fn redrive() {
 }
 
 #[must_use = "run one outer child and deposit its sealed step in the claimed Work row"]
+#[derive(Clone, Copy)]
 pub(crate) struct PortConnectPumpSelector {
     row_index: usize,
     reverse_owner_id: u64,
@@ -461,6 +462,28 @@ pub(super) fn claim_suspended_port_connect_pump() -> Option<PortConnectPumpSelec
             return None;
         }
         let (irp_id, key) = work.port.claim_suspended_pump_step()?;
+        Some(PortConnectPumpSelector {
+            row_index,
+            reverse_owner_id: work.reverse_owner_id,
+            source_irp: work.source.source_irp_address(),
+            irp_id,
+            key,
+        })
+    })
+}
+
+/// The child receipt was deposited on a previous root turn, but an inner Hook File pump
+/// deferred this parent. Select it again without running or admitting another child.
+pub(super) fn recorded_suspended_connect_pump() -> Option<PortConnectPumpSelector> {
+    if unsafe { !(*core::ptr::addr_of!(ORPHANED_CONNECT_PUMP_STEPS)).is_empty() } {
+        return None;
+    }
+    rows().iter().enumerate().find_map(|(row_index, slot)| {
+        let work = slot.as_deref()?;
+        if work.blocked || work.port_acknowledged || !work.source.source_pin_owned() {
+            return None;
+        }
+        let (irp_id, key) = work.port.recorded_pump_selector()?;
         Some(PortConnectPumpSelector {
             row_index,
             reverse_owner_id: work.reverse_owner_id,
@@ -516,10 +539,9 @@ pub(super) unsafe fn redrive_retryable_connect_pump() -> PortConnectPumpProgress
     PortConnectPumpProgress::NoWork
 }
 
-/// Deposit the one-use child certificate in the claimed Work row before any route/parent
-/// validation. If the row disappeared despite its unsettled source, retain the certificate in
-/// a quarantined fallback row; it is never replayed or treated as provider completion.
-pub(super) unsafe fn redrive_suspended_connect_pump(
+/// Deposit the one-use child certificate before any operation that may return to root. A
+/// missing or changed Work row leaves the receipt in the orphan quarantine, never on the stack.
+pub(super) unsafe fn record_suspended_connect_pump_child_step(
     selector: PortConnectPumpSelector,
     step: crate::service_sec_image::NestedChildStep,
 ) -> PortConnectPumpProgress {
@@ -542,6 +564,25 @@ pub(super) unsafe fn redrive_suspended_connect_pump(
     }
     let (_, step) = orphaned.pop().expect("validated CONNECT child step missing");
     work.port.retain_child_step(step);
+    PortConnectPumpProgress::Retained
+}
+
+/// Resume only after the exact Work row already owns the sealed child receipt. This may be
+/// delayed while an inner Hook File child finishes without exposing an unowned CONNECT step.
+pub(super) unsafe fn redrive_recorded_connect_pump(
+    selector: PortConnectPumpSelector,
+) -> PortConnectPumpProgress {
+    let Some(work) = rows().get_mut(selector.row_index).and_then(Option::as_deref_mut) else {
+        return PortConnectPumpProgress::Blocked;
+    };
+    if work.reverse_owner_id != selector.reverse_owner_id
+        || work.source.source_irp_address() != selector.source_irp
+        || work.port.phase() != hosted_input_connect_dispatch::PortConnectPhase::PumpStepClaimed(
+            selector.irp_id, selector.key,
+        )
+    {
+        return PortConnectPumpProgress::Blocked;
+    }
     let phase = work.port.resume_pump_after_child();
     let observed = observe_port_dispatch_result(work, Ok(phase));
     if work.blocked { return PortConnectPumpProgress::Blocked; }
