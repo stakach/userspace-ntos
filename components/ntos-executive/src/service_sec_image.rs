@@ -6750,6 +6750,49 @@ pub(crate) unsafe fn nested_hosted_file_work_ready() -> bool {
         || crate::provider_directory_broker::nested_work_ready()
 }
 
+// Read-only readiness census for an indeterminate nested child under a Pending CONNECT.
+// Bits 0..2: StartFdo, CONNECT, HOOK; 3..19 follow the remaining runners in
+// redrive_nested_hosted_file_work, from create through directory broker.
+unsafe fn nested_child_ready_bits() -> u64 {
+    macro_rules! bit { ($index:expr, $ready:expr) => { u64::from($ready) << $index }; }
+    let input = bit!(0, crate::driver_launch::nested_hosted_start_fdo_ready())
+        | bit!(1, crate::driver_launch::nested_hosted_connect_forward_ready())
+        | bit!(2, crate::driver_launch::nested_hosted_hook_forward_ready());
+    if SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) == 0 { return input; }
+    input | bit!(3, crate::driver_launch::nested_hosted_driver_create_ready())
+        | bit!(4, crate::driver_launch::nested_hosted_query_path_ready())
+        | bit!(5, crate::driver_launch::nested_hosted_internal_control_ready())
+        | bit!(6, crate::driver_launch::nested_hosted_buffered_control_ready())
+        | bit!(7, crate::driver_launch::nested_hosted_write_ready())
+        | bit!(8, crate::driver_launch::nested_hosted_read_ready())
+        | bit!(9, crate::driver_launch::nested_hosted_flush_ready())
+        | bit!(10, crate::driver_launch::nested_hosted_query_information_ready())
+        | bit!(11, crate::driver_launch::nested_hosted_lower_pnp_ready())
+        | bit!(12, crate::driver_launch::nested_hosted_lower_file_ready())
+        | bit!(13, crate::driver_launch::nested_hosted_kernel_file_read_query_ready())
+        | bit!(14, crate::driver_launch::nested_hosted_win32k_async_read_ready())
+        | bit!(15, crate::driver_launch::nested_hosted_file_lifecycle_work_ready())
+        | bit!(16, crate::hosted_routed_file_close_work::nested_work_ready())
+        | bit!(17, crate::driver_launch::nested_win32k_source_work_ready())
+        | bit!(18, crate::provider_section_broker::nested_work_ready())
+        | bit!(19, crate::provider_directory_broker::nested_work_ready())
+}
+
+unsafe fn trace_nested_child_selection(stage: u64, detail: u64) {
+    static COUNT: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    if !crate::driver_launch::hosted_connect_pending_reply_published()
+        || COUNT.fetch_add(1, Ordering::Relaxed) >= 18 { return; }
+    print_str(b"[connect-nested-child] stage/detail=");
+    print_u64(stage); print_str(b"/"); print_hex_u64(detail); print_str(b"\n");
+}
+
+unsafe fn trace_nested_child_readiness(stage: u64) {
+    if crate::driver_launch::hosted_connect_pending_reply_published() {
+        trace_nested_child_selection(stage, nested_child_ready_bits());
+    }
+}
+
 /// Evidence for one outer-loop child pass under a retained physical parent. A ready runner
 /// that reports no progress may have made an uncertain native effect, so it cannot authorize
 /// parent restoration. The no-ready case checks only owner readiness and enters no runner.
@@ -6787,10 +6830,15 @@ impl NestedChildStep {
 }
 
 pub(crate) unsafe fn drive_one_nested_file_child_step() -> NestedChildStep {
-    if !nested_hosted_file_work_ready() {
+    let ready = nested_hosted_file_work_ready();
+    trace_nested_child_readiness(0);
+    if !ready {
         return NestedChildStep { outcome: NestedChildStepOutcome::NoReady };
     }
-    if redrive_nested_hosted_file_work() {
+    let progressed = redrive_nested_hosted_file_work();
+    trace_nested_child_selection(1, u64::from(progressed));
+    trace_nested_child_readiness(2);
+    if progressed {
         NestedChildStep { outcome: NestedChildStepOutcome::Progressed }
     } else {
         NestedChildStep { outcome: NestedChildStepOutcome::Indeterminate }

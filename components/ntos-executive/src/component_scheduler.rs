@@ -581,6 +581,14 @@ unsafe fn fence_nested_child_parent(
 
 /// Consume the one child-step certificate exactly once. The File owner retains any returned
 /// pending state; a wrong pump state returns both original owners without entering an effect.
+fn trace_connect_child_quarantine(reason: u64) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if !crate::driver_launch::hosted_connect_pending_reply_published()
+        || COUNT.fetch_add(1, Ordering::Relaxed) >= 8 { return; }
+    print_str(b"[connect-child-quarantine] reason=");
+    print_u64(reason); print_str(b"\n");
+}
+
 pub(super) unsafe fn resume_child_work(
     pump: HostedPumpRestore,
     step: crate::service_sec_image::NestedChildStep,
@@ -589,6 +597,7 @@ pub(super) unsafe fn resume_child_work(
         return Err((pump, step));
     };
     if matches!(step.into_decision(), crate::service_sec_image::NestedChildStepDecision::Quarantine) {
+        trace_connect_child_quarantine(1);
         if let Some(crate::spawn_hosts::NestedChildWorkState::Ready(yielded)) = result.nested_child_work {
             if let Some(ticket) = yielded.parent {
                 let _ = crate::spawn_hosts::shared_ingress::owner::runtime::nested::quarantine_child_work_parent(ticket);
@@ -598,7 +607,10 @@ pub(super) unsafe fn resume_child_work(
     }
     let inner_ticket = match result.nested_child_work {
         Some(crate::spawn_hosts::NestedChildWorkState::Ready(yielded)) => yielded.parent,
-        _ => return Ok(HostedPumpRestore::ChildWorkQuarantined { result, parent, channel, caller }),
+        _ => {
+            trace_connect_child_quarantine(2);
+            return Ok(HostedPumpRestore::ChildWorkQuarantined { result, parent, channel, caller });
+        }
     };
     Ok(resume_pending_child_work(PendingChildWorkRestore {
         mode: PendingReceiveMode::ChildWork,
