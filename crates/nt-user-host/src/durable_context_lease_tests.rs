@@ -114,3 +114,56 @@ fn retained_shared_bank_remains_exclusive_while_its_transfer_is_unbound() {
     assert_ne!(outer, replacement);
     assert_eq!(leases.get(replacement), Some(&(0x1000, "replacement")));
 }
+
+#[test]
+fn one_retained_row_excludes_both_add_device_pages_until_exact_retirement() {
+    type BankOwner = (usize, Option<usize>, &'static str);
+    let mut leases = DurableContextLeases::<u64, BankOwner>::new();
+    let reservation = leases.reserve().unwrap();
+    let add_device = leases.retain_exclusive_by(
+        reservation, 1, (0x1000, Some(0x2000), "AddDevice"), |_| false,
+    ).unwrap();
+    leases.bind(add_device).unwrap();
+    leases.unbind(add_device).unwrap();
+
+    for (key, bank) in [(2, 0x1000), (3, 0x2000)] {
+        let reservation = leases.reserve().unwrap();
+        assert_eq!(leases.retain_exclusive_by(
+            reservation, key, (bank, None, "File"),
+            |(primary, secondary, _)| *primary == bank || *secondary == Some(bank),
+        ), Err((DurableContextLeaseError::ConflictingRetained, (bank, None, "File"))));
+        assert!(leases.cancel_reservation(reservation));
+        assert_eq!(leases.get(add_device), Some(&(0x1000, Some(0x2000), "AddDevice")));
+    }
+
+    let other_reservation = leases.reserve().unwrap();
+    let other = leases.retain_exclusive_by(
+        other_reservation, 4, (0x3000, None, "File"),
+        |(primary, secondary, _)| *primary == 0x3000 || *secondary == Some(0x3000),
+    ).unwrap();
+    leases.bind(other).unwrap();
+    leases.unbind(other).unwrap();
+
+    // If File already owns the provider page, an AddDevice pair cannot partially claim its
+    // primary page and proceed to publish either page.
+    assert_eq!(leases.retire(add_device), Ok((0x1000, Some(0x2000), "AddDevice")));
+    let reservation = leases.reserve().unwrap();
+    let file = leases.retain_exclusive_by(
+        reservation, 5, (0x2000, None, "File"),
+        |(primary, secondary, _)| *primary == 0x2000 || *secondary == Some(0x2000),
+    ).unwrap();
+    let pair_reservation = leases.reserve().unwrap();
+    assert_eq!(leases.retain_exclusive_by(
+        pair_reservation, 6, (0x1000, Some(0x2000), "AddDevice"),
+        |(primary, secondary, _)| *primary == 0x1000 || *secondary == Some(0x1000)
+            || *primary == 0x2000 || *secondary == Some(0x2000),
+    ), Err((DurableContextLeaseError::ConflictingRetained,
+        (0x1000, Some(0x2000), "AddDevice"))));
+    assert!(leases.cancel_reservation(pair_reservation));
+    assert_eq!(leases.retire(file), Ok((0x2000, None, "File")));
+    assert_eq!(leases.retire(other), Ok((0x3000, None, "File")));
+    let replacement = leases.reserve().unwrap();
+    assert!(leases.retain_exclusive_by(
+        replacement, 7, (0x1000, Some(0x2000), "AddDevice"), |_| false,
+    ).is_ok());
+}

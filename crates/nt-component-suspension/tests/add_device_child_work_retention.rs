@@ -75,3 +75,51 @@ fn add_device_retains_its_parent_and_tokens_until_exact_child_restore_and_termin
         (111, 202, 303));
     assert_eq!(*terminal, 404);
 }
+
+#[test]
+fn retryable_nested_restore_keeps_add_device_parent_without_inventing_a_child() {
+    let key = (31, 32, 33, 34);
+    let mut owner = RetainedChildDispatch::<_, _, Box<u64>>::retain(key, AddDeviceOwners {
+        continuation: Box::new(1), rollback: Box::new(2), registry_identity: Box::new(3),
+    });
+    owner.park_for_child(key).unwrap();
+    assert!(owner.begin_restore(key).is_err(), "no child receipt was observed");
+    // The native continuation has a retryable physical parent ticket before any child ran.
+    owner.begin_restore_without_child(key).unwrap();
+    let (_, terminal) = owner.finish_terminal(key, Box::new(4)).unwrap_err();
+    owner.refuse_restore_no_effects(key).unwrap();
+    assert!(owner.record_child_step(key, Box::new(5)).is_err(),
+        "a native-held restore ticket must retry before another child is selected");
+    owner.begin_restore(key).unwrap();
+    owner.acknowledge_restore(key).unwrap();
+    let (owners, terminal) = owner.finish_terminal(key, terminal).unwrap();
+    assert_eq!((*owners.continuation, *owners.rollback, *owners.registry_identity), (1, 2, 3));
+    assert_eq!(*terminal, 4);
+}
+
+#[test]
+fn repeated_child_yield_rekeys_the_exact_physical_reply_without_releasing_owners() {
+    let original = (41, 42, 43, 44);
+    let next_reply = (41, 42, 45, 44);
+    let mut owner = RetainedChildDispatch::retain(original, AddDeviceOwners {
+        continuation: Box::new(1), rollback: Box::new(2), registry_identity: Box::new(3),
+    });
+    owner.park_for_child(original).unwrap();
+    owner.record_child_step(original, Box::new(5)).unwrap();
+    owner.begin_restore(original).unwrap();
+    assert_eq!(*owner.take_child_step_for_native_restore(original).unwrap(), 5);
+
+    // Native authenticated a fresh ChildWorkReady with a new Reply. Its original physical
+    // witness must stop admitting child receipts, while all move-only owners remain retained.
+    owner.repark_after_native_yield_with_key(original, next_reply).unwrap();
+    assert!(owner.owners(original).is_err());
+    assert!(owner.record_child_step(original, Box::new(6)).is_err());
+    assert_eq!(*owner.owners(next_reply).unwrap().rollback, 2);
+    owner.record_child_step(next_reply, Box::new(7)).unwrap();
+    owner.begin_restore(next_reply).unwrap();
+    assert_eq!(*owner.take_child_step_for_native_restore(next_reply).unwrap(), 7);
+    owner.acknowledge_restore(next_reply).unwrap();
+    assert!(owner.finish_terminal(original, ()).is_err());
+    let (owners, ()) = owner.finish_terminal(next_reply, ()).unwrap();
+    assert_eq!((*owners.continuation, *owners.rollback, *owners.registry_identity), (1, 2, 3));
+}

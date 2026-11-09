@@ -91,6 +91,20 @@ impl<K: Copy + Eq, B, S> RetainedChildDispatch<K, B, S> {
         Ok(())
     }
 
+    /// A native continuation may already own a retryable nested physical restore ticket
+    /// before any child certificate exists. Its adapter must prove that exact ticket before
+    /// calling this method; the row creates no child and retains the original dispatch.
+    pub fn begin_restore_without_child(
+        &mut self, key: K,
+    ) -> Result<(), RetainedChildDispatchError> {
+        self.exact(key)?;
+        if self.phase != RetainedChildDispatchPhase::Parked || self.child_step.is_some() {
+            return Err(RetainedChildDispatchError::InvalidPhase);
+        }
+        self.phase = RetainedChildDispatchPhase::Restoring;
+        Ok(())
+    }
+
     /// Only a certified no-effect refusal may retry with the same retained child receipt.
     pub fn refuse_restore_no_effects(
         &mut self, key: K,
@@ -134,13 +148,22 @@ impl<K: Copy + Eq, B, S> RetainedChildDispatch<K, B, S> {
     /// A real native child-ready result starts a new pass on this same parent. It may follow
     /// either physical restoration or a scheduler yield during the previous restore attempt.
     pub fn repark_after_native_yield(&mut self, key: K) -> Result<(), RetainedChildDispatchError> {
-        self.exact(key)?;
+        self.repark_after_native_yield_with_key(key, key)
+    }
+
+    /// Atomically replace the physical witness when native authenticated a fresh child-ready
+    /// result. The old Reply cannot select the parked parent or offer another child receipt.
+    pub fn repark_after_native_yield_with_key(
+        &mut self, old_key: K, new_key: K,
+    ) -> Result<(), RetainedChildDispatchError> {
+        self.exact(old_key)?;
         if !matches!(self.phase,
             RetainedChildDispatchPhase::Restoring | RetainedChildDispatchPhase::Restored)
             || self.child_step.is_some()
         {
             return Err(RetainedChildDispatchError::InvalidPhase);
         }
+        self.key = new_key;
         self.phase = RetainedChildDispatchPhase::Parked;
         Ok(())
     }
