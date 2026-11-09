@@ -196,7 +196,33 @@ pub(super) enum HostedPumpRestore {
     },
 }
 
+/// Read-only witness of the physical source held by a typed child-work continuation.
+/// The scheduler authenticates the live route, dispatch and Reply again before native receive.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) struct ChildWorkPhysicalIdentity {
+    pub(super) route: nt_component_suspension::peer_registry::PeerRoute,
+    pub(super) dispatch: nt_component_suspension::LaneDispatchIdentity,
+    pub(super) reply_cap: u64,
+    pub(super) tcb: u64,
+    pub(super) shared_va: u64,
+}
+
 impl HostedPumpRestore {
+    pub(super) fn child_work_identity(&self) -> Option<ChildWorkPhysicalIdentity> {
+        let (channel, dispatch, reply_cap) = match self {
+            Self::ChildWorkReady { result, channel, dispatch, .. } =>
+                (channel, *dispatch, result.reply_cap),
+            Self::ChildWorkPending(pending) =>
+                (&pending.channel, pending.dispatch, pending.result.reply_cap),
+            _ => return None,
+        };
+        if reply_cap == 0 || channel.reply_cap != reply_cap { return None; }
+        Some(ChildWorkPhysicalIdentity {
+            route: channel.ingress_route?, dispatch, reply_cap,
+            tcb: channel.tcb, shared_va: channel.shared_va,
+        })
+    }
+
     fn legacy(self) -> crate::spawn_hosts::PumpResult {
         match self {
             Self::Restored(result) => result,
@@ -247,10 +273,9 @@ pub(super) unsafe fn hosted_component_pump_observed_retained(
     hosted_component_pump_inner(channel, caller, Some(owner))
 }
 
-/// Only a File owner that can retain its native invocation may request an intentional child
-/// handoff. This private copy carries the capability through pump enter, loop and shared receive;
-/// every ordinary constructed channel remains incapable.
-unsafe fn file_child_work_channel(
+/// Only a caller that retains its native invocation and exact physical parent may request an
+/// intentional child handoff. The copied channel carries that authority through shared receive.
+unsafe fn owned_child_work_channel(
     original: &crate::spawn_hosts::PumpChannel,
 ) -> Option<crate::spawn_hosts::PumpChannel> {
     use crate::spawn_hosts::shared_ingress::owner::runtime;
@@ -277,7 +302,7 @@ pub(super) unsafe fn hosted_component_pump_with_caller_child_work(
     caller: nt_process::native_handle::NativeHandleCaller,
 ) -> HostedPumpRestore {
     crate::driver_launch::trace_port_connect_handoff_probe(10, channel, 0);
-    let Some(channel) = file_child_work_channel(channel) else {
+    let Some(channel) = owned_child_work_channel(channel) else {
         crate::driver_launch::trace_port_connect_handoff_probe(11, channel, 0);
         return HostedPumpRestore::Unattributed(crate::spawn_hosts::PumpResult::refused(
             nt_process::STATUS_INVALID_HANDLE as i32, channel.reply_cap));
@@ -295,11 +320,24 @@ pub(super) unsafe fn hosted_component_pump_observed_child_work(
         return HostedPumpRestore::Unattributed(crate::spawn_hosts::PumpResult::refused(
             nt_process::STATUS_INVALID_HANDLE as i32, channel.reply_cap));
     }
-    let Some(channel) = file_child_work_channel(channel) else {
+    let Some(channel) = owned_child_work_channel(channel) else {
         return HostedPumpRestore::Unattributed(crate::spawn_hosts::PumpResult::refused(
             nt_process::STATUS_INVALID_HANDLE as i32, channel.reply_cap));
     };
     hosted_component_pump_inner(&channel, caller, Some(owner))
+}
+
+/// AddDevice has a move-only rollback/registry transaction and a retained PnP batch cursor.
+/// Its caller must store every typed outcome before the root runs the selected child.
+pub(super) unsafe fn hosted_component_pump_with_caller_add_device_child_work(
+    channel: &crate::spawn_hosts::PumpChannel,
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> HostedPumpRestore {
+    let Some(channel) = owned_child_work_channel(channel) else {
+        return HostedPumpRestore::Unattributed(crate::spawn_hosts::PumpResult::refused(
+            nt_process::STATUS_INVALID_HANDLE as i32, channel.reply_cap));
+    };
+    hosted_component_pump_inner(&channel, Some(caller), None)
 }
 
 unsafe fn hosted_component_pump_inner(

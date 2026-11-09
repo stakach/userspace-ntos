@@ -12,8 +12,8 @@ const REGISTRY: &str = include_str!("../../../components/ntos-executive/src/prov
 #[test]
 fn primary_driver_file_pump_can_admit_a_retained_child_handoff() {
     let gate = SCHEDULER
-        .split_once("unsafe fn file_child_work_channel(")
-        .expect("typed File pump route gate")
+        .split_once("unsafe fn owned_child_work_channel(")
+        .expect("typed owned pump route gate")
         .1
         .split_once("pub(super) unsafe fn hosted_component_pump_with_caller_child_work(")
         .expect("end of route gate")
@@ -75,7 +75,7 @@ fn observed_scsi_pump_can_return_the_retained_child_handoff() {
 }
 
 #[test]
-fn only_a_typed_file_entry_can_admit_child_work() {
+fn only_a_typed_owner_entry_can_admit_child_work() {
     assert!(PUMP.contains("child_work_capable: bool"),
         "capability travels with the copied pump channel through enter and loop");
     let entry = SCHEDULER
@@ -84,13 +84,26 @@ fn only_a_typed_file_entry_can_admit_child_work() {
         .split_once("unsafe fn hosted_component_pump_inner(")
         .expect("scheduler inner boundary").0;
     assert!(SCHEDULER.contains("channel.child_work_capable = true"));
-    assert!(entry.contains("file_child_work_channel(channel)"),
+    assert!(entry.contains("owned_child_work_channel(channel)"),
         "typed entry must perform exact physical-route preflight");
     assert!(entry.contains("hosted_component_pump_inner(&channel, caller, Some(owner))"));
     for (name, source) in [("class", CLASS), ("source", SOURCE), ("win32k", WIN32K)] {
         assert!(source.contains("child_work_capable: false"),
             "{name} channels must begin without File child-work authority");
     }
+}
+
+#[test]
+fn add_device_child_entry_preserves_the_typed_result() {
+    let entry = SCHEDULER
+        .split_once("fn hosted_component_pump_with_caller_add_device_child_work(")
+        .expect("AddDevice owns a separate child-capable entry").1
+        .split_once("unsafe fn hosted_component_pump_inner(")
+        .expect("scheduler inner boundary").0;
+    assert!(entry.contains("owned_child_work_channel(channel)"));
+    assert!(entry.contains("-> HostedPumpRestore"));
+    assert!(entry.contains("hosted_component_pump_inner(&channel, Some(caller), None)"));
+    assert!(!entry.contains(".legacy()"));
 }
 
 #[test]

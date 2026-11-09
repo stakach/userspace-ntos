@@ -10753,6 +10753,46 @@ pub(crate) unsafe fn service_sec_image(
         // change its attachment. Its ordinary fault handler still performs fresh admission.
         let ingress;
         if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+        // The batch cursor owns an entered AddDevice Reply. Run only its selected child,
+        // settle any inner CONNECT, then resume that same batch before general redrives.
+        // The sealed child step is deposited before any subsequent batch borrow.
+        let mut add_device_passes = 0u8;
+        let mut consecutive_no_child_yields = 0u8;
+        loop {
+            let selected = {
+                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                match run_one_pending_add_device_child_step(nt_handler as *mut _) {
+                    Ok(selected) => selected,
+                    Err(()) => {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        break 'service_loop;
+                    }
+                }
+            };
+            let Some((reservation, ran_child)) = selected else { break };
+            let _message = crate::ipc_message::SavedMessageBuffer::capture();
+            if settle_suspended_connect_pumps().is_err() {
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                break 'service_loop;
+            }
+            pending_driver_start_redrive_selected(&mut nt_handler, Some(reservation));
+            let still_parked = nt_handler.pending_driver_starts.get_exact(reservation)
+                .is_some_and(|pending| pending.batch.wait_stage()
+                    == hosted_pnp_start::HostedPnpWaitStage::AddDevice);
+            if !still_parked { break }
+            add_device_passes += 1;
+            consecutive_no_child_yields = if ran_child { 0 }
+                else { consecutive_no_child_yields.saturating_add(1) };
+            if add_device_passes >= 16 || consecutive_no_child_yields >= 2 {
+                // The parent remains physically held. A later provider cannot borrow its
+                // Reply or either AddDevice shared page while ownership is unsettled.
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                break 'service_loop;
+            }
+        }
         // Bound notifications do not bind the offered Reply and use a separate badge namespace.
         crate::provider_bugcheck::stop_if_pending();
         // Retry outside registry/runtime borrows, including when the next ingress is excluded.
@@ -10810,43 +10850,7 @@ pub(crate) unsafe fn service_sec_image(
             // A port CONNECT may have yielded while its provider parent remained physically
             // parked. Its File frames have ended here. Run one selected child per flat pass,
             // then resume only that exact retained pump before another provider can enter.
-            crate::driver_launch::trace_port_connect_root_probe(80, 0);
-            let mut consecutive_no_child_yields = 0u8;
-            loop {
-                use crate::driver_launch::PortConnectPumpProgress as Progress;
-                match crate::driver_launch::redrive_retryable_connect_pump() {
-                    Progress::Blocked | Progress::Retained => {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
-                        break 'service_loop;
-                    }
-                    Progress::NoWork | Progress::Returned | Progress::Yielded => {}
-                }
-                let Some(selector) = crate::driver_launch::claim_suspended_port_connect_pump()
-                else { break };
-                crate::driver_launch::trace_port_connect_root_probe(81, 1);
-                let step = drive_one_nested_file_child_step();
-                let ran_child = step.ran_child();
-                match crate::driver_launch::redrive_suspended_connect_pump(selector, step) {
-                    Progress::Blocked | Progress::Retained => {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
-                        break 'service_loop;
-                    }
-                    Progress::Yielded if !ran_child => {
-                        consecutive_no_child_yields += 1;
-                        if consecutive_no_child_yields >= 2 {
-                            stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                            stop_ssn = 0;
-                            break 'service_loop;
-                        }
-                    }
-                    Progress::NoWork | Progress::Returned | Progress::Yielded => {
-                        consecutive_no_child_yields = 0;
-                    }
-                }
-            }
-            if crate::driver_launch::unsettled_suspended_connect_pump() {
+            if settle_suspended_connect_pumps().is_err() {
                 // A nonretryable restore or a claimed, orphaned, or blocked port parent still
                 // owns its Reply. No later provider may enter while that physical owner is held.
                 stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
@@ -27565,15 +27569,95 @@ fn trace_pending_driver_start_wait(
     print_str(b"\n");
 }
 
+/// Run at most one certified nested File step for an exact retained AddDevice batch. The
+/// PendingDriverStart row cannot retire during this step: its Ready cursor is held until the
+/// step is deposited, and its redrive reports AwaitingCompletion while that deposit is absent.
+unsafe fn run_one_pending_add_device_child_step(
+    handler: *mut ExecNtHandler,
+) -> Result<Option<(nt_driver_start::PendingOperationReservation, bool)>, ()> {
+    let selected = {
+        let table = &(*handler).pending_driver_starts;
+        table.occupied_slots().find_map(|slot| {
+            let pending = table.get(slot)?;
+            (pending.batch.wait_stage() == hosted_pnp_start::HostedPnpWaitStage::AddDevice)
+                .then_some((slot, pending.reservation,
+                    pending.batch.needs_add_device_child_step()))
+        })
+    };
+    let Some((slot, reservation, needs_child)) = selected else { return Ok(None) };
+    if !needs_child { return Ok(Some((reservation, false))) }
+    let step = drive_one_nested_file_child_step();
+    let ran_child = step.ran_child();
+    let pending = (*handler).pending_driver_starts.get_mut(slot)
+        .filter(|pending| pending.reservation == reservation)
+        .expect("selected AddDevice batch cannot retire before its child receipt is deposited");
+    match pending.batch.record_add_device_child_step(step) {
+        Ok(crate::hosted_pnp_start::AddDeviceStepDeposit::Recorded) =>
+            Ok(Some((reservation, ran_child))),
+        Ok(crate::hosted_pnp_start::AddDeviceStepDeposit::Quarantined) => Err(()),
+        Err(_) => unreachable!("exact AddDevice batch refused its selected child receipt"),
+    }
+}
+
+/// Settle every inner CONNECT owner before an AddDevice parent or unrelated provider resumes.
+/// Each selected child has one sealed observation; repeated empty yields are bounded.
+unsafe fn settle_suspended_connect_pumps() -> Result<(), ()> {
+    use crate::driver_launch::PortConnectPumpProgress as Progress;
+    crate::driver_launch::trace_port_connect_root_probe(80, 0);
+    let mut consecutive_no_child_yields = 0u8;
+    loop {
+        match crate::driver_launch::redrive_retryable_connect_pump() {
+            Progress::Blocked | Progress::Retained => return Err(()),
+            Progress::NoWork | Progress::Returned | Progress::Yielded => {}
+        }
+        let Some(selector) = crate::driver_launch::claim_suspended_port_connect_pump()
+        else { break };
+        crate::driver_launch::trace_port_connect_root_probe(81, 1);
+        let step = drive_one_nested_file_child_step();
+        let ran_child = step.ran_child();
+        match crate::driver_launch::redrive_suspended_connect_pump(selector, step) {
+            Progress::Blocked | Progress::Retained => return Err(()),
+            Progress::Yielded if !ran_child => {
+                consecutive_no_child_yields += 1;
+                if consecutive_no_child_yields >= 2 { return Err(()) }
+            }
+            Progress::NoWork | Progress::Returned | Progress::Yielded => {
+                consecutive_no_child_yields = 0;
+            }
+        }
+    }
+    if crate::driver_launch::unsettled_suspended_connect_pump() { Err(()) } else { Ok(()) }
+}
+
 unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
+    pending_driver_start_redrive_selected(nt_handler, None)
+}
+
+/// The root can settle only a selected parked AddDevice batch before any unrelated start row.
+/// Ordinary completion redrive uses the same terminal publication logic with no selector.
+unsafe fn pending_driver_start_redrive_selected(
+    nt_handler: &mut ExecNtHandler,
+    selected: Option<nt_driver_start::PendingOperationReservation>,
+) -> u64 {
     let mut completed = 0u64;
     for slot in 0..nt_handler.pending_driver_starts.slot_count() {
+        if selected.is_some_and(|reservation| nt_handler.pending_driver_starts
+            .get(slot).is_none_or(|pending| pending.reservation != reservation))
+        {
+            continue;
+        }
         let bootstrap_barrier = {
             let table = &nt_handler.pending_driver_starts;
             let Some(pending) = table.get(slot) else {
                 continue;
             };
-            if !matches!(&pending.owner, PendingDriverStartOwner::Boot { .. }) {
+            if selected.is_some()
+                && pending.batch.wait_stage() == hosted_pnp_start::HostedPnpWaitStage::AddDevice
+            {
+                // This exact AddDevice has already entered native code. A predecessor may
+                // affect later START policy, but cannot revoke its physical Reply owner.
+                0u8
+            } else if !matches!(&pending.owner, PendingDriverStartOwner::Boot { .. }) {
                 0u8
             } else if pending.bootstrap_predecessors.iter().any(|predecessor| {
                 table.get_exact(*predecessor).is_some_and(|older| {

@@ -4,13 +4,8 @@ const SERVICE: &str = include_str!("../../../components/ntos-executive/src/servi
 
 #[test]
 fn root_claims_and_runs_one_connect_child_before_other_provider_work() {
-    let maintenance = SERVICE
-        .split_once("crate::driver_launch::redrive_hosted_connect_forward();")
-        .expect("CONNECT redrive in outer service loop")
-        .1
-        .split_once("crate::driver_launch::redrive_hosted_hook_forward();")
-        .expect("HOOK redrive after CONNECT")
-        .0;
+    let maintenance = SERVICE.split_once("unsafe fn settle_suspended_connect_pumps()")
+        .expect("shared flat-root CONNECT settlement").1;
     let claim = maintenance
         .find("claim_suspended_port_connect_pump()")
         .expect("claim exact suspended CONNECT before child work");
@@ -21,35 +16,32 @@ fn root_claims_and_runs_one_connect_child_before_other_provider_work() {
         .find("redrive_suspended_connect_pump(")
         .expect("resume the exact CONNECT continuation");
     assert!(claim < child && child < resume);
+    let root = SERVICE.split_once("'service_loop: loop {").unwrap().1;
+    let settle = root.find("settle_suspended_connect_pumps()")
+        .expect("CONNECT settlement must run at root");
+    let later = root.find("redrive_hosted_hook_forward()")
+        .expect("HOOK redrive after CONNECT settlement");
+    assert!(settle < later);
 }
 
 #[test]
 fn unresolved_connect_parent_fences_later_provider_work() {
-    let maintenance = SERVICE
-        .split_once("crate::driver_launch::redrive_hosted_connect_forward();")
-        .expect("CONNECT redrive in outer service loop")
-        .1
-        .split_once("crate::driver_launch::redrive_hosted_hook_forward();")
-        .expect("HOOK redrive after CONNECT")
-        .0;
+    let maintenance = SERVICE.split_once("unsafe fn settle_suspended_connect_pumps()")
+        .expect("shared flat-root CONNECT settlement").1;
     let gate = maintenance
         .find("unsettled_suspended_connect_pump()")
         .expect("unresolved parked CONNECT must fence later providers");
-    let stop = maintenance[gate..]
-        .find("break 'service_loop")
-        .expect("unresolved parent cannot admit unrelated provider work");
-    assert!(stop > 0);
+    assert!(maintenance[gate..].contains("Err(())"),
+        "unresolved parent must refuse settlement");
+    let root = SERVICE.split_once("'service_loop: loop {").unwrap().1;
+    assert!(root.contains("if settle_suspended_connect_pumps().is_err()"));
+    assert!(root.contains("break 'service_loop"));
 }
 
 #[test]
 fn repeated_yield_without_a_child_cannot_spin_the_root_loop() {
-    let maintenance = SERVICE
-        .split_once("claim_suspended_port_connect_pump()")
-        .expect("root must claim a parked CONNECT")
-        .1
-        .split_once("unsettled_suspended_connect_pump()")
-        .expect("root must fence parked CONNECT before other providers")
-        .0;
+    let maintenance = SERVICE.split_once("unsafe fn settle_suspended_connect_pumps()")
+        .expect("shared flat-root CONNECT settlement").1;
     assert!(maintenance.contains("consecutive_no_child_yields"));
-    assert!(maintenance.contains("break 'service_loop"));
+    assert!(maintenance.contains("consecutive_no_child_yields >= 2 { return Err(()) }"));
 }

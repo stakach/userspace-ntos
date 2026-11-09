@@ -62622,6 +62622,7 @@ mod hosted_irp_banks;
 
 struct ActiveHostedIrpTransfer {
     shared_va: u64,
+    secondary_shared_va: Option<u64>,
     transfer_id: u64,
     source_instance: usize,
     source_domain: Option<HostedDomainIdentity>,
@@ -62747,6 +62748,7 @@ unsafe fn enter_active_hosted_irp_transfer(
     };
     let transfer = ActiveHostedIrpTransfer {
         shared_va,
+        secondary_shared_va: None,
         transfer_id,
         source_instance,
         source_domain: instance(source_instance).and_then(instance_domain_identity),
@@ -62765,7 +62767,8 @@ unsafe fn enter_active_hosted_irp_transfer(
     };
     let ticket = match transfers.retain_exclusive_by(
         reservation, (shared_va, transfer_id, source_instance), transfer,
-        |held| held.shared_va == shared_va,
+        |held| held.shared_va == shared_va
+            || held.secondary_shared_va == Some(shared_va),
     ) {
         Ok(ticket) => ticket,
         Err((error, _transfer)) => {
@@ -69451,7 +69454,7 @@ unsafe fn dispatch_driver_unload_for_instance(
     nt_status::NtStatus(pr.status).to_result()
 }
 
-unsafe fn dispatch_device_projection_control_for_instance(
+unsafe fn prepare_device_projection_control_for_instance(
     index: usize,
     driver_object: u64,
     selector: u64,
@@ -69459,8 +69462,7 @@ unsafe fn dispatch_device_projection_control_for_instance(
     previous_device_head: u64,
     delete_pdo: bool,
     class_projection: Option<hosted_upper_filter_projection::PreparedUpperFilterProjection>,
-    caller: nt_process::native_handle::NativeHandleCaller,
-) -> Result<u64, nt_status::NtStatus> {
+) -> Result<(crate::spawn_hosts::PumpChannel, u64), nt_status::NtStatus> {
     let inst = instance(index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     if inst.fault_ep == 0 || inst.pml4 == 0 || inst.reply_cap == 0 {
         return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
@@ -69521,6 +69523,23 @@ unsafe fn dispatch_device_projection_control_for_instance(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
+    Ok((ch, sh))
+}
+
+unsafe fn dispatch_device_projection_control_for_instance(
+    index: usize,
+    driver_object: u64,
+    selector: u64,
+    pdo_object: u64,
+    previous_device_head: u64,
+    delete_pdo: bool,
+    class_projection: Option<hosted_upper_filter_projection::PreparedUpperFilterProjection>,
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> Result<u64, nt_status::NtStatus> {
+    let (ch, sh) = prepare_device_projection_control_for_instance(
+        index, driver_object, selector, pdo_object, previous_device_head,
+        delete_pdo, class_projection,
+    )?;
     let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
     if !pr.completed {
         register_instance_ready(index, false);
@@ -69550,6 +69569,14 @@ unsafe fn create_hosted_pdo_projection(
         Ok(pdo_object)
     }
 }
+
+#[path = "hosted_add_device_continuation.rs"]
+mod hosted_add_device_continuation;
+pub(crate) use hosted_add_device_continuation::{
+    HostedAddDeviceContinuation, HostedAddDeviceProgress,
+    call_add_device_for_driver_progress, call_add_device_for_bus_pdo_progress,
+};
+use hosted_add_device_continuation::call_add_device_for_existing_pdo;
 
 struct AddDeviceDispatchResult {
     status: nt_status::NtStatus,
@@ -69971,260 +69998,6 @@ pub(crate) unsafe fn call_add_device_for_bus_pdo(
         bus_information,
         pdo_address,
     )
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe fn call_add_device_for_existing_pdo(
-    driver_id: u64,
-    class_guid: Option<&str>,
-    driver_key: Option<&str>,
-    linkage_export: Option<&str>,
-    instance_path: &str,
-    pdo_device_id: u64,
-    bus_information: Option<nt_pnp_manager::PnpBusInformation>,
-    pdo_address: u32,
-) -> Result<u64, nt_status::NtStatus> {
-    let _durable = crate::allocator::enter_durable();
-    let caller = crate::initial_system_driver_caller();
-    let pdo_device = nt_io_manager::DeviceId(pdo_device_id);
-    let (index, inst) =
-        instance_by_driver_id(driver_id).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
-    if inst.faulted {
-        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
-    }
-    let provider_route = hosted_provider_dispatch_route_for_instance(index);
-    let projection_instance = provider_route
-        .map(|route| route.provider_instance)
-        .unwrap_or(index);
-    let projection_inst =
-        instance(projection_instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-    if projection_inst.faulted {
-        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
-    }
-    if projection_inst.hosted_domain_id == 0 || projection_inst.hosted_domain_cookie == 0 {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
-    }
-    let registry_identity =
-        build_hosted_registry_identity(class_guid, driver_key, linkage_export, instance_path)?;
-    let projection_domain = HostedDomainIdentity {
-        domain_id: nt_io_manager::HostedDomainId(projection_inst.hosted_domain_id),
-        cookie: projection_inst.hosted_domain_cookie,
-    };
-    if io_manager_mut().hosted_domain_identity(projection_domain.domain_id)
-        != Some(projection_domain)
-    {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
-    }
-    let pdo_is_unattached = io_manager_mut()
-        .device(pdo_device)
-        .is_some_and(|device| device.top_of_stack == pdo_device && !device.delete_pending);
-    if !pdo_is_unattached {
-        return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
-    }
-    let mut rollback = Some(hosted_add_device_rollback::reserve(
-        projection_instance, projection_domain, pdo_device_id, driver_id,
-    )?);
-    let existing_pdo_object =
-        io_manager_mut().hosted_device_address_by_identity(projection_domain, pdo_device);
-    let pdo_object = match existing_pdo_object {
-        Some(pdo_object) => {
-            let binding_live = hosted_device_bindings().is_some_and(|bindings| {
-                bindings.iter().any(|binding| {
-                    binding.used
-                        && binding.projection_domain == projection_domain
-                        && binding.pdo_device_id == pdo_device_id
-                        && binding.pdo_object == pdo_object
-                })
-            });
-            if binding_live {
-                hosted_add_device_rollback::commit(rollback.take().unwrap());
-                return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
-            }
-            let registration = match hosted_device_pointer_registration(projection_domain, pdo_object, pdo_device) {
-                Ok(registration) => registration,
-                Err(status) => {
-                    hosted_add_device_rollback::commit(rollback.take().unwrap());
-                    return Err(status);
-                }
-            };
-            hosted_add_device_rollback::set_pdo(
-                rollback.as_ref().unwrap(),
-                pdo_object,
-                false,
-                Some(registration),
-            );
-            pdo_object
-        }
-        None => {
-            let pdo_object = match create_hosted_pdo_projection(projection_instance, caller) {
-                Ok(pdo) => pdo,
-                Err(status) => {
-                    hosted_add_device_rollback::block(rollback.take().unwrap(), status);
-                    return Err(status);
-                }
-            };
-            hosted_add_device_rollback::set_pdo(rollback.as_ref().unwrap(), pdo_object, true, None);
-            let registration = match register_unlinked_hosted_device_projection(
-                projection_inst,
-                projection_domain,
-                pdo_object,
-                pdo_device,
-            ) {
-                Ok(registration) => registration,
-                Err(error) => {
-                    if let Some(registration) = error.accepted_registration() {
-                        hosted_add_device_rollback::set_pdo(
-                            rollback.as_ref().unwrap(),
-                            pdo_object,
-                            true,
-                            Some(registration),
-                        );
-                        hosted_add_device_rollback::abort(rollback.take().unwrap());
-                    } else if error.cleanup_unbound {
-                        hosted_add_device_rollback::abort(rollback.take().unwrap());
-                    } else {
-                        hosted_add_device_rollback::block(rollback.take().unwrap(), error.status);
-                    }
-                    return Err(error.status);
-                }
-            };
-            hosted_add_device_rollback::set_pdo(
-                rollback.as_ref().unwrap(),
-                pdo_object,
-                true,
-                Some(registration),
-            );
-            pdo_object
-        }
-    };
-
-    let provider_add_device_shared = provider_route.and_then(|route| {
-        instance(route.provider_instance).map(|provider| provider.exec_shared_va)
-    });
-    let mut registry_identity_id = INVALID_HOSTED_REGISTRY_IDENTITY_ID;
-
-    let result = (|| -> Result<u64, nt_status::NtStatus> {
-        registry_identity_id = allocate_hosted_registry_identity(registry_identity)?;
-        hosted_add_device_rollback::record_registry(
-            rollback.as_ref().unwrap(),
-            registry_identity_id,
-            inst.exec_shared_va,
-            provider_add_device_shared,
-        );
-        publish_shared_registry_identity_at(inst.exec_shared_va, &registry_identity)?;
-        if let Some(provider_shared) = provider_add_device_shared {
-            publish_shared_registry_identity_at(provider_shared, &registry_identity)?;
-        }
-
-        write_volatile(
-            core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID),
-            registry_identity_id,
-        );
-        crate::power_manager::prepare_device(pdo_device_id)?;
-        hosted_add_device_rollback::record_power(rollback.as_ref().unwrap());
-        hosted_add_device_rollback::begin_dispatch(rollback.as_ref().unwrap());
-        let dispatch = dispatch_add_device_for_instance(index, inst, pdo_object, caller);
-        let dispatch = match dispatch {
-            Ok(dispatch) => dispatch,
-            Err(status) => {
-                hosted_add_device_rollback::block(rollback.take().unwrap(), status);
-                return Err(status);
-            }
-        };
-        hosted_add_device_rollback::completed_dispatch(rollback.as_ref().unwrap(), &dispatch);
-        write_volatile(
-            core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID),
-            INVALID_HOSTED_REGISTRY_IDENTITY_ID,
-        );
-        let add_device = &dispatch;
-        add_device.status.to_result()?;
-        if add_device.pdo_object != pdo_object {
-            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-        }
-        let device_id = io_manager_mut()
-            .hosted_device_by_identity(projection_domain, add_device.fdo_object)
-            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        let canonical_name_matches = io_manager_mut().device(device_id).is_some_and(|device| {
-            device.name.as_ref().is_none_or(|name| {
-                !registry_identity.has_linkage_export()
-                    || nt_path_ascii(name).is_some_and(|name| {
-                        name.eq_ignore_ascii_case(registry_identity.export_name.as_bytes())
-                    })
-            })
-        });
-        if !canonical_name_matches {
-            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-        }
-        validate_and_sync_hosted_device_projection(
-            projection_inst,
-            projection_domain,
-            add_device.fdo_object,
-            device_id,
-            DriverId(driver_id),
-            add_device.driver_object,
-        )?;
-        match io_manager_mut()
-            .device(device_id)
-            .and_then(|device| device.attached_to)
-        {
-            Some(lower) if lower == pdo_device => {}
-            None | Some(_) => return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
-        }
-        hosted_pnp_manager_mut()
-            .commit_device_stack(pdo_device_id, device_id.raw(), driver_id)
-            .map_err(hosted_pnp_status)?;
-        hosted_add_device_rollback::committed_stack(rollback.as_ref().unwrap(), device_id);
-        if !driver_instances().is_some_and(|table| index < table.len() && table[index].used) {
-            return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
-        }
-        let registration = hosted_device_pointer_registration(
-            projection_domain, add_device.fdo_object, device_id,
-        )?;
-        if !hosted_add_device_rollback::owns_created_registration(
-            rollback.as_ref().unwrap(), registration,
-        ) {
-            return Err(nt_status::NtStatus::INVALID_HANDLE);
-        }
-        register_hosted_device_binding(
-            driver_id,
-            device_id.raw(),
-            pdo_device_id,
-            index,
-            projection_instance,
-            projection_domain,
-            add_device.fdo_object,
-            registration,
-            pdo_object,
-            registry_identity_id,
-            bus_information.as_ref(),
-            pdo_address,
-        )?;
-
-        register_instance_ready(index, true);
-        Ok(device_id.raw())
-    })();
-
-    if rollback.is_some() {
-        write_volatile(
-            core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID),
-            INVALID_HOSTED_REGISTRY_IDENTITY_ID,
-        );
-    }
-    match result {
-        Ok(device_id) => {
-            hosted_add_device_rollback::commit(rollback.take().unwrap());
-            if let Some(provider_shared) = provider_add_device_shared {
-                clear_shared_registry_identity_at(provider_shared);
-            }
-            Ok(device_id)
-        }
-        Err(status) => {
-            if let Some(rollback) = rollback.take() {
-                hosted_add_device_rollback::abort(rollback);
-            }
-            Err(status)
-        }
-    }
 }
 
 /// Grant a hosted device driver access to the MMIO/port/interrupt resources selected for its

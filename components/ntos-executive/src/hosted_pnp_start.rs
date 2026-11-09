@@ -183,6 +183,7 @@ pub(crate) enum OwnedHostedPnpStartProgress {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostedPnpWaitStage {
     BootstrapPredecessor,
+    AddDevice,
     Relations,
     FilterAdmission,
     FilterCompletion,
@@ -195,6 +196,7 @@ impl HostedPnpWaitStage {
     pub(crate) const fn label(self) -> &'static [u8] {
         match self {
             Self::BootstrapPredecessor => b"bootstrap-predecessor",
+            Self::AddDevice => b"add-device",
             Self::Relations => b"relations",
             Self::FilterAdmission => b"filter-admission",
             Self::FilterCompletion => b"filter-completion",
@@ -211,6 +213,7 @@ pub(crate) struct OwnedHostedPnpStartBatch {
     coordinator: nt_driver_start::DriverStartBatch,
     report: HostedPnpStartReport,
     pending_device_id: u64,
+    pending_add_device: Option<PendingHostedAddDevice>,
     pending_filter_admission: Option<PendingHostedFilterAdmission>,
     pending_filter: Option<PendingHostedPnpFilter>,
     pending_grant_admission: Option<PendingHostedGrantAdmission>,
@@ -251,6 +254,22 @@ struct PendingHostedFilterAdmission {
     devnode_index: usize,
     device_id: u64,
     resource_plan: PreparedHostedResourcePlan,
+}
+
+/// The batch retains the move-only resource lease and native AddDevice transaction while the
+/// root runs one child outside every provider stack. The Ready cursor is not advanced yet.
+struct PendingHostedAddDevice {
+    devnode_index: usize,
+    resource_plan: PreparedHostedResourcePlan,
+    continuation: driver_launch::HostedAddDeviceContinuation,
+    child_step_recorded: bool,
+    blocked: bool,
+    quarantined_child_step: Option<crate::service_sec_image::NestedChildStep>,
+}
+
+pub(crate) enum AddDeviceStepDeposit {
+    Recorded,
+    Quarantined,
 }
 
 /// FILTER is terminal, but the accepted controller is not yet available for a physical grant.
@@ -296,6 +315,7 @@ impl OwnedHostedPnpStartBatch {
             coordinator,
             report,
             pending_device_id: 0,
+            pending_add_device: None,
             pending_filter_admission: None,
             pending_filter: None,
             pending_grant_admission: None,
@@ -322,6 +342,8 @@ impl OwnedHostedPnpStartBatch {
     pub(crate) fn wait_stage(&self) -> HostedPnpWaitStage {
         if self.pending_relations.is_some() {
             HostedPnpWaitStage::Relations
+        } else if self.pending_add_device.is_some() {
+            HostedPnpWaitStage::AddDevice
         } else if self.pending_filter_admission.is_some() {
             HostedPnpWaitStage::FilterAdmission
         } else if self.pending_grant_admission.is_some() {
@@ -473,7 +495,8 @@ impl OwnedHostedPnpStartBatch {
     }
 
     pub(crate) fn needs_completion_redrive(&self) -> bool {
-        self.pending_filter_admission.is_some()
+        self.pending_add_device.is_some()
+            || self.pending_filter_admission.is_some()
             || self.pending_grant_admission.as_ref().is_some_and(|pending| pending.blocked_status.is_none())
             || self.pending_filter
             .as_ref()
@@ -484,6 +507,46 @@ impl OwnedHostedPnpStartBatch {
                 self.coordinator.phase(),
                 nt_driver_start::BatchPhase::Ready | nt_driver_start::BatchPhase::Awaiting { .. }
             )
+    }
+
+    /// The root selects a child only for the exact suspended AddDevice at the Ready cursor.
+    pub(crate) fn needs_add_device_child_step(&self) -> bool {
+        self.pending_add_device.as_ref().is_some_and(|pending| {
+            !pending.blocked && !pending.child_step_recorded
+                && pending.quarantined_child_step.is_none()
+                && !driver_launch::unsettled_suspended_connect_pump()
+                && pending.devnode_index == self.coordinator.next_devnode()
+                && pending.continuation.child_work_ready()
+                && !pending.continuation.retry_without_new_child()
+        })
+    }
+
+    /// A child may have entered before this deposit. A refusal stays in this batch and fences
+    /// re-selection; the root retains the returned certificate only if the exact batch vanished.
+    pub(crate) fn record_add_device_child_step(
+        &mut self,
+        step: crate::service_sec_image::NestedChildStep,
+    ) -> Result<AddDeviceStepDeposit, crate::service_sec_image::NestedChildStep> {
+        let Some(pending) = self.pending_add_device.as_mut() else { return Err(step) };
+        if pending.quarantined_child_step.is_some() { return Err(step); }
+        if pending.blocked || pending.child_step_recorded
+            || pending.devnode_index != self.coordinator.next_devnode()
+        {
+            pending.blocked = true;
+            pending.quarantined_child_step = Some(step);
+            return Ok(AddDeviceStepDeposit::Quarantined);
+        }
+        match pending.continuation.record_child_step(step) {
+            Ok(()) => {
+                pending.child_step_recorded = true;
+                Ok(AddDeviceStepDeposit::Recorded)
+            }
+            Err(step) => {
+                pending.blocked = true;
+                pending.quarantined_child_step = Some(step);
+                Ok(AddDeviceStepDeposit::Quarantined)
+            }
+        }
     }
 
     pub(crate) unsafe fn drive(&mut self) -> OwnedHostedPnpStartProgress {
@@ -533,6 +596,17 @@ impl OwnedHostedPnpStartBatch {
         progress: HostedPnpDevnodeProgress,
     ) -> Option<OwnedHostedPnpStartProgress> {
         match progress {
+            HostedPnpDevnodeProgress::AddDevicePending {
+                resource_plan, continuation, blocked,
+            } => {
+                assert!(self.pending_add_device.is_none());
+                self.pending_add_device = Some(PendingHostedAddDevice {
+                    devnode_index, resource_plan, continuation,
+                    child_step_recorded: false, blocked,
+                    quarantined_child_step: None,
+                });
+                return Some(OwnedHostedPnpStartProgress::AwaitingCompletion);
+            }
             HostedPnpDevnodeProgress::BusRelationPending { require_accepted_bus_pdo } => {
                 if require_accepted_bus_pdo {
                     self.pending_bus_relation_devnode = Some(devnode_index);
@@ -678,7 +752,8 @@ impl OwnedHostedPnpStartBatch {
                     },
                 ))
             }
-            HostedPnpDevnodeProgress::BusRelationPending { .. }
+            HostedPnpDevnodeProgress::AddDevicePending { .. }
+            | HostedPnpDevnodeProgress::BusRelationPending { .. }
             | HostedPnpDevnodeProgress::FilterAdmissionPending { .. }
             | HostedPnpDevnodeProgress::FilterPending { .. }
             | HostedPnpDevnodeProgress::FilterOwnershipLost { .. }
@@ -691,6 +766,44 @@ impl OwnedHostedPnpStartBatch {
     unsafe fn drive_inner(&mut self, pump_before_observe: bool) -> OwnedHostedPnpStartProgress {
         let _active_drive = ActiveHostedStartBatchDrive::enter();
         loop {
+            if let Some(pending) = self.pending_add_device.as_ref() {
+                // A CONNECT child can itself suspend. Its inner physical parent must settle
+                // before this AddDevice parent resumes; neither path may replay AddDevice.
+                if pending.blocked || pending.quarantined_child_step.is_some()
+                    || driver_launch::unsettled_suspended_connect_pump()
+                    || !pending.child_step_recorded
+                        && !pending.continuation.retry_without_new_child()
+                {
+                    return OwnedHostedPnpStartProgress::AwaitingCompletion;
+                }
+                let pending = self.pending_add_device.take().expect("inspected AddDevice owner");
+                let devnode_index = pending.devnode_index;
+                assert_eq!(self.coordinator.next_devnode(), devnode_index);
+                let progress = match pending.continuation.resume() {
+                    driver_launch::HostedAddDeviceProgress::Completed(result) => {
+                        let devnode = &self.spec.devnodes[devnode_index];
+                        finish_add_device_for_devnode(result, pending.resource_plan, false,
+                            &self.spec.service_name, &devnode.instance_id,
+                            self.options, &mut self.report)
+                    }
+                    driver_launch::HostedAddDeviceProgress::ChildWorkYield(continuation) =>
+                        HostedPnpDevnodeProgress::AddDevicePending {
+                            resource_plan: pending.resource_plan,
+                            continuation, blocked: false,
+                        },
+                    driver_launch::HostedAddDeviceProgress::RetainedRefusal(continuation) => {
+                        let blocked = !continuation.retry_without_new_child();
+                        HostedPnpDevnodeProgress::AddDevicePending {
+                            resource_plan: pending.resource_plan,
+                            continuation, blocked,
+                        }
+                    }
+                };
+                if let Some(outcome) = self.apply_devnode_progress(devnode_index, progress) {
+                    return outcome;
+                }
+                continue;
+            }
             if let Some(refresh) = self.pending_relations {
                 if pump_before_observe {
                     driver_launch::pump_hosted_io_completions();
@@ -2107,6 +2220,11 @@ where
 }
 
 enum HostedPnpDevnodeProgress {
+    AddDevicePending {
+        resource_plan: PreparedHostedResourcePlan,
+        continuation: driver_launch::HostedAddDeviceContinuation,
+        blocked: bool,
+    },
     BusRelationPending { require_accepted_bus_pdo: bool },
     ResourceAdmissionPending,
     FilterAdmissionPending {
@@ -2427,12 +2545,13 @@ where
     report.attempted += 1;
     let reused_stack = options.reuse_existing_stack || existing_stack.is_some();
     let add_device = if options.reuse_existing_stack {
-        driver_launch::hosted_function_device_id_for_instance(devnode.instance_id, driver_id)
+        driver_launch::HostedAddDeviceProgress::Completed(
+            driver_launch::hosted_function_device_id_for_instance(devnode.instance_id, driver_id))
     } else if let Some(device_id) = existing_stack {
-        Ok(device_id)
+        driver_launch::HostedAddDeviceProgress::Completed(Ok(device_id))
     } else {
         match bus_pdo {
-            Some(pdo_device_id) => driver_launch::call_add_device_for_bus_pdo(
+            Some(pdo_device_id) => driver_launch::call_add_device_for_bus_pdo_progress(
                 driver_id,
                 class_guid,
                 devnode.driver_key,
@@ -2441,7 +2560,7 @@ where
                 pdo_device_id,
             ),
             None => match pdo_description {
-                Some(pdo_description) => driver_launch::call_add_device_for_driver(
+                Some(pdo_description) => driver_launch::call_add_device_for_driver_progress(
                     driver_id,
                     class_guid,
                     devnode.driver_key,
@@ -2451,10 +2570,39 @@ where
                     devnode.compatible_ids,
                     pdo_description,
                 ),
-                None => Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+                None => driver_launch::HostedAddDeviceProgress::Completed(
+                    Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)),
             },
         }
     };
+    match add_device {
+        driver_launch::HostedAddDeviceProgress::Completed(result) =>
+            finish_add_device_for_devnode(result, resource_plan, reused_stack,
+                service_name, devnode.instance_id, options, report),
+        driver_launch::HostedAddDeviceProgress::ChildWorkYield(continuation) =>
+            HostedPnpDevnodeProgress::AddDevicePending {
+                resource_plan, continuation, blocked: false,
+            },
+        driver_launch::HostedAddDeviceProgress::RetainedRefusal(continuation) => {
+            let blocked = !continuation.retry_without_new_child();
+            HostedPnpDevnodeProgress::AddDevicePending {
+                resource_plan, continuation, blocked,
+            }
+        }
+    }
+}
+
+/// Continue only after native AddDevice returned. The batch owns the same resource plan across
+/// a child yield; neither the preparation count nor the AddDevice ReplyRequest is replayed.
+unsafe fn finish_add_device_for_devnode(
+    add_device: Result<u64, nt_status::NtStatus>,
+    resource_plan: PreparedHostedResourcePlan,
+    reused_stack: bool,
+    service_name: &str,
+    instance_id: &str,
+    options: HostedPnpStartOptions,
+    report: &mut HostedPnpStartReport,
+) -> HostedPnpDevnodeProgress {
     match add_device {
         Ok(device_id) => {
             if !reused_stack {
@@ -2463,23 +2611,23 @@ where
                 print_add_device_success(
                     options.trace,
                     service_name,
-                    devnode.instance_id,
+                    instance_id,
                     device_id,
                 );
             }
-            let (filter_generation, upper_filter_driver_ids) = match resolve_upper_filter_drivers(devnode.instance_id) {
+            let (filter_generation, upper_filter_driver_ids) = match resolve_upper_filter_drivers(instance_id) {
                 Ok(plan) => plan,
                 Err(status) => {
                     print_str(b"[pnp-upper-filter] resolve failed status=0x");
                     print_hex(status.raw() as u32);
                     print_str(b" devnode=");
-                    print_str(devnode.instance_id.as_bytes());
+                    print_str(instance_id.as_bytes());
                     print_str(b"\n");
                     return finish_filter_failure(
                         device_id,
                         resource_plan,
                         service_name,
-                        devnode.instance_id,
+                        instance_id,
                         options,
                         status,
                         report,
@@ -2487,7 +2635,7 @@ where
                 }
             };
             if let Err(status) = driver_launch::attach_hosted_class_upper_filters(
-                devnode.instance_id,
+                instance_id,
                 device_id,
                 filter_generation,
                 &upper_filter_driver_ids,
@@ -2495,13 +2643,13 @@ where
                 print_str(b"[pnp-upper-filter] AddDevice failed status=0x");
                 print_hex(status.raw() as u32);
                 print_str(b" devnode=");
-                print_str(devnode.instance_id.as_bytes());
+                print_str(instance_id.as_bytes());
                 print_str(b"\n");
                 return finish_filter_failure(
                     device_id,
                     resource_plan,
                     service_name,
-                    devnode.instance_id,
+                    instance_id,
                     options,
                     status,
                     report,
@@ -2511,7 +2659,7 @@ where
                 device_id,
                 resource_plan,
                 service_name,
-                devnode.instance_id,
+                instance_id,
                 options,
                 report,
             )
@@ -2522,7 +2670,7 @@ where
                 .err()
                 .unwrap_or(status);
             record_terminal_start_failure(report, status);
-            print_add_device_failure(options.trace, service_name, devnode.instance_id, status);
+            print_add_device_failure(options.trace, service_name, instance_id, status);
             HostedPnpDevnodeProgress::Terminal {
                 device_id: 0,
                 status,
