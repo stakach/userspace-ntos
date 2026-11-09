@@ -192,6 +192,8 @@ pub(crate) mod win32k_device_pointers;
 pub(crate) mod hosted_add_device_rollback;
 #[path = "hosted_file_dispatch.rs"]
 mod hosted_file_dispatch;
+#[path = "hosted_work_queue_owner.rs"]
+mod hosted_work_queue_owner;
 #[path = "hosted_file_owners.rs"]
 mod hosted_file_owners;
 #[path = "scsi_srb_pump_phase.rs"]
@@ -33733,15 +33735,14 @@ type HostedProviderCallbackDispatcher<'a> = dyn FnMut(
     ) -> Result<u64, HostedComponentDispatchError>
     + 'a;
 
-unsafe fn dispatch_hosted_component_target(
+unsafe fn prepare_hosted_component_target(
     instance_index: usize,
     inst: DriverInstance,
     exec_code_va: u64,
     target: u64,
     args: [u64; 4],
     stack_args: [u64; PROVIDER_CALLBACK_STACK_QWORDS],
-    caller: nt_process::native_handle::NativeHandleCaller,
-) -> Result<u64, HostedComponentDispatchError> {
+) -> (crate::spawn_hosts::PumpChannel, u64) {
     let inst = instance(instance_index).unwrap_or(inst);
     let shared = inst.exec_shared_va;
     write_volatile(
@@ -33800,6 +33801,21 @@ unsafe fn dispatch_hosted_component_target(
             ..crate::spawn_hosts::HostCaps::default()
         },
     };
+    (ch, shared)
+}
+
+unsafe fn dispatch_hosted_component_target(
+    instance_index: usize,
+    inst: DriverInstance,
+    exec_code_va: u64,
+    target: u64,
+    args: [u64; 4],
+    stack_args: [u64; PROVIDER_CALLBACK_STACK_QWORDS],
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> Result<u64, HostedComponentDispatchError> {
+    let (ch, shared) = prepare_hosted_component_target(
+        instance_index, inst, exec_code_va, target, args, stack_args,
+    );
     let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
     if !pr.completed {
         register_instance_ready(instance_index, false);
@@ -33913,6 +33929,9 @@ unsafe fn drain_hosted_work_queue_for_instance(
     caller: nt_process::native_handle::NativeHandleCaller,
     io_only: bool,
 ) -> Result<u64, i32> {
+    // A prior callback may own an entered Reply after its ring slot advanced. The global
+    // drain guard is stack-scoped, so this per-instance claim fences later queue entries.
+    if hosted_work_queue_owner::pending(instance_index) { return Ok(0); }
     let shared = inst.exec_shared_va;
     let Some(exec_code_va) = ExecVaWindow::try_for_instance(instance_index).map(|win| win.code_va)
     else {
@@ -33928,14 +33947,21 @@ unsafe fn drain_hosted_work_queue_for_instance(
             break;
         }
         let slot = hosted_work_queue_slot(shared, head);
-        let kind = read_volatile((slot + SH_WORK_QUEUE_ENTRY_KIND) as *const u64);
-        if io_only && kind != HOSTED_WORK_QUEUE_KIND_IO {
+        let entry = hosted_work_queue_owner::QueueEntry {
+            kind: read_volatile((slot + SH_WORK_QUEUE_ENTRY_KIND) as *const u64),
+            work_item: read_volatile((slot + SH_WORK_QUEUE_ENTRY_WORK_ITEM) as *const u64),
+            routine: read_volatile((slot + SH_WORK_QUEUE_ENTRY_ROUTINE) as *const u64),
+            arg0: read_volatile((slot + SH_WORK_QUEUE_ENTRY_ARG0) as *const u64),
+            arg1: read_volatile((slot + SH_WORK_QUEUE_ENTRY_ARG1) as *const u64),
+        };
+        if io_only && entry.kind != HOSTED_WORK_QUEUE_KIND_IO {
             break;
         }
-        let work_item = read_volatile((slot + SH_WORK_QUEUE_ENTRY_WORK_ITEM) as *const u64);
-        let routine = read_volatile((slot + SH_WORK_QUEUE_ENTRY_ROUTINE) as *const u64);
-        let arg0 = read_volatile((slot + SH_WORK_QUEUE_ENTRY_ARG0) as *const u64);
-        let arg1 = read_volatile((slot + SH_WORK_QUEUE_ENTRY_ARG1) as *const u64);
+        let claim_key = hosted_work_queue_owner::QueueEntryKey::new(inst, head, entry.work_item);
+        if !hosted_work_queue_owner::claim(instance_index, claim_key, entry) {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let hosted_work_queue_owner::QueueEntry { kind, work_item, routine, arg0, arg1 } = entry;
         write_volatile((slot + SH_WORK_QUEUE_ENTRY_KIND) as *mut u64, 0);
         write_volatile((slot + SH_WORK_QUEUE_ENTRY_WORK_ITEM) as *mut u64, 0);
         write_volatile((slot + SH_WORK_QUEUE_ENTRY_ROUTINE) as *mut u64, 0);
@@ -33946,17 +33972,31 @@ unsafe fn drain_hosted_work_queue_for_instance(
             head.wrapping_add(1),
         );
         if routine == 0 {
+            if !hosted_work_queue_owner::abort_before_enter(instance_index, claim_key) {
+                return Err(STATUS_DEVICE_NOT_READY);
+            }
             continue;
         }
         let args = match kind {
             HOSTED_WORK_QUEUE_KIND_EX => [arg0, 0, 0, 0],
             HOSTED_WORK_QUEUE_KIND_IO => [arg0, arg1, 0, 0],
-            _ => continue,
+            _ => {
+                if !hosted_work_queue_owner::abort_before_enter(instance_index, claim_key) {
+                    return Err(STATUS_DEVICE_NOT_READY);
+                }
+                continue;
+            }
         };
         let ndis_work_dispatch = if kind == HOSTED_WORK_QUEUE_KIND_EX {
             match begin_hosted_provider_ndis_work_item_dispatch(instance_index, work_item, arg0) {
                 Ok(dispatch) => dispatch,
                 Err(status) => {
+                    // The NDIS shadow was not written and no provider callback entered.
+                    if !hosted_work_queue_owner::abort_before_enter(instance_index, claim_key) {
+                        register_instance_ready(instance_index, false);
+                        write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
+                        return Err(STATUS_DEVICE_NOT_READY);
+                    }
                     register_instance_ready(instance_index, false);
                     write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
                     return Err(status);
@@ -33965,6 +34005,21 @@ unsafe fn drain_hosted_work_queue_for_instance(
         } else {
             None
         };
+        if !hosted_work_queue_owner::record_ndis(instance_index, claim_key, ndis_work_dispatch) {
+            if let Some(dispatch) = ndis_work_dispatch {
+                mark_hosted_provider_ndis_work_item_dispatch_indeterminate(dispatch);
+            }
+            // The NDIS shadow may have committed its token. Keep the queue claim fenced.
+            register_instance_ready(instance_index, false);
+            return Err(STATUS_DEVICE_NOT_READY);
+        }
+        if hosted_work_queue_owner::enter(instance_index, claim_key).is_none() {
+            if let Some(dispatch) = ndis_work_dispatch {
+                mark_hosted_provider_ndis_work_item_dispatch_indeterminate(dispatch);
+            }
+            register_instance_ready(instance_index, false);
+            return Err(STATUS_DEVICE_NOT_READY);
+        }
         write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, PASSIVE_LEVEL);
         match dispatch_hosted_component_target(
             instance_index,
@@ -33983,6 +34038,10 @@ unsafe fn drain_hosted_work_queue_for_instance(
                     write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
                     return Err(STATUS_DEVICE_NOT_READY);
                 }
+                if !hosted_work_queue_owner::acknowledge_return(instance_index, claim_key) {
+                    write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
+                    return Err(STATUS_DEVICE_NOT_READY);
+                }
                 drained = drained.saturating_add(1);
                 let total = read_volatile((shared + SH_WORK_QUEUE_DRAINED) as *const u64);
                 write_volatile(
@@ -33994,6 +34053,7 @@ unsafe fn drain_hosted_work_queue_for_instance(
                 if let Some(dispatch) = ndis_work_dispatch {
                     mark_hosted_provider_ndis_work_item_dispatch_indeterminate(dispatch);
                 }
+                let _ = hosted_work_queue_owner::acknowledge_return(instance_index, claim_key);
                 register_instance_ready(instance_index, false);
                 write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
                 return Err(status);

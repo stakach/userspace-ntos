@@ -30,6 +30,8 @@ pub use external_selection::{
 mod ingress;
 mod inline_irq_checkpoint;
 mod nested_pre_entry_checkpoint;
+mod nested_file_work_path;
+pub use nested_file_work_path::{nested_file_work_path, NestedFileWorkPath};
 pub use nested_pre_entry_checkpoint::{
     NestedPreEntryCheckpoint, NestedPreEntryChildReceipt, NestedPreEntryError,
     NestedPreEntryPhase, NestedPreEntryRestoreEffect,
@@ -52,6 +54,8 @@ pub use peer_installation::{PeerAdmissionFence, PeerCapabilityDestination, PeerS
 mod retained_ingress;
 mod retained_dispatch;
 mod retained_child_dispatch;
+mod hosted_work_queue_claim;
+pub use hosted_work_queue_claim::{HostedWorkQueueClaim, HostedWorkQueueClaimError};
 pub use retained_child_dispatch::{
     RetainedChildDispatch, RetainedChildDispatchError, RetainedChildDispatchPhase,
 };

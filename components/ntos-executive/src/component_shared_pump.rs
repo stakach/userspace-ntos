@@ -5,7 +5,8 @@ use super::file_pump_diagnostic::{Stage, StageScope};
 use super::*;
 use nt_component_suspension::{
     InlineIrqCheckpoint, InlineIrqCheckpointError, InlineIrqCheckpointMismatch,
-    InlineIrqCheckpointObservation, IngressExecutionOwner,
+    InlineIrqCheckpointObservation, IngressExecutionOwner, NestedFileWorkPath,
+    nested_file_work_path,
 };
 use nt_component_suspension::peer_registry::PeerRoute;
 
@@ -934,14 +935,15 @@ pub(super) unsafe fn receive(
             let _stage = StageScope::enter(ch, Stage::NestedFileReady);
             crate::service_sec_image::nested_hosted_file_work_ready()
         };
-        if nested_file_ready {
+        let nested_file_path = nested_file_work_path(nested_file_ready, ch.child_work_capable);
+        if nested_file_path != NestedFileWorkPath::NoWork {
             let _stage = StageScope::enter(ch, Stage::NestedWork);
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             let mut parent = match runtime::nested::park_current() {
                 Ok(parent) => parent,
                 Err(_) => return PumpMessage::transport_wall(),
             };
-            if ch.child_work_capable {
+            if nested_file_path == NestedFileWorkPath::RetainForRoot {
                 // The File owner has already retained the move-only invocation and native bank.
                 // Keep this exact physical parent in its durable row before unwinding every
                 // pump/dispatch frame; root will run one certified child step outside them.
