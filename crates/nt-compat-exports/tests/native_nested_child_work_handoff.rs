@@ -10,6 +10,21 @@ const SHARED: &str = include_str!("../../../components/ntos-executive/src/compon
 const REGISTRY: &str = include_str!("../../../components/ntos-executive/src/provider_registry_caller.rs");
 
 #[test]
+fn primary_driver_file_pump_can_admit_a_retained_child_handoff() {
+    let gate = SCHEDULER
+        .split_once("unsafe fn file_child_work_channel(")
+        .expect("typed File pump route gate")
+        .1
+        .split_once("pub(super) unsafe fn hosted_component_pump_with_caller_child_work(")
+        .expect("end of route gate")
+        .0;
+    assert!(gate.contains("PhysicalSourceKind::Primary"),
+        "a main driver TCB is a valid physical File pump source");
+    assert!(gate.contains("PhysicalSourceKind::DispatchWorker"),
+        "a registered dispatch worker remains eligible");
+}
+
+#[test]
 fn scheduler_yields_before_completion_or_parent_restore() {
     assert!(SCHEDULER.contains("ChildWorkReady {"), "intentional child work needs a typed result");
     let body = SCHEDULER

@@ -257,7 +257,10 @@ unsafe fn file_child_work_channel(
     let route = runtime::channel_route(original).ok()??;
     let source = runtime::physical_source(route).ok()?;
     if !matches!(source.domain, runtime::PhysicalDomain::Hosted(_))
-        || !matches!(source.kind, runtime::PhysicalSourceKind::DispatchWorker { .. })
+        || !matches!(source.kind,
+            runtime::PhysicalSourceKind::Primary
+            | runtime::PhysicalSourceKind::DispatchWorker { .. })
+        || source.tcb != original.tcb || source.pml4 != original.pml4
     {
         return None;
     }
