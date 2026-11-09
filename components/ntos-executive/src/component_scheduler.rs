@@ -158,6 +158,8 @@ pub(super) struct PendingChildWorkRestore {
 enum PendingReceiveMode {
     ChildWork,
     NestedRestore,
+    /// The child receive has already run; only its retained scheduler receive may resume.
+    SchedulerYield,
 }
 
 impl PendingChildWorkRestore {
@@ -720,6 +722,11 @@ unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> Hos
                 runtime::nested::restore_child_work_parent(ticket).map(Some),
             PendingReceiveMode::NestedRestore =>
                 runtime::nested::restore_pending_ticket(ticket).map(|_| None),
+            PendingReceiveMode::SchedulerYield => {
+                pending.retryable = false;
+                trace_connect_child_restore(2, &pending);
+                return HostedPumpRestore::ChildWorkPending(pending);
+            }
         };
         match restored {
             Ok(receipt) => { pending.inner_receipt = receipt; pending.inner_restored = true; }
@@ -774,6 +781,7 @@ unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> Hos
             crate::spawn_hosts::component_pump_continue_nested_restore_receive(
                 &pending.channel, &pending.result,
             ).map_err(|status| (status, None)),
+        PendingReceiveMode::SchedulerYield => Ok(pending.result),
     };
     trace_connect_child_restore(22, &pending);
     let mut result = match receive {
@@ -787,7 +795,7 @@ unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> Hos
     };
     trace_connect_child_result(0, &result);
     let mut channel = pending.channel;
-    while result.scheduler_yielded {
+    if result.scheduler_yielded {
         trace_connect_child_result(1, &result);
         scope.service_irq_yield(channel.shared_va);
         trace_connect_child_result(2, &result);
@@ -805,6 +813,22 @@ unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> Hos
             Err(_) => return retain_uncertain_receive(pending, result, channel, 10),
         };
         trace_connect_child_result(4, &result);
+    }
+    if result.scheduler_yielded {
+        // The receive already happened. Give the retained root owner another turn rather
+        // than servicing renewed timer demand forever inside the parked AddDevice parent.
+        if result.reply_cap == 0
+            || runtime::current_reply(route).ok() != Some(result.reply_cap)
+            || runtime::dispatch(route).ok() != Some(pending.dispatch)
+        {
+            return retain_uncertain_receive(pending, result, channel, 15);
+        }
+        channel.reply_cap = result.reply_cap;
+        pending.mode = PendingReceiveMode::SchedulerYield;
+        pending.result = result;
+        pending.channel = channel;
+        pending.retryable = true;
+        return HostedPumpRestore::ChildWorkPending(pending);
     }
     if let Some(crate::spawn_hosts::NestedChildWorkState::Ready(_)) = result.nested_child_work {
         if runtime::dispatch(route).ok() != Some(pending.dispatch) {

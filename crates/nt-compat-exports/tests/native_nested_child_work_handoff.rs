@@ -154,8 +154,9 @@ fn resumed_child_step_restores_both_parents_before_receive_and_completion() {
     assert!(inner < outer && outer < receive && receive < complete);
     assert!(body.contains("step.into_decision()"),
         "an uncertain child effect cannot restore or replay the parent");
-    assert!(body.contains("while result.scheduler_yielded"),
-        "resumed receive must service IRQ yields before completion");
+    assert!(body.contains("if result.scheduler_yielded")
+        && body.contains("PendingReceiveMode::SchedulerYield"),
+        "resumed receive must service one IRQ yield and retain renewed demand before completion");
     let completion_contract = SCHEDULER
         .split_once("fn authenticate_component_completion(")
         .expect("shared exact completion contract").1
