@@ -616,6 +616,29 @@ pub(super) unsafe fn retry_child_work(pump: HostedPumpRestore) -> HostedPumpRest
     }
 }
 
+/// Retry only the exact no-effects outer restore ticket. The original pump result remains
+/// owned here; no ReplyRequest or receive is replayed on a failed physical restoration.
+pub(super) unsafe fn retry_retained_add_device_restore(
+    pump: HostedPumpRestore,
+) -> HostedPumpRestore {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    match pump {
+        HostedPumpRestore::Retained { result, key, ticket, retryable }
+            if retryable && key.scope() == ticket.identity() =>
+        {
+            if runtime::nested::restore_pending_ticket(ticket).is_ok() {
+                HostedPumpRestore::Restored(result)
+            } else {
+                HostedPumpRestore::Retained {
+                    result, key, ticket,
+                    retryable: runtime::nested::pending_ticket(ticket),
+                }
+            }
+        }
+        other => other,
+    }
+}
+
 unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> HostedPumpRestore {
     use crate::spawn_hosts::shared_ingress::owner::runtime;
     let route = match runtime::channel_route(&pending.channel) {

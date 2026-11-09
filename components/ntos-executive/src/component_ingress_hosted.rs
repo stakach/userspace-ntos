@@ -333,6 +333,9 @@ pub(crate) unsafe fn take_hosted_with(
         return Ok(None);
     }
     let pending_receive = receive_child_pending();
+    if crate::service_sec_image::root_add_device_exclusive_pending() && !pending_receive {
+        return Ok(None);
+    }
     let Some(index) = nt_component_suspension::oldest_external_ingress(
         (&*core::ptr::addr_of!(CALLS))
             .iter()
@@ -668,9 +671,50 @@ pub(crate) unsafe fn abort_root_ingress_reply_park(
         .map_err(|(_, no_effect)| (Error::Admission, no_effect))
 }
 
+/// Exact identity of an original Call retained while a selected AddDevice owns the root turn.
+/// The Call and Reply remain in CALLS; this ticket only prevents the outer turn from forgetting
+/// which ingress must be made available again after that physical parent settles.
+pub(crate) struct DeferredAddDeviceIngress {
+    binding: nt_user_host::thread_binding::ThreadBinding<crate::HostedThreadRole>,
+    reply: u64,
+    admission_sequence: u64,
+}
+
+pub(crate) unsafe fn deferred_add_device_ingress_is_exact(
+    ticket: &DeferredAddDeviceIngress,
+) -> bool {
+    (&*core::ptr::addr_of!(CALLS)).iter().flatten().any(|row| {
+        row.binding == ticket.binding
+            && !row.delivered && !row.released && row.completion.is_none()
+            && row.call.as_ref().is_some_and(|call| {
+                call.reply() == ticket.reply
+                    && call.admission_sequence() == ticket.admission_sequence
+                    && call.can_park()
+            })
+    })
+}
+
 /// Return an unexecuted root delivery to its existing physical ingress owner. No syscall has
 /// been admitted yet, so replay restores the original full message rather than captured argv.
 pub(crate) unsafe fn defer_hosted_delivery(reply: u64, badge: u64) -> Result<(), Error> {
+    defer_hosted_delivery_inner(reply, badge, false).map(|_| ())
+}
+
+/// The exact parked AddDevice permit is issued only after the selected batch has entered and
+/// retained its physical provider parent. No unrelated hosted Call is admitted by this park.
+pub(crate) unsafe fn defer_hosted_delivery_for_add_device(
+    reply: u64,
+    badge: u64,
+    _permit: &crate::service_sec_image::ParkedRootAddDevicePermit,
+) -> Result<DeferredAddDeviceIngress, Error> {
+    defer_hosted_delivery_inner(reply, badge, true)
+}
+
+unsafe fn defer_hosted_delivery_inner(
+    reply: u64,
+    badge: u64,
+    parked_add_device: bool,
+) -> Result<DeferredAddDeviceIngress, Error> {
     if crate::REPLY_MAIN_SLOT.load(Ordering::Relaxed) != reply {
         return Err(Error::PhysicalIdentity);
     }
@@ -693,6 +737,9 @@ pub(crate) unsafe fn defer_hosted_delivery(reply: u64, badge: u64) -> Result<(),
         .as_ref()
         .unwrap()
         .binding;
+    let admission_sequence = (&*core::ptr::addr_of!(CALLS))[index]
+        .as_ref().and_then(|row| row.call.as_ref())
+        .ok_or(Error::Retain)?.admission_sequence();
     let busy_win32k = crate::service_sec_image::component_shared_publication_is_busy()
         && (&*core::ptr::addr_of!(CALLS))[index]
             .as_ref()
@@ -705,6 +752,7 @@ pub(crate) unsafe fn defer_hosted_delivery(reply: u64, badge: u64) -> Result<(),
     if !crate::writable_fs::registry_journal::owns_volume()
         && (!receive_child_pending() || receive_child_is_current(binding, reply))
         && !busy_win32k
+        && !parked_add_device
     {
         return Err(Error::PhysicalIdentity);
     }
@@ -739,7 +787,7 @@ pub(crate) unsafe fn defer_hosted_delivery(reply: u64, badge: u64) -> Result<(),
     if !crate::wait_reply_pool_clear_cap(pool_index) {
         return Err(Error::Reply);
     }
-    Ok(())
+    Ok(DeferredAddDeviceIngress { binding, reply, admission_sequence })
 }
 
 pub(crate) unsafe fn owns_hosted_reply(reply: u64) -> bool {

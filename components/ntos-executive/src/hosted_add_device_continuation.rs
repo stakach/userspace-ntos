@@ -57,7 +57,7 @@ unsafe fn reserve_add_device_bank(
     Ok(SuspendedActiveHostedIrpTransfer { ticket })
 }
 
-unsafe fn retire_add_device_bank(
+pub(super) unsafe fn retire_add_device_bank(
     ticket: SuspendedActiveHostedIrpTransfer,
 ) -> Result<(), (nt_status::NtStatus, SuspendedActiveHostedIrpTransfer)> {
     active_hosted_irp_transfers_mut().retire(ticket.ticket)
@@ -138,6 +138,8 @@ impl AddDevicePumpContinuation {
         self.child_step.is_some()
             || matches!(self.pump, Some(component_scheduler::HostedPumpRestore::ChildWorkPending(ref pending))
                 if pending.retryable())
+            || matches!(self.pump,
+                Some(component_scheduler::HostedPumpRestore::Retained { retryable: true, .. }))
     }
 
     fn record_child_step(
@@ -172,6 +174,12 @@ impl AddDevicePumpContinuation {
                 if pending.retryable() =>
                     component_scheduler::retry_child_work(
                         component_scheduler::HostedPumpRestore::ChildWorkPending(pending)),
+            component_scheduler::HostedPumpRestore::Retained {
+                result, key, ticket, retryable: true,
+            } => component_scheduler::retry_retained_add_device_restore(
+                component_scheduler::HostedPumpRestore::Retained {
+                    result, key, ticket, retryable: true,
+                }),
             other => other,
         };
         self.pump = Some(next);
@@ -400,6 +408,12 @@ struct AddDeviceTransaction {
     pdo_object: u64,
     bus_information: Option<nt_pnp_manager::PnpBusInformation>,
     pdo_address: u32,
+    bank_owned_by_rollback: bool,
+}
+
+enum AddDeviceFinishProgress {
+    Completed(Result<u64, nt_status::NtStatus>),
+    RetainedCommit(hosted_add_device_rollback::Reservation, u64, usize),
 }
 
 enum AddDevicePreparation {
@@ -412,6 +426,8 @@ struct AddDeviceRetainedOwners {
     transaction: Option<AddDeviceTransaction>,
     pump: Option<AddDevicePumpContinuation>,
     terminal: Option<Result<AddDeviceDispatchResult, nt_status::NtStatus>>,
+    projection_terminal: Option<Result<u64, nt_status::NtStatus>>,
+    commit_retry: Option<(hosted_add_device_rollback::Reservation, u64, usize)>,
 }
 
 static NEXT_ADD_DEVICE_CONTINUATION_EPOCH: AtomicU64 = AtomicU64::new(1);
@@ -452,6 +468,8 @@ pub(crate) struct HostedAddDeviceContinuation {
     >,
     preentry_error: Option<nt_status::NtStatus>,
     preentry_block: bool,
+    undeposited_terminal: Option<Result<AddDeviceDispatchResult, nt_status::NtStatus>>,
+    undeposited_projection_terminal: Option<Result<u64, nt_status::NtStatus>>,
 }
 
 #[must_use = "an AddDevice yield or refusal still owns its physical transaction"]
@@ -469,10 +487,14 @@ impl HostedAddDeviceContinuation {
         let mut retained = nt_component_suspension::RetainedChildDispatch::retain(
             key, AddDeviceRetainedOwners {
                 transaction: Some(transaction), pump: Some(pump), terminal: None,
+                projection_terminal: None,
+                commit_retry: None,
             },
         );
         let _ = retained.park_for_child(key);
-        Self { retained, preentry_error: None, preentry_block: false }
+        Self { retained, preentry_error: None, preentry_block: false,
+            undeposited_terminal: None,
+            undeposited_projection_terminal: None }
     }
 
     fn retain_preentry(transaction: AddDeviceTransaction, status: nt_status::NtStatus,
@@ -484,9 +506,13 @@ impl HostedAddDeviceContinuation {
             retained: nt_component_suspension::RetainedChildDispatch::retain(
                 key, AddDeviceRetainedOwners {
                     transaction: Some(transaction), pump: None, terminal: None,
+                    projection_terminal: None,
+                    commit_retry: None,
                 },
             ),
             preentry_error: Some(status), preentry_block: block,
+            undeposited_terminal: None,
+            undeposited_projection_terminal: None,
         }
     }
 
@@ -499,10 +525,32 @@ impl HostedAddDeviceContinuation {
         let mut retained = nt_component_suspension::RetainedChildDispatch::retain(
             key, AddDeviceRetainedOwners {
                 transaction: Some(transaction), pump: None, terminal: Some(terminal),
+                projection_terminal: None,
+                commit_retry: None,
             },
         );
         let _ = retained.park_for_child(key);
-        Self { retained, preentry_error: None, preentry_block: false }
+        Self { retained, preentry_error: None, preentry_block: false,
+            undeposited_terminal: None,
+            undeposited_projection_terminal: None }
+    }
+
+    fn retain_commit(key: AddDeviceRetainedKey,
+        reservation: hosted_add_device_rollback::Reservation, device_id: u64, index: usize)
+        -> Self
+    {
+        Self {
+            retained: nt_component_suspension::RetainedChildDispatch::retain(
+                key, AddDeviceRetainedOwners {
+                    transaction: None, pump: None, terminal: None,
+                    projection_terminal: None,
+                    commit_retry: Some((reservation, device_id, index)),
+                },
+            ),
+            preentry_error: None, preentry_block: false,
+            undeposited_terminal: None,
+            undeposited_projection_terminal: None,
+        }
     }
 
     pub(crate) fn child_work_ready(&self) -> bool {
@@ -514,8 +562,12 @@ impl HostedAddDeviceContinuation {
 
     pub(crate) fn retry_without_new_child(&self) -> bool {
         if self.preentry_error.is_some() { return true; }
+        if self.undeposited_terminal.is_some() { return true; }
+        if self.undeposited_projection_terminal.is_some() { return true; }
         self.retained.owners(self.retained.key()).ok()
             .is_some_and(|owners| owners.terminal.is_some()
+                || owners.projection_terminal.is_some()
+                || owners.commit_retry.is_some()
                 || owners.pump.as_ref()
                     .is_some_and(AddDevicePumpContinuation::retry_without_new_child))
     }
@@ -523,6 +575,15 @@ impl HostedAddDeviceContinuation {
     unsafe fn settle_terminal(mut self) -> HostedAddDeviceProgress {
         use nt_component_suspension::RetainedChildDispatchPhase;
         let key = self.retained.key();
+        if let Some(result) = self.undeposited_terminal.take() {
+            match self.retained.owners_mut(key) {
+                Ok(owners) => owners.terminal = Some(result),
+                Err(_) => {
+                    self.undeposited_terminal = Some(result);
+                    return HostedAddDeviceProgress::RetainedRefusal(self);
+                }
+            }
+        }
         if self.retained.phase() == RetainedChildDispatchPhase::Parked
             && self.retained.begin_restore_without_child(key).is_err()
         {
@@ -540,7 +601,14 @@ impl HostedAddDeviceContinuation {
             .and_then(|owners| owners.transaction.as_mut()) else {
             return HostedAddDeviceProgress::RetainedRefusal(self);
         };
-        if transaction.banks.retire().is_err() {
+        // The typed bank is owned by rollback through all shared-page cleanup. A ticket
+        // still present here means attachment failed; it cannot be released before finish.
+        if transaction.banks.held() {
+            return HostedAddDeviceProgress::RetainedRefusal(self);
+        }
+        if !self.retained.owners(key).ok().is_some_and(|owners|
+            owners.transaction.is_some() && owners.terminal.is_some())
+        {
             return HostedAddDeviceProgress::RetainedRefusal(self);
         }
         let (mut owners, ()) = match self.retained.finish_terminal(key, ()) {
@@ -550,7 +618,52 @@ impl HostedAddDeviceContinuation {
         let (Some(transaction), Some(terminal)) =
             (owners.transaction.take(), owners.terminal.take())
         else { return HostedAddDeviceProgress::RetainedRefusal(self); };
-        HostedAddDeviceProgress::Completed(transaction.finish(terminal))
+        match transaction.finish(terminal) {
+            AddDeviceFinishProgress::Completed(result) => HostedAddDeviceProgress::Completed(result),
+            AddDeviceFinishProgress::RetainedCommit(reservation, device_id, index) =>
+                HostedAddDeviceProgress::RetainedRefusal(
+                    Self::retain_commit(key, reservation, device_id, index)),
+        }
+    }
+
+    unsafe fn settle_projection(mut self) -> HostedAddDeviceProgress {
+        use nt_component_suspension::RetainedChildDispatchPhase;
+        let key = self.retained.key();
+        if let Some(result) = self.undeposited_projection_terminal.take() {
+            match self.retained.owners_mut(key) {
+                Ok(owners) => owners.projection_terminal = Some(result),
+                Err(_) => {
+                    self.undeposited_projection_terminal = Some(result);
+                    return HostedAddDeviceProgress::RetainedRefusal(self);
+                }
+            }
+        }
+        if self.retained.phase() == RetainedChildDispatchPhase::Parked
+            && self.retained.begin_restore_without_child(key).is_err()
+        {
+            return HostedAddDeviceProgress::RetainedRefusal(self);
+        }
+        if self.retained.phase() == RetainedChildDispatchPhase::Restoring
+            && self.retained.acknowledge_restore(key).is_err()
+        {
+            return HostedAddDeviceProgress::RetainedRefusal(self);
+        }
+        if self.retained.phase() != RetainedChildDispatchPhase::Restored {
+            return HostedAddDeviceProgress::RetainedRefusal(self);
+        }
+        if !self.retained.owners(key).ok().is_some_and(|owners|
+            owners.transaction.is_some() && owners.projection_terminal.is_some())
+        {
+            return HostedAddDeviceProgress::RetainedRefusal(self);
+        }
+        let (mut owners, ()) = match self.retained.finish_terminal(key, ()) {
+            Ok(finished) => finished,
+            Err(_) => return HostedAddDeviceProgress::RetainedRefusal(self),
+        };
+        let (Some(transaction), Some(result)) =
+            (owners.transaction.take(), owners.projection_terminal.take())
+        else { return HostedAddDeviceProgress::RetainedRefusal(self); };
+        continue_typed_after_projection(transaction, result, key.epoch, true)
     }
 
     pub(crate) fn record_child_step(
@@ -564,6 +677,20 @@ impl HostedAddDeviceContinuation {
 
     pub(crate) unsafe fn resume(mut self) -> HostedAddDeviceProgress {
         let key = self.retained.key();
+        if let Ok(owners) = self.retained.owners_mut(key) {
+            if let Some((reservation, device_id, index)) = owners.commit_retry.take() {
+                return match hosted_add_device_rollback::commit_banked(reservation) {
+                    Ok(()) => {
+                        register_instance_ready(index, true);
+                        HostedAddDeviceProgress::Completed(Ok(device_id))
+                    }
+                    Err(reservation) => {
+                        owners.commit_retry = Some((reservation, device_id, index));
+                        HostedAddDeviceProgress::RetainedRefusal(self)
+                    }
+                };
+            }
+        }
         if let Some(status) = self.preentry_error {
             let Ok(owners) = self.retained.owners_mut(key) else {
                 return HostedAddDeviceProgress::RetainedRefusal(self);
@@ -586,8 +713,16 @@ impl HostedAddDeviceContinuation {
                 INVALID_HOSTED_REGISTRY_IDENTITY_ID);
             return HostedAddDeviceProgress::Completed(Err(status));
         }
-        if self.retained.owners(key).ok().is_some_and(|owners| owners.terminal.is_some()) {
+        if self.undeposited_terminal.is_some()
+            || self.retained.owners(key).ok().is_some_and(|owners| owners.terminal.is_some())
+        {
             return self.settle_terminal();
+        }
+        if self.undeposited_projection_terminal.is_some()
+            || self.retained.owners(key).ok()
+                .is_some_and(|owners| owners.projection_terminal.is_some())
+        {
+            return self.settle_projection();
         }
         let child_ready = self.child_work_ready();
         let retry = self.retry_without_new_child();
@@ -637,24 +772,20 @@ impl HostedAddDeviceContinuation {
             AddDevicePumpProgress::Completed(result) => {
                 if let Ok(owners) = self.retained.owners_mut(key) {
                     owners.terminal = Some(result);
+                    self.settle_terminal()
+                } else {
+                    self.undeposited_terminal = Some(result);
+                    HostedAddDeviceProgress::RetainedRefusal(self)
                 }
-                self.settle_terminal()
             }
             AddDevicePumpProgress::ProjectionCompleted(result) => {
-                use nt_component_suspension::RetainedChildDispatchPhase;
-                if self.retained.phase() == RetainedChildDispatchPhase::Restoring
-                    && self.retained.acknowledge_restore(key).is_err()
-                {
-                    return HostedAddDeviceProgress::RetainedRefusal(self);
+                if let Ok(owners) = self.retained.owners_mut(key) {
+                    owners.projection_terminal = Some(result);
+                    self.settle_projection()
+                } else {
+                    self.undeposited_projection_terminal = Some(result);
+                    HostedAddDeviceProgress::RetainedRefusal(self)
                 }
-                let (mut owners, ()) = match self.retained.finish_terminal(key, ()) {
-                    Ok(finished) => finished,
-                    Err(_) => return HostedAddDeviceProgress::RetainedRefusal(self),
-                };
-                let Some(transaction) = owners.transaction.take() else {
-                    return HostedAddDeviceProgress::RetainedRefusal(self);
-                };
-                continue_typed_after_projection(transaction, result, key.epoch, true)
             }
             AddDevicePumpProgress::ChildWorkYield(pump) => {
                 let mut next_key = key;
@@ -681,7 +812,7 @@ impl HostedAddDeviceContinuation {
 
 impl AddDeviceTransaction {
     unsafe fn finish(mut self, dispatch: Result<AddDeviceDispatchResult, nt_status::NtStatus>)
-        -> Result<u64, nt_status::NtStatus>
+        -> AddDeviceFinishProgress
     {
         let dispatch = match dispatch {
             Ok(dispatch) => dispatch,
@@ -689,7 +820,7 @@ impl AddDeviceTransaction {
                 write_volatile(core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID),
                     INVALID_HOSTED_REGISTRY_IDENTITY_ID);
                 hosted_add_device_rollback::block(self.rollback.take().unwrap(), status);
-                return Err(status);
+                return AddDeviceFinishProgress::Completed(Err(status));
             }
         };
         hosted_add_device_rollback::completed_dispatch(self.rollback.as_ref().unwrap(), &dispatch);
@@ -743,478 +874,40 @@ impl AddDeviceTransaction {
                 registration, self.pdo_object, self.registry_identity_id,
                 self.bus_information.as_ref(), self.pdo_address,
             )?;
-            register_instance_ready(self.index, true);
             Ok(device_id.raw())
         })();
         match result {
             Ok(device_id) => {
-                hosted_add_device_rollback::commit(self.rollback.take().unwrap());
                 if let Some(shared) = self.provider_add_device_shared {
                     clear_shared_registry_identity_at(shared);
                 }
-                Ok(device_id)
+                let reservation = self.rollback.take().unwrap();
+                if self.bank_owned_by_rollback {
+                    match hosted_add_device_rollback::commit_banked(reservation) {
+                        Ok(()) => {
+                            register_instance_ready(self.index, true);
+                            AddDeviceFinishProgress::Completed(Ok(device_id))
+                        }
+                        Err(reservation) => AddDeviceFinishProgress::RetainedCommit(
+                            reservation, device_id, self.index),
+                    }
+                } else {
+                    hosted_add_device_rollback::commit(reservation);
+                    register_instance_ready(self.index, true);
+                    AddDeviceFinishProgress::Completed(Ok(device_id))
+                }
             }
             Err(status) => {
                 hosted_add_device_rollback::abort(self.rollback.take().unwrap());
-                Err(status)
+                AddDeviceFinishProgress::Completed(Err(status))
             }
         }
     }
 }
 
-unsafe fn reject_typed_preentry(
-    mut transaction: AddDeviceTransaction, status: nt_status::NtStatus,
-    epoch: u64, block: bool,
-) -> HostedAddDeviceProgress {
-    if transaction.banks.retire().is_err() {
-        return HostedAddDeviceProgress::RetainedRefusal(
-            HostedAddDeviceContinuation::retain_preentry(transaction, status, epoch, block));
-    }
-    if let Some(rollback) = transaction.rollback.take() {
-        if block {
-            hosted_add_device_rollback::block(rollback, status);
-        } else {
-            hosted_add_device_rollback::abort(rollback);
-        }
-    }
-    write_volatile(core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID),
-        INVALID_HOSTED_REGISTRY_IDENTITY_ID);
-    HostedAddDeviceProgress::Completed(Err(status))
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe fn start_typed_add_device(
-    driver_id: u64,
-    class_guid: Option<&str>,
-    driver_key: Option<&str>,
-    linkage_export: Option<&str>,
-    instance_path: &str,
-    pdo_device_id: u64,
-    bus_information: Option<nt_pnp_manager::PnpBusInformation>,
-    pdo_address: u32,
-    epoch: u64,
-) -> HostedAddDeviceProgress {
-    let prepared = (|| -> Result<AddDeviceTransaction, nt_status::NtStatus> {
-        let pdo_device = nt_io_manager::DeviceId(pdo_device_id);
-        let (index, inst) = instance_by_driver_id(driver_id)
-            .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
-        if inst.faulted { return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED); }
-        let provider_route = hosted_provider_dispatch_route_for_instance(index);
-        let projection_instance = provider_route.map(|route| route.provider_instance)
-            .unwrap_or(index);
-        let projection_inst = instance(projection_instance)
-            .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-        if projection_inst.faulted {
-            return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
-        }
-        if projection_inst.hosted_domain_id == 0 || projection_inst.hosted_domain_cookie == 0 {
-            return Err(nt_status::NtStatus::INVALID_PARAMETER);
-        }
-        let projection_domain = HostedDomainIdentity {
-            domain_id: nt_io_manager::HostedDomainId(projection_inst.hosted_domain_id),
-            cookie: projection_inst.hosted_domain_cookie,
-        };
-        if io_manager_mut().hosted_domain_identity(projection_domain.domain_id)
-            != Some(projection_domain)
-        {
-            return Err(nt_status::NtStatus::INVALID_PARAMETER);
-        }
-        if !io_manager_mut().device(pdo_device)
-            .is_some_and(|device| device.top_of_stack == pdo_device && !device.delete_pending)
-        {
-            return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
-        }
-        let registry_identity = build_hosted_registry_identity(
-            class_guid, driver_key, linkage_export, instance_path,
-        )?;
-        let rollback = hosted_add_device_rollback::reserve(
-            projection_instance, projection_domain, pdo_device_id, driver_id,
-        )?;
-        let registry_identity_id = match allocate_hosted_registry_identity(registry_identity) {
-            Ok(id) => id,
-            Err(status) => {
-                hosted_add_device_rollback::abort(rollback);
-                return Err(status);
-            }
-        };
-        let provider_add_device_shared = provider_route.and_then(|route| {
-            instance(route.provider_instance).map(|provider| provider.exec_shared_va)
-        });
-        // One claim covers projection and AddDevice, including a distinct provider page.
-        let bank = match reserve_add_device_bank(
-            inst.exec_shared_va, provider_add_device_shared, index,
-        ) {
-            Ok(bank) => bank,
-            Err(status) => {
-                hosted_add_device_rollback::abort(rollback);
-                return Err(status);
-            }
-        };
-        Ok(AddDeviceTransaction {
-            rollback: Some(rollback), banks: AddDeviceBanks { ticket: Some(bank) },
-            registry_identity, registry_identity_id, provider_add_device_shared,
-            projection_inst, projection_domain, projection_instance, index, inst, driver_id,
-            pdo_device_id, pdo_object: 0, bus_information, pdo_address,
-        })
-    })();
-    let transaction = match prepared {
-        Ok(transaction) => transaction,
-        Err(status) => return HostedAddDeviceProgress::Completed(Err(status)),
-    };
-    let existing = io_manager_mut().hosted_device_address_by_identity(
-        transaction.projection_domain, nt_io_manager::DeviceId(pdo_device_id),
-    );
-    if let Some(pdo_object) = existing {
-        return continue_typed_after_projection(transaction, Ok(pdo_object), epoch, false);
-    }
-    match dispatch_pdo_projection_progress(
-        transaction.projection_instance, crate::initial_system_driver_caller(),
-    ) {
-        AddDevicePumpProgress::ProjectionCompleted(projected) =>
-            continue_typed_after_projection(transaction, projected, epoch, true),
-        AddDevicePumpProgress::ChildWorkYield(pump) => {
-            let owner = HostedAddDeviceContinuation::retain(transaction, pump, epoch);
-            if owner.child_work_ready() {
-                HostedAddDeviceProgress::ChildWorkYield(owner)
-            } else {
-                HostedAddDeviceProgress::RetainedRefusal(owner)
-            }
-        }
-        AddDevicePumpProgress::RetainedRefusal(pump) =>
-            HostedAddDeviceProgress::RetainedRefusal(
-                HostedAddDeviceContinuation::retain(transaction, pump, epoch)),
-        AddDevicePumpProgress::Completed(_) =>
-            reject_typed_preentry(
-                transaction, nt_status::NtStatus::INVALID_DEVICE_REQUEST, epoch, true),
-    }
-}
-
-/// Continue only after an authenticated projection terminal, or a pre-existing PDO identity.
-/// All later shared writes and the AddDevice entry use the same retained dual-page lease.
-unsafe fn continue_typed_after_projection(
-    mut transaction: AddDeviceTransaction,
-    projected: Result<u64, nt_status::NtStatus>,
-    epoch: u64,
-    created: bool,
-) -> HostedAddDeviceProgress {
-    let pdo_object = match projected {
-        Ok(pdo_object) if pdo_object != 0 => pdo_object,
-        Ok(_) => return reject_typed_preentry(
-            transaction, nt_status::NtStatus::INVALID_DEVICE_REQUEST, epoch, true),
-        Err(status) => return reject_typed_preentry(transaction, status, epoch, true),
-    };
-    transaction.pdo_object = pdo_object;
-    let pdo_device = nt_io_manager::DeviceId(transaction.pdo_device_id);
-    if created {
-        hosted_add_device_rollback::set_pdo(
-            transaction.rollback.as_ref().unwrap(), pdo_object, true, None,
-        );
-        let registration = match register_unlinked_hosted_device_projection(
-            transaction.projection_inst, transaction.projection_domain,
-            pdo_object, pdo_device,
-        ) {
-            Ok(registration) => registration,
-            Err(error) => {
-                if let Some(registration) = error.accepted_registration() {
-                    hosted_add_device_rollback::set_pdo(
-                        transaction.rollback.as_ref().unwrap(), pdo_object, true,
-                        Some(registration),
-                    );
-                }
-                return reject_typed_preentry(
-                    transaction, error.status, epoch, !error.cleanup_unbound
-                        && error.accepted_registration().is_none(),
-                );
-            }
-        };
-        hosted_add_device_rollback::set_pdo(
-            transaction.rollback.as_ref().unwrap(), pdo_object, true, Some(registration),
-        );
-    } else {
-        let binding_live = hosted_device_bindings().is_some_and(|bindings| {
-            bindings.iter().any(|binding| {
-                binding.used && binding.projection_domain == transaction.projection_domain
-                    && binding.pdo_device_id == transaction.pdo_device_id
-                    && binding.pdo_object == pdo_object
-            })
-        });
-        if binding_live {
-            return reject_typed_preentry(
-                transaction, nt_status::NtStatus::OBJECT_NAME_COLLISION, epoch, false);
-        }
-        let registration = match hosted_device_pointer_registration(
-            transaction.projection_domain, pdo_object, pdo_device,
-        ) {
-            Ok(registration) => registration,
-            Err(status) => return reject_typed_preentry(transaction, status, epoch, false),
-        };
-        hosted_add_device_rollback::set_pdo(
-            transaction.rollback.as_ref().unwrap(), pdo_object, false, Some(registration),
-        );
-    }
-    hosted_add_device_rollback::record_registry(
-        transaction.rollback.as_ref().unwrap(), transaction.registry_identity_id,
-        transaction.inst.exec_shared_va, transaction.provider_add_device_shared,
-    );
-    let setup = (|| -> Result<(), nt_status::NtStatus> {
-        publish_shared_registry_identity_at(
-            transaction.inst.exec_shared_va, &transaction.registry_identity,
-        )?;
-        if let Some(shared) = transaction.provider_add_device_shared {
-            publish_shared_registry_identity_at(shared, &transaction.registry_identity)?;
-        }
-        write_volatile(core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID),
-            transaction.registry_identity_id);
-        crate::power_manager::prepare_device(transaction.pdo_device_id)?;
-        hosted_add_device_rollback::record_power(transaction.rollback.as_ref().unwrap());
-        hosted_add_device_rollback::begin_dispatch(transaction.rollback.as_ref().unwrap());
-        Ok(())
-    })();
-    if let Err(status) = setup {
-        return reject_typed_preentry(transaction, status, epoch, false);
-    }
-    match dispatch_add_device_for_instance_progress(
-        transaction.index, transaction.inst, transaction.pdo_object,
-        crate::initial_system_driver_caller(),
-    ) {
-        AddDevicePumpProgress::Completed(dispatch) =>
-            HostedAddDeviceContinuation::retain_terminal(transaction, dispatch, epoch)
-                .settle_terminal(),
-        AddDevicePumpProgress::ChildWorkYield(pump) => {
-            let owner = HostedAddDeviceContinuation::retain(transaction, pump, epoch);
-            if owner.child_work_ready() {
-                HostedAddDeviceProgress::ChildWorkYield(owner)
-            } else {
-                HostedAddDeviceProgress::RetainedRefusal(owner)
-            }
-        }
-        AddDevicePumpProgress::RetainedRefusal(pump) =>
-            HostedAddDeviceProgress::RetainedRefusal(
-                HostedAddDeviceContinuation::retain(transaction, pump, epoch)),
-        AddDevicePumpProgress::ProjectionCompleted(_) =>
-            reject_typed_preentry(
-                transaction, nt_status::NtStatus::INVALID_DEVICE_REQUEST, epoch, true),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe fn prepare_add_device_transaction(
-    driver_id: u64,
-    class_guid: Option<&str>,
-    driver_key: Option<&str>,
-    linkage_export: Option<&str>,
-    instance_path: &str,
-    pdo_device_id: u64,
-    bus_information: Option<nt_pnp_manager::PnpBusInformation>,
-    pdo_address: u32,
-    lease_bank: bool,
-) -> AddDevicePreparation {
-    let _durable = crate::allocator::enter_durable();
-    let mut retained_tx = None;
-    let prepare = (|| -> Result<AddDeviceTransaction, nt_status::NtStatus> {
-    let caller = crate::initial_system_driver_caller();
-    let pdo_device = nt_io_manager::DeviceId(pdo_device_id);
-    let (index, inst) =
-        instance_by_driver_id(driver_id).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
-    if inst.faulted { return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED); }
-    let provider_route = hosted_provider_dispatch_route_for_instance(index);
-    let projection_instance = provider_route.map(|route| route.provider_instance).unwrap_or(index);
-    let projection_inst = instance(projection_instance)
-        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-    if projection_inst.faulted { return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED); }
-    if projection_inst.hosted_domain_id == 0 || projection_inst.hosted_domain_cookie == 0 {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
-    }
-    let registry_identity =
-        build_hosted_registry_identity(class_guid, driver_key, linkage_export, instance_path)?;
-    let projection_domain = HostedDomainIdentity {
-        domain_id: nt_io_manager::HostedDomainId(projection_inst.hosted_domain_id),
-        cookie: projection_inst.hosted_domain_cookie,
-    };
-    if io_manager_mut().hosted_domain_identity(projection_domain.domain_id)
-        != Some(projection_domain)
-    {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
-    }
-    if !io_manager_mut().device(pdo_device)
-        .is_some_and(|device| device.top_of_stack == pdo_device && !device.delete_pending)
-    {
-        return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
-    }
-    let mut rollback = Some(hosted_add_device_rollback::reserve(
-        projection_instance, projection_domain, pdo_device_id, driver_id,
-    )?);
-    let result = (|| -> Result<AddDeviceTransaction, nt_status::NtStatus> {
-        let pdo_object = match io_manager_mut()
-            .hosted_device_address_by_identity(projection_domain, pdo_device)
-        {
-            Some(pdo_object) => {
-                let binding_live = hosted_device_bindings().is_some_and(|bindings| {
-                    bindings.iter().any(|binding| {
-                        binding.used && binding.projection_domain == projection_domain
-                            && binding.pdo_device_id == pdo_device_id
-                            && binding.pdo_object == pdo_object
-                    })
-                });
-                if binding_live {
-                    hosted_add_device_rollback::commit(rollback.take().unwrap());
-                    return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
-                }
-                let registration = match hosted_device_pointer_registration(
-                    projection_domain, pdo_object, pdo_device,
-                ) {
-                    Ok(registration) => registration,
-                    Err(status) => {
-                        hosted_add_device_rollback::commit(rollback.take().unwrap());
-                        return Err(status);
-                    }
-                };
-                hosted_add_device_rollback::set_pdo(
-                    rollback.as_ref().unwrap(), pdo_object, false, Some(registration),
-                );
-                pdo_object
-            }
-            None => {
-                let pdo_object = match create_hosted_pdo_projection(projection_instance, caller) {
-                    Ok(pdo) => pdo,
-                    Err(status) => {
-                        hosted_add_device_rollback::block(rollback.take().unwrap(), status);
-                        return Err(status);
-                    }
-                };
-                hosted_add_device_rollback::set_pdo(
-                    rollback.as_ref().unwrap(), pdo_object, true, None,
-                );
-                let registration = match register_unlinked_hosted_device_projection(
-                    projection_inst, projection_domain, pdo_object, pdo_device,
-                ) {
-                    Ok(registration) => registration,
-                    Err(error) => {
-                        if let Some(registration) = error.accepted_registration() {
-                            hosted_add_device_rollback::set_pdo(
-                                rollback.as_ref().unwrap(), pdo_object, true, Some(registration),
-                            );
-                            hosted_add_device_rollback::abort(rollback.take().unwrap());
-                        } else if error.cleanup_unbound {
-                            hosted_add_device_rollback::abort(rollback.take().unwrap());
-                        } else {
-                            hosted_add_device_rollback::block(rollback.take().unwrap(), error.status);
-                        }
-                        return Err(error.status);
-                    }
-                };
-                hosted_add_device_rollback::set_pdo(
-                    rollback.as_ref().unwrap(), pdo_object, true, Some(registration),
-                );
-                pdo_object
-            }
-        };
-        let provider_add_device_shared = provider_route.and_then(|route| {
-            instance(route.provider_instance).map(|provider| provider.exec_shared_va)
-        });
-        let registry_identity_id = allocate_hosted_registry_identity(registry_identity)?;
-        let bank = if lease_bank {
-            Some(reserve_add_device_bank(
-                inst.exec_shared_va, provider_add_device_shared, index,
-            )?)
-        } else { None };
-        retained_tx = Some(AddDeviceTransaction {
-            rollback: rollback.take(), banks: AddDeviceBanks { ticket: bank },
-            registry_identity, registry_identity_id, provider_add_device_shared,
-            projection_inst, projection_domain, projection_instance, index, inst, driver_id,
-            pdo_device_id, pdo_object, bus_information, pdo_address,
-        });
-        let transaction = retained_tx.as_ref().unwrap();
-        hosted_add_device_rollback::record_registry(
-            transaction.rollback.as_ref().unwrap(), registry_identity_id, inst.exec_shared_va,
-            provider_add_device_shared,
-        );
-        publish_shared_registry_identity_at(inst.exec_shared_va, &registry_identity)?;
-        if let Some(shared) = provider_add_device_shared {
-            publish_shared_registry_identity_at(shared, &registry_identity)?;
-        }
-        write_volatile(core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID),
-            registry_identity_id);
-        crate::power_manager::prepare_device(pdo_device_id)?;
-        hosted_add_device_rollback::record_power(transaction.rollback.as_ref().unwrap());
-        hosted_add_device_rollback::begin_dispatch(transaction.rollback.as_ref().unwrap());
-        Ok(retained_tx.take().unwrap())
-    })();
-    if result.is_err() {
-        write_volatile(core::ptr::addr_of_mut!(HOSTED_ADD_DEVICE_REGISTRY_IDENTITY_ID),
-            INVALID_HOSTED_REGISTRY_IDENTITY_ID);
-        if let Some(rollback) = rollback.take() {
-            hosted_add_device_rollback::abort(rollback);
-        }
-    }
-    result
-    })();
-    match prepare {
-        Ok(transaction) => AddDevicePreparation::Ready(transaction),
-        Err(status) => {
-            if let Some(mut transaction) = retained_tx.take() {
-                if transaction.banks.retire().is_err() {
-                    return AddDevicePreparation::Retained(transaction, status);
-                }
-                if let Some(rollback) = transaction.rollback.take() {
-                    hosted_add_device_rollback::abort(rollback);
-                }
-            }
-            AddDevicePreparation::Rejected(status)
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn call_add_device_for_existing_pdo(
-    driver_id: u64,
-    class_guid: Option<&str>,
-    driver_key: Option<&str>,
-    linkage_export: Option<&str>,
-    instance_path: &str,
-    pdo_device_id: u64,
-    bus_information: Option<nt_pnp_manager::PnpBusInformation>,
-    pdo_address: u32,
-) -> Result<u64, nt_status::NtStatus> {
-    let _durable = crate::allocator::enter_durable();
-    let transaction = match prepare_add_device_transaction(
-        driver_id, class_guid, driver_key, linkage_export, instance_path,
-        pdo_device_id, bus_information, pdo_address, false,
-    ) {
-        AddDevicePreparation::Ready(transaction) => transaction,
-        AddDevicePreparation::Rejected(status) => return Err(status),
-        AddDevicePreparation::Retained(_, _) =>
-            unreachable!("unleased legacy AddDevice cannot retain a bank"),
-    };
-    let dispatch = dispatch_add_device_for_instance(
-        transaction.index, transaction.inst, transaction.pdo_object,
-        crate::initial_system_driver_caller(),
-    );
-    transaction.finish(dispatch)
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe fn call_add_device_for_existing_pdo_progress(
-    driver_id: u64,
-    class_guid: Option<&str>,
-    driver_key: Option<&str>,
-    linkage_export: Option<&str>,
-    instance_path: &str,
-    pdo_device_id: u64,
-    bus_information: Option<nt_pnp_manager::PnpBusInformation>,
-    pdo_address: u32,
-) -> HostedAddDeviceProgress {
-    let _durable = crate::allocator::enter_durable();
-    // Exhaustion is checked before any PDO or native effect, so no move-only owner can be lost.
-    let epoch = match NEXT_ADD_DEVICE_CONTINUATION_EPOCH.fetch_update(
-        Ordering::AcqRel, Ordering::Acquire, |next| next.checked_add(1),
-    ) {
-        Ok(epoch) => epoch,
-        Err(_) => return HostedAddDeviceProgress::Completed(
-            Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES)),
-    };
-    start_typed_add_device(
-        driver_id, class_guid, driver_key, linkage_export, instance_path,
-        pdo_device_id, bus_information, pdo_address, epoch,
-    )
-}
+#[path = "hosted_add_device_continuation/preparation.rs"]
+mod preparation;
+use preparation::{
+    call_add_device_for_existing_pdo_progress, continue_typed_after_projection,
+};
+pub(super) use preparation::call_add_device_for_existing_pdo;

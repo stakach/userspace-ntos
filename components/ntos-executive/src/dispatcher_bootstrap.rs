@@ -134,6 +134,7 @@ unsafe fn collect_owned_deadline(now: nt_time::TimeSnapshot) -> Result<Option<(u
                 user_timer: None,
                 job_time: None,
                 component_resume: service_sec_image::component_resume::retained_deadline(),
+                root_add_device: None,
             })
         })
         .map_err(|_| 0xC000_00A3u32)??;

@@ -521,6 +521,15 @@ impl OwnedHostedPnpStartBatch {
         })
     }
 
+    pub(crate) fn retry_add_device_without_new_child(&self) -> bool {
+        self.pending_add_device.as_ref().is_some_and(|pending| {
+            !pending.blocked && !pending.child_step_recorded
+                && pending.quarantined_child_step.is_none()
+                && pending.devnode_index == self.coordinator.next_devnode()
+                && pending.continuation.retry_without_new_child()
+        })
+    }
+
     /// A child may have entered before this deposit. A refusal stays in this batch and fences
     /// re-selection; the root retains the returned certificate only if the exact batch vanished.
     pub(crate) fn record_add_device_child_step(
@@ -550,13 +559,24 @@ impl OwnedHostedPnpStartBatch {
     }
 
     pub(crate) unsafe fn drive(&mut self) -> OwnedHostedPnpStartProgress {
-        self.drive_inner(true)
+        self.drive_inner(true, false)
     }
 
     /// Resume after the caller has pumped the shared hosted-I/O completion plane once.
     /// Walking several pending batches must not repump that global plane once per row.
     pub(crate) unsafe fn drive_after_completion_pump(&mut self) -> OwnedHostedPnpStartProgress {
-        self.drive_inner(false)
+        self.drive_inner(false, false)
+    }
+
+    /// Only the flat root phase can enter a new native AddDevice parent. Ordinary completion
+    /// redrives may reach Ready, but leave its physical Reply and resource plan unentered.
+    pub(crate) unsafe fn drive_flat_root_add_device(&mut self) -> OwnedHostedPnpStartProgress {
+        self.drive_inner(false, true)
+    }
+
+    pub(crate) fn ready_for_flat_root_add_device(&self) -> bool {
+        self.wait_stage() == HostedPnpWaitStage::DevnodeAdmission
+            && self.coordinator.phase() == nt_driver_start::BatchPhase::Ready
     }
 
     unsafe fn schedule_initial_bus_relations(
@@ -763,10 +783,18 @@ impl OwnedHostedPnpStartBatch {
         }
     }
 
-    unsafe fn drive_inner(&mut self, pump_before_observe: bool) -> OwnedHostedPnpStartProgress {
+    unsafe fn drive_inner(&mut self, pump_before_observe: bool,
+        flat_root_add_device_permit: bool) -> OwnedHostedPnpStartProgress {
         let _active_drive = ActiveHostedStartBatchDrive::enter();
+        let mut flat_root_add_device_permit = flat_root_add_device_permit;
         loop {
             if let Some(pending) = self.pending_add_device.as_ref() {
+                // Only the selected flat root turn may consume this physical parent. An
+                // ordinary timer, completion, or selected Receive child can update readiness,
+                // but it cannot retire the exact row behind the root's retained ingress.
+                if !flat_root_add_device_permit {
+                    return OwnedHostedPnpStartProgress::AwaitingCompletion;
+                }
                 // A CONNECT child can itself suspend. Its inner physical parent must settle
                 // before this AddDevice parent resumes; neither path may replay AddDevice.
                 if pending.blocked || pending.quarantined_child_step.is_some()
@@ -777,6 +805,7 @@ impl OwnedHostedPnpStartBatch {
                     return OwnedHostedPnpStartProgress::AwaitingCompletion;
                 }
                 let pending = self.pending_add_device.take().expect("inspected AddDevice owner");
+                flat_root_add_device_permit = false;
                 let devnode_index = pending.devnode_index;
                 assert_eq!(self.coordinator.next_devnode(), devnode_index);
                 let progress = match pending.continuation.resume() {
@@ -1103,9 +1132,13 @@ impl OwnedHostedPnpStartBatch {
                     }
                 }
                 nt_driver_start::BatchPhase::Ready => {
+                    if !flat_root_add_device_permit {
+                        return OwnedHostedPnpStartProgress::AwaitingCompletion;
+                    }
                     if defer_unrelated_start_during_native_drain(false) {
                         return OwnedHostedPnpStartProgress::AwaitingCompletion;
                     }
+                    flat_root_add_device_permit = false;
                     let devnode_index = self.coordinator.next_devnode();
                     let devnode = &self.spec.devnodes[devnode_index];
                     let progress = start_one_devnode(
@@ -1205,11 +1238,40 @@ impl OwnedHostedPnpRebalance {
     }
 
     pub(crate) unsafe fn drive(&mut self) -> OwnedHostedPnpRebalanceProgress {
-        self.drive_inner(true)
+        self.drive_inner(true, false)
     }
 
     pub(crate) unsafe fn drive_after_completion_pump(&mut self) -> OwnedHostedPnpRebalanceProgress {
-        self.drive_inner(false)
+        self.drive_inner(false, false)
+    }
+
+    pub(crate) unsafe fn drive_flat_root_add_device(&mut self) -> OwnedHostedPnpRebalanceProgress {
+        self.drive_inner(false, true)
+    }
+
+    pub(crate) fn ready_for_flat_root_add_device(&self) -> bool {
+        self.stage == HostedPnpRebalanceStage::Restart
+            && self.restart.ready_for_flat_root_add_device()
+    }
+
+    pub(crate) fn add_device_wait_stage(&self) -> bool {
+        self.stage == HostedPnpRebalanceStage::Restart
+            && self.restart.wait_stage() == HostedPnpWaitStage::AddDevice
+    }
+
+    pub(crate) fn needs_add_device_child_step(&self) -> bool {
+        self.add_device_wait_stage() && self.restart.needs_add_device_child_step()
+    }
+
+    pub(crate) fn retry_add_device_without_new_child(&self) -> bool {
+        self.add_device_wait_stage() && self.restart.retry_add_device_without_new_child()
+    }
+
+    pub(crate) fn record_add_device_child_step(
+        &mut self, step: crate::service_sec_image::NestedChildStep,
+    ) -> Result<AddDeviceStepDeposit, crate::service_sec_image::NestedChildStep> {
+        if !self.add_device_wait_stage() { return Err(step) }
+        self.restart.record_add_device_child_step(step)
     }
 
     fn fail_terminal(&mut self, failure: HostedPnpStartBatchFailure) {
@@ -1305,7 +1367,8 @@ impl OwnedHostedPnpRebalance {
         }
     }
 
-    unsafe fn drive_inner(&mut self, pump_before_observe: bool) -> OwnedHostedPnpRebalanceProgress {
+    unsafe fn drive_inner(&mut self, pump_before_observe: bool,
+        flat_root_add_device_permit: bool) -> OwnedHostedPnpRebalanceProgress {
         loop {
             match self.stage {
                 HostedPnpRebalanceStage::QueryStop => {
@@ -1356,7 +1419,9 @@ impl OwnedHostedPnpRebalance {
                     }
                 }
                 HostedPnpRebalanceStage::Restart => {
-                    let progress = if pump_before_observe {
+                    let progress = if flat_root_add_device_permit {
+                        self.restart.drive_flat_root_add_device()
+                    } else if pump_before_observe {
                         self.restart.drive()
                     } else {
                         self.restart.drive_after_completion_pump()

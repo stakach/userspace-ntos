@@ -45,6 +45,7 @@ struct Owner {
     provider_registry_shared: Option<u64>,
     power_prepared: bool,
     dispatch_context_held: bool,
+    bank_ticket: Option<SuspendedActiveHostedIrpTransfer>,
 }
 
 static mut OWNERS: Vec<Owner> = Vec::new();
@@ -165,9 +166,26 @@ pub(super) unsafe fn reserve(
         provider_registry_shared: None,
         power_prepared: false,
         dispatch_context_held: false,
+        bank_ticket: None,
     });
     core::ptr::addr_of_mut!(NEXT_OWNER).write(next);
     Ok(Reservation(id))
+}
+
+/// Transfer the one atomic primary/provider page claim to the rollback owner before either
+/// projection or AddDevice enters native code. Deferred drain keeps the same exact ticket.
+pub(super) unsafe fn attach_bank_ticket(
+    reservation: &Reservation,
+    bank_ticket: SuspendedActiveHostedIrpTransfer,
+) -> Result<(), SuspendedActiveHostedIrpTransfer> {
+    let Some(row) = owners().iter_mut().find(|row| row.id == reservation.0) else {
+        return Err(bank_ticket);
+    };
+    if row.phase != Phase::Preparing || row.bank_ticket.is_some() {
+        return Err(bank_ticket);
+    }
+    row.bank_ticket = Some(bank_ticket);
+    Ok(())
 }
 
 pub(super) unsafe fn record_registry(
@@ -502,6 +520,30 @@ pub(super) unsafe fn commit(reservation: Reservation) {
     owners().swap_remove(index);
 }
 
+/// Finalize a typed AddDevice only when its exact shared-page claim can be retired. A refusal
+/// leaves the committed projection owner and the bank ticket together for a no-replay retry.
+pub(super) unsafe fn commit_banked(
+    reservation: Reservation,
+) -> Result<(), Reservation> {
+    let Some(index) = owners().iter().position(|owner| owner.id == reservation.0) else {
+        return Err(reservation);
+    };
+    if owners()[index].phase != Phase::Preparing || owners()[index].created_reserved != 0 {
+        return Err(reservation);
+    }
+    if let Some(ticket) = owners()[index].bank_ticket.take() {
+        match crate::driver_launch::hosted_add_device_continuation::retire_add_device_bank(ticket) {
+            Ok(()) => {}
+            Err((_, ticket)) => {
+                owners()[index].bank_ticket = Some(ticket);
+                return Err(reservation);
+            }
+        }
+    }
+    owners().swap_remove(index);
+    Ok(())
+}
+
 pub(super) unsafe fn block(reservation: Reservation, status: nt_status::NtStatus) {
     block_id(reservation.0, status);
 }
@@ -694,12 +736,25 @@ unsafe fn advance_inner(id: u64) -> Result<(), nt_status::NtStatus> {
     };
     if power_prepared {
         crate::power_manager::unregister_device(pdo_id);
+        owner(id).power_prepared = false;
     }
     if shared != 0 {
         clear_shared_registry_identity_at(shared);
+        owner(id).registry_shared = 0;
     }
     if let Some(shared) = provider_shared {
         clear_shared_registry_identity_at(shared);
+        owner(id).provider_registry_shared = None;
+    }
+    let ticket = owner(id).bank_ticket.take();
+    if let Some(ticket) = ticket {
+        match crate::driver_launch::hosted_add_device_continuation::retire_add_device_bank(ticket) {
+            Ok(()) => {}
+            Err((status, ticket)) => {
+                owner(id).bank_ticket = Some(ticket);
+                return Err(status);
+            }
+        }
     }
     if registry_identity != INVALID_HOSTED_REGISTRY_IDENTITY_ID {
         release_hosted_registry_identity(registry_identity);

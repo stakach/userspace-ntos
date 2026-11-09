@@ -4,6 +4,12 @@ const SOURCE: &str = include_str!("../../../components/ntos-executive/src/driver
 const ADD_DEVICE: &str = include_str!(
     "../../../components/ntos-executive/src/hosted_add_device_continuation.rs"
 );
+const PREPARATION: &str = include_str!(
+    "../../../components/ntos-executive/src/hosted_add_device_continuation/preparation.rs"
+);
+const ROLLBACK: &str = include_str!(
+    "../../../components/ntos-executive/src/hosted_add_device_rollback.rs"
+);
 
 fn between(source: &'static str, start: &str, end: &str) -> &'static str {
     source.split_once(start).expect("native start boundary").1
@@ -28,14 +34,14 @@ fn add_device_claims_both_pages_atomically_in_the_file_transfer_authority() {
     assert!(file_entry.contains("held.secondary_shared_va"),
         "ordinary File admission must reject either page in a retained AddDevice row");
 
-    let transaction = between(ADD_DEVICE, "unsafe fn start_typed_add_device(",
+    let transaction = between(PREPARATION, "unsafe fn start_typed_add_device(",
         "unsafe fn continue_typed_after_projection(");
     let claim = transaction.find("reserve_add_device_bank(").expect("single dual-page claim");
     let create_pdo = transaction.find("dispatch_pdo_projection_progress(")
         .expect("typed native PDO projection pump");
     assert!(claim < create_pdo,
         "both pages must be claimed before PDO projection writes SH_REQ and enters its pump");
-    let after_projection = between(ADD_DEVICE, "unsafe fn continue_typed_after_projection(",
+    let after_projection = between(PREPARATION, "unsafe fn continue_typed_after_projection(",
         "unsafe fn prepare_add_device_transaction(");
     assert!(after_projection.contains("publish_shared_registry_identity_at("),
         "registry publication must follow the leased typed projection stage");
@@ -45,16 +51,61 @@ fn add_device_claims_both_pages_atomically_in_the_file_transfer_authority() {
 }
 
 #[test]
-fn terminal_phase_is_authenticated_before_releasing_the_dual_bank_claim() {
-    let retirement = between(ADD_DEVICE, "unsafe fn settle_terminal(",
+fn terminal_phase_is_authenticated_before_banked_rollback_settlement() {
+    let terminal = between(ADD_DEVICE, "unsafe fn settle_terminal(",
         "pub(crate) fn record_child_step(");
-    let retire = retirement.find("transaction.banks.retire()")
-        .expect("the typed terminal owner retires the exact bank ticket");
-    let finish = retirement.find("self.retained.finish_terminal(key, ())")
+    let finish = terminal.find("self.retained.finish_terminal(key, ())")
         .expect("the retained transaction consumes its authenticated terminal");
-    let authenticated_phase = retirement.find("self.retained.acknowledge_restore(key)")
-        .expect("exact owner must authenticate physical restore before releasing bank claim");
-    assert!(authenticated_phase < retire,
-        "a failed phase transition must retain both bank claims with the terminal owner");
-    assert!(retire < finish, "bank retirement refusal must retain the AddDevice transaction");
+    let authenticated_phase = terminal.find("self.retained.acknowledge_restore(key)")
+        .expect("exact owner must authenticate physical restore before transaction settlement");
+    let transaction_finish = terminal.find("transaction.finish(terminal)")
+        .expect("banked rollback owner settles only after authenticated terminal");
+    assert!(authenticated_phase < finish && finish < transaction_finish);
+    assert!(!terminal.contains("transaction.banks.retire()"),
+        "the terminal path must leave the bank claim with rollback through shared cleanup");
+}
+
+#[test]
+fn deferred_rollback_retains_both_bank_claims_until_shared_registry_cleanup() {
+    let owner = between(ROLLBACK, "struct Owner {", "static mut OWNERS:");
+    assert!(owner.contains("bank_ticket: Option<SuspendedActiveHostedIrpTransfer>"),
+        "rollback owns the exact dual-page lease after preparation, including deferred drain");
+
+    let preparation = between(PREPARATION, "unsafe fn start_typed_add_device(",
+        "unsafe fn continue_typed_after_projection(");
+    let claim = preparation.find("reserve_add_device_bank(").expect("dual-page claim");
+    let projection = preparation.find("dispatch_pdo_projection_progress(")
+        .expect("first native projection pump");
+    assert!(preparation[claim..projection].contains("bank_ticket"),
+        "move the claim into rollback ownership before the projection pump can yield");
+
+    let advance = between(ROLLBACK, "unsafe fn advance_inner(",
+        "pub(super) unsafe fn drain(");
+    let last_clear = advance.rfind("clear_shared_registry_identity_at(")
+        .expect("rollback clears both request pages");
+    let retire = advance.rfind("retire_add_device_bank(")
+        .expect("rollback retires exact bank ticket after shared cleanup");
+    assert!(last_clear < retire,
+        "deferred cleanup may not write either shared page after releasing its lease");
+}
+
+#[test]
+fn successful_add_device_clears_provider_registry_before_bank_retirement() {
+    let terminal = between(ADD_DEVICE, "unsafe fn settle_terminal(",
+        "pub(crate) fn record_child_step(");
+    assert!(!terminal.contains("transaction.banks.retire()"),
+        "terminal handoff must retain the dual-page claim through transaction.finish");
+
+    let finish = between(ADD_DEVICE, "impl AddDeviceTransaction {", "mod preparation;");
+    let clear = finish.find("clear_shared_registry_identity_at(shared)")
+        .expect("successful AddDevice clears provider registry page");
+    let commit = finish.find("hosted_add_device_rollback::commit(")
+        .expect("successful AddDevice commits rollback owner");
+    assert!(clear < commit,
+        "provider registry write must finish while rollback owner still holds both bank claims");
+
+    let rollback_commit = between(ROLLBACK, "pub(super) unsafe fn commit(",
+        "pub(super) unsafe fn block(");
+    assert!(rollback_commit.contains("bank_ticket") && rollback_commit.contains("retire_add_device_bank"),
+        "success commit must retire the exact dual-page ticket before discarding rollback owner");
 }

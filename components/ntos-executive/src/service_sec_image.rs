@@ -10612,6 +10612,7 @@ pub(crate) unsafe fn service_sec_image(
     // wall-clock went. Successive dumps turn a runaway into a measurable RATE. The clock is a
     // STATIC because the win32k dispatch arm's nested pump ticks it too (see `w32_census_enter`).
     CENSUS_LAST_DUMP.store(last_progress_t, Ordering::Relaxed);
+    let mut root_add_device_turn: Option<RootAddDeviceTurn> = None;
     let memory_context = ExecLoopCtx {
         owner_pi: primary_pi,
         owner_pid: nt_handler.capture_process_identity(primary_pi)
@@ -10661,7 +10662,13 @@ pub(crate) unsafe fn service_sec_image(
         macro_rules! component_recv {
             ($ep:expr, $reply:expr) => {{
                 assert!(crate::executive_ingress::handles($ep));
-                if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+                if root_add_device_exclusive_pending() {
+                    if !prepare_parked_add_device_receive(&mut root_add_device_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        break 'service_loop;
+                    }
+                } else if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
                     prepare_service_receive(&mut *delay_queue, &mut nt_handler);
                 }
                 component_receive_outcome!(crate::executive_ingress::receive($reply))
@@ -10670,7 +10677,13 @@ pub(crate) unsafe fn service_sec_image(
         macro_rules! component_client_reply_recv {
             ($ep:expr, $reply:expr, $len:expr, $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {{
                 assert!(crate::executive_ingress::handles($ep));
-                if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+                if root_add_device_exclusive_pending() {
+                    if !prepare_parked_add_device_receive(&mut root_add_device_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        break 'service_loop;
+                    }
+                } else if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
                     prepare_service_receive(&mut *delay_queue, &mut nt_handler);
                 }
                 component_receive_outcome!(crate::executive_ingress::reply_receive(
@@ -10725,7 +10738,15 @@ pub(crate) unsafe fn service_sec_image(
             }
             if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
                 component_resume::run_outer(core::ptr::from_mut(&mut *nt_handler));
-                prepare_service_receive(&mut *delay_queue, &mut nt_handler);
+                if root_add_device_exclusive_pending() {
+                    if !prepare_parked_add_device_receive(&mut root_add_device_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        break 'service_loop;
+                    }
+                } else {
+                    prepare_service_receive(&mut *delay_queue, &mut nt_handler);
+                }
             }
             let received = crate::executive_ingress::receive(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
             let received = match received {
@@ -10756,8 +10777,23 @@ pub(crate) unsafe fn service_sec_image(
         // The batch cursor owns an entered AddDevice Reply. Run only its selected child,
         // settle any inner CONNECT, then resume that same batch before general redrives.
         // The sealed child step is deposited before any subsequent batch borrow.
-        let mut add_device_passes = 0u8;
-        let mut consecutive_no_child_yields = 0u8;
+        let mut root_event_consumed = false;
+        if let Some(turn) = root_add_device_turn.as_mut() {
+            if badge_has_delay_timer(badge) || hosted_irq_lines_from_badge(badge) != 0 {
+                if let Err(status) = service_parked_add_device_notification(badge) {
+                    stop = status.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    break 'service_loop;
+                }
+                let arrival = if badge_has_delay_timer(badge) {
+                    nt_driver_start::RootArrival::Timer { now: monotonic_time_100ns() }
+                } else {
+                    nt_driver_start::RootArrival::Irq
+                };
+                let _ = turn.observe_arrival(turn.owner(), arrival);
+                root_event_consumed = true;
+            }
+        }
         loop {
             let selected = {
                 let _message = crate::ipc_message::SavedMessageBuffer::capture();
@@ -10770,28 +10806,202 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
             };
-            let Some((reservation, ran_child)) = selected else { break };
-            let _message = crate::ipc_message::SavedMessageBuffer::capture();
-            if settle_suspended_connect_pumps().is_err() {
+            let Some((reservation, ran_child)) = selected else {
+                if let Some(turn) = root_add_device_turn.take() {
+                    let owner = turn.owner();
+                    if !root_add_device_owner_exact_present(&nt_handler, owner)
+                        || root_add_device_still_parked(&nt_handler, turn.owner())
+                    {
+                        root_add_device_turn = Some(turn);
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        break 'service_loop;
+                    }
+                    if turn.retained_ingress(owner).ok().flatten().is_some_and(|ticket|
+                        !crate::spawn_hosts::shared_ingress::owner::runtime::deferred_add_device_ingress_is_exact(ticket))
+                    {
+                        root_add_device_turn = Some(turn);
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        break 'service_loop;
+                    }
+                    let retained = match turn.settle(owner) {
+                        Ok(retained) => retained,
+                        Err(turn) => {
+                            root_add_device_turn = Some(turn);
+                            stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                            stop_ssn = 0;
+                            break 'service_loop;
+                        }
+                    };
+                    ROOT_ADD_DEVICE_RETRY_DEADLINE.store(u64::MAX, Ordering::Release);
+                    ROOT_ADD_DEVICE_EXCLUSIVE.store(false, Ordering::Release);
+                    root_event_consumed |= retained.is_some();
+                    break;
+                }
+                // Ordinary redrives may reach Ready, but only this flat root phase may
+                // enter AddDevice. Admit one exact row and recheck it before other work.
+                let Some(ready) = ready_flat_root_add_device(&nt_handler) else { break };
+                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                redrive_flat_root_add_device_selected(&mut nt_handler, ready);
+                if root_add_device_still_parked(&nt_handler, ready) {
+                    root_add_device_turn = Some(nt_driver_start::AddDeviceRootTurn::new(ready));
+                    ROOT_ADD_DEVICE_EXCLUSIVE.store(true, Ordering::Release);
+                    continue;
+                }
+                break;
+            };
+            if root_add_device_turn.is_none() {
+                root_add_device_turn = Some(nt_driver_start::AddDeviceRootTurn::new(reservation));
+                ROOT_ADD_DEVICE_EXCLUSIVE.store(true, Ordering::Release);
+            }
+            if root_add_device_turn.as_ref().is_none_or(|turn| turn.owner() != reservation) {
                 stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                 stop_ssn = 0;
                 break 'service_loop;
             }
-            pending_driver_start_redrive_selected(&mut nt_handler, Some(reservation));
-            let still_parked = nt_handler.pending_driver_starts.get_exact(reservation)
-                .is_some_and(|pending| pending.batch.wait_stage()
-                    == hosted_pnp_start::HostedPnpWaitStage::AddDevice);
-            if !still_parked { break }
-            add_device_passes += 1;
-            consecutive_no_child_yields = if ran_child { 0 }
-                else { consecutive_no_child_yields.saturating_add(1) };
-            if add_device_passes >= 16 || consecutive_no_child_yields >= 2 {
-                // The parent remains physically held. A later provider cannot borrow its
-                // Reply or either AddDevice shared page while ownership is unsettled.
+            let still_parked = {
+                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                if settle_suspended_connect_pumps().is_err() {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    break 'service_loop;
+                }
+                redrive_flat_root_add_device_selected(&mut nt_handler, reservation);
+                root_add_device_still_parked(&nt_handler, reservation)
+            };
+            if !still_parked {
+                if root_add_device_turn.as_ref().and_then(|turn|
+                    turn.retained_ingress(reservation).ok().flatten())
+                    .is_some_and(|ticket|
+                        !crate::spawn_hosts::shared_ingress::owner::runtime::deferred_add_device_ingress_is_exact(ticket))
+                {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    break 'service_loop;
+                }
+                let turn = root_add_device_turn.take().expect("exact AddDevice turn");
+                let retained = match turn.settle(reservation) {
+                    Ok(retained) => retained,
+                    Err(turn) => {
+                        root_add_device_turn = Some(turn);
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        break 'service_loop;
+                    }
+                };
+                ROOT_ADD_DEVICE_RETRY_DEADLINE.store(u64::MAX, Ordering::Release);
+                ROOT_ADD_DEVICE_EXCLUSIVE.store(false, Ordering::Release);
+                break;
+            }
+            if !ran_child && !root_add_device_retry_without_new_child(&nt_handler, reservation)
+                && !root_add_device_needs_child_step(&nt_handler, reservation)
+            {
+                // The exact parent has an indeterminate or quarantined outcome. Its Reply
+                // and banks remain held, and no unrelated provider can enter after this.
                 stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                 stop_ssn = 0;
                 break 'service_loop;
             }
+            if ran_child { continue }
+            let turn = root_add_device_turn.as_mut().expect("parked AddDevice turn");
+            if !root_event_consumed && badge_has_delay_timer(badge)
+                || !root_event_consumed && hosted_irq_lines_from_badge(badge) != 0
+            {
+                if let Err(status) = service_parked_add_device_notification(badge) {
+                    stop = status.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    break 'service_loop;
+                }
+                let arrival = if badge_has_delay_timer(badge) {
+                    nt_driver_start::RootArrival::Timer { now: monotonic_time_100ns() }
+                } else {
+                    nt_driver_start::RootArrival::Irq
+                };
+                let _ = turn.observe_arrival(reservation, arrival);
+                root_event_consumed = true;
+                continue;
+            }
+            if !root_event_consumed && badge != DELAY_TIMER_BADGE
+                && hosted_irq_lines_from_badge(badge) == 0
+            {
+                let Some(permit) = ParkedRootAddDevicePermit::for_exact(&nt_handler, reservation)
+                else {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    break 'service_loop;
+                };
+                let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let ticket = match crate::spawn_hosts::shared_ingress::owner::runtime::
+                    defer_hosted_delivery_for_add_device(reply, badge, &permit)
+                {
+                    Ok(ticket) => ticket,
+                    Err(_) => {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        break 'service_loop;
+                    }
+                };
+                if turn.retain_ingress(reservation, ticket).is_err() {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    break 'service_loop;
+                }
+                root_event_consumed = true;
+            }
+            let now = monotonic_time_100ns();
+            let deadline = match turn.arm_retry(reservation, now, 1_000_000) {
+                Ok(deadline) => deadline,
+                Err(_) => {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    break 'service_loop;
+                }
+            };
+            ROOT_ADD_DEVICE_RETRY_DEADLINE.store(deadline, Ordering::Release);
+            let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+            (badge, mi, m0, m1, m2, m3) = received;
+            continue 'service_loop;
+        }
+        // A nested provider can select a Receive child after the early guard was sampled.
+        // Import that exact child before any ordinary provider redrive in this event.
+        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+            if root_event_consumed && !root_add_device_exclusive_pending()
+                && !delay_timer_rearm(&*delay_queue, &nt_handler).owner_available()
+            {
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                break 'service_loop;
+            }
+            if badge_has_delay_timer(badge) || hosted_irq_lines_from_badge(badge) != 0 {
+                if !root_event_consumed {
+                    if let Err(status) = service_parked_add_device_notification(badge) {
+                        stop = status.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        break 'service_loop;
+                    }
+                }
+            } else if !root_event_consumed {
+                crate::spawn_hosts::shared_ingress::owner::runtime::defer_hosted_delivery(
+                    REPLY_MAIN_SLOT.load(Ordering::Relaxed), badge,
+                ).expect("selected Receive child retains the unexecuted current Call");
+            }
+            let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+            (badge, mi, m0, m1, m2, m3) = received;
+            continue 'service_loop;
+        }
+        if root_event_consumed {
+            // The parked ACK-only timer deliberately retained unrelated due owners. The
+            // AddDevice bank has now settled, so restore their ordinary shared one-shot before
+            // waiting for the next real ingress. A failed arm cannot be treated as an idle wait.
+            if !delay_timer_rearm(&*delay_queue, &nt_handler).owner_available() {
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                break 'service_loop;
+            }
+            let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+            (badge, mi, m0, m1, m2, m3) = received;
+            continue 'service_loop;
         }
         // Bound notifications do not bind the offered Reply and use a separate badge namespace.
         crate::provider_bugcheck::stop_if_pending();
@@ -27456,7 +27666,7 @@ unsafe fn pending_pnp_operation_transfer(
     });
     nt_handler
         .pending_pnp_operations
-        .publish(reservation, PendingPnpOperation { operation, reply })
+        .publish(reservation, PendingPnpOperation { operation, reservation, reply })
         .expect("reserved PnP continuation rejected its exact operation");
     reply_park.commit();
 }
@@ -27569,12 +27779,190 @@ fn trace_pending_driver_start_wait(
     print_str(b"\n");
 }
 
-/// Run at most one certified nested File step for an exact retained AddDevice batch. The
-/// PendingDriverStart row cannot retire during this step: its Ready cursor is held until the
-/// step is deposited, and its redrive reports AwaitingCompletion while that deposit is absent.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RootAddDeviceOwner {
+    DriverStart(nt_driver_start::PendingOperationReservation),
+    PnpRebalance(nt_driver_start::PendingOperationReservation),
+}
+type RootAddDeviceTurn = nt_driver_start::AddDeviceRootTurn<
+    RootAddDeviceOwner,
+    crate::spawn_hosts::shared_ingress::owner::runtime::DeferredAddDeviceIngress,
+>;
+
+/// This is a wake request only. The exact batch reservation remains the sole parent authority.
+/// `u64::MAX` denotes no armed retry; the PIT remains one-shot and idle without retained work.
+static ROOT_ADD_DEVICE_RETRY_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+static ROOT_ADD_DEVICE_EXCLUSIVE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn root_add_device_exclusive_pending() -> bool {
+    ROOT_ADD_DEVICE_EXCLUSIVE.load(Ordering::Acquire)
+}
+
+pub(crate) fn root_add_device_retry_deadline() -> Option<u64> {
+    let deadline = ROOT_ADD_DEVICE_RETRY_DEADLINE.load(Ordering::Acquire);
+    (deadline != u64::MAX).then_some(deadline)
+}
+
+pub(crate) fn root_add_device_retry_wake_due(now: u64) -> u64 {
+    let Some(deadline) = root_add_device_retry_deadline() else { return 0 };
+    if now < deadline { return 0 }
+    u64::from(ROOT_ADD_DEVICE_RETRY_DEADLINE.compare_exchange(
+        deadline, u64::MAX, Ordering::AcqRel, Ordering::Acquire,
+    ).is_ok())
+}
+
+/// The parked parent owns an explicit PIT one-shot. General timer reconciliation may select an
+/// unrelated overdue source whose callback writes this retained bank, so only the exact retry
+/// shot is programmed until the parent has settled. Nested pump ticks are already ACKed there.
+unsafe fn prepare_parked_add_device_receive(
+    current: &mut Option<RootAddDeviceTurn>,
+) -> bool {
+    let Some(turn) = current.as_mut() else { return false };
+    let owner = turn.owner();
+    let pending = DELAY_TIMER_TICKS_PENDING.swap(0, Ordering::AcqRel);
+    if pending != 0 {
+        PUMP_TIMER_TICKS_DRAINED.fetch_add(pending, Ordering::Relaxed);
+        let now = monotonic_time_100ns();
+        let _ = root_add_device_retry_wake_due(now);
+        if turn.observe_arrival(owner, nt_driver_start::RootArrival::Timer { now }).is_err() {
+            return false;
+        }
+    }
+    let now = monotonic_time_100ns();
+    let deadline = match turn.retry_deadline(owner) {
+        Ok(Some(deadline)) if deadline > now => deadline,
+        Ok(_) => match turn.arm_retry(turn.owner(), now, 1_000_000) {
+            Ok(deadline) => deadline,
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+    ROOT_ADD_DEVICE_RETRY_DEADLINE.store(deadline, Ordering::Release);
+    delay_timer_program(deadline, DELAY_TIMER_SOURCE_ROOT_ADD_DEVICE_RETRY)
+}
+
+unsafe fn service_parked_add_device_notification(
+    badge: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let _ = driver_launch::latch_hosted_irq_badge(badge);
+    let _ = driver_launch::drain_pending_hosted_irqs();
+    if badge_has_delay_timer(badge) {
+        ack_parked_add_device_retry_timer()?;
+    }
+    Ok(())
+}
+
+pub(crate) struct ParkedRootAddDevicePermit(());
+
+impl ParkedRootAddDevicePermit {
+    fn for_exact(handler: &ExecNtHandler, owner: RootAddDeviceOwner) -> Option<Self> {
+        root_add_device_still_parked(handler, owner).then_some(Self(()))
+    }
+
+}
+
+fn ready_flat_root_add_device(handler: &ExecNtHandler) -> Option<RootAddDeviceOwner> {
+    let starts = &handler.pending_driver_starts;
+    for slot in handler.pending_driver_starts.occupied_slots() {
+        let pending = starts.get(slot)?;
+        // A Ready boot batch can still be ordered behind an earlier enumerator. The
+        // selected root pass must not repeatedly choose that row ahead of an eligible
+        // sibling or rebalance restart. General redrive handles an uncertain predecessor.
+        if pending.bootstrap_predecessors.iter().any(|predecessor| {
+            starts.get_exact(*predecessor).is_some_and(|older| {
+                matches!(&older.owner, PendingDriverStartOwner::Boot { .. })
+            })
+        }) {
+            continue;
+        }
+        if pending.batch.ready_for_flat_root_add_device() {
+            return Some(RootAddDeviceOwner::DriverStart(pending.reservation));
+        }
+    }
+    for slot in handler.pending_pnp_operations.occupied_slots() {
+        let pending = handler.pending_pnp_operations.get(slot)?;
+        if let OwnedPendingPnpOperation::Rebalance(batch) = &pending.operation {
+            if batch.ready_for_flat_root_add_device() {
+                return Some(RootAddDeviceOwner::PnpRebalance(pending.reservation));
+            }
+        }
+    }
+    None
+}
+
+fn root_add_device_still_parked(handler: &ExecNtHandler, owner: RootAddDeviceOwner) -> bool {
+    match owner {
+        RootAddDeviceOwner::DriverStart(reservation) => handler.pending_driver_starts
+            .get_exact(reservation).is_some_and(|pending|
+                pending.batch.wait_stage() == hosted_pnp_start::HostedPnpWaitStage::AddDevice),
+        RootAddDeviceOwner::PnpRebalance(reservation) => handler.pending_pnp_operations
+            .get_exact(reservation).is_some_and(|pending| match &pending.operation {
+                OwnedPendingPnpOperation::Rebalance(batch) => batch.add_device_wait_stage(),
+                OwnedPendingPnpOperation::Removal(_) => false,
+            }),
+    }
+}
+
+fn root_add_device_owner_exact_present(
+    handler: &ExecNtHandler,
+    owner: RootAddDeviceOwner,
+) -> bool {
+    match owner {
+        RootAddDeviceOwner::DriverStart(reservation) =>
+            handler.pending_driver_starts.get_exact(reservation).is_some(),
+        RootAddDeviceOwner::PnpRebalance(reservation) =>
+            handler.pending_pnp_operations.get_exact(reservation).is_some(),
+    }
+}
+
+fn root_add_device_retry_without_new_child(
+    handler: &ExecNtHandler, owner: RootAddDeviceOwner,
+) -> bool {
+    match owner {
+        RootAddDeviceOwner::DriverStart(reservation) => handler.pending_driver_starts
+            .get_exact(reservation).is_some_and(|pending|
+                pending.batch.retry_add_device_without_new_child()),
+        RootAddDeviceOwner::PnpRebalance(reservation) => handler.pending_pnp_operations
+            .get_exact(reservation).is_some_and(|pending| match &pending.operation {
+                OwnedPendingPnpOperation::Rebalance(batch) =>
+                    batch.retry_add_device_without_new_child(),
+                OwnedPendingPnpOperation::Removal(_) => false,
+            }),
+    }
+}
+
+fn root_add_device_needs_child_step(
+    handler: &ExecNtHandler, owner: RootAddDeviceOwner,
+) -> bool {
+    match owner {
+        RootAddDeviceOwner::DriverStart(reservation) => handler.pending_driver_starts
+            .get_exact(reservation).is_some_and(|pending|
+                pending.batch.needs_add_device_child_step()),
+        RootAddDeviceOwner::PnpRebalance(reservation) => handler.pending_pnp_operations
+            .get_exact(reservation).is_some_and(|pending| match &pending.operation {
+                OwnedPendingPnpOperation::Rebalance(batch) =>
+                    batch.needs_add_device_child_step(),
+                OwnedPendingPnpOperation::Removal(_) => false,
+            }),
+    }
+}
+
+unsafe fn redrive_flat_root_add_device_selected(
+    handler: &mut ExecNtHandler, owner: RootAddDeviceOwner,
+) -> u64 {
+    match owner {
+        RootAddDeviceOwner::DriverStart(reservation) =>
+            pending_driver_start_redrive_flat_root_selected(handler, reservation),
+        RootAddDeviceOwner::PnpRebalance(reservation) =>
+            pending_pnp_operation_redrive_flat_root_selected(handler, reservation),
+    }
+}
+
+/// Run at most one certified nested File step for an exact retained AddDevice batch. Its
+/// Ready cursor cannot retire during this step: redrive waits until the receipt is deposited.
 unsafe fn run_one_pending_add_device_child_step(
     handler: *mut ExecNtHandler,
-) -> Result<Option<(nt_driver_start::PendingOperationReservation, bool)>, ()> {
+) -> Result<Option<(RootAddDeviceOwner, bool)>, ()> {
     let selected = {
         let table = &(*handler).pending_driver_starts;
         table.occupied_slots().find_map(|slot| {
@@ -27584,18 +27972,48 @@ unsafe fn run_one_pending_add_device_child_step(
                     pending.batch.needs_add_device_child_step()))
         })
     };
+    if let Some((slot, reservation, needs_child)) = selected {
+        let owner = RootAddDeviceOwner::DriverStart(reservation);
+        if !needs_child { return Ok(Some((owner, false))) }
+        let step = drive_one_nested_file_child_step();
+        let ran_child = step.ran_child();
+        let pending = (*handler).pending_driver_starts.get_mut(slot)
+            .filter(|pending| pending.reservation == reservation)
+            .expect("selected AddDevice batch cannot retire before its child receipt is deposited");
+        return match pending.batch.record_add_device_child_step(step) {
+            Ok(crate::hosted_pnp_start::AddDeviceStepDeposit::Recorded) =>
+                Ok(Some((owner, ran_child))),
+            Ok(crate::hosted_pnp_start::AddDeviceStepDeposit::Quarantined) => Err(()),
+            Err(_) => unreachable!("exact AddDevice batch refused its selected child receipt"),
+        };
+    }
+    let selected = {
+        let table = &(*handler).pending_pnp_operations;
+        table.occupied_slots().find_map(|slot| {
+            let pending = table.get(slot)?;
+            let OwnedPendingPnpOperation::Rebalance(batch) = &pending.operation else {
+                return None;
+            };
+            batch.add_device_wait_stage().then_some((slot, pending.reservation,
+                batch.needs_add_device_child_step()))
+        })
+    };
     let Some((slot, reservation, needs_child)) = selected else { return Ok(None) };
-    if !needs_child { return Ok(Some((reservation, false))) }
+    let owner = RootAddDeviceOwner::PnpRebalance(reservation);
+    if !needs_child { return Ok(Some((owner, false))) }
     let step = drive_one_nested_file_child_step();
     let ran_child = step.ran_child();
-    let pending = (*handler).pending_driver_starts.get_mut(slot)
+    let pending = (*handler).pending_pnp_operations.get_mut(slot)
         .filter(|pending| pending.reservation == reservation)
-        .expect("selected AddDevice batch cannot retire before its child receipt is deposited");
-    match pending.batch.record_add_device_child_step(step) {
+        .expect("selected rebalance AddDevice cannot retire before its child receipt is deposited");
+    let OwnedPendingPnpOperation::Rebalance(batch) = &mut pending.operation else {
+        unreachable!("exact rebalance AddDevice changed operation kind");
+    };
+    match batch.record_add_device_child_step(step) {
         Ok(crate::hosted_pnp_start::AddDeviceStepDeposit::Recorded) =>
-            Ok(Some((reservation, ran_child))),
+            Ok(Some((owner, ran_child))),
         Ok(crate::hosted_pnp_start::AddDeviceStepDeposit::Quarantined) => Err(()),
-        Err(_) => unreachable!("exact AddDevice batch refused its selected child receipt"),
+        Err(_) => unreachable!("exact rebalance AddDevice refused its selected child receipt"),
     }
 }
 
@@ -27630,7 +28048,14 @@ unsafe fn settle_suspended_connect_pumps() -> Result<(), ()> {
 }
 
 unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
-    pending_driver_start_redrive_selected(nt_handler, None)
+    pending_driver_start_redrive_selected(nt_handler, None, false)
+}
+
+unsafe fn pending_driver_start_redrive_flat_root_selected(
+    nt_handler: &mut ExecNtHandler,
+    reservation: nt_driver_start::PendingOperationReservation,
+) -> u64 {
+    pending_driver_start_redrive_selected(nt_handler, Some(reservation), true)
 }
 
 /// The root can settle only a selected parked AddDevice batch before any unrelated start row.
@@ -27638,6 +28063,7 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
 unsafe fn pending_driver_start_redrive_selected(
     nt_handler: &mut ExecNtHandler,
     selected: Option<nt_driver_start::PendingOperationReservation>,
+    flat_root_add_device_permit: bool,
 ) -> u64 {
     let mut completed = 0u64;
     for slot in 0..nt_handler.pending_driver_starts.slot_count() {
@@ -27701,7 +28127,11 @@ unsafe fn pending_driver_start_redrive_selected(
                     nt_status::NtStatus::INVALID_DEVICE_REQUEST,
                 )
             } else {
-                pending.batch.drive_after_completion_pump()
+                if flat_root_add_device_permit {
+                    pending.batch.drive_flat_root_add_device()
+                } else {
+                    pending.batch.drive_after_completion_pump()
+                }
             }
         };
         match progress {
@@ -27838,13 +28268,53 @@ unsafe fn pending_driver_start_redrive_selected(
 }
 
 unsafe fn pending_pnp_operation_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
+    pending_pnp_operation_redrive_selected(nt_handler, None, false)
+}
+
+unsafe fn pending_pnp_operation_redrive_flat_root_selected(
+    nt_handler: &mut ExecNtHandler,
+    reservation: nt_driver_start::PendingOperationReservation,
+) -> u64 {
+    pending_pnp_operation_redrive_selected(nt_handler, Some(reservation), true)
+}
+
+unsafe fn pending_pnp_operation_redrive_selected(
+    nt_handler: &mut ExecNtHandler,
+    selected: Option<nt_driver_start::PendingOperationReservation>,
+    flat_root_add_device_permit: bool,
+) -> u64 {
     let mut completed = 0u64;
     for slot in 0..nt_handler.pending_pnp_operations.slot_count() {
+        if selected.is_some_and(|reservation| nt_handler.pending_pnp_operations
+            .get(slot).is_none_or(|pending| pending.reservation != reservation))
+        {
+            continue;
+        }
         let progress = {
             let Some(pending) = nt_handler.pending_pnp_operations.get_mut(slot) else {
                 continue;
             };
-            pending.operation.drive_after_completion_pump()
+            if flat_root_add_device_permit {
+                match &mut pending.operation {
+                    OwnedPendingPnpOperation::Rebalance(batch) =>
+                        match batch.drive_flat_root_add_device() {
+                            OwnedHostedPnpRebalanceProgress::AwaitingCompletion =>
+                                OwnedPendingPnpOperationProgress::AwaitingCompletion,
+                            OwnedHostedPnpRebalanceProgress::Complete(result) =>
+                                OwnedPendingPnpOperationProgress::Complete(match result {
+                                    Ok(_) => nt_status::NtStatus::SUCCESS.raw() as u32,
+                                    Err(failure) => failure.status.raw() as u32,
+                                }),
+                            OwnedHostedPnpRebalanceProgress::OwnershipLost(failure) =>
+                                OwnedPendingPnpOperationProgress::OwnershipLost(
+                                    failure.status.raw() as u32),
+                        },
+                    OwnedPendingPnpOperation::Removal(_) =>
+                        unreachable!("flat root AddDevice selected removal"),
+                }
+            } else {
+                pending.operation.drive_after_completion_pump()
+            }
         };
         match progress {
             OwnedPendingPnpOperationProgress::AwaitingCompletion => {}

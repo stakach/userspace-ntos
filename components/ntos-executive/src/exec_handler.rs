@@ -19831,6 +19831,7 @@ impl ExecNtHandler {
                         reservation,
                         PendingPnpOperation {
                             operation: OwnedPendingPnpOperation::Rebalance(batch),
+                            reservation,
                             reply: None,
                         },
                     )
@@ -19912,6 +19913,7 @@ impl ExecNtHandler {
                         reservation,
                         PendingPnpOperation {
                             operation: OwnedPendingPnpOperation::Removal(removal),
+                            reservation,
                             reply: None,
                         },
                     )

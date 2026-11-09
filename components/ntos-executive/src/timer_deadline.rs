@@ -7,6 +7,7 @@ pub(super) struct OwnerDeadlines {
     pub user_timer: Option<u64>,
     pub job_time: Option<u64>,
     pub component_resume: Option<u64>,
+    pub root_add_device: Option<u64>,
 }
 
 /// Retry owners may reconcile retained demand at this snapshot. No notification acknowledgment,
@@ -100,6 +101,7 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
             DELAY_TIMER_SOURCE_MOUNTED_NATIVE_BLOCK,
         ),
         (owner.component_resume, DELAY_TIMER_SOURCE_COMPONENT_RESUME),
+        (owner.root_add_device, DELAY_TIMER_SOURCE_ROOT_ADD_DEVICE_RETRY),
         (
             service_sec_image::system_wal_fold_next_deadline(),
             DELAY_TIMER_SOURCE_SYSTEM_WAL_FOLD,

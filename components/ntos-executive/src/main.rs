@@ -3123,6 +3123,7 @@ const DELAY_TIMER_SOURCE_HOSTED_DYNAMIC_DELETE: u64 = 29;
 const DELAY_TIMER_SOURCE_HOSTED_PROVIDER_STARTUP_RESTORE: u64 = 30;
 const DELAY_TIMER_SOURCE_NESTED_ACQUIRE_ABORT: u64 = 31;
 const DELAY_TIMER_SOURCE_HOSTED_IRQ_RETRY: u64 = 33;
+const DELAY_TIMER_SOURCE_ROOT_ADD_DEVICE_RETRY: u64 = 34;
 const DELAY_TIMER_SOURCE_WIN32K_STARTUP_RESTORE: u64 = 32;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
@@ -17306,6 +17307,7 @@ unsafe fn delay_timer_next_deadline(
         user_timer: handler.user_timer_next_deadline(now),
         job_time: handler.job_time_sample_next_deadline(),
         component_resume: service_sec_image::component_resume::next_deadline(&handler.pm),
+        root_add_device: service_sec_image::root_add_device_retry_deadline(),
     })
 }
 
@@ -17627,6 +17629,7 @@ unsafe fn delay_timer_drain_due_work(
             now,
         ))
         + timer_retry_wake_due(now_100ns)
+        + service_sec_image::root_add_device_retry_wake_due(now_100ns)
         + service_sec_image::component_resume::wake_due(&handler.pm, now_100ns)
         + driver_launch::hosted_dpc_wake_due(now_100ns)
         + driver_launch::hosted_driver_pnp_notification_wake_due()
@@ -17875,6 +17878,18 @@ unsafe fn delay_timer_interrupt(
         .try_enter()
         .expect("outer timer delivery reentered an active scan");
     delay_timer_interrupt_claimed(queue, handler, &delivery);
+}
+
+/// A physically parked AddDevice bank excludes ordinary timer callbacks that may write that
+/// page. Consume only this root turn's wake and ACK the delivered one-shot. Other due owners
+/// retain their deadlines until the exact parent has released its shared banks.
+unsafe fn ack_parked_add_device_retry_timer() -> Result<(), nt_status::NtStatus> {
+    let _delivery = TIMER_DELIVERY_GATE.try_enter()
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    LAST_REARM_AUTHORITY.invalidate();
+    let _ = service_sec_image::root_add_device_retry_wake_due(monotonic_time_100ns());
+    TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
+    delay_timer_ack_irq()
 }
 
 unsafe fn delay_timer_interrupt_claimed(
@@ -24828,6 +24843,7 @@ struct PendingPnpOperationTransfer {
 
 struct PendingPnpOperation {
     operation: OwnedPendingPnpOperation,
+    reservation: nt_driver_start::PendingOperationReservation,
     reply: Option<PendingPnpSyscallReply>,
 }
 

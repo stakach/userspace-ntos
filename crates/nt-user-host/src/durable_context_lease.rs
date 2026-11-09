@@ -84,6 +84,11 @@ impl<K: Copy + Eq, B> DurableContextLeases<K, B> {
         self.rows.get_mut(ticket)
     }
 
+    /// Read-only physical exclusion includes unbound rows retained across a native yield.
+    pub fn any_held(&self, matches: impl FnMut(&B) -> bool) -> bool {
+        self.rows.any_held(matches)
+    }
+
     /// Bind an exact retained row for this synchronous slice. The active selector stack has
     /// capacity before it changes, so a refusal leaves both row and previous binding intact.
     pub fn bind(&mut self, ticket: RetainedOwnerTicket<K>) -> Result<(), DurableContextLeaseError> {

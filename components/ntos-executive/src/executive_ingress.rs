@@ -224,7 +224,9 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
         );
         // The snapshot journal owns the mounted volume through COMMIT and its terminal ACK.
         // Autonomous Calls stay retained and unadmitted while that ownership is live.
-        if !crate::writable_fs::registry_journal::owns_volume() {
+        if !crate::writable_fs::registry_journal::owns_volume()
+            && !crate::service_sec_image::root_add_device_exclusive_pending()
+        {
             if runtime::service_autonomous()
                 .expect("autonomous ingress remains retained on failure")
             {

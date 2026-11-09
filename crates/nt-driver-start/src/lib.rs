@@ -5,6 +5,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 pub mod preload_catalog;
+mod add_device_root_turn;
+pub use add_device_root_turn::{AddDeviceRootTurn, RootArrival, RootTurnAction, RootTurnError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DispatchToken {

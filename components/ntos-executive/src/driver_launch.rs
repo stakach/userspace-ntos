@@ -58787,6 +58787,9 @@ unsafe fn dispatch_hosted_irq_connection(
         .filter(|(_, inst)| inst.ready)
         .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     let sh = inst.exec_shared_va;
+    if retained_hosted_irp_bank_conflicts(sh) {
+        return Ok(HostedIrqConnectionDispatchOutcome::DeferredBusy);
+    }
     restore_hosted_device_resource_state(binding, sh, false)?;
     let lane_live = hosted_irq_lanes().is_some_and(|lanes| {
         lanes.iter().any(|lane| {
@@ -58848,6 +58851,37 @@ enum HostedIrqServiceOutcome {
 struct HostedIrqLeasedConnection {
     connection: HostedIrqConnection,
     lease: InterruptConnectionLease,
+}
+
+unsafe fn retained_hosted_irq_line_bank_conflict(
+    leased: &[HostedIrqLeasedConnection],
+) -> bool {
+    leased.iter().any(|held| {
+        instance_by_driver_id(held.connection.binding.driver_id)
+            .is_some_and(|(_, inst)| retained_hosted_irp_bank_conflicts(inst.exec_shared_va))
+    })
+}
+
+unsafe fn defer_hosted_irq_line_delivery(
+    line_index: usize,
+    delivery: InterruptLineDelivery,
+    leased: &[HostedIrqLeasedConnection],
+) -> Result<HostedIrqServiceOutcome, nt_status::NtStatus> {
+    let line = hosted_irq_lines_mut()[line_index];
+    let physical_line = line.physical_line;
+    let identity = line.rundown.identity();
+    if let Err(status) = complete_hosted_irq_connection_leases(leased) {
+        return Err(quarantine_hosted_irq_delivery(
+            physical_line, identity, delivery, leased, status,
+        ));
+    }
+    if hosted_irq_lines_mut()[line_index].rundown.defer_delivery(delivery).is_err() {
+        return Err(quarantine_hosted_irq_delivery(
+            physical_line, identity, delivery, leased,
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+    }
+    Ok(HostedIrqServiceOutcome::DeferredBusy)
 }
 
 unsafe fn complete_hosted_irq_connection_leases(
@@ -59025,6 +59059,11 @@ unsafe fn service_hosted_irq_event(
             nt_status::NtStatus::DEVICE_NOT_CONNECTED,
         ));
     }
+    // A shared line must be preflighted as one unit: deferring only its later connection
+    // after an earlier ISR effect would make the delivery impossible to replay safely.
+    if retained_hosted_irq_line_bank_conflict(&leased) {
+        return defer_hosted_irq_line_delivery(line_index, delivery, &leased);
+    }
     let mut scan_entries = Vec::new();
     if scan_entries.try_reserve_exact(leased.len()).is_err() {
         return Err(quarantine_hosted_irq_delivery(
@@ -59089,27 +59128,7 @@ unsafe fn service_hosted_irq_event(
                 claimed
             }
             Ok(HostedIrqConnectionDispatchOutcome::DeferredBusy) if dispatched == 0 => {
-                if complete_hosted_irq_connection_leases(&leased).is_err() {
-                    return Err(quarantine_hosted_irq_delivery(
-                        line.physical_line,
-                        line.rundown.identity(),
-                        delivery,
-                        &leased,
-                        nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-                    ));
-                }
-                let line_index = hosted_irq_lines()
-                    .and_then(|lines| {
-                        lines.iter().position(|candidate| {
-                            candidate.rundown.identity() == line.rundown.identity()
-                        })
-                    })
-                    .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-                hosted_irq_lines_mut()[line_index]
-                    .rundown
-                    .defer_delivery(delivery)
-                    .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-                return Ok(HostedIrqServiceOutcome::DeferredBusy);
+                return defer_hosted_irq_line_delivery(line_index, delivery, &leased);
             }
             Ok(HostedIrqConnectionDispatchOutcome::DeferredBusy) => {
                 return Err(quarantine_hosted_irq_delivery(
@@ -62659,6 +62678,16 @@ unsafe fn active_hosted_irp_transfers_mut() -> &'static mut ActiveHostedIrpTrans
 unsafe fn reserve_active_hosted_irp_transfer_slot() -> Result<(), nt_status::NtStatus> {
     active_hosted_irp_transfers_mut().prepare_one()
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)
+}
+
+/// An unbound AddDevice owner still holds both pages. IRQ projection and ISR dispatch must
+/// defer before writing either page, while unrelated drivers retain their independent lanes.
+unsafe fn retained_hosted_irp_bank_conflicts(shared_va: u64) -> bool {
+    (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
+        .as_ref()
+        .is_some_and(|transfers| transfers.any_held(|held| {
+            held.shared_va == shared_va || held.secondary_shared_va == Some(shared_va)
+        }))
 }
 
 #[must_use = "resume or retain this exact hosted IRP transfer"]
