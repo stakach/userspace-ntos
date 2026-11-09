@@ -1012,8 +1012,8 @@ fn trace_generic_file_selector(
 
 fn trace_generic_file_no_candidate() {
     static COUNT: AtomicU64 = AtomicU64::new(0);
-    if !hosted_input_hook_live::entered_port_with_published_class() { return; }
-    if COUNT.fetch_add(1, Ordering::Relaxed) >= 32 { return; }
+    if !hosted_input_hook_live::entered_port_source_unpublished() { return; }
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 256 { return; }
     print_str(b"[hook-file-selector-none] hook-row-count=");
     let count = rows().iter().filter(|owner| owner.hook_pump.is_some()).count();
     print_u64(count as u64); print_str(b"\n");

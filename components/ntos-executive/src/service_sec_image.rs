@@ -11075,8 +11075,14 @@ pub(crate) unsafe fn service_sec_image(
                 break 'service_loop;
             }
             crate::driver_launch::redrive_hosted_hook_forward();
+            if crate::driver_launch::hosted_hook_port_waiting() {
+                trace_hook_root_boundary(1);
+            }
             let hook_pump_settlement = {
                 let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                if crate::driver_launch::hosted_hook_port_waiting() {
+                    trace_hook_root_boundary(2);
+                }
                 settle_suspended_file_pumps()
             };
             if !matches!(hook_pump_settlement, ConnectPumpSettlement::Settled) {
@@ -28112,6 +28118,15 @@ unsafe fn settle_suspended_connect_pumps() -> ConnectPumpSettlement {
 /// Run every nested Hook File child after its caller's stack has unwound. A claimed parent
 /// retains its one-use child observation while a newer Hook pump settles; retry resumes only
 /// that recorded parent and never redispatches its original IRP.
+fn trace_hook_root_boundary(stage: u64) {
+    static COUNT: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    if COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 64 { return; }
+    print_str(b"[hook-root-boundary] stage=");
+    print_u64(stage);
+    print_str(b"\n");
+}
+
 unsafe fn settle_suspended_file_pumps() -> ConnectPumpSettlement {
     use crate::driver_launch::GenericFilePumpDrive as Progress;
     {
@@ -28121,7 +28136,7 @@ unsafe fn settle_suspended_file_pumps() -> ConnectPumpSettlement {
         let generic = crate::driver_launch::generic_file_pump_unsettled();
         let source = crate::driver_launch::hook_source_unsettled();
         if crate::driver_launch::hosted_hook_port_waiting()
-            && COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 16
+            && COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 256
         {
             print_str(b"[hook-root-settle] returned/generic/source=");
             print_u64(u64::from(returned)); print_str(b"/");

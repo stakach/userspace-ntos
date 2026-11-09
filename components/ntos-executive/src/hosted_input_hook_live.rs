@@ -1008,10 +1008,8 @@ pub(super) unsafe fn nested_work_ready() -> bool {
     })
 }
 
-pub(super) fn entered_port_with_published_class() -> bool {
-    port_sources().iter().any(|port| port.entered && !port.published
-        && class_sources().iter().any(|class| class.owner_id == port.owner_id
-            && class.published))
+pub(super) fn entered_port_source_unpublished() -> bool {
+    port_sources().iter().any(|port| port.entered && !port.published)
 }
 
 fn returned_hook_state(
