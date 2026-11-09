@@ -56,6 +56,18 @@ pub(super) struct Reservation(u64);
 
 pub(super) struct CreatedReservation(u64);
 
+/// A failed AddDevice's exact rollback row remains owned until its deferred native cleanup is
+/// terminal. The id is monotonic and is never reused; absence after abort began proves that
+/// `advance_inner` removed this row after its last projection and bank effect.
+#[must_use = "retain until this exact rollback is retired or blocked"]
+pub(super) struct AbortReceipt(Reservation);
+
+pub(super) enum AbortProgress {
+    Retired,
+    Retiring(AbortReceipt),
+    Blocked(AbortReceipt),
+}
+
 #[derive(Default)]
 pub(crate) struct Stats {
     pub live: usize,
@@ -557,6 +569,43 @@ unsafe fn block_id(id: u64, status: nt_status::NtStatus) {
 pub(super) unsafe fn abort(reservation: Reservation) {
     owner(reservation.0).phase = Phase::Retiring;
     let _ = advance(reservation.0);
+}
+
+/// Start rollback once, retaining the exact row selector when cleanup must continue later.
+/// A blocked row keeps its physical bank and cannot authorize parent-stack teardown.
+pub(super) unsafe fn abort_owned(reservation: Reservation) -> AbortProgress {
+    let id = reservation.0;
+    let Some(row) = owners().iter_mut().find(|row| row.id == id) else {
+        return AbortProgress::Blocked(AbortReceipt(reservation));
+    };
+    if !matches!(row.phase, Phase::Preparing | Phase::Dispatching) {
+        return AbortProgress::Blocked(AbortReceipt(reservation));
+    }
+    row.phase = Phase::Retiring;
+    let _ = advance(id);
+    observe_abort(AbortReceipt(reservation))
+}
+
+/// Retry only a still-retiring row. Global rollback drain may have completed this exact id in
+/// the meantime; an absent row is terminal because no other path can reuse its reservation.
+pub(super) unsafe fn retry_abort_owned(receipt: AbortReceipt) -> AbortProgress {
+    let id = receipt.0.0;
+    let Some(row) = owners().iter().find(|row| row.id == id) else {
+        return AbortProgress::Retired;
+    };
+    if row.phase != Phase::Retiring {
+        return AbortProgress::Blocked(receipt);
+    }
+    let _ = advance(id);
+    observe_abort(receipt)
+}
+
+unsafe fn observe_abort(receipt: AbortReceipt) -> AbortProgress {
+    match owners().iter().find(|row| row.id == receipt.0.0).map(|row| row.phase) {
+        None => AbortProgress::Retired,
+        Some(Phase::Retiring) => AbortProgress::Retiring(receipt),
+        Some(_) => AbortProgress::Blocked(receipt),
+    }
 }
 
 unsafe fn advance(id: u64) -> Result<(), nt_status::NtStatus> {

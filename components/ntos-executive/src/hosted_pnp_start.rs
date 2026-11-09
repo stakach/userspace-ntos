@@ -214,6 +214,7 @@ pub(crate) struct OwnedHostedPnpStartBatch {
     report: HostedPnpStartReport,
     pending_device_id: u64,
     pending_add_device: Option<PendingHostedAddDevice>,
+    pending_upper_filter: Option<PendingHostedUpperFilter>,
     pending_filter_admission: Option<PendingHostedFilterAdmission>,
     pending_filter: Option<PendingHostedPnpFilter>,
     pending_grant_admission: Option<PendingHostedGrantAdmission>,
@@ -262,6 +263,19 @@ struct PendingHostedAddDevice {
     devnode_index: usize,
     resource_plan: PreparedHostedResourcePlan,
     continuation: driver_launch::HostedAddDeviceContinuation,
+    child_step_recorded: bool,
+    blocked: bool,
+    quarantined_child_step: Option<crate::service_sec_image::NestedChildStep>,
+}
+
+/// The function FDO has returned, but its ordered class filter still owns an entered
+/// AddDevice claim. Keep the same resource plan and Ready cursor until that exact callback
+/// and every selected child have settled at the flat root.
+struct PendingHostedUpperFilter {
+    devnode_index: usize,
+    device_id: u64,
+    resource_plan: PreparedHostedResourcePlan,
+    continuation: driver_launch::UpperFilterAttachContinuation,
     child_step_recorded: bool,
     blocked: bool,
     quarantined_child_step: Option<crate::service_sec_image::NestedChildStep>,
@@ -316,6 +330,7 @@ impl OwnedHostedPnpStartBatch {
             report,
             pending_device_id: 0,
             pending_add_device: None,
+            pending_upper_filter: None,
             pending_filter_admission: None,
             pending_filter: None,
             pending_grant_admission: None,
@@ -342,7 +357,7 @@ impl OwnedHostedPnpStartBatch {
     pub(crate) fn wait_stage(&self) -> HostedPnpWaitStage {
         if self.pending_relations.is_some() {
             HostedPnpWaitStage::Relations
-        } else if self.pending_add_device.is_some() {
+        } else if self.pending_add_device.is_some() || self.pending_upper_filter.is_some() {
             HostedPnpWaitStage::AddDevice
         } else if self.pending_filter_admission.is_some() {
             HostedPnpWaitStage::FilterAdmission
@@ -496,6 +511,7 @@ impl OwnedHostedPnpStartBatch {
 
     pub(crate) fn needs_completion_redrive(&self) -> bool {
         self.pending_add_device.is_some()
+            || self.pending_upper_filter.is_some()
             || self.pending_filter_admission.is_some()
             || self.pending_grant_admission.as_ref().is_some_and(|pending| pending.blocked_status.is_none())
             || self.pending_filter
@@ -519,6 +535,14 @@ impl OwnedHostedPnpStartBatch {
                 && pending.continuation.child_work_ready()
                 && !pending.continuation.retry_without_new_child()
         })
+            || self.pending_upper_filter.as_ref().is_some_and(|pending| {
+                !pending.blocked && !pending.child_step_recorded
+                    && pending.quarantined_child_step.is_none()
+                    && !driver_launch::unsettled_suspended_connect_pump()
+                    && pending.devnode_index == self.coordinator.next_devnode()
+                    && pending.continuation.child_work_ready()
+                    && !pending.continuation.retry_without_new_child()
+            })
     }
 
     pub(crate) fn retry_add_device_without_new_child(&self) -> bool {
@@ -528,6 +552,12 @@ impl OwnedHostedPnpStartBatch {
                 && pending.devnode_index == self.coordinator.next_devnode()
                 && pending.continuation.retry_without_new_child()
         })
+            || self.pending_upper_filter.as_ref().is_some_and(|pending| {
+                !pending.blocked && !pending.child_step_recorded
+                    && pending.quarantined_child_step.is_none()
+                    && pending.devnode_index == self.coordinator.next_devnode()
+                    && pending.continuation.retry_without_new_child()
+            })
     }
 
     /// A child may have entered before this deposit. A refusal stays in this batch and fences
@@ -536,7 +566,36 @@ impl OwnedHostedPnpStartBatch {
         &mut self,
         step: crate::service_sec_image::NestedChildStep,
     ) -> Result<AddDeviceStepDeposit, crate::service_sec_image::NestedChildStep> {
+        if self.pending_upper_filter.is_some() {
+            return self.record_upper_filter_child_step(step);
+        }
         let Some(pending) = self.pending_add_device.as_mut() else { return Err(step) };
+        if pending.quarantined_child_step.is_some() { return Err(step); }
+        if pending.blocked || pending.child_step_recorded
+            || pending.devnode_index != self.coordinator.next_devnode()
+        {
+            pending.blocked = true;
+            pending.quarantined_child_step = Some(step);
+            return Ok(AddDeviceStepDeposit::Quarantined);
+        }
+        match pending.continuation.record_child_step(step) {
+            Ok(()) => {
+                pending.child_step_recorded = true;
+                Ok(AddDeviceStepDeposit::Recorded)
+            }
+            Err(step) => {
+                pending.blocked = true;
+                pending.quarantined_child_step = Some(step);
+                Ok(AddDeviceStepDeposit::Quarantined)
+            }
+        }
+    }
+
+    fn record_upper_filter_child_step(
+        &mut self,
+        step: crate::service_sec_image::NestedChildStep,
+    ) -> Result<AddDeviceStepDeposit, crate::service_sec_image::NestedChildStep> {
+        let Some(pending) = self.pending_upper_filter.as_mut() else { return Err(step) };
         if pending.quarantined_child_step.is_some() { return Err(step); }
         if pending.blocked || pending.child_step_recorded
             || pending.devnode_index != self.coordinator.next_devnode()
@@ -620,8 +679,21 @@ impl OwnedHostedPnpStartBatch {
                 resource_plan, continuation, blocked,
             } => {
                 assert!(self.pending_add_device.is_none());
+                assert!(self.pending_upper_filter.is_none());
                 self.pending_add_device = Some(PendingHostedAddDevice {
                     devnode_index, resource_plan, continuation,
+                    child_step_recorded: false, blocked,
+                    quarantined_child_step: None,
+                });
+                return Some(OwnedHostedPnpStartProgress::AwaitingCompletion);
+            }
+            HostedPnpDevnodeProgress::UpperFilterPending {
+                device_id, resource_plan, continuation, blocked,
+            } => {
+                assert!(self.pending_add_device.is_none());
+                assert!(self.pending_upper_filter.is_none());
+                self.pending_upper_filter = Some(PendingHostedUpperFilter {
+                    devnode_index, device_id, resource_plan, continuation,
                     child_step_recorded: false, blocked,
                     quarantined_child_step: None,
                 });
@@ -773,6 +845,7 @@ impl OwnedHostedPnpStartBatch {
                 ))
             }
             HostedPnpDevnodeProgress::AddDevicePending { .. }
+            | HostedPnpDevnodeProgress::UpperFilterPending { .. }
             | HostedPnpDevnodeProgress::BusRelationPending { .. }
             | HostedPnpDevnodeProgress::FilterAdmissionPending { .. }
             | HostedPnpDevnodeProgress::FilterPending { .. }
@@ -828,6 +901,33 @@ impl OwnedHostedPnpStartBatch {
                         }
                     }
                 };
+                if let Some(outcome) = self.apply_devnode_progress(devnode_index, progress) {
+                    return outcome;
+                }
+                continue;
+            }
+            if let Some(pending) = self.pending_upper_filter.as_ref() {
+                if !flat_root_add_device_permit {
+                    return OwnedHostedPnpStartProgress::AwaitingCompletion;
+                }
+                if pending.blocked || pending.quarantined_child_step.is_some()
+                    || driver_launch::unsettled_suspended_connect_pump()
+                    || !pending.child_step_recorded
+                        && !pending.continuation.retry_without_new_child()
+                {
+                    return OwnedHostedPnpStartProgress::AwaitingCompletion;
+                }
+                let pending = self.pending_upper_filter.take()
+                    .expect("inspected upper-filter AddDevice owner");
+                flat_root_add_device_permit = false;
+                let devnode_index = pending.devnode_index;
+                assert_eq!(self.coordinator.next_devnode(), devnode_index);
+                let progress = finish_upper_filter_progress(
+                    pending.continuation.resume(), pending.device_id,
+                    pending.resource_plan, &self.spec.service_name,
+                    &self.spec.devnodes[devnode_index].instance_id,
+                    self.options, &mut self.report,
+                );
                 if let Some(outcome) = self.apply_devnode_progress(devnode_index, progress) {
                     return outcome;
                 }
@@ -2290,6 +2390,12 @@ enum HostedPnpDevnodeProgress {
         continuation: driver_launch::HostedAddDeviceContinuation,
         blocked: bool,
     },
+    UpperFilterPending {
+        device_id: u64,
+        resource_plan: PreparedHostedResourcePlan,
+        continuation: driver_launch::UpperFilterAttachContinuation,
+        blocked: bool,
+    },
     BusRelationPending { require_accepted_bus_pdo: bool },
     ResourceAdmissionPending,
     FilterAdmissionPending {
@@ -2699,35 +2805,14 @@ unsafe fn finish_add_device_for_devnode(
                     );
                 }
             };
-            if let Err(status) = driver_launch::attach_hosted_class_upper_filters(
+            let upper_filter = driver_launch::attach_hosted_class_upper_filters_progress(
                 instance_id,
                 device_id,
                 filter_generation,
                 &upper_filter_driver_ids,
-            ) {
-                print_str(b"[pnp-upper-filter] AddDevice failed status=0x");
-                print_hex(status.raw() as u32);
-                print_str(b" devnode=");
-                print_str(instance_id.as_bytes());
-                print_str(b"\n");
-                return finish_filter_failure(
-                    device_id,
-                    resource_plan,
-                    service_name,
-                    instance_id,
-                    options,
-                    status,
-                    report,
-                );
-            }
-            filter_attached_devnode(
-                device_id,
-                resource_plan,
-                service_name,
-                instance_id,
-                options,
-                report,
-            )
+            );
+            finish_upper_filter_progress(upper_filter, device_id, resource_plan,
+                service_name, instance_id, options, report)
         }
         Err(status) => {
             let status = resource_plan
@@ -2740,6 +2825,43 @@ unsafe fn finish_add_device_for_devnode(
                 device_id: 0,
                 status,
                 receipt: None,
+            }
+        }
+    }
+}
+
+/// Function AddDevice has already returned. Keep the original resource plan at the same Ready
+/// cursor while an entered class filter and its selected child settle at the flat root.
+unsafe fn finish_upper_filter_progress(
+    progress: driver_launch::UpperFilterAttachProgress,
+    device_id: u64,
+    resource_plan: PreparedHostedResourcePlan,
+    service_name: &str,
+    instance_id: &str,
+    options: HostedPnpStartOptions,
+    report: &mut HostedPnpStartReport,
+) -> HostedPnpDevnodeProgress {
+    match progress {
+        driver_launch::UpperFilterAttachProgress::Completed(Ok(())) =>
+            filter_attached_devnode(device_id, resource_plan, service_name,
+                instance_id, options, report),
+        driver_launch::UpperFilterAttachProgress::Completed(Err(status)) => {
+            print_str(b"[pnp-upper-filter] AddDevice failed status=0x");
+            print_hex(status.raw() as u32);
+            print_str(b" devnode=");
+            print_str(instance_id.as_bytes());
+            print_str(b"\n");
+            finish_filter_failure(device_id, resource_plan, service_name,
+                instance_id, options, status, report)
+        }
+        driver_launch::UpperFilterAttachProgress::ChildWorkYield(continuation) =>
+            HostedPnpDevnodeProgress::UpperFilterPending {
+                device_id, resource_plan, continuation, blocked: false,
+            },
+        driver_launch::UpperFilterAttachProgress::RetainedRefusal(continuation) => {
+            let blocked = !continuation.retry_without_new_child();
+            HostedPnpDevnodeProgress::UpperFilterPending {
+                device_id, resource_plan, continuation, blocked,
             }
         }
     }

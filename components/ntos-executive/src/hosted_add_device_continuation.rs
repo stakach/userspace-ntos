@@ -65,12 +65,41 @@ pub(super) unsafe fn retire_add_device_bank(
         .map_err(|_| (nt_status::NtStatus::INVALID_HANDLE, ticket))
 }
 
-struct AddDeviceBanks {
+pub(super) struct AddDeviceBanks {
     ticket: Option<SuspendedActiveHostedIrpTransfer>,
 }
 
 impl AddDeviceBanks {
-    unsafe fn retire(&mut self) -> Result<(), nt_status::NtStatus> {
+    /// Retain the exact class dispatch page before either native upper-filter phase enters.
+    /// The caller keeps this owner through child work, terminal validation, and rollback.
+    pub(super) unsafe fn claim(
+        shared_va: u64,
+        instance_index: usize,
+    ) -> Result<Self, nt_status::NtStatus> {
+        reserve_add_device_bank(shared_va, None, instance_index)
+            .map(|ticket| Self { ticket: Some(ticket) })
+    }
+
+    /// Rollback may continue after the caller's stack unwinds. Give that durable owner the
+    /// same exact page ticket before native AddDevice enters, so a deferred drain cannot race
+    /// with another claimant of the class dispatch page.
+    pub(super) unsafe fn transfer_to_rollback(
+        &mut self,
+        reservation: &hosted_add_device_rollback::Reservation,
+    ) -> Result<(), nt_status::NtStatus> {
+        let Some(ticket) = self.ticket.take() else {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        };
+        match hosted_add_device_rollback::attach_bank_ticket(reservation, ticket) {
+            Ok(()) => Ok(()),
+            Err(ticket) => {
+                self.ticket = Some(ticket);
+                Err(nt_status::NtStatus::INVALID_HANDLE)
+            }
+        }
+    }
+
+    pub(super) unsafe fn retire(&mut self) -> Result<(), nt_status::NtStatus> {
         if let Some(ticket) = self.ticket.take() {
             if let Err((status, ticket)) = retire_add_device_bank(ticket) {
                 self.ticket = Some(ticket);
@@ -80,12 +109,12 @@ impl AddDeviceBanks {
         Ok(())
     }
 
-    fn held(&self) -> bool { self.ticket.is_some() }
+    pub(super) fn held(&self) -> bool { self.ticket.is_some() }
 }
 
 /// The native AddDevice request has one dispatch page and one physical Reply. A yielded pump
 /// owns the Reply here; its caller keeps this with both leased pages and rollback transaction.
-struct AddDevicePumpContinuation {
+pub(super) struct AddDevicePumpContinuation {
     pump: Option<component_scheduler::HostedPumpRestore>,
     child_step: Option<crate::service_sec_image::NestedChildStep>,
     instance_index: usize,
@@ -96,7 +125,7 @@ struct AddDevicePumpContinuation {
 }
 
 impl AddDevicePumpContinuation {
-    fn physical_identity(&self) -> Option<component_scheduler::ChildWorkPhysicalIdentity> {
+    pub(super) fn physical_identity(&self) -> Option<component_scheduler::ChildWorkPhysicalIdentity> {
         self.pump.as_ref()?.child_work_identity()
     }
 }
@@ -104,7 +133,7 @@ impl AddDevicePumpContinuation {
 /// Enter CREATE_PDO_PROJECTION once while the AddDevice transaction owns the shared-page
 /// lease. A yielded projection carries the same physical Reply and one-use child receipt as
 /// the later AddDevice dispatch; its caller may not send another ReplyRequest on resume.
-unsafe fn dispatch_pdo_projection_progress(
+pub(super) unsafe fn dispatch_pdo_projection_progress(
     projection_instance: usize,
     caller: nt_process::native_handle::NativeHandleCaller,
 ) -> AddDevicePumpProgress {
@@ -121,7 +150,7 @@ unsafe fn dispatch_pdo_projection_progress(
     }.into_progress()
 }
 
-enum AddDevicePumpProgress {
+pub(super) enum AddDevicePumpProgress {
     Completed(Result<AddDeviceDispatchResult, nt_status::NtStatus>),
     ProjectionCompleted(Result<u64, nt_status::NtStatus>),
     ChildWorkYield(AddDevicePumpContinuation),
@@ -129,12 +158,12 @@ enum AddDevicePumpProgress {
 }
 
 impl AddDevicePumpContinuation {
-    fn child_work_ready(&self) -> bool {
+    pub(super) fn child_work_ready(&self) -> bool {
         self.child_step.is_none()
             && matches!(self.pump, Some(component_scheduler::HostedPumpRestore::ChildWorkReady { .. }))
     }
 
-    fn retry_without_new_child(&self) -> bool {
+    pub(super) fn retry_without_new_child(&self) -> bool {
         self.child_step.is_some()
             || matches!(self.pump, Some(component_scheduler::HostedPumpRestore::ChildWorkPending(ref pending))
                 if pending.retryable())
@@ -142,7 +171,7 @@ impl AddDevicePumpContinuation {
                 Some(component_scheduler::HostedPumpRestore::Retained { retryable: true, .. }))
     }
 
-    fn record_child_step(
+    pub(super) fn record_child_step(
         &mut self,
         step: crate::service_sec_image::NestedChildStep,
     ) -> Result<(), crate::service_sec_image::NestedChildStep> {
@@ -151,7 +180,7 @@ impl AddDevicePumpContinuation {
         Ok(())
     }
 
-    unsafe fn resume(mut self) -> AddDevicePumpProgress {
+    pub(super) unsafe fn resume(mut self) -> AddDevicePumpProgress {
         let Some(pump) = self.pump.take() else {
             return AddDevicePumpProgress::RetainedRefusal(self);
         };
@@ -226,7 +255,31 @@ impl AddDevicePumpContinuation {
     }
 }
 
-unsafe fn dispatch_add_device_for_instance_progress(
+/// Enter a class-local lower-alias projection through the same move-only child-work pump as
+/// AddDevice. The caller owns the exact attachment claim and shared-bank lease across a yield.
+pub(super) unsafe fn dispatch_class_lower_alias_progress(
+    class_instance: usize,
+    prepared: hosted_upper_filter_projection::PreparedUpperFilterProjection,
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> AddDevicePumpProgress {
+    let (ch, sh) = match prepare_device_projection_control_for_instance(
+        class_instance, 0, FSD_DISPATCH_CLASS_LOWER_ALIAS,
+        prepared.pdo_object, 0, false, Some(prepared),
+    ) {
+        Ok(ready) => ready,
+        Err(status) => return AddDevicePumpProgress::ProjectionCompleted(Err(status)),
+    };
+    let pump = component_scheduler::hosted_component_pump_with_caller_add_device_child_work(
+        &ch, caller,
+    );
+    AddDevicePumpContinuation {
+        pump: Some(pump), child_step: None, instance_index: class_instance,
+        shared_va: sh, driver_object: 0, pdo_object: prepared.pdo_object,
+        projection: true,
+    }.into_progress()
+}
+
+pub(super) unsafe fn dispatch_add_device_for_instance_progress(
     index: usize,
     inst: DriverInstance,
     pdo_object: u64,

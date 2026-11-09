@@ -11,7 +11,9 @@ use nt_io_manager::HostedDevicePointerRegistration;
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Phase {
     Reserved,
+    ProjectingPdo,
     Allocating,
+    ProjectingLower,
     Published,
     Configuring,
     Configured,
@@ -179,12 +181,20 @@ pub(super) struct PreparedUpperFilterProjection {
     pub(super) lower_stack_size: u8,
 }
 
-/// Reserve one exact PnP generation before allocating either alias. Failed or uncertain native
-/// effects keep this owner blocked; they never permit another allocation for the same devnode.
-pub(super) unsafe fn prepare(
+/// The two class-local aliases have distinct canonical targets and must be acknowledged in
+/// order. The caller owns the class dispatch page across both native projection pumps.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum AliasKind {
+    Pdo,
+    Lower,
+}
+
+/// Reserve one exact PnP generation before entering a native projection pump. This is pure
+/// admission: the caller may release this row if bank or ledger admission fails afterward.
+pub(super) unsafe fn reserve_alias_owner(
     instance_path: &str,
     claim: nt_pnp_manager::UpperFilterAttachmentClaim,
-) -> Result<PreparedUpperFilterProjection, nt_status::NtStatus> {
+) -> Result<(u64, usize), nt_status::NtStatus> {
     let _durable = crate::allocator::enter_durable();
     let pdo_id = claim.key().child().pdo_object_id();
     let function_id = claim.key().function_fdo();
@@ -313,91 +323,116 @@ pub(super) unsafe fn prepare(
     unsafe {
         NEXT_ID = next;
     }
+    Ok((id, class_instance))
+}
 
-    // The row now owns every possible effect. A failed pump may have allocated a projection
-    // without returning its address, so no error path frees, unbinds, or retries an alias.
-    let caller = crate::initial_system_driver_caller();
-    for device in [pdo, lower] {
-        owner(id).unwrap().phase = Phase::Allocating;
-        let address = match create_hosted_pdo_projection(class_instance, caller) {
-            Ok(address) => address,
-            Err(status) => {
-                owner(id).unwrap().phase = Phase::Blocked;
-                return Err(status);
-            }
-        };
-        let alias = Alias {
-            address,
-            allocation: None,
-            registration: None,
-            pointer_retired: false,
-            physical_retired: false,
-        };
-        if device == pdo {
-            owner(id).unwrap().pdo_alias = Some(alias);
-        } else {
-            owner(id).unwrap().lower_alias = Some(alias);
+/// Release a reservation only while no native projection has entered. Once an alias pump starts,
+/// its caller must keep the exact row, including an indeterminate completion without an address.
+pub(super) fn release_reserved_alias_owner(owner_id: u64) -> Result<(), nt_status::NtStatus> {
+    let index = owners().iter().position(|row| row.id == owner_id)
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    let row = owners()[index];
+    if row.phase != Phase::Reserved || row.pdo_alias.is_some() || row.lower_alias.is_some() {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    owners().swap_remove(index);
+    Ok(())
+}
+
+/// Transfer the reserved row to an impending native pump before it can allocate an alias. A
+/// yielded or uncertain pump therefore cannot be released as a no-effect reservation.
+pub(super) fn begin_alias_projection(
+    owner_id: u64,
+    kind: AliasKind,
+) -> Result<(), nt_status::NtStatus> {
+    let row = owner(owner_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    let (expected, entered) = match kind {
+        AliasKind::Pdo => (Phase::Reserved, Phase::ProjectingPdo),
+        AliasKind::Lower => (Phase::Allocating, Phase::ProjectingLower),
+    };
+    if row.phase != expected
+        || (kind == AliasKind::Pdo && row.pdo_alias.is_some())
+        || (kind == AliasKind::Lower
+            && (row.pdo_alias.is_none_or(|alias| alias.registration.is_none())
+                || row.lower_alias.is_some()))
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    row.phase = entered;
+    Ok(())
+}
+
+/// Record an acknowledged projection immediately. The owner remains durable across allocation,
+/// protection and pointer registration; a failure blocks reuse of the class domain and address.
+pub(super) unsafe fn accept_alias_projection(
+    owner_id: u64,
+    kind: AliasKind,
+    address: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let row = *owner(owner_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    let expected_phase = match kind { AliasKind::Pdo => Phase::ProjectingPdo, AliasKind::Lower => Phase::ProjectingLower };
+    if row.phase != expected_phase
+        || address == 0
+        || (kind == AliasKind::Pdo && row.pdo_alias.is_some())
+        || (kind == AliasKind::Lower
+            && (row.pdo_alias.is_none_or(|alias| alias.registration.is_none())
+                || row.lower_alias.is_some()))
+    {
+        block_uncertain(owner_id);
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let device = match kind { AliasKind::Pdo => row.pdo, AliasKind::Lower => row.lower };
+    let alias = Alias {
+        address, allocation: None, registration: None,
+        pointer_retired: false, physical_retired: false,
+    };
+    {
+        let target = owner(owner_id).unwrap();
+        target.phase = Phase::Allocating;
+        match kind { AliasKind::Pdo => target.pdo_alias = Some(alias), AliasKind::Lower => target.lower_alias = Some(alias) };
+    }
+    let result = (|| {
+        let class_inst = instance(row.class_instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+        if instance_domain_identity(class_inst) != Some(row.class_domain) {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
-        let allocation = match hosted_device_allocations::capture_allocation(class_inst, address) {
-            Ok(allocation) => allocation,
-            Err(status) => {
-                owner(id).unwrap().phase = Phase::Blocked;
-                return Err(status);
-            }
-        };
-        if device == pdo {
-            owner(id).unwrap().pdo_alias.as_mut().unwrap().allocation = Some(allocation);
-        } else {
-            owner(id).unwrap().lower_alias.as_mut().unwrap().allocation = Some(allocation);
-        }
-        if let Err(status) = hosted_device_allocations::protect_allocation_exact(
-            class_inst,
-            address,
-            Some(allocation),
-        ) {
-            owner(id).unwrap().phase = Phase::Blocked;
-            return Err(status);
-        }
-        match register_unlinked_hosted_device_projection(class_inst, class_domain, address, device) {
+        let allocation = hosted_device_allocations::capture_allocation(class_inst, address)?;
+        let alias = match kind { AliasKind::Pdo => owner(owner_id).unwrap().pdo_alias.as_mut().unwrap(),
+                                 AliasKind::Lower => owner(owner_id).unwrap().lower_alias.as_mut().unwrap() };
+        alias.allocation = Some(allocation);
+        hosted_device_allocations::protect_allocation_exact(class_inst, address, Some(allocation))?;
+        match register_unlinked_hosted_device_projection(class_inst, row.class_domain, address, device) {
             Ok(registration) => {
-                if device == pdo {
-                    owner(id).unwrap().pdo_alias.as_mut().unwrap().registration =
-                        Some(registration);
-                } else {
-                    owner(id)
-                        .unwrap()
-                        .lower_alias
-                        .as_mut()
-                        .unwrap()
-                        .registration = Some(registration);
-                }
+                let alias = match kind { AliasKind::Pdo => owner(owner_id).unwrap().pdo_alias.as_mut().unwrap(),
+                                         AliasKind::Lower => owner(owner_id).unwrap().lower_alias.as_mut().unwrap() };
+                alias.registration = Some(registration);
+                Ok(())
             }
             Err(error) => {
                 if let Some(registration) = error.accepted_registration() {
-                    if device == pdo {
-                        owner(id).unwrap().pdo_alias.as_mut().unwrap().registration =
-                            Some(registration);
-                    } else {
-                        owner(id)
-                            .unwrap()
-                            .lower_alias
-                            .as_mut()
-                            .unwrap()
-                            .registration = Some(registration);
-                    }
+                    let alias = match kind { AliasKind::Pdo => owner(owner_id).unwrap().pdo_alias.as_mut().unwrap(),
+                                             AliasKind::Lower => owner(owner_id).unwrap().lower_alias.as_mut().unwrap() };
+                    alias.registration = Some(registration);
                 }
-                owner(id).unwrap().phase = Phase::Blocked;
-                return Err(error.status);
+                Err(error.status)
             }
         }
+    })();
+    if let Err(status) = result {
+        block_uncertain(owner_id);
+        return Err(status);
     }
-    owner(id).unwrap().phase = Phase::Published;
-    match validate_before_add_device(id) {
+    if kind == AliasKind::Lower { owner(owner_id).unwrap().phase = Phase::Published; }
+    Ok(())
+}
+
+/// Publish the fully recorded pair after both typed projection pumps have completed.
+pub(super) unsafe fn finish_prepared(
+    owner_id: u64,
+) -> Result<PreparedUpperFilterProjection, nt_status::NtStatus> {
+    match validate_before_add_device(owner_id) {
         Ok(prepared) => Ok(prepared),
-        Err(status) => {
-            let _ = abort_prepared(id);
-            Err(status)
-        }
+        Err(status) => { block_uncertain(owner_id); Err(status) }
     }
 }
 

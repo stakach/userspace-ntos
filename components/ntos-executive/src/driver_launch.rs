@@ -234,6 +234,9 @@ mod hosted_reverse_class_alias;
 mod hosted_reverse_class_projection;
 #[path = "hosted_upper_filter_add_device.rs"]
 mod hosted_upper_filter_add_device;
+pub(crate) use hosted_upper_filter_add_device::{
+    UpperFilterAttachContinuation, UpperFilterAttachProgress,
+};
 use hosted_device_retirement::{retire_hosted_device_projection, CanonicalRetirement};
 #[path = "hosted_file_lifecycle_owners.rs"]
 mod hosted_file_lifecycle_owners;
@@ -69962,18 +69965,20 @@ where
 }
 
 /// Attach registry-selected class filters above an existing function FDO before START.
-pub(crate) unsafe fn attach_hosted_class_upper_filters(
+pub(crate) unsafe fn attach_hosted_class_upper_filters_progress(
     instance_path: &str,
     function_device_id: u64,
     mount_generation: u64,
     ordered_drivers: &[u64],
-) -> Result<(), nt_status::NtStatus> {
+) -> UpperFilterAttachProgress {
     if ordered_drivers.is_empty() {
-        return Ok(());
+        return UpperFilterAttachProgress::Completed(Ok(()));
     }
-    let binding = hosted_device_binding_by_device_id(function_device_id)
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    hosted_upper_filter_add_device::attach_ordered(
+    let Some(binding) = hosted_device_binding_by_device_id(function_device_id) else {
+        return UpperFilterAttachProgress::Completed(
+            Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST));
+    };
+    hosted_upper_filter_add_device::attach_ordered_progress(
         instance_path,
         binding.pdo_device_id,
         function_device_id,
