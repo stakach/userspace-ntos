@@ -60,6 +60,15 @@ pub use root_child_turn::{
 };
 mod hosted_work_queue_claim;
 pub use hosted_work_queue_claim::{HostedWorkQueueClaim, HostedWorkQueueClaimError};
+mod hosted_work_queue_claims;
+pub use hosted_work_queue_claims::{
+    HostedWorkQueueClaims, HostedWorkQueueClaimsError, HostedWorkQueueWorker,
+};
+mod hosted_work_queue_admission;
+pub use hosted_work_queue_admission::{
+    HostedWorkQueueAdmission, HostedWorkQueueAdmissionError, HostedWorkQueueReady,
+    HostedWorkQueueReservation,
+};
 pub use retained_child_dispatch::{
     RetainedChildDispatch, RetainedChildDispatchError, RetainedChildDispatchPhase,
 };

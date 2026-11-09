@@ -25,6 +25,9 @@ impl<K: Copy + Eq, E: Copy> HostedWorkQueueClaim<K, E> {
 
     pub fn invocation(&self) -> K { self.invocation }
 
+    /// The claim's callback has entered and still owns its exact terminal ACK.
+    pub fn entered(&self) -> bool { self.entered && self.entry.is_some() }
+
     pub fn retained_entry(&self, invocation: K) -> Result<&E, HostedWorkQueueClaimError> {
         if invocation != self.invocation {
             return Err(HostedWorkQueueClaimError::WrongInvocation);
