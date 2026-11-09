@@ -13827,6 +13827,7 @@ fn trace_hook_source_completion_probe(irp: u64, stage: u64, event: u64, status: 
     print_hex64(event); print_str(b"/"); print_hex(status as u32); print_str(b"\n");
     if kind == 1 && stage == 3 {
         CONNECT_DPC_PROBE_ARMED.store(true, Ordering::Release);
+        unsafe { hosted_input_hook_live::trace_class_source_after_hook(); }
     }
 }
 
@@ -67789,6 +67790,9 @@ pub(crate) fn trace_connect_child_receive_yield(
     reply: u64, reason: u64, timer_checkpoint: bool, serviced: bool,
     badge: u64, info: u64, demand: u64,
 ) {
+    if CONNECT_DPC_PROBE_ARMED.load(Ordering::Acquire) && demand & 4 != 0 {
+        unsafe { hosted_input_hook_live::trace_class_source_after_hook(); }
+    }
     component_scheduler::trace_connect_child_receive_yield(
         reply, reason, timer_checkpoint, serviced, badge, info, demand,
     );

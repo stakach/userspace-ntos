@@ -269,6 +269,48 @@ fn trace_class_source(stage: u64, work: &ClassSource, target: u64) {
     print_str(b"\n");
 }
 
+/// Observe only published, live class sources after the lower Hook event is signaled.
+pub(super) unsafe fn trace_class_source_after_hook() {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 10 { return; }
+    let count = class_sources().len();
+    for index in 0..count {
+        let Some((irp, route, dispatch, reply, token, class_tcb, acknowledged)) =
+            class_sources().get(index).and_then(|work| {
+                (work.published && !work.source_released).then_some((
+                    work.irp, work.origin.route, work.origin.dispatch,
+                    work.origin.reply, work.origin.token, work.instance.tcb,
+                    work.canonical_acknowledged,
+                ))
+            }) else { continue; };
+        let wait = runtime::hosted_forward_wait_probe(route, dispatch, reply, token);
+        let current_reply = runtime::current_reply(route).ok() == Some(reply);
+        let source_tcb = runtime::physical_source(route).map_or(0, |source| source.tcb);
+        let mut state = [0u64; crate::win32k_glue::TCB_DEBUG_STATE_WORDS];
+        if source_tcb != 0 {
+            crate::win32k_glue::tcb_read_debug_state(source_tcb, reply, &mut state);
+        }
+        print_str(b"[hook-class-post-event] irp/route/epoch/reply/token/class-tcb/source-tcb/ack/wait-phase/can-resume/next-call/current-reply/tcb-state/sched/enqueued/pending-reply=");
+        print_hex_u64(irp); print_str(b"/"); print_hex_u64(route.badge()); print_str(b"/");
+        print_u64(dispatch.epoch()); print_str(b"/"); print_hex_u64(reply); print_str(b"/");
+        print_hex_u64(token); print_str(b"/"); print_hex_u64(class_tcb); print_str(b"/");
+        print_hex_u64(source_tcb); print_str(b"/"); print_u64(u64::from(acknowledged));
+        print_str(b"/"); print_u64(wait.map_or(9, |state| state.0));
+        print_str(b"/"); print_u64(wait.map_or(2, |state| state.1));
+        print_str(b"/"); print_u64(wait.map_or(2, |state| state.2));
+        print_str(b"/"); print_u64(u64::from(current_reply));
+        for field in [
+            crate::win32k_glue::TCB_DBG_STATE,
+            crate::win32k_glue::TCB_DBG_SCHEDULABLE,
+            crate::win32k_glue::TCB_DBG_ENQUEUED,
+            crate::win32k_glue::TCB_DBG_PENDING_REPLY,
+        ] {
+            print_str(b"/"); print_u64(state[field]);
+        }
+        print_str(b"\n");
+    }
+}
+
 fn class_sources() -> &'static mut Vec<Box<ClassSource>> {
     unsafe { &mut *core::ptr::addr_of_mut!(CLASS_SOURCES) }
 }

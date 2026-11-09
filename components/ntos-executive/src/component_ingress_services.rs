@@ -123,6 +123,29 @@ impl ServiceCompletion {
 }
 static mut WAITS: Vec<Wait> = Vec::new();
 
+/// Read-only diagnostic for an exact retained forward Reply; no wait is claimed or resumed.
+pub(crate) unsafe fn hosted_forward_wait_probe(
+    route: PeerRoute, dispatch: LaneDispatchIdentity, reply: u64, token: u64,
+) -> Option<(u64, u64, u64)> {
+    let phase = (&*core::ptr::addr_of!(WAITS)).iter().find(|wait| {
+        wait.route == route && wait.dispatch == dispatch
+            && wait.reply == reply && wait.token == token
+            && matches!(wait.completion, Some(ServiceCompletion::HostedForward { .. }))
+    })?.phase;
+    let phase = match phase {
+        WaitPhase::Entering => 0, WaitPhase::Parked => 1,
+        WaitPhase::ReplyEntered => 2, WaitPhase::Acknowledged => 3,
+        WaitPhase::Resumed => 4, WaitPhase::CompletedAcknowledged => 5,
+        WaitPhase::StoppedAcknowledged => 6, WaitPhase::Cancelled => 7,
+        WaitPhase::Finished => 8,
+    };
+    let resumable = lanes().can_resume_external(route.identity().lane, reply, token)
+        .map(u64::from).unwrap_or(2);
+    let next_call = next_message(route).map(|message| u64::from(message.is_some()))
+        .unwrap_or(2);
+    Some((phase, resumable, next_call))
+}
+
 unsafe fn wait_exact(
     route: PeerRoute,
     dispatch: LaneDispatchIdentity,
