@@ -67808,6 +67808,10 @@ pub(crate) unsafe fn redrive_hosted_connect_forward() {
     hosted_connect_live::redrive();
 }
 
+pub(crate) unsafe fn redrive_entered_hosted_connect_completions() {
+    hosted_connect_live::redrive_entered_completions();
+}
+
 pub(crate) unsafe fn nested_hosted_connect_forward_ready() -> bool {
     hosted_connect_live::nested_work_ready()
 }

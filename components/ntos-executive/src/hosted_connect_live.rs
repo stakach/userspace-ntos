@@ -452,8 +452,14 @@ pub(super) unsafe fn service(
 
 pub(super) unsafe fn redrive() {
     trace_connect_redrive_if_pending(0, false);
-    redrive_inner(false);
+    redrive_inner(RedriveMode::General);
     trace_connect_redrive_if_pending(5, false);
+}
+
+/// An exclusive AddDevice turn can import an already-entered CONNECT completion while
+/// retaining its parent Reply. It must not dispatch a new port provider or queue worker.
+pub(super) unsafe fn redrive_entered_completions() {
+    redrive_inner(RedriveMode::EnteredCompletion);
 }
 
 #[must_use = "run one outer child and deposit its sealed step in the claimed Work row"]
@@ -675,7 +681,14 @@ unsafe fn observe_port_dispatch_result(
     true
 }
 
-unsafe fn redrive_inner(nested_ready_only: bool) -> bool {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RedriveMode {
+    General,
+    NestedReady,
+    EnteredCompletion,
+}
+
+unsafe fn redrive_inner(mode: RedriveMode) -> bool {
     let mut advanced = false;
     let count = rows().len();
     for index in 0..count {
@@ -687,7 +700,13 @@ unsafe fn redrive_inner(nested_ready_only: bool) -> bool {
             None => continue,
         };
         if (*work_ptr).port_acknowledged || (*work_ptr).blocked
-            || (nested_ready_only && !(*work_ptr).nested_ready()) {
+            || (mode == RedriveMode::NestedReady && !(*work_ptr).nested_ready())
+            || (mode == RedriveMode::EnteredCompletion
+                && (!(*work_ptr).provider_entered
+                    || !(*work_ptr).source.origin_mut().armed()
+                    || !matches!((*work_ptr).port.phase(),
+                        hosted_input_connect_dispatch::PortConnectPhase::AwaitingCompletion(_)
+                        | hosted_input_connect_dispatch::PortConnectPhase::Terminal(_)))) {
             continue;
         }
         static REDRIVE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -710,7 +729,9 @@ unsafe fn redrive_inner(nested_ready_only: bool) -> bool {
                 hosted_input_connect_dispatch::PortConnectPhase::AwaitingCompletion(irp) => irp,
                 _ => unreachable!(),
             };
-            if io_manager_mut().completed_irp(pending_irp).is_none() {
+            if mode != RedriveMode::EnteredCompletion
+                && io_manager_mut().completed_irp(pending_irp).is_none()
+            {
                 let queue_progress = drain_hosted_connect_io_work_item(
                     (*work_ptr).port_instance,
                     (*work_ptr).port_domain,
@@ -779,19 +800,23 @@ unsafe fn redrive_inner(nested_ready_only: bool) -> bool {
             work.provider_entered = true;
             advanced = true;
             trace_connect_live(7, work.source.source_irp_address(), work.reverse_owner_id, 0);
-            trace_connect_redrive(1, nested_ready_only, work.source.source_irp_address());
+            trace_connect_redrive(1, mode == RedriveMode::NestedReady,
+                work.source.source_irp_address());
             let phase = {
                 let port = &mut (*work_ptr).port;
                 let permit = &(*work_ptr).permit;
                 let caller = (*work_ptr).caller;
                 port.dispatch(permit, caller)
             };
-            trace_connect_redrive(2, nested_ready_only, (*work_ptr).source.source_irp_address());
+            trace_connect_redrive(2, mode == RedriveMode::NestedReady,
+                (*work_ptr).source.source_irp_address());
             let work = &mut *work_ptr;
             let _ = observe_port_dispatch_result(work, phase);
             if work.blocked { return false; }
-            trace_connect_redrive(3, nested_ready_only, work.source.source_irp_address());
-            trace_connect_redrive(4, nested_ready_only, work.source.source_irp_address());
+            trace_connect_redrive(3, mode == RedriveMode::NestedReady,
+                work.source.source_irp_address());
+            trace_connect_redrive(4, mode == RedriveMode::NestedReady,
+                work.source.source_irp_address());
             continue;
         }
         let work = &mut *work_ptr;
@@ -836,7 +861,7 @@ unsafe fn redrive_inner(nested_ready_only: bool) -> bool {
             // Published aliases and the callback thunk remain installed for subsequent input.
         }
     }
-    trace_connect_redrive_if_pending(6, nested_ready_only);
+    trace_connect_redrive_if_pending(6, mode == RedriveMode::NestedReady);
     advanced
 }
 
@@ -877,7 +902,7 @@ pub(super) fn root_probe_origin_bits() -> u64 {
 
 pub(super) unsafe fn redrive_nested_ready() -> bool {
     trace_connect_redrive_if_pending(0, true);
-    let advanced = redrive_inner(true);
+    let advanced = redrive_inner(RedriveMode::NestedReady);
     trace_connect_redrive_if_pending(5, true);
     advanced
 }

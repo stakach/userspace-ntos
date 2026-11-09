@@ -10954,7 +10954,7 @@ pub(crate) unsafe fn service_sec_image(
                     // The selected AddDevice may be waiting for a detached CONNECT whose
                     // provider has just completed. Import that exact completion before
                     // resuming the parent; this exclusive root path skips ordinary redrives.
-                    crate::driver_launch::redrive_hosted_connect_forward();
+                    crate::driver_launch::redrive_entered_hosted_connect_completions();
                     settle_suspended_connect_pumps()
                 } {
                     ConnectPumpSettlement::Settled => {

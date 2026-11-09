@@ -7,6 +7,14 @@ from pathlib import Path
 
 
 SOURCE = re.compile(r"\[hosted-connect-live\] stage=0 irp=(0x[0-9a-f]+)")
+PENDING = re.compile(
+    r"\[hosted-connect-live\] stage=8 irp=(0x[0-9a-f]+) "
+    r"first=0x0000000000000001 second=(0x[0-9a-f]+)"
+)
+RAW_CLAIM = re.compile(
+    r"\[post-hook-connect-completion\] stage/raw/canonical/detail=2/"
+    r"(0x[0-9a-f]+)/(0x[0-9a-f]+)/0x0000000000000001"
+)
 RAW_TERMINAL = re.compile(
     r"\[post-hook-connect-completion\] stage/raw/canonical/detail=4/"
     r"(0x[0-9a-f]+)/0x[0-9a-f]+/0x0000000000000000"
@@ -21,12 +29,20 @@ def check(log: str) -> tuple[bool, str]:
     source = SOURCE.search(log)
     if source is None:
         return False, "no retained keyboard CONNECT source was captured"
-    raw = RAW_TERMINAL.search(log)
-    if raw is None:
+    pending = next((match for match in PENDING.finditer(log)
+                    if match.group(1) == source.group(1)), None)
+    if pending is None:
+        return False, "retained keyboard CONNECT did not publish its pending port IRP"
+    raw = next((match for match in RAW_CLAIM.finditer(log)
+                if match.group(2) == pending.group(2) and match.start() > pending.end()), None)
+    terminal = next((match for match in RAW_TERMINAL.finditer(log)
+                     if raw is not None and match.group(1) == raw.group(1)
+                     and match.start() > raw.end()), None)
+    if terminal is None:
         return False, "i8042 did not complete a materialized CONNECT IRP"
     observed = next(
         (match for match in OBSERVED.finditer(log)
-         if match.group(1) == source.group(1) and match.start() > raw.end()),
+         if match.group(1) == source.group(1) and match.start() > terminal.end()),
         None,
     )
     if observed is None:

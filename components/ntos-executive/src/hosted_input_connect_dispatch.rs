@@ -317,7 +317,7 @@ impl PortLocalConnect {
         };
         // A nested HOOK source may have finished while the outer CONNECT pump is parked.
         // Drive the I/O Manager before observing this exact canonical IRP.
-        pump_io_manager();
+        unsafe { io_manager_mut().publish_ready_completion_for(irp_id); }
         if unsafe { io_manager_mut().completed_irp(irp_id) }.is_none() {
             return Ok(None);
         }
