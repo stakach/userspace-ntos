@@ -272,12 +272,16 @@ pub(super) fn invoke_suspend_aware(
 fn trace_port_connect_execute(stage: u64, irp: nt_io_manager::IrpId, device: nt_io_manager::DeviceId) {
     static COUNT: AtomicU64 = AtomicU64::new(0);
     if COUNT.fetch_add(1, Ordering::Relaxed) >= 16 { return; }
+    let rsp: u64;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, nomem, preserves_flags)); }
     print_str(b"[port-connect-execute] stage/irp/device=");
     print_u64(stage);
     print_str(b"/");
     print_hex_u64(irp.raw());
     print_str(b"/");
     print_hex_u64(device.raw());
+    print_str(b" rsp=");
+    print_hex_u64(rsp);
     print_str(b"\n");
 }
 
