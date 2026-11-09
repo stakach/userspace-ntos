@@ -1496,6 +1496,12 @@ fn trace_port_connect_dispatch(stage: u64, irp: IrpId, device: nt_io_manager::De
 
 /// Bounded, read-only owner transition probe for mutable METHOD_NEITHER returns.
 fn trace_file_return_probe(stage: u64, irp: IrpId) {
+    trace_file_return_probe_status(stage, irp, None);
+}
+
+fn trace_file_return_probe_status(
+    stage: u64, irp: IrpId, status: Option<nt_status::NtStatus>,
+) {
     let owner = rows().iter().find(|owner| owner.irp_id == Some(irp));
     if owner.is_some_and(|owner| owner.output_capture
         != ExternalFileIrpOutputCapture::MethodNeitherInput) {
@@ -1527,13 +1533,15 @@ fn trace_file_return_probe(stage: u64, irp: IrpId) {
         };
         (owner.id, flight, u64::from(owner.hook_pump.is_some()), payload)
     });
-    print_str(b"[file-return-probe] stage/irp/row/flight/hook/payload=");
+    print_str(b"[file-return-probe] stage/irp/row/flight/hook/payload/status=");
     print_u64(stage); print_str(b"/");
     print_hex_u64(irp.raw()); print_str(b"/");
     print_u64(row_id); print_str(b"/");
     print_u64(flight); print_str(b"/");
     print_u64(hook); print_str(b"/");
-    print_u64(payload); print_str(b"\n");
+    print_u64(payload); print_str(b"/");
+    print_hex_u64(status.map_or(0, |status| status.raw() as u32 as u64));
+    print_str(b"\n");
 }
 
 fn dispatch_with_port_connect<Yield>(
@@ -1672,12 +1680,19 @@ fn settle_returned_dispatch(
             let completion = *terminal.completion();
             match io_manager_mut().retire_external_file_irp_terminal(terminal) {
                 Ok((receipt, buffers)) => {
+                    trace_file_return_probe(78, irp_id);
                     assert!(io_manager_mut().accepts_external_file_irp_receipt(&receipt));
                     row(id).terminal_receipt = Some(receipt);
                     row(id).settled_buffers = Some(buffers);
                     let mut retired = match remove(id) {
-                        Ok(retired) => retired,
-                        Err(_) => return Ok(DispatchResult::Outstanding { irp_id }),
+                        Ok(retired) => {
+                            trace_file_return_probe(79, irp_id);
+                            retired
+                        }
+                        Err(status) => {
+                            trace_file_return_probe_status(80, irp_id, Some(status));
+                            return Ok(DispatchResult::Outstanding { irp_id });
+                        }
                     };
                     Ok(DispatchResult::Returned {
                         irp_id,
@@ -1693,6 +1708,7 @@ fn settle_returned_dispatch(
                 Err(rejection) => {
                     let (status, terminal) = rejection.into_parts();
                     block(id, Payload::Terminal(terminal), status);
+                    trace_file_return_probe_status(81, irp_id, Some(status));
                     Ok(DispatchResult::Outstanding { irp_id })
                 }
             }

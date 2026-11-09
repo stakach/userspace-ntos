@@ -19,6 +19,9 @@ use nt_types::ClientId;
 
 const INVALID: i32 = 0xc000_0010u32 as i32;
 const BUSY: i32 = nt_status::NtStatus::DEVICE_BUSY.raw();
+static HOOK_PORT_TRACE_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+const HOOK_PORT_TRACE_LIMIT: u64 = 192;
 
 #[derive(Clone, Copy)]
 struct ActiveClassDispatch {
@@ -191,6 +194,36 @@ pub(super) fn class_dispatch_active(
 
 fn port_sources() -> &'static mut Vec<Box<PortSource>> {
     unsafe { &mut *core::ptr::addr_of_mut!(PORT_SOURCES) }
+}
+
+/// Capped source-side evidence for the exact port HOOK owner. Phase bits are
+/// entered/pending/candidate/observed/terminal/published/blocked/pump-returned.
+fn trace_port_source(stage: u64, work: &PortSource, detail: u64) {
+    if HOOK_PORT_TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        >= HOOK_PORT_TRACE_LIMIT
+    {
+        return;
+    }
+    let phase = u64::from(work.entered)
+        | (u64::from(work.pending.is_some()) << 1)
+        | (u64::from(work.terminal_candidate.is_some()) << 2)
+        | (u64::from(work.terminal_observed.is_some()) << 3)
+        | (u64::from(work.terminal_status.is_some()) << 4)
+        | (u64::from(work.published) << 5)
+        | (u64::from(work.blocked) << 6)
+        | (u64::from(work.pump_return_consumed) << 7);
+    print_str(b"[hook-port-source] stage/owner/source-irp/file-irp/phase/status/obs-retry/pub-retry/detail=");
+    print_u64(stage);
+    print_str(b"/"); print_u64(work.owner_id);
+    print_str(b"/0x"); print_hex_u64(work.source.source_irp_address());
+    print_str(b"/0x"); print_hex_u64(work.pending.map_or(0, |id| id.raw()));
+    print_str(b"/0x"); print_hex_u64(phase);
+    print_str(b"/0x"); print_hex_u64(work.terminal_candidate.map_or(0,
+        |candidate| candidate.status.raw() as u32 as u64));
+    print_str(b"/"); print_u64(u64::from(work.source.terminal_observation_retryable()));
+    print_str(b"/"); print_u64(u64::from(work.source.terminal_publication_retryable()));
+    print_str(b"/0x"); print_hex_u64(detail);
+    print_str(b"\n");
 }
 
 fn class_sources() -> &'static mut Vec<Box<ClassSource>> {
@@ -629,7 +662,9 @@ unsafe fn stage_port_terminal(
     updated: &[u8],
     completed: Option<IrpId>,
 ) {
+    trace_port_source(10, work, completed.map_or(0, |id| id.raw()));
     if updated.len() != work.input_length || work.terminal_candidate.is_some() {
+        trace_port_source(11, work, updated.len() as u64);
         work.blocked = true;
         return;
     }
@@ -638,21 +673,36 @@ unsafe fn stage_port_terminal(
     work.terminal_candidate = Some(PortTerminalCandidate {
         status, updated: bytes, completed,
     });
+    trace_port_source(12, work, updated.len() as u64);
 }
 
 unsafe fn advance_port_terminal(work: &mut PortSource) {
     let Some(candidate) = work.terminal_candidate else { return; };
+    trace_port_source(20, work, candidate.completed.map_or(0, |id| id.raw()));
     let status = candidate.status;
     if work.terminal_observed.is_none() {
+        trace_port_source(21, work, work.origin.token);
         let outcome = hosted_connect_live::with_hook_sequence(work.owner_id, |_, sequence| {
             work.source.observe_terminal(sequence, status,
                 &candidate.updated[..work.input_length], candidate.completed)
         });
+        let observation = match &outcome {
+            None => 0,
+            Some(Ok(_)) => 1,
+            Some(Err(hosted_input_hook_dispatch::HookError::WrongCaller)) => 2,
+            Some(Err(hosted_input_hook_dispatch::HookError::WrongSource)) => 3,
+            Some(Err(hosted_input_hook_dispatch::HookError::WrongAlias)) => 4,
+            Some(Err(hosted_input_hook_dispatch::HookError::WrongPayload)) => 5,
+            Some(Err(hosted_input_hook_dispatch::HookError::WrongPhase)) => 6,
+        };
+        trace_port_source(22, work, observation);
         if outcome != Some(Ok((work.source.source_identity(), status))) {
             work.blocked = !work.source.terminal_observation_retryable();
+            trace_port_source(23, work, observation);
             return;
         }
         work.terminal_observed = Some(status);
+        trace_port_source(24, work, status.raw() as u32 as u64);
     }
     if work.terminal_observed != Some(status) {
         work.blocked = true;
@@ -676,13 +726,16 @@ unsafe fn advance_port_terminal(work: &mut PortSource) {
         }
         work.pump_key = None;
     }
+    trace_port_source(30, work, status.raw() as u32 as u64);
     if work.source.publish_source_terminal().is_err() {
         // A pre-effect lock refusal leaves Phase::Terminal and can be redriven. A failed
         // native write or deferred-free arm is indeterminate and must never be replayed.
         work.blocked = !work.source.terminal_publication_retryable();
+        trace_port_source(31, work, u64::from(work.blocked));
         return;
     }
     work.terminal_status = Some(status);
+    trace_port_source(32, work, status.raw() as u32 as u64);
 }
 
 unsafe fn advance_port_source(work: &mut PortSource) {
@@ -739,6 +792,7 @@ unsafe fn advance_port_source(work: &mut PortSource) {
                 status, information: 0, buffers, ..
             })) => {
                 let (updated, _) = buffers.into_parts();
+                trace_port_source(49, work, updated.len() as u64);
                 stage_port_terminal(work, status, &updated, None);
             }
             Ok(hosted_file_owners::HookDispatchResult::Returned(
@@ -812,12 +866,15 @@ unsafe fn advance_port_source(work: &mut PortSource) {
         }
     }
     if work.terminal_candidate.is_some() && work.terminal_status.is_none() {
+        trace_port_source(60, work, 0);
         advance_port_terminal(work);
     }
     if let Some(status) = work.terminal_status {
+        trace_port_source(70, work, status.raw() as u32 as u64);
         work.published = work.origin.reply_dispatch(
             HostedForwardDispatchReply::InlineTerminal(status.raw()), true,
         );
+        trace_port_source(71, work, u64::from(work.published));
     }
 }
 
