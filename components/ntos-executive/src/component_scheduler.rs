@@ -204,6 +204,7 @@ pub(super) struct ChildWorkPhysicalIdentity {
     pub(super) dispatch: nt_component_suspension::LaneDispatchIdentity,
     pub(super) reply_cap: u64,
     pub(super) tcb: u64,
+    pub(super) pml4: u64,
     pub(super) shared_va: u64,
 }
 
@@ -219,7 +220,7 @@ impl HostedPumpRestore {
         if reply_cap == 0 || channel.reply_cap != reply_cap { return None; }
         Some(ChildWorkPhysicalIdentity {
             route: channel.ingress_route?, dispatch, reply_cap,
-            tcb: channel.tcb, shared_va: channel.shared_va,
+            tcb: channel.tcb, pml4: channel.pml4, shared_va: channel.shared_va,
         })
     }
 
@@ -762,8 +763,15 @@ unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> Hos
         pending.channel = channel;
         return HostedPumpRestore::ChildWorkPending(pending);
     }
-    if result.completed && authenticate_component_completion(&channel, &result).is_err() {
-        return retain_uncertain_receive(pending, result, channel);
+    if result.completed {
+        // The generic authenticator reads the current dispatch. A resumed slice must also
+        // prove that it is still completing the dispatch it originally retained.
+        if runtime::dispatch(route).ok() != Some(pending.dispatch)
+            || runtime::current_reply(route).ok() != Some(result.reply_cap)
+            || authenticate_component_completion(&channel, &result).is_err()
+        {
+            return retain_uncertain_receive(pending, result, channel);
+        }
     }
     HostedPumpRestore::Restored(result)
 }

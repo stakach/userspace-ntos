@@ -186,11 +186,12 @@ fn uncertain_child_step_fences_the_exact_physical_parent() {
 #[test]
 fn file_capable_nested_work_unwinds_before_running_its_child() {
     let branch = SHARED
-        .split_once("if nested_file_ready {")
+        .split_once("if nested_file_path != NestedFileWorkPath::NoWork {")
         .expect("nested File readiness gate").1
         .split_once("trace_ps_create_receive(ch, b\"retained-services\"")
         .expect("nested File branch boundary").0;
-    let capability = branch.find("if ch.child_work_capable {").expect("explicit File capability");
+    let capability = branch.find("if nested_file_path == NestedFileWorkPath::RetainForRoot {")
+        .expect("typed child-work selection");
     let retain = branch.find("runtime::nested::retain_child_work_parent(&mut parent)")
         .expect("physical parent retained before unwind");
     let yield_out = branch.find("PumpMessage::nested_child_work_yield(ticket)")

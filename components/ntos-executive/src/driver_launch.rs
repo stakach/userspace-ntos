@@ -194,6 +194,12 @@ pub(crate) mod hosted_add_device_rollback;
 mod hosted_file_dispatch;
 #[path = "hosted_work_queue_owner.rs"]
 mod hosted_work_queue_owner;
+pub(crate) use hosted_work_queue_owner::{
+    QueuedCallbackProgress, QueuedCallbackRootAction, QueuedCallbackSelector,
+    queued_callback_file_floor, queued_callback_root_action,
+    record_queued_callback_child_step, resume_queued_callback_after_file_settlement,
+    unsettled_queued_callback,
+};
 #[path = "hosted_file_owners.rs"]
 mod hosted_file_owners;
 #[path = "scsi_srb_pump_phase.rs"]
@@ -33817,6 +33823,12 @@ unsafe fn dispatch_hosted_component_target(
         instance_index, inst, exec_code_va, target, args, stack_args,
     );
     let pr = component_scheduler::hosted_component_pump_with_caller(&ch, caller);
+    finish_hosted_component_target(instance_index, shared, pr)
+}
+
+unsafe fn finish_hosted_component_target(
+    instance_index: usize, shared: u64, pr: crate::spawn_hosts::PumpResult,
+) -> Result<u64, HostedComponentDispatchError> {
     if !pr.completed {
         register_instance_ready(instance_index, false);
         return Err(HostedComponentDispatchError::Wall(pr));
@@ -33826,6 +33838,33 @@ unsafe fn dispatch_hosted_component_target(
         return Err(HostedComponentDispatchError::Status(dispatch_status));
     }
     Ok(read_volatile((shared + SH_REQ_INFO) as *const u64))
+}
+
+enum QueuedComponentTargetProgress {
+    Returned(Result<u64, HostedComponentDispatchError>),
+    Suspended(component_scheduler::HostedPumpRestore),
+}
+
+/// Only a queue caller with a durable claimed row may enter the typed child-work pump.
+/// Ordinary provider export calls still use their legacy synchronous dispatch above.
+unsafe fn dispatch_queued_component_target(
+    instance_index: usize,
+    inst: DriverInstance,
+    exec_code_va: u64,
+    target: u64,
+    args: [u64; 4],
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> QueuedComponentTargetProgress {
+    let (ch, shared) = prepare_hosted_component_target(
+        instance_index, inst, exec_code_va, target, args,
+        [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
+    );
+    match component_scheduler::hosted_component_pump_with_caller_child_work(&ch, caller) {
+        component_scheduler::HostedPumpRestore::Restored(pr) =>
+            QueuedComponentTargetProgress::Returned(
+                finish_hosted_component_target(instance_index, shared, pr)),
+        retained => QueuedComponentTargetProgress::Suspended(retained),
+    }
 }
 
 unsafe fn dispatch_dependent_provider_callback(
@@ -33958,7 +33997,8 @@ unsafe fn drain_hosted_work_queue_for_instance(
             break;
         }
         let claim_key = hosted_work_queue_owner::QueueEntryKey::new(inst, head, entry.work_item);
-        if !hosted_work_queue_owner::claim(instance_index, claim_key, entry) {
+        let file_floor = hosted_file_owners::generic_file_owner_high_water();
+        if !hosted_work_queue_owner::claim(instance_index, claim_key, entry, file_floor) {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
         let hosted_work_queue_owner::QueueEntry { kind, work_item, routine, arg0, arg1 } = entry;
@@ -34021,16 +34061,15 @@ unsafe fn drain_hosted_work_queue_for_instance(
             return Err(STATUS_DEVICE_NOT_READY);
         }
         write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, PASSIVE_LEVEL);
-        match dispatch_hosted_component_target(
+        match dispatch_queued_component_target(
             instance_index,
             inst,
             exec_code_va,
             routine,
             args,
-            [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
             caller,
         ) {
-            Ok(_) => {
+            QueuedComponentTargetProgress::Returned(Ok(_)) => {
                 if ndis_work_dispatch.is_some_and(|dispatch| {
                     !complete_hosted_provider_ndis_work_item_dispatch(dispatch)
                 }) {
@@ -34049,7 +34088,8 @@ unsafe fn drain_hosted_work_queue_for_instance(
                     total.saturating_add(1),
                 );
             }
-            Err(HostedComponentDispatchError::Status(status)) => {
+            QueuedComponentTargetProgress::Returned(
+                Err(HostedComponentDispatchError::Status(status))) => {
                 if let Some(dispatch) = ndis_work_dispatch {
                     mark_hosted_provider_ndis_work_item_dispatch_indeterminate(dispatch);
                 }
@@ -34058,7 +34098,8 @@ unsafe fn drain_hosted_work_queue_for_instance(
                 write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
                 return Err(status);
             }
-            Err(HostedComponentDispatchError::Wall(pr)) => {
+            QueuedComponentTargetProgress::Returned(
+                Err(HostedComponentDispatchError::Wall(pr))) => {
                 if let Some(dispatch) = ndis_work_dispatch {
                     mark_hosted_provider_ndis_work_item_dispatch_indeterminate(dispatch);
                 }
@@ -34073,6 +34114,19 @@ unsafe fn drain_hosted_work_queue_for_instance(
                 );
                 write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
                 return Err(STATUS_UNSUCCESSFUL);
+            }
+            QueuedComponentTargetProgress::Suspended(pump) => {
+                let actionable = pump.child_work_identity().is_some();
+                let retained = hosted_work_queue_owner::retain_pump(
+                    instance_index, claim_key, pump);
+                write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
+                if !retained || !actionable {
+                    register_instance_ready(instance_index, false);
+                    return Err(STATUS_DEVICE_NOT_READY);
+                }
+                // The queue row owns the exact callback pump. Root settles its child and
+                // resumes this receive without replaying the queue entry or callback Call.
+                return Ok(drained);
             }
         }
     }
@@ -67571,8 +67625,16 @@ pub(crate) fn returned_hook_pump_ready() -> bool {
     hosted_input_hook_live::returned_hook_pump_ready()
 }
 
+pub(crate) fn returned_hook_pump_ready_after(floor: u64) -> bool {
+    hosted_input_hook_live::returned_hook_pump_ready_after(floor)
+}
+
 pub(crate) unsafe fn redrive_returned_hook_pump() -> bool {
     hosted_input_hook_live::redrive_returned_hook_pump()
+}
+
+pub(crate) unsafe fn redrive_returned_hook_pump_after(floor: u64) -> bool {
+    hosted_input_hook_live::redrive_returned_hook_pump_after(floor)
 }
 
 pub(crate) unsafe fn redrive_hosted_connect_forward() {
@@ -73633,6 +73695,45 @@ pub(crate) fn unsettled_suspended_connect_pump() -> bool {
 /// selects its exact child after the provider stack has unwound, before restoring CONNECT.
 pub(crate) use hosted_file_owners::GenericFilePumpDrive;
 
+pub(crate) fn generic_file_owner_high_water() -> u64 {
+    hosted_file_owners::generic_file_owner_high_water()
+}
+
+pub(crate) fn generic_file_pump_unsettled_after(floor: u64) -> bool {
+    hosted_file_owners::generic_file_pump_unsettled_after(floor)
+}
+
+pub(crate) fn claim_suspended_generic_file_pump_after(
+    floor: u64,
+) -> Option<hosted_file_owners::GenericFilePumpSelector> {
+    hosted_file_owners::claim_suspended_generic_file_pump_after(floor)
+}
+
+pub(crate) fn recorded_suspended_generic_file_pump_after(
+    floor: u64,
+) -> Option<hosted_file_owners::GenericFilePumpSelector> {
+    hosted_file_owners::recorded_suspended_generic_file_pump_after(floor)
+}
+
+pub(crate) fn record_suspended_generic_file_pump_child_step(
+    selector: hosted_file_owners::GenericFilePumpSelector,
+    step: crate::service_sec_image::NestedChildStep,
+) -> hosted_file_owners::GenericFilePumpDrive {
+    hosted_file_owners::record_suspended_generic_file_pump_child_step(selector, step)
+}
+
+pub(crate) unsafe fn redrive_recorded_generic_file_pump(
+    selector: hosted_file_owners::GenericFilePumpSelector,
+) -> hosted_file_owners::GenericFilePumpDrive {
+    hosted_file_owners::redrive_recorded_generic_file_pump(selector)
+}
+
+pub(crate) unsafe fn redrive_retryable_generic_file_pump_after(
+    floor: u64,
+) -> hosted_file_owners::GenericFilePumpDrive {
+    hosted_file_owners::redrive_retryable_generic_file_pump_after(floor)
+}
+
 pub(crate) fn claim_suspended_generic_file_pump(
 ) -> Option<hosted_file_owners::GenericFilePumpSelector> {
     hosted_file_owners::claim_suspended_generic_file_pump()
@@ -73656,6 +73757,10 @@ pub(crate) fn generic_file_pump_unsettled() -> bool {
 
 pub(crate) fn hook_source_unsettled() -> bool {
     hosted_input_hook_live::hook_source_unsettled()
+}
+
+pub(crate) fn hook_source_unsettled_after(floor: u64) -> bool {
+    hosted_input_hook_live::hook_source_unsettled_after(floor)
 }
 
 enum FileTransferOwner {

@@ -10795,6 +10795,32 @@ pub(crate) unsafe fn service_sec_image(
             }
         }
         loop {
+            // A callback reached by the preceding AddDevice child owns a nested physical
+            // Reply. Settle it before running another AddDevice child or resuming the batch.
+            let callback_settlement = {
+                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                settle_queued_callbacks()
+            };
+            match callback_settlement {
+                ConnectPumpSettlement::Settled => {}
+                ConnectPumpSettlement::AwaitingLocalChild => {
+                    if root_add_device_turn.is_none()
+                        || !prepare_parked_add_device_receive(&mut root_add_device_turn)
+                    {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        break 'service_loop;
+                    }
+                    let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    (badge, mi, m0, m1, m2, m3) = received;
+                    continue 'service_loop;
+                }
+                ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    break 'service_loop;
+                }
+            }
             let selected = {
                 let _message = crate::ipc_message::SavedMessageBuffer::capture();
                 match run_one_pending_add_device_child_step(nt_handler as *mut _) {
@@ -10863,7 +10889,22 @@ pub(crate) unsafe fn service_sec_image(
             let mut awaiting_connect_child = false;
             let still_parked = {
                 let _message = crate::ipc_message::SavedMessageBuffer::capture();
-                match settle_suspended_connect_pumps() {
+                match settle_queued_callbacks() {
+                    ConnectPumpSettlement::Settled => {}
+                    ConnectPumpSettlement::AwaitingLocalChild => {
+                        awaiting_connect_child = true;
+                    }
+                    ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        break 'service_loop;
+                    }
+                }
+                match if awaiting_connect_child {
+                    ConnectPumpSettlement::AwaitingLocalChild
+                } else {
+                    settle_suspended_connect_pumps()
+                } {
                     ConnectPumpSettlement::Settled => {
                         redrive_flat_root_add_device_selected(&mut nt_handler, reservation);
                         root_add_device_still_parked(&nt_handler, reservation)
@@ -11070,6 +11111,13 @@ pub(crate) unsafe fn service_sec_image(
             if !matches!(settle_suspended_connect_pumps(), ConnectPumpSettlement::Settled) {
                 // A nonretryable restore or a claimed, orphaned, or blocked port parent still
                 // owns its Reply. No later provider may enter while that physical owner is held.
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                break 'service_loop;
+            }
+            // A work-queue callback can outlive its invoking provider frame. Reconcile
+            // its exact Reply before a fresh Hook source may enter native code.
+            if !matches!(settle_queued_callbacks(), ConnectPumpSettlement::Settled) {
                 stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                 stop_ssn = 0;
                 break 'service_loop;
@@ -28059,6 +28107,12 @@ unsafe fn settle_suspended_connect_pumps() -> ConnectPumpSettlement {
     use crate::driver_launch::PortConnectPumpProgress as Progress;
     crate::driver_launch::trace_port_connect_root_probe(80, 0);
     loop {
+        // A CONNECT child can enter a queued callback before its File/Hook source
+        // publishes. That callback's physical Reply must settle first.
+        match settle_queued_callbacks() {
+            ConnectPumpSettlement::Settled => {}
+            other => return other,
+        }
         if let Some(selector) = crate::driver_launch::recorded_suspended_connect_pump() {
             match settle_suspended_file_pumps() {
                 ConnectPumpSettlement::Settled => {}
@@ -28132,6 +28186,112 @@ fn trace_hook_root_boundary(stage: u64) {
 }
 
 unsafe fn settle_suspended_file_pumps() -> ConnectPumpSettlement {
+    // A queued callback may be the child of a File pump. Its receipt must settle before
+    // the older File parent resumes. Recheck the newest exact queue row after every File
+    // transition because that transition can itself create another callback.
+    for _ in 0..512 {
+        match settle_queued_callback_turn() {
+            FilePumpTurn::Progressed => continue,
+            FilePumpTurn::AwaitingLocalChild =>
+                return ConnectPumpSettlement::AwaitingLocalChild,
+            FilePumpTurn::Retained => return ConnectPumpSettlement::Retained,
+            FilePumpTurn::Blocked => return ConnectPumpSettlement::Blocked,
+            FilePumpTurn::Settled => {}
+        }
+        match settle_one_generic_file_pump_after(0) {
+            FilePumpTurn::Progressed => continue,
+            FilePumpTurn::AwaitingLocalChild =>
+                return ConnectPumpSettlement::AwaitingLocalChild,
+            FilePumpTurn::Retained => return ConnectPumpSettlement::Retained,
+            FilePumpTurn::Blocked => return ConnectPumpSettlement::Blocked,
+            FilePumpTurn::Settled => return if crate::driver_launch::hook_source_unsettled() {
+                ConnectPumpSettlement::Retained
+            } else {
+                ConnectPumpSettlement::Settled
+            },
+        }
+    }
+    // Every owner and one-use receipt remains in its durable row; no provider is replayed
+    // after this per-turn progress bound.
+    ConnectPumpSettlement::Retained
+}
+
+enum FilePumpTurn {
+    Progressed,
+    Settled,
+    AwaitingLocalChild,
+    Retained,
+    Blocked,
+}
+
+/// Settle only one queued callback transition. Its File floor is captured before native
+/// callback entry, so an older File parent stays parked until this callback completes.
+unsafe fn settle_queued_callback_turn() -> FilePumpTurn {
+    use crate::driver_launch::{QueuedCallbackProgress as Progress,
+        QueuedCallbackRootAction as Action};
+    let Some(action) = crate::driver_launch::queued_callback_root_action() else {
+        return if crate::driver_launch::unsettled_queued_callback() {
+            FilePumpTurn::Retained
+        } else {
+            FilePumpTurn::Settled
+        };
+    };
+    let selector = match action {
+        Action::NeedsChild(selector) => {
+            let step = drive_one_nested_file_child_step();
+            return match crate::driver_launch::record_queued_callback_child_step(selector, step) {
+                Progress::RecordedStep => FilePumpTurn::Progressed,
+                Progress::AwaitingLocalChild => FilePumpTurn::AwaitingLocalChild,
+                Progress::Blocked => FilePumpTurn::Blocked,
+                _ => FilePumpTurn::Retained,
+            };
+        }
+        Action::ResumeRecordedStep(selector) | Action::RetryRestore(selector)
+        | Action::RetryTerminalAck(selector) => selector,
+    };
+    let Some(floor) = crate::driver_launch::queued_callback_file_floor(selector) else {
+        return FilePumpTurn::Retained;
+    };
+    match settle_one_generic_file_pump_after(floor) {
+        FilePumpTurn::Progressed => return FilePumpTurn::Progressed,
+        FilePumpTurn::Settled => {}
+        other => return other,
+    }
+    // The File transition may have created a newer callback. Only the same exact row may
+    // resume; a different selected row must first settle in physical LIFO order.
+    if crate::driver_launch::queued_callback_root_action() != Some(action) {
+        return FilePumpTurn::Progressed;
+    }
+    match crate::driver_launch::resume_queued_callback_after_file_settlement(selector) {
+        Progress::Completed | Progress::TerminalFailure(_) | Progress::NeedsChild =>
+            FilePumpTurn::Progressed,
+        Progress::RecordedStep | Progress::InnerFilePending => FilePumpTurn::Retained,
+        Progress::AwaitingLocalChild => FilePumpTurn::AwaitingLocalChild,
+        Progress::PendingRestore | Progress::PendingTerminalAck => FilePumpTurn::Retained,
+        Progress::Blocked => FilePumpTurn::Blocked,
+    }
+}
+
+/// A queue-only pass is used before ordinary CONNECT/Hook redrives. It does not inspect an
+/// unrelated Hook source that can only finish after its own parent has resumed.
+unsafe fn settle_queued_callbacks() -> ConnectPumpSettlement {
+    for _ in 0..512 {
+        match settle_queued_callback_turn() {
+            FilePumpTurn::Progressed => continue,
+            FilePumpTurn::Settled => return ConnectPumpSettlement::Settled,
+            FilePumpTurn::AwaitingLocalChild =>
+                return ConnectPumpSettlement::AwaitingLocalChild,
+            FilePumpTurn::Retained => return ConnectPumpSettlement::Retained,
+            FilePumpTurn::Blocked => return ConnectPumpSettlement::Blocked,
+        }
+    }
+    ConnectPumpSettlement::Retained
+}
+
+/// Advance one generic File owner, then return to the queue selector before any other
+/// File parent can resume. A selected child receipt is deposited before this function
+/// returns, including when the child creates another queued callback.
+unsafe fn settle_one_generic_file_pump_after(floor: u64) -> FilePumpTurn {
     use crate::driver_launch::GenericFilePumpDrive as Progress;
     {
         static COUNT: core::sync::atomic::AtomicU64 =
@@ -28148,40 +28308,39 @@ unsafe fn settle_suspended_file_pumps() -> ConnectPumpSettlement {
             print_u64(u64::from(source)); print_str(b"\n");
         }
     }
-    loop {
-        if crate::driver_launch::returned_hook_pump_ready() {
-            if !crate::driver_launch::redrive_returned_hook_pump() {
-                return ConnectPumpSettlement::Retained;
-            }
-            continue;
-        }
-        let progress = if let Some(selector) =
-            crate::driver_launch::claim_suspended_generic_file_pump()
-        {
-            let step = drive_one_nested_file_child_step();
-            let ran_child = step.ran_child();
-            match crate::driver_launch::redrive_suspended_generic_file_pump(selector, step) {
-                Progress::Yielded if !ran_child =>
-                    return ConnectPumpSettlement::AwaitingLocalChild,
-                other => other,
-            }
+    // A queued callback's floor excludes its older File/Hook parent. Source rows keep
+    // their exact File owner ID even after the File row retires.
+    if crate::driver_launch::returned_hook_pump_ready_after(floor) {
+        return if crate::driver_launch::redrive_returned_hook_pump_after(floor) {
+            FilePumpTurn::Progressed
         } else {
-            crate::driver_launch::redrive_retryable_generic_file_pump()
+            FilePumpTurn::Retained
         };
-        match progress {
-            Progress::NoWork => break,
-            Progress::Returned | Progress::Pending | Progress::Yielded => continue,
-            Progress::AwaitingLocalChild => return ConnectPumpSettlement::AwaitingLocalChild,
-            Progress::Retained => return ConnectPumpSettlement::Retained,
-            Progress::Blocked => return ConnectPumpSettlement::Blocked,
-        }
     }
-    if crate::driver_launch::generic_file_pump_unsettled()
-        || crate::driver_launch::hook_source_unsettled()
+    let (progress, deposited) = if let Some(selector) =
+        crate::driver_launch::claim_suspended_generic_file_pump_after(floor)
     {
-        ConnectPumpSettlement::Retained
+        let step = drive_one_nested_file_child_step();
+        (crate::driver_launch::record_suspended_generic_file_pump_child_step(selector, step), true)
+    } else if let Some(selector) =
+        crate::driver_launch::recorded_suspended_generic_file_pump_after(floor)
+    {
+        (crate::driver_launch::redrive_recorded_generic_file_pump(selector), false)
     } else {
-        ConnectPumpSettlement::Settled
+        (crate::driver_launch::redrive_retryable_generic_file_pump_after(floor), false)
+    };
+    match progress {
+        Progress::NoWork if crate::driver_launch::generic_file_pump_unsettled_after(floor)
+            || crate::driver_launch::hook_source_unsettled_after(floor) =>
+            FilePumpTurn::Retained,
+        Progress::NoWork => FilePumpTurn::Settled,
+        Progress::Returned | Progress::Pending | Progress::Yielded => FilePumpTurn::Progressed,
+        // A successful deposit returns Retained while the sealed receipt is held by the
+        // row. It is progress, not a restore refusal.
+        Progress::Retained if deposited => FilePumpTurn::Progressed,
+        Progress::Retained => FilePumpTurn::Retained,
+        Progress::AwaitingLocalChild => FilePumpTurn::AwaitingLocalChild,
+        Progress::Blocked => FilePumpTurn::Blocked,
     }
 }
 

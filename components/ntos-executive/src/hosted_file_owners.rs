@@ -114,6 +114,8 @@ struct Row {
     port_connect_control_storage: Option<usize>,
     hook_pump: Option<HookPumpIdentity>,
     hook_pump_claimed: bool,
+    /// The one-use child observation is in the native continuation, even across restore retry.
+    recorded_generic_child_ran: Option<bool>,
     flight: Flight,
     payload: Option<Payload>,
     blocked_status: Option<nt_status::NtStatus>,
@@ -502,6 +504,7 @@ fn reserve(
         port_connect_control_storage: None,
         hook_pump: None,
         hook_pump_claimed: false,
+        recorded_generic_child_ran: None,
         flight: Flight::Preparing,
         payload: None,
         blocked_status: None,
@@ -774,6 +777,7 @@ pub(super) fn suspend_dispatch_for_pump(
     }
     owner.flight = Flight::PumpSuspended;
     if owner.hook_pump.is_some() { owner.hook_pump_claimed = false; }
+    owner.recorded_generic_child_ran = None;
     crate::driver_launch::trace_port_connect_root_probe(70, irp_id.raw());
     Ok(())
 }
@@ -981,6 +985,14 @@ fn generic_orphans() -> &'static mut Vec<OrphanedGenericFilePump> {
     unsafe { &mut *core::ptr::addr_of_mut!(ORPHANED_GENERIC_FILE_PUMPS) }
 }
 
+fn generic_orphan_after(floor: u64) -> bool {
+    generic_orphans().iter().any(|orphan| match orphan {
+        OrphanedGenericFilePump::Step(selector, _)
+        | OrphanedGenericFilePump::Yield(selector, _, _)
+        | OrphanedGenericFilePump::Return(selector, _) => selector.row_id > floor,
+    })
+}
+
 /// Root-only census of the newest Hook File row considered for a child step.
 /// Flight: 1 preparing, 2 queued, 3 dispatch, 4 suspended, 5 returned,
 /// 6 copy, 7 cancel, 8 acknowledge, 9 idle, 10 blocked.
@@ -1032,21 +1044,35 @@ fn trace_generic_file_no_candidate() {
     }
 }
 
-pub(super) fn generic_file_pump_unsettled() -> bool {
-    !generic_orphans().is_empty() || rows().iter().any(|owner| {
-        owner.hook_pump.is_some()
+pub(super) fn generic_file_owner_high_water() -> u64 {
+    unsafe { NEXT_ID.saturating_sub(1) }
+}
+
+pub(super) fn generic_file_pump_unsettled_after(floor: u64) -> bool {
+    generic_orphan_after(floor) || rows().iter().any(|owner| {
+        owner.id > floor && owner.hook_pump.is_some()
             && matches!(owner.flight,
                 Flight::PumpSuspended | Flight::PumpReturned | Flight::Blocked)
     })
 }
 
+pub(super) fn generic_file_pump_unsettled() -> bool {
+    generic_file_pump_unsettled_after(0)
+}
+
 /// Claim the most recently created ready File child. A claimed parent cannot run a second
 /// child; the sealed receipt is kept until any inner File child has settled.
 pub(super) fn claim_suspended_generic_file_pump() -> Option<GenericFilePumpSelector> {
-    let orphaned = !generic_orphans().is_empty();
+    claim_suspended_generic_file_pump_after(0)
+}
+
+pub(super) fn claim_suspended_generic_file_pump_after(
+    floor: u64,
+) -> Option<GenericFilePumpSelector> {
+    let orphaned = generic_orphan_after(floor);
     let reserved = !orphaned && generic_orphans().try_reserve(1).is_ok();
     let index = rows().iter().enumerate()
-        .filter(|(_, owner)| owner.hook_pump.is_some()
+        .filter(|(_, owner)| owner.id > floor && owner.hook_pump.is_some()
             && matches!(owner.flight,
                 Flight::PumpSuspended | Flight::PumpReturned | Flight::Blocked))
         .max_by_key(|(_, owner)| owner.id).map(|(index, _)| index);
@@ -1101,6 +1127,8 @@ unsafe fn resume_generic_file_pump(
     selector: GenericFilePumpSelector,
 ) -> GenericFilePumpDrive {
     if !exact_generic_pump(selector) { return GenericFilePumpDrive::Blocked; }
+    let recorded_child_ran = rows().iter().find(|owner| owner.id == selector.row_id)
+        .and_then(|owner| owner.recorded_generic_child_ran);
     let (invocation, continuation) = match resume_dispatch_from_pump(selector.irp_id, selector.key) {
         Ok(owners) => owners,
         Err(status) => {
@@ -1108,6 +1136,9 @@ unsafe fn resume_generic_file_pump(
             return GenericFilePumpDrive::Blocked;
         }
     };
+    if let Some(owner) = rows().iter_mut().find(|owner| owner.id == selector.row_id) {
+        owner.recorded_generic_child_ran = None;
+    }
     let mut owners = Some((invocation, continuation));
     let progress = hosted_input_hook_live::with_suspended_hook_alias(
         selector.irp_id,
@@ -1159,7 +1190,10 @@ unsafe fn resume_generic_file_pump(
     match suspend_dispatch_for_pump(selector.irp_id, invocation, next_key, continuation, None) {
         Ok(()) if child_ready => GenericFilePumpDrive::Yielded,
         Ok(()) if retryable => {
-            if let Some(id) = find(selector.irp_id) { row(id).hook_pump_claimed = true; }
+            if let Some(id) = find(selector.irp_id) {
+                row(id).hook_pump_claimed = true;
+                row(id).recorded_generic_child_ran = recorded_child_ran;
+            }
             GenericFilePumpDrive::Retained
         }
         Ok(()) => {
@@ -1177,21 +1211,56 @@ unsafe fn resume_generic_file_pump(
     }
 }
 
-pub(super) unsafe fn redrive_suspended_generic_file_pump(
+/// Seal one selected child observation in its exact File continuation before running any
+/// dependency that child created. A refused deposit stays in the orphan row and cannot be
+/// silently rerun or interpreted as a provider completion.
+pub(super) fn record_suspended_generic_file_pump_child_step(
     selector: GenericFilePumpSelector,
     step: crate::service_sec_image::NestedChildStep,
 ) -> GenericFilePumpDrive {
     let ran_child = step.ran_child();
     generic_orphans().push(OrphanedGenericFilePump::Step(selector, step));
     if !exact_generic_pump(selector) { return GenericFilePumpDrive::Blocked; }
-    let Some(OrphanedGenericFilePump::Step(_, step)) = generic_orphans().pop() else {
+    let Some(index) = generic_orphans().iter().rposition(|orphan|
+        matches!(orphan, OrphanedGenericFilePump::Step(key, _) if *key == selector)) else {
         return GenericFilePumpDrive::Blocked;
     };
+    let OrphanedGenericFilePump::Step(_, step) = generic_orphans().remove(index) else {
+        unreachable!("selected exact generic File child observation changed kind");
+    };
+    let Some(owner) = rows().iter_mut().find(|owner| owner.id == selector.row_id) else {
+        generic_orphans().push(OrphanedGenericFilePump::Step(selector, step));
+        return GenericFilePumpDrive::Blocked;
+    };
+    owner.recorded_generic_child_ran = Some(ran_child);
     if let Err(step) = record_suspended_pump_child_step(selector.irp_id, selector.key, step) {
+        if let Some(owner) = rows().iter_mut().find(|owner| owner.id == selector.row_id) {
+            owner.recorded_generic_child_ran = None;
+        }
         generic_orphans().push(OrphanedGenericFilePump::Step(selector, step));
         return GenericFilePumpDrive::Blocked;
     }
-    if rows().iter().any(|owner| owner.id > selector.row_id
+    GenericFilePumpDrive::Retained
+}
+
+/// Resume only the already-recorded File child. The root must first settle any queued callback
+/// or newer File pump created by that child; no second child selection occurs here.
+pub(super) unsafe fn redrive_recorded_generic_file_pump(
+    selector: GenericFilePumpSelector,
+) -> GenericFilePumpDrive {
+    if !exact_generic_pump(selector) { return GenericFilePumpDrive::Blocked; }
+    let Some(ran_child) = rows().iter().find(|owner| owner.id == selector.row_id)
+        .and_then(|owner| owner.recorded_generic_child_ran) else {
+        return GenericFilePumpDrive::Blocked;
+    };
+    let recorded = rows().iter().find(|owner| owner.id == selector.row_id)
+        .and_then(|owner| owner.payload.as_ref())
+        .is_some_and(|payload| matches!(payload, Payload::PumpSuspended(pump)
+            if pump.invocation.key() == selector.key
+                && pump.continuation.retry_without_new_child()));
+    if !recorded { return GenericFilePumpDrive::Blocked; }
+    if generic_orphan_after(selector.row_id)
+        || rows().iter().any(|owner| owner.id > selector.row_id
         && owner.hook_pump.is_some()
         && matches!(owner.flight,
             Flight::PumpSuspended | Flight::PumpReturned | Flight::Blocked))
@@ -1205,11 +1274,56 @@ pub(super) unsafe fn redrive_suspended_generic_file_pump(
     }
 }
 
+pub(super) unsafe fn redrive_suspended_generic_file_pump(
+    selector: GenericFilePumpSelector,
+    step: crate::service_sec_image::NestedChildStep,
+) -> GenericFilePumpDrive {
+    match record_suspended_generic_file_pump_child_step(selector, step) {
+        GenericFilePumpDrive::Retained =>
+            redrive_recorded_generic_file_pump(selector),
+        other => other,
+    }
+}
+
+/// Select an already-sealed File receipt above a parked queue callback's owner floor.
+/// The saved ran-child bit stays in the row across a no-effects physical restore retry.
+pub(super) fn recorded_suspended_generic_file_pump_after(
+    floor: u64,
+) -> Option<GenericFilePumpSelector> {
+    rows().iter().filter_map(|owner| {
+        let identity = owner.hook_pump?;
+        if owner.id <= floor || owner.flight != Flight::PumpSuspended
+            || !owner.hook_pump_claimed || owner.recorded_generic_child_ran.is_none()
+            || !owner.authorities.iter().all(|authority| authority.live())
+            || generic_orphan_after(owner.id)
+            || rows().iter().any(|inner| inner.id > owner.id
+                && inner.hook_pump.is_some()
+                && matches!(inner.flight,
+                    Flight::PumpSuspended | Flight::PumpReturned | Flight::Blocked))
+            || !matches!(owner.payload.as_ref(), Some(Payload::PumpSuspended(pump))
+                if pump.invocation.key() == identity.current_key
+                    && pump.continuation.retry_without_new_child())
+        { return None; }
+        Some(GenericFilePumpSelector {
+            row_id: owner.id, irp_id: owner.irp_id?, key: identity.current_key,
+            hook_owner_id: identity.owner_id, device: identity.device,
+        })
+    }).max_by_key(|selector| selector.row_id)
+}
+
 /// Retry only a sealed child receipt or a certified no-effect restore refusal.
 pub(super) unsafe fn redrive_retryable_generic_file_pump() -> GenericFilePumpDrive {
+    redrive_retryable_generic_file_pump_after(0)
+}
+
+pub(super) unsafe fn redrive_retryable_generic_file_pump_after(
+    floor: u64,
+) -> GenericFilePumpDrive {
     let selected = rows().iter().rev().find_map(|owner| {
         let identity = owner.hook_pump?;
-        if owner.flight != Flight::PumpSuspended || !owner.hook_pump_claimed
+        if owner.id <= floor || owner.flight != Flight::PumpSuspended
+            || !owner.hook_pump_claimed
+            || generic_orphan_after(owner.id)
             || rows().iter().any(|inner| inner.id > owner.id
                 && inner.hook_pump.is_some()
                 && matches!(inner.flight,
@@ -1222,7 +1336,15 @@ pub(super) unsafe fn redrive_retryable_generic_file_pump() -> GenericFilePumpDri
             hook_owner_id: identity.owner_id, device: identity.device,
         })
     });
-    selected.map_or(GenericFilePumpDrive::NoWork, |selector| resume_generic_file_pump(selector))
+    selected.map_or(GenericFilePumpDrive::NoWork, |selector| {
+        if rows().iter().any(|owner| owner.id == selector.row_id
+            && owner.recorded_generic_child_ran.is_some())
+        {
+            redrive_recorded_generic_file_pump(selector)
+        } else {
+            resume_generic_file_pump(selector)
+        }
+    })
 }
 
 pub(super) enum DispatchResult {
@@ -1299,6 +1421,21 @@ pub(super) fn hook_pump_state(
         Flight::Blocked => HookPumpState::Blocked,
         _ => HookPumpState::Pending,
     })
+}
+
+/// Retain the monotonic File owner boundary on the exact Hook source before its
+/// terminal can retire the File row. Numeric IRP identity alone is insufficient.
+pub(super) fn hook_pump_owner_row_id(
+    irp_id: IrpId,
+    key: ExternalFileIrpPumpKey,
+    hook_owner_id: u64,
+    device: nt_io_manager::DeviceId,
+) -> Result<u64, nt_status::NtStatus> {
+    let id = find(irp_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if !exact_hook_owner(id, hook_owner_id, device, key) {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    Ok(id)
 }
 
 fn exact_hook_owner(

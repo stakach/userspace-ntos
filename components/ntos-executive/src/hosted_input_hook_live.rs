@@ -58,6 +58,7 @@ struct PortSource {
     entered: bool,
     pending: Option<IrpId>,
     pump_key: Option<ExternalFileIrpPumpKey>,
+    file_owner_row_id: Option<u64>,
     pump_return_consumed: bool,
     class_alias: Option<ActiveClassDispatch>,
     unowned_yield: Option<hosted_file_owners::HookDispatchFailure>,
@@ -88,6 +89,7 @@ struct ClassSource {
     entered: bool,
     pending: Option<IrpId>,
     pump_key: Option<ExternalFileIrpPumpKey>,
+    file_owner_row_id: Option<u64>,
     pump_return_consumed: bool,
     unowned_yield: Option<hosted_file_owners::HookDispatchFailure>,
     returned_terminal: Option<PortTerminalCandidate>,
@@ -454,7 +456,8 @@ unsafe fn dispatch_class_lower(
         owner_id, port_device, control_code,
         input_length, input,
         input_pointer, origin, caller, entered: false, pending: None,
-        pump_key: None, pump_return_consumed: false, unowned_yield: None,
+        pump_key: None, file_owner_row_id: None,
+        pump_return_consumed: false, unowned_yield: None,
         returned_terminal: None,
         terminal_status: None, published: false,
         canonical_acknowledged: false, pin_released: false, source_released: false,
@@ -497,7 +500,8 @@ unsafe fn dispatch_port_source(
     };
     port_sources().push(Box::new(PortSource {
         source, instance: inst, irp, device, owner_id, input_length, origin, caller, entered: false,
-        pending: None, pump_key: None, pump_return_consumed: false,
+        pending: None, pump_key: None, file_owner_row_id: None,
+        pump_return_consumed: false,
         class_alias: None, unowned_yield: None,
         terminal_candidate: None, terminal_observed: None,
         terminal_status: None, published: false,
@@ -606,6 +610,9 @@ unsafe fn advance_class_source(work: &mut ClassSource) {
             Ok(hosted_file_owners::HookDispatchResult::PumpSuspended { irp_id, key }) => {
                 work.pending = Some(irp_id);
                 work.pump_key = Some(key);
+                work.file_owner_row_id = hosted_file_owners::hook_pump_owner_row_id(
+                    irp_id, key, work.owner_id, work.port_device.device_id(),
+                ).ok();
             }
             Err(hosted_file_owners::HookDispatchFailure::Status(status)) => {
                 // Dispatch errors are pre-entry. Complete the parked lower-edge source with
@@ -865,6 +872,10 @@ unsafe fn advance_port_source(work: &mut PortSource) {
                 if !recorded { return; }
                 work.pending = Some(irp_id);
                 work.pump_key = Some(key);
+                work.file_owner_row_id = hosted_file_owners::hook_pump_owner_row_id(
+                    irp_id, key, work.owner_id,
+                    work.source.class_target_registration().device_id(),
+                ).ok();
             }
             Err(hosted_file_owners::HookDispatchFailure::Status(status)) => {
                 trace_port_dispatch(43, work, 4, 0, false,
@@ -1024,7 +1035,8 @@ pub(super) unsafe fn redrive() {
             trace_hook_redrive(4, index as u64, (*ptr).owner_id, (*ptr).entered,
                 (*ptr).published, (*ptr).pump_key.is_some(), (*ptr).unowned_yield.is_some());
         }
-        if (*ptr).entered && !(*ptr).published {
+        if (*ptr).entered && !(*ptr).published
+        {
             // State: 0 no pending/key pair, 1 suspended, 2 returned,
             // 3 provider pending, 4 blocked, 5 exact owner/key refusal.
             let state = match ((*ptr).pending, (*ptr).pump_key) {
@@ -1096,37 +1108,60 @@ fn returned_hook_state(
 /// Only a returned or lost exact Hook terminal fences the outer CONNECT here. A real
 /// provider Pending is handled by the ordinary completion path after the pump has returned.
 pub(super) fn returned_hook_pump_ready() -> bool {
-    class_sources().iter().any(|row| row.unowned_yield.is_some()
-        || row.pump_return_consumed && !row.published
-        || matches!(returned_hook_state(row.pending, row.pump_key, row.owner_id,
-            row.port_device.device_id()),
-            Some(hosted_file_owners::HookPumpState::Returned
-                | hosted_file_owners::HookPumpState::Blocked)))
-    || port_sources().iter().any(|row| row.unowned_yield.is_some()
-        || row.pump_return_consumed && !row.published
-        || matches!(returned_hook_state(row.pending, row.pump_key, row.owner_id,
-            row.source.class_target_registration().device_id()),
-            Some(hosted_file_owners::HookPumpState::Returned
-                | hosted_file_owners::HookPumpState::Blocked)))
+    returned_hook_pump_ready_after(0)
+}
+
+/// A nested queue may publish only Hook sources created after its File-owner
+/// boundary. The retained row ID remains available after the File row retires.
+pub(super) fn returned_hook_pump_ready_after(floor: u64) -> bool {
+    class_sources().iter().any(|row| source_after_floor(row.file_owner_row_id, floor)
+        && (row.unowned_yield.is_some()
+            || row.pump_return_consumed && !row.published
+            || matches!(returned_hook_state(row.pending, row.pump_key, row.owner_id,
+                row.port_device.device_id()),
+                Some(hosted_file_owners::HookPumpState::Returned
+                    | hosted_file_owners::HookPumpState::Blocked))))
+    || port_sources().iter().any(|row| source_after_floor(row.file_owner_row_id, floor)
+        && (row.unowned_yield.is_some()
+            || row.pump_return_consumed && !row.published
+            || matches!(returned_hook_state(row.pending, row.pump_key, row.owner_id,
+                row.source.class_target_registration().device_id()),
+                Some(hosted_file_owners::HookPumpState::Returned
+                    | hosted_file_owners::HookPumpState::Blocked))))
+}
+
+fn source_after_floor(file_owner_row_id: Option<u64>, floor: u64) -> bool {
+    floor == 0 || file_owner_row_id.is_some_and(|id| id > floor)
 }
 
 /// A consumed File terminal is still owned until the original Hook source Reply is published.
 /// A provider Pending has not consumed its pump return and remains on the ordinary path.
 pub(super) fn hook_source_unsettled() -> bool {
-    class_sources().iter().any(|row| row.pump_return_consumed && !row.published)
-        || port_sources().iter().any(|row| row.pump_return_consumed && !row.published)
+    hook_source_unsettled_after(0)
+}
+
+pub(super) fn hook_source_unsettled_after(floor: u64) -> bool {
+    class_sources().iter().any(|row| source_after_floor(row.file_owner_row_id, floor)
+        && row.pump_return_consumed && !row.published)
+        || port_sources().iter().any(|row| source_after_floor(row.file_owner_row_id, floor)
+            && row.pump_return_consumed && !row.published)
 }
 
 /// Advance only entered Hook work whose real File terminal is held for observation. Never
 /// dispatch a fresh Hook from this flat-root settlement phase.
 pub(super) unsafe fn redrive_returned_hook_pump() -> bool {
+    redrive_returned_hook_pump_after(0)
+}
+
+pub(super) unsafe fn redrive_returned_hook_pump_after(floor: u64) -> bool {
     let mut progressed = false;
     let class_count = class_sources().len();
     for index in 0..class_count {
         let ptr = class_sources()[index].as_mut() as *mut ClassSource;
-        if (*ptr).pump_return_consumed && !(*ptr).published
-            || returned_hook_state((*ptr).pending, (*ptr).pump_key, (*ptr).owner_id,
-                (*ptr).port_device.device_id()) == Some(hosted_file_owners::HookPumpState::Returned)
+        if source_after_floor((*ptr).file_owner_row_id, floor)
+            && ((*ptr).pump_return_consumed && !(*ptr).published
+                || returned_hook_state((*ptr).pending, (*ptr).pump_key, (*ptr).owner_id,
+                    (*ptr).port_device.device_id()) == Some(hosted_file_owners::HookPumpState::Returned))
         {
             let before = ((*ptr).pump_key, (*ptr).pump_return_consumed,
                 (*ptr).returned_terminal.is_some(), (*ptr).terminal_status,
@@ -1146,10 +1181,11 @@ pub(super) unsafe fn redrive_returned_hook_pump() -> bool {
                 (*ptr).pending.map_or(0, |id| id.raw()), (*ptr).pump_key.is_some(),
                 u64::from((*ptr).pump_return_consumed), u64::from((*ptr).published));
         }
-        if (*ptr).pump_return_consumed && !(*ptr).published
-            || returned_hook_state((*ptr).pending, (*ptr).pump_key, (*ptr).owner_id,
-                (*ptr).source.class_target_registration().device_id())
-                == Some(hosted_file_owners::HookPumpState::Returned)
+        if source_after_floor((*ptr).file_owner_row_id, floor)
+            && ((*ptr).pump_return_consumed && !(*ptr).published
+                || returned_hook_state((*ptr).pending, (*ptr).pump_key, (*ptr).owner_id,
+                    (*ptr).source.class_target_registration().device_id())
+                    == Some(hosted_file_owners::HookPumpState::Returned))
         {
             let before = ((*ptr).pump_key, (*ptr).pump_return_consumed,
                 (*ptr).terminal_candidate.is_some(), (*ptr).terminal_observed,
