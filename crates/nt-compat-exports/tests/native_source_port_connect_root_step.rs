@@ -51,7 +51,7 @@ fn unresolved_connect_parent_fences_later_provider_work() {
 
 #[test]
 fn repeated_yield_without_a_child_cannot_spin_the_root_loop() {
-    let maintenance = SERVICE.split_once("unsafe fn settle_suspended_connect_pumps()")
+    let maintenance = SERVICE.split_once("unsafe fn settle_suspended_connect_pumps_inner()")
         .expect("shared flat-root CONNECT settlement").1;
     let maintenance = maintenance.split_once("unsafe fn pending_driver_start_redrive_all")
         .expect("CONNECT settlement function boundary").0;
