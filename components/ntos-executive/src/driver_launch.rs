@@ -67721,6 +67721,14 @@ pub(crate) fn hosted_connect_pending_reply_published() -> bool {
     hosted_connect_live::pending_reply_published()
 }
 
+pub(crate) fn trace_connect_child_receive_yield(
+    reply: u64, reason: u64, timer_checkpoint: bool, serviced: bool, badge: u64, info: u64,
+) {
+    component_scheduler::trace_connect_child_receive_yield(
+        reply, reason, timer_checkpoint, serviced, badge, info,
+    );
+}
+
 pub(crate) fn hosted_connect_root_probe_phase() -> u64 {
     hosted_connect_live::root_probe_phase()
 }

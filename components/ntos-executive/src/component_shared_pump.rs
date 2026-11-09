@@ -1081,6 +1081,9 @@ pub(super) unsafe fn receive(
             && (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
             && crate::dispatcher_bootstrap::timer_work_pending();
         if timer_checkpoint && timer_probe_consumed {
+            crate::driver_launch::trace_connect_child_receive_yield(
+                ch.reply_cap, 1, timer_checkpoint, serviced_scheduler_yield, 0, 0,
+            );
             if crate::driver_launch::file_rpc_pump_for_diagnostic(ch) {
                 FILE_RECEIVE_SCHEDULER_YIELD.fetch_add(1, Ordering::Relaxed);
             }
@@ -1163,6 +1166,10 @@ pub(super) unsafe fn receive(
                 // The shared ingress has already proven NoCall with a free Reply. An empty
                 // nonblocking probe has no sender and must not count as watchdog progress.
                 if timer_checkpoint && message.badge() == 0 && message.info() == 0 {
+                    crate::driver_launch::trace_connect_child_receive_yield(
+                        ch.reply_cap, 2, timer_checkpoint, serviced_scheduler_yield,
+                        message.badge(), message.info(),
+                    );
                     if file_receive {
                         FILE_RECEIVE_SCHEDULER_YIELD.fetch_add(1, Ordering::Relaxed);
                     }
@@ -1195,6 +1202,10 @@ pub(super) unsafe fn receive(
                     irq_checkpoint = true;
                 }
                 if !inline_irq_checkpoint && pump_scheduler_work_pending(ch, irq) {
+                    crate::driver_launch::trace_connect_child_receive_yield(
+                        ch.reply_cap, 3, timer_checkpoint, serviced_scheduler_yield,
+                        message.badge(), message.info(),
+                    );
                     if file_receive {
                         FILE_RECEIVE_SCHEDULER_YIELD.fetch_add(1, Ordering::Relaxed);
                     }

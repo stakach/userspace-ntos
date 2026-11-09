@@ -684,6 +684,9 @@ fn trace_connect_child_restore(reason: u64, pending: &PendingChildWorkRestore) {
 }
 
 fn trace_connect_child_result(stage: u64, result: &crate::spawn_hosts::PumpResult) {
+    if stage == 0 && result.scheduler_yielded {
+        CONNECT_CHILD_YIELD_PROBE_REPLY.store(result.reply_cap, Ordering::Release);
+    }
     static COUNT: AtomicU64 = AtomicU64::new(0);
     if !crate::driver_launch::hosted_connect_pending_reply_published()
         || COUNT.fetch_add(1, Ordering::Relaxed) >= 48 { return; }
@@ -698,6 +701,24 @@ fn trace_connect_child_result(stage: u64, result: &crate::spawn_hosts::PumpResul
         | (u64::from(result.nested_restore_quarantined.is_some()) << 5);
     print_u64(flags); print_str(b"/");
     print_u64(result.wall_label); print_str(b"\n");
+}
+
+static CONNECT_CHILD_YIELD_PROBE_REPLY: AtomicU64 = AtomicU64::new(0);
+
+/// Only copied scalar state is read inside the isolated receive. The retained Reply selects
+/// the exact child whose repeated scheduler yields were observed after Hook completion.
+pub(crate) fn trace_connect_child_receive_yield(
+    reply: u64, reason: u64, timer_checkpoint: bool, serviced: bool, badge: u64, info: u64,
+) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if reply == 0 || CONNECT_CHILD_YIELD_PROBE_REPLY.load(Ordering::Acquire) != reply
+        || COUNT.fetch_add(1, Ordering::Relaxed) >= 32
+    { return; }
+    print_str(b"[connect-child-receive-yield] reply/reason/timer/serviced/badge/info=");
+    print_u64(reply); print_str(b"/"); print_u64(reason); print_str(b"/");
+    print_u64(u64::from(timer_checkpoint)); print_str(b"/");
+    print_u64(u64::from(serviced)); print_str(b"/");
+    print_hex64(badge); print_str(b"/"); print_hex64(info); print_str(b"\n");
 }
 
 unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> HostedPumpRestore {
