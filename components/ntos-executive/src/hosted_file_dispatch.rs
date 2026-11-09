@@ -9,11 +9,89 @@ use nt_io_manager::detached_file_irp::{
     ExternalFileIrpCancelOutcome, ExternalFileIrpCancelReturn, ExternalFileIrpCompletionReturn,
     ExternalFileIrpCopyInvocation, ExternalFileIrpCopyOutcome, ExternalFileIrpCopyReturn,
     ExternalFileIrpInvocation, ExternalFileIrpOutcome, ExternalFileIrpOutputCapture,
+    ExternalFileIrpPumpKey,
     ExternalFileIrpReturn,
 };
 
 /// Root's completion-storage selector copies the retained Type3InputBuffer before ACK.
 pub(super) const FSD_DISPATCH_COPY_MUTABLE_INPUT: u64 = super::FSD_DISPATCH_COPY_MUTABLE_INPUT;
+
+#[must_use = "retain either the manager return or the original invocation and native continuation"]
+pub(super) enum InvokeResult {
+    Returned(ExternalFileIrpReturn),
+    ChildWorkYield {
+        invocation: ExternalFileIrpInvocation,
+        key: ExternalFileIrpPumpKey,
+        continuation: FileDispatchContinuation,
+    },
+    /// A malformed native epoch cannot be used as authority; both owners still survive.
+    UnkeyedChildWorkYield {
+        invocation: ExternalFileIrpInvocation,
+        continuation: FileDispatchContinuation,
+    },
+}
+
+#[must_use = "resume the exact native dispatch before finishing this File invocation"]
+pub(super) struct FileDispatchContinuation {
+    native: FileIrpPumpContinuation,
+    instance_index: usize,
+}
+
+impl FileDispatchContinuation {
+    pub(super) fn epoch(&self) -> u64 { self.native.epoch() }
+
+    pub(super) fn child_work_ready(&self) -> bool { self.native.child_work_ready() }
+
+    pub(super) fn retry_without_new_child(&self) -> bool {
+        self.native.retry_without_new_child()
+    }
+
+    pub(super) fn record_child_step(
+        &mut self,
+        step: crate::service_sec_image::NestedChildStep,
+    ) -> Result<(), crate::service_sec_image::NestedChildStep> {
+        self.native.record_child_step(step)
+    }
+
+    /// The caller has already run or retained one exact outer-loop child step. Reborrow the
+    /// output from the move-only invocation only for the receive half; no stack slice survives.
+    pub(super) unsafe fn resume_after_child(
+        self,
+        mut invocation: ExternalFileIrpInvocation,
+    ) -> Result<InvokeResult, (ExternalFileIrpInvocation, Self)> {
+        let Self { native, instance_index } = self;
+        let progress = {
+            let (_, output) = invocation.buffers_mut().split();
+            native.resume_after_child(output)
+        };
+        match progress {
+            Ok(FileIrpResumeProgress::Completed(result)) => {
+                let projection = invocation.projection().clone();
+                Ok(InvokeResult::Returned(finish_invoke_result(
+                    invocation, projection, instance_index,
+                    ExternalFileIrpOutputCapture::MethodNeitherInput, result, true,
+                )))
+            }
+            Ok(FileIrpResumeProgress::ChildWorkYield(native)) => {
+                let continuation = Self { native, instance_index };
+                match ExternalFileIrpPumpKey::new(&invocation, continuation.epoch()) {
+                    Some(key) => Ok(InvokeResult::ChildWorkYield {
+                        invocation, key, continuation,
+                    }),
+                    None => Ok(InvokeResult::UnkeyedChildWorkYield {
+                        invocation, continuation,
+                    }),
+                }
+            }
+            Err(native) => Err((invocation, Self { native, instance_index })),
+        }
+    }
+}
+
+enum FileExecuteProgress {
+    Returned(HostedIrpTransportResult),
+    ChildWorkYield(FileDispatchContinuation),
+}
 
 pub(super) fn invoke(
     mut invocation: ExternalFileIrpInvocation,
@@ -56,6 +134,17 @@ pub(super) fn invoke(
             execute_with_capture(instance_index, Some(caller), &projection, input, output, capture)
         }
     };
+    finish_invoke_result(invocation, projection, instance_index, capture, result, trace_connect)
+}
+
+fn finish_invoke_result(
+    mut invocation: ExternalFileIrpInvocation,
+    projection: IrpProjection,
+    instance_index: usize,
+    capture: ExternalFileIrpOutputCapture,
+    result: HostedIrpTransportResult,
+    trace_connect: bool,
+) -> ExternalFileIrpReturn {
     if trace_connect {
         trace_port_connect_execute(1, projection.irp_id, projection.device_id);
     }
@@ -136,6 +225,48 @@ pub(super) fn invoke(
         }
     };
     invocation.returned(outcome)
+}
+
+/// A port-local CONNECT may yield while its provider waits for nested root work. The original
+/// invocation is returned intact; only a genuine native return may reach `finish_invoke_result`.
+pub(super) fn invoke_suspend_aware(
+    mut invocation: ExternalFileIrpInvocation,
+    caller: nt_process::native_handle::NativeHandleCaller,
+    capture: ExternalFileIrpOutputCapture,
+) -> InvokeResult {
+    let projection = invocation.projection().clone();
+    let route = invocation.route();
+    let Some((instance_index, _)) = instance_by_driver_id(route.driver_id().raw()) else {
+        return InvokeResult::Returned(invocation.returned(ExternalFileIrpOutcome::NotEntered {
+            status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+        }));
+    };
+    if route.driver_id() != projection.driver_id || route.device_id() != projection.device_id
+        || capture != ExternalFileIrpOutputCapture::MethodNeitherInput
+        || projection.major != major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+    {
+        return InvokeResult::Returned(invocation.returned(ExternalFileIrpOutcome::NotEntered {
+            status: nt_status::NtStatus::INVALID_PARAMETER,
+        }));
+    }
+    trace_port_connect_execute(0, projection.irp_id, projection.device_id);
+    let progress = {
+        let (input, output) = invocation.buffers_mut().split();
+        execute_port_connect_suspend_aware(
+            instance_index, caller, &projection, input, output,
+        )
+    };
+    match progress {
+        FileExecuteProgress::Returned(result) => InvokeResult::Returned(
+            finish_invoke_result(invocation, projection, instance_index, capture, result, true),
+        ),
+        FileExecuteProgress::ChildWorkYield(continuation) => {
+            let Some(key) = ExternalFileIrpPumpKey::new(&invocation, continuation.epoch()) else {
+                return InvokeResult::UnkeyedChildWorkYield { invocation, continuation };
+            };
+            InvokeResult::ChildWorkYield { invocation, key, continuation }
+        }
+    }
 }
 
 fn trace_port_connect_execute(stage: u64, irp: nt_io_manager::IrpId, device: nt_io_manager::DeviceId) {
@@ -439,6 +570,79 @@ pub(super) fn execute(
         ExternalFileIrpOutputCapture::Information)
 }
 
+fn prepare_dispatch_request(
+    instance_index: usize,
+    projection: &IrpProjection,
+    input_len: usize,
+    output_len: usize,
+    capture: ExternalFileIrpOutputCapture,
+) -> Result<(IrpDispatchRequest, usize, DriverInstance, u64), nt_status::NtStatus> {
+    let mut request = hosted_irp_dispatch_request(
+        instance_index, projection, input_len, output_len,
+    )?;
+    if capture == ExternalFileIrpOutputCapture::BufferedDeviceControlCapacity {
+        request._reserved0 = nt_io_abi::IRP_DISPATCH_BUFFERED_OUTPUT_CAPACITY;
+        if !nt_io_abi::valid_buffered_output_capacity_dispatch(&request) {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+    }
+    let Some((route_instance, route_inst, device_object)) =
+        hosted_driver_device_route_by_device_id_for_irp(
+            projection.device_id.raw(), Some(projection.irp_id),
+        ).filter(|(index, _, _)| *index == instance_index)
+    else {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    };
+    Ok((request, route_instance, route_inst, device_object))
+}
+
+fn execute_port_connect_suspend_aware(
+    instance_index: usize,
+    caller: nt_process::native_handle::NativeHandleCaller,
+    projection: &IrpProjection,
+    input: &[u8],
+    output: &mut [u8],
+) -> FileExecuteProgress {
+    let (request, route_instance, _, device_object) = match prepare_dispatch_request(
+        instance_index, projection, input.len(), output.len(),
+        ExternalFileIrpOutputCapture::MethodNeitherInput,
+    ) {
+        Ok(prepared) => prepared,
+        Err(status) => return FileExecuteProgress::Returned(
+            HostedIrpTransportResult::NotDispatched { status },
+        ),
+    };
+    let progress = unsafe {
+        dispatch_irp_for_instance_exact_suspend_aware(
+            route_instance,
+            projection.major as u64,
+            projection.minor as u64,
+            device_object,
+            projection.irp_id.raw(),
+            projection.file_id.map(FileId::raw).unwrap_or(0),
+            projection_fsctl(projection),
+            projection.user_data,
+            projection.requestor_tid,
+            Some(request),
+            input,
+            output,
+            Some(caller),
+        )
+    };
+    match progress {
+        HostedIrpDispatchProgress::Returned(result) => FileExecuteProgress::Returned(
+            result.unwrap_or(HostedIrpTransportResult::NotDispatched {
+                status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+            }),
+        ),
+        HostedIrpDispatchProgress::ChildWorkYield(native) => {
+            FileExecuteProgress::ChildWorkYield(FileDispatchContinuation {
+                native, instance_index,
+            })
+        }
+    }
+}
+
 fn execute_with_capture(
     instance_index: usize,
     caller: Option<nt_process::native_handle::NativeHandleCaller>,
@@ -447,28 +651,13 @@ fn execute_with_capture(
     output: &mut [u8],
     capture: ExternalFileIrpOutputCapture,
 ) -> HostedIrpTransportResult {
-    let mut request =
-        match hosted_irp_dispatch_request(instance_index, projection, input.len(), output.len()) {
-            Ok(request) => request,
+    let (request, route_instance, route_inst, device_object) =
+        match prepare_dispatch_request(
+            instance_index, projection, input.len(), output.len(), capture,
+        ) {
+            Ok(prepared) => prepared,
             Err(status) => return HostedIrpTransportResult::NotDispatched { status },
         };
-    if capture == ExternalFileIrpOutputCapture::BufferedDeviceControlCapacity {
-        request._reserved0 = nt_io_abi::IRP_DISPATCH_BUFFERED_OUTPUT_CAPACITY;
-        if !nt_io_abi::valid_buffered_output_capacity_dispatch(&request) {
-            return HostedIrpTransportResult::NotDispatched {
-                status: nt_status::NtStatus::INVALID_PARAMETER,
-            };
-        }
-    }
-    let Some((route_instance, route_inst, device_object)) =
-        hosted_driver_device_route_by_device_id_for_irp(
-            projection.device_id.raw(), Some(projection.irp_id))
-            .filter(|(index, _, _)| *index == instance_index)
-    else {
-        return HostedIrpTransportResult::NotDispatched {
-            status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-        };
-    };
     let scsi_data = match &projection.parameters {
         IoParameters::Scsi(parameters) if parameters.data_length != 0 => {
             if let Err(status) = unsafe {

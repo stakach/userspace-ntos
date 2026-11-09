@@ -6713,13 +6713,12 @@ unsafe fn prepare_service_receive(
 /// CONNECT and HOOK own their source Replies and provider projections directly. Their nested
 /// redrive does not borrow the File handler used by the other hosted work runners.
 unsafe fn redrive_nested_hosted_input_work() -> bool {
-    let start = crate::driver_launch::nested_hosted_start_fdo_ready()
-        && crate::driver_launch::redrive_nested_hosted_start_fdo();
-    let connect = crate::driver_launch::nested_hosted_connect_forward_ready()
-        && crate::driver_launch::redrive_nested_hosted_connect_forward();
-    let hook = crate::driver_launch::nested_hosted_hook_forward_ready()
-        && crate::driver_launch::redrive_nested_hosted_hook_forward();
-    start || connect || hook
+    if crate::driver_launch::nested_hosted_start_fdo_ready()
+        && crate::driver_launch::redrive_nested_hosted_start_fdo() { return true; }
+    if crate::driver_launch::nested_hosted_connect_forward_ready()
+        && crate::driver_launch::redrive_nested_hosted_connect_forward() { return true; }
+    crate::driver_launch::nested_hosted_hook_forward_ready()
+        && crate::driver_launch::redrive_nested_hosted_hook_forward()
 }
 
 /// Admit a nested pump only when a local runner can advance. Keep this gate beside the
@@ -6751,50 +6750,98 @@ pub(crate) unsafe fn nested_hosted_file_work_ready() -> bool {
         || crate::provider_directory_broker::nested_work_ready()
 }
 
-/// Run locally ready retained work while the exact parent invocation is parked. The File
-/// handler is required only by runners that actually borrow it across their local step.
+/// Evidence for one outer-loop child pass under a retained physical parent. A ready runner
+/// that reports no progress may have made an uncertain native effect, so it cannot authorize
+/// parent restoration. The no-ready case checks only owner readiness and enters no runner.
+enum NestedChildStepOutcome {
+    NoReady,
+    Progressed,
+    Indeterminate,
+}
+
+/// A one-use observation from the outer runner. Only this module can issue it after checking
+/// readiness and, when ready, running one selected child. A copyable boolean is not authority
+/// to resume a physically parked parent.
+#[must_use = "retain until the exact child-work parent is restored or quarantined"]
+pub(crate) struct NestedChildStep {
+    outcome: NestedChildStepOutcome,
+}
+
+pub(crate) enum NestedChildStepDecision {
+    RestoreParent,
+    Quarantine,
+}
+
+impl NestedChildStep {
+    pub(crate) fn ran_child(&self) -> bool {
+        !matches!(self.outcome, NestedChildStepOutcome::NoReady)
+    }
+
+    pub(crate) fn into_decision(self) -> NestedChildStepDecision {
+        match self.outcome {
+            NestedChildStepOutcome::NoReady | NestedChildStepOutcome::Progressed =>
+                NestedChildStepDecision::RestoreParent,
+            NestedChildStepOutcome::Indeterminate => NestedChildStepDecision::Quarantine,
+        }
+    }
+}
+
+pub(crate) unsafe fn drive_one_nested_file_child_step() -> NestedChildStep {
+    if !nested_hosted_file_work_ready() {
+        return NestedChildStep { outcome: NestedChildStepOutcome::NoReady };
+    }
+    if redrive_nested_hosted_file_work() {
+        NestedChildStep { outcome: NestedChildStepOutcome::Progressed }
+    } else {
+        NestedChildStep { outcome: NestedChildStepOutcome::Indeterminate }
+    }
+}
+
+/// Run one locally ready retained child while the exact parent invocation is parked. A caller
+/// can repeat the pass when more work is ready. Each runner checks and claims its retained
+/// request before making a native effect.
 pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {
     let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     if handler.is_null() { return redrive_nested_hosted_input_work(); }
-    // Check each owner just before entering its runner. The runner can reserve a large Work
-    // frame even when it finds no ready row, and this sweep also runs inside nested pumps.
-    let create = crate::driver_launch::nested_hosted_driver_create_ready()
-        && crate::driver_launch::redrive_nested_hosted_driver_create(handler);
-    let query = crate::driver_launch::nested_hosted_query_path_ready()
-        && crate::driver_launch::redrive_nested_hosted_query_path(handler);
-    let internal_control = crate::driver_launch::nested_hosted_internal_control_ready()
-        && crate::driver_launch::redrive_nested_hosted_internal_control(handler);
-    let buffered_control = crate::driver_launch::nested_hosted_buffered_control_ready()
-        && crate::driver_launch::redrive_nested_hosted_buffered_control(handler);
-    let write = crate::driver_launch::nested_hosted_write_ready()
-        && crate::driver_launch::redrive_nested_hosted_write(handler);
-    let read = crate::driver_launch::nested_hosted_read_ready()
-        && crate::driver_launch::redrive_nested_hosted_read(handler);
-    let flush = crate::driver_launch::nested_hosted_flush_ready()
-        && crate::driver_launch::redrive_nested_hosted_flush(handler);
-    let query_information = crate::driver_launch::nested_hosted_query_information_ready()
-        && crate::driver_launch::redrive_nested_hosted_query_information(handler);
-    let lower_pnp = crate::driver_launch::nested_hosted_lower_pnp_ready()
-        && crate::driver_launch::redrive_nested_hosted_lower_pnp(handler);
-    let lower_file = crate::driver_launch::nested_hosted_lower_file_ready()
-        && crate::driver_launch::redrive_nested_hosted_lower_file(handler);
-    let input = redrive_nested_hosted_input_work();
-    let kernel_file_query = crate::driver_launch::nested_hosted_kernel_file_read_query_ready()
-        && crate::driver_launch::redrive_nested_hosted_kernel_file_read_query(handler);
-    let win32k_async_read = crate::driver_launch::nested_hosted_win32k_async_read_ready()
-        && crate::driver_launch::redrive_nested_hosted_win32k_async_read(handler);
-    let lifecycle = crate::driver_launch::nested_hosted_file_lifecycle_work_ready()
-        && crate::driver_launch::redrive_nested_hosted_file_lifecycle_work();
-    let close = crate::hosted_routed_file_close_work::nested_work_ready()
-        && crate::hosted_routed_file_close_work::redrive_nested_ready(handler);
-    let source = crate::driver_launch::nested_win32k_source_work_ready()
-        && crate::driver_launch::redrive_nested_win32k_source_work(handler);
-    let section = crate::provider_section_broker::nested_work_ready()
-        && crate::provider_section_broker::redrive_nested_ready(handler);
-    let directory = crate::provider_directory_broker::nested_work_ready()
-        && crate::provider_directory_broker::redrive_nested_ready(handler);
+    // Check each owner immediately before entry. A runner may reserve a large Work frame even
+    // when its row is not ready, so never enter a later runner after one has progressed.
+    if crate::driver_launch::nested_hosted_driver_create_ready()
+        && crate::driver_launch::redrive_nested_hosted_driver_create(handler) { return true; }
+    if crate::driver_launch::nested_hosted_query_path_ready()
+        && crate::driver_launch::redrive_nested_hosted_query_path(handler) { return true; }
+    if crate::driver_launch::nested_hosted_internal_control_ready()
+        && crate::driver_launch::redrive_nested_hosted_internal_control(handler) { return true; }
+    if crate::driver_launch::nested_hosted_buffered_control_ready()
+        && crate::driver_launch::redrive_nested_hosted_buffered_control(handler) { return true; }
+    if crate::driver_launch::nested_hosted_write_ready()
+        && crate::driver_launch::redrive_nested_hosted_write(handler) { return true; }
+    if crate::driver_launch::nested_hosted_read_ready()
+        && crate::driver_launch::redrive_nested_hosted_read(handler) { return true; }
+    if crate::driver_launch::nested_hosted_flush_ready()
+        && crate::driver_launch::redrive_nested_hosted_flush(handler) { return true; }
+    if crate::driver_launch::nested_hosted_query_information_ready()
+        && crate::driver_launch::redrive_nested_hosted_query_information(handler) { return true; }
+    if crate::driver_launch::nested_hosted_lower_pnp_ready()
+        && crate::driver_launch::redrive_nested_hosted_lower_pnp(handler) { return true; }
+    if crate::driver_launch::nested_hosted_lower_file_ready()
+        && crate::driver_launch::redrive_nested_hosted_lower_file(handler) { return true; }
+    if redrive_nested_hosted_input_work() { return true; }
+    if crate::driver_launch::nested_hosted_kernel_file_read_query_ready()
+        && crate::driver_launch::redrive_nested_hosted_kernel_file_read_query(handler) { return true; }
+    if crate::driver_launch::nested_hosted_win32k_async_read_ready()
+        && crate::driver_launch::redrive_nested_hosted_win32k_async_read(handler) { return true; }
+    if crate::driver_launch::nested_hosted_file_lifecycle_work_ready()
+        && crate::driver_launch::redrive_nested_hosted_file_lifecycle_work() { return true; }
+    if crate::hosted_routed_file_close_work::nested_work_ready()
+        && crate::hosted_routed_file_close_work::redrive_nested_ready(handler) { return true; }
+    if crate::driver_launch::nested_win32k_source_work_ready()
+        && crate::driver_launch::redrive_nested_win32k_source_work(handler) { return true; }
+    if crate::provider_section_broker::nested_work_ready()
+        && crate::provider_section_broker::redrive_nested_ready(handler) { return true; }
+    if crate::provider_directory_broker::nested_work_ready()
+        && crate::provider_directory_broker::redrive_nested_ready(handler) { return true; }
     crate::provider_mm_section_objects::redrive(handler);
-    create || query || internal_control || buffered_control || write || read || flush || query_information || lower_pnp || lower_file || input || kernel_file_query || win32k_async_read || lifecycle || close || source || section || directory
+    false
 }
 
 pub(crate) unsafe fn watchdog_defer_if_hosted_work_can_run(site: &[u8]) -> bool {
@@ -10760,6 +10807,50 @@ pub(crate) unsafe fn service_sec_image(
             crate::driver_launch::redrive_hosted_flush_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_query_information_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_connect_forward();
+            // A port CONNECT may have yielded while its provider parent remained physically
+            // parked. Its File frames have ended here. Run one selected child per flat pass,
+            // then resume only that exact retained pump before another provider can enter.
+            let mut consecutive_no_child_yields = 0u8;
+            loop {
+                use crate::driver_launch::PortConnectPumpProgress as Progress;
+                match crate::driver_launch::redrive_retryable_connect_pump() {
+                    Progress::Blocked | Progress::Retained => {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        break 'service_loop;
+                    }
+                    Progress::NoWork | Progress::Returned | Progress::Yielded => {}
+                }
+                let Some(selector) = crate::driver_launch::claim_suspended_port_connect_pump()
+                else { break };
+                let step = drive_one_nested_file_child_step();
+                let ran_child = step.ran_child();
+                match crate::driver_launch::redrive_suspended_connect_pump(selector, step) {
+                    Progress::Blocked | Progress::Retained => {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        break 'service_loop;
+                    }
+                    Progress::Yielded if !ran_child => {
+                        consecutive_no_child_yields += 1;
+                        if consecutive_no_child_yields >= 2 {
+                            stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                            stop_ssn = 0;
+                            break 'service_loop;
+                        }
+                    }
+                    Progress::NoWork | Progress::Returned | Progress::Yielded => {
+                        consecutive_no_child_yields = 0;
+                    }
+                }
+            }
+            if crate::driver_launch::unsettled_suspended_connect_pump() {
+                // A nonretryable restore or a claimed, orphaned, or blocked port parent still
+                // owns its Reply. No later provider may enter while that physical owner is held.
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                break 'service_loop;
+            }
             crate::driver_launch::redrive_hosted_hook_forward();
             crate::driver_launch::redrive_hosted_lower_pnp_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_lower_file_forward(nt_handler as *mut _);

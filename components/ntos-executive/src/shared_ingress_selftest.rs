@@ -90,6 +90,7 @@ unsafe fn channel(index: usize) -> PumpChannel {
         initial: InitialAction::RecvFirst,
         tcb: row.source.tcb,
         reply_cap: ingress::current_reply(route).expect("fixture canonical Reply"),
+        child_work_capable: false,
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,

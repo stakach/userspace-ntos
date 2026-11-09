@@ -259,6 +259,7 @@ unsafe fn channel(index: usize, worker: HostedDriverThreadRuntime,
         shared_va: row.executive_shared, dispatch_label: LABEL, demand_cap: 256,
         trace_faults: false, initial, tcb: worker.tcb,
         reply_cap: runtime::current_reply(route).map_err(|_| STATUS_INVALID_HANDLE as u32)?,
+        child_work_capable: false,
         client_pi: 0, client_generation: 0, logical_caller: None, kernel_caller: None,
         caps: crate::spawn_hosts::HostCaps { dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp, ..crate::spawn_hosts::HostCaps::default() },
@@ -399,6 +400,21 @@ pub(super) unsafe fn dispatch_callback(
             let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
             row.delete_unattributed_result = Some(result);
             row.phase = Phase::Uncertain;
+            DeleteCallbackProgress::Uncertain
+        }
+        component_scheduler::HostedPumpRestore::ChildWorkReady { result, .. }
+        | component_scheduler::HostedPumpRestore::ChildWorkQuarantined { result, .. } => {
+            // This lane cannot transfer a child-work continuation; retain the result and let
+            // the physical owner keep any parked parent rather than claiming completion.
+            let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+            row.delete_unattributed_result = Some(result);
+            row.phase = Phase::Uncertain;
+            DeleteCallbackProgress::Uncertain
+        }
+        component_scheduler::HostedPumpRestore::ChildWorkPending(_) => {
+            // This lane cannot own a File continuation. The physical row remains retained;
+            // no completion or Reply ACK is inferred from this impossible result.
+            (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;
             DeleteCallbackProgress::Uncertain
         }
     }

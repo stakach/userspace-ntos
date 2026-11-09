@@ -905,6 +905,24 @@ pub(super) unsafe fn receive(
                 Ok(parent) => parent,
                 Err(_) => return PumpMessage::transport_wall(),
             };
+            if ch.child_work_capable {
+                // The File owner has already retained the move-only invocation and native bank.
+                // Keep this exact physical parent in its durable row before unwinding every
+                // pump/dispatch frame; root will run one certified child step outside them.
+                let ticket = parent.as_ref().map(|parent| parent.ticket());
+                let ticket = match runtime::nested::retain_child_work_parent(&mut parent) {
+                    Ok(ticket) => ticket,
+                    Err(_) => {
+                        // Retention made no child effect. Restore this attempt before reporting
+                        // the real transport refusal; an uncertain restore remains fenced.
+                        if runtime::nested::restore_or_retain(&mut parent).is_err() {
+                            return nested_restore_refusal(ticket);
+                        }
+                        return PumpMessage::transport_wall();
+                    }
+                };
+                return PumpMessage::nested_child_work_yield(ticket);
+            }
             let progressed = crate::service_sec_image::redrive_nested_hosted_file_work();
             let ticket = parent.as_ref().map(|parent| parent.ticket());
             if runtime::nested::restore_or_retain(&mut parent).is_err() {

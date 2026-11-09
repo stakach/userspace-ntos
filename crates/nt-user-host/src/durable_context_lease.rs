@@ -15,6 +15,7 @@ pub enum DurableContextLeaseError {
     AlreadyBound,
     NotTop,
     StillBound,
+    ConflictingRetained,
 }
 
 /// The native adapter owns the decision to retire after a genuine terminal acknowledgement.
@@ -59,6 +60,20 @@ impl<K: Copy + Eq, B> DurableContextLeases<K, B> {
                 RetainedOwnerError::StaleReservation => DurableContextLeaseError::StaleTicket,
             }, bundle)
         })
+    }
+
+    /// Admit a row only while no retained owner holds the same physical resource. This
+    /// check and insertion share one mutable borrow, so an unbound parent remains exclusive
+    /// across nested callback admission. A refusal returns the bundle and leaves the exact
+    /// reservation available for cancellation by its caller.
+    pub fn retain_exclusive_by(
+        &mut self, reservation: RetainedOwnerReservation, key: K, bundle: B,
+        matches: impl FnMut(&B) -> bool,
+    ) -> Result<RetainedOwnerTicket<K>, (DurableContextLeaseError, B)> {
+        if self.rows.any_held(matches) {
+            return Err((DurableContextLeaseError::ConflictingRetained, bundle));
+        }
+        self.retain(reservation, key, bundle)
     }
 
     pub fn get(&self, ticket: RetainedOwnerTicket<K>) -> Option<&B> {

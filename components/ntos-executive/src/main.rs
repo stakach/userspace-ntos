@@ -32612,6 +32612,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 initial: spawn_hosts::InitialAction::RecvFirst,
                 tcb: WIN32K_TCB.load(Ordering::Relaxed),
                 reply_cap: primary_reply,
+                child_work_capable: false,
                 client_pi: 0,
                 client_generation: 0,
                 logical_caller: None,

@@ -6,8 +6,9 @@
 //! owned by `hosted_file_owners` until the real provider completion is acknowledged.
 
 use super::*;
+use alloc::vec::Vec;
 use nt_io_abi::major;
-use nt_io_manager::detached_file_irp::ExternalFileIrpRequest;
+use nt_io_manager::detached_file_irp::{ExternalFileIrpPumpKey, ExternalFileIrpRequest};
 use nt_io_manager::retained_connect_forward::ConnectPayloadIdentity;
 use nt_io_manager::{DeviceControlParameters, HostedDevicePointerRegistration, IoParameters};
 use nt_types::ClientId;
@@ -17,6 +18,14 @@ pub(super) enum PortConnectPhase {
     Prepared,
     Entered,
     Rejected(nt_status::NtStatus),
+    /// Native provider has not returned; root must run one child and resume this exact pump.
+    PumpSuspended(nt_io_manager::IrpId, ExternalFileIrpPumpKey),
+    /// The boxed Work owns one claimed outer child pass before any child enters.
+    PumpStepClaimed(nt_io_manager::IrpId, ExternalFileIrpPumpKey),
+    /// The one-use child receipt is already in the native continuation; retry only restoration.
+    PumpRestoreRetry(nt_io_manager::IrpId, ExternalFileIrpPumpKey),
+    /// An uncertain handoff keeps both manager and native owners without replying to the source.
+    PumpBlocked,
     AwaitingCompletion(nt_io_manager::IrpId),
     Terminal(nt_status::NtStatus),
     Acknowledged,
@@ -34,6 +43,10 @@ pub(super) struct PortLocalConnect {
     thunk: hosted_class_callback_thunk::PublishedClassServiceThunk,
     pending_irp: Option<nt_io_manager::IrpId>,
     returned_input: Option<[u8; 16]>,
+    unowned_yield: Option<hosted_file_owners::PortConnectDispatchFailure>,
+    unowned_return: Option<nt_io_manager::detached_file_irp::ExternalFileIrpReturn>,
+    retained_buffers: Option<nt_io_manager::detached_file_irp::ExternalFileIrpBuffers>,
+    child_steps: Vec<crate::service_sec_image::NestedChildStep>,
     phase: PortConnectPhase,
 }
 
@@ -81,11 +94,103 @@ impl PortLocalConnect {
             thunk,
             pending_irp: None,
             returned_input: None,
+            unowned_yield: None,
+            unowned_return: None,
+            retained_buffers: None,
+            child_steps: Vec::new(),
             phase: PortConnectPhase::Prepared,
         })
     }
 
     pub(super) const fn phase(&self) -> PortConnectPhase {
+        self.phase
+    }
+
+    pub(super) fn suspended_pump_selector(
+        &self,
+    ) -> Option<(nt_io_manager::IrpId, ExternalFileIrpPumpKey)> {
+        let PortConnectPhase::PumpSuspended(irp, key) = self.phase else { return None; };
+        (self.child_steps.is_empty()
+            && hosted_file_owners::suspended_pump_child_ready(irp, key))
+            .then_some((irp, key))
+    }
+
+    pub(super) fn claim_suspended_pump_step(
+        &mut self,
+    ) -> Option<(nt_io_manager::IrpId, ExternalFileIrpPumpKey)> {
+        let (irp, key) = self.suspended_pump_selector()?;
+        self.child_steps.try_reserve(1).ok()?;
+        self.phase = PortConnectPhase::PumpStepClaimed(irp, key);
+        Some((irp, key))
+    }
+
+    /// The child has already run. Store its one-use receipt before any route revalidation or
+    /// native restore so a refused handoff cannot cause another child or provider entry.
+    pub(super) fn retain_child_step(&mut self, step: crate::service_sec_image::NestedChildStep) {
+        self.child_steps.push(step);
+    }
+
+    pub(super) fn restore_retryable_selector(
+        &self,
+    ) -> Option<(nt_io_manager::IrpId, ExternalFileIrpPumpKey)> {
+        let PortConnectPhase::PumpRestoreRetry(irp, key) = self.phase else { return None; };
+        hosted_file_owners::suspended_pump_restore_retryable(irp, key).then_some((irp, key))
+    }
+
+    /// Consume no new root event here. The child step was retained before this method starts;
+    /// a refused native restore keeps both the File owner and its one-use certificate.
+    pub(super) unsafe fn resume_pump_after_child(&mut self) -> PortConnectPhase {
+        let (irp, key, first_restore) = match self.phase {
+            PortConnectPhase::PumpStepClaimed(irp, key) => (irp, key, true),
+            PortConnectPhase::PumpRestoreRetry(irp, key) => (irp, key, false),
+            _ => return self.phase,
+        };
+        if first_restore {
+            let Some(step) = self.child_steps.pop() else { return self.phase; };
+            if let Err(step) = hosted_file_owners::record_suspended_pump_child_step(irp, key, step) {
+                self.child_steps.push(step);
+                self.phase = PortConnectPhase::PumpBlocked;
+                return self.phase;
+            }
+        }
+        match hosted_file_owners::resume_suspended_port_connect_pump(irp, key) {
+            hosted_file_owners::PortConnectPumpDrive::Returned(
+                hosted_file_owners::DispatchResult::Returned { status, buffers, .. }
+            ) => {
+                let mut returned = [0u8; 16];
+                if buffers.input().len() != returned.len() {
+                    self.retained_buffers = Some(buffers);
+                    self.phase = PortConnectPhase::PumpBlocked;
+                    return self.phase;
+                }
+                returned.copy_from_slice(buffers.input());
+                self.returned_input = Some(returned);
+                self.phase = PortConnectPhase::Terminal(status);
+            }
+            hosted_file_owners::PortConnectPumpDrive::Returned(
+                hosted_file_owners::DispatchResult::Outstanding { irp_id }
+            ) => self.phase = PortConnectPhase::AwaitingCompletion(irp_id),
+            hosted_file_owners::PortConnectPumpDrive::Rejected(status) => {
+                self.phase = PortConnectPhase::Rejected(status)
+            }
+            hosted_file_owners::PortConnectPumpDrive::Yielded { irp_id, key } => {
+                self.phase = PortConnectPhase::PumpSuspended(irp_id, key)
+            }
+            hosted_file_owners::PortConnectPumpDrive::Retained => {
+                self.phase = PortConnectPhase::PumpRestoreRetry(irp, key)
+            }
+            hosted_file_owners::PortConnectPumpDrive::Blocked => {
+                self.phase = PortConnectPhase::PumpBlocked
+            }
+            hosted_file_owners::PortConnectPumpDrive::UnownedYield(failure) => {
+                self.unowned_yield = Some(failure);
+                self.phase = PortConnectPhase::PumpBlocked;
+            }
+            hosted_file_owners::PortConnectPumpDrive::UnownedReturned(returned) => {
+                self.unowned_return = Some(returned);
+                self.phase = PortConnectPhase::PumpBlocked;
+            }
+        }
         self.phase
     }
     pub(super) const fn source(&self) -> ConnectPayloadIdentity {
@@ -153,25 +258,40 @@ impl PortLocalConnect {
             &input,
             self.port_device.device_id(),
         ) {
-            Ok(hosted_file_owners::DispatchResult::Returned { status, buffers, .. }) => {
+            Ok(hosted_file_owners::PortConnectDispatchResult::Returned(
+                hosted_file_owners::DispatchResult::Returned { status, buffers, .. }
+            )) => {
                 if status == nt_status::NtStatus::PENDING {
                     return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
                 }
                 let mut returned = [0u8; 16];
-                assert_eq!(buffers.input().len(), returned.len(),
-                    "validated CONNECT input length changed");
+                if buffers.input().len() != returned.len() {
+                    self.retained_buffers = Some(buffers);
+                    self.phase = PortConnectPhase::PumpBlocked;
+                    return Ok(self.phase);
+                }
                 returned.copy_from_slice(buffers.input());
                 self.returned_input = Some(returned);
                 self.phase = PortConnectPhase::Terminal(status);
             }
-            Ok(hosted_file_owners::DispatchResult::Outstanding { irp_id }) => {
+            Ok(hosted_file_owners::PortConnectDispatchResult::Returned(
+                hosted_file_owners::DispatchResult::Outstanding { irp_id }
+            )) => {
                 self.pending_irp = Some(irp_id);
                 self.phase = PortConnectPhase::AwaitingCompletion(irp_id);
             }
-            Err(status) => {
+            Ok(hosted_file_owners::PortConnectDispatchResult::PumpSuspended { irp_id, key }) => {
+                self.pending_irp = Some(irp_id);
+                self.phase = PortConnectPhase::PumpSuspended(irp_id, key);
+            }
+            Err(hosted_file_owners::PortConnectDispatchFailure::Status(status)) => {
                 // The detached owner returns an error only for known pre-entry rejection. The
                 // source caller still decides whether its own retained work may be aborted.
                 self.phase = PortConnectPhase::Rejected(status);
+            }
+            Err(failure @ hosted_file_owners::PortConnectDispatchFailure::UnownedYield { .. }) => {
+                self.unowned_yield = Some(failure);
+                self.phase = PortConnectPhase::PumpBlocked;
             }
         }
         Ok(self.phase)

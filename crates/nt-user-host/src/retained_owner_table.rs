@@ -129,6 +129,15 @@ impl<K: Copy + Eq, B> RetainedOwnerTable<K, B> {
         }
     }
 
+    /// Inspect every retained owner, including rows whose transient selector was unbound.
+    /// Reserved and taken rows do not expose a bundle to this predicate.
+    pub fn any_held(&self, mut matches: impl FnMut(&B) -> bool) -> bool {
+        self.slots.iter().any(|slot| match slot {
+            Some(Slot::Held { bundle, .. }) => matches(bundle),
+            _ => false,
+        })
+    }
+
     /// A short mutable borrow of the exact held row. Callers must not carry this borrow across
     /// another reservation, bind, or native effect that can reenter the owner table.
     pub fn get_mut(&mut self, ticket: RetainedOwnerTicket<K>) -> Option<&mut B> {

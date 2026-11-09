@@ -137,11 +137,57 @@ impl Drop for ComponentSchedulerScope {
     }
 }
 
+/// A child step is already consumed when this row exists. It preserves every stage that may
+/// refuse before the original receive, including the one-use inner restore receipt.
+#[must_use = "retain this exact File pump continuation until receive or quarantine"]
+pub(super) struct PendingChildWorkRestore {
+    mode: PendingReceiveMode,
+    result: crate::spawn_hosts::PumpResult,
+    channel: crate::spawn_hosts::PumpChannel,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+    caller: Option<nt_process::native_handle::NativeHandleCaller>,
+    inner_ticket: Option<crate::spawn_hosts::shared_ingress::owner::runtime::nested::NestedRestoreTicket>,
+    inner_restored: bool,
+    inner_receipt: Option<crate::spawn_hosts::shared_ingress::owner::runtime::nested::ChildWorkParentRestored>,
+    parent: Option<crate::spawn_hosts::shared_ingress::owner::runtime::nested::ParkedParentHandle>,
+    outer_restored: bool,
+    retryable: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PendingReceiveMode {
+    ChildWork,
+    NestedRestore,
+}
+
+impl PendingChildWorkRestore {
+    pub(super) const fn retryable(&self) -> bool { self.retryable }
+}
+
 /// A component result remains owned by its physical parent on restore refusal. The retained
 /// ticket is a selector only; `runtime::nested` continues to own the stopped TCB and Reply.
 pub(super) enum HostedPumpRestore {
     Restored(crate::spawn_hosts::PumpResult),
     Unattributed(crate::spawn_hosts::PumpResult),
+    /// The outer caller owns the stopped pump result and move-only outer physical parent while
+    /// root executes one retained child. Neither parent is restored on this stack.
+    ChildWorkReady {
+        result: crate::spawn_hosts::PumpResult,
+        parent: Option<crate::spawn_hosts::shared_ingress::owner::runtime::nested::ParkedParentHandle>,
+        /// Admission refreshed the canonical Reply on this local channel. The caller's input
+        /// channel is stale and cannot authorize a receive continuation.
+        channel: crate::spawn_hosts::PumpChannel,
+        dispatch: nt_component_suspension::LaneDispatchIdentity,
+        caller: Option<nt_process::native_handle::NativeHandleCaller>,
+    },
+    /// A failed SEH settlement fences child entry and keeps both physical parents retained.
+    ChildWorkQuarantined {
+        result: crate::spawn_hosts::PumpResult,
+        parent: Option<crate::spawn_hosts::shared_ingress::owner::runtime::nested::ParkedParentHandle>,
+        channel: crate::spawn_hosts::PumpChannel,
+        caller: Option<nt_process::native_handle::NativeHandleCaller>,
+    },
+    ChildWorkPending(PendingChildWorkRestore),
     Retained {
         result: crate::spawn_hosts::PumpResult,
         key: nt_component_suspension::NestedRestoreResultKey,
@@ -154,7 +200,10 @@ impl HostedPumpRestore {
     fn legacy(self) -> crate::spawn_hosts::PumpResult {
         match self {
             Self::Restored(result) => result,
-            Self::Retained { .. } | Self::Unattributed(_) => panic!("restore nested hosted parent"),
+            Self::Retained { .. } | Self::Unattributed(_)
+            | Self::ChildWorkReady { .. } | Self::ChildWorkQuarantined { .. }
+            | Self::ChildWorkPending(_) =>
+                panic!("restore nested hosted parent"),
         }
     }
 }
@@ -185,6 +234,66 @@ pub(super) unsafe fn hosted_component_pump_observed(
     owner: &scsi_srb_pump_owner::ScsiSrbPumpOwnerClaim<'_, SCSI_SRB_PUMP_OWNER_SLOTS>,
 ) -> crate::spawn_hosts::PumpResult {
     hosted_component_pump_inner(channel, caller, Some(owner)).legacy()
+}
+
+/// Preserve the observed SCSI timeline while returning a typed suspended child-work result.
+/// The File owner must retain the move-only parent and post-admission channel before any child
+/// effect; the legacy observer remains for callers that cannot transfer this continuation.
+pub(super) unsafe fn hosted_component_pump_observed_retained(
+    channel: &crate::spawn_hosts::PumpChannel,
+    caller: Option<nt_process::native_handle::NativeHandleCaller>,
+    owner: &scsi_srb_pump_owner::ScsiSrbPumpOwnerClaim<'_, SCSI_SRB_PUMP_OWNER_SLOTS>,
+) -> HostedPumpRestore {
+    hosted_component_pump_inner(channel, caller, Some(owner))
+}
+
+/// Only a File owner that can retain its native invocation may request an intentional child
+/// handoff. This private copy carries the capability through pump enter, loop and shared receive;
+/// every ordinary constructed channel remains incapable.
+unsafe fn file_child_work_channel(
+    original: &crate::spawn_hosts::PumpChannel,
+) -> Option<crate::spawn_hosts::PumpChannel> {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let route = runtime::channel_route(original).ok()??;
+    let source = runtime::physical_source(route).ok()?;
+    if !matches!(source.domain, runtime::PhysicalDomain::Hosted(_))
+        || !matches!(source.kind, runtime::PhysicalSourceKind::DispatchWorker { .. })
+    {
+        return None;
+    }
+    let reply = runtime::current_reply(route).ok()?;
+    if reply == 0 { return None; }
+    let mut channel = *original;
+    channel.reply_cap = reply;
+    channel.child_work_capable = true;
+    Some(channel)
+}
+
+pub(super) unsafe fn hosted_component_pump_with_caller_child_work(
+    channel: &crate::spawn_hosts::PumpChannel,
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> HostedPumpRestore {
+    let Some(channel) = file_child_work_channel(channel) else {
+        return HostedPumpRestore::Unattributed(crate::spawn_hosts::PumpResult::refused(
+            nt_process::STATUS_INVALID_HANDLE as i32, channel.reply_cap));
+    };
+    hosted_component_pump_inner(&channel, Some(caller), None)
+}
+
+pub(super) unsafe fn hosted_component_pump_observed_child_work(
+    channel: &crate::spawn_hosts::PumpChannel,
+    caller: Option<nt_process::native_handle::NativeHandleCaller>,
+    owner: &scsi_srb_pump_owner::ScsiSrbPumpOwnerClaim<'_, SCSI_SRB_PUMP_OWNER_SLOTS>,
+) -> HostedPumpRestore {
+    if caller.is_none() {
+        return HostedPumpRestore::Unattributed(crate::spawn_hosts::PumpResult::refused(
+            nt_process::STATUS_INVALID_HANDLE as i32, channel.reply_cap));
+    }
+    let Some(channel) = file_child_work_channel(channel) else {
+        return HostedPumpRestore::Unattributed(crate::spawn_hosts::PumpResult::refused(
+            nt_process::STATUS_INVALID_HANDLE as i32, channel.reply_cap));
+    };
+    hosted_component_pump_inner(&channel, caller, Some(owner))
 }
 
 unsafe fn hosted_component_pump_inner(
@@ -265,6 +374,67 @@ unsafe fn hosted_component_pump_inner(
         trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 4, Some(&result));
         trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 4, Some(&result));
     }
+    match result.nested_child_work {
+        Some(crate::spawn_hosts::NestedChildWorkState::Ready(yielded)) => {
+            let dispatch = match route.and_then(|route| runtime::dispatch(route).ok()) {
+                Some(dispatch) => dispatch,
+                None => {
+                    result.nested_child_work = Some(
+                        crate::spawn_hosts::NestedChildWorkState::Quarantined(yielded));
+                    fence_nested_child_parent(yielded.parent);
+                    return HostedPumpRestore::ChildWorkQuarantined {
+                        result, parent, channel: *channel, caller,
+                    };
+                }
+            };
+            let canonical_reply = match route.and_then(|route| runtime::current_reply(route).ok()) {
+                Some(reply) if reply != 0 && reply == result.reply_cap => reply,
+                _ => {
+                    // The component may adopt a new shared Call while receiving. An unmatched
+                    // snapshot cannot authorize the resumed receive or another child entry.
+                    result.nested_child_work = Some(
+                        crate::spawn_hosts::NestedChildWorkState::Quarantined(yielded));
+                    fence_nested_child_parent(yielded.parent);
+                    return HostedPumpRestore::ChildWorkQuarantined {
+                        result, parent, channel: *channel, caller,
+                    };
+                }
+            };
+            channel.reply_cap = canonical_reply;
+            return HostedPumpRestore::ChildWorkReady {
+                result, parent, channel: *channel, dispatch, caller,
+            };
+        }
+        Some(crate::spawn_hosts::NestedChildWorkState::Quarantined(yielded)) => {
+            fence_nested_child_parent(yielded.parent);
+            return HostedPumpRestore::ChildWorkQuarantined { result, parent, channel: *channel, caller };
+        }
+        None => {}
+    }
+    if channel.child_work_capable
+        && (result.nested_restore_yield.is_some() || result.nested_restore_quarantined.is_some())
+    {
+        let Some(route) = route else {
+            return HostedPumpRestore::ChildWorkQuarantined {
+                result, parent, channel: *channel, caller,
+            };
+        };
+        let Ok(dispatch) = runtime::dispatch(route) else {
+            return HostedPumpRestore::ChildWorkQuarantined {
+                result, parent, channel: *channel, caller,
+            };
+        };
+        let exact_reply = runtime::current_reply(route).ok() == Some(result.reply_cap);
+        if exact_reply { channel.reply_cap = result.reply_cap; }
+        let inner_ticket = result.nested_restore_yield.or(result.nested_restore_quarantined);
+        return HostedPumpRestore::ChildWorkPending(PendingChildWorkRestore {
+            mode: PendingReceiveMode::NestedRestore,
+            result, channel: *channel, dispatch, caller, inner_ticket,
+            inner_restored: false, inner_receipt: None,
+            outer_restored: parent.is_none(), parent,
+            retryable: exact_reply && result.nested_restore_yield.is_some(),
+        });
+    }
     if result.completed {
         if let Some(timeline) = timeline.as_mut() {
             timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::Completion,
@@ -272,26 +442,8 @@ unsafe fn hosted_component_pump_inner(
         }
         trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 5, Some(&result));
         trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 5, Some(&result));
-        let route = route.expect("hosted completion requires enrolled source");
-        let dispatch = runtime::dispatch(route).expect("retained hosted dispatch epoch");
-        if let Some(words) = result.startup_stack_receipt {
-            assert!(
-                crate::driver_launch::hosted_source_completion_lane::validate_startup_ready(
-                    channel, words
-                ) || crate::driver_launch::hosted_class_irp_lane::validate_startup_ready(
-                    channel, words
-                ) || crate::driver_launch::hosted_provider_export_lane::validate_startup_ready(
-                    channel, words
-                ),
-                "authenticate exact retained hosted worker READY"
-            );
-            let reply = runtime::current_reply(route).expect("current canonical startup Reply");
-            runtime::complete_protocol(route, dispatch, reply, channel.dispatch_label, &words)
-                .expect("settle exact hosted worker startup protocol");
-        } else {
-            runtime::complete(route, dispatch, result.reply_cap, channel.dispatch_label)
-                .expect("authenticate hosted final completion Call");
-        }
+        authenticate_component_completion(channel, &result)
+            .expect("authenticate hosted final completion Call");
         trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 6, Some(&result));
         trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 6, Some(&result));
     }
@@ -322,4 +474,223 @@ unsafe fn hosted_component_pump_inner(
         timeline.finish(crate::disk_census_ticks());
     }
     HostedPumpRestore::Restored(result)
+}
+
+/// Shared completion contract for uninterrupted and resumed receive slices. A failed exact
+/// authentication leaves the caller responsible for retaining the entered result.
+unsafe fn authenticate_component_completion(
+    channel: &crate::spawn_hosts::PumpChannel,
+    result: &crate::spawn_hosts::PumpResult,
+) -> Result<(), crate::spawn_hosts::shared_ingress::owner::runtime::Error> {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let route = runtime::channel_route(channel)?.ok_or(runtime::Error::PhysicalIdentity)?;
+    let dispatch = runtime::dispatch(route)?;
+    if let Some(words) = result.startup_stack_receipt {
+        if !(crate::driver_launch::hosted_source_completion_lane::validate_startup_ready(
+            channel, words
+        ) || crate::driver_launch::hosted_class_irp_lane::validate_startup_ready(
+            channel, words
+        ) || crate::driver_launch::hosted_provider_export_lane::validate_startup_ready(
+            channel, words
+        )) {
+            return Err(runtime::Error::PhysicalIdentity);
+        }
+        let reply = runtime::current_reply(route)?;
+        runtime::complete_protocol(route, dispatch, reply, channel.dispatch_label, &words)
+    } else {
+        runtime::complete(route, dispatch, result.reply_cap, channel.dispatch_label)
+    }
+}
+
+unsafe fn fence_nested_child_parent(
+    ticket: Option<crate::spawn_hosts::shared_ingress::owner::runtime::nested::NestedRestoreTicket>,
+) {
+    if let Some(ticket) = ticket {
+        let _ = crate::spawn_hosts::shared_ingress::owner::runtime::nested::quarantine_child_work_parent(ticket);
+    }
+}
+
+/// Consume the one child-step certificate exactly once. The File owner retains any returned
+/// pending state; a wrong pump state returns both original owners without entering an effect.
+pub(super) unsafe fn resume_child_work(
+    pump: HostedPumpRestore,
+    step: crate::service_sec_image::NestedChildStep,
+) -> Result<HostedPumpRestore, (HostedPumpRestore, crate::service_sec_image::NestedChildStep)> {
+    let HostedPumpRestore::ChildWorkReady { result, parent, channel, dispatch, caller } = pump else {
+        return Err((pump, step));
+    };
+    if matches!(step.into_decision(), crate::service_sec_image::NestedChildStepDecision::Quarantine) {
+        if let Some(crate::spawn_hosts::NestedChildWorkState::Ready(yielded)) = result.nested_child_work {
+            if let Some(ticket) = yielded.parent {
+                let _ = crate::spawn_hosts::shared_ingress::owner::runtime::nested::quarantine_child_work_parent(ticket);
+            }
+        }
+        return Ok(HostedPumpRestore::ChildWorkQuarantined { result, parent, channel, caller });
+    }
+    let inner_ticket = match result.nested_child_work {
+        Some(crate::spawn_hosts::NestedChildWorkState::Ready(yielded)) => yielded.parent,
+        _ => return Ok(HostedPumpRestore::ChildWorkQuarantined { result, parent, channel, caller }),
+    };
+    Ok(resume_pending_child_work(PendingChildWorkRestore {
+        mode: PendingReceiveMode::ChildWork,
+        result, channel, dispatch, caller, inner_ticket,
+        inner_restored: inner_ticket.is_none(), inner_receipt: None,
+        outer_restored: parent.is_none(), parent, retryable: true,
+    }))
+}
+
+/// Retry only a certified no-effects refusal. The consumed child step is never run again.
+pub(super) unsafe fn retry_child_work(pump: HostedPumpRestore) -> HostedPumpRestore {
+    match pump {
+        HostedPumpRestore::ChildWorkPending(pending) if pending.retryable =>
+            resume_pending_child_work(pending),
+        other => other,
+    }
+}
+
+unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> HostedPumpRestore {
+    use crate::spawn_hosts::shared_ingress::owner::runtime;
+    let route = match runtime::channel_route(&pending.channel) {
+        Ok(Some(route)) if runtime::dispatch(route).ok() == Some(pending.dispatch) => route,
+        _ => {
+            pending.retryable = false;
+            return HostedPumpRestore::ChildWorkPending(pending);
+        }
+    };
+    if !pending.inner_restored {
+        let Some(ticket) = pending.inner_ticket else {
+            pending.retryable = false;
+            return HostedPumpRestore::ChildWorkPending(pending);
+        };
+        let restored = match pending.mode {
+            PendingReceiveMode::ChildWork =>
+                runtime::nested::restore_child_work_parent(ticket).map(Some),
+            PendingReceiveMode::NestedRestore =>
+                runtime::nested::restore_pending_ticket(ticket).map(|_| None),
+        };
+        match restored {
+            Ok(receipt) => { pending.inner_receipt = receipt; pending.inner_restored = true; }
+            Err(_) => {
+                pending.retryable = runtime::nested::pending_ticket(ticket);
+                return HostedPumpRestore::ChildWorkPending(pending);
+            }
+        }
+    }
+    if !pending.outer_restored {
+        let ticket = pending.parent.as_ref().map(|parent| parent.ticket());
+        let mut parent = pending.parent.take();
+        if runtime::nested::restore_or_retain(&mut parent).is_err() {
+            pending.parent = parent;
+            pending.retryable = ticket.is_some_and(|ticket| unsafe {
+                runtime::nested::pending_ticket(ticket)
+            });
+            return HostedPumpRestore::ChildWorkPending(pending);
+        }
+        pending.outer_restored = true;
+    }
+    if runtime::current_reply(route).ok() != Some(pending.result.reply_cap) {
+        pending.retryable = false;
+        return HostedPumpRestore::ChildWorkPending(pending);
+    }
+    pending.channel.reply_cap = pending.result.reply_cap;
+    if let Some(caller) = pending.caller {
+        if crate::provider_registry_caller::resolve_retained(
+            route, pending.dispatch, pending.channel.pml4,
+        ).ok() != Some(caller) {
+            pending.retryable = false;
+            return HostedPumpRestore::ChildWorkPending(pending);
+        }
+    }
+    if crate::driver_launch::driver_thread_projection::enter(&pending.channel, pending.caller).is_err() {
+        pending.retryable = false;
+        return HostedPumpRestore::ChildWorkPending(pending);
+    }
+    let scope = ComponentSchedulerScope::enter();
+    let receive = match pending.mode {
+        PendingReceiveMode::ChildWork =>
+            crate::spawn_hosts::component_pump_continue_nested_child_work_receive(
+                &pending.channel, &pending.result, pending.inner_receipt.take(),
+            ),
+        PendingReceiveMode::NestedRestore =>
+            crate::spawn_hosts::component_pump_continue_nested_restore_receive(
+                &pending.channel, &pending.result,
+            ).map_err(|status| (status, None)),
+    };
+    let mut result = match receive {
+        Ok(result) => result,
+        Err((status, receipt)) => {
+            pending.inner_receipt = receipt;
+            pending.retryable = status == nt_process::STATUS_INSUFFICIENT_RESOURCES;
+            return HostedPumpRestore::ChildWorkPending(pending);
+        }
+    };
+    let mut channel = pending.channel;
+    while result.scheduler_yielded {
+        scope.service_irq_yield(channel.shared_va);
+        let _ = handoff_exact_component_once(channel.tcb);
+        let reply = match runtime::current_reply(route) {
+            Ok(reply) if reply != 0 => reply,
+            _ => return retain_uncertain_receive(pending, result, channel),
+        };
+        channel.reply_cap = reply;
+        result = match crate::spawn_hosts::component_pump_continue_receive_after_scheduler_service(
+            &channel, &result,
+        ) {
+            Ok(result) => result,
+            Err(_) => return retain_uncertain_receive(pending, result, channel),
+        };
+    }
+    if let Some(crate::spawn_hosts::NestedChildWorkState::Ready(_)) = result.nested_child_work {
+        if runtime::dispatch(route).ok() != Some(pending.dispatch) {
+            return retain_uncertain_receive(pending, result, channel);
+        }
+        let reply = match runtime::current_reply(route) {
+            Ok(reply) if reply != 0 && reply == result.reply_cap => reply,
+            _ => return retain_uncertain_receive(pending, result, channel),
+        };
+        channel.reply_cap = reply;
+        return HostedPumpRestore::ChildWorkReady {
+            result, parent: None, channel, dispatch: pending.dispatch, caller: pending.caller,
+        };
+    }
+    if result.nested_child_work.is_some() {
+        return retain_uncertain_receive(pending, result, channel);
+    }
+    if result.nested_restore_yield.is_some() || result.nested_restore_quarantined.is_some() {
+        let exact_reply = runtime::current_reply(route).ok() == Some(result.reply_cap)
+            && runtime::dispatch(route).ok() == Some(pending.dispatch);
+        if exact_reply { channel.reply_cap = result.reply_cap; }
+        pending.mode = PendingReceiveMode::NestedRestore;
+        pending.inner_ticket = result.nested_restore_yield.or(result.nested_restore_quarantined);
+        pending.inner_restored = false;
+        pending.inner_receipt = None;
+        pending.outer_restored = true;
+        pending.parent = None;
+        pending.retryable = exact_reply && result.nested_restore_yield.is_some();
+        pending.result = result;
+        pending.channel = channel;
+        return HostedPumpRestore::ChildWorkPending(pending);
+    }
+    if result.completed && authenticate_component_completion(&channel, &result).is_err() {
+        return retain_uncertain_receive(pending, result, channel);
+    }
+    HostedPumpRestore::Restored(result)
+}
+
+/// Preserve the exact dispatch generation and latest Reply after an entered receive refused.
+/// This state is never retryable because effects may already have occurred.
+unsafe fn retain_uncertain_receive(
+    mut pending: PendingChildWorkRestore,
+    result: crate::spawn_hosts::PumpResult,
+    channel: crate::spawn_hosts::PumpChannel,
+) -> HostedPumpRestore {
+    if let Some(crate::spawn_hosts::NestedChildWorkState::Quarantined(yielded)) = result.nested_child_work {
+        if let Some(ticket) = yielded.parent {
+            let _ = crate::spawn_hosts::shared_ingress::owner::runtime::nested::quarantine_child_work_parent(ticket);
+        }
+    }
+    pending.result = result;
+    pending.channel = channel;
+    pending.retryable = false;
+    HostedPumpRestore::ChildWorkPending(pending)
 }

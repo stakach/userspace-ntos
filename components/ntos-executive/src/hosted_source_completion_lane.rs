@@ -440,6 +440,7 @@ unsafe fn channel(
         initial,
         tcb: worker.tcb,
         reply_cap: runtime::current_reply(route).map_err(|_| STATUS_INVALID_HANDLE as u32)?,
+        child_work_capable: false,
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
@@ -648,6 +649,19 @@ pub(super) unsafe fn dispatch(
             let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
             row.pump = Some(result);
             row.phase = Phase::Uncertain;
+            SourceCompletionDispatch::Uncertain
+        }
+        component_scheduler::HostedPumpRestore::ChildWorkReady { result, .. }
+        | component_scheduler::HostedPumpRestore::ChildWorkQuarantined { result, .. } => {
+            // Source completion has no File continuation owner. Fence the retained result;
+            // the physical parent row survives the dropped selector/stack handle.
+            let row = &mut (&mut *core::ptr::addr_of_mut!(LANES))[index];
+            row.pump = Some(result);
+            row.phase = Phase::Uncertain;
+            SourceCompletionDispatch::Uncertain
+        }
+        component_scheduler::HostedPumpRestore::ChildWorkPending(_) => {
+            (&mut *core::ptr::addr_of_mut!(LANES))[index].phase = Phase::Uncertain;
             SourceCompletionDispatch::Uncertain
         }
     }

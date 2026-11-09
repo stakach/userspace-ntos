@@ -1,13 +1,15 @@
 //! Native File IRP ownership across provider IPC and completion delivery.
 
 use super::*;
+use hosted_file_dispatch::FileDispatchContinuation;
 use nt_io_manager::detached_file_irp::{
     ExternalFileIrpBuffers, ExternalFileIrpCancelPhase, ExternalFileIrpCancelReturn,
     ExternalFileIrpCompletionInvocation, ExternalFileIrpCompletionReturn,
     ExternalFileIrpCopyReturn, ExternalFileIrpDispatchPolicy, ExternalFileIrpOutputCapture,
     ExternalFileIrpNoEntryReceipt, ExternalFileIrpOutcome, ExternalFileIrpRequest,
-    ExternalFileIrpResult, ExternalFileIrpReturn, ExternalFileIrpTerminal,
+    ExternalFileIrpPumpKey, ExternalFileIrpResult, ExternalFileIrpReturn, ExternalFileIrpTerminal,
     ExternalFileIrpTerminalReceipt, PreparedExternalFileIrp, RetainedExternalFileIrp,
+    SuspendedExternalFileIrpInvocation, ExternalFileIrpInvocation,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -15,6 +17,7 @@ enum Flight {
     Preparing,
     QueuedDispatch,
     Dispatch,
+    PumpSuspended,
     Copy,
     Cancel,
     Acknowledge,
@@ -26,12 +29,19 @@ enum Payload {
     Prepared(PreparedExternalFileIrp),
     NoEntry(ExternalFileIrpNoEntryReceipt),
     Returned(ExternalFileIrpReturn),
+    PumpSuspended(SuspendedFilePumpOwner),
     Retained(RetainedExternalFileIrp),
     Completion(ExternalFileIrpCompletionInvocation),
     Acknowledgement(ExternalFileIrpCompletionReturn),
     Copy(ExternalFileIrpCopyReturn),
     Cancel(ExternalFileIrpCancelReturn),
     Terminal(ExternalFileIrpTerminal),
+}
+
+#[must_use = "retain both the manager invocation and native pump continuation"]
+struct SuspendedFilePumpOwner {
+    invocation: SuspendedExternalFileIrpInvocation,
+    continuation: FileDispatchContinuation,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -288,6 +298,7 @@ pub(crate) struct Stats {
     pub preparing: usize,
     pub queued_dispatch: usize,
     pub dispatching: usize,
+    pub pump_suspended: usize,
     pub copying: usize,
     pub cancelling: usize,
     pub acknowledging: usize,
@@ -311,6 +322,7 @@ pub(super) fn stats() -> Stats {
             Flight::Preparing => stats.preparing += 1,
             Flight::QueuedDispatch => stats.queued_dispatch += 1,
             Flight::Dispatch => stats.dispatching += 1,
+            Flight::PumpSuspended => stats.pump_suspended += 1,
             Flight::Copy => stats.copying += 1,
             Flight::Cancel => stats.cancelling += 1,
             Flight::Acknowledge => stats.acknowledging += 1,
@@ -696,6 +708,208 @@ fn discard(id: u64, prepared: PreparedExternalFileIrp) -> Result<(), nt_status::
     }
 }
 
+/// Move the entered manager invocation into its exact native File owner before the pump stack
+/// unwinds. The caller must separately retain the physical pump continuation and Reply.
+pub(super) fn suspend_dispatch_for_pump(
+    irp_id: IrpId,
+    invocation: ExternalFileIrpInvocation,
+    key: ExternalFileIrpPumpKey,
+    continuation: FileDispatchContinuation,
+) -> Result<(), (nt_status::NtStatus, ExternalFileIrpInvocation,
+    FileDispatchContinuation)> {
+    let Some(id) = find(irp_id) else {
+        return Err((nt_status::NtStatus::INVALID_HANDLE, invocation, continuation));
+    };
+    if invocation.irp_id() != irp_id || row(id).flight != Flight::Dispatch
+        || row(id).payload.is_some()
+    {
+        return Err((nt_status::NtStatus::INVALID_HANDLE, invocation, continuation));
+    }
+    let suspended = match invocation.suspend_for_pump(key) {
+        Ok(suspended) => suspended,
+        Err(invocation) => {
+            return Err((nt_status::NtStatus::INVALID_HANDLE, invocation, continuation));
+        }
+    };
+    let owner = row(id);
+    owner.payload = Some(Payload::PumpSuspended(SuspendedFilePumpOwner {
+        invocation: suspended, continuation,
+    }));
+    owner.flight = Flight::PumpSuspended;
+    Ok(())
+}
+
+/// Only the same manager, IRP, route, and native epoch may recover the invocation. A failed
+/// check leaves it in the row; no I/O Manager outcome or provider completion is synthesized.
+pub(super) fn resume_dispatch_from_pump(
+    irp_id: IrpId,
+    key: ExternalFileIrpPumpKey,
+) -> Result<(ExternalFileIrpInvocation, FileDispatchContinuation),
+    nt_status::NtStatus> {
+    let id = find(irp_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if row(id).flight != Flight::PumpSuspended || !live_route(id) {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    let suspended = match row(id).payload.take() {
+        Some(Payload::PumpSuspended(suspended)) => suspended,
+        other => {
+            row(id).payload = other;
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+    };
+    let SuspendedFilePumpOwner { invocation, continuation } = suspended;
+    match invocation.resume(key) {
+        Ok(invocation) => {
+            row(id).flight = Flight::Dispatch;
+            Ok((invocation, continuation))
+        }
+        Err(invocation) => {
+            row(id).payload = Some(Payload::PumpSuspended(SuspendedFilePumpOwner {
+                invocation, continuation,
+            }));
+            Err(nt_status::NtStatus::INVALID_HANDLE)
+        }
+    }
+}
+
+/// An uncertain native effect permanently fences replay while the exact File row keeps the
+/// dispatched IRP. A separate, authenticated reconciliation must settle the I/O Manager owner.
+pub(super) fn quarantine_dispatch_pump(
+    irp_id: IrpId,
+    key: ExternalFileIrpPumpKey,
+    status: nt_status::NtStatus,
+) -> Result<(), nt_status::NtStatus> {
+    let id = find(irp_id).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if row(id).flight != Flight::PumpSuspended || !status.is_error() {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let mut suspended = match row(id).payload.take() {
+        Some(Payload::PumpSuspended(suspended)) => suspended,
+        other => {
+            row(id).payload = other;
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+    };
+    let outcome = suspended.invocation.quarantine(key);
+    row(id).payload = Some(Payload::PumpSuspended(suspended));
+    outcome?;
+    row(id).flight = Flight::Blocked;
+    row(id).blocked_status = Some(status);
+    Ok(())
+}
+
+pub(super) fn suspended_pump_child_ready(
+    irp_id: IrpId,
+    key: ExternalFileIrpPumpKey,
+) -> bool {
+    let Some(id) = find(irp_id) else { return false; };
+    if row(id).flight != Flight::PumpSuspended || !live_route(id) {
+        return false;
+    }
+    matches!(row(id).payload.as_ref(), Some(Payload::PumpSuspended(owner))
+        if owner.invocation.key() == key && owner.continuation.child_work_ready())
+}
+
+pub(super) fn suspended_pump_restore_retryable(
+    irp_id: IrpId,
+    key: ExternalFileIrpPumpKey,
+) -> bool {
+    let Some(id) = find(irp_id) else { return false; };
+    if row(id).flight != Flight::PumpSuspended { return false; }
+    matches!(row(id).payload.as_ref(), Some(Payload::PumpSuspended(owner))
+        if owner.invocation.key() == key
+            && owner.continuation.retry_without_new_child())
+}
+
+pub(super) fn record_suspended_pump_child_step(
+    irp_id: IrpId,
+    key: ExternalFileIrpPumpKey,
+    step: crate::service_sec_image::NestedChildStep,
+) -> Result<(), crate::service_sec_image::NestedChildStep> {
+    let Some(id) = find(irp_id) else { return Err(step); };
+    if row(id).flight != Flight::PumpSuspended {
+        return Err(step);
+    }
+    let Some(Payload::PumpSuspended(owner)) = row(id).payload.as_mut() else {
+        return Err(step);
+    };
+    if owner.invocation.key() != key { return Err(step); }
+    owner.continuation.record_child_step(step)
+}
+
+pub(super) enum PortConnectPumpDrive {
+    Returned(DispatchResult),
+    Rejected(nt_status::NtStatus),
+    Yielded { irp_id: IrpId, key: ExternalFileIrpPumpKey },
+    Retained,
+    Blocked,
+    UnownedYield(PortConnectDispatchFailure),
+    UnownedReturned(ExternalFileIrpReturn),
+}
+
+/// Resume only the receive half. The child receipt is already in the native continuation;
+/// neither this method nor a retry may redispatch the original IRP or run another child.
+pub(super) unsafe fn resume_suspended_port_connect_pump(
+    irp_id: IrpId,
+    key: ExternalFileIrpPumpKey,
+) -> PortConnectPumpDrive {
+    let (invocation, continuation) = match resume_dispatch_from_pump(irp_id, key) {
+        Ok(owners) => owners,
+        Err(status) => {
+            let _ = quarantine_dispatch_pump(irp_id, key, status);
+            return PortConnectPumpDrive::Blocked;
+        }
+    };
+    let progress = continuation.resume_after_child(invocation);
+    let yielded = match progress {
+        Ok(hosted_file_dispatch::InvokeResult::Returned(returned)) => {
+            let Some(id) = find(irp_id) else {
+                // The exact File row must remain present until this manager return is settled.
+                // A missing row is a fatal owner invariant, never a provider terminal status.
+                return PortConnectPumpDrive::UnownedReturned(returned);
+            };
+            return match settle_returned_dispatch(id, irp_id, returned) {
+                Ok(result) => PortConnectPumpDrive::Returned(result),
+                Err(status) => PortConnectPumpDrive::Rejected(status),
+            };
+        }
+        Ok(hosted_file_dispatch::InvokeResult::ChildWorkYield {
+            invocation, key, continuation,
+        }) => (invocation, Some(key), continuation, true, false),
+        Ok(hosted_file_dispatch::InvokeResult::UnkeyedChildWorkYield {
+            invocation, continuation,
+        }) => (invocation, None, continuation, true, false),
+        Err((invocation, continuation)) => {
+            let retryable = continuation.retry_without_new_child();
+            (invocation, Some(key), continuation, false, retryable)
+        }
+    };
+    let (invocation, next_key, continuation, child_ready, retryable) = yielded;
+    let Some(next_key) = next_key else {
+        return PortConnectPumpDrive::UnownedYield(
+            PortConnectDispatchFailure::UnownedYield {
+                status: nt_status::NtStatus::INVALID_PARAMETER,
+                invocation, continuation,
+            },
+        );
+    };
+    match suspend_dispatch_for_pump(irp_id, invocation, next_key, continuation) {
+        Ok(()) if child_ready => PortConnectPumpDrive::Yielded { irp_id, key: next_key },
+        Ok(()) if retryable => PortConnectPumpDrive::Retained,
+        Ok(()) => {
+            let _ = quarantine_dispatch_pump(
+                irp_id, next_key, nt_status::NtStatus::UNSUCCESSFUL,
+            );
+            PortConnectPumpDrive::Blocked
+        }
+        Err((status, invocation, continuation)) => {
+            PortConnectPumpDrive::UnownedYield(PortConnectDispatchFailure::UnownedYield {
+                status, invocation, continuation,
+            })
+        }
+    }
+}
+
 pub(super) enum DispatchResult {
     Returned {
         irp_id: IrpId,
@@ -709,6 +923,42 @@ pub(super) enum DispatchResult {
     },
 }
 
+enum DispatchFailure<Yield> {
+    Status(nt_status::NtStatus),
+    Yield(Yield),
+}
+
+impl<Yield> From<nt_status::NtStatus> for DispatchFailure<Yield> {
+    fn from(status: nt_status::NtStatus) -> Self { Self::Status(status) }
+}
+
+enum PortConnectYield {
+    Keyed {
+        invocation: ExternalFileIrpInvocation,
+        key: ExternalFileIrpPumpKey,
+        continuation: FileDispatchContinuation,
+    },
+    Unkeyed {
+        invocation: ExternalFileIrpInvocation,
+        continuation: FileDispatchContinuation,
+    },
+}
+
+pub(super) enum PortConnectDispatchResult {
+    Returned(DispatchResult),
+    PumpSuspended { irp_id: IrpId, key: ExternalFileIrpPumpKey },
+}
+
+#[must_use = "retain an unowned native yield; it cannot be mapped to a status"]
+pub(super) enum PortConnectDispatchFailure {
+    Status(nt_status::NtStatus),
+    UnownedYield {
+        status: nt_status::NtStatus,
+        invocation: ExternalFileIrpInvocation,
+        continuation: FileDispatchContinuation,
+    },
+}
+
 /// Exact-device callers must authenticate and retain their Device and completion recipient.
 pub(super) fn dispatch(
     caller: nt_process::native_handle::NativeHandleCaller,
@@ -717,7 +967,18 @@ pub(super) fn dispatch(
     initial_output: &[u8],
     policy: ExternalFileIrpDispatchPolicy,
 ) -> Result<DispatchResult, nt_status::NtStatus> {
-    dispatch_with_port_connect(caller, request, input, initial_output, policy, None)
+    match dispatch_with_port_connect(
+        caller, request, input, initial_output, policy, None,
+        |invocation, caller, capture| {
+            Ok::<_, core::convert::Infallible>(
+                hosted_file_dispatch::invoke(invocation, caller, capture),
+            )
+        },
+    ) {
+        Ok(result) => Ok(result),
+        Err(DispatchFailure::Status(status)) => Err(status),
+        Err(DispatchFailure::Yield(never)) => match never {},
+    }
 }
 
 pub(super) fn dispatch_port_connect(
@@ -725,12 +986,46 @@ pub(super) fn dispatch_port_connect(
     request: ExternalFileIrpRequest,
     input: &[u8],
     device: nt_io_manager::DeviceId,
-) -> Result<DispatchResult, nt_status::NtStatus> {
-    dispatch_with_port_connect(
+) -> Result<PortConnectDispatchResult, PortConnectDispatchFailure> {
+    let result = dispatch_with_port_connect(
         caller, request, input, &[],
         ExternalFileIrpDispatchPolicy::MutableMethodNeitherInputAtDevice,
         Some(device),
-    )
+        |invocation, caller, capture| {
+            match hosted_file_dispatch::invoke_suspend_aware(invocation, caller, capture) {
+                hosted_file_dispatch::InvokeResult::Returned(returned) => Ok(returned),
+                hosted_file_dispatch::InvokeResult::ChildWorkYield {
+                    invocation, key, continuation,
+                } => Err(PortConnectYield::Keyed { invocation, key, continuation }),
+                hosted_file_dispatch::InvokeResult::UnkeyedChildWorkYield {
+                    invocation, continuation,
+                } => Err(PortConnectYield::Unkeyed { invocation, continuation }),
+            }
+        },
+    );
+    match result {
+        Ok(returned) => Ok(PortConnectDispatchResult::Returned(returned)),
+        Err(DispatchFailure::Status(status)) => Err(PortConnectDispatchFailure::Status(status)),
+        Err(DispatchFailure::Yield(PortConnectYield::Keyed {
+            invocation, key, continuation,
+        })) => {
+            let irp_id = invocation.irp_id();
+            match suspend_dispatch_for_pump(irp_id, invocation, key, continuation) {
+                Ok(()) => Ok(PortConnectDispatchResult::PumpSuspended { irp_id, key }),
+                Err((status, invocation, continuation)) => {
+                    Err(PortConnectDispatchFailure::UnownedYield {
+                        status, invocation, continuation,
+                    })
+                }
+            }
+        }
+        Err(DispatchFailure::Yield(PortConnectYield::Unkeyed {
+            invocation, continuation,
+        })) => Err(PortConnectDispatchFailure::UnownedYield {
+            status: nt_status::NtStatus::INVALID_PARAMETER,
+            invocation, continuation,
+        }),
+    }
 }
 
 fn trace_port_connect_dispatch(stage: u64, irp: IrpId, device: nt_io_manager::DeviceId) {
@@ -745,14 +1040,19 @@ fn trace_port_connect_dispatch(stage: u64, irp: IrpId, device: nt_io_manager::De
     print_str(b"\n");
 }
 
-fn dispatch_with_port_connect(
+fn dispatch_with_port_connect<Yield>(
     caller: nt_process::native_handle::NativeHandleCaller,
     request: ExternalFileIrpRequest,
     input: &[u8],
     initial_output: &[u8],
     policy: ExternalFileIrpDispatchPolicy,
     port_connect_device: Option<nt_io_manager::DeviceId>,
-) -> Result<DispatchResult, nt_status::NtStatus> {
+    invoke: impl FnOnce(
+        ExternalFileIrpInvocation,
+        nt_process::native_handle::NativeHandleCaller,
+        ExternalFileIrpOutputCapture,
+    ) -> Result<ExternalFileIrpReturn, Yield>,
+) -> Result<DispatchResult, DispatchFailure<Yield>> {
     let major = request.major;
     let mut phase = FileRpcPhaseGuard::new(major);
     let mut scsi_phase = ScsiRpcPhaseGuard::new(major, policy);
@@ -775,16 +1075,16 @@ fn dispatch_with_port_connect(
         Ok(prepared) => prepared,
         Err(status) => {
             remove(id)?;
-            return Err(status);
+            return Err(DispatchFailure::Status(status));
         }
     };
     if let Err(status) = unsafe { bind_pending_scsi_proof_irp(policy, &prepared) } {
         discard(id, prepared)?;
-        return Err(status);
+        return Err(DispatchFailure::Status(status));
     }
     if let Err(status) = capture_route(id, &prepared) {
         discard(id, prepared)?;
-        return Err(status);
+        return Err(DispatchFailure::Status(status));
     }
     // This exact retained stack is the last Executive-side point before a disk provider may
     // enter. A possible installed-media mutation permanently disables metadata read-through.
@@ -796,7 +1096,7 @@ fn dispatch_with_port_connect(
     if let Some(device) = port_connect_device {
         if let Err(status) = mark_port_connect_control(irp_id, device) {
             discard(id, prepared)?;
-            return Err(status);
+            return Err(DispatchFailure::Status(status));
         }
     }
     let invocation = match io_manager_mut().begin_prepared_external_file_irp(prepared) {
@@ -804,7 +1104,7 @@ fn dispatch_with_port_connect(
         Err(rejection) => {
             let (status, prepared) = rejection.into_parts();
             discard(id, prepared)?;
-            return Err(status);
+            return Err(DispatchFailure::Status(status));
         }
     };
     row(id).flight = Flight::Dispatch;
@@ -819,8 +1119,10 @@ fn dispatch_with_port_connect(
     }
     if phase.entered != 0 { phase.invoked = crate::disk_census_ticks(); }
     if scsi_phase.started.is_some() { scsi_phase.invoked = Some(crate::disk_census_ticks()); }
-    let returned =
-        hosted_file_dispatch::invoke(invocation, row(id).caller, policy.output_capture());
+    let returned = match invoke(invocation, row(id).caller, policy.output_capture()) {
+        Ok(returned) => returned,
+        Err(yielded) => return Err(DispatchFailure::Yield(yielded)),
+    };
     if scsi_phase.started.is_some() { scsi_phase.returned = Some(crate::disk_census_ticks()); }
     if phase.entered != 0 {
         phase.returned = crate::disk_census_ticks();
@@ -830,6 +1132,14 @@ fn dispatch_with_port_connect(
     if let Some(device) = port_connect_device {
         trace_port_connect_dispatch(3, irp_id, device);
     }
+    settle_returned_dispatch(id, irp_id, returned).map_err(DispatchFailure::Status)
+}
+
+fn settle_returned_dispatch(
+    id: u64,
+    irp_id: IrpId,
+    returned: ExternalFileIrpReturn,
+) -> Result<DispatchResult, nt_status::NtStatus> {
     let result = match io_manager_mut().finish_external_file_irp(returned) {
         Ok(result) => result,
         Err(rejection) => {

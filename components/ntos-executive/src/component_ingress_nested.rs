@@ -20,6 +20,17 @@ pub(crate) struct ParkedParentHandle {
     identity: NestedExecutionIdentity,
 }
 
+/// Issued only after the exact retained parent has completed every physical restore stage.
+/// Consuming this receipt admits one receive continuation; a selector alone cannot do so.
+#[must_use = "consume when resuming the exact nested child-work receive"]
+pub(crate) struct ChildWorkParentRestored {
+    ticket: NestedRestoreTicket,
+}
+
+impl ChildWorkParentRestored {
+    pub(crate) fn ticket(&self) -> NestedRestoreTicket { self.ticket }
+}
+
 /// Issued only when this park attempt made no physical change, or its abort fully acknowledged.
 /// It names the exact prepared child and cannot be constructed outside this owner module.
 #[must_use = "consume only while cancelling the matching unbound root ingress pass"]
@@ -825,6 +836,54 @@ pub(crate) unsafe fn restore_or_retain(
         retain_restore_refusal(handle);
     }
     result
+}
+
+/// Persist an intentionally parked parent before the pump stack unwinds. This transition has
+/// no physical effect; the exact row keeps the Reply, scope and hold until an outer owner runs
+/// one child and requests its restore. On refusal the move-only handle stays with the caller.
+pub(crate) unsafe fn retain_child_work_parent(
+    handle: &mut Option<ParkedParentHandle>,
+) -> Result<Option<NestedRestoreTicket>, Error> {
+    let Some(ticket) = handle.as_ref() else { return Ok(None) };
+    let parent = (&mut *core::ptr::addr_of_mut!(PARENTS))
+        .get_mut(ticket.index)
+        .and_then(Option::as_mut)
+        .ok_or(Error::Admission)?;
+    if !row_matches(ticket, parent) || parent.root_admission.is_some()
+        || parent.phase != ParentPhase::Parked || !parent.physical.held()
+    {
+        return Err(Error::Admission);
+    }
+    parent.phase = ParentPhase::RestorePending;
+    let selector = ticket.ticket();
+    *handle = None;
+    Ok(Some(selector))
+}
+
+/// A successful physical restore creates a one-use receive receipt. A no-effect refusal stays
+/// retryable in the retained row; uncertain release stays quarantined there.
+pub(crate) unsafe fn restore_child_work_parent(
+    ticket: NestedRestoreTicket,
+) -> Result<ChildWorkParentRestored, Error> {
+    restore_pending_ticket(ticket)?;
+    Ok(ChildWorkParentRestored { ticket })
+}
+
+/// A selected child may have made an uncertain effect. Revoke the exact parked parent's
+/// restore eligibility before dropping the child-step certificate; the physical hold and Reply
+/// remain in this row for diagnosis and later explicit reconciliation.
+pub(crate) unsafe fn quarantine_child_work_parent(
+    ticket: NestedRestoreTicket,
+) -> Result<(), Error> {
+    let parent = (&mut *core::ptr::addr_of_mut!(PARENTS))
+        .get_mut(ticket.index).and_then(Option::as_mut).ok_or(Error::Admission)?;
+    if !ticket_matches(ticket, parent) || parent.phase != ParentPhase::RestorePending
+        || !parent.physical.held()
+    {
+        return Err(Error::Admission);
+    }
+    parent.phase = ParentPhase::Quarantined;
+    Ok(())
 }
 
 /// A root child has a typed positive receipt. It is produced only after every physical parent

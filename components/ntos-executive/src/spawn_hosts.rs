@@ -1363,6 +1363,9 @@ pub(crate) struct PumpChannel {
     /// Snapshot of the shared owner's canonical Reply; admission/adoption refreshes this value.
     /// A parked service retains its exact Reply through the shared owner, never a private pool.
     pub reply_cap: u64,
+    /// Only the typed File continuation may request an intentional child-work handoff. All
+    /// constructed channels begin false; the scheduler sets this on its private working copy.
+    pub(crate) child_work_capable: bool,
     /// win32k only (0 for the FSD): the exact client identity captured when this dispatch was routed.
     /// Event-object broker calls consume both fields from this scoped channel rather than consulting
     /// ambient last-writer state, so a nested GUI dispatch cannot change the outer caller's owner.
@@ -1709,6 +1712,21 @@ impl PumpIngressYield {
     }
 }
 
+/// An intentional child-work handoff. The physical parent, if any, remains in the nested
+/// ingress owner; this copyable selector is never authority to restore its Reply.
+#[derive(Clone, Copy)]
+pub(crate) struct NestedChildWorkYield {
+    pub parent: Option<shared_ingress::owner::runtime::nested::NestedRestoreTicket>,
+}
+
+/// One intentional handoff has one state. A failed SEH settlement fences the same exact
+/// selector; it cannot also remain ready for child dispatch.
+#[derive(Clone, Copy)]
+pub(crate) enum NestedChildWorkState {
+    Ready(NestedChildWorkYield),
+    Quarantined(NestedChildWorkYield),
+}
+
 struct PumpMessage {
     shared_reply: Option<u64>,
     service_finished: bool,
@@ -1725,6 +1743,7 @@ struct PumpMessage {
     service_wait_yield: Option<crate::win32k_glue::ServiceWaitYield>,
     maintenance_yield: Option<crate::win32k_glue::RootMaintenanceYield>,
     nested_restore_yield: Option<shared_ingress::owner::runtime::nested::NestedRestoreTicket>,
+    nested_child_work: Option<NestedChildWorkState>,
     nested_restore_quarantined: Option<shared_ingress::owner::runtime::nested::NestedRestoreTicket>,
 }
 
@@ -1759,6 +1778,7 @@ impl PumpMessage {
             service_wait_yield: None,
             maintenance_yield: None,
             nested_restore_yield: None,
+            nested_child_work: None,
             nested_restore_quarantined: None,
         }
     }
@@ -1793,6 +1813,7 @@ impl PumpMessage {
             service_wait_yield: None,
             maintenance_yield: None,
             nested_restore_yield: None,
+            nested_child_work: None,
             nested_restore_quarantined: None,
         }
     }
@@ -1815,6 +1836,7 @@ impl PumpMessage {
             service_wait_yield: None,
             maintenance_yield: None,
             nested_restore_yield: None,
+            nested_child_work: None,
             nested_restore_quarantined: None,
         }
     }
@@ -1837,6 +1859,7 @@ impl PumpMessage {
             service_wait_yield: None,
             maintenance_yield: None,
             nested_restore_yield: None,
+            nested_child_work: None,
             nested_restore_quarantined: None,
         }
     }
@@ -1849,6 +1872,7 @@ impl PumpMessage {
             service_wait_yield: None,
             maintenance_yield: None,
             nested_restore_yield: None,
+            nested_child_work: None,
             nested_restore_quarantined: None,
         }
     }
@@ -1868,6 +1892,7 @@ impl PumpMessage {
             service_wait_yield: Some(yielded),
             maintenance_yield: None,
             nested_restore_yield: None,
+            nested_child_work: None,
             nested_restore_quarantined: None,
         }
     }
@@ -1879,6 +1904,7 @@ impl PumpMessage {
             scheduler_yield: false, ingress_yield: None,
             service_wait_yield: None, maintenance_yield: Some(yielded),
             nested_restore_yield: None,
+            nested_child_work: None,
             nested_restore_quarantined: None,
         }
     }
@@ -1887,6 +1913,13 @@ impl PumpMessage {
         let mut message = Self::transport_wall();
         message.mi = 0;
         message.nested_restore_yield = Some(ticket);
+        message
+    }
+
+    fn nested_child_work_yield(parent: Option<shared_ingress::owner::runtime::nested::NestedRestoreTicket>) -> Self {
+        let mut message = Self::transport_wall();
+        message.mi = 0;
+        message.nested_child_work = Some(NestedChildWorkState::Ready(NestedChildWorkYield { parent }));
         message
     }
 
@@ -1948,6 +1981,7 @@ struct PumpLoopOutcome {
     service_wait_yield: Option<crate::win32k_glue::ServiceWaitYield>,
     maintenance_yield: Option<crate::win32k_glue::RootMaintenanceYield>,
     nested_restore_yield: Option<shared_ingress::owner::runtime::nested::NestedRestoreTicket>,
+    nested_child_work: Option<NestedChildWorkState>,
     nested_restore_quarantined: Option<shared_ingress::owner::runtime::nested::NestedRestoreTicket>,
     nested_restore_seh_retained: bool,
     wall_ip: u64,
@@ -1981,6 +2015,7 @@ impl PumpLoopOutcome {
             service_wait_yield: None,
             maintenance_yield: None,
             nested_restore_yield: None,
+            nested_child_work: None,
             nested_restore_quarantined: None,
             nested_restore_seh_retained: false,
             wall_ip: 0,
@@ -2179,6 +2214,9 @@ pub(crate) struct PumpResult {
     pub maintenance_yield: Option<crate::win32k_glue::RootMaintenanceYield>,
     /// Exact parked-parent selector; the physical owner retains the Reply and restoration state.
     pub nested_restore_yield: Option<shared_ingress::owner::runtime::nested::NestedRestoreTicket>,
+    /// Intentional child work is selected outside this pump's stack. A ticket only locates the
+    /// parked parent; the native owner must authenticate its physical identity before restore.
+    pub nested_child_work: Option<NestedChildWorkState>,
     /// An uncertain restore is fenced by its owner and must never be retried or redispatched.
     pub nested_restore_quarantined: Option<shared_ingress::owner::runtime::nested::NestedRestoreTicket>,
     /// The exact exception walk lease is retained with this receive half across parent restore.
@@ -2222,6 +2260,7 @@ impl PumpResult {
             service_wait_yield: None,
             maintenance_yield: None,
             nested_restore_yield: None,
+            nested_child_work: None,
             nested_restore_quarantined: None,
             nested_restore_seh_retained: false,
             wall_ip: 0,
@@ -2243,6 +2282,7 @@ impl PumpResult {
             && self.service_wait_yield.is_none()
             && self.maintenance_yield.is_none()
             && self.nested_restore_yield.is_none()
+            && self.nested_child_work.is_none()
             && self.nested_restore_quarantined.is_none()
             && !self.completed
             && !self.callback_suspended
@@ -2257,6 +2297,7 @@ impl PumpResult {
             && self.root_ingress_yield().is_none()
             && self.maintenance_yield.is_none()
             && self.nested_restore_yield.is_none()
+            && self.nested_child_work.is_none()
             && self.nested_restore_quarantined.is_none()
             && !self.scheduler_yielded
             && !self.completed
@@ -2590,6 +2631,7 @@ pub(crate) unsafe fn component_pump_continue_root_maintenance(
         || previous.receive_yield().is_some() || previous.root_ingress_yield().is_some()
         || previous.service_wait_yield.is_some()
         || previous.nested_restore_yield.is_some()
+        || previous.nested_child_work.is_some()
         || previous.nested_restore_quarantined.is_some()
         || previous.scheduler_yielded
     {
@@ -2615,6 +2657,7 @@ pub(crate) unsafe fn component_pump_continue_root_ingress_after_unwind(
         || previous.provider_wait_suspended || previous.lpc_wait_suspended
         || previous.receive_yield().is_some() || previous.service_wait_yield.is_some()
         || previous.maintenance_yield.is_some() || previous.nested_restore_yield.is_some()
+        || previous.nested_child_work.is_some()
         || previous.nested_restore_quarantined.is_some() || previous.scheduler_yielded
     {
         return Err(nt_process::STATUS_INVALID_PARAMETER);
@@ -2649,6 +2692,7 @@ pub(crate) unsafe fn component_pump_restore_nested_parent(
         || previous.scheduler_yielded || previous.receive_yield().is_some()
         || previous.root_ingress_yield().is_some()
         || previous.service_wait_yield.is_some() || previous.maintenance_yield.is_some()
+        || previous.nested_child_work.is_some()
         || previous.nested_restore_quarantined.is_some()
         || !runtime::nested::ticket_matches_channel(ticket, route, previous.reply_cap)
     {
@@ -2686,6 +2730,49 @@ pub(crate) unsafe fn component_pump_continue_nested_restore_receive(
     component_pump_continue_receive_half(
         ch, previous, false, previous.nested_restore_seh_retained, true,
     )
+}
+
+/// Continue only the receive half of an intentional child-work handoff. The outer owner must
+/// first run one child and physically restore the exact inner parent. A refusal returns the
+/// positive restore receipt to that owner, so it can retry without replaying ReplyRequest.
+pub(crate) unsafe fn component_pump_continue_nested_child_work_receive(
+    ch: &PumpChannel,
+    previous: &PumpResult,
+    restored: Option<shared_ingress::owner::runtime::nested::ChildWorkParentRestored>,
+) -> Result<PumpResult, (u32, Option<shared_ingress::owner::runtime::nested::ChildWorkParentRestored>)> {
+    use shared_ingress::owner::runtime;
+    let Some(NestedChildWorkState::Ready(yielded)) = previous.nested_child_work else {
+        return Err((nt_process::STATUS_INVALID_PARAMETER, restored));
+    };
+    let route = match runtime::channel_route(ch) {
+        Ok(Some(route)) => route,
+        _ => return Err((nt_process::STATUS_INVALID_PARAMETER, restored)),
+    };
+    let parent_matches = match (yielded.parent, restored.as_ref()) {
+        (None, None) => true,
+        (Some(ticket), Some(receipt)) => ticket == receipt.ticket()
+            && ticket.identity().route() == route
+            && ticket.identity().dispatch() == match runtime::dispatch(route) {
+                Ok(dispatch) => dispatch,
+                Err(_) => return Err((nt_process::STATUS_INVALID_PARAMETER, restored)),
+            },
+        _ => false,
+    };
+    if !parent_matches || previous.reply_cap == 0 || previous.reply_cap != ch.reply_cap
+        || runtime::current_reply(route).ok() != Some(previous.reply_cap)
+        || previous.completed || previous.callback_suspended
+        || previous.provider_wait_suspended || previous.lpc_wait_suspended
+        || previous.scheduler_yielded || previous.receive_yield().is_some()
+        || previous.root_ingress_yield().is_some()
+        || previous.service_wait_yield.is_some() || previous.maintenance_yield.is_some()
+        || previous.nested_restore_yield.is_some()
+        || previous.nested_restore_quarantined.is_some()
+    {
+        return Err((nt_process::STATUS_INVALID_PARAMETER, restored));
+    }
+    component_pump_continue_receive_half(
+        ch, previous, false, previous.nested_restore_seh_retained, true,
+    ).map_err(|status| (status, restored))
 }
 
 unsafe fn component_pump_continue_receive_half(
@@ -2731,6 +2818,10 @@ unsafe fn component_pump_continue_receive_half(
             "receive yield retained with failed SEH retirement");
         if let Some(ticket) = outcome.nested_restore_yield.take() {
             outcome.nested_restore_quarantined = Some(ticket);
+            outcome.nested_restore_seh_retained = false;
+        }
+        if let Some(NestedChildWorkState::Ready(yielded)) = outcome.nested_child_work {
+            outcome.nested_child_work = Some(NestedChildWorkState::Quarantined(yielded));
             outcome.nested_restore_seh_retained = false;
         }
         outcome.callback_suspended = false;
@@ -2892,6 +2983,10 @@ unsafe fn component_pump_enter(
             outcome.nested_restore_quarantined = Some(ticket);
             outcome.nested_restore_seh_retained = false;
         }
+        if let Some(NestedChildWorkState::Ready(yielded)) = outcome.nested_child_work {
+            outcome.nested_child_work = Some(NestedChildWorkState::Quarantined(yielded));
+            outcome.nested_restore_seh_retained = false;
+        }
         outcome.callback_suspended = false;
         outcome.provider_wait_suspended = false;
         outcome.lpc_wait_suspended = false;
@@ -2997,6 +3092,13 @@ unsafe fn component_pump_loop(
         if let Some(ticket) = msg.nested_restore_yield {
             outcome.nested_restore_yield = Some(ticket);
             outcome.nested_restore_seh_retained = seh.retained();
+            break;
+        }
+        if let Some(child_work) = msg.nested_child_work {
+            outcome.nested_child_work = Some(child_work);
+            if matches!(child_work, NestedChildWorkState::Ready(_)) {
+                outcome.nested_restore_seh_retained = seh.retained();
+            }
             break;
         }
         if let Some(ticket) = msg.nested_restore_quarantined {
@@ -6037,6 +6139,7 @@ unsafe fn pump_finish_slice(
             || outcome.root_ingress_yield().is_some()
             || outcome.service_wait_yield.is_some() || outcome.maintenance_yield.is_some()
             || outcome.nested_restore_yield.is_some()
+            || outcome.nested_child_work.is_some()
             || outcome.nested_restore_quarantined.is_some(),
         outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended,
     ) {
@@ -6066,6 +6169,7 @@ unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutco
         && outcome.service_wait_yield.is_none()
         && outcome.maintenance_yield.is_none()
         && outcome.nested_restore_yield.is_none()
+        && outcome.nested_child_work.is_none()
         && outcome.nested_restore_quarantined.is_none()
     {
         pump_wall_state_diag(ch, outcome);
@@ -6149,6 +6253,7 @@ unsafe fn pump_result_from_outcome(
         || outcome.service_wait_yield.is_some()
         || outcome.maintenance_yield.is_some()
         || outcome.nested_restore_yield.is_some()
+        || matches!(outcome.nested_child_work, Some(NestedChildWorkState::Ready(_)))
     {
         let status = nt_user_callback::STATUS_PENDING;
         (status, status as u32 as u64)
@@ -6180,6 +6285,7 @@ unsafe fn pump_result_from_outcome(
         service_wait_yield: outcome.service_wait_yield,
         maintenance_yield: outcome.maintenance_yield,
         nested_restore_yield: outcome.nested_restore_yield,
+        nested_child_work: outcome.nested_child_work,
         nested_restore_quarantined: outcome.nested_restore_quarantined,
         nested_restore_seh_retained: outcome.nested_restore_seh_retained,
         wall_ip: outcome.wall_ip,

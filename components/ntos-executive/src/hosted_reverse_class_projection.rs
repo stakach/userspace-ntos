@@ -520,6 +520,7 @@ pub(super) unsafe fn dispatch_configure(
         initial: crate::spawn_hosts::InitialAction::ReplyRequest,
         tcb: inst.tcb,
         reply_cap: inst.reply_cap,
+        child_work_capable: false,
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,

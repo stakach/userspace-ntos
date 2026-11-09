@@ -76,3 +76,41 @@ fn durable_context_lease_find_active_uses_nearest_matching_nested_binding() {
     assert_eq!(leases.find_active(|(instance, _)| *instance == 1), Some(&(1, "outer")));
     assert_eq!(leases.find_active(|(instance, _)| *instance == 3), None);
 }
+
+#[test]
+fn retained_shared_bank_remains_exclusive_while_its_transfer_is_unbound() {
+    let mut leases = DurableContextLeases::<u64, (usize, &'static str)>::new();
+    let first = leases.reserve().unwrap();
+    let outer = leases
+        .retain_exclusive_by(first, 1, (0x1000, "outer"), |(bank, _)| *bank == 0x1000)
+        .unwrap();
+    leases.bind(outer).unwrap();
+    leases.unbind(outer).unwrap();
+
+    // A suspended parent still owns this physical page even though another transfer can
+    // bind a different page. A distinct key or generation cannot authorize its overwrite.
+    let duplicate = leases.reserve().unwrap();
+    assert_eq!(
+        leases.retain_exclusive_by(duplicate, 2, (0x1000, "duplicate"), |(bank, _)| *bank == 0x1000),
+        Err((DurableContextLeaseError::ConflictingRetained, (0x1000, "duplicate"))),
+    );
+    assert_eq!(leases.get(outer), Some(&(0x1000, "outer")));
+    assert!(leases.cancel_reservation(duplicate));
+
+    let different = leases.reserve().unwrap();
+    let inner = leases
+        .retain_exclusive_by(different, 3, (0x2000, "inner"), |(bank, _)| *bank == 0x2000)
+        .unwrap();
+    leases.bind(inner).unwrap();
+    assert_eq!(leases.active(), Some(&(0x2000, "inner")));
+    leases.unbind(inner).unwrap();
+    assert_eq!(leases.retire(inner), Ok((0x2000, "inner")));
+
+    assert_eq!(leases.retire(outer), Ok((0x1000, "outer")));
+    let recycled = leases.reserve().unwrap();
+    let replacement = leases
+        .retain_exclusive_by(recycled, 2, (0x1000, "replacement"), |(bank, _)| *bank == 0x1000)
+        .unwrap();
+    assert_ne!(outer, replacement);
+    assert_eq!(leases.get(replacement), Some(&(0x1000, "replacement")));
+}

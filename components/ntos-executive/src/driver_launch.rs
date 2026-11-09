@@ -33228,6 +33228,7 @@ unsafe fn dispatch_hosted_provider_export_legacy(
         initial: crate::spawn_hosts::InitialAction::ReplyRequest,
         tcb: provider_inst.tcb,
         reply_cap: provider_inst.reply_cap,
+        child_work_capable: false,
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
@@ -33784,6 +33785,7 @@ unsafe fn dispatch_hosted_component_target(
         initial: crate::spawn_hosts::InitialAction::ReplyRequest,
         tcb: inst.tcb,
         reply_cap: inst.reply_cap,
+        child_work_capable: false,
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
@@ -42786,6 +42788,7 @@ unsafe fn load_driver_reserved(
         initial: crate::spawn_hosts::InitialAction::RecvFirst,
         tcb,
         reply_cap,
+        child_work_capable: false,
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
@@ -51390,8 +51393,13 @@ type HostedDeviceContextLeases = nt_user_host::durable_context_lease::DurableCon
 
 static mut HOSTED_DEVICE_DISPATCH_CONTEXTS: Option<HostedDeviceContextLeases> = None;
 
-struct HostedDeviceDispatchContextGuard {
+#[must_use = "resume or retain this exact device dispatch context"]
+struct SuspendedHostedDeviceDispatchContext {
     ticket: HostedDeviceContextTicket,
+}
+
+struct HostedDeviceDispatchContextGuard {
+    ticket: Option<HostedDeviceContextTicket>,
 }
 
 impl HostedDeviceDispatchContextGuard {
@@ -51435,17 +51443,58 @@ impl HostedDeviceDispatchContextGuard {
             let _ = contexts.retire(ticket);
             return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
         }
-        Ok(Self { ticket })
+        Ok(Self { ticket: Some(ticket) })
+    }
+
+    /// End only this active binding. The generation-keyed row continues to own the context.
+    unsafe fn suspend(mut self) -> Result<SuspendedHostedDeviceDispatchContext, (nt_status::NtStatus, Self)> {
+        let ticket = self.ticket.expect("active device dispatch context missing ticket");
+        if hosted_device_dispatch_contexts_mut().unbind(ticket).is_err() {
+            return Err((nt_status::NtStatus::INVALID_PARAMETER, self));
+        }
+        self.ticket = None;
+        Ok(SuspendedHostedDeviceDispatchContext { ticket })
+    }
+
+    /// A recycled slot or changed device publication cannot acquire the old binding.
+    unsafe fn resume(
+        suspended: SuspendedHostedDeviceDispatchContext,
+    ) -> Result<Self, (nt_status::NtStatus, SuspendedHostedDeviceDispatchContext)> {
+        let contexts = hosted_device_dispatch_contexts_mut();
+        let ticket = suspended.ticket;
+        let Some(context) = contexts.get(ticket) else {
+            return Err((nt_status::NtStatus::INVALID_PARAMETER, suspended));
+        };
+        let binding = context.binding;
+        if ticket.key() != (context.instance, binding.device_id)
+            || !binding.used
+            || binding.instance != context.instance
+            || hosted_device_binding_by_device_id(binding.device_id) != Some(binding)
+            || hosted_driver_device_route_by_device_id(binding.device_id).is_none_or(
+                |(route_instance, route_inst, route_object)| {
+                    route_instance != context.instance
+                        || route_inst.driver_id != binding.driver_id
+                        || route_object != binding.device_object
+                },
+            )
+        {
+            return Err((nt_status::NtStatus::DEVICE_NOT_CONNECTED, suspended));
+        }
+        if contexts.bind(ticket).is_err() {
+            return Err((nt_status::NtStatus::INSUFFICIENT_RESOURCES, suspended));
+        }
+        Ok(Self { ticket: Some(ticket) })
     }
 }
 
 impl Drop for HostedDeviceDispatchContextGuard {
     fn drop(&mut self) {
+        let Some(ticket) = self.ticket.take() else { return; };
         unsafe {
             let contexts = hosted_device_dispatch_contexts_mut();
-            contexts.unbind(self.ticket)
+            contexts.unbind(ticket)
                 .expect("hosted device dispatch context stack lost LIFO ownership");
-            contexts.retire(self.ticket)
+            contexts.retire(ticket)
                 .expect("hosted device dispatch context lost its exact owner");
         }
     }
@@ -57648,6 +57697,7 @@ unsafe fn hosted_irq_lane_channel(
         initial: crate::spawn_hosts::InitialAction::RecvFirst,
         tcb: lane.tcb,
         reply_cap: binding.reply_object,
+        child_work_capable: false,
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
@@ -62574,6 +62624,7 @@ struct ActiveHostedIrpTransfer {
     shared_va: u64,
     transfer_id: u64,
     source_instance: usize,
+    source_domain: Option<HostedDomainIdentity>,
     requestor_thread: Option<nt_process::ThreadLifetime>,
     create_subject: Option<hosted_source_create_security::SourceSecurityIdentity>,
     /// Set only by the root after exact op6 source registration succeeds. The component calls
@@ -62609,30 +62660,69 @@ unsafe fn reserve_active_hosted_irp_transfer_slot() -> Result<(), nt_status::NtS
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)
 }
 
-struct ActiveHostedIrpTransferGuard {
+#[must_use = "resume or retain this exact hosted IRP transfer"]
+struct SuspendedActiveHostedIrpTransfer {
     ticket: ActiveHostedIrpTransferTicket,
 }
 
+struct ActiveHostedIrpTransferGuard {
+    ticket: Option<ActiveHostedIrpTransferTicket>,
+}
+
 impl ActiveHostedIrpTransferGuard {
+    /// Keep the bank and cursors in the retained row while another pump slice runs.
+    fn suspend(mut self) -> Result<SuspendedActiveHostedIrpTransfer, (nt_status::NtStatus, Self)> {
+        let ticket = self.ticket.expect("active hosted IRP transfer missing ticket");
+        if unsafe { active_hosted_irp_transfers_mut().unbind(ticket) }.is_err() {
+            return Err((nt_status::NtStatus::INVALID_PARAMETER, self));
+        }
+        self.ticket = None;
+        Ok(SuspendedActiveHostedIrpTransfer { ticket })
+    }
+
+    /// Rebind the same retained bank only if its exact source domain and transfer key remain live.
+    unsafe fn resume(
+        suspended: SuspendedActiveHostedIrpTransfer,
+    ) -> Result<Self, (nt_status::NtStatus, SuspendedActiveHostedIrpTransfer)> {
+        let transfers = active_hosted_irp_transfers_mut();
+        let ticket = suspended.ticket;
+        let Some(transfer) = transfers.get(ticket) else {
+            return Err((nt_status::NtStatus::INVALID_PARAMETER, suspended));
+        };
+        if ticket.key() != (transfer.shared_va, transfer.transfer_id, transfer.source_instance)
+            || transfer.source_domain.is_none()
+            || instance(transfer.source_instance)
+                .and_then(instance_domain_identity) != transfer.source_domain
+        {
+            return Err((nt_status::NtStatus::DEVICE_NOT_CONNECTED, suspended));
+        }
+        if transfers.bind(ticket).is_err() {
+            return Err((nt_status::NtStatus::INSUFFICIENT_RESOURCES, suspended));
+        }
+        Ok(Self { ticket: Some(ticket) })
+    }
+
     /// Bank pushes write the owned buffer. Publish their bytes to the original caller while its
     /// output slice is still live, including a partial write before an uncertain pump result.
     unsafe fn copy_output_to(&self, output: &mut [u8]) {
         let transfers = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
             .as_ref()
             .expect("active hosted IRP transfer stack disappeared");
-        assert_eq!(transfers.active_ticket(), Some(self.ticket));
-        let active = transfers.get(self.ticket).expect("active hosted IRP transfer disappeared");
+        let ticket = self.ticket.expect("suspended hosted IRP transfer cannot copy output");
+        assert_eq!(transfers.active_ticket(), Some(ticket));
+        let active = transfers.get(ticket).expect("active hosted IRP transfer disappeared");
         active.banks.copy_output_to(output);
     }
 }
 
 impl Drop for ActiveHostedIrpTransferGuard {
     fn drop(&mut self) {
+        let Some(ticket) = self.ticket.take() else { return; };
         unsafe {
             let transfers = active_hosted_irp_transfers_mut();
-            transfers.unbind(self.ticket)
+            transfers.unbind(ticket)
                 .expect("active hosted IRP transfer stack lost LIFO ownership");
-            transfers.retire(self.ticket)
+            transfers.retire(ticket)
                 .expect("active hosted IRP transfer lost its exact owner");
         }
     }
@@ -62647,17 +62737,19 @@ unsafe fn enter_active_hosted_irp_transfer(
     file_create: Option<(FileId, HostedDomainIdentity)>,
     input: &[u8],
     output: &mut [u8],
-) -> Option<ActiveHostedIrpTransferGuard> {
+) -> Result<ActiveHostedIrpTransferGuard, nt_status::NtStatus> {
     let transfers = active_hosted_irp_transfers_mut();
-    let reservation = transfers.reserve().ok()?;
+    let reservation = transfers.reserve()
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let Some(banks) = hosted_irp_banks::HostedIrpBanks::new(input, output) else {
         let _ = transfers.cancel_reservation(reservation);
-        return None;
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     };
     let transfer = ActiveHostedIrpTransfer {
         shared_va,
         transfer_id,
         source_instance,
+        source_domain: instance(source_instance).and_then(instance_domain_identity),
         requestor_thread,
         create_subject: None,
         source_registered: false,
@@ -62671,20 +62763,25 @@ unsafe fn enter_active_hosted_irp_transfer(
         diagnostic_file_rpc: measure_bank
             && hosted_file_owners::file_read_write_dispatch_for_diagnostic(IrpId(transfer_id)),
     };
-    let ticket = match transfers.retain(
+    let ticket = match transfers.retain_exclusive_by(
         reservation, (shared_va, transfer_id, source_instance), transfer,
+        |held| held.shared_va == shared_va,
     ) {
         Ok(ticket) => ticket,
-        Err(_) => {
+        Err((error, _transfer)) => {
             let _ = transfers.cancel_reservation(reservation);
-            return None;
+            return Err(if error == nt_user_host::durable_context_lease::DurableContextLeaseError::ConflictingRetained {
+                nt_status::NtStatus::DEVICE_BUSY
+            } else {
+                nt_status::NtStatus::INSUFFICIENT_RESOURCES
+            });
         }
     };
     if transfers.bind(ticket).is_err() {
         let _ = transfers.retire(ticket);
-        return None;
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     }
-    Some(ActiveHostedIrpTransferGuard { ticket })
+    Ok(ActiveHostedIrpTransferGuard { ticket: Some(ticket) })
 }
 
 unsafe fn active_hosted_irp_transfer_mut(
@@ -64427,6 +64524,7 @@ pub(crate) unsafe fn autonomous_pump_channel(
         shared_va: inst.exec_shared_va, dispatch_label: FSD_DISPATCH_LABEL,
         demand_cap: 512, trace_faults: true, initial: crate::spawn_hosts::InitialAction::RecvFirst,
         tcb: source.tcb, reply_cap: runtime::current_reply(route).ok()?,
+        child_work_capable: false,
         client_pi: 0, client_generation: 0, logical_caller: None, kernel_caller: None,
         caps: crate::spawn_hosts::HostCaps { kind: crate::spawn_hosts::ReqKind::Irp,
             ..crate::spawn_hosts::HostCaps::default() },
@@ -69334,6 +69432,7 @@ unsafe fn dispatch_driver_unload_for_instance(
         initial: crate::spawn_hosts::InitialAction::ReplyRequest,
         tcb: inst.tcb,
         reply_cap: inst.reply_cap,
+        child_work_capable: false,
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
@@ -69411,6 +69510,7 @@ unsafe fn dispatch_device_projection_control_for_instance(
         initial: crate::spawn_hosts::InitialAction::ReplyRequest,
         tcb: inst.tcb,
         reply_cap: inst.reply_cap,
+        child_work_capable: false,
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
@@ -69550,6 +69650,7 @@ unsafe fn dispatch_video_add_device_for_instance(
         initial: crate::spawn_hosts::InitialAction::ReplyRequest,
         tcb: inst.tcb,
         reply_cap: inst.reply_cap,
+        child_work_capable: false,
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
@@ -69630,6 +69731,7 @@ unsafe fn dispatch_provider_add_device_for_instance(
         initial: crate::spawn_hosts::InitialAction::ReplyRequest,
         tcb: provider_inst.tcb,
         reply_cap: provider_inst.reply_cap,
+        child_work_capable: false,
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
@@ -69716,6 +69818,7 @@ unsafe fn dispatch_add_device_for_instance(
         initial: crate::spawn_hosts::InitialAction::ReplyRequest,
         tcb: inst.tcb,
         reply_cap: inst.reply_cap,
+        child_work_capable: false,
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
@@ -71570,6 +71673,7 @@ unsafe fn dispatch_video_find_adapter_pnp_for_instance(
         initial: crate::spawn_hosts::InitialAction::ReplyRequest,
         tcb: inst.tcb,
         reply_cap: inst.reply_cap,
+        child_work_capable: false,
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
@@ -73536,7 +73640,281 @@ fn print_scsi_srb_pump_timing() {
     }
 }
 
+/// Root's outer loop drives selected connect work without borrowing a File invocation.
+pub(crate) use hosted_connect_live::PortConnectPumpProgress;
+
+pub(crate) fn claim_suspended_port_connect_pump(
+) -> Option<hosted_connect_live::PortConnectPumpSelector> {
+    hosted_connect_live::claim_suspended_port_connect_pump()
+}
+
+pub(crate) unsafe fn redrive_suspended_connect_pump(
+    selector: hosted_connect_live::PortConnectPumpSelector,
+    step: crate::service_sec_image::NestedChildStep,
+) -> hosted_connect_live::PortConnectPumpProgress {
+    hosted_connect_live::redrive_suspended_connect_pump(selector, step)
+}
+
+pub(crate) unsafe fn redrive_retryable_connect_pump(
+) -> hosted_connect_live::PortConnectPumpProgress {
+    hosted_connect_live::redrive_retryable_connect_pump()
+}
+
+pub(crate) fn unsettled_suspended_connect_pump() -> bool {
+    hosted_connect_live::unsettled_suspended_connect_pump()
+}
+
+enum FileTransferOwner {
+    Active(ActiveHostedIrpTransferGuard),
+    Suspended(SuspendedActiveHostedIrpTransfer),
+}
+
+enum FileDeviceContextOwner {
+    Active(HostedDeviceDispatchContextGuard),
+    Suspended(SuspendedHostedDeviceDispatchContext),
+}
+
+/// The native half of an entered File dispatch. This is move-only because a yielded pump may
+/// resume its exact receive half once; an epoch is a lookup witness, never Reply authority.
+#[must_use = "retain until the exact File pump resumes or is quarantined"]
+pub(super) struct FileIrpPumpContinuation {
+    pump: Option<component_scheduler::HostedPumpRestore>,
+    transfer: Option<FileTransferOwner>,
+    device_context: Option<FileDeviceContextOwner>,
+    active_dispatch: ActiveHostedDispatchDiagnosticGuard,
+    class_selection: Option<hosted_class_irp_lane::Selection>,
+    scsi_timing: ScsiSrbPumpTiming,
+    dispatch_seq: u64,
+    dispatch_index: usize,
+    dependent_inst: DriverInstance,
+    d: DriverInstance,
+    inst: usize,
+    shared_va: u64,
+    ingress_route: nt_component_suspension::peer_registry::PeerRoute,
+    executor_tcb: u64,
+    canonical_irp_id: u64,
+    major: u64,
+    fsctl: u64,
+    provider_binding: Option<HostedDeviceBinding>,
+    dispatch_request: Option<IrpDispatchRequest>,
+    bugchecks_before: u64,
+    trace_connect_pump: bool,
+    class_hook_request: bool,
+    class_hook_control: bool,
+    connect_ack_control: bool,
+    measure_rpc: bool,
+    pump_started: u64,
+    trace_dispatch: bool,
+    ready_for_child: bool,
+    child_step: Option<crate::service_sec_image::NestedChildStep>,
+}
+
+impl FileIrpPumpContinuation {
+    pub(super) const fn epoch(&self) -> u64 { self.dispatch_seq }
+
+    /// Release only the active stack bindings. The retained lease rows still own the physical
+    /// request bank and device context; a failed unbind fences child admission.
+    unsafe fn suspend_bindings(&mut self) {
+        if let Some(owner) = self.transfer.take() {
+            self.transfer = Some(match owner {
+                FileTransferOwner::Suspended(ticket) => FileTransferOwner::Suspended(ticket),
+                FileTransferOwner::Active(guard) => match guard.suspend() {
+                Ok(ticket) => FileTransferOwner::Suspended(ticket),
+                Err((_, guard)) => {
+                    self.ready_for_child = false;
+                    FileTransferOwner::Active(guard)
+                }
+                },
+            });
+        }
+        if let Some(owner) = self.device_context.take() {
+            self.device_context = Some(match owner {
+                FileDeviceContextOwner::Suspended(ticket) => FileDeviceContextOwner::Suspended(ticket),
+                FileDeviceContextOwner::Active(guard) => match guard.suspend() {
+                Ok(ticket) => FileDeviceContextOwner::Suspended(ticket),
+                Err((_, guard)) => {
+                    self.ready_for_child = false;
+                    FileDeviceContextOwner::Active(guard)
+                }
+                },
+            });
+        }
+    }
+
+    pub(super) const fn child_work_ready(&self) -> bool { self.ready_for_child }
+
+    pub(super) fn restore_retryable(&self) -> bool {
+        matches!(self.pump.as_ref(),
+            Some(component_scheduler::HostedPumpRestore::ChildWorkPending(pending))
+                if pending.retryable())
+    }
+
+    /// Retry a saved child observation or a scheduler refusal without selecting another child.
+    pub(super) fn retry_without_new_child(&self) -> bool {
+        self.child_step.is_some() || self.restore_retryable()
+    }
+
+    /// A child is selected at the outer root boundary, after this File's Rust stack unwound.
+    /// The sealed observation is retained here so a later restore refusal cannot run it twice.
+    pub(super) fn record_child_step(
+        &mut self,
+        step: crate::service_sec_image::NestedChildStep,
+    ) -> Result<(), crate::service_sec_image::NestedChildStep> {
+        if !self.ready_for_child || self.child_step.is_some()
+            || !matches!(self.pump.as_ref(),
+                Some(component_scheduler::HostedPumpRestore::ChildWorkReady { .. }))
+        {
+            return Err(step);
+        }
+        self.ready_for_child = false;
+        self.child_step = Some(step);
+        Ok(())
+    }
+
+    /// Bind only the same generation-keyed rows. A refusal leaves the move-only ticket here;
+    /// the receive half is not entered and can be retried without replaying ReplyRequest.
+    unsafe fn rebind_bindings(&mut self) -> Result<(), nt_status::NtStatus> {
+        if let Some(owner) = self.transfer.take() {
+            self.transfer = Some(match owner {
+                FileTransferOwner::Active(guard) => FileTransferOwner::Active(guard),
+                FileTransferOwner::Suspended(ticket) => {
+                    match ActiveHostedIrpTransferGuard::resume(ticket) {
+                        Ok(guard) => FileTransferOwner::Active(guard),
+                        Err((status, ticket)) => {
+                            self.transfer = Some(FileTransferOwner::Suspended(ticket));
+                            return Err(status);
+                        }
+                    }
+                }
+            });
+        }
+        if let Some(owner) = self.device_context.take() {
+            self.device_context = Some(match owner {
+                FileDeviceContextOwner::Active(guard) => FileDeviceContextOwner::Active(guard),
+                FileDeviceContextOwner::Suspended(ticket) => {
+                    match HostedDeviceDispatchContextGuard::resume(ticket) {
+                        Ok(guard) => FileDeviceContextOwner::Active(guard),
+                        Err((status, ticket)) => {
+                            self.device_context = Some(FileDeviceContextOwner::Suspended(ticket));
+                            return Err(status);
+                        }
+                    }
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// Resume the receive half after an outer-loop child step. A physical or SEH refusal
+    /// returns this entire owner to the File row; it never replays the initial ReplyRequest.
+    pub(super) unsafe fn resume_after_child(
+        mut self,
+        out: &mut [u8],
+    ) -> Result<FileIrpResumeProgress, Self> {
+        let can_resume = self.child_step.is_some()
+            || self.restore_retryable();
+        if !can_resume {
+            return Err(self);
+        }
+        if self.rebind_bindings().is_err() {
+            self.suspend_bindings();
+            return Err(self);
+        }
+        let Some(pump) = self.pump.take() else { return Err(self) };
+        let next = if let Some(step) = self.child_step.take() {
+            match component_scheduler::resume_child_work(pump, step) {
+                Ok(next) => next,
+                Err((pump, step)) => {
+                    self.pump = Some(pump);
+                    self.child_step = Some(step);
+                    self.suspend_bindings();
+                    return Err(self);
+                }
+            }
+        } else {
+            component_scheduler::retry_child_work(pump)
+        };
+        match next {
+            component_scheduler::HostedPumpRestore::Restored(_) => {
+                self.pump = Some(next);
+                Ok(FileIrpResumeProgress::Completed(self.finish(out)))
+            }
+            component_scheduler::HostedPumpRestore::ChildWorkReady { .. } => {
+                self.pump = Some(next);
+                self.ready_for_child = true;
+                self.suspend_bindings();
+                Ok(FileIrpResumeProgress::ChildWorkYield(self))
+            }
+            other => {
+                self.pump = Some(other);
+                self.ready_for_child = false;
+                self.suspend_bindings();
+                Err(self)
+            }
+        }
+    }
+}
+
+pub(super) enum HostedIrpDispatchProgress {
+    Returned(Option<HostedIrpTransportResult>),
+    ChildWorkYield(FileIrpPumpContinuation),
+}
+
+/// An entered pump cannot return a no-entry observation. The File row either keeps its entire
+/// continuation or receives a real transport result from the authenticated provider return.
+pub(super) enum FileIrpResumeProgress {
+    Completed(HostedIrpTransportResult),
+    ChildWorkYield(FileIrpPumpContinuation),
+}
+
 unsafe fn dispatch_irp_for_instance_exact(
+    inst: usize,
+    major: u64,
+    minor: u64,
+    device_object: u64,
+    canonical_irp_id: u64,
+    canonical_file_id: u64,
+    fsctl: u64,
+    file_id: u64,
+    requestor_tid: u64,
+    dispatch_request: Option<IrpDispatchRequest>,
+    in_data: &[u8],
+    out: &mut [u8],
+    caller: Option<nt_process::native_handle::NativeHandleCaller>,
+) -> Option<HostedIrpTransportResult> {
+    dispatch_irp_for_instance_exact_inner(
+        inst, major, minor, device_object, canonical_irp_id, canonical_file_id, fsctl, file_id,
+        requestor_tid, dispatch_request, in_data, out, caller, None,
+    )
+}
+
+pub(super) unsafe fn dispatch_irp_for_instance_exact_suspend_aware(
+    inst: usize,
+    major: u64,
+    minor: u64,
+    device_object: u64,
+    canonical_irp_id: u64,
+    canonical_file_id: u64,
+    fsctl: u64,
+    file_id: u64,
+    requestor_tid: u64,
+    dispatch_request: Option<IrpDispatchRequest>,
+    in_data: &[u8],
+    out: &mut [u8],
+    caller: Option<nt_process::native_handle::NativeHandleCaller>,
+) -> HostedIrpDispatchProgress {
+    let mut yielded = None;
+    let result = dispatch_irp_for_instance_exact_inner(
+        inst, major, minor, device_object, canonical_irp_id, canonical_file_id, fsctl, file_id,
+        requestor_tid, dispatch_request, in_data, out, caller, Some(&mut yielded),
+    );
+    match yielded {
+        Some(continuation) => HostedIrpDispatchProgress::ChildWorkYield(continuation),
+        None => HostedIrpDispatchProgress::Returned(result),
+    }
+}
+
+unsafe fn dispatch_irp_for_instance_exact_inner(
     inst: usize,
     major: u64,
     minor: u64,
@@ -73550,7 +73928,13 @@ unsafe fn dispatch_irp_for_instance_exact(
     in_data: &[u8],
     out: &mut [u8],
     caller: Option<nt_process::native_handle::NativeHandleCaller>,
+    yielded: Option<&mut Option<FileIrpPumpContinuation>>,
 ) -> Option<HostedIrpTransportResult> {
+    if yielded.is_some() && caller.is_none() {
+        return Some(HostedIrpTransportResult::NotDispatched {
+            status: nt_status::NtStatus::INVALID_PARAMETER,
+        });
+    }
     if in_data.len() > u32::MAX as usize || out.len() > u32::MAX as usize {
         return Some(HostedIrpTransportResult::NotDispatched {
             status: nt_status::NtStatus(STATUS_INVALID_BUFFER_SIZE as i32),
@@ -73732,6 +74116,55 @@ unsafe fn dispatch_irp_for_instance_exact(
             status: nt_status::NtStatus::DEVICE_BUSY,
         });
     }
+    // Claim the exact physical request page before projection or any SH_REQ publication. A
+    // suspended parent's lease remains held while its binding is absent; a nested dispatch may
+    // use a distinct class worker bank but cannot overwrite the parent's request and File ID.
+    sh = class_selection.as_ref().map_or(sh, |selection| selection.shared);
+    let requestor_thread = if major::is_create_major(major as u8) && requestor_tid != 0 {
+        match crate::service_sec_image::with_provider_process_manager(|pm| {
+            if let Some(caller) = caller {
+                pm.validate_native_handle_caller(caller)?;
+            }
+            let thread = pm.thread_lifetime(requestor_tid as nt_process::ThreadId)
+                .ok_or(STATUS_INVALID_HANDLE as u32)?;
+            if caller.is_some_and(|caller| caller.original_thread() != thread) {
+                return Err(STATUS_INVALID_HANDLE as u32);
+            }
+            Ok(thread)
+        }) {
+            Ok(thread) => Some(thread),
+            Err(status) => {
+                return Some(HostedIrpTransportResult::NotDispatched {
+                    status: nt_status::NtStatus(status as i32),
+                });
+            }
+        }
+    } else {
+        None
+    };
+    let file_create = dispatch_request
+        .filter(|request| major::is_create_major(request.major) && request.file_id != 0)
+        .map(|request| {
+            (
+                FileId(request.file_id),
+                instance_domain_identity(d).expect("validated physical dispatch domain"),
+            )
+        });
+    let transfer_guard = match enter_active_hosted_irp_transfer(
+        sh,
+        canonical_irp_id,
+        dispatch_index,
+        major == major::IRP_MJ_READ as u64 || major == major::IRP_MJ_WRITE as u64,
+        requestor_thread,
+        file_create,
+        in_data,
+        out,
+    ) {
+        Ok(guard) => guard,
+        Err(status) => {
+            return Some(HostedIrpTransportResult::NotDispatched { status });
+        }
+    };
     if let Some(binding) = provider_binding {
         project_provider_device_dispatch_state(binding, dependent_inst.exec_shared_va, d, sh)
         .ok()?;
@@ -73747,9 +74180,6 @@ unsafe fn dispatch_irp_for_instance_exact(
         } else if let Err(status) = restore_hosted_device_resource_state(binding, sh, false) {
             return Some(HostedIrpTransportResult::NotDispatched { status });
         }
-    }
-    if let Some(selection) = class_selection.as_ref() {
-        sh = selection.shared;
     }
     let ep = class_selection.as_ref().map_or(d.fault_ep, |selection| selection.route.endpoint());
     let pml4 = d.pml4;
@@ -73869,6 +74299,7 @@ unsafe fn dispatch_irp_for_instance_exact(
         initial: crate::spawn_hosts::InitialAction::ReplyRequest,
         tcb: class_selection.as_ref().map_or(d.tcb, |selection| selection.tcb),
         reply_cap,
+        child_work_capable: false,
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
@@ -73926,50 +74357,6 @@ unsafe fn dispatch_irp_for_instance_exact(
             });
         }
     }
-    let requestor_thread = if major::is_create_major(major as u8) && requestor_tid != 0 {
-        match crate::service_sec_image::with_provider_process_manager(|pm| {
-            if let Some(caller) = caller {
-                pm.validate_native_handle_caller(caller)?;
-            }
-            let thread = pm.thread_lifetime(requestor_tid as nt_process::ThreadId)
-                .ok_or(STATUS_INVALID_HANDLE as u32)?;
-            if caller.is_some_and(|caller| caller.original_thread() != thread) {
-                return Err(STATUS_INVALID_HANDLE as u32);
-            }
-            Ok(thread)
-        }) {
-            Ok(thread) => Some(thread),
-            Err(status) => {
-                return Some(HostedIrpTransportResult::NotDispatched {
-                status: nt_status::NtStatus(status as i32),
-                })
-            }
-        }
-    } else {
-        None
-    };
-    let file_create = dispatch_request
-        .filter(|request| major::is_create_major(request.major) && request.file_id != 0)
-        .map(|request| {
-            (
-                FileId(request.file_id),
-                instance_domain_identity(d).expect("validated physical dispatch domain"),
-            )
-        });
-    let Some(transfer_guard) = enter_active_hosted_irp_transfer(
-        sh,
-        canonical_irp_id,
-        dispatch_index,
-        major == major::IRP_MJ_READ as u64 || major == major::IRP_MJ_WRITE as u64,
-        requestor_thread,
-        file_create,
-        in_data,
-        out,
-    ) else {
-        return Some(HostedIrpTransportResult::NotDispatched {
-            status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
-        });
-    };
     let mut scsi_srb_pump_timing = ScsiSrbPumpTiming::new(dispatch_request.as_ref()
         .is_some_and(|request| request._reserved0 == nt_io_abi::IRP_DISPATCH_SCSI_SRB));
     let bugchecks_before = FSD_BUGCHECKS.load(Ordering::Relaxed);
@@ -74037,13 +74424,88 @@ unsafe fn dispatch_irp_for_instance_exact(
             entered_ticks: crate::disk_census_ticks(),
         }));
     scsi_srb_pump_timing.enter_pump();
-    let pr = match (scsi_srb_pump_owner.as_ref(), caller) {
-        (Some(owner), caller) => component_scheduler::hosted_component_pump_observed(&ch, caller, owner),
-        (None, Some(caller)) => component_scheduler::hosted_component_pump_with_caller(&ch, caller),
-        (None, None) => hosted_component_pump(&ch),
+    let pump = match (yielded.is_some(), scsi_srb_pump_owner.as_ref(), caller) {
+        (true, Some(owner), Some(caller)) =>
+            component_scheduler::hosted_component_pump_observed_child_work(&ch, Some(caller), owner),
+        (true, None, Some(caller)) =>
+            component_scheduler::hosted_component_pump_with_caller_child_work(&ch, caller),
+        (false, Some(owner), caller) =>
+            component_scheduler::HostedPumpRestore::Restored(
+                component_scheduler::hosted_component_pump_observed(&ch, caller, owner)),
+        (false, None, Some(caller)) =>
+            component_scheduler::HostedPumpRestore::Restored(
+                component_scheduler::hosted_component_pump_with_caller(&ch, caller)),
+        (false, None, None) =>
+            component_scheduler::HostedPumpRestore::Restored(hosted_component_pump(&ch)),
+        (true, _, None) => unreachable!("suspend-aware File dispatch requires a caller"),
     };
-    scsi_srb_pump_timing.exit_pump();
     drop(scsi_srb_pump_owner);
+    let ready_for_child =
+        matches!(&pump, component_scheduler::HostedPumpRestore::ChildWorkReady { .. });
+    let has_child_handoff =
+        !matches!(&pump, component_scheduler::HostedPumpRestore::Restored(_));
+    let mut continuation = FileIrpPumpContinuation {
+        pump: Some(pump),
+        transfer: Some(FileTransferOwner::Active(transfer_guard)),
+        device_context: _device_dispatch_context.map(FileDeviceContextOwner::Active),
+        active_dispatch,
+        class_selection,
+        scsi_timing: scsi_srb_pump_timing,
+        dispatch_seq,
+        dispatch_index,
+        dependent_inst,
+        d,
+        inst,
+        shared_va: sh,
+        ingress_route,
+        executor_tcb: ch.tcb,
+        canonical_irp_id,
+        major,
+        fsctl,
+        provider_binding,
+        dispatch_request,
+        bugchecks_before,
+        trace_connect_pump,
+        class_hook_request,
+        class_hook_control,
+        connect_ack_control,
+        measure_rpc,
+        pump_started,
+        trace_dispatch,
+        ready_for_child,
+        child_step: None,
+    };
+    if has_child_handoff {
+        continuation.suspend_bindings();
+        *yielded.expect("child-work handoff requires a File owner") = Some(continuation);
+        return None;
+    }
+    Some(continuation.finish(out))
+
+}
+
+impl FileIrpPumpContinuation {
+    /// Settle only an actually returned component pump. All post-result effects use the same
+    /// retained state on the synchronous and resumed paths.
+    unsafe fn finish(self, out: &mut [u8]) -> HostedIrpTransportResult {
+        let Self {
+            pump, transfer, device_context: _device_dispatch_context, active_dispatch,
+            class_selection, scsi_timing: mut scsi_srb_pump_timing, dispatch_seq,
+            dispatch_index, dependent_inst, d, inst, shared_va: sh, ingress_route,
+            executor_tcb, canonical_irp_id, major, fsctl, provider_binding,
+            dispatch_request, bugchecks_before, trace_connect_pump, class_hook_request,
+            class_hook_control, connect_ack_control, measure_rpc, pump_started,
+            trace_dispatch, ready_for_child: _, child_step: _,
+        } = self;
+        let pr = match pump {
+            Some(component_scheduler::HostedPumpRestore::Restored(pr)) => pr,
+            _ => panic!("native File finish requires restored pump"),
+        };
+        let FileTransferOwner::Active(transfer_guard) =
+            transfer.expect("native File finish requires transfer owner") else {
+                panic!("native File finish requires active transfer");
+            };
+        scsi_srb_pump_timing.exit_pump();
     if measure_rpc {
         let pump_ticks = crate::disk_census_ticks().wrapping_sub(pump_started);
         let bank_ticks = active_hosted_irp_transfer_mut(sh, canonical_irp_id)
@@ -74053,7 +74515,7 @@ unsafe fn dispatch_irp_for_instance_exact(
     }
     if trace_connect_pump {
         trace_port_connect_pump(2, canonical_irp_id, class_hook_request,
-            class_selection.is_some(), ingress_route, ch.tcb,
+            class_selection.is_some(), ingress_route, executor_tcb,
             ((u64::from(pr.completed)) << 32) | (pr.status as u32 as u64));
     }
     let guarded_abort = FSD_BUGCHECKS.load(Ordering::Relaxed) != bugchecks_before;
@@ -74125,9 +74587,9 @@ unsafe fn dispatch_irp_for_instance_exact(
         if dispatch_index != inst {
             register_instance_ready(inst, false);
         }
-        return Some(HostedIrpTransportResult::Indeterminate {
+        return HostedIrpTransportResult::Indeterminate {
             transport_status: nt_status::NtStatus::UNSUCCESSFUL,
-        });
+        };
     }
     let d = instance(dispatch_index).unwrap_or(d);
     let sh = class_selection.as_ref().map_or(d.exec_shared_va, |selection| selection.shared);
@@ -74161,9 +74623,9 @@ unsafe fn dispatch_irp_for_instance_exact(
             binding, dependent_inst.exec_shared_va, sh,
         ) {
             hosted_scsi_dma_reservation::quarantine(canonical_irp_id);
-            return Some(HostedIrpTransportResult::Indeterminate {
+            return HostedIrpTransportResult::Indeterminate {
                 transport_status: status,
-            });
+            };
         }
     }
     let subsidiary_bare_return = dispatch_request.is_some_and(|request| {
@@ -74197,28 +74659,30 @@ unsafe fn dispatch_irp_for_instance_exact(
     if guarded_abort || subsidiary_bare_return
         || (subsidiary_no_entry && st >= 0)
     {
-        Some(HostedIrpTransportResult::Indeterminate {
+        HostedIrpTransportResult::Indeterminate {
             transport_status: if subsidiary_bare_return {
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST
             } else {
                 nt_status::NtStatus::UNSUCCESSFUL
             },
-        })
+        }
     } else if subsidiary_no_entry {
         // All native pre-handler exits precede successful op6 source registration. The root's
         // active transfer recorded no such registration, so this subsidiary never entered its
         // provider MajorFunction and may be discarded by the exact manager owner.
-        Some(HostedIrpTransportResult::NotDispatched {
+        HostedIrpTransportResult::NotDispatched {
             status: nt_status::NtStatus(st),
-        })
+        }
     } else {
-        Some(HostedIrpTransportResult::Returned {
+        HostedIrpTransportResult::Returned {
             status: nt_status::NtStatus(st),
             information: info,
             file_context,
-        })
+        }
+    }
     }
 }
+
 
 /// Allocate the canonical File before a hosted driver sees CREATE. Process
 /// handles remain executive-owned; all File and IRP lifetime is manager-owned.
