@@ -21,7 +21,7 @@ use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
 // Synchronous CREATE only needs a brief opportunity to consume an already-ready terminal
 // completion. A backend can keep reporting unrelated records, so this path must yield back to
 // the ordinary pump rather than holding the caller indefinitely.
-const CREATE_READY_COMPLETION_DRAIN_LIMIT: usize = 32;
+const EXACT_READY_COMPLETION_DRAIN_LIMIT: usize = 32;
 
 /// Stable terminal projection delivered to an I/O Manager consumer. The
 /// canonical IRP remains live until [`IoManager::acknowledge_completed_irp`].
@@ -147,10 +147,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
         }
     }
 
-    /// A synchronous open can observe STATUS_PENDING after its native peer has already
-    /// published terminal CREATE. Drain only that driver's ready queue before deciding whether
-    /// the File handle must be withheld. Unrelated completions keep their normal published owner.
-    pub(crate) fn publish_ready_create_completion(&mut self, irp_id: IrpId) {
+    /// Import an exact pending IRP's ready backend completion without dispatching new work.
+    /// Earlier completions from that backend keep their normal published owners. This is
+    /// bounded so an unrelated producer cannot hold a nested caller indefinitely.
+    pub fn publish_ready_completion_for(&mut self, irp_id: IrpId) {
         let Some(backend_index) = self
             .irp(irp_id)
             .and_then(|irp| irp.current_stack())
@@ -160,7 +160,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         else {
             return;
         };
-        for _ in 0..CREATE_READY_COMPLETION_DRAIN_LIMIT {
+        for _ in 0..EXACT_READY_COMPLETION_DRAIN_LIMIT {
             if self.completed_irp(irp_id).is_some() {
                 break;
             }

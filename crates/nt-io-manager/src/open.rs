@@ -1077,7 +1077,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         if matches!(outcome, Ok(DispatchOutcome::Pending))
             && self.irp(irp_id).is_some_and(|irp| irp.state == IrpState::Dispatched)
         {
-            self.publish_ready_create_completion(irp_id);
+            self.publish_ready_completion_for(irp_id);
         }
 
         // A reentrant IoCompleteRequest can publish terminal CREATE before dispatch returns.
