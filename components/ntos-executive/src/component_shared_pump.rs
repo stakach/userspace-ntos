@@ -749,6 +749,26 @@ unsafe fn nested_restore_refusal(
     }
 }
 
+/// Observe a classified arrival only after the shared receive borrow has ended.
+unsafe fn observe_pump_receive_return(
+    ch: &PumpChannel,
+    observed_nested_file: bool,
+    file_receive: bool,
+    receive_started: u64,
+    counter: &AtomicU64,
+    success: bool,
+) {
+    if observed_nested_file {
+        crate::driver_launch::trace_port_connect_outer_probe(46, ch, u64::from(success));
+    }
+    if file_receive {
+        FILE_RECEIVE_CALLS.fetch_add(1, Ordering::Relaxed);
+        FILE_RECEIVE_TICKS.fetch_add(
+            crate::disk_census_ticks().wrapping_sub(receive_started), Ordering::Relaxed);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub(super) unsafe fn receive(
     ch: &PumpChannel, route: PeerRoute, retained_seh: bool, serviced_scheduler_yield: bool,
 ) -> PumpMessage {
@@ -1080,31 +1100,18 @@ pub(super) unsafe fn receive(
         }
         let arrival = runtime::receive(execution, ch.tcb,
             serviced_scheduler_yield || !timer_checkpoint);
-        if observed_nested_file {
-            crate::driver_launch::trace_port_connect_outer_probe(46, ch, u64::from(arrival.is_ok()));
-        }
-        if file_receive {
-            FILE_RECEIVE_CALLS.fetch_add(1, Ordering::Relaxed);
-            FILE_RECEIVE_TICKS.fetch_add(
-                crate::disk_census_ticks().wrapping_sub(receive_started), Ordering::Relaxed);
-            let counter = match &arrival {
-                Ok(runtime::Arrival::Hosted) => &FILE_RECEIVE_HOSTED,
-                Ok(runtime::Arrival::Call { .. }) => &FILE_RECEIVE_CALL,
-                Ok(runtime::Arrival::Notification(message))
-                    if crate::badge_has_delay_timer(message.badge()) => &FILE_RECEIVE_TIMER,
-                Ok(runtime::Arrival::Notification(_)) => &FILE_RECEIVE_OTHER_NOTIFICATION,
-                Err(_) => &FILE_RECEIVE_ERROR,
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
-        }
         match arrival {
             Ok(runtime::Arrival::Hosted) => {
+                observe_pump_receive_return(ch, observed_nested_file, file_receive,
+                    receive_started, &FILE_RECEIVE_HOSTED, true);
                 record_active_syscall_transition(&census_scope, SYSCALL_PHASE_HOSTED);
                 record_active_syscall_provider_arrival(&census_scope, 1, 0, 0, 0);
                 trace_ps_create_receive(ch, b"hosted-arrival", Some(route));
                 trace_ps_create_event(b"hosted-arrival", route, 0, 0);
             }
             Ok(runtime::Arrival::Call { route: sender, reply }) => {
+                observe_pump_receive_return(ch, observed_nested_file, file_receive,
+                    receive_started, &FILE_RECEIVE_CALL, true);
                 record_active_syscall_transition(&census_scope, SYSCALL_PHASE_CALL);
                 let info = runtime::pending_route_snapshot(sender)
                     .ok().flatten().filter(|(held_reply, _)| *held_reply == reply)
@@ -1118,6 +1125,13 @@ pub(super) unsafe fn receive(
                 // this invocation's stored arrival on the next pass.
             }
             Ok(runtime::Arrival::Notification(message)) => {
+                let counter = if crate::badge_has_delay_timer(message.badge()) {
+                    &FILE_RECEIVE_TIMER
+                } else {
+                    &FILE_RECEIVE_OTHER_NOTIFICATION
+                };
+                observe_pump_receive_return(ch, observed_nested_file, file_receive,
+                    receive_started, counter, true);
                 record_active_syscall_transition(&census_scope, SYSCALL_PHASE_NOTIFICATION);
                 record_active_syscall_notification(
                     &census_scope, message.badge(), message.info(), timer_checkpoint,
@@ -1166,6 +1180,8 @@ pub(super) unsafe fn receive(
                 }
             }
             Err(_) => {
+                observe_pump_receive_return(ch, observed_nested_file, file_receive,
+                    receive_started, &FILE_RECEIVE_ERROR, false);
                 crate::print_str(b"[pump-ingress] physical receive failed\n");
                 return PumpMessage::transport_wall();
             }
