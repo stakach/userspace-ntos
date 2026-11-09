@@ -356,6 +356,18 @@ unsafe fn hosted_component_pump_inner(
     crate::driver_launch::trace_port_connect_handoff_probe(25, channel, channel.reply_cap);
     let mut result = crate::spawn_hosts::component_pump(channel);
     crate::driver_launch::trace_port_connect_handoff_probe(26, channel, result.reply_cap);
+    let result_flags = u64::from(result.completed)
+        | (u64::from(result.scheduler_yielded) << 1)
+        | (u64::from(matches!(result.nested_child_work,
+            Some(crate::spawn_hosts::NestedChildWorkState::Ready(_)))) << 2)
+        | (u64::from(matches!(result.nested_child_work,
+            Some(crate::spawn_hosts::NestedChildWorkState::Quarantined(_)))) << 3)
+        | (u64::from(result.nested_restore_yield.is_some()) << 4)
+        | (u64::from(result.nested_restore_quarantined.is_some()) << 5)
+        | (u64::from(result.wall_label != 0) << 6)
+        | (u64::from(result.provider_wait_suspended) << 7)
+        | (u64::from(result.lpc_wait_suspended) << 8);
+    crate::driver_launch::trace_port_connect_handoff_probe(27, channel, result_flags);
     trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 1, Some(&result));
     trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 1, Some(&result));
     while result.scheduler_yielded {
@@ -414,12 +426,14 @@ unsafe fn hosted_component_pump_inner(
                 }
             };
             channel.reply_cap = canonical_reply;
+            crate::driver_launch::trace_port_connect_handoff_probe(50, channel, canonical_reply);
             return HostedPumpRestore::ChildWorkReady {
                 result, parent, channel: *channel, dispatch, caller,
             };
         }
         Some(crate::spawn_hosts::NestedChildWorkState::Quarantined(yielded)) => {
             fence_nested_child_parent(yielded.parent);
+            crate::driver_launch::trace_port_connect_handoff_probe(51, channel, result.reply_cap);
             return HostedPumpRestore::ChildWorkQuarantined { result, parent, channel: *channel, caller };
         }
         None => {}
@@ -440,6 +454,7 @@ unsafe fn hosted_component_pump_inner(
         let exact_reply = runtime::current_reply(route).ok() == Some(result.reply_cap);
         if exact_reply { channel.reply_cap = result.reply_cap; }
         let inner_ticket = result.nested_restore_yield.or(result.nested_restore_quarantined);
+        crate::driver_launch::trace_port_connect_handoff_probe(52, channel, u64::from(exact_reply));
         return HostedPumpRestore::ChildWorkPending(PendingChildWorkRestore {
             mode: PendingReceiveMode::NestedRestore,
             result, channel: *channel, dispatch, caller, inner_ticket,
@@ -469,6 +484,7 @@ unsafe fn hosted_component_pump_inner(
     let restore_key = parent.as_ref().and_then(|handle| runtime::nested::result_key(handle));
     let restore_ticket = parent.as_ref().map(|handle| handle.ticket());
     if runtime::nested::restore(&mut parent).is_err() {
+        crate::driver_launch::trace_port_connect_handoff_probe(54, channel, 0);
         // An impossible missing key is still a retained refusal. The physical row remains
         // discoverable in `runtime::nested`; never return an entered result as completed.
         let (Some(key), Some(ticket)) = (restore_key, restore_ticket) else {
@@ -483,6 +499,7 @@ unsafe fn hosted_component_pump_inner(
     }
     trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 8, Some(&result));
     trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 8, Some(&result));
+    crate::driver_launch::trace_port_connect_handoff_probe(53, channel, result.reply_cap);
     if let Some(timeline) = timeline {
         timeline.finish(crate::disk_census_ticks());
     }

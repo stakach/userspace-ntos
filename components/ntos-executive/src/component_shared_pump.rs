@@ -759,6 +759,7 @@ pub(super) unsafe fn receive(
         retained_seh || (ch.caps.kind == ReqKind::Syscall && !ch.caps.kernel_irq_yield);
     let mut irq_checkpoint = inline_irq_checkpoint && inline_irq_work_pending();
     let mut timer_probe_consumed = false;
+    let mut observed_nested_file = false;
     loop {
         record_active_syscall_transition(&census_scope, SYSCALL_PHASE_PUMP_WORK);
         trace_ps_create_receive(ch, b"loop", Some(route));
@@ -923,11 +924,17 @@ pub(super) unsafe fn receive(
                 };
                 return PumpMessage::nested_child_work_yield(ticket);
             }
+            observed_nested_file = true;
+            crate::driver_launch::trace_port_connect_outer_probe(40, ch, u64::from(parent.is_some()));
             let progressed = crate::service_sec_image::redrive_nested_hosted_file_work();
+            crate::driver_launch::trace_port_connect_outer_probe(41, ch, u64::from(progressed));
             let ticket = parent.as_ref().map(|parent| parent.ticket());
+            crate::driver_launch::trace_port_connect_outer_probe(42, ch, u64::from(ticket.is_some()));
             if runtime::nested::restore_or_retain(&mut parent).is_err() {
+                crate::driver_launch::trace_port_connect_outer_probe(44, ch, 0);
                 return nested_restore_refusal(ticket);
             }
+            crate::driver_launch::trace_port_connect_outer_probe(43, ch, u64::from(progressed));
             if progressed { continue; }
         }
         trace_ps_create_receive(ch, b"retained-services", Some(route));
@@ -1068,8 +1075,14 @@ pub(super) unsafe fn receive(
         let receive_started = if file_receive { crate::disk_census_ticks() } else { 0 };
         record_active_syscall_physical_owner(&census_scope, route, ch.tcb);
         record_active_syscall_transition(&census_scope, SYSCALL_PHASE_PHYSICAL_WAIT);
+        if observed_nested_file {
+            crate::driver_launch::trace_port_connect_outer_probe(45, ch, 0);
+        }
         let arrival = runtime::receive(execution, ch.tcb,
             serviced_scheduler_yield || !timer_checkpoint);
+        if observed_nested_file {
+            crate::driver_launch::trace_port_connect_outer_probe(46, ch, u64::from(arrival.is_ok()));
+        }
         if file_receive {
             FILE_RECEIVE_CALLS.fetch_add(1, Ordering::Relaxed);
             FILE_RECEIVE_TICKS.fetch_add(

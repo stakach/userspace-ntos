@@ -10810,6 +10810,7 @@ pub(crate) unsafe fn service_sec_image(
             // A port CONNECT may have yielded while its provider parent remained physically
             // parked. Its File frames have ended here. Run one selected child per flat pass,
             // then resume only that exact retained pump before another provider can enter.
+            crate::driver_launch::trace_port_connect_root_probe(80, 0);
             let mut consecutive_no_child_yields = 0u8;
             loop {
                 use crate::driver_launch::PortConnectPumpProgress as Progress;
@@ -10823,6 +10824,7 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 let Some(selector) = crate::driver_launch::claim_suspended_port_connect_pump()
                 else { break };
+                crate::driver_launch::trace_port_connect_root_probe(81, 1);
                 let step = drive_one_nested_file_child_step();
                 let ran_child = step.ran_child();
                 match crate::driver_launch::redrive_suspended_connect_pump(selector, step) {

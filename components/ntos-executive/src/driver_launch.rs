@@ -73507,6 +73507,32 @@ pub(crate) unsafe fn trace_port_connect_handoff_probe(
     print_hex_u64(detail); print_str(b"\n");
 }
 
+/// The enclosing pump can have a different TCB from the CONNECT worker. Keep the same IRP key
+/// while observing whether that outer stack returns to its receive loop.
+pub(crate) unsafe fn trace_port_connect_outer_probe(
+    stage: u64, ch: &crate::spawn_hosts::PumpChannel, detail: u64,
+) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let irp = PORT_CONNECT_PUMP_TRACE_IRP.load(Ordering::Relaxed);
+    if irp == 0 || COUNT.fetch_add(1, Ordering::Relaxed) >= 24 { return; }
+    let shared_control = read_volatile((ch.shared_va + SH_REQ_CONTROL_ID) as *const u64);
+    print_str(b"[port-connect-outer] stage/irp/tcb/reply/child-capable/shared-control/detail=");
+    print_u64(stage); print_str(b"/"); print_hex_u64(irp); print_str(b"/");
+    print_hex_u64(ch.tcb); print_str(b"/"); print_hex_u64(ch.reply_cap);
+    print_str(b"/"); print_u64(u64::from(ch.child_work_capable));
+    print_str(b"/"); print_hex_u64(shared_control); print_str(b"/");
+    print_hex_u64(detail); print_str(b"\n");
+}
+
+pub(crate) fn trace_port_connect_root_probe(stage: u64, detail: u64) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let irp = PORT_CONNECT_PUMP_TRACE_IRP.load(Ordering::Relaxed);
+    if irp == 0 || COUNT.fetch_add(1, Ordering::Relaxed) >= 8 { return; }
+    print_str(b"[port-connect-root] stage/irp/detail=");
+    print_u64(stage); print_str(b"/"); print_hex_u64(irp);
+    print_str(b"/"); print_hex_u64(detail); print_str(b"\n");
+}
+
 fn trace_port_connect_pump(
     stage: u64,
     irp: u64,
@@ -74465,6 +74491,9 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
         matches!(&pump, component_scheduler::HostedPumpRestore::ChildWorkReady { .. });
     let has_child_handoff =
         !matches!(&pump, component_scheduler::HostedPumpRestore::Restored(_));
+    crate::driver_launch::trace_port_connect_handoff_probe(
+        60, &ch, u64::from(ready_for_child) | (u64::from(has_child_handoff) << 1),
+    );
     let mut continuation = FileIrpPumpContinuation {
         pump: Some(pump),
         transfer: Some(FileTransferOwner::Active(transfer_guard)),
@@ -74498,7 +74527,11 @@ unsafe fn dispatch_irp_for_instance_exact_inner(
     };
     if has_child_handoff {
         continuation.suspend_bindings();
+        crate::driver_launch::trace_port_connect_handoff_probe(
+            61, &ch, u64::from(continuation.child_work_ready()),
+        );
         *yielded.expect("child-work handoff requires a File owner") = Some(continuation);
+        crate::driver_launch::trace_port_connect_handoff_probe(62, &ch, dispatch_seq);
         return None;
     }
     Some(continuation.finish(out))

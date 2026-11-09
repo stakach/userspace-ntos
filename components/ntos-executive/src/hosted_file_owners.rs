@@ -736,6 +736,7 @@ pub(super) fn suspend_dispatch_for_pump(
         invocation: suspended, continuation,
     }));
     owner.flight = Flight::PumpSuspended;
+    crate::driver_launch::trace_port_connect_root_probe(70, irp_id.raw());
     Ok(())
 }
 
