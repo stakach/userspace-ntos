@@ -34190,6 +34190,55 @@ impl Drop for HostedWorkQueueDrainGuard {
 /// AddDevice can be parked in that CONNECT while the component scheduler is nested; generic EX
 /// workers still wait for the outermost component return.
 
+unsafe fn hosted_connect_io_work_candidate(
+    port_index: usize,
+    port_domain: nt_io_manager::HostedDomainIdentity,
+    storage_index: usize,
+    storage_domain: nt_io_manager::HostedDomainIdentity,
+    target_device: nt_io_manager::DeviceId,
+    pending_irp: nt_io_manager::IrpId,
+) -> Result<Option<DriverInstance>, nt_status::NtStatus> {
+    if HOSTED_WORK_QUEUE_DRAIN_ACTIVE.load(Ordering::Acquire) != 0
+        || hosted_work_queue_owner::pending(storage_index)
+    {
+        return Ok(None);
+    }
+    let dependent = instance(port_index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let provider = instance(storage_index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    if instance_domain_identity(dependent) != Some(port_domain)
+        || hosted_completion_storage_instance(port_index) != storage_index
+        || instance_domain_identity(provider) != Some(storage_domain)
+        || !dependent.ready || dependent.faulted || !provider.ready || provider.faulted
+    {
+        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+    }
+    let pending = io_manager_mut().irp(pending_irp).is_some_and(|irp| {
+        irp.state == nt_io_manager::IrpState::Pending
+            && irp.current_stack().is_some_and(|stack| {
+                stack.driver_id.raw() == dependent.driver_id && stack.device_id == target_device
+            })
+    });
+    if !pending { return Ok(None); }
+    let route = hosted_ingress_sources::primary_route(storage_index)
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    if !crate::spawn_hosts::shared_ingress::owner::runtime::ready_for_admission(route)
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    let shared = provider.exec_shared_va;
+    if shared == 0 { return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED); }
+    let Some(pending) = hosted_work_queue_admission(shared).peek_ready() else {
+        return Ok(None);
+    };
+    if read_volatile((hosted_work_queue_slot(shared, pending.sequence())
+        + SH_WORK_QUEUE_ENTRY_KIND) as *const u64) != HOSTED_WORK_QUEUE_KIND_IO
+    {
+        return Ok(None);
+    }
+    Ok(Some(provider))
+}
+
 unsafe fn drain_hosted_connect_io_work_item(
     port_index: usize,
     port_domain: nt_io_manager::HostedDomainIdentity,
@@ -34201,50 +34250,12 @@ unsafe fn drain_hosted_connect_io_work_item(
     if hosted_work_queue_owner::unsettled_queued_callback() {
         return Ok(HostedWorkQueueDrainProgress::Suspended);
     }
-    let dependent = instance(port_index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-    let provider = instance(storage_index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-    if instance_domain_identity(dependent) != Some(port_domain)
-        || hosted_completion_storage_instance(port_index) != storage_index
-        || instance_domain_identity(provider) != Some(storage_domain)
-        || !dependent.ready
-        || dependent.faulted
-        || !provider.ready
-        || provider.faulted
-    {
-        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
-    }
-    let pending = io_manager_mut().irp(pending_irp).is_some_and(|irp| {
-        irp.state == nt_io_manager::IrpState::Pending
-            && irp.current_stack().is_some_and(|stack| {
-                stack.driver_id.raw() == dependent.driver_id && stack.device_id == target_device
-            })
-    });
-    if !pending {
-        return Ok(HostedWorkQueueDrainProgress::Drained(0));
-    }
-    let route = hosted_ingress_sources::primary_route(storage_index)
-        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-    if !crate::spawn_hosts::shared_ingress::owner::runtime::ready_for_admission(route)
-        .unwrap_or(false)
-    {
-        return Ok(HostedWorkQueueDrainProgress::Drained(0));
-    }
+    let Some(provider) = hosted_connect_io_work_candidate(
+        port_index, port_domain, storage_index, storage_domain, target_device, pending_irp,
+    )? else { return Ok(HostedWorkQueueDrainProgress::Drained(0)); };
     let Some(_guard) = HostedWorkQueueDrainGuard::enter() else {
         return Ok(HostedWorkQueueDrainProgress::Drained(0));
     };
-    let shared = provider.exec_shared_va;
-    if shared == 0 {
-        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
-    }
-    let Some(pending) = hosted_work_queue_admission(shared).peek_ready() else {
-        return Ok(HostedWorkQueueDrainProgress::Drained(0));
-    };
-    if read_volatile((hosted_work_queue_slot(shared, pending.sequence())
-        + SH_WORK_QUEUE_ENTRY_KIND) as *const u64)
-            != HOSTED_WORK_QUEUE_KIND_IO
-    {
-        return Ok(HostedWorkQueueDrainProgress::Drained(0));
-    }
     let drained = drain_hosted_work_queue_for_instance(
         storage_index,
         provider,

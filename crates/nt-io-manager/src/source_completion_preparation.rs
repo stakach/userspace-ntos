@@ -25,13 +25,16 @@ pub const fn admit_existing(
     }
 }
 
-/// Whether a retained CONNECT owner may run in a nested receive turn.
+/// Whether a retained CONNECT owner may run in a nested receive turn. An entered
+/// provider is not itself work: its exact owner must expose a step that can advance
+/// before the root selects it as a child of another parked dispatch.
 pub const fn nested_connect_ready(
     active: bool,
     provider_entered: bool,
     source_admissible: bool,
+    entered_actionable: bool,
 ) -> bool {
-    active && (provider_entered || source_admissible)
+    active && if provider_entered { entered_actionable } else { source_admissible }
 }
 
 /// Admission before a nested CONNECT provider entry, using the exact source lane state.
@@ -80,10 +83,22 @@ mod tests {
 
     #[test]
     fn nested_connect_waits_for_prepared_source_but_preserves_entered_progress() {
-        assert!(!super::nested_connect_ready(true, false, false));
-        assert!(super::nested_connect_ready(true, false, true));
-        assert!(super::nested_connect_ready(true, true, false));
-        assert!(!super::nested_connect_ready(false, true, true));
+        assert!(!super::nested_connect_ready(true, false, false, false));
+        assert!(super::nested_connect_ready(true, false, true, false));
+        assert!(super::nested_connect_ready(true, true, false, true));
+        assert!(!super::nested_connect_ready(false, true, true, true));
+    }
+
+    #[test]
+    fn entered_pending_connect_is_not_a_nested_child_until_a_real_step_is_ready() {
+        use super::nested_connect_ready;
+        // The provider has already returned Pending, but its source has not sent the
+        // separate arm Call. Selecting it here would run no step and quarantine its parent.
+        assert!(!nested_connect_ready(true, true, false, false));
+        // An exact entered step may be selected after native code proves it actionable.
+        assert!(nested_connect_ready(true, true, false, true));
+        assert!(nested_connect_ready(true, false, true, false));
+        assert!(!nested_connect_ready(false, true, false, true));
     }
 
     #[test]

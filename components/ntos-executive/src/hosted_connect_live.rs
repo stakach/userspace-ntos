@@ -674,7 +674,8 @@ unsafe fn observe_port_dispatch_result(
     true
 }
 
-unsafe fn redrive_inner(nested_ready_only: bool) {
+unsafe fn redrive_inner(nested_ready_only: bool) -> bool {
+    let mut advanced = false;
     let count = rows().len();
     for index in 0..count {
         // A parked i8042 dispatch can synchronously reenter the executive for HOOK. The boxed
@@ -708,19 +709,24 @@ unsafe fn redrive_inner(nested_ready_only: bool) {
                 hosted_input_connect_dispatch::PortConnectPhase::AwaitingCompletion(irp) => irp,
                 _ => unreachable!(),
             };
-            let queue_progress = drain_hosted_connect_io_work_item(
-                (*work_ptr).port_instance,
-                (*work_ptr).port_domain,
-                (*work_ptr).port_storage_instance,
-                (*work_ptr).port_storage_domain,
-                (*work_ptr).source.payload().forward.target.device_id(),
-                pending_irp,
-            );
-            trace_connect_live(11, (*work_ptr).source.source_irp_address(),
-                u64::from(matches!(queue_progress, Ok(HostedWorkQueueDrainProgress::Suspended))),
-                u64::from(queue_progress.is_err()));
-            if matches!(queue_progress, Ok(HostedWorkQueueDrainProgress::Suspended)) {
-                return;
+            if io_manager_mut().completed_irp(pending_irp).is_none() {
+                let queue_progress = drain_hosted_connect_io_work_item(
+                    (*work_ptr).port_instance,
+                    (*work_ptr).port_domain,
+                    (*work_ptr).port_storage_instance,
+                    (*work_ptr).port_storage_domain,
+                    (*work_ptr).source.payload().forward.target.device_id(),
+                    pending_irp,
+                );
+                trace_connect_live(11, (*work_ptr).source.source_irp_address(),
+                    u64::from(matches!(queue_progress, Ok(HostedWorkQueueDrainProgress::Suspended))),
+                    u64::from(queue_progress.is_err()));
+                if matches!(queue_progress, Ok(HostedWorkQueueDrainProgress::Drained(count)) if count != 0) {
+                    advanced = true;
+                }
+                if matches!(queue_progress, Ok(HostedWorkQueueDrainProgress::Suspended)) {
+                    return advanced;
+                }
             }
         }
         if !(*work_ptr).provider_entered {
@@ -770,6 +776,7 @@ unsafe fn redrive_inner(nested_ready_only: bool) {
                 continue;
             }
             work.provider_entered = true;
+            advanced = true;
             trace_connect_live(7, work.source.source_irp_address(), work.reverse_owner_id, 0);
             trace_connect_redrive(1, nested_ready_only, work.source.source_irp_address());
             let phase = {
@@ -781,6 +788,7 @@ unsafe fn redrive_inner(nested_ready_only: bool) {
             trace_connect_redrive(2, nested_ready_only, (*work_ptr).source.source_irp_address());
             let work = &mut *work_ptr;
             let _ = observe_port_dispatch_result(work, phase);
+            if work.blocked { return false; }
             trace_connect_redrive(3, nested_ready_only, work.source.source_irp_address());
             trace_connect_redrive(4, nested_ready_only, work.source.source_irp_address());
             continue;
@@ -790,7 +798,9 @@ unsafe fn redrive_inner(nested_ready_only: bool) {
             continue;
         }
         if work.source.terminal_status().is_none() {
+            let phase_before = work.port.phase();
             let Ok(Some(status)) = work.port.poll_terminal() else { continue; };
+            advanced |= work.port.phase() != phase_before;
             trace_connect_live(9, work.source.source_irp_address(), status.raw() as u32 as u64,
                 u64::from(matches!(work.sequence.phase(), HookForwardPhase::Terminal(_, _))));
             if !matches!(work.sequence.phase(), HookForwardPhase::Terminal(_, _)) {
@@ -801,9 +811,16 @@ unsafe fn redrive_inner(nested_ready_only: bool) {
                 continue;
             }
             work.source.set_terminal_after_hook(status);
+            advanced = true;
         }
         if !work.source_acknowledged {
+            let source_before = work.source.terminal_progress();
             work.source_acknowledged = work.source.complete_terminal();
+            if work.source.origin().preparation_uncertain() {
+                work.blocked = true;
+                return false;
+            }
+            advanced |= work.source.terminal_progress() != source_before;
             trace_connect_live(10, work.source.source_irp_address(), u64::from(work.source_acknowledged), 0);
         }
         if work.source_acknowledged {
@@ -814,10 +831,12 @@ unsafe fn redrive_inner(nested_ready_only: bool) {
                 | hosted_input_connect_dispatch::PortConnectPhase::Rejected(_) => true,
                 _ => work.port.acknowledge_after_source_completion(&work.source).is_ok(),
             };
+            advanced |= work.port_acknowledged;
             // Published aliases and the callback thunk remain installed for subsequent input.
         }
     }
     trace_connect_redrive_if_pending(6, nested_ready_only);
+    advanced
 }
 
 pub(super) fn nested_work_ready() -> bool {
@@ -857,21 +876,40 @@ pub(super) fn root_probe_origin_bits() -> u64 {
 
 pub(super) unsafe fn redrive_nested_ready() -> bool {
     trace_connect_redrive_if_pending(0, true);
-    let progress = || {
-        rows().iter().flatten().fold(0usize, |total, work| {
-            total
-                + usize::from(work.provider_entered)
-                + usize::from(work.source_acknowledged)
-                + usize::from(work.port_acknowledged)
-        })
-    };
-    let before = progress();
-    redrive_inner(true);
+    let advanced = redrive_inner(true);
     trace_connect_redrive_if_pending(5, true);
-    progress() != before
+    advanced
 }
 
 impl Work {
+    fn entered_nested_step_ready(&self) -> bool {
+        if !self.source.origin().armed() { return false; }
+        if self.source.terminal_status().is_some() {
+            return unsafe { self.source.terminal_step_ready() }
+                || (self.source_acknowledged && !self.port_acknowledged);
+        }
+        match self.port.phase() {
+            hosted_input_connect_dispatch::PortConnectPhase::AwaitingCompletion(irp) => {
+                unsafe {
+                    if io_manager_mut().completed_irp(irp).is_some() {
+                        return true;
+                    }
+                    if hosted_work_queue_owner::unsettled_queued_callback()
+                        || hosted_work_queue_owner::pending(self.port_storage_instance)
+                    { return false; }
+                    hosted_connect_io_work_candidate(
+                                self.port_instance, self.port_domain,
+                                self.port_storage_instance, self.port_storage_domain,
+                                self.source.payload().forward.target.device_id(), irp,
+                            ).ok().flatten().is_some()
+                }
+            }
+            hosted_input_connect_dispatch::PortConnectPhase::Terminal(_) =>
+                matches!(self.sequence.phase(), HookForwardPhase::Terminal(_, _)),
+            _ => false,
+        }
+    }
+
     fn nested_ready(&self) -> bool {
         // A parked provider parent cannot be its own child. Its source Reply is still held,
         // and redriving this Work before native receive resumes makes no progress.
@@ -888,6 +926,7 @@ impl Work {
             && unsafe { self.source.nested_preparation_ready() };
         nt_io_manager::source_completion_preparation::nested_connect_ready(
             active, self.provider_entered, source_admissible,
+            self.provider_entered && self.entered_nested_step_ready(),
         )
     }
 

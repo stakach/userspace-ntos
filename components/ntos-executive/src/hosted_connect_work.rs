@@ -167,6 +167,25 @@ impl RetainedConnectWork {
         self.terminal_status
     }
 
+    /// A nested parent may select this source only when its exact completion lane can
+    /// advance. An entered provider or a terminal status alone is not a child step.
+    pub(super) unsafe fn terminal_step_ready(&self) -> bool {
+        let Ok(command) = self.source.completion_command(self.origin.token) else {
+            return false;
+        };
+        self.terminal_status.is_some() && self.origin.terminal_ready(command)
+    }
+
+    /// Read-only monotonic completion witness, including partial source publication.
+    /// A retained completion can advance and still return false while its unwinder waits.
+    pub(super) fn terminal_progress(&self) -> (
+        bool, bool, bool, bool,
+        nt_io_manager::hosted_forward_progress::HostedForwardOriginProgress,
+    ) {
+        (self.published, self.terminal_consumed, self.source_retired,
+            self.completion_acknowledged, self.origin.progress())
+    }
+
     /// An exact source continuation and its origin receipt have both completed. A provider
     /// terminal alone cannot authorize retirement of the port-local pending IRP.
     pub(super) fn acknowledged_source_payload(&self) -> Option<ConnectPayloadIdentity> {
