@@ -112,3 +112,22 @@ fn peek_does_not_claim_or_skip_a_published_head() {
     queue.acknowledge(claimed).unwrap();
     queue.acknowledge(queue.claim_ready().unwrap()).unwrap();
 }
+
+#[test]
+fn cursor_snapshot_reports_reservation_dequeue_and_retirement_independently() {
+    let queue = HostedWorkQueueAdmission::<2>::new();
+    let initial = queue.cursors();
+    assert_eq!((initial.reserved(), initial.dequeued(), initial.retired()), (0, 0, 0));
+    let first = queue.reserve().unwrap();
+    let second = queue.reserve().unwrap();
+    queue.publish(first).unwrap();
+    queue.publish(second).unwrap();
+    let first_ready = queue.claim_ready().unwrap();
+    let second_ready = queue.claim_ready().unwrap();
+    let parked = queue.cursors();
+    assert_eq!((parked.reserved(), parked.dequeued(), parked.retired()), (2, 2, 0));
+    queue.acknowledge(second_ready).unwrap();
+    assert_eq!(queue.cursors().retired(), 0);
+    queue.acknowledge(first_ready).unwrap();
+    assert_eq!(queue.cursors().retired(), 2);
+}

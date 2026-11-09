@@ -1150,9 +1150,7 @@ pub const SH_PROVIDER_EXPORT_MARSHAL_BYTES: u64 = 0x800;
 pub const SH_PROVIDER_EXPORT_SCRATCH_BYTES: u64 =
     0x18 + SH_PROVIDER_EXPORT_STACK_QWORDS * 8 + SH_PROVIDER_EXPORT_MARSHAL_BYTES;
 pub const SH_WORK_QUEUE_BASE: u64 = SH_PROVIDER_EXPORT_ARG2 + SH_PROVIDER_EXPORT_SCRATCH_BYTES; // in/out: queued Ex/Io work items
-pub const SH_WORK_QUEUE_HEAD: u64 = SH_WORK_QUEUE_BASE;
-pub const SH_WORK_QUEUE_TAIL: u64 = SH_WORK_QUEUE_HEAD + 0x08;
-pub const SH_WORK_QUEUE_DROPS: u64 = SH_WORK_QUEUE_TAIL + 0x08;
+pub const SH_WORK_QUEUE_DROPS: u64 = SH_WORK_QUEUE_BASE + 0x10;
 pub const SH_WORK_QUEUE_DRAINED: u64 = SH_WORK_QUEUE_DROPS + 0x08;
 pub const SH_WORK_QUEUE_ENTRIES: u64 = SH_WORK_QUEUE_BASE + 0x20;
 pub const SH_WORK_QUEUE_ENTRY_SIZE: u64 = 0x28;
@@ -1163,7 +1161,11 @@ pub const SH_WORK_QUEUE_ENTRY_ARG0: u64 = 0x18;
 pub const SH_WORK_QUEUE_ENTRY_ARG1: u64 = 0x20;
 pub const SH_WORK_QUEUE_CAPACITY: u64 = 256;
 pub const SH_WORK_QUEUE_ARENA_BYTES: u64 = 0x20 + SH_WORK_QUEUE_CAPACITY * SH_WORK_QUEUE_ENTRY_SIZE;
-pub const SH_DMA_ALLOC_RECORDS: u64 = SH_WORK_QUEUE_BASE + SH_WORK_QUEUE_ARENA_BYTES; // out: [logical,len,va] allocation records
+type SharedWorkQueueAdmission =
+    nt_component_suspension::HostedWorkQueueAdmission<{ SH_WORK_QUEUE_CAPACITY as usize }>;
+pub const SH_WORK_QUEUE_ADMISSION: u64 = SH_WORK_QUEUE_BASE + SH_WORK_QUEUE_ARENA_BYTES;
+pub const SH_DMA_ALLOC_RECORDS: u64 =
+    SH_WORK_QUEUE_ADMISSION + core::mem::size_of::<SharedWorkQueueAdmission>() as u64; // out: [logical,len,va] allocation records
 pub const SH_DMA_ALLOC_RECORD_LIMIT: u64 = SH_HANDOFF_ARENA_LIMIT;
 const _: () = assert!(SH_DMA_ALLOC_RECORDS > SH_HOSTED_CURRENT_IRQL);
 const _: () = assert!(SH_VIDEO_HW_START_IO_CALLS + 8 <= SH_HANDOFF_ARENA_BASE);
@@ -1174,6 +1176,7 @@ const _: () = assert!(
         <= SH_DMA_ALLOC_RECORDS
 );
 const _: () = assert!(SH_DMA_ALLOC_RECORD_LIMIT > SH_DMA_ALLOC_RECORDS);
+const _: () = assert!(SH_WORK_QUEUE_ADMISSION % core::mem::align_of::<SharedWorkQueueAdmission>() as u64 == 0);
 const _: () = assert!(SH_VIDEO_MEMORY_MAPPED_VA + 8 <= SH_RESOURCE_IO_PORT_OUT32_FAULTS);
 const _: () = assert!(SH_TSC_FREQUENCY_HZ + 8 <= SH_VIDEO_MEMORY_PHYS);
 const _: () = assert!(SH_VIDEO_DISPI_SELECTED_INDEX + 8 <= SH_HANDOFF_ARENA_BASE);
@@ -9484,6 +9487,11 @@ unsafe fn hosted_work_queue_slot(shared_va: u64, index: u64) -> u64 {
     shared_va + SH_WORK_QUEUE_ENTRIES + (index % SH_WORK_QUEUE_CAPACITY) * SH_WORK_QUEUE_ENTRY_SIZE
 }
 
+#[inline]
+unsafe fn hosted_work_queue_admission(shared_va: u64) -> &'static SharedWorkQueueAdmission {
+    &*((shared_va + SH_WORK_QUEUE_ADMISSION) as *const SharedWorkQueueAdmission)
+}
+
 unsafe fn enqueue_hosted_work_item(
     kind: u64,
     work_item: u64,
@@ -9494,17 +9502,16 @@ unsafe fn enqueue_hosted_work_item(
     if routine == 0 {
         return false;
     }
-    let head = read_volatile((FSD_SHARED_VADDR + SH_WORK_QUEUE_HEAD) as *const u64);
-    let tail = read_volatile((FSD_SHARED_VADDR + SH_WORK_QUEUE_TAIL) as *const u64);
-    if tail.wrapping_sub(head) >= SH_WORK_QUEUE_CAPACITY {
-        let drops = read_volatile((FSD_SHARED_VADDR + SH_WORK_QUEUE_DROPS) as *const u64);
-        write_volatile(
-            (FSD_SHARED_VADDR + SH_WORK_QUEUE_DROPS) as *mut u64,
-            drops.saturating_add(1),
-        );
-        return false;
-    }
-    let slot = hosted_work_queue_slot(FSD_SHARED_VADDR, tail);
+    let admission = hosted_work_queue_admission(FSD_SHARED_VADDR);
+    let reservation = match admission.reserve() {
+        Ok(reservation) => reservation,
+        Err(_) => {
+            (&*((FSD_SHARED_VADDR + SH_WORK_QUEUE_DROPS) as *const AtomicU64))
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+    };
+    let slot = hosted_work_queue_slot(FSD_SHARED_VADDR, reservation.sequence());
     write_volatile((slot + SH_WORK_QUEUE_ENTRY_KIND) as *mut u64, kind);
     write_volatile(
         (slot + SH_WORK_QUEUE_ENTRY_WORK_ITEM) as *mut u64,
@@ -9513,10 +9520,13 @@ unsafe fn enqueue_hosted_work_item(
     write_volatile((slot + SH_WORK_QUEUE_ENTRY_ROUTINE) as *mut u64, routine);
     write_volatile((slot + SH_WORK_QUEUE_ENTRY_ARG0) as *mut u64, arg0);
     write_volatile((slot + SH_WORK_QUEUE_ENTRY_ARG1) as *mut u64, arg1);
-    write_volatile(
-        (FSD_SHARED_VADDR + SH_WORK_QUEUE_TAIL) as *mut u64,
-        tail.wrapping_add(1),
-    );
+    if admission.publish(reservation).is_err() {
+        // The claimed reservation may have had an uncertain native effect. Keep its
+        // slot fenced and report the provider failure without replaying its payload.
+        (&*((FSD_SHARED_VADDR + SH_WORK_QUEUE_DROPS) as *const AtomicU64))
+            .fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
     true
 }
 
@@ -33988,11 +33998,11 @@ unsafe fn drain_hosted_work_queue_for_instance(
     let mut drained = 0u64;
     let budget = if io_only { 1 } else { SH_WORK_QUEUE_CAPACITY.saturating_mul(4) };
     while drained < budget {
-        let head = read_volatile((shared + SH_WORK_QUEUE_HEAD) as *const u64);
-        let tail = read_volatile((shared + SH_WORK_QUEUE_TAIL) as *const u64);
-        if head == tail {
+        let admission = hosted_work_queue_admission(shared);
+        let Some(pending) = admission.peek_ready() else {
             break;
-        }
+        };
+        let head = pending.sequence();
         let slot = hosted_work_queue_slot(shared, head);
         let entry = hosted_work_queue_owner::QueueEntry {
             kind: read_volatile((slot + SH_WORK_QUEUE_ENTRY_KIND) as *const u64),
@@ -34009,16 +34019,23 @@ unsafe fn drain_hosted_work_queue_for_instance(
         if !hosted_work_queue_owner::claim(instance_index, claim_key, entry, file_floor) {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
+        let Some(ready) = admission.claim_ready() else {
+            if !hosted_work_queue_owner::discard_unclaimed(instance_index, claim_key) {
+                register_instance_ready(instance_index, false);
+                return Err(STATUS_DEVICE_NOT_READY);
+            }
+            break;
+        };
+        if !hosted_work_queue_owner::record_admission(instance_index, claim_key, ready) {
+            register_instance_ready(instance_index, false);
+            return Err(STATUS_DEVICE_NOT_READY);
+        }
         let hosted_work_queue_owner::QueueEntry { kind, work_item, routine, arg0, arg1 } = entry;
         write_volatile((slot + SH_WORK_QUEUE_ENTRY_KIND) as *mut u64, 0);
         write_volatile((slot + SH_WORK_QUEUE_ENTRY_WORK_ITEM) as *mut u64, 0);
         write_volatile((slot + SH_WORK_QUEUE_ENTRY_ROUTINE) as *mut u64, 0);
         write_volatile((slot + SH_WORK_QUEUE_ENTRY_ARG0) as *mut u64, 0);
         write_volatile((slot + SH_WORK_QUEUE_ENTRY_ARG1) as *mut u64, 0);
-        write_volatile(
-            (shared + SH_WORK_QUEUE_HEAD) as *mut u64,
-            head.wrapping_add(1),
-        );
         if routine == 0 {
             if !hosted_work_queue_owner::abort_before_enter(instance_index, claim_key) {
                 return Err(STATUS_DEVICE_NOT_READY);
@@ -34138,10 +34155,11 @@ unsafe fn drain_hosted_work_queue_for_instance(
             }
         }
     }
-    let head = read_volatile((shared + SH_WORK_QUEUE_HEAD) as *const u64);
-    let tail = read_volatile((shared + SH_WORK_QUEUE_TAIL) as *const u64);
-    let drops = read_volatile((shared + SH_WORK_QUEUE_DROPS) as *const u64);
-    if drops != 0 || (!io_only && head != tail) {
+    let cursors = hosted_work_queue_admission(shared).cursors();
+    let head = cursors.dequeued();
+    let tail = cursors.reserved();
+    let drops = (&*((shared + SH_WORK_QUEUE_DROPS) as *const AtomicU64)).load(Ordering::Relaxed);
+    if drops != 0 || (!io_only && hosted_work_queue_admission(shared).peek_ready().is_some()) {
         trace_hosted_work_queue_capacity(instance_index, head, tail, drops, drained);
         register_instance_ready(instance_index, false);
         write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
@@ -34218,10 +34236,11 @@ unsafe fn drain_hosted_connect_io_work_item(
     if shared == 0 {
         return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
     }
-    let head = read_volatile((shared + SH_WORK_QUEUE_HEAD) as *const u64);
-    let tail = read_volatile((shared + SH_WORK_QUEUE_TAIL) as *const u64);
-    if head == tail
-        || read_volatile((hosted_work_queue_slot(shared, head) + SH_WORK_QUEUE_ENTRY_KIND) as *const u64)
+    let Some(pending) = hosted_work_queue_admission(shared).peek_ready() else {
+        return Ok(HostedWorkQueueDrainProgress::Drained(0));
+    };
+    if read_volatile((hosted_work_queue_slot(shared, pending.sequence())
+        + SH_WORK_QUEUE_ENTRY_KIND) as *const u64)
             != HOSTED_WORK_QUEUE_KIND_IO
     {
         return Ok(HostedWorkQueueDrainProgress::Drained(0));
@@ -34270,10 +34289,11 @@ unsafe fn drain_hosted_work_queues_at_passive_level(
             if !inst.ready || inst.exec_shared_va == 0 {
                 continue;
             }
-            let head = read_volatile((inst.exec_shared_va + SH_WORK_QUEUE_HEAD) as *const u64);
-            let tail = read_volatile((inst.exec_shared_va + SH_WORK_QUEUE_TAIL) as *const u64);
-            let drops = read_volatile((inst.exec_shared_va + SH_WORK_QUEUE_DROPS) as *const u64);
-            if head == tail && drops == 0 {
+            let drops = (&*((inst.exec_shared_va + SH_WORK_QUEUE_DROPS) as *const AtomicU64))
+                .load(Ordering::Relaxed);
+            if hosted_work_queue_admission(inst.exec_shared_va).peek_ready().is_none()
+                && drops == 0
+            {
                 continue;
             }
             let drained = match drain_hosted_work_queue_for_instance(
@@ -42695,6 +42715,15 @@ unsafe fn load_driver_reserved(
     write_volatile(
         (win.shared_va + SH_HOSTED_CURRENT_IRQL) as *mut u8,
         PASSIVE_LEVEL,
+    );
+    core::ptr::write_bytes(
+        (win.shared_va + SH_WORK_QUEUE_BASE) as *mut u8,
+        0,
+        SH_WORK_QUEUE_ARENA_BYTES as usize,
+    );
+    core::ptr::write(
+        (win.shared_va + SH_WORK_QUEUE_ADMISSION) as *mut SharedWorkQueueAdmission,
+        SharedWorkQueueAdmission::new(),
     );
     clear_dma_allocation_records(win.shared_va);
     clear_shared_registry_identity_at(win.shared_va);

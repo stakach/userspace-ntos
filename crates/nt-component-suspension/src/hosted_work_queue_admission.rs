@@ -52,6 +52,21 @@ pub struct HostedWorkQueuePending {
     slot: usize,
 }
 
+/// Read-only cursor sample for diagnostics. Concurrent movement can make the
+/// three loads non-atomic as a group; admission decisions use the slot phases.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostedWorkQueueCursors {
+    reserved: u64,
+    dequeued: u64,
+    retired: u64,
+}
+
+impl HostedWorkQueueCursors {
+    pub fn reserved(self) -> u64 { self.reserved }
+    pub fn dequeued(self) -> u64 { self.dequeued }
+    pub fn retired(self) -> u64 { self.retired }
+}
+
 impl HostedWorkQueuePending {
     pub fn sequence(self) -> u64 { self.sequence }
     pub fn slot(self) -> usize { self.slot }
@@ -80,6 +95,14 @@ impl<const N: usize> HostedWorkQueueAdmission<N> {
         Self { id, next: AtomicU64::new(0), dequeue: AtomicU64::new(0),
             retired: AtomicU64::new(0),
             slots: core::array::from_fn(|_| AtomicU64::new(VACANT)) }
+    }
+
+    pub fn cursors(&self) -> HostedWorkQueueCursors {
+        HostedWorkQueueCursors {
+            reserved: self.next.load(Ordering::Acquire),
+            dequeued: self.dequeue.load(Ordering::Acquire),
+            retired: self.retired.load(Ordering::Acquire),
+        }
     }
 
     /// Claim a free slot without exposing its payload to the consumer. A full queue retains

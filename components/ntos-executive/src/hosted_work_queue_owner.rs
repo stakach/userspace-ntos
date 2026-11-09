@@ -4,7 +4,7 @@
 //! and authenticate its physical route, dispatch, TCB, Reply, and epoch before root resumes it.
 
 use super::*;
-use nt_component_suspension::HostedWorkQueueClaim;
+use nt_component_suspension::{HostedWorkQueueClaim, HostedWorkQueueReady};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) struct QueueEntryKey {
@@ -38,6 +38,7 @@ struct Row {
     sequence: u64,
     file_floor: u64,
     claim: HostedWorkQueueClaim<QueueEntryKey, QueueEntry>,
+    admission: Option<HostedWorkQueueReady>,
     ndis: Option<HostedProviderNdisWorkItemDispatch>,
     pump: Option<component_scheduler::HostedPumpRestore>,
     child_step: Option<crate::service_sec_image::NestedChildStep>,
@@ -119,10 +120,49 @@ pub(super) unsafe fn claim(
     let Some(sequence) = sequence else { return false; };
     rows[index] = Some(Row {
         sequence, file_floor, claim: HostedWorkQueueClaim::dequeue(key, entry),
+        admission: None,
         ndis: None, pump: None, child_step: None, resuming: false, terminal_ack: None,
     });
     trace_queued_callback(1, index, sequence);
     true
+}
+
+/// The owner row was reserved before the ring's published slot was claimed. Store
+/// its one-use ticket before clearing the payload or invoking any callback.
+pub(super) unsafe fn record_admission(
+    index: usize, key: QueueEntryKey, ready: HostedWorkQueueReady,
+) -> bool {
+    let Some(row) = (&mut *core::ptr::addr_of_mut!(CLAIMS))
+        .get_mut(index).and_then(Option::as_mut) else { return false; };
+    if row.claim.invocation() != key || row.admission.is_some()
+        || row.claim.entered()
+    { return false; }
+    row.admission = Some(ready);
+    ready.sequence() == key.head
+        && ready.slot() as u64 == key.head % SH_WORK_QUEUE_CAPACITY
+}
+
+/// No queue claim occurred. Remove only the exact pre-entry reservation; the
+/// still-published ring slot remains available for a later root admission.
+pub(super) unsafe fn discard_unclaimed(index: usize, key: QueueEntryKey) -> bool {
+    let rows = &mut *core::ptr::addr_of_mut!(CLAIMS);
+    let Some(row) = rows.get_mut(index).and_then(Option::as_mut) else { return false; };
+    if row.claim.invocation() != key || row.admission.is_some()
+        || row.ndis.is_some() || row.claim.abort_before_enter(key).is_err()
+    { return false; }
+    rows[index] = None;
+    true
+}
+
+unsafe fn acknowledge_admission(index: usize, row: &Row) -> bool {
+    let Some(ready) = row.admission else { return false; };
+    let Some(inst) = instance(index) else { return false; };
+    let key = row.claim.invocation();
+    if inst.exec_shared_va == 0 || inst.hosted_domain_id != key.domain_id
+        || inst.hosted_domain_cookie != key.domain_cookie || ready.sequence() != key.head
+        || ready.slot() as u64 != key.head % SH_WORK_QUEUE_CAPACITY
+    { return false; }
+    hosted_work_queue_admission(inst.exec_shared_va).acknowledge(ready).is_ok()
 }
 
 pub(super) unsafe fn pending(index: usize) -> bool {
@@ -168,7 +208,10 @@ pub(super) unsafe fn record_ndis(
 pub(super) unsafe fn acknowledge_return(index: usize, key: QueueEntryKey) -> bool {
     let rows = &mut *core::ptr::addr_of_mut!(CLAIMS);
     let Some(row) = rows.get_mut(index).and_then(Option::as_mut) else { return false; };
-    if row.pump.is_some() || row.child_step.is_some() || row.resuming { return false; }
+    if row.pump.is_some() || row.child_step.is_some() || row.resuming
+        || row.claim.invocation() != key || !row.claim.entered()
+        || !acknowledge_admission(index, row)
+    { return false; }
     if row.claim.acknowledge_return(key).is_err() { return false; }
     trace_queued_callback(5, index, row.sequence);
     rows[index] = None;
@@ -188,6 +231,7 @@ unsafe fn acknowledge_resumed_return(selector: QueuedCallbackSelector) -> bool {
         || !(row.resuming && row.pump.is_none()
             || !row.resuming && matches!(row.pump.as_ref(),
                 Some(component_scheduler::HostedPumpRestore::Restored(pr)) if pr.completed))
+        || !row.claim.entered() || !acknowledge_admission(selector.index, row)
         || row.claim.acknowledge_return(selector.key).is_err()
     { return false; }
     rows[selector.index] = None;
@@ -210,7 +254,10 @@ unsafe fn mark_terminal_ack(selector: QueuedCallbackSelector, status: i32) -> bo
 pub(super) unsafe fn abort_before_enter(index: usize, key: QueueEntryKey) -> bool {
     let rows = &mut *core::ptr::addr_of_mut!(CLAIMS);
     let Some(row) = rows.get_mut(index).and_then(Option::as_mut) else { return false; };
-    if row.ndis.is_some() || row.claim.abort_before_enter(key).is_err() { return false; }
+    if row.ndis.is_some() || row.claim.invocation() != key || row.claim.entered()
+        || !acknowledge_admission(index, row)
+        || row.claim.abort_before_enter(key).is_err()
+    { return false; }
     rows[index] = None;
     true
 }
