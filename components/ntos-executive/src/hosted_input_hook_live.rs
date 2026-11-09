@@ -226,6 +226,22 @@ fn trace_port_source(stage: u64, work: &PortSource, detail: u64) {
     print_str(b"\n");
 }
 
+fn trace_class_source(stage: u64, work: &ClassSource, target: u64) {
+    static CLASS_TRACE_COUNT: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    if CLASS_TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 96
+    {
+        return;
+    }
+    print_str(b"[hook-class-source] stage/owner/source-irp/file-irp/target=");
+    print_u64(stage);
+    print_str(b"/"); print_u64(work.owner_id);
+    print_str(b"/0x"); print_hex_u64(work.irp);
+    print_str(b"/0x"); print_hex_u64(work.pending.map_or(0, |id| id.raw()));
+    print_str(b"/0x"); print_hex_u64(target);
+    print_str(b"\n");
+}
+
 fn class_sources() -> &'static mut Vec<Box<ClassSource>> {
     unsafe { &mut *core::ptr::addr_of_mut!(CLASS_SOURCES) }
 }
@@ -538,20 +554,25 @@ unsafe fn advance_class_source(work: &mut ClassSource) {
             target: work.port_device,
             control_code: work.control_code,
         });
+        trace_class_source(40, work, work.port_device.device_id().raw());
         let result = hosted_file_owners::dispatch_mutable_method_neither_suspend_aware(
             work.caller,
             hook_request(work.caller, work.port_device, work.control_code, work.input_length),
             &work.input[..work.input_length],
             work.port_device.device_id(), work.owner_id,
         );
+        trace_class_source(41, work, work.port_device.device_id().raw());
         assert_eq!(active_port().pop().map(|row| row.target), Some(work.port_device));
+        trace_class_source(42, work, work.port_device.device_id().raw());
         match result {
             Ok(hosted_file_owners::HookDispatchResult::Returned(
                 hosted_file_owners::DispatchResult::Returned {
                 status, information: 0, buffers, ..
             })) => {
                 let (updated, _) = buffers.into_parts();
+                trace_class_source(43, work, work.port_device.device_id().raw());
                 class_terminal(work, status, &updated);
+                trace_class_source(44, work, work.port_device.device_id().raw());
             }
             Ok(hosted_file_owners::HookDispatchResult::Returned(
                 hosted_file_owners::DispatchResult::Outstanding { irp_id })) => {
@@ -650,9 +671,11 @@ unsafe fn advance_class_source(work: &mut ClassSource) {
             }
             work.pin_released = true;
         }
+        trace_class_source(45, work, work.port_device.device_id().raw());
         work.published = work.origin.reply_dispatch(
             HostedForwardDispatchReply::InlineTerminal(status.raw()), true,
         );
+        trace_class_source(46, work, work.port_device.device_id().raw());
     }
 }
 
@@ -778,6 +801,7 @@ unsafe fn advance_port_source(work: &mut PortSource) {
         };
         work.class_alias = Some(class_alias);
         active().push(class_alias);
+        trace_port_source(40, work, ticket.target.device_id().raw());
         let result = hosted_file_owners::dispatch_mutable_method_neither_suspend_aware(
             work.caller,
             hook_request(work.caller, ticket.target, ticket.control_code,
@@ -785,7 +809,9 @@ unsafe fn advance_port_source(work: &mut PortSource) {
             &ticket.input[..ticket.input_length as usize],
             ticket.target.device_id(), work.owner_id,
         );
+        trace_port_source(41, work, ticket.target.device_id().raw());
         assert_eq!(active().pop().map(|row| row.owner_id), Some(work.owner_id));
+        trace_port_source(42, work, ticket.target.device_id().raw());
         match result {
             Ok(hosted_file_owners::HookDispatchResult::Returned(
                 hosted_file_owners::DispatchResult::Returned {
