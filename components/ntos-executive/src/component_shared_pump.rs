@@ -1220,6 +1220,7 @@ pub(super) unsafe fn autonomous(ch: &PumpChannel) -> bool {
 
 /// Persistent dispatch workers retain their invocation across a service wait; unlike autonomous
 /// threads, the service ACK cannot finish their enclosing dispatch.
+#[track_caller]
 pub(super) unsafe fn service_wait_yields(ch: &PumpChannel) -> bool {
     if autonomous(ch) { return true; }
     if ch.caps.kind != ReqKind::Irp { return false; }
@@ -1230,10 +1231,23 @@ pub(super) unsafe fn service_wait_yields(ch: &PumpChannel) -> bool {
     // The exact class source has already parked its CONNECT Call. Its retained owner must
     // redrive the port provider before this receiver can deliver the first service Reply.
     if crate::driver_launch::parked_hosted_connect_source_channel(ch) { return false; }
-    matches!(runtime::channel_route(ch).and_then(|route| route.ok_or(runtime::Error::UnknownPeer))
+    let yields = matches!(runtime::channel_route(ch).and_then(|route| route.ok_or(runtime::Error::UnknownPeer))
         .and_then(|route| runtime::physical_source(route)),
         Ok(source) if matches!(source.domain, runtime::PhysicalDomain::Hosted(_))
-            && matches!(source.kind, runtime::PhysicalSourceKind::DispatchWorker { .. }))
+            && matches!(source.kind, runtime::PhysicalSourceKind::DispatchWorker { .. }));
+    if crate::driver_launch::hosted_connect_pending_reply_published() {
+        static TRACE_COUNT: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        if TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 48 {
+            crate::print_str(b"[connect-service-wait] caller/tcb/reply/yields=");
+            crate::print_u64(core::panic::Location::caller().line() as u64);
+            crate::print_str(b"/"); crate::print_u64(ch.tcb);
+            crate::print_str(b"/"); crate::print_u64(ch.reply_cap);
+            crate::print_str(b"/"); crate::print_u64(u64::from(yields));
+            crate::print_str(b"\n");
+        }
+    }
+    yields
 }
 
 pub(super) unsafe fn service_autonomous(route: PeerRoute) -> Result<(), runtime::Error> {

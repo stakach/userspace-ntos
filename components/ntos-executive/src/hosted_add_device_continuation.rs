@@ -184,6 +184,12 @@ impl AddDevicePumpContinuation {
         let Some(pump) = self.pump.take() else {
             return AddDevicePumpProgress::RetainedRefusal(self);
         };
+        trace_add_device_resume_gate(42, match &pump {
+            component_scheduler::HostedPumpRestore::ChildWorkReady { .. } => 1,
+            component_scheduler::HostedPumpRestore::ChildWorkPending(_) => 2,
+            component_scheduler::HostedPumpRestore::Retained { .. } => 3,
+            _ => 4,
+        });
         let next = match pump {
             component_scheduler::HostedPumpRestore::ChildWorkReady { .. } => {
                 let Some(step) = self.child_step.take() else {

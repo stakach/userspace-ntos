@@ -639,9 +639,12 @@ pub(super) unsafe fn retry_retained_add_device_restore(
         HostedPumpRestore::Retained { result, key, ticket, retryable }
             if retryable && key.scope() == ticket.identity() =>
         {
+            trace_connect_retained_restore(0);
             if runtime::nested::restore_pending_ticket(ticket).is_ok() {
+                trace_connect_retained_restore(1);
                 HostedPumpRestore::Restored(result)
             } else {
+                trace_connect_retained_restore(2);
                 HostedPumpRestore::Retained {
                     result, key, ticket,
                     retryable: runtime::nested::pending_ticket(ticket),
@@ -650,6 +653,15 @@ pub(super) unsafe fn retry_retained_add_device_restore(
         }
         other => other,
     }
+}
+
+fn trace_connect_retained_restore(stage: u64) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if !crate::driver_launch::hosted_connect_pending_reply_published()
+        || COUNT.fetch_add(1, Ordering::Relaxed) >= 16 { return; }
+    print_str(b"[connect-retained-restore] stage=");
+    print_u64(stage);
+    print_str(b"\n");
 }
 
 // Nonretryable child restore exits. Reasons 1..8 are pre/at receive;
@@ -671,6 +683,7 @@ fn trace_connect_child_restore(reason: u64, pending: &PendingChildWorkRestore) {
 
 unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> HostedPumpRestore {
     use crate::spawn_hosts::shared_ingress::owner::runtime;
+    trace_connect_child_restore(20, &pending);
     let route = match runtime::channel_route(&pending.channel) {
         Ok(Some(route)) if runtime::dispatch(route).ok() == Some(pending.dispatch) => route,
         _ => {
@@ -734,6 +747,7 @@ unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> Hos
         return HostedPumpRestore::ChildWorkPending(pending);
     }
     let scope = ComponentSchedulerScope::enter();
+    trace_connect_child_restore(21, &pending);
     let receive = match pending.mode {
         PendingReceiveMode::ChildWork =>
             crate::spawn_hosts::component_pump_continue_nested_child_work_receive(
@@ -744,6 +758,7 @@ unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> Hos
                 &pending.channel, &pending.result,
             ).map_err(|status| (status, None)),
     };
+    trace_connect_child_restore(22, &pending);
     let mut result = match receive {
         Ok(result) => result,
         Err((status, receipt)) => {

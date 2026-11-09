@@ -2041,15 +2041,19 @@ impl PumpLoopOutcome {
 
 /// Receive only through the shared, retained ingress owner.
 #[inline(never)]
+#[track_caller]
 unsafe fn pump_recv(ch: &PumpChannel, _reply_cap: u64) -> PumpMessage {
     pump_recv_with_scheduler_checkpoint(ch, false)
 }
 
 /// Scheduler work has already run for this retained receive half. A blocking receive gives
 /// lower-priority component workers a chance to publish READY even if timer demand renews.
+#[track_caller]
 unsafe fn pump_recv_with_scheduler_checkpoint(
     ch: &PumpChannel, serviced_scheduler_yield: bool,
 ) -> PumpMessage {
+    let caller_line = core::panic::Location::caller().line() as u64;
+    trace_connect_pump_receive(0, caller_line, ch, 0);
     let started = file_pump_diagnostic::start(ch);
     let result = match shared_ingress::owner::runtime::channel_route(ch) {
         Ok(Some(route)) => shared_pump::receive(ch, route, false, serviced_scheduler_yield),
@@ -2059,7 +2063,20 @@ unsafe fn pump_recv_with_scheduler_checkpoint(
         }
     };
     file_pump_diagnostic::record_receive(started);
+    trace_connect_pump_receive(1, caller_line, ch, result.label());
     result
+}
+
+fn trace_connect_pump_receive(stage: u64, caller_line: u64, ch: &PumpChannel, label: u64) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if !crate::driver_launch::hosted_connect_pending_reply_published()
+        || COUNT.fetch_add(1, Ordering::Relaxed) >= 96 { return; }
+    crate::print_str(b"[connect-pump-receive] stage/caller/tcb/reply/label=");
+    crate::print_u64(stage); crate::print_str(b"/");
+    crate::print_u64(caller_line); crate::print_str(b"/");
+    crate::print_u64(ch.tcb); crate::print_str(b"/");
+    crate::print_u64(ch.reply_cap); crate::print_str(b"/");
+    crate::print_u64(label); crate::print_str(b"\n");
 }
 
 /// A handler exchange cannot shed its one-shot walk or its parent IRP at a scheduler checkpoint.
