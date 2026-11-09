@@ -67710,6 +67710,10 @@ pub(crate) fn hosted_connect_pending_reply_published() -> bool {
     hosted_connect_live::pending_reply_published()
 }
 
+pub(crate) fn hosted_connect_root_probe_phase() -> u64 {
+    hosted_connect_live::root_probe_phase()
+}
+
 pub(crate) unsafe fn redrive_nested_hosted_connect_forward() -> bool {
     hosted_connect_live::redrive_nested_ready()
 }

@@ -10922,6 +10922,9 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
             };
+            trace_connect_add_device_boundary(3, u64::from(still_parked)
+                | (u64::from(awaiting_connect_child) << 1)
+                | (u64::from(ran_child) << 2));
             if !still_parked {
                 if root_add_device_turn.as_ref().and_then(|turn|
                     turn.retained_ingress(reservation).ok().flatten())
@@ -11002,7 +11005,9 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 root_event_consumed = true;
             }
-            if !prepare_parked_add_device_receive(&mut root_add_device_turn) {
+            let prepared = prepare_parked_add_device_receive(&mut root_add_device_turn);
+            trace_connect_add_device_boundary(4, u64::from(prepared));
+            if !prepared {
                 stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                 stop_ssn = 0;
                 break 'service_loop;
@@ -28148,7 +28153,44 @@ unsafe fn trace_connect_root_checkpoint(
     print_str(b"\n");
 }
 
+// Stages: 1 recorded pump result (0 no work, 1 returned, 2 yielded,
+// 3 retained, 4 blocked), 2 settlement (1 settled, 2 awaiting, 3 retained,
+// 4 blocked), 3 AddDevice still-parked/awaiting-child/ran-child bits,
+// 4 parked receive prepared. Phase comes from the live CONNECT owner.
+unsafe fn trace_connect_add_device_boundary(stage: u64, detail: u64) {
+    static COUNT: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    if !crate::driver_launch::hosted_connect_pending_reply_published() { return; }
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 32 { return; }
+    print_str(b"[connect-add-device] stage/detail/phase/unsettled=");
+    print_u64(stage); print_str(b"/"); print_u64(detail); print_str(b"/");
+    print_u64(crate::driver_launch::hosted_connect_root_probe_phase()); print_str(b"/");
+    print_u64(u64::from(crate::driver_launch::unsettled_suspended_connect_pump()));
+    print_str(b"\n");
+}
+
+unsafe fn trace_connect_pump_progress(progress: &crate::driver_launch::PortConnectPumpProgress) {
+    use crate::driver_launch::PortConnectPumpProgress as Progress;
+    let code = match progress {
+        Progress::NoWork => 0, Progress::Returned => 1, Progress::Yielded => 2,
+        Progress::Retained => 3, Progress::Blocked => 4,
+    };
+    trace_connect_add_device_boundary(1, code);
+}
+
 unsafe fn settle_suspended_connect_pumps() -> ConnectPumpSettlement {
+    let result = settle_suspended_connect_pumps_inner();
+    let code = match &result {
+        ConnectPumpSettlement::Settled => 1,
+        ConnectPumpSettlement::AwaitingLocalChild => 2,
+        ConnectPumpSettlement::Retained => 3,
+        ConnectPumpSettlement::Blocked => 4,
+    };
+    trace_connect_add_device_boundary(2, code);
+    result
+}
+
+unsafe fn settle_suspended_connect_pumps_inner() -> ConnectPumpSettlement {
     use crate::driver_launch::PortConnectPumpProgress as Progress;
     crate::driver_launch::trace_port_connect_root_probe(80, 0);
     loop {
@@ -28163,7 +28205,9 @@ unsafe fn settle_suspended_connect_pumps() -> ConnectPumpSettlement {
                 ConnectPumpSettlement::Settled => {}
                 other => return other,
             }
-            match crate::driver_launch::redrive_recorded_connect_pump(selector) {
+            let progress = crate::driver_launch::redrive_recorded_connect_pump(selector);
+            trace_connect_pump_progress(&progress);
+            match progress {
                 Progress::Blocked => return ConnectPumpSettlement::Blocked,
                 Progress::Retained => return ConnectPumpSettlement::Retained,
                 Progress::NoWork | Progress::Returned | Progress::Yielded => continue,
@@ -28204,7 +28248,9 @@ unsafe fn settle_suspended_connect_pumps() -> ConnectPumpSettlement {
             ConnectPumpSettlement::Retained => return ConnectPumpSettlement::Retained,
             ConnectPumpSettlement::Blocked => return ConnectPumpSettlement::Blocked,
         }
-        match crate::driver_launch::redrive_recorded_connect_pump(selector) {
+        let progress = crate::driver_launch::redrive_recorded_connect_pump(selector);
+        trace_connect_pump_progress(&progress);
+        match progress {
             Progress::Blocked => return ConnectPumpSettlement::Blocked,
             Progress::Retained => return ConnectPumpSettlement::Retained,
             Progress::Yielded if !ran_child => return ConnectPumpSettlement::AwaitingLocalChild,

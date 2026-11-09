@@ -829,6 +829,23 @@ pub(super) fn pending_reply_published() -> bool {
     rows().iter().flatten().any(|work| work.source.origin().pending())
 }
 
+/// Read-only phase of the first live CONNECT row for the AddDevice root probe.
+pub(super) fn root_probe_phase() -> u64 {
+    rows().iter().flatten().find(|work| work.provider_entered)
+        .map_or(0, |work| match work.port.phase() {
+            hosted_input_connect_dispatch::PortConnectPhase::Prepared => 1,
+            hosted_input_connect_dispatch::PortConnectPhase::Entered => 2,
+            hosted_input_connect_dispatch::PortConnectPhase::Rejected(_) => 3,
+            hosted_input_connect_dispatch::PortConnectPhase::PumpSuspended(_, _) => 4,
+            hosted_input_connect_dispatch::PortConnectPhase::PumpStepClaimed(_, _) => 5,
+            hosted_input_connect_dispatch::PortConnectPhase::PumpRestoreRetry(_, _) => 6,
+            hosted_input_connect_dispatch::PortConnectPhase::PumpBlocked => 7,
+            hosted_input_connect_dispatch::PortConnectPhase::AwaitingCompletion(_) => 8,
+            hosted_input_connect_dispatch::PortConnectPhase::Terminal(_) => 9,
+            hosted_input_connect_dispatch::PortConnectPhase::Acknowledged => 10,
+        })
+}
+
 pub(super) unsafe fn redrive_nested_ready() -> bool {
     trace_connect_redrive_if_pending(0, true);
     let progress = || {
