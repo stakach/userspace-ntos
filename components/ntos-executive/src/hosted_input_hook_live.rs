@@ -226,6 +226,30 @@ fn trace_port_source(stage: u64, work: &PortSource, detail: u64) {
     print_str(b"\n");
 }
 
+/// Dispatch kind: 1 returned, 2 outstanding, 3 suspended, 4 status refusal,
+/// 5 unowned yield, 6 unexpected returned shape. A key bit records presence;
+/// the exact IRP and owner are printed without inspecting provider-owned memory.
+fn trace_port_dispatch(
+    stage: u64, work: &PortSource, kind: u64, irp: u64, key: bool,
+    status: u64, information: u64,
+) {
+    if HOOK_PORT_TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        >= HOOK_PORT_TRACE_LIMIT
+    {
+        return;
+    }
+    print_str(b"[hook-port-dispatch] stage/owner/source-irp/irp/kind/key/status/info=");
+    print_u64(stage);
+    print_str(b"/"); print_u64(work.owner_id);
+    print_str(b"/0x"); print_hex_u64(work.source.source_irp_address());
+    print_str(b"/0x"); print_hex_u64(irp);
+    print_str(b"/"); print_u64(kind);
+    print_str(b"/"); print_u64(u64::from(key));
+    print_str(b"/0x"); print_hex_u64(status);
+    print_str(b"/0x"); print_hex_u64(information);
+    print_str(b"\n");
+}
+
 fn trace_class_source(stage: u64, work: &ClassSource, target: u64) {
     static CLASS_TRACE_COUNT: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
@@ -233,12 +257,13 @@ fn trace_class_source(stage: u64, work: &ClassSource, target: u64) {
     {
         return;
     }
-    print_str(b"[hook-class-source] stage/owner/source-irp/file-irp/target=");
+    print_str(b"[hook-class-source] stage/owner/source-irp/file-irp/target/published=");
     print_u64(stage);
     print_str(b"/"); print_u64(work.owner_id);
     print_str(b"/0x"); print_hex_u64(work.irp);
     print_str(b"/0x"); print_hex_u64(work.pending.map_or(0, |id| id.raw()));
     print_str(b"/0x"); print_hex_u64(target);
+    print_str(b"/"); print_u64(u64::from(work.published));
     print_str(b"\n");
 }
 
@@ -815,51 +840,79 @@ unsafe fn advance_port_source(work: &mut PortSource) {
         match result {
             Ok(hosted_file_owners::HookDispatchResult::Returned(
                 hosted_file_owners::DispatchResult::Returned {
-                status, information: 0, buffers, ..
+                irp_id, status, information: 0, buffers, ..
             })) => {
+                trace_port_dispatch(43, work, 1, irp_id.raw(), false,
+                    status.raw() as u32 as u64, 0);
                 let (updated, _) = buffers.into_parts();
                 trace_port_source(49, work, updated.len() as u64);
                 stage_port_terminal(work, status, &updated, None);
             }
             Ok(hosted_file_owners::HookDispatchResult::Returned(
                 hosted_file_owners::DispatchResult::Outstanding { irp_id })) => {
-                if work.source.record_pending(irp_id).is_err() { return; }
+                trace_port_dispatch(43, work, 2, irp_id.raw(), false, 0, 0);
+                let recorded = work.source.record_pending(irp_id).is_ok();
+                trace_port_dispatch(44, work, 2, irp_id.raw(), false,
+                    u64::from(recorded), 0);
+                if !recorded { return; }
                 work.pending = Some(irp_id);
             }
             Ok(hosted_file_owners::HookDispatchResult::PumpSuspended { irp_id, key }) => {
-                if work.source.record_pending(irp_id).is_err() { return; }
+                trace_port_dispatch(43, work, 3, irp_id.raw(), true, 0, 0);
+                let recorded = work.source.record_pending(irp_id).is_ok();
+                trace_port_dispatch(44, work, 3, irp_id.raw(), true,
+                    u64::from(recorded), 0);
+                if !recorded { return; }
                 work.pending = Some(irp_id);
                 work.pump_key = Some(key);
             }
             Err(hosted_file_owners::HookDispatchFailure::Status(status)) => {
+                trace_port_dispatch(43, work, 4, 0, false,
+                    status.raw() as u32 as u64, 0);
                 // No class provider was entered. Complete this source through the usual
                 // sequence so its original Reply and pinned IRP can be retired.
                 stage_port_terminal(work, status,
                     &ticket.input[..ticket.input_length as usize], None);
             }
-            Err(failure @ hosted_file_owners::HookDispatchFailure::UnownedYield { .. }) => {
+            Err(failure @ hosted_file_owners::HookDispatchFailure::UnownedYield { status, .. }) => {
+                trace_port_dispatch(43, work, 5, 0, false,
+                    status.raw() as u32 as u64, 0);
                 work.unowned_yield = Some(failure);
                 work.blocked = true;
                 return;
             }
             Ok(hosted_file_owners::HookDispatchResult::Returned(
-                hosted_file_owners::DispatchResult::Returned { .. })) => {
+                hosted_file_owners::DispatchResult::Returned {
+                    irp_id, status, information, ..
+                })) => {
+                trace_port_dispatch(43, work, 6, irp_id.raw(), false,
+                    status.raw() as u32 as u64, information);
                 return;
             }
         }
+        trace_port_dispatch(45, work, 0, work.pending.map_or(0, |id| id.raw()),
+            work.pump_key.is_some(), 0, 0);
     }
     if work.terminal_candidate.is_none() {
         if let Some(irp_id) = work.pending {
             if let Some(key) = work.pump_key {
                 let device = work.source.class_target_registration().device_id();
                 match hosted_file_owners::hook_pump_state(irp_id, key, work.owner_id, device) {
-                    Ok(hosted_file_owners::HookPumpState::Suspended) => return,
+                    Ok(hosted_file_owners::HookPumpState::Suspended) => {
+                        trace_port_dispatch(50, work, 3, irp_id.raw(), true, 0, 0);
+                        return;
+                    }
                     Ok(hosted_file_owners::HookPumpState::Blocked) | Err(_) => {
+                        trace_port_dispatch(50, work, 4, irp_id.raw(), true, 0, 0);
                         work.blocked = true;
                         return;
                     }
-                    Ok(hosted_file_owners::HookPumpState::Pending) => work.pump_key = None,
+                    Ok(hosted_file_owners::HookPumpState::Pending) => {
+                        trace_port_dispatch(50, work, 2, irp_id.raw(), true, 0, 0);
+                        work.pump_key = None;
+                    }
                     Ok(hosted_file_owners::HookPumpState::Returned) => {
+                        trace_port_dispatch(50, work, 1, irp_id.raw(), true, 0, 0);
                         let mut updated = [0u8; 48];
                         let Ok(Some((status, 0, _))) =
                             hosted_file_owners::peek_returned_hook_pump(
@@ -914,7 +967,15 @@ pub(super) unsafe fn redrive() {
     let port_count = port_sources().len();
     for index in 0..port_count {
         let ptr = port_sources()[index].as_mut() as *mut PortSource;
+        if (*ptr).entered && !(*ptr).published {
+            trace_port_dispatch(80, &*ptr, 0,
+                (*ptr).pending.map_or(0, |id| id.raw()), (*ptr).pump_key.is_some(),
+                u64::from((*ptr).unowned_yield.is_some()), 0);
+        }
         if (*ptr).pump_key.is_some() || (*ptr).unowned_yield.is_some() { continue; }
+        if (*ptr).entered && !(*ptr).published {
+            trace_port_source(81, &*ptr, 0);
+        }
         advance_port_source(&mut *ptr);
     }
 }
@@ -989,6 +1050,11 @@ pub(super) unsafe fn redrive_returned_hook_pump() -> bool {
     let port_count = port_sources().len();
     for index in 0..port_count {
         let ptr = port_sources()[index].as_mut() as *mut PortSource;
+        if (*ptr).entered && !(*ptr).published {
+            trace_port_dispatch(82, &*ptr, 0,
+                (*ptr).pending.map_or(0, |id| id.raw()), (*ptr).pump_key.is_some(),
+                u64::from((*ptr).pump_return_consumed), u64::from((*ptr).published));
+        }
         if (*ptr).pump_return_consumed && !(*ptr).published
             || returned_hook_state((*ptr).pending, (*ptr).pump_key, (*ptr).owner_id,
                 (*ptr).source.class_target_registration().device_id())
