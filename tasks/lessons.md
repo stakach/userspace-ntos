@@ -812,3 +812,8 @@ diagnosis-free failure.
 ## Treat Partial Receipts As Samples, Not Complete Retry Histories
 - A gap between two traced CM acknowledged-BUSY outcomes is not a gap between all registry retries. Cross-check the work-row refusal census, transport phases, and checkpoint owner before claiming a missed wake or avoidable latency.
 - A missing process-wait trace does not prove the caller never waited when another native wait route may exist. Correlate the exact pipe payload, child work, event signal, and process retirement before assigning a blocked owner.
+
+## Identify Every Caller Before Treating A Missing Marker As A Stall
+- A function-level trace may come from a nested caller that never passes the expected outer wrapper. Map the exact return chain in the boot artifact before inferring a blocked syscall or missing wrapper return. In the Hook investigation, the stage-7 record came from the shared pump's nested File runner; the main-loop wrapper was never entered.
+- A saved return address proves the current call site, not that the call returned. Put a bounded marker after the call and after parent restoration before claiming the receiver advanced to its next blocking operation. Keep diagnostic gates independent of trace IDs that can be cleared by an earlier phase.
+- Apply a trace's target-state predicate before spending its capped record budget. A Hook receive marker counted twelve earlier receive-loop passes before the File pump became suspended and hid the one return it was meant to observe.

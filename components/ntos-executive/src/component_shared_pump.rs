@@ -18,6 +18,7 @@ static HOOK_NESTED_RETURN_PROBES: AtomicU64 = AtomicU64::new(0);
 
 fn trace_hook_nested_receive(stage: u64, ch: &PumpChannel, detail: u64) {
     if !crate::driver_launch::hosted_hook_port_waiting()
+        || !crate::driver_launch::generic_file_pump_unsettled()
         || HOOK_NESTED_RETURN_PROBES.fetch_add(1, Ordering::Relaxed) >= 12
     { return; }
     crate::print_str(b"[hook-nested-receive] stage/tcb/reply/child-capable/file-pump/detail=");
@@ -997,7 +998,9 @@ pub(super) unsafe fn receive(
             return PumpMessage::transport_wall();
         }
         trace_ps_create_receive(ch, b"route-next", Some(route));
-        trace_hook_nested_receive(50, ch, u64::from(observed_nested_file));
+        if observed_nested_file {
+            trace_hook_nested_receive(50, ch, 1);
+        }
         let next_result = {
             let _stage = StageScope::enter(ch, Stage::NextMessage);
             runtime::next_message(route)
