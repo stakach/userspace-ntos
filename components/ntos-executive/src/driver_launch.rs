@@ -51382,11 +51382,16 @@ struct HostedDeviceDispatchContext {
     binding: HostedDeviceBinding,
 }
 
-static mut HOSTED_DEVICE_DISPATCH_CONTEXTS: Option<Vec<HostedDeviceDispatchContext>> = None;
+type HostedDeviceContextTicket =
+    nt_user_host::retained_owner_table::RetainedOwnerTicket<(usize, u64)>;
+type HostedDeviceContextLeases = nt_user_host::durable_context_lease::DurableContextLeases<
+    (usize, u64), HostedDeviceDispatchContext,
+>;
+
+static mut HOSTED_DEVICE_DISPATCH_CONTEXTS: Option<HostedDeviceContextLeases> = None;
 
 struct HostedDeviceDispatchContextGuard {
-    instance: usize,
-    device_id: u64,
+    ticket: HostedDeviceContextTicket,
 }
 
 impl HostedDeviceDispatchContextGuard {
@@ -51414,14 +51419,23 @@ impl HostedDeviceDispatchContextGuard {
             return Err(nt_status::NtStatus::INVALID_PARAMETER);
         }
         let contexts = hosted_device_dispatch_contexts_mut();
-        contexts
-            .try_reserve(1)
+        let reservation = contexts.reserve()
             .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-        contexts.push(HostedDeviceDispatchContext { instance, binding });
-        Ok(Self {
-            instance,
-            device_id: binding.device_id,
-        })
+        let ticket = match contexts.retain(
+            reservation, (instance, binding.device_id),
+            HostedDeviceDispatchContext { instance, binding },
+        ) {
+            Ok(ticket) => ticket,
+            Err(_) => {
+                let _ = contexts.cancel_reservation(reservation);
+                return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+            }
+        };
+        if contexts.bind(ticket).is_err() {
+            let _ = contexts.retire(ticket);
+            return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+        }
+        Ok(Self { ticket })
     }
 }
 
@@ -51429,21 +51443,18 @@ impl Drop for HostedDeviceDispatchContextGuard {
     fn drop(&mut self) {
         unsafe {
             let contexts = hosted_device_dispatch_contexts_mut();
-            let context = contexts
-                .pop()
-                .expect("hosted device dispatch context stack underflow");
-            assert!(
-                context.instance == self.instance && context.binding.device_id == self.device_id,
-                "hosted device dispatch context stack lost LIFO ownership"
-            );
+            contexts.unbind(self.ticket)
+                .expect("hosted device dispatch context stack lost LIFO ownership");
+            contexts.retire(self.ticket)
+                .expect("hosted device dispatch context lost its exact owner");
         }
     }
 }
 
-unsafe fn hosted_device_dispatch_contexts_mut() -> &'static mut Vec<HostedDeviceDispatchContext> {
+unsafe fn hosted_device_dispatch_contexts_mut() -> &'static mut HostedDeviceContextLeases {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_DISPATCH_CONTEXTS);
     if slot.is_none() {
-        *slot = Some(Vec::new());
+        *slot = Some(HostedDeviceContextLeases::new());
     }
     slot.as_mut().unwrap()
 }
@@ -51451,9 +51462,7 @@ unsafe fn hosted_device_dispatch_contexts_mut() -> &'static mut Vec<HostedDevice
 fn current_hosted_device_dispatch_binding(instance: usize) -> Option<HostedDeviceBinding> {
     let contexts = unsafe { (*core::ptr::addr_of!(HOSTED_DEVICE_DISPATCH_CONTEXTS)).as_ref()? };
     let binding = contexts
-        .iter()
-        .rev()
-        .find(|context| context.instance == instance)?
+        .find_active(|context| context.instance == instance)?
         .binding;
     hosted_device_binding_by_device_id(binding.device_id).filter(|current| {
         current.driver_id == binding.driver_id
@@ -51505,9 +51514,7 @@ fn current_hosted_device_dispatch_binding_for_projection(
             .ok_or(HostedProjectionBindingRejection::ContextTable)?
     };
     let binding = contexts
-        .iter()
-        .rev()
-        .find(|context| {
+        .find_active(|context| {
             context.instance == projection_instance
                 || context.binding.projection_instance == projection_instance
         })

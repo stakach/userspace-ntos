@@ -88,6 +88,14 @@ impl<K: Copy + Eq, B> DurableContextLeases<K, B> {
         self.rows.get(self.active_ticket()?)
     }
 
+    /// Select the nearest matching active context without exposing the binding stack. An
+    /// unrelated nested slice does not hide an older context for another instance.
+    pub fn find_active(&self, mut matches: impl FnMut(&B) -> bool) -> Option<&B> {
+        self.active.iter().rev()
+            .filter_map(|ticket| self.rows.get(*ticket))
+            .find(|bundle| matches(bundle))
+    }
+
     pub fn active_mut(&mut self) -> Option<&mut B> {
         let ticket = self.active_ticket()?;
         self.rows.get_mut(ticket)

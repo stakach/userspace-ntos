@@ -57,3 +57,22 @@ fn durable_context_lease_refusal_keeps_the_held_bundle() {
     assert_eq!(leases.get(held), Some(&"held"));
     assert_eq!(leases.retire(held), Ok("held"));
 }
+
+#[test]
+fn durable_context_lease_find_active_uses_nearest_matching_nested_binding() {
+    let mut leases = DurableContextLeases::<u64, (u64, &'static str)>::new();
+    let outer_reservation = leases.reserve().unwrap();
+    let outer = leases.retain(outer_reservation, 1, (1, "outer")).unwrap();
+    leases.bind(outer).unwrap();
+    let other_reservation = leases.reserve().unwrap();
+    let other = leases.retain(other_reservation, 2, (2, "other")).unwrap();
+    leases.bind(other).unwrap();
+    assert_eq!(leases.find_active(|(instance, _)| *instance == 1), Some(&(1, "outer")));
+    let inner_reservation = leases.reserve().unwrap();
+    let inner = leases.retain(inner_reservation, 3, (1, "inner")).unwrap();
+    leases.bind(inner).unwrap();
+    assert_eq!(leases.find_active(|(instance, _)| *instance == 1), Some(&(1, "inner")));
+    leases.unbind(inner).unwrap();
+    assert_eq!(leases.find_active(|(instance, _)| *instance == 1), Some(&(1, "outer")));
+    assert_eq!(leases.find_active(|(instance, _)| *instance == 3), None);
+}
