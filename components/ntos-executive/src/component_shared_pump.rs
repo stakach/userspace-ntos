@@ -14,6 +14,20 @@ use nt_component_suspension::peer_registry::PeerRoute;
 static ACTIVE_IRP_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SYSCALL_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_RETAINED_SEH_RECEIVES: AtomicU64 = AtomicU64::new(0);
+static HOOK_NESTED_RETURN_PROBES: AtomicU64 = AtomicU64::new(0);
+
+fn trace_hook_nested_receive(stage: u64, ch: &PumpChannel, detail: u64) {
+    if !crate::driver_launch::hosted_hook_port_waiting()
+        || HOOK_NESTED_RETURN_PROBES.fetch_add(1, Ordering::Relaxed) >= 12
+    { return; }
+    crate::print_str(b"[hook-nested-receive] stage/tcb/reply/child-capable/file-pump/detail=");
+    crate::print_u64(stage); crate::print_str(b"/");
+    crate::print_u64(ch.tcb); crate::print_str(b"/");
+    crate::print_u64(ch.reply_cap); crate::print_str(b"/");
+    crate::print_u64(u64::from(ch.child_work_capable)); crate::print_str(b"/");
+    crate::print_u64(u64::from(crate::driver_launch::generic_file_pump_unsettled()));
+    crate::print_str(b"/"); crate::print_u64(detail); crate::print_str(b"\n");
+}
 const ACTIVE_IRP_SNAPSHOT_SLOTS: usize = 8;
 const SNAPSHOT_CLAIMED: u64 = u64::MAX;
 static NEXT_IRP_SNAPSHOT: AtomicU64 = AtomicU64::new(1);
@@ -947,13 +961,16 @@ pub(super) unsafe fn receive(
             observed_nested_file = true;
             crate::driver_launch::trace_port_connect_outer_probe(40, ch, u64::from(parent.is_some()));
             let progressed = crate::service_sec_image::redrive_nested_hosted_file_work();
+            trace_hook_nested_receive(41, ch, u64::from(progressed));
             crate::driver_launch::trace_port_connect_outer_probe(41, ch, u64::from(progressed));
             let ticket = parent.as_ref().map(|parent| parent.ticket());
             crate::driver_launch::trace_port_connect_outer_probe(42, ch, u64::from(ticket.is_some()));
             if runtime::nested::restore_or_retain(&mut parent).is_err() {
+                trace_hook_nested_receive(44, ch, u64::from(parent.is_some()));
                 crate::driver_launch::trace_port_connect_outer_probe(44, ch, 0);
                 return nested_restore_refusal(ticket);
             }
+            trace_hook_nested_receive(43, ch, u64::from(parent.is_some()));
             crate::driver_launch::trace_port_connect_outer_probe(43, ch, u64::from(progressed));
             if progressed { continue; }
         }
@@ -980,6 +997,7 @@ pub(super) unsafe fn receive(
             return PumpMessage::transport_wall();
         }
         trace_ps_create_receive(ch, b"route-next", Some(route));
+        trace_hook_nested_receive(50, ch, u64::from(observed_nested_file));
         let next_result = {
             let _stage = StageScope::enter(ch, Stage::NextMessage);
             runtime::next_message(route)
