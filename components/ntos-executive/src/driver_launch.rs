@@ -38489,31 +38489,35 @@ unsafe fn component_dispatch_provider_export_with_bank(shared: u64, jb: *mut u64
 }
 
 unsafe fn component_dispatch_provider_callback() -> (i32, u64) {
-    let target = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
+    component_dispatch_provider_callback_with_bank(
+        FSD_SHARED_VADDR, core::ptr::addr_of_mut!(BUGCHECK_JB) as *mut u64)
+}
+
+unsafe fn component_dispatch_provider_callback_with_bank(shared: u64, jb: *mut u64) -> (i32, u64) {
+    let target = read_volatile((shared + SH_REQ_MINOR) as *const u64);
     if target == 0 {
         return (STATUS_INVALID_PARAMETER, 0);
     }
-    let arg0 = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
-    let arg1 = read_volatile((FSD_SHARED_VADDR + SH_REQ_INLEN) as *const u64);
-    let arg2 = read_volatile((FSD_SHARED_VADDR + SH_REQ_OUTLEN) as *const u64);
-    let arg3 = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
-    let jb = &mut *core::ptr::addr_of_mut!(BUGCHECK_JB);
-    jb[0] = 0;
-    jb[1] = 0;
-    jb[2] = 0;
+    let arg0 = read_volatile((shared + SH_REQ_FSCTL) as *const u64);
+    let arg1 = read_volatile((shared + SH_REQ_INLEN) as *const u64);
+    let arg2 = read_volatile((shared + SH_REQ_OUTLEN) as *const u64);
+    let arg3 = read_volatile((shared + SH_REQ_FILEID) as *const u64);
+    *jb.add(0) = 0;
+    *jb.add(1) = 0;
+    *jb.add(2) = 0;
     let mut args = [0u64; 12];
     args[..4].copy_from_slice(&[arg0, arg1, arg2, arg3]);
     for index in 0..8 {
         args[index + 4] = read_volatile(
-            (FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_STACK_BASE + (index as u64) * 8) as *const u64,
+            (shared + SH_PROVIDER_EXPORT_STACK_BASE + (index as u64) * 8) as *const u64,
         );
     }
-    let boundary = read_volatile((FSD_SHARED_VADDR + SH_SEH_FOREIGN_CALL16_VA) as *const u64);
+    let boundary = read_volatile((shared + SH_SEH_FOREIGN_CALL16_VA) as *const u64);
     assert_ne!(boundary, 0, "hosted provider callback lacks its admitted PE boundary");
-    let result = fsd_guarded_call_vector(target, args.as_ptr(), 12, jb.as_mut_ptr(), boundary);
-    let bugchecked = jb[2] != 0;
-    jb[1] = 0;
-    jb[2] = 0;
+    let result = fsd_guarded_call_vector(target, args.as_ptr(), 12, jb, boundary);
+    let bugchecked = *jb.add(2) != 0;
+    *jb.add(1) = 0;
+    *jb.add(2) = 0;
     if bugchecked {
         return (STATUS_UNSUCCESSFUL, 0);
     }
