@@ -21,6 +21,6 @@ fn nested_start_fdo_uses_retained_process_authority_without_file_handler() {
     assert!(handlerless.contains("nested_hosted_start_fdo_ready()"));
     assert!(handlerless.contains("redrive_nested_hosted_start_fdo()"));
     let outer = &service[service.find("pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {").unwrap()..];
-    let guard = &outer[..outer.find("// Check each owner just before entering its runner.").unwrap()];
+    let guard = &outer[..outer.find("nested_hosted_driver_create_ready()").unwrap()];
     assert!(guard.contains("if handler.is_null() { return redrive_nested_hosted_input_work(); }"));
 }

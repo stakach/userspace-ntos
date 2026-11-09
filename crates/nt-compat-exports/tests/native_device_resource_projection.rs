@@ -107,7 +107,7 @@ fn ordinary_dispatch_restores_selected_device_resources_before_native_entry() {
         .items
         .iter()
         .find_map(|item| match item {
-            Item::Fn(function) if function.sig.ident == "dispatch_irp_for_instance_exact" => {
+            Item::Fn(function) if function.sig.ident == "dispatch_irp_for_instance_exact_inner" => {
                 Some(function)
             }
             _ => None,
@@ -144,22 +144,18 @@ fn ordinary_dispatch_restores_selected_device_resources_before_native_entry() {
         contract.errors_return_not_dispatched,
         "propagate restoration failure as NotDispatched with its actual status"
     );
-    for statement in &dispatch.block.stmts[..position] {
-        assert!(
-            !statement_facts(statement)
-                .calls
-                .iter()
-                .any(|call| call == "enter_active_hosted_irp_transfer" || call == "component_pump"),
-            "resource restoration must precede native dispatch effects"
-        );
-    }
+    assert!(dispatch.block.stmts[..position].iter().any(|statement|
+        statement_facts(statement).calls.iter().any(|call| call == "enter_active_hosted_irp_transfer")),
+        "claim the retained physical bank before resource projection can reenter dispatch");
+    assert!(dispatch.block.stmts[..position].iter().all(|statement|
+        !statement_facts(statement).calls.iter().any(|call| call.starts_with("hosted_component_pump"))),
+        "provider execution must follow exact resource restoration");
     assert!(
         dispatch.block.stmts[position + 1..]
             .iter()
             .any(|statement| statement_facts(statement)
                 .calls
-                .iter()
-                .any(|call| call == "enter_active_hosted_irp_transfer")),
-        "check ordering against the actual owned dispatch entry"
+                .iter().any(|call| call.starts_with("hosted_component_pump"))),
+        "check ordering against the actual provider execution"
     );
 }

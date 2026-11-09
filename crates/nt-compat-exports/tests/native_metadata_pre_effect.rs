@@ -6,7 +6,7 @@ const NATIVE_BLOCK: &str = include_str!("../../../components/ntos-executive/src/
 #[test]
 fn canonical_scsi_owner_fences_media_before_provider_entry() {
     let owner = FILE_OWNERS
-        .split_once("fn dispatch_with_port_connect(")
+        .split_once("fn dispatch_with_port_connect<Yield>(")
         .expect("shared File IRP dispatch")
         .1;
     let capture = owner.find("capture_route(id, &prepared)").expect("exact route capture");

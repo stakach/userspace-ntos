@@ -4,7 +4,7 @@
 fn nested_connect_redrive_does_not_require_the_file_handler() {
     let source = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
     let runner = &source[source.find("pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {").unwrap()..];
-    let guard = &runner[..runner.find("// Check each owner just before entering its runner.").unwrap()];
+    let guard = &runner[..runner.find("nested_hosted_driver_create_ready()").unwrap()];
     assert!(guard.contains("if handler.is_null()"));
     assert!(guard.contains("redrive_nested_hosted_input_work()"),
         "handler-free CONNECT must run before the handler-required early return");

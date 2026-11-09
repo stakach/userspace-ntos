@@ -200,7 +200,13 @@ fn hosted_ready_admission_uses_retained_physical_bootstrap_and_current_reply() {
 #[test]
 fn scheduler_settles_validated_startup_with_exact_protocol_and_current_reply() {
     let file = source("component_scheduler.rs");
-    let helper = function(&file, "hosted_component_pump_inner").unwrap();
+    let pump = function(&file, "hosted_component_pump_inner").unwrap();
+    let helper = function(&file, "authenticate_component_completion")
+        .expect("shared final completion must authenticate startup and ordinary Calls");
+    let mut pump_calls = Observe::default();
+    pump_calls.visit_block(&pump.block);
+    assert!(pump_calls.calls.iter().any(|name| name == "authenticate_component_completion"),
+        "the scheduler must authenticate a completed pump before restoring its parent");
     let mut observe = Observe::default();
     observe.visit_block(&helper.block);
     assert!(observe

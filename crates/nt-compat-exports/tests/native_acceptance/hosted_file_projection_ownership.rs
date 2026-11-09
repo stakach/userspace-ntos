@@ -224,7 +224,10 @@ fn detached_file_pending_and_uncertain_paths_keep_projection_ownership() {
     };
     let entry = evidence(&function(&file, "dispatch").unwrap().block);
     assert!(has(&entry.calls, "dispatch_with_port_connect"));
-    arms.visit_block(&function(&file, "dispatch_with_port_connect").unwrap().block);
+    let dispatch = evidence(&function(&file, "dispatch_with_port_connect").unwrap().block);
+    assert!(has(&dispatch.calls, "settle_returned_dispatch"),
+        "the entered invocation must pass its real return to the common settlement owner");
+    arms.visit_block(&function(&file, "settle_returned_dispatch").unwrap().block);
     assert_eq!(arms.retained, 2);
     assert!(
         !arms.invalid,
@@ -283,14 +286,19 @@ fn detached_file_removal_follows_canonical_terminal_and_real_backend_ack() {
     let entry = evidence(&function(&file, "dispatch").unwrap().block);
     assert!(has(&entry.calls, "dispatch_with_port_connect"));
     let dispatch = evidence(&function(&file, "dispatch_with_port_connect").unwrap().block);
-    let terminal = dispatch
+    assert!(has(&dispatch.calls, "settle_returned_dispatch"));
+    let settled = evidence(&function(&file, "settle_returned_dispatch").unwrap().block);
+    let terminal = settled
         .calls
         .iter()
         .position(|call| call == "retire_external_file_irp_terminal")
         .unwrap();
-    assert!(dispatch.calls[terminal..]
+    assert!(settled.calls[terminal..]
         .iter()
         .any(|call| call == "accepts_external_file_irp_receipt"));
+    assert!(settled.calls[terminal..]
+        .iter().any(|call| call == "remove"),
+        "canonical synchronous terminal must release only after receipt acceptance");
     let entry = evidence(&function(&file, "acknowledge").unwrap().block);
     assert!(has(&entry.calls, "acknowledge_with_buffers"));
     let ack = evidence(&function(&file, "acknowledge_with_buffers").unwrap().block);
