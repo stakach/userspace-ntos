@@ -4,7 +4,7 @@ use super::*;
 use super::hosted_add_device_continuation::{
     AddDeviceBanks, AddDevicePumpContinuation, AddDevicePumpProgress,
     dispatch_add_device_for_instance_progress, dispatch_class_lower_alias_progress,
-    dispatch_pdo_projection_progress,
+    dispatch_pdo_projection_progress, trace_add_device_resume_gate,
 };
 use super::hosted_upper_filter_projection::AliasKind;
 use alloc::boxed::Box;
@@ -448,6 +448,10 @@ impl UpperFilterAttachContinuation {
                     let projection_kind = if pdo_projection_pump { Some(AliasKind::Pdo) }
                         else if lower_projection_pump { Some(AliasKind::Lower) }
                         else { None };
+                    trace_add_device_resume_gate(40,
+                        u64::from(alias) | (u64::from(projection_kind.is_some()) << 1)
+                            | (u64::from(pump.child_work_ready()) << 2)
+                            | (u64::from(pump.retry_without_new_child()) << 3));
                     let waiting = |pump| match projection_kind {
                         Some(kind) => Self::projection_pump_phase(kind, pump),
                         None if alias => ActivePhase::AliasPump(pump),
@@ -464,6 +468,12 @@ impl UpperFilterAttachContinuation {
                         return UpperFilterAttachProgress::RetainedRefusal(self);
                     }
                     let progress = pump.resume();
+                    trace_add_device_resume_gate(41, match &progress {
+                        AddDevicePumpProgress::Completed(_) => 1,
+                        AddDevicePumpProgress::ProjectionCompleted(_) => 2,
+                        AddDevicePumpProgress::ChildWorkYield(_) => 3,
+                        AddDevicePumpProgress::RetainedRefusal(_) => 4,
+                    });
                     active.phase = match progress {
                         AddDevicePumpProgress::ProjectionCompleted(result)
                             if projection_kind.is_some() =>

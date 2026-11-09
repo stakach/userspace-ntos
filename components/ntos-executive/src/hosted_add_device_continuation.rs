@@ -212,6 +212,19 @@ impl AddDevicePumpContinuation {
             other => other,
         };
         self.pump = Some(next);
+        let detail = match self.pump.as_ref() {
+            Some(component_scheduler::HostedPumpRestore::Restored(result)) =>
+                1 | (u64::from(result.completed) << 8),
+            Some(component_scheduler::HostedPumpRestore::ChildWorkReady { .. }) => 2,
+            Some(component_scheduler::HostedPumpRestore::ChildWorkPending(pending)) =>
+                3 | (u64::from(pending.retryable()) << 8),
+            Some(component_scheduler::HostedPumpRestore::Retained { retryable, .. }) =>
+                4 | (u64::from(*retryable) << 8),
+            Some(component_scheduler::HostedPumpRestore::ChildWorkQuarantined { .. }) => 5,
+            Some(component_scheduler::HostedPumpRestore::Unattributed(_)) => 6,
+            None => 0,
+        };
+        trace_add_device_resume_gate(20, detail);
         self.into_progress()
     }
 
@@ -223,6 +236,7 @@ impl AddDevicePumpContinuation {
                 if !matches!(self.pump.as_ref(),
                     Some(component_scheduler::HostedPumpRestore::Restored(result)) if result.completed)
                 {
+                    trace_add_device_resume_gate(21, 0);
                     return AddDevicePumpProgress::RetainedRefusal(self);
                 }
                 let Some(component_scheduler::HostedPumpRestore::Restored(pr)) = self.pump.take()
@@ -535,7 +549,7 @@ pub(crate) enum HostedAddDeviceProgress {
 /// Capped location probe for the retained AddDevice child restore. Stage 1 records
 /// child-ready/retry bits; 2 entered the native pump; 3/4/5/6 are completed,
 /// projection, yielded, and refused. Stages 10..18 identify pre-pump refusals.
-unsafe fn trace_add_device_resume_gate(stage: u64, detail: u64) {
+pub(super) unsafe fn trace_add_device_resume_gate(stage: u64, detail: u64) {
     static COUNT: AtomicU64 = AtomicU64::new(0);
     if !hosted_connect_live::pending_reply_published()
         || COUNT.fetch_add(1, Ordering::Relaxed) >= 32 { return; }
