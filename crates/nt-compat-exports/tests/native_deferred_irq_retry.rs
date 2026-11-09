@@ -11,13 +11,13 @@ const BLOCK: &str = include_str!("../../../components/ntos-executive/src/mounted
 
 #[test]
 fn deferred_actual_lock_irq_retries_on_timer_without_new_irq_badge() {
-    let start = PUMP.find("unsafe fn pump_scheduler_work_pending(").expect("scheduler predicate");
-    let end = PUMP[start..].find("\n}\n").expect("predicate boundary") + 2;
+    let start = PUMP.find("unsafe fn pump_scheduler_work_bits(").expect("scheduler demand bits");
+    let end = PUMP[start..].find("\n}\n").expect("demand boundary") + 2;
     let predicate = &PUMP[start..start + end];
-    syn::parse_str::<syn::ItemFn>(predicate).expect("parse native scheduler predicate");
+    syn::parse_str::<syn::ItemFn>(predicate).expect("parse native scheduler demand");
 
     let receive = RECEIVER.split("pub(super) unsafe fn receive(").nth(1).expect("shared receiver");
-    assert!(receive.contains("pump_scheduler_work_pending(ch, irq)"));
+    assert!(receive.contains("pump_scheduler_work_bits(ch, irq)"));
     let drain = DRIVER.split("unsafe fn drain_pending_hosted_irqs_snapshot()").nth(1)
         .expect("physical IRQ drain");
     assert!(drain.contains("HOSTED_IRQ_PENDING_EVENTS.fetch_or(deferred"),
@@ -75,10 +75,10 @@ fn deferred_level_irq_uses_timer_arrival_to_retry_while_irp_reply_is_retained() 
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let irp = PumpChannel { caps: Caps { kind: ReqKind::Irp, kernel_irq_yield: false } };
     driver_launch::PENDING_IRQ.store(true, Ordering::Relaxed);
-    assert!(unsafe { pump_scheduler_work_pending(&irp, false) },
+    assert!(unsafe { pump_scheduler_work_bits(&irp, false) != 0 },
         "a latched deferred IRQ must schedule a checkpoint without another IRQ badge");
     driver_launch::PENDING_IRQ.store(false, Ordering::Relaxed);
-    assert!(!unsafe { pump_scheduler_work_pending(&irp, false) },
+    assert!(!unsafe { pump_scheduler_work_bits(&irp, false) != 0 },
         "a timer with no pending IRQ or other work must not spuriously yield");
 }
 
@@ -88,8 +88,8 @@ fn exact_channel_still_controls_scheduler_authority() {
     let nonyielding = PumpChannel { caps: Caps { kind: ReqKind::Syscall, kernel_irq_yield: false } };
     let yielding = PumpChannel { caps: Caps { kind: ReqKind::Syscall, kernel_irq_yield: true } };
     driver_launch::PENDING_IRQ.store(true, Ordering::Relaxed);
-    assert!(!unsafe { pump_scheduler_work_pending(&nonyielding, false) });
-    assert!(unsafe { pump_scheduler_work_pending(&yielding, false) });
+    assert!(!unsafe { pump_scheduler_work_bits(&nonyielding, false) != 0 });
+    assert!(unsafe { pump_scheduler_work_bits(&yielding, false) != 0 });
 }
 
 #[test]
@@ -98,9 +98,9 @@ fn due_mounted_sector_yields_after_nested_timer_announces_it() {
     let irp = PumpChannel { caps: Caps { kind: ReqKind::Irp, kernel_irq_yield: false } };
     driver_launch::PENDING_IRQ.store(false, Ordering::Relaxed);
     driver_launch::MOUNTED_READY.store(true, Ordering::Relaxed);
-    assert!(unsafe { pump_scheduler_work_pending(&irp, false) },
+    assert!(unsafe { pump_scheduler_work_bits(&irp, false) != 0 },
         "a nested timer may mark the exact mounted owner notified; its outer scheduler must run");
     driver_launch::MOUNTED_READY.store(false, Ordering::Relaxed);
-    assert!(!unsafe { pump_scheduler_work_pending(&irp, false) });
+    assert!(!unsafe { pump_scheduler_work_bits(&irp, false) != 0 });
 }
 "#;

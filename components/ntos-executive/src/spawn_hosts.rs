@@ -1684,14 +1684,15 @@ pub(crate) unsafe fn pump_handle_executive_event_badge(badge: u64) -> (bool, boo
     (event, timer, irq)
 }
 
-unsafe fn pump_scheduler_work_pending(ch: &PumpChannel, irq: bool) -> bool {
-    (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
-        && (irq
-            || crate::driver_launch::hosted_irq_work_pending()
-            || crate::driver_launch::hosted_driver_dpc_activation_pending()
-            || crate::driver_launch::mounted_native_block_nested_ready()
-            || crate::dispatcher_bootstrap::timer_work_pending())
+unsafe fn pump_scheduler_work_bits(ch: &PumpChannel, irq: bool) -> u64 {
+    if ch.caps.kind != ReqKind::Irp && !ch.caps.kernel_irq_yield { return 0; }
+    u64::from(irq)
+        | (u64::from(crate::driver_launch::hosted_irq_work_pending()) << 1)
+        | (u64::from(crate::driver_launch::hosted_driver_dpc_activation_pending()) << 2)
+        | (u64::from(crate::driver_launch::mounted_native_block_nested_ready()) << 3)
+        | (u64::from(crate::dispatcher_bootstrap::timer_work_pending()) << 4)
 }
+
 
 
 /// The receive half yields one physical handoff at a time. Keeping these alternatives in one

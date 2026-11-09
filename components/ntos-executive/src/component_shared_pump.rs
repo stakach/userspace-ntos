@@ -1082,7 +1082,7 @@ pub(super) unsafe fn receive(
             && crate::dispatcher_bootstrap::timer_work_pending();
         if timer_checkpoint && timer_probe_consumed {
             crate::driver_launch::trace_connect_child_receive_yield(
-                ch.reply_cap, 1, timer_checkpoint, serviced_scheduler_yield, 0, 0,
+                ch.reply_cap, 1, timer_checkpoint, serviced_scheduler_yield, 0, 0, 0,
             );
             if crate::driver_launch::file_rpc_pump_for_diagnostic(ch) {
                 FILE_RECEIVE_SCHEDULER_YIELD.fetch_add(1, Ordering::Relaxed);
@@ -1168,7 +1168,7 @@ pub(super) unsafe fn receive(
                 if timer_checkpoint && message.badge() == 0 && message.info() == 0 {
                     crate::driver_launch::trace_connect_child_receive_yield(
                         ch.reply_cap, 2, timer_checkpoint, serviced_scheduler_yield,
-                        message.badge(), message.info(),
+                        message.badge(), message.info(), 0,
                     );
                     if file_receive {
                         FILE_RECEIVE_SCHEDULER_YIELD.fetch_add(1, Ordering::Relaxed);
@@ -1201,10 +1201,12 @@ pub(super) unsafe fn receive(
                 if inline_irq_checkpoint && (irq || inline_irq_work_pending()) {
                     irq_checkpoint = true;
                 }
-                if !inline_irq_checkpoint && pump_scheduler_work_pending(ch, irq) {
+                let scheduler_demand = if inline_irq_checkpoint { 0 }
+                    else { pump_scheduler_work_bits(ch, irq) };
+                if scheduler_demand != 0 {
                     crate::driver_launch::trace_connect_child_receive_yield(
                         ch.reply_cap, 3, timer_checkpoint, serviced_scheduler_yield,
-                        message.badge(), message.info(),
+                        message.badge(), message.info(), scheduler_demand,
                     );
                     if file_receive {
                         FILE_RECEIVE_SCHEDULER_YIELD.fetch_add(1, Ordering::Relaxed);

@@ -462,6 +462,7 @@ unsafe fn dispatch_class_lower(
         terminal_status: None, published: false,
         canonical_acknowledged: false, pin_released: false, source_released: false,
     }));
+    super::mark_hook_class_source_completion_probe(irp);
     None
 }
 

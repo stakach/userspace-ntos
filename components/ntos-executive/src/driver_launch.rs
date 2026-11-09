@@ -13801,17 +13801,29 @@ extern "win64" fn s_io_unregister_file_system(device: u64) {
 }
 
 static HOOK_SOURCE_COMPLETION_PROBE_IRP: AtomicU64 = AtomicU64::new(0);
+static HOOK_CLASS_SOURCE_COMPLETION_PROBE_IRP: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn mark_hook_source_completion_probe(irp: u64) {
     HOOK_SOURCE_COMPLETION_PROBE_IRP.store(irp, Ordering::Release);
 }
 
+pub(crate) fn mark_hook_class_source_completion_probe(irp: u64) {
+    HOOK_CLASS_SOURCE_COMPLETION_PROBE_IRP.store(irp, Ordering::Release);
+}
+
 fn trace_hook_source_completion_probe(irp: u64, stage: u64, event: u64, status: i32) {
-    if irp == 0 || HOOK_SOURCE_COMPLETION_PROBE_IRP.load(Ordering::Acquire) != irp {
+    let kind = if irp != 0 && HOOK_SOURCE_COMPLETION_PROBE_IRP.load(Ordering::Acquire) == irp {
+        1
+    } else if irp != 0
+        && HOOK_CLASS_SOURCE_COMPLETION_PROBE_IRP.load(Ordering::Acquire) == irp
+    {
+        2
+    } else {
         return;
-    }
-    print_str(b"[hook-source-completion] stage/irp/event/status=");
-    print_u64(stage); print_str(b"/"); print_hex64(irp); print_str(b"/");
+    };
+    print_str(b"[hook-source-completion] kind/stage/irp/event/status=");
+    print_u64(kind); print_str(b"/"); print_u64(stage); print_str(b"/");
+    print_hex64(irp); print_str(b"/");
     print_hex64(event); print_str(b"/"); print_hex(status as u32); print_str(b"\n");
 }
 
@@ -67741,10 +67753,11 @@ pub(crate) fn hosted_connect_pending_reply_published() -> bool {
 }
 
 pub(crate) fn trace_connect_child_receive_yield(
-    reply: u64, reason: u64, timer_checkpoint: bool, serviced: bool, badge: u64, info: u64,
+    reply: u64, reason: u64, timer_checkpoint: bool, serviced: bool,
+    badge: u64, info: u64, demand: u64,
 ) {
     component_scheduler::trace_connect_child_receive_yield(
-        reply, reason, timer_checkpoint, serviced, badge, info,
+        reply, reason, timer_checkpoint, serviced, badge, info, demand,
     );
 }
 
