@@ -273,10 +273,13 @@ pub(super) unsafe fn hosted_component_pump_with_caller_child_work(
     channel: &crate::spawn_hosts::PumpChannel,
     caller: nt_process::native_handle::NativeHandleCaller,
 ) -> HostedPumpRestore {
+    crate::driver_launch::trace_port_connect_handoff_probe(10, channel, 0);
     let Some(channel) = file_child_work_channel(channel) else {
+        crate::driver_launch::trace_port_connect_handoff_probe(11, channel, 0);
         return HostedPumpRestore::Unattributed(crate::spawn_hosts::PumpResult::refused(
             nt_process::STATUS_INVALID_HANDLE as i32, channel.reply_cap));
     };
+    crate::driver_launch::trace_port_connect_handoff_probe(12, &channel, 1);
     hosted_component_pump_inner(&channel, Some(caller), None)
 }
 
@@ -307,10 +310,15 @@ unsafe fn hosted_component_pump_inner(
         scsi_srb_pump_owner::ScsiSrbPumpTimeline::new(owner, crate::disk_census_ticks()));
     let route = runtime::channel_route(&channel).expect("physical hosted ingress identity");
     let mut parent = if channel.initial == crate::spawn_hosts::InitialAction::ReplyRequest {
+        crate::driver_launch::trace_port_connect_handoff_probe(20, &channel, 0);
         let parent = runtime::nested::park_current().expect("retain nested hosted parent");
+        crate::driver_launch::trace_port_connect_handoff_probe(21, &channel, u64::from(parent.is_some()));
         let route = route.expect("hosted dispatch requires enrolled source");
+        crate::driver_launch::trace_port_connect_handoff_probe(22, &channel, route.endpoint());
         runtime::admit(route).expect("admit exact hosted dispatch Call");
+        crate::driver_launch::trace_port_connect_handoff_probe(23, &channel, route.endpoint());
         channel.reply_cap = runtime::current_reply(route).expect("admitted canonical Reply");
+        crate::driver_launch::trace_port_connect_handoff_probe(24, &channel, channel.reply_cap);
         crate::driver_launch::trace_port_connect_pump_boundary(
             0, &channel, channel.reply_cap, 0,
         );
@@ -342,7 +350,9 @@ unsafe fn hosted_component_pump_inner(
         timeline.transition(scsi_srb_pump_owner::ScsiSrbPumpStage::ProviderPump,
             crate::disk_census_ticks());
     }
+    crate::driver_launch::trace_port_connect_handoff_probe(25, channel, channel.reply_cap);
     let mut result = crate::spawn_hosts::component_pump(channel);
+    crate::driver_launch::trace_port_connect_handoff_probe(26, channel, result.reply_cap);
     trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 1, Some(&result));
     trace_worker_startup_pump(StartupKind::Class, class_startup_ordinal, 1, Some(&result));
     while result.scheduler_yielded {

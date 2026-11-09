@@ -2145,7 +2145,9 @@ unsafe fn pump_reply_recv4_traced(
         crate::print_str(b"\n");
     }
     let reply_started = file_pump_diagnostic::start(ch);
+    crate::driver_launch::trace_port_connect_handoff_probe(30, ch, reply_cap);
     let sent = shared_pump::reply(ch, reply_cap, reply_msginfo, [reply_r0, reply_r1, reply_r2, reply_r3]);
+    crate::driver_launch::trace_port_connect_handoff_probe(31, ch, u64::from(sent));
     file_pump_diagnostic::record_reply(reply_started);
     if trace_system_thread_reply {
         crate::print_str(b"[driver-thread-reply] sent=");
@@ -2182,7 +2184,10 @@ unsafe fn pump_reply_recv4_traced(
     if trace_system_thread_reply {
         crate::print_str(b"[driver-thread-reply] receive-next\n");
     }
-    pump_recv(ch, reply_cap)
+    crate::driver_launch::trace_port_connect_handoff_probe(32, ch, reply_cap);
+    let received = pump_recv(ch, reply_cap);
+    crate::driver_launch::trace_port_connect_handoff_probe(33, ch, reply_cap);
+    received
 }
 
 /// The outcome of one pump: `(status, completed)`. `completed=true` iff the server re-parked at its

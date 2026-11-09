@@ -73486,6 +73486,27 @@ pub(crate) unsafe fn trace_port_connect_pump_boundary(
     print_str(b"\n");
 }
 
+/// Temporary, bounded observation around the exact CONNECT handoff. Unlike the detailed
+/// boundary trace this deliberately does not filter on the shared control ID: a changed ID is
+/// one of the conditions being diagnosed. It performs no native inspection or owner transition.
+pub(crate) unsafe fn trace_port_connect_handoff_probe(
+    stage: u64, ch: &crate::spawn_hosts::PumpChannel, detail: u64,
+) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let irp = PORT_CONNECT_PUMP_TRACE_IRP.load(Ordering::Relaxed);
+    if irp == 0 || PORT_CONNECT_PUMP_TRACE_TCB.load(Ordering::Relaxed) != ch.tcb
+        || COUNT.fetch_add(1, Ordering::Relaxed) >= 32
+    {
+        return;
+    }
+    let shared_control = read_volatile((ch.shared_va + SH_REQ_CONTROL_ID) as *const u64);
+    print_str(b"[port-connect-handoff] stage/irp/tcb/reply/shared-control/detail=");
+    print_u64(stage); print_str(b"/"); print_hex_u64(irp); print_str(b"/");
+    print_hex_u64(ch.tcb); print_str(b"/"); print_hex_u64(ch.reply_cap);
+    print_str(b"/"); print_hex_u64(shared_control); print_str(b"/");
+    print_hex_u64(detail); print_str(b"\n");
+}
+
 fn trace_port_connect_pump(
     stage: u64,
     irp: u64,
