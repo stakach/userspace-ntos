@@ -218,7 +218,7 @@ pub(super) unsafe fn submit(
     }
     let Some((shared_va, transfer_id, active_source_instance)) = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
         .as_ref()
-        .and_then(|rows| rows.last())
+        .and_then(|rows| rows.active())
         .map(|active| (active.shared_va, active.transfer_id, active.source_instance))
     else {
         return Some(INVALID);

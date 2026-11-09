@@ -73,7 +73,7 @@ pub(super) unsafe fn consume(
 ) -> Option<(i32, bool)> {
     let refused = (nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw(), false);
     let Some((shared_va, transfer_id, source_instance)) = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
-        .as_ref().and_then(|rows| rows.last())
+        .as_ref().and_then(|rows| rows.active())
         .map(|active| (active.shared_va, active.transfer_id, active.source_instance))
     else { return None; };
     let outer_irp = IrpId(transfer_id);

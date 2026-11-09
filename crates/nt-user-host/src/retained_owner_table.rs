@@ -69,6 +69,13 @@ impl<K: Copy + Eq, B> RetainedOwnerTable<K, B> {
     #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize { self.slots.capacity() }
 
+    /// Ensure the next reservation has room without consuming a generation or creating an
+    /// owner. A later nested reservation may still use that room before the caller returns.
+    pub fn prepare_one(&mut self) -> Result<(), RetainedOwnerError> {
+        if self.slots.iter().any(Option::is_none) { return Ok(()); }
+        self.slots.try_reserve(1).map_err(|_| RetainedOwnerError::NoCapacity)
+    }
+
     /// Reserve the row before removing the sole selected bundle from its pending owner.
     pub fn reserve(&mut self) -> Result<RetainedOwnerReservation, RetainedOwnerError> {
         let slot = self.slots.iter().position(Option::is_none).unwrap_or(self.slots.len());

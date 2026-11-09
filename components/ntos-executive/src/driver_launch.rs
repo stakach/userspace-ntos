@@ -55209,7 +55209,7 @@ pub(crate) unsafe fn print_hosted_pnp_enumeration_evidence() {
         .unwrap_or(0);
     let transfers = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
         .as_ref()
-        .map(|transfers| transfers.len())
+        .map(|transfers| transfers.active_len())
         .unwrap_or(0);
     let route_fences = (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS))
         .as_ref()
@@ -62590,24 +62590,27 @@ struct ActiveHostedIrpTransfer {
     diagnostic_file_rpc: bool,
 }
 
-static mut ACTIVE_HOSTED_IRP_TRANSFERS: Option<Vec<ActiveHostedIrpTransfer>> = None;
+type ActiveHostedIrpTransferTicket =
+    nt_user_host::retained_owner_table::RetainedOwnerTicket<(u64, u64, usize)>;
+type ActiveHostedIrpTransferLeases = nt_user_host::durable_context_lease::DurableContextLeases<
+    (u64, u64, usize), ActiveHostedIrpTransfer,
+>;
+
+static mut ACTIVE_HOSTED_IRP_TRANSFERS: Option<ActiveHostedIrpTransferLeases> = None;
+
+unsafe fn active_hosted_irp_transfers_mut() -> &'static mut ActiveHostedIrpTransferLeases {
+    let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_HOSTED_IRP_TRANSFERS);
+    if slot.is_none() { *slot = Some(ActiveHostedIrpTransferLeases::new()); }
+    slot.as_mut().unwrap()
+}
 
 unsafe fn reserve_active_hosted_irp_transfer_slot() -> Result<(), nt_status::NtStatus> {
-    let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_HOSTED_IRP_TRANSFERS);
-    if slot.is_none() {
-        *slot = Some(Vec::new());
-    }
-    let transfers = slot.as_mut().unwrap();
-    if transfers.len() == transfers.capacity() {
-        transfers
-            .try_reserve(1)
-            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    }
-    Ok(())
+    active_hosted_irp_transfers_mut().prepare_one()
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)
 }
 
 struct ActiveHostedIrpTransferGuard {
-    depth: usize,
+    ticket: ActiveHostedIrpTransferTicket,
 }
 
 impl ActiveHostedIrpTransferGuard {
@@ -62617,8 +62620,8 @@ impl ActiveHostedIrpTransferGuard {
         let transfers = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS))
             .as_ref()
             .expect("active hosted IRP transfer stack disappeared");
-        assert_eq!(transfers.len(), self.depth + 1);
-        let active = transfers.last().expect("active hosted IRP transfer disappeared");
+        assert_eq!(transfers.active_ticket(), Some(self.ticket));
+        let active = transfers.get(self.ticket).expect("active hosted IRP transfer disappeared");
         active.banks.copy_output_to(output);
     }
 }
@@ -62626,11 +62629,11 @@ impl ActiveHostedIrpTransferGuard {
 impl Drop for ActiveHostedIrpTransferGuard {
     fn drop(&mut self) {
         unsafe {
-            let transfers = (*core::ptr::addr_of_mut!(ACTIVE_HOSTED_IRP_TRANSFERS))
-                .as_mut()
-                .expect("active hosted IRP transfer stack disappeared");
-            assert_eq!(transfers.len(), self.depth + 1);
-            transfers.pop();
+            let transfers = active_hosted_irp_transfers_mut();
+            transfers.unbind(self.ticket)
+                .expect("active hosted IRP transfer stack lost LIFO ownership");
+            transfers.retire(self.ticket)
+                .expect("active hosted IRP transfer lost its exact owner");
         }
     }
 }
@@ -62645,17 +62648,13 @@ unsafe fn enter_active_hosted_irp_transfer(
     input: &[u8],
     output: &mut [u8],
 ) -> Option<ActiveHostedIrpTransferGuard> {
-    let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_HOSTED_IRP_TRANSFERS);
-    if slot.is_none() {
-        *slot = Some(Vec::new());
-    }
-    let transfers = slot.as_mut().unwrap();
-    let depth = transfers.len();
-    if transfers.len() == transfers.capacity() {
-        transfers.try_reserve(1).ok()?;
-    }
-    let banks = hosted_irp_banks::HostedIrpBanks::new(input, output)?;
-    transfers.push(ActiveHostedIrpTransfer {
+    let transfers = active_hosted_irp_transfers_mut();
+    let reservation = transfers.reserve().ok()?;
+    let Some(banks) = hosted_irp_banks::HostedIrpBanks::new(input, output) else {
+        let _ = transfers.cancel_reservation(reservation);
+        return None;
+    };
+    let transfer = ActiveHostedIrpTransfer {
         shared_va,
         transfer_id,
         source_instance,
@@ -62671,8 +62670,21 @@ unsafe fn enter_active_hosted_irp_transfer(
         measure_bank,
         diagnostic_file_rpc: measure_bank
             && hosted_file_owners::file_read_write_dispatch_for_diagnostic(IrpId(transfer_id)),
-    });
-    Some(ActiveHostedIrpTransferGuard { depth })
+    };
+    let ticket = match transfers.retain(
+        reservation, (shared_va, transfer_id, source_instance), transfer,
+    ) {
+        Ok(ticket) => ticket,
+        Err(_) => {
+            let _ = transfers.cancel_reservation(reservation);
+            return None;
+        }
+    };
+    if transfers.bind(ticket).is_err() {
+        let _ = transfers.retire(ticket);
+        return None;
+    }
+    Some(ActiveHostedIrpTransferGuard { ticket })
 }
 
 unsafe fn active_hosted_irp_transfer_mut(
@@ -62680,7 +62692,7 @@ unsafe fn active_hosted_irp_transfer_mut(
     transfer_id: u64,
 ) -> Option<&'static mut ActiveHostedIrpTransfer> {
     let transfers = (*core::ptr::addr_of_mut!(ACTIVE_HOSTED_IRP_TRANSFERS)).as_mut()?;
-    let active = transfers.last_mut()?;
+    let active = transfers.active_mut()?;
     (active.shared_va == shared_va && active.transfer_id == transfer_id).then_some(active)
 }
 
@@ -62690,7 +62702,7 @@ pub(crate) unsafe fn file_rpc_pump_for_diagnostic(ch: &crate::spawn_hosts::PumpC
     let Some(transfers) = (*core::ptr::addr_of!(ACTIVE_HOSTED_IRP_TRANSFERS)).as_ref() else {
         return false;
     };
-    let Some(active) = transfers.last() else { return false; };
+    let Some(active) = transfers.active() else { return false; };
     active.shared_va == ch.shared_va
         && active.diagnostic_file_rpc
         && ch.ingress_route.is_some()

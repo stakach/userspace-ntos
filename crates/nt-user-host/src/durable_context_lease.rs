@@ -42,6 +42,13 @@ impl<K: Copy + Eq, B> DurableContextLeases<K, B> {
         self.rows.cancel_reservation(reservation)
     }
 
+    /// Preflight both row and binding-stack capacity for a later native effect. This creates
+    /// no held owner or active selector; the caller still reserves an exact row at entry.
+    pub fn prepare_one(&mut self) -> Result<(), DurableContextLeaseError> {
+        self.rows.prepare_one().map_err(|_| DurableContextLeaseError::NoCapacity)?;
+        self.active.try_reserve(1).map_err(|_| DurableContextLeaseError::NoCapacity)
+    }
+
     /// A refusal returns the original bundle to its caller; no owner is dropped.
     pub fn retain(
         &mut self, reservation: RetainedOwnerReservation, key: K, bundle: B,
@@ -83,6 +90,8 @@ impl<K: Copy + Eq, B> DurableContextLeases<K, B> {
     pub fn active_ticket(&self) -> Option<RetainedOwnerTicket<K>> {
         self.active.last().copied()
     }
+
+    pub fn active_len(&self) -> usize { self.active.len() }
 
     pub fn active(&self) -> Option<&B> {
         self.rows.get(self.active_ticket()?)
