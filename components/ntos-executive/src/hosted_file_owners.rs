@@ -993,6 +993,19 @@ fn generic_orphan_after(floor: u64) -> bool {
     })
 }
 
+/// Capped boot probe for the exact Hook File resume. Stages: 1/2/3 recorded
+/// entry/before/after; 10/11/12 native resume entry/before/after owner take;
+/// 13/14/15 alias invocation entry/return/exit; 16 returned, 17 yielded,
+/// 18 retryable refusal, 19 take refusal, 20 uncertain refusal.
+fn trace_generic_file_resume(stage: u64, selector: GenericFilePumpSelector) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 80 { return; }
+    print_str(b"[hook-file-resume] stage/row/irp=");
+    print_u64(stage); print_str(b"/");
+    print_u64(selector.row_id); print_str(b"/0x");
+    print_hex_u64(selector.irp_id.raw()); print_str(b"\n");
+}
+
 /// Root-only census of the newest Hook File row considered for a child step.
 /// Flight: 1 preparing, 2 queued, 3 dispatch, 4 suspended, 5 returned,
 /// 6 copy, 7 cancel, 8 acknowledge, 9 idle, 10 blocked.
@@ -1126,16 +1139,20 @@ fn exact_generic_pump(selector: GenericFilePumpSelector) -> bool {
 unsafe fn resume_generic_file_pump(
     selector: GenericFilePumpSelector,
 ) -> GenericFilePumpDrive {
+    trace_generic_file_resume(10, selector);
     if !exact_generic_pump(selector) { return GenericFilePumpDrive::Blocked; }
     let recorded_child_ran = rows().iter().find(|owner| owner.id == selector.row_id)
         .and_then(|owner| owner.recorded_generic_child_ran);
+    trace_generic_file_resume(11, selector);
     let (invocation, continuation) = match resume_dispatch_from_pump(selector.irp_id, selector.key) {
         Ok(owners) => owners,
         Err(status) => {
+            trace_generic_file_resume(19, selector);
             let _ = quarantine_dispatch_pump(selector.irp_id, selector.key, status);
             return GenericFilePumpDrive::Blocked;
         }
     };
+    trace_generic_file_resume(12, selector);
     if let Some(owner) = rows().iter_mut().find(|owner| owner.id == selector.row_id) {
         owner.recorded_generic_child_ran = None;
     }
@@ -1145,16 +1162,21 @@ unsafe fn resume_generic_file_pump(
         row(selector.row_id).hook_pump.map(|h| h.initial_key).unwrap_or(selector.key),
         selector.hook_owner_id, selector.device,
         || {
+            trace_generic_file_resume(13, selector);
             let (invocation, continuation) = owners.take().expect("validated Hook pump owners");
-            continuation.resume_after_child(invocation)
+            let result = continuation.resume_after_child(invocation);
+            trace_generic_file_resume(14, selector);
+            result
         },
     );
+    trace_generic_file_resume(15, selector);
     let progress = match progress {
         Ok(progress) => progress,
         Err(_) => Err(owners.take().expect("refused alias preserved Hook pump owners")),
     };
     let (invocation, next_key, continuation, child_ready, retryable) = match progress {
         Ok(hosted_file_dispatch::InvokeResult::Returned(returned)) => {
+            trace_generic_file_resume(16, selector);
             trace_file_return_probe(60, selector.irp_id);
             let Some(id) = find(selector.irp_id) else {
                 generic_orphans().push(OrphanedGenericFilePump::Return(selector, returned));
@@ -1173,7 +1195,10 @@ unsafe fn resume_generic_file_pump(
         }
         Ok(hosted_file_dispatch::InvokeResult::ChildWorkYield {
             invocation, key, continuation,
-        }) => (invocation, key, continuation, true, false),
+        }) => {
+            trace_generic_file_resume(17, selector);
+            (invocation, key, continuation, true, false)
+        },
         Ok(hosted_file_dispatch::InvokeResult::UnkeyedChildWorkYield {
             invocation, continuation,
         }) => {
@@ -1184,6 +1209,7 @@ unsafe fn resume_generic_file_pump(
         }
         Err((invocation, continuation)) => {
             let retryable = continuation.retry_without_new_child();
+            trace_generic_file_resume(if retryable { 18 } else { 20 }, selector);
             (invocation, selector.key, continuation, false, retryable)
         }
     };
@@ -1248,6 +1274,7 @@ pub(super) fn record_suspended_generic_file_pump_child_step(
 pub(super) unsafe fn redrive_recorded_generic_file_pump(
     selector: GenericFilePumpSelector,
 ) -> GenericFilePumpDrive {
+    trace_generic_file_resume(1, selector);
     if !exact_generic_pump(selector) { return GenericFilePumpDrive::Blocked; }
     let Some(ran_child) = rows().iter().find(|owner| owner.id == selector.row_id)
         .and_then(|owner| owner.recorded_generic_child_ran) else {
@@ -1267,7 +1294,10 @@ pub(super) unsafe fn redrive_recorded_generic_file_pump(
     {
         return GenericFilePumpDrive::Yielded;
     }
-    match resume_generic_file_pump(selector) {
+    trace_generic_file_resume(2, selector);
+    let result = resume_generic_file_pump(selector);
+    trace_generic_file_resume(3, selector);
+    match result {
         GenericFilePumpDrive::Yielded if !ran_child =>
             GenericFilePumpDrive::AwaitingLocalChild,
         progress => progress,

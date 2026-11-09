@@ -682,7 +682,7 @@ unsafe fn redrive_inner(nested_ready_only: bool) {
                 hosted_input_connect_dispatch::PortConnectPhase::AwaitingCompletion(irp) => irp,
                 _ => unreachable!(),
             };
-            let _ = drain_hosted_connect_io_work_item(
+            let queue_progress = drain_hosted_connect_io_work_item(
                 (*work_ptr).port_instance,
                 (*work_ptr).port_domain,
                 (*work_ptr).port_storage_instance,
@@ -690,6 +690,9 @@ unsafe fn redrive_inner(nested_ready_only: bool) {
                 (*work_ptr).source.payload().forward.target.device_id(),
                 pending_irp,
             );
+            if matches!(queue_progress, Ok(HostedWorkQueueDrainProgress::Suspended)) {
+                return;
+            }
         }
         if !(*work_ptr).provider_entered {
             let work = &mut *work_ptr;

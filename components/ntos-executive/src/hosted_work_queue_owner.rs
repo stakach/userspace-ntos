@@ -88,6 +88,17 @@ pub(crate) enum QueuedCallbackProgress {
     Blocked,
 }
 
+/// Capped boot probe: 1 exact claim, 2 callback entry, 3 pump retained,
+/// 4 orphaned pump, 5 callback return ACK, 6 root child step recorded.
+fn trace_queued_callback(stage: u64, index: usize, sequence: u64) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 48 { return; }
+    print_str(b"[queued-callback] stage/index/sequence=");
+    print_u64(stage); print_str(b"/");
+    print_u64(index as u64); print_str(b"/");
+    print_u64(sequence); print_str(b"\n");
+}
+
 /// Reserve the claim before clearing the shared slot or entering any native callback.
 pub(super) unsafe fn claim(
     index: usize, key: QueueEntryKey, entry: QueueEntry, file_floor: u64,
@@ -110,6 +121,7 @@ pub(super) unsafe fn claim(
         sequence, file_floor, claim: HostedWorkQueueClaim::dequeue(key, entry),
         ndis: None, pump: None, child_step: None, resuming: false, terminal_ack: None,
     });
+    trace_queued_callback(1, index, sequence);
     true
 }
 
@@ -126,17 +138,21 @@ pub(super) unsafe fn retain_pump(
     if let Some(row) = rows.get_mut(index).and_then(Option::as_mut) {
         if row.claim.invocation() == key && row.pump.is_none() {
             row.pump = Some(pump);
+            trace_queued_callback(3, index, row.sequence);
             return true;
         }
     }
     (&mut *core::ptr::addr_of_mut!(ORPHANED_PUMPS)).push(pump);
+    trace_queued_callback(4, index, 0);
     false
 }
 
 /// Return only copied callback arguments; the row keeps the physical queue claim.
 pub(super) unsafe fn enter(index: usize, key: QueueEntryKey) -> Option<QueueEntry> {
-    (&mut *core::ptr::addr_of_mut!(CLAIMS)).get_mut(index)?
-        .as_mut()?.claim.enter(key).ok()
+    let row = (&mut *core::ptr::addr_of_mut!(CLAIMS)).get_mut(index)?.as_mut()?;
+    let entered = row.claim.enter(key).ok();
+    if entered.is_some() { trace_queued_callback(2, index, row.sequence); }
+    entered
 }
 
 pub(super) unsafe fn record_ndis(
@@ -154,6 +170,7 @@ pub(super) unsafe fn acknowledge_return(index: usize, key: QueueEntryKey) -> boo
     let Some(row) = rows.get_mut(index).and_then(Option::as_mut) else { return false; };
     if row.pump.is_some() || row.child_step.is_some() || row.resuming { return false; }
     if row.claim.acknowledge_return(key).is_err() { return false; }
+    trace_queued_callback(5, index, row.sequence);
     rows[index] = None;
     true
 }
@@ -293,6 +310,7 @@ pub(crate) unsafe fn record_queued_callback_child_step(
                 return QueuedCallbackProgress::AwaitingLocalChild;
             }
             row.child_step = Some(step);
+            trace_queued_callback(6, selector.index, row.sequence);
             return QueuedCallbackProgress::RecordedStep;
         }
     }

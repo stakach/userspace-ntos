@@ -33962,15 +33962,23 @@ unsafe fn trace_hosted_work_queue_capacity(
     print_str(b"\n");
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HostedWorkQueueDrainProgress {
+    Drained(u64),
+    Suspended,
+}
+
 unsafe fn drain_hosted_work_queue_for_instance(
     instance_index: usize,
     inst: DriverInstance,
     caller: nt_process::native_handle::NativeHandleCaller,
     io_only: bool,
-) -> Result<u64, i32> {
+) -> Result<HostedWorkQueueDrainProgress, i32> {
     // A prior callback may own an entered Reply after its ring slot advanced. The global
     // drain guard is stack-scoped, so this per-instance claim fences later queue entries.
-    if hosted_work_queue_owner::pending(instance_index) { return Ok(0); }
+    if hosted_work_queue_owner::pending(instance_index) {
+        return Ok(HostedWorkQueueDrainProgress::Suspended);
+    }
     let shared = inst.exec_shared_va;
     let Some(exec_code_va) = ExecVaWindow::try_for_instance(instance_index).map(|win| win.code_va)
     else {
@@ -34126,7 +34134,7 @@ unsafe fn drain_hosted_work_queue_for_instance(
                 }
                 // The queue row owns the exact callback pump. Root settles its child and
                 // resumes this receive without replaying the queue entry or callback Call.
-                return Ok(drained);
+                return Ok(HostedWorkQueueDrainProgress::Suspended);
             }
         }
     }
@@ -34140,7 +34148,7 @@ unsafe fn drain_hosted_work_queue_for_instance(
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
     write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
-    Ok(drained)
+    Ok(HostedWorkQueueDrainProgress::Drained(drained))
 }
 
 struct HostedWorkQueueDrainGuard;
@@ -34171,7 +34179,10 @@ unsafe fn drain_hosted_connect_io_work_item(
     storage_domain: nt_io_manager::HostedDomainIdentity,
     target_device: nt_io_manager::DeviceId,
     pending_irp: nt_io_manager::IrpId,
-) -> Result<bool, nt_status::NtStatus> {
+) -> Result<HostedWorkQueueDrainProgress, nt_status::NtStatus> {
+    if hosted_work_queue_owner::unsettled_queued_callback() {
+        return Ok(HostedWorkQueueDrainProgress::Suspended);
+    }
     let dependent = instance(port_index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     let provider = instance(storage_index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     if instance_domain_identity(dependent) != Some(port_domain)
@@ -34191,17 +34202,17 @@ unsafe fn drain_hosted_connect_io_work_item(
             })
     });
     if !pending {
-        return Ok(false);
+        return Ok(HostedWorkQueueDrainProgress::Drained(0));
     }
     let route = hosted_ingress_sources::primary_route(storage_index)
         .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     if !crate::spawn_hosts::shared_ingress::owner::runtime::ready_for_admission(route)
         .unwrap_or(false)
     {
-        return Ok(false);
+        return Ok(HostedWorkQueueDrainProgress::Drained(0));
     }
     let Some(_guard) = HostedWorkQueueDrainGuard::enter() else {
-        return Ok(false);
+        return Ok(HostedWorkQueueDrainProgress::Drained(0));
     };
     let shared = provider.exec_shared_va;
     if shared == 0 {
@@ -34213,7 +34224,7 @@ unsafe fn drain_hosted_connect_io_work_item(
         || read_volatile((hosted_work_queue_slot(shared, head) + SH_WORK_QUEUE_ENTRY_KIND) as *const u64)
             != HOSTED_WORK_QUEUE_KIND_IO
     {
-        return Ok(false);
+        return Ok(HostedWorkQueueDrainProgress::Drained(0));
     }
     let drained = drain_hosted_work_queue_for_instance(
         storage_index,
@@ -34221,7 +34232,7 @@ unsafe fn drain_hosted_connect_io_work_item(
         crate::initial_system_driver_caller(),
         true,
     );
-    drained.map(|count| count != 0).map_err(nt_status::NtStatus)
+    drained.map_err(nt_status::NtStatus)
 }
 
 /// Run queued PASSIVE_LEVEL work only after the outermost hosted component call has returned.
@@ -34230,16 +34241,20 @@ unsafe fn drain_hosted_connect_io_work_item(
 /// owns DISPATCH_LEVEL state such as an NDIS miniport lock. Scanning every live instance here keeps
 /// work ownership dynamic (no NIC/driver bitset or identity list) and prevents a nested callback
 /// from running a passive worker before that outer state is released.
-unsafe fn drain_hosted_work_queues_at_passive_level() -> Result<u64, i32> {
+unsafe fn drain_hosted_work_queues_at_passive_level(
+) -> Result<HostedWorkQueueDrainProgress, i32> {
+    if hosted_work_queue_owner::unsettled_queued_callback() {
+        return Ok(HostedWorkQueueDrainProgress::Suspended);
+    }
     if component_scheduler::is_active() {
-        return Ok(0);
+        return Ok(HostedWorkQueueDrainProgress::Drained(0));
     }
     let Some(_drain) = HostedWorkQueueDrainGuard::enter() else {
-        return Ok(0);
+        return Ok(HostedWorkQueueDrainProgress::Drained(0));
     };
     let instance_count = driver_instances().map(Vec::len).unwrap_or(0);
     if instance_count == 0 {
-        return Ok(0);
+        return Ok(HostedWorkQueueDrainProgress::Drained(0));
     }
     // This sweep schedules executive work items, not continuations of their enqueueing threads.
     let caller = crate::initial_system_driver_caller();
@@ -34261,12 +34276,18 @@ unsafe fn drain_hosted_work_queues_at_passive_level() -> Result<u64, i32> {
             if head == tail && drops == 0 {
                 continue;
             }
-            let drained = drain_hosted_work_queue_for_instance(instance_index, inst, caller, false)?;
+            let drained = match drain_hosted_work_queue_for_instance(
+                instance_index, inst, caller, false,
+            )? {
+                HostedWorkQueueDrainProgress::Drained(count) => count,
+                HostedWorkQueueDrainProgress::Suspended =>
+                    return Ok(HostedWorkQueueDrainProgress::Suspended),
+            };
             sweep_drained = sweep_drained.saturating_add(drained);
             total = total.saturating_add(drained);
         }
         if sweep_drained == 0 {
-            return Ok(total);
+            return Ok(HostedWorkQueueDrainProgress::Drained(total));
         }
         sweeps += 1;
     }
@@ -48783,12 +48804,19 @@ impl Drop for HostedIoPumpObservation {
     }
 }
 
-pub(crate) fn pump_hosted_io_completions() -> usize {
+pub(crate) enum HostedIoPumpProgress {
+    Progress(usize),
+    CallbackSuspended,
+}
+
+pub(crate) fn pump_hosted_io_completions() -> HostedIoPumpProgress {
     let _observation = HostedIoPumpObservation::enter();
     // A nested provider dispatch can queue PASSIVE_LEVEL work while the scheduler is active.
     // Revisit it from the outer pump before looking for IRP completions produced by that work.
     let deferred = match unsafe { drain_hosted_work_queues_at_passive_level() } {
-        Ok(count) => count as usize,
+        Ok(HostedWorkQueueDrainProgress::Drained(count)) => count as usize,
+        Ok(HostedWorkQueueDrainProgress::Suspended) =>
+            return HostedIoPumpProgress::CallbackSuspended,
         Err(status) => {
             print_str(b"[hosted-work] outer drain failed status=0x");
             print_hex(status as u32);
@@ -48797,7 +48825,7 @@ pub(crate) fn pump_hosted_io_completions() -> usize {
         }
     };
     let pumped = pump_io_manager();
-    deferred
+    HostedIoPumpProgress::Progress(deferred
         .saturating_add(pumped)
         .saturating_add(hosted_start_io::drain_cleanup())
         .saturating_add(hosted_file_owners::drain())
@@ -48812,7 +48840,7 @@ pub(crate) fn pump_hosted_io_completions() -> usize {
         .saturating_add(unsafe { drain_hosted_acpi_pci_route_query() })
         .saturating_add(unsafe { start_hosted_device_relation_query() })
         .saturating_add(unsafe { start_hosted_acpi_pci_route_query() })
-        .saturating_add(unsafe { hosted_sync_relations::drain() })
+        .saturating_add(unsafe { hosted_sync_relations::drain() }))
 }
 
 pub(crate) fn hosted_file_retry_deadline(now: u64) -> Option<u64> {
@@ -74716,14 +74744,8 @@ impl FileIrpPumpContinuation {
     // work can reuse the transport. It is payload attached to canonical FileId,
     // never the cross-domain identity itself.
     let file_context = read_volatile((sh + SH_REQ_FILEID) as *const u64);
-    if let Err(status) = drain_hosted_work_queues_at_passive_level() {
-        // The drain retires the instance that owns the failed worker. Its failure is independent
-        // of this IRP's already-committed result: rewriting STATUS_PENDING here would orphan the
-        // canonical PendingIrp while the hosted driver still owns its raw IRP.
-        print_str(b"[hosted-work] deferred drain failed status=0x");
-        print_hex(status as u32);
-        print_str(b"; preserving dispatched IRP result\n");
-    }
+    // Publish this IRP's canonical result before a queued callback may enter and retain its
+    // physical parent. The flat-root completion pump drains the work queue afterwards.
     if let Some(binding) = provider_binding {
         if let Err(status) = import_provider_device_dispatch_state(
             binding, dependent_inst.exec_shared_va, sh,

@@ -28827,10 +28827,13 @@ fn service_mounted_native_blocks_and_redrive_backends() -> u64 {
 /// Keep the original ordering and retry-flag claim.
 unsafe fn redrive_global_post_syscall_work(nt_handler: &mut ExecNtHandler) {
     let _ = driver_launch::pump_hosted_file_lifecycle();
-    let hosted_io_progress = pump_hosted_io_and_redrive_driver_starts(
+    let hosted_io_progress = match pump_hosted_io_and_redrive_driver_starts(
         driver_launch::drain_hosted_driver_dpcs(),
         nt_handler,
-    );
+    ) {
+        HostedIoAdvance::Progress(count) => count,
+        HostedIoAdvance::CallbackSuspended => return,
+    };
     if hosted_io_progress != 0
         || FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
     {
@@ -28852,15 +28855,24 @@ unsafe fn redrive_global_post_syscall_work(nt_handler: &mut ExecNtHandler) {
 }
 
 // Callers execute DPCs before borrowing the handler and pass only the completed work count.
+enum HostedIoAdvance {
+    Progress(u64),
+    CallbackSuspended,
+}
+
 unsafe fn pump_hosted_io_and_redrive_driver_starts(
     activated: u64,
     nt_handler: &mut ExecNtHandler,
-) -> u64 {
+) -> HostedIoAdvance {
     let retired = driver_launch::drain_hosted_file_retirements();
     let video_retired = crate::video_device::drain_video_file_retirements();
     let serviced = driver_launch::service_pending_file_backends() as u64;
     let native_blocks = service_mounted_native_blocks_and_redrive_backends();
-    let pumped = driver_launch::pump_hosted_io_completions() as u64;
+    let pumped = match driver_launch::pump_hosted_io_completions() {
+        driver_launch::HostedIoPumpProgress::Progress(count) => count as u64,
+        driver_launch::HostedIoPumpProgress::CallbackSuspended =>
+            return HostedIoAdvance::CallbackSuspended,
+    };
     if crate::config_manager_take_device_action_wake() {
         nt_handler.pnp_signal_pending_action();
     }
@@ -28895,7 +28907,7 @@ unsafe fn pump_hosted_io_and_redrive_driver_starts(
         FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
     }
     rearm_requested_mounted_native_timer(nt_handler);
-    progress
+    HostedIoAdvance::Progress(progress)
 }
 
 fn pending_driver_start_redrive_needed(nt_handler: &ExecNtHandler) -> bool {

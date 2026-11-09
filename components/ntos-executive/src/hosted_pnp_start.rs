@@ -935,7 +935,9 @@ impl OwnedHostedPnpStartBatch {
             }
             if let Some(refresh) = self.pending_relations {
                 if pump_before_observe {
-                    driver_launch::pump_hosted_io_completions();
+                    if matches!(driver_launch::pump_hosted_io_completions(),
+                        driver_launch::HostedIoPumpProgress::CallbackSuspended)
+                    { return OwnedHostedPnpStartProgress::AwaitingCompletion; }
                 }
                 match driver_launch::hosted_pnp_relation_progress(refresh) {
                     driver_launch::HostedPnpRelationProgress::Current => {
@@ -1077,7 +1079,9 @@ impl OwnedHostedPnpStartBatch {
                     );
                 }
                 if pump_before_observe {
-                    driver_launch::pump_hosted_io_completions();
+                    if matches!(driver_launch::pump_hosted_io_completions(),
+                        driver_launch::HostedIoPumpProgress::CallbackSuspended)
+                    { return OwnedHostedPnpStartProgress::AwaitingCompletion; }
                 }
                 let devnode_index = pending.devnode_index;
                 let device_id = pending.device_id;
@@ -1499,7 +1503,9 @@ impl OwnedHostedPnpRebalance {
                     failure_status,
                 } => {
                     if pump_before_observe {
-                        driver_launch::pump_hosted_io_completions();
+                        if matches!(driver_launch::pump_hosted_io_completions(),
+                            driver_launch::HostedIoPumpProgress::CallbackSuspended)
+                        { return OwnedHostedPnpRebalanceProgress::AwaitingCompletion; }
                     }
                     match driver_launch::observe_hosted_pnp_lifecycle(irp_id, minor) {
                         Ok(driver_launch::HostedPnpLifecycleObservation::AwaitingCompletion) => {
@@ -1765,7 +1771,9 @@ impl OwnedHostedPnpRemoval {
                     failure_status,
                 } => {
                     if pump_before_observe {
-                        driver_launch::pump_hosted_io_completions();
+                        if matches!(driver_launch::pump_hosted_io_completions(),
+                            driver_launch::HostedIoPumpProgress::CallbackSuspended)
+                        { return OwnedHostedPnpRemovalProgress::AwaitingCompletion; }
                     }
                     match driver_launch::observe_hosted_pnp_lifecycle(irp_id, minor) {
                         Ok(driver_launch::HostedPnpLifecycleObservation::AwaitingCompletion) => {
@@ -3224,7 +3232,9 @@ unsafe fn observe_canonical_start(
     pump_before_observe: bool,
 ) -> CanonicalStartDisposition {
     if pump_before_observe {
-        driver_launch::pump_hosted_io_completions();
+        if matches!(driver_launch::pump_hosted_io_completions(),
+            driver_launch::HostedIoPumpProgress::CallbackSuspended)
+        { return CanonicalStartDisposition::Pending { irp_id, driver_pending }; }
     }
     match driver_launch::observe_hosted_pnp_start(irp_id) {
         Ok(driver_launch::HostedPnpStartObservation::NotEntered { status, device_id }) => {
