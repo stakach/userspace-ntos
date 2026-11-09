@@ -676,6 +676,7 @@ use nt_kernel_exec::{
     classify_dispatcher_wait_timeout, init_ksemaphore, kevent, ksemaphore_read_state,
     ksemaphore_release, ksemaphore_try_wait, rtl_bitmap, DispatcherWaitTimeout, EventKind,
     HostedDpcActivation, HostedDpcError, HostedDpcImportance, HostedDpcOwner,
+    HostedDpcResourceIdentity,
     HostedDpcQueueResult, HostedDpcTable,
     HostedDriverThreadError, HostedDriverThreadTable,
     InterruptActualLockError, InterruptActualLockIdentity, InterruptActualLockLease,
@@ -11365,7 +11366,9 @@ unsafe fn hosted_component_physical_mappings(
 }
 
 unsafe fn hosted_component_physical_address(virtual_address: u64) -> Option<u64> {
-    if let Some(resource) = find_shared_address_resource_by_va(FSD_SHARED_VADDR, virtual_address, 1)
+    if let Some(resource) = find_shared_address_resource_by_va(
+        hosted_component_resource_shared_va(), virtual_address, 1,
+    )
     {
         return resource
             .translated_start
@@ -11378,9 +11381,7 @@ unsafe fn hosted_component_physical_address(virtual_address: u64) -> Option<u64>
 }
 
 unsafe fn hosted_component_virtual_address(physical_address: u64, length: u64) -> Option<u64> {
-    let shared = hosted_provider_export_lane::current_component_bank()
-        .or_else(hosted_class_irp_lane::current_component_bank)
-        .unwrap_or(FSD_SHARED_VADDR);
+    let shared = hosted_component_resource_shared_va();
     if let Some(resource) = find_shared_address_resource_by_range(
         shared,
         SH_RESOURCE_ADDRESS_KIND_MEMORY,
@@ -11414,9 +11415,7 @@ extern "win64" fn s_mm_get_virtual_for_physical(physical_address: u64) -> u64 {
 /// grant fail with NULL; there is no success fallback.
 extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, cache: u32) -> u64 {
     unsafe {
-        let shared = hosted_provider_export_lane::current_component_bank()
-            .or_else(hosted_class_irp_lane::current_component_bank)
-            .unwrap_or(FSD_SHARED_VADDR);
+        let shared = hosted_component_resource_shared_va();
         if let Some(existing) = hosted_component_virtual_address(phys, length) {
             trace_hosted_mm_map_io_space(phys, length, cache, existing, b"component-map");
             return existing;
@@ -14952,6 +14951,17 @@ unsafe fn hosted_component_shared_va() -> u64 {
 }
 
 #[inline]
+unsafe fn hosted_component_resource_shared_va() -> u64 {
+    if hosted_irq_lane_context().is_some() {
+        hosted_component_shared_va()
+    } else {
+        hosted_provider_export_lane::current_component_bank()
+            .or_else(hosted_class_irp_lane::current_component_bank)
+            .unwrap_or(FSD_SHARED_VADDR)
+    }
+}
+
+#[inline]
 unsafe fn hosted_raise_irql(irql: u8) -> u8 {
     let old = hosted_current_irql();
     if irql > old {
@@ -16489,7 +16499,7 @@ pub(crate) unsafe fn hosted_driver_timer_wake_due(now: nt_time::TimeSnapshot) ->
                 delivered.saturating_add(wake_hosted_driver_waiters_for_instance(instance_index));
 
             if let Some(dpc) = expiry.dpc_ptr {
-                if queue_hosted_driver_dpc(instance_index, dpc, None, None, 0, 0).is_err() {
+                if queue_hosted_driver_dpc(instance_index, dpc, None, None, 0, 0, None).is_err() {
                     let drops = read_volatile((inst.exec_shared_va + SH_DPC_QUEUE_DROPS) as *const u64);
                     write_volatile(
                         (inst.exec_shared_va + SH_DPC_QUEUE_DROPS) as *mut u64,
@@ -58172,6 +58182,23 @@ pub(crate) fn hosted_irq_pump_caller_tcb(
     Some(lane.tcb)
 }
 
+/// A fault delivered by the dedicated IRQ worker must resolve resources from its own bank.
+/// Verify the endpoint, Reply object, badge, domain and lane generation before exposing it.
+pub(crate) unsafe fn hosted_irq_port_fault_shared_va(
+    channel: &crate::spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    identity: nt_hosted_runtime::HostedIrqLaneIdentity,
+    badge: u64,
+) -> Option<u64> {
+    hosted_irq_pump_caller_tcb(channel, reply_cap, identity, badge)?;
+    hosted_irq_lanes()?.iter().find(|lane| {
+        lane.identity == identity
+            && lane.state == HostedIrqLaneState::Ready
+            && lane.exec_shared_va != 0
+            && lane.shared.iter().all(|leaf| leaf.mapped && leaf.exec_mapped)
+    }).map(|lane| lane.exec_shared_va)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct HostedIrqCr8FaultLane {
     instance: usize,
@@ -59141,6 +59168,21 @@ enum HostedIrqConnectionDispatchOutcome {
     DeferredBusy,
 }
 
+unsafe fn hosted_irq_private_shared_va(connection: HostedIrqConnection) -> Option<u64> {
+    let binding = connection.binding;
+    let (_, inst) = instance_by_driver_id(binding.driver_id).filter(|(_, inst)| inst.ready)?;
+    hosted_irq_lanes()?.iter().find(|lane| {
+        lane.projection_instance == binding.projection_instance
+            && lane.domain == binding.projection_domain
+            && lane.identity.lane_generation == connection.lane_generation
+            && lane.state == HostedIrqLaneState::Ready
+            && lane.exec_shared_va != 0
+            && lane.exec_shared_va != inst.exec_shared_va
+            && lane.shared.iter().all(|leaf| leaf.mapped && leaf.exec_mapped)
+            && lane.arg.iter().all(|leaf| leaf.mapped && leaf.exec_mapped)
+    }).map(|lane| lane.exec_shared_va)
+}
+
 unsafe fn dispatch_hosted_irq_connection(
     connection: HostedIrqConnection,
 ) -> Result<HostedIrqConnectionDispatchOutcome, nt_status::NtStatus> {
@@ -59184,18 +59226,8 @@ unsafe fn dispatch_hosted_irq_connection(
     let ordinary_shared = inst.exec_shared_va;
     // Trace a parked ordinary bank while the separate IRQ bank carries this dispatch.
     let _ = retained_hosted_irp_bank_conflicts(ordinary_shared);
-    let irq_shared = hosted_irq_lanes().and_then(|lanes| {
-        lanes.iter().find(|lane| {
-            lane.projection_instance == binding.projection_instance
-                && lane.domain == binding.projection_domain
-                && lane.identity.lane_generation == connection.lane_generation
-                && lane.state == HostedIrqLaneState::Ready
-                && lane.exec_shared_va != 0
-                && lane.exec_shared_va != ordinary_shared
-                && lane.shared.iter().all(|leaf| leaf.mapped && leaf.exec_mapped)
-                && lane.arg.iter().all(|leaf| leaf.mapped && leaf.exec_mapped)
-        }).map(|lane| lane.exec_shared_va)
-    }).ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let irq_shared = hosted_irq_private_shared_va(connection)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     restore_hosted_device_resource_state(binding, irq_shared, false)?;
     let outcome = hosted_irq_broker::dispatch_interrupt(connection);
     match outcome {
@@ -59657,11 +59689,6 @@ unsafe fn service_hosted_irq_event(
                 if !already_drained {
                     hosted_irq_broker::drain_dpcs(owner)?;
                 }
-                let binding = retained.connection.binding;
-                let (_, inst) = instance_by_driver_id(binding.driver_id)
-                    .filter(|(_, inst)| inst.ready)
-                    .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-                refresh_hosted_device_resource_state(binding, inst.exec_shared_va);
             }
             Ok(HostedIrqServiceOutcome::Serviced(claimed))
         }
@@ -62356,7 +62383,8 @@ pub(crate) unsafe fn hosted_io_port_fault_grant(
     shared_va: u64,
     port: u16,
 ) -> Option<HostedIoPortFaultGrant> {
-    let (instance, inst) = instance_by_shared_va(shared_va)?;
+    let (instance, inst) = instance_by_shared_va(shared_va)
+        .or_else(|| hosted_irq_instance_by_shared_va(shared_va))?;
     let pdo_object = read_volatile((shared_va + SH_RESOURCE_PDO_OBJECT) as *const u64);
     let current = hosted_device_bindings()?.iter().copied().find(|binding| {
         binding.used && binding.instance == instance && binding.pdo_object == pdo_object
@@ -64825,6 +64853,20 @@ fn instance_by_shared_va(shared_va: u64) -> Option<(usize, DriverInstance)> {
     t.iter().copied().enumerate().find(|(_, entry)| {
         entry.used && entry.exec_shared_va != 0 && entry.exec_shared_va == shared_va
     })
+}
+
+fn hosted_irq_instance_by_shared_va(shared_va: u64) -> Option<(usize, DriverInstance)> {
+    let lane = unsafe { hosted_irq_lanes()? }.iter().find(|lane| {
+        lane.state == HostedIrqLaneState::Ready
+            && lane.exec_shared_va != 0
+            && lane.exec_shared_va == shared_va
+            && lane.shared.iter().all(|leaf| leaf.mapped && leaf.exec_mapped)
+    })?;
+    let inst = instance(lane.projection_instance)?;
+    if !inst.ready || instance_domain_identity(inst) != Some(lane.domain) {
+        return None;
+    }
+    Some((lane.projection_instance, inst))
 }
 
 fn authenticated_pump_channel_domain(
@@ -69163,6 +69205,104 @@ pub(crate) fn service_hosted_driver_ke_set_timer(
     unsafe { apply_hosted_driver_ke_set_timer(instance, exec_timer, timer, due_time, period_ms, dpc) }
 }
 
+/// Capture the canonical device registration, including its reuse generation, before a DPC is
+/// inserted. A pointer or private-bank PDO alone is never resource authority.
+unsafe fn hosted_dpc_resource_for_binding(
+    binding: HostedDeviceBinding,
+) -> Option<HostedDpcResourceIdentity> {
+    if hosted_device_binding_by_device_id(binding.device_id) != Some(binding) {
+        return None;
+    }
+    let state = hosted_device_resource_state_by_device_id(binding.device_id)?;
+    let lease = state.pnp_context_lease?;
+    if state.projection_domain != binding.projection_domain
+        || state.pdo_object != binding.pdo_object
+        || !crate::hosted_pnp_context_lease_is_live(lease)
+    {
+        return None;
+    }
+    let registration = io_manager_mut().hosted_device_pointer_registration(
+        binding.projection_domain, binding.device_object,
+    )?;
+    if registration.device_id().raw() != binding.device_id {
+        return None;
+    }
+    HostedDpcResourceIdentity::new(
+        binding.device_id,
+        binding.projection_domain.domain_id.raw(),
+        binding.projection_domain.cookie,
+        registration.generation(),
+    )
+}
+
+unsafe fn hosted_dpc_resource_from_shared(
+    instance_index: usize,
+    shared_va: u64,
+) -> Option<HostedDpcResourceIdentity> {
+    let pdo = read_volatile((shared_va + SH_RESOURCE_PDO_OBJECT) as *const u64);
+    let binding = hosted_device_bindings()?.iter().copied().find(|binding| {
+        binding.used && binding.instance == instance_index && binding.pdo_object == pdo
+    })?;
+    hosted_dpc_resource_for_binding(binding)
+}
+
+unsafe fn hosted_dpc_binding_for_resource(
+    resource: HostedDpcResourceIdentity,
+    projection_instance: usize,
+) -> Option<HostedDeviceBinding> {
+    let binding = hosted_device_binding_by_device_id(resource.device_id)?;
+    if binding.projection_instance != projection_instance
+        || binding.projection_domain.domain_id.raw() != resource.domain_id
+        || binding.projection_domain.cookie != resource.domain_cookie
+        || hosted_dpc_resource_for_binding(binding)? != resource
+    {
+        return None;
+    }
+    Some(binding)
+}
+
+unsafe fn prepare_hosted_dpc_resource_projection(
+    resource: Option<HostedDpcResourceIdentity>,
+    projection_instance: usize,
+    shared_va: u64,
+) -> Result<(), nt_status::NtStatus> {
+    // Always drop the previous ISR/DPC's resource authority before selecting this callback.
+    clear_shared_address_resources(shared_va);
+    write_volatile((shared_va + SH_RESOURCE_PDO_OBJECT) as *mut u64, 0);
+    write_volatile((shared_va + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64, 0);
+    write_volatile((shared_va + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64, 0);
+    write_volatile((shared_va + SH_RESOURCE_INTERRUPT_VECTOR) as *mut u32, 0);
+    write_volatile((shared_va + SH_RESOURCE_INTERRUPT_LINE) as *mut u32, 0);
+    write_volatile((shared_va + SH_RESOURCE_INTERRUPT_AFFINITY) as *mut u64, 0);
+    write_volatile((shared_va + SH_RESOURCE_INTERRUPT_POLICY) as *mut u64, 0);
+    write_volatile((shared_va + SH_RESOURCE_INTERFACE_TYPE) as *mut u32,
+        HOSTED_INTERFACE_TYPE_INTERNAL);
+    write_volatile((shared_va + SH_RESOURCE_BUS_NUMBER) as *mut u32, 0);
+    write_volatile((shared_va + SH_RESOURCE_ADDRESS) as *mut u32, 0);
+    write_volatile((shared_va + SH_RESOURCE_PCI_VENDOR_DEVICE) as *mut u32, 0);
+    write_volatile((shared_va + SH_RESOURCE_PCI_CLASS_REV) as *mut u32, 0);
+    write_volatile((shared_va + SH_RESOURCE_PCI_IRQ) as *mut u32, 0);
+    write_volatile((shared_va + SH_VIDEO_MEMORY_PHYS) as *mut u64, 0);
+    write_volatile((shared_va + SH_VIDEO_MEMORY_LEN) as *mut u64, 0);
+    write_volatile((shared_va + SH_VIDEO_MEMORY_CALLER_VA) as *mut u64, 0);
+    write_volatile((shared_va + SH_VIDEO_MEMORY_MAPPED_VA) as *mut u64, 0);
+    write_volatile((shared_va + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64, 0);
+    write_volatile((shared_va + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64, 0);
+    write_volatile((shared_va + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64, 0);
+    write_volatile((shared_va + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
+    write_volatile((shared_va + SH_DMA_COMMON_VA) as *mut u64, 0);
+    write_volatile((shared_va + SH_DMA_COMMON_LEN) as *mut u64, 0);
+    write_volatile((shared_va + SH_DMA_COMMON_LOGICAL) as *mut u64, 0);
+    write_volatile((shared_va + SH_DMA_ADAPTER_ID) as *mut u64, 0);
+    write_volatile((shared_va + SH_DMA_ADAPTER_BLOB) as *mut u64, 0);
+    if let Some(resource) = resource {
+        let binding = hosted_dpc_binding_for_resource(resource, projection_instance)
+            .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+        restore_hosted_device_resource_state(binding, shared_va, false)?;
+    }
+    Ok(())
+}
+
 unsafe fn queue_hosted_driver_dpc(
     instance_index: usize,
     dpc: u64,
@@ -69170,6 +69310,7 @@ unsafe fn queue_hosted_driver_dpc(
     expected_context: Option<u64>,
     argument1: u64,
     argument2: u64,
+    resource: Option<HostedDpcResourceIdentity>,
 ) -> Result<HostedDpcQueueResult, nt_status::NtStatus> {
     let inst = instance(instance_index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     let domain = instance_domain_identity(inst).ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
@@ -69213,8 +69354,8 @@ unsafe fn queue_hosted_driver_dpc(
     let owner = HostedDpcOwner::new(domain.domain_id.raw(), domain.cookie, lane_generation)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let queued = hosted_dpcs_mut()
-        .register_and_queue_with_importance(
-            owner, dpc, routine, deferred_context, argument1, argument2, importance,
+        .register_and_queue_with_resource_and_importance(
+            owner, dpc, routine, deferred_context, argument1, argument2, resource, importance,
         )
         .map_err(hosted_dpc_status)?;
     let inserted = matches!(queued, HostedDpcQueueResult::Queued(_));
@@ -69316,6 +69457,7 @@ pub(crate) fn service_hosted_driver_queue_dpc(
         return (STATUS_INVALID_PARAMETER, 0, 0);
     };
     let queued = unsafe {
+        let resource = hosted_dpc_resource_from_shared(instance_index, ch.shared_va);
         queue_hosted_driver_dpc(
             instance_index,
             dpc,
@@ -69323,6 +69465,7 @@ pub(crate) fn service_hosted_driver_queue_dpc(
             Some(deferred_context),
             argument1,
             argument2,
+            resource,
         )
     };
     match queued {

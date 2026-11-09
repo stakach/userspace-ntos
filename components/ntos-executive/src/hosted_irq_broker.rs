@@ -50,6 +50,7 @@ struct HostedIrqRootSession {
         nt_hosted_runtime::HostedIrqLaneIdentity,
         nt_hosted_runtime::HostedIrqGrantIdentity,
     )>,
+    dpc_resource: Option<HostedDpcResourceIdentity>,
     service_locks: Vec<InterruptActualLockLease>,
     class_acks: Vec<ClassCallbackAck>,
 }
@@ -1359,6 +1360,21 @@ impl HostedIrqRootSession {
         if !root_dpc_grant && !lane_has_service_grant(lane, command.grant) {
             return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
         }
+        let resource = if root_dpc_grant {
+            self.dpc_resource
+        } else if lane_has_connection_grant(lane, command.grant) {
+            let connection = match connection_for_service(lane, command) {
+                Ok(connection) => connection,
+                Err(status) => return fatal_service_result(status.raw()),
+            };
+            match hosted_dpc_resource_for_binding(connection.binding) {
+                Some(resource) => Some(resource),
+                None => return fatal_service_result(nt_status::NtStatus::DEVICE_NOT_CONNECTED.raw()),
+            }
+        } else {
+            // A provider dependency grant carries no local device registration.
+            None
+        };
         let instance_index = lane.projection_instance;
         let queue = match queue_hosted_driver_dpc(
             instance_index,
@@ -1367,6 +1383,7 @@ impl HostedIrqRootSession {
             Some(command.arguments[1]),
             command.arguments[2],
             command.arguments[3],
+            resource,
         ) {
             Ok(queue) => queue,
             Err(status) => return fatal_service_result(status.raw()),
@@ -2060,6 +2077,7 @@ pub(super) unsafe fn dispatch_interrupt(
         call_frames: Vec::new(),
         outer_lock: Some(outer_lock),
         dpc_grant: None,
+        dpc_resource: None,
         service_locks: Vec::new(),
         class_acks: Vec::new(),
     };
@@ -2341,6 +2359,13 @@ unsafe fn dispatch_next_dpc(
             return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
         }
     };
+    if let Err(status) = prepare_hosted_dpc_resource_projection(
+        activation.resource, lane.projection_instance, lane.shared_va,
+    ) {
+        trace_hosted_dpc_failure_stage(lane, activation, b"resource", status);
+        abort_dpc_transaction(lane, transaction, activation)?;
+        return Err(status);
+    }
     let exec_dpc = match hosted_driver_component_object_exec_va(
         lane.projection_instance,
         inst,
@@ -2429,6 +2454,7 @@ unsafe fn dispatch_next_dpc(
         call_frames: Vec::new(),
         outer_lock: None,
         dpc_grant: Some((lane.identity, grant)),
+        dpc_resource: activation.resource,
         service_locks: Vec::new(),
         class_acks: Vec::new(),
     };

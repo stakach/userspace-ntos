@@ -2519,7 +2519,12 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
             continue;
         }
         if label == 3 {
-            if let Some(next_ip) = pump_service_io_port_fault(ch, ch.reply_cap, msg.m0, msg.m3) {
+            let irq_shared = crate::driver_launch::hosted_irq_port_fault_shared_va(
+                ch, ch.reply_cap, identity, expected_badge,
+            );
+            if let Some(next_ip) = irq_shared.and_then(|shared_va| {
+                pump_service_io_port_fault(ch, shared_va, ch.reply_cap, msg.m0, msg.m3)
+            }) {
                 msg = hosted_irq_reply_recv(
                     ch, ch.reply_cap, 1, [next_ip, 0, 0, 0], identity, expected_badge,
                 );
@@ -3146,7 +3151,7 @@ unsafe fn component_pump_loop(
         // in the same driver instance owns the controller port. The decoder
         // and exact hosted grant selector decide whether this GP is I/O.
         if label == 3 {
-            if let Some(next_ip) = pump_service_io_port_fault(ch, *reply_cap, msg.m0, msg.m3) {
+            if let Some(next_ip) = pump_service_io_port_fault(ch, ch.shared_va, *reply_cap, msg.m0, msg.m3) {
                 pump_reply_recv_into!(ch, *reply_cap, msg, 1, next_ip);
                 continue;
             }
@@ -5889,6 +5894,7 @@ unsafe fn pump_service_generic_fault(
 #[inline(never)]
 unsafe fn pump_service_io_port_fault(
     ch: &PumpChannel,
+    shared_va: u64,
     active_reply_cap: u64,
     fault_ip: u64,
     exception_number: u64,
@@ -5899,7 +5905,7 @@ unsafe fn pump_service_io_port_fault(
         return None;
     }
 
-    let sh = ch.shared_va;
+    let sh = shared_va;
     let (component_code_va, image_frames) = if ch.code_va != 0 && ch.image_frames != 0 {
         (ch.code_va, ch.image_frames)
     } else if ch.caps.kind == ReqKind::Irp {
@@ -5971,7 +5977,7 @@ unsafe fn pump_service_io_port_fault(
         nt_kernel_exec::x86_io::PortIoPort::Dx => (regs[6] & 0xFFFF) as u16,
         nt_kernel_exec::x86_io::PortIoPort::Immediate(port) => port as u16,
     };
-    let grant = crate::driver_launch::hosted_io_port_fault_grant(sh, port).or_else(|| {
+    let grant = crate::driver_launch::hosted_io_port_fault_grant(shared_va, port).or_else(|| {
         crate::driver_launch::hosted_legacy_vga_port_fault_grant(
             ch, active_reply_cap, port, is_in, bits,
         )

@@ -109,7 +109,7 @@ pub use event_object::{
 };
 pub use hosted_dpc::{
     HostedDpcActivation, HostedDpcError, HostedDpcIdentity, HostedDpcImportance, HostedDpcOwner,
-    HostedDpcQueueResult, HostedDpcSnapshot, HostedDpcTable,
+    HostedDpcQueueResult, HostedDpcResourceIdentity, HostedDpcSnapshot, HostedDpcTable,
 };
 pub use interrupt::{
     InterruptConnectError, InterruptConnection, InterruptMode, InterruptScan,

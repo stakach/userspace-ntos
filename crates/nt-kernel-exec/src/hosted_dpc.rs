@@ -48,9 +48,44 @@ impl HostedDpcIdentity {
     }
 }
 
+/// Exact device projection that authorized a DPC insertion. The generation comes from the
+/// root-owned device pointer registration, not from provider memory or a numeric capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostedDpcResourceIdentity {
+    pub device_id: u64,
+    pub domain_id: u64,
+    pub domain_cookie: u64,
+    pub binding_generation: u64,
+}
+
+impl HostedDpcResourceIdentity {
+    pub const fn new(
+        device_id: u64,
+        domain_id: u64,
+        domain_cookie: u64,
+        binding_generation: u64,
+    ) -> Option<Self> {
+        if device_id == 0 || domain_id == 0 || domain_cookie == 0 || binding_generation == 0 {
+            None
+        } else {
+            Some(Self {
+                device_id,
+                domain_id,
+                domain_cookie,
+                binding_generation,
+            })
+        }
+    }
+
+    pub const fn belongs_to(self, owner: HostedDpcOwner) -> bool {
+        self.domain_id == owner.domain_id && self.domain_cookie == owner.domain_cookie
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostedDpcActivation {
     pub identity: HostedDpcIdentity,
+    pub resource: Option<HostedDpcResourceIdentity>,
     pub sequence: u64,
     pub routine: u64,
     pub deferred_context: u64,
@@ -110,6 +145,7 @@ pub enum HostedDpcError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HostedDpcQueued {
     sequence: u64,
+    resource: Option<HostedDpcResourceIdentity>,
     importance: HostedDpcImportance,
     argument1: u64,
     argument2: u64,
@@ -245,7 +281,45 @@ impl HostedDpcTable {
         argument2: u64,
         importance: HostedDpcImportance,
     ) -> Result<HostedDpcQueueResult, HostedDpcError> {
+        self.queue_with_resource_and_importance(identity, argument1, argument2, None, importance)
+    }
+
+    pub fn queue_with_resource(
+        &mut self,
+        identity: HostedDpcIdentity,
+        argument1: u64,
+        argument2: u64,
+        resource: HostedDpcResourceIdentity,
+    ) -> Result<HostedDpcQueueResult, HostedDpcError> {
+        self.queue_with_resource_and_importance(
+            identity,
+            argument1,
+            argument2,
+            Some(resource),
+            HostedDpcImportance::Medium,
+        )
+    }
+
+    pub fn queue_with_resource_and_importance(
+        &mut self,
+        identity: HostedDpcIdentity,
+        argument1: u64,
+        argument2: u64,
+        resource: Option<HostedDpcResourceIdentity>,
+        importance: HostedDpcImportance,
+    ) -> Result<HostedDpcQueueResult, HostedDpcError> {
         let index = self.record_index(identity)?;
+        if resource.is_some_and(|resource| {
+            HostedDpcResourceIdentity::new(
+                resource.device_id,
+                resource.domain_id,
+                resource.domain_cookie,
+                resource.binding_generation,
+            ) != Some(resource)
+                || !resource.belongs_to(identity.owner)
+        }) {
+            return Err(HostedDpcError::InvalidIdentity);
+        }
         if self.records[index].queued.is_some() {
             return Ok(HostedDpcQueueResult::AlreadyQueued(identity));
         }
@@ -255,6 +329,7 @@ impl HostedDpcTable {
             .ok_or(HostedDpcError::SequenceExhausted)?;
         self.records[index].queued = Some(HostedDpcQueued {
             sequence,
+            resource,
             importance,
             argument1,
             argument2,
@@ -288,8 +363,33 @@ impl HostedDpcTable {
         argument2: u64,
         importance: HostedDpcImportance,
     ) -> Result<HostedDpcQueueResult, HostedDpcError> {
+        self.register_and_queue_with_resource_and_importance(
+            owner,
+            dpc_token,
+            routine,
+            deferred_context,
+            argument1,
+            argument2,
+            None,
+            importance,
+        )
+    }
+
+    pub fn register_and_queue_with_resource_and_importance(
+        &mut self,
+        owner: HostedDpcOwner,
+        dpc_token: u64,
+        routine: u64,
+        deferred_context: u64,
+        argument1: u64,
+        argument2: u64,
+        resource: Option<HostedDpcResourceIdentity>,
+        importance: HostedDpcImportance,
+    ) -> Result<HostedDpcQueueResult, HostedDpcError> {
         let identity = self.register(owner, dpc_token, routine, deferred_context)?;
-        self.queue_with_importance(identity, argument1, argument2, importance)
+        self.queue_with_resource_and_importance(
+            identity, argument1, argument2, resource, importance,
+        )
     }
 
     pub fn remove(&mut self, identity: HostedDpcIdentity) -> Result<bool, HostedDpcError> {
@@ -386,6 +486,7 @@ impl HostedDpcTable {
         record.in_flight = Some(queued);
         Ok(Some(HostedDpcActivation {
             identity: record.identity,
+            resource: queued.resource,
             sequence: queued.sequence,
             routine: record.routine,
             deferred_context: record.deferred_context,
@@ -397,7 +498,9 @@ impl HostedDpcTable {
     pub fn complete(&mut self, activation: HostedDpcActivation) -> Result<(), HostedDpcError> {
         let index = self.record_index(activation.identity)?;
         let record = &mut self.records[index];
-        if record.in_flight.map(|queued| queued.sequence) != Some(activation.sequence) {
+        if record.in_flight.map(|queued| (queued.sequence, queued.resource))
+            != Some((activation.sequence, activation.resource))
+        {
             return Err(HostedDpcError::StaleActivation);
         }
         record.in_flight = None;
@@ -407,7 +510,8 @@ impl HostedDpcTable {
     pub fn abort(&mut self, activation: HostedDpcActivation) -> Result<(), HostedDpcError> {
         let index = self.record_index(activation.identity)?;
         let record = &mut self.records[index];
-        if record.in_flight.map(|queued| queued.sequence) != Some(activation.sequence)
+        if record.in_flight.map(|queued| (queued.sequence, queued.resource))
+            != Some((activation.sequence, activation.resource))
             || record.queued.is_some()
         {
             return Err(HostedDpcError::StaleActivation);
@@ -498,6 +602,91 @@ mod tests {
 
     fn owner(id: u64) -> HostedDpcOwner {
         HostedDpcOwner::new(id, id + 1, id + 2).unwrap()
+    }
+
+    fn resource(owner: HostedDpcOwner, device_id: u64, generation: u64) -> HostedDpcResourceIdentity {
+        HostedDpcResourceIdentity::new(
+            device_id,
+            owner.domain_id,
+            owner.domain_cookie,
+            generation,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn queued_dpcs_retain_distinct_device_bindings_through_activation() {
+        let mut table = HostedDpcTable::new();
+        let lane = owner(7);
+        let first = table.register(lane, 0x1000, 0x2000, 0).unwrap();
+        let second = table.register(lane, 0x1001, 0x2001, 0).unwrap();
+        let first_resource = resource(lane, 41, 3);
+        let second_resource = resource(lane, 42, 4);
+        table.queue_with_resource(first, 1, 2, first_resource).unwrap();
+        table.queue_with_resource(second, 3, 4, second_resource).unwrap();
+
+        let first_activation = table.begin_next(lane).unwrap().unwrap();
+        assert_eq!(first_activation.identity, first);
+        assert_eq!(first_activation.resource, Some(first_resource));
+        assert_eq!(
+            table.complete(HostedDpcActivation {
+                resource: Some(second_resource),
+                ..first_activation
+            }),
+            Err(HostedDpcError::StaleActivation)
+        );
+        table.complete(first_activation).unwrap();
+        let second_activation = table.begin_next(lane).unwrap().unwrap();
+        assert_eq!(second_activation.identity, second);
+        assert_eq!(second_activation.resource, Some(second_resource));
+    }
+
+    #[test]
+    fn duplicate_queue_preserves_first_resource_and_abort_restores_it() {
+        let mut table = HostedDpcTable::new();
+        let lane = owner(7);
+        let identity = table.register(lane, 0x1000, 0x2000, 0).unwrap();
+        let original = resource(lane, 41, 3);
+        table.queue_with_resource(identity, 11, 13, original).unwrap();
+        assert_eq!(
+            table.queue_with_resource(identity, 17, 19, resource(lane, 42, 4)),
+            Ok(HostedDpcQueueResult::AlreadyQueued(identity))
+        );
+        let activation = table.begin_next(lane).unwrap().unwrap();
+        assert_eq!(activation.resource, Some(original));
+        assert_eq!(activation.system_argument1, 11);
+        table.abort(activation).unwrap();
+        assert_eq!(table.begin_next(lane), Ok(Some(activation)));
+    }
+
+    #[test]
+    fn resource_domain_and_reused_binding_generation_are_exact() {
+        let mut table = HostedDpcTable::new();
+        let lane = owner(7);
+        let identity = table.register(lane, 0x1000, 0x2000, 0).unwrap();
+        let stale_binding = resource(lane, 41, 3);
+        let other_domain_binding = resource(owner(9), 41, 3);
+        assert_eq!(
+            table.queue_with_resource(identity, 0, 0, other_domain_binding),
+            Err(HostedDpcError::InvalidIdentity)
+        );
+        assert_eq!(table.queued_count(lane), 0);
+        table.queue_with_resource(identity, 0, 0, stale_binding).unwrap();
+        let old_activation = table.begin_next(lane).unwrap().unwrap();
+        table.complete(old_activation).unwrap();
+        table.retire(identity).unwrap();
+
+        let replacement = table.register(lane, 0x1000, 0x2001, 0).unwrap();
+        let current_binding = resource(lane, 41, 4);
+        assert_ne!(replacement.generation, identity.generation);
+        assert_ne!(current_binding, stale_binding);
+        assert_eq!(
+            table.queue_with_resource(identity, 0, 0, stale_binding),
+            Err(HostedDpcError::NotRegistered)
+        );
+        table.queue_with_resource(replacement, 0, 0, current_binding).unwrap();
+        let new_activation = table.begin_next(lane).unwrap().unwrap();
+        assert_eq!(new_activation.resource, Some(current_binding));
     }
 
     #[test]
