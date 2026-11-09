@@ -274,15 +274,19 @@ pub(super) unsafe fn trace_class_source_after_hook() {
     static COUNT: AtomicU64 = AtomicU64::new(0);
     if COUNT.fetch_add(1, Ordering::Relaxed) >= 10 { return; }
     let count = class_sources().len();
+    print_str(b"[hook-class-post-event-count] rows=");
+    print_u64(count as u64); print_str(b"\n");
     for index in 0..count {
-        let Some((irp, route, dispatch, reply, token, class_tcb, acknowledged)) =
-            class_sources().get(index).and_then(|work| {
-                (work.published && !work.source_released).then_some((
-                    work.irp, work.origin.route, work.origin.dispatch,
-                    work.origin.reply, work.origin.token, work.instance.tcb,
-                    work.canonical_acknowledged,
-                ))
-            }) else { continue; };
+        let Some((irp, route, dispatch, reply, token, class_tcb, flags)) =
+            class_sources().get(index).map(|work| (
+                work.irp, work.origin.route, work.origin.dispatch,
+                work.origin.reply, work.origin.token, work.instance.tcb,
+                u64::from(work.entered)
+                    | (u64::from(work.published) << 1)
+                    | (u64::from(work.canonical_acknowledged) << 2)
+                    | (u64::from(work.pin_released) << 3)
+                    | (u64::from(work.source_released) << 4),
+            )) else { continue; };
         let wait = runtime::hosted_forward_wait_probe(route, dispatch, reply, token);
         let current_reply = runtime::current_reply(route).ok() == Some(reply);
         let source_tcb = runtime::physical_source(route).map_or(0, |source| source.tcb);
@@ -290,11 +294,11 @@ pub(super) unsafe fn trace_class_source_after_hook() {
         if source_tcb != 0 {
             crate::win32k_glue::tcb_read_debug_state(source_tcb, reply, &mut state);
         }
-        print_str(b"[hook-class-post-event] irp/route/epoch/reply/token/class-tcb/source-tcb/ack/wait-phase/can-resume/next-call/current-reply/tcb-state/sched/enqueued/pending-reply=");
+        print_str(b"[hook-class-post-event] irp/route/epoch/reply/token/class-tcb/source-tcb/flags/wait-phase/can-resume/next-call/current-reply/tcb-state/sched/enqueued/pending-reply=");
         print_hex_u64(irp); print_str(b"/"); print_hex_u64(route.badge()); print_str(b"/");
         print_u64(dispatch.epoch()); print_str(b"/"); print_hex_u64(reply); print_str(b"/");
         print_hex_u64(token); print_str(b"/"); print_hex_u64(class_tcb); print_str(b"/");
-        print_hex_u64(source_tcb); print_str(b"/"); print_u64(u64::from(acknowledged));
+        print_hex_u64(source_tcb); print_str(b"/"); print_u64(flags);
         print_str(b"/"); print_u64(wait.map_or(9, |state| state.0));
         print_str(b"/"); print_u64(wait.map_or(2, |state| state.1));
         print_str(b"/"); print_u64(wait.map_or(2, |state| state.2));
@@ -1325,6 +1329,7 @@ pub(super) unsafe fn service(
                 row.source_released = true;
             }
             if !row.origin.retire_receipt() { return Some((BUSY, false)); }
+            trace_class_source(47, row, row.origin.token);
             class_sources().swap_remove(index);
             return Some((STATUS_SUCCESS, false));
         }
