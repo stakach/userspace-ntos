@@ -978,6 +978,17 @@ fn trace_hook_redrive(
     print_u64(u64::from(unowned)); print_str(b"\n");
 }
 
+static HOOK_REDRIVE_EXIT_PROBE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn redrive_exit_probe() -> bool {
+    HOOK_REDRIVE_EXIT_PROBE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+pub(super) fn clear_redrive_exit_probe() {
+    HOOK_REDRIVE_EXIT_PROBE.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
 pub(super) unsafe fn redrive() {
     let trace = entered_port_source_unpublished();
     let class_count = class_sources().len();
@@ -1052,6 +1063,7 @@ pub(super) unsafe fn redrive() {
     if trace {
         trace_hook_redrive(7, class_count as u64, port_count as u64,
             false, false, false, false);
+        HOOK_REDRIVE_EXIT_PROBE.store(true, core::sync::atomic::Ordering::Relaxed);
     }
 }
 

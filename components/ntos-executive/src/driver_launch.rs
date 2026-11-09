@@ -67482,6 +67482,17 @@ pub(crate) unsafe fn service_hosted_hook_forward(
 
 pub(crate) unsafe fn redrive_hosted_hook_forward() {
     hosted_input_hook_live::redrive();
+    if hosted_input_hook_live::redrive_exit_probe() {
+        print_str(b"[hook-root-boundary] wrapper-return\n");
+    }
+}
+
+pub(crate) fn hook_redrive_exit_probe() -> bool {
+    hosted_input_hook_live::redrive_exit_probe()
+}
+
+pub(crate) fn clear_hook_redrive_exit_probe() {
+    hosted_input_hook_live::clear_redrive_exit_probe();
 }
 
 pub(crate) fn hosted_hook_port_waiting() -> bool {

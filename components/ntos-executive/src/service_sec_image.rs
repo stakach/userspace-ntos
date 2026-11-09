@@ -11075,6 +11075,10 @@ pub(crate) unsafe fn service_sec_image(
                 break 'service_loop;
             }
             crate::driver_launch::redrive_hosted_hook_forward();
+            if crate::driver_launch::hook_redrive_exit_probe() {
+                trace_hook_root_boundary(0);
+                crate::driver_launch::clear_hook_redrive_exit_probe();
+            }
             if crate::driver_launch::hosted_hook_port_waiting() {
                 trace_hook_root_boundary(1);
             }
