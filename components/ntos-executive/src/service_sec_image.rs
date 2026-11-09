@@ -10925,6 +10925,10 @@ pub(crate) unsafe fn service_sec_image(
             trace_connect_add_device_boundary(3, u64::from(still_parked)
                 | (u64::from(awaiting_connect_child) << 1)
                 | (u64::from(ran_child) << 2));
+            trace_connect_add_device_boundary(5,
+                root_add_device_probe_bits(&nt_handler, reservation));
+            trace_connect_add_device_boundary(6,
+                crate::driver_launch::hosted_connect_root_probe_origin_bits());
             if !still_parked {
                 if root_add_device_turn.as_ref().and_then(|turn|
                     turn.retained_ingress(reservation).ok().flatten())
@@ -28020,6 +28024,19 @@ fn root_add_device_retry_without_new_child(
     }
 }
 
+fn root_add_device_probe_bits(handler: &ExecNtHandler, owner: RootAddDeviceOwner) -> u64 {
+    match owner {
+        RootAddDeviceOwner::DriverStart(reservation) => handler.pending_driver_starts
+            .get_exact(reservation).map_or(0, |pending|
+                pending.batch.root_add_device_probe_bits()),
+        RootAddDeviceOwner::PnpRebalance(reservation) => handler.pending_pnp_operations
+            .get_exact(reservation).map_or(0, |pending| match &pending.operation {
+                OwnedPendingPnpOperation::Rebalance(batch) => batch.root_add_device_probe_bits(),
+                OwnedPendingPnpOperation::Removal(_) => 0,
+            }),
+    }
+}
+
 fn root_add_device_needs_child_step(
     handler: &ExecNtHandler, owner: RootAddDeviceOwner,
 ) -> bool {
@@ -28156,7 +28173,8 @@ unsafe fn trace_connect_root_checkpoint(
 // Stages: 1 recorded pump result (0 no work, 1 returned, 2 yielded,
 // 3 retained, 4 blocked), 2 settlement (1 settled, 2 awaiting, 3 retained,
 // 4 blocked), 3 AddDevice still-parked/awaiting-child/ran-child bits,
-// 4 parked receive prepared. Phase comes from the live CONNECT owner.
+// 4 parked receive prepared, 5 native AddDevice continuation bits, 6 CONNECT
+// origin bits. Phase comes from the live CONNECT owner.
 unsafe fn trace_connect_add_device_boundary(stage: u64, detail: u64) {
     static COUNT: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);

@@ -846,6 +846,15 @@ pub(super) fn root_probe_phase() -> u64 {
         })
 }
 
+/// Pending Reply, source arm, and exact provider entry for the retained CONNECT row.
+pub(super) fn root_probe_origin_bits() -> u64 {
+    rows().iter().flatten().find(|work| work.provider_entered).map_or(0, |work| {
+        u64::from(work.source.origin().pending())
+            | (u64::from(work.source.origin().armed()) << 1)
+            | (u64::from(work.source_acknowledged) << 2)
+    })
+}
+
 pub(super) unsafe fn redrive_nested_ready() -> bool {
     trace_connect_redrive_if_pending(0, true);
     let progress = || {

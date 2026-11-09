@@ -67714,6 +67714,10 @@ pub(crate) fn hosted_connect_root_probe_phase() -> u64 {
     hosted_connect_live::root_probe_phase()
 }
 
+pub(crate) fn hosted_connect_root_probe_origin_bits() -> u64 {
+    hosted_connect_live::root_probe_origin_bits()
+}
+
 pub(crate) unsafe fn redrive_nested_hosted_connect_forward() -> bool {
     hosted_connect_live::redrive_nested_ready()
 }

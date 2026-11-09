@@ -560,6 +560,28 @@ impl OwnedHostedPnpStartBatch {
             })
     }
 
+    /// Read-only census for the retained root AddDevice turn. Bit 0 is a present native
+    /// continuation; bits 1..5 are blocked, child receipt, quarantine, child ready, and
+    /// retry without a new child. Bit 6 means its devnode is still the Ready cursor.
+    pub(crate) fn root_add_device_probe_bits(&self) -> u64 {
+        if let Some(pending) = self.pending_upper_filter.as_ref() {
+            return 1 | (u64::from(pending.blocked) << 1)
+                | (u64::from(pending.child_step_recorded) << 2)
+                | (u64::from(pending.quarantined_child_step.is_some()) << 3)
+                | (u64::from(pending.continuation.child_work_ready()) << 4)
+                | (u64::from(pending.continuation.retry_without_new_child()) << 5)
+                | (u64::from(pending.devnode_index == self.coordinator.next_devnode()) << 6);
+        }
+        self.pending_add_device.as_ref().map_or(0, |pending| {
+            1 | (u64::from(pending.blocked) << 1)
+                | (u64::from(pending.child_step_recorded) << 2)
+                | (u64::from(pending.quarantined_child_step.is_some()) << 3)
+                | (u64::from(pending.continuation.child_work_ready()) << 4)
+                | (u64::from(pending.continuation.retry_without_new_child()) << 5)
+                | (u64::from(pending.devnode_index == self.coordinator.next_devnode()) << 6)
+        })
+    }
+
     /// A child may have entered before this deposit. A refusal stays in this batch and fences
     /// re-selection; the root retains the returned certificate only if the exact batch vanished.
     pub(crate) fn record_add_device_child_step(
@@ -1369,6 +1391,14 @@ impl OwnedHostedPnpRebalance {
 
     pub(crate) fn retry_add_device_without_new_child(&self) -> bool {
         self.add_device_wait_stage() && self.restart.retry_add_device_without_new_child()
+    }
+
+    pub(crate) fn root_add_device_probe_bits(&self) -> u64 {
+        if self.add_device_wait_stage() {
+            self.restart.root_add_device_probe_bits()
+        } else {
+            0
+        }
     }
 
     pub(crate) fn record_add_device_child_step(
