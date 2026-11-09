@@ -19,6 +19,7 @@ struct HostedIrqLaneView {
     channel: crate::spawn_hosts::PumpChannel,
     badge: u64,
     arena_va: u64,
+    shared_va: u64,
 }
 
 impl HostedIrqLaneView {
@@ -120,7 +121,10 @@ unsafe fn lane_view_for_domain(
         })
         .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     if lane.exec_arena_va == 0
+        || lane.exec_shared_va == 0
         || !lane.arena.iter().all(|leaf| leaf.exec_mapped)
+        || !lane.shared.iter().all(|leaf| leaf.mapped && leaf.exec_mapped)
+        || !lane.arg.iter().all(|leaf| leaf.mapped && leaf.exec_mapped)
         || !lane
             .stack
             .iter()
@@ -139,6 +143,7 @@ unsafe fn lane_view_for_domain(
         channel,
         badge: lane.badge,
         arena_va: lane.exec_arena_va,
+        shared_va: lane.exec_shared_va,
     })
 }
 
@@ -2473,9 +2478,9 @@ unsafe fn dispatch_next_dpc(
         trace_hosted_dpc_failure_stage(lane, activation, b"result", status);
         return Err(status);
     }
-    let deliveries = read_volatile((inst.exec_shared_va + SH_DPC_DELIVERIES) as *const u64);
+    let deliveries = read_volatile((lane.shared_va + SH_DPC_DELIVERIES) as *const u64);
     write_volatile(
-        (inst.exec_shared_va + SH_DPC_DELIVERIES) as *mut u64,
+        (lane.shared_va + SH_DPC_DELIVERIES) as *mut u64,
         deliveries.saturating_add(1),
     );
     Ok(HostedDpcRootDispatchOutcome::Completed)

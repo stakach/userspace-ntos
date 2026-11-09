@@ -55,29 +55,6 @@ fn selected_receive_child_may_finish_parent_before_next_root_turn() {
 }
 
 #[test]
-fn irq_dispatch_defers_only_a_connection_whose_shared_bank_is_retained() {
-    let dispatch = DRIVER
-        .split_once("unsafe fn dispatch_hosted_irq_connection(").unwrap().1
-        .split_once("enum HostedIrqServiceOutcome").unwrap().0;
-    let held = dispatch.find("retained_hosted_irp_bank_conflicts(sh)")
-        .expect("IRQ must check both retained shared pages, including suspended owners");
-    let projection = dispatch.find("restore_hosted_device_resource_state(binding, sh, false)")
-        .unwrap();
-    assert!(held < projection,
-        "a conflicting IRQ must defer before writing the parked AddDevice bank");
-    assert!(dispatch[held..projection].contains("DeferredBusy"),
-        "an unrelated IRQ may still dispatch, while the conflicting line is retried later");
-    let line = DRIVER
-        .split_once("unsafe fn service_hosted_irq_event(").unwrap().1
-        .split_once("unsafe fn drain_pending_hosted_irqs_snapshot()").unwrap().0;
-    let preflight = line.find("retained_hosted_irq_line_bank_conflict(&leased)")
-        .expect("all connections on a shared line must be checked before any ISR runs");
-    let first_isr = line.find("while let Some(ready) = scan.next_isr()").unwrap();
-    assert!(preflight < first_isr,
-        "a later conflicting connection cannot be discovered after an earlier ISR effect");
-}
-
-#[test]
 fn parked_timer_ack_preserves_other_due_owners_until_bank_release() {
     let notification = SERVICE
         .split_once("unsafe fn service_parked_add_device_notification(").unwrap().1

@@ -778,12 +778,22 @@ const FSD_WORKER_TRAMP_OFFSET: u64 = 0x0004_1000;
 const FSD_WORKER_SCRATCH_OFFSET: u64 = 0x0004_2000;
 const FSD_WORKER_KPCR_OFFSET: u64 = 0x0004_3000;
 const FSD_IRQ_LANE_ARENA_OFFSET: u64 = 0x0004_3000;
+const FSD_IRQ_LANE_SHARED_OFFSET: u64 = 0x0006_5000;
+const FSD_IRQ_LANE_ARG_OFFSET: u64 = FSD_IRQ_LANE_SHARED_OFFSET + FSD_SHARED_FRAMES * 0x1000;
 const FSD_IRQ_LANE_COMPONENT_SLOT: usize = 0;
 const FSD_WORKER_EXEC_ALIAS_BASE: u64 = 0x0000_0102_0000_0000;
 const HOSTED_DRIVER_WAIT_OBJECT_MAX: u32 = 64;
 const _: () = assert!(FSD_WORKER_VADDR > crate::WORK_CLUSTER_BASE + 0x20_0000);
 const _: () = assert!(FSD_WORKER_VADDR & (FSD_WORKER_STRIDE - 1) == 0);
 const _: () = assert!(FSD_WORKER_STRIDE & 0x1f_ffff == 0);
+const _: () = assert!(nt_hosted_runtime::HostedIrqPrivateBankLayout::new(
+    FSD_IRQ_LANE_ARENA_OFFSET,
+    FSD_IRQ_LANE_SHARED_OFFSET,
+    FSD_SHARED_FRAMES,
+    FSD_IRQ_LANE_ARG_OFFSET,
+    FSD_ARG_FRAMES,
+    FSD_WORKER_STRIDE,
+).is_some());
 const _: () = assert!(
     FSD_IRQ_LANE_ARENA_OFFSET + nt_hosted_runtime::HOSTED_IRQ_ARENA_BYTES <= FSD_WORKER_STRIDE
         && FSD_WORKER_SCRATCH_OFFSET + 0x1000 <= FSD_IRQ_LANE_ARENA_OFFSET
@@ -5334,7 +5344,9 @@ extern "win64" {
 
 pub(crate) unsafe fn call_hosted_pe(target: u64, args: &[u64]) -> u64 {
     assert!(target != 0 && args.len() <= 16, "invalid hosted PE callback");
-    let boundary = read_volatile((FSD_SHARED_VADDR + SH_SEH_FOREIGN_CALL16_VA) as *const u64);
+    let boundary = read_volatile(
+        (hosted_component_shared_va() + SH_SEH_FOREIGN_CALL16_VA) as *const u64,
+    );
     assert_ne!(boundary, 0, "hosted PE callback lacks its admitted boundary");
     let call: unsafe extern "win64" fn(u64, *const u64, u64) -> u64 =
         core::mem::transmute(boundary as *const ());
@@ -5348,6 +5360,22 @@ pub(crate) unsafe fn call_hosted_pe(target: u64, args: &[u64]) -> u64 {
 /// dispatch bugchecks are fail-closed through the guarded unwind path.
 extern "win64" fn s_ke_bug_check_ex(code: u64, p1: u64, p2: u64, p3: u64, p4: u64) {
     unsafe {
+        if let Some((arena, identity, transaction, depth, _)) = hosted_irq_lane_context() {
+            let sequence = hosted_irq_lane_gs_read(HOSTED_IRQ_LANE_KPCR_SEQUENCE_OFFSET);
+            let bugcheck = nt_hosted_runtime::HostedIrqFaultRecord {
+                kind: nt_hosted_runtime::HostedIrqFaultKind::BugCheck,
+                transaction: transaction.transaction,
+                sequence,
+                depth,
+                direction: nt_hosted_runtime::HostedIrqLaneDirection::Dispatch,
+                code,
+                instruction_pointer: 0,
+                address: 0,
+                parameters: [p1, p2, p3, p4],
+            };
+            let _ = arena.control.record_first_bugcheck(identity, bugcheck);
+            hosted_irq_lane_protocol_fault(sequence);
+        }
         FSD_BUGCHECKS.fetch_add(1, Ordering::Relaxed);
         FSD_BUGCHECK_CODE.store(code, Ordering::Relaxed);
         FSD_BUGCHECK_P1.store(p1, Ordering::Relaxed);
@@ -5539,8 +5567,9 @@ extern "win64" fn s_ke_stall_execution_processor(microseconds: u32) {
     if microseconds == 0 {
         return;
     }
-    let frequency_hz =
-        unsafe { read_volatile((FSD_SHARED_VADDR + SH_TSC_FREQUENCY_HZ) as *const u64) };
+    let frequency_hz = unsafe {
+        read_volatile((hosted_component_shared_va() + SH_TSC_FREQUENCY_HZ) as *const u64)
+    };
     let Some(required_cycles) =
         nt_kernel_exec::stall::cycles_for_microseconds(microseconds, frequency_hz)
     else {
@@ -5560,8 +5589,9 @@ extern "win64" fn s_ke_stall_execution_processor(microseconds: u32) {
 /// kernel component. The measured TSC and its boot-calibrated frequency are one coherent counter
 /// authority and require no executive data/MMIO mapping in the component VSpace.
 extern "win64" fn s_hosted_ke_query_performance_counter(frequency: *mut u64) -> u64 {
-    let frequency_hz =
-        unsafe { read_volatile((FSD_SHARED_VADDR + SH_TSC_FREQUENCY_HZ) as *const u64) };
+    let frequency_hz = unsafe {
+        read_volatile((hosted_component_shared_va() + SH_TSC_FREQUENCY_HZ) as *const u64)
+    };
     if frequency_hz == 0 {
         panic!("hosted kernel timing authority is invalid");
     }
@@ -14910,6 +14940,17 @@ unsafe fn hosted_current_irql() -> u8 {
     read_volatile((FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL) as *const u8)
 }
 
+/// The IRQ worker's authenticated GS context selects its private request bank. Other hosted
+/// driver threads keep the ordinary bank until their independent lane is explicitly admitted.
+#[inline]
+unsafe fn hosted_component_shared_va() -> u64 {
+    if hosted_irq_lane_context().is_some() {
+        FSD_WORKER_VADDR + FSD_IRQ_LANE_SHARED_OFFSET
+    } else {
+        FSD_SHARED_VADDR
+    }
+}
+
 #[inline]
 unsafe fn hosted_raise_irql(irql: u8) -> u8 {
     let old = hosted_current_irql();
@@ -14953,6 +14994,7 @@ const HOSTED_IRQ_LANE_KPCR_CLASS_OFFSET: u64 = 0x30;
 const HOSTED_IRQ_LANE_KPCR_DEPTH_OFFSET: u64 = 0x38;
 const HOSTED_IRQ_LANE_KPCR_GRANT_ID_OFFSET: u64 = 0x40;
 const HOSTED_IRQ_LANE_KPCR_GRANT_GENERATION_OFFSET: u64 = 0x48;
+const HOSTED_IRQ_LANE_KPCR_SEQUENCE_OFFSET: u64 = 0x50;
 
 #[inline]
 unsafe fn hosted_irq_lane_gs_read(offset: u64) -> u64 {
@@ -15020,6 +15062,7 @@ unsafe fn hosted_irq_lane_publish_context(
     identity: nt_hosted_runtime::HostedIrqLaneIdentity,
     transaction: nt_hosted_runtime::HostedIrqTransaction,
     depth: u8,
+    sequence: u64,
     grant: nt_hosted_runtime::HostedIrqGrantIdentity,
 ) {
     let kpcr = FSD_WORKER_VADDR + FSD_WORKER_SCRATCH_OFFSET;
@@ -15052,6 +15095,10 @@ unsafe fn hosted_irq_lane_publish_context(
         depth as u64,
     );
     write_volatile(
+        (kpcr + HOSTED_IRQ_LANE_KPCR_SEQUENCE_OFFSET) as *mut u64,
+        sequence,
+    );
+    write_volatile(
         (kpcr + HOSTED_IRQ_LANE_KPCR_GRANT_ID_OFFSET) as *mut u64,
         grant.grant_id,
     );
@@ -15079,6 +15126,10 @@ unsafe fn hosted_irq_lane_clear_context() {
     write_volatile((kpcr + HOSTED_IRQ_LANE_KPCR_GRANT_ID_OFFSET) as *mut u64, 0);
     write_volatile(
         (kpcr + HOSTED_IRQ_LANE_KPCR_GRANT_GENERATION_OFFSET) as *mut u64,
+        0,
+    );
+    write_volatile(
+        (kpcr + HOSTED_IRQ_LANE_KPCR_SEQUENCE_OFFSET) as *mut u64,
         0,
     );
 }
@@ -15179,6 +15230,8 @@ unsafe fn hosted_irq_lane_execute_dispatch(
         hosted_irq_lane_protocol_fault(sequence);
     }
     let parent_context = hosted_irq_lane_context();
+    let parent_sequence = parent_context
+        .map(|_| hosted_irq_lane_gs_read(HOSTED_IRQ_LANE_KPCR_SEQUENCE_OFFSET));
     let entry_irql = arena
         .control
         .current_irql(identity)
@@ -15200,6 +15253,7 @@ unsafe fn hosted_irq_lane_execute_dispatch(
         identity,
         transaction_state,
         token.depth,
+        token.sequence,
         command.grant,
     );
     let execution_irql = command.execution_irql();
@@ -15237,6 +15291,7 @@ unsafe fn hosted_irq_lane_execute_dispatch(
             parent_identity,
             parent_transaction,
             parent_depth,
+            parent_sequence.unwrap_or_else(|| hosted_irq_lane_protocol_fault(token.sequence)),
             parent_grant,
         );
     } else {
@@ -19673,7 +19728,7 @@ unsafe fn component_read_video_access_range(ptr: u64) -> VideoAccessRangeX64 {
 
 unsafe fn hosted_memory_range_granted(start: u64, len: u64) -> bool {
     find_shared_address_resource_by_range(
-        FSD_SHARED_VADDR,
+        hosted_component_shared_va(),
         SH_RESOURCE_ADDRESS_KIND_MEMORY,
         start,
         len,
@@ -19683,7 +19738,7 @@ unsafe fn hosted_memory_range_granted(start: u64, len: u64) -> bool {
 }
 
 unsafe fn hosted_video_memory_64k_units() -> Option<u16> {
-    let bytes = read_volatile((FSD_SHARED_VADDR + SH_VIDEO_MEMORY_LEN) as *const u64);
+    let bytes = read_volatile((hosted_component_shared_va() + SH_VIDEO_MEMORY_LEN) as *const u64);
     let units = bytes / VIDEO_MEMORY_64K_UNIT;
     if units == 0 {
         None
@@ -19694,7 +19749,7 @@ unsafe fn hosted_video_memory_64k_units() -> Option<u16> {
 
 unsafe fn hosted_io_range_granted(start: u64, len: u64) -> bool {
     find_shared_address_resource_by_range(
-        FSD_SHARED_VADDR,
+        hosted_component_shared_va(),
         SH_RESOURCE_ADDRESS_KIND_PORT,
         start,
         len,
@@ -19704,11 +19759,11 @@ unsafe fn hosted_io_range_granted(start: u64, len: u64) -> bool {
 }
 
 unsafe fn hosted_mmio_va_range_granted(start: u64, len: u64) -> bool {
-    find_shared_address_resource_by_va(FSD_SHARED_VADDR, start, len).is_some()
+    find_shared_address_resource_by_va(hosted_component_shared_va(), start, len).is_some()
 }
 
 unsafe fn bump_shared_io_counter(offset: u64) -> u64 {
-    let ptr = (FSD_SHARED_VADDR + offset) as *mut u64;
+    let ptr = (hosted_component_shared_va() + offset) as *mut u64;
     let next = read_volatile(ptr).saturating_add(1);
     write_volatile(ptr, next);
     next
@@ -19719,7 +19774,7 @@ unsafe fn hosted_port_cap_for_component_io(port: u64, width: u64) -> Option<u64>
         return None;
     }
     let resource = find_shared_address_resource_by_range(
-        FSD_SHARED_VADDR,
+        hosted_component_shared_va(),
         SH_RESOURCE_ADDRESS_KIND_PORT,
         port,
         width,
@@ -19732,28 +19787,28 @@ extern "win64" fn s_read_port_ushort(port: u64) -> u16 {
     unsafe {
         bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_CALLS);
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64,
+            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64,
             port,
         );
         let Some(cap) = hosted_port_cap_for_component_io(port, 2) else {
             bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_DENIED);
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+                (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
                 u64::MAX,
             );
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+                (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
                 0,
             );
             return 0;
         };
         let (value, status) = crate::io_in16_r(cap, port as u16);
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
             status,
         );
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
             value as u64,
         );
         if status != 0 {
@@ -19768,24 +19823,24 @@ extern "win64" fn s_write_port_ushort(port: u64, value: u16) {
     unsafe {
         bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_CALLS);
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64,
+            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64,
             port,
         );
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *mut u64,
+            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *mut u64,
             value as u64,
         );
         let Some(cap) = hosted_port_cap_for_component_io(port, 2) else {
             bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_DENIED);
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+                (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
                 u64::MAX,
             );
             return;
         };
         let status = crate::io_out16(cap, port as u16, value);
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
             status,
         );
         if status != 0 {
@@ -19798,28 +19853,28 @@ extern "win64" fn s_read_port_ulong(port: u64) -> u32 {
     unsafe {
         bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_CALLS);
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64,
+            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_PORT) as *mut u64,
             port,
         );
         let Some(cap) = hosted_port_cap_for_component_io(port, 4) else {
             bump_shared_io_counter(SH_RESOURCE_IO_PORT_IN16_DENIED);
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+                (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
                 u64::MAX,
             );
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+                (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
                 0,
             );
             return 0;
         };
         let (value, status) = crate::io_in32_r(cap, port as u16);
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
+            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_STATUS) as *mut u64,
             status,
         );
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
+            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_IN16_VALUE) as *mut u64,
             value as u64,
         );
         if status == 0 {
@@ -19835,24 +19890,24 @@ extern "win64" fn s_write_port_ulong(port: u64, value: u32) {
     unsafe {
         bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_CALLS);
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64,
+            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_PORT) as *mut u64,
             port,
         );
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *mut u64,
+            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE) as *mut u64,
             value as u64,
         );
         let Some(cap) = hosted_port_cap_for_component_io(port, 4) else {
             bump_shared_io_counter(SH_RESOURCE_IO_PORT_OUT16_DENIED);
             write_volatile(
-                (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+                (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
                 u64::MAX,
             );
             return;
         };
         let status = crate::io_out32(cap, port as u16, value);
         write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
+            (hosted_component_shared_va() + SH_RESOURCE_IO_PORT_LAST_OUT16_STATUS) as *mut u64,
             status,
         );
         if status == 0 {
@@ -19930,13 +19985,13 @@ unsafe fn hosted_videoprt_pci_identity_matches(vendor_id: u64, device_id: u64) -
     if vendor_id == 0 && device_id == 0 {
         return true;
     }
-    if read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERFACE_TYPE) as *const u32)
+    if read_volatile((hosted_component_shared_va() + SH_RESOURCE_INTERFACE_TYPE) as *const u32)
         != HOSTED_INTERFACE_TYPE_PCIBUS
     {
         return false;
     }
     let vendor_device =
-        read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_PCI_VENDOR_DEVICE) as *const u32);
+        read_volatile((hosted_component_shared_va() + SH_RESOURCE_PCI_VENDOR_DEVICE) as *const u32);
     let granted_vendor = (vendor_device & 0xFFFF) as u16;
     let granted_device = (vendor_device >> 16) as u16;
     if vendor_id != 0 && read_unaligned(vendor_id as *const u16) != granted_vendor {
@@ -52154,11 +52209,14 @@ struct HostedIrqLaneRuntime {
     cspace_fault: bool,
     badge: u64,
     exec_arena_va: u64,
+    exec_shared_va: u64,
     stack: [HostedIrqLaneLeaf; FSD_WORKER_STACK_FRAMES as usize],
     ipc_buffer: HostedIrqLaneLeaf,
     trampoline: HostedIrqLaneLeaf,
     kpcr: HostedIrqLaneLeaf,
     arena: [HostedIrqLaneLeaf; nt_hosted_runtime::HOSTED_IRQ_ARENA_PAGE_COUNT],
+    shared: [HostedIrqLaneLeaf; FSD_SHARED_FRAMES as usize],
+    arg: [HostedIrqLaneLeaf; FSD_ARG_FRAMES as usize],
 }
 
 struct HostedIrqLaneBuildError {
@@ -52173,6 +52231,7 @@ impl HostedIrqLaneRuntime {
         identity: nt_hosted_runtime::HostedIrqLaneIdentity,
         pml4: u64,
         exec_arena_va: u64,
+        exec_shared_va: u64,
         badge: u64,
     ) -> Self {
         Self {
@@ -52196,11 +52255,14 @@ impl HostedIrqLaneRuntime {
             cspace_fault: false,
             badge,
             exec_arena_va,
+            exec_shared_va,
             stack: [HostedIrqLaneLeaf::EMPTY; FSD_WORKER_STACK_FRAMES as usize],
             ipc_buffer: HostedIrqLaneLeaf::EMPTY,
             trampoline: HostedIrqLaneLeaf::EMPTY,
             kpcr: HostedIrqLaneLeaf::EMPTY,
             arena: [HostedIrqLaneLeaf::EMPTY; nt_hosted_runtime::HOSTED_IRQ_ARENA_PAGE_COUNT],
+            shared: [HostedIrqLaneLeaf::EMPTY; FSD_SHARED_FRAMES as usize],
+            arg: [HostedIrqLaneLeaf::EMPTY; FSD_ARG_FRAMES as usize],
         }
     }
 }
@@ -57583,6 +57645,12 @@ unsafe fn release_hosted_irq_lane_mechanism(lane: &mut HostedIrqLaneRuntime) -> 
     if release_hosted_irq_lane_cap(&mut lane.raw_cnode) != 0 {
         return 1;
     }
+    for leaf in lane.arg.iter_mut().rev() {
+        failures += release_hosted_irq_lane_leaf(leaf);
+    }
+    for leaf in lane.shared.iter_mut().rev() {
+        failures += release_hosted_irq_lane_leaf(leaf);
+    }
     for leaf in lane.arena.iter_mut().rev() {
         failures += release_hosted_irq_lane_leaf(leaf);
     }
@@ -57799,12 +57867,19 @@ unsafe fn build_hosted_irq_lane(
                 status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
                 partial: None,
             })?;
+    let exec_shared_va = exec_base
+        .checked_add(FSD_IRQ_LANE_SHARED_OFFSET)
+        .ok_or(HostedIrqLaneBuildError {
+            status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+            partial: None,
+        })?;
     let mut lane = HostedIrqLaneRuntime::new(
         projection_instance,
         domain,
         identity,
         inst.pml4,
         exec_arena_va,
+        exec_shared_va,
         0,
     );
 
@@ -57886,6 +57961,36 @@ unsafe fn build_hosted_irq_lane(
             ) {
                 return None;
             }
+        }
+        for index in 0..FSD_SHARED_FRAMES as usize {
+            let offset = index as u64 * 0x1000;
+            if !map_hosted_irq_shared_leaf(
+                inst,
+                component_base.checked_add(FSD_IRQ_LANE_SHARED_OFFSET + offset)?,
+                exec_shared_va.checked_add(offset)?,
+                RW_NX,
+                &mut lane.shared[index],
+            ) {
+                return None;
+            }
+        }
+        for index in 0..FSD_ARG_FRAMES as usize {
+            let offset = index as u64 * 0x1000;
+            if !map_hosted_irq_shared_leaf(
+                inst,
+                component_base.checked_add(FSD_IRQ_LANE_ARG_OFFSET + offset)?,
+                exec_base.checked_add(FSD_IRQ_LANE_ARG_OFFSET + offset)?,
+                RW_NX,
+                &mut lane.arg[index],
+            ) {
+                return None;
+            }
+        }
+        for offset in [SH_SEH_FOREIGN_CALL2_VA, SH_SEH_FOREIGN_CALL16_VA, SH_TSC_FREQUENCY_HZ] {
+            write_volatile(
+                (exec_shared_va + offset) as *mut u64,
+                read_volatile((inst.exec_shared_va + offset) as *const u64),
+            );
         }
         nt_hosted_runtime::HostedIrqArena::initialize_in_place(
             exec_arena_va as *mut nt_hosted_runtime::HostedIrqArena,
@@ -59076,31 +59181,31 @@ unsafe fn dispatch_hosted_irq_connection(
     let (_, inst) = instance_by_driver_id(binding.driver_id)
         .filter(|(_, inst)| inst.ready)
         .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-    let sh = inst.exec_shared_va;
-    if retained_hosted_irp_bank_conflicts(sh) {
-        return Ok(HostedIrqConnectionDispatchOutcome::DeferredBusy);
-    }
-    restore_hosted_device_resource_state(binding, sh, false)?;
-    let lane_live = hosted_irq_lanes().is_some_and(|lanes| {
-        lanes.iter().any(|lane| {
+    let ordinary_shared = inst.exec_shared_va;
+    // Trace a parked ordinary bank while the separate IRQ bank carries this dispatch.
+    let _ = retained_hosted_irp_bank_conflicts(ordinary_shared);
+    let irq_shared = hosted_irq_lanes().and_then(|lanes| {
+        lanes.iter().find(|lane| {
             lane.projection_instance == binding.projection_instance
                 && lane.domain == binding.projection_domain
                 && lane.identity.lane_generation == connection.lane_generation
                 && lane.state == HostedIrqLaneState::Ready
-        })
-    });
-    if !lane_live {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-    }
+                && lane.exec_shared_va != 0
+                && lane.exec_shared_va != ordinary_shared
+                && lane.shared.iter().all(|leaf| leaf.mapped && leaf.exec_mapped)
+                && lane.arg.iter().all(|leaf| leaf.mapped && leaf.exec_mapped)
+        }).map(|lane| lane.exec_shared_va)
+    }).ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    restore_hosted_device_resource_state(binding, irq_shared, false)?;
     let outcome = hosted_irq_broker::dispatch_interrupt(connection);
     match outcome {
         Err(status) => {
-            refresh_hosted_device_resource_state(binding, sh);
+            refresh_hosted_device_resource_state(binding, irq_shared);
             Err(status)
         }
         Ok(hosted_irq_broker::HostedIrqRootDispatchOutcome::Completed(result)) => {
             if result.faulted || result.status != STATUS_SUCCESS || result.value_count != 1 {
-                refresh_hosted_device_resource_state(binding, sh);
+                refresh_hosted_device_resource_state(binding, irq_shared);
                 return Err(if result.status == STATUS_SUCCESS {
                     nt_status::NtStatus::INVALID_DEVICE_REQUEST
                 } else {
@@ -59109,24 +59214,24 @@ unsafe fn dispatch_hosted_irq_connection(
             }
             let claimed = result.claimed();
             let deliveries =
-                read_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *const u64);
+                read_volatile((irq_shared + SH_RESOURCE_INTERRUPT_DELIVERIES) as *const u64);
             write_volatile(
-                (sh + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64,
+                (irq_shared + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64,
                 route.tokens.vector as u64,
             );
             write_volatile(
-                (sh + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64,
+                (irq_shared + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64,
                 claimed as u64,
             );
             write_volatile(
-                (sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64,
+                (irq_shared + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64,
                 deliveries.saturating_add(1),
             );
-            refresh_hosted_device_resource_state(binding, sh);
+            refresh_hosted_device_resource_state(binding, irq_shared);
             Ok(HostedIrqConnectionDispatchOutcome::Completed(claimed))
         }
         Ok(hosted_irq_broker::HostedIrqRootDispatchOutcome::DeferredBusy) => {
-            refresh_hosted_device_resource_state(binding, sh);
+            refresh_hosted_device_resource_state(binding, irq_shared);
             Ok(HostedIrqConnectionDispatchOutcome::DeferredBusy)
         }
     }
@@ -59349,11 +59454,9 @@ unsafe fn service_hosted_irq_event(
             nt_status::NtStatus::DEVICE_NOT_CONNECTED,
         ));
     }
-    // A shared line must be preflighted as one unit: deferring only its later connection
-    // after an earlier ISR effect would make the delivery impossible to replay safely.
-    if retained_hosted_irq_line_bank_conflict(&leased) {
-        return defer_hosted_irq_line_delivery(line_index, delivery, &leased);
-    }
+    // The private IRQ banks are disjoint from held IRP banks. Keep a bounded ownership trace
+    // while proving that a parked driver can now receive its own hardware completion.
+    let _ = retained_hosted_irq_line_bank_conflict(&leased);
     let mut scan_entries = Vec::new();
     if scan_entries.try_reserve_exact(leased.len()).is_err() {
         return Err(quarantine_hosted_irq_delivery(
