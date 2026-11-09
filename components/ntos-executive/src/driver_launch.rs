@@ -16428,6 +16428,18 @@ pub(crate) fn hosted_driver_dpc_activation_pending() -> bool {
     unsafe { (*core::ptr::addr_of!(HOSTED_DPCS)).as_ref().is_some_and(HostedDpcTable::has_queued) }
 }
 
+static CONNECT_DPC_PROBE_ARMED: AtomicBool = AtomicBool::new(false);
+
+fn trace_connect_dpc_probe(stage: u64, first: u64, second: u64, third: u64) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if !CONNECT_DPC_PROBE_ARMED.load(Ordering::Acquire)
+        || COUNT.fetch_add(1, Ordering::Relaxed) >= 48
+    { return; }
+    print_str(b"[connect-dpc-probe] stage/first/second/third=");
+    print_u64(stage); print_str(b"/"); print_u64(first); print_str(b"/");
+    print_u64(second); print_str(b"/"); print_u64(third); print_str(b"\n");
+}
+
 /// Run a due, paced DPC pass. Self-requeued work retains its wake for a later scheduler boundary.
 pub(crate) unsafe fn drain_hosted_driver_dpcs() -> u64 {
     hosted_dpc_scheduler::run()
@@ -16437,6 +16449,7 @@ pub(crate) unsafe fn drain_hosted_driver_dpcs() -> u64 {
 unsafe fn drain_hosted_driver_dpc_snapshot() -> u64 {
     let budget = hosted_irq_lanes().map(Vec::len).unwrap_or(0);
     let mut delivered = 0u64;
+    let mut matched_queued = 0u64;
     for index in 0..budget {
         let Some(identity) = hosted_irq_lanes()
             .and_then(|lanes| lanes.get(index))
@@ -16451,8 +16464,24 @@ unsafe fn drain_hosted_driver_dpc_snapshot() -> u64 {
         ) else {
             continue;
         };
+        let queued = (*core::ptr::addr_of!(HOSTED_DPCS))
+            .as_ref().map_or(0, |table| table.queued_count(owner) as u64);
+        matched_queued = matched_queued.saturating_add(queued);
+        if queued != 0 {
+            let state = hosted_irq_lanes().and_then(|lanes| lanes.get(index)).map_or(0, |lane|
+                match lane.state {
+                    HostedIrqLaneState::Ready => 1,
+                    HostedIrqLaneState::Booting => 2,
+                    HostedIrqLaneState::Quarantined => 3,
+                    HostedIrqLaneState::ShuttingDown => 4,
+                });
+            trace_connect_dpc_probe(11, index as u64, queued, state);
+        }
         match hosted_irq_broker::drain_dpcs(owner) {
-            Ok(count) => delivered = delivered.saturating_add(count),
+            Ok(count) => {
+                if queued != 0 { trace_connect_dpc_probe(12, index as u64, queued, count); }
+                delivered = delivered.saturating_add(count);
+            }
             Err(status) => {
                 print_str(b"[hosted-dpc] dispatch failed domain=");
                 print_u64(identity.domain_id);
@@ -16464,6 +16493,7 @@ unsafe fn drain_hosted_driver_dpc_snapshot() -> u64 {
             }
         }
     }
+    trace_connect_dpc_probe(10, budget as u64, matched_queued, delivered);
     delivered
 }
 
@@ -67756,6 +67786,7 @@ pub(crate) fn trace_connect_child_receive_yield(
     reply: u64, reason: u64, timer_checkpoint: bool, serviced: bool,
     badge: u64, info: u64, demand: u64,
 ) {
+    if demand & 4 != 0 { CONNECT_DPC_PROBE_ARMED.store(true, Ordering::Release); }
     component_scheduler::trace_connect_child_receive_yield(
         reply, reason, timer_checkpoint, serviced, badge, info, demand,
     );

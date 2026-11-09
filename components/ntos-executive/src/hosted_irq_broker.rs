@@ -2283,6 +2283,8 @@ unsafe fn dispatch_next_dpc(
     ) {
         Ok(transaction) => transaction,
         Err(nt_hosted_runtime::HostedIrqArenaError::Busy) => {
+            super::trace_connect_dpc_probe(13, owner.domain_id,
+                owner.domain_cookie, owner.lane_generation);
             return Ok(HostedDpcRootDispatchOutcome::DeferredBusy)
         }
         Err(error) => {

@@ -23,16 +23,22 @@ pub(crate) unsafe fn wake_due(now: u64) -> u64 {
 
 pub(super) unsafe fn run() -> u64 {
     let now = crate::monotonic_time_100ns();
-    next_deadline(now);
+    let deadline = next_deadline(now);
+    super::trace_connect_dpc_probe(0, now, deadline.unwrap_or(0),
+        u64::from(hosted_driver_dpc_activation_pending()));
     let Some(mut pass) = (&mut *core::ptr::addr_of_mut!(WAKE))
         .begin_pass(now)
         .expect("hosted DPC wake identity exhausted")
     else {
+        super::trace_connect_dpc_probe(1, now, deadline.unwrap_or(0), 0);
         return 0;
     };
+    super::trace_connect_dpc_probe(2, now, deadline.unwrap_or(0), 0);
     // No wake/table borrow survives native execution. Nested scans cannot claim this pass.
     let delivered = drain_hosted_driver_dpc_snapshot();
     let pending = hosted_driver_dpc_activation_pending();
+    super::trace_connect_dpc_probe(3, delivered, u64::from(pending),
+        (&*core::ptr::addr_of!(WAKE)).next_deadline().unwrap_or(0));
     (&mut *core::ptr::addr_of_mut!(WAKE))
         .finish_pass(
             &mut pass,
@@ -41,6 +47,8 @@ pub(super) unsafe fn run() -> u64 {
             delivered != 0,
         )
         .expect("hosted DPC wake completion lost its exact pass");
+    super::trace_connect_dpc_probe(4, delivered, u64::from(pending),
+        (&*core::ptr::addr_of!(WAKE)).next_deadline().unwrap_or(0));
     // A retained component may receive again without visiting the outer runtime barrier.
     // Programming does not acknowledge demand; bootstrap has no registered runtime owner.
     let _message = crate::ipc_message::SavedMessageBuffer::capture();
