@@ -12,7 +12,7 @@ const BLOCK: &str = include_str!("../../../components/ntos-executive/src/mounted
 #[test]
 fn deferred_actual_lock_irq_retries_on_timer_without_new_irq_badge() {
     let start = PUMP.find("unsafe fn pump_scheduler_work_pending(").expect("scheduler predicate");
-    let end = PUMP[start..].find("\n\nstruct PumpMessage").expect("predicate boundary");
+    let end = PUMP[start..].find("\n}\n").expect("predicate boundary") + 2;
     let predicate = &PUMP[start..start + end];
     syn::parse_str::<syn::ItemFn>(predicate).expect("parse native scheduler predicate");
 

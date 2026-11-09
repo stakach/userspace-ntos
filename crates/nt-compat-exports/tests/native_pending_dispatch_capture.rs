@@ -78,6 +78,12 @@ fn initial_wait_snapshot_capture_has_one_policy_and_reparks_keep_saved_bytes() {
                         if let syn::Member::Named(name) = &field.member { self.0.push(name.to_string()); }
                         syn::visit::visit_expr_field(self, field);
                     }
+                    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+                        if matches!(call.receiver.as_ref(), syn::Expr::Path(path) if path.path.is_ident("pr")) {
+                            self.0.push(call.method.to_string());
+                        }
+                        syn::visit::visit_expr_method_call(self, call);
+                    }
                 }
                 let expected: &[&str] = match constructor.as_str() {
                     "PendingProviderWaitDispatch" => &["provider_wait_suspended"],
