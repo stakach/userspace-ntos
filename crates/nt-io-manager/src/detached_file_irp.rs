@@ -113,6 +113,73 @@ pub struct PreparedExternalFileIrp(Owner);
 #[derive(Debug)]
 #[must_use = "return the exact invocation; dropping it retains the canonical IRP"]
 pub struct ExternalFileIrpInvocation(Owner);
+/// Lookup witness for a native pump continuation. The epoch is supplied by the physical owner;
+/// this value alone never authorizes a Reply, provider entry, or completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExternalFileIrpPumpKey {
+    manager: u64,
+    irp: IrpId,
+    route: ExternalFileIrpRoute,
+    epoch: u64,
+}
+
+impl ExternalFileIrpPumpKey {
+    pub fn new(invocation: &ExternalFileIrpInvocation, epoch: u64) -> Option<Self> {
+        (epoch != 0).then_some(Self {
+            manager: invocation.0.manager,
+            irp: invocation.0.projection.irp_id,
+            route: invocation.0.route,
+            epoch,
+        })
+    }
+}
+
+/// The manager IRP remains Dispatched while an entered native pump unwinds. Only the exact
+/// continuation can resume its original invocation; no provider result is reported here.
+#[derive(Debug)]
+#[must_use = "retain the exact dispatched IRP until its native pump resumes or is fenced"]
+pub struct SuspendedExternalFileIrpInvocation {
+    key: ExternalFileIrpPumpKey,
+    invocation: ExternalFileIrpInvocation,
+    quarantined: bool,
+}
+
+impl SuspendedExternalFileIrpInvocation {
+    pub const fn key(&self) -> ExternalFileIrpPumpKey { self.key }
+
+    pub fn resume(self, key: ExternalFileIrpPumpKey) -> Result<ExternalFileIrpInvocation, Self> {
+        if self.key != key || self.quarantined {
+            return Err(self);
+        }
+        Ok(self.invocation)
+    }
+
+    /// An uncertain native effect permanently fences continuation replay. Keep the manager's
+    /// move-only owner here until an explicit indeterminate report is accepted.
+    pub fn quarantine(&mut self, key: ExternalFileIrpPumpKey) -> Result<(), NtStatus> {
+        if self.key != key {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        if self.quarantined {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        self.quarantined = true;
+        Ok(())
+    }
+
+    /// This reports transport uncertainty, never a provider completion. The I/O Manager then
+    /// retains the canonical IRP and its buffers for later genuine completion or cancellation.
+    pub fn into_indeterminate(
+        self, key: ExternalFileIrpPumpKey, status: NtStatus,
+    ) -> Result<ExternalFileIrpReturn, Self> {
+        if self.key != key || !self.quarantined || !status.is_error() {
+            return Err(self);
+        }
+        Ok(self.invocation.returned(ExternalFileIrpOutcome::Indeterminate {
+            transport_status: status,
+        }))
+    }
+}
 #[derive(Debug)]
 #[must_use = "finish through the issuing I/O Manager"]
 pub struct ExternalFileIrpReturn {
@@ -287,6 +354,21 @@ mod policy;
 pub use policy::{ExternalFileIrpDispatchPolicy, MAX_MUTABLE_METHOD_NEITHER_INPUT};
 
 impl ExternalFileIrpInvocation {
+    /// Publish the exact manager-bound invocation before releasing a native pump stack. The
+    /// physical adapter must separately authenticate the worker generation and retained Reply.
+    pub fn suspend_for_pump(
+        self, key: ExternalFileIrpPumpKey,
+    ) -> Result<SuspendedExternalFileIrpInvocation, Self> {
+        if key.manager != self.0.manager || key.irp != self.0.projection.irp_id
+            || key.route != self.0.route || key.epoch == 0
+        {
+            return Err(self);
+        }
+        Ok(SuspendedExternalFileIrpInvocation {
+            key, invocation: self, quarantined: false,
+        })
+    }
+
     pub fn buffers_mut(&mut self) -> ExternalFileIrpBufferView<'_> {
         ExternalFileIrpBufferView {
             input: &self.0.buffers.input,

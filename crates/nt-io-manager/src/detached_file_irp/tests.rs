@@ -13,6 +13,7 @@ mod exact_device_control_tests;
 mod internal_block_io_tests;
 mod open_case_tests;
 mod operations_tests;
+mod pump_suspension_tests;
 mod relative_root_tests;
 
 #[derive(Default)]
