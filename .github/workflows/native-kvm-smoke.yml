@@ -128,6 +128,7 @@ jobs:
       - name: Build native image from verified pinned LiberNT release
         run: |
           set -o pipefail
+          bash rust-micro/scripts/test_simpleboot_source.sh
           ./run.sh --build-only 2>&1 | tee native-kvm-build.log
           sha256sum rust-micro/.tmp/disk.img > native-kvm-image.sha256
           sha256sum rust-micro/.tmp/rootserver.elf > native-kvm-rootserver.sha256
