@@ -622,7 +622,9 @@ unsafe fn observe_port_dispatch_result(
     trace_connect_live(8, work.source.source_irp_address(), phase_kind, phase_detail);
     match phase {
         Ok(hosted_input_connect_dispatch::PortConnectPhase::AwaitingCompletion(_)) => {
-            let _ = work.source.observe_dispatch(ConnectDispatchReturn::Pending);
+            let observed = work.source.observe_dispatch(ConnectDispatchReturn::Pending);
+            trace_connect_live(9, work.source.source_irp_address(),
+                u64::from(observed.is_ok()), u64::from(work.source.origin_mut().armed()));
         }
         Ok(hosted_input_connect_dispatch::PortConnectPhase::Terminal(status)) => {
             if matches!(work.sequence.phase(), HookForwardPhase::Terminal(_, _)) {
@@ -642,7 +644,11 @@ unsafe fn observe_port_dispatch_result(
         }
         _ => {}
     }
-    if !work.source.origin_mut().reply_dispatch(HostedForwardDispatchReply::Pending, false) {
+    let replied = work.source.origin_mut().reply_dispatch(
+        HostedForwardDispatchReply::Pending, false);
+    trace_connect_live(10, work.source.source_irp_address(),
+        u64::from(replied), u64::from(work.blocked));
+    if !replied {
         work.blocked = true;
     }
     true
@@ -690,6 +696,9 @@ unsafe fn redrive_inner(nested_ready_only: bool) {
                 (*work_ptr).source.payload().forward.target.device_id(),
                 pending_irp,
             );
+            trace_connect_live(11, (*work_ptr).source.source_irp_address(),
+                u64::from(matches!(queue_progress, Ok(HostedWorkQueueDrainProgress::Suspended))),
+                u64::from(queue_progress.is_err()));
             if matches!(queue_progress, Ok(HostedWorkQueueDrainProgress::Suspended)) {
                 return;
             }
