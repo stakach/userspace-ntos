@@ -44,6 +44,19 @@ pub struct HostedWorkQueueReady {
     slot: usize,
 }
 
+/// Read-only observation of the oldest published entry. This is not a claim and
+/// cannot acknowledge or authorize a callback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostedWorkQueuePending {
+    sequence: u64,
+    slot: usize,
+}
+
+impl HostedWorkQueuePending {
+    pub fn sequence(self) -> u64 { self.sequence }
+    pub fn slot(self) -> usize { self.slot }
+}
+
 impl HostedWorkQueueReady {
     pub fn sequence(self) -> u64 { self.sequence }
     pub fn slot(self) -> usize { self.slot }
@@ -105,6 +118,19 @@ impl<const N: usize> HostedWorkQueueAdmission<N> {
             phase(reservation.sequence, RESERVED), phase(reservation.sequence, PUBLISHED),
             Ordering::AcqRel, Ordering::Acquire,
         ).map(|_| ()).map_err(|_| HostedWorkQueueAdmissionError::WrongReservation)
+    }
+
+    /// Inspect the next published payload without consuming it. A reserved head
+    /// fences younger entries, including when producers publish out of order.
+    pub fn peek_ready(&self) -> Option<HostedWorkQueuePending> {
+        let sequence = self.dequeue.load(Ordering::Acquire);
+        if sequence == self.next.load(Ordering::Acquire)
+            || self.slots[self.slot(sequence)].load(Ordering::Acquire)
+                != phase(sequence, PUBLISHED)
+        {
+            return None;
+        }
+        Some(HostedWorkQueuePending { sequence, slot: self.slot(sequence) })
     }
 
     /// Return the oldest unclaimed published entry exactly once. A reserved entry fences

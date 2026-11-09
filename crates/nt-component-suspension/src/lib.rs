@@ -66,7 +66,8 @@ pub use hosted_work_queue_claims::{
 };
 mod hosted_work_queue_admission;
 pub use hosted_work_queue_admission::{
-    HostedWorkQueueAdmission, HostedWorkQueueAdmissionError, HostedWorkQueueReady,
+    HostedWorkQueueAdmission, HostedWorkQueueAdmissionError, HostedWorkQueuePending,
+    HostedWorkQueueReady,
     HostedWorkQueueReservation,
 };
 pub use retained_child_dispatch::{

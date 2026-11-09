@@ -94,3 +94,21 @@ fn another_queue_cannot_publish_or_acknowledge_an_identical_slot_generation() {
     first.acknowledge(first.claim_ready().unwrap()).unwrap();
     other.acknowledge(other_ready).unwrap();
 }
+
+#[test]
+fn peek_does_not_claim_or_skip_a_published_head() {
+    let queue = HostedWorkQueueAdmission::<2>::new();
+    let first = queue.reserve().unwrap();
+    let second = queue.reserve().unwrap();
+    queue.publish(second).unwrap();
+    assert!(queue.peek_ready().is_none(), "a later published slot cannot bypass the reserved head");
+    queue.publish(first).unwrap();
+    let pending = queue.peek_ready().expect("published head can be inspected");
+    assert_eq!((pending.sequence(), pending.slot()), (first.sequence(), first.slot()));
+    assert_eq!(queue.peek_ready(), Some(pending), "inspection cannot consume the head");
+    let claimed = queue.claim_ready().unwrap();
+    assert_eq!((claimed.sequence(), claimed.slot()), (first.sequence(), first.slot()));
+    assert_eq!(queue.peek_ready().unwrap().sequence(), second.sequence());
+    queue.acknowledge(claimed).unwrap();
+    queue.acknowledge(queue.claim_ready().unwrap()).unwrap();
+}
