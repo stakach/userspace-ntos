@@ -16,7 +16,7 @@ fn parked_parent_retains_original_call_and_receives_real_notifications() {
     let ordinary = root.find("redrive_hosted_driver_io_create_file(").unwrap();
     let exclusive = &root[child..ordinary];
     let hold = exclusive.find("defer_hosted_delivery_for_add_device(").unwrap();
-    let arm = exclusive.find("ROOT_ADD_DEVICE_RETRY_DEADLINE.store(deadline").unwrap();
+    let arm = exclusive.find("prepare_parked_add_device_receive(&mut root_add_device_turn)").unwrap();
     let receive = exclusive.find("component_recv!(fault_ep").unwrap();
     assert!(hold < arm && arm < receive);
     assert!(exclusive.contains("service_parked_add_device_notification("));

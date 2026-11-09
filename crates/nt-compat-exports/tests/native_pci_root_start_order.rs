@@ -92,7 +92,7 @@ fn persisted_bus_child_waits_for_physical_pdo_instead_of_claiming_root_identity(
         .expect("a registry-listed child without a bus PDO must not claim a root PDO");
     let defer = start_one[root_gate..].find("HostedPnpDevnodeProgress::BusRelationPending")
         .expect("the original START owner must await its bus PDO") + root_gate;
-    let add_device = start_one.find("driver_launch::call_add_device_for_driver(")
+    let add_device = start_one.find("driver_launch::call_add_device_for_driver_progress(")
         .expect("root-owned AddDevice path");
     assert!(root_gate < defer && defer < add_device,
         "bus-child deferral must precede synthetic root PDO publication");

@@ -60,7 +60,7 @@ fn progressing_or_certified_retryable_add_device_gets_another_exclusive_root_tur
         "successful child progress must not exhaust a fixed total pass budget");
     assert!(!phase.contains("consecutive_no_child_yields >= 2"),
         "a certified no-effects retry must not terminate the service loop after two turns");
-    assert!(phase.contains("ROOT_ADD_DEVICE_RETRY_DEADLINE.store(deadline")
+    assert!(phase.contains("prepare_parked_add_device_receive(&mut root_add_device_turn)")
         && phase.contains("component_recv!(fault_ep"),
         "a retained retryable parent needs an armed one-shot and a fresh receive before unrelated work");
     assert!(!phase.contains("crate::yield_now()"),

@@ -4,6 +4,7 @@ const CONSUMER: &str = include_str!("../../../components/ntos-executive/src/host
 const ROLLBACK: &str = include_str!("../../../components/ntos-executive/src/hosted_add_device_rollback.rs");
 const FILE_OWNERS: &str = include_str!("../../../components/ntos-executive/src/hosted_file_owners.rs");
 const DRIVER: &str = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+const ADD_DEVICE: &str = include_str!("../../../components/ntos-executive/src/hosted_add_device_continuation.rs");
 
 fn native_function(start: &str, end: &str) -> syn::ItemFn {
     let source = &DRIVER[DRIVER.find(start).expect("native function")..];
@@ -16,6 +17,18 @@ fn function(file: &syn::File, name: &str) -> syn::ItemFn {
         syn::Item::Fn(item) if item.sig.ident == name => Some(item.clone()),
         _ => None,
     }).unwrap()
+}
+
+fn method(file: &syn::File, owner: &str, name: &str) -> syn::ImplItemFn {
+    file.items.iter().find_map(|item| match item {
+        syn::Item::Impl(item) if matches!(&*item.self_ty,
+            syn::Type::Path(path) if path.path.segments.last().is_some_and(|part| part.ident == owner)) =>
+            item.items.iter().find_map(|method| match method {
+                syn::ImplItem::Fn(method) if method.sig.ident == name => Some(method.clone()),
+                _ => None,
+            }),
+        _ => None,
+    }).expect("native AddDevice transaction method")
 }
 
 #[derive(Default)]
@@ -75,10 +88,7 @@ fn add_device_binding_uses_the_created_registration_without_republishing_it() {
     assert!(calls.0.iter().any(|call| call == "hosted_device_pointer_registration"));
     assert!(calls.0.iter().any(|call| call == "registration"));
 
-    let add_device = native_function(
-        "unsafe fn call_add_device_for_existing_pdo(",
-        "\n/// Grant a hosted device driver access",
-    );
+    let add_device = method(&syn::parse_file(ADD_DEVICE).unwrap(), "AddDeviceTransaction", "finish");
     let mut calls = Calls::default();
     calls.visit_block(&add_device.block);
     let owner = calls.0.iter().position(|call| call == "owns_created_registration").unwrap();

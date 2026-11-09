@@ -60,7 +60,7 @@ fn native_drain_waits_for_entered_lifecycle_and_video_create() {
 
 #[test]
 fn draining_mount_defers_unentered_nonstorage_start_owners() {
-    let drive = START.split_once("unsafe fn drive_inner(&mut self, pump_before_observe: bool)")
+    let drive = START.split_once("unsafe fn drive_inner(&mut self, pump_before_observe: bool,")
         .expect("retained Start batch").1.split_once("enum HostedPnpRebalanceStage")
         .expect("Start batch boundary").0;
     for branch in ["pending_filter_admission.take()", "pending_grant_admission.take()",
@@ -99,7 +99,7 @@ fn post_start_video_open_waits_for_exact_native_publication() {
         && DRIVER.contains("native_storage_route()")
         && HANDOFF.contains("exec_block_route_kind("),
         "video CREATE resumes only after the matching mounted route becomes Native");
-    let drive = START.split_once("unsafe fn drive_inner(&mut self, pump_before_observe: bool)")
+    let drive = START.split_once("unsafe fn drive_inner(&mut self, pump_before_observe: bool,")
         .expect("retained Start batch").1.split_once("enum HostedPnpRebalanceStage")
         .expect("Start batch boundary").0;
     assert!(drive.find("if let Some((devnode_index, owner)) = self.pending_video_publication")

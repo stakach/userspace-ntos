@@ -10860,15 +10860,26 @@ pub(crate) unsafe fn service_sec_image(
                 stop_ssn = 0;
                 break 'service_loop;
             }
+            let mut awaiting_connect_child = false;
             let still_parked = {
                 let _message = crate::ipc_message::SavedMessageBuffer::capture();
-                if settle_suspended_connect_pumps().is_err() {
-                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    stop_ssn = 0;
-                    break 'service_loop;
+                match settle_suspended_connect_pumps() {
+                    ConnectPumpSettlement::Settled => {
+                        redrive_flat_root_add_device_selected(&mut nt_handler, reservation);
+                        root_add_device_still_parked(&nt_handler, reservation)
+                    }
+                    ConnectPumpSettlement::AwaitingLocalChild => {
+                        // The exact CONNECT pump has its sealed empty child observation.
+                        // Keep both parents and their Replies parked until the root retry shot.
+                        awaiting_connect_child = true;
+                        true
+                    }
+                    ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        break 'service_loop;
+                    }
                 }
-                redrive_flat_root_add_device_selected(&mut nt_handler, reservation);
-                root_add_device_still_parked(&nt_handler, reservation)
             };
             if !still_parked {
                 if root_add_device_turn.as_ref().and_then(|turn|
@@ -10894,7 +10905,8 @@ pub(crate) unsafe fn service_sec_image(
                 ROOT_ADD_DEVICE_EXCLUSIVE.store(false, Ordering::Release);
                 break;
             }
-            if !ran_child && !root_add_device_retry_without_new_child(&nt_handler, reservation)
+            if !awaiting_connect_child && !ran_child
+                && !root_add_device_retry_without_new_child(&nt_handler, reservation)
                 && !root_add_device_needs_child_step(&nt_handler, reservation)
             {
                 // The exact parent has an indeterminate or quarantined outcome. Its Reply
@@ -10903,7 +10915,7 @@ pub(crate) unsafe fn service_sec_image(
                 stop_ssn = 0;
                 break 'service_loop;
             }
-            if ran_child { continue }
+            if ran_child && !awaiting_connect_child { continue }
             let turn = root_add_device_turn.as_mut().expect("parked AddDevice turn");
             if !root_event_consumed && badge_has_delay_timer(badge)
                 || !root_event_consumed && hosted_irq_lines_from_badge(badge) != 0
@@ -10949,16 +10961,11 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 root_event_consumed = true;
             }
-            let now = monotonic_time_100ns();
-            let deadline = match turn.arm_retry(reservation, now, 1_000_000) {
-                Ok(deadline) => deadline,
-                Err(_) => {
-                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    stop_ssn = 0;
-                    break 'service_loop;
-                }
-            };
-            ROOT_ADD_DEVICE_RETRY_DEADLINE.store(deadline, Ordering::Release);
+            if !prepare_parked_add_device_receive(&mut root_add_device_turn) {
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                break 'service_loop;
+            }
             let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
             (badge, mi, m0, m1, m2, m3) = received;
             continue 'service_loop;
@@ -11060,7 +11067,7 @@ pub(crate) unsafe fn service_sec_image(
             // A port CONNECT may have yielded while its provider parent remained physically
             // parked. Its File frames have ended here. Run one selected child per flat pass,
             // then resume only that exact retained pump before another provider can enter.
-            if settle_suspended_connect_pumps().is_err() {
+            if !matches!(settle_suspended_connect_pumps(), ConnectPumpSettlement::Settled) {
                 // A nonretryable restore or a claimed, orphaned, or blocked port parent still
                 // owns its Reply. No later provider may enter while that physical owner is held.
                 stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
@@ -28018,14 +28025,22 @@ unsafe fn run_one_pending_add_device_child_step(
 }
 
 /// Settle every inner CONNECT owner before an AddDevice parent or unrelated provider resumes.
-/// Each selected child has one sealed observation; repeated empty yields are bounded.
-unsafe fn settle_suspended_connect_pumps() -> Result<(), ()> {
+/// Each selected child has one sealed observation. An empty local pass is retryable only after
+/// the exact selector and its observation are deposited back in the CONNECT owner.
+enum ConnectPumpSettlement {
+    Settled,
+    AwaitingLocalChild,
+    Retained,
+    Blocked,
+}
+
+unsafe fn settle_suspended_connect_pumps() -> ConnectPumpSettlement {
     use crate::driver_launch::PortConnectPumpProgress as Progress;
     crate::driver_launch::trace_port_connect_root_probe(80, 0);
-    let mut consecutive_no_child_yields = 0u8;
     loop {
         match crate::driver_launch::redrive_retryable_connect_pump() {
-            Progress::Blocked | Progress::Retained => return Err(()),
+            Progress::Blocked => return ConnectPumpSettlement::Blocked,
+            Progress::Retained => return ConnectPumpSettlement::Retained,
             Progress::NoWork | Progress::Returned | Progress::Yielded => {}
         }
         let Some(selector) = crate::driver_launch::claim_suspended_port_connect_pump()
@@ -28034,17 +28049,17 @@ unsafe fn settle_suspended_connect_pumps() -> Result<(), ()> {
         let step = drive_one_nested_file_child_step();
         let ran_child = step.ran_child();
         match crate::driver_launch::redrive_suspended_connect_pump(selector, step) {
-            Progress::Blocked | Progress::Retained => return Err(()),
-            Progress::Yielded if !ran_child => {
-                consecutive_no_child_yields += 1;
-                if consecutive_no_child_yields >= 2 { return Err(()) }
-            }
-            Progress::NoWork | Progress::Returned | Progress::Yielded => {
-                consecutive_no_child_yields = 0;
-            }
+            Progress::Blocked => return ConnectPumpSettlement::Blocked,
+            Progress::Retained => return ConnectPumpSettlement::Retained,
+            Progress::Yielded if !ran_child => return ConnectPumpSettlement::AwaitingLocalChild,
+            Progress::NoWork | Progress::Returned | Progress::Yielded => {}
         }
     }
-    if crate::driver_launch::unsettled_suspended_connect_pump() { Err(()) } else { Ok(()) }
+    if crate::driver_launch::unsettled_suspended_connect_pump() {
+        ConnectPumpSettlement::Retained
+    } else {
+        ConnectPumpSettlement::Settled
+    }
 }
 
 unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
