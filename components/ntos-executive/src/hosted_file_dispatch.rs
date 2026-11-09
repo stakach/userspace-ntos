@@ -163,6 +163,7 @@ fn finish_invoke_result(
         } => {
             if capture == ExternalFileIrpOutputCapture::MethodNeitherInput {
                 let expected = invocation.input_mut().len() as u64;
+                trace_mutable_control_probe(10, invocation.irp_id(), instance_index, expected, None);
                 let copied = control(
                     instance_index,
                     invocation.irp_id(),
@@ -170,6 +171,7 @@ fn finish_invoke_result(
                     0,
                     invocation.input_mut(),
                 );
+                trace_mutable_control_probe(11, invocation.irp_id(), instance_index, expected, Some(&copied));
                 if !matches!(copied, HostedIrpTransportResult::Returned {
                     status: nt_status::NtStatus::SUCCESS,
                     information,
@@ -188,6 +190,7 @@ fn finish_invoke_result(
                 }
                 // Synchronous completion already released the IRP graph. The sidecar survives
                 // until this exact copy is acknowledged through the same terminal selector.
+                trace_mutable_control_probe(12, invocation.irp_id(), instance_index, 0, None);
                 let ack = control(
                     instance_index,
                     invocation.irp_id(),
@@ -195,6 +198,7 @@ fn finish_invoke_result(
                     0,
                     &mut [],
                 );
+                trace_mutable_control_probe(13, invocation.irp_id(), instance_index, 0, Some(&ack));
                 if !matches!(
                     ack,
                     HostedIrpTransportResult::Returned {
@@ -225,6 +229,32 @@ fn finish_invoke_result(
         }
     };
     invocation.returned(outcome)
+}
+
+/// Bounded observation of an exact METHOD_NEITHER terminal's copy and ACK handoff.
+fn trace_mutable_control_probe(
+    stage: u64, irp: IrpId, instance_index: usize, expected: u64,
+    result: Option<&HostedIrpTransportResult>,
+) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 64 { return; }
+    let (kind, status, information) = match result {
+        None => (0, 0, 0),
+        Some(HostedIrpTransportResult::NotDispatched { status }) =>
+            (1, status.raw() as u32 as u64, 0),
+        Some(HostedIrpTransportResult::Returned { status, information, .. }) =>
+            (2, status.raw() as u32 as u64, *information),
+        Some(HostedIrpTransportResult::Indeterminate { transport_status }) =>
+            (3, transport_status.raw() as u32 as u64, 0),
+    };
+    print_str(b"[mutable-control-probe] stage/irp/instance/expected/kind/status/info=");
+    print_u64(stage); print_str(b"/");
+    print_hex_u64(irp.raw()); print_str(b"/");
+    print_u64(instance_index as u64); print_str(b"/");
+    print_u64(expected); print_str(b"/");
+    print_u64(kind); print_str(b"/");
+    print_hex_u64(status); print_str(b"/");
+    print_u64(information); print_str(b"\n");
 }
 
 /// A port-local CONNECT may yield while its provider waits for nested root work. The original
@@ -477,6 +507,14 @@ pub(super) fn control(
         };
     }
     let storage_instance = hosted_completion_storage_instance(instance_index);
+    let mutable_probe = matches!(operation,
+        FSD_DISPATCH_COPY_MUTABLE_INPUT | FSD_DISPATCH_ACK_COMPLETION);
+    let probe_stage = if operation == FSD_DISPATCH_COPY_MUTABLE_INPUT { 20 } else { 22 };
+    if mutable_probe {
+        trace_mutable_control_probe(
+            probe_stage, irp_id, instance_index, storage_instance as u64, None,
+        );
+    }
     let result = unsafe {
         let caller = crate::initial_system_driver_caller();
         dispatch_irp_for_instance_exact(
@@ -498,6 +536,11 @@ pub(super) fn control(
     .unwrap_or(HostedIrpTransportResult::NotDispatched {
         status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
     });
+    if mutable_probe {
+        trace_mutable_control_probe(
+            probe_stage + 1, irp_id, instance_index, storage_instance as u64, Some(&result),
+        );
+    }
     if operation == FSD_DISPATCH_ACK_COMPLETION
         && matches!(result, HostedIrpTransportResult::Returned {
             status: nt_status::NtStatus::SUCCESS,

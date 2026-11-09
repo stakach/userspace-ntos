@@ -38547,7 +38547,24 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
         let canonical_irp_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_CONTROL_ID) as *const u64);
         let offset = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
         let capacity = read_volatile((FSD_SHARED_VADDR + SH_REQ_OUTLEN) as *const u64);
-        return hosted_mutable_input_completion::copy(canonical_irp_id, offset, capacity);
+        static COPY_PROBE_COUNT: AtomicU64 = AtomicU64::new(0);
+        let trace = COPY_PROBE_COUNT.fetch_add(1, Ordering::Relaxed) < 24;
+        if trace {
+            print_str(b"[mutable-sidecar-probe] stage/irp/offset/capacity/status/info=30/");
+            print_hex_u64(canonical_irp_id); print_str(b"/");
+            print_u64(offset); print_str(b"/");
+            print_u64(capacity); print_str(b"/0/0\n");
+        }
+        let result = hosted_mutable_input_completion::copy(canonical_irp_id, offset, capacity);
+        if trace {
+            print_str(b"[mutable-sidecar-probe] stage/irp/offset/capacity/status/info=31/");
+            print_hex_u64(canonical_irp_id); print_str(b"/");
+            print_u64(offset); print_str(b"/");
+            print_u64(capacity); print_str(b"/");
+            print_hex_u64(result.0 as u32 as u64); print_str(b"/");
+            print_u64(result.1); print_str(b"\n");
+        }
+        return result;
     }
     if major == FSD_DISPATCH_ACK_COMPLETION {
         let canonical_irp_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_CONTROL_ID) as *const u64);
