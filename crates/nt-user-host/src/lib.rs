@@ -30,6 +30,9 @@ pub mod hosted_return_target;
 pub mod receive_child_barrier;
 pub mod root_ingress_pass;
 pub mod retained_owner_table;
+pub mod durable_context_lease;
+#[cfg(test)]
+mod durable_context_lease_tests;
 pub mod returned_pump_owner;
 pub mod win32k_dispatch_outcome;
 #[cfg(test)]

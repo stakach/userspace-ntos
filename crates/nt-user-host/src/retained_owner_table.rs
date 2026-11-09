@@ -122,6 +122,17 @@ impl<K: Copy + Eq, B> RetainedOwnerTable<K, B> {
         }
     }
 
+    /// A short mutable borrow of the exact held row. Callers must not carry this borrow across
+    /// another reservation, bind, or native effect that can reenter the owner table.
+    pub fn get_mut(&mut self, ticket: RetainedOwnerTicket<K>) -> Option<&mut B> {
+        if ticket.reservation.table != self.table { return None; }
+        match self.slots.get_mut(ticket.reservation.slot)?.as_mut()? {
+            Slot::Held { generation, key, bundle }
+                if *generation == ticket.reservation.generation && *key == ticket.key => Some(bundle),
+            _ => None,
+        }
+    }
+
     /// Run a serialized, move-only owner transition in its exact held row. A refusal must
     /// return the original owner; the row is restored before the refusal reaches the caller.
     pub fn transition_held<E>(
