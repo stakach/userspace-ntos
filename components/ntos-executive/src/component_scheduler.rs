@@ -640,18 +640,37 @@ pub(super) unsafe fn retry_retained_add_device_restore(
     }
 }
 
+// Nonretryable child restore exits. Reasons 1..8 are pre/at receive;
+// 9..14 are uncertain results after the receive was entered.
+fn trace_connect_child_restore(reason: u64, pending: &PendingChildWorkRestore) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if !crate::driver_launch::hosted_connect_pending_reply_published()
+        || COUNT.fetch_add(1, Ordering::Relaxed) >= 32 { return; }
+    print_str(b"[connect-child-restore] reason/mode/inner/outer/retry/result-reply/channel-reply=");
+    print_u64(reason); print_str(b"/");
+    print_u64(u64::from(matches!(pending.mode, PendingReceiveMode::NestedRestore)));
+    print_str(b"/"); print_u64(u64::from(pending.inner_restored));
+    print_str(b"/"); print_u64(u64::from(pending.outer_restored));
+    print_str(b"/"); print_u64(u64::from(pending.retryable));
+    print_str(b"/"); print_hex64(pending.result.reply_cap);
+    print_str(b"/"); print_hex64(pending.channel.reply_cap);
+    print_str(b"\n");
+}
+
 unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> HostedPumpRestore {
     use crate::spawn_hosts::shared_ingress::owner::runtime;
     let route = match runtime::channel_route(&pending.channel) {
         Ok(Some(route)) if runtime::dispatch(route).ok() == Some(pending.dispatch) => route,
         _ => {
             pending.retryable = false;
+            trace_connect_child_restore(1, &pending);
             return HostedPumpRestore::ChildWorkPending(pending);
         }
     };
     if !pending.inner_restored {
         let Some(ticket) = pending.inner_ticket else {
             pending.retryable = false;
+            trace_connect_child_restore(2, &pending);
             return HostedPumpRestore::ChildWorkPending(pending);
         };
         let restored = match pending.mode {
@@ -664,6 +683,7 @@ unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> Hos
             Ok(receipt) => { pending.inner_receipt = receipt; pending.inner_restored = true; }
             Err(_) => {
                 pending.retryable = runtime::nested::pending_ticket(ticket);
+                if !pending.retryable { trace_connect_child_restore(3, &pending); }
                 return HostedPumpRestore::ChildWorkPending(pending);
             }
         }
@@ -676,12 +696,14 @@ unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> Hos
             pending.retryable = ticket.is_some_and(|ticket| unsafe {
                 runtime::nested::pending_ticket(ticket)
             });
+            if !pending.retryable { trace_connect_child_restore(4, &pending); }
             return HostedPumpRestore::ChildWorkPending(pending);
         }
         pending.outer_restored = true;
     }
     if runtime::current_reply(route).ok() != Some(pending.result.reply_cap) {
         pending.retryable = false;
+        trace_connect_child_restore(5, &pending);
         return HostedPumpRestore::ChildWorkPending(pending);
     }
     pending.channel.reply_cap = pending.result.reply_cap;
@@ -690,11 +712,13 @@ unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> Hos
             route, pending.dispatch, pending.channel.pml4,
         ).ok() != Some(caller) {
             pending.retryable = false;
+            trace_connect_child_restore(6, &pending);
             return HostedPumpRestore::ChildWorkPending(pending);
         }
     }
     if crate::driver_launch::driver_thread_projection::enter(&pending.channel, pending.caller).is_err() {
         pending.retryable = false;
+        trace_connect_child_restore(7, &pending);
         return HostedPumpRestore::ChildWorkPending(pending);
     }
     let scope = ComponentSchedulerScope::enter();
@@ -713,6 +737,7 @@ unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> Hos
         Err((status, receipt)) => {
             pending.inner_receipt = receipt;
             pending.retryable = status == nt_process::STATUS_INSUFFICIENT_RESOURCES;
+            if !pending.retryable { trace_connect_child_restore(8, &pending); }
             return HostedPumpRestore::ChildWorkPending(pending);
         }
     };
@@ -722,23 +747,23 @@ unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> Hos
         let _ = handoff_exact_component_once(channel.tcb);
         let reply = match runtime::current_reply(route) {
             Ok(reply) if reply != 0 => reply,
-            _ => return retain_uncertain_receive(pending, result, channel),
+            _ => return retain_uncertain_receive(pending, result, channel, 9),
         };
         channel.reply_cap = reply;
         result = match crate::spawn_hosts::component_pump_continue_receive_after_scheduler_service(
             &channel, &result,
         ) {
             Ok(result) => result,
-            Err(_) => return retain_uncertain_receive(pending, result, channel),
+            Err(_) => return retain_uncertain_receive(pending, result, channel, 10),
         };
     }
     if let Some(crate::spawn_hosts::NestedChildWorkState::Ready(_)) = result.nested_child_work {
         if runtime::dispatch(route).ok() != Some(pending.dispatch) {
-            return retain_uncertain_receive(pending, result, channel);
+            return retain_uncertain_receive(pending, result, channel, 11);
         }
         let reply = match runtime::current_reply(route) {
             Ok(reply) if reply != 0 && reply == result.reply_cap => reply,
-            _ => return retain_uncertain_receive(pending, result, channel),
+            _ => return retain_uncertain_receive(pending, result, channel, 12),
         };
         channel.reply_cap = reply;
         return HostedPumpRestore::ChildWorkReady {
@@ -746,7 +771,7 @@ unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> Hos
         };
     }
     if result.nested_child_work.is_some() {
-        return retain_uncertain_receive(pending, result, channel);
+        return retain_uncertain_receive(pending, result, channel, 13);
     }
     if result.nested_restore_yield.is_some() || result.nested_restore_quarantined.is_some() {
         let exact_reply = runtime::current_reply(route).ok() == Some(result.reply_cap)
@@ -770,7 +795,7 @@ unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> Hos
             || runtime::current_reply(route).ok() != Some(result.reply_cap)
             || authenticate_component_completion(&channel, &result).is_err()
         {
-            return retain_uncertain_receive(pending, result, channel);
+            return retain_uncertain_receive(pending, result, channel, 14);
         }
     }
     HostedPumpRestore::Restored(result)
@@ -782,6 +807,7 @@ unsafe fn retain_uncertain_receive(
     mut pending: PendingChildWorkRestore,
     result: crate::spawn_hosts::PumpResult,
     channel: crate::spawn_hosts::PumpChannel,
+    reason: u64,
 ) -> HostedPumpRestore {
     if let Some(crate::spawn_hosts::NestedChildWorkState::Quarantined(yielded)) = result.nested_child_work {
         if let Some(ticket) = yielded.parent {
@@ -791,5 +817,6 @@ unsafe fn retain_uncertain_receive(
     pending.result = result;
     pending.channel = channel;
     pending.retryable = false;
+    trace_connect_child_restore(reason, &pending);
     HostedPumpRestore::ChildWorkPending(pending)
 }

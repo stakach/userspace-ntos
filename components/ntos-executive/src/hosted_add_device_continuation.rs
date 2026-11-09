@@ -532,6 +532,17 @@ pub(crate) enum HostedAddDeviceProgress {
     RetainedRefusal(HostedAddDeviceContinuation),
 }
 
+/// Capped location probe for the retained AddDevice child restore. Stage 1 records
+/// child-ready/retry bits; 2 entered the native pump; 3/4/5/6 are completed,
+/// projection, yielded, and refused. Stages 10..18 identify pre-pump refusals.
+unsafe fn trace_add_device_resume_gate(stage: u64, detail: u64) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if !hosted_connect_live::pending_reply_published()
+        || COUNT.fetch_add(1, Ordering::Relaxed) >= 32 { return; }
+    print_str(b"[add-device-resume-gate] stage/detail=");
+    print_u64(stage); print_str(b"/"); print_u64(detail); print_str(b"\n");
+}
+
 impl HostedAddDeviceContinuation {
     fn retain(transaction: AddDeviceTransaction, pump: AddDevicePumpContinuation, epoch: u64)
         -> Self
@@ -779,28 +790,39 @@ impl HostedAddDeviceContinuation {
         }
         let child_ready = self.child_work_ready();
         let retry = self.retry_without_new_child();
+        trace_add_device_resume_gate(1, u64::from(child_ready) | (u64::from(retry) << 1));
         if !child_ready && !retry {
+            trace_add_device_resume_gate(10, 0);
             return HostedAddDeviceProgress::RetainedRefusal(self);
         }
         if child_ready && !retry {
             if self.retained.begin_restore(key).is_err() {
+                trace_add_device_resume_gate(11, 0);
                 return HostedAddDeviceProgress::RetainedRefusal(self);
             }
             let step = match self.retained.take_child_step_for_native_restore(key) {
                 Ok(step) => step,
-                Err(_) => return HostedAddDeviceProgress::RetainedRefusal(self),
+                Err(_) => {
+                    trace_add_device_resume_gate(12, 0);
+                    return HostedAddDeviceProgress::RetainedRefusal(self);
+                }
             };
             let owner = match self.retained.owners_mut(key) {
                 Ok(owner) => owner,
-                Err(_) => return HostedAddDeviceProgress::RetainedRefusal(self),
+                Err(_) => {
+                    trace_add_device_resume_gate(13, 0);
+                    return HostedAddDeviceProgress::RetainedRefusal(self);
+                }
             };
             let Some(pump) = owner.pump.as_mut() else {
+                trace_add_device_resume_gate(14, 0);
                 return HostedAddDeviceProgress::RetainedRefusal(self);
             };
             if let Err(step) = pump.record_child_step(step) {
                 // The physical owner refused before entry. Keep the sealed receipt in the
                 // native bundle; this row remains fenced and cannot select another child.
                 pump.child_step = Some(step);
+                trace_add_device_resume_gate(15, 0);
                 return HostedAddDeviceProgress::RetainedRefusal(self);
             }
         } else {
@@ -812,6 +834,7 @@ impl HostedAddDeviceContinuation {
                 self.retained.begin_restore_without_child(key)
             };
             if begun.is_err() {
+                trace_add_device_resume_gate(16, 0);
                 return HostedAddDeviceProgress::RetainedRefusal(self);
             }
         }
@@ -819,10 +842,15 @@ impl HostedAddDeviceContinuation {
             Ok(owners) => owners.pump.take(),
             Err(_) => None,
         };
-        let Some(pump) = pump else { return HostedAddDeviceProgress::RetainedRefusal(self); };
+        let Some(pump) = pump else {
+            trace_add_device_resume_gate(17, 0);
+            return HostedAddDeviceProgress::RetainedRefusal(self);
+        };
+        trace_add_device_resume_gate(2, 0);
         let progress = pump.resume();
         match progress {
             AddDevicePumpProgress::Completed(result) => {
+                trace_add_device_resume_gate(3, 0);
                 if let Ok(owners) = self.retained.owners_mut(key) {
                     owners.terminal = Some(result);
                     self.settle_terminal()
@@ -832,6 +860,7 @@ impl HostedAddDeviceContinuation {
                 }
             }
             AddDevicePumpProgress::ProjectionCompleted(result) => {
+                trace_add_device_resume_gate(4, 0);
                 if let Ok(owners) = self.retained.owners_mut(key) {
                     owners.projection_terminal = Some(result);
                     self.settle_projection()
@@ -841,18 +870,21 @@ impl HostedAddDeviceContinuation {
                 }
             }
             AddDevicePumpProgress::ChildWorkYield(pump) => {
+                trace_add_device_resume_gate(5, 0);
                 let mut next_key = key;
                 next_key.physical = pump.physical_identity();
                 if let Ok(owners) = self.retained.owners_mut(key) { owners.pump = Some(pump); }
                 if next_key.physical.is_none()
                     || self.retained.repark_after_native_yield_with_key(key, next_key).is_err()
                 {
+                    trace_add_device_resume_gate(18, 0);
                     return HostedAddDeviceProgress::RetainedRefusal(self);
                 }
                 HostedAddDeviceProgress::ChildWorkYield(self)
             }
             AddDevicePumpProgress::RetainedRefusal(pump) => {
                 let retryable = pump.retry_without_new_child();
+                trace_add_device_resume_gate(6, u64::from(retryable));
                 if let Ok(owners) = self.retained.owners_mut(key) { owners.pump = Some(pump); }
                 if retryable {
                     let _ = self.retained.refuse_restore_no_effects(key);
