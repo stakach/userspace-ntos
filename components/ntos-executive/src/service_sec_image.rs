@@ -11104,11 +11104,15 @@ pub(crate) unsafe fn service_sec_image(
             crate::driver_launch::redrive_hosted_read_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_flush_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_query_information_forward(nt_handler as *mut _);
+            trace_connect_root_checkpoint(0, None);
             crate::driver_launch::redrive_hosted_connect_forward();
+            trace_connect_root_checkpoint(1, None);
             // A port CONNECT may have yielded while its provider parent remained physically
             // parked. Its File frames have ended here. Run one selected child per flat pass,
             // then resume only that exact retained pump before another provider can enter.
-            if !matches!(settle_suspended_connect_pumps(), ConnectPumpSettlement::Settled) {
+            let connect_settlement = settle_suspended_connect_pumps();
+            trace_connect_root_checkpoint(2, Some(&connect_settlement));
+            if !matches!(connect_settlement, ConnectPumpSettlement::Settled) {
                 // A nonretryable restore or a claimed, orphaned, or blocked port parent still
                 // owns its Reply. No later provider may enter while that physical owner is held.
                 stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
@@ -11117,12 +11121,16 @@ pub(crate) unsafe fn service_sec_image(
             }
             // A work-queue callback can outlive its invoking provider frame. Reconcile
             // its exact Reply before a fresh Hook source may enter native code.
-            if !matches!(settle_queued_callbacks(), ConnectPumpSettlement::Settled) {
+            let queue_settlement = settle_queued_callbacks();
+            trace_connect_root_checkpoint(3, Some(&queue_settlement));
+            if !matches!(queue_settlement, ConnectPumpSettlement::Settled) {
                 stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                 stop_ssn = 0;
                 break 'service_loop;
             }
+            trace_connect_root_checkpoint(4, None);
             crate::driver_launch::redrive_hosted_hook_forward();
+            trace_connect_root_checkpoint(5, None);
             if crate::driver_launch::hook_redrive_exit_probe() {
                 trace_hook_root_boundary(0);
                 crate::driver_launch::clear_hook_redrive_exit_probe();
@@ -28101,6 +28109,44 @@ enum ConnectPumpSettlement {
     AwaitingLocalChild,
     Retained,
     Blocked,
+}
+
+/// Capped root checkpoint around CONNECT, queue, and Hook settlement. This reads only
+/// owner readiness; no provider or shared-ring operation is issued by the probe.
+/// Stages: 0 CONNECT redrive entry, 1 CONNECT redrive returned,
+/// 2 CONNECT settled, 3 queue settled,
+/// 4 Hook redrive entry, 5 Hook redrive returned. Settlement: 0 none,
+/// 1 settled, 2 awaiting child, 3 retained, 4 blocked.
+unsafe fn trace_connect_root_checkpoint(
+    stage: u64, settlement: Option<&ConnectPumpSettlement>,
+) {
+    static ARMED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    static COUNT: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    if !ARMED.load(core::sync::atomic::Ordering::Relaxed) {
+        let connect_owner = crate::driver_launch::unsettled_suspended_connect_pump()
+            || crate::driver_launch::nested_hosted_connect_forward_ready();
+        if !connect_owner { return; }
+        ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+    if COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 128 { return; }
+    let settlement = match settlement {
+        None => 0,
+        Some(ConnectPumpSettlement::Settled) => 1,
+        Some(ConnectPumpSettlement::AwaitingLocalChild) => 2,
+        Some(ConnectPumpSettlement::Retained) => 3,
+        Some(ConnectPumpSettlement::Blocked) => 4,
+    };
+    print_str(b"[connect-root-checkpoint] stage/settlement/hook-ready/queue-held/file-held=");
+    print_u64(stage); print_str(b"/");
+    print_u64(settlement); print_str(b"/");
+    print_u64(u64::from(crate::driver_launch::nested_hosted_hook_forward_ready()));
+    print_str(b"/");
+    print_u64(u64::from(crate::driver_launch::unsettled_queued_callback()));
+    print_str(b"/");
+    print_u64(u64::from(crate::driver_launch::generic_file_pump_unsettled()));
+    print_str(b"\n");
 }
 
 unsafe fn settle_suspended_connect_pumps() -> ConnectPumpSettlement {
