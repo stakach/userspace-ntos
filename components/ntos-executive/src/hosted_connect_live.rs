@@ -255,6 +255,7 @@ unsafe fn submit(
             return Some((INVALID, false));
         }
     };
+    super::mark_connect_source_completion_probe(source_irp);
     if source.payload().forward.target != target {
         abort_capture(source);
         return Some((INVALID, false));

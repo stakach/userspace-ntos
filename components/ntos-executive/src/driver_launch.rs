@@ -13802,6 +13802,7 @@ extern "win64" fn s_io_unregister_file_system(device: u64) {
 
 static HOOK_SOURCE_COMPLETION_PROBE_IRP: AtomicU64 = AtomicU64::new(0);
 static HOOK_CLASS_SOURCE_COMPLETION_PROBE_IRP: AtomicU64 = AtomicU64::new(0);
+static CONNECT_SOURCE_COMPLETION_PROBE_IRP: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn mark_hook_source_completion_probe(irp: u64) {
     HOOK_SOURCE_COMPLETION_PROBE_IRP.store(irp, Ordering::Release);
@@ -13811,6 +13812,10 @@ pub(crate) fn mark_hook_class_source_completion_probe(irp: u64) {
     HOOK_CLASS_SOURCE_COMPLETION_PROBE_IRP.store(irp, Ordering::Release);
 }
 
+pub(crate) fn mark_connect_source_completion_probe(irp: u64) {
+    CONNECT_SOURCE_COMPLETION_PROBE_IRP.store(irp, Ordering::Release);
+}
+
 fn trace_hook_source_completion_probe(irp: u64, stage: u64, event: u64, status: i32) {
     let kind = if irp != 0 && HOOK_SOURCE_COMPLETION_PROBE_IRP.load(Ordering::Acquire) == irp {
         1
@@ -13818,6 +13823,10 @@ fn trace_hook_source_completion_probe(irp: u64, stage: u64, event: u64, status: 
         && HOOK_CLASS_SOURCE_COMPLETION_PROBE_IRP.load(Ordering::Acquire) == irp
     {
         2
+    } else if irp != 0
+        && CONNECT_SOURCE_COMPLETION_PROBE_IRP.load(Ordering::Acquire) == irp
+    {
+        3
     } else {
         return;
     };

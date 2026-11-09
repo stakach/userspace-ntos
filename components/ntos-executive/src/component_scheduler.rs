@@ -721,6 +721,7 @@ pub(crate) fn trace_connect_child_receive_yield(
     print_u64(u64::from(serviced)); print_str(b"/");
     print_hex64(badge); print_str(b"/"); print_hex64(info); print_str(b"/");
     print_hex64(demand); print_str(b"\n");
+    unsafe { crate::driver_launch::hosted_work_queue_owner::trace_connect_callback_rows(); }
 }
 
 unsafe fn resume_pending_child_work(mut pending: PendingChildWorkRestore) -> HostedPumpRestore {

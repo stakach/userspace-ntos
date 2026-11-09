@@ -374,6 +374,31 @@ pub(crate) unsafe fn unsettled_queued_callback() -> bool {
             .any(|row| row.pump.is_some() || row.resuming)
 }
 
+/// Read-only census after Hook completion. A retired queue row means its callback return was
+/// acknowledged; a retained row reports its exact generation and physical Reply.
+pub(crate) unsafe fn trace_connect_callback_rows() {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 12 { return; }
+    let rows = &*core::ptr::addr_of!(CLAIMS);
+    print_str(b"[connect-callback-count] rows=");
+    print_u64(rows.iter().flatten().count() as u64);
+    print_str(b"\n");
+    for (index, row) in rows.iter().enumerate().filter_map(|(index, slot)|
+        slot.as_ref().map(|row| (index, row)))
+    {
+        let physical = row.pump.as_ref().and_then(|pump| pump.child_work_identity());
+        print_str(b"[connect-callback-row] index/sequence/pump/step/resuming/terminal/tcb/reply=");
+        print_u64(index as u64); print_str(b"/");
+        print_u64(row.sequence); print_str(b"/");
+        print_u64(u64::from(row.pump.is_some())); print_str(b"/");
+        print_u64(u64::from(row.child_step.is_some())); print_str(b"/");
+        print_u64(u64::from(row.resuming)); print_str(b"/");
+        print_u64(u64::from(row.terminal_ack.is_some())); print_str(b"/");
+        print_u64(physical.map_or(0, |identity| identity.tcb)); print_str(b"/");
+        print_u64(physical.map_or(0, |identity| identity.reply_cap)); print_str(b"\n");
+    }
+}
+
 fn same_selector(row: &Row, selector: QueuedCallbackSelector) -> bool {
     row.sequence == selector.sequence && row.claim.invocation() == selector.key
         && row.pump.as_ref().and_then(|pump| pump.child_work_identity())
