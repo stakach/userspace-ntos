@@ -42,15 +42,39 @@ fn unpublished_head_blocks_consumption_and_cannot_be_replayed() {
     let claimed_first = queue.claim_ready().expect("first entry becomes visible");
     assert_eq!(claimed_first.sequence(), first.sequence());
     assert_eq!(claimed_first.slot(), first.slot());
+    let claimed_second = queue.claim_ready().expect("a second published entry is independent");
+    assert_eq!(claimed_second.sequence(), second.sequence());
+    assert_eq!(claimed_second.slot(), second.slot());
     assert!(queue.claim_ready().is_none(), "an entered claim cannot be handed out twice");
     assert!(queue.acknowledge(claimed_first).is_ok());
     assert!(queue.acknowledge(claimed_first).is_err(), "claim ACK is one use");
-
-    let claimed_second = queue.claim_ready().expect("second entry follows first");
-    assert_eq!(claimed_second.sequence(), second.sequence());
-    assert_eq!(claimed_second.slot(), second.slot());
     assert!(queue.acknowledge(claimed_second).is_ok());
     assert!(queue.claim_ready().is_none());
+}
+
+#[test]
+fn parked_claim_does_not_block_a_second_worker_but_fences_slot_reuse() {
+    let queue = HostedWorkQueueAdmission::<2>::new();
+    let first = queue.reserve().unwrap();
+    let second = queue.reserve().unwrap();
+    queue.publish(first).unwrap();
+    queue.publish(second).unwrap();
+
+    let first_ready = queue.claim_ready().unwrap();
+    let second_ready = queue.claim_ready()
+        .expect("a parked callback cannot block an independent worker");
+    assert_eq!(second_ready.sequence(), second.sequence());
+    queue.acknowledge(second_ready).unwrap();
+    assert!(queue.reserve().is_err(),
+        "the earlier live callback still fences ring reuse");
+    queue.acknowledge(first_ready).unwrap();
+
+    let next = queue.reserve().expect("contiguous ACKs release capacity");
+    assert_eq!(next.slot(), first.slot());
+    assert!(queue.publish(first).is_err(), "stale reservation cannot publish a reused slot");
+    assert!(queue.acknowledge(first_ready).is_err(), "stale claim cannot retire a reused slot");
+    queue.publish(next).unwrap();
+    queue.acknowledge(queue.claim_ready().unwrap()).unwrap();
 }
 
 #[test]
