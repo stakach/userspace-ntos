@@ -799,6 +799,11 @@ pub(super) fn nested_work_ready() -> bool {
     rows().iter().flatten().any(|work| work.nested_ready())
 }
 
+/// Read-only witness that the CONNECT source Reply has been issued as Pending.
+pub(super) fn pending_reply_published() -> bool {
+    rows().iter().flatten().any(|work| work.source.origin().pending())
+}
+
 pub(super) unsafe fn redrive_nested_ready() -> bool {
     let progress = || {
         rows().iter().flatten().fold(0usize, |total, work| {

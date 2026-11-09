@@ -28125,8 +28125,7 @@ unsafe fn trace_connect_root_checkpoint(
     static COUNT: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
     if !ARMED.load(core::sync::atomic::Ordering::Relaxed) {
-        let connect_owner = crate::driver_launch::unsettled_suspended_connect_pump()
-            || crate::driver_launch::nested_hosted_connect_forward_ready();
+        let connect_owner = crate::driver_launch::hosted_connect_pending_reply_published();
         if !connect_owner { return; }
         ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
     }

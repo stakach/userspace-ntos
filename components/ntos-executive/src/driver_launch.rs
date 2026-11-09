@@ -67677,6 +67677,10 @@ pub(crate) unsafe fn nested_hosted_connect_forward_ready() -> bool {
     hosted_connect_live::nested_work_ready()
 }
 
+pub(crate) fn hosted_connect_pending_reply_published() -> bool {
+    hosted_connect_live::pending_reply_published()
+}
+
 pub(crate) unsafe fn redrive_nested_hosted_connect_forward() -> bool {
     hosted_connect_live::redrive_nested_ready()
 }

@@ -90,6 +90,10 @@ impl RetainedConnectWork {
         &mut self.origin
     }
 
+    pub(super) fn origin(&self) -> &hosted_forward_origin::HostedForwardOrigin {
+        &self.origin
+    }
+
     pub(super) unsafe fn nested_preparation_ready(&self) -> bool {
         let Ok(command) = self.completion_command() else { return false };
         use nt_io_manager::source_irp_ledger::SourceIrpOwner;
