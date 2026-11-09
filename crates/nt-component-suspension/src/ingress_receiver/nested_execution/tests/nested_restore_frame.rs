@@ -1,6 +1,61 @@
 use super::*;
 
 #[test]
+fn intentionally_parked_parent_waits_for_exact_child_handoff_before_restore() {
+    use crate::{NestedRestoreFrame, NestedRestoreFrameError as Error, NestedRestoreKey,
+        NestedRestorePhase as Phase};
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let scope = f.receiver.suspend_for_nested_execution(
+        route, dispatch, &mut f.lanes, &f.peers, bound,
+    ).unwrap();
+    let reply = f.lanes.binding(dispatch.lane()).unwrap().reply_object;
+    let key = NestedRestoreKey::new(scope.identity(), reply, 501, receive_owner(dispatch)).unwrap();
+    let stale = NestedRestoreKey::new(scope.identity(), reply + 1, 501, receive_owner(dispatch)).unwrap();
+    let mut frame = NestedRestoreFrame::prepare_child_work(key, 0xBEEF_u64);
+    frame.retain(key).unwrap();
+    assert_eq!(frame.begin_retry(key), Err(Error::InvalidPhase));
+    assert_eq!(frame.begin_child_work(stale), Err(Error::InvalidIdentity));
+    frame.begin_child_work(key).unwrap();
+    assert_eq!(frame.begin_child_work(key), Err(Error::InvalidPhase));
+    frame.refuse_child_work_no_effects(key).unwrap();
+    assert_eq!(frame.begin_retry(key), Err(Error::InvalidPhase));
+    frame.begin_child_work(key).unwrap();
+    assert_eq!(frame.finish_child_work(stale), Err(Error::InvalidIdentity));
+    assert_eq!(frame.begin_retry(key), Err(Error::InvalidPhase));
+    frame.finish_child_work(key).unwrap();
+    assert_eq!(frame.phase(), Phase::Retained);
+    frame.begin_retry(key).unwrap();
+    frame.acknowledge_restored(key).unwrap();
+    frame.begin_receive(key).unwrap();
+    assert_eq!(frame.record_receive_result(key, 0xCAFE), Ok(0xBEEF));
+    assert_eq!(frame.transfer_result_no_effects(key, Ok::<_, u64>), Ok(0xCAFE));
+}
+
+#[test]
+fn uncertain_child_handoff_retains_parent_and_fences_restore_and_replay() {
+    use crate::{NestedRestoreFrame, NestedRestoreFrameError as Error, NestedRestoreKey,
+        NestedRestorePhase as Phase};
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let scope = f.receiver.suspend_for_nested_execution(
+        route, dispatch, &mut f.lanes, &f.peers, bound,
+    ).unwrap();
+    let reply = f.lanes.binding(dispatch.lane()).unwrap().reply_object;
+    let key = NestedRestoreKey::new(scope.identity(), reply, 501, receive_owner(dispatch)).unwrap();
+    let mut frame = NestedRestoreFrame::prepare_child_work(key, 0xBEEF_u64);
+    frame.retain(key).unwrap();
+    frame.begin_child_work(key).unwrap();
+    frame.quarantine_child_work(key).unwrap();
+    assert_eq!(frame.phase(), Phase::Quarantined);
+    assert_eq!(frame.continuation_ref(key), Ok(&0xBEEF));
+    assert_eq!(frame.begin_child_work(key), Err(Error::InvalidPhase));
+    assert_eq!(frame.finish_child_work(key), Err(Error::InvalidPhase));
+    assert_eq!(frame.begin_retry(key), Err(Error::InvalidPhase));
+    assert_eq!(frame.transfer_result_no_effects(key, Ok::<_, u64>), Err(Error::InvalidPhase));
+}
+
+#[test]
 fn nested_restore_frame_keeps_the_continuation_until_exact_restoration() {
     use crate::{NestedRestoreFrame, NestedRestoreFrameError as Error, NestedRestoreKey,
         NestedRestorePhase as Phase};

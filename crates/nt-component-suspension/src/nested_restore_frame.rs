@@ -37,6 +37,9 @@ impl NestedRestoreKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NestedRestorePhase {
     Prepared,
+    PreparedChildWork,
+    ChildWorkReady,
+    ChildWorkEntered,
     Retained,
     Retrying,
     Quarantined,
@@ -75,6 +78,13 @@ impl<C> NestedRestoreFrame<C> {
         Self { key, phase: NestedRestorePhase::Prepared, continuation: Some(continuation) }
     }
 
+    /// An intentional outer-loop handoff must run its selected child work before the parked
+    /// parent can be restored. The work's own native effects and completion remain separate.
+    pub fn prepare_child_work(key: NestedRestoreKey, continuation: C) -> Self {
+        Self { key, phase: NestedRestorePhase::PreparedChildWork,
+            continuation: Some(continuation) }
+    }
+
     pub const fn key(&self) -> NestedRestoreKey { self.key }
     pub const fn phase(&self) -> NestedRestorePhase { self.phase }
 
@@ -94,10 +104,61 @@ impl<C> NestedRestoreFrame<C> {
     /// Publish the durable frame before the root Reply park can enter a native effect.
     pub fn retain(&mut self, key: NestedRestoreKey) -> Result<(), NestedRestoreFrameError> {
         self.exact(key)?;
-        if self.phase != NestedRestorePhase::Prepared {
+        self.phase = match self.phase {
+            NestedRestorePhase::Prepared => NestedRestorePhase::Retained,
+            NestedRestorePhase::PreparedChildWork => NestedRestorePhase::ChildWorkReady,
+            _ => return Err(NestedRestoreFrameError::InvalidPhase),
+        };
+        Ok(())
+    }
+
+    /// Claim one child runner after the exact parent continuation has a durable owner. A
+    /// reentrant or stale caller cannot launch the same work again.
+    pub fn begin_child_work(
+        &mut self, key: NestedRestoreKey,
+    ) -> Result<(), NestedRestoreFrameError> {
+        self.exact(key)?;
+        if self.phase != NestedRestorePhase::ChildWorkReady {
+            return Err(NestedRestoreFrameError::InvalidPhase);
+        }
+        self.phase = NestedRestorePhase::ChildWorkEntered;
+        Ok(())
+    }
+
+    /// Only a certified no-effects refusal restores child dispatch authority.
+    pub fn refuse_child_work_no_effects(
+        &mut self, key: NestedRestoreKey,
+    ) -> Result<(), NestedRestoreFrameError> {
+        self.exact(key)?;
+        if self.phase != NestedRestorePhase::ChildWorkEntered {
+            return Err(NestedRestoreFrameError::InvalidPhase);
+        }
+        self.phase = NestedRestorePhase::ChildWorkReady;
+        Ok(())
+    }
+
+    /// The selected child runner has returned with its own outcome retained. This permits
+    /// restoration of the parent, but does not assert provider completion or Reply ACK.
+    pub fn finish_child_work(
+        &mut self, key: NestedRestoreKey,
+    ) -> Result<(), NestedRestoreFrameError> {
+        self.exact(key)?;
+        if self.phase != NestedRestorePhase::ChildWorkEntered {
             return Err(NestedRestoreFrameError::InvalidPhase);
         }
         self.phase = NestedRestorePhase::Retained;
+        Ok(())
+    }
+
+    /// An uncertain child effect retains the parent continuation and permanently fences replay.
+    pub fn quarantine_child_work(
+        &mut self, key: NestedRestoreKey,
+    ) -> Result<(), NestedRestoreFrameError> {
+        self.exact(key)?;
+        if self.phase != NestedRestorePhase::ChildWorkEntered {
+            return Err(NestedRestoreFrameError::InvalidPhase);
+        }
+        self.phase = NestedRestorePhase::Quarantined;
         Ok(())
     }
 
