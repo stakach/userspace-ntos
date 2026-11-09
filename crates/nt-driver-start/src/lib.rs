@@ -5,8 +5,10 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 pub mod preload_catalog;
-mod add_device_root_turn;
-pub use add_device_root_turn::{AddDeviceRootTurn, RootArrival, RootTurnAction, RootTurnError};
+pub use nt_component_suspension::{
+    RootChildTurn as AddDeviceRootTurn, RootChildArrival as RootArrival,
+    RootChildTurnAction as RootTurnAction, RootChildTurnError as RootTurnError,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DispatchToken {

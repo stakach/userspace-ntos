@@ -54,6 +54,10 @@ pub use peer_installation::{PeerAdmissionFence, PeerCapabilityDestination, PeerS
 mod retained_ingress;
 mod retained_dispatch;
 mod retained_child_dispatch;
+mod root_child_turn;
+pub use root_child_turn::{
+    RootChildArrival, RootChildTurn, RootChildTurnAction, RootChildTurnError,
+};
 mod hosted_work_queue_claim;
 pub use hosted_work_queue_claim::{HostedWorkQueueClaim, HostedWorkQueueClaimError};
 pub use retained_child_dispatch::{

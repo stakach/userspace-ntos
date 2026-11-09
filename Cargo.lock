@@ -363,6 +363,9 @@ dependencies = [
 [[package]]
 name = "nt-driver-start"
 version = "0.1.0"
+dependencies = [
+ "nt-component-suspension",
+]
 
 [[package]]
 name = "nt-driver-supervisor"
