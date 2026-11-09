@@ -507,6 +507,7 @@ unsafe fn dispatch_port_source(
         terminal_status: None, published: false,
         blocked: false, source_retired: false,
     }));
+    super::mark_hook_source_completion_probe(irp);
     None
 }
 

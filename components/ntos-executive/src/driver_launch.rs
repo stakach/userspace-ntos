@@ -13800,6 +13800,21 @@ extern "win64" fn s_io_unregister_file_system(device: u64) {
     }
 }
 
+static HOOK_SOURCE_COMPLETION_PROBE_IRP: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn mark_hook_source_completion_probe(irp: u64) {
+    HOOK_SOURCE_COMPLETION_PROBE_IRP.store(irp, Ordering::Release);
+}
+
+fn trace_hook_source_completion_probe(irp: u64, stage: u64, event: u64, status: i32) {
+    if irp == 0 || HOOK_SOURCE_COMPLETION_PROBE_IRP.load(Ordering::Acquire) != irp {
+        return;
+    }
+    print_str(b"[hook-source-completion] stage/irp/event/status=");
+    print_u64(stage); print_str(b"/"); print_hex64(irp); print_str(b"/");
+    print_hex64(event); print_str(b"/"); print_hex(status as u32); print_str(b"\n");
+}
+
 unsafe fn finish_driver_local_irp(irp: u64) {
     let (begin_status, auxiliary_output_limit) = if let Some((_, identity, _, _, grant)) =
         hosted_irq_lane_context()
@@ -13844,6 +13859,7 @@ unsafe fn finish_driver_local_irp(irp: u64) {
         read_unaligned((irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *const u64);
     let user_iosb = read_unaligned((irp + 0x48) as *const u64);
     let user_event = read_unaligned((irp + 0x50) as *const u64);
+    trace_hook_source_completion_probe(irp, 2, user_event, status);
     if user_iosb != 0 {
         write_unaligned(user_iosb as *mut i32, status);
         write_unaligned((user_iosb + 8) as *mut u64, information);
@@ -13892,6 +13908,7 @@ unsafe fn finish_driver_local_irp(irp: u64) {
     }
     if user_event != 0 {
         let _ = s_ke_set_event(user_event, 0, 0);
+        trace_hook_source_completion_probe(irp, 3, user_event, status);
     }
     s_io_free_irp(irp);
 }
@@ -14118,7 +14135,9 @@ unsafe fn acknowledge_held_pnp_if_terminal(irp: u64) {
 
 extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
     unsafe {
+        trace_hook_source_completion_probe(irp, 1, 0, 0);
         let outcome = complete_hosted_irp(irp);
+        trace_hook_source_completion_probe(irp, 4, 0, outcome as i32);
         if outcome == HostedIrpUnwindOutcome::Terminal {
             acknowledge_held_pnp_if_terminal(irp);
             if let Some(identity) = observe_held_scsi_terminal(irp) {
