@@ -769,10 +769,14 @@ unsafe fn advance_port_terminal(work: &mut PortSource) {
             irp_id, key, work.owner_id, work.source.class_target_registration().device_id(),
         ).is_err() { return; }
         let Ok(Some(hosted_file_owners::DispatchResult::Returned {
-            status: returned_status, information: 0, buffers, ..
+            irp_id: retired_irp, status: returned_status, information: 0, buffers, ..
         })) = hosted_file_owners::take_returned_hook_pump(
             irp_id, key, work.owner_id, work.source.class_target_registration().device_id(),
         ) else { return; };
+        if !work.source.record_returned_file_retirement(retired_irp) {
+            work.blocked = true;
+            return;
+        }
         let (updated, _) = buffers.into_parts();
         work.pump_return_consumed = true;
         if returned_status != status || updated.as_slice() != &candidate.updated[..work.input_length] {
