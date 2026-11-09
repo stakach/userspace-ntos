@@ -68,6 +68,24 @@ fn trace_connect_gate(stage: u64, source_irp: u64, detail: u64) {
     }
 }
 
+// Capped caller and return markers for the first live CONNECT provider entry.
+// Stages: 0 wrapper entry, 1 dispatch entry, 2 dispatch return, 3 observe return,
+// 4 loop continue, 5 wrapper return, 6 loop end. caller: 0 root, 1 nested.
+fn trace_connect_redrive(stage: u64, nested: bool, source_irp: u64) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 40 { return; }
+    print_str(b"[hosted-connect-redrive] stage/caller/irp=");
+    print_u64(stage); print_str(b"/");
+    print_u64(u64::from(nested)); print_str(b"/");
+    print_hex64(source_irp); print_str(b"\n");
+}
+
+fn trace_connect_redrive_if_pending(stage: u64, nested: bool) {
+    if let Some(work) = rows().iter().flatten().find(|work| work.source.origin().pending()) {
+        trace_connect_redrive(stage, nested, work.source.source_irp_address());
+    }
+}
+
 fn trace_parked_connect_gate(stage: u64, tcb: u64, detail: u64) {
     static TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
     if TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 20 {
@@ -432,7 +450,9 @@ pub(super) unsafe fn service(
 }
 
 pub(super) unsafe fn redrive() {
+    trace_connect_redrive_if_pending(0, false);
     redrive_inner(false);
+    trace_connect_redrive_if_pending(5, false);
 }
 
 #[must_use = "run one outer child and deposit its sealed step in the claimed Work row"]
@@ -751,14 +771,18 @@ unsafe fn redrive_inner(nested_ready_only: bool) {
             }
             work.provider_entered = true;
             trace_connect_live(7, work.source.source_irp_address(), work.reverse_owner_id, 0);
+            trace_connect_redrive(1, nested_ready_only, work.source.source_irp_address());
             let phase = {
                 let port = &mut (*work_ptr).port;
                 let permit = &(*work_ptr).permit;
                 let caller = (*work_ptr).caller;
                 port.dispatch(permit, caller)
             };
+            trace_connect_redrive(2, nested_ready_only, (*work_ptr).source.source_irp_address());
             let work = &mut *work_ptr;
             let _ = observe_port_dispatch_result(work, phase);
+            trace_connect_redrive(3, nested_ready_only, work.source.source_irp_address());
+            trace_connect_redrive(4, nested_ready_only, work.source.source_irp_address());
             continue;
         }
         let work = &mut *work_ptr;
@@ -793,6 +817,7 @@ unsafe fn redrive_inner(nested_ready_only: bool) {
             // Published aliases and the callback thunk remain installed for subsequent input.
         }
     }
+    trace_connect_redrive_if_pending(6, nested_ready_only);
 }
 
 pub(super) fn nested_work_ready() -> bool {
@@ -805,6 +830,7 @@ pub(super) fn pending_reply_published() -> bool {
 }
 
 pub(super) unsafe fn redrive_nested_ready() -> bool {
+    trace_connect_redrive_if_pending(0, true);
     let progress = || {
         rows().iter().flatten().fold(0usize, |total, work| {
             total
@@ -815,6 +841,7 @@ pub(super) unsafe fn redrive_nested_ready() -> bool {
     };
     let before = progress();
     redrive_inner(true);
+    trace_connect_redrive_if_pending(5, true);
     progress() != before
 }
 
