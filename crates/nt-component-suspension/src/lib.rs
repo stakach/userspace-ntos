@@ -51,6 +51,10 @@ mod peer_installation;
 pub use peer_installation::{PeerAdmissionFence, PeerCapabilityDestination, PeerSpaceBinding, PeerInstallation, PeerInstallationError, PeerInstallationPhase, PeerStartupError, PeerRetirementEffect, PeerRetirementError, PeerRetirementPhase};
 mod retained_ingress;
 mod retained_dispatch;
+mod retained_child_dispatch;
+pub use retained_child_dispatch::{
+    RetainedChildDispatch, RetainedChildDispatchError, RetainedChildDispatchPhase,
+};
 mod retained_work;
 mod reserved_receive;
 mod ingress_receiver;
