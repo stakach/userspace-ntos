@@ -115,8 +115,12 @@ jobs:
         with:
           path: |
             components/ntos-executive/target
+            crates/nt-ntdll-dll/target
             rust-micro/target
-          key: native-kvm-build-v2-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'components/ntos-executive/triplet.json', 'rust-micro/Cargo.lock', 'rust-micro/rust-toolchain') }}
+          key: native-kvm-build-v3-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'components/ntos-executive/triplet.json', 'crates/nt-ntdll-dll/Cargo.lock', 'rust-micro/Cargo.lock', 'rust-micro/rust-toolchain') }}-${{ github.sha }}
+          restore-keys: |
+            native-kvm-build-v3-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'components/ntos-executive/triplet.json', 'crates/nt-ntdll-dll/Cargo.lock', 'rust-micro/Cargo.lock', 'rust-micro/rust-toolchain') }}-
+            native-kvm-build-v2-${{ runner.os }}-
       - name: Build native image from verified pinned LiberNT release
         run: |
           set -o pipefail
@@ -138,8 +142,9 @@ jobs:
         with:
           path: |
             components/ntos-executive/target
+            crates/nt-ntdll-dll/target
             rust-micro/target
-          key: native-kvm-build-v2-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'components/ntos-executive/triplet.json', 'rust-micro/Cargo.lock', 'rust-micro/rust-toolchain') }}
+          key: native-kvm-build-v3-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'components/ntos-executive/triplet.json', 'crates/nt-ntdll-dll/Cargo.lock', 'rust-micro/Cargo.lock', 'rust-micro/rust-toolchain') }}-${{ github.sha }}
       - name: Run bounded KVM startup and capture QMP framebuffer
         env:
           QEMU_ACCEL: kvm
