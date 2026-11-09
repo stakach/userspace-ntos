@@ -957,16 +957,62 @@ unsafe fn advance_port_source(work: &mut PortSource) {
     }
 }
 
+/// Stage: 0 entry (index=class count, owner=port count), 1/2 class before/after,
+/// 3 class skip, 4/5 port before/after, 6 port skip, 7 function exit.
+fn trace_hook_redrive(
+    stage: u64, index: u64, owner: u64, entered: bool, published: bool,
+    pump_key: bool, unowned: bool,
+) {
+    static COUNT: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    if COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 96 {
+        return;
+    }
+    print_str(b"[hook-redrive] stage/index/owner/entered/published/key/unowned=");
+    print_u64(stage); print_str(b"/");
+    print_u64(index); print_str(b"/");
+    print_u64(owner); print_str(b"/");
+    print_u64(u64::from(entered)); print_str(b"/");
+    print_u64(u64::from(published)); print_str(b"/");
+    print_u64(u64::from(pump_key)); print_str(b"/");
+    print_u64(u64::from(unowned)); print_str(b"\n");
+}
+
 pub(super) unsafe fn redrive() {
+    let trace = entered_port_source_unpublished();
     let class_count = class_sources().len();
+    if trace {
+        trace_hook_redrive(0, class_count as u64, port_sources().len() as u64,
+            false, false, false, false);
+    }
     for index in 0..class_count {
         let ptr = class_sources()[index].as_mut() as *mut ClassSource;
-        if (*ptr).pump_key.is_some() || (*ptr).unowned_yield.is_some() { continue; }
+        let owner_id = (*ptr).owner_id;
+        if trace {
+            trace_hook_redrive(1, index as u64, (*ptr).owner_id, (*ptr).entered,
+                (*ptr).published, (*ptr).pump_key.is_some(), (*ptr).unowned_yield.is_some());
+        }
+        if (*ptr).pump_key.is_some() || (*ptr).unowned_yield.is_some() {
+            if trace {
+                trace_hook_redrive(3, index as u64, (*ptr).owner_id, (*ptr).entered,
+                    (*ptr).published, (*ptr).pump_key.is_some(), (*ptr).unowned_yield.is_some());
+            }
+            continue;
+        }
         advance_class_source(&mut *ptr);
+        if trace {
+            trace_hook_redrive(2, index as u64, owner_id,
+                false, false, false, false);
+        }
     }
     let port_count = port_sources().len();
     for index in 0..port_count {
         let ptr = port_sources()[index].as_mut() as *mut PortSource;
+        let owner_id = (*ptr).owner_id;
+        if trace {
+            trace_hook_redrive(4, index as u64, (*ptr).owner_id, (*ptr).entered,
+                (*ptr).published, (*ptr).pump_key.is_some(), (*ptr).unowned_yield.is_some());
+        }
         if (*ptr).entered && !(*ptr).published {
             // State: 0 no pending/key pair, 1 suspended, 2 returned,
             // 3 provider pending, 4 blocked, 5 exact owner/key refusal.
@@ -987,11 +1033,25 @@ pub(super) unsafe fn redrive() {
                 (*ptr).pending.map_or(0, |id| id.raw()), (*ptr).pump_key.is_some(),
                 u64::from((*ptr).unowned_yield.is_some()), state);
         }
-        if (*ptr).pump_key.is_some() || (*ptr).unowned_yield.is_some() { continue; }
+        if (*ptr).pump_key.is_some() || (*ptr).unowned_yield.is_some() {
+            if trace {
+                trace_hook_redrive(6, index as u64, (*ptr).owner_id, (*ptr).entered,
+                    (*ptr).published, (*ptr).pump_key.is_some(), (*ptr).unowned_yield.is_some());
+            }
+            continue;
+        }
         if (*ptr).entered && !(*ptr).published {
             trace_port_source(81, &*ptr, 0);
         }
         advance_port_source(&mut *ptr);
+        if trace {
+            trace_hook_redrive(5, index as u64, owner_id,
+                false, false, false, false);
+        }
+    }
+    if trace {
+        trace_hook_redrive(7, class_count as u64, port_count as u64,
+            false, false, false, false);
     }
 }
 
