@@ -28114,6 +28114,21 @@ unsafe fn settle_suspended_connect_pumps() -> ConnectPumpSettlement {
 /// that recorded parent and never redispatches its original IRP.
 unsafe fn settle_suspended_file_pumps() -> ConnectPumpSettlement {
     use crate::driver_launch::GenericFilePumpDrive as Progress;
+    {
+        static COUNT: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        let returned = crate::driver_launch::returned_hook_pump_ready();
+        let generic = crate::driver_launch::generic_file_pump_unsettled();
+        let source = crate::driver_launch::hook_source_unsettled();
+        if (returned || generic || source)
+            && COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 32
+        {
+            print_str(b"[hook-root-settle] returned/generic/source=");
+            print_u64(u64::from(returned)); print_str(b"/");
+            print_u64(u64::from(generic)); print_str(b"/");
+            print_u64(u64::from(source)); print_str(b"\n");
+        }
+    }
     loop {
         if crate::driver_launch::returned_hook_pump_ready() {
             if !crate::driver_launch::redrive_returned_hook_pump() {

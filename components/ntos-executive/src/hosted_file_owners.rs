@@ -981,6 +981,35 @@ fn generic_orphans() -> &'static mut Vec<OrphanedGenericFilePump> {
     unsafe { &mut *core::ptr::addr_of_mut!(ORPHANED_GENERIC_FILE_PUMPS) }
 }
 
+/// Root-only census of the newest Hook File row considered for a child step.
+/// Flight: 1 preparing, 2 queued, 3 dispatch, 4 suspended, 5 returned,
+/// 6 copy, 7 cancel, 8 acknowledge, 9 idle, 10 blocked.
+fn trace_generic_file_selector(
+    owner: &Row, orphaned: bool, reserved: bool, authorities_live: bool,
+    key_matches: bool, child_ready: bool, retryable: bool, selected: bool,
+) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 32 { return; }
+    let flight = match owner.flight {
+        Flight::Preparing => 1, Flight::QueuedDispatch => 2, Flight::Dispatch => 3,
+        Flight::PumpSuspended => 4, Flight::PumpReturned => 5, Flight::Copy => 6,
+        Flight::Cancel => 7, Flight::Acknowledge => 8, Flight::Idle => 9,
+        Flight::Blocked => 10,
+    };
+    print_str(b"[hook-file-selector] row/irp/flight/claimed/authority/key/child/retry/orphan/reserve/selected=");
+    print_u64(owner.id); print_str(b"/0x");
+    print_hex_u64(owner.irp_id.map_or(0, |id| id.raw())); print_str(b"/");
+    print_u64(flight); print_str(b"/");
+    print_u64(u64::from(owner.hook_pump_claimed)); print_str(b"/");
+    print_u64(u64::from(authorities_live)); print_str(b"/");
+    print_u64(u64::from(key_matches)); print_str(b"/");
+    print_u64(u64::from(child_ready)); print_str(b"/");
+    print_u64(u64::from(retryable)); print_str(b"/");
+    print_u64(u64::from(orphaned)); print_str(b"/");
+    print_u64(u64::from(reserved)); print_str(b"/");
+    print_u64(u64::from(selected)); print_str(b"\n");
+}
+
 pub(super) fn generic_file_pump_unsettled() -> bool {
     !generic_orphans().is_empty() || rows().iter().any(|owner| {
         owner.hook_pump.is_some()
@@ -992,9 +1021,8 @@ pub(super) fn generic_file_pump_unsettled() -> bool {
 /// Claim the most recently created ready File child. A claimed parent cannot run a second
 /// child; the sealed receipt is kept until any inner File child has settled.
 pub(super) fn claim_suspended_generic_file_pump() -> Option<GenericFilePumpSelector> {
-    if !generic_orphans().is_empty() || generic_orphans().try_reserve(1).is_err() {
-        return None;
-    }
+    let orphaned = !generic_orphans().is_empty();
+    let reserved = !orphaned && generic_orphans().try_reserve(1).is_ok();
     let index = rows().iter().enumerate()
         .filter(|(_, owner)| owner.hook_pump.is_some()
             && matches!(owner.flight,
@@ -1002,12 +1030,22 @@ pub(super) fn claim_suspended_generic_file_pump() -> Option<GenericFilePumpSelec
         .max_by_key(|(_, owner)| owner.id)?.0;
     let owner = rows().get_mut(index)?;
         let identity = owner.hook_pump?;
-        if owner.flight != Flight::PumpSuspended || owner.hook_pump_claimed
-            || owner.irp_id.is_none() || !owner.authorities.iter().all(|a| a.live())
-            || !matches!(owner.payload.as_ref(), Some(Payload::PumpSuspended(pump))
-                if pump.invocation.key() == identity.current_key
-                    && pump.continuation.child_work_ready())
-        {
+        let authorities_live = owner.authorities.iter().all(|a| a.live());
+        let (key_matches, child_ready, retryable) =
+            match owner.payload.as_ref() {
+                Some(Payload::PumpSuspended(pump)) => (
+                    pump.invocation.key() == identity.current_key,
+                    pump.continuation.child_work_ready(),
+                    pump.continuation.retry_without_new_child(),
+                ),
+                _ => (false, false, false),
+            };
+        let selected = !orphaned && reserved
+            && owner.flight == Flight::PumpSuspended && !owner.hook_pump_claimed
+            && owner.irp_id.is_some() && authorities_live && key_matches && child_ready;
+        trace_generic_file_selector(owner, orphaned, reserved, authorities_live,
+            key_matches, child_ready, retryable, selected);
+        if !selected {
             return None;
         }
         owner.hook_pump_claimed = true;
