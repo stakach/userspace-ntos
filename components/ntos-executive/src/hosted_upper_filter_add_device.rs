@@ -7,6 +7,7 @@ use super::hosted_add_device_continuation::{
     dispatch_pdo_projection_progress,
 };
 use super::hosted_upper_filter_projection::AliasKind;
+use alloc::boxed::Box;
 
 static mut LEDGER: nt_pnp_manager::UpperFilterAttachmentLedger =
     nt_pnp_manager::UpperFilterAttachmentLedger::new();
@@ -57,6 +58,18 @@ struct ActiveFilter {
     phase: ActivePhase,
 }
 
+/// Reserve the large move-only owner before claiming any PnP or native resource. Box::new
+/// would turn heap exhaustion into a rootserver allocation panic after effects begin.
+fn try_allocate_active_filter(
+) -> Result<Box<core::mem::MaybeUninit<ActiveFilter>>, nt_status::NtStatus> {
+    let layout = core::alloc::Layout::new::<ActiveFilter>();
+    let pointer = unsafe { alloc::alloc::alloc(layout) };
+    if pointer.is_null() {
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    }
+    Ok(unsafe { Box::from_raw(pointer.cast::<core::mem::MaybeUninit<ActiveFilter>>()) })
+}
+
 impl ActiveFilter {
     fn prepared(&self) -> hosted_upper_filter_projection::PreparedUpperFilterProjection {
         self.prepared.expect("upper-filter aliases are not yet published")
@@ -69,7 +82,7 @@ impl ActiveFilter {
 pub(crate) struct UpperFilterAttachContinuation {
     key: nt_pnp_manager::UpperFilterAttachmentKey,
     instance_path: String,
-    active: Option<ActiveFilter>,
+    active: Option<Box<ActiveFilter>>,
     /// A claim may have entered before projection preparation refused. Keep its exact token
     /// even when no native pump was created; neither it nor a later ordered slot may replay.
     blocked_claim: Option<nt_pnp_manager::UpperFilterAttachmentClaim>,
@@ -212,6 +225,7 @@ impl UpperFilterAttachContinuation {
     }
 
     unsafe fn begin_next(&mut self) -> Result<bool, nt_status::NtStatus> {
+        let mut storage = try_allocate_active_filter()?;
         let Some(claim) = ledger().claim_next(hosted_pnp_manager_mut(), self.key)
             .map_err(ledger_status)? else { return Ok(false) };
         self.blocked_claim = Some(claim);
@@ -250,16 +264,16 @@ impl UpperFilterAttachContinuation {
                 return Err(status);
             }
         };
-        if ledger().mark_entered(hosted_pnp_manager_mut(), claim).is_err() {
+        let phase = if ledger().mark_entered(hosted_pnp_manager_mut(), claim).is_err() {
             hosted_upper_filter_projection::block_uncertain(owner_id);
-            self.active = Some(ActiveFilter { claim, owner_id, prepared: None,
-                class_instance, driver_index, driver_inst, rollback: None, banks,
-                transferred: false, phase: ActivePhase::Blocked });
+            ActivePhase::Blocked
         } else {
-            self.active = Some(ActiveFilter { claim, owner_id, prepared: None,
-                class_instance, driver_index, driver_inst, rollback: None, banks,
-                transferred: false, phase: ActivePhase::PdoProjectionReady });
-        }
+            ActivePhase::PdoProjectionReady
+        };
+        storage.as_mut_ptr().write(ActiveFilter { claim, owner_id, prepared: None,
+            class_instance, driver_index, driver_inst, rollback: None, banks,
+            transferred: false, phase });
+        self.active = Some(storage.assume_init());
         self.blocked_claim = None;
         Ok(true)
     }

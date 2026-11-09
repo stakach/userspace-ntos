@@ -7,6 +7,22 @@ const ROLLBACK: &str = include_str!("../../../components/ntos-executive/src/host
 const PUMP: &str = include_str!("../../../components/ntos-executive/src/hosted_add_device_continuation.rs");
 
 #[test]
+fn active_upper_filter_owner_is_heap_backed_before_entering_ledger() {
+    assert!(UPPER.contains("active: Option<Box<ActiveFilter>>"),
+        "a by-value active pump inflates every PnP and root ingress frame");
+    let begin = UPPER.split_once("unsafe fn begin_next(&mut self)")
+        .expect("upper-filter claim boundary").1
+        .split_once("unsafe fn finish_dispatch(")
+        .expect("dispatch boundary").0;
+    let allocate = begin.find("try_allocate_active_filter()")
+        .expect("fallible owner allocation");
+    let claim = begin.find("ledger().claim_next(")
+        .expect("ordered ledger claim");
+    assert!(allocate < claim,
+        "allocation must fail before a ledger, alias, page, or native effect can become uncertain");
+}
+
+#[test]
 fn upper_filter_dispatch_uses_a_typed_retained_child_work_pump() {
     let entered = UPPER.split_once("unsafe fn drive(mut self)")
         .expect("entered upper-filter continuation").1;
