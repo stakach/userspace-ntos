@@ -189,6 +189,8 @@ pub(crate) fn maybe_sample_gap(handler: &ExecNtHandler, now: u64) {
             if regs_valid {
                 print_str(b" rip="); print_hex_u64(regs[0]);
                 print_str(b" rsp="); print_hex_u64(regs[1]);
+                print_str(b" rdx="); print_hex_u64(regs[nt_user_callback::USER_CONTEXT_RDX]);
+                print_str(b" rsi="); print_hex_u64(regs[nt_user_callback::USER_CONTEXT_RSI]);
             }
             print_str(b"\n");
         }
