@@ -11493,6 +11493,7 @@ pub(crate) unsafe fn service_sec_image(
                 );
                 census_tick_static(now);
                 native_process_time_census::sample_after_census(&nt_handler);
+                installer_child_span_census::maybe_sample_gap(&nt_handler, now);
                 installer_child_span_census::print_census(&nt_handler);
                 if CENSUS_LAST_DUMP.load(Ordering::Relaxed) == now {
                 }

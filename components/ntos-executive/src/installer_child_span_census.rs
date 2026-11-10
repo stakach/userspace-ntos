@@ -2,16 +2,34 @@
 //! its first assigned PnP Enum open. Pending returns remain explicitly unresolved.
 
 use crate::*;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use nt_hosted_runtime::{CensusEpochGate, InstallerSyscallSpans, SpanOwner};
 
 const ROWS: usize = 8;
 const TOP: usize = 4;
 const CENSUS_LIMIT: u64 = 16;
+const GAP_THRESHOLD_100NS: u64 = 5 * 10_000_000;
+const GAP_SCAN_INTERVAL_100NS: u64 = 10_000_000;
+const GAP_REPEAT_INTERVAL_100NS: u64 = 5 * 10_000_000;
+const GAP_SAMPLES_PER_RETURN: u8 = 3;
+const GAP_SAMPLES_TOTAL: u64 = 64;
+
+#[derive(Clone, Copy)]
+struct GapSampleRecord {
+    owner: SpanOwner,
+    return_at: u64,
+    sampled_at: u64,
+}
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+static NEXT_GAP_SCAN_100NS: AtomicU64 = AtomicU64::new(0);
 static mut CENSUS_GATE: CensusEpochGate = CensusEpochGate::new(CENSUS_LIMIT);
 static mut SPANS: InstallerSyscallSpans<ROWS, TOP> = InstallerSyscallSpans::new();
+// Only the root loop appends to this finite diagnostic history. An old generation never
+// authorizes another sample; the total cap also bounds all native debug IPCs for the boot.
+static mut GAP_SAMPLES: [Option<GapSampleRecord>; GAP_SAMPLES_TOTAL as usize] =
+    [None; GAP_SAMPLES_TOTAL as usize];
+static mut GAP_SAMPLES_USED: usize = 0;
 
 fn exact_owner(handler: &ExecNtHandler, pi: usize, tid: u64, badge: u64) -> Option<SpanOwner> {
     if handler.hosted_thread_pi_for_badge(badge) != Some(pi)
@@ -77,6 +95,99 @@ pub(crate) fn returned(handler: &ExecNtHandler, owner: Option<SpanOwner>,
         owner, ssn, status, monotonic_time_100ns()) };
 }
 
+/// Claim before the native debug reads; nested observations cannot repeat an uncertain read.
+/// The return timestamp distinguishes consecutive gaps of the same exact thread.
+fn claim_gap_sample(owner: SpanOwner, return_at: u64, now: u64) -> bool {
+    let used = unsafe { *core::ptr::addr_of!(GAP_SAMPLES_USED) };
+    if used as u64 >= GAP_SAMPLES_TOTAL { return false; }
+    let history = unsafe { &*core::ptr::addr_of!(GAP_SAMPLES) };
+    let mut count = 0u8;
+    let mut last = 0u64;
+    for record in history[..used].iter().flatten() {
+        if record.owner == owner && record.return_at == return_at {
+            count += 1;
+            last = last.max(record.sampled_at);
+        }
+    }
+    if count >= GAP_SAMPLES_PER_RETURN
+        || (count != 0 && now.saturating_sub(last) < GAP_REPEAT_INTERVAL_100NS)
+    { return false; }
+    unsafe {
+        (&mut *core::ptr::addr_of_mut!(GAP_SAMPLES))[used] =
+            Some(GapSampleRecord { owner, return_at, sampled_at: now });
+        *core::ptr::addr_of_mut!(GAP_SAMPLES_USED) = used + 1;
+    }
+    true
+}
+
+/// Observe a live return-to-entry interval from the root loop's existing census opportunity.
+/// This does not add a wakeup: a gap with no root events cannot be physically sampled.
+pub(crate) fn maybe_sample_gap(handler: &ExecNtHandler, now: u64) {
+    if !ACTIVE.load(Ordering::Acquire) { return; }
+    let due = NEXT_GAP_SCAN_100NS.load(Ordering::Acquire);
+    if now < due || NEXT_GAP_SCAN_100NS.compare_exchange(due,
+        now.saturating_add(GAP_SCAN_INTERVAL_100NS), Ordering::AcqRel,
+        Ordering::Acquire).is_err() { return; }
+
+    // Copy value-only candidates before any debug IPC mutates the executive IPC buffer.
+    let mut candidates = [None; ROWS];
+    {
+        let ledger = unsafe { &*core::ptr::addr_of!(SPANS) };
+        for (slot, owner) in ledger.owners().enumerate() {
+            let Some(snapshot) = ledger.snapshot(owner, now) else { continue; };
+            if snapshot.active.is_some() || snapshot.pending.is_some() { continue; }
+            let Some(age) = snapshot.last_return_age_100ns else { continue; };
+            if age < GAP_THRESHOLD_100NS { continue; }
+            candidates[slot] = Some((owner, now.saturating_sub(age)));
+        }
+    }
+
+    for (owner, return_at) in candidates.into_iter().flatten() {
+        let Some(badge) = handler.hosted_thread_badge_for_tid(owner.thread_id) else { continue; };
+        if exact_owner(handler, owner.process_index, owner.thread_id, badge) != Some(owner) {
+            continue;
+        }
+        let Some(tcb) = handler.hosted_thread_tcb_for_badge(badge).filter(|tcb| *tcb > 1)
+            else { continue; };
+        if !claim_gap_sample(owner, return_at, now) { continue; }
+
+        let _message = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
+        let mut regs = [0u64; 20];
+        let regs_valid = unsafe { win32k_glue::tcb_read_regs20_checked(tcb, &mut regs) };
+        let mut state = [0u64; win32k_glue::TCB_DEBUG_STATE_WORDS];
+        unsafe { win32k_glue::tcb_read_debug_state(tcb, 0, &mut state) };
+
+        // A numeric TCB cap or badge is not identity. Do not attribute a sample to an
+        // owner that retired, changed generation, or entered another table call.
+        let still_same_gap = unsafe { (&*core::ptr::addr_of!(SPANS)).snapshot(owner, now) }
+            .is_some_and(|snapshot| snapshot.active.is_none()
+                && snapshot.pending.is_none()
+                && snapshot.last_return_age_100ns == Some(now.saturating_sub(return_at)));
+        if exact_owner(handler, owner.process_index, owner.thread_id, badge) == Some(owner)
+            && handler.hosted_thread_tcb_for_badge(badge) == Some(tcb)
+            && still_same_gap
+        {
+            print_str(b"[installer-child-gap-tcb] pi/pgen/tid/tgen/badge/tcb/return-at-100ns/sample-at-100ns/age-ms/regs-valid/state/sched/enqueued/active-sc/pending-reply/reply-to=");
+            for (index, value) in [owner.process_index as u64, owner.process_generation,
+                owner.thread_id, owner.thread_generation, badge, tcb,
+                return_at, now, now.saturating_sub(return_at) / 10_000,
+                u64::from(regs_valid),
+                state[win32k_glue::TCB_DBG_STATE], state[win32k_glue::TCB_DBG_SCHEDULABLE],
+                state[win32k_glue::TCB_DBG_ENQUEUED], state[win32k_glue::TCB_DBG_ACTIVE_SC],
+                state[win32k_glue::TCB_DBG_PENDING_REPLY], state[win32k_glue::TCB_DBG_REPLY_TO],
+            ].into_iter().enumerate() {
+                if index != 0 { print_str(b"/"); }
+                print_u64(value);
+            }
+            if regs_valid {
+                print_str(b" rip=0x"); print_hex_u64(regs[0]);
+                print_str(b" rsp=0x"); print_hex_u64(regs[1]);
+            }
+            print_str(b"\n");
+        }
+    }
+}
+
 /// Sparse 30-second sample, capped at sixteen census passes after activation.
 /// Only table dispatch is covered; retained pending owners have no terminal timestamp here.
 pub(crate) fn print_census(handler: &ExecNtHandler) {
@@ -136,6 +247,18 @@ pub(crate) fn print_census(handler: &ExecNtHandler) {
             print_u64(gap.total_100ns / 10_000); print_str(b"/");
             print_u64(gap.max_100ns / 10_000); print_str(b" ");
         }
+        print_str(b" transition-pairs/from-ssn/to-ssn/count/total-ms/max-ms=");
+        for pair in snapshot.top_transition_pairs.into_iter().flatten() {
+            print_u64(pair.from_ssn as u64); print_str(b"/");
+            print_u64(pair.to_ssn as u64); print_str(b"/");
+            print_u64(pair.calls); print_str(b"/");
+            print_u64(pair.total_100ns / 10_000); print_str(b"/");
+            print_u64(pair.max_100ns / 10_000); print_str(b" ");
+        }
+        print_str(b" pair-overflow/distinct-omitted/gaps-untracked/ms-untracked=");
+        print_u64(snapshot.overflow_transition_pairs); print_str(b"/");
+        print_u64(snapshot.untracked_transition_gaps); print_str(b"/");
+        print_u64(snapshot.untracked_transition_gap_100ns / 10_000);
         // This exact return-to-next-entry interval belongs to the pi/generation/tid above.
         // It excludes pending dispatch returns, whose terminal time is not observed here.
         print_str(b" longest-gap/present/from-ssn/from-status/to-ssn/from-at-100ns/to-at-100ns=");

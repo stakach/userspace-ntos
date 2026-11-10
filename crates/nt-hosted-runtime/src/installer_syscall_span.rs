@@ -1,6 +1,7 @@
 //! Bounded, value-only observation of exact installer-child native table calls.
 
 const SSN_CAP: usize = 512;
+const PAIR_CAP: usize = 128;
 const STATUS_PENDING: u32 = 0x103;
 
 /// One diagnostic sample per completed periodic census epoch after activation.
@@ -58,6 +59,17 @@ pub struct SsnTotal {
     pub max_100ns: u64,
 }
 
+/// Exact cumulative time from one nonpending table-dispatch return to the
+/// following table-dispatch entry for the same owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransitionPairTotal {
+    pub from_ssn: u32,
+    pub to_ssn: u32,
+    pub calls: u64,
+    pub total_100ns: u64,
+    pub max_100ns: u64,
+}
+
 /// The largest observed interval between a nonpending table-dispatch return
 /// and the next table-dispatch entry for one exact installer child. Pending returns have no
 /// terminal timestamp here and cannot create this receipt.
@@ -92,6 +104,13 @@ pub struct SpanSnapshot<const TOP: usize> {
     pub top: [Option<SsnTotal>; TOP],
     /// Return-to-next-entry gaps where both completed calls have the same SSN.
     pub same_ssn_gaps: [Option<SsnTotal>; TOP],
+    /// Exact observed pairs ranked by cumulative gap time.
+    pub top_transition_pairs: [Option<TransitionPairTotal>; TOP],
+    /// Tracked distinct pairs omitted from `top_transition_pairs`.
+    pub overflow_transition_pairs: u64,
+    /// Gap observations omitted when the fixed pair table was full.
+    pub untracked_transition_gaps: u64,
+    pub untracked_transition_gap_100ns: u64,
     /// Distinct observed SSNs omitted from `top`.
     pub overflow_ssns: u64,
     /// Completed calls outside the fixed canonical SSN range.
@@ -110,6 +129,20 @@ struct Counter { calls: u64, total_100ns: u64, max_100ns: u64 }
 impl Counter { const EMPTY: Self = Self { calls: 0, total_100ns: 0, max_100ns: 0 }; }
 
 #[derive(Clone, Copy)]
+struct PairCounter { key: Option<(u32, u32)>, counter: Counter }
+
+impl PairCounter {
+    const EMPTY: Self = Self { key: None, counter: Counter::EMPTY };
+
+    fn observe(&mut self, from_ssn: u32, to_ssn: u32, gap: u64) {
+        self.key = Some((from_ssn, to_ssn));
+        self.counter.calls = self.counter.calls.saturating_add(1);
+        self.counter.total_100ns = self.counter.total_100ns.saturating_add(gap);
+        self.counter.max_100ns = self.counter.max_100ns.max(gap);
+    }
+}
+
+#[derive(Clone, Copy)]
 struct Row {
     owner: Option<SpanOwner>,
     active: Option<ActiveSpan>,
@@ -123,6 +156,9 @@ struct Row {
     unindexed_calls: u64,
     counters: [Counter; SSN_CAP],
     same_ssn_gap_counters: [Counter; SSN_CAP],
+    transition_pairs: [PairCounter; PAIR_CAP],
+    untracked_transition_gaps: u64,
+    untracked_transition_gap_100ns: u64,
 }
 
 impl Row {
@@ -132,11 +168,14 @@ impl Row {
         total_gap_100ns: 0, longest_gap: None, unindexed_calls: 0,
         counters: [Counter::EMPTY; SSN_CAP],
         same_ssn_gap_counters: [Counter::EMPTY; SSN_CAP],
+        transition_pairs: [PairCounter::EMPTY; PAIR_CAP],
+        untracked_transition_gaps: 0, untracked_transition_gap_100ns: 0,
     };
 
     fn snapshot<const TOP: usize>(&self, owner: SpanOwner, now: u64) -> SpanSnapshot<TOP> {
         let (top, distinct) = top_counters(&self.counters);
         let (same_ssn_gaps, _) = top_counters(&self.same_ssn_gap_counters);
+        let (top_transition_pairs, tracked_pairs) = top_transition_pairs(&self.transition_pairs);
         SpanSnapshot {
             owner, completed: self.completed, retained_pending: self.retained_pending,
             unresolved_replaced: self.unresolved_replaced,
@@ -148,8 +187,26 @@ impl Row {
                 age_100ns: now.saturating_sub(span.at_100ns) }),
             pending: self.pending.map(|span| SpanSample { ssn: span.ssn,
                 age_100ns: now.saturating_sub(span.at_100ns) }),
-            top, same_ssn_gaps, overflow_ssns: distinct.saturating_sub(TOP as u64),
+            top, same_ssn_gaps, top_transition_pairs,
+            overflow_transition_pairs: tracked_pairs.saturating_sub(TOP as u64),
+            untracked_transition_gaps: self.untracked_transition_gaps,
+            untracked_transition_gap_100ns: self.untracked_transition_gap_100ns,
+            overflow_ssns: distinct.saturating_sub(TOP as u64),
             unindexed_calls: self.unindexed_calls,
+        }
+    }
+
+    fn observe_transition_pair(&mut self, from_ssn: u32, to_ssn: u32, gap: u64) {
+        if let Some(pair) = self.transition_pairs.iter_mut()
+            .find(|pair| pair.key == Some((from_ssn, to_ssn))) {
+            pair.observe(from_ssn, to_ssn, gap);
+        } else if let Some(pair) = self.transition_pairs.iter_mut()
+            .find(|pair| pair.key.is_none()) {
+            pair.observe(from_ssn, to_ssn, gap);
+        } else {
+            self.untracked_transition_gaps = self.untracked_transition_gaps.saturating_add(1);
+            self.untracked_transition_gap_100ns =
+                self.untracked_transition_gap_100ns.saturating_add(gap);
         }
     }
 }
@@ -166,6 +223,30 @@ fn top_counters<const TOP: usize>(counters: &[Counter; SSN_CAP])
         let Some(position) = top.iter().position(|slot: &Option<SsnTotal>| slot.is_none_or(|prior|
             (item.total_100ns, item.calls, core::cmp::Reverse(item.ssn))
                 > (prior.total_100ns, prior.calls, core::cmp::Reverse(prior.ssn))))
+            else { continue; };
+        for index in (position + 1..TOP).rev() { top[index] = top[index - 1]; }
+        top[position] = Some(item);
+    }
+    (top, distinct)
+}
+
+fn top_transition_pairs<const TOP: usize>(pairs: &[PairCounter; PAIR_CAP])
+    -> ([Option<TransitionPairTotal>; TOP], u64) {
+    let mut top = [None; TOP];
+    let mut distinct = 0u64;
+    for pair in pairs {
+        let Some((from_ssn, to_ssn)) = pair.key else { continue; };
+        distinct += 1;
+        let item = TransitionPairTotal {
+            from_ssn, to_ssn, calls: pair.counter.calls,
+            total_100ns: pair.counter.total_100ns,
+            max_100ns: pair.counter.max_100ns,
+        };
+        let Some(position) = top.iter().position(|slot: &Option<TransitionPairTotal>|
+            slot.is_none_or(|prior| (item.total_100ns, item.calls,
+                core::cmp::Reverse((item.from_ssn, item.to_ssn)))
+                > (prior.total_100ns, prior.calls,
+                    core::cmp::Reverse((prior.from_ssn, prior.to_ssn)))))
             else { continue; };
         for index in (position + 1..TOP).rev() { top[index] = top[index - 1]; }
         top[position] = Some(item);
@@ -226,6 +307,7 @@ impl<const N: usize, const TOP: usize> InstallerSyscallSpans<N, TOP> {
         if let Some(last) = row.last_return.take() {
             let gap = now.saturating_sub(last.at_100ns);
             row.total_gap_100ns = row.total_gap_100ns.saturating_add(gap);
+            row.observe_transition_pair(last.ssn, ssn, gap);
             if row.longest_gap.is_none_or(|prior| gap > prior.duration_100ns()) {
                 row.longest_gap = Some(LongestGap {
                     owner, from_ssn: last.ssn, from_status: last.status, to_ssn: ssn,
@@ -422,5 +504,85 @@ mod tests {
             to_ssn: 149, from_at_100ns: 1_000_100, to_at_100ns: 1_250_100 };
         assert_eq!(snapshot.longest_gap, Some(gap));
         assert_eq!(gap.duration_100ns(), snapshot.max_gap_100ns);
+    }
+
+    #[test]
+    fn transition_pairs_use_only_nonpending_returns_from_the_exact_owner() {
+        let mut ledger = InstallerSyscallSpans::<2, 2>::new();
+        assert!(ledger.activate(A));
+        assert!(ledger.begin(A, 700, 100));
+        assert!(ledger.return_from_dispatch(A, 700, 0xC000_0034, 110));
+        assert!(ledger.begin(A, 701, 210));
+        assert!(ledger.return_from_dispatch(A, 701, STATUS_PENDING, 220));
+        assert!(ledger.begin(A, 702, 1_220));
+        assert!(ledger.return_from_dispatch(A, 702, 0, 1_230));
+        assert!(ledger.begin(A, 700, 1_430));
+        let snapshot = ledger.snapshot(A, 1_430).unwrap();
+        assert_eq!(snapshot.top_transition_pairs[0], Some(TransitionPairTotal {
+            from_ssn: 702, to_ssn: 700, calls: 1,
+            total_100ns: 200, max_100ns: 200,
+        }));
+        assert_eq!(snapshot.top_transition_pairs[1], Some(TransitionPairTotal {
+            from_ssn: 700, to_ssn: 701, calls: 1,
+            total_100ns: 100, max_100ns: 100,
+        }));
+        assert_eq!(snapshot.total_gap_100ns, 300);
+
+        let newer = SpanOwner { process_generation: A.process_generation + 1, ..A };
+        assert!(ledger.activate(newer));
+        assert!(!ledger.begin(A, 701, 2_000));
+        assert_eq!(ledger.snapshot(A, 2_000), None);
+        assert!(ledger.begin(newer, 701, 2_100));
+        assert!(ledger.return_from_dispatch(newer, 701, 0, 2_110));
+        assert!(ledger.begin(newer, 702, 2_160));
+        let snapshot = ledger.snapshot(newer, 2_160).unwrap();
+        assert_eq!(snapshot.top_transition_pairs[0], Some(TransitionPairTotal {
+            from_ssn: 701, to_ssn: 702, calls: 1,
+            total_100ns: 50, max_100ns: 50,
+        }));
+        assert_eq!(snapshot.top_transition_pairs[1], None);
+
+        let recycled = SpanOwner { thread_generation: newer.thread_generation + 1, ..newer };
+        assert!(ledger.activate(recycled));
+        assert_eq!(ledger.snapshot(newer, 2_200), None);
+        assert_eq!(ledger.snapshot(recycled, 2_200).unwrap().top_transition_pairs[0], None);
+    }
+
+    #[test]
+    fn transition_pairs_accumulate_rank_and_report_bounded_overflow() {
+        let mut ledger = InstallerSyscallSpans::<1, 2>::new();
+        assert!(ledger.activate(A));
+        for (ssn, start) in [(900, 100), (901, 210), (900, 300),
+            (901, 530), (900, 600), (901, 840)] {
+            assert!(ledger.begin(A, ssn, start));
+            assert!(ledger.return_from_dispatch(A, ssn, 0, start + 10));
+        }
+        let snapshot = ledger.snapshot(A, 850).unwrap();
+        assert_eq!(snapshot.top_transition_pairs[0], Some(TransitionPairTotal {
+            from_ssn: 900, to_ssn: 901, calls: 3,
+            total_100ns: 550, max_100ns: 230,
+        }));
+        assert_eq!(snapshot.top_transition_pairs[1], Some(TransitionPairTotal {
+            from_ssn: 901, to_ssn: 900, calls: 2,
+            total_100ns: 80 + 60, max_100ns: 80,
+        }));
+        assert_eq!(snapshot.overflow_transition_pairs, 0);
+        assert_eq!(snapshot.untracked_transition_gaps, 0);
+
+        let mut bounded = InstallerSyscallSpans::<1, 2>::new();
+        assert!(bounded.activate(A));
+        for i in 0..(PAIR_CAP + 2) {
+            let start = 10 + i as u64 * 10;
+            let ssn = 1_000 + i as u32;
+            assert!(bounded.begin(A, ssn, start));
+            assert!(bounded.return_from_dispatch(A, ssn, 0, start + 1));
+        }
+        let snapshot = bounded.snapshot(A, 10_000).unwrap();
+        assert_eq!(snapshot.top_transition_pairs[0].unwrap().from_ssn, 1_000);
+        assert_eq!(snapshot.top_transition_pairs[1].unwrap().from_ssn, 1_001);
+        assert_eq!(snapshot.overflow_transition_pairs, (PAIR_CAP - 2) as u64);
+        assert_eq!(snapshot.untracked_transition_gaps, 1);
+        assert_eq!(snapshot.untracked_transition_gap_100ns, 9);
+        assert_eq!(snapshot.total_gap_100ns, (PAIR_CAP as u64 + 1) * 9);
     }
 }
