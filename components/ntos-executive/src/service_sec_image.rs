@@ -3820,20 +3820,20 @@ fn maybe_fold_system_wal() -> Result<(), u32> {
         retire_system_wal_fold_demand();
         return Ok(());
     }
-    let now = monotonic_time_100ns();
     let first_dirty = SYSTEM_WAL_FIRST_DIRTY_100NS.load(Ordering::Acquire);
     if first_dirty == 0 {
         // No epoch exists to fold. Retire stale timer demand without publishing a fold ACK.
         retire_system_wal_fold_demand();
         return Ok(());
     }
-    if !crate::wal_fold_cadence::background_fold_due(
-        first_dirty, now,
+    let Some(now) = crate::wal_fold_cadence::background_fold_due_time_if_owned(
+        Some(first_dirty),
         SYSTEM_WAL_USED_SECTORS.load(Ordering::Acquire),
         SYSTEM_WAL_CAPACITY_SECTORS.load(Ordering::Acquire),
-    ) {
+        monotonic_time_100ns,
+    ) else {
         return Ok(());
-    }
+    };
     let _transient = allocator::enter_transient();
     let _alloc_ctx = allocator::enter_context(allocator::ALLOC_CTX_WRITABLE_SNAPSHOT);
     let result = unsafe { crate::writable_fs::fold_system_wal_if_dirty() };

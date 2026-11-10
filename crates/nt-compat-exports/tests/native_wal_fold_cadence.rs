@@ -3,7 +3,35 @@
 #[path = "../../../components/ntos-executive/src/wal_fold_cadence.rs"]
 mod wal_fold_cadence;
 
-use wal_fold_cadence::{background_fold_due, next_background_fold_deadline, MAX_DIRTY_AGE_100NS};
+use wal_fold_cadence::{background_fold_due, background_fold_due_time_if_owned,
+    next_background_fold_deadline, MAX_DIRTY_AGE_100NS};
+
+#[test]
+fn background_fold_reads_time_only_for_a_dirty_wal_owner() {
+    let first_dirty = 10 * 10_000_000;
+    let mut reads = 0;
+    assert_eq!(background_fold_due_time_if_owned(None, 0, 4096, || {
+        reads += 1;
+        first_dirty + MAX_DIRTY_AGE_100NS
+    }), None);
+    assert_eq!(reads, 0);
+
+    assert_eq!(background_fold_due_time_if_owned(Some(first_dirty), 64, 4096, || {
+        reads += 1;
+        first_dirty + MAX_DIRTY_AGE_100NS - 1
+    }), None);
+    assert_eq!(reads, 1);
+    assert_eq!(background_fold_due_time_if_owned(Some(first_dirty), 64, 4096, || {
+        reads += 1;
+        first_dirty + MAX_DIRTY_AGE_100NS
+    }), Some(first_dirty + MAX_DIRTY_AGE_100NS));
+    assert_eq!(reads, 2);
+    assert_eq!(background_fold_due_time_if_owned(Some(first_dirty), 3072, 4096, || {
+        reads += 1;
+        first_dirty
+    }), Some(first_dirty));
+    assert_eq!(reads, 3);
+}
 
 #[test]
 fn small_durable_wal_records_coalesce_from_the_first_dirty_observation() {
