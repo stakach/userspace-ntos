@@ -14,6 +14,7 @@ use nt_memory_manager::RoutedSectionLease;
 use nt_process::native_handle::{NativeHandleCaller, NativeObjectReference,
     NativeThreadProcessReference, PsHandleType};
 use nt_user_host::provider_logical_caller::ProviderLogicalCaller;
+use nt_user_host::entered_spawn_abort::{AbortPhase, AliasFailure, EnteredSpawnAbort};
 
 const RESOURCES: u32 = nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
 const NOT_READY: u32 = 0xc000_00a3;
@@ -39,7 +40,7 @@ struct Capture {
 
 type ImageRead = RoutedImageRead<(ImageAreaId, RoutedSectionLease), u64, Capture>;
 
-enum Phase { Read, Spawn, ReadyReply, ReplyEntered, ReplySent,
+enum Phase { Read, Spawn, AbortChild, ReadyReply, ReplyEntered, ReplySent,
     RevokeReply, RetypeReply, ReconcileRuntime, Indeterminate }
 
 struct Work {
@@ -59,6 +60,11 @@ struct Work {
     phase: Phase,
     status: u32,
     published_handle: Option<u64>,
+    child_pi: Option<usize>,
+    child_refs: Option<hosted_spawn_uncertainty::ChildRefs>,
+    abort: Option<EnteredSpawnAbort>,
+    abort_revoke_entered: bool,
+    abort_retype_entered: bool,
     cancel_requested: bool,
     cancelled: bool,
 }
@@ -208,7 +214,9 @@ pub(crate) unsafe fn submit_routed_process_image(
         flags: handler.current_flags, native_call_transport: handler.current_native_call_transport,
         service_number: handler.current_service_number, logical,
         read: Some(read), capture: None, bytes: None, phase: Phase::Read,
-        status: 0, published_handle: None, cancel_requested: false, cancelled: false };
+        status: 0, published_handle: None, child_pi: None,
+        child_refs: None, abort: None, abort_revoke_entered: false,
+        abort_retype_entered: false, cancel_requested: false, cancelled: false };
     match index { Some(index) => rows[index] = Some(work), None => rows.push(Some(work)) }
     park.commit();
     WAKE.publish(monotonic_time_100ns());
@@ -221,7 +229,11 @@ pub(crate) fn take_transferred() -> bool { TRANSFERRED.swap(false, Ordering::Acq
 pub(crate) fn has_thread(tid: u64) -> bool {
     EXECUTING_TID.load(Ordering::Acquire) == tid || unsafe {
         (&*core::ptr::addr_of!(WORK)).iter().flatten().any(|work|
-            work.tid == tid && !matches!(work.phase, Phase::ReplySent | Phase::ReconcileRuntime))
+            (work.tid == tid && (work.abort.as_ref()
+                    .is_some_and(EnteredSpawnAbort::blocks_creator_teardown)
+                || !matches!(work.phase, Phase::ReplySent | Phase::ReconcileRuntime)))
+                || (work.child_refs.as_ref().is_some_and(|child| child.tid == tid)
+                    && work.abort.as_ref().is_none_or(EnteredSpawnAbort::blocks_child_teardown)))
     }
 }
 
@@ -229,8 +241,12 @@ pub(crate) fn has_process(pi: usize, preserve_tid: Option<u64>) -> bool {
     (EXECUTING_PI.load(Ordering::Acquire) == pi as u64
         && preserve_tid != Some(EXECUTING_TID.load(Ordering::Acquire))) || unsafe {
         (&*core::ptr::addr_of!(WORK)).iter().flatten().any(|work|
-            work.pi == pi && preserve_tid != Some(work.tid)
-                && !matches!(work.phase, Phase::ReplySent | Phase::ReconcileRuntime))
+            (work.pi == pi && preserve_tid != Some(work.tid)
+                && (work.abort.as_ref()
+                    .is_some_and(EnteredSpawnAbort::blocks_creator_teardown)
+                    || !matches!(work.phase, Phase::ReplySent | Phase::ReconcileRuntime)))
+                || (work.child_pi == Some(pi)
+                    && work.abort.as_ref().is_none_or(EnteredSpawnAbort::blocks_child_teardown)))
     }
 }
 
@@ -361,22 +377,66 @@ unsafe fn advance(
                 capture.parent_pid, capture.create, capture.desired_access, capture.output,
                 capture.previous_mode, view, work.bytes.take().expect("acknowledged PE bytes"));
             work.status = match result {
-                Ok(Some(request)) => match service_sec_image::publish_reserved_hosted_exe(
-                    request, catalog, loaded_images, ntdll, fault_ep, procs, handler, exe_images)
-                {
-                    Ok((handle, _)) => { work.published_handle = Some(handle); 0 },
-                    Err(service_sec_image::HostedExeSpawnError::Unentered(status)) => {
-                        if !handler.abort_unentered_native_image_process(request) {
+                Ok(Some(request)) => {
+                    // The snapshot already owns the original Reply and creator references.
+                    // Hold the exact child independently before any VSpace effect enters.
+                    let child = match hosted_spawn_uncertainty::prepare_child_refs(handler, request) {
+                        Ok(child) => child,
+                        Err(status) => {
+                            if !handler.abort_unentered_native_image_process(request) {
+                                work.status = status;
+                                work.phase = Phase::Indeterminate;
+                                return Step::Wait;
+                            }
+                            work.phase = Phase::ReadyReply;
+                            work.status = status;
+                            return Step::Progress;
+                        }
+                    };
+                    let child_pi = request.target.expect("reserved child target").pi;
+                    match service_sec_image::publish_reserved_hosted_exe(
+                        request, catalog, loaded_images, ntdll, fault_ep, procs, handler, exe_images)
+                    {
+                        Ok((handle, _)) => {
+                            hosted_spawn_uncertainty::release_child_refs(handler, child);
+                            work.published_handle = Some(handle);
+                            0
+                        },
+                        Err(service_sec_image::HostedExeSpawnError::Unentered(status)) => {
+                            hosted_spawn_uncertainty::release_child_refs(handler, child);
+                            if !handler.abort_unentered_native_image_process(request) {
+                                work.status = status;
+                                work.phase = Phase::Indeterminate;
+                                return Step::Wait;
+                            }
+                            status
+                        }
+                        Err(service_sec_image::HostedExeSpawnError::Entered(status)) => {
+                            work.child_pi = Some(child_pi);
+                            work.child_refs = Some(child);
                             work.status = status;
                             work.phase = Phase::Indeterminate;
                             return Step::Wait;
                         }
-                        status
-                    }
-                    Err(service_sec_image::HostedExeSpawnError::Entered(status)) => {
-                        work.status = status;
-                        work.phase = Phase::Indeterminate;
-                        return Step::Wait;
+                        Err(service_sec_image::HostedExeSpawnError::EnteredAbortable(status)) => {
+                            let abort = handler.process_mechanisms.get(child_pi)
+                                .filter(|mechanism| mechanism.pid == child.identity.pid
+                                    && nt_types::ProcessGeneration::Hosted(mechanism.generation)
+                                        == child.identity.generation
+                                    && u64::from(mechanism.main_tid) == child.tid)
+                                .and_then(|mechanism| EnteredSpawnAbort::begin(
+                                    mechanism, AliasFailure::Definite(status)).ok());
+                            work.child_pi = Some(child_pi);
+                            work.child_refs = Some(child);
+                            work.status = status;
+                            work.abort = abort;
+                            work.phase = if work.abort.is_some() {
+                                Phase::AbortChild
+                            } else {
+                                Phase::Indeterminate
+                            };
+                            return Step::Wait;
+                        }
                     }
                 },
                 Ok(None) => nt_fs::STATUS_INVALID_HANDLE,
@@ -388,6 +448,24 @@ unsafe fn advance(
             work.phase = Phase::ReadyReply;
             Step::Progress
         }
+        Phase::AbortChild => {
+            let abort = work.abort.as_mut().expect("definite child abort owner");
+            let child = abort.child();
+            match hosted_spawn_uncertainty::redrive_child_abort(
+                child, abort.phase(), work.status, delay_queue, handler)
+            {
+                hosted_spawn_uncertainty::ChildAbortObservation::Pending => Step::Wait,
+                hosted_spawn_uncertainty::ChildAbortObservation::ChildTerminated => {
+                    if abort.record_child_terminated(child).is_err() { return Step::Wait; }
+                    Step::Progress
+                }
+                hosted_spawn_uncertainty::ChildAbortObservation::ExecutionRetired(candidate) => {
+                    if abort.record_execution_retired(candidate).is_err() { return Step::Wait; }
+                    work.phase = Phase::ReadyReply;
+                    Step::Progress
+                }
+            }
+        }
         Phase::ReadyReply => {
             trace_image_not_supported(work, b"reply", work.status);
             if work.cancelled {
@@ -397,10 +475,19 @@ unsafe fn advance(
                     work.phase = Phase::Indeterminate;
                     return Step::Wait;
                 }
+                if let Some(abort) = work.abort.as_mut() {
+                    if abort.enter_revoke(abort.child(), true).is_err() {
+                        return Step::Wait;
+                    }
+                }
                 work.phase = Phase::RevokeReply;
                 return Step::Progress;
             }
             if parked_reply::validate_saved(work.reply).is_err() { return Step::Wait; }
+            if let Some(abort) = work.abort.as_mut() {
+                work.status = abort.enter_reply(abort.child())
+                    .expect("exact child retirement precedes original Reply");
+            }
             work.phase = Phase::ReplyEntered;
             if !reply_parked_syscall(work.reply, work.status as u64) { return Step::Wait; }
             work.phase = Phase::ReplySent;
@@ -412,29 +499,74 @@ unsafe fn advance(
                 work.phase = Phase::Indeterminate;
                 Step::Wait
             },
-            _ if work.cancelled => { work.phase = Phase::RevokeReply; Step::Progress },
+            _ if work.cancelled => {
+                if let Some(abort) = work.abort.as_mut() {
+                    if abort.enter_revoke(abort.child(), true).is_err() { return Step::Wait; }
+                }
+                work.phase = Phase::RevokeReply;
+                Step::Progress
+            },
             _ => Step::Wait,
         },
         Phase::ReplySent => {
             if parked_reply::retire_sent(work.reply).is_err() { return Step::Wait; }
+            if let Some(abort) = work.abort.as_mut() {
+                let child = abort.child();
+                abort.acknowledge_reply(child)
+                    .expect("retired original Reply acknowledges exact child");
+                abort.release_references(child)
+                    .expect("acknowledged original Reply releases child references");
+                hosted_spawn_uncertainty::release_child_refs(handler,
+                    work.child_refs.take().expect("aborted child wait references"));
+                work.child_pi = None;
+            }
             thread_wait_state_clear_badge_ready(handler, work.badge);
             release_capture(handler, work.capture.as_mut().expect("terminal process snapshot capture"));
             Step::Done
         }
         Phase::RevokeReply => {
-            if !spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(work.reply)
-                && parked_reply::revoke(work.reply).is_err() { return Step::Wait; }
+            let cancelled = spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(work.reply);
+            if work.abort.is_some() {
+                if !work.abort_revoke_entered {
+                    work.abort_revoke_entered = true;
+                    if !cancelled && parked_reply::revoke(work.reply).is_err() {
+                        return Step::Wait;
+                    }
+                } else if !cancelled {
+                    // The first native revoke may have taken effect despite its
+                    // error. Never replay it without an exact cancellation receipt.
+                    return Step::Wait;
+                }
+            } else if !cancelled && parked_reply::revoke(work.reply).is_err() {
+                return Step::Wait;
+            }
             work.phase = Phase::RetypeReply;
             Step::Progress
         }
         Phase::RetypeReply => {
+            if work.abort.is_some() && work.abort_retype_entered { return Step::Wait; }
+            work.abort_retype_entered = work.abort.is_some();
             if parked_reply::retype(work.reply).is_err() { return Step::Wait; }
+            if let Some(abort) = work.abort.as_mut() {
+                abort.acknowledge_revoke(abort.child())
+                    .expect("retyped original Reply revocation");
+            }
             work.phase = Phase::ReconcileRuntime;
             Step::Progress
         }
         Phase::ReconcileRuntime => {
             if !hosted_termination::reconcile(handler, delay_queue, work.logical) {
                 return Step::Wait;
+            }
+            if let Some(abort) = work.abort.as_mut() {
+                let child = abort.child();
+                abort.record_revoke_runtime_reconciled(child)
+                    .expect("reconciled creator runtime follows Reply revocation");
+                abort.release_references(child)
+                    .expect("reconciled revocation releases child references");
+                hosted_spawn_uncertainty::release_child_refs(handler,
+                    work.child_refs.take().expect("aborted child wait references"));
+                work.child_pi = None;
             }
             release_capture(handler, work.capture.as_mut().expect("cancelled process snapshot capture"));
             Step::Done

@@ -21,6 +21,13 @@ static ROOT_ALIAS_CAP: AtomicU64 = AtomicU64::new(0);
 static ROOT_ALIAS_COPY_STATE: AtomicU32 = AtomicU32::new(0);
 static READY: AtomicBool = AtomicBool::new(false);
 
+/// Whether a native root-page effect has an entered, unresolved owner.
+/// A known resource refusal can be retried; this state cannot.
+pub(crate) fn root_init_uncertain() -> bool {
+    FAILED_FRAME_SLOT.load(Ordering::Acquire) != 0
+        || ROOT_ALIAS_COPY_STATE.load(Ordering::Acquire) == 1
+}
+
 /// Return the one root-writable page. Synchronous native errors retain the
 /// allocated frame/cap so a later attempt cannot reuse an uncertain owner.
 ///

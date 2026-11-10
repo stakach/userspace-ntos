@@ -434,6 +434,34 @@ unsafe fn register_image_range_committed_mappings(
 const SEC_IMAGE_OWNED_MAPPING_CAPS: usize = 64;
 const SEC_IMAGE_OWNED_PLAIN_CAPS: usize = 16;
 
+/// Exact copy effect for the root-owned debug-filter frame's process alias.
+/// `Entered` is retained across any interruption until a native result is known.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DebugFilterAliasCopy {
+    Vacant,
+    Entered,
+    Present,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DebugFilterProcessAlias {
+    pub(crate) cap: u64,
+    pub(crate) copy: DebugFilterAliasCopy,
+    pub(crate) mapped: bool,
+    pub(crate) map_entered: bool,
+    pub(crate) vm_registered: bool,
+}
+
+impl DebugFilterProcessAlias {
+    pub(crate) const EMPTY: Self = Self {
+        cap: 0,
+        copy: DebugFilterAliasCopy::Vacant,
+        mapped: false,
+        map_entered: false,
+        vm_registered: false,
+    };
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct HostedProcessVspaceCaps {
     pub(crate) generation: u64,
@@ -448,6 +476,7 @@ pub(crate) struct HostedProcessVspaceCaps {
     pub(crate) mapped_unmapped: u64,
     pub(crate) plain: [u64; SEC_IMAGE_OWNED_PLAIN_CAPS],
     pub(crate) plain_len: usize,
+    pub(crate) debug_filter: DebugFilterProcessAlias,
 }
 
 impl HostedProcessVspaceCaps {
@@ -473,6 +502,7 @@ impl HostedProcessVspaceCaps {
             mapped_unmapped: 0,
             plain: [0; SEC_IMAGE_OWNED_PLAIN_CAPS],
             plain_len: 0,
+            debug_filter: DebugFilterProcessAlias::EMPTY,
         }
     }
 

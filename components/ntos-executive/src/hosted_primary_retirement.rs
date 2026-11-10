@@ -43,12 +43,6 @@ fn delete(effects: &mut Vec<Effect>, cap: u64) {
 fn append_debug_filter_cap_effects(effects: &mut Vec<Effect>, inst: DriverInstance) -> Option<()> {
     match (inst.debug_filter_map_cap, inst.debug_filter_copy_state) {
         (0, DebugFilterCopyState::Vacant) if !inst.debug_filter_map_established => {}
-        (cap, DebugFilterCopyState::KnownEmpty)
-            if cap != 0 && !inst.debug_filter_map_established => {
-                // The synchronous copy reported a known failure; this slot has
-                // no cap to delete, but still belongs to this instance.
-                effects.push(Effect::Recycle(cap));
-            }
         (cap, DebugFilterCopyState::Present) if cap != 0 => {
             if inst.debug_filter_map_established { effects.push(Effect::Unmap(cap)); }
             delete(effects, cap);

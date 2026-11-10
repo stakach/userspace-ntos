@@ -178,6 +178,10 @@ impl VSpaceUpdate {
                 && caps.mapped_unmapped == 0
                 && caps.mapped.iter().all(|cap| *cap == 0)
                 && caps.plain.iter().all(|cap| *cap == 0)
+                && caps.debug_filter.cap == 0
+                && caps.debug_filter.copy == crate::img_spawn::DebugFilterAliasCopy::Vacant
+                && !caps.debug_filter.mapped
+                && !caps.debug_filter.map_entered
         );
         let mut rows = self.store.borrow_mut();
         assert!(matches!(rows[self.pi], Slot::Updating));
@@ -228,6 +232,7 @@ mod tests {
             mapped_unmapped: 0,
             plain: [0; 16],
             plain_len: 0,
+            debug_filter: crate::img_spawn::DebugFilterProcessAlias::EMPTY,
         }
     }
     #[test]

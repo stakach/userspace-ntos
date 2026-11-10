@@ -805,6 +805,9 @@ diagnosis-free failure.
 - A larger diagnostic sample cap can expose names that were already reached in an earlier boot. Compare like-for-like counters and terminal milestones before calling those names new progress; a completed mounted CREATE is not proof that its SEC_IMAGE was loaded.
 - A sampled trace line is not necessarily the final operation. Record the total and latest request label, operation, and Reply at a periodic census before inferring a blocker from a sparse trace. A shared hosted-thread table can contain both SystemThread and DispatchWorker records; classify their physical kind before changing route selection. A dispatch worker's parked READY `0x771` Call can be normal reusable capacity.
 
+## Keep Failed Capability Slots Retained
+- A failed capability copy does not prove its destination slot stayed empty. Record the slot and entered copy before the call; retain both on any ambiguous error, and recycle only after a separate exact observation proves the slot vacant or the copied cap has been safely deleted.
+
 ## Keep Isolated Service Diagnostics Off Shared Image Statics
 - Object and Configuration Manager services map the shared root image read-only. A new atomic trace counter in `.bss` can pass a native build yet fault on its first isolated-service write. Keep per-service diagnostic budgets on private stack or owned heap state, and use a focused read-only-image regression before a boot.
 - An existing root helper can also write shared state: `monotonic_time_100ns()` records calls in a root static before reading the clock. Audit every helper invoked from an isolated service, including diagnostic helpers, for hidden static writes; use service-local data or serial ordering instead.

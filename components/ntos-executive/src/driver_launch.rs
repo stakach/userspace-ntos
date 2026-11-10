@@ -43604,7 +43604,8 @@ unsafe fn install_hosted_debug_filter_alias(
     driver_instances_mut()[instance].debug_filter_copy_state = DebugFilterCopyState::Entered;
     let copy_error = copy_cap_into_r(frame, cap);
     if copy_error != 0 {
-        driver_instances_mut()[instance].debug_filter_copy_state = DebugFilterCopyState::KnownEmpty;
+        // The error does not prove the destination slot was empty before copy.
+        // Retain its entered owner instead of recycling an unrelated cap.
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     }
     driver_instances_mut()[instance].debug_filter_copy_state = DebugFilterCopyState::Present;
@@ -63121,7 +63122,6 @@ fn hosted_video_object_number_from_path(path: &[u8]) -> Option<u32> {
 pub(crate) enum DebugFilterCopyState {
     Vacant,
     Entered,
-    KnownEmpty,
     Present,
 }
 

@@ -70,21 +70,13 @@ const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005;
 const STATUS_DATATYPE_MISALIGNMENT: NtStatus = 0x8000_0002;
 const STATUS_SXS_SECTION_NOT_FOUND: NtStatus = 0xC015_0001;
 const STATUS_SXS_KEY_NOT_FOUND: NtStatus = 0xC015_0008;
-#[cfg(not(target_arch = "x86_64"))]
-const DBG_TRUE: NtStatus = 1;
-#[cfg(not(target_arch = "x86_64"))]
-const DEBUG_FILTER_COMPONENTS: usize = 256;
 const TEB_DBGSS_RESERVED1_OFFSET: u64 = 0x16A8;
 const TEB_EXCEPTION_CODE_OFFSET: u64 = 0x2C0;
 const KUSER_SHARED_DATA_VA: usize = 0x7FFE_0000;
 
 #[cfg(not(target_arch = "x86_64"))]
-static DEBUG_FILTERS: [AtomicU32; DEBUG_FILTER_COMPONENTS] =
-    [const { AtomicU32::new(0) }; DEBUG_FILTER_COMPONENTS];
-#[cfg(not(target_arch = "x86_64"))]
-static DEBUG_FILTER_DEFAULT_MASK: AtomicU32 = AtomicU32::new(0);
-#[cfg(not(target_arch = "x86_64"))]
-static DEBUG_FILTER_WIN2000_MASK: AtomicU32 = AtomicU32::new(1);
+static HOST_DEBUG_FILTER_PAGE: nt_ntdll_layout::debug_filter::DebugFilterPage =
+    nt_ntdll_layout::debug_filter::DebugFilterPage::new();
 static RTL_UNHANDLED_EXCEPTION_FILTER: AtomicU64 = AtomicU64::new(0);
 static RTL_DLL_SHUTDOWN_IN_PROGRESS: AtomicU64 = AtomicU64::new(0);
 static RTL_PROCESS_COOKIE: nt_ntdll::rtl::encode::ProcessCookieCache =
@@ -236,17 +228,6 @@ static mut NLS_ANSI_DEFAULT_CHAR: u8 = b'?';
 static mut NLS_OEM_DEFAULT_CHAR: u8 = b'?';
 #[cfg(target_arch = "x86_64")]
 static mut NLS_UNICODE_DEFAULT_CHAR: u16 = b'?' as u16;
-
-#[cfg(not(target_arch = "x86_64"))]
-fn debug_filter_mask(component: u32) -> &'static AtomicU32 {
-    if component == u32::MAX {
-        &DEBUG_FILTER_WIN2000_MASK
-    } else if (component as usize) < DEBUG_FILTER_COMPONENTS {
-        &DEBUG_FILTERS[component as usize]
-    } else {
-        &DEBUG_FILTER_DEFAULT_MASK
-    }
-}
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn current_teb() -> u64 {
@@ -5509,7 +5490,7 @@ unsafe fn dbg_emit_variadic(format: *const u8, args: VaList<'_>) -> NtStatus {
 }
 
 fn dbg_print_filter_allows(component: u32, level: u32) -> bool {
-    if component == u32::MAX || level == nt_ntdll::dbg::level::ERROR {
+    if component == u32::MAX {
         return true;
     }
 
@@ -28225,9 +28206,7 @@ pub unsafe extern "system" fn rtl_reset_rtl_translations(nls_table: *const c_voi
 
 #[cfg(not(target_arch = "x86_64"))]
 fn debug_filter_enabled(component: u32, level: u32) -> bool {
-    let win2000 = DEBUG_FILTER_WIN2000_MASK.load(Ordering::Relaxed);
-    let component_mask = debug_filter_mask(component).load(Ordering::Relaxed);
-    nt_ntdll::dbg::debug_filter_state(win2000, component_mask, level)
+    HOST_DEBUG_FILTER_PAGE.query(component, level).unwrap_or(false)
 }
 
 /// `DbgPrintEx(ULONG ComponentId, ULONG Level, PCSTR Format, ...) -> ULONG`. Applies the native
@@ -28259,27 +28238,31 @@ pub unsafe extern "C" fn dbg_print_return_control_c(format: *const u8, args: ...
 
 /// `DbgQueryDebugFilterState(ULONG ComponentId, ULONG Level) -> NTSTATUS/BOOLEAN`.
 ///
-/// ReactOS forwards this to `NtQueryDebugFilterState`, whose successful query returns
-/// `(NTSTATUS)TRUE` or `(NTSTATUS)FALSE`. On target this calls the generated Nt stub and lets the
-/// executive's debug-filter service decide.
+/// ReactOS returns `(NTSTATUS)TRUE` or `(NTSTATUS)FALSE`. The native guest reads
+/// the root-owned mask page installed before its initial thread starts. A bad
+/// page version falls back to the canonical `NtQueryDebugFilterState` service.
 ///
 /// # Safety
-/// Pure scalar ABI.
+/// Native process startup must install the read-only filter page before this
+/// export can execute; the scalar arguments themselves need no probing.
 #[export_name = "DbgQueryDebugFilterState"]
 pub unsafe extern "system" fn dbg_query_debug_filter_state(component: u32, level: u32) -> NtStatus {
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: forwards to the generated NtQueryDebugFilterState native stub.
-        return unsafe {
-            nt_ntdll::trap_stubs::nt_query_debug_filter_state(component as u64, level as u64) as NtStatus
+        // SAFETY: process startup maps this page read-only before ntdll executes.
+        let page = unsafe {
+            &*(nt_ntdll_layout::debug_filter::HOSTED_USER_VA
+                as *const nt_ntdll_layout::debug_filter::DebugFilterPage)
         };
+        if let Some(enabled) = page.query(component, level) {
+            return u32::from(enabled);
+        }
+        // SAFETY: an incompatible page requires the executive's canonical decision.
+        return unsafe { nt_ntdll::trap_stubs::nt_query_debug_filter_state(
+            component as u64, level as u64) as NtStatus };
     }
     #[cfg(not(target_arch = "x86_64"))]
-    if debug_filter_enabled(component, level) {
-        DBG_TRUE
-    } else {
-        STATUS_SUCCESS
-    }
+    { u32::from(debug_filter_enabled(component, level)) }
 }
 
 /// `DbgSetDebugFilterState(ULONG ComponentId, ULONG Level, BOOLEAN State) -> NTSTATUS`.
@@ -28301,14 +28284,10 @@ pub unsafe extern "system" fn dbg_set_debug_filter_state(
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let mask = nt_ntdll::dbg::debug_filter_level_mask(level);
-        let cell = debug_filter_mask(component);
-        if state != 0 {
-            cell.fetch_or(mask, Ordering::Relaxed);
-        } else {
-            cell.fetch_and(!mask, Ordering::Relaxed);
+        match HOST_DEBUG_FILTER_PAGE.set(component, level, state as u8 != 0, true) {
+            Ok(()) => STATUS_SUCCESS,
+            Err(_) => STATUS_UNSUCCESSFUL,
         }
-        STATUS_SUCCESS
     }
 }
 

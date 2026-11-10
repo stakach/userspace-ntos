@@ -77,6 +77,94 @@ mod process_information_native;
 pub(crate) use process_information_native::service_win32k_process_query_request;
 
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
+const PRIMARY_ALIAS_RETRY_DELAY_100NS: u64 = 10_000_000;
+static PRIMARY_ALIAS_RETRY_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+static PRIMARY_ALIAS_RETRY_WAKE_PENDING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn primary_alias_retry_deadline() -> Option<u64> {
+    let deadline = PRIMARY_ALIAS_RETRY_DEADLINE.load(Ordering::Acquire);
+    (deadline != u64::MAX).then_some(deadline)
+}
+
+/// The timer owner only records demand. The service loop owns the exact TCB and
+/// process generation and is the only place that may retry the native effect.
+pub(crate) fn primary_alias_retry_wake_due(now: u64) -> u64 {
+    let Some(deadline) = primary_alias_retry_deadline() else { return 0 };
+    if now < deadline { return 0; }
+    if PRIMARY_ALIAS_RETRY_DEADLINE.compare_exchange(
+        deadline, u64::MAX, Ordering::AcqRel, Ordering::Acquire,
+    ).is_err() { return 0; }
+    PRIMARY_ALIAS_RETRY_WAKE_PENDING.store(true, Ordering::Release);
+    1
+}
+
+#[cfg(not(feature = "mup-provider-kernel-only"))]
+unsafe fn attempt_primary_alias_activation(
+    handler: &mut ExecNtHandler,
+    activation: &mut nt_hosted_runtime::PrimaryAliasActivation,
+) {
+    let owner = activation.owner();
+    if !activation.ready(owner) { return; }
+    if handler.hosted_process_generation(owner.process_index) != Some(owner.process_generation) {
+        activation.fail_uncertain(owner);
+        print_str(b"[debug-filter] primary owner changed before alias installation\n");
+        return;
+    }
+    match hosted_debug_filter_process::install_hosted_user_alias(handler, owner.process_index) {
+        Ok(()) => {
+            let resume_error = handler.start_configured_initial_thread(owner.process_index, owner.tcb);
+            if resume_error != 0 {
+                // Initial-thread creation can have entered native effects. Do not
+                // replay it from a timer merely because it returned an error.
+                activation.fail_uncertain(owner);
+                print_str(b"[thread-life] primary resume after alias installation failed pi=");
+                print_u64(owner.process_index as u64);
+                print_str(b" error=");
+                print_u64(u64::from(resume_error));
+                print_str(b"\n");
+                return;
+            }
+            activation.start(owner);
+            if let Some(tid) = handler.pm_main_tid_for_pi(owner.process_index) {
+                handler.observe_desktop_thread_activation(u64::from(tid));
+            }
+        }
+        Err(error) if error.retained_uncertain => {
+            activation.fail_uncertain(owner);
+            print_str(b"[debug-filter] primary alias retained uncertain pi=");
+            print_u64(owner.process_index as u64);
+            print_str(b" status=0x");
+            print_hex(error.status);
+            print_str(b"\n");
+        }
+        Err(error) => {
+            let now = monotonic_time_100ns();
+            let deadline = activation.fail_definitive(
+                owner, now, PRIMARY_ALIAS_RETRY_DELAY_100NS,
+            ).expect("ready exact primary alias owner");
+            PRIMARY_ALIAS_RETRY_DEADLINE.store(deadline, Ordering::Release);
+            let rearm = rearm_registered_delay_timer();
+            print_str(b"[debug-filter] primary alias retry pi=");
+            print_u64(owner.process_index as u64);
+            print_str(b" status=0x");
+            print_hex(error.status);
+            print_str(b" timer=");
+            print_u64(rearm.owner_available() as u64);
+            print_str(b"\n");
+        }
+    }
+}
+
+#[cfg(not(feature = "mup-provider-kernel-only"))]
+unsafe fn service_primary_alias_retry(
+    handler: &mut ExecNtHandler,
+    activation: &mut nt_hosted_runtime::PrimaryAliasActivation,
+) {
+    if !PRIMARY_ALIAS_RETRY_WAKE_PENDING.swap(false, Ordering::AcqRel) { return; }
+    let owner = activation.owner();
+    if !activation.wake_due(owner, monotonic_time_100ns()) { return; }
+    attempt_primary_alias_activation(handler, activation);
+}
 static FILE_IO_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
 static PIPE_TRANSCEIVE_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut FILE_IO_COPY_WORK: [u8; 4096] = [0; 4096];
@@ -8178,6 +8266,7 @@ unsafe fn hosted_exe_spawn_for<'a>(
 pub(crate) enum HostedExeSpawnError {
     Unentered(u32),
     Entered(u32),
+    EnteredAbortable(u32),
 }
 
 pub(crate) unsafe fn publish_reserved_hosted_exe(
@@ -8251,6 +8340,12 @@ unsafe fn spawn_requested_hosted_exe(
     }
     nt_handler.register_main_thread_spawn(pi, child_spawn)
         .map_err(HostedExeSpawnError::Entered)?;
+    hosted_debug_filter_process::install_hosted_user_alias(nt_handler, pi)
+        .map_err(|error| if error.retained_uncertain {
+            HostedExeSpawnError::Entered(error.status)
+        } else {
+            HostedExeSpawnError::EnteredAbortable(error.status)
+        })?;
     procs[pi].img_base = spec.layout.base();
     procs[pi].img_end = spec.layout.end();
     procs[pi].scratch_base = spec.runtime.scratch_base;
@@ -10323,23 +10418,21 @@ pub(crate) unsafe fn service_sec_image(
     }
     nt_handler.capture_desktop_launch_contract();
     #[cfg(not(feature = "mup-provider-kernel-only"))]
-    {
-        let resume_error = nt_handler.start_configured_initial_thread(primary_pi, main_tcb);
-        if resume_error != 0 {
-            print_str(b"[thread-life] primary resume after service init failed pi=");
-            print_u64(primary_pi as u64);
-            print_str(b" tcb=0x");
-            print_hex((main_tcb >> 32) as u32);
-            print_hex(main_tcb as u32);
-            print_str(b" error=");
-            print_u64(u64::from(resume_error));
-            print_str(b"\n");
-            panic!("primary hosted process resume failed");
-        }
-        if let Some(tid) = nt_handler.pm_main_tid_for_pi(primary_pi) {
-            nt_handler.observe_desktop_thread_activation(u64::from(tid));
-        }
-    }
+    let mut primary_alias_activation = {
+        let primary_alias_owner = nt_hosted_runtime::PrimaryAliasOwner {
+            process_index: primary_pi,
+            process_generation: nt_handler.hosted_process_generation(primary_pi)
+                .expect("primary process retains its generation"),
+            tcb: main_tcb,
+        };
+        let mut activation = nt_hosted_runtime::PrimaryAliasActivation::new(
+            primary_alias_owner,
+        ).expect("primary process retains its TCB and generation");
+        PRIMARY_ALIAS_RETRY_DEADLINE.store(u64::MAX, Ordering::Release);
+        PRIMARY_ALIAS_RETRY_WAKE_PENDING.store(false, Ordering::Release);
+        attempt_primary_alias_activation(&mut nt_handler, &mut activation);
+        activation
+    };
     #[cfg(feature = "mup-provider-kernel-only")]
     print_str(b"[mup-provider-gate] SMSS remains suspended during native driver proof\n");
     // Every blocking ingress rechecks retained work, including early fault/refusal branches.
@@ -10697,6 +10790,9 @@ pub(crate) unsafe fn service_sec_image(
     receive_vspace::install(nt_handler.hosted_vspace_observer());
     let mut receive_boundary = None;
     'service_loop: loop {
+        #[cfg(not(feature = "mup-provider-kernel-only"))]
+        service_primary_alias_retry(&mut nt_handler, &mut primary_alias_activation);
+        hosted_spawn_uncertainty::redrive(&mut *delay_queue, &mut nt_handler);
         macro_rules! component_receive_outcome {
             ($outcome:expr) => {{
                 match $outcome {
@@ -11512,6 +11608,8 @@ pub(crate) unsafe fn service_sec_image(
         if pump_ticks != 0 {
             PUMP_TIMER_TICKS_DRAINED.fetch_add(pump_ticks, Ordering::Relaxed);
             delay_timer_interrupt(&mut *delay_queue, &mut nt_handler);
+            #[cfg(not(feature = "mup-provider-kernel-only"))]
+            service_primary_alias_retry(&mut nt_handler, &mut primary_alias_activation);
             let _ = pump_hosted_io_and_redrive_driver_starts(
                 driver_launch::drain_hosted_driver_dpcs(),
                 &mut nt_handler,
@@ -11537,6 +11635,8 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b"\n");
             }
             delay_timer_interrupt(&mut *delay_queue, &mut nt_handler);
+            #[cfg(not(feature = "mup-provider-kernel-only"))]
+            service_primary_alias_retry(&mut nt_handler, &mut primary_alias_activation);
             let _ = pump_hosted_io_and_redrive_driver_starts(
                 driver_launch::drain_hosted_driver_dpcs(),
                 &mut nt_handler,
@@ -15552,6 +15652,11 @@ pub(crate) unsafe fn service_sec_image(
                             }
                             Err(HostedExeSpawnError::Entered(status)) => {
                                 hosted_spawn_uncertainty::retain_entered(prepared, status);
+                            }
+                            Err(HostedExeSpawnError::EnteredAbortable(status)) => {
+                                hosted_spawn_uncertainty::retain_definite(
+                                    &nt_handler, prepared, status,
+                                );
                             }
                         },
                         Err(status) => {

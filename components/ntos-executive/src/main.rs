@@ -223,6 +223,7 @@ pub(crate) use win32k_glue::*;
 pub(crate) use win32k_session_runtime::*;
 mod driver_launch;
 mod debug_filter_shared;
+mod hosted_debug_filter_process;
 mod hosted_driver_assertion;
 pub(crate) use driver_launch::*;
 
@@ -3125,6 +3126,8 @@ const DELAY_TIMER_SOURCE_HOSTED_PROVIDER_STARTUP_RESTORE: u64 = 30;
 const DELAY_TIMER_SOURCE_NESTED_ACQUIRE_ABORT: u64 = 31;
 const DELAY_TIMER_SOURCE_HOSTED_IRQ_RETRY: u64 = 33;
 const DELAY_TIMER_SOURCE_ROOT_ADD_DEVICE_RETRY: u64 = 34;
+const DELAY_TIMER_SOURCE_PRIMARY_ALIAS_RETRY: u64 = 35;
+const DELAY_TIMER_SOURCE_HOSTED_SPAWN_ABORT: u64 = 36;
 const DELAY_TIMER_SOURCE_WIN32K_STARTUP_RESTORE: u64 = 32;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
@@ -17331,6 +17334,8 @@ unsafe fn delay_timer_next_deadline(
         job_time: handler.job_time_sample_next_deadline(),
         component_resume: service_sec_image::component_resume::next_deadline(&handler.pm),
         root_add_device: service_sec_image::root_add_device_retry_deadline(),
+        primary_alias: service_sec_image::primary_alias_retry_deadline(),
+        hosted_spawn_abort: hosted_spawn_uncertainty::next_deadline(),
     })
 }
 
@@ -17653,6 +17658,8 @@ unsafe fn delay_timer_drain_due_work(
         ))
         + timer_retry_wake_due(now_100ns)
         + service_sec_image::root_add_device_retry_wake_due(now_100ns)
+        + service_sec_image::primary_alias_retry_wake_due(now_100ns)
+        + hosted_spawn_uncertainty::wake_due(queue, handler, now_100ns)
         + service_sec_image::component_resume::wake_due(&handler.pm, now_100ns)
         + driver_launch::hosted_dpc_wake_due(now_100ns)
         + driver_launch::hosted_driver_pnp_notification_wake_due()
@@ -18614,6 +18621,25 @@ unsafe fn release_sec_image_vspace_caps(
 unsafe fn release_sec_image_vspace_leaves(
     owner: &mut img_spawn::HostedProcessVspaceCaps,
 ) -> bool {
+    let alias = &mut owner.debug_filter;
+    match alias.copy {
+        img_spawn::DebugFilterAliasCopy::Vacant => {
+            if alias.cap != 0 || alias.mapped || alias.map_entered { return false; }
+        }
+        img_spawn::DebugFilterAliasCopy::Entered => return false,
+        img_spawn::DebugFilterAliasCopy::Present => {
+            if alias.cap == 0 { return false; }
+            if alias.map_entered && !alias.mapped { return false; }
+            if alias.mapped {
+                if page_unmap_r(alias.cap) != 0 { return false; }
+                alias.mapped = false;
+                alias.map_entered = false;
+            }
+            if cnode_delete_recycle_r(alias.cap) != 0 { return false; }
+            alias.cap = 0;
+            alias.copy = img_spawn::DebugFilterAliasCopy::Vacant;
+        }
+    }
     while owner.mapped_len != 0 {
         let index = owner.mapped_len - 1;
         let cap = owner.mapped[index];
