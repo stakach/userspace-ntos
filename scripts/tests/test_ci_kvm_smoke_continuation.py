@@ -1,6 +1,7 @@
 """A writable KVM disk resumes only from a stopped exact-source run."""
 
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -99,7 +100,7 @@ class ContinuationTests(unittest.TestCase):
     def test_mismatched_provenance_size_or_hash_preserves_generated_disk(self):
         for key, value in (("submodule_sha", "0" * 40),
                            ("libernt_manifest_sha256", "0" * 64),
-                           ("base_disk_sha256", "0" * 64),
+                           ("base_disk_sha256", "bad"),
                            ("qemu_stopped", False),
                            ("disk_size_bytes", 12),
                            ("disk_sha256", "0" * 64)):
@@ -110,6 +111,20 @@ class ContinuationTests(unittest.TestCase):
                     self.restore()
                 self.assertEqual(self.paths["DISK"].read_bytes(), self.baseline)
                 self.assertFalse(self.paths["BACKUP"].exists())
+
+    def test_source_and_current_generated_baselines_can_have_different_bytes(self):
+        self.manifest["base_disk_sha256"] = sha(b"source Simpleboot GUID and timestamp")
+        self.paths["IN"].joinpath("manifest.json").write_text(json.dumps(self.manifest))
+        self.restore()
+        self.assertEqual(self.paths["DISK"].read_bytes(), self.advanced)
+        self.assertEqual(self.paths["BACKUP"].read_bytes(), self.baseline)
+
+    def test_source_run_lookup_uses_the_requested_attempt(self):
+        response = io.BytesIO(b'{"id": 101}')
+        with patch.object(disk.urllib.request, "urlopen", return_value=response) as lookup:
+            self.assertEqual(disk.api_run(101, 2, "token", self.current["repo"]), {"id": 101})
+        request = lookup.call_args.args[0]
+        self.assertTrue(request.full_url.endswith("/actions/runs/101/attempts/2"))
 
     def test_symlink_disk_is_rejected_before_replacing_baseline(self):
         incoming = self.paths["IN"] / "disk.img"
@@ -153,6 +168,15 @@ class ContinuationTests(unittest.TestCase):
         self.assertTrue(self.paths["ROLLBACK_MARKER"].exists())
         with patch.object(disk, "stopped"), self.assertRaises(disk.ContinuationError):
             disk.rollback()
+
+    def test_rollback_marker_failure_does_not_overwrite_restored_baseline(self):
+        self.restore()
+        self.paths["ROLLBACK_MARKER"].mkdir()
+        with patch.object(disk, "stopped"), patch.object(disk, "no_qemu_owner"), \
+             self.assertRaises(OSError):
+            disk.rollback()
+        self.assertEqual(self.paths["DISK"].read_bytes(), self.baseline)
+        self.assertEqual(self.paths["FAILED"].read_bytes(), self.advanced)
 
 
 if __name__ == "__main__":

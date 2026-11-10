@@ -115,11 +115,11 @@ def read_manifest(path: Path) -> dict:
     return value
 
 
-def api_run(run_id: int, token: str, repo: str) -> dict:
+def api_run(run_id: int, attempt: int, token: str, repo: str) -> dict:
     if not token or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
         raise ContinuationError("invalid Actions API authority")
     request = urllib.request.Request(
-        f"https://api.github.com/repos/{repo}/actions/runs/{run_id}",
+        f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/attempts/{attempt}",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
                  "X-GitHub-Api-Version": "2022-11-28"},
     )
@@ -154,7 +154,7 @@ def verify_manifest(value: dict, run_id: int, attempt: int, current: dict) -> No
         "source_repo": current["repo"], "workflow": WORKFLOW,
     }
     expected.update({key: current[key] for key in (
-        "submodule_sha", "libernt_manifest_sha256", "base_disk_sha256",
+        "submodule_sha", "libernt_manifest_sha256",
         "disk_size_bytes", "rootserver_sha256", "kernel_sha256",
         "ntdll_sha256", "image_profile",
     )})
@@ -164,6 +164,11 @@ def verify_manifest(value: dict, run_id: int, attempt: int, current: dict) -> No
     if not isinstance(value.get("disk_sha256"), str) \
         or not SHA256.fullmatch(value["disk_sha256"]):
         raise ContinuationError("continuation disk digest is invalid")
+    # Simpleboot seeds GUIDs and FAT timestamps at image creation. Each run checks
+    # its own generated baseline receipt; byte equality across builds is not identity.
+    if not isinstance(value.get("base_disk_sha256"), str) \
+        or not SHA256.fullmatch(value["base_disk_sha256"]):
+        raise ContinuationError("source generated-disk digest is invalid")
     if value.get("qemu_stopped") is not True:
         raise ContinuationError("source QEMU stop receipt absent")
 
@@ -227,7 +232,7 @@ def expected_build_after_boot() -> dict:
 
 def restore(run_id: int, attempt: int, token: str) -> None:
     current = expected_build()
-    verify_run(api_run(run_id, token, current["repo"]), run_id, attempt, current)
+    verify_run(api_run(run_id, attempt, token, current["repo"]), run_id, attempt, current)
     if not stat.S_ISDIR(IN.lstat().st_mode):
         raise ContinuationError("continuation input is not a real directory")
     manifest = read_manifest(IN / "manifest.json")
@@ -264,10 +269,10 @@ def rollback() -> None:
     os.replace(DISK, FAILED)
     try:
         os.replace(BACKUP, DISK)
-        ROLLBACK_MARKER.write_text("resumed boot failed; generated disk restored\n")
     except BaseException:
         os.replace(FAILED, DISK)
         raise
+    ROLLBACK_MARKER.write_text("resumed boot failed; generated disk restored\n")
 
 
 def read_json_receipt() -> dict:
@@ -302,7 +307,7 @@ def main() -> None:
                        "repo": os.environ["GITHUB_REPOSITORY"]}
             if current["head_sha"] != os.environ["GITHUB_SHA"]:
                 raise ContinuationError("checkout is not the workflow event head")
-            verify_run(api_run(args.run_id, token, current["repo"]),
+            verify_run(api_run(args.run_id, args.attempt, token, current["repo"]),
                        args.run_id, args.attempt, current)
         else:
             restore(args.run_id, args.attempt, token)
