@@ -8150,7 +8150,7 @@ pub(crate) unsafe fn tcb_read_regs20_checked(tcb: u64, out: &mut [u64; 20]) -> b
     true
 }
 
-pub(crate) const TCB_DEBUG_STATE_WORDS: usize = 29;
+pub(crate) const TCB_DEBUG_STATE_WORDS: usize = 34;
 pub(crate) const TCB_DEBUG_NONE: u64 = u64::MAX;
 pub(crate) const TCB_DBG_STATE: usize = 0;
 pub(crate) const TCB_DBG_SCHEDULABLE: usize = 1;
@@ -8181,6 +8181,11 @@ pub(crate) const TCB_DBG_DOMAIN: usize = 25;
 pub(crate) const TCB_DBG_CURRENT_DOMAIN: usize = 26;
 pub(crate) const TCB_DBG_QUEUE_TOP_PRIORITY: usize = 27;
 pub(crate) const TCB_DBG_DIRECT_HANDOFF: usize = 28;
+pub(crate) const TCB_DBG_CALL_REPLY_KIND: usize = 29;
+pub(crate) const TCB_DBG_CALL_REPLY_INDEX: usize = 30;
+pub(crate) const TCB_DBG_CALL_RECEIVER_TCB: usize = 31;
+pub(crate) const TCB_DBG_CALL_RECEIVER_CSPACE: usize = 32;
+pub(crate) const TCB_DBG_CALL_RECEIVER_STATE: usize = 33;
 
 fn print_tcb_debug_opt(value: u64) {
     if value == TCB_DEBUG_NONE {
@@ -8207,6 +8212,16 @@ fn print_tcb_debug_state_body(state: &[u64; TCB_DEBUG_STATE_WORDS]) {
     print_tcb_debug_opt(state[TCB_DBG_PENDING_REPLY]);
     print_str(b" reply_to=");
     print_tcb_debug_opt(state[TCB_DBG_REPLY_TO]);
+    print_str(b" call_reply_kind/index/receiver/cspace/state=");
+    print_u64(state[TCB_DBG_CALL_REPLY_KIND]);
+    print_str(b"/");
+    print_tcb_debug_opt(state[TCB_DBG_CALL_REPLY_INDEX]);
+    print_str(b"/");
+    print_tcb_debug_opt(state[TCB_DBG_CALL_RECEIVER_TCB]);
+    print_str(b"/");
+    print_tcb_debug_opt(state[TCB_DBG_CALL_RECEIVER_CSPACE]);
+    print_str(b"/");
+    print_tcb_debug_opt(state[TCB_DBG_CALL_RECEIVER_STATE]);
     print_str(b" ntfn=");
     print_tcb_debug_opt(state[TCB_DBG_BOUND_NOTIFICATION]);
     print_str(b" call=");
