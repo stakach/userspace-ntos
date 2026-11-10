@@ -471,7 +471,7 @@ pub(crate) unsafe fn prepare_root_maintenance_yield(
         || channel.caps.kind != crate::spawn_hosts::ReqKind::Syscall
         || crate::writable_fs::registry_journal::owns_volume()
         || runtime::receive_child_pending()
-        || !crate::process_image_snapshot_work::due_for_outer(monotonic_time_100ns())
+        || !crate::process_image_snapshot_work::due_for_outer_with_clock(monotonic_time_100ns)
     {
         return Ok(None);
     }

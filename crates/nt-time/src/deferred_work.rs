@@ -66,6 +66,17 @@ impl CoalescedRetryWake {
         has_work && now >= self.deadline.load(Ordering::Acquire)
     }
 
+    /// Defer the clock read until the caller has found a retained owner. The due decision
+    /// still uses a fresh sample and the latest deadline under the same writer lock.
+    pub fn due_for_outer_with_clock(
+        &self,
+        has_work: bool,
+        clock: impl FnOnce() -> u64,
+    ) -> bool {
+        if !has_work { return false; }
+        self.due_for_outer(clock(), true)
+    }
+
     /// The timer may announce due work once; it never claims or drops the retained owner.
     pub fn wake_due(&self, now: u64, has_work: bool) -> bool {
         let _writer = self.writer();
@@ -377,6 +388,38 @@ mod tests {
         wake.publish(200);
         assert!(!wake.due_for_outer(199, true));
         assert!(wake.due_for_outer(200, true));
+    }
+
+    #[test]
+    fn empty_outer_probe_skips_clock_and_due_probe_uses_current_publication() {
+        use core::cell::Cell;
+
+        let wake = CoalescedRetryWake::new();
+        let reads = Cell::new(0);
+        assert!(!wake.due_for_outer_with_clock(false, || {
+            reads.set(reads.get() + 1);
+            100
+        }));
+        assert_eq!(reads.get(), 0);
+
+        wake.publish(100);
+        assert!(!wake.due_for_outer_with_clock(true, || {
+            reads.set(reads.get() + 1);
+            99
+        }));
+        assert_eq!(reads.get(), 1);
+        assert!(wake.due_for_outer_with_clock(true, || {
+            reads.set(reads.get() + 1);
+            100
+        }));
+        assert_eq!(reads.get(), 2);
+
+        // The callback is outside the deadline lock; a new publication wins the check.
+        assert!(!wake.due_for_outer_with_clock(true, || {
+            wake.publish(200);
+            100
+        }));
+        assert!(wake.due_for_outer_with_clock(true, || 200));
     }
 
     #[test]

@@ -261,9 +261,10 @@ fn has_queued_work() -> bool {
 /// A nested provider pump may yield to the outer service loop only when a retained image row
 /// is due and no image redrive is already executing. Querying does not claim the row, deliver
 /// another timer notification, or alter the original Reply owner.
-pub(crate) fn due_for_outer(now_100ns: u64) -> bool {
+pub(crate) fn due_for_outer_with_clock(clock: impl FnOnce() -> u64) -> bool {
     !ACTIVE.load(Ordering::Acquire)
-        && WAKE.due_for_outer(now_100ns, has_queued_work())
+        && has_queued_work()
+        && WAKE.due_for_outer_with_clock(true, clock)
 }
 
 pub(crate) fn next_deadline() -> Option<u64> {

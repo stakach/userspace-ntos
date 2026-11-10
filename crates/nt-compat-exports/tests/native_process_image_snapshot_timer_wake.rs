@@ -5,6 +5,7 @@
 const SNAPSHOT: &str = include_str!("../../../components/ntos-executive/src/process_image_snapshot_work.rs");
 const TIMER: &str = include_str!("../../../components/ntos-executive/src/timer_deadline.rs");
 const MAIN: &str = include_str!("../../../components/ntos-executive/src/main.rs");
+const RECEIVE: &str = include_str!("../../../components/ntos-executive/src/win32k_receive.rs");
 
 fn body<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start = source.find(start).unwrap_or_else(|| panic!("missing {start}"));
@@ -40,4 +41,20 @@ fn new_image_publication_rearms_without_replaying_a_retained_reply() {
     assert!(MAIN.contains("process_image_snapshot_work::wake_due(now_100ns)"));
     assert!(SNAPSHOT.contains("REPLY_MAIN_SLOT.load(Ordering::Relaxed)"),
         "the work still retains its original physical Reply");
+}
+
+#[test]
+fn nested_receive_checks_image_ownership_before_sampling_the_clock() {
+    let receive = body(RECEIVE, "pub(crate) unsafe fn prepare_root_maintenance_yield(",
+        "let snapshot = runtime::hold_snapshot()");
+    assert!(!receive.contains("due_for_outer(monotonic_time_100ns())"),
+        "the old eager HPET sample ran on every otherwise eligible nested receive");
+    let probe = body(SNAPSHOT, "pub(crate) fn due_for_outer_with_clock(",
+        "pub(crate) fn next_deadline()");
+
+    assert!(probe.contains("has_queued_work()")
+        && probe.find("has_queued_work()").unwrap() < probe.find("WAKE.due_for_outer_with_clock(").unwrap(),
+        "the empty snapshot owner must be rejected before the clock callback runs");
+    assert!(receive.contains("process_image_snapshot_work::due_for_outer_with_clock(monotonic_time_100ns)"),
+        "the nested receive path must pass the clock lazily to the image owner");
 }
