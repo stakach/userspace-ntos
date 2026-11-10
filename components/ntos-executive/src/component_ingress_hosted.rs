@@ -71,6 +71,82 @@ struct HostedCall {
 static mut CALLS: Vec<Option<HostedCall>> = Vec::new();
 static BUSY_WIN32K_RETAIN_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Equality witness for one delivered win32k Call. The move-only `ExternalIngress` and its
+/// physical Reply remain in `CALLS`; possession of this ticket grants no Reply authority.
+#[must_use = "revalidate the original Call before entering or deferring win32k"]
+pub(crate) struct HostedWin32kPreentryTicket {
+    binding: Binding,
+    admission: ExternalAdmissionKey,
+    info: u64,
+    service_number: u64,
+}
+
+/// Read the original, still-delivered native Call before any win32k argument staging. The
+/// message and Reply binding are checked together because a badge or numeric cap alone is not
+/// evidence that this is the same physical caller.
+unsafe fn exact_delivered_win32k_preentry(
+    reply: u64,
+    badge: u64,
+    service_number: u64,
+) -> Result<(Binding, ExternalAdmissionKey, u64), Error> {
+    if reply == 0 || crate::REPLY_MAIN_SLOT.load(Ordering::Relaxed) != reply {
+        return Err(Error::PhysicalIdentity);
+    }
+    let mut matches = (&*core::ptr::addr_of!(CALLS)).iter().flatten().filter(|row| {
+        row.binding.badge == badge
+            && row.call.as_ref().is_some_and(|call| call.reply() == reply)
+    });
+    let row = matches.next().ok_or(Error::Admission)?;
+    if matches.next().is_some() {
+        return Err(Error::Admission);
+    }
+    let call = row.call.as_ref().ok_or(Error::Admission)?;
+    let info = call.message().info();
+    if !row.delivered || row.completion.is_some() || row.released
+        || row.receive_settlement.is_some() || row.root_ingress.is_some()
+        || !call.can_park() || call.executor() != row.binding.tcb
+        || call.message().badge() != badge
+        || call.message().word(0) != Some(service_number)
+        || !is_win32k_native_call(info, service_number)
+        || crate::service_sec_image::hosted_ingress_binding(badge) != Some(row.binding)
+    {
+        return Err(Error::Admission);
+    }
+    let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+    if crate::spawn_hosts::query_component_reply_binding(row.binding.tcb, reply)
+        != Ok(ReplyBindingObservation::BoundToTarget)
+    {
+        return Err(Error::Reply);
+    }
+    Ok((row.binding, call.admission_key(), info))
+}
+
+pub(crate) unsafe fn mint_hosted_win32k_preentry_ticket(
+    reply: u64,
+    badge: u64,
+    service_number: u64,
+) -> Result<HostedWin32kPreentryTicket, Error> {
+    let (binding, admission, info) =
+        exact_delivered_win32k_preentry(reply, badge, service_number)?;
+    Ok(HostedWin32kPreentryTicket { binding, admission, info, service_number })
+}
+
+pub(crate) unsafe fn revalidate_hosted_win32k_preentry_ticket(
+    ticket: &HostedWin32kPreentryTicket,
+    reply: u64,
+    badge: u64,
+    service_number: u64,
+) -> Result<(), Error> {
+    let (binding, admission, info) =
+        exact_delivered_win32k_preentry(reply, badge, service_number)?;
+    if binding != ticket.binding || admission != ticket.admission
+        || info != ticket.info || service_number != ticket.service_number
+    {
+        return Err(Error::Admission);
+    }
+    Ok(())
+}
+
 fn trace_busy_win32k_retention(stage: &[u8], call: &ExternalIngress<ReceivedMessage>) {
     let count = BUSY_WIN32K_RETAIN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if count <= 8 || count.is_power_of_two() {
@@ -744,9 +820,11 @@ unsafe fn defer_hosted_delivery_inner(
         && (&*core::ptr::addr_of!(CALLS))[index]
             .as_ref()
             .and_then(|row| row.call.as_ref())
-            .is_some_and(|call| is_win32k_native_call(
-                call.message().info(), call.message().registers()[0],
-            ));
+            .is_some_and(|call| {
+                call.message().word(0).is_some_and(|service_number| {
+                    is_win32k_native_call(call.message().info(), service_number)
+                })
+            });
     // A Receive child can become selected while root redrives an already delivered,
     // unrelated Call. Return that untouched Call to its exact ingress owner first.
     if !crate::writable_fs::registry_journal::owns_volume()
