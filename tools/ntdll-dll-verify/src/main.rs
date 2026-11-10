@@ -25,6 +25,13 @@ const IMAGE_FILE_DLL: u16 = 0x2000;
 // PE32+ optional-header magic.
 const PE32PLUS_MAGIC: u16 = 0x020b;
 
+fn coff_timestamp(bytes: &[u8], nt_offset: usize) -> Option<u32> {
+    let start = nt_offset.checked_add(8)?;
+    let end = start.checked_add(4)?;
+    let field: [u8; 4] = bytes.get(start..end)?.try_into().ok()?;
+    Some(u32::from_le_bytes(field))
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let first = args.next();
@@ -119,6 +126,10 @@ fn main() -> ExitCode {
             "IMAGE_FILE_DLL set (characteristics {:#06x})",
             h.characteristics
         ),
+    );
+    check(
+        coff_timestamp(&bytes, h.nt_offset) == Some(0),
+        "reproducible PE COFF timestamp is zero",
     );
     println!(
         "       image_base={:#x} size_of_image={:#x} entry_rva={:#x} subsystem={}",

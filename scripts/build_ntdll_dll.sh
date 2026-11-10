@@ -44,8 +44,10 @@ BUILD_ARGS+=(
 
 echo "==> building nt-ntdll-dll (PE32+ ntdll.dll) for $TARGET_DIRNAME"
 
+# A wall-clock COFF timestamp changes the DLL hash on every relink and prevents
+# exact-head boot-disk continuation from authenticating the source-built payload.
 ( cd "$DLL_CRATE" && \
-  RUSTFLAGS="-Zunstable-options -Cpanic=immediate-abort -Clink-arg=--no-gc-sections" \
+  RUSTFLAGS="-Zunstable-options -Cpanic=immediate-abort -Clink-arg=--no-gc-sections -Clink-arg=--no-insert-timestamp" \
     cargo +nightly build "${BUILD_ARGS[@]}" )
 
 BUILT="$DLL_CRATE/target/$TARGET_DIRNAME/release/nt_ntdll_dll.dll"
