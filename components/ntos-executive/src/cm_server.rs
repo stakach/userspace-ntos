@@ -10,7 +10,8 @@ use crate::*;
 
 use alloc::rc::Rc;
 use core::num::NonZeroU32;
-use nt_config_server::{CmServer, CmIdentitySource};
+use nt_config_abi::{mutation_begin, opcode};
+use nt_config_server::{CmIdentitySource, CmServer};
 use surt_sel4::surt_core::surt_abi::{SurtCqe, SurtSqe};
 use surt_sel4::surt_core::{Consumer, Producer};
 use surt_sel4::{drain_blocking, Sel4Notify};
@@ -40,6 +41,8 @@ pub unsafe extern "C" fn cm_server_entry(launch_context: u64) -> ! {
     };
     let identities = Rc::new(CmIdentitySource::new(incarnation));
     let mut server = CmServer::new_with_identity_source(identities);
+    // This service has a private stack even though the shared image's statics are read-only.
+    let mut busy_begin_count = 0u64;
 
     let _ = drain_blocking(&mut submissions, &wait_requests, |sqe: &SurtSqe| {
         // SAFETY: single request in flight; the ring push/pop orders the client's
@@ -53,6 +56,45 @@ pub unsafe extern "C" fn cm_server_entry(launch_context: u64) -> ! {
         let out_buf =
             unsafe { core::slice::from_raw_parts_mut(REP_DATA_VADDR as *mut u8, REP_DATA_LEN) };
         let reply = server.dispatch(sqe.opcode, in_buf, out_buf);
+        if sqe.opcode == opcode::CM_OP_SYSTEM_HIVE_MUTATION_BEGIN && reply.status == 0 {
+            if let (Some(request), Some(outcome)) = (
+                mutation_begin::Request::from_bytes(in_buf),
+                mutation_begin::Reply::from_bytes(
+                    &out_buf[..core::mem::size_of::<mutation_begin::Reply>()],
+                ),
+            ) {
+                if request.operation == mutation_begin::operation::BEGIN
+                    && outcome.disposition == mutation_begin::disposition::OUTCOME
+                    && outcome.outcome_status == nt_status::NtStatus::DEVICE_BUSY.raw()
+                {
+                    busy_begin_count = busy_begin_count.saturating_add(1);
+                    if busy_begin_count <= 16 || busy_begin_count % 32 == 0 {
+                        let owner = server.system_mutation_busy_diagnostic();
+                        print_str(b"[cm-busy-begin] n/t-ms/requester/slot/seq/expected-gen/prepared/checkpoint/checkpoint-offset/checkpoint-len/outcome-gen/lease/lease-uploaded/lease-total=");
+                        for value in [
+                            busy_begin_count,
+                            monotonic_time_100ns() / 10_000,
+                            request.requester_nonce,
+                            request.request_slot,
+                            request.request_generation,
+                            request.expected_generation,
+                            owner.prepared_token,
+                            owner.checkpoint_token,
+                            owner.checkpoint_offset as u64,
+                            owner.checkpoint_len as u64,
+                            owner.outcome_receipt_generation,
+                            owner.lease_token,
+                            owner.lease_uploaded as u64,
+                            owner.lease_total as u64,
+                        ] {
+                            print_u64(value);
+                            print_str(b"/");
+                        }
+                        print_str(b"\n");
+                    }
+                }
+            }
+        }
         let cqe = SurtCqe {
             request_id: sqe.request_id,
             status: reply.status,
