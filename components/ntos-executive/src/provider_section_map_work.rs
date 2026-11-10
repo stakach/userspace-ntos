@@ -66,6 +66,7 @@ struct Work {
     query_status: u32,
     query_information: u64,
     read: Option<PendingSectionPageReadId>,
+    ready_probe: Option<PendingSectionPageReadId>,
     read_trace: Option<ReadTrace>,
     plan: Option<DataSectionReadWindow>,
     bytes: Option<Vec<u8>>,
@@ -169,6 +170,7 @@ pub(crate) unsafe fn submit(
         query_status: 0,
         query_information: 0,
         read: None,
+        ready_probe: None,
         read_trace: None,
         plan: None,
         bytes: None,
@@ -907,22 +909,50 @@ pub(crate) fn wake_due(now: u64) -> u64 {
     u64::from(next_deadline().is_some_and(|deadline| now >= deadline))
 }
 
-pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
-    if next_deadline().is_none_or(|deadline| monotonic_time_100ns() < deadline)
-        || EXECUTING.swap(true, Ordering::AcqRel)
+/// READY is only a hint to recheck this retained read. The authoritative
+/// terminal, File identity, copyback and backend ACK remain in `advance`.
+unsafe fn exact_pending_read_ready(work: &Work) -> bool {
+    let Phase::ReadPending(irp) = work.phase else { return false; };
+    let (Some(read), Some(prepared), Some(lease)) =
+        (work.read, work.prepared, work.lease) else { return false; };
+    if work.ready_probe == Some(read)
+        || (&*core::ptr::addr_of!(READS)).bound_key_if(
+            read, prepared.section, lease, work.page as u64,
+        ) != Some(irp.raw())
     {
+        return false;
+    }
+    driver_launch::nested_file_irp_completion_ready_exact(irp.raw())
+        || driver_launch::io_manager_mut().completed_irp(irp).is_some()
+}
+
+pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
+    if next_deadline().is_none() || EXECUTING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let now = monotonic_time_100ns();
+    if NEXT.load(Ordering::Acquire) > now
+        && !(&*core::ptr::addr_of!(WORK))
+            .iter()
+            .flatten()
+            .any(|work| exact_pending_read_ready(work))
+    {
+        EXECUTING.store(false, Ordering::Release);
         return;
     }
     let _durable = allocator::enter_durable();
-    let now = monotonic_time_100ns();
     let count = (&*core::ptr::addr_of!(WORK)).len();
     for index in 0..count {
         let Some(mut work) = (&mut *core::ptr::addr_of_mut!(WORK))[index].take() else {
             continue;
         };
-        if work.retry_at > now {
+        let exact_ready = exact_pending_read_ready(&work);
+        if work.retry_at > now && !exact_ready {
             (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
             continue;
+        }
+        if exact_ready {
+            work.ready_probe = work.read;
         }
         // Bound inline page progress per owner so a large font never monopolizes
         // the service loop. Pending IRPs and uncertain effects wait for evidence.

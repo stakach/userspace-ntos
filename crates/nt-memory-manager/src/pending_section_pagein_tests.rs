@@ -148,6 +148,30 @@ fn one_provider_key_cannot_own_two_live_page_reads() {
 }
 
 #[test]
+fn pending_wake_key_requires_the_exact_live_section_read() {
+    let mut sections = GenericSectionTable::new();
+    let first = sections.create(2, 0x40, 0x3000, PAGE_READONLY,
+        SECTION_ATTR_SEC_COMMIT, GenericSectionBacking::anonymous()).unwrap();
+    let second = sections.create(2, 0x41, 0x3000, PAGE_READONLY,
+        SECTION_ATTR_SEC_COMMIT, GenericSectionBacking::anonymous()).unwrap();
+    let section = sections.section_identity(first).unwrap();
+    let wrong_section = sections.section_identity(second).unwrap();
+    let plan = plan_data_section_page_read(0, 0x3000, 0x3000).unwrap();
+    let mut reads = PendingSectionPageReads::<(), u64>::new();
+    let id = reads.reserve(section, lease(), 0, plan, ()).unwrap();
+
+    assert_eq!(reads.bound_key_if(id, section, lease(), 0), None);
+    assert!(reads.bind(id, 91));
+    assert_eq!(reads.bound_key_if(id, section, lease(), 0), Some(91));
+    assert_eq!(reads.bound_key_if(id, wrong_section, lease(), 0), None);
+    assert_eq!(reads.bound_key_if(id, section, RoutedSectionLease::new(8).unwrap(), 0), None);
+    assert_eq!(reads.bound_key_if(id, section, lease(), 1), None);
+
+    assert!(reads.terminal(id, 91, 0, plan.length() as u64));
+    assert_eq!(reads.bound_key_if(id, section, lease(), 0), None);
+}
+
+#[test]
 fn invalid_geometry_and_generation_exhaustion_return_the_owner() {
     let plan = plan_data_section_page_read(1, 0x2000, 0x2000).unwrap();
     let mut reads = PendingSectionPageReads::<Box<u32>, u64>::new();

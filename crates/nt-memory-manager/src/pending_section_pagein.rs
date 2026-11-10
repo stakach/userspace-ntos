@@ -153,6 +153,24 @@ impl<R, K: Copy + Eq> PendingSectionPageReads<R, K> {
             .map(|row| (row.section, row.lease, row.page_index))
     }
 
+    /// Observe the provider key only while this exact read is awaiting a terminal.
+    /// A wake hint never claims the completion or authorizes copyback and ACK.
+    pub fn bound_key_if(
+        &self,
+        id: PendingSectionPageReadId,
+        section: SectionIdentity,
+        lease: RoutedSectionLease,
+        page_index: u64,
+    ) -> Option<K> {
+        let row = self.row(id)?;
+        (row.phase == Phase::Submitted
+            && row.section == section
+            && row.lease == lease
+            && row.page_index == page_index)
+            .then_some(row.key)
+            .flatten()
+    }
+
     /// Once dispatch may have entered, only its exact completion can advance this row.
     pub fn bind(&mut self, id: PendingSectionPageReadId, key: K) -> bool {
         if self.rows.iter().flatten().any(|row| row.key == Some(key)) {
