@@ -49,13 +49,18 @@ pub(crate) unsafe fn install_hosted_user_alias(
     }
     let alias = &mut caps.debug_filter;
     if !alias.vm_registered {
-        let registered = unsafe { process_committed_mapping_register(
+        let registration_status = unsafe { process_committed_mapping_register_status(
             pi as u64,
             nt_address_space::VmCommittedRange::mapped(
                 USER_VA, PAGE_SIZE, nt_address_space::PAGE_READONLY),
         ) };
-        if !registered {
-            return Err(UserAliasError::retryable(nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw() as u32));
+        if registration_status != 0 {
+            return Err(match nt_hosted_runtime::classify_alias_registration_status(registration_status) {
+                nt_hosted_runtime::AliasRetryDisposition::Retry =>
+                    UserAliasError::retryable(registration_status),
+                nt_hosted_runtime::AliasRetryDisposition::Retain =>
+                    UserAliasError::retained(registration_status),
+            });
         }
         alias.vm_registered = true;
     }

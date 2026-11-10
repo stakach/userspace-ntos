@@ -422,6 +422,7 @@ version = "0.1.0"
 dependencies = [
  "nt-hal-abi",
  "nt-io-completion",
+ "nt-status",
  "nt-user-callback",
 ]
 

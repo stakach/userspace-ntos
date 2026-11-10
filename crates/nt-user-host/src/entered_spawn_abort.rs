@@ -12,6 +12,14 @@ pub enum AliasFailure {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplyCancellation {
+    /// The creator ended, but the shared ingress has not confirmed Reply cancellation.
+    OwnerTerminated,
+    /// The exact retained Reply has an acknowledged cancellation receipt.
+    ExactReceipt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AbortError {
     InvalidIdentity,
     InvalidStatus,
@@ -125,17 +133,18 @@ impl EnteredSpawnAbort {
         Ok(())
     }
 
-    /// A confirmed cancellation permits revoking the original Reply. Record
-    /// entry before the native revoke; an uncertain result must not be replayed.
+    /// Before a send enters, creator termination permits revoking the held Reply.
+    /// After a send enters, only the exact cancellation receipt proves that
+    /// revocation cannot race an acknowledged Reply awaiting settlement.
     pub fn enter_revoke(
         &mut self,
         child: ProcessMechanism,
-        cancelled: bool,
+        cancellation: ReplyCancellation,
     ) -> Result<(), AbortError> {
         self.require_child(child)?;
-        if !cancelled
-            || !matches!(self.phase, AbortPhase::ReplyReady | AbortPhase::ReplyEntered)
-        {
+        if !matches!(self.phase, AbortPhase::ReplyReady | AbortPhase::ReplyEntered)
+            || (self.phase == AbortPhase::ReplyEntered
+                && cancellation != ReplyCancellation::ExactReceipt) {
             return Err(AbortError::OutOfOrder);
         }
         self.phase = AbortPhase::RevokeEntered;

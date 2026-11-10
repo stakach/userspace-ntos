@@ -49,7 +49,10 @@ pub use win32k_bulk_stage::{
 
 pub use driver_load_receipt::{DriverLoadPhase, RetainedEffectState};
 pub use installer_syscall_span::{CensusEpochGate, InstallerSyscallSpans, SpanOwner, SpanSample, SpanSnapshot, SsnTotal};
-pub use primary_alias_activation::{PrimaryAliasActivation, PrimaryAliasOwner, PrimaryAliasPhase};
+pub use primary_alias_activation::{
+    classify_alias_registration_status, AliasRetryDisposition,
+    PrimaryAliasActivation, PrimaryAliasOwner, PrimaryAliasPhase,
+};
 pub use contiguous_ram::{ContiguousRamCachePolicy, ContiguousRamError, ContiguousRamLayout, ContiguousRamOwner,
     ContiguousRamPrepareTable, ContiguousRamReceipt, ContiguousRamRequest,
     ContiguousRamLeaseBank, ContiguousRamLease, ContiguousRamLeaseSource,

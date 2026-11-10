@@ -8,7 +8,7 @@ use crate::*;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use nt_process::native_handle::NativeThreadProcessReference;
-use nt_user_host::entered_spawn_abort::{AbortPhase, AliasFailure, EnteredSpawnAbort};
+use nt_user_host::entered_spawn_abort::{AbortPhase, AliasFailure, EnteredSpawnAbort, ReplyCancellation};
 use nt_user_host::provider_logical_caller::ProviderLogicalCaller;
 
 const RESOURCES: u32 = nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
@@ -398,7 +398,7 @@ pub(crate) unsafe fn redrive(
             AbortPhase::ReplyReady => {
                 if spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(reply) {
                     (*row).abort.as_mut().expect("retained abort owner")
-                        .enter_revoke(child, true)
+                        .enter_revoke(child, ReplyCancellation::ExactReceipt)
                         .expect("proven creator cancellation enters Reply revoke");
                     continue;
                 }
@@ -423,7 +423,7 @@ pub(crate) unsafe fn redrive(
                         .expect("reconciled abort Reply has exact owner");
                 } else if spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(reply) {
                     (*row).abort.as_mut().expect("retained abort owner")
-                        .enter_revoke(child, true)
+                        .enter_revoke(child, ReplyCancellation::ExactReceipt)
                         .expect("proven creator cancellation enters Reply revoke");
                 }
             }

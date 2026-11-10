@@ -19,6 +19,8 @@ static ROOT_ALIAS_CAP: AtomicU64 = AtomicU64::new(0);
 // 0=not attempted, 1=entered, 2=copied. An entered or failed copy is
 // retained and cannot be replayed against the same destination slot.
 static ROOT_ALIAS_COPY_STATE: AtomicU32 = AtomicU32::new(0);
+// A structural map refusal cannot be retried against the same VA/cap owner.
+static ROOT_ALIAS_MAP_TERMINAL: AtomicU32 = AtomicU32::new(0);
 static READY: AtomicBool = AtomicBool::new(false);
 
 /// Whether a native root-page effect has an entered, unresolved owner.
@@ -26,6 +28,7 @@ static READY: AtomicBool = AtomicBool::new(false);
 pub(crate) fn root_init_uncertain() -> bool {
     FAILED_FRAME_SLOT.load(Ordering::Acquire) != 0
         || ROOT_ALIAS_COPY_STATE.load(Ordering::Acquire) == 1
+        || ROOT_ALIAS_MAP_TERMINAL.load(Ordering::Acquire) != 0
 }
 
 /// Return the one root-writable page. Synchronous native errors retain the
@@ -35,6 +38,14 @@ pub(crate) fn root_init_uncertain() -> bool {
 /// Called in the executive's serialized root context, with its VSpace active.
 pub(crate) unsafe fn root_page() -> Result<&'static DebugFilterPage, nt_status::NtStatus> {
     if !READY.load(Ordering::Acquire) {
+        let map_terminal = ROOT_ALIAS_MAP_TERMINAL.load(Ordering::Acquire);
+        if map_terminal != 0 {
+            return Err(if map_terminal == 8 {
+                nt_status::NtStatus::CONFLICTING_ADDRESSES
+            } else {
+                nt_status::NtStatus::DEVICE_BUSY
+            });
+        }
         if FAILED_FRAME_SLOT.load(Ordering::Acquire) != 0 {
             return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
         }
@@ -72,11 +83,22 @@ pub(crate) unsafe fn root_page() -> Result<&'static DebugFilterPage, nt_status::
         }
         let map_error = page_map_r(alias, ROOT_ALIAS_VA, RW_NX, CAP_INIT_THREAD_VSPACE);
         if map_error != 0 {
-            // A failed Call did not establish a mapping. Keep the exact cap for a retry.
+            // A failed Call did not establish a mapping. Only exhaustion can
+            // retry against the same exact cap and destination.
+            if map_error != 10 {
+                ROOT_ALIAS_MAP_TERMINAL.store(
+                    u32::try_from(map_error).unwrap_or(u32::MAX),
+                    Ordering::Release,
+                );
+            }
             print_str(b"[debug-filter-page] root alias map failed label=");
             print_u64(map_error);
             print_str(b"\n");
-            return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+            return Err(match map_error {
+                10 => nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+                8 => nt_status::NtStatus::CONFLICTING_ADDRESSES,
+                _ => nt_status::NtStatus::DEVICE_BUSY,
+            });
         }
         let page = ROOT_ALIAS_VA as *mut DebugFilterPage;
         // Retype zeroes the frame. Publish the small header and initial system

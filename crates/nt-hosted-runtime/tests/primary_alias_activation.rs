@@ -1,5 +1,18 @@
 use nt_hosted_runtime::{PrimaryAliasActivation, PrimaryAliasOwner, PrimaryAliasPhase};
 
+#[test]
+fn permanent_mapping_conflict_does_not_schedule_a_primary_retry() {
+    use nt_hosted_runtime::{classify_alias_registration_status, AliasRetryDisposition};
+    assert_eq!(
+        classify_alias_registration_status(0xC000_0018),
+        AliasRetryDisposition::Retain,
+    );
+    assert_eq!(
+        classify_alias_registration_status(0xC000_009A),
+        AliasRetryDisposition::Retry,
+    );
+}
+
 const OWNER: PrimaryAliasOwner = PrimaryAliasOwner {
     process_index: 0, process_generation: 17, tcb: 0x1234,
 };

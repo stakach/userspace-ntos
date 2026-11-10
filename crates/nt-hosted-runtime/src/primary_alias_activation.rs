@@ -4,6 +4,19 @@
 //! one retry after a definitive failure and never replays an uncertain effect.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AliasRetryDisposition { Retry, Retain }
+
+/// Only exhaustion of the committed-range table can be retried without a
+/// change in layout. A conflict or invalid range needs a corrected owner.
+pub const fn classify_alias_registration_status(status: u32) -> AliasRetryDisposition {
+    if status == nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw() as u32 {
+        AliasRetryDisposition::Retry
+    } else {
+        AliasRetryDisposition::Retain
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PrimaryAliasOwner {
     pub process_index: usize,
     pub process_generation: u64,

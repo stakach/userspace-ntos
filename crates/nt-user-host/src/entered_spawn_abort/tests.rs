@@ -119,12 +119,11 @@ fn cancelled_original_reply_releases_child_only_after_exact_revocation_reconcili
     let stale = child(10);
     let child = child(9);
     let mut abort = EnteredSpawnAbort::begin(child, AliasFailure::Definite(0xc000_009a)).unwrap();
-    assert_eq!(abort.enter_revoke(child, true), Err(AbortError::OutOfOrder));
+    assert_eq!(abort.enter_revoke(child, ReplyCancellation::ExactReceipt), Err(AbortError::OutOfOrder));
     abort.record_child_terminated(child).unwrap();
     abort.record_execution_retired(retired(child)).unwrap();
-    assert_eq!(abort.enter_revoke(child, false), Err(AbortError::OutOfOrder));
-    assert_eq!(abort.enter_revoke(stale, true), Err(AbortError::StaleIdentity));
-    abort.enter_revoke(child, true).unwrap();
+    assert_eq!(abort.enter_revoke(stale, ReplyCancellation::ExactReceipt), Err(AbortError::StaleIdentity));
+    abort.enter_revoke(child, ReplyCancellation::ExactReceipt).unwrap();
     assert_eq!(abort.phase(), AbortPhase::RevokeEntered);
     assert_eq!(abort.enter_reply(child), Err(AbortError::OutOfOrder));
     assert_eq!(abort.release_references(child), Err(AbortError::OutOfOrder));
@@ -138,4 +137,19 @@ fn cancelled_original_reply_releases_child_only_after_exact_revocation_reconcili
     assert_eq!(abort.phase(), AbortPhase::RevokeReconciled);
     abort.release_references(child).unwrap();
     assert_eq!(abort.phase(), AbortPhase::Complete);
+}
+
+#[test]
+fn creator_termination_without_reply_receipt_cannot_revoke_entered_reply() {
+    let child = child(9);
+    let mut abort = EnteredSpawnAbort::begin(child, AliasFailure::Definite(0xc000_009a)).unwrap();
+    abort.record_child_terminated(child).unwrap();
+    abort.record_execution_retired(retired(child)).unwrap();
+    abort.enter_reply(child).unwrap();
+    assert_eq!(
+        abort.enter_revoke(child, ReplyCancellation::OwnerTerminated),
+        Err(AbortError::OutOfOrder),
+    );
+    assert_eq!(abort.phase(), AbortPhase::ReplyEntered);
+    abort.enter_revoke(child, ReplyCancellation::ExactReceipt).unwrap();
 }

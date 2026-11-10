@@ -1500,13 +1500,22 @@ pub(crate) unsafe fn process_committed_mapping_register(
     pi: u64,
     range: nt_address_space::VmCommittedRange,
 ) -> bool {
+    process_committed_mapping_register_status(pi, range) == 0
+}
+
+/// Preserve the exact registration failure for callers that must distinguish
+/// transient capacity from a permanent overlap with another mapping owner.
+pub(crate) unsafe fn process_committed_mapping_register_status(
+    pi: u64,
+    range: nt_address_space::VmCommittedRange,
+) -> u32 {
     let Some(table) = process_committed_mapping_table_mut(pi as usize) else {
-        return false;
+        return nt_address_space::STATUS_INVALID_PARAMETER;
     };
     match table.register(range) {
         Ok(()) => {
             note_high_water(&VM_COMMITTED_MAPPING_HW, table.range_count() as u64);
-            true
+            0
         }
         Err(status) => {
             if VM_COMMITTED_MAPPING_REGISTRATION_FAILS.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -1522,7 +1531,7 @@ pub(crate) unsafe fn process_committed_mapping_register(
                 print_hex(status);
                 print_str(b"\n");
             }
-            false
+            status
         }
     }
 }

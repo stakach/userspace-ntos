@@ -14,7 +14,7 @@ use nt_memory_manager::RoutedSectionLease;
 use nt_process::native_handle::{NativeHandleCaller, NativeObjectReference,
     NativeThreadProcessReference, PsHandleType};
 use nt_user_host::provider_logical_caller::ProviderLogicalCaller;
-use nt_user_host::entered_spawn_abort::{AbortPhase, AliasFailure, EnteredSpawnAbort};
+use nt_user_host::entered_spawn_abort::{AbortPhase, AliasFailure, EnteredSpawnAbort, ReplyCancellation};
 
 const RESOURCES: u32 = nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
 const NOT_READY: u32 = 0xc000_00a3;
@@ -476,7 +476,12 @@ unsafe fn advance(
                     return Step::Wait;
                 }
                 if let Some(abort) = work.abort.as_mut() {
-                    if abort.enter_revoke(abort.child(), true).is_err() {
+                    let evidence = if spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(work.reply) {
+                        ReplyCancellation::ExactReceipt
+                    } else {
+                        ReplyCancellation::OwnerTerminated
+                    };
+                    if abort.enter_revoke(abort.child(), evidence).is_err() {
                         return Step::Wait;
                     }
                 }
@@ -499,9 +504,9 @@ unsafe fn advance(
                 work.phase = Phase::Indeterminate;
                 Step::Wait
             },
-            _ if work.cancelled => {
+            _ if spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(work.reply) => {
                 if let Some(abort) = work.abort.as_mut() {
-                    if abort.enter_revoke(abort.child(), true).is_err() { return Step::Wait; }
+                    if abort.enter_revoke(abort.child(), ReplyCancellation::ExactReceipt).is_err() { return Step::Wait; }
                 }
                 work.phase = Phase::RevokeReply;
                 Step::Progress

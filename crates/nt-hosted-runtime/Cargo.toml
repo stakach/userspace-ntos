@@ -15,6 +15,7 @@ std = []
 nt-hal-abi.workspace = true
 nt-user-callback.workspace = true
 nt-io-completion.workspace = true
+nt-status.workspace = true
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
