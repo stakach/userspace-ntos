@@ -268,9 +268,6 @@ pub(super) fn print_active_syscall_receive_census() {
         crate::print_str(b"\n");
         let last_provider = values[14].max(values[0]);
         let now = crate::monotonic_time_100ns();
-        let Some(client_tcb) = (unsafe { crate::win32k_glue::active_callback_client_tcb(
-            values[11], values[6], values[7],
-        ) }) else { continue; };
         if values[8] != 0 && values[9] != 0
             && now.saturating_sub(last_provider) >= 300_000_000
             && slot.sequence.load(Ordering::Acquire) == sequence
@@ -282,17 +279,22 @@ pub(super) fn print_active_syscall_receive_census() {
             // The microkernel query overwrites IPC MRs. Preserve the in-flight
             // message; this is an observation, never authority to reuse Reply.
             let _saved = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
+            if slot.sequence.load(Ordering::Acquire) != sequence { continue; }
             unsafe {
-                crate::service_sec_image::trace_stale_suspension_frames(values[6], values[7]);
-                crate::win32k_glue::trace_stale_callback_chain(
-                    values[11], values[6], values[7],
-                );
                 crate::win32k_glue::trace_hosted_tcb_debug_state(
                     b"pump-stale-provider", values[8], values[9],
                 );
-                crate::win32k_glue::trace_hosted_tcb_debug_state(
-                    b"pump-stale-client", client_tcb, 0,
-                );
+                if let Some(client_tcb) = crate::win32k_glue::active_callback_client_tcb(
+                    values[11], values[6], values[7],
+                ) {
+                    crate::service_sec_image::trace_stale_suspension_frames(values[6], values[7]);
+                    crate::win32k_glue::trace_stale_callback_chain(
+                        values[11], values[6], values[7],
+                    );
+                    crate::win32k_glue::trace_hosted_tcb_debug_state(
+                        b"pump-stale-client", client_tcb, 0,
+                    );
+                }
             }
         }
     }
