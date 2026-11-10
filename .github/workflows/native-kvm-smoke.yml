@@ -13,9 +13,18 @@ on:
         type: choice
         default: '1'
         options: ['1', '2']
+      resume_run_id:
+        description: Exact successful KVM workflow run whose writable disk should continue (blank builds fresh)
+        type: string
+        default: ''
+      resume_run_attempt:
+        description: Exact source run attempt; required with resume_run_id
+        type: string
+        default: ''
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: native-kvm-smoke-${{ github.ref }}
@@ -31,6 +40,13 @@ jobs:
         with:
           persist-credentials: false
           submodules: true
+      - name: Authenticate requested exact-head continuation run
+        if: inputs.resume_run_id != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+          RESUME_RUN_ATTEMPT: ${{ inputs.resume_run_attempt }}
+        run: python3 scripts/ci_kvm_disk_continuation.py check-run --run-id "$RESUME_RUN_ID" --attempt "$RESUME_RUN_ATTEMPT"
       - name: Fetch pinned ReactOS source inputs
         uses: actions/checkout@v4
         with:
@@ -150,6 +166,22 @@ jobs:
             crates/nt-ntdll-dll/target
             rust-micro/target
           key: ${{ steps.native-cache-identity.outputs.prefix }}-${{ github.sha }}
+      - name: Download exact stopped writable disk
+        if: inputs.resume_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: native-kvm-continuation-${{ inputs.resume_run_id }}-${{ inputs.resume_run_attempt }}
+          path: native-kvm-continuation-in
+          run-id: ${{ inputs.resume_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify and install exact writable disk
+        id: resume-disk
+        if: inputs.resume_run_id != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+          RESUME_RUN_ATTEMPT: ${{ inputs.resume_run_attempt }}
+        run: python3 scripts/ci_kvm_disk_continuation.py restore --run-id "$RESUME_RUN_ID" --attempt "$RESUME_RUN_ATTEMPT"
       - name: Run bounded KVM startup and capture QMP framebuffer
         env:
           QEMU_ACCEL: kvm
@@ -180,6 +212,24 @@ jobs:
             sha256sum rust-micro/.tmp/disk.img > native-kvm-image-after-boot2.sha256
             if [ "$boot_status" -ne 0 ]; then exit "$boot_status"; fi
           fi
+      - name: Prepare full stopped writable disk for an exact later run
+        if: success()
+        run: |
+          python3 scripts/ci_kvm_disk_continuation.py publish \
+            --boot-runs "${{ inputs.boot_runs || '1' }}" \
+            --boot-seconds "${{ inputs.boot_seconds || '300' }}"
+      - name: Upload full writable disk continuation
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-kvm-continuation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: native-kvm-continuation-out/
+          compression-level: 1
+          retention-days: 7
+          if-no-files-found: error
+      - name: Roll back the generated disk after a failed continuation
+        if: failure() && steps.resume-disk.outcome == 'success'
+        run: python3 scripts/ci_kvm_disk_continuation.py rollback
       - name: Upload native build and startup evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -210,6 +260,9 @@ jobs:
             native-kvm-rootserver.sha256
             native-kvm-qemu-stopped
             native-kvm-libernt-manifest.txt
+            native-kvm-continuation-out/manifest.json
+            native-kvm-continuation-receipt.json
+            native-kvm-continuation-rolled-back
             rust-micro/target/mykernel-x86/release/mykernel-rust
             rust-micro/.tmp/rootserver.elf
           if-no-files-found: warn
