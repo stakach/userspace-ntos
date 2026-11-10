@@ -584,6 +584,9 @@ dependencies = [
 [[package]]
 name = "nt-ntdll-layout"
 version = "0.1.0"
+dependencies = [
+ "nt-compat-exports",
+]
 
 [[package]]
 name = "nt-object-abi"
