@@ -250,6 +250,9 @@ pub(crate) fn complete_cached_mounted_create_sector(
     let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_CREATE_QUEUE)).as_ref().cloned() }
         .ok_or(crate::mounted_volume_backend::mounted_create_lookup::CreateLookupError::Invalid)?;
     let completed = queue.borrow_mut().complete_cached(claim, Ok(sector));
+    if completed.is_ok() {
+        crate::service_sec_image::mounted_installer_file_trace::sector(claim.irp, claim.mount, true);
+    }
     if !matches!(&completed, Err(crate::mounted_volume_backend::mounted_create_lookup::CreateLookupError::WrongClaim)) {
         let attribution = queue.borrow().attribution(claim.irp, claim.mount);
         if let Some(attribution) = attribution {
@@ -267,6 +270,9 @@ pub(crate) fn complete_physical_mounted_create_sector(
     let queue = unsafe { (&*core::ptr::addr_of!(MOUNT_CREATE_QUEUE)).as_ref().cloned() }
         .ok_or(crate::mounted_volume_backend::mounted_create_lookup::CreateLookupError::Invalid)?;
     let completed = queue.borrow_mut().complete_physical(claim, sector);
+    if completed.is_ok() {
+        crate::service_sec_image::mounted_installer_file_trace::sector(claim.irp, claim.mount, false);
+    }
     if !matches!(&completed, Err(crate::mounted_volume_backend::mounted_create_lookup::CreateLookupError::WrongClaim)) {
         let attribution = queue.borrow().attribution(claim.irp, claim.mount);
         if let Some(attribution) = attribution {

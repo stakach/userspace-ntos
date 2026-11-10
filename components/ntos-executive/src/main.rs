@@ -7415,6 +7415,7 @@ pub(crate) fn census_tick_static(now: u64) {
     }
     service_sec_image::pending_pipe_read_trace::print_summary();
     service_sec_image::mounted_read_lifetime_trace::print_summary();
+    service_sec_image::mounted_installer_file_trace::print_summary();
     print_add_device_rollback_census(b"periodic", false);
     print_hosted_file_owner_census(b"periodic", false);
 }

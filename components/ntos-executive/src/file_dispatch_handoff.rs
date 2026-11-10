@@ -291,6 +291,7 @@ pub(super) unsafe fn before_post_action(
             nt_handler, identity, pending, wait_for_completion,
         );
         super::mounted_read_lifetime_trace::parked(nt_handler, identity, pending);
+        super::mounted_installer_file_trace::parked(nt_handler, identity, pending);
         Some(PublishedFileIo {
             identity,
             irp_id: pending.irp_id,

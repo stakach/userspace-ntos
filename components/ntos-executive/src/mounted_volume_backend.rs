@@ -315,6 +315,10 @@ impl MountedVolumeBackend {
                     irp.irp_id.raw(), physical_mount.value(), owner, lookup)
                     .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
             }
+            if route_kind == nt_fs::BlockSourceKind::Native {
+                crate::service_sec_image::mounted_installer_file_trace::ingress(
+                    irp.irp_id.raw(), file_id.raw(), physical_mount.value(), irp.major);
+            }
             crate::service_sec_image::request_mounted_native_timer_rearm();
             return Ok(DispatchOutcome::Pending);
         }

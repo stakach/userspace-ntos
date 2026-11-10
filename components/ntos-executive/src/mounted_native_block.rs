@@ -386,6 +386,10 @@ impl SectorClaim {
                 crate::mounted_volume::complete_physical_mounted_create_sector(c, sector)
                     .expect("settled physical CREATE sector claim lost");
             }
+            Self::Directory(c) => {
+                Self::Directory(c).complete(bytes);
+                crate::service_sec_image::mounted_installer_file_trace::sector(c.irp, c.mount, false);
+            }
             claim => claim.complete(bytes),
         }
     }
@@ -499,6 +503,7 @@ impl WorkClaim {
             Self::Sector(SectorClaim::Directory(claim)) => {
                 crate::mounted_volume::complete_mounted_directory_sector(claim, Ok(bytes))
                     .expect("copied exact DIRECTORY sector claim lost");
+                crate::service_sec_image::mounted_installer_file_trace::sector(claim.irp, claim.mount, true);
             }
             Self::Sector(SectorClaim::Overlay(_) | SectorClaim::Read(_))
             | Self::Snapshot(_) => unreachable!("only metadata claims can use copied sectors"),

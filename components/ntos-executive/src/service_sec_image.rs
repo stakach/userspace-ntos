@@ -59,6 +59,8 @@ pub(crate) mod mounted_read_owner_trace;
 pub(crate) mod pending_pipe_read_trace;
 #[path = "mounted_read_lifetime_trace.rs"]
 pub(crate) mod mounted_read_lifetime_trace;
+#[path = "mounted_installer_file_trace.rs"]
+pub(crate) mod mounted_installer_file_trace;
 #[path = "inline_file_retirement.rs"]
 pub(crate) mod inline_file_retirement;
 #[path = "hosted_gui_client_info.rs"]
@@ -29720,6 +29722,7 @@ unsafe fn pending_file_io_redrive_pass(
             pending_pipe_read_trace::terminal_observed(identity, pending.irp_id, completed.status);
             mounted_read_lifetime_trace::terminal_observed(identity, pending.irp_id,
                 completed.status, completed.information);
+            mounted_installer_file_trace::terminal(identity, pending.irp_id, completed.status);
             if pending.major == nt_io_abi::major::IRP_MJ_CREATE {
                 mounted_create_owner_trace::terminal_exact(identity, pending.irp_id,
                     completed.file_id, completed.status);
@@ -30507,6 +30510,7 @@ unsafe fn pending_file_io_redrive_pass(
             }
             pending_pipe_read_trace::reply_delivered(identity, pending.irp_id);
             mounted_read_lifetime_trace::reply_delivered(identity, pending.irp_id);
+            mounted_installer_file_trace::reply(identity, pending.irp_id);
             release_reply_pool_cap(cap);
             thread_wait_state_clear_badge_ready(nt_handler, pending.badge);
         }
@@ -30535,6 +30539,7 @@ unsafe fn pending_file_io_redrive_pass(
                 .mark_backend_acked_exact(slot, pending.irp_id)
                 .expect("ACKed pending File owner disappeared");
             mounted_read_lifetime_trace::backend_acked(identity, pending.irp_id);
+            mounted_installer_file_trace::ack(identity, pending.irp_id);
             if pending.major == nt_io_abi::major::IRP_MJ_CREATE {
                 if let Some(file) = hosted_file_id {
                     mounted_create_owner_trace::ack_exact(identity, pending.irp_id,
@@ -30596,6 +30601,7 @@ unsafe fn pending_file_io_redrive_pass(
             .expect("completed pending File owner did not retire");
         pending_pipe_read_trace::retired(identity, pending.irp_id);
         mounted_read_lifetime_trace::retired(identity, pending.irp_id);
+        mounted_installer_file_trace::retired(identity, pending.irp_id);
         if let Some(file_id) = finished.route.hosted_file_id() {
             if matches!(finished.major, nt_io_abi::major::IRP_MJ_READ | nt_io_abi::major::IRP_MJ_WRITE) {
                 let fs_context = driver_launch::hosted_file_route(file_id)
