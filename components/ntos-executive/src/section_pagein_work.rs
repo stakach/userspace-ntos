@@ -13,10 +13,14 @@ use nt_memory_manager::data_section::{
 use nt_memory_manager::pending_section_pagein::{
     PendingSectionPageReadId, PendingSectionPageReads,
 };
+use nt_memory_manager::local_pagein_drive::{
+    classify_drive_step, DriveBoundary, DriveDecision, LocalDriveBudget,
+};
 use nt_memory_manager::CompletedFileQuery;
 use nt_user_host::provider_logical_caller::ProviderLogicalCaller;
 
 const RETRY_DELAY: u64 = 1_000_000;
+const LOCAL_FAULT_STEPS: usize = 16;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xc000_009a;
 
 #[derive(Clone, Copy)]
@@ -50,6 +54,22 @@ enum Phase {
     Indeterminate,
 }
 
+fn local_progress_offset(phase: &Phase) -> usize {
+    match phase {
+        Phase::QueryCopying(_, offset) | Phase::Copying(_, offset) => *offset,
+        _ => 0,
+    }
+}
+
+fn drive_boundary(phase: &Phase) -> DriveBoundary {
+    match phase {
+        Phase::QueryPending(_) | Phase::Pending(_) => DriveBoundary::External,
+        Phase::ReplyEntered | Phase::ReplySent => DriveBoundary::ReplyEntered,
+        Phase::Indeterminate => DriveBoundary::Uncertain,
+        _ => DriveBoundary::Local,
+    }
+}
+
 struct Work {
     purpose: Purpose,
     pi: usize,
@@ -75,6 +95,7 @@ struct Work {
     failure: Option<u32>,
     failure_logged: bool,
     phase: Phase,
+    // Cumulative age in this phase; Copying offset progress does not reset it.
     phase_entered_at_100ns: u64,
     cancel_requested: bool,
 }
@@ -930,6 +951,7 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
     }
     let _durable = allocator::enter_durable();
     let count = (&*core::ptr::addr_of!(WORK)).len();
+    let mut immediate_followup = false;
     for index in 0..count {
         let Some(mut work) = (&mut *core::ptr::addr_of_mut!(WORK))[index].take() else {
             continue;
@@ -939,13 +961,14 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         EXECUTING_PI.store(work.pi as u64, Ordering::Release);
         *core::ptr::addr_of_mut!(EXECUTING_PROBE) = diagnostic_probe(&work, true);
         let phase_before = core::mem::discriminant(&work.phase);
+        let is_fault = matches!(work.purpose, Purpose::Fault);
         let caller_pi = match work.purpose {
             Purpose::Fault => work.pi,
             Purpose::VmLock { caller_pi, .. } | Purpose::VmCopy { caller_pi, .. } => caller_pi,
             Purpose::RoutedFileModeInput { .. } => work.pi,
         };
         EXECUTING_CALLER_PI.store(caller_pi as u64, Ordering::Release);
-        let done = service_sec_image::with_pagein_caller_target_context(
+        let decision = service_sec_image::with_pagein_caller_target_context(
             handler,
             caller_pi,
             work.pi,
@@ -956,7 +979,26 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
             0,
             false,
             0,
-            |handler| advance(handler, &mut work),
+            |handler| {
+                if !is_fault {
+                    return if advance(handler, &mut work) {
+                        DriveDecision::Complete
+                    } else { DriveDecision::RetryLater };
+                }
+                LocalDriveBudget::new(LOCAL_FAULT_STEPS).drive_while_local(|| {
+                    // A nested provider pump can inspect this row while it is out of WORK.
+                    *core::ptr::addr_of_mut!(EXECUTING_PROBE) = diagnostic_probe(&work, true);
+                    let before = core::mem::discriminant(&work.phase);
+                    let offset_before = local_progress_offset(&work.phase);
+                    let done = advance(handler, &mut work);
+                    let after = core::mem::discriminant(&work.phase);
+                    if after != before {
+                        work.phase_entered_at_100ns = monotonic_time_100ns();
+                    }
+                    classify_drive_step(done, drive_boundary(&work.phase),
+                        after != before || local_progress_offset(&work.phase) != offset_before)
+                })
+            },
         )
         .unwrap_or_else(|| {
             let stopped =
@@ -972,9 +1014,9 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
                             process.state == nt_process::ProcessState::Terminated
                         });
             if !stopped {
-                return false;
+                return DriveDecision::RetryLater;
             }
-            match &work.phase {
+            let done = match &work.phase {
                 Phase::QueryDispatch | Phase::PlanRead => {
                     work.phase = Phase::Cancel;
                     false
@@ -999,11 +1041,14 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
                 | Phase::ReplyEntered
                 | Phase::ReplySent
                 | Phase::Indeterminate => advance(handler, &mut work),
-            }
+            };
+            if done { DriveDecision::Complete } else { DriveDecision::RetryLater }
         });
         if core::mem::discriminant(&work.phase) != phase_before {
             work.phase_entered_at_100ns = monotonic_time_100ns();
         }
+        if decision == DriveDecision::RetryNow { immediate_followup = true; }
+        let done = decision == DriveDecision::Complete;
         if !done {
             (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
         }
@@ -1013,9 +1058,9 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         EXECUTING_CALLER_PI.store(u64::MAX, Ordering::Release);
         EXECUTING_INDEX.store(u64::MAX, Ordering::Release);
     }
-    NEXT.store(
-        monotonic_time_100ns().saturating_add(RETRY_DELAY),
-        Ordering::Release,
-    );
+    let now = monotonic_time_100ns();
+    NEXT.store(if immediate_followup { now } else {
+        now.saturating_add(RETRY_DELAY)
+    }, Ordering::Release);
     ACTIVE.store(false, Ordering::Release);
 }
