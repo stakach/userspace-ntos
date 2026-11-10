@@ -341,6 +341,18 @@ pub struct TimerExpiry {
     pub dpc_ptr: Option<u64>,
 }
 
+/// Copied owner of the earliest active timer at one clock snapshot.
+/// Observation does not expire or otherwise change the timer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActiveTimerSnapshot {
+    pub timer_ptr: u64,
+    pub generation: u64,
+    pub deadline: Deadline,
+    pub projected_monotonic_100ns: u64,
+    pub period_100ns: u64,
+    pub dpc_ptr: Option<u64>,
+}
+
 /// The Driver Host's timer queue (spec §6.4).
 #[derive(Default)]
 pub struct TimerQueue {
@@ -443,11 +455,26 @@ impl TimerQueue {
     }
 
     pub fn next_deadline_at(&self, now: TimeSnapshot) -> Option<u64> {
+        self.earliest_active_at(now)
+            .map(|timer| timer.projected_monotonic_100ns)
+    }
+
+    /// Break equal comparator targets by timer identity, then generation, so
+    /// diagnostic selection is independent of the queue's insertion order.
+    pub fn earliest_active_at(&self, now: TimeSnapshot) -> Option<ActiveTimerSnapshot> {
         self.timers
             .iter()
             .filter(|timer| timer.active)
-            .filter_map(|timer| timer.deadline.monotonic_target(now))
-            .min()
+            .filter_map(|timer| Some(ActiveTimerSnapshot {
+                timer_ptr: timer.ptr,
+                generation: timer.generation,
+                deadline: timer.deadline,
+                projected_monotonic_100ns: timer.deadline.monotonic_target(now)?,
+                period_100ns: timer.period_100ns,
+                dpc_ptr: timer.dpc_ptr,
+            }))
+            .min_by_key(|timer| (timer.projected_monotonic_100ns,
+                timer.timer_ptr, timer.generation))
     }
 
     /// Discard all timer identities owned by this queue.
@@ -679,6 +706,53 @@ mod tests {
         assert!(tq.run_due_expirations(&clk).is_empty());
         clk.advance_100ns(1);
         assert_eq!(tq.run_due_expirations(&clk).len(), 1);
+    }
+
+    #[test]
+    fn earliest_active_snapshot_is_read_only_and_orders_equal_deadlines_by_identity() {
+        let mut clk = FakeClock::new();
+        let mut tq = TimerQueue::new();
+        // Insert the higher identity first to prove the result does not depend
+        // on insertion order. An inactive earlier timer must not be selected.
+        tq.set(0x900, -1_000, 0, Some(0xD9), &clk);
+        tq.set(0x700, -1_000, 1, Some(0xD7), &clk);
+        tq.set(0x500, -500, 0, None, &clk);
+        tq.cancel(0x500);
+        let snapshot = tq.earliest_active_at(clk.snapshot()).unwrap();
+        assert_eq!(snapshot, ActiveTimerSnapshot {
+            timer_ptr: 0x700,
+            generation: tq.generation(0x700).unwrap(),
+            deadline: Deadline::Relative { monotonic_100ns: 1_000 },
+            projected_monotonic_100ns: 1_000,
+            period_100ns: 10_000,
+            dpc_ptr: Some(0xD7),
+        });
+        assert_eq!(tq.earliest_active_at(clk.snapshot()), Some(snapshot));
+        assert_eq!(tq.next_deadline(&clk), Some(snapshot.projected_monotonic_100ns));
+        assert!(!tq.read_state(0x700));
+        clk.advance_100ns(1_000);
+        assert_eq!(tq.run_due_expirations(&clk).len(), 2);
+        assert_eq!(tq.earliest_active_at(clk.snapshot()).unwrap().projected_monotonic_100ns,
+            11_000);
+    }
+
+    #[test]
+    fn earliest_active_snapshot_projects_absolute_deadline_at_sample_time() {
+        let mut clk = FakeClock::new();
+        clk.set_system_time(1_000);
+        let mut tq = TimerQueue::new();
+        tq.set(0x700, 5_000, 0, None, &clk);
+        let snapshot = tq.earliest_active_at(clk.snapshot()).unwrap();
+        assert_eq!(snapshot.deadline,
+            Deadline::Absolute { system_time_100ns: 5_000 });
+        assert_eq!(snapshot.projected_monotonic_100ns, 4_000);
+        clk.advance_100ns(1_000);
+        clk.set_system_time(6_000);
+        let overdue = tq.earliest_active_at(clk.snapshot()).unwrap();
+        assert_eq!(overdue.projected_monotonic_100ns, 1_000);
+        assert_eq!(overdue.timer_ptr, snapshot.timer_ptr);
+        assert_eq!(overdue.generation, snapshot.generation);
+        assert!(!tq.read_state(0x700));
     }
 
     #[test]

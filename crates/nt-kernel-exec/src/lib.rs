@@ -141,7 +141,7 @@ pub use semaphore::{
 pub use spin::{SpinError, SpinLockTable};
 pub use timer::{
     map_timer_access, pit_oneshot_covers_deadline, pit_oneshot_for_deadline,
-    Clock, FakeClock, PitOneShot, PitOneShotAuthority, TimerExpiry,
+    ActiveTimerSnapshot, Clock, FakeClock, PitOneShot, PitOneShotAuthority, TimerExpiry,
     TimerQueue, TimerRearmDemand, TimerRearmOutcome, TimerReceiveError, TimerReceiveState,
     PIT_INPUT_HZ,
 };

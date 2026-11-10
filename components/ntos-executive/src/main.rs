@@ -7122,6 +7122,7 @@ fn print_shared_receive_census() {
 
 fn print_timer_deadline_census() {
     use nt_hosted_runtime::TimerDeadlineCensus;
+    static HOSTED_TIMER_SAMPLES: AtomicU64 = AtomicU64::new(0);
     print_str(b"[census] timer-scan seen/spurious/early-stale/shots/idle-disarms/due-drains/past-rearms=");
     for (index, value) in [
         TIMER_TICKS_SEEN.load(Ordering::Relaxed),
@@ -7155,6 +7156,26 @@ fn print_timer_deadline_census() {
             print_u64(value);
         }
         print_str(b"\n");
+    }
+    // A finite 30-second snapshot identifies which root-owned hosted timer
+    // supplies source 6 without reading a provider's timer body.
+    if HOSTED_TIMER_SAMPLES.fetch_add(1, Ordering::Relaxed) < 16 {
+        let now = nt_time_snapshot();
+        if let Some((instance, timer)) = driver_launch::hosted_driver_earliest_timer_snapshot(now) {
+            print_str(b"[census] hosted-kernel-timer instance/ptr/gen/deadline-kind/deadline-100ns/projected-100ns/period-100ns/dpc=");
+            let (kind, deadline) = match timer.deadline {
+                nt_time::Deadline::Infinite => (0, 0),
+                nt_time::Deadline::Relative { monotonic_100ns } => (1, monotonic_100ns),
+                nt_time::Deadline::Absolute { system_time_100ns } => (2, system_time_100ns),
+            };
+            for (index, value) in [instance as u64, timer.timer_ptr, timer.generation,
+                kind, deadline, timer.projected_monotonic_100ns, timer.period_100ns,
+                timer.dpc_ptr.unwrap_or(0)].into_iter().enumerate() {
+                if index != 0 { print_str(b"/"); }
+                print_u64(value);
+            }
+            print_str(b"\n");
+        }
     }
     if let Some((wait, age)) = object_waiter_oldest_unselected(monotonic_time_100ns()) {
         if age >= WAIT_LATENCY_REPORT_THRESHOLD_100NS {

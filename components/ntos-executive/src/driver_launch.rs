@@ -16539,6 +16539,23 @@ pub(crate) fn hosted_driver_timer_next_deadline(now: nt_time::TimeSnapshot) -> O
     }
 }
 
+/// Root-owned timer metadata only. The provider's timer body is not read.
+pub(crate) fn hosted_driver_earliest_timer_snapshot(
+    now: nt_time::TimeSnapshot,
+) -> Option<(usize, nt_kernel_exec::ActiveTimerSnapshot)> {
+    unsafe {
+        (*core::ptr::addr_of!(HOSTED_DRIVER_TIMERS))
+            .as_ref()?
+            .iter()
+            .enumerate()
+            .filter_map(|(instance, queue)| queue.earliest_active_at(now)
+                .map(|timer| (instance, timer)))
+            .min_by_key(|(instance, timer)|
+                (timer.projected_monotonic_100ns, *instance, timer.timer_ptr,
+                    timer.generation))
+    }
+}
+
 /// Publish expirations and queue DPCs; driver execution belongs to a scheduler boundary.
 pub(crate) unsafe fn hosted_driver_timer_wake_due(now: nt_time::TimeSnapshot) -> u64 {
     let queue_count = (*core::ptr::addr_of!(HOSTED_DRIVER_TIMERS))
