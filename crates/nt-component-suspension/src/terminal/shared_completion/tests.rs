@@ -222,11 +222,21 @@ fn shared_root_maintenance_callback_retains_external_transfer_until_ack() {
         let mut attempt = lanes.begin_terminal_stage(terminal, 30, stage).unwrap();
         lanes.record_terminal_stage(&mut attempt, 30, TerminalStageOutcome::Acknowledged).unwrap();
     }
+    assert!(lanes.finish_shared_root_maintenance_terminal(route, dispatch, terminal, 30, Err(5))
+        .unwrap().is_none());
+    assert_eq!(lanes.phase(lane), Ok(LanePhase::Terminal));
+    assert_eq!(lanes.external_top(lane), Ok(None));
+    assert_eq!(lanes.active_dispatch_identity(lane), Ok(Some(dispatch)));
+    assert!(matches!(lanes.terminal(terminal, 30).unwrap().phase,
+        TerminalPhase::Acknowledged { local_error: Some(5) }));
     let retired = lanes.finish_shared_root_maintenance_terminal(route, dispatch, terminal, 30, Ok(()))
         .unwrap().unwrap();
     assert_eq!(retired.continuation, 123);
     assert_eq!(retired.payload, 789);
     assert_eq!(lanes.phase(lane), Ok(LanePhase::Running));
+    assert_eq!(lanes.active_dispatch_identity(lane), Ok(Some(dispatch)));
+    assert_eq!(lanes.external_top(lane), Ok(Some(77)));
+    lanes.repark_external(lane, 30, 77).unwrap();
     assert_eq!(lanes.active_dispatch_identity(lane), Ok(Some(dispatch)));
 }
 

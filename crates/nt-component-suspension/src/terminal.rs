@@ -110,6 +110,19 @@ pub struct RetiredTerminal<C, R, T> {
     pub payload: T,
 }
 
+/// Restore a terminal's previously reserved external token after local retirement succeeds.
+/// Admission checked uniqueness and capacity while the terminal held the lane exclusively.
+fn restore_terminal_external_token<C, R, T>(
+    lane: &mut Lane<C, R, T>,
+    identity: TerminalIdentity,
+) {
+    if let Some(token) = identity.external_token {
+        assert!(lane.external_tokens.len() < lane.external_tokens.capacity());
+        debug_assert!(!lane.external_tokens.contains(&token));
+        lane.external_tokens.push(token);
+    }
+}
+
 /// A maintenance checkpoint has no provider completion value. Its native result and original
 /// continuation are released only after the ordinary terminal stages acknowledge the Reply.
 pub struct RetiredRootMaintenance<C, T> {
@@ -757,6 +770,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             || !matches!(record.phase, TerminalPhase::Acknowledged { .. })
             || !self.lane(identity.lane())?.suspensions.top()
                 .is_some_and(|frame| matches!(frame.phase, SuspensionPhase::MaintenanceResuming { .. }))
+            || (!preserve_execution && record.identity.external_token.is_some())
         {
             return Err(LaneError::InvalidPhase);
         }
@@ -771,6 +785,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             .retire_root_maintenance(identity.key, identity.owner)
             .map_err(LaneError::Suspension)?;
         let record = lane.terminal.take().unwrap();
+        restore_terminal_external_token(lane, record.identity);
         lane.phase = if preserve_execution { LanePhase::Running } else { LanePhase::Idle };
         if !preserve_execution { lane.dispatch = None; }
         if preserve_execution { self.running = Some(identity.lane()); }
@@ -824,12 +839,7 @@ impl<C, R: Clone, T> ComponentSuspensionLanes<C, R, T> {
             .complete_dispatch(identity.key, identity.owner)
             .map_err(LaneError::Suspension)?;
         let record = lane.terminal.take().unwrap();
-        if let Some(token) = record.identity.external_token {
-            // Terminal phase excludes every other mutation of this lane's external stack.
-            // Capacity and uniqueness were checked before retaining the transfer.
-            assert!(lane.external_tokens.len() < lane.external_tokens.capacity());
-            lane.external_tokens.push(token);
-        }
+        restore_terminal_external_token(lane, record.identity);
         lane.phase = if preserve_execution {
             LanePhase::Running
         } else if lane.suspensions.is_empty() && lane.external_tokens.is_empty() {
