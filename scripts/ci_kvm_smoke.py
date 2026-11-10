@@ -295,6 +295,23 @@ def cpu_sample_delay(sample_index):
     return CPU_SAMPLE_DELAYS[sample_index % len(CPU_SAMPLE_DELAYS)]
 
 
+def halted_cpu_indices(sample):
+    """Return the exact reported CPU set only when every vCPU is halted."""
+    state = sample.get("state")
+    if not isinstance(state, dict) or state.get("error") or state.get("register_errors"):
+        return None
+    cpus, registers = state.get("cpus"), state.get("registers")
+    if not isinstance(cpus, list) or not cpus or not isinstance(registers, dict):
+        return None
+    indices = [cpu.get("cpu-index") for cpu in cpus if isinstance(cpu, dict)]
+    if len(indices) != len(cpus) or len(set(indices)) != len(cpus):
+        return None
+    if not all(isinstance(registers.get(str(index)), str)
+               and re.search(r"\bHLT=1\b", registers[str(index)]) for index in indices):
+        return None
+    return set(indices)
+
+
 def stationary_boot_pair(previous, current):
     """Classify two QMP/serial samples without altering the guest."""
     if not previous or not current:
@@ -310,23 +327,8 @@ def stationary_boot_pair(previous, current):
             or after - before < 30:
         return False
 
-    def halted(sample):
-        state = sample.get("state")
-        if not isinstance(state, dict) or state.get("error") or state.get("register_errors"):
-            return None
-        cpus, registers = state.get("cpus"), state.get("registers")
-        if not isinstance(cpus, list) or not cpus or not isinstance(registers, dict):
-            return None
-        indices = [cpu.get("cpu-index") for cpu in cpus if isinstance(cpu, dict)]
-        if len(indices) != len(cpus) or len(set(indices)) != len(cpus):
-            return None
-        if not all(isinstance(registers.get(str(index)), str)
-                   and re.search(r"\bHLT=1\b", registers[str(index)]) for index in indices):
-            return None
-        return set(indices)
-
-    before_cpus = halted(previous)
-    return before_cpus is not None and before_cpus == halted(current)
+    before_cpus = halted_cpu_indices(previous)
+    return before_cpus is not None and before_cpus == halted_cpu_indices(current)
 
 
 def ps_create_fold_stall_pair(previous, current, serial):
@@ -459,6 +461,61 @@ def read_cpu_state():
     except (OSError, RuntimeError, ValueError, KeyError) as error:
         state["error"] = str(error)
     return state
+
+
+def read_interrupt_state():
+    """Read PIC, IRQ and per-vCPU LAPIC state without changing guest execution."""
+    state = {"lapic": {}}
+    try:
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.settimeout(3)
+            connection.connect(str(QMP_SOCKET))
+            with connection.makefile("rwb", buffering=0) as stream:
+                greeting = json.loads(stream.readline())
+                if "QMP" not in greeting:
+                    raise RuntimeError("QMP greeting missing")
+                stream.write(b'{"execute":"qmp_capabilities","id":"capabilities"}\n')
+                qmp_reply(stream, "capabilities")
+                stream.write(b'{"execute":"query-cpus-fast","id":"cpus"}\n')
+                try:
+                    cpus = qmp_reply(stream, "cpus")["return"]
+                    if not isinstance(cpus, list):
+                        raise ValueError("QMP CPU list missing")
+                except (OSError, RuntimeError, ValueError, KeyError) as error:
+                    cpus = []
+                    state["cpu_error"] = str(error)
+                commands = [("pic", "info pic", None), ("irq", "info irq", None)]
+                commands.extend((f"lapic-{cpu['cpu-index']}", "info lapic", cpu["cpu-index"])
+                                for cpu in cpus if isinstance(cpu, dict)
+                                and isinstance(cpu.get("cpu-index"), int)
+                                and not isinstance(cpu["cpu-index"], bool))
+                for command_id, line, cpu_index in commands:
+                    arguments = {"command-line": line}
+                    if cpu_index is not None:
+                        arguments["cpu-index"] = cpu_index
+                    stream.write((json.dumps({"execute": "human-monitor-command",
+                                              "arguments": arguments, "id": command_id}) + "\n").encode())
+                    try:
+                        result = qmp_reply(stream, command_id)["return"]
+                        if cpu_index is None:
+                            state[command_id] = result
+                        else:
+                            state["lapic"][str(cpu_index)] = result
+                    except (OSError, RuntimeError, ValueError, KeyError) as error:
+                        if cpu_index is None:
+                            state[f"{command_id}_error"] = str(error)
+                        else:
+                            state.setdefault("lapic_errors", {})[str(cpu_index)] = str(error)
+    except (OSError, RuntimeError, ValueError, KeyError) as error:
+        state["error"] = str(error)
+    return state
+
+
+def retain_halted_interrupt_state(sample, read_state):
+    """Retain a bounded read-only controller snapshot for each all-HLT CPU sample."""
+    if halted_cpu_indices(sample) is not None:
+        sample["interrupts"] = read_state()
+    return sample
 
 
 def read_bootdisk_blockstats():
@@ -626,8 +683,9 @@ def published_storahci_abars(serial):
 
 
 def capture_stall_state(path=STALL_STATE):
-    """Keep per-CPU and AHCI register evidence at a proof frontier or stall."""
+    """Keep CPU, interrupt-controller and AHCI evidence at a proof frontier or stall."""
     state = read_cpu_state()
+    state["interrupts"] = read_interrupt_state()
     # Every published AHCI BAR is evidence: a boot may enumerate multiple controllers,
     # and the last one in the serial log need not own the mounted volume.
     # Read controller registers through QMP without changing the guest or its disk.
@@ -868,6 +926,7 @@ def main():
                               "host": host, "serial_bytes": serial_bytes,
                               "boot_marker": b"boot: reading Simpleboot memory map" in serial,
                               "desktop_ready": b"PASS exec_explorer_shell_chrome_painted" in serial}
+                    retain_halted_interrupt_state(sample, read_interrupt_state)
                     with CPU_SAMPLES.open("a") as samples:
                         samples.write(json.dumps(sample) + "\n")
                     if stationary_boot_pair(previous_sample, sample):

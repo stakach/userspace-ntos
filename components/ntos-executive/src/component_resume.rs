@@ -294,6 +294,7 @@ pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) -> ReceivePrep
     super::mounted_create_owner_trace::receive_boundary_snapshot();
     super::mounted_read_owner_trace::receive_boundary_snapshot();
     trace_retained_receive_owners();
+    trace_root_receive_idle_state();
     ReceivePreparation::Ready
 }
 
@@ -301,6 +302,60 @@ pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) -> ReceivePrep
 pub(super) enum ReceivePreparation {
     Ready,
     PendingDelivery,
+}
+
+/// Observe the last outer receive boundary before a guest can go all-HLT. A
+/// periodic census cannot run after this receive blocks. Sampling changes no
+/// timer, Reply, IRQ, or retained owner; transition and periodic print budgets
+/// are independent of the older section/cleanup/lifecycle trace below.
+fn trace_root_receive_idle_state() {
+    use core::fmt::Write;
+    static PROBE: nt_hosted_runtime::RootReceiveIdleProbe =
+        nt_hosted_runtime::RootReceiveIdleProbe::new(128, 360, 10 * 10_000_000);
+    let now = monotonic_time_100ns();
+    let armed = LAST_REARM_AUTHORITY.is_armed();
+    let physical_wake = LAST_REARM_AUTHORITY.physical_wake_100ns();
+    let (callback_depth, continuation_depth) = win32k_glue::user_callback_stack_depths();
+    let state = nt_hosted_runtime::RootReceiveIdleObservation {
+        physical_shot_armed: armed,
+        physical_shot_due: armed && now >= physical_wake,
+        callback_depth: callback_depth as u64,
+        continuation_depth: continuation_depth as u64,
+        dispatch_depth: spawn_hosts::dispatch_depth(),
+        suspended_components: spawn_hosts::SUSPENDED_COMPONENT_OUTSTANDING.load(Ordering::Relaxed),
+    };
+    if !PROBE.observe(state, now) { return; }
+
+    let hold = unsafe { spawn_hosts::shared_ingress::owner::runtime::hold_snapshot() };
+    let gate = unsafe {
+        spawn_hosts::shared_ingress::owner::runtime::delivery_gate_snapshot(0)
+    };
+    let mut record = nt_printf::record::RecordBuffer::<2048>::new();
+    let _ = writeln!(record,
+        "[root-receive-idle] now={} shot={}/{}/{} selected={}/{} irq={}/{} ticks={} callbacks={}/{} dispatch={} suspended={} ingress={:?} gate={:?}",
+        now, u8::from(armed), physical_wake, u8::from(state.physical_shot_due),
+        LAST_REARM_SOURCE.load(Ordering::Relaxed),
+        LAST_REARM_DEADLINE.load(Ordering::Relaxed),
+        DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire),
+        DELAY_TIMER_TICKS_PENDING.load(Ordering::Relaxed),
+        TIMER_TICKS_SEEN.load(Ordering::Relaxed),
+        callback_depth, continuation_depth, state.dispatch_depth,
+        state.suspended_components, hold, gate);
+    let _ = writeln!(record,
+        "[root-receive-idle] deadlines registry={:?} section={:?} process-image={:?} section-pagein={:?} native-image-pagein={:?}",
+        crate::registry_mutation_work::next_deadline(),
+        crate::section_metadata_work::next_deadline(),
+        crate::process_image_snapshot_work::next_deadline(),
+        crate::section_pagein_work::next_deadline(),
+        crate::native_image_pagein_work::next_deadline());
+    sel4_rt::print_record(if record.overflowed() {
+        b"[root-receive-idle] record-truncated\n"
+    } else {
+        record.bytes()
+    });
+    if callback_depth != 0 || continuation_depth != 0 {
+        win32k_glue::print_callback_owner_census();
+    }
 }
 
 /// A finite IOCP wait must retain a wake before the root blocks. Capture the
