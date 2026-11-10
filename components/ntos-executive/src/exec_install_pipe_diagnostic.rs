@@ -5,6 +5,13 @@ use super::*;
 
 const PIPE_NAME_CAP: usize = 96;
 const PRINT_DEVICE_CAP: u64 = 128;
+const PRINT_RPC_CAP: u64 = 32;
+
+fn plugplay_pipe_name_hash() -> u64 {
+    const LEAF: [u16; 9] = [b'\\' as u16, b'p' as u16, b'l' as u16, b'u' as u16,
+        b'g' as u16, b'p' as u16, b'l' as u16, b'a' as u16, b'y' as u16];
+    nt_io_manager::pipe_name_hash(&LEAF)
+}
 
 fn exact_pipe_name(file_id: u64, out: &mut [u16; PIPE_NAME_CAP]) -> Option<usize> {
     let file = driver_launch::io_manager_mut().file(nt_io_manager::FileId(file_id))?;
@@ -34,6 +41,115 @@ fn trace_device(observation: &nt_hosted_runtime::InstallPipeObservation) {
 }
 
 impl ExecNtHandler {
+    pub(crate) fn rpc_op6_client_key(
+        &self, pi: usize, file_id: u64,
+    ) -> Option<nt_hosted_runtime::RpcClientKey> {
+        let (device_id, npfs_fid) = driver_launch::hosted_file_route(file_id)?;
+        if driver_launch::device_id_by_name("\\Device\\NamedPipe") != Some(device_id)
+            || crate::pipe_fid_name_hash(npfs_fid) != plugplay_pipe_name_hash()
+        { return None; }
+        Some(nt_hosted_runtime::RpcClientKey {
+            pid: self.pm_pid_for_pi(pi)?,
+            generation: self.hosted_process_generation(pi)?,
+            file_id, npfs_fid,
+        })
+    }
+
+    pub(crate) fn stage_rpc_op6_client_write(
+        &mut self, pi: usize, file_id: u64, irp_id: u64, bytes: &[u8],
+    ) {
+        if let Some(key) = self.rpc_op6_client_key(pi, file_id) {
+            let _ = self.rpc_op6_client_capture.stage_write(key, irp_id, bytes);
+            self.print_rpc_op6_client_overflow();
+        }
+    }
+
+    pub(crate) fn stage_rpc_op6_client_transceive(
+        &mut self, pi: usize, file_id: u64, irp_id: u64, bytes: &[u8],
+    ) {
+        if let Some(key) = self.rpc_op6_client_key(pi, file_id) {
+            let _ = self.rpc_op6_client_capture.stage_transceive(key, irp_id, bytes);
+            self.print_rpc_op6_client_overflow();
+        }
+    }
+
+    pub(crate) fn complete_rpc_op6_client_write(
+        &mut self, pi: usize, file_id: u64, irp_id: u64, status: u32, information: u64,
+    ) {
+        if let Some(key) = self.rpc_op6_client_key(pi, file_id) {
+            if let Some(event) = self.rpc_op6_client_capture.complete_write(key, irp_id, status, information) {
+                self.print_rpc_op6_client_event(&event);
+            }
+            self.print_rpc_op6_client_overflow();
+        }
+    }
+
+    pub(crate) fn observe_rpc_op6_client_write(
+        &mut self, pi: usize, file_id: u64, bytes: &[u8], status: u32, information: u64,
+    ) {
+        if let Some(key) = self.rpc_op6_client_key(pi, file_id) {
+            if let Some(event) = self.rpc_op6_client_capture.write(key, bytes, status, information) {
+                self.print_rpc_op6_client_event(&event);
+            }
+            self.print_rpc_op6_client_overflow();
+        }
+    }
+
+    pub(crate) fn observe_rpc_op6_client_transceive(
+        &mut self, pi: usize, file_id: u64, bytes: &[u8], status: u32,
+    ) {
+        if let Some(key) = self.rpc_op6_client_key(pi, file_id) {
+            if let Some(event) = self.rpc_op6_client_capture.transceive(key, bytes, status) {
+                self.print_rpc_op6_client_event(&event);
+            }
+            self.print_rpc_op6_client_overflow();
+        }
+    }
+
+    pub(crate) fn print_rpc_op6_client_overflow(&mut self) {
+        let count = self.rpc_op6_client_capture.overflow();
+        if count != 0 && count != self.rpc_op6_client_overflow_reported {
+            self.rpc_op6_client_overflow_reported = count;
+            if count.is_power_of_two() {
+                print_str(b"[pnp-rpc-op6-client] capture-overflow=");
+                print_u64(count);
+                print_str(b"\n");
+            }
+        }
+        let ambiguous = self.rpc_op6_client_capture.ambiguities();
+        if ambiguous != 0 && ambiguous != self.rpc_op6_client_ambiguity_reported {
+            self.rpc_op6_client_ambiguity_reported = ambiguous;
+            if ambiguous.is_power_of_two() {
+                print_str(b"[pnp-rpc-op6-client] ambiguous-overlap=");
+                print_u64(ambiguous);
+                print_str(b"\n");
+            }
+        }
+    }
+
+    pub(crate) fn print_rpc_op6_client_event(&mut self, event: &nt_hosted_runtime::RpcCaptureEvent) {
+        if self.rpc_op6_client_printed >= PRINT_RPC_CAP { return; }
+        self.rpc_op6_client_printed += 1;
+        print_str(b"[pnp-rpc-op6-client] pid/gen/file/fid=");
+        print_u64(u64::from(event.key.pid)); print_str(b"/");
+        print_u64(event.key.generation); print_str(b"/");
+        print_hex_u64(event.key.file_id); print_str(b"/");
+        print_hex_u64(event.key.npfs_fid);
+        print_str(if event.direction == nt_hosted_runtime::RpcCaptureDirection::Request {
+            b" request" as &[u8]
+        } else { b" response" as &[u8] });
+        print_str(b" call/len/status/sample=");
+        print_u64(u64::from(event.call_id)); print_str(b"/");
+        print_u64(event.length as u64); print_str(b"/");
+        print_hex(event.status); print_str(b"/");
+        for &byte in &event.sample[..event.sample_len] {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            debug_put_char(HEX[(byte >> 4) as usize]);
+            debug_put_char(HEX[(byte & 15) as usize]);
+        }
+        print_str(b"\n");
+    }
+
     /// Observe only a completed native registry open by a live, attached child generation.
     pub(crate) fn observe_install_pipe_enum_open(&mut self, pi: usize, path: &str, status: u32) {
         let Some(pid) = self.pm_pid_for_pi(pi) else { return; };

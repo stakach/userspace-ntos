@@ -36,6 +36,7 @@ mod hosted_event_projection;
 mod event_terminal_receipt;
 mod win32k_bulk_stage;
 mod rpc_op6_trace;
+mod rpc_op6_client_capture;
 mod wait_owner_latency;
 
 pub use win32k_bulk_stage::{
@@ -91,6 +92,7 @@ pub use hosted_event_projection::{HostedEventProjectionKey, HostedEventProjectio
     HostedEventWaitDelivery};
 pub use event_terminal_receipt::EventTerminalReceiptSampler;
 pub use rpc_op6_trace::{RpcOp6ExchangeTracker, RpcOp6TraceCounts};
+pub use rpc_op6_client_capture::{RpcCaptureDirection, RpcCaptureEvent, RpcClientKey, RpcOp6ClientCapture, RPC_SAMPLE_CAP};
 pub use wait_owner_latency::{
     WaitLatencyCounters, WaitLatencyError, WaitLatencyInterval, WaitLatencyKey,
     WaitLatencyLedger, WaitLatencyLive, WaitLatencyOwner, WaitLatencyPhase,

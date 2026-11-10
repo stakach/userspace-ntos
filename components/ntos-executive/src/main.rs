@@ -23883,6 +23883,11 @@ struct ExecNtHandler {
     /// Root-owned, bounded observation of exact native install-pipe Files and children.
     /// The File and Process managers remain the only authorities for those identities.
     install_pipe_diagnostic: nt_hosted_runtime::InstallPipeDiagnostic<8>,
+    /// Exact client-side PlugPlay RPC observations; never used for dispatch.
+    rpc_op6_client_capture: nt_hosted_runtime::RpcOp6ClientCapture<16>,
+    rpc_op6_client_printed: u64,
+    rpc_op6_client_overflow_reported: u64,
+    rpc_op6_client_ambiguity_reported: u64,
     /// Security descriptors for virtual registry namespace roots. `\Registry\Machine` and
     /// `\Registry\User` are CM namespace sentinels, not hive cells and not overlay keys, but
     /// security queries/updates still target their handle identity.

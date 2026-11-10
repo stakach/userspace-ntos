@@ -29708,6 +29708,9 @@ unsafe fn pending_file_io_redrive_pass(
             }
             continue;
         }
+        let is_pipe_transceive = !pending.is_local()
+            && pending.major == nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL
+            && pending.control_code == crate::exec_handler::FSCTL_PIPE_TRANSCEIVE;
         if let Some(completed) = completed {
             if !(&*core::ptr::addr_of!(PENDING_FILE_IO)).matches_completion_exact(
                 slot,
@@ -29724,6 +29727,17 @@ unsafe fn pending_file_io_redrive_pass(
                         pending.pi as usize, file_id, pending.irp_id,
                         completed.status, completed.information,
                     );
+                    nt_handler.complete_rpc_op6_client_write(
+                        pending.pi as usize, file_id, pending.irp_id,
+                        completed.status, completed.information,
+                    );
+                }
+            } else if is_pipe_transceive {
+                if let Some(file_id) = hosted_file_id {
+                    nt_handler.complete_rpc_op6_client_write(
+                        pending.pi as usize, file_id, pending.irp_id,
+                        completed.status, completed.information,
+                    );
                 }
             }
             pending_pipe_read_trace::terminal_observed(identity, pending.irp_id, completed.status);
@@ -29735,9 +29749,6 @@ unsafe fn pending_file_io_redrive_pass(
                     completed.file_id, completed.status);
             }
         }
-        let is_pipe_transceive = !pending.is_local()
-            && pending.major == nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL
-            && pending.control_code == crate::exec_handler::FSCTL_PIPE_TRANSCEIVE;
         let is_pipe_listen = !pending.is_local()
             && pending.major == nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL
             && pending.control_code == crate::exec_handler::FSCTL_PIPE_LISTEN;
@@ -30306,6 +30317,7 @@ unsafe fn pending_file_io_redrive_pass(
                 }
                 if let Some(file_id) = hosted_file_id.filter(|_| pending.major == nt_io_abi::major::IRP_MJ_READ || is_pipe_transceive) {
                     nt_handler.observe_completed_npfs_read(
+                        pending.pi as usize,
                         file_id,
                         pending.badge,
                         terminal_status,

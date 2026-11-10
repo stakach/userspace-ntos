@@ -4291,6 +4291,10 @@ impl ExecNtHandler {
         );
         write_field!(installer_progress, None);
         write_field!(install_pipe_diagnostic, nt_hosted_runtime::InstallPipeDiagnostic::new());
+        write_field!(rpc_op6_client_capture, nt_hosted_runtime::RpcOp6ClientCapture::new());
+        write_field!(rpc_op6_client_printed, 0);
+        write_field!(rpc_op6_client_overflow_reported, 0);
+        write_field!(rpc_op6_client_ambiguity_reported, 0);
         write_field!(registry_machine_root_security_descriptor, root_security.machine);
         write_field!(registry_user_root_security_descriptor, root_security.user);
         write_field!(time_zone_information, time_zone_information);
@@ -13076,7 +13080,8 @@ impl ExecNtHandler {
     }
 
     pub(crate) fn observe_completed_npfs_read(
-        &self,
+        &mut self,
+        pi: usize,
         file_id: u64,
         badge: u64,
         status: u32,
@@ -13089,6 +13094,12 @@ impl ExecNtHandler {
         };
         if driver_launch::device_id_by_name("\\Device\\NamedPipe") != Some(device_id) {
             return;
+        }
+        if let Some(key) = self.rpc_op6_client_key(pi, file_id) {
+            if let Some(event) = self.rpc_op6_client_capture.read_chunk(key, output, status) {
+                self.print_rpc_op6_client_event(&event);
+            }
+            self.print_rpc_op6_client_overflow();
         }
         unsafe {
             driver_launch::trace_dcerpc_read_reassembly_from_slice(
@@ -13217,6 +13228,7 @@ impl ExecNtHandler {
     ) {
         if release.cleanup_required {
             let _ = self.install_pipe_diagnostic.retire_server_file(file_id);
+            self.rpc_op6_client_capture.retire_file(file_id);
             match self
                 .file_completion
                 .begin_cleanup(file_id)
@@ -34767,6 +34779,17 @@ impl ExecNtHandler {
                                         status = st as u64;
                                         information = completed;
                                         pending_endpoint_irp_id = pending_irp_id;
+                                        if is_pipe_transceive {
+                                            if st as u32 == STATUS_PENDING && pending_irp_id != 0 {
+                                                self.stage_rpc_op6_client_transceive(
+                                                    self.pi, route.file_id, pending_irp_id, &input,
+                                                );
+                                            } else if st as u32 != STATUS_PENDING {
+                                                self.observe_rpc_op6_client_transceive(
+                                                    self.pi, route.file_id, &input, st as u32,
+                                                );
+                                            }
+                                        }
                                         if st as u32 != STATUS_PENDING
                                             && nt_io_completion::file_io_status_copies_output(
                                                 st as u32,
@@ -34784,6 +34807,7 @@ impl ExecNtHandler {
                                                 information = 0;
                                             } else if is_pipe_transceive && copy_len != 0 {
                                                 self.observe_completed_npfs_read(
+                                                    self.pi,
                                                     route.file_id,
                                                     self.current_badge,
                                                     status as u32,
@@ -41185,8 +41209,14 @@ impl ExecNtHandler {
                         let _ = self.stage_install_pipe_write(
                             self.pi, completion_file_id, pending_write_irp_id, &payload,
                         );
+                        self.stage_rpc_op6_client_write(
+                            self.pi, completion_file_id, pending_write_irp_id, &payload,
+                        );
                     } else if status != STATUS_PENDING {
                         let _ = self.observe_install_pipe_write(
+                            self.pi, completion_file_id, &payload, status, information,
+                        );
+                        self.observe_rpc_op6_client_write(
                             self.pi, completion_file_id, &payload, status, information,
                         );
                     }
@@ -41751,6 +41781,7 @@ impl ExecNtHandler {
                                                         &output[..copy_len],
                                                     ) {
                                                         self.observe_completed_npfs_read(
+                                                            self.pi,
                                                             file_id,
                                                             self.current_badge,
                                                             driver_status,
