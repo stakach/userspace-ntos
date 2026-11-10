@@ -70,10 +70,9 @@ pub unsafe extern "C" fn cm_server_entry(launch_context: u64) -> ! {
                     busy_begin_count = busy_begin_count.saturating_add(1);
                     if busy_begin_count <= 16 || busy_begin_count % 32 == 0 {
                         let owner = server.system_mutation_busy_diagnostic();
-                        print_str(b"[cm-busy-begin] n/t-ms/requester/slot/seq/expected-gen/prepared/checkpoint/checkpoint-offset/checkpoint-len/outcome-gen/lease/lease-uploaded/lease-total=");
+                        print_str(b"[cm-busy-begin] n/requester/slot/seq/expected-gen/prepared/checkpoint/checkpoint-offset/checkpoint-len/outcome-gen/lease/lease-uploaded/lease-total=");
                         for value in [
                             busy_begin_count,
-                            monotonic_time_100ns() / 10_000,
                             request.requester_nonce,
                             request.request_slot,
                             request.request_generation,

@@ -807,6 +807,7 @@ diagnosis-free failure.
 
 ## Keep Isolated Service Diagnostics Off Shared Image Statics
 - Object and Configuration Manager services map the shared root image read-only. A new atomic trace counter in `.bss` can pass a native build yet fault on its first isolated-service write. Keep per-service diagnostic budgets on private stack or owned heap state, and use a focused read-only-image regression before a boot.
+- An existing root helper can also write shared state: `monotonic_time_100ns()` records calls in a root static before reading the clock. Audit every helper invoked from an isolated service, including diagnostic helpers, for hidden static writes; use service-local data or serial ordering instead.
 - A successful ELF PT_LOAD write flag does not prove that an isolated service maps that shared page writable. Identify the executing VSpace and its actual mapping policy before changing the rootserver loader.
 
 ## Treat Partial Receipts As Samples, Not Complete Retry Histories
