@@ -74,6 +74,15 @@ const ATL_CREATE_WND_DATA_TID_OFFSET: u64 = 0x08;
 const ATL_CREATE_WND_DATA_NEXT_OFFSET: u64 = 0x10;
 
 static USER_CALLBACK_DISPATCH_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// Issue the one identity carried from pre-entry staging through physical lane admission.
+/// Exhaustion refuses a fresh dispatch instead of wrapping to a live identity.
+pub(crate) fn next_win32k_dispatch_id() -> Option<u64> {
+    USER_CALLBACK_DISPATCH_IDS
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_add(1))
+        .ok()?
+        .checked_add(1)
+}
 static USER_CALLBACK_TRANSFER_IDS: AtomicU64 = AtomicU64::new(1);
 static USER_CALLBACK_RENDEZVOUS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_WINLOGON_API0: AtomicU64 = AtomicU64::new(0);
@@ -6936,10 +6945,13 @@ unsafe fn dispatch_source_terminal(
     len: u64,
     request_kind: u64,
 ) -> SourcePnpTerminalDispatch {
+    let Some(dispatch_id) = next_win32k_dispatch_id() else {
+        return SourcePnpTerminalDispatch::NotEntered(0xC000_009Au32 as i32);
+    };
     let mut entered = false;
     let mut retained = None;
     let Win32kDispatchOutcome::Known { value: result, completed } = win32k_dispatch_wide_observed_inner(
-        0, packet_va, len, 0, 0, 0, &[], [packet_va, len, 0, 0],
+        dispatch_id, 0, packet_va, len, 0, 0, 0, &[], [packet_va, len, 0, 0],
         None, None, executive_win32k_client(), request_kind,
         false, Some(&mut entered), None, None, None, None, DispatchMode::Source(&mut retained),
     );
@@ -7039,6 +7051,7 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
 }
 
 pub(crate) unsafe fn win32k_dispatch_wide_with_return_receipt(
+    dispatch_id: u64,
     ssn: u64, a0: u64, a1: u64, a2: u64, a3: u64,
     caller_sp: u64, stack_args: &[u64], completion_args: [u64; 4],
     output_stage: Option<nt_user_callback::DispatchOutputStage>,
@@ -7049,7 +7062,7 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_return_receipt(
 ) -> Win32kDispatchWithReceipt {
     let mut dispatch_return = None;
     let outcome = win32k_dispatch_wide_observed_inner(
-        ssn, a0, a1, a2, a3, caller_sp, stack_args, completion_args, output_stage,
+        dispatch_id, ssn, a0, a1, a2, a3, caller_sp, stack_args, completion_args, output_stage,
         paint_output, client, win32k_subsystem::WIN32K_REQUEST_SSDT, true,
         Some(entered), None, Some(&mut dispatch_return), None, Some(dispatch_context), DispatchMode::Standard,
     );
@@ -7107,8 +7120,11 @@ pub(crate) unsafe fn win32k_dispatch_ps_provider_command(
             )?;
             run_kernel_job(caller, &result)
         };
+        let Some(dispatch_id) = next_win32k_dispatch_id() else {
+            return (0xC000_009Au64, false).into();
+        };
         return win32k_dispatch_wide_observed_inner(
-            0, command, expected_provider_state, flags, 0, 0, &[],
+            dispatch_id, 0, command, expected_provider_state, flags, 0, 0, &[],
             [command, expected_provider_state, flags, 0], None, None,
             client, win32k_subsystem::WIN32K_REQUEST_PS_RETIREMENT, true,
             Some(&mut entered), Some(&mut execute), None, None, None, DispatchMode::Standard,
@@ -7138,10 +7154,13 @@ pub(crate) unsafe fn win32k_create_process_before_loader(
     client: Win32kClientContext,
 ) -> Win32kProcessCreateResult {
     let command = win32k_subsystem::PS_WIN32_PROVIDER_PROCESS_CREATE;
+    let Some(dispatch_id) = next_win32k_dispatch_id() else {
+        return Win32kProcessCreateResult::NotEntered(0xC000_009A);
+    };
     let mut entered = false;
     let mut suspended = false;
     let outcome = win32k_dispatch_wide_observed_inner(
-        0, command, 0, 0, 0, 0, &[], [command, 0, 0, 0], None, None,
+        dispatch_id, 0, command, 0, 0, 0, 0, &[], [command, 0, 0, 0], None, None,
         client, win32k_subsystem::WIN32K_REQUEST_PS_PROVIDER, true, Some(&mut entered),
         None, None, Some(&mut suspended), None, DispatchMode::Standard,
     );
@@ -7220,8 +7239,11 @@ unsafe fn win32k_dispatch_wide_observed(
     attach_client: bool,
     entered: Option<&mut bool>,
 ) -> Win32kDispatchOutcome {
+    let Some(dispatch_id) = next_win32k_dispatch_id() else {
+        return (0xC000_009Au64, false).into();
+    };
     win32k_dispatch_wide_observed_inner(
-        ssn, a0, a1, a2, a3, caller_sp, stack_args, completion_args, output_stage,
+        dispatch_id, ssn, a0, a1, a2, a3, caller_sp, stack_args, completion_args, output_stage,
         paint_output, client, request_kind, attach_client, entered, None, None, None, None, DispatchMode::Standard,
     )
 }
@@ -7248,8 +7270,11 @@ unsafe fn win32k_dispatch_kernel_job_observed(
         let caller = capture_kernel_job(&channel, lane, native, &result)?;
         run_kernel_job(caller, &result)
     };
+    let Some(dispatch_id) = next_win32k_dispatch_id() else {
+        return (0xC000_009Au64, false).into();
+    };
     win32k_dispatch_wide_observed_inner(
-        0, arguments[0], arguments[1], arguments[2], arguments[3], 0, &[],
+        dispatch_id, 0, arguments[0], arguments[1], arguments[2], arguments[3], 0, &[],
         [0; 4], None, None, client, request_kind, false, Some(entered),
         Some(&mut execute), None, None, None, DispatchMode::Standard,
     )
@@ -7407,6 +7432,7 @@ unsafe fn publish_initial_win32k_request(
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn win32k_dispatch_wide_observed_inner(
+    dispatch_id: u64,
     ssn: u64,
     a0: u64,
     a1: u64,
@@ -7503,7 +7529,6 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         }
         return (nt_process::STATUS_INVALID_PARAMETER as u64, false).into();
     }
-    let dispatch_id = USER_CALLBACK_DISPATCH_IDS.fetch_add(1, Ordering::Relaxed) + 1;
     let callback_client = client.callback_client();
     let registered_client = client.logical_caller.is_some()
         && user_callback_client_can_register(callback_client);

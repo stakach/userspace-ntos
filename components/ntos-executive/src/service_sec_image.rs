@@ -7393,6 +7393,7 @@ unsafe fn dispatch_win32k_for_client(
 
 unsafe fn dispatch_win32k_for_client_with_completion_args(
     nt_handler: &mut ExecNtHandler,
+    dispatch_id: u64,
     ssn: u64,
     a0: u64,
     a1: u64,
@@ -7409,6 +7410,7 @@ unsafe fn dispatch_win32k_for_client_with_completion_args(
     dispatch_context: &mut Option<nt_user_callback::DispatchContext>,
 ) -> (u64, bool) {
     let result = win32k_glue::win32k_dispatch_wide_with_return_receipt(
+        dispatch_id,
         ssn,
         a0,
         a1,
@@ -15920,6 +15922,15 @@ pub(crate) unsafe fn service_sec_image(
                     dispatch_peb_mirror,
                     scratch_base,
                 );
+                'root_gui_dispatch: {
+                let Some(dispatch_id) = win32k_glue::next_win32k_dispatch_id() else {
+                    // No shared ARG or provider state belongs to this call yet. Preserve its
+                    // bound Reply and let the ordinary syscall tail return the failure.
+                    result = nt_process::STATUS_INSUFFICIENT_RESOURCES as u64;
+                    handled = true;
+                    wl_milestone_park = false;
+                    break 'root_gui_dispatch;
+                };
                 // CROSS-AS ARG MARSHALING. NtUserProcessConnect(handle, USERCONNECT* buf, size): the
                 // buffer is a client user pointer (usually its stack) NOT mapped in win32k's VSpace.
                 // Passing it raw makes win32k's handler fault/spin on an address win32k_dispatch can't
@@ -19241,6 +19252,7 @@ pub(crate) unsafe fn service_sec_image(
                         };
                     let mut r = dispatch_win32k_for_client_with_completion_args(
                         &mut nt_handler,
+                        dispatch_id,
                         dispatch_ssn,
                         d_a0,
                         d_a1,
@@ -20161,6 +20173,7 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     handled = false; // dispatch wall — stop with the SSN recorded
                     result = 0xC0000001;
+                }
                 }
             } else {
                 // SSNs absent from the registered native table are complete dispatcher decisions:
