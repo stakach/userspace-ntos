@@ -393,6 +393,48 @@ fn find(irp_id: IrpId) -> Option<u64> {
         .map(|row| row.id)
 }
 
+/// Bounded by the SCSI caller. Read the exact detached provider owner without advancing it.
+/// Flight values follow the existing file-return probe; payload values are listed here so a
+/// stalled dispatch can be distinguished from a retained or completed provider.
+pub(super) fn trace_scsi_provider_owner(phase: u64, source: u64, use_epoch: u64, irp: IrpId) {
+    let owner = rows().iter().find(|row| row.irp_id == Some(irp));
+    let (id, flight, payload, ready, blocked, completion, tcb) =
+        owner.map_or((0, 0, 0, 0, u64::MAX, 0, 0), |row| {
+            let flight = match row.flight {
+                Flight::Preparing => 1, Flight::QueuedDispatch => 2, Flight::Dispatch => 3,
+                Flight::PumpSuspended => 4, Flight::PumpReturned => 5, Flight::Copy => 6,
+                Flight::Cancel => 7, Flight::Acknowledge => 8, Flight::Idle => 9,
+                Flight::Blocked => 10,
+            };
+            let payload = match row.payload.as_ref() {
+                None => 0, Some(Payload::Prepared(_)) => 1,
+                Some(Payload::NoEntry(_)) => 2, Some(Payload::Returned(_)) => 3,
+                Some(Payload::PumpSuspended(_)) => 4,
+                Some(Payload::HookReturned(_)) => 5,
+                Some(Payload::Retained(_)) => 6,
+                Some(Payload::Completion(_)) => 7,
+                Some(Payload::Acknowledgement(_)) => 8,
+                Some(Payload::Copy(_)) => 9, Some(Payload::Cancel(_)) => 10,
+                Some(Payload::Terminal(_)) => 11,
+            };
+            let authority = row.authorities.iter().find(|authority| {
+                row.primary_driver.is_some_and(|driver| driver.raw() == authority.driver_id)
+            }).or_else(|| row.authorities.first());
+            (row.id, flight, payload, u64::from(row.work_ready),
+                row.blocked_status.map_or(u64::MAX, |status| status.raw() as u32 as u64),
+                u64::from(row.completion.is_some()),
+                authority.map_or(0, |authority| authority.tcb))
+        });
+    print_str(b"[scsi-provider-owner] phase/source/use/provider/row/flight/payload/work-ready/blocked/completion/tcb=");
+    let values = [phase, source, use_epoch, irp.raw(), id, flight, payload,
+        ready, blocked, completion, tcb];
+    for (index, value) in values.into_iter().enumerate() {
+        if index != 0 { print_str(b"/"); }
+        print_u64(value);
+    }
+    print_str(b"\n");
+}
+
 /// Bind a port CONNECT's mutable input copy and ACK to its captured physical store before
 /// native entry. A synchronous completion may need both controls before dispatch returns.
 fn mark_port_connect_control(

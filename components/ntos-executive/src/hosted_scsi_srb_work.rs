@@ -92,6 +92,7 @@ static CURSOR: AtomicU64 = AtomicU64::new(0);
 static CLAIM_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static SCSI_CAPTURE_REFUSAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static SCSI_PROGRESS_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static SCSI_PENDING_BOUNDARY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static SCSI_HELD_REFUSAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static SCSI_IRQ_BOUNDARY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static mut SCSI_IRQ_BOUNDARY_SEEN: [Option<(u64, u64, u64, bool, bool)>; 128] = [None; 128];
@@ -164,6 +165,27 @@ fn trace_scsi_progress(
     print_str(b"/");
     print_u64(result);
     print_str(b"\n");
+}
+
+/// Observation at provider acceptance and after the first redrive restores its SCSI owner.
+/// Neither the canonical completion query nor the ready hint claims or pumps an IRP.
+unsafe fn trace_scsi_pending_boundary(phase: u64, work: &Work, irp: IrpId) {
+    if SCSI_PENDING_BOUNDARY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 64 { return; }
+    let source = work.source.source_irp_address();
+    let use_epoch = work.source.scsi_identity().use_ticket().epoch().get();
+    let terminal = io_manager_mut().completed_irp(irp).is_some();
+    let ready = nested_device_control_completion_ready_exact(irp.raw());
+    print_str(b"[scsi-pending-boundary] phase/source/use/provider/terminal/ready/reply/provider-tcb=");
+    let values = [
+        phase, source, use_epoch, irp.raw(), u64::from(terminal), u64::from(ready),
+        work.reply, work.provider_instance.tcb,
+    ];
+    for (index, value) in values.into_iter().enumerate() {
+        if index != 0 { print_str(b"/"); }
+        print_u64(value);
+    }
+    print_str(b"\n");
+    hosted_file_owners::trace_scsi_provider_owner(phase, source, use_epoch, irp);
 }
 
 fn trace_claim(stage: u64, status: i32, detail: u64) {
@@ -512,6 +534,7 @@ impl Work {
                 self.canonical_irp = Some(irp_id);
                 self.entered_provider = true;
                 trace_scsi_progress(3, &self.source, Some(irp_id), STATUS_PENDING as i32, 0, 0);
+                trace_scsi_pending_boundary(1, self, irp_id);
             }
             Err(status) if status == nt_status::NtStatus::DEVICE_BUSY => {}
             Err(status) => {
@@ -901,6 +924,7 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, scope: ReadyScope) -> bool {
         work.reply_entered,
         work.ack.as_ref().map(|ack| ack.reply_entered),
     );
+    let newly_pending = before.0.is_none() && after.0.is_some() && !done;
     if !done {
         (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
     } else {
@@ -912,6 +936,13 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, scope: ReadyScope) -> bool {
             .map(|row| row.0),
         Some(index)
     );
+    if newly_pending {
+        let restored = (&*core::ptr::addr_of!(WORK))[index]
+            .as_ref().expect("pending SCSI owner restored");
+        if let Some(irp) = restored.canonical_irp {
+            trace_scsi_pending_boundary(2, restored, irp);
+        }
+    }
     if let Some(wake) = wake {
         wake_after_restore(wake);
     }
