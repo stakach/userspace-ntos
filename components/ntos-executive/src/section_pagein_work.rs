@@ -75,6 +75,7 @@ struct Work {
     failure: Option<u32>,
     failure_logged: bool,
     phase: Phase,
+    phase_entered_at_100ns: u64,
     cancel_requested: bool,
 }
 
@@ -85,6 +86,8 @@ static EXECUTING_TID: AtomicU64 = AtomicU64::new(0);
 static EXECUTING_PI: AtomicU64 = AtomicU64::new(u64::MAX);
 static EXECUTING_CALLER_PI: AtomicU64 = AtomicU64::new(u64::MAX);
 static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
+static mut EXECUTING_PROBE: Option<(nt_hosted_runtime::SpanOwner, u64,
+    crate::installer_child_span_census::PageInProbe)> = None;
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) unsafe fn submit(
@@ -229,6 +232,7 @@ unsafe fn submit_owned(
         query_status: 0,
         query_information: 0,
         phase: Phase::QueryDispatch,
+        phase_entered_at_100ns: monotonic_time_100ns(),
         cancel_requested: false,
         failure: None,
         failure_logged: false,
@@ -273,6 +277,62 @@ pub(crate) fn next_deadline() -> Option<u64> {
 
 pub(crate) fn wake_due(now: u64) -> u64 {
     u64::from(next_deadline().is_some_and(|deadline| now >= deadline))
+}
+
+fn diagnostic_probe(work: &Work, executing: bool) -> Option<(
+    nt_hosted_runtime::SpanOwner, u64, crate::installer_child_span_census::PageInProbe,
+)> {
+    if !matches!(work.purpose, Purpose::Fault) { return None; }
+    let nt_user_host::process_identity::ProcessGeneration::Hosted(process_generation) =
+        work.process.generation else { return None; };
+    let phase = match &work.phase {
+        Phase::QueryDispatch => 1, Phase::QueryPending(_) => 2,
+        Phase::QueryCopying(_, _) => 3, Phase::QueryAckPending(_) => 4,
+        Phase::PlanRead => 5, Phase::Dispatch => 6, Phase::Pending(_) => 7,
+        Phase::Copying(_, _) => 8, Phase::AckPending(_) => 9,
+        Phase::Publish(_) => 10, Phase::ReadyReply => 11,
+        Phase::ReplyEntered => 12, Phase::ReplySent => 13,
+        Phase::Cancel => 14, Phase::Cancelled => 15, Phase::Indeterminate => 16,
+    };
+    let irp_id = match &work.phase {
+        Phase::QueryPending(id) | Phase::QueryCopying(id, _)
+        | Phase::QueryAckPending(id) | Phase::Pending(id)
+        | Phase::Copying(id, _) | Phase::AckPending(id) => Some(id.raw()),
+        _ => None,
+    };
+    Some((nt_hosted_runtime::SpanOwner {
+        process_index: work.pi, process_generation,
+        thread_id: work.tid, thread_generation: work.logical.thread().generation(),
+    }, work.badge, crate::installer_child_span_census::PageInProbe {
+        source: crate::installer_child_span_census::PageInSource::Data(work.section),
+        phase, phase_entered_at_100ns: work.phase_entered_at_100ns,
+        irp_id, irp_entered_at_100ns: irp_id.map(|_| work.phase_entered_at_100ns),
+        read_subphase: 0, page: work.page, reply: work.reply, executing,
+    }))
+}
+
+/// Value-only observation; no provider pump, Reply operation or page-table access.
+pub(crate) fn diagnostic_snapshot(owner: nt_hosted_runtime::SpanOwner, badge: u64,
+    page: u64, reply: u64) -> Option<crate::installer_child_span_census::PageInProbe> {
+    let mut found = None;
+    unsafe {
+        if let Some((row_owner, row_badge, probe)) =
+            *core::ptr::addr_of!(EXECUTING_PROBE) {
+            if row_owner == owner && row_badge == badge && probe.page == page
+                && probe.reply == reply { found = Some(probe); }
+        }
+        for work in (&*core::ptr::addr_of!(WORK)).iter().flatten() {
+            let Some((row_owner, row_badge, probe)) = diagnostic_probe(work, false) else {
+                continue;
+            };
+            if row_owner == owner && row_badge == badge && probe.page == page
+                && probe.reply == reply {
+                if found.is_some() { return None; }
+                found = Some(probe);
+            }
+        }
+    }
+    found
 }
 
 fn exact_hosted_scratch(work: &Work) -> Option<u64> {
@@ -877,6 +937,8 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         EXECUTING_INDEX.store(index as u64, Ordering::Release);
         EXECUTING_TID.store(work.tid, Ordering::Release);
         EXECUTING_PI.store(work.pi as u64, Ordering::Release);
+        *core::ptr::addr_of_mut!(EXECUTING_PROBE) = diagnostic_probe(&work, true);
+        let phase_before = core::mem::discriminant(&work.phase);
         let caller_pi = match work.purpose {
             Purpose::Fault => work.pi,
             Purpose::VmLock { caller_pi, .. } | Purpose::VmCopy { caller_pi, .. } => caller_pi,
@@ -939,9 +1001,13 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
                 | Phase::Indeterminate => advance(handler, &mut work),
             }
         });
+        if core::mem::discriminant(&work.phase) != phase_before {
+            work.phase_entered_at_100ns = monotonic_time_100ns();
+        }
         if !done {
             (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
         }
+        *core::ptr::addr_of_mut!(EXECUTING_PROBE) = None;
         EXECUTING_TID.store(0, Ordering::Release);
         EXECUTING_PI.store(u64::MAX, Ordering::Release);
         EXECUTING_CALLER_PI.store(u64::MAX, Ordering::Release);

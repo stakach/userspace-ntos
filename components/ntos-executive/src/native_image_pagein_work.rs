@@ -85,6 +85,8 @@ struct Work {
     span: Option<ImagePageFileSpan>,
     read: Option<ImageRead>,
     phase: Phase,
+    phase_entered_at_100ns: u64,
+    pending_irp_since_100ns: Option<u64>,
     failure: Option<u32>,
     failure_logged: bool,
     cancel_requested: bool,
@@ -110,6 +112,8 @@ static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 // The active row is temporarily absent from WORK while redrive can pump a provider.
 // Keep its exact source key visible to a nested fault admission until it is reinserted.
 static mut EXECUTING_SOURCE: Option<(ImageAreaId, u32, Phase)> = None;
+static mut EXECUTING_PROBE: Option<(nt_hosted_runtime::SpanOwner, u64,
+    crate::installer_child_span_census::PageInProbe)> = None;
 static NEXT: AtomicU64 = AtomicU64::new(0);
 static ADMISSIONS: AtomicU64 = AtomicU64::new(0);
 static UNREADY_FAULT_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -213,6 +217,8 @@ unsafe fn prepare_page(
         phase: if decision == RoutedSourceReadDecision::EnterRead {
             Phase::Read
         } else { Phase::AwaitSource },
+        phase_entered_at_100ns: monotonic_time_100ns(),
+        pending_irp_since_100ns: None,
         failure: None, failure_logged: false, cancel_requested: false,
         purpose, progress: nt_syscall::copy_preflight::CopyOutputContinuation::PageReady,
         drive_progress: false,
@@ -394,6 +400,64 @@ pub(crate) fn next_deadline() -> Option<u64> {
 
 pub(crate) fn wake_due(now: u64) -> u64 {
     u64::from(next_deadline().is_some_and(|deadline| now >= deadline))
+}
+
+fn diagnostic_probe(work: &Work, executing: bool) -> Option<(
+    nt_hosted_runtime::SpanOwner, u64, crate::installer_child_span_census::PageInProbe,
+)> {
+    if !matches!(work.purpose, Purpose::Fault) { return None; }
+    let nt_user_host::process_identity::ProcessGeneration::Hosted(process_generation) =
+        work.view.process.generation else { return None; };
+    let phase = match work.phase {
+        Phase::AwaitSource => 1, Phase::Read => 2, Phase::Publish => 3,
+        Phase::MapPage => 4, Phase::ScanSyscall => 5,
+        Phase::DispatchSyscall => 6, Phase::ReplyReady => 7,
+        Phase::ReadyError => 8, Phase::ReplyEntered => 9,
+        Phase::ReplySent => 10, Phase::Cancel => 11,
+        Phase::Cancelled => 12, Phase::Indeterminate => 13,
+    };
+    let read_subphase = match work.read.as_ref() {
+        Some(read) if read.acknowledgment_key().is_some() => 3,
+        Some(read) if read.copy_position().is_some() => 2,
+        Some(read) if read.pending_key().is_some() => 1,
+        Some(read) if read.terminal_result().is_some() => 4,
+        Some(_) => 5,
+        None => 0,
+    };
+    Some((nt_hosted_runtime::SpanOwner {
+        process_index: work.pi, process_generation,
+        thread_id: work.tid, thread_generation: work.logical.thread().generation(),
+    }, work.badge, crate::installer_child_span_census::PageInProbe {
+        source: crate::installer_child_span_census::PageInSource::Image(work.view.view.area()),
+        phase, phase_entered_at_100ns: work.phase_entered_at_100ns,
+        irp_id: work.read.as_ref().and_then(ImageRead::pending_key),
+        irp_entered_at_100ns: work.pending_irp_since_100ns,
+        read_subphase, page: work.page, reply: work.reply, executing,
+    }))
+}
+
+/// Value-only observation; an executing row is represented even while removed from WORK.
+pub(crate) fn diagnostic_snapshot(owner: nt_hosted_runtime::SpanOwner, badge: u64,
+    page: u64, reply: u64) -> Option<crate::installer_child_span_census::PageInProbe> {
+    let mut found = None;
+    unsafe {
+        if let Some((row_owner, row_badge, probe)) =
+            *core::ptr::addr_of!(EXECUTING_PROBE) {
+            if row_owner == owner && row_badge == badge && probe.page == page
+                && probe.reply == reply { found = Some(probe); }
+        }
+        for work in (&*core::ptr::addr_of!(WORK)).iter().flatten() {
+            let Some((row_owner, row_badge, probe)) = diagnostic_probe(work, false) else {
+                continue;
+            };
+            if row_owner == owner && row_badge == badge && probe.page == page
+                && probe.reply == reply {
+                if found.is_some() { return None; }
+                found = Some(probe);
+            }
+        }
+    }
+    found
 }
 
 fn valid(handler: &ExecNtHandler, work: &Work) -> bool {
@@ -910,9 +974,19 @@ pub(crate) unsafe fn redrive(
                 // A nested admission can inspect this exact source while its row is absent.
                 *core::ptr::addr_of_mut!(EXECUTING_SOURCE) =
                     Some((work.view.view.area(), work.rva, work.phase));
+                *core::ptr::addr_of_mut!(EXECUTING_PROBE) = diagnostic_probe(&work, true);
                 work.drive_progress = false;
                 let before = core::mem::discriminant(&work.phase);
+                let pending_before = work.read.as_ref().and_then(ImageRead::pending_key);
                 let done = advance(handler, dispatcher, &mut work);
+                if core::mem::discriminant(&work.phase) != before {
+                    work.phase_entered_at_100ns = monotonic_time_100ns();
+                }
+                let pending_after = work.read.as_ref().and_then(ImageRead::pending_key);
+                if pending_after != pending_before {
+                    work.pending_irp_since_100ns =
+                        pending_after.map(|_| monotonic_time_100ns());
+                }
                 if !is_fault { break done; }
                 let step = if done { DriveStep::Done }
                     else if matches!(work.phase, Phase::ReplyEntered | Phase::ReplySent) {
@@ -956,6 +1030,7 @@ pub(crate) unsafe fn redrive(
         });
         if !done { (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work); }
         *core::ptr::addr_of_mut!(EXECUTING_SOURCE) = None;
+        *core::ptr::addr_of_mut!(EXECUTING_PROBE) = None;
         EXECUTING_TID.store(0, Ordering::Release);
         EXECUTING_PI.store(u64::MAX, Ordering::Release);
         EXECUTING_CALLER_PI.store(u64::MAX, Ordering::Release);

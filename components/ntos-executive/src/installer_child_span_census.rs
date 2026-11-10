@@ -3,7 +3,9 @@
 
 use crate::*;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use nt_hosted_runtime::{CensusEpochGate, InstallerSyscallSpans, SpanOwner};
+use nt_hosted_runtime::{CensusEpochGate, InstallerFaultReceipt, InstallerFaultReceipts,
+    InstallerSyscallSpans, SpanOwner};
+use core::fmt::Write;
 
 const ROWS: usize = 8;
 const TOP: usize = 4;
@@ -25,6 +27,26 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static NEXT_GAP_SCAN_100NS: AtomicU64 = AtomicU64::new(0);
 static mut CENSUS_GATE: CensusEpochGate = CensusEpochGate::new(CENSUS_LIMIT);
 static mut SPANS: InstallerSyscallSpans<ROWS, TOP> = InstallerSyscallSpans::new();
+static mut FAULTS: InstallerFaultReceipts<ROWS> = InstallerFaultReceipts::new();
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PageInSource {
+    Data(nt_memory_manager::SectionIdentity),
+    Image(nt_memory_manager::image_section::ImageAreaId),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PageInProbe {
+    pub source: PageInSource,
+    pub phase: u8,
+    pub phase_entered_at_100ns: u64,
+    pub irp_id: Option<u64>,
+    pub irp_entered_at_100ns: Option<u64>,
+    pub read_subphase: u8,
+    pub page: u64,
+    pub reply: u64,
+    pub executing: bool,
+}
 // Only the root loop appends to this finite diagnostic history. An old generation never
 // authorizes another sample; the total cap also bounds all native debug IPCs for the boot.
 static mut GAP_SAMPLES: [Option<GapSampleRecord>; GAP_SAMPLES_TOTAL as usize] =
@@ -60,7 +82,27 @@ fn retire_stale(handler: &ExecNtHandler) {
         }
     }
     let ledger = unsafe { &mut *core::ptr::addr_of_mut!(SPANS) };
-    for owner in stale.into_iter().flatten() { let _ = ledger.retire(owner); }
+    for owner in stale.into_iter().flatten() {
+        let _ = ledger.retire(owner);
+        unsafe { (&mut *core::ptr::addr_of_mut!(FAULTS)).retire(owner); }
+    }
+}
+
+/// Capture ingress before a routed worker moves the exact fault Reply. Sampling is gated by
+/// the already activated installer ledger, so ordinary boot faults do not fill this table.
+pub(crate) fn note_fault(handler: &ExecNtHandler, pi: usize, tid: u64, badge: u64,
+    reply: u64, ip: u64, addr: u64, error_code: u64) {
+    if !ACTIVE.load(Ordering::Acquire) { return; }
+    let tracked = unsafe { (&*core::ptr::addr_of!(SPANS)).owners() }
+        .any(|owner| owner.process_index == pi && owner.thread_id == tid);
+    if !tracked { return; }
+    let Some(owner) = exact_owner(handler, pi, tid, badge) else { return; };
+    let now = monotonic_time_100ns();
+    if unsafe { (&*core::ptr::addr_of!(SPANS)).snapshot(owner, now) }
+        .is_none() { return; }
+    let _ = unsafe { (&mut *core::ptr::addr_of_mut!(FAULTS)).record(
+        InstallerFaultReceipt { owner, badge, reply, fault_ip: ip, fault_addr: addr,
+            fault_error_code: error_code, entered_at_100ns: now }) };
 }
 
 pub(crate) fn activate_after_enum_open(handler: &ExecNtHandler, pi: usize) {
@@ -151,6 +193,16 @@ pub(crate) fn maybe_sample_gap(handler: &ExecNtHandler, now: u64) {
             else { continue; };
         if !claim_gap_sample(owner, return_at, now) { continue; }
 
+        // Copy value-only root/worker records before debug IPC can nest into a provider pump.
+        let fault = unsafe { (&*core::ptr::addr_of!(FAULTS)).latest(owner, badge) };
+        let (section_probe, image_probe) = if let Some(fault) = fault {
+            let page = fault.fault_addr & !0xfffu64;
+            (crate::section_pagein_work::diagnostic_snapshot(
+                owner, badge, page, fault.reply),
+             crate::native_image_pagein_work::diagnostic_snapshot(
+                owner, badge, page, fault.reply))
+        } else { (None, None) };
+
         let _message = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
         let mut regs = [0u64; 20];
         let regs_valid = unsafe { win32k_glue::tcb_read_regs20_checked(tcb, &mut regs) };
@@ -193,6 +245,42 @@ pub(crate) fn maybe_sample_gap(handler: &ExecNtHandler, now: u64) {
                 print_str(b" rsi="); print_hex_u64(regs[nt_user_callback::USER_CONTEXT_RSI]);
             }
             print_str(b"\n");
+            if state[win32k_glue::TCB_DBG_PENDING_FAULT] == 6 {
+                let mut record = nt_printf::record::RecordBuffer::<512>::new();
+                match fault {
+                    Some(fault) => {
+                        let _ = write!(record,
+                            "[installer-child-gap-fault] pi/pgen/tid/tgen/badge/reply/ip/addr/x86-error/age-ms={}/{}/{}/{}/{}/{}/0x{:x}/0x{:x}/0x{:x}/{}",
+                            owner.process_index, owner.process_generation, owner.thread_id,
+                            owner.thread_generation, badge, fault.reply, fault.fault_ip,
+                            fault.fault_addr, fault.fault_error_code,
+                            now.saturating_sub(fault.entered_at_100ns) / 10_000);
+                        match (section_probe, image_probe) {
+                            (Some(probe), None) | (None, Some(probe)) => {
+                                let _ = write!(record,
+                                    " worker={:?} phase={} age-ms={} read-subphase={} irp={:?} irp-age-ms={:?} executing={}",
+                                    probe.source, probe.phase,
+                                    now.saturating_sub(probe.phase_entered_at_100ns) / 10_000,
+                                    probe.read_subphase, probe.irp_id,
+                                    probe.irp_entered_at_100ns.map(|at|
+                                        now.saturating_sub(at) / 10_000), probe.executing);
+                            }
+                            (None, None) => { let _ = write!(record, " worker=none"); }
+                            (Some(_), Some(_)) => {
+                                let _ = write!(record, " worker=ambiguous");
+                            }
+                        }
+                    }
+                    None => { let _ = write!(record,
+                        "[installer-child-gap-fault] pi/pgen/tid/tgen={}/{}/{}/{} receipt=none",
+                        owner.process_index, owner.process_generation, owner.thread_id,
+                        owner.thread_generation); }
+                }
+                let _ = write!(record, "\n");
+                sel4_rt::print_record(if record.overflowed() {
+                    b"[installer-child-gap-fault] trace truncated\n"
+                } else { record.bytes() });
+            }
         }
     }
 }

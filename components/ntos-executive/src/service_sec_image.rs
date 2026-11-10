@@ -12510,6 +12510,9 @@ pub(crate) unsafe fn service_sec_image(
         if (mi >> 12) == 6 {
             let addr = m1;
             let page = addr & !0xFFFu64;
+            installer_child_span_census::note_fault(&nt_handler, pi,
+                nt_handler.current_tid, badge, REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                m0, addr, m3);
             if hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE).is_err() {
                 // This is a valid caller making an invalid memory access, not stale ingress.
                 // Debugger delivery retains the fault Reply; containment must cancel it otherwise.
