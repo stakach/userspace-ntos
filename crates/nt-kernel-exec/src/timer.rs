@@ -338,6 +338,8 @@ struct Timer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimerExpiry {
     pub timer_ptr: u64,
+    /// The exact set generation that expired, retained across periodic rescheduling.
+    pub generation: u64,
     pub dpc_ptr: Option<u64>,
 }
 
@@ -477,10 +479,10 @@ impl TimerQueue {
                 timer.timer_ptr, timer.generation))
     }
 
-    /// Discard all timer identities owned by this queue.
+    /// Discard all timers while keeping the generation sequence. A later timer at
+    /// the same pointer cannot acquire an identity held by an old expiry receipt.
     pub fn clear(&mut self) {
         self.timers.clear();
-        self.next_gen = 0;
     }
 
     /// The timer's current generation (bumped on every `set`; a stale expiry
@@ -507,6 +509,7 @@ impl TimerQueue {
                 t.signaled = true;
                 fired.push(TimerExpiry {
                     timer_ptr: t.ptr,
+                    generation: t.generation,
                     dpc_ptr: t.dpc_ptr,
                 });
                 if t.period_100ns > 0 {
@@ -628,6 +631,58 @@ mod tests {
     }
 
     #[test]
+    fn expiry_keeps_the_set_generation_across_periods_and_reused_pointer() {
+        let mut clk = FakeClock::new();
+        let mut tq = TimerQueue::new();
+        tq.set(0x700, -100, 1, Some(0xD1), &clk);
+        let selected = tq.earliest_active_at(clk.snapshot()).unwrap();
+
+        clk.advance_100ns(100);
+        let first = tq.run_due_expirations(&clk)[0];
+        assert_eq!(first.timer_ptr, selected.timer_ptr);
+        assert_eq!(first.generation, selected.generation);
+        assert_eq!(tq.generation(0x700), Some(first.generation));
+
+        clk.advance_100ns(10_000);
+        let periodic = tq.run_due_expirations(&clk)[0];
+        assert_eq!(periodic.generation, first.generation);
+
+        // Re-arm the same pointer with the same DPC. Pointer-only matching would
+        // misidentify a delayed receipt from the old set as this new expiry.
+        tq.set(0x700, -100, 0, Some(0xD1), &clk);
+        let replacement = tq.earliest_active_at(clk.snapshot()).unwrap();
+        assert_eq!(replacement.timer_ptr, first.timer_ptr);
+        assert_ne!(replacement.generation, first.generation);
+        clk.advance_100ns(100);
+        let current = tq.run_due_expirations(&clk)[0];
+        assert_eq!(current.generation, replacement.generation);
+        assert_eq!(current.timer_ptr, first.timer_ptr);
+        assert_eq!(current.dpc_ptr, first.dpc_ptr);
+        assert_ne!(current, first);
+
+        tq.clear();
+        tq.set(0x700, -100, 0, Some(0xD1), &clk);
+        let after_clear = tq.earliest_active_at(clk.snapshot()).unwrap();
+        assert_ne!(after_clear.generation, current.generation);
+        clk.advance_100ns(100);
+        let recycled = tq.run_due_expirations(&clk)[0];
+        assert_eq!(recycled.timer_ptr, first.timer_ptr);
+        assert_ne!(recycled.generation, first.generation);
+        assert_ne!(recycled.generation, current.generation);
+    }
+
+    #[test]
+    fn queue_clear_never_reuses_a_previously_published_generation() {
+        let clk = FakeClock::new();
+        let mut tq = TimerQueue::new();
+        tq.set(0x700, -100, 0, None, &clk);
+        let before = tq.generation(0x700).unwrap();
+        tq.clear();
+        tq.set(0x700, -100, 0, None, &clk);
+        assert_ne!(tq.generation(0x700), Some(before));
+    }
+
+    #[test]
     fn cancel_stops_a_timer() {
         let mut clk = FakeClock::new();
         let mut tq = TimerQueue::new();
@@ -643,6 +698,7 @@ mod tests {
         let mut clk = FakeClock::new();
         let mut tq = TimerQueue::new();
         tq.set(0x700, -1_000, 0, None, &clk);
+        let generation = tq.generation(0x700).unwrap();
         tq.set(0x800, -2_000, 0, Some(0xD2), &clk);
         assert_eq!(tq.next_deadline(&clk), Some(1_000));
 
@@ -651,6 +707,7 @@ mod tests {
             tq.run_due_expirations(&clk),
             vec![TimerExpiry {
                 timer_ptr: 0x700,
+                generation,
                 dpc_ptr: None,
             }]
         );
@@ -666,6 +723,7 @@ mod tests {
         let clk = FakeClock::new();
         let mut tq = TimerQueue::new();
         tq.set(0x700, -1_000, 0, Some(0xD1), &clk);
+        let generation = tq.generation(0x700).unwrap();
 
         // The sampled clock is still one quantum behind, but the interrupt
         // owner knows that the armed deadline produced this delivery.
@@ -679,6 +737,7 @@ mod tests {
             tq.run_due_expirations_at(now),
             vec![TimerExpiry {
                 timer_ptr: 0x700,
+                generation,
                 dpc_ptr: Some(0xD1),
             }]
         );
