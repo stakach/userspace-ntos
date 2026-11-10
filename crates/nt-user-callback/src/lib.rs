@@ -2,7 +2,9 @@
 
 mod message_output;
 mod dispatch_return;
+mod private_arg_stage;
 mod shared_page_lease;
+pub use private_arg_stage::{ArgStageError, DirtyArgSpan, PrivateArgStage};
 pub use shared_page_lease::{
     SharedPageClientIdentity, SharedPageLeaseError, SharedPageLeaseIdentity,
     SharedPageProvisionalIdentity, SharedPageReservationEffect,
@@ -19,6 +21,10 @@ pub use windowproc::windowproc_lparam_span;
 #[cfg(test)]
 #[path = "shared_page_lease_tests.rs"]
 mod shared_page_lease_tests;
+
+#[cfg(test)]
+#[path = "private_arg_stage_tests.rs"]
+mod private_arg_stage_tests;
 
 pub const CALLBACK_MAGIC: u32 = u32::from_le_bytes(*b"UCBK");
 pub const CALLBACK_VERSION: u16 = 1;
