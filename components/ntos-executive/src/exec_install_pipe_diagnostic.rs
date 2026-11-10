@@ -158,6 +158,9 @@ impl ExecNtHandler {
         if !self.install_pipe_diagnostic.child_is_tracked(child) { return; }
         let Some(open) = self.install_pipe_diagnostic.observe_enum_open(child, path, status)
             else { return; };
+        if status == 0 && open.device_ordinal == 1 {
+            crate::service_sec_image::installer_child_span_census::activate_after_enum_open(self, pi);
+        }
         print_str(b"[pnp-install-enum-open] child-pid/gen/server-file/ordinal/status=");
         print_u64(u64::from(pid));
         print_str(b"/");

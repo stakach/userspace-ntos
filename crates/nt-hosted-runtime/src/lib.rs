@@ -22,6 +22,7 @@ mod setup_read_stage_sample;
 mod hosted_file_phase_diagnostic;
 mod hosted_file_rpc_phase;
 mod hosted_install_pipe_diagnostic;
+mod installer_syscall_span;
 mod native_block_stage_sample;
 mod native_cache_claim_drain;
 mod retained_system_fold_phase;
@@ -46,6 +47,7 @@ pub use win32k_bulk_stage::{
 };
 
 pub use driver_load_receipt::{DriverLoadPhase, RetainedEffectState};
+pub use installer_syscall_span::{InstallerSyscallSpans, SpanOwner, SpanSample, SpanSnapshot, SsnTotal};
 pub use contiguous_ram::{ContiguousRamCachePolicy, ContiguousRamError, ContiguousRamLayout, ContiguousRamOwner,
     ContiguousRamPrepareTable, ContiguousRamReceipt, ContiguousRamRequest,
     ContiguousRamLeaseBank, ContiguousRamLease, ContiguousRamLeaseSource,
