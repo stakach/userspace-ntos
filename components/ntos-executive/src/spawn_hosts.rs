@@ -2147,9 +2147,9 @@ unsafe fn pump_reply_recv4_traced(
     reply_r3: u64,
     power_report_badge: Option<u64>,
     trace_system_thread_reply: bool,
-    dpc_probe: Option<(u64, u64)>,
+    dpc_reply: Option<(u64, u64)>,
 ) -> PumpMessage {
-    if let Some((dpc, generation)) = dpc_probe {
+    if let Some((dpc, generation)) = dpc_reply {
         crate::driver_launch::hosted_dpc_transition_trace::record(
             1, None, dpc, generation, reply_r1, reply_r0 as u32 as i32, ch.tcb, reply_cap);
     }
@@ -2187,7 +2187,7 @@ unsafe fn pump_reply_recv4_traced(
     if !sent {
         return PumpMessage::transport_wall();
     }
-    if let Some((dpc, generation)) = dpc_probe {
+    if let Some((dpc, generation)) = dpc_reply {
         crate::driver_launch::hosted_dpc_transition_trace::record(
             2, None, dpc, generation, u64::from(sent), reply_r0 as u32 as i32,
             ch.tcb, reply_cap);
@@ -2203,8 +2203,14 @@ unsafe fn pump_reply_recv4_traced(
     let timer_checkpoint = (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
         && crate::dispatcher_bootstrap::request_receive_checkpoint()
         && crate::dispatcher_bootstrap::timer_work_pending();
-    if timer_checkpoint {
-        if let Some((dpc, generation)) = dpc_probe {
+    let receive_demand = nt_user_host::component_pump::PostReplyReceiveDemand {
+        timer_checkpoint_ready: timer_checkpoint,
+        queued_dpc: dpc_reply.is_some()
+            && reply_r0 as u32 == nt_process::STATUS_SUCCESS
+            && crate::driver_launch::hosted_driver_dpc_activation_pending(),
+    };
+    if receive_demand.scheduler_yield() {
+        if let Some((dpc, generation)) = dpc_reply {
             crate::driver_launch::hosted_dpc_transition_trace::record(
                 3, None, dpc, generation, 1, reply_r0 as u32 as i32,
                 ch.tcb, reply_cap);
@@ -2217,7 +2223,7 @@ unsafe fn pump_reply_recv4_traced(
     if trace_system_thread_reply {
         crate::print_str(b"[driver-thread-reply] receive-next\n");
     }
-    if let Some((dpc, generation)) = dpc_probe {
+    if let Some((dpc, generation)) = dpc_reply {
         crate::driver_launch::hosted_dpc_transition_trace::record(
             4, None, dpc, generation, 0, reply_r0 as u32 as i32,
             ch.tcb, reply_cap);

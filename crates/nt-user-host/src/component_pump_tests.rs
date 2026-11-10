@@ -1,6 +1,29 @@
 use super::*;
 
 #[test]
+fn post_reply_receive_keeps_timer_checkpoint_and_idle_receive_behavior() {
+    assert!(PostReplyReceiveDemand {
+        timer_checkpoint_ready: true,
+        queued_dpc: false,
+    }.scheduler_yield());
+    assert!(!PostReplyReceiveDemand {
+        timer_checkpoint_ready: false,
+        queued_dpc: false,
+    }.scheduler_yield());
+}
+
+#[test]
+fn queued_dpc_yields_before_retained_receive_without_bootstrap_timer_owner() {
+    // QueueDpc has already acknowledged its exact DPC and the service Reply has been sent.
+    // An unowned dispatcher bootstrap cannot supply a timer checkpoint; the queued DPC
+    // remains scheduler work before this retained component enters physical receive.
+    assert!(PostReplyReceiveDemand {
+        timer_checkpoint_ready: false,
+        queued_dpc: true,
+    }.scheduler_yield());
+}
+
+#[test]
 fn counters_and_depth_follow_the_active_snapshot_across_yields() {
     let mut active = ComponentPumpAccounting::new(true);
     for slice in 1..=4 {

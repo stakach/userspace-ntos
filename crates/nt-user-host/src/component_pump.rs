@@ -1,5 +1,5 @@
-//! Cumulative component-pump diagnostics and dispatch-depth bookkeeping across receive slices.
-//! Copies are observational snapshots, never independent execution or endpoint authority.
+//! Component receive-boundary policy and cumulative dispatch-depth bookkeeping.
+//! Demand snapshots select a scheduling boundary without owning a Reply, DPC, or endpoint.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PumpDepthDisposition {
@@ -7,6 +7,21 @@ pub enum PumpDepthDisposition {
     Retained,
     Suspended,
     Released,
+}
+
+/// Scheduler demand observed after an authenticated service Reply has been sent.
+/// This only selects the next receive boundary; Reply and DPC ownership stay with their
+/// existing canonical owners.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PostReplyReceiveDemand {
+    pub timer_checkpoint_ready: bool,
+    pub queued_dpc: bool,
+}
+
+impl PostReplyReceiveDemand {
+    pub const fn scheduler_yield(self) -> bool {
+        self.timer_checkpoint_ready || self.queued_dpc
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
