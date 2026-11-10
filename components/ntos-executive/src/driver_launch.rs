@@ -167,6 +167,8 @@ pub(crate) fn hosted_seh_linkage(
 mod component_scheduler;
 #[path = "hosted_dpc_scheduler.rs"]
 mod hosted_dpc_scheduler;
+#[path = "hosted_dpc_transition_trace.rs"]
+pub(crate) mod hosted_dpc_transition_trace;
 pub(crate) use hosted_dpc_scheduler::{
     next_deadline as hosted_dpc_next_deadline, wake_due as hosted_dpc_wake_due,
 };
@@ -1845,6 +1847,7 @@ static HOSTED_DMA_SG_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_DMA_SG_TRACE_CAP: u64 = 16;
 static HOSTED_DMA_SG_FAILURE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_DMA_SG_FAILURE_TRACE_CAP: u64 = 16;
+static HOSTED_DMA_EIGHT_BYTE_READ_SG_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DMA_PRIVATE_POOL_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_DMA_PRIVATE_POOL_FAILURE_CAP: u64 = 4;
 static HOSTED_RESOURCE_GRANT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -12560,6 +12563,32 @@ unsafe fn trace_hosted_dma_sg(
     print_str(b"\n");
 }
 
+#[allow(clippy::too_many_arguments)]
+fn trace_hosted_dma_eight_byte_read_sg(
+    event: u64,
+    stage: &[u8],
+    status: i32,
+    adapter: u64,
+    device_object: u64,
+    mdl: u64,
+    current_va: u64,
+    execution_routine: u64,
+    context: u64,
+    sg_list: u64,
+) {
+    print_str(b"[provider-eight-byte-read-sg] event/stage/status/adapter/device/mdl/va/routine/context/sg=");
+    print_u64(event);
+    print_str(b"/");
+    print_str(stage);
+    print_str(b"/");
+    print_hex(status as u32);
+    for value in [adapter, device_object, mdl, current_va, execution_routine, context, sg_list] {
+        print_str(b"/");
+        print_hex64(value);
+    }
+    print_str(b"\n");
+}
+
 /// A root-provisioned DMA graph allocates from the same component pool as ExAllocatePool,
 /// but does not pass through the component-side pool exhaustion logger.
 unsafe fn trace_hosted_dma_private_pool_failure(inst: DriverInstance, size: u64) {
@@ -13485,9 +13514,16 @@ extern "win64" fn s_dma_get_scatter_gather_list(
     context: u64,
     write_to_device: u8,
 ) -> i32 {
+    let eight_byte_read_event = (length == 8 && write_to_device == 0).then(|| {
+        HOSTED_DMA_EIGHT_BYTE_READ_SG_TRACE_COUNT.fetch_add(1, Ordering::Relaxed)
+    }).filter(|event| *event < 32 || event.is_power_of_two());
     unsafe {
         if execution_routine == 0 || length == 0 || dma_active_adapter_and_grant(adapter).is_none()
         {
+            if let Some(event) = eight_byte_read_event {
+                trace_hosted_dma_eight_byte_read_sg(event, b"bad-input", STATUS_INVALID_PARAMETER,
+                    adapter, device_object, mdl, current_va, execution_routine, context, 0);
+            }
             trace_hosted_dma_sg(
                 b"get",
                 b"bad-input",
@@ -13505,6 +13541,10 @@ extern "win64" fn s_dma_get_scatter_gather_list(
         let Some((map_register, sg_context, sg_list)) = dma_allocate_private_graph(
             adapter, HOSTED_DMA_SERVICE_ALLOC_SG_GET, 0, 0,
         ) else {
+            if let Some(event) = eight_byte_read_event {
+                trace_hosted_dma_eight_byte_read_sg(event, b"list-alloc-failed", STATUS_INSUFFICIENT_RESOURCES,
+                    adapter, device_object, mdl, current_va, execution_routine, context, 0);
+            }
             trace_hosted_dma_sg(
                 b"get",
                 b"list-alloc-failed",
@@ -13533,6 +13573,10 @@ extern "win64" fn s_dma_get_scatter_gather_list(
         );
         if status != 0 {
             let _ = dma_retire_sg_list(adapter, sg_list);
+            if let Some(event) = eight_byte_read_event {
+                trace_hosted_dma_eight_byte_read_sg(event, b"prepare-failed", status,
+                    adapter, device_object, mdl, current_va, execution_routine, context, sg_list);
+            }
             trace_hosted_dma_sg(
                 b"get",
                 b"prepare-failed",
@@ -13560,7 +13604,15 @@ extern "win64" fn s_dma_get_scatter_gather_list(
             print_u64(u32::from_be(read_unaligned((current_va + 8) as *const u32)) as u64);
             print_str(b"\n");
         }
+        if let Some(event) = eight_byte_read_event {
+            trace_hosted_dma_eight_byte_read_sg(event, b"callback-enter", STATUS_SUCCESS,
+                adapter, device_object, mdl, current_va, execution_routine, context, sg_list);
+        }
         call_hosted_pe(execution_routine, &[device_object, 0, sg_list, context]);
+        if let Some(event) = eight_byte_read_event {
+            trace_hosted_dma_eight_byte_read_sg(event, b"callback-return", STATUS_SUCCESS,
+                adapter, device_object, mdl, current_va, execution_routine, context, sg_list);
+        }
         if trace_capacity_data {
             print_str(b"[provider-capacity-sg] after va/last-lba/sector-bytes=");
             print_u64(current_va);
@@ -16556,6 +16608,8 @@ unsafe fn drain_hosted_driver_dpc_snapshot() -> u64 {
             .as_ref().map_or(0, |table| table.queued_count(owner) as u64);
         matched_queued = matched_queued.saturating_add(queued);
         if queued != 0 {
+            hosted_dpc_transition_trace::record(5, Some(owner), 0, 0,
+                queued, STATUS_SUCCESS, 0, 0);
             let state = hosted_irq_lanes().and_then(|lanes| lanes.get(index)).map_or(0, |lane|
                 match lane.state {
                     HostedIrqLaneState::Ready => 1,
@@ -16567,10 +16621,18 @@ unsafe fn drain_hosted_driver_dpc_snapshot() -> u64 {
         }
         match hosted_irq_broker::drain_dpcs(owner) {
             Ok(count) => {
+                if queued != 0 {
+                    hosted_dpc_transition_trace::record(6, Some(owner), 0, 0,
+                        count, STATUS_SUCCESS, 0, 0);
+                }
                 if queued != 0 { trace_connect_dpc_probe(12, index as u64, queued, count); }
                 delivered = delivered.saturating_add(count);
             }
             Err(status) => {
+                if queued != 0 {
+                    hosted_dpc_transition_trace::record(6, Some(owner), 0, 0,
+                        0, status.raw(), 0, 0);
+                }
                 print_str(b"[hosted-dpc] dispatch failed domain=");
                 print_u64(identity.domain_id);
                 print_str(b" lane-generation=");
@@ -69469,8 +69531,14 @@ pub(crate) fn service_hosted_driver_queue_dpc(
         )
     };
     match queued {
-        Ok(HostedDpcQueueResult::Queued(identity)) => (STATUS_SUCCESS, 1, identity.generation),
+        Ok(HostedDpcQueueResult::Queued(identity)) => {
+            hosted_dpc_transition_trace::record(0, Some(identity.owner), dpc,
+                identity.generation, 1, STATUS_SUCCESS, ch.tcb, active_reply_cap);
+            (STATUS_SUCCESS, 1, identity.generation)
+        }
         Ok(HostedDpcQueueResult::AlreadyQueued(identity)) => {
+            hosted_dpc_transition_trace::record(0, Some(identity.owner), dpc,
+                identity.generation, 0, STATUS_SUCCESS, ch.tcb, active_reply_cap);
             (STATUS_SUCCESS, 0, identity.generation)
         }
         Err(status) => {
@@ -69484,6 +69552,8 @@ pub(crate) fn service_hosted_driver_queue_dpc(
                     );
                 }
             }
+            hosted_dpc_transition_trace::record(0, None, dpc, 0, 0,
+                status.raw(), ch.tcb, active_reply_cap);
             (status.raw(), 0, 0)
         }
     }

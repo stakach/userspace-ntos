@@ -1392,6 +1392,10 @@ impl HostedIrqRootSession {
             HostedDpcQueueResult::Queued(identity) => (true, identity),
             HostedDpcQueueResult::AlreadyQueued(identity) => (false, identity),
         };
+        super::hosted_dpc_transition_trace::record(
+            0, Some(identity.owner), command.service_id, identity.generation,
+            u64::from(inserted), STATUS_SUCCESS, 0, 0,
+        );
         let mut result = service_result(STATUS_SUCCESS, Some(inserted as u64));
         result.value_count = 2;
         result.values[1] = identity.generation;

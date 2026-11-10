@@ -2134,7 +2134,7 @@ unsafe fn pump_reply_recv4(
     reply_r2: u64,
     reply_r3: u64,
 ) -> PumpMessage {
-    pump_reply_recv4_traced(ch, reply_cap, reply_msginfo, reply_r0, reply_r1, reply_r2, reply_r3, None, false)
+    pump_reply_recv4_traced(ch, reply_cap, reply_msginfo, reply_r0, reply_r1, reply_r2, reply_r3, None, false, None)
 }
 
 unsafe fn pump_reply_recv4_traced(
@@ -2147,7 +2147,12 @@ unsafe fn pump_reply_recv4_traced(
     reply_r3: u64,
     power_report_badge: Option<u64>,
     trace_system_thread_reply: bool,
+    dpc_probe: Option<(u64, u64)>,
 ) -> PumpMessage {
+    if let Some((dpc, generation)) = dpc_probe {
+        crate::driver_launch::hosted_dpc_transition_trace::record(
+            1, None, dpc, generation, reply_r1, reply_r0 as u32 as i32, ch.tcb, reply_cap);
+    }
     if let Some(badge) = power_report_badge {
         crate::driver_launch::trace_report_rpc(b"reply-send", reply_cap, badge, reply_r0 as u32 as i32, reply_r1);
     }
@@ -2182,6 +2187,11 @@ unsafe fn pump_reply_recv4_traced(
     if !sent {
         return PumpMessage::transport_wall();
     }
+    if let Some((dpc, generation)) = dpc_probe {
+        crate::driver_launch::hosted_dpc_transition_trace::record(
+            2, None, dpc, generation, u64::from(sent), reply_r0 as u32 as i32,
+            ch.tcb, reply_cap);
+    }
     if shared_pump::autonomous(ch) {
         let route = shared_ingress::owner::runtime::channel_route(ch).ok().flatten()
             .expect("authenticated autonomous source");
@@ -2190,10 +2200,15 @@ unsafe fn pump_reply_recv4_traced(
         message.service_finished = true;
         return message;
     }
-    if (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
+    let timer_checkpoint = (ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield)
         && crate::dispatcher_bootstrap::request_receive_checkpoint()
-        && crate::dispatcher_bootstrap::timer_work_pending()
-    {
+        && crate::dispatcher_bootstrap::timer_work_pending();
+    if timer_checkpoint {
+        if let Some((dpc, generation)) = dpc_probe {
+            crate::driver_launch::hosted_dpc_transition_trace::record(
+                3, None, dpc, generation, 1, reply_r0 as u32 as i32,
+                ch.tcb, reply_cap);
+        }
         if trace_system_thread_reply {
             crate::print_str(b"[driver-thread-reply] scheduler-checkpoint\n");
         }
@@ -2201,6 +2216,11 @@ unsafe fn pump_reply_recv4_traced(
     }
     if trace_system_thread_reply {
         crate::print_str(b"[driver-thread-reply] receive-next\n");
+    }
+    if let Some((dpc, generation)) = dpc_probe {
+        crate::driver_launch::hosted_dpc_transition_trace::record(
+            4, None, dpc, generation, 0, reply_r0 as u32 as i32,
+            ch.tcb, reply_cap);
     }
     crate::driver_launch::trace_port_connect_handoff_probe(32, ch, reply_cap);
     let received = pump_recv(ch, reply_cap);
@@ -4105,7 +4125,7 @@ unsafe fn component_pump_loop(
                     ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.m4, msg.badge, *reply_cap,
                 );
             msg = pump_reply_recv4_traced(
-                ch, *reply_cap, 2, status as u32 as u64, handle, 0, 0, None, true,
+                ch, *reply_cap, 2, status as u32 as u64, handle, 0, 0, None, true, None,
             );
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL
@@ -4756,15 +4776,9 @@ unsafe fn component_pump_loop(
                 crate::driver_launch::service_hosted_driver_queue_dpc(
                     ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.m4, *reply_cap,
                 );
-            pump_reply_recv4_into!(
-                ch,
-                *reply_cap,
-                msg,
-                3,
-                status as u32 as u64,
-                inserted,
-                generation,
-                0
+            msg = pump_reply_recv4_traced(
+                ch, *reply_cap, 3, status as u32 as u64,
+                inserted, generation, 0, None, false, Some((msg.m0, generation)),
             );
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_REMOVE_DPC_LABEL
@@ -4970,7 +4984,7 @@ unsafe fn component_pump_loop(
                 );
                 msg = pump_reply_recv4_traced(
                     ch, *reply_cap, 4, status as u32 as u64,
-                    required_len, transfer_token, chunk_len, Some(msg.badge), false,
+                    required_len, transfer_token, chunk_len, Some(msg.badge), false, None,
                 );
             } else {
                 pump_reply_recv4_into!(
