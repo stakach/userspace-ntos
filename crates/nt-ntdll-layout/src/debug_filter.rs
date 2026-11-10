@@ -18,10 +18,11 @@ pub const ABI_VERSION: u32 = 1;
 /// The executive must reserve this page in its guest VM policy before mapping it.
 pub const HOSTED_USER_VA: u64 = 0x0000_0100_1605_0000;
 
-/// Adjacent to, and disjoint from, the one-page kernel-mode KUSER alias.
-/// Hosted driver domains map this page read-only; the executive has a separate
-/// writable alias. PnP resource windows live in the low user canonical range.
-pub const HOSTED_DRIVER_VA: u64 = crate::kuser::KERNEL_ALIAS_VA + PAGE_SIZE as u64;
+/// Reserved leaf in the hosted driver's existing auxiliary page table, beyond
+/// its argument bank. Only the exact KUSER leaf is admitted in the upper
+/// canonical half, so this shared page has its own lower-canonical address.
+/// The executive retains a separate writable alias.
+pub const HOSTED_DRIVER_VA: u64 = 0x0000_0100_0F3B_0000;
 
 const HEADER_SIZE: usize = 4 * size_of::<u32>();
 const MASKS_SIZE: usize = COMPONENT_COUNT * size_of::<u32>();
@@ -98,7 +99,7 @@ const _: () = assert!(offset_of!(DebugFilterPage, default_mask) == 12);
 const _: () = assert!(offset_of!(DebugFilterPage, component_masks) == 16);
 const _: () = assert!(HOSTED_USER_VA & (PAGE_SIZE as u64 - 1) == 0);
 const _: () = assert!(HOSTED_DRIVER_VA & (PAGE_SIZE as u64 - 1) == 0);
-const _: () = assert!(HOSTED_DRIVER_VA == crate::kuser::KERNEL_ALIAS_VA + PAGE_SIZE as u64);
+const _: () = assert!(HOSTED_DRIVER_VA + (PAGE_SIZE as u64) < (1u64 << 47));
 
 #[cfg(test)]
 mod tests {
@@ -117,6 +118,15 @@ mod tests {
         assert_eq!(offset_of!(DebugFilterPage, component_masks), 16);
         assert_eq!(HOSTED_USER_VA & 0xfff, 0);
         assert_eq!(HOSTED_DRIVER_VA & 0xfff, 0);
+    }
+
+    #[test]
+    fn driver_alias_is_admitted_by_the_microkernel_user_frame_boundary() {
+        // rust-micro admits only the exact KUSER leaf in the upper canonical
+        // half. Any other driver frame must fit wholly below USER_VADDR_END.
+        assert!(HOSTED_DRIVER_VA
+            .checked_add(PAGE_SIZE as u64)
+            .is_some_and(|end| end < (1u64 << 47)));
     }
 
     #[test]

@@ -918,6 +918,13 @@ const _: () = assert!(FSD_SHARED_VADDR + FSD_SHARED_FRAMES * 0x1000 <= FSD_ARG_V
 /// for synchronous device-service replies so registry/IRP marshalling cannot overwrite them.
 pub const FSD_ARG_VADDR: u64 = 0x0000_0100_0F3A_0000;
 pub const FSD_ARG_FRAMES: u64 = 4;
+// Reserve the debug-filter leaf in the existing aux PT without overlapping
+// the shared argument bank or a later driver mapping window.
+const _: () = assert!(FSD_ARG_VADDR + FSD_ARG_FRAMES * 0x1000
+    <= nt_ntdll_layout::debug_filter::HOSTED_DRIVER_VA);
+const _: () = assert!(nt_ntdll_layout::debug_filter::HOSTED_DRIVER_VA + 0x1000
+    <= FSD_AUX_PT_VADDR + 0x20_0000);
+const _: () = assert!(nt_ntdll_layout::debug_filter::HOSTED_DRIVER_VA < FSD_WORKER_VADDR);
 const FSD_ARG_MAPPED_BYTES: u64 = FSD_ARG_FRAMES * 0x1000;
 const FSD_ARG_BYTES: u64 = FSD_ARG_MAPPED_BYTES - REP_DATA_LEN as u64;
 const STATUS_INVALID_BUFFER_SIZE: u32 = 0xC000_0206;
