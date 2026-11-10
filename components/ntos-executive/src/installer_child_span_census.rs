@@ -129,6 +129,13 @@ pub(crate) fn print_census(handler: &ExecNtHandler) {
             print_u64(top.total_100ns / 10_000); print_str(b"/");
             print_u64(top.max_100ns / 10_000); print_str(b" ");
         }
+        print_str(b" same-ssn-gap/ssn/count/total-ms/max-ms=");
+        for gap in snapshot.same_ssn_gaps.into_iter().flatten() {
+            print_u64(gap.ssn as u64); print_str(b"/");
+            print_u64(gap.calls); print_str(b"/");
+            print_u64(gap.total_100ns / 10_000); print_str(b"/");
+            print_u64(gap.max_100ns / 10_000); print_str(b" ");
+        }
         print_str(b"\n");
     }
     if ledger.activation_overflow() != 0 {

@@ -70,6 +70,8 @@ pub struct SpanSnapshot<const TOP: usize> {
     pub active: Option<SpanSample>,
     pub pending: Option<SpanSample>,
     pub top: [Option<SsnTotal>; TOP],
+    /// Return-to-next-entry gaps where both completed calls have the same SSN.
+    pub same_ssn_gaps: [Option<SsnTotal>; TOP],
     /// Distinct observed SSNs omitted from `top`.
     pub overflow_ssns: u64,
     /// Completed calls outside the fixed canonical SSN range.
@@ -90,6 +92,7 @@ struct Row {
     active: Option<ActiveSpan>,
     pending: Option<ActiveSpan>,
     last_return_at: Option<u64>,
+    last_return_ssn: Option<u32>,
     completed: u64,
     retained_pending: u64,
     unresolved_replaced: u64,
@@ -97,31 +100,22 @@ struct Row {
     max_gap_100ns: u64,
     unindexed_calls: u64,
     counters: [Counter; SSN_CAP],
+    same_ssn_gap_counters: [Counter; SSN_CAP],
 }
 
 impl Row {
     const EMPTY: Self = Self {
         owner: None, active: None, pending: None, last_return_at: None,
+        last_return_ssn: None,
         completed: 0, retained_pending: 0, unresolved_replaced: 0,
         total_gap_100ns: 0, max_gap_100ns: 0, unindexed_calls: 0,
         counters: [Counter::EMPTY; SSN_CAP],
+        same_ssn_gap_counters: [Counter::EMPTY; SSN_CAP],
     };
 
     fn snapshot<const TOP: usize>(&self, owner: SpanOwner, now: u64) -> SpanSnapshot<TOP> {
-        let mut top: [Option<SsnTotal>; TOP] = [None; TOP];
-        let mut distinct = 0u64;
-        for (ssn, counter) in self.counters.iter().enumerate() {
-            if counter.calls == 0 { continue; }
-            distinct += 1;
-            let item = SsnTotal { ssn: ssn as u32, calls: counter.calls,
-                total_100ns: counter.total_100ns, max_100ns: counter.max_100ns };
-            let Some(position) = top.iter().position(|slot| slot.is_none_or(|prior|
-                (item.total_100ns, item.calls, core::cmp::Reverse(item.ssn))
-                    > (prior.total_100ns, prior.calls, core::cmp::Reverse(prior.ssn))))
-                else { continue; };
-            for index in (position + 1..TOP).rev() { top[index] = top[index - 1]; }
-            top[position] = Some(item);
-        }
+        let (top, distinct) = top_counters(&self.counters);
+        let (same_ssn_gaps, _) = top_counters(&self.same_ssn_gap_counters);
         SpanSnapshot {
             owner, completed: self.completed, retained_pending: self.retained_pending,
             unresolved_replaced: self.unresolved_replaced,
@@ -131,10 +125,29 @@ impl Row {
                 age_100ns: now.saturating_sub(span.at_100ns) }),
             pending: self.pending.map(|span| SpanSample { ssn: span.ssn,
                 age_100ns: now.saturating_sub(span.at_100ns) }),
-            top, overflow_ssns: distinct.saturating_sub(TOP as u64),
+            top, same_ssn_gaps, overflow_ssns: distinct.saturating_sub(TOP as u64),
             unindexed_calls: self.unindexed_calls,
         }
     }
+}
+
+fn top_counters<const TOP: usize>(counters: &[Counter; SSN_CAP])
+    -> ([Option<SsnTotal>; TOP], u64) {
+    let mut top = [None; TOP];
+    let mut distinct = 0u64;
+    for (ssn, counter) in counters.iter().enumerate() {
+        if counter.calls == 0 { continue; }
+        distinct += 1;
+        let item = SsnTotal { ssn: ssn as u32, calls: counter.calls,
+            total_100ns: counter.total_100ns, max_100ns: counter.max_100ns };
+        let Some(position) = top.iter().position(|slot: &Option<SsnTotal>| slot.is_none_or(|prior|
+            (item.total_100ns, item.calls, core::cmp::Reverse(item.ssn))
+                > (prior.total_100ns, prior.calls, core::cmp::Reverse(prior.ssn))))
+            else { continue; };
+        for index in (position + 1..TOP).rev() { top[index] = top[index - 1]; }
+        top[position] = Some(item);
+    }
+    (top, distinct)
 }
 
 /// Fixed-capacity diagnostic. Only an exact observed owner may update its row.
@@ -191,7 +204,15 @@ impl<const N: usize, const TOP: usize> InstallerSyscallSpans<N, TOP> {
             let gap = now.saturating_sub(last);
             row.total_gap_100ns = row.total_gap_100ns.saturating_add(gap);
             row.max_gap_100ns = row.max_gap_100ns.max(gap);
+            if row.last_return_ssn == Some(ssn) {
+                if let Some(counter) = row.same_ssn_gap_counters.get_mut(ssn as usize) {
+                    counter.calls = counter.calls.saturating_add(1);
+                    counter.total_100ns = counter.total_100ns.saturating_add(gap);
+                    counter.max_100ns = counter.max_100ns.max(gap);
+                }
+            }
         }
+        row.last_return_ssn = None;
         row.active = Some(ActiveSpan { ssn, at_100ns: now });
         true
     }
@@ -209,11 +230,14 @@ impl<const N: usize, const TOP: usize> InstallerSyscallSpans<N, TOP> {
         if status == STATUS_PENDING {
             row.retained_pending = row.retained_pending.saturating_add(1);
             row.pending = Some(active);
+            row.last_return_at = None;
+            row.last_return_ssn = None;
             return true;
         }
         let elapsed = now.saturating_sub(active.at_100ns);
         row.completed = row.completed.saturating_add(1);
         row.last_return_at = Some(now);
+        row.last_return_ssn = Some(ssn);
         if let Some(counter) = row.counters.get_mut(ssn as usize) {
             counter.calls = counter.calls.saturating_add(1);
             counter.total_100ns = counter.total_100ns.saturating_add(elapsed);
@@ -328,5 +352,24 @@ mod tests {
         assert_eq!(snapshot.top[0].map(|item| item.ssn), Some(39));
         assert_eq!(snapshot.top[1].map(|item| item.ssn), Some(191));
         assert_eq!(snapshot.overflow_ssns, 1);
+    }
+
+    #[test]
+    fn consecutive_same_ssn_gaps_exclude_other_calls_and_pending_returns() {
+        let mut ledger = InstallerSyscallSpans::<1, 2>::new();
+        assert!(ledger.activate(A));
+        for (ssn, start, status) in [
+            (148, 100, 0), (148, 200, 0), (39, 400, 0),
+            (148, 600, 0), (148, 900, 0x103), (148, 1_200, 0),
+            (148, 1_400, 0),
+        ] {
+            assert!(ledger.begin(A, ssn, start));
+            assert!(ledger.return_from_dispatch(A, ssn, status, start + 10));
+        }
+        let snapshot = ledger.snapshot(A, 1_500).unwrap();
+        assert_eq!(snapshot.same_ssn_gaps[0].map(|item| item.ssn), Some(148));
+        assert_eq!(snapshot.same_ssn_gaps[0].map(|item| item.calls), Some(3));
+        assert_eq!(snapshot.same_ssn_gaps[0].map(|item| item.total_100ns), Some(570));
+        assert_eq!(snapshot.same_ssn_gaps[0].map(|item| item.max_100ns), Some(290));
     }
 }
