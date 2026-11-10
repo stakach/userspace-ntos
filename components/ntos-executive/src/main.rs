@@ -222,6 +222,7 @@ mod win32k_shared_page_authority;
 pub(crate) use win32k_glue::*;
 pub(crate) use win32k_session_runtime::*;
 mod driver_launch;
+mod debug_filter_shared;
 mod hosted_driver_assertion;
 pub(crate) use driver_launch::*;
 

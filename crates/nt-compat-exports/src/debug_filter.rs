@@ -5,6 +5,15 @@ pub const COMPONENT_COUNT: usize = 156;
 pub const SYSTEM_WIDE_COMPONENT: u32 = u32::MAX;
 const DPFLTR_MASK: u32 = 0x8000_0000;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaskSlot { System, Default, Component(usize) }
+
+pub const fn mask_slot(component: u32) -> MaskSlot {
+    if component == SYSTEM_WIDE_COMPONENT { MaskSlot::System }
+    else if component < COMPONENT_COUNT as u32 { MaskSlot::Component(component as usize) }
+    else { MaskSlot::Default }
+}
+
 /// Convert a level index or raw `DPFLTR_MASK` value into mask bits.
 pub const fn level_mask(level: u32) -> u32 {
     let bits = if level < 32 { 1u32 << level } else { level };
@@ -17,7 +26,7 @@ pub const fn enabled(system_mask: u32, component_mask: u32, level: u32) -> bool 
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SetFilterError { AccessDenied }
+pub enum SetFilterError { AccessDenied, IncompatiblePage }
 
 /// Root-owned debug-print filter state. Unknown component IDs share the default mask.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,13 +60,19 @@ impl DebugFilterMasks {
     pub fn component_masks(&self) -> &[u32; COMPONENT_COUNT] { &self.components }
 
     fn selected(&self, component: u32) -> u32 {
-        if component == SYSTEM_WIDE_COMPONENT { self.system }
-        else { self.components.get(component as usize).copied().unwrap_or(self.default) }
+        match mask_slot(component) {
+            MaskSlot::System => self.system,
+            MaskSlot::Default => self.default,
+            MaskSlot::Component(index) => self.components[index],
+        }
     }
 
     fn selected_mut(&mut self, component: u32) -> &mut u32 {
-        if component == SYSTEM_WIDE_COMPONENT { &mut self.system }
-        else { self.components.get_mut(component as usize).unwrap_or(&mut self.default) }
+        match mask_slot(component) {
+            MaskSlot::System => &mut self.system,
+            MaskSlot::Default => &mut self.default,
+            MaskSlot::Component(index) => &mut self.components[index],
+        }
     }
 }
 

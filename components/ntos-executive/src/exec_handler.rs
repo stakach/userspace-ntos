@@ -35337,13 +35337,34 @@ impl ExecNtHandler {
                 print_str(b"\n");
                 0
             },
-            // NtQueryDebugFilterState — return FALSE (filter disabled), the state of a machine with
-            // no kernel debugger attached, so DbgPrintEx suppresses the message (see the ladder note
-            // this replaces: a TRUE here makes ntdll format a null-relative string → VMFault).
-            NativeService::NtQueryDebugFilterState => 0,
-            // NtSetDebugFilterState requires SeDebugPrivilege in ReactOS/NT. We do not model that
-            // privilege plane yet, so deny the mutation instead of fabricating a changed mask.
-            NativeService::NtSetDebugFilterState => 0xC0000022,
+            NativeService::NtQueryDebugFilterState => {
+                match unsafe { crate::debug_filter_shared::root_page() } {
+                    Ok(page) => match page.query(args[0] as u32, args[1] as u32) {
+                        Some(enabled) => u32::from(enabled),
+                        None => STATUS_UNSUCCESSFUL,
+                    },
+                    Err(error) => error.raw() as u32,
+                }
+            },
+            NativeService::NtSetDebugFilterState => {
+                let privileged = ctx.previous_mode == nt_syscall::ProcessorMode::KernelMode
+                    || self.current_token_has_privilege(nt_security::SE_DEBUG);
+                if !privileged {
+                    STATUS_ACCESS_DENIED
+                } else {
+                    match unsafe { crate::debug_filter_shared::root_page() } {
+                        Ok(page) => match page.set(args[0] as u32, args[1] as u32,
+                            args[2] as u8 != 0, true) {
+                            Ok(()) => 0,
+                            Err(nt_compat_exports::debug_filter::SetFilterError::AccessDenied) =>
+                                STATUS_ACCESS_DENIED,
+                            Err(nt_compat_exports::debug_filter::SetFilterError::IncompatiblePage) =>
+                                STATUS_UNSUCCESSFUL,
+                        },
+                        Err(error) => error.raw() as u32,
+                    }
+                }
+            },
             NativeService::NtOpenThreadToken => unsafe { self.nt_open_thread_token(args, false) },
             NativeService::NtOpenThreadTokenEx => unsafe { self.nt_open_thread_token(args, true) },
             NativeService::NtContinue => unsafe { self.nt_continue(args) },

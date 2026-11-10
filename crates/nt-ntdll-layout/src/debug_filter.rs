@@ -6,9 +6,9 @@
 //! while an ntdll or hosted driver reader runs in another domain.
 
 use core::mem::{align_of, offset_of, size_of};
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, Ordering};
 
-use nt_compat_exports::debug_filter::COMPONENT_COUNT;
+use nt_compat_exports::debug_filter::{self, COMPONENT_COUNT, MaskSlot, SetFilterError};
 
 pub const PAGE_SIZE: usize = crate::kuser::PAGE_SIZE;
 pub const MAGIC: u32 = u32::from_le_bytes(*b"NTDF");
@@ -54,6 +54,35 @@ impl DebugFilterPage {
     pub const fn compatible(&self) -> bool {
         self.magic == MAGIC && self.abi_version == ABI_VERSION
     }
+
+    fn selected_mask(&self, component: u32) -> &AtomicU32 {
+        match debug_filter::mask_slot(component) {
+            MaskSlot::System => &self.system_mask,
+            MaskSlot::Default => &self.default_mask,
+            MaskSlot::Component(index) => &self.component_masks[index],
+        }
+    }
+
+    /// Read the same root-owned words used by the direct native query.
+    pub fn query(&self, component: u32, level: u32) -> Option<bool> {
+        if !self.compatible() { return None; }
+        let system = self.system_mask.load(Ordering::Acquire);
+        let selected = self.selected_mask(component).load(Ordering::Acquire);
+        Some(debug_filter::enabled(system, selected, level))
+    }
+
+    /// Mutate a mask through the root's writable alias after a privilege check.
+    /// Guest mappings of this frame are read-only.
+    pub fn set(&self, component: u32, level: u32, state: bool,
+        has_debug_privilege: bool) -> Result<(), SetFilterError> {
+        if !has_debug_privilege { return Err(SetFilterError::AccessDenied); }
+        if !self.compatible() { return Err(SetFilterError::IncompatiblePage); }
+        let bits = debug_filter::level_mask(level);
+        let mask = self.selected_mask(component);
+        if state { mask.fetch_or(bits, Ordering::AcqRel); }
+        else { mask.fetch_and(!bits, Ordering::AcqRel); }
+        Ok(())
+    }
 }
 
 impl Default for DebugFilterPage {
@@ -95,8 +124,29 @@ mod tests {
         let mut page = DebugFilterPage::new();
         page.abi_version += 1;
         assert!(!page.compatible());
+        assert_eq!(page.query(0, 0), None);
+        assert_eq!(page.set(0, 0, false, true),
+            Err(nt_compat_exports::debug_filter::SetFilterError::IncompatiblePage));
         page.abi_version = ABI_VERSION;
         page.magic = 0;
         assert!(!page.compatible());
+    }
+
+    #[test]
+    fn shared_page_query_and_privileged_update_use_the_same_mask_words() {
+        let page = DebugFilterPage::new();
+        assert_eq!(page.query(42, 0), Some(true));
+        assert_eq!(page.query(42, 1), Some(false));
+        assert_eq!(page.set(42, 1, true, false), Err(nt_compat_exports::debug_filter::SetFilterError::AccessDenied));
+        assert_eq!(page.query(42, 1), Some(false));
+        page.set(42, 1, true, true).unwrap();
+        assert_eq!(page.query(42, 1), Some(true));
+        assert_eq!(page.query(43, 1), Some(false));
+        page.set(u32::MAX, 0, false, true).unwrap();
+        assert_eq!(page.query(43, 0), Some(false));
+        assert_eq!(page.query(42, 0), Some(false));
+        page.set(200, 2, true, true).unwrap();
+        assert_eq!(page.query(201, 2), Some(true));
+        assert_eq!(page.query(155, 2), Some(false));
     }
 }

@@ -19453,8 +19453,10 @@ pub(crate) fn bind_kd_debug_export(reg: &mut DriverExportRegistry) {
     );
 }
 
-extern "win64" fn s_dbg_query_debug_filter_state(_component_id: u32, _level: u32) -> u8 {
-    0
+extern "win64" fn s_dbg_query_debug_filter_state(component_id: u32, level: u32) -> u8 {
+    // Hosted drivers enter with their read-only alias installed before DriverEntry.
+    let page = unsafe { crate::debug_filter_shared::hosted_driver_page() };
+    u8::from(page.query(component_id, level).unwrap_or(false))
 }
 
 #[derive(Clone, Copy)]
@@ -43181,6 +43183,14 @@ unsafe fn load_driver_reserved(
         error
     })?;
     driver_instances_mut()[instance].kuser_map_cap = kuser_map_cap;
+    install_hosted_debug_filter_alias(
+        instance,
+        pml4,
+        instance_domain_identity(domain).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?,
+    ).map_err(|error| {
+        print_str(b"[driver-launch] primary debug-filter alias failed\n");
+        error
+    })?;
     hosted_exception_images::project_sealed(
         instance,
         instance_domain_identity(domain).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?,
@@ -43568,6 +43578,47 @@ unsafe fn install_hosted_kuser_alias(
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     }
     Ok(cap)
+}
+
+/// Map the root-owned mask frame into one hosted driver VSpace. The instance
+/// records the copied cap before the native map effect and retains it if the
+/// synchronous map reports a failure.
+unsafe fn install_hosted_debug_filter_alias(
+    instance: usize,
+    pml4: u64,
+    domain: HostedDomainIdentity,
+) -> Result<(), nt_status::NtStatus> {
+    let frame = crate::debug_filter_shared::frame()?;
+    let address = nt_ntdll_layout::debug_filter::HOSTED_DRIVER_VA;
+    if !ensure_paging(address, pml4, domain) {
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    }
+    let owner = &driver_instances_mut()[instance];
+    if owner.debug_filter_map_cap != 0 || owner.pml4 != pml4 {
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    let Some(cap) = try_alloc_slot() else {
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    };
+    driver_instances_mut()[instance].debug_filter_map_cap = cap;
+    driver_instances_mut()[instance].debug_filter_copy_state = DebugFilterCopyState::Entered;
+    let copy_error = copy_cap_into_r(frame, cap);
+    if copy_error != 0 {
+        driver_instances_mut()[instance].debug_filter_copy_state = DebugFilterCopyState::KnownEmpty;
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    }
+    driver_instances_mut()[instance].debug_filter_copy_state = DebugFilterCopyState::Present;
+    let map_error = page_map_r(cap, address, RO_NX, pml4);
+    if map_error != 0 {
+        print_str(b"[driver-launch] debug-filter map failed inst/error=");
+        print_u64(instance as u64);
+        print_str(b"/");
+        print_u64(map_error);
+        print_str(b"\n");
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    }
+    driver_instances_mut()[instance].debug_filter_map_established = true;
+    Ok(())
 }
 
 const HOSTED_PAGING_LEVEL_PDPT: u8 = 1;
@@ -63065,6 +63116,15 @@ fn hosted_video_object_number_from_path(path: &[u8]) -> Option<u32> {
     Some(value)
 }
 
+/// Copy-cap effect state retained by one exact hosted-driver instance.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DebugFilterCopyState {
+    Vacant,
+    Entered,
+    KnownEmpty,
+    Present,
+}
+
 /// A live launched IRP driver (a snapshot of the routing facts from its [`DriverComponent`]).
 #[derive(Clone, Copy)]
 pub(crate) struct DriverInstance {
@@ -63098,6 +63158,9 @@ pub(crate) struct DriverInstance {
     pub map_cap_bank: crate::spawn_hosts::ComponentMapCapBank,
     pub reply_cap: u64,
     pub kuser_map_cap: u64,
+    pub debug_filter_map_cap: u64,
+    pub debug_filter_copy_state: DebugFilterCopyState,
+    pub debug_filter_map_established: bool,
     pub hosted_domain_id: u64,
     pub hosted_domain_cookie: u64,
     pub driver_id: u64,
@@ -63144,6 +63207,9 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     map_cap_bank: crate::spawn_hosts::ComponentMapCapBank { owner: 0, count: 0 },
     reply_cap: 0,
     kuser_map_cap: 0,
+    debug_filter_map_cap: 0,
+    debug_filter_copy_state: DebugFilterCopyState::Vacant,
+    debug_filter_map_established: false,
     hosted_domain_id: 0,
     hosted_domain_cookie: 0,
     driver_id: 0,
@@ -64179,6 +64245,17 @@ fn register_instance(dc: &DriverComponent) {
     } else {
         0
     };
+    let (debug_filter_map_cap, debug_filter_copy_state, debug_filter_map_established) = if t[dc.instance].used
+        && t[dc.instance].pml4 == dc.pml4
+        && t[dc.instance].hosted_domain_id == dc.hosted_domain_id
+        && t[dc.instance].hosted_domain_cookie == dc.hosted_domain_cookie
+    {
+        (t[dc.instance].debug_filter_map_cap,
+            t[dc.instance].debug_filter_copy_state,
+            t[dc.instance].debug_filter_map_established)
+    } else {
+        (0, DebugFilterCopyState::Vacant, false)
+    };
     t[dc.instance] = DriverInstance {
         fault_ep: dc.fault_ep,
         pml4: dc.pml4,
@@ -64210,6 +64287,9 @@ fn register_instance(dc: &DriverComponent) {
         map_cap_bank: dc.map_cap_bank,
         reply_cap: dc.reply_cap,
         kuser_map_cap,
+        debug_filter_map_cap,
+        debug_filter_copy_state,
+        debug_filter_map_established,
         hosted_domain_id: dc.hosted_domain_id,
         hosted_domain_cookie: dc.hosted_domain_cookie,
         driver_id: dc.driver_id,

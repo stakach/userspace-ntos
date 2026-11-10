@@ -40,6 +40,26 @@ fn delete(effects: &mut Vec<Effect>, cap: u64) {
     }
 }
 
+fn append_debug_filter_cap_effects(effects: &mut Vec<Effect>, inst: DriverInstance) -> Option<()> {
+    match (inst.debug_filter_map_cap, inst.debug_filter_copy_state) {
+        (0, DebugFilterCopyState::Vacant) if !inst.debug_filter_map_established => {}
+        (cap, DebugFilterCopyState::KnownEmpty)
+            if cap != 0 && !inst.debug_filter_map_established => {
+                // The synchronous copy reported a known failure; this slot has
+                // no cap to delete, but still belongs to this instance.
+                effects.push(Effect::Recycle(cap));
+            }
+        (cap, DebugFilterCopyState::Present) if cap != 0 => {
+            if inst.debug_filter_map_established { effects.push(Effect::Unmap(cap)); }
+            delete(effects, cap);
+        }
+        // An entered copy without a known result remains an exact retained
+        // owner. Retirement cannot infer whether the destination is empty.
+        _ => return None,
+    }
+    Some(())
+}
+
 unsafe fn prepare(
     instance_index: usize,
     inst: DriverInstance,
@@ -94,6 +114,7 @@ unsafe fn prepare(
         effects.push(Effect::Unmap(inst.kuser_map_cap));
         delete(&mut effects, inst.kuser_map_cap);
     }
+    append_debug_filter_cap_effects(&mut effects, inst)?;
     if let Some(caps) = exec {
         for &cap in caps {
             if cap != 0 {
@@ -205,6 +226,7 @@ unsafe fn prepare_unenrolled(
     let mut effects = Vec::new();
     effects.try_reserve_exact(capacity).ok()?;
     effects.push(Effect::MapBank(inst.map_cap_bank));
+    append_debug_filter_cap_effects(&mut effects, inst)?;
     for offset in (0..inst.stack_frame_count).rev() {
         delete(&mut effects, inst.stack_frame_base.checked_add(offset)?);
     }
