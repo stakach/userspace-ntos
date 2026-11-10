@@ -167,7 +167,7 @@ pub(crate) fn maybe_sample_gap(handler: &ExecNtHandler, now: u64) {
             && handler.hosted_thread_tcb_for_badge(badge) == Some(tcb)
             && still_same_gap
         {
-            print_str(b"[installer-child-gap-tcb] pi/pgen/tid/tgen/badge/tcb/return-at-100ns/sample-at-100ns/age-ms/regs-valid/state/sched/enqueued/active-sc/pending-reply/reply-to/call-reply-kind/call-reply-index/receiver-tcb/receiver-cspace/receiver-state=");
+            print_str(b"[installer-child-gap-tcb] pi/pgen/tid/tgen/badge/tcb/return-at-100ns/sample-at-100ns/age-ms/regs-valid/state/sched/enqueued/active-sc/pending-reply/reply-to/fault-type/blocked-is-call/call-reply-kind/call-reply-index/receiver-tcb/receiver-cspace/receiver-state=");
             for (index, value) in [owner.process_index as u64, owner.process_generation,
                 owner.thread_id, owner.thread_generation, badge, tcb,
                 return_at, now, now.saturating_sub(return_at) / 10_000,
@@ -175,6 +175,8 @@ pub(crate) fn maybe_sample_gap(handler: &ExecNtHandler, now: u64) {
                 state[win32k_glue::TCB_DBG_STATE], state[win32k_glue::TCB_DBG_SCHEDULABLE],
                 state[win32k_glue::TCB_DBG_ENQUEUED], state[win32k_glue::TCB_DBG_ACTIVE_SC],
                 state[win32k_glue::TCB_DBG_PENDING_REPLY], state[win32k_glue::TCB_DBG_REPLY_TO],
+                state[win32k_glue::TCB_DBG_PENDING_FAULT],
+                state[win32k_glue::TCB_DBG_BLOCKED_IS_CALL],
                 state[win32k_glue::TCB_DBG_CALL_REPLY_KIND],
                 state[win32k_glue::TCB_DBG_CALL_REPLY_INDEX],
                 state[win32k_glue::TCB_DBG_CALL_RECEIVER_TCB],
