@@ -66,6 +66,7 @@ struct Work {
     query_status: u32,
     query_information: u64,
     read: Option<PendingSectionPageReadId>,
+    read_trace: Option<ReadTrace>,
     plan: Option<DataSectionReadWindow>,
     bytes: Option<Vec<u8>>,
     result: (u32, u64, u64),
@@ -75,10 +76,49 @@ struct Work {
     cancel_requested: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ReadTrace {
+    ordinal: u64,
+    started_tsc: u64,
+}
+
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static mut READS: PendingSectionPageReads<(), u64> = PendingSectionPageReads::new();
 static EXECUTING: AtomicBool = AtomicBool::new(false);
 static NEXT: AtomicU64 = AtomicU64::new(0);
+static READ_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Observation only. Keep the first windows and sparse later samples so a long
+/// font map can be timed without turning every page into serial output.
+fn next_read_trace() -> Option<ReadTrace> {
+    let ordinal = READ_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    (ordinal <= 64 || ordinal.is_power_of_two()).then(|| ReadTrace {
+        ordinal,
+        started_tsc: driver_launch::read_ordered_tsc(),
+    })
+}
+
+fn trace_read(work: &Work, stage: &[u8], irp: u64, status: u32) {
+    let Some(trace) = work.read_trace else { return; };
+    let Some(prepared) = work.prepared else { return; };
+    let Some(plan) = work.plan else { return; };
+    let Some(capture) = work.capture.as_ref() else { return; };
+    print_str(b"[section-map-read] stage="); print_str(stage);
+    print_str(b" ordinal="); print_u64(trace.ordinal);
+    print_str(b" token="); print_u64(work.token);
+    print_str(b" section-index="); print_u64(prepared.section.index() as u64);
+    print_str(b" lease="); print_u64(work.lease.map_or(0, |lease| lease.value()));
+    print_str(b" device="); print_u64(capture.device_id());
+    print_str(b" file="); print_u64(capture.file_id());
+    print_str(b" page="); print_u64(work.page as u64);
+    print_str(b" offset="); print_u64(plan.offset());
+    print_str(b" length="); print_u64(plan.length() as u64);
+    print_str(b" irp="); print_u64(irp);
+    print_str(b" status=0x"); print_hex(status);
+    print_str(b" start-tsc="); print_u64(trace.started_tsc);
+    print_str(b" now-tsc="); print_u64(driver_launch::read_ordered_tsc());
+    print_str(b"\n");
+}
 
 pub(crate) unsafe fn submit(
     handler: &mut ExecNtHandler,
@@ -129,6 +169,7 @@ pub(crate) unsafe fn submit(
         query_status: 0,
         query_information: 0,
         read: None,
+        read_trace: None,
         plan: None,
         bytes: None,
         result: (0, 0, 0),
@@ -474,6 +515,7 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) {
                 }
                 output.resize(plan.length(), 0);
                 let capture = work.capture.as_ref().unwrap();
+                work.read_trace = next_read_trace();
                 let result = driver_launch::io_manager_mut().build_and_dispatch_external_to_device(
                     nt_types::ClientId(driver_launch::IO_MANAGER_COMPONENT_ID),
                     DeviceId(capture.device_id()),
@@ -496,6 +538,7 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) {
                         information,
                         ..
                     }) => {
+                        trace_read(work, b"inline-terminal", 0, status.raw() as u32);
                         let (_, result) = (&mut *core::ptr::addr_of_mut!(READS))
                             .complete_inline(read, status.raw() as u32, information, &output)
                             .expect("reserved provider MAP read");
@@ -509,15 +552,20 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) {
                                 work.phase = Phase::Abort;
                             }
                         }
+                        trace_read(work, b"inline-retired", 0, work.result.0);
+                        work.read_trace = None;
                     }
                     Ok(ExternalDispatchResult::Pending { irp_id }) => {
                         assert!((&mut *core::ptr::addr_of_mut!(READS)).bind(read, irp_id.raw()));
                         work.phase = Phase::ReadPending(irp_id);
+                        trace_read(work, b"pending", irp_id.raw(), 0x103);
                     }
                     Err(status) => {
                         let _ = (&mut *core::ptr::addr_of_mut!(READS)).cancel_reserved(read);
                         work.result.0 = status.raw() as u32;
                         work.phase = Phase::Abort;
+                        trace_read(work, b"dispatch-failed", 0, work.result.0);
+                        work.read_trace = None;
                     }
                 }
             } else {
@@ -573,8 +621,10 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) {
                 )
             {
                 work.phase = Phase::Indeterminate;
+                trace_read(work, b"terminal-mismatch", irp.raw(), done.status);
                 return;
             }
+            trace_read(work, b"terminal", irp.raw(), done.status);
             work.phase = if (&*core::ptr::addr_of!(READS))
                 .failure(work.read.unwrap(), irp.raw())
                 .is_some()
@@ -630,6 +680,7 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) {
                 .acknowledge_completed_irp_strict(irp)
                 .is_err()
             {
+                trace_read(work, b"ack-uncertain", irp.raw(), work.result.0);
                 return;
             }
             assert!((&mut *core::ptr::addr_of_mut!(READS))
@@ -646,6 +697,7 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) {
                 },
             );
             let Some((_, result)) = result else {
+                trace_read(work, b"ack-owner-mismatch", irp.raw(), work.result.0);
                 return;
             };
             match result {
@@ -662,6 +714,8 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) {
                     work.phase = Phase::Abort;
                 }
             }
+            trace_read(work, b"acknowledged", irp.raw(), work.result.0);
+            work.read_trace = None;
         }
         Phase::PublishFrame => {
             if cancelled {
