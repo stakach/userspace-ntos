@@ -16563,8 +16563,17 @@ pub(crate) fn hosted_driver_earliest_timer_snapshot(
     }
 }
 
+/// The timer-delivery owner copies this launch identity beside the selected timer generation.
+pub(crate) fn hosted_driver_timer_domain_identity(instance_index: usize) -> Option<(u64, u64)> {
+    let inst = instance(instance_index)?;
+    Some((inst.hosted_domain_id, inst.hosted_domain_cookie))
+}
+
 /// Publish expirations and queue DPCs; driver execution belongs to a scheduler boundary.
-pub(crate) unsafe fn hosted_driver_timer_wake_due(now: nt_time::TimeSnapshot) -> u64 {
+pub(crate) unsafe fn hosted_driver_timer_wake_due(
+    now: nt_time::TimeSnapshot,
+    mut probe: Option<&mut crate::hosted_timer_source6_probe::Scan>,
+) -> u64 {
     let queue_count = (*core::ptr::addr_of!(HOSTED_DRIVER_TIMERS))
         .as_ref()
         .map(Vec::len)
@@ -16581,6 +16590,11 @@ pub(crate) unsafe fn hosted_driver_timer_wake_due(now: nt_time::TimeSnapshot) ->
             continue;
         }
         let Some(inst) = instance(instance_index) else {
+            if let Some(probe) = probe.as_deref_mut() {
+                for expiry in expirations {
+                    probe.missing_instance(instance_index, expiry);
+                }
+            }
             continue;
         };
         for expiry in expirations {
@@ -16597,21 +16611,33 @@ pub(crate) unsafe fn hosted_driver_timer_wake_due(now: nt_time::TimeSnapshot) ->
                         })
                     });
             let Some(exec_timer) = exec_timer else {
+                if let Some(probe) = probe.as_deref_mut() {
+                    probe.observe_expiry(instance_index, inst.hosted_domain_id,
+                        inst.hosted_domain_cookie, expiry, 1, 0, 0);
+                }
                 continue;
             };
             write_unaligned((exec_timer + 4) as *mut i32, 1);
             delivered = delivered.saturating_add(1);
-            delivered =
-                delivered.saturating_add(wake_hosted_driver_waiters_for_instance(instance_index));
+            let woken = wake_hosted_driver_waiters_for_instance(instance_index);
+            delivered = delivered.saturating_add(woken);
 
+            let mut dpc_queue = 0;
             if let Some(dpc) = expiry.dpc_ptr {
                 if queue_hosted_driver_dpc(instance_index, dpc, None, None, 0, 0, None).is_err() {
+                    dpc_queue = 2;
                     let drops = read_volatile((inst.exec_shared_va + SH_DPC_QUEUE_DROPS) as *const u64);
                     write_volatile(
                         (inst.exec_shared_va + SH_DPC_QUEUE_DROPS) as *mut u64,
                         drops.saturating_add(1),
                     );
+                } else {
+                    dpc_queue = 1;
                 }
+            }
+            if let Some(probe) = probe.as_deref_mut() {
+                probe.observe_expiry(instance_index, inst.hosted_domain_id,
+                    inst.hosted_domain_cookie, expiry, 2, woken, dpc_queue);
             }
         }
     }

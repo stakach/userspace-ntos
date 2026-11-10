@@ -225,6 +225,7 @@ mod driver_launch;
 mod debug_filter_shared;
 mod hosted_debug_filter_process;
 mod hosted_driver_assertion;
+mod hosted_timer_source6_probe;
 pub(crate) use driver_launch::*;
 
 use core::panic::PanicInfo;
@@ -7170,24 +7171,12 @@ fn print_timer_deadline_census() {
         }
         print_str(b"\n");
     }
-    // A finite 30-second snapshot identifies which root-owned hosted timer
-    // supplies source 6 without reading a provider's timer body.
+    // The timer-delivery owner copied this record before and after its due-work scan.
+    // A nested census must never walk mutable root-owned timer queues.
     if HOSTED_TIMER_SAMPLES.fetch_add(1, Ordering::Relaxed) < 16 {
-        let now = nt_time_snapshot();
-        if let Some((instance, timer)) = driver_launch::hosted_driver_earliest_timer_snapshot(now) {
-            print_str(b"[census] hosted-kernel-timer instance/ptr/gen/deadline-kind/deadline-100ns/projected-100ns/period-100ns/dpc=");
-            let (kind, deadline) = match timer.deadline {
-                nt_time::Deadline::Infinite => (0, 0),
-                nt_time::Deadline::Relative { monotonic_100ns } => (1, monotonic_100ns),
-                nt_time::Deadline::Absolute { system_time_100ns } => (2, system_time_100ns),
-            };
-            for (index, value) in [instance as u64, timer.timer_ptr, timer.generation,
-                kind, deadline, timer.projected_monotonic_100ns, timer.period_100ns,
-                timer.dpc_ptr.unwrap_or(0)].into_iter().enumerate() {
-                if index != 0 { print_str(b"/"); }
-                print_u64(value);
-            }
-            print_str(b"\n");
+        if let Some(fields) = hosted_timer_source6_probe::snapshot() {
+            print_str(b"[census] hosted-kernel-timer scan/now/selected/instance/domain/cookie/ptr/gen/deadline-kind/deadline/projected/period/dpc/effect/woken/dpc-queue=");
+            hosted_timer_source6_probe::print_fields(fields);
         }
     }
     if let Some((wait, age)) = object_waiter_oldest_unselected(monotonic_time_100ns()) {
@@ -17644,8 +17633,11 @@ unsafe fn timer_retry_wake_due(now_100ns: u64) -> u64 {
 }
 
 /// May reply to driver waiters and establish DPC lanes; never use from ACK-only paths.
-unsafe fn timer_hosted_driver_wake_due(now: nt_time::TimeSnapshot) -> u64 {
-    subdrain!(6, driver_launch::hosted_driver_timer_wake_due(now))
+unsafe fn timer_hosted_driver_wake_due(
+    now: nt_time::TimeSnapshot,
+    probe: Option<&mut hosted_timer_source6_probe::Scan>,
+) -> u64 {
+    subdrain!(6, driver_launch::hosted_driver_timer_wake_due(now, probe))
         + subdrain!(7, driver_launch::hosted_driver_wait_wake_due(now))
 }
 
@@ -17655,6 +17647,7 @@ unsafe fn delay_timer_drain_due_work(
     queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
     now: nt_time::TimeSnapshot,
+    probe: Option<&mut hosted_timer_source6_probe::Scan>,
 ) -> u64 {
     let now_100ns = now.monotonic_100ns;
     let watchdog_tick = subdrain!(8, watchdog_take_timer_work(now_100ns));
@@ -17666,7 +17659,7 @@ unsafe fn delay_timer_drain_due_work(
         + subdrain!(4, io_completion_wake_due(handler, now))
         + thread_alert::redrive(handler)
         + subdrain!(5, user_timer_wake_due(handler, now))
-        + timer_hosted_driver_wake_due(now)
+        + timer_hosted_driver_wake_due(now, probe)
         + subdrain!(9, handler.job_time_sample_due(now_100ns))
         + subdrain!(
             10,
@@ -17721,7 +17714,9 @@ pub(crate) unsafe fn delay_timer_drain_overdue_without_badge(
     }
     DRAIN_DUE_HITS.fetch_add(1, Ordering::Relaxed);
     let work_started = disk_census_ticks();
-    let woken = delay_timer_drain_due_work(queue, handler, now);
+    let mut source6_probe = hosted_timer_source6_probe::select(now, next);
+    let woken = delay_timer_drain_due_work(queue, handler, now, source6_probe.as_mut());
+    if let Some(probe) = source6_probe { probe.publish(); }
     teardown_pending_job_time_terminations(queue, handler);
     let work_ticks = disk_census_ticks().wrapping_sub(work_started);
     DRAIN_WORK_TICKS.fetch_add(work_ticks, Ordering::Relaxed);
@@ -17963,7 +17958,9 @@ unsafe fn delay_timer_interrupt_claimed(
     let now_100ns = now.monotonic_100ns;
     let selected = delay_timer_next_deadline(queue, handler, now);
     let early_or_stale = selected.is_none_or(|(deadline, _)| deadline > now_100ns);
-    let woken = delay_timer_drain_due_work(queue, handler, now);
+    let mut source6_probe = hosted_timer_source6_probe::select(now, selected);
+    let woken = delay_timer_drain_due_work(queue, handler, now, source6_probe.as_mut());
+    if let Some(probe) = source6_probe { probe.publish(); }
     (*core::ptr::addr_of_mut!(TIMER_DEADLINE_CENSUS)).observe(selected, now_100ns, woken);
     teardown_pending_job_time_terminations(queue, handler);
     TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);

@@ -70,7 +70,7 @@ pub(crate) unsafe fn service_hosted_timer_work() -> u64 {
         return 0;
     }
     let now = nt_time_snapshot();
-    let work = timer_hosted_driver_wake_due(now);
+    let work = timer_hosted_driver_wake_due(now, None);
     let provider_work = scan_owned_timer_work(now)
         .expect("bootstrap timer selection lost its canonical continuation");
     // Observe retained demand only. ACPI acknowledgement and DPC execution have outer owners.
