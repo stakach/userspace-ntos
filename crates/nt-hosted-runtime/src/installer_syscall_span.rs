@@ -58,6 +58,25 @@ pub struct SsnTotal {
     pub max_100ns: u64,
 }
 
+/// The largest observed interval between a nonpending table-dispatch return
+/// and the next table-dispatch entry for one exact installer child. Pending returns have no
+/// terminal timestamp here and cannot create this receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LongestGap {
+    pub owner: SpanOwner,
+    pub from_ssn: u32,
+    pub from_status: u32,
+    pub to_ssn: u32,
+    pub from_at_100ns: u64,
+    pub to_at_100ns: u64,
+}
+
+impl LongestGap {
+    pub fn duration_100ns(self) -> u64 {
+        self.to_at_100ns.saturating_sub(self.from_at_100ns)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpanSnapshot<const TOP: usize> {
     pub owner: SpanOwner,
@@ -66,6 +85,7 @@ pub struct SpanSnapshot<const TOP: usize> {
     pub unresolved_replaced: u64,
     pub total_gap_100ns: u64,
     pub max_gap_100ns: u64,
+    pub longest_gap: Option<LongestGap>,
     pub last_return_age_100ns: Option<u64>,
     pub active: Option<SpanSample>,
     pub pending: Option<SpanSample>,
@@ -82,6 +102,9 @@ pub struct SpanSnapshot<const TOP: usize> {
 struct ActiveSpan { ssn: u32, at_100ns: u64 }
 
 #[derive(Clone, Copy)]
+struct LastReturn { ssn: u32, status: u32, at_100ns: u64 }
+
+#[derive(Clone, Copy)]
 struct Counter { calls: u64, total_100ns: u64, max_100ns: u64 }
 
 impl Counter { const EMPTY: Self = Self { calls: 0, total_100ns: 0, max_100ns: 0 }; }
@@ -91,13 +114,12 @@ struct Row {
     owner: Option<SpanOwner>,
     active: Option<ActiveSpan>,
     pending: Option<ActiveSpan>,
-    last_return_at: Option<u64>,
-    last_return_ssn: Option<u32>,
+    last_return: Option<LastReturn>,
     completed: u64,
     retained_pending: u64,
     unresolved_replaced: u64,
     total_gap_100ns: u64,
-    max_gap_100ns: u64,
+    longest_gap: Option<LongestGap>,
     unindexed_calls: u64,
     counters: [Counter; SSN_CAP],
     same_ssn_gap_counters: [Counter; SSN_CAP],
@@ -105,10 +127,9 @@ struct Row {
 
 impl Row {
     const EMPTY: Self = Self {
-        owner: None, active: None, pending: None, last_return_at: None,
-        last_return_ssn: None,
+        owner: None, active: None, pending: None, last_return: None,
         completed: 0, retained_pending: 0, unresolved_replaced: 0,
-        total_gap_100ns: 0, max_gap_100ns: 0, unindexed_calls: 0,
+        total_gap_100ns: 0, longest_gap: None, unindexed_calls: 0,
         counters: [Counter::EMPTY; SSN_CAP],
         same_ssn_gap_counters: [Counter::EMPTY; SSN_CAP],
     };
@@ -119,8 +140,10 @@ impl Row {
         SpanSnapshot {
             owner, completed: self.completed, retained_pending: self.retained_pending,
             unresolved_replaced: self.unresolved_replaced,
-            total_gap_100ns: self.total_gap_100ns, max_gap_100ns: self.max_gap_100ns,
-            last_return_age_100ns: self.last_return_at.map(|at| now.saturating_sub(at)),
+            total_gap_100ns: self.total_gap_100ns,
+            max_gap_100ns: self.longest_gap.map_or(0, LongestGap::duration_100ns),
+            longest_gap: self.longest_gap,
+            last_return_age_100ns: self.last_return.map(|last| now.saturating_sub(last.at_100ns)),
             active: self.active.map(|span| SpanSample { ssn: span.ssn,
                 age_100ns: now.saturating_sub(span.at_100ns) }),
             pending: self.pending.map(|span| SpanSample { ssn: span.ssn,
@@ -200,11 +223,16 @@ impl<const N: usize, const TOP: usize> InstallerSyscallSpans<N, TOP> {
         if row.active.is_some() || row.pending.take().is_some() {
             row.unresolved_replaced = row.unresolved_replaced.saturating_add(1);
         }
-        if let Some(last) = row.last_return_at.take() {
-            let gap = now.saturating_sub(last);
+        if let Some(last) = row.last_return.take() {
+            let gap = now.saturating_sub(last.at_100ns);
             row.total_gap_100ns = row.total_gap_100ns.saturating_add(gap);
-            row.max_gap_100ns = row.max_gap_100ns.max(gap);
-            if row.last_return_ssn == Some(ssn) {
+            if row.longest_gap.is_none_or(|prior| gap > prior.duration_100ns()) {
+                row.longest_gap = Some(LongestGap {
+                    owner, from_ssn: last.ssn, from_status: last.status, to_ssn: ssn,
+                    from_at_100ns: last.at_100ns, to_at_100ns: now,
+                });
+            }
+            if last.ssn == ssn {
                 if let Some(counter) = row.same_ssn_gap_counters.get_mut(ssn as usize) {
                     counter.calls = counter.calls.saturating_add(1);
                     counter.total_100ns = counter.total_100ns.saturating_add(gap);
@@ -212,7 +240,6 @@ impl<const N: usize, const TOP: usize> InstallerSyscallSpans<N, TOP> {
                 }
             }
         }
-        row.last_return_ssn = None;
         row.active = Some(ActiveSpan { ssn, at_100ns: now });
         true
     }
@@ -230,14 +257,12 @@ impl<const N: usize, const TOP: usize> InstallerSyscallSpans<N, TOP> {
         if status == STATUS_PENDING {
             row.retained_pending = row.retained_pending.saturating_add(1);
             row.pending = Some(active);
-            row.last_return_at = None;
-            row.last_return_ssn = None;
+            row.last_return = None;
             return true;
         }
         let elapsed = now.saturating_sub(active.at_100ns);
         row.completed = row.completed.saturating_add(1);
-        row.last_return_at = Some(now);
-        row.last_return_ssn = Some(ssn);
+        row.last_return = Some(LastReturn { ssn, status, at_100ns: now });
         if let Some(counter) = row.counters.get_mut(ssn as usize) {
             counter.calls = counter.calls.saturating_add(1);
             counter.total_100ns = counter.total_100ns.saturating_add(elapsed);
@@ -326,11 +351,13 @@ mod tests {
         assert!(ledger.begin(newer, 191, 10_000));
         assert!(ledger.return_from_dispatch(newer, 191, 0, 10_100));
         assert_eq!(ledger.snapshot(newer, 10_100).unwrap().total_gap_100ns, 0);
+        assert_eq!(ledger.snapshot(newer, 10_100).unwrap().longest_gap, None);
         assert_eq!(ledger.snapshot(A, 10_100), None);
         let other_thread = SpanOwner { thread_id: 568, thread_generation: 2, ..newer };
         assert!(ledger.activate(other_thread));
         assert!(ledger.begin(other_thread, 191, 20_000));
         assert_eq!(ledger.snapshot(other_thread, 20_000).unwrap().total_gap_100ns, 0);
+        assert_eq!(ledger.snapshot(other_thread, 20_000).unwrap().longest_gap, None);
         let recycled_thread = SpanOwner { thread_generation: 3, ..other_thread };
         assert!(ledger.activate(recycled_thread));
         assert_eq!(ledger.snapshot(other_thread, 20_000), None);
@@ -371,5 +398,29 @@ mod tests {
         assert_eq!(snapshot.same_ssn_gaps[0].map(|item| item.calls), Some(3));
         assert_eq!(snapshot.same_ssn_gaps[0].map(|item| item.total_100ns), Some(570));
         assert_eq!(snapshot.same_ssn_gaps[0].map(|item| item.max_100ns), Some(290));
+    }
+
+    #[test]
+    fn longest_completed_return_to_next_entry_gap_keeps_exact_context() {
+        let mut ledger = InstallerSyscallSpans::<1, 2>::new();
+        assert!(ledger.activate(A));
+        let status = 0xC000_0034u32;
+        assert!(ledger.begin(A, 191, 1_000_000));
+        assert!(ledger.return_from_dispatch(A, 191, status, 1_000_100));
+        assert!(ledger.begin(A, 149, 1_250_100)); // 250,000 ticks after a completed return.
+        assert!(ledger.return_from_dispatch(A, 149, STATUS_PENDING, 1_250_200));
+        assert!(ledger.begin(A, 148, 1_900_000)); // Pending is not a terminal return/gap.
+        assert!(ledger.return_from_dispatch(A, 148, 0, 1_900_100));
+        assert!(ledger.begin(A, 39, 1_900_200)); // A shorter gap cannot replace the maximum.
+
+        let snapshot = ledger.snapshot(A, 1_900_200).unwrap();
+        assert_eq!(snapshot.owner, A);
+        assert_eq!(snapshot.max_gap_100ns, 250_000);
+        assert_eq!(snapshot.retained_pending, 1);
+        assert_eq!(snapshot.unresolved_replaced, 1);
+        let gap = LongestGap { owner: A, from_ssn: 191, from_status: status,
+            to_ssn: 149, from_at_100ns: 1_000_100, to_at_100ns: 1_250_100 };
+        assert_eq!(snapshot.longest_gap, Some(gap));
+        assert_eq!(gap.duration_100ns(), snapshot.max_gap_100ns);
     }
 }

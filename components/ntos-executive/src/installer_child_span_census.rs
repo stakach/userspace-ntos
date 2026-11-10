@@ -136,6 +136,21 @@ pub(crate) fn print_census(handler: &ExecNtHandler) {
             print_u64(gap.total_100ns / 10_000); print_str(b"/");
             print_u64(gap.max_100ns / 10_000); print_str(b" ");
         }
+        // This exact return-to-next-entry interval belongs to the pi/generation/tid above.
+        // It excludes pending dispatch returns, whose terminal time is not observed here.
+        print_str(b" longest-gap/present/from-ssn/from-status/to-ssn/from-at-100ns/to-at-100ns=");
+        let longest = snapshot.longest_gap;
+        for (index, value) in [
+            u64::from(longest.is_some()),
+            longest.map_or(0, |gap| u64::from(gap.from_ssn)),
+            longest.map_or(0, |gap| u64::from(gap.from_status)),
+            longest.map_or(0, |gap| u64::from(gap.to_ssn)),
+            longest.map_or(0, |gap| gap.from_at_100ns),
+            longest.map_or(0, |gap| gap.to_at_100ns),
+        ].into_iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(value);
+        }
         print_str(b"\n");
     }
     if ledger.activation_overflow() != 0 {
