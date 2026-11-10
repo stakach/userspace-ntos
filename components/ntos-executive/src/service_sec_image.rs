@@ -15900,6 +15900,25 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(a2 as u32);
                     print_str(b"\n");
                 }
+                let Some(dispatch_peb_mirror) = hosted_peb_mirror_for_pi(pi) else {
+                    reject_hosted_ingress!()
+                };
+                let dispatch_client_teb = nt_handler
+                    .pm
+                    .thread_teb(current_tid as nt_process::ThreadId)
+                    .filter(|teb| *teb != 0)
+                    .unwrap_or(SMSS_TEB_VA);
+                let dispatch_client = win32k_client_context_for_thread(
+                    &nt_handler,
+                    pi,
+                    badge,
+                    current_tid,
+                    hosted_thread_tcb_or_zero(&nt_handler, current_tid),
+                    nt_handler.hosted_thread_role(current_tid),
+                    dispatch_client_teb,
+                    dispatch_peb_mirror,
+                    scratch_base,
+                );
                 // CROSS-AS ARG MARSHALING. NtUserProcessConnect(handle, USERCONNECT* buf, size): the
                 // buffer is a client user pointer (usually its stack) NOT mapped in win32k's VSpace.
                 // Passing it raw makes win32k's handler fault/spin on an address win32k_dispatch can't
@@ -18664,25 +18683,6 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 }
-                let Some(dispatch_peb_mirror) = hosted_peb_mirror_for_pi(pi) else {
-                    reject_hosted_ingress!()
-                };
-                let dispatch_client_teb = nt_handler
-                    .pm
-                    .thread_teb(current_tid as nt_process::ThreadId)
-                    .filter(|teb| *teb != 0)
-                    .unwrap_or(SMSS_TEB_VA);
-                let dispatch_client = win32k_client_context_for_thread(
-                    &nt_handler,
-                    pi,
-                    badge,
-                    current_tid,
-                    hosted_thread_tcb_or_zero(&nt_handler, current_tid),
-                    nt_handler.hosted_thread_role(current_tid),
-                    dispatch_client_teb,
-                    dispatch_peb_mirror,
-                    scratch_base,
-                );
                 let session_cursor_hit = if m0 == 0x103d {
                     cursor_identity_key
                         .as_ref()
