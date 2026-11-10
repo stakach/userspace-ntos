@@ -31,10 +31,14 @@ fn initial_thread_selection_is_owned_by_the_canonical_lifetime_not_reusable_pi()
         creation.contains("commit_initial_thread_creation"),
         "additional-thread selection requires acknowledged initial creation"
     );
-    assert!(
-        service.contains("handler.start_configured_initial_thread(primary_pi, main_tcb)"),
-        "configured bootstrap startup must commit the same canonical creation receipt"
-    );
+    let alias = service.find(
+        "hosted_debug_filter_process::install_hosted_user_alias(handler, owner.process_index)"
+    ).expect("primary alias must be installed under the exact activation owner");
+    let start = service.find(
+        "handler.start_configured_initial_thread(owner.process_index, owner.tcb)"
+    ).expect("configured bootstrap startup must commit the canonical creation receipt");
+    assert!(service.contains("activation.ready(owner)"));
+    assert!(alias < start, "the required alias must precede the first thread start");
     assert!(
         !service.contains("tcb_resume_r(main_tcb)"),
         "raw bootstrap resume cannot bypass canonical creation ownership"
