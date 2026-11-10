@@ -510,11 +510,23 @@ pub(crate) unsafe fn capture_shared_resume_snapshot(
     }
 }
 
-pub(crate) unsafe fn restore_shared_resume_snapshot(
+/// The effect on the physical request and callback page. A rejected identity has not
+/// written the page; an applied restore carries the exact bytes that were published.
+/// If a future native write can refuse after its first store, it must return Uncertain
+/// and retain the page owner rather than allowing another writer to enter.
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // The current volatile write sequence has no fallible step after its first store.
+pub(crate) enum SharedResumeRestoreEffect {
+    NoPageWrite,
+    Applied(SharedResumeSnapshot),
+    Uncertain,
+}
+
+pub(crate) unsafe fn restore_shared_resume_snapshot_effect(
     snapshot: SharedResumeSnapshot,
     dispatch: nt_user_callback::DispatchContext,
     client: Win32kClientContext,
-) -> bool {
+) -> SharedResumeRestoreEffect {
     let checks = [
         win32k_client_context_is_admitted(client),
         snapshot.header.matches_dispatch_identity(
@@ -543,7 +555,7 @@ pub(crate) unsafe fn restore_shared_resume_snapshot(
         print_str(b"/"); print_u64(client.tid);
         print_str(b"/0x"); print_hex_u64(missing);
         print_str(b"\n");
-        return false;
+        return SharedResumeRestoreEffect::NoPageWrite;
     }
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
     for (value, offset) in snapshot.request.into_iter().zip(SHARED_RESUME_REQUEST_OFFSETS) {
@@ -573,7 +585,20 @@ pub(crate) unsafe fn restore_shared_resume_snapshot(
         }
     }
     core::ptr::write_volatile(core::ptr::addr_of_mut!((*frame).header), snapshot.header);
-    true
+    SharedResumeRestoreEffect::Applied(snapshot)
+}
+
+/// Keep existing callers' completion behavior while the native page authority is
+/// integrated. Only a full, acknowledged publication counts as restored.
+pub(crate) unsafe fn restore_shared_resume_snapshot(
+    snapshot: SharedResumeSnapshot,
+    dispatch: nt_user_callback::DispatchContext,
+    client: Win32kClientContext,
+) -> bool {
+    matches!(
+        restore_shared_resume_snapshot_effect(snapshot, dispatch, client),
+        SharedResumeRestoreEffect::Applied(_)
+    )
 }
 
 /// Select the exact client window before restoring its retained shared publication.
