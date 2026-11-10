@@ -734,6 +734,12 @@ mod tests {
         assert_eq!(tq.run_due_expirations(&clk).len(), 2);
         assert_eq!(tq.earliest_active_at(clk.snapshot()).unwrap().projected_monotonic_100ns,
             11_000);
+        tq.set(0x700, -2_000, 0, Some(0xD8), &clk);
+        let rearmed = tq.earliest_active_at(clk.snapshot()).unwrap();
+        assert_eq!(rearmed.timer_ptr, 0x700);
+        assert!(rearmed.generation > snapshot.generation);
+        assert_eq!(rearmed.projected_monotonic_100ns, 3_000);
+        assert_eq!(rearmed.dpc_ptr, Some(0xD8));
     }
 
     #[test]
