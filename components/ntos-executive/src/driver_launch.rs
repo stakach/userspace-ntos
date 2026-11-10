@@ -14268,6 +14268,21 @@ fn trace_post_hook_connect_completion(stage: u64, irp: u64, canonical: u64, deta
     print_hex64(canonical); print_str(b"/"); print_hex64(detail); print_str(b"\n");
 }
 
+static SCSI_CANONICAL_COMPLETION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn trace_scsi_canonical_completion(
+    stage: u64, ordinal: u64, raw: u64, canonical: u64, node: u64,
+    status: u32, information: u64,
+) {
+    print_str(b"[scsi-canonical-completion] stage/ordinal/raw/canonical/node/status/info=");
+    for (index, value) in [stage, ordinal, raw, canonical, node, u64::from(status), information]
+        .into_iter().enumerate() {
+        if index != 0 { print_str(b"/"); }
+        print_u64(value);
+    }
+    print_str(b"\n");
+}
+
 unsafe fn complete_hosted_irp(irp: u64) -> HostedIrpUnwindOutcome {
     unsafe { complete_hosted_irp_with_owner(irp).outcome }
 }
@@ -14286,6 +14301,16 @@ struct HostedIrpCompletionReceipt {
 unsafe fn complete_hosted_irp_with_owner(irp: u64) -> HostedIrpCompletionReceipt {
     unsafe {
         let claim = claim_pending_irp_completion(irp);
+        let scsi_trace = claim.as_ref().and_then(|claim| {
+            claim.target.scsi_route.map(|_| {
+                let ordinal = SCSI_CANONICAL_COMPLETION_TRACE_COUNT
+                    .fetch_add(1, Ordering::Relaxed) + 1;
+                (ordinal, pending_irp_canonical_id(claim.node).load(Ordering::Acquire), claim.node)
+            })
+        }).filter(|(ordinal, _, _)| *ordinal <= 192 || ordinal.is_power_of_two());
+        if let Some((ordinal, canonical, node)) = scsi_trace {
+            trace_scsi_canonical_completion(1, ordinal, irp, canonical, node, 0, 0);
+        }
         if CONNECT_DPC_PROBE_ARMED.load(Ordering::Acquire) {
             trace_post_hook_connect_completion(2, irp,
                 claim.as_ref().map_or(0, |claim| pending_irp_canonical_id(claim.node)
@@ -14481,6 +14506,11 @@ unsafe fn complete_hosted_irp_with_owner(irp: u64) -> HostedIrpCompletionReceipt
             claim,
             nt_io_manager::CompletionClaimRelease::Terminal,
         );
+        if let Some((ordinal, canonical, node)) = scsi_trace {
+            trace_scsi_canonical_completion(
+                2, ordinal, irp, canonical, node, status, information,
+            );
+        }
         if PEER_COMPLETION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
             print_str(b"[fsd-peer-complete] major=");
             print_u64(target.major as u64);

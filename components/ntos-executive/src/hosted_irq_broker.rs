@@ -2350,6 +2350,10 @@ unsafe fn dispatch_next_dpc(
             return Err(status);
         }
     };
+    super::hosted_dpc_transition_trace::record(
+        7, Some(owner), activation.identity.dpc_token, activation.identity.generation,
+        activation.sequence, STATUS_SUCCESS, 0, 0,
+    );
     let inst = match instance(lane.projection_instance) {
         Some(inst) => inst,
         None => {
@@ -2463,6 +2467,12 @@ unsafe fn dispatch_next_dpc(
         class_acks: Vec::new(),
     };
     let result = session.drive_dispatch(0, dispatch);
+    super::hosted_dpc_transition_trace::record(
+        8, Some(owner), activation.identity.dpc_token, activation.identity.generation,
+        activation.sequence,
+        match &result { Ok(result) => result.status, Err(status) => status.raw() },
+        0, 0,
+    );
     let leaked_service_lock = !session.service_locks.is_empty();
     let leaked_recursive_state = !session.call_frames.is_empty() || session.lanes.len() != 1;
     let leaked_class_callback = session.quarantine_unacknowledged_class_callbacks();

@@ -6,8 +6,9 @@
 use super::*;
 
 // Stages: 0 queue result, 1 before QueueDpc service Reply, 2 after Reply/checkpoint,
-// 3 scheduler yield, 4 physical receive, 5 drain owner, 6 drain result.
-static STAGE_COUNTS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+// 3 scheduler yield, 4 physical receive, 5 drain owner, 6 drain result,
+// 7 exact DPC activation, 8 exact DPC dispatch returned.
+static STAGE_COUNTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 pub(crate) fn record(
     stage: usize,
@@ -21,7 +22,8 @@ pub(crate) fn record(
 ) {
     let Some(counter) = STAGE_COUNTS.get(stage) else { return; };
     let ordinal = counter.fetch_add(1, Ordering::Relaxed) + 1;
-    if ordinal > 32 && !ordinal.is_power_of_two() { return; }
+    let first = if matches!(stage, 0 | 7 | 8) { 192 } else { 32 };
+    if ordinal > first && !ordinal.is_power_of_two() { return; }
     let pending = hosted_driver_dpc_activation_pending();
     let (bootstrap, timer, receive) = unsafe {
         (crate::dispatcher_bootstrap::is_owned(),
