@@ -61,6 +61,8 @@ pub(crate) mod pending_pipe_read_trace;
 pub(crate) mod mounted_read_lifetime_trace;
 #[path = "mounted_installer_file_trace.rs"]
 pub(crate) mod mounted_installer_file_trace;
+#[path = "native_process_time_census.rs"]
+pub(crate) mod native_process_time_census;
 #[path = "inline_file_retirement.rs"]
 pub(crate) mod inline_file_retirement;
 #[path = "hosted_gui_client_info.rs"]
@@ -11392,6 +11394,7 @@ pub(crate) unsafe fn service_sec_image(
                     Ordering::Relaxed,
                 );
                 census_tick_static(now);
+                native_process_time_census::sample_after_census(&nt_handler);
                 if CENSUS_LAST_DUMP.load(Ordering::Relaxed) == now {
                 }
             }
@@ -14860,13 +14863,17 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 } else {
                     crate::probe_reset();
+                    let dispatch_generation = nt_handler.hosted_process_generation(pi);
                     let dispatch_started = crate::disk_census_ticks();
                     let res =
                         nt_dispatcher.dispatch(m0 as u32, &argv[..n], &origin, &mut nt_handler);
                     current_apc_handoff = nt_handler.current_apc_handoff.take();
-                    crate::record_native_dispatch_ticks(
-                        m0,
-                        crate::disk_census_ticks().wrapping_sub(dispatch_started),
+                    let elapsed_ticks = crate::disk_census_ticks().wrapping_sub(dispatch_started);
+                    crate::record_native_dispatch_ticks(m0, elapsed_ticks);
+                    native_process_time_census::record_dispatch(
+                        pi, dispatch_generation,
+                        table_entry.map(|entry| entry.service), res.status,
+                        elapsed_ticks,
                     );
                     result = res.status as u64;
                     if m0 == SSN_NT_CREATE_THREAD {

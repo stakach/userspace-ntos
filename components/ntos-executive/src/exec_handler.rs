@@ -9652,6 +9652,17 @@ impl ExecNtHandler {
         None
     }
 
+    /// Read-only identity gate for diagnostic scheduler-context sampling.
+    pub(crate) fn observed_sched_context_for_binding(
+        &self,
+        binding: nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+    ) -> Option<u64> {
+        let runtime = self.thread_runtime.executable_by_tid(binding.tid)?;
+        (runtime.binding() == binding
+            && self.capture_process_identity(binding.pi) == Some(binding.process))
+            .then_some(runtime.mechanism.sched_context)
+    }
+
     pub(crate) fn hosted_thread_quiesce_records_for_pi(
         &self,
         pi: usize,
