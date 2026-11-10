@@ -38,9 +38,8 @@ pub mod level {
     pub const MASK: u32 = 0x8000_0000;
 }
 
-/// The per-component debug-print filter mask (WinDbg `Kd_*_Mask`). Real ntdll reads these from the
-/// `HKLM\...\Debug Print Filter` registry key at init; we model the mask so the *filtering decision*
-/// is host-tested. Default (all zero) = only unconditional `DbgPrint` and `ERROR`-level output.
+/// A host-testable component mask paired with the initial system-wide mask.
+/// Default component mask zero still enables `ERROR` through the system-wide bit.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ComponentFilter {
     /// The component's enabled-level bit mask.
@@ -48,39 +47,15 @@ pub struct ComponentFilter {
 }
 
 impl ComponentFilter {
-    /// Whether a `DbgPrintEx(component, level, …)` call with this `level` should actually print,
-    /// given this component's filter `mask`. Mirrors `NtQueryDebugFilterState`:
-    /// - `ERROR` level (0) always prints (the default-on floor).
-    /// - a `level < 32` prints iff bit `level` is set in the mask.
-    /// - a `level` with the `MASK` bit prints iff `(level & mask) != 0`.
+    /// Query with the initial system-wide mask and this component mask.
+    /// Native mutable masks are owned by the executive.
     pub fn should_print(&self, level: u32) -> bool {
-        if level == self::level::ERROR {
-            return true;
-        }
-        if level & self::level::MASK != 0 {
-            (level & !self::level::MASK) & self.mask != 0
-        } else if level < 32 {
-            self.mask & (1u32 << level) != 0
-        } else {
-            // Out-of-range raw importance: only ERROR/WARNING/TRACE/INFO are meaningful; anything
-            // else defaults off unless the mask opts in via bit 0.
-            self.mask & 1 != 0
-        }
+        debug_filter_state(1, self.mask, level)
     }
 }
 
-/// Convert an `NtQueryDebugFilterState`/`NtSetDebugFilterState` level to the stored mask bitfield.
-pub fn debug_filter_level_mask(level: u32) -> u32 {
-    let mask = if level < 32 { 1u32 << level } else { level };
-    mask & !self::level::MASK
-}
-
-/// Query a debug-filter mask pair using the ReactOS kernel contract: a message is enabled if either
-/// the system-wide mask or the component mask contains the converted level bit.
-pub fn debug_filter_state(system_mask: u32, component_mask: u32, level: u32) -> bool {
-    let mask = debug_filter_level_mask(level);
-    mask != 0 && ((system_mask | component_mask) & mask) != 0
-}
+pub use nt_compat_exports::debug_filter::{enabled as debug_filter_state,
+    level_mask as debug_filter_level_mask};
 
 /// Render a `DbgPrint`-style message: `format` + `args` → the bytes that would be emitted to the
 /// debug service. Pure; the target-side `emit` hands these to `int 0x2d`.
