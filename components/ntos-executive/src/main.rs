@@ -19453,7 +19453,7 @@ unsafe fn wait_select_dispatcher_ready(handler: &mut ExecNtHandler) {
     let mut sequence = 0;
     while let Some((identity, record)) = object_waiter_next_after_sequence(sequence) {
         sequence = record.sequence;
-        let _ = object_waiter_select_ready(handler, identity, record);
+        let _ = object_waiter_select_ready(handler, identity, record, b"scan");
     }
 }
 
@@ -19461,6 +19461,7 @@ unsafe fn object_waiter_select_ready(
     handler: &mut ExecNtHandler,
     identity: nt_user_host::object_wait::ObjectWaiterIdentity,
     record: ObjectWaiterRecord,
+    route: &'static [u8],
 ) -> bool {
     let count = record.count as usize;
     let Some((selected_slot, mut wake_index)) = object_waiter_ready_selection(handler, record) else {
@@ -19493,7 +19494,34 @@ unsafe fn object_waiter_select_ready(
             | nt_kernel_exec::DispatcherConsumeResult::NotReady => {}
         }
     }
-    object_wait_reply::select(identity, wake_index);
+    // The Reply owner samples time once for both selection and observation. The handler's
+    // current context is only a clue: a scan may run outside the signaler's call.
+    if let Some(age) = object_wait_reply::select(identity, wake_index) {
+        static LONG_SELECTION_TRACE_N: AtomicU64 = AtomicU64::new(0);
+        if age >= WAIT_LATENCY_REPORT_THRESHOLD_100NS
+            && LONG_SELECTION_TRACE_N.fetch_add(1, Ordering::Relaxed) < 256
+        {
+            let selected = record.objects[selected_slot];
+            let generation = match record.caller.process().generation {
+                nt_types::ProcessGeneration::Hosted(value)
+                | nt_types::ProcessGeneration::Temporary(value) => value,
+            };
+            print_str(b"[long-object-selection] wait-pi/pgen/tid/tgen/seq/slot/object/kind/age-ms/status/context-pi/tid/badge=");
+            for (index, value) in [
+                record.pi as u64, generation, record.tid,
+                record.caller.thread().generation(), record.sequence,
+                selected_slot as u64, selected.raw(), selected.kind(),
+                age / 10_000, wake_index, handler.pi as u64,
+                handler.current_tid, handler.current_badge,
+            ].into_iter().enumerate() {
+                if index != 0 { print_str(b"/"); }
+                print_u64(value);
+            }
+            print_str(b" route=");
+            print_str(route);
+            print_str(b"\n");
+        }
+    }
     true
 }
 
@@ -19508,7 +19536,8 @@ unsafe fn object_waiter_select_event_consumer(
     let Some((identity, record)) = object_waiter_next_after_sequence(expected_sequence.saturating_sub(1)) else {
         return false;
     };
-    record.sequence == expected_sequence && object_waiter_select_ready(handler, identity, record)
+    record.sequence == expected_sequence
+        && object_waiter_select_ready(handler, identity, record, b"event")
 }
 
 unsafe fn wait_wake_due(handler: &mut ExecNtHandler, now: nt_time::TimeSnapshot) -> u64 {
@@ -19521,7 +19550,7 @@ unsafe fn wait_wake_due(handler: &mut ExecNtHandler, now: nt_time::TimeSnapshot)
         {
             continue;
         }
-        object_wait_reply::select(identity, 0x102);
+        let _ = object_wait_reply::select(identity, 0x102);
     }
     object_wait_reply::redrive(handler)
 }

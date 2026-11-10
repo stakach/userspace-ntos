@@ -1309,7 +1309,7 @@ static CM_REGISTRY_BOOT_FLAG: AtomicU32 = AtomicU32::new(u32::MAX);
 static CM_REGISTRY_BOOT_SETUP: AtomicBool = AtomicBool::new(false);
 static CM_REGISTRY_BOOT_ACCEPTED: AtomicBool = AtomicBool::new(false);
 static CM_REGISTRY_LAZY_FLUSH_ENABLED: AtomicBool = AtomicBool::new(false);
-fn print_sanitized_ascii(bytes: &[u8], limit: usize) {
+pub(crate) fn print_sanitized_ascii(bytes: &[u8], limit: usize) {
     for &byte in bytes.iter().take(limit) {
         debug_put_char(if (0x20..0x7f).contains(&byte) {
             byte

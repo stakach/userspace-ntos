@@ -40,13 +40,14 @@ pub(crate) fn has_process(pi: usize, preserve_tid: Option<u64>) -> bool {
 }
 
 /// Selection and claim run without callouts after dispatcher state has been consumed.
-pub(crate) unsafe fn select(identity: Identity, status: u64) {
+pub(crate) unsafe fn select(identity: Identity, status: u64) -> Option<u64> {
     let table = &mut *core::ptr::addr_of_mut!(OBJECT_WAITERS);
     let selected_at = monotonic_time_100ns();
     let record = *table
         .get_exact(identity)
         .expect("wait selection lost its owner");
     let count = record.count;
+    let parked_age = record.latency.parked_age_100ns(selected_at);
     // Sampling the exact unclaimed row precedes the existing terminal claim.
     // A reply retry cannot change this first selection time.
     let _ = table.update_exact(identity, |record| {
@@ -57,6 +58,7 @@ pub(crate) unsafe fn select(identity: Identity, status: u64) {
         .expect("wait selection lost its exclusive terminal result");
     crate::ingress_observation::object_wait_selected(&record, selected_at);
     RETRY_PENDING.store(true, Ordering::Release);
+    parked_age
 }
 
 /// Publish intent for every target before teardown can run a nested provider dispatch.
@@ -240,6 +242,39 @@ unsafe fn finish(handler: &mut ExecNtHandler, id: Identity) -> u64 {
                 parked / 10_000, reply / 10_000].into_iter().enumerate() {
                 if index != 0 { print_str(b"/"); }
                 print_u64(value);
+            }
+            let process_generation = match record.caller.process().generation {
+                nt_types::ProcessGeneration::Hosted(value)
+                | nt_types::ProcessGeneration::Temporary(value) => value,
+            };
+            print_str(b" pgen/tgen/object-kind=");
+            print_u64(process_generation);
+            print_str(b"/");
+            print_u64(record.caller.thread().generation());
+            print_str(b"/");
+            print_u64(record.objects[0].kind());
+            if exact_caller_live && record.objects[0].kind() == WaitObject::KIND_DISPATCHER {
+                let index = record.objects[0].id() as usize;
+                if let Some(entry) = handler.obj_ns.get(index).filter(|entry| entry.is_live()) {
+                    print_str(b" ns-kind=");
+                    print_u64(entry.kind as u64);
+                    print_str(b" name=\"");
+                    crate::exec_handler::print_sanitized_ascii(entry.name(), 48);
+                    print_str(b"\"");
+                }
+                if let Some((kind, signaled)) = handler.events.query_existing(index as u64) {
+                    print_str(b" event-kind/signaled=");
+                    print_u64(matches!(kind, EventKind::Synchronization) as u64);
+                    print_str(b"/");
+                    print_u64(signaled as u64);
+                } else if let Some((current, maximum)) = handler.semaphores.query(index as u64) {
+                    print_str(b" semaphore-current/max=");
+                    print_u64(current as u64);
+                    print_str(b"/");
+                    print_u64(maximum as u64);
+                } else if handler.mutants.contains(index as u64) {
+                    print_str(b" mutant=1");
+                }
             }
             print_str(b"\n");
         }
