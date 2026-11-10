@@ -7136,7 +7136,6 @@ fn print_shared_receive_census() {
 fn print_timer_deadline_census() {
     use nt_hosted_runtime::TimerDeadlineCensus;
     static HOSTED_TIMER_SAMPLES: AtomicU64 = AtomicU64::new(0);
-    static CLOCK_CALLSITE_CENSUSES: AtomicU64 = AtomicU64::new(0);
     print_str(b"[census] timer-scan seen/spurious/early-stale/shots/idle-disarms/due-drains/past-rearms=");
     for (index, value) in [
         TIMER_TICKS_SEEN.load(Ordering::Relaxed),
@@ -7154,29 +7153,6 @@ fn print_timer_deadline_census() {
     print_str(b"[census] timer-shots-retained=");
     print_u64(TIMER_SHOTS_RETAINED.load(Ordering::Relaxed));
     print_str(b"\n");
-    // The clock sampler is already updated by monotonic_time_100ns. Publish
-    // only a bounded top set every fourth census so a slow HPET fallback can
-    // be attributed without turning the diagnostic into a serial workload.
-    let clock_census = CLOCK_CALLSITE_CENSUSES.fetch_add(1, Ordering::Relaxed);
-    if clock_census < 128 && clock_census % 4 == 0 {
-        let snapshot = MONOTONIC_CALLS.snapshot::<8>();
-        print_str(b"[census] monotonic-calls total/sampled/overflow=");
-        print_u64(snapshot.calls);
-        print_str(b"/");
-        print_u64(snapshot.sampled);
-        print_str(b"/");
-        print_u64(snapshot.overflow);
-        print_str(b"\n");
-        for sample in snapshot.top.into_iter().flatten() {
-            print_str(b"[census] monotonic-callsite samples/file/line=");
-            print_u64(sample.samples);
-            print_str(b"/");
-            print_str(sample.location.file().as_bytes());
-            print_str(b"/");
-            print_u64(sample.location.line() as u64);
-            print_str(b"\n");
-        }
-    }
     let census = unsafe { *core::ptr::addr_of!(TIMER_DEADLINE_CENSUS) };
     for bucket in 0..TimerDeadlineCensus::BUCKETS {
         let source = if bucket == 0 { None } else { Some(bucket as u64) };
