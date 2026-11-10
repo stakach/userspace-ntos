@@ -17414,13 +17414,31 @@ unsafe fn delay_timer_rearm(
     queue: &nt_delay_execution::Queue,
     handler: &ExecNtHandler,
 ) -> nt_kernel_exec::TimerRearmOutcome {
+    delay_timer_rearm_with_snapshot(queue, handler, nt_time_snapshot)
+}
+
+/// Select deadlines from one caller-owned causal snapshot. The physical PIT
+/// programming path still samples time afresh after selection.
+unsafe fn delay_timer_rearm_at(
+    queue: &nt_delay_execution::Queue,
+    handler: &ExecNtHandler,
+    selection_time: nt_time::TimeSnapshot,
+) -> nt_kernel_exec::TimerRearmOutcome {
+    delay_timer_rearm_with_snapshot(queue, handler, || selection_time)
+}
+
+unsafe fn delay_timer_rearm_with_snapshot(
+    queue: &nt_delay_execution::Queue,
+    handler: &ExecNtHandler,
+    selection_time: impl FnOnce() -> nt_time::TimeSnapshot,
+) -> nt_kernel_exec::TimerRearmOutcome {
     use nt_kernel_exec::TimerRearmOutcome;
     if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0
         || DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire) != DELAY_TIMER_IRQ_ACTIVE
     {
         return TimerRearmOutcome::Unavailable;
     }
-    if let Some((deadline, source)) = delay_timer_next_deadline(queue, handler, nt_time_snapshot()) {
+    if let Some((deadline, source)) = delay_timer_next_deadline(queue, handler, selection_time()) {
         if delay_timer_program(deadline, source) {
             TimerRearmOutcome::Programmed
         } else {

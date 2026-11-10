@@ -507,7 +507,7 @@ unsafe fn reconcile_runtime(handler: &mut ExecNtHandler) -> Option<nt_kernel_exe
     let queue =
         SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) as *const nt_delay_execution::Queue;
     let _message = crate::ipc_message::SavedMessageBuffer::capture();
-    Some(delay_timer_rearm(&*queue, handler))
+    Some(delay_timer_rearm_at(&*queue, handler, nt_time_snapshot_at(now)))
 }
 
 unsafe fn drain_terminals(handler: *mut ExecNtHandler) -> bool {
