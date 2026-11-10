@@ -2,15 +2,15 @@
 //! its first assigned PnP Enum open. Pending returns remain explicitly unresolved.
 
 use crate::*;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use nt_hosted_runtime::{InstallerSyscallSpans, SpanOwner};
+use core::sync::atomic::{AtomicBool, Ordering};
+use nt_hosted_runtime::{CensusEpochGate, InstallerSyscallSpans, SpanOwner};
 
 const ROWS: usize = 8;
 const TOP: usize = 4;
 const CENSUS_LIMIT: u64 = 16;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
-static CENSUS_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static mut CENSUS_GATE: CensusEpochGate = CensusEpochGate::new(CENSUS_LIMIT);
 static mut SPANS: InstallerSyscallSpans<ROWS, TOP> = InstallerSyscallSpans::new();
 
 fn exact_owner(handler: &ExecNtHandler, pi: usize, tid: u64, badge: u64) -> Option<SpanOwner> {
@@ -51,6 +51,10 @@ pub(crate) fn activate_after_enum_open(handler: &ExecNtHandler, pi: usize) {
         return;
     };
     if unsafe { (&mut *core::ptr::addr_of_mut!(SPANS)).activate(owner) } {
+        if !ACTIVE.load(Ordering::Acquire) {
+            let epoch = CENSUS_PERIODIC_DUMPS.load(Ordering::Relaxed);
+            unsafe { (&mut *core::ptr::addr_of_mut!(CENSUS_GATE)).prime(epoch); }
+        }
         ACTIVE.store(true, Ordering::Release);
     }
 }
@@ -77,8 +81,9 @@ pub(crate) fn returned(handler: &ExecNtHandler, owner: Option<SpanOwner>,
 /// Only table dispatch is covered; retained pending owners have no terminal timestamp here.
 pub(crate) fn print_census(handler: &ExecNtHandler) {
     if !ACTIVE.load(Ordering::Acquire) { return; }
+    let epoch = CENSUS_PERIODIC_DUMPS.load(Ordering::Relaxed);
+    if !unsafe { (&mut *core::ptr::addr_of_mut!(CENSUS_GATE)).admit(epoch) } { return; }
     retire_stale(handler);
-    if CENSUS_SAMPLES.fetch_add(1, Ordering::Relaxed) >= CENSUS_LIMIT { return; }
     let now = monotonic_time_100ns();
     let ledger = unsafe { &*core::ptr::addr_of!(SPANS) };
     for owner in ledger.owners() {
@@ -116,6 +121,7 @@ pub(crate) fn print_census(handler: &ExecNtHandler) {
             if index != 0 { print_str(b"/"); }
             print_u64(value);
         }
+        print_str(b" census-epoch="); print_u64(epoch);
         print_str(b" top-ssn/calls/wall-total-ms/max-ms=");
         for top in snapshot.top.into_iter().flatten() {
             print_u64(top.ssn as u64); print_str(b"/");

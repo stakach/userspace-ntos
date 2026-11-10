@@ -3,6 +3,39 @@
 const SSN_CAP: usize = 512;
 const STATUS_PENDING: u32 = 0x103;
 
+/// One diagnostic sample per completed periodic census epoch after activation.
+/// The current epoch is primed without consuming the bounded sample budget.
+pub struct CensusEpochGate {
+    last_epoch: u64,
+    emitted: u64,
+    limit: u64,
+    primed: bool,
+}
+
+impl CensusEpochGate {
+    pub const fn new(limit: u64) -> Self {
+        Self { last_epoch: 0, emitted: 0, limit, primed: false }
+    }
+
+    pub fn prime(&mut self, epoch: u64) {
+        if !self.primed {
+            self.last_epoch = epoch;
+            self.primed = true;
+        }
+    }
+
+    pub fn admit(&mut self, epoch: u64) -> bool {
+        if epoch == 0 || epoch <= self.last_epoch || self.emitted >= self.limit {
+            return false;
+        }
+        self.last_epoch = epoch;
+        self.emitted += 1;
+        true
+    }
+
+    pub fn emitted(&self) -> u64 { self.emitted }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpanOwner {
     pub process_index: usize,
@@ -208,6 +241,33 @@ impl<const N: usize, const TOP: usize> Default for InstallerSyscallSpans<N, TOP>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn census_epoch_gate_uses_only_distinct_periodic_epochs_after_activation() {
+        let mut gate = CensusEpochGate::new(16);
+        gate.prime(31);
+        assert!(!gate.admit(0));
+        assert!(!gate.admit(31));
+        assert!(!gate.admit(31));
+        for epoch in 32..48 {
+            assert!(gate.admit(epoch));
+            assert!(!gate.admit(epoch));
+        }
+        assert!(!gate.admit(48));
+        assert!(!gate.admit(49));
+        assert_eq!(gate.emitted(), 16);
+    }
+
+    #[test]
+    fn census_epoch_gate_rejects_stale_and_zero_epochs() {
+        let mut gate = CensusEpochGate::new(2);
+        assert!(!gate.admit(0));
+        assert!(gate.admit(1));
+        assert!(!gate.admit(1));
+        assert!(gate.admit(3));
+        assert!(!gate.admit(2));
+        assert_eq!(gate.emitted(), 2);
+    }
 
     const A: SpanOwner = SpanOwner { process_index: 18, process_generation: 17,
         thread_id: 560, thread_generation: 1 };
