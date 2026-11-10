@@ -19519,6 +19519,19 @@ unsafe fn object_waiter_select_ready(
             }
             print_str(b" route=");
             print_str(route);
+            // The selected slot is authoritative for a multi-object wait. Inspect its retained
+            // namespace entry before Reply retirement releases the wait's object references.
+            if selected.kind() == WaitObject::KIND_DISPATCHER {
+                if let Some(entry) = handler.obj_ns.get(selected.id() as usize)
+                    .filter(|entry| entry.is_live())
+                {
+                    print_str(b" ns-kind=");
+                    print_u64(entry.kind as u64);
+                    print_str(b" name=\"");
+                    exec_handler::print_sanitized_ascii(entry.name(), 48);
+                    print_str(b"\"");
+                }
+            }
             print_str(b"\n");
         }
     }
