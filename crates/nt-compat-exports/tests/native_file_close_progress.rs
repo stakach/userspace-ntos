@@ -212,6 +212,13 @@ fn retained_file_lifecycle_refusal_has_a_root_timer_and_outer_pump_demand() {
     let resume = include_str!("../../../components/ntos-executive/src/component_resume.rs");
     let reconcile = resume.split("fn reconcile_runtime(").nth(1).unwrap()
         .split("fn drain_terminals(").next().unwrap();
-    assert!(reconcile.contains("driver_launch::hosted_file_retry_deadline(now)"),
+    let timer = include_str!("../../../components/ntos-executive/src/timer_deadline.rs");
+    let after_demand = reconcile.split_once("reconcile_demand(&handler.pm, now);")
+        .map(|(_, body)| body).expect("receive demand reconciliation");
+    let before_selector = after_demand
+        .split_once("Some(delay_timer_rearm_at(&*queue, handler, nt_time_snapshot_at(now)))")
+        .map(|(body, _)| body).expect("canonical timer selector");
+    assert!(timer.contains("driver_launch::hosted_file_retry_deadline(now.monotonic_100ns)")
+        && !before_selector.contains("return None"),
         "component receive must rearm a retained lifecycle retry without another syscall");
 }
