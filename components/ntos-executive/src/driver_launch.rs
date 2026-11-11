@@ -199,6 +199,8 @@ mod hosted_work_queue_owner;
 pub(crate) use hosted_work_queue_owner::{
     QueuedCallbackProgress, QueuedCallbackRootAction, QueuedCallbackSelector,
     queued_callback_file_floor, queued_callback_root_action,
+    watch_queued_callback_root_retirement, queued_callback_root_retired,
+    consume_queued_callback_root_retirement, queued_callback_newer_root_child,
     record_queued_callback_child_step, resume_queued_callback_after_file_settlement,
     unsettled_queued_callback,
 };

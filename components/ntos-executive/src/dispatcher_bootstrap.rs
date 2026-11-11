@@ -135,6 +135,7 @@ unsafe fn collect_owned_deadline(now: nt_time::TimeSnapshot) -> Result<Option<(u
                 job_time: None,
                 component_resume: service_sec_image::component_resume::retained_deadline(),
                 root_add_device: None,
+                root_queued_callback: None,
                 primary_alias: None,
                 hosted_spawn_abort: None,
             })

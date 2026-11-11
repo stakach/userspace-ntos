@@ -115,12 +115,12 @@ fn irq_line_preflight_quarantines_uncertain_lease_release() {
 fn exact_ingress_is_prevalidated_before_move_only_turn_is_consumed() {
     let root = SERVICE.split_once("'service_loop: loop {").unwrap().1;
     let first_settle = root.find("turn.settle(").unwrap();
-    let first_validate = root.find("deferred_add_device_ingress_is_exact(ticket)").unwrap();
+    let first_validate = root.find("deferred_parked_ingress_is_exact(ticket)").unwrap();
     assert!(first_validate < first_settle,
         "a failed exact physical Reply check must leave the whole turn retained");
     let second_settle = root[first_settle + 1..].find("turn.settle(").unwrap() + first_settle + 1;
     let second_validate = root[first_validate + 1..]
-        .find("deferred_add_device_ingress_is_exact(ticket)").unwrap() + first_validate + 1;
+        .find("deferred_parked_ingress_is_exact(ticket)").unwrap() + first_validate + 1;
     assert!(second_validate < second_settle,
         "both root completion paths must retain the turn on validation refusal");
 }

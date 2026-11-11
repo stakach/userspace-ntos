@@ -46,8 +46,10 @@ pub(crate) use retirement::retire;
 mod hosted;
 pub(crate) use hosted::{
     can_park_hosted_reply, cancel_hosted, cancel_hosted_caller, defer_hosted_delivery,
-    defer_hosted_delivery_for_add_device, deferred_add_device_ingress_is_exact,
-    DeferredAddDeviceIngress,
+    defer_hosted_delivery_for_add_device, defer_hosted_delivery_for_queued_callback,
+    deferred_parked_ingress_is_exact,
+    deferred_queued_ingress_selected,
+    DeferredParkedIngress,
     is_win32k_native_call,
     parkable_hosted_reply_binding,
     finish_acknowledged_hosted_reply, hosted_can_resume, hosted_cancellation_proven,

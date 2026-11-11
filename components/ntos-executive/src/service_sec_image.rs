@@ -10797,6 +10797,7 @@ pub(crate) unsafe fn service_sec_image(
     // STATIC because the win32k dispatch arm's nested pump ticks it too (see `w32_census_enter`).
     CENSUS_LAST_DUMP.store(last_progress_t, Ordering::Relaxed);
     let mut root_add_device_turn: Option<RootAddDeviceTurn> = None;
+    let mut root_queued_callback_turn: Vec<RootQueuedCallbackTurn> = Vec::new();
     let memory_context = ExecLoopCtx {
         owner_pi: primary_pi,
         owner_pid: nt_handler.capture_process_identity(primary_pi)
@@ -10827,9 +10828,15 @@ pub(crate) unsafe fn service_sec_image(
     receive_vspace::install(nt_handler.hosted_vspace_observer());
     let mut receive_boundary = None;
     'service_loop: loop {
+        let queued_callback_fences_providers = root_queued_callback_exclusive_pending()
+            || crate::driver_launch::unsettled_queued_callback();
         #[cfg(not(feature = "mup-provider-kernel-only"))]
-        service_primary_alias_retry(&mut nt_handler, &mut primary_alias_activation);
-        hosted_spawn_uncertainty::redrive(&mut *delay_queue, &mut nt_handler);
+        if !queued_callback_fences_providers {
+            service_primary_alias_retry(&mut nt_handler, &mut primary_alias_activation);
+        }
+        if !queued_callback_fences_providers {
+            hosted_spawn_uncertainty::redrive(&mut *delay_queue, &mut nt_handler);
+        }
         macro_rules! component_receive_outcome {
             ($outcome:expr) => {{
                 match $outcome {
@@ -10857,6 +10864,21 @@ pub(crate) unsafe fn service_sec_image(
                         record_service_loop_exit!(b"add-device-receive");
                         break 'service_loop;
                     }
+                } else if root_queued_callback_exclusive_pending() {
+                    if !prepare_parked_queued_callback_receive(&mut root_queued_callback_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-callback-receive");
+                        break 'service_loop;
+                    }
+                    if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+                        && !transfer_selected_queued_callback_ingress(&mut root_queued_callback_turn)
+                    {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-callback-child-transfer");
+                        break 'service_loop;
+                    }
                 } else if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
                     prepare_service_receive(&mut *delay_queue, &mut nt_handler);
                 }
@@ -10873,6 +10895,21 @@ pub(crate) unsafe fn service_sec_image(
                         record_service_loop_exit!(b"add-device-reply-receive");
                         break 'service_loop;
                     }
+                } else if root_queued_callback_exclusive_pending() {
+                    if !prepare_parked_queued_callback_receive(&mut root_queued_callback_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-callback-reply-receive");
+                        break 'service_loop;
+                    }
+                    if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+                        && !transfer_selected_queued_callback_ingress(&mut root_queued_callback_turn)
+                    {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-callback-child-transfer");
+                        break 'service_loop;
+                    }
                 } else if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
                     prepare_service_receive(&mut *delay_queue, &mut nt_handler);
                 }
@@ -10884,6 +10921,80 @@ pub(crate) unsafe fn service_sec_image(
             ($ep:expr, $len:expr, $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {{
                 component_client_reply_recv!($ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed),
                     $len, $r0, $r1, $r2, $r3)
+            }};
+        }
+        // A retained queued callback is an independent root parent. Its exact queue selector
+        // and Reply remain owned while this root receives a child-producing notification.
+        macro_rules! park_queued_callback_root_receive {
+            ($root_event_consumed:ident) => {{
+                let permit = match ParkedRootQueuedCallbackPermit::current() {
+                    Some(permit) => permit,
+                    None => {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-callback-owner");
+                        break 'service_loop;
+                    }
+                };
+                if !ensure_queued_callback_root_turn(&mut root_queued_callback_turn, &permit) {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"queued-callback-owner-changed");
+                    break 'service_loop;
+                }
+                ROOT_QUEUED_CALLBACK_EXCLUSIVE.store(true, Ordering::Release);
+                if !$root_event_consumed {
+                    if badge_has_delay_timer(badge) || hosted_irq_lines_from_badge(badge) != 0 {
+                        let turn = root_queued_callback_turn.last_mut()
+                            .expect("queued callback turn");
+                        if service_parked_queued_callback_notification(badge).is_err() {
+                            stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                            stop_ssn = 0;
+                            record_service_loop_exit!(b"queued-callback-notification");
+                            break 'service_loop;
+                        }
+                        let arrival = if badge_has_delay_timer(badge) {
+                            nt_driver_start::RootArrival::Timer { now: monotonic_time_100ns() }
+                        } else { nt_driver_start::RootArrival::Irq };
+                        if turn.observe_arrival(permit.0, arrival).is_err() {
+                            stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                            stop_ssn = 0;
+                            record_service_loop_exit!(b"queued-callback-arrival");
+                            break 'service_loop;
+                        }
+                    } else {
+                        let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                        let selected_child = crate::spawn_hosts::shared_ingress::owner::runtime::
+                            receive_child_pending()
+                            && hosted_ingress_binding(badge).is_some_and(|binding|
+                                crate::spawn_hosts::shared_ingress::owner::runtime::
+                                    receive_child_is_current(binding, reply));
+                        let retained = if selected_child {
+                            crate::spawn_hosts::shared_ingress::owner::runtime::
+                                defer_hosted_delivery_for_queued_callback(reply, badge, &permit)
+                                .is_ok()
+                        } else {
+                            retain_parked_queued_callback_ingress(
+                                &mut root_queued_callback_turn, &permit, reply, badge)
+                        };
+                        if !retained {
+                            stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                            stop_ssn = 0;
+                            record_service_loop_exit!(b"queued-callback-ingress-defer");
+                            break 'service_loop;
+                        }
+                    }
+                    $root_event_consumed = true;
+                }
+                if !prepare_parked_queued_callback_receive(&mut root_queued_callback_turn) {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"queued-callback-receive-prepare");
+                    break 'service_loop;
+                }
+                let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                (badge, mi, m0, m1, m2, m3) = received;
+                continue 'service_loop;
             }};
         }
         // This endpoint admits hosted faults/native Calls, not asynchronous Send traffic. A
@@ -10936,6 +11047,19 @@ pub(crate) unsafe fn service_sec_image(
                         record_service_loop_exit!(b"restored-add-device-receive");
                         break 'service_loop;
                     }
+                } else if root_queued_callback_exclusive_pending() {
+                    if !prepare_parked_queued_callback_receive(&mut root_queued_callback_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"restored-queued-callback-receive");
+                        break 'service_loop;
+                    }
+                    if !transfer_selected_queued_callback_ingress(&mut root_queued_callback_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"restored-queued-callback-child-transfer");
+                        break 'service_loop;
+                    }
                 } else {
                     prepare_service_receive(&mut *delay_queue, &mut nt_handler);
                 }
@@ -10971,6 +11095,58 @@ pub(crate) unsafe fn service_sec_image(
         // settle any inner CONNECT, then resume that same batch before general redrives.
         // The sealed child step is deposited before any subsequent batch borrow.
         let mut root_event_consumed = false;
+        if root_queued_callback_exclusive_pending()
+            && (badge_has_delay_timer(badge) || hosted_irq_lines_from_badge(badge) != 0)
+        {
+            let Some(turn) = root_queued_callback_turn.last_mut() else {
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                record_service_loop_exit!(b"queued-callback-missing-turn");
+                break 'service_loop;
+            };
+            if service_parked_queued_callback_notification(badge).is_err() {
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                record_service_loop_exit!(b"queued-callback-notification");
+                break 'service_loop;
+            }
+            let arrival = if badge_has_delay_timer(badge) {
+                nt_driver_start::RootArrival::Timer { now: monotonic_time_100ns() }
+            } else { nt_driver_start::RootArrival::Irq };
+            if turn.observe_arrival(turn.owner(), arrival).is_err() {
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                record_service_loop_exit!(b"queued-callback-arrival");
+                break 'service_loop;
+            }
+            root_event_consumed = true;
+        } else if root_queued_callback_exclusive_pending() {
+            // Keep original ingress order: a newer Call Y cannot overtake an older deferred
+            // Call X if this callback happens to settle while Y is the current delivery.
+            let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let selected_child = crate::spawn_hosts::shared_ingress::owner::runtime::
+                receive_child_pending()
+                && hosted_ingress_binding(badge).is_some_and(|binding|
+                    crate::spawn_hosts::shared_ingress::owner::runtime::
+                        receive_child_is_current(binding, reply));
+            if !selected_child {
+                let Some(permit) = ParkedRootQueuedCallbackPermit::retained() else {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"queued-callback-ingress-owner");
+                    break 'service_loop;
+                };
+                if !retain_parked_queued_callback_ingress(
+                    &mut root_queued_callback_turn, &permit, reply, badge)
+                {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"queued-callback-ingress-defer");
+                    break 'service_loop;
+                }
+                root_event_consumed = true;
+            }
+        }
         if let Some(turn) = root_add_device_turn.as_mut() {
             if badge_has_delay_timer(badge) || hosted_irq_lines_from_badge(badge) != 0 {
                 if let Err(status) = service_parked_add_device_notification(badge) {
@@ -10996,11 +11172,19 @@ pub(crate) unsafe fn service_sec_image(
                 settle_queued_callbacks()
             };
             match callback_settlement {
-                ConnectPumpSettlement::Settled => {}
+                ConnectPumpSettlement::Settled => {
+                    if !settle_parked_queued_callback_turn(&mut root_queued_callback_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-callback-settle");
+                        break 'service_loop;
+                    }
+                }
                 ConnectPumpSettlement::AwaitingLocalChild => {
-                    if root_add_device_turn.is_none()
-                        || !prepare_parked_add_device_receive(&mut root_add_device_turn)
-                    {
+                    if root_add_device_turn.is_none() {
+                        park_queued_callback_root_receive!(root_event_consumed);
+                    }
+                    if !prepare_parked_add_device_receive(&mut root_add_device_turn) {
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = 0;
                         record_service_loop_exit!(b"add-device-child-receive");
@@ -11042,7 +11226,7 @@ pub(crate) unsafe fn service_sec_image(
                         break 'service_loop;
                     }
                     if turn.retained_ingress(owner).ok().flatten().is_some_and(|ticket|
-                        !crate::spawn_hosts::shared_ingress::owner::runtime::deferred_add_device_ingress_is_exact(ticket))
+                        !crate::spawn_hosts::shared_ingress::owner::runtime::deferred_parked_ingress_is_exact(ticket))
                     {
                         root_add_device_turn = Some(turn);
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
@@ -11140,7 +11324,7 @@ pub(crate) unsafe fn service_sec_image(
                 if root_add_device_turn.as_ref().and_then(|turn|
                     turn.retained_ingress(reservation).ok().flatten())
                     .is_some_and(|ticket|
-                        !crate::spawn_hosts::shared_ingress::owner::runtime::deferred_add_device_ingress_is_exact(ticket))
+                        !crate::spawn_hosts::shared_ingress::owner::runtime::deferred_parked_ingress_is_exact(ticket))
                 {
                     stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                     stop_ssn = 0;
@@ -11239,6 +11423,7 @@ pub(crate) unsafe fn service_sec_image(
         // Import that exact child before any ordinary provider redrive in this event.
         if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
             if root_event_consumed && !root_add_device_exclusive_pending()
+                && !root_queued_callback_exclusive_pending()
                 && !delay_timer_rearm(&*delay_queue, &nt_handler).owner_available()
             {
                 stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
@@ -11248,7 +11433,12 @@ pub(crate) unsafe fn service_sec_image(
             }
             if badge_has_delay_timer(badge) || hosted_irq_lines_from_badge(badge) != 0 {
                 if !root_event_consumed {
-                    if let Err(status) = service_parked_add_device_notification(badge) {
+                    let notification = if root_queued_callback_exclusive_pending() {
+                        service_parked_queued_callback_notification(badge)
+                    } else {
+                        service_parked_add_device_notification(badge)
+                    };
+                    if let Err(status) = notification {
                         stop = status.raw() as u32 as u64;
                         stop_ssn = 0;
                         record_service_loop_exit!(b"receive-child-notification");
@@ -11256,9 +11446,31 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
             } else if !root_event_consumed {
-                crate::spawn_hosts::shared_ingress::owner::runtime::defer_hosted_delivery(
-                    REPLY_MAIN_SLOT.load(Ordering::Relaxed), badge,
-                ).expect("selected Receive child retains the unexecuted current Call");
+                let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let selected_callback_child = root_queued_callback_exclusive_pending()
+                    && hosted_ingress_binding(badge).is_some_and(|binding|
+                        crate::spawn_hosts::shared_ingress::owner::runtime::
+                            receive_child_is_current(binding, reply));
+                if selected_callback_child {
+                    let Some(permit) = ParkedRootQueuedCallbackPermit::retained() else {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-callback-child-owner");
+                        break 'service_loop;
+                    };
+                    if crate::spawn_hosts::shared_ingress::owner::runtime::
+                        defer_hosted_delivery_for_queued_callback(reply, badge, &permit).is_err()
+                    {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-callback-child-defer");
+                        break 'service_loop;
+                    }
+                } else {
+                    crate::spawn_hosts::shared_ingress::owner::runtime::defer_hosted_delivery(
+                        reply, badge,
+                    ).expect("selected Receive child retains the unexecuted current Call");
+                }
             }
             let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
             (badge, mi, m0, m1, m2, m3) = received;
@@ -11351,11 +11563,24 @@ pub(crate) unsafe fn service_sec_image(
             // its exact Reply before a fresh Hook source may enter native code.
             let queue_settlement = settle_queued_callbacks();
             trace_connect_root_checkpoint(3, Some(&queue_settlement));
-            if !matches!(queue_settlement, ConnectPumpSettlement::Settled) {
-                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                stop_ssn = 0;
-                record_service_loop_exit!(b"queued-callback-unsettled");
-                break 'service_loop;
+            match queue_settlement {
+                ConnectPumpSettlement::Settled => {
+                    if !settle_parked_queued_callback_turn(&mut root_queued_callback_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-callback-settle");
+                        break 'service_loop;
+                    }
+                }
+                ConnectPumpSettlement::AwaitingLocalChild => {
+                    park_queued_callback_root_receive!(root_event_consumed);
+                }
+                ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"queued-callback-unsettled");
+                    break 'service_loop;
+                }
             }
             trace_connect_root_checkpoint(4, None);
             crate::driver_launch::redrive_hosted_hook_forward();
@@ -11859,6 +12084,15 @@ pub(crate) unsafe fn service_sec_image(
             );
             // No attachment, process scratch, provider, timer or legacy fault policy runs here.
             // The canonical root pager revalidated the captured resident frame or stack guard.
+            if root_queued_callback_exclusive_pending()
+                && crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+                && !transfer_selected_queued_callback_ingress(&mut root_queued_callback_turn)
+            {
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                record_service_loop_exit!(b"queued-callback-child-transfer");
+                break 'service_loop;
+            }
             let outcome = crate::executive_ingress::reply_receive(
                 REPLY_MAIN_SLOT.load(Ordering::Relaxed), 0, 0, 0, 0, 0,
             );
@@ -28260,13 +28494,39 @@ enum RootAddDeviceOwner {
 }
 type RootAddDeviceTurn = nt_driver_start::AddDeviceRootTurn<
     RootAddDeviceOwner,
-    crate::spawn_hosts::shared_ingress::owner::runtime::DeferredAddDeviceIngress,
+    crate::spawn_hosts::shared_ingress::owner::runtime::DeferredParkedIngress,
+>;
+type RootQueuedCallbackTurn = nt_component_suspension::RootChildTurn<
+    crate::driver_launch::QueuedCallbackSelector,
+    Vec<crate::spawn_hosts::shared_ingress::owner::runtime::DeferredParkedIngress>,
 >;
 
 /// This is a wake request only. The exact batch reservation remains the sole parent authority.
 /// `u64::MAX` denotes no armed retry; the PIT remains one-shot and idle without retained work.
 static ROOT_ADD_DEVICE_RETRY_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
 static ROOT_ADD_DEVICE_EXCLUSIVE: AtomicBool = AtomicBool::new(false);
+
+/// A root-owned callback is physically retained while its selected local child is absent.
+/// The retry is only a wake request; neither the timer nor another Call may replace that owner.
+static ROOT_QUEUED_CALLBACK_EXCLUSIVE: AtomicBool = AtomicBool::new(false);
+static ROOT_QUEUED_CALLBACK_RETRY_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+pub(crate) fn root_queued_callback_exclusive_pending() -> bool {
+    ROOT_QUEUED_CALLBACK_EXCLUSIVE.load(Ordering::Acquire)
+}
+
+pub(crate) fn root_queued_callback_retry_deadline() -> Option<u64> {
+    let deadline = ROOT_QUEUED_CALLBACK_RETRY_DEADLINE.load(Ordering::Acquire);
+    (deadline != u64::MAX).then_some(deadline)
+}
+
+pub(crate) fn root_queued_callback_retry_wake_due(now: u64) -> u64 {
+    let Some(deadline) = root_queued_callback_retry_deadline() else { return 0 };
+    if now < deadline { return 0 }
+    u64::from(ROOT_QUEUED_CALLBACK_RETRY_DEADLINE.compare_exchange(
+        deadline, u64::MAX, Ordering::AcqRel, Ordering::Acquire,
+    ).is_ok())
+}
 
 pub(crate) fn root_add_device_exclusive_pending() -> bool {
     ROOT_ADD_DEVICE_EXCLUSIVE.load(Ordering::Acquire)
@@ -28315,6 +28575,49 @@ unsafe fn prepare_parked_add_device_receive(
     delay_timer_program(deadline, DELAY_TIMER_SOURCE_ROOT_ADD_DEVICE_RETRY)
 }
 
+/// The queued callback's physical parent owns the root until one selected local child is
+/// available. A short one-shot wakes the root without dispatching unrelated timer providers.
+unsafe fn prepare_parked_queued_callback_receive(
+    current: &mut Vec<RootQueuedCallbackTurn>,
+) -> bool {
+    let Some(turn) = current.last_mut() else { return false };
+    let owner = turn.owner();
+    if crate::driver_launch::queued_callback_root_action()
+        != Some(crate::driver_launch::QueuedCallbackRootAction::NeedsChild(owner))
+    { return false; }
+    let pending = DELAY_TIMER_TICKS_PENDING.swap(0, Ordering::AcqRel);
+    if pending != 0 {
+        PUMP_TIMER_TICKS_DRAINED.fetch_add(pending, Ordering::Relaxed);
+        let now = monotonic_time_100ns();
+        let _ = root_queued_callback_retry_wake_due(now);
+        if turn.observe_arrival(owner, nt_driver_start::RootArrival::Timer { now }).is_err() {
+            return false;
+        }
+    }
+    let now = monotonic_time_100ns();
+    let deadline = match turn.retry_deadline(owner) {
+        Ok(Some(deadline)) if deadline > now => deadline,
+        Ok(_) => match turn.arm_retry(owner, now, 1_000_000) {
+            Ok(deadline) => deadline,
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+    ROOT_QUEUED_CALLBACK_RETRY_DEADLINE.store(deadline, Ordering::Release);
+    delay_timer_program(deadline, DELAY_TIMER_SOURCE_ROOT_QUEUED_CALLBACK_RETRY)
+}
+
+unsafe fn service_parked_queued_callback_notification(
+    badge: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let _ = driver_launch::latch_hosted_irq_badge(badge);
+    let _ = driver_launch::drain_pending_hosted_irqs();
+    if badge_has_delay_timer(badge) {
+        ack_parked_queued_callback_retry_timer()?;
+    }
+    Ok(())
+}
+
 unsafe fn service_parked_add_device_notification(
     badge: u64,
 ) -> Result<(), nt_status::NtStatus> {
@@ -28333,6 +28636,129 @@ impl ParkedRootAddDevicePermit {
         root_add_device_still_parked(handler, owner).then_some(Self(()))
     }
 
+}
+
+/// Proof that the newest physical queue callback still needs one local child. The selector
+/// includes both the queue generation and the provider's physical Reply identity.
+pub(crate) struct ParkedRootQueuedCallbackPermit(crate::driver_launch::QueuedCallbackSelector);
+
+impl ParkedRootQueuedCallbackPermit {
+    unsafe fn current() -> Option<Self> {
+        let crate::driver_launch::QueuedCallbackRootAction::NeedsChild(selector) =
+            crate::driver_launch::queued_callback_root_action()? else { return None };
+        crate::driver_launch::queued_callback_file_floor(selector)?;
+        Some(Self(selector))
+    }
+
+    unsafe fn retained() -> Option<Self> {
+        use crate::driver_launch::QueuedCallbackRootAction as Action;
+        let selector = match crate::driver_launch::queued_callback_root_action()? {
+            Action::NeedsChild(selector) | Action::ResumeRecordedStep(selector)
+            | Action::RetryRestore(selector) | Action::RetryTerminalAck(selector) => selector,
+        };
+        crate::driver_launch::queued_callback_file_floor(selector)?;
+        Some(Self(selector))
+    }
+
+    pub(crate) unsafe fn is_exact(&self) -> bool {
+        use crate::driver_launch::QueuedCallbackRootAction as Action;
+        matches!(crate::driver_launch::queued_callback_root_action(),
+            Some(Action::NeedsChild(selector) | Action::ResumeRecordedStep(selector)
+                | Action::RetryRestore(selector) | Action::RetryTerminalAck(selector))
+                if selector == self.0)
+            && crate::driver_launch::queued_callback_file_floor(self.0).is_some()
+    }
+}
+
+/// Synchronize the retained parent stack to the newest exact queue action before any current
+/// Call is returned to ingress. A newer callback must get its own root turn and ACK witness.
+unsafe fn ensure_queued_callback_root_turn(
+    current: &mut Vec<RootQueuedCallbackTurn>,
+    permit: &ParkedRootQueuedCallbackPermit,
+) -> bool {
+    if !permit.is_exact() || !settle_parked_queued_callback_turn(current) { return false; }
+    if current.last().is_some_and(|turn| turn.owner() == permit.0) { return true; }
+    if current.last().is_some_and(|turn|
+        !crate::driver_launch::queued_callback_newer_root_child(turn.owner(), permit.0))
+        || current.try_reserve(1).is_err()
+    { return false; }
+    let mut turn = RootQueuedCallbackTurn::new(permit.0);
+    if turn.retain_ingress(permit.0, Vec::new()).is_err()
+        || !crate::driver_launch::watch_queued_callback_root_retirement(permit.0)
+    { return false; }
+    current.push(turn);
+    ROOT_QUEUED_CALLBACK_EXCLUSIVE.store(true, Ordering::Release);
+    true
+}
+
+/// Reserve before touching the physical ingress row. Every deferred Call stays owned by CALLS;
+/// the root turn retains an exact ticket so no later Call can overtake it at release.
+unsafe fn retain_parked_queued_callback_ingress(
+    current: &mut Vec<RootQueuedCallbackTurn>,
+    permit: &ParkedRootQueuedCallbackPermit,
+    reply: u64,
+    badge: u64,
+) -> bool {
+    if !ensure_queued_callback_root_turn(current, permit) { return false; }
+    let Some(turn) = current.last_mut() else { return false };
+    if turn.owner() != permit.0 { return false; }
+    let owner = turn.owner();
+    if turn.observe_arrival(owner, nt_driver_start::RootArrival::RetainedCall).is_err() {
+        return false;
+    }
+    let Ok(Some(tickets)) = turn.retained_ingress_mut(owner) else { return false };
+    if tickets.try_reserve(1).is_err() { return false; }
+    let Ok(ticket) = crate::spawn_hosts::shared_ingress::owner::runtime::
+        defer_hosted_delivery_for_queued_callback(reply, badge, permit)
+    else { return false };
+    tickets.push(ticket);
+    true
+}
+
+unsafe fn transfer_selected_queued_callback_ingress(
+    current: &mut Vec<RootQueuedCallbackTurn>,
+) -> bool {
+    for turn in current.iter_mut() {
+        let owner = turn.owner();
+        let Ok(Some(tickets)) = turn.retained_ingress_mut(owner) else { return false };
+        tickets.retain(|ticket| unsafe {
+            !crate::spawn_hosts::shared_ingress::owner::runtime::
+                deferred_queued_ingress_selected(ticket)
+        });
+    }
+    true
+}
+
+unsafe fn settle_parked_queued_callback_turn(
+    current: &mut Vec<RootQueuedCallbackTurn>,
+) -> bool {
+    while let Some(turn) = current.last() {
+        let owner = turn.owner();
+        if !crate::driver_launch::queued_callback_root_retired(owner) { break; }
+        let tickets = match turn.retained_ingress(owner) {
+            Ok(Some(tickets)) => tickets,
+            _ => return false,
+        };
+        if tickets.iter().any(|ticket|
+            !crate::spawn_hosts::shared_ingress::owner::runtime::
+                deferred_parked_ingress_is_exact(ticket))
+        { return false; }
+        let turn = current.pop().expect("watched callback turn");
+        if !crate::driver_launch::consume_queued_callback_root_retirement(owner) {
+            current.push(turn);
+            return false;
+        }
+        if let Err(turn) = turn.settle(owner) {
+            current.push(turn);
+            return false;
+        }
+    }
+    if !crate::driver_launch::unsettled_queued_callback() {
+        if !current.is_empty() { return false; }
+        ROOT_QUEUED_CALLBACK_RETRY_DEADLINE.store(u64::MAX, Ordering::Release);
+        ROOT_QUEUED_CALLBACK_EXCLUSIVE.store(false, Ordering::Release);
+    }
+    true
 }
 
 fn ready_flat_root_add_device(handler: &ExecNtHandler) -> Option<RootAddDeviceOwner> {

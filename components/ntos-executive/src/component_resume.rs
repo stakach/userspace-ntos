@@ -628,6 +628,8 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
     if !runtime_ready(handler)
         || is_running()
         || super::root_add_device_exclusive_pending()
+        || super::root_queued_callback_exclusive_pending()
+        || crate::driver_launch::unsettled_queued_callback()
         || crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
         || crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
     {

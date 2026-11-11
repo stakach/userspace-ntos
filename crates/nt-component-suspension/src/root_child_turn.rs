@@ -65,6 +65,15 @@ impl<O: Copy + Eq, I> RootChildTurn<O, I> {
         Ok(self.ingress.as_ref())
     }
 
+    /// Access the retained owner collection only for the same physical parent.
+    pub fn retained_ingress_mut(
+        &mut self,
+        observed: O,
+    ) -> Result<Option<&mut I>, RootChildTurnError> {
+        self.require_owner(observed)?;
+        Ok(self.ingress.as_mut())
+    }
+
     /// Publishes a bounded wake request. Native timer ownership must arm this deadline
     /// before a blocking receive; a failed physical arm retains this whole turn.
     pub fn arm_retry(

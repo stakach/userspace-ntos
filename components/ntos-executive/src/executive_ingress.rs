@@ -226,6 +226,8 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
         // Autonomous Calls stay retained and unadmitted while that ownership is live.
         if !crate::writable_fs::registry_journal::owns_volume()
             && !crate::service_sec_image::root_add_device_exclusive_pending()
+            && !crate::service_sec_image::root_queued_callback_exclusive_pending()
+            && !crate::driver_launch::unsettled_queued_callback()
         {
             if runtime::service_autonomous()
                 .expect("autonomous ingress remains retained on failure")

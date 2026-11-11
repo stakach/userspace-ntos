@@ -57,7 +57,15 @@ struct TerminalAck {
 static mut CLAIMS: Vec<Option<Row>> = Vec::new();
 static mut ORPHANED_PUMPS: Vec<component_scheduler::HostedPumpRestore> = Vec::new();
 static mut ORPHANED_STEPS: Vec<crate::service_sec_image::NestedChildStep> = Vec::new();
+/// Root waits register before retrying a retained callback. The one-use queue ACK seals an
+/// exact retirement receipt without allocating after the physical provider effect.
+static mut ROOT_RETIREMENT_WATCHES: Vec<WatchedCallbackRetirement> = Vec::new();
 static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+struct WatchedCallbackRetirement {
+    selector: QueuedCallbackSelector,
+    acknowledged: bool,
+}
 
 /// An exact selector for a parked callback. Queue entry identity and physical invocation
 /// identity are separate; neither the shared ring head nor a numeric Reply alone is authority.
@@ -208,6 +216,10 @@ pub(super) unsafe fn record_ndis(
 pub(super) unsafe fn acknowledge_return(index: usize, key: QueueEntryKey) -> bool {
     let rows = &mut *core::ptr::addr_of_mut!(CLAIMS);
     let Some(row) = rows.get_mut(index).and_then(Option::as_mut) else { return false; };
+    if (&*core::ptr::addr_of!(ROOT_RETIREMENT_WATCHES)).iter().any(|watch|
+        watch.selector.index == index && watch.selector.sequence == row.sequence
+            && watch.selector.key == key)
+    { return false; }
     if row.pump.is_some() || row.child_step.is_some() || row.resuming
         || row.claim.invocation() != key || !row.claim.entered()
         || !acknowledge_admission(index, row)
@@ -235,6 +247,11 @@ unsafe fn acknowledge_resumed_return(selector: QueuedCallbackSelector) -> bool {
         || row.claim.acknowledge_return(selector.key).is_err()
     { return false; }
     rows[selector.index] = None;
+    if let Some(watch) = (&mut *core::ptr::addr_of_mut!(ROOT_RETIREMENT_WATCHES))
+        .iter_mut().find(|watch| watch.selector == selector)
+    {
+        watch.acknowledged = true;
+    }
     true
 }
 
@@ -325,6 +342,62 @@ pub(crate) unsafe fn queued_callback_root_action() -> Option<QueuedCallbackRootA
                 Some(QueuedCallbackRootAction::RetryRestore(selector)),
         _ => None,
     }
+}
+
+/// Reserve an exact ACK witness before the callback's next native effect. A reused queue slot
+/// or matching numeric Reply cannot retire a watched parent of another generation.
+pub(crate) unsafe fn watch_queued_callback_root_retirement(
+    selector: QueuedCallbackSelector,
+) -> bool {
+    let selected = match queued_callback_root_action() {
+        Some(QueuedCallbackRootAction::NeedsChild(selected)
+            | QueuedCallbackRootAction::ResumeRecordedStep(selected)
+            | QueuedCallbackRootAction::RetryRestore(selected)
+            | QueuedCallbackRootAction::RetryTerminalAck(selected)) => selected,
+        None => return false,
+    };
+    if selected != selector || queued_callback_file_floor(selector).is_none()
+    { return false; }
+    let watches = &mut *core::ptr::addr_of_mut!(ROOT_RETIREMENT_WATCHES);
+    if watches.iter().any(|watch| watch.selector == selector) { return false; }
+    if watches.try_reserve(1).is_err() { return false; }
+    watches.push(WatchedCallbackRetirement { selector, acknowledged: false });
+    true
+}
+
+pub(crate) unsafe fn queued_callback_root_retired(selector: QueuedCallbackSelector) -> bool {
+    (&*core::ptr::addr_of!(ROOT_RETIREMENT_WATCHES))
+        .iter().any(|watch| watch.selector == selector && watch.acknowledged)
+}
+
+pub(crate) unsafe fn queued_callback_newer_root_child(
+    older: QueuedCallbackSelector,
+    newer: QueuedCallbackSelector,
+) -> bool {
+    let rows = &*core::ptr::addr_of!(CLAIMS);
+    let Some(row) = rows.get(older.index).and_then(Option::as_ref) else { return false };
+    row.sequence == older.sequence && row.claim.invocation() == older.key
+        && (row.resuming
+            || row.terminal_ack.is_some_and(|ack| ack.physical == older.physical)
+            || row.pump.as_ref().and_then(|pump| pump.child_work_identity())
+                == Some(older.physical))
+        && newer.sequence > older.sequence
+        && matches!(queued_callback_root_action(),
+            Some(QueuedCallbackRootAction::NeedsChild(selected)
+                | QueuedCallbackRootAction::ResumeRecordedStep(selected)
+                | QueuedCallbackRootAction::RetryRestore(selected)
+                | QueuedCallbackRootAction::RetryTerminalAck(selected)) if selected == newer)
+}
+
+pub(crate) unsafe fn consume_queued_callback_root_retirement(
+    selector: QueuedCallbackSelector,
+) -> bool {
+    let watches = &mut *core::ptr::addr_of_mut!(ROOT_RETIREMENT_WATCHES);
+    let Some(index) = watches.iter().position(|watch|
+        watch.selector == selector && watch.acknowledged)
+    else { return false };
+    watches.swap_remove(index);
+    true
 }
 
 pub(crate) unsafe fn queued_callback_file_floor(

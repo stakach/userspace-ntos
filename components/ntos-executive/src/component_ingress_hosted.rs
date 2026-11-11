@@ -409,7 +409,9 @@ pub(crate) unsafe fn take_hosted_with(
         return Ok(None);
     }
     let pending_receive = receive_child_pending();
-    if crate::service_sec_image::root_add_device_exclusive_pending() && !pending_receive {
+    if (crate::service_sec_image::root_add_device_exclusive_pending() && !pending_receive)
+        || ((crate::service_sec_image::root_queued_callback_exclusive_pending()
+            || crate::driver_launch::unsettled_queued_callback()) && !pending_receive) {
         return Ok(None);
     }
     let Some(index) = nt_component_suspension::oldest_external_ingress(
@@ -747,17 +749,17 @@ pub(crate) unsafe fn abort_root_ingress_reply_park(
         .map_err(|(_, no_effect)| (Error::Admission, no_effect))
 }
 
-/// Exact identity of an original Call retained while a selected AddDevice owns the root turn.
+/// Exact identity of an original Call retained while a physical parent owns the root turn.
 /// The Call and Reply remain in CALLS; this ticket only prevents the outer turn from forgetting
 /// which ingress must be made available again after that physical parent settles.
-pub(crate) struct DeferredAddDeviceIngress {
+pub(crate) struct DeferredParkedIngress {
     binding: nt_user_host::thread_binding::ThreadBinding<crate::HostedThreadRole>,
     reply: u64,
     admission_sequence: u64,
 }
 
-pub(crate) unsafe fn deferred_add_device_ingress_is_exact(
-    ticket: &DeferredAddDeviceIngress,
+pub(crate) unsafe fn deferred_parked_ingress_is_exact(
+    ticket: &DeferredParkedIngress,
 ) -> bool {
     (&*core::ptr::addr_of!(CALLS)).iter().flatten().any(|row| {
         row.binding == ticket.binding
@@ -770,10 +772,43 @@ pub(crate) unsafe fn deferred_add_device_ingress_is_exact(
     })
 }
 
+/// An ingress row may become the exact selected Receive child while the callback is parked.
+/// In that phase the Receive barrier, rather than the callback's deferred-call list, owns it.
+pub(crate) unsafe fn deferred_queued_ingress_selected(
+    ticket: &DeferredParkedIngress,
+) -> bool {
+    (&*core::ptr::addr_of!(CALLS)).iter().flatten().any(|row| {
+        row.binding == ticket.binding
+            && !row.delivered && !row.released && row.completion.is_none()
+            && row.call.as_ref().is_some_and(|call| {
+                call.reply() == ticket.reply
+                    && call.admission_sequence() == ticket.admission_sequence
+                    && call.can_park()
+                    && row.receive_settlement.as_ref().is_some_and(|receive|
+                        !receive.transferred && receive.parent.is_some()
+                            && receive.barrier.admission_key() == call.admission_key())
+            })
+    })
+}
+
 /// Return an unexecuted root delivery to its existing physical ingress owner. No syscall has
 /// been admitted yet, so replay restores the original full message rather than captured argv.
 pub(crate) unsafe fn defer_hosted_delivery(reply: u64, badge: u64) -> Result<(), Error> {
-    defer_hosted_delivery_inner(reply, badge, false).map(|_| ())
+    defer_hosted_delivery_inner(reply, badge, None).map(|_| ())
+}
+
+enum ParkedRootParentProof<'a> {
+    AddDevice(&'a crate::service_sec_image::ParkedRootAddDevicePermit),
+    QueuedCallback(&'a crate::service_sec_image::ParkedRootQueuedCallbackPermit),
+}
+
+impl ParkedRootParentProof<'_> {
+    unsafe fn is_exact(&self) -> bool {
+        match self {
+            Self::AddDevice(_) => crate::service_sec_image::root_add_device_exclusive_pending(),
+            Self::QueuedCallback(permit) => permit.is_exact(),
+        }
+    }
 }
 
 /// The exact parked AddDevice permit is issued only after the selected batch has entered and
@@ -781,16 +816,29 @@ pub(crate) unsafe fn defer_hosted_delivery(reply: u64, badge: u64) -> Result<(),
 pub(crate) unsafe fn defer_hosted_delivery_for_add_device(
     reply: u64,
     badge: u64,
-    _permit: &crate::service_sec_image::ParkedRootAddDevicePermit,
-) -> Result<DeferredAddDeviceIngress, Error> {
-    defer_hosted_delivery_inner(reply, badge, true)
+    permit: &crate::service_sec_image::ParkedRootAddDevicePermit,
+) -> Result<DeferredParkedIngress, Error> {
+    defer_hosted_delivery_inner(reply, badge, Some(ParkedRootParentProof::AddDevice(permit)))
+}
+
+/// A queued callback may hold an exact physical provider parent while a different, unexecuted
+/// root Call arrives. The permit is issued and checked against the newest retained queue row.
+pub(crate) unsafe fn defer_hosted_delivery_for_queued_callback(
+    reply: u64,
+    badge: u64,
+    permit: &crate::service_sec_image::ParkedRootQueuedCallbackPermit,
+) -> Result<DeferredParkedIngress, Error> {
+    defer_hosted_delivery_inner(reply, badge, Some(ParkedRootParentProof::QueuedCallback(permit)))
 }
 
 unsafe fn defer_hosted_delivery_inner(
     reply: u64,
     badge: u64,
-    parked_add_device: bool,
-) -> Result<DeferredAddDeviceIngress, Error> {
+    parked_parent: Option<ParkedRootParentProof<'_>>,
+) -> Result<DeferredParkedIngress, Error> {
+    if parked_parent.as_ref().is_some_and(|proof| !proof.is_exact()) {
+        return Err(Error::PhysicalIdentity);
+    }
     if crate::REPLY_MAIN_SLOT.load(Ordering::Relaxed) != reply {
         return Err(Error::PhysicalIdentity);
     }
@@ -830,7 +878,7 @@ unsafe fn defer_hosted_delivery_inner(
     if !crate::writable_fs::registry_journal::owns_volume()
         && (!receive_child_pending() || receive_child_is_current(binding, reply))
         && !busy_win32k
-        && !parked_add_device
+        && parked_parent.is_none()
     {
         return Err(Error::PhysicalIdentity);
     }
@@ -865,7 +913,7 @@ unsafe fn defer_hosted_delivery_inner(
     if !crate::wait_reply_pool_clear_cap(pool_index) {
         return Err(Error::Reply);
     }
-    Ok(DeferredAddDeviceIngress { binding, reply, admission_sequence })
+    Ok(DeferredParkedIngress { binding, reply, admission_sequence })
 }
 
 pub(crate) unsafe fn owns_hosted_reply(reply: u64) -> bool {

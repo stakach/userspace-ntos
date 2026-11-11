@@ -3147,6 +3147,7 @@ const DELAY_TIMER_SOURCE_VM_COPY: u64 = 41;
 const DELAY_TIMER_SOURCE_NATIVE_DIRECTORY_OPEN: u64 = 42;
 const DELAY_TIMER_SOURCE_NATIVE_FILE_TARGET_OPEN: u64 = 43;
 const DELAY_TIMER_SOURCE_NATIVE_DIRECTORY_EFFECT: u64 = 44;
+const DELAY_TIMER_SOURCE_ROOT_QUEUED_CALLBACK_RETRY: u64 = 45;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -17356,6 +17357,7 @@ unsafe fn delay_timer_next_deadline(
         job_time: handler.job_time_sample_next_deadline(),
         component_resume: service_sec_image::component_resume::next_deadline(&handler.pm),
         root_add_device: service_sec_image::root_add_device_retry_deadline(),
+        root_queued_callback: service_sec_image::root_queued_callback_retry_deadline(),
         primary_alias: service_sec_image::primary_alias_retry_deadline(),
         hosted_spawn_abort: hosted_spawn_uncertainty::next_deadline(),
     })
@@ -17964,6 +17966,17 @@ unsafe fn ack_parked_add_device_retry_timer() -> Result<(), nt_status::NtStatus>
         .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
     LAST_REARM_AUTHORITY.invalidate();
     let _ = service_sec_image::root_add_device_retry_wake_due(monotonic_time_100ns());
+    TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
+    delay_timer_ack_irq()
+}
+
+/// ACK only the callback root's retry shot while its physical provider bank is retained.
+/// General timer delivery can enter unrelated providers and must wait for this parent.
+unsafe fn ack_parked_queued_callback_retry_timer() -> Result<(), nt_status::NtStatus> {
+    let _delivery = TIMER_DELIVERY_GATE.try_enter()
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    LAST_REARM_AUTHORITY.invalidate();
+    let _ = service_sec_image::root_queued_callback_retry_wake_due(monotonic_time_100ns());
     TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
     delay_timer_ack_irq()
 }

@@ -8,6 +8,7 @@ pub(super) struct OwnerDeadlines {
     pub job_time: Option<u64>,
     pub component_resume: Option<u64>,
     pub root_add_device: Option<u64>,
+    pub root_queued_callback: Option<u64>,
     pub primary_alias: Option<u64>,
     pub hosted_spawn_abort: Option<u64>,
 }
@@ -114,6 +115,7 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
         ),
         (owner.component_resume, DELAY_TIMER_SOURCE_COMPONENT_RESUME),
         (owner.root_add_device, DELAY_TIMER_SOURCE_ROOT_ADD_DEVICE_RETRY),
+        (owner.root_queued_callback, DELAY_TIMER_SOURCE_ROOT_QUEUED_CALLBACK_RETRY),
         (owner.primary_alias, DELAY_TIMER_SOURCE_PRIMARY_ALIAS_RETRY),
         (owner.hosted_spawn_abort, DELAY_TIMER_SOURCE_HOSTED_SPAWN_ABORT),
         (
