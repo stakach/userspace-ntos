@@ -27,6 +27,7 @@ pub(super) struct AdjacentGrowth {
     pub inspected: usize,
 }
 
+#[derive(Debug)]
 pub(super) struct TakeFit {
     pub address: Option<usize>,
     pub inspected: usize,
@@ -59,22 +60,62 @@ impl FreeList {
         Corruption { operation, node, size, next }
     }
 
-    /// First-fit selection and reinsertion of the unused aligned prefix and suffix. The
-    /// reinsertions deliberately use the ordinary ordered insertion path; callers can count
-    /// each traversal separately while the split transaction remains unchanged.
+    /// Check a node before a split uses its links or publishes a replacement.
+    unsafe fn checked_node(
+        &self,
+        node: usize,
+        top: usize,
+    ) -> Result<(usize, usize, usize), Corruption> {
+        if node < self.data
+            || node % GRANULE != 0
+            || node.checked_add(NODE_SIZE).is_none_or(|end| end > top)
+        {
+            return Err(Self::corrupt(b"take-fit-walk", node, 0, 0));
+        }
+        let size = unsafe { Self::read(node) };
+        let next = unsafe { Self::read(node + WORD) };
+        let Some(end) = node.checked_add(size) else {
+            return Err(Self::corrupt(b"take-fit-walk", node, size, next));
+        };
+        if size < NODE_SIZE
+            || size % GRANULE != 0
+            || end > top
+            || (next != 0 && (next <= end || next >= top || next % GRANULE != 0))
+        {
+            return Err(Self::corrupt(b"take-fit-walk", node, size, next));
+        }
+        Ok((size, next, end))
+    }
+
+    /// First-fit selection. The split already knows the predecessor and successor, so unused
+    /// fragments can be linked in place without searching the ordered list a second time.
     pub(super) unsafe fn take_fit(
         &self,
         align: usize,
         needed: usize,
     ) -> Result<TakeFit, TakeFitError> {
         let align = align.max(GRANULE);
+        let top = self.data.checked_add(unsafe { Self::read(self.counter) })
+            .ok_or_else(|| TakeFitError {
+                corruption: Self::corrupt(b"take-fit-top", self.data, 0, 0),
+                owner_start: self.data, owner_size: 0,
+            })?;
         let mut prev_link = self.head;
         let mut cur = unsafe { Self::read(self.head) };
+        let mut previous_end = self.data;
         let mut inspected = 0usize;
         while cur != 0 {
             inspected += 1;
-            let size = unsafe { Self::read(cur) };
-            let next = unsafe { Self::read(cur + WORD) };
+            let (size, next, cur_end) = unsafe { self.checked_node(cur, top) }
+                .map_err(|corruption| TakeFitError {
+                    corruption, owner_start: cur, owner_size: 0,
+                })?;
+            if inspected > 1 && cur <= previous_end {
+                return Err(TakeFitError {
+                    corruption: Self::corrupt(b"take-fit-order", cur, size, next),
+                    owner_start: cur, owner_size: size,
+                });
+            }
             let mut start = match align_up(cur, align) {
                 Some(start) => start,
                 None => return Ok(TakeFit {
@@ -94,29 +135,43 @@ impl FreeList {
                 prefix = start - cur;
             }
             if prefix.checked_add(needed).is_some_and(|total| total <= size) {
-                unsafe { Self::write(prev_link, next) };
-                let prefix_reinsert_visits = if prefix >= NODE_SIZE {
-                    Some(unsafe { self.insert(cur, prefix) }.map_err(|corruption| TakeFitError {
-                        corruption, owner_start: cur, owner_size: prefix,
-                    })?)
-                } else {
-                    None
-                };
                 let suffix_start = start + needed;
-                let suffix = cur + size - suffix_start;
-                let suffix_reinsert_visits = if suffix >= NODE_SIZE {
-                    Some(unsafe { self.insert(suffix_start, suffix) }.map_err(|corruption| TakeFitError {
-                        corruption, owner_start: suffix_start, owner_size: suffix,
-                    })?)
-                } else {
-                    None
-                };
+                let suffix = cur_end - suffix_start;
+                if next != 0 {
+                    unsafe { self.checked_node(next, top) }
+                        .map_err(|corruption| TakeFitError {
+                            corruption, owner_start: cur, owner_size: size,
+                        })?;
+                }
+                let keep_prefix = prefix >= NODE_SIZE;
+                // Insertion immediately trims a top-ending suffix. Publish the same bump
+                // position without first writing and walking an unreachable free node.
+                let keep_suffix = suffix >= NODE_SIZE && cur_end != top;
+                let first = if keep_prefix { cur }
+                    else if keep_suffix { suffix_start }
+                    else { next };
+                unsafe {
+                    if keep_suffix {
+                        Self::write(suffix_start, suffix);
+                        Self::write(suffix_start + WORD, next);
+                    }
+                    if keep_prefix {
+                        Self::write(cur, prefix);
+                        Self::write(cur + WORD, if keep_suffix { suffix_start } else { next });
+                    }
+                    Self::write(prev_link, first);
+                    if suffix >= NODE_SIZE && cur_end == top {
+                        Self::write(self.counter, suffix_start - self.data);
+                    }
+                }
                 return Ok(TakeFit {
                     address: Some(start), inspected,
-                    prefix_reinsert_visits, suffix_reinsert_visits,
+                    prefix_reinsert_visits: keep_prefix.then_some(0),
+                    suffix_reinsert_visits: (suffix >= NODE_SIZE).then_some(0),
                 });
             }
             prev_link = cur + WORD;
+            previous_end = cur_end;
             cur = next;
         }
         Ok(TakeFit {

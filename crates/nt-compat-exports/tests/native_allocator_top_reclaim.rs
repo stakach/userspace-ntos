@@ -138,8 +138,8 @@ fn first_fit_preserves_aligned_prefix_suffix_and_earlier_free_nodes() {
     let taken = unsafe { heap.list.take_fit(64, 32).unwrap() };
     assert_eq!(taken.address, Some(heap.data + high + 48));
     assert_eq!(taken.inspected, 2);
-    assert_eq!(taken.prefix_reinsert_visits, Some(1));
-    assert_eq!(taken.suffix_reinsert_visits, Some(2));
+    assert_eq!(taken.prefix_reinsert_visits, Some(0));
+    assert_eq!(taken.suffix_reinsert_visits, Some(0));
     assert_eq!(heap.blocks(), [(16, NODE), (high, 48), (high + 80, 112)]);
     assert_eq!(heap.bump(), 1024);
 }
@@ -161,4 +161,57 @@ fn first_fit_preserves_top_trim_when_a_top_ending_node_is_present() {
     assert_eq!(taken.address, Some(node + 48));
     assert_eq!(heap.bump(), high + 80);
     assert_eq!(heap.blocks(), [(high, 48)]);
+}
+
+#[test]
+fn first_fit_reuses_its_known_links_when_splitting_a_high_free_node() {
+    const EARLIER: usize = 256;
+    let mut heap = Heap::new(EARLIER * 64 + 512);
+    for index in 0..EARLIER {
+        heap.insert(index * 64, NODE);
+    }
+    let high = EARLIER * 64 + ((16 + 64 - ((heap.data + EARLIER * 64) % 64)) % 64);
+    heap.insert(high, 192);
+
+    let taken = unsafe { heap.list.take_fit(64, 32).unwrap() };
+    assert_eq!(taken.address, Some(heap.data + high + 48));
+    assert_eq!(taken.inspected, EARLIER + 1);
+    assert_eq!(taken.prefix_reinsert_visits.unwrap_or(0)
+        + taken.suffix_reinsert_visits.unwrap_or(0), 0,
+        "a split already knows its predecessor and successor; reinsertion must not rewalk the list");
+    assert_eq!(heap.blocks().len(), EARLIER + 2);
+}
+
+#[test]
+fn first_fit_rejects_a_corrupt_successor_before_relinking_the_selected_node() {
+    let mut heap = Heap::new(256);
+    heap.insert(16, 64);
+    heap.insert(128, NODE);
+    let first = heap.data + 16;
+    let successor = heap.data + 128;
+    unsafe { (successor as *mut usize).write(WORD) };
+
+    let error = unsafe { heap.list.take_fit(WORD, NODE) }.unwrap_err();
+    assert_eq!(error.corruption.operation, b"take-fit-walk");
+    assert_eq!(heap.words[1], first);
+    assert_eq!(unsafe { (first as *const usize).read() }, 64);
+    assert_eq!(unsafe { ((first + WORD) as *const usize).read() }, successor);
+    assert_eq!(heap.bump(), 256);
+}
+
+#[test]
+fn first_fit_removes_exact_block_and_discards_unusable_suffix() {
+    let mut heap = Heap::new(512);
+    heap.insert(64, 32);
+    heap.insert(160, 32);
+
+    let exact = unsafe { heap.list.take_fit(WORD, 32).unwrap() };
+    assert_eq!(exact.address, Some(heap.data + 64));
+    assert_eq!(heap.blocks(), [(160, 32)]);
+
+    let tiny_suffix = unsafe { heap.list.take_fit(WORD, 24).unwrap() };
+    assert_eq!(tiny_suffix.address, Some(heap.data + 160));
+    assert_eq!(tiny_suffix.suffix_reinsert_visits, None);
+    assert!(heap.blocks().is_empty());
+    assert_eq!(heap.bump(), 512);
 }
