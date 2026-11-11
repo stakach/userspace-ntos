@@ -20,6 +20,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 mod oom_budget;
 #[path = "allocator_free_list.rs"]
 mod free_list;
+#[path = "allocator_walk_observation.rs"]
+mod walk_observation;
+use walk_observation::WalkCounter;
+pub use walk_observation::WalkSample;
 
 /// The component-local heap VA. The root reserves an 88 MiB band before the scratch
 /// base; its lower 32 MiB is mapped initially and later durable pages are committed on demand.
@@ -78,6 +82,20 @@ const _: () = assert!(DRIVER_OBJECT_EXTENSIONS_STATE + size_of::<usize>() <= DAT
 const WORD: usize = size_of::<usize>();
 const ALLOC_GRANULE: usize = align_of::<usize>();
 const FREE_NODE_SIZE: usize = WORD * 2; // { size, next } stored inside the freed block
+
+static ALLOC_WALK: WalkCounter = WalkCounter::new();
+static INSERT_WALK: WalkCounter = WalkCounter::new();
+static GROW_WALK: WalkCounter = WalkCounter::new();
+
+/// Approximate cumulative root-only walk counts; concurrent lanes may advance between loads.
+pub fn walk_samples() -> [WalkSample; 3] {
+    let root_heap = transient_heap_size() != 0;
+    [
+        ALLOC_WALK.sample(root_heap),
+        INSERT_WALK.sample(root_heap),
+        GROW_WALK.sample(root_heap),
+    ]
+}
 
 pub(crate) fn dcerpc_trace_state_anchor() -> &'static AtomicUsize {
     unsafe { &*(DCERPC_TRACE_STATE as *const AtomicUsize) }
@@ -586,15 +604,16 @@ unsafe fn insert_free_block(start: usize, size: usize) {
         counter: CTR,
         head: FREE_HEAD,
     };
-    if let Err(corruption) = unsafe { list.insert(start, size) } {
-        allocator_corruption(
+    match unsafe { list.insert(start, size) } {
+        Ok(visits) => INSERT_WALK.record(transient_heap_size() != 0, visits),
+        Err(corruption) => allocator_corruption(
             corruption.operation,
             start,
             size,
             corruption.node,
             corruption.size,
             corruption.next,
-        );
+        ),
     }
 }
 
@@ -602,18 +621,26 @@ unsafe fn alloc_from_free_list(layout: Layout, needed: usize) -> *mut u8 {
     let align = layout.align().max(ALLOC_GRANULE);
     let mut prev_link = FREE_HEAD;
     let mut cur = unsafe { read_word(FREE_HEAD) };
+    let mut visits = 0usize;
     while cur != 0 {
+        visits += 1;
         let size = unsafe { free_node_size(cur) };
         let next = unsafe { free_node_next(cur) };
         let mut start = match align_up(cur, align) {
             Some(start) => start,
-            None => return null_mut(),
+            None => {
+                ALLOC_WALK.record(transient_heap_size() != 0, visits);
+                return null_mut();
+            }
         };
         let mut prefix = start - cur;
         if prefix != 0 && prefix < FREE_NODE_SIZE {
             start = match align_up(cur + FREE_NODE_SIZE, align) {
                 Some(start) => start,
-                None => return null_mut(),
+                None => {
+                    ALLOC_WALK.record(transient_heap_size() != 0, visits);
+                    return null_mut();
+                }
             };
             prefix = start - cur;
         }
@@ -630,11 +657,13 @@ unsafe fn alloc_from_free_list(layout: Layout, needed: usize) -> *mut u8 {
             if suffix >= FREE_NODE_SIZE {
                 unsafe { insert_free_block(suffix_start, suffix) };
             }
+            ALLOC_WALK.record(transient_heap_size() != 0, visits);
             return start as *mut u8;
         }
         prev_link = cur + WORD;
         cur = next;
     }
+    ALLOC_WALK.record(transient_heap_size() != 0, visits);
     null_mut()
 }
 
@@ -644,7 +673,9 @@ unsafe fn grow_in_place_from_adjacent_free(start: usize, old_size: usize, new_si
         counter: CTR,
         head: FREE_HEAD,
     };
-    unsafe { list.grow_adjacent(start, old_size, new_size) }.grown
+    let result = unsafe { list.grow_adjacent(start, old_size, new_size) };
+    GROW_WALK.record(transient_heap_size() != 0, result.inspected);
+    result.grown
 }
 
 impl Bump {

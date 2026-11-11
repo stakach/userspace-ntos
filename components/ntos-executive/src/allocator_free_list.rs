@@ -24,7 +24,6 @@ pub(super) struct FreeList {
 
 pub(super) struct AdjacentGrowth {
     pub grown: bool,
-    #[cfg(test)]
     pub inspected: usize,
 }
 
@@ -43,7 +42,7 @@ impl FreeList {
 
     /// Insert one dead allocation and immediately trim the coalesced node if it reaches the bump
     /// top. The ordered insertion walk already knows the link preceding that node; no second walk
-    /// is needed. Returns the visited-node count in host tests only.
+    /// is needed. Returns the visited-node count for bounded allocator telemetry.
     pub(super) unsafe fn insert(&self, start: usize, size: usize) -> Result<usize, Corruption> {
         let top = self.data + unsafe { Self::read(self.counter) };
         if size < NODE_SIZE
@@ -54,7 +53,6 @@ impl FreeList {
         {
             return Err(Self::corrupt(b"insert", start, size, 0));
         }
-        #[allow(unused_mut)]
         let mut visits = 0;
         let mut prev = 0usize;
         let mut link = self.head;
@@ -80,8 +78,7 @@ impl FreeList {
             {
                 return Err(Self::corrupt(b"insert-walk", cur, cur_size, next));
             }
-            #[cfg(test)]
-            { visits += 1; }
+            visits += 1;
             if cur >= start {
                 break;
             }
@@ -147,19 +144,17 @@ impl FreeList {
         old_size: usize,
         new_size: usize,
     ) -> AdjacentGrowth {
-        #[cfg(test)]
         let mut inspected = 0;
         let Some(adjacent) = start.checked_add(old_size) else {
-            return AdjacentGrowth { grown: false, #[cfg(test)] inspected };
+            return AdjacentGrowth { grown: false, inspected };
         };
         let Some(need) = new_size.checked_sub(old_size) else {
-            return AdjacentGrowth { grown: false, #[cfg(test)] inspected };
+            return AdjacentGrowth { grown: false, inspected };
         };
         let mut prev_link = self.head;
         let mut cur = unsafe { Self::read(self.head) };
         while cur != 0 {
-            #[cfg(test)]
-            { inspected += 1; }
+            inspected += 1;
             if cur > adjacent {
                 break;
             }
@@ -176,11 +171,11 @@ impl FreeList {
                 } else {
                     unsafe { Self::write(prev_link, next) };
                 }
-                return AdjacentGrowth { grown: true, #[cfg(test)] inspected };
+                return AdjacentGrowth { grown: true, inspected };
             }
             prev_link = cur + WORD;
             cur = next;
         }
-        AdjacentGrowth { grown: false, #[cfg(test)] inspected }
+        AdjacentGrowth { grown: false, inspected }
     }
 }

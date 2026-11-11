@@ -72,7 +72,7 @@ fn top_dealloc_uses_existing_insertion_walk_even_after_many_interior_blocks() {
     // The existing address-order search visits each interior node once. Tail release should use
     // the predecessor link found by that search rather than scan those nodes a second time.
     let visits = heap.insert(top - NODE, NODE);
-    assert!(visits <= INTERIOR + 1, "tail release repeated the free-list walk: {visits}");
+    assert_eq!(visits, INTERIOR, "telemetry must count each inspected free node once");
     assert_eq!(heap.bump(), top - NODE);
     assert_eq!(heap.blocks().len(), INTERIOR);
 }
@@ -119,11 +119,11 @@ fn adjacent_growth_stops_at_first_free_block_past_target() {
     let before = heap.blocks();
     let miss = unsafe { heap.list.grow_adjacent(heap.data, 512, 512 + NODE) };
     assert!(!miss.grown);
-    assert!(miss.inspected <= 1, "miss scanned {} unrelated free blocks", miss.inspected);
+    assert_eq!(miss.inspected, 1, "miss must inspect only the first free node past target");
     assert_eq!(heap.blocks(), before);
 
     let hit = unsafe { heap.list.grow_adjacent(heap.data + 1008, NODE, NODE * 2) };
     assert!(hit.grown);
-    assert!(hit.inspected <= 1);
+    assert_eq!(hit.inspected, 1);
     assert_eq!(heap.blocks().len(), 127);
 }

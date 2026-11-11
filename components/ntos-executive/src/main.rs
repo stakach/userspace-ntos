@@ -7381,6 +7381,21 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
         &*core::ptr::addr_of!(EXPLORER_SSN_HIST)
     });
     print_str(b"\n");
+    let walks = allocator::walk_samples();
+    print_str(b"[census] allocator-walk");
+    for (label, sample) in [
+        (b" alloc=".as_slice(), walks[0]),
+        (b" insert=".as_slice(), walks[1]),
+        (b" grow=".as_slice(), walks[2]),
+    ] {
+        print_str(label);
+        print_u64(sample.operations);
+        print_str(b"/");
+        print_u64(sample.visited);
+        print_str(b"/");
+        print_u64(sample.max_visited);
+    }
+    print_str(b" ops/visits/max\n");
     driver_launch::print_mounted_native_block_census();
     service_sec_image::mounted_create_owner_trace::print_snapshot();
     print_shared_receive_census();
