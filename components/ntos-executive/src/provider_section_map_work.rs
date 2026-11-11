@@ -24,7 +24,7 @@ const INVALID: u32 = nt_process::STATUS_INVALID_HANDLE;
 const NO_MEMORY: u32 = nt_process::STATUS_INSUFFICIENT_RESOURCES;
 const CANCELLED: u32 = 0xc000_0120;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Prepare,
     Tables,
@@ -903,6 +903,30 @@ pub(crate) fn next_deadline() -> Option<u64> {
     (EXECUTING.load(Ordering::Acquire)
         || unsafe { (&*core::ptr::addr_of!(WORK)).iter().any(Option::is_some) })
     .then(|| NEXT.load(Ordering::Acquire))
+}
+
+/// Read-only receipt for a root Receive with no armed timer. A redriver may
+/// temporarily hold one row outside WORK, so include EXECUTING as well.
+pub(crate) fn print_no_shot_owner() {
+    use core::fmt::Write;
+    let rows = unsafe { &*core::ptr::addr_of!(WORK) };
+    let mut record = nt_printf::record::RecordBuffer::<2048>::new();
+    let _ = writeln!(record,
+        "[root-no-shot-section-map] occupied={} executing={} next={} deadline={:?}",
+        rows.iter().filter(|row| row.is_some()).count(),
+        u8::from(EXECUTING.load(Ordering::Acquire)),
+        NEXT.load(Ordering::Acquire), next_deadline());
+    for (slot, work) in rows.iter().enumerate().filter_map(|(slot, row)|
+        row.as_ref().map(|work| (slot, work))).take(4) {
+        let _ = writeln!(record,
+            "[root-no-shot-section-map-row] slot={} route={:?} dispatch={:?} reply={} token={} phase={:?} retry={}",
+            slot, work.route, work.dispatch, work.reply, work.token, work.phase, work.retry_at);
+    }
+    sel4_rt::print_record(if record.overflowed() {
+        b"[root-no-shot-section-map] record-truncated\n"
+    } else {
+        record.bytes()
+    });
 }
 
 pub(crate) fn wake_due(now: u64) -> u64 {

@@ -370,12 +370,46 @@ fn trace_root_receive_idle_state(
             TIMER_IDLE_DISARMS.load(Ordering::Relaxed), wal_fold.next_deadline,
             u8::from(wal_fold.due), u8::from(wal_fold.ready), u8::from(wal_fold.running),
             wal_fold.retry_100ns, wal_fold.first_dirty_100ns);
+        let _ = writeln!(record,
+            "[root-receive-idle] retries section-map={:?} vm-lock={:?} vm-copy={:?} directory-open={:?} target-open={:?} directory-effect={:?}",
+            crate::provider_section_map_work::next_deadline(),
+            crate::vm_lock_pagein_work::next_deadline(),
+            crate::vm_copy_work::next_deadline(),
+            crate::native_directory_open_work::next_deadline(),
+            crate::native_file_target_open_work::next_deadline(),
+            crate::native_directory_effect_work::next_deadline());
     }
     sel4_rt::print_record(if record.overflowed() {
         b"[root-receive-idle] record-truncated\n"
     } else {
         record.bytes()
     });
+    if !armed {
+        let mut calls = nt_printf::record::RecordBuffer::<4096>::new();
+        let _ = writeln!(calls,
+            "[root-no-shot-calls] start={} total={} overflow={}",
+            gate.retained_start, gate.retained_total, gate.retained_overflow);
+        for call in gate.retained.into_iter().flatten() {
+            let (generation_kind, generation) = match call.binding.process.generation {
+                nt_user_host::process_identity::ProcessGeneration::Hosted(value) =>
+                    ("hosted", value),
+                nt_user_host::process_identity::ProcessGeneration::Temporary(value) =>
+                    ("temporary", value),
+            };
+            let _ = writeln!(calls,
+                "[root-no-shot-call] pi/pid/pgen/tid/badge/tcb/seq/reply/label/ssn/delivered/settlement={}/{}/{}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+                call.binding.pi, call.binding.process.pid, generation_kind, generation,
+                call.binding.tid, call.binding.badge, call.binding.tcb,
+                call.admission_sequence, call.reply, call.label, call.ssn,
+                u8::from(call.delivered), u8::from(call.settlement_prepared));
+        }
+        sel4_rt::print_record(if calls.overflowed() {
+            b"[root-no-shot-calls] record-truncated\n"
+        } else {
+            calls.bytes()
+        });
+        crate::provider_section_map_work::print_no_shot_owner();
+    }
     if callback_depth != 0 || continuation_depth != 0 {
         win32k_glue::print_callback_owner_census();
     }
