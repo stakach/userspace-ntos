@@ -537,28 +537,8 @@ unsafe fn reconcile_runtime(handler: &mut ExecNtHandler) -> Option<nt_kernel_exe
     if !runtime_ready(core::ptr::from_ref(handler)) || is_running() {
         return None;
     }
-    let previous = (&*core::ptr::addr_of!(WAKE)).next_deadline();
     let now = monotonic_time_100ns();
     reconcile_demand(&handler.pm, now);
-    let dpc_deadline = driver_launch::hosted_dpc_next_deadline(now);
-    let acpi_deadline = driver_launch::hosted_acpi_pci_route_recovery_next_deadline(now);
-    if previous.is_none()
-        && (&*core::ptr::addr_of!(WAKE)).next_deadline().is_none()
-        && nested_restore_owner::next_deadline().is_none()
-        && dpc_deadline.is_none()
-        && acpi_deadline.is_none()
-        && driver_launch::hosted_irq_retry_next_deadline().is_none()
-        && driver_launch::hosted_file_retry_deadline(now).is_none()
-        && !super::MOUNTED_NATIVE_TIMER_REARM_DEMAND.is_pending()
-        && driver_launch::mounted_native_block_next_deadline(now).is_none()
-        && crate::registry_mutation_work::next_deadline().is_none()
-        && crate::section_metadata_work::next_deadline().is_none()
-        && crate::process_image_snapshot_work::next_deadline().is_none()
-        && crate::provider_section_broker::next_deadline().is_none()
-        && crate::gdi_routed_image_work::next_deadline().is_none()
-    {
-        return None;
-    }
     let queue =
         SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) as *const nt_delay_execution::Queue;
     let _message = crate::ipc_message::SavedMessageBuffer::capture();

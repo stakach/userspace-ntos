@@ -19,7 +19,12 @@ fn deferred_level_irq_owns_a_stable_autonomous_retry_deadline() {
         "an idle shared PIT still needs the deferred IRQ as an owner");
     let reconcile = RESUME.split("unsafe fn reconcile_runtime(").nth(1)
         .expect("receive-boundary timer reconciliation");
-    assert!(reconcile.contains("driver_launch::hosted_irq_retry_next_deadline().is_none()"),
+    let after_demand = reconcile.split_once("reconcile_demand(&handler.pm, now);")
+        .map(|(_, body)| body).expect("receive demand reconciliation");
+    let before_selector = after_demand
+        .split_once("Some(delay_timer_rearm_at(&*queue, handler, nt_time_snapshot_at(now)))")
+        .map(|(body, _)| body).expect("canonical timer selector");
+    assert!(!before_selector.contains("return None"),
         "the root receive gate must not skip rearm for an IRQ-only dispatch");
     let nested = SCHEDULER.split("pub(crate) unsafe fn service_irq_yield(").nth(1)
         .expect("nested retained-IRP scheduler");

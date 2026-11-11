@@ -115,6 +115,30 @@ fn lazy_writer_and_shutdown_fold_without_changing_explicit_flush_fence() {
 }
 
 #[test]
+fn wal_fold_only_deadline_cannot_be_skipped_before_blocking_receive() {
+    let timer = source("timer_deadline.rs");
+    assert!(timer.contains("service_sec_image::system_wal_fold_next_deadline()"),
+        "the unified timer selector must retain the WAL-fold deadline");
+
+    let resume = source("component_resume.rs");
+    let preflight = resume
+        .split_once("unsafe fn reconcile_runtime(")
+        .and_then(|(_, rest)| rest.split_once("unsafe fn drain_terminals("))
+        .map(|(body, _)| body)
+        .expect("outer receive timer preflight");
+    let after_reconciliation = preflight
+        .split_once("reconcile_demand(&handler.pm, now);")
+        .map(|(_, body)| body)
+        .expect("component demand reconciliation");
+    let before_selection = after_reconciliation
+        .split_once("Some(delay_timer_rearm_at(&*queue, handler, nt_time_snapshot_at(now)))")
+        .map(|(body, _)| body)
+        .expect("canonical timer selection before receive");
+    assert!(!before_selection.contains("return None"),
+        "an incomplete demand shortcut must not skip the canonical timer selector");
+}
+
+#[test]
 fn pending_cm_ack_redrives_before_generic_snapshot_or_timer_gate() {
     let fold = source("writable_fs/system_wal_fold.rs");
     assert!(fold.contains("system_wal_fold_ack_pending()"));
