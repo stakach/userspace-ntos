@@ -103,6 +103,8 @@ static USER_CALLBACK_CONTINUATION_PUSHES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CONTINUATION_UNWINDS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CONTINUATION_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_NESTED_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+// Diagnostic only: a fixed serial budget across nested entry, park, and terminal records.
+static USER_CALLBACK_NESTED_FRONTIER_TRACES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_NESTED_SSN_1298: AtomicU64 = AtomicU64::new(0);
 static WIN32K_WINDOW_EXTRA_INGRESS_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_BUSY_INGRESS_TRACES: AtomicU64 = AtomicU64::new(0);
@@ -2769,6 +2771,46 @@ pub(crate) unsafe fn begin_nested_user_callback_dispatch(
     Ok(true)
 }
 
+/// Observe the physical shared-page cells without treating them as lease authority. The
+/// singleton lease authority is not yet wired into this path, so these are only a snapshot.
+unsafe fn trace_nested_callback_frontier(
+    phase: &[u8], dispatch_id: u64, ssn: u64, client: Win32kClientContext,
+    completed: bool, callback_wait: bool, provider_wait: bool, lpc_wait: bool,
+) {
+    if USER_CALLBACK_NESTED_FRONTIER_TRACES.fetch_update(
+        Ordering::Relaxed, Ordering::Relaxed,
+        |count| (count < 4096).then_some(count + 1),
+    ).is_err() {
+        return;
+    }
+    let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
+    let header = (sh + win32k_subsystem::SH_USER_CALLBACK)
+        as *const nt_user_callback::CallbackFrame;
+    let callback = core::ptr::read_volatile(core::ptr::addr_of!((*header).header));
+    print_str(b"[nested-win32k-frontier] phase="); print_str(phase);
+    print_str(b" dispatch/ssn/pi/tid/badge=");
+    print_u64(dispatch_id); print_str(b"/"); print_hex_u64(ssn);
+    print_str(b"/"); print_u64(client.pi as u64);
+    print_str(b"/"); print_u64(client.tid);
+    print_str(b"/"); print_u64(client.badge);
+    print_str(b" completed/callback/provider/lpc=");
+    print_u64(completed as u64); print_str(b"/");
+    print_u64(callback_wait as u64); print_str(b"/");
+    print_u64(provider_wait as u64); print_str(b"/");
+    print_u64(lpc_wait as u64);
+    print_str(b" shared-ssn/pi/tid/gen=");
+    print_hex_u64(core::ptr::read_volatile((sh + win32k_subsystem::SH_REQ_SSN) as *const u64));
+    print_str(b"/"); print_u64(core::ptr::read_volatile((sh + win32k_subsystem::SH_REQ_CLIENT_PI) as *const u64));
+    print_str(b"/"); print_u64(core::ptr::read_volatile((sh + win32k_subsystem::SH_REQ_THREAD_ID) as *const u64));
+    print_str(b"/"); print_u64(core::ptr::read_volatile((sh + win32k_subsystem::SH_REQ_GENERATION) as *const u64));
+    print_str(b" callback-dispatch/pi/tid/badge=");
+    print_u64(callback.dispatch_id); print_str(b"/");
+    print_u64(callback.client_pi as u64); print_str(b"/");
+    print_u64(callback.client_tid); print_str(b"/");
+    print_u64(callback.client_badge);
+    print_str(b"\n");
+}
+
 unsafe fn active_callback_lane_and_token(
     client: Win32kClientContext,
 ) -> Option<(nt_component_suspension::LaneHandle, u64)> {
@@ -4899,6 +4941,13 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         previous_dispatch,
     );
     retire_win32k_on_wall(&pump);
+    if pending.nested_user_callback {
+        trace_nested_callback_frontier(
+            if pump.completed { b"resume-terminal".as_slice() } else { b"resume-park".as_slice() },
+            pending.dispatch.dispatch_id, pending.dispatch.ssn, client, pump.completed,
+            pump.callback_suspended, pump.provider_wait_suspended, pump.lpc_wait_suspended,
+        );
+    }
 
     if let Some(yielded) = pump.receive_yield() {
         return ProviderWaitPumpCompletion::ReceiveReparked(PendingReceiveDispatch {
@@ -5098,6 +5147,13 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
         previous_dispatch,
     );
     retire_win32k_on_wall(&pump);
+    if pending.nested_user_callback {
+        trace_nested_callback_frontier(
+            if pump.completed { b"resume-terminal".as_slice() } else { b"resume-park".as_slice() },
+            pending.dispatch.dispatch_id, pending.dispatch.ssn, client, pump.completed,
+            pump.callback_suspended, pump.provider_wait_suspended, pump.lpc_wait_suspended,
+        );
+    }
 
     if let Some(yielded) = pump.receive_yield() {
         return LpcWaitPumpCompletion::ReceiveReparked(PendingReceiveDispatch {
@@ -7574,6 +7630,11 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             return (0xC000_000Du64, false).into();
         }
     };
+    if nested_user_callback {
+        trace_nested_callback_frontier(
+            b"entry", dispatch_id, ssn, client, false, false, false, false,
+        );
+    }
     let outer_callback = nested_user_callback
         .then(|| active_callback_lane_and_token(client))
         .flatten();
@@ -8017,8 +8078,16 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             || pr.service_wait_yield.is_some()
             || pr.nested_restore_yield.is_some() || pr.nested_restore_quarantined.is_some()
         {
+            trace_nested_callback_frontier(
+                b"park", dispatch_id, ssn, client, pr.completed,
+                pr.callback_suspended, pr.provider_wait_suspended, pr.lpc_wait_suspended,
+            );
             return (pr.result, false).into();
         }
+        trace_nested_callback_frontier(
+            if pr.completed { b"terminal".as_slice() } else { b"incomplete".as_slice() },
+            dispatch_id, ssn, client, pr.completed, false, false, false,
+        );
         if !pr.completed || !complete_nested_user_callback_dispatch(client, dispatch_id) {
             if let Some(claim) = source_claim.as_mut() {
                 let _ = crate::win32k_pump_owner::quarantine_capture(claim.ticket);
