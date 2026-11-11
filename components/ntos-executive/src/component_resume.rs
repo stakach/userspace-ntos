@@ -279,11 +279,21 @@ pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) -> ReceivePrep
         continuation_running: is_running(),
         pending_delivery: DELAY_TIMER_TICKS_PENDING.load(Ordering::Acquire) != 0,
     };
-    match state.prepare(|| reconcile_runtime(handler)) {
+    // Keep the callback result distinct from a callback that never ran.
+    let mut preflight = None;
+    match state.prepare(|| {
+        let outcome = reconcile_runtime(handler);
+        preflight = Some(outcome);
+        outcome
+    }) {
         Err(nt_kernel_exec::TimerReceiveError::PendingDelivery) =>
             return ReceivePreparation::PendingDelivery,
         other => other.expect("runtime timer ownership must permit blocking receive"),
     }
+    let preflight_shot = (
+        LAST_REARM_AUTHORITY.is_armed(),
+        LAST_REARM_AUTHORITY.physical_wake_100ns(),
+    );
     // Reconciliation can itself enter a nested pump that ACKs a one-shot. The
     // owner must drain its newly deferred tick before the blocking syscall.
     if DELAY_TIMER_TICKS_PENDING.load(Ordering::Acquire) != 0 {
@@ -294,7 +304,7 @@ pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) -> ReceivePrep
     super::mounted_create_owner_trace::receive_boundary_snapshot();
     super::mounted_read_owner_trace::receive_boundary_snapshot();
     trace_retained_receive_owners();
-    trace_root_receive_idle_state();
+    trace_root_receive_idle_state(preflight, preflight_shot);
     ReceivePreparation::Ready
 }
 
@@ -308,7 +318,10 @@ pub(super) enum ReceivePreparation {
 /// periodic census cannot run after this receive blocks. Sampling changes no
 /// timer, Reply, IRQ, or retained owner; transition and periodic print budgets
 /// are independent of the older section/cleanup/lifecycle trace below.
-fn trace_root_receive_idle_state() {
+fn trace_root_receive_idle_state(
+    preflight: Option<Option<nt_kernel_exec::TimerRearmOutcome>>,
+    preflight_shot: (bool, u64),
+) {
     use core::fmt::Write;
     static PROBE: nt_hosted_runtime::RootReceiveIdleProbe =
         nt_hosted_runtime::RootReceiveIdleProbe::new(128, 360, 10 * 10_000_000);
@@ -348,6 +361,16 @@ fn trace_root_receive_idle_state() {
         crate::process_image_snapshot_work::next_deadline(),
         crate::section_pagein_work::next_deadline(),
         crate::native_image_pagein_work::next_deadline());
+    if !armed {
+        let wal_fold = crate::service_sec_image::system_wal_fold_observation();
+        let _ = writeln!(record,
+            "[root-receive-idle] preflight={:?} preflight-shot={}/{} final-shot={}/{} idle-disarms={} wal-fold=deadline:{:?}/due:{}/ready:{}/running:{}/retry:{}/first-dirty:{}",
+            preflight, u8::from(preflight_shot.0), preflight_shot.1,
+            u8::from(armed), physical_wake,
+            TIMER_IDLE_DISARMS.load(Ordering::Relaxed), wal_fold.next_deadline,
+            u8::from(wal_fold.due), u8::from(wal_fold.ready), u8::from(wal_fold.running),
+            wal_fold.retry_100ns, wal_fold.first_dirty_100ns);
+    }
     sel4_rt::print_record(if record.overflowed() {
         b"[root-receive-idle] record-truncated\n"
     } else {

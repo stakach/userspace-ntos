@@ -822,3 +822,6 @@ diagnosis-free failure.
 - A function-level trace may come from a nested caller that never passes the expected outer wrapper. Map the exact return chain in the boot artifact before inferring a blocked syscall or missing wrapper return. In the Hook investigation, the stage-7 record came from the shared pump's nested File runner; the main-loop wrapper was never entered.
 - A saved return address proves the current call site, not that the call returned. Put a bounded marker after the call and after parent restoration before claiming the receiver advanced to its next blocking operation. Keep diagnostic gates independent of trace IDs that can be cleared by an earlier phase.
 - Apply a trace's target-state predicate before spending its capped record budget. A Hook receive marker counted twelve earlier receive-loop passes before the File pump became suspended and hid the one return it was meant to observe.
+
+## Distinguish Last Timer Selection From Live Wake Demand
+- `LAST_REARM_SOURCE` and `LAST_REARM_DEADLINE` remain as historical values after an Idle rearm disarms the physical shot. A final receive log with `shot=0` and a selected source does not prove that source still has a deadline. Capture the actual preflight outcome, current producer state, and shot authority on both sides of the receive trace before assigning a missed wake.

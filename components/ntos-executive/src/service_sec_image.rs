@@ -3865,6 +3865,29 @@ pub(crate) fn system_wal_fold_next_deadline() -> Option<u64> {
     )
 }
 
+/// Read-only receive-boundary diagnostic. Fields are sampled independently; the
+/// timer selector remains the sole authority for choosing a wake deadline.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SystemWalFoldObservation {
+    pub(crate) next_deadline: Option<u64>,
+    pub(crate) due: bool,
+    pub(crate) ready: bool,
+    pub(crate) running: bool,
+    pub(crate) retry_100ns: u64,
+    pub(crate) first_dirty_100ns: u64,
+}
+
+pub(crate) fn system_wal_fold_observation() -> SystemWalFoldObservation {
+    SystemWalFoldObservation {
+        next_deadline: system_wal_fold_next_deadline(),
+        due: SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire),
+        ready: SYSTEM_WAL_FOLD_READY.load(Ordering::Acquire),
+        running: SYSTEM_WAL_FOLD_RUNNING.load(Ordering::Acquire),
+        retry_100ns: SYSTEM_WAL_FOLD_RETRY_100NS.load(Ordering::Acquire),
+        first_dirty_100ns: SYSTEM_WAL_FIRST_DIRTY_100NS.load(Ordering::Acquire),
+    }
+}
+
 pub(crate) fn record_due_system_wal_fold(now_100ns: u64) -> u64 {
     if !system_wal_fold_next_deadline().is_some_and(|deadline| deadline <= now_100ns) {
         return 0;
