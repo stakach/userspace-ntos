@@ -16,6 +16,36 @@ static ACTIVE_IRP_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SYSCALL_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_RETAINED_SEH_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static HOOK_NESTED_RETURN_PROBES: AtomicU64 = AtomicU64::new(0);
+static NESTED_REGISTRY_WAKE_GAP_TRACE_N: AtomicU64 = AtomicU64::new(0);
+
+/// Observation only: a nested physical Receive bypasses the root's outer
+/// preflight, so retain evidence if a live registry retry is not covered.
+fn trace_nested_registry_wake_gap(ch: &PumpChannel, route: PeerRoute, blocking: bool) {
+    if !blocking { return; }
+    let Some(deadline) = crate::registry_mutation_work::next_deadline() else { return; };
+    let now = crate::monotonic_time_100ns();
+    if crate::LAST_REARM_AUTHORITY.covers(now, deadline)
+        || NESTED_REGISTRY_WAKE_GAP_TRACE_N.fetch_add(1, Ordering::Relaxed) >= 16
+    {
+        return;
+    }
+    use core::fmt::Write;
+    let mut record = nt_printf::record::RecordBuffer::<512>::new();
+    let _ = writeln!(record,
+        "[nested-registry-wake-gap] route={:?} tcb={} now={} retry={} shot={}/{} last={}/{} irq={} pending={}",
+        route, ch.tcb, now, deadline,
+        u8::from(crate::LAST_REARM_AUTHORITY.is_armed()),
+        crate::LAST_REARM_AUTHORITY.physical_wake_100ns(),
+        crate::LAST_REARM_SOURCE.load(Ordering::Relaxed),
+        crate::LAST_REARM_DEADLINE.load(Ordering::Relaxed),
+        crate::DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire),
+        crate::DELAY_TIMER_TICKS_PENDING.load(Ordering::Acquire));
+    sel4_rt::print_record(if record.overflowed() {
+        b"[nested-registry-wake-gap] record-truncated\n"
+    } else {
+        record.bytes()
+    });
+}
 
 fn trace_hook_nested_receive(stage: u64, ch: &PumpChannel, detail: u64) {
     if !crate::driver_launch::hosted_hook_port_waiting()
@@ -1126,8 +1156,9 @@ pub(super) unsafe fn receive(
         if observed_nested_file {
             crate::driver_launch::trace_port_connect_outer_probe(45, ch, 0);
         }
-        let arrival = runtime::receive(execution, ch.tcb,
-            serviced_scheduler_yield || !timer_checkpoint);
+        let blocking = serviced_scheduler_yield || !timer_checkpoint;
+        trace_nested_registry_wake_gap(ch, route, blocking);
+        let arrival = runtime::receive(execution, ch.tcb, blocking);
         match arrival {
             Ok(runtime::Arrival::Hosted) => {
                 observe_pump_receive_return(ch, observed_nested_file, file_receive,

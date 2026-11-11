@@ -6966,6 +6966,7 @@ static mut TIMER_DEADLINE_CENSUS: nt_hosted_runtime::TimerDeadlineCensus =
     nt_hosted_runtime::TimerDeadlineCensus::new();
 pub(crate) static IO_COMPLETION_TIMEOUT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DELAY_TIMER_REARM_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static TIMER_POST_EMPTY_DELIVERY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 /// The deadline SOURCE the last spurious rearm picked, so the storm is attributable:
 /// 1 = delay queue, 2 = event waiter, 3 = keyed waiter, 4 = io-completion waiter,
 /// 8 = keyed release waiter.
@@ -18015,8 +18016,26 @@ unsafe fn delay_timer_interrupt_claimed(
             print_str(b"\n");
         }
     }
-    delay_timer_rearm(queue, handler);
-    let _ = delay_timer_ack_irq();
+    let rearm = delay_timer_rearm(queue, handler);
+    let ack = delay_timer_ack_irq();
+    if woken == 0 && TIMER_POST_EMPTY_DELIVERY_TRACE_N.fetch_add(1, Ordering::Relaxed) < 16 {
+        let mut record = nt_printf::record::RecordBuffer::<512>::new();
+        use core::fmt::Write;
+        let _ = writeln!(record,
+            "[timer-post-empty-delivery] now={} pre-selected={:?} rearm={:?} ack={} shot={}/{} last={}/{} registry={:?} ticks={}",
+            monotonic_time_100ns(), selected, rearm, u8::from(ack.is_ok()),
+            u8::from(LAST_REARM_AUTHORITY.is_armed()),
+            LAST_REARM_AUTHORITY.physical_wake_100ns(),
+            LAST_REARM_SOURCE.load(Ordering::Relaxed),
+            LAST_REARM_DEADLINE.load(Ordering::Relaxed),
+            registry_mutation_work::next_deadline(),
+            TIMER_TICKS_SEEN.load(Ordering::Relaxed));
+        sel4_rt::print_record(if record.overflowed() {
+            b"[timer-post-empty-delivery] record-truncated\n"
+        } else {
+            record.bytes()
+        });
+    }
 }
 
 unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue, handler: &ExecNtHandler) {
