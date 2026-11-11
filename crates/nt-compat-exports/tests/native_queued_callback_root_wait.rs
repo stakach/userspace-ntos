@@ -292,6 +292,20 @@ fn root_admits_queued_callbacks_before_other_provider_work() {
 }
 
 #[test]
+fn root_retires_a_parked_callback_turn_before_admitting_another_provider() {
+    let root = between(
+        SERVICE,
+        "        loop {\n            // A callback reached by the preceding AddDevice child",
+        "            let callback_settlement =",
+    );
+    assert!(
+        root.contains("root_queued_callback_turn.is_empty()")
+            && root.contains("!root_queued_callback_exclusive_pending()"),
+        "a callback ACK may remove its queue row before the root has retired its deferred ingress tickets"
+    );
+}
+
+#[test]
 fn productive_queue_budget_yields_without_disabling_its_provider() {
     let outer = function_body(
         DRIVER,

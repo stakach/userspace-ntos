@@ -11188,7 +11188,10 @@ pub(crate) unsafe fn service_sec_image(
             // Reply. Settle it before running another AddDevice child or resuming the batch.
             // Passive work may enter a provider and retain a physical callback Reply. Only
             // this root boundary can hand that owner to the callback settlement below.
-            if root_add_device_turn.is_none() {
+            if root_add_device_turn.is_none()
+                && root_queued_callback_turn.is_empty()
+                && !root_queued_callback_exclusive_pending()
+            {
                 let queued_admission = {
                     let _message = crate::ipc_message::SavedMessageBuffer::capture();
                     crate::driver_launch::drain_hosted_queued_callbacks_at_root()
