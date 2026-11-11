@@ -422,8 +422,12 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) -> bool {
     progressed
 }
 
-pub(crate) fn wake_due(now: u64) -> u64 {
+pub(crate) fn next_deadline() -> Option<u64> {
     let runnable = unsafe { (&*core::ptr::addr_of!(PENDING)).iter().any(|work|
         !matches!(work.phase, Phase::Quarantined | Phase::Done)) };
-    u64::from(runnable && now >= NEXT_RETRY.load(Ordering::Acquire))
+    runnable.then(|| NEXT_RETRY.load(Ordering::Acquire))
+}
+
+pub(crate) fn wake_due(now: u64) -> u64 {
+    u64::from(next_deadline().is_some_and(|deadline| now >= deadline))
 }

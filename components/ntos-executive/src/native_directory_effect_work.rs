@@ -79,12 +79,17 @@ pub(crate) fn wake_now() {
 }
 
 pub(crate) fn wake_due(now: u64) -> u64 {
-    u64::from((HAS_DETACHED.load(Ordering::Acquire)
-        && now >= DETACHED_RETRY.load(Ordering::Acquire))
-        || (unsafe {
+    u64::from(next_deadline().is_some_and(|deadline| now >= deadline))
+}
+
+pub(crate) fn next_deadline() -> Option<u64> {
+    let detached = HAS_DETACHED.load(Ordering::Acquire)
+        .then(|| DETACHED_RETRY.load(Ordering::Acquire));
+    let effect = unsafe {
         (&*core::ptr::addr_of!(EFFECTS)).iter()
             .any(|work| work.phase != EffectPhase::Quarantined)
-    } && now >= EFFECT_RETRY.load(Ordering::Acquire)))
+    }.then(|| EFFECT_RETRY.load(Ordering::Acquire));
+    detached.into_iter().chain(effect).min()
 }
 
 pub(crate) fn has_outstanding(handler: &ExecNtHandler) -> bool {
