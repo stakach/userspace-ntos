@@ -34268,7 +34268,7 @@ unsafe fn trace_hosted_work_queue_capacity(
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum HostedWorkQueueDrainProgress {
+pub(crate) enum HostedWorkQueueDrainProgress {
     Drained(u64),
     Suspended,
 }
@@ -34454,7 +34454,7 @@ unsafe fn drain_hosted_work_queue_for_instance(
     let head = cursors.dequeued();
     let tail = cursors.reserved();
     let drops = (&*((shared + SH_WORK_QUEUE_DROPS) as *const AtomicU64)).load(Ordering::Relaxed);
-    if drops != 0 || (!io_only && hosted_work_queue_admission(shared).peek_ready().is_some()) {
+    if drops != 0 {
         trace_hosted_work_queue_capacity(instance_index, head, tail, drops, drained);
         register_instance_ready(instance_index, false);
         write_volatile((shared + SH_HOSTED_CURRENT_IRQL) as *mut u8, saved_irql);
@@ -34617,7 +34617,9 @@ unsafe fn drain_hosted_work_queues_at_passive_level(
         }
         sweeps += 1;
     }
-    Err(STATUS_INSUFFICIENT_RESOURCES)
+    // A productive bounded sweep yields to the root; remaining published entries retain their
+    // ring positions and will be admitted on a later root turn or the receive poll wake.
+    Ok(HostedWorkQueueDrainProgress::Drained(total))
 }
 
 unsafe fn provider_callback_marshal_window(
@@ -49193,37 +49195,12 @@ impl Drop for HostedIoPumpObservation {
     }
 }
 
-pub(crate) enum HostedIoPumpProgress {
-    Progress(usize),
-    CallbackSuspended,
-}
-
-#[track_caller]
-pub(crate) fn pump_hosted_io_completions() -> HostedIoPumpProgress {
+/// Advance completion and cleanup owners without admitting a new passive queued callback.
+/// Each completion path still enforces its own provider and Reply ownership prerequisites.
+pub(crate) fn pump_hosted_io_completions() -> usize {
     let _observation = HostedIoPumpObservation::enter();
-    // A nested provider dispatch can queue PASSIVE_LEVEL work while the scheduler is active.
-    // Revisit it from the outer pump before looking for IRP completions produced by that work.
-    let deferred = match unsafe { drain_hosted_work_queues_at_passive_level() } {
-        Ok(HostedWorkQueueDrainProgress::Drained(count)) => count as usize,
-        Ok(HostedWorkQueueDrainProgress::Suspended) => {
-            let origin = core::panic::Location::caller();
-            print_str(b"[queued-callback-origin] file=");
-            print_str(origin.file().as_bytes());
-            print_str(b" line=");
-            print_u64(origin.line() as u64);
-            print_str(b"\n");
-            return HostedIoPumpProgress::CallbackSuspended;
-        }
-        Err(status) => {
-            print_str(b"[hosted-work] outer drain failed status=0x");
-            print_hex(status as u32);
-            print_str(b"\n");
-            0
-        }
-    };
     let pumped = pump_io_manager();
-    HostedIoPumpProgress::Progress(deferred
-        .saturating_add(pumped)
+    pumped
         .saturating_add(hosted_start_io::drain_cleanup())
         .saturating_add(hosted_file_owners::drain())
         .saturating_add(hosted_file_lifecycle_owners::retire())
@@ -49237,7 +49214,29 @@ pub(crate) fn pump_hosted_io_completions() -> HostedIoPumpProgress {
         .saturating_add(unsafe { drain_hosted_acpi_pci_route_query() })
         .saturating_add(unsafe { start_hosted_device_relation_query() })
         .saturating_add(unsafe { start_hosted_acpi_pci_route_query() })
-        .saturating_add(unsafe { hosted_sync_relations::drain() }))
+        .saturating_add(unsafe { hosted_sync_relations::drain() })
+}
+
+/// Admit passive queue work only where the root can immediately settle a suspended callback's
+/// exact queue selector, provider dispatch and physical Reply before any other provider runs.
+///
+/// # Safety
+/// The caller must own a root callback admission boundary and handle every `Suspended` or error
+/// result without replaying or retiring the callback's retained physical owner.
+#[track_caller]
+pub(crate) unsafe fn drain_hosted_queued_callbacks_at_root(
+) -> Result<HostedWorkQueueDrainProgress, i32> {
+    let _observation = HostedIoPumpObservation::enter();
+    let progress = drain_hosted_work_queues_at_passive_level();
+    if matches!(&progress, Ok(HostedWorkQueueDrainProgress::Suspended)) {
+        let origin = core::panic::Location::caller();
+        print_str(b"[queued-callback-origin] file=");
+        print_str(origin.file().as_bytes());
+        print_str(b" line=");
+        print_u64(origin.line() as u64);
+        print_str(b"\n");
+    }
+    progress
 }
 
 pub(crate) fn hosted_file_retry_deadline(now: u64) -> Option<u64> {

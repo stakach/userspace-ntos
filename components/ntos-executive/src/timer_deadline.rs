@@ -2,6 +2,33 @@
 
 use super::*;
 
+/// Backstop for work queued after the root's last queue scan but before Receive. Only the
+/// ordinary root Receive arms it; a due timer consumes it, so active service turns do not poll.
+const QUEUED_WORK_RECEIVE_POLL_INTERVAL_100NS: u64 = 2_500_000;
+static QUEUED_WORK_RECEIVE_POLL_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+pub(super) fn arm_queued_work_receive_poll(now_100ns: u64) {
+    let deadline = now_100ns
+        .saturating_add(QUEUED_WORK_RECEIVE_POLL_INTERVAL_100NS)
+        .min(u64::MAX - 1);
+    let _ = QUEUED_WORK_RECEIVE_POLL_DEADLINE.compare_exchange(
+        u64::MAX, deadline, Ordering::AcqRel, Ordering::Acquire,
+    );
+}
+
+fn queued_work_receive_poll_deadline() -> Option<u64> {
+    let deadline = QUEUED_WORK_RECEIVE_POLL_DEADLINE.load(Ordering::Acquire);
+    (deadline != u64::MAX).then_some(deadline)
+}
+
+pub(super) fn queued_work_receive_poll_wake_due(now_100ns: u64) -> u64 {
+    let Some(deadline) = queued_work_receive_poll_deadline() else { return 0 };
+    if now_100ns < deadline { return 0; }
+    u64::from(QUEUED_WORK_RECEIVE_POLL_DEADLINE.compare_exchange(
+        deadline, u64::MAX, Ordering::AcqRel, Ordering::Acquire,
+    ).is_ok())
+}
+
 pub(super) struct OwnerDeadlines {
     pub dispatcher: nt_user_host::dispatcher_deadlines::DispatcherDeadlines,
     pub user_timer: Option<u64>,
@@ -116,6 +143,7 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
         (owner.component_resume, DELAY_TIMER_SOURCE_COMPONENT_RESUME),
         (owner.root_add_device, DELAY_TIMER_SOURCE_ROOT_ADD_DEVICE_RETRY),
         (owner.root_queued_callback, DELAY_TIMER_SOURCE_ROOT_QUEUED_CALLBACK_RETRY),
+        (queued_work_receive_poll_deadline(), DELAY_TIMER_SOURCE_QUEUED_WORK_RECEIVE_POLL),
         (owner.primary_alias, DELAY_TIMER_SOURCE_PRIMARY_ALIAS_RETRY),
         (owner.hosted_spawn_abort, DELAY_TIMER_SOURCE_HOSTED_SPAWN_ABORT),
         (

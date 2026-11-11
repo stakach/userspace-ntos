@@ -7,6 +7,9 @@ const QUEUE: &str =
     include_str!("../../../components/ntos-executive/src/hosted_work_queue_owner.rs");
 const INGRESS: &str =
     include_str!("../../../components/ntos-executive/src/component_ingress_hosted.rs");
+const MAIN: &str = include_str!("../../../components/ntos-executive/src/main.rs");
+const DRIVER: &str = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+const TIMER: &str = include_str!("../../../components/ntos-executive/src/timer_deadline.rs");
 
 fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     source
@@ -224,6 +227,87 @@ fn shared_queued_wait_settles_current_ingress_before_blocking() {
             && receive_macro
                 .contains("component_receive_outcome!(crate::executive_ingress::receive($reply))"),
         "the exclusive callback must arm its one-shot immediately before Receive"
+    );
+}
+
+#[test]
+fn outer_io_pump_cannot_discard_a_suspended_callback_owner() {
+    let pump = function_body(
+        DRIVER,
+        "pub(crate) fn pump_hosted_io_completions() -> usize {",
+    );
+    assert!(
+        !pump.contains("drain_hosted_work_queues_at_passive_level")
+            && !pump.contains("drain_hosted_queued_callbacks_at_root"),
+        "ordinary I/O pumping may be ignored only when callback admission and its physical Reply are reserved for the root"
+    );
+}
+
+#[test]
+fn post_syscall_redrive_cannot_hide_a_suspended_callback_from_its_caller() {
+    let post = function_body(
+        SERVICE,
+        "unsafe fn redrive_global_post_syscall_work(",
+    );
+    assert!(
+        !post.contains("CallbackSuspended"),
+        "returning from post-syscall redrive without reporting its retained callback leaves the current Reply and provider continuation without a root barrier"
+    );
+}
+
+#[test]
+fn root_receive_has_a_physical_queue_wake_after_an_empty_scan() {
+    let receive = function_body(SERVICE, "unsafe fn prepare_service_receive(");
+    assert!(
+        receive.contains("delay_timer_arm_queued_work_receive_poll("),
+        "an enqueue after the root's empty queue scan must still wake a blocking Receive"
+    );
+    let poll = function_body(MAIN, "unsafe fn delay_timer_arm_queued_work_receive_poll(");
+    assert!(
+        poll.contains("delay_timer_rearm(") && !poll.contains("peek_ready()"),
+        "the physical receive poll must be armed regardless of observed queue readiness"
+    );
+    assert!(
+        TIMER.contains("queued_work_receive_poll_deadline(), DELAY_TIMER_SOURCE_QUEUED_WORK_RECEIVE_POLL")
+            && MAIN.contains("timer_deadline::queued_work_receive_poll_wake_due(now_100ns)"),
+        "the poll needs one canonical timer selector and a due transition before root rescans the queue"
+    );
+}
+
+#[test]
+fn root_admits_queued_callbacks_before_other_provider_work() {
+    let root = between(
+        SERVICE,
+        "        loop {\n            // A callback reached by the preceding AddDevice child",
+        "            let callback_settlement =",
+    );
+    assert!(
+        root.contains("drain_hosted_queued_callbacks_at_root()"),
+        "root must admit passive queue work where it can immediately settle a retained callback owner"
+    );
+    assert!(
+        root.contains("if root_add_device_turn.is_none()"),
+        "queue admission must not enter an unrelated provider while AddDevice retains its parent"
+    );
+}
+
+#[test]
+fn productive_queue_budget_yields_without_disabling_its_provider() {
+    let outer = function_body(
+        DRIVER,
+        "unsafe fn drain_hosted_work_queues_at_passive_level(",
+    );
+    assert!(
+        outer.trim_end().ends_with("Ok(HostedWorkQueueDrainProgress::Drained(total))"),
+        "a bounded productive sweep must yield to root, retaining later queue entries for the next turn"
+    );
+    let instance = function_body(
+        DRIVER,
+        "unsafe fn drain_hosted_work_queue_for_instance(",
+    );
+    assert!(
+        !instance.contains("drops != 0 || (!io_only && hosted_work_queue_admission(shared).peek_ready().is_some())"),
+        "a ready next item after a productive per-instance budget is not proof of an overflow or failed provider"
     );
 }
 

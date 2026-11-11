@@ -6813,10 +6813,11 @@ pub(crate) unsafe fn drain_nested_pump_timer_delivery() -> bool {
 unsafe fn prepare_service_receive(
     queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
-) {
+) -> bool {
     loop {
         match component_resume::prepare_receive(handler) {
-            component_resume::ReceivePreparation::Ready => return,
+            component_resume::ReceivePreparation::Ready =>
+                return delay_timer_arm_queued_work_receive_poll(queue, handler),
             component_resume::ReceivePreparation::PendingDelivery => {
                 let ticks = DELAY_TIMER_TICKS_PENDING.swap(0, Ordering::AcqRel);
                 if ticks == 0 { continue; }
@@ -10468,19 +10469,22 @@ pub(crate) unsafe fn service_sec_image(
     // This barrier only programs wake demand; provider execution stays at the outer loop top.
     macro_rules! component_recv {
         ($($arg:expr),* $(,)?) => {{
-            prepare_service_receive(&mut *delay_queue, &mut nt_handler);
+            assert!(prepare_service_receive(&mut *delay_queue, &mut nt_handler),
+                "initial root receive lost its physical timer owner");
             recv_full_r12($($arg),*)
         }};
     }
     macro_rules! component_reply_recv {
         ($($arg:expr),* $(,)?) => {{
-            prepare_service_receive(&mut *delay_queue, &mut nt_handler);
+            assert!(prepare_service_receive(&mut *delay_queue, &mut nt_handler),
+                "initial root reply receive lost its physical timer owner");
             reply_recv_badge($($arg),*)
         }};
     }
     macro_rules! component_client_reply_recv {
         ($($arg:expr),* $(,)?) => {{
-            prepare_service_receive(&mut *delay_queue, &mut nt_handler);
+            assert!(prepare_service_receive(&mut *delay_queue, &mut nt_handler),
+                "initial root client reply receive lost its physical timer owner");
             client_reply_recv_badge($($arg),*)
         }};
     }
@@ -10880,7 +10884,12 @@ pub(crate) unsafe fn service_sec_image(
                         break 'service_loop;
                     }
                 } else if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
-                    prepare_service_receive(&mut *delay_queue, &mut nt_handler);
+                    if !prepare_service_receive(&mut *delay_queue, &mut nt_handler) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-work-receive-poll");
+                        break 'service_loop;
+                    }
                 }
                 component_receive_outcome!(crate::executive_ingress::receive($reply))
             }};
@@ -10911,7 +10920,12 @@ pub(crate) unsafe fn service_sec_image(
                         break 'service_loop;
                     }
                 } else if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
-                    prepare_service_receive(&mut *delay_queue, &mut nt_handler);
+                    if !prepare_service_receive(&mut *delay_queue, &mut nt_handler) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-work-reply-poll");
+                        break 'service_loop;
+                    }
                 }
                 component_receive_outcome!(crate::executive_ingress::reply_receive(
                     $reply, $len, $r0, $r1, $r2, $r3))
@@ -11061,7 +11075,12 @@ pub(crate) unsafe fn service_sec_image(
                         break 'service_loop;
                     }
                 } else {
-                    prepare_service_receive(&mut *delay_queue, &mut nt_handler);
+                    if !prepare_service_receive(&mut *delay_queue, &mut nt_handler) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"restored-queued-work-poll");
+                        break 'service_loop;
+                    }
                 }
             }
             let received = crate::executive_ingress::receive(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
@@ -11167,6 +11186,20 @@ pub(crate) unsafe fn service_sec_image(
         loop {
             // A callback reached by the preceding AddDevice child owns a nested physical
             // Reply. Settle it before running another AddDevice child or resuming the batch.
+            // Passive work may enter a provider and retain a physical callback Reply. Only
+            // this root boundary can hand that owner to the callback settlement below.
+            if root_add_device_turn.is_none() {
+                let queued_admission = {
+                    let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                    crate::driver_launch::drain_hosted_queued_callbacks_at_root()
+                };
+                if let Err(status) = queued_admission {
+                    stop = status as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"queued-callback-admission");
+                    break 'service_loop;
+                }
+            }
             let callback_settlement = {
                 let _message = crate::ipc_message::SavedMessageBuffer::capture();
                 settle_queued_callbacks()
@@ -29743,13 +29776,10 @@ fn service_mounted_native_blocks_and_redrive_backends() -> u64 {
 /// Keep the original ordering and retry-flag claim.
 unsafe fn redrive_global_post_syscall_work(nt_handler: &mut ExecNtHandler) {
     let _ = driver_launch::pump_hosted_file_lifecycle();
-    let hosted_io_progress = match pump_hosted_io_and_redrive_driver_starts(
+    let hosted_io_progress = pump_hosted_io_and_redrive_driver_starts(
         driver_launch::drain_hosted_driver_dpcs(),
         nt_handler,
-    ) {
-        HostedIoAdvance::Progress(count) => count,
-        HostedIoAdvance::CallbackSuspended => return,
-    };
+    );
     if hosted_io_progress != 0
         || FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
     {
@@ -29771,25 +29801,15 @@ unsafe fn redrive_global_post_syscall_work(nt_handler: &mut ExecNtHandler) {
 }
 
 // Callers execute DPCs before borrowing the handler and pass only the completed work count.
-enum HostedIoAdvance {
-    Progress(u64),
-    CallbackSuspended,
-}
-
-#[track_caller]
 unsafe fn pump_hosted_io_and_redrive_driver_starts(
     activated: u64,
     nt_handler: &mut ExecNtHandler,
-) -> HostedIoAdvance {
+) -> u64 {
     let retired = driver_launch::drain_hosted_file_retirements();
     let video_retired = crate::video_device::drain_video_file_retirements();
     let serviced = driver_launch::service_pending_file_backends() as u64;
     let native_blocks = service_mounted_native_blocks_and_redrive_backends();
-    let pumped = match driver_launch::pump_hosted_io_completions() {
-        driver_launch::HostedIoPumpProgress::Progress(count) => count as u64,
-        driver_launch::HostedIoPumpProgress::CallbackSuspended =>
-            return HostedIoAdvance::CallbackSuspended,
-    };
+    let pumped = driver_launch::pump_hosted_io_completions() as u64;
     if crate::config_manager_take_device_action_wake() {
         nt_handler.pnp_signal_pending_action();
     }
@@ -29824,7 +29844,7 @@ unsafe fn pump_hosted_io_and_redrive_driver_starts(
         FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
     }
     rearm_requested_mounted_native_timer(nt_handler);
-    HostedIoAdvance::Progress(progress)
+    progress
 }
 
 fn pending_driver_start_redrive_needed(nt_handler: &ExecNtHandler) -> bool {

@@ -3148,6 +3148,7 @@ const DELAY_TIMER_SOURCE_NATIVE_DIRECTORY_OPEN: u64 = 42;
 const DELAY_TIMER_SOURCE_NATIVE_FILE_TARGET_OPEN: u64 = 43;
 const DELAY_TIMER_SOURCE_NATIVE_DIRECTORY_EFFECT: u64 = 44;
 const DELAY_TIMER_SOURCE_ROOT_QUEUED_CALLBACK_RETRY: u64 = 45;
+const DELAY_TIMER_SOURCE_QUEUED_WORK_RECEIVE_POLL: u64 = 46;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -17432,6 +17433,17 @@ unsafe fn delay_timer_rearm(
     delay_timer_rearm_with_snapshot(queue, handler, nt_time_snapshot)
 }
 
+/// Keep an independent physical wake armed while the root may block in Receive. A work-item
+/// producer can publish just after the last queue scan without sending an endpoint message.
+/// The poll deadline is stable across unrelated timer rearms and is consumed only when due.
+unsafe fn delay_timer_arm_queued_work_receive_poll(
+    queue: &nt_delay_execution::Queue,
+    handler: &ExecNtHandler,
+) -> bool {
+    timer_deadline::arm_queued_work_receive_poll(monotonic_time_100ns());
+    delay_timer_rearm(queue, handler).deadline_programmed()
+}
+
 /// Select deadlines from one caller-owned causal snapshot. The physical PIT
 /// programming path still samples time afresh after selection.
 unsafe fn delay_timer_rearm_at(
@@ -17704,6 +17716,7 @@ unsafe fn delay_timer_drain_due_work(
         ))
         + timer_retry_wake_due(now_100ns)
         + service_sec_image::root_add_device_retry_wake_due(now_100ns)
+        + timer_deadline::queued_work_receive_poll_wake_due(now_100ns)
         + service_sec_image::primary_alias_retry_wake_due(now_100ns)
         + hosted_spawn_uncertainty::wake_due(queue, handler, now_100ns)
         + service_sec_image::component_resume::wake_due(&handler.pm, now_100ns)
