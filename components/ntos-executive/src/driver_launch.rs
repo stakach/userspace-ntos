@@ -49198,14 +49198,22 @@ pub(crate) enum HostedIoPumpProgress {
     CallbackSuspended,
 }
 
+#[track_caller]
 pub(crate) fn pump_hosted_io_completions() -> HostedIoPumpProgress {
     let _observation = HostedIoPumpObservation::enter();
     // A nested provider dispatch can queue PASSIVE_LEVEL work while the scheduler is active.
     // Revisit it from the outer pump before looking for IRP completions produced by that work.
     let deferred = match unsafe { drain_hosted_work_queues_at_passive_level() } {
         Ok(HostedWorkQueueDrainProgress::Drained(count)) => count as usize,
-        Ok(HostedWorkQueueDrainProgress::Suspended) =>
-            return HostedIoPumpProgress::CallbackSuspended,
+        Ok(HostedWorkQueueDrainProgress::Suspended) => {
+            let origin = core::panic::Location::caller();
+            print_str(b"[queued-callback-origin] file=");
+            print_str(origin.file().as_bytes());
+            print_str(b" line=");
+            print_u64(origin.line() as u64);
+            print_str(b"\n");
+            return HostedIoPumpProgress::CallbackSuspended;
+        }
         Err(status) => {
             print_str(b"[hosted-work] outer drain failed status=0x");
             print_hex(status as u32);

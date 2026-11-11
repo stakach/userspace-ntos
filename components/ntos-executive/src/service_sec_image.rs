@@ -29776,6 +29776,7 @@ enum HostedIoAdvance {
     CallbackSuspended,
 }
 
+#[track_caller]
 unsafe fn pump_hosted_io_and_redrive_driver_starts(
     activated: u64,
     nt_handler: &mut ExecNtHandler,
