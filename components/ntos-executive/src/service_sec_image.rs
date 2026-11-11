@@ -10151,6 +10151,10 @@ pub(crate) unsafe fn service_sec_image(
     let mut stop: u64;
     let mut ntfaults: u64;
     let mut stop_ssn = 0u64;
+    // A single terminal receipt identifies which safety gate ended the serialized loop.
+    // The source location is recorded at the branch, before any quiesce checkpoint can fail.
+    let mut service_loop_exit_site = 0u32;
+    let mut service_loop_exit_reason: &'static [u8] = b"unrecorded";
     let mut iters = 0u64;
     let mut dbgsvc = 0u64;
     // page VA filled at each fault index → its persistent executive scratch is
@@ -10487,6 +10491,12 @@ pub(crate) unsafe fn service_sec_image(
     // reply cap. A process contributes to this mask only when every live hosted thread with a real TCB
     // is parked, so ordinary worker churn no longer clears or sets process liveness as a side effect.
     let mut wait_parked: u64 = 0;
+    macro_rules! record_service_loop_exit {
+        ($reason:expr) => {{
+            service_loop_exit_site = line!();
+            service_loop_exit_reason = $reason;
+        }};
+    }
     // park_and_log!(label, ip, cr2): the generalized UNRECOVERABLE-fault handler. Logs once per
     // top-level process (`[parked] pi=.. badge=.. fault=.. ip=.. cr2=..`), marks its crash bit,
     // flushes this pi's fault bookkeeping, then QUIESCE-checks (if every live top-level process is
@@ -10572,6 +10582,7 @@ pub(crate) unsafe fn service_sec_image(
             {
                 print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
                 stop = $ip as u64;
+                record_service_loop_exit!(b"crash-all-live-parked");
                 break;
             }
             let _ = finalize_service_loop_state(&mut nt_handler);
@@ -10731,6 +10742,7 @@ pub(crate) unsafe fn service_sec_image(
                 );
                 stop = $ip as u64;
                 let _ = $pi;
+                record_service_loop_exit!(b"wait-all-live-parked");
                 break;
             }
         }};
@@ -10806,6 +10818,7 @@ pub(crate) unsafe fn service_sec_image(
                     crate::executive_ingress::ReceiveOutcome::RetainedFailure => {
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = 0;
+                        record_service_loop_exit!(b"ingress-retained");
                         break 'service_loop;
                     }
                 }
@@ -10818,6 +10831,7 @@ pub(crate) unsafe fn service_sec_image(
                     if !prepare_parked_add_device_receive(&mut root_add_device_turn) {
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-receive");
                         break 'service_loop;
                     }
                 } else if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
@@ -10833,6 +10847,7 @@ pub(crate) unsafe fn service_sec_image(
                     if !prepare_parked_add_device_receive(&mut root_add_device_turn) {
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-reply-receive");
                         break 'service_loop;
                     }
                 } else if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
@@ -10869,6 +10884,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                     stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                     stop_ssn = 0;
+                    record_service_loop_exit!(b"rejected-reply-retained");
                     break 'service_loop;
                 }
                 let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
@@ -10894,6 +10910,7 @@ pub(crate) unsafe fn service_sec_image(
                     if !prepare_parked_add_device_receive(&mut root_add_device_turn) {
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = 0;
+                        record_service_loop_exit!(b"restored-add-device-receive");
                         break 'service_loop;
                     }
                 } else {
@@ -10906,6 +10923,7 @@ pub(crate) unsafe fn service_sec_image(
                 crate::executive_ingress::ReceiveOutcome::RetainedFailure => {
                     stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                     stop_ssn = 0;
+                    record_service_loop_exit!(b"restored-ingress-retained");
                     break 'service_loop;
                 }
                 crate::executive_ingress::ReceiveOutcome::OuterBoundary(_) => {
@@ -10935,6 +10953,7 @@ pub(crate) unsafe fn service_sec_image(
                 if let Err(status) = service_parked_add_device_notification(badge) {
                     stop = status.raw() as u32 as u64;
                     stop_ssn = 0;
+                    record_service_loop_exit!(b"add-device-notification");
                     break 'service_loop;
                 }
                 let arrival = if badge_has_delay_timer(badge) {
@@ -10961,6 +10980,7 @@ pub(crate) unsafe fn service_sec_image(
                     {
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-child-receive");
                         break 'service_loop;
                     }
                     let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
@@ -10970,6 +10990,7 @@ pub(crate) unsafe fn service_sec_image(
                 ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
                     stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                     stop_ssn = 0;
+                    record_service_loop_exit!(b"add-device-connect-retained");
                     break 'service_loop;
                 }
             }
@@ -10980,6 +11001,7 @@ pub(crate) unsafe fn service_sec_image(
                     Err(()) => {
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-child-step");
                         break 'service_loop;
                     }
                 }
@@ -10993,6 +11015,7 @@ pub(crate) unsafe fn service_sec_image(
                         root_add_device_turn = Some(turn);
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-owner-changed");
                         break 'service_loop;
                     }
                     if turn.retained_ingress(owner).ok().flatten().is_some_and(|ticket|
@@ -11001,6 +11024,7 @@ pub(crate) unsafe fn service_sec_image(
                         root_add_device_turn = Some(turn);
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-ingress-changed");
                         break 'service_loop;
                     }
                     let retained = match turn.settle(owner) {
@@ -11009,6 +11033,7 @@ pub(crate) unsafe fn service_sec_image(
                             root_add_device_turn = Some(turn);
                             stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                             stop_ssn = 0;
+                            record_service_loop_exit!(b"add-device-settle");
                             break 'service_loop;
                         }
                     };
@@ -11036,6 +11061,7 @@ pub(crate) unsafe fn service_sec_image(
             if root_add_device_turn.as_ref().is_none_or(|turn| turn.owner() != reservation) {
                 stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                 stop_ssn = 0;
+                record_service_loop_exit!(b"add-device-reservation-changed");
                 break 'service_loop;
             }
             let mut awaiting_connect_child = false;
@@ -11049,6 +11075,7 @@ pub(crate) unsafe fn service_sec_image(
                     ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-connect-retained");
                         break 'service_loop;
                     }
                 }
@@ -11074,6 +11101,7 @@ pub(crate) unsafe fn service_sec_image(
                     ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-connect-retained");
                         break 'service_loop;
                     }
                 }
@@ -11093,6 +11121,7 @@ pub(crate) unsafe fn service_sec_image(
                 {
                     stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                     stop_ssn = 0;
+                    record_service_loop_exit!(b"add-device-ingress-changed");
                     break 'service_loop;
                 }
                 let turn = root_add_device_turn.take().expect("exact AddDevice turn");
@@ -11102,6 +11131,7 @@ pub(crate) unsafe fn service_sec_image(
                         root_add_device_turn = Some(turn);
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-settle");
                         break 'service_loop;
                     }
                 };
@@ -11117,6 +11147,7 @@ pub(crate) unsafe fn service_sec_image(
                 // and banks remain held, and no unrelated provider can enter after this.
                 stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                 stop_ssn = 0;
+                record_service_loop_exit!(b"add-device-parent-retained");
                 break 'service_loop;
             }
             if ran_child && !awaiting_connect_child { continue }
@@ -11127,6 +11158,7 @@ pub(crate) unsafe fn service_sec_image(
                 if let Err(status) = service_parked_add_device_notification(badge) {
                     stop = status.raw() as u32 as u64;
                     stop_ssn = 0;
+                    record_service_loop_exit!(b"add-device-notification");
                     break 'service_loop;
                 }
                 let arrival = if badge_has_delay_timer(badge) {
@@ -11145,6 +11177,7 @@ pub(crate) unsafe fn service_sec_image(
                 else {
                     stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                     stop_ssn = 0;
+                    record_service_loop_exit!(b"add-device-permit");
                     break 'service_loop;
                 };
                 let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -11155,12 +11188,14 @@ pub(crate) unsafe fn service_sec_image(
                     Err(_) => {
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-ingress-defer");
                         break 'service_loop;
                     }
                 };
                 if turn.retain_ingress(reservation, ticket).is_err() {
                     stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                     stop_ssn = 0;
+                    record_service_loop_exit!(b"add-device-ingress-retain");
                     break 'service_loop;
                 }
                 root_event_consumed = true;
@@ -11170,6 +11205,7 @@ pub(crate) unsafe fn service_sec_image(
             if !prepared {
                 stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                 stop_ssn = 0;
+                record_service_loop_exit!(b"add-device-receive-prepare");
                 break 'service_loop;
             }
             let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
@@ -11184,6 +11220,7 @@ pub(crate) unsafe fn service_sec_image(
             {
                 stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                 stop_ssn = 0;
+                record_service_loop_exit!(b"receive-child-timer-owner");
                 break 'service_loop;
             }
             if badge_has_delay_timer(badge) || hosted_irq_lines_from_badge(badge) != 0 {
@@ -11191,6 +11228,7 @@ pub(crate) unsafe fn service_sec_image(
                     if let Err(status) = service_parked_add_device_notification(badge) {
                         stop = status.raw() as u32 as u64;
                         stop_ssn = 0;
+                        record_service_loop_exit!(b"receive-child-notification");
                         break 'service_loop;
                     }
                 }
@@ -11210,6 +11248,7 @@ pub(crate) unsafe fn service_sec_image(
             if !delay_timer_rearm(&*delay_queue, &nt_handler).owner_available() {
                 stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                 stop_ssn = 0;
+                record_service_loop_exit!(b"timer-rearm");
                 break 'service_loop;
             }
             let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
@@ -11282,6 +11321,7 @@ pub(crate) unsafe fn service_sec_image(
                 // owns its Reply. No later provider may enter while that physical owner is held.
                 stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                 stop_ssn = 0;
+                record_service_loop_exit!(b"connect-pump-unsettled");
                 break 'service_loop;
             }
             // A work-queue callback can outlive its invoking provider frame. Reconcile
@@ -11291,6 +11331,7 @@ pub(crate) unsafe fn service_sec_image(
             if !matches!(queue_settlement, ConnectPumpSettlement::Settled) {
                 stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                 stop_ssn = 0;
+                record_service_loop_exit!(b"queued-callback-unsettled");
                 break 'service_loop;
             }
             trace_connect_root_checkpoint(4, None);
@@ -11315,6 +11356,7 @@ pub(crate) unsafe fn service_sec_image(
                 // next unrelated provider or publish a synthetic Hook completion.
                 stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                 stop_ssn = 0;
+                record_service_loop_exit!(b"file-pump-unsettled");
                 break 'service_loop;
             }
             crate::driver_launch::redrive_hosted_lower_pnp_forward(nt_handler as *mut _);
@@ -11413,6 +11455,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(irq_durable_status);
                     print_str(b"\n");
                     stop = irq_durable_status as u64;
+                    record_service_loop_exit!(b"irq-checkpoint");
                     break;
                 }
                 let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
@@ -11469,6 +11512,7 @@ pub(crate) unsafe fn service_sec_image(
                 } else if crate::watchdog_confirm_trip() {
                     print_str(b"[deadman] confirmed -> QUIESCE; run the gate\n");
                     stop = m1;
+                    record_service_loop_exit!(b"overdue-watchdog");
                     break;
                 }
             }
@@ -11546,6 +11590,7 @@ pub(crate) unsafe fn service_sec_image(
                     );
                     print_str(b"[quiesce] no boot milestone for ~180s wall-clock -> run gate\n");
                     stop = m1;
+                    record_service_loop_exit!(b"boot-milestone-stall");
                     break;
                 }
             }
@@ -11580,6 +11625,7 @@ pub(crate) unsafe fn service_sec_image(
                 );
                 print_str(b"[deadman] nested receive confirmed watchdog -> run gate\n");
                 stop = m1;
+                record_service_loop_exit!(b"nested-receive-watchdog");
                 break;
             }
         }
@@ -11655,6 +11701,7 @@ pub(crate) unsafe fn service_sec_image(
                 } else if crate::watchdog_confirm_trip() {
                     print_str(b"[deadman] confirmed -> QUIESCE; run the gate\n");
                     stop = m1;
+                    record_service_loop_exit!(b"timer-watchdog");
                     break;
                 }
             }
@@ -11666,6 +11713,7 @@ pub(crate) unsafe fn service_sec_image(
                 print_hex(timer_durable_status);
                 print_str(b"\n");
                 stop = timer_durable_status as u64;
+                record_service_loop_exit!(b"timer-checkpoint");
                 break;
             }
             let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
@@ -11696,6 +11744,7 @@ pub(crate) unsafe fn service_sec_image(
             print_hex(durability_status);
             print_str(b"\n");
             stop = durability_status as u64;
+            record_service_loop_exit!(b"durability-publication");
             break;
         }
         // This delivery still owns its Reply and captured message. An outer resume can select
@@ -11798,6 +11847,7 @@ pub(crate) unsafe fn service_sec_image(
                 crate::executive_ingress::ReceiveOutcome::RetainedFailure => {
                     stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                     stop_ssn = 0;
+                    record_service_loop_exit!(b"receive-child-ack-retained");
                     break 'service_loop;
                 }
                 crate::executive_ingress::ReceiveOutcome::Message(_) => panic!("Receive ACK requires exact settlement boundary"),
@@ -12324,6 +12374,7 @@ pub(crate) unsafe fn service_sec_image(
                 {
                     print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
                     stop = fip;
+                    record_service_loop_exit!(b"winlogon-post-logon-fault");
                     break;
                 }
                 let (nb, nmi, nm0, nm1, nm2, nm3) =
@@ -12777,6 +12828,7 @@ pub(crate) unsafe fn service_sec_image(
                     {
                         print_str(b"[wl-worker] terminal wall while winlogon main waits for this worker -> run gate\n");
                         stop = m0;
+                        record_service_loop_exit!(b"winlogon-worker-terminal");
                         break;
                     }
                     procs[pi].faults = faults;
@@ -12848,6 +12900,7 @@ pub(crate) unsafe fn service_sec_image(
                     pfilled[pi] = *filled_pages;
                     print_str(b"[wl-main] winlogon crashed at its post-OpenSCManager GUI/login frontier (LSA signalled, SCM servers idle) -> QUIESCE; run gate\n");
                     stop = m0;
+                    record_service_loop_exit!(b"winlogon-main-crash");
                     break;
                 }
                 // Unrecoverable NULL/low deref on a top-level process thread — a crash. Park+log
@@ -13451,6 +13504,7 @@ pub(crate) unsafe fn service_sec_image(
                         driver_launch::print_mounted_native_block_quiesce_snapshot();
                         print_str(b"[quiesce] every live process parked/waiting (no signaler left) -> run gate\n");
                         stop = addr;
+                        record_service_loop_exit!(b"fault-all-live-waiting");
                         break;
                     }
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
@@ -13530,6 +13584,7 @@ pub(crate) unsafe fn service_sec_image(
                     {
                         print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
                         stop = m0;
+                        record_service_loop_exit!(b"winlogon-post-logon-syscall");
                         break;
                     }
                     let _ = finalize_service_loop_state(&mut nt_handler);
@@ -15034,6 +15089,7 @@ pub(crate) unsafe fn service_sec_image(
                                 pfilled[pi] = *filled_pages;
                                 stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                                 stop_ssn = m0;
+                                record_service_loop_exit!(b"win32k-initial-dispatch-retained");
                                 break 'service_loop;
                             }
                             assert!(handoff.parked || handoff.callback_suspended,
@@ -15459,6 +15515,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(reply_dropped as u64);
                         print_str(b" -> fatal stop\n");
                         stop = code as u64;
+                        record_service_loop_exit!(b"fatal-stop");
                         break;
                     }
                     ExecPostAction::None => {}
@@ -19741,6 +19798,7 @@ pub(crate) unsafe fn service_sec_image(
                     pfilled[pi] = *filled_pages;
                     stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                     stop_ssn = m0;
+                    record_service_loop_exit!(b"win32k-dispatch-retained");
                     break 'service_loop;
                 }
                 let callback_suspended = handoff.callback_suspended;
@@ -20235,6 +20293,7 @@ pub(crate) unsafe fn service_sec_image(
                     {
                         print_str(b"[quiesce] winlogon reached its win32k SAS-window milestone + steady state -> run gate\n");
                         stop = m0;
+                        record_service_loop_exit!(b"winlogon-sas-milestone");
                         break;
                     } else if userinit_shell_pending {
                         print_str(b"[quiesce] winlogon milestone parked; deferring gate until userinit attempts its shell image\n");
@@ -20299,6 +20358,7 @@ pub(crate) unsafe fn service_sec_image(
                     {
                         print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
                         stop = m0;
+                        record_service_loop_exit!(b"all-live-waiting");
                         break;
                     }
                     let _ = finalize_service_loop_state(&mut nt_handler);
@@ -20371,6 +20431,7 @@ pub(crate) unsafe fn service_sec_image(
                     {
                         print_str(b"[wl-worker] parked before signalling the waiting winlogon main thread -> run gate\n");
                         stop = m0;
+                        record_service_loop_exit!(b"winlogon-worker-parked");
                         break;
                     }
                     procs[pi].faults = faults;
@@ -20435,6 +20496,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"[root-maintenance] pending Receive child; checkpoint retained\n");
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = m0;
+                        record_service_loop_exit!(b"root-maintenance-receive-child");
                         break 'service_loop;
                     }
                     // The ordinary syscall has yielded with both Replies retained. Run this
@@ -20450,6 +20512,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"[root-maintenance] image worker did not enter; checkpoint retained\n");
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = m0;
+                        record_service_loop_exit!(b"root-maintenance-worker");
                         break 'service_loop;
                     }
                     let Some(observed_pass) = ROOT_MAINTENANCE_PASS.fetch_update(
@@ -20458,12 +20521,14 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"[root-maintenance] outer pass epoch exhausted\n");
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = m0;
+                        record_service_loop_exit!(b"root-maintenance-epoch");
                         break 'service_loop;
                     };
                     let Some(key) = root_maintenance_owner::key(maintenance_ticket) else {
                         print_str(b"[root-maintenance] exact owner missing before pass grant\n");
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = m0;
+                        record_service_loop_exit!(b"root-maintenance-owner");
                         break 'service_loop;
                     };
                     let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
@@ -20475,6 +20540,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"[root-maintenance] exact pass grant refused\n");
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = m0;
+                        record_service_loop_exit!(b"root-maintenance-pass");
                         break 'service_loop;
                     }
                     if matches!(
@@ -20486,6 +20552,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"[root-maintenance] exact resume retained after refusal\n");
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = m0;
+                        record_service_loop_exit!(b"root-maintenance-resume");
                         break 'service_loop;
                     }
                 }
@@ -20543,6 +20610,7 @@ pub(crate) unsafe fn service_sec_image(
                     {
                         print_str(b"[quiesce] active callback bad-resume park reached steady state -> run gate\n");
                         stop = resume_ip;
+                        record_service_loop_exit!(b"callback-bad-resume");
                         break;
                     }
                     let _ = finalize_service_loop_state(&mut nt_handler);
@@ -21451,6 +21519,106 @@ pub(crate) unsafe fn service_sec_image(
         // This profile has no desktop verdict. Retain all live owners if its pump terminates.
         print_str(b"[mup-provider-gate] terminal service-loop failure\n");
         park();
+    }
+    // One terminal receipt, before checkpointing can obscure the branch that ended the
+    // serialized loop. Every field below is an observation; no owner or dirty bit is consumed.
+    let ingress_hold = unsafe {
+        crate::spawn_hosts::shared_ingress::owner::runtime::hold_snapshot()
+    };
+    let (callback_depth, continuation_depth) = win32k_glue::user_callback_stack_depths();
+    print_str(b"[service-loop-exit] reason=");
+    print_str(service_loop_exit_reason);
+    print_str(b" site=");
+    print_u64(service_loop_exit_site as u64);
+    print_str(b" stop=");
+    print_hex_u64(stop);
+    print_str(b" stop-ssn=");
+    print_u64(stop_ssn);
+    print_str(b" badge/label/m0/reply=");
+    print_u64(badge);
+    print_str(b"/");
+    print_u64(mi >> 12);
+    print_str(b"/");
+    print_hex_u64(m0);
+    print_str(b"/");
+    print_u64(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+    print_str(b" child-pending=");
+    print_u64(u64::from(crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()));
+    print_str(b" add-device-owner=");
+    match root_add_device_turn.as_ref().map(|turn| turn.owner()) {
+        Some(RootAddDeviceOwner::DriverStart(owner)) => {
+            print_str(b"driver-start/");
+            print_u64(owner.slot() as u64);
+        }
+        Some(RootAddDeviceOwner::PnpRebalance(owner)) => {
+            print_str(b"pnp-rebalance/");
+            print_u64(owner.slot() as u64);
+        }
+        None => print_str(b"none"),
+    }
+    print_str(b" callbacks/continuations/dispatch/suspended=");
+    print_u64(callback_depth as u64);
+    print_str(b"/");
+    print_u64(continuation_depth as u64);
+    print_str(b"/");
+    print_u64(spawn_hosts::dispatch_depth());
+    print_str(b"/");
+    print_u64(spawn_hosts::SUSPENDED_COMPONENT_OUTSTANDING.load(Ordering::Relaxed));
+    print_str(b" snapshot-dirty=");
+    print_u64(u64::from(crate::writable_fs::snapshot_dirty_for_diagnostics()));
+    print_str(b" live/crash/wait=");
+    print_hex_u64(live_top_badges(&nt_handler));
+    print_str(b"/");
+    print_hex_u64(crash_parked);
+    print_str(b"/");
+    print_hex_u64(wait_parked);
+    print_str(b"\n");
+    if let Some(running) = ingress_hold.running {
+        print_str(b"[service-loop-exit-owner] running lane/gen/epoch/route/executor/reply/tcb=");
+        print_u64(running.lane.index as u64);
+        print_str(b"/");
+        print_u64(running.lane.generation);
+        print_str(b"/");
+        print_u64(running.dispatch.map_or(0, |dispatch| dispatch.epoch()));
+        print_str(b"/");
+        print_u64(running.route.map_or(0, |route| route.badge()));
+        print_str(b"/");
+        print_u64(running.binding.map_or(0, |binding| binding.executor_id));
+        print_str(b"/");
+        print_u64(running.binding.map_or(0, |binding| binding.reply_object));
+        print_str(b"/");
+        print_u64(running.physical.map_or(0, |source| source.tcb));
+        print_str(b" quarantined=");
+        print_u64(u64::from(running.quarantined.unwrap_or(false)));
+        print_str(b"\n");
+    }
+    if let Some(oldest) = ingress_hold.oldest {
+        print_str(b"[service-loop-exit-owner] oldest pi/pid/generation/tid/badge/reply/executor/admission=");
+        print_u64(oldest.binding.pi as u64);
+        print_str(b"/");
+        print_u64(oldest.binding.process.pid as u64);
+        print_str(b"/");
+        match oldest.binding.process.generation {
+            nt_types::ProcessGeneration::Hosted(generation) => {
+                print_str(b"hosted:");
+                print_u64(generation);
+            }
+            nt_types::ProcessGeneration::Temporary(generation) => {
+                print_str(b"temporary:");
+                print_u64(generation);
+            }
+        }
+        print_str(b"/");
+        print_u64(oldest.binding.tid);
+        print_str(b"/");
+        print_u64(oldest.binding.badge);
+        print_str(b"/");
+        print_u64(oldest.reply);
+        print_str(b"/");
+        print_u64(oldest.executor);
+        print_str(b"/");
+        print_u64(oldest.admission_sequence);
+        print_str(b"\n");
     }
     nt_handler.loop_ctx = nt_handler.loop_ctx.map(|ctx| ctx.checkpoint_live());
     // Attribute a busy snapshot reserve before the terminal durability proof attempts to

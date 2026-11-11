@@ -379,6 +379,11 @@ static WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED: AtomicBool = AtomicBool::new(false);
 // A v2 fold may advance the global WAL base only after any SYSTEM suffix is represented by
 // an exact CM checkpoint image. Boot replay can leave such a suffix even before a new mutation.
 static SYSTEM_WAL_FOLD_REQUIRED: AtomicBool = AtomicBool::new(false);
+
+/// Terminal service-loop evidence only; observing this flag must not checkpoint it.
+pub(crate) fn snapshot_dirty_for_diagnostics() -> bool {
+    WRITABLE_FS_SNAPSHOT_DIRTY.load(Ordering::Acquire)
+}
 /// The mounted filesystem's durable snapshot format, recorded before it is published.
 /// Generic checkpoints preserve this format; CM mutations use the v2 WAL when mounted.
 static WRITABLE_FS_MOUNTED_WAL_FORMAT: AtomicBool = AtomicBool::new(false);
