@@ -19,7 +19,10 @@ fn retained_seh_receive_services_irq_before_blocking_without_replaying_reply() {
     let blocking = receive
         .find("runtime::receive(execution, ch.tcb,")
         .expect("physical receive selected by timer checkpoint");
-    assert!(receive[blocking..].contains("serviced_scheduler_yield || !timer_checkpoint"));
+    let formula = receive.find("let blocking = serviced_scheduler_yield || !timer_checkpoint;")
+        .expect("exact retained receive blocking rule");
+    assert!(formula < blocking);
+    assert!(receive[blocking..].contains("runtime::receive(execution, ch.tcb, blocking)"));
     assert!(receive[..blocking].contains("let timer_checkpoint = !retained_seh"),
         "retained SEH must always use the blocking receive");
     assert!(
@@ -73,7 +76,10 @@ fn non_yielding_syscall_receive_services_latched_irq_before_blocking() {
     let blocking = receive
         .find("runtime::receive(execution, ch.tcb,")
         .expect("physical receive selected by timer checkpoint");
-    assert!(receive[blocking..].contains("serviced_scheduler_yield || !timer_checkpoint"));
+    let formula = receive.find("let blocking = serviced_scheduler_yield || !timer_checkpoint;")
+        .expect("exact retained receive blocking rule");
+    assert!(formula < blocking);
+    assert!(receive[blocking..].contains("runtime::receive(execution, ch.tcb, blocking)"));
     assert!(receive[..blocking].contains("ch.caps.kind == ReqKind::Irp || ch.caps.kernel_irq_yield"),
         "non-yielding syscall channels must always use the blocking receive");
     assert!(

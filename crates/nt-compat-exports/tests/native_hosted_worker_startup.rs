@@ -291,6 +291,21 @@ fn serviced_scheduler_yield_blocks_on_exact_worker_receive_despite_renewed_timer
     });
     assert!(armed, "record the one-shot probe before entering the native receive effect");
 
+    let blocking_formula = loop_body.stmts[..physical].iter().any(|statement| {
+        let syn::Stmt::Local(local) = statement else { return false; };
+        let syn::Pat::Ident(binding) = &local.pat else { return false; };
+        let Some(init) = &local.init else { return false; };
+        binding.ident == "blocking" && matches!(&*init.expr, Expr::Binary(blocking)
+            if matches!(&blocking.op, syn::BinOp::Or(_))
+                && matches!(&*blocking.left, Expr::Path(path)
+                    if path.path.is_ident("serviced_scheduler_yield"))
+                && matches!(&*blocking.right, Expr::Unary(unary)
+                    if matches!(&unary.op, syn::UnOp::Not(_))
+                        && matches!(&*unary.expr, Expr::Path(path)
+                            if path.path.is_ident("timer_checkpoint"))))
+    });
+    assert!(blocking_formula, "the exact worker receive keeps its timer fairness rule");
+
     struct PhysicalProbe(bool);
     impl<'ast> Visit<'ast> for PhysicalProbe {
         fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
@@ -302,14 +317,8 @@ fn serviced_scheduler_yield_blocks_on_exact_worker_receive_despite_renewed_timer
                         if path.path.is_ident("execution"))
                     && matches!(&call.args[1], Expr::Field(field)
                         if matches!(&field.member, syn::Member::Named(name) if name == "tcb"))
-                    && matches!(&call.args[2], Expr::Binary(blocking)
-                        if matches!(&blocking.op, syn::BinOp::Or(_))
-                            && matches!(&*blocking.left, Expr::Path(path)
-                                if path.path.is_ident("serviced_scheduler_yield"))
-                            && matches!(&*blocking.right, Expr::Unary(unary)
-                                if matches!(&unary.op, syn::UnOp::Not(_))
-                                    && matches!(&*unary.expr, Expr::Path(path)
-                                        if path.path.is_ident("timer_checkpoint"))));
+                    && matches!(&call.args[2], Expr::Path(path)
+                        if path.path.is_ident("blocking"));
             }
             syn::visit::visit_expr_call(self, call);
         }
