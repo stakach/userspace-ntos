@@ -20,6 +20,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 mod oom_budget;
 #[path = "allocator_free_list.rs"]
 mod free_list;
+use free_list::align_up;
 #[path = "allocator_walk_observation.rs"]
 mod walk_observation;
 use walk_observation::WalkCounter;
@@ -367,11 +368,6 @@ fn report_oom(size: usize, align: usize, cur: usize, start: usize, requested_end
     crate::debug_put_char(b'\n');
 }
 
-fn align_up(value: usize, align: usize) -> Option<usize> {
-    debug_assert!(align.is_power_of_two());
-    Some(value.checked_add(align - 1)? & !(align - 1))
-}
-
 fn block_size(size: usize) -> Option<usize> {
     align_up(size.max(FREE_NODE_SIZE), ALLOC_GRANULE)
 }
@@ -618,53 +614,32 @@ unsafe fn insert_free_block(start: usize, size: usize) {
 }
 
 unsafe fn alloc_from_free_list(layout: Layout, needed: usize) -> *mut u8 {
-    let align = layout.align().max(ALLOC_GRANULE);
-    let mut prev_link = FREE_HEAD;
-    let mut cur = unsafe { read_word(FREE_HEAD) };
-    let mut visits = 0usize;
-    while cur != 0 {
-        visits += 1;
-        let size = unsafe { free_node_size(cur) };
-        let next = unsafe { free_node_next(cur) };
-        let mut start = match align_up(cur, align) {
-            Some(start) => start,
-            None => {
-                ALLOC_WALK.record(transient_heap_size() != 0, visits);
-                return null_mut();
+    let list = free_list::FreeList {
+        data: DATA,
+        counter: CTR,
+        head: FREE_HEAD,
+    };
+    match unsafe { list.take_fit(layout.align(), needed) } {
+        Ok(taken) => {
+            let root_heap = transient_heap_size() != 0;
+            if let Some(visits) = taken.prefix_reinsert_visits {
+                INSERT_WALK.record(root_heap, visits);
             }
-        };
-        let mut prefix = start - cur;
-        if prefix != 0 && prefix < FREE_NODE_SIZE {
-            start = match align_up(cur + FREE_NODE_SIZE, align) {
-                Some(start) => start,
-                None => {
-                    ALLOC_WALK.record(transient_heap_size() != 0, visits);
-                    return null_mut();
-                }
-            };
-            prefix = start - cur;
+            if let Some(visits) = taken.suffix_reinsert_visits {
+                INSERT_WALK.record(root_heap, visits);
+            }
+            ALLOC_WALK.record(root_heap, taken.inspected);
+            taken.address.map_or(null_mut(), |address| address as *mut u8)
         }
-        if prefix
-            .checked_add(needed)
-            .is_some_and(|total| total <= size)
-        {
-            unsafe { write_word(prev_link, next) };
-            if prefix >= FREE_NODE_SIZE {
-                unsafe { insert_free_block(cur, prefix) };
-            }
-            let suffix_start = start + needed;
-            let suffix = cur + size - suffix_start;
-            if suffix >= FREE_NODE_SIZE {
-                unsafe { insert_free_block(suffix_start, suffix) };
-            }
-            ALLOC_WALK.record(transient_heap_size() != 0, visits);
-            return start as *mut u8;
-        }
-        prev_link = cur + WORD;
-        cur = next;
+        Err(error) => allocator_corruption(
+            error.corruption.operation,
+            error.owner_start,
+            error.owner_size,
+            error.corruption.node,
+            error.corruption.size,
+            error.corruption.next,
+        ),
     }
-    ALLOC_WALK.record(transient_heap_size() != 0, visits);
-    null_mut()
 }
 
 unsafe fn grow_in_place_from_adjacent_free(start: usize, old_size: usize, new_size: usize) -> bool {

@@ -27,6 +27,25 @@ pub(super) struct AdjacentGrowth {
     pub inspected: usize,
 }
 
+pub(super) struct TakeFit {
+    pub address: Option<usize>,
+    pub inspected: usize,
+    pub prefix_reinsert_visits: Option<usize>,
+    pub suffix_reinsert_visits: Option<usize>,
+}
+
+#[derive(Debug)]
+pub(super) struct TakeFitError {
+    pub corruption: Corruption,
+    pub owner_start: usize,
+    pub owner_size: usize,
+}
+
+pub(super) fn align_up(value: usize, align: usize) -> Option<usize> {
+    debug_assert!(align.is_power_of_two());
+    Some(value.checked_add(align - 1)? & !(align - 1))
+}
+
 impl FreeList {
     unsafe fn read(addr: usize) -> usize {
         unsafe { read_volatile(addr as *const usize) }
@@ -38,6 +57,72 @@ impl FreeList {
 
     fn corrupt(operation: &'static [u8], node: usize, size: usize, next: usize) -> Corruption {
         Corruption { operation, node, size, next }
+    }
+
+    /// First-fit selection and reinsertion of the unused aligned prefix and suffix. The
+    /// reinsertions deliberately use the ordinary ordered insertion path; callers can count
+    /// each traversal separately while the split transaction remains unchanged.
+    pub(super) unsafe fn take_fit(
+        &self,
+        align: usize,
+        needed: usize,
+    ) -> Result<TakeFit, TakeFitError> {
+        let align = align.max(GRANULE);
+        let mut prev_link = self.head;
+        let mut cur = unsafe { Self::read(self.head) };
+        let mut inspected = 0usize;
+        while cur != 0 {
+            inspected += 1;
+            let size = unsafe { Self::read(cur) };
+            let next = unsafe { Self::read(cur + WORD) };
+            let mut start = match align_up(cur, align) {
+                Some(start) => start,
+                None => return Ok(TakeFit {
+                    address: None, inspected,
+                    prefix_reinsert_visits: None, suffix_reinsert_visits: None,
+                }),
+            };
+            let mut prefix = start - cur;
+            if prefix != 0 && prefix < NODE_SIZE {
+                start = match align_up(cur + NODE_SIZE, align) {
+                    Some(start) => start,
+                    None => return Ok(TakeFit {
+                        address: None, inspected,
+                        prefix_reinsert_visits: None, suffix_reinsert_visits: None,
+                    }),
+                };
+                prefix = start - cur;
+            }
+            if prefix.checked_add(needed).is_some_and(|total| total <= size) {
+                unsafe { Self::write(prev_link, next) };
+                let prefix_reinsert_visits = if prefix >= NODE_SIZE {
+                    Some(unsafe { self.insert(cur, prefix) }.map_err(|corruption| TakeFitError {
+                        corruption, owner_start: cur, owner_size: prefix,
+                    })?)
+                } else {
+                    None
+                };
+                let suffix_start = start + needed;
+                let suffix = cur + size - suffix_start;
+                let suffix_reinsert_visits = if suffix >= NODE_SIZE {
+                    Some(unsafe { self.insert(suffix_start, suffix) }.map_err(|corruption| TakeFitError {
+                        corruption, owner_start: suffix_start, owner_size: suffix,
+                    })?)
+                } else {
+                    None
+                };
+                return Ok(TakeFit {
+                    address: Some(start), inspected,
+                    prefix_reinsert_visits, suffix_reinsert_visits,
+                });
+            }
+            prev_link = cur + WORD;
+            cur = next;
+        }
+        Ok(TakeFit {
+            address: None, inspected,
+            prefix_reinsert_visits: None, suffix_reinsert_visits: None,
+        })
     }
 
     /// Insert one dead allocation and immediately trim the coalesced node if it reaches the bump

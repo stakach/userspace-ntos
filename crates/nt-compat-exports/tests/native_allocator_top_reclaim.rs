@@ -127,3 +127,38 @@ fn adjacent_growth_stops_at_first_free_block_past_target() {
     assert_eq!(hit.inspected, 1);
     assert_eq!(heap.blocks().len(), 127);
 }
+
+#[test]
+fn first_fit_preserves_aligned_prefix_suffix_and_earlier_free_nodes() {
+    let mut heap = Heap::new(1024);
+    let high = 128 + ((16 + 64 - ((heap.data + 128) % 64)) % 64);
+    heap.insert(16, NODE);
+    heap.insert(high, 192);
+
+    let taken = unsafe { heap.list.take_fit(64, 32).unwrap() };
+    assert_eq!(taken.address, Some(heap.data + high + 48));
+    assert_eq!(taken.inspected, 2);
+    assert_eq!(taken.prefix_reinsert_visits, Some(1));
+    assert_eq!(taken.suffix_reinsert_visits, Some(2));
+    assert_eq!(heap.blocks(), [(16, NODE), (high, 48), (high + 80, 112)]);
+    assert_eq!(heap.bump(), 1024);
+}
+
+#[test]
+fn first_fit_preserves_top_trim_when_a_top_ending_node_is_present() {
+    let mut heap = Heap::new(512);
+    let high = 256 + ((16 + 64 - ((heap.data + 256) % 64)) % 64);
+    let node = heap.data + high;
+    // Ordinarily insert() trims a top-ending node immediately. Seed this boundary directly to
+    // prove that take_fit retains the old split path's top-trim behavior as well.
+    heap.words[1] = node;
+    unsafe {
+        (node as *mut usize).write(512 - high);
+        ((node + WORD) as *mut usize).write(0);
+    }
+
+    let taken = unsafe { heap.list.take_fit(64, 32).unwrap() };
+    assert_eq!(taken.address, Some(node + 48));
+    assert_eq!(heap.bump(), high + 80);
+    assert_eq!(heap.blocks(), [(high, 48)]);
+}
