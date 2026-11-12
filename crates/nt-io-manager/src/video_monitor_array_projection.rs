@@ -1,6 +1,7 @@
 //! Exact ownership of VideoPort's monitor array returned through an IOCTL pointer.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::source_irp_auxiliary::SourcePoolAllocationIdentity;
 use crate::HostedDomainIdentity;
@@ -51,6 +52,191 @@ pub enum MonitorProjectionError {
     InvalidIdentity,
     InvalidArray,
     InvalidTransition,
+}
+
+/// Exact provider-owned PDO behind an entry in a transferred monitor array. The provider
+/// cookie identifies its current address space; the generation identifies this physical child
+/// registration even if a later child reuses the same native address.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MonitorPdoIdentity {
+    provider: HostedDomainIdentity,
+    address: u64,
+    generation: u64,
+}
+
+impl MonitorPdoIdentity {
+    pub fn new(
+        provider: HostedDomainIdentity,
+        address: u64,
+        generation: u64,
+    ) -> Result<Self, MonitorProjectionError> {
+        if provider.domain_id.raw() == 0 || provider.cookie == 0 || address == 0
+            || address & 7 != 0 || generation == 0
+        {
+            return Err(MonitorProjectionError::InvalidIdentity);
+        }
+        Ok(Self { provider, address, generation })
+    }
+
+    pub const fn provider(self) -> HostedDomainIdentity { self.provider }
+    pub const fn address(self) -> u64 { self.address }
+    pub const fn generation(self) -> u64 { self.generation }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReferenceEffect {
+    Acquire,
+    Release,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReferencePhase {
+    Unacquired,
+    Acquiring(u64),
+    Acquired,
+    Releasing(u64),
+    Released,
+    Uncertain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReferenceEntry {
+    pdo: MonitorPdoIdentity,
+    phase: ReferencePhase,
+}
+
+/// A move-only receipt for one exact native reference or dereference attempt. A rejected receipt
+/// leaves the ledger's in-flight effect owned; only its matching completion may advance it.
+#[derive(Debug)]
+#[must_use = "complete or quarantine the exact PDO reference effect"]
+pub struct MonitorPdoReferenceTicket {
+    ledger: u64,
+    sequence: u64,
+    pdo: MonitorPdoIdentity,
+    effect: ReferenceEffect,
+}
+
+impl MonitorPdoReferenceTicket {
+    pub const fn pdo(&self) -> MonitorPdoIdentity { self.pdo }
+}
+
+static NEXT_REFERENCE_LEDGER: AtomicU64 = AtomicU64::new(1);
+
+/// Records per-array PDO reference ownership before each native effect. BusRelations owns a
+/// separate reference series; aggregate canonical pointer counts never identify this array's
+/// references or authorize their release.
+#[derive(Debug)]
+pub struct MonitorPdoReferenceLedger {
+    id: u64,
+    next_sequence: u64,
+    entries: Vec<ReferenceEntry>,
+}
+
+impl MonitorPdoReferenceLedger {
+    pub fn new(pdos: &[MonitorPdoIdentity]) -> Result<Self, MonitorProjectionError> {
+        let provider = pdos.first().map(|pdo| pdo.provider);
+        if pdos.iter().any(|pdo| Some(pdo.provider) != provider
+            || pdo.provider.domain_id.raw() == 0 || pdo.provider.cookie == 0
+            || pdo.address == 0 || pdo.generation == 0)
+            || pdos.iter().enumerate().any(|(index, pdo)| pdos[..index].iter()
+                .any(|previous| previous.provider == pdo.provider
+                    && previous.address == pdo.address))
+        {
+            return Err(MonitorProjectionError::InvalidIdentity);
+        }
+        let id = NEXT_REFERENCE_LEDGER.fetch_update(
+            Ordering::AcqRel, Ordering::Acquire, |next| next.checked_add(1),
+        ).map_err(|_| MonitorProjectionError::InvalidTransition)?;
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(pdos.len())
+            .map_err(|_| MonitorProjectionError::InvalidArray)?;
+        entries.extend(pdos.iter().copied().map(|pdo| ReferenceEntry {
+            pdo, phase: ReferencePhase::Unacquired,
+        }));
+        Ok(Self { id, next_sequence: 1, entries })
+    }
+
+    fn ticket(&mut self, index: usize, effect: ReferenceEffect) -> Result<MonitorPdoReferenceTicket, MonitorProjectionError> {
+        let sequence = self.next_sequence;
+        self.next_sequence = sequence.checked_add(1)
+            .ok_or(MonitorProjectionError::InvalidTransition)?;
+        let entry = &mut self.entries[index];
+        entry.phase = match effect {
+            ReferenceEffect::Acquire => ReferencePhase::Acquiring(sequence),
+            ReferenceEffect::Release => ReferencePhase::Releasing(sequence),
+        };
+        Ok(MonitorPdoReferenceTicket { ledger: self.id, sequence, pdo: entry.pdo, effect })
+    }
+
+    pub fn begin_acquire(&mut self) -> Result<Option<MonitorPdoReferenceTicket>, MonitorProjectionError> {
+        if self.entries.iter().any(|entry| matches!(entry.phase,
+            ReferencePhase::Acquiring(_) | ReferencePhase::Releasing(_)
+                | ReferencePhase::Released | ReferencePhase::Uncertain))
+        {
+            return Err(MonitorProjectionError::InvalidTransition);
+        }
+        match self.entries.iter().position(|entry| entry.phase == ReferencePhase::Unacquired) {
+            Some(index) => self.ticket(index, ReferenceEffect::Acquire).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn settle(
+        &mut self,
+        ticket: MonitorPdoReferenceTicket,
+        effect: ReferenceEffect,
+        next: ReferencePhase,
+    ) -> Result<(), MonitorProjectionError> {
+        let entry = self.entries.iter_mut().find(|entry| entry.pdo == ticket.pdo)
+            .ok_or(MonitorProjectionError::InvalidIdentity)?;
+        let expected = match effect {
+            ReferenceEffect::Acquire => ReferencePhase::Acquiring(ticket.sequence),
+            ReferenceEffect::Release => ReferencePhase::Releasing(ticket.sequence),
+        };
+        if ticket.ledger != self.id || ticket.effect != effect || entry.phase != expected
+        {
+            return Err(MonitorProjectionError::InvalidTransition);
+        }
+        entry.phase = next;
+        Ok(())
+    }
+
+    pub fn complete_acquire(&mut self, ticket: MonitorPdoReferenceTicket) -> Result<(), MonitorProjectionError> {
+        self.settle(ticket, ReferenceEffect::Acquire, ReferencePhase::Acquired)
+    }
+
+    /// Only a proven no-effect native refusal may release an acquisition claim. Previously
+    /// acquired entries remain owned and can then be drained by `begin_release`.
+    pub fn cancel_unentered_acquire(&mut self, ticket: MonitorPdoReferenceTicket) -> Result<(), MonitorProjectionError> {
+        self.settle(ticket, ReferenceEffect::Acquire, ReferencePhase::Unacquired)
+    }
+
+    pub fn begin_release(&mut self) -> Result<Option<MonitorPdoReferenceTicket>, MonitorProjectionError> {
+        if self.entries.iter().any(|entry| matches!(entry.phase,
+            ReferencePhase::Acquiring(_) | ReferencePhase::Releasing(_)
+                | ReferencePhase::Uncertain))
+        {
+            return Err(MonitorProjectionError::InvalidTransition);
+        }
+        match self.entries.iter().position(|entry| entry.phase == ReferencePhase::Acquired) {
+            Some(index) => self.ticket(index, ReferenceEffect::Release).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub fn complete_release(&mut self, ticket: MonitorPdoReferenceTicket) -> Result<(), MonitorProjectionError> {
+        self.settle(ticket, ReferenceEffect::Release, ReferencePhase::Released)
+    }
+
+    pub fn mark_uncertain(&mut self, ticket: MonitorPdoReferenceTicket) -> Result<(), MonitorProjectionError> {
+        let effect = ticket.effect;
+        self.settle(ticket, effect, ReferencePhase::Uncertain)
+    }
+
+    pub fn all_released(&self) -> bool {
+        self.entries.iter().all(|entry| matches!(entry.phase,
+            ReferencePhase::Unacquired | ReferencePhase::Released))
+    }
 }
 
 /// Only VideoPort transfers counted PDO references with its monitor array. Other
