@@ -2159,7 +2159,7 @@ unsafe fn service_wait_admit_with_transfer(
         NestedWaitTransfer::InCallback { lane: captured, token } => captured == lane
             && win32k_glue::in_callback_nested_wait_token_is_current(
                 pending.snapshot.client, captured, token,
-            ) && transfer.admits(pending.snapshot.client, lane),
+            ),
         _ => transfer.admits(pending.snapshot.client, lane),
     };
     if pending.snapshot.callback_token != transfer.token() {

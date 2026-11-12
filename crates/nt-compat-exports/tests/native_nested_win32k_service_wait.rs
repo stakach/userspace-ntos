@@ -66,7 +66,28 @@ fn nested_service_wait_keeps_callback_and_root_reply_owned() {
         .next()
         .unwrap();
     assert!(handoff.contains("restore_pending_service_wait_dispatch(pending)"));
-    assert!(handoff.contains("RetainedWaitAdmission::Indeterminate => retained_failure = true"));
+    let indeterminate = handoff.split("RetainedWaitAdmission::Indeterminate =>")
+        .nth(1).expect("physical uncertainty has its own retained branch")
+        .split("\n        }").next().unwrap();
+    assert!(indeterminate.contains("retained_failure = true"),
+        "an uncertain service wait must retain its caller Reply");
+}
+
+#[test]
+fn parked_service_token_does_not_hide_its_callback_origin() {
+    let admission = SERVICE
+        .split("unsafe fn service_wait_admit_with_transfer(")
+        .nth(1).expect("service wait admission")
+        .split("unsafe fn service_wait_admit_current(").next().unwrap();
+    let callback_origin = admission
+        .split("NestedWaitTransfer::InCallback { lane: captured, token } =>")
+        .nth(1).expect("nested callback admission")
+        .split("_ =>").next().unwrap();
+    assert!(callback_origin.contains("in_callback_nested_wait_token_is_current"));
+    assert!(!callback_origin.contains("transfer.admits("),
+        "the parked service token is on top; the lane admission validates the callback beneath it");
+    assert!(admission.contains("admit_in_callback_service_wait_external_owned("),
+        "the exact callback and service tokens must be checked together by the lane owner");
 }
 
 #[test]
