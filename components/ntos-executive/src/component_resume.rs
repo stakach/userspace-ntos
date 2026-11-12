@@ -68,6 +68,67 @@ pub(super) fn trace_preclaim_refusal(
     }
 }
 
+/// Sample the exact selected source owner from its ready Work's bounded retry trace.
+/// Global resume counters can be exhausted long before this later boot frontier appears.
+pub(crate) unsafe fn trace_source_selected_resume_snapshot(
+    lane: nt_component_suspension::LaneHandle,
+    key: nt_component_suspension::SuspensionKey,
+    owner: SuspensionOwner,
+) {
+    let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
+    let Some(frame) = lanes.frame(lane, key).ok().flatten().filter(|frame| frame.owner == owner)
+    else { return };
+    let (pending_kind, reply_ready, client_ready, eligible) = match frame.continuation {
+        ComponentNativeContinuation::Hosted(hosted) => {
+            let kind = match hosted.pending {
+                PendingComponentDispatch::Provider(_) => 1,
+                PendingComponentDispatch::Lpc(_) => 2,
+                PendingComponentDispatch::Receive(_) => 3,
+                PendingComponentDispatch::ServiceWait(_) => 4,
+                PendingComponentDispatch::RootMaintenance(_) => 5,
+                PendingComponentDispatch::NestedRestore(_) => 6,
+            };
+            let reply = hosted.return_target.can_resume();
+            let client = win32k_glue::win32k_client_context_is_admitted(hosted.pending.client());
+            (kind, reply, client, reply && client && kind != 5 && kind != 6)
+        }
+        ComponentNativeContinuation::Kernel(_) => (7, false, false, false),
+        ComponentNativeContinuation::RootIngress(_) => (8, false, false, false),
+    };
+    let oldest = lanes.next_resumable_if(|_| true);
+    let target = lanes.next_resumable_if(|candidate|
+        candidate.key == key && candidate.owner == owner && eligible);
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *const ExecNtHandler;
+    let now = monotonic_time_100ns();
+    let deadline = (&*core::ptr::addr_of!(WAKE)).next_deadline();
+    let gates = u64::from(handler.is_null() || !runtime_ready(handler))
+        | (u64::from(is_running()) << 1)
+        | (u64::from(super::root_add_device_exclusive_pending()) << 2)
+        | (u64::from(super::root_queued_callback_exclusive_pending()) << 3)
+        | (u64::from(crate::driver_launch::unsettled_queued_callback()) << 4)
+        | (u64::from(crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()) << 5)
+        | (u64::from(crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()) << 6);
+    print_str(b"[source-selected-resume] lane/gen/key/owner/kind/reply/client/eligible/busy/oldest-lane/oldest-key/exact-candidate/gates/now/deadline=");
+    for value in [lane.index as u64, lane.generation, key.id, owner.dispatch_id,
+        pending_kind, u64::from(reply_ready), u64::from(client_ready), u64::from(eligible),
+        u64::from(lanes.execution_busy()),
+        oldest.as_ref().map_or(u64::MAX, |resume| resume.lane.index as u64),
+        oldest.as_ref().map_or(0, |resume| resume.suspension.key.id),
+        u64::from(target.as_ref().is_some_and(|resume| resume.lane == lane)),
+        gates, now, deadline.unwrap_or(0)] {
+        print_str(b"/"); print_hex_u64(value);
+    }
+    print_str(b"\n");
+    for identity in lanes.terminal_identities() {
+        let Ok(binding) = lanes.binding(identity.lane()) else { continue };
+        let Ok(view) = lanes.terminal(identity, binding.reply_object) else { continue };
+        if let nt_component_suspension::TerminalPhase::Invoking { attempt, .. } = view.phase {
+            trace_resume_frame(b"source-terminal-invoking", identity.lane(), identity.key(),
+                identity.owner(), attempt);
+        }
+    }
+}
+
 unsafe fn trace_selected_resume_gate(stage: &'static [u8], detail: u64) {
     if !resume_trace_sample(&RESUME_GATE_TRACES) { return; }
     let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);

@@ -391,6 +391,9 @@ pub(crate) unsafe fn trace_source_terminal_lane(
             nt_component_suspension::SuspensionPhase::MaintenanceResuming { .. } => 5,
             _ => 6,
         };
+        let exact_work = frame_route == Some(work_route)
+            && frame_dispatch == Some(work_dispatch)
+            && frame_reply == Some(work_reply);
         crate::print_str(b"[source-terminal-frame] sample/lane/gen/phase/kind/key/owner/route-domain/route-gen/route-exec/epoch/reply/exact-work/parent-blocks-resume=");
         for value in [sample, u64::from(frame_lane.index), frame_lane.generation,
             phase, frame.key.kind as u64, frame.key.id, frame.owner.dispatch_id,
@@ -399,13 +402,19 @@ pub(crate) unsafe fn trace_source_terminal_lane(
             frame_route.map_or(0, |route| route.identity().executor),
             frame_dispatch.map_or(0, |dispatch| dispatch.epoch()),
             frame_reply.unwrap_or(0),
-            u64::from(frame_route == Some(work_route)
-                && frame_dispatch == Some(work_dispatch)
-                && frame_reply == Some(work_reply)),
+            u64::from(exact_work),
             u64::from(source_ioctl_parent_blocks_provider_resume(frame.owner.dispatch_id))] {
             crate::print_str(b"/"); crate::print_hex_u64(value);
         }
         crate::print_str(b"\n");
+        if exact_work
+            && lanes().phase(frame_lane) == Ok(nt_component_suspension::LanePhase::Suspended)
+            && matches!(frame.phase, nt_component_suspension::SuspensionPhase::Selected { .. })
+        {
+            crate::component_resume::trace_source_selected_resume_snapshot(
+                frame_lane, frame.key, frame.owner,
+            );
+        }
     }
     for (index, parent) in (&*core::ptr::addr_of!(PARENTS)).iter().enumerate() {
         let Some(parent) = parent.as_ref() else { continue };
