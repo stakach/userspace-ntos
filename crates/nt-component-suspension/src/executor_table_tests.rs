@@ -197,13 +197,13 @@ fn routed_arrival_resumes_exactly_the_executor_parked_on_that_wait() {
 }
 
 #[test]
-fn stale_dispatch_generation_is_refused_and_the_exact_arrival_stays_deliverable() {
+fn mismatched_dispatch_generation_is_refused_and_the_exact_arrival_stays_deliverable() {
     let mut routes = Routes::new();
     let route = routes.route();
     let mut root = Root::new(2, 2);
     let waiter = root.turn(Unrouted, Parked(wait(route, 5)));
-    for stale in [4, 6] {
-        assert_eq!(root.refused(Routed(wait(route, stale))), ExecutorError::StaleDispatch);
+    for other in [4, 6] {
+        assert_eq!(root.refused(Routed(wait(route, other))), ExecutorError::WrongDispatch);
     }
     assert_eq!(root.state(waiter), ExecutorState::Parked(wait(route, 5)));
     assert_eq!(root.turn(Routed(wait(route, 5)), Idle), waiter);
@@ -281,7 +281,7 @@ fn done_retires_the_executor_and_a_reused_slot_gets_a_new_generation() {
 
 #[test]
 fn unknown_and_stale_handles_are_refused() {
-    let mut root = Root::new(2, 1);
+    let root = Root::new(2, 1);
     let known = root.executors[0];
     let beyond = ExecutorHandle { index: 1, generation: known.generation() };
     let stale = ExecutorHandle { index: 0, generation: known.generation() + 1 };
@@ -300,7 +300,7 @@ fn late_arrival_for_a_retired_occupant_cannot_wake_the_slots_new_occupant() {
     // A replacement executor in the same slot waits for a later job on the same route.
     let new = root.register().unwrap();
     assert_eq!(root.turn(Unrouted, Parked(wait(route, 6))), new);
-    assert_eq!(root.refused(Routed(wait(route, 5))), ExecutorError::StaleDispatch);
+    assert_eq!(root.refused(Routed(wait(route, 5))), ExecutorError::WrongDispatch);
     assert_eq!(root.table.state(old), Err(ExecutorError::StaleGeneration));
     assert_eq!(root.turn(Routed(wait(route, 6)), Idle), new);
 }

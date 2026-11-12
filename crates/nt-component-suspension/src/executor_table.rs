@@ -7,7 +7,7 @@
 
 use crate::{peer_registry::PeerRoute, LaneDispatchIdentity};
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TABLE: AtomicU64 = AtomicU64::new(1);
 
@@ -38,8 +38,7 @@ pub struct ExecutorWait {
 impl ExecutorWait {
     /// A dispatch is one job on one lane, so it can only be awaited on that lane's own route.
     pub fn new(route: PeerRoute, dispatch: LaneDispatchIdentity) -> Option<Self> {
-        let _ = (route, dispatch);
-        None
+        (dispatch.lane() == route.identity().lane).then_some(Self { route, dispatch })
     }
 
     pub const fn route(self) -> PeerRoute {
@@ -97,7 +96,7 @@ pub enum ExecutorError {
     /// No executor is parked on this route.
     NotParked,
     /// The route's waiter is parked on a different dispatch generation.
-    StaleDispatch,
+    WrongDispatch,
     /// Another executor is already parked on this route.
     RouteOccupied,
 }
@@ -162,23 +161,85 @@ impl ExecutorTable {
         capacity: usize,
         counter: &AtomicU64,
     ) -> Result<(Self, RunToken), ExecutorError> {
-        let _ = counter;
-        Ok((Self { id: 0, capacity, slots: Vec::new() }, RunToken { table: 0 }))
+        if capacity == 0 || capacity > u32::MAX as usize {
+            return Err(ExecutorError::NoCapacity);
+        }
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(capacity).map_err(|_| ExecutorError::NoCapacity)?;
+        // Burn the identity even if this table is dropped: a leftover token names no later table.
+        let id = counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+            .map_err(|_| ExecutorError::IdentityExhausted)?;
+        Ok((Self { id, capacity, slots }, RunToken { table: id }))
     }
 
     /// Register an executor that is blocked at loop-top on its own endpoint.
     pub fn register(&mut self, root: &RunToken) -> Result<ExecutorHandle, ExecutorError> {
-        let _ = (root, self.id, self.capacity, &self.slots);
-        Err(ExecutorError::NotFound)
+        if root.table != self.id {
+            return Err(ExecutorError::WrongTable);
+        }
+        // A retired slot that cannot take a new generation stays retired for good.
+        let reusable = self.slots.iter().position(|slot| {
+            slot.state == ExecutorState::Retired && slot.generation < u64::MAX
+        });
+        let index = match reusable {
+            Some(index) => {
+                self.slots[index].generation += 1;
+                self.slots[index].state = ExecutorState::Idle;
+                index
+            }
+            None if self.slots.len() < self.capacity => {
+                self.slots.push(Slot { generation: 1, state: ExecutorState::Idle });
+                self.slots.len() - 1
+            }
+            None => return Err(ExecutorError::NoCapacity),
+        };
+        Ok(self.handle(index))
     }
 
     pub fn state(&self, executor: ExecutorHandle) -> Result<ExecutorState, ExecutorError> {
-        let _ = executor;
-        Err(ExecutorError::NotFound)
+        let slot = self.slots.get(executor.index as usize).ok_or(ExecutorError::NotFound)?;
+        if slot.generation != executor.generation {
+            return Err(ExecutorError::StaleGeneration);
+        }
+        Ok(slot.state)
     }
 
     pub fn running(&self) -> Option<ExecutorHandle> {
-        None
+        self.position(|state| state == ExecutorState::Running).map(|index| self.handle(index))
+    }
+
+    fn handle(&self, index: usize) -> ExecutorHandle {
+        ExecutorHandle { index: index as u32, generation: self.slots[index].generation }
+    }
+
+    fn position(&self, matches: impl Fn(ExecutorState) -> bool) -> Option<usize> {
+        self.slots.iter().position(|slot| matches(slot.state))
+    }
+
+    /// The route-to-waiter map is this view of the slots, so it cannot disagree with them.
+    fn waiter(&self, route: PeerRoute) -> Option<(usize, ExecutorWait)> {
+        self.slots.iter().enumerate().find_map(|(index, slot)| match slot.state {
+            ExecutorState::Parked(wait) if wait.route == route => Some((index, wait)),
+            _ => None,
+        })
+    }
+
+    fn select(&self, cause: ExecutorResume) -> Result<usize, ExecutorError> {
+        match cause {
+            ExecutorResume::Unrouted => self
+                .position(|state| state == ExecutorState::Idle)
+                .ok_or(ExecutorError::NoIdleExecutor),
+            ExecutorResume::Routed(arrival) => match self.waiter(arrival.route) {
+                Some((index, wait)) if wait == arrival => Ok(index),
+                Some(_) => Err(ExecutorError::WrongDispatch),
+                None => Err(ExecutorError::NotParked),
+            },
+            ExecutorResume::RouteRetired(route) => self
+                .waiter(route)
+                .map(|(index, _)| index)
+                .ok_or(ExecutorError::NotParked),
+        }
     }
 
     /// Lend the run token to the one executor this cause selects. A refusal returns the token
@@ -188,8 +249,15 @@ impl ExecutorTable {
         token: RunToken,
         cause: ExecutorResume,
     ) -> Result<ExecutorRun, (ExecutorError, RunToken)> {
-        let _ = cause;
-        Err((ExecutorError::NotFound, token))
+        if token.table != self.id {
+            return Err((ExecutorError::WrongTable, token));
+        }
+        let index = match self.select(cause) {
+            Ok(index) => index,
+            Err(error) => return Err((error, token)),
+        };
+        self.slots[index].state = ExecutorState::Running;
+        Ok(ExecutorRun { executor: self.handle(index), cause, token })
     }
 
     /// Record the running executor's yield and return the run token to root. A refusal leaves
@@ -199,8 +267,20 @@ impl ExecutorTable {
         run: ExecutorRun,
         yielded: ExecutorYield,
     ) -> Result<RunToken, (ExecutorError, ExecutorRun)> {
-        let _ = (yielded, run.executor, run.cause, run.token.table);
-        Err((ExecutorError::NotFound, run))
+        // This table's only token is inside this run, so its executor is the one running.
+        if run.token.table != self.id {
+            return Err((ExecutorError::WrongTable, run));
+        }
+        let state = match yielded {
+            ExecutorYield::Idle => ExecutorState::Idle,
+            ExecutorYield::Done => ExecutorState::Retired,
+            ExecutorYield::Parked(wait) if self.waiter(wait.route).is_some() => {
+                return Err((ExecutorError::RouteOccupied, run));
+            }
+            ExecutorYield::Parked(wait) => ExecutorState::Parked(wait),
+        };
+        self.slots[run.executor.index as usize].state = state;
+        Ok(run.token)
     }
 }
 
