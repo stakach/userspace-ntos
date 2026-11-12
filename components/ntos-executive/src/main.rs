@@ -17426,6 +17426,26 @@ unsafe fn arm_hosted_irq_retry_before_nested_receive() {
     }
 }
 
+/// A nested provider Receive bypasses the root receive barrier. Keep the exact
+/// published registry retry reachable while its parent and Reply remain parked.
+/// Timer delivery and acknowledgement stay with their existing owners.
+unsafe fn arm_nested_registry_retry_before_receive() -> bool {
+    let Some(deadline) = registry_mutation_work::next_deadline() else {
+        return true;
+    };
+    if !delay_timer_program(deadline, DELAY_TIMER_SOURCE_REGISTRY_MUTATION) {
+        return false;
+    }
+    // PIT tick rounding and the minimum arm can place the earliest feasible
+    // physical wake just after the logical deadline. Compare against that
+    // feasible wake, sampled after programming, while still requiring a live shot.
+    let now = monotonic_time_100ns();
+    let feasible_wake = nt_kernel_exec::pit_oneshot_for_deadline(
+        now, deadline, DELAY_TIMER_MIN_ARM_100NS,
+    ).wake_deadline_100ns;
+    LAST_REARM_AUTHORITY.covers(now, feasible_wake)
+}
+
 unsafe fn delay_timer_rearm(
     queue: &nt_delay_execution::Queue,
     handler: &ExecNtHandler,

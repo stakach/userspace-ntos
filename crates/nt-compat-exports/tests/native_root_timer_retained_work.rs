@@ -5,6 +5,7 @@
 const SELECTOR: &str = include_str!("../../../components/ntos-executive/src/timer_deadline.rs");
 const ROOT: &str = include_str!("../../../components/ntos-executive/src/main.rs");
 const SERVICE: &str = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
+const NESTED: &str = include_str!("../../../components/ntos-executive/src/component_shared_pump.rs");
 
 const RETAINED_RETRIES: [&str; 5] = [
     "section_pagein_work",
@@ -55,4 +56,26 @@ fn retained_page_and_map_retries_can_wake_the_root() {
             "{owner} has no service-loop redriver after timer delivery"
         );
     }
+}
+
+#[test]
+fn nested_registry_retry_is_physically_covered_before_blocking_receive() {
+    let arm = ROOT
+        .split_once("unsafe fn arm_nested_registry_retry_before_receive() -> bool {")
+        .and_then(|(_, body)| body.split_once("\n}").map(|(body, _)| body))
+        .expect("nested receive needs a physical registry retry wake contract");
+    assert!(arm.contains("registry_mutation_work::next_deadline()")
+        && arm.contains("delay_timer_program(")
+        && arm.contains("pit_oneshot_for_deadline(")
+        && arm.contains("LAST_REARM_AUTHORITY.covers("),
+        "a registry retry published after a consumed timer shot needs a live, feasible physical wake");
+
+    let receive = NESTED
+        .split_once("let blocking = serviced_scheduler_yield || !timer_checkpoint;")
+        .and_then(|(_, body)| body.split_once("let arrival = runtime::receive(").map(|(body, _)| body))
+        .expect("nested physical Receive boundary");
+    assert!(receive.contains("arm_nested_registry_retry_before_receive()")
+        && receive.contains("if blocking")
+        && receive.contains("return PumpMessage::transport_wall()"),
+        "an ordinary nested syscall may not block with an uncovered retry or discard its retained parent");
 }

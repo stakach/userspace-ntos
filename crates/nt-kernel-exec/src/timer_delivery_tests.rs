@@ -32,6 +32,25 @@ fn delivered_or_expired_pit_shot_never_covers_new_demand() {
 }
 
 #[test]
+fn feasible_pit_wake_covers_short_and_overdue_registry_retries() {
+    const MIN_ARM: u64 = 10_000;
+    for deadline_offset in [20_000, 1, 0] {
+        let programmed_at: u64 = 1_000_000;
+        let deadline = programmed_at + deadline_offset;
+        let shot = pit_oneshot_for_deadline(programmed_at, deadline, MIN_ARM);
+        let authority = PitOneShotAuthority::new();
+        authority.publish(shot.wake_deadline_100ns);
+
+        let checked_at = programmed_at + 1;
+        let feasible_wake =
+            pit_oneshot_for_deadline(checked_at, deadline, MIN_ARM).wake_deadline_100ns;
+        assert!(authority.covers(checked_at, feasible_wake));
+        authority.invalidate();
+        assert!(!authority.covers(checked_at, feasible_wake));
+    }
+}
+
+#[test]
 fn chunked_pit_shot_is_retained_only_until_its_physical_wake() {
     let now = 50;
     let deadline = 10_000_000;

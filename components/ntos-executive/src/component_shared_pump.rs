@@ -1157,6 +1157,10 @@ pub(super) unsafe fn receive(
             crate::driver_launch::trace_port_connect_outer_probe(45, ch, 0);
         }
         let blocking = serviced_scheduler_yield || !timer_checkpoint;
+        if blocking && !crate::arm_nested_registry_retry_before_receive() {
+            crate::print_str(b"[pump-ingress] registry retry timer unavailable\n");
+            return PumpMessage::transport_wall();
+        }
         trace_nested_registry_wake_gap(ch, route, blocking);
         let arrival = runtime::receive(execution, ch.tcb, blocking);
         match arrival {
