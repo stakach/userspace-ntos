@@ -114,7 +114,8 @@ fn queued_wait_revalidates_the_newest_generation_and_physical_reply() {
         "fn ready_flat_root_add_device(",
     );
     assert!(
-        permit.contains("QueuedCallbackRootAction::NeedsChild(selector)")
+        permit.contains("Action::NeedsChild(selector)")
+            && permit.contains("Action::RetryRestore(selector)")
             && permit.contains("if selector == self.0")
             && permit.contains("queued_callback_root_action()")
             && permit.contains("queued_callback_file_floor(self.0)"),

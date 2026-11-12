@@ -11001,7 +11001,7 @@ pub(crate) unsafe fn service_sec_image(
         // and Reply remain owned while this root receives a child-producing notification.
         macro_rules! park_queued_callback_root_receive {
             ($root_event_consumed:ident) => {{
-                let permit = match ParkedRootQueuedCallbackPermit::current() {
+                let permit = match ParkedRootQueuedCallbackPermit::retained() {
                     Some(permit) => permit,
                     None => {
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
@@ -11290,6 +11290,9 @@ pub(crate) unsafe fn service_sec_image(
                     (badge, mi, m0, m1, m2, m3) = received;
                     continue 'service_loop;
                 }
+                ConnectPumpSettlement::RetryableRestore => {
+                    park_queued_callback_root_receive!(root_event_consumed);
+                }
                 ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
                     stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                     stop_ssn = 0;
@@ -11375,6 +11378,9 @@ pub(crate) unsafe fn service_sec_image(
                     ConnectPumpSettlement::AwaitingLocalChild => {
                         awaiting_connect_child = true;
                     }
+                    ConnectPumpSettlement::RetryableRestore => {
+                        park_queued_callback_root_receive!(root_event_consumed);
+                    }
                     ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                         stop_ssn = 0;
@@ -11400,6 +11406,9 @@ pub(crate) unsafe fn service_sec_image(
                         // Keep both parents and their Replies parked until the root retry shot.
                         awaiting_connect_child = true;
                         true
+                    }
+                    ConnectPumpSettlement::RetryableRestore => {
+                        park_queued_callback_root_receive!(root_event_consumed);
                     }
                     ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
@@ -11669,6 +11678,9 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 ConnectPumpSettlement::AwaitingLocalChild => {
+                    park_queued_callback_root_receive!(root_event_consumed);
+                }
+                ConnectPumpSettlement::RetryableRestore => {
                     park_queued_callback_root_receive!(root_event_consumed);
                 }
                 ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
@@ -28671,15 +28683,17 @@ unsafe fn prepare_parked_add_device_receive(
     delay_timer_program(deadline, DELAY_TIMER_SOURCE_ROOT_ADD_DEVICE_RETRY)
 }
 
-/// The queued callback's physical parent owns the root until one selected local child is
-/// available. A short one-shot wakes the root without dispatching unrelated timer providers.
+/// The queued callback's physical parent owns the root until its selected child or restore
+/// completes. A short one-shot wakes the root without dispatching unrelated timer providers.
 unsafe fn prepare_parked_queued_callback_receive(
     current: &mut Vec<RootQueuedCallbackTurn>,
 ) -> bool {
     let Some(turn) = current.last_mut() else { return false };
     let owner = turn.owner();
-    if crate::driver_launch::queued_callback_root_action()
-        != Some(crate::driver_launch::QueuedCallbackRootAction::NeedsChild(owner))
+    use crate::driver_launch::QueuedCallbackRootAction as Action;
+    if !matches!(crate::driver_launch::queued_callback_root_action(),
+        Some(Action::NeedsChild(selector) | Action::RetryRestore(selector))
+            if selector == owner)
     { return false; }
     let pending = DELAY_TIMER_TICKS_PENDING.swap(0, Ordering::AcqRel);
     if pending != 0 {
@@ -28734,18 +28748,11 @@ impl ParkedRootAddDevicePermit {
 
 }
 
-/// Proof that the newest physical queue callback still needs one local child. The selector
-/// includes both the queue generation and the provider's physical Reply identity.
+/// Proof that the newest physical queue callback still needs a local child or a certified
+/// no-effects restore retry. The selector includes queue generation and physical Reply identity.
 pub(crate) struct ParkedRootQueuedCallbackPermit(crate::driver_launch::QueuedCallbackSelector);
 
 impl ParkedRootQueuedCallbackPermit {
-    unsafe fn current() -> Option<Self> {
-        let crate::driver_launch::QueuedCallbackRootAction::NeedsChild(selector) =
-            crate::driver_launch::queued_callback_root_action()? else { return None };
-        crate::driver_launch::queued_callback_file_floor(selector)?;
-        Some(Self(selector))
-    }
-
     unsafe fn retained() -> Option<Self> {
         use crate::driver_launch::QueuedCallbackRootAction as Action;
         let selector = match crate::driver_launch::queued_callback_root_action()? {
@@ -29032,6 +29039,8 @@ unsafe fn run_one_pending_add_device_child_step(
 enum ConnectPumpSettlement {
     Settled,
     AwaitingLocalChild,
+    /// A retryable physical restore or scheduler yield still owns its original Reply.
+    RetryableRestore,
     Retained,
     Blocked,
 }
@@ -29059,6 +29068,7 @@ unsafe fn trace_connect_root_checkpoint(
         None => 0,
         Some(ConnectPumpSettlement::Settled) => 1,
         Some(ConnectPumpSettlement::AwaitingLocalChild) => 2,
+        Some(ConnectPumpSettlement::RetryableRestore) => 5,
         Some(ConnectPumpSettlement::Retained) => 3,
         Some(ConnectPumpSettlement::Blocked) => 4,
     };
@@ -29104,6 +29114,7 @@ unsafe fn settle_suspended_connect_pumps() -> ConnectPumpSettlement {
     let code = match &result {
         ConnectPumpSettlement::Settled => 1,
         ConnectPumpSettlement::AwaitingLocalChild => 2,
+        ConnectPumpSettlement::RetryableRestore => 5,
         ConnectPumpSettlement::Retained => 3,
         ConnectPumpSettlement::Blocked => 4,
     };
@@ -29159,6 +29170,7 @@ unsafe fn settle_suspended_connect_pumps_inner() -> ConnectPumpSettlement {
         crate::driver_launch::trace_port_connect_root_probe(83, match inner_settlement {
             ConnectPumpSettlement::Settled => 0,
             ConnectPumpSettlement::AwaitingLocalChild => 1,
+            ConnectPumpSettlement::RetryableRestore => 4,
             ConnectPumpSettlement::Retained => 2,
             ConnectPumpSettlement::Blocked => 3,
         });
@@ -29166,6 +29178,8 @@ unsafe fn settle_suspended_connect_pumps_inner() -> ConnectPumpSettlement {
             ConnectPumpSettlement::Settled => {}
             ConnectPumpSettlement::AwaitingLocalChild =>
                 return ConnectPumpSettlement::AwaitingLocalChild,
+            ConnectPumpSettlement::RetryableRestore =>
+                return ConnectPumpSettlement::RetryableRestore,
             ConnectPumpSettlement::Retained => return ConnectPumpSettlement::Retained,
             ConnectPumpSettlement::Blocked => return ConnectPumpSettlement::Blocked,
         }
@@ -29206,6 +29220,8 @@ unsafe fn settle_suspended_file_pumps() -> ConnectPumpSettlement {
             FilePumpTurn::Progressed => continue,
             FilePumpTurn::AwaitingLocalChild =>
                 return ConnectPumpSettlement::AwaitingLocalChild,
+            FilePumpTurn::RetryableRestore =>
+                return ConnectPumpSettlement::RetryableRestore,
             FilePumpTurn::Retained => return ConnectPumpSettlement::Retained,
             FilePumpTurn::Blocked => return ConnectPumpSettlement::Blocked,
             FilePumpTurn::Settled => {}
@@ -29214,6 +29230,8 @@ unsafe fn settle_suspended_file_pumps() -> ConnectPumpSettlement {
             FilePumpTurn::Progressed => continue,
             FilePumpTurn::AwaitingLocalChild =>
                 return ConnectPumpSettlement::AwaitingLocalChild,
+            FilePumpTurn::RetryableRestore =>
+                return ConnectPumpSettlement::RetryableRestore,
             FilePumpTurn::Retained => return ConnectPumpSettlement::Retained,
             FilePumpTurn::Blocked => return ConnectPumpSettlement::Blocked,
             FilePumpTurn::Settled => return if crate::driver_launch::hook_source_unsettled() {
@@ -29232,6 +29250,8 @@ enum FilePumpTurn {
     Progressed,
     Settled,
     AwaitingLocalChild,
+    /// The selected callback is durable and may retry after a root timer/IRQ receive.
+    RetryableRestore,
     Retained,
     Blocked,
 }
@@ -29279,7 +29299,8 @@ unsafe fn settle_queued_callback_turn() -> FilePumpTurn {
             FilePumpTurn::Progressed,
         Progress::RecordedStep | Progress::InnerFilePending => FilePumpTurn::Retained,
         Progress::AwaitingLocalChild => FilePumpTurn::AwaitingLocalChild,
-        Progress::PendingRestore | Progress::PendingTerminalAck => FilePumpTurn::Retained,
+        Progress::PendingRestore => FilePumpTurn::RetryableRestore,
+        Progress::PendingTerminalAck => FilePumpTurn::Retained,
         Progress::Blocked => FilePumpTurn::Blocked,
     }
 }
@@ -29293,6 +29314,7 @@ unsafe fn settle_queued_callbacks() -> ConnectPumpSettlement {
             FilePumpTurn::Settled => return ConnectPumpSettlement::Settled,
             FilePumpTurn::AwaitingLocalChild =>
                 return ConnectPumpSettlement::AwaitingLocalChild,
+            FilePumpTurn::RetryableRestore => return ConnectPumpSettlement::RetryableRestore,
             FilePumpTurn::Retained => return ConnectPumpSettlement::Retained,
             FilePumpTurn::Blocked => return ConnectPumpSettlement::Blocked,
         }
