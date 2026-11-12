@@ -2162,13 +2162,22 @@ unsafe fn service_wait_admit_with_transfer(
             ) && transfer.admits(pending.snapshot.client, lane),
         _ => transfer.admits(pending.snapshot.client, lane),
     };
-    if pending.snapshot.callback_token != transfer.token() || !origin_valid {
+    if pending.snapshot.callback_token != transfer.token() {
+        trace_win32k_handoff_refusal(b"service-wait-callback-token");
+        return RetainedWaitAdmission::RefusedNoEffect;
+    }
+    if !origin_valid {
+        trace_win32k_handoff_refusal(b"service-wait-callback-origin");
         return RetainedWaitAdmission::RefusedNoEffect;
     }
     let Ok(return_target) = HostedReturnTarget::new(
         reply_cap, transfer.context(),
-    ) else { return RetainedWaitAdmission::RefusedNoEffect; };
+    ) else {
+        trace_win32k_handoff_refusal(b"service-wait-return-target");
+        return RetainedWaitAdmission::RefusedNoEffect;
+    };
     let Some(owner) = service_wait_expected_owner(pending) else {
+        trace_win32k_handoff_refusal(b"service-wait-expected-owner");
         return RetainedWaitAdmission::RefusedNoEffect;
     };
     let yielded = pending.yielded;
@@ -2195,7 +2204,10 @@ unsafe fn service_wait_admit_with_transfer(
         ),
     };
     if admitted.is_ok() { RetainedWaitAdmission::Accepted }
-    else { RetainedWaitAdmission::RefusedNoEffect }
+    else {
+        trace_win32k_handoff_refusal(b"service-wait-lane-admission");
+        RetainedWaitAdmission::RefusedNoEffect
+    }
 }
 
 unsafe fn service_wait_admit_current(
@@ -2208,7 +2220,10 @@ unsafe fn service_wait_admit_current(
     } else {
         root_reply_park::RootReplyPark::prepare()
     };
-    let Some(reply_park) = reply_park else { return RetainedWaitAdmission::RefusedNoEffect; };
+    let Some(reply_park) = reply_park else {
+        trace_win32k_handoff_refusal(b"service-wait-root-park-prepare");
+        return RetainedWaitAdmission::RefusedNoEffect;
+    };
     let transfer = match pending.snapshot.callback_token {
         Some(token) => NestedWaitTransfer::InCallback {
             lane: pending.snapshot.dispatch.lane, token,
@@ -2219,7 +2234,10 @@ unsafe fn service_wait_admit_current(
         pending, root_reply, transfer, destination,
     );
     if admitted != RetainedWaitAdmission::Accepted { return admitted; }
-    if reply_park.try_commit().is_err() { RetainedWaitAdmission::Indeterminate }
+    if reply_park.try_commit().is_err() {
+        trace_win32k_handoff_refusal(b"service-wait-root-park-commit");
+        RetainedWaitAdmission::Indeterminate
+    }
     else { RetainedWaitAdmission::Accepted }
 }
 
@@ -2341,20 +2359,32 @@ struct PendingWin32kHandoff {
     retained_failure: bool,
 }
 
+fn trace_win32k_handoff_refusal(stage: &[u8]) {
+    print_str(b"[win32k-handoff-refusal] stage=");
+    print_str(stage);
+    print_str(b"\n");
+}
+
 /// The physical nested parent already owns its Reply. Retain the independent root Call before
 /// rotating the root Reply; no ordinary syscall result can be delivered from this handoff.
 unsafe fn admit_pending_nested_restore_dispatch(
     destination: HostedContinuationDestination,
 ) -> Result<u64, ()> {
     let root_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    if root_reply == 0 { return Err(()); }
+    if root_reply == 0 {
+        trace_win32k_handoff_refusal(b"nested-restore-root-reply");
+        return Err(());
+    }
     let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
+        trace_win32k_handoff_refusal(b"nested-restore-reply-park-prepare");
         return Err(());
     };
     let Some(reservation) = nested_restore_owner::reserve_capacity() else {
+        trace_win32k_handoff_refusal(b"nested-restore-capacity");
         return Err(());
     };
     let Some(pending) = win32k_glue::take_pending_nested_restore_dispatch() else {
+        trace_win32k_handoff_refusal(b"nested-restore-pending-absent");
         return Err(());
     };
     let dispatch_id = pending.snapshot.dispatch.dispatch_id;
@@ -2364,6 +2394,7 @@ unsafe fn admit_pending_nested_restore_dispatch(
         Ok(ticket) => ticket,
         Err(pending) => {
             let _ = win32k_glue::restore_pending_nested_restore_dispatch(pending);
+            trace_win32k_handoff_refusal(b"nested-restore-retain");
             return Err(());
         }
     };
@@ -2372,6 +2403,7 @@ unsafe fn admit_pending_nested_restore_dispatch(
     {
         // The retained frame still owns the original root Reply and physical parent. A refusal
         // cannot become a synthetic provider result or let the root receive reuse this Reply.
+        trace_win32k_handoff_refusal(b"nested-restore-park-root");
         return Err(());
     }
     Ok(dispatch_id)
@@ -2530,6 +2562,7 @@ unsafe fn admit_pending_win32k_dispatch(
     let mut retained_failure = false;
     if win32k_glue::pending_nested_restore_dispatch_is_some() {
         if callback_suspended {
+            trace_win32k_handoff_refusal(b"nested-restore-callback-suspended");
             return PendingWin32kHandoff {
                 callback_suspended, admitted_dispatch_id, parked,
                 maintenance_ticket, retained_failure: true,
@@ -2551,6 +2584,7 @@ unsafe fn admit_pending_win32k_dispatch(
         // The distinct owner is retained in the Win32k pending slot, CALLS and PARENTS. This
         // dormant path must not import the child or rotate either Reply until the serialized
         // route preflight and undelivered-parent unwind are implemented together.
+        trace_win32k_handoff_refusal(b"root-ingress-unimplemented");
         return PendingWin32kHandoff {
             callback_suspended, admitted_dispatch_id, parked,
             maintenance_ticket, retained_failure: true,
@@ -2710,10 +2744,16 @@ unsafe fn admit_pending_win32k_dispatch(
         match service_wait_admit_current(pending, destination) {
             RetainedWaitAdmission::Accepted => parked = true,
             RetainedWaitAdmission::RefusedNoEffect => {
-                let _ = win32k_glue::restore_pending_service_wait_dispatch(pending);
+                let restored = win32k_glue::restore_pending_service_wait_dispatch(pending);
+                trace_win32k_handoff_refusal(if restored {
+                    b"service-wait-refused-restored"
+                } else { b"service-wait-refused-restore-failed" });
                 retained_failure = true;
             }
-            RetainedWaitAdmission::Indeterminate => retained_failure = true,
+            RetainedWaitAdmission::Indeterminate => {
+                trace_win32k_handoff_refusal(b"service-wait-indeterminate");
+                retained_failure = true;
+            }
         }
     } else if let Some(pending) = win32k_glue::take_pending_provider_wait_dispatch() {
         admitted_dispatch_id = pending.dispatch.dispatch_id;
