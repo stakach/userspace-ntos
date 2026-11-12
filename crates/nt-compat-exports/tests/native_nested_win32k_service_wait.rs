@@ -31,6 +31,23 @@ fn nested_callback_gets_only_exact_service_wait_yield() {
 }
 
 #[test]
+fn resumed_waits_restore_the_nested_service_yield_before_entering_the_pump() {
+    for function in [
+        "resume_suspended_provider_wait_component(",
+        "resume_suspended_lpc_wait_component(",
+    ] {
+        let setup = GLUE
+            .split(function).nth(1).expect("resumed wait entry")
+            .split("let Some(shared_resume)").next().expect("channel setup");
+        assert!(setup.contains("resume_yield_caps(\n        pending.nested_user_callback, channel.logical_caller.is_some()"),
+            "{function} must restore the authenticated callback origin");
+        assert!(setup.contains("channel.caps.hosted_receive_yield = yield_caps.hosted_receive"));
+        assert!(setup.contains("channel.caps.nested_service_wait_yield = yield_caps.nested_service_wait"),
+            "{function} must let a parked source service token yield the pump");
+    }
+}
+
+#[test]
 fn nested_service_wait_keeps_callback_and_root_reply_owned() {
     let finish = GLUE
         .split("if let Some(yielded) = pr.service_wait_yield {")

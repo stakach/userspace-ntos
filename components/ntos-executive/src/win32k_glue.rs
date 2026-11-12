@@ -4972,8 +4972,11 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
     ) else {
         return ProviderWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
     };
-    channel.caps.hosted_receive_yield = !pending.nested_user_callback
-        && channel.logical_caller.is_some();
+    let yield_caps = nt_user_host::component_pump::resume_yield_caps(
+        pending.nested_user_callback, channel.logical_caller.is_some(),
+    );
+    channel.caps.hosted_receive_yield = yield_caps.hosted_receive;
+    channel.caps.nested_service_wait_yield = yield_caps.nested_service_wait;
     let Some(shared_resume) = pending.shared_resume else {
         return ProviderWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
     };
@@ -5238,8 +5241,11 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
     ) else {
         return LpcWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
     };
-    channel.caps.hosted_receive_yield = !pending.nested_user_callback
-        && channel.logical_caller.is_some();
+    let yield_caps = nt_user_host::component_pump::resume_yield_caps(
+        pending.nested_user_callback, channel.logical_caller.is_some(),
+    );
+    channel.caps.hosted_receive_yield = yield_caps.hosted_receive;
+    channel.caps.nested_service_wait_yield = yield_caps.nested_service_wait;
     let Some(shared_resume) = pending.shared_resume else {
         return LpcWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
     };

@@ -3,6 +3,24 @@
 
 use nt_component_suspension::{ComponentSuspensionLanes, LaneDispatchIdentity};
 
+/// Which typed receive boundary a resumed Win32k pump may yield through.
+/// The nested callback origin is retained with the pending dispatch across reparks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResumeYieldCaps {
+    pub hosted_receive: bool,
+    pub nested_service_wait: bool,
+}
+
+pub const fn resume_yield_caps(
+    nested_callback: bool,
+    has_logical_caller: bool,
+) -> ResumeYieldCaps {
+    ResumeYieldCaps {
+        hosted_receive: has_logical_caller && !nested_callback,
+        nested_service_wait: has_logical_caller && nested_callback,
+    }
+}
+
 /// A refused root receive has either a certified pre-native owner conflict or an
 /// uncertain native effect. Only the former may give the exact child another turn.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

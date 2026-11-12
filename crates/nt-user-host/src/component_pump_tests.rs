@@ -6,6 +6,23 @@ use nt_component_suspension::{
 };
 
 #[test]
+fn resumed_provider_preserves_the_yield_authority_of_its_callback_origin() {
+    let nested = resume_yield_caps(true, true);
+    assert!(nested.nested_service_wait);
+    assert!(!nested.hosted_receive);
+
+    let ordinary = resume_yield_caps(false, true);
+    assert!(!ordinary.nested_service_wait);
+    assert!(ordinary.hosted_receive);
+
+    for nested_callback in [false, true] {
+        let no_caller = resume_yield_caps(nested_callback, false);
+        assert!(!no_caller.nested_service_wait);
+        assert!(!no_caller.hosted_receive);
+    }
+}
+
+#[test]
 fn busy_idle_receive_after_child_scheduler_yield_keeps_the_running_reply_and_continuation() {
     // The child receive returned a scheduler yield with a new physical Reply. The root loop
     // still owns a running primary dispatch and must give that retained continuation another
