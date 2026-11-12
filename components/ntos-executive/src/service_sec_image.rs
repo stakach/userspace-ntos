@@ -11771,7 +11771,6 @@ pub(crate) unsafe fn service_sec_image(
         {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             crate::native_alpc_create_work::redrive(&mut nt_handler);
-            crate::exec_handler::initial_thread_creation::redrive_retry_no_effect(&mut nt_handler);
             crate::native_alpc_close_work::redrive(&mut nt_handler);
             crate::native_alpc_connect_accept_work::redrive(&mut nt_handler);
             crate::native_srm_command_work::redrive(&mut nt_handler);
@@ -11889,6 +11888,9 @@ pub(crate) unsafe fn service_sec_image(
             crate::object_wait_reply::redrive(&mut nt_handler);
             crate::object_wait_reply::redrive_terminated_runtimes(&mut nt_handler, &mut *delay_queue);
             inline_file_retirement::redrive(&mut nt_handler);
+            // A provider may clear the shared publication fence in this pass. Retry the
+            // exact parked first-thread Reply after settlement, before receiving again.
+            crate::exec_handler::initial_thread_creation::redrive_retry_no_effect(&mut nt_handler);
         }
         if alpc_reply_committed.is_some() {
             let _ = lpc_component_reply_commit_drain(&mut nt_handler);

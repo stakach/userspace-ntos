@@ -75,6 +75,12 @@ impl<R: Copy + Eq> InitialReplyRetry<R> {
                 InitialReplyRetryPhase::ReplyUncertain
                 | InitialReplyRetryPhase::Transferred | InitialReplyRetryPhase::Complete)
     }
+    pub fn can_redrive_while(
+        &self, source: ThreadBinding<R>, target: ThreadBinding<R>, shared_page_busy: bool,
+    ) -> bool {
+        self.can_redrive(source, target)
+            && (!shared_page_busy || self.phase != InitialReplyRetryPhase::AwaitingPage)
+    }
     /// The root selector was rotated before this marker can be consumed. It cannot be taken
     /// twice, even if the same source process calls again on a recycled thread identifier.
     pub fn take_root_transfer(&mut self, source: ThreadBinding<R>) -> bool {
@@ -298,6 +304,21 @@ mod tests {
         assert!(retry.transition(InitialReplyRetryPhase::AwaitingPage));
         assert_eq!(retry.reply_cap(), 41);
         assert_eq!(callout.begin(8, origin.target().process), Ok(()));
+    }
+
+    #[test]
+    fn shared_page_busy_blocks_only_fresh_callout_entry() {
+        let origin = reply_origin();
+        let mut retry = InitialReplyRetry::new(origin, 41).unwrap();
+        assert!(retry.take_root_transfer(origin.source()));
+        assert!(!retry.can_redrive_while(origin.source(), origin.target(), true));
+        assert!(retry.transition(InitialReplyRetryPhase::SuspendedTransfer));
+        assert!(retry.can_redrive_while(origin.source(), origin.target(), true),
+            "a captured pending wait must still transfer while its page owner is active");
+        let mut finishing = InitialReplyRetry::new(origin, 42).unwrap();
+        assert!(finishing.take_root_transfer(origin.source()));
+        assert!(finishing.transition(InitialReplyRetryPhase::Finishing));
+        assert!(finishing.can_redrive_while(origin.source(), origin.target(), true));
     }
 
     #[test]

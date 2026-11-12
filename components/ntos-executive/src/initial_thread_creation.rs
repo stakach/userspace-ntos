@@ -91,11 +91,11 @@ pub(crate) unsafe fn take_retry_transferred(caller: Binding) -> bool {
 /// Advance at most one retained source Reply per flat root pass. The shared-page owner must
 /// settle in the root loop; spinning here would prevent the very event that clears its fence.
 pub(crate) unsafe fn redrive_retry_no_effect(handler: &mut ExecNtHandler) {
-    if crate::service_sec_image::component_shared_publication_is_busy() { return; }
+    let shared_page_busy = crate::service_sec_image::component_shared_publication_is_busy();
     let mut row = {
         let rows = &mut *core::ptr::addr_of_mut!(INITIAL_CREATE_RETRIES);
-        let Some(index) = rows.iter().position(|row| row.can_redrive(
-            row.origin().source(), row.origin().target(),
+        let Some(index) = rows.iter().position(|row| row.can_redrive_while(
+            row.origin().source(), row.origin().target(), shared_page_busy,
         )) else { return; };
         rows.swap_remove(index)
     };
