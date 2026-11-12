@@ -11209,7 +11209,7 @@ pub(crate) unsafe fn service_sec_image(
         // A retained queued callback is an independent root parent. Its exact queue selector
         // and Reply remain owned while this root receives a child-producing notification.
         macro_rules! park_queued_callback_root_receive {
-            ($root_event_consumed:ident) => {{
+            ($root_event_consumed:ident $(, $retry_label:lifetime)?) => {{
                 let permit = match ParkedRootQueuedCallbackPermit::retained() {
                     Some(permit) => permit,
                     None => {
@@ -11269,22 +11269,22 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     $root_event_consumed = true;
                 }
-                // RetryRestore may return after an exact child scheduler yield while its
-                // dispatch still runs. The root event and queued selector are already
-                // retained above. Give that child another settlement turn before any Idle
-                // receive; the latter is refused before SYS_RECV while this lane runs.
-                if let Some(crate::driver_launch::QueuedCallbackRootAction::RetryRestore(selector)) =
-                    crate::driver_launch::queued_callback_root_action()
-                {
-                    if selector == permit.0 {
-                        let (dispatch, reply) = selector.dispatch_reply();
-                        if crate::spawn_hosts::shared_ingress::owner::runtime::
-                            root_idle_receive_after_child_yield(dispatch, reply)
-                        {
-                            continue 'service_loop;
+                $(
+                    // This retry remains inside the same root-event settlement loop. The
+                    // consumed marker must survive until a different ingress is received.
+                    if let Some(crate::driver_launch::QueuedCallbackRootAction::RetryRestore(selector)) =
+                        crate::driver_launch::queued_callback_root_action()
+                    {
+                        if selector == permit.0 {
+                            let (dispatch, reply) = selector.dispatch_reply();
+                            if crate::spawn_hosts::shared_ingress::owner::runtime::
+                                root_idle_receive_after_child_yield(dispatch, reply)
+                            {
+                                continue $retry_label;
+                            }
                         }
                     }
-                }
+                )?
                 if !prepare_parked_queued_callback_receive(&mut root_queued_callback_turn) {
                     stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                     stop_ssn = 0;
@@ -11468,7 +11468,7 @@ pub(crate) unsafe fn service_sec_image(
                 root_event_consumed = true;
             }
         }
-        loop {
+        'queued_callback_settlement: loop {
             // A callback reached by the preceding AddDevice child owns a nested physical
             // Reply. Settle it before running another AddDevice child or resuming the batch.
             // Passive work may enter a provider and retain a physical callback Reply. Only
@@ -11503,7 +11503,7 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 ConnectPumpSettlement::AwaitingLocalChild => {
                     if root_add_device_turn.is_none() {
-                        park_queued_callback_root_receive!(root_event_consumed);
+                        park_queued_callback_root_receive!(root_event_consumed, 'queued_callback_settlement);
                     }
                     if !prepare_parked_add_device_receive(&mut root_add_device_turn) {
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
@@ -11516,7 +11516,7 @@ pub(crate) unsafe fn service_sec_image(
                     continue 'service_loop;
                 }
                 ConnectPumpSettlement::RetryableRestore => {
-                    park_queued_callback_root_receive!(root_event_consumed);
+                    park_queued_callback_root_receive!(root_event_consumed, 'queued_callback_settlement);
                 }
                 ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
                     stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
@@ -11604,7 +11604,7 @@ pub(crate) unsafe fn service_sec_image(
                         awaiting_connect_child = true;
                     }
                     ConnectPumpSettlement::RetryableRestore => {
-                        park_queued_callback_root_receive!(root_event_consumed);
+                        park_queued_callback_root_receive!(root_event_consumed, 'queued_callback_settlement);
                     }
                     ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
@@ -11633,7 +11633,7 @@ pub(crate) unsafe fn service_sec_image(
                         true
                     }
                     ConnectPumpSettlement::RetryableRestore => {
-                        park_queued_callback_root_receive!(root_event_consumed);
+                        park_queued_callback_root_receive!(root_event_consumed, 'queued_callback_settlement);
                     }
                     ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
                         stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
