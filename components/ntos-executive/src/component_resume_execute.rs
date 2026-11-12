@@ -37,7 +37,12 @@ fn trace_repark_failure(
         Some(nt_component_suspension::LaneError::WrongBinding) => b"wrong-binding",
         Some(nt_component_suspension::LaneError::Busy) => b"busy",
         Some(nt_component_suspension::LaneError::InvalidPhase) => b"invalid-phase",
-        Some(nt_component_suspension::LaneError::Suspension(_)) => b"suspension",
+        Some(nt_component_suspension::LaneError::Suspension(inner)) => match inner {
+            nt_component_suspension::SuspensionError::InvalidPhase => b"suspension-invalid-phase",
+            nt_component_suspension::SuspensionError::NotTop => b"suspension-not-top",
+            nt_component_suspension::SuspensionError::DuplicateIdentity => b"suspension-duplicate-identity",
+            _ => b"suspension-other",
+        },
     });
     print_str(b"\n");
 }
@@ -583,6 +588,28 @@ unsafe fn finish_hosted_resume(
                 )
             {
                 trace_repark_failure(b"rearm", lane, resume.key, 0xC000_000D, Some(next), Some(error));
+                if let Ok(Some(current)) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+                    .frame(lane, resume.key)
+                {
+                    print_str(b"[component-rearm-owner] old-key/new-key/same-owner/phase/old-dispatch/new-dispatch/old-pi/new-pi/old-tid/new-tid=");
+                    print_u64(resume.key.id); print_str(b"/");
+                    print_u64(next_key.id); print_str(b"/");
+                    print_u64((current.owner == next_owner) as u64); print_str(b"/");
+                    print_u64(match current.phase {
+                        nt_component_suspension::SuspensionPhase::Resuming { .. } => 1,
+                        nt_component_suspension::SuspensionPhase::ResumingChildParked { .. } => 2,
+                        nt_component_suspension::SuspensionPhase::ResumingChildQuarantined { .. } => 3,
+                        _ => 0,
+                    }); print_str(b"/");
+                    print_u64(current.owner.dispatch_id); print_str(b"/");
+                    print_u64(next_owner.dispatch_id); print_str(b"/");
+                    let old_client = current.owner.hosted_client();
+                    let new_client = next_owner.hosted_client();
+                    print_u64(old_client.map_or(0, |client| client.client_pi as u64)); print_str(b"/");
+                    print_u64(new_client.map_or(0, |client| client.client_pi as u64)); print_str(b"/");
+                    print_u64(old_client.map_or(0, |client| client.client_tid)); print_str(b"/");
+                    print_u64(new_client.map_or(0, |client| client.client_tid)); print_str(b"\n");
+                }
                 if let Some(reservation) = lpc_reservation {
                     let _ =
                         (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
