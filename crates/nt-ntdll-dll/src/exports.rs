@@ -23508,20 +23508,45 @@ pub unsafe extern "system" fn rtl_restore_context(
     }
 }
 
-/// `RtlExitUserThread(NTSTATUS Status)` — terminate the current thread. Route to the NtTerminateThread
-/// stub with the current-thread pseudo-handle (-2).
+/// `RtlExitUserThread(NTSTATUS Status)` — notify the process loader when this is the
+/// last thread, otherwise detach the thread and terminate it.
 ///
 /// # Safety
 /// Does not return.
 #[export_name = "RtlExitUserThread"]
 pub unsafe extern "system" fn rtl_exit_user_thread(status: NtStatus) {
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: forwards to NtTerminateThread(NtCurrentThread=-2, status); does not return.
+    // SAFETY: the current-thread query and terminal native calls use valid current
+    // process/thread pseudo-handles. Neither terminal call returns on success.
     unsafe {
-        let _ = ldr_shutdown_thread();
-        (*(current_teb() as *mut Teb)).free_stack_on_termination = 1;
-        nt_ntdll::trap_stubs::nt_terminate_thread((-2isize) as u64, status as u64) as NtStatus;
-        // Should not return; if it does, spin at a breakpoint.
+        const THREAD_AM_I_LAST_THREAD: u64 = 12;
+        let mut last_thread = 0u32;
+        nt_ntdll::user_exit::exit_user_thread(
+            status,
+            || {
+                let query_status = nt_ntdll::trap_stubs::nt_query_information_thread(
+                    (-2isize) as u64,
+                    THREAD_AM_I_LAST_THREAD,
+                    &mut last_thread as *mut u32 as u64,
+                    core::mem::size_of::<u32>() as u64,
+                    0,
+                ) as NtStatus;
+                if (query_status as i32) < 0 {
+                    Err(query_status)
+                } else {
+                    Ok(last_thread != 0)
+                }
+            },
+            |status| rtl_exit_user_process(status),
+            || {
+                let _ = ldr_shutdown_thread();
+            },
+            |status| {
+                (*(current_teb() as *mut Teb)).free_stack_on_termination = 1;
+                let _ = nt_ntdll::trap_stubs::nt_terminate_thread((-2isize) as u64, status as u64);
+            },
+        );
+        // A successful terminal service call never returns.
         core::arch::asm!("int3");
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -23532,8 +23557,8 @@ pub unsafe extern "system" fn rtl_exit_user_thread(status: NtStatus) {
 
 /// `RtlExitUserProcess(NTSTATUS Status) -> VOID`.
 ///
-/// Run process loader shutdown notifications, then terminate the current process through the native
-/// process service. This function does not return on success.
+/// Stop peer threads, run process loader shutdown notifications, then terminate
+/// the current process. This function does not return on success.
 ///
 /// # Safety
 /// Terminates the calling process.
@@ -23541,8 +23566,18 @@ pub unsafe extern "system" fn rtl_exit_user_thread(status: NtStatus) {
 pub unsafe extern "system" fn rtl_exit_user_process(status: NtStatus) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        let _ = ldr_shutdown_process();
-        nt_ntdll::trap_stubs::nt_terminate_process((-1isize) as u64, status as u64) as NtStatus;
+        nt_ntdll::user_exit::exit_user_process(
+            status,
+            |status| {
+                let _ = nt_ntdll::trap_stubs::nt_terminate_process(0, status as u64);
+            },
+            || {
+                let _ = ldr_shutdown_process();
+            },
+            |status| {
+                let _ = nt_ntdll::trap_stubs::nt_terminate_process((-1isize) as u64, status as u64);
+            },
+        );
         core::arch::asm!("int3");
     }
     #[cfg(not(target_arch = "x86_64"))]
