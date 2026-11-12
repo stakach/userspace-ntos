@@ -56,8 +56,10 @@ mod retained_dispatch;
 mod retained_child_dispatch;
 mod root_child_turn;
 pub use root_child_turn::{
-    RootChildArrival, RootChildTurn, RootChildTurnAction, RootChildTurnError,
+    RootChildArrival, RootChildOwner, RootChildTurn, RootChildTurnAction, RootChildTurnError,
 };
+mod root_child_retirement;
+pub use root_child_retirement::{RootChildRetirementError, RootChildRetirementWatches};
 mod hosted_work_queue_claim;
 pub use hosted_work_queue_claim::{HostedWorkQueueClaim, HostedWorkQueueClaimError};
 mod hosted_work_queue_claims;

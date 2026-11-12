@@ -10,9 +10,21 @@ pub struct RootChildTurn<O, I> {
     retry_deadline: Option<u64>,
 }
 
+/// A root parent's identity: one stable claim plus the physical witness last authenticated
+/// for it. The claim names a single retained generation. A refreshed Reply or dispatch changes
+/// only the witness; a reused slot or a later generation is a different claim.
+pub trait RootChildOwner: Copy + Eq {
+    type Claim: Copy + Eq;
+
+    fn claim(&self) -> Self::Claim;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RootChildTurnError {
     WrongOwner,
+    /// Another claim never continues this turn; it needs its own turn and retirement proof.
+    ForeignClaim,
+    WitnessUnchanged,
     IngressAlreadyRetained,
     InvalidRetryInterval,
     DeadlineOverflow,
@@ -123,5 +135,18 @@ impl<O: Copy + Eq, I> RootChildTurn<O, I> {
     pub fn settle(self, observed: O) -> Result<Option<I>, Self> {
         if self.owner != observed { return Err(self); }
         Ok(self.ingress)
+    }
+}
+
+impl<O: RootChildOwner, I> RootChildTurn<O, I> {
+    /// Continue this turn under a refreshed witness of its own claim, keeping the retained
+    /// ingress and retry deadline. The caller must have authenticated `current` as the claim's
+    /// live physical owner; afterwards `retired` is refused like any other stale owner.
+    pub fn advance_owner(&mut self, retired: O, current: O) -> Result<(), RootChildTurnError> {
+        self.require_owner(retired)?;
+        if retired.claim() != current.claim() { return Err(RootChildTurnError::ForeignClaim); }
+        if retired == current { return Err(RootChildTurnError::WitnessUnchanged); }
+        self.owner = current;
+        Ok(())
     }
 }
