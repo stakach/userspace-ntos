@@ -50,7 +50,7 @@ pub(super) fn is_active() -> bool {
 
 /// The retained physical route owns this TCB cap. A failed request means the worker is no
 /// longer runnable; the subsequent exact receive remains responsible for any completion.
-fn handoff_exact_component_once(tcb: u64) -> bool {
+pub(crate) fn handoff_exact_component_once(tcb: u64) -> bool {
     sel4_rt::tcb_yield_to(tcb) == 0
 }
 

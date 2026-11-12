@@ -174,6 +174,7 @@ pub(crate) use hosted_dpc_scheduler::{
 };
 use component_scheduler::hosted_component_pump;
 pub(crate) use component_scheduler::ComponentSchedulerScope;
+pub(crate) use component_scheduler::handoff_exact_component_once;
 
 #[path = "device_property.rs"]
 pub(crate) mod device_property;

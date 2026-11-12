@@ -1131,6 +1131,10 @@ pub(super) unsafe fn receive(
                 crate::print_str(b"[pump-ingress] inline IRQ checkpoint lost its route\n");
                 return PumpMessage::transport_wall();
             }
+            // The checkpoint restored the exact route and Reply. A timer notification can
+            // keep this higher-priority receiver runnable indefinitely while its provider
+            // is already enqueued. Grant only that provider one dispatch opportunity.
+            let _ = crate::driver_launch::handoff_exact_component_once(ch.tcb);
             // Deferred IRQ bits may remain set. This pass belongs to the observed arrival only;
             // inspect new Calls before waiting, then await another notification to retry.
             irq_checkpoint = false;
