@@ -21,6 +21,14 @@ on:
         description: Exact source run attempt; required with resume_run_id
         type: string
         default: ''
+      migrate_run_id:
+        description: Prior successful KVM run whose installed writable disk receives this commit's boot code
+        type: string
+        default: ''
+      migrate_run_attempt:
+        description: Source run attempt; required with migrate_run_id and exclusive with resume_run_id
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -40,6 +48,25 @@ jobs:
         with:
           persist-credentials: false
           submodules: true
+          fetch-depth: 0
+      - name: Validate disk continuation mode
+        env:
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+          RESUME_RUN_ATTEMPT: ${{ inputs.resume_run_attempt }}
+          MIGRATE_RUN_ID: ${{ inputs.migrate_run_id }}
+          MIGRATE_RUN_ATTEMPT: ${{ inputs.migrate_run_attempt }}
+        run: |
+          if [ -n "$RESUME_RUN_ID" ] && [ -n "$MIGRATE_RUN_ID" ]; then
+            echo 'exact-head continuation and cross-commit migration are exclusive' >&2
+            exit 1
+          fi
+          if { [ -n "$RESUME_RUN_ID" ] && [ -z "$RESUME_RUN_ATTEMPT" ]; } || \
+             { [ -z "$RESUME_RUN_ID" ] && [ -n "$RESUME_RUN_ATTEMPT" ]; } || \
+             { [ -n "$MIGRATE_RUN_ID" ] && [ -z "$MIGRATE_RUN_ATTEMPT" ]; } || \
+             { [ -z "$MIGRATE_RUN_ID" ] && [ -n "$MIGRATE_RUN_ATTEMPT" ]; }; then
+            echo 'disk run ID and attempt must be supplied together' >&2
+            exit 1
+          fi
       - name: Authenticate requested exact-head continuation run
         if: inputs.resume_run_id != ''
         env:
@@ -47,6 +74,13 @@ jobs:
           RESUME_RUN_ID: ${{ inputs.resume_run_id }}
           RESUME_RUN_ATTEMPT: ${{ inputs.resume_run_attempt }}
         run: python3 scripts/ci_kvm_disk_continuation.py check-run --run-id "$RESUME_RUN_ID" --attempt "$RESUME_RUN_ATTEMPT"
+      - name: Authenticate requested cross-commit migration run
+        if: inputs.migrate_run_id != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MIGRATE_RUN_ID: ${{ inputs.migrate_run_id }}
+          MIGRATE_RUN_ATTEMPT: ${{ inputs.migrate_run_attempt }}
+        run: python3 scripts/ci_kvm_disk_continuation.py check-migration-run --run-id "$MIGRATE_RUN_ID" --attempt "$MIGRATE_RUN_ATTEMPT"
       - name: Fetch pinned ReactOS source inputs
         uses: actions/checkout@v4
         with:
@@ -66,12 +100,12 @@ jobs:
         run: |
           sudo apt-get update
           # The headless QMP/PPM runner does not need QEMU's GUI and multimedia recommends.
-          sudo apt-get install -y --no-install-recommends build-essential clang curl libarchive-tools ovmf qemu-system-x86 7zip
+          sudo apt-get install -y --no-install-recommends build-essential clang curl libarchive-tools ovmf qemu-system-x86 7zip mtools dosfstools
           # Ubuntu's 7zip package exposes 7z; the project uses the equivalent 7zz CLI.
           if ! command -v 7zz >/dev/null && command -v 7z >/dev/null; then
             sudo ln -s "$(command -v 7z)" /usr/local/bin/7zz
           fi
-          for tool in bsdtar 7zz qemu-system-x86_64 clang cc python3; do
+          for tool in bsdtar 7zz qemu-system-x86_64 clang cc python3 mcopy mdir mmd mkfs.fat; do
             command -v "$tool"
           done
       - name: Install native target-spec compatible nightly
@@ -166,13 +200,13 @@ jobs:
             crates/nt-ntdll-dll/target
             rust-micro/target
           key: ${{ steps.native-cache-identity.outputs.prefix }}-${{ github.sha }}
-      - name: Download exact stopped writable disk
-        if: inputs.resume_run_id != ''
+      - name: Download stopped writable disk
+        if: inputs.resume_run_id != '' || inputs.migrate_run_id != ''
         uses: actions/download-artifact@v4
         with:
-          name: native-kvm-continuation-${{ inputs.resume_run_id }}-${{ inputs.resume_run_attempt }}
+          name: native-kvm-continuation-${{ inputs.resume_run_id || inputs.migrate_run_id }}-${{ inputs.resume_run_attempt || inputs.migrate_run_attempt }}
           path: native-kvm-continuation-in
-          run-id: ${{ inputs.resume_run_id }}
+          run-id: ${{ inputs.resume_run_id || inputs.migrate_run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Verify and install exact writable disk
         id: resume-disk
@@ -182,6 +216,14 @@ jobs:
           RESUME_RUN_ID: ${{ inputs.resume_run_id }}
           RESUME_RUN_ATTEMPT: ${{ inputs.resume_run_attempt }}
         run: python3 scripts/ci_kvm_disk_continuation.py restore --run-id "$RESUME_RUN_ID" --attempt "$RESUME_RUN_ATTEMPT"
+      - name: Verify and migrate installed writable disk
+        id: migrate-disk
+        if: inputs.migrate_run_id != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MIGRATE_RUN_ID: ${{ inputs.migrate_run_id }}
+          MIGRATE_RUN_ATTEMPT: ${{ inputs.migrate_run_attempt }}
+        run: python3 scripts/ci_kvm_disk_continuation.py migrate --run-id "$MIGRATE_RUN_ID" --attempt "$MIGRATE_RUN_ATTEMPT"
       - name: Run bounded KVM startup and capture QMP framebuffer
         env:
           QEMU_ACCEL: kvm
@@ -227,8 +269,8 @@ jobs:
           compression-level: 1
           retention-days: 7
           if-no-files-found: error
-      - name: Roll back the generated disk after a failed continuation
-        if: failure() && steps.resume-disk.outcome == 'success'
+      - name: Roll back the generated disk after a failed continuation or migration
+        if: failure() && (steps.resume-disk.outcome == 'success' || steps.migrate-disk.outcome == 'success')
         run: python3 scripts/ci_kvm_disk_continuation.py rollback
       - name: Upload native build and startup evidence
         if: always()

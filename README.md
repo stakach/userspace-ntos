@@ -21,6 +21,8 @@ The launcher requires Rust nightly with `rust-src`, QEMU with OVMF, a C compiler
 
 `./run.sh` checks a headless boot; `./run.sh --desktop` also opens a QEMU display. [LiberNT desktop acceptance](https://github.com/stakach/userspace-ntos/issues/310) requires genuine Winlogon, Userinit, and Explorer execution, a screenshot, and reboot and persistence checks. A successful crate test or image build alone does not establish desktop acceptance. [The previous ReactOS acceptance](https://github.com/stakach/userspace-ntos/issues/18) is separate.
 
+The [Native x86 KVM smoke workflow](.github/workflows/native-kvm-smoke.yml) can continue a stopped writable disk with `resume_run_id` and `resume_run_attempt` when the source and target use the same commit. For a reviewed newer commit, use the separate `migrate_run_id` and `migrate_run_attempt` inputs. Migration is limited to a successful ancestor run on the same branch, production image, pinned LiberNT release, and verified registry-hive provenance. It stages the new kernel and source-built `ntdll.dll` on a copy of the stopped disk and records the disk's origin; two boots of the resulting exact commit are still required for reboot proof.
+
 ## Update
 
 To update the microkernel, check out the reviewed rust-micro commit in its submodule and commit the new submodule pointer in this repository. To update the LiberNT base, review and change the release URL, source revision, and SHA-256 values in the [media manifest](rust-micro/vendor/libernt/manifest.txt); then rerun the build, crate tests, and desktop acceptance. Push submodule commits before a parent commit that references them.
