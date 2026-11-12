@@ -648,6 +648,7 @@ pub(super) static mut LPC_WAIT_PENDING_DISPATCH: Option<PendingLpcWaitDispatch> 
 
 #[derive(Clone, Copy)]
 pub(crate) enum ProviderWaitPumpCompletion {
+    NestedSourceDeferred,
     Completed(CompletedWin32kDispatch),
     Reparked(PendingProviderWaitDispatch),
     LpcReparked(PendingLpcWaitDispatch),

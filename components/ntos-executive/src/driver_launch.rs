@@ -516,6 +516,11 @@ pub(crate) mod hosted_sync_relations;
 mod hosted_kernel_win32k_buffered_ioctl;
 #[path = "hosted_kernel_win32k_source_ioctl.rs"]
 mod hosted_kernel_win32k_source_ioctl;
+pub(crate) use hosted_kernel_win32k_source_ioctl::{
+    NestedIoctlKey, NestedIoctlSelection, NestedIoctlTerminalStep,
+    selected_nested_terminal_dispatch_matches,
+    selected_nested_terminal_ready,
+};
 #[path = "hosted_source_terminal_packet.rs"]
 mod hosted_source_terminal_packet;
 #[path = "hosted_video_caller_aperture.rs"]

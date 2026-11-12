@@ -1,12 +1,28 @@
 //! Wait-preserving physical exclusion while another component owns root dispatch.
 
 use super::*;
+#[path = "component_ingress_nested_source_ioctl.rs"]
+mod source_ioctl;
+pub(crate) use source_ioctl::{
+    drain_source_ioctl_parent, park_resuming_source_ioctl,
+    redrive_selected_source_ioctl_terminal, requeue_no_effect_source_ioctl,
+    restore_settled_source_ioctl_parent, source_ioctl_child_blocks_fresh_dispatch,
+    source_ioctl_parent_retained, source_ioctl_parent_blocks_provider_resume,
+    source_ioctl_parent_ready,
+    register_selected_source_ioctl_dispatch, finish_selected_source_ioctl_dispatch,
+    quarantine_refused_source_ioctl,
+};
+use crate::{win32k_glue, win32k_subsystem};
 use super::physical_hold::PhysicalExecutionHold;
 use nt_component_suspension::{ExternalAdmissionKey, NestedExecutionIdentity, NestedExecutionScope};
 use nt_user_host::physical_execution_restore::RestoreStep;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use nt_time::CoalescedRetryWake;
 use nt_component_suspension::{next_ready_pending_lane, PendingLaneReadiness};
+use nt_component_suspension::NestedPreEntryCheckpoint;
+use nt_component_suspension::NestedPreEntryParentParkReceipt;
+use nt_component_suspension::NestedPreEntryParentRestoreReceipt;
+use nt_component_suspension::NestedPreEntryPhase;
 
 const ABORT_RETRY_100NS: u64 = 1_600_000;
 static ABORT_WAKE: CoalescedRetryWake = CoalescedRetryWake::new();
@@ -69,10 +85,19 @@ pub(crate) enum RootParkOutcome {
 }
 
 enum ParkAttemptOutcome {
-    NoRunningLane,
+    NoRunningLane(Option<SourceIoctlParent>),
     Parked(ParkedParentHandle),
-    RefusedNoEffect(Error),
+    RefusedNoEffect(Error, Option<SourceIoctlParent>),
     Retained(Error),
+}
+
+pub(crate) enum SourceIoctlPark {
+    NoChild,
+    Parked(ParkedParentHandle),
+    /// Certified no physical effect; the exact selection and page remain owned here.
+    RefusedNoEffect(SourceIoctlParent),
+    RequeuedNoEffect,
+    Retained,
 }
 
 /// A copyable lookup key for a retained restore. The row still owns every physical effect.
@@ -150,6 +175,36 @@ struct Parent {
     root_lane_begun: bool,
     undelivered_root:
         Option<nt_user_host::root_ingress_pass::UndeliveredRootIngress<crate::HostedThreadRole>>,
+    source_ioctl: Option<SourceIoctlParent>,
+}
+
+/// Retained with the physical Reply before a source terminal may borrow the singleton page.
+/// The selection is move-only; a packet address or recycled Work index cannot stand for it.
+pub(crate) struct SourceIoctlParent {
+    key: crate::driver_launch::NestedIoctlKey,
+    checkpoint: NestedPreEntryCheckpoint<crate::driver_launch::NestedIoctlKey>,
+    selection: Option<crate::driver_launch::NestedIoctlSelection>,
+    shared_resume: win32k_glue::SharedResumeSnapshot,
+    dispatch: nt_user_callback::DispatchContext,
+    client: win32k_glue::Win32kClientContext,
+    shared_leases: nt_user_callback::SharedPageLeaseStack<2>,
+    child_dispatch: Option<u64>,
+}
+
+struct ParkedSourceIoctlPage(NestedExecutionIdentity);
+
+// SAFETY: issued only after the retained Parent row owns the complete page snapshot, the
+// exact Reply, a validated canonical nested scope, and an acknowledged physical hold.
+unsafe impl NestedPreEntryParentParkReceipt for ParkedSourceIoctlPage {
+    fn scope_identity(&self) -> NestedExecutionIdentity { self.0 }
+}
+
+struct RestoredSourceIoctlPage(NestedExecutionIdentity);
+
+// SAFETY: issued only after the exact full page has been physically restored and its
+// displaced lease acknowledged. A transport ACK alone never creates this receipt.
+unsafe impl NestedPreEntryParentRestoreReceipt for RestoredSourceIoctlPage {
+    fn scope_identity(&self) -> NestedExecutionIdentity { self.0 }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -253,10 +308,10 @@ fn ticket_matches(ticket: NestedRestoreTicket, parent: &Parent) -> bool {
 }
 
 pub(crate) unsafe fn park_current() -> Result<Option<ParkedParentHandle>, Error> {
-    match park_current_attempt(None) {
-        ParkAttemptOutcome::NoRunningLane => Ok(None),
+    match park_current_attempt(None, None) {
+        ParkAttemptOutcome::NoRunningLane(_) => Ok(None),
         ParkAttemptOutcome::Parked(handle) => Ok(Some(handle)),
-        ParkAttemptOutcome::RefusedNoEffect(error) | ParkAttemptOutcome::Retained(error) => {
+        ParkAttemptOutcome::RefusedNoEffect(error, _) | ParkAttemptOutcome::Retained(error) => {
             Err(error)
         }
     }
@@ -265,19 +320,21 @@ pub(crate) unsafe fn park_current() -> Result<Option<ParkedParentHandle>, Error>
 /// Root ingress receives a move-only proof only when the exact park attempt has no effects.
 /// A retained or uncertain attempt never grants cancellation of its prepared child owner.
 pub(crate) unsafe fn park_current_for_root(admission: ExternalAdmissionKey) -> RootParkOutcome {
-    match park_current_attempt(Some(admission)) {
-        ParkAttemptOutcome::NoRunningLane => {
+    match park_current_attempt(Some(admission), None) {
+        ParkAttemptOutcome::NoRunningLane(_) => {
             RootParkOutcome::NoRunningLane(NoEffectParkProof { admission })
         }
         ParkAttemptOutcome::Parked(handle) => RootParkOutcome::Parked(handle),
-        ParkAttemptOutcome::RefusedNoEffect(error) => {
+        ParkAttemptOutcome::RefusedNoEffect(error, _) => {
             RootParkOutcome::RefusedNoEffect(error, NoEffectParkProof { admission })
         }
         ParkAttemptOutcome::Retained(error) => RootParkOutcome::Retained(error),
     }
 }
 
-unsafe fn park_current_attempt(root_admission: Option<ExternalAdmissionKey>) -> ParkAttemptOutcome {
+unsafe fn park_current_attempt(
+    root_admission: Option<ExternalAdmissionKey>, source_ioctl: Option<SourceIoctlParent>,
+) -> ParkAttemptOutcome {
     // A previous uncertain park remains keyed to this exact child even if the route changed.
     // Never issue a new no-effect proof after a retained attempt for the same admission.
     if root_admission.is_some() && (&*core::ptr::addr_of!(PARENTS)).iter().flatten()
@@ -286,7 +343,7 @@ unsafe fn park_current_attempt(root_admission: Option<ExternalAdmissionKey>) -> 
         return ParkAttemptOutcome::Retained(Error::Admission);
     }
     let Some(lane) = lanes().running() else {
-        return ParkAttemptOutcome::NoRunningLane;
+        return ParkAttemptOutcome::NoRunningLane(source_ioctl);
     };
     let preflight = (|| -> Result<_, Error> {
         let route = lanes()
@@ -297,8 +354,19 @@ unsafe fn park_current_attempt(root_admission: Option<ExternalAdmissionKey>) -> 
     })();
     let (route, dispatch, reply) = match preflight {
         Ok(values) => values,
-        Err(error) => return ParkAttemptOutcome::RefusedNoEffect(error),
+        Err(error) => return ParkAttemptOutcome::RefusedNoEffect(error, source_ioctl),
     };
+    if source_ioctl.as_ref().is_some_and(|source|
+        source.checkpoint.parent_route() != route
+            || source.checkpoint.parent_dispatch() != dispatch
+            || source.checkpoint.parent_reply_object() != reply
+            || source.selection.as_ref().is_none_or(|selection|
+                selection.key().route != route
+                    || selection.key().dispatch != dispatch
+                    || selection.key().reply != reply))
+    {
+        return ParkAttemptOutcome::RefusedNoEffect(Error::Admission, source_ioctl);
+    }
     let rows = &mut *core::ptr::addr_of_mut!(PARENTS);
     // A retained uncertain hold fences its physical TCB even if its old route was retired.
     // A new route generation may not acquire that TCB through a second row.
@@ -312,7 +380,7 @@ unsafe fn park_current_attempt(root_admission: Option<ExternalAdmissionKey>) -> 
         None => {
             let _durable = crate::allocator::enter_durable();
             if rows.try_reserve(1).is_err() {
-                return ParkAttemptOutcome::RefusedNoEffect(Error::Capacity);
+                return ParkAttemptOutcome::RefusedNoEffect(Error::Capacity, source_ioctl);
             }
             rows.push(None);
             rows.len() - 1
@@ -322,7 +390,7 @@ unsafe fn park_current_attempt(root_admission: Option<ExternalAdmissionKey>) -> 
         Ordering::AcqRel, Ordering::Acquire, |next| next.checked_add(1),
     ) {
         Ok(generation) => generation,
-        Err(_) => return ParkAttemptOutcome::RefusedNoEffect(Error::Capacity),
+        Err(_) => return ParkAttemptOutcome::RefusedNoEffect(Error::Capacity, source_ioctl),
     };
     rows[index] = Some(Parent {
         generation,
@@ -338,6 +406,7 @@ unsafe fn park_current_attempt(root_admission: Option<ExternalAdmissionKey>) -> 
         root_ingress_restore: None,
         root_lane_begun: false,
         undelivered_root: None,
+        source_ioctl,
     });
     let _saved = crate::ipc_message::SavedMessageBuffer::capture();
     // Suspend cancels IPC in the microkernel. Execution holds preserve the held Call, donated
@@ -347,17 +416,15 @@ unsafe fn park_current_attempt(root_admission: Option<ExternalAdmissionKey>) -> 
             .physical.acquire_has_no_effects();
         if certified_no_effect {
             // The kernel certified no effects. No scope exists and this row can be reused.
+            let source = rows[index].as_mut().expect("retained parent").source_ioctl.take();
             rows[index] = None;
+            return ParkAttemptOutcome::RefusedNoEffect(error, source);
         } else {
             // A held or possibly entered acquire has no scope/handle yet. Keep it fenced and
             // visible as quarantine; never reissue acquire through another generation.
             rows[index].as_mut().expect("retained parent").phase = ParentPhase::Quarantined;
         }
-        return if certified_no_effect {
-            ParkAttemptOutcome::RefusedNoEffect(error)
-        } else {
-            ParkAttemptOutcome::Retained(error)
-        };
+        return ParkAttemptOutcome::Retained(error);
     }
     let owner = owner();
     let scope = owner
@@ -375,26 +442,31 @@ unsafe fn park_current_attempt(root_admission: Option<ExternalAdmissionKey>) -> 
         Ok(scope) => scope,
         Err(_) => {
             let parent = rows[index].as_mut().expect("retained parent");
-            let mut abort_acknowledged = false;
             if parent.physical.begin_abort_after_failed_scope().is_ok() {
                 parent.phase = ParentPhase::AbortPending;
                 if attempt_abort(parent) {
+                    let source = rows[index].as_mut().expect("retained parent").source_ioctl.take();
                     rows[index] = None;
-                    abort_acknowledged = true;
+                    return ParkAttemptOutcome::RefusedNoEffect(Error::Admission, source);
                 }
             } else {
                 parent.phase = ParentPhase::Quarantined;
             }
-            return if abort_acknowledged {
-                ParkAttemptOutcome::RefusedNoEffect(Error::Admission)
-            } else {
-                ParkAttemptOutcome::Retained(Error::Admission)
-            };
+            return ParkAttemptOutcome::Retained(Error::Admission);
         }
     };
     let identity = scope.identity();
     let parent = rows[index].as_mut().expect("retained parent");
     parent.scope = Some(scope);
+    if let Some(source) = parent.source_ioctl.as_mut() {
+        let scope = parent.scope.as_ref().expect("retained source scope");
+        if source.checkpoint.park(
+            lanes(), scope, ParkedSourceIoctlPage(scope.identity()),
+        ).is_err() {
+            parent.phase = ParentPhase::Quarantined;
+            return ParkAttemptOutcome::Retained(Error::Admission);
+        }
+    }
     parent.phase = ParentPhase::Parked;
     ParkAttemptOutcome::Parked(ParkedParentHandle { index, generation, identity })
 }

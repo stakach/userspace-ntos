@@ -540,6 +540,9 @@ pub(crate) unsafe fn run_root_maintenance(
             RootMaintenanceResumeOutcome::RetainedFailure
         }
         win32k_glue::RootMaintenancePumpCompletion::Restored(
+            win32k_glue::ProviderWaitPumpCompletion::NestedSourceDeferred,
+        ) => RootMaintenanceResumeOutcome::RetainedFailure,
+        win32k_glue::RootMaintenancePumpCompletion::Restored(
             win32k_glue::ProviderWaitPumpCompletion::UserCallbackSuspended,
         ) => {
             trace_root_refusal(ticket, b"callback-unexpected", 0);

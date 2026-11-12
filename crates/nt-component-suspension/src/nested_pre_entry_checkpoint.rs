@@ -7,7 +7,7 @@ use crate::{peer_registry::PeerRoute, ComponentSuspensionLanes, LaneDispatchIden
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NestedPreEntryPhase {
     ResumingCandidate, Parked, ChildReserved, ChildActive, ChildAcknowledged,
-    Restoring, ParentActive, Uncertain,
+    Restoring, ParentActive, Requeued, Uncertain,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,6 +231,61 @@ impl<K: Copy + Eq> NestedPreEntryCheckpoint<K> {
         };
         frame.phase = SuspensionPhase::Resuming { completion, cancelled };
         self.phase = NestedPreEntryPhase::ParentActive;
+        Ok(())
+    }
+
+    /// The provider pump has not entered since begin_resume. Once the exact child settled and
+    /// the physical parent was restored, return the original completion to normal selection.
+    /// This never replays the child; the retained frame still owns its original continuation.
+    pub fn requeue_unentered_parent<C, R: Clone, T>(
+        &mut self, lanes: &mut ComponentSuspensionLanes<C, R, T>,
+    ) -> Result<(), NestedPreEntryError> {
+        self.expect_phase(NestedPreEntryPhase::ParentActive)?;
+        self.requeue_unentered_frame(lanes)
+    }
+
+    /// A certified no-effect physical park leaves the parent Resuming and may be retried later.
+    pub fn requeue_no_effect_parent<C, R: Clone, T>(
+        &mut self, lanes: &mut ComponentSuspensionLanes<C, R, T>,
+    ) -> Result<(), NestedPreEntryError> {
+        self.expect_phase(NestedPreEntryPhase::ResumingCandidate)?;
+        self.requeue_unentered_frame(lanes)
+    }
+
+    fn requeue_unentered_frame<C, R: Clone, T>(
+        &mut self, lanes: &mut ComponentSuspensionLanes<C, R, T>,
+    ) -> Result<(), NestedPreEntryError> {
+        let lane = self.dispatch.lane();
+        if lanes.running != Some(lane)
+            || lanes.phase(lane) != Ok(LanePhase::Running)
+            || lanes.active_dispatch_identity(lane) != Ok(Some(self.dispatch))
+            || lanes.peer_route(lane) != Ok(Some(self.route))
+            || lanes.binding(lane).map(|binding| binding.reply_object) != Ok(self.reply_object)
+        {
+            return Err(NestedPreEntryError::WrongParent);
+        }
+        let frame = lanes.top(lane).map_err(|_| NestedPreEntryError::WrongParent)?
+            .ok_or(NestedPreEntryError::WrongParent)?;
+        if frame.key != self.key || frame.owner != self.owner
+            || frame.admission_sequence != self.admission_sequence
+            || frame.nested_child.is_some()
+        {
+            return Err(NestedPreEntryError::WrongParent);
+        }
+        let (completion, cancelled) = match &frame.phase {
+            SuspensionPhase::Resuming { completion, cancelled } =>
+                (completion.clone(), *cancelled),
+            _ => return Err(NestedPreEntryError::WrongParent),
+        };
+        let lane = lanes.lane_mut(lane).expect("validated exact parent");
+        lane.suspensions.frames.last_mut().expect("validated top").phase = if cancelled {
+            SuspensionPhase::Cancelled { completion }
+        } else {
+            SuspensionPhase::Selected { completion }
+        };
+        lane.phase = LanePhase::Suspended;
+        lanes.running = None;
+        self.phase = NestedPreEntryPhase::Requeued;
         Ok(())
     }
 

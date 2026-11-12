@@ -439,7 +439,8 @@ fn result_kind(result: RootMaintenancePumpCompletion) -> Option<RootMaintenanceT
         Pump::ReceiveReparked(_) => RootMaintenanceTransferKind::Receive,
         Pump::ServiceReparked(_) => RootMaintenanceTransferKind::ServiceWait,
         Pump::MaintenanceReparked(_) => RootMaintenanceTransferKind::RootMaintenance,
-        Pump::Restored(Provider::Failed(_) | Provider::RetainedFailure(_, _)
+        Pump::Restored(Provider::NestedSourceDeferred
+            | Provider::Failed(_) | Provider::RetainedFailure(_, _)
             | Provider::ReceiveReparked(_)
             | Provider::ServiceReparked(_)) | Pump::RetainedFailure(_) => return None,
     })

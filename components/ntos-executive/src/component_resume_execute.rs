@@ -64,7 +64,11 @@ pub(crate) unsafe fn run_hosted(
     nt_handler: *mut ExecNtHandler,
     candidate: Candidate,
 ) -> Option<ComponentSuspensionRuntimeOutcome> {
-    if crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume() {
+    if crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
+        || crate::spawn_hosts::shared_ingress::owner::runtime::nested::source_ioctl_parent_blocks_provider_resume(
+            candidate.owner.dispatch_id,
+        )
+    {
         return None;
     }
     let lane_resume = candidate.resume;
@@ -124,10 +128,12 @@ pub(crate) unsafe fn run_hosted(
     let pump_completion = match continuation.pending {
         PendingComponentDispatch::Provider(pending) => {
             match win32k_glue::resume_suspended_provider_wait_component(
+                nt_handler,
                 pending,
                 resume.key.id,
                 resume.completion.status,
             ) {
+                win32k_glue::ProviderWaitPumpCompletion::NestedSourceDeferred => return None,
                 win32k_glue::ProviderWaitPumpCompletion::Completed(dispatch) => {
                     ComponentPumpCompletion::Completed(dispatch)
                 }
@@ -199,6 +205,7 @@ pub(crate) unsafe fn run_hosted(
         PendingComponentDispatch::ServiceWait(pending) => {
             match win32k_glue::resume_suspended_service_wait_component(pending) {
                 win32k_glue::ServiceWaitPumpCompletion::Restored(completion) => match completion {
+                    win32k_glue::ProviderWaitPumpCompletion::NestedSourceDeferred => return None,
                     win32k_glue::ProviderWaitPumpCompletion::Completed(dispatch) =>
                         ComponentPumpCompletion::Completed(dispatch),
                     win32k_glue::ProviderWaitPumpCompletion::Reparked(pending) =>
@@ -392,6 +399,7 @@ pub(crate) unsafe fn run_receive(
         }
     };
     let pump_completion = match pump_completion {
+        win32k_glue::ProviderWaitPumpCompletion::NestedSourceDeferred => return None,
         win32k_glue::ProviderWaitPumpCompletion::Completed(dispatch) => {
             ComponentPumpCompletion::Completed(dispatch)
         }

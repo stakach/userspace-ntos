@@ -6909,6 +6909,7 @@ pub(crate) unsafe fn nested_hosted_file_work_ready() -> bool {
         return input;
     }
     input
+        || crate::spawn_hosts::shared_ingress::owner::runtime::nested::source_ioctl_parent_ready()
         || crate::driver_launch::nested_hosted_driver_create_ready()
         || crate::driver_launch::nested_hosted_query_path_ready()
         || crate::driver_launch::nested_hosted_internal_control_ready()
@@ -7060,7 +7061,11 @@ pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {
         && crate::driver_launch::redrive_nested_hosted_file_lifecycle_work() { return true; }
     if crate::hosted_routed_file_close_work::nested_work_ready()
         && crate::hosted_routed_file_close_work::redrive_nested_ready(handler) { return true; }
-    if crate::driver_launch::nested_win32k_source_work_ready()
+    if crate::spawn_hosts::shared_ingress::owner::runtime::nested::drain_source_ioctl_parent(handler) {
+        return true;
+    }
+    if !crate::spawn_hosts::shared_ingress::owner::runtime::nested::source_ioctl_parent_retained()
+        && crate::driver_launch::nested_win32k_source_work_ready()
         && crate::driver_launch::redrive_nested_win32k_source_work(handler) { return true; }
     if crate::provider_section_broker::nested_work_ready()
         && crate::provider_section_broker::redrive_nested_ready(handler) { return true; }

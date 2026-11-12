@@ -1,6 +1,7 @@
 //! Retained file-less win32k source IRPs dispatched to an exact canonical Device.
 
 use super::*;
+use core::sync::atomic::{AtomicU64, AtomicUsize};
 use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_io_manager::hosted_forward_target::HostedForwardTarget;
 use nt_io_manager::win32k_source_irp_ioctl_wire as wire;
@@ -14,9 +15,74 @@ use nt_io_manager::{WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IRP_SIZE};
 use nt_kernel_exec::{EventLeaseId, EventLeaseKind, EventObjectId, EventSignalMode};
 
 type Route = nt_component_suspension::peer_registry::PeerRoute;
-type NestedIoctlKey = NestedSourceWorkKey<Route, nt_component_suspension::LaneDispatchIdentity>;
+pub(crate) type NestedIoctlKey = NestedSourceWorkKey<Route, nt_component_suspension::LaneDispatchIdentity>;
 pub(crate) type NestedIoctlSelection =
     NestedSourceSelection<Route, nt_component_suspension::LaneDispatchIdentity>;
+
+// The physical Parent retains the exact selection. These scalars prove that only its selected
+// Work's terminal transport is making the current dispatch, without borrowing the Work during
+// its mutable advance or aliasing the retained Parent row across nested native entry.
+static ACTIVE_NESTED_WORK: AtomicUsize = AtomicUsize::new(0);
+static mut ACTIVE_NESTED_KEY: Option<NestedIoctlKey> = None;
+static ACTIVE_NESTED_PACKET: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_NESTED_LENGTH: AtomicU64 = AtomicU64::new(0);
+
+struct ActiveNestedWork;
+
+impl ActiveNestedWork {
+    unsafe fn enter(key: NestedIoctlKey) -> Option<Self> {
+        if ACTIVE_NESTED_WORK.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return None;
+        }
+        core::ptr::write(core::ptr::addr_of_mut!(ACTIVE_NESTED_KEY), Some(key));
+        Some(Self)
+    }
+}
+
+impl Drop for ActiveNestedWork {
+    fn drop(&mut self) {
+        ACTIVE_NESTED_PACKET.store(0, Ordering::Release);
+        ACTIVE_NESTED_LENGTH.store(0, Ordering::Release);
+        unsafe { core::ptr::write(core::ptr::addr_of_mut!(ACTIVE_NESTED_KEY), None); }
+        ACTIVE_NESTED_WORK.store(0, Ordering::Release);
+    }
+}
+
+pub(crate) unsafe fn selected_nested_terminal_dispatch_matches(
+    key: NestedIoctlKey, packet: u64, length: u64,
+) -> bool {
+    ACTIVE_NESTED_WORK.load(Ordering::Acquire) != 0
+        && core::ptr::read(core::ptr::addr_of!(ACTIVE_NESTED_KEY)) == Some(key)
+        && ACTIVE_NESTED_PACKET.load(Ordering::Acquire) == packet
+        && ACTIVE_NESTED_LENGTH.load(Ordering::Acquire) == length
+        && packet != 0 && length != 0
+}
+
+pub(crate) unsafe fn selected_nested_terminal_ready(key: NestedIoctlKey) -> bool {
+    (&*core::ptr::addr_of!(WORK)).iter().flatten()
+        .any(|work| work.nested_terminal_key() == Some(key)
+            && work.ready_for_nested_step())
+}
+
+unsafe fn dispatch_selected_source_ioctl_terminal(
+    packet: u64, length: u64,
+) -> crate::win32k_glue::SourceIoctlTerminalDispatch {
+    struct PacketPermit;
+    impl Drop for PacketPermit {
+        fn drop(&mut self) {
+            ACTIVE_NESTED_PACKET.store(0, Ordering::Release);
+            ACTIVE_NESTED_LENGTH.store(0, Ordering::Release);
+        }
+    }
+    let permit = if ACTIVE_NESTED_WORK.load(Ordering::Acquire) != 0 {
+        ACTIVE_NESTED_PACKET.store(packet, Ordering::Release);
+        ACTIVE_NESTED_LENGTH.store(length, Ordering::Release);
+        Some(PacketPermit)
+    } else { None };
+    let result = crate::win32k_glue::dispatch_source_ioctl_terminal(packet, length);
+    drop(permit);
+    result
+}
 
 pub(crate) enum NestedIoctlTerminalStep {
     PreEntryRetained,
@@ -860,7 +926,7 @@ impl Work {
         }
         let transport = self.terminal_packet.as_mut().expect("retained IOCTL terminal transport");
         let ready = if self.discarding { transport.publish() }
-            else { transport.prepare(crate::win32k_glue::dispatch_source_ioctl_terminal) };
+            else { transport.prepare(dispatch_selected_source_ioctl_terminal) };
         if !self.terminal_traced {
             if let Some(address) = transport.packet_address() {
                 self.terminal_traced = true;
@@ -944,7 +1010,7 @@ impl Work {
         if self.origin_committed { return self.event_barrier.is_none(); }
         if !self.terminal_acknowledged || !self.event_signaled { return false; }
         if !self.terminal_packet.as_mut().expect("retained terminal transport").finish(
-            88, false, self.event_barrier.map_or(0, |barrier| barrier.sequence()), crate::win32k_glue::dispatch_source_ioctl_terminal,
+            88, false, self.event_barrier.map_or(0, |barrier| barrier.sequence()), dispatch_selected_source_ioctl_terminal,
         ) {
             self.indeterminate |= self.terminal_packet.as_ref().is_some_and(|packet| packet.indeterminate());
             return false;
@@ -1088,7 +1154,7 @@ impl Work {
             self.discarding = true;
             if !self.deliver_terminal() { return false; }
             if !self.terminal_packet.as_mut().expect("retained terminal transport").finish(
-                88, true, 0, crate::win32k_glue::dispatch_source_ioctl_terminal,
+                88, true, 0, dispatch_selected_source_ioctl_terminal,
             ) {
                 self.indeterminate |= self.terminal_packet.as_ref().is_some_and(|packet| packet.indeterminate());
                 return false;
@@ -1246,10 +1312,15 @@ pub(crate) unsafe fn redrive_selected_nested_terminal(
     if (&mut *core::ptr::addr_of_mut!(EXECUTING)).try_reserve(1).is_err() {
         return (selection, NestedIoctlTerminalStep::PreEntryRetained);
     }
+    if ACTIVE_NESTED_WORK.load(Ordering::Acquire) != 0 {
+        return (selection, NestedIoctlTerminalStep::PreEntryRetained);
+    }
     let Some(mut work) = (&mut *core::ptr::addr_of_mut!(WORK))[index].take() else {
         return (selection, NestedIoctlTerminalStep::Indeterminate);
     };
     (&mut *core::ptr::addr_of_mut!(EXECUTING)).push(index);
+    let _active = ActiveNestedWork::enter(selection.key())
+        .expect("preflight nested Work exclusion");
     let before_attempt = work.terminal_packet.as_ref()
         .map_or(0, |packet| packet.dispatch_observation().0);
     let done = work.advance(handler);
@@ -1284,6 +1355,7 @@ pub(crate) unsafe fn redrive_selected_nested_terminal(
 }
 
 unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> bool {
+    if runtime::nested::source_ioctl_parent_retained() { return false; }
     let _durable = crate::allocator::enter_durable();
     let count = (&*core::ptr::addr_of!(WORK)).len();
     if count == 0 { return false; }

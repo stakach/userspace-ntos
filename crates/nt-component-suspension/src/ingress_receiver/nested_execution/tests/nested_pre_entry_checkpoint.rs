@@ -73,6 +73,29 @@ fn resuming_parent_requires_exact_park_and_child_ack_before_restore() {
 }
 
 #[test]
+fn settled_nested_child_requeues_only_the_exact_unentered_provider_resume() {
+    let mut f = Fixture::new();
+    let packet = Packet { address: 0x2000, allocation_id: 8, generation: 5 };
+    let (route, dispatch, mut checkpoint) = parent_and_checkpoint(&mut f, packet);
+    let key = checkpoint.parent_key();
+    let mut scope = f.receiver.suspend_for_nested_execution(
+        route, dispatch, &mut f.lanes, &f.peers, bound,
+    ).unwrap();
+    checkpoint.park(&mut f.lanes, &scope, ParkedPage(scope.identity())).unwrap();
+    checkpoint.reserve_child(packet, Box::new(1u64)).unwrap();
+    checkpoint.child_started(packet).unwrap();
+    checkpoint.acknowledge_child(TerminalAck(packet)).unwrap();
+    checkpoint.begin_restore(&f.lanes, &scope).unwrap();
+    checkpoint.restore_applied(&mut f.lanes, &scope, RestoredPage(scope.identity())).unwrap();
+    f.receiver.resume_nested_execution(&mut scope, &mut f.lanes, &f.peers, bound).unwrap();
+    checkpoint.requeue_unentered_parent(&mut f.lanes).unwrap();
+    assert_eq!(f.lanes.next_resumable().unwrap().suspension.key, key);
+    assert_eq!(f.lanes.begin_resume(dispatch.lane(), checkpoint.parent_reply_object(), key)
+        .unwrap().key, key);
+    assert!(checkpoint.requeue_unentered_parent(&mut f.lanes).is_err());
+}
+
+#[test]
 fn wrong_packet_generation_duplicate_and_uncertain_effect_cannot_resume_parent() {
     let mut f = Fixture::new();
     let packet = Packet { address: 0x1000, allocation_id: 7, generation: 4 };

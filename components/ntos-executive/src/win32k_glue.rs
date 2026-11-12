@@ -33,7 +33,7 @@ pub(crate) use receive::{prepare_receive_yield, prepare_root_ingress_yield, prep
 pub(crate) use pending_dispatch::{
     shared_page_client_identity, try_capture_exact_shared_resume_snapshot,
     select_and_restore_shared_resume_snapshot,
-    SharedResumeSnapshot,
+    restore_shared_resume_snapshot_effect, SharedResumeRestoreEffect, SharedResumeSnapshot,
     take_pending_lpc_wait_dispatch, take_pending_provider_wait_dispatch, LpcWaitPumpCompletion,
     PendingLpcWaitDispatch, PendingProviderWaitDispatch, ProviderWaitPumpCompletion,
     PendingReceiveDispatch, ReceiveYield, take_pending_receive_dispatch,
@@ -4845,6 +4845,7 @@ unsafe fn restore_wait_argument_snapshot(
 }
 
 pub(crate) unsafe fn resume_suspended_provider_wait_component(
+    handler: *mut ExecNtHandler,
     pending: PendingProviderWaitDispatch,
     wait_id: u64,
     status: i32,
@@ -4892,6 +4893,29 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
     }
     if !restore_wait_argument_snapshot(&pending.arg_snapshot, pending.arg_snapshot_len) {
         return ProviderWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
+    }
+    use crate::spawn_hosts::shared_ingress::owner::runtime::nested;
+    match nested::park_resuming_source_ioctl(pending.dispatch, pending.client) {
+        nested::SourceIoctlPark::NoChild => {}
+        nested::SourceIoctlPark::RequeuedNoEffect => {
+            return ProviderWaitPumpCompletion::NestedSourceDeferred;
+        }
+        nested::SourceIoctlPark::Parked(handle) => {
+            if matches!(nested::redrive_selected_source_ioctl_terminal(&handle, handler), Ok(true)) {
+                let mut handle = Some(handle);
+                let _ = nested::restore_settled_source_ioctl_parent(&mut handle);
+            }
+            return ProviderWaitPumpCompletion::NestedSourceDeferred;
+        }
+        nested::SourceIoctlPark::RefusedNoEffect(source) => {
+            if let Err((_, source)) = nested::requeue_no_effect_source_ioctl(source) {
+                nested::quarantine_refused_source_ioctl(source);
+            }
+            return ProviderWaitPumpCompletion::NestedSourceDeferred;
+        }
+        nested::SourceIoctlPark::Retained => {
+            return ProviderWaitPumpCompletion::NestedSourceDeferred;
+        }
     }
     let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
         as *mut nt_provider_wait::ProviderWaitSharedPage;
@@ -7014,6 +7038,12 @@ unsafe fn dispatch_source_terminal(
     let Some(dispatch_id) = next_win32k_dispatch_id() else {
         return SourcePnpTerminalDispatch::NotEntered(0xC000_009Au32 as i32);
     };
+    let selected_ioctl = request_kind == win32k_subsystem::WIN32K_REQUEST_SOURCE_IOCTL_TERMINAL;
+    if selected_ioctl && !crate::spawn_hosts::shared_ingress::owner::runtime::nested::register_selected_source_ioctl_dispatch(
+        dispatch_id, packet_va, len,
+    ) {
+        return SourcePnpTerminalDispatch::NotEntered(0xC000_000Du32 as i32);
+    }
     let mut entered = false;
     let mut retained = None;
     let Win32kDispatchOutcome::Known { value: result, completed } = win32k_dispatch_wide_observed_inner(
@@ -7022,6 +7052,11 @@ unsafe fn dispatch_source_terminal(
         false, Some(&mut entered), None, None, None, None, DispatchMode::Source(&mut retained),
     );
     if let Some(owner) = retained { return SourcePnpTerminalDispatch::Retained(owner); }
+    if selected_ioctl {
+        crate::spawn_hosts::shared_ingress::owner::runtime::nested::finish_selected_source_ioctl_dispatch(
+            dispatch_id,
+        );
+    }
     let status = result as u32 as i32;
     if completed {
         SourcePnpTerminalDispatch::Returned(status)
@@ -7555,7 +7590,11 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         }
         print_str(b"\n");
     }
-    if shared_busy || !win32k_client_context_is_admitted(client)
+    if shared_busy
+        || crate::spawn_hosts::shared_ingress::owner::runtime::nested::source_ioctl_child_blocks_fresh_dispatch(
+            request_kind, a0, a1,
+        )
+        || !win32k_client_context_is_admitted(client)
         || !callback_client_can_enter_nested(client) {
         return (0xC000_000Du64, false).into();
     }
