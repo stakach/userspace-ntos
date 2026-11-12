@@ -34,9 +34,12 @@ pub(crate) use pending_dispatch::{
     shared_page_client_identity, try_capture_exact_shared_resume_snapshot,
     select_and_restore_shared_resume_snapshot,
     restore_shared_resume_snapshot_effect, SharedResumeRestoreEffect, SharedResumeSnapshot,
-    take_pending_lpc_wait_dispatch, take_pending_provider_wait_dispatch, LpcWaitPumpCompletion,
+    take_pending_lpc_wait_dispatch, take_pending_provider_wait_dispatch,
+    restore_pending_lpc_wait_dispatch, restore_pending_provider_wait_dispatch,
+    LpcWaitPumpCompletion,
     PendingLpcWaitDispatch, PendingProviderWaitDispatch, ProviderWaitPumpCompletion,
     PendingReceiveDispatch, ReceiveYield, take_pending_receive_dispatch,
+    restore_pending_receive_dispatch,
     PendingRootIngressDispatch, RootIngressYield,
     pending_root_ingress_dispatch_is_some, pending_root_ingress_selector,
     TakenRootIngressDispatch,
@@ -2842,7 +2845,7 @@ pub(crate) unsafe fn in_callback_nested_wait_token_is_current(
             && frame.client_tcb() == client.tcb)
 }
 
-unsafe fn pending_callback_token_on_lane(
+pub(crate) unsafe fn pending_callback_token_on_lane(
     client: Win32kClientContext,
     lane: nt_component_suspension::LaneHandle,
 ) -> Option<u64> {
@@ -7265,7 +7268,11 @@ pub(crate) unsafe fn win32k_create_process_before_loader(
         client, win32k_subsystem::WIN32K_REQUEST_PS_PROVIDER, true, Some(&mut entered),
         None, None, Some(&mut suspended), None, DispatchMode::Standard,
     );
-    outcome.process_create(entered, suspended)
+    match outcome.process_create(entered, suspended) {
+        Win32kProcessCreateResult::NotEntered(nt_process::STATUS_DEVICE_BUSY) =>
+            Win32kProcessCreateResult::BusyNoEffect,
+        other => other,
+    }
 }
 
 pub(crate) use nt_user_host::provider_finalization::ProviderFinalizationResult as PsProviderFinalization;
@@ -7590,8 +7597,11 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         }
         print_str(b"\n");
     }
-    if shared_busy
-        || crate::spawn_hosts::shared_ingress::owner::runtime::nested::source_ioctl_child_blocks_fresh_dispatch(
+    if shared_busy {
+        // This shared publication has another retained owner. No provider effect was entered.
+        return (nt_process::STATUS_DEVICE_BUSY as u64, false).into();
+    }
+    if crate::spawn_hosts::shared_ingress::owner::runtime::nested::source_ioctl_child_blocks_fresh_dispatch(
             request_kind, a0, a1,
         )
         || !win32k_client_context_is_admitted(client)

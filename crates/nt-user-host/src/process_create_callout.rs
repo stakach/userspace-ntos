@@ -32,6 +32,112 @@ impl<R: Copy + Eq> InitialThreadReplyOrigin<R> {
     }
 }
 
+/// The original source Reply and the target's one-shot initial creation have one owner.
+/// Native effects live in the executive; this contract permits only ordered redrive after a
+/// proven no-effect refusal and makes uncertain ownership absorbing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitialReplyRetryPhase {
+    AwaitingPage,
+    Cancelling(u32),
+    Finishing,
+    SuspendedTransfer,
+    Replying(u32),
+    ReplyUncertain,
+    Transferred,
+    Complete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InitialReplyRetry<R: Copy + Eq> {
+    origin: InitialThreadReplyOrigin<R>,
+    reply_cap: u64,
+    transferred_from_root: bool,
+    phase: InitialReplyRetryPhase,
+}
+
+impl<R: Copy + Eq> InitialReplyRetry<R> {
+    pub fn new(origin: InitialThreadReplyOrigin<R>, reply_cap: u64) -> Option<Self> {
+        (reply_cap != 0).then_some(Self {
+            origin, reply_cap, transferred_from_root: true,
+            phase: InitialReplyRetryPhase::AwaitingPage,
+        })
+    }
+
+    pub const fn origin(&self) -> InitialThreadReplyOrigin<R> { self.origin }
+    pub const fn reply_cap(&self) -> u64 { self.reply_cap }
+    pub const fn phase(&self) -> InitialReplyRetryPhase { self.phase }
+    pub fn exact(&self, source: ThreadBinding<R>, target: ThreadBinding<R>) -> bool {
+        self.origin.source == source && self.origin.target == target
+    }
+    pub fn can_redrive(&self, source: ThreadBinding<R>, target: ThreadBinding<R>) -> bool {
+        self.exact(source, target) && !self.transferred_from_root
+            && !matches!(self.phase,
+                InitialReplyRetryPhase::ReplyUncertain
+                | InitialReplyRetryPhase::Transferred | InitialReplyRetryPhase::Complete)
+    }
+    /// The root selector was rotated before this marker can be consumed. It cannot be taken
+    /// twice, even if the same source process calls again on a recycled thread identifier.
+    pub fn take_root_transfer(&mut self, source: ThreadBinding<R>) -> bool {
+        if self.origin.source != source || !self.transferred_from_root { return false; }
+        self.transferred_from_root = false;
+        true
+    }
+    pub fn transition(&mut self, next: InitialReplyRetryPhase) -> bool {
+        use InitialReplyRetryPhase::*;
+        let valid = matches!((self.phase, next),
+            (AwaitingPage, AwaitingPage | Cancelling(_) | Finishing | SuspendedTransfer | ReplyUncertain)
+            | (Cancelling(_), Cancelling(_) | Replying(_) | ReplyUncertain)
+            | (Finishing, Finishing | Replying(_) | ReplyUncertain)
+            | (SuspendedTransfer, SuspendedTransfer | Transferred | ReplyUncertain)
+            | (Replying(_), Complete | ReplyUncertain)
+            | (ReplyUncertain, ReplyUncertain));
+        if valid { self.phase = next; }
+        valid
+    }
+}
+
+/// Selects only the callback token carried by the exact pending lane. The executive validates
+/// that this token still owns the active callback before any native wait admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitialCallbackTransfer<L: Copy + Eq> {
+    Root,
+    InCallback { lane: L, token: u64 },
+}
+
+pub fn initial_callback_transfer<L: Copy + Eq>(
+    lane: L, token: Option<u64>,
+) -> Option<InitialCallbackTransfer<L>> {
+    match token {
+        Some(0) => None,
+        Some(token) => Some(InitialCallbackTransfer::InCallback { lane, token }),
+        None => Some(InitialCallbackTransfer::Root),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitialFinishOwner {
+    Retired,
+    Retained(crate::initial_creation_progress::InitialCreationStep),
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitialFinishDisposition { Redrive, Reply, Fence }
+
+pub fn initial_finish_disposition(
+    status: u32, busy_status: u32, owner: InitialFinishOwner,
+) -> InitialFinishDisposition {
+    use InitialFinishDisposition::*;
+    use InitialFinishOwner::*;
+    match owner {
+        Retired => Reply,
+        Retained(crate::initial_creation_progress::InitialCreationStep::PhysicalIndeterminate) =>
+            Redrive,
+        Retained(_) if status == busy_status => Redrive,
+        Retained(_) | Unknown => Fence,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CalloutResult {
     NotEntered(u32),
@@ -157,9 +263,102 @@ impl ProcessCreateCalloutOwner {
 mod tests {
     use super::*;
     use crate::process_identity::{ProcessGeneration, ProcessIdentity};
+    use crate::thread_binding::ThreadBinding;
 
     fn process(generation: u64) -> ProcessIdentity {
         ProcessIdentity { pid: 60, generation: ProcessGeneration::Hosted(generation) }
+    }
+
+    fn reply_origin() -> InitialThreadReplyOrigin<u8> {
+        let source = ThreadBinding {
+            pi: 3, process: ProcessIdentity {
+                pid: 50, generation: ProcessGeneration::Hosted(10),
+            }, tid: 100, badge: 17, role: 0, tcb: 0x1000, reservations: None,
+        };
+        let target = ThreadBinding {
+            pi: 8, process: process(20), tid: 200, badge: 29,
+            role: 0, tcb: 0x2000, reservations: None,
+        };
+        InitialThreadReplyOrigin::new(source, target).unwrap()
+    }
+
+    #[test]
+    fn no_effect_busy_preserves_one_reply_and_retries_only_the_same_callout() {
+        let origin = reply_origin();
+        let mut retry = InitialReplyRetry::new(origin, 41).unwrap();
+        let mut callout = ProcessCreateCalloutOwner::new(8, origin.target().process).unwrap();
+        assert_eq!(callout.begin(8, origin.target().process), Ok(()));
+        assert_eq!(callout.record(CalloutResult::NotEntered(0xc000_009e)), Ok(()));
+        assert_eq!(callout.phase(), ProcessCreateCalloutPhase::Pending);
+        assert!(!retry.can_redrive(origin.source(), origin.target()),
+            "the root must consume its one-time transfer first");
+        assert!(retry.take_root_transfer(origin.source()));
+        assert!(!retry.take_root_transfer(origin.source()));
+        assert!(retry.can_redrive(origin.source(), origin.target()));
+        assert!(retry.transition(InitialReplyRetryPhase::AwaitingPage));
+        assert_eq!(retry.reply_cap(), 41);
+        assert_eq!(callout.begin(8, origin.target().process), Ok(()));
+    }
+
+    #[test]
+    fn recycled_source_or_target_generation_cannot_adopt_retained_reply() {
+        let origin = reply_origin();
+        let mut retry = InitialReplyRetry::new(origin, 41).unwrap();
+        let stale_source = ThreadBinding { process: ProcessIdentity {
+            pid: 50, generation: ProcessGeneration::Hosted(11),
+        }, ..origin.source() };
+        let stale_target = ThreadBinding { process: process(21), ..origin.target() };
+        assert!(!retry.take_root_transfer(stale_source));
+        assert!(retry.take_root_transfer(origin.source()));
+        assert!(!retry.can_redrive(stale_source, origin.target()));
+        assert!(!retry.can_redrive(origin.source(), stale_target));
+        assert!(retry.can_redrive(origin.source(), origin.target()));
+    }
+
+    #[test]
+    fn uncertain_reply_and_entered_transfer_cannot_be_redriven() {
+        let origin = reply_origin();
+        let mut retry = InitialReplyRetry::new(origin, 41).unwrap();
+        assert!(retry.take_root_transfer(origin.source()));
+        assert!(retry.transition(InitialReplyRetryPhase::SuspendedTransfer));
+        assert!(retry.transition(InitialReplyRetryPhase::ReplyUncertain));
+        assert!(!retry.can_redrive(origin.source(), origin.target()));
+        assert!(!retry.transition(InitialReplyRetryPhase::SuspendedTransfer));
+        let mut transferred = InitialReplyRetry::new(origin, 42).unwrap();
+        assert!(transferred.take_root_transfer(origin.source()));
+        assert!(transferred.transition(InitialReplyRetryPhase::SuspendedTransfer));
+        assert!(transferred.transition(InitialReplyRetryPhase::Transferred));
+        assert!(!transferred.can_redrive(origin.source(), origin.target()));
+        assert!(!transferred.transition(InitialReplyRetryPhase::Replying(0)));
+    }
+
+    #[test]
+    fn callback_transfer_uses_only_the_captured_lane_and_nonzero_token() {
+        assert_eq!(initial_callback_transfer(7u64, None), Some(InitialCallbackTransfer::Root));
+        assert_eq!(initial_callback_transfer(7u64, Some(31)), Some(
+            InitialCallbackTransfer::InCallback { lane: 7, token: 31 }));
+        assert_eq!(initial_callback_transfer(8u64, Some(31)), Some(
+            InitialCallbackTransfer::InCallback { lane: 8, token: 31 }));
+        assert_eq!(initial_callback_transfer(7u64, Some(0)), None);
+    }
+
+    #[test]
+    fn finish_requires_retired_owner_or_a_safe_redrive_phase() {
+        use crate::initial_creation_progress::InitialCreationStep;
+        use InitialFinishDisposition::*;
+        use InitialFinishOwner::*;
+        const BUSY: u32 = 0xc000_009e;
+        assert_eq!(initial_finish_disposition(0xc000_0005, BUSY, Retired), Reply,
+            "copyout failure after committed creation has one terminal reply");
+        assert_eq!(initial_finish_disposition(BUSY, BUSY,
+            Retained(InitialCreationStep::CommitPs)), Redrive);
+        assert_eq!(initial_finish_disposition(0xc000_0001, BUSY,
+            Retained(InitialCreationStep::CommitPs)), Fence);
+        assert_eq!(initial_finish_disposition(0xc000_0001, BUSY,
+            Retained(InitialCreationStep::PublishHandle)), Fence);
+        assert_eq!(initial_finish_disposition(0xc000_0001, BUSY,
+            Retained(InitialCreationStep::PhysicalIndeterminate)), Redrive);
+        assert_eq!(initial_finish_disposition(BUSY, BUSY, Unknown), Fence);
     }
 
     #[test]

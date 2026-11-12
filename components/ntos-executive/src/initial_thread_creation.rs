@@ -47,6 +47,165 @@ enum InitialCreationDelivery {
 enum ProcessCalloutProgress {
     Ready,
     Suspended,
+    RetryNoEffect,
+}
+
+/// The guest still owns its original NtCreateThread Call. The target runtime retains the Ps
+/// plan; this row owns the source Reply while a different Win32k shared-page owner settles.
+type InitialCreateRetry = nt_user_host::process_create_callout::InitialReplyRetry<HostedThreadRole>;
+use nt_user_host::process_create_callout::InitialReplyRetryPhase as RetryPhase;
+
+static mut INITIAL_CREATE_RETRIES: alloc::vec::Vec<InitialCreateRetry> = alloc::vec::Vec::new();
+
+unsafe fn park_foreign_retry_no_effect(caller: Binding, target: Binding) -> Result<(), u32> {
+    let origin = nt_user_host::process_create_callout::InitialThreadReplyOrigin::new(caller, target)
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let rows = &mut *core::ptr::addr_of_mut!(INITIAL_CREATE_RETRIES);
+    if rows.iter().any(|row| row.origin().source() == caller || row.origin().target() == target) {
+        return Err(nt_process::STATUS_DEVICE_BUSY);
+    }
+    rows.try_reserve(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    let reply_cap = crate::REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    if reply_cap == 0 { return Err(STATUS_INSUFFICIENT_RESOURCES); }
+    // Record the exact process generations and Reply before rotating the root selector.
+    rows.push(InitialCreateRetry::new(origin, reply_cap)
+        .expect("captured root Reply is valid"));
+    if crate::service_sec_image::steal_main_reply() != Some(reply_cap) {
+        // steal_main_reply returns None only when the selector was not rotated. Its commit
+        // path does not return after an uncertain effect, so cancellation is still safe here.
+        assert_eq!(crate::REPLY_MAIN_SLOT.load(Ordering::Relaxed), reply_cap);
+        rows.pop();
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    Ok(())
+}
+
+/// The service loop consumes this marker before its ordinary STATUS_PENDING provider handoff.
+pub(crate) unsafe fn take_retry_transferred(caller: Binding) -> bool {
+    let rows = &mut *core::ptr::addr_of_mut!(INITIAL_CREATE_RETRIES);
+    let Some(row) = rows.iter_mut().find(|row| row.origin().source() == caller)
+    else { return false; };
+    row.take_root_transfer(caller)
+}
+
+/// Advance at most one retained source Reply per flat root pass. The shared-page owner must
+/// settle in the root loop; spinning here would prevent the very event that clears its fence.
+pub(crate) unsafe fn redrive_retry_no_effect(handler: &mut ExecNtHandler) {
+    if crate::service_sec_image::component_shared_publication_is_busy() { return; }
+    let mut row = {
+        let rows = &mut *core::ptr::addr_of_mut!(INITIAL_CREATE_RETRIES);
+        let Some(index) = rows.iter().position(|row| row.can_redrive(
+            row.origin().source(), row.origin().target(),
+        )) else { return; };
+        rows.swap_remove(index)
+    };
+    let source = row.origin().source();
+    let target = row.origin().target();
+    // A numeric pid or TCB is insufficient: the retained Reply belongs to these two exact
+    // process generations. An unproven disappearance fences the Reply instead of replaying it.
+    if runtime(handler, source).is_none() || runtime(handler, target).is_none()
+        || handler.capture_process_identity(source.pi) != Some(source.process)
+        || handler.capture_process_identity(target.pi) != Some(target.process)
+    {
+        assert!(row.transition(RetryPhase::ReplyUncertain));
+        (&mut *core::ptr::addr_of_mut!(INITIAL_CREATE_RETRIES)).push(row);
+        return;
+    }
+    // Run immediate local steps through terminal reply in this pass. A blocked step stops the
+    // bounded chain; the next root event wakes it after the shared-page owner can settle.
+    for _ in 0..4 {
+    let previous = row.phase();
+    let next = match row.phase() {
+        RetryPhase::AwaitingPage => {
+            match capture_initial_win32k_client(handler, target) {
+                Ok(client) => match create_win32_process_before_loader(handler, target, client) {
+                    Ok(ProcessCalloutProgress::Ready) => RetryPhase::Finishing,
+                    Ok(ProcessCalloutProgress::RetryNoEffect) => RetryPhase::AwaitingPage,
+                    Ok(ProcessCalloutProgress::Suspended) =>
+                        RetryPhase::SuspendedTransfer,
+                    Err(status) if callout_may_retire(handler, target) => {
+                        RetryPhase::Cancelling(status)
+                    }
+                    Err(_) => RetryPhase::ReplyUncertain,
+                },
+                Err(status) if status == nt_process::STATUS_DEVICE_BUSY => RetryPhase::AwaitingPage,
+                Err(status) => {
+                    RetryPhase::Cancelling(status)
+                }
+            }
+        }
+        RetryPhase::Cancelling(status) => {
+            let result = cancel_creation(handler, target, status);
+            match runtime(handler, target)
+                .and_then(|owner| owner.initial_creation.try_borrow().ok()) {
+                Some(slot) if slot.is_none() => RetryPhase::Replying(result),
+                Some(_) => RetryPhase::Cancelling(status),
+                None => RetryPhase::ReplyUncertain,
+            }
+        }
+        RetryPhase::Finishing => {
+            let status = handler.finish_foreign_initial_thread(target, InitialCreationDelivery::Direct);
+            // Only retirement of the exact creation owner proves a terminal status. A
+            // physical-start uncertainty can be retried through its dedicated resolver;
+            // another non-busy error with retained ownership is fenced for inspection.
+            let owner = match runtime(handler, target)
+                .and_then(|owner| owner.initial_creation.try_borrow().ok()) {
+                Some(slot) if slot.is_none() =>
+                    nt_user_host::process_create_callout::InitialFinishOwner::Retired,
+                Some(slot) => nt_user_host::process_create_callout::InitialFinishOwner::Retained(
+                    slot.as_ref().expect("retained initial owner").progress.next_step(),
+                ),
+                None => nt_user_host::process_create_callout::InitialFinishOwner::Unknown,
+            };
+            match nt_user_host::process_create_callout::initial_finish_disposition(
+                status, nt_process::STATUS_DEVICE_BUSY, owner,
+            ) {
+                nt_user_host::process_create_callout::InitialFinishDisposition::Redrive =>
+                    RetryPhase::Finishing,
+                nt_user_host::process_create_callout::InitialFinishDisposition::Reply =>
+                    RetryPhase::Replying(status),
+                nt_user_host::process_create_callout::InitialFinishDisposition::Fence =>
+                    RetryPhase::ReplyUncertain,
+            }
+        }
+        RetryPhase::SuspendedTransfer => {
+            match crate::service_sec_image::admit_retained_initial_win32k_dispatch(
+                handler, row.origin(), row.reply_cap(),
+            ) {
+                crate::service_sec_image::RetainedInitialCalloutHandoff::Accepted => {
+                    assert!(row.transition(RetryPhase::Transferred));
+                    return;
+                }
+                crate::service_sec_image::RetainedInitialCalloutHandoff::RetryNoEffect =>
+                    RetryPhase::SuspendedTransfer,
+                crate::service_sec_image::RetainedInitialCalloutHandoff::Retained =>
+                    RetryPhase::ReplyUncertain,
+            }
+        }
+        RetryPhase::Replying(status) => {
+            if crate::service_sec_image::reply_retained_initial_creation(row.reply_cap(), status) {
+                assert!(row.transition(RetryPhase::Complete));
+                return;
+            }
+            RetryPhase::ReplyUncertain
+        }
+        RetryPhase::ReplyUncertain | RetryPhase::Transferred | RetryPhase::Complete =>
+            RetryPhase::ReplyUncertain,
+    };
+    assert!(row.transition(next), "initial Reply phase transition must retain exact ownership");
+    if row.phase() == previous { break; }
+    }
+    (&mut *core::ptr::addr_of_mut!(INITIAL_CREATE_RETRIES)).push(row);
+}
+
+pub(crate) unsafe fn configured_retry_no_effect(handler: &ExecNtHandler, pi: usize, tcb: u64) -> bool {
+    use nt_user_host::process_create_callout::ProcessCreateCalloutPhase;
+    (&*handler.thread_runtime.table).entries.iter().filter_map(|slot| slot.owner())
+        .any(|target| target.pi == pi && target.binding().tcb == tcb
+            && target.initial_creation.try_borrow().is_ok_and(|slot| slot.as_ref()
+                .is_some_and(|owner| matches!(owner.origin, InitialCreationOrigin::Configured)))
+            && target.process_create_callout.try_borrow().is_ok_and(|slot| slot.as_ref()
+                .is_some_and(|owner| owner.phase() == ProcessCreateCalloutPhase::Pending)))
 }
 
 unsafe fn runtime(handler: &ExecNtHandler, binding: Binding) -> Option<&HostedThreadRuntimeOwner> {
@@ -227,6 +386,8 @@ unsafe fn create_win32_process_before_loader(
             .map_err(|_| nt_process::STATUS_DEVICE_BUSY)?;
         let callout = slot.as_mut().ok_or(nt_process::STATUS_DEVICE_BUSY)?;
         let result = match outcome {
+            crate::win32k_glue::Win32kProcessCreateResult::BusyNoEffect =>
+                CalloutResult::NotEntered(nt_process::STATUS_DEVICE_BUSY),
             crate::win32k_glue::Win32kProcessCreateResult::NotEntered(status) =>
                 CalloutResult::NotEntered(status),
             crate::win32k_glue::Win32kProcessCreateResult::Returned(status) =>
@@ -237,11 +398,18 @@ unsafe fn create_win32_process_before_loader(
                 CalloutResult::Suspended,
         };
         callout.record(result).map_err(|_| nt_process::STATUS_DEVICE_BUSY)?;
+        if matches!(outcome, crate::win32k_glue::Win32kProcessCreateResult::BusyNoEffect) {
+            // No shared request, Reply or provider effect was entered. Keep the same exact
+            // process owner and let the root continuation retry after the page fence clears.
+            return Ok(ProcessCalloutProgress::RetryNoEffect);
+        }
         if callout.phase() == ProcessCreateCalloutPhase::Suspended {
             return Ok(ProcessCalloutProgress::Suspended);
         }
         if callout.phase() != ProcessCreateCalloutPhase::Returned {
             return Err(match outcome {
+                crate::win32k_glue::Win32kProcessCreateResult::BusyNoEffect =>
+                    nt_process::STATUS_DEVICE_BUSY,
                 crate::win32k_glue::Win32kProcessCreateResult::NotEntered(status)
                 | crate::win32k_glue::Win32kProcessCreateResult::Returned(status)
                 | crate::win32k_glue::Win32kProcessCreateResult::Indeterminate(status) => {
@@ -555,6 +723,20 @@ impl ExecNtHandler {
         if binding.pi != pi || binding.process != process || binding.tcb != main_tcb {
             return nt_process::STATUS_INVALID_PARAMETER;
         }
+        let retry = runtime(self, binding).is_some_and(|target| {
+            target.initial_creation.try_borrow().is_ok_and(|slot| {
+                slot.as_ref().is_some_and(|owner| matches!(owner.origin, InitialCreationOrigin::Configured))
+            })
+        });
+        if retry {
+            // The original plan owns this process. Re-enter only its no-effect callout;
+            // a further busy refusal remains internal STATUS_PENDING for the alias wake.
+            let client = match capture_initial_win32k_client(self, binding) {
+                Ok(client) => client,
+                Err(status) => return status,
+            };
+            return self.continue_configured_initial_thread(binding, client);
+        }
         let plan = match self.pm.prepare_initial_thread_creation(process.pid) {
             Ok(Some(plan)) => plan,
             Ok(None) => return nt_process::STATUS_INVALID_PARAMETER,
@@ -584,13 +766,24 @@ impl ExecNtHandler {
                 origin: InitialCreationOrigin::Configured,
             });
         }
+        self.continue_configured_initial_thread(binding, client)
+    }
+
+    unsafe fn continue_configured_initial_thread(
+        &mut self, binding: Binding,
+        client: Option<crate::win32k_glue::Win32kClientContext>,
+    ) -> u32 {
         match create_win32_process_before_loader(self, binding, client) {
             Ok(ProcessCalloutProgress::Ready) => {}
             Ok(ProcessCalloutProgress::Suspended) => return nt_user_callback::STATUS_PENDING as u32,
-            Err(status) if callout_may_retire(self, binding) => {
-                return cancel_creation(self, binding, status);
+            Ok(ProcessCalloutProgress::RetryNoEffect) =>
+                return nt_user_callback::STATUS_PENDING as u32,
+            Err(status) => {
+                if callout_may_retire(self, binding) {
+                    return cancel_creation(self, binding, status);
+                }
+                return status;
             }
-            Err(status) => return status,
         }
         self.finish_configured_initial_thread(binding)
     }
@@ -714,10 +907,19 @@ impl ExecNtHandler {
         match create_win32_process_before_loader(self, binding, client) {
             Ok(ProcessCalloutProgress::Ready) => {}
             Ok(ProcessCalloutProgress::Suspended) => return nt_user_callback::STATUS_PENDING as u32,
-            Err(status) if callout_may_retire(self, binding) => {
-                return cancel_creation(self, binding, status);
+            Ok(ProcessCalloutProgress::RetryNoEffect) => {
+                // The source Reply, exact target and plan form one retained retry owner.
+                return match park_foreign_retry_no_effect(caller, binding) {
+                    Ok(()) => nt_user_callback::STATUS_PENDING as u32,
+                    Err(status) => cancel_creation(self, binding, status),
+                };
             }
-            Err(status) => return status,
+            Err(status) => {
+                if callout_may_retire(self, binding) {
+                    return cancel_creation(self, binding, status);
+                }
+                return status;
+            }
         }
         self.finish_foreign_initial_thread(binding, InitialCreationDelivery::Queue)
     }

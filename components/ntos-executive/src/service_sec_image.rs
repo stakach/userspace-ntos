@@ -113,6 +113,19 @@ unsafe fn attempt_primary_alias_activation(
     match hosted_debug_filter_process::install_hosted_user_alias(handler, owner.process_index) {
         Ok(()) => {
             let resume_error = handler.start_configured_initial_thread(owner.process_index, owner.tcb);
+            if resume_error == nt_user_callback::STATUS_PENDING as u32
+                && crate::exec_handler::initial_thread_creation::configured_retry_no_effect(
+                    handler, owner.process_index, owner.tcb,
+                ) {
+                // A pre-entry Win32k shared-page refusal retained the exact configured plan.
+                // The existing timer wakes this same owner after other page work can settle.
+                let deadline = activation.fail_definitive(
+                    owner, monotonic_time_100ns(), PRIMARY_ALIAS_RETRY_DELAY_100NS,
+                ).expect("configured initial retry owns exact alias activation");
+                PRIMARY_ALIAS_RETRY_DEADLINE.store(deadline, Ordering::Release);
+                let _ = rearm_registered_delay_timer();
+                return;
+            }
             if resume_error != 0 {
                 // Initial-thread creation can have entered native effects. Do not
                 // replay it from a timer merely because it returned an error.
@@ -2146,7 +2159,7 @@ unsafe fn service_wait_admit_with_transfer(
         NestedWaitTransfer::InCallback { lane: captured, token } => captured == lane
             && win32k_glue::in_callback_nested_wait_token_is_current(
                 pending.snapshot.client, captured, token,
-            ),
+            ) && transfer.admits(pending.snapshot.client, lane),
         _ => transfer.admits(pending.snapshot.client, lane),
     };
     if pending.snapshot.callback_token != transfer.token() || !origin_valid {
@@ -2366,6 +2379,146 @@ unsafe fn admit_pending_nested_restore_dispatch(
 
 /// One authoritative transfer from a returned native pump to the retained execution owner.
 /// Direct Win32k syscalls and early Ps process-create callouts use the same wait ordering.
+/// Transfer an already parked initial-thread Reply when its later Win32k entry genuinely
+/// suspends. A no-effect admission refusal restores the copied pending snapshot for redrive;
+/// an uncertain transfer keeps the exact Reply fenced with its initial owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetainedInitialCalloutHandoff {
+    Accepted,
+    RetryNoEffect,
+    Retained,
+}
+
+/// A retained initial syscall can run inside an active redirected callback. Its wait inherits
+/// that exact lane token; it must not invent the staged context of a completed NtCallbackReturn.
+fn retained_initial_callback_transfer(
+    lane: nt_component_suspension::LaneHandle,
+    token: Option<u64>,
+) -> Option<NestedWaitTransfer> {
+    use nt_user_host::process_create_callout::InitialCallbackTransfer;
+    match nt_user_host::process_create_callout::initial_callback_transfer(lane, token)? {
+        InitialCallbackTransfer::Root => Some(NestedWaitTransfer::None),
+        InitialCallbackTransfer::InCallback { lane, token } =>
+            Some(NestedWaitTransfer::InCallback { lane, token }),
+    }
+}
+
+pub(crate) unsafe fn admit_retained_initial_win32k_dispatch(
+    handler: &mut ExecNtHandler,
+    origin: nt_user_host::process_create_callout::InitialThreadReplyOrigin<HostedThreadRole>,
+    reply_cap: u64,
+) -> RetainedInitialCalloutHandoff {
+    use RetainedInitialCalloutHandoff::*;
+    if reply_cap == 0 { return Retained; }
+    if win32k_glue::pending_nested_restore_dispatch_is_some()
+        || win32k_glue::pending_root_ingress_dispatch_is_some()
+        || win32k_glue::pending_root_maintenance_dispatch_is_some()
+    { return RetryNoEffect; }
+    let destination = HostedContinuationDestination::InitialThread(origin);
+    if let Some(pending) = win32k_glue::take_pending_receive_dispatch() {
+        let Some(transfer) = retained_initial_callback_transfer(
+            pending.snapshot.dispatch.lane, pending.snapshot.callback_token,
+        ) else {
+            return if win32k_glue::restore_pending_receive_dispatch(pending) {
+                RetryNoEffect
+            } else { Retained };
+        };
+        return match receive_admit_with_transfer(
+            pending, reply_cap, transfer, destination,
+        ) {
+            RetainedWaitAdmission::Accepted => Accepted,
+            RetainedWaitAdmission::RefusedNoEffect => {
+                if win32k_glue::restore_pending_receive_dispatch(pending) { RetryNoEffect }
+                else { Retained }
+            }
+            RetainedWaitAdmission::Indeterminate => Retained,
+        };
+    }
+    if let Some(pending) = win32k_glue::take_pending_service_wait_dispatch() {
+        let Some(transfer) = retained_initial_callback_transfer(
+            pending.snapshot.dispatch.lane, pending.snapshot.callback_token,
+        ) else {
+            return if win32k_glue::restore_pending_service_wait_dispatch(pending) {
+                RetryNoEffect
+            } else { Retained };
+        };
+        return match service_wait_admit_with_transfer(
+            pending, reply_cap, transfer, destination,
+        ) {
+            RetainedWaitAdmission::Accepted => Accepted,
+            RetainedWaitAdmission::RefusedNoEffect => {
+                if win32k_glue::restore_pending_service_wait_dispatch(pending) { RetryNoEffect }
+                else { Retained }
+            }
+            RetainedWaitAdmission::Indeterminate => Retained,
+        };
+    }
+    if let Some(pending) = win32k_glue::take_pending_provider_wait_dispatch() {
+        let token = if pending.nested_user_callback {
+            let Some(token) = win32k_glue::pending_callback_token_on_lane(
+                pending.client, pending.dispatch.lane,
+            ) else {
+                return if win32k_glue::restore_pending_provider_wait_dispatch(pending) {
+                    RetryNoEffect
+                } else { Retained };
+            };
+            Some(token)
+        } else { None };
+        let Some(transfer) = retained_initial_callback_transfer(pending.dispatch.lane, token)
+        else {
+            return if win32k_glue::restore_pending_provider_wait_dispatch(pending) {
+                RetryNoEffect
+            } else { Retained };
+        };
+        return match provider_wait_admit_with_transfer(
+            handler, pending, reply_cap, transfer, destination,
+        ) {
+            RetainedWaitAdmission::Accepted => Accepted,
+            RetainedWaitAdmission::RefusedNoEffect => {
+                if win32k_glue::restore_pending_provider_wait_dispatch(pending) { RetryNoEffect }
+                else { Retained }
+            }
+            RetainedWaitAdmission::Indeterminate => Retained,
+        };
+    }
+    if let Some(pending) = win32k_glue::take_pending_lpc_wait_dispatch() {
+        let token = if pending.nested_user_callback {
+            let Some(token) = win32k_glue::pending_callback_token_on_lane(
+                pending.client, pending.dispatch.lane,
+            ) else {
+                return if win32k_glue::restore_pending_lpc_wait_dispatch(pending) {
+                    RetryNoEffect
+                } else { Retained };
+            };
+            Some(token)
+        } else { None };
+        let Some(transfer) = retained_initial_callback_transfer(pending.dispatch.lane, token)
+        else {
+            return if win32k_glue::restore_pending_lpc_wait_dispatch(pending) {
+                RetryNoEffect
+            } else { Retained };
+        };
+        return match lpc_wait_admit_with_transfer(
+            handler, pending, reply_cap, transfer, destination,
+        ) {
+            RetainedWaitAdmission::Accepted => Accepted,
+            RetainedWaitAdmission::RefusedNoEffect => {
+                if win32k_glue::restore_pending_lpc_wait_dispatch(pending) { RetryNoEffect }
+                else { Retained }
+            }
+            RetainedWaitAdmission::Indeterminate => Retained,
+        };
+    }
+    Retained
+}
+
+/// A returned physical reply effect is never replayed when its receipt is uncertain.
+pub(crate) unsafe fn reply_retained_initial_creation(reply_cap: u64, status: u32) -> bool {
+    if !reply_parked_syscall(reply_cap, u64::from(status)) { return false; }
+    release_reply_pool_cap(reply_cap);
+    true
+}
+
 unsafe fn admit_pending_win32k_dispatch(
     handler: &mut ExecNtHandler,
     destination: HostedContinuationDestination,
@@ -11618,6 +11771,7 @@ pub(crate) unsafe fn service_sec_image(
         {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             crate::native_alpc_create_work::redrive(&mut nt_handler);
+            crate::exec_handler::initial_thread_creation::redrive_retry_no_effect(&mut nt_handler);
             crate::native_alpc_close_work::redrive(&mut nt_handler);
             crate::native_alpc_connect_accept_work::redrive(&mut nt_handler);
             crate::native_srm_command_work::redrive(&mut nt_handler);
@@ -15418,6 +15572,27 @@ pub(crate) unsafe fn service_sec_image(
                         let caller = nt_handler.thread_runtime.executable_by_tid(current_tid)
                             .filter(|runtime| runtime.pi == pi && runtime.badge == badge)
                             .map(|runtime| runtime.binding());
+                        if caller.is_some_and(|caller| unsafe {
+                            crate::exec_handler::initial_thread_creation::take_retry_transferred(caller)
+                        }) {
+                            assert_eq!(res.status, nt_user_callback::STATUS_PENDING as u32);
+                            assert_eq!(nt_handler.out_writes_n, 0,
+                                "retained no-effect process callout has no caller copyout");
+                            mark_wait_parked!(pi, resume_ip);
+                            crate::exec_handler::initial_thread_creation::redrive_retry_no_effect(
+                                &mut nt_handler,
+                            );
+                            let _ = finalize_service_loop_state(&mut nt_handler);
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
                         let suspended_target = caller.and_then(|caller| {
                             crate::exec_handler::initial_thread_creation::suspended_for_caller(
                                 &nt_handler, caller,

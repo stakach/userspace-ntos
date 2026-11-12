@@ -617,6 +617,13 @@ pub(crate) unsafe fn take_pending_receive_dispatch() -> Option<PendingReceiveDis
     core::ptr::replace(core::ptr::addr_of_mut!(RECEIVE_PENDING_DISPATCH), None)
 }
 
+pub(crate) unsafe fn restore_pending_receive_dispatch(pending: PendingReceiveDispatch) -> bool {
+    let slot = &mut *core::ptr::addr_of_mut!(RECEIVE_PENDING_DISPATCH);
+    if slot.is_some() { return false; }
+    *slot = Some(pending);
+    true
+}
+
 pub(super) static PROVIDER_WAIT_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 pub(super) static LPC_WAIT_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 
@@ -680,11 +687,29 @@ pub(crate) unsafe fn take_pending_provider_wait_dispatch() -> Option<PendingProv
     )
 }
 
+pub(crate) unsafe fn restore_pending_provider_wait_dispatch(
+    pending: PendingProviderWaitDispatch,
+) -> bool {
+    let slot = &mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_PENDING_DISPATCH);
+    if slot.is_some() { return false; }
+    *slot = Some(pending);
+    PROVIDER_WAIT_LAST_PUMP_SUSPENDED.store(1, Ordering::Release);
+    true
+}
+
 pub(crate) unsafe fn take_pending_lpc_wait_dispatch() -> Option<PendingLpcWaitDispatch> {
     if LPC_WAIT_LAST_PUMP_SUSPENDED.swap(0, Ordering::AcqRel) == 0 {
         return None;
     }
     core::ptr::replace(core::ptr::addr_of_mut!(LPC_WAIT_PENDING_DISPATCH), None)
+}
+
+pub(crate) unsafe fn restore_pending_lpc_wait_dispatch(pending: PendingLpcWaitDispatch) -> bool {
+    let slot = &mut *core::ptr::addr_of_mut!(LPC_WAIT_PENDING_DISPATCH);
+    if slot.is_some() { return false; }
+    *slot = Some(pending);
+    LPC_WAIT_LAST_PUMP_SUSPENDED.store(1, Ordering::Release);
+    true
 }
 
 pub(super) unsafe fn capture_provider_wait_repark(

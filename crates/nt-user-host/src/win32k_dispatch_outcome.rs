@@ -22,6 +22,8 @@ pub struct Win32kDispatchWithReceipt {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Win32kProcessCreateResult {
+    /// Shared publication refused this request before any Win32k provider entry.
+    BusyNoEffect,
     NotEntered(u32),
     Returned(u32),
     /// The physical dispatch has a retained callback or wait.
