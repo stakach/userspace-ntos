@@ -64,42 +64,61 @@ pub(crate) unsafe fn run_hosted(
     nt_handler: *mut ExecNtHandler,
     candidate: Candidate,
 ) -> Option<ComponentSuspensionRuntimeOutcome> {
-    if crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
-        || crate::spawn_hosts::shared_ingress::owner::runtime::nested::source_ioctl_parent_blocks_provider_resume(
+    let trace_lane = candidate.resume.lane;
+    let trace_key = candidate.resume.suspension.key;
+    let trace_owner = candidate.owner;
+    let root_blocked = crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume();
+    let source_blocked = crate::spawn_hosts::shared_ingress::owner::runtime::nested::source_ioctl_parent_blocks_provider_resume(
             candidate.owner.dispatch_id,
-        )
-    {
+        );
+    if root_blocked || source_blocked {
+        trace_preclaim_refusal(b"physical-parent-blocked", trace_lane, trace_key, trace_owner,
+            u64::from(root_blocked) | (u64::from(source_blocked) << 1));
         return None;
     }
     let lane_resume = candidate.resume;
     let lane = lane_resume.lane;
     let reply_object = lane_resume.binding.reply_object;
     let resume = lane_resume.suspension;
-    let frame = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+    let Some(frame) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
         .frame(lane, resume.key)
-        .ok()??
-        .clone();
+        .ok().flatten().cloned() else {
+        trace_preclaim_refusal(b"frame-absent", trace_lane, trace_key, trace_owner, 0);
+        return None;
+    };
     if frame.owner != candidate.owner || frame.admission_sequence != candidate.sequence {
+        trace_preclaim_refusal(b"frame-identity-changed", trace_lane, trace_key, trace_owner,
+            frame.admission_sequence);
         return None;
     }
     let continuation = match frame.continuation {
         ComponentNativeContinuation::Hosted(hosted) => hosted,
-        ComponentNativeContinuation::Kernel(_) => return None,
-        ComponentNativeContinuation::RootIngress(_) => return None,
+        ComponentNativeContinuation::Kernel(_) => {
+            trace_preclaim_refusal(b"became-kernel", trace_lane, trace_key, trace_owner, 0);
+            return None;
+        }
+        ComponentNativeContinuation::RootIngress(_) => {
+            trace_preclaim_refusal(b"became-root-ingress", trace_lane, trace_key, trace_owner, 0);
+            return None;
+        }
     };
     if matches!(continuation.pending, PendingComponentDispatch::Receive(_)
         | PendingComponentDispatch::RootMaintenance(_)
         | PendingComponentDispatch::NestedRestore(_)) {
+        trace_preclaim_refusal(b"unsupported-pending-kind", trace_lane, trace_key, trace_owner, 0);
         return None;
     }
-    if !continuation.return_target.can_resume()
-        || !win32k_glue::win32k_client_context_is_admitted(continuation.pending.client())
-    {
+    let reply_ready = continuation.return_target.can_resume();
+    let client_ready = win32k_glue::win32k_client_context_is_admitted(continuation.pending.client());
+    if !reply_ready || !client_ready {
+        trace_preclaim_refusal(b"claim-readiness-refused", trace_lane, trace_key, trace_owner,
+            u64::from(reply_ready) | (u64::from(client_ready) << 1));
         return None;
     }
     // Reserve all handoff storage before entering a provider that may yield a callback.
     // Refusal leaves the selected source wait and its reply authority unchanged.
     let Ok(callback_transfer) = component_callback_transfer::CallbackTransfer::reserve() else {
+        trace_preclaim_refusal(b"callback-transfer-capacity", trace_lane, trace_key, trace_owner, 0);
         return None;
     };
     let admitted = {
@@ -112,6 +131,7 @@ pub(crate) unsafe fn run_hosted(
     };
     // Claim-time cancellation/completion is authoritative, not the earlier candidate snapshot.
     let Ok(resume) = admitted else {
+        trace_preclaim_refusal(b"begin-resume-refused", trace_lane, trace_key, trace_owner, 0);
         return None;
     };
     let admitted_dispatch = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))

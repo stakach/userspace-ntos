@@ -35,6 +35,74 @@ static mut WAKE: ResumeWake = match ResumeWake::new(10_000, 160_000) {
     Err(_) => panic!("invalid component resume pacing"),
 };
 static FAILURES: AtomicU64 = AtomicU64::new(0);
+static RESUME_GATE_TRACES: AtomicU64 = AtomicU64::new(0);
+static RESUME_ELIGIBILITY_TRACES: AtomicU64 = AtomicU64::new(0);
+static RESUME_SELECTION_TRACES: AtomicU64 = AtomicU64::new(0);
+static RESUME_PRECLAIM_TRACES: AtomicU64 = AtomicU64::new(0);
+
+fn resume_trace_sample(counter: &AtomicU64) -> bool {
+    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    count <= 16 || count.is_power_of_two()
+}
+
+fn trace_resume_frame(
+    stage: &'static [u8], lane: nt_component_suspension::LaneHandle,
+    key: nt_component_suspension::SuspensionKey, owner: SuspensionOwner,
+    detail: u64,
+) {
+    print_str(b"[component-resume-preclaim] stage="); print_str(stage);
+    print_str(b" lane/gen/kind/key/owner/detail=");
+    for value in [lane.index as u64, lane.generation, key.kind as u64,
+        key.id, owner.dispatch_id, detail] {
+        print_str(b"/"); print_hex_u64(value);
+    }
+    print_str(b"\n");
+}
+
+pub(super) fn trace_preclaim_refusal(
+    stage: &'static [u8], lane: nt_component_suspension::LaneHandle,
+    key: nt_component_suspension::SuspensionKey, owner: SuspensionOwner, detail: u64,
+) {
+    if resume_trace_sample(&RESUME_PRECLAIM_TRACES) {
+        trace_resume_frame(stage, lane, key, owner, detail);
+    }
+}
+
+unsafe fn trace_selected_resume_gate(stage: &'static [u8], detail: u64) {
+    if !resume_trace_sample(&RESUME_GATE_TRACES) { return; }
+    let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
+    print_str(b"[component-resume-fence] execution-busy/running-lane=");
+    print_hex_u64(u64::from(lanes.execution_busy()));
+    print_str(b"/");
+    print_hex_u64(lanes.running().map_or(u64::MAX, |lane| lane.index as u64));
+    print_str(b"\n");
+    for identity in lanes.terminal_identities() {
+        let Ok(binding) = lanes.binding(identity.lane()) else { continue };
+        let Ok(view) = lanes.terminal(identity, binding.reply_object) else { continue };
+        if let nt_component_suspension::TerminalPhase::Invoking { attempt, .. } = view.phase {
+            trace_resume_frame(b"terminal-invoking", identity.lane(), identity.key(),
+                identity.owner(), attempt);
+        }
+    }
+    for (lane, frame) in lanes.frames() {
+        if !matches!(frame.phase,
+            nt_component_suspension::SuspensionPhase::Selected { .. }
+                | nt_component_suspension::SuspensionPhase::Cancelled { .. }) {
+            continue;
+        }
+        if lanes.phase(lane) != Ok(nt_component_suspension::LanePhase::Suspended)
+            || !lanes.top(lane).ok().flatten().is_some_and(|top| top.key == frame.key)
+        { continue; }
+        trace_resume_frame(stage, lane, frame.key, frame.owner, detail);
+        if let ComponentNativeContinuation::Hosted(hosted) = frame.continuation {
+            let readiness = u64::from(hosted.return_target.can_resume())
+                | (u64::from(win32k_glue::win32k_client_context_is_admitted(
+                    hosted.pending.client())) << 1);
+            trace_resume_frame(b"selected-hosted-readiness", lane, frame.key,
+                frame.owner, readiness);
+        }
+    }
+}
 
 pub(super) struct Candidate {
     pub(super) resume: LaneResume<ComponentSuspensionCompletion>,
@@ -97,8 +165,32 @@ pub(super) unsafe fn next_ready(pm: &nt_process::ProcessManager) -> Option<Candi
 
 unsafe fn next_in_pass(pm: &nt_process::ProcessManager, pass: &mut ResumePass) -> Option<Candidate> {
     let resume = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
-        .next_resumable_in_pass(pass, |frame| eligible(pm, frame.continuation))?;
-    candidate(resume)
+        .next_resumable_in_pass(pass, |frame| {
+            let accepted = eligible(pm, frame.continuation);
+            if !accepted && resume_trace_sample(&RESUME_ELIGIBILITY_TRACES) {
+                let lane = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).frames()
+                    .find_map(|(lane, current)| (current.key == frame.key
+                        && current.owner == frame.owner).then_some(lane));
+                if let Some(lane) = lane {
+                    let detail = match frame.continuation {
+                        ComponentNativeContinuation::Hosted(hosted) => {
+                            u64::from(hosted.return_target.can_resume())
+                                | (u64::from(win32k_glue::win32k_client_context_is_admitted(
+                                    hosted.pending.client())) << 1)
+                        }
+                        _ => 0,
+                    };
+                    trace_resume_frame(b"ineligible", lane, frame.key, frame.owner, detail);
+                }
+            }
+            accepted
+        })?;
+    let selected = candidate(resume)?;
+    if resume_trace_sample(&RESUME_SELECTION_TRACES) {
+        trace_resume_frame(b"selected", selected.resume.lane,
+            selected.resume.suspension.key, selected.owner, selected.sequence);
+    }
+    Some(selected)
 }
 
 /// ACK plus a retained next Call transfers the external service token to its
@@ -137,6 +229,7 @@ pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
         || crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
         || crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
     {
+        trace_selected_resume_gate(b"hosted-drain-gated", 0);
         return 0;
     }
     let Some(ctx) = (*handler).loop_ctx else {
@@ -170,6 +263,7 @@ pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
             }
         }
         let Some(candidate) = next_in_pass(&(*handler).pm, &mut pass) else {
+            trace_selected_resume_gate(b"hosted-no-candidate", 0);
             break;
         };
         if matches!(candidate.continuation,
@@ -633,12 +727,21 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
         || crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
         || crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
     {
+        trace_selected_resume_gate(b"outer-entry-gated",
+            u64::from(!runtime_ready(handler))
+                | (u64::from(is_running()) << 1)
+                | (u64::from(super::root_add_device_exclusive_pending()) << 2)
+                | (u64::from(super::root_queued_callback_exclusive_pending()) << 3)
+                | (u64::from(crate::driver_launch::unsettled_queued_callback()) << 4)
+                | (u64::from(crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()) << 5)
+                | (u64::from(crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()) << 6));
         return;
     }
     // A hosted terminal may own the shared execution fence while awaiting the separately
     // retained final Call. Settle that exact return before the ordinary busy-lane gate.
     let _ = component_terminal::drain_shared_returns();
     if crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume() {
+        trace_selected_resume_gate(b"root-parent-after-return", 0);
         return;
     }
     if let Some(ticket) = nested_restore_owner::next_retry() {
@@ -659,6 +762,7 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
         let _ = drain_terminals(handler);
     }
     if crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume() {
+        trace_selected_resume_gate(b"root-parent-after-nested", 0);
         return;
     }
     if let Some(ticket) = root_maintenance_owner::next_returned_ticket() {
@@ -673,11 +777,13 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
         }
     }
     if crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume() {
+        trace_selected_resume_gate(b"root-parent-after-maintenance", 0);
         return;
     }
     if component_execution_is_busy()
         && !kernel_provider_activation::has_stopped_wait_work(&(*handler).pm)
     {
+        trace_selected_resume_gate(b"physical-execution-busy", 0);
         return;
     }
     let _message = crate::ipc_message::SavedMessageBuffer::capture();
@@ -687,7 +793,10 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
     let mut ticket = match (&mut *core::ptr::addr_of_mut!(WAKE)).begin_pass(monotonic_time_100ns())
     {
         Ok(Some(ticket)) => ticket,
-        Ok(None) => return,
+        Ok(None) => {
+            trace_selected_resume_gate(b"wake-not-due", 0);
+            return;
+        }
         Err(_) => {
             report_retained(nt_process::STATUS_INSUFFICIENT_RESOURCES);
             return;
@@ -717,6 +826,7 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
             }
         }
         let Some(candidate) = next_in_pass(&(*handler).pm, &mut pass) else {
+            trace_selected_resume_gate(b"outer-no-candidate", 0);
             break;
         };
         match candidate.continuation {
