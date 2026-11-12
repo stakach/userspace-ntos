@@ -86,7 +86,7 @@ fn initial_wait_snapshot_capture_has_one_policy_and_reparks_keep_saved_bytes() {
                     }
                 }
                 let expected: &[&str] = match constructor.as_str() {
-                    "PendingProviderWaitDispatch" => &["provider_wait_suspended"],
+                    "PendingProviderWaitDispatch" => &["provider_wait_request"],
                     "PendingLpcWaitDispatch" => &["lpc_wait_suspended"],
                     "PendingReceiveDispatch" => &["receive_yield"],
                     "PendingRootIngressDispatch" => &["root_ingress_yield"],
