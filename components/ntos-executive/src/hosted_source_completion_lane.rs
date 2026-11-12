@@ -397,7 +397,7 @@ unsafe fn construct(index: usize, inst: DriverInstance) -> Result<(), u32> {
                 | ((pump.receive_yield().is_some() as u64) << 1)
                 | ((pump.service_wait_yield.is_some() as u64) << 2)
                 | ((pump.callback_suspended as u64) << 3)
-                | ((pump.provider_wait_suspended as u64) << 4)
+                | ((pump.provider_wait_suspended() as u64) << 4)
                 | ((pump.lpc_wait_suspended as u64) << 5);
             print_hex(flags as u32);
             print_str(b"/");
@@ -675,7 +675,7 @@ unsafe fn finish_slice(
     if !pump.completed
         && !pump.callback_suspended
         && !pump.scheduler_yielded
-        && pump.provider_wait_suspended != pump.lpc_wait_suspended
+        && pump.provider_wait_suspended() != pump.lpc_wait_suspended
     {
         let route = (&*core::ptr::addr_of!(LANES))[index].route.unwrap();
         if let Ok(dispatch) = runtime::dispatch(route) {

@@ -95,7 +95,7 @@ fn resumed_wait_restores_exact_callback_page_before_reentering_pump() {
     let pending = source("win32k_pending_dispatch.rs");
     let dispatch = source("win32k_glue.rs");
     for (kind, pending_type, suspend, pending_store, resume, pump) in [
-        ("provider", "PendingProviderWaitDispatch", "if pr.provider_wait_suspended {\n        let page =",
+        ("provider", "PendingProviderWaitDispatch", "if let Some(request) = pr.provider_wait_request {",
             "PROVIDER_WAIT_LAST_PUMP_SUSPENDED.store", "resume_suspended_provider_wait_component(",
             "component_pump_resume_provider_wait(&channel)"),
         ("LPC", "PendingLpcWaitDispatch", "if pr.lpc_wait_suspended {\n        let Some(request) =",

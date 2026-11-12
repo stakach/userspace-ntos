@@ -688,11 +688,10 @@ pub(crate) unsafe fn take_pending_lpc_wait_dispatch() -> Option<PendingLpcWaitDi
 
 pub(super) unsafe fn capture_provider_wait_repark(
     prior: PendingProviderWaitDispatch,
+    request: nt_provider_wait::ProviderWaitRequest,
 ) -> PendingProviderWaitDispatch {
-    let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-        as *const nt_provider_wait::ProviderWaitSharedPage;
     PendingProviderWaitDispatch {
-        request: core::ptr::read_volatile(core::ptr::addr_of!((*page).request)),
+        request,
         dispatch: prior.dispatch,
         client: prior.client,
         shared_resume: try_capture_exact_shared_resume_snapshot(prior.dispatch, prior.client),

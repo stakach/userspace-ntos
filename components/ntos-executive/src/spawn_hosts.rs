@@ -1976,6 +1976,7 @@ struct PumpLoopOutcome {
     startup_stack_receipt: Option<[u64; 5]>,
     callback_suspended: bool,
     provider_wait_suspended: bool,
+    provider_wait_request: Option<nt_provider_wait::ProviderWaitRequest>,
     lpc_wait_suspended: bool,
     scheduler_yielded: bool,
     ingress_yield: Option<PumpIngressYield>,
@@ -2010,6 +2011,7 @@ impl PumpLoopOutcome {
             startup_stack_receipt: None,
             callback_suspended: false,
             provider_wait_suspended: false,
+            provider_wait_request: None,
             lpc_wait_suspended: false,
             scheduler_yielded: false,
             ingress_yield: None,
@@ -2252,7 +2254,10 @@ pub(crate) struct PumpResult {
     pub startup_stack_receipt: Option<[u64; 5]>,
     pub callback_suspended: bool,
     /// The component is blocked in its provider-wait rendezvous and its reply object remains bound.
-    pub provider_wait_suspended: bool,
+    /// Exact bytes captured when the provider's labelled Call reached this pump.
+    pub provider_wait_request: Option<nt_provider_wait::ProviderWaitRequest>,
+    /// Other component services can suspend without issuing a provider wait request.
+    service_deferred: bool,
     /// The component is blocked in an ordinary retained LPC request/reply rendezvous.
     pub lpc_wait_suspended: bool,
     /// The request remains live while IRQ scheduler work runs. Continue its receive half on this
@@ -2283,6 +2288,10 @@ pub(crate) struct PumpResult {
 }
 
 impl PumpResult {
+    pub(crate) fn provider_wait_suspended(&self) -> bool {
+        self.provider_wait_request.is_some() || self.service_deferred
+    }
+
     pub(crate) fn receive_yield(&self) -> Option<crate::win32k_glue::ReceiveYield> {
         self.ingress_yield.and_then(PumpIngressYield::receive)
     }
@@ -2302,7 +2311,8 @@ impl PumpResult {
             completed: false,
             startup_stack_receipt: None,
             callback_suspended: false,
-            provider_wait_suspended: false,
+            provider_wait_request: None,
+            service_deferred: false,
             lpc_wait_suspended: false,
             scheduler_yielded: false,
             ingress_yield: None,
@@ -2335,7 +2345,7 @@ impl PumpResult {
             && self.nested_restore_quarantined.is_none()
             && !self.completed
             && !self.callback_suspended
-            && !self.provider_wait_suspended
+            && !self.provider_wait_suspended()
             && !self.lpc_wait_suspended
     }
 
@@ -2351,7 +2361,7 @@ impl PumpResult {
             && !self.scheduler_yielded
             && !self.completed
             && !self.callback_suspended
-            && !self.provider_wait_suspended
+            && !self.provider_wait_suspended()
             && !self.lpc_wait_suspended
     }
 }
@@ -2681,7 +2691,7 @@ pub(crate) unsafe fn component_pump_continue_root_maintenance(
             && crate::win32k_glue::root_maintenance_continuation_is_current(ch, yielded)
     });
     if !current || previous.completed || previous.callback_suspended
-        || previous.provider_wait_suspended || previous.lpc_wait_suspended
+        || previous.provider_wait_suspended() || previous.lpc_wait_suspended
         || previous.receive_yield().is_some() || previous.root_ingress_yield().is_some()
         || previous.service_wait_yield.is_some()
         || previous.nested_restore_yield.is_some()
@@ -2708,7 +2718,7 @@ pub(crate) unsafe fn component_pump_continue_root_ingress_after_unwind(
         ));
     if !current || previous.reply_cap == 0 || previous.reply_cap != ch.reply_cap
         || previous.completed || previous.callback_suspended
-        || previous.provider_wait_suspended || previous.lpc_wait_suspended
+        || previous.provider_wait_suspended() || previous.lpc_wait_suspended
         || previous.receive_yield().is_some() || previous.service_wait_yield.is_some()
         || previous.maintenance_yield.is_some() || previous.nested_restore_yield.is_some()
         || previous.nested_child_work.is_some()
@@ -2742,7 +2752,7 @@ pub(crate) unsafe fn component_pump_restore_nested_parent(
         .map_err(|_| nt_process::STATUS_INVALID_PARAMETER)?
         .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
     if previous.reply_cap == 0 || previous.completed || previous.callback_suspended
-        || previous.provider_wait_suspended || previous.lpc_wait_suspended
+        || previous.provider_wait_suspended() || previous.lpc_wait_suspended
         || previous.scheduler_yielded || previous.receive_yield().is_some()
         || previous.root_ingress_yield().is_some()
         || previous.service_wait_yield.is_some() || previous.maintenance_yield.is_some()
@@ -2815,7 +2825,7 @@ pub(crate) unsafe fn component_pump_continue_nested_child_work_receive(
     if !parent_matches || previous.reply_cap == 0 || previous.reply_cap != ch.reply_cap
         || runtime::current_reply(route).ok() != Some(previous.reply_cap)
         || previous.completed || previous.callback_suspended
-        || previous.provider_wait_suspended || previous.lpc_wait_suspended
+        || previous.provider_wait_suspended() || previous.lpc_wait_suspended
         || previous.scheduler_yielded || previous.receive_yield().is_some()
         || previous.root_ingress_yield().is_some()
         || previous.service_wait_yield.is_some() || previous.maintenance_yield.is_some()
@@ -2880,6 +2890,7 @@ unsafe fn component_pump_continue_receive_half(
         }
         outcome.callback_suspended = false;
         outcome.provider_wait_suspended = false;
+        outcome.provider_wait_request = None;
         outcome.lpc_wait_suspended = false;
         outcome.wall_label = nt_unwind::seh_transport::RAISE_LABEL;
     }
@@ -2914,7 +2925,7 @@ pub(crate) unsafe fn component_pump_resume_kernel_provider_wait(
         || binding.reply_object != ch.reply_cap
         || ch.reply_cap == 0
         || previous.reply_cap != ch.reply_cap
-        || !previous.provider_wait_suspended
+        || !previous.provider_wait_suspended()
         || previous.completed
         || previous.callback_suspended
         || previous.lpc_wait_suspended
@@ -2951,7 +2962,7 @@ pub(crate) unsafe fn component_pump_resume_hosted_wait(
         || !matches!(source.kind, runtime::PhysicalSourceKind::DispatchWorker { .. })
         || ch.caps.kind != ReqKind::Irp || ch.initial != InitialAction::RecvFirst
         || previous.completed || previous.callback_suspended || previous.scheduler_yielded
-        || previous.provider_wait_suspended == previous.lpc_wait_suspended
+        || previous.provider_wait_suspended() == previous.lpc_wait_suspended
         || previous.reply_cap != ch.reply_cap
     {
         return Err(nt_process::STATUS_INVALID_PARAMETER);
@@ -2962,7 +2973,7 @@ pub(crate) unsafe fn component_pump_resume_hosted_wait(
     if transferred_depth {
         SUSPENDED_COMPONENT_OUTSTANDING.fetch_sub(1, Ordering::Relaxed);
     }
-    let resume = if previous.provider_wait_suspended {
+    let resume = if previous.provider_wait_suspended() {
         PumpResume::ProviderWait
     } else { PumpResume::LpcWait };
     Ok(component_pump_enter(ch, resume, accounting))
@@ -3043,6 +3054,7 @@ unsafe fn component_pump_enter(
         }
         outcome.callback_suspended = false;
         outcome.provider_wait_suspended = false;
+        outcome.provider_wait_request = None;
         outcome.lpc_wait_suspended = false;
         outcome.wall_label = nt_unwind::seh_transport::RAISE_LABEL;
     }
@@ -3331,6 +3343,16 @@ unsafe fn component_pump_loop(
             }
             // The executive validates and admits the copied shared-page request only after the
             // exact hosted or kernel continuation storage is reserved. Keep this Call bound.
+            let page = crate::win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
+                as *const nt_provider_wait::ProviderWaitSharedPage;
+            let request: nt_provider_wait::ProviderWaitRequest =
+                core::ptr::read_volatile(core::ptr::addr_of!((*page).request));
+            // A malformed request still owns this exact Call. Keep its complete bytes for
+            // admission refusal instead of reconstructing identity from a reused bank.
+            if request.validate().is_err() {
+                crate::print_str(b"[provider-wait-capture] invalid labelled request retained\n");
+            }
+            outcome.provider_wait_request = Some(request);
             outcome.provider_wait_suspended = true;
             break;
         } else if label == crate::win32k_subsystem::W32_LPC_WAIT_LABEL
@@ -6327,7 +6349,10 @@ unsafe fn pump_result_from_outcome(
         completed: outcome.completed,
         startup_stack_receipt: outcome.startup_stack_receipt,
         callback_suspended: outcome.callback_suspended,
-        provider_wait_suspended: outcome.provider_wait_suspended,
+        provider_wait_request: outcome.provider_wait_request,
+        service_deferred: outcome.provider_wait_suspended
+            && outcome.provider_wait_request.is_none()
+            && (ch.caps.kind == ReqKind::Irp || shared_pump::autonomous(ch)),
         lpc_wait_suspended: outcome.lpc_wait_suspended,
         scheduler_yielded: outcome.scheduler_yielded,
         ingress_yield: outcome.ingress_yield,

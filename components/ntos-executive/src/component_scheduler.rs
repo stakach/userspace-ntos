@@ -31,7 +31,7 @@ fn trace_worker_startup_pump(
             | (u32::from(result.receive_yield().is_some()) << 1)
             | (u32::from(result.service_wait_yield.is_some()) << 2)
             | (u32::from(result.callback_suspended) << 3)
-            | (u32::from(result.provider_wait_suspended) << 4)
+            | (u32::from(result.provider_wait_suspended()) << 4)
             | (u32::from(result.lpc_wait_suspended) << 5);
         print_u64(u64::from(result.completed)); print_str(b"/");
         print_hex(result.status as u32); print_str(b"/");
@@ -406,7 +406,7 @@ unsafe fn hosted_component_pump_inner(
         | (u64::from(result.nested_restore_yield.is_some()) << 4)
         | (u64::from(result.nested_restore_quarantined.is_some()) << 5)
         | (u64::from(result.wall_label != 0) << 6)
-        | (u64::from(result.provider_wait_suspended) << 7)
+        | (u64::from(result.provider_wait_suspended()) << 7)
         | (u64::from(result.lpc_wait_suspended) << 8);
     crate::driver_launch::trace_port_connect_handoff_probe(27, channel, result_flags);
     trace_worker_startup_pump(StartupKind::Source, startup_ordinal, 1, Some(&result));
@@ -694,7 +694,7 @@ fn trace_connect_child_result(stage: u64, result: &crate::spawn_hosts::PumpResul
     print_u64(stage); print_str(b"/");
     print_u64(result.reply_cap); print_str(b"/");
     let flags = u64::from(result.scheduler_yielded)
-        | (u64::from(result.provider_wait_suspended) << 1)
+        | (u64::from(result.provider_wait_suspended()) << 1)
         | (u64::from(result.completed) << 2)
         | (u64::from(result.nested_child_work.is_some()) << 3)
         | (u64::from(result.nested_restore_yield.is_some()) << 4)

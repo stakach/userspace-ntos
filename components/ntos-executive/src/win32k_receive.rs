@@ -195,11 +195,9 @@ pub(crate) unsafe fn settle_nested_restore_result(
         pump.completed,
     );
     retire_win32k_on_wall(&pump);
-    let result = if pump.provider_wait_suspended {
-        let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-            as *const nt_provider_wait::ProviderWaitSharedPage;
+    let result = if let Some(request) = pump.provider_wait_request {
         ProviderWaitPumpCompletion::Reparked(PendingProviderWaitDispatch {
-            request: core::ptr::read_volatile(core::ptr::addr_of!((*page).request)),
+            request,
             dispatch: snapshot.dispatch,
             client: snapshot.client,
             shared_resume: try_capture_exact_shared_resume_snapshot(snapshot.dispatch, snapshot.client),
@@ -1044,11 +1042,9 @@ unsafe fn classify_returned_win32k_pump(
         pump.completed,
     );
     retire_win32k_on_wall(&pump);
-    let completion = if pump.provider_wait_suspended {
-        let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-            as *const nt_provider_wait::ProviderWaitSharedPage;
+    let completion = if let Some(request) = pump.provider_wait_request {
         ProviderWaitPumpCompletion::Reparked(PendingProviderWaitDispatch {
-            request: core::ptr::read_volatile(core::ptr::addr_of!((*page).request)),
+            request,
             dispatch: snapshot.dispatch,
             client: snapshot.client,
             shared_resume: try_capture_exact_shared_resume_snapshot(snapshot.dispatch, snapshot.client),
@@ -1229,11 +1225,9 @@ pub(crate) unsafe fn resume_suspended_receive_component(
         pump.completed,
     );
     retire_win32k_on_wall(&pump);
-    let completion = if pump.provider_wait_suspended {
-        let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-            as *const nt_provider_wait::ProviderWaitSharedPage;
+    let completion = if let Some(request) = pump.provider_wait_request {
         ProviderWaitPumpCompletion::Reparked(PendingProviderWaitDispatch {
-            request: core::ptr::read_volatile(core::ptr::addr_of!((*page).request)),
+            request,
             dispatch: pending.snapshot.dispatch,
             client: pending.snapshot.client,
             shared_resume: try_capture_exact_shared_resume_snapshot(pending.snapshot.dispatch, pending.snapshot.client),
@@ -1352,11 +1346,9 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
         pump.completed,
     );
     retire_win32k_on_wall(&pump);
-    let completion = if pump.provider_wait_suspended {
-        let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-            as *const nt_provider_wait::ProviderWaitSharedPage;
+    let completion = if let Some(request) = pump.provider_wait_request {
         ProviderWaitPumpCompletion::Reparked(PendingProviderWaitDispatch {
-            request: core::ptr::read_volatile(core::ptr::addr_of!((*page).request)),
+            request,
             dispatch: pending.snapshot.dispatch,
             client: pending.snapshot.client,
             shared_resume: try_capture_exact_shared_resume_snapshot(pending.snapshot.dispatch, pending.snapshot.client),

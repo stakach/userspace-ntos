@@ -20,7 +20,7 @@ fn returned_receive_half_classifies_and_captures_output_in_one_typed_tail() {
         .split("pub(crate) unsafe fn resume_suspended_receive_component(").next().unwrap();
     let capture = tail.find("capture_win32k_dispatch_return(").unwrap();
     let wall = tail.find("retire_win32k_on_wall(&pump)").unwrap();
-    let provider = tail.find("pump.provider_wait_suspended").unwrap();
+    let provider = tail.find("pump.provider_wait_request").unwrap();
     let lpc = tail.find("pump.lpc_wait_suspended").unwrap();
     let callback = tail.find("pump.callback_suspended").unwrap();
     let completed = tail.find("complete_resumed_dispatch(").unwrap();

@@ -4651,7 +4651,7 @@ pub(crate) unsafe fn retire_bugchecked_vspace(vspace: u64, reporting_tcb: u64) {
 }
 
 unsafe fn retire_win32k_on_wall(pr: &crate::spawn_hosts::PumpResult) {
-    if pr.completed || pr.callback_suspended || pr.provider_wait_suspended || pr.lpc_wait_suspended
+    if pr.completed || pr.callback_suspended || pr.provider_wait_suspended() || pr.lpc_wait_suspended
         || pr.receive_yield().is_some() || pr.root_ingress_yield().is_some()
         || pr.service_wait_yield.is_some()
         || pr.maintenance_yield.is_some() || pr.nested_restore_yield.is_some()
@@ -4807,7 +4807,7 @@ unsafe fn resume_suspended_user_callback_component(
                     next_token,
                 )
             })
-    } else if pr.provider_wait_suspended || pr.lpc_wait_suspended
+    } else if pr.provider_wait_suspended() || pr.lpc_wait_suspended
         || pr.receive_yield().is_some() || pr.service_wait_yield.is_some() {
         // The native NtCallbackReturn continuation must be attached before this callback token is
         // removed. Its service-loop consumer performs one atomic token-to-wait transfer.
@@ -4919,7 +4919,7 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         trace_nested_callback_frontier(
             if pump.completed { b"resume-terminal".as_slice() } else { b"resume-park".as_slice() },
             pending.dispatch.dispatch_id, pending.dispatch.ssn, client, pump.completed,
-            pump.callback_suspended, pump.provider_wait_suspended, pump.lpc_wait_suspended,
+            pump.callback_suspended, pump.provider_wait_suspended(), pump.lpc_wait_suspended,
         );
     }
 
@@ -4944,8 +4944,13 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
             },
         });
     }
-    if pump.provider_wait_suspended {
-        return ProviderWaitPumpCompletion::Reparked(capture_provider_wait_repark(pending));
+    if pump.provider_wait_suspended() {
+        let Some(request) = pump.provider_wait_request else {
+            return ProviderWaitPumpCompletion::RetainedFailure(
+                pending, 0xC000_000Du32 as i32,
+            );
+        };
+        return ProviderWaitPumpCompletion::Reparked(capture_provider_wait_repark(pending, request));
     }
     if pump.lpc_wait_suspended {
         return capture_lpc_wait_repark(
@@ -5127,7 +5132,7 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
         trace_nested_callback_frontier(
             if pump.completed { b"resume-terminal".as_slice() } else { b"resume-park".as_slice() },
             pending.dispatch.dispatch_id, pending.dispatch.ssn, client, pump.completed,
-            pump.callback_suspended, pump.provider_wait_suspended, pump.lpc_wait_suspended,
+            pump.callback_suspended, pump.provider_wait_suspended(), pump.lpc_wait_suspended,
         );
     }
 
@@ -5152,13 +5157,14 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
             },
         });
     }
-    if pump.provider_wait_suspended {
+    if pump.provider_wait_suspended() {
+        let Some(request) = pump.provider_wait_request else {
+            return LpcWaitPumpCompletion::RetainedFailure(
+                pending, 0xC000_000Du32 as i32,
+            );
+        };
         let provider = PendingProviderWaitDispatch {
-            request: {
-                let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-                    as *const nt_provider_wait::ProviderWaitSharedPage;
-                core::ptr::read_volatile(core::ptr::addr_of!((*page).request))
-            },
+            request,
             dispatch: pending.dispatch,
             client: pending.client,
             shared_resume: try_capture_exact_shared_resume_snapshot(pending.dispatch, pending.client),
@@ -6025,10 +6031,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             pending, callback_token, callback_context,
         });
     }
-    if component.provider_wait_suspended {
-        let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-            as *const nt_provider_wait::ProviderWaitSharedPage;
-        let wait_request = core::ptr::read_volatile(core::ptr::addr_of!((*page).request));
+    if let Some(wait_request) = component.provider_wait_request {
         let pending = PendingProviderWaitDispatch {
             request: wait_request,
             dispatch: dispatch_context,
@@ -7790,7 +7793,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         print_str(b"/");
         print_u64(pr.callback_suspended as u64);
         print_str(b"/");
-        print_u64(pr.provider_wait_suspended as u64);
+        print_u64(pr.provider_wait_suspended() as u64);
         print_str(b"/");
         print_u64(pr.lpc_wait_suspended as u64);
         print_str(b"/");
@@ -7819,7 +7822,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         pending_callback_token_on_lane(client, lane).is_some_and(|token| {
             crate::service_sec_image::suspend_component_execution_lane_for_callback(lane, token)
         })
-    } else if pr.provider_wait_suspended || pr.lpc_wait_suspended
+    } else if pr.provider_wait_suspended() || pr.lpc_wait_suspended
         || pr.receive_yield().is_some() || pr.root_ingress_yield().is_some()
         || pr.service_wait_yield.is_some()
         || pr.maintenance_yield.is_some() || pr.nested_restore_yield.is_some()
@@ -7947,10 +7950,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     if pr.callback_suspended {
         capture_suspended_published_win32k_context(callback_client);
     }
-    if pr.provider_wait_suspended {
-        let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-            as *const nt_provider_wait::ProviderWaitSharedPage;
-        let request = core::ptr::read_volatile(core::ptr::addr_of!((*page).request));
+    if let Some(request) = pr.provider_wait_request {
         let (arg_snapshot_len, arg_snapshot) = capture_initial_arg_snapshot(ssn, completion_args);
         core::ptr::write(
             core::ptr::addr_of_mut!(PROVIDER_WAIT_PENDING_DISPATCH),
@@ -8010,7 +8010,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         // Report only this invocation's authenticated pump outcome. Pending dispatch slots and
         // callback flags belong to the caller's handoff path and must remain untouched here.
         *suspended = pr.callback_suspended
-            || pr.provider_wait_suspended
+            || pr.provider_wait_suspended()
             || pr.lpc_wait_suspended
             || pr.receive_yield().is_some()
             || pr.root_ingress_yield().is_some()
@@ -8020,7 +8020,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
             || pr.nested_restore_quarantined.is_some();
     }
     if let Some(ticket) = displaced_parent {
-        let child_suspended = pr.callback_suspended || pr.provider_wait_suspended
+        let child_suspended = pr.callback_suspended || pr.provider_wait_suspended()
             || pr.lpc_wait_suspended || pr.receive_yield().is_some()
             || pr.root_ingress_yield().is_some() || pr.service_wait_yield.is_some()
             || pr.maintenance_yield.is_some() || pr.nested_restore_yield.is_some()
@@ -8054,13 +8054,13 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         }
     }
     if nested_user_callback {
-        if pr.callback_suspended || pr.provider_wait_suspended || pr.lpc_wait_suspended
+        if pr.callback_suspended || pr.provider_wait_suspended() || pr.lpc_wait_suspended
             || pr.service_wait_yield.is_some()
             || pr.nested_restore_yield.is_some() || pr.nested_restore_quarantined.is_some()
         {
             trace_nested_callback_frontier(
                 b"park", dispatch_id, ssn, client, pr.completed,
-                pr.callback_suspended, pr.provider_wait_suspended, pr.lpc_wait_suspended,
+                pr.callback_suspended, pr.provider_wait_suspended(), pr.lpc_wait_suspended,
             );
             return (pr.result, false).into();
         }
@@ -8089,7 +8089,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     }
     if registered_client
         && !pr.callback_suspended
-        && !pr.provider_wait_suspended
+        && !pr.provider_wait_suspended()
         && !pr.lpc_wait_suspended
         && pr.receive_yield().is_none()
         && pr.root_ingress_yield().is_none()

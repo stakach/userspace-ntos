@@ -750,7 +750,7 @@ unsafe fn observe_driver_entry_pump(
         reply_cap: result.reply_cap,
         completed: result.completed,
         callback_suspended: result.callback_suspended,
-        provider_wait_suspended: result.provider_wait_suspended,
+        provider_wait_suspended: result.provider_wait_suspended(),
         lpc_wait_suspended: result.lpc_wait_suspended,
         scheduler_yielded: result.scheduler_yielded,
     };
@@ -762,10 +762,7 @@ unsafe fn observe_driver_entry_pump(
     (&mut *core::ptr::addr_of_mut!(ACTIVATIONS))
         .recipient_mut(caller)?
         .observe(attempt, *result, facts, status, current.reply_cap)?;
-    if result.provider_wait_suspended {
-        let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-            as *const nt_provider_wait::ProviderWaitSharedPage;
-        let request = core::ptr::read_volatile(core::ptr::addr_of!((*page).request));
+    if let Some(request) = result.provider_wait_request {
         // No mechanism call or bank release separates observation, capture and retention.
         // Keep the lane Running and exclusive until owned runtime readiness admission.
         with_provider_process_manager(|pm| {
