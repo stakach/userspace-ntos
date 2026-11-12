@@ -316,6 +316,9 @@ struct Work {
     pool_map_handled: bool,
     monitor_source: Option<crate::driver_launch::HostedVideoMonitorArray>,
     monitor_projected: Option<crate::win32k_subsystem::RootProviderPoolAllocation>,
+    monitor_transfer: Option<MonitorPdoTransfer>,
+    monitor_source_retired: bool,
+    monitor_source_acknowledged: bool,
     terminal_claimed: bool,
     terminal_published: bool,
     terminal_packet: Option<super::hosted_source_terminal_packet::RetainedTerminalPacket>,
@@ -347,7 +350,45 @@ struct MonitorArrayRow {
     ownership: nt_io_manager::video_monitor_array_projection::MonitorArrayProjection,
     dependent_free_claimed: bool,
     source_retired: bool,
+    ownership_published: bool,
+    provider_quiesced: bool,
+    provider_acknowledged: bool,
+    ack_indeterminate: bool,
+    monitor_count: usize,
+    transfer: MonitorPdoTransfer,
     stop_abort_started: bool,
+}
+
+struct MonitorPdoTransfer {
+    entries: Vec<MonitorPdoProjection>,
+    ledger: nt_io_manager::video_monitor_array_projection::MonitorPdoReferenceLedger,
+}
+
+struct MonitorPdoProjection {
+    source: nt_io_manager::video_monitor_array_projection::MonitorPdoIdentity,
+    projected: u64,
+    registration: nt_io_manager::HostedDevicePointerRegistration,
+}
+
+impl MonitorPdoTransfer {
+    /// Only a sealed stop before terminal publication proves the caller never received the
+    /// projected PDO pointers. After publication, win32k owns these canonical references.
+    unsafe fn release_unpublished(&mut self) -> bool {
+        loop {
+            let ticket = match self.ledger.begin_release() {
+                Ok(Some(ticket)) => ticket,
+                Ok(None) => return self.ledger.all_released(),
+                Err(_) => return false,
+            };
+            let Some(entry) = self.entries.iter().find(|entry| entry.source == ticket.pdo())
+            else { let _ = self.ledger.mark_uncertain(ticket); return false; };
+            if io_manager_mut().dereference_hosted_device_pointer(entry.registration).is_err() {
+                let _ = self.ledger.mark_uncertain(ticket);
+                return false;
+            }
+            if self.ledger.complete_release(ticket).is_err() { return false; }
+        }
+    }
 }
 
 static mut MONITOR_ARRAYS: Vec<MonitorArrayRow> = Vec::new();
@@ -551,7 +592,8 @@ pub(crate) unsafe fn submit(
         reply_entered: false, reply_acked: false,
         pending: false, origin_armed: false, terminal: None, output_captured: false,
         pool_map_handled: false,
-        monitor_source: None, monitor_projected: None,
+        monitor_source: None, monitor_projected: None, monitor_transfer: None,
+        monitor_source_retired: false, monitor_source_acknowledged: false,
         terminal_claimed: false, terminal_published: false,
         terminal_packet: None, terminal_traced: false,
         terminal_acknowledged: false, terminal_ack_receipt: None,
@@ -626,7 +668,8 @@ impl Work {
     unsafe fn project_monitor_array(&mut self, length: usize) -> bool {
         use nt_io_manager::source_irp_auxiliary::SourcePoolAllocationIdentity;
         use nt_io_manager::video_monitor_array_projection::{
-            decode_monitor_array, MonitorArrayAllocation, MonitorArrayProjection,
+            classify_monitor_source_release, decode_monitor_array, monitor_projection_layout,
+            MonitorArrayAllocation, MonitorArrayProjection, MonitorPdoIdentity,
         };
         if self.code != nt_video_miniport::IOCTL_VIDEO_ENUM_MONITOR_PDO
             || self.terminal.is_none_or(|(status, _)| status != 0)
@@ -664,24 +707,74 @@ impl Work {
                 return true;
             }
         };
-        if !monitors.is_empty() {
-            // VideoPort has transferred extra PDO references as well as the array. Until a
-            // canonical cross-domain reference transfer is available, retain the exact source
-            // allocation and references in quarantine and return a real unsupported status.
-            self.monitor_source.take().unwrap().quarantine();
-            self.terminal = Some((0xC000_00BB, 0));
-            self.output.fill(0);
-            return true;
+        let source = self.monitor_source.as_ref().unwrap();
+        if classify_monitor_source_release(source.video_port(), monitors.len()).is_err() {
+            source.quarantine();
+            self.indeterminate = true;
+            return false;
         }
+        let layout = match monitor_projection_layout(monitors.len()) {
+            Ok(layout) if layout.allocation_bytes <= 0x10_0000 => layout,
+            _ => { source.quarantine(); self.indeterminate = true; return false; }
+        };
         if (&mut *core::ptr::addr_of_mut!(MONITOR_ARRAYS)).try_reserve(1).is_err() {
-            self.monitor_source.take().unwrap().quarantine();
-            self.terminal = Some((STATUS_INSUFFICIENT_RESOURCES as u32, 0));
-            self.output.fill(0);
-            return true;
+            return false;
+        }
+        if self.monitor_transfer.is_none() {
+            let mut entries = Vec::new();
+            let mut identities = Vec::new();
+            if entries.try_reserve_exact(monitors.len()).is_err()
+                || identities.try_reserve_exact(monitors.len()).is_err()
+            { source.quarantine(); self.indeterminate = true; return false; }
+            let source_domain = source.identity().domain;
+            let caller_domain = self.target.registration().domain();
+            for monitor in &monitors {
+                let Some(device) = io_manager_mut().hosted_device_by_identity(source_domain, monitor.pdo)
+                else { source.quarantine(); self.indeterminate = true; return false; };
+                let Some(source_registration) = io_manager_mut()
+                    .hosted_device_pointer_registration(source_domain, monitor.pdo)
+                else { source.quarantine(); self.indeterminate = true; return false; };
+                if source_registration.device_id() != device
+                    || io_manager_mut().hosted_device_pointer_count(source_registration).is_err()
+                { source.quarantine(); self.indeterminate = true; return false; }
+                let Ok(source_identity) = MonitorPdoIdentity::new(
+                    source_domain, monitor.pdo, source_registration.generation(),
+                ) else { source.quarantine(); self.indeterminate = true; return false; };
+                let Ok(projected) = crate::win32k_device_consumer::ensure_projection(device)
+                else { return false; };
+                let Some(registration) = io_manager_mut()
+                    .hosted_device_pointer_registration(caller_domain, projected)
+                else { source.quarantine(); self.indeterminate = true; return false; };
+                if registration.device_id() != device
+                    || io_manager_mut().hosted_device_by_identity(caller_domain, projected) != Some(device)
+                { source.quarantine(); self.indeterminate = true; return false; }
+                identities.push(source_identity);
+                entries.push(MonitorPdoProjection { source: source_identity, projected, registration });
+            }
+            let Ok(ledger) = nt_io_manager::video_monitor_array_projection::MonitorPdoReferenceLedger::new(&identities)
+            else { source.quarantine(); self.indeterminate = true; return false; };
+            self.monitor_transfer = Some(MonitorPdoTransfer { entries, ledger });
+        }
+        let transfer = self.monitor_transfer.as_mut().unwrap();
+        loop {
+            let ticket = match transfer.ledger.begin_acquire() {
+                Ok(Some(ticket)) => ticket,
+                Ok(None) => break,
+                Err(_) => { source.quarantine(); self.indeterminate = true; return false; }
+            };
+            let Some(entry) = transfer.entries.iter().find(|entry| entry.source == ticket.pdo())
+            else { source.quarantine(); self.indeterminate = true; return false; };
+            if io_manager_mut().reference_hosted_device_pointer(entry.registration).is_err() {
+                let _ = transfer.ledger.mark_uncertain(ticket);
+                source.quarantine(); self.indeterminate = true; return false;
+            }
+            if transfer.ledger.complete_acquire(ticket).is_err() {
+                source.quarantine(); self.indeterminate = true; return false;
+            }
         }
         if self.monitor_projected.is_none() {
             self.monitor_projected = match crate::win32k_subsystem::try_allocate_root_provider_pool_allocation(
-                crate::win32k_subsystem::VIDEO_MONITOR_ARRAY_PROJECTION_BYTES as u64,
+                layout.allocation_bytes as u64,
             ) {
                 Ok(projected) => Some(projected),
                 Err(crate::win32k_subsystem::RootPoolError::BusyNoEffect) => return false,
@@ -691,18 +784,14 @@ impl Work {
                     return false;
                 }
                 Err(_) => {
-                    self.monitor_source.take().unwrap().quarantine();
-                    self.terminal = Some((STATUS_INSUFFICIENT_RESOURCES as u32, 0));
-                    self.output.fill(0);
-                    return true;
+                    // Caller PDO references already have exact retained ownership. Keep this
+                    // Work for retry or a sealed-stop rollback rather than dropping them.
+                    return false;
                 }
             };
         }
         let Some(projected) = self.monitor_projected else {
-            self.monitor_source.take().unwrap().quarantine();
-            self.terminal = Some((STATUS_INSUFFICIENT_RESOURCES as u32, 0));
-            self.output.fill(0);
-            return true;
+            return false;
         };
         let projected_identity = MonitorArrayAllocation::new(
             self.target.registration().domain(),
@@ -712,11 +801,23 @@ impl Work {
                 pool_generation: projected.packet_lease().native_identity().allocation_generation,
             },
         ).expect("root allocation has exact domain and generation");
-        let mut bytes = [0u8; crate::win32k_subsystem::VIDEO_MONITOR_ARRAY_PROJECTION_BYTES];
-        bytes[24..32].copy_from_slice(
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(layout.allocation_bytes).is_err() {
+            source.quarantine(); self.indeterminate = true; return false;
+        }
+        bytes.resize(layout.allocation_bytes, 0);
+        for (index, (monitor, entry)) in monitors.iter().zip(&transfer.entries).enumerate() {
+            let offset = index * nt_io_manager::video_monitor_array_projection::VIDEO_MONITOR_DEVICE_X64_BYTES;
+            bytes[offset..offset + 4].copy_from_slice(&monitor.flag.to_le_bytes());
+            bytes[offset + 8..offset + 16].copy_from_slice(&entry.projected.to_le_bytes());
+            bytes[offset + 16..offset + 20].copy_from_slice(&monitor.hw_id.to_le_bytes());
+            bytes[offset + 20] = u8::from(monitor.internal);
+        }
+        bytes[layout.visible_bytes..layout.visible_bytes + 8].copy_from_slice(
             &crate::win32k_subsystem::VIDEO_MONITOR_ARRAY_PROJECTION_MAGIC.to_le_bytes(),
         );
-        bytes[32..40].copy_from_slice(&self.token.to_le_bytes());
+        bytes[layout.visible_bytes + 8..layout.visible_bytes + 16]
+            .copy_from_slice(&self.token.to_le_bytes());
         match crate::win32k_subsystem::try_publish_root_provider_pool_packet(
             projected.packet_lease(), &bytes,
         ) {
@@ -734,7 +835,11 @@ impl Work {
             .expect("provider and dependent allocations have distinct domains");
         (&mut *core::ptr::addr_of_mut!(MONITOR_ARRAYS)).push(MonitorArrayRow {
             token: self.token, source, projected: Some(projected), ownership,
-            dependent_free_claimed: false, source_retired: false, stop_abort_started: false,
+            dependent_free_claimed: false, source_retired: false,
+            ownership_published: false, provider_quiesced: false,
+            provider_acknowledged: false, ack_indeterminate: false,
+            monitor_count: monitors.len(), transfer: self.monitor_transfer.take().unwrap(),
+            stop_abort_started: false,
         });
         self.output[..8].copy_from_slice(&projected.address().to_le_bytes());
         true
@@ -1053,12 +1158,19 @@ impl Work {
         if let Some(row) = (&mut *core::ptr::addr_of_mut!(MONITOR_ARRAYS))
             .iter_mut().find(|row| row.token == self.token)
         {
-            if row.ownership.publish().is_err()
-                || row.ownership.confirm_provider_effect_quiesced().is_err()
-            {
-                row.source.quarantine();
-                return false;
+            if !row.ownership_published {
+                if row.ownership.publish().is_err() { row.source.quarantine(); return false; }
+                row.ownership_published = true;
             }
+            if !row.provider_quiesced {
+                if row.ownership.confirm_provider_effect_quiesced().is_err() {
+                    row.source.quarantine(); return false;
+                }
+                row.provider_quiesced = true;
+            }
+            if !row.transfer.ledger.caller_handoff()
+                && row.transfer.ledger.handoff_to_caller().is_err()
+            { row.source.quarantine(); return false; }
         }
         if let Some(event) = self.event.take() { release_event(handler, event); }
         self.target.release(io_manager_mut()).expect("terminal source IOCTL target");
@@ -1080,8 +1192,28 @@ impl Work {
 
     unsafe fn settle_monitor_array_on_stop(&mut self) -> bool {
         if let Some(source) = self.monitor_source.as_mut() {
-            if !source.retire_unpublished_after_sealed_stop() { return false; }
+            if self.terminal_packet.is_some() || self.terminal_acknowledged || self.origin_committed {
+                source.quarantine();
+                return false;
+            }
+            if let Some(transfer) = self.monitor_transfer.as_mut() {
+                if !transfer.release_unpublished() { return false; }
+            }
+            if !self.monitor_source_retired {
+                if !source.retire_unpublished_after_sealed_stop() { return false; }
+                self.monitor_source_retired = true;
+            }
+            if !self.monitor_source_acknowledged {
+                match source.acknowledge_hosted_video_monitor_array(
+                    self.monitor_transfer.as_ref().map_or(0, |transfer| transfer.entries.len()),
+                ) {
+                    Some(true) => self.monitor_source_acknowledged = true,
+                    None => return false,
+                    Some(false) => { source.quarantine(); self.indeterminate = true; return false; }
+                }
+            }
             self.monitor_source = None;
+            self.monitor_transfer = None;
         }
         if let Some(projected) = self.monitor_projected {
             match crate::win32k_subsystem::try_retire_root_provider_pool_allocation(projected) {
@@ -1101,6 +1233,7 @@ impl Work {
             return true;
         }
         if !row.stop_abort_started {
+            if !row.transfer.release_unpublished() { return false; }
             if row.ownership.abort_unpublished().is_err()
                 || row.ownership.confirm_provider_effect_quiesced().is_err()
             {
@@ -1116,6 +1249,18 @@ impl Work {
                 return false;
             }
             row.source_retired = true;
+        }
+        if !row.provider_acknowledged {
+            if row.ack_indeterminate { return false; }
+            match row.source.acknowledge_hosted_video_monitor_array(row.monitor_count) {
+                Some(true) => row.provider_acknowledged = true,
+                None => return false,
+                Some(false) => {
+                    row.ack_indeterminate = true;
+                    row.source.quarantine();
+                    return false;
+                }
+            }
         }
         let projected = row.projected.expect("retained unpublished monitor allocation");
         match crate::win32k_subsystem::try_retire_root_provider_pool_allocation(projected) {
@@ -1390,6 +1535,7 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
 }
 
 unsafe fn retire_released_monitor_arrays() -> bool {
+    use nt_io_manager::video_monitor_array_projection::monitor_projection_layout;
     let rows = &mut *core::ptr::addr_of_mut!(MONITOR_ARRAYS);
     for index in 0..rows.len() {
         let row = &mut rows[index];
@@ -1404,15 +1550,20 @@ unsafe fn retire_released_monitor_arrays() -> bool {
                 continue;
             }
         };
-        if bytes.len() != crate::win32k_subsystem::VIDEO_MONITOR_ARRAY_PROJECTION_BYTES
-            || u64::from_le_bytes(bytes[24..32].try_into().unwrap())
+        let Ok(layout) = monitor_projection_layout(row.monitor_count) else {
+            row.source.quarantine();
+            continue;
+        };
+        let metadata = layout.visible_bytes;
+        if bytes.len() != layout.allocation_bytes
+            || u64::from_le_bytes(bytes[metadata..metadata + 8].try_into().unwrap())
                 != crate::win32k_subsystem::VIDEO_MONITOR_ARRAY_PROJECTION_MAGIC
-            || u64::from_le_bytes(bytes[32..40].try_into().unwrap()) != row.token
+            || u64::from_le_bytes(bytes[metadata + 8..metadata + 16].try_into().unwrap()) != row.token
         {
             row.source.quarantine();
             continue;
         }
-        if u64::from_le_bytes(bytes[40..48].try_into().unwrap()) != 1 { continue; }
+        if u64::from_le_bytes(bytes[metadata + 16..metadata + 24].try_into().unwrap()) != 1 { continue; }
         if !row.dependent_free_claimed {
             if row.ownership.claim_dependent_free(row.ownership.projected()).is_err() { continue; }
             row.dependent_free_claimed = true;
@@ -1425,6 +1576,18 @@ unsafe fn retire_released_monitor_arrays() -> bool {
                 continue;
             }
             row.source_retired = true;
+        }
+        if !row.provider_acknowledged {
+            if row.ack_indeterminate { continue; }
+            match row.source.acknowledge_hosted_video_monitor_array(row.monitor_count) {
+                Some(true) => row.provider_acknowledged = true,
+                None => continue,
+                Some(false) => {
+                    row.ack_indeterminate = true;
+                    row.source.quarantine();
+                    continue;
+                }
+            }
         }
         if crate::win32k_subsystem::try_retire_root_provider_pool_allocation(projected).is_ok() {
             rows.swap_remove(index);

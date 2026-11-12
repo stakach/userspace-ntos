@@ -130,6 +130,7 @@ pub struct MonitorPdoReferenceLedger {
     id: u64,
     next_sequence: u64,
     entries: Vec<ReferenceEntry>,
+    caller_handoff: bool,
 }
 
 impl MonitorPdoReferenceLedger {
@@ -153,7 +154,7 @@ impl MonitorPdoReferenceLedger {
         entries.extend(pdos.iter().copied().map(|pdo| ReferenceEntry {
             pdo, phase: ReferencePhase::Unacquired,
         }));
-        Ok(Self { id, next_sequence: 1, entries })
+        Ok(Self { id, next_sequence: 1, entries, caller_handoff: false })
     }
 
     fn ticket(&mut self, index: usize, effect: ReferenceEffect) -> Result<MonitorPdoReferenceTicket, MonitorProjectionError> {
@@ -169,7 +170,7 @@ impl MonitorPdoReferenceLedger {
     }
 
     pub fn begin_acquire(&mut self) -> Result<Option<MonitorPdoReferenceTicket>, MonitorProjectionError> {
-        if self.entries.iter().any(|entry| matches!(entry.phase,
+        if self.caller_handoff || self.entries.iter().any(|entry| matches!(entry.phase,
             ReferencePhase::Acquiring(_) | ReferencePhase::Releasing(_)
                 | ReferencePhase::Released | ReferencePhase::Uncertain))
         {
@@ -206,7 +207,7 @@ impl MonitorPdoReferenceLedger {
     }
 
     pub fn begin_release(&mut self) -> Result<Option<MonitorPdoReferenceTicket>, MonitorProjectionError> {
-        if self.entries.iter().any(|entry| matches!(entry.phase,
+        if self.caller_handoff || self.entries.iter().any(|entry| matches!(entry.phase,
             ReferencePhase::Acquiring(_) | ReferencePhase::Releasing(_)
                 | ReferencePhase::Uncertain))
         {
@@ -228,9 +229,20 @@ impl MonitorPdoReferenceLedger {
     }
 
     pub fn all_released(&self) -> bool {
-        self.entries.iter().all(|entry| matches!(entry.phase,
+        !self.caller_handoff && self.entries.iter().all(|entry| matches!(entry.phase,
             ReferencePhase::Unacquired | ReferencePhase::Released))
     }
+
+    /// The terminal has been published and acknowledged by win32k. The exact canonical
+    /// registration counts now belong to the caller, which dereferences each PDO later.
+    pub fn handoff_to_caller(&mut self) -> Result<(), MonitorProjectionError> {
+        if self.caller_handoff || self.entries.iter().any(|entry| entry.phase != ReferencePhase::Acquired)
+        { return Err(MonitorProjectionError::InvalidTransition); }
+        self.caller_handoff = true;
+        Ok(())
+    }
+
+    pub fn caller_handoff(&self) -> bool { self.caller_handoff }
 }
 
 /// Only VideoPort transfers counted PDO references with its monitor array. Other
@@ -246,8 +258,8 @@ pub fn classify_monitor_source_release(
     monitor_count: usize,
 ) -> Result<MonitorSourceReferenceRelease, MonitorProjectionError> {
     match (video_port_registered, monitor_count) {
+        (_, 0) => Ok(MonitorSourceReferenceRelease::NoReferences),
         (true, _) => Ok(MonitorSourceReferenceRelease::VideoPortAck),
-        (false, 0) => Ok(MonitorSourceReferenceRelease::NoReferences),
         (false, _) => Err(MonitorProjectionError::InvalidArray),
     }
 }
@@ -414,7 +426,7 @@ mod tests {
         );
         assert_eq!(
             classify_monitor_source_release(true, 0),
-            Ok(MonitorSourceReferenceRelease::VideoPortAck),
+            Ok(MonitorSourceReferenceRelease::NoReferences),
         );
         assert_eq!(
             classify_monitor_source_release(true, 2),

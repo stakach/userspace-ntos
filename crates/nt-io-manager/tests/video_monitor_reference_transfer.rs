@@ -97,3 +97,18 @@ fn preflight_refusal_before_next_acquire_can_drain_only_held_references() {
     assert!(references.all_released());
     assert!(references.begin_acquire().is_err(), "a drained array cannot be replayed");
 }
+
+#[test]
+fn published_caller_references_cannot_be_released_by_array_retirement() {
+    let mut references = MonitorPdoReferenceLedger::new(&[
+        child(0x7000, 25), child(0x8000, 26),
+    ]).unwrap();
+    assert!(references.handoff_to_caller().is_err());
+    while let Some(ticket) = references.begin_acquire().unwrap() {
+        references.complete_acquire(ticket).unwrap();
+    }
+    references.handoff_to_caller().unwrap();
+    assert!(references.caller_handoff());
+    assert!(references.begin_release().is_err());
+    assert!(!references.all_released());
+}

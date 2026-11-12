@@ -1521,6 +1521,7 @@ pub const FSD_DISPATCH_COPY_COMPLETION: u64 = u64::MAX - 0x77C;
 pub const FSD_DISPATCH_ACK_COMPLETION: u64 = u64::MAX - 0x77D;
 pub const FSD_DISPATCH_COPY_MUTABLE_INPUT: u64 = u64::MAX - 0x785;
 pub const FSD_DISPATCH_VIDEO_RELATION_ACK: u64 = u64::MAX - 0x77E;
+pub const FSD_DISPATCH_VIDEO_MONITOR_ARRAY_ACK: u64 = u64::MAX - 0x788;
 pub const FSD_DISPATCH_CREATE_PDO_PROJECTION: u64 = u64::MAX - 0x77F;
 pub const FSD_DISPATCH_DRAIN_FILE_RETIREMENTS: u64 = u64::MAX - 0x781;
 pub const FSD_DISPATCH_DRIVER_REINIT: u64 = u64::MAX - 0x782;
@@ -4752,6 +4753,9 @@ unsafe fn hosted_instance_pool_allocation_exec_if_live(
 pub(crate) struct HostedVideoMonitorArray {
     pin: hosted_device_allocations::TemporaryPoolPin,
     identity: nt_io_manager::video_monitor_array_projection::MonitorArrayAllocation,
+    parent_device_id: u64,
+    driver_id: u64,
+    video_port: bool,
     bytes: Vec<u8>,
 }
 
@@ -4761,6 +4765,39 @@ impl HostedVideoMonitorArray {
     }
 
     pub(crate) fn bytes(&self) -> &[u8] { &self.bytes }
+
+    pub(crate) fn video_port(&self) -> bool { self.video_port }
+
+    pub(crate) unsafe fn acknowledge_hosted_video_monitor_array(&self, count: usize) -> Option<bool> {
+        // The empty VideoPort array transfers no PDO references and has no provider row.
+        // Freeing its exact source allocation completes retirement without an ACK RPC.
+        if count == 0 { return Some(true); }
+        if !self.video_port { return Some(false); }
+        let Some((instance_index, inst, parent_object)) =
+            hosted_driver_device_route_by_device_id(self.parent_device_id)
+        else { return Some(false); };
+        if !inst.ready || inst.driver_id != self.driver_id
+            || instance_domain_identity(inst) != Some(self.identity.domain)
+            || io_manager_mut().hosted_device_address_by_identity(
+                self.identity.domain, nt_io_manager::DeviceId(self.parent_device_id),
+            ) != Some(parent_object)
+        { return Some(false); }
+        let result = dispatch_irp_for_instance_exact(
+            instance_index, FSD_DISPATCH_VIDEO_MONITOR_ARRAY_ACK,
+            self.identity.allocation.pool_generation, parent_object, 0, 0,
+            self.identity.allocation.component_address, parent_object, 0,
+            None, &[], &mut [], Some(crate::initial_system_driver_caller()),
+        );
+        match result {
+            Some(HostedIrpTransportResult::Returned { status, information, .. })
+                if status.is_success() => Some(information == 1),
+            Some(HostedIrpTransportResult::NotDispatched { status })
+                if status == nt_status::NtStatus::INSUFFICIENT_RESOURCES
+                    || status == nt_status::NtStatus::DEVICE_BUSY => None,
+            None => None,
+            _ => Some(false),
+        }
+    }
 
     pub(crate) unsafe fn retire_transferred(
         &mut self,
@@ -4819,7 +4856,10 @@ pub(crate) unsafe fn capture_hosted_video_monitor_array(
         let _ = hosted_device_allocations::retain_temporary_pool_pin_uncertain(&pin);
         return Err(status.raw() as u32);
     }
-    Ok(HostedVideoMonitorArray { pin, identity, bytes })
+    Ok(HostedVideoMonitorArray {
+        pin, identity, parent_device_id: device_id, driver_id: completion_driver_id,
+        video_port: hosted_device_video_port_initialized(device_id), bytes,
+    })
 }
 
 unsafe fn print_active_irp_graph_for_deadman(inst: &DriverInstance) {
@@ -39060,6 +39100,16 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
         let allocation = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
         let generation = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
         return match hosted_video_port_pnp::acknowledge_relation(parent, allocation, generation) {
+            Some(true) => (STATUS_SUCCESS, 1),
+            None => (STATUS_SUCCESS, 0),
+            Some(false) => (STATUS_INVALID_DEVICE_REQUEST, 0),
+        };
+    }
+    if major == FSD_DISPATCH_VIDEO_MONITOR_ARRAY_ACK {
+        let parent = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
+        let allocation = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
+        let generation = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
+        return match hosted_video_port_pnp::acknowledge_monitor_array(parent, allocation, generation) {
             Some(true) => (STATUS_SUCCESS, 1),
             None => (STATUS_SUCCESS, 0),
             Some(false) => (STATUS_INVALID_DEVICE_REQUEST, 0),

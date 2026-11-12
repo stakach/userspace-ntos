@@ -1,5 +1,8 @@
 # Lessons
 
+## Check VideoPort's Child List Lifetime
+- `VideoPortEnumMonitorPdo` may return an allocated empty sentinel before BusRelations has created a parent child row. Validate the live FDO, then preserve that empty result; only a populated list requires per-child references and cross-domain projection. Check the pinned source before treating an absent parent row as synthetic success.
+
 ## Project The Caller Core, Not The Service Core
 - A native syscall handled by the executive observes the executive TCB if it executes CPUID there. `NtGetCurrentProcessorNumber{Ex}` must use the exact guest caller's generation-checked TCB and SC placement; an executive-local APIC read cannot report a migrated caller's CPU.
 - Keep a physical placement owner with the published runtime. Record an attempted SC migration before invocation, expose a core only when its effect is known, and retain uncertain effects without replay or retirement. A driver callback may observe its own executing core, but that does not identify an unrelated user caller.
@@ -825,3 +828,8 @@ diagnosis-free failure.
 
 ## Distinguish Last Timer Selection From Live Wake Demand
 - `LAST_REARM_SOURCE` and `LAST_REARM_DEADLINE` remain as historical values after an Idle rearm disarms the physical shot. A final receive log with `shot=0` and a selected source does not prove that source still has a deadline. Capture the actual preflight outcome, current producer state, and shot authority on both sides of the receive trace before assigning a missed wake.
+
+## Count Native References Before Sending Their ACK
+- VideoPort allocates a monitor array even when its child list is empty, but creates no per-array reference row for that case. Free the exact empty allocation without a provider reference ACK. For populated arrays, transfer each canonical caller reference first, free the source allocation, then ACK the provider's counted references.
+- Classify transferred ownership from the exact completing FDO, not a driver-wide initialized flag. A driver may serve more than one device with different roles; bind the ACK choice to the same canonical device identity that produced the array.
+- Parse caller-visible monitor entries once at admission. After publication, the caller may change those entries; exact free and retirement must validate the immutable recorded metadata offset and physical allocation generation rather than rescan mutable PDO bytes.

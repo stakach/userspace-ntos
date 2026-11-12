@@ -23,6 +23,7 @@ const EDID_HEADER: [u8; 8] = [0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0];
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Phase {
     Enumerating,
+    EnumeratingMonitor,
     Ready,
     Publishing,
     Published,
@@ -56,6 +57,39 @@ struct ChildSnapshot {
     descriptor: [u8; VIDEO_CHILD_DESCRIPTOR_SIZE as usize],
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum MonitorReferencePhase {
+    Prepared,
+    Referencing,
+    Referenced,
+    Releasing,
+    Released,
+}
+
+struct MonitorReference {
+    device: u64,
+    pool_generation: u64,
+    phase: MonitorReferencePhase,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum MonitorArrayPhase {
+    Building,
+    Published,
+    Releasing,
+    Aborting,
+    Reclaiming,
+}
+
+/// The VideoPort component owns these references independently of BusRelations. An interrupted
+/// native reference or dereference remains in its in-flight phase and cannot be replayed.
+struct MonitorArrayRow {
+    allocation: u64,
+    allocation_generation: u64,
+    phase: MonitorArrayPhase,
+    references: Vec<MonitorReference>,
+}
+
 unsafe fn child_snapshot(device: u64) -> Option<ChildSnapshot> {
     let _guard = ParentsGuard::acquire();
     (*core::ptr::addr_of!(PARENTS)).iter().find_map(|parent| {
@@ -75,6 +109,7 @@ struct Parent {
     driver: u64,
     phase: Phase,
     children: Vec<Box<Child>>,
+    monitor_arrays: Vec<MonitorArrayRow>,
     /// A publication begun before native reference/complete effects remains owned on a fault.
     relation: u64,
     relation_generation: u64,
@@ -117,31 +152,329 @@ unsafe fn parent_update<T>(device: u64, update: impl FnOnce(&mut Parent) -> T) -
         .map(update)
 }
 
-/// ReactOS VideoPort returns an allocated, null-terminated monitor array even when the
-/// current child list is empty. The caller owns the returned pool allocation. A populated
-/// list needs counted PDO references and a cross-domain projection before publication.
+/// Return VideoPort's allocated, null-terminated array of its published monitor PDOs.
+/// The root projects the foreign pointers for its caller; this component owns the counted
+/// references until that exact source array has been copied and freed.
 pub(super) unsafe fn enumerate_monitor_pdos(parent_device: u64) -> Result<u64, i32> {
     let (driver, _) = opened_video_fdo(parent_device)?;
-    let child_count = {
-        let _guard = ParentsGuard::acquire();
-        (*core::ptr::addr_of!(PARENTS)).iter()
-            .find(|parent| parent.device == parent_device)
-            .map(|parent| {
-                (parent.driver == driver && parent.phase == Phase::Ready
-                    && parent.children.iter().all(|child| {
-                    child.phase == ChildPhase::Published && child.device != 0
-                })).then_some(parent.children.len())
+    let children = parent_update(parent_device, |parent| {
+        if parent.driver != driver || parent.phase != Phase::Ready
+            || parent.children.iter().any(|child| {
+                child.phase != ChildPhase::Published || child.device == 0
             })
-            .unwrap_or(Some(0))
-    }.ok_or(STATUS_DEVICE_BUSY)?;
-    if child_count != 0 {
-        return Err(0xc000_00bbu32 as i32); // Cross-domain reference transfer is required.
+        {
+            return Err(STATUS_DEVICE_BUSY);
+        }
+        let mut children = Vec::new();
+        children.try_reserve_exact(parent.children.len())
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        for child in &parent.children { children.push(child.device); }
+        parent.phase = Phase::EnumeratingMonitor;
+        Ok(children)
+    }).transpose()?.unwrap_or_default();
+    let layout = match nt_io_manager::video_monitor_array_projection::monitor_projection_layout(children.len()) {
+        Ok(layout) => layout,
+        Err(_) => {
+            parent_update(parent_device, |parent| parent.phase = Phase::Ready);
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+    };
+    let mut references = Vec::new();
+    if references.try_reserve_exact(children.len()).is_err() {
+        parent_update(parent_device, |parent| parent.phase = Phase::Ready);
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
-    let allocation = pool_alloc(nt_io_manager::video_monitor_array_projection::VIDEO_MONITOR_DEVICE_X64_BYTES as u64);
-    if allocation == 0 { return Err(STATUS_INSUFFICIENT_RESOURCES); }
-    core::ptr::write_bytes(allocation as *mut u8, 0,
-        nt_io_manager::video_monitor_array_projection::VIDEO_MONITOR_DEVICE_X64_BYTES);
+    for &device in &children {
+        let Some(pool_generation) = component_pool_allocation_generation(device) else {
+            parent_update(parent_device, |parent| parent.phase = Phase::Ready);
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        references.push(MonitorReference {
+            device, pool_generation, phase: MonitorReferencePhase::Prepared,
+        });
+    }
+    let allocation = pool_alloc(layout.visible_bytes as u64);
+    if allocation == 0 {
+        parent_update(parent_device, |parent| parent.phase = Phase::Ready);
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let Some(allocation_generation) = component_pool_allocation_generation(allocation) else {
+        parent_update(parent_device, |parent| parent.phase = Phase::Blocked);
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    };
+    core::ptr::write_bytes(allocation as *mut u8, 0, layout.visible_bytes);
+    if children.is_empty() {
+        parent_update(parent_device, |parent| parent.phase = Phase::Ready);
+        return Ok(allocation);
+    }
+    let recorded = parent_update(parent_device, |parent| {
+        if parent.driver != driver || parent.phase != Phase::EnumeratingMonitor
+            || parent.monitor_arrays.try_reserve(1).is_err()
+        { return false; }
+        parent.monitor_arrays.push(MonitorArrayRow {
+            allocation, allocation_generation, phase: MonitorArrayPhase::Building, references,
+        });
+        true
+    }).unwrap_or(false);
+    if !recorded {
+        if !pool_free_exact(allocation, allocation_generation) {
+            parent_update(parent_device, |parent| parent.phase = Phase::Blocked);
+        } else {
+            parent_update(parent_device, |parent| parent.phase = Phase::Ready);
+        }
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    for (index, &device) in children.iter().enumerate() {
+        let expected_generation = parent_update(parent_device, |parent| {
+            parent.monitor_arrays.iter().find(|row| {
+                row.allocation == allocation && row.allocation_generation == allocation_generation
+            }).and_then(|row| row.references.get(index))
+                .map(|reference| reference.pool_generation)
+        }).flatten();
+        if expected_generation.is_none()
+            || component_pool_allocation_generation(device) != expected_generation
+        {
+            if !abort_building_monitor_array(parent_device, allocation, allocation_generation) {
+                parent_update(parent_device, |parent| parent.phase = Phase::Blocked);
+            }
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let armed = parent_update(parent_device, |parent| {
+            if parent.phase != Phase::EnumeratingMonitor { return false; }
+            let Some(row) = parent.monitor_arrays.iter_mut().find(|row| {
+                row.allocation == allocation && row.allocation_generation == allocation_generation
+                    && row.phase == MonitorArrayPhase::Building
+            }) else { return false; };
+            let Some(reference) = row.references.get_mut(index) else { return false; };
+            if reference.device != device || reference.pool_generation != expected_generation.unwrap()
+                || reference.phase != MonitorReferencePhase::Prepared
+            { return false; }
+            reference.phase = MonitorReferencePhase::Referencing;
+            true
+        }).unwrap_or(false);
+        if !armed {
+            if !abort_building_monitor_array(parent_device, allocation, allocation_generation) {
+                parent_update(parent_device, |parent| parent.phase = Phase::Blocked);
+            }
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        s_obf_reference_object(device);
+        let recorded = parent_update(parent_device, |parent| {
+            let Some(row) = parent.monitor_arrays.iter_mut().find(|row| {
+                row.allocation == allocation && row.allocation_generation == allocation_generation
+                    && row.phase == MonitorArrayPhase::Building
+            }) else { return false; };
+            let Some(reference) = row.references.get_mut(index) else { return false; };
+            if reference.device != device || reference.phase != MonitorReferencePhase::Referencing
+            { return false; }
+            reference.phase = MonitorReferencePhase::Referenced;
+            true
+        }).unwrap_or(false);
+        if !recorded {
+            // The native reference may have happened. An in-flight entry cannot be unwound.
+            parent_update(parent_device, |parent| parent.phase = Phase::Blocked);
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        core::ptr::write_unaligned(
+            (allocation + (index * nt_io_manager::video_monitor_array_projection::VIDEO_MONITOR_DEVICE_X64_BYTES + 8) as u64) as *mut u64,
+            device,
+        );
+    }
+    let published = parent_update(parent_device, |parent| {
+        if parent.phase != Phase::EnumeratingMonitor { return false; }
+        let Some(row) = parent.monitor_arrays.iter_mut().find(|row| {
+            row.allocation == allocation && row.allocation_generation == allocation_generation
+                && row.phase == MonitorArrayPhase::Building
+        }) else { return false; };
+        if row.references.iter().any(|reference| reference.phase != MonitorReferencePhase::Referenced)
+        { return false; }
+        row.phase = MonitorArrayPhase::Published;
+        parent.phase = Phase::Ready;
+        true
+    }).unwrap_or(false);
+    if !published {
+        if !abort_building_monitor_array(parent_device, allocation, allocation_generation) {
+            parent_update(parent_device, |parent| parent.phase = Phase::Blocked);
+        }
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
     Ok(allocation)
+}
+
+/// A rejected construction has not published its array. Release only references whose native
+/// acquire returned and was recorded. Any in-flight effect keeps the row and its allocation.
+unsafe fn abort_building_monitor_array(
+    parent_device: u64, allocation: u64, allocation_generation: u64,
+) -> bool {
+    let admitted = parent_update(parent_device, |parent| {
+        if parent.phase != Phase::EnumeratingMonitor { return false; }
+        let Some(row) = parent.monitor_arrays.iter_mut().find(|row| {
+            row.allocation == allocation && row.allocation_generation == allocation_generation
+                && row.phase == MonitorArrayPhase::Building
+        }) else { return false; };
+        if row.references.iter().any(|reference| matches!(reference.phase,
+            MonitorReferencePhase::Referencing | MonitorReferencePhase::Releasing))
+        { return false; }
+        row.phase = MonitorArrayPhase::Aborting;
+        true
+    }).unwrap_or(false);
+    if !admitted { return false; }
+    loop {
+        let next = parent_update(parent_device, |parent| {
+            let row = parent.monitor_arrays.iter().find(|row| {
+                row.allocation == allocation && row.allocation_generation == allocation_generation
+                    && row.phase == MonitorArrayPhase::Aborting
+            })?;
+            if row.references.iter().any(|reference| matches!(reference.phase,
+                MonitorReferencePhase::Referencing | MonitorReferencePhase::Releasing))
+            { return None; }
+            Some(row.references.iter().enumerate().find_map(|(index, reference)| {
+                (reference.phase == MonitorReferencePhase::Referenced)
+                    .then_some((index, reference.device, reference.pool_generation))
+            }))
+        }).flatten().flatten();
+        let Some((index, device, generation)) = next else { break };
+        if component_pool_allocation_generation(device) != Some(generation) { return false; }
+        let armed = parent_update(parent_device, |parent| {
+            let Some(row) = parent.monitor_arrays.iter_mut().find(|row| {
+                row.allocation == allocation && row.allocation_generation == allocation_generation
+                    && row.phase == MonitorArrayPhase::Aborting
+            }) else { return false; };
+            let Some(reference) = row.references.get_mut(index) else { return false; };
+            if reference.device != device || reference.pool_generation != generation
+                || reference.phase != MonitorReferencePhase::Referenced
+            { return false; }
+            reference.phase = MonitorReferencePhase::Releasing;
+            true
+        }).unwrap_or(false);
+        if !armed { return false; }
+        s_obf_dereference_object(device);
+        let recorded = parent_update(parent_device, |parent| {
+            let Some(row) = parent.monitor_arrays.iter_mut().find(|row| {
+                row.allocation == allocation && row.allocation_generation == allocation_generation
+                    && row.phase == MonitorArrayPhase::Aborting
+            }) else { return false; };
+            let Some(reference) = row.references.get_mut(index) else { return false; };
+            if reference.device != device || reference.pool_generation != generation
+                || reference.phase != MonitorReferencePhase::Releasing
+            { return false; }
+            reference.phase = MonitorReferencePhase::Released;
+            true
+        }).unwrap_or(false);
+        if !recorded { return false; }
+    }
+    let reclaim = parent_update(parent_device, |parent| {
+        let Some(row) = parent.monitor_arrays.iter_mut().find(|row| {
+            row.allocation == allocation && row.allocation_generation == allocation_generation
+                && row.phase == MonitorArrayPhase::Aborting
+        }) else { return false; };
+        if row.references.iter().any(|reference| !matches!(reference.phase,
+            MonitorReferencePhase::Prepared | MonitorReferencePhase::Released))
+        { return false; }
+        row.phase = MonitorArrayPhase::Reclaiming;
+        true
+    }).unwrap_or(false);
+    if !reclaim || !pool_free_exact(allocation, allocation_generation) { return false; }
+    parent_update(parent_device, |parent| {
+        if parent.phase != Phase::EnumeratingMonitor { return false; }
+        let Some(index) = parent.monitor_arrays.iter().position(|row| {
+            row.allocation == allocation && row.allocation_generation == allocation_generation
+                && row.phase == MonitorArrayPhase::Reclaiming
+        }) else { return false; };
+        parent.monitor_arrays.remove(index);
+        parent.phase = Phase::Ready;
+        true
+    }).unwrap_or(false)
+}
+
+/// The root calls this only after it has authenticated, copied and freed the exact source
+/// allocation. Each child reference belongs to this array, independently of BusRelations or
+/// other monitor arrays. A fault during a native dereference leaves the row in flight.
+pub(super) unsafe fn acknowledge_monitor_array(
+    parent_device: u64, allocation: u64, allocation_generation: u64,
+) -> Option<bool> {
+    let admitted = parent_update(parent_device, |parent| {
+        if allocation == 0 || allocation_generation == 0 { return false; }
+        let Some(row) = parent.monitor_arrays.iter_mut().find(|row| {
+            row.allocation == allocation && row.allocation_generation == allocation_generation
+        }) else { return false; };
+        if row.phase == MonitorArrayPhase::Published {
+            if row.references.iter().any(|reference| {
+                reference.phase != MonitorReferencePhase::Referenced
+            }) { return false; }
+            row.phase = MonitorArrayPhase::Releasing;
+            return true;
+        }
+        row.phase == MonitorArrayPhase::Releasing
+            && row.references.iter().all(|reference| {
+                reference.phase == MonitorReferencePhase::Referenced
+                    || reference.phase == MonitorReferencePhase::Released
+            })
+    })?;
+    if !admitted { return Some(false); }
+    loop {
+        let next = parent_update(parent_device, |parent| {
+            let Some(row) = parent.monitor_arrays.iter().find(|row| {
+                row.allocation == allocation && row.allocation_generation == allocation_generation
+                    && row.phase == MonitorArrayPhase::Releasing
+            }) else { return Err(()); };
+            if row.references.iter().any(|reference| {
+                reference.phase == MonitorReferencePhase::Referencing
+                    || reference.phase == MonitorReferencePhase::Releasing
+                    || reference.phase == MonitorReferencePhase::Prepared
+            }) { return Err(()); }
+            Ok(row.references.iter().enumerate().find_map(|(index, reference)| {
+                (reference.phase == MonitorReferencePhase::Referenced)
+                    .then_some((index, reference.device, reference.pool_generation))
+            }))
+        }).unwrap_or(Err(()));
+        let (index, device, generation) = match next {
+            Ok(Some(next)) => next,
+            Ok(None) => break,
+            Err(()) => return Some(false),
+        };
+        if component_pool_allocation_generation(device) != Some(generation) {
+            return Some(false);
+        }
+        let armed = parent_update(parent_device, |parent| {
+            let Some(row) = parent.monitor_arrays.iter_mut().find(|row| {
+                row.allocation == allocation && row.allocation_generation == allocation_generation
+                    && row.phase == MonitorArrayPhase::Releasing
+            }) else { return false; };
+            let Some(reference) = row.references.get_mut(index) else { return false; };
+            if reference.device != device || reference.pool_generation != generation
+                || reference.phase != MonitorReferencePhase::Referenced
+            { return false; }
+            reference.phase = MonitorReferencePhase::Releasing;
+            true
+        }).unwrap_or(false);
+        if !armed { return Some(false); }
+        s_obf_dereference_object(device);
+        let recorded = parent_update(parent_device, |parent| {
+            let Some(row) = parent.monitor_arrays.iter_mut().find(|row| {
+                row.allocation == allocation && row.allocation_generation == allocation_generation
+                    && row.phase == MonitorArrayPhase::Releasing
+            }) else { return false; };
+            let Some(reference) = row.references.get_mut(index) else { return false; };
+            if reference.device != device || reference.pool_generation != generation
+                || reference.phase != MonitorReferencePhase::Releasing
+            { return false; }
+            reference.phase = MonitorReferencePhase::Released;
+            true
+        }).unwrap_or(false);
+        if !recorded { return Some(false); }
+    }
+    Some(parent_update(parent_device, |parent| {
+        let Some(index) = parent.monitor_arrays.iter().position(|row| {
+            row.allocation == allocation && row.allocation_generation == allocation_generation
+                && row.phase == MonitorArrayPhase::Releasing
+                && row.references.iter().all(|reference| {
+                    reference.phase == MonitorReferencePhase::Released
+                })
+        }) else { return false; };
+        parent.monitor_arrays.remove(index);
+        true
+    }).unwrap_or(false))
 }
 
 unsafe fn complete(irp: u64, status: i32, information: u64) -> i32 {
@@ -605,7 +938,11 @@ unsafe fn child_query_capabilities(irp: u64, stack: u64, child: &ChildSnapshot) 
 
 unsafe fn child_remove(device: u64, irp: u64, child: &ChildSnapshot) -> i32 {
     let admitted = parent_update(child.parent_device, |parent| {
-        if parent.phase != Phase::Ready { return false; }
+        if parent.phase != Phase::Ready || parent.monitor_arrays.iter().any(|row| {
+            row.references.iter().any(|reference| {
+                reference.device == device && reference.phase != MonitorReferencePhase::Released
+            })
+        }) { return false; }
         let Some(child) = parent.children.iter_mut().find(|child| child.device == device) else {
             return false;
         };
@@ -692,6 +1029,7 @@ pub(super) unsafe extern "win64" fn dispatch(device: u64, irp: u64) -> i32 {
             } else {
                 parents.push(Parent {
                     device, driver, phase: Phase::Enumerating, children: Vec::new(),
+                    monitor_arrays: Vec::new(),
                     relation: 0, relation_generation: 0, referenced: 0, released: 0,
                     release_in_flight: None, release_allocation: false,
                     release_allocation_in_flight: false,

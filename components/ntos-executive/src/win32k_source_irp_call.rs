@@ -12,6 +12,7 @@ struct MonitorArrayAdmission {
     allocation: shared_pool::AllocationIdentity,
     provider: nt_provider_wait::ProviderDomainIdentity,
     token: u64,
+    metadata_offset: usize,
     claimed: bool,
 }
 
@@ -44,11 +45,19 @@ unsafe fn register_monitor_array_projection(pointer: u64, token: u64) -> bool {
     let _guard = MonitorArrayAdmissionsGuard::acquire();
     let Some(provider) = registered_provider_wait_domain() else { return false };
     let Some(allocation) = provider_pool_allocation_identity(pointer) else { return false };
-    if provider_pool_allocation_capacity(pointer)
-        .is_none_or(|capacity| capacity < VIDEO_MONITOR_ARRAY_PROJECTION_BYTES as u64)
-        || read_volatile((pointer + 24) as *const u64) != VIDEO_MONITOR_ARRAY_PROJECTION_MAGIC
-        || read_volatile((pointer + 32) as *const u64) != token
-        || read_volatile((pointer + 40) as *const u64) != 0
+    let Some(capacity) = provider_pool_allocation_capacity(pointer) else { return false };
+    if capacity < nt_io_manager::video_monitor_array_projection::monitor_projection_layout(0)
+        .expect("empty monitor projection layout").allocation_bytes as u64
+        || capacity > 0x10_0000
+    { return false; }
+    let bytes = core::slice::from_raw_parts(pointer as *const u8, capacity as usize);
+    let Ok(layout) = nt_io_manager::video_monitor_array_projection::projected_monitor_layout(bytes)
+    else { return false; };
+    let metadata_offset = layout.visible_bytes;
+    if read_volatile((pointer + metadata_offset as u64) as *const u64)
+            != VIDEO_MONITOR_ARRAY_PROJECTION_MAGIC
+        || read_volatile((pointer + metadata_offset as u64 + 8) as *const u64) != token
+        || read_volatile((pointer + metadata_offset as u64 + 16) as *const u64) != 0
     {
         return false;
     }
@@ -73,7 +82,7 @@ unsafe fn register_monitor_array_projection(pointer: u64, token: u64) -> bool {
         return false;
     }
     admissions.push(MonitorArrayAdmission {
-        address: pointer, allocation, provider, token, claimed: false,
+        address: pointer, allocation, provider, token, metadata_offset, claimed: false,
     });
     true
 }
@@ -90,14 +99,16 @@ pub(super) unsafe fn claim_monitor_array_projection_free(pointer: u64) -> Option
     })?;
     if admissions[index].claimed { return Some(false); }
     let token = admissions[index].token;
-    if provider_pool_allocation_capacity(pointer)
-            .is_none_or(|capacity| capacity < VIDEO_MONITOR_ARRAY_PROJECTION_BYTES as u64)
-        || read_volatile((pointer + 24) as *const u64) != VIDEO_MONITOR_ARRAY_PROJECTION_MAGIC
-        || read_volatile((pointer + 32) as *const u64) != token
+    let Some(capacity) = provider_pool_allocation_capacity(pointer) else { return Some(false) };
+    let metadata_offset = admissions[index].metadata_offset;
+    if metadata_offset.checked_add(24).is_none_or(|end| end > capacity as usize)
+        || read_volatile((pointer + metadata_offset as u64) as *const u64)
+            != VIDEO_MONITOR_ARRAY_PROJECTION_MAGIC
+        || read_volatile((pointer + metadata_offset as u64 + 8) as *const u64) != token
     {
         return Some(false);
     }
-    let released = &*((pointer + 40) as *const AtomicU64);
+    let released = &*((pointer + metadata_offset as u64 + 16) as *const AtomicU64);
     if released.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
         return Some(false);
     }

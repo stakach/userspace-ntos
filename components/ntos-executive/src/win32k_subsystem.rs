@@ -10418,7 +10418,6 @@ extern "win64" fn s_ke_add_system_service_table(
 
 /// `VOID ExFreePoolWithTag(PVOID, ULONG)`. Resolve the allocation by exact arena membership and
 /// live-header validation. Foreign and duplicate frees remain visible instead of being accepted.
-pub(crate) const VIDEO_MONITOR_ARRAY_PROJECTION_BYTES: usize = 48;
 pub(crate) const VIDEO_MONITOR_ARRAY_PROJECTION_MAGIC: u64 = 0x564d_4f4e_4152_5231;
 
 /// The root pins this typed array until it observes the dependent's exact free. The final word is
