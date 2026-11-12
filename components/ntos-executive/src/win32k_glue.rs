@@ -4938,6 +4938,19 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         pump.dispatch_return_receipt, pending.dispatch.dispatch_id, pending.dispatch.ssn,
         pump.result, pump.completed,
     );
+    if pump.nested_restore_yield.is_some()
+        || pump.nested_restore_quarantined.is_some()
+        || pump.nested_child_work.is_some()
+    {
+        print_str(b"[provider-wait-nested-handoff] dispatch/wait/status/completed/restore/quarantined/child=");
+        for value in [pending.dispatch.dispatch_id, wait_id, pump.status as u32 as u64,
+            u64::from(pump.completed), u64::from(pump.nested_restore_yield.is_some()),
+            u64::from(pump.nested_restore_quarantined.is_some()),
+            u64::from(pump.nested_child_work.is_some())] {
+            print_str(b"/"); print_hex_u64(value);
+        }
+        print_str(b"\n");
+    }
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
         previous_dispatch,

@@ -17,6 +17,7 @@ static ACTIVE_SYSCALL_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_RETAINED_SEH_RECEIVES: AtomicU64 = AtomicU64::new(0);
 static HOOK_NESTED_RETURN_PROBES: AtomicU64 = AtomicU64::new(0);
 static NESTED_REGISTRY_WAKE_GAP_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static INLINE_SOURCE_WORK_TRACE_N: AtomicU64 = AtomicU64::new(0);
 
 /// Observation only: a nested physical Receive bypasses the root's outer
 /// preflight, so retain evidence if a live registry retry is not covered.
@@ -969,6 +970,18 @@ pub(super) unsafe fn receive(
         };
         let nested_file_path = nested_file_work_path(nested_file_ready, ch.child_work_capable);
         if nested_file_path != NestedFileWorkPath::NoWork {
+            let source_ready = crate::driver_launch::nested_win32k_source_work_ready();
+            let source_sample = source_ready && {
+                let count = INLINE_SOURCE_WORK_TRACE_N.fetch_add(1, Ordering::Relaxed) + 1;
+                count <= 8 || count.is_power_of_two()
+            };
+            if source_sample {
+                crate::print_str(b"[inline-source-work] stage/path/child-capable=before-park/");
+                crate::print_u64(nested_file_path as u64);
+                crate::print_str(b"/");
+                crate::print_u64(u64::from(ch.child_work_capable));
+                crate::print_str(b"\n");
+            }
             let _stage = StageScope::enter(ch, Stage::NestedWork);
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
             let mut parent = match runtime::nested::park_current() {
@@ -996,15 +1009,24 @@ pub(super) unsafe fn receive(
             observed_nested_file = true;
             crate::driver_launch::trace_port_connect_outer_probe(40, ch, u64::from(parent.is_some()));
             let progressed = crate::service_sec_image::redrive_nested_hosted_file_work();
+            if source_sample {
+                crate::print_str(b"[inline-source-work] stage/parked/progressed=after-child/");
+                crate::print_u64(u64::from(parent.is_some()));
+                crate::print_str(b"/");
+                crate::print_u64(u64::from(progressed));
+                crate::print_str(b"\n");
+            }
             trace_hook_nested_receive(41, ch, u64::from(progressed));
             crate::driver_launch::trace_port_connect_outer_probe(41, ch, u64::from(progressed));
             let ticket = parent.as_ref().map(|parent| parent.ticket());
             crate::driver_launch::trace_port_connect_outer_probe(42, ch, u64::from(ticket.is_some()));
             if runtime::nested::restore_or_retain(&mut parent).is_err() {
+                if source_sample { crate::print_str(b"[inline-source-work] stage=restore-refused\n"); }
                 trace_hook_nested_receive(44, ch, u64::from(parent.is_some()));
                 crate::driver_launch::trace_port_connect_outer_probe(44, ch, 0);
                 return nested_restore_refusal(ticket);
             }
+            if source_sample { crate::print_str(b"[inline-source-work] stage=restored\n"); }
             trace_hook_nested_receive(43, ch, u64::from(parent.is_some()));
             crate::driver_launch::trace_port_connect_outer_probe(43, ch, u64::from(progressed));
             if progressed { continue; }

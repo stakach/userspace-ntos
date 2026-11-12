@@ -407,6 +407,22 @@ pub(crate) unsafe fn trace_source_terminal_lane(
         }
         crate::print_str(b"\n");
     }
+    for (index, parent) in (&*core::ptr::addr_of!(PARENTS)).iter().enumerate() {
+        let Some(parent) = parent.as_ref() else { continue };
+        crate::print_str(b"[source-terminal-any-parent] sample/row/gen/phase/held/canonical/scope/child/source/route-exec/lane/lane-gen/epoch/reply/exact-work=");
+        for value in [sample, index as u64, parent.generation, parent.phase as u64,
+            u64::from(parent.physical.held()),
+            u64::from(parent.physical.canonical_pending()),
+            u64::from(parent.scope.is_some()), u64::from(parent.child.is_some()),
+            u64::from(parent.source_ioctl.is_some()), parent.route.identity().executor,
+            u64::from(parent.dispatch.lane().index), parent.dispatch.lane().generation,
+            parent.dispatch.epoch(), parent.reply,
+            u64::from(parent.route == work_route && parent.dispatch == work_dispatch
+                && parent.reply == work_reply)] {
+            crate::print_str(b"/"); crate::print_hex_u64(value);
+        }
+        crate::print_str(b"\n");
+    }
     trace_source_ioctl_parent_for_work(sample, work_route, work_dispatch, work_reply, packet);
 }
 
