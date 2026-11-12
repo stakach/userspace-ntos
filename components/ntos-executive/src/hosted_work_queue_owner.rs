@@ -67,13 +67,30 @@ struct WatchedCallbackRetirement {
     acknowledged: bool,
 }
 
+/// One queue row generation, stable from its claim to its one-use return ACK. A reused
+/// slot or ring head gets a new sequence, so this never names a later claim.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct QueuedCallbackClaim {
+    index: usize,
+    key: QueueEntryKey,
+    sequence: u64,
+}
+
+impl QueuedCallbackClaim {
+    fn of(index: usize, row: &Row) -> Self {
+        Self { index, key: row.claim.invocation(), sequence: row.sequence }
+    }
+
+    fn owns(self, row: &Row) -> bool {
+        row.sequence == self.sequence && row.claim.invocation() == self.key
+    }
+}
+
 /// An exact selector for a parked callback. Queue entry identity and physical invocation
 /// identity are separate; neither the shared ring head nor a numeric Reply alone is authority.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct QueuedCallbackSelector {
-    index: usize,
-    key: QueueEntryKey,
-    sequence: u64,
+    claim: QueuedCallbackClaim,
     physical: component_scheduler::ChildWorkPhysicalIdentity,
 }
 
@@ -85,8 +102,9 @@ impl QueuedCallbackSelector {
     /// Copied queue and physical identity for failure receipts; grants no queue authority.
     pub(crate) fn diagnostic_identity(self) -> [u64; 10] {
         let (dispatch, reply) = self.dispatch_reply();
-        [self.index as u64, self.sequence, self.key.domain_id, self.key.domain_cookie,
-            self.key.head, self.key.work_item, dispatch.lane().index as u64,
+        let claim = self.claim;
+        [claim.index as u64, claim.sequence, claim.key.domain_id, claim.key.domain_cookie,
+            claim.key.head, claim.key.work_item, dispatch.lane().index as u64,
             dispatch.lane().generation, dispatch.epoch(), reply]
     }
 }
@@ -231,8 +249,7 @@ pub(super) unsafe fn acknowledge_return(index: usize, key: QueueEntryKey) -> boo
     let rows = &mut *core::ptr::addr_of_mut!(CLAIMS);
     let Some(row) = rows.get_mut(index).and_then(Option::as_mut) else { return false; };
     if (&*core::ptr::addr_of!(ROOT_RETIREMENT_WATCHES)).iter().any(|watch|
-        watch.selector.index == index && watch.selector.sequence == row.sequence
-            && watch.selector.key == key)
+        watch.selector.claim == QueuedCallbackClaim { index, key, sequence: row.sequence })
     { return false; }
     if row.pump.is_some() || row.child_step.is_some() || row.resuming
         || row.claim.invocation() != key || !row.claim.entered()
@@ -248,19 +265,20 @@ pub(super) unsafe fn acknowledge_return(index: usize, key: QueueEntryKey) -> boo
 /// retiring it. Remove this resuming row atomically with its one-use queue ACK.
 unsafe fn acknowledge_resumed_return(selector: QueuedCallbackSelector) -> bool {
     let rows = &mut *core::ptr::addr_of_mut!(CLAIMS);
-    let Some(row) = rows.get_mut(selector.index).and_then(Option::as_mut) else {
+    let claim = selector.claim;
+    let Some(row) = rows.get_mut(claim.index).and_then(Option::as_mut) else {
         return false;
     };
-    if row.sequence != selector.sequence || row.claim.invocation() != selector.key
+    if !claim.owns(row)
         || row.terminal_ack.is_none_or(|terminal| terminal.physical != selector.physical)
         || row.child_step.is_some()
         || !(row.resuming && row.pump.is_none()
             || !row.resuming && matches!(row.pump.as_ref(),
                 Some(component_scheduler::HostedPumpRestore::Restored(pr)) if pr.completed))
-        || !row.claim.entered() || !acknowledge_admission(selector.index, row)
-        || row.claim.acknowledge_return(selector.key).is_err()
+        || !row.claim.entered() || !acknowledge_admission(claim.index, row)
+        || row.claim.acknowledge_return(claim.key).is_err()
     { return false; }
-    rows[selector.index] = None;
+    rows[claim.index] = None;
     if let Some(watch) = (&mut *core::ptr::addr_of_mut!(ROOT_RETIREMENT_WATCHES))
         .iter_mut().find(|watch| watch.selector == selector)
     {
@@ -271,8 +289,8 @@ unsafe fn acknowledge_resumed_return(selector: QueuedCallbackSelector) -> bool {
 
 unsafe fn mark_terminal_ack(selector: QueuedCallbackSelector, status: i32) -> bool {
     let Some(row) = (&mut *core::ptr::addr_of_mut!(CLAIMS))
-        .get_mut(selector.index).and_then(Option::as_mut) else { return false; };
-    if row.sequence != selector.sequence || row.claim.invocation() != selector.key
+        .get_mut(selector.claim.index).and_then(Option::as_mut) else { return false; };
+    if !selector.claim.owns(row)
         || !row.resuming || row.pump.is_some() || row.child_step.is_some()
         || row.terminal_ack.is_some()
     { return false; }
@@ -318,9 +336,7 @@ unsafe fn exact_physical_identity(
 
 fn selector_for(index: usize, row: &Row) -> Option<QueuedCallbackSelector> {
     let physical = unsafe { exact_physical_identity(index, row) }?;
-    Some(QueuedCallbackSelector {
-        index, key: row.claim.invocation(), sequence: row.sequence, physical,
-    })
+    Some(QueuedCallbackSelector { claim: QueuedCallbackClaim::of(index, row), physical })
 }
 
 /// Newer claimed callbacks are physically nested beneath older work, including older File
@@ -340,8 +356,7 @@ pub(crate) unsafe fn queued_callback_root_action() -> Option<QueuedCallbackRootA
     if row.resuming { return None; }
     if let Some(terminal) = row.terminal_ack {
         return Some(QueuedCallbackRootAction::RetryTerminalAck(QueuedCallbackSelector {
-            index, key: row.claim.invocation(), sequence: row.sequence,
-            physical: terminal.physical,
+            claim: QueuedCallbackClaim::of(index, row), physical: terminal.physical,
         }));
     }
     let selector = selector_for(index, row)?;
@@ -394,13 +409,13 @@ pub(crate) unsafe fn queued_callback_newer_root_child(
     newer: QueuedCallbackSelector,
 ) -> bool {
     let rows = &*core::ptr::addr_of!(CLAIMS);
-    let Some(row) = rows.get(older.index).and_then(Option::as_ref) else { return false };
-    row.sequence == older.sequence && row.claim.invocation() == older.key
+    let Some(row) = rows.get(older.claim.index).and_then(Option::as_ref) else { return false };
+    older.claim.owns(row)
         && (row.resuming
             || row.terminal_ack.is_some_and(|ack| ack.physical == older.physical)
             || row.pump.as_ref().and_then(|pump| pump.child_work_identity())
                 == Some(older.physical))
-        && newer.sequence > older.sequence
+        && newer.claim.sequence > older.claim.sequence
         && matches!(queued_callback_root_action(),
             Some(QueuedCallbackRootAction::NeedsChild(selected)
                 | QueuedCallbackRootAction::ResumeRecordedStep(selected)
@@ -422,8 +437,8 @@ pub(crate) unsafe fn consume_queued_callback_root_retirement(
 pub(crate) unsafe fn queued_callback_file_floor(
     selector: QueuedCallbackSelector,
 ) -> Option<u64> {
-    let row = (&*core::ptr::addr_of!(CLAIMS)).get(selector.index)?.as_ref()?;
-    (row.sequence == selector.sequence && row.claim.invocation() == selector.key
+    let row = (&*core::ptr::addr_of!(CLAIMS)).get(selector.claim.index)?.as_ref()?;
+    (selector.claim.owns(row)
         && (row.terminal_ack.is_some_and(|terminal| terminal.physical == selector.physical)
             || row.pump.as_ref().and_then(|pump| pump.child_work_identity())
                 == Some(selector.physical)))
@@ -437,8 +452,8 @@ pub(crate) unsafe fn record_queued_callback_child_step(
     step: crate::service_sec_image::NestedChildStep,
 ) -> QueuedCallbackProgress {
     let rows = &mut *core::ptr::addr_of_mut!(CLAIMS);
-    if let Some(row) = rows.get_mut(selector.index).and_then(Option::as_mut) {
-        if row.sequence == selector.sequence && row.claim.invocation() == selector.key
+    if let Some(row) = rows.get_mut(selector.claim.index).and_then(Option::as_mut) {
+        if selector.claim.owns(row)
             && !row.resuming && row.child_step.is_none()
             && row.pump.as_ref().and_then(|pump| pump.child_work_identity())
                 == Some(selector.physical)
@@ -449,7 +464,7 @@ pub(crate) unsafe fn record_queued_callback_child_step(
                 return QueuedCallbackProgress::AwaitingLocalChild;
             }
             row.child_step = Some(step);
-            trace_queued_callback(6, selector.index, row.sequence);
+            trace_queued_callback(6, selector.claim.index, row.sequence);
             return QueuedCallbackProgress::RecordedStep;
         }
     }
@@ -492,7 +507,7 @@ pub(crate) unsafe fn trace_connect_callback_rows() {
 }
 
 fn same_selector(row: &Row, selector: QueuedCallbackSelector) -> bool {
-    row.sequence == selector.sequence && row.claim.invocation() == selector.key
+    selector.claim.owns(row)
         && row.pump.as_ref().and_then(|pump| pump.child_work_identity())
             == Some(selector.physical)
 }
@@ -501,11 +516,9 @@ unsafe fn retain_result(
     selector: QueuedCallbackSelector, pump: component_scheduler::HostedPumpRestore,
 ) -> QueuedCallbackProgress {
     if let Some(row) = (&mut *core::ptr::addr_of_mut!(CLAIMS))
-        .get_mut(selector.index).and_then(Option::as_mut)
+        .get_mut(selector.claim.index).and_then(Option::as_mut)
     {
-        if row.sequence == selector.sequence && row.claim.invocation() == selector.key
-            && row.resuming && row.pump.is_none()
-        {
+        if selector.claim.owns(row) && row.resuming && row.pump.is_none() {
             let progress = match &pump {
                 component_scheduler::HostedPumpRestore::ChildWorkReady { .. } =>
                     QueuedCallbackProgress::NeedsChild,
@@ -528,11 +541,12 @@ unsafe fn terminal_physical_bound(
     use crate::spawn_hosts::shared_ingress::owner::runtime;
     let Some(domain) = instance_domain_identity(inst) else { return false; };
     let Ok(source) = runtime::physical_source(selector.physical.route) else { return false; };
-    inst.hosted_domain_id == selector.key.domain_id
-        && inst.hosted_domain_cookie == selector.key.domain_cookie
+    inst.hosted_domain_id == selector.claim.key.domain_id
+        && inst.hosted_domain_cookie == selector.claim.key.domain_cookie
         && inst.tcb == selector.physical.tcb && inst.pml4 == selector.physical.pml4
         && inst.exec_shared_va == selector.physical.shared_va
-        && hosted_ingress_sources::primary_route(selector.index) == Some(selector.physical.route)
+        && hosted_ingress_sources::primary_route(selector.claim.index)
+            == Some(selector.physical.route)
         && source.domain == runtime::PhysicalDomain::Hosted(domain)
         && source.kind == runtime::PhysicalSourceKind::Primary
         && source.tcb == selector.physical.tcb && source.pml4 == selector.physical.pml4
@@ -541,56 +555,57 @@ unsafe fn terminal_physical_bound(
 unsafe fn finish_returned_callback(
     selector: QueuedCallbackSelector, pr: crate::spawn_hosts::PumpResult,
 ) -> QueuedCallbackProgress {
-    let Some(inst) = instance(selector.index) else {
+    let index = selector.claim.index;
+    let Some(inst) = instance(index) else {
         return retain_result(selector,
             component_scheduler::HostedPumpRestore::Restored(pr));
     };
     if !terminal_physical_bound(selector, inst) || pr.reply_cap == 0 || !pr.completed
     {
-        register_instance_ready(selector.index, false);
+        register_instance_ready(index, false);
         return retain_result(selector,
             component_scheduler::HostedPumpRestore::Restored(pr));
     }
     let shared = inst.exec_shared_va;
     let status = read_volatile((shared + SH_REQ_STATUS) as *const i32);
-    let ndis = (&*core::ptr::addr_of!(CLAIMS)).get(selector.index)
+    let ndis = (&*core::ptr::addr_of!(CLAIMS)).get(index)
         .and_then(Option::as_ref).and_then(|row| row.ndis);
     if status != STATUS_SUCCESS {
         if let Some(dispatch) = ndis {
             mark_hosted_provider_ndis_work_item_dispatch_indeterminate(dispatch);
         }
         if !mark_terminal_ack(selector, status) {
-            register_instance_ready(selector.index, false);
+            register_instance_ready(index, false);
             return retain_result(selector,
                 component_scheduler::HostedPumpRestore::Restored(pr));
         }
         if !acknowledge_resumed_return(selector) {
-            register_instance_ready(selector.index, false);
+            register_instance_ready(index, false);
             return retain_result(selector,
                 component_scheduler::HostedPumpRestore::Restored(pr));
         }
-        register_instance_ready(selector.index, false);
+        register_instance_ready(index, false);
         return QueuedCallbackProgress::TerminalFailure(status);
     }
     if let Some(dispatch) = ndis {
         if !complete_hosted_provider_ndis_work_item_dispatch(dispatch) {
-            register_instance_ready(selector.index, false);
+            register_instance_ready(index, false);
             return retain_result(selector,
                 component_scheduler::HostedPumpRestore::Restored(pr));
         }
         if let Some(row) = (&mut *core::ptr::addr_of_mut!(CLAIMS))
-            .get_mut(selector.index).and_then(Option::as_mut)
+            .get_mut(index).and_then(Option::as_mut)
         {
             row.ndis = None;
         }
     }
     if !mark_terminal_ack(selector, STATUS_SUCCESS) {
-        register_instance_ready(selector.index, false);
+        register_instance_ready(index, false);
         return retain_result(selector,
             component_scheduler::HostedPumpRestore::Restored(pr));
     }
     if !acknowledge_resumed_return(selector) {
-        register_instance_ready(selector.index, false);
+        register_instance_ready(index, false);
         return retain_result(selector,
             component_scheduler::HostedPumpRestore::Restored(pr));
     }
@@ -605,14 +620,15 @@ unsafe fn finish_returned_callback(
 pub(crate) unsafe fn resume_queued_callback_after_file_settlement(
     selector: QueuedCallbackSelector,
 ) -> QueuedCallbackProgress {
+    let index = selector.claim.index;
     // A completed callback cannot run another receive. Only the queue claim's no-effects
     // ACK is retryable after its terminal phase was recorded before the first ACK attempt.
     let terminal = {
         let rows = &*core::ptr::addr_of!(CLAIMS);
-        let Some(row) = rows.get(selector.index).and_then(Option::as_ref) else {
+        let Some(row) = rows.get(index).and_then(Option::as_ref) else {
             return QueuedCallbackProgress::Blocked;
         };
-        if row.sequence != selector.sequence || row.claim.invocation() != selector.key
+        if !selector.claim.owns(row)
             || rows.iter().flatten().any(|other| other.sequence > row.sequence
                 && (other.pump.is_some() || other.resuming))
         { return QueuedCallbackProgress::Blocked; }
@@ -625,7 +641,7 @@ pub(crate) unsafe fn resume_queued_callback_after_file_settlement(
         if crate::driver_launch::generic_file_pump_unsettled_after(floor) {
             return QueuedCallbackProgress::InnerFilePending;
         }
-        let Some(inst) = instance(selector.index) else { return QueuedCallbackProgress::Blocked; };
+        let Some(inst) = instance(index) else { return QueuedCallbackProgress::Blocked; };
         if !terminal_physical_bound(selector, inst) {
             return QueuedCallbackProgress::Blocked;
         }
@@ -633,7 +649,7 @@ pub(crate) unsafe fn resume_queued_callback_after_file_settlement(
             return QueuedCallbackProgress::PendingTerminalAck;
         }
         if terminal.status != STATUS_SUCCESS {
-            register_instance_ready(selector.index, false);
+            register_instance_ready(index, false);
             return QueuedCallbackProgress::TerminalFailure(terminal.status);
         }
         let shared = inst.exec_shared_va;
@@ -644,11 +660,11 @@ pub(crate) unsafe fn resume_queued_callback_after_file_settlement(
     }
     let (floor, has_step, retry) = {
         let rows = &*core::ptr::addr_of!(CLAIMS);
-        let Some(row) = rows.get(selector.index).and_then(Option::as_ref) else {
+        let Some(row) = rows.get(index).and_then(Option::as_ref) else {
             return QueuedCallbackProgress::Blocked;
         };
         if !same_selector(row, selector)
-            || exact_physical_identity(selector.index, row) != Some(selector.physical)
+            || exact_physical_identity(index, row) != Some(selector.physical)
             || rows.iter().flatten().any(|other| other.sequence > row.sequence
                 && (other.pump.is_some() || other.resuming))
         { return QueuedCallbackProgress::Blocked; }
@@ -664,7 +680,7 @@ pub(crate) unsafe fn resume_queued_callback_after_file_settlement(
     if !has_step && !retry { return QueuedCallbackProgress::AwaitingLocalChild; }
     let (pump, step) = {
         let Some(row) = (&mut *core::ptr::addr_of_mut!(CLAIMS))
-            .get_mut(selector.index).and_then(Option::as_mut) else {
+            .get_mut(index).and_then(Option::as_mut) else {
             return QueuedCallbackProgress::Blocked;
         };
         let Some(pump) = row.pump.take() else { return QueuedCallbackProgress::Blocked; };
@@ -679,9 +695,9 @@ pub(crate) unsafe fn resume_queued_callback_after_file_settlement(
             Ok(next) => next,
             Err((pump, step)) => {
                 if let Some(row) = (&mut *core::ptr::addr_of_mut!(CLAIMS))
-                    .get_mut(selector.index).and_then(Option::as_mut)
+                    .get_mut(index).and_then(Option::as_mut)
                 {
-                    if row.sequence == selector.sequence && row.claim.invocation() == selector.key
+                    if selector.claim.owns(row)
                         && row.pump.is_none() && row.child_step.is_none()
                     {
                         row.pump = Some(pump);
