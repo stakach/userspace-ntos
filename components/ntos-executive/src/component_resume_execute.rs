@@ -140,6 +140,9 @@ pub(crate) unsafe fn run_hosted(
         .expect("resumed provider retains an active dispatch");
     let provider_resume = matches!(continuation.pending, PendingComponentDispatch::Provider(_));
     if provider_resume {
+        crate::spawn_hosts::shared_ingress::owner::runtime::nested::record_source_resume_transition(
+            1, lane, admitted_dispatch, reply_object, resume.key, frame.owner,
+        );
         PROVIDER_WAIT_RESUMES.fetch_add(1, Ordering::Relaxed);
         if !resume.cancelled {
             PROVIDER_WAIT_SUCCESSFUL_RESUMES.fetch_add(1, Ordering::Relaxed);
@@ -147,12 +150,19 @@ pub(crate) unsafe fn run_hosted(
     }
     let pump_completion = match continuation.pending {
         PendingComponentDispatch::Provider(pending) => {
-            match win32k_glue::resume_suspended_provider_wait_component(
+            crate::spawn_hosts::shared_ingress::owner::runtime::nested::record_source_resume_transition(
+                2, lane, admitted_dispatch, reply_object, resume.key, frame.owner,
+            );
+            let completion = win32k_glue::resume_suspended_provider_wait_component(
                 nt_handler,
                 pending,
                 resume.key.id,
                 resume.completion.status,
-            ) {
+            );
+            crate::spawn_hosts::shared_ingress::owner::runtime::nested::record_source_resume_transition(
+                3, lane, admitted_dispatch, reply_object, resume.key, frame.owner,
+            );
+            match completion {
                 win32k_glue::ProviderWaitPumpCompletion::NestedSourceDeferred => {
                     crate::spawn_hosts::shared_ingress::owner::runtime::nested::trace_deferred_resume_owner(
                         lane, resume.key, frame.owner,

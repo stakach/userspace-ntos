@@ -28,6 +28,92 @@ const ABORT_RETRY_100NS: u64 = 1_600_000;
 static ABORT_WAKE: CoalescedRetryWake = CoalescedRetryWake::new();
 static LAST_ABORT: AtomicUsize = AtomicUsize::new(usize::MAX);
 
+// Temporary bounded evidence for a source Work that arrives while its exact Win32k
+// provider frame is Resuming. Keep recent transitions by physical dispatch and Reply;
+// the source terminal dumps only records for the Work it actually owns.
+#[derive(Clone, Copy)]
+struct SourceResumeTrace {
+    sequence: u64,
+    stage: u64, // 1 begin, 2 pump enter, 3 pump return, 4 no child, 5 first source Work
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    key: u64,
+    owner: u64,
+}
+
+const SOURCE_RESUME_TRACE_CAP: usize = 64;
+static SOURCE_RESUME_TRACE_NEXT: AtomicU64 = AtomicU64::new(0);
+static mut SOURCE_RESUME_TRACES: [Option<SourceResumeTrace>; SOURCE_RESUME_TRACE_CAP] =
+    [None; SOURCE_RESUME_TRACE_CAP];
+
+pub(crate) unsafe fn record_source_resume_transition(
+    stage: u64, lane: nt_component_suspension::LaneHandle,
+    dispatch: LaneDispatchIdentity, reply: u64,
+    key: nt_component_suspension::SuspensionKey, owner: nt_component_suspension::SuspensionOwner,
+) {
+    let Some(route) = lanes().peer_route(lane).ok().flatten() else { return };
+    let sequence = SOURCE_RESUME_TRACE_NEXT.fetch_add(1, Ordering::Relaxed);
+    let record = SourceResumeTrace {
+        sequence, stage, route, dispatch, reply, key: key.id, owner: owner.dispatch_id,
+    };
+    core::ptr::write(
+        core::ptr::addr_of_mut!(SOURCE_RESUME_TRACES).cast::<Option<SourceResumeTrace>>()
+            .add(sequence as usize % SOURCE_RESUME_TRACE_CAP),
+        Some(record),
+    );
+}
+
+unsafe fn trace_exact_source_resume_history(
+    work_route: PeerRoute, work_dispatch: LaneDispatchIdentity, work_reply: u64,
+) {
+    for index in 0..SOURCE_RESUME_TRACE_CAP {
+        let record = core::ptr::addr_of!(SOURCE_RESUME_TRACES)
+            .cast::<Option<SourceResumeTrace>>().add(index).read();
+        let Some(record) = record else { continue };
+        if record.route != work_route || record.dispatch != work_dispatch
+            || record.reply != work_reply
+        { continue }
+        crate::print_str(b"[source-resume-history] seq/stage/lane/epoch/reply/key/owner=");
+        for value in [record.sequence, record.stage,
+            record.dispatch.lane().index as u64, record.dispatch.epoch(),
+            record.reply, record.key, record.owner] {
+            crate::print_str(b"/"); crate::print_hex_u64(value);
+        }
+        crate::print_str(b"\n");
+    }
+}
+
+unsafe fn trace_first_exact_resuming_source_work(
+    work_route: PeerRoute, work_dispatch: LaneDispatchIdentity, work_reply: u64,
+) {
+    let exact = lanes().frames().find_map(|(lane, frame)| {
+        let matching = lanes().peer_route(lane).ok().flatten() == Some(work_route)
+            && lanes().active_dispatch_identity(lane).ok().flatten() == Some(work_dispatch)
+            && lanes().binding(lane).ok().map(|binding| binding.reply_object) == Some(work_reply)
+            && matches!(frame.phase, nt_component_suspension::SuspensionPhase::Resuming { .. });
+        matching.then_some((lane, frame.key, frame.owner))
+    });
+    let Some((lane, key, owner)) = exact else { return };
+    let mut began = false;
+    let mut saw_work = false;
+    for index in 0..SOURCE_RESUME_TRACE_CAP {
+        let record = core::ptr::addr_of!(SOURCE_RESUME_TRACES)
+            .cast::<Option<SourceResumeTrace>>().add(index).read();
+        let Some(record) = record else { continue };
+        if record.route == work_route && record.dispatch == work_dispatch
+            && record.reply == work_reply && record.key == key.id
+            && record.owner == owner.dispatch_id
+        {
+            began |= record.stage == 1;
+            saw_work |= record.stage == 5;
+        }
+    }
+    if !began || saw_work { return }
+    record_source_resume_transition(5, lane, work_dispatch, work_reply, key, owner);
+    trace_exact_source_resume_history(work_route, work_dispatch, work_reply);
+}
+
 /// The slot is storage, not authority. A recycled slot cannot restore a different parent scope.
 #[must_use = "retain the exact parked parent until restoration acknowledges"]
 pub(crate) struct ParkedParentHandle {
@@ -327,6 +413,7 @@ pub(crate) unsafe fn trace_source_terminal_lane(
     // must not exhaust the diagnosis before a later terminal reaches the actual wall.
     let sample = TRACES.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     if !sample.is_power_of_two() { return; }
+    trace_first_exact_resuming_source_work(work_route, work_dispatch, work_reply);
     let (running, route, phase, top_kind, top_id, top_phase, top_owner) = {
         let catalog = lanes();
         let running = catalog.running();

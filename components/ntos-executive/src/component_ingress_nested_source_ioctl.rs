@@ -143,6 +143,13 @@ pub(crate) unsafe fn park_resuming_source_ioctl(
     let Some(selection) = crate::driver_launch::select_nested_win32k_source_ioctl_terminal(
         route, dispatch, reply,
     ) else {
+        if let Some(frame) = lanes().top(lane).ok().flatten() {
+            if frame.owner.dispatch_id == dispatch_context.dispatch_id
+                && matches!(frame.phase, nt_component_suspension::SuspensionPhase::Resuming { .. })
+            {
+                record_source_resume_transition(4, lane, dispatch, reply, frame.key, frame.owner);
+            }
+        }
         trace_source_ioctl_no_child(lane, dispatch_context.dispatch_id);
         return SourceIoctlPark::NoChild;
     };
