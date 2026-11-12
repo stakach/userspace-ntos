@@ -1,5 +1,77 @@
 use super::*;
 
+use nt_component_suspension::{
+    ComponentSuspensionLanes, IngressError, IngressExecutionOwner, IngressReceiver,
+    LaneBinding, ReservedReceiveError,
+};
+
+#[test]
+fn busy_idle_receive_after_child_scheduler_yield_keeps_the_running_reply_and_continuation() {
+    // The child receive returned a scheduler yield with a new physical Reply. The root loop
+    // still owns a running primary dispatch and must give that retained continuation another
+    // turn before attempting an Idle receive. This models the Boot 43247312492 lane 17 failure.
+    let mut lanes = ComponentSuspensionLanes::<(), (), ()>::new(1, 1);
+    let lane = lanes.allocate(LaneBinding {
+        executor_id: 210390,
+        receive_endpoint: 20,
+        reply_object: 73489,
+    }).unwrap();
+    lanes.begin_dispatch(lane, 73489).unwrap();
+    let dispatch = lanes.active_dispatch_identity(lane).unwrap().unwrap();
+    let mut root_receive = IngressReceiver::<u64>::new(20, 40000, 1).unwrap();
+    let mut continuation = ComponentPumpAccounting::new(true);
+    assert_eq!(continuation.after_slice(true, false), PumpDepthDisposition::Retained);
+
+    let preflight = root_receive.begin_receive_for_owner(&lanes, IngressExecutionOwner::Idle);
+    assert_eq!(preflight, Err(ReservedReceiveError::Ingress(IngressError::ExecutionBusy)));
+    assert_eq!(root_receive.phase(), None); // No native receive was authorized.
+
+    let decision = root_receive_disposition_after_yield(
+        &lanes,
+        dispatch,
+        73489,
+        RootReceiveRefusal::IdleExecutionBusyBeforeNativeReceive,
+    );
+    assert_eq!(decision, RootReceiveDisposition::ResumeRetainedDispatch);
+    assert_eq!(lanes.running(), Some(lane));
+    assert_eq!(lanes.active_dispatch_identity(lane), Ok(Some(dispatch)));
+    assert_eq!(lanes.binding(lane).unwrap().reply_object, 73489);
+    assert!(continuation.owns_depth());
+    assert_eq!(root_receive.phase(), None);
+}
+
+#[test]
+fn uncertain_receive_after_child_scheduler_yield_cannot_be_recast_as_a_busy_preflight() {
+    let mut lanes = ComponentSuspensionLanes::<(), (), ()>::new(1, 1);
+    let lane = lanes.allocate(LaneBinding {
+        executor_id: 210390,
+        receive_endpoint: 20,
+        reply_object: 73489,
+    }).unwrap();
+    lanes.begin_dispatch(lane, 73489).unwrap();
+    let dispatch = lanes.active_dispatch_identity(lane).unwrap().unwrap();
+
+    assert_eq!(
+        root_receive_disposition_after_yield(
+            &lanes,
+            dispatch,
+            73489,
+            RootReceiveRefusal::NativeReceiveEffectUncertain,
+        ),
+        RootReceiveDisposition::RetainFailure,
+    );
+    assert_eq!(
+        root_receive_disposition_after_yield(
+            &lanes,
+            dispatch,
+            73461, // Stale Reply from before the child scheduler yield.
+            RootReceiveRefusal::IdleExecutionBusyBeforeNativeReceive,
+        ),
+        RootReceiveDisposition::RetainFailure,
+    );
+    assert_eq!(lanes.binding(lane).unwrap().reply_object, 73489);
+}
+
 #[test]
 fn post_reply_receive_keeps_timer_checkpoint_and_idle_receive_behavior() {
     assert!(PostReplyReceiveDemand {

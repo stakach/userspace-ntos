@@ -77,6 +77,12 @@ pub(crate) struct QueuedCallbackSelector {
     physical: component_scheduler::ChildWorkPhysicalIdentity,
 }
 
+impl QueuedCallbackSelector {
+    pub(crate) fn dispatch_reply(self) -> (nt_component_suspension::LaneDispatchIdentity, u64) {
+        (self.physical.dispatch, self.physical.reply_cap)
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum QueuedCallbackRootAction {
     NeedsChild(QueuedCallbackSelector),

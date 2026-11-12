@@ -11269,6 +11269,22 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     $root_event_consumed = true;
                 }
+                // RetryRestore may return after an exact child scheduler yield while its
+                // dispatch still runs. The root event and queued selector are already
+                // retained above. Give that child another settlement turn before any Idle
+                // receive; the latter is refused before SYS_RECV while this lane runs.
+                if let Some(crate::driver_launch::QueuedCallbackRootAction::RetryRestore(selector)) =
+                    crate::driver_launch::queued_callback_root_action()
+                {
+                    if selector == permit.0 {
+                        let (dispatch, reply) = selector.dispatch_reply();
+                        if crate::spawn_hosts::shared_ingress::owner::runtime::
+                            root_idle_receive_after_child_yield(dispatch, reply)
+                        {
+                            continue 'service_loop;
+                        }
+                    }
+                }
                 if !prepare_parked_queued_callback_receive(&mut root_queued_callback_turn) {
                     stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
                     stop_ssn = 0;

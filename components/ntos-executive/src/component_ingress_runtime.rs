@@ -144,6 +144,18 @@ pub(crate) unsafe fn hold_snapshot() -> HoldSnapshot {
     HoldSnapshot { running, oldest: hosted::oldest_pending_snapshot() }
 }
 
+/// A queued child's scheduler yield retains the exact running dispatch and Reply.
+/// The root may give that child another turn without entering an Idle receive.
+pub(crate) unsafe fn root_idle_receive_after_child_yield(
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+) -> bool {
+    nt_user_host::component_pump::root_receive_disposition_after_yield(
+        &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS), dispatch, reply,
+        nt_user_host::component_pump::RootReceiveRefusal::IdleExecutionBusyBeforeNativeReceive,
+    ) == nt_user_host::component_pump::RootReceiveDisposition::ResumeRetainedDispatch
+}
+
 unsafe fn lanes() -> &'static mut ComponentLanes {
     &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS)
 }
