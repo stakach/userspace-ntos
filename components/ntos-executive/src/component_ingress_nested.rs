@@ -28,21 +28,20 @@ const ABORT_RETRY_100NS: u64 = 1_600_000;
 static ABORT_WAKE: CoalescedRetryWake = CoalescedRetryWake::new();
 static LAST_ABORT: AtomicUsize = AtomicUsize::new(usize::MAX);
 
-// Temporary bounded evidence for a source Work that arrives while its exact Win32k
-// provider frame is Resuming. Keep recent transitions by physical dispatch and Reply;
-// the source terminal dumps only records for the Work it actually owns.
+// Temporary read-only evidence for a source Work that arrives while its exact Win32k
+// provider frame is Resuming. One slot per physical lane prevents unrelated provider
+// activity from evicting this resume before the source terminal is sampled.
 #[derive(Clone, Copy)]
 struct SourceResumeTrace {
-    sequence: u64,
-    stage: u64, // 1 begin, 2 pump enter, 3 pump return, 4 no child, 5 first source Work
     route: PeerRoute,
     dispatch: LaneDispatchIdentity,
     reply: u64,
     key: u64,
     owner: u64,
+    stages: [u64; 5], // begin, pump enter, pump return, no child, first source Work
 }
 
-const SOURCE_RESUME_TRACE_CAP: usize = 64;
+const SOURCE_RESUME_TRACE_CAP: usize = 256;
 static SOURCE_RESUME_TRACE_NEXT: AtomicU64 = AtomicU64::new(0);
 static mut SOURCE_RESUME_TRACES: [Option<SourceResumeTrace>; SOURCE_RESUME_TRACE_CAP] =
     [None; SOURCE_RESUME_TRACE_CAP];
@@ -52,36 +51,26 @@ pub(crate) unsafe fn record_source_resume_transition(
     dispatch: LaneDispatchIdentity, reply: u64,
     key: nt_component_suspension::SuspensionKey, owner: nt_component_suspension::SuspensionOwner,
 ) {
+    if !(1..=4).contains(&stage) { return }
+    if dispatch.lane() != lane { return }
     let Some(route) = lanes().peer_route(lane).ok().flatten() else { return };
-    let sequence = SOURCE_RESUME_TRACE_NEXT.fetch_add(1, Ordering::Relaxed);
-    let record = SourceResumeTrace {
-        sequence, stage, route, dispatch, reply, key: key.id, owner: owner.dispatch_id,
+    let index = lane.index as usize;
+    if index >= SOURCE_RESUME_TRACE_CAP { return }
+    let slot = core::ptr::addr_of_mut!(SOURCE_RESUME_TRACES)
+        .cast::<Option<SourceResumeTrace>>().add(index);
+    let previous = slot.read();
+    let same = previous.is_some_and(|entry| entry.route == route
+        && entry.dispatch == dispatch && entry.reply == reply
+        && entry.key == key.id && entry.owner == owner.dispatch_id);
+    let mut record = match previous {
+        Some(entry) if stage != 1 && same => entry,
+        _ => SourceResumeTrace {
+            route, dispatch, reply, key: key.id, owner: owner.dispatch_id, stages: [0; 5],
+        },
     };
-    core::ptr::write(
-        core::ptr::addr_of_mut!(SOURCE_RESUME_TRACES).cast::<Option<SourceResumeTrace>>()
-            .add(sequence as usize % SOURCE_RESUME_TRACE_CAP),
-        Some(record),
-    );
-}
-
-unsafe fn trace_exact_source_resume_history(
-    work_route: PeerRoute, work_dispatch: LaneDispatchIdentity, work_reply: u64,
-) {
-    for index in 0..SOURCE_RESUME_TRACE_CAP {
-        let record = core::ptr::addr_of!(SOURCE_RESUME_TRACES)
-            .cast::<Option<SourceResumeTrace>>().add(index).read();
-        let Some(record) = record else { continue };
-        if record.route != work_route || record.dispatch != work_dispatch
-            || record.reply != work_reply
-        { continue }
-        crate::print_str(b"[source-resume-history] seq/stage/lane/epoch/reply/key/owner=");
-        for value in [record.sequence, record.stage,
-            record.dispatch.lane().index as u64, record.dispatch.epoch(),
-            record.reply, record.key, record.owner] {
-            crate::print_str(b"/"); crate::print_hex_u64(value);
-        }
-        crate::print_str(b"\n");
-    }
+    record.stages[(stage - 1) as usize] = SOURCE_RESUME_TRACE_NEXT
+        .fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    slot.write(Some(record));
 }
 
 unsafe fn trace_first_exact_resuming_source_work(
@@ -95,23 +84,31 @@ unsafe fn trace_first_exact_resuming_source_work(
         matching.then_some((lane, frame.key, frame.owner))
     });
     let Some((lane, key, owner)) = exact else { return };
-    let mut began = false;
-    let mut saw_work = false;
-    for index in 0..SOURCE_RESUME_TRACE_CAP {
-        let record = core::ptr::addr_of!(SOURCE_RESUME_TRACES)
-            .cast::<Option<SourceResumeTrace>>().add(index).read();
-        let Some(record) = record else { continue };
-        if record.route == work_route && record.dispatch == work_dispatch
-            && record.reply == work_reply && record.key == key.id
-            && record.owner == owner.dispatch_id
-        {
-            began |= record.stage == 1;
-            saw_work |= record.stage == 5;
-        }
+    let index = lane.index as usize;
+    let slot = (index < SOURCE_RESUME_TRACE_CAP).then(|| core::ptr::addr_of_mut!(SOURCE_RESUME_TRACES)
+        .cast::<Option<SourceResumeTrace>>().add(index));
+    let previous = slot.and_then(|slot| slot.read());
+    let same = previous.is_some_and(|entry| entry.route == work_route
+        && entry.dispatch == work_dispatch && entry.reply == work_reply
+        && entry.key == key.id && entry.owner == owner.dispatch_id);
+    let mut record = match previous {
+        Some(entry) if same => entry,
+        _ => SourceResumeTrace {
+            route: work_route, dispatch: work_dispatch, reply: work_reply,
+            key: key.id, owner: owner.dispatch_id, stages: [0; 5],
+        },
+    };
+    if record.stages[4] != 0 { return }
+    record.stages[4] = SOURCE_RESUME_TRACE_NEXT.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if let Some(slot) = slot { slot.write(Some(record)); }
+    crate::print_str(b"[source-resume-history] lane/gen/epoch/reply/key/owner/begin/pump-enter/pump-return/no-child/first-work/begin-missing=");
+    for value in [u64::from(lane.index), lane.generation, work_dispatch.epoch(),
+        work_reply, key.id, owner.dispatch_id, record.stages[0], record.stages[1],
+        record.stages[2], record.stages[3], record.stages[4],
+        u64::from(record.stages[0] == 0)] {
+        crate::print_str(b"/"); crate::print_hex_u64(value);
     }
-    if !began || saw_work { return }
-    record_source_resume_transition(5, lane, work_dispatch, work_reply, key, owner);
-    trace_exact_source_resume_history(work_route, work_dispatch, work_reply);
+    crate::print_str(b"\n");
 }
 
 /// The slot is storage, not authority. A recycled slot cannot restore a different parent scope.

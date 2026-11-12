@@ -138,11 +138,11 @@ pub(crate) unsafe fn run_hosted(
         .active_dispatch_identity(lane)
         .expect("resumed provider retains its dispatch identity")
         .expect("resumed provider retains an active dispatch");
+    crate::spawn_hosts::shared_ingress::owner::runtime::nested::record_source_resume_transition(
+        1, lane, admitted_dispatch, reply_object, resume.key, frame.owner,
+    );
     let provider_resume = matches!(continuation.pending, PendingComponentDispatch::Provider(_));
     if provider_resume {
-        crate::spawn_hosts::shared_ingress::owner::runtime::nested::record_source_resume_transition(
-            1, lane, admitted_dispatch, reply_object, resume.key, frame.owner,
-        );
         PROVIDER_WAIT_RESUMES.fetch_add(1, Ordering::Relaxed);
         if !resume.cancelled {
             PROVIDER_WAIT_SUCCESSFUL_RESUMES.fetch_add(1, Ordering::Relaxed);
