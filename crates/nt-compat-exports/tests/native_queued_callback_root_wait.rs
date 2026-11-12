@@ -43,7 +43,7 @@ fn empty_queued_child_without_add_device_is_not_a_terminal_add_device_failure() 
         "a generic callback's empty child step cannot require an AddDevice turn");
     assert!(
         early.contains("if root_add_device_turn.is_none() {")
-            && early.contains("park_queued_callback_root_receive!(root_event_consumed);")
+            && early.contains("park_queued_callback_root_receive!(root_event_consumed, 'queued_callback_settlement);")
             && early.contains("if !prepare_parked_add_device_receive(&mut root_add_device_turn)"),
         "a standalone callback must enter its wait before the AddDevice-only branch"
     );
@@ -175,7 +175,7 @@ fn queued_wait_acks_the_current_notification_and_arms_a_retry_before_receive() {
 fn both_root_settlement_sites_fence_providers_while_the_queued_reply_is_parked() {
     let early = early_callback_wait();
     assert!(
-        early.contains("park_queued_callback_root_receive!(root_event_consumed)"),
+        early.contains("park_queued_callback_root_receive!(root_event_consumed, 'queued_callback_settlement)"),
         "the early site must enter the generic queued callback wait"
     );
     let later = between(
@@ -279,7 +279,7 @@ fn root_receive_has_a_physical_queue_wake_after_an_empty_scan() {
 fn root_admits_queued_callbacks_before_other_provider_work() {
     let root = between(
         SERVICE,
-        "        loop {\n            // A callback reached by the preceding AddDevice child",
+        "        'queued_callback_settlement: loop {\n            // A callback reached by the preceding AddDevice child",
         "            let callback_settlement =",
     );
     assert!(
@@ -296,7 +296,7 @@ fn root_admits_queued_callbacks_before_other_provider_work() {
 fn root_retires_a_parked_callback_turn_before_admitting_another_provider() {
     let root = between(
         SERVICE,
-        "        loop {\n            // A callback reached by the preceding AddDevice child",
+        "        'queued_callback_settlement: loop {\n            // A callback reached by the preceding AddDevice child",
         "            let callback_settlement =",
     );
     assert!(

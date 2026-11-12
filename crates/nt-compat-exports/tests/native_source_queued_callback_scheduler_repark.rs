@@ -1,5 +1,5 @@
 //! A queued callback's exact child may yield again after its timer/IRQ service pass.
-//! That retryable continuation must retain its physical Reply and wait at the root;
+//! That retryable continuation must retain its physical Reply at the root;
 //! it must not be confused with an uncertain or nonretryable retained callback.
 
 const SERVICE: &str = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
@@ -73,10 +73,14 @@ fn retryable_queued_scheduler_yield_waits_at_the_root_with_its_original_reply() 
         "ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked",
     );
     assert!(
-        retryable.contains("park_queued_callback_root_receive!(root_event_consumed)")
+        retryable.contains("park_queued_callback_root_receive!(root_event_consumed, 'queued_callback_settlement)")
             && !retryable.contains("break 'service_loop"),
-        "the exact queued callback owner must receive the next timer/IRQ at root"
+        "the exact queued callback owner must retain this root event through its retry"
     );
+    let parked = between(SERVICE, "macro_rules! park_queued_callback_root_receive", "macro_rules! reject_hosted_ingress");
+    assert!(parked.contains("$root_event_consumed = true;")
+        && parked.contains("continue $retry_label;"),
+        "an active child must retry inside the same settlement loop after retaining the root event");
     let uncertain = root
         .split_once("ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked")
         .expect("nonretryable callback settlement")
