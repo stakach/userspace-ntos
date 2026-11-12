@@ -71,6 +71,101 @@ struct HostedCall {
 static mut CALLS: Vec<Option<HostedCall>> = Vec::new();
 static BUSY_WIN32K_RETAIN_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Temporary read-only follow-up of a missing IFEO key on the authenticated caller.
+#[derive(Clone, Copy)]
+struct IfeoMissWatch {
+    binding: Binding,
+    admission_sequence: u64,
+    reply: u64,
+    settled: bool,
+    next_call: bool,
+    receive_wait_logged: bool,
+}
+static mut IFEO_MISS_WATCHES: [Option<IfeoMissWatch>; 16] = [None; 16];
+static IFEO_MISS_WATCH_NEXT: AtomicU64 = AtomicU64::new(0);
+static IFEO_MISS_CENSUS_PRINTS: AtomicU64 = AtomicU64::new(0);
+
+fn print_ifeo_watch(stage: &str, watch: IfeoMissWatch, next: Option<(u64, u64, u64, u64)>) {
+    use core::fmt::Write;
+    let mut record = nt_printf::record::RecordBuffer::<384>::new();
+    let _ = writeln!(record,
+        "[ifeo-followup] stage={} pi/pid/gen/tid/badge/tcb={}/{}/{:?}/{}/{}/{} prior-seq/reply={}/{} settled={} next-call={} next-seq/reply/label/ssn={:?}",
+        stage, watch.binding.pi, watch.binding.process.pid,
+        watch.binding.process.generation, watch.binding.tid, watch.binding.badge,
+        watch.binding.tcb, watch.admission_sequence, watch.reply,
+        u8::from(watch.settled), u8::from(watch.next_call), next);
+    sel4_rt::print_record(record.bytes());
+}
+
+pub(crate) unsafe fn trace_ifeo_open_miss(pi: usize, tid: u64, badge: u64) {
+    let Some(binding) = crate::service_sec_image::hosted_ingress_binding(badge)
+        .filter(|binding| binding.pi == pi && binding.tid == tid) else {
+            sel4_rt::print_record(b"[ifeo-followup] stage=miss-unbound\n");
+            return;
+        };
+    let mut matches = (&*core::ptr::addr_of!(CALLS)).iter().flatten().filter(|row| {
+        row.binding == binding && row.delivered && !row.released && row.completion.is_none()
+            && row.call.as_ref().is_some_and(|call|
+                call.executor() == binding.tcb && call.message().badge() == badge)
+    });
+    let Some(call) = matches.next().and_then(|row| row.call.as_ref()) else {
+        sel4_rt::print_record(b"[ifeo-followup] stage=miss-no-retained-call\n");
+        return;
+    };
+    if matches.next().is_some() {
+        sel4_rt::print_record(b"[ifeo-followup] stage=miss-ambiguous-call\n");
+        return;
+    }
+    let watch = IfeoMissWatch {
+        binding, admission_sequence: call.admission_sequence(), reply: call.reply(),
+        settled: false, next_call: false, receive_wait_logged: false,
+    };
+    let watches = &mut *core::ptr::addr_of_mut!(IFEO_MISS_WATCHES);
+    let slot = watches.iter().position(Option::is_none)
+        .unwrap_or_else(|| IFEO_MISS_WATCH_NEXT.fetch_add(1, Ordering::Relaxed) as usize % watches.len());
+    watches[slot] = Some(watch);
+    print_ifeo_watch("miss", watch, None);
+}
+
+unsafe fn trace_ifeo_next_call(binding: Binding, sequence: u64, reply: u64, info: u64, ssn: u64) {
+    for watch in (&mut *core::ptr::addr_of_mut!(IFEO_MISS_WATCHES)).iter_mut().flatten() {
+        if watch.binding == binding && !watch.next_call && watch.admission_sequence != sequence {
+            watch.next_call = true;
+            print_ifeo_watch("next-call", *watch, Some((sequence, reply, info >> 12, ssn)));
+        }
+    }
+}
+
+unsafe fn trace_ifeo_settled(binding: Binding, sequence: u64, reply: u64) {
+    for watch in (&mut *core::ptr::addr_of_mut!(IFEO_MISS_WATCHES)).iter_mut().flatten() {
+        if watch.binding == binding && watch.admission_sequence == sequence
+            && watch.reply == reply && !watch.settled
+        {
+            watch.settled = true;
+            print_ifeo_watch("ack-free", *watch, None);
+        }
+    }
+}
+
+pub(crate) unsafe fn trace_ifeo_miss_census() {
+    for watch in (&*core::ptr::addr_of!(IFEO_MISS_WATCHES)).iter().flatten() {
+        if !watch.next_call
+            && IFEO_MISS_CENSUS_PRINTS.fetch_add(1, Ordering::Relaxed) < 64
+        {
+            print_ifeo_watch("census-no-next-call", *watch, None);
+        }
+    }
+}
+
+pub(crate) unsafe fn trace_ifeo_root_receive() {
+    for watch in (&mut *core::ptr::addr_of_mut!(IFEO_MISS_WATCHES)).iter_mut().flatten() {
+        if watch.settled && !watch.next_call && !watch.receive_wait_logged {
+            watch.receive_wait_logged = true;
+            print_ifeo_watch("root-awaiting-next-call", *watch, None);
+        }
+    }
+}
+
 /// Equality witness for one delivered win32k Call. The move-only `ExternalIngress` and its
 /// physical Reply remain in `CALLS`; possession of this ticket grants no Reply authority.
 #[must_use = "revalidate the original Call before entering or deferring win32k"]
@@ -416,6 +511,10 @@ pub(super) unsafe fn retain(
         .map_err(|_| Error::Retain)?;
     crate::registry_mutation_work::trace_next_hosted_call(
         binding, call.reply(), call.message().info(), call.message().registers()[0],
+    );
+    trace_ifeo_next_call(
+        binding, call.admission_sequence(), call.reply(), call.message().info(),
+        call.message().registers()[0],
     );
     records[index] = Some(HostedCall {
         binding,
@@ -1184,6 +1283,7 @@ pub(crate) unsafe fn finish_acknowledged_hosted_reply(reply: u64) -> Result<bool
 
 unsafe fn finish_acknowledged(row: &mut HostedCall) -> Result<(), Error> {
     preflight_root_ingress_settlement(row)?;
+    let original = row.call.as_ref().map(|call| (call.admission_sequence(), call.reply()));
     let _saved = crate::ipc_message::SavedMessageBuffer::capture();
     let owner = owner();
     let (ready, _message, settlement) = owner
@@ -1200,6 +1300,9 @@ unsafe fn finish_acknowledged(row: &mut HostedCall) -> Result<(), Error> {
         settle_root_ingress(row, settlement)?;
     } else {
         settle_receive(row, settlement)?;
+    }
+    if let Some((sequence, reply)) = original {
+        trace_ifeo_settled(row.binding, sequence, reply);
     }
     let trace = row.receive_settlement.as_ref().and_then(|receive| {
         receive

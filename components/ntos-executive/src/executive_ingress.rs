@@ -235,6 +235,7 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
                 continue;
             }
         }
+        runtime::trace_ifeo_root_receive();
         let arrival = match runtime::receive(IngressExecutionOwner::Idle, ROOT_THREAD_CAP, true) {
             Ok(arrival) => arrival,
             Err(error) => {

@@ -137,6 +137,7 @@ fn append_wait_latency_census(record: &mut nt_printf::record::RecordBuffer<4096>
 
 pub(crate) fn print_hold_snapshot(now: u64) {
     use core::fmt::Write;
+    unsafe { crate::spawn_hosts::shared_ingress::owner::runtime::trace_ifeo_miss_census(); }
     static HOSTED_CALL_CENSUS_SAMPLES: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
     let sample_page = HOSTED_CALL_CENSUS_SAMPLES

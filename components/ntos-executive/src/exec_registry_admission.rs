@@ -527,6 +527,13 @@ impl ExecNtHandler {
                 if status == STATUS_OBJECT_NAME_NOT_FOUND {
                     self.note_registry_open_miss(&state.path);
                     self.note_completed_installer_inf_probe(&state.path, status);
+                    if state.path.split('\\').any(|part|
+                        part.eq_ignore_ascii_case("image file execution options"))
+                    {
+                        crate::spawn_hosts::shared_ingress::owner::runtime::trace_ifeo_open_miss(
+                            self.pi, self.current_tid, self.current_badge,
+                        );
+                    }
                 }
                 crate::registry_security_audit::admission_error(
                     b"open", &state.path, status, self.pi, self.current_tid,
