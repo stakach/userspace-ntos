@@ -59,3 +59,28 @@ fn resuming_parent_lends_its_page_only_to_the_exact_nested_ioctl_terminal() {
         && before_pump.contains("nested::restore_settled_source_ioctl_parent("),
         "RED: the selected terminal must run after the exact parent page restore and before its pump");
 }
+
+#[test]
+fn parked_source_parent_fences_all_other_page_and_work_redrivers() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let driver = fs::read_to_string(root.join("components/ntos-executive/src/driver_launch.rs"))
+        .expect("generic source redriver");
+    let source_redrive = driver.split("pub(crate) unsafe fn redrive_win32k_source_work(")
+        .nth(1).expect("generic source redriver").split("\n}").next().unwrap();
+    assert!(source_redrive.contains("source_ioctl_parent_retained("),
+        "RED: ordinary service redrive must not advance the selected Work outside its checkpoint");
+
+    let maintenance = fs::read_to_string(
+        root.join("components/ntos-executive/src/component_resume_maintenance.rs"),
+    ).expect("root maintenance resume");
+    let root_resume = maintenance.split("pub(crate) unsafe fn run_root_maintenance(")
+        .nth(1).expect("root maintenance resume").split("\n}").next().unwrap();
+    assert!(root_resume.contains("source_ioctl_parent_blocks_provider_resume("),
+        "RED: root maintenance must not restore another shared page while source parent is parked");
+
+    // Source terminal dispatch disables Receive yields; the serialized service loop settles an
+    // existing Receive boundary before it can select a provider and park a source parent.
+    let glue = fs::read_to_string(root.join("components/ntos-executive/src/win32k_glue.rs"))
+        .expect("source dispatch gate");
+    assert!(glue.contains("ch.caps.hosted_receive_yield = request_kind == win32k_subsystem::WIN32K_REQUEST_SSDT"));
+}

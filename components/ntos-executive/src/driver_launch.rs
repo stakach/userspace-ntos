@@ -67778,6 +67778,9 @@ pub(crate) unsafe fn redrive_nested_hosted_kernel_file_read_query(
 }
 
 pub(crate) unsafe fn redrive_win32k_source_work(handler: *mut ExecNtHandler) -> bool {
+    if crate::spawn_hosts::shared_ingress::owner::runtime::nested::source_ioctl_parent_retained() {
+        return false;
+    }
     let ioctl = hosted_kernel_win32k_source_ioctl::redrive(handler);
     let pnp = hosted_kernel_win32k_source_pnp::redrive(handler);
     let fsd = hosted_kernel_win32k_source_fsd::redrive(handler);

@@ -309,6 +309,9 @@ pub(crate) unsafe fn run_root_maintenance(
     nt_handler: *mut ExecNtHandler,
     mut ticket: root_maintenance_owner::RootMaintenanceTicket,
 ) -> RootMaintenanceResumeOutcome {
+    if runtime::nested::source_ioctl_parent_blocks_provider_resume(ticket.owner.dispatch_id) {
+        return RootMaintenanceResumeOutcome::DeferredRetry;
+    }
     let Some(pending) = root_maintenance_owner::pending(ticket) else {
         trace_root_refusal(ticket, b"pending-owner", 0);
         return RootMaintenanceResumeOutcome::RetainedFailure;
