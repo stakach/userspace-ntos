@@ -32312,8 +32312,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             }
             let data_base = alloc_frame_run(win32k_subsystem::WIN32K_DATA_FRAMES);
             let shared = alloc_frame();
-            // A provider wait can outlive and nest with the ordinary syscall/callback frames.
-            let provider_wait_frame = alloc_frame();
+            // Each physical lane keeps its request and result while another lane runs.
+            let provider_wait_base = alloc_frame_run(win32k_subsystem::WIN32K_PROVIDER_WAIT_FRAMES);
             // The cross-AS arg-marshal frame(s) — mapped in both the executive and the component.
             let arg_base = alloc_frame_run(win32k_subsystem::WIN32K_ARG_FRAMES);
             // Pointer-free kernel LPC staging. The executive owns the isolated LPC broker caps;
@@ -32377,23 +32377,32 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 RW_NX,
                 CAP_INIT_THREAD_VSPACE,
             );
-            let _ = page_map(
-                copy_cap(provider_wait_frame),
-                win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR,
-                RW_NX,
-                CAP_INIT_THREAD_VSPACE,
-            );
+            for ordinal in 0..win32k_subsystem::WIN32K_PROVIDER_WAIT_FRAMES {
+                let address = win32k_subsystem::WIN32K_PROVIDER_WAIT_LAYOUT
+                    .address(ordinal as usize)
+                    .expect("provider wait page for every physical lane");
+                let _ = page_map(
+                    copy_cap(provider_wait_base + ordinal),
+                    address,
+                    RW_NX,
+                    CAP_INIT_THREAD_VSPACE,
+                );
+            }
             let provider_wait_identity = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_DOMAINS))
                 .register()
                 .expect("win32k provider-domain allocation failed");
             let mut provider_wait_page = nt_provider_wait::ProviderWaitSharedPage::empty();
             provider_wait_page.control =
                 nt_provider_wait::ProviderWaitSharedControl::published(provider_wait_identity);
-            core::ptr::write_volatile(
-                win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-                    as *mut nt_provider_wait::ProviderWaitSharedPage,
-                provider_wait_page,
-            );
+            for ordinal in 0..win32k_subsystem::WIN32K_PROVIDER_WAIT_FRAMES {
+                let address = win32k_subsystem::WIN32K_PROVIDER_WAIT_LAYOUT
+                    .address(ordinal as usize)
+                    .expect("provider wait page for every physical lane");
+                core::ptr::write_volatile(
+                    address as *mut nt_provider_wait::ProviderWaitSharedPage,
+                    provider_wait_page,
+                );
+            }
             WIN32K_PROVIDER_DOMAIN.store(provider_wait_identity.domain, Ordering::Release);
             WIN32K_PROVIDER_GENERATION
                 .store(provider_wait_identity.generation, Ordering::Release);
@@ -32665,9 +32674,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     pts: 0,
                 };
                 n += 1;
-                // Provider wait request (aux PT window). It remains stable across nested dispatch.
+                // Lane-local provider wait pages (aux PT window).
                 regions[n] = Region {
-                    source: FrameSource::Alias(provider_wait_frame),
+                    source: FrameSource::Alias(provider_wait_base),
                     base_va: win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR,
                     count: win32k_subsystem::WIN32K_PROVIDER_WAIT_FRAMES,
                     rights: Rights::Uniform(RW_NX),

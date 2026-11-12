@@ -76,8 +76,8 @@ pub(crate) unsafe fn run_driver_entry_wait_resume(
         .recipient(caller)?
         .observation()
         .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
-    let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-        as *mut nt_provider_wait::ProviderWaitSharedPage;
+    let page = win32k_glue::provider_wait_page_for_channel(&channel)
+        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
     core::ptr::write_volatile(
         core::ptr::addr_of_mut!((*page).result),
         nt_provider_wait::ProviderWaitResult::completed(

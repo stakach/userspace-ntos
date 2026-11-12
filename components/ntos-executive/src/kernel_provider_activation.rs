@@ -374,13 +374,15 @@ pub(crate) unsafe fn publish(channel: &spawn_hosts::PumpChannel) -> u32 {
     })();
     match descriptor {
         Ok(descriptor) => {
-            let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-                as *mut nt_provider_wait::ProviderWaitSharedPage;
-            core::ptr::write_volatile(
-                core::ptr::addr_of_mut!((*page).kernel_activation),
-                descriptor,
-            );
-            nt_process::STATUS_SUCCESS
+            if let Some(page) = win32k_glue::provider_wait_page_for_channel(channel) {
+                core::ptr::write_volatile(
+                    core::ptr::addr_of_mut!((*page).kernel_activation),
+                    descriptor,
+                );
+                nt_process::STATUS_SUCCESS
+            } else {
+                nt_process::STATUS_INVALID_HANDLE
+            }
         }
         Err(status) => status,
     }

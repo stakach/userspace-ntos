@@ -1347,15 +1347,50 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
     );
     retire_win32k_on_wall(&pump);
     let completion = if let Some(request) = pump.provider_wait_request {
-        ProviderWaitPumpCompletion::Reparked(PendingProviderWaitDispatch {
+        let client = pending.snapshot.client;
+        let expected_owner = if win32k_client_context_is_admitted(client)
+            && client.logical_caller.is_some()
+        {
+            crate::current_win32k_provider_domain().map(|provider|
+                nt_provider_wait::ProviderWaitOwner {
+                    provider_domain: provider.domain,
+                    provider_generation: provider.generation,
+                    dispatch_id: pending.snapshot.dispatch.dispatch_id,
+                    caller: nt_provider_wait::SuspensionCaller::Hosted(
+                        nt_provider_wait::SuspensionHostedClient {
+                            client_pi: client.pi,
+                            client_generation: client.generation,
+                            client_tid: client.tid,
+                            client_badge: client.badge,
+                        },
+                    ),
+                })
+        } else {
+            None
+        };
+        let owner_matches = request.validate().is_ok()
+            && request.header.owner().is_some()
+            && request.header.owner() == expected_owner;
+        let next = PendingProviderWaitDispatch {
             request,
             dispatch: pending.snapshot.dispatch,
             client: pending.snapshot.client,
-            shared_resume: try_capture_exact_shared_resume_snapshot(pending.snapshot.dispatch, pending.snapshot.client),
+            shared_resume: owner_matches.then(||
+                try_capture_exact_shared_resume_snapshot(
+                    pending.snapshot.dispatch, pending.snapshot.client,
+                )).flatten(),
             nested_user_callback: nested,
             arg_snapshot_len: pending.snapshot.arg_snapshot_len,
             arg_snapshot: pending.snapshot.arg_snapshot,
-        })
+        };
+        if owner_matches {
+            ProviderWaitPumpCompletion::Reparked(next)
+        } else {
+            print_str(b"[service-wait-provider-owner] foreign or invalid labelled request retained\n");
+            ProviderWaitPumpCompletion::RetainedFailure(
+                next, nt_process::STATUS_INVALID_PARAMETER as i32,
+            )
+        }
     } else if pump.lpc_wait_suspended {
         capture_lpc_wait_repark(
             pending.snapshot.dispatch,

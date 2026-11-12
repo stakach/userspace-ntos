@@ -129,6 +129,40 @@ impl PhysicalKpcrLayout {
     }
 }
 
+/// One page for the primary physical lane and each worker. A blocked lane keeps its
+/// request and result while another lane runs a nested provider dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhysicalLanePageLayout {
+    pub base: u64,
+    pub page_bytes: u64,
+    pub worker_capacity: usize,
+}
+
+impl PhysicalLanePageLayout {
+    pub const fn address(self, physical_ordinal: usize) -> Option<u64> {
+        if physical_ordinal > self.worker_capacity || self.page_bytes == 0 {
+            return None;
+        }
+        let offset = match (physical_ordinal as u64).checked_mul(self.page_bytes) {
+            Some(offset) => offset,
+            None => return None,
+        };
+        self.base.checked_add(offset)
+    }
+
+    pub const fn end(self) -> Option<u64> {
+        let pages = match (self.worker_capacity as u64).checked_add(1) {
+            Some(pages) => pages,
+            None => return None,
+        };
+        let bytes = match pages.checked_mul(self.page_bytes) {
+            Some(bytes) => bytes,
+            None => return None,
+        };
+        self.base.checked_add(bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -238,6 +272,23 @@ mod tests {
 
     #[repr(align(8))]
     struct Page([u8; 4096]);
+
+    #[test]
+    fn distinct_provider_wait_pages_cover_every_physical_lane() {
+        let pages = PhysicalLanePageLayout {
+            base: 0x1000_0711_0000,
+            page_bytes: 0x1000,
+            worker_capacity: 48,
+        };
+        assert_eq!(pages.address(0), Some(0x1000_0711_0000));
+        assert_eq!(pages.address(8), Some(0x1000_0711_8000));
+        assert_eq!(pages.address(9), Some(0x1000_0711_9000));
+        assert_eq!(pages.address(48), Some(0x1000_0714_0000));
+        assert_eq!(pages.address(49), None);
+        assert_eq!(pages.end(), Some(0x1000_0714_1000));
+        assert_ne!(pages.address(8), pages.address(9),
+            "a nested wait on lane 9 must never overwrite lane 8's request or result");
+    }
 
     #[test]
     fn interleaved_system_lane_cannot_change_client_fast_mutex_owner() {

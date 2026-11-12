@@ -3324,6 +3324,13 @@ unsafe fn component_pump_loop(
             && (ch.caps.provider_wait || ch.kernel_caller.is_some())
             && ch.caps.kind == ReqKind::Syscall
         {
+            // This Call owns the current Reply. A route mismatch cannot be returned as an
+            // ordinary pump result, because that would permit the lane to be reused while
+            // the component still waits for this Reply.
+            if !shared_pump::authenticated_badge(ch, msg.badge) {
+                crate::print_str(b"[provider-wait-capture] physical route badge refused\n");
+                crate::park();
+            }
             if crate::service_sec_image::service_provider_wait_poll(
                 ch,
                 nt_user_host::provider_kernel_activation::KernelProviderServiceEnvelope {
@@ -3343,8 +3350,10 @@ unsafe fn component_pump_loop(
             }
             // The executive validates and admits the copied shared-page request only after the
             // exact hosted or kernel continuation storage is reserved. Keep this Call bound.
-            let page = crate::win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-                as *const nt_provider_wait::ProviderWaitSharedPage;
+            let Some(page) = crate::win32k_glue::provider_wait_page_for_channel(ch) else {
+                crate::print_str(b"[provider-wait-capture] physical lane page unavailable\n");
+                crate::park();
+            };
             let request: nt_provider_wait::ProviderWaitRequest =
                 core::ptr::read_volatile(core::ptr::addr_of!((*page).request));
             // A malformed request still owns this exact Call. Keep its complete bytes for

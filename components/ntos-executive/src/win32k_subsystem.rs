@@ -499,14 +499,34 @@ unsafe fn call_win32k_pe(target: u64, args: &[u64]) -> u64 {
         core::mem::transmute(boundary as *const ());
     call(target, args.as_ptr(), args.len() as u64)
 }
-/// Dedicated fixed-frame provider-wait ABI. A wait may remain live while nested dispatches overwrite
-/// the general request and callback frames, so its canonical object identities cannot alias either.
-pub const WIN32K_PROVIDER_WAIT_VADDR: u64 = WIN32K_SHARED_VADDR + 0x1000;
-pub const WIN32K_PROVIDER_WAIT_FRAMES: u64 = 1;
+/// A provider wait keeps its own request and result while another physical lane runs. The
+/// contiguous bank fits in the unused portion of the existing aux page-table window.
+pub const WIN32K_PROVIDER_WAIT_VADDR: u64 = 0x0000_0100_0711_0000;
+pub const WIN32K_PROVIDER_WAIT_FRAMES: u64 = (WIN32K_LANE_CAPACITY + 1) as u64;
+pub const WIN32K_PROVIDER_WAIT_LAYOUT:
+    nt_kernel_exec::win32k_lane_context::PhysicalLanePageLayout =
+    nt_kernel_exec::win32k_lane_context::PhysicalLanePageLayout {
+        base: WIN32K_PROVIDER_WAIT_VADDR,
+        page_bytes: 0x1000,
+        worker_capacity: WIN32K_LANE_CAPACITY,
+    };
 const _: () = assert!(
     core::mem::size_of::<nt_provider_wait::ProviderWaitSharedPage>()
-        <= WIN32K_PROVIDER_WAIT_FRAMES as usize * 0x1000
+        <= WIN32K_PROVIDER_WAIT_LAYOUT.page_bytes as usize
 );
+const _: () = assert!(
+    WIN32K_DATA_VADDR + WIN32K_DATA_FRAMES * 0x1000 <= WIN32K_PROVIDER_WAIT_VADDR
+        && WIN32K_PROVIDER_WAIT_VADDR + WIN32K_PROVIDER_WAIT_FRAMES * 0x1000
+            <= WIN32K_SHARED_VADDR
+);
+
+fn provider_wait_page_for_current_lane() -> *mut nt_provider_wait::ProviderWaitSharedPage {
+    let ordinal = WIN32K_PHYSICAL_KPCR_LAYOUT.ordinal(current_kpcr_va())
+        .expect("provider wait requires a registered physical lane");
+    WIN32K_PROVIDER_WAIT_LAYOUT.address(ordinal)
+        .expect("registered lane has a provider wait page")
+        as *mut nt_provider_wait::ProviderWaitSharedPage
+}
 /// The cross-address-space ARG-MARSHAL frame: mapped RW in BOTH the executive and the win32k
 /// component (within the pool PT window). The executive copies a dispatched syscall's user buffers
 /// here (sized per the win32k SSN signature); win32k's handler reads/writes them in its own context;
@@ -529,7 +549,7 @@ pub const WIN32K_PAINT_STAGE_OUTPUT_LENGTH_OFFSET: u64 = 120;
 const _: () = assert!(WIN32K_PAINT_STAGE_PROBE_BYTES_OFFSET >= nt_user_callback::BEGIN_PAINT_OUTPUT_BYTES as u64);
 const _: () = assert!(WIN32K_PAINT_STAGE_PROBE_BYTES_OFFSET + 8 == WIN32K_PAINT_STAGE_OUTPUT_LENGTH_OFFSET);
 const _: () = assert!(
-    WIN32K_PROVIDER_WAIT_VADDR + WIN32K_PROVIDER_WAIT_FRAMES * 0x1000 <= WIN32K_ARG_VADDR
+    WIN32K_SHARED_VADDR + 0x1000 <= WIN32K_ARG_VADDR
 );
 const _: () = assert!(
     WIN32K_MESSAGE_STAGE_BASE + WIN32K_MESSAGE_STAGE_SLOTS * WIN32K_MESSAGE_STAGE_SLOT_BYTES
@@ -789,8 +809,7 @@ fn registered_provider_wait_domain() -> Option<nt_provider_wait::ProviderDomainI
     unsafe {
         read_volatile(
             core::ptr::addr_of!(
-                (*(WIN32K_PROVIDER_WAIT_VADDR
-                    as *const nt_provider_wait::ProviderWaitSharedPage))
+                (*provider_wait_page_for_current_lane())
                 .control
             ),
         )
@@ -990,7 +1009,7 @@ unsafe fn capture_kernel_provider_stack_activation() -> Option<ProviderStackEven
     if reply_info != 1 || status != nt_process::STATUS_SUCCESS as u64 {
         return None;
     }
-    let page = WIN32K_PROVIDER_WAIT_VADDR as *const nt_provider_wait::ProviderWaitSharedPage;
+    let page = provider_wait_page_for_current_lane() as *const nt_provider_wait::ProviderWaitSharedPage;
     let descriptor = read_volatile(core::ptr::addr_of!((*page).kernel_activation));
     let _metadata = ProviderMetadataGuard::acquire();
     let activation = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
@@ -6549,7 +6568,7 @@ unsafe fn provider_wait_rendezvous(
         print_str(b"[win32k-provider-wait-reject] resolve\n");
         return 0xC000_000Du32 as i32;
     };
-    let page = WIN32K_PROVIDER_WAIT_VADDR as *mut nt_provider_wait::ProviderWaitSharedPage;
+    let page = provider_wait_page_for_current_lane();
     let mut request = nt_provider_wait::ProviderWaitRequest::empty();
     if let Err(error) = request
         .begin(

@@ -1488,8 +1488,9 @@ pub(crate) unsafe fn service_provider_wait_poll(
     channel: &spawn_hosts::PumpChannel,
     envelope: nt_user_host::provider_kernel_activation::KernelProviderServiceEnvelope,
 ) -> bool {
-    let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-        as *mut nt_provider_wait::ProviderWaitSharedPage;
+    let Some(page) = win32k_glue::provider_wait_page_for_channel(channel) else {
+        return false;
+    };
     let request = core::ptr::read_volatile(core::ptr::addr_of!((*page).request));
     if request.header.timeout_kind != nt_provider_wait::ProviderWaitTimeoutKind::Poll as u32
     {

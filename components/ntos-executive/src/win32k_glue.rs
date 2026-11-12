@@ -316,6 +316,47 @@ pub(crate) unsafe fn win32k_physical_lane_for_channel(
         })
 }
 
+/// Locate the provider wait page through the authenticated physical lane, never through a
+/// process, dispatch number, or the last writer of the shared request bank.
+pub(crate) unsafe fn provider_wait_page_for_lane(
+    handle: nt_component_suspension::LaneHandle,
+) -> Option<*mut nt_provider_wait::ProviderWaitSharedPage> {
+    let binding = win32k_physical_lane_binding(handle)?;
+    let row = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES)).as_ref()?
+        .iter().find(|row| row.handle == Some(handle)
+            && row.tcb == binding.executor_id)?;
+    let route = row.route?;
+    if route.identity().lane != handle || route.identity().executor != row.tcb {
+        return None;
+    }
+    let physical = crate::spawn_hosts::shared_ingress::owner::runtime::physical_source(route)
+        .ok()?;
+    let retained_pml4 = row.primary.as_ref().map(|component| component.pml4)
+        .or_else(|| row.worker.as_ref().map(|worker| worker.pml4))?;
+    if physical.tcb != row.tcb || physical.pml4 != retained_pml4 {
+        return None;
+    }
+    let ordinal = row.worker_ordinal.unwrap_or(0) as usize;
+    win32k_subsystem::WIN32K_PROVIDER_WAIT_LAYOUT.address(ordinal)
+        .map(|address| address as *mut nt_provider_wait::ProviderWaitSharedPage)
+}
+
+pub(crate) unsafe fn provider_wait_page_for_channel(
+    channel: &crate::spawn_hosts::PumpChannel,
+) -> Option<*mut nt_provider_wait::ProviderWaitSharedPage> {
+    let route = channel.ingress_route?;
+    let handle = win32k_physical_lane_for_channel(
+        channel.tcb, channel.fault_ep, channel.reply_cap,
+    )?;
+    if route.identity().lane != handle || route.identity().executor != channel.tcb
+        || shared_win32k_lane_route(handle) != Some(route)
+    {
+        return None;
+    }
+    let physical = crate::spawn_hosts::shared_ingress::owner::runtime::physical_source(route).ok()?;
+    (physical.pml4 == channel.pml4).then(|| provider_wait_page_for_lane(handle)).flatten()
+}
+
 pub(crate) unsafe fn win32k_physical_stack_route_for_channel(
     tcb: u64,
     endpoint: u64,
@@ -4920,8 +4961,11 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
             return ProviderWaitPumpCompletion::NestedSourceDeferred;
         }
     }
-    let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-        as *mut nt_provider_wait::ProviderWaitSharedPage;
+    let Some(page) = provider_wait_page_for_lane(pending.dispatch.lane) else {
+        return ProviderWaitPumpCompletion::RetainedFailure(
+            pending, 0xC000_000Du32 as i32,
+        );
+    };
     core::ptr::write_volatile(
         core::ptr::addr_of_mut!((*page).result),
         nt_provider_wait::ProviderWaitResult::completed(wait_id, status),
