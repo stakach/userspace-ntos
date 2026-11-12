@@ -65,10 +65,9 @@ fn nested_registry_retry_is_physically_covered_before_blocking_receive() {
         .and_then(|(_, body)| body.split_once("\n}").map(|(body, _)| body))
         .expect("nested receive needs a physical registry retry wake contract");
     assert!(arm.contains("registry_mutation_work::next_deadline()")
-        && arm.contains("delay_timer_program(")
-        && arm.contains("pit_oneshot_for_deadline(")
-        && arm.contains("LAST_REARM_AUTHORITY.covers("),
-        "a registry retry published after a consumed timer shot needs a live, feasible physical wake");
+        && arm.contains("delay_timer_program(deadline, DELAY_TIMER_SOURCE_REGISTRY_MUTATION)")
+        && !arm.contains("LAST_REARM_AUTHORITY.covers("),
+        "a successful timer program is the wake handoff; re-sampling a short PIT shot can falsely wall it");
 
     let receive = NESTED
         .split_once("let blocking = serviced_scheduler_yield || !timer_checkpoint;")

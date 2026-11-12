@@ -32,22 +32,17 @@ fn delivered_or_expired_pit_shot_never_covers_new_demand() {
 }
 
 #[test]
-fn feasible_pit_wake_covers_short_and_overdue_registry_retries() {
-    const MIN_ARM: u64 = 10_000;
-    for deadline_offset in [20_000, 1, 0] {
-        let programmed_at: u64 = 1_000_000;
-        let deadline = programmed_at + deadline_offset;
-        let shot = pit_oneshot_for_deadline(programmed_at, deadline, MIN_ARM);
-        let authority = PitOneShotAuthority::new();
-        authority.publish(shot.wake_deadline_100ns);
-
-        let checked_at = programmed_at + 1;
-        let feasible_wake =
-            pit_oneshot_for_deadline(checked_at, deadline, MIN_ARM).wake_deadline_100ns;
-        assert!(authority.covers(checked_at, feasible_wake));
-        authority.invalidate();
-        assert!(!authority.covers(checked_at, feasible_wake));
-    }
+fn resampling_a_live_short_pit_shot_can_make_feasible_wake_earlier() {
+    let programmed_at = 1_000_000;
+    let deadline = programmed_at + 20_000;
+    let shot = pit_oneshot_for_deadline(programmed_at, deadline, 10_000);
+    let checked_at = programmed_at + 4;
+    let resampled_wake =
+        pit_oneshot_for_deadline(checked_at, deadline, 10_000).wake_deadline_100ns;
+    assert!(checked_at < shot.wake_deadline_100ns);
+    assert!(shot.wake_deadline_100ns > resampled_wake);
+    // The original programmed shot remains live; the second computation cannot
+    // revoke its pending notification merely because it rounded differently.
 }
 
 #[test]

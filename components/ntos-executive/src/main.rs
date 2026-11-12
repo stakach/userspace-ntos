@@ -17433,17 +17433,19 @@ unsafe fn arm_nested_registry_retry_before_receive() -> bool {
     let Some(deadline) = registry_mutation_work::next_deadline() else {
         return true;
     };
-    if !delay_timer_program(deadline, DELAY_TIMER_SOURCE_REGISTRY_MUTATION) {
-        return false;
+    // A successful arm is the handoff: if the shot expires before Receive, its
+    // bound notification is pending there. A second clock sample can falsely
+    // reject a live short shot because PIT tick rounding changes the comparison.
+    let programmed = delay_timer_program(deadline, DELAY_TIMER_SOURCE_REGISTRY_MUTATION);
+    if !programmed {
+        print_str(b"[nested-registry-arm-failed] deadline/now/irq/shot/pending=");
+        print_u64(deadline); print_str(b"/");
+        print_u64(monotonic_time_100ns()); print_str(b"/");
+        print_u64(DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire) as u64); print_str(b"/");
+        print_u64(u64::from(LAST_REARM_AUTHORITY.is_armed())); print_str(b"/");
+        print_u64(DELAY_TIMER_TICKS_PENDING.load(Ordering::Acquire)); print_str(b"\n");
     }
-    // PIT tick rounding and the minimum arm can place the earliest feasible
-    // physical wake just after the logical deadline. Compare against that
-    // feasible wake, sampled after programming, while still requiring a live shot.
-    let now = monotonic_time_100ns();
-    let feasible_wake = nt_kernel_exec::pit_oneshot_for_deadline(
-        now, deadline, DELAY_TIMER_MIN_ARM_100NS,
-    ).wake_deadline_100ns;
-    LAST_REARM_AUTHORITY.covers(now, feasible_wake)
+    programmed
 }
 
 unsafe fn delay_timer_rearm(
