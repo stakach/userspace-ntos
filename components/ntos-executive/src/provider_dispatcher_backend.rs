@@ -46,6 +46,19 @@ unsafe fn sync_catalog_for_lease(
     catalog
 }
 
+/// Observe an already-published canonical sync object during a stalled-pump trace.
+/// This never creates a catalog, enters the provider, or changes a wait lease.
+pub(crate) unsafe fn snapshot_sync_for_stale_trace(
+    provider: nt_provider_wait::ProviderDomainIdentity,
+    canonical: nt_provider_wait::ProviderWaitObject,
+) -> Option<nt_provider_wait::ProviderLocalSyncSnapshot> {
+    let catalog = (&*core::ptr::addr_of!(ROOT_PROVIDER_SYNC)).as_ref()?;
+    if catalog.provider() != provider {
+        return None;
+    }
+    catalog.snapshot_for_canonical(canonical).ok()
+}
+
 pub(crate) unsafe fn publish_sync(
     provider: nt_provider_wait::ProviderDomainIdentity,
     local_identity: u64,

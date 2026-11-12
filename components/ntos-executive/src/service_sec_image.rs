@@ -407,6 +407,7 @@ pub(crate) static mut COMPONENT_SUSPENSIONS: ComponentLanes = nt_component_suspe
 pub(crate) unsafe fn trace_stale_suspension_frames(lane_index: u64, lane_generation: u64) {
     const CAP: usize = 16;
     let mut rows = [[0u64; 19]; CAP];
+    let mut mutant_objects: [Option<(nt_provider_wait::ProviderDomainIdentity, nt_provider_wait::ProviderWaitObject)>; CAP] = [None; CAP];
     let mut count = 0usize;
     let mut overflow = 0u64;
     {
@@ -436,6 +437,12 @@ pub(crate) unsafe fn trace_stale_suspension_frames(lane_index: u64, lane_generat
                     Some(component_continuation::PendingComponentDispatch::Provider(pending)) => {
                         let first = (pending.request.header.object_count != 0)
                             .then(|| pending.request.objects.first()).flatten();
+                        if let Some(object) = first.filter(|object| object.object_type == nt_provider_wait::ProviderWaitObjectType::Mutant as u32) {
+                            mutant_objects[count] = Some((nt_provider_wait::ProviderDomainIdentity {
+                                domain: pending.request.header.provider_domain,
+                                generation: pending.request.header.provider_generation,
+                            }, *object));
+                        }
                         (1, pending.request.header.wait_id, pending.dispatch.dispatch_id,
                             pending.dispatch.ssn, arbiter.contains(pending.request.header.wait_id) as u64,
                             [pending.request.header.wait_type as u64,
@@ -468,11 +475,63 @@ pub(crate) unsafe fn trace_stale_suspension_frames(lane_index: u64, lane_generat
             count += 1;
         }
     }
-    for row in &rows[..count] {
+    for (index, row) in rows[..count].iter().enumerate() {
         print_str(b"[pump-stale-suspension] kind/id/admission/phase/owner-dispatch/pi/tid/pending-kind/wait-id/pending-dispatch/ssn/arbiter/wait-type/timeout-kind/timeout-raw-100ns/object-count/first-type/first-id/first-generation=");
         print_u64(row[0]);
         for value in &row[1..] { print_str(b"/"); print_u64(*value); }
         print_str(b"\n");
+        if let Some((provider, object)) = mutant_objects[index] {
+            print_str(b"[pump-stale-mutant] provider-domain/generation/object-id/generation/flags/wait-id=");
+            print_u64(provider.domain); print_str(b"/"); print_u64(provider.generation);
+            print_str(b"/"); print_u64(object.object_id);
+            print_str(b"/"); print_u64(object.object_generation);
+            print_str(b"/"); print_u64(object.flags as u64);
+            print_str(b"/"); print_u64(row[8]);
+            if let Some(snapshot) = crate::provider_dispatcher_backend::snapshot_sync_for_stale_trace(provider, object) {
+                print_str(b" canonical-generation/local-id/body/signal-state/wait-leases/storage-offset=");
+                print_u64(snapshot.canonical.map_or(0, |canonical| canonical.object_generation));
+                print_str(b"/"); print_u64(snapshot.id.raw());
+                print_str(b"/"); print_hex_u64(snapshot.body);
+                print_str(b"/");
+                if snapshot.signal_state < 0 { print_str(b"-"); }
+                print_u64(snapshot.signal_state.unsigned_abs() as u64);
+                print_str(b"/"); print_u64(snapshot.wait_leases as u64);
+                print_str(b"/"); print_u64(snapshot.storage.offset);
+                match snapshot.storage.backing {
+                    nt_provider_wait::ProviderEventBacking::Static { instance_generation } => {
+                        print_str(b" storage=static/"); print_u64(instance_generation);
+                    }
+                    nt_provider_wait::ProviderEventBacking::Allocation { arena_id, arena_generation, allocation_id, allocation_generation } => {
+                        print_str(b" storage=allocation/"); print_u64(arena_id);
+                        print_str(b"/"); print_u64(arena_generation);
+                        print_str(b"/"); print_u64(allocation_id);
+                        print_str(b"/"); print_u64(allocation_generation);
+                    }
+                    nt_provider_wait::ProviderEventBacking::Stack { lane_id, lane_generation, dispatch_id, activation_generation } => {
+                        print_str(b" storage=stack/"); print_u64(lane_id);
+                        print_str(b"/"); print_u64(lane_generation);
+                        print_str(b"/"); print_u64(dispatch_id);
+                        print_str(b"/"); print_u64(activation_generation);
+                    }
+                }
+                match snapshot.mutant_owner {
+                    Some(nt_component_suspension::SuspensionCaller::Hosted(holder)) => {
+                        print_str(b" holder=hosted/"); print_u64(holder.client_pi as u64);
+                        print_str(b"/"); print_u64(holder.client_generation);
+                        print_str(b"/"); print_u64(holder.client_tid);
+                        print_str(b"/"); print_u64(holder.client_badge);
+                    }
+                    Some(nt_component_suspension::SuspensionCaller::Kernel { lane }) => {
+                        print_str(b" holder=kernel/"); print_u64(lane.index as u64);
+                        print_str(b"/"); print_u64(lane.generation);
+                    }
+                    None => print_str(b" holder=none"),
+                }
+            } else {
+                print_str(b" snapshot=absent");
+            }
+            print_str(b"\n");
+        }
     }
     if overflow != 0 {
         print_str(b"[pump-stale-suspension] overflow=");
