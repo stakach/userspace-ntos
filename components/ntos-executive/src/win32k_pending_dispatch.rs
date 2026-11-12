@@ -662,6 +662,7 @@ pub(crate) enum ProviderWaitPumpCompletion {
     ReceiveReparked(PendingReceiveDispatch),
     ServiceReparked(PendingServiceWaitDispatch),
     UserCallbackSuspended,
+    CaptureRefused(PendingProviderWaitDispatch, crate::spawn_hosts::PumpResult, crate::spawn_hosts::PumpChannel),
     RetainedFailure(PendingProviderWaitDispatch, i32),
     Failed(i32),
 }
@@ -673,6 +674,7 @@ pub(crate) enum LpcWaitPumpCompletion {
     ReceiveReparked(PendingReceiveDispatch),
     ServiceReparked(PendingServiceWaitDispatch),
     UserCallbackSuspended,
+    CaptureRefused(PendingLpcWaitDispatch, crate::spawn_hosts::PumpResult, crate::spawn_hosts::PumpChannel),
     RetainedFailure(PendingLpcWaitDispatch, i32),
     Failed(i32),
 }

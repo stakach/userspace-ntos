@@ -27,6 +27,98 @@ fn key() -> ReturnedPumpKey {
     ReturnedPumpKey::new(route, physical, dispatch, client, binding.reply_object, 19).unwrap()
 }
 
+fn independent_lane_keys() -> (ReturnedPumpKey, ReturnedPumpKey) {
+    let mut lanes = ComponentSuspensionLanes::<u64, u64, u64>::new(2, 2);
+    let mut make = |executor, reply, dispatch_id, attempt| {
+        let endpoint = executor + 1;
+        let binding = LaneBinding {
+            executor_id: executor,
+            receive_endpoint: endpoint,
+            reply_object: reply,
+        };
+        let lane = lanes.allocate(binding).unwrap();
+        lanes.begin_dispatch(lane, reply).unwrap();
+        let physical = lanes.active_dispatch_identity(lane).unwrap().unwrap();
+        lanes.suspend_running(lane, reply, dispatch_id).unwrap();
+        let mut peers = PeerRegistry::new(endpoint, 1);
+        let mut staged = peers.stage(PeerIdentity {
+            domain: 11,
+            domain_generation: 12,
+            executor,
+            lane,
+        }).unwrap();
+        let route = peers.publish(&mut staged).unwrap();
+        let dispatch = DispatchContext {
+            lane,
+            dispatch_id,
+            ssn: 0x1007,
+            ..DispatchContext::EMPTY
+        };
+        let client = SharedPageClientIdentity {
+            pi: 8,
+            pid: 14,
+            generation: 15,
+            tid: dispatch_id,
+            badge: 17,
+            tcb: executor,
+        };
+        ReturnedPumpKey::new(route, physical, dispatch, client, reply, attempt).unwrap()
+    };
+    (make(101, 103, 13, 19), make(201, 203, 23, 29))
+}
+
+#[test]
+fn refused_provider_wait_capture_retains_its_reply_without_blocking_another_lane() {
+    let (refused, independent) = independent_lane_keys();
+    assert_ne!(refused.route(), independent.route());
+    assert_ne!(refused.physical_dispatch().lane(), independent.physical_dispatch().lane());
+    let mut table = RetainedOwnerTable::<ReturnedPumpKey,
+        ReturnedPumpOwner<Box<u64>, Box<u64>>>::new();
+    let refused_ticket = {
+        let reservation = table.reserve().unwrap();
+        table.retain(reservation, refused,
+            ReturnedPumpOwner::active(refused, Box::new(401))).ok().unwrap()
+    };
+    let independent_ticket = {
+        let reservation = table.reserve().unwrap();
+        table.retain(reservation, independent,
+            ReturnedPumpOwner::active(independent, Box::new(501))).ok().unwrap()
+    };
+
+    // This badge does not authenticate the physical route. The labelled Call has nevertheless
+    // consumed the current Reply, so the refusal must be a retained outcome, never a return.
+    let wrong_badge = refused.route().badge() + 1;
+    assert_ne!(wrong_badge, refused.route().badge());
+    assert!(table.transition_held(refused_ticket, |mut owner| {
+        assert!(matches!(owner.record_capture_refusal(
+            refused, 104, 104, wrong_badge, Box::new(601)),
+            ReturnedPumpObservation::Quarantined(ReturnedPumpError::CaptureRefused)));
+        Ok::<_, ((), _)>(owner)
+    }).is_ok());
+    let retained = table.get(refused_ticket).unwrap();
+    assert_eq!(retained.phase(), ReturnedPumpPhase::Quarantined);
+    assert_eq!(retained.key().route(), refused.route());
+    assert_eq!(retained.replies().unwrap().current, 104);
+    assert_eq!(retained.replies().unwrap().returned, 104);
+    assert_eq!(retained.capture_refusal().unwrap().observed_badge, wrong_badge);
+    assert_eq!(**retained.continuation(), 401);
+    assert_eq!(**retained.pump().unwrap(), 601);
+    let owner = table.take(refused_ticket).unwrap();
+    let (_, owner) = owner.into_returned(refused).err().unwrap();
+    table.restore(refused_ticket, owner).ok().unwrap();
+
+    // A quarantined lane must not impose a global stop: a different physical route can finish.
+    assert!(table.transition_held(independent_ticket, |mut owner| {
+        assert!(matches!(owner.record_return(
+            independent, 204, 204, Box::new(701)),
+            ReturnedPumpObservation::Accepted));
+        Ok::<_, ((), _)>(owner)
+    }).is_ok());
+    let owner = table.take(independent_ticket).unwrap();
+    let (continuation, pump, reply) = owner.into_returned(independent).ok().unwrap();
+    assert_eq!((*continuation, *pump, reply), (501, 701, 204));
+}
+
 #[test]
 fn active_bundle_is_retained_before_pump_and_uncertain_capture_keeps_both_owners() {
     let key = key();

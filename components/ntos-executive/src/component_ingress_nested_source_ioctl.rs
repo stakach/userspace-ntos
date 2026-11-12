@@ -32,6 +32,43 @@ fn trace_source_ioctl_preflight(stage: &[u8]) {
     crate::print_str(b"\n");
 }
 
+unsafe fn trace_source_ioctl_park_transition(
+    stage: &[u8], lane: nt_component_suspension::LaneHandle,
+    dispatch_id: u64, key: crate::driver_launch::NestedIoctlKey,
+) {
+    crate::print_str(b"[source-resume-park] stage=");
+    crate::print_str(stage);
+    crate::print_str(b" dispatch/lane/key-nonce/key-ticket/run-lane/frame-phase=");
+    let frame_phase = lanes().top(lane).ok().flatten().map_or(0, |frame|
+        match &frame.phase {
+            nt_component_suspension::SuspensionPhase::Selected { .. } => 2,
+            nt_component_suspension::SuspensionPhase::Resuming { .. } => 3,
+            nt_component_suspension::SuspensionPhase::ResumingChildParked { .. } => 4,
+            nt_component_suspension::SuspensionPhase::ResumingChildQuarantined { .. } => 5,
+            _ => 1,
+        });
+    for value in [dispatch_id, lane.index as u64, key.nonce, key.source_ticket,
+        lanes().running().map_or(u64::MAX, |running| running.index as u64), frame_phase] {
+        crate::print_str(b"/");
+        crate::print_hex_u64(value);
+    }
+    crate::print_str(b"\n");
+}
+
+static NO_CHILD_TRACE_SAMPLES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+fn trace_source_ioctl_no_child(lane: nt_component_suspension::LaneHandle, dispatch_id: u64) {
+    let sample = NO_CHILD_TRACE_SAMPLES.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if sample > 16 && !sample.is_power_of_two() { return; }
+    crate::print_str(b"[source-resume-park] stage=no-child sample/dispatch/lane=");
+    for value in [sample, dispatch_id, lane.index as u64] {
+        crate::print_str(b"/");
+        crate::print_hex_u64(value);
+    }
+    crate::print_str(b"\n");
+}
+
 pub(crate) unsafe fn trace_source_ioctl_parent_for_work(
     sample: u64, work_route: PeerRoute, work_dispatch: LaneDispatchIdentity,
     work_reply: u64, packet: u64,
@@ -105,7 +142,12 @@ pub(crate) unsafe fn park_resuming_source_ioctl(
     };
     let Some(selection) = crate::driver_launch::select_nested_win32k_source_ioctl_terminal(
         route, dispatch, reply,
-    ) else { return SourceIoctlPark::NoChild };
+    ) else {
+        trace_source_ioctl_no_child(lane, dispatch_context.dispatch_id);
+        return SourceIoctlPark::NoChild;
+    };
+    let selected_key = selection.key();
+    trace_source_ioctl_park_transition(b"selected", lane, dispatch_context.dispatch_id, selected_key);
     let Some(frame) = lanes().top(lane).ok().flatten() else {
         quarantine_preflight(QuarantinedSourcePreflight::Selection(selection), b"no-resuming-frame");
         return SourceIoctlPark::Retained;
@@ -130,6 +172,7 @@ pub(crate) unsafe fn park_resuming_source_ioctl(
             );
             return SourceIoctlPark::Retained;
         }
+        trace_source_ioctl_park_transition(b"capture-requeued", lane, dispatch_context.dispatch_id, selected_key);
         return SourceIoctlPark::RequeuedNoEffect;
     };
     let Some(page) = shared_resume.lease_snapshot(client) else {
@@ -140,6 +183,7 @@ pub(crate) unsafe fn park_resuming_source_ioctl(
             );
             return SourceIoctlPark::Retained;
         }
+        trace_source_ioctl_park_transition(b"page-requeued", lane, dispatch_context.dispatch_id, selected_key);
         return SourceIoctlPark::RequeuedNoEffect;
     };
     let identity = nt_user_callback::SharedPageLeaseIdentity {
@@ -155,6 +199,7 @@ pub(crate) unsafe fn park_resuming_source_ioctl(
             );
             return SourceIoctlPark::Retained;
         }
+        trace_source_ioctl_park_transition(b"lease-requeued", lane, dispatch_context.dispatch_id, selected_key);
         return SourceIoctlPark::RequeuedNoEffect;
     }
     let source = SourceIoctlParent {
@@ -162,11 +207,19 @@ pub(crate) unsafe fn park_resuming_source_ioctl(
         dispatch: dispatch_context, client, shared_leases, child_dispatch: None,
     };
     match park_current_attempt(None, Some(source)) {
-        ParkAttemptOutcome::Parked(handle) => SourceIoctlPark::Parked(handle),
+        ParkAttemptOutcome::Parked(handle) => {
+            trace_source_ioctl_park_transition(b"parked", lane, dispatch_context.dispatch_id, selected_key);
+            SourceIoctlPark::Parked(handle)
+        }
         ParkAttemptOutcome::NoRunningLane(Some(source))
-            | ParkAttemptOutcome::RefusedNoEffect(_, Some(source)) =>
-            SourceIoctlPark::RefusedNoEffect(source),
-        _ => SourceIoctlPark::Retained,
+            | ParkAttemptOutcome::RefusedNoEffect(_, Some(source)) => {
+            trace_source_ioctl_park_transition(b"refused-no-effect", lane, dispatch_context.dispatch_id, selected_key);
+            SourceIoctlPark::RefusedNoEffect(source)
+        }
+        _ => {
+            trace_source_ioctl_park_transition(b"retained", lane, dispatch_context.dispatch_id, selected_key);
+            SourceIoctlPark::Retained
+        }
     }
 }
 

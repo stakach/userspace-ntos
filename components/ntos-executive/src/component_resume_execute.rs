@@ -133,7 +133,12 @@ pub(crate) unsafe fn run_hosted(
                 resume.key.id,
                 resume.completion.status,
             ) {
-                win32k_glue::ProviderWaitPumpCompletion::NestedSourceDeferred => return None,
+                win32k_glue::ProviderWaitPumpCompletion::NestedSourceDeferred => {
+                    crate::spawn_hosts::shared_ingress::owner::runtime::nested::trace_deferred_resume_owner(
+                        lane, resume.key, frame.owner,
+                    );
+                    return None;
+                }
                 win32k_glue::ProviderWaitPumpCompletion::Completed(dispatch) => {
                     ComponentPumpCompletion::Completed(dispatch)
                 }
@@ -154,6 +159,11 @@ pub(crate) unsafe fn run_hosted(
                 }
                 win32k_glue::ProviderWaitPumpCompletion::Failed(status) => {
                     ComponentPumpCompletion::Failed(status)
+                }
+                win32k_glue::ProviderWaitPumpCompletion::CaptureRefused(_, pump, channel) => {
+                    ComponentPumpCompletion::CaptureRefused(
+                        continuation.pending, pump, channel,
+                    )
                 }
                 win32k_glue::ProviderWaitPumpCompletion::RetainedFailure(pending, status) => {
                     ComponentPumpCompletion::FailedRetained(
@@ -190,6 +200,11 @@ pub(crate) unsafe fn run_hosted(
                 win32k_glue::LpcWaitPumpCompletion::Failed(status) => {
                     ComponentPumpCompletion::Failed(status)
                 }
+                win32k_glue::LpcWaitPumpCompletion::CaptureRefused(_, pump, channel) => {
+                    ComponentPumpCompletion::CaptureRefused(
+                        continuation.pending, pump, channel,
+                    )
+                }
                 win32k_glue::LpcWaitPumpCompletion::RetainedFailure(pending, status) => {
                     ComponentPumpCompletion::FailedRetained(
                         PendingComponentDispatch::Lpc(pending), status,
@@ -205,7 +220,12 @@ pub(crate) unsafe fn run_hosted(
         PendingComponentDispatch::ServiceWait(pending) => {
             match win32k_glue::resume_suspended_service_wait_component(pending) {
                 win32k_glue::ServiceWaitPumpCompletion::Restored(completion) => match completion {
-                    win32k_glue::ProviderWaitPumpCompletion::NestedSourceDeferred => return None,
+                    win32k_glue::ProviderWaitPumpCompletion::NestedSourceDeferred => {
+                        crate::spawn_hosts::shared_ingress::owner::runtime::nested::trace_deferred_resume_owner(
+                            lane, resume.key, frame.owner,
+                        );
+                        return None;
+                    }
                     win32k_glue::ProviderWaitPumpCompletion::Completed(dispatch) =>
                         ComponentPumpCompletion::Completed(dispatch),
                     win32k_glue::ProviderWaitPumpCompletion::Reparked(pending) =>
@@ -220,6 +240,10 @@ pub(crate) unsafe fn run_hosted(
                         ComponentPumpCompletion::UserCallbackSuspended,
                     win32k_glue::ProviderWaitPumpCompletion::Failed(status) =>
                         ComponentPumpCompletion::Failed(status),
+                    win32k_glue::ProviderWaitPumpCompletion::CaptureRefused(_, pump, channel) =>
+                        ComponentPumpCompletion::CaptureRefused(
+                            continuation.pending, pump, channel,
+                        ),
                     win32k_glue::ProviderWaitPumpCompletion::RetainedFailure(pending, status) =>
                         ComponentPumpCompletion::FailedRetained(
                             PendingComponentDispatch::Provider(pending), status,
@@ -229,6 +253,10 @@ pub(crate) unsafe fn run_hosted(
                     ComponentPumpCompletion::Reparked(PendingComponentDispatch::ServiceWait(pending)),
                 win32k_glue::ServiceWaitPumpCompletion::ReceiveReparked(pending) =>
                     ComponentPumpCompletion::Reparked(PendingComponentDispatch::Receive(pending)),
+                win32k_glue::ServiceWaitPumpCompletion::CaptureRefused(_, pump, channel) =>
+                    ComponentPumpCompletion::CaptureRefused(
+                        continuation.pending, pump, channel,
+                    ),
             }
         }
     };
@@ -247,6 +275,7 @@ pub(crate) unsafe fn run_hosted(
             ComponentPumpCompletion::FailedRetained(_, _) => (0, 7),
             ComponentPumpCompletion::Failed(_) => (0, 8),
             ComponentPumpCompletion::UserCallbackSuspended => (0, 9),
+            ComponentPumpCompletion::CaptureRefused(_, _, _) => (0, 10),
         };
         trace_nested_provider_outer(b"pump-return", resume.key,
             frame.owner.dispatch_id, next_wait, detail);
@@ -339,7 +368,8 @@ pub(crate) unsafe fn run_receive(
         return Some(boundary);
     };
     let pump_completion = match win32k_glue::resume_suspended_receive_component(pending, boundary) {
-        win32k_glue::ReceivePumpCompletion::Restored(completion) => completion,
+        restored @ win32k_glue::ReceivePumpCompletion::Restored(_) => restored,
+        refused @ win32k_glue::ReceivePumpCompletion::CaptureRefused(_, _, _) => refused,
         win32k_glue::ReceivePumpCompletion::Reparked(next) => {
             assert!(
                 next.yielded.replaces == Some(frame.key) && next.yielded.owner == frame.owner,
@@ -399,7 +429,14 @@ pub(crate) unsafe fn run_receive(
         }
     };
     let pump_completion = match pump_completion {
-        win32k_glue::ProviderWaitPumpCompletion::NestedSourceDeferred => return None,
+        win32k_glue::ReceivePumpCompletion::CaptureRefused(_, pump, channel) => {
+            ComponentPumpCompletion::CaptureRefused(continuation.pending, pump, channel)
+        }
+        win32k_glue::ReceivePumpCompletion::Restored(pump_completion) => match pump_completion {
+        win32k_glue::ProviderWaitPumpCompletion::NestedSourceDeferred => {
+            runtime::nested::trace_deferred_resume_owner(lane, frame.key, frame.owner);
+            return None;
+        }
         win32k_glue::ProviderWaitPumpCompletion::Completed(dispatch) => {
             ComponentPumpCompletion::Completed(dispatch)
         }
@@ -421,11 +458,16 @@ pub(crate) unsafe fn run_receive(
         win32k_glue::ProviderWaitPumpCompletion::Failed(status) => {
             ComponentPumpCompletion::Failed(status)
         }
+        win32k_glue::ProviderWaitPumpCompletion::CaptureRefused(_, pump, channel) => {
+            ComponentPumpCompletion::CaptureRefused(continuation.pending, pump, channel)
+        }
         win32k_glue::ProviderWaitPumpCompletion::RetainedFailure(pending, status) => {
             ComponentPumpCompletion::FailedRetained(
                 PendingComponentDispatch::Provider(pending), status,
             )
         }
+        },
+        _ => unreachable!("receive repark and deferral return before classification"),
     };
     let outcome = finish_hosted_resume(
         nt_handler,
@@ -534,6 +576,21 @@ unsafe fn finish_hosted_resume(
                 frame.owner,
                 Some(next),
                 status as u32,
+            );
+            return Some(ComponentSuspensionRuntimeOutcome::Terminal);
+        }
+        ComponentPumpCompletion::CaptureRefused(previous, pump, channel) => {
+            let refusal = pump.provider_wait_capture_refusal
+                .expect("capture refusal must retain its labelled Call observation");
+            let status = match refusal.reason {
+                spawn_hosts::ProviderWaitCaptureRefusalReason::BadBadge =>
+                    nt_process::STATUS_INVALID_PARAMETER,
+                spawn_hosts::ProviderWaitCaptureRefusalReason::MissingLanePage =>
+                    nt_process::STATUS_INVALID_HANDLE,
+            };
+            component_terminal::retain_capture_refused(
+                lane, reply_object, resume.key, frame.owner,
+                previous, pump, channel, status,
             );
             return Some(ComponentSuspensionRuntimeOutcome::Terminal);
         }

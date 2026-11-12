@@ -10,8 +10,8 @@ use nt_user_host::retained_owner_table::{
     RetainedOwnerTransitionError,
 };
 use nt_user_host::returned_pump_owner::{
-    ReturnedPumpError, ReturnedPumpKey, ReturnedPumpObservation, ReturnedPumpOwner,
-    ReturnedPumpPhase,
+    ReturnedPumpCaptureRefusal, ReturnedPumpError, ReturnedPumpKey, ReturnedPumpObservation,
+    ReturnedPumpOwner, ReturnedPumpPhase, ReturnedPumpReplies,
 };
 
 use crate::spawn_hosts::{PumpChannel, PumpResult};
@@ -74,6 +74,15 @@ pub(crate) enum ReturnDisposition {
     Quarantined(ReturnedPumpError),
 }
 
+/// Read-only evidence for a refused labelled Call. The ticket remains the authority; this
+/// receipt cannot release the stored pump, channel, or Reply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RetainedCaptureRefusal {
+    pub key: ReturnedPumpKey,
+    pub replies: ReturnedPumpReplies,
+    pub observed_badge: u64,
+}
+
 static BUSY: AtomicBool = AtomicBool::new(false);
 static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 static mut OWNERS: RetainedOwnerTable<ReturnedPumpKey, PumpOwner> =
@@ -104,8 +113,9 @@ fn with_owners<R>(f: impl FnOnce(&mut RetainedOwnerTable<ReturnedPumpKey, PumpOw
     f(unsafe { &mut *core::ptr::addr_of_mut!(OWNERS) })
 }
 
-/// Retain the source Work's exact physical continuation before entering its pump.
-pub(crate) unsafe fn begin_source_terminal(
+/// Retain any win32k dispatch's exact physical continuation before entering its pump.
+/// The source Work and ordinary hosted paths share this pre-entry owner.
+pub(crate) unsafe fn begin_pump(
     context: PumpContext,
     displaced_parent: Option<crate::nested_restore_owner::NestedRestoreOwnerTicket>,
 ) -> Result<PumpTicket, BeginError> {
@@ -164,10 +174,17 @@ pub(crate) unsafe fn record_return(
     // preserving the returned pump and both observed Reply numbers in the same row.
     let (observed, current_reply) = observation.unwrap_or((key, 0));
     let pump_reply = pump.reply_cap;
+    let refusal = pump.provider_wait_capture_refusal;
     with_owners(|owners| {
         let mut result = ReturnDisposition::Returned;
         let transitioned = owners.transition_held(ticket, |mut owner| {
-            match owner.record_return(observed, current_reply, pump_reply, pump) {
+            let observation = match refusal {
+                Some(refusal) => owner.record_capture_refusal(
+                    observed, current_reply, pump_reply, refusal.observed_badge, pump,
+                ),
+                None => owner.record_return(observed, current_reply, pump_reply, pump),
+            };
+            match observation {
                 ReturnedPumpObservation::Accepted => Ok(owner),
                 ReturnedPumpObservation::Quarantined(error) => {
                     result = ReturnDisposition::Quarantined(error);
@@ -182,6 +199,21 @@ pub(crate) unsafe fn record_return(
                 Err((ReturnError::Refused(error), offered)),
             Err(RetainedOwnerTransitionError::StaleTicket) => Err((ReturnError::StaleTicket, pump)),
         }
+    })
+}
+
+pub(crate) fn retained_capture_refusal(ticket: PumpTicket) -> Option<RetainedCaptureRefusal> {
+    with_owners(|owners| {
+        let owner = owners.get(ticket)?;
+        if owner.phase() != ReturnedPumpPhase::Quarantined {
+            return None;
+        }
+        let ReturnedPumpCaptureRefusal { observed_badge } = owner.capture_refusal()?;
+        Some(RetainedCaptureRefusal {
+            key: owner.key(),
+            replies: owner.replies()?,
+            observed_badge,
+        })
     })
 }
 
@@ -205,6 +237,7 @@ pub(crate) fn classify_source_terminal(
     with_owners(|owners| owners.transition_held(ticket, |mut owner| {
         let classified = owner.capture_or_quarantine(|_, pump| {
             (pump.completed
+                && pump.provider_wait_capture_refusal.is_none()
                 && !pump.callback_suspended && !pump.provider_wait_suspended()
                 && !pump.lpc_wait_suspended && pump.receive_yield().is_none()
                 && pump.root_ingress_yield().is_none() && pump.service_wait_yield.is_none()

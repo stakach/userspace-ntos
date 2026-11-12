@@ -432,6 +432,51 @@ fn trace_source_park(stage: &[u8]) {
     crate::print_str(b"\n");
 }
 
+/// Observe the exact owner at a native deferred-resume return without changing admission.
+pub(crate) unsafe fn trace_deferred_resume_owner(
+    lane: nt_component_suspension::LaneHandle,
+    key: nt_component_suspension::SuspensionKey,
+    owner: nt_component_suspension::SuspensionOwner,
+) {
+    let lanes = lanes();
+    let phase = lanes.frame(lane, key).ok().flatten()
+        .filter(|frame| frame.owner == owner)
+        .map(|frame| match &frame.phase {
+            nt_component_suspension::SuspensionPhase::Waiting => 1,
+            nt_component_suspension::SuspensionPhase::Selected { .. } => 2,
+            nt_component_suspension::SuspensionPhase::Resuming { .. } => 3,
+            nt_component_suspension::SuspensionPhase::ResumingChildParked { .. } => 4,
+            nt_component_suspension::SuspensionPhase::ResumingChildQuarantined { .. } => 5,
+            nt_component_suspension::SuspensionPhase::Cancelled { .. } => 6,
+            _ => 7,
+        }).unwrap_or(0);
+    let parents = &*core::ptr::addr_of!(PARENTS);
+    let total_parents = parents.iter().flatten().count();
+    let matching_parents = parents.iter().flatten().filter(|parent| {
+        parent.source_ioctl.as_ref().is_some_and(|source|
+            source.checkpoint.parent_key() == key
+                && source.checkpoint.parent_owner() == owner
+                && source.checkpoint.parent_dispatch().lane() == lane)
+    }).count();
+    let lane_phase = lanes.phase(lane).map_or(0, |phase| match phase {
+        nt_component_suspension::LanePhase::Running => 1,
+        nt_component_suspension::LanePhase::Suspended => 2,
+        nt_component_suspension::LanePhase::NestedExecution(_) => 3,
+        nt_component_suspension::LanePhase::Terminal => 4,
+        _ => 5,
+    });
+    crate::print_str(b"[deferred-resume-owner] lane/key/owner/run-lane/lane-phase/frame-phase/parent-count/exact-source-parents/source-retained=");
+    for value in [lane.index as u64, key.id, owner.dispatch_id,
+        lanes.running().map_or(u64::MAX, |running| running.index as u64),
+        lane_phase, phase,
+        total_parents as u64, matching_parents as u64,
+        u64::from(source_ioctl_parent_retained())] {
+        crate::print_str(b"/");
+        crate::print_hex_u64(value);
+    }
+    crate::print_str(b"\n");
+}
+
 /// Root ingress receives a move-only proof only when the exact park attempt has no effects.
 /// A retained or uncertain attempt never grants cancellation of its prepared child owner.
 pub(crate) unsafe fn park_current_for_root(admission: ExternalAdmissionKey) -> RootParkOutcome {

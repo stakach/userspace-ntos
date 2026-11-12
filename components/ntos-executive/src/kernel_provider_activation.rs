@@ -18,7 +18,7 @@ mod terminal;
 #[path = "kernel_provider_wait_work.rs"]
 mod wait_work;
 pub(super) use wait_work::{publish_bootstrap_waits, publish_runtime_waits};
-use bootstrap::{KernelJobCompletion, KernelJobInitialization, KernelJobRecipient};
+use bootstrap::{KernelJobCompletion, KernelJobInitialization, KernelJobRecipient, KernelResumeAuthority};
 
 struct PendingWin32kBootstrap {
     receipt: KernelProviderCompletionReceipt,
@@ -458,7 +458,16 @@ unsafe fn run_issued_kernel_job(
         activations.recipient_mut(caller)?.begin_initial(caller)
     })?;
     let result = spawn_hosts::component_pump(&channel);
-    observe_driver_entry_pump(&channel, &mut attempt, &result)?;
+    if result.provider_wait_capture_refusal.is_some() {
+        return Err(retain_driver_entry_capture_refusal(
+            caller, attempt, channel, result, None,
+        ));
+    }
+    if let Err(status) = observe_driver_entry_pump(&channel, &mut attempt, &result) {
+        return Err(retain_driver_entry_uncertain(
+            caller, attempt, channel, Some(result), None, status,
+        ));
+    }
     let result = receive_driver_entry_yields(&scope, caller, None, result)?;
     use nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome;
     let stop = (&*core::ptr::addr_of!(ACTIVATIONS))
@@ -517,20 +526,105 @@ unsafe fn receive_driver_entry_yields(
                 .recipient_mut(caller)?
                 .begin_receive_after_yield(caller)
         })?;
-        validate_driver_entry_execution(caller, capture, &receive_attempt)?;
+        if let Err(status) = validate_driver_entry_execution(caller, capture, &receive_attempt) {
+            return Err(retain_driver_entry_uncertain(
+                caller, receive_attempt, receiving, None,
+                capture.map(|capture| KernelResumeAuthority { capture, selection: None }),
+                status,
+            ));
+        }
         scope.service_irq_yield(receiving.shared_va);
         // Dedicated IRQ workers can perform nested IPC. Recheck authority after those effects,
         // without minting another attempt or permitting a failed entered continuation to replay.
-        validate_driver_entry_execution(caller, capture, &receive_attempt)?;
-        let receiving = (&*core::ptr::addr_of!(ACTIVATIONS))
-            .recipient(caller)?
-            .execution_channel(caller)?;
-        restore_ps_retirement_window(caller, &receiving)?;
-        result = spawn_hosts::component_pump_continue_receive_after_scheduler_service(
-            &receiving, &previous)?;
-        observe_driver_entry_pump(&receiving, &mut receive_attempt, &result)?;
+        if let Err(status) = validate_driver_entry_execution(caller, capture, &receive_attempt) {
+            return Err(retain_driver_entry_uncertain(
+                caller, receive_attempt, receiving, None,
+                capture.map(|capture| KernelResumeAuthority { capture, selection: None }),
+                status,
+            ));
+        }
+        let current = (&*core::ptr::addr_of!(ACTIVATIONS))
+            .recipient(caller).and_then(|recipient| recipient.execution_channel(caller));
+        let receiving = match current {
+            Ok(current) => current,
+            Err(status) => return Err(retain_driver_entry_uncertain(
+                caller, receive_attempt, receiving, None,
+                capture.map(|capture| KernelResumeAuthority { capture, selection: None }),
+                status,
+            )),
+        };
+        if let Err(status) = (&mut *core::ptr::addr_of_mut!(ACTIVATIONS))
+            .recipient_mut(caller)
+            .and_then(|recipient| recipient.rebind_reserved_reply(caller, &receiving))
+        {
+            return Err(retain_driver_entry_uncertain(
+                caller, receive_attempt, receiving, None,
+                capture.map(|capture| KernelResumeAuthority { capture, selection: None }),
+                status,
+            ));
+        }
+        if let Err(status) = restore_ps_retirement_window(caller, &receiving) {
+            return Err(retain_driver_entry_uncertain(
+                caller, receive_attempt, receiving, None,
+                capture.map(|capture| KernelResumeAuthority { capture, selection: None }),
+                status,
+            ));
+        }
+        result = match spawn_hosts::component_pump_continue_receive_after_scheduler_service(
+            &receiving, &previous)
+        {
+            Ok(result) => result,
+            Err(status) => return Err(retain_driver_entry_uncertain(
+                caller, receive_attempt, receiving, None,
+                capture.map(|capture| KernelResumeAuthority { capture, selection: None }),
+                status,
+            )),
+        };
+        if result.provider_wait_capture_refusal.is_some() {
+            return Err(retain_driver_entry_capture_refusal(
+                caller, receive_attempt, receiving, result,
+                capture.map(|capture| KernelResumeAuthority { capture, selection: None }),
+            ));
+        }
+        if let Err(status) = observe_driver_entry_pump(&receiving, &mut receive_attempt, &result) {
+            return Err(retain_driver_entry_uncertain(
+                caller, receive_attempt, receiving, Some(result),
+                capture.map(|capture| KernelResumeAuthority { capture, selection: None }),
+                status,
+            ));
+        }
     }
     Ok(result)
+}
+
+/// The recipient's inline row was reserved before this exact native pump. Store the refused
+/// Call and its non-copyable attempt before any route authentication or result classification;
+/// an invalid badge cannot turn the live Reply into an ordinary provider-wait observation.
+unsafe fn retain_driver_entry_capture_refusal(
+    caller: KernelProviderCaller,
+    attempt: KernelProviderPumpAttempt,
+    channel: spawn_hosts::PumpChannel,
+    result: spawn_hosts::PumpResult,
+    resume: Option<KernelResumeAuthority>,
+) -> u32 {
+    (&mut *core::ptr::addr_of_mut!(ACTIVATIONS))
+        .recipient_mut(caller)
+        .expect("entered kernel activation must retain its pre-entry refusal row")
+        .retain_capture_refusal(caller, attempt, channel, result, resume)
+}
+
+unsafe fn retain_driver_entry_uncertain(
+    caller: KernelProviderCaller,
+    attempt: KernelProviderPumpAttempt,
+    channel: spawn_hosts::PumpChannel,
+    result: Option<spawn_hosts::PumpResult>,
+    resume: Option<KernelResumeAuthority>,
+    status: u32,
+) -> u32 {
+    (&mut *core::ptr::addr_of_mut!(ACTIVATIONS))
+        .recipient_mut(caller)
+        .expect("entered kernel activation must retain its uncertain pump row")
+        .retain_uncertain_pump(caller, attempt, channel, result, resume, status)
 }
 
 pub(super) unsafe fn service_ps(
@@ -783,7 +877,9 @@ unsafe fn observe_driver_entry_pump(
                 .retain_provider_wait(request, capture)
         })?;
     }
-    Ok(())
+    (&mut *core::ptr::addr_of_mut!(ACTIVATIONS))
+        .recipient_mut(caller)?
+        .finish_observation(caller)
 }
 
 /// Retry local completion recording from retained evidence only. This never repumps a stopped

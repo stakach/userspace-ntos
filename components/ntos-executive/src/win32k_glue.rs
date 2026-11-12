@@ -200,6 +200,42 @@ enum Win32kStackAlias {
 
 static mut WIN32K_PHYSICAL_LANES: Option<Vec<Win32kPhysicalLane>> = None;
 static mut WIN32K_PENDING_PRIMARY: Option<crate::spawn_hosts::SpawnedComponent> = None;
+// A refused initial pump keeps its exact returned owner and Reply on this physical lane.
+// A later dispatch cannot enter that lane while the slot remains occupied.
+static mut WIN32K_RETAINED_INITIAL_PUMPS:
+    [Option<crate::win32k_pump_owner::SourcePumpRetained>;
+        win32k_subsystem::WIN32K_LANE_CAPACITY + 1] =
+    [const { None }; win32k_subsystem::WIN32K_LANE_CAPACITY + 1];
+
+#[derive(Clone, Copy)]
+struct CallbackResumeClaim {
+    ordinal: usize,
+    key: nt_user_host::callback_resume_owner::CallbackResumeKey,
+    frame: nt_user_callback::ActiveCallbackFrame,
+}
+
+/// A pure row refusal after physical pump return still needs a reserved place for the offered
+/// result. This companion slot has the same stable physical ordinal and is checked before entry.
+struct CallbackResumeOffered {
+    key: nt_user_host::callback_resume_owner::CallbackResumeKey,
+    frame: nt_user_callback::ActiveCallbackFrame,
+    channel: crate::spawn_hosts::PumpChannel,
+    pump: crate::spawn_hosts::PumpResult,
+    current_reply_cap: u64,
+    provider_reply_cap: u64,
+    outer_reply_cap: Option<u64>,
+}
+
+static mut CALLBACK_RESUME_REFUSALS:
+    nt_user_host::callback_resume_owner::CallbackResumeBank<
+        nt_user_callback::ActiveCallbackFrame,
+        crate::spawn_hosts::PumpChannel,
+        crate::spawn_hosts::PumpResult,
+        { win32k_subsystem::WIN32K_LANE_CAPACITY + 1 },
+    > = nt_user_host::callback_resume_owner::CallbackResumeBank::new();
+static mut CALLBACK_RESUME_OFFERED:
+    [Option<CallbackResumeOffered>; win32k_subsystem::WIN32K_LANE_CAPACITY + 1] =
+    [const { None }; win32k_subsystem::WIN32K_LANE_CAPACITY + 1];
 static WIN32K_LANE_STARTUP_ACTIVE: AtomicU64 = AtomicU64::new(0);
 const WIN32K_STARTUP_RESTORE_RETRY_100NS: u64 = 1_600_000;
 static WIN32K_STARTUP_RESTORE_WAKE: CoalescedRetryWake = CoalescedRetryWake::new();
@@ -1785,6 +1821,13 @@ pub(crate) enum CompletedUserCallback {
         pending: PendingServiceWaitDispatch,
         callback_token: u64,
         callback_context: StagedUserCallbackContext,
+    },
+    /// The physical provider Call and popped callback frame are retained by the lane-local
+    /// callback resume owner. This marker is not authority to release either Reply.
+    CaptureRefused {
+        lane: nt_component_suspension::LaneHandle,
+        callback_token: u64,
+        provider_reply_cap: u64,
     },
 }
 
@@ -4766,6 +4809,7 @@ unsafe fn resume_suspended_user_callback_component(
     client: crate::spawn_hosts::UserCallbackClient,
     callback_token: u64,
     allow_receive_yield: bool,
+    claim: CallbackResumeClaim,
 ) -> crate::spawn_hosts::PumpResult {
     if client.pi != request.client_pi
         || client.tid != request.client_tid
@@ -4835,6 +4879,10 @@ unsafe fn resume_suspended_user_callback_component(
         );
     }
     let mut pr = crate::spawn_hosts::component_pump_resume_user_callback(&channel);
+    if pr.provider_wait_capture_refusal.is_some() {
+        let _ = retain_callback_resume_refusal(claim, channel, pr);
+        return pr;
+    }
     pr.dispatch_return = capture_win32k_dispatch_return(
         pr.dispatch_return_receipt, request.dispatch_id, dispatch.ssn, pr.result, pr.completed,
     );
@@ -4863,7 +4911,8 @@ unsafe fn resume_suspended_user_callback_component(
         false
     };
     if !transition_ok {
-        panic!("callback resume violated execution-lane ownership");
+        let _ = retain_callback_resume_refusal(claim, channel, pr);
+        return pr;
     }
     pr
 }
@@ -4978,6 +5027,12 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         pending.dispatch,
     );
     let mut pump = crate::spawn_hosts::component_pump_resume_provider_wait(&channel);
+    if pump.provider_wait_capture_refusal.is_some() {
+        core::ptr::write(
+            core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous_dispatch,
+        );
+        return ProviderWaitPumpCompletion::CaptureRefused(pending, pump, channel);
+    }
     pump.dispatch_return = capture_win32k_dispatch_return(
         pump.dispatch_return_receipt, pending.dispatch.dispatch_id, pending.dispatch.ssn,
         pump.result, pump.completed,
@@ -5232,6 +5287,12 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
         pending.dispatch,
     );
     let mut pump = crate::spawn_hosts::component_pump_resume_lpc_wait(&channel);
+    if pump.provider_wait_capture_refusal.is_some() {
+        core::ptr::write(
+            core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous_dispatch,
+        );
+        return LpcWaitPumpCompletion::CaptureRefused(pending, pump, channel);
+    }
     pump.dispatch_return = capture_win32k_dispatch_return(
         pump.dispatch_return_receipt, pending.dispatch.dispatch_id, pending.dispatch.ssn,
         pump.result, pump.completed,
@@ -5366,7 +5427,7 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
     let mut cancelled_count = 0u64;
     let mut last_status = STATUS_UNSUCCESSFUL;
     while cancelled_count < nt_user_callback::MAX_CONTINUATION_DEPTH as u64 {
-        let (request, dispatch_context, client, callback_token) = {
+        let (request, dispatch_context, client, callback_token, claim) = {
             let active_frame = {
                 let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
                 active.top().copied()
@@ -5392,6 +5453,9 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
             };
             let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
             let dispatch_context = *active_frame.dispatch_context();
+            let Some(claim) = reserve_callback_resume(active_frame) else {
+                return (STATUS_UNSUCCESSFUL, false);
+            };
             write_callback_failure_reply(request, STATUS_UNSUCCESSFUL);
             let unwind_ok = unwind_controlled_callback(request);
             let cancelled = {
@@ -5402,12 +5466,16 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
                 abort_controlled_user_callbacks();
                 return (STATUS_UNSUCCESSFUL, false);
             };
+            if !transfer_popped_callback_resume(claim, cancelled_frame) {
+                abort_controlled_user_callbacks();
+                return (STATUS_UNSUCCESSFUL, false);
+            }
             restore_client_callback_window(cancelled_frame);
             if !unwind_ok {
                 abort_controlled_user_callbacks();
                 return (STATUS_UNSUCCESSFUL, false);
             }
-            (request, dispatch_context, client, cancelled_frame.external_token())
+            (request, dispatch_context, client, cancelled_frame.external_token(), claim)
         };
 
         cancelled_count += 1;
@@ -5417,11 +5485,17 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
             dispatch_context,
         );
-        let result = resume_suspended_user_callback_component(request, client, callback_token, false);
+        let result = resume_suspended_user_callback_component(
+            request, client, callback_token, false, claim,
+        );
         core::ptr::write(
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
             previous_dispatch,
         );
+        if callback_resume_refusal_retained(claim) || result.provider_wait_capture_refusal.is_some() {
+            return (STATUS_UNSUCCESSFUL, false);
+        }
+        if !finish_callback_resume(claim) { return (STATUS_UNSUCCESSFUL, false); }
         last_status = result.status;
 
         if result.callback_suspended {
@@ -5605,6 +5679,10 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
         };
         let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
         let dispatch_context = *frame.dispatch_context();
+        let Some(claim) = reserve_callback_resume(frame) else {
+            print_str(b"[user-callback] dead-client resume owner busy; frame retained\n");
+            return unwound;
+        };
         // (1) Fail the withheld KeUserModeCallback.
         write_callback_failure_reply(request, STATUS_THREAD_IS_TERMINATING);
         // (2) Unwind the callback continuation + pop the active frame (same order as a real return).
@@ -5627,6 +5705,10 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
             abort_controlled_user_callbacks();
             break;
         };
+        if !transfer_popped_callback_resume(claim, popped) {
+            print_str(b"[user-callback] dead-client popped frame retained for recovery\n");
+            return unwound;
+        }
         restore_client_callback_window(popped);
         // (3) Resume win32k with the failure and let it unwind its own dispatch.
         let previous_dispatch =
@@ -5635,12 +5717,18 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
             dispatch_context,
         );
-        let component = resume_suspended_user_callback_component(request, client, popped.external_token(), false);
+        let component = resume_suspended_user_callback_component(
+            request, client, popped.external_token(), false, claim,
+        );
         core::ptr::write(
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
             previous_dispatch,
         );
         unwound += 1;
+        if callback_resume_refusal_retained(claim) || component.provider_wait_capture_refusal.is_some() {
+            return unwound;
+        }
+        if !finish_callback_resume(claim) { return unwound; }
         if !component.callback_suspended {
             release_dispatch_output_stage(dispatch_context);
         }
@@ -5970,6 +6058,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         abort_controlled_user_callbacks();
         return None;
     }
+    let claim = reserve_callback_resume(active_frame)?;
     // The flush can itself enter win32k, and win32k reuses the same shared callback page for every
     // nested dispatch. Re-publish the reply after the flush so the parked `KeUserModeCallback`
     // continuation consumes the result for THIS callback, not the last nested dispatch's header.
@@ -6010,6 +6099,9 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         abort_controlled_user_callbacks();
         return None;
     };
+    if !transfer_popped_callback_resume(claim, completed_frame) {
+        return None;
+    }
     restore_client_callback_window(completed_frame);
     let dispatch_context = *completed_frame.dispatch_context();
     if dispatch_context.dispatch_id != request.dispatch_id {
@@ -6034,12 +6126,20 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         .top_for(&identity)
         .is_none();
     let component = resume_suspended_user_callback_component(
-        request, completed_client, completed_frame.external_token(), allow_receive_yield,
+        request, completed_client, completed_frame.external_token(), allow_receive_yield, claim,
     );
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
         previous_dispatch,
     );
+    if callback_resume_refusal_retained(claim) || component.provider_wait_capture_refusal.is_some() {
+        return Some(CompletedUserCallback::CaptureRefused {
+            lane: claim.key.lane,
+            callback_token: claim.key.callback_token,
+            provider_reply_cap: component.reply_cap,
+        });
+    }
+    if !finish_callback_resume(claim) { return None; }
     if component.callback_suspended {
         let chained_client = completed_context;
         if callback_context_tcb(chained_client).is_none() {
@@ -7133,6 +7233,215 @@ unsafe fn quarantine_source_terminal_route(channel: &crate::spawn_hosts::PumpCha
     }
 }
 
+unsafe fn physical_win32k_lane_ordinal(
+    lane: nt_component_suspension::LaneHandle,
+) -> Option<usize> {
+    let physical = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES)).as_ref()?
+        .iter().find(|physical| physical.handle == Some(lane))?;
+    let ordinal = usize::try_from(physical.worker_ordinal.unwrap_or(0)).ok()?;
+    if ordinal >= win32k_subsystem::WIN32K_LANE_CAPACITY + 1 { return None; }
+    Some(ordinal)
+}
+
+unsafe fn retained_initial_pump_slot(
+    lane: nt_component_suspension::LaneHandle,
+) -> Option<*mut Option<crate::win32k_pump_owner::SourcePumpRetained>> {
+    let ordinal = physical_win32k_lane_ordinal(lane)?;
+    Some(core::ptr::addr_of_mut!(WIN32K_RETAINED_INITIAL_PUMPS)
+        .cast::<Option<crate::win32k_pump_owner::SourcePumpRetained>>()
+        .add(ordinal))
+}
+
+unsafe fn reserve_callback_resume(
+    frame: nt_user_callback::ActiveCallbackFrame,
+) -> Option<CallbackResumeClaim> {
+    let lane = frame.dispatch_context().lane;
+    let ordinal = physical_win32k_lane_ordinal(lane)?;
+    let callback_token = frame.external_token();
+    let key = nt_user_host::callback_resume_owner::CallbackResumeKey {
+        lane, dispatch_id: frame.dispatch_context().dispatch_id, callback_token,
+    };
+    let offered = core::ptr::addr_of!(CALLBACK_RESUME_OFFERED)
+        .cast::<Option<CallbackResumeOffered>>().add(ordinal);
+    if (*offered).is_some() { return None; }
+    (&mut *core::ptr::addr_of_mut!(CALLBACK_RESUME_REFUSALS))
+        .reserve(ordinal, key, frame).ok()?;
+    Some(CallbackResumeClaim { ordinal, key, frame })
+}
+
+unsafe fn transfer_popped_callback_resume(
+    claim: CallbackResumeClaim,
+    frame: nt_user_callback::ActiveCallbackFrame,
+) -> bool {
+    (&mut *core::ptr::addr_of_mut!(CALLBACK_RESUME_REFUSALS))
+        .accept_pop(claim.ordinal, claim.key, frame).is_ok()
+}
+
+unsafe fn retain_callback_resume_refusal(
+    claim: CallbackResumeClaim,
+    channel: crate::spawn_hosts::PumpChannel,
+    pump: crate::spawn_hosts::PumpResult,
+) -> bool {
+    let current_reply_cap = channel.ingress_route.and_then(|route|
+        crate::spawn_hosts::shared_ingress::owner::runtime::current_reply(route).ok()
+    ).unwrap_or(0);
+    let retained = (&mut *core::ptr::addr_of_mut!(CALLBACK_RESUME_REFUSALS))
+        .retain_refusal(claim.ordinal, claim.key, channel, pump, pump.reply_cap).is_ok();
+    let mut offered_retained = false;
+    if !retained {
+        let slot = core::ptr::addr_of_mut!(CALLBACK_RESUME_OFFERED)
+            .cast::<Option<CallbackResumeOffered>>().add(claim.ordinal);
+        if (*slot).is_none() {
+            *slot = Some(CallbackResumeOffered {
+                key: claim.key, frame: claim.frame, channel, pump,
+                current_reply_cap, provider_reply_cap: pump.reply_cap,
+                outer_reply_cap: None,
+            });
+            offered_retained = true;
+        }
+    }
+    quarantine_source_terminal_route(&channel);
+    retained || offered_retained
+}
+
+unsafe fn callback_resume_refusal_retained(claim: CallbackResumeClaim) -> bool {
+    use nt_user_host::callback_resume_owner::CallbackResumePhase;
+    let bank_retained = (&*core::ptr::addr_of!(CALLBACK_RESUME_REFUSALS))
+        .get(claim.ordinal).is_some_and(|row|
+            row.key() == claim.key && row.phase() == CallbackResumePhase::Refused
+                && row.channel().is_some() && row.pump().is_some());
+    bank_retained || (*core::ptr::addr_of!(CALLBACK_RESUME_OFFERED)
+        .cast::<Option<CallbackResumeOffered>>().add(claim.ordinal))
+        .as_ref().is_some_and(|offered| offered.key == claim.key
+            && offered.frame == claim.frame
+            && offered.provider_reply_cap == offered.pump.reply_cap
+            && offered.channel.tcb != 0)
+}
+
+/// The service loop owns this distinct NtCallbackReturn Reply until the exact refused
+/// callback row accepts it. A duplicate or foreign attachment leaves both Replies retained.
+pub(crate) unsafe fn retain_callback_outer_reply(
+    lane: nt_component_suspension::LaneHandle,
+    callback_token: u64,
+    outer_reply_cap: u64,
+) -> bool {
+    if outer_reply_cap == 0 { return false; }
+    let Some(ordinal) = physical_win32k_lane_ordinal(lane) else { return false; };
+    let offered = core::ptr::addr_of_mut!(CALLBACK_RESUME_OFFERED)
+        .cast::<Option<CallbackResumeOffered>>().add(ordinal);
+    if let Some(offered) = (*offered).as_mut() {
+        if offered.key.lane != lane || offered.key.callback_token != callback_token
+            || offered.outer_reply_cap.is_some()
+        { return false; }
+        offered.outer_reply_cap = Some(outer_reply_cap);
+        return true;
+    }
+    let bank = &mut *core::ptr::addr_of_mut!(CALLBACK_RESUME_REFUSALS);
+    let Some(row) = bank.get(ordinal) else { return false; };
+    let key = row.key();
+    if key.lane != lane || key.callback_token != callback_token { return false; }
+    bank.attach_outer_reply(ordinal, key, outer_reply_cap).is_ok()
+}
+
+unsafe fn finish_callback_resume(claim: CallbackResumeClaim) -> bool {
+    if (*core::ptr::addr_of!(CALLBACK_RESUME_OFFERED)
+        .cast::<Option<CallbackResumeOffered>>().add(claim.ordinal)).is_some()
+    { return false; }
+    (&mut *core::ptr::addr_of_mut!(CALLBACK_RESUME_REFUSALS))
+        .release_normal(claim.ordinal, claim.key).is_ok()
+}
+
+unsafe fn retain_initial_pump_failure(
+    slot: *mut Option<crate::win32k_pump_owner::SourcePumpRetained>,
+    retained: crate::win32k_pump_owner::SourcePumpRetained,
+    channel: &crate::spawn_hosts::PumpChannel,
+    displaced_parent: Option<crate::nested_restore_owner::NestedRestoreOwnerTicket>,
+) {
+    // The caller checked this physical slot before starting the pump. A refusal fences the
+    // lane and leaves the ticket here as an addressable handle to its returned owner row.
+    *slot = Some(retained);
+    quarantine_source_terminal_route(channel);
+    if let Some(parent) = displaced_parent {
+        let _ = crate::nested_restore_owner::quarantine_displaced_child(parent);
+    }
+}
+
+unsafe fn transfer_initial_standard_pump(
+    ticket: crate::win32k_pump_owner::PumpTicket,
+    context: crate::win32k_pump_owner::PumpContext,
+    displaced_parent: Option<crate::nested_restore_owner::NestedRestoreOwnerTicket>,
+    pump: crate::spawn_hosts::PumpResult,
+) -> Result<crate::spawn_hosts::PumpResult, crate::win32k_pump_owner::SourcePumpRetained> {
+    use crate::win32k_pump_owner::{self, ReturnDisposition, SourcePumpRetained};
+    match win32k_pump_owner::record_return(ticket, pump) {
+        Ok(ReturnDisposition::Quarantined(_)) => Err(SourcePumpRetained::Ticket(ticket)),
+        Err((_, offered)) => {
+            let current_reply = context.channel.ingress_route.and_then(|route|
+                crate::spawn_hosts::shared_ingress::owner::runtime::current_reply(route).ok()
+            ).unwrap_or(0);
+            Err(SourcePumpRetained::Offered {
+                context, displaced_parent, pump: offered, current_reply,
+            })
+        }
+        Ok(ReturnDisposition::Returned) => {
+            let Some(owner) = win32k_pump_owner::take_returned(ticket) else {
+                let _ = win32k_pump_owner::quarantine_capture(ticket);
+                return Err(SourcePumpRetained::Ticket(ticket));
+            };
+            let owned_context = owner.continuation().context();
+            let owned_reply = owner.replies().map(|replies| replies.current);
+            if owned_context.channel.tcb != context.channel.tcb
+                || owned_context.channel.fault_ep != context.channel.fault_ep
+                || owned_context.channel.reply_cap != context.channel.reply_cap
+                || owned_reply == Some(0)
+                || owner.pump().map(|pump| pump.reply_cap) != owned_reply
+            {
+                let offered = owner.pump().copied();
+                let current_reply = owned_reply.unwrap_or(0);
+                return match win32k_pump_owner::restore(ticket, owner) {
+                    Ok(()) => {
+                        let _ = win32k_pump_owner::quarantine_capture(ticket);
+                        Err(SourcePumpRetained::Ticket(ticket))
+                    }
+                    Err(_) => Err(SourcePumpRetained::Offered {
+                        context, displaced_parent,
+                        pump: offered.unwrap_or(pump), current_reply,
+                    }),
+                };
+            }
+            let (continuation, returned, reply) = match owner.into_returned(ticket.key()) {
+                Ok(returned) => returned,
+                Err((_, owner)) => {
+                    let Some(offered) = owner.pump().copied() else {
+                        let _ = win32k_pump_owner::restore(ticket, owner);
+                        return Err(SourcePumpRetained::Ticket(ticket));
+                    };
+                    let current_reply = owner.replies().map(|replies| replies.current).unwrap_or(0);
+                    return match win32k_pump_owner::restore(ticket, owner) {
+                        Ok(()) => Err(SourcePumpRetained::Ticket(ticket)),
+                        Err(_) => Err(SourcePumpRetained::Offered {
+                            context, displaced_parent, pump: offered, current_reply,
+                        }),
+                    };
+                }
+            };
+            if continuation.context().channel.reply_cap != context.channel.reply_cap
+                || returned.reply_cap != reply
+            {
+                return Err(SourcePumpRetained::Offered {
+                    context, displaced_parent, pump: returned, current_reply: reply,
+                });
+            }
+            if win32k_pump_owner::finish_taken(ticket).is_err() {
+                return Err(SourcePumpRetained::Offered {
+                    context, displaced_parent, pump: returned, current_reply: reply,
+                });
+            }
+            Ok(returned)
+        }
+    }
+}
+
 /// Like [`win32k_dispatch`] but carries the win64 stack-argument source for win32k SSNs. Real client
 /// syscalls pass `caller_sp`, and the win32k component reads exactly the provider-required tail
 /// from the attached client stack. Executive-originated calls pass explicit `stack_args`, which are
@@ -7859,11 +8168,47 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         };
         owner.is_valid().then_some(owner)
     });
+    let standard_slot = if matches!(&mode, DispatchMode::Standard) {
+        let Some(slot) = retained_initial_pump_slot(lane) else {
+            quarantine_source_terminal_route(&ch);
+            core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous_dispatch);
+            return (nt_process::STATUS_INVALID_HANDLE as u64, false).into();
+        };
+        if (*slot).is_some() {
+            quarantine_source_terminal_route(&ch);
+            core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous_dispatch);
+            return (nt_process::STATUS_INVALID_HANDLE as u64, false).into();
+        }
+        Some(slot)
+    } else { None };
+    let mut standard_claim = None;
     let mut source_claim = match &mut mode {
-        DispatchMode::Standard => None,
+        DispatchMode::Standard => {
+            let Some(slot) = standard_slot else {
+                quarantine_source_terminal_route(&ch);
+                core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous_dispatch);
+                return (nt_process::STATUS_INVALID_HANDLE as u64, false).into();
+            };
+            let context = crate::win32k_pump_owner::PumpContext { channel: ch, dispatch, client };
+            match crate::win32k_pump_owner::begin_pump(context, displaced_parent) {
+                Ok(ticket) => standard_claim = Some((ticket, context, slot)),
+                Err(_) => {
+                    retain_initial_pump_failure(
+                        slot,
+                        crate::win32k_pump_owner::SourcePumpRetained::PreEntry {
+                            context, displaced_parent,
+                        },
+                        &ch, displaced_parent,
+                    );
+                    core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous_dispatch);
+                    return (nt_process::STATUS_UNSUCCESSFUL as u64, false).into();
+                }
+            }
+            None
+        }
         DispatchMode::Source(out) => {
             let context = crate::win32k_pump_owner::PumpContext { channel: ch, dispatch, client };
-            match crate::win32k_pump_owner::begin_source_terminal(context, displaced_parent) {
+            match crate::win32k_pump_owner::begin_pump(context, displaced_parent) {
                 Ok(ticket) => Some(SourceReturnClaim { ticket, context, out: &mut **out }),
                 Err(_) => {
                     quarantine_source_terminal_route(&ch);
@@ -7880,6 +8225,18 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         }
     };
     let mut pr = crate::spawn_hosts::component_pump(&ch);
+    if let Some((ticket, context, slot)) = standard_claim {
+        pr = match transfer_initial_standard_pump(ticket, context, displaced_parent, pr) {
+            Ok(returned) => returned,
+            Err(retained) => {
+                retain_initial_pump_failure(
+                    slot, retained, &ch, displaced_parent,
+                );
+                core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous_dispatch);
+                return (nt_process::STATUS_UNSUCCESSFUL as u64, false).into();
+            }
+        };
+    }
     if let Some(claim) = source_claim.as_mut() {
         let recorded = crate::win32k_pump_owner::record_return(claim.ticket, pr);
         match recorded {

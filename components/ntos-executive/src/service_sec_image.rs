@@ -1768,6 +1768,7 @@ unsafe fn lpc_component_reply_commit_drain(
 enum ComponentPumpCompletion {
     Completed(win32k_glue::CompletedWin32kDispatch),
     Reparked(PendingComponentDispatch),
+    CaptureRefused(PendingComponentDispatch, spawn_hosts::PumpResult, spawn_hosts::PumpChannel),
     UserCallbackSuspended,
     FailedRetained(PendingComponentDispatch, i32),
     Failed(i32),
@@ -3349,7 +3350,7 @@ unsafe fn drain_deferred_user_callback_returns(
         if let Some(completion) = completion {
             let completion_pi = deferred.pi as usize;
             effects_ok = completion_pi < MAX_PI;
-            if effects_ok {
+            if effects_ok && !matches!(completion, win32k_glue::CompletedUserCallback::CaptureRefused { .. }) {
                 effects_ok = sync_completed_user_callback_win32k_context(
                     nt_handler,
                     completion_pi,
@@ -3357,6 +3358,15 @@ unsafe fn drain_deferred_user_callback_returns(
                 );
             }
             match completion {
+                win32k_glue::CompletedUserCallback::CaptureRefused {
+                    lane, callback_token, provider_reply_cap,
+                } => {
+                    let _ = provider_reply_cap; // The exact provider Reply, including zero, is retained as evidence.
+                    assert!(win32k_glue::retain_callback_outer_reply(
+                        lane, callback_token, deferred.reply_cap,
+                    ), "refused callback lost its two exact Reply owners");
+                    retained_reply = true;
+                }
                 win32k_glue::CompletedUserCallback::Completed { outer_dispatch, callback_context } => {
                     staged_context = Some(callback_context);
                     if let Some(dispatch) = outer_dispatch {
@@ -14760,7 +14770,16 @@ pub(crate) unsafe fn service_sec_image(
                         continue;
                     }
                     win32k_glue::UserCallbackReturnReadiness::Ready => {
-                        if let Some(completion) = win32k_glue::complete_controlled_user_callback(
+                        let Some(callback_reply_reservation) =
+                            root_reply_park::RootReplyReservation::before_native()
+                        else {
+                            let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            reply_parked_syscall(reply_main, nt_process::STATUS_INSUFFICIENT_RESOURCES as u64);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, reply_main);
+                            badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                            continue;
+                        };
+                        let callback_completion = win32k_glue::complete_controlled_user_callback(
                             pi as u32,
                             badge,
                             current_tid,
@@ -14770,7 +14789,36 @@ pub(crate) unsafe fn service_sec_image(
                             resume_ip,
                             sp,
                             flags,
-                        ) {
+                        );
+                        if let Some(completion) = callback_completion {
+                            if let win32k_glue::CompletedUserCallback::CaptureRefused {
+                                lane, callback_token, provider_reply_cap,
+                            } = completion {
+                                let _ = provider_reply_cap; // The provider owner records an uncertain zero Reply.
+                                assert!(win32k_glue::retain_callback_outer_reply(
+                                    lane, callback_token, REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                                ), "refused callback lost its two exact Reply owners");
+                                assert!(callback_reply_reservation.commit(),
+                                    "reserved callback Reply replacement lost its exact lease");
+                                procs[pi].faults = faults;
+                                procs[pi].first = first;
+                                procs[pi].ntfaults = ntfaults;
+                                pfilled[pi] = *filled_pages;
+                                let _ = finalize_service_loop_state(&mut nt_handler);
+                                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                                let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                                badge = nb;
+                                mi = nmi;
+                                m0 = nm0;
+                                m1 = nm1;
+                                m2 = nm2;
+                                m3 = nm3;
+                                continue;
+                            }
+                        }
+                        assert!(callback_reply_reservation.cancel_no_effects(),
+                            "ordinary callback return lost its unused Reply reservation");
+                        if let Some(completion) = callback_completion {
                             if !sync_completed_user_callback_win32k_context(
                                 &mut nt_handler,
                                 pi,
@@ -14782,6 +14830,9 @@ pub(crate) unsafe fn service_sec_image(
                                 panic!("failed callback context publication retains its bound Reply");
                             }
                             let staged_context = match completion {
+                                win32k_glue::CompletedUserCallback::CaptureRefused { .. } => {
+                                    unreachable!("refused callback returns before context classification")
+                                }
                                 win32k_glue::CompletedUserCallback::Completed {
                                     outer_dispatch,
                                     callback_context,

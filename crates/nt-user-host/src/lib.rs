@@ -34,6 +34,7 @@ pub mod durable_context_lease;
 #[cfg(test)]
 mod durable_context_lease_tests;
 pub mod returned_pump_owner;
+pub mod callback_resume_owner;
 pub mod win32k_dispatch_outcome;
 #[cfg(test)]
 mod win32k_dispatch_outcome_tests;

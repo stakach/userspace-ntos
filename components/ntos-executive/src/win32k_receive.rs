@@ -113,6 +113,7 @@ pub(crate) enum ReceivePumpCompletion {
     Restored(ProviderWaitPumpCompletion),
     Reparked(PendingReceiveDispatch),
     ServiceReparked(PendingServiceWaitDispatch),
+    CaptureRefused(PendingReceiveDispatch, crate::spawn_hosts::PumpResult, crate::spawn_hosts::PumpChannel),
     Deferred(runtime::ReceiveSettlementBoundary),
 }
 
@@ -120,6 +121,7 @@ pub(crate) enum ServiceWaitPumpCompletion {
     Restored(ProviderWaitPumpCompletion),
     ServiceReparked(PendingServiceWaitDispatch),
     ReceiveReparked(PendingReceiveDispatch),
+    CaptureRefused(PendingServiceWaitDispatch, crate::spawn_hosts::PumpResult, crate::spawn_hosts::PumpChannel),
 }
 
 #[derive(Clone, Copy)]
@@ -128,6 +130,7 @@ pub(crate) enum RootMaintenancePumpCompletion {
     ServiceReparked(PendingServiceWaitDispatch),
     ReceiveReparked(PendingReceiveDispatch),
     MaintenanceReparked(PendingRootMaintenanceDispatch),
+    CaptureRefused(PendingRootMaintenanceDispatch, crate::spawn_hosts::PumpResult, crate::spawn_hosts::PumpChannel),
     RetainedFailure(u32),
 }
 
@@ -164,6 +167,10 @@ pub(crate) unsafe fn settle_nested_restore_result(
 ) -> NestedRestorePumpCompletion {
     let mut pump = pending.snapshot.pump;
     let snapshot = pending.snapshot;
+    if pump.provider_wait_capture_refusal.is_some() {
+        // The nested owner still retains the complete returned snapshot and bound Reply.
+        return NestedRestorePumpCompletion::RetainedFailure(nt_process::STATUS_INVALID_PARAMETER);
+    }
     if pump.nested_restore_yield.is_some() || pump.nested_restore_quarantined.is_some() {
         let mut next = pending;
         next.snapshot.shared_resume = snapshot.shared_resume;
@@ -984,6 +991,10 @@ pub(crate) unsafe fn resume_suspended_root_maintenance_component(
         },
     };
     let reply_cap = pump.reply_cap;
+    if pump.provider_wait_capture_refusal.is_some() {
+        return RootMaintenancePumpReturn { reply_cap, completion:
+            RootMaintenancePumpCompletion::CaptureRefused(pending, pump, channel) };
+    }
     if let Some(yielded) = pump.maintenance_yield {
         return RootMaintenancePumpReturn { reply_cap, completion:
             RootMaintenancePumpCompletion::MaintenanceReparked(PendingRootMaintenanceDispatch {
@@ -1034,6 +1045,9 @@ unsafe fn classify_returned_win32k_pump(
     snapshot: SuspendedPumpSnapshot,
     mut pump: crate::spawn_hosts::PumpResult,
 ) -> Result<ProviderWaitPumpCompletion, u32> {
+    if pump.provider_wait_capture_refusal.is_some() {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
     pump.dispatch_return = capture_win32k_dispatch_return(
         pump.dispatch_return_receipt,
         snapshot.dispatch.dispatch_id,
@@ -1079,7 +1093,8 @@ pub(crate) unsafe fn classify_root_ingress_unwind_result(
     snapshot: SuspendedPumpSnapshot,
     pump: crate::spawn_hosts::PumpResult,
 ) -> Result<RootIngressUnwindPumpCompletion, u32> {
-    if pump.root_ingress_yield().is_some() || pump.nested_restore_yield.is_some()
+    if pump.provider_wait_capture_refusal.is_some()
+        || pump.root_ingress_yield().is_some() || pump.nested_restore_yield.is_some()
         || pump.nested_restore_quarantined.is_some() || pump.scheduler_yielded
     {
         return Err(nt_process::STATUS_INVALID_PARAMETER);
@@ -1193,6 +1208,9 @@ pub(crate) unsafe fn resume_suspended_receive_component(
             ))
         }
     };
+    if pump.provider_wait_capture_refusal.is_some() {
+        return ReceivePumpCompletion::CaptureRefused(pending, pump, channel);
+    }
     if let Some(yielded) = pump.receive_yield() {
         return ReceivePumpCompletion::Reparked(PendingReceiveDispatch {
             yielded,
@@ -1314,6 +1332,9 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
             );
         }
     };
+    if pump.provider_wait_capture_refusal.is_some() {
+        return ServiceWaitPumpCompletion::CaptureRefused(pending, pump, channel);
+    }
     if let Some(yielded) = pump.service_wait_yield {
         return ServiceWaitPumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
             yielded,

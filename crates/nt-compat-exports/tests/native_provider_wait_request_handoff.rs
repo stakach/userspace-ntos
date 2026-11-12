@@ -81,15 +81,36 @@ fn provider_wait_request_and_result_are_isolated_by_physical_lane() {
     assert!(labelled.contains("provider_wait_page_for_channel(ch)")
         && labelled.contains("authenticated_badge(ch, msg.badge)"),
         "capture must read the authenticated caller's lane page, never a shared singleton");
-    assert!(labelled.contains("crate::park();")
+    assert!(labelled.contains("provider_wait_capture_refusal = Some(")
+        && !labelled.contains("crate::park();")
         && !labelled.contains("outcome.provider_wait_suspended = true;\n                break;"),
-        "a refused lane lookup must keep the bound Call and Reply out of ordinary pump completion");
+        "a refused capture must return a typed retained observation without freezing the executive");
     let resumed = service.split_once("pub(crate) unsafe fn resume_suspended_service_wait_component(")
         .and_then(|(_, rest)| rest.split_once("\n}\n").map(|(body, _)| body))
         .expect("service-wait return boundary");
     assert!(resumed.contains("request.header.owner()")
         && resumed.contains("pending.snapshot.dispatch"),
         "a foreign provider request may not be repackaged under the service-wait owner");
+}
+
+#[test]
+fn refused_provider_capture_has_a_physical_owner_before_native_return() {
+    let pump = source("spawn_hosts.rs");
+    let owner = source("win32k_pump_owner.rs");
+    let glue = source("win32k_glue.rs");
+    let terminal = source("component_terminal.rs");
+    assert!(pump.contains("pub provider_wait_capture_refusal: Option<ProviderWaitCaptureRefusal>")
+        && pump.contains("outcome.provider_wait_capture_refusal.is_some()"),
+        "the bound Call must survive pump return without posing as a valid provider request");
+    assert!(owner.contains("record_capture_refusal(")
+        && owner.contains("begin_pump("),
+        "initial pump ownership must precede the effectful receive and retain refusal");
+    assert!(glue.contains("WIN32K_RETAINED_INITIAL_PUMPS")
+        && glue.contains("transfer_initial_standard_pump("),
+        "ordinary initial dispatches need per-physical-lane refusal storage");
+    assert!(terminal.contains("retain_capture_refused(")
+        && terminal.contains("TerminalStageOutcome::Indeterminate(status)"),
+        "resumed waits must retain the old suspension and raw returned pump terminally");
 }
 
 #[test]

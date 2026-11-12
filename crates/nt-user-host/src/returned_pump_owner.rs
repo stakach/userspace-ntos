@@ -43,7 +43,13 @@ impl ReturnedPumpKey {
 pub enum ReturnedPumpPhase { Active, Returned, Quarantined }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReturnedPumpError { WrongIdentity, ReplyMismatch, InvalidPhase, Quarantined }
+pub enum ReturnedPumpError {
+    WrongIdentity,
+    ReplyMismatch,
+    CaptureRefused,
+    InvalidPhase,
+    Quarantined,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReturnedPumpReplies {
@@ -51,11 +57,22 @@ pub struct ReturnedPumpReplies {
     pub returned: u64,
 }
 
+/// The badge observed on a labelled Call that could not be admitted. The expected route remains
+/// in the owner's key; neither badge alone is authority to complete or recycle its Reply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReturnedPumpCaptureRefusal {
+    pub observed_badge: u64,
+}
+
 #[derive(Debug)]
 enum State<P> {
     Active,
     Returned { pump: P, reply: u64 },
-    Quarantined { pump: P, replies: ReturnedPumpReplies },
+    Quarantined {
+        pump: P,
+        replies: ReturnedPumpReplies,
+        capture_refusal: Option<ReturnedPumpCaptureRefusal>,
+    },
 }
 
 /// `C` carries the channel and the semantic continuation owner; `P` carries the returned pump.
@@ -104,6 +121,13 @@ impl<C, P> ReturnedPumpOwner<C, P> {
         }
     }
 
+    pub fn capture_refusal(&self) -> Option<ReturnedPumpCaptureRefusal> {
+        match &self.state {
+            State::Quarantined { capture_refusal, .. } => *capture_refusal,
+            State::Active | State::Returned { .. } => None,
+        }
+    }
+
     /// The native adapter must query `observed` from the physical owner and compare
     /// `current_reply` with the returned pump's own Reply. A copied key is not authority.
     /// A mismatch still moves the entire returned pump into this quarantined owner.
@@ -118,32 +142,67 @@ impl<C, P> ReturnedPumpOwner<C, P> {
             return ReturnedPumpObservation::Refused(ReturnedPumpError::InvalidPhase, pump);
         }
         if observed != self.key {
-            self.state = State::Quarantined { pump, replies: ReturnedPumpReplies {
-                current: current_reply, returned: pump_reply,
-            } };
+            self.state = State::Quarantined {
+                pump,
+                replies: ReturnedPumpReplies { current: current_reply, returned: pump_reply },
+                capture_refusal: None,
+            };
             return ReturnedPumpObservation::Quarantined(ReturnedPumpError::WrongIdentity);
         }
         if current_reply == 0 || pump_reply == 0 || current_reply != pump_reply {
-            self.state = State::Quarantined { pump, replies: ReturnedPumpReplies {
-                current: current_reply, returned: pump_reply,
-            } };
+            self.state = State::Quarantined {
+                pump,
+                replies: ReturnedPumpReplies { current: current_reply, returned: pump_reply },
+                capture_refusal: None,
+            };
             return ReturnedPumpObservation::Quarantined(ReturnedPumpError::ReplyMismatch);
         }
         self.state = State::Returned { pump, reply: pump_reply };
         ReturnedPumpObservation::Accepted
     }
 
+    /// A labelled Call whose capture was refused is a physical return with uncertain effects.
+    /// Retain its pump, both Reply observations and badge under the pre-entry route key. A
+    /// different lane's owner can still complete independently.
+    pub fn record_capture_refusal(
+        &mut self,
+        observed: ReturnedPumpKey,
+        current_reply: u64,
+        pump_reply: u64,
+        observed_badge: u64,
+        pump: P,
+    ) -> ReturnedPumpObservation<P> {
+        if !matches!(self.state, State::Active) {
+            return ReturnedPumpObservation::Refused(ReturnedPumpError::InvalidPhase, pump);
+        }
+        let error = if observed != self.key {
+            ReturnedPumpError::WrongIdentity
+        } else if current_reply == 0 || pump_reply == 0 || current_reply != pump_reply {
+            ReturnedPumpError::ReplyMismatch
+        } else {
+            ReturnedPumpError::CaptureRefused
+        };
+        self.state = State::Quarantined {
+            pump,
+            replies: ReturnedPumpReplies { current: current_reply, returned: pump_reply },
+            capture_refusal: Some(ReturnedPumpCaptureRefusal { observed_badge }),
+        };
+        ReturnedPumpObservation::Quarantined(error)
+    }
+
     pub fn quarantine_capture(&mut self) -> Result<(), ReturnedPumpError> {
         let previous = core::mem::replace(&mut self.state, State::Active);
         match previous {
             State::Returned { pump, reply } => {
-                self.state = State::Quarantined { pump, replies: ReturnedPumpReplies {
-                    current: reply, returned: reply,
-                } };
+                self.state = State::Quarantined {
+                    pump,
+                    replies: ReturnedPumpReplies { current: reply, returned: reply },
+                    capture_refusal: None,
+                };
                 Ok(())
             }
-            State::Quarantined { pump, replies } => {
-                self.state = State::Quarantined { pump, replies };
+            State::Quarantined { pump, replies, capture_refusal } => {
+                self.state = State::Quarantined { pump, replies, capture_refusal };
                 Err(ReturnedPumpError::Quarantined)
             }
             State::Active => Err(ReturnedPumpError::InvalidPhase),

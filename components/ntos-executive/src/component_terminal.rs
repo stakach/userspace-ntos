@@ -17,7 +17,18 @@ pub(crate) struct NativeTerminal {
     returned: NativeReturn,
     status: u64,
     rejected_repark: Option<PendingComponentDispatch>,
+    capture_refused: Option<RefusedPumpCapture>,
     callback: Option<component_callback_transfer::CallbackTransfer>,
+}
+
+/// The old suspension and the newly observed labelled Call stay under one terminal owner.
+/// Neither the provider's missing request nor an invalid badge can authorize a replay.
+#[allow(dead_code)] // Retained for exact-owner diagnostics; never executed again.
+#[derive(Clone, Copy)]
+struct RefusedPumpCapture {
+    previous: PendingComponentDispatch,
+    pump: spawn_hosts::PumpResult,
+    channel: spawn_hosts::PumpChannel,
 }
 
 impl NativeTerminal {
@@ -34,6 +45,7 @@ impl NativeTerminal {
             returned: NativeReturn::Hosted(dispatch),
             status: dispatch.status,
             rejected_repark: None,
+            capture_refused: None,
             callback: None,
         }
     }
@@ -43,6 +55,7 @@ impl NativeTerminal {
             returned: NativeReturn::Incomplete,
             status: status as u64,
             rejected_repark: None,
+            capture_refused: None,
             callback: None,
         }
     }
@@ -63,6 +76,7 @@ impl NativeTerminal {
             NativeReturn::Kernel { caller, status }
                 if self.status == status as u64
                     && self.rejected_repark.is_none()
+                    && self.capture_refused.is_none()
                     && self.callback.is_none() => Some((caller, status)),
             _ => None,
         }
@@ -73,6 +87,7 @@ impl NativeTerminal {
             returned: self.returned,
             status: self.status,
             rejected_repark: self.rejected_repark,
+            capture_refused: self.capture_refused,
             callback: None,
         }
     }
@@ -169,6 +184,40 @@ pub(super) unsafe fn retain_incomplete_provider(
         )
         .expect("rejected component re-wait uncertainty publication failed");
     report_retained_failure(lane, b"repark-rejected", Some(TerminalStage::Output), None, false);
+}
+
+/// A refused labelled Call retains the old Running suspension and the full returned pump in
+/// the same terminal row. The indeterminate output stage forbids delivery or lane retirement.
+pub(super) unsafe fn retain_capture_refused(
+    lane: nt_component_suspension::LaneHandle,
+    reply_object: u64,
+    key: nt_component_suspension::SuspensionKey,
+    owner: nt_component_suspension::SuspensionOwner,
+    previous: PendingComponentDispatch,
+    pump: spawn_hosts::PumpResult,
+    channel: spawn_hosts::PumpChannel,
+    status: u32,
+) {
+    assert!(pump.provider_wait_capture_refusal.is_some(),
+        "capture refusal requires the exact observed labelled Call");
+    let mut payload = NativeTerminal::blocked(status);
+    payload.capture_refused = Some(RefusedPumpCapture { previous, pump, channel });
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let identity = lanes
+        .retain_terminal_running(lane, reply_object, key, owner, payload)
+        .unwrap_or_else(|(error, _)| panic!("refused provider Call lost its retained authority: {:?}", error));
+    let mut attempt = lanes
+        .begin_terminal_stage(identity, reply_object, TerminalStage::Output)
+        .expect("refused provider Call lost its uncertainty owner");
+    lanes
+        .record_terminal_stage(
+            &mut attempt,
+            reply_object,
+            TerminalStageOutcome::Indeterminate(status),
+        )
+        .expect("refused provider Call uncertainty publication failed");
+    report_retained_failure(lane, b"provider-capture-refused",
+        Some(TerminalStage::Output), None, false);
 }
 
 static DELIVERY_FAILURES: AtomicU64 = AtomicU64::new(0);

@@ -1970,6 +1970,44 @@ macro_rules! pump_reply_recv4_into {
     }};
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderWaitCaptureRefusalReason {
+    BadBadge,
+    MissingLanePage,
+}
+
+/// An observed provider-wait Call that could not be admitted. Its Reply stays bound to the
+/// physical channel; the returned pump owner must quarantine this exact observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderWaitCaptureRefusal {
+    pub reason: ProviderWaitCaptureRefusalReason,
+    pub observed_badge: u64,
+    pub message_info: u64,
+    pub label: u64,
+    pub tcb: u64,
+    pub fault_ep: u64,
+    pub reply_cap: u64,
+}
+
+impl ProviderWaitCaptureRefusal {
+    fn observed(
+        reason: ProviderWaitCaptureRefusalReason,
+        ch: &PumpChannel,
+        msg: &PumpMessage,
+        reply_cap: u64,
+    ) -> Self {
+        Self {
+            reason,
+            observed_badge: msg.badge,
+            message_info: msg.mi,
+            label: msg.label(),
+            tcb: ch.tcb,
+            fault_ep: ch.fault_ep,
+            reply_cap,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PumpLoopOutcome {
     completed: bool,
@@ -1977,6 +2015,7 @@ struct PumpLoopOutcome {
     callback_suspended: bool,
     provider_wait_suspended: bool,
     provider_wait_request: Option<nt_provider_wait::ProviderWaitRequest>,
+    provider_wait_capture_refusal: Option<ProviderWaitCaptureRefusal>,
     lpc_wait_suspended: bool,
     scheduler_yielded: bool,
     ingress_yield: Option<PumpIngressYield>,
@@ -2012,6 +2051,7 @@ impl PumpLoopOutcome {
             callback_suspended: false,
             provider_wait_suspended: false,
             provider_wait_request: None,
+            provider_wait_capture_refusal: None,
             lpc_wait_suspended: false,
             scheduler_yielded: false,
             ingress_yield: None,
@@ -2256,6 +2296,9 @@ pub(crate) struct PumpResult {
     /// The component is blocked in its provider-wait rendezvous and its reply object remains bound.
     /// Exact bytes captured when the provider's labelled Call reached this pump.
     pub provider_wait_request: Option<nt_provider_wait::ProviderWaitRequest>,
+    /// A labelled Call whose physical identity or lane page was refused. This is retained
+    /// independently of an admitted provider-wait request or deferred service work.
+    pub provider_wait_capture_refusal: Option<ProviderWaitCaptureRefusal>,
     /// Other component services can suspend without issuing a provider wait request.
     service_deferred: bool,
     /// The component is blocked in an ordinary retained LPC request/reply rendezvous.
@@ -2312,6 +2355,7 @@ impl PumpResult {
             startup_stack_receipt: None,
             callback_suspended: false,
             provider_wait_request: None,
+            provider_wait_capture_refusal: None,
             service_deferred: false,
             lpc_wait_suspended: false,
             scheduler_yielded: false,
@@ -2874,7 +2918,8 @@ unsafe fn component_pump_continue_receive_half(
         );
     }
     let mut outcome = component_pump_loop(ch, first, &mut reply_cap, previous.accounting, &mut seh.pump);
-    let suspended = outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended;
+    let suspended = outcome.callback_suspended || outcome.provider_wait_suspended
+        || outcome.provider_wait_capture_refusal.is_some() || outcome.lpc_wait_suspended;
     if !seh.finish(ch, reply_cap, suspended) {
         assert!(outcome.receive_yield().is_none() && outcome.root_ingress_yield().is_none()
             && outcome.service_wait_yield.is_none()
@@ -3038,7 +3083,8 @@ unsafe fn component_pump_enter(
         pump_recv(ch, reply_cap)
     };
     let mut outcome = component_pump_loop(ch, first, &mut reply_cap, accounting, &mut seh.pump);
-    let suspended = outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended;
+    let suspended = outcome.callback_suspended || outcome.provider_wait_suspended
+        || outcome.provider_wait_capture_refusal.is_some() || outcome.lpc_wait_suspended;
     if !seh.finish(ch, reply_cap, suspended) {
         assert!(outcome.receive_yield().is_none() && outcome.root_ingress_yield().is_none()
             && outcome.service_wait_yield.is_none()
@@ -3329,7 +3375,10 @@ unsafe fn component_pump_loop(
             // the component still waits for this Reply.
             if !shared_pump::authenticated_badge(ch, msg.badge) {
                 crate::print_str(b"[provider-wait-capture] physical route badge refused\n");
-                crate::park();
+                outcome.provider_wait_capture_refusal = Some(ProviderWaitCaptureRefusal::observed(
+                    ProviderWaitCaptureRefusalReason::BadBadge, ch, &msg, *reply_cap,
+                ));
+                break;
             }
             if crate::service_sec_image::service_provider_wait_poll(
                 ch,
@@ -3352,7 +3401,10 @@ unsafe fn component_pump_loop(
             // exact hosted or kernel continuation storage is reserved. Keep this Call bound.
             let Some(page) = crate::win32k_glue::provider_wait_page_for_channel(ch) else {
                 crate::print_str(b"[provider-wait-capture] physical lane page unavailable\n");
-                crate::park();
+                outcome.provider_wait_capture_refusal = Some(ProviderWaitCaptureRefusal::observed(
+                    ProviderWaitCaptureRefusalReason::MissingLanePage, ch, &msg, *reply_cap,
+                ));
+                break;
             };
             let request: nt_provider_wait::ProviderWaitRequest =
                 core::ptr::read_volatile(core::ptr::addr_of!((*page).request));
@@ -6221,7 +6273,8 @@ unsafe fn pump_finish_slice(
             || outcome.nested_restore_yield.is_some()
             || outcome.nested_child_work.is_some()
             || outcome.nested_restore_quarantined.is_some(),
-        outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended,
+        outcome.callback_suspended || outcome.provider_wait_suspended
+            || outcome.provider_wait_capture_refusal.is_some() || outcome.lpc_wait_suspended,
     ) {
         PumpDepthDisposition::None | PumpDepthDisposition::Retained => {}
         PumpDepthDisposition::Suspended => {
@@ -6242,6 +6295,7 @@ unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutco
     if !outcome.completed
         && !outcome.callback_suspended
         && !outcome.provider_wait_suspended
+        && outcome.provider_wait_capture_refusal.is_none()
         && !outcome.lpc_wait_suspended
         && !outcome.scheduler_yielded
         && outcome.receive_yield().is_none()
@@ -6326,6 +6380,7 @@ unsafe fn pump_result_from_outcome(
         }
     } else if outcome.callback_suspended
         || outcome.provider_wait_suspended
+        || outcome.provider_wait_capture_refusal.is_some()
         || outcome.lpc_wait_suspended
         || outcome.scheduler_yielded
         || outcome.receive_yield().is_some()
@@ -6359,6 +6414,7 @@ unsafe fn pump_result_from_outcome(
         startup_stack_receipt: outcome.startup_stack_receipt,
         callback_suspended: outcome.callback_suspended,
         provider_wait_request: outcome.provider_wait_request,
+        provider_wait_capture_refusal: outcome.provider_wait_capture_refusal,
         service_deferred: outcome.provider_wait_suspended
             && outcome.provider_wait_request.is_none()
             && (ch.caps.kind == ReqKind::Irp || shared_pump::autonomous(ch)),

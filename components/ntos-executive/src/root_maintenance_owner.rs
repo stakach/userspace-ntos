@@ -401,6 +401,7 @@ pub(crate) unsafe fn store_result(
     let exact = match returned.completion {
         RootMaintenancePumpCompletion::Restored(_)
         | RootMaintenancePumpCompletion::MaintenanceReparked(_)
+        | RootMaintenancePumpCompletion::CaptureRefused(_, _, _)
         | RootMaintenancePumpCompletion::RetainedFailure(_) =>
             lanes.validate_root_maintenance_return_reply(
                 ticket.route, ticket.dispatch, key, ticket.owner, returned.reply_cap,
@@ -439,8 +440,10 @@ fn result_kind(result: RootMaintenancePumpCompletion) -> Option<RootMaintenanceT
         Pump::ReceiveReparked(_) => RootMaintenanceTransferKind::Receive,
         Pump::ServiceReparked(_) => RootMaintenanceTransferKind::ServiceWait,
         Pump::MaintenanceReparked(_) => RootMaintenanceTransferKind::RootMaintenance,
+        Pump::CaptureRefused(_, _, _) => return None,
         Pump::Restored(Provider::NestedSourceDeferred
             | Provider::Failed(_) | Provider::RetainedFailure(_, _)
+            | Provider::CaptureRefused(_, _, _)
             | Provider::ReceiveReparked(_)
             | Provider::ServiceReparked(_)) | Pump::RetainedFailure(_) => return None,
     })

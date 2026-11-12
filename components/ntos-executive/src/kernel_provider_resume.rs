@@ -71,13 +71,39 @@ pub(crate) unsafe fn run_driver_entry_wait_resume(
     let (mut channel, ticket) = claim_driver_entry_wait_resume(caller, capture)?;
     let (capture, mut attempt, selection) = ticket.into_parts();
     channel.initial = spawn_hosts::InitialAction::ReplyRequest;
-    validate_driver_entry_execution(caller, Some(capture), &attempt)?;
-    let previous = (&*core::ptr::addr_of!(ACTIVATIONS))
-        .recipient(caller)?
-        .observation()
-        .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
-    let page = win32k_glue::provider_wait_page_for_channel(&channel)
-        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let reservation = (&mut *core::ptr::addr_of_mut!(ACTIVATIONS))
+        .recipient_mut(caller)?
+        .reserve_capture_refusal(caller, &channel);
+    if let Err(status) = reservation {
+        return Err(retain_driver_entry_uncertain(
+            caller, attempt, channel, None,
+            Some(KernelResumeAuthority { capture, selection: Some(selection) }), status,
+        ));
+    }
+    if let Err(status) = validate_driver_entry_execution(caller, Some(capture), &attempt) {
+        return Err(retain_driver_entry_uncertain(
+            caller, attempt, channel, None,
+            Some(KernelResumeAuthority { capture, selection: Some(selection) }), status,
+        ));
+    }
+    let previous = match (&*core::ptr::addr_of!(ACTIVATIONS))
+        .recipient(caller).ok().and_then(KernelJobRecipient::observation)
+    {
+        Some(previous) => previous,
+        None => return Err(retain_driver_entry_uncertain(
+            caller, attempt, channel, None,
+            Some(KernelResumeAuthority { capture, selection: Some(selection) }),
+            nt_process::STATUS_INVALID_PARAMETER,
+        )),
+    };
+    let page = match win32k_glue::provider_wait_page_for_channel(&channel) {
+        Some(page) => page,
+        None => return Err(retain_driver_entry_uncertain(
+            caller, attempt, channel, None,
+            Some(KernelResumeAuthority { capture, selection: Some(selection) }),
+            nt_process::STATUS_INVALID_HANDLE,
+        )),
+    };
     core::ptr::write_volatile(
         core::ptr::addr_of_mut!((*page).result),
         nt_provider_wait::ProviderWaitResult::completed(
@@ -86,8 +112,25 @@ pub(crate) unsafe fn run_driver_entry_wait_resume(
         ),
     );
     // No coordinator, recipient or process-manager borrow crosses this real Reply/Recv.
-    let result = spawn_hosts::component_pump_resume_kernel_provider_wait(&channel, &previous)?;
-    observe_driver_entry_pump(&channel, &mut attempt, &result)?;
+    let result = match spawn_hosts::component_pump_resume_kernel_provider_wait(&channel, &previous) {
+        Ok(result) => result,
+        Err(status) => return Err(retain_driver_entry_uncertain(
+            caller, attempt, channel, None,
+            Some(KernelResumeAuthority { capture, selection: Some(selection) }), status,
+        )),
+    };
+    if result.provider_wait_capture_refusal.is_some() {
+        return Err(retain_driver_entry_capture_refusal(
+            caller, attempt, channel, result,
+            Some(KernelResumeAuthority { capture, selection: Some(selection) }),
+        ));
+    }
+    if let Err(status) = observe_driver_entry_pump(&channel, &mut attempt, &result) {
+        return Err(retain_driver_entry_uncertain(
+            caller, attempt, channel, Some(result),
+            Some(KernelResumeAuthority { capture, selection: Some(selection) }), status,
+        ));
+    }
     let result = receive_driver_entry_yields(&scope, caller, Some(capture), result)?;
     finish_stopped_wait(caller, capture, result)
 }

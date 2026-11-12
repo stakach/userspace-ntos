@@ -8,6 +8,51 @@ pub(crate) struct RootReplyPark {
     replacement: Option<(usize, u64)>,
 }
 
+/// Reserve a replacement before an entered callback can return with an uncertain provider
+/// Call. The pure Reply table keeps that spare unavailable to nested work until commit/cancel.
+pub(crate) struct RootReplyReservation {
+    park: RootReplyPark,
+    lease: Option<nt_component_suspension::RootReplyReplacementLease>,
+}
+
+impl RootReplyReservation {
+    pub(crate) unsafe fn before_native() -> Option<Self> {
+        let park = RootReplyPark::prepare()?;
+        let lease = if let Some((index, cap)) = park.replacement {
+            let pool = wait_reply_pool_mut();
+            let active = pool.find_cap(park.active)?;
+            let replacement = pool.at(index)?;
+            if replacement.cap() != cap { return None; }
+            Some(pool.reserve(active, replacement).ok()?)
+        } else {
+            None
+        };
+        Some(Self { park, lease })
+    }
+
+    pub(crate) unsafe fn cancel_no_effects(self) -> bool {
+        match self.lease {
+            Some(lease) => wait_reply_pool_mut().cancel_no_effects(lease).is_ok(),
+            None => true,
+        }
+    }
+
+    pub(crate) unsafe fn commit(self) -> bool {
+        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) != self.park.active { return false; }
+        match self.lease {
+            Some(lease) => {
+                let Some((_, cap)) = self.park.replacement else { return false; };
+                if wait_reply_pool_mut().commit(lease).ok().map(|identity| identity.cap()) != Some(cap) {
+                    return false;
+                }
+                REPLY_MAIN_SLOT.store(cap, Ordering::Relaxed);
+                true
+            }
+            None => self.park.try_commit().is_ok(),
+        }
+    }
+}
+
 pub(crate) enum SelectedParkRefusal {
     /// The selected attempt made no Reply-pool or main-selector change. The native child owner
     /// must still recheck exact CALLS and physical binding before reopening its pure pass.
