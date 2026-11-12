@@ -80,3 +80,20 @@ fn stale_child_generation_cannot_complete_the_live_reference_effect() {
     live.complete_release(release).unwrap();
     assert!(live.all_released());
 }
+
+#[test]
+fn preflight_refusal_before_next_acquire_can_drain_only_held_references() {
+    let mut references = MonitorPdoReferenceLedger::new(&[
+        child(0x5000, 23), child(0x6000, 24),
+    ]).unwrap();
+    let first = references.begin_acquire().unwrap().unwrap();
+    references.complete_acquire(first).unwrap();
+
+    // The second child's preflight fails before begin_acquire, so it has no native effect.
+    let release = references.begin_release().unwrap().unwrap();
+    assert_eq!(release.pdo(), child(0x5000, 23));
+    references.complete_release(release).unwrap();
+    assert!(references.begin_release().unwrap().is_none());
+    assert!(references.all_released());
+    assert!(references.begin_acquire().is_err(), "a drained array cannot be replayed");
+}

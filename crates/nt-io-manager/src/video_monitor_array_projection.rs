@@ -205,12 +205,6 @@ impl MonitorPdoReferenceLedger {
         self.settle(ticket, ReferenceEffect::Acquire, ReferencePhase::Acquired)
     }
 
-    /// Only a proven no-effect native refusal may release an acquisition claim. Previously
-    /// acquired entries remain owned and can then be drained by `begin_release`.
-    pub fn cancel_unentered_acquire(&mut self, ticket: MonitorPdoReferenceTicket) -> Result<(), MonitorProjectionError> {
-        self.settle(ticket, ReferenceEffect::Acquire, ReferencePhase::Unacquired)
-    }
-
     pub fn begin_release(&mut self) -> Result<Option<MonitorPdoReferenceTicket>, MonitorProjectionError> {
         if self.entries.iter().any(|entry| matches!(entry.phase,
             ReferencePhase::Acquiring(_) | ReferencePhase::Releasing(_)
