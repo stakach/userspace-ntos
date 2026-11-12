@@ -316,6 +316,60 @@ static DEF_SET_TEXT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static SET_CURSOR_ICON_DATA_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static STRETCH_DIBITS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static FIND_CURSOR_ICON_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static CURSOR_LOOKUP_OWNER_TRACE: AtomicU64 = AtomicU64::new(0);
+
+/// Bounded root-side trace of one original Call across GUI staging and provider entry.
+/// Neither the copied key nor the numeric Reply authorizes a settlement.
+pub(crate) unsafe fn trace_cursor_lookup_owner(
+    stage: &str,
+    client: win32k_glue::Win32kClientContext,
+    ssn: u64,
+    dispatch_id: u64,
+    lane: Option<nt_component_suspension::LaneHandle>,
+    entered: bool,
+    not_completed: bool,
+    callback_suspended: bool,
+) {
+    if ssn != 0x103d
+        || CURSOR_LOOKUP_OWNER_TRACE.fetch_add(1, Ordering::Relaxed) >= 4096
+    {
+        return;
+    }
+    use core::fmt::Write;
+    let key = crate::spawn_hosts::shared_ingress::owner::runtime::observed_win32k_call_for_client(
+        client, ssn,
+    );
+    let mut record = nt_printf::record::RecordBuffer::<512>::new();
+    let _ = writeln!(record,
+        "[cursor-lookup-owner] stage={} pi/pid/gen/tid/badge/tcb={}/{}/{}/{}/{}/{} original-tcb/seq/reply={:?} dispatch={} lane={:?} entered={} not-completed={} callback-suspended={}",
+        stage, client.pi, client.pid, client.generation, client.tid, client.badge, client.tcb,
+        key, dispatch_id, lane, u8::from(entered), u8::from(not_completed),
+        u8::from(callback_suspended));
+    sel4_rt::print_record(record.bytes());
+}
+
+/// The provider entry boundary may be nested: log copied dispatch metadata only.
+/// CALLS is root owned and must never be scanned from the isolated provider pump.
+pub(crate) fn trace_cursor_lookup_lane(
+    stage: &str,
+    client: win32k_glue::Win32kClientContext,
+    ssn: u64,
+    dispatch_id: u64,
+    lane: nt_component_suspension::LaneHandle,
+) {
+    if ssn != 0x103d
+        || CURSOR_LOOKUP_OWNER_TRACE.fetch_add(1, Ordering::Relaxed) >= 4096
+    {
+        return;
+    }
+    use core::fmt::Write;
+    let mut record = nt_printf::record::RecordBuffer::<512>::new();
+    let _ = writeln!(record,
+        "[cursor-lookup-owner] stage={} pi/pid/gen/tid/badge/tcb={}/{}/{}/{}/{}/{} dispatch={} lane={:?} original-key=root-only",
+        stage, client.pi, client.pid, client.generation, client.tid, client.badge, client.tcb,
+        dispatch_id, lane);
+    sel4_rt::print_record(record.bytes());
+}
 static SESSION_CURSOR_SERVE_TRACE: AtomicU64 = AtomicU64::new(0);
 static EXT_TEXT_OUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static PAINTSTRUCT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -16637,6 +16691,9 @@ pub(crate) unsafe fn service_sec_image(
                     dispatch_peb_mirror,
                     scratch_base,
                 );
+                trace_cursor_lookup_owner(
+                    "preentry", dispatch_client, m0, 0, None, false, false, false,
+                );
                 'root_gui_dispatch: {
                 let Some(dispatch_id) = win32k_glue::next_win32k_dispatch_id() else {
                     // No shared ARG or provider state belongs to this call yet. Preserve its
@@ -16646,6 +16703,9 @@ pub(crate) unsafe fn service_sec_image(
                     wl_milestone_park = false;
                     break 'root_gui_dispatch;
                 };
+                trace_cursor_lookup_owner(
+                    "dispatch-id", dispatch_client, m0, dispatch_id, None, false, false, false,
+                );
                 // CROSS-AS ARG MARSHALING. NtUserProcessConnect(handle, USERCONNECT* buf, size): the
                 // buffer is a client user pointer (usually its stack) NOT mapped in win32k's VSpace.
                 // Passing it raw makes win32k's handler fault/spin on an address win32k_dispatch can't
@@ -19965,6 +20025,9 @@ pub(crate) unsafe fn service_sec_image(
                         } else {
                             m0
                         };
+                    trace_cursor_lookup_owner(
+                        "pre-dispatch", client, m0, dispatch_id, None, false, false, false,
+                    );
                     let mut r = dispatch_win32k_for_client_with_completion_args(
                         &mut nt_handler,
                         dispatch_id,
@@ -19982,6 +20045,11 @@ pub(crate) unsafe fn service_sec_image(
                         &mut dispatch_return,
                         &mut dispatch_entered,
                         &mut dispatch_context,
+                    );
+                    trace_cursor_lookup_owner(
+                        "provider-return", client, m0, dispatch_id,
+                        dispatch_context.map(|context| context.lane),
+                        dispatch_entered, !r.1, false,
                     );
                     let inline_batch_records = win32k_glue::completed_gdi_batch_records(
                         dispatch_return, r.0, r.1,
@@ -20457,6 +20525,12 @@ pub(crate) unsafe fn service_sec_image(
                     break 'service_loop;
                 }
                 let callback_suspended = handoff.callback_suspended;
+                trace_cursor_lookup_owner(
+                    "handoff", dispatch_client, m0, dispatch_id,
+                    dispatch_context.map(|context| context.lane),
+                    dispatch_entered, handoff.parked || callback_suspended,
+                    callback_suspended,
+                );
                 component_suspension_admitted_dispatch_id = handoff.admitted_dispatch_id;
                 component_suspension_park_request = handoff.parked;
                 component_root_maintenance_ticket = handoff.maintenance_ticket;

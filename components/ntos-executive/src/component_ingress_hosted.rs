@@ -248,6 +248,35 @@ pub(crate) struct RetainedCallSample {
     pub settlement_prepared: bool,
 }
 
+/// Diagnostic-only identity of one delivered GUI Call. The original Call remains in CALLS;
+/// this copied observation grants no Reply or dispatch authority.
+pub(crate) unsafe fn observed_win32k_call_for_client(
+    client: crate::win32k_glue::Win32kClientContext,
+    ssn: u64,
+) -> Option<(u64, u64, u64)> {
+    let mut matched = None;
+    for row in (&*core::ptr::addr_of!(CALLS)).iter().flatten() {
+        let Some(call) = row.call.as_ref() else { continue };
+        if row.released || row.completion.is_some() || !row.delivered
+            || row.binding.pi != client.pi as usize
+            || u64::from(row.binding.process.pid) != client.pid
+            || row.binding.process.generation
+                != nt_user_host::process_identity::ProcessGeneration::Hosted(client.generation)
+            || row.binding.tid != client.tid
+            || row.binding.badge != client.badge
+            || row.binding.tcb != client.tcb
+            || call.message().registers()[0] != ssn
+        {
+            continue;
+        }
+        if matched.is_some() {
+            return None;
+        }
+        matched = Some((row.binding.tcb, call.admission_sequence(), call.reply()));
+    }
+    matched
+}
+
 /// Read-only gate state for retained hosted Calls at a periodic root census.
 #[derive(Clone, Copy)]
 pub(crate) struct DeliveryGateSnapshot {

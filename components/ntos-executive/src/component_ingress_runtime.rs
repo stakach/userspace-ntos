@@ -73,6 +73,7 @@ pub(crate) use hosted::{
 };
 pub(crate) use hosted::PendingSnapshot;
 pub(crate) use hosted::delivery_gate_snapshot;
+pub(crate) use hosted::observed_win32k_call_for_client;
 
 const RETAINED_CALL_CAPACITY: usize = 256;
 const PEER_CAPACITY: usize = 256;

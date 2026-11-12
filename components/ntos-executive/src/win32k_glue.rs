@@ -8094,6 +8094,9 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         }
         return (0xC000_009Au64, false).into();
     };
+    crate::service_sec_image::trace_cursor_lookup_lane(
+        "lane-acquired", client, ssn, dispatch_id, lane,
+    );
     let dispatch = UserCallbackDispatchContext {
         lane, dispatch_id, ssn, args: completion_args, caller_sp,
         output_stage, paint_output,
@@ -8110,6 +8113,9 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     let previous_dispatch = publish_initial_win32k_request(
         dispatch, request_kind, client, [a0, a1, a2, a3], stack_args,
         nested_user_callback, dispatch_context_out,
+    );
+    crate::service_sec_image::trace_cursor_lookup_lane(
+        "published", client, ssn, dispatch_id, lane,
     );
     // ── FAULT LOOP (shared): drive win32k's dispatch through the unified `component_pump`, all win32k
     // capability gates TRUE. Fix (A) [DONE via a plain Send, distinguished by label] + Fix (B) [nested
