@@ -8,6 +8,8 @@
 
 mod process_image_layout;
 pub use process_image_layout::ProcessImageLayout;
+mod startup_trampoline;
+pub use startup_trampoline::{StartupTrampoline, StartupTrampolineError};
 pub mod service_group_launch;
 pub mod execution_role;
 mod process_image_source;

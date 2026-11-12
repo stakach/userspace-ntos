@@ -27,6 +27,7 @@ pub(crate) enum HostedProcessRuntimeRegistrationError {
     MissingLayout,
     NotFound,
     StaleIdentity,
+    MissingStartupExport,
 }
 
 struct HostedProcessRuntimeTable {
@@ -396,7 +397,7 @@ pub(crate) unsafe fn spawn_hosted_sec_image_for_image(
     if runtime.generation != image.generation {
         return Err(HostedProcessRuntimeRegistrationError::StaleIdentity);
     }
-    Ok(spawn_sec_image(
+    spawn_sec_image(
         image.pi as u64,
         image.generation,
         lifetime,
@@ -415,7 +416,8 @@ pub(crate) unsafe fn spawn_hosted_sec_image_for_image(
         image.command_line,
         start_immediately,
         ldrpinit_rva,
-    ))
+    )
+    .map_err(|_| HostedProcessRuntimeRegistrationError::MissingStartupExport)
 }
 
 pub(crate) fn hosted_scratch_base_for_pi(pi: usize) -> Option<u64> {

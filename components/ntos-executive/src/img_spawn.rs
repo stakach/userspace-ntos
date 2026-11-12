@@ -976,7 +976,7 @@ pub(crate) unsafe fn spawn_sec_image(
     // across builds (0x1050 in the current build) — so the caller DERIVES it from OUR DLL's export
     // table (nt-pe-loader) and passes it here.
     ldrpinit_rva: u64,
-) -> SecImageSpawn {
+) -> Result<SecImageSpawn, nt_exe_image::StartupTrampolineError> {
     assert!(lifetime.is_valid(), "SEC_IMAGE spawn requires exact memory lifetime");
     assert_eq!(layout.size(), u64::from(pe.size_of_image()));
     assert_eq!(layout.entry_rva(), pe.entry_point_rva());
@@ -986,6 +986,29 @@ pub(crate) unsafe fn spawn_sec_image(
     if let nt_memory_manager::MemoryLifetime::Process(process) = lifetime {
         assert_eq!(u64::from(process.pid), client_process_id, "SEC_IMAGE PID differs from owner");
     }
+    // Resolve both entrypoints from the exact ntdll mapped into this child. This preflight
+    // precedes cap allocation and publication, so an incomplete DLL cannot leave native effects.
+    let startup = if setup_env {
+        let (ntdll_base, ntdll_pe) = ntdll
+            .ok_or(nt_exe_image::StartupTrampolineError::MissingThreadExit)?;
+        let thread_exit_rva = ntdll_pe
+            .export_rva_by_name("RtlExitUserThread")
+            .ok()
+            .flatten()
+            .map(u64::from)
+            .ok_or(nt_exe_image::StartupTrampolineError::MissingThreadExit)?;
+        Some(nt_exe_image::StartupTrampoline::emit(
+            SMSS_PEB_VA + 0x900,
+            SMSS_PEB_VA,
+            ntdll_base,
+            layout.base(),
+            layout.entry(),
+            effective_ldrp_rva(ldrpinit_rva),
+            thread_exit_rva,
+        )?)
+    } else {
+        None
+    };
     trace_spawn_phase(pi, b"begin");
     crate::temporary_frame_alias::drain()
         .expect("process-slot reuse requires completed temporary-frame alias retirement");
@@ -1605,50 +1628,8 @@ pub(crate) unsafe fn spawn_sec_image(
             b"tramp-scratch",
         );
         zero_scratch_page(scr + 0x2000);
-        let mut tb = alloc::vec::Vec::new();
-        // Reserve 0x20 shadow space so LdrpInitialize's register-arg spills ([rsp+0x8..0x20]) land
-        // WITHIN the stack, not above its top. RSP starts 16-aligned; sub 0x20 keeps it aligned so
-        // the `call` gives LdrpInitialize the ABI-correct (rsp ≡ 8 mod 16) frame.
-        tb.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 0x20
-        tb.extend_from_slice(&[0x48, 0xB9]);
-        tb.extend_from_slice(&(SMSS_PEB_VA + 0x900).to_le_bytes()); // movabs rcx, Context (placeholder)
-                                                                    // SystemArgument1 (RDX) = the ntdll base — LdrpInitializeProcess builds ntdll's
-                                                                    // LDR_DATA_TABLE_ENTRY from it (the kernel passes it via the initial APC). RDX=0 left the
-                                                                    // ntdll DllBase null → LdrpAllocateModuleEntry(RtlImageNtHeader(0)=0) returned null.
-        tb.extend_from_slice(&[0x48, 0xBA]);
-        tb.extend_from_slice(&NTDLL_BASE.to_le_bytes()); // movabs rdx, NTDLL_BASE
-                                                         // Step 4.B: OUR ntdll's in-process LoaderHost snaps smss's imports against OUR export table,
-                                                         // which needs smss's own image base. Pass it in R8 (SystemArgument2) when calling OUR
-                                                         // LdrpInitialize (ldrpinit_rva != 0). The real ReactOS ntdll ignores SystemArgument2, but to
-                                                         // keep the flag-OFF / pi>=1 path BYTE-IDENTICAL we still emit `xor r8d,r8d` there.
-                                                         // Our ntdll's in-process LoaderHost snaps the child's imports against OUR export table, which
-                                                         // needs the child's own image base — pass it in R8 (SystemArgument2). (Our ntdll is THE ntdll
-                                                         // for every process, so this is always taken.)
-        let eff_ldrp = effective_ldrp_rva(ldrpinit_rva);
-        if eff_ldrp != 0 {
-            tb.extend_from_slice(&[0x49, 0xB8]); // movabs r8, imm64
-            tb.extend_from_slice(&layout.base().to_le_bytes()); // R8 = child image base
-        } else {
-            tb.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d  (SystemArgument2)
-        }
-        tb.extend_from_slice(&[0x48, 0xB8]);
-        // Call OUR LdrpInitialize RVA (derived from the loaded ntdll's export table — never hardcoded;
-        // the retired real-ntdll fixed 0x8e70 is gone since our ntdll IS the ntdll).
-        let ldrp_off = eff_ldrp;
-        tb.extend_from_slice(&(NTDLL_BASE + ldrp_off).to_le_bytes()); // movabs rax, LdrpInitialize
-        tb.extend_from_slice(&[0xFF, 0xD0]); // call rax  (runs the whole loader, then RETURNS here)
-                                             // LdrpInitialize (== ReactOS LdrpInit) runs the entire process init and RETURNS — in real
-                                             // Windows KiUserApcDispatcher would then NtContinue to the image entry; we have no APC
-                                             // dispatcher, so chain straight to smss's native entry (NtProcessStartup) with RCX=PEB.
-                                             // `call` (not jmp) gives the entry the ABI-correct rsp≡8(mod16); the entry never returns
-                                             // (it ends in NtTerminateProcess), and the trailing jmp$ is a safety net if it does.
-        tb.extend_from_slice(&[0x48, 0xB9]);
-        tb.extend_from_slice(&SMSS_PEB_VA.to_le_bytes()); // movabs rcx, PEB
-        tb.extend_from_slice(&[0x48, 0xB8]);
-        tb.extend_from_slice(&layout.entry().to_le_bytes()); // movabs rax, entry
-        tb.extend_from_slice(&[0xFF, 0xD0]); // call rax  (enter smss)
-        tb.extend_from_slice(&[0xEB, 0xFE]); // jmp $
-        for (j, &b) in tb.iter().enumerate() {
+        let startup = startup.as_ref().expect("preflighted executable startup");
+        for (j, &b) in startup.bytes().iter().enumerate() {
             core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
         }
         let tramp_client = checked_spawn_copy_cap(tramp, b"tramp-target");
@@ -1737,7 +1718,7 @@ pub(crate) unsafe fn spawn_sec_image(
         checked_spawn_tcb_op(tcb_resume_r(tcb), tcb, b"secimage-resume");
     }
     trace_spawn_phase(pi, b"done");
-    SecImageSpawn {
+    Ok(SecImageSpawn {
         lifetime,
         layout,
         pml4,
@@ -1753,7 +1734,7 @@ pub(crate) unsafe fn spawn_sec_image(
             create_time_100ns: nt_system_time_100ns() as i64,
             started: start_immediately,
         },
-    }
+    })
 }
 
 /// Read a u64 through the process's recorded frame backing.
