@@ -3,6 +3,7 @@
 use super::*;
 
 static REPARK_FAILURE_TRACE: AtomicU64 = AtomicU64::new(0);
+static REPARK_CONFLICT_TRACE: AtomicU64 = AtomicU64::new(0);
 
 fn trace_repark_failure(
     branch: &'static [u8], lane: nt_component_suspension::LaneHandle,
@@ -609,6 +610,39 @@ unsafe fn finish_hosted_resume(
                     print_u64(new_client.map_or(0, |client| client.client_pi as u64)); print_str(b"/");
                     print_u64(old_client.map_or(0, |client| client.client_tid)); print_str(b"/");
                     print_u64(new_client.map_or(0, |client| client.client_tid)); print_str(b"\n");
+                }
+                if matches!(error, nt_component_suspension::LaneError::Suspension(
+                    nt_component_suspension::SuspensionError::DuplicateIdentity,
+                )) && REPARK_CONFLICT_TRACE.fetch_add(1, Ordering::Relaxed) < 8 {
+                    if let PendingComponentDispatch::Provider(pending) = next {
+                        let request_owner = pending.request.header.owner();
+                        print_str(b"[component-rearm-request] wait/owner-valid/owner-matches-next/dispatch/pi/tid=");
+                        print_u64(pending.request.header.wait_id); print_str(b"/");
+                        print_u64(request_owner.is_some() as u64); print_str(b"/");
+                        print_u64((request_owner == Some(next_owner)) as u64); print_str(b"/");
+                        print_u64(request_owner.map_or(0, |owner| owner.dispatch_id)); print_str(b"/");
+                        let client = request_owner.and_then(|owner| owner.hosted_client());
+                        print_u64(client.map_or(0, |client| client.client_pi as u64)); print_str(b"/");
+                        print_u64(client.map_or(0, |client| client.client_tid)); print_str(b"\n");
+                    }
+                    for (conflict_lane, conflict) in (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+                        .frames().filter(|(_, frame)| frame.key == next_key)
+                    {
+                        print_str(b"[component-rearm-conflict] lane/generation/owner-matches-next/dispatch/pi/tid/phase=");
+                        print_u64(u64::from(conflict_lane.index)); print_str(b"/");
+                        print_u64(conflict_lane.generation); print_str(b"/");
+                        print_u64((conflict.owner == next_owner) as u64); print_str(b"/");
+                        print_u64(conflict.owner.dispatch_id); print_str(b"/");
+                        let client = conflict.owner.hosted_client();
+                        print_u64(client.map_or(0, |client| client.client_pi as u64)); print_str(b"/");
+                        print_u64(client.map_or(0, |client| client.client_tid)); print_str(b"/");
+                        print_u64(match conflict.phase {
+                            nt_component_suspension::SuspensionPhase::Waiting => 1,
+                            nt_component_suspension::SuspensionPhase::Selected { .. } => 2,
+                            nt_component_suspension::SuspensionPhase::Resuming { .. } => 3,
+                            _ => 0,
+                        }); print_str(b"\n");
+                    }
                 }
                 if let Some(reservation) = lpc_reservation {
                     let _ =
