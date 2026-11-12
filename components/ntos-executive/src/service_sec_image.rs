@@ -29046,6 +29046,35 @@ static ROOT_ADD_DEVICE_EXCLUSIVE: AtomicBool = AtomicBool::new(false);
 /// The retry is only a wake request; neither the timer nor another Call may replace that owner.
 static ROOT_QUEUED_CALLBACK_EXCLUSIVE: AtomicBool = AtomicBool::new(false);
 static ROOT_QUEUED_CALLBACK_RETRY_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+static ROOT_QUEUED_CALLBACK_FAILURE_TRACE: AtomicU64 = AtomicU64::new(0);
+
+/// Failure-only root receipt. Selector snapshots are copied identities, never ACK authority.
+unsafe fn trace_queued_callback_root_failure(
+    stage: &str,
+    current: &[RootQueuedCallbackTurn],
+    permit: Option<&ParkedRootQueuedCallbackPermit>,
+) {
+    if ROOT_QUEUED_CALLBACK_FAILURE_TRACE.fetch_add(1, Ordering::Relaxed) >= 64 { return; }
+    use core::fmt::Write;
+    use crate::driver_launch::QueuedCallbackRootAction as Action;
+    let action = crate::driver_launch::queued_callback_root_action().map(|action| match action {
+        Action::NeedsChild(selector) => ("needs-child", selector.diagnostic_identity()),
+        Action::ResumeRecordedStep(selector) => ("resume-step", selector.diagnostic_identity()),
+        Action::RetryRestore(selector) => ("retry-restore", selector.diagnostic_identity()),
+        Action::RetryTerminalAck(selector) => ("retry-ack", selector.diagnostic_identity()),
+    });
+    let top = current.last().map(|turn| turn.owner());
+    let mut record = nt_printf::record::RecordBuffer::<1536>::new();
+    let _ = writeln!(record,
+        "[queued-callback-root-failure] stage={} depth={} permit={:?} permit-floor/watch={:?}/{:?} top={:?} top-retired={:?} selected={:?} unsettled={}",
+        stage, current.len(), permit.map(|permit| permit.0.diagnostic_identity()),
+        permit.map(|permit| crate::driver_launch::queued_callback_file_floor(permit.0).is_some()),
+        permit.map(|permit| crate::driver_launch::queued_callback_root_watch_present(permit.0)),
+        top.map(|selector| selector.diagnostic_identity()),
+        top.map(|selector| crate::driver_launch::queued_callback_root_retired(selector)),
+        action, u8::from(crate::driver_launch::unsettled_queued_callback()));
+    sel4_rt::print_record(record.bytes());
+}
 
 pub(crate) fn root_queued_callback_exclusive_pending() -> bool {
     ROOT_QUEUED_CALLBACK_EXCLUSIVE.load(Ordering::Acquire)
@@ -29207,16 +29236,34 @@ unsafe fn ensure_queued_callback_root_turn(
     current: &mut Vec<RootQueuedCallbackTurn>,
     permit: &ParkedRootQueuedCallbackPermit,
 ) -> bool {
-    if !permit.is_exact() || !settle_parked_queued_callback_turn(current) { return false; }
+    if !permit.is_exact() {
+        trace_queued_callback_root_failure("permit-inexact", current, Some(permit));
+        return false;
+    }
+    if !settle_parked_queued_callback_turn(current) {
+        trace_queued_callback_root_failure("prior-turn-settlement", current, Some(permit));
+        return false;
+    }
     if current.last().is_some_and(|turn| turn.owner() == permit.0) { return true; }
     if current.last().is_some_and(|turn|
         !crate::driver_launch::queued_callback_newer_root_child(turn.owner(), permit.0))
-        || current.try_reserve(1).is_err()
-    { return false; }
+    {
+        trace_queued_callback_root_failure("not-newer-child", current, Some(permit));
+        return false;
+    }
+    if current.try_reserve(1).is_err() {
+        trace_queued_callback_root_failure("reserve", current, Some(permit));
+        return false;
+    }
     let mut turn = RootQueuedCallbackTurn::new(permit.0);
-    if turn.retain_ingress(permit.0, Vec::new()).is_err()
-        || !crate::driver_launch::watch_queued_callback_root_retirement(permit.0)
-    { return false; }
+    if turn.retain_ingress(permit.0, Vec::new()).is_err() {
+        trace_queued_callback_root_failure("retain-ingress", current, Some(permit));
+        return false;
+    }
+    if !crate::driver_launch::watch_queued_callback_root_retirement(permit.0) {
+        trace_queued_callback_root_failure("watch-retirement", current, Some(permit));
+        return false;
+    }
     current.push(turn);
     ROOT_QUEUED_CALLBACK_EXCLUSIVE.store(true, Ordering::Release);
     true
@@ -29268,24 +29315,35 @@ unsafe fn settle_parked_queued_callback_turn(
         if !crate::driver_launch::queued_callback_root_retired(owner) { break; }
         let tickets = match turn.retained_ingress(owner) {
             Ok(Some(tickets)) => tickets,
-            _ => return false,
+            _ => {
+                trace_queued_callback_root_failure("retired-ingress-missing", current, None);
+                return false;
+            }
         };
         if tickets.iter().any(|ticket|
             !crate::spawn_hosts::shared_ingress::owner::runtime::
                 deferred_parked_ingress_is_exact(ticket))
-        { return false; }
+        {
+            trace_queued_callback_root_failure("retired-ticket-inexact", current, None);
+            return false;
+        }
         let turn = current.pop().expect("watched callback turn");
         if !crate::driver_launch::consume_queued_callback_root_retirement(owner) {
             current.push(turn);
+            trace_queued_callback_root_failure("consume-retirement", current, None);
             return false;
         }
         if let Err(turn) = turn.settle(owner) {
             current.push(turn);
+            trace_queued_callback_root_failure("settle-turn", current, None);
             return false;
         }
     }
     if !crate::driver_launch::unsettled_queued_callback() {
-        if !current.is_empty() { return false; }
+        if !current.is_empty() {
+            trace_queued_callback_root_failure("orphaned-turn", current, None);
+            return false;
+        }
         ROOT_QUEUED_CALLBACK_RETRY_DEADLINE.store(u64::MAX, Ordering::Release);
         ROOT_QUEUED_CALLBACK_EXCLUSIVE.store(false, Ordering::Release);
     }

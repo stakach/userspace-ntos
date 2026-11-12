@@ -81,6 +81,14 @@ impl QueuedCallbackSelector {
     pub(crate) fn dispatch_reply(self) -> (nt_component_suspension::LaneDispatchIdentity, u64) {
         (self.physical.dispatch, self.physical.reply_cap)
     }
+
+    /// Copied queue and physical identity for failure receipts; grants no queue authority.
+    pub(crate) fn diagnostic_identity(self) -> [u64; 10] {
+        let (dispatch, reply) = self.dispatch_reply();
+        [self.index as u64, self.sequence, self.key.domain_id, self.key.domain_cookie,
+            self.key.head, self.key.work_item, dispatch.lane().index as u64,
+            dispatch.lane().generation, dispatch.epoch(), reply]
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -374,6 +382,11 @@ pub(crate) unsafe fn watch_queued_callback_root_retirement(
 pub(crate) unsafe fn queued_callback_root_retired(selector: QueuedCallbackSelector) -> bool {
     (&*core::ptr::addr_of!(ROOT_RETIREMENT_WATCHES))
         .iter().any(|watch| watch.selector == selector && watch.acknowledged)
+}
+
+pub(crate) unsafe fn queued_callback_root_watch_present(selector: QueuedCallbackSelector) -> bool {
+    (&*core::ptr::addr_of!(ROOT_RETIREMENT_WATCHES))
+        .iter().any(|watch| watch.selector == selector)
 }
 
 pub(crate) unsafe fn queued_callback_newer_root_child(
