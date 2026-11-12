@@ -806,10 +806,13 @@ pub fn registered_win32k_service_metadata() -> Option<(u64, u32, u64)> {
 }
 
 fn registered_provider_wait_domain() -> Option<nt_provider_wait::ProviderDomainIdentity> {
+    // Static import loading runs in the executive before any Win32k lane has a KPCR. The
+    // published control is immutable and identical on every page; only requests/results need
+    // a physical-lane selection.
     unsafe {
         read_volatile(
             core::ptr::addr_of!(
-                (*provider_wait_page_for_current_lane())
+                (*(WIN32K_PROVIDER_WAIT_VADDR as *const nt_provider_wait::ProviderWaitSharedPage))
                 .control
             ),
         )

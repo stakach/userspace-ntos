@@ -91,3 +91,14 @@ fn provider_wait_request_and_result_are_isolated_by_physical_lane() {
         && resumed.contains("pending.snapshot.dispatch"),
         "a foreign provider request may not be repackaged under the service-wait owner");
 }
+
+#[test]
+fn provider_domain_control_is_readable_before_win32k_lane_kpcr_exists() {
+    let source = source("win32k_subsystem.rs");
+    let domain = source.split_once("fn registered_provider_wait_domain()")
+        .and_then(|(_, rest)| rest.split_once("\n}").map(|(body, _)| body))
+        .expect("provider domain lookup exists");
+    assert!(domain.contains("WIN32K_PROVIDER_WAIT_VADDR")
+        && !domain.contains("provider_wait_page_for_current_lane"),
+        "root-side static import loading needs the immutable primary control before GS/KPCR exists");
+}
