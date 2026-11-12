@@ -323,7 +323,10 @@ pub(crate) unsafe fn trace_source_terminal_lane(
     packet: u64, terminal_ready: bool, nested_ready: bool,
 ) {
     static TRACES: AtomicU64 = AtomicU64::new(0);
-    if TRACES.fetch_add(1, Ordering::Relaxed) >= 8 { return; }
+    // Sample a sustained refusal as well as the first few. A short-lived earlier packet
+    // must not exhaust the diagnosis before a later terminal reaches the actual wall.
+    let sample = TRACES.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if !sample.is_power_of_two() { return; }
     let (running, route, phase, top_kind, top_id, top_phase, top_owner) = {
         let catalog = lanes();
         let running = catalog.running();
@@ -376,6 +379,33 @@ pub(crate) unsafe fn trace_source_terminal_lane(
         crate::print_str(b"/"); crate::print_hex_u64(value);
     }
     crate::print_str(b"\n");
+    for (frame_lane, frame) in lanes().frames() {
+        let frame_route = lanes().peer_route(frame_lane).ok().flatten();
+        let frame_dispatch = lanes().active_dispatch_identity(frame_lane).ok().flatten();
+        let frame_reply = lanes().binding(frame_lane).ok().map(|binding| binding.reply_object);
+        let phase = match &frame.phase {
+            nt_component_suspension::SuspensionPhase::Waiting => 1,
+            nt_component_suspension::SuspensionPhase::Resuming { .. } => 2,
+            nt_component_suspension::SuspensionPhase::ResumingChildParked { .. } => 3,
+            nt_component_suspension::SuspensionPhase::ResumingChildQuarantined { .. } => 4,
+            nt_component_suspension::SuspensionPhase::MaintenanceResuming { .. } => 5,
+            _ => 6,
+        };
+        crate::print_str(b"[source-terminal-frame] sample/lane/gen/phase/kind/key/owner/route-domain/route-gen/route-exec/epoch/reply/exact-work=");
+        for value in [sample, u64::from(frame_lane.index), frame_lane.generation,
+            phase, frame.key.kind as u64, frame.key.id, frame.owner.dispatch_id,
+            frame_route.map_or(0, |route| route.identity().domain),
+            frame_route.map_or(0, |route| route.identity().domain_generation),
+            frame_route.map_or(0, |route| route.identity().executor),
+            frame_dispatch.map_or(0, |dispatch| dispatch.epoch()),
+            frame_reply.unwrap_or(0),
+            u64::from(frame_route == Some(work_route)
+                && frame_dispatch == Some(work_dispatch)
+                && frame_reply == Some(work_reply))] {
+            crate::print_str(b"/"); crate::print_hex_u64(value);
+        }
+        crate::print_str(b"\n");
+    }
 }
 
 /// Root ingress receives a move-only proof only when the exact park attempt has no effects.
