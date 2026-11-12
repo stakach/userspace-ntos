@@ -4823,27 +4823,12 @@ unsafe fn resume_suspended_user_callback_component(
     pr
 }
 
-/// Republish the retained request cells after either kind of service wait completes.
-/// Both callers select the client window and publish their service result first.
-unsafe fn restore_wait_dispatch_cells(
-    dispatch: nt_user_callback::DispatchContext,
-    client: Win32kClientContext,
-    nested_user_callback: bool,
+/// The argument bank is separate from the dispatch-owned shared page snapshot.
+/// Restore only these bounded bytes after the exact page has been restored.
+unsafe fn restore_wait_argument_snapshot(
     arg_snapshot: &[u8; COMPLETED_ARG_SNAPSHOT_BYTES],
     arg_snapshot_len: u32,
 ) -> bool {
-    let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
-    for (offset, value) in [
-        (win32k_subsystem::SH_REQ_SSN, dispatch.ssn),
-        (win32k_subsystem::SH_REQ_A0, dispatch.args[0]),
-        (win32k_subsystem::SH_REQ_A1, dispatch.args[1]),
-        (win32k_subsystem::SH_REQ_A2, dispatch.args[2]),
-        (win32k_subsystem::SH_REQ_A3, dispatch.args[3]),
-        (win32k_subsystem::SH_REQ_CALLER_SP, dispatch.caller_sp),
-        (win32k_subsystem::SH_REQ_NESTED_CALLBACK, nested_user_callback as u64),
-    ] {
-        core::ptr::write_volatile((sh + offset) as *mut u64, value);
-    }
     let arg_snapshot_len = arg_snapshot_len as usize;
     if arg_snapshot_len > arg_snapshot.len() {
         return false;
@@ -4855,21 +4840,6 @@ unsafe fn restore_wait_dispatch_cells(
             arg_snapshot_len,
         );
     }
-    for (offset, value) in [
-        (win32k_subsystem::SH_REQ_PROCESS_ID, client.pid),
-        (win32k_subsystem::SH_REQ_CLIENT_PI, client.pi as u64),
-        (win32k_subsystem::SH_REQ_GENERATION, client.generation),
-        (win32k_subsystem::SH_REQ_CLIENT_TEB, client.teb),
-        (win32k_subsystem::SH_REQ_THREAD_ID, client.tid),
-        (win32k_subsystem::SH_REQ_EPROCESS, client.eprocess),
-        (win32k_subsystem::SH_REQ_ETHREAD, client.ethread),
-        (
-            win32k_subsystem::SH_REQ_PROCESS_ROLE,
-            callback_process_role_code(client.process_role) as u64,
-        ),
-    ] {
-        core::ptr::write_volatile((sh + offset) as *mut u64, value);
-    }
     true
 }
 
@@ -4879,13 +4849,13 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
     status: i32,
 ) -> ProviderWaitPumpCompletion {
     if !win32k_client_context_is_admitted(pending.client) {
-        return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+        return ProviderWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
     }
     let Some(request) = pending.request.validate().ok() else {
-        return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+        return ProviderWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
     };
     let Some(client) = request.owner.hosted_client() else {
-        return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+        return ProviderWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
     };
     if request.wait_id != wait_id
         || client.client_pi != pending.client.pi
@@ -4894,7 +4864,7 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         || client.client_badge != pending.client.badge
         || request.owner.dispatch_id != pending.dispatch.dispatch_id
     {
-        return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+        return ProviderWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
     }
 
     let Some(mut channel) = win32k_lane_channel(
@@ -4905,12 +4875,22 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         true,
         true,
     ) else {
-        return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+        return ProviderWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
     };
     channel.caps.hosted_receive_yield = !pending.nested_user_callback
         && channel.logical_caller.is_some();
-    if !select_win32k_client_window(pending.client) {
-        return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+    let Some(shared_resume) = pending.shared_resume else {
+        return ProviderWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
+    };
+    // The singleton page may now belong to a different dispatch. Restore the exact
+    // retained header and payload before a resumed pump can yield another Receive.
+    if !select_and_restore_shared_resume_snapshot(
+        shared_resume, pending.dispatch, pending.client,
+    ).1 {
+        return ProviderWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
+    }
+    if !restore_wait_argument_snapshot(&pending.arg_snapshot, pending.arg_snapshot_len) {
+        return ProviderWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
     }
     let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
         as *mut nt_provider_wait::ProviderWaitSharedPage;
@@ -4919,12 +4899,6 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         nt_provider_wait::ProviderWaitResult::completed(wait_id, status),
     );
 
-    if !restore_wait_dispatch_cells(
-        pending.dispatch, pending.client, pending.nested_user_callback,
-        &pending.arg_snapshot, pending.arg_snapshot_len,
-    ) {
-        return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
-    }
     let client = pending.client;
     let previous_dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
     core::ptr::write(
@@ -5063,7 +5037,7 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
     reply: &[u8],
 ) -> LpcWaitPumpCompletion {
     if !win32k_client_context_is_admitted(pending.client) {
-        return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+        return LpcWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
     }
     if !pending.request.validate()
         || pending.request.port_handle == 0
@@ -5078,7 +5052,7 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
                 || u16::from_le_bytes(reply[4..6].try_into().unwrap())
                     != nt_lpc_abi::msg_type::LPC_REPLY))
     {
-        return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+        return LpcWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
     }
 
     let Some(mut channel) = win32k_lane_channel(
@@ -5089,12 +5063,20 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
         true,
         true,
     ) else {
-        return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+        return LpcWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
     };
     channel.caps.hosted_receive_yield = !pending.nested_user_callback
         && channel.logical_caller.is_some();
-    if !select_win32k_client_window(pending.client) {
-        return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+    let Some(shared_resume) = pending.shared_resume else {
+        return LpcWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
+    };
+    if !select_and_restore_shared_resume_snapshot(
+        shared_resume, pending.dispatch, pending.client,
+    ).1 {
+        return LpcWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
+    }
+    if !restore_wait_argument_snapshot(&pending.arg_snapshot, pending.arg_snapshot_len) {
+        return LpcWaitPumpCompletion::RetainedFailure(pending, 0xC000_000Du32 as i32);
     }
     let lpc = win32k_subsystem::WIN32K_LPC_VADDR;
     core::ptr::write_volatile(
@@ -5125,12 +5107,6 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
         pending.request.generation,
     );
 
-    if !restore_wait_dispatch_cells(
-        pending.dispatch, pending.client, pending.nested_user_callback,
-        &pending.arg_snapshot, pending.arg_snapshot_len,
-    ) {
-        return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
-    }
     let client = pending.client;
     let previous_dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
     core::ptr::write(
@@ -5185,6 +5161,7 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
             },
             dispatch: pending.dispatch,
             client: pending.client,
+            shared_resume: try_capture_exact_shared_resume_snapshot(pending.dispatch, pending.client),
             nested_user_callback: pending.nested_user_callback,
             arg_snapshot_len: pending.arg_snapshot_len,
             arg_snapshot: pending.arg_snapshot,
@@ -6056,6 +6033,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             request: wait_request,
             dispatch: dispatch_context,
             client: completed_context,
+            shared_resume: try_capture_exact_shared_resume_snapshot(dispatch_context, completed_context),
             nested_user_callback,
             arg_snapshot_len,
             arg_snapshot,
@@ -7988,6 +7966,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
                     paint_output,
                 },
                 client,
+                shared_resume: try_capture_exact_shared_resume_snapshot(dispatch, client),
                 nested_user_callback,
                 arg_snapshot_len,
                 arg_snapshot,
@@ -8019,6 +7998,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
                     paint_output,
                 },
                 client,
+                shared_resume: try_capture_exact_shared_resume_snapshot(dispatch, client),
                 nested_user_callback,
                 arg_snapshot_len,
                 arg_snapshot,

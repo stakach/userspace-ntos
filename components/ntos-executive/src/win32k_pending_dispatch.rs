@@ -625,6 +625,7 @@ pub(crate) struct PendingProviderWaitDispatch {
     pub request: nt_provider_wait::ProviderWaitRequest,
     pub dispatch: nt_user_callback::DispatchContext,
     pub client: Win32kClientContext,
+    pub shared_resume: Option<SharedResumeSnapshot>,
     pub nested_user_callback: bool,
     pub arg_snapshot_len: u32,
     pub arg_snapshot: [u8; COMPLETED_ARG_SNAPSHOT_BYTES],
@@ -637,6 +638,7 @@ pub(crate) struct PendingLpcWaitDispatch {
     pub request: win32k_subsystem::Win32kLpcWaitRequest,
     pub dispatch: nt_user_callback::DispatchContext,
     pub client: Win32kClientContext,
+    pub shared_resume: Option<SharedResumeSnapshot>,
     pub nested_user_callback: bool,
     pub arg_snapshot_len: u32,
     pub arg_snapshot: [u8; COMPLETED_ARG_SNAPSHOT_BYTES],
@@ -652,6 +654,7 @@ pub(crate) enum ProviderWaitPumpCompletion {
     ReceiveReparked(PendingReceiveDispatch),
     ServiceReparked(PendingServiceWaitDispatch),
     UserCallbackSuspended,
+    RetainedFailure(PendingProviderWaitDispatch, i32),
     Failed(i32),
 }
 
@@ -662,6 +665,7 @@ pub(crate) enum LpcWaitPumpCompletion {
     ReceiveReparked(PendingReceiveDispatch),
     ServiceReparked(PendingServiceWaitDispatch),
     UserCallbackSuspended,
+    RetainedFailure(PendingLpcWaitDispatch, i32),
     Failed(i32),
 }
 
@@ -691,6 +695,7 @@ pub(super) unsafe fn capture_provider_wait_repark(
         request: core::ptr::read_volatile(core::ptr::addr_of!((*page).request)),
         dispatch: prior.dispatch,
         client: prior.client,
+        shared_resume: try_capture_exact_shared_resume_snapshot(prior.dispatch, prior.client),
         nested_user_callback: prior.nested_user_callback,
         arg_snapshot_len: prior.arg_snapshot_len,
         arg_snapshot: prior.arg_snapshot,
@@ -708,6 +713,7 @@ pub(super) unsafe fn capture_lpc_wait_repark(
         request: win32k_subsystem::capture_lpc_wait_request()?,
         dispatch,
         client,
+        shared_resume: try_capture_exact_shared_resume_snapshot(dispatch, client),
         nested_user_callback,
         arg_snapshot_len,
         arg_snapshot,

@@ -525,6 +525,14 @@ pub(crate) unsafe fn run_root_maintenance(
             RootMaintenanceResumeOutcome::RetainedFailure
         }
         win32k_glue::RootMaintenancePumpCompletion::Restored(
+            win32k_glue::ProviderWaitPumpCompletion::RetainedFailure(_, status),
+        ) => {
+            // The root maintenance row has already stored the returned pump result,
+            // including its exact pending wait and physical Reply owner.
+            trace_root_refusal(ticket, b"pump-restore-refused", status as u32 as u64);
+            RootMaintenanceResumeOutcome::RetainedFailure
+        }
+        win32k_glue::RootMaintenancePumpCompletion::Restored(
             win32k_glue::ProviderWaitPumpCompletion::ReceiveReparked(_)
             | win32k_glue::ProviderWaitPumpCompletion::ServiceReparked(_),
         ) => {

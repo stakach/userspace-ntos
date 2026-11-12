@@ -89,3 +89,53 @@ fn fresh_win32k_dispatch_waits_for_returned_receive_page_capture() {
     assert!(service.contains("fn component_shared_publication_is_busy()"));
     assert!(service.contains(".fresh_dispatch_busy()"));
 }
+
+#[test]
+fn resumed_wait_restores_exact_callback_page_before_reentering_pump() {
+    let pending = source("win32k_pending_dispatch.rs");
+    let dispatch = source("win32k_glue.rs");
+    for (kind, pending_type, suspend, pending_store, resume, pump) in [
+        ("provider", "PendingProviderWaitDispatch", "if pr.provider_wait_suspended {\n        let page =",
+            "PROVIDER_WAIT_LAST_PUMP_SUSPENDED.store", "resume_suspended_provider_wait_component(",
+            "component_pump_resume_provider_wait(&channel)"),
+        ("LPC", "PendingLpcWaitDispatch", "if pr.lpc_wait_suspended {\n        let Some(request) =",
+            "LPC_WAIT_LAST_PUMP_SUSPENDED.store", "resume_suspended_lpc_wait_component(",
+            "component_pump_resume_lpc_wait(&channel)"),
+    ] {
+        let declaration = pending.split_once(&format!("struct {pending_type} {{"))
+            .and_then(|(_, rest)| rest.split_once("\n}").map(|(body, _)| body))
+            .expect("retained wait dispatch type");
+        assert!(declaration.contains("shared_resume: Option<SharedResumeSnapshot>"),
+            "{kind} wait must retain its complete callback header, payload and request owner before another dispatch can overwrite the singleton page");
+
+        let suspend_body = dispatch.rsplit_once(suspend)
+            .and_then(|(_, rest)| rest.split_once(pending_store).map(|(body, _)| body))
+            .expect("wait suspension publishes a pending owner");
+        assert!(suspend_body.contains("try_capture_exact_shared_resume_snapshot(")
+            && suspend_body.contains("shared_resume"),
+            "{kind} wait must capture its exact shared page before publishing a suspended owner");
+
+        let resume_body = dispatch.split_once(resume)
+            .and_then(|(_, rest)| rest.split_once(pump).map(|(before_pump, _)| before_pump))
+            .expect("wait resume enters the existing pump");
+        assert!(resume_body.contains("pending.shared_resume")
+            && resume_body.contains("select_and_restore_shared_resume_snapshot("),
+            "{kind} wait must restore its exact retained page before the pump may yield a nested receive");
+        assert!(!resume_body.contains("CallbackHeader::idle("),
+            "a resumed wait cannot synthesize a callback header from request cells");
+        assert!(!resume_body.contains("PumpCompletion::Failed("),
+            "pre-entry identity or channel refusal must retain its pending wait record");
+    }
+}
+
+#[test]
+fn refused_wait_page_restore_retains_the_exact_pending_owner() {
+    let pending = source("win32k_pending_dispatch.rs");
+    let execute = source("component_resume_execute.rs");
+    assert!(pending.contains("RetainedFailure(PendingProviderWaitDispatch, i32)")
+        && pending.contains("RetainedFailure(PendingLpcWaitDispatch, i32)"),
+        "a refused page restore must carry its original pending wait instead of dropping it into a status");
+    assert!(execute.contains("ComponentPumpCompletion::FailedRetained(")
+        && execute.contains("Some(next),"),
+        "the blocked terminal must retain the exact pending snapshot alongside its lane and Reply");
+}

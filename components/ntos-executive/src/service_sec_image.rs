@@ -1755,6 +1755,7 @@ enum ComponentPumpCompletion {
     Completed(win32k_glue::CompletedWin32kDispatch),
     Reparked(PendingComponentDispatch),
     UserCallbackSuspended,
+    FailedRetained(PendingComponentDispatch, i32),
     Failed(i32),
 }
 

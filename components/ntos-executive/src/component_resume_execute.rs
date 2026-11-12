@@ -131,6 +131,11 @@ pub(crate) unsafe fn run_hosted(
                 win32k_glue::ProviderWaitPumpCompletion::Failed(status) => {
                     ComponentPumpCompletion::Failed(status)
                 }
+                win32k_glue::ProviderWaitPumpCompletion::RetainedFailure(pending, status) => {
+                    ComponentPumpCompletion::FailedRetained(
+                        PendingComponentDispatch::Provider(pending), status,
+                    )
+                }
             }
         }
         PendingComponentDispatch::Lpc(pending) => {
@@ -161,6 +166,11 @@ pub(crate) unsafe fn run_hosted(
                 win32k_glue::LpcWaitPumpCompletion::Failed(status) => {
                     ComponentPumpCompletion::Failed(status)
                 }
+                win32k_glue::LpcWaitPumpCompletion::RetainedFailure(pending, status) => {
+                    ComponentPumpCompletion::FailedRetained(
+                        PendingComponentDispatch::Lpc(pending), status,
+                    )
+                }
             }
         }
         PendingComponentDispatch::Receive(_) => {
@@ -185,6 +195,10 @@ pub(crate) unsafe fn run_hosted(
                         ComponentPumpCompletion::UserCallbackSuspended,
                     win32k_glue::ProviderWaitPumpCompletion::Failed(status) =>
                         ComponentPumpCompletion::Failed(status),
+                    win32k_glue::ProviderWaitPumpCompletion::RetainedFailure(pending, status) =>
+                        ComponentPumpCompletion::FailedRetained(
+                            PendingComponentDispatch::Provider(pending), status,
+                        ),
                 },
                 win32k_glue::ServiceWaitPumpCompletion::ServiceReparked(pending) =>
                     ComponentPumpCompletion::Reparked(PendingComponentDispatch::ServiceWait(pending)),
@@ -361,6 +375,11 @@ pub(crate) unsafe fn run_receive(
         win32k_glue::ProviderWaitPumpCompletion::Failed(status) => {
             ComponentPumpCompletion::Failed(status)
         }
+        win32k_glue::ProviderWaitPumpCompletion::RetainedFailure(pending, status) => {
+            ComponentPumpCompletion::FailedRetained(
+                PendingComponentDispatch::Provider(pending), status,
+            )
+        }
     };
     let outcome = finish_hosted_resume(
         nt_handler,
@@ -451,6 +470,21 @@ unsafe fn finish_hosted_resume(
                 resume.key,
                 frame.owner,
                 None,
+                status as u32,
+            );
+            return Some(ComponentSuspensionRuntimeOutcome::Terminal);
+        }
+        ComponentPumpCompletion::FailedRetained(next, status) => {
+            // Page restoration was refused before publishing a result or entering the
+            // provider. Keep the exact suspended owner in the terminal quarantine.
+            trace_repark_failure(b"pump-restore-refused", lane, resume.key,
+                status as u32, Some(next), None);
+            component_terminal::retain_incomplete_provider(
+                lane,
+                reply_object,
+                resume.key,
+                frame.owner,
+                Some(next),
                 status as u32,
             );
             return Some(ComponentSuspensionRuntimeOutcome::Terminal);
