@@ -29047,6 +29047,29 @@ static ROOT_ADD_DEVICE_EXCLUSIVE: AtomicBool = AtomicBool::new(false);
 static ROOT_QUEUED_CALLBACK_EXCLUSIVE: AtomicBool = AtomicBool::new(false);
 static ROOT_QUEUED_CALLBACK_RETRY_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
 static ROOT_QUEUED_CALLBACK_FAILURE_TRACE: AtomicU64 = AtomicU64::new(0);
+static ROOT_QUEUED_CALLBACK_REFRESH_TRACE: AtomicU64 = AtomicU64::new(0);
+
+/// A queue claim owns its root turn across every Reply its resumed parent refreshes. Follow
+/// only the exact selector that claim's own row yields now; the turn keeps its deferred
+/// ingress tickets, retry deadline, and single retirement watch. The bounded receipt records
+/// each copied identity pair so a boot shows the transition that used to end the root loop.
+unsafe fn refresh_queued_callback_turn_witness(turn: &mut RootQueuedCallbackTurn) -> bool {
+    let retired = turn.owner();
+    let Some(current) = crate::driver_launch::queued_callback_refreshed_selector(retired) else {
+        return true;
+    };
+    if turn.advance_owner(retired, current).is_err() { return false; }
+    if ROOT_QUEUED_CALLBACK_REFRESH_TRACE.fetch_add(1, Ordering::Relaxed) < 16 {
+        use core::fmt::Write;
+        let mut record = nt_printf::record::RecordBuffer::<768>::new();
+        let _ = writeln!(record,
+            "[queued-callback-root-refresh] retired={:?} current={:?} watch={}",
+            retired.diagnostic_identity(), current.diagnostic_identity(),
+            u8::from(crate::driver_launch::queued_callback_root_watch_present(current)));
+        sel4_rt::print_record(record.bytes());
+    }
+    true
+}
 
 /// Failure-only root receipt. Selector snapshots are copied identities, never ACK authority.
 unsafe fn trace_queued_callback_root_failure(
@@ -29146,6 +29169,7 @@ unsafe fn prepare_parked_queued_callback_receive(
     current: &mut Vec<RootQueuedCallbackTurn>,
 ) -> bool {
     let Some(turn) = current.last_mut() else { return false };
+    if !refresh_queued_callback_turn_witness(turn) { return false; }
     let owner = turn.owner();
     use crate::driver_launch::QueuedCallbackRootAction as Action;
     if !matches!(crate::driver_launch::queued_callback_root_action(),
@@ -29206,7 +29230,8 @@ impl ParkedRootAddDevicePermit {
 }
 
 /// Proof that the newest physical queue callback still needs a local child or a certified
-/// no-effects restore retry. The selector includes queue generation and physical Reply identity.
+/// no-effects restore retry. The selector includes queue generation and physical Reply identity;
+/// it is reselected at every park because the Reply can be refreshed within one generation.
 pub(crate) struct ParkedRootQueuedCallbackPermit(crate::driver_launch::QueuedCallbackSelector);
 
 impl ParkedRootQueuedCallbackPermit {
@@ -29231,7 +29256,8 @@ impl ParkedRootQueuedCallbackPermit {
 }
 
 /// Synchronize the retained parent stack to the newest exact queue action before any current
-/// Call is returned to ingress. A newer callback must get its own root turn and ACK witness.
+/// Call is returned to ingress. The same queue claim continues its turn under a refreshed
+/// Reply; a newer callback must get its own root turn and ACK witness.
 unsafe fn ensure_queued_callback_root_turn(
     current: &mut Vec<RootQueuedCallbackTurn>,
     permit: &ParkedRootQueuedCallbackPermit,
@@ -29242,6 +29268,10 @@ unsafe fn ensure_queued_callback_root_turn(
     }
     if !settle_parked_queued_callback_turn(current) {
         trace_queued_callback_root_failure("prior-turn-settlement", current, Some(permit));
+        return false;
+    }
+    if current.last_mut().is_some_and(|turn| !refresh_queued_callback_turn_witness(turn)) {
+        trace_queued_callback_root_failure("witness-refresh", current, Some(permit));
         return false;
     }
     if current.last().is_some_and(|turn| turn.owner() == permit.0) { return true; }

@@ -412,3 +412,55 @@ fn older_deferred_call_is_preserved_before_later_arrival_after_callback_settleme
         && root.contains("component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed))"),
         "after retained ingress X/Y is released, root must receive those original Calls before ordinary admission");
 }
+
+// Behaviour of the owner advance and claim-keyed retirement is proven on the host by
+// nt-component-suspension's queued_callback_selector_advance tests. This fixes only the
+// native wiring: where the witness is refreshed and what the watch storage can be keyed on.
+#[test]
+fn refreshed_reply_continues_the_claims_root_turn_and_retirement_watch() {
+    assert!(
+        QUEUE.contains(
+            "static mut ROOT_RETIREMENT_WATCHES: RootChildRetirementWatches<QueuedCallbackClaim>"
+        ),
+        "a retirement receipt must be keyed by the queue claim, which carries no Reply"
+    );
+    let ack = function_body(QUEUE, "unsafe fn acknowledge_resumed_return(");
+    assert!(
+        ack.contains("terminal.physical != selector.physical")
+            && ack.contains(".acknowledge(claim)"),
+        "the exact terminal Reply authorizes the queue ACK; the claim seals its root receipt"
+    );
+    let refreshed = function_body(
+        QUEUE,
+        "pub(crate) unsafe fn queued_callback_refreshed_selector(",
+    );
+    assert!(
+        refreshed.contains("!owner.claim.owns(row) || row.resuming")
+            && refreshed.contains("exact_physical_identity(index, row)?")
+            && refreshed.contains("physical != owner.physical")
+            && refreshed.contains("claim: owner.claim"),
+        "only the same row generation's authenticated current identity may replace a witness"
+    );
+    let refresh = function_body(SERVICE, "unsafe fn refresh_queued_callback_turn_witness(");
+    assert!(
+        refresh.contains("queued_callback_refreshed_selector(retired)")
+            && refresh.contains("turn.advance_owner(retired, current)"),
+        "the retained turn follows its own claim through the typed owner advance"
+    );
+    let park = function_body(SERVICE, "unsafe fn ensure_queued_callback_root_turn(");
+    let settle = park.find("settle_parked_queued_callback_turn(current)").expect("settle");
+    let refresh = park.find("refresh_queued_callback_turn_witness(turn)").expect("refresh");
+    let same = park.find("turn.owner() == permit.0").expect("same owner");
+    let newer = park.find("queued_callback_newer_root_child").expect("newer child proof");
+    let watch = park.find("watch_queued_callback_root_retirement").expect("new watch");
+    assert!(
+        settle < refresh && refresh < same && same < newer && newer < watch,
+        "a refreshed Reply must be recognised as the same owner before a second turn or watch"
+    );
+    let prepare = function_body(SERVICE, "unsafe fn prepare_parked_queued_callback_receive(");
+    assert!(
+        prepare.find("refresh_queued_callback_turn_witness(turn)").expect("refresh")
+            < prepare.find("if selector == owner").expect("exact action"),
+        "the blocking receive must compare the selected action with the refreshed witness"
+    );
+}

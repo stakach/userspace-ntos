@@ -4,7 +4,9 @@
 //! and authenticate its physical route, dispatch, TCB, Reply, and epoch before root resumes it.
 
 use super::*;
-use nt_component_suspension::{HostedWorkQueueClaim, HostedWorkQueueReady};
+use nt_component_suspension::{
+    HostedWorkQueueClaim, HostedWorkQueueReady, RootChildOwner, RootChildRetirementWatches,
+};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) struct QueueEntryKey {
@@ -58,14 +60,11 @@ static mut CLAIMS: Vec<Option<Row>> = Vec::new();
 static mut ORPHANED_PUMPS: Vec<component_scheduler::HostedPumpRestore> = Vec::new();
 static mut ORPHANED_STEPS: Vec<crate::service_sec_image::NestedChildStep> = Vec::new();
 /// Root waits register before retrying a retained callback. The one-use queue ACK seals an
-/// exact retirement receipt without allocating after the physical provider effect.
-static mut ROOT_RETIREMENT_WATCHES: Vec<WatchedCallbackRetirement> = Vec::new();
+/// exact retirement receipt without allocating after the physical provider effect. A receipt
+/// belongs to the queue claim, so it survives every Reply that claim's resumed parent refreshes.
+static mut ROOT_RETIREMENT_WATCHES: RootChildRetirementWatches<QueuedCallbackClaim> =
+    RootChildRetirementWatches::new();
 static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-struct WatchedCallbackRetirement {
-    selector: QueuedCallbackSelector,
-    acknowledged: bool,
-}
 
 /// One queue row generation, stable from its claim to its one-use return ACK. A reused
 /// slot or ring head gets a new sequence, so this never names a later claim.
@@ -88,10 +87,17 @@ impl QueuedCallbackClaim {
 
 /// An exact selector for a parked callback. Queue entry identity and physical invocation
 /// identity are separate; neither the shared ring head nor a numeric Reply alone is authority.
+/// The claim owns root turns and retirement; the physical identity is its revalidated witness.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct QueuedCallbackSelector {
     claim: QueuedCallbackClaim,
     physical: component_scheduler::ChildWorkPhysicalIdentity,
+}
+
+impl RootChildOwner for QueuedCallbackSelector {
+    type Claim = QueuedCallbackClaim;
+
+    fn claim(&self) -> QueuedCallbackClaim { self.claim }
 }
 
 impl QueuedCallbackSelector {
@@ -248,8 +254,8 @@ pub(super) unsafe fn record_ndis(
 pub(super) unsafe fn acknowledge_return(index: usize, key: QueueEntryKey) -> bool {
     let rows = &mut *core::ptr::addr_of_mut!(CLAIMS);
     let Some(row) = rows.get_mut(index).and_then(Option::as_mut) else { return false; };
-    if (&*core::ptr::addr_of!(ROOT_RETIREMENT_WATCHES)).iter().any(|watch|
-        watch.selector.claim == QueuedCallbackClaim { index, key, sequence: row.sequence })
+    if (&*core::ptr::addr_of!(ROOT_RETIREMENT_WATCHES))
+        .watched(QueuedCallbackClaim { index, key, sequence: row.sequence })
     { return false; }
     if row.pump.is_some() || row.child_step.is_some() || row.resuming
         || row.claim.invocation() != key || !row.claim.entered()
@@ -279,11 +285,8 @@ unsafe fn acknowledge_resumed_return(selector: QueuedCallbackSelector) -> bool {
         || row.claim.acknowledge_return(claim.key).is_err()
     { return false; }
     rows[claim.index] = None;
-    if let Some(watch) = (&mut *core::ptr::addr_of_mut!(ROOT_RETIREMENT_WATCHES))
-        .iter_mut().find(|watch| watch.selector == selector)
-    {
-        watch.acknowledged = true;
-    }
+    // A callback that never parked at the root has no watch and retires without a receipt.
+    let _ = (&mut *core::ptr::addr_of_mut!(ROOT_RETIREMENT_WATCHES)).acknowledge(claim);
     true
 }
 
@@ -387,21 +390,33 @@ pub(crate) unsafe fn watch_queued_callback_root_retirement(
     };
     if selected != selector || queued_callback_file_floor(selector).is_none()
     { return false; }
-    let watches = &mut *core::ptr::addr_of_mut!(ROOT_RETIREMENT_WATCHES);
-    if watches.iter().any(|watch| watch.selector == selector) { return false; }
-    if watches.try_reserve(1).is_err() { return false; }
-    watches.push(WatchedCallbackRetirement { selector, acknowledged: false });
-    true
+    (&mut *core::ptr::addr_of_mut!(ROOT_RETIREMENT_WATCHES)).watch(selector.claim()).is_ok()
 }
 
 pub(crate) unsafe fn queued_callback_root_retired(selector: QueuedCallbackSelector) -> bool {
-    (&*core::ptr::addr_of!(ROOT_RETIREMENT_WATCHES))
-        .iter().any(|watch| watch.selector == selector && watch.acknowledged)
+    (&*core::ptr::addr_of!(ROOT_RETIREMENT_WATCHES)).retired(selector.claim())
 }
 
 pub(crate) unsafe fn queued_callback_root_watch_present(selector: QueuedCallbackSelector) -> bool {
-    (&*core::ptr::addr_of!(ROOT_RETIREMENT_WATCHES))
-        .iter().any(|watch| watch.selector == selector)
+    (&*core::ptr::addr_of!(ROOT_RETIREMENT_WATCHES)).watched(selector.claim())
+}
+
+/// The exact selector `owner`'s own queue claim yields now, when its witness has moved on.
+/// A resumed parent can return in the same row with a refreshed Reply. Only that row's
+/// authenticated current identity is offered; a reused slot, another key, a resuming row, or
+/// an unauthenticated Reply yields nothing and leaves the recorded witness in place.
+pub(crate) unsafe fn queued_callback_refreshed_selector(
+    owner: QueuedCallbackSelector,
+) -> Option<QueuedCallbackSelector> {
+    let index = owner.claim.index;
+    let row = (&*core::ptr::addr_of!(CLAIMS)).get(index)?.as_ref()?;
+    if !owner.claim.owns(row) || row.resuming { return None; }
+    let physical = match row.terminal_ack {
+        Some(terminal) => terminal.physical,
+        None => exact_physical_identity(index, row)?,
+    };
+    (physical != owner.physical)
+        .then_some(QueuedCallbackSelector { claim: owner.claim, physical })
 }
 
 pub(crate) unsafe fn queued_callback_newer_root_child(
@@ -426,12 +441,7 @@ pub(crate) unsafe fn queued_callback_newer_root_child(
 pub(crate) unsafe fn consume_queued_callback_root_retirement(
     selector: QueuedCallbackSelector,
 ) -> bool {
-    let watches = &mut *core::ptr::addr_of_mut!(ROOT_RETIREMENT_WATCHES);
-    let Some(index) = watches.iter().position(|watch|
-        watch.selector == selector && watch.acknowledged)
-    else { return false };
-    watches.swap_remove(index);
-    true
+    (&mut *core::ptr::addr_of_mut!(ROOT_RETIREMENT_WATCHES)).consume(selector.claim())
 }
 
 pub(crate) unsafe fn queued_callback_file_floor(
