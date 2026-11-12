@@ -39,6 +39,55 @@ impl InitialThreadCreationPlan {
 }
 
 impl ProcessManager {
+    /// A published child with no started main thread may be abandoned after its last external
+    /// owner disappears. Reservations and committed creation retain the child independently of
+    /// handles; the host uses this predicate only after observing a final handle close.
+    pub fn should_terminate_unstarted_process(&self, pid: ProcessId) -> bool {
+        let Some(process) = self.process(pid) else { return false; };
+        if process.kernel_process_object.is_none()
+            || matches!(process.state, ProcessState::Exiting | ProcessState::Terminated)
+            || process.exit_status.is_some()
+            || process.initial_creation != InitialThreadCreationState::Unclaimed
+            || process.wait_references != 0
+            || process.kernel_pointer_references != 0
+            || self.handle_object_reference_count(HandleObject::Process(pid)) != 0
+        { return false; }
+        let Some(main) = process.main_thread else { return false; };
+        if !process.threads.iter().any(|&tid| tid == main) { return false; }
+        process.threads.iter().all(|&tid| {
+            let Some(thread) = self.thread(tid) else { return false; };
+            thread.process_id == pid
+                && (tid == main || thread.state == ThreadState::Initialized)
+                && thread.state != ThreadState::Terminated
+                && thread.activation_generation == 1
+                && thread.wait_references == 0
+                && thread.kernel_pointer_references == 0
+                && thread.pending_suspend_control.is_none()
+                && self.handle_object_reference_count(HandleObject::Thread(tid)) == 0
+        })
+    }
+
+    /// Record an actual last-handle close even when a transient pointer, wait, or in-flight
+    /// creation still owns the process. The drain checks eligibility later; this receipt is not
+    /// inferred merely from a process that has not published its first handle yet.
+    pub fn request_unstarted_process_abandonment(&mut self, pid: ProcessId) -> bool {
+        let Some(process) = self.process(pid) else { return false; };
+        if process.kernel_process_object.is_none()
+            || process.main_thread.is_none()
+            || matches!(process.state, ProcessState::Exiting | ProcessState::Terminated)
+            || matches!(process.initial_creation, InitialThreadCreationState::Committed { .. })
+            || self.handle_object_reference_count(HandleObject::Process(pid)) != 0
+        { return false; }
+        self.processes.get_mut(&pid).unwrap().unstarted_abandonment_requested = true;
+        true
+    }
+
+    /// A failed host preflight remains discoverable without replaying any uncertain effect.
+    pub fn unstarted_process_abandonment_pending(&self, pid: ProcessId) -> bool {
+        self.process(pid).is_some_and(|process| process.unstarted_abandonment_requested)
+            && self.should_terminate_unstarted_process(pid)
+    }
+
     /// Reserve the initial creation once. `None` means its creation was already committed,
     /// including after main-thread exit; subsequent creations must use ordinary worker admission.
     pub fn prepare_initial_thread_creation(

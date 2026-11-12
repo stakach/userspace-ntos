@@ -21242,6 +21242,7 @@ impl ExecNtHandler {
                 let _ = self
                     .pm
                     .clear_deleted_process_debug_object_if_unreferenced(pid);
+                let _ = self.try_terminate_unstarted_process(pid);
                 let _ = self.try_delete_hosted_process_object(pid);
             }
             nt_process::HandleObject::Thread(tid) => {
@@ -21534,6 +21535,38 @@ impl ExecNtHandler {
             .take_process_exception_port_endpoint(pid)
             .expect("a process with a retained exception port remains live through teardown");
         assert_eq!(released, Some(endpoint));
+    }
+
+    /// A failed first-thread creation can leave a published process after CreateProcessW closes
+    /// its final handle. That close records abandonment once; a failed preflight is retried by
+    /// the service-loop drain using the same process identity, never by a guessed slot occupant.
+    fn try_terminate_unstarted_process(&mut self, pid: nt_process::ProcessId) -> bool {
+        if !self.pm.request_unstarted_process_abandonment(pid)
+            || !self.pm.unstarted_process_abandonment_pending(pid)
+        { return false; }
+        let reserved_files = match self.reserve_rundown_hosted_files(pid) {
+            Ok(files) => files,
+            Err(_) => return false,
+        };
+        if !self.pm.unstarted_process_abandonment_pending(pid) {
+            self.cancel_rundown_hosted_files(&reserved_files);
+            return false;
+        }
+        self.sample_hosted_process_scheduler_times(pid);
+        if self.pm.terminate_process_at(
+            pid, nt_process::STATUS_UNSUCCESSFUL, nt_system_time_100ns() as i64,
+        ).is_err() {
+            self.cancel_rundown_hosted_files(&reserved_files);
+            return false;
+        }
+        crate::process_terminal_receipt::drain_hosted_process_exit_notifications(self);
+        crate::process_terminal_receipt::note_native_process_terminal(
+            self, pid, self.pi_for_pid(pid).and_then(|pi| u8::try_from(pi).ok()),
+        );
+        self.release_process_handles(pid, reserved_files);
+        unsafe { wait_wake_dispatcher_set(self); }
+        let _ = self.try_delete_hosted_process_object(pid);
+        true
     }
 
     /// Queue and, when currently ready, complete the Object Manager's EPROCESS delete procedure.
@@ -22054,6 +22087,16 @@ impl ExecNtHandler {
         self.drain_failed_thread_constructions();
         let mut deleted = 0usize;
         let _durable = allocator::enter_durable();
+        // A final process-handle close may have recorded abandonment before an exit-notify or
+        // file-rundown preflight could finish. Retry only that recorded exact PID, never an
+        // unstarted process that has not yet published its first handle.
+        for pi in 0..MAX_PI {
+            let Some(mechanism) = self.process_mechanisms.get(pi) else { continue; };
+            let pid = mechanism.pid;
+            if self.pm.unstarted_process_abandonment_pending(pid) {
+                let _ = self.try_terminate_unstarted_process(pid);
+            }
+        }
         // A transient reservation failure cannot strand a signaled process whose deletion row
         // was never queued. Rediscover that exact live mechanism on each service-loop drain.
         for pi in 0..MAX_PI {

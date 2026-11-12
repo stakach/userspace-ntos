@@ -719,6 +719,9 @@ pub struct NtProcess {
     pub threads: ThreadIdSet,
     pub main_thread: Option<ThreadId>,
     initial_creation: initial_thread_creation::InitialThreadCreationState,
+    /// Set only after the last external process handle closes before main-thread creation.
+    /// Retained across transient termination failures for the executive's exact retry drain.
+    unstarted_abandonment_requested: bool,
     pub state: ProcessState,
     pub exit_status: Option<u32>,
     /// Dispatcher references held by parked waits independently of user handles.
@@ -1487,6 +1490,7 @@ impl ProcessManager {
                 threads: ThreadIdSet::new(),
                 main_thread: None,
                 initial_creation: initial_thread_creation::InitialThreadCreationState::Unclaimed,
+                unstarted_abandonment_requested: false,
                 state,
                 exit_status: None,
                 wait_references: 0,
