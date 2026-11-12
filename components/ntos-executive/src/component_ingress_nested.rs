@@ -29,8 +29,8 @@ static ABORT_WAKE: CoalescedRetryWake = CoalescedRetryWake::new();
 static LAST_ABORT: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 // Temporary read-only evidence for a source Work that arrives while its exact Win32k
-// provider frame is Resuming. One slot per physical lane prevents unrelated provider
-// activity from evicting this resume before the source terminal is sampled.
+// provider frame is Resuming. Several exact frames can be nested on one physical lane;
+// retain their separate histories until the source terminal is sampled.
 #[derive(Clone, Copy)]
 struct SourceResumeTrace {
     route: PeerRoute,
@@ -42,9 +42,36 @@ struct SourceResumeTrace {
 }
 
 const SOURCE_RESUME_TRACE_CAP: usize = 256;
+const SOURCE_RESUME_TRACE_DEPTH: usize = 8;
 static SOURCE_RESUME_TRACE_NEXT: AtomicU64 = AtomicU64::new(0);
-static mut SOURCE_RESUME_TRACES: [Option<SourceResumeTrace>; SOURCE_RESUME_TRACE_CAP] =
-    [None; SOURCE_RESUME_TRACE_CAP];
+static mut SOURCE_RESUME_TRACES: [Option<SourceResumeTrace>; SOURCE_RESUME_TRACE_CAP * SOURCE_RESUME_TRACE_DEPTH] =
+    [None; SOURCE_RESUME_TRACE_CAP * SOURCE_RESUME_TRACE_DEPTH];
+
+unsafe fn source_resume_trace_slot(
+    lane: nt_component_suspension::LaneHandle, route: PeerRoute,
+    dispatch: LaneDispatchIdentity, reply: u64, key: u64, owner: u64,
+) -> Option<*mut Option<SourceResumeTrace>> {
+    let base = (lane.index as usize).checked_mul(SOURCE_RESUME_TRACE_DEPTH)?;
+    if base >= SOURCE_RESUME_TRACE_CAP * SOURCE_RESUME_TRACE_DEPTH { return None }
+    let slots = core::ptr::addr_of_mut!(SOURCE_RESUME_TRACES)
+        .cast::<Option<SourceResumeTrace>>().add(base);
+    let mut vacant = None;
+    let mut oldest = (u64::MAX, 0);
+    for offset in 0..SOURCE_RESUME_TRACE_DEPTH {
+        let slot = slots.add(offset);
+        match slot.read() {
+            Some(entry) if entry.route == route && entry.dispatch == dispatch
+                && entry.reply == reply && entry.key == key && entry.owner == owner =>
+                return Some(slot),
+            Some(entry) => {
+                let last = entry.stages.iter().copied().max().unwrap_or(0);
+                if last < oldest.0 { oldest = (last, offset); }
+            }
+            None => if vacant.is_none() { vacant = Some(slot); },
+        }
+    }
+    Some(vacant.unwrap_or_else(|| slots.add(oldest.1)))
+}
 
 pub(crate) unsafe fn record_source_resume_transition(
     stage: u64, lane: nt_component_suspension::LaneHandle,
@@ -53,11 +80,20 @@ pub(crate) unsafe fn record_source_resume_transition(
 ) {
     if !(1..=4).contains(&stage) { return }
     if dispatch.lane() != lane { return }
-    let Some(route) = lanes().peer_route(lane).ok().flatten() else { return };
-    let index = lane.index as usize;
-    if index >= SOURCE_RESUME_TRACE_CAP { return }
-    let slot = core::ptr::addr_of_mut!(SOURCE_RESUME_TRACES)
-        .cast::<Option<SourceResumeTrace>>().add(index);
+    let route = lanes().peer_route(lane).ok().flatten();
+    if stage == 1 && key.kind == nt_component_suspension::SuspensionKind::ProviderWait {
+        // Printed at the mutation site: even a later nested frame or missing route cannot
+        // erase proof that begin_resume happened for this exact frame.
+        crate::print_str(b"[source-resume-claim] lane/gen/epoch/reply/key/owner/route-present=");
+        for value in [u64::from(lane.index), lane.generation, dispatch.epoch(), reply,
+            key.id, owner.dispatch_id, u64::from(route.is_some())] {
+            crate::print_str(b"/"); crate::print_hex_u64(value);
+        }
+        crate::print_str(b"\n");
+    }
+    let Some(route) = route else { return };
+    let Some(slot) = source_resume_trace_slot(lane, route, dispatch, reply, key.id, owner.dispatch_id)
+        else { return };
     let previous = slot.read();
     let same = previous.is_some_and(|entry| entry.route == route
         && entry.dispatch == dispatch && entry.reply == reply
@@ -84,9 +120,8 @@ unsafe fn trace_first_exact_resuming_source_work(
         matching.then_some((lane, frame.key, frame.owner))
     });
     let Some((lane, key, owner)) = exact else { return };
-    let index = lane.index as usize;
-    let slot = (index < SOURCE_RESUME_TRACE_CAP).then(|| core::ptr::addr_of_mut!(SOURCE_RESUME_TRACES)
-        .cast::<Option<SourceResumeTrace>>().add(index));
+    let slot = source_resume_trace_slot(lane, work_route, work_dispatch, work_reply,
+        key.id, owner.dispatch_id);
     let previous = slot.and_then(|slot| slot.read());
     let same = previous.is_some_and(|entry| entry.route == work_route
         && entry.dispatch == work_dispatch && entry.reply == work_reply

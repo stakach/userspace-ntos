@@ -469,6 +469,17 @@ pub(crate) unsafe fn restore_settled_source_ioctl_parent(
                 parent.phase = ParentPhase::Quarantined;
                 return Err(Error::Admission);
             }
+            // This is the other ProviderWait transition into Resuming: an exact source
+            // child has settled and its previously parked parent is physically restored.
+            let checkpoint = &source.checkpoint;
+            crate::print_str(b"[source-resume-parent-restored] lane/gen/epoch/reply/key/owner=");
+            for value in [u64::from(checkpoint.parent_dispatch().lane().index),
+                checkpoint.parent_dispatch().lane().generation,
+                checkpoint.parent_dispatch().epoch(), checkpoint.parent_reply_object(),
+                checkpoint.parent_key().id, checkpoint.parent_owner().dispatch_id] {
+                crate::print_str(b"/"); crate::print_hex_u64(value);
+            }
+            crate::print_str(b"\n");
         }
         if source.checkpoint.phase() != NestedPreEntryPhase::ParentActive {
             parent.phase = ParentPhase::Quarantined;
