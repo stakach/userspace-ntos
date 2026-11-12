@@ -4,6 +4,18 @@ use super::*;
 
 static REPARK_FAILURE_TRACE: AtomicU64 = AtomicU64::new(0);
 static REPARK_CONFLICT_TRACE: AtomicU64 = AtomicU64::new(0);
+static NESTED_PROVIDER_OUTER_TRACES: AtomicU64 = AtomicU64::new(0);
+
+fn trace_nested_provider_outer(
+    stage: &'static [u8], old_key: nt_component_suspension::SuspensionKey,
+    dispatch_id: u64, next_wait: u64, detail: u64,
+) {
+    print_str(b"[nested-provider-outer] stage="); print_str(stage);
+    print_str(b" old-wait/dispatch/next-wait/detail=");
+    print_u64(old_key.id); print_str(b"/"); print_u64(dispatch_id);
+    print_str(b"/"); print_u64(next_wait); print_str(b"/");
+    print_u64(detail); print_str(b"\n");
+}
 
 fn trace_repark_failure(
     branch: &'static [u8], lane: nt_component_suspension::LaneHandle,
@@ -213,6 +225,25 @@ pub(crate) unsafe fn run_hosted(
             }
         }
     };
+    let trace_nested_provider = matches!(continuation.pending,
+        PendingComponentDispatch::Provider(pending) if pending.nested_user_callback)
+        && NESTED_PROVIDER_OUTER_TRACES.fetch_add(1, Ordering::Relaxed) < 4096;
+    if trace_nested_provider {
+        let (next_wait, detail) = match &pump_completion {
+            ComponentPumpCompletion::Reparked(PendingComponentDispatch::Provider(next)) =>
+                (next.request.header.wait_id, 1),
+            ComponentPumpCompletion::Reparked(PendingComponentDispatch::Receive(_)) => (0, 2),
+            ComponentPumpCompletion::Reparked(PendingComponentDispatch::ServiceWait(_)) => (0, 3),
+            ComponentPumpCompletion::Reparked(PendingComponentDispatch::Lpc(_)) => (0, 4),
+            ComponentPumpCompletion::Reparked(_) => (0, 5),
+            ComponentPumpCompletion::Completed(_) => (0, 6),
+            ComponentPumpCompletion::FailedRetained(_, _) => (0, 7),
+            ComponentPumpCompletion::Failed(_) => (0, 8),
+            ComponentPumpCompletion::UserCallbackSuspended => (0, 9),
+        };
+        trace_nested_provider_outer(b"pump-return", resume.key,
+            frame.owner.dispatch_id, next_wait, detail);
+    }
     finish_hosted_resume(
         nt_handler,
         lane,
@@ -223,6 +254,7 @@ pub(crate) unsafe fn run_hosted(
         continuation,
         callback_transfer,
         pump_completion,
+        trace_nested_provider,
     )
 }
 
@@ -397,6 +429,7 @@ pub(crate) unsafe fn run_receive(
         continuation,
         callback_transfer,
         pump_completion,
+        false,
     );
     assert!(
         outcome.is_some(),
@@ -418,6 +451,7 @@ unsafe fn finish_hosted_resume(
     continuation: HostedNativeContinuation,
     mut callback_transfer: component_callback_transfer::CallbackTransfer,
     pump_completion: ComponentPumpCompletion,
+    trace_nested_provider: bool,
 ) -> Option<ComponentSuspensionRuntimeOutcome> {
     // An authenticated interim Call may replace the lane's Reply while the provider runs.
     // Its dispatch epoch and physical executor remain the same, but the pre-pump Reply is stale.
@@ -577,7 +611,12 @@ unsafe fn finish_hosted_resume(
             let sequence = next_dispatcher_wait_sequence();
             let mut next_continuation = continuation;
             next_continuation.pending = next;
-            if let Err(error) = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+            if trace_nested_provider {
+                trace_nested_provider_outer(b"rearm-begin", resume.key,
+                    frame.owner.dispatch_id, next_key.id,
+                    (frame.owner == next_owner) as u64);
+            }
+            let rearm_result = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                 .rearm_running(
                     lane,
                     reply_object,
@@ -586,8 +625,12 @@ unsafe fn finish_hosted_resume(
                     sequence,
                     next_owner,
                     ComponentNativeContinuation::Hosted(next_continuation),
-                )
-            {
+                );
+            if trace_nested_provider {
+                trace_nested_provider_outer(b"rearm-end", resume.key,
+                    frame.owner.dispatch_id, next_key.id, rearm_result.is_ok() as u64);
+            }
+            if let Err(error) = rearm_result {
                 trace_repark_failure(b"rearm", lane, resume.key, 0xC000_000D, Some(next), Some(error));
                 if let Ok(Some(current)) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
                     .frame(lane, resume.key)
@@ -660,6 +703,10 @@ unsafe fn finish_hosted_resume(
             }
             match next {
                 PendingComponentDispatch::Provider(next) => {
+                    if trace_nested_provider {
+                        trace_nested_provider_outer(b"arbiter-begin", resume.key,
+                            frame.owner.dispatch_id, next.request.header.wait_id, sequence);
+                    }
                     let admission = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).admit(
                         &mut *nt_handler,
                         &next.request,
@@ -667,6 +714,11 @@ unsafe fn finish_hosted_resume(
                         sequence,
                         nt_time_snapshot(),
                     );
+                    if trace_nested_provider {
+                        trace_nested_provider_outer(b"arbiter-end", resume.key,
+                            frame.owner.dispatch_id, next.request.header.wait_id,
+                            admission.is_ok() as u64);
+                    }
                     match admission {
                         Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::Parked {
                             ..

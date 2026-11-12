@@ -105,6 +105,7 @@ static USER_CALLBACK_CONTINUATION_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_NESTED_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 // Diagnostic only: a fixed serial budget across nested entry, park, and terminal records.
 static USER_CALLBACK_NESTED_FRONTIER_TRACES: AtomicU64 = AtomicU64::new(0);
+static NESTED_PROVIDER_RESUME_SHAPE_TRACES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_NESTED_SSN_1298: AtomicU64 = AtomicU64::new(0);
 static WIN32K_WINDOW_EXTRA_INGRESS_TRACES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_BUSY_INGRESS_TRACES: AtomicU64 = AtomicU64::new(0);
@@ -4922,6 +4923,21 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
             pump.callback_suspended, pump.provider_wait_suspended(), pump.lpc_wait_suspended,
         );
     }
+    let trace_handoff = pending.nested_user_callback
+        && NESTED_PROVIDER_RESUME_SHAPE_TRACES.fetch_add(1, Ordering::Relaxed) < 4096;
+    if trace_handoff {
+        print_str(b"[nested-provider-resume-shape] old-wait/dispatch/receive/service/provider-request/service-deferred/lpc/callback/complete/wall-label=");
+        print_u64(wait_id); print_str(b"/");
+        print_u64(pending.dispatch.dispatch_id); print_str(b"/");
+        print_u64(pump.receive_yield().is_some() as u64); print_str(b"/");
+        print_u64(pump.service_wait_yield.is_some() as u64); print_str(b"/");
+        print_u64(pump.provider_wait_request.map_or(0, |request| request.header.wait_id)); print_str(b"/");
+        print_u64((pump.provider_wait_suspended() && pump.provider_wait_request.is_none()) as u64);
+        print_str(b"/"); print_u64(pump.lpc_wait_suspended as u64);
+        print_str(b"/"); print_u64(pump.callback_suspended as u64);
+        print_str(b"/"); print_u64(pump.completed as u64);
+        print_str(b"/"); print_u64(pump.wall_label); print_str(b"\n");
+    }
 
     if let Some(yielded) = pump.receive_yield() {
         return ProviderWaitPumpCompletion::ReceiveReparked(PendingReceiveDispatch {
@@ -4950,7 +4966,20 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
                 pending, 0xC000_000Du32 as i32,
             );
         };
-        return ProviderWaitPumpCompletion::Reparked(capture_provider_wait_repark(pending, request));
+        if trace_handoff {
+            print_str(b"[nested-provider-snapshot] stage=begin old-wait/new-wait/dispatch=");
+            print_u64(wait_id); print_str(b"/"); print_u64(request.header.wait_id);
+            print_str(b"/"); print_u64(pending.dispatch.dispatch_id); print_str(b"\n");
+        }
+        let next = capture_provider_wait_repark(pending, request);
+        if trace_handoff {
+            print_str(b"[nested-provider-snapshot] stage=end old-wait/new-wait/dispatch/exact-page=");
+            print_u64(wait_id); print_str(b"/"); print_u64(next.request.header.wait_id);
+            print_str(b"/"); print_u64(next.dispatch.dispatch_id);
+            print_str(b"/"); print_u64(next.shared_resume.is_some() as u64);
+            print_str(b"\n");
+        }
+        return ProviderWaitPumpCompletion::Reparked(next);
     }
     if pump.lpc_wait_suspended {
         return capture_lpc_wait_repark(
