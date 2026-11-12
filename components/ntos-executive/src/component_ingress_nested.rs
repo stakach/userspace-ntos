@@ -317,6 +317,67 @@ pub(crate) unsafe fn park_current() -> Result<Option<ParkedParentHandle>, Error>
     }
 }
 
+/// Bounded, read-only diagnosis for a source terminal that meets the shared-page fence.
+pub(crate) unsafe fn trace_source_terminal_lane(
+    work_route: PeerRoute, work_dispatch: LaneDispatchIdentity, work_reply: u64,
+    packet: u64, terminal_ready: bool, nested_ready: bool,
+) {
+    static TRACES: AtomicU64 = AtomicU64::new(0);
+    if TRACES.fetch_add(1, Ordering::Relaxed) >= 8 { return; }
+    let (running, route, phase, top_kind, top_id, top_phase, top_owner) = {
+        let catalog = lanes();
+        let running = catalog.running();
+        let route = running.and_then(|lane| catalog.peer_route(lane).ok().flatten());
+        let phase = running.and_then(|lane| catalog.phase(lane).ok());
+        let top = running.and_then(|lane| catalog.top(lane).ok().flatten());
+        let top_phase = top.map(|frame| match &frame.phase {
+            nt_component_suspension::SuspensionPhase::Waiting => 1,
+            nt_component_suspension::SuspensionPhase::Resuming { .. } => 2,
+            nt_component_suspension::SuspensionPhase::ResumingChildParked { .. } => 3,
+            nt_component_suspension::SuspensionPhase::ResumingChildQuarantined { .. } => 4,
+            _ => 5,
+        }).unwrap_or(0);
+        (running, route, phase, top.map_or(0, |frame| frame.key.kind as u64),
+            top.map_or(0, |frame| frame.key.id), top_phase,
+            top.map_or(0, |frame| frame.owner.dispatch_id))
+    };
+    let current_dispatch = route.and_then(|route| dispatch(route).ok());
+    let current_reply = route.and_then(|route| current_reply(route).ok());
+    let work_id = work_route.identity();
+    let current_id = route.map(PeerRoute::identity);
+    crate::print_str(b"[source-terminal-lane] packet/terminal-ready/nested-ready/run-lane/run-gen/run-phase/top-kind/top-id/top-phase/top-owner/work-domain/work-gen/work-exec/work-lane/work-lgen/work-epoch/work-reply/current-domain/current-gen/current-exec/current-lane/current-lgen/current-epoch/current-reply/match=");
+    for value in [
+        packet,
+        u64::from(terminal_ready), u64::from(nested_ready),
+        running.map_or(0, |lane| lane.index as u64),
+        running.map_or(0, |lane| lane.generation),
+        match phase {
+            Some(nt_component_suspension::LanePhase::Running) => 1,
+            Some(nt_component_suspension::LanePhase::NestedExecution(_)) => 2,
+            Some(nt_component_suspension::LanePhase::Suspended) => 3,
+            Some(_) => 4,
+            None => 0,
+        },
+        top_kind, top_id, top_phase, top_owner,
+        work_id.domain, work_id.domain_generation, work_id.executor,
+        work_dispatch.lane().index as u64, work_dispatch.lane().generation,
+        work_dispatch.epoch(), work_reply,
+        current_id.map_or(0, |id| id.domain),
+        current_id.map_or(0, |id| id.domain_generation),
+        current_id.map_or(0, |id| id.executor),
+        current_dispatch.map_or(0, |id| id.lane().index as u64),
+        current_dispatch.map_or(0, |id| id.lane().generation),
+        current_dispatch.map_or(0, |id| id.epoch()),
+        current_reply.unwrap_or(0),
+        u64::from(route == Some(work_route)
+            && current_dispatch == Some(work_dispatch)
+            && current_reply == Some(work_reply)),
+    ] {
+        crate::print_str(b"/"); crate::print_hex_u64(value);
+    }
+    crate::print_str(b"\n");
+}
+
 /// Root ingress receives a move-only proof only when the exact park attempt has no effects.
 /// A retained or uncertain attempt never grants cancellation of its prepared child owner.
 pub(crate) unsafe fn park_current_for_root(admission: ExternalAdmissionKey) -> RootParkOutcome {

@@ -924,9 +924,17 @@ impl Work {
             if wire::encode_terminal_handoff(handoff, &mut packet).is_err() { return false; }
             self.terminal_packet = Some(super::hosted_source_terminal_packet::RetainedTerminalPacket::new(packet));
         }
+        let terminal_ready = self.terminal_step_ready();
+        let nested_ready = self.ready_for_nested_step();
         let transport = self.terminal_packet.as_mut().expect("retained IOCTL terminal transport");
         let ready = if self.discarding { transport.publish() }
             else { transport.prepare(dispatch_selected_source_ioctl_terminal) };
+        if !ready && crate::service_sec_image::component_shared_publication_is_busy() {
+            runtime::nested::trace_source_terminal_lane(
+                self.route, self.dispatch, self.reply,
+                transport.packet_address().unwrap_or(0), terminal_ready, nested_ready,
+            );
+        }
         if !self.terminal_traced {
             if let Some(address) = transport.packet_address() {
                 self.terminal_traced = true;
