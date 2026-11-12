@@ -183,6 +183,46 @@ pub(crate) fn print_hold_snapshot(now: u64) {
     } else {
         record.bytes()
     });
+    // Root-only snapshot: the isolated provider pump records copied dispatch/lane
+    // identity, then this census inspects the canonical lane after handoff.
+    if let Some((dispatch, lane)) = crate::service_sec_image::cursor_lookup_last_incomplete() {
+        let lanes = unsafe { &*core::ptr::addr_of!(crate::service_sec_image::COMPONENT_SUSPENSIONS) };
+        let mut cursor = nt_printf::record::RecordBuffer::<1024>::new();
+        let _ = writeln!(cursor,
+            "[cursor-lookup-lane] t_ms={} dispatch={} lane={:?} phase={:?} active={:?} top={:?} external-depth={:?}",
+            now / 10_000, dispatch, lane, lanes.phase(lane),
+            lanes.active_dispatch_identity(lane),
+            lanes.top(lane).map(|top| top.map(|frame| (frame.key, frame.owner.dispatch_id))),
+            lanes.external_depth(lane));
+        let mut matched = 0;
+        for (frame_lane, frame) in lanes.frames() {
+            if frame.owner.dispatch_id != dispatch { continue; }
+            matched += 1;
+            let phase = match &frame.phase {
+                nt_component_suspension::SuspensionPhase::Waiting => "waiting",
+                nt_component_suspension::SuspensionPhase::Selected { .. } => "selected",
+                nt_component_suspension::SuspensionPhase::Resuming { .. } => "resuming",
+                nt_component_suspension::SuspensionPhase::ResumingChildParked { .. } => "child-parked",
+                nt_component_suspension::SuspensionPhase::ResumingChildQuarantined { .. } => "child-quarantined",
+                nt_component_suspension::SuspensionPhase::Cancelled { .. } => "cancelled",
+                nt_component_suspension::SuspensionPhase::MaintenanceWaiting { .. } => "maintenance-waiting",
+                nt_component_suspension::SuspensionPhase::MaintenanceReady { .. } => "maintenance-ready",
+                nt_component_suspension::SuspensionPhase::MaintenanceResuming { .. } => "maintenance-resuming",
+                nt_component_suspension::SuspensionPhase::NestedTerminal => "nested-terminal",
+            };
+            let _ = writeln!(cursor,
+                "[cursor-lookup-frame] lane={:?} key={:?} seq={} phase={} owner={:?}",
+                frame_lane, frame.key, frame.admission_sequence, phase, frame.owner);
+        }
+        if matched == 0 {
+            let _ = writeln!(cursor, "[cursor-lookup-frame] dispatch={} absent", dispatch);
+        }
+        sel4_rt::print_record(if cursor.overflowed() {
+            b"[cursor-lookup-lane] record-truncated\n"
+        } else {
+            cursor.bytes()
+        });
+    }
     if (gate.retained.iter().any(Option::is_some) || gate.retained_overflow != 0)
         && sample_page < 64
     {

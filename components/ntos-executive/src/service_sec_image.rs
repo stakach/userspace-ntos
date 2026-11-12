@@ -317,6 +317,40 @@ static SET_CURSOR_ICON_DATA_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static STRETCH_DIBITS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static FIND_CURSOR_ICON_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static CURSOR_LOOKUP_OWNER_TRACE: AtomicU64 = AtomicU64::new(0);
+static CURSOR_LOOKUP_LAST_INCOMPLETE_DISPATCH: AtomicU64 = AtomicU64::new(0);
+static CURSOR_LOOKUP_LAST_INCOMPLETE_LANE_INDEX: AtomicU64 = AtomicU64::new(0);
+static CURSOR_LOOKUP_LAST_INCOMPLETE_LANE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn cursor_lookup_last_incomplete() -> Option<(u64, nt_component_suspension::LaneHandle)> {
+    let dispatch = CURSOR_LOOKUP_LAST_INCOMPLETE_DISPATCH.load(Ordering::Relaxed);
+    (dispatch != 0).then_some((dispatch, nt_component_suspension::LaneHandle {
+        index: CURSOR_LOOKUP_LAST_INCOMPLETE_LANE_INDEX.load(Ordering::Relaxed) as u32,
+        generation: CURSOR_LOOKUP_LAST_INCOMPLETE_LANE_GENERATION.load(Ordering::Relaxed),
+    }))
+}
+
+/// Log copied pump flags before its completion moves into an exact pending owner.
+/// This may run at an isolated provider boundary, so it never reads CALLS.
+pub(crate) fn trace_cursor_lookup_pump(
+    client: win32k_glue::Win32kClientContext,
+    ssn: u64,
+    dispatch_id: u64,
+    lane: nt_component_suspension::LaneHandle,
+    flags: u16,
+) {
+    if ssn != 0x103d
+        || CURSOR_LOOKUP_OWNER_TRACE.fetch_add(1, Ordering::Relaxed) >= 4096
+    {
+        return;
+    }
+    use core::fmt::Write;
+    let mut record = nt_printf::record::RecordBuffer::<384>::new();
+    let _ = writeln!(record,
+        "[cursor-lookup-pump] pi/pid/gen/tid/tcb={}/{}/{}/{}/{} dispatch={} lane={:?} flags=0x{:03x} bits=complete/callback/provider/lpc/receive/root/service/maintenance/nested/quarantine",
+        client.pi, client.pid, client.generation, client.tid, client.tcb,
+        dispatch_id, lane, flags);
+    sel4_rt::print_record(record.bytes());
+}
 
 /// Bounded root-side trace of one original Call across GUI staging and provider entry.
 /// Neither the copied key nor the numeric Reply authorizes a settlement.
@@ -330,9 +364,17 @@ pub(crate) unsafe fn trace_cursor_lookup_owner(
     not_completed: bool,
     callback_suspended: bool,
 ) {
-    if ssn != 0x103d
-        || CURSOR_LOOKUP_OWNER_TRACE.fetch_add(1, Ordering::Relaxed) >= 4096
-    {
+    if ssn != 0x103d {
+        return;
+    }
+    if stage == "provider-return" && not_completed {
+        if let Some(lane) = lane {
+            CURSOR_LOOKUP_LAST_INCOMPLETE_LANE_INDEX.store(u64::from(lane.index), Ordering::Relaxed);
+            CURSOR_LOOKUP_LAST_INCOMPLETE_LANE_GENERATION.store(lane.generation, Ordering::Relaxed);
+        }
+        CURSOR_LOOKUP_LAST_INCOMPLETE_DISPATCH.store(dispatch_id, Ordering::Relaxed);
+    }
+    if CURSOR_LOOKUP_OWNER_TRACE.fetch_add(1, Ordering::Relaxed) >= 4096 {
         return;
     }
     use core::fmt::Write;
@@ -2443,6 +2485,9 @@ unsafe fn admit_pending_nested_restore_dispatch(
         trace_win32k_handoff_refusal(b"nested-restore-pending-absent");
         return Err(());
     };
+    trace_cursor_lookup_owner("handoff-kind:nested-restore", pending.snapshot.client,
+        pending.snapshot.dispatch.ssn, pending.snapshot.dispatch.dispatch_id,
+        Some(pending.snapshot.dispatch.lane), true, true, false);
     let dispatch_id = pending.snapshot.dispatch.dispatch_id;
     let ticket = match nested_restore_owner::retain(
         reservation, pending, root_reply, destination, false,
@@ -2637,6 +2682,10 @@ unsafe fn admit_pending_win32k_dispatch(
         };
     }
     if win32k_glue::pending_root_ingress_dispatch_is_some() {
+        if let Some((client, dispatch)) = win32k_glue::pending_root_ingress_dispatch_identity() {
+            trace_cursor_lookup_owner("handoff-kind:root-ingress-refused", client,
+                dispatch.ssn, dispatch.dispatch_id, Some(dispatch.lane), true, true, false);
+        }
         // The distinct owner is retained in the Win32k pending slot, CALLS and PARENTS. This
         // dormant path must not import the child or rotate either Reply until the serialized
         // route preflight and undelivered-parent unwind are implemented together.
@@ -2681,6 +2730,9 @@ unsafe fn admit_pending_win32k_dispatch(
                 maintenance_ticket, retained_failure: true,
             };
         };
+        trace_cursor_lookup_owner("handoff-kind:maintenance", pending.snapshot.client,
+            pending.snapshot.dispatch.ssn, pending.snapshot.dispatch.dispatch_id,
+            Some(pending.snapshot.dispatch.lane), true, true, false);
         // The reservation makes this memory-only transfer allocation free. A defensive refusal
         // returns the snapshot to its pending cell before any physical effect can enter.
         let ticket = match root_maintenance_owner::retain(reservation, pending, root_reply) {
@@ -2792,10 +2844,16 @@ unsafe fn admit_pending_win32k_dispatch(
         };
     }
     if let Some(pending) = win32k_glue::take_pending_receive_dispatch() {
+        trace_cursor_lookup_owner("handoff-kind:receive", pending.snapshot.client,
+            pending.snapshot.dispatch.ssn, pending.snapshot.dispatch.dispatch_id,
+            Some(pending.snapshot.dispatch.lane), true, true, false);
         admitted_dispatch_id = pending.snapshot.dispatch.dispatch_id;
         parked = receive_admit_current(pending, destination);
         assert!(parked, "Receive retains parked parent and original client Reply");
     } else if let Some(pending) = win32k_glue::take_pending_service_wait_dispatch() {
+        trace_cursor_lookup_owner("handoff-kind:service-wait", pending.snapshot.client,
+            pending.snapshot.dispatch.ssn, pending.snapshot.dispatch.dispatch_id,
+            Some(pending.snapshot.dispatch.lane), true, true, false);
         admitted_dispatch_id = pending.snapshot.dispatch.dispatch_id;
         match service_wait_admit_current(pending, destination) {
             RetainedWaitAdmission::Accepted => parked = true,
@@ -2812,11 +2870,17 @@ unsafe fn admit_pending_win32k_dispatch(
             }
         }
     } else if let Some(pending) = win32k_glue::take_pending_provider_wait_dispatch() {
+        trace_cursor_lookup_owner("handoff-kind:provider-wait", pending.client,
+            pending.dispatch.ssn, pending.dispatch.dispatch_id,
+            Some(pending.dispatch.lane), true, true, false);
         admitted_dispatch_id = pending.dispatch.dispatch_id;
         parked = provider_wait_admit_current(handler, pending, None, destination)
             == RetainedWaitAdmission::Accepted;
         assert!(parked, "provider wait could not reserve its native continuation");
     } else if let Some(pending) = win32k_glue::take_pending_lpc_wait_dispatch() {
+        trace_cursor_lookup_owner("handoff-kind:lpc-wait", pending.client,
+            pending.dispatch.ssn, pending.dispatch.dispatch_id,
+            Some(pending.dispatch.lane), true, true, false);
         admitted_dispatch_id = pending.dispatch.dispatch_id;
         parked = lpc_wait_admit_current(handler, pending, None, destination)
             == RetainedWaitAdmission::Accepted;

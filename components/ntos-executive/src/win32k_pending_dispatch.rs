@@ -165,6 +165,13 @@ pub(crate) unsafe fn pending_root_ingress_dispatch_is_some() -> bool {
     (&*core::ptr::addr_of!(ROOT_INGRESS_PENDING_DISPATCH)).is_some()
 }
 
+pub(crate) unsafe fn pending_root_ingress_dispatch_identity() -> Option<(
+    Win32kClientContext, nt_user_callback::DispatchContext,
+)> {
+    let pending = (&*core::ptr::addr_of!(ROOT_INGRESS_PENDING_DISPATCH)).as_ref()?;
+    Some((pending.snapshot.client, pending.snapshot.dispatch))
+}
+
 /// Observe a selectable root child without moving its saved pump or physical parent. Retained
 /// and uncertain yields do not expose a selector; the later take rechecks both identities.
 pub(crate) unsafe fn pending_root_ingress_selector() -> Option<(

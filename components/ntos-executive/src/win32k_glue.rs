@@ -41,7 +41,8 @@ pub(crate) use pending_dispatch::{
     PendingReceiveDispatch, ReceiveYield, take_pending_receive_dispatch,
     restore_pending_receive_dispatch,
     PendingRootIngressDispatch, RootIngressYield,
-    pending_root_ingress_dispatch_is_some, pending_root_ingress_selector,
+    pending_root_ingress_dispatch_is_some, pending_root_ingress_dispatch_identity,
+    pending_root_ingress_selector,
     TakenRootIngressDispatch,
     take_pending_root_ingress_dispatch, restore_pending_root_ingress_dispatch,
     PendingServiceWaitDispatch, ServiceWaitYield, take_pending_service_wait_dispatch,
@@ -8307,6 +8308,21 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         print_str(b"/");
         print_u64(pr.wall_label);
         print_str(b"\n");
+    }
+    if ssn == 0x103d {
+        let cursor_yield_flags = u16::from(pr.completed)
+            | (u16::from(pr.callback_suspended) << 1)
+            | (u16::from(pr.provider_wait_suspended()) << 2)
+            | (u16::from(pr.lpc_wait_suspended) << 3)
+            | (u16::from(pr.receive_yield().is_some()) << 4)
+            | (u16::from(pr.root_ingress_yield().is_some()) << 5)
+            | (u16::from(pr.service_wait_yield.is_some()) << 6)
+            | (u16::from(pr.maintenance_yield.is_some()) << 7)
+            | (u16::from(pr.nested_restore_yield.is_some()) << 8)
+            | (u16::from(pr.nested_restore_quarantined.is_some()) << 9);
+        crate::service_sec_image::trace_cursor_lookup_pump(
+            client, ssn, dispatch_id, lane, cursor_yield_flags,
+        );
     }
     pr.dispatch_return = capture_win32k_dispatch_return(
         pr.dispatch_return_receipt, dispatch_id, ssn, pr.result, pr.completed,
