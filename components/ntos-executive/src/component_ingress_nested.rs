@@ -10,7 +10,7 @@ pub(crate) use source_ioctl::{
     source_ioctl_parent_retained, source_ioctl_parent_blocks_provider_resume,
     source_ioctl_parent_ready,
     register_selected_source_ioctl_dispatch, finish_selected_source_ioctl_dispatch,
-    quarantine_refused_source_ioctl,
+    quarantine_refused_source_ioctl, trace_source_ioctl_parent_for_work,
 };
 use crate::{win32k_glue, win32k_subsystem};
 use super::physical_hold::PhysicalExecutionHold;
@@ -391,7 +391,7 @@ pub(crate) unsafe fn trace_source_terminal_lane(
             nt_component_suspension::SuspensionPhase::MaintenanceResuming { .. } => 5,
             _ => 6,
         };
-        crate::print_str(b"[source-terminal-frame] sample/lane/gen/phase/kind/key/owner/route-domain/route-gen/route-exec/epoch/reply/exact-work=");
+        crate::print_str(b"[source-terminal-frame] sample/lane/gen/phase/kind/key/owner/route-domain/route-gen/route-exec/epoch/reply/exact-work/parent-blocks-resume=");
         for value in [sample, u64::from(frame_lane.index), frame_lane.generation,
             phase, frame.key.kind as u64, frame.key.id, frame.owner.dispatch_id,
             frame_route.map_or(0, |route| route.identity().domain),
@@ -401,11 +401,19 @@ pub(crate) unsafe fn trace_source_terminal_lane(
             frame_reply.unwrap_or(0),
             u64::from(frame_route == Some(work_route)
                 && frame_dispatch == Some(work_dispatch)
-                && frame_reply == Some(work_reply))] {
+                && frame_reply == Some(work_reply)),
+            u64::from(source_ioctl_parent_blocks_provider_resume(frame.owner.dispatch_id))] {
             crate::print_str(b"/"); crate::print_hex_u64(value);
         }
         crate::print_str(b"\n");
     }
+    trace_source_ioctl_parent_for_work(sample, work_route, work_dispatch, work_reply, packet);
+}
+
+fn trace_source_park(stage: &[u8]) {
+    crate::print_str(b"[source-parent-park] stage=");
+    crate::print_str(stage);
+    crate::print_str(b"\n");
 }
 
 /// Root ingress receives a move-only proof only when the exact park attempt has no effects.
@@ -426,6 +434,7 @@ pub(crate) unsafe fn park_current_for_root(admission: ExternalAdmissionKey) -> R
 unsafe fn park_current_attempt(
     root_admission: Option<ExternalAdmissionKey>, source_ioctl: Option<SourceIoctlParent>,
 ) -> ParkAttemptOutcome {
+    let source_selected = source_ioctl.is_some();
     // A previous uncertain park remains keyed to this exact child even if the route changed.
     // Never issue a new no-effect proof after a retained attempt for the same admission.
     if root_admission.is_some() && (&*core::ptr::addr_of!(PARENTS)).iter().flatten()
@@ -434,6 +443,7 @@ unsafe fn park_current_attempt(
         return ParkAttemptOutcome::Retained(Error::Admission);
     }
     let Some(lane) = lanes().running() else {
+        if source_selected { trace_source_park(b"no-running-lane"); }
         return ParkAttemptOutcome::NoRunningLane(source_ioctl);
     };
     let preflight = (|| -> Result<_, Error> {
@@ -445,7 +455,10 @@ unsafe fn park_current_attempt(
     })();
     let (route, dispatch, reply) = match preflight {
         Ok(values) => values,
-        Err(error) => return ParkAttemptOutcome::RefusedNoEffect(error, source_ioctl),
+        Err(error) => {
+            if source_selected { trace_source_park(b"route-preflight"); }
+            return ParkAttemptOutcome::RefusedNoEffect(error, source_ioctl);
+        }
     };
     if source_ioctl.as_ref().is_some_and(|source|
         source.checkpoint.parent_route() != route
@@ -456,6 +469,7 @@ unsafe fn park_current_attempt(
                     || selection.key().dispatch != dispatch
                     || selection.key().reply != reply))
     {
+        if source_selected { trace_source_park(b"source-identity"); }
         return ParkAttemptOutcome::RefusedNoEffect(Error::Admission, source_ioctl);
     }
     let rows = &mut *core::ptr::addr_of_mut!(PARENTS);
@@ -464,6 +478,7 @@ unsafe fn park_current_attempt(
     if rows.iter().flatten().any(|parent| {
         parent.route.identity().executor == route.identity().executor
     }) {
+        if source_selected { trace_source_park(b"existing-physical-parent"); }
         return ParkAttemptOutcome::Retained(Error::Admission);
     }
     let index = match rows.iter().position(Option::is_none) {
@@ -471,6 +486,7 @@ unsafe fn park_current_attempt(
         None => {
             let _durable = crate::allocator::enter_durable();
             if rows.try_reserve(1).is_err() {
+                if source_selected { trace_source_park(b"parent-capacity"); }
                 return ParkAttemptOutcome::RefusedNoEffect(Error::Capacity, source_ioctl);
             }
             rows.push(None);
@@ -481,7 +497,10 @@ unsafe fn park_current_attempt(
         Ordering::AcqRel, Ordering::Acquire, |next| next.checked_add(1),
     ) {
         Ok(generation) => generation,
-        Err(_) => return ParkAttemptOutcome::RefusedNoEffect(Error::Capacity, source_ioctl),
+        Err(_) => {
+            if source_selected { trace_source_park(b"parent-generation"); }
+            return ParkAttemptOutcome::RefusedNoEffect(Error::Capacity, source_ioctl);
+        }
     };
     rows[index] = Some(Parent {
         generation,
@@ -503,6 +522,7 @@ unsafe fn park_current_attempt(
     // Suspend cancels IPC in the microkernel. Execution holds preserve the held Call, donated
     // scheduling context and queued message, including the receive continuation after Reply ACK.
     if let Err(error) = rows[index].as_mut().expect("retained parent").physical.acquire() {
+        if source_selected { trace_source_park(b"physical-acquire"); }
         let certified_no_effect = rows[index].as_ref().expect("retained parent")
             .physical.acquire_has_no_effects();
         if certified_no_effect {
@@ -532,6 +552,7 @@ unsafe fn park_current_attempt(
     let scope = match scope {
         Ok(scope) => scope,
         Err(_) => {
+            if source_selected { trace_source_park(b"scope-suspend"); }
             let parent = rows[index].as_mut().expect("retained parent");
             if parent.physical.begin_abort_after_failed_scope().is_ok() {
                 parent.phase = ParentPhase::AbortPending;
@@ -551,12 +572,17 @@ unsafe fn park_current_attempt(
     parent.scope = Some(scope);
     if let Some(source) = parent.source_ioctl.as_mut() {
         let scope = parent.scope.as_ref().expect("retained source scope");
-        if source.checkpoint.park(
+        if let Err((error, _park_receipt)) = source.checkpoint.park(
             lanes(), scope, ParkedSourceIoctlPage(scope.identity()),
-        ).is_err() {
+        ) {
+            trace_source_park(b"checkpoint-park");
+            crate::print_str(b"[source-parent-park] checkpoint-error=");
+            crate::print_hex_u64(error as u64);
+            crate::print_str(b"\n");
             parent.phase = ParentPhase::Quarantined;
             return ParkAttemptOutcome::Retained(Error::Admission);
         }
+        trace_source_park(b"parked");
     }
     parent.phase = ParentPhase::Parked;
     ParkAttemptOutcome::Parked(ParkedParentHandle { index, generation, identity })

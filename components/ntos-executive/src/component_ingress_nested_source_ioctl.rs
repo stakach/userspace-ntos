@@ -32,6 +32,39 @@ fn trace_source_ioctl_preflight(stage: &[u8]) {
     crate::print_str(b"\n");
 }
 
+pub(crate) unsafe fn trace_source_ioctl_parent_for_work(
+    sample: u64, work_route: PeerRoute, work_dispatch: LaneDispatchIdentity,
+    work_reply: u64, packet: u64,
+) {
+    let mut found = false;
+    for (index, parent) in (&*core::ptr::addr_of!(PARENTS)).iter().enumerate() {
+        let Some(parent) = parent.as_ref() else { continue };
+        let Some(source) = parent.source_ioctl.as_ref() else { continue };
+        found = true;
+        crate::print_str(b"[source-terminal-parent] sample/packet/row/generation/parent-phase/physical-held/checkpoint-phase/selection/child-dispatch/key-nonce/key-token/key-source/key-ticket/key-generation/exact-work=");
+        for value in [sample, packet, index as u64, parent.generation,
+            parent.phase as u64, u64::from(parent.physical.held()),
+            source.checkpoint.phase() as u64, u64::from(source.selection.is_some()),
+            source.child_dispatch.unwrap_or(0), source.key.nonce, source.key.token,
+            source.key.source_address, source.key.source_ticket,
+            source.key.source_generation,
+            u64::from(source.key.route == work_route
+                && source.key.dispatch == work_dispatch
+                && source.key.reply == work_reply)] {
+            crate::print_str(b"/");
+            crate::print_hex_u64(value);
+        }
+        crate::print_str(b"\n");
+    }
+    if !found {
+        crate::print_str(b"[source-terminal-parent] sample/packet/none=");
+        crate::print_hex_u64(sample);
+        crate::print_str(b"/");
+        crate::print_hex_u64(packet);
+        crate::print_str(b"/1\n");
+    }
+}
+
 pub(crate) unsafe fn requeue_no_effect_source_ioctl(
     mut source: SourceIoctlParent,
 ) -> Result<(), (Error, SourceIoctlParent)> {
