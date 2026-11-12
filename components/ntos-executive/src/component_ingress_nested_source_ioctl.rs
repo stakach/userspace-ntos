@@ -143,13 +143,6 @@ pub(crate) unsafe fn park_resuming_source_ioctl(
     let Some(selection) = crate::driver_launch::select_nested_win32k_source_ioctl_terminal(
         route, dispatch, reply,
     ) else {
-        if let Some(frame) = lanes().top(lane).ok().flatten() {
-            if frame.owner.dispatch_id == dispatch_context.dispatch_id
-                && matches!(frame.phase, nt_component_suspension::SuspensionPhase::Resuming { .. })
-            {
-                record_source_resume_transition(4, lane, dispatch, reply, frame.key, frame.owner);
-            }
-        }
         trace_source_ioctl_no_child(lane, dispatch_context.dispatch_id);
         return SourceIoctlPark::NoChild;
     };
@@ -469,17 +462,6 @@ pub(crate) unsafe fn restore_settled_source_ioctl_parent(
                 parent.phase = ParentPhase::Quarantined;
                 return Err(Error::Admission);
             }
-            // This is the other ProviderWait transition into Resuming: an exact source
-            // child has settled and its previously parked parent is physically restored.
-            let checkpoint = &source.checkpoint;
-            crate::print_str(b"[source-resume-parent-restored] lane/gen/epoch/reply/key/owner=");
-            for value in [u64::from(checkpoint.parent_dispatch().lane().index),
-                checkpoint.parent_dispatch().lane().generation,
-                checkpoint.parent_dispatch().epoch(), checkpoint.parent_reply_object(),
-                checkpoint.parent_key().id, checkpoint.parent_owner().dispatch_id] {
-                crate::print_str(b"/"); crate::print_hex_u64(value);
-            }
-            crate::print_str(b"\n");
         }
         if source.checkpoint.phase() != NestedPreEntryPhase::ParentActive {
             parent.phase = ParentPhase::Quarantined;

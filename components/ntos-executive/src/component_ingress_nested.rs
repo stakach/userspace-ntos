@@ -28,132 +28,6 @@ const ABORT_RETRY_100NS: u64 = 1_600_000;
 static ABORT_WAKE: CoalescedRetryWake = CoalescedRetryWake::new();
 static LAST_ABORT: AtomicUsize = AtomicUsize::new(usize::MAX);
 
-// Temporary read-only evidence for a source Work that arrives while its exact Win32k
-// provider frame is Resuming. Several exact frames can be nested on one physical lane;
-// retain their separate histories until the source terminal is sampled.
-#[derive(Clone, Copy)]
-struct SourceResumeTrace {
-    route: PeerRoute,
-    dispatch: LaneDispatchIdentity,
-    claim_reply: u64,
-    current_reply: u64,
-    key: u64,
-    owner: u64,
-    stages: [u64; 5], // begin, pump enter, pump return, no child, first source Work
-}
-
-const SOURCE_RESUME_TRACE_CAP: usize = 256;
-const SOURCE_RESUME_TRACE_DEPTH: usize = 8;
-static SOURCE_RESUME_TRACE_NEXT: AtomicU64 = AtomicU64::new(0);
-static mut SOURCE_RESUME_TRACES: [Option<SourceResumeTrace>; SOURCE_RESUME_TRACE_CAP * SOURCE_RESUME_TRACE_DEPTH] =
-    [None; SOURCE_RESUME_TRACE_CAP * SOURCE_RESUME_TRACE_DEPTH];
-
-unsafe fn source_resume_trace_slot(
-    lane: nt_component_suspension::LaneHandle, route: PeerRoute,
-    dispatch: LaneDispatchIdentity, key: u64, owner: u64,
-) -> Option<*mut Option<SourceResumeTrace>> {
-    // A legitimate interim Call can transfer Reply while this provider frame resumes.
-    // Reply remains evidence in the record, but it is not part of frame identity.
-    let base = (lane.index as usize).checked_mul(SOURCE_RESUME_TRACE_DEPTH)?;
-    if base >= SOURCE_RESUME_TRACE_CAP * SOURCE_RESUME_TRACE_DEPTH { return None }
-    let slots = core::ptr::addr_of_mut!(SOURCE_RESUME_TRACES)
-        .cast::<Option<SourceResumeTrace>>().add(base);
-    let mut vacant = None;
-    let mut oldest = (u64::MAX, 0);
-    for offset in 0..SOURCE_RESUME_TRACE_DEPTH {
-        let slot = slots.add(offset);
-        match slot.read() {
-            Some(entry) if entry.route == route && entry.dispatch == dispatch
-                && entry.key == key && entry.owner == owner =>
-                return Some(slot),
-            Some(entry) => {
-                let last = entry.stages.iter().copied().max().unwrap_or(0);
-                if last < oldest.0 { oldest = (last, offset); }
-            }
-            None => if vacant.is_none() { vacant = Some(slot); },
-        }
-    }
-    Some(vacant.unwrap_or_else(|| slots.add(oldest.1)))
-}
-
-pub(crate) unsafe fn record_source_resume_transition(
-    stage: u64, lane: nt_component_suspension::LaneHandle,
-    dispatch: LaneDispatchIdentity, reply: u64,
-    key: nt_component_suspension::SuspensionKey, owner: nt_component_suspension::SuspensionOwner,
-) {
-    if !(1..=4).contains(&stage) { return }
-    if dispatch.lane() != lane { return }
-    let route = lanes().peer_route(lane).ok().flatten();
-    if stage == 1 && key.kind == nt_component_suspension::SuspensionKind::ProviderWait {
-        // Printed at the mutation site: even a later nested frame or missing route cannot
-        // erase proof that begin_resume happened for this exact frame.
-        crate::print_str(b"[source-resume-claim] lane/gen/epoch/reply/key/owner/route-present=");
-        for value in [u64::from(lane.index), lane.generation, dispatch.epoch(), reply,
-            key.id, owner.dispatch_id, u64::from(route.is_some())] {
-            crate::print_str(b"/"); crate::print_hex_u64(value);
-        }
-        crate::print_str(b"\n");
-    }
-    let Some(route) = route else { return };
-    let Some(slot) = source_resume_trace_slot(lane, route, dispatch, key.id, owner.dispatch_id)
-        else { return };
-    let previous = slot.read();
-    let same = previous.is_some_and(|entry| entry.route == route
-        && entry.dispatch == dispatch
-        && entry.key == key.id && entry.owner == owner.dispatch_id);
-    let mut record = match previous {
-        Some(entry) if stage != 1 && same => entry,
-        _ => SourceResumeTrace {
-            route, dispatch, claim_reply: reply, current_reply: reply,
-            key: key.id, owner: owner.dispatch_id, stages: [0; 5],
-        },
-    };
-    record.current_reply = reply;
-    record.stages[(stage - 1) as usize] = SOURCE_RESUME_TRACE_NEXT
-        .fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-    slot.write(Some(record));
-}
-
-unsafe fn trace_first_exact_resuming_source_work(
-    work_route: PeerRoute, work_dispatch: LaneDispatchIdentity, work_reply: u64,
-) {
-    let exact = lanes().frames().find_map(|(lane, frame)| {
-        let matching = lanes().peer_route(lane).ok().flatten() == Some(work_route)
-            && lanes().active_dispatch_identity(lane).ok().flatten() == Some(work_dispatch)
-            && lanes().binding(lane).ok().map(|binding| binding.reply_object) == Some(work_reply)
-            && matches!(frame.phase, nt_component_suspension::SuspensionPhase::Resuming { .. });
-        matching.then_some((lane, frame.key, frame.owner))
-    });
-    let Some((lane, key, owner)) = exact else { return };
-    let slot = source_resume_trace_slot(lane, work_route, work_dispatch,
-        key.id, owner.dispatch_id);
-    let previous = slot.and_then(|slot| slot.read());
-    let same = previous.is_some_and(|entry| entry.route == work_route
-        && entry.dispatch == work_dispatch
-        && entry.key == key.id && entry.owner == owner.dispatch_id);
-    let mut record = match previous {
-        Some(entry) if same => entry,
-        _ => SourceResumeTrace {
-            route: work_route, dispatch: work_dispatch,
-            claim_reply: work_reply, current_reply: work_reply,
-            key: key.id, owner: owner.dispatch_id, stages: [0; 5],
-        },
-    };
-    if record.stages[4] != 0 { return }
-    record.current_reply = work_reply;
-    record.stages[4] = SOURCE_RESUME_TRACE_NEXT.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-    if let Some(slot) = slot { slot.write(Some(record)); }
-    crate::print_str(b"[source-resume-history] lane/gen/epoch/claim-reply/current-reply/key/owner/begin/pump-enter/pump-return/no-child/first-work/begin-missing=");
-    for value in [u64::from(lane.index), lane.generation, work_dispatch.epoch(),
-        record.claim_reply, record.current_reply, key.id, owner.dispatch_id,
-        record.stages[0], record.stages[1],
-        record.stages[2], record.stages[3], record.stages[4],
-        u64::from(record.stages[0] == 0)] {
-        crate::print_str(b"/"); crate::print_hex_u64(value);
-    }
-    crate::print_str(b"\n");
-}
-
 /// The slot is storage, not authority. A recycled slot cannot restore a different parent scope.
 #[must_use = "retain the exact parked parent until restoration acknowledges"]
 pub(crate) struct ParkedParentHandle {
@@ -453,7 +327,6 @@ pub(crate) unsafe fn trace_source_terminal_lane(
     // must not exhaust the diagnosis before a later terminal reaches the actual wall.
     let sample = TRACES.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     if !sample.is_power_of_two() { return; }
-    trace_first_exact_resuming_source_work(work_route, work_dispatch, work_reply);
     let (running, route, phase, top_kind, top_id, top_phase, top_owner) = {
         let catalog = lanes();
         let running = catalog.running();
@@ -521,10 +394,7 @@ pub(crate) unsafe fn trace_source_terminal_lane(
         let exact_work = frame_route == Some(work_route)
             && frame_dispatch == Some(work_dispatch)
             && frame_reply == Some(work_reply);
-        let lane_phase = lanes().phase(frame_lane).ok();
-        let external_depth = lanes().external_depth(frame_lane).unwrap_or(0);
-        let external_top = lanes().external_top(frame_lane).ok().flatten();
-        crate::print_str(b"[source-terminal-frame] sample/lane/gen/phase/kind/key/owner/route-domain/route-gen/route-exec/epoch/reply/exact-work/parent-blocks-resume/lane-phase/external-depth/external-top=");
+        crate::print_str(b"[source-terminal-frame] sample/lane/gen/phase/kind/key/owner/route-domain/route-gen/route-exec/epoch/reply/exact-work/parent-blocks-resume=");
         for value in [sample, u64::from(frame_lane.index), frame_lane.generation,
             phase, frame.key.kind as u64, frame.key.id, frame.owner.dispatch_id,
             frame_route.map_or(0, |route| route.identity().domain),
@@ -533,16 +403,7 @@ pub(crate) unsafe fn trace_source_terminal_lane(
             frame_dispatch.map_or(0, |dispatch| dispatch.epoch()),
             frame_reply.unwrap_or(0),
             u64::from(exact_work),
-            u64::from(source_ioctl_parent_blocks_provider_resume(frame.owner.dispatch_id)),
-            lane_phase.map_or(0, |phase| match phase {
-                nt_component_suspension::LanePhase::Running => 1,
-                nt_component_suspension::LanePhase::Suspended => 2,
-                nt_component_suspension::LanePhase::NestedExecution(_) => 3,
-                nt_component_suspension::LanePhase::Terminal => 4,
-                nt_component_suspension::LanePhase::Idle => 5,
-                _ => 6,
-            }),
-            external_depth as u64, external_top.unwrap_or(0)] {
+            u64::from(source_ioctl_parent_blocks_provider_resume(frame.owner.dispatch_id))] {
             crate::print_str(b"/"); crate::print_hex_u64(value);
         }
         crate::print_str(b"\n");
