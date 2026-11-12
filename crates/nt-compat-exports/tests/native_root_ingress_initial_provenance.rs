@@ -35,15 +35,14 @@ fn only_initial_ssdt_dispatch_mints_root_provenance() {
     let constructors = GLUE.split("Some(crate::spawn_hosts::PumpChannel {").nth(1).unwrap();
     assert!(constructors.split("caps: crate::spawn_hosts::HostCaps").next().unwrap()
         .contains("initial_root_dispatch: None"));
-    for resumed in ["channel.caps.hosted_receive_yield = allow_receive_yield",
-        "channel.caps.hosted_receive_yield = !pending.nested_user_callback"] {
-        let paths: Vec<_> = GLUE.split(resumed).skip(1).collect();
-        assert!(!paths.is_empty(), "resumed provider/callback path must remain visible");
-        for path in paths {
-            assert!(!path.split("component_pump(&channel)").next().unwrap().contains(
-                "channel.initial_root_dispatch ="),
-                "resumed callback/provider/LPC pump must not mint initial provenance");
-        }
+    for resumed in ["resume_suspended_provider_wait_component(",
+        "resume_suspended_lpc_wait_component("] {
+        let path = GLUE.split(resumed).nth(1)
+            .expect("resumed provider/LPC path must remain visible")
+            .split("component_pump_resume_").next().unwrap();
+        assert!(path.contains("channel.caps.hosted_receive_yield = yield_caps.hosted_receive"));
+        assert!(!path.contains("channel.initial_root_dispatch ="),
+            "resumed provider/LPC pump must not mint initial provenance");
     }
 }
 
