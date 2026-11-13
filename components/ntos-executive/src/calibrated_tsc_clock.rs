@@ -145,6 +145,7 @@ fn disable_for(error: TscClockError) {
         TscClockError::ReferenceRegressed => REFERENCE_REGRESSED,
         TscClockError::NotInvariant => NO_INVARIANT_TSC,
         TscClockError::Uncalibrated => NO_CALIBRATION,
+        TscClockError::Unstable => DRIFT_EXCEEDED,
     };
     disable(reason);
 }

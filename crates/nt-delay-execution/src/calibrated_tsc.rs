@@ -14,6 +14,8 @@ pub enum TscClockError {
     TimeRegressed,
     TimeOverflow,
     ReferenceRegressed,
+    /// The counter kept leaving the rate tolerance of the reference clock.
+    Unstable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

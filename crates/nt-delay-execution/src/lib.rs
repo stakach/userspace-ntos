@@ -12,6 +12,16 @@ pub use calibrated_tsc::{CalibratedTscEpoch, TscClockError, TscDrift};
 #[cfg(test)]
 mod calibrated_tsc_tests;
 
+mod disciplined_tsc;
+pub use disciplined_tsc::{
+    DisciplinedTsc, MonotonicTime, Published, ReferenceSample, TscObservation, TscPhase, TscRead,
+    CHECK_INTERVAL_100NS, CHECK_READS, CLEAN_WINDOWS_TO_ADMIT, FORGIVENESS_WINDOWS,
+    MAX_BRACKET_100NS, MAX_EXCURSIONS, RATE_TOLERANCE_PPM, RATE_WINDOW_100NS,
+};
+
+#[cfg(test)]
+mod disciplined_tsc_tests;
+
 pub fn due_time(interval: i64, monotonic_now: u64, system_now: u64) -> Deadline {
     Deadline::from_nt_timeout(
         Some(interval),
