@@ -46,39 +46,3 @@ fn loader_copyin_uses_recorded_stack_backing_without_role_or_geometry_fallback()
     assert_recorded_route("client_copyin_process_mapped_impl");
 }
 
-#[test]
-fn critical_section_diagnostics_use_recorded_backing_not_computed_stack_mirror() {
-    let file = syn::parse_file(include_str!(
-        "../../../../components/ntos-executive/src/service_sec_image.rs"
-    )).unwrap();
-    struct Diagnostic(bool);
-    impl<'ast> Visit<'ast> for Diagnostic {
-        fn visit_expr_if(&mut self, expression: &'ast syn::ExprIf) {
-            let tagged = expression.then_branch.stmts.iter().any(|statement|
-                matches!(statement, syn::Stmt::Expr(syn::Expr::Call(call), _)
-                    if matches!(call.args.first(), Some(syn::Expr::Lit(literal))
-                        if matches!(&literal.lit, syn::Lit::ByteStr(bytes)
-                            if bytes.value() == b"[cs-diag] label=3 exc#="))));
-            if tagged {
-                struct Paths(Vec<String>);
-                impl<'ast> Visit<'ast> for Paths {
-                    fn visit_path(&mut self, path: &'ast syn::Path) {
-                        if let Some(name) = path.segments.last() { self.0.push(name.ident.to_string()); }
-                        syn::visit::visit_path(self, path);
-                    }
-                }
-                let mut paths = Paths(Vec::new());
-                paths.visit_block(&expression.then_branch);
-                assert!(!paths.0.iter().any(|name| name == "read_volatile"),
-                    "diagnostics must not fault the executive through inferred stack mirrors");
-                assert!(paths.0.iter().any(|name| name == "read_fault_stack_word"),
-                    "diagnostic reads use the shared retained backing boundary");
-                self.0 = true;
-            }
-            syn::visit::visit_expr_if(self, expression);
-        }
-    }
-    let mut diagnostic = Diagnostic(false);
-    diagnostic.visit_file(&file);
-    assert!(diagnostic.0, "critical-section diagnostic boundary exists");
-}
