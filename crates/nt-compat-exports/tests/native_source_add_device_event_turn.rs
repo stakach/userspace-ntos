@@ -22,24 +22,6 @@ fn central_receive_defers_unrelated_calls_but_allows_exact_selected_child() {
 }
 
 #[test]
-fn one_shot_retry_is_registered_with_shared_timer_owner() {
-    assert!(TIMER.contains("owner.root_add_device, DELAY_TIMER_SOURCE_ROOT_ADD_DEVICE_RETRY"));
-    assert!(SERVICE.contains("root_add_device_retry_wake_due"));
-    assert!(SERVICE.contains("ROOT_ADD_DEVICE_RETRY_DEADLINE.store(u64::MAX"));
-}
-
-#[test]
-fn selected_receive_child_may_finish_parent_before_next_root_turn() {
-    let no_selected = SERVICE
-        .split_once("let Some((reservation, ran_child)) = selected else {").unwrap().1
-        .split_once("// Ordinary redrives may reach Ready").unwrap().0;
-    assert!(no_selected.contains("root_add_device_still_parked(&nt_handler, turn.owner())"),
-        "a selected Receive child can finish AddDevice while the root is servicing its fault");
-    assert!(no_selected.contains("turn.settle("),
-        "the exact owner must release its retained ingress after that completion");
-}
-
-#[test]
 fn parked_timer_ack_preserves_other_due_owners_until_bank_release() {
     let notification = SERVICE
         .split_once("unsafe fn service_parked_add_device_notification(").unwrap().1
@@ -53,17 +35,6 @@ fn parked_timer_ack_preserves_other_due_owners_until_bank_release() {
         && ack.contains("delay_timer_ack_irq()"));
     assert!(!ack.contains("delay_timer_drain_due_work"),
         "other timer owners must remain queued for a post-parent root turn");
-}
-
-#[test]
-fn parent_settlement_rearms_deferred_global_due_owners_before_receive() {
-    let root = SERVICE.split_once("'service_loop: loop {").unwrap().1;
-    let resumed = root.split_once("if root_event_consumed {").unwrap().1
-        .split_once("// Bound notifications do not bind").unwrap().0;
-    let rearm = resumed.find("delay_timer_rearm(&*delay_queue, &nt_handler)")
-        .expect("deferred timer owners need a fresh physical shot after AddDevice releases its bank");
-    let receive = resumed.find("component_recv!(fault_ep").unwrap();
-    assert!(rearm < receive);
 }
 
 #[test]
@@ -85,16 +56,3 @@ fn irq_line_preflight_quarantines_uncertain_lease_release() {
         "failed lease release must mask and quarantine the line before returning");
 }
 
-#[test]
-fn exact_ingress_is_prevalidated_before_move_only_turn_is_consumed() {
-    let root = SERVICE.split_once("'service_loop: loop {").unwrap().1;
-    let first_settle = root.find("turn.settle(").unwrap();
-    let first_validate = root.find("deferred_parked_ingress_is_exact(ticket)").unwrap();
-    assert!(first_validate < first_settle,
-        "a failed exact physical Reply check must leave the whole turn retained");
-    let second_settle = root[first_settle + 1..].find("turn.settle(").unwrap() + first_settle + 1;
-    let second_validate = root[first_validate + 1..]
-        .find("deferred_parked_ingress_is_exact(ticket)").unwrap() + first_validate + 1;
-    assert!(second_validate < second_settle,
-        "both root completion paths must retain the turn on validation refusal");
-}

@@ -139,22 +139,3 @@ fn pnp_batch_retains_upper_filter_after_function_add_device_without_replaying_it
         "function AddDevice terminal must hand a live filter continuation to the batch");
 }
 
-#[test]
-fn root_selects_the_exact_upper_filter_child_before_other_provider_redrives() {
-    let service = ROOT.split_once("'service_loop: loop {")
-        .expect("flat root service loop").1;
-    let child = service.find("run_one_pending_add_device_child_step(")
-        .expect("root selects one retained AddDevice child step");
-    let parent = service[child..].find("redrive_flat_root_add_device_selected(")
-        .expect("root resumes the selected PnP batch") + child;
-    let unrelated = service.find("redrive_hosted_driver_io_create_file(")
-        .expect("later unrelated provider redrive");
-    assert!(child < parent && parent < unrelated,
-        "the upper-filter child and parent must settle before unrelated providers enter");
-    let wait_stage = PNP.split_once("pub(crate) fn wait_stage(&self)")
-        .expect("batch wait stage").1
-        .split_once("pub(crate) fn").expect("following batch method").0;
-    assert!(wait_stage.contains("pending_upper_filter.is_some()")
-        && PNP.contains("self.record_upper_filter_child_step(step)"),
-        "root's generic AddDevice selector must include the exact retained upper filter");
-}

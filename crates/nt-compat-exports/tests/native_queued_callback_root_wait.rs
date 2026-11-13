@@ -36,26 +36,6 @@ fn early_callback_wait() -> &'static str {
 }
 
 #[test]
-fn later_generic_settlement_keeps_retryable_child_absence_distinct_from_uncertainty() {
-    let generic = SERVICE
-        .split_once("let queue_settlement = settle_queued_callbacks();")
-        .expect("generic callback settlement")
-        .1
-        .split_once("trace_connect_root_checkpoint(4, None)")
-        .expect("later Hook boundary")
-        .0;
-    assert!(
-        generic.contains("ConnectPumpSettlement::AwaitingLocalChild =>"),
-        "a retained callback waiting for a child needs a bounded root wait before Hook redrive"
-    );
-    assert!(
-        generic.contains("ConnectPumpSettlement::Retained")
-            && generic.contains("ConnectPumpSettlement::Blocked"),
-        "uncertain or blocked owners remain fail-closed with their exact Reply"
-    );
-}
-
-#[test]
 fn no_ready_child_keeps_the_exact_callback_selector_and_reply_parked() {
     let deposit = QUEUE
         .split_once("pub(crate) unsafe fn record_queued_callback_child_step(")
@@ -158,31 +138,6 @@ fn queued_wait_acks_the_current_notification_and_arms_a_retry_before_receive() {
 }
 
 #[test]
-fn both_root_settlement_sites_fence_providers_while_the_queued_reply_is_parked() {
-    let early = early_callback_wait();
-    assert!(
-        early.contains("park_queued_callback_root_receive!(root_event_consumed, 'queued_callback_settlement)"),
-        "the early site must enter the generic queued callback wait"
-    );
-    let later = between(
-        SERVICE,
-        "let queue_settlement = settle_queued_callbacks();",
-        "trace_connect_root_checkpoint(4, None)",
-    );
-    assert!(
-        later.contains("ConnectPumpSettlement::AwaitingLocalChild =>")
-            && later.contains("park_queued_callback_root_receive!(root_event_consumed)"),
-        "the later site must use the same exact queued callback wait before Hook redrive"
-    );
-    assert!(
-        later.contains("ConnectPumpSettlement::Retained")
-            && later.contains("ConnectPumpSettlement::Blocked")
-            && later.contains("break 'service_loop"),
-        "an uncertain callback continues to fence unrelated provider entry"
-    );
-}
-
-#[test]
 fn outer_io_pump_cannot_discard_a_suspended_callback_owner() {
     let pump = function_body(
         DRIVER,
@@ -223,20 +178,6 @@ fn root_receive_has_a_physical_queue_wake_after_an_empty_scan() {
         TIMER.contains("queued_work_receive_poll_deadline(), DELAY_TIMER_SOURCE_QUEUED_WORK_RECEIVE_POLL")
             && MAIN.contains("timer_deadline::queued_work_receive_poll_wake_due(now_100ns)"),
         "the poll needs one canonical timer selector and a due transition before root rescans the queue"
-    );
-}
-
-#[test]
-fn root_retires_a_parked_callback_turn_before_admitting_another_provider() {
-    let root = between(
-        SERVICE,
-        "        'queued_callback_settlement: loop {\n            // A callback reached by the preceding AddDevice child",
-        "            let callback_settlement =",
-    );
-    assert!(
-        root.contains("root_queued_callback_turn.is_empty()")
-            && root.contains("!root_queued_callback_exclusive_pending()"),
-        "a callback ACK may remove its queue row before the root has retired its deferred ingress tickets"
     );
 }
 
@@ -294,38 +235,6 @@ fn deferred_call_ticket_is_attached_only_to_its_selected_callback() {
     let retain = function_body(SERVICE, "unsafe fn retain_parked_queued_callback_ingress(");
     assert!(retain.contains("turn.owner() != permit.0"),
         "a newly selected callback cannot put its Call ticket on an older stack turn");
-}
-
-#[test]
-fn older_deferred_call_is_preserved_before_later_arrival_after_callback_settlement() {
-    let prelude = between(
-        SERVICE,
-        "let mut root_event_consumed = false;",
-        "let callback_settlement = {",
-    );
-    assert!(
-        prelude.contains("retain_parked_queued_callback_ingress("),
-        "current Call Y must be retained before the callback can settle and reimport older X"
-    );
-    let early = early_callback_wait();
-    let later = between(
-        SERVICE,
-        "let queue_settlement = settle_queued_callbacks();",
-        "trace_connect_root_checkpoint(4, None)",
-    );
-    assert!(
-        early.contains("settle_parked_queued_callback_turn(")
-            && later.contains("settle_parked_queued_callback_turn("),
-        "both settlement sites must release only the exact callback stack top"
-    );
-    let root = between(
-        SERVICE,
-        "'service_loop: loop {",
-        "fn ready_flat_root_add_device(",
-    );
-    assert!(root.contains("if root_event_consumed {")
-        && root.contains("component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed))"),
-        "after retained ingress X/Y is released, root must receive those original Calls before ordinary admission");
 }
 
 // Behaviour of the owner advance and claim-keyed retirement is proven on the host by

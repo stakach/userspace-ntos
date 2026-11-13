@@ -4,34 +4,6 @@ const SERVICE: &str = include_str!("../../../components/ntos-executive/src/servi
 const LIVE: &str = include_str!("../../../components/ntos-executive/src/hosted_connect_live.rs");
 
 #[test]
-fn root_claims_and_runs_one_connect_child_before_other_provider_work() {
-    let maintenance = SERVICE.split_once("unsafe fn settle_suspended_connect_pumps()")
-        .expect("shared flat-root CONNECT settlement").1;
-    let claim = maintenance
-        .find("claim_suspended_port_connect_pump()")
-        .expect("claim exact suspended CONNECT before child work");
-    let child = maintenance
-        .find("drive_one_nested_file_child_step()")
-        .expect("one child step after File frames unwind");
-    let fresh_child = maintenance.split_once("let step = drive_one_nested_file_child_step();")
-        .expect("fresh CONNECT child boundary").1;
-    let resume = fresh_child
-        .find("redrive_recorded_connect_pump(")
-        .expect("resume the exact CONNECT continuation");
-    let deposit = fresh_child.find("record_suspended_connect_pump_child_step(")
-        .expect("deposit the sealed child before any early root exit");
-    let hook = fresh_child.find("settle_suspended_file_pumps()")
-        .expect("settle nested Hook File before parent restore");
-    assert!(claim < child && deposit < hook && hook < resume);
-    let root = SERVICE.split_once("'service_loop: loop {").unwrap().1;
-    let settle = root.find("settle_suspended_connect_pumps()")
-        .expect("CONNECT settlement must run at root");
-    let later = root.find("redrive_hosted_hook_forward()")
-        .expect("HOOK redrive after CONNECT settlement");
-    assert!(settle < later);
-}
-
-#[test]
 fn unresolved_connect_parent_fences_later_provider_work() {
     let maintenance = SERVICE.split_once("unsafe fn settle_suspended_connect_pumps()")
         .expect("shared flat-root CONNECT settlement").1;

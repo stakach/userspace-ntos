@@ -2,6 +2,7 @@
 //!
 //! A service the native dispatcher or the ALPC table implements: argument capture, the
 //! dispatch through `ExecNtHandler`, and the handler's post-actions.
+//!
 //! The text is the loop's, moved verbatim: an exit from the service loop is now a
 //! `Break(Turn::Exit)`, the end of a turn a `Break(Turn::Next)`, and the flow macros are
 //! direct calls.

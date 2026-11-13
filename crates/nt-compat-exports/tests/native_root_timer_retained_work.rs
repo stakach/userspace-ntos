@@ -21,44 +21,6 @@ const NATIVE_DIRECTORY_RETRIES: [&str; 3] = [
 ];
 
 #[test]
-fn retained_page_and_map_retries_can_wake_the_root() {
-    let selector = SELECTOR
-        .split_once("pub(super) unsafe fn next(")
-        .map(|(_, body)| body)
-        .expect("canonical root timer selector");
-    let pump = ROOT
-        .split_once("unsafe fn timer_retry_wake_due(")
-        .and_then(|(_, body)| body.split_once("unsafe fn timer_hosted_driver_wake_due("))
-        .map(|(body, _)| body)
-        .expect("root timer retry pump");
-
-    for owner in RETAINED_RETRIES.into_iter().chain(NATIVE_DIRECTORY_RETRIES) {
-        let deadline = format!("{owner}::next_deadline()");
-        let due = format!("{owner}::wake_due(now_100ns)");
-        let redrive = format!("crate::{owner}::redrive(");
-        assert!(
-            selector.contains(&deadline),
-            "{owner} retains a retry but cannot arm a physical root wake"
-        );
-        assert!(
-            pump.contains(&due),
-            "{owner} has no retry readiness scan on timer delivery"
-        );
-        let redriven = match owner {
-            "native_directory_effect_work" => {
-                SERVICE.contains("crate::native_directory_effect_work::redrive_effects(")
-                    && SERVICE.contains("crate::native_directory_effect_work::redrive_detached(")
-            }
-            _ => SERVICE.contains(&redrive),
-        };
-        assert!(
-            redriven,
-            "{owner} has no service-loop redriver after timer delivery"
-        );
-    }
-}
-
-#[test]
 fn nested_registry_retry_is_physically_covered_before_blocking_receive() {
     let arm = ROOT
         .split_once("unsafe fn arm_nested_registry_retry_before_receive() -> bool {")

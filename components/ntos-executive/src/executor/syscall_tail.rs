@@ -2,6 +2,7 @@
 //!
 //! Everything a syscall does after its NT or win32k route returns: post-dispatch
 //! bookkeeping, then either the park the outcome asks for or the reply, and the next receive.
+//!
 //! The text is the loop's, moved verbatim: an exit from the service loop is now a
 //! `Break(Turn::Exit)`, the end of a turn a `Break(Turn::Next)`, and the flow macros are
 //! direct calls.

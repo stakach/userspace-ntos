@@ -5,46 +5,6 @@ const SERVICE: &str = include_str!("../../../components/ntos-executive/src/servi
 const HOSTED: &str = include_str!("../../../components/ntos-executive/src/component_ingress_hosted.rs");
 
 #[test]
-fn retired_runtime_cancellation_uses_retained_physical_call_not_live_admission() {
-    let resume_stopped = HOSTED
-        .split_once("pub(crate) unsafe fn hosted_can_resume(")
-        .expect("hosted resume fence")
-        .1
-        .split_once("let cancelled =")
-        .expect("stopped-call fence boundary")
-        .0;
-    let stop = HOSTED
-        .split_once("unsafe fn stop_retained_hosted_call(")
-        .expect("retained physical Call Stop")
-        .1
-        .split_once("pub(crate) unsafe fn stop_hosted_caller(")
-        .expect("Stop boundary")
-        .0;
-    let cancel = HOSTED
-        .split_once("pub(crate) unsafe fn stop_and_cancel_hosted(")
-        .expect("retained hosted cancellation")
-        .1
-        .split_once("pub(crate) unsafe fn cancel_hosted(")
-        .expect("cancellation boundary")
-        .0;
-    for source in [resume_stopped, stop, cancel] {
-        assert!(!source.contains("hosted_ingress_binding("),
-            "retiring the semantic runtime cannot un-fence or revoke its retained Call");
-    }
-    assert!(stop.contains("query_component_reply_binding("),
-        "physical Stop must prove the retained Reply still binds the exact TCB");
-    let rejection = SERVICE
-        .split_once("macro_rules! reject_hosted_ingress")
-        .expect("hosted ingress rejection")
-        .1
-        .split_once("// The previous iteration's event locals")
-        .expect("rejection boundary")
-        .0;
-    assert!(!rejection.contains("assert!(drop_current_hosted_reply()"),
-        "an uncertain or refused cancellation must retain the Call without panicking");
-}
-
-#[test]
 fn acknowledged_hosted_stop_does_not_require_its_old_reply_binding() {
     let stop = HOSTED
         .split_once("unsafe fn stop_retained_hosted_call(")

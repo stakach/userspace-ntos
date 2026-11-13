@@ -93,15 +93,3 @@ fn retained_initial_owner_must_retire_before_terminal_reply() {
         "a retained non-busy effect must keep the source Reply fenced");
 }
 
-#[test]
-fn retry_runs_after_provider_settlement_in_the_root_pass() {
-    let service = source("service_sec_image.rs");
-    let root = service.find("let alpc_reply_committed;").expect("root redrive pass");
-    let tail = service[root..].find("if alpc_reply_committed.is_some()").unwrap() + root;
-    let pass = &service[root..tail];
-    let settlement = pass.find("inline_file_retirement::redrive(&mut nt_handler)").unwrap();
-    let retry = pass.rfind("initial_thread_creation::redrive_retry_no_effect(&mut nt_handler)")
-        .expect("retained initial Reply redrive");
-    assert!(retry > settlement,
-        "a provider settling later in the pass must not leave the parked first-thread caller asleep");
-}

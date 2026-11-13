@@ -2,6 +2,7 @@
 //!
 //! A service number in the win32k range: argument staging, the dispatch into the hosted
 //! win32k component, and the copy-back of its results.
+//!
 //! The text is the loop's, moved verbatim: an exit from the service loop is now a
 //! `Break(Turn::Exit)`, the end of a turn a `Break(Turn::Next)`, and the flow macros are
 //! direct calls.

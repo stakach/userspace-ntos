@@ -3,6 +3,7 @@
 //! `admit` validates the received event against the live thread and process tables, selects
 //! the roles of the sending thread, loads its process's working state and builds the `Event`
 //! the arms read.
+//!
 //! The text is the loop's, moved verbatim: an exit from the service loop is now a
 //! `Break(Turn::Exit)`, the end of a turn a `Break(Turn::Next)`, and the flow macros are
 //! direct calls.

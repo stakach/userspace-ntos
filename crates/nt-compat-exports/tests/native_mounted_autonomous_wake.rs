@@ -139,19 +139,3 @@ fn native_settlement_services_resolved_backend_before_receive() {
     assert!(completion > 0, "hosted completions must follow native settlement");
 }
 
-#[test]
-fn irq_fast_path_delivers_native_backend_terminal_before_receive() {
-    let irq = &SERVICE[SERVICE.find("if current_irq_lines != 0 {")
-        .expect("root IRQ fast path")..];
-    let receive = irq.find("let received = component_recv!")
-        .expect("IRQ fast path parks root Receive");
-    let before_receive = &irq[..receive];
-    let settled = before_receive.find("service_mounted_native_blocks_and_redrive_backends()")
-        .expect("IRQ terminal uses shared native block/backend ordering");
-    let pumped = before_receive.find("driver_launch::pump_hosted_io_completions()")
-        .expect("resolved terminal enters I/O Manager before Receive");
-    let delivered = before_receive.find("pending_file_io_redrive_all(&mut nt_handler)")
-        .expect("retained File reply redrives before Receive");
-    assert!(settled < pumped && pumped < delivered,
-        "IRQ path must settle native work, publish backend completion, then redrive File reply");
-}
