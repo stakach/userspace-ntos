@@ -155,8 +155,8 @@ extern "win64" fn rtl_unicode_to_multibyte_size(
 }
 
 pub(crate) fn bind(reg: &mut DriverExportRegistry) {
-    reg.bind("RtlAnsiCharToUnicodeChar", rtl_ansi_char_to_unicode_char as usize as u64);
-    reg.bind("RtlMultiByteToUnicodeN", rtl_multibyte_to_unicode_n as usize as u64);
-    reg.bind("RtlMultiByteToUnicodeSize", rtl_multibyte_to_unicode_size as usize as u64);
-    reg.bind("RtlUnicodeToMultiByteSize", rtl_unicode_to_multibyte_size as usize as u64);
+    reg.bind("RtlAnsiCharToUnicodeChar", rtl_ansi_char_to_unicode_char as *const () as usize as u64);
+    reg.bind("RtlMultiByteToUnicodeN", rtl_multibyte_to_unicode_n as *const () as usize as u64);
+    reg.bind("RtlMultiByteToUnicodeSize", rtl_multibyte_to_unicode_size as *const () as usize as u64);
+    reg.bind("RtlUnicodeToMultiByteSize", rtl_unicode_to_multibyte_size as *const () as usize as u64);
 }

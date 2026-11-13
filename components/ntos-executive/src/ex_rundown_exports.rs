@@ -93,15 +93,15 @@ pub(crate) extern "win64" fn ex_wait_for_rundown_protection_release(run_ref: *co
 }
 
 pub(crate) fn bind_ex_rundown_exports(reg: &mut DriverExportRegistry) {
-    reg.bind("ExAcquireRundownProtectionCacheAware", ex_acquire_rundown_protection_cache_aware as usize as u64);
-    reg.bind("ExInitializeRundownProtectionCacheAware", ex_initialize_rundown_protection_cache_aware as usize as u64);
-    reg.bind("ExReInitializeRundownProtectionCacheAware", ex_reinitialize_rundown_protection_cache_aware as usize as u64);
-    reg.bind("ExReleaseRundownProtectionCacheAware", ex_release_rundown_protection_cache_aware as usize as u64);
-    reg.bind("ExSizeOfRundownProtectionCacheAware", ex_size_of_rundown_protection_cache_aware as usize as u64);
-    reg.bind("ExWaitForRundownProtectionReleaseCacheAware", ex_wait_for_rundown_protection_release_cache_aware as usize as u64);
-    reg.bind("ExAcquireRundownProtection", ex_acquire_rundown_protection as usize as u64);
-    reg.bind("ExInitializeRundownProtection", ex_initialize_rundown_protection as usize as u64);
-    reg.bind("ExReInitializeRundownProtection", ex_reinitialize_rundown_protection as usize as u64);
-    reg.bind("ExReleaseRundownProtection", ex_release_rundown_protection as usize as u64);
-    reg.bind("ExWaitForRundownProtectionRelease", ex_wait_for_rundown_protection_release as usize as u64);
+    reg.bind("ExAcquireRundownProtectionCacheAware", ex_acquire_rundown_protection_cache_aware as *const () as usize as u64);
+    reg.bind("ExInitializeRundownProtectionCacheAware", ex_initialize_rundown_protection_cache_aware as *const () as usize as u64);
+    reg.bind("ExReInitializeRundownProtectionCacheAware", ex_reinitialize_rundown_protection_cache_aware as *const () as usize as u64);
+    reg.bind("ExReleaseRundownProtectionCacheAware", ex_release_rundown_protection_cache_aware as *const () as usize as u64);
+    reg.bind("ExSizeOfRundownProtectionCacheAware", ex_size_of_rundown_protection_cache_aware as *const () as usize as u64);
+    reg.bind("ExWaitForRundownProtectionReleaseCacheAware", ex_wait_for_rundown_protection_release_cache_aware as *const () as usize as u64);
+    reg.bind("ExAcquireRundownProtection", ex_acquire_rundown_protection as *const () as usize as u64);
+    reg.bind("ExInitializeRundownProtection", ex_initialize_rundown_protection as *const () as usize as u64);
+    reg.bind("ExReInitializeRundownProtection", ex_reinitialize_rundown_protection as *const () as usize as u64);
+    reg.bind("ExReleaseRundownProtection", ex_release_rundown_protection as *const () as usize as u64);
+    reg.bind("ExWaitForRundownProtectionRelease", ex_wait_for_rundown_protection_release as *const () as usize as u64);
 }

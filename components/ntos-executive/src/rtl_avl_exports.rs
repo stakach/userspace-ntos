@@ -45,9 +45,9 @@ pub(crate) extern "win64" fn rtl_number_generic_table_elements_avl(
 }
 
 pub(crate) fn bind_rtl_avl_exports(reg: &mut DriverExportRegistry) {
-    reg.bind("RtlInitializeGenericTableAvl", rtl_initialize_generic_table_avl as usize as u64);
-    reg.bind("RtlInsertElementGenericTableAvl", rtl_insert_element_generic_table_avl as usize as u64);
-    reg.bind("RtlLookupElementGenericTableAvl", rtl_lookup_element_generic_table_avl as usize as u64);
-    reg.bind("RtlDeleteElementGenericTableAvl", rtl_delete_element_generic_table_avl as usize as u64);
-    reg.bind("RtlNumberGenericTableElementsAvl", rtl_number_generic_table_elements_avl as usize as u64);
+    reg.bind("RtlInitializeGenericTableAvl", rtl_initialize_generic_table_avl as *const () as usize as u64);
+    reg.bind("RtlInsertElementGenericTableAvl", rtl_insert_element_generic_table_avl as *const () as usize as u64);
+    reg.bind("RtlLookupElementGenericTableAvl", rtl_lookup_element_generic_table_avl as *const () as usize as u64);
+    reg.bind("RtlDeleteElementGenericTableAvl", rtl_delete_element_generic_table_avl as *const () as usize as u64);
+    reg.bind("RtlNumberGenericTableElementsAvl", rtl_number_generic_table_elements_avl as *const () as usize as u64);
 }

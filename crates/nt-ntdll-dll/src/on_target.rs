@@ -7699,7 +7699,7 @@ unsafe fn execute_registered_wait_dispatch(dispatch: RtlRegisteredWaitDispatch) 
     };
     let status = unsafe {
         rtl_queue_work_item(
-            rtl_registered_wait_callback_worker as usize as u64,
+            rtl_registered_wait_callback_worker as *const () as usize as u64,
             packet_address as u64,
             dispatch.queue_flags,
         )
@@ -7930,7 +7930,7 @@ unsafe fn execute_timer_dispatch(queue_token: u64, dispatch: nt_rtl_timer_wait::
             };
             let status = unsafe {
                 rtl_queue_work_item(
-                    rtl_timer_callback_worker as usize as u64,
+                    rtl_timer_callback_worker as *const () as usize as u64,
                     packet_address as u64,
                     flags.bits(),
                 )
@@ -7976,7 +7976,7 @@ unsafe fn rtl_async_execute_one_completion(timeout: Option<i64>) -> Result<bool,
     if !nt_rtl_work_item::nt_success(status) || key == 0 {
         return Err(status);
     }
-    if key == rtlp_execute_work_item as usize as u64 {
+    if key == rtlp_execute_work_item as *const () as usize as u64 {
         unsafe {
             rtlp_execute_work_item(
                 core::ptr::null_mut(),
@@ -8244,8 +8244,8 @@ pub static ON_TARGET_EXPORT_ANCHOR_FN: unsafe extern "C" fn() = on_target_export
 /// Never called; it only takes export addresses so linker DCE keeps the symbols.
 pub unsafe extern "C" fn on_target_export_anchor() {
     let anchors: &[usize] = &[
-        rtlp_worker_thread as usize,
-        rtlp_completion_worker_thread as usize,
+        rtlp_worker_thread as *const () as usize,
+        rtlp_completion_worker_thread as *const () as usize,
     ];
     core::hint::black_box(anchors);
 }
@@ -8388,7 +8388,7 @@ pub unsafe fn rtl_queue_work_item_checked(
         syscall6(
             SSN_NT_SET_IO_COMPLETION,
             port,
-            rtlp_execute_work_item as usize as u64,
+            rtlp_execute_work_item as *const () as usize as u64,
             packet_address as u64,
             STATUS_SUCCESS_U32 as u64,
             0,

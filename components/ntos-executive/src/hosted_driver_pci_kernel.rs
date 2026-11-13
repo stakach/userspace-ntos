@@ -66,8 +66,8 @@ pub(super) extern "win64" fn ke_ipi_generic_call(callback: u64, argument: u64) -
 }
 
 pub(crate) fn bind_pci_kernel_exports(reg: &mut nt_compat_exports::DriverExportRegistry) {
-    reg.bind("KdDisableDebugger", hosted_kd_debug::s_kd_disable_debugger as usize as u64);
-    reg.bind("KdEnableDebugger", hosted_kd_debug::s_kd_enable_debugger as usize as u64);
-    reg.bind("KeQueryActiveProcessorCountEx", hosted_driver_processor_mask::query_active_processor_count_ex as usize as u64);
-    reg.bind("KeIpiGenericCall", ke_ipi_generic_call as usize as u64);
+    reg.bind("KdDisableDebugger", hosted_kd_debug::s_kd_disable_debugger as *const () as usize as u64);
+    reg.bind("KdEnableDebugger", hosted_kd_debug::s_kd_enable_debugger as *const () as usize as u64);
+    reg.bind("KeQueryActiveProcessorCountEx", hosted_driver_processor_mask::query_active_processor_count_ex as *const () as usize as u64);
+    reg.bind("KeIpiGenericCall", ke_ipi_generic_call as *const () as usize as u64);
 }

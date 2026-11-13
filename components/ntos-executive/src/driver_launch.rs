@@ -36826,7 +36826,7 @@ fn register_fsd_trampolines() -> bool {
         crate::debug_traps::DbgBreakPointWithStatus as *const () as usize as u64,
     );
     bind_kd_debug_export(reg);
-    reg.bind("RtlAssert", crate::hosted_driver_assertion::rtl_assert as usize as u64);
+    reg.bind("RtlAssert", crate::hosted_driver_assertion::rtl_assert as *const () as usize as u64);
     crate::ex_rundown_exports::bind_ex_rundown_exports(reg);
     io_paging_priority_exports::bind(reg);
     hosted_driver_frame_capture::bind(reg);

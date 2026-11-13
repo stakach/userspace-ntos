@@ -188,7 +188,7 @@ unsafe fn post(work: *mut Work) -> u32 {
     }
     unsafe { core::ptr::write(ticket, WorkTicket { work, sequence }) };
     match unsafe {
-        crate::on_target::rtl_queue_work_item_checked(dispatch_ticket as u64, ticket as u64, 0)
+        crate::on_target::rtl_queue_work_item_checked(dispatch_ticket as *const () as u64, ticket as u64, 0)
     } {
         crate::on_target::QueueWorkItemOutcome::Queued => STATUS_SUCCESS,
         crate::on_target::QueueWorkItemOutcome::NoEffect(status) => {

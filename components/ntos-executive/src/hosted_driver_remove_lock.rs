@@ -177,8 +177,8 @@ pub(super) extern "win64" fn release_and_wait(lock: u64, tag: u64, size: u32) {
 }
 
 pub(crate) fn bind_remove_lock_exports(reg: &mut nt_compat_exports::DriverExportRegistry) {
-    reg.bind("IoInitializeRemoveLockEx", initialize as usize as u64);
-    reg.bind("IoAcquireRemoveLockEx", acquire as usize as u64);
-    reg.bind("IoReleaseRemoveLockEx", release as usize as u64);
-    reg.bind("IoReleaseRemoveLockAndWaitEx", release_and_wait as usize as u64);
+    reg.bind("IoInitializeRemoveLockEx", initialize as *const () as usize as u64);
+    reg.bind("IoAcquireRemoveLockEx", acquire as *const () as usize as u64);
+    reg.bind("IoReleaseRemoveLockEx", release as *const () as usize as u64);
+    reg.bind("IoReleaseRemoveLockAndWaitEx", release_and_wait as *const () as usize as u64);
 }

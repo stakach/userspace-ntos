@@ -9910,12 +9910,12 @@ unsafe fn init_lookaside(
     let alloc_fn = if allocate != 0 {
         allocate
     } else {
-        s_lookaside_alloc as usize as u64
+        s_lookaside_alloc as *const () as usize as u64
     };
     let free_fn = if free != 0 {
         free
     } else {
-        s_lookaside_free as usize as u64
+        s_lookaside_free as *const () as usize as u64
     };
     nt_kernel_exec::init_general_lookaside(
         la as *mut u8,
@@ -15604,7 +15604,7 @@ fn register_trampolines() -> bool {
         return false;
     }
     crate::driver_launch::bind_kd_debug_export(reg);
-    reg.bind("ExQueueWorkItem", s_ex_queue_work_item as usize as u64);
+    reg.bind("ExQueueWorkItem", s_ex_queue_work_item as *const () as usize as u64);
     reg.bind(
         "DbgBreakPoint",
         crate::debug_traps::DbgBreakPoint as *const () as usize as u64,
@@ -15616,15 +15616,15 @@ fn register_trampolines() -> bool {
     // pool (Driver Host arena)
     reg.bind(
         "ExAllocatePoolWithTag",
-        s_ex_alloc_pool_with_tag as usize as u64,
+        s_ex_alloc_pool_with_tag as *const () as usize as u64,
     );
-    reg.bind("ExAllocatePool", s_ex_alloc_pool as usize as u64);
+    reg.bind("ExAllocatePool", s_ex_alloc_pool as *const () as usize as u64);
     reg.bind(
         "ExAllocatePoolWithQuotaTag",
-        s_ex_alloc_pool_quota as usize as u64,
+        s_ex_alloc_pool_quota as *const () as usize as u64,
     );
-    reg.bind("ExFreePoolWithTag", s_ex_free_pool_with_tag as usize as u64);
-    reg.bind("ExFreePool", s_ex_free_pool as usize as u64);
+    reg.bind("ExFreePoolWithTag", s_ex_free_pool_with_tag as *const () as usize as u64);
+    reg.bind("ExFreePool", s_ex_free_pool as *const () as usize as u64);
     reg.bind(
         "KeBugCheck",
         crate::provider_bugcheck::ke_bug_check as *const () as usize as u64,
@@ -15633,112 +15633,112 @@ fn register_trampolines() -> bool {
         "KeBugCheckEx",
         crate::provider_bugcheck::ke_bug_check_ex as *const () as usize as u64,
     );
-    reg.bind("ProbeForRead", s_probe_for_read as usize as u64);
-    reg.bind("ProbeForWrite", s_probe_for_write as usize as u64);
-    reg.bind("RtlGetVersion", s_rtl_get_version as usize as u64);
-    reg.bind("RtlSetActiveConsoleId", s_rtl_set_active_console_id as usize as u64);
-    reg.bind("KeDelayExecutionThread", s_ke_delay_execution_thread as usize as u64);
-    reg.bind("KeQueryTimeIncrement", crate::driver_launch::s_ke_query_time_increment as usize as u64);
-    reg.bind("RtlUnicodeToMultiByteN", s_rtl_unicode_to_multibyte_n as usize as u64);
+    reg.bind("ProbeForRead", s_probe_for_read as *const () as usize as u64);
+    reg.bind("ProbeForWrite", s_probe_for_write as *const () as usize as u64);
+    reg.bind("RtlGetVersion", s_rtl_get_version as *const () as usize as u64);
+    reg.bind("RtlSetActiveConsoleId", s_rtl_set_active_console_id as *const () as usize as u64);
+    reg.bind("KeDelayExecutionThread", s_ke_delay_execution_thread as *const () as usize as u64);
+    reg.bind("KeQueryTimeIncrement", crate::driver_launch::s_ke_query_time_increment as *const () as usize as u64);
+    reg.bind("RtlUnicodeToMultiByteN", s_rtl_unicode_to_multibyte_n as *const () as usize as u64);
     crate::rtl_avl_exports::bind_rtl_avl_exports(reg);
-    reg.bind("RtlPrefixUnicodeString", s_rtl_prefix_unicode_string as usize as u64);
-    reg.bind("RtlSetSaclSecurityDescriptor", s_rtl_set_sacl_security_descriptor as usize as u64);
-    reg.bind("RtlSubAuthoritySid", s_rtl_sub_authority_sid as usize as u64);
-    reg.bind("RtlMultiByteToUnicodeSize", s_rtl_multibyte_to_unicode_size as usize as u64);
+    reg.bind("RtlPrefixUnicodeString", s_rtl_prefix_unicode_string as *const () as usize as u64);
+    reg.bind("RtlSetSaclSecurityDescriptor", s_rtl_set_sacl_security_descriptor as *const () as usize as u64);
+    reg.bind("RtlSubAuthoritySid", s_rtl_sub_authority_sid as *const () as usize as u64);
+    reg.bind("RtlMultiByteToUnicodeSize", s_rtl_multibyte_to_unicode_size as *const () as usize as u64);
     reg.bind("ExRaiseAccessViolation", seh.access_violation_va);
     reg.bind("ExRaiseStatus", seh.raise_va);
     crate::ex_rundown_exports::bind_ex_rundown_exports(reg);
     reg.bind("RtlUnwindEx", seh.unwind_entry_va);
     reg.bind("RtlUnwind", seh.legacy_unwind_va);
-    reg.bind("PsDereferencePrimaryToken", s_ps_dereference_primary_token as usize as u64);
+    reg.bind("PsDereferencePrimaryToken", s_ps_dereference_primary_token as *const () as usize as u64);
     reg.bind(
         "RtlAreAllAccessesGranted",
-        s_rtl_are_all_accesses_granted as usize as u64,
+        s_rtl_are_all_accesses_granted as *const () as usize as u64,
     );
     reg.bind(
         "RtlNtStatusToDosError",
-        s_rtl_nt_status_to_dos_error as usize as u64,
+        s_rtl_nt_status_to_dos_error as *const () as usize as u64,
     );
     reg.bind(
         "ExSystemTimeToLocalTime",
-        s_ex_system_time_to_local_time as usize as u64,
+        s_ex_system_time_to_local_time as *const () as usize as u64,
     );
-    reg.bind("IoGetStackLimits", s_io_get_stack_limits as usize as u64);
+    reg.bind("IoGetStackLimits", s_io_get_stack_limits as *const () as usize as u64);
     reg.bind(
         "ZwQueryDefaultLocale",
-        s_zw_query_default_locale as usize as u64,
+        s_zw_query_default_locale as *const () as usize as u64,
     );
     reg.bind(
         "ZwQuerySystemInformation",
-        crate::ntoskrnl_shared::s_query_system_information as usize as u64,
+        crate::ntoskrnl_shared::s_query_system_information as *const () as usize as u64,
     );
     reg.bind(
         "NtQuerySystemInformation",
-        crate::ntoskrnl_shared::s_query_system_information as usize as u64,
+        crate::ntoskrnl_shared::s_query_system_information as *const () as usize as u64,
     );
-    reg.bind("NtAddAtom", s_nt_add_atom as usize as u64);
-    reg.bind("RtlImageNtHeader", s_rtl_image_nt_header as usize as u64);
+    reg.bind("NtAddAtom", s_nt_add_atom as *const () as usize as u64);
+    reg.bind("RtlImageNtHeader", s_rtl_image_nt_header as *const () as usize as u64);
     reg.bind(
         "RtlImageDirectoryEntryToData",
-        s_rtl_image_directory_entry_to_data as usize as u64,
+        s_rtl_image_directory_entry_to_data as *const () as usize as u64,
     );
     reg.bind(
         "MmPageEntireDriver",
-        s_mm_page_entire_driver as usize as u64,
+        s_mm_page_entire_driver as *const () as usize as u64,
     );
-    reg.bind("ZwYieldExecution", s_zw_yield_execution as usize as u64);
+    reg.bind("ZwYieldExecution", s_zw_yield_execution as *const () as usize as u64);
     // RTL atom table (nt_kernel_exec::rtl_atom)
     reg.bind(
         "RtlCreateAtomTable",
-        s_rtl_create_atom_table as usize as u64,
+        s_rtl_create_atom_table as *const () as usize as u64,
     );
     reg.bind(
         "RtlAddAtomToAtomTable",
-        s_rtl_add_atom_to_atom_table as usize as u64,
+        s_rtl_add_atom_to_atom_table as *const () as usize as u64,
     );
     reg.bind(
         "RtlLookupAtomInAtomTable",
-        s_rtl_lookup_atom_in_atom_table as usize as u64,
+        s_rtl_lookup_atom_in_atom_table as *const () as usize as u64,
     );
     reg.bind(
         "RtlDeleteAtomFromAtomTable",
-        s_rtl_delete_atom_from_atom_table as usize as u64,
+        s_rtl_delete_atom_from_atom_table as *const () as usize as u64,
     );
     reg.bind(
         "RtlPinAtomInAtomTable",
-        s_rtl_pin_atom_in_atom_table as usize as u64,
+        s_rtl_pin_atom_in_atom_table as *const () as usize as u64,
     );
     reg.bind(
         "RtlQueryAtomInAtomTable",
-        s_rtl_query_atom_in_atom_table as usize as u64,
+        s_rtl_query_atom_in_atom_table as *const () as usize as u64,
     );
     reg.bind(
         "RtlDestroyAtomTable",
-        s_rtl_destroy_atom_table as usize as u64,
+        s_rtl_destroy_atom_table as *const () as usize as u64,
     );
     // Ob object layer (nt-object-manager)
     reg.bind(
         "ObReferenceObjectByHandle",
-        s_ob_reference_object_by_handle as usize as u64,
+        s_ob_reference_object_by_handle as *const () as usize as u64,
     );
     reg.bind(
         "ObReferenceObjectByPointer",
-        s_ob_reference_object_by_pointer as usize as u64,
+        s_ob_reference_object_by_pointer as *const () as usize as u64,
     );
     reg.bind(
         "ObOpenObjectByName",
-        s_ob_open_object_by_name as usize as u64,
+        s_ob_open_object_by_name as *const () as usize as u64,
     );
     reg.bind(
         "ObOpenObjectByPointer",
-        s_ob_open_object_by_pointer as usize as u64,
+        s_ob_open_object_by_pointer as *const () as usize as u64,
     );
     reg.bind(
         "ObFindHandleForObject",
-        s_ob_find_handle_for_object as usize as u64,
+        s_ob_find_handle_for_object as *const () as usize as u64,
     );
-    reg.bind("ObCreateObject", s_ob_create_object as usize as u64);
-    reg.bind("ObInsertObject", s_ob_insert_object as usize as u64);
+    reg.bind("ObCreateObject", s_ob_create_object as *const () as usize as u64);
+    reg.bind("ObInsertObject", s_ob_insert_object as *const () as usize as u64);
     reg.bind(
         "ObGetObjectSecurity",
         object_security::get as *const () as usize as u64,
@@ -15751,23 +15751,23 @@ fn register_trampolines() -> bool {
         "ObAssignSecurity",
         object_security::assign_export as *const () as usize as u64,
     );
-    reg.bind("ObCloseHandle", s_ob_close_handle as usize as u64);
-    reg.bind("ObGetObjectType", s_ob_get_object_type as usize as u64);
+    reg.bind("ObCloseHandle", s_ob_close_handle as *const () as usize as u64);
+    reg.bind("ObGetObjectType", s_ob_get_object_type as *const () as usize as u64);
     reg.bind(
         "ObSetHandleAttributes",
         object_handle_flags::set_handle_attributes as *const () as usize as u64,
     );
-    reg.bind("ObReferenceObject", s_ob_reference_object as usize as u64);
-    reg.bind("ObDereferenceObject", s_ob_dereference_object as usize as u64);
-    reg.bind("ObfReferenceObject", s_ob_reference_object as usize as u64);
+    reg.bind("ObReferenceObject", s_ob_reference_object as *const () as usize as u64);
+    reg.bind("ObDereferenceObject", s_ob_dereference_object as *const () as usize as u64);
+    reg.bind("ObfReferenceObject", s_ob_reference_object as *const () as usize as u64);
     reg.bind(
         "ObfDereferenceObject",
-        s_ob_dereference_object as usize as u64,
+        s_ob_dereference_object as *const () as usize as u64,
     );
-    reg.bind("ZwDuplicateObject", s_zw_duplicate_object as usize as u64);
-    reg.bind("NtDuplicateObject", s_zw_duplicate_object as usize as u64);
-    reg.bind("ZwClose", s_zw_close as usize as u64);
-    reg.bind("NtClose", s_nt_close as usize as u64);
+    reg.bind("ZwDuplicateObject", s_zw_duplicate_object as *const () as usize as u64);
+    reg.bind("NtDuplicateObject", s_zw_duplicate_object as *const () as usize as u64);
+    reg.bind("ZwClose", s_zw_close as *const () as usize as u64);
+    reg.bind("NtClose", s_nt_close as *const () as usize as u64);
     reg.bind(
         "ZwCreateDirectoryObject",
         directory_object::create as *const () as usize as u64,
@@ -15792,250 +15792,250 @@ fn register_trampolines() -> bool {
         "LpcSendWaitReceivePort",
         s_lpc_send_wait_receive_port as *const () as usize as u64,
     );
-    reg.bind("ZwCreateEvent", s_zw_create_event as usize as u64);
-    reg.bind("NtCreateEvent", s_zw_create_event as usize as u64);
-    reg.bind("KeInitializeEvent", s_ke_initialize_event as usize as u64);
-    reg.bind("KeInitializeMutex", local_sync::ke_initialize_mutant as usize as u64);
-    reg.bind("KeReleaseMutex", local_sync::ke_release_mutant as usize as u64);
-    reg.bind("KeInitializeSemaphore", local_sync::ke_initialize_semaphore as usize as u64);
-    reg.bind("KeReleaseSemaphore", local_sync::ke_release_semaphore as usize as u64);
+    reg.bind("ZwCreateEvent", s_zw_create_event as *const () as usize as u64);
+    reg.bind("NtCreateEvent", s_zw_create_event as *const () as usize as u64);
+    reg.bind("KeInitializeEvent", s_ke_initialize_event as *const () as usize as u64);
+    reg.bind("KeInitializeMutex", local_sync::ke_initialize_mutant as *const () as usize as u64);
+    reg.bind("KeReleaseMutex", local_sync::ke_release_mutant as *const () as usize as u64);
+    reg.bind("KeInitializeSemaphore", local_sync::ke_initialize_semaphore as *const () as usize as u64);
+    reg.bind("KeReleaseSemaphore", local_sync::ke_release_semaphore as *const () as usize as u64);
     reg.bind("KeGetCurrentIrql", irql::get_current as *const () as u64);
     reg.bind("KfRaiseIrql", irql::raise as *const () as u64);
     reg.bind("KeLowerIrql", irql::lower as *const () as u64);
     reg.bind("KeRaiseIrqlToDpcLevel", irql::raise_to_dpc as *const () as u64);
-    reg.bind("KeInitializeTimer", s_ke_initialize_timer as usize as u64);
+    reg.bind("KeInitializeTimer", s_ke_initialize_timer as *const () as usize as u64);
     reg.bind(
         "KeInitializeTimerEx",
-        s_ke_initialize_timer_ex as usize as u64,
+        s_ke_initialize_timer_ex as *const () as usize as u64,
     );
-    reg.bind("KeSetTimer", s_ke_set_timer as usize as u64);
-    reg.bind("KeCancelTimer", s_ke_cancel_timer as usize as u64);
-    reg.bind("KeReadStateTimer", s_ke_read_state_timer as usize as u64);
+    reg.bind("KeSetTimer", s_ke_set_timer as *const () as usize as u64);
+    reg.bind("KeCancelTimer", s_ke_cancel_timer as *const () as usize as u64);
+    reg.bind("KeReadStateTimer", s_ke_read_state_timer as *const () as usize as u64);
     reg.bind(
         "PoRequestShutdownEvent",
-        s_po_request_shutdown_event as usize as u64,
+        s_po_request_shutdown_event as *const () as usize as u64,
     );
-    reg.bind("KeSetEvent", s_ke_set_event as usize as u64);
-    reg.bind("KeResetEvent", s_ke_reset_event as usize as u64);
-    reg.bind("KeClearEvent", s_ke_clear_event as usize as u64);
-    reg.bind("KePulseEvent", s_ke_pulse_event as usize as u64);
-    reg.bind("KeReadStateEvent", s_ke_read_state_event as usize as u64);
+    reg.bind("KeSetEvent", s_ke_set_event as *const () as usize as u64);
+    reg.bind("KeResetEvent", s_ke_reset_event as *const () as usize as u64);
+    reg.bind("KeClearEvent", s_ke_clear_event as *const () as usize as u64);
+    reg.bind("KePulseEvent", s_ke_pulse_event as *const () as usize as u64);
+    reg.bind("KeReadStateEvent", s_ke_read_state_event as *const () as usize as u64);
     reg.bind(
         "KeWaitForSingleObject",
-        s_ke_wait_for_single_object as usize as u64,
+        s_ke_wait_for_single_object as *const () as usize as u64,
     );
     reg.bind(
         "KeWaitForMultipleObjects",
-        s_ke_wait_for_multiple_objects as usize as u64,
+        s_ke_wait_for_multiple_objects as *const () as usize as u64,
     );
     reg.bind(
         "KeEnterCriticalRegion",
-        s_ke_enter_critical_region as usize as u64,
+        s_ke_enter_critical_region as *const () as usize as u64,
     );
     reg.bind(
         "KeLeaveCriticalRegion",
-        s_ke_leave_critical_region as usize as u64,
+        s_ke_leave_critical_region as *const () as usize as u64,
     );
     reg.bind(
         "KeEnterGuardedRegion",
-        s_ke_enter_guarded_region as usize as u64,
+        s_ke_enter_guarded_region as *const () as usize as u64,
     );
     reg.bind(
         "KeLeaveGuardedRegion",
-        s_ke_leave_guarded_region as usize as u64,
+        s_ke_leave_guarded_region as *const () as usize as u64,
     );
-    reg.bind("EngGetTickCount", s_eng_get_tick_count as usize as u64);
-    reg.bind("EngGetTickCount32", s_eng_get_tick_count as usize as u64);
-    reg.bind("RtlGetExpWinVer", s_rtl_get_exp_winver as usize as u64);
+    reg.bind("EngGetTickCount", s_eng_get_tick_count as *const () as usize as u64);
+    reg.bind("EngGetTickCount32", s_eng_get_tick_count as *const () as usize as u64);
+    reg.bind("RtlGetExpWinVer", s_rtl_get_exp_winver as *const () as usize as u64);
     // --- batch 2: RTL heap (win32k session heap) ---
-    reg.bind("RtlCreateHeap", s_rtl_create_heap as usize as u64);
-    reg.bind("RtlAllocateHeap", s_rtl_allocate_heap as usize as u64);
-    reg.bind("RtlFreeHeap", s_rtl_free_heap as usize as u64);
-    reg.bind("RtlSizeHeap", s_rtl_size_heap as usize as u64);
-    reg.bind("RtlReAllocateHeap", s_rtl_reallocate_heap as usize as u64);
+    reg.bind("RtlCreateHeap", s_rtl_create_heap as *const () as usize as u64);
+    reg.bind("RtlAllocateHeap", s_rtl_allocate_heap as *const () as usize as u64);
+    reg.bind("RtlFreeHeap", s_rtl_free_heap as *const () as usize as u64);
+    reg.bind("RtlSizeHeap", s_rtl_size_heap as *const () as usize as u64);
+    reg.bind("RtlReAllocateHeap", s_rtl_reallocate_heap as *const () as usize as u64);
     // --- batch 2: RTL_BITMAP (GDI pool slot allocator) ---
     reg.bind(
         "RtlInitializeBitMap",
-        s_rtl_initialize_bitmap as usize as u64,
+        s_rtl_initialize_bitmap as *const () as usize as u64,
     );
-    reg.bind("RtlClearAllBits", s_rtl_clear_all_bits as usize as u64);
-    reg.bind("RtlSetAllBits", s_rtl_set_all_bits as usize as u64);
+    reg.bind("RtlClearAllBits", s_rtl_clear_all_bits as *const () as usize as u64);
+    reg.bind("RtlSetAllBits", s_rtl_set_all_bits as *const () as usize as u64);
     reg.bind(
         "RtlFindClearBitsAndSet",
-        s_rtl_find_clear_bits_and_set as usize as u64,
+        s_rtl_find_clear_bits_and_set as *const () as usize as u64,
     );
     reg.bind(
         "RtlNumberOfSetBits",
-        s_rtl_number_of_set_bits as usize as u64,
+        s_rtl_number_of_set_bits as *const () as usize as u64,
     );
-    reg.bind("RtlTestBit", s_rtl_test_bit as usize as u64);
-    reg.bind("RtlSetBit", s_rtl_set_bit as usize as u64);
-    reg.bind("RtlClearBit", s_rtl_clear_bit as usize as u64);
-    reg.bind("RtlSetBits", s_rtl_set_bits as usize as u64);
-    reg.bind("RtlClearBits", s_rtl_clear_bits as usize as u64);
-    reg.bind("RtlAreBitsClear", s_rtl_are_bits_clear as usize as u64);
+    reg.bind("RtlTestBit", s_rtl_test_bit as *const () as usize as u64);
+    reg.bind("RtlSetBit", s_rtl_set_bit as *const () as usize as u64);
+    reg.bind("RtlClearBit", s_rtl_clear_bit as *const () as usize as u64);
+    reg.bind("RtlSetBits", s_rtl_set_bits as *const () as usize as u64);
+    reg.bind("RtlClearBits", s_rtl_clear_bits as *const () as usize as u64);
+    reg.bind("RtlAreBitsClear", s_rtl_are_bits_clear as *const () as usize as u64);
     // --- batch 2: RTL string init ---
     reg.bind(
         "RtlInitUnicodeString",
-        s_rtl_init_unicode_string as usize as u64,
+        s_rtl_init_unicode_string as *const () as usize as u64,
     );
-    reg.bind("RtlInitAnsiString", s_rtl_init_ansi_string as usize as u64);
+    reg.bind("RtlInitAnsiString", s_rtl_init_ansi_string as *const () as usize as u64);
     reg.bind(
         "RtlInitEmptyUnicodeString",
-        s_rtl_init_empty_unicode_string as usize as u64,
+        s_rtl_init_empty_unicode_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlCopyUnicodeString",
-        s_rtl_copy_unicode_string as usize as u64,
+        s_rtl_copy_unicode_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlCompareUnicodeString",
-        s_rtl_compare_unicode_string as usize as u64,
+        s_rtl_compare_unicode_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlEqualUnicodeString",
-        s_rtl_equal_unicode_string as usize as u64,
+        s_rtl_equal_unicode_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlAppendUnicodeToString",
-        s_rtl_append_unicode_to_string as usize as u64,
+        s_rtl_append_unicode_to_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlAppendUnicodeStringToString",
-        s_rtl_append_unicode_string_to_string as usize as u64,
+        s_rtl_append_unicode_string_to_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlFormatCurrentUserKeyPath",
-        s_rtl_format_current_user_key_path as usize as u64,
+        s_rtl_format_current_user_key_path as *const () as usize as u64,
     );
     reg.bind(
         "RtlFreeUnicodeString",
-        s_rtl_free_unicode_string as usize as u64,
+        s_rtl_free_unicode_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlCreateUnicodeString",
-        s_rtl_create_unicode_string as usize as u64,
+        s_rtl_create_unicode_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlMultiByteToUnicodeN",
-        s_rtl_multibyte_to_unicode_n as usize as u64,
+        s_rtl_multibyte_to_unicode_n as *const () as usize as u64,
     );
     reg.bind(
         "RtlGetDefaultCodePage",
-        s_rtl_get_default_code_page as usize as u64,
+        s_rtl_get_default_code_page as *const () as usize as u64,
     );
     reg.bind(
         "RtlAnsiStringToUnicodeString",
-        s_rtl_ansi_string_to_unicode_string as usize as u64,
+        s_rtl_ansi_string_to_unicode_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlUnicodeStringToAnsiString",
-        s_rtl_unicode_string_to_ansi_string as usize as u64,
+        s_rtl_unicode_string_to_ansi_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlxUnicodeStringToAnsiSize",
-        s_rtlx_unicode_string_to_ansi_size as usize as u64,
+        s_rtlx_unicode_string_to_ansi_size as *const () as usize as u64,
     );
     reg.bind(
         "RtlUnicodeToMultiByteSize",
-        s_rtl_unicode_to_multibyte_size as usize as u64,
+        s_rtl_unicode_to_multibyte_size as *const () as usize as u64,
     );
-    reg.bind("RtlOemToUnicodeN", s_rtl_oem_to_unicode_n as usize as u64);
+    reg.bind("RtlOemToUnicodeN", s_rtl_oem_to_unicode_n as *const () as usize as u64);
     reg.bind(
         "RtlUpcaseUnicodeChar",
-        s_rtl_upcase_unicode_char as usize as u64,
+        s_rtl_upcase_unicode_char as *const () as usize as u64,
     );
     reg.bind(
         "RtlAnsiCharToUnicodeChar",
-        s_rtl_ansi_char_to_unicode_char as usize as u64,
+        s_rtl_ansi_char_to_unicode_char as *const () as usize as u64,
     );
-    reg.bind("wcslen", s_wcslen as usize as u64);
-    reg.bind("_wcsnicmp", s_wcsnicmp as usize as u64);
-    reg.bind("wcsnicmp", s_wcsnicmp as usize as u64);
-    reg.bind("RtlCompareMemory", s_rtl_compare_memory as usize as u64);
+    reg.bind("wcslen", s_wcslen as *const () as usize as u64);
+    reg.bind("_wcsnicmp", s_wcsnicmp as *const () as usize as u64);
+    reg.bind("wcsnicmp", s_wcsnicmp as *const () as usize as u64);
+    reg.bind("RtlCompareMemory", s_rtl_compare_memory as *const () as usize as u64);
     reg.bind(
         "RtlIntegerToUnicodeString",
-        s_rtl_integer_to_unicode_string as usize as u64,
+        s_rtl_integer_to_unicode_string as *const () as usize as u64,
     );
     reg.bind(
         "RtlUnicodeStringToInteger",
-        s_rtl_unicode_string_to_integer as usize as u64,
+        s_rtl_unicode_string_to_integer as *const () as usize as u64,
     );
     reg.bind(
         "RtlTimeToTimeFields",
-        s_rtl_time_to_time_fields as usize as u64,
+        s_rtl_time_to_time_fields as *const () as usize as u64,
     );
     crate::driver_launch::bind_debug_exports(reg);
     // --- batch 3: section objects (nt-kernel-exec session_section) ---
-    reg.bind("MmCreateSection", s_mm_create_section as usize as u64);
-    reg.bind("MmMapViewInSessionSpace", s_mm_map_view as usize as u64);
-    reg.bind("MmMapViewInSystemSpace", s_mm_map_view as usize as u64);
+    reg.bind("MmCreateSection", s_mm_create_section as *const () as usize as u64);
+    reg.bind("MmMapViewInSessionSpace", s_mm_map_view as *const () as usize as u64);
+    reg.bind("MmMapViewInSystemSpace", s_mm_map_view as *const () as usize as u64);
     reg.bind(
         "MmMapViewOfSection",
-        s_mm_map_view_of_section as usize as u64,
+        s_mm_map_view_of_section as *const () as usize as u64,
     );
     reg.bind(
         "MmUnmapViewInSessionSpace",
-        s_mm_unmap_view_in_space as usize as u64,
+        s_mm_unmap_view_in_space as *const () as usize as u64,
     );
     reg.bind(
         "MmUnmapViewInSystemSpace",
-        s_mm_unmap_view_in_space as usize as u64,
+        s_mm_unmap_view_in_space as *const () as usize as u64,
     );
     reg.bind(
         "MmUnmapViewOfSection",
-        s_mm_unmap_view_of_section as usize as u64,
+        s_mm_unmap_view_of_section as *const () as usize as u64,
     );
     reg.bind(
         "MmSecureVirtualMemory",
-        s_mm_secure_virtual_memory as usize as u64,
+        s_mm_secure_virtual_memory as *const () as usize as u64,
     );
     reg.bind(
         "MmUnsecureVirtualMemory",
-        s_mm_unsecure_virtual_memory as usize as u64,
+        s_mm_unsecure_virtual_memory as *const () as usize as u64,
     );
     // --- batch 3: lookaside-list init (nt_kernel_exec::init_general_lookaside) ---
     reg.bind(
         "ExInitializePagedLookasideList",
-        s_ex_init_paged_lookaside as usize as u64,
+        s_ex_init_paged_lookaside as *const () as usize as u64,
     );
     reg.bind(
         "ExInitializeNPagedLookasideList",
-        s_ex_init_npaged_lookaside as usize as u64,
+        s_ex_init_npaged_lookaside as *const () as usize as u64,
     );
     reg.bind(
         "ExpInterlockedPushEntrySList",
-        s_exp_interlocked_push_entry_slist as usize as u64,
+        s_exp_interlocked_push_entry_slist as *const () as usize as u64,
     );
     reg.bind(
         "ExpInterlockedPopEntrySList",
-        s_exp_interlocked_pop_entry_slist as usize as u64,
+        s_exp_interlocked_pop_entry_slist as *const () as usize as u64,
     );
-    reg.bind("ExQueryDepthSList", s_ex_query_depth_slist as usize as u64);
+    reg.bind("ExQueryDepthSList", s_ex_query_depth_slist as *const () as usize as u64);
     // --- batch 3: Zw virtual-memory / registry / file (canned; see backlog) ---
     reg.bind(
         "ZwAllocateVirtualMemory",
-        s_zw_allocate_virtual_memory as usize as u64,
+        s_zw_allocate_virtual_memory as *const () as usize as u64,
     );
     reg.bind(
         "NtAllocateVirtualMemory",
-        s_zw_allocate_virtual_memory as usize as u64,
+        s_zw_allocate_virtual_memory as *const () as usize as u64,
     );
     reg.bind(
         "ZwFreeVirtualMemory",
-        s_zw_free_virtual_memory as usize as u64,
+        s_zw_free_virtual_memory as *const () as usize as u64,
     );
     reg.bind(
         "NtFreeVirtualMemory",
-        s_zw_free_virtual_memory as usize as u64,
+        s_zw_free_virtual_memory as *const () as usize as u64,
     );
     reg.bind(
         "ZwSetSystemInformation",
-        s_zw_set_system_information as usize as u64,
+        s_zw_set_system_information as *const () as usize as u64,
     );
     reg.bind(
         "NtSetSystemInformation",
-        s_nt_set_system_information as usize as u64,
+        s_nt_set_system_information as *const () as usize as u64,
     );
     reg.bind("ZwOpenFile", file_open::open as *const () as usize as u64);
     reg.bind("ZwCreateFile", file_open::create as *const () as usize as u64);
@@ -16057,8 +16057,8 @@ fn register_trampolines() -> bool {
     reg.bind("ZwDeviceIoControlFile", file_ioctl::device_io_control_file as *const () as usize as u64);
     reg.bind("ZwQueryObject", file_object_query::query_object as *const () as usize as u64);
     reg.bind("ZwSetInformationObject", object_handle_flags::set_information_object as *const () as usize as u64);
-    reg.bind("ZwOpenKey", s_zw_open_key as usize as u64);
-    reg.bind("NtOpenKey", s_nt_open_key as usize as u64);
+    reg.bind("ZwOpenKey", s_zw_open_key as *const () as usize as u64);
+    reg.bind("NtOpenKey", s_nt_open_key as *const () as usize as u64);
     reg.bind(
         "ZwCreateKey",
         s_zw_create_key as *const () as usize as u64,
@@ -16071,104 +16071,104 @@ fn register_trampolines() -> bool {
         "ZwDeleteValueKey",
         s_zw_delete_value_key as *const () as usize as u64,
     );
-    reg.bind("ZwQueryValueKey", s_zw_query_value_key as usize as u64);
-    reg.bind("NtQueryValueKey", s_nt_query_value_key as usize as u64);
-    reg.bind("ZwQueryKey", s_zw_query_key as usize as u64);
-    reg.bind("ZwQueryInformationProcess", process_information_query::query_information_process as usize as u64);
+    reg.bind("ZwQueryValueKey", s_zw_query_value_key as *const () as usize as u64);
+    reg.bind("NtQueryValueKey", s_nt_query_value_key as *const () as usize as u64);
+    reg.bind("ZwQueryKey", s_zw_query_key as *const () as usize as u64);
+    reg.bind("ZwQueryInformationProcess", process_information_query::query_information_process as *const () as usize as u64);
     reg.bind(
         "ZwEnumerateValueKey",
-        s_zw_enumerate_value_key as usize as u64,
+        s_zw_enumerate_value_key as *const () as usize as u64,
     );
     reg.bind(
         "RtlQueryRegistryValues",
-        s_rtl_query_registry_values as usize as u64,
+        s_rtl_query_registry_values as *const () as usize as u64,
     );
-    reg.bind("ZwOpenThreadToken", s_zw_open_thread_token as usize as u64);
-    reg.bind("NtOpenThreadToken", s_zw_open_thread_token as usize as u64);
+    reg.bind("ZwOpenThreadToken", s_zw_open_thread_token as *const () as usize as u64);
+    reg.bind("NtOpenThreadToken", s_zw_open_thread_token as *const () as usize as u64);
     reg.bind(
         "ZwOpenProcessToken",
-        s_zw_open_process_token as usize as u64,
+        s_zw_open_process_token as *const () as usize as u64,
     );
     reg.bind(
         "NtOpenProcessToken",
-        s_zw_open_process_token as usize as u64,
+        s_zw_open_process_token as *const () as usize as u64,
     );
     reg.bind(
         "ZwQueryInformationToken",
-        s_zw_query_information_token as usize as u64,
+        s_zw_query_information_token as *const () as usize as u64,
     );
     reg.bind(
         "NtQueryInformationToken",
-        s_zw_query_information_token as usize as u64,
+        s_zw_query_information_token as *const () as usize as u64,
     );
     // --- batch 3: CRT mem intrinsics (dxg.sys imports) ---
-    reg.bind("memcpy", s_memcpy as usize as u64);
-    reg.bind("RtlCopyMemory", s_memcpy as usize as u64);
-    reg.bind("memmove", s_memmove as usize as u64);
-    reg.bind("RtlMoveMemory", s_memmove as usize as u64);
-    reg.bind("memset", s_memset as usize as u64);
-    reg.bind("RtlFillMemory", s_memset as usize as u64);
-    reg.bind("RtlAssert", native_assertion::rtl_assert as usize as u64);
+    reg.bind("memcpy", s_memcpy as *const () as usize as u64);
+    reg.bind("RtlCopyMemory", s_memcpy as *const () as usize as u64);
+    reg.bind("memmove", s_memmove as *const () as usize as u64);
+    reg.bind("RtlMoveMemory", s_memmove as *const () as usize as u64);
+    reg.bind("memset", s_memset as *const () as usize as u64);
+    reg.bind("RtlFillMemory", s_memset as *const () as usize as u64);
+    reg.bind("RtlAssert", native_assertion::rtl_assert as *const () as usize as u64);
     reg.bind(
         "RtlWalkFrameChain",
-        crate::win32k_frame_capture::rtl_walk_frame_chain as usize as u64,
+        crate::win32k_frame_capture::rtl_walk_frame_chain as *const () as usize as u64,
     );
     crate::rtl_avl_exports::bind_rtl_avl_exports(reg);
     // --- batch 4: Ps identity + per-process win32-slots (set by win32k's process callout) ---
     reg.bind(
         "PsGetCurrentProcessId",
-        s_current_process_id as usize as u64,
+        s_current_process_id as *const () as usize as u64,
     );
     reg.bind(
         "PsGetCurrentThreadProcessId",
-        s_current_thread_process_id as usize as u64,
+        s_current_thread_process_id as *const () as usize as u64,
     );
-    reg.bind("PsGetProcessId", s_ps_get_process_id as usize as u64);
-    reg.bind("PsGetProcessJob", s_ps_get_process_job as usize as u64);
+    reg.bind("PsGetProcessId", s_ps_get_process_id as *const () as usize as u64);
+    reg.bind("PsGetProcessJob", s_ps_get_process_job as *const () as usize as u64);
     reg.bind(
         "PsGetJobUIRestrictionsClass",
-        s_ps_get_job_ui_restrictions_class as usize as u64,
+        s_ps_get_job_ui_restrictions_class as *const () as usize as u64,
     );
-    reg.bind("PsGetProcessImageFileName", s_ps_get_process_image_file_name as usize as u64);
-    reg.bind("PsGetProcessWow64Process", s_ps_get_process_wow64_process as usize as u64);
-    reg.bind("PsGetProcessPeb", s_ps_get_process_peb as usize as u64);
-    reg.bind("PsGetProcessPeb32", s_ps_get_process_peb32 as usize as u64);
+    reg.bind("PsGetProcessImageFileName", s_ps_get_process_image_file_name as *const () as usize as u64);
+    reg.bind("PsGetProcessWow64Process", s_ps_get_process_wow64_process as *const () as usize as u64);
+    reg.bind("PsGetProcessPeb", s_ps_get_process_peb as *const () as usize as u64);
+    reg.bind("PsGetProcessPeb32", s_ps_get_process_peb32 as *const () as usize as u64);
     reg.bind(
         "PsGetProcessPriorityClass",
-        s_ps_get_process_priority_class as usize as u64,
+        s_ps_get_process_priority_class as *const () as usize as u64,
     );
     reg.bind(
         "PsSetProcessPriorityClass",
-        s_ps_set_process_priority_class as usize as u64,
+        s_ps_set_process_priority_class as *const () as usize as u64,
     );
     reg.bind(
         "PsSetProcessPriorityByClass",
-        s_ps_set_process_priority_by_class as usize as u64,
+        s_ps_set_process_priority_by_class as *const () as usize as u64,
     );
     reg.bind(
         "PsGetProcessSequenceNumber",
-        s_ps_get_process_sequence_number as usize as u64,
+        s_ps_get_process_sequence_number as *const () as usize as u64,
     );
     reg.bind(
         "PsGetProcessMitigationPolicyFlags",
-        s_ps_get_process_mitigation_policy_flags as usize as u64,
+        s_ps_get_process_mitigation_policy_flags as *const () as usize as u64,
     );
     reg.bind(
         "PsGetCurrentProcessWow64Process",
-        s_ps_get_current_process_wow64_process as usize as u64,
+        s_ps_get_current_process_wow64_process as *const () as usize as u64,
     );
-    reg.bind("PsGetProcessSessionId", s_ps_get_process_session_id as usize as u64);
+    reg.bind("PsGetProcessSessionId", s_ps_get_process_session_id as *const () as usize as u64);
     reg.bind(
         "PsGetProcessSessionIdEx",
-        s_ps_get_process_session_id_ex as usize as u64,
+        s_ps_get_process_session_id_ex as *const () as usize as u64,
     );
     reg.bind("PsIsSystemProcess", s_ps_is_system_process as *const () as usize as u64);
     reg.bind(
         "PsGetCurrentThreadId",
-        s_ps_get_current_thread_id as usize as u64,
+        s_ps_get_current_thread_id as *const () as usize as u64,
     );
-    reg.bind("PsGetThreadId", s_ps_get_thread_id as usize as u64);
-    reg.bind("KeIsAttachedProcess", s_ke_is_attached_process as usize as u64);
+    reg.bind("PsGetThreadId", s_ps_get_thread_id as *const () as usize as u64);
+    reg.bind("KeIsAttachedProcess", s_ke_is_attached_process as *const () as usize as u64);
     reg.bind("KeAttachProcess", process_attach::ke_attach_process as *const () as usize as u64);
     reg.bind("KeDetachProcess", process_attach::ke_detach_process as *const () as usize as u64);
     reg.bind(
@@ -16181,101 +16181,101 @@ fn register_trampolines() -> bool {
     );
     reg.bind(
         "PsGetThreadProcessId",
-        s_ps_get_thread_process_id as usize as u64,
+        s_ps_get_thread_process_id as *const () as usize as u64,
     );
-    reg.bind("IoGetCurrentProcess", s_current_process as usize as u64);
-    reg.bind("PsGetCurrentProcess", s_current_process as usize as u64);
-    reg.bind("PsGetCurrentThread", s_current_thread as usize as u64);
+    reg.bind("IoGetCurrentProcess", s_current_process as *const () as usize as u64);
+    reg.bind("PsGetCurrentProcess", s_current_process as *const () as usize as u64);
+    reg.bind("PsGetCurrentThread", s_current_thread as *const () as usize as u64);
     reg.bind(
         "PsGetThreadProcess",
-        s_ps_get_thread_process as usize as u64,
+        s_ps_get_thread_process as *const () as usize as u64,
     );
     reg.bind(
         "PsLookupProcessByProcessId",
-        s_ps_lookup_process_by_id as usize as u64,
+        s_ps_lookup_process_by_id as *const () as usize as u64,
     );
     reg.bind(
         "PsLookupThreadByThreadId",
-        s_ps_lookup_thread_by_id as usize as u64,
+        s_ps_lookup_thread_by_id as *const () as usize as u64,
     );
     reg.bind(
         "PsGetProcessExitStatus",
-        s_ps_get_process_exit_status as usize as u64,
+        s_ps_get_process_exit_status as *const () as usize as u64,
     );
     reg.bind(
         "PsGetCurrentProcessSessionId",
-        s_ps_get_current_process_session_id as usize as u64,
+        s_ps_get_current_process_session_id as *const () as usize as u64,
     );
     reg.bind(
         "PsGetProcessExitProcessCalled",
-        s_ps_get_process_exit_process_called as usize as u64,
+        s_ps_get_process_exit_process_called as *const () as usize as u64,
     );
     reg.bind(
         "PsIsThreadTerminating",
-        s_ps_is_thread_terminating as usize as u64,
+        s_ps_is_thread_terminating as *const () as usize as u64,
     );
     reg.bind(
         "PsGetThreadFreezeCount",
-        s_ps_get_thread_freeze_count as usize as u64,
+        s_ps_get_thread_freeze_count as *const () as usize as u64,
     );
     reg.bind(
         "PsIsSystemThread",
-        s_ps_is_system_thread as usize as u64,
+        s_ps_is_system_thread as *const () as usize as u64,
     );
     reg.bind(
         "KeSetPriorityThread",
-        s_ke_set_priority_thread as usize as u64,
+        s_ke_set_priority_thread as *const () as usize as u64,
     );
-    reg.bind("KeGetCurrentThread", s_current_thread as usize as u64);
+    reg.bind("KeGetCurrentThread", s_current_thread as *const () as usize as u64);
     reg.bind(
         "PsGetCurrentProcessWin32Process",
-        s_get_current_win32process as usize as u64,
+        s_get_current_win32process as *const () as usize as u64,
     );
     reg.bind(
         "PsGetProcessWin32Process",
-        s_get_process_win32process as usize as u64,
+        s_get_process_win32process as *const () as usize as u64,
     );
     reg.bind(
         "PsGetCurrentThreadWin32Thread",
-        s_get_current_win32thread as usize as u64,
+        s_get_current_win32thread as *const () as usize as u64,
     );
     reg.bind(
         "PsGetThreadWin32Thread",
-        s_get_thread_win32thread as usize as u64,
+        s_get_thread_win32thread as *const () as usize as u64,
     );
     reg.bind(
         "PsSetProcessWin32Process",
-        s_set_win32process as usize as u64,
+        s_set_win32process as *const () as usize as u64,
     );
-    reg.bind("PsSetThreadWin32Thread", s_set_win32thread as usize as u64);
+    reg.bind("PsSetThreadWin32Thread", s_set_win32thread as *const () as usize as u64);
     reg.bind(
         "PsGetProcessWin32WindowStation",
-        s_ps_get_process_winsta as usize as u64,
+        s_ps_get_process_winsta as *const () as usize as u64,
     );
     reg.bind(
         "PsSetProcessWindowStation",
-        s_ps_set_process_winsta as usize as u64,
+        s_ps_set_process_winsta as *const () as usize as u64,
     );
     reg.bind(
         "PsEstablishWin32Callouts",
-        s_establish_win32_callouts as usize as u64,
+        s_establish_win32_callouts as *const () as usize as u64,
     );
     reg.bind(
         "PsReferencePrimaryToken",
-        s_ps_reference_primary_token as usize as u64,
+        s_ps_reference_primary_token as *const () as usize as u64,
     );
     reg.bind(
         "PsReferenceImpersonationToken",
-        s_ps_reference_impersonation_token as usize as u64,
+        s_ps_reference_impersonation_token as *const () as usize as u64,
     );
     // --- batch 4: misc scalars ---
     reg.bind(
         "IoGetDeviceObjectPointer",
-        s_io_get_device_object_pointer as usize as u64,
+        s_io_get_device_object_pointer as *const () as usize as u64,
     );
     reg.bind(
         "IoGetRelatedDeviceObject",
-        s_io_get_related_device_object as usize as u64,
+        s_io_get_related_device_object as *const () as usize as u64,
     );
     reg.bind(
         "IoGetDeviceProperty",
@@ -16307,72 +16307,72 @@ fn register_trampolines() -> bool {
     );
     reg.bind(
         "KeUserModeCallback",
-        s_ke_user_mode_callback_rendezvous as usize as u64,
+        s_ke_user_mode_callback_rendezvous as *const () as usize as u64,
     );
     reg.bind(
         "KeAddSystemServiceTable",
-        s_ke_add_system_service_table as usize as u64,
+        s_ke_add_system_service_table as *const () as usize as u64,
     );
     reg.bind(
         "KeQueryPerformanceCounter",
-        s_ke_query_performance_counter as usize as u64,
+        s_ke_query_performance_counter as *const () as usize as u64,
     );
     // --- batch 4: native executive resources / critical regions / fast mutexes ---
     reg.bind(
         "ExInitializeResourceLite",
-        s_ex_initialize_resource_lite as usize as u64,
+        s_ex_initialize_resource_lite as *const () as usize as u64,
     );
     reg.bind(
         "ExDeleteResourceLite",
-        s_ex_delete_resource_lite as usize as u64,
+        s_ex_delete_resource_lite as *const () as usize as u64,
     );
     reg.bind(
         "ExAcquireResourceExclusiveLite",
-        s_ex_acquire_resource_exclusive_lite as usize as u64,
+        s_ex_acquire_resource_exclusive_lite as *const () as usize as u64,
     );
     reg.bind(
         "ExAcquireResourceSharedLite",
-        s_ex_acquire_resource_shared_lite as usize as u64,
+        s_ex_acquire_resource_shared_lite as *const () as usize as u64,
     );
     reg.bind(
         "ExReleaseResourceLite",
-        s_ex_release_resource_lite as usize as u64,
+        s_ex_release_resource_lite as *const () as usize as u64,
     );
     reg.bind(
         "ExIsResourceAcquiredExclusiveLite",
-        s_ex_is_resource_acquired_exclusive_lite as usize as u64,
+        s_ex_is_resource_acquired_exclusive_lite as *const () as usize as u64,
     );
     reg.bind(
         "ExIsResourceAcquiredSharedLite",
-        s_ex_is_resource_acquired_shared_lite as usize as u64,
+        s_ex_is_resource_acquired_shared_lite as *const () as usize as u64,
     );
     reg.bind(
         "ExEnterCriticalRegionAndAcquireResourceShared",
-        s_ex_enter_critical_region_and_acquire_resource_shared as usize as u64,
+        s_ex_enter_critical_region_and_acquire_resource_shared as *const () as usize as u64,
     );
     reg.bind(
         "ExEnterCriticalRegionAndAcquireResourceExclusive",
-        s_ex_enter_critical_region_and_acquire_resource_exclusive as usize as u64,
+        s_ex_enter_critical_region_and_acquire_resource_exclusive as *const () as usize as u64,
     );
     reg.bind(
         "ExReleaseResourceAndLeaveCriticalRegion",
-        s_ex_release_resource_and_leave_critical_region as usize as u64,
+        s_ex_release_resource_and_leave_critical_region as *const () as usize as u64,
     );
     reg.bind(
         "ExAcquireFastMutexUnsafe",
-        s_ex_acquire_fast_mutex_unsafe as usize as u64,
+        s_ex_acquire_fast_mutex_unsafe as *const () as usize as u64,
     );
     reg.bind(
         "ExReleaseFastMutexUnsafe",
-        s_ex_release_fast_mutex_unsafe as usize as u64,
+        s_ex_release_fast_mutex_unsafe as *const () as usize as u64,
     );
     reg.bind(
         "ExEnterCriticalRegionAndAcquireFastMutexUnsafe",
-        s_ex_enter_critical_region_and_acquire_fast_mutex_unsafe as usize as u64,
+        s_ex_enter_critical_region_and_acquire_fast_mutex_unsafe as *const () as usize as u64,
     );
     reg.bind(
         "ExReleaseFastMutexUnsafeAndLeaveCriticalRegion",
-        s_ex_release_fast_mutex_unsafe_and_leave_critical_region as usize as u64,
+        s_ex_release_fast_mutex_unsafe_and_leave_critical_region as *const () as usize as u64,
     );
     reg.bind("ExfAcquirePushLockExclusive", push_lock::acquire_exclusive as *const () as u64);
     reg.bind("ExfAcquirePushLockShared", push_lock::acquire_shared as *const () as u64);
@@ -16380,34 +16380,34 @@ fn register_trampolines() -> bool {
     reg.bind("ExfReleasePushLockShared", push_lock::release_shared as *const () as u64);
     reg.bind("ExfReleasePushLock", push_lock::release_generic as *const () as u64);
     reg.bind("ExfTryToWakePushLock", push_lock::try_to_wake as *const () as u64);
-    reg.bind("KeSetKernelStackSwapEnable", thread_execution::set_stack_swap_enable as usize as u64);
-    reg.bind("ExGetPreviousMode", thread_execution::previous_mode as usize as u64);
+    reg.bind("KeSetKernelStackSwapEnable", thread_execution::set_stack_swap_enable as *const () as usize as u64);
+    reg.bind("ExGetPreviousMode", thread_execution::previous_mode as *const () as usize as u64);
     // --- batch 5: RTL security descriptors / ACLs / SIDs ---
     reg.bind(
         "RtlCreateSecurityDescriptor",
-        s_rtl_create_security_descriptor as usize as u64,
+        s_rtl_create_security_descriptor as *const () as usize as u64,
     );
     reg.bind(
         "RtlSetDaclSecurityDescriptor",
-        s_rtl_set_dacl_security_descriptor as usize as u64,
+        s_rtl_set_dacl_security_descriptor as *const () as usize as u64,
     );
-    reg.bind("RtlLengthSid", s_rtl_length_sid as usize as u64);
-    reg.bind("RtlCreateAcl", s_rtl_create_acl as usize as u64);
+    reg.bind("RtlLengthSid", s_rtl_length_sid as *const () as usize as u64);
+    reg.bind("RtlCreateAcl", s_rtl_create_acl as *const () as usize as u64);
     reg.bind(
         "RtlAddAccessAllowedAceEx",
-        s_rtl_add_access_allowed_ace_ex as usize as u64,
+        s_rtl_add_access_allowed_ace_ex as *const () as usize as u64,
     );
     reg.bind(
         "RtlSetOwnerSecurityDescriptor",
-        s_rtl_set_owner_security_descriptor as usize as u64,
+        s_rtl_set_owner_security_descriptor as *const () as usize as u64,
     );
     reg.bind(
         "RtlSetGroupSecurityDescriptor",
-        s_rtl_set_group_security_descriptor as usize as u64,
+        s_rtl_set_group_security_descriptor as *const () as usize as u64,
     );
     reg.bind(
         "RtlAbsoluteToSelfRelativeSD",
-        s_rtl_absolute_to_self_relative_sd as usize as u64,
+        s_rtl_absolute_to_self_relative_sd as *const () as usize as u64,
     );
     // --- batch 5: Se → nt-security (backlog item 3, COMPLETE — all 7 Se imports real) ---
     // SeQueryAuthenticationIdToken is the only Se* on the boot/connect path (win32k GetProcessLuid);
@@ -16419,25 +16419,25 @@ fn register_trampolines() -> bool {
     // privilege-check algorithm over the SYSTEM privilege set → legitimately PASSES for SeShutdown.
     reg.bind(
         "SeQueryAuthenticationIdToken",
-        s_se_query_authentication_id_token as usize as u64,
+        s_se_query_authentication_id_token as *const () as usize as u64,
     );
     reg.bind(
         "SeCaptureSubjectContext",
-        s_se_capture_subject_context as usize as u64,
+        s_se_capture_subject_context as *const () as usize as u64,
     );
     reg.bind(
         "SeLockSubjectContext",
-        s_se_lock_subject_context as usize as u64,
+        s_se_lock_subject_context as *const () as usize as u64,
     );
     reg.bind(
         "SeUnlockSubjectContext",
-        s_se_lock_subject_context as usize as u64,
+        s_se_lock_subject_context as *const () as usize as u64,
     );
     reg.bind(
         "SeReleaseSubjectContext",
-        s_se_lock_subject_context as usize as u64,
+        s_se_lock_subject_context as *const () as usize as u64,
     );
-    reg.bind("SePrivilegeCheck", s_se_privilege_check as usize as u64);
+    reg.bind("SePrivilegeCheck", s_se_privilege_check as *const () as usize as u64);
     // --- batch 4: DATA EXPORTS folded in as data-cell resolutions. The IAT slot points at the
     // cell (WIN32K_DATA_VADDR page 1); load_into writes each cell's VALUE from DATA_EXPORTS. The
     // object-type cells hold canonical OBJECT_TYPE pointers; KUSER holds its checked writable

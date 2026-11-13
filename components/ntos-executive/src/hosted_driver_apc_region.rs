@@ -52,8 +52,8 @@ extern "win64" fn leave_guarded_region() {
 }
 
 pub(super) fn bind(reg: &mut DriverExportRegistry) {
-    reg.bind("KeEnterCriticalRegion", enter_critical_region as usize as u64);
-    reg.bind("KeLeaveCriticalRegion", leave_critical_region as usize as u64);
-    reg.bind("KeEnterGuardedRegion", enter_guarded_region as usize as u64);
-    reg.bind("KeLeaveGuardedRegion", leave_guarded_region as usize as u64);
+    reg.bind("KeEnterCriticalRegion", enter_critical_region as *const () as usize as u64);
+    reg.bind("KeLeaveCriticalRegion", leave_critical_region as *const () as usize as u64);
+    reg.bind("KeEnterGuardedRegion", enter_guarded_region as *const () as usize as u64);
+    reg.bind("KeLeaveGuardedRegion", leave_guarded_region as *const () as usize as u64);
 }

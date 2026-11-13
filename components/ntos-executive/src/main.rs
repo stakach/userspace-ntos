@@ -20047,7 +20047,7 @@ pub unsafe extern "C" fn user_entry() -> ! {
     // P3 NtCreateThreadEx: create a SECOND thread in this process; it runs concurrently in our
     // VSpace and writes a marker we then observe (proving a real independent thread).
     core::ptr::write_volatile((SYSARG_VADDR + 0x468) as *mut u64, 0);
-    let th = native_syscall(NT_CREATE_THREAD, thread2_entry as u64);
+    let th = native_syscall(NT_CREATE_THREAD, thread2_entry as *const () as u64);
     let mut tmarker = 0u64;
     for _ in 0..2_000_000u64 {
         tmarker = core::ptr::read_volatile((SYSARG_VADDR + 0x468) as *const u64);

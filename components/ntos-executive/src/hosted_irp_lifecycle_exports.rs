@@ -51,6 +51,6 @@ pub(super) extern "win64" fn io_reuse_irp(irp: u64, status: i32) {
 }
 
 pub(super) fn bind(reg: &mut nt_compat_exports::DriverExportRegistry) {
-    reg.bind("IoInitializeIrp", io_initialize_irp as usize as u64);
-    reg.bind("IoReuseIrp", io_reuse_irp as usize as u64);
+    reg.bind("IoInitializeIrp", io_initialize_irp as *const () as usize as u64);
+    reg.bind("IoReuseIrp", io_reuse_irp as *const () as usize as u64);
 }

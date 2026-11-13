@@ -12,5 +12,5 @@ pub(super) extern "win64" fn io_get_paging_io_priority(irp: u64) -> u32 {
 }
 
 pub(super) fn bind(reg: &mut DriverExportRegistry) {
-    reg.bind("IoGetPagingIoPriority", io_get_paging_io_priority as usize as u64);
+    reg.bind("IoGetPagingIoPriority", io_get_paging_io_priority as *const () as usize as u64);
 }
