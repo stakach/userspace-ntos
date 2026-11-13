@@ -7,7 +7,8 @@ use alloc::vec::Vec;
 mod add_device_selection;
 pub mod preload_catalog;
 pub use add_device_selection::{
-    select_add_device_row, AddDeviceReadiness, AddDeviceSelection, AwaitingBusPdo,
+    select_add_device_row, AddDeviceReadiness, AddDeviceSelection, AddDeviceSelectionEvidence,
+    AwaitingBusPdo,
 };
 pub use nt_component_suspension::{
     RootChildTurn as AddDeviceRootTurn, RootChildArrival as RootArrival,

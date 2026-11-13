@@ -11188,6 +11188,7 @@ pub(crate) unsafe fn service_sec_image(
     // STATIC because the win32k dispatch arm's nested pump ticks it too (see `w32_census_enter`).
     CENSUS_LAST_DUMP.store(last_progress_t, Ordering::Relaxed);
     let mut root_add_device_turn: Option<RootAddDeviceTurn> = None;
+    let mut add_device_selection_evidence = nt_driver_start::AddDeviceSelectionEvidence::new(64);
     let mut root_queued_callback_turn: Vec<RootQueuedCallbackTurn> = Vec::new();
     let memory_context = ExecLoopCtx {
         owner_pi: primary_pi,
@@ -11693,8 +11694,14 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 // Ordinary redrives may reach Ready, but only this flat root phase may
                 // enter AddDevice. Admit one exact row and recheck it before other work.
+                let selection = ready_flat_root_add_device(&nt_handler);
+                if add_device_selection_evidence.report(selection) {
+                    trace_flat_root_add_device_selection(&nt_handler, selection);
+                }
+                // A row awaiting its bus PDO is not admitted or retried here: only another
+                // row's relations can report that PDO.
                 let nt_driver_start::AddDeviceSelection::Selected { owner: ready, .. } =
-                    ready_flat_root_add_device(&nt_handler) else { break };
+                    selection else { break };
                 let _message = crate::ipc_message::SavedMessageBuffer::capture();
                 redrive_flat_root_add_device_selected(&mut nt_handler, ready);
                 if root_add_device_still_parked(&nt_handler, ready) {
@@ -29258,6 +29265,60 @@ fn ready_flat_root_add_device(
             OwnedPendingPnpOperation::Removal(_) => None,
         });
     nt_driver_start::select_add_device_row(driver_starts.chain(rebalances))
+}
+
+/// Bounded native evidence for a flat root selection that passed over, or stopped at, a row
+/// whose bus PDO has not been reported. `selected=none` means no row could enter AddDevice.
+fn trace_flat_root_add_device_selection(
+    handler: &ExecNtHandler,
+    selection: nt_driver_start::AddDeviceSelection<RootAddDeviceOwner>,
+) {
+    let (selected, awaiting) = match selection {
+        nt_driver_start::AddDeviceSelection::Selected { owner, passed_over: Some(awaiting) } =>
+            (Some(owner), awaiting),
+        nt_driver_start::AddDeviceSelection::AwaitingBusRelations(awaiting) => (None, awaiting),
+        _ => return,
+    };
+    print_str(b"[pnp-add-device-select] selected=");
+    match selected {
+        Some(owner) => print_root_add_device_owner(handler, owner),
+        None => print_str(b"none"),
+    }
+    print_str(b" awaiting-bus-pdo=");
+    print_u64(awaiting.rows as u64);
+    print_str(b" first=");
+    print_root_add_device_owner(handler, awaiting.first);
+    print_str(b"\n");
+}
+
+fn print_root_add_device_owner(handler: &ExecNtHandler, owner: RootAddDeviceOwner) {
+    let (kind, slot, identity) = match owner {
+        RootAddDeviceOwner::DriverStart(reservation) => (
+            b"start".as_slice(),
+            reservation.slot(),
+            handler.pending_driver_starts.get_exact(reservation)
+                .map(|pending| pending.batch.next_devnode_identity()),
+        ),
+        RootAddDeviceOwner::PnpRebalance(reservation) => (
+            b"rebalance".as_slice(),
+            reservation.slot(),
+            handler.pending_pnp_operations.get_exact(reservation)
+                .and_then(|pending| match &pending.operation {
+                    OwnedPendingPnpOperation::Rebalance(batch) =>
+                        Some(batch.next_devnode_identity()),
+                    OwnedPendingPnpOperation::Removal(_) => None,
+                }),
+        ),
+    };
+    print_str(kind);
+    print_str(b" slot=");
+    print_u64(slot as u64);
+    if let Some((service, devnode)) = identity {
+        print_str(b" service=");
+        print_str(service.as_bytes());
+        print_str(b" devnode=");
+        print_str(devnode.unwrap_or("none").as_bytes());
+    }
 }
 
 fn root_add_device_still_parked(handler: &ExecNtHandler, owner: RootAddDeviceOwner) -> bool {

@@ -655,14 +655,34 @@ impl OwnedHostedPnpStartBatch {
         self.drive_inner(false, true)
     }
 
-    /// What this batch offers the flat root AddDevice phase.
+    /// What this batch offers the flat root AddDevice phase. A devnode that needs its bus
+    /// driver's PDO cannot enter AddDevice before that bus reports it, so driving this row
+    /// could only return `BusRelationPending` again.
     pub(crate) fn flat_root_add_device_readiness(&self) -> nt_driver_start::AddDeviceReadiness {
         if self.wait_stage() != HostedPnpWaitStage::DevnodeAdmission
             || self.coordinator.phase() != nt_driver_start::BatchPhase::Ready
         {
             return nt_driver_start::AddDeviceReadiness::NotReady;
         }
-        nt_driver_start::AddDeviceReadiness::Ready
+        let devnode_index = self.coordinator.next_devnode();
+        nt_driver_start::AddDeviceReadiness::for_unentered_devnode(
+            self.requires_accepted_bus_pdo(devnode_index),
+            driver_launch::hosted_bus_reported_device_id(
+                &self.spec.devnodes[devnode_index].instance_id,
+            ).is_some(),
+        )
+    }
+
+    /// The devnode was deferred to its bus relation, or an earlier enumerator must supply it.
+    fn requires_accepted_bus_pdo(&self, devnode_index: usize) -> bool {
+        self.pending_bus_relation_devnode == Some(devnode_index)
+            || self.bootstrap_required_bus_pdos.contains(&devnode_index)
+    }
+
+    /// Service and next unentered devnode instance, for selection evidence.
+    pub(crate) fn next_devnode_identity(&self) -> (&str, Option<&str>) {
+        let devnode = self.spec.devnodes.get(self.coordinator.next_devnode());
+        (&self.spec.service_name, devnode.map(|devnode| devnode.instance_id.as_str()))
     }
 
     unsafe fn schedule_initial_bus_relations(
@@ -1279,8 +1299,7 @@ impl OwnedHostedPnpStartBatch {
                             hardware_ids: &devnode.hardware_ids,
                             compatible_ids: &devnode.compatible_ids,
                         },
-                        self.pending_bus_relation_devnode == Some(devnode_index)
-                            || self.bootstrap_required_bus_pdos.contains(&devnode_index),
+                        self.requires_accepted_bus_pdo(devnode_index),
                         self.options,
                         &mut self.report,
                     );
@@ -1381,6 +1400,10 @@ impl OwnedHostedPnpRebalance {
             return nt_driver_start::AddDeviceReadiness::NotReady;
         }
         self.restart.flat_root_add_device_readiness()
+    }
+
+    pub(crate) fn next_devnode_identity(&self) -> (&str, Option<&str>) {
+        self.restart.next_devnode_identity()
     }
 
     pub(crate) fn add_device_wait_stage(&self) -> bool {
