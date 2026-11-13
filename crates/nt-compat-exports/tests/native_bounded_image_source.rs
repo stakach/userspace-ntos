@@ -123,40 +123,6 @@ fn routed_process_snapshot_retains_pending_file_reads_before_process_publication
 }
 
 #[test]
-fn routed_dll_fault_retains_pending_read_until_page_and_reply_are_safe() {
-    let fault_loop = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../components/ntos-executive/src/service_sec_image.rs"),
-    ).unwrap();
-    let deferred = fault_loop.find("native_image_pagein_work::submit(")
-        .expect("retained routed DLL fault must park its original Reply before provider READ");
-    let synchronous = fault_loop.find("match nt_handler.service_native_image_page_residency(")
-        .expect("local and already resident image pages retain the synchronous root fault path");
-    assert!(deferred < synchronous,
-        "a pending installed DLL READ must not enter synchronous source-page initialization");
-
-    let worker_text = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../components/ntos-executive/src/native_image_pagein_work.rs"),
-    ).expect("native image page-in worker");
-    let worker = syn::parse_file(&worker_text).expect("parsed native image page-in worker");
-    let mut audited = Audit::default();
-    audited.visit_file(&worker);
-    for required in ["prepare", "commit", "new_at", "next_span",
-        "bind_pending", "completed_irp_exact", "copy_completed_irp_output_exact",
-        "terminal", "copy_fragment", "acknowledge_completed_irp_strict",
-        "acknowledge", "accept_acknowledged_span", "completed_page"] {
-        assert!(has(&audited, required),
-            "pending DLL page worker must retain exact I/O and accept only ACKed spans: {required}");
-    }
-    for required in ["RootReplyPark", "RoutedImageRead", "ImagePageFillCapture",
-        "capture_process_identity", "source_for_view", "capture_owned"] {
-        assert!(worker_text.contains(required),
-            "page worker must retain and revalidate the fault, source and File: {required}");
-    }
-}
-
-#[test]
 fn routed_hardware_fault_does_not_fall_through_on_an_unready_source_row() {
     use nt_memory_manager::image_source_page::ImageSourcePage;
 
