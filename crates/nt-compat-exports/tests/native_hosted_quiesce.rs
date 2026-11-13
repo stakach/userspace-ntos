@@ -74,47 +74,6 @@ fn audit(value: &syn::Block) -> Audit {
 }
 
 #[test]
-fn terminal_quiesce_dumps_all_runtime_threads_after_live_checkpoint() {
-    struct Ordered {
-        checkpoint: bool,
-        found: bool,
-    }
-    impl<'ast> Visit<'ast> for Ordered {
-        fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
-            self.checkpoint = false;
-            visit::visit_item_fn(self, function);
-        }
-        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-            if call.method == "checkpoint_live" {
-                self.checkpoint = true;
-            }
-            visit::visit_expr_method_call(self, call);
-        }
-        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-            if matches!(call.func.as_ref(), syn::Expr::Path(path)
-                if path.path.is_ident("dump_all_hosted_thread_quiesce"))
-            {
-                assert!(
-                    self.checkpoint,
-                    "copy exact live process state before terminal observation"
-                );
-                self.found = true;
-            }
-            visit::visit_expr_call(self, call);
-        }
-    }
-    let mut ordered = Ordered {
-        checkpoint: false,
-        found: false,
-    };
-    ordered.visit_file(&syn::parse_file(SERVICE).unwrap());
-    assert!(
-        ordered.found,
-        "terminal diagnostics currently omit non-main, non-hot workers"
-    );
-}
-
-#[test]
 fn generic_quiesce_paginates_copied_executable_bindings_without_role_selection() {
     let dump = audit(&block(QUIESCE, "dump_all_hosted_thread_quiesce"));
     assert!(

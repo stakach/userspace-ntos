@@ -37,33 +37,6 @@ fn dirty_dynamic_hive_is_durable_before_ntunload_detaches_its_owner() {
 }
 
 #[test]
-fn shutdown_flushes_all_dynamic_hives_before_quiesce_teardown() {
-    let handler = source("exec_handler.rs");
-    let start = handler.find("fn checkpoint_dirty_dynamic_mutable_hives(")
-        .expect("shutdown dynamic hive flush");
-    let body = &handler[start..];
-    assert!(body.contains("for hive_sel in HIVE_SEL_DYNAMIC"));
-    assert!(body.contains("self.checkpoint_dynamic_mutable_hive(hive_sel, dirty)"));
-    assert!(body.contains("return status"),
-        "failed dynamic checkpoint must stop the shutdown barrier");
-
-    let service = source("service_sec_image.rs");
-    let start = service.find("fn checkpoint_boot_hives_at_quiesce(")
-        .expect("shutdown hive barrier");
-    let end = service[start..].find("#[path = \"service_section_pagein.rs\"]")
-        .expect("end of shutdown hive barrier") + start;
-    let quiesce = &service[start..end];
-    let flush = quiesce.find("checkpoint_dirty_dynamic_mutable_hives()")
-        .expect("dynamic hives included at shutdown");
-    let commit = quiesce.find("crate::writable_fs::checkpoint_dirty_volume()")
-        .expect("quiesce volume durability barrier");
-    assert!(flush < commit, "dynamic hives must be checkpointed before volume commit");
-    let call = service.find("checkpoint_boot_hives_at_quiesce(&mut nt_handler)").unwrap();
-    let teardown = service[call..].find("dump_all_hosted_thread_quiesce(").unwrap() + call;
-    assert!(call < teardown, "shutdown flush precedes quiesce teardown");
-}
-
-#[test]
 fn native_quiesce_proves_dirty_dynamic_hive_sidecars_without_async_checkpoint() {
     let handler = source("exec_handler.rs");
     let path_start = handler

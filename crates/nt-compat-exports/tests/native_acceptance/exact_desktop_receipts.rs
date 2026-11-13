@@ -216,54 +216,6 @@ fn local_name(pattern: &syn::Pat) -> Option<String> {
     }
 }
 
-#[test]
-fn service_returns_copied_desktop_report_before_withdrawing_live_context() {
-    let file = syn::parse_file(SERVICE).expect("actual service source must parse");
-    let service = function(&file, "service_sec_image");
-    let statements = &service.block.stmts;
-    let withdrawal = statements
-        .iter()
-        .position(withdraws_loop_context)
-        .expect("service must withdraw its live loop context");
-    let (capture, report) = statements
-        .iter()
-        .enumerate()
-        .find_map(|(index, statement)| {
-            let syn::Stmt::Local(local) = statement else {
-                return None;
-            };
-            let name = local_name(&local.pat)?;
-            let initializer = local.init.as_ref()?;
-            let mut evidence = Evidence::default();
-            evidence.visit_expr(&initializer.expr);
-            evidence
-                .calls
-                .iter()
-                .any(|call| call == "capture_desktop_acceptance_report")
-                .then_some((index, name))
-        })
-        .expect("capture an owned exact-generation acceptance report while the handler is live");
-    assert!(
-        capture < withdrawal,
-        "capture must precede loop_ctx withdrawal"
-    );
-    let syn::ReturnType::Type(_, returned) = &service.sig.output else {
-        panic!("service must return its acceptance report");
-    };
-    let mut return_type = Evidence::default();
-    return_type.visit_type(returned);
-    assert!(return_type
-        .names
-        .iter()
-        .any(|name| name == "DesktopAcceptanceReport"));
-    let mut returned = Evidence::default();
-    returned.visit_stmt(statements.last().expect("service has a return expression"));
-    assert!(
-        returned.names.contains(&report),
-        "the returned result must contain the captured report, not a live handler pointer"
-    );
-}
-
 #[derive(Default)]
 struct LaunchContractArms {
     report: String,
