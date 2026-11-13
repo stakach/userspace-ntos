@@ -24,6 +24,7 @@ pub mod directory;
 pub mod hosted_dynamic_type;
 pub mod object_security;
 pub mod object_type;
+pub mod slot_ledger;
 mod store;
 mod types;
 pub mod win32k_ob;
