@@ -159,6 +159,9 @@ pub(super) struct LoopState<'a> {
     pub(super) ingress: Ingress,
     pub(super) procs: Procs,
     pub(super) images: Images<'a>,
+    /// The primary process's loop context, as setup published it. Admission derives each
+    /// event's context from it.
+    pub(super) memory_context: ExecLoopCtx,
     pub(super) handler: &'static mut ExecNtHandler,
     pub(super) dispatcher: &'a NativeSyscallDispatcher,
 }

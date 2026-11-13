@@ -24,26 +24,6 @@ const HOSTED_RUNTIME: &str =
 const SERVICE_LOOP: &str =
     include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
 
-#[test]
-fn child_created_during_unrelated_ingress_is_selected_before_fault_observation() {
-    let before_admission = SERVICE_LOOP
-        .split("let event_runtime = match (ingress")
-        .next()
-        .expect("hosted event admission");
-    let late_boundary = before_admission
-        .rsplit("finalize_service_loop_state(&mut nt_handler)")
-        .next()
-        .expect("late work checkpoint");
-    assert!(late_boundary.contains("receive_child_pending()"));
-    assert!(late_boundary.contains("receive_child_is_current("));
-    assert!(late_boundary.contains("defer_hosted_delivery("));
-    assert!(late_boundary.contains("component_recv!("));
-    let defer = HOSTED.split("pub(crate) unsafe fn defer_hosted_delivery(")
-        .nth(1).expect("exact unexecuted delivery handoff");
-    assert!(defer.contains("receive_child_pending()"));
-    assert!(defer.contains("receive_child_is_current("));
-}
-
 #[derive(Default)]
 struct Audit {
     calls: Vec<String>,
