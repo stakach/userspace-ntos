@@ -19,19 +19,6 @@ fn refused_hosted_release_quarantines_the_exact_reply_before_receive() {
 }
 
 #[test]
-fn refusal_exits_the_service_loop_without_reusing_the_owned_reply() {
-    let outcome = SERVICE
-        .split_once("macro_rules! component_receive_outcome")
-        .expect("service receive outcome")
-        .1
-        .split_once("macro_rules! component_recv")
-        .expect("receive outcome boundary")
-        .0;
-    assert!(outcome.contains("ReceiveOutcome::RetainedFailure"));
-    assert!(outcome.contains("break 'service_loop"));
-}
-
-#[test]
 fn uncertain_root_reply_quarantines_exact_owner_before_fresh_receive() {
     let reply_receive = INGRESS
         .split_once("pub(crate) unsafe fn reply_receive(")

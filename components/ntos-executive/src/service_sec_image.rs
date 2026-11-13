@@ -8,7 +8,10 @@ use nt_user_host::hosted_return_target::HostedReturnTarget;
 
 #[path = "executor/loop_state.rs"]
 mod loop_state;
-use loop_state::{Diag, Images, Ingress, LoopExit, LoopState, Message, Parks, Procs};
+use loop_state::{Diag, Images, Ingress, LoopExit, LoopState, Message, Parks, Procs, Turn};
+#[path = "executor/receive.rs"]
+mod loop_receive;
+use core::ops::ControlFlow;
 #[path = "hosted_quiesce.rs"]
 mod hosted_quiesce;
 use hosted_quiesce::dump_all_hosted_thread_quiesce;
@@ -10840,34 +10843,15 @@ pub(crate) unsafe fn service_sec_image(
     };
     #[cfg(feature = "mup-provider-kernel-only")]
     print_str(b"[mup-provider-gate] SMSS remains suspended during native driver proof\n");
-    // Every blocking ingress rechecks retained work, including early fault/refusal branches.
-    // This barrier only programs wake demand; provider execution stays at the outer loop top.
-    macro_rules! component_recv {
-        ($($arg:expr),* $(,)?) => {{
-            assert!(prepare_service_receive(&mut *delay_queue, &mut nt_handler),
-                "initial root receive lost its physical timer owner");
-            recv_full_r12($($arg),*)
-        }};
-    }
-    macro_rules! component_reply_recv {
-        ($($arg:expr),* $(,)?) => {{
-            assert!(prepare_service_receive(&mut *delay_queue, &mut nt_handler),
-                "initial root reply receive lost its physical timer owner");
-            reply_recv_badge($($arg),*)
-        }};
-    }
-    macro_rules! component_client_reply_recv {
-        ($($arg:expr),* $(,)?) => {{
-            assert!(prepare_service_receive(&mut *delay_queue, &mut nt_handler),
-                "initial root client reply receive lost its physical timer owner");
-            client_reply_recv_badge($($arg),*)
-        }};
-    }
     // Fix (B): the INITIAL recv also binds REPLY_MAIN (r12) so the first caller's Call is captured
     // as a reply cap, matching every reply_recv_badge recv in the loop body.
+    // The first blocking ingress rechecks retained work like every later one. This barrier
+    // only programs wake demand; provider execution stays at the outer loop top.
     let msg = {
+        assert!(prepare_service_receive(&mut *delay_queue, &mut nt_handler),
+            "initial root receive lost its physical timer owner");
         let (badge, mi, m0, m1, m2, m3) =
-            component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+            recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
         Message { badge, mi, m0, m1, m2, m3 }
     };
     // ★★ PARK + QUIESCE CONTRACT — see docs/n-threads-multiplex.md §1a for the authoritative catalog
@@ -11280,95 +11264,29 @@ pub(crate) unsafe fn service_sec_image(
         if !queued_callback_fences_providers {
             hosted_spawn_uncertainty::redrive(&mut *delay_queue, &mut nt_handler);
         }
-        macro_rules! component_receive_outcome {
-            ($outcome:expr) => {{
-                match $outcome {
-                    crate::executive_ingress::ReceiveOutcome::Message(message) => message,
-                    crate::executive_ingress::ReceiveOutcome::OuterBoundary(boundary) => {
-                        lp.ingress.receive_boundary = Some(boundary);
-                        continue 'service_loop;
-                    }
-                    crate::executive_ingress::ReceiveOutcome::RetainedFailure => {
-                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        lp.exit.stop_ssn = 0;
-                        record_service_loop_exit!(b"ingress-retained");
-                        break 'service_loop;
-                    }
-                }
-            }};
-        }
+        // Adapters over `executor/receive.rs`. A `Break` leaves the turn the way the macro did.
         macro_rules! component_recv {
-            ($ep:expr, $reply:expr) => {{
-                assert!(crate::executive_ingress::handles($ep));
-                if root_add_device_exclusive_pending() {
-                    if !prepare_parked_add_device_receive(&mut lp.ingress.root_add_device_turn) {
-                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        lp.exit.stop_ssn = 0;
-                        record_service_loop_exit!(b"add-device-receive");
-                        break 'service_loop;
-                    }
-                } else if root_queued_callback_exclusive_pending() {
-                    if !prepare_parked_queued_callback_receive(&mut lp.ingress.root_queued_callback_turn) {
-                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        lp.exit.stop_ssn = 0;
-                        record_service_loop_exit!(b"queued-callback-receive");
-                        break 'service_loop;
-                    }
-                    if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
-                        && !transfer_selected_queued_callback_ingress(&mut lp.ingress.root_queued_callback_turn)
-                    {
-                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        lp.exit.stop_ssn = 0;
-                        record_service_loop_exit!(b"queued-callback-child-transfer");
-                        break 'service_loop;
-                    }
-                } else if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
-                    if !prepare_service_receive(&mut *delay_queue, &mut nt_handler) {
-                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        lp.exit.stop_ssn = 0;
-                        record_service_loop_exit!(b"queued-work-receive-poll");
-                        break 'service_loop;
-                    }
+            ($ep:expr, $reply:expr) => {
+                match loop_receive::receive(
+                    &mut lp.ingress, &mut *nt_handler, &mut lp.exit, $ep, || $reply,
+                ) {
+                    ControlFlow::Continue(message) => message,
+                    ControlFlow::Break(Turn::Next) => continue 'service_loop,
+                    ControlFlow::Break(Turn::Exit) => break 'service_loop,
                 }
-                component_receive_outcome!(crate::executive_ingress::receive($reply))
-            }};
+            };
         }
         macro_rules! component_client_reply_recv {
-            ($ep:expr, $reply:expr, $len:expr, $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {{
-                assert!(crate::executive_ingress::handles($ep));
-                if root_add_device_exclusive_pending() {
-                    if !prepare_parked_add_device_receive(&mut lp.ingress.root_add_device_turn) {
-                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        lp.exit.stop_ssn = 0;
-                        record_service_loop_exit!(b"add-device-reply-receive");
-                        break 'service_loop;
-                    }
-                } else if root_queued_callback_exclusive_pending() {
-                    if !prepare_parked_queued_callback_receive(&mut lp.ingress.root_queued_callback_turn) {
-                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        lp.exit.stop_ssn = 0;
-                        record_service_loop_exit!(b"queued-callback-reply-receive");
-                        break 'service_loop;
-                    }
-                    if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
-                        && !transfer_selected_queued_callback_ingress(&mut lp.ingress.root_queued_callback_turn)
-                    {
-                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        lp.exit.stop_ssn = 0;
-                        record_service_loop_exit!(b"queued-callback-child-transfer");
-                        break 'service_loop;
-                    }
-                } else if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
-                    if !prepare_service_receive(&mut *delay_queue, &mut nt_handler) {
-                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        lp.exit.stop_ssn = 0;
-                        record_service_loop_exit!(b"queued-work-reply-poll");
-                        break 'service_loop;
-                    }
+            ($ep:expr, $reply:expr, $len:expr, $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {
+                match loop_receive::reply_receive(
+                    &mut lp.ingress, &mut *nt_handler, &mut lp.exit, $ep,
+                    || ($reply, $len, $r0, $r1, $r2, $r3),
+                ) {
+                    ControlFlow::Continue(message) => message,
+                    ControlFlow::Break(Turn::Next) => continue 'service_loop,
+                    ControlFlow::Break(Turn::Exit) => break 'service_loop,
                 }
-                component_receive_outcome!(crate::executive_ingress::reply_receive(
-                    $reply, $len, $r0, $r1, $r2, $r3))
-            }};
+            };
         }
         macro_rules! component_reply_recv {
             ($ep:expr, $len:expr, $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {{

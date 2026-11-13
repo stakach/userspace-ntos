@@ -10,6 +10,13 @@
 
 use super::*;
 
+/// How a helper that ends the current turn leaves it: `Next` was `continue 'service_loop`,
+/// `Exit` was `break 'service_loop`.
+pub(super) enum Turn {
+    Next,
+    Exit,
+}
+
 /// The verdict the service loop returns to `_start`, and the working fault counters of the
 /// process whose event is being served.
 pub(super) struct LoopExit {
