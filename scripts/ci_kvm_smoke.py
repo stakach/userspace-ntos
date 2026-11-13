@@ -781,9 +781,10 @@ def main():
         "-qmp",
         f"unix:{QMP_SOCKET},server=on,wait=off",
     ]
-    # KVM's host model can expose invariant TSC when the runner CPU provides it.
-    # Keep this explicit so the guest's guarded clock, not the harness, decides
-    # whether the calibrated fast path is safe to admit.
+    # The workflow names the CPU model. `-cpu host` alone never exposes invariant TSC:
+    # QEMU treats the bit as unmigratable, so the workflow requests `invtsc=on`. KVM
+    # grants it only when the runner CPU has it, and the guest's guarded clock still
+    # decides whether the calibrated fast path is safe to admit.
     if cpu_model := os.environ.get("QEMU_CPU_MODEL"):
         command += ["-cpu", cpu_model]
     if args.trace_interrupts:

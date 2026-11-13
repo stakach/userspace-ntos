@@ -143,6 +143,11 @@ jobs:
           if version != 12:
               raise SystemExit(f"unexpected KVM API version {version}")
           print("hosted KVM API version 12 available")
+          flags = next((line.split(":", 1)[1].split() for line in open("/proc/cpuinfo")
+                        if line.startswith("flags")), [])
+          print("host TSC flags:", " ".join(
+              flag for flag in ("constant_tsc", "nonstop_tsc", "tsc_reliable") if flag in flags
+          ) or "none")
           PY
       - name: Verify bounded QEMU runner contracts
         run: python3 -m unittest discover -s scripts/tests -p 'test_ci_kvm_smoke_*.py' -v
@@ -226,7 +231,9 @@ jobs:
           GRAPHICS: '1'
           QEMU_MEMORY: 3072M
           QEMU_CPUS: '4'
-          QEMU_CPU_MODEL: host
+          # QEMU leaves invariant TSC (CPUID 0x80000007 EDX[8]) out of `-cpu host` because
+          # it blocks migration. Request it; QEMU drops it with a warning when KVM lacks it.
+          QEMU_CPU_MODEL: host,invtsc=on
         run: |
           set -euo pipefail
           boot_status=0
