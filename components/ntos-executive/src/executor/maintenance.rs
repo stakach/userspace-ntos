@@ -12,6 +12,7 @@
 use super::loop_flow::*;
 use super::loop_receive::receive;
 use super::*;
+use crate::executor::local;
 
 /// What maintenance hands to admission.
 pub(super) type Maintained =
@@ -85,7 +86,7 @@ pub(super) unsafe fn maintain(
                 }
             }
         }
-        let received = crate::executive_ingress::receive(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+        let received = crate::executive_ingress::receive(local().reply_main_slot.load(Ordering::Relaxed));
         let received = match received {
             crate::executive_ingress::ReceiveOutcome::Message(received) => received,
             crate::executive_ingress::ReceiveOutcome::RetainedFailure => {
@@ -144,7 +145,7 @@ pub(super) unsafe fn maintain(
     } else if root_queued_callback_exclusive_pending() {
         // Keep original ingress order: a newer Call Y cannot overtake an older deferred
         // Call X if this callback happens to settle while Y is the current delivery.
-        let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+        let reply = local().reply_main_slot.load(Ordering::Relaxed);
         let selected_child = crate::spawn_hosts::shared_ingress::owner::runtime::
             receive_child_pending()
             && hosted_ingress_binding(lp.msg.badge).is_some_and(|binding|
@@ -234,7 +235,7 @@ pub(super) unsafe fn maintain(
                     return ControlFlow::Break(Turn::Exit);
                 }
                 let received = receive(
-                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
                 )?;
                 (lp.msg.badge, lp.msg.mi, lp.msg.m0, lp.msg.m1, lp.msg.m2, lp.msg.m3) = received;
                 return ControlFlow::Break(Turn::Next);
@@ -463,7 +464,7 @@ pub(super) unsafe fn maintain(
                 lp.exit.record(b"add-device-permit");
                 return ControlFlow::Break(Turn::Exit);
             };
-            let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let reply = local().reply_main_slot.load(Ordering::Relaxed);
             let ticket = match crate::spawn_hosts::shared_ingress::owner::runtime::
                 defer_hosted_delivery_for_add_device(reply, lp.msg.badge, &permit)
             {
@@ -492,7 +493,7 @@ pub(super) unsafe fn maintain(
             return ControlFlow::Break(Turn::Exit);
         }
         let received = receive(
-            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
         )?;
         (lp.msg.badge, lp.msg.mi, lp.msg.m0, lp.msg.m1, lp.msg.m2, lp.msg.m3) = received;
         return ControlFlow::Break(Turn::Next);
@@ -524,7 +525,7 @@ pub(super) unsafe fn maintain(
                 }
             }
         } else if !root_event_consumed {
-            let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let reply = local().reply_main_slot.load(Ordering::Relaxed);
             let selected_callback_child = root_queued_callback_exclusive_pending()
                 && hosted_ingress_binding(lp.msg.badge).is_some_and(|binding|
                     crate::spawn_hosts::shared_ingress::owner::runtime::
@@ -551,7 +552,7 @@ pub(super) unsafe fn maintain(
             }
         }
         let received = receive(
-            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
         )?;
         (lp.msg.badge, lp.msg.mi, lp.msg.m0, lp.msg.m1, lp.msg.m2, lp.msg.m3) = received;
         return ControlFlow::Break(Turn::Next);
@@ -567,7 +568,7 @@ pub(super) unsafe fn maintain(
             return ControlFlow::Break(Turn::Exit);
         }
         let received = receive(
-            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
         )?;
         (lp.msg.badge, lp.msg.mi, lp.msg.m0, lp.msg.m1, lp.msg.m2, lp.msg.m3) = received;
         return ControlFlow::Break(Turn::Next);
@@ -729,10 +730,10 @@ pub(super) unsafe fn maintain(
         && hosted_irq_lines_from_badge(lp.msg.badge) == 0
     {
         crate::spawn_hosts::shared_ingress::owner::runtime::defer_hosted_delivery(
-            REPLY_MAIN_SLOT.load(Ordering::Relaxed), lp.msg.badge,
+            local().reply_main_slot.load(Ordering::Relaxed), lp.msg.badge,
         ).expect("unexecuted hosted delivery retains its physical ingress owner");
         let received = receive(
-            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
         )?;
         lp.msg.badge = received.0;
         lp.msg.mi = received.1;
@@ -752,10 +753,10 @@ pub(super) unsafe fn maintain(
         // imported. Move the still-unexecuted original Call and Reply back to its ingress
         // row before fault-frame or win32k shared-page staging can overwrite either owner.
         crate::spawn_hosts::shared_ingress::owner::runtime::defer_hosted_delivery(
-            REPLY_MAIN_SLOT.load(Ordering::Relaxed), lp.msg.badge,
+            local().reply_main_slot.load(Ordering::Relaxed), lp.msg.badge,
         ).expect("busy win32k Call retains its original physical ingress owner");
         let received = receive(
-            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
         )?;
         (lp.msg.badge, lp.msg.mi, lp.msg.m0, lp.msg.m1, lp.msg.m2, lp.msg.m3) = received;
         return ControlFlow::Break(Turn::Next);
@@ -809,7 +810,7 @@ pub(super) unsafe fn maintain(
                 return ControlFlow::Break(Turn::Exit);
             }
             let received = receive(
-                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
             )?;
             lp.msg.badge = received.0;
             lp.msg.mi = received.1;
@@ -1069,7 +1070,7 @@ pub(super) unsafe fn maintain(
             return ControlFlow::Break(Turn::Exit);
         }
         let received = receive(
-            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
         )?;
         lp.msg.badge = received.0;
         lp.msg.mi = received.1;
@@ -1107,7 +1108,7 @@ pub(super) unsafe fn maintain(
         ingress = Some(nt_handler.admit_hosted_thread_ingress(lp.msg.badge)
             .expect("selected Receive child retains its current ingress binding"));
         assert!(crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_is_current(
-            ingress.as_ref().unwrap().binding(), REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+            ingress.as_ref().unwrap().binding(), local().reply_main_slot.load(Ordering::Relaxed),
         ), "only the exact selected Receive child may run while its parent is held");
     }
     ControlFlow::Continue((ingress, native_ingress_request))

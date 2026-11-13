@@ -10,6 +10,7 @@
 use super::loop_flow::*;
 use super::loop_receive::receive;
 use super::*;
+use crate::executor::local;
 
 #[inline(never)]
 pub(super) unsafe fn syscall_nt_route(
@@ -204,7 +205,7 @@ pub(super) unsafe fn syscall_nt_route(
             crate::vm_lock_pagein_work::redrive(&mut nt_handler);
         }
         let _ = finalize_service_loop_state(&mut nt_handler);
-        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+        let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
         let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
             &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
         )?;
@@ -222,7 +223,7 @@ pub(super) unsafe fn syscall_nt_route(
             crate::vm_copy_work::redrive(&mut nt_handler);
         }
         let _ = finalize_service_loop_state(&mut nt_handler);
-        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+        let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
         let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
             &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
         )?;
@@ -240,7 +241,7 @@ pub(super) unsafe fn syscall_nt_route(
             crate::native_image_pagein_work::redrive(&mut nt_handler, &nt_dispatcher);
         }
         let _ = finalize_service_loop_state(&mut nt_handler);
-        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+        let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
         let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
             &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
         )?;
@@ -294,7 +295,7 @@ pub(super) unsafe fn syscall_nt_route(
                     crate::native_alpc_create_work::redrive(&mut nt_handler);
                 }
                 let _ = finalize_service_loop_state(&mut nt_handler);
-                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                     &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
                 )?;
@@ -336,7 +337,7 @@ pub(super) unsafe fn syscall_nt_route(
                 }
                 print_str(b"[native-alpc-connect-begin] redrove\n");
                 let _ = finalize_service_loop_state(&mut nt_handler);
-                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                     &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
                 )?;
@@ -364,7 +365,7 @@ pub(super) unsafe fn syscall_nt_route(
                     crate::native_alpc_connect_accept_work::redrive(&mut nt_handler);
                 }
                 let _ = finalize_service_loop_state(&mut nt_handler);
-                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                     &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
                 )?;
@@ -425,7 +426,7 @@ pub(super) unsafe fn syscall_nt_route(
                     let _ = lpc_component_reply_commit_drain(&mut nt_handler);
                 }
                 let _ = finalize_service_loop_state(&mut nt_handler);
-                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                     &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
                 )?;
@@ -451,7 +452,7 @@ pub(super) unsafe fn syscall_nt_route(
                     crate::native_alpc_close_work::redrive(&mut nt_handler);
                 }
                 let _ = finalize_service_loop_state(&mut nt_handler);
-                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                     &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
                 )?;
@@ -500,7 +501,7 @@ pub(super) unsafe fn syscall_nt_route(
                     &mut nt_handler,
                 );
                 let _ = finalize_service_loop_state(&mut nt_handler);
-                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                     &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
                 )?;
@@ -573,7 +574,7 @@ pub(super) unsafe fn syscall_nt_route(
             )?;
             crate::registry_mutation_work::redrive(&mut nt_handler, &mut *delay_queue);
             let _ = finalize_service_loop_state(&mut nt_handler);
-            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
             let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                 &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
             )?;
@@ -591,7 +592,7 @@ pub(super) unsafe fn syscall_nt_route(
             )?;
             crate::mutable_hive_mutation_work::redrive(&mut nt_handler, &mut *delay_queue);
             let _ = finalize_service_loop_state(&mut nt_handler);
-            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
             let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                 &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
             )?;
@@ -609,7 +610,7 @@ pub(super) unsafe fn syscall_nt_route(
             )?;
             crate::section_metadata_work::redrive(&mut nt_handler, &mut *delay_queue);
             let _ = finalize_service_loop_state(&mut nt_handler);
-            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
             let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                 &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
             )?;
@@ -629,7 +630,7 @@ pub(super) unsafe fn syscall_nt_route(
                 &mut *delay_queue, ntdll, fault_ep, procs, exe_images,
                 &*exe_image_catalog, hosted_loaded_images_ptr);
             let _ = finalize_service_loop_state(&mut nt_handler);
-            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
             let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                 &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
             )?;
@@ -795,7 +796,7 @@ pub(super) unsafe fn syscall_nt_route(
             // the old reply in the same restart. Never delete that reply beforehand.
             let applied = if nt_handler.hosted_thread_tcb(tid) == Some(tcb) {
                 crate::spawn_hosts::shared_ingress::owner::runtime::restart_hosted(
-                    REPLY_MAIN_SLOT.load(Ordering::Relaxed), tcb, &context,
+                    local().reply_main_slot.load(Ordering::Relaxed), tcb, &context,
                 ).expect("uncertain context restart retains its hosted Call owner")
             } else {
                 Err(u64::MAX)
@@ -813,7 +814,7 @@ pub(super) unsafe fn syscall_nt_route(
                 procs[pi].ntfaults = lp.exit.ntfaults;
                 pfilled[pi] = *filled_pages;
                 let _ = finalize_service_loop_state(&mut nt_handler);
-                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                     &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
                 )?;
@@ -843,7 +844,7 @@ pub(super) unsafe fn syscall_nt_route(
                 crate::win32k_glue::trace_hosted_tcb_debug_state(
                     b"thread-term-root-before",
                     1,
-                    REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                    local().reply_main_slot.load(Ordering::Relaxed),
                 );
             }
             let reply_dropped = !apc_owned_terminating_reply
@@ -867,7 +868,7 @@ pub(super) unsafe fn syscall_nt_route(
             procs[pi].ntfaults = lp.exit.ntfaults;
             pfilled[pi] = *filled_pages;
             let _ = finalize_service_loop_state(&mut nt_handler);
-            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
             if trace_index < 8 {
                 crate::win32k_glue::trace_hosted_tcb_debug_state(
                     b"thread-term-root-recv",
@@ -972,7 +973,7 @@ pub(super) unsafe fn syscall_nt_route(
             print_str(b"\n");
             if drop_reply {
                 let _ = finalize_service_loop_state(&mut nt_handler);
-                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                     &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
                 )?;

@@ -9,6 +9,7 @@
 
 use super::loop_receive::receive;
 use super::*;
+use crate::executor::local;
 
 impl LoopState<'_> {
     // park_and_log!(label, ip, cr2): the generalized UNRECOVERABLE-fault handler. Logs once per
@@ -107,7 +108,7 @@ impl LoopState<'_> {
         let _ = finalize_service_loop_state(nt_handler);
         let (nb, nmi, nm0, nm1, nm2, nm3) = match receive(
             &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep,
-            || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+            || local().reply_main_slot.load(Ordering::Relaxed),
         ) {
             ControlFlow::Continue(message) => message,
             ControlFlow::Break(turn) => return turn,
@@ -141,7 +142,7 @@ impl LoopState<'_> {
             print_str(b"[service-loop] rejected ingress Reply retained badge=");
             print_u64(lp.msg.badge);
             print_str(b" reply=");
-            print_u64(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+            print_u64(local().reply_main_slot.load(Ordering::Relaxed));
             print_str(b"\n");
             lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
             lp.exit.stop_ssn = 0;
@@ -150,7 +151,7 @@ impl LoopState<'_> {
         }
         let received = match receive(
             &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep,
-            || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+            || local().reply_main_slot.load(Ordering::Relaxed),
         ) {
             ControlFlow::Continue(message) => message,
             ControlFlow::Break(turn) => return turn,
@@ -265,7 +266,7 @@ pub(super) unsafe fn dbgk_block_and_park(
         let _ = finalize_service_loop_state(nt_handler);
         let (nb, nmi, nm0, nm1, nm2, nm3) = match receive(
             ingress, nt_handler, exit, fault_ep,
-            || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+            || local().reply_main_slot.load(Ordering::Relaxed),
         ) {
             ControlFlow::Continue(message) => message,
             ControlFlow::Break(turn) => return ControlFlow::Break(turn),
@@ -404,7 +405,7 @@ pub(super) unsafe fn park_queued_callback_root_receive(
                 return QueuedCallbackPark::Turn(Turn::Exit);
             }
         } else {
-            let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let reply = local().reply_main_slot.load(Ordering::Relaxed);
             let selected_child = crate::spawn_hosts::shared_ingress::owner::runtime::
                 receive_child_pending()
                 && hosted_ingress_binding(msg.badge).is_some_and(|binding|
@@ -451,7 +452,7 @@ pub(super) unsafe fn park_queued_callback_root_receive(
     }
     let received = match receive(
         ingress, nt_handler, exit, fault_ep,
-        || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+        || local().reply_main_slot.load(Ordering::Relaxed),
     ) {
         ControlFlow::Continue(message) => message,
         ControlFlow::Break(turn) => return QueuedCallbackPark::Turn(turn),

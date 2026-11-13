@@ -10,6 +10,7 @@
 use super::loop_flow::*;
 use super::loop_receive::{receive, reply_receive};
 use super::*;
+use crate::executor::local;
 
 #[inline(never)]
 pub(super) unsafe fn vm_fault(
@@ -36,7 +37,7 @@ pub(super) unsafe fn vm_fault(
     let addr = lp.msg.m1;
     let page = addr & !0xFFFu64;
     installer_child_span_census::note_fault(&nt_handler, pi,
-        nt_handler.current_tid, lp.msg.badge, REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+        nt_handler.current_tid, lp.msg.badge, local().reply_main_slot.load(Ordering::Relaxed),
         lp.msg.m0, addr, lp.msg.m3);
     if hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE).is_err() {
         // This is a valid caller making an invalid memory access, not stale ingress.
@@ -244,7 +245,7 @@ pub(super) unsafe fn vm_fault(
             let _ = finalize_service_loop_state(&mut nt_handler);
             let (nb, nmi, nm0, nm1, nm2, nm3) =
                 receive(
-                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
                 )?;
             lp.msg.badge = nb;
             lp.msg.mi = nmi;
@@ -307,7 +308,7 @@ pub(super) unsafe fn vm_fault(
             let _ = finalize_service_loop_state(&mut nt_handler);
             let (nb, nmi, nm0, nm1, nm2, nm3) =
                 receive(
-                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
                 )?;
             lp.msg.badge = nb;
             lp.msg.mi = nmi;
@@ -418,7 +419,7 @@ pub(super) unsafe fn vm_fault(
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         reply_receive(
-                            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (REPLY_MAIN_SLOT.load(Ordering::Relaxed), 0, 0, 0, 0, 0),
+                            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (local().reply_main_slot.load(Ordering::Relaxed), 0, 0, 0, 0, 0),
                         )?;
                     trace_stack_growth_reply(pi, lp.msg.badge, nb, nmi, nm0, nm1, nm2, nm3);
                     lp.msg.badge = nb;
@@ -460,7 +461,7 @@ pub(super) unsafe fn vm_fault(
             pfilled[pi] = *filled_pages;
             let (nb, nmi, nm0, nm1, nm2, nm3) =
                 reply_receive(
-                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (REPLY_MAIN_SLOT.load(Ordering::Relaxed), 0, 0, 0, 0, 0),
+                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (local().reply_main_slot.load(Ordering::Relaxed), 0, 0, 0, 0, 0),
                 )?;
             lp.msg.badge = nb;
             lp.msg.mi = nmi;
@@ -551,7 +552,7 @@ pub(super) unsafe fn vm_fault(
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         reply_receive(
-                            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (REPLY_MAIN_SLOT.load(Ordering::Relaxed), 0, 0, 0, 0, 0),
+                            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (local().reply_main_slot.load(Ordering::Relaxed), 0, 0, 0, 0, 0),
                         )?;
                     lp.msg.badge = nb;
                     lp.msg.mi = nmi;
@@ -596,7 +597,7 @@ pub(super) unsafe fn vm_fault(
             procs[pi].ntfaults = lp.exit.ntfaults;
             pfilled[pi] = *filled_pages;
             let (nb, nmi, nm0, nm1, nm2, nm3) = reply_receive(
-                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (REPLY_MAIN_SLOT.load(Ordering::Relaxed), 0, 0, 0, 0, 0),
+                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (local().reply_main_slot.load(Ordering::Relaxed), 0, 0, 0, 0, 0),
             )?;
             lp.msg.badge = nb;
             lp.msg.mi = nmi;
@@ -633,7 +634,7 @@ pub(super) unsafe fn vm_fault(
             procs[pi].ntfaults = lp.exit.ntfaults;
             pfilled[pi] = *filled_pages;
             let (nb, nmi, nm0, nm1, nm2, nm3) = reply_receive(
-                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (REPLY_MAIN_SLOT.load(Ordering::Relaxed), 0, 0, 0, 0, 0),
+                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (local().reply_main_slot.load(Ordering::Relaxed), 0, 0, 0, 0, 0),
             )?;
             lp.msg.badge = nb;
             lp.msg.mi = nmi;
@@ -659,7 +660,7 @@ pub(super) unsafe fn vm_fault(
             crate::native_image_pagein_work::redrive(&mut nt_handler, &nt_dispatcher);
             let _ = finalize_service_loop_state(&mut nt_handler);
             let received = receive(
-                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
             )?;
             lp.msg.badge = received.0;
             lp.msg.mi = received.1;
@@ -688,7 +689,7 @@ pub(super) unsafe fn vm_fault(
             procs[pi].ntfaults = lp.exit.ntfaults;
             pfilled[pi] = *filled_pages;
             let (nb, nmi, nm0, nm1, nm2, nm3) = reply_receive(
-                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (REPLY_MAIN_SLOT.load(Ordering::Relaxed), 0, 0, 0, 0, 0),
+                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (local().reply_main_slot.load(Ordering::Relaxed), 0, 0, 0, 0, 0),
             )?;
             lp.msg.badge = nb;
             lp.msg.mi = nmi;
@@ -724,7 +725,7 @@ pub(super) unsafe fn vm_fault(
             procs[pi].ntfaults = lp.exit.ntfaults;
             pfilled[pi] = *filled_pages;
             let (nb, nmi, nm0, nm1, nm2, nm3) = reply_receive(
-                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (REPLY_MAIN_SLOT.load(Ordering::Relaxed), 0, 0, 0, 0, 0),
+                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (local().reply_main_slot.load(Ordering::Relaxed), 0, 0, 0, 0, 0),
             )?;
             lp.msg.badge = nb;
             lp.msg.mi = nmi;
@@ -742,7 +743,7 @@ pub(super) unsafe fn vm_fault(
                     crate::section_pagein_work::redrive(&mut nt_handler);
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let received = receive(
-                        &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                        &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
                     )?;
                     lp.msg.badge = received.0;
                     lp.msg.mi = received.1;
@@ -977,7 +978,7 @@ pub(super) unsafe fn vm_fault(
             }
             let (nb, nmi, nm0, nm1, nm2, nm3) =
                 receive(
-                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
                 )?;
             lp.msg.badge = nb;
             lp.msg.mi = nmi;
@@ -1060,7 +1061,7 @@ pub(super) unsafe fn vm_fault(
             let _ = finalize_service_loop_state(&mut nt_handler);
             let (nb, nmi, nm0, nm1, nm2, nm3) =
                 receive(
-                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
                 )?;
             lp.msg.badge = nb;
             lp.msg.mi = nmi;
@@ -1216,7 +1217,7 @@ pub(super) unsafe fn vm_fault(
     procs[pi].ntfaults = lp.exit.ntfaults;
     pfilled[pi] = *filled_pages;
     let (nb, nmi, nm0, nm1, nm2, nm3) = reply_receive(
-        &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (REPLY_MAIN_SLOT.load(Ordering::Relaxed), 0, 0, 0, 0, 0),
+        &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (local().reply_main_slot.load(Ordering::Relaxed), 0, 0, 0, 0, 0),
     )?;
     lp.msg.badge = nb;
     lp.msg.mi = nmi;

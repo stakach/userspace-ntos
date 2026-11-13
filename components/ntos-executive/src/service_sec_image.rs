@@ -34,6 +34,8 @@ mod loop_vm_fault;
 mod loop_exceptions;
 #[path = "executor/maintenance.rs"]
 mod loop_maintenance;
+#[path = "executor/body.rs"]
+mod loop_body;
 use core::ops::ControlFlow;
 #[path = "hosted_quiesce.rs"]
 mod hosted_quiesce;
@@ -11001,72 +11003,7 @@ pub(crate) unsafe fn service_sec_image(
             alpc_send_ingress_trace: AtomicU64::new(0),
         },
     };
-    'service_loop: loop {
-        let (ingress, native_ingress_request) = match loop_maintenance::maintain(&mut lp) {
-            ControlFlow::Continue(maintained) => maintained,
-            ControlFlow::Break(Turn::Next) => continue 'service_loop,
-            ControlFlow::Break(Turn::Exit) => break 'service_loop,
-        };
-        let ev = match loop_admission::admit(&mut lp, ingress, native_ingress_request) {
-            ControlFlow::Continue(ev) => ev,
-            ControlFlow::Break(Turn::Next) => continue 'service_loop,
-            ControlFlow::Break(Turn::Exit) => break 'service_loop,
-        };
-        // A CPU exception (label 3). The DEBUG ntdll emits `int 0x2d` (DebugService/DPRINT),
-        // which #GPs with no kernel debugger; emulate it as a no-op by skipping past the
-        // `int 0x2d; int3` pair (echo the registers, advance the fault IP by 3, restart).
-        if (lp.msg.mi >> 12) == 3 {
-            match loop_exceptions::cpu_exception(&mut lp, &ev) {
-                ControlFlow::Break(Turn::Next) => continue 'service_loop,
-                ControlFlow::Break(Turn::Exit) => break 'service_loop,
-            }
-        }
-        // DebugException (label 4 = seL4's #DB/#BP bucket). The microkernel payload is
-        // m0=FaultIP, m1=ExceptionReason, m2=TriggerAddress, m3=BreakpointNumber. OUR ntdll's
-        // `RtlRaiseException` / `RtlRaiseStatus` seams issue int3, so software-break requests also
-        // decode WHAT exception the caller is raising: recover winlogon's full GPRs (RCX =
-        // PEXCEPTION_RECORD arg, RSP), read the EXCEPTION_RECORD from its demand-faulted memory, and
-        // walk the stack for the raise site.
-        if (lp.msg.mi >> 12) == 4 {
-            match loop_exceptions::debug_exception(&mut lp, &ev) {
-                ControlFlow::Break(Turn::Next) => continue 'service_loop,
-                ControlFlow::Break(Turn::Exit) => break 'service_loop,
-            }
-        }
-        if (lp.msg.mi >> 12) == 6 {
-            match loop_vm_fault::vm_fault(&mut lp, &ev) {
-                ControlFlow::Break(Turn::Next) => continue 'service_loop,
-                ControlFlow::Break(Turn::Exit) => break 'service_loop,
-            }
-        }
-        // ntdll_plan Step 6.A — NATIVE seL4-Call transport. OUR ntdll (native-transport smss) does a
-        // real seL4 `Call(CT_FAULT)` instead of a Windows-`syscall` UnknownSyscall trap. The request
-        // carries MR0=SSN, MR1=caller RSP, and the complete argument vector in MR2 onward. We
-        // NORMALIZE it into the fault-frame register slots the `(mi>>12)==2` arm reads, then re-label
-        // the message as UnknownSyscall (2) so it flows through that arm's FULL servicing body
-        // unchanged (dispatch + out-writes + spawn/park/delay post-actions). The reply is a NORMAL IPC
-        // reply (the native caller has NO pending fault): `component_reply_recv!(..,result,..)` fans
-        // result→MR0→the caller's r10, which our native stub reads as NTSTATUS.
-        let native_call_transport = (lp.msg.mi >> 12) == nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL;
-        if native_call_transport {
-            match loop_native_call::native_call(&mut lp, &ev) {
-                ControlFlow::Continue(()) => {}
-                ControlFlow::Break(Turn::Next) => continue 'service_loop,
-                ControlFlow::Break(Turn::Exit) => break 'service_loop,
-            }
-        }
-        if (lp.msg.mi >> 12) == 2 {
-            match loop_syscall::syscall(&mut lp, &ev, native_call_transport) {
-                ControlFlow::Break(Turn::Next) => continue 'service_loop,
-                ControlFlow::Break(Turn::Exit) => break 'service_loop,
-            }
-        }
-        // A non-VMFault, non-syscall fault (e.g. #GP) the loop can't service — unrecoverable. Park+log.
-        match lp.park_and_log(ev.pi, b"other-fault", lp.msg.m1, lp.msg.m1) {
-            Turn::Next => continue 'service_loop,
-            Turn::Exit => break 'service_loop,
-        }
-    }
+    while loop_body::turn(&mut lp).is_continue() {}
     if cfg!(feature = "mup-provider-kernel-only") {
         // This profile has no desktop verdict. Retain all live owners if its pump terminates.
         print_str(b"[mup-provider-gate] terminal service-loop failure\n");

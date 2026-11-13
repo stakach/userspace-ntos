@@ -10,6 +10,7 @@
 use super::loop_flow::*;
 use super::loop_receive::{receive, reply_receive};
 use super::*;
+use crate::executor::local;
 
 #[inline(never)]
 pub(super) unsafe fn syscall_tail(
@@ -38,7 +39,7 @@ pub(super) unsafe fn syscall_tail(
             &mut lp.parks, nt_handler, &mut lp.exit, lp.msg.badge, pi, resume_ip,
         )?;
         let _ = finalize_service_loop_state(&mut nt_handler);
-        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+        let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
         let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
             &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
         )?;
@@ -99,7 +100,7 @@ pub(super) unsafe fn syscall_tail(
             let _ = finalize_service_loop_state(&mut nt_handler);
             let (nb, nmi, nm0, nm1, nm2, nm3) =
                 receive(
-                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
                 )?;
             lp.msg.badge = nb;
             lp.msg.mi = nmi;
@@ -162,7 +163,7 @@ pub(super) unsafe fn syscall_tail(
             let _ = finalize_service_loop_state(&mut nt_handler);
             let (nb, nmi, nm0, nm1, nm2, nm3) =
                 receive(
-                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
                 )?;
             lp.msg.badge = nb;
             lp.msg.mi = nmi;
@@ -189,7 +190,7 @@ pub(super) unsafe fn syscall_tail(
             let _ = finalize_service_loop_state(&mut nt_handler);
             let (nb, nmi, nm0, nm1, nm2, nm3) =
                 receive(
-                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
                 )?;
             lp.msg.badge = nb;
             lp.msg.mi = nmi;
@@ -248,7 +249,7 @@ pub(super) unsafe fn syscall_tail(
             let _ = finalize_service_loop_state(&mut nt_handler);
             let (nb, nmi, nm0, nm1, nm2, nm3) =
                 receive(
-                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                    &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
                 )?;
             lp.msg.badge = nb;
             lp.msg.mi = nmi;
@@ -285,7 +286,7 @@ pub(super) unsafe fn syscall_tail(
         lp.exit.stop_ssn = lp.msg.m0;
         return ControlFlow::Break(lp.park_and_log(pi, b"unhandled-syscall", lp.msg.m0, lp.msg.m0));
     }
-    let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let reply_main = local().reply_main_slot.load(Ordering::Relaxed);
     if sc.component_suspension_park_request {
         procs[pi].faults = lp.exit.faults;
         procs[pi].first = lp.exit.first;
@@ -375,7 +376,7 @@ pub(super) unsafe fn syscall_tail(
         }
         if !receive_child_pending { let _ = finalize_service_loop_state(&mut nt_handler); }
         let received = receive(
-            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
         )?;
         lp.msg.badge = received.0;
         lp.msg.mi = received.1;
@@ -427,7 +428,7 @@ pub(super) unsafe fn syscall_tail(
             }
             let _ = finalize_service_loop_state(&mut nt_handler);
             let received = receive(
-                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
             )?;
             lp.msg.badge = received.0;
             lp.msg.mi = received.1;
@@ -449,7 +450,7 @@ pub(super) unsafe fn syscall_tail(
     procs[pi].first = lp.exit.first;
     procs[pi].ntfaults = lp.exit.ntfaults;
     pfilled[pi] = *filled_pages;
-    let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let reply_main = local().reply_main_slot.load(Ordering::Relaxed);
     if let Some(pending) = sc.park_lpc_receive.take() {
         if reply_main != 0
             && lpc_receive_wait_park(
@@ -489,7 +490,7 @@ pub(super) unsafe fn syscall_tail(
             }
             let _ = finalize_service_loop_state(&mut nt_handler);
             let received = receive(
-                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
             )?;
             lp.msg.badge = received.0;
             lp.msg.mi = received.1;
@@ -528,7 +529,7 @@ pub(super) unsafe fn syscall_tail(
             )?;
             let _ = finalize_service_loop_state(&mut nt_handler);
             let received = receive(
-                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
             )?;
             lp.msg.badge = received.0;
             lp.msg.mi = received.1;
@@ -574,7 +575,7 @@ pub(super) unsafe fn syscall_tail(
             )?;
             let _ = finalize_service_loop_state(&mut nt_handler);
             let received = receive(
-                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
             )?;
             lp.msg.badge = received.0;
             lp.msg.mi = received.1;
@@ -630,7 +631,7 @@ pub(super) unsafe fn syscall_tail(
             }
             let _ = finalize_service_loop_state(&mut nt_handler);
             let received = receive(
-                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
             )?;
             lp.msg.badge = received.0;
             lp.msg.mi = received.1;
@@ -657,7 +658,7 @@ pub(super) unsafe fn syscall_tail(
             lp.msg.badge,
         ) {
             let _ = finalize_service_loop_state(&mut nt_handler);
-            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
             let received = receive(
                 &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
             )?;
@@ -680,7 +681,7 @@ pub(super) unsafe fn syscall_tail(
             delay_timer_rearm_after_park(&mut *delay_queue, &mut nt_handler, timed);
             thread_alert::redrive(&mut nt_handler);
             let _ = finalize_service_loop_state(&mut nt_handler);
-            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
             let received = receive(
                 &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
             )?;
@@ -724,7 +725,7 @@ pub(super) unsafe fn syscall_tail(
                 )?;
             }
             let _ = finalize_service_loop_state(&mut nt_handler);
-            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
             let received = receive(
                 &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
             )?;
@@ -770,7 +771,7 @@ pub(super) unsafe fn syscall_tail(
                 )?;
             }
             let _ = finalize_service_loop_state(&mut nt_handler);
-            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
             let received = receive(
                 &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
             )?;
@@ -851,7 +852,7 @@ pub(super) unsafe fn syscall_tail(
                 )?;
             }
             let _ = finalize_service_loop_state(&mut nt_handler);
-            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
             let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                 &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
             )?;
@@ -909,7 +910,7 @@ pub(super) unsafe fn syscall_tail(
                 )?;
             }
             let _ = finalize_service_loop_state(&mut nt_handler);
-            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
             let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                 &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
             )?;
@@ -929,7 +930,7 @@ pub(super) unsafe fn syscall_tail(
     // an IRP. Transfer the live syscall reply into the FIFO acquisition owner.
     if sc.synchronous_file_wait_parked {
         let _ = finalize_service_loop_state(&mut nt_handler);
-        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+        let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
         let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
             &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
         )?;
@@ -960,7 +961,7 @@ pub(super) unsafe fn syscall_tail(
             &mut nt_handler,
         );
         let _ = finalize_service_loop_state(&mut nt_handler);
-        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+        let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
         let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
             &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
         )?;
@@ -989,7 +990,7 @@ pub(super) unsafe fn syscall_tail(
             &mut nt_handler,
         );
         let _ = finalize_service_loop_state(&mut nt_handler);
-        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+        let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
         let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
             &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
         )?;
@@ -1008,7 +1009,7 @@ pub(super) unsafe fn syscall_tail(
                     &mut lp.parks, nt_handler, &mut lp.exit, lp.msg.badge, pi, resume_ip,
                 )?;
                 let _ = finalize_service_loop_state(&mut nt_handler);
-                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                     &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
                 )?;
@@ -1030,7 +1031,7 @@ pub(super) unsafe fn syscall_tail(
                     &mut lp.parks, nt_handler, &mut lp.exit, lp.msg.badge, pi, resume_ip,
                 )?;
                 let _ = finalize_service_loop_state(&mut nt_handler);
-                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                     &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
                 )?;
@@ -1052,7 +1053,7 @@ pub(super) unsafe fn syscall_tail(
                     &mut lp.parks, nt_handler, &mut lp.exit, lp.msg.badge, pi, resume_ip,
                 )?;
                 let _ = finalize_service_loop_state(&mut nt_handler);
-                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                     &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
                 )?;
@@ -1093,7 +1094,7 @@ pub(super) unsafe fn syscall_tail(
         let _ = file_cleanup_redrive_all(&mut nt_handler);
         if wait_for_completion {
             let _ = finalize_service_loop_state(&mut nt_handler);
-            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
             let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                 &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
             )?;
@@ -1123,7 +1124,7 @@ pub(super) unsafe fn syscall_tail(
             // completes the exact parked `NtClose` instead of waiting for another event.
             let _ = file_cleanup_redrive_all(&mut nt_handler);
             let _ = finalize_service_loop_state(&mut nt_handler);
-            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
             let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                 &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
             )?;
@@ -1158,7 +1159,7 @@ pub(super) unsafe fn syscall_tail(
         let _ = file_cleanup_redrive_all(&mut nt_handler);
         let _ = file_irp_drain_redrive_all(&mut nt_handler);
         let _ = finalize_service_loop_state(&mut nt_handler);
-        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+        let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
         let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
             &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
         )?;
@@ -1202,7 +1203,7 @@ pub(super) unsafe fn syscall_tail(
                 &mut lp.parks, nt_handler, &mut lp.exit, lp.msg.badge, pi, resume_ip,
             )?;
             let _ = finalize_service_loop_state(&mut nt_handler);
-            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
             let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                 &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
             )?;
@@ -1247,7 +1248,7 @@ pub(super) unsafe fn syscall_tail(
         crate::current_apc::release_tail(&mut nt_handler, identity);
         crate::current_apc::redrive(&mut nt_handler);
         let _ = finalize_service_loop_state(&mut nt_handler);
-        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+        let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
         let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
             &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
         )?;
@@ -1335,7 +1336,7 @@ pub(super) unsafe fn syscall_tail(
     } else if reply_main == 0 {
         // Pre-retype (demo path): no reply objects exist yet, legacy `reply_to` it is.
         (reply_receive(
-            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (REPLY_MAIN_SLOT.load(Ordering::Relaxed), len, r0, 0, 0, 0),
+            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (local().reply_main_slot.load(Ordering::Relaxed), len, r0, 0, 0, 0),
         )?, true)
     } else {
         // Current APC delivery owns its saved Reply independently and bypasses this tail.

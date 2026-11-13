@@ -9,6 +9,7 @@
 use super::loop_flow::*;
 use super::loop_receive::{receive, reply_receive};
 use super::*;
+use crate::executor::local;
 
 #[inline(never)]
 pub(super) unsafe fn cpu_exception(
@@ -37,7 +38,7 @@ pub(super) unsafe fn cpu_exception(
                 pfilled[pi] = *filled_pages;
                 let (nb, nmi, nm0, nm1, nm2, nm3) =
                     reply_receive(
-                        &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (REPLY_MAIN_SLOT.load(Ordering::Relaxed), 3, fip + 3, lp.msg.m1, lp.msg.m2, 0),
+                        &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || (local().reply_main_slot.load(Ordering::Relaxed), 3, fip + 3, lp.msg.m1, lp.msg.m2, 0),
                     )?;
                 lp.msg.badge = nb;
                 lp.msg.mi = nmi;
@@ -257,7 +258,7 @@ pub(super) unsafe fn cpu_exception(
         }
         let (nb, nmi, nm0, nm1, nm2, nm3) =
             receive(
-                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
             )?;
         lp.msg.badge = nb;
         lp.msg.mi = nmi;

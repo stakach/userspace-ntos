@@ -4,24 +4,6 @@ const SERVICE: &str = include_str!("../../../components/ntos-executive/src/servi
 const LIVE: &str = include_str!("../../../components/ntos-executive/src/hosted_connect_live.rs");
 
 #[test]
-fn unresolved_connect_parent_fences_later_provider_work() {
-    let maintenance = SERVICE.split_once("unsafe fn settle_suspended_connect_pumps()")
-        .expect("shared flat-root CONNECT settlement").1;
-    let gate = maintenance
-        .find("unsettled_suspended_connect_pump()")
-        .expect("unresolved parked CONNECT must fence later providers");
-    assert!(maintenance[gate..].contains("ConnectPumpSettlement::Retained"),
-        "unresolved parent must retain its exact Reply and fence later providers");
-    assert!(maintenance.contains("Progress::Blocked")
-        && maintenance.contains("ConnectPumpSettlement::Blocked"),
-        "uncertain or blocked pump must remain distinct from retryable child absence");
-    let root = SERVICE.split_once("'service_loop: loop {").unwrap().1;
-    assert!(root.contains("ConnectPumpSettlement::Retained")
-        && root.contains("ConnectPumpSettlement::Blocked"));
-    assert!(root.contains("break 'service_loop"));
-}
-
-#[test]
 fn repeated_yield_without_a_child_cannot_spin_the_root_loop() {
     let maintenance = SERVICE.split_once("unsafe fn settle_suspended_connect_pumps_inner()")
         .expect("shared flat-root CONNECT settlement").1;

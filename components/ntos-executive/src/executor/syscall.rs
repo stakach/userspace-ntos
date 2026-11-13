@@ -3,6 +3,7 @@
 use super::loop_flow::*;
 use super::loop_receive::receive;
 use super::*;
+use crate::executor::local;
 
 /// What the syscall prelude establishes for the routes and the tail: the caller's resume
 /// coordinates, the selected table entry and the trace state of this call.
@@ -213,7 +214,7 @@ pub(super) unsafe fn syscall(
     {
         // An uncertain earlier retry is not a fresh File acquisition. Reject only this
         // new request; its distinct main Reply cannot retire the old grant or reply.
-        let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+        let reply_main = local().reply_main_slot.load(Ordering::Relaxed);
         assert!(reply_parked_syscall(reply_main, 0xC000_00A3),
             "retained File retry ingress refusal lost its new reply");
         // Once this request has been refused, its IPC words are no longer needed.
@@ -224,7 +225,7 @@ pub(super) unsafe fn syscall(
         crate::pending_file_apc::redrive(&mut nt_handler);
         crate::current_apc::redrive(&mut nt_handler);
         inline_file_retirement::redrive(&mut nt_handler);
-        let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+        let reply_main = local().reply_main_slot.load(Ordering::Relaxed);
         let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
             &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || reply_main,
         )?;
@@ -358,7 +359,7 @@ pub(super) unsafe fn syscall(
                     procs[pi].first = lp.exit.first;
                     procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
-                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                         &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
                     )?;
@@ -373,7 +374,7 @@ pub(super) unsafe fn syscall(
                 print_str(
                     b"[user-callback] unable to defer out-of-order NtCallbackReturn -> STATUS_INSUFFICIENT_RESOURCES\n",
                 );
-                let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let reply_main = local().reply_main_slot.load(Ordering::Relaxed);
                 reply_parked_syscall(reply_main, 0xC000_009A);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                     &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || reply_main,
@@ -390,7 +391,7 @@ pub(super) unsafe fn syscall(
                 let Some(callback_reply_reservation) =
                     root_reply_park::RootReplyReservation::before_native()
                 else {
-                    let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let reply_main = local().reply_main_slot.load(Ordering::Relaxed);
                     reply_parked_syscall(reply_main, nt_process::STATUS_INSUFFICIENT_RESOURCES as u64);
                     let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                         &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || reply_main,
@@ -415,7 +416,7 @@ pub(super) unsafe fn syscall(
                     } = completion {
                         let _ = provider_reply_cap; // The provider owner records an uncertain zero Reply.
                         assert!(win32k_glue::retain_callback_outer_reply(
-                            lane, callback_token, REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                            lane, callback_token, local().reply_main_slot.load(Ordering::Relaxed),
                         ), "refused callback lost its two exact Reply owners");
                         assert!(callback_reply_reservation.commit(),
                             "reserved callback Reply replacement lost its exact lease");
@@ -424,7 +425,7 @@ pub(super) unsafe fn syscall(
                         procs[pi].ntfaults = lp.exit.ntfaults;
                         pfilled[pi] = *filled_pages;
                         let _ = finalize_service_loop_state(&mut nt_handler);
-                        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                        let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                             &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
                         )?;
@@ -507,7 +508,7 @@ pub(super) unsafe fn syscall(
                                 )?;
                             }
                             let _ = finalize_service_loop_state(&mut nt_handler);
-                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
                             let (nb, nmi, nm0, nm1, nm2, nm3) =
                                 receive(
                                     &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
@@ -546,7 +547,7 @@ pub(super) unsafe fn syscall(
                                 )?;
                             }
                             let _ = finalize_service_loop_state(&mut nt_handler);
-                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
                             let (nb, nmi, nm0, nm1, nm2, nm3) =
                                 receive(
                                     &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
@@ -570,7 +571,7 @@ pub(super) unsafe fn syscall(
                             };
                             assert!(receive_admit_retained(
                                 pending,
-                                REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                                local().reply_main_slot.load(Ordering::Relaxed),
                                 Some(ComponentCallbackTransfer {
                                     token: callback_token,
                                     context: callback_context,
@@ -589,7 +590,7 @@ pub(super) unsafe fn syscall(
                                 )?;
                             }
                             let _ = finalize_service_loop_state(&mut nt_handler);
-                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
                             let (nb, nmi, nm0, nm1, nm2, nm3) =
                                 receive(
                                     &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
@@ -613,7 +614,7 @@ pub(super) unsafe fn syscall(
                             };
                             assert!(service_wait_admit_retained(
                                 pending,
-                                REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                                local().reply_main_slot.load(Ordering::Relaxed),
                                 Some(ComponentCallbackTransfer {
                                     token: callback_token,
                                     context: callback_context,
@@ -632,7 +633,7 @@ pub(super) unsafe fn syscall(
                                 )?;
                             }
                             let _ = finalize_service_loop_state(&mut nt_handler);
-                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let new_reply = local().reply_main_slot.load(Ordering::Relaxed);
                             let (nb, nmi, nm0, nm1, nm2, nm3) =
                                 receive(
                                     &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || new_reply,
@@ -658,7 +659,7 @@ pub(super) unsafe fn syscall(
                     procs[pi].first = lp.exit.first;
                     procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
-                    let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let reply_main = local().reply_main_slot.load(Ordering::Relaxed);
                     let restarted = win32k_glue::restart_staged_user_callback_context(
                         staged_context,
                         reply_main,
@@ -773,11 +774,11 @@ pub(super) unsafe fn syscall(
         Ok(ingress) => ingress,
         Err(_) => {
             // A mismatched request cannot consume an existing thread's grant.
-            let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let reply_main = local().reply_main_slot.load(Ordering::Relaxed);
             assert!(reply_parked_syscall(reply_main, 0xC000_00A3),
                 "File ingress refusal lost its new reply");
             synchronous_file_cancellation::redrive(&mut nt_handler);
-            let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let reply_main = local().reply_main_slot.load(Ordering::Relaxed);
             let (nb, nmi, nm0, nm1, nm2, nm3) = receive(
                 &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || reply_main,
             )?;

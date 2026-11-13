@@ -10,6 +10,7 @@
 
 use super::loop_receive::receive;
 use super::*;
+use crate::executor::local;
 
 /// The admitted event of one turn: who sent it, which roles that thread has and the
 /// geometry of its process. Admission builds it once; the arms read it.
@@ -61,17 +62,17 @@ pub(super) unsafe fn admit<'a>(
     if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
         && !ingress.as_ref().is_some_and(|admitted| {
             crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_is_current(
-                admitted.binding(), REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                admitted.binding(), local().reply_main_slot.load(Ordering::Relaxed),
             )
         })
     {
         if ingress.is_some() {
             crate::spawn_hosts::shared_ingress::owner::runtime::defer_hosted_delivery(
-                REPLY_MAIN_SLOT.load(Ordering::Relaxed), lp.msg.badge,
+                local().reply_main_slot.load(Ordering::Relaxed), lp.msg.badge,
             ).expect("unexecuted unrelated Call retains its exact ingress owner");
         }
         let received = receive(
-            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+            &mut lp.ingress, nt_handler, &mut lp.exit, fault_ep, || local().reply_main_slot.load(Ordering::Relaxed),
         )?;
         (lp.msg.badge, lp.msg.mi, lp.msg.m0, lp.msg.m1, lp.msg.m2, lp.msg.m3) = received;
         return ControlFlow::Break(Turn::Next);
@@ -113,7 +114,7 @@ pub(super) unsafe fn admit<'a>(
     if event_layout.is_none() { return ControlFlow::Break(lp.reject_hosted_ingress()) }
     if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
         let observed = crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_observation(
-            event_runtime.binding(), REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+            event_runtime.binding(), local().reply_main_slot.load(Ordering::Relaxed),
         ).expect("selected Receive child owns its exact fault observation");
         assert!(receive_vspace::validate_current(&nt_handler, event_runtime.binding(), observed),
             "Receive child and held provider require exact distinct current VSpace objects");
@@ -148,7 +149,7 @@ pub(super) unsafe fn admit<'a>(
             return ControlFlow::Break(Turn::Exit);
         }
         let outcome = crate::executive_ingress::reply_receive(
-            REPLY_MAIN_SLOT.load(Ordering::Relaxed), 0, 0, 0, 0, 0,
+            local().reply_main_slot.load(Ordering::Relaxed), 0, 0, 0, 0, 0,
         );
         match outcome {
             crate::executive_ingress::ReceiveOutcome::OuterBoundary(boundary) => {

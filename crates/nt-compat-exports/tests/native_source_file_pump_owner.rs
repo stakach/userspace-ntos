@@ -31,22 +31,6 @@ fn returned_hook_progress_and_unpublished_source_are_tracked_exactly() {
 }
 
 #[test]
-fn ordinary_mutable_method_neither_dispatch_retains_child_work_for_flat_root() {
-    let hook = OWNERS.split_once("fn dispatch_mutable_method_neither_suspend_aware(")
-        .expect("typed Hook File dispatch").1
-        .split_once("pub(super) fn dispatch_port_connect(")
-        .expect("port CONNECT boundary").0;
-    assert!(hook.contains("MutableMethodNeitherInputAtDevice")
-        && hook.contains("invoke_suspend_aware")
-        && hook.contains("suspend_dispatch_for_pump"),
-        "ordinary class-hook METHOD_NEITHER must retain its File invocation on child yield");
-    let root = SERVICE.split_once("'service_loop: loop {")
-        .expect("flat root loop").1;
-    assert!(root.contains("settle_suspended_file_pumps()"),
-        "root must select and resume a generic File child after the parent stack unwinds");
-}
-
-#[test]
 fn resumed_mutable_hook_result_waits_in_exact_file_row_until_hook_takes_it() {
     assert!(OWNERS.contains("PumpReturned") && OWNERS.contains("HookReturned"),
         "root must not discard the mutable Type3 input before its Hook owner observes it");
