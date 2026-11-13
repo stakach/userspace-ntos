@@ -178,9 +178,21 @@ pub(crate) unsafe fn refuse_unentered_native_snapshot_io(
             crate::registry_mutation_work::refuse_unentered_native_wal_io(work_id, request, status),
         SnapshotOwnerToken::RelationWal { claim } =>
             crate::driver_launch::refuse_unentered_native_relation_wal(claim.owner, claim.request, status),
-        SnapshotOwnerToken::Storage(ticket) => snapshot_storage::refuse_unentered_storage_io(ticket, status),
+        SnapshotOwnerToken::Storage(ticket) => {
+            let refusal = snapshot_storage::refuse_unentered_storage_io(ticket, status);
+            wake_settled_header_recheck_owner();
+            refusal
+        }
         SnapshotOwnerToken::Checkpoint(ticket) => super::native_checkpoint::refuse_unentered(ticket, status),
         SnapshotOwnerToken::Fold(ticket) => super::system_wal_fold::native::refuse_unentered(ticket, status),
+    }
+}
+
+/// A registry mutation refused at storage admission waits for its header recheck, not for
+/// its retry delay. Once the recheck has a terminal state, ready that exact row.
+unsafe fn wake_settled_header_recheck_owner() {
+    if let Some(id) = snapshot_storage::settled_header_recheck_id() {
+        crate::registry_mutation_work::wake_header_recheck_waiter(id);
     }
 }
 
@@ -193,7 +205,11 @@ pub(crate) unsafe fn complete_native_snapshot_io(
             crate::registry_mutation_work::complete_native_wal_io(work_id, request, result),
         SnapshotOwnerToken::RelationWal { claim } =>
             crate::driver_launch::complete_native_relation_wal_io(claim.owner, claim.request, result),
-        SnapshotOwnerToken::Storage(ticket) => snapshot_storage::complete_storage_io(ticket, result),
+        SnapshotOwnerToken::Storage(ticket) => {
+            let completion = snapshot_storage::complete_storage_io(ticket, result);
+            wake_settled_header_recheck_owner();
+            completion
+        }
         SnapshotOwnerToken::Checkpoint(ticket) => super::native_checkpoint::complete(ticket, result),
         SnapshotOwnerToken::Fold(ticket) => super::system_wal_fold::native::complete(ticket, result),
     }

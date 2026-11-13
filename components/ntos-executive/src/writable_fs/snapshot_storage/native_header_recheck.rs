@@ -56,6 +56,15 @@ pub(crate) fn recheck_was_aborted_no_effect(id: u64) -> bool {
     id != 0 && LAST_NO_EFFECT_ABORT_ID.load(Ordering::Acquire) == id
 }
 
+/// The pending recheck's identity once it can enter no further native read: its proof is
+/// ready, or it failed or was aborted. Its waiting owner can then act without polling.
+pub(crate) unsafe fn settled_header_recheck_id() -> Option<u64> {
+    let owner = (&*core::ptr::addr_of!(PENDING_HEADER)).as_ref()?;
+    (owner.failed.is_some()
+        || matches!(&owner.state, HeaderState::Ready(_) | HeaderState::Aborted))
+        .then_some(owner.id)
+}
+
 /// Move the mounted proof and exact reserve lease into one asynchronous recheck owner.
 /// A refused admission restores the original proof before any native effect enters.
 pub(crate) unsafe fn begin_wal_continuation_recheck() -> Result<u64, u32> {

@@ -952,6 +952,20 @@ fn wake_mutation_row(work: &mut Work) {
     NEXT.store(now, Ordering::Release);
 }
 
+/// The native header recheck retained by a storage admission reached a terminal state: that
+/// is what its refused row waits for. Ready the exact row now; `RETRY_DELAY` remains the
+/// bound when no row is found, such as one a running redrive has taken out of the table.
+pub(crate) unsafe fn wake_header_recheck_waiter(recheck_id: u64) {
+    let rows = &mut *core::ptr::addr_of_mut!(WORK);
+    let waiter = nt_config_client::mutation_retry_schedule::header_recheck_waiter(
+        rows.len(), recheck_id,
+        |index| rows[index].as_ref().and_then(|work| work.persistence.admission_recheck_id()),
+    );
+    if let Some(work) = waiter.and_then(|index| rows[index].as_mut()) {
+        wake_mutation_row(work);
+    }
+}
+
 pub(crate) fn redrive_active() -> bool {
     ACTIVE.load(Ordering::Acquire)
 }
