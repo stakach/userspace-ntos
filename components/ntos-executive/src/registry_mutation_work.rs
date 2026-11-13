@@ -1389,7 +1389,7 @@ pub(crate) fn wake_due(now: u64) -> u64 {
 
 /// Top-level only. The selected owner is moved, never borrowed, across component IPC.
 pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler, queue: &mut nt_delay_execution::Queue) {
-    redrive_inner(Some((handler, queue)));
+    redrive_inner(Some((handler, queue)), None);
 }
 
 /// Bootstrap and provider pumps may progress provider work without inventing a hosted handler.
@@ -1397,21 +1397,21 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler, queue: &mut nt_delay_e
 pub(crate) unsafe fn redrive_provider() -> bool {
     // Keep the common empty/already-running path out of redrive_inner's large Work frame.
     // Nested hosted pumps can reach this call several times on the rootserver stack.
-    if PENDING.load(Ordering::Acquire) == 0
-        || monotonic_time_100ns() < NEXT.load(Ordering::Acquire)
-        || ACTIVE.load(Ordering::Acquire)
-    {
+    if PENDING.load(Ordering::Acquire) == 0 { return false; }
+    let now = monotonic_time_100ns();
+    if now < NEXT.load(Ordering::Acquire) || ACTIVE.load(Ordering::Acquire) {
         return false;
     }
-    redrive_inner(None)
+    redrive_inner(None, Some(now))
 }
 
 #[inline(never)]
-unsafe fn redrive_inner(mut context: HostedContext<'_>) -> bool {
-    if PENDING.load(Ordering::Acquire) == 0
-        || monotonic_time_100ns() < NEXT.load(Ordering::Acquire)
-        || ACTIVE.swap(true, Ordering::AcqRel)
-    {
+unsafe fn redrive_inner(mut context: HostedContext<'_>, gate_time: Option<u64>) -> bool {
+    if PENDING.load(Ordering::Acquire) == 0 { return false; }
+    // One reading gates the retry and selects the ready row. Only memory operations run
+    // between the caller's gate, this gate and the selection, so they share it.
+    let now = gate_time.unwrap_or_else(|| monotonic_time_100ns());
+    if now < NEXT.load(Ordering::Acquire) || ACTIVE.swap(true, Ordering::AcqRel) {
         return false;
     }
     let _durable = allocator::enter_durable();
@@ -1422,7 +1422,7 @@ unsafe fn redrive_inner(mut context: HostedContext<'_>) -> bool {
         let rows = &mut *core::ptr::addr_of_mut!(WORK);
         let count = rows.len();
         let start = CURSOR.load(Ordering::Relaxed) as usize;
-        select_ready_mutation(rows, start, monotonic_time_100ns(), context.is_none())
+        select_ready_mutation(rows, start, now, context.is_none())
             .and_then(|index| rows[index].take().map(|work| (index, work)))
     };
     if let Some((index, mut work)) = selected {
