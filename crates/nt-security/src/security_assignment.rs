@@ -85,6 +85,29 @@ fn descriptor(bytes: Option<&[u8]>) -> Result<Option<ParsedDescriptor<'_>>, u32>
     Ok(parsed)
 }
 
+/// LiberNT's `ObpSaclHasAuditAces` requests ACCESS_SYSTEM_SECURITY only when
+/// the caller's explicit SACL contains an ACE other than a mandatory label.
+/// Inspect the creator bytes, not the selected/inherited ACL: an audit ACE
+/// remains privilege-requiring even if assignment would filter it later.
+fn explicit_sacl_requires_security_privilege(
+    creator: Option<&ParsedDescriptor<'_>>,
+) -> Result<bool, u32> {
+    let Some(sacl) = creator.and_then(|descriptor| descriptor.sacl) else {
+        return Ok(false);
+    };
+    let sacl = crate::NativeAcl::validated_prefix(sacl)
+        .map_err(|error| error.status())?;
+    let mut offset = 8usize;
+    for _ in 0..u16::from_le_bytes(sacl[4..6].try_into().unwrap()) {
+        let size = u16::from_le_bytes(sacl[offset + 2..offset + 4].try_into().unwrap()) as usize;
+        if sacl[offset] != 0x11 {
+            return Ok(true);
+        }
+        offset += size;
+    }
+    Ok(false)
+}
+
 fn sid_bytes(sid: &Sid, invalid: u32) -> Result<Vec<u8>, u32> {
     let length = sid.native_len().ok_or(invalid)?;
     let mut bytes = Vec::new();
@@ -222,7 +245,9 @@ pub fn assign_object_security_with_audit(
         let subject_can_act = request
             .client
             .is_none_or(|client| client.level >= SecurityImpersonationLevel::Impersonation);
-        if sacl.explicit && flags & SEF_AVOID_PRIVILEGE_CHECK == 0 {
+        if sacl.explicit && flags & SEF_AVOID_PRIVILEGE_CHECK == 0
+            && explicit_sacl_requires_security_privilege(creator.as_ref())?
+        {
             let granted = subject_can_act && effective.has_privilege(SE_SECURITY);
             audit.security = Some(if granted {
                 SecurityAssignmentPrivilegeOutcome::Granted

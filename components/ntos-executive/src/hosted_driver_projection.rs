@@ -87,7 +87,10 @@ pub(crate) unsafe fn create_hosted_device_projection(
 /// The caller is responsible for checking canonical I/O Manager lifetime first. This only mutates the
 /// hosted driver's local WDM list (`DriverObject->DeviceObject` / `DeviceObject->NextDevice`) and
 /// returns the allocation to the hosted pool.
-pub(crate) unsafe fn delete_hosted_device_projection(device_object: u64, free: unsafe fn(u64)) {
+pub(crate) unsafe fn delete_hosted_device_projection(
+    projection: HostedDeviceProjection, free: unsafe fn(u64),
+) {
+    let device_object = projection.device_object;
     if device_object == 0 {
         return;
     }

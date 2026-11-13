@@ -9,12 +9,16 @@ fn nested_connect_redrive_requires_targeted_io_queue_drain() {
         redrive.contains("drain_hosted_connect_io_work_item("),
         "pending CONNECT must drive the exact provider's queued IO work"
     );
-    let helper = &driver[driver
+    let candidate = &driver[driver
+        .find("unsafe fn hosted_connect_io_work_candidate(")
+        .expect("exact nested I/O candidate")..];
+    let candidate = candidate.split_once("\nunsafe fn ").unwrap().0;
+    assert!(candidate.contains("ready_for_admission"));
+    assert!(candidate.contains("HOSTED_WORK_QUEUE_KIND_IO"));
+    let drain = &driver[driver
         .find("unsafe fn drain_hosted_connect_io_work_item(")
         .expect("targeted nested I/O drain")..];
-    let end = helper.find("\nunsafe fn ").unwrap();
-    let helper = &helper[..end];
-    assert!(helper.contains("ready_for_admission"));
-    assert!(helper.contains("HOSTED_WORK_QUEUE_KIND_IO"));
-    assert!(helper.contains("HostedWorkQueueDrainGuard::enter"));
+    let drain = drain.split_once("\nunsafe fn ").unwrap().0;
+    assert!(drain.contains("hosted_connect_io_work_candidate("));
+    assert!(drain.contains("HostedWorkQueueDrainGuard::enter"));
 }

@@ -8,9 +8,7 @@
 
 use crate::*;
 
-use nt_object_manager::ClientKind;
 use nt_object_server::Server;
-use nt_types::AccessMode;
 use surt_sel4::surt_core::surt_abi::{SurtCqe, SurtSqe};
 use surt_sel4::surt_core::{Consumer, Producer};
 use surt_sel4::{drain_blocking, Sel4Notify};
@@ -33,7 +31,7 @@ pub unsafe extern "C" fn server_entry() -> ! {
         Ok(s) => s,
         Err(_) => park(),
     };
-    let client = server.connect(ClientKind::NativeUser, AccessMode::UserMode);
+    let client = server.connect_executive();
 
     let _ = drain_blocking(&mut submissions, &wait_requests, |sqe: &SurtSqe| {
         // SAFETY: single request in flight; the ring push/pop pairs order the

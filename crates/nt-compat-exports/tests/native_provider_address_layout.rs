@@ -48,3 +48,24 @@ fn provider_section_views_do_not_overlap_the_reserved_component_heap() {
     assert_eq!(start % value("TABLE_SIZE"), 0);
     assert!(start < value("VIEW_END"));
 }
+
+#[test]
+fn root_heap_has_headroom_for_native_system_fold_staging() {
+    let allocator = syn::parse_file(include_str!("../../../components/ntos-executive/src/allocator.rs")).unwrap();
+    let mut constants = HashMap::new();
+    for item in allocator.items {
+        if let Item::Const(item) = item {
+            constants.insert(item.ident.to_string(), *item.expr);
+        }
+    }
+    let value = |name: &str| evaluate(&constants[name], &constants);
+    let durable_bytes = (value("HEAP_FRAMES") - value("EXECUTIVE_TRANSIENT_HEAP_FRAMES")) * 0x1000;
+    // The live LiberNT fold reached a 61,424,896-byte bump before allocating its
+    // 1,792,428-byte SYSTEM image. Reserve room for that image, a second snapshot,
+    // and subsequent boot work rather than admitting the fold at the terminal page.
+    const OBSERVED_BUMP: u64 = 61_424_896;
+    const SYSTEM_IMAGE: u64 = 1_792_428;
+    const SNAPSHOT: u64 = 2_921_809;
+    const BOOT_HEADROOM: u64 = 8 * 1024 * 1024;
+    assert!(durable_bytes >= OBSERVED_BUMP + SYSTEM_IMAGE + SNAPSHOT + BOOT_HEADROOM);
+}

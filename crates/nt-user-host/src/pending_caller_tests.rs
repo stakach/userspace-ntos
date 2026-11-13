@@ -72,6 +72,55 @@ fn reserve_publish_and_removal_enforce_exact_phases() {
 }
 
 #[test]
+fn checked_publication_keeps_reserved_owner_on_caller_mismatch() {
+    let (_, binding, caller) = caller();
+    let mut table = PendingCallerTable::new();
+    let key = key(0);
+    table.reserve(0, key, caller).unwrap();
+    let different = ProviderLogicalCaller::capture(
+        ThreadBinding {
+            badge: binding.badge + 1,
+            ..binding
+        },
+        caller.thread(),
+    )
+    .unwrap();
+    assert_ne!(different, caller);
+    assert_eq!(
+        table.publish_checked(0, key, different, |_| true),
+        Err(PendingCallerError::CallerMismatch)
+    );
+    assert_eq!(
+        table.publish_checked(0, key, caller, |stored| stored.badge()
+            == caller.badge() + 1),
+        Err(PendingCallerError::CallerMismatch)
+    );
+    assert_eq!(table.get_reserved(0, key), Some(caller));
+    assert_eq!(table.get_published(0, key), None);
+    assert_eq!(
+        table.publish_checked(0, key, caller, |stored| stored.badge() == caller.badge()),
+        Ok(caller)
+    );
+    assert_eq!(table.get_published(0, key), Some(caller));
+    assert_eq!(
+        table.publish_checked(0, key, caller, |_| true),
+        Err(PendingCallerError::InvalidPhase)
+    );
+    assert_eq!(
+        table.publish_checked(
+            0,
+            Key {
+                generation: 2,
+                ..key
+            },
+            caller,
+            |_| true
+        ),
+        Err(PendingCallerError::WrongKey)
+    );
+}
+
+#[test]
 fn failed_or_cancelled_publication_does_not_replace_provenance() {
     let (_, _, caller) = caller();
     let mut table = PendingCallerTable::new();

@@ -32,7 +32,7 @@
 //! - [`trap_stubs`] — the full `Nt*` trap-stub body set, macro-generated (`mov r10,rcx;
 //!   mov eax,<ssn>; syscall; ret`), target-only asm with host-tested generation coverage.
 //! - [`marshal`] — arity-driven **argument marshalling** for the non-trap backends (seL4/SURT must
-//!   gather the >4-arg stack tail into an IPC message; host-tested, incl. the widest 14-arg service).
+//!   gather the >4-arg stack tail into an IPC message; host-tested, incl. the widest 17-arg service).
 //! - [`csr`] — the `Csr*` CSR client (CSR_API_MESSAGE + capture-buffer marshalling over
 //!   [`nt_port_core`]; the port send is the honest LPC seam).
 //! - [`dbg`] — the `Dbg*` debug surface (formatting + component/level filtering host-tested; the
@@ -69,12 +69,14 @@ pub mod loader;
 pub mod marshal;
 pub mod native_call;
 pub mod nls;
+pub mod nls_file_mapping;
 pub use nt_printf as printf;
 pub mod rtl;
 pub mod stubs;
 pub mod sync;
 pub mod transport;
 pub mod trap_stubs;
+pub mod user_exit;
 
 /// `NTSTATUS` — the 32-bit status every `Nt*` stub returns in `rax` (`STATUS_SUCCESS` = 0).
 pub type NtStatus = u32;

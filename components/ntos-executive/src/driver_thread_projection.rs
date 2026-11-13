@@ -4,7 +4,11 @@ use super::*;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_component_suspension::{peer_registry::PeerRoute, LaneDispatchIdentity};
 use nt_process::{native_handle::NativeHandleCaller, STATUS_INVALID_HANDLE};
-use nt_user_host::provider_thread_projection::{ProjectionOwners, ThreadProjection};
+use nt_user_host::provider_thread_projection::{
+    ProjectionHoldReservation, ProjectionOwners, ThreadProjection,
+};
+
+pub(crate) type HoldReservation = ProjectionHoldReservation<PeerRoute, LaneDispatchIdentity>;
 
 static mut OWNERS: ProjectionOwners<PeerRoute, LaneDispatchIdentity> = ProjectionOwners::new();
 
@@ -74,13 +78,22 @@ pub(crate) unsafe fn enter(channel: &crate::spawn_hosts::PumpChannel,
     Ok(())
 }
 
-/// Called after the exact parent's physical execution hold was acquired.
-pub(crate) unsafe fn hold(route: PeerRoute, dispatch: LaneDispatchIdentity) -> Result<(), u32> {
-    if primary(route)?.is_none() { return Ok(()); }
-    if !(&mut *core::ptr::addr_of_mut!(OWNERS)).hold(route, dispatch)? {
-        return Err(STATUS_INVALID_HANDLE);
-    }
-    Ok(())
+/// Reserve the exact projection before the physical hold can enter the microkernel.
+pub(crate) unsafe fn prepare_hold(route: PeerRoute, dispatch: LaneDispatchIdentity)
+    -> Result<Option<HoldReservation>, u32> {
+    if primary(route)?.is_none() { return Ok(None); }
+    (&mut *core::ptr::addr_of_mut!(OWNERS)).prepare_hold(route, dispatch)
+}
+
+/// Publish only after seL4 acknowledges the hold; retain a refused lease with its owner.
+pub(crate) unsafe fn acknowledge_hold(reservation: HoldReservation)
+    -> Result<(), (u32, HoldReservation)> {
+    (&mut *core::ptr::addr_of_mut!(OWNERS)).acknowledge_hold(reservation)
+}
+
+pub(crate) unsafe fn cancel_hold_no_effects(reservation: HoldReservation)
+    -> Result<(), (u32, HoldReservation)> {
+    (&mut *core::ptr::addr_of_mut!(OWNERS)).cancel_hold_no_effects(reservation)
 }
 
 pub(crate) unsafe fn restore(route: PeerRoute, dispatch: LaneDispatchIdentity) -> Result<(), u32> {

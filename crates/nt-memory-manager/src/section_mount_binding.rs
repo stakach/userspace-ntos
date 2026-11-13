@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use super::SectionMountId;
+use super::{SectionFileIdentity, SectionMountId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SectionMountBindingError {
@@ -74,6 +74,31 @@ impl<K: Copy + Eq> SectionMountBindings<K> {
             .map(|binding| binding.mount)
     }
 
+    /// Translate a routed File identity only for the registered physical volume's exact live
+    /// device binding. This is a catalog lookup alias; the routed File identity stays unchanged.
+    /// The caller attests that the physical block source is already Draining or Native.
+    pub fn physical_file_alias(
+        &self,
+        routed_device: K,
+        routed_file: SectionFileIdentity,
+        physical_volume: Option<(SectionMountId, K)>,
+        physical_route_live: bool,
+    ) -> Option<SectionFileIdentity> {
+        let (physical_mount, registered_device) = physical_volume?;
+        if !physical_route_live
+            || routed_file.file_id == 0
+            || physical_mount.value() == 0
+            || registered_device != routed_device
+            || self.lookup(routed_device) != Some(routed_file.mount)
+        {
+            return None;
+        }
+        Some(SectionFileIdentity {
+            mount: physical_mount,
+            file_id: routed_file.file_id,
+        })
+    }
+
     pub fn cancel(&mut self, mount: SectionMountId) -> Result<(), SectionMountBindingError> {
         let index = self
             .bindings
@@ -103,7 +128,34 @@ impl<K: Copy + Eq> Default for SectionMountBindings<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SectionMountIds;
+    use crate::{SectionFileIdentity, SectionMountIds};
+
+    #[test]
+    fn physical_file_alias_requires_exact_live_device_mount_and_file() {
+        let mut ids = SectionMountIds::new();
+        let physical = ids.allocate().unwrap();
+        let mounted = ids.allocate().unwrap();
+        let other = ids.allocate().unwrap();
+        let mut bindings = SectionMountBindings::new();
+        bindings.reserve(mounted).unwrap();
+        bindings.reserve(other).unwrap();
+        bindings.publish(mounted, 41u64).unwrap();
+        bindings.publish(other, 42u64).unwrap();
+        let file = SectionFileIdentity { mount: mounted, file_id: 0x1234 };
+        let resolved = SectionFileIdentity { mount: physical, file_id: 0x1234 };
+        assert_eq!(bindings.physical_file_alias(41, file, Some((physical, 41)), true), Some(resolved));
+        assert_eq!(bindings.physical_file_alias(42, file, Some((physical, 41)), true), None);
+        assert_eq!(bindings.physical_file_alias(41, SectionFileIdentity { mount: other, ..file }, Some((physical, 41)), true), None);
+        assert_eq!(bindings.physical_file_alias(41, file, Some((physical, 42)), true), None);
+        assert_eq!(bindings.physical_file_alias(41, file, None, true), None);
+        assert_eq!(bindings.physical_file_alias(41, file, Some((physical, 41)), false), None);
+        assert_eq!(bindings.physical_file_alias(41, SectionFileIdentity { file_id: 0, ..file }, Some((physical, 41)), true), None);
+        assert_eq!(bindings.retire(41), Some(mounted));
+        assert_eq!(bindings.physical_file_alias(41, file, Some((physical, 41)), true), None);
+        bindings.reserve(mounted).unwrap();
+        bindings.publish(mounted, 43).unwrap();
+        assert_eq!(bindings.physical_file_alias(41, file, Some((physical, 41)), true), None);
+    }
 
     #[test]
     fn distinct_devices_cannot_share_one_mount_identity() {

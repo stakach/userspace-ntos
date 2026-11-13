@@ -199,7 +199,7 @@ pub struct ReturnedPnpBufferCatalog {
 impl ReturnedPnpBufferCatalog {
     pub fn new() -> Result<Self, ReturnedPnpBufferError> {
         let identity = NEXT_CATALOG
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| ReturnedPnpBufferError::Exhausted)?;

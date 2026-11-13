@@ -3,6 +3,16 @@
 use super::*;
 use nt_config_client::plan_rtl_registry_write;
 
+static RTL_WRITE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn trace_rtl_write(ordinal: u64, stage: u64, status: i32) {
+    if ordinal > 32 && !hosted_video_port_control::video_create_hw_initialize_active() { return; }
+    print_str(b"[rtl-registry-write-stage] ordinal="); print_u64(ordinal);
+    print_str(b" stage="); print_u64(stage);
+    print_str(b" status=0x"); print_hex_u64(status as u32 as u64);
+    print_str(b"\n");
+}
+
 /// Create/open the selected key, preserve the caller's exact value type and byte length, then
 /// close only the key opened here. The HANDLE form borrows the caller's existing key handle.
 pub(super) extern "win64" fn write_registry_value(
@@ -13,6 +23,8 @@ pub(super) extern "win64" fn write_registry_value(
     value_data: u64,
     value_length: u32,
 ) -> i32 {
+    let ordinal = RTL_WRITE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    trace_rtl_write(ordinal, 1, 0);
     unsafe {
         let path_ascii = if relative_to & 0x4000_0000 != 0 {
             None
@@ -54,6 +66,7 @@ pub(super) extern "win64" fn write_registry_value(
             Ok(target) => target,
             Err(status) => return status,
         };
+        trace_rtl_write(ordinal, 2, 0);
         let status = s_zw_set_value_key(
             handle,
             value_unicode.as_ptr() as u64,
@@ -62,9 +75,11 @@ pub(super) extern "win64" fn write_registry_value(
             value_data,
             plan.value_length,
         );
+        trace_rtl_write(ordinal, 3, status);
         if owned {
             let _ = s_zw_close(handle);
         }
+        trace_rtl_write(ordinal, 4, status);
         status
     }
 }

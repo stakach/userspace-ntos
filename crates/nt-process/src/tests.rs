@@ -3,6 +3,49 @@ use alloc::format;
 use nt_driver_test_fixtures::{minimal_pe, DEFAULT_IMAGE_BASE};
 
 #[test]
+fn boot_topology_sets_root_process_and_inherited_thread_affinity() {
+    let mut pm = ProcessManager::new_with_active_processor_count(4).unwrap();
+    let system = pm.create_process("System", None, None);
+    let system_thread = pm.create_thread(system, 0x1000, 0, true).unwrap();
+    let child = pm.create_process("child.exe", Some(system), None);
+    let child_thread = pm.create_thread(child, 0x2000, 0, false).unwrap();
+    for pid in [system, child] {
+        assert_eq!(
+            pm.query_process_basic(pid, u64::MAX).unwrap().affinity_mask,
+            0b1111
+        );
+    }
+    for (pid, tid) in [(system, system_thread), (child, child_thread)] {
+        assert_eq!(
+            pm.query_thread_basic(pid, tid, u64::MAX - 1)
+                .unwrap()
+                .affinity_mask,
+            0b1111
+        );
+    }
+    assert!(ProcessManager::new_with_active_processor_count(0).is_none());
+    assert!(ProcessManager::new_with_active_processor_count(65).is_none());
+    let mut max_pm = ProcessManager::new_with_active_processor_count(64).unwrap();
+    let max_pid = max_pm.create_process("max.exe", None, None);
+    assert_eq!(
+        max_pm
+            .query_process_basic(max_pid, u64::MAX)
+            .unwrap()
+            .affinity_mask,
+        u64::MAX
+    );
+    let mut legacy_pm = ProcessManager::new();
+    let legacy_pid = legacy_pm.create_process("legacy.exe", None, None);
+    assert_eq!(
+        legacy_pm
+            .query_process_basic(legacy_pid, u64::MAX)
+            .unwrap()
+            .affinity_mask,
+        1
+    );
+}
+
+#[test]
 fn client_ids_are_handle_shaped_and_globally_unique() {
     let mut pm = ProcessManager::new();
     let first_pid = pm.create_process("first.exe", None, None);
@@ -3803,12 +3846,14 @@ fn process_delete_readiness_leaves_impersonation_to_the_delete_procedure() {
     let blockers = pm.process_object_delete_blockers(pid).unwrap();
     assert_eq!(blockers.thread_impersonations, 1);
     assert!(blockers.delete_ready());
+    assert!(!pm.process_execution_retirement_ready(pid));
     assert_eq!(pm.delete_process_object_if_unreferenced(pid), None);
 
     assert_eq!(
         pm.replace_thread_impersonation(tid, None),
         Ok(Some(context))
     );
+    assert!(pm.process_execution_retirement_ready(pid));
     assert!(pm.delete_process_object_if_unreferenced(pid).is_some());
 }
 
@@ -3847,6 +3892,35 @@ fn process_object_delete_blockers_report_exact_reference_owners() {
         .process_object_delete_blockers(target)
         .unwrap()
         .delete_ready());
+}
+
+#[test]
+fn terminated_execution_can_retire_while_external_object_references_remain() {
+    let mut pm = ProcessManager::new();
+    let owner = pm.create_process("owner.exe", None, None);
+    let target = pm.create_process("target.exe", None, None);
+    let tid = pm.create_thread(target, 0x1000, 0, false).unwrap();
+    let process_handle = pm
+        .insert_handle(owner, HandleObject::Process(target), PROCESS_ALL_ACCESS)
+        .unwrap();
+    let thread_handle = pm
+        .insert_handle(owner, HandleObject::Thread(tid), THREAD_ALL_ACCESS)
+        .unwrap();
+    pm.retain_process_wait_reference(target).unwrap();
+    pm.retain_thread_wait_reference(tid).unwrap();
+    assert!(!pm.process_execution_retirement_ready(target));
+    pm.terminate_process(target, 0x55).unwrap();
+
+    assert!(pm.process_execution_retirement_ready(target));
+    assert!(!pm.process_object_delete_ready(target));
+    assert_eq!(pm.process_object_delete_blockers(target).unwrap().external_process_handles, 1);
+    assert_eq!(pm.process_object_delete_blockers(target).unwrap().external_thread_handles, 1);
+
+    pm.release_process_wait_reference(target).unwrap();
+    pm.release_thread_wait_reference(tid).unwrap();
+    pm.close_handle(owner, process_handle).unwrap();
+    pm.close_handle(owner, thread_handle).unwrap();
+    assert!(pm.process_object_delete_ready(target));
 }
 
 #[test]
@@ -4479,4 +4553,25 @@ fn process_create_ex_decodes_boolean_without_consuming_dirty_stack_padding() {
             .job_member_level,
         1
     );
+}
+
+#[test]
+fn initialized_child_wait_refs_pin_pre_spawn_lifetime_until_unentered_rollback() {
+    let mut pm = ProcessManager::new();
+    let child = pm.create_process("child.exe", None, None);
+    let main = pm.create_thread(child, 0, 0, false).unwrap();
+    pm.set_thread_state(main, ThreadState::Initialized).unwrap();
+    assert_eq!(pm.thread(main).unwrap().state, ThreadState::Initialized);
+    let lifetime = pm.thread_lifetime(main).unwrap();
+
+    pm.retain_process_wait_reference(child).unwrap();
+    pm.retain_thread_wait_reference(main).unwrap();
+    assert_eq!(pm.thread_lifetime(main), Some(lifetime));
+    assert!(pm.abort_process_creation(child).is_none(),
+        "the entered spawn owner must keep the initialized child alive");
+
+    pm.release_thread_wait_reference(main).unwrap();
+    pm.release_process_wait_reference(child).unwrap();
+    assert!(pm.abort_process_creation(child).is_some(),
+        "proven-unentered cleanup must release both exact wait references");
 }

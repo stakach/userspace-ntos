@@ -1,9 +1,13 @@
 //! Retained file-less win32k source IRPs dispatched to an exact canonical Device.
 
 use super::*;
+use core::sync::atomic::{AtomicU64, AtomicUsize};
 use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_io_manager::hosted_forward_target::HostedForwardTarget;
 use nt_io_manager::win32k_source_irp_ioctl_wire as wire;
+use nt_io_manager::source_terminal::{
+    NestedSourceDispatchEffect, NestedSourceSelection, NestedSourceWorkKey,
+};
 use nt_io_manager::kernel_irp_builder::{
     validate_kernel_irp_dispatch_cursor, KernelIrpDispatchHeader,
 };
@@ -11,6 +15,107 @@ use nt_io_manager::{WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IRP_SIZE};
 use nt_kernel_exec::{EventLeaseId, EventLeaseKind, EventObjectId, EventSignalMode};
 
 type Route = nt_component_suspension::peer_registry::PeerRoute;
+pub(crate) type NestedIoctlKey = NestedSourceWorkKey<Route, nt_component_suspension::LaneDispatchIdentity>;
+pub(crate) type NestedIoctlSelection =
+    NestedSourceSelection<Route, nt_component_suspension::LaneDispatchIdentity>;
+
+// The physical Parent retains the exact selection. These scalars prove that only its selected
+// Work's terminal transport is making the current dispatch, without borrowing the Work during
+// its mutable advance or aliasing the retained Parent row across nested native entry.
+static ACTIVE_NESTED_WORK: AtomicUsize = AtomicUsize::new(0);
+static mut ACTIVE_NESTED_KEY: Option<NestedIoctlKey> = None;
+static ACTIVE_NESTED_PACKET: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_NESTED_LENGTH: AtomicU64 = AtomicU64::new(0);
+
+struct ActiveNestedWork;
+
+impl ActiveNestedWork {
+    unsafe fn enter(key: NestedIoctlKey) -> Option<Self> {
+        if ACTIVE_NESTED_WORK.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return None;
+        }
+        core::ptr::write(core::ptr::addr_of_mut!(ACTIVE_NESTED_KEY), Some(key));
+        Some(Self)
+    }
+}
+
+impl Drop for ActiveNestedWork {
+    fn drop(&mut self) {
+        ACTIVE_NESTED_PACKET.store(0, Ordering::Release);
+        ACTIVE_NESTED_LENGTH.store(0, Ordering::Release);
+        unsafe { core::ptr::write(core::ptr::addr_of_mut!(ACTIVE_NESTED_KEY), None); }
+        ACTIVE_NESTED_WORK.store(0, Ordering::Release);
+    }
+}
+
+pub(crate) unsafe fn selected_nested_terminal_dispatch_matches(
+    key: NestedIoctlKey, packet: u64, length: u64,
+) -> bool {
+    ACTIVE_NESTED_WORK.load(Ordering::Acquire) != 0
+        && core::ptr::read(core::ptr::addr_of!(ACTIVE_NESTED_KEY)) == Some(key)
+        && ACTIVE_NESTED_PACKET.load(Ordering::Acquire) == packet
+        && ACTIVE_NESTED_LENGTH.load(Ordering::Acquire) == length
+        && packet != 0 && length != 0
+}
+
+pub(crate) unsafe fn selected_nested_terminal_ready(key: NestedIoctlKey) -> bool {
+    (&*core::ptr::addr_of!(WORK)).iter().flatten()
+        .any(|work| work.nested_terminal_key() == Some(key)
+            && work.ready_for_nested_step())
+}
+
+unsafe fn dispatch_selected_source_ioctl_terminal(
+    packet: u64, length: u64,
+) -> crate::win32k_glue::SourceIoctlTerminalDispatch {
+    struct PacketPermit;
+    impl Drop for PacketPermit {
+        fn drop(&mut self) {
+            ACTIVE_NESTED_PACKET.store(0, Ordering::Release);
+            ACTIVE_NESTED_LENGTH.store(0, Ordering::Release);
+        }
+    }
+    let permit = if ACTIVE_NESTED_WORK.load(Ordering::Acquire) != 0 {
+        ACTIVE_NESTED_PACKET.store(packet, Ordering::Release);
+        ACTIVE_NESTED_LENGTH.store(length, Ordering::Release);
+        Some(PacketPermit)
+    } else { None };
+    let result = crate::win32k_glue::dispatch_source_ioctl_terminal(packet, length);
+    drop(permit);
+    result
+}
+
+pub(crate) enum NestedIoctlTerminalStep {
+    PreEntryRetained,
+    ReturnedNotReady,
+    ReturnedAwaitingAck,
+    PacketAckRetained,
+    Settled(SettledIoctlTerminal),
+    Indeterminate,
+}
+
+/// The source Work retired its Reply and resource owners after a validated terminal ACK.
+/// Only this move-only result can be considered a completed local child by a parent checkpoint.
+pub(crate) struct SettledIoctlTerminal {
+    key: NestedIoctlKey,
+    ack: super::hosted_source_terminal_packet::ValidatedTerminalAck,
+}
+
+impl SettledIoctlTerminal {
+    pub(crate) fn key(&self) -> NestedIoctlKey { self.key }
+    pub(crate) fn packet(&self) -> nt_io_manager::source_terminal::TerminalPacketIdentity {
+        self.ack.packet()
+    }
+}
+
+// SAFETY: the only constructor is in exact redrive after `Work::advance` returns done. For an
+// inline IOCTL, that requires a decoded matching terminal ACK, origin commit, Reply ACK, resource
+// release, and retirement of the same route/dispatch/Reply/token/source ticket. The ACK alone
+// never implements this trait and cannot authorize parent restoration.
+unsafe impl nt_component_suspension::NestedPreEntryChildReceipt<NestedIoctlKey>
+    for SettledIoctlTerminal
+{
+    fn child_key(&self) -> NestedIoctlKey { self.key }
+}
 const STATUS_CANCELLED: u32 = 0xc000_0120;
 
 struct RootSource {
@@ -208,10 +313,18 @@ struct Work {
     origin_armed: bool,
     terminal: Option<(u32, u64)>,
     output_captured: bool,
+    pool_map_handled: bool,
+    monitor_source: Option<crate::driver_launch::HostedVideoMonitorArray>,
+    monitor_projected: Option<crate::win32k_subsystem::RootProviderPoolAllocation>,
+    monitor_transfer: Option<MonitorPdoTransfer>,
+    monitor_source_retired: bool,
+    monitor_source_acknowledged: bool,
     terminal_claimed: bool,
     terminal_published: bool,
     terminal_packet: Option<super::hosted_source_terminal_packet::RetainedTerminalPacket>,
+    terminal_traced: bool,
     terminal_acknowledged: bool,
+    terminal_ack_receipt: Option<super::hosted_source_terminal_packet::ValidatedTerminalAck>,
     origin_committed: bool,
     discarding: bool,
     event_claimed: bool,
@@ -228,6 +341,57 @@ struct Work {
 static mut WORK: Vec<Option<Work>> = Vec::new();
 static mut EXECUTING: Vec<usize> = Vec::new();
 static CURSOR: AtomicU64 = AtomicU64::new(0);
+static TERMINAL_OWNER_TRACES: AtomicU64 = AtomicU64::new(0);
+
+struct MonitorArrayRow {
+    token: u64,
+    source: crate::driver_launch::HostedVideoMonitorArray,
+    projected: Option<crate::win32k_subsystem::RootProviderPoolAllocation>,
+    ownership: nt_io_manager::video_monitor_array_projection::MonitorArrayProjection,
+    dependent_free_claimed: bool,
+    source_retired: bool,
+    ownership_published: bool,
+    provider_quiesced: bool,
+    provider_acknowledged: bool,
+    ack_indeterminate: bool,
+    monitor_count: usize,
+    transfer: MonitorPdoTransfer,
+    stop_abort_started: bool,
+}
+
+struct MonitorPdoTransfer {
+    entries: Vec<MonitorPdoProjection>,
+    ledger: nt_io_manager::video_monitor_array_projection::MonitorPdoReferenceLedger,
+}
+
+struct MonitorPdoProjection {
+    source: nt_io_manager::video_monitor_array_projection::MonitorPdoIdentity,
+    projected: u64,
+    registration: nt_io_manager::HostedDevicePointerRegistration,
+}
+
+impl MonitorPdoTransfer {
+    /// Only a sealed stop before terminal publication proves the caller never received the
+    /// projected PDO pointers. After publication, win32k owns these canonical references.
+    unsafe fn release_unpublished(&mut self) -> bool {
+        loop {
+            let ticket = match self.ledger.begin_release() {
+                Ok(Some(ticket)) => ticket,
+                Ok(None) => return self.ledger.all_released(),
+                Err(_) => return false,
+            };
+            let Some(entry) = self.entries.iter().find(|entry| entry.source == ticket.pdo())
+            else { let _ = self.ledger.mark_uncertain(ticket); return false; };
+            if io_manager_mut().dereference_hosted_device_pointer(entry.registration).is_err() {
+                let _ = self.ledger.mark_uncertain(ticket);
+                return false;
+            }
+            if self.ledger.complete_release(ticket).is_err() { return false; }
+        }
+    }
+}
+
+static mut MONITOR_ARRAYS: Vec<MonitorArrayRow> = Vec::new();
 
 pub(super) fn next_source_reply_token() -> Option<u64> {
     runtime::next_service_wait_token()
@@ -427,8 +591,13 @@ pub(crate) unsafe fn submit(
         irp: None, entered: false, packet_prepared: false,
         reply_entered: false, reply_acked: false,
         pending: false, origin_armed: false, terminal: None, output_captured: false,
+        pool_map_handled: false,
+        monitor_source: None, monitor_projected: None, monitor_transfer: None,
+        monitor_source_retired: false, monitor_source_acknowledged: false,
         terminal_claimed: false, terminal_published: false,
-        terminal_packet: None, terminal_acknowledged: false, origin_committed: false, discarding: false,
+        terminal_packet: None, terminal_traced: false,
+        terminal_acknowledged: false, terminal_ack_receipt: None,
+        origin_committed: false, discarding: false,
         event_claimed: false, event_signaled: false, event_barrier: None, ack_claimed: false,
         cancel_requested: false, cancellation_terminal: false,
         resources_claimed: false, resources_committed: false, indeterminate: false,
@@ -490,6 +659,192 @@ pub(super) unsafe fn arm_pending(
 }
 
 impl Work {
+    fn nested_terminal_key(&self) -> Option<NestedIoctlKey> {
+        NestedSourceWorkKey::new(
+            self.route, self.dispatch, self.reply, self.nonce, self.token,
+            self.source_address, self.source_ticket, self.source_generation,
+        )
+    }
+    unsafe fn project_monitor_array(&mut self, length: usize) -> bool {
+        use nt_io_manager::source_irp_auxiliary::SourcePoolAllocationIdentity;
+        use nt_io_manager::video_monitor_array_projection::{
+            classify_monitor_source_release, decode_monitor_array, monitor_projection_layout,
+            MonitorArrayAllocation, MonitorArrayProjection, MonitorPdoIdentity,
+        };
+        if self.code != nt_video_miniport::IOCTL_VIDEO_ENUM_MONITOR_PDO
+            || self.terminal.is_none_or(|(status, _)| status != 0)
+        {
+            return true;
+        }
+        if length != 8 {
+            self.terminal = Some((STATUS_INVALID_PARAMETER as u32, 0));
+            self.output.fill(0);
+            return true;
+        }
+        let provider_pointer = u64::from_le_bytes(self.output[..8].try_into().unwrap());
+        if self.monitor_source.is_none() {
+            let device_id = self.target.device_id();
+            let Some(driver) = io_manager_mut().device(device_id).map(|device| device.driver_id.raw())
+            else { return false; };
+            let source = match crate::driver_launch::capture_hosted_video_monitor_array(
+                device_id.raw(), driver, provider_pointer,
+            ) {
+                Ok(source) => source,
+                Err(status) => {
+                    self.terminal = Some((status, 0));
+                    self.output.fill(0);
+                    return true;
+                }
+            };
+            self.monitor_source = Some(source);
+        }
+        let monitors = match decode_monitor_array(self.monitor_source.as_ref().unwrap().bytes()) {
+            Ok(monitors) => monitors,
+            Err(_) => {
+                self.monitor_source.take().unwrap().quarantine();
+                self.terminal = Some((STATUS_INVALID_PARAMETER as u32, 0));
+                self.output.fill(0);
+                return true;
+            }
+        };
+        let source = self.monitor_source.as_ref().unwrap();
+        if classify_monitor_source_release(source.video_port(), monitors.len()).is_err() {
+            source.quarantine();
+            self.indeterminate = true;
+            return false;
+        }
+        let layout = match monitor_projection_layout(monitors.len()) {
+            Ok(layout) if layout.allocation_bytes <= 0x10_0000 => layout,
+            _ => { source.quarantine(); self.indeterminate = true; return false; }
+        };
+        if (&mut *core::ptr::addr_of_mut!(MONITOR_ARRAYS)).try_reserve(1).is_err() {
+            return false;
+        }
+        if self.monitor_transfer.is_none() {
+            let mut entries = Vec::new();
+            let mut identities = Vec::new();
+            if entries.try_reserve_exact(monitors.len()).is_err()
+                || identities.try_reserve_exact(monitors.len()).is_err()
+            { source.quarantine(); self.indeterminate = true; return false; }
+            let source_domain = source.identity().domain;
+            let caller_domain = self.target.registration().domain();
+            for monitor in &monitors {
+                let Some(device) = io_manager_mut().hosted_device_by_identity(source_domain, monitor.pdo)
+                else { source.quarantine(); self.indeterminate = true; return false; };
+                let Some(source_registration) = io_manager_mut()
+                    .hosted_device_pointer_registration(source_domain, monitor.pdo)
+                else { source.quarantine(); self.indeterminate = true; return false; };
+                if source_registration.device_id() != device
+                    || io_manager_mut().hosted_device_pointer_count(source_registration).is_err()
+                { source.quarantine(); self.indeterminate = true; return false; }
+                let Ok(source_identity) = MonitorPdoIdentity::new(
+                    source_domain, monitor.pdo, source_registration.generation(),
+                ) else { source.quarantine(); self.indeterminate = true; return false; };
+                let Ok(projected) = crate::win32k_device_consumer::ensure_projection(device)
+                else { return false; };
+                let Some(registration) = io_manager_mut()
+                    .hosted_device_pointer_registration(caller_domain, projected)
+                else { source.quarantine(); self.indeterminate = true; return false; };
+                if registration.device_id() != device
+                    || io_manager_mut().hosted_device_by_identity(caller_domain, projected) != Some(device)
+                { source.quarantine(); self.indeterminate = true; return false; }
+                identities.push(source_identity);
+                entries.push(MonitorPdoProjection { source: source_identity, projected, registration });
+            }
+            let Ok(ledger) = nt_io_manager::video_monitor_array_projection::MonitorPdoReferenceLedger::new(&identities)
+            else { source.quarantine(); self.indeterminate = true; return false; };
+            self.monitor_transfer = Some(MonitorPdoTransfer { entries, ledger });
+        }
+        let transfer = self.monitor_transfer.as_mut().unwrap();
+        loop {
+            let ticket = match transfer.ledger.begin_acquire() {
+                Ok(Some(ticket)) => ticket,
+                Ok(None) => break,
+                Err(_) => { source.quarantine(); self.indeterminate = true; return false; }
+            };
+            let Some(entry) = transfer.entries.iter().find(|entry| entry.source == ticket.pdo())
+            else { source.quarantine(); self.indeterminate = true; return false; };
+            if io_manager_mut().reference_hosted_device_pointer(entry.registration).is_err() {
+                let _ = transfer.ledger.mark_uncertain(ticket);
+                source.quarantine(); self.indeterminate = true; return false;
+            }
+            if transfer.ledger.complete_acquire(ticket).is_err() {
+                source.quarantine(); self.indeterminate = true; return false;
+            }
+        }
+        if self.monitor_projected.is_none() {
+            self.monitor_projected = match crate::win32k_subsystem::try_allocate_root_provider_pool_allocation(
+                layout.allocation_bytes as u64,
+            ) {
+                Ok(projected) => Some(projected),
+                Err(crate::win32k_subsystem::RootPoolError::BusyNoEffect) => return false,
+                Err(crate::win32k_subsystem::RootPoolError::Indeterminate) => {
+                    self.monitor_source.as_ref().unwrap().quarantine();
+                    self.indeterminate = true;
+                    return false;
+                }
+                Err(_) => {
+                    // Caller PDO references already have exact retained ownership. Keep this
+                    // Work for retry or a sealed-stop rollback rather than dropping them.
+                    return false;
+                }
+            };
+        }
+        let Some(projected) = self.monitor_projected else {
+            return false;
+        };
+        let projected_identity = MonitorArrayAllocation::new(
+            self.target.registration().domain(),
+            SourcePoolAllocationIdentity {
+                component_address: projected.address(),
+                capacity: projected.packet_lease().capacity(),
+                pool_generation: projected.packet_lease().native_identity().allocation_generation,
+            },
+        ).expect("root allocation has exact domain and generation");
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(layout.allocation_bytes).is_err() {
+            source.quarantine(); self.indeterminate = true; return false;
+        }
+        bytes.resize(layout.allocation_bytes, 0);
+        for (index, (monitor, entry)) in monitors.iter().zip(&transfer.entries).enumerate() {
+            let offset = index * nt_io_manager::video_monitor_array_projection::VIDEO_MONITOR_DEVICE_X64_BYTES;
+            bytes[offset..offset + 4].copy_from_slice(&monitor.flag.to_le_bytes());
+            bytes[offset + 8..offset + 16].copy_from_slice(&entry.projected.to_le_bytes());
+            bytes[offset + 16..offset + 20].copy_from_slice(&monitor.hw_id.to_le_bytes());
+            bytes[offset + 20] = u8::from(monitor.internal);
+        }
+        bytes[layout.visible_bytes..layout.visible_bytes + 8].copy_from_slice(
+            &crate::win32k_subsystem::VIDEO_MONITOR_ARRAY_PROJECTION_MAGIC.to_le_bytes(),
+        );
+        bytes[layout.visible_bytes + 8..layout.visible_bytes + 16]
+            .copy_from_slice(&self.token.to_le_bytes());
+        match crate::win32k_subsystem::try_publish_root_provider_pool_packet(
+            projected.packet_lease(), &bytes,
+        ) {
+            Ok(()) => {}
+            Err(crate::win32k_subsystem::RootPoolError::BusyNoEffect) => return false,
+            Err(_) => {
+                self.monitor_source.as_ref().unwrap().quarantine();
+                self.indeterminate = true;
+                return false;
+            }
+        }
+        let source = self.monitor_source.take().unwrap();
+        self.monitor_projected = None;
+        let ownership = MonitorArrayProjection::new(source.identity(), projected_identity)
+            .expect("provider and dependent allocations have distinct domains");
+        (&mut *core::ptr::addr_of_mut!(MONITOR_ARRAYS)).push(MonitorArrayRow {
+            token: self.token, source, projected: Some(projected), ownership,
+            dependent_free_claimed: false, source_retired: false,
+            ownership_published: false, provider_quiesced: false,
+            provider_acknowledged: false, ack_indeterminate: false,
+            monitor_count: monitors.len(), transfer: self.monitor_transfer.take().unwrap(),
+            stop_abort_started: false,
+        });
+        self.output[..8].copy_from_slice(&projected.address().to_le_bytes());
+        true
+    }
+
     unsafe fn terminal_step_ready(&self) -> bool {
         self.terminal_packet.as_ref().is_none_or(|packet| {
             !packet.needs_lane(self.discarding || self.terminal_acknowledged)
@@ -598,6 +953,7 @@ impl Work {
     }
 
     unsafe fn capture_output(&mut self) -> bool {
+        if self.indeterminate { return false; }
         if self.output_captured {
             return true;
         }
@@ -613,6 +969,27 @@ impl Work {
                 }
             }
         }
+        if !self.project_monitor_array(length) { return false; }
+        if self.pool_map_handled && status == 0
+            && self.code == nt_video_miniport::IOCTL_VIDEO_MAP_VIDEO_MEMORY
+            && !super::hosted_video_pool_map::publish_map(
+                self.route, &self.target, information, &mut self.output[..length],
+            )
+        {
+            self.indeterminate = true;
+            return false;
+        }
+        if self.pool_map_handled
+            && self.code == nt_video_miniport::IOCTL_VIDEO_UNMAP_VIDEO_MEMORY
+            && !super::hosted_video_pool_map::complete_unmap(self.token, status)
+        {
+            self.indeterminate = true;
+            return false;
+        }
+        let (status, information) = self.terminal.expect("projected source IOCTL terminal");
+        let length = wire::completion_output_len(
+            self.code, status, information, self.output_capacity,
+        );
         super::hosted_video_caller_aperture::observe_terminal(
             &self.target, self.code, status, &self.input, information, &self.output[..length],
         );
@@ -652,9 +1029,37 @@ impl Work {
             if wire::encode_terminal_handoff(handoff, &mut packet).is_err() { return false; }
             self.terminal_packet = Some(super::hosted_source_terminal_packet::RetainedTerminalPacket::new(packet));
         }
+        let terminal_ready = self.terminal_step_ready();
+        let nested_ready = self.ready_for_nested_step();
         let transport = self.terminal_packet.as_mut().expect("retained IOCTL terminal transport");
         let ready = if self.discarding { transport.publish() }
-            else { transport.prepare(crate::win32k_glue::dispatch_source_ioctl_terminal) };
+            else { transport.prepare(dispatch_selected_source_ioctl_terminal) };
+        if !ready && crate::service_sec_image::component_shared_publication_is_busy() {
+            runtime::nested::trace_source_terminal_lane(
+                self.route, self.dispatch, self.reply,
+                transport.packet_address().unwrap_or(0), terminal_ready, nested_ready,
+            );
+        }
+        if !self.terminal_traced {
+            if let Some(address) = transport.packet_address() {
+                self.terminal_traced = true;
+                if TERMINAL_OWNER_TRACES.fetch_add(1, Ordering::Relaxed) < 128 {
+                    let owner = self.route.identity();
+                    print_str(b"[source-ioctl-terminal-owner] packet/nonce/token/source/ticket/gen/code/route-domain/route-gen/executor/lane/lane-gen/epoch/reply/pending/reply-entered/status/info=");
+                    for value in [address, self.nonce, self.token, self.source_address,
+                        self.source_ticket, self.source_generation, u64::from(self.code),
+                        owner.domain, owner.domain_generation, owner.executor,
+                        self.dispatch.lane().index as u64,
+                        self.dispatch.lane().generation, self.dispatch.epoch(), self.reply,
+                        u64::from(self.pending), u64::from(self.reply_entered),
+                        u64::from(status), information] {
+                        print_str(b"/");
+                        print_hex_u64(value);
+                    }
+                    print_str(b"\n");
+                }
+            }
+        }
         if !ready { self.indeterminate |= transport.indeterminate(); return false; }
         if self.discarding { return true; }
         let expected = wire::SourceIoctlTerminalHandoff {
@@ -666,9 +1071,11 @@ impl Work {
         };
         let valid = matches!(wire::decode_terminal_ack(self.terminal_packet.as_ref().unwrap().ack()),
             Ok(ack) if ack.handoff == expected && ack.publication == wire::TerminalPublication::Published);
-        if !self.terminal_packet.as_mut().unwrap().acknowledge_prepare(valid) {
-            self.indeterminate = true; return false;
-        }
+        let Some(receipt) = self.terminal_packet.as_mut().unwrap()
+            .acknowledge_prepare_receipt(valid) else {
+                self.indeterminate = true; return false;
+            };
+        self.terminal_ack_receipt = Some(receipt);
         self.terminal_acknowledged = true;
         true
     }
@@ -716,7 +1123,7 @@ impl Work {
         if self.origin_committed { return self.event_barrier.is_none(); }
         if !self.terminal_acknowledged || !self.event_signaled { return false; }
         if !self.terminal_packet.as_mut().expect("retained terminal transport").finish(
-            88, false, self.event_barrier.map_or(0, |barrier| barrier.sequence()), crate::win32k_glue::dispatch_source_ioctl_terminal,
+            88, false, self.event_barrier.map_or(0, |barrier| barrier.sequence()), dispatch_selected_source_ioctl_terminal,
         ) {
             self.indeterminate |= self.terminal_packet.as_ref().is_some_and(|packet| packet.indeterminate());
             return false;
@@ -748,6 +1155,23 @@ impl Work {
             self.irp = None;
         }
         if !self.signal_event(handler) || !self.commit_origin(handler) { return false; }
+        if let Some(row) = (&mut *core::ptr::addr_of_mut!(MONITOR_ARRAYS))
+            .iter_mut().find(|row| row.token == self.token)
+        {
+            if !row.ownership_published {
+                if row.ownership.publish().is_err() { row.source.quarantine(); return false; }
+                row.ownership_published = true;
+            }
+            if !row.provider_quiesced {
+                if row.ownership.confirm_provider_effect_quiesced().is_err() {
+                    row.source.quarantine(); return false;
+                }
+                row.provider_quiesced = true;
+            }
+            if !row.transfer.ledger.caller_handoff()
+                && row.transfer.ledger.handoff_to_caller().is_err()
+            { row.source.quarantine(); return false; }
+        }
         if let Some(event) = self.event.take() { release_event(handler, event); }
         self.target.release(io_manager_mut()).expect("terminal source IOCTL target");
         self.resources_committed = true;
@@ -764,6 +1188,86 @@ impl Work {
         );
         super::source_observability::retired(super::source_observability::Kind::Ioctl);
         true
+    }
+
+    unsafe fn settle_monitor_array_on_stop(&mut self) -> bool {
+        if let Some(source) = self.monitor_source.as_mut() {
+            if self.terminal_packet.is_some() || self.terminal_acknowledged || self.origin_committed {
+                source.quarantine();
+                return false;
+            }
+            if let Some(transfer) = self.monitor_transfer.as_mut() {
+                if !transfer.release_unpublished() { return false; }
+            }
+            if !self.monitor_source_retired {
+                if !source.retire_unpublished_after_sealed_stop() { return false; }
+                self.monitor_source_retired = true;
+            }
+            if !self.monitor_source_acknowledged {
+                match source.acknowledge_hosted_video_monitor_array(
+                    self.monitor_transfer.as_ref().map_or(0, |transfer| transfer.entries.len()),
+                ) {
+                    Some(true) => self.monitor_source_acknowledged = true,
+                    None => return false,
+                    Some(false) => { source.quarantine(); self.indeterminate = true; return false; }
+                }
+            }
+            self.monitor_source = None;
+            self.monitor_transfer = None;
+        }
+        if let Some(projected) = self.monitor_projected {
+            match crate::win32k_subsystem::try_retire_root_provider_pool_allocation(projected) {
+                Ok(()) => self.monitor_projected = None,
+                Err(crate::win32k_subsystem::RootPoolError::BusyNoEffect) => return false,
+                Err(_) => return false,
+            }
+        }
+        let rows = &mut *core::ptr::addr_of_mut!(MONITOR_ARRAYS);
+        let Some(index) = rows.iter().position(|row| row.token == self.token) else { return true };
+        let row = &mut rows[index];
+        if self.terminal_packet.is_some() || self.terminal_acknowledged || self.origin_committed {
+            // Publication may have reached the dependent without an ACK. Retain both exact
+            // allocations rather than treating a sealed stop as proof of absent pointer use.
+            row.source.quarantine();
+            row.ownership.mark_effect_uncertain();
+            return true;
+        }
+        if !row.stop_abort_started {
+            if !row.transfer.release_unpublished() { return false; }
+            if row.ownership.abort_unpublished().is_err()
+                || row.ownership.confirm_provider_effect_quiesced().is_err()
+            {
+                row.source.quarantine();
+                return false;
+            }
+            row.stop_abort_started = true;
+        }
+        if !row.source_retired {
+            if !row.source.retire_transferred(&row.ownership) { return false; }
+            if row.ownership.confirm_provider_retired(row.ownership.source()).is_err() {
+                row.source.quarantine();
+                return false;
+            }
+            row.source_retired = true;
+        }
+        if !row.provider_acknowledged {
+            if row.ack_indeterminate { return false; }
+            match row.source.acknowledge_hosted_video_monitor_array(row.monitor_count) {
+                Some(true) => row.provider_acknowledged = true,
+                None => return false,
+                Some(false) => {
+                    row.ack_indeterminate = true;
+                    row.source.quarantine();
+                    return false;
+                }
+            }
+        }
+        let projected = row.projected.expect("retained unpublished monitor allocation");
+        match crate::win32k_subsystem::try_retire_root_provider_pool_allocation(projected) {
+            Ok(()) => { rows.swap_remove(index); true }
+            Err(crate::win32k_subsystem::RootPoolError::BusyNoEffect) => false,
+            Err(_) => false,
+        }
     }
 
     unsafe fn finish_stopped(&mut self, handler: *mut ExecNtHandler) -> bool {
@@ -798,11 +1302,12 @@ impl Work {
                 }
                 self.irp = None;
             }
+            if !self.settle_monitor_array_on_stop() { return false; }
             if self.terminal_packet.is_none() { self.terminal = Some((0xc000_0120, 0)); }
             self.discarding = true;
             if !self.deliver_terminal() { return false; }
             if !self.terminal_packet.as_mut().expect("retained terminal transport").finish(
-                88, true, 0, crate::win32k_glue::dispatch_source_ioctl_terminal,
+                88, true, 0, dispatch_selected_source_ioctl_terminal,
             ) {
                 self.indeterminate |= self.terminal_packet.as_ref().is_some_and(|packet| packet.indeterminate());
                 return false;
@@ -833,13 +1338,27 @@ impl Work {
                 return false;
             }
             let aperture = if self.internal { Ok(()) } else {
-                super::hosted_video_caller_aperture::prepare(
+                match super::hosted_video_pool_map::prepare(
                     self.route, self.dispatch, self.reply, self.token, &self.target,
-                    self.code, &self.input, self.output_capacity,
-                )
+                    self.code, &mut self.input, self.output_capacity,
+                ) {
+                    Ok(true) => { self.pool_map_handled = true; Ok(()) }
+                    Ok(false) => super::hosted_video_caller_aperture::prepare(
+                        self.route, self.dispatch, self.reply, self.token, &self.target,
+                        self.code, &self.input, self.output_capacity,
+                    ),
+                    Err(status) => Err(status),
+                }
             };
             self.entered = true;
             let result = if let Err(status) = aperture {
+                if self.code == nt_video_miniport::IOCTL_VIDEO_MAP_VIDEO_MEMORY {
+                    print_str(b"[win32k-video-map] aperture rejected status=");
+                    print_hex_u64(status.raw() as u32 as u64);
+                    print_str(b" device-id=");
+                    print_u64(self.target.device_id().raw());
+                    print_str(b"\n");
+                }
                 Err(status)
             } else if self.internal {
                 io_manager_mut().internal_device_control_exact_device(
@@ -904,7 +1423,92 @@ impl Work {
     }
 }
 
+/// Select the exact retained inline terminal before lending the parent's shared page. The
+/// selection owns Work identity, not a Vec index that can be recycled while the parent parks.
+pub(crate) unsafe fn next_nested_terminal_selection(
+    route: Route,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+    reply: u64,
+) -> Option<NestedIoctlSelection> {
+    (&*core::ptr::addr_of!(WORK)).iter().enumerate().find_map(|(index, row)| {
+        if (&*core::ptr::addr_of!(EXECUTING)).contains(&index) { return None; }
+        let work = row.as_ref()?;
+        if work.route != route || work.dispatch != dispatch || work.reply != reply
+            || work.pending || work.discarding || work.indeterminate
+            || work.terminal.is_none() || work.terminal_acknowledged
+            || !work.ready_for_nested_step()
+        { return None; }
+        work.nested_terminal_key().map(NestedSourceSelection::new)
+    })
+}
+
+/// Drive only the selected Work. The caller retains `selection` on every outcome and may settle
+/// the child only with the move-only receipt issued after Work retirement.
+pub(crate) unsafe fn redrive_selected_nested_terminal(
+    handler: *mut ExecNtHandler,
+    selection: NestedIoctlSelection,
+) -> (NestedIoctlSelection, NestedIoctlTerminalStep) {
+    let _durable = crate::allocator::enter_durable();
+    let index = (&*core::ptr::addr_of!(WORK)).iter().position(|row|
+        row.as_ref().is_some_and(|work| work.nested_terminal_key()
+            .is_some_and(|key| selection.matches(key))));
+    let Some(index) = index else {
+        return (selection, NestedIoctlTerminalStep::Indeterminate);
+    };
+    if (&*core::ptr::addr_of!(EXECUTING)).contains(&index) {
+        return (selection, NestedIoctlTerminalStep::Indeterminate);
+    }
+    if !(&*core::ptr::addr_of!(WORK))[index].as_ref()
+        .is_some_and(|work| work.ready_for_nested_step()) {
+        return (selection, NestedIoctlTerminalStep::PreEntryRetained);
+    }
+    if (&mut *core::ptr::addr_of_mut!(EXECUTING)).try_reserve(1).is_err() {
+        return (selection, NestedIoctlTerminalStep::PreEntryRetained);
+    }
+    if ACTIVE_NESTED_WORK.load(Ordering::Acquire) != 0 {
+        return (selection, NestedIoctlTerminalStep::PreEntryRetained);
+    }
+    let Some(mut work) = (&mut *core::ptr::addr_of_mut!(WORK))[index].take() else {
+        return (selection, NestedIoctlTerminalStep::Indeterminate);
+    };
+    (&mut *core::ptr::addr_of_mut!(EXECUTING)).push(index);
+    let _active = ActiveNestedWork::enter(selection.key())
+        .expect("preflight nested Work exclusion");
+    let before_attempt = work.terminal_packet.as_ref()
+        .map_or(0, |packet| packet.dispatch_observation().0);
+    let done = work.advance(handler);
+    let observation = work.terminal_packet.as_ref().map(|packet| packet.dispatch_observation());
+    let step = if work.indeterminate
+        || work.terminal_packet.as_ref().is_some_and(|packet| packet.indeterminate()) {
+        NestedIoctlTerminalStep::Indeterminate
+    } else if done {
+        match (work.nested_terminal_key(), work.terminal_ack_receipt.take()) {
+            (Some(key), Some(ack)) => NestedIoctlTerminalStep::Settled(
+                SettledIoctlTerminal { key, ack }),
+            _ => NestedIoctlTerminalStep::Indeterminate,
+        }
+    } else if work.terminal_ack_receipt.is_some() {
+        NestedIoctlTerminalStep::PacketAckRetained
+    } else if let Some((_, effect)) = observation.filter(|(attempt, _)| *attempt > before_attempt) {
+        match effect {
+            NestedSourceDispatchEffect::NotEntered => NestedIoctlTerminalStep::PreEntryRetained,
+            NestedSourceDispatchEffect::ReturnedNotReady => NestedIoctlTerminalStep::ReturnedNotReady,
+            NestedSourceDispatchEffect::ReturnedSuccessNeedsAck =>
+                NestedIoctlTerminalStep::ReturnedAwaitingAck,
+            NestedSourceDispatchEffect::Indeterminate => NestedIoctlTerminalStep::Indeterminate,
+        }
+    } else if work.terminal_packet.as_ref().is_some_and(|packet| packet.awaiting_prepare_ack()) {
+        NestedIoctlTerminalStep::ReturnedAwaitingAck
+    } else {
+        NestedIoctlTerminalStep::PreEntryRetained
+    };
+    if !done { (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work); }
+    assert_eq!((&mut *core::ptr::addr_of_mut!(EXECUTING)).pop(), Some(index));
+    (selection, step)
+}
+
 unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> bool {
+    if runtime::nested::source_ioctl_parent_retained() { return false; }
     let _durable = crate::allocator::enter_durable();
     let count = (&*core::ptr::addr_of!(WORK)).len();
     if count == 0 { return false; }
@@ -930,8 +1534,71 @@ unsafe fn redrive_one(handler: *mut ExecNtHandler, nested_ready_only: bool) -> b
     progressed
 }
 
+unsafe fn retire_released_monitor_arrays() -> bool {
+    use nt_io_manager::video_monitor_array_projection::monitor_projection_layout;
+    let rows = &mut *core::ptr::addr_of_mut!(MONITOR_ARRAYS);
+    for index in 0..rows.len() {
+        let row = &mut rows[index];
+        let Some(projected) = row.projected else { continue };
+        let bytes = match crate::win32k_subsystem::try_capture_root_provider_pool_packet(
+            projected.packet_lease(),
+        ) {
+            Ok(bytes) => bytes,
+            Err(crate::win32k_subsystem::RootPoolError::BusyNoEffect) => continue,
+            Err(_) => {
+                row.source.quarantine();
+                continue;
+            }
+        };
+        let Ok(layout) = monitor_projection_layout(row.monitor_count) else {
+            row.source.quarantine();
+            continue;
+        };
+        let metadata = layout.visible_bytes;
+        if bytes.len() != layout.allocation_bytes
+            || u64::from_le_bytes(bytes[metadata..metadata + 8].try_into().unwrap())
+                != crate::win32k_subsystem::VIDEO_MONITOR_ARRAY_PROJECTION_MAGIC
+            || u64::from_le_bytes(bytes[metadata + 8..metadata + 16].try_into().unwrap()) != row.token
+        {
+            row.source.quarantine();
+            continue;
+        }
+        if u64::from_le_bytes(bytes[metadata + 16..metadata + 24].try_into().unwrap()) != 1 { continue; }
+        if !row.dependent_free_claimed {
+            if row.ownership.claim_dependent_free(row.ownership.projected()).is_err() { continue; }
+            row.dependent_free_claimed = true;
+        }
+        if !row.source_retired {
+            if !row.ownership.provider_retirement_ready() { continue; }
+            if !row.source.retire_transferred(&row.ownership) { continue; }
+            if row.ownership.confirm_provider_retired(row.ownership.source()).is_err() {
+                row.source.quarantine();
+                continue;
+            }
+            row.source_retired = true;
+        }
+        if !row.provider_acknowledged {
+            if row.ack_indeterminate { continue; }
+            match row.source.acknowledge_hosted_video_monitor_array(row.monitor_count) {
+                Some(true) => row.provider_acknowledged = true,
+                None => continue,
+                Some(false) => {
+                    row.ack_indeterminate = true;
+                    row.source.quarantine();
+                    continue;
+                }
+            }
+        }
+        if crate::win32k_subsystem::try_retire_root_provider_pool_allocation(projected).is_ok() {
+            rows.swap_remove(index);
+            return true;
+        }
+    }
+    false
+}
+
 pub(crate) unsafe fn redrive(handler: *mut ExecNtHandler) -> bool {
-    redrive_one(handler, false)
+    retire_released_monitor_arrays() | redrive_one(handler, false)
 }
 
 pub(super) unsafe fn nested_work_ready() -> bool {

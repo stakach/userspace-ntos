@@ -74,10 +74,16 @@ pub(crate) unsafe fn service_drain_section_retirement_for_handler(
     table: &mut GenericSectionTable,
     handler: &mut ExecNtHandler,
 ) -> Result<(), u32> {
-    section_scratch::drain_section_scratch()?;
+    section_scratch::drain_section_scratch().map_err(|status| {
+        report_service_finalize_failure(b"section-scratch", status)
+    })?;
     let mut io = RetirementIo { files: Some(&mut handler.readonly_file_opens) };
-    (&mut *core::ptr::addr_of_mut!(PENDING_PAGEIN_FRAMES)).drain(&mut io)?;
-    table.drain_retired(&mut io)
+    (&mut *core::ptr::addr_of_mut!(PENDING_PAGEIN_FRAMES))
+        .drain(&mut io)
+        .map_err(|status| report_service_finalize_failure(b"pagein-frame-retirement", status))?;
+    table
+        .drain_retired(&mut io)
+        .map_err(|status| report_service_finalize_failure(b"section-table-retirement", status))
 }
 
 /// Detach every page, not just dirty writeback pages, before the view identity is discarded.

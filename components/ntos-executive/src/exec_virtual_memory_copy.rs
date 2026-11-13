@@ -136,7 +136,7 @@ impl ExecNtHandler {
         )
     }
 
-    pub(super) unsafe fn publish_vm_range(
+    pub(crate) unsafe fn publish_vm_range(
         &mut self,
         memory: SyscallUserMemory,
         output: nt_address_space::native_output::VmRangeOutput,
@@ -188,7 +188,7 @@ impl ExecNtHandler {
         self.process_memory_write_status(pi, address, input).is_ok()
     }
 
-    pub(super) unsafe fn process_memory_write_status(
+    pub(crate) unsafe fn process_memory_write_status(
         &mut self,
         pi: usize,
         address: u64,
@@ -303,7 +303,7 @@ impl ExecNtHandler {
         }
     }
 
-    unsafe fn consume_copy_guard(
+    pub(crate) unsafe fn consume_copy_guard(
         &mut self,
         pi: usize,
         old: nt_address_space::VmBasicInformation,
@@ -440,7 +440,7 @@ impl ExecNtHandler {
         self.probe_copy_scalar::<8>(address)
     }
 
-    unsafe fn copy_read_page(
+    pub(crate) unsafe fn copy_read_page(
         &mut self,
         pi: usize,
         address: u64,
@@ -484,7 +484,7 @@ impl ExecNtHandler {
         }
     }
 
-    unsafe fn copy_write_page(&mut self, pi: usize, address: u64, input: &[u8]) -> Result<(), u32> {
+    pub(crate) unsafe fn copy_write_page(&mut self, pi: usize, address: u64, input: &[u8]) -> Result<(), u32> {
         self.copy_write_page_checked(pi, address, input)
             .map_err(MemoryCopyFailure::status)
     }

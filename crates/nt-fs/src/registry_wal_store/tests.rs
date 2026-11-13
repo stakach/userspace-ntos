@@ -1,12 +1,128 @@
 use super::*;
 use crate::snapshot_test_device::CachedDisk;
-use crate::{BoundedBlockRange, OwnedBoundedBlockRange, SnapshotBlockStore, SnapshotReserve, WalSnapshotAnchor};
+use crate::{AsyncWalIoKind, AsyncWalIoRequest, AsyncWalRefusal, BoundedBlockRange, OwnedBoundedBlockRange, SnapshotBlockStore, SnapshotReserve, WalSnapshotAnchor};
 extern crate std;
 use alloc::rc::Rc;
 use core::cell::Cell;
 
 fn disk() -> CachedDisk {
     CachedDisk::with_sectors(32)
+}
+
+#[test]
+fn only_newly_committed_frame_moves_payload_into_anchor_owner() {
+    let payload = alloc::vec![0x52; 600];
+    let mut wal = RegistryWal::recover(disk(), 77).unwrap();
+    wal.begin(payload.clone()).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let (mut device, prefix, _, committed) = wal.into_verified_device().unwrap().into_parts();
+    assert_eq!(prefix.anchor().serial, 1);
+    assert_eq!(committed, Some(payload));
+
+    device.power_cut();
+    let recovered = RegistryWal::recover(device, 77).unwrap();
+    let (_, prefix, _, committed) = recovered.into_verified_device().unwrap().into_parts();
+    assert_eq!(prefix.anchor().serial, 1);
+    assert_eq!(committed, None, "recovery does not mint a new publication receipt");
+}
+
+fn settle_async_step(wal: &mut RegistryWal<CachedDisk>, request: AsyncWalIoRequest) {
+    match request.kind {
+        AsyncWalIoKind::Write => {
+            let bytes = wal.async_write_bytes(request).unwrap().to_vec();
+            wal.device_mut_for_test().write_sector(request.lba, &bytes).unwrap();
+        }
+        AsyncWalIoKind::Flush => wal.device_mut_for_test().flush().unwrap(),
+    }
+    wal.complete_async(request, Ok(())).unwrap();
+}
+
+#[test]
+fn async_prepare_requires_exact_write_terminals_before_the_durable_barrier() {
+    let mut wal = RegistryWal::recover(disk(), 77).unwrap();
+    wal.begin(alloc::vec![0x51; 600]).unwrap();
+    wal.start_async_prepare().unwrap();
+
+    let header = wal.enter_next_async().unwrap().unwrap();
+    assert_eq!(header.kind, AsyncWalIoKind::Write);
+    assert_eq!(header.lba, 0);
+    assert_eq!(wal.async_write_bytes(header).unwrap().len(), 512);
+    assert!(wal.enter_next_async().is_err(), "a second effect cannot enter while one is live");
+    assert!(wal.complete_async(header, Ok(())).is_err(), "unentered write is not durable");
+    wal.mark_entered_async(header).unwrap();
+    assert!(wal.release_unentered_async(header).is_err(), "entered write cannot be replayed");
+    settle_async_step(&mut wal, header);
+
+    for lba in 1..=2 {
+        let payload = wal.enter_next_async().unwrap().unwrap();
+        assert_eq!((payload.kind, payload.lba), (AsyncWalIoKind::Write, lba));
+        wal.mark_entered_async(payload).unwrap();
+        settle_async_step(&mut wal, payload);
+    }
+    assert_eq!(wal.state(), RegistryWalState::PendingPrepare);
+    let barrier = wal.enter_next_async().unwrap().unwrap();
+    assert_eq!(barrier.kind, AsyncWalIoKind::Flush);
+    wal.mark_entered_async(barrier).unwrap();
+    settle_async_step(&mut wal, barrier);
+    assert!(wal.enter_next_async().unwrap().is_none());
+    assert_eq!(wal.state(), RegistryWalState::Prepared);
+
+    wal.start_async_commit().unwrap();
+    let marker = wal.enter_next_async().unwrap().unwrap();
+    assert_eq!((marker.kind, marker.lba), (AsyncWalIoKind::Write, 3));
+    wal.mark_entered_async(marker).unwrap();
+    settle_async_step(&mut wal, marker);
+    let barrier = wal.enter_next_async().unwrap().unwrap();
+    assert_eq!(barrier.kind, AsyncWalIoKind::Flush);
+    wal.mark_entered_async(barrier).unwrap();
+    settle_async_step(&mut wal, barrier);
+    assert_eq!(wal.settled_anchor().unwrap().serial, 1);
+    let mut disk = wal.into_device().unwrap();
+    disk.power_cut();
+    assert_eq!(RegistryWal::recover(disk, 77).unwrap().records()[0].payload, alloc::vec![0x51; 600]);
+}
+
+#[test]
+fn async_wal_uncertain_terminal_never_replays_or_releases_owner() {
+    let mut wal = RegistryWal::recover(disk(), 77).unwrap();
+    wal.begin(alloc::vec![0x51; 512]).unwrap();
+    wal.start_async_prepare().unwrap();
+    let first = wal.enter_next_async().unwrap().unwrap();
+    wal.release_unentered_async(first).unwrap();
+    assert!(wal.mark_entered_async(first).is_err());
+    let second = wal.enter_next_async().unwrap().unwrap();
+    assert_ne!(first.sequence, second.sequence);
+    wal.mark_entered_async(second).unwrap();
+    assert_eq!(wal.complete_async(second, Err(SnapshotBlockStoreError::Io)),
+        Err(RegistryWalError::Storage(SnapshotBlockStoreError::Io)));
+    assert_eq!(wal.state(), RegistryWalState::Uncertain);
+    assert_eq!(wal.enter_next_async(), Err(RegistryWalError::Uncertain));
+    assert!(wal.release_unentered_async(second).is_err());
+    core::mem::forget(wal);
+}
+
+#[test]
+fn hard_refusal_before_first_wal_effect_can_abort_but_later_refusal_retains_owner() {
+    let mut wal = RegistryWal::recover(disk(), 77).unwrap();
+    wal.begin(alloc::vec![0x51; 512]).unwrap();
+    wal.start_async_prepare().unwrap();
+    let first = wal.enter_next_async().unwrap().unwrap();
+    assert_eq!(wal.refuse_unentered_async(first), Ok(AsyncWalRefusal::NoEffect));
+    assert_eq!(wal.state(), RegistryWalState::Ready);
+    assert!(wal.into_device().is_ok());
+
+    let mut wal = RegistryWal::recover(disk(), 77).unwrap();
+    wal.begin(alloc::vec![0x51; 512]).unwrap();
+    wal.start_async_prepare().unwrap();
+    let header = wal.enter_next_async().unwrap().unwrap();
+    wal.mark_entered_async(header).unwrap();
+    settle_async_step(&mut wal, header);
+    let payload = wal.enter_next_async().unwrap().unwrap();
+    assert_eq!(wal.refuse_unentered_async(payload), Ok(AsyncWalRefusal::RetainedEffects));
+    assert_eq!(wal.state(), RegistryWalState::Uncertain);
+    assert_eq!(wal.enter_next_async(), Err(RegistryWalError::Uncertain));
+    core::mem::forget(wal);
 }
 
 struct BatchedZeroDisk {
@@ -53,6 +169,46 @@ fn empty_tail_recovery_uses_bounded_range_reads_and_checks_the_last_sector() {
     let mut failed = CachedDisk::with_sectors(65);
     failed.fail_read = Some(64);
     assert!(matches!(RegistryWal::recover(make_disk(failed), 77),
+        Err(RegistryWalError::Storage(SnapshotBlockStoreError::Io))));
+}
+
+#[test]
+fn committed_payload_recovery_reads_a_range_without_losing_padding_or_io_errors() {
+    let payload = alloc::vec![0x5a; 6 * 512 + 17];
+    let mut wal = RegistryWal::recover(CachedDisk::with_sectors(24), 77).unwrap();
+    wal.begin(payload.clone()).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let mut disk = wal.into_device().unwrap();
+    disk.power_cut();
+
+    let singles = Rc::new(Cell::new(0));
+    let batches = Rc::new(Cell::new(0));
+    let counted = |inner| BatchedZeroDisk {
+        inner,
+        singles: singles.clone(),
+        batches: batches.clone(),
+    };
+    let recovered = RegistryWal::recover(counted(disk), 77).unwrap();
+    assert_eq!(recovered.records()[0].payload, payload);
+    assert_eq!(recovered.settled_anchor().unwrap().serial, 1);
+    assert!(batches.get() >= 2, "payload and empty suffix must use range reads");
+    assert!(singles.get() <= 4, "payload must not issue a command per sector");
+
+    let mut disk = recovered.into_device().unwrap().inner;
+    let padding_byte = 512 + payload.len();
+    disk.cache[padding_byte] = 1;
+    disk.stable[padding_byte] = 1;
+    assert!(matches!(RegistryWal::recover(counted(disk), 77), Err(RegistryWalError::Corrupt)));
+
+    let mut wal = RegistryWal::recover(CachedDisk::with_sectors(24), 77).unwrap();
+    wal.begin(payload).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let mut disk = wal.into_device().unwrap();
+    disk.power_cut();
+    disk.fail_read = Some(3);
+    assert!(matches!(RegistryWal::recover(counted(disk), 77),
         Err(RegistryWalError::Storage(SnapshotBlockStoreError::Io))));
 }
 

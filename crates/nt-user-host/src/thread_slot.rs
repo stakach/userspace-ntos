@@ -184,6 +184,7 @@ pub enum ThreadIngressError {
     Publishing,
     Unbuilt,
     ProcessChanged,
+    RuntimeRetired,
 }
 
 impl<R: RuntimeIdentity> ThreadRuntimeSlot<R> {

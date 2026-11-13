@@ -23,7 +23,7 @@ fn canonical_process_reservation_preserves_preferred_layout_not_global_relocatio
     let file = source("exec_image_process_create.rs");
     let method = file.items.iter().find_map(|item| match item {
         syn::Item::Impl(item) => item.items.iter().find_map(|item| match item {
-            syn::ImplItem::Fn(method) if method.sig.ident == "reserve_native_image_process" => Some(method),
+            syn::ImplItem::Fn(method) if method.sig.ident == "reserve_native_image_process_with_bytes" => Some(method),
             _ => None,
         }),
         _ => None,

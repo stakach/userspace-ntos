@@ -1220,20 +1220,51 @@ pub fn seed_reactos_explorer_shell_com_classes_into_target<T: ReactOsSetupSeedTa
     mask
 }
 
+fn profile_shell_folder_keys(user_hive_root: &str) -> (String, String) {
+    (
+        join_key_path(
+            user_hive_root,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+        ),
+        join_key_path(
+            user_hive_root,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        ),
+    )
+}
+
+/// Verify the complete setup-owned profile table after a fresh seed or an idempotent replay.
+/// Uses the same value table as the writer so a missing, stale, or mistyped value cannot
+/// authorize publication of a partial Default User hive image.
+pub fn reactos_user_profile_shell_folders_complete_in_target<T: ReactOsSetupSeedTarget>(
+    target: &T,
+    user_hive_root: &str,
+    profile_path: &str,
+    user_shell_profile_root: &str,
+) -> bool {
+    let (shell_key, user_shell_key) = profile_shell_folder_keys(user_hive_root);
+    REACTOS_USER_PROFILE_SHELL_FOLDERS.iter().all(|folder| {
+        (!folder.shell_folder || target.value_matches(
+            &shell_key,
+            folder.value_name,
+            RegistryValueType::Sz,
+            &utf16le_sz(&join_registry_profile_path(profile_path, folder.path)),
+        )) && (!folder.user_shell_folder || target.value_matches(
+            &user_shell_key,
+            folder.value_name,
+            RegistryValueType::ExpandSz,
+            &utf16le_sz(&join_registry_profile_path(user_shell_profile_root, folder.path)),
+        ))
+    })
+}
+
 pub fn seed_reactos_user_profile_shell_folders_into_target<T: ReactOsSetupSeedTarget>(
     target: &mut T,
     user_hive_root: &str,
     profile_path: &str,
     user_shell_profile_root: &str,
 ) -> ReactOsProfileShellFolderSeedStats {
-    let shell_key = join_key_path(
-        user_hive_root,
-        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
-    );
-    let user_shell_key = join_key_path(
-        user_hive_root,
-        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
-    );
+    let (shell_key, user_shell_key) = profile_shell_folder_keys(user_hive_root);
     if !target.create_key(&shell_key) || !target.create_key(&user_shell_key) {
         return ReactOsProfileShellFolderSeedStats::default();
     }
@@ -2401,6 +2432,13 @@ mod tests {
         );
         assert_eq!(stats.shell_folder_values, 17);
         assert_eq!(stats.user_shell_folder_values, 17);
+        let target = MutableHiveRgsSeedTarget { hives: &mut hives };
+        assert!(reactos_user_profile_shell_folders_complete_in_target(
+            &target,
+            r"\Registry\User\.Default",
+            r"C:\Profiles\Default User",
+            "%USERPROFILE%",
+        ));
 
         let (ty, data) = hive_value_bytes(
             &hives,
@@ -2435,11 +2473,30 @@ mod tests {
             r"C:\Profiles\Default User",
         );
         assert_eq!(second_stats, ReactOsProfileShellFolderSeedStats::default());
+        let target = MutableHiveRgsSeedTarget { hives: &mut hives };
+        assert!(reactos_user_profile_shell_folders_complete_in_target(
+            &target,
+            r"\Registry\User\.Default",
+            r"C:\Profiles\Default User",
+            "%USERPROFILE%",
+        ));
         assert_eq!(
             hives.hive(5).expect("default hive").cell_count(),
             first_cell_count
         );
         assert_eq!(hives.hive(5).expect("default hive").dirty_count(), 0);
+
+        let shell = hives.resolve_key(
+            r"\Registry\User\.Default\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+        ).expect("shell key");
+        assert!(hives.set_value(shell, "AppData", RegistryValueType::Dword, alloc::vec![1, 0, 0, 0]));
+        let target = MutableHiveRgsSeedTarget { hives: &mut hives };
+        assert!(!reactos_user_profile_shell_folders_complete_in_target(
+            &target,
+            r"\Registry\User\.Default",
+            r"C:\Profiles\Default User",
+            "%USERPROFILE%",
+        ));
     }
 
     #[test]

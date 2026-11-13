@@ -6,10 +6,11 @@ pub(crate) unsafe fn validate_saved(cap: u64) -> Result<usize, u32> {
     if cap == 0 || cap == REPLY_MAIN_SLOT.load(Ordering::Relaxed) {
         return Err(nt_fs::STATUS_INVALID_HANDLE);
     }
-    wait_reply_pool_ref()
-        .iter()
-        .position(|record| record.cap == cap && record.used)
-        .ok_or(nt_fs::STATUS_INVALID_HANDLE)
+    let identity = wait_reply_pool_ref().find_cap(cap)
+        .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    (wait_reply_pool_ref().state(identity)
+        == Ok(nt_component_suspension::RootReplySlotState::Used))
+        .then_some(identity.slot()).ok_or(nt_fs::STATUS_INVALID_HANDLE)
 }
 
 pub(crate) unsafe fn revoke(cap: u64) -> Result<(), u32> {
@@ -39,8 +40,8 @@ pub(crate) unsafe fn retype(cap: u64) -> Result<(), u32> {
         return Err(nt_fs::STATUS_INSUFFICIENT_RESOURCES);
     }
     // No callout separates accepted retype from pool publication and the caller's receipt.
-    wait_reply_pool_mut()[slot].used = false;
-    Ok(())
+    wait_reply_pool_mark_free(slot)
+        .then_some(()).ok_or(nt_fs::STATUS_INVALID_HANDLE)
 }
 
 pub(crate) unsafe fn retire_sent(cap: u64) -> Result<(), u32> {
@@ -50,6 +51,6 @@ pub(crate) unsafe fn retire_sent(cap: u64) -> Result<(), u32> {
             .map_err(|_| nt_fs::STATUS_INVALID_HANDLE);
     }
     // An acknowledged Reply already consumed the binding. Do not delete or retype it again.
-    wait_reply_pool_mut()[slot].used = false;
-    Ok(())
+    wait_reply_pool_mark_free(slot)
+        .then_some(()).ok_or(nt_fs::STATUS_INVALID_HANDLE)
 }

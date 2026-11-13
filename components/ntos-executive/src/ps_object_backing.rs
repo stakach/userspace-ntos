@@ -4,11 +4,13 @@
 //! are adopted here. PM withdrawal owns retirement of published ordinary bodies.
 
 use super::*;
-use nt_kernel_abi::{ps_reactos_x64 as abi, GuestAddr};
+use nt_kernel_abi::{ps_hosted_x64 as abi, GuestAddr};
 use nt_memory_manager::owned_object_page::{ObjectPageIo, OwnedObjectPage, ROOT_ALIAS_RIGHTS};
 use nt_pnp_context::{AddressSlotAllocator, AddressSlotReservation};
 use nt_process::process_object_retirement::ProcessObjectRetirement;
 use nt_process::{InitialSystemIdentity, ProcessId, ProcessManager, ThreadId, ThreadLifetime};
+use nt_io_manager::verify_device_retirement::{ThreadVerifyIdentity, VerifyDeviceBindings};
+use nt_io_manager::HostedDevicePointerRegistration;
 use ps_object_paging::{PsObjectPaging, PS_OBJECT_ARENA_BASE, PS_OBJECT_ARENA_LIMIT};
 use ps_object_provider::{ProviderRoot, ProviderRoots};
 
@@ -86,6 +88,7 @@ struct Arena {
     paging: PsObjectPaging<InitialSystemIdentity>,
     providers: ProviderRoots,
     rows: Vec<Row>,
+    verify_devices: VerifyDeviceBindings,
     last_census: [usize; 9],
 }
 
@@ -124,6 +127,7 @@ pub(super) unsafe fn initialize(system: InitialSystemIdentity) -> Result<(), u32
         paging: PsObjectPaging::new(system, CAP_INIT_THREAD_VSPACE).map_err(|_| INVALID)?,
         providers: ProviderRoots::new(),
         rows: Vec::new(),
+        verify_devices: VerifyDeviceBindings::new(),
         last_census: [0; 9],
     });
     Ok(())
@@ -232,6 +236,42 @@ pub(super) enum PublishedBody {
     Thread,
 }
 
+/// Authenticate a provider-visible ETHREAD against the published Ps row and its live alias.
+/// This performs no mapping or reference acquisition; the caller retains the wait reference.
+pub(super) fn verify_provider_thread_wait_body(
+    pm: &ProcessManager,
+    lifetime: ThreadLifetime,
+    body: u64,
+    target: ProviderRoot,
+) -> Result<(), u32> {
+    let _borrow = Borrow::acquire()?;
+    let arena = unsafe { &*core::ptr::addr_of!(ARENA) }.as_ref().ok_or(INVALID)?;
+    arena.validate(pm)?;
+    if !arena.providers.retains(target)
+        || pm.thread_lifetime(lifetime.thread_id()) != Some(lifetime)
+        || pm.thread_kernel_object(lifetime.thread_id()) != Some(body)
+    {
+        return Err(INVALID);
+    }
+    if lifetime == arena.root.system.thread() {
+        let initial = ps_bootstrap::initial_system_projection().ok_or(INVALID)?;
+        return (initial.identity == arena.root.system && body == initial.thread_body)
+            .then_some(()).ok_or(INVALID);
+    }
+    let index = arena.existing(BodyId::Thread(lifetime.thread_id())).ok_or(INVALID)?;
+    let row = &arena.rows[index];
+    if row.phase != BodyPhase::Published
+        || row.current_thread_lifetime != Some(lifetime)
+        || row.page.descriptor().address != body
+        || !row.page.is_initialized()
+        || !row.page.live_alias(MappingTarget::Provider(target))
+            .is_some_and(|(cap, rights)| cap != 0 && rights == ROOT_ALIAS_RIGHTS)
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
 /// Read provider-published Win32Thread state from this owner's acknowledged canonical body.
 /// The PM mirror may not yet have been imported while the provider's dispatch is still entered.
 pub(super) fn read_thread_win32(
@@ -276,6 +316,122 @@ pub(super) fn read_thread_win32(
         .checked_add(abi::KTHREAD_WIN32_THREAD as u64)
         .ok_or(INVALID)?;
     Ok(unsafe { core::ptr::read_volatile(field as *const u64) })
+}
+
+/// Set the requestor's verify device in the exact published ETHREAD body.
+///
+/// The caller retains the source-IRP and pool locks and the canonical PM borrow through
+/// this call. Holding the backing arena borrow prevents retirement or alias replacement
+/// between live-body validation and the field write.
+pub(super) fn set_thread_device_to_verify(
+    pm: &ProcessManager,
+    ethread: u64,
+    registration: Option<HostedDevicePointerRegistration>,
+) -> Result<(), u32> {
+    let _borrow = Borrow::acquire()?;
+    let arena = unsafe { &mut *core::ptr::addr_of_mut!(ARENA) }.as_mut().ok_or(INVALID)?;
+    arena.validate(pm)?;
+    let tid = pm.tid_for_kernel_thread_object(ethread).ok_or(INVALID)?;
+    let lifetime = pm.thread_lifetime(tid).ok_or(INVALID)?;
+    let identity = ThreadVerifyIdentity {
+        body: ethread,
+        process_id: lifetime.process_id(),
+        thread_id: lifetime.thread_id(),
+        generation: lifetime.generation(),
+    };
+    arena.verify_devices.reserve_write(identity, registration)
+        .map_err(|status| status.raw() as u32)?;
+    let device = registration.map_or(0, HostedDevicePointerRegistration::address);
+    set_thread_device_to_verify_unlocked(arena, pm, ethread, lifetime, device)?;
+    arena.verify_devices.commit_write(identity, registration);
+    Ok(())
+}
+
+fn set_thread_device_to_verify_unlocked(
+    arena: &Arena,
+    pm: &ProcessManager,
+    ethread: u64,
+    lifetime: ThreadLifetime,
+    device: u64,
+) -> Result<(), u32> {
+    let tid = lifetime.thread_id();
+    if !pm.validate_thread_lifetime(lifetime)
+        || pm.thread_kernel_object(tid) != Some(ethread)
+    {
+        return Err(INVALID);
+    }
+    let fields = if lifetime == arena.root.system.thread() {
+        let initial = ps_bootstrap::initial_system_projection().ok_or(INVALID)?;
+        if initial.identity != arena.root.system || initial.thread_body != ethread
+            || pm.process_kernel_object(lifetime.process_id()) != Some(initial.process_body)
+        {
+            return Err(INVALID);
+        }
+        abi::ThreadInitialization {
+            body: GuestAddr(ethread),
+            process_body: GuestAddr(initial.process_body),
+            process_id: u64::from(lifetime.process_id()),
+            thread_id: u64::from(tid),
+            teb: GuestAddr(0),
+            system_thread: true,
+        }
+    } else {
+        let index = arena.existing(BodyId::Thread(tid)).ok_or(INVALID)?;
+        let row = &arena.rows[index];
+        if row.phase != BodyPhase::Published
+            || row.current_thread_lifetime != Some(lifetime)
+            || row.page.descriptor().address != ethread
+            || !row.page.is_initialized()
+            || !row.page.live_alias(MappingTarget::Executive(arena.root))
+                .is_some_and(|(cap, rights)| cap != 0 && rights == ROOT_ALIAS_RIGHTS)
+        {
+            return Err(INVALID);
+        }
+        let Initialization::Thread { fields, .. } = row.page.descriptor().initialization
+        else { return Err(INVALID); };
+        if pm.process_kernel_object(lifetime.process_id()) != Some(fields.process_body.0) {
+            return Err(INVALID);
+        }
+        fields
+    };
+    let body = unsafe { core::slice::from_raw_parts_mut(ethread as *mut u8, abi::ETHREAD_BODY_BYTES) };
+    abi::set_thread_device_to_verify(body, fields, GuestAddr(device)).map_err(|_| INVALID)
+}
+
+/// Clear only fields owned by the retiring exact physical registration. An old
+/// thread incarnation is forgotten without touching a reused ETHREAD address.
+pub(super) fn clear_device_to_verify_for_registration(
+    pm: &ProcessManager,
+    registration: HostedDevicePointerRegistration,
+) -> Result<(), u32> {
+    let _borrow = Borrow::acquire()?;
+    let arena = unsafe { &mut *core::ptr::addr_of_mut!(ARENA) }.as_mut().ok_or(INVALID)?;
+    arena.validate(pm)?;
+    while let Some(identity) = arena.verify_devices.next_for_retirement(registration) {
+        let live = pm.tid_for_kernel_thread_object(identity.body)
+            .and_then(|tid| pm.thread_lifetime(tid))
+            .filter(|lifetime| lifetime.thread_id() == identity.thread_id
+                && lifetime.process_id() == identity.process_id
+                && lifetime.generation() == identity.generation
+                && pm.validate_thread_lifetime(*lifetime)
+                && pm.thread_kernel_object(identity.thread_id) == Some(identity.body));
+        if let Some(lifetime) = live {
+            let current = unsafe {
+                core::ptr::read_unaligned((identity.body
+                    + abi::ETHREAD_DEVICE_TO_VERIFY as u64) as *const u64)
+            };
+            if current != registration.address() {
+                // A foreign write has broken the last admitted assignment. Keep the
+                // physical registration retained rather than clearing unknown state.
+                return Err(INVALID);
+            }
+            set_thread_device_to_verify_unlocked(arena, pm, identity.body, lifetime, 0)?;
+        }
+        if !arena.verify_devices.forget_exact(identity, registration) {
+            return Err(INVALID);
+        }
+    }
+    Ok(())
 }
 
 /// # Safety
@@ -418,6 +574,7 @@ pub(super) unsafe fn grant_referenced_body(
 /// Root has stopped provider execution and closed all dispatch/callback admission for this exact
 /// target. Closing leaf admission is sticky; failures retain every remaining leaf/table/root.
 pub(super) unsafe fn retire_provider(target: ProviderRoot, scratch_base: u64) -> Result<(), u32> {
+    if crate::provider_ps_wait::has_target(target) { return Err(RESOURCES); }
     let borrow = Borrow::acquire()?;
     let arena = (&mut *core::ptr::addr_of_mut!(ARENA))
         .as_mut()
@@ -557,6 +714,9 @@ pub(super) unsafe fn prepare_process(
         return Err(INVALID);
     }
     let peb = pm.query_process_basic(pid, u64::MAX)?.peb_base_address;
+    let image_file_name = pm.kernel_process_export_state(pid)
+        .and_then(|state| state.eprocess_image_file_name())
+        .ok_or(INVALID)?;
     arena.prepare(
         BodyId::Process(pid),
         |address| {
@@ -564,6 +724,7 @@ pub(super) unsafe fn prepare_process(
                 body: GuestAddr(address),
                 process_id: u64::from(pid),
                 peb: GuestAddr(peb),
+                image_file_name,
             })
         },
         scratch_base,
@@ -859,6 +1020,17 @@ pub(super) unsafe fn retire_withdrawn(
                 borrow: &borrow,
             };
             row.page.retire(&mut io)?;
+        }
+    }
+    for index in 0..snapshot.thread_count {
+        let thread = pm.process_object_retirement_thread(ticket, index)?;
+        if let Some(body) = thread.body {
+            arena.verify_devices.forget_thread(ThreadVerifyIdentity {
+                body,
+                process_id: thread.lifetime.process_id(),
+                thread_id: thread.lifetime.thread_id(),
+                generation: thread.lifetime.generation(),
+            });
         }
     }
     Ok(ProcessBackingRetirement {

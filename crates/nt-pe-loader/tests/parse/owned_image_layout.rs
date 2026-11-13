@@ -71,3 +71,24 @@ fn owned_metadata_uses_the_existing_header_and_table_rejections() {
         PeError::TooManySections(97)
     );
 }
+
+#[test]
+fn owned_layout_resolves_only_file_backed_rva_spans_within_the_file() {
+    let bytes = build_pe(
+        BASE,
+        0x1000,
+        0x3000,
+        &[text_section(0x1000, vec![0xcc; 0x201])],
+        &[],
+    );
+    let layout = PeLayout::parse(&bytes).unwrap();
+    let section = &layout.sections()[0];
+    let raw = u64::from(section.pointer_to_raw_data);
+    let raw_size = section.size_of_raw_data as usize;
+
+    assert_eq!(layout.file_span_at_rva(0x1000, raw_size, bytes.len() as u64), Some(raw));
+    assert_eq!(layout.file_span_at_rva(0x1000, raw_size + 1, bytes.len() as u64), None);
+    assert_eq!(layout.file_span_at_rva(0x1000, 1, raw), None);
+    assert_eq!(layout.file_span_at_rva(0x1000, 1, bytes.len() as u64), Some(raw));
+    assert_eq!(layout.file_span_at_rva(u32::MAX, 2, bytes.len() as u64), None);
+}

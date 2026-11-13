@@ -26,14 +26,17 @@ enum HostedCompletion {
         publication: HostedRegistryPublication,
         parent_owner: RegistryKeyHandlePublication,
         parent: KeyRef,
+        parent_target: CmSystemKeyTarget,
         leaf: String,
         grant: u32,
     },
     Existing {
         key_owner: RegistryKeyHandlePublication,
+        key: KeyRef,
+        target: CmSystemKeyTarget,
         kind: ExistingMutationKind,
     },
-    SystemLocale { lease: SystemHiveKeyLease, locale_id: u32 },
+    SystemLocale { lease: SystemHiveKeyLease, physical_path: String, locale_id: u32 },
 }
 
 #[derive(Clone, Copy)]
@@ -83,6 +86,9 @@ impl HostedExistingKey {
     }
 }
 
+#[path = "registry_mutation_retry.rs"]
+mod retry;
+
 /// Bind a hidden PM reference before any CM query can reenter the executive.
 pub(crate) fn retain_hosted_existing(handler: &mut ExecNtHandler, key: KeyRef) -> Result<HostedExistingKey, u32> {
     let target = registry_key_targets::system(key).ok_or(0xC000_0008u32)?;
@@ -100,7 +106,7 @@ pub(crate) fn retain_hosted_existing(handler: &mut ExecNtHandler, key: KeyRef) -
 #[path = "registry_mutation_provider.rs"]
 mod provider;
 pub(crate) use provider::{
-    submit_provider, submit_provider_existing, DeferredRegistryExisting, ProviderRegistryResult,
+    submit_provider, submit_provider_existing, submit_provider_interface, DeferredRegistryExisting, ProviderRegistryResult,
     ProviderValueMutation,
 };
 
@@ -168,6 +174,7 @@ enum Phase {
 enum PersistenceOwner {
     Unadmitted,
     NoStorage,
+    Admitting { recheck_id: u64, bytes: Vec<u8> },
     Legacy(writable_fs::registry_journal::Journal<()>),
     Wal(WalJournal),
 }
@@ -183,6 +190,32 @@ pub(crate) struct MutationPersistence {
 }
 
 impl MutationPersistence {
+    pub(crate) fn admission_recheck_id(&self) -> Option<u64> {
+        match &self.owner {
+            PersistenceOwner::Admitting { recheck_id, .. } if *recheck_id != 0 =>
+                Some(*recheck_id),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn has_native_wal(&self) -> bool {
+        matches!(&self.owner, PersistenceOwner::Wal(_))
+    }
+
+    pub(crate) fn admitting(&self) -> bool {
+        matches!(&self.owner, PersistenceOwner::Admitting { .. })
+    }
+
+    pub(crate) fn claim_native_wal_io(&mut self) -> Result<Option<(nt_fs::AsyncWalIoRequest, nt_fs::BlockOperation, Vec<u8>, nt_memory_manager::SectionMountId)>, u32> {
+        let PersistenceOwner::Wal(wal) = &mut self.owner else { return Ok(None); };
+        let mount = wal.mount();
+        wal.claim_native_io().map(|claim| claim.map(|(request, operation, input)| (request, operation, input, mount)))
+    }
+
+    pub(crate) fn native_wal_mut(&mut self) -> Option<&mut WalJournal> {
+        match &mut self.owner { PersistenceOwner::Wal(wal) => Some(wal), _ => None }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             owner: PersistenceOwner::Unadmitted,
@@ -202,6 +235,21 @@ impl MutationPersistence {
         prepared: &PreparedSystemHiveMutation,
         bytes: Vec<u8>,
     ) -> Result<(), u32> {
+        if let PersistenceOwner::Admitting { recheck_id, .. } = &self.owner {
+            let recheck_id = *recheck_id;
+            let Some((lease, token, rechecked)) =
+                writable_fs::snapshot_storage::take_rechecked_wal_continuation(recheck_id)?
+            else { return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32); };
+            let PersistenceOwner::Admitting { bytes: retained, .. } =
+                core::mem::replace(&mut self.owner, PersistenceOwner::Unadmitted)
+            else { unreachable!() };
+            // The prepared CM bytes are checked again by admit_rechecked before its lease
+            // moves into the WAL. The retained copy is the only bytes that may be persisted.
+            drop(bytes);
+            let wal = WalJournal::admit_rechecked(prepared, retained, lease, token, rechecked)?;
+            self.owner = PersistenceOwner::Wal(wal);
+            return Ok(());
+        }
         assert!(matches!(&self.owner, PersistenceOwner::Unadmitted), "one storage owner per CM mutation");
         writable_fs::ensure_mounted()?;
         if bytes.is_empty() {
@@ -210,6 +258,21 @@ impl MutationPersistence {
             self.owner = PersistenceOwner::NoStorage;
             self.binding = Some(prepared.storage_binding());
             return Ok(());
+        }
+        match crate::fs_loader::exec_fs_mount_identity()
+            .and_then(crate::fs_loader::exec_block_route_kind) {
+            Some(nt_fs::BlockSourceKind::Draining) =>
+                return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32),
+            Some(nt_fs::BlockSourceKind::Native) => {
+                let recheck_id = writable_fs::snapshot_storage::begin_wal_continuation_recheck()
+                    .map_err(|status| if writable_fs::native_snapshot_io::admission_busy(status) {
+                        nt_status::NtStatus::DEVICE_BUSY.raw() as u32
+                    } else { status })?;
+                self.binding = Some(prepared.storage_binding());
+                self.owner = PersistenceOwner::Admitting { recheck_id, bytes };
+                return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as u32);
+            }
+            _ => {}
         }
         self.owner = if writable_fs::legacy_snapshot_writes_allowed() {
             let journal = writable_fs::registry_journal::Journal::admit(bytes, ())
@@ -228,6 +291,7 @@ impl MutationPersistence {
             PersistenceOwner::Legacy(journal) => journal.make_durable(),
             PersistenceOwner::Wal(wal) => wal.prepare(),
             PersistenceOwner::NoStorage | PersistenceOwner::Unadmitted => Ok(()),
+            PersistenceOwner::Admitting { .. } => Err(nt_fs::STATUS_DEVICE_NOT_READY),
         }
     }
 
@@ -264,6 +328,7 @@ impl MutationPersistence {
         match &mut self.owner {
             PersistenceOwner::Legacy(journal) => journal.rollback(),
             PersistenceOwner::Wal(_) | PersistenceOwner::NoStorage | PersistenceOwner::Unadmitted => Ok(()),
+            PersistenceOwner::Admitting { .. } => Err(nt_fs::STATUS_DEVICE_NOT_READY),
         }
     }
 
@@ -293,6 +358,10 @@ impl MutationPersistence {
         }
         match core::mem::replace(&mut self.owner, PersistenceOwner::Unadmitted) {
             PersistenceOwner::NoStorage => {}
+            PersistenceOwner::Admitting { recheck_id, bytes } => {
+                self.owner = PersistenceOwner::Admitting { recheck_id, bytes };
+                return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+            }
             PersistenceOwner::Unadmitted => return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST),
             PersistenceOwner::Legacy(journal) => match journal.release_after_publication() {
                 Ok(()) => {}
@@ -319,8 +388,39 @@ impl MutationPersistence {
         if self.abort_receipt != Some(ack.receipt()) {
             return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
         }
+        if let PersistenceOwner::Admitting { recheck_id, .. } = &self.owner {
+            let recheck_id = *recheck_id;
+            match writable_fs::snapshot_storage::take_rechecked_wal_continuation(recheck_id) {
+                Ok(None) => return Err(nt_fs::STATUS_DEVICE_NOT_READY),
+                Err(status) => {
+                    if writable_fs::snapshot_storage::recheck_was_aborted_no_effect(recheck_id) {
+                        self.owner = PersistenceOwner::Unadmitted;
+                        return Ok(());
+                    }
+                    return Err(status);
+                }
+                Ok(Some((lease, token, proof))) => {
+                    if let Err((status, token, pair)) =
+                        writable_fs::snapshot_storage::install_wal_continuation(
+                            &lease, token, proof.into_pair()) {
+                        core::mem::forget(lease);
+                        core::mem::forget(token);
+                        core::mem::forget(pair);
+                        writable_fs::block_uncertain_snapshot_reserve();
+                        return Err(status);
+                    }
+                    drop(lease);
+                    self.owner = PersistenceOwner::Unadmitted;
+                    return Ok(());
+                }
+            }
+        }
         match core::mem::replace(&mut self.owner, PersistenceOwner::Unadmitted) {
             PersistenceOwner::NoStorage | PersistenceOwner::Unadmitted => {}
+            PersistenceOwner::Admitting { recheck_id, bytes } => {
+                self.owner = PersistenceOwner::Admitting { recheck_id, bytes };
+                return Err(nt_fs::STATUS_DEVICE_NOT_READY);
+            }
             PersistenceOwner::Legacy(journal) => match journal.release_rolled_back() {
                 Ok(()) => {}
                 Err(journal) => {
@@ -341,6 +441,7 @@ impl MutationPersistence {
 }
 
 struct Work {
+    id: u64,
     caller: Caller,
     phase: Phase,
     prepared: Option<PreparedSystemHiveMutation>,
@@ -351,10 +452,127 @@ struct Work {
     cancelled: bool,
     commit_entered: bool,
     published: bool,
+    last_refusal: Option<(&'static str, u32)>,
+    refusal_count: u64,
+    retry_at: u64,
 }
 
 static mut ATTEMPTS: CmMutationBeginAttempts = CmMutationBeginAttempts::new();
 static mut WORK: Vec<Option<Work>> = Vec::new();
+static NEXT_WORK_ID: AtomicU64 = AtomicU64::new(1);
+static LAST_INTERFACE_RETRY_WORK_ID: AtomicU64 = AtomicU64::new(0);
+static LAST_INTERFACE_RETRY_PHASE: AtomicU64 = AtomicU64::new(0);
+static INTERFACE_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
+static LAST_EXISTING_RETRY_WORK_ID: AtomicU64 = AtomicU64::new(0);
+static LAST_EXISTING_RETRY_PHASE: AtomicU64 = AtomicU64::new(0);
+static EXISTING_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_REPLY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_REPLY_RECEIVE_WORK: AtomicU64 = AtomicU64::new(0);
+type WatchedBinding = nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>;
+#[derive(Clone, Copy)]
+struct HostedReplyWatch {
+    binding: WatchedBinding,
+    work_id: u64,
+    old_reply: u64,
+    call_seen: bool,
+    syscall_seen: bool,
+}
+static mut HOSTED_REPLY_WATCHES: [Option<HostedReplyWatch>; 16] = [None; 16];
+static HOSTED_REPLY_WATCH_NEXT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_REPLY_WATCH_PRINTS: AtomicU64 = AtomicU64::new(0);
+
+fn trace_reply_watch(stage: &[u8], watch: HostedReplyWatch, reply: u64,
+    label: u64, raw_ssn: u64, normalized_ssn: u64,
+) {
+    if HOSTED_REPLY_WATCH_PRINTS.fetch_add(1, Ordering::Relaxed) >= 1024 { return; }
+    print_str(b"[registry-reply-watch] stage="); print_str(stage);
+    print_str(b" id/pi/tid/badge/tcb/old-reply/new-reply=");
+    print_u64(watch.work_id); print_str(b"/");
+    print_u64(watch.binding.pi as u64); print_str(b"/");
+    print_u64(watch.binding.tid); print_str(b"/");
+    print_u64(watch.binding.badge); print_str(b"/");
+    print_u64(watch.binding.tcb); print_str(b"/");
+    print_u64(watch.old_reply); print_str(b"/"); print_u64(reply);
+    print_str(b" label/raw-ssn/normalized-ssn=");
+    print_u64(label); print_str(b"/"); print_u64(raw_ssn);
+    print_str(b"/"); print_u64(normalized_ssn);
+    print_str(b"\n");
+}
+
+/// Publish before the native Reply effect: a promptly resumed caller may reenter immediately.
+unsafe fn watch_hosted_reply(work_id: u64, caller: &HostedCaller) {
+    let Some(binding) = crate::service_sec_image::hosted_ingress_binding(caller.badge)
+        .filter(|binding| binding.pi == caller.pi && binding.tid == caller.tid
+            && binding.badge == caller.logical.badge()
+            && binding.process == caller.logical.process()
+            && binding.tcb == caller.logical.tcb())
+        else { return; };
+    let watch = HostedReplyWatch {
+        binding, work_id, old_reply: caller.reply, call_seen: false, syscall_seen: false,
+    };
+    let watches = &mut *core::ptr::addr_of_mut!(HOSTED_REPLY_WATCHES);
+    let index = watches.iter().position(|slot| slot.is_some_and(|row| row.binding == binding))
+        .or_else(|| watches.iter().position(Option::is_none))
+        .unwrap_or_else(|| HOSTED_REPLY_WATCH_NEXT.fetch_add(1, Ordering::Relaxed) as usize % watches.len());
+    watches[index] = Some(watch);
+    trace_reply_watch(b"published", watch, 0, 0, 0, 0);
+}
+
+/// Observe the first physical Call for each exact watched binding, even during Reply send.
+pub(crate) unsafe fn trace_next_hosted_call(binding: WatchedBinding, reply: u64, info: u64, mr0: u64) {
+    for slot in (&mut *core::ptr::addr_of_mut!(HOSTED_REPLY_WATCHES)).iter_mut() {
+        let Some(watch) = slot.as_mut().filter(|watch| watch.binding == binding && !watch.call_seen)
+            else { continue; };
+        watch.call_seen = true;
+        trace_reply_watch(b"next-call", *watch, reply, info >> 12, mr0, 0);
+        break;
+    }
+}
+
+/// Observe the first normalized root syscall independently of the Call observation.
+pub(crate) unsafe fn trace_next_hosted_syscall(
+    binding: WatchedBinding, raw_ssn: u64, normalized_ssn: u64,
+) {
+    for slot in (&mut *core::ptr::addr_of_mut!(HOSTED_REPLY_WATCHES)).iter_mut() {
+        let Some(watch) = slot.as_mut().filter(|watch| watch.binding == binding && !watch.syscall_seen)
+            else { continue; };
+        watch.syscall_seen = true;
+        trace_reply_watch(b"next-syscall", *watch, 0, 2, raw_ssn, normalized_ssn);
+        break;
+    }
+}
+
+fn trace_hosted_reply(work: &Work, from: &'static str, effect_status: u32) {
+    let Caller::Hosted(caller) = &work.caller else { return; };
+    if from != "complete" && from != "ready-reply" && from != "reply-entered"
+        && from != "reply-sent" { return; }
+    HOSTED_REPLY_RECEIVE_WORK.store(work.id, Ordering::Release);
+    // Keep every transition through a bounded boot budget so a later caller is not sampled away.
+    let count = HOSTED_REPLY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count > 1024 { return; }
+    print_str(b"[registry-hosted-reply] n="); print_u64(count);
+    print_str(b" id="); print_u64(work.id);
+    print_str(b" pi/tid/reply="); print_u64(caller.pi as u64);
+    print_str(b"/"); print_u64(caller.tid);
+    print_str(b"/"); print_u64(caller.reply);
+    print_str(b" from="); print_str(from.as_bytes());
+    print_str(b" to="); print_str(phase_name(&work.phase).as_bytes());
+    print_str(b" status=0x"); print_hex(work.status);
+    print_str(b" effect=0x"); print_hex(effect_status);
+    print_str(b" cancelled="); print_u64(u64::from(work.cancelled));
+    print_str(b"\n");
+}
+
+/// One copied work identity for the first root receive after a hosted Reply phase transition.
+pub(crate) fn take_hosted_reply_receive_work() -> u64 {
+    HOSTED_REPLY_RECEIVE_WORK.swap(0, Ordering::AcqRel)
+}
+
+fn next_work_id() -> u64 {
+    let id = NEXT_WORK_ID.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(id, 0, "registry mutation work id exhausted");
+    id
+}
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static PENDING: AtomicU64 = AtomicU64::new(0);
 static SYSTEM_LOCALE_PENDING: AtomicU64 = AtomicU64::new(0);
@@ -365,14 +583,462 @@ static mut EXECUTING: Option<ProviderLogicalCaller> = None;
 static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
 const RETRY_DELAY: u64 = 10_000_000;
 
+#[derive(Eq, PartialEq)]
+enum PhaseProgressFingerprint {
+    Other(core::mem::Discriminant<Phase>),
+    Begin(Option<u64>, Option<i32>, bool),
+    Prepare(CmMutationPreparationPhase, usize, usize),
+}
+
+fn phase_progress_fingerprint(phase: &Phase) -> PhaseProgressFingerprint {
+    match phase {
+        Phase::Begin(attempt) => PhaseProgressFingerprint::Begin(
+            attempt.server_nonce(), attempt.outcome_status(), attempt.is_acknowledged(),
+        ),
+        Phase::Prepare(preparation) => PhaseProgressFingerprint::Prepare(
+            preparation.phase(), preparation.uploaded_len(), preparation.collected_len(),
+        ),
+        _ => PhaseProgressFingerprint::Other(core::mem::discriminant(phase)),
+    }
+}
+
+fn trace_interface_retry_at(failures: u64) -> bool {
+    failures != 0 && failures.is_power_of_two()
+}
+
+#[derive(Clone, Copy)]
+enum AdmitRetrySubstage {
+    None,
+    ValidateStorage,
+    PersistenceAdmit,
+}
+
+fn phase_name(phase: &Phase) -> &'static str {
+    match phase {
+        Phase::ProviderAdmit => "provider-admit", Phase::Begin(_) => "begin",
+        Phase::Prepare(_) => "prepare", Phase::Admit => "admit",
+        Phase::Durable => "durable", Phase::Commit => "commit",
+        Phase::CommitDurable => "commit-durable", Phase::Open => "open",
+        Phase::Acknowledge => "acknowledge",
+        Phase::ReleasePublication(_) => "release-publication",
+        Phase::Abort => "abort", Phase::Rollback => "rollback",
+        Phase::DurableAbort(_) => "durable-abort",
+        Phase::AcknowledgeAbort(_) => "acknowledge-abort",
+        Phase::ReleaseRollback(_) => "release-rollback",
+        Phase::Complete => "complete", Phase::ReadyReply => "ready-reply",
+        Phase::ReplyEntered => "reply-entered", Phase::ReplySent => "reply-sent",
+        Phase::RevokeReply => "revoke-reply", Phase::RetypeReply => "retype-reply",
+        Phase::ReconcileRuntime => "reconcile-runtime",
+        Phase::ProviderReplyEntered => "provider-reply-entered",
+    }
+}
+
+/// The registry writer can retry a retained provider mutation indefinitely. Log only the
+/// first and power-of-two failures of the same interface-registration owner/phase so a bounded
+/// boot names the refused CM step without flooding serial or changing its retry contract.
+fn trace_interface_retry(work: &Work, error: i32, substage: AdmitRetrySubstage) {
+    let Caller::Provider(provider::ProviderCaller {
+        admission: provider::ProviderAdmission::InterfaceRegister(admission), ..
+    }) = &work.caller else { return; };
+    let phase = phase_name(&work.phase);
+    let phase_key = phase.as_ptr() as usize as u64;
+    let previous = LAST_INTERFACE_RETRY_WORK_ID.swap(work.id, Ordering::AcqRel);
+    let previous_phase = LAST_INTERFACE_RETRY_PHASE.swap(phase_key, Ordering::AcqRel);
+    let count = if previous == work.id && previous_phase == phase_key {
+        INTERFACE_RETRY_COUNT.fetch_add(1, Ordering::AcqRel).saturating_add(1)
+    } else {
+        INTERFACE_RETRY_COUNT.store(1, Ordering::Release);
+        1
+    };
+    if !trace_interface_retry_at(count) { return; }
+    print_str(b"[registry-interface-retry] id="); print_u64(work.id);
+    print_str(b" count="); print_u64(count);
+    print_str(b" route="); print_u64(admission.dispatch.route().badge());
+    print_str(b" phase="); print_str(phase.as_bytes());
+    if matches!(work.phase, Phase::Admit) {
+        print_str(b" admit-substage=");
+        print_str(match substage {
+            AdmitRetrySubstage::None => b"none",
+            AdmitRetrySubstage::ValidateStorage => b"validate-storage",
+            AdmitRetrySubstage::PersistenceAdmit => b"persistence-admit",
+        });
+        print_str(b" storage-owner=");
+        print_str(match &work.persistence.owner {
+            PersistenceOwner::Unadmitted => b"unadmitted",
+            PersistenceOwner::NoStorage => b"no-storage",
+            PersistenceOwner::Admitting { .. } => b"admitting",
+            PersistenceOwner::Legacy(_) => b"legacy",
+            PersistenceOwner::Wal(_) => b"wal",
+        });
+        if let Some(recheck_id) = work.persistence.admission_recheck_id() {
+            print_str(b" recheck-id="); print_u64(recheck_id);
+        }
+    }
+    print_str(b" error=0x"); print_hex_u64(error as u32 as u64);
+    print_str(b" work-status=0x"); print_hex_u64(work.status as u64);
+    print_str(b" expected-generation="); print_u64(admission.expected_generation);
+    match &work.phase {
+        Phase::Begin(attempt) => {
+            print_str(b" begin-nonce="); print_u64(attempt.server_nonce().unwrap_or(0));
+            print_str(b" begin-outcome=0x");
+            print_hex_u64(attempt.outcome_status().unwrap_or(0) as u32 as u64);
+            print_str(b" begin-ack="); print_u64(u64::from(attempt.is_acknowledged()));
+        }
+        Phase::Prepare(preparation) => {
+            print_str(b" prepare-phase=");
+            print_str(match preparation.phase() {
+                CmMutationPreparationPhase::Appending => b"appending",
+                CmMutationPreparationPhase::Preparing => b"preparing",
+                CmMutationPreparationPhase::Allocating => b"allocating",
+                CmMutationPreparationPhase::Pulling => b"pulling",
+                CmMutationPreparationPhase::Prepared => b"prepared",
+                CmMutationPreparationPhase::Cancelling => b"cancelling",
+                CmMutationPreparationPhase::AcknowledgingCancellation => b"acknowledging-cancellation",
+                CmMutationPreparationPhase::Cancelled => b"cancelled",
+                CmMutationPreparationPhase::Taken => b"taken",
+            });
+            print_str(b" uploaded="); print_u64(preparation.uploaded_len() as u64);
+            print_str(b" collected="); print_u64(preparation.collected_len() as u64);
+        }
+        _ => {}
+    }
+    print_str(b" retry-100ns="); print_u64(RETRY_DELAY);
+    print_str(b"\n");
+}
+
+/// Name a retained SYSTEM value mutation that repeatedly fails during a nested provider call.
+fn trace_existing_provider_retry(work: &Work, error: i32, substage: AdmitRetrySubstage) {
+    let Caller::Provider(provider::ProviderCaller {
+        admission: provider::ProviderAdmission::Existing(admission), ..
+    }) = &work.caller else { return; };
+    let phase = phase_name(&work.phase);
+    let phase_key = phase.as_ptr() as usize as u64;
+    let previous = LAST_EXISTING_RETRY_WORK_ID.swap(work.id, Ordering::AcqRel);
+    let previous_phase = LAST_EXISTING_RETRY_PHASE.swap(phase_key, Ordering::AcqRel);
+    let count = if previous == work.id && previous_phase == phase_key {
+        EXISTING_RETRY_COUNT.fetch_add(1, Ordering::AcqRel).saturating_add(1)
+    } else {
+        EXISTING_RETRY_COUNT.store(1, Ordering::Release);
+        1
+    };
+    if !trace_interface_retry_at(count) { return; }
+    print_str(b"[registry-existing-retry] id="); print_u64(work.id);
+    print_str(b" count="); print_u64(count);
+    print_str(b" route="); print_u64(admission.dispatch.route().badge());
+    print_str(b" phase="); print_str(phase.as_bytes());
+    print_str(b" admit-substage=");
+    print_str(match substage {
+        AdmitRetrySubstage::None => b"none",
+        AdmitRetrySubstage::ValidateStorage => b"validate-storage",
+        AdmitRetrySubstage::PersistenceAdmit => b"persistence-admit",
+    });
+    print_str(b" storage-owner=");
+    print_str(match &work.persistence.owner {
+        PersistenceOwner::Unadmitted => b"unadmitted",
+        PersistenceOwner::NoStorage => b"no-storage",
+        PersistenceOwner::Admitting { .. } => b"admitting",
+        PersistenceOwner::Legacy(_) => b"legacy",
+        PersistenceOwner::Wal(_) => b"wal",
+    });
+    if let Some(recheck_id) = work.persistence.admission_recheck_id() {
+        print_str(b" recheck-id="); print_u64(recheck_id);
+    }
+    print_str(b" error=0x"); print_hex_u64(error as u32 as u64);
+    print_str(b" work-status=0x"); print_hex_u64(work.status as u64);
+    print_str(b" expected-generation="); print_u64(admission.expected_generation);
+    print_str(b" retry-100ns="); print_u64(RETRY_DELAY);
+    print_str(b"\n");
+}
+
 /// Includes work retained across a failed CM exchange or a storage effect. The bootstrap
 /// handoff must wait for this count and the journal owner before moving Ps into the handler.
 pub(crate) fn pending_count() -> u64 {
     PENDING.load(Ordering::Acquire)
 }
 
+/// Bounded quiesce-only census. The selected row may be temporarily moved out while ACTIVE.
+pub(crate) unsafe fn print_quiesce_owners() {
+    print_str(b"[quiesce-registry-mutation] pending=");
+    print_u64(PENDING.load(Ordering::Acquire));
+    print_str(b" active="); print_u64(u64::from(ACTIVE.load(Ordering::Acquire)));
+    print_str(b" next-100ns="); print_u64(NEXT.load(Ordering::Acquire));
+    print_str(b" selected-index="); print_u64(EXECUTING_INDEX.load(Ordering::Relaxed));
+    print_str(b"\n");
+    let mut shown = 0usize;
+    let mut omitted = 0usize;
+    for work in (&*core::ptr::addr_of!(WORK)).iter().flatten() {
+        if shown == 8 { omitted += 1; continue; }
+        print_str(b"[quiesce-registry-owner] id="); print_u64(work.id);
+        print_str(b" caller=");
+        print_str(match &work.caller { Caller::Hosted(_) => b"hosted", Caller::Provider(_) => b"provider" });
+        print_str(b" phase="); print_str(phase_name(&work.phase).as_bytes());
+        print_str(b" storage=");
+        print_str(match &work.persistence.owner {
+            PersistenceOwner::Unadmitted => b"unadmitted",
+            PersistenceOwner::NoStorage => b"no-storage",
+            PersistenceOwner::Admitting { .. } => b"admitting",
+            PersistenceOwner::Legacy(_) => b"legacy",
+            PersistenceOwner::Wal(_) => b"wal",
+        });
+        print_str(b" recheck-id=");
+        print_u64(work.persistence.admission_recheck_id().unwrap_or(0));
+        print_str(b" status="); print_hex(work.status);
+        print_str(b" commit-entered="); print_u64(u64::from(work.commit_entered));
+        print_str(b"\n");
+        shown += 1;
+    }
+    if omitted != 0 {
+        print_str(b"[quiesce-registry-owner] omitted="); print_u64(omitted as u64);
+        print_str(b"\n");
+    }
+}
+
+/// A provider's retained storage admission is the authority for its native header recheck.
+/// The numeric recheck id alone never authorizes unrelated mounted block work.
+pub(crate) fn pending_provider_header_recheck() -> Option<u64> {
+    unsafe {
+        if ACTIVE.load(Ordering::Acquire) {
+            return None;
+        }
+        (&*core::ptr::addr_of!(WORK)).iter().flatten().find_map(|work| {
+            (matches!(&work.caller, Caller::Provider(_)) && matches!(&work.phase, Phase::Admit))
+                .then(|| work.persistence.admission_recheck_id())
+                .flatten()
+        })
+    }
+}
+
+/// A provider mutation waiting for its own native WAL PREPARE, marker, abort, or anchor.
+/// The row remains pinned while the physical command is outstanding. A numeric work id alone
+/// cannot authorize native I/O; the exact retained owner and phase are checked here.
+pub(crate) fn pending_provider_native_wal_io() -> Option<u64> {
+    unsafe {
+        if ACTIVE.load(Ordering::Acquire) {
+            return None;
+        }
+        (&*core::ptr::addr_of!(WORK)).iter().flatten().find_map(|work| {
+            if !matches!(&work.caller, Caller::Provider(_))
+                || !matches!(&work.phase,
+                    Phase::Durable | Phase::CommitDurable | Phase::DurableAbort(_))
+            {
+                return None;
+            }
+            match &work.persistence.owner {
+                PersistenceOwner::Wal(wal) if wal.native_io_active() => Some(work.id),
+                _ => None,
+            }
+        })
+    }
+}
+
+/// Copied census evidence. The work table is inspected only on the executive thread.
+#[derive(Debug)]
+pub(crate) struct CensusSnapshot {
+    pending: u64,
+    active: bool,
+    next_deadline: u64,
+    selected_index: u64,
+    hosted_rows: usize,
+    provider_rows: usize,
+    hosted_samples: [Option<HostedRowSample>; 4],
+    hosted_sample_overflow: usize,
+    first_provider: Option<(u64, &'static str, &'static str)>,
+}
+
+/// Fixed-size copied evidence; no retained Reply, Key, journal, or table reference escapes.
+#[derive(Clone, Copy, Debug)]
+struct HostedRowSample {
+    id: u64,
+    pi: usize,
+    tid: u64,
+    phase: &'static str,
+    storage: &'static str,
+    recheck_id: Option<u64>,
+    wal_io_active: bool,
+    status: u32,
+    commit_entered: bool,
+    last_refusal: Option<(&'static str, u32)>,
+    refusal_count: u64,
+    retry_at: u64,
+}
+
+pub(crate) unsafe fn census_snapshot() -> CensusSnapshot {
+    let rows = &*core::ptr::addr_of!(WORK);
+    let mut hosted_rows = 0;
+    let mut provider_rows = 0;
+    let mut hosted_samples = [None; 4];
+    let mut hosted_sample_overflow = 0;
+    let mut first_provider = None;
+    for work in rows.iter().flatten() {
+        match &work.caller {
+            Caller::Hosted(caller) => {
+                hosted_rows += 1;
+                if let Some(slot) = hosted_samples.iter_mut().find(|slot| slot.is_none()) {
+                    *slot = Some(HostedRowSample {
+                        id: work.id,
+                        pi: caller.pi,
+                        tid: caller.tid,
+                        phase: phase_name(&work.phase),
+                        storage: persistence_name(&work.persistence.owner),
+                        recheck_id: work.persistence.admission_recheck_id(),
+                        wal_io_active: match &work.persistence.owner {
+                            PersistenceOwner::Wal(wal) => wal.native_io_active(),
+                            _ => false,
+                        },
+                        status: work.status,
+                        commit_entered: work.commit_entered,
+                        last_refusal: work.last_refusal,
+                        refusal_count: work.refusal_count,
+                        retry_at: work.retry_at,
+                    });
+                } else {
+                    hosted_sample_overflow += 1;
+                }
+            }
+            Caller::Provider(_) => {
+                provider_rows += 1;
+                if first_provider.is_none() {
+                    let storage = persistence_name(&work.persistence.owner);
+                    first_provider = Some((work.id, phase_name(&work.phase), storage));
+                }
+            }
+        }
+    }
+    CensusSnapshot {
+        pending: PENDING.load(Ordering::Acquire),
+        active: ACTIVE.load(Ordering::Acquire),
+        next_deadline: NEXT.load(Ordering::Acquire),
+        selected_index: EXECUTING_INDEX.load(Ordering::Relaxed),
+        hosted_rows,
+        provider_rows,
+        hosted_samples,
+        hosted_sample_overflow,
+        first_provider,
+    }
+}
+
+fn persistence_name(owner: &PersistenceOwner) -> &'static str {
+    match owner {
+        PersistenceOwner::Unadmitted => "unadmitted",
+        PersistenceOwner::NoStorage => "no-storage",
+        PersistenceOwner::Admitting { .. } => "admitting",
+        PersistenceOwner::Legacy(_) => "legacy",
+        PersistenceOwner::Wal(_) => "wal",
+    }
+}
+
+/// Eligibility is value-only. The selected row is taken only after the exact caller kind and
+/// deadline have been checked, so an unrelated refusal cannot delay another retained owner.
+fn select_ready_mutation(
+    rows: &[Option<Work>], start: usize, now: u64, provider_only: bool,
+) -> Option<usize> {
+    nt_config_client::mutation_retry_schedule::select_ready_index(
+        rows.len(), start, now, |index| rows[index].as_ref().and_then(|work| {
+            (!provider_only || matches!(work.caller, Caller::Provider(_)))
+                .then_some(work.retry_at)
+        }),
+    )
+}
+
+fn earliest_mutation_retry(rows: &[Option<Work>]) -> Option<u64> {
+    nt_config_client::mutation_retry_schedule::earliest_retry_deadline(
+        rows.len(), |index| rows[index].as_ref().map(|work| work.retry_at),
+    )
+}
+
+fn wake_mutation_row(work: &mut Work) {
+    let now = monotonic_time_100ns();
+    work.retry_at = now;
+    NEXT.store(now, Ordering::Release);
+}
+
 pub(crate) fn redrive_active() -> bool {
     ACTIVE.load(Ordering::Acquire)
+}
+
+/// The outer native block executor alone claims physical WAL commands. A selected work row is
+/// temporarily moved out of this table, so skip it until redrive has restored the owner.
+pub(crate) unsafe fn claim_next_native_wal_io() -> Option<writable_fs::native_snapshot_io::SnapshotClaim> {
+    let rows = &mut *core::ptr::addr_of_mut!(WORK);
+    for (index, row) in rows.iter_mut().enumerate() {
+        if EXECUTING_INDEX.load(Ordering::Relaxed) == index as u64 { continue; }
+        let Some(work) = row.as_mut() else { continue; };
+        match work.persistence.claim_native_wal_io() {
+            Ok(Some((request, operation, input, mount))) => {
+                return Some(writable_fs::native_snapshot_io::SnapshotClaim::from_mutation(
+                    mount, operation, input, work.id, request,
+                ));
+            }
+            Ok(None) => {},
+            Err(_) => {
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// Claim only the retained provider row selected under a parked Receive parent. The outer
+/// executor may claim any work; nested Receive has authority for this one exact WAL owner.
+pub(crate) unsafe fn claim_native_wal_io_for(id: u64) -> Option<writable_fs::native_snapshot_io::SnapshotClaim> {
+    if pending_provider_native_wal_io() != Some(id) {
+        return None;
+    }
+    let work = (&mut *core::ptr::addr_of_mut!(WORK)).iter_mut().flatten()
+        .find(|work| work.id == id)?;
+    match work.persistence.claim_native_wal_io() {
+        Ok(Some((request, operation, input, mount))) =>
+            Some(writable_fs::native_snapshot_io::SnapshotClaim::from_mutation(
+                mount, operation, input, work.id, request,
+            )),
+        Ok(None) | Err(_) => None,
+    }
+}
+
+unsafe fn native_wal_by_id(id: u64) -> Result<&'static mut WalJournal, u32> {
+    let rows = &mut *core::ptr::addr_of_mut!(WORK);
+    rows.iter_mut().flatten().find(|work| work.id == id)
+        .and_then(|work| work.persistence.native_wal_mut())
+        .ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)
+}
+
+pub(crate) unsafe fn mark_native_wal_io_entered(id: u64, request: nt_fs::AsyncWalIoRequest) -> Result<(), u32> {
+    native_wal_by_id(id)?.mark_native_io_entered(request)
+}
+
+pub(crate) unsafe fn release_unentered_native_wal_io(id: u64, request: nt_fs::AsyncWalIoRequest) -> Result<(), u32> {
+    let work = (&mut *core::ptr::addr_of_mut!(WORK)).iter_mut().flatten()
+        .find(|work| work.id == id).ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
+    work.persistence.native_wal_mut().ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?
+        .release_unentered_native_io(request)?;
+    wake_mutation_row(work);
+    Ok(())
+}
+
+pub(crate) unsafe fn refuse_unentered_native_wal_io(
+    id: u64, request: nt_fs::AsyncWalIoRequest, status: nt_status::NtStatus,
+) -> Result<(), u32> {
+    let work = (&mut *core::ptr::addr_of_mut!(WORK)).iter_mut().flatten()
+        .find(|work| work.id == id).ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
+    let wal = work.persistence.native_wal_mut().ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
+    let refusal = wal.refuse_unentered_native_io(request)?;
+    work.status = status.raw() as u32;
+    if refusal == nt_fs::AsyncWalRefusal::NoEffect {
+        work.phase = Phase::Rollback;
+    }
+    wake_mutation_row(work);
+    Ok(())
+}
+
+pub(crate) unsafe fn complete_native_wal_io(
+    id: u64, request: nt_fs::AsyncWalIoRequest, result: Result<&[u8], nt_status::NtStatus>,
+) -> Result<writable_fs::native_snapshot_io::SnapshotCompletion, u32> {
+    let work = (&mut *core::ptr::addr_of_mut!(WORK)).iter_mut().flatten()
+        .find(|work| work.id == id).ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?;
+    let settled = work.persistence.native_wal_mut().ok_or(nt_fs::STATUS_INVALID_DEVICE_REQUEST)?
+        .complete_native_io(request, result);
+    wake_mutation_row(work);
+    settled
 }
 
 /// Failure returns both canonical owners unchanged; no CM mutation has been sent.
@@ -388,6 +1054,12 @@ pub(crate) unsafe fn submit_hosted(
 ) -> Result<(), (u32, HostedRegistryPublication, RegistryKeyHandlePublication)> {
     let _durable = allocator::enter_durable();
     let admission = (|| {
+        let parent_target = registry_key_targets::system(parent).ok_or(0xC000_0008u32)?;
+        match &mutation {
+            SystemHiveMutation::CreateChildRelative { parent: lease, name, .. }
+                if *lease == parent_target.lease && *name == leaf.as_str() => {}
+            _ => return Err(0xC000_0008u32),
+        }
         let tcb = handler.hosted_thread_tcb(handler.current_tid).ok_or(0xC000_0008u32)?;
         let logical = handler.capture_provider_logical_caller(
             handler.pi, handler.current_tid, handler.current_badge, tcb,
@@ -416,14 +1088,14 @@ pub(crate) unsafe fn submit_hosted(
                 return Err(status as u32);
             }
         };
-        Ok((park, attempt, logical, reference, index))
+        Ok((park, attempt, logical, reference, index, parent_target))
     })();
-    let (park, attempt, logical, reference, index) = match admission {
+    let (park, attempt, logical, reference, index, parent_target) = match admission {
         Ok(admission) => admission,
         Err(status) => return Err((status, publication, parent_owner)),
     };
     let caller = HostedCaller {
-        completion: HostedCompletion::Create { publication, parent_owner, parent, leaf, grant },
+        completion: HostedCompletion::Create { publication, parent_owner, parent, parent_target, leaf, grant },
         pi: handler.pi,
         tid: handler.current_tid,
         badge: handler.current_badge,
@@ -442,9 +1114,11 @@ pub(crate) unsafe fn submit_hosted(
     };
     assert_ne!(caller.reply, 0);
     let work = Some(Work {
+        id: next_work_id(),
         caller: Caller::Hosted(caller), phase: Phase::Begin(attempt), prepared: None, persistence: MutationPersistence::new(),
         receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
+        last_refusal: None, refusal_count: 0, retry_at: 0,
     });
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
     match index {
@@ -510,16 +1184,22 @@ pub(crate) unsafe fn submit_hosted_existing(
     mutation: SystemHiveMutation<'_>,
 ) -> Result<(), u32> {
     let _durable = allocator::enter_durable();
-    let kind = match &mutation {
-        SystemHiveMutation::SetValue { .. } => ExistingMutationKind::SetValue,
-        SystemHiveMutation::DeleteValue { .. } => ExistingMutationKind::DeleteValue,
-        SystemHiveMutation::SetKeySecurity { .. } => ExistingMutationKind::SetSecurity,
-        SystemHiveMutation::DeleteKey { .. } => ExistingMutationKind::DeleteKey,
+    let (kind, mutation_path) = match &mutation {
+        SystemHiveMutation::SetValue { path, .. } => (ExistingMutationKind::SetValue, *path),
+        SystemHiveMutation::DeleteValue { path, .. } => (ExistingMutationKind::DeleteValue, *path),
+        SystemHiveMutation::SetKeySecurity { path, .. } => (ExistingMutationKind::SetSecurity, *path),
+        SystemHiveMutation::DeleteKey { path } => (ExistingMutationKind::DeleteKey, *path),
         _ => {
             retained.abort(handler);
             return Err(0xC000_000Du32);
         }
     };
+    if nt_hive_core::canon_path(mutation_path)
+        != nt_hive_core::canon_path(&retained.target.physical_path)
+    {
+        retained.abort(handler);
+        return Err(0xC000_0008u32);
+    }
     let (park, index, logical, reference, attempt) = match admit_hosted_mutation(
         handler, expected_generation, mutation,
     ) {
@@ -531,7 +1211,7 @@ pub(crate) unsafe fn submit_hosted_existing(
     };
     let key_owner = retained.owner.take().expect("retained existing Key owner");
     let hosted = HostedCaller {
-        completion: HostedCompletion::Existing { key_owner, kind },
+        completion: HostedCompletion::Existing { key_owner, key: retained.key, target: retained.target, kind },
         pi: handler.pi,
         tid: handler.current_tid,
         badge: handler.current_badge,
@@ -550,9 +1230,11 @@ pub(crate) unsafe fn submit_hosted_existing(
     };
     assert_ne!(hosted.reply, 0);
     let work = Some(Work {
+        id: next_work_id(),
         caller: Caller::Hosted(hosted), phase: Phase::Begin(attempt), prepared: None, persistence: MutationPersistence::new(),
         receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
+        last_refusal: None, refusal_count: 0, retry_at: 0,
     });
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
     match index {
@@ -577,6 +1259,12 @@ pub(crate) unsafe fn submit_hosted_system_locale(
     locale_id: u32,
 ) -> Result<(), u32> {
     let _durable = allocator::enter_durable();
+    let mut physical_path = String::new();
+    if physical_path.try_reserve_exact(path.len()).is_err() {
+        let _ = config_manager_retire_system_hive_key(lease);
+        return Err(0xC000_009Au32);
+    }
+    physical_path.push_str(path);
     let mutation = SystemHiveMutation::SetValue { path, name, value_type: 1, data };
     let (park, index, logical, reference, attempt) = match admit_hosted_mutation(
         handler, expected_generation, mutation,
@@ -588,7 +1276,7 @@ pub(crate) unsafe fn submit_hosted_system_locale(
         }
     };
     let caller = HostedCaller {
-        completion: HostedCompletion::SystemLocale { lease, locale_id },
+        completion: HostedCompletion::SystemLocale { lease, physical_path, locale_id },
         pi: handler.pi,
         tid: handler.current_tid,
         badge: handler.current_badge,
@@ -607,9 +1295,11 @@ pub(crate) unsafe fn submit_hosted_system_locale(
     };
     assert_ne!(caller.reply, 0);
     let work = Some(Work {
+        id: next_work_id(),
         caller: Caller::Hosted(caller), phase: Phase::Begin(attempt), prepared: None, persistence: MutationPersistence::new(),
         receipt: None, opening: None, status: 0,
         cancelled: false, commit_entered: false, published: false,
+        last_refusal: None, refusal_count: 0, retry_at: 0,
     });
     let rows = &mut *core::ptr::addr_of_mut!(WORK);
     match index {
@@ -673,66 +1363,85 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler, queue: &mut nt_delay_e
 
 /// Bootstrap and provider pumps may progress provider work without inventing a hosted handler.
 #[inline(never)]
-pub(crate) unsafe fn redrive_provider() {
+pub(crate) unsafe fn redrive_provider() -> bool {
     // Keep the common empty/already-running path out of redrive_inner's large Work frame.
     // Nested hosted pumps can reach this call several times on the rootserver stack.
     if PENDING.load(Ordering::Acquire) == 0
         || monotonic_time_100ns() < NEXT.load(Ordering::Acquire)
         || ACTIVE.load(Ordering::Acquire)
     {
-        return;
+        return false;
     }
-    redrive_inner(None);
+    redrive_inner(None)
 }
 
 #[inline(never)]
-unsafe fn redrive_inner(mut context: HostedContext<'_>) {
+unsafe fn redrive_inner(mut context: HostedContext<'_>) -> bool {
     if PENDING.load(Ordering::Acquire) == 0
         || monotonic_time_100ns() < NEXT.load(Ordering::Acquire)
         || ACTIVE.swap(true, Ordering::AcqRel)
     {
-        return;
+        return false;
     }
     let _durable = allocator::enter_durable();
     let mut failed = false;
+    let mut immediate_progress = false;
+    let mut completed = false;
     let selected = {
         let rows = &mut *core::ptr::addr_of_mut!(WORK);
         let count = rows.len();
-        let start = CURSOR.load(Ordering::Relaxed) as usize % count;
-        (0..count).find_map(|step| {
-            let index = (start + step) % count;
-            if context.is_none() && rows[index].as_ref()
-                .is_some_and(|work| matches!(work.caller, Caller::Hosted(_))) {
-                return None;
-            }
-            rows[index].take().map(|work| (index, work))
-        })
+        let start = CURSOR.load(Ordering::Relaxed) as usize;
+        select_ready_mutation(rows, start, monotonic_time_100ns(), context.is_none())
+            .and_then(|index| rows[index].take().map(|work| (index, work)))
     };
     if let Some((index, mut work)) = selected {
         EXECUTING_INDEX.store(index as u64, Ordering::Relaxed);
         CURSOR.store(index as u64 + 1, Ordering::Relaxed);
         *core::ptr::addr_of_mut!(EXECUTING) = work.caller.logical();
-        let mut completed = false;
         // Bound each sweep; long journals resume fairly on the next maintenance tick.
         for _ in 0..16 {
             *core::ptr::addr_of_mut!(EXECUTING) =
                 if matches!(work.phase, Phase::ReconcileRuntime) { None } else { work.caller.logical() };
-            match advance(&mut context, &mut work) {
-                Ok(true) => { completed = true; break; }
-                Ok(false) => {}
-                Err(_) => { failed = true; break; }
+            let previous_phase = phase_progress_fingerprint(&work.phase);
+            let previous_name = phase_name(&work.phase);
+            let mut admit_retry_substage = AdmitRetrySubstage::None;
+            let result = advance(&mut context, &mut work, &mut admit_retry_substage);
+            trace_hosted_reply(&work, previous_name,
+                result.as_ref().err().copied().unwrap_or(0) as u32);
+            match result {
+                Ok(true) => { completed = true; immediate_progress = true; break; }
+                Ok(false) => {
+                    immediate_progress = previous_phase != phase_progress_fingerprint(&work.phase);
+                }
+                Err(status) => {
+                    work.last_refusal = Some((phase_name(&work.phase), status as u32));
+                    work.refusal_count = work.refusal_count.saturating_add(1);
+                    trace_interface_retry(&work, status, admit_retry_substage);
+                    trace_existing_provider_retry(&work, status, admit_retry_substage);
+                    failed = true;
+                    immediate_progress = false;
+                    break;
+                }
             }
         }
         if completed {
             PENDING.fetch_sub(1, Ordering::Release);
         } else {
+            work.retry_at = if failed {
+                monotonic_time_100ns().saturating_add(RETRY_DELAY)
+            } else { 0 };
             (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
         }
         *core::ptr::addr_of_mut!(EXECUTING) = None;
         EXECUTING_INDEX.store(u64::MAX, Ordering::Relaxed);
     }
-    NEXT.store(monotonic_time_100ns().saturating_add(if failed { RETRY_DELAY } else { 0 }), Ordering::Release);
+    let next = earliest_mutation_retry(&*core::ptr::addr_of!(WORK)).unwrap_or(0);
+    NEXT.store(next, Ordering::Release);
     ACTIVE.store(false, Ordering::Release);
+    if !completed && immediate_progress {
+        return true;
+    }
+    completed && PENDING.load(Ordering::Acquire) != 0
 }
 
 unsafe fn caller_cancelled(handler: &ExecNtHandler, caller: &HostedCaller) -> bool {
@@ -746,6 +1455,7 @@ unsafe fn caller_cancelled(handler: &ExecNtHandler, caller: &HostedCaller) -> bo
 unsafe fn advance(
     context: &mut HostedContext<'_>,
     work: &mut Work,
+    admit_retry_substage: &mut AdmitRetrySubstage,
 ) -> Result<bool, i32> {
     work.cancelled |= match &work.caller {
         Caller::Hosted(caller) => caller_cancelled(&*context.as_ref().unwrap().0, caller),
@@ -769,6 +1479,88 @@ unsafe fn advance(
             if attempt.is_acknowledged() {
                 if attempt.outcome_status() == Some(0) {
                     work.phase = Phase::Prepare(attempts.take_upload(attempt)?.into_preparation());
+                } else if attempt.outcome_status() == Some(nt_status::NtStatus::DEVICE_BUSY.raw() as i32)
+                    && !work.cancelled
+                    && matches!(&work.caller, Caller::Hosted(_))
+                {
+                    // CM ACKed an exact no-token refusal. Keep the original caller, Reply,
+                    // mutation journal and mount while a prior writer releases its lease.
+                    attempts.retry_acknowledged_busy(attempt)?;
+                    return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as i32);
+                } else if attempt.outcome_status() == Some(0xC000_0059u32 as i32)
+                    && !work.cancelled
+                    && matches!(&work.caller, Caller::Hosted(_))
+                {
+                    let rebase = (|| {
+                        let generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+                        let mount = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT
+                            .ok_or(0xC000_00A3u32 as i32)?;
+                        if mount != attempt.mount() {
+                            return Err(0xC000_0008u32 as i32);
+                        }
+                        if generation <= attempt.expected_generation() {
+                            return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as i32);
+                        }
+                        let Caller::Hosted(caller) = &work.caller else { unreachable!() };
+                        retry::revalidate_hosted_revision(caller, mount, generation)?;
+                        attempts.retry_acknowledged_revision(attempt, mount, generation)
+                    })();
+                    match rebase {
+                        Ok(()) => return Err(nt_status::NtStatus::DEVICE_BUSY.raw() as i32),
+                        // The durable writer may still be catching up. Keep the ACKed attempt;
+                        // its exact continuation remains available for the next revalidation.
+                        Err(status) if status == nt_status::NtStatus::DEVICE_BUSY.raw() as i32 =>
+                            return Err(status),
+                        Err(status) => {
+                            let _ = attempts.take_failure(attempt)?;
+                            work.status = status as u32;
+                            work.phase = Phase::Complete;
+                        }
+                    }
+                } else if attempt.outcome_status() == Some(0xC000_0059u32 as i32)
+                    && !work.cancelled
+                    && matches!(&work.caller, Caller::Provider(provider::ProviderCaller {
+                        admission: provider::ProviderAdmission::InterfaceRegister(_), ..
+                    }))
+                {
+                    // The old BEGIN is durably ACKed with no effect. A concurrent writer may
+                    // advance SYSTEM, but the original interface may retry only on the same
+                    // mounted hive while its exact PDO and devnode still name that instance.
+                    let rebase = (|| {
+                        let generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+                        let mount = LIVE_CONFIG_MANAGER_SYSTEM_MOUNT
+                            .ok_or(0xC000_00A3u32 as i32)?;
+                        let value = match &mut work.caller {
+                            Caller::Provider(provider::ProviderCaller {
+                                admission: provider::ProviderAdmission::InterfaceRegister(value), ..
+                            }) => value,
+                            _ => unreachable!(),
+                        };
+                        if mount != value.mount {
+                            return Err(0xC000_00A3u32 as i32);
+                        }
+                        if generation <= attempt.expected_generation() {
+                            return Err(0x8000_0011u32 as i32);
+                        }
+                        CONFIG_CLIENT_PTR.as_mut()
+                            .ok_or(0xC000_00A3u32 as i32)?
+                            .validate_system_hive_mount(value.mount, generation)?;
+                        value.revalidate_for_revision_retry(
+                            mount, attempt.expected_generation(), generation,
+                        )?;
+                        attempts.retry_acknowledged_revision(attempt, value.mount, generation)?;
+                        value.expected_generation = generation;
+                        Ok(())
+                    })();
+                    match rebase {
+                        Ok(()) => return Ok(false),
+                        Err(status) if status == 0x8000_0011u32 as i32 => return Err(status),
+                        Err(status) => {
+                            let _ = attempts.take_failure(attempt)?;
+                            work.status = status as u32;
+                            work.phase = Phase::Complete;
+                        }
+                    }
                 } else {
                     let (status, ()) = attempts.take_failure(attempt)?;
                     work.status = status as u32;
@@ -824,22 +1616,28 @@ unsafe fn advance(
             }
         }
         Phase::Admit => {
-            if work.cancelled {
+            if work.cancelled && !work.persistence.admitting() {
                 work.phase = Phase::Abort;
                 return Ok(false);
             }
             let prepared = work.prepared.as_ref().unwrap();
             if let Err(status) = cm_mutation_transport::validate_storage(prepared) {
+                if status == nt_status::NtStatus::DEVICE_BUSY.raw() {
+                    *admit_retry_substage = AdmitRetrySubstage::ValidateStorage;
+                    return Err(status);
+                }
                 work.status = status as u32;
                 work.phase = Phase::Abort;
                 return Ok(false);
             }
-            let bytes = system_mutation_storage(prepared).map_err(|status| status as i32)?;
+            let bytes = if work.persistence.admitting() { Vec::new() }
+                else { system_mutation_storage(prepared).map_err(|status| status as i32)? };
             match work.persistence.admit(prepared, bytes) {
                 Ok(()) => {
                     work.phase = if work.persistence.has_journal() { Phase::Durable } else { Phase::Commit };
                 }
                 Err(status) if status == nt_status::NtStatus::DEVICE_BUSY.raw() as u32 => {
+                    *admit_retry_substage = AdmitRetrySubstage::PersistenceAdmit;
                     return Err(status as i32)
                 }
                 Err(status) => {
@@ -920,7 +1718,8 @@ unsafe fn advance(
             if matches!(&work.caller, Caller::Hosted(HostedCaller {
                 completion: HostedCompletion::Existing { .. } | HostedCompletion::SystemLocale { .. }, ..
             }) | Caller::Provider(provider::ProviderCaller {
-                admission: provider::ProviderAdmission::Existing(_), ..
+                admission: provider::ProviderAdmission::Existing(_)
+                    | provider::ProviderAdmission::InterfaceRegister(_), ..
             })) {
                 work.published = !work.cancelled;
                 work.phase = Phase::Acknowledge;
@@ -1013,6 +1812,10 @@ unsafe fn advance(
                     let handler = &mut *context.as_mut().unwrap().0;
                     match &mut caller.completion {
                         HostedCompletion::Create { publication, parent_owner, .. } => {
+                            crate::exec_handler::registry_admission::trace_computer_name_registry(
+                                b"create-completion", &publication.path, work.status,
+                                caller.pi, caller.tid,
+                            );
                             crate::registry_security_audit::admission_error(
                                 b"create-completion", &publication.path, work.status,
                                 caller.pi, caller.tid,
@@ -1025,9 +1828,17 @@ unsafe fn advance(
                                 handler.release_registry_key_target(target);
                             }
                         }
-                        HostedCompletion::Existing { key_owner, kind } => {
+                        HostedCompletion::Existing { key_owner, kind, .. } => {
                             if let Some(target) = key_owner.abort(&mut handler.pm)
                                 .expect("retained existing Key") {
+                                if matches!(*kind, ExistingMutationKind::SetValue) {
+                                    if let Some(path) = handler.registry_target_path(target) {
+                                        crate::exec_handler::registry_admission::trace_computer_name_registry(
+                                            b"set-completion", &path, work.status,
+                                            caller.pi, caller.tid,
+                                        );
+                                    }
+                                }
                                 if work.status != 0 {
                                     if let Some(path) = handler.registry_target_path(target) {
                                         let operation: &[u8] = match kind {
@@ -1060,6 +1871,7 @@ unsafe fn advance(
             work.phase = Phase::ReadyReply;
         }
         Phase::ReadyReply => {
+            let work_id = work.id;
             let Caller::Hosted(caller) = &mut work.caller else { unreachable!() };
             let handler = &mut *context.as_mut().unwrap().0;
             if work.cancelled {
@@ -1067,6 +1879,7 @@ unsafe fn advance(
                 return Ok(false);
             }
             parked_reply::validate_saved(caller.reply).map_err(|status| status as i32)?;
+            watch_hosted_reply(work_id, caller);
             // An uncertain send cannot repeat cleanup or issue a second reply to this owner.
             work.phase = Phase::ReplyEntered;
             let delivered = crate::service_sec_image::complete_registry_mutation_reply(

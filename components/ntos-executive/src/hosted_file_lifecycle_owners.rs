@@ -27,6 +27,7 @@ struct Row {
 }
 
 static mut ROWS: Vec<Row> = Vec::new();
+static RETRY_READY: AtomicBool = AtomicBool::new(false);
 
 fn rows() -> &'static mut Vec<Row> {
     // Executive work is serialized. No row borrow spans a hosted invocation.
@@ -104,6 +105,63 @@ fn retain(file_id: FileId, payload: Payload, status: nt_status::NtStatus) {
     rows()[index].payload = Some(payload);
     rows()[index].blocked = Some(status);
     rows()[index].retry_after = monotonic_time_100ns().saturating_add(1_000_000);
+}
+
+/// A refused lifecycle operation retains its exact File and IRP owner until an
+/// outer pump can retry it. Timer delivery only requests that pump.
+pub(super) fn retry_deadline() -> Option<u64> {
+    if RETRY_READY.load(Ordering::Acquire) {
+        return None;
+    }
+    rows()
+        .iter()
+        .filter(|row| !row.executing && row.payload.is_some() && row.retry_after != 0)
+        .map(|row| row.retry_after)
+        .min()
+}
+
+pub(super) fn retry_wake_due(now: u64) -> u64 {
+    if retry_deadline().is_some_and(|deadline| deadline <= now) {
+        RETRY_READY.store(true, Ordering::Release);
+        crate::service_sec_image::FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+        return 1;
+    }
+    0
+}
+
+/// Inspect one exact retained File without changing driver or retry ownership.
+pub(super) fn receive_owner_snapshot() -> Option<[u64; 6]> {
+    let rows = rows();
+    let row = rows.iter().find(|row| row.payload.is_some() || row.retry_after != 0)?;
+    Some(receive_owner_fields(row, rows))
+}
+
+fn receive_owner_fields(row: &Row, rows: &[Row]) -> [u64; 6] {
+    let payload = match row.payload.as_ref() {
+        None => 0,
+        Some(Payload::Prepared(_)) => 1,
+        Some(Payload::Returned(_)) => 2,
+        Some(Payload::Retained(_)) => 3,
+        Some(Payload::AckReturned(_)) => 4,
+    };
+    [
+        row.file_id.raw(), payload,
+        row.blocked.map_or(0, |status| status.raw() as u64),
+        row.retry_after, u64::from(row.executing),
+        rows.iter().filter(|row| row.payload.is_some() || row.retry_after != 0).count() as u64,
+    ]
+}
+
+pub(super) fn trace_receive_owner_rows() {
+    let rows = rows();
+    for row in rows.iter().filter(|row| row.payload.is_some() || row.retry_after != 0).take(4) {
+        print_str(b"[retained-receive-lifecycle] file/payload/blocked/retry-after/executing/count=");
+        for (index, value) in receive_owner_fields(row, rows).into_iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(value);
+        }
+        print_str(b"\n");
+    }
 }
 
 fn route_live(projection: &IrpProjection) -> Option<usize> {
@@ -284,7 +342,10 @@ fn drive_retained(file_id: FileId, owner: RetainedFileLifecycle) -> bool {
 
 fn drive_payload(file_id: FileId, executor: NativeHandleCaller) -> bool {
     let slot = index(file_id).expect("lifecycle File owner missing");
-    if rows()[slot].executing || rows()[slot].retry_after > monotonic_time_100ns() {
+    if rows()[slot].executing
+        || (rows()[slot].retry_after != 0
+            && rows()[slot].retry_after > monotonic_time_100ns())
+    {
         return false;
     }
     let Some(payload) = rows()[slot].payload.take() else { return false };
@@ -326,7 +387,9 @@ fn queued_route_ready(file_id: FileId) -> bool {
 pub(super) fn nested_ready(file_id: FileId) -> bool {
     let Some(index) = index(file_id) else { return false; };
     let row = &rows()[index];
-    if row.executing || row.retry_after > monotonic_time_100ns() { return false; }
+    if row.executing || (row.retry_after != 0 && row.retry_after > monotonic_time_100ns()) {
+        return false;
+    }
     match row.payload.as_ref() {
         Some(Payload::Prepared(prepared)) => projection_ready(prepared.projection()),
         Some(Payload::Returned(_)) | Some(Payload::AckReturned(_)) => true,
@@ -408,6 +471,7 @@ pub(super) fn nested_work_step(executor: NativeHandleCaller) -> bool {
 /// A pending or uncertain effect remains held by its exact File and generation.
 pub(super) fn pump(executor: NativeHandleCaller) -> usize {
     let _durable = crate::allocator::enter_durable();
+    RETRY_READY.store(false, Ordering::Release);
     let mut progress = 0;
     let mut ids = [FileId(0); 32];
     let count = rows().len().min(ids.len());

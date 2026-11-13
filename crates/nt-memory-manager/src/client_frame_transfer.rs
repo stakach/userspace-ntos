@@ -82,7 +82,7 @@ impl ClientFrameRegistry {
             return Err(ClientFrameTransferError::InsufficientResources);
         }
         let id = counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| ClientFrameTransferError::IdentityExhausted)?;
@@ -115,7 +115,7 @@ impl ClientFrameRegistry {
             let index = self
                 .index_for(record.pi, record.page)
                 .expect("prevalidated transfer row");
-            self.records.swap_remove(index);
+            self.swap_remove_index(index);
         }
         self.reclaiming -= transfer.records.len();
         Ok(())

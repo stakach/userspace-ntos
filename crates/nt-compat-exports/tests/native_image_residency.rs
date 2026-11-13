@@ -50,7 +50,7 @@ fn residency_calls(file: &syn::File) -> Vec<String> {
         matches!(&*call.func, syn::Expr::Path(path) if path.path.is_ident("service_page_residency"))
             .then_some(call)
     }).expect("public residency wrapper must call the actual owner implementation");
-    assert_eq!(invocation.args.len(), 6);
+    assert_eq!(invocation.args.len(), 7);
     for (argument, expected) in
         invocation
             .args
@@ -63,6 +63,9 @@ fn residency_calls(file: &syn::File) -> Vec<String> {
             "residency wrapper must preserve {expected}"
         );
     }
+    assert!(matches!(invocation.args.iter().nth(5), Some(syn::Expr::Path(path))
+        if path.path.segments.last().unwrap().ident == "Direct"),
+        "ordinary image faults retain direct source admission");
     let wrapper_calls = calls(file, "service_native_image_page_residency");
     assert_eq!(
         wrapper_calls
@@ -184,8 +187,7 @@ fn residency_failure_diagnostic_runs_after_inner_borrow_ends() {
         .iter()
         .position(|statement| {
             matches!(statement, syn::Stmt::Local(local)
-            if matches!(&local.pat, syn::Pat::Ident(binding) if binding.ident == "result")
-            && local.init.as_ref().is_some_and(|initializer| matches!(&*initializer.expr,
+            if local.init.as_ref().is_some_and(|initializer| matches!(&*initializer.expr,
                 syn::Expr::Call(call) if matches!(&*call.func,
                     syn::Expr::Path(path) if path.path.is_ident("service_page_residency")))))
         })

@@ -32,8 +32,11 @@ struct Construction {
     step: Step,
     finished: bool,
     thread: Option<nt_process::ThreadLifetime>,
+    object: Option<nt_hosted_runtime::HostedDriverThreadObjectRecord>,
+    unreturned_public_handle: Option<(nt_process::ProcessId, nt_process::Handle)>,
     caller: Option<nt_process::native_handle::NativeHandleCaller>,
     reference: Option<nt_process::native_handle::NativeThreadProcessReference>,
+    priority_plan: Option<nt_process::KernelThreadPriorityPlan>,
 }
 
 static mut OWNERS: Vec<Construction> = Vec::new();
@@ -75,8 +78,11 @@ pub(super) unsafe fn begin(
         step: Step::Unmap,
         finished: false,
         thread: None,
+        object: None,
+        unreturned_public_handle: None,
         caller: None,
         reference: None,
+        priority_plan: None,
     });
     Some(id)
 }
@@ -117,6 +123,162 @@ pub(super) unsafe fn registry_caller(
     })
 }
 
+/// Publish the already constructed System ETHREAD under a typed handle in the
+/// creating caller's table. The private hosted handle remains transport-only.
+pub(super) unsafe fn publish_object(
+    runtime: HostedDriverThreadRuntime,
+    creator: nt_process::native_handle::NativeHandleCaller,
+) -> Result<u64, u32> {
+    let row = owner(runtime.construction);
+    if row.instance != runtime.instance || row.handle != runtime.handle
+        || row.domain != runtime.domain || row.pml4 != runtime.pml4
+        || row.tcb != runtime.tcb || !row.ready || row.shared_entered
+    { return Err(nt_process::STATUS_INVALID_HANDLE); }
+    let lifetime = row.thread.ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    if row.object.is_some() || row.stopped || row.finished || row.tcb != runtime.tcb {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    let (key, public) = crate::service_sec_image::with_provider_process_manager(|pm| {
+        pm.validate_native_handle_caller(creator)?;
+        let body = pm.thread_kernel_object(lifetime.thread_id())
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let key = nt_hosted_runtime::HostedDriverThreadObjectKey::new(
+            runtime.instance, runtime.domain.domain_id.raw(), runtime.domain.cookie,
+            runtime.handle, runtime.tcb, body,
+        ).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let public = pm.open_thread_by_client_id(
+            creator.effective_process(),
+            nt_process::ClientId {
+                unique_process: lifetime.process_id(),
+                unique_thread: lifetime.thread_id(),
+            },
+            nt_process::THREAD_ALL_ACCESS,
+        )?;
+        Ok((key, public))
+    })?;
+    let mut object = nt_hosted_runtime::HostedDriverThreadObjectRecord::new(key);
+    if !object.publish_canonical(
+        key, u64::from(lifetime.process_id()), u64::from(lifetime.thread_id()),
+        u64::from(public), nt_process::THREAD_ALL_ACCESS,
+    ) {
+        crate::service_sec_image::with_provider_process_manager(|pm| {
+            pm.close_handle(creator.effective_process(), public)
+        })?;
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    owner(runtime.construction).object = Some(object);
+    owner(runtime.construction).unreturned_public_handle = Some((creator.effective_process(), public));
+    Ok(u64::from(public))
+}
+
+/// The creator has not received a failing PsCreateSystemThread result's handle.
+/// Remove exactly that table entry; the construction's internal PM reference
+/// still keeps its ETHREAD alive until acknowledged worker retirement.
+pub(super) unsafe fn withdraw_unreturned_public_handle(
+    runtime: HostedDriverThreadRuntime,
+    creator: nt_process::native_handle::NativeHandleCaller,
+    public: u64,
+) -> Result<(), u32> {
+    let row = owner(runtime.construction);
+    if row.instance != runtime.instance || row.handle != runtime.handle
+        || row.domain != runtime.domain || row.tcb != runtime.tcb
+    { return Err(nt_process::STATUS_INVALID_HANDLE); }
+    let lifetime = row.thread.ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let handle = nt_process::Handle::try_from(public)
+        .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+    if row.unreturned_public_handle != Some((creator.effective_process(), handle))
+        || !row.object.is_some_and(|object| object.matches_public(
+            object.key(), u64::from(lifetime.process_id()),
+            u64::from(lifetime.thread_id()), public,
+        ))
+    { return Err(nt_process::STATUS_INVALID_HANDLE); }
+    crate::service_sec_image::with_provider_process_manager(|pm| {
+        pm.validate_native_handle_caller(creator)?;
+        let target = pm.inspect_native_close_target(creator, public)?;
+        if target.table_owner() != creator.effective_process()
+            || target.object() != nt_process::HandleObject::Thread(lifetime.thread_id())
+        { return Err(nt_process::STATUS_INVALID_HANDLE); }
+        pm.close_handle(creator.effective_process(), handle)
+    })?;
+    owner(runtime.construction).unreturned_public_handle = None;
+    Ok(())
+}
+
+pub(super) unsafe fn deliver_public_handle(runtime: HostedDriverThreadRuntime, public: u64) -> bool {
+    let row = owner(runtime.construction);
+    if row.instance != runtime.instance || row.handle != runtime.handle
+        || row.domain != runtime.domain || row.tcb != runtime.tcb
+        || row.unreturned_public_handle.map(|(_, handle)| u64::from(handle)) != Some(public)
+    { return false; }
+    row.unreturned_public_handle = None;
+    true
+}
+
+/// Admit only an exact ETHREAD belonging to a retained worker of this instance.
+pub(super) unsafe fn wait_body(instance: usize, body: u64) -> Option<(u64, bool)> {
+    (&*core::ptr::addr_of!(OWNERS)).iter().find_map(|row| {
+        let object = row.object?;
+        (row.instance == instance && object.key().body() == body)
+            .then_some((body, object.wait_ready(object.key())))
+    })
+}
+
+pub(super) unsafe fn wait_ready(body: u64) -> Option<bool> {
+    (&*core::ptr::addr_of!(OWNERS)).iter().find_map(|row| {
+        let object = row.object?;
+        (object.key().body() == body).then_some(object.wait_ready(object.key()))
+    })
+}
+
+/// Retain the canonical PM plan before changing this exact worker's native TCB. The actor
+/// cannot retire or accept a second priority effect until the first one commits.
+pub(super) unsafe fn prepare_priority(
+    runtime: HostedDriverThreadRuntime,
+    lifetime: nt_process::ThreadLifetime,
+    thread: u64,
+    priority: i32,
+) -> Result<(i32, i32), u32> {
+    if !matches(runtime.construction, runtime) {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    let row = owner(runtime.construction);
+    if row.stopped || row.finished || row.priority_plan.is_some()
+        || row.thread != Some(lifetime) || row.tcb != runtime.tcb
+    {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    let plan = crate::service_sec_image::with_provider_process_manager(|pm| {
+        if !pm.validate_thread_lifetime(lifetime)
+            || pm.thread_kernel_object(lifetime.thread_id()) != Some(thread)
+        {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
+        pm.prepare_kernel_thread_priority(thread, priority)
+    })?;
+    let result = (plan.previous(), plan.next());
+    row.priority_plan = Some(plan);
+    Ok(result)
+}
+
+/// Acknowledged native effect precedes PM commit. On a post-effect refusal the plan remains
+/// owned, preventing retry, retirement, or TCB reuse with uncertain scheduler state.
+pub(super) unsafe fn commit_priority(
+    runtime: HostedDriverThreadRuntime,
+    lifetime: nt_process::ThreadLifetime,
+) -> Result<i32, u32> {
+    if !matches(runtime.construction, runtime) { return Err(nt_process::STATUS_INVALID_HANDLE); }
+    let row = owner(runtime.construction);
+    if row.stopped || row.thread != Some(lifetime) || row.tcb != runtime.tcb {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    let plan = row.priority_plan.as_ref().ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+    let previous = crate::service_sec_image::with_provider_process_manager(|pm| {
+        pm.commit_kernel_thread_priority_retained(plan)
+    })?;
+    row.priority_plan = None;
+    Ok(previous)
+}
+
 pub(super) unsafe fn initialize_kpcr(
     id: usize, inst: DriverInstance, component: u64, executive: u64,
 ) -> Result<(), u32> {
@@ -142,6 +304,9 @@ unsafe fn retire_actor(id: usize) -> Result<(), u32> {
                 return Err(nt_process::STATUS_INVALID_HANDLE);
             }
             pm.terminate_thread(lifetime.thread_id(), exit_status)?;
+            if let Some(object) = row.object.as_mut() {
+                if !object.terminate(object.key()) { return Err(nt_process::STATUS_INVALID_HANDLE); }
+            }
             if let Some(reference) = row.reference.as_mut() { reference.release(pm)?; }
             row.reference = None;
             row.caller = None;
@@ -240,6 +405,10 @@ pub(super) unsafe fn retire(id: usize, shared_retired: bool) -> bool {
     if owner(id).finished {
         return true;
     }
+    if owner(id).priority_plan.is_some() {
+        return false;
+    }
+    if owner(id).unreturned_public_handle.is_some() { return false; }
     if hosted_source_stack_lease::blocks_worker_retirement(id) {
         return false;
     }

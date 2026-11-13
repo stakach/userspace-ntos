@@ -428,6 +428,26 @@ pub(crate) struct PreparedAcpiPlatformAuthority {
     pub(crate) owner: HostedPnpContextOwner,
 }
 
+impl PreparedAcpiPlatformAuthority {
+    /// Share only the firmware-selected, retained read-only HPET frame. The executive
+    /// keeps timer programming rights; a component receives only a read alias.
+    pub(crate) fn hpet_read_only_alias(&self) -> Option<nt_acpi::HpetReadOnlyAlias> {
+        let range = self.discovery.hpet?.register_block;
+        self.memory.iter().filter(|resource| resource.platform_hpet).find_map(|resource| {
+            nt_acpi::HpetReadOnlyAlias::for_firmware_range(
+                range,
+                nt_acpi::PhysicalRange {
+                    start: resource.paddr,
+                    length: resource.length,
+                },
+                resource.frame_base,
+                resource.pages,
+                resource.writable,
+            )
+        })
+    }
+}
+
 /// Map the executive's timer view from the same retained frames later projected read-only to the
 /// ACPI component. The returned address is the exact GAS address within `mapping_page_va`.
 pub(crate) unsafe fn map_executive_hpet(
@@ -619,6 +639,56 @@ unsafe fn prepare_memory_authority(
     })
 }
 
+fn project_static_io_ports(
+    ports: &mut Vec<AcpiPortAuthority>,
+    resources: &[nt_acpi::StaticIoResource],
+) -> Result<(), nt_status::NtStatus> {
+    let matching = resources
+        .iter()
+        .filter(|resource| resource.hardware_id == "PNP0A06");
+    let additional = matching.clone().count();
+    let total = ports
+        .len()
+        .checked_add(additional)
+        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    if total > driver_launch::SH_RESOURCE_KIND_CAPACITY as usize {
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    }
+    for resource in matching.clone() {
+        let start = resource.start as u32;
+        let end = start
+            .checked_add(resource.length as u32)
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+        if resource.length == 0 || end > 0x1_0000 {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        if ports.iter().any(|port| {
+            let prior_start = port.base;
+            let prior_end = prior_start.saturating_add(port.length as u64);
+            (start as u64) < prior_end && prior_start < end as u64
+        }) || resources.iter().any(|other| {
+            !core::ptr::eq(other, resource)
+                && other.hardware_id == "PNP0A06"
+                && start < (other.start as u32).saturating_add(other.length as u32)
+                && (other.start as u32) < end
+        }) {
+            return Err(nt_status::NtStatus::CONFLICTING_ADDRESSES);
+        }
+    }
+    ports
+        .try_reserve_exact(additional)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    for resource in matching {
+        ports.push(AcpiPortAuthority {
+            resource_index: ports.len() as u8,
+            base: resource.start as u64,
+            length: resource.length as u32,
+            platform_reset: false,
+        });
+    }
+    Ok(())
+}
+
 unsafe fn discover_acpi_platform_authority_inner(
     bi: &BootInfo,
     owner: &mut HostedPnpContextOwner,
@@ -760,6 +830,28 @@ unsafe fn discover_acpi_platform_authority_inner(
             _ => return Err(nt_status::NtStatus::INVALID_PARAMETER),
         }
     }
+    let fixed_port_count = ports.len();
+    project_static_io_ports(&mut ports, &discovery.static_io)?;
+    print_str(b"[acpi-platform] static SystemIO discovered/granted=");
+    print_u64(discovery.static_io.len() as u64);
+    print_str(b"/");
+    print_u64((ports.len() - fixed_port_count) as u64);
+    if let Some(resource) = discovery
+        .static_io
+        .iter()
+        .find(|resource| resource.hardware_id == "PNP0A06")
+    {
+        print_str(b" first PNP0A06 start/len/table/region=0x");
+        print_hex(resource.start as u32);
+        print_str(b"/");
+        print_u64(resource.length as u64);
+        print_str(b"/0x");
+        print_hex((resource.table_address >> 32) as u32);
+        print_hex(resource.table_address as u32);
+        print_str(b"/");
+        print_str(&resource.region_name);
+    }
+    print_str(b"\n");
     let writable_ranges = nt_acpi::normalize_physical_ranges(&writable_ranges)
         .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
     for range in &writable_ranges {
@@ -906,25 +998,47 @@ fn encode_registry_multi_sz(values: &[&str]) -> Result<Vec<u8>, nt_status::NtSta
     Ok(encoded)
 }
 
-/// Publish the firmware-discovered ACPI root identity through normal CriticalDeviceDatabase
-/// policy before the boot-driver launch snapshot is taken. No service name is embedded here.
+struct AcpiRootRegistryPolicy {
+    mount_generation: u64,
+    class_guid: alloc::string::String,
+    service_name: alloc::string::String,
+}
+
+unsafe fn acpi_root_registry_policy(
+    expected_generation: u64,
+) -> Result<AcpiRootRegistryPolicy, nt_status::NtStatus> {
+    let binding = match config_manager_query_critical_device_binding(ACPI_ROOT_COMPATIBLE_ID)
+        .map_err(nt_status::NtStatus)?
+    {
+        Some(binding) => Some(binding),
+        None => config_manager_query_driver_database_binding(ACPI_ROOT_COMPATIBLE_ID)
+            .map_err(nt_status::NtStatus)?,
+    }
+    .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    if binding.mount_generation != expected_generation || binding.class_guid.is_empty() {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let service_name = binding
+        .service_name
+        .filter(|service| !service.is_empty())
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    Ok(AcpiRootRegistryPolicy {
+        mount_generation: binding.mount_generation,
+        class_guid: binding.class_guid,
+        service_name,
+    })
+}
+
+/// Publish the firmware-discovered ACPI root identity through mounted registry policy before the
+/// boot-driver launch snapshot is taken. No service name is embedded here.
 pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(
 ) -> Result<(), nt_status::NtStatus> {
     let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
-    let policy = config_manager_query_critical_device_binding(ACPI_ROOT_COMPATIBLE_ID)
-        .map_err(nt_status::NtStatus)?
-        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    let policy = acpi_root_registry_policy(expected_generation)?;
     if policy.mount_generation != expected_generation {
         return Err(nt_status::NtStatus(0xC000_0059u32 as i32));
     }
-    let service = policy
-        .service_name
-        .as_deref()
-        .filter(|service| !service.is_empty())
-        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
-    if policy.class_guid.is_empty() {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
-    }
+    let service = policy.service_name.as_str();
     let existing = match config_manager_query_system_hive_key(ACPI_ROOT_ENUM_PATH) {
         Ok(snapshot) => Some(snapshot),
         Err(status) if status as u32 == nt_status::NtStatus::OBJECT_NAME_NOT_FOUND.raw() as u32 => {
@@ -932,7 +1046,10 @@ pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(
         }
         Err(status) => return Err(nt_status::NtStatus(status)),
     };
-    if existing.as_ref().is_some_and(|snapshot| snapshot.mount_generation != expected_generation) {
+    if existing
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.mount_generation != expected_generation)
+    {
         return Err(nt_status::NtStatus(0xC000_0059u32 as i32));
     }
     let hardware = encode_registry_multi_sz(&[ACPI_ROOT_HARDWARE_ID])?;
@@ -1028,7 +1145,10 @@ pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(
         &mutations,
     )
     .map_err(|status| nt_status::NtStatus(status as i32))?;
-    assert_eq!(outcome.generation, expected_generation + 1,
-        "ACPI root CM ACK returned the wrong generation");
+    assert_eq!(
+        outcome.generation,
+        expected_generation + 1,
+        "ACPI root CM ACK returned the wrong generation"
+    );
     Ok(())
 }

@@ -26,6 +26,8 @@ pub enum ExternalFileIrpOutputCapture {
     /// The driver modified its METHOD_NEITHER Type3InputBuffer. Capture the exact input bytes
     /// independently of IoStatus.Information; output length must be zero.
     MethodNeitherInput,
+    /// Full authenticated SCSI completion packet, including SRB/data/sense on error status.
+    Scsi,
 }
 impl ExternalFileIrpOutputCapture {
     pub(super) fn required_len(
@@ -96,6 +98,12 @@ impl ExternalFileIrpOutputCapture {
                     }
                     _ => Err(NtStatus::INVALID_PARAMETER),
                 }
+            }
+            Self::Scsi => {
+                if owner.projection.major != major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                    || !matches!(owner.projection.parameters, IoParameters::Scsi(_))
+                { return Err(NtStatus::INVALID_PARAMETER); }
+                Ok(capacity)
             }
         }
     }
@@ -396,6 +404,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
     > {
         let result = (|| {
             self.validate_detached_completion_operation(&completion)?;
+            if completion.completion.completion_origin == crate::IrpCompletionOrigin::NoBackendEntry {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
             if max_bytes == 0 || completion.capture_complete() {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
@@ -472,6 +483,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
         let valid = self
             .validate_detached_completion_operation(&completion)
             .and_then(|_| {
+                if completion.completion.completion_origin != crate::IrpCompletionOrigin::Driver {
+                    return Err(NtStatus::INVALID_PARAMETER);
+                }
                 if !completion.capture_complete()
                     && !self
                         .irp(completion.irp_id())

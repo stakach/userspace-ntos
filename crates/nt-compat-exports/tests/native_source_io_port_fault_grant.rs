@@ -9,8 +9,8 @@ fn hosted_io_port_fault_grant_retains_same_instance_controller_authority() {
         .find("pub(crate) unsafe fn hosted_io_port_fault_grant(")
         .expect("native I/O-port GP grant selector");
     let end = source[start..]
-        .find("\npub(crate) unsafe fn refresh_hosted_resource_state_for_shared(")
-        .expect("next native function");
+        .find("\n}\n")
+        .expect("native grant selector closing brace") + 2;
     let selector = &source[start..start + end];
     syn::parse_str::<syn::ItemFn>(selector).expect("native grant selector is a complete function");
     let range_start = source
@@ -104,8 +104,15 @@ static mut STATES: Option<Vec<HostedDeviceResourceState>> = None;
 static mut BINDINGS: Option<Vec<HostedDeviceBinding>> = None;
 static ACTIVE_INSTANCE: AtomicU64 = AtomicU64::new(0);
 static PROJECTED_PDO: AtomicU64 = AtomicU64::new(0);
+static PRIVATE_BANK: AtomicU64 = AtomicU64::new(0);
 
-fn instance_by_shared_va(_: u64) -> Option<(usize, DriverInstance)> {
+fn instance_by_shared_va(shared_va: u64) -> Option<(usize, DriverInstance)> {
+    if PRIVATE_BANK.load(Ordering::Relaxed) == shared_va { return None; }
+    Some((ACTIVE_INSTANCE.load(Ordering::Relaxed) as usize, DriverInstance { driver_id: 42 }))
+}
+
+fn hosted_irq_instance_by_shared_va(shared_va: u64) -> Option<(usize, DriverInstance)> {
+    if PRIVATE_BANK.load(Ordering::Relaxed) != shared_va { return None; }
     Some((ACTIVE_INSTANCE.load(Ordering::Relaxed) as usize, DriverInstance { driver_id: 42 }))
 }
 
@@ -168,6 +175,10 @@ fn same_instance_sibling_port_is_available_without_projecting_sibling_resources(
     assert_eq!(grant, Some(HostedIoPortFaultGrant { cap: 77, base: 0x64, len: 1 }));
     assert_ne!(PROJECTED_PDO.load(Ordering::Relaxed), 111,
         "the mouse PDO must not publish keyboard resource identity");
+    PRIVATE_BANK.store(shared_va, Ordering::Relaxed);
+    assert_eq!(unsafe { hosted_io_port_fault_grant(shared_va, 0x64) }, grant,
+        "the IRQ private bank must resolve the same live device grant");
+    PRIVATE_BANK.store(0, Ordering::Relaxed);
 
     // Neither another driver instance nor a retired cap can authorize this mouse dispatch.
     ACTIVE_INSTANCE.store(8, Ordering::Relaxed);

@@ -503,7 +503,7 @@ impl AdmittedExceptionImage {
         Ok(scopes)
     }
 
-    fn lookup(&self, pc: u64) -> Result<ExceptionFunction, ExceptionImageError> {
+    pub(crate) fn lookup(&self, pc: u64) -> Result<ExceptionFunction, ExceptionImageError> {
         let rva = u32::try_from(
             pc.checked_sub(self.base)
                 .ok_or(ExceptionImageError::UnknownImage)?,

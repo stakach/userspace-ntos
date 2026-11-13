@@ -332,7 +332,7 @@ static NEXT_PAGEFILE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 
 fn allocate_pagefile_id(counter: &core::sync::atomic::AtomicU64) -> Result<u64, u32> {
     counter
-        .fetch_update(
+        .try_update(
             core::sync::atomic::Ordering::Relaxed,
             core::sync::atomic::Ordering::Relaxed,
             |value| {

@@ -57,6 +57,7 @@ impl PendingFileIo {
         match self.operation {
             PendingFileIoOperation::Transfer
             | PendingFileIoOperation::Create(_)
+            | PendingFileIoOperation::AttributeQuery(_)
             | PendingFileIoOperation::SetFileName(_) => matches!(self.route, Hosted(_)),
             PendingFileIoOperation::LocalByteLock(_) => {
                 matches!(self.route, Local(ReadonlyFile(_) | Overlay(_)))
@@ -65,7 +66,8 @@ impl PendingFileIo {
                 matches!(self.route, Local(ReadonlyDirectory(_) | Overlay(_)))
             }
             PendingFileIoOperation::OwnedInline(_) => self.route.is_valid(),
-            PendingFileIoOperation::OwnedModePrecommit(_) => matches!(self.route,
+            PendingFileIoOperation::OwnedModeInputCapture(_)
+            | PendingFileIoOperation::OwnedModePrecommit(_) => matches!(self.route,
                 Hosted(_) | Local(Overlay(_))),
             PendingFileIoOperation::LocalBuffered(_) => match self.major {
                 nt_io_abi::major::IRP_MJ_READ => {

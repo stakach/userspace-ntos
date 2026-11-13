@@ -197,7 +197,7 @@ impl ProviderSubjectRegistry {
             .try_reserve(1)
             .map_err(|_| ProviderSubjectError::Capacity)?;
         let id = counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 if value == 0 {
                     None
                 } else {

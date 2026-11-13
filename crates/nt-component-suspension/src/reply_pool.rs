@@ -7,7 +7,10 @@ use core::convert::Infallible;
 
 use crate::peer_registry::PeerRoute;
 use crate::{peer_registry::PeerRegistry, ReservedReceiveError};
-use crate::{ComponentIngress, ComponentSuspensionLanes, IngressReceiver, ReplyBindingObservation};
+use crate::{
+    ComponentIngress, ComponentSuspensionLanes, IngressExecutionOwner, IngressReceiver,
+    ReplyBindingObservation, ReservedReceivePhase, RetainedIngressError,
+};
 use crate::{LaneDispatchIdentity, LanePhase, RetainedDispatchError, RetainedWorkError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,12 +155,53 @@ impl<M> IngressReplyPool<M> {
         self.entries.iter().any(|owner| owner.reply() == reply)
     }
 
-    fn validate<C, R, T, E>(
+    /// Local eligibility for one more read-only binding query after a Held retain refusal.
+    /// This neither proves the physical Reply binding nor permits a new receive, completion,
+    /// or capability reuse. Native adapters must authenticate the captured badge and physical
+    /// source generation, and bound any retry independently.
+    pub fn held_query_retry_eligible<C, R, T, E>(
+        &self,
+        receiver: &IngressReceiver<M>,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        execution: IngressExecutionOwner,
+        route: PeerRoute,
+        original_reply: u64,
+        replacement_reply: u64,
+        refusal: &ReplyPoolError<E>,
+    ) -> bool {
+        if !matches!(
+            refusal,
+            ReplyPoolError::Query(_)
+                | ReplyPoolError::Retain(ReservedReceiveError::Retain(
+                    RetainedIngressError::Query(_)
+                ))
+        ) || receiver.endpoint() != self.endpoint
+            || route.endpoint() != self.endpoint
+            || receiver.reply() != original_reply
+            || receiver.recovery_for_owner(lanes, execution) != Ok(ReservedReceivePhase::Held)
+            || match execution {
+                IngressExecutionOwner::Dispatch(dispatch) => dispatch.lane() != route.identity().lane,
+                IngressExecutionOwner::Startup(startup_route) => startup_route != route,
+                IngressExecutionOwner::Idle => false,
+            }
+            || lanes.peer_route(route.identity().lane) != Ok(Some(route))
+            || !lanes.binding(route.identity().lane).is_ok_and(|binding| {
+                binding.executor_id == route.identity().executor
+                    && binding.receive_endpoint == self.endpoint
+            })
+        {
+            return false;
+        }
+        let Some(replacement) = self.entries.last() else { return false; };
+        replacement.reply() == replacement_reply
+            && self.validate_local::<C, R, T, E>(replacement, receiver, lanes).is_ok()
+    }
+
+    fn validate_local<C, R, T, E>(
         &self,
         owner: &ComponentIngress<M>,
         receiver: &IngressReceiver<M>,
         lanes: &ComponentSuspensionLanes<C, R, T>,
-        query: impl FnOnce(u64) -> Result<ReplyBindingObservation, E>,
     ) -> Result<(), ReplyPoolError<E>> {
         if owner.endpoint() != self.endpoint || receiver.endpoint() != self.endpoint {
             return Err(ReplyPoolError::WrongEndpoint);
@@ -174,6 +218,17 @@ impl<M> IngressReplyPool<M> {
         {
             return Err(ReplyPoolError::ReplyInUse);
         }
+        Ok(())
+    }
+
+    fn validate<C, R, T, E>(
+        &self,
+        owner: &ComponentIngress<M>,
+        receiver: &IngressReceiver<M>,
+        lanes: &ComponentSuspensionLanes<C, R, T>,
+        query: impl FnOnce(u64) -> Result<ReplyBindingObservation, E>,
+    ) -> Result<(), ReplyPoolError<E>> {
+        self.validate_local(owner, receiver, lanes)?;
         if query(owner.reply()).map_err(ReplyPoolError::Query)? != ReplyBindingObservation::Free {
             return Err(ReplyPoolError::NotFree);
         }

@@ -35,6 +35,13 @@ fn paths(function: &syn::ItemFn) -> Paths {
     paths
 }
 
+fn compact_source(name: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../components/ntos-executive/src").join(name);
+    std::fs::read_to_string(path).unwrap().chars()
+        .filter(|ch| !ch.is_whitespace()).collect()
+}
+
 #[test]
 fn component_power_export_only_enters_the_owned_broker() {
     let file = source("driver_launch.rs");
@@ -81,4 +88,28 @@ fn root_power_report_resolves_exact_device_and_lifecycle_authority() {
     }
     assert!(!service.0.iter().any(|name| name == "power_manager"),
         "PoSetPowerState must update the requested canonical DeviceRecord, not a devnode aggregate");
+}
+
+#[test]
+fn power_report_returns_the_exact_previous_state_on_the_callers_retained_reply() {
+    let broker = source("hosted_power_broker.rs");
+    let service = paths(function(&broker, "service_report"));
+    assert_eq!(service.0.iter().filter(|name| *name == "report_device_power_state").count(), 1);
+    assert_eq!(service.0.iter().filter(|name| *name == "report_system_power_state").count(), 1);
+    let root = compact_source("hosted_power_broker.rs");
+    assert!(root.contains("Ok(previous)=>(STATUS_SUCCESS,previousasu64,0,0)"),
+        "the state committed once must be the reply's previous-state word");
+    assert!(root.contains("PowerReportReply::decode(words,status,previous,[reserved0,reserved1],power_type)"),
+        "the caller must validate the exact four-word reply before returning previous state");
+
+    let pump = compact_source("spawn_hosts.rs");
+    let start = pump.find("elseiflabel==crate::driver_launch::FSD_SERVICE_DEVICE_LABEL")
+        .expect("hosted-device service arm");
+    let end = pump[start..].find("elseiflabel==crate::driver_launch::FSD_SERVICE_KE_PULSE_EVENT_LABEL")
+        .expect("end of hosted-device service arm") + start;
+    let arm = &pump[start..end];
+    assert!(arm.contains("service_hosted_device(ch,msg.m0,msg.m1,msg.m2,msg.m3,*reply_cap,msg.badge"),
+        "the service must authenticate the received badge and retained Reply");
+    assert!(arm.contains("msg=pump_reply_recv4_traced(ch,*reply_cap,4,statusasu32asu64,required_len,transfer_token,chunk_len,Some(msg.badge)"),
+        "the same Reply must deliver the status and previous state in four words");
 }

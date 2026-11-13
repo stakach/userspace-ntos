@@ -245,7 +245,8 @@ pub(super) unsafe fn map_private_page(
         return Err(nt_process::STATUS_INVALID_HANDLE);
     }
     let alias = if page >= SMSS_ALLOC_VA && page < SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
-        heap_mirror_for_pi(pi) + (page - SMSS_ALLOC_VA)
+        heap_mirror_for_pi(pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?
+            + (page - SMSS_ALLOC_VA)
     } else {
         0
     };

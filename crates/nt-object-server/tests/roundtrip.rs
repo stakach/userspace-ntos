@@ -32,6 +32,117 @@ fn client(server: &mut Server, cid: ClientId) -> ObjectClient<Direct<'_>> {
 }
 
 #[test]
+fn executive_endpoint_publishes_smss_permanent_directory_and_opens_global_dos_directory() {
+    use nt_types::{ObjAttrFlags, UnicodeString};
+
+    let mut server = Server::new().unwrap();
+    let executive = server.connect_executive();
+    let mut c = client(&mut server, executive);
+    let attributes = ObjAttrFlags::CASE_INSENSITIVE | ObjAttrFlags::OPEN_IF | ObjAttrFlags::PERMANENT;
+    let rpc = c.create_directory_handle(None, &UnicodeString::from_str("\\RPC Control"),
+        AccessMask::from_bits_retain(0x000f_000f), attributes)
+        .expect("executive admitted SMSS permanent directory create");
+    assert!(rpc.created);
+    let dos = c.open_directory_handle(None, &UnicodeString::from_str("\\??"),
+        AccessMask::from_bits_retain(0x000f_000f), attributes)
+        .expect("executive admitted SMSS global DOS directory open");
+    c.close_handle(dos).unwrap();
+    c.close_handle(rpc.handle).unwrap();
+
+    let user = server.connect(ClientKind::NativeUser, AccessMode::UserMode);
+    let mut c = client(&mut server, user);
+    assert_eq!(c.create_directory_handle(None, &UnicodeString::from_str("\\UserPermanent"),
+        AccessMask::from_bits_retain(0x000f_000f), attributes).unwrap_err(),
+        NtStatus::ACCESS_DENIED);
+}
+
+#[test]
+fn native_directory_handle_publishes_device_parent_and_temporary_close_reaps_name() {
+    use nt_types::{ObjAttrFlags, UnicodeString};
+
+    let mut server = Server::new().unwrap();
+    let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
+    let mut c = client(&mut server, cid);
+    let name = UnicodeString::from_str("\\Device\\Harddisk0");
+    let created = c.create_directory_handle(None, &name,
+        AccessMask::GENERIC_ALL | AccessMask::DELETE,
+        ObjAttrFlags::CASE_INSENSITIVE | ObjAttrFlags::PERMANENT).unwrap();
+    assert!(created.created);
+    c.create_device("\\Device\\Harddisk0\\DR0", 0x494f, 17, true).unwrap();
+    c.delete_object("\\Device\\Harddisk0\\DR0", true).unwrap();
+
+    // The native directory's DELETE-authorized handle can clear permanence.
+    c.make_temporary(created.handle).unwrap();
+    c.close_handle(created.handle).unwrap();
+    assert_eq!(c.lookup("\\Device\\Harddisk0", true).unwrap_err(), NtStatus::OBJECT_NAME_NOT_FOUND);
+}
+
+#[test]
+fn directory_make_temporary_requires_delete_and_exact_live_handle() {
+    use nt_types::{ObjAttrFlags, UnicodeString};
+
+    let mut server = Server::new().unwrap();
+    let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
+    let mut c = client(&mut server, cid);
+    let name = UnicodeString::from_str("\\Device\\TempGuard");
+    let handle = c.create_directory_handle(None, &name, AccessMask::GENERIC_READ,
+        ObjAttrFlags::CASE_INSENSITIVE | ObjAttrFlags::PERMANENT).unwrap().handle;
+    assert_eq!(c.make_temporary(handle).unwrap_err(), NtStatus::ACCESS_DENIED);
+    c.close_handle(handle).unwrap();
+    assert_eq!(c.make_temporary(handle).unwrap_err(), NtStatus::INVALID_HANDLE);
+    assert!(c.lookup("\\Device\\TempGuard", true).is_ok());
+}
+
+#[test]
+fn directory_make_permanent_requires_delete_and_preserves_exact_name() {
+    use nt_object_abi::{opcode, ObCloseHandleRequest};
+    use nt_types::{ObjAttrFlags, UnicodeString};
+
+    let mut server = Server::new().unwrap();
+    let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
+    let mut c = client(&mut server, cid);
+    let name = UnicodeString::from_str("\\Device\\PermanentGuard");
+    let temporary = c.create_directory_handle(None, &name,
+        AccessMask::GENERIC_ALL | AccessMask::DELETE,
+        ObjAttrFlags::CASE_INSENSITIVE).unwrap().handle;
+    let read_only = c.open_directory_handle(None, &name,
+        AccessMask::GENERIC_READ, ObjAttrFlags::CASE_INSENSITIVE).unwrap();
+    let mut req = ObCloseHandleRequest {
+        abi_size: core::mem::size_of::<ObCloseHandleRequest>() as u16,
+        _reserved: 0,
+        _reserved2: 0,
+        handle: read_only.0,
+    };
+    let denied = c.backend_mut().call(opcode::OB_OP_MAKE_PERMANENT,
+        bytemuck::bytes_of(&req), &mut []);
+    assert_eq!(NtStatus(denied.status), NtStatus::ACCESS_DENIED);
+    req.handle = temporary.0;
+    req._reserved = 1;
+    let invalid = c.backend_mut().call(opcode::OB_OP_MAKE_PERMANENT,
+        bytemuck::bytes_of(&req), &mut []);
+    assert_eq!(NtStatus(invalid.status), NtStatus::INVALID_PARAMETER);
+    req._reserved = 0;
+    let allowed = c.backend_mut().call(opcode::OB_OP_MAKE_PERMANENT,
+        bytemuck::bytes_of(&req), &mut []);
+    assert_eq!(NtStatus(allowed.status), NtStatus::SUCCESS);
+    assert_eq!(allowed.information, 0);
+    assert_eq!((allowed.detail0, allowed.detail1), (0, 0));
+    c.make_permanent(temporary).unwrap(); // idempotent through the client stub
+    c.close_handle(read_only).unwrap();
+    c.close_handle(temporary).unwrap();
+    assert!(c.lookup("\\Device\\PermanentGuard", true).is_ok());
+    let stale = c.backend_mut().call(opcode::OB_OP_MAKE_PERMANENT,
+        bytemuck::bytes_of(&req), &mut []);
+    assert_eq!(NtStatus(stale.status), NtStatus::INVALID_HANDLE);
+    let delete = c.open_directory_handle(None, &name, AccessMask::DELETE,
+        ObjAttrFlags::CASE_INSENSITIVE).unwrap();
+    c.make_temporary(delete).unwrap();
+    c.close_handle(delete).unwrap();
+    assert_eq!(c.lookup("\\Device\\PermanentGuard", true).unwrap_err(),
+        NtStatus::OBJECT_NAME_NOT_FOUND);
+}
+
+#[test]
 fn full_service_roundtrip() {
     let mut server = Server::new().unwrap();
     let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
@@ -86,6 +197,72 @@ fn full_service_roundtrip() {
     c.close_handle(h).unwrap();
     // closing again is a stale handle
     assert_eq!(c.close_handle(h).unwrap_err(), NtStatus::INVALID_HANDLE);
+}
+
+#[test]
+fn session_zero_link_openif_returns_the_existing_canonical_identity() {
+    let mut server = Server::new().unwrap();
+    let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
+    let mut c = client(&mut server, cid);
+    let path = "\\Sessions\\0\\BaseNamedObjects";
+    let target = "\\BaseNamedObjects";
+    let (existing, existing_before) = c
+        .create_or_open_symbolic_link(path, target, true, true, true)
+        .unwrap();
+    assert!(existing_before);
+    assert_ne!(existing.0, 0);
+    assert_eq!(c.query_symbolic_link(path, true).unwrap(), target.encode_utf16().collect::<Vec<_>>());
+    assert_eq!(
+        c.create_or_open_symbolic_link(path, target, true, false, true),
+        Err(NtStatus::OBJECT_NAME_COLLISION)
+    );
+    assert_eq!(
+        c.create_or_open_symbolic_link(path, "\\Different", true, true, true),
+        Err(NtStatus::OBJECT_NAME_COLLISION)
+    );
+    assert_eq!(
+        c.create_or_open_symbolic_link("\\Sessions\\0", target, true, true, true),
+        Err(NtStatus::OBJECT_TYPE_MISMATCH)
+    );
+    let (again, opened_existing) = c
+        .create_or_open_symbolic_link(path, target, true, true, true)
+        .unwrap();
+    assert!(opened_existing);
+    assert_eq!(again, existing);
+    let (folded, folded_existing) = c
+        .create_or_open_symbolic_link("\\sessions\\0\\basenamedobjects", target, true, true, true)
+        .unwrap();
+    assert!(folded_existing);
+    assert_eq!(folded, existing);
+}
+
+#[test]
+fn created_session_owns_exact_numbered_windows_namespace_until_retired() {
+    let mut server = Server::new().unwrap();
+    let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
+    let mut c = client(&mut server, cid);
+    assert_eq!(c.lookup("\\Sessions\\37", true), Err(NtStatus::OBJECT_NAME_NOT_FOUND));
+
+    let owned = c.create_session_namespace(37).unwrap();
+    assert_eq!(c.lookup("\\Sessions\\37", true).unwrap(), owned.session);
+    assert_eq!(c.lookup("\\Sessions\\37\\Windows", true).unwrap(), owned.windows);
+    assert_eq!(c.lookup("\\Sessions\\37\\BaseNamedObjects", true).unwrap(), owned.base_named_objects);
+    assert_eq!(c.create_session_namespace(37), Err(NtStatus::OBJECT_NAME_COLLISION));
+    assert_eq!(c.lookup("\\Sessions\\38", true), Err(NtStatus::OBJECT_NAME_NOT_FOUND));
+    let stale = nt_object_client::SessionNamespace {
+        session: nt_types::ObjectId(owned.session.0 + 1),
+        windows: owned.windows,
+        base_named_objects: owned.base_named_objects,
+    };
+    assert_eq!(c.retire_session_namespace_exact(37, stale), Err(NtStatus::INVALID_HANDLE));
+    assert_eq!(c.lookup("\\Sessions\\37\\Windows", true).unwrap(), owned.windows);
+
+    let child = c.create_directory("\\Sessions\\37\\Windows\\WindowStations", false).unwrap();
+    assert_eq!(c.lookup("\\Sessions\\37\\Windows\\WindowStations", true).unwrap(), child);
+    assert_eq!(c.retire_session_namespace_exact(37, owned), Err(NtStatus::DIRECTORY_NOT_EMPTY));
+    c.delete_object("\\Sessions\\37\\Windows\\WindowStations", true).unwrap();
+    c.retire_session_namespace_exact(37, owned).unwrap();
+    assert_eq!(c.lookup("\\Sessions\\37", true), Err(NtStatus::OBJECT_NAME_NOT_FOUND));
 }
 
 #[test]

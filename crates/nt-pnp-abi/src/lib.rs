@@ -52,7 +52,12 @@ pub const IRP_MN_QUERY_DEVICE_TEXT: u8 = 0x0C;
 pub const DEVICE_TEXT_DESCRIPTION: u32 = 0;
 pub const IRP_MN_FILTER_RESOURCE_REQUIREMENTS: u8 = 0x0D;
 pub const IRP_MN_QUERY_ID: u8 = 0x13;
+pub const IRP_MN_QUERY_PNP_DEVICE_STATE: u8 = 0x14;
 pub const IRP_MN_QUERY_BUS_INFORMATION: u8 = 0x15;
+/// Flags returned as a scalar in `IoStatus.Information` for QUERY_PNP_DEVICE_STATE.
+pub const PNP_DEVICE_STATE_KNOWN_MASK: u32 = 0x0000_01ff;
+pub const PNP_DEVICE_DONT_DISPLAY_IN_UI: u32 = 0x0000_0002;
+pub const PNP_DEVICE_NOT_DISABLEABLE: u32 = 0x0000_0020;
 
 /// Native NT5 x64 `DEVICE_CAPABILITIES` extent.
 pub const DEVICE_CAPABILITIES_X64_SIZE: usize = 64;

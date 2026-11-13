@@ -62,20 +62,18 @@ fn shared_hosted_terminal_keeps_exact_owner_until_final_call_completion() {
             }
             visit::visit_expr_method_call(self, call);
         }
-        fn visit_expr_struct(&mut self, item: &'ast syn::ExprStruct) {
-            if item.path.is_ident("PendingSharedReturn") {
-                self.pending |= ["route", "dispatch", "reply"].iter().all(|name| {
-                    item.fields.iter().any(|field| {
-                        matches!(&field.member, syn::Member::Named(member) if member == *name)
-                            && if *name == "reply" {
-                                path_is(&field.expr, "reply_object")
-                            } else {
-                                path_is(&field.expr, name)
-                            }
-                    })
-                });
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if matches!(&*call.func, syn::Expr::Path(path)
+                if path.path.segments.len() == 2
+                    && path.path.segments[0].ident == "PendingSharedReturn"
+                    && path.path.segments[1].ident == "new") {
+                let args: Vec<_> = call.args.iter().collect();
+                self.pending |= args.len() == 7
+                    && path_is(args[0], "route")
+                    && path_is(args[1], "dispatch")
+                    && path_is(args[2], "reply_object");
             }
-            visit::visit_expr_struct(self, item);
+            visit::visit_expr_call(self, call);
         }
     }
     let mut wiring = TerminalWiring::default();
@@ -84,8 +82,30 @@ fn shared_hosted_terminal_keeps_exact_owner_until_final_call_completion() {
     assert!(wiring.pending, "semantic retirement must retain its original route, epoch and Reply");
 
     #[derive(Default)]
-    struct CompletionWiring { entered: bool, complete: bool, wrong_order: bool }
+    struct CompletionWiring {
+        captured: bool,
+        entered: bool,
+        complete: bool,
+        wrong_order: bool,
+        exact_route: bool,
+        exact_dispatch: bool,
+        exact_reply: bool,
+    }
     impl<'ast> Visit<'ast> for CompletionWiring {
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            if let (syn::Pat::Tuple(names), Some(init)) = (&local.pat, &local.init) {
+                if let syn::Expr::Tuple(values) = &*init.expr {
+                    let names: Vec<_> = names.elems.iter().collect();
+                    let values: Vec<_> = values.elems.iter().collect();
+                    self.captured |= names.len() >= 3 && values.len() >= 3
+                        && ["route", "dispatch", "reply"].iter().enumerate().all(|(index, name)| {
+                            matches!(names[index], syn::Pat::Ident(ident) if ident.ident == *name)
+                                && field_is(values[index], "pending", name)
+                        });
+                }
+            }
+            visit::visit_local(self, local);
+        }
         fn visit_expr_assign(&mut self, assign: &'ast syn::ExprAssign) {
             if field_is(&assign.left, "pending", "entered")
                 && matches!(&*assign.right, syn::Expr::Lit(lit)
@@ -99,21 +119,34 @@ fn shared_hosted_terminal_keeps_exact_owner_until_final_call_completion() {
             if call_is(call, "complete") {
                 let args: Vec<_> = call.args.iter().collect();
                 if args.len() == 4
-                    && field_is(args[0], "pending", "route")
-                    && field_is(args[1], "pending", "dispatch")
-                    && field_is(args[2], "pending", "reply")
+                    && path_is(args[0], "route")
+                    && path_is(args[1], "dispatch")
+                    && path_is(args[2], "reply")
                 {
                     self.complete = true;
-                    self.wrong_order |= !self.entered;
+                    self.wrong_order |= !self.captured || !self.entered;
                 }
             }
             visit::visit_expr_call(self, call);
         }
+        fn visit_expr_binary(&mut self, binary: &'ast syn::ExprBinary) {
+            if self.complete && matches!(&binary.op, syn::BinOp::Eq(_)) {
+                self.exact_route |= field_is(&binary.left, "pending", "route")
+                    && path_is(&binary.right, "route");
+                self.exact_dispatch |= field_is(&binary.left, "pending", "dispatch")
+                    && path_is(&binary.right, "dispatch");
+                self.exact_reply |= field_is(&binary.left, "pending", "reply")
+                    && path_is(&binary.right, "reply");
+            }
+            visit::visit_expr_binary(self, binary);
+        }
     }
     let mut completion = CompletionWiring::default();
     completion.visit_item_fn(function(&file, "drain_shared_returns"));
-    assert!(completion.entered && completion.complete && !completion.wrong_order,
-        "final Call completion must retain the exact attempt before using its original owners");
+    assert!(completion.captured && completion.entered && completion.complete
+        && !completion.wrong_order && completion.exact_route
+        && completion.exact_dispatch && completion.exact_reply,
+        "final Call must use copied exact owners, enter once, and revalidate the retained row");
 }
 
 #[test]

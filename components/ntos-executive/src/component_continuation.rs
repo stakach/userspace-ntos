@@ -8,6 +8,16 @@ pub(super) enum PendingComponentDispatch {
     Lpc(win32k_glue::PendingLpcWaitDispatch),
     Receive(win32k_glue::PendingReceiveDispatch),
     ServiceWait(win32k_glue::PendingServiceWaitDispatch),
+    RootMaintenance(win32k_glue::PendingRootMaintenanceDispatch),
+    NestedRestore(PendingNestedTerminalDispatch),
+}
+
+/// A real returned receive half transferred from its independent nested parent owner. The
+/// owner keeps the original root Reply until terminal retirement acknowledges it.
+#[derive(Clone, Copy)]
+pub(super) struct PendingNestedTerminalDispatch {
+    pub(super) ticket: nested_restore_owner::NestedRestoreOwnerTicket,
+    pub(super) client: win32k_glue::Win32kClientContext,
 }
 
 impl PendingComponentDispatch {
@@ -15,8 +25,10 @@ impl PendingComponentDispatch {
         match self {
             Self::Provider(pending) => pending.client,
             Self::Lpc(pending) => pending.client,
-            Self::Receive(pending) => pending.client,
-            Self::ServiceWait(pending) => pending.client,
+            Self::Receive(pending) => pending.snapshot.client,
+            Self::ServiceWait(pending) => pending.snapshot.client,
+            Self::RootMaintenance(pending) => pending.snapshot.client,
+            Self::NestedRestore(pending) => pending.client,
         }
     }
 }
@@ -31,7 +43,7 @@ pub(crate) struct ComponentSuspensionCompletion {
 
 impl ComponentSuspensionCompletion {
     /// Internal receive readiness, never supplied as a provider wait result or user Reply.
-    pub(super) const fn receive_ready() -> Self {
+    pub(crate) const fn receive_ready() -> Self {
         Self::provider(0)
     }
     pub(super) const fn provider(status: i32) -> Self {
@@ -66,11 +78,20 @@ impl ComponentSuspensionCompletion {
 pub(super) struct HostedNativeContinuation {
     pub(super) pending: PendingComponentDispatch,
     pub(super) return_target: HostedReturnTarget<win32k_glue::StagedUserCallbackContext>,
+    pub(super) destination: HostedContinuationDestination,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HostedContinuationDestination {
+    Win32k,
+    InitialThread(nt_user_host::process_create_callout::InitialThreadReplyOrigin<HostedThreadRole>),
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum ComponentNativeContinuation {
     Hosted(HostedNativeContinuation),
+    /// Dedicated held-parent checkpoint; never a generic provider resume or terminal Reply.
+    RootIngress(nt_user_host::root_ingress_handoff::RootIngressHandoffTicket),
     // Native blocking admission still requires the stopped-job scheduler and receive ownership.
     Kernel(nt_user_host::provider_kernel_activation::KernelProviderWaitCapture),
 }
@@ -80,6 +101,7 @@ impl nt_user_host::provider_kernel_wait::KernelProviderWaitContinuation for Comp
         match self {
             Self::Kernel(capture) => Some(*capture),
             Self::Hosted(_) => None,
+            Self::RootIngress(_) => None,
         }
     }
 }
@@ -89,6 +111,7 @@ impl ComponentNativeContinuation {
         match self {
             Self::Hosted(hosted) => Some(hosted),
             Self::Kernel(_) => None,
+            Self::RootIngress(_) => None,
         }
     }
 
@@ -96,6 +119,7 @@ impl ComponentNativeContinuation {
         match self {
             Self::Hosted(hosted) => Some(hosted),
             Self::Kernel(_) => None,
+            Self::RootIngress(_) => None,
         }
     }
 }

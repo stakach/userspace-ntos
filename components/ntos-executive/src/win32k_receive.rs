@@ -113,6 +113,7 @@ pub(crate) enum ReceivePumpCompletion {
     Restored(ProviderWaitPumpCompletion),
     Reparked(PendingReceiveDispatch),
     ServiceReparked(PendingServiceWaitDispatch),
+    CaptureRefused(PendingReceiveDispatch, crate::spawn_hosts::PumpResult, crate::spawn_hosts::PumpChannel),
     Deferred(runtime::ReceiveSettlementBoundary),
 }
 
@@ -120,6 +121,139 @@ pub(crate) enum ServiceWaitPumpCompletion {
     Restored(ProviderWaitPumpCompletion),
     ServiceReparked(PendingServiceWaitDispatch),
     ReceiveReparked(PendingReceiveDispatch),
+    CaptureRefused(PendingServiceWaitDispatch, crate::spawn_hosts::PumpResult, crate::spawn_hosts::PumpChannel),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RootMaintenancePumpCompletion {
+    Restored(ProviderWaitPumpCompletion),
+    ServiceReparked(PendingServiceWaitDispatch),
+    ReceiveReparked(PendingReceiveDispatch),
+    MaintenanceReparked(PendingRootMaintenanceDispatch),
+    CaptureRefused(PendingRootMaintenanceDispatch, crate::spawn_hosts::PumpResult, crate::spawn_hosts::PumpChannel),
+    RetainedFailure(u32),
+}
+
+/// The returned receive half owns the canonical Reply after any authenticated interim Call.
+/// Its completion and Reply receipt must be retained together before a pure lane transition.
+#[derive(Clone, Copy)]
+pub(crate) struct RootMaintenancePumpReturn {
+    pub(crate) completion: RootMaintenancePumpCompletion,
+    pub(crate) reply_cap: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RootIngressUnwindPumpCompletion {
+    Restored(ProviderWaitPumpCompletion),
+    ReceiveReparked(PendingReceiveDispatch),
+    ServiceReparked(PendingServiceWaitDispatch),
+    MaintenanceReparked(PendingRootMaintenanceDispatch),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum NestedRestorePumpCompletion {
+    Restored(ProviderWaitPumpCompletion),
+    NestedReparked(PendingNestedRestoreDispatch),
+    ReceiveReparked(PendingReceiveDispatch),
+    ServiceReparked(PendingServiceWaitDispatch),
+    RetainedFailure(u32),
+}
+
+/// Classify a real returned receive half exactly once. Output capture and callback-stack
+/// completion may have native or shared-memory effects; the outer owner records entry before
+/// calling this and retains the returned value for any pure transfer retry.
+pub(crate) unsafe fn settle_nested_restore_result(
+    pending: PendingNestedRestoreDispatch,
+) -> NestedRestorePumpCompletion {
+    let mut pump = pending.snapshot.pump;
+    let snapshot = pending.snapshot;
+    if pump.provider_wait_capture_refusal.is_some() {
+        // The nested owner still retains the complete returned snapshot and bound Reply.
+        return NestedRestorePumpCompletion::RetainedFailure(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    if pump.nested_restore_yield.is_some() || pump.nested_restore_quarantined.is_some() {
+        let mut next = pending;
+        next.snapshot.shared_resume = snapshot.shared_resume;
+        return NestedRestorePumpCompletion::NestedReparked(next);
+    }
+    if let Some(yielded) = pump.receive_yield() {
+        return NestedRestorePumpCompletion::ReceiveReparked(PendingReceiveDispatch {
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                shared_resume: yielded.shared_resume,
+                ..snapshot
+            },
+        });
+    }
+    if let Some(yielded) = pump.service_wait_yield {
+        return NestedRestorePumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                shared_resume: snapshot.shared_resume,
+                ..snapshot
+            },
+        });
+    }
+    pump.dispatch_return = capture_win32k_dispatch_return(
+        pump.dispatch_return_receipt,
+        snapshot.dispatch.dispatch_id,
+        snapshot.dispatch.ssn,
+        pump.result,
+        pump.completed,
+    );
+    retire_win32k_on_wall(&pump);
+    let result = if let Some(request) = pump.provider_wait_request {
+        ProviderWaitPumpCompletion::Reparked(PendingProviderWaitDispatch {
+            request,
+            dispatch: snapshot.dispatch,
+            client: snapshot.client,
+            shared_resume: try_capture_exact_shared_resume_snapshot(snapshot.dispatch, snapshot.client),
+            nested_user_callback: pending.origin.nested_user_callback,
+            arg_snapshot_len: snapshot.arg_snapshot_len,
+            arg_snapshot: snapshot.arg_snapshot,
+        })
+    } else if pump.lpc_wait_suspended {
+        capture_lpc_wait_repark(
+            snapshot.dispatch, snapshot.client, pending.origin.nested_user_callback,
+            snapshot.arg_snapshot_len, snapshot.arg_snapshot,
+        ).map(ProviderWaitPumpCompletion::LpcReparked)
+            .unwrap_or(ProviderWaitPumpCompletion::Failed(nt_process::STATUS_UNSUCCESSFUL as i32))
+    } else if pump.callback_suspended {
+        ProviderWaitPumpCompletion::UserCallbackSuspended
+    } else if pump.completed {
+        return NestedRestorePumpCompletion::Restored(complete_resumed_dispatch(
+            snapshot.dispatch, snapshot.client, pending.origin.nested_user_callback,
+            snapshot.arg_snapshot_len, snapshot.arg_snapshot, pump,
+        ));
+    } else {
+        return NestedRestorePumpCompletion::RetainedFailure(pump.status as u32);
+    };
+    NestedRestorePumpCompletion::Restored(result)
+}
+
+/// Resume the already-entered receive half after the independent nested parent owner has
+/// acknowledged its physical restore. A refusal occurs before receiving another native message;
+/// the outer frame keeps the same snapshot and must retry only this function.
+pub(crate) unsafe fn resume_suspended_nested_restore_receive(
+    pending: PendingNestedRestoreDispatch,
+) -> Result<crate::spawn_hosts::PumpResult, u32> {
+    if !select_and_restore_shared_resume_snapshot(
+        pending.snapshot.shared_resume,
+        pending.snapshot.dispatch,
+        pending.snapshot.client,
+    ).1
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    let previous = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    core::ptr::write(
+        core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), pending.snapshot.dispatch,
+    );
+    let result = crate::spawn_hosts::component_pump_continue_nested_restore_receive(
+        &pending.snapshot.channel, &pending.snapshot.pump,
+    );
+    core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous);
+    result
 }
 
 static RECEIVE_PHASE_TRACES: AtomicU64 = AtomicU64::new(0);
@@ -211,9 +345,12 @@ unsafe fn trace_receive_failure(
             print_str(b" top=");
             print_u64(match frame.key.kind {
                 nt_component_suspension::SuspensionKind::Receive => 1,
+                nt_component_suspension::SuspensionKind::RootIngress => 7,
                 nt_component_suspension::SuspensionKind::ServiceWait => 2,
                 nt_component_suspension::SuspensionKind::ProviderWait => 3,
                 nt_component_suspension::SuspensionKind::LpcRequest => 4,
+                nt_component_suspension::SuspensionKind::RootMaintenance => 5,
+                nt_component_suspension::SuspensionKind::NestedRestore => 6,
             });
             print_str(b"/");
             print_u64(frame.key.id);
@@ -282,7 +419,7 @@ pub(crate) fn trace_receive_phase(
 pub(crate) unsafe fn prepare_service_wait_yield(
     channel: &crate::spawn_hosts::PumpChannel,
 ) -> Result<Option<ServiceWaitYield>, runtime::Error> {
-    if !channel.caps.hosted_receive_yield
+    if !(channel.caps.hosted_receive_yield || channel.caps.nested_service_wait_yield)
         || channel.kernel_caller.is_some()
         || channel.caps.kind != crate::spawn_hosts::ReqKind::Syscall
         || crate::writable_fs::registry_journal::owns_volume()
@@ -328,6 +465,185 @@ pub(crate) unsafe fn prepare_service_wait_yield(
         return Ok(None);
     };
     Ok(Some(ServiceWaitYield { route, dispatch, reply, token }))
+}
+
+/// Observe an overdue independent root task without reentering the borrowed executive handler.
+/// Admission and physical execution exclusion remain the outer root owner's responsibility.
+pub(crate) unsafe fn prepare_root_maintenance_yield(
+    channel: &crate::spawn_hosts::PumpChannel,
+) -> Result<Option<RootMaintenanceYield>, runtime::Error> {
+    if !channel.caps.hosted_receive_yield
+        || channel.kernel_caller.is_some()
+        || channel.caps.kind != crate::spawn_hosts::ReqKind::Syscall
+        || crate::writable_fs::registry_journal::owns_volume()
+        || runtime::receive_child_pending()
+        || !crate::process_image_snapshot_work::due_for_outer_with_clock(monotonic_time_100ns)
+    {
+        return Ok(None);
+    }
+    let snapshot = runtime::hold_snapshot();
+    if snapshot.oldest.is_some() { return Ok(None); }
+    let Some(running) = snapshot.running else { return Ok(None); };
+    let Some(caller) = channel.logical_caller else { return Ok(None); };
+    let nt_user_host::process_identity::ProcessGeneration::Hosted(generation) =
+        caller.process().generation
+    else { return Ok(None); };
+    let route = runtime::channel_route(channel)?.ok_or(runtime::Error::PhysicalIdentity)?;
+    let dispatch = runtime::dispatch(route)?;
+    let Some(binding) = running.binding else { return Err(runtime::Error::Admission); };
+    let Some(running_dispatch) = running.dispatch else { return Err(runtime::Error::Admission); };
+    let active = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    let provider = crate::current_win32k_provider_domain()
+        .ok_or(runtime::Error::PhysicalIdentity)?;
+    let physical = runtime::physical_source(route)?;
+    let pi = u32::try_from(caller.pi()).map_err(|_| runtime::Error::PhysicalIdentity)?;
+    let registered = (&*core::ptr::addr_of!(WIN32K_DISPATCH_CLIENT_REGISTRY))
+        .dispatch(active.dispatch_id);
+    let lanes = &*core::ptr::addr_of!(crate::service_sec_image::COMPONENT_SUSPENSIONS);
+    if running.lane != dispatch.lane()
+        || running.route != Some(route)
+        || running_dispatch != dispatch
+        || running.quarantined != Some(false)
+        || route.identity().lane != dispatch.lane()
+        || active.lane != dispatch.lane()
+        || active.dispatch_id == 0
+        || binding.executor_id != channel.tcb
+        || binding.receive_endpoint != channel.fault_ep
+        || binding.reply_object == 0
+        || runtime::current_reply(route)? != binding.reply_object
+        || physical.tcb != channel.tcb
+        || physical.pml4 != channel.pml4
+        || running.physical != Some(physical)
+        || !matches!(physical.kind,
+            runtime::PhysicalSourceKind::Primary | runtime::PhysicalSourceKind::DispatchWorker { .. })
+        || !matches!(physical.domain,
+            runtime::PhysicalDomain::Provider { domain, .. } if domain == provider)
+        || u64::from(pi) != channel.client_pi
+        || generation != channel.client_generation
+        || lanes.suspension_count(running.lane) != Ok(0)
+        || lanes.external_depth(running.lane) != Ok(0)
+        || !registered.is_some_and(|client| {
+            client.logical_caller == Some(caller)
+                && client.tcb == caller.tcb()
+                && client.generation == generation
+        })
+    {
+        return Err(runtime::Error::PhysicalIdentity);
+    }
+    // A pre-Receive Reply is normally Free. Query the exact physical TCB and retained cap;
+    // an offered or foreign binding must not be mistaken for this dispatch's authority.
+    let reply_is_free = {
+        let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+        matches!(crate::spawn_hosts::query_component_reply_binding(
+            channel.tcb, binding.reply_object,
+        ), Ok(nt_component_suspension::ReplyBindingObservation::Free))
+    };
+    if !reply_is_free { return Err(runtime::Error::PhysicalIdentity); }
+    let owner = nt_component_suspension::SuspensionOwner {
+        provider_domain: provider.domain,
+        provider_generation: provider.generation,
+        dispatch_id: active.dispatch_id,
+        caller: nt_component_suspension::SuspensionCaller::Hosted(
+            nt_component_suspension::SuspensionHostedClient {
+                client_pi: pi,
+                client_generation: generation,
+                client_tid: u64::from(caller.thread().thread_id()),
+                client_badge: caller.badge(),
+            },
+        ),
+    };
+    if !owner.is_valid() { return Err(runtime::Error::PhysicalIdentity); }
+    Ok(Some(RootMaintenanceYield {
+        route, dispatch, reply: binding.reply_object, owner,
+        captured_pass: crate::service_sec_image::root_maintenance_pass(),
+    }))
+}
+
+/// The entered provider still borrows the executive handler. Only retained ingress and
+/// registered physical dispatch metadata may establish this nested parent identity.
+struct NestedYieldParent {
+    route: nt_component_suspension::peer_registry::PeerRoute,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+    binding: nt_component_suspension::LaneBinding,
+    owner: nt_component_suspension::SuspensionOwner,
+    shared_resume: SharedResumeSnapshot,
+}
+
+struct NestedYieldParentRoute {
+    route: nt_component_suspension::peer_registry::PeerRoute,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+    binding: nt_component_suspension::LaneBinding,
+    active: nt_user_callback::DispatchContext,
+    client: Win32kClientContext,
+    provider: nt_provider_wait::ProviderDomainIdentity,
+}
+
+unsafe fn validate_nested_yield_parent_route(
+    channel: &crate::spawn_hosts::PumpChannel,
+    running: runtime::RunningSnapshot,
+    caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+    generation: u64,
+) -> Result<Option<NestedYieldParentRoute>, runtime::Error> {
+    let Some(dispatch) = running.dispatch else { return Ok(None); };
+    let Some(binding) = running.binding else { return Ok(None); };
+    let route = runtime::channel_route(channel)
+        .map_err(|error| trace_receive_failure(b"channel-route", error, channel, None))?
+        .ok_or_else(|| trace_receive_failure(b"missing-route", runtime::Error::PhysicalIdentity, channel, None))?;
+    let active = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    let registered_client = (&*core::ptr::addr_of!(WIN32K_DISPATCH_CLIENT_REGISTRY))
+        .dispatch(active.dispatch_id);
+    if active.lane != running.lane
+        || binding.executor_id != channel.tcb
+        || binding.receive_endpoint != channel.fault_ep
+        || running.route != Some(route)
+        || route.identity().lane != active.lane
+        || !registered_client.is_some_and(|client| {
+                client.logical_caller == Some(caller)
+                    && client.tcb == caller.tcb()
+                    && client.generation == generation
+            })
+    {
+        return Err(trace_receive_failure(b"dispatch-identity", runtime::Error::PhysicalIdentity, channel, Some(route)));
+    }
+    let provider = crate::current_win32k_provider_domain().ok_or_else(||
+        trace_receive_failure(b"provider-domain", runtime::Error::PhysicalIdentity, channel, Some(route)))?;
+    if !running.physical.is_some_and(|physical| {
+        matches!(physical.domain, runtime::PhysicalDomain::Provider { domain, .. } if domain == provider)
+            && physical.pml4 == channel.pml4 && physical.tcb == channel.tcb
+    }) {
+        return Err(trace_receive_failure(b"physical-source", runtime::Error::PhysicalIdentity, channel, Some(route)));
+    }
+    let client = win32k_client_context_from_callback_client(registered_client.unwrap());
+    Ok(Some(NestedYieldParentRoute { route, dispatch, binding, active, client, provider }))
+}
+
+unsafe fn finish_nested_yield_parent(
+    channel: &crate::spawn_hosts::PumpChannel,
+    parent: NestedYieldParentRoute,
+    caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+    generation: u64,
+) -> Result<NestedYieldParent, runtime::Error> {
+    let NestedYieldParentRoute { route, dispatch, binding, active, client, provider } = parent;
+    let pi = u32::try_from(caller.pi()).map_err(|_| trace_receive_failure(
+        b"client-pi-width", runtime::Error::PhysicalIdentity, channel, Some(route)))?;
+    if u64::from(pi) != channel.client_pi || generation != channel.client_generation {
+        return Err(trace_receive_failure(b"client-generation", runtime::Error::PhysicalIdentity, channel, Some(route)));
+    }
+    let shared_resume = capture_shared_resume_snapshot(active, client);
+    let owner = nt_component_suspension::SuspensionOwner {
+        provider_domain: provider.domain,
+        provider_generation: provider.generation,
+        dispatch_id: active.dispatch_id,
+        caller: nt_component_suspension::SuspensionCaller::Hosted(
+            nt_component_suspension::SuspensionHostedClient {
+                client_pi: pi,
+                client_generation: generation,
+                client_tid: u64::from(caller.thread().thread_id()),
+                client_badge: caller.badge(),
+            },
+        ),
+    };
+    Ok(NestedYieldParent { route, dispatch, binding, owner, shared_resume })
 }
 
 /// Inspect only already-authenticated ingress and registered dispatch metadata. The outer
@@ -376,40 +692,9 @@ pub(crate) unsafe fn prepare_receive_yield(
     let Some(running) = snapshot.running else {
         return Ok(None);
     };
-    let Some(dispatch) = running.dispatch else {
-        return Ok(None);
-    };
-    let Some(binding) = running.binding else {
-        return Ok(None);
-    };
-    let route = runtime::channel_route(channel)
-        .map_err(|error| trace_receive_failure(b"channel-route", error, channel, None))?
-        .ok_or_else(|| trace_receive_failure(b"missing-route", runtime::Error::PhysicalIdentity, channel, None))?;
-    let active = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
-    if active.lane != running.lane
-        || binding.executor_id != channel.tcb
-        || binding.receive_endpoint != channel.fault_ep
-        || running.route != Some(route)
-        || route.identity().lane != active.lane
-        || !(&*core::ptr::addr_of!(WIN32K_DISPATCH_CLIENT_REGISTRY))
-            .dispatch(active.dispatch_id)
-            .is_some_and(|client| {
-                client.logical_caller == Some(caller)
-                    && client.tcb == caller.tcb()
-                    && client.generation == generation
-            })
-    {
-        return Err(trace_receive_failure(b"dispatch-identity", runtime::Error::PhysicalIdentity, channel, Some(route)));
-    }
-    let provider =
-        crate::current_win32k_provider_domain().ok_or_else(||
-            trace_receive_failure(b"provider-domain", runtime::Error::PhysicalIdentity, channel, Some(route)))?;
-    if !running.physical.is_some_and(|physical| {
-        matches!(physical.domain, runtime::PhysicalDomain::Provider { domain, .. } if domain == provider)
-            && physical.pml4 == channel.pml4 && physical.tcb == channel.tcb
-    }) {
-        return Err(trace_receive_failure(b"physical-source", runtime::Error::PhysicalIdentity, channel, Some(route)));
-    }
+    let Some(parent_route) = validate_nested_yield_parent_route(
+        channel, running, caller, generation,
+    )? else { return Ok(None); };
     let Some(child_root) = crate::service_sec_image::receive_vspace::peek_root(child.binding)
     else {
         return Ok(None);
@@ -422,24 +707,12 @@ pub(crate) unsafe fn prepare_receive_yield(
     ) {
         return Ok(None);
     }
-    let pi = u32::try_from(caller.pi()).map_err(|_| trace_receive_failure(
-        b"client-pi-width", runtime::Error::PhysicalIdentity, channel, Some(route)))?;
-    if u64::from(pi) != channel.client_pi || generation != channel.client_generation {
-        return Err(trace_receive_failure(b"client-generation", runtime::Error::PhysicalIdentity, channel, Some(route)));
-    }
-    let owner = nt_component_suspension::SuspensionOwner {
-        provider_domain: provider.domain,
-        provider_generation: provider.generation,
-        dispatch_id: active.dispatch_id,
-        caller: nt_component_suspension::SuspensionCaller::Hosted(
-            nt_component_suspension::SuspensionHostedClient {
-                client_pi: pi,
-                client_generation: generation,
-                client_tid: u64::from(caller.thread().thread_id()),
-                client_badge: caller.badge(),
-            },
-        ),
-    };
+    let parent = finish_nested_yield_parent(channel, parent_route, caller, generation)?;
+    let dispatch = parent.dispatch;
+    let binding = parent.binding;
+    let route = parent.route;
+    let owner = parent.owner;
+    let shared_resume = parent.shared_resume;
     let replaces = {
         // Canonical lane storage outlives any transient arena inherited by this pump.
         let _durable = crate::allocator::enter_durable();
@@ -479,7 +752,82 @@ pub(crate) unsafe fn prepare_receive_yield(
         child: child_key,
         owner,
         replaces,
+        shared_resume,
     }))
+}
+
+/// Prepare one ordinary root Call without entering the borrowed executive handler. The parent
+/// is parked but deliberately left unbound: the serialized root owner must authenticate the
+/// child's File route before it may bind/deliver it, or perform an undelivered parent unwind.
+/// This entry is dormant until both outer outcomes have exact native checkpoints and an
+/// initial-dispatch provenance gate excludes resumed provider/callback receive halves.
+pub(crate) unsafe fn prepare_root_ingress_yield(
+    channel: &crate::spawn_hosts::PumpChannel,
+) -> Result<Option<RootIngressYield>, runtime::Error> {
+    if !channel.caps.hosted_receive_yield
+        || channel.kernel_caller.is_some()
+        || channel.caps.kind != crate::spawn_hosts::ReqKind::Syscall
+        || crate::writable_fs::registry_journal::owns_volume()
+    {
+        return Ok(None);
+    }
+    let Some(provenance) = channel.initial_root_dispatch else { return Ok(None); };
+    let Some(caller) = channel.logical_caller else { return Ok(None); };
+    let nt_user_host::process_identity::ProcessGeneration::Hosted(generation) =
+        caller.process().generation
+    else { return Ok(None); };
+    let snapshot = runtime::hold_snapshot();
+    let (Some(child), Some(running)) = (snapshot.oldest, snapshot.running) else {
+        return Ok(None);
+    };
+    if child.info >> 12 != nt_syscall_abi::NT_NATIVE_SYSCALL_LABEL {
+        return Ok(None);
+    }
+    let Some(parent_route) = validate_nested_yield_parent_route(
+        channel, running, caller, generation,
+    )? else { return Ok(None); };
+    if parent_route.route != provenance.route()
+        || parent_route.dispatch != provenance.dispatch()
+        || parent_route.binding.executor_id != provenance.tcb()
+        || parent_route.binding.reply_object != provenance.reply()
+    {
+        return Err(runtime::Error::PhysicalIdentity);
+    }
+    let Some(child_root) = crate::service_sec_image::receive_vspace::peek_root(child.binding)
+    else { return Ok(None); };
+    if !crate::service_sec_image::receive_vspace::validate_pair(
+        child.binding.tcb, child_root, channel.tcb, channel.pml4,
+    ) {
+        return Ok(None);
+    }
+    let parent = finish_nested_yield_parent(channel, parent_route, caller, generation)?;
+    {
+        let _durable = crate::allocator::enter_durable();
+        let lanes = &mut *core::ptr::addr_of_mut!(crate::service_sec_image::COMPONENT_SUSPENSIONS);
+        lanes.reserve_root_ingress_capacity(
+            running.lane, parent.binding.reply_object, parent.owner,
+        ).map_err(|_| runtime::Error::Capacity)?;
+    }
+    let admission = runtime::prepare_root_ingress_pass(child)?;
+    match runtime::nested::park_current_for_root(admission) {
+        runtime::nested::RootParkOutcome::NoRunningLane(proof)
+        | runtime::nested::RootParkOutcome::RefusedNoEffect(_, proof) => {
+            if runtime::cancel_unbound_root_ingress_pass(child, admission, proof).is_ok() {
+                Ok(None)
+            } else {
+                Ok(Some(RootIngressYield::Retained { child: admission }))
+            }
+        }
+        runtime::nested::RootParkOutcome::Retained(_) => {
+            Ok(Some(RootIngressYield::Retained { child: admission }))
+        }
+        runtime::nested::RootParkOutcome::Parked(handle) => {
+            Ok(Some(RootIngressYield::ParkedUnbound {
+                ticket: handle.ticket(), child: admission, owner: parent.owner,
+                shared_resume: parent.shared_resume,
+            }))
+        }
+    }
 }
 
 pub(crate) unsafe fn receive_continuation_is_current(
@@ -511,7 +859,7 @@ pub(crate) unsafe fn service_wait_continuation_is_current(
     yielded: ServiceWaitYield,
 ) -> bool {
     if channel.caps.kind != crate::spawn_hosts::ReqKind::Syscall
-        || !channel.caps.hosted_receive_yield
+        || !(channel.caps.hosted_receive_yield || channel.caps.nested_service_wait_yield)
         || channel.kernel_caller.is_some()
         || yielded.route.identity().lane != yielded.dispatch.lane()
         || runtime::channel_route(channel).ok().flatten() != Some(yielded.route)
@@ -531,6 +879,286 @@ pub(crate) unsafe fn service_wait_continuation_is_current(
     ), Ok(true))
 }
 
+/// Authenticate the exact component lane and original receive half before leaving maintenance.
+/// No Reply or request is sent here; a stale route or generation retains the parked owner.
+pub(crate) unsafe fn root_maintenance_continuation_is_current(
+    channel: &crate::spawn_hosts::PumpChannel,
+    yielded: RootMaintenanceYield,
+) -> bool {
+    if channel.caps.kind != crate::spawn_hosts::ReqKind::Syscall
+        || !channel.caps.hosted_receive_yield
+        || channel.kernel_caller.is_some()
+        || yielded.route.identity().lane != yielded.dispatch.lane()
+        || runtime::channel_route(channel).ok().flatten() != Some(yielded.route)
+        || runtime::dispatch(yielded.route).ok() != Some(yielded.dispatch)
+        || runtime::current_reply(yielded.route).ok() != Some(yielded.reply)
+    {
+        return false;
+    }
+    let lane = yielded.dispatch.lane();
+    let lanes = &*core::ptr::addr_of!(crate::service_sec_image::COMPONENT_SUSPENSIONS);
+    if lanes.running() != Some(lane)
+        || lanes.active_dispatch_identity(lane).ok().flatten() != Some(yielded.dispatch)
+        || !lanes.binding(lane).is_ok_and(|binding| {
+            binding.executor_id == channel.tcb
+                && binding.receive_endpoint == channel.fault_ep
+                && binding.reply_object == yielded.reply
+        })
+        || !runtime::physical_source(yielded.route).is_ok_and(|physical| {
+            physical.tcb == channel.tcb && physical.pml4 == channel.pml4
+        })
+    {
+        return false;
+    }
+    lanes.top(lane).is_ok_and(|frame| frame.is_some_and(|frame| {
+        frame.key.kind == nt_component_suspension::SuspensionKind::RootMaintenance
+            && frame.owner == yielded.owner
+            && matches!(frame.phase,
+                nt_component_suspension::SuspensionPhase::MaintenanceResuming { .. })
+    }))
+}
+
+/// A route-refusal unwind restored the original physical parent and cancelled the undelivered
+/// child. Only that original Win32k receive half may run; no RootIngress frame was admitted.
+pub(crate) unsafe fn root_ingress_unwind_continuation_is_current(
+    channel: &crate::spawn_hosts::PumpChannel,
+    yielded: RootIngressYield,
+    parent: nt_component_suspension::NestedExecutionIdentity,
+    reply: u64,
+    expected_dispatch_id: u64,
+) -> bool {
+    let RootIngressYield::ParkedUnbound { ticket, child, owner, .. } = yielded else {
+        return false;
+    };
+    let route = parent.route();
+    let dispatch = parent.dispatch();
+    let lane = dispatch.lane();
+    if channel.caps.kind != crate::spawn_hosts::ReqKind::Syscall
+        || !channel.caps.hosted_receive_yield
+        || channel.kernel_caller.is_some()
+        || ticket.identity() != parent
+        || child.reply() == reply
+        || expected_dispatch_id == 0 || owner.dispatch_id != expected_dispatch_id
+        || !channel.initial_root_dispatch.is_some_and(|initial| {
+            initial.route() == route && initial.dispatch() == dispatch
+                && initial.tcb() == channel.tcb && initial.reply() == reply
+        })
+        || runtime::channel_route(channel).ok().flatten() != Some(route)
+        || runtime::dispatch(route).ok() != Some(dispatch)
+        || runtime::current_reply(route).ok() != Some(reply)
+        || !runtime::physical_source(route).is_ok_and(|source| {
+            source.tcb == channel.tcb && source.pml4 == channel.pml4
+        })
+    {
+        return false;
+    }
+    let lanes = &*core::ptr::addr_of!(crate::service_sec_image::COMPONENT_SUSPENSIONS);
+    lanes.running() == Some(lane)
+        && lanes.active_dispatch_identity(lane).ok().flatten() == Some(dispatch)
+        && lanes.binding(lane).is_ok_and(|binding| {
+            binding.executor_id == channel.tcb
+                && binding.receive_endpoint == channel.fault_ep
+                && binding.reply_object == reply
+        })
+}
+
+/// Resume only the receive half after the exact maintenance owner restored its physical hold.
+/// A refusal here is retained by that owner; it is never a completed provider or syscall result.
+pub(crate) unsafe fn resume_suspended_root_maintenance_component(
+    pending: PendingRootMaintenanceDispatch,
+) -> RootMaintenancePumpReturn {
+    let original_reply = pending.snapshot.pump.reply_cap;
+    if !select_and_restore_shared_resume_snapshot(
+        pending.snapshot.shared_resume, pending.snapshot.dispatch, pending.snapshot.client,
+    ).1
+    {
+        return RootMaintenancePumpReturn { completion: RootMaintenancePumpCompletion::RetainedFailure(
+            nt_process::STATUS_INVALID_PARAMETER), reply_cap: original_reply };
+    }
+    let channel = pending.snapshot.channel;
+    let previous = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    core::ptr::write(
+        core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), pending.snapshot.dispatch,
+    );
+    let result = crate::spawn_hosts::component_pump_continue_root_maintenance(
+        &channel, &pending.snapshot.pump,
+    );
+    core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous);
+    let mut pump = match result {
+        Ok(pump) => pump,
+        Err(status) => return RootMaintenancePumpReturn {
+            completion: RootMaintenancePumpCompletion::RetainedFailure(status), reply_cap: original_reply,
+        },
+    };
+    let reply_cap = pump.reply_cap;
+    if pump.provider_wait_capture_refusal.is_some() {
+        return RootMaintenancePumpReturn { reply_cap, completion:
+            RootMaintenancePumpCompletion::CaptureRefused(pending, pump, channel) };
+    }
+    if let Some(yielded) = pump.maintenance_yield {
+        return RootMaintenancePumpReturn { reply_cap, completion:
+            RootMaintenancePumpCompletion::MaintenanceReparked(PendingRootMaintenanceDispatch {
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, channel, callback_token: None,
+                shared_resume: capture_shared_resume_snapshot(
+                    pending.snapshot.dispatch, pending.snapshot.client,
+                ),
+                ..pending.snapshot
+            },
+        }) };
+    }
+    if let Some(yielded) = pump.receive_yield() {
+        return RootMaintenancePumpReturn { reply_cap, completion:
+            RootMaintenancePumpCompletion::ReceiveReparked(PendingReceiveDispatch {
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, channel, callback_token: None,
+                shared_resume: yielded.shared_resume,
+                ..pending.snapshot
+            },
+        }) };
+    }
+    if let Some(yielded) = pump.service_wait_yield {
+        return RootMaintenancePumpReturn { reply_cap, completion:
+            RootMaintenancePumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, channel, callback_token: None,
+                shared_resume: capture_shared_resume_snapshot(
+                    pending.snapshot.dispatch, pending.snapshot.client,
+                ),
+                ..pending.snapshot
+            },
+        }) };
+    }
+    let completion = match classify_returned_win32k_pump(pending.snapshot, pump) {
+        Ok(completion) => RootMaintenancePumpCompletion::Restored(completion),
+        Err(status) => RootMaintenancePumpCompletion::RetainedFailure(status),
+    };
+    RootMaintenancePumpReturn { completion, reply_cap }
+}
+
+/// Capture the exact returned receive half before a later dispatch can reuse shared output.
+/// The caller owns entry into this effectful classifier and retains its typed result.
+unsafe fn classify_returned_win32k_pump(
+    snapshot: SuspendedPumpSnapshot,
+    mut pump: crate::spawn_hosts::PumpResult,
+) -> Result<ProviderWaitPumpCompletion, u32> {
+    if pump.provider_wait_capture_refusal.is_some() {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    pump.dispatch_return = capture_win32k_dispatch_return(
+        pump.dispatch_return_receipt,
+        snapshot.dispatch.dispatch_id,
+        snapshot.dispatch.ssn,
+        pump.result,
+        pump.completed,
+    );
+    retire_win32k_on_wall(&pump);
+    let completion = if let Some(request) = pump.provider_wait_request {
+        ProviderWaitPumpCompletion::Reparked(PendingProviderWaitDispatch {
+            request,
+            dispatch: snapshot.dispatch,
+            client: snapshot.client,
+            shared_resume: try_capture_exact_shared_resume_snapshot(snapshot.dispatch, snapshot.client),
+            nested_user_callback: false,
+            arg_snapshot_len: snapshot.arg_snapshot_len,
+            arg_snapshot: snapshot.arg_snapshot,
+        })
+    } else if pump.lpc_wait_suspended {
+        match capture_lpc_wait_repark(
+            snapshot.dispatch, snapshot.client, false,
+            snapshot.arg_snapshot_len, snapshot.arg_snapshot,
+        ) {
+            Some(next) => ProviderWaitPumpCompletion::LpcReparked(next),
+            None => return Err(0xC000_0001),
+        }
+    } else if pump.callback_suspended {
+        ProviderWaitPumpCompletion::UserCallbackSuspended
+    } else if !pump.completed {
+        return Err(pump.status as u32);
+    } else {
+        complete_resumed_dispatch(
+            snapshot.dispatch, snapshot.client, false,
+            snapshot.arg_snapshot_len, snapshot.arg_snapshot, pump,
+        )
+    };
+    Ok(completion)
+}
+
+/// Classify an entered root-unwind receive exactly once. Unsupported nested/root/scheduler
+/// yields remain in the caller's raw owner for quarantine, never a fabricated Failed result.
+pub(crate) unsafe fn classify_root_ingress_unwind_result(
+    snapshot: SuspendedPumpSnapshot,
+    pump: crate::spawn_hosts::PumpResult,
+) -> Result<RootIngressUnwindPumpCompletion, u32> {
+    if pump.provider_wait_capture_refusal.is_some()
+        || pump.root_ingress_yield().is_some() || pump.nested_restore_yield.is_some()
+        || pump.nested_restore_quarantined.is_some() || pump.scheduler_yielded
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    if let Some(yielded) = pump.maintenance_yield {
+        return Ok(RootIngressUnwindPumpCompletion::MaintenanceReparked(PendingRootMaintenanceDispatch {
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, callback_token: None,
+                shared_resume: capture_shared_resume_snapshot(snapshot.dispatch, snapshot.client),
+                ..snapshot
+            },
+        }));
+    }
+    if let Some(yielded) = pump.receive_yield() {
+        return Ok(RootIngressUnwindPumpCompletion::ReceiveReparked(PendingReceiveDispatch {
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, callback_token: None, shared_resume: yielded.shared_resume, ..snapshot
+            },
+        }));
+    }
+    if let Some(yielded) = pump.service_wait_yield {
+        return Ok(RootIngressUnwindPumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, callback_token: None,
+                shared_resume: capture_shared_resume_snapshot(snapshot.dispatch, snapshot.client),
+                ..snapshot
+            },
+        }));
+    }
+    classify_returned_win32k_pump(snapshot, pump).map(RootIngressUnwindPumpCompletion::Restored)
+}
+
+/// The parent has been physically restored and its undelivered child cancelled. Restore the
+/// saved client window, then enter only the existing receive half; the owner records Entering
+/// before calling this function and retains every returned outcome.
+pub(crate) unsafe fn resume_root_ingress_after_unwind_receive(
+    pending: PendingRootIngressDispatch,
+    parent: nt_component_suspension::NestedExecutionIdentity,
+) -> Result<crate::spawn_hosts::PumpResult, u32> {
+    if !root_ingress_unwind_continuation_is_current(
+        &pending.snapshot.channel, pending.yielded, parent, pending.snapshot.pump.reply_cap,
+        pending.snapshot.dispatch.dispatch_id,
+    ) {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    if !select_and_restore_shared_resume_snapshot(
+        pending.snapshot.shared_resume, pending.snapshot.dispatch, pending.snapshot.client,
+    ).1
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    let previous = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), pending.snapshot.dispatch);
+    let result = crate::spawn_hosts::component_pump_continue_root_ingress_after_unwind(
+        &pending.snapshot.channel, &pending.snapshot.pump, parent,
+        pending.snapshot.dispatch.dispatch_id,
+    );
+    core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous);
+    result
+}
+
 pub(crate) unsafe fn resume_suspended_receive_component(
     pending: PendingReceiveDispatch,
     mut boundary: runtime::ReceiveSettlementBoundary,
@@ -547,13 +1175,21 @@ pub(crate) unsafe fn resume_suspended_receive_component(
         pending.yielded.child,
         pending.yielded.owner,
     );
-    let channel = pending.channel;
+    if !select_and_restore_shared_resume_snapshot(
+        pending.snapshot.shared_resume, pending.snapshot.dispatch, pending.snapshot.client,
+    ).1
+    {
+        return ReceivePumpCompletion::Restored(ProviderWaitPumpCompletion::Failed(
+            nt_process::STATUS_INVALID_PARAMETER as i32,
+        ));
+    }
+    let channel = pending.snapshot.channel;
     let previous = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
-        pending.dispatch,
+        pending.snapshot.dispatch,
     );
-    let result = crate::spawn_hosts::component_pump_continue_receive(&channel, &pending.pump);
+    let result = crate::spawn_hosts::component_pump_continue_receive(&channel, &pending.snapshot.pump);
     trace_receive_phase(
         b"receive-continued",
         pending.yielded.parent,
@@ -572,51 +1208,58 @@ pub(crate) unsafe fn resume_suspended_receive_component(
             ))
         }
     };
-    if let Some(yielded) = pump.receive_yield {
+    if pump.provider_wait_capture_refusal.is_some() {
+        return ReceivePumpCompletion::CaptureRefused(pending, pump, channel);
+    }
+    if let Some(yielded) = pump.receive_yield() {
         return ReceivePumpCompletion::Reparked(PendingReceiveDispatch {
             yielded,
-            pump,
-            channel,
-            callback_token: None,
-            ..pending
+            snapshot: SuspendedPumpSnapshot {
+                pump, channel, callback_token: None,
+                shared_resume: yielded.shared_resume,
+                ..pending.snapshot
+            },
         });
     }
     if let Some(yielded) = pump.service_wait_yield {
         return ReceivePumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
-            yielded, pump, channel,
-            dispatch: pending.dispatch,
-            client: pending.client,
-            callback_token: None,
-            arg_snapshot_len: pending.arg_snapshot_len,
-            arg_snapshot: pending.arg_snapshot,
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, channel,
+                dispatch: pending.snapshot.dispatch,
+                client: pending.snapshot.client,
+                callback_token: None,
+                shared_resume: capture_shared_resume_snapshot(pending.snapshot.dispatch, pending.snapshot.client),
+                arg_snapshot_len: pending.snapshot.arg_snapshot_len,
+                arg_snapshot: pending.snapshot.arg_snapshot,
+            },
         });
     }
     pump.dispatch_return = capture_win32k_dispatch_return(
         pump.dispatch_return_receipt,
-        pending.dispatch.dispatch_id,
-        pending.dispatch.ssn,
+        pending.snapshot.dispatch.dispatch_id,
+        pending.snapshot.dispatch.ssn,
         pump.result,
         pump.completed,
     );
     retire_win32k_on_wall(&pump);
-    let completion = if pump.provider_wait_suspended {
-        let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-            as *const nt_provider_wait::ProviderWaitSharedPage;
+    let completion = if let Some(request) = pump.provider_wait_request {
         ProviderWaitPumpCompletion::Reparked(PendingProviderWaitDispatch {
-            request: core::ptr::read_volatile(core::ptr::addr_of!((*page).request)),
-            dispatch: pending.dispatch,
-            client: pending.client,
+            request,
+            dispatch: pending.snapshot.dispatch,
+            client: pending.snapshot.client,
+            shared_resume: try_capture_exact_shared_resume_snapshot(pending.snapshot.dispatch, pending.snapshot.client),
             nested_user_callback: false,
-            arg_snapshot_len: pending.arg_snapshot_len,
-            arg_snapshot: pending.arg_snapshot,
+            arg_snapshot_len: pending.snapshot.arg_snapshot_len,
+            arg_snapshot: pending.snapshot.arg_snapshot,
         })
     } else if pump.lpc_wait_suspended {
         capture_lpc_wait_repark(
-            pending.dispatch,
-            pending.client,
+            pending.snapshot.dispatch,
+            pending.snapshot.client,
             false,
-            pending.arg_snapshot_len,
-            pending.arg_snapshot,
+            pending.snapshot.arg_snapshot_len,
+            pending.snapshot.arg_snapshot,
         )
         .map(ProviderWaitPumpCompletion::LpcReparked)
         .unwrap_or(ProviderWaitPumpCompletion::Failed(0xC000_0001u32 as i32))
@@ -626,11 +1269,11 @@ pub(crate) unsafe fn resume_suspended_receive_component(
         ProviderWaitPumpCompletion::Failed(pump.status)
     } else {
         complete_resumed_dispatch(
-            pending.dispatch,
-            pending.client,
+            pending.snapshot.dispatch,
+            pending.snapshot.client,
             false,
-            pending.arg_snapshot_len,
-            pending.arg_snapshot,
+            pending.snapshot.arg_snapshot_len,
+            pending.snapshot.arg_snapshot,
             pump,
         )
     };
@@ -642,14 +1285,32 @@ pub(crate) unsafe fn resume_suspended_receive_component(
 pub(crate) unsafe fn resume_suspended_service_wait_component(
     pending: PendingServiceWaitDispatch,
 ) -> ServiceWaitPumpCompletion {
-    let channel = pending.channel;
+    let nested = pending.snapshot.callback_token.is_some();
+    let (selected, restored) = select_and_restore_shared_resume_snapshot(
+        pending.snapshot.shared_resume, pending.snapshot.dispatch, pending.snapshot.client,
+    );
+    if !restored {
+        static SERVICE_RESTORE_FAILURES: AtomicU64 = AtomicU64::new(0);
+        if SERVICE_RESTORE_FAILURES.fetch_add(1, Ordering::Relaxed) < 8 {
+            print_str(b"[service-wait-resume] stage=restore selected/restored/pi/tid/dispatch=");
+            print_u64(selected as u64); print_str(b"/"); print_u64(restored as u64);
+            print_str(b"/"); print_u64(pending.snapshot.client.pi as u64);
+            print_str(b"/"); print_u64(pending.snapshot.client.tid);
+            print_str(b"/"); print_u64(pending.snapshot.dispatch.dispatch_id);
+            print_str(b"\n");
+        }
+        return ServiceWaitPumpCompletion::Restored(ProviderWaitPumpCompletion::Failed(
+            nt_process::STATUS_INVALID_PARAMETER as i32,
+        ));
+    }
+    let channel = pending.snapshot.channel;
     let previous = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
-        pending.dispatch,
+        pending.snapshot.dispatch,
     );
     let result = crate::spawn_hosts::component_pump_continue_service_wait(
-        &channel, &pending.pump,
+        &channel, &pending.snapshot.pump,
     );
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
@@ -658,52 +1319,106 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
     let mut pump = match result {
         Ok(pump) => pump,
         Err(status) => {
+            static SERVICE_CONTINUE_FAILURES: AtomicU64 = AtomicU64::new(0);
+            if SERVICE_CONTINUE_FAILURES.fetch_add(1, Ordering::Relaxed) < 8 {
+                print_str(b"[service-wait-resume] stage=continue pi/tid/dispatch/status=");
+                print_u64(pending.snapshot.client.pi as u64); print_str(b"/"); print_u64(pending.snapshot.client.tid);
+                print_str(b"/"); print_u64(pending.snapshot.dispatch.dispatch_id);
+                print_str(b"/0x"); print_hex(status);
+                print_str(b"\n");
+            }
             return ServiceWaitPumpCompletion::Restored(
                 ProviderWaitPumpCompletion::Failed(status as i32),
             );
         }
     };
+    if pump.provider_wait_capture_refusal.is_some() {
+        return ServiceWaitPumpCompletion::CaptureRefused(pending, pump, channel);
+    }
     if let Some(yielded) = pump.service_wait_yield {
         return ServiceWaitPumpCompletion::ServiceReparked(PendingServiceWaitDispatch {
-            yielded, pump, channel, callback_token: None, ..pending
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, channel, callback_token: pending.snapshot.callback_token,
+                shared_resume: capture_shared_resume_snapshot(pending.snapshot.dispatch, pending.snapshot.client),
+                ..pending.snapshot
+            },
         });
     }
-    if let Some(yielded) = pump.receive_yield {
+    if let Some(yielded) = pump.receive_yield() {
         return ServiceWaitPumpCompletion::ReceiveReparked(PendingReceiveDispatch {
-            yielded, pump, channel,
-            dispatch: pending.dispatch,
-            client: pending.client,
-            callback_token: None,
-            arg_snapshot_len: pending.arg_snapshot_len,
-            arg_snapshot: pending.arg_snapshot,
+            yielded,
+            snapshot: SuspendedPumpSnapshot {
+                pump, channel,
+                dispatch: pending.snapshot.dispatch,
+                client: pending.snapshot.client,
+                callback_token: pending.snapshot.callback_token,
+                shared_resume: yielded.shared_resume,
+                arg_snapshot_len: pending.snapshot.arg_snapshot_len,
+                arg_snapshot: pending.snapshot.arg_snapshot,
+            },
         });
     }
     pump.dispatch_return = capture_win32k_dispatch_return(
         pump.dispatch_return_receipt,
-        pending.dispatch.dispatch_id,
-        pending.dispatch.ssn,
+        pending.snapshot.dispatch.dispatch_id,
+        pending.snapshot.dispatch.ssn,
         pump.result,
         pump.completed,
     );
     retire_win32k_on_wall(&pump);
-    let completion = if pump.provider_wait_suspended {
-        let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-            as *const nt_provider_wait::ProviderWaitSharedPage;
-        ProviderWaitPumpCompletion::Reparked(PendingProviderWaitDispatch {
-            request: core::ptr::read_volatile(core::ptr::addr_of!((*page).request)),
-            dispatch: pending.dispatch,
-            client: pending.client,
-            nested_user_callback: false,
-            arg_snapshot_len: pending.arg_snapshot_len,
-            arg_snapshot: pending.arg_snapshot,
-        })
+    let completion = if let Some(request) = pump.provider_wait_request {
+        let client = pending.snapshot.client;
+        let expected_owner = if win32k_client_context_is_admitted(client)
+            && client.logical_caller.is_some()
+        {
+            crate::current_win32k_provider_domain().map(|provider|
+                nt_provider_wait::ProviderWaitOwner {
+                    provider_domain: provider.domain,
+                    provider_generation: provider.generation,
+                    dispatch_id: pending.snapshot.dispatch.dispatch_id,
+                    caller: nt_provider_wait::SuspensionCaller::Hosted(
+                        nt_provider_wait::SuspensionHostedClient {
+                            client_pi: client.pi,
+                            client_generation: client.generation,
+                            client_tid: client.tid,
+                            client_badge: client.badge,
+                        },
+                    ),
+                })
+        } else {
+            None
+        };
+        let owner_matches = request.validate().is_ok()
+            && request.header.owner().is_some()
+            && request.header.owner() == expected_owner;
+        let next = PendingProviderWaitDispatch {
+            request,
+            dispatch: pending.snapshot.dispatch,
+            client: pending.snapshot.client,
+            shared_resume: owner_matches.then(||
+                try_capture_exact_shared_resume_snapshot(
+                    pending.snapshot.dispatch, pending.snapshot.client,
+                )).flatten(),
+            nested_user_callback: nested,
+            arg_snapshot_len: pending.snapshot.arg_snapshot_len,
+            arg_snapshot: pending.snapshot.arg_snapshot,
+        };
+        if owner_matches {
+            ProviderWaitPumpCompletion::Reparked(next)
+        } else {
+            print_str(b"[service-wait-provider-owner] foreign or invalid labelled request retained\n");
+            ProviderWaitPumpCompletion::RetainedFailure(
+                next, nt_process::STATUS_INVALID_PARAMETER as i32,
+            )
+        }
     } else if pump.lpc_wait_suspended {
         capture_lpc_wait_repark(
-            pending.dispatch,
-            pending.client,
-            false,
-            pending.arg_snapshot_len,
-            pending.arg_snapshot,
+            pending.snapshot.dispatch,
+            pending.snapshot.client,
+            nested,
+            pending.snapshot.arg_snapshot_len,
+            pending.snapshot.arg_snapshot,
         )
         .map(ProviderWaitPumpCompletion::LpcReparked)
         .unwrap_or(ProviderWaitPumpCompletion::Failed(0xC000_0001u32 as i32))
@@ -713,11 +1428,11 @@ pub(crate) unsafe fn resume_suspended_service_wait_component(
         ProviderWaitPumpCompletion::Failed(pump.status)
     } else {
         complete_resumed_dispatch(
-            pending.dispatch,
-            pending.client,
-            false,
-            pending.arg_snapshot_len,
-            pending.arg_snapshot,
+            pending.snapshot.dispatch,
+            pending.snapshot.client,
+            nested,
+            pending.snapshot.arg_snapshot_len,
+            pending.snapshot.arg_snapshot,
             pump,
         )
     };

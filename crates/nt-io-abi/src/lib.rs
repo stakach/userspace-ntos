@@ -12,10 +12,12 @@
 pub mod device_pointer;
 pub mod device_mutation;
 pub mod power_report;
+pub mod power_dispatch;
 pub mod ioctl;
 pub mod major;
 pub mod opcodes;
 pub mod projection;
+pub mod scsi_dma_authority;
 pub mod wire;
 
 pub use device_pointer::{
@@ -25,17 +27,66 @@ pub use device_pointer::{
 pub use projection::{
     DeviceObjectProjection, DriverObjectProjection, FileObjectProjection, IoStackLocationProjection,
 };
+pub use scsi_dma_authority::{
+    select_scsi_coherent_controller, validate_scsi_coherent_authority,
+    ScsiCoherentAlias, ScsiCoherentAuthority, ScsiCoherentProjection,
+    ScsiControllerAuthority, ScsiControllerCandidate, SCSI_DMA_AUTHORITY_ALIASES,
+    SCSI_DMA_AUTHORITY_BYTES, SCSI_DMA_AUTHORITY_SLOTS, SCSI_COHERENT_RECORD_KIND,
+};
 pub use wire::{
     IoCancelRequest, IoDeviceControlRequest, IoFileRequest, IoOpenRequest, IoReadWriteRequest,
     IoReply, IrpDispatchRequest,
 };
 
 /// ABI version of this wire contract; bumped on any incompatible change.
-pub const IO_ABI_VERSION: u32 = 15;
+pub const IO_ABI_VERSION: u32 = 19;
 
 /// Root-authenticated `IrpDispatchRequest._reserved0` value for a canonical subsidiary File
 /// lifecycle IRP. Native retains an inline terminal until physical completion ACK.
 pub const IRP_DISPATCH_SUBSIDIARY_FILE_LIFECYCLE: u16 = 1;
+/// Root-authenticated, File-less `IRP_MJ_SCSI` payload. Its SRB is pointer-free on the wire.
+pub const IRP_DISPATCH_SCSI_SRB: u16 = 2;
+/// Root-authenticated METHOD_BUFFERED device control whose complete declared output buffer is
+/// captured even if the provider reports zero IoStatus.Information.
+pub const IRP_DISPATCH_BUFFERED_OUTPUT_CAPACITY: u16 = 3;
+
+pub const fn valid_buffered_output_capacity_dispatch(request: &IrpDispatchRequest) -> bool {
+    request._reserved0 == IRP_DISPATCH_BUFFERED_OUTPUT_CAPACITY
+        && matches!(request.major, major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL)
+        && request.file_id == 0
+        && request.scsi_relation_generation == 0
+        && ioctl::method(request.ioctl_code) == ioctl::METHOD_BUFFERED
+        && request.output_len != 0
+        && request.buffer_len >= request.input_len
+        && request.buffer_len >= request.output_len
+}
+
+#[cfg(test)]
+mod buffered_capture_tests {
+    use super::*;
+
+    #[test]
+    fn capacity_capture_requires_fileless_buffered_device_control() {
+        let mut request = IrpDispatchRequest {
+            _reserved0: IRP_DISPATCH_BUFFERED_OUTPUT_CAPACITY,
+            major: major::IRP_MJ_DEVICE_CONTROL,
+            ioctl_code: ioctl::ctl_code(0x22, 0x800, ioctl::METHOD_BUFFERED, ioctl::FILE_ANY_ACCESS),
+            input_len: 12,
+            output_len: 8,
+            buffer_len: 12,
+            ..IrpDispatchRequest::default()
+        };
+        assert!(valid_buffered_output_capacity_dispatch(&request));
+        request.file_id = 1;
+        assert!(!valid_buffered_output_capacity_dispatch(&request));
+        request.file_id = 0;
+        request.ioctl_code |= ioctl::METHOD_NEITHER;
+        assert!(!valid_buffered_output_capacity_dispatch(&request));
+        request.ioctl_code &= !ioctl::METHOD_NEITHER;
+        request.major = major::IRP_MJ_READ;
+        assert!(!valid_buffered_output_capacity_dispatch(&request));
+    }
+}
 
 /// Validate original canonical File CREATE options separately from mutable stack options.
 /// CREATE, named-pipe CREATE, and mailslot CREATE carry only the low 24 option bits and cannot
@@ -563,8 +614,8 @@ mod tests {
 
     #[test]
     fn initial_information_wire_appends_scalar_without_moving_existing_fields() {
-        assert_eq!(IO_ABI_VERSION, 15);
-        assert_eq!(core::mem::size_of::<IrpDispatchRequest>(), 256);
+        assert_eq!(IO_ABI_VERSION, 19);
+        assert_eq!(core::mem::size_of::<IrpDispatchRequest>(), 280);
         assert_eq!(
             core::mem::offset_of!(IrpDispatchRequest, target_domain_id),
             16
@@ -592,7 +643,7 @@ mod tests {
 
     #[test]
     fn create_case_provenance_reuses_reserved_word_without_moving_query_information() {
-        assert_eq!(core::mem::size_of::<IrpDispatchRequest>(), 256);
+        assert_eq!(core::mem::size_of::<IrpDispatchRequest>(), 280);
         assert_eq!(
             core::mem::offset_of!(IrpDispatchRequest, create_case_sensitive),
             244
@@ -611,12 +662,12 @@ mod tests {
         };
         let bytes = bytemuck::bytes_of(&request);
         assert_eq!(&bytes[244..248], &1u32.to_le_bytes());
-        assert_eq!(&bytes[..2], &15u16.to_le_bytes());
+        assert_eq!(&bytes[..2], &(IO_ABI_VERSION as u16).to_le_bytes());
         assert_eq!(
             bytemuck::pod_read_unaligned::<IrpDispatchRequest>(bytes),
             request
         );
-        // ABI 13 has the same size but cannot identify explicit case provenance.
+        // ABI 13 cannot identify explicit case provenance.
         let old_request = IrpDispatchRequest {
             abi_version: 13,
             ..request
@@ -626,7 +677,7 @@ mod tests {
 
     #[test]
     fn file_create_options_reuses_reserved_word_without_moving_other_fields() {
-        assert_eq!(core::mem::size_of::<IrpDispatchRequest>(), 256);
+        assert_eq!(core::mem::size_of::<IrpDispatchRequest>(), 280);
         assert_eq!(
             core::mem::offset_of!(IrpDispatchRequest, file_create_options),
             228
@@ -658,12 +709,12 @@ mod tests {
         ));
         let bytes = bytemuck::bytes_of(&request);
         assert_eq!(&bytes[228..232], &request.file_create_options.to_le_bytes());
-        assert_eq!(&bytes[..2], &15u16.to_le_bytes());
+        assert_eq!(&bytes[..2], &(IO_ABI_VERSION as u16).to_le_bytes());
         let decoded: IrpDispatchRequest = bytemuck::pod_read_unaligned(bytes);
         assert_eq!(decoded, request);
         assert_ne!(decoded.create_options, decoded.file_create_options);
 
-        // ABI 14 has identical size but its reserved word cannot attest original File options.
+        // ABI 14 cannot attest original File options.
         let old_request = IrpDispatchRequest {
             abi_version: 14,
             ..request

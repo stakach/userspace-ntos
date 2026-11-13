@@ -22,6 +22,35 @@ pub enum ImageSourcePageOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageSourcePageState {
+    Acquiring,
+    Initializing,
+    Ready,
+    Retiring,
+    Retired,
+    Quarantined,
+}
+
+/// Decide whether a routed source READ may enter for an exact area/RVA. An in-flight owner may
+/// precede the cache row, so row existence alone cannot authorize or forbid another READ.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoutedSourceReadDecision {
+    Ready,
+    EnterRead,
+    AwaitProducer,
+    RetainUncertain,
+}
+
+pub const fn routed_source_read_decision(
+    row_exists: bool, ready: bool, producer_active: bool, uncertain_owner: bool,
+) -> RoutedSourceReadDecision {
+    if ready { RoutedSourceReadDecision::Ready }
+    else if producer_active { RoutedSourceReadDecision::AwaitProducer }
+    else if row_exists || uncertain_owner { RoutedSourceReadDecision::RetainUncertain }
+    else { RoutedSourceReadDecision::EnterRead }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
     Acquire,
     Initialize,
@@ -53,6 +82,17 @@ impl<D: Copy + Eq> ImageSourcePage<D> {
 
     pub fn ready_frame(&self) -> Option<InstallationCap> {
         (self.phase == Phase::Ready).then_some(self.frame).flatten()
+    }
+
+    pub fn state(&self) -> ImageSourcePageState {
+        match self.phase {
+            Phase::Acquire => ImageSourcePageState::Acquiring,
+            Phase::Initialize => ImageSourcePageState::Initializing,
+            Phase::Ready => ImageSourcePageState::Ready,
+            Phase::Retiring(_) => ImageSourcePageState::Retiring,
+            Phase::Retired => ImageSourcePageState::Retired,
+            Phase::Quarantined(_) => ImageSourcePageState::Quarantined,
+        }
     }
 
     pub fn is_retiring(&self) -> bool {
@@ -162,15 +202,36 @@ mod tests {
     }
 
     #[test]
+    fn second_fault_waits_for_exact_pending_source_before_cache_row_exists() {
+        assert_eq!(routed_source_read_decision(false, false, false, false),
+            RoutedSourceReadDecision::EnterRead);
+        assert_eq!(routed_source_read_decision(false, false, true, false),
+            RoutedSourceReadDecision::AwaitProducer,
+            "a second fault must retain its Reply while the first READ is pending");
+        assert_eq!(routed_source_read_decision(true, false, true, false),
+            RoutedSourceReadDecision::AwaitProducer);
+        assert_eq!(routed_source_read_decision(true, true, false, false),
+            RoutedSourceReadDecision::Ready);
+        assert_eq!(routed_source_read_decision(true, false, false, false),
+            RoutedSourceReadDecision::RetainUncertain,
+            "an unready row without an exact producer cannot authorize another READ");
+        assert_eq!(routed_source_read_decision(false, false, false, true),
+            RoutedSourceReadDecision::RetainUncertain,
+            "a quarantined owner cannot be replayed after its row disappears");
+    }
+
+    #[test]
     fn canonical_source_is_ready_only_after_fill_and_retirement_is_exact() {
         let mut owner = ImageSourcePage::new((9, 0x2000));
         let mut io = io();
         assert_eq!(owner.ready_frame(), None);
+        assert_eq!(owner.state(), ImageSourcePageState::Acquiring);
         assert_eq!(
             owner.advance(&mut io),
             ImageSourcePageOutcome::Ready(InstallationCap { cap: 7 })
         );
         assert_eq!(io.events, ["acquire", "initialize"]);
+        assert_eq!(owner.state(), ImageSourcePageState::Ready);
         assert!(!owner.begin_retirement((10, 0x2000)));
         assert!(owner.owns_cap(7));
         assert!(owner.begin_retirement((9, 0x2000)));
@@ -178,6 +239,7 @@ mod tests {
         assert_eq!(owner.advance(&mut io), ImageSourcePageOutcome::Retained(1));
         assert!(owner.owns_cap(7));
         assert_eq!(owner.ready_frame(), None);
+        assert_eq!(owner.state(), ImageSourcePageState::Retiring);
         io.release = InstallationEffect::Acknowledged;
         assert_eq!(owner.advance(&mut io), ImageSourcePageOutcome::Retired);
         assert!(!owner.owns_cap(7));
@@ -213,6 +275,7 @@ mod tests {
                 owner.advance(&mut io),
                 ImageSourcePageOutcome::Quarantined(4)
             );
+            assert_eq!(owner.state(), ImageSourcePageState::Quarantined);
             let events = io.events.clone();
             assert_eq!(
                 owner.advance(&mut io),

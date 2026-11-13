@@ -10,6 +10,7 @@ unsafe fn state() -> FrameRecycleState<'static> {
         pinned: &*core::ptr::addr_of!(ROOT_SLOT_PINNED_BITS),
         retype_bytes: &*core::ptr::addr_of!(ROOT_SLOT_RETYPE_BYTES),
         free_slots: &*core::ptr::addr_of!(ROOT_SLOT_RECYCLE),
+        free_membership: &*core::ptr::addr_of!(ROOT_SLOT_RECYCLE_BITS),
         free_slot_count: ROOT_SLOT_RECYCLE_N.load(Ordering::Relaxed),
         live_bytes: UT_RETYPE_LIVE_BYTES.load(Ordering::Relaxed),
     }

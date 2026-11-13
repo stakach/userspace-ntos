@@ -245,7 +245,8 @@ pub(crate) unsafe fn begin(
     }
     let alias =
         if source.page >= SMSS_ALLOC_VA && source.page < SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
-            heap_mirror_for_pi(pi) + (source.page - SMSS_ALLOC_VA)
+            heap_mirror_for_pi(pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?
+                + (source.page - SMSS_ALLOC_VA)
         } else {
             0
         };

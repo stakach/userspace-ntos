@@ -7,10 +7,28 @@ use nt_io_manager::{
 use nt_types::ClientId;
 use nt_memory_manager::data_section::{DataSectionFileInfo, STATUS_IO_DEVICE_ERROR};
 use nt_memory_manager::{CompletedFileQuery, PendingSectionMetadataQueries, RoutedSectionMetadata, SectionMountId};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::driver_launch::{self, IO_MANAGER_COMPONENT_ID};
 
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xc000_009a;
+static ROUTED_READ_ANOMALY_TRACES: AtomicU64 = AtomicU64::new(0);
+
+fn trace_read_anomaly(kind: &[u8], file_id: u64, device_id: u64, offset: u64,
+    requested: usize, status: u32, read: usize,
+) {
+    if ROUTED_READ_ANOMALY_TRACES.fetch_add(1, Ordering::Relaxed) >= 8 {
+        return;
+    }
+    crate::print_str(b"[section-routed-read] kind="); crate::print_str(kind);
+    crate::print_str(b" file="); crate::print_u64(file_id);
+    crate::print_str(b" device="); crate::print_u64(device_id);
+    crate::print_str(b" offset="); crate::print_u64(offset);
+    crate::print_str(b" requested="); crate::print_u64(requested as u64);
+    crate::print_str(b" status="); crate::print_hex(status);
+    crate::print_str(b" read="); crate::print_u64(read as u64);
+    crate::print_str(b"\n");
+}
 
 fn query_information(
     file_id: u64,
@@ -150,10 +168,18 @@ pub(crate) fn read(file_id: u64, device_id: u64, offset: u64, output: &mut [u8])
             ..
         }) => {
             let Ok(information) = usize::try_from(information) else {
+                trace_read_anomaly(b"invalid-information", file_id, device_id, offset,
+                    output.len(), status.raw() as u32, 0);
                 return (STATUS_IO_DEVICE_ERROR, 0);
             };
             if information > output.len() {
+                trace_read_anomaly(b"oversized", file_id, device_id, offset,
+                    output.len(), status.raw() as u32, information);
                 return (STATUS_IO_DEVICE_ERROR, 0);
+            }
+            if status.raw() != 0 || information != output.len() {
+                trace_read_anomaly(b"completed", file_id, device_id, offset,
+                    output.len(), status.raw() as u32, information);
             }
             (status.raw() as u32, information)
         }
@@ -161,6 +187,8 @@ pub(crate) fn read(file_id: u64, device_id: u64, offset: u64, output: &mut [u8])
             let status = unsafe { driver_launch::abandon_pending_irp(irp_id.raw()) }
                 .err()
                 .unwrap_or(STATUS_IO_DEVICE_ERROR);
+            trace_read_anomaly(b"pending", file_id, device_id, offset,
+                output.len(), status, 0);
             (status, 0)
         }
         Err(status) => {
@@ -172,4 +200,22 @@ pub(crate) fn read(file_id: u64, device_id: u64, offset: u64, output: &mut [u8])
             (status.raw() as u32, 0)
         },
     }
+}
+
+/// Read through a Section-retained canonical File only while its original provider context
+/// remains attached. CLEANUP may have run; the retained pointer still owns the File and context.
+pub(crate) fn read_retained(
+    file_id: u64,
+    device_id: u64,
+    file_context: u64,
+    offset: u64,
+    output: &mut [u8],
+) -> (u32, usize) {
+    let Some(file) = driver_launch::io_manager_mut().file(FileId(file_id)) else {
+        return (nt_fs::STATUS_INVALID_HANDLE, 0);
+    };
+    if file.device_id.raw() != device_id || file.driver_context != Some(file_context) {
+        return (nt_fs::STATUS_INVALID_HANDLE, 0);
+    }
+    read(file_id, device_id, offset, output)
 }

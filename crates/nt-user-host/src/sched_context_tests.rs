@@ -1,6 +1,61 @@
 use super::*;
 use alloc::vec::Vec;
 
+#[test]
+fn hosted_affinity_requires_the_target_bound_core_in_requested_mask() {
+    assert_eq!(validate_hosted_thread_affinity(2, 4, 0), Err(STATUS_NOT_SUPPORTED));
+    assert_eq!(validate_hosted_thread_affinity(1, 4, 0), Ok(()));
+    assert_eq!(validate_hosted_thread_affinity(3, 4, 0), Ok(()));
+    assert_eq!(validate_hosted_thread_affinity(2, 4, 1), Ok(()));
+    assert_eq!(validate_hosted_thread_affinity(1, 4, 4), Err(STATUS_NOT_SUPPORTED));
+    assert_eq!(validate_hosted_thread_affinity(1u64 << 63, 64, 63), Ok(()));
+    for invalid_mask in [0, 0b1_0000] {
+        assert_eq!(
+            validate_hosted_thread_affinity(invalid_mask, 4, 0),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+    }
+    for invalid_count in [0, 65, u64::MAX] {
+        assert_eq!(
+            validate_hosted_thread_affinity(1, invalid_count, 0),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+    }
+}
+
+#[test]
+fn dormant_thread_affinity_accepts_any_online_core_without_claiming_placement() {
+    assert_eq!(validate_online_affinity(0b10, 4), Ok(()));
+    assert_eq!(validate_online_affinity(0b1000, 4), Ok(()));
+    assert_eq!(validate_online_affinity(0, 4), Err(STATUS_INVALID_PARAMETER));
+    assert_eq!(validate_online_affinity(0b1_0000, 4), Err(STATUS_INVALID_PARAMETER));
+}
+
+#[test]
+fn guest_worker_selection_spreads_four_granular_thread_ids() {
+    let selected: Vec<_> = [4, 8, 12, 16]
+        .into_iter()
+        .map(|tid| select_guest_worker_core(0b1111, 4, tid).unwrap())
+        .collect();
+    assert_eq!(selected, [0, 1, 2, 3]);
+    assert_eq!(select_guest_worker_core(0b1010, 4, 4), Ok(1));
+    assert_eq!(select_guest_worker_core(0b1010, 4, 8), Ok(3));
+    assert_eq!(select_guest_worker_core(1u64 << 63, 64, 4), Ok(63));
+}
+
+#[test]
+fn guest_worker_selection_rejects_invalid_or_offline_affinity() {
+    for mask in [0, 0b1_0000, 0b1_0001] {
+        assert_eq!(select_guest_worker_core(mask, 4, 4), Err(STATUS_INVALID_PARAMETER));
+    }
+    for count in [0, 65, u64::MAX] {
+        assert_eq!(select_guest_worker_core(1, count, 4), Err(STATUS_INVALID_PARAMETER));
+    }
+    for tid in [0, 1, 2, 3, 5] {
+        assert_eq!(select_guest_worker_core(1, 4, tid), Err(STATUS_INVALID_PARAMETER));
+    }
+}
+
 struct Backend {
     calls: Vec<Stage>,
     fail: Option<Stage>,

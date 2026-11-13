@@ -102,7 +102,7 @@ pub struct IngressReplyAttempt {
 
 fn allocate_attempt(counter: &AtomicU64) -> Result<u64, IngressError> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             if next == 0 {
                 None
             } else {
@@ -140,6 +140,12 @@ impl<M> ComponentIngress<M> {
     }
     pub(crate) fn held_receive_matches(&self, identity: u64) -> bool {
         identity != 0 && self.phase == Phase::Held && self.held_receive == identity
+    }
+    pub(crate) fn receiving_matches(&self, identity: u64) -> bool {
+        identity != 0 && self.phase == Phase::Receiving(identity)
+    }
+    pub(crate) fn captured_receive_matches(&self, identity: u64) -> bool {
+        identity != 0 && self.phase == Phase::Unresolved(identity)
     }
     /// Inspect retained data, including unresolved receives. Presence does not prove Call or Reply
     /// binding authority; classification requires separately established transport provenance.

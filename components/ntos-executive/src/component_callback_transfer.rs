@@ -82,7 +82,7 @@ impl CallbackTransfer {
         }
         match win32k_glue::capture_callback_transfer(client, lane, dispatch_id, &mut self.input) {
             Ok(binding) => {
-                let token = u64::from(binding.request().callback_id);
+                let token = binding.external_token();
                 self.binding = Some(binding);
                 self.phase = TransferPhase::Captured;
                 Ok(token)

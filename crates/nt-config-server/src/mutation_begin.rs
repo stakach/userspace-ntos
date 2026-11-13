@@ -5,7 +5,35 @@ use nt_config_abi::mutation_begin::{disposition, operation, Reply, Request, MAX_
 
 pub(super) mod journal;
 
+/// Owner identity only, for bounded native diagnostics of a blocked SYSTEM writer.
+/// No key names, paths, or value data cross this boundary.
+#[derive(Clone, Copy, Default)]
+pub struct SystemMutationBusyDiagnostic {
+    pub prepared_token: u64,
+    pub checkpoint_token: u64,
+    pub checkpoint_offset: usize,
+    pub checkpoint_len: usize,
+    pub outcome_receipt_generation: u64,
+    pub lease_token: u64,
+    pub lease_uploaded: usize,
+    pub lease_total: usize,
+}
+
 impl CmServer {
+    pub fn system_mutation_busy_diagnostic(&self) -> SystemMutationBusyDiagnostic {
+        let lease = self.system_mutation_leases.diagnostic_owner();
+        SystemMutationBusyDiagnostic {
+            prepared_token: self.prepared_system_mutation.as_ref().map_or(0, |owner| owner.token),
+            checkpoint_token: self.prepared_system_checkpoint.as_ref().map_or(0, |owner| owner.token),
+            checkpoint_offset: self.prepared_system_checkpoint.as_ref().map_or(0, |owner| owner.offset),
+            checkpoint_len: self.prepared_system_checkpoint.as_ref().map_or(0, |owner| owner.value.len()),
+            outcome_receipt_generation: self.system_mutation_outcomes.pending_receipt_generation().unwrap_or(0),
+            lease_token: lease.map_or(0, |owner| owner.0),
+            lease_uploaded: lease.map_or(0, |owner| owner.1),
+            lease_total: lease.map_or(0, |owner| owner.2),
+        }
+    }
+
     pub(super) fn op_system_hive_mutation_begin(
         &mut self,
         input: &[u8],

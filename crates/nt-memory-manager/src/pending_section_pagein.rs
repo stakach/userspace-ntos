@@ -91,7 +91,7 @@ impl<R, K: Copy + Eq> PendingSectionPageReads<R, K> {
         bytes.resize(plan.capacity(), 0);
         if self.store == 0 {
             let Ok(store) =
-                NEXT_STORE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                NEXT_STORE.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     value.checked_add(1)
                 })
             else {
@@ -151,6 +151,24 @@ impl<R, K: Copy + Eq> PendingSectionPageReads<R, K> {
     ) -> Option<(SectionIdentity, RoutedSectionLease, u64)> {
         self.row(id)
             .map(|row| (row.section, row.lease, row.page_index))
+    }
+
+    /// Observe the provider key only while this exact read is awaiting a terminal.
+    /// A wake hint never claims the completion or authorizes copyback and ACK.
+    pub fn bound_key_if(
+        &self,
+        id: PendingSectionPageReadId,
+        section: SectionIdentity,
+        lease: RoutedSectionLease,
+        page_index: u64,
+    ) -> Option<K> {
+        let row = self.row(id)?;
+        (row.phase == Phase::Submitted
+            && row.section == section
+            && row.lease == lease
+            && row.page_index == page_index)
+            .then_some(row.key)
+            .flatten()
     }
 
     /// Once dispatch may have entered, only its exact completion can advance this row.
@@ -309,8 +327,22 @@ impl<R, K: Copy + Eq> PendingSectionPageReads<R, K> {
         id: PendingSectionPageReadId,
         key: K,
     ) -> Option<(R, Result<Vec<u8>, u32>)> {
+        self.take_acknowledged_if(id, key, |_, _, _, _| true)
+    }
+
+    /// Check the current Section, backing lease, page, and retained continuation together
+    /// before consuming an acknowledged read. A failed check keeps its owner and bytes parked.
+    pub fn take_acknowledged_if(
+        &mut self,
+        id: PendingSectionPageReadId,
+        key: K,
+        current: impl FnOnce(&R, SectionIdentity, RoutedSectionLease, u64) -> bool,
+    ) -> Option<(R, Result<Vec<u8>, u32>)> {
         let row = self.row(id)?;
-        if row.key != Some(key) || !matches!(row.phase, Phase::AckedReady | Phase::AckedFailed(_)) {
+        if row.key != Some(key)
+            || !matches!(row.phase, Phase::AckedReady | Phase::AckedFailed(_))
+            || !current(&row.owner, row.section, row.lease, row.page_index)
+        {
             return None;
         }
         let row = self.rows[id.slot].take()?;

@@ -19,6 +19,24 @@ fn allocation(owner: SourceIrpOwner) -> SourceIrpAllocation {
 }
 
 #[test]
+fn irp_header_mutation_requires_idle_exact_driver_source() {
+    let mut ledger = SourceIrpLedger::new();
+    let driver = allocation(SourceIrpOwner::HostedDriver(3));
+    let ticket = ledger.register(driver).unwrap();
+    assert_eq!(ledger.mutation_ready(ticket, driver), Ok(()));
+    assert_eq!(ledger.mutation_ready(ticket, SourceIrpAllocation {
+        pool_generation: driver.pool_generation + 1, ..driver
+    }), Err(SourceIrpLedgerError::WrongIdentity));
+    ledger.pin(driver.owner, driver.domain, driver.component_address).unwrap();
+    assert_eq!(ledger.mutation_ready(ticket, driver), Err(SourceIrpLedgerError::Pinned));
+    ledger.arm_deferred_free(ticket).unwrap();
+    assert_eq!(ledger.prepare_driver_free(3, driver.domain, driver.component_address),
+        Ok(SourceIrpRetirement::Deferred(ticket)));
+    ledger.unpin(ticket).unwrap();
+    assert_eq!(ledger.mutation_ready(ticket, driver), Err(SourceIrpLedgerError::RetirementStarted));
+}
+
+#[test]
 fn caller_storage_stays_protected_through_pin_and_uncertain_retirement() {
     let mut ledger = SourceIrpLedger::new();
     let caller = allocation(SourceIrpOwner::HostedCaller(3));

@@ -6,7 +6,7 @@
 //!
 //! Cap layout (all in this host's own VSpace):
 //!   * `AHCI_VADDR`           — the AHCI ABAR MMIO (granted BAR frame)
-//!   * `AHCI_DMA_VADDR`       — the DMA frame (command list + FIS + command table + data)
+//!   * `AHCI_DMA_VADDR`       — the DMA page run (command list + FIS + command table + data)
 //!   * `STORAGE_SHARED_VADDR` — dma_paddr in @0; verdict @8,
 //!     import table at page-0 offset, generated hive at page-1 offset
 

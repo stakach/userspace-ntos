@@ -1,6 +1,28 @@
 use super::*;
 
 #[test]
+fn hosted_ingress_requires_its_live_runtime_attachment() {
+    let process = ProcessIdentity {
+        pid: 180,
+        generation: ProcessGeneration::Hosted(7),
+    };
+    // PM can retain the exact process and thread records after execution retirement. Their
+    // identity alone must not admit another syscall once the hosted layout is gone.
+    assert!(hosted_runtime_attachment_matches(process, Some(7)));
+    assert!(!hosted_runtime_attachment_matches(process, None));
+    assert!(!hosted_runtime_attachment_matches(process, Some(8)));
+}
+
+#[test]
+fn temporary_process_ingress_keeps_its_separate_claim_authority() {
+    let process = ProcessIdentity {
+        pid: 180,
+        generation: ProcessGeneration::Temporary(7),
+    };
+    assert!(hosted_runtime_attachment_matches(process, None));
+}
+
+#[test]
 fn claim_and_exact_release_preserve_pid_and_lifetime() {
     let mut slots = TemporaryProcessSlots::try_new(3).unwrap();
     let claim = slots.claim(2, 90).unwrap();

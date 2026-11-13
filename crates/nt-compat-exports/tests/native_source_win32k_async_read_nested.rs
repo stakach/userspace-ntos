@@ -13,7 +13,8 @@ fn win32k_async_read_has_exact_nested_completion_handoff() {
     assert!(worker.contains("if nested_ready_only && !(&*core::ptr::addr_of!(WORK))[index]"));
 
     let receiver = include_str!("../../../components/ntos-executive/src/component_shared_pump.rs");
-    assert!(receiver.contains("nested_hosted_win32k_async_read_ready()"));
+    assert!(receiver.contains("service_sec_image::nested_hosted_file_work_ready()"));
     let service = include_str!("../../../components/ntos-executive/src/service_sec_image.rs");
+    assert!(service.contains("nested_hosted_win32k_async_read_ready()"));
     assert!(service.contains("redrive_nested_hosted_win32k_async_read(handler)"));
 }

@@ -1,7 +1,135 @@
 use super::*;
 use crate::{IngressReplyObservation, LaneBinding};
 
+mod inline_irq_checkpoint;
+mod nested_pre_entry_checkpoint;
+
 type Lanes = ComponentSuspensionLanes<u64, u32, ()>;
+
+#[test]
+fn nested_identity_sequence_matches_only_its_active_lane_epoch() {
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let scope = f.receiver.suspend_for_nested_execution(
+        route, dispatch, &mut f.lanes, &f.peers, bound,
+    ).unwrap();
+    let identity = scope.identity();
+    assert_eq!(identity.route(), route);
+    assert_eq!(identity.dispatch(), dispatch);
+    assert_eq!(f.lanes.phase(dispatch.lane()),
+        Ok(LanePhase::NestedExecution(identity.sequence())));
+    assert_ne!(f.lanes.phase(dispatch.lane()),
+        Ok(LanePhase::NestedExecution(identity.sequence() + 1)));
+}
+
+mod nested_restore_frame;
+mod nested_restore_result;
+mod nested_restore_chain;
+mod nested_callback_terminal;
+
+#[test]
+fn root_ingress_park_checkpoint_restores_parent_before_child_settlement() {
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let owner = receive_owner(dispatch);
+    let reply = f.lanes.binding(dispatch.lane()).unwrap().reply_object;
+    let (mut child_receiver, mut child_call) = pending_root_ingress_child();
+    let child = child_call.as_ref().unwrap().admission_key();
+    let key = crate::SuspensionKey::root_ingress(child.admission_sequence());
+    f.lanes.reserve_root_ingress_capacity(dispatch.lane(), reply, owner).unwrap();
+    let mut scope = f.receiver.suspend_for_nested_execution(
+        route, dispatch, &mut f.lanes, &f.peers, bound,
+    ).unwrap();
+    f.lanes.admit_root_ingress_owned(&scope, key, 1, owner, child, 123).unwrap();
+    assert!(f.receiver.resume_nested_execution(&mut scope, &mut f.lanes, &f.peers, bound).is_err());
+    assert!(f.lanes.frame_mut(dispatch.lane(), key).is_err());
+    assert!(f.lanes.begin_resume(dispatch.lane(), reply, key).is_err());
+    assert!(f.lanes.select(key, 0).is_err());
+    assert!(f.lanes.cancel(key, 0).is_err());
+    let checkpoint = unsafe { crate::RootIngressCheckpoint::after_park(&scope, child) };
+    f.lanes.begin_root_ingress_restore(&scope, key, owner, &checkpoint, 0).unwrap();
+    assert!(f.lanes.begin_root_ingress_restore(&scope, key, owner, &checkpoint, 0).is_err());
+    f.receiver.resume_nested_execution(&mut scope, &mut f.lanes, &f.peers, bound).unwrap();
+    assert!(child_call.as_ref().unwrap().can_park());
+    child_call.as_mut().unwrap().reply_owned(bound, |_| IngressReplyObservation::Acknowledged).unwrap();
+    let settled = child_receiver.finish_external_with_settlement(&mut child_call, free).unwrap().2;
+    assert_eq!(settled.admission_key(), child);
+}
+
+#[test]
+fn root_ingress_lane_refusal_returns_exact_continuation_for_bound_retry() {
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let owner = receive_owner(dispatch);
+    let reply = f.lanes.binding(dispatch.lane()).unwrap().reply_object;
+    let (_receiver, child_call) = pending_root_ingress_child();
+    let child = child_call.as_ref().unwrap().admission_key();
+    let key = crate::SuspensionKey::root_ingress(child.admission_sequence());
+    f.lanes.reserve_root_ingress_capacity(dispatch.lane(), reply, owner).unwrap();
+    let scope = f.receiver.suspend_for_nested_execution(
+        route, dispatch, &mut f.lanes, &f.peers, bound,
+    ).unwrap();
+    let mut wrong_owner = owner;
+    wrong_owner.dispatch_id += 1;
+    let (_, retained) = f.lanes.admit_root_ingress_owned(
+        &scope, key, 71, wrong_owner, child, 0x6a11,
+    ).unwrap_err();
+    assert_eq!(retained, 0x6a11);
+    assert!(f.lanes.frame(dispatch.lane(), key).unwrap().is_none());
+    f.lanes.admit_root_ingress_owned(&scope, key, 71, owner, child, retained).unwrap();
+    let frame = f.lanes.frame(dispatch.lane(), key).unwrap().unwrap();
+    assert_eq!(frame.admission_sequence, 71);
+    assert_eq!(frame.continuation, 0x6a11);
+    assert_eq!(frame.owner, owner);
+    assert!(f.lanes.admit_root_ingress_owned(&scope, key, 72, owner, child, 0x6a11).is_err());
+}
+
+#[test]
+fn root_ingress_checkpoint_rejects_wrong_scope_child_and_owner() {
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let owner = receive_owner(dispatch);
+    let reply = f.lanes.binding(dispatch.lane()).unwrap().reply_object;
+    let (_receiver, child_call) = pending_root_ingress_child();
+    let child = child_call.as_ref().unwrap().admission_key();
+    let foreign = child_settlement().admission_key();
+    let key = crate::SuspensionKey::root_ingress(child.admission_sequence());
+    f.lanes.reserve_root_ingress_capacity(dispatch.lane(), reply, owner).unwrap();
+    let mut scope = f.receiver.suspend_for_nested_execution(
+        route, dispatch, &mut f.lanes, &f.peers, bound,
+    ).unwrap();
+    f.lanes.admit_root_ingress_owned(&scope, key, 1, owner, child, 123).unwrap();
+    let wrong_child = unsafe { crate::RootIngressCheckpoint::after_park(&scope, foreign) };
+    assert!(f.lanes.begin_root_ingress_restore(&scope, key, owner, &wrong_child, 0).is_err());
+    let (other_route, other_dispatch) = f.parent(2);
+    let mut other = f.receiver.suspend_for_nested_execution(
+        other_route, other_dispatch, &mut f.lanes, &f.peers, bound,
+    ).unwrap();
+    let wrong_scope = unsafe { crate::RootIngressCheckpoint::after_park(&other, child) };
+    f.receiver.resume_nested_execution(&mut other, &mut f.lanes, &f.peers, bound).unwrap();
+    f.ack(other_route, other_dispatch);
+    f.receiver.complete_stored(other_route, other_dispatch, &mut f.lanes, &mut f.peers, free).unwrap();
+    assert!(f.lanes.begin_root_ingress_restore(&scope, key, owner, &wrong_scope, 0).is_err());
+    let exact = unsafe { crate::RootIngressCheckpoint::after_park(&scope, child) };
+    let mut wrong_owner = owner;
+    wrong_owner.provider_generation += 1;
+    assert!(f.lanes.begin_root_ingress_restore(&scope, key, wrong_owner, &exact, 0).is_err());
+    assert!(f.receiver.resume_nested_execution(&mut scope, &mut f.lanes, &f.peers, bound).is_err());
+}
+
+fn pending_root_ingress_child() -> (IngressReceiver<u64>, Option<crate::ExternalIngress<u64>>) {
+    let lanes = ComponentSuspensionLanes::<u64, u32>::new(1, 2);
+    let mut receiver = IngressReceiver::new(20, 300, 1).unwrap();
+    let mut pool = crate::IngressReplyPool::new(20, 2).unwrap();
+    pool.insert(ComponentIngress::new(20, 301).unwrap(), &receiver, &lanes,
+        |_| Ok::<_, u8>(ReplyBindingObservation::Free)).ok().unwrap();
+    receiver.begin_receive(&lanes).unwrap();
+    receiver.capture(7).ok().unwrap();
+    receiver.resolve(IngressReceiveDisposition::Call).ok().unwrap();
+    let call = pool.retain_external(&mut receiver, &lanes, 999,
+        |_| Ok::<_, u8>(ReplyBindingObservation::Free), bound).unwrap();
+    (receiver, Some(call))
+}
 
 fn child_settlement() -> crate::ExternalSettlement {
     let lanes = ComponentSuspensionLanes::<u64, u32>::new(1, 2);
@@ -114,6 +242,43 @@ fn receive_can_repark_as_exact_service_wait() {
     assert_eq!(f.lanes.phase(lane), Ok(crate::LanePhase::Suspended));
     assert_eq!(f.lanes.frame(lane, next).unwrap().unwrap().continuation, 456);
     assert_eq!(f.lanes.frame(lane, next).unwrap().unwrap().phase, crate::SuspensionPhase::Waiting);
+}
+
+#[test]
+fn receive_return_keeps_fresh_dispatch_fenced_until_its_repark_is_retained() {
+    let mut f = Fixture::new();
+    let (route, dispatch) = f.parent(1);
+    let owner = receive_owner(dispatch);
+    let lane = dispatch.lane();
+    let reply = f.lanes.binding(lane).unwrap().reply_object;
+    f.lanes.reserve_receive_capacity(lane, reply, owner).unwrap();
+    let mut receive = f.receiver
+        .suspend_for_nested_execution(route, dispatch, &mut f.lanes, &f.peers, bound)
+        .unwrap();
+    let settled = child_settlement();
+    let key = crate::SuspensionKey::receive(settled.admission_key().admission_sequence());
+    f.lanes.admit_receive_owned(&receive, key, 1, owner, settled.admission_key(), 123).unwrap();
+    f.lanes.begin_receive_restore(&receive, key, owner, &settled, 0).unwrap();
+    f.receiver.resume_nested_execution(&mut receive, &mut f.lanes, &f.peers, bound).unwrap();
+
+    // The native pump has returned and parked its physical lane, but the exact Receive
+    // continuation has not yet retained the new wait and its shared-page snapshot.
+    f.lanes.suspend_running(lane, reply, 41).unwrap();
+    assert_eq!(f.lanes.running(), None);
+    assert_eq!(f.lanes.frame(lane, key).unwrap().unwrap().phase,
+        crate::SuspensionPhase::Resuming { completion: 0, cancelled: false });
+    assert!(f.lanes.fresh_dispatch_busy(),
+        "an unsettled Receive return must fence fresh shared-page publication");
+    assert!(!f.lanes.can_add_lane());
+
+    let next = crate::SuspensionKey::service_wait(2);
+    f.lanes.rearm_service_wait_external_owned(
+        lane, reply, dispatch, 41, key, next, 2, owner, 456,
+    ).unwrap();
+    assert_eq!(f.lanes.frame(lane, next).unwrap().unwrap().phase,
+        crate::SuspensionPhase::Waiting);
+    assert!(!f.lanes.fresh_dispatch_busy(),
+        "the fresh-dispatch fence ends after exact repark ownership is retained");
 }
 
 #[test]

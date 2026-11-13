@@ -373,6 +373,9 @@ pub struct AccessToken {
     /// deny-only state is observable and affects access checks.
     pub user_attributes: u32,
     pub groups: Vec<TokenGroup>,
+    /// Authenticated mandatory integrity RID (`S-1-16-<RID>`). `None` is unknown and must
+    /// never be elevated to SYSTEM by an object access adapter.
+    pub integrity_level: Option<u32>,
     /// Restricting SIDs. A non-empty set makes access checks perform the native second DACL pass.
     pub restricted_sids: Vec<TokenGroup>,
     pub privileges: Vec<TokenPrivilege>,
@@ -656,6 +659,7 @@ impl AccessToken {
                 TokenGroup::enabled(Sid::authenticated_users()),
                 TokenGroup::enabled(Sid::everyone()),
             ],
+            integrity_level: Some(0x4000),
             restricted_sids: Vec::new(),
             privileges: vec![
                 Self::priv_enabled(SE_TCB, 7),
@@ -709,6 +713,7 @@ impl AccessToken {
             } else {
                 Vec::new()
             },
+            integrity_level: Some(0),
             restricted_sids: Vec::new(),
             privileges: Vec::new(),
             owner: anonymous.clone(),
@@ -735,6 +740,7 @@ impl AccessToken {
                 TokenGroup::enabled(Sid::authenticated_users()),
                 TokenGroup::enabled(Sid::everyone()),
             ],
+            integrity_level: Some(0x3000),
             restricted_sids: Vec::new(),
             privileges: vec![
                 Self::priv_enabled(SE_LOAD_DRIVER, 10),
@@ -765,6 +771,7 @@ impl AccessToken {
                 TokenGroup::enabled(Sid::authenticated_users()),
                 TokenGroup::enabled(Sid::everyone()),
             ],
+            integrity_level: Some(0x2000),
             restricted_sids: Vec::new(),
             privileges: vec![Self::priv_enabled(SE_CHANGE_NOTIFY, 23)],
             owner: Sid::local_account(machine, 1000),
@@ -912,7 +919,7 @@ impl TokenStore {
     pub(crate) fn acquire_subject_domain(&mut self) -> Result<u64, u32> {
         if self.subject_domain == 0 {
             self.subject_domain = NEXT_SUBJECT_DOMAIN
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
                 .map_err(|_| 0xc000_009au32)?;
         }
         Ok(self.subject_domain)

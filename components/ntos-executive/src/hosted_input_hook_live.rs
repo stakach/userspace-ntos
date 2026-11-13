@@ -9,7 +9,7 @@ use super::*;
 use alloc::boxed::Box;
 use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_io_manager::detached_file_irp::{
-    ExternalFileIrpDispatchPolicy, ExternalFileIrpRequest,
+    ExternalFileIrpPumpKey, ExternalFileIrpRequest,
 };
 use nt_io_manager::hosted_forward_progress::HostedForwardDispatchReply;
 use nt_io_manager::{DeviceControlParameters, IoParameters};
@@ -19,7 +19,11 @@ use nt_types::ClientId;
 
 const INVALID: i32 = 0xc000_0010u32 as i32;
 const BUSY: i32 = nt_status::NtStatus::DEVICE_BUSY.raw();
+static HOOK_PORT_TRACE_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+const HOOK_PORT_TRACE_LIMIT: u64 = 192;
 
+#[derive(Clone, Copy)]
 struct ActiveClassDispatch {
     owner_id: u64,
     class_target: nt_io_manager::HostedDevicePointerRegistration,
@@ -53,6 +57,11 @@ struct PortSource {
     caller: nt_process::native_handle::NativeHandleCaller,
     entered: bool,
     pending: Option<IrpId>,
+    pump_key: Option<ExternalFileIrpPumpKey>,
+    file_owner_row_id: Option<u64>,
+    pump_return_consumed: bool,
+    class_alias: Option<ActiveClassDispatch>,
+    unowned_yield: Option<hosted_file_owners::HookDispatchFailure>,
     terminal_candidate: Option<PortTerminalCandidate>,
     terminal_observed: Option<nt_status::NtStatus>,
     terminal_status: Option<nt_status::NtStatus>,
@@ -79,6 +88,11 @@ struct ClassSource {
     caller: nt_process::native_handle::NativeHandleCaller,
     entered: bool,
     pending: Option<IrpId>,
+    pump_key: Option<ExternalFileIrpPumpKey>,
+    file_owner_row_id: Option<u64>,
+    pump_return_consumed: bool,
+    unowned_yield: Option<hosted_file_owners::HookDispatchFailure>,
+    returned_terminal: Option<PortTerminalCandidate>,
     terminal_status: Option<nt_status::NtStatus>,
     published: bool,
     canonical_acknowledged: bool,
@@ -99,6 +113,77 @@ fn active_port() -> &'static mut Vec<ActivePortDispatch> {
     unsafe { &mut *core::ptr::addr_of_mut!(ACTIVE_PORT_DISPATCH) }
 }
 
+enum HookAliasKind { Class(u64), Port(nt_io_manager::HostedDevicePointerRegistration) }
+
+struct HookAliasGuard(HookAliasKind);
+
+impl Drop for HookAliasGuard {
+    fn drop(&mut self) {
+        match self.0 {
+            HookAliasKind::Class(owner_id) => {
+                if active().pop().is_none_or(|alias| alias.owner_id != owner_id) {
+                    unsafe { crate::provider_bugcheck::report(0xc4, [owner_id, 0, 0, 0]); }
+                }
+            }
+            HookAliasKind::Port(target) => {
+                if active_port().pop().is_none_or(|alias| alias.target != target) {
+                    unsafe { crate::provider_bugcheck::report(0xc4, [target.address(), 0, 0, 0]); }
+                }
+            }
+        }
+    }
+}
+
+/// Restore only the callback alias bound to this exact suspended File IRP and physical pump key.
+/// The alias is visible while native receive runs, then removed even on an early return.
+pub(super) unsafe fn with_suspended_hook_alias<R>(
+    irp_id: IrpId,
+    key: ExternalFileIrpPumpKey,
+    owner_id: u64,
+    device: nt_io_manager::DeviceId,
+    resume: impl FnOnce() -> R,
+) -> Result<R, nt_status::NtStatus> {
+    if let Some(alias) = port_sources().iter().find_map(|work| {
+        (work.pending == Some(irp_id) && work.pump_key == Some(key)
+            && work.owner_id == owner_id && !work.blocked)
+            .then_some(work.class_alias).flatten()
+    }) {
+        let prepared = hosted_reverse_class_projection::validate(owner_id)
+            .map_err(|_| nt_status::NtStatus::INVALID_HANDLE)?;
+        if alias.class_target.device_id() != device
+            || alias.class_target != prepared.port_do_registration
+            || alias.class_source != prepared.source_port_do_registration
+            || hosted_reverse_class_projection::port_source_for_hook(owner_id)
+                != Ok(alias.port_device)
+            || !active().is_empty()
+        {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+        active().try_reserve(1).map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        active().push(alias);
+        let _alias = HookAliasGuard(HookAliasKind::Class(owner_id));
+        return Ok(resume());
+    }
+    if let Some(work) = class_sources().iter().find(|work| {
+        work.pending == Some(irp_id) && work.pump_key == Some(key)
+            && work.owner_id == owner_id && work.port_device.device_id() == device
+    }) {
+        let target = work.port_device;
+        let control_code = work.control_code;
+        if hosted_reverse_class_projection::validate(owner_id).is_err()
+            || hosted_reverse_class_projection::port_source_for_hook(owner_id) != Ok(target)
+            || !active_port().is_empty()
+        {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+        active_port().try_reserve(1).map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        active_port().push(ActivePortDispatch { target, control_code });
+        let _alias = HookAliasGuard(HookAliasKind::Port(target));
+        return Ok(resume());
+    }
+    Err(nt_status::NtStatus::INVALID_HANDLE)
+}
+
 pub(super) fn class_dispatch_active(
     target: nt_io_manager::DeviceId, control_code: u64,
 ) -> bool {
@@ -111,6 +196,123 @@ pub(super) fn class_dispatch_active(
 
 fn port_sources() -> &'static mut Vec<Box<PortSource>> {
     unsafe { &mut *core::ptr::addr_of_mut!(PORT_SOURCES) }
+}
+
+/// Capped source-side evidence for the exact port HOOK owner. Phase bits are
+/// entered/pending/candidate/observed/terminal/published/blocked/pump-returned.
+fn trace_port_source(stage: u64, work: &PortSource, detail: u64) {
+    if HOOK_PORT_TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        >= HOOK_PORT_TRACE_LIMIT
+    {
+        return;
+    }
+    let phase = u64::from(work.entered)
+        | (u64::from(work.pending.is_some()) << 1)
+        | (u64::from(work.terminal_candidate.is_some()) << 2)
+        | (u64::from(work.terminal_observed.is_some()) << 3)
+        | (u64::from(work.terminal_status.is_some()) << 4)
+        | (u64::from(work.published) << 5)
+        | (u64::from(work.blocked) << 6)
+        | (u64::from(work.pump_return_consumed) << 7);
+    print_str(b"[hook-port-source] stage/owner/source-irp/file-irp/phase/status/obs-retry/pub-retry/detail=");
+    print_u64(stage);
+    print_str(b"/"); print_u64(work.owner_id);
+    print_str(b"/0x"); print_hex_u64(work.source.source_irp_address());
+    print_str(b"/0x"); print_hex_u64(work.pending.map_or(0, |id| id.raw()));
+    print_str(b"/0x"); print_hex_u64(phase);
+    print_str(b"/0x"); print_hex_u64(work.terminal_candidate.map_or(0,
+        |candidate| candidate.status.raw() as u32 as u64));
+    print_str(b"/"); print_u64(u64::from(work.source.terminal_observation_retryable()));
+    print_str(b"/"); print_u64(u64::from(work.source.terminal_publication_retryable()));
+    print_str(b"/0x"); print_hex_u64(detail);
+    print_str(b"\n");
+}
+
+/// Dispatch kind: 1 returned, 2 outstanding, 3 suspended, 4 status refusal,
+/// 5 unowned yield, 6 unexpected returned shape. A key bit records presence;
+/// the exact IRP and owner are printed without inspecting provider-owned memory.
+fn trace_port_dispatch(
+    stage: u64, work: &PortSource, kind: u64, irp: u64, key: bool,
+    status: u64, information: u64,
+) {
+    if HOOK_PORT_TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        >= HOOK_PORT_TRACE_LIMIT
+    {
+        return;
+    }
+    print_str(b"[hook-port-dispatch] stage/owner/source-irp/irp/kind/key/status/info=");
+    print_u64(stage);
+    print_str(b"/"); print_u64(work.owner_id);
+    print_str(b"/0x"); print_hex_u64(work.source.source_irp_address());
+    print_str(b"/0x"); print_hex_u64(irp);
+    print_str(b"/"); print_u64(kind);
+    print_str(b"/"); print_u64(u64::from(key));
+    print_str(b"/0x"); print_hex_u64(status);
+    print_str(b"/0x"); print_hex_u64(information);
+    print_str(b"\n");
+}
+
+fn trace_class_source(stage: u64, work: &ClassSource, target: u64) {
+    static CLASS_TRACE_COUNT: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    if CLASS_TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 96
+    {
+        return;
+    }
+    print_str(b"[hook-class-source] stage/owner/source-irp/file-irp/target/published=");
+    print_u64(stage);
+    print_str(b"/"); print_u64(work.owner_id);
+    print_str(b"/0x"); print_hex_u64(work.irp);
+    print_str(b"/0x"); print_hex_u64(work.pending.map_or(0, |id| id.raw()));
+    print_str(b"/0x"); print_hex_u64(target);
+    print_str(b"/"); print_u64(u64::from(work.published));
+    print_str(b"\n");
+}
+
+/// Observe only published, live class sources after the lower Hook event is signaled.
+pub(super) unsafe fn trace_class_source_after_hook() {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 10 { return; }
+    let count = class_sources().len();
+    print_str(b"[hook-class-post-event-count] rows=");
+    print_u64(count as u64); print_str(b"\n");
+    for index in 0..count {
+        let Some((irp, route, dispatch, reply, token, class_tcb, flags)) =
+            class_sources().get(index).map(|work| (
+                work.irp, work.origin.route, work.origin.dispatch,
+                work.origin.reply, work.origin.token, work.instance.tcb,
+                u64::from(work.entered)
+                    | (u64::from(work.published) << 1)
+                    | (u64::from(work.canonical_acknowledged) << 2)
+                    | (u64::from(work.pin_released) << 3)
+                    | (u64::from(work.source_released) << 4),
+            )) else { continue; };
+        let wait = runtime::hosted_forward_wait_probe(route, dispatch, reply, token);
+        let current_reply = runtime::current_reply(route).ok() == Some(reply);
+        let source_tcb = runtime::physical_source(route).map_or(0, |source| source.tcb);
+        let mut state = [0u64; crate::win32k_glue::TCB_DEBUG_STATE_WORDS];
+        if source_tcb != 0 {
+            crate::win32k_glue::tcb_read_debug_state(source_tcb, reply, &mut state);
+        }
+        print_str(b"[hook-class-post-event] irp/route/epoch/reply/token/class-tcb/source-tcb/flags/wait-phase/can-resume/next-call/current-reply/tcb-state/sched/enqueued/pending-reply=");
+        print_hex_u64(irp); print_str(b"/"); print_hex_u64(route.badge()); print_str(b"/");
+        print_u64(dispatch.epoch()); print_str(b"/"); print_hex_u64(reply); print_str(b"/");
+        print_hex_u64(token); print_str(b"/"); print_hex_u64(class_tcb); print_str(b"/");
+        print_hex_u64(source_tcb); print_str(b"/"); print_u64(flags);
+        print_str(b"/"); print_u64(wait.map_or(9, |state| state.0));
+        print_str(b"/"); print_u64(wait.map_or(2, |state| state.1));
+        print_str(b"/"); print_u64(wait.map_or(2, |state| state.2));
+        print_str(b"/"); print_u64(u64::from(current_reply));
+        for field in [
+            crate::win32k_glue::TCB_DBG_STATE,
+            crate::win32k_glue::TCB_DBG_SCHEDULABLE,
+            crate::win32k_glue::TCB_DBG_ENQUEUED,
+            crate::win32k_glue::TCB_DBG_PENDING_REPLY,
+        ] {
+            print_str(b"/"); print_u64(state[field]);
+        }
+        print_str(b"\n");
+    }
 }
 
 fn class_sources() -> &'static mut Vec<Box<ClassSource>> {
@@ -300,9 +502,13 @@ unsafe fn dispatch_class_lower(
         owner_id, port_device, control_code,
         input_length, input,
         input_pointer, origin, caller, entered: false, pending: None,
+        pump_key: None, file_owner_row_id: None,
+        pump_return_consumed: false, unowned_yield: None,
+        returned_terminal: None,
         terminal_status: None, published: false,
         canonical_acknowledged: false, pin_released: false, source_released: false,
     }));
+    super::mark_hook_class_source_completion_probe(irp);
     None
 }
 
@@ -341,10 +547,14 @@ unsafe fn dispatch_port_source(
     };
     port_sources().push(Box::new(PortSource {
         source, instance: inst, irp, device, owner_id, input_length, origin, caller, entered: false,
-        pending: None, terminal_candidate: None, terminal_observed: None,
+        pending: None, pump_key: None, file_owner_row_id: None,
+        pump_return_consumed: false,
+        class_alias: None, unowned_yield: None,
+        terminal_candidate: None, terminal_observed: None,
         terminal_status: None, published: false,
         blocked: false, source_retired: false,
     }));
+    super::mark_hook_source_completion_probe(irp);
     None
 }
 
@@ -421,32 +631,95 @@ unsafe fn advance_class_source(work: &mut ClassSource) {
             target: work.port_device,
             control_code: work.control_code,
         });
-        let result = hosted_file_owners::dispatch(
+        trace_class_source(40, work, work.port_device.device_id().raw());
+        let result = hosted_file_owners::dispatch_mutable_method_neither_suspend_aware(
             work.caller,
             hook_request(work.caller, work.port_device, work.control_code, work.input_length),
             &work.input[..work.input_length],
-            &[],
-            ExternalFileIrpDispatchPolicy::MutableMethodNeitherInputAtDevice,
+            work.port_device.device_id(), work.owner_id,
         );
+        trace_class_source(41, work, work.port_device.device_id().raw());
         assert_eq!(active_port().pop().map(|row| row.target), Some(work.port_device));
+        trace_class_source(42, work, work.port_device.device_id().raw());
         match result {
-            Ok(hosted_file_owners::DispatchResult::Returned {
+            Ok(hosted_file_owners::HookDispatchResult::Returned(
+                hosted_file_owners::DispatchResult::Returned {
                 status, information: 0, buffers, ..
-            }) => {
+            })) => {
                 let (updated, _) = buffers.into_parts();
+                trace_class_source(43, work, work.port_device.device_id().raw());
                 class_terminal(work, status, &updated);
+                trace_class_source(44, work, work.port_device.device_id().raw());
             }
-            Ok(hosted_file_owners::DispatchResult::Outstanding { irp_id }) => {
+            Ok(hosted_file_owners::HookDispatchResult::Returned(
+                hosted_file_owners::DispatchResult::Outstanding { irp_id })) => {
                 work.pending = Some(irp_id);
             }
-            Err(status) => {
+            Ok(hosted_file_owners::HookDispatchResult::PumpSuspended { irp_id, key }) => {
+                work.pending = Some(irp_id);
+                work.pump_key = Some(key);
+                work.file_owner_row_id = hosted_file_owners::hook_pump_owner_row_id(
+                    irp_id, key, work.owner_id, work.port_device.device_id(),
+                ).ok();
+            }
+            Err(hosted_file_owners::HookDispatchFailure::Status(status)) => {
                 // Dispatch errors are pre-entry. Complete the parked lower-edge source with
                 // its original input; an accepted or uncertain effect remains Outstanding.
                 let input = work.input;
                 let length = work.input_length;
                 class_terminal(work, status, &input[..length]);
             }
+            Err(failure @ hosted_file_owners::HookDispatchFailure::UnownedYield { .. }) => {
+                work.unowned_yield = Some(failure);
+                return;
+            }
             Ok(_) => return,
+        }
+    }
+    if let Some(irp_id) = work.pending {
+        if let Some(key) = work.pump_key {
+            match hosted_file_owners::hook_pump_state(
+                irp_id, key, work.owner_id, work.port_device.device_id(),
+            ) {
+                Ok(hosted_file_owners::HookPumpState::Suspended) => return,
+                Ok(hosted_file_owners::HookPumpState::Blocked) | Err(_) => return,
+                Ok(hosted_file_owners::HookPumpState::Pending) => work.pump_key = None,
+                Ok(hosted_file_owners::HookPumpState::Returned) => {
+                    if work.returned_terminal.is_none() {
+                        let mut updated = [0u8; 48];
+                        let Ok(Some((status, 0, _))) =
+                            hosted_file_owners::peek_returned_hook_pump(
+                                irp_id, key, work.owner_id, work.port_device.device_id(),
+                                &mut updated[..work.input_length],
+                            ) else { return; };
+                        work.returned_terminal = Some(PortTerminalCandidate {
+                            status, updated, completed: Some(irp_id),
+                        });
+                    }
+                    let candidate = work.returned_terminal.expect("peeked exact Hook terminal");
+                    if work.terminal_status.is_none() {
+                        class_terminal(work, candidate.status,
+                            &candidate.updated[..work.input_length]);
+                    }
+                    if work.terminal_status != Some(candidate.status)
+                        || hosted_file_owners::mark_returned_hook_pump_observed(
+                            irp_id, key, work.owner_id, work.port_device.device_id(),
+                        ).is_err()
+                    { return; }
+                    let Ok(Some(hosted_file_owners::DispatchResult::Returned {
+                        status, information: 0, buffers, ..
+                    })) = hosted_file_owners::take_returned_hook_pump(
+                        irp_id, key, work.owner_id, work.port_device.device_id(),
+                    ) else { return; };
+                    let (updated, _) = buffers.into_parts();
+                    work.pump_return_consumed = true;
+                    if status != candidate.status
+                        || updated.as_slice() != &candidate.updated[..work.input_length]
+                    { return; }
+                    work.pump_key = None;
+                    work.canonical_acknowledged = true;
+                }
+            }
         }
     }
     if work.terminal_status.is_none() {
@@ -468,6 +741,7 @@ unsafe fn advance_class_source(work: &mut ClassSource) {
         class_terminal(work, completion.status,
             &updated[..work.input_length]);
     }
+    if work.pump_key.is_some() { return; }
     if let Some(status) = work.terminal_status {
         // Release the mutable input exclusion before the source Reply. Keep the exact FSD
         // caller IRP ticket until its lower-edge source completion has been acknowledged.
@@ -477,9 +751,11 @@ unsafe fn advance_class_source(work: &mut ClassSource) {
             }
             work.pin_released = true;
         }
+        trace_class_source(45, work, work.port_device.device_id().raw());
         work.published = work.origin.reply_dispatch(
             HostedForwardDispatchReply::InlineTerminal(status.raw()), true,
         );
+        trace_class_source(46, work, work.port_device.device_id().raw());
     }
 }
 
@@ -489,7 +765,9 @@ unsafe fn stage_port_terminal(
     updated: &[u8],
     completed: Option<IrpId>,
 ) {
+    trace_port_source(10, work, completed.map_or(0, |id| id.raw()));
     if updated.len() != work.input_length || work.terminal_candidate.is_some() {
+        trace_port_source(11, work, updated.len() as u64);
         work.blocked = true;
         return;
     }
@@ -498,33 +776,73 @@ unsafe fn stage_port_terminal(
     work.terminal_candidate = Some(PortTerminalCandidate {
         status, updated: bytes, completed,
     });
+    trace_port_source(12, work, updated.len() as u64);
 }
 
 unsafe fn advance_port_terminal(work: &mut PortSource) {
     let Some(candidate) = work.terminal_candidate else { return; };
+    trace_port_source(20, work, candidate.completed.map_or(0, |id| id.raw()));
     let status = candidate.status;
     if work.terminal_observed.is_none() {
+        trace_port_source(21, work, work.origin.token);
         let outcome = hosted_connect_live::with_hook_sequence(work.owner_id, |_, sequence| {
             work.source.observe_terminal(sequence, status,
                 &candidate.updated[..work.input_length], candidate.completed)
         });
+        let observation = match &outcome {
+            None => 0,
+            Some(Ok(_)) => 1,
+            Some(Err(hosted_input_hook_dispatch::HookError::WrongCaller)) => 2,
+            Some(Err(hosted_input_hook_dispatch::HookError::WrongSource)) => 3,
+            Some(Err(hosted_input_hook_dispatch::HookError::WrongAlias)) => 4,
+            Some(Err(hosted_input_hook_dispatch::HookError::WrongPayload)) => 5,
+            Some(Err(hosted_input_hook_dispatch::HookError::WrongPhase)) => 6,
+        };
+        trace_port_source(22, work, observation);
         if outcome != Some(Ok((work.source.source_identity(), status))) {
             work.blocked = !work.source.terminal_observation_retryable();
+            trace_port_source(23, work, observation);
             return;
         }
         work.terminal_observed = Some(status);
+        trace_port_source(24, work, status.raw() as u32 as u64);
     }
     if work.terminal_observed != Some(status) {
         work.blocked = true;
         return;
     }
+    if let Some(key) = work.pump_key {
+        let Some(irp_id) = work.pending else { work.blocked = true; return; };
+        if hosted_file_owners::mark_returned_hook_pump_observed(
+            irp_id, key, work.owner_id, work.source.class_target_registration().device_id(),
+        ).is_err() { return; }
+        let Ok(Some(hosted_file_owners::DispatchResult::Returned {
+            irp_id: retired_irp, status: returned_status, information: 0, buffers, ..
+        })) = hosted_file_owners::take_returned_hook_pump(
+            irp_id, key, work.owner_id, work.source.class_target_registration().device_id(),
+        ) else { return; };
+        if !work.source.record_returned_file_retirement(retired_irp) {
+            work.blocked = true;
+            return;
+        }
+        let (updated, _) = buffers.into_parts();
+        work.pump_return_consumed = true;
+        if returned_status != status || updated.as_slice() != &candidate.updated[..work.input_length] {
+            work.blocked = true;
+            return;
+        }
+        work.pump_key = None;
+    }
+    trace_port_source(30, work, status.raw() as u32 as u64);
     if work.source.publish_source_terminal().is_err() {
         // A pre-effect lock refusal leaves Phase::Terminal and can be redriven. A failed
         // native write or deferred-free arm is indeterminate and must never be replayed.
         work.blocked = !work.source.terminal_publication_retryable();
+        trace_port_source(31, work, u64::from(work.blocked));
         return;
     }
     work.terminal_status = Some(status);
+    trace_port_source(32, work, status.raw() as u32 as u64);
 }
 
 unsafe fn advance_port_source(work: &mut PortSource) {
@@ -556,7 +874,7 @@ unsafe fn advance_port_source(work: &mut PortSource) {
             _ => return,
         };
         work.entered = true;
-        active().push(ActiveClassDispatch {
+        let class_alias = ActiveClassDispatch {
             owner_id: work.owner_id,
             class_target: ticket.target,
             class_source: prepared.source_port_do_registration,
@@ -564,40 +882,116 @@ unsafe fn advance_port_source(work: &mut PortSource) {
             control_code: ticket.control_code,
             input_length: ticket.input_length as usize,
             input: ticket.input,
-        });
-        let result = hosted_file_owners::dispatch(
+        };
+        work.class_alias = Some(class_alias);
+        active().push(class_alias);
+        trace_port_source(40, work, ticket.target.device_id().raw());
+        let result = hosted_file_owners::dispatch_mutable_method_neither_suspend_aware(
             work.caller,
             hook_request(work.caller, ticket.target, ticket.control_code,
                 ticket.input_length as usize),
             &ticket.input[..ticket.input_length as usize],
-            &[],
-            ExternalFileIrpDispatchPolicy::MutableMethodNeitherInputAtDevice,
+            ticket.target.device_id(), work.owner_id,
         );
+        trace_port_source(41, work, ticket.target.device_id().raw());
         assert_eq!(active().pop().map(|row| row.owner_id), Some(work.owner_id));
+        trace_port_source(42, work, ticket.target.device_id().raw());
         match result {
-            Ok(hosted_file_owners::DispatchResult::Returned {
-                status, information: 0, buffers, ..
-            }) => {
+            Ok(hosted_file_owners::HookDispatchResult::Returned(
+                hosted_file_owners::DispatchResult::Returned {
+                irp_id, status, information: 0, buffers, ..
+            })) => {
+                trace_port_dispatch(43, work, 1, irp_id.raw(), false,
+                    status.raw() as u32 as u64, 0);
                 let (updated, _) = buffers.into_parts();
+                trace_port_source(49, work, updated.len() as u64);
                 stage_port_terminal(work, status, &updated, None);
             }
-            Ok(hosted_file_owners::DispatchResult::Outstanding { irp_id }) => {
-                if work.source.record_pending(irp_id).is_err() { return; }
+            Ok(hosted_file_owners::HookDispatchResult::Returned(
+                hosted_file_owners::DispatchResult::Outstanding { irp_id })) => {
+                trace_port_dispatch(43, work, 2, irp_id.raw(), false, 0, 0);
+                let recorded = work.source.record_pending(irp_id).is_ok();
+                trace_port_dispatch(44, work, 2, irp_id.raw(), false,
+                    u64::from(recorded), 0);
+                if !recorded { return; }
                 work.pending = Some(irp_id);
             }
-            Err(status) => {
+            Ok(hosted_file_owners::HookDispatchResult::PumpSuspended { irp_id, key }) => {
+                trace_port_dispatch(43, work, 3, irp_id.raw(), true, 0, 0);
+                let recorded = work.source.record_pending(irp_id).is_ok();
+                trace_port_dispatch(44, work, 3, irp_id.raw(), true,
+                    u64::from(recorded), 0);
+                if !recorded { return; }
+                work.pending = Some(irp_id);
+                work.pump_key = Some(key);
+                work.file_owner_row_id = hosted_file_owners::hook_pump_owner_row_id(
+                    irp_id, key, work.owner_id,
+                    work.source.class_target_registration().device_id(),
+                ).ok();
+            }
+            Err(hosted_file_owners::HookDispatchFailure::Status(status)) => {
+                trace_port_dispatch(43, work, 4, 0, false,
+                    status.raw() as u32 as u64, 0);
                 // No class provider was entered. Complete this source through the usual
                 // sequence so its original Reply and pinned IRP can be retired.
                 stage_port_terminal(work, status,
                     &ticket.input[..ticket.input_length as usize], None);
             }
-            Ok(hosted_file_owners::DispatchResult::Returned { .. }) => {
+            Err(failure @ hosted_file_owners::HookDispatchFailure::UnownedYield { status, .. }) => {
+                trace_port_dispatch(43, work, 5, 0, false,
+                    status.raw() as u32 as u64, 0);
+                work.unowned_yield = Some(failure);
+                work.blocked = true;
+                return;
+            }
+            Ok(hosted_file_owners::HookDispatchResult::Returned(
+                hosted_file_owners::DispatchResult::Returned {
+                    irp_id, status, information, ..
+                })) => {
+                trace_port_dispatch(43, work, 6, irp_id.raw(), false,
+                    status.raw() as u32 as u64, information);
                 return;
             }
         }
+        trace_port_dispatch(45, work, 0, work.pending.map_or(0, |id| id.raw()),
+            work.pump_key.is_some(), 0, 0);
     }
     if work.terminal_candidate.is_none() {
         if let Some(irp_id) = work.pending {
+            if let Some(key) = work.pump_key {
+                let device = work.source.class_target_registration().device_id();
+                match hosted_file_owners::hook_pump_state(irp_id, key, work.owner_id, device) {
+                    Ok(hosted_file_owners::HookPumpState::Suspended) => {
+                        trace_port_dispatch(50, work, 3, irp_id.raw(), true, 0, 0);
+                        return;
+                    }
+                    Ok(hosted_file_owners::HookPumpState::Blocked) | Err(_) => {
+                        trace_port_dispatch(50, work, 4, irp_id.raw(), true, 0, 0);
+                        work.blocked = true;
+                        return;
+                    }
+                    Ok(hosted_file_owners::HookPumpState::Pending) => {
+                        trace_port_dispatch(50, work, 2, irp_id.raw(), true, 0, 0);
+                        work.pump_key = None;
+                    }
+                    Ok(hosted_file_owners::HookPumpState::Returned) => {
+                        trace_port_dispatch(50, work, 1, irp_id.raw(), true, 0, 0);
+                        let mut updated = [0u8; 48];
+                        let Ok(Some((status, 0, _))) =
+                            hosted_file_owners::peek_returned_hook_pump(
+                                irp_id, key, work.owner_id, device,
+                                &mut updated[..work.input_length],
+                            ) else { return; };
+                        stage_port_terminal(work, status,
+                            &updated[..work.input_length], Some(irp_id));
+                        if work.terminal_candidate.is_none() { return; }
+                    }
+                }
+            }
+            if work.terminal_candidate.is_some() {
+                advance_port_terminal(work);
+                return;
+            }
             let Ok(completion) = hosted_file_owners::completion(irp_id) else { return; };
             if completion.major != major::IRP_MJ_INTERNAL_DEVICE_CONTROL
                 || completion.information != 0
@@ -614,39 +1008,248 @@ unsafe fn advance_port_source(work: &mut PortSource) {
         }
     }
     if work.terminal_candidate.is_some() && work.terminal_status.is_none() {
+        trace_port_source(60, work, 0);
         advance_port_terminal(work);
     }
     if let Some(status) = work.terminal_status {
+        trace_port_source(70, work, status.raw() as u32 as u64);
         work.published = work.origin.reply_dispatch(
             HostedForwardDispatchReply::InlineTerminal(status.raw()), true,
         );
+        trace_port_source(71, work, u64::from(work.published));
     }
 }
 
+/// Stage: 0 entry (index=class count, owner=port count), 1/2 class before/after,
+/// 3 class skip, 4/5 port before/after, 6 port skip, 7 function exit.
+fn trace_hook_redrive(
+    stage: u64, index: u64, owner: u64, entered: bool, published: bool,
+    pump_key: bool, unowned: bool,
+) {
+    static COUNT: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    if COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 96 {
+        return;
+    }
+    print_str(b"[hook-redrive] stage/index/owner/entered/published/key/unowned=");
+    print_u64(stage); print_str(b"/");
+    print_u64(index); print_str(b"/");
+    print_u64(owner); print_str(b"/");
+    print_u64(u64::from(entered)); print_str(b"/");
+    print_u64(u64::from(published)); print_str(b"/");
+    print_u64(u64::from(pump_key)); print_str(b"/");
+    print_u64(u64::from(unowned)); print_str(b"\n");
+}
+
+static HOOK_REDRIVE_EXIT_PROBE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn redrive_exit_probe() -> bool {
+    HOOK_REDRIVE_EXIT_PROBE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+pub(super) fn clear_redrive_exit_probe() {
+    HOOK_REDRIVE_EXIT_PROBE.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
 pub(super) unsafe fn redrive() {
+    let trace = entered_port_source_unpublished();
     let class_count = class_sources().len();
+    if trace {
+        trace_hook_redrive(0, class_count as u64, port_sources().len() as u64,
+            false, false, false, false);
+    }
     for index in 0..class_count {
         let ptr = class_sources()[index].as_mut() as *mut ClassSource;
+        let owner_id = (*ptr).owner_id;
+        if trace {
+            trace_hook_redrive(1, index as u64, (*ptr).owner_id, (*ptr).entered,
+                (*ptr).published, (*ptr).pump_key.is_some(), (*ptr).unowned_yield.is_some());
+        }
+        if (*ptr).pump_key.is_some() || (*ptr).unowned_yield.is_some() {
+            if trace {
+                trace_hook_redrive(3, index as u64, (*ptr).owner_id, (*ptr).entered,
+                    (*ptr).published, (*ptr).pump_key.is_some(), (*ptr).unowned_yield.is_some());
+            }
+            continue;
+        }
         advance_class_source(&mut *ptr);
+        if trace {
+            trace_hook_redrive(2, index as u64, owner_id,
+                false, false, false, false);
+        }
     }
     let port_count = port_sources().len();
     for index in 0..port_count {
         let ptr = port_sources()[index].as_mut() as *mut PortSource;
+        let owner_id = (*ptr).owner_id;
+        if trace {
+            trace_hook_redrive(4, index as u64, (*ptr).owner_id, (*ptr).entered,
+                (*ptr).published, (*ptr).pump_key.is_some(), (*ptr).unowned_yield.is_some());
+        }
+        if (*ptr).entered && !(*ptr).published
+        {
+            // State: 0 no pending/key pair, 1 suspended, 2 returned,
+            // 3 provider pending, 4 blocked, 5 exact owner/key refusal.
+            let state = match ((*ptr).pending, (*ptr).pump_key) {
+                (Some(irp_id), Some(key)) => match hosted_file_owners::hook_pump_state(
+                    irp_id, key, (*ptr).owner_id,
+                    (*ptr).source.class_target_registration().device_id(),
+                ) {
+                    Ok(hosted_file_owners::HookPumpState::Suspended) => 1,
+                    Ok(hosted_file_owners::HookPumpState::Returned) => 2,
+                    Ok(hosted_file_owners::HookPumpState::Pending) => 3,
+                    Ok(hosted_file_owners::HookPumpState::Blocked) => 4,
+                    Err(_) => 5,
+                },
+                _ => 0,
+            };
+            trace_port_dispatch(80, &*ptr, 0,
+                (*ptr).pending.map_or(0, |id| id.raw()), (*ptr).pump_key.is_some(),
+                u64::from((*ptr).unowned_yield.is_some()), state);
+        }
+        if (*ptr).pump_key.is_some() || (*ptr).unowned_yield.is_some() {
+            if trace {
+                trace_hook_redrive(6, index as u64, (*ptr).owner_id, (*ptr).entered,
+                    (*ptr).published, (*ptr).pump_key.is_some(), (*ptr).unowned_yield.is_some());
+            }
+            continue;
+        }
+        if (*ptr).entered && !(*ptr).published {
+            trace_port_source(81, &*ptr, 0);
+        }
         advance_port_source(&mut *ptr);
+        if trace {
+            trace_hook_redrive(5, index as u64, owner_id,
+                false, false, false, false);
+        }
+    }
+    if trace {
+        trace_hook_redrive(7, class_count as u64, port_count as u64,
+            false, false, false, false);
+        HOOK_REDRIVE_EXIT_PROBE.store(true, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
 pub(super) unsafe fn nested_work_ready() -> bool {
     class_sources().iter().any(|row| {
-        !row.entered
+        row.pump_key.is_none() && row.unowned_yield.is_none() && (!row.entered
             || (row.terminal_status.is_some() && !row.published)
-            || row.pending.is_some_and(|id| completed_irp_exact(id.raw()).is_some())
+            || row.pending.is_some_and(|id| completed_irp_exact(id.raw()).is_some()))
     }) || port_sources().iter().any(|row| {
-        !row.blocked && (!row.entered
+        row.pump_key.is_none() && row.unowned_yield.is_none() && !row.blocked && (!row.entered
             || (row.terminal_candidate.is_some() && row.terminal_status.is_none())
             || (row.terminal_status.is_some() && !row.published)
             || row.pending.is_some_and(|id| completed_irp_exact(id.raw()).is_some()))
     })
+}
+
+pub(super) fn entered_port_source_unpublished() -> bool {
+    port_sources().iter().any(|port| port.entered && !port.published)
+}
+
+fn returned_hook_state(
+    irp_id: Option<IrpId>, key: Option<ExternalFileIrpPumpKey>, owner_id: u64,
+    device: nt_io_manager::DeviceId,
+) -> Option<hosted_file_owners::HookPumpState> {
+    let (Some(irp_id), Some(key)) = (irp_id, key) else { return None; };
+    hosted_file_owners::hook_pump_state(irp_id, key, owner_id, device)
+        .ok().or(Some(hosted_file_owners::HookPumpState::Blocked))
+}
+
+/// Only a returned or lost exact Hook terminal fences the outer CONNECT here. A real
+/// provider Pending is handled by the ordinary completion path after the pump has returned.
+pub(super) fn returned_hook_pump_ready() -> bool {
+    returned_hook_pump_ready_after(0)
+}
+
+/// A nested queue may publish only Hook sources created after its File-owner
+/// boundary. The retained row ID remains available after the File row retires.
+pub(super) fn returned_hook_pump_ready_after(floor: u64) -> bool {
+    class_sources().iter().any(|row| source_after_floor(row.file_owner_row_id, floor)
+        && (row.unowned_yield.is_some()
+            || row.pump_return_consumed && !row.published
+            || matches!(returned_hook_state(row.pending, row.pump_key, row.owner_id,
+                row.port_device.device_id()),
+                Some(hosted_file_owners::HookPumpState::Returned
+                    | hosted_file_owners::HookPumpState::Blocked))))
+    || port_sources().iter().any(|row| source_after_floor(row.file_owner_row_id, floor)
+        && (row.unowned_yield.is_some()
+            || row.pump_return_consumed && !row.published
+            || matches!(returned_hook_state(row.pending, row.pump_key, row.owner_id,
+                row.source.class_target_registration().device_id()),
+                Some(hosted_file_owners::HookPumpState::Returned
+                    | hosted_file_owners::HookPumpState::Blocked))))
+}
+
+fn source_after_floor(file_owner_row_id: Option<u64>, floor: u64) -> bool {
+    floor == 0 || file_owner_row_id.is_some_and(|id| id > floor)
+}
+
+/// A consumed File terminal is still owned until the original Hook source Reply is published.
+/// A provider Pending has not consumed its pump return and remains on the ordinary path.
+pub(super) fn hook_source_unsettled() -> bool {
+    hook_source_unsettled_after(0)
+}
+
+pub(super) fn hook_source_unsettled_after(floor: u64) -> bool {
+    class_sources().iter().any(|row| source_after_floor(row.file_owner_row_id, floor)
+        && row.pump_return_consumed && !row.published)
+        || port_sources().iter().any(|row| source_after_floor(row.file_owner_row_id, floor)
+            && row.pump_return_consumed && !row.published)
+}
+
+/// Advance only entered Hook work whose real File terminal is held for observation. Never
+/// dispatch a fresh Hook from this flat-root settlement phase.
+pub(super) unsafe fn redrive_returned_hook_pump() -> bool {
+    redrive_returned_hook_pump_after(0)
+}
+
+pub(super) unsafe fn redrive_returned_hook_pump_after(floor: u64) -> bool {
+    let mut progressed = false;
+    let class_count = class_sources().len();
+    for index in 0..class_count {
+        let ptr = class_sources()[index].as_mut() as *mut ClassSource;
+        if source_after_floor((*ptr).file_owner_row_id, floor)
+            && ((*ptr).pump_return_consumed && !(*ptr).published
+                || returned_hook_state((*ptr).pending, (*ptr).pump_key, (*ptr).owner_id,
+                    (*ptr).port_device.device_id()) == Some(hosted_file_owners::HookPumpState::Returned))
+        {
+            let before = ((*ptr).pump_key, (*ptr).pump_return_consumed,
+                (*ptr).returned_terminal.is_some(), (*ptr).terminal_status,
+                (*ptr).canonical_acknowledged, (*ptr).pin_released, (*ptr).published);
+            advance_class_source(&mut *ptr);
+            let after = ((*ptr).pump_key, (*ptr).pump_return_consumed,
+                (*ptr).returned_terminal.is_some(), (*ptr).terminal_status,
+                (*ptr).canonical_acknowledged, (*ptr).pin_released, (*ptr).published);
+            progressed |= before != after;
+        }
+    }
+    let port_count = port_sources().len();
+    for index in 0..port_count {
+        let ptr = port_sources()[index].as_mut() as *mut PortSource;
+        if (*ptr).entered && !(*ptr).published {
+            trace_port_dispatch(82, &*ptr, 0,
+                (*ptr).pending.map_or(0, |id| id.raw()), (*ptr).pump_key.is_some(),
+                u64::from((*ptr).pump_return_consumed), u64::from((*ptr).published));
+        }
+        if source_after_floor((*ptr).file_owner_row_id, floor)
+            && ((*ptr).pump_return_consumed && !(*ptr).published
+                || returned_hook_state((*ptr).pending, (*ptr).pump_key, (*ptr).owner_id,
+                    (*ptr).source.class_target_registration().device_id())
+                    == Some(hosted_file_owners::HookPumpState::Returned))
+        {
+            let before = ((*ptr).pump_key, (*ptr).pump_return_consumed,
+                (*ptr).terminal_candidate.is_some(), (*ptr).terminal_observed,
+                (*ptr).terminal_status, (*ptr).published, (*ptr).blocked);
+            advance_port_source(&mut *ptr);
+            let after = ((*ptr).pump_key, (*ptr).pump_return_consumed,
+                (*ptr).terminal_candidate.is_some(), (*ptr).terminal_observed,
+                (*ptr).terminal_status, (*ptr).published, (*ptr).blocked);
+            progressed |= before != after;
+        }
+    }
+    progressed
 }
 
 fn progress_generation() -> u64 {
@@ -654,12 +1257,16 @@ fn progress_generation() -> u64 {
     for row in class_sources() {
         generation += u64::from(row.entered)
             + u64::from(row.pending.is_some())
+            + u64::from(row.pump_key.is_some())
+            + u64::from(row.returned_terminal.is_some())
             + u64::from(row.terminal_status.is_some())
+            + u64::from(row.canonical_acknowledged)
             + u64::from(row.published);
     }
     for row in port_sources() {
         generation += u64::from(row.entered)
             + u64::from(row.pending.is_some())
+            + u64::from(row.pump_key.is_some())
             + u64::from(row.terminal_candidate.is_some())
             + u64::from(row.terminal_observed.is_some())
             + u64::from(row.terminal_status.is_some())
@@ -722,6 +1329,7 @@ pub(super) unsafe fn service(
                 row.source_released = true;
             }
             if !row.origin.retire_receipt() { return Some((BUSY, false)); }
+            trace_class_source(47, row, row.origin.token);
             class_sources().swap_remove(index);
             return Some((STATUS_SUCCESS, false));
         }

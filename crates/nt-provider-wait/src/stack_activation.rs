@@ -186,7 +186,7 @@ impl ProviderStackActivationCatalog {
             return Err(ProviderStackActivationError::InvalidCapacity);
         }
         let identity = counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 if next == 0 {
                     None
                 } else {

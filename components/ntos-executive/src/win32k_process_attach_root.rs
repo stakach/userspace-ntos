@@ -3,7 +3,7 @@
 use super::*;
 use core::ptr::read_volatile;
 use nt_kernel_exec::process_attach::{ProcessAttachState, SavedAttachState};
-use nt_user_host::{client_alias_window::WindowOwner, process_identity::ProcessGeneration};
+use nt_user_host::{client_alias_window::{WindowOwner, WindowSelectionEffect}, process_identity::ProcessGeneration};
 use nt_user_host::provider_kernel_activation::{KernelProviderCaller, KernelProviderServiceEnvelope};
 use nt_user_host::provider_logical_caller::ProviderLogicalCaller;
 
@@ -46,18 +46,70 @@ struct AttachIntent {
 
 static mut THREAD_ATTACHMENTS: Vec<ThreadAttach> = Vec::new();
 
-pub(super) unsafe fn select_effective_client(
+pub(super) unsafe fn select_effective_client_effect(
     caller: ProviderLogicalCaller,
     original: WindowOwner,
-) -> bool {
+) -> WindowSelectionEffect {
     let records = &*core::ptr::addr_of!(THREAD_ATTACHMENTS);
     let Some(record) = records.iter().find(|record| record.caller == AttachCaller::Logical(caller)) else {
-        return w32_client_attach(original);
+        return w32_client_attach_effect(original);
     };
     if record.state.original().owner != Some(original) {
-        return false;
+        return WindowSelectionEffect::RefusedNoEffect;
     }
-    select(record.state.current()).is_ok()
+    let current = record.state.current();
+    match current.owner {
+        Some(owner) => w32_client_attach_effect(owner),
+        None => match select(current) {
+            Ok(()) => WindowSelectionEffect::Applied,
+            // Process detachment may have removed an earlier alias before returning an error.
+            Err(()) => WindowSelectionEffect::Uncertain,
+        },
+    }
+}
+
+/// Rebind a retained kernel Ps callout after a provider wait or scheduler yield. The native
+/// callout may have an active KeStackAttachProcess, so its current target takes precedence over
+/// the original process whose lifetime the root has retained.
+pub(crate) unsafe fn select_effective_kernel(
+    caller: KernelProviderCaller,
+    original: WindowOwner,
+    eprocess: u64,
+) -> Result<(), u32> {
+    let records = &*core::ptr::addr_of!(THREAD_ATTACHMENTS);
+    let Some(record) = records.iter().find(|record| record.caller == AttachCaller::Kernel(caller)) else {
+        return w32_client_attach(original).then_some(()).ok_or(nt_process::STATUS_INSUFFICIENT_RESOURCES);
+    };
+    if record.inflight.is_some()
+        || record.state.original().owner != Some(original)
+        || record.state.original().eprocess != eprocess
+    {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    select(record.state.current()).map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)
+}
+
+/// Capture the exact process whose aliases are selected for this logical win32k invocation.
+/// An attach in progress or a mismatched shared client window cannot supply handle authority.
+pub(crate) unsafe fn current_query_process(
+    caller: ProviderLogicalCaller,
+    vspace: u64,
+) -> Option<WindowOwner> {
+    let original = WindowOwner {
+        pi: caller.pi(),
+        process: caller.process(),
+        vspace,
+    };
+    let records = &*core::ptr::addr_of!(THREAD_ATTACHMENTS);
+    let record = match records.iter().find(|record| record.caller == AttachCaller::Logical(caller)) {
+        Some(record) => Some((
+            record.state.original().owner?,
+            record.state.current().owner?,
+            record.inflight.is_some(),
+        )),
+        None => None,
+    };
+    crate::process_information_bridge::selected_effective_owner(original, record, attached_owner())
 }
 
 pub(crate) unsafe fn retire_thread_attach(client: Win32kClientContext) -> bool {

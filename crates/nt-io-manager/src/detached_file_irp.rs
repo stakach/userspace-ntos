@@ -113,6 +113,73 @@ pub struct PreparedExternalFileIrp(Owner);
 #[derive(Debug)]
 #[must_use = "return the exact invocation; dropping it retains the canonical IRP"]
 pub struct ExternalFileIrpInvocation(Owner);
+/// Lookup witness for a native pump continuation. The epoch is supplied by the physical owner;
+/// this value alone never authorizes a Reply, provider entry, or completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExternalFileIrpPumpKey {
+    manager: u64,
+    irp: IrpId,
+    route: ExternalFileIrpRoute,
+    epoch: u64,
+}
+
+impl ExternalFileIrpPumpKey {
+    pub fn new(invocation: &ExternalFileIrpInvocation, epoch: u64) -> Option<Self> {
+        (epoch != 0).then_some(Self {
+            manager: invocation.0.manager,
+            irp: invocation.0.projection.irp_id,
+            route: invocation.0.route,
+            epoch,
+        })
+    }
+}
+
+/// The manager IRP remains Dispatched while an entered native pump unwinds. Only the exact
+/// continuation can resume its original invocation; no provider result is reported here.
+#[derive(Debug)]
+#[must_use = "retain the exact dispatched IRP until its native pump resumes or is fenced"]
+pub struct SuspendedExternalFileIrpInvocation {
+    key: ExternalFileIrpPumpKey,
+    invocation: ExternalFileIrpInvocation,
+    quarantined: bool,
+}
+
+impl SuspendedExternalFileIrpInvocation {
+    pub const fn key(&self) -> ExternalFileIrpPumpKey { self.key }
+
+    pub fn resume(self, key: ExternalFileIrpPumpKey) -> Result<ExternalFileIrpInvocation, Self> {
+        if self.key != key || self.quarantined {
+            return Err(self);
+        }
+        Ok(self.invocation)
+    }
+
+    /// An uncertain native effect permanently fences continuation replay. Keep the manager's
+    /// move-only owner here until an explicit indeterminate report is accepted.
+    pub fn quarantine(&mut self, key: ExternalFileIrpPumpKey) -> Result<(), NtStatus> {
+        if self.key != key {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        if self.quarantined {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        self.quarantined = true;
+        Ok(())
+    }
+
+    /// This reports transport uncertainty, never a provider completion. The I/O Manager then
+    /// retains the canonical IRP and its buffers for later genuine completion or cancellation.
+    pub fn into_indeterminate(
+        self, key: ExternalFileIrpPumpKey, status: NtStatus,
+    ) -> Result<ExternalFileIrpReturn, Self> {
+        if self.key != key || !self.quarantined || !status.is_error() {
+            return Err(self);
+        }
+        Ok(self.invocation.returned(ExternalFileIrpOutcome::Indeterminate {
+            transport_status: status,
+        }))
+    }
+}
 #[derive(Debug)]
 #[must_use = "finish through the issuing I/O Manager"]
 pub struct ExternalFileIrpReturn {
@@ -187,6 +254,14 @@ pub enum ExternalFileIrpOutcome {
     },
 }
 
+/// A prepared IRP is still owned by the caller and has never entered a backend.
+/// Only manager-observable failures may complete it for an already parked caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalFileIrpPreEntryFailure {
+    Cancelled,
+    ManagerRouteUnavailable,
+}
+
 #[derive(Debug)]
 pub enum ExternalFileIrpResult {
     NotEntered {
@@ -199,6 +274,38 @@ pub enum ExternalFileIrpResult {
         transport_status: NtStatus,
         retained: RetainedExternalFileIrp,
     },
+}
+
+/// One definitive transport refusal after an exact detached invocation. The private fields
+/// preserve its manager-bound preparation and status without permitting a caller to relabel it.
+#[derive(Debug)]
+#[must_use = "complete or retain the exact no-entry File IRP owner"]
+pub struct ExternalFileIrpNoEntryReceipt {
+    status: NtStatus,
+    prepared: PreparedExternalFileIrp,
+}
+
+impl ExternalFileIrpNoEntryReceipt {
+    pub fn status(&self) -> NtStatus {
+        self.status
+    }
+
+    pub fn irp_id(&self) -> IrpId {
+        self.prepared.irp_id()
+    }
+}
+
+impl ExternalFileIrpResult {
+    /// Only a failed, manager-accepted NotEntered return can authorize a parked caller's
+    /// no-backend completion. All other results keep their original move-only owner.
+    pub fn into_no_entry_receipt(self) -> Result<ExternalFileIrpNoEntryReceipt, Self> {
+        match self {
+            Self::NotEntered { status, prepared } if status.is_error() => {
+                Ok(ExternalFileIrpNoEntryReceipt { status, prepared })
+            }
+            other => Err(other),
+        }
+    }
 }
 
 /// Only successful canonical retirement can mint this receipt.
@@ -247,6 +354,21 @@ mod policy;
 pub use policy::{ExternalFileIrpDispatchPolicy, MAX_MUTABLE_METHOD_NEITHER_INPUT};
 
 impl ExternalFileIrpInvocation {
+    /// Publish the exact manager-bound invocation before releasing a native pump stack. The
+    /// physical adapter must separately authenticate the worker generation and retained Reply.
+    pub fn suspend_for_pump(
+        self, key: ExternalFileIrpPumpKey,
+    ) -> Result<SuspendedExternalFileIrpInvocation, Self> {
+        if key.manager != self.0.manager || key.irp != self.0.projection.irp_id
+            || key.route != self.0.route || key.epoch == 0
+        {
+            return Err(self);
+        }
+        Ok(SuspendedExternalFileIrpInvocation {
+            key, invocation: self, quarantined: false,
+        })
+    }
+
     pub fn buffers_mut(&mut self) -> ExternalFileIrpBufferView<'_> {
         ExternalFileIrpBufferView {
             input: &self.0.buffers.input,
@@ -348,6 +470,18 @@ fn validate_buffers(
                 && input == p.input_len
                 && output == p.output_len
         }
+        IoParameters::Scsi(p) => {
+            let transfer = p.data_length.checked_add(u32::from(p.sense_length));
+            request.major == major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                && p.route.pdo == request.device_id
+                && request.file_id.is_none()
+                && request.stack_flags.is_empty()
+                && transfer == Some(input)
+                && transfer.and_then(|length| length.checked_add(64 + 0x58)) == Some(output)
+                && p.srb[0x18..0x40] == [0; 0x28]
+                && u32::from_le_bytes(p.srb[0x10..0x14].try_into().unwrap()) == p.data_length
+                && p.srb[0x0b] == p.sense_length
+        }
         IoParameters::QueryInformation(p) => {
             request.major == major::IRP_MJ_QUERY_INFORMATION && input == 0 && output == p.length
         }
@@ -372,8 +506,10 @@ fn validate_buffers(
         || request.file_id.is_none()
             && !matches!(
                 request.parameters,
-                IoParameters::DeviceControl(_)
+                IoParameters::Read(_)
+                    | IoParameters::DeviceControl(_)
                     | IoParameters::InternalDeviceControl(_)
+                    | IoParameters::Scsi(_)
                     | IoParameters::FlushBuffers
             )
     {
@@ -414,6 +550,24 @@ impl<P: ObjectManagerPort> IoManager<P> {
         self.prepare_external_file_irp_owned_with_start(request, buffers, false)
     }
 
+    /// Prepare a File-less kernel READ at the exact authenticated Device, without
+    /// selecting an attached device above it. The native caller retains the source
+    /// IRP, output buffer, completion event and IOSB through provider acknowledgement.
+    pub fn prepare_external_read_irp_owned_at_device(
+        &mut self,
+        request: ExternalFileIrpRequest,
+        buffers: ExternalFileIrpBuffers,
+    ) -> Result<PreparedExternalFileIrp, NtStatus> {
+        if request.file_id.is_some()
+            || !matches!((&request.parameters, request.major),
+                (IoParameters::Read(parameters), major::IRP_MJ_READ)
+                    if parameters.length != 0)
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        self.prepare_external_file_irp_owned_with_start(request, buffers, true)
+    }
+
     /// Prepare a File-less kernel IOCTL starting at the exact authenticated Device object,
     /// matching `IoCallDriver(DeviceObject, Irp)` rather than entering attached devices above it.
     /// The caller owns Device authority; dispatch, copy, and ACK retain the ordinary detached
@@ -438,12 +592,31 @@ impl<P: ObjectManagerPort> IoManager<P> {
         self.prepare_external_file_irp_owned_with_start(request, buffers, true)
     }
 
+    /// Prepare a pointer-free SCSI SRB at the exact accepted PDO. The source adapter retains
+    /// the physical SRB, MDL, data and sense allocations independently of this canonical IRP.
+    pub fn prepare_external_scsi_irp_owned_at_device(
+        &mut self,
+        request: ExternalFileIrpRequest,
+        buffers: ExternalFileIrpBuffers,
+    ) -> Result<PreparedExternalFileIrp, NtStatus> {
+        if request.file_id.is_some()
+            || !matches!((&request.parameters, request.major),
+                (IoParameters::Scsi(_), major::IRP_MJ_INTERNAL_DEVICE_CONTROL))
+        { return Err(NtStatus::INVALID_PARAMETER); }
+        self.prepare_external_file_irp_owned_with_start(request, buffers, true)
+    }
+
     fn prepare_external_file_irp_owned_with_start(
         &mut self,
         mut request: ExternalFileIrpRequest,
         buffers: ExternalFileIrpBuffers,
         exact_device: bool,
     ) -> Result<PreparedExternalFileIrp, NtStatus> {
+        if !exact_device && (matches!(request.parameters, IoParameters::Scsi(_))
+            || request.file_id.is_none() && matches!(request.parameters, IoParameters::Read(_)))
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let (input, output, total) = validate_buffers(&request, &buffers)?;
         let device = self
             .device(request.device_id)
@@ -668,6 +841,100 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .unwrap()
             .transition(IrpState::Dispatched));
         Ok(ExternalFileIrpInvocation(prepared.0))
+    }
+
+    /// Publish an exact failed completion after the caller has already transferred delivery.
+    /// The move-only preparation proves no backend dispatch or ACK obligation exists.
+    pub fn complete_prepared_external_file_irp_without_entry(
+        &mut self,
+        prepared: PreparedExternalFileIrp,
+        failure: ExternalFileIrpPreEntryFailure,
+    ) -> Result<RetainedExternalFileIrp, ExternalFileIrpRejection<PreparedExternalFileIrp>> {
+        let status = (|| {
+            self.validate_detached_owner(&prepared.0)?;
+            let record = self.irp(prepared.irp_id()).ok_or(NtStatus::INVALID_HANDLE)?;
+            match failure {
+                ExternalFileIrpPreEntryFailure::Cancelled
+                    if record.detached_file_intent.cancel == ExternalFileIrpCancelPhase::Queued =>
+                {
+                    Ok(NtStatus::CANCELLED)
+                }
+                ExternalFileIrpPreEntryFailure::ManagerRouteUnavailable => {
+                    if self.driver(prepared.0.route.driver_id)
+                        .is_some_and(|driver| driver.flags.contains(crate::DriverFlags::FAULTED))
+                    {
+                        Ok(NtStatus::DEVICE_NOT_CONNECTED)
+                    } else {
+                        self.validate_detached_route(&prepared.0)
+                            .err()
+                            .ok_or(NtStatus::INVALID_PARAMETER)
+                    }
+                }
+                _ => Err(NtStatus::INVALID_PARAMETER),
+            }
+        })();
+        let status = match status {
+            Ok(status) => status,
+            Err(status) => return Err(ExternalFileIrpRejection { status, owner: prepared }),
+        };
+        self.publish_prepared_external_file_irp_no_backend_failure(prepared, status)
+    }
+
+    /// Convert a transport-certified refusal into a canonical terminal for a parked READ.
+    /// The receipt's status came from `finish_external_file_irp`, never from this caller.
+    pub fn complete_external_file_irp_not_entered(
+        &mut self,
+        receipt: ExternalFileIrpNoEntryReceipt,
+    ) -> Result<RetainedExternalFileIrp, ExternalFileIrpRejection<ExternalFileIrpNoEntryReceipt>> {
+        let ExternalFileIrpNoEntryReceipt { status, prepared } = receipt;
+        match self.publish_prepared_external_file_irp_no_backend_failure(prepared, status) {
+            Ok(retained) => Ok(retained),
+            Err(rejection) => {
+                let (failure, prepared) = rejection.into_parts();
+                Err(ExternalFileIrpRejection {
+                    status: failure,
+                    owner: ExternalFileIrpNoEntryReceipt { status, prepared },
+                })
+            }
+        }
+    }
+
+    fn publish_prepared_external_file_irp_no_backend_failure(
+        &mut self,
+        prepared: PreparedExternalFileIrp,
+        status: NtStatus,
+    ) -> Result<RetainedExternalFileIrp, ExternalFileIrpRejection<PreparedExternalFileIrp>> {
+        let valid = (|| {
+            self.validate_detached_owner(&prepared.0)?;
+            let record = self.irp(prepared.irp_id()).ok_or(NtStatus::INVALID_HANDLE)?;
+            if !status.is_error()
+                || record.state != IrpState::Initialized
+                || prepared.0.projection.major != major::IRP_MJ_READ
+                || self.file_irp_projection(prepared.irp_id())? != prepared.0.projection
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            Ok(())
+        })();
+        if let Err(status) = valid {
+            return Err(ExternalFileIrpRejection { status, owner: prepared });
+        }
+        if self.completed_irps.try_reserve(1).is_err() {
+            return Err(ExternalFileIrpRejection {
+                status: NtStatus::INSUFFICIENT_RESOURCES,
+                owner: prepared,
+            });
+        }
+        let id = prepared.irp_id();
+        let record = self.irp_mut(id).expect("validated detached IRP");
+        record.status = status;
+        record.information = 0;
+        record.completion_file_context = None;
+        record.completion_origin = Some(IrpCompletionOrigin::NoBackendEntry);
+        assert!(record.transition(IrpState::Completing));
+        assert!(record.transition(IrpState::Completed));
+        self.completed_irps.push_back(id);
+        Ok(RetainedExternalFileIrp { owner: prepared.0, indeterminate: false })
     }
 
     pub fn discard_prepared_external_file_irp(
@@ -914,8 +1181,14 @@ impl<P: ObjectManagerPort> IoManager<P> {
             let completed = self
                 .completed_irp_snapshot(retained.irp_id())
                 .ok_or(NtStatus::PENDING)?;
+            if completed.completion_origin == IrpCompletionOrigin::NoBackendEntry
+                && capture != ExternalFileIrpOutputCapture::Information
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
             if !self.completed_irps.contains(&completed.id)
-                || completed.completion_origin != IrpCompletionOrigin::Driver
+                || !matches!(completed.completion_origin,
+                    IrpCompletionOrigin::Driver | IrpCompletionOrigin::NoBackendEntry)
             {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
@@ -953,6 +1226,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
                     .as_ref()
                     != Some(&invocation.completion)
                     || !self.completed_irps.contains(&invocation.completion.id)
+                    || invocation.completion.completion_origin != IrpCompletionOrigin::Driver
                 {
                     return Err(NtStatus::INVALID_PARAMETER);
                 }
@@ -985,6 +1259,47 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 backend_acknowledged: true,
             },
             owner.buffers,
+        ))
+    }
+
+    /// Retire a failed preparation without issuing an ACK to a backend that was never entered.
+    pub fn retire_external_file_irp_completion_without_backend(
+        &mut self,
+        completion: ExternalFileIrpCompletionInvocation,
+    ) -> Result<
+        (ExternalFileIrpTerminalReceipt, ExternalFileIrpBuffers),
+        ExternalFileIrpRejection<ExternalFileIrpCompletionInvocation>,
+    > {
+        let valid = self.validate_detached_owner(&completion.owner).and_then(|_| {
+            if self.completed_irp_snapshot(completion.completion.id).as_ref()
+                != Some(&completion.completion)
+                || !self.completed_irps.contains(&completion.completion.id)
+                || completion.completion.completion_origin != IrpCompletionOrigin::NoBackendEntry
+                || !completion.capture_complete()
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            Ok(())
+        });
+        if let Err(status) = valid {
+            return Err(ExternalFileIrpRejection { status, owner: completion });
+        }
+        let id = completion.completion.id;
+        let index = self.completed_irps.iter().position(|current| *current == id)
+            .expect("validated no-backend completion queue");
+        self.completed_irps.remove(index);
+        self.irp_mut(id).unwrap().detached_file_owner = false;
+        self.free_irp(id).expect("validated no-backend retirement");
+        if let Some(file) = completion.completion.file_id {
+            self.schedule_deferred_file_close(file);
+        }
+        Ok((
+            ExternalFileIrpTerminalReceipt {
+                manager: completion.owner.manager,
+                completion: completion.completion,
+                backend_acknowledged: false,
+            },
+            completion.owner.buffers,
         ))
     }
 

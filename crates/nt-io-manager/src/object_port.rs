@@ -41,6 +41,15 @@ pub trait ObjectManagerPort {
         owner_local_id: u64,
     ) -> Result<ObjectId, NtStatus>;
 
+    /// Publish one internal name for an exact unnamed Device object so PnP interface links
+    /// can resolve it. A port without an unnamed OM object may create it at this point.
+    fn publish_device_endpoint(
+        &mut self,
+        object: ObjectId,
+        endpoint: &NtPath,
+        owner_local_id: u64,
+    ) -> Result<ObjectId, NtStatus>;
+
     /// Delete a `Device` object during `IoDeleteDevice`/driver unload.
     fn delete_device_object(
         &mut self,
@@ -137,6 +146,8 @@ pub struct MockObjectPort {
     next_reference: u64,
     #[cfg(test)]
     fail_next_file_reference: bool,
+    #[cfg(test)]
+    fail_next_device_delete: bool,
 }
 
 impl MockObjectPort {
@@ -151,6 +162,11 @@ impl MockObjectPort {
     #[cfg(test)]
     pub fn fail_next_file_reference(&mut self) {
         self.fail_next_file_reference = true;
+    }
+
+    #[cfg(test)]
+    pub fn fail_next_device_delete(&mut self) {
+        self.fail_next_device_delete = true;
     }
 
     #[cfg(test)]
@@ -237,11 +253,31 @@ impl ObjectManagerPort for MockObjectPort {
         Ok(id)
     }
 
+    fn publish_device_endpoint(
+        &mut self,
+        object: ObjectId,
+        endpoint: &NtPath,
+        _owner_local_id: u64,
+    ) -> Result<ObjectId, NtStatus> {
+        if object == ObjectId::NULL || !self.device_ids.contains(&object) {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        if self.devices.iter().any(|(path, _)| path == endpoint) {
+            return Err(NtStatus::OBJECT_NAME_COLLISION);
+        }
+        self.devices.push((endpoint.clone(), object));
+        Ok(object)
+    }
+
     fn delete_device_object(
         &mut self,
         object: ObjectId,
         name: Option<&NtPath>,
     ) -> Result<(), NtStatus> {
+        #[cfg(test)]
+        if core::mem::take(&mut self.fail_next_device_delete) {
+            return Err(NtStatus::UNSUCCESSFUL);
+        }
         let before_ids = self.device_ids.len();
         self.device_ids.retain(|id| id != &object);
         if let Some(name) = name {
@@ -393,7 +429,7 @@ mod library {
     use alloc::vec::Vec;
 
     use super::ObjectManagerPort;
-    use nt_object_manager::{ClientKind, ComponentId, ObjectManager, ObjectRef};
+    use nt_object_manager::{ClientKind, ComponentId, ObjectBody, ObjectManager, ObjectRef};
     use nt_status::NtStatus;
     use nt_types::{
         AccessMask, AccessMode, CaseSensitivity, ClientId, HandleValue, NtPath, ObjAttrFlags,
@@ -476,12 +512,36 @@ mod library {
             name: Option<&NtPath>,
             owner_local_id: u64,
         ) -> Result<ObjectId, NtStatus> {
-            let name = name.ok_or(NtStatus::INVALID_PARAMETER)?; // named devices only
+            let Some(name) = name else {
+                // As in the native port, an unnamed WDM Device has no namespace object
+                // until an interface publishes its exact internal endpoint.
+                return Ok(ObjectId::NULL);
+            };
             let (parent, leaf) = self.split(name)?;
             let r = self
                 .om
                 .create_device(&parent, &leaf, self.component, owner_local_id, true)?;
             Ok(r.id())
+        }
+
+        fn publish_device_endpoint(
+            &mut self,
+            object: ObjectId,
+            endpoint: &NtPath,
+            owner_local_id: u64,
+        ) -> Result<ObjectId, NtStatus> {
+            let (parent, leaf) = self.split(endpoint)?;
+            if object == ObjectId::NULL {
+                let published = self.om.create_device(
+                    &parent, &leaf, self.component, owner_local_id, true)?;
+                return Ok(published.id());
+            }
+            let existing = self.om.reference_by_id(object)?;
+            if !existing.with_body(|body| matches!(body, ObjectBody::Device(device)
+                if device.owner == self.component && device.owner_local_id == owner_local_id))
+            { return Err(NtStatus::INVALID_HANDLE); }
+            self.om.insert_named_object(&parent, &leaf, &existing, true)?;
+            Ok(object)
         }
 
         fn delete_device_object(

@@ -144,6 +144,116 @@ pub struct PreparedTerminal {
     pub inline: bool,
 }
 
+/// The retained source Work row, including its physical provider route and allocation epoch.
+/// A Vec slot or packet address alone can be reused and is not a child identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NestedSourceWorkKey<R, D> {
+    pub route: R,
+    pub dispatch: D,
+    pub reply: u64,
+    pub nonce: u64,
+    pub token: u64,
+    pub source_address: u64,
+    pub source_ticket: u64,
+    pub source_generation: u64,
+}
+
+impl<R, D> NestedSourceWorkKey<R, D> {
+    pub fn new(
+        route: R, dispatch: D, reply: u64, nonce: u64, token: u64,
+        source_address: u64, source_ticket: u64, source_generation: u64,
+    ) -> Option<Self> {
+        if reply == 0 || nonce == 0 || token == 0 || source_address == 0
+            || source_ticket == 0 || source_generation == 0
+        { return None; }
+        Some(Self { route, dispatch, reply, nonce, token, source_address,
+            source_ticket, source_generation })
+    }
+}
+
+/// Move-only preselection. The native owner must redrive this exact row after parking its parent.
+#[must_use = "redrive only the exact retained source child or keep the selection"]
+pub struct NestedSourceSelection<R, D> {
+    key: NestedSourceWorkKey<R, D>,
+}
+
+impl<R: Copy + Eq, D: Copy + Eq> NestedSourceSelection<R, D> {
+    pub fn new(key: NestedSourceWorkKey<R, D>) -> Self { Self { key } }
+    pub fn key(&self) -> NestedSourceWorkKey<R, D> { self.key }
+    pub fn matches(&self, actual: NestedSourceWorkKey<R, D>) -> bool { self.key == actual }
+}
+
+/// This describes only native dispatch entry. `ReturnedSuccessNeedsAck` is not a terminal
+/// completion receipt; the source owner must validate the exact packet ACK separately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NestedSourceDispatchEffect {
+    NotEntered,
+    ReturnedNotReady,
+    ReturnedSuccessNeedsAck,
+    Indeterminate,
+}
+
+impl NestedSourceDispatchEffect {
+    pub fn from_returned(status: i32) -> Self {
+        match status {
+            TERMINAL_NOT_READY => Self::ReturnedNotReady,
+            0 => Self::ReturnedSuccessNeedsAck,
+            _ => Self::Indeterminate,
+        }
+    }
+}
+
+/// A source terminal pump return. A retained physical owner has no status that the work
+/// owner may classify as retryable; its exact ticket must move to the work record.
+#[derive(Debug)]
+pub enum SourceTerminalDispatch<Ticket> {
+    NotEntered(i32),
+    Indeterminate(i32),
+    Returned(i32),
+    Retained(Ticket),
+}
+
+impl<Ticket> SourceTerminalDispatch<Ticket> {
+    pub fn into_effect(self) -> Result<NestedSourceDispatchEffect, Ticket> {
+        match self {
+            Self::NotEntered(_) => Ok(NestedSourceDispatchEffect::NotEntered),
+            Self::Indeterminate(_) => Ok(NestedSourceDispatchEffect::Indeterminate),
+            Self::Returned(status) => Ok(NestedSourceDispatchEffect::from_returned(status)),
+            Self::Retained(ticket) => Err(ticket),
+        }
+    }
+}
+
+/// The source Work owns an uncertain physical return in its preparation state. Once retained,
+/// neither dispatch retry nor packet retirement can run, and a second return cannot replace it.
+pub enum TerminalPreparePhase<Owner> {
+    Publish,
+    Dispatch,
+    ReadAck,
+    Published,
+    Indeterminate,
+    Retained(Owner),
+}
+
+impl<Owner> TerminalPreparePhase<Owner> {
+    pub fn is_publish(&self) -> bool { matches!(self, Self::Publish) }
+    pub fn needs_lane(&self) -> bool { matches!(self, Self::Dispatch) }
+    pub fn is_read_ack(&self) -> bool { matches!(self, Self::ReadAck) }
+    pub fn can_retire(&self) -> bool { matches!(self, Self::Published) }
+    pub fn is_indeterminate(&self) -> bool {
+        matches!(self, Self::Indeterminate | Self::Retained(_))
+    }
+    pub fn retained(&self) -> Option<&Owner> {
+        match self { Self::Retained(owner) => Some(owner), _ => None }
+    }
+    pub fn progress_code(&self) -> u64 {
+        match self {
+            Self::Publish => 0, Self::Dispatch => 1, Self::ReadAck => 2,
+            Self::Published => 3, Self::Indeterminate => 4, Self::Retained(_) => 5,
+        }
+    }
+}
+
 impl PreparedTerminal {
     pub fn matches(
         self,
@@ -219,6 +329,57 @@ mod tests {
         );
         assert!(!TerminalPublication::Discarded.can_follow(Some(TerminalPublication::Published)));
         assert_eq!(TerminalPublication::decode(2, 0), None);
+    }
+
+    #[test]
+    fn nested_source_selection_keeps_exact_child_across_cursor_changes() {
+        let first = NestedSourceWorkKey::new(11u64, 21u64, 31, 41, 51, 61, 71, 81).unwrap();
+        let reused_row = NestedSourceWorkKey::new(11u64, 21u64, 31, 41, 51, 61, 71, 82).unwrap();
+        let other_child = NestedSourceWorkKey::new(12u64, 22u64, 32, 42, 52, 62, 72, 83).unwrap();
+        let selected = NestedSourceSelection::new(first);
+        assert!(selected.matches(first));
+        assert!(!selected.matches(reused_row));
+        assert!(!selected.matches(other_child));
+        assert_eq!(selected.key(), first);
+    }
+
+    #[test]
+    fn nested_source_dispatch_distinguishes_no_entry_returned_retry_and_uncertain() {
+        assert_eq!(NestedSourceDispatchEffect::from_returned(TERMINAL_NOT_READY),
+            NestedSourceDispatchEffect::ReturnedNotReady);
+        assert_eq!(NestedSourceDispatchEffect::from_returned(0),
+            NestedSourceDispatchEffect::ReturnedSuccessNeedsAck);
+        assert_eq!(NestedSourceDispatchEffect::from_returned(0xc000_0001u32 as i32),
+            NestedSourceDispatchEffect::Indeterminate);
+        assert_ne!(NestedSourceDispatchEffect::NotEntered,
+            NestedSourceDispatchEffect::ReturnedNotReady);
+        assert!(NestedSourceWorkKey::new(11u64, 21u64, 0, 41, 51, 61, 71, 81).is_none());
+    }
+
+    #[test]
+    fn retained_source_dispatch_moves_exact_owner_without_retry_classification() {
+        #[derive(Debug)]
+        struct Ticket { attempt: u64 }
+        let ticket = Ticket { attempt: 37 };
+        let observed = SourceTerminalDispatch::Retained(ticket);
+        let retained = observed.into_effect().expect_err("retained pump has no status effect");
+        assert_eq!(retained.attempt, 37);
+        assert_eq!(SourceTerminalDispatch::<Ticket>::NotEntered(0xc000_0001u32 as i32)
+            .into_effect().unwrap(), NestedSourceDispatchEffect::NotEntered);
+        assert_eq!(SourceTerminalDispatch::<Ticket>::Returned(TERMINAL_NOT_READY)
+            .into_effect().unwrap(), NestedSourceDispatchEffect::ReturnedNotReady);
+    }
+
+    #[test]
+    fn source_work_retains_uncertain_return_and_blocks_retry_and_retirement() {
+        let owner = alloc::boxed::Box::new(0xabcdu64);
+        let address = &*owner as *const u64;
+        let phase = TerminalPreparePhase::Retained(owner);
+        assert!(phase.is_indeterminate());
+        assert!(!phase.needs_lane());
+        assert!(!phase.can_retire());
+        assert!(core::ptr::eq(&**phase.retained().unwrap(), address));
+        assert!(core::ptr::eq(&**phase.retained().unwrap(), address));
     }
 
     #[test]

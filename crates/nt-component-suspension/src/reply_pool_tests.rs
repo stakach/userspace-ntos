@@ -1,5 +1,5 @@
 use super::*;
-use crate::{IngressReceiveDisposition, IngressReplyObservation, LaneBinding};
+use crate::{IngressExecutionOwner, IngressReceiveDisposition, IngressReplyObservation, LaneBinding};
 
 type Lanes = ComponentSuspensionLanes<(), (), ()>;
 
@@ -25,6 +25,32 @@ fn setup() -> (
         lanes,
         peers,
         route,
+        IngressReceiver::new(20, 40, 2).unwrap(),
+        IngressReplyPool::new(20, 1).unwrap(),
+    )
+}
+
+fn setup_shared() -> (
+    Lanes,
+    PeerRegistry,
+    crate::peer_registry::PeerRoute,
+    IngressReceiver<u64>,
+    IngressReplyPool<u64>,
+) {
+    let mut lanes = Lanes::new(2, 2);
+    let mut peers = PeerRegistry::new(20, 2);
+    let (lane, mut registration) = lanes.allocate_shared_staged(
+        &mut peers, 1, 2, LaneBinding {
+            executor_id: 10,
+            receive_endpoint: 20,
+            reply_object: 30,
+        },
+    ).unwrap();
+    let route = peers.publish_lane(&mut registration, 1, 2, &lanes).unwrap();
+    lanes.begin_startup(lane, 30, |_, _| Ok::<_, u8>(ReplyBindingObservation::Free)).unwrap();
+    lanes.complete_startup(lane, 30, |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundToTarget)).unwrap();
+    (
+        lanes, peers, route,
         IngressReceiver::new(20, 40, 2).unwrap(),
         IngressReplyPool::new(20, 1).unwrap(),
     )
@@ -375,6 +401,88 @@ fn failed_handoff_restores_replacement_and_success_transfers_once() {
     assert!(pool
         .retain(&mut owner, &lanes, &mut peers, route.badge(), free, bound)
         .is_err());
+}
+
+#[test]
+fn held_query_refusal_retries_only_with_the_original_execution_and_reply_owners() {
+    use crate::ReservedReceivePhase;
+
+    let (mut lanes, mut peers, route, mut owner, mut pool) = setup_shared();
+    pool.insert(ComponentIngress::new(20, 41).unwrap(), &owner, &lanes, free)
+        .ok().unwrap();
+    lanes.begin_dispatch(route.identity().lane, 30).unwrap();
+    let dispatch = lanes.active_dispatch_identity(route.identity().lane).unwrap().unwrap();
+    let execution = IngressExecutionOwner::Dispatch(dispatch);
+    owner.begin_receive_for_owner(&lanes, execution).unwrap();
+    owner.capture(123).unwrap();
+    owner.resolve(IngressReceiveDisposition::Call).unwrap();
+
+    let refusal = pool.retain(
+        &mut owner, &lanes, &mut peers, route.badge(), free,
+        |_, _| Err(7u8),
+    ).unwrap_err();
+    assert_eq!(owner.phase(), Some(ReservedReceivePhase::Held));
+    assert_eq!(owner.message(), Some(&123));
+    assert_eq!(owner.reply(), 40);
+    assert!(pool.excludes_reply(41));
+    assert_eq!(peers.state(route).unwrap().1, 0);
+
+    // This is only eligibility for another read-only query, not physical binding authority.
+    // A copied numeric Reply, foreign route, new epoch, or endpoint must not grant eligibility.
+    assert!(pool.held_query_retry_eligible(&owner, &lanes, execution, route, 40, 41, &refusal));
+    let (_, mut foreign_registration) = lanes.allocate_shared_staged(
+        &mut peers, 9, 10, LaneBinding {
+            executor_id: 11,
+            receive_endpoint: 20,
+            reply_object: 31,
+        },
+    ).unwrap();
+    let foreign_route = peers.publish_lane(&mut foreign_registration, 9, 10, &lanes).unwrap();
+    assert!(!pool.held_query_retry_eligible(
+        &owner, &lanes, execution, foreign_route, 40, 41, &refusal,
+    ));
+    assert!(!pool.held_query_retry_eligible(
+        &owner, &lanes, IngressExecutionOwner::Idle, route, 40, 41, &refusal,
+    ));
+    assert!(!pool.held_query_retry_eligible(&owner, &lanes, execution, route, 41, 41, &refusal));
+    assert!(!pool.held_query_retry_eligible(&owner, &lanes, execution, route, 40, 42, &refusal));
+    let mut foreign_endpoint = IngressReceiver::<u64>::new(21, 40, 2).unwrap();
+    foreign_endpoint.begin_receive_for_owner(&lanes, execution).unwrap();
+    foreign_endpoint.capture(123).unwrap();
+    foreign_endpoint.resolve(IngressReceiveDisposition::Call).unwrap();
+    assert_eq!(foreign_endpoint.phase(), Some(ReservedReceivePhase::Held));
+    assert!(!pool.held_query_retry_eligible(
+        &foreign_endpoint, &lanes, execution, route, 40, 41, &refusal,
+    ));
+
+    pool.retain(&mut owner, &lanes, &mut peers, route.badge(), free, bound).unwrap();
+    assert_eq!(owner.phase(), None);
+    assert_eq!(owner.reply(), 41);
+    assert!(!pool.held_query_retry_eligible(&owner, &lanes, execution, route, 40, 41, &refusal));
+    assert_eq!(*owner.checkout(route).unwrap().call().message(), 123);
+}
+
+#[test]
+fn held_binding_mismatch_does_not_authorize_query_retry() {
+    let (mut lanes, mut peers, route, mut owner, mut pool) = setup_shared();
+    pool.insert(ComponentIngress::new(20, 41).unwrap(), &owner, &lanes, free)
+        .ok().unwrap();
+    lanes.begin_dispatch(route.identity().lane, 30).unwrap();
+    let dispatch = lanes.active_dispatch_identity(route.identity().lane).unwrap().unwrap();
+    let execution = IngressExecutionOwner::Dispatch(dispatch);
+    owner.begin_receive_for_owner(&lanes, execution).unwrap();
+    owner.capture(123).unwrap();
+    owner.resolve(IngressReceiveDisposition::Call).unwrap();
+
+    let refusal = pool.retain(
+        &mut owner, &lanes, &mut peers, route.badge(), free,
+        |_, _| Ok::<_, u8>(ReplyBindingObservation::BoundElsewhere),
+    ).unwrap_err();
+    assert!(!pool.held_query_retry_eligible(&owner, &lanes, execution, route, 40, 41, &refusal));
+    assert_eq!(owner.message(), Some(&123));
+    assert_eq!(owner.reply(), 40);
+    assert!(pool.excludes_reply(41));
+    assert_eq!(peers.state(route).unwrap().1, 0);
 }
 
 #[test]

@@ -568,6 +568,15 @@ pub fn split_enum_instance_path(path: &str) -> (&str, &str) {
     }
 }
 
+/// An imported Enum entry authorizes a synthetic root PDO only when its enumerator is ROOT.
+/// Children of physical buses retain their instance IDs across boots, but receive fresh PDOs
+/// from the bus driver; an old registry entry does not authorize inventing one.
+pub fn is_root_enumerated_instance(path: &str) -> bool {
+    let Some((enumerator, rest)) = path.split_once('\\') else { return false; };
+    let Some((device, instance)) = rest.rsplit_once('\\') else { return false; };
+    enumerator.eq_ignore_ascii_case("ROOT") && !device.is_empty() && !instance.is_empty()
+}
+
 /// A single NUL-terminated wide string.
 fn wide_z(s: &str) -> Vec<u16> {
     let mut v: Vec<u16> = s.encode_utf16().collect();
@@ -810,6 +819,17 @@ mod tests {
             split_enum_instance_path("LEGACY_DEVICE"),
             ("LEGACY_DEVICE", "")
         );
+    }
+
+    #[test]
+    fn only_root_enumerator_may_claim_an_unreported_root_pdo() {
+        assert!(is_root_enumerated_instance(r"ROOT\BASICDISPLAY\0000"));
+        assert!(is_root_enumerated_instance(r"root\DEVICE\0001"));
+        assert!(!is_root_enumerated_instance(r"SCSI\Disk&Ven_Test\000000"));
+        assert!(!is_root_enumerated_instance(r"PCI\VEN_8086&DEV_2922\02"));
+        assert!(!is_root_enumerated_instance(r"ACPI\PNP0303\0"));
+        assert!(!is_root_enumerated_instance(r"ROOTLESS\DEVICE\0001"));
+        assert!(!is_root_enumerated_instance("ROOT"));
     }
 
     #[test]

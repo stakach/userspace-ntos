@@ -55,6 +55,14 @@ struct Wait {
     semantic_retired: bool,
 }
 
+impl Wait {
+    fn resume_eligible(&self) -> bool {
+        self.kind == WaitKind::RetainedSemantic
+            && self.autonomous
+            && matches!(self.phase, WaitPhase::Acknowledged | WaitPhase::Resumed)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ServiceCompletion {
     Status(i32),
@@ -72,11 +80,14 @@ enum ServiceCompletion {
         handle: u64,
         disposition: u64,
     },
+    Directory { status: i32 },
     SectionCreate {
         status: i32,
         token: u64,
         handle: u64,
     },
+    SectionMap { status: i32, base: u64, size: u64 },
+    GdiImage { status: i32, module: u64 },
 }
 
 impl ServiceCompletion {
@@ -96,15 +107,44 @@ impl ServiceCompletion {
                 handle,
                 disposition,
             } => (4, [status as u32 as u64, handle, disposition, 0]),
+            Self::Directory { status } => (4, [status as u32 as u64, 0, 0, 0]),
             Self::SectionCreate {
                 status,
                 token,
                 handle,
             } => (4, [status as u32 as u64, token, handle, 0]),
+            Self::SectionMap { status, base, size } =>
+                (4, [status as u32 as u64, base, size, 0]),
+            Self::GdiImage { status, module } => {
+                (2, [status as u32 as u64, if status == 0 { module } else { 0 }, 0, 0])
+            }
         }
     }
 }
 static mut WAITS: Vec<Wait> = Vec::new();
+
+/// Read-only diagnostic for an exact retained forward Reply; no wait is claimed or resumed.
+pub(crate) unsafe fn hosted_forward_wait_probe(
+    route: PeerRoute, dispatch: LaneDispatchIdentity, reply: u64, token: u64,
+) -> Option<(u64, u64, u64)> {
+    let phase = (&*core::ptr::addr_of!(WAITS)).iter().find(|wait| {
+        wait.route == route && wait.dispatch == dispatch
+            && wait.reply == reply && wait.token == token
+            && matches!(wait.completion, Some(ServiceCompletion::HostedForward { .. }))
+    })?.phase;
+    let phase = match phase {
+        WaitPhase::Entering => 0, WaitPhase::Parked => 1,
+        WaitPhase::ReplyEntered => 2, WaitPhase::Acknowledged => 3,
+        WaitPhase::Resumed => 4, WaitPhase::CompletedAcknowledged => 5,
+        WaitPhase::StoppedAcknowledged => 6, WaitPhase::Cancelled => 7,
+        WaitPhase::Finished => 8,
+    };
+    let resumable = lanes().can_resume_external(route.identity().lane, reply, token)
+        .map(u64::from).unwrap_or(2);
+    let next_call = next_message(route).map(|message| u64::from(message.is_some()))
+        .unwrap_or(2);
+    Some((phase, resumable, next_call))
+}
 
 unsafe fn wait_exact(
     route: PeerRoute,
@@ -294,6 +334,47 @@ pub(crate) unsafe fn wake_section_create_service(
             token: if status == 0 { token } else { 0 },
             handle: if status == 0 { handle } else { 0 },
         },
+    )
+}
+
+pub(crate) unsafe fn wake_section_map_service(
+    route: PeerRoute, dispatch: LaneDispatchIdentity, reply: u64, token: u64,
+    status: i32, base: u64, size: u64,
+) -> Result<(), Error> {
+    wake_with_completion(route, dispatch, reply, token,
+        ServiceCompletion::SectionMap {
+            status, base: if status == 0 { base } else { 0 },
+            size: if status == 0 { size } else { 0 },
+        })
+}
+
+pub(crate) unsafe fn wake_gdi_image_service(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+    status: i32,
+    module: u64,
+) -> Result<(), Error> {
+    wake_with_completion(
+        route, dispatch, reply, token,
+        ServiceCompletion::GdiImage { status, module },
+    )
+}
+
+pub(crate) unsafe fn wake_directory_service(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+    status: i32,
+) -> Result<(), Error> {
+    wake_with_completion(
+        route,
+        dispatch,
+        reply,
+        token,
+        ServiceCompletion::Directory { status },
     )
 }
 
@@ -565,17 +646,12 @@ unsafe fn wake_service_inner(
 /// Complete one acknowledged autonomous semantic service by its retained route and token.
 /// A busy lane remains owned and is retried by the normal timer source.
 pub(crate) unsafe fn resume_acknowledged_retained_services() -> Result<bool, Error> {
-    let now = crate::monotonic_time_100ns();
-    let route = (&*core::ptr::addr_of!(WAITS))
-        .iter()
-        .find(|wait| {
-            wait.kind == WaitKind::RetainedSemantic
-                && wait.autonomous
-                && matches!(wait.phase, WaitPhase::Acknowledged | WaitPhase::Resumed)
-                && wait.resume_retry_at <= now
-        })
-        .map(|wait| wait.route);
-    let Some(route) = route else {
+    let Some((route, now)) = nt_time::first_due(
+        (&*core::ptr::addr_of!(WAITS)).iter().map(|wait| {
+            (wait.resume_eligible().then_some(wait.resume_retry_at), wait.route)
+        }),
+        crate::monotonic_time_100ns,
+    ) else {
         return Ok(false);
     };
     match resume_service(route) {
@@ -585,8 +661,7 @@ pub(crate) unsafe fn resume_acknowledged_retained_services() -> Result<bool, Err
             // The external token is already retired. Retain the acknowledged Call and retry
             // only its physical completion after the query becomes available.
             if !(&*core::ptr::addr_of!(WAITS)).iter().any(|wait| {
-                wait.kind == WaitKind::RetainedSemantic
-                    && wait.autonomous
+                wait.resume_eligible()
                     && wait.route == route
                     && wait.phase == WaitPhase::Resumed
             }) {
@@ -596,12 +671,7 @@ pub(crate) unsafe fn resume_acknowledged_retained_services() -> Result<bool, Err
     }
     let wait = (&mut *core::ptr::addr_of_mut!(WAITS))
         .iter_mut()
-        .find(|wait| {
-            wait.kind == WaitKind::RetainedSemantic
-                && wait.autonomous
-                && wait.route == route
-                && matches!(wait.phase, WaitPhase::Acknowledged | WaitPhase::Resumed)
-        })
+        .find(|wait| wait.resume_eligible() && wait.route == route)
         .ok_or(Error::Retirement)?;
     wait.resume_retry_at = now.saturating_add(1_000_000);
     Ok(false)
@@ -610,11 +680,7 @@ pub(crate) unsafe fn resume_acknowledged_retained_services() -> Result<bool, Err
 pub(crate) unsafe fn retained_service_resume_next_deadline() -> Option<u64> {
     (&*core::ptr::addr_of!(WAITS))
         .iter()
-        .filter(|wait| {
-            wait.kind == WaitKind::RetainedSemantic
-                && wait.autonomous
-                && matches!(wait.phase, WaitPhase::Acknowledged | WaitPhase::Resumed)
-        })
+        .filter(|wait| wait.resume_eligible())
         .map(|wait| wait.resume_retry_at)
         .min()
 }

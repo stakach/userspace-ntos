@@ -68,6 +68,26 @@ fn success(expression: &syn::Expr) -> bool {
                     if matches!(value.base10_parse::<u64>(), Ok(0)))))
 }
 
+fn exact_direct_read_guard(expression: &syn::Expr) -> bool {
+    let syn::Expr::Binary(and) = expression else { return false };
+    if !matches!(and.op, syn::BinOp::And(_)) { return false; }
+    let syn::Expr::Binary(status) = &*and.left else { return false };
+    let syn::Expr::Binary(information) = &*and.right else { return false };
+    matches!(status.op, syn::BinOp::Eq(_))
+        && matches!(&*status.left, syn::Expr::MethodCall(raw)
+            if raw.method == "raw" && matches!(&*raw.receiver, syn::Expr::Path(path)
+                if named_path(&path.path, "status")))
+        && matches!(&*status.right, syn::Expr::Lit(lit)
+            if matches!(&lit.lit, syn::Lit::Int(value)
+                if matches!(value.base10_parse::<u64>(), Ok(0))))
+        && matches!(information.op, syn::BinOp::Eq(_))
+        && matches!(&*information.left, syn::Expr::Path(path)
+            if named_path(&path.path, "information"))
+        && matches!(&*information.right, syn::Expr::Cast(cast)
+            if matches!(&*cast.expr, syn::Expr::Path(path)
+                if named_path(&path.path, "length")))
+}
+
 fn assert_cancel_guard(expression: &syn::Expr) {
     struct Guard { guarded: bool, notes: usize }
     impl<'a> Visit<'a> for Guard {
@@ -99,8 +119,11 @@ fn direct_snapshot_progress_follows_full_successful_append_only() {
             let mut calls = Calls::default();
             calls.visit_expr(&arm.body);
             if calls.sequence.iter().any(|name| name == "extend_from_slice") {
-                assert!(arm.guard.is_some(), "the direct append requires the exact successful length guard");
-                assert_eq!(calls.sequence, ["extend_from_slice", "note"],
+                assert!(arm.guard.as_ref().is_some_and(|(_, guard)| exact_direct_read_guard(guard)),
+                    "the direct append requires status success and the exact requested length");
+                let append = calls.sequence.iter().position(|name| name == "extend_from_slice").unwrap();
+                let note = calls.sequence.iter().position(|name| name == "note").unwrap();
+                assert!(append < note && calls.sequence.iter().filter(|name| *name == "note").count() == 1,
                     "only accepted full snapshot bytes advance progress after append");
                 assert_cancel_guard(&arm.body);
                 self.found = true;

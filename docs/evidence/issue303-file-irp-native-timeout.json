@@ -1,0 +1,23 @@
+{
+  "issue": 303,
+  "profile": "production",
+  "status": "native boot progressed; Explorer gate did not complete within the bound",
+  "source_commit": "d3ede2a7",
+  "microkernel_commit": "0a968a4",
+  "boot_bound_seconds": 2400,
+  "launcher_exit": 124,
+  "evidence": {
+    "raw_log": ".tmp/run-headless-20261016-021111.log",
+    "archived_log": "docs/evidence/issue303-file-irp-native-timeout.log.gz"
+  },
+  "sha256": {
+    "raw_log": "a3d4f60a219a7abbb606453ee1fb87875a4d7cea0b3adec2075f6abbeea4e1c1",
+    "archived_log": "f1de55563d212d9d2a6e0d74b90c86978c8a4da4202313a4e136bdfa63176639"
+  },
+  "observations": [
+    "The launcher terminated the sole QEMU process at the configured deadline; no QEMU or timeout wrapper remained afterward.",
+    "The final periodic census was #78 at 2404178 guest milliseconds with 357244 events and heap high-water 56103832 bytes below the 67108864-byte cap.",
+    "The guest logged 1106 hosted File release transitions and 920 registry checkpoint probes; these counts establish path activity, not exact completion of every File or IRP graph member.",
+    "No terminal provider bugcheck, executive summary, or PASS exec_explorer_shell_chrome_painted marker appeared. The boot is not desktop acceptance evidence."
+  ]
+}

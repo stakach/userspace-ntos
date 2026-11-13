@@ -166,6 +166,11 @@ pub mod port_flag {
     pub const ALLOW_DUP_OBJECT: u32 = 0x8_0000;
 }
 
+/// `NtAlpcConnectPort` flags supported by the owned native adapter.
+pub mod connect_flag {
+    pub const SYNC_CONNECTION: u32 = 0x0002_0000;
+}
+
 /// `PORT_MESSAGE.Type` values (shared with LPC).
 pub mod msg_type {
     pub const REQUEST: u16 = 1;
@@ -203,10 +208,29 @@ pub mod opcode {
     // section's shared backing store (the ALPC big-data / WOW64 mechanism).
     pub const ALPC_OP_WRITE_SECTION_VIEW: u16 = 0x230c;
     pub const ALPC_OP_READ_SECTION_VIEW: u16 = 0x230d;
+    /// Look up the recorded result of one checked port-create invocation.
+    pub const ALPC_OP_LOOKUP_CREATE_PORT: u16 = 0x230e;
+    /// Close only the result of an exact checked create after caller copyout failed.
+    pub const ALPC_OP_CLOSE_CREATED_PORT: u16 = 0x230f;
+    /// Retire an exact terminal checked send/receive record after the native
+    /// executive has retained its output and before it replies to the caller.
+    pub const ALPC_OP_ACK_SEND_RECEIVE: u16 = 0x2310;
+    /// Exact cleanup of a checked Connect/Accept communication endpoint.
+    pub const ALPC_OP_CLOSE_LATER_PORT: u16 = 0x2311;
+    /// Retire a terminal checked Connect result after native publication/copyout.
+    pub const ALPC_OP_ACK_CONNECT_PORT: u16 = 0x2312;
+    /// Retire a terminal checked Accept result after native publication/copyout.
+    pub const ALPC_OP_ACK_ACCEPT_CONNECT: u16 = 0x2313;
 }
 
 /// `AlpcSendReceiveRequest.flags` bits.
 pub mod send_flag {
+    /// Native `ALPC_MSGFLG_REPLY_MESSAGE`: the send half replies to the exact
+    /// previously delivered request selected by the PORT_MESSAGE identity.
+    pub const REPLY_MESSAGE: u32 = 0x0001_0000;
+    /// Native `ALPC_MSGFLG_SYNC_REQUEST`: send one request and wait for only
+    /// its matching reply on the same communication endpoint.
+    pub const SYNC_REQUEST: u32 = 0x0002_0000;
     /// On a receive, serialize the received `ALPC_MESSAGE_ATTRIBUTES` (the 8-byte
     /// header + the per-attribute structs, in the fixed SECURITY,VIEW,CONTEXT,
     /// HANDLE,TOKEN order) into the FRONT of the reply frame, before the message
@@ -234,6 +258,70 @@ pub struct AlpcCreatePortRequest {
     pub name_offset: u32,
     pub name_len_bytes: u32,
     pub _reserved2: u32,
+}
+
+/// Checked create request. The legacy 24-byte prefix remains valid for existing callers.
+/// A native caller must supply its kernel-authenticated owner and a nonzero, unique token.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcCreatePortCheckedRequest {
+    pub create: AlpcCreatePortRequest,
+    pub owner_process: u64,
+    pub owner_thread: u64,
+    /// Kernel-authenticated process incarnation, not a reusable PID.
+    pub owner_generation: u64,
+    pub invocation_hi: u64,
+    pub invocation_lo: u64,
+}
+
+/// Native checked create with the caller's complete copied `ALPC_PORT_ATTRIBUTES`.
+/// The 64-byte checked prefix remains supported for older in-tree callers.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcCreatePortOwnedRequest {
+    pub checked: AlpcCreatePortCheckedRequest,
+    pub attributes: AlpcPortAttributes,
+}
+
+/// Checked native create with an owned self-relative security descriptor.
+/// The descriptor follows the UTF-16 name in the same exact invocation bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcCreatePortSecuredRequest {
+    pub owned: AlpcCreatePortOwnedRequest,
+    pub security_offset: u32,
+    pub security_len_bytes: u32,
+}
+
+/// Read the result of a prior checked create. Absence is inconclusive if a ring
+/// submission may still be in flight; callers must not treat it as replay authority.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcLookupCreatePortRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub _reserved2: u32,
+    pub owner_process: u64,
+    pub owner_thread: u64,
+    pub owner_generation: u64,
+    pub invocation_hi: u64,
+    pub invocation_lo: u64,
+}
+
+/// Exact cleanup authority for a checked create. The service verifies every
+/// identity field against its durable create-result record before closing.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcCloseCreatedPortRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub _reserved2: u32,
+    pub handle: u64,
+    pub owner_process: u64,
+    pub owner_thread: u64,
+    pub owner_generation: u64,
+    pub invocation_hi: u64,
+    pub invocation_lo: u64,
 }
 
 /// `ALPC_OP_CONNECT_PORT` — connect to a named ALPC port, carrying the connect
@@ -286,6 +374,69 @@ pub struct AlpcSendReceiveRequest {
     pub attr_offset: u32,
     pub attr_len_bytes: u32,
     pub _reserved2: u32,
+}
+
+/// Kernel-authenticated owner and unique invocation token for native ALPC
+/// operations that may block or have an uncertain service effect. The service
+/// must reserve this token before an effect and never replay it.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcCheckedInvocation {
+    pub owner_process: u64,
+    pub owner_thread: u64,
+    pub owner_generation: u64,
+    pub invocation_hi: u64,
+    pub invocation_lo: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcConnectPortCheckedRequest {
+    pub connect: AlpcConnectPortRequest,
+    pub invocation: AlpcCheckedInvocation,
+    /// Copied native port attributes; `has_port_attributes` says whether present.
+    pub port_attributes: AlpcPortAttributes,
+    pub has_port_attributes: u32,
+    pub _reserved: u32,
+}
+
+/// Executive-authorized checked connect. The grant is valid only for the
+/// specified live listen handle, not for a name that may be replaced.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcConnectPortAuthorizedRequest {
+    pub checked: AlpcConnectPortCheckedRequest,
+    pub target_listen_handle: u64,
+    pub access_granted: u32,
+    pub _reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcAcceptConnectCheckedRequest {
+    pub accept: AlpcAcceptConnectRequest,
+    pub invocation: AlpcCheckedInvocation,
+    /// Native listen-port handle; the service must bind it to `connection_id`.
+    pub listen_port: u64,
+    /// Optional copied native PORT_MESSAGE carrying server connection info.
+    pub message_offset: u32,
+    pub message_len_bytes: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcSendReceiveCheckedRequest {
+    pub send_receive: AlpcSendReceiveRequest,
+    pub invocation: AlpcCheckedInvocation,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AlpcAcknowledgeSendReceiveRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub _reserved2: u32,
+    pub invocation: AlpcCheckedInvocation,
 }
 
 /// `ALPC_OP_CREATE_PORT_SECTION` — create a shared-memory section on a port.
@@ -375,9 +526,19 @@ const _: () = {
     assert!(size_of::<AlpcTokenAttr>() == 24);
     // Service wire structs.
     assert!(size_of::<AlpcCreatePortRequest>() == 24);
+    assert!(size_of::<AlpcCreatePortCheckedRequest>() == 64);
+    assert!(size_of::<AlpcCreatePortOwnedRequest>() == 136);
+    assert!(size_of::<AlpcCreatePortSecuredRequest>() == 144);
+    assert!(size_of::<AlpcLookupCreatePortRequest>() == 48);
+    assert!(size_of::<AlpcCloseCreatedPortRequest>() == 56);
     assert!(size_of::<AlpcConnectPortRequest>() == 40);
     assert!(size_of::<AlpcAcceptConnectRequest>() == 24);
     assert!(size_of::<AlpcSendReceiveRequest>() == 40);
+    assert!(size_of::<AlpcCheckedInvocation>() == 40);
+    assert!(size_of::<AlpcConnectPortCheckedRequest>() == 160);
+    assert!(size_of::<AlpcConnectPortAuthorizedRequest>() == 176);
+    assert!(size_of::<AlpcAcceptConnectCheckedRequest>() == 80);
+    assert!(size_of::<AlpcSendReceiveCheckedRequest>() == 80);
     assert!(size_of::<AlpcCreatePortSectionRequest>() == 32);
     assert!(size_of::<AlpcCreateSectionViewRequest>() == 32);
     assert!(size_of::<AlpcViewIoRequest>() == 32);

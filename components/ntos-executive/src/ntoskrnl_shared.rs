@@ -88,6 +88,80 @@ pub extern "win64" fn s_rtl_compare_memory(a: u64, b: u64, n: u64) -> u64 {
     }
 }
 
+/// `int memcmp(const void*, const void*, size_t)` compares unsigned bytes in order.
+pub extern "win64" fn s_memcmp(a: u64, b: u64, n: u64) -> i32 {
+    if n == 0 {
+        return 0;
+    }
+    let left = unsafe { core::slice::from_raw_parts(a as *const u8, n as usize) };
+    let right = unsafe { core::slice::from_raw_parts(b as *const u8, n as usize) };
+    nt_compat_exports::rtl::compare_bytes_lexicographic(left, right)
+}
+
+/// Kernel-callable `ZwQuerySystemInformation` for the fixed classes backed by live machine facts.
+/// Unsupported classes return the native invalid-class status without fabricated data.
+pub extern "win64" fn s_query_system_information(
+    class: u32,
+    buffer: u64,
+    buffer_length: u32,
+    return_length: *mut u32,
+) -> i32 {
+    use nt_syscall::system_information::{
+        query_plan, SystemInformationKind, SYSTEM_BASIC_INFORMATION_CLASS,
+        SYSTEM_PROCESSOR_INFORMATION_CLASS,
+    };
+
+    const STATUS_ACCESS_VIOLATION: i32 = 0xC000_0005u32 as i32;
+    const STATUS_DATATYPE_MISALIGNMENT: i32 = 0x8000_0002u32 as i32;
+    const STATUS_INVALID_INFO_CLASS: i32 = 0xC000_0003u32 as i32;
+
+    if !return_length.is_null() {
+        if return_length as u64 & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        unsafe { core::ptr::write_unaligned(return_length, 0) };
+    }
+    if !matches!(
+        class,
+        SYSTEM_BASIC_INFORMATION_CLASS | SYSTEM_PROCESSOR_INFORMATION_CLASS
+    ) {
+        return STATUS_INVALID_INFO_CLASS;
+    }
+    let plan = match query_plan(class, buffer_length as usize) {
+        Ok(plan) => plan,
+        Err(error) => {
+            if !return_length.is_null() {
+                unsafe { core::ptr::write_unaligned(return_length, error.return_length) };
+            }
+            return error.status as i32;
+        }
+    };
+    if buffer == 0 {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if buffer & 3 != 0 {
+        return STATUS_DATATYPE_MISALIGNMENT;
+    }
+    if !return_length.is_null() {
+        unsafe { core::ptr::write_unaligned(return_length, plan.return_length) };
+    }
+
+    unsafe {
+        match plan.kind {
+            SystemInformationKind::Basic => {
+                let output = crate::exec_handler::native_basic_system_information().encode();
+                core::ptr::copy_nonoverlapping(output.as_ptr(), buffer as *mut u8, plan.copy_length);
+            }
+            SystemInformationKind::Processor => {
+                let output = crate::exec_handler::native_processor_information().encode();
+                core::ptr::copy_nonoverlapping(output.as_ptr(), buffer as *mut u8, plan.copy_length);
+            }
+            _ => return STATUS_INVALID_INFO_CLASS,
+        }
+    }
+    0
+}
+
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
 const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
@@ -192,6 +266,13 @@ pub extern "win64" fn s_ke_query_performance_counter(frequency: *mut u64) -> u64
     crate::monotonic_time_100ns()
 }
 
+/// `VOID InitializeSListHead(PSLIST_HEADER)`.
+pub extern "win64" fn s_initialize_slist_head(head: *mut u8) {
+    if !unsafe { nt_kernel_exec::slist::initialize(head) } {
+        unsafe { crate::provider_bugcheck::report(0xc4, [0x534c_494e, 0, 0, 0]) }
+    }
+}
+
 /// `PSLIST_ENTRY ExpInterlockedPushEntrySList(PSLIST_HEADER, PSLIST_ENTRY)`.
 pub extern "win64" fn s_exp_interlocked_push_entry_slist(head: *mut u8, entry: u64) -> u64 {
     unsafe { nt_kernel_exec::slist::push(head, entry) }
@@ -200,6 +281,11 @@ pub extern "win64" fn s_exp_interlocked_push_entry_slist(head: *mut u8, entry: u
 /// `PSLIST_ENTRY ExpInterlockedPopEntrySList(PSLIST_HEADER)`.
 pub extern "win64" fn s_exp_interlocked_pop_entry_slist(head: *mut u8) -> u64 {
     unsafe { nt_kernel_exec::slist::pop(head) }
+}
+
+/// `PSLIST_ENTRY ExpInterlockedFlushSList(PSLIST_HEADER)`.
+pub extern "win64" fn s_exp_interlocked_flush_slist(head: *mut u8) -> u64 {
+    unsafe { nt_kernel_exec::slist::flush(head) }
 }
 
 /// `USHORT ExQueryDepthSList(PSLIST_HEADER)`.

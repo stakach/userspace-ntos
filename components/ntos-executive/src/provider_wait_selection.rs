@@ -8,13 +8,21 @@ use nt_user_host::provider_wait_selection::{select_provider_wait, ProviderWaitSe
 pub(super) unsafe fn publish(
     completion: ProviderDispatcherWaitCompletion,
 ) -> Result<LaneHandle, ProviderWaitSelectionError<u32>> {
-    select_provider_wait(
+    let selected = select_provider_wait(
         &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS),
         completion,
         |lane, continuation, completion| {
             const INVALID_HANDLE: u32 = 0xC000_0008;
             match (completion.owner.caller, continuation) {
                 (SuspensionCaller::Hosted(client), ComponentNativeContinuation::Hosted(hosted)) => {
+                    if matches!(hosted.destination, HostedContinuationDestination::InitialThread(_)) {
+                        print_str(b"[initial-provider-wait] stage=select wait/status/pi/tid=");
+                        print_u64(completion.wait_id);
+                        print_str(b"/"); print_hex_u64(completion.status as u32 as u64);
+                        print_str(b"/"); print_u64(client.client_pi as u64);
+                        print_str(b"/"); print_u64(client.client_tid);
+                        print_str(b"\n");
+                    }
                     let PendingComponentDispatch::Provider(pending) = &hosted.pending else {
                         return Err(INVALID_HANDLE);
                     };
@@ -48,5 +56,6 @@ pub(super) unsafe fn publish(
             // fabricated hosted return target, determines the eventual execution/delivery path.
             Ok(ComponentSuspensionCompletion::provider(completion.status))
         },
-    )
+    );
+    selected
 }

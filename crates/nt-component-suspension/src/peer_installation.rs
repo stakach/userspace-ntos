@@ -21,7 +21,7 @@ mod autonomous;
 
 #[path = "peer_retirement.rs"]
 mod retirement;
-pub use retirement::{PeerRetirementEffect, PeerRetirementError, PeerRetirementPhase};
+pub use retirement::{PeerAdmissionFence, PeerRetirementEffect, PeerRetirementError, PeerRetirementPhase};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PeerInstallationPhase {

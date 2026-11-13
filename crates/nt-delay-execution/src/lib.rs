@@ -6,6 +6,12 @@ use alloc::vec::Vec;
 
 pub use nt_time::{Deadline, TimeSnapshot};
 
+mod calibrated_tsc;
+pub use calibrated_tsc::{CalibratedTscEpoch, TscClockError, TscDrift};
+
+#[cfg(test)]
+mod calibrated_tsc_tests;
+
 pub fn due_time(interval: i64, monotonic_now: u64, system_now: u64) -> Deadline {
     Deadline::from_nt_timeout(
         Some(interval),
@@ -73,12 +79,23 @@ pub fn timer_min_delta_ticks(min_delta_100ns: u64, period_fs: u64, floor_ticks: 
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WaitDiagnostic {
+    pub process_id: u64,
+    pub process_generation: u64,
+    pub thread_generation: u64,
+    pub process_index: usize,
+    pub parked_at_100ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Waiter {
     pub deadline: Deadline,
     pub sequence: u64,
     pub reply_cap: u64,
     pub thread_id: u64,
     pub badge: u64,
+    /// Copied timing only; queue ordering and wake admission never inspect it.
+    pub observation: Option<WaitDiagnostic>,
 }
 
 pub struct Queue {
@@ -214,6 +231,7 @@ mod tests {
             reply_cap: thread_id + 100,
             thread_id,
             badge: thread_id + 10,
+            observation: None,
         }
     }
 
@@ -245,6 +263,18 @@ mod tests {
                 monotonic_100ns: 1 + (1u64 << 63)
             }
         );
+    }
+
+    #[test]
+    fn kernel_thread_delay_keeps_full_interval_and_correct_clock_domain() {
+        let initial = snapshot(1_000_000, 500_000_000);
+        let relative = Deadline::from_nt_timeout(Some(-50_000_000), initial); // five seconds
+        assert!(!relative.is_due(snapshot(1_010_000, 600_000_000)));
+        assert!(relative.is_due(snapshot(51_000_000, 400_000_000)));
+
+        let absolute = Deadline::from_nt_timeout(Some(550_000_000), initial);
+        assert!(!absolute.is_due(snapshot(100_000_000, 549_999_999)));
+        assert!(absolute.is_due(snapshot(1_000_001, 550_000_000)));
     }
 
     #[test]

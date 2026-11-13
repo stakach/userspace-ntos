@@ -5,6 +5,18 @@ use crate::spawn_hosts::shared_ingress::owner::runtime;
 use nt_io_abi::power_report::{PowerReportReply, PowerReportRequest};
 
 static REPORT_RECEIPTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static REPORT_RPC_TRACES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static COMPONENT_REPORT_TRACES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn trace_report_rpc(stage: &[u8], reply_cap: u64, badge: u64, status: i32, previous: u64) {
+    if REPORT_RPC_TRACES.fetch_add(1, Ordering::Relaxed) >= 32 { return; }
+    print_str(b"[power-report-rpc] "); print_str(stage);
+    print_str(b" reply="); print_u64(reply_cap);
+    print_str(b" badge="); print_u64(badge);
+    print_str(b" status="); print_u64(status as u32 as u64);
+    print_str(b" previous="); print_u64(previous);
+    print_str(b"\n");
+}
 
 struct ReportTarget {
     device: nt_io_manager::DeviceId,
@@ -30,10 +42,21 @@ pub(super) unsafe fn component_report(device: u64, power_type: u32, state: u32) 
     if PowerReportRequest::decode(device, power_type as u64, state as u64).is_err() {
         crate::provider_bugcheck::report(0xc4, [HOSTED_DEVICE_OP_REPORT_POWER_STATE, device, power_type as u64, state as u64]);
     }
+    let trace = COMPONENT_REPORT_TRACES.fetch_add(1, Ordering::Relaxed) < 8;
+    if trace {
+        print_str(b"[power-report-rpc] component-call device="); print_u64(device);
+        print_str(b" type="); print_u64(power_type as u64);
+        print_str(b" state="); print_u64(state as u64); print_str(b"\n");
+    }
     let (words, status, previous, reserved0, reserved1) = call_on4_raw(
         (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
         HOSTED_DEVICE_OP_REPORT_POWER_STATE, device, power_type as u64, state as u64,
     );
+    if trace {
+        print_str(b"[power-report-rpc] component-return words="); print_u64(words);
+        print_str(b" status="); print_u64(status);
+        print_str(b" previous="); print_u64(previous); print_str(b"\n");
+    }
     match PowerReportReply::decode(words, status, previous, [reserved0, reserved1], power_type) {
         Ok(PowerReportReply::Success(previous)) => previous,
         // This ULONG-returning NT API has no error channel. Neither rejection nor an

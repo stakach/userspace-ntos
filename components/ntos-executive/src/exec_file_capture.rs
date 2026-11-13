@@ -8,7 +8,83 @@ pub(super) struct HostedFileCapture {
     _reference: Option<driver_launch::hosted_file_capture::Capture>,
 }
 
+fn file_transfer_access_mask(writing: bool) -> u32 {
+    if writing {
+        nt_fs::FILE_WRITE_DATA | nt_fs::FILE_APPEND_DATA
+            | nt_security::GENERIC_WRITE | nt_security::GENERIC_ALL
+    } else {
+        nt_fs::FILE_READ_DATA | nt_security::GENERIC_READ | nt_security::GENERIC_ALL
+    }
+}
+
+/// Scheduling observation only. The delivered syscall must repeat normal File capture before
+/// queuing an IRP; this does not acquire a File reference or authorize provider entry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RootIngressReadRouteObservation {
+    pub child: nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+    pub route: HostedFileRoute,
+    pub granted_access: u32,
+    pub mode: nt_io_completion::FileIoMode,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootIngressReadPreflight {
+    Accepted(RootIngressReadRouteObservation),
+    Unsupported,
+    Changed,
+}
+
 impl ExecNtHandler {
+    /// Classify a selected child from its exact runtime, never this handler's previous `pi`.
+    /// Unknown routes are unsupported; a changed child or prior observation cannot be replayed.
+    pub(crate) fn root_ingress_read_preflight(
+        &self,
+        child: nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+        handle: u64,
+        expected: Option<RootIngressReadRouteObservation>,
+    ) -> RootIngressReadPreflight {
+        use nt_user_host::process_identity::ProcessGeneration;
+        let ProcessGeneration::Hosted(generation) = child.process.generation else {
+            return RootIngressReadPreflight::Unsupported;
+        };
+        if self.hosted_process_generation(child.pi) != Some(generation)
+            || self.capture_thread_process_identity(child.pi, child.tid) != Some(child.process)
+            || !self.admit_hosted_thread_ingress(child.badge)
+                .is_ok_and(|runtime| runtime.binding() == child)
+        {
+            return RootIngressReadPreflight::Changed;
+        }
+        let Some(pid) = self.pm_pid_for_pi(child.pi).filter(|pid| *pid == child.process.pid)
+        else { return RootIngressReadPreflight::Changed; };
+        let unsupported = if expected.is_some() {
+            RootIngressReadPreflight::Changed
+        } else {
+            RootIngressReadPreflight::Unsupported
+        };
+        let Ok(typed_handle) = nt_process::Handle::try_from(handle) else { return unsupported; };
+        let Some(granted_access) = self.pm.handle_access(pid, typed_handle) else {
+            return unsupported;
+        };
+        if granted_access & file_transfer_access_mask(false) == 0 {
+            return unsupported;
+        }
+        let Some(route) = self.hosted_file_route_for_pid(pid, handle) else { return unsupported; };
+        let Ok(mode) = self.file_completion.io_mode(route.file_id) else { return unsupported; };
+        if crate::driver_launch::registered_file_target(
+            route.device_id, nt_io_abi::major::IRP_MJ_READ,
+        ) != Ok(crate::driver_launch::RegisteredFileTarget::DriverPeer) {
+            return unsupported;
+        }
+        let observed = RootIngressReadRouteObservation {
+            child, route, granted_access, mode,
+        };
+        if expected.is_some_and(|prior| prior != observed) {
+            RootIngressReadPreflight::Changed
+        } else {
+            RootIngressReadPreflight::Accepted(observed)
+        }
+    }
+
     /// Only fresh local requests may enter the local router. A promoted hosted request keeps
     /// its original grant even if the handle now names a local File or has already closed.
     pub(super) fn capture_hosted_file_unless_local(
@@ -39,14 +115,7 @@ impl ExecNtHandler {
         writing: bool,
     ) -> Result<(HostedFileCapture, nt_io_completion::FileIoMode), u32> {
         let capture = self.capture_hosted_file(handle)?;
-        let access_mask = if writing {
-            nt_fs::FILE_WRITE_DATA
-                | nt_fs::FILE_APPEND_DATA
-                | nt_security::GENERIC_WRITE
-                | nt_security::GENERIC_ALL
-        } else {
-            nt_fs::FILE_READ_DATA | nt_security::GENERIC_READ | nt_security::GENERIC_ALL
-        };
+        let access_mask = file_transfer_access_mask(writing);
         if capture.granted_access & access_mask == 0 {
             return Err(STATUS_ACCESS_DENIED);
         }

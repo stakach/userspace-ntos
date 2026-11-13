@@ -70,7 +70,7 @@ pub(crate) unsafe fn service_hosted_timer_work() -> u64 {
         return 0;
     }
     let now = nt_time_snapshot();
-    let work = timer_hosted_driver_wake_due(now);
+    let work = timer_hosted_driver_wake_due(now, None);
     let provider_work = scan_owned_timer_work(now)
         .expect("bootstrap timer selection lost its canonical continuation");
     // Observe retained demand only. ACPI acknowledgement and DPC execution have outer owners.
@@ -134,6 +134,10 @@ unsafe fn collect_owned_deadline(now: nt_time::TimeSnapshot) -> Result<Option<(u
                 user_timer: None,
                 job_time: None,
                 component_resume: service_sec_image::component_resume::retained_deadline(),
+                root_add_device: None,
+                root_queued_callback: None,
+                primary_alias: None,
+                hosted_spawn_abort: None,
             })
         })
         .map_err(|_| 0xC000_00A3u32)??;
@@ -219,6 +223,7 @@ pub(crate) unsafe fn with_provider_objects<R>(
                     backing: crate::provider_dispatcher_backend::NativeEventBacking {
                         objects: &mut seed.obj_ns,
                         file_completion: None,
+                        pm: None,
                     },
                     access: None,
                 },

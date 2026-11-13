@@ -39,6 +39,8 @@ pub fn join_layered_relative_name_into(
 /// The source selected by CREATE. Later operations must not repeat namespace lookup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayeredOpenSource {
+    /// An exact empty-name open of the mounted volume, distinct from its root directory.
+    Volume,
     Installed {
         first_cluster: u32,
         metadata: FileMetadata,
@@ -228,6 +230,21 @@ impl<const SLOTS: usize> LayeredOpenTable<SLOTS> {
         })
     }
 
+    /// Immutable-source evidence from the exact CREATE-selected File context. Namespace names
+    /// and volume attributes cannot grant this evidence to an overlay or a reused context.
+    pub fn immutable_installed_file_extent(
+        &self,
+        context: LayeredOpenContextId,
+        canonical_file_id: u64,
+    ) -> Option<u64> {
+        let LayeredOpenSource::Installed { metadata, .. } =
+            self.get(context, canonical_file_id).ok()?.source
+        else {
+            return None;
+        };
+        (!metadata.is_directory && metadata.end_of_file != 0).then_some(metadata.end_of_file)
+    }
+
     /// Find the live open bound to an exact canonical File identity, including its generation.
     pub fn get_by_file_id(
         &self,
@@ -374,6 +391,23 @@ mod tests {
     }
 
     #[test]
+    fn volume_file_keeps_its_own_generation_and_is_not_a_named_file() {
+        let mut table = LayeredOpenTable::<1>::new();
+        let volume = table.insert(17, LayeredOpenSource::Volume, &[]).unwrap();
+        assert_eq!(table.get(volume, 17).unwrap().source, LayeredOpenSource::Volume);
+        assert_eq!(table.get(volume, 17).unwrap().name, &[]);
+        assert_eq!(
+            LayeredOpenSource::Volume.file_internal_index(1),
+            Err(STATUS_DATA_ERROR),
+        );
+        assert_eq!(table.release(volume, 17), Ok(LayeredOpenSource::Volume));
+        let next = table.insert(18, LayeredOpenSource::Volume, &[]).unwrap();
+        assert_ne!(volume, next);
+        assert_eq!(table.get(volume, 17), Err(STATUS_INVALID_HANDLE));
+        assert_eq!(table.get(next, 18).unwrap().source, LayeredOpenSource::Volume);
+    }
+
+    #[test]
     fn reservation_retains_identity_until_source_is_known() {
         let mut table = LayeredOpenTable::<1>::new();
         let mut name = alloc::vec![b'a' as u16];
@@ -473,6 +507,28 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(table.get_by_file_id(10), Err(STATUS_INVALID_HANDLE));
         assert_eq!(table.get_by_file_id(11).unwrap().0, second);
+    }
+
+    #[test]
+    fn immutable_extent_requires_exact_installed_open_generation_not_name() {
+        let mut table = LayeredOpenTable::<2>::new();
+        let name = [b'a' as u16];
+        let installed_context = table.insert(10, installed(), &name).unwrap();
+        assert_eq!(table.immutable_installed_file_extent(installed_context, 10), Some(4096));
+        assert_eq!(table.immutable_installed_file_extent(installed_context, 11), None);
+
+        // A later overlay open under the same name must not change the retained installed File.
+        let overlay = table
+            .insert(11, LayeredOpenSource::Overlay { file_id: 88 }, &name)
+            .unwrap();
+        assert_eq!(table.immutable_installed_file_extent(installed_context, 10), Some(4096));
+        assert_eq!(table.immutable_installed_file_extent(overlay, 11), None);
+
+        table.release(installed_context, 10).unwrap();
+        let replacement = table.insert(10, installed(), &name).unwrap();
+        assert_ne!(installed_context, replacement);
+        assert_eq!(table.immutable_installed_file_extent(installed_context, 10), None);
+        assert_eq!(table.immutable_installed_file_extent(replacement, 10), Some(4096));
     }
 
     #[test]

@@ -95,6 +95,114 @@ pub struct LegacyIrqOverride {
     pub active_low: Option<bool>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedInterruptResource {
+    pub gsi: u32,
+    pub level_sensitive: bool,
+    pub active_low: bool,
+    pub shared: bool,
+}
+
+/// Interrupt fields retained from a bus-reported CM descriptor.
+/// CM omits both polarity and whether its line is a legacy IRQ or a direct GSI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReportedInterruptResource {
+    pub line: u32,
+    pub level_sensitive: bool,
+    pub shared: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportedInterruptError {
+    Missing,
+    Ambiguous,
+    Mismatch,
+    InvalidRoute,
+}
+
+/// Reconcile an accepted PDO's exact `_CRS` with its bus-reported CM interrupt.
+/// The caller must retain the `_CRS` slice with that same PDO and provider generation.
+pub fn reconcile_reported_interrupt(
+    crs_interrupts: &[InterruptResource],
+    reported: ReportedInterruptResource,
+    legacy_irq_overrides: &[LegacyIrqOverride],
+) -> Result<ResolvedInterruptResource, ReportedInterruptError> {
+    let mut selected = None;
+    for resource in crs_interrupts {
+        let source_line = match resource.interrupt {
+            InterruptSource::LegacyIrq(irq) => u32::from(irq),
+            InterruptSource::GlobalSystemInterrupt(gsi) => gsi,
+        };
+        if source_line != reported.line {
+            continue;
+        }
+        if selected.replace(*resource).is_some() {
+            return Err(ReportedInterruptError::Ambiguous);
+        }
+    }
+    let resource = selected.ok_or(ReportedInterruptError::Missing)?;
+    if resource.level_sensitive != reported.level_sensitive || resource.shared != reported.shared {
+        return Err(ReportedInterruptError::Mismatch);
+    }
+    resolve_interrupt_resource(resource, legacy_irq_overrides)
+        .map_err(|_| ReportedInterruptError::InvalidRoute)
+}
+
+#[cfg(test)]
+#[path = "pci_routing/reconcile_tests.rs"]
+mod reconcile_tests;
+
+/// Resolve one exact ACPI `_CRS` interrupt descriptor without discarding its electrical mode.
+///
+/// A small IRQ descriptor names a legacy line and its own trigger, polarity, and sharing. A MADT
+/// override may translate that line to a GSI, but any explicit override mode must agree with the
+/// descriptor. An Extended IRQ descriptor already names a GSI and bypasses legacy translation.
+pub fn resolve_interrupt_resource(
+    resource: InterruptResource,
+    legacy_irq_overrides: &[LegacyIrqOverride],
+) -> Result<ResolvedInterruptResource, PciRoutingError> {
+    validate_legacy_irq_overrides(legacy_irq_overrides)?;
+    let gsi = match resource.interrupt {
+        InterruptSource::GlobalSystemInterrupt(gsi) => gsi,
+        InterruptSource::LegacyIrq(irq) if irq < 16 => {
+            let route = legacy_irq_overrides.iter().find(|route| route.irq == irq);
+            if route.is_some_and(|route| {
+                route
+                    .level_sensitive
+                    .is_some_and(|level| level != resource.level_sensitive)
+                    || route
+                        .active_low
+                        .is_some_and(|active_low| active_low != resource.active_low)
+            }) {
+                return Err(PciRoutingError::ConflictingLegacyIrqOverride);
+            }
+            route.map(|route| route.gsi).unwrap_or(u32::from(irq))
+        }
+        InterruptSource::LegacyIrq(_) => return Err(PciRoutingError::InvalidResourceTemplate),
+    };
+    Ok(ResolvedInterruptResource {
+        gsi,
+        level_sensitive: resource.level_sensitive,
+        active_low: resource.active_low,
+        shared: resource.shared,
+    })
+}
+
+fn validate_legacy_irq_overrides(
+    legacy_irq_overrides: &[LegacyIrqOverride],
+) -> Result<(), PciRoutingError> {
+    for (index, route) in legacy_irq_overrides.iter().enumerate() {
+        if route.irq >= 16
+            || legacy_irq_overrides[index + 1..]
+                .iter()
+                .any(|other| other.irq == route.irq || other.gsi == route.gsi)
+        {
+            return Err(PciRoutingError::DuplicateLegacyIrqOverride);
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a legacy bus IRQ using validated MADT overrides. Conforming ISA polarity and
 /// trigger mode are active high and edge triggered.
 pub fn resolve_legacy_irq(
@@ -118,7 +226,24 @@ pub fn resolve_legacy_irq(
 
 #[cfg(test)]
 mod legacy_irq_tests {
-    use super::{resolve_legacy_irq, LegacyIrqOverride, PciRoutingError};
+    use super::{
+        parse_interrupt_resource_template, resolve_interrupt_resource, resolve_legacy_irq,
+        InterruptResource, InterruptSource, LegacyIrqOverride, PciRoutingError,
+        ResolvedInterruptResource, EVAL_OUTPUT_SIGNATURE, METHOD_ARGUMENT_BUFFER,
+    };
+    use alloc::vec::Vec;
+
+    fn crs(template: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&EVAL_OUTPUT_SIGNATURE.to_le_bytes());
+        bytes.extend_from_slice(&((12 + 4 + template.len().max(4)) as u32).to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&METHOD_ARGUMENT_BUFFER.to_le_bytes());
+        bytes.extend_from_slice(&(template.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(template);
+        bytes.resize(12 + 4 + template.len().max(4), 0);
+        bytes
+    }
 
     #[test]
     fn isa_default_and_madt_override_preserve_trigger_and_polarity() {
@@ -141,6 +266,77 @@ mod legacy_irq_tests {
         assert_eq!(
             resolve_legacy_irq(16, false, &[override_irq]),
             Err(PciRoutingError::InvalidRoutingEntry),
+        );
+    }
+
+    #[test]
+    fn child_crs_legacy_irq4_keeps_level_low_shared_authority_without_madt_override() {
+        // Small IRQ descriptor: mask IRQ4, level triggered, active low, shared.
+        let resources = parse_interrupt_resource_template(&crs(&[0x23, 0x10, 0, 0x18, 0x79, 0]))
+            .unwrap();
+        assert_eq!(resources, [InterruptResource {
+            descriptor_index: 0,
+            interrupt: InterruptSource::LegacyIrq(4),
+            level_sensitive: true,
+            active_low: true,
+            shared: true,
+        }]);
+        assert_eq!(
+            resolve_interrupt_resource(resources[0], &[]),
+            Ok(ResolvedInterruptResource {
+                gsi: 4,
+                level_sensitive: true,
+                active_low: true,
+                shared: true,
+            })
+        );
+    }
+
+    #[test]
+    fn child_crs_extended_irq4_keeps_direct_gsi_attributes() {
+        // Extended IRQ descriptor: consumer, level triggered, active high, shared.
+        let resources = parse_interrupt_resource_template(&crs(&[
+            0x89, 0x06, 0, 0x09, 0x01, 4, 0, 0, 0, 0x79, 0,
+        ]))
+        .unwrap();
+        assert_eq!(resources[0].interrupt, InterruptSource::GlobalSystemInterrupt(4));
+        assert_eq!(
+            resolve_interrupt_resource(resources[0], &[]),
+            Ok(ResolvedInterruptResource {
+                gsi: 4,
+                level_sensitive: true,
+                active_low: false,
+                shared: true,
+            })
+        );
+    }
+
+    #[test]
+    fn child_crs_legacy_irq_rejects_conflicting_madt_override() {
+        let resource = parse_interrupt_resource_template(&crs(&[0x23, 0x10, 0, 0x18, 0x79, 0]))
+            .unwrap()[0];
+        assert_eq!(
+            resolve_interrupt_resource(resource, &[LegacyIrqOverride {
+                irq: 4,
+                gsi: 20,
+                level_sensitive: Some(true),
+                active_low: Some(true),
+            }]),
+            Ok(ResolvedInterruptResource {
+                gsi: 20,
+                level_sensitive: true,
+                active_low: true,
+                shared: true,
+            })
+        );
+        assert_eq!(
+            resolve_interrupt_resource(resource, &[LegacyIrqOverride {
+                irq: 4,
+                gsi: 20,
+                level_sensitive: Some(false),
+                active_low: Some(false),
+            }]),
+            Err(PciRoutingError::ConflictingLegacyIrqOverride)
         );
     }
 }
@@ -352,9 +548,6 @@ fn parse_small_irq(
     }
     let level_sensitive = flags & 0x01 == 0;
     let active_low = flags & 0x08 != 0;
-    if level_sensitive != active_low {
-        return Err(PciRoutingError::InvalidResourceTemplate);
-    }
     for irq in 0..16u8 {
         if mask & (1u16 << irq) == 0 {
             continue;
@@ -446,15 +639,7 @@ pub fn resolve_pci_routing_table(
     links: &[PciInterruptLink],
     legacy_irq_overrides: &[LegacyIrqOverride],
 ) -> Result<Vec<ResolvedPciRoute>, PciRoutingError> {
-    for (index, route) in legacy_irq_overrides.iter().enumerate() {
-        if route.irq >= 16
-            || legacy_irq_overrides[index + 1..]
-                .iter()
-                .any(|other| other.irq == route.irq || other.gsi == route.gsi)
-        {
-            return Err(PciRoutingError::DuplicateLegacyIrqOverride);
-        }
-    }
+    validate_legacy_irq_overrides(legacy_irq_overrides)?;
     let mut routes = Vec::new();
     routes
         .try_reserve_exact(table.entries.len())
@@ -855,12 +1040,12 @@ mod tests {
 
     #[test]
     fn unsupported_or_ambiguous_interrupt_authority_fails_closed() {
-        let invalid_pic_pair = eval_output(&[argument(
+        let reserved_pic_flags = eval_output(&[argument(
             METHOD_ARGUMENT_BUFFER,
-            &[0x23, 0x20, 0x00, 0x19, 0x79, 0],
+            &[0x23, 0x20, 0x00, 0x40, 0x79, 0],
         )]);
         assert_eq!(
-            parse_interrupt_resource_template(&invalid_pic_pair),
+            parse_interrupt_resource_template(&reserved_pic_flags),
             Err(PciRoutingError::InvalidResourceTemplate)
         );
 

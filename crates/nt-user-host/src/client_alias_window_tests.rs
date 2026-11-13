@@ -4,6 +4,13 @@ use alloc::{rc::Rc, vec, vec::Vec};
 use core::cell::RefCell;
 use nt_memory_manager::retained_alias::AliasRetirementIo;
 
+#[test]
+fn window_selection_bool_compatibility_accepts_only_applied_effects() {
+    assert!(WindowSelectionEffect::Applied.is_applied());
+    assert!(!WindowSelectionEffect::RefusedNoEffect.is_applied());
+    assert!(!WindowSelectionEffect::Uncertain.is_applied());
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Call {
     Unmap(u64),

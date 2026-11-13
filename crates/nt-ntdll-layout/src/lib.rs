@@ -32,6 +32,7 @@
 use core::mem::{offset_of, size_of};
 
 pub mod kuser;
+pub mod debug_filter;
 
 /// `LIST_ENTRY` — a doubly-linked list node (`ntdef.h`). 16 bytes on x64.
 #[repr(C)]

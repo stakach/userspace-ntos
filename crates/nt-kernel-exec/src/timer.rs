@@ -4,6 +4,7 @@
 //! at the API boundary are Windows 100ns intervals.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use nt_time::{AdjustableClock, Deadline, TimeSnapshot};
 
 /// Input frequency of the PC-compatible 8254 timer.
@@ -30,6 +31,62 @@ impl TimerRearmOutcome {
     }
 }
 
+/// Retained demand for a physical timer shot. A nested publisher can add work
+/// while an earlier programming attempt is in flight; only that attempt's
+/// captured publication may be acknowledged.
+pub struct TimerRearmDemand {
+    publication: AtomicU64,
+    acknowledged: AtomicU64,
+}
+
+#[must_use = "finish the captured rearm attempt after timer programming"]
+pub struct TimerRearmAttempt<'a> {
+    demand: &'a TimerRearmDemand,
+    publication: u64,
+    claimable: bool,
+}
+
+impl TimerRearmDemand {
+    pub const fn new() -> Self {
+        Self { publication: AtomicU64::new(0), acknowledged: AtomicU64::new(0) }
+    }
+
+    pub fn publish(&self) {
+        self.publication.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.publication.load(Ordering::Acquire) != self.acknowledged.load(Ordering::Acquire)
+    }
+
+    /// An unavailable queue borrow cannot justify either programming or idle.
+    pub fn begin(&self, claimable: Option<bool>) -> Option<TimerRearmAttempt<'_>> {
+        let claimable = claimable?;
+        let publication = self.publication.load(Ordering::Acquire);
+        (publication != self.acknowledged.load(Ordering::Acquire)).then_some(TimerRearmAttempt {
+            demand: self, publication, claimable,
+        })
+    }
+}
+
+impl Default for TimerRearmDemand {
+    fn default() -> Self { Self::new() }
+}
+
+impl TimerRearmAttempt<'_> {
+    /// A successful shot covers the sampled work. Idle is conclusive only when
+    /// the sampled queue had no claimable sector. Failure retains the demand.
+    pub fn finish(self, outcome: TimerRearmOutcome) -> bool {
+        if matches!(outcome, TimerRearmOutcome::Programmed)
+            || (!self.claimable && matches!(outcome, TimerRearmOutcome::Idle))
+        {
+            self.demand.acknowledged.fetch_max(self.publication, Ordering::AcqRel);
+            return true;
+        }
+        false
+    }
+}
+
 /// Outer receive preconditions, sampled from the current timer and scheduler owners.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimerReceiveState {
@@ -37,6 +94,7 @@ pub struct TimerReceiveState {
     pub active: bool,
     pub delivery_running: bool,
     pub continuation_running: bool,
+    pub pending_delivery: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +103,7 @@ pub enum TimerReceiveError {
     UnavailableOwner,
     ActiveDelivery,
     ActiveContinuation,
+    PendingDelivery,
     Rearm(TimerRearmOutcome),
 }
 
@@ -68,6 +127,9 @@ impl TimerReceiveState {
         }
         if self.continuation_running {
             return Err(TimerReceiveError::ActiveContinuation);
+        }
+        if self.pending_delivery {
+            return Err(TimerReceiveError::PendingDelivery);
         }
         match rearm() {
             Some(outcome) if !outcome.owner_available() => Err(TimerReceiveError::Rearm(outcome)),
@@ -130,6 +192,63 @@ pub fn pit_oneshot_for_deadline(
         wake_deadline_100ns,
         chunked: wake_deadline_100ns < deadline_100ns,
     }
+}
+
+/// A live one-shot is sufficient when its physical wake is no later than the next
+/// selected deadline. An expired or delivered shot cannot cover new demand, even
+/// if its former wake time compares favourably with that deadline.
+pub const fn pit_oneshot_covers_deadline(
+    armed: bool,
+    physical_wake_100ns: u64,
+    now_100ns: u64,
+    selected_deadline_100ns: u64,
+) -> bool {
+    armed && now_100ns < physical_wake_100ns
+        && physical_wake_100ns <= selected_deadline_100ns
+}
+
+/// Authority to reuse one physical PIT shot. A timer notification or an idle
+/// selection retires it before any subsequent rearm decision. The wake target
+/// remains available for diagnostics after retirement.
+pub struct PitOneShotAuthority {
+    physical_wake_100ns: AtomicU64,
+    armed: AtomicBool,
+}
+
+impl PitOneShotAuthority {
+    pub const fn new() -> Self {
+        Self { physical_wake_100ns: AtomicU64::new(0), armed: AtomicBool::new(false) }
+    }
+
+    pub fn publish(&self, physical_wake_100ns: u64) {
+        self.physical_wake_100ns.store(physical_wake_100ns, Ordering::Relaxed);
+        self.armed.store(true, Ordering::Release);
+    }
+
+    pub fn invalidate(&self) {
+        self.armed.store(false, Ordering::Release);
+    }
+
+    pub fn covers(&self, now_100ns: u64, selected_deadline_100ns: u64) -> bool {
+        pit_oneshot_covers_deadline(
+            self.armed.load(Ordering::Acquire),
+            self.physical_wake_100ns.load(Ordering::Relaxed),
+            now_100ns,
+            selected_deadline_100ns,
+        )
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::Acquire)
+    }
+
+    pub fn physical_wake_100ns(&self) -> u64 {
+        self.physical_wake_100ns.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for PitOneShotAuthority {
+    fn default() -> Self { Self::new() }
 }
 
 fn div_ceil_u128(numerator: u128, denominator: u128) -> u128 {
@@ -219,6 +338,20 @@ struct Timer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimerExpiry {
     pub timer_ptr: u64,
+    /// The exact set generation that expired, retained across periodic rescheduling.
+    pub generation: u64,
+    pub dpc_ptr: Option<u64>,
+}
+
+/// Copied owner of the earliest active timer at one clock snapshot.
+/// Observation does not expire or otherwise change the timer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActiveTimerSnapshot {
+    pub timer_ptr: u64,
+    pub generation: u64,
+    pub deadline: Deadline,
+    pub projected_monotonic_100ns: u64,
+    pub period_100ns: u64,
     pub dpc_ptr: Option<u64>,
 }
 
@@ -324,17 +457,32 @@ impl TimerQueue {
     }
 
     pub fn next_deadline_at(&self, now: TimeSnapshot) -> Option<u64> {
+        self.earliest_active_at(now)
+            .map(|timer| timer.projected_monotonic_100ns)
+    }
+
+    /// Break equal comparator targets by timer identity, then generation, so
+    /// diagnostic selection is independent of the queue's insertion order.
+    pub fn earliest_active_at(&self, now: TimeSnapshot) -> Option<ActiveTimerSnapshot> {
         self.timers
             .iter()
             .filter(|timer| timer.active)
-            .filter_map(|timer| timer.deadline.monotonic_target(now))
-            .min()
+            .filter_map(|timer| Some(ActiveTimerSnapshot {
+                timer_ptr: timer.ptr,
+                generation: timer.generation,
+                deadline: timer.deadline,
+                projected_monotonic_100ns: timer.deadline.monotonic_target(now)?,
+                period_100ns: timer.period_100ns,
+                dpc_ptr: timer.dpc_ptr,
+            }))
+            .min_by_key(|timer| (timer.projected_monotonic_100ns,
+                timer.timer_ptr, timer.generation))
     }
 
-    /// Discard all timer identities owned by this queue.
+    /// Discard all timers while keeping the generation sequence. A later timer at
+    /// the same pointer cannot acquire an identity held by an old expiry receipt.
     pub fn clear(&mut self) {
         self.timers.clear();
-        self.next_gen = 0;
     }
 
     /// The timer's current generation (bumped on every `set`; a stale expiry
@@ -361,6 +509,7 @@ impl TimerQueue {
                 t.signaled = true;
                 fired.push(TimerExpiry {
                     timer_ptr: t.ptr,
+                    generation: t.generation,
                     dpc_ptr: t.dpc_ptr,
                 });
                 if t.period_100ns > 0 {
@@ -482,6 +631,58 @@ mod tests {
     }
 
     #[test]
+    fn expiry_keeps_the_set_generation_across_periods_and_reused_pointer() {
+        let mut clk = FakeClock::new();
+        let mut tq = TimerQueue::new();
+        tq.set(0x700, -100, 1, Some(0xD1), &clk);
+        let selected = tq.earliest_active_at(clk.snapshot()).unwrap();
+
+        clk.advance_100ns(100);
+        let first = tq.run_due_expirations(&clk)[0];
+        assert_eq!(first.timer_ptr, selected.timer_ptr);
+        assert_eq!(first.generation, selected.generation);
+        assert_eq!(tq.generation(0x700), Some(first.generation));
+
+        clk.advance_100ns(10_000);
+        let periodic = tq.run_due_expirations(&clk)[0];
+        assert_eq!(periodic.generation, first.generation);
+
+        // Re-arm the same pointer with the same DPC. Pointer-only matching would
+        // misidentify a delayed receipt from the old set as this new expiry.
+        tq.set(0x700, -100, 0, Some(0xD1), &clk);
+        let replacement = tq.earliest_active_at(clk.snapshot()).unwrap();
+        assert_eq!(replacement.timer_ptr, first.timer_ptr);
+        assert_ne!(replacement.generation, first.generation);
+        clk.advance_100ns(100);
+        let current = tq.run_due_expirations(&clk)[0];
+        assert_eq!(current.generation, replacement.generation);
+        assert_eq!(current.timer_ptr, first.timer_ptr);
+        assert_eq!(current.dpc_ptr, first.dpc_ptr);
+        assert_ne!(current, first);
+
+        tq.clear();
+        tq.set(0x700, -100, 0, Some(0xD1), &clk);
+        let after_clear = tq.earliest_active_at(clk.snapshot()).unwrap();
+        assert_ne!(after_clear.generation, current.generation);
+        clk.advance_100ns(100);
+        let recycled = tq.run_due_expirations(&clk)[0];
+        assert_eq!(recycled.timer_ptr, first.timer_ptr);
+        assert_ne!(recycled.generation, first.generation);
+        assert_ne!(recycled.generation, current.generation);
+    }
+
+    #[test]
+    fn queue_clear_never_reuses_a_previously_published_generation() {
+        let clk = FakeClock::new();
+        let mut tq = TimerQueue::new();
+        tq.set(0x700, -100, 0, None, &clk);
+        let before = tq.generation(0x700).unwrap();
+        tq.clear();
+        tq.set(0x700, -100, 0, None, &clk);
+        assert_ne!(tq.generation(0x700), Some(before));
+    }
+
+    #[test]
     fn cancel_stops_a_timer() {
         let mut clk = FakeClock::new();
         let mut tq = TimerQueue::new();
@@ -497,6 +698,7 @@ mod tests {
         let mut clk = FakeClock::new();
         let mut tq = TimerQueue::new();
         tq.set(0x700, -1_000, 0, None, &clk);
+        let generation = tq.generation(0x700).unwrap();
         tq.set(0x800, -2_000, 0, Some(0xD2), &clk);
         assert_eq!(tq.next_deadline(&clk), Some(1_000));
 
@@ -505,6 +707,7 @@ mod tests {
             tq.run_due_expirations(&clk),
             vec![TimerExpiry {
                 timer_ptr: 0x700,
+                generation,
                 dpc_ptr: None,
             }]
         );
@@ -520,6 +723,7 @@ mod tests {
         let clk = FakeClock::new();
         let mut tq = TimerQueue::new();
         tq.set(0x700, -1_000, 0, Some(0xD1), &clk);
+        let generation = tq.generation(0x700).unwrap();
 
         // The sampled clock is still one quantum behind, but the interrupt
         // owner knows that the armed deadline produced this delivery.
@@ -533,6 +737,7 @@ mod tests {
             tq.run_due_expirations_at(now),
             vec![TimerExpiry {
                 timer_ptr: 0x700,
+                generation,
                 dpc_ptr: Some(0xD1),
             }]
         );
@@ -560,6 +765,59 @@ mod tests {
         assert!(tq.run_due_expirations(&clk).is_empty());
         clk.advance_100ns(1);
         assert_eq!(tq.run_due_expirations(&clk).len(), 1);
+    }
+
+    #[test]
+    fn earliest_active_snapshot_is_read_only_and_orders_equal_deadlines_by_identity() {
+        let mut clk = FakeClock::new();
+        let mut tq = TimerQueue::new();
+        // Insert the higher identity first to prove the result does not depend
+        // on insertion order. An inactive earlier timer must not be selected.
+        tq.set(0x900, -1_000, 0, Some(0xD9), &clk);
+        tq.set(0x700, -1_000, 1, Some(0xD7), &clk);
+        tq.set(0x500, -500, 0, None, &clk);
+        tq.cancel(0x500);
+        let snapshot = tq.earliest_active_at(clk.snapshot()).unwrap();
+        assert_eq!(snapshot, ActiveTimerSnapshot {
+            timer_ptr: 0x700,
+            generation: tq.generation(0x700).unwrap(),
+            deadline: Deadline::Relative { monotonic_100ns: 1_000 },
+            projected_monotonic_100ns: 1_000,
+            period_100ns: 10_000,
+            dpc_ptr: Some(0xD7),
+        });
+        assert_eq!(tq.earliest_active_at(clk.snapshot()), Some(snapshot));
+        assert_eq!(tq.next_deadline(&clk), Some(snapshot.projected_monotonic_100ns));
+        assert!(!tq.read_state(0x700));
+        clk.advance_100ns(1_000);
+        assert_eq!(tq.run_due_expirations(&clk).len(), 2);
+        assert_eq!(tq.earliest_active_at(clk.snapshot()).unwrap().projected_monotonic_100ns,
+            11_000);
+        tq.set(0x700, -2_000, 0, Some(0xD8), &clk);
+        let rearmed = tq.earliest_active_at(clk.snapshot()).unwrap();
+        assert_eq!(rearmed.timer_ptr, 0x700);
+        assert!(rearmed.generation > snapshot.generation);
+        assert_eq!(rearmed.projected_monotonic_100ns, 3_000);
+        assert_eq!(rearmed.dpc_ptr, Some(0xD8));
+    }
+
+    #[test]
+    fn earliest_active_snapshot_projects_absolute_deadline_at_sample_time() {
+        let mut clk = FakeClock::new();
+        clk.set_system_time(1_000);
+        let mut tq = TimerQueue::new();
+        tq.set(0x700, 5_000, 0, None, &clk);
+        let snapshot = tq.earliest_active_at(clk.snapshot()).unwrap();
+        assert_eq!(snapshot.deadline,
+            Deadline::Absolute { system_time_100ns: 5_000 });
+        assert_eq!(snapshot.projected_monotonic_100ns, 4_000);
+        clk.advance_100ns(1_000);
+        clk.set_system_time(6_000);
+        let overdue = tq.earliest_active_at(clk.snapshot()).unwrap();
+        assert_eq!(overdue.projected_monotonic_100ns, 1_000);
+        assert_eq!(overdue.timer_ptr, snapshot.timer_ptr);
+        assert_eq!(overdue.generation, snapshot.generation);
+        assert!(!tq.read_state(0x700));
     }
 
     #[test]

@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 
 use super::pe_resource::{self, FindStatus, ResName};
 use crate::{NtStatus, STATUS_INVALID_PARAMETER};
+use nt_pe_loader::{capture_image_layout, ImageHeaderCaptureError, PeLayout};
 
 pub const STATUS_INVALID_IMAGE_FORMAT: NtStatus = 0xC000_007B;
 pub const STATUS_RESOURCE_DATA_NOT_FOUND: NtStatus = 0xC000_0089;
@@ -110,6 +111,160 @@ pub fn extract_manifest_resource<'a>(
         pe_resource::data_entry(rsrc, found.offset).ok_or(STATUS_RESOURCE_DATA_NOT_FOUND)?;
     pe.bytes_at_rva(data_rva, size as usize)
         .ok_or(STATUS_RESOURCE_DATA_NOT_FOUND)
+}
+
+fn read_exact_at(
+    read: &mut impl FnMut(u64, &mut [u8]) -> Result<usize, NtStatus>,
+    offset: u64,
+    output: &mut [u8],
+    short_status: NtStatus,
+) -> Result<(), NtStatus> {
+    let mut filled = 0usize;
+    while filled < output.len() {
+        let current = offset
+            .checked_add(filled as u64)
+            .ok_or(short_status)?;
+        let count = read(current, &mut output[filled..])?;
+        if count == 0 || count > output.len() - filled {
+            return Err(short_status);
+        }
+        filled += count;
+    }
+    Ok(())
+}
+
+/// A single 4 KiB resource-directory window. Resource offsets remain relative
+/// to the PE data-directory root, exactly as in the slice-backed walker.
+struct SparseResource<'a, F> {
+    read: &'a mut F,
+    root: u64,
+    length: usize,
+    page: [u8; 4096],
+    page_start: usize,
+    page_length: usize,
+    read_error: Option<NtStatus>,
+}
+
+impl<F: FnMut(u64, &mut [u8]) -> Result<usize, NtStatus>> SparseResource<'_, F> {
+    fn byte(&mut self, offset: usize) -> Option<u8> {
+        if offset >= self.length {
+            return None;
+        }
+        if offset < self.page_start || offset >= self.page_start + self.page_length {
+            let page_start = offset & !4095;
+            let page_length = (self.length - page_start).min(self.page.len());
+            let file_offset = self.root.checked_add(page_start as u64)?;
+            if let Err(status) = read_exact_at(
+                self.read,
+                file_offset,
+                &mut self.page[..page_length],
+                STATUS_RESOURCE_DATA_NOT_FOUND,
+            ) {
+                self.read_error = Some(status);
+                return None;
+            }
+            self.page_start = page_start;
+            self.page_length = page_length;
+        }
+        Some(self.page[offset - self.page_start])
+    }
+
+    fn bytes<const N: usize>(&mut self, offset: usize) -> Option<[u8; N]> {
+        let end = offset.checked_add(N)?;
+        if end > self.length {
+            return None;
+        }
+        let mut result = [0; N];
+        for (index, byte) in result.iter_mut().enumerate() {
+            *byte = self.byte(offset + index)?;
+        }
+        Some(result)
+    }
+}
+
+impl<F: FnMut(u64, &mut [u8]) -> Result<usize, NtStatus>> pe_resource::ResourceBytes
+    for SparseResource<'_, F>
+{
+    fn len(&self) -> usize { self.length }
+    fn read_u16(&mut self, offset: usize) -> Option<u16> {
+        self.bytes(offset).map(u16::from_le_bytes)
+    }
+    fn read_u32(&mut self, offset: usize) -> Option<u32> {
+        self.bytes(offset).map(u32::from_le_bytes)
+    }
+}
+
+/// Read only the PE metadata, selected resource-tree pages and manifest payload
+/// from one retained File. The File extent is authoritative; no image-sized
+/// allocation or scan is needed when the manifest lives near the front.
+pub fn extract_manifest_resource_from_reader(
+    file_size: u64,
+    mut read: impl FnMut(u64, &mut [u8]) -> Result<usize, NtStatus>,
+    resource_name: &ManifestResourceName,
+    language: u16,
+) -> Result<Vec<u8>, NtStatus> {
+    let layout: PeLayout = capture_image_layout(file_size, |offset, output| {
+        read_exact_at(&mut read, offset, output, STATUS_INVALID_IMAGE_FORMAT)?;
+        Ok(output.len())
+    })
+    .map_err(|error| match error {
+        ImageHeaderCaptureError::Read(status) => status,
+        ImageHeaderCaptureError::Parse(_) | ImageHeaderCaptureError::ShortRead { .. } =>
+            STATUS_INVALID_IMAGE_FORMAT,
+    })?;
+    let directory = layout
+        .headers()
+        .data_directory(nt_pe_loader::DIRECTORY_ENTRY_RESOURCE);
+    if directory.virtual_address == 0 || directory.size < pe_resource::DIR_SIZE as u32 {
+        return Err(STATUS_RESOURCE_DATA_NOT_FOUND);
+    }
+    let root = layout
+        .file_span_at_rva(directory.virtual_address, directory.size as usize, file_size)
+        .ok_or(STATUS_RESOURCE_DATA_NOT_FOUND)?;
+    let mut resource = SparseResource {
+        read: &mut read,
+        root,
+        length: directory.size as usize,
+        page: [0; 4096],
+        page_start: 0,
+        page_length: 0,
+        read_error: None,
+    };
+    let (languages, language_count, neutral_first) = language_candidates(language);
+    let found = pe_resource::find_entry_in(
+        &mut resource,
+        &ResName::Id(24),
+        &resource_name.as_res_name(),
+        &languages[..language_count],
+        neutral_first,
+        3,
+        false,
+    );
+    if let Some(status) = resource.read_error {
+        return Err(status);
+    }
+    let found = found.map_err(find_status)?;
+    let (data_rva, size) = pe_resource::data_entry_in(&mut resource, found.offset)
+        .ok_or_else(|| resource.read_error.unwrap_or(STATUS_RESOURCE_DATA_NOT_FOUND))?;
+    if size == 0 || size as usize > super::activation::MAX_MANIFEST_BYTES {
+        return Err(super::activation::STATUS_SXS_INVALID_ACTCTXDATA_FORMAT);
+    }
+    let offset = layout
+        .file_span_at_rva(data_rva, size as usize, file_size)
+        .ok_or(STATUS_RESOURCE_DATA_NOT_FOUND)?;
+    let mut manifest = Vec::new();
+    manifest.try_reserve_exact(size as usize)
+        .map_err(|_| super::activation_section::STATUS_NO_MEMORY)?;
+    manifest.resize(size as usize, 0);
+    for (index, chunk) in manifest.chunks_mut(0x4000).enumerate() {
+        read_exact_at(
+            &mut read,
+            offset.checked_add((index * 0x4000) as u64).ok_or(STATUS_RESOURCE_DATA_NOT_FOUND)?,
+            chunk,
+            STATUS_RESOURCE_DATA_NOT_FOUND,
+        )?;
+    }
+    Ok(manifest)
 }
 
 /// Extract the first numeric `RT_MANIFEST` name and its first language leaf.
@@ -284,5 +439,107 @@ mod tests {
             extract_manifest_resource(&image, &ManifestResourceName::Id(1), 0),
             Err(STATUS_RESOURCE_DATA_NOT_FOUND)
         );
+    }
+
+    #[test]
+    fn sparse_pe_manifest_read_matches_full_image_without_scanning_file_body() {
+        let mut image = manifest_pe(None, 0x0409, b"<assembly>real manifest</assembly>");
+        image.resize(12 * 1024 * 1024, 0xa5);
+        let name = ManifestResourceName::Id(1);
+        let expected = extract_manifest_resource(&image, &name, 0x0409)
+            .unwrap()
+            .to_vec();
+        let mut read_bytes = 0usize;
+        let mut read_calls = 0usize;
+        let actual = extract_manifest_resource_from_reader(
+            image.len() as u64,
+            |offset, output| {
+                let start = usize::try_from(offset).map_err(|_| STATUS_INVALID_IMAGE_FORMAT)?;
+                let end = start
+                    .checked_add(output.len())
+                    .ok_or(STATUS_INVALID_IMAGE_FORMAT)?;
+                let source = image.get(start..end).ok_or(STATUS_INVALID_IMAGE_FORMAT)?;
+                output.copy_from_slice(source);
+                read_bytes += output.len();
+                read_calls += 1;
+                Ok(output.len())
+            },
+            &name,
+            0x0409,
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+        assert!(read_bytes < 128 * 1024, "read {read_bytes} of {} bytes", image.len());
+        assert!(read_calls < 24, "made {read_calls} reads");
+    }
+
+    #[test]
+    fn sparse_pe_manifest_reader_handles_partial_reads_and_rejects_early_eof() {
+        let image = manifest_pe(None, 0x0409, b"<assembly>partial reads</assembly>");
+        let name = ManifestResourceName::Id(1);
+        let expected = extract_manifest_resource(&image, &name, 0x0409)
+            .unwrap()
+            .to_vec();
+        let actual = extract_manifest_resource_from_reader(
+            image.len() as u64,
+            |offset, output| {
+                let start = usize::try_from(offset).map_err(|_| STATUS_INVALID_IMAGE_FORMAT)?;
+                let count = output.len().min(3);
+                let source = image
+                    .get(start..start + count)
+                    .ok_or(STATUS_INVALID_IMAGE_FORMAT)?;
+                output[..count].copy_from_slice(source);
+                Ok(count)
+            },
+            &name,
+            0x0409,
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+
+        let mut calls = 0usize;
+        let error = extract_manifest_resource_from_reader(
+            image.len() as u64,
+            |offset, output| {
+                calls += 1;
+                if calls == 2 {
+                    return Ok(0);
+                }
+                let start = usize::try_from(offset).map_err(|_| STATUS_INVALID_IMAGE_FORMAT)?;
+                let count = output.len().min(3);
+                let source = image
+                    .get(start..start + count)
+                    .ok_or(STATUS_INVALID_IMAGE_FORMAT)?;
+                output[..count].copy_from_slice(source);
+                Ok(count)
+            },
+            &name,
+            0x0409,
+        )
+        .unwrap_err();
+        assert_eq!(error, STATUS_INVALID_IMAGE_FORMAT);
+    }
+
+    #[test]
+    fn sparse_pe_manifest_preserves_resource_extent_errors() {
+        let mut image = manifest_pe(None, 0x0409, b"manifest");
+        put_u32(&mut image, OPTIONAL_OFFSET + 112 + 2 * 8 + 4, 0x300);
+        let name = ManifestResourceName::Id(1);
+        let expected = extract_manifest_resource(&image, &name, 0x0409).unwrap_err();
+        let actual = extract_manifest_resource_from_reader(
+            image.len() as u64,
+            |offset, output| {
+                let start = offset as usize;
+                let source = image
+                    .get(start..start + output.len())
+                    .ok_or(STATUS_RESOURCE_DATA_NOT_FOUND)?;
+                output.copy_from_slice(source);
+                Ok(output.len())
+            },
+            &name,
+            0x0409,
+        )
+        .unwrap_err();
+        assert_eq!(actual, expected);
     }
 }

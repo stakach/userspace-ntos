@@ -54,7 +54,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
             return Err(StartupError::BindingMismatch);
         }
         let epoch = crate::NEXT_DISPATCH_EPOCH
-            .fetch_update(
+            .try_update(
                 core::sync::atomic::Ordering::Relaxed,
                 core::sync::atomic::Ordering::Relaxed,
                 |next| {

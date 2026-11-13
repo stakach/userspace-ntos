@@ -8,6 +8,9 @@ use nt_user_host::ProcessDeletionCandidate;
 
 struct Row {
     candidate: ProcessDeletionCandidate,
+    provider_badge: u64,
+    provider_role: Option<nt_exe_image::HostedProcessRole>,
+    execution_retired: bool,
     owner: Option<ProcessObjectRetirement>,
     provider: ProviderFinalization,
     backing: Option<crate::ps_object_backing::ProcessBackingRetirement>,
@@ -69,7 +72,65 @@ impl Retirements {
     }
 
     pub(crate) fn owns_mechanism_slot(&self, pi: usize) -> bool {
-        self.rows.iter().any(|row| row.candidate.pi == pi)
+        self.rows.iter().any(|row| row.candidate.pi == pi && !row.execution_retired)
+    }
+
+    /// Freeze provider identity while the exact execution mechanism and image still exist.
+    /// A later finalizer must never read badge or role from a replacement in the same pi.
+    pub(crate) fn prepare_provider_context(
+        &mut self,
+        candidate: ProcessDeletionCandidate,
+        badge: u64,
+        role: Option<nt_exe_image::HostedProcessRole>,
+    ) -> Result<(), u32> {
+        let _durable = crate::allocator::enter_durable();
+        if let Some(index) = self.index(candidate) {
+            let row = &self.rows[index];
+            return if row.provider_badge == badge && row.provider_role == role {
+                Ok(())
+            } else {
+                Err(nt_process::STATUS_INVALID_HANDLE)
+            };
+        }
+        self.rows
+            .try_reserve(1)
+            .map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
+        self.rows.push(Row {
+            candidate,
+            provider_badge: badge,
+            provider_role: role,
+            execution_retired: false,
+            owner: None,
+            provider: ProviderFinalization::new(candidate.provider_objects),
+            backing: None,
+            deletion: None,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn provider_finalizer_context(
+        &self,
+        candidate: ProcessDeletionCandidate,
+    ) -> Option<(u64, Option<nt_exe_image::HostedProcessRole>)> {
+        self.index(candidate).map(|index| {
+            let row = &self.rows[index];
+            (row.provider_badge, row.provider_role)
+        })
+    }
+
+    pub(crate) fn mark_execution_retired(&mut self, candidate: ProcessDeletionCandidate) -> Result<(), u32> {
+        let row = self.index(candidate)
+            .and_then(|index| self.rows.get_mut(index))
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        if row.execution_retired {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        row.execution_retired = true;
+        Ok(())
+    }
+
+    pub(crate) fn execution_retired(&self, candidate: ProcessDeletionCandidate) -> bool {
+        self.index(candidate).is_some_and(|index| self.rows[index].execution_retired)
     }
 
     pub(crate) fn withdraw(
@@ -78,23 +139,10 @@ impl Retirements {
         pm: &mut ProcessManager,
     ) -> Result<(), u32> {
         let _durable = crate::allocator::enter_durable();
-        let index = match self.index(candidate) {
-            Some(index) => index,
-            None => {
-                self.rows
-                    .try_reserve(1)
-                    .map_err(|_| nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
-                let index = self.rows.len();
-                self.rows.push(Row {
-                    candidate,
-                    owner: None,
-                    provider: ProviderFinalization::new(candidate.provider_objects),
-                    backing: None,
-                    deletion: None,
-                });
-                index
-            }
-        };
+        let index = self.index(candidate).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        if !self.rows[index].execution_retired {
+            return Err(nt_process::STATUS_DEVICE_BUSY);
+        }
         if self.rows[index].owner.is_none() && self.rows[index].deletion.is_none() {
             // This call cannot enter a provider. The prepared native row receives the
             // sole ticket before any subsequent operation may invoke external code.

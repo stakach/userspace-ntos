@@ -8,7 +8,7 @@ fn attach_function() -> syn::ItemFn {
     file.items
         .into_iter()
         .find_map(|item| match item {
-            syn::Item::Fn(function) if function.sig.ident == "w32_client_attach" => Some(function),
+            syn::Item::Fn(function) if function.sig.ident == "w32_client_attach_effect" => Some(function),
             _ => None,
         })
         .expect("native attachment boundary")

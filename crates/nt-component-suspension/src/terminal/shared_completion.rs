@@ -41,3 +41,103 @@ impl<C, R: Clone, T> ComponentSuspensionLanes<C, R, T> {
         self.finish_terminal_with_execution(identity, reply_object, local_retirement, true)
     }
 }
+
+impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
+    /// Retire a real receive-half result after every Reply stage acknowledges. No synthetic
+    /// provider completion is required; the original shared dispatch remains active.
+    pub fn finish_shared_nested_restore_terminal(
+        &mut self,
+        route: peer_registry::PeerRoute,
+        dispatch: LaneDispatchIdentity,
+        identity: TerminalIdentity,
+        reply_object: u64,
+        local_retirement: Result<(), u32>,
+    ) -> Result<Option<RetiredNestedRestore<C, T>>, LaneError> {
+        let record = self.terminal_record(identity, reply_object)?;
+        let lane = self.lane(identity.lane())?;
+        if identity.key.kind != SuspensionKind::NestedRestore
+            || route.identity().lane != identity.lane()
+            || lane.shared_peer != Some(route)
+            || dispatch != identity.dispatch
+            || lane.dispatch != Some(dispatch)
+            || lane.binding.executor_id != route.identity().executor
+            || lane.binding.receive_endpoint != route.endpoint()
+            || lane.suspensions.len() != 1
+            || match record.pending_nested_callback {
+                Some(callback) => {
+                    identity.external_token != Some(callback.new_token)
+                        || lane.external_tokens.last().copied() != callback.outer_token
+                        || (callback.outer_token.is_none() && !lane.external_tokens.is_empty())
+                }
+                None => match identity.external_token {
+                    Some(token) => lane.external_tokens.last().copied() != Some(token),
+                    None => !lane.external_tokens.is_empty(),
+                },
+            }
+            || !lane.suspensions.top().is_some_and(|frame| {
+                frame.key == identity.key && frame.owner == identity.owner
+                    && matches!(frame.phase, SuspensionPhase::NestedTerminal)
+            })
+        {
+            return Err(LaneError::InvalidIdentity);
+        }
+        if !matches!(record.phase, TerminalPhase::Acknowledged { .. }) {
+            return Err(LaneError::InvalidPhase);
+        }
+        if self.execution_busy() { return Err(LaneError::Busy); }
+        if record.pending_nested_callback.is_some()
+            && lane.external_tokens.len() >= lane.external_tokens.capacity()
+        {
+            return Err(LaneError::NoCapacity);
+        }
+        let lane = self.lane_mut(identity.lane())?;
+        if let Err(status) = local_retirement {
+            lane.terminal.as_mut().unwrap().phase = TerminalPhase::Acknowledged {
+                local_error: Some(status),
+            };
+            return Ok(None);
+        }
+        let frame = lane.suspensions.frames.pop().unwrap();
+        let terminal = lane.terminal.take().unwrap();
+        if let Some(callback) = terminal.pending_nested_callback {
+            // Retention reserved this slot and checked uniqueness before native effects.
+            lane.external_tokens.push(callback.new_token);
+        }
+        lane.phase = LanePhase::Running;
+        self.running = Some(identity.lane());
+        Ok(Some(RetiredNestedRestore {
+            key: identity.key, owner: identity.owner,
+            continuation: frame.continuation, payload: terminal.payload,
+        }))
+    }
+
+    /// Retire an acknowledged maintenance Reply while preserving the exact shared dispatch.
+    /// The adapter must separately authenticate the provider's final completion Call.
+    pub fn finish_shared_root_maintenance_terminal(
+        &mut self,
+        route: peer_registry::PeerRoute,
+        dispatch: LaneDispatchIdentity,
+        identity: TerminalIdentity,
+        reply_object: u64,
+        local_retirement: Result<(), u32>,
+    ) -> Result<Option<RetiredRootMaintenance<C, T>>, LaneError> {
+        let record = self.terminal_record(identity, reply_object)?;
+        let lane = self.lane(identity.lane())?;
+        if route.identity().lane != identity.lane()
+            || lane.shared_peer != Some(route)
+            || dispatch != identity.dispatch
+            || lane.dispatch != Some(dispatch)
+            || lane.binding.executor_id != route.identity().executor
+            || lane.binding.receive_endpoint != route.endpoint()
+        {
+            return Err(LaneError::InvalidIdentity);
+        }
+        if !matches!(record.phase, TerminalPhase::Acknowledged { .. }) {
+            return Err(LaneError::InvalidPhase);
+        }
+        if self.execution_busy() { return Err(LaneError::Busy); }
+        self.finish_root_maintenance_terminal_with_execution(
+            identity, reply_object, local_retirement, true,
+        )
+    }
+}

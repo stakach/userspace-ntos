@@ -39,7 +39,7 @@ struct Fixture {
     id: ObjectWaiterIdentity,
     waiter: Wait,
     files: FileCompletionTable<1>,
-    ports: CompletionPortTable<1, 1>,
+    ports: CompletionPortTable<1>,
     receipt: Option<FileReferenceRelease>,
     registers: [u64; 20],
     releases: usize,

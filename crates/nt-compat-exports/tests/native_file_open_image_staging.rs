@@ -56,8 +56,15 @@ impl<'ast> Visit<'ast> for Effects {
 
 #[test]
 fn canonical_file_open_does_not_stage_or_relocate_a_dll() {
+    let handler = source("exec_handler.rs");
+    let mut service = Effects::default();
+    service.visit_block(&method(&handler, "nt_open_file_service"));
+    assert!(service.calls.iter().any(|name| name == "nt_open_file_captured"),
+        "validated OpenFile admission reaches its captured File path");
     let mut effects = Effects::default();
-    effects.visit_block(&method(&source("exec_handler.rs"), "nt_open_file_service"));
+    effects.visit_block(&method(&handler, "nt_open_file_captured"));
+    effects.calls.extend(service.calls);
+    effects.fields.extend(service.fields);
     for forbidden in [
         "demand_load_dll_result",
         "pool_alloc",

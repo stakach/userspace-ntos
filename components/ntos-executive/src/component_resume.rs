@@ -7,6 +7,10 @@ use nt_component_suspension::{LaneResume, ResumeDemand, ResumePass, ResumeWake, 
 mod execute;
 pub(super) use execute::{run_hosted, run_receive};
 
+#[path = "component_resume_maintenance.rs"]
+mod maintenance;
+pub(crate) use maintenance::{run_root_maintenance, RootMaintenanceResumeOutcome};
+
 #[path = "component_resume_bootstrap.rs"]
 mod bootstrap;
 pub(crate) use bootstrap::{run_bootstrap_outer, BootstrapPassOutcome};
@@ -31,6 +35,135 @@ static mut WAKE: ResumeWake = match ResumeWake::new(10_000, 160_000) {
     Err(_) => panic!("invalid component resume pacing"),
 };
 static FAILURES: AtomicU64 = AtomicU64::new(0);
+static RESUME_GATE_TRACES: AtomicU64 = AtomicU64::new(0);
+static RESUME_ELIGIBILITY_TRACES: AtomicU64 = AtomicU64::new(0);
+static RESUME_SELECTION_TRACES: AtomicU64 = AtomicU64::new(0);
+static RESUME_PRECLAIM_TRACES: AtomicU64 = AtomicU64::new(0);
+
+fn resume_trace_sample(counter: &AtomicU64) -> bool {
+    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    count <= 16 || count.is_power_of_two()
+}
+
+fn trace_resume_frame(
+    stage: &'static [u8], lane: nt_component_suspension::LaneHandle,
+    key: nt_component_suspension::SuspensionKey, owner: SuspensionOwner,
+    detail: u64,
+) {
+    print_str(b"[component-resume-preclaim] stage="); print_str(stage);
+    print_str(b" lane/gen/kind/key/owner/detail=");
+    for value in [lane.index as u64, lane.generation, key.kind as u64,
+        key.id, owner.dispatch_id, detail] {
+        print_str(b"/"); print_hex_u64(value);
+    }
+    print_str(b"\n");
+}
+
+pub(super) fn trace_preclaim_refusal(
+    stage: &'static [u8], lane: nt_component_suspension::LaneHandle,
+    key: nt_component_suspension::SuspensionKey, owner: SuspensionOwner, detail: u64,
+) {
+    if resume_trace_sample(&RESUME_PRECLAIM_TRACES) {
+        trace_resume_frame(stage, lane, key, owner, detail);
+    }
+}
+
+/// Sample the exact selected source owner from its ready Work's bounded retry trace.
+/// Global resume counters can be exhausted long before this later boot frontier appears.
+pub(crate) unsafe fn trace_source_selected_resume_snapshot(
+    lane: nt_component_suspension::LaneHandle,
+    key: nt_component_suspension::SuspensionKey,
+    owner: SuspensionOwner,
+) {
+    let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
+    let Some(frame) = lanes.frame(lane, key).ok().flatten().filter(|frame| frame.owner == owner)
+    else { return };
+    let (pending_kind, reply_ready, client_ready, eligible) = match frame.continuation {
+        ComponentNativeContinuation::Hosted(hosted) => {
+            let kind = match hosted.pending {
+                PendingComponentDispatch::Provider(_) => 1,
+                PendingComponentDispatch::Lpc(_) => 2,
+                PendingComponentDispatch::Receive(_) => 3,
+                PendingComponentDispatch::ServiceWait(_) => 4,
+                PendingComponentDispatch::RootMaintenance(_) => 5,
+                PendingComponentDispatch::NestedRestore(_) => 6,
+            };
+            let reply = hosted.return_target.can_resume();
+            let client = win32k_glue::win32k_client_context_is_admitted(hosted.pending.client());
+            (kind, reply, client, reply && client && kind != 5 && kind != 6)
+        }
+        ComponentNativeContinuation::Kernel(_) => (7, false, false, false),
+        ComponentNativeContinuation::RootIngress(_) => (8, false, false, false),
+    };
+    let oldest = lanes.next_resumable_if(|_| true);
+    let target = lanes.next_resumable_if(|candidate|
+        candidate.key == key && candidate.owner == owner && eligible);
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *const ExecNtHandler;
+    let now = monotonic_time_100ns();
+    let deadline = (&*core::ptr::addr_of!(WAKE)).next_deadline();
+    let gates = u64::from(handler.is_null() || !runtime_ready(handler))
+        | (u64::from(is_running()) << 1)
+        | (u64::from(super::root_add_device_exclusive_pending()) << 2)
+        | (u64::from(super::root_queued_callback_exclusive_pending()) << 3)
+        | (u64::from(crate::driver_launch::unsettled_queued_callback()) << 4)
+        | (u64::from(crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()) << 5)
+        | (u64::from(crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()) << 6);
+    print_str(b"[source-selected-resume] lane/gen/key/owner/kind/reply/client/eligible/busy/oldest-lane/oldest-key/exact-candidate/gates/now/deadline=");
+    for value in [lane.index as u64, lane.generation, key.id, owner.dispatch_id,
+        pending_kind, u64::from(reply_ready), u64::from(client_ready), u64::from(eligible),
+        u64::from(lanes.execution_busy()),
+        oldest.as_ref().map_or(u64::MAX, |resume| resume.lane.index as u64),
+        oldest.as_ref().map_or(0, |resume| resume.suspension.key.id),
+        u64::from(target.as_ref().is_some_and(|resume| resume.lane == lane)),
+        gates, now, deadline.unwrap_or(0)] {
+        print_str(b"/"); print_hex_u64(value);
+    }
+    print_str(b"\n");
+    for identity in lanes.terminal_identities() {
+        let Ok(binding) = lanes.binding(identity.lane()) else { continue };
+        let Ok(view) = lanes.terminal(identity, binding.reply_object) else { continue };
+        if let nt_component_suspension::TerminalPhase::Invoking { attempt, .. } = view.phase {
+            trace_resume_frame(b"source-terminal-invoking", identity.lane(), identity.key(),
+                identity.owner(), attempt);
+        }
+    }
+}
+
+unsafe fn trace_selected_resume_gate(stage: &'static [u8], detail: u64) {
+    if !resume_trace_sample(&RESUME_GATE_TRACES) { return; }
+    let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
+    print_str(b"[component-resume-fence] execution-busy/running-lane=");
+    print_hex_u64(u64::from(lanes.execution_busy()));
+    print_str(b"/");
+    print_hex_u64(lanes.running().map_or(u64::MAX, |lane| lane.index as u64));
+    print_str(b"\n");
+    for identity in lanes.terminal_identities() {
+        let Ok(binding) = lanes.binding(identity.lane()) else { continue };
+        let Ok(view) = lanes.terminal(identity, binding.reply_object) else { continue };
+        if let nt_component_suspension::TerminalPhase::Invoking { attempt, .. } = view.phase {
+            trace_resume_frame(b"terminal-invoking", identity.lane(), identity.key(),
+                identity.owner(), attempt);
+        }
+    }
+    for (lane, frame) in lanes.frames() {
+        if !matches!(frame.phase,
+            nt_component_suspension::SuspensionPhase::Selected { .. }
+                | nt_component_suspension::SuspensionPhase::Cancelled { .. }) {
+            continue;
+        }
+        if lanes.phase(lane) != Ok(nt_component_suspension::LanePhase::Suspended)
+            || !lanes.top(lane).ok().flatten().is_some_and(|top| top.key == frame.key)
+        { continue; }
+        trace_resume_frame(stage, lane, frame.key, frame.owner, detail);
+        if let ComponentNativeContinuation::Hosted(hosted) = frame.continuation {
+            let readiness = u64::from(hosted.return_target.can_resume())
+                | (u64::from(win32k_glue::win32k_client_context_is_admitted(
+                    hosted.pending.client())) << 1);
+            trace_resume_frame(b"selected-hosted-readiness", lane, frame.key,
+                frame.owner, readiness);
+        }
+    }
+}
 
 pub(super) struct Candidate {
     pub(super) resume: LaneResume<ComponentSuspensionCompletion>,
@@ -45,12 +178,31 @@ unsafe fn eligible(
 ) -> bool {
     match continuation {
         ComponentNativeContinuation::Hosted(hosted) => {
-            hosted.return_target.can_resume()
-                && win32k_glue::win32k_client_context_is_admitted(hosted.pending.client())
+            if matches!(hosted.pending, PendingComponentDispatch::RootMaintenance(_)
+                | PendingComponentDispatch::NestedRestore(_)) {
+                return false;
+            }
+            let reply_ready = hosted.return_target.can_resume();
+            let client_ready = win32k_glue::win32k_client_context_is_admitted(hosted.pending.client());
+            if let HostedContinuationDestination::InitialThread(origin) = hosted.destination {
+                let binding = origin.target();
+                static INITIAL_RESUME_TRACE: AtomicU64 = AtomicU64::new(0);
+                let count = INITIAL_RESUME_TRACE.fetch_add(1, Ordering::Relaxed);
+                if count < 12 || count.is_power_of_two() {
+                    print_str(b"[initial-provider-wait] stage=eligible pi/tid/reply/client=");
+                    print_u64(binding.pi as u64);
+                    print_str(b"/"); print_u64(binding.tid);
+                    print_str(b"/"); print_u64(reply_ready as u64);
+                    print_str(b"/"); print_u64(client_ready as u64);
+                    print_str(b"\n");
+                }
+            }
+            reply_ready && client_ready
         }
         ComponentNativeContinuation::Kernel(capture) => {
             kernel_provider_activation::wait_resume_is_eligible(pm, capture)
         }
+        ComponentNativeContinuation::RootIngress(_) => false,
     }
 }
 
@@ -74,8 +226,32 @@ pub(super) unsafe fn next_ready(pm: &nt_process::ProcessManager) -> Option<Candi
 
 unsafe fn next_in_pass(pm: &nt_process::ProcessManager, pass: &mut ResumePass) -> Option<Candidate> {
     let resume = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
-        .next_resumable_in_pass(pass, |frame| eligible(pm, frame.continuation))?;
-    candidate(resume)
+        .next_resumable_in_pass(pass, |frame| {
+            let accepted = eligible(pm, frame.continuation);
+            if !accepted && resume_trace_sample(&RESUME_ELIGIBILITY_TRACES) {
+                let lane = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).frames()
+                    .find_map(|(lane, current)| (current.key == frame.key
+                        && current.owner == frame.owner).then_some(lane));
+                if let Some(lane) = lane {
+                    let detail = match frame.continuation {
+                        ComponentNativeContinuation::Hosted(hosted) => {
+                            u64::from(hosted.return_target.can_resume())
+                                | (u64::from(win32k_glue::win32k_client_context_is_admitted(
+                                    hosted.pending.client())) << 1)
+                        }
+                        _ => 0,
+                    };
+                    trace_resume_frame(b"ineligible", lane, frame.key, frame.owner, detail);
+                }
+            }
+            accepted
+        })?;
+    let selected = candidate(resume)?;
+    if resume_trace_sample(&RESUME_SELECTION_TRACES) {
+        trace_resume_frame(b"selected", selected.resume.lane,
+            selected.resume.suspension.key, selected.owner, selected.sequence);
+    }
+    Some(selected)
 }
 
 /// ACK plus a retained next Call transfers the external service token to its
@@ -112,7 +288,9 @@ unsafe fn select_ready_service_waits() {
 pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
     if is_running()
         || crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+        || crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
     {
+        trace_selected_resume_gate(b"hosted-drain-gated", 0);
         return 0;
     }
     let Some(ctx) = (*handler).loop_ctx else {
@@ -124,17 +302,33 @@ pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
     let mut pass = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).resume_pass();
     let mut drained = 0;
     loop {
-        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+            || crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
+        {
             break;
         }
         drained += component_terminal::drain(&mut *handler, &mut *ctx.procs, &mut *ctx.pfilled);
-        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+            || crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
+        {
             break;
         }
+        if let Some(ticket) = root_maintenance_owner::next_returned_ticket()
+            .or_else(|| root_maintenance_owner::next_ready_ticket()) {
+            match run_root_maintenance(handler, ticket) {
+                RootMaintenanceResumeOutcome::Parked | RootMaintenanceResumeOutcome::Terminal => {
+                    continue;
+                }
+                RootMaintenanceResumeOutcome::DeferredRetry
+                | RootMaintenanceResumeOutcome::RetainedFailure => break,
+            }
+        }
         let Some(candidate) = next_in_pass(&(*handler).pm, &mut pass) else {
+            trace_selected_resume_gate(b"hosted-no-candidate", 0);
             break;
         };
-        if matches!(candidate.continuation, ComponentNativeContinuation::Kernel(_)) {
+        if matches!(candidate.continuation,
+            ComponentNativeContinuation::Kernel(_) | ComponentNativeContinuation::RootIngress(_)) {
             break;
         }
         if run_hosted(handler, candidate).is_none() {
@@ -142,6 +336,7 @@ pub(super) unsafe fn drain_hosted_ready(handler: *mut ExecNtHandler) -> u64 {
         }
     }
     if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+        && !crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
         && (*handler).lpc_endpoint_progress
     {
         let _ = lpc_endpoint_redrive_all(&mut *handler);
@@ -162,12 +357,17 @@ fn runtime_ready(handler: *const ExecNtHandler) -> bool {
 
 /// Timer callbacks only query this demand; they never claim or execute a selected continuation.
 pub(crate) unsafe fn next_deadline(pm: &nt_process::ProcessManager) -> Option<u64> {
+    let nested = nested_restore_owner::next_deadline();
     if component_execution_is_busy()
         && !kernel_provider_activation::has_stopped_wait_work(pm)
     {
-        return None;
+        return nested;
     }
-    retained_deadline()
+    match (nested, retained_deadline()) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
 }
 
 /// Copy retained demand without runtime eligibility checks or claiming a continuation.
@@ -188,6 +388,15 @@ unsafe fn observe_demand(pm: &nt_process::ProcessManager) -> ResumeDemand {
         kernel_provider_activation::has_stopped_wait_work(pm),
         || {
             next_ready(pm).is_some()
+                || root_maintenance_owner::next_returned_ticket().is_some()
+                || (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).frames().any(|(_, frame)| {
+                    frame.key.kind == nt_component_suspension::SuspensionKind::RootMaintenance
+                        && matches!(frame.phase,
+                            nt_component_suspension::SuspensionPhase::MaintenanceReady { .. })
+                        && frame.continuation.hosted().is_some_and(|hosted| {
+                            hosted.return_target.can_resume()
+                        })
+                })
                 || kernel_provider_activation::has_ready_completions()
                 || (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
                     .next_terminal_if(|_, terminal| {
@@ -214,7 +423,7 @@ pub(super) unsafe fn reconcile(handler: &mut ExecNtHandler) {
 
 /// A failed source may not silently strand deadlines in a blocking receive. Do not initialize
 /// or replace hardware here: the existing fault path owns disabling and retiring that source.
-pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) {
+pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) -> ReceivePreparation {
     let state = nt_kernel_exec::TimerReceiveState {
         registered: SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire)
             == core::ptr::from_ref(handler) as u64
@@ -223,35 +432,329 @@ pub(super) unsafe fn prepare_receive(handler: &mut ExecNtHandler) {
             && DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire) == DELAY_TIMER_IRQ_ACTIVE,
         delivery_running: TIMER_DELIVERY_GATE.is_active(),
         continuation_running: is_running(),
+        pending_delivery: DELAY_TIMER_TICKS_PENDING.load(Ordering::Acquire) != 0,
     };
-    state
-        .prepare(|| reconcile_runtime(handler))
-        .expect("runtime timer ownership must permit blocking receive");
+    // Keep the callback result distinct from a callback that never ran.
+    let mut preflight = None;
+    match state.prepare(|| {
+        let outcome = reconcile_runtime(handler);
+        preflight = Some(outcome);
+        outcome
+    }) {
+        Err(nt_kernel_exec::TimerReceiveError::PendingDelivery) =>
+            return ReceivePreparation::PendingDelivery,
+        other => other.expect("runtime timer ownership must permit blocking receive"),
+    }
+    let preflight_shot = (
+        LAST_REARM_AUTHORITY.is_armed(),
+        LAST_REARM_AUTHORITY.physical_wake_100ns(),
+    );
+    // Reconciliation can itself enter a nested pump that ACKs a one-shot. The
+    // owner must drain its newly deferred tick before the blocking syscall.
+    if DELAY_TIMER_TICKS_PENDING.load(Ordering::Acquire) != 0 {
+        return ReceivePreparation::PendingDelivery;
+    }
+    trace_iocp_receive_deadline();
+    trace_registry_reply_receive();
+    super::mounted_create_owner_trace::receive_boundary_snapshot();
+    super::mounted_read_owner_trace::receive_boundary_snapshot();
+    trace_retained_receive_owners();
+    trace_root_receive_idle_state(preflight, preflight_shot);
+    ReceivePreparation::Ready
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReceivePreparation {
+    Ready,
+    PendingDelivery,
+}
+
+/// Observe the last outer receive boundary before a guest can go all-HLT. A
+/// periodic census cannot run after this receive blocks. Sampling changes no
+/// timer, Reply, IRQ, or retained owner; transition and periodic print budgets
+/// are independent of the older section/cleanup/lifecycle trace below.
+fn trace_root_receive_idle_state(
+    preflight: Option<Option<nt_kernel_exec::TimerRearmOutcome>>,
+    preflight_shot: (bool, u64),
+) {
+    use core::fmt::Write;
+    static PROBE: nt_hosted_runtime::RootReceiveIdleProbe =
+        nt_hosted_runtime::RootReceiveIdleProbe::new(128, 360, 10 * 10_000_000);
+    let now = monotonic_time_100ns();
+    let armed = LAST_REARM_AUTHORITY.is_armed();
+    let physical_wake = LAST_REARM_AUTHORITY.physical_wake_100ns();
+    let (callback_depth, continuation_depth) = win32k_glue::user_callback_stack_depths();
+    let state = nt_hosted_runtime::RootReceiveIdleObservation {
+        physical_shot_armed: armed,
+        physical_shot_due: armed && now >= physical_wake,
+        callback_depth: callback_depth as u64,
+        continuation_depth: continuation_depth as u64,
+        dispatch_depth: spawn_hosts::dispatch_depth(),
+        suspended_components: spawn_hosts::SUSPENDED_COMPONENT_OUTSTANDING.load(Ordering::Relaxed),
+    };
+    if !PROBE.observe(state, now) { return; }
+
+    let hold = unsafe { spawn_hosts::shared_ingress::owner::runtime::hold_snapshot() };
+    let gate = unsafe {
+        spawn_hosts::shared_ingress::owner::runtime::delivery_gate_snapshot(0)
+    };
+    let mut record = nt_printf::record::RecordBuffer::<2048>::new();
+    let _ = writeln!(record,
+        "[root-receive-idle] now={} shot={}/{}/{} selected={}/{} irq={}/{} ticks={} callbacks={}/{} dispatch={} suspended={} ingress={:?} gate={:?}",
+        now, u8::from(armed), physical_wake, u8::from(state.physical_shot_due),
+        LAST_REARM_SOURCE.load(Ordering::Relaxed),
+        LAST_REARM_DEADLINE.load(Ordering::Relaxed),
+        DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire),
+        DELAY_TIMER_TICKS_PENDING.load(Ordering::Relaxed),
+        TIMER_TICKS_SEEN.load(Ordering::Relaxed),
+        callback_depth, continuation_depth, state.dispatch_depth,
+        state.suspended_components, hold, gate);
+    let _ = writeln!(record,
+        "[root-receive-idle] deadlines registry={:?} section={:?} process-image={:?} section-pagein={:?} native-image-pagein={:?}",
+        crate::registry_mutation_work::next_deadline(),
+        crate::section_metadata_work::next_deadline(),
+        crate::process_image_snapshot_work::next_deadline(),
+        crate::section_pagein_work::next_deadline(),
+        crate::native_image_pagein_work::next_deadline());
+    if !armed {
+        let wal_fold = crate::service_sec_image::system_wal_fold_observation();
+        let _ = writeln!(record,
+            "[root-receive-idle] preflight={:?} preflight-shot={}/{} final-shot={}/{} idle-disarms={} wal-fold=deadline:{:?}/due:{}/ready:{}/running:{}/retry:{}/first-dirty:{}",
+            preflight, u8::from(preflight_shot.0), preflight_shot.1,
+            u8::from(armed), physical_wake,
+            TIMER_IDLE_DISARMS.load(Ordering::Relaxed), wal_fold.next_deadline,
+            u8::from(wal_fold.due), u8::from(wal_fold.ready), u8::from(wal_fold.running),
+            wal_fold.retry_100ns, wal_fold.first_dirty_100ns);
+        let _ = writeln!(record,
+            "[root-receive-idle] retries section-map={:?} vm-lock={:?} vm-copy={:?} directory-open={:?} target-open={:?} directory-effect={:?}",
+            crate::provider_section_map_work::next_deadline(),
+            crate::vm_lock_pagein_work::next_deadline(),
+            crate::vm_copy_work::next_deadline(),
+            crate::native_directory_open_work::next_deadline(),
+            crate::native_file_target_open_work::next_deadline(),
+            crate::native_directory_effect_work::next_deadline());
+    }
+    sel4_rt::print_record(if record.overflowed() {
+        b"[root-receive-idle] record-truncated\n"
+    } else {
+        record.bytes()
+    });
+    if !armed {
+        let mut calls = nt_printf::record::RecordBuffer::<4096>::new();
+        let _ = writeln!(calls,
+            "[root-no-shot-calls] start={} total={} overflow={}",
+            gate.retained_start, gate.retained_total, gate.retained_overflow);
+        for call in gate.retained.into_iter().flatten() {
+            let (generation_kind, generation) = match call.binding.process.generation {
+                nt_user_host::process_identity::ProcessGeneration::Hosted(value) =>
+                    ("hosted", value),
+                nt_user_host::process_identity::ProcessGeneration::Temporary(value) =>
+                    ("temporary", value),
+            };
+            let _ = writeln!(calls,
+                "[root-no-shot-call] pi/pid/pgen/tid/badge/tcb/seq/reply/label/ssn/delivered/settlement={}/{}/{}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+                call.binding.pi, call.binding.process.pid, generation_kind, generation,
+                call.binding.tid, call.binding.badge, call.binding.tcb,
+                call.admission_sequence, call.reply, call.label, call.ssn,
+                u8::from(call.delivered), u8::from(call.settlement_prepared));
+        }
+        sel4_rt::print_record(if calls.overflowed() {
+            b"[root-no-shot-calls] record-truncated\n"
+        } else {
+            calls.bytes()
+        });
+        crate::provider_section_map_work::print_no_shot_owner();
+    }
+    if callback_depth != 0 || continuation_depth != 0 {
+        win32k_glue::print_callback_owner_census();
+    }
+}
+
+/// A finite IOCP wait must retain a wake before the root blocks. Capture the
+/// selected physical shot when that wait's exact deadline changes or after a
+/// guest second of the same wait; the regular timer trace can expire early.
+fn trace_iocp_receive_deadline() {
+    static LAST_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+    static LAST_SAMPLE: AtomicU64 = AtomicU64::new(0);
+    static PRINTS: AtomicU64 = AtomicU64::new(0);
+    let now = crate::nt_time_snapshot();
+    let waiters = unsafe { &*core::ptr::addr_of!(crate::IO_COMPLETION_WAITERS) };
+    let deadline = waiters.next_deadline(now);
+    let key = deadline.unwrap_or(u64::MAX);
+    let changed = LAST_DEADLINE.swap(key, Ordering::Relaxed) != key;
+    if deadline.is_none() { return; }
+    let previous = LAST_SAMPLE.load(Ordering::Relaxed);
+    if !changed && now.monotonic_100ns < previous.saturating_add(10_000_000) { return; }
+    LAST_SAMPLE.store(now.monotonic_100ns, Ordering::Relaxed);
+    let count = PRINTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if count > 128 { return; }
+    print_str(b"[iocp-receive] n/now/deadline/waiters=");
+    print_u64(count); print_str(b"/"); print_u64(now.monotonic_100ns);
+    print_str(b"/"); print_u64(key);
+    print_str(b"/"); print_u64(waiters.len() as u64);
+    print_str(b" timer-source/deadline/physical-wake/armed/irq/ticks=");
+    print_u64(LAST_REARM_SOURCE.load(Ordering::Relaxed)); print_str(b"/");
+    print_u64(LAST_REARM_DEADLINE.load(Ordering::Relaxed)); print_str(b"/");
+    print_u64(LAST_REARM_AUTHORITY.physical_wake_100ns()); print_str(b"/");
+    print_u64(u64::from(LAST_REARM_AUTHORITY.is_armed())); print_str(b"/");
+    print_u64(DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire)); print_str(b"/");
+    print_u64(DELAY_TIMER_TICKS_PENDING.load(Ordering::Relaxed));
+    print_str(b" section/mounted-deadline=");
+    match crate::section_metadata_work::next_deadline() {
+        Some(deadline) => print_u64(deadline),
+        None => print_str(b"-"),
+    }
+    print_str(b"/");
+    match driver_launch::mounted_native_block_next_deadline(now.monotonic_100ns) {
+        Some(deadline) => print_u64(deadline),
+        None => print_str(b"-"),
+    }
+    print_str(b"\n");
+}
+
+/// Capture the first blocking receive after a hosted registry Reply transition.
+fn trace_registry_reply_receive() {
+    static PRINTS: AtomicU64 = AtomicU64::new(0);
+    let work = crate::registry_mutation_work::take_hosted_reply_receive_work();
+    if work == 0 { return; }
+    let count = PRINTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if count > 1024 { return; }
+    let now = monotonic_time_100ns();
+    print_str(b"[registry-reply-receive] n/id/now-ms=");
+    print_u64(count); print_str(b"/"); print_u64(work);
+    print_str(b"/"); print_u64(now / 10_000);
+    print_str(b" pending/next-ms=");
+    print_u64(crate::registry_mutation_work::pending_count());
+    print_str(b"/");
+    match crate::registry_mutation_work::next_deadline() {
+        Some(deadline) => print_u64(deadline / 10_000),
+        None => print_str(b"-"),
+    }
+    print_str(b" timer-source/deadline-ms/rearm-ms/armed/irq/ticks=");
+    print_u64(LAST_REARM_SOURCE.load(Ordering::Relaxed)); print_str(b"/");
+    print_u64(LAST_REARM_DEADLINE.load(Ordering::Relaxed) / 10_000); print_str(b"/");
+    print_u64(LAST_REARM_NOW.load(Ordering::Relaxed) / 10_000); print_str(b"/");
+    print_u64(u64::from(LAST_REARM_AUTHORITY.is_armed())); print_str(b"/");
+    print_u64(DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire)); print_str(b"/");
+    print_u64(DELAY_TIMER_TICKS_PENDING.load(Ordering::Relaxed));
+    print_str(b"\n");
+}
+
+/// The final root receive boundary is the last point that can explain an all-HLT
+/// guest. Keep separate budgets for changed and repeated states so early healthy
+/// progress cannot consume every later sample. No Reply or timer owner changes.
+fn trace_retained_receive_owners() {
+    static LAST_KEY: AtomicU64 = AtomicU64::new(0);
+    static REPEATS: AtomicU64 = AtomicU64::new(0);
+    static CHANGES: AtomicU64 = AtomicU64::new(0);
+    static CHANGE_PRINTS: AtomicU64 = AtomicU64::new(0);
+    static REPEAT_PRINTS: AtomicU64 = AtomicU64::new(0);
+    static URGENT_PRINTS: AtomicU64 = AtomicU64::new(0);
+    static EMPTY_PRINTS: AtomicU64 = AtomicU64::new(0);
+    static PRINTS: AtomicU64 = AtomicU64::new(0);
+    let section = crate::section_metadata_work::receive_owner_snapshot();
+    let cleanup = crate::service_sec_image::file_cleanup_receive_owner_snapshot();
+    let lifecycle = driver_launch::hosted_file_lifecycle_receive_owner_snapshot();
+    let empty = section.is_none() && cleanup.is_none() && lifecycle.is_none();
+    let mut key = if empty { 0 } else { 0xcbf2_9ce4_8422_2325u64 };
+    for value in section.into_iter().flatten()
+        .chain(cleanup.into_iter().flatten())
+        .chain(lifecycle.into_iter().flatten())
+    {
+        key = (key ^ value).wrapping_mul(0x100_0000_01b3);
+    }
+    let previous = LAST_KEY.swap(key, Ordering::Relaxed);
+    // A transition to no retained owner is still evidence at the receive
+    // boundary, but repeated empty receives need no serial output.
+    if empty && previous == 0 {
+        return;
+    }
+    let repeat = if previous == key {
+        REPEATS.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        REPEATS.store(0, Ordering::Relaxed);
+        0
+    };
+    let now = monotonic_time_100ns();
+    let armed = LAST_REARM_AUTHORITY.is_armed();
+    let urgent = !armed || LAST_REARM_DEADLINE.load(Ordering::Relaxed) <= now;
+    let urgent_selected = !empty && urgent && (repeat == 0 || repeat.is_power_of_two())
+        && URGENT_PRINTS.fetch_add(1, Ordering::Relaxed) < 12;
+    let selected = if empty {
+        EMPTY_PRINTS.fetch_add(1, Ordering::Relaxed) < 16
+    } else if urgent_selected {
+        true
+    } else if repeat == 0 {
+        let change = CHANGES.fetch_add(1, Ordering::Relaxed) + 1;
+        (change <= 8 || change.is_power_of_two() || change % 16 == 0)
+            && CHANGE_PRINTS.fetch_add(1, Ordering::Relaxed) < 24
+    } else {
+        repeat.is_power_of_two() && REPEAT_PRINTS.fetch_add(1, Ordering::Relaxed) < 12
+    };
+    if !selected {
+        return;
+    }
+    let sample = PRINTS.fetch_add(1, Ordering::Relaxed);
+    if sample >= 64 {
+        return;
+    }
+    print_str(b"[retained-receive] sample/repeat/now-ms=");
+    print_u64(sample + 1);
+    print_str(b"/"); print_u64(repeat);
+    print_str(b"/"); print_u64(now / 10_000);
+    print_str(b" section pi/tid/handle/file/phase/irp/reply/count=");
+    print_receive_owner_fields(section);
+    print_str(b" section-wake-ms=");
+    match crate::section_metadata_work::next_deadline() {
+        Some(deadline) => print_u64(deadline / 10_000),
+        None => print_str(b"-"),
+    }
+    print_str(b" cleanup file/pi/tid/badge/reply/count=");
+    print_receive_owner_fields(cleanup);
+    print_str(b" lifecycle file/payload/blocked/retry-after/executing/count=");
+    print_receive_owner_fields(lifecycle);
+    print_str(b" timer source/deadline-ms/rearm-now-ms/armed/irq-state/tick-pending=");
+    print_receive_owner_fields(Some([
+        LAST_REARM_SOURCE.load(Ordering::Relaxed),
+        LAST_REARM_DEADLINE.load(Ordering::Relaxed) / 10_000,
+        LAST_REARM_NOW.load(Ordering::Relaxed) / 10_000,
+        u64::from(LAST_REARM_AUTHORITY.is_armed()),
+        DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire),
+        DELAY_TIMER_TICKS_PENDING.load(Ordering::Relaxed),
+    ]));
+    print_str(b"\n");
+    if section.is_some_and(|owner| owner[7] > 1) {
+        crate::section_metadata_work::trace_receive_owner_rows();
+    }
+    if cleanup.is_some_and(|owner| owner[5] > 1) {
+        crate::service_sec_image::trace_file_cleanup_receive_owner_rows();
+    }
+    if lifecycle.is_some_and(|owner| owner[5] > 1) {
+        driver_launch::trace_hosted_file_lifecycle_receive_owner_rows();
+    }
+}
+
+fn print_receive_owner_fields<const N: usize>(fields: Option<[u64; N]>) {
+    let Some(fields) = fields else {
+        print_str(b"-");
+        return;
+    };
+    for (index, value) in fields.into_iter().enumerate() {
+        if index != 0 { print_str(b"/"); }
+        print_u64(value);
+    }
 }
 
 unsafe fn reconcile_runtime(handler: &mut ExecNtHandler) -> Option<nt_kernel_exec::TimerRearmOutcome> {
     if !runtime_ready(core::ptr::from_ref(handler)) || is_running() {
         return None;
     }
-    let previous = (&*core::ptr::addr_of!(WAKE)).next_deadline();
     let now = monotonic_time_100ns();
     reconcile_demand(&handler.pm, now);
-    let dpc_deadline = driver_launch::hosted_dpc_next_deadline(now);
-    let acpi_deadline = driver_launch::hosted_acpi_pci_route_recovery_next_deadline(now);
-    if previous.is_none()
-        && (&*core::ptr::addr_of!(WAKE)).next_deadline().is_none()
-        && dpc_deadline.is_none()
-        && acpi_deadline.is_none()
-        && crate::registry_mutation_work::next_deadline().is_none()
-        && crate::section_metadata_work::next_deadline().is_none()
-        && crate::provider_section_broker::next_deadline().is_none()
-    {
-        return None;
-    }
     let queue =
         SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) as *const nt_delay_execution::Queue;
     let _message = crate::ipc_message::SavedMessageBuffer::capture();
-    Some(delay_timer_rearm(&*queue, handler))
+    Some(delay_timer_rearm_at(&*queue, handler, nt_time_snapshot_at(now)))
 }
 
 unsafe fn drain_terminals(handler: *mut ExecNtHandler) -> bool {
@@ -279,16 +782,69 @@ fn report_retained(status: u32) {
 pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
     if !runtime_ready(handler)
         || is_running()
+        || super::root_add_device_exclusive_pending()
+        || super::root_queued_callback_exclusive_pending()
+        || crate::driver_launch::unsettled_queued_callback()
         || crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+        || crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
     {
+        trace_selected_resume_gate(b"outer-entry-gated",
+            u64::from(!runtime_ready(handler))
+                | (u64::from(is_running()) << 1)
+                | (u64::from(super::root_add_device_exclusive_pending()) << 2)
+                | (u64::from(super::root_queued_callback_exclusive_pending()) << 3)
+                | (u64::from(crate::driver_launch::unsettled_queued_callback()) << 4)
+                | (u64::from(crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()) << 5)
+                | (u64::from(crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()) << 6));
         return;
     }
     // A hosted terminal may own the shared execution fence while awaiting the separately
     // retained final Call. Settle that exact return before the ordinary busy-lane gate.
     let _ = component_terminal::drain_shared_returns();
+    if crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume() {
+        trace_selected_resume_gate(b"root-parent-after-return", 0);
+        return;
+    }
+    if let Some(ticket) = nested_restore_owner::next_retry() {
+        let _message = crate::ipc_message::SavedMessageBuffer::capture();
+        let _durable = allocator::enter_durable();
+        if nested_restore_owner::run_one(ticket)
+            == nested_restore_owner::NestedRestorePassOutcome::ResultRetained
+        {
+            let _ = nested_restore_owner::settle_result(ticket);
+            if !nested_restore_owner::transfer_nested_repark(ticket)
+                && !nested_restore_owner::transfer_genuine_wait(ticket, handler)
+                && nested_restore_owner::transfer_callback_terminal(ticket).is_none()
+            {
+                let _ = nested_restore_owner::transfer_completed_terminal(ticket);
+            }
+        }
+        nested_restore_owner::defer_retry(ticket);
+        let _ = drain_terminals(handler);
+    }
+    if crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume() {
+        trace_selected_resume_gate(b"root-parent-after-nested", 0);
+        return;
+    }
+    if let Some(ticket) = root_maintenance_owner::next_returned_ticket() {
+        let _message = crate::ipc_message::SavedMessageBuffer::capture();
+        let _durable = allocator::enter_durable();
+        match run_root_maintenance(handler, ticket) {
+            RootMaintenanceResumeOutcome::Terminal => { let _ = drain_terminals(handler); }
+            RootMaintenanceResumeOutcome::Parked => {}
+            RootMaintenanceResumeOutcome::DeferredRetry => {}
+            RootMaintenanceResumeOutcome::RetainedFailure =>
+                report_retained(nt_process::STATUS_UNSUCCESSFUL),
+        }
+    }
+    if crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume() {
+        trace_selected_resume_gate(b"root-parent-after-maintenance", 0);
+        return;
+    }
     if component_execution_is_busy()
         && !kernel_provider_activation::has_stopped_wait_work(&(*handler).pm)
     {
+        trace_selected_resume_gate(b"physical-execution-busy", 0);
         return;
     }
     let _message = crate::ipc_message::SavedMessageBuffer::capture();
@@ -298,7 +854,10 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
     let mut ticket = match (&mut *core::ptr::addr_of_mut!(WAKE)).begin_pass(monotonic_time_100ns())
     {
         Ok(Some(ticket)) => ticket,
-        Ok(None) => return,
+        Ok(None) => {
+            trace_selected_resume_gate(b"wake-not-due", 0);
+            return;
+        }
         Err(_) => {
             report_retained(nt_process::STATUS_INSUFFICIENT_RESOURCES);
             return;
@@ -308,10 +867,27 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
     let mut pass = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).resume_pass();
     let mut progressed = drain_terminals(handler);
     loop {
-        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+            || crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
+        {
             break;
         }
+        if let Some(ticket) = root_maintenance_owner::next_ready_ticket() {
+            match run_root_maintenance(handler, ticket) {
+                RootMaintenanceResumeOutcome::Parked | RootMaintenanceResumeOutcome::Terminal => {
+                    progressed = true;
+                    progressed |= drain_terminals(handler);
+                    continue;
+                }
+                RootMaintenanceResumeOutcome::DeferredRetry => break,
+                RootMaintenanceResumeOutcome::RetainedFailure => {
+                    report_retained(nt_process::STATUS_UNSUCCESSFUL);
+                    break;
+                }
+            }
+        }
         let Some(candidate) = next_in_pass(&(*handler).pm, &mut pass) else {
+            trace_selected_resume_gate(b"outer-no-candidate", 0);
             break;
         };
         match candidate.continuation {
@@ -336,13 +912,17 @@ pub(super) unsafe fn run_outer(handler: *mut ExecNtHandler) {
                 // only after real lease acquisition. Refusal retains both original captures.
                 kernel_provider_activation::publish_runtime_waits(&mut *handler);
             }
+            ComponentNativeContinuation::RootIngress(_) => {}
         }
-        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+            || crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
+        {
             break;
         }
         progressed |= drain_terminals(handler);
     }
     if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+        && !crate::spawn_hosts::shared_ingress::owner::runtime::root_ingress_parent_blocks_provider_resume()
         && (*handler).lpc_endpoint_progress
     {
         // Component-originated LPC work bypasses the ordinary syscall post-action.

@@ -124,6 +124,16 @@ pub struct ClosedNativeHandle {
     target: NativeCloseTarget,
 }
 
+/// A native directory close admitted before its Reply is parked. This preliminary
+/// reservation retains the table owner and directory identity across that wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeDirectoryCloseReservation {
+    caller: NativeHandleCaller,
+    value: u64,
+    target: NativeCloseTarget,
+    generation: u64,
+}
+
 impl ClosedNativeHandle {
     pub const fn table_owner(&self) -> ProcessId {
         self.target.table_owner
@@ -418,6 +428,62 @@ impl NativePsHandlePublication {
 }
 
 impl ProcessManager {
+    /// Validate a retained directory operation without consuming its handle. The
+    /// host may then submit one canonical effect while retaining this owner.
+    pub fn validate_reserved_native_directory(
+        &self, reservation: &NativeDirectoryCloseReservation, required_access: u32,
+    ) -> Result<u64, u32> {
+        let current = self.inspect_native_close_target(reservation.caller, reservation.value)?;
+        let slot = crate::handle_to_slot(current.handle).ok_or(STATUS_INVALID_HANDLE)?;
+        let same_generation = matches!(self.process(current.table_owner)
+            .and_then(|process| process.handles.get(slot)),
+            Some(crate::HandleSlot::Occupied { generation, .. })
+                if *generation == reservation.generation);
+        if !same_generation { return Err(STATUS_INVALID_HANDLE); }
+        if current != reservation.target { return Err(STATUS_INVALID_HANDLE); }
+        let granted = current.information.granted_access.ok_or(STATUS_INVALID_HANDLE)?;
+        if required_access & !granted != 0 { return Err(STATUS_ACCESS_DENIED); }
+        let HandleObject::ObjectDirectory(identity) = current.object else {
+            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+        };
+        Ok(identity)
+    }
+
+    pub fn reserve_native_directory_close(
+        &self, caller: NativeHandleCaller, value: u64,
+    ) -> Result<NativeDirectoryCloseReservation, u32> {
+        let target = self.inspect_native_close_target(caller, value)?;
+        if !matches!(target.object, HandleObject::ObjectDirectory(_)) {
+            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        let slot = crate::handle_to_slot(target.handle).ok_or(STATUS_INVALID_HANDLE)?;
+        let Some(crate::HandleSlot::Occupied { generation, .. }) = self.process(target.table_owner)
+            .and_then(|process| process.handles.get(slot)) else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        Ok(NativeDirectoryCloseReservation { caller, value, target, generation: *generation })
+    }
+
+    pub fn close_reserved_native_directory(
+        &mut self, reservation: NativeDirectoryCloseReservation,
+    ) -> Result<ClosedNativeHandle, NativeCloseError> {
+        let current = self.inspect_native_close_target(reservation.caller, reservation.value)
+            .map_err(NativeCloseError::Status)?;
+        let slot = crate::handle_to_slot(current.handle)
+            .ok_or(NativeCloseError::Status(STATUS_INVALID_HANDLE))?;
+        let same_generation = matches!(self.process(current.table_owner)
+            .and_then(|process| process.handles.get(slot)),
+            Some(crate::HandleSlot::Occupied { generation, .. })
+                if *generation == reservation.generation);
+        if !same_generation {
+            return Err(NativeCloseError::Status(STATUS_INVALID_HANDLE));
+        }
+        if current != reservation.target {
+            return Err(NativeCloseError::Status(STATUS_INVALID_HANDLE));
+        }
+        self.close_native_handle(reservation.caller, reservation.value)
+    }
+
     /// Inspect one visible entry in the caller's canonical native table without changing it.
     /// The host may use this for resource preflight only within the same serialized dispatch as
     /// `close_native_handle`; it is not a retained reference across callbacks or IPC.
@@ -446,6 +512,43 @@ impl ProcessManager {
                 granted_access: Some(entry.granted_access),
             },
         })
+    }
+
+    /// Inspect an Event handle through the authenticated native handle scope.
+    /// A tagged kernel handle resolves in System's table; this is a preflight
+    /// only and the host must retain the Event pointer in the same serialized
+    /// dispatch before the handle can be closed.
+    pub fn inspect_native_event_handle(
+        &self,
+        caller: NativeHandleCaller,
+        value: u64,
+        desired_access: u32,
+    ) -> Result<NativeCloseTarget, u32> {
+        let target = self.inspect_native_close_target(caller, value)?;
+        if !matches!(target.object(), HandleObject::Event(_)) {
+            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        let granted = target.information().granted_access.ok_or(STATUS_INVALID_HANDLE)?;
+        if desired_access & !granted != 0 {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        Ok(target)
+    }
+
+    /// An image-less System thread has no hosted process index. Its tagged Event handle
+    /// is created in the canonical System table and owned by the current bootstrap root.
+    pub fn authorize_initial_system_native_event_create(
+        &self,
+        caller: NativeHandleCaller,
+        attributes: u32,
+    ) -> Result<(ProcessId, u64), u32> {
+        self.validate_native_handle_caller(caller)?;
+        let system = self.initial_system_identity().ok_or(STATUS_INVALID_HANDLE)?;
+        if caller.mode() != AccessMode::KernelMode
+            || caller.effective_process() != system.process_id()
+        { return Err(STATUS_INVALID_HANDLE); }
+        if attributes != OBJ_KERNEL_HANDLE { return Err(STATUS_INVALID_PARAMETER); }
+        Ok((system.process_id(), system.thread().generation()))
     }
 
     /// Remove exactly one visible reference from the decoded native table, irrespective of
@@ -611,6 +714,22 @@ impl ProcessManager {
         })
     }
 
+    /// `ObSetHandleAttributes`: update one entry in the authenticated caller's exact table.
+    /// Tagged kernel handles belong to System's table; pseudo handles have no mutable entry.
+    pub fn set_native_handle_flags(
+        &mut self,
+        caller: NativeHandleCaller,
+        value: u64,
+        flags: HandleFlags,
+    ) -> Result<(), u32> {
+        let NativeHandleScope::Table { owner, handle, .. } =
+            self.decode_native_handle(caller, value)?
+        else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        self.set_handle_flags(owner, handle, flags)
+    }
+
     /// Retain an authenticated kernel caller's original thread and owning process together.
     /// Preflight both projections and checked increments before the first mutation. The pair
     /// does not use CurrentProcess: attachment must never substitute a different owning process.
@@ -622,6 +741,14 @@ impl ProcessManager {
         if caller.mode != AccessMode::KernelMode {
             return Err(STATUS_ACCESS_DENIED);
         }
+        self.reference_original_native_requestor(caller)
+    }
+
+    fn reference_original_native_requestor(
+        &mut self,
+        caller: NativeHandleCaller,
+    ) -> Result<NativeThreadProcessReference, u32> {
+        self.validate_native_handle_caller(caller)?;
         let lifetime = caller.original_thread;
         let pid = lifetime.process_id();
         let tid = lifetime.thread_id();
@@ -677,6 +804,15 @@ impl ProcessManager {
             .unwrap()
             .kernel_pointer_references = thread_count;
         Ok(pair)
+    }
+
+    /// Retain the authenticated original thread and process for a native user syscall whose
+    /// Reply must outlive this dispatch. The syscall adapter performs access admission itself.
+    pub fn reference_native_syscall_requestor(
+        &mut self,
+        caller: NativeHandleCaller,
+    ) -> Result<NativeThreadProcessReference, u32> {
+        self.reference_original_native_requestor(caller)
     }
 
     /// Reference a Process/Thread handle, including native pseudo handles. All fallible admission,

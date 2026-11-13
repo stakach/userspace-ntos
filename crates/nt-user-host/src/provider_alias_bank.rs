@@ -98,6 +98,14 @@ pub enum BankError {
     Backend(u32),
 }
 
+/// The backend must distinguish a rejected deletion from an ambiguous capability effect.
+/// Only a proven no-effect result may be retried against the same exact owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderAliasDeleteError {
+    NoEffect(u32),
+    Indeterminate(u32),
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProviderAliasStats {
     pub entries: usize,
@@ -119,9 +127,9 @@ pub trait ProviderAliasIo {
     fn move_to_child(&mut self, root: u64, child: ChildCap) -> Result<(), u32>;
     fn recycle_empty_root(&mut self, root: u64) -> Result<(), u32>;
     /// Successful deletion finalizes any mapping; it does not recycle the root slot.
-    fn delete_root(&mut self, root: u64) -> Result<(), u32>;
+    fn delete_root(&mut self, root: u64) -> Result<(), ProviderAliasDeleteError>;
     /// Successful deletion finalizes the mapping. The bank itself owns child slot reuse.
-    fn delete_child(&mut self, child: ChildCap) -> Result<(), u32>;
+    fn delete_child(&mut self, child: ChildCap) -> Result<(), ProviderAliasDeleteError>;
 }
 
 struct Row {
@@ -129,23 +137,36 @@ struct Row {
     root: Option<RootAliasSnapshot>,
     child: Option<ChildCap>,
     releasing: bool,
+    retirement_indeterminate: bool,
     claim: Option<ThreadRollbackId>,
 }
 
 impl Row {
     fn retire(&mut self, io: &mut impl ProviderAliasIo) -> Result<(), BankError> {
+        if self.retirement_indeterminate { return Err(BankError::Releasing); }
         if let Some(child) = self.child {
-            io.delete_child(child).map_err(BankError::Backend)?;
+            if let Err(error) = io.delete_child(child) {
+                self.retirement_indeterminate = matches!(error, ProviderAliasDeleteError::Indeterminate(_));
+                return Err(BankError::Backend(match error {
+                    ProviderAliasDeleteError::NoEffect(status)
+                    | ProviderAliasDeleteError::Indeterminate(status) => status,
+                }));
+            }
             self.child = None;
         }
         if let Some(root) = self.root.as_mut() {
             if root.populated {
-                io.delete_root(root.slot).map_err(BankError::Backend)?;
+                if let Err(error) = io.delete_root(root.slot) {
+                    self.retirement_indeterminate = matches!(error, ProviderAliasDeleteError::Indeterminate(_));
+                    return Err(BankError::Backend(match error {
+                        ProviderAliasDeleteError::NoEffect(status)
+                        | ProviderAliasDeleteError::Indeterminate(status) => status,
+                    }));
+                }
                 root.populated = false;
                 root.mapped = false;
             }
-            io.recycle_empty_root(root.slot)
-                .map_err(BankError::Backend)?;
+            io.recycle_empty_root(root.slot).map_err(BankError::Backend)?;
             self.root = None;
         }
         Ok(())
@@ -485,6 +506,9 @@ impl ProviderAliasBank {
                     if row.claim.is_some() {
                         return Err(BankError::Claimed);
                     }
+                    if row.releasing {
+                        return Err(BankError::Releasing);
+                    }
                     if row.request != request {
                         return Err(BankError::RequestConflict);
                     }
@@ -548,6 +572,7 @@ impl ProviderAliasBank {
             root: None,
             child: None,
             releasing: false,
+            retirement_indeterminate: false,
             claim: None,
         });
         self.processes[process_index].pages.insert(
@@ -661,6 +686,72 @@ impl ProviderAliasBank {
             self.failures = self.failures.saturating_add(1);
         }
         result
+    }
+
+    /// Retire one exact mapped page. A Section view can release its own pages without consuming
+    /// unrelated USER/desktop aliases belonging to the same process. A proven no-effect
+    /// rejection permits an exact retry; an indeterminate delete keeps the row fenced.
+    pub fn release_page_exact(
+        &mut self,
+        request: ProviderAliasRequest,
+        handle: ProviderAliasHandle,
+        io: &mut impl ProviderAliasIo,
+    ) -> Result<(), BankError> {
+        let result = self.release_page_exact_inner(request, handle, io);
+        if result.is_err() {
+            self.failures = self.failures.saturating_add(1);
+        }
+        result
+    }
+
+    fn release_page_exact_inner(
+        &mut self,
+        request: ProviderAliasRequest,
+        handle: ProviderAliasHandle,
+        io: &mut impl ProviderAliasIo,
+    ) -> Result<(), BankError> {
+        if !request.process.is_valid() || request.page == 0 || request.page & 0xfff != 0 {
+            return Err(BankError::InvalidRequest);
+        }
+        let process_index = self.processes.iter().position(|row| row.pi == request.pi)
+            .ok_or(BankError::StaleHandle)?;
+        let owner = &self.processes[process_index];
+        if owner.process != request.process {
+            return Err(BankError::OwnerChanged);
+        }
+        if owner.releasing {
+            return Err(BankError::Releasing);
+        }
+        let position = owner.pages.binary_search_by_key(&request.page, |(page, _)| *page)
+            .map_err(|_| BankError::StaleHandle)?;
+        if owner.pages[position].1 != handle {
+            return Err(BankError::StaleHandle);
+        }
+        let slot = self.slots.get_mut(handle.index).ok_or(BankError::StaleHandle)?;
+        if slot.generation != handle.generation {
+            return Err(BankError::StaleHandle);
+        }
+        let row = slot.row.as_mut().ok_or(BankError::StaleHandle)?;
+        if row.request != request {
+            return Err(BankError::RequestConflict);
+        }
+        if row.claim.is_some() {
+            return Err(BankError::Claimed);
+        }
+        row.releasing = true;
+        row.retire(io)?;
+        slot.row = None;
+        let recyclable = slot.generation != u64::MAX;
+        self.processes[process_index].pages.remove(position);
+        if self.processes[process_index].pages.is_empty() {
+            self.processes.swap_remove(process_index);
+        }
+        if recyclable {
+            self.publish_free(handle.index);
+        }
+        self.live -= 1;
+        self.releases = self.releases.saturating_add(1);
+        Ok(())
     }
 
     fn release_inner(

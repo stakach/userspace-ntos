@@ -1,9 +1,10 @@
 use syn::{visit::Visit, ItemFn};
 
 const SOURCE: &str = include_str!("../../../components/ntos-executive/src/driver_launch.rs");
+const ALLOCATIONS_SOURCE: &str = include_str!("../../../components/ntos-executive/src/hosted_device_allocations.rs");
 
-fn function(name: &str) -> ItemFn {
-    syn::parse_file(SOURCE)
+fn function_in(source: &str, name: &str) -> ItemFn {
+    syn::parse_file(source)
         .unwrap()
         .items
         .into_iter()
@@ -12,6 +13,10 @@ fn function(name: &str) -> ItemFn {
             _ => None,
         })
         .unwrap_or_else(|| panic!("missing native function {name}"))
+}
+
+fn function(name: &str) -> ItemFn {
+    function_in(SOURCE, name)
 }
 
 #[derive(Default)]
@@ -66,15 +71,29 @@ fn terminal_binding_teardown_removes_identity_only_after_pointer_retirement() {
     );
     assert!(
         position("validate_hosted_device_resources_revoked")
-            < position("retire_hosted_device_pointer")
+            < position("retire_canonical_pointer")
     );
     assert!(
-        position("retire_hosted_device_pointer") < position("remove_hosted_device_resource_state")
+        position("retire_canonical_pointer") < position("remove_hosted_device_resource_state")
     );
     assert!(
         position("remove_hosted_device_resource_state")
             < position("release_hosted_registry_identity")
     );
+    let retirement = function_in(ALLOCATIONS_SOURCE, "retire_canonical_pointer");
+    assert!(
+        calls(&retirement)
+            .iter()
+            .any(|call| call == "retire_hosted_device_pointer"),
+        "the catalog helper must retire the canonical IoManager pointer"
+    );
+    let helper = &ALLOCATIONS_SOURCE[ALLOCATIONS_SOURCE
+        .find("pub(super) fn retire_canonical_pointer")
+        .unwrap()..];
+    let helper = &helper[..helper.find("/// The source owner").unwrap()];
+    assert!(helper.find("retire_hosted_device_pointer").unwrap()
+        < helper.find("canonical_live = false").unwrap(),
+        "the physical catalog must stay live until canonical retirement succeeds");
 }
 
 #[test]

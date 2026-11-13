@@ -197,7 +197,7 @@ impl KernelProviderPumpProgress {
         resume_from: Option<KernelProviderPumpObservation>,
     ) -> Result<KernelProviderPumpAttempt, PumpProgressError> {
         let nonce = counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 if value == 0 {
                     None
                 } else {

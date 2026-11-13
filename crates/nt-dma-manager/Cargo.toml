@@ -7,8 +7,5 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-[dependencies]
-nt-mdl = { workspace = true }
-
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

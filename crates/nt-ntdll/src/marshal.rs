@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn marshals_the_widest_service() {
-        // NtCreateNamedPipeFile = 14 args (the widest). 4 reg + 10 stack.
+        // NtCreateNamedPipeFile = 14 args. 4 reg + 10 stack.
         let regs = [1, 2, 3, 4];
         let stack: [u64; 10] = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
         let src = SliceArgSource {
@@ -174,6 +174,13 @@ mod tests {
         let m = marshal_named("NtCreateNamedPipeFile", 46, &src);
         assert_eq!(m.argc(), 14);
         assert_eq!(m.args.last(), Some(&14));
+
+        // The audit-by-handle service is the widest: 4 register + 13 stack args.
+        let stack: [u64; 13] = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+        let src = SliceArgSource { regs: &regs, stack: &stack };
+        let m = marshal_named("NtAccessCheckByTypeResultListAndAuditAlarmByHandle", 7, &src);
+        assert_eq!(m.argc(), 17);
+        assert_eq!(m.args.last(), Some(&17));
     }
 
     #[test]

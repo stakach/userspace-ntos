@@ -47,6 +47,21 @@ pub(crate) fn capture_mapping_provenance(
     }
 }
 
+/// DriverEntry has no hosted process handler yet. The authenticated provider dispatch and
+/// physical source remain authoritative; there is no process initiator to report.
+pub(crate) fn capture_bootstrap_mapping_provenance(
+    identity: SectionIdentity,
+    section: GenericSection,
+) -> MappingProvenance {
+    MappingProvenance {
+        section_index: identity.index(),
+        section_generation: section.generation,
+        backing_kind: section.backing.kind,
+        file: section.backing.file,
+        initiator: None,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct RetirementReceipt {
     pub pointer: u64,
@@ -124,6 +139,7 @@ pub(crate) unsafe fn observe_cleanup_result(
     let runtime::PhysicalDomain::Provider { domain, .. } = physical.domain else { return; };
     let name: &[u8] = match op {
         nt_io_manager::win32k_mm_section_wire::OP_UNMAP => b"unmap",
+        nt_io_manager::win32k_mm_section_wire::OP_UNMAP_CLIENT => b"unmap-client",
         nt_io_manager::win32k_mm_section_wire::OP_DEREFERENCE => b"dereference",
         _ => return,
     };

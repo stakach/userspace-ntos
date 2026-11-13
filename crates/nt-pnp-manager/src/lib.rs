@@ -11,7 +11,10 @@
 extern crate alloc;
 
 mod accepted_pdo_filter_edge;
+mod accepted_pdo_direct_filter_edge;
 mod accepted_pdo_pnp;
+mod existing_device_start_service;
+pub use existing_device_start_service::*;
 mod accepted_pdo_provider;
 mod bus_properties;
 mod bus_relations;
@@ -27,9 +30,11 @@ mod retained_start_fdo_forward;
 mod retained_start_fdo_forward_tests;
 pub mod returned_pnp_buffer;
 mod target_device_relation;
+pub mod target_device_change;
 mod upper_filter_attachment;
 
 pub use accepted_pdo_filter_edge::*;
+pub use accepted_pdo_direct_filter_edge::*;
 pub use accepted_pdo_pnp::*;
 pub use accepted_pdo_provider::*;
 pub use bus_properties::*;
@@ -147,6 +152,41 @@ pub const fn existing_device_start_disposition(
         Some(DeviceState::Removed) => ExistingDeviceStartDisposition::NoSuchDevice,
         Some(_) | None => ExistingDeviceStartDisposition::RequiresAction,
     }
+}
+
+/// `PlugPlayControlStartDevice` acknowledges a processed action separately from a completed
+/// START IRP. An initialized PDO with no service and a known negative RawDeviceOK capability has
+/// no stack to start; the action can finish successfully while `DN_STARTED` remains clear. This
+/// matches the reference PnP action worker, whose state machine does not return AddDevice failure
+/// as the action's syscall status. The native caller must first verify the exact live PDO identity.
+pub const fn may_acknowledge_unstarted_start_action(
+    state: Option<DeviceState>,
+    raw_device_ok: Option<bool>,
+    has_problem: bool,
+) -> bool {
+    matches!(state, Some(DeviceState::Enumerated))
+        && matches!(raw_device_ok, Some(false))
+        && !has_problem
+}
+
+/// Report a devnode's started bit from its canonical PnP lifecycle.
+///
+/// A Configuration Manager instance or a caller-written status record does not prove that its
+/// START transaction completed. Preserve the other explicit status/problem bits, but never let
+/// a stale record assert `DN_STARTED` for an absent or nonstarted hosted devnode.
+pub const fn device_status_from_lifecycle(
+    state: Option<DeviceState>,
+    explicit_status: u32,
+    explicit_problem: u32,
+) -> (u32, u32) {
+    const DN_STARTED: u32 = 0x0000_0008;
+    let status = (explicit_status & !DN_STARTED)
+        | if matches!(state, Some(DeviceState::Started)) {
+            DN_STARTED
+        } else {
+            0
+        };
+    (status, explicit_problem)
 }
 
 /// Pure coordinator for one live CM notification.
@@ -302,6 +342,7 @@ pub struct StartDeviceLifecycleReceipt {
     start_status: u32,
 }
 
+#[derive(Clone, Copy)]
 struct StartDeviceIoTerminalIdentity {
     irp_id: u64,
     pdo_device_id: u64,
@@ -393,6 +434,8 @@ impl StartDeviceCompletion {
 pub struct StartDeviceTerminalRecord {
     identity: StartDeviceRequestIdentity,
     instance_id: String,
+    caller_pid: u64,
+    caller_generation: u64,
     completion: StartDeviceCompletionKind,
     path: StartDeviceCallPath,
     lifecycle_receipt: Option<StartDeviceLifecycleReceipt>,
@@ -409,6 +452,14 @@ impl StartDeviceTerminalRecord {
 
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    pub const fn caller_pid(&self) -> u64 {
+        self.caller_pid
+    }
+
+    pub const fn caller_generation(&self) -> u64 {
+        self.caller_generation
     }
 
     pub const fn completion(&self) -> StartDeviceCompletionKind {
@@ -449,9 +500,29 @@ impl StartDeviceTerminalRecord {
 struct ActiveStartDeviceRequest {
     identity: StartDeviceRequestIdentity,
     instance_id: String,
+    caller_pid: u64,
+    caller_generation: u64,
     path: StartDeviceCallPath,
     completion: Option<StartDeviceCompletion>,
     reply: ActiveStartDeviceReply,
+}
+
+/// Read-only evidence for the exact completed START result awaiting its syscall reply.
+#[derive(Debug, PartialEq, Eq)]
+pub struct StartDeviceReplyEvidence<'a> {
+    instance_id: &'a str,
+    caller_pid: u64,
+    caller_generation: u64,
+    completion: StartDeviceCompletionKind,
+    status: u32,
+}
+
+impl StartDeviceReplyEvidence<'_> {
+    pub const fn instance_id(&self) -> &str { self.instance_id }
+    pub const fn caller_pid(&self) -> u64 { self.caller_pid }
+    pub const fn caller_generation(&self) -> u64 { self.caller_generation }
+    pub const fn completion(&self) -> StartDeviceCompletionKind { self.completion }
+    pub const fn status(&self) -> u32 { self.status }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -494,6 +565,15 @@ impl StartDeviceCallLedger {
         &mut self,
         instance_id: &str,
     ) -> Result<StartDeviceRequestIdentity, StartDeviceLedgerError> {
+        self.begin_with_caller(instance_id, 0, 0)
+    }
+
+    pub fn begin_with_caller(
+        &mut self,
+        instance_id: &str,
+        caller_pid: u64,
+        caller_generation: u64,
+    ) -> Result<StartDeviceRequestIdentity, StartDeviceLedgerError> {
         if instance_id.is_empty() {
             return Err(StartDeviceLedgerError::InvalidInstance);
         }
@@ -528,6 +608,8 @@ impl StartDeviceCallLedger {
         self.active.push(ActiveStartDeviceRequest {
             identity,
             instance_id: owned_instance,
+            caller_pid,
+            caller_generation,
             path: StartDeviceCallPath::Synchronous,
             completion: None,
             reply: ActiveStartDeviceReply::Awaiting,
@@ -750,6 +832,8 @@ impl StartDeviceCallLedger {
         self.terminal.push(StartDeviceTerminalRecord {
             identity,
             instance_id: request.instance_id,
+            caller_pid: request.caller_pid,
+            caller_generation: request.caller_generation,
             completion: completion_kind,
             path: request.path,
             lifecycle_receipt,
@@ -773,6 +857,31 @@ impl StartDeviceCallLedger {
         &self.terminal
     }
 
+    pub fn result_for_reply(
+        &self,
+        identity: StartDeviceRequestIdentity,
+    ) -> Option<StartDeviceReplyEvidence<'_>> {
+        let request = self.active.iter().find(|request| request.identity == identity)?;
+        if request.reply != ActiveStartDeviceReply::Awaiting {
+            return None;
+        }
+        let completion = request.completion.as_ref()?;
+        Some(StartDeviceReplyEvidence {
+            instance_id: &request.instance_id,
+            caller_pid: request.caller_pid,
+            caller_generation: request.caller_generation,
+            completion: completion.kind(),
+            status: completion.status(),
+        })
+    }
+
+    pub fn terminal_by_identity(
+        &self,
+        identity: StartDeviceRequestIdentity,
+    ) -> Option<&StartDeviceTerminalRecord> {
+        self.terminal.iter().find(|row| row.identity == identity)
+    }
+
     pub const fn protocol_errors(&self) -> u64 {
         self.protocol_errors
     }
@@ -790,6 +899,8 @@ pub struct PdoCapabilities {
     pub removable: bool,
     pub eject_supported: bool,
     pub surprise_removal_ok: bool,
+    /// The bus permits the PDO to act as the complete device stack without a function driver.
+    pub raw_device_ok: bool,
     pub address: u32,
 }
 
@@ -831,6 +942,8 @@ pub struct PdoProperties {
     pub boot_resources_translated: PropertyBlobState,
     /// Initial requirements returned by the bus before the function stack is built.
     pub resource_requirements: PropertyBlobState,
+    /// Exact `_CRS` interrupt facts from this PDO's accepted ACPI relation query.
+    pub acpi_interrupt_resources: Option<Vec<nt_acpi::InterruptResource>>,
     /// Requirements after `IRP_MN_FILTER_RESOURCE_REQUIREMENTS` has traversed the function stack.
     pub filtered_resource_requirements: PropertyBlobState,
     pub allocated_resources_raw: PropertyBlobState,
@@ -855,6 +968,7 @@ impl PdoProperties {
             boot_resources_raw,
             boot_resources_translated,
             resource_requirements,
+            acpi_interrupt_resources: None,
             filtered_resource_requirements: PropertyBlobState::Unqueried,
             allocated_resources_raw: PropertyBlobState::Unqueried,
             allocated_resources_translated: PropertyBlobState::Unqueried,
@@ -877,6 +991,14 @@ impl PdoProperties {
         )
     }
 
+    pub fn with_acpi_interrupt_resources(
+        mut self,
+        resources: Vec<nt_acpi::InterruptResource>,
+    ) -> Self {
+        self.acpi_interrupt_resources = Some(resources);
+        self
+    }
+
     fn immutable_identity_eq(&self, other: &Self) -> bool {
         self.bus_information == other.bus_information
             && self.capabilities == other.capabilities
@@ -884,6 +1006,32 @@ impl PdoProperties {
             && self.boot_resources_raw == other.boot_resources_raw
             && self.boot_resources_translated == other.boot_resources_translated
             && self.resource_requirements == other.resource_requirements
+            && self.acpi_interrupt_resources == other.acpi_interrupt_resources
+    }
+}
+
+#[cfg(test)]
+mod acpi_interrupt_provenance_tests {
+    use super::*;
+
+    #[test]
+    fn accepted_pdo_identity_includes_evaluated_interrupt_provenance() {
+        let plain = PdoProperties::from_bus_queries(
+            None,
+            None,
+            PropertyBlobState::KnownNone,
+            PropertyBlobState::KnownNone,
+            PropertyBlobState::KnownNone,
+        );
+        let with_crs = plain.clone().with_acpi_interrupt_resources(alloc::vec![nt_acpi::InterruptResource {
+            descriptor_index: 0,
+            interrupt: nt_acpi::InterruptSource::LegacyIrq(4),
+            level_sensitive: true,
+            active_low: true,
+            shared: true,
+        }]);
+        assert!(!plain.immutable_identity_eq(&with_crs));
+        assert!(plain.immutable_identity_eq(&plain.clone()));
     }
 }
 
@@ -1081,6 +1229,8 @@ struct Devnode {
     instance_id: Option<String>,
     service: Option<String>,
     state: DeviceState,
+    /// Last successful QUERY_PNP_DEVICE_STATE result for this exact incarnation.
+    pnp_device_state: u32,
     pdo_object_id: u64,
     fdo_object_id: u64,
     driver_id: u64,
@@ -1273,6 +1423,7 @@ impl PnpManager {
             instance_id: instance_id.map(ToString::to_string),
             service: service.map(ToString::to_string),
             state: DeviceState::Enumerated,
+            pnp_device_state: 0,
             pdo_object_id,
             fdo_object_id: 0,
             driver_id: 0,
@@ -1331,6 +1482,44 @@ impl PnpManager {
                 && devnode.pdo_object_id == identity.pdo_object_id
                 && devnode.state == DeviceState::Started
         })
+    }
+
+    /// Commit only a terminal driver's state query to the same started PDO generation.
+    pub fn set_queried_pnp_device_state(
+        &mut self,
+        identity: DevnodeIdentity,
+        state: u32,
+    ) -> Result<(), PnpError> {
+        if state & !nt_pnp_abi::PNP_DEVICE_STATE_KNOWN_MASK != 0 {
+            return Err(PnpError::InvalidIdentity);
+        }
+        let node = self.devnodes.iter_mut().find(|node| {
+            node.id == identity.devnode_id
+                && node.generation == identity.generation
+                && node.pdo_object_id == identity.pdo_object_id
+                && node.state == DeviceState::Started
+        }).ok_or(PnpError::StaleId)?;
+        node.pnp_device_state = state;
+        Ok(())
+    }
+
+    pub fn queried_pnp_device_state(&self, identity: DevnodeIdentity) -> Option<u32> {
+        self.devnodes.iter().find(|node| {
+            node.id == identity.devnode_id
+                && node.generation == identity.generation
+                && node.pdo_object_id == identity.pdo_object_id
+                && node.state != DeviceState::Removed
+        }).map(|node| node.pnp_device_state)
+    }
+
+    pub fn devnode_dont_display_in_ui(&self, identity: DevnodeIdentity) -> Option<bool> {
+        self.queried_pnp_device_state(identity)
+            .map(|bits| bits & nt_pnp_abi::PNP_DEVICE_DONT_DISPLAY_IN_UI != 0)
+    }
+
+    pub fn devnode_not_disableable(&self, identity: DevnodeIdentity) -> Option<bool> {
+        self.queried_pnp_device_state(identity)
+            .map(|bits| bits & nt_pnp_abi::PNP_DEVICE_NOT_DISABLEABLE != 0)
     }
 
     pub fn claim_started_parent_relation(
@@ -1651,6 +1840,7 @@ impl PnpManager {
                 instance_id: Some(record.instance_id),
                 service: None,
                 state: DeviceState::Enumerated,
+                pnp_device_state: 0,
                 pdo_object_id: record.pdo_object_id,
                 fdo_object_id: 0,
                 driver_id: 0,
@@ -1783,6 +1973,83 @@ impl PnpManager {
         devnode.driver_id = driver_id;
         devnode.state = DeviceState::DeviceStackBuilt;
         Ok(devnode.id)
+    }
+
+    /// Build a root PDO-only stack from its published bus capability query.
+    /// A bus child must instead prove that its accepted parent relation is still current.
+    pub fn commit_raw_pdo_stack(&mut self, pdo_object_id: u64) -> Result<u64, PnpError> {
+        if self.parent_relation_for_pdo(pdo_object_id).is_some() {
+            return Err(PnpError::InvalidTransition);
+        }
+        self.commit_raw_pdo_stack_inner(pdo_object_id)
+    }
+
+    /// Build a bus child PDO-only stack under its exact accepted parent relation.
+    pub fn commit_raw_pdo_stack_for_current_relation(
+        &mut self,
+        relations: &BusRelationTable,
+        pdo_object_id: u64,
+    ) -> Result<u64, PnpError> {
+        let parent_relation = self
+            .parent_relation_for_pdo(pdo_object_id)
+            .ok_or(PnpError::InvalidIdentity)?;
+        if !self.relation_parent_is_started(parent_relation)
+            || !relations.relation_contains(parent_relation.relation, pdo_object_id)
+        {
+            return Err(PnpError::StalePublication);
+        }
+        self.commit_raw_pdo_stack_inner(pdo_object_id)
+    }
+
+    /// No FDO or function-driver identity is fabricated for this devnode.
+    fn commit_raw_pdo_stack_inner(&mut self, pdo_object_id: u64) -> Result<u64, PnpError> {
+        let devnode = self.devnodes.iter_mut().find(|devnode| {
+            devnode.pdo_object_id == pdo_object_id && devnode.pdo_properties.is_some()
+        }).ok_or(PnpError::StaleId)?;
+        if !devnode.pdo_properties.as_ref().and_then(|properties| properties.capabilities.as_ref())
+            .is_some_and(|capabilities| capabilities.raw_device_ok)
+            || devnode.fdo_object_id != 0
+            || devnode.driver_id != 0
+            || devnode.pending_dispatch.is_some()
+            || devnode.negotiation.is_some()
+            || devnode.remove_ready.is_some()
+        {
+            return Err(PnpError::InvalidTransition);
+        }
+        match devnode.state {
+            DeviceState::Enumerated => devnode.state = DeviceState::DeviceStackBuilt,
+            DeviceState::DeviceStackBuilt => {},
+            _ => return Err(PnpError::InvalidTransition),
+        }
+        Ok(devnode.id)
+    }
+
+    /// Direct START may enter the accepted PDO provider only for a current, resource-assigned
+    /// raw child that has no function stack and no in-flight lifecycle effect.
+    pub fn raw_pdo_start_admissible(
+        &self,
+        relations: &BusRelationTable,
+        pdo_object_id: u64,
+    ) -> bool {
+        let Some(devnode) = self.devnodes.iter().find(|devnode| {
+            devnode.pdo_object_id == pdo_object_id && devnode.pdo_properties.is_some()
+        }) else {
+            return false;
+        };
+        let Some(parent_relation) = devnode.parent_relation else {
+            return false;
+        };
+        devnode.state == DeviceState::ResourcesAssigned
+            && devnode.fdo_object_id == 0
+            && devnode.driver_id == 0
+            && devnode.pending_dispatch.is_none()
+            && devnode.negotiation.is_none()
+            && devnode.remove_ready.is_none()
+            && devnode.pdo_properties.as_ref()
+                .and_then(|properties| properties.capabilities.as_ref())
+                .is_some_and(|capabilities| capabilities.raw_device_ok)
+            && self.relation_parent_is_started(parent_relation)
+            && relations.relation_contains(parent_relation.relation, pdo_object_id)
     }
 
     /// Roll back a stack that never became externally visible to PnP clients.
@@ -2264,7 +2531,13 @@ impl PnpManager {
             || pending.canonical_irp_id != identity.canonical_irp_id
             || pending.minor != PnpMinor::StartDevice
             || pending_devnode.pdo_object_id != pdo_device_id
-            || pending_devnode.fdo_object_id != fdo_device_id
+            || (pending_devnode.fdo_object_id != fdo_device_id
+                && !(pending_devnode.fdo_object_id == 0
+                    && fdo_device_id == pdo_device_id
+                    && pending_devnode.pdo_properties.as_ref()
+                        .and_then(|properties| properties.capabilities.as_ref())
+                        .is_some_and(|capabilities| capabilities.raw_device_ok)))
+            || (pending_devnode.fdo_object_id == 0 && completion_device_id != pdo_device_id)
         {
             return Err(PnpError::StaleDispatch);
         }
@@ -2281,7 +2554,12 @@ impl PnpManager {
             || devnode.pending_dispatch.is_some()
             || devnode.state != expected_state
             || devnode.pdo_object_id != pdo_device_id
-            || devnode.fdo_object_id != fdo_device_id
+            || (devnode.fdo_object_id != fdo_device_id
+                && !(devnode.fdo_object_id == 0
+                    && fdo_device_id == pdo_device_id
+                    && devnode.pdo_properties.as_ref()
+                        .and_then(|properties| properties.capabilities.as_ref())
+                        .is_some_and(|capabilities| capabilities.raw_device_ok)))
         {
             return Err(PnpError::StaleDispatch);
         }
@@ -2548,6 +2826,31 @@ mod tests {
         id
     }
 
+    #[test]
+    fn queried_device_state_updates_only_the_exact_started_pdo_generation() {
+        let mut pnp = PnpManager::new();
+        let pdo = 0x4455;
+        create_started_parent(&mut pnp, pdo);
+        let identity = pnp.devnode_identity_for_pdo(pdo).unwrap();
+        assert_eq!(pnp.devnode_dont_display_in_ui(identity), Some(false));
+        assert_eq!(pnp.devnode_not_disableable(identity), Some(false));
+
+        let stale = DevnodeIdentity { generation: identity.generation + 1, ..identity };
+        let flags = nt_pnp_abi::PNP_DEVICE_DONT_DISPLAY_IN_UI
+            | nt_pnp_abi::PNP_DEVICE_NOT_DISABLEABLE;
+        assert_eq!(pnp.set_queried_pnp_device_state(stale, flags), Err(PnpError::StaleId));
+        assert_eq!(pnp.queried_pnp_device_state(identity), Some(0));
+        assert_eq!(pnp.set_queried_pnp_device_state(identity, 0x200),
+            Err(PnpError::InvalidIdentity));
+        assert_eq!(pnp.set_queried_pnp_device_state(identity, flags), Ok(()));
+        assert_eq!(pnp.devnode_dont_display_in_ui(identity), Some(true));
+        assert_eq!(pnp.devnode_not_disableable(identity), Some(true));
+
+        assert_eq!(pnp.set_queried_pnp_device_state(identity, 0), Ok(()));
+        assert_eq!(pnp.devnode_dont_display_in_ui(identity), Some(false));
+        assert_eq!(pnp.devnode_not_disableable(identity), Some(false));
+    }
+
     fn pci_properties() -> PdoProperties {
         PdoProperties::enumerated(
             PnpBusInformation {
@@ -2559,6 +2862,7 @@ mod tests {
                 removable: false,
                 eject_supported: false,
                 surprise_removal_ok: false,
+                raw_device_ok: false,
                 address: (3 << 16) | 1,
             },
             PropertyBlobState::Present(vec![9, 8]),
@@ -2676,6 +2980,7 @@ mod tests {
                 removable: true,
                 eject_supported: true,
                 surprise_removal_ok: false,
+                raw_device_ok: false,
                 address: 0,
             }),
             DeviceRemovalPolicy::ExpectOrderlyRemoval
@@ -2685,6 +2990,7 @@ mod tests {
                 removable: true,
                 eject_supported: false,
                 surprise_removal_ok: true,
+                raw_device_ok: false,
                 address: 0,
             }),
             DeviceRemovalPolicy::ExpectSurpriseRemoval
@@ -2785,6 +3091,45 @@ mod tests {
         relations.commit_bus_relations(unrelated).unwrap();
         p.commit_resource_assignment_for_current_relation(&relations, 0x1235, vec![3], vec![4])
             .unwrap();
+    }
+
+    #[test]
+    fn raw_pdo_stack_rejects_stale_accepted_parent_relation() {
+        let mut p = PnpManager::new();
+        let parent_pdo = 0x9a00;
+        create_started_parent(&mut p, parent_pdo);
+        let first = BusReportedChild::new(
+            0x9a01, r"ACPI\RAW", "0001", &[r"ACPI\RAW"], &[] as &[&str],
+        );
+        let second = BusReportedChild::new(
+            0x9a02, r"ACPI\RAW", "0002", &[r"ACPI\RAW"], &[] as &[&str],
+        );
+        let mut relations = BusRelationTable::new();
+        relations.seed_bus_relations(parent_pdo, &[]).unwrap();
+        let prepared = relations.prepare_bus_relations(parent_pdo, &[first.clone(), second.clone()]).unwrap();
+        let parent_relation = p.claim_started_parent_relation(parent_pdo, prepared.relation_identity()).unwrap();
+        let raw_properties = || {
+            let mut properties = pci_properties();
+            properties.capabilities.as_mut().unwrap().raw_device_ok = true;
+            properties
+        };
+        let children = p.prepare_enumerated_pdo_batch(vec![
+            EnumeratedPdoRecord::new(first.enum_instance_path(), first.pdo_object_id, raw_properties())
+                .with_parent_relation(parent_relation),
+            EnumeratedPdoRecord::new(second.enum_instance_path(), second.pdo_object_id, raw_properties())
+                .with_parent_relation(parent_relation),
+        ]).unwrap();
+        p.commit_enumerated_pdo_batch(children).unwrap();
+        relations.commit_bus_relations(prepared).unwrap();
+
+        assert_eq!(p.commit_raw_pdo_stack(first.pdo_object_id), Err(PnpError::InvalidTransition));
+        assert!(p.commit_raw_pdo_stack_for_current_relation(&relations, first.pdo_object_id).is_ok());
+        let second_id = p.devnode_for_pdo(second.pdo_object_id).unwrap();
+        let removed = relations.prepare_bus_relations(parent_pdo, &[first]).unwrap();
+        relations.commit_bus_relations(removed).unwrap();
+        assert_eq!(p.commit_raw_pdo_stack_for_current_relation(&relations, second.pdo_object_id),
+            Err(PnpError::StalePublication));
+        assert_eq!(p.state(second_id), Some(DeviceState::Enumerated));
     }
 
     #[test]
@@ -3661,6 +4006,56 @@ mod tests {
     }
 
     #[test]
+    fn initialized_driverless_pdo_acknowledges_action_without_claiming_start() {
+        assert!(may_acknowledge_unstarted_start_action(
+            Some(DeviceState::Enumerated), Some(false), false,
+        ));
+        assert_eq!(
+            device_status_from_lifecycle(Some(DeviceState::Enumerated), 0, 0),
+            (0, 0),
+        );
+        for state in [
+            None,
+            Some(DeviceState::Uninitialized),
+            Some(DeviceState::DeviceStackBuilt),
+            Some(DeviceState::ResourcesAssigned),
+            Some(DeviceState::Stopped),
+            Some(DeviceState::Failed),
+            Some(DeviceState::Removed),
+        ] {
+            assert!(!may_acknowledge_unstarted_start_action(state, Some(false), false));
+        }
+        assert!(!may_acknowledge_unstarted_start_action(
+            Some(DeviceState::Enumerated), None, false,
+        ));
+        assert!(!may_acknowledge_unstarted_start_action(
+            Some(DeviceState::Enumerated), Some(true), false,
+        ));
+        assert!(!may_acknowledge_unstarted_start_action(
+            Some(DeviceState::Enumerated), Some(false), true,
+        ));
+    }
+
+    #[test]
+    fn device_status_started_bit_follows_canonical_lifecycle() {
+        const DN_STARTED: u32 = 0x0000_0008;
+        const DN_HAS_PROBLEM: u32 = 0x0000_0400;
+        let explicit = DN_HAS_PROBLEM | 0x0000_0002;
+
+        assert_eq!(
+            device_status_from_lifecycle(Some(Started), explicit, 0x25),
+            (explicit | DN_STARTED, 0x25),
+        );
+        for state in [None, Some(Enumerated), Some(StartIrpSent), Some(Stopped), Some(Failed)] {
+            assert_eq!(
+                device_status_from_lifecycle(state, explicit | DN_STARTED, 0x25),
+                (explicit, 0x25),
+                "nonstarted devnode must not inherit a stale started flag: {state:?}",
+            );
+        }
+    }
+
+    #[test]
     fn device_action_ack_requires_response_and_delivered_syscall_reply() {
         let mut response_first = DeviceActionOwner::new(action_identity()).unwrap();
         response_first.respond().unwrap();
@@ -3787,6 +4182,64 @@ mod tests {
         assert_eq!(receipt.driver_pending(), driver_pending);
         assert_eq!(manager.state(id), Some(DeviceState::Started));
         receipt
+    }
+
+    #[test]
+    fn raw_pdo_start_requires_provider_capability_and_exact_terminal_irp() {
+        let mut manager = PnpManager::new();
+        let pdo = 0x7a00;
+        let mut raw = pci_properties();
+        raw.capabilities.as_mut().unwrap().raw_device_ok = true;
+        let id = manager.register_enumerated_pdo(r"ACPI\RAW\0001", pdo, raw).unwrap();
+        let other = 0x7a01;
+        manager.register_enumerated_pdo(r"ACPI\NORAW\0001", other, pci_properties()).unwrap();
+        assert_eq!(manager.commit_raw_pdo_stack(other), Err(PnpError::InvalidTransition));
+        assert_eq!(manager.state(id), Some(DeviceState::Enumerated));
+
+        manager.commit_raw_pdo_stack(pdo).unwrap();
+        manager.commit_resource_assignment(pdo, vec![], vec![]).unwrap();
+        let token = manager.begin_pnp_dispatch(pdo, PnpMinor::StartDevice, 0x7a02).unwrap();
+        assert_eq!(manager.state(id), Some(DeviceState::StartIrpSent));
+        let identity = StartDeviceIoTerminalIdentity {
+            irp_id: 0x7a02,
+            pdo_device_id: pdo,
+            origin_driver_id: 0x44,
+            completion_driver_id: 0x44,
+            completion_device_id: pdo,
+            minor: PnpMinor::StartDevice.raw(),
+            driver_pending: true,
+            start_status: 0,
+        };
+        let mut wrong = identity;
+        wrong.completion_device_id = other;
+        assert_eq!(manager.complete_start_device_dispatch_identity(&token, pdo, wrong),
+            Err(PnpError::StaleDispatch));
+        assert_eq!(manager.state(id), Some(DeviceState::StartIrpSent));
+        manager.complete_start_device_dispatch_identity(&token, pdo, identity).unwrap();
+        assert_eq!(manager.state(id), Some(DeviceState::Started));
+        assert_eq!(manager.begin_pnp_dispatch(pdo, PnpMinor::StartDevice, 0x7a03),
+            Err(PnpError::InvalidTransition));
+
+        let failed_pdo = 0x7a04;
+        let mut raw = pci_properties();
+        raw.capabilities.as_mut().unwrap().raw_device_ok = true;
+        let failed_id = manager.register_enumerated_pdo(r"ACPI\RAW\0002", failed_pdo, raw).unwrap();
+        manager.commit_raw_pdo_stack(failed_pdo).unwrap();
+        manager.commit_resource_assignment(failed_pdo, vec![], vec![]).unwrap();
+        let failed_token = manager.begin_pnp_dispatch(failed_pdo, PnpMinor::StartDevice, 0x7a05).unwrap();
+        manager.complete_start_device_dispatch_identity(&failed_token, failed_pdo,
+            StartDeviceIoTerminalIdentity {
+                irp_id: 0x7a05,
+                pdo_device_id: failed_pdo,
+                origin_driver_id: 0x44,
+                completion_driver_id: 0x44,
+                completion_device_id: failed_pdo,
+                minor: PnpMinor::StartDevice.raw(),
+                driver_pending: false,
+                start_status: 0xC000_0001,
+            }).unwrap();
+        assert_eq!(manager.state(failed_id), Some(DeviceState::Failed));
+        assert_eq!(device_status_from_lifecycle(manager.state(failed_id), 0, 0).0 & 8, 0);
     }
 
     #[test]
@@ -4032,5 +4485,40 @@ mod tests {
             Err(StartDeviceLedgerError::UnknownRequest)
         );
         assert_eq!(ledger.protocol_errors(), 3);
+    }
+
+    #[test]
+    fn start_device_reply_evidence_requires_exact_live_request_identity() {
+        let mut ledger = StartDeviceCallLedger::new();
+        let old = ledger.begin_with_caller(r"PCI\VEN_1111\0001", 40, 3).unwrap();
+        let current = ledger.begin_with_caller(r"PCI\VEN_2222\0002", 44, 7).unwrap();
+        ledger.complete_without_start_irp(old, 0xc000_000e).unwrap();
+        ledger.complete_without_start_irp(current, 0xc000_000e).unwrap();
+
+        let evidence = ledger.result_for_reply(current).unwrap();
+        assert_eq!(evidence.instance_id(), r"PCI\VEN_2222\0002");
+        assert_eq!((evidence.caller_pid(), evidence.caller_generation()), (44, 7));
+        assert_eq!(evidence.completion(), StartDeviceCompletionKind::NoStartIrp);
+        assert_eq!(evidence.status(), 0xc000_000e);
+        assert_ne!(ledger.result_for_reply(old).unwrap().instance_id(), evidence.instance_id());
+        assert_eq!(ledger.result_for_reply(StartDeviceRequestIdentity { sequence: 999 }), None);
+        assert_eq!(
+            ledger.record_reply(StartDeviceRequestIdentity { sequence: 999 }, 0xc000_000e, true),
+            Err(StartDeviceLedgerError::UnknownRequest)
+        );
+        assert_eq!(ledger.result_for_reply(current).unwrap().instance_id(), r"PCI\VEN_2222\0002");
+
+        ledger.record_reply(current, 0xc000_000e, true).unwrap();
+        assert_eq!(ledger.result_for_reply(current), None);
+        let terminal = ledger.terminal_by_identity(current).unwrap();
+        assert_eq!(terminal.instance_id(), r"PCI\VEN_2222\0002");
+        assert_eq!((terminal.caller_pid(), terminal.caller_generation()), (44, 7));
+        assert!(terminal.reply_matches());
+        assert!(ledger.terminal_by_identity(old).is_none());
+        assert_eq!(ledger.result_for_reply(old).unwrap().instance_id(), r"PCI\VEN_1111\0001");
+        ledger.record_reply(old, 0xc000_000e, true).unwrap();
+        assert_eq!(ledger.result_for_reply(old), None);
+        assert_eq!(ledger.record_reply(old, 0xc000_000e, true), Err(StartDeviceLedgerError::UnknownRequest));
+        assert_eq!(ledger.terminal_by_identity(current).unwrap().instance_id(), r"PCI\VEN_2222\0002");
     }
 }

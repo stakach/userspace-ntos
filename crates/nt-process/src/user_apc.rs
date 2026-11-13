@@ -7,7 +7,7 @@ static NEXT_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn allocate_identity() -> Result<u64, u32> {
     NEXT_IDENTITY
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
             next.checked_add(1)
         })
         .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)

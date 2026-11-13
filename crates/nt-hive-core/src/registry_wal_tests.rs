@@ -187,6 +187,30 @@ fn committed_wal_payloads_require_contiguous_semantic_sequences() {
 }
 
 #[test]
+fn shutdown_proves_complete_hive_sidecar_through_live_sequence() {
+    let first = encode_log_record(&HiveLogOp::CreateKey { path: "Default\\One" }, 1);
+    let second = encode_log_record(&HiveLogOp::CreateKey { path: "Default\\Two" }, 2);
+    let third = encode_log_record(&HiveLogOp::CreateKey { path: "Default\\Three" }, 3);
+    let mut sidecar = first.clone();
+    sidecar.extend_from_slice(&second);
+    assert_eq!(super::complete_hive_log_end_sequence(0, &sidecar), Ok(2));
+
+    // A newer primary can legitimately cover complete records still in the sidecar.
+    sidecar.extend_from_slice(&third);
+    assert_eq!(super::complete_hive_log_end_sequence(2, &sidecar), Ok(3));
+    assert_eq!(super::complete_hive_log_end_sequence(3, &sidecar), Ok(3));
+
+    let mut torn = first.clone();
+    torn.extend_from_slice(&second[..second.len() - 1]);
+    assert_eq!(super::complete_hive_log_end_sequence(0, &torn),
+        Err(super::HiveLogReplayError::Truncated));
+    let mut gap = first;
+    gap.extend_from_slice(&third);
+    assert_eq!(super::complete_hive_log_end_sequence(0, &gap),
+        Err(super::HiveLogReplayError::SequenceGap));
+}
+
+#[test]
 fn torn_tail_exposes_only_verified_prefix() {
     let first = encode_record(7, 10, b"first").unwrap();
     let second = encode_record(7, 11, b"second").unwrap();

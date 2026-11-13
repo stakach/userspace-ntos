@@ -67,6 +67,8 @@ pub const SE_GROUP_ENABLED_BY_DEFAULT: u32 = 0x0000_0002;
 pub const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 pub const SE_GROUP_OWNER: u32 = 0x0000_0008;
 pub const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x0000_0010;
+pub const SE_GROUP_INTEGRITY: u32 = 0x0000_0020;
+pub const SE_GROUP_INTEGRITY_ENABLED: u32 = 0x0000_0040;
 /// `SE_GROUP_LOGON_ID` — marks the logon SID of an interactive logon session (two bits, so a
 /// simple `& SE_GROUP_LOGON_ID` test is not enough; the caller must compare the whole mask).
 pub const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
@@ -440,6 +442,19 @@ pub fn capture_token(
     for (sid, attributes) in captured_groups {
         groups.push(group_from_attributes(sid, attributes));
     }
+    let mut integrity_level = None;
+    for group in &groups {
+        if group.native_attributes() & SE_GROUP_INTEGRITY == 0 {
+            continue;
+        }
+        if integrity_level.is_some()
+            || group.sid.identifier_authority != [0, 0, 0, 0, 0, 16]
+            || group.sid.sub_authorities.len() != 1
+        {
+            return Err(STATUS_INVALID_SID);
+        }
+        integrity_level = group.sid.sub_authorities.first().copied();
+    }
 
     // TOKEN_PRIVILEGES — the count, then that many LUID_AND_ATTRIBUTES.
     let requested_privilege_count = read_u32(memory, args.token_privileges)?;
@@ -491,6 +506,7 @@ pub fn capture_token(
             user,
             user_attributes,
             groups,
+            integrity_level,
             restricted_sids: Vec::new(),
             privileges,
             owner,

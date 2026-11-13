@@ -205,6 +205,66 @@ fn recycled_frame_pool_grows_past_the_old_policy_limit_and_reuses_lifo() {
 }
 
 #[test]
+fn recycled_frame_preflight_work_is_bounded_after_large_pool_growth() {
+    let mut pool = RecycledFramePool::new();
+    assert!(pool.reserve(5_000));
+    for frame in 1..=5_000 {
+        pool.publish_reserved(frame).unwrap();
+    }
+    pool.inspected.set(0);
+    assert_eq!(pool.check_reserved(10_000), Err(FramePoolError::Full));
+    assert!(pool.inspected.get() < 64, "preflight inspected {} frames", pool.inspected.get());
+    assert_eq!(pool.check_reserved(5_000), Err(FramePoolError::AlreadyPublished));
+    assert_eq!(pool.acquire(), Some(5_000));
+    pool.publish_reserved(5_000).unwrap();
+    assert_eq!(pool.acquire(), Some(5_000));
+}
+
+#[test]
+fn recycled_frame_index_preserves_exact_membership_across_collisions_and_churn() {
+    let mut pool = RecycledFramePool::new();
+    assert!(pool.reserve(32));
+    let colliding: Vec<_> = (1..)
+        .filter(|&frame| RecycledFramePool::index_start(frame, pool.index.len()) == 0)
+        .take(24)
+        .collect();
+    for &frame in &colliding {
+        pool.publish_reserved(frame).unwrap();
+    }
+    for &frame in colliding.iter().rev().take(12) {
+        assert_eq!(pool.acquire(), Some(frame));
+        assert_eq!(pool.check_reserved(frame), Ok(()));
+    }
+    for &frame in colliding.iter().take(12) {
+        assert_eq!(pool.check_reserved(frame), Err(FramePoolError::AlreadyPublished));
+    }
+    for &frame in colliding.iter().skip(12) {
+        pool.publish_reserved(frame).unwrap();
+    }
+    for &frame in colliding.iter().rev().take(12) {
+        assert_eq!(pool.acquire(), Some(frame));
+    }
+    for &frame in colliding.iter().take(12) {
+        assert_eq!(pool.check_reserved(frame), Err(FramePoolError::AlreadyPublished));
+    }
+    pool.inspected.set(0);
+    assert_eq!(pool.check_reserved(10_000), Ok(()));
+    assert!(pool.inspected.get() < 64);
+}
+
+#[test]
+fn recycled_frame_index_tracks_direct_recycle_duplicates_until_last_acquisition() {
+    let mut pool = RecycledFramePool::new();
+    assert_eq!(pool.try_recycle(70), Ok(()));
+    assert_eq!(pool.try_recycle(70), Ok(()));
+    assert_eq!(pool.check_reserved(70), Err(FramePoolError::AlreadyPublished));
+    assert_eq!(pool.acquire(), Some(70));
+    assert_eq!(pool.check_reserved(70), Err(FramePoolError::AlreadyPublished));
+    assert_eq!(pool.acquire(), Some(70));
+    assert_eq!(pool.check_reserved(70), Ok(()));
+}
+
+#[test]
 fn page_chunks_cover_in_page_boundary_and_cross_page_ranges() {
     assert_eq!(page_chunks(0x1234, 0).unwrap().next(), None);
     assert_eq!(
@@ -1665,6 +1725,98 @@ fn fixed_vm_map_query_basic_splits_on_page_protection_override() {
 }
 
 #[test]
+fn fixed_vm_map_large_query_inspects_sparse_protection_boundaries() {
+    const REGION_SIZE: u64 = 64 * 1024 * 1024;
+    const OVERRIDE_OFFSET: u64 = 32 * 1024 * 1024;
+    let mut map = VmRegionMap::<4>::new(0x10000, 0x1000_0000);
+    let allocation = map
+        .allocate(
+            Some(0x10000),
+            REGION_SIZE,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+        .unwrap();
+    map.protect(allocation.base + OVERRIDE_OFFSET, PAGE_SIZE, PAGE_READONLY)
+        .unwrap();
+
+    VM_BASIC_EXTENT_INSPECTIONS.with(|count| count.set(0));
+    let before_override = map.query_basic(allocation.base, 0x1000_0000).unwrap();
+    let inspections = VM_BASIC_EXTENT_INSPECTIONS.with(|count| count.get());
+    assert_eq!(before_override.region_size, OVERRIDE_OFFSET);
+    assert_eq!(before_override.protect, PAGE_READWRITE);
+    assert!(
+        inspections <= 2,
+        "query searched extents {inspections} times"
+    );
+
+    let overridden = map
+        .query_basic(allocation.base + OVERRIDE_OFFSET, 0x1000_0000)
+        .unwrap();
+    assert_eq!(overridden.region_size, PAGE_SIZE);
+    assert_eq!(overridden.protect, PAGE_READONLY);
+    let after_override = map
+        .query_basic(allocation.base + OVERRIDE_OFFSET + PAGE_SIZE, 0x1000_0000)
+        .unwrap();
+    assert_eq!(
+        after_override.region_size,
+        REGION_SIZE - OVERRIDE_OFFSET - PAGE_SIZE
+    );
+    assert_eq!(after_override.protect, PAGE_READWRITE);
+}
+
+#[test]
+fn fixed_vm_map_query_basic_finds_unsorted_and_contiguous_protection_overrides() {
+    let mut map = VmRegionMap::<4>::new(0x10000, 0x20_0000);
+    let allocation = map
+        .allocate(
+            Some(0x10000),
+            0x8000,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+        .unwrap();
+    // Insert the later override first so slot order differs from virtual address order.
+    map.protect(allocation.base + 0x5000, PAGE_SIZE, PAGE_READONLY)
+        .unwrap();
+    map.protect(allocation.base + 0x2000, 2 * PAGE_SIZE, PAGE_READONLY)
+        .unwrap();
+
+    for (offset, region_size, protect) in [
+        (0, 0x2000, PAGE_READWRITE),
+        (0x2000, 0x2000, PAGE_READONLY),
+        (0x3000, 0x1000, PAGE_READONLY),
+        (0x4000, 0x1000, PAGE_READWRITE),
+        (0x5000, 0x1000, PAGE_READONLY),
+        (0x6000, 0x2000, PAGE_READWRITE),
+    ] {
+        let info = map
+            .query_basic(allocation.base + offset, 0x20_0000)
+            .unwrap();
+        assert_eq!(info.region_size, region_size, "offset {offset:#x}");
+        assert_eq!(info.protect, protect, "offset {offset:#x}");
+        assert_eq!(info.allocation_base, allocation.base);
+        assert_eq!(info.allocation_protect, PAGE_READWRITE);
+    }
+}
+
+#[test]
+fn fixed_vm_map_query_basic_reserved_extent_stops_at_address_ceiling() {
+    let mut map = VmRegionMap::<4>::new(0x10000, 0x20_0000);
+    let allocation = map
+        .allocate(Some(0x10000), 0x8000, MEM_RESERVE, PAGE_READWRITE)
+        .unwrap();
+    let info = map
+        .query_basic(allocation.base + 0x123, allocation.base + 0x2800)
+        .unwrap();
+    assert_eq!(info.base_address, allocation.base);
+    assert_eq!(info.region_size, 0x2800);
+    assert_eq!(info.state, MEM_RESERVE);
+    assert_eq!(info.protect, 0);
+    assert_eq!(info.allocation_protect, PAGE_READWRITE);
+}
+
+#[test]
 fn committed_range_table_queries_and_coalesces_runtime_mappings() {
     let mut table = VmCommittedRangeTable::<4>::new();
     table
@@ -1702,6 +1854,81 @@ fn committed_range_table_queries_and_coalesces_runtime_mappings() {
         }
     );
     assert_eq!(table.query_basic(0x1600_1000).unwrap().region_size, 0x1000);
+}
+
+#[test]
+fn committed_range_table_large_queries_inspect_bounded_candidates() {
+    const BASE: u64 = 0x2000_0000;
+    const STRIDE: u64 = 0x3000;
+    const COUNT: usize = 400;
+    // Build the same sorted layout produced by registration and normalization without
+    // making this lookup regression depend on the cost of 400 insertions.
+    let mut ranges = [None; 512];
+    for (index, slot) in ranges.iter_mut().enumerate().take(COUNT) {
+        *slot = Some(VmCommittedRange::mapped(
+            BASE + index as u64 * STRIDE,
+            PAGE_SIZE,
+            PAGE_READONLY,
+        ));
+    }
+    let table = VmCommittedRangeTable::<512> { ranges };
+
+    let last = BASE + (COUNT as u64 - 1) * STRIDE;
+    VM_COMMITTED_QUERY_INSPECTIONS.with(|count| count.set(0));
+    assert_eq!(table.query_basic(last + 0x123).unwrap().base_address, last);
+    let inspections = VM_COMMITTED_QUERY_INSPECTIONS.with(|count| count.get());
+    assert!(
+        inspections < 32,
+        "last-range query inspected {inspections} candidates"
+    );
+
+    VM_COMMITTED_QUERY_INSPECTIONS.with(|count| count.set(0));
+    assert!(table.query_basic(last - PAGE_SIZE).is_none());
+    let inspections = VM_COMMITTED_QUERY_INSPECTIONS.with(|count| count.get());
+    assert!(
+        inspections < 32,
+        "late-gap query inspected {inspections} candidates"
+    );
+}
+
+#[test]
+fn committed_range_table_normalizes_many_ranges_with_bounded_comparisons() {
+    const BASE: u64 = 0x4000_0000;
+    const PAIRS: usize = 200;
+    // Include holes and reverse address order so normalization must both compact and sort.
+    // Each pair has a common allocation identity and must coalesce after sorting.
+    let mut ranges = [None; 512];
+    for index in 0..PAIRS * 2 {
+        let pair_base = BASE + (index / 2) as u64 * 3 * PAGE_SIZE;
+        ranges[511 - index] = Some(VmCommittedRange::image_region(
+            pair_base + (index % 2) as u64 * PAGE_SIZE,
+            PAGE_SIZE,
+            pair_base,
+            PAGE_READONLY,
+        ));
+    }
+    let mut table = VmCommittedRangeTable::<512> { ranges };
+    VM_COMMITTED_NORMALIZE_COMPARISONS.with(|count| count.set(0));
+    table.normalize();
+    let comparisons = VM_COMMITTED_NORMALIZE_COMPARISONS.with(|count| count.get());
+    assert!(
+        comparisons < 10_000,
+        "normalizing 400 ranges took {comparisons} comparisons"
+    );
+    assert_eq!(table.range_count(), PAIRS);
+    for (index, slot) in table.ranges.iter().enumerate() {
+        if index < PAIRS {
+            let range = slot.expect("sorted committed range prefix");
+            assert_eq!(range.base, BASE + index as u64 * 3 * PAGE_SIZE);
+            assert_eq!(range.size, 2 * PAGE_SIZE);
+            assert_eq!(range.allocation_base, range.base);
+        } else {
+            assert!(
+                slot.is_none(),
+                "normalization must clear the trailing slots"
+            );
+        }
+    }
 }
 
 #[test]

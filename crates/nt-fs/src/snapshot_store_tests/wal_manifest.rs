@@ -1,7 +1,31 @@
 use super::*;
 use crate::RegistryWal;
 use crate::{OwnedBoundedBlockRange, SnapshotReserve, WalSnapshotBaselineRepair};
+use alloc::rc::Rc;
+use core::cell::Cell;
 extern crate std;
+
+struct ReadCountingDisk {
+    inner: CachedDisk,
+    reads: Rc<Cell<usize>>,
+}
+
+impl SnapshotBlockDevice for ReadCountingDisk {
+    fn sector_size(&self) -> usize { self.inner.sector_size() }
+    fn sector_count(&self) -> u64 { self.inner.sector_count() }
+    fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.reads.set(self.reads.get() + 1);
+        self.inner.read_sector(lba, out)
+    }
+    fn read_sectors(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.reads.set(self.reads.get() + 1);
+        self.inner.read_sectors(lba, out)
+    }
+    fn write_sector(&mut self, lba: u64, data: &[u8]) -> Result<(), SnapshotBlockStoreError> {
+        self.inner.write_sector(lba, data)
+    }
+    fn flush(&mut self) -> Result<(), SnapshotBlockStoreError> { self.inner.flush() }
+}
 
 fn base() -> WalSnapshotManifest {
     WalSnapshotManifest {
@@ -37,6 +61,72 @@ fn paired_wal_journal_manifest_requires_two_payload_valid_slots() {
         store.current_paired_wal_journal_manifest(&mut disk),
         Err(SnapshotBlockStoreError::Corrupt)
     );
+}
+
+#[test]
+fn repeated_paired_wal_admission_reuses_verified_unchanged_payloads() {
+    let store = SnapshotBlockStore::new(0, 32);
+    let mut disk = CachedDisk::with_sectors(32);
+    let payload = [0x5a; 4096];
+    store
+        .commit_next_with_wal_manifest(&mut disk, &payload, base())
+        .unwrap();
+    store
+        .commit_next_with_wal_manifest(&mut disk, &payload, base())
+        .unwrap();
+
+    // Boot pays the full CRC cost once; the exclusive mounted owner retains this proof.
+    let proof = store.verify_paired_wal_snapshot(&mut disk).unwrap();
+    disk.read_attempts = 0;
+    for _ in 0..3 {
+        assert_eq!(store.recheck_verified_paired_wal_snapshot(&mut disk, &proof), Ok(base()));
+    }
+    assert!(
+        disk.read_attempts <= 6,
+        "three unchanged admissions should inspect at most two headers each; observed {} reads",
+        disk.read_attempts,
+    );
+}
+
+#[test]
+fn verified_pair_refuses_a_changed_header_without_reusing_its_proof() {
+    let (store, mut disk) = two_v2_slots();
+    let proof = store.verify_paired_wal_snapshot(&mut disk).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, b"third", base()).unwrap();
+    disk.read_attempts = 0;
+    assert_eq!(
+        store.recheck_verified_paired_wal_snapshot(&mut disk, &proof),
+        Err(SnapshotBlockStoreError::Corrupt),
+    );
+    assert!(disk.read_attempts <= 2, "stale proof must fail from exact headers");
+}
+
+#[test]
+fn verified_pair_anchor_advances_headers_without_rereading_payloads() {
+    let store = SnapshotBlockStore::new(0, 16);
+    let reads = Rc::new(Cell::new(0));
+    let mut disk = ReadCountingDisk { inner: CachedDisk::with_sectors(32), reads: reads.clone() };
+    let payload = [0x5a; 2048];
+    store.commit_next_with_wal_manifest(&mut disk, &payload, base()).unwrap();
+    store.commit_next_with_wal_manifest(&mut disk, &payload, base()).unwrap();
+    let pair = store.verify_paired_wal_snapshot(&mut disk).unwrap();
+    let range = OwnedBoundedBlockRange::new(disk, 16, 16).ok().unwrap();
+    let mut wal = RegistryWal::recover(range, 77).unwrap();
+    wal.begin(alloc::vec![0x51; 512]).unwrap();
+    wal.prepare().unwrap();
+    wal.commit().unwrap();
+    let verified = wal.into_verified_device().unwrap().into_full_device();
+    let before_anchor = reads.get();
+    let mut update = WalSnapshotAnchorUpdate::admit_verified_wal_pair(store, verified, pair)
+        .ok().unwrap();
+    update.advance().unwrap();
+    assert_eq!(reads.get() - before_anchor, 2, "only the two exact headers are rechecked");
+    let (mut disk, continuation, pair) = update.into_continuation_and_pair().ok().unwrap();
+    assert_eq!(pair.anchor(), continuation.anchor());
+    assert_eq!(pair.anchor(), WalSnapshotAnchor { incarnation: 77, serial: 1, end_lba: 3 });
+    assert_eq!(store.recheck_verified_paired_wal_snapshot(&mut disk, &pair), Ok(pair.manifest()));
+    disk.inner.power_cut();
+    assert_eq!(store.read_latest_wal(&mut disk).unwrap().unwrap().anchor, pair.anchor());
 }
 
 #[test]

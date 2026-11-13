@@ -26,6 +26,10 @@ impl EventSignalSelector for Selector<'_> {
                     self.event?,
                 )
             }
+            DispatcherWaitSource::HostedDriver => {
+                unsafe { driver_launch::hosted_driver_wait_oldest_event_consumer_sequence(
+                    self.index, self.handler) }
+            }
         }
     }
 
@@ -44,13 +48,17 @@ impl EventSignalSelector for Selector<'_> {
                         sequence,
                     )
                 }
+                DispatcherWaitSource::HostedDriver => {
+                    driver_launch::hosted_driver_wait_select_event_consumer(
+                        self.index, sequence, self.handler)
+                }
             }
         };
         assert!(
             selected,
             "exact Event consumer changed during local selection"
         );
-        if !matches!(source, DispatcherWaitSource::Native) {
+        if matches!(source, DispatcherWaitSource::Provider) {
             self.deferred_selected = self.deferred_selected.saturating_add(1);
         }
     }
@@ -83,6 +91,7 @@ pub(super) unsafe fn wake(index: usize, handler: &mut ExecNtHandler, mode: Event
     };
     // Selection and pulse clearing are complete before reply delivery can run any hosted caller.
     let woken = object_wait_reply::redrive(handler);
+    let hosted_woken = driver_launch::hosted_driver_wait_redrive_selected();
     if let Some(operation) = operation {
         if let Some(retired) = handler
             .event_objects
@@ -92,5 +101,5 @@ pub(super) unsafe fn wake(index: usize, handler: &mut ExecNtHandler, mode: Event
             handler.finalize_retired_event_object(retired);
         }
     }
-    woken.saturating_add(deferred_selected)
+    woken.saturating_add(deferred_selected).saturating_add(hosted_woken)
 }

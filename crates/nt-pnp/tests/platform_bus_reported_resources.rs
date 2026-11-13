@@ -32,6 +32,15 @@ fn mouse_reports() -> (Vec<u8>, Vec<u8>) {
     )
 }
 
+fn libernt_serial_reports() -> (Vec<u8>, Vec<u8>) {
+    // Exact Boot17 accepted ACPI\\PNP0501 PDO query. The CM interrupt records IRQ4 as
+    // level-sensitive/shared, but only the child's _CRS can authorize its polarity and source.
+    (
+        hex_bytes("010000000000000000000000010001000200000001021100f8030000000000000800000000000000020300000400000004000000ffffffffffffffff"),
+        hex_bytes("6800000000000000000000000000000000000000000000000000000001000000010001000200000000010200110000000800000001000000f803000000000000ff030000000000000102030000000000040000000400000000000000000000000000000000000000"),
+    )
+}
+
 fn irq(line: u32, vector: u32) -> PlatformInterruptResource {
     PlatformInterruptResource {
         level: line,
@@ -104,6 +113,29 @@ fn mouse_accepts_an_interrupt_only_and_rejects_changed_bus_evidence() {
     non_acpi_requirements[4] = 5;
     assert!(admit_bus_reported_platform_resources(&non_acpi_raw, &non_acpi_requirements, &[], irq(12, 44)).is_err());
     assert!(admit_bus_reported_platform_resources(&raw[..raw.len() - 1], &requirements, &[], irq(12, 44)).is_err());
+}
+
+#[test]
+fn libernt_serial_exact_bus_bytes_admit_before_irq_electrical_resolution() {
+    let (raw, requirements) = libernt_serial_reports();
+    let root_ports = [PlatformPortResource { start: 0, length: 0x1_0000 }];
+    let interrupt = PlatformInterruptResource {
+        level: 4,
+        vector: 4,
+        affinity: 1,
+        latched: false,
+        shared: true,
+    };
+    let admitted = admit_bus_reported_platform_resources(
+        &raw, &requirements, &root_ports, interrupt,
+    ).expect("exact accepted serial CM reports satisfy bus resource admission");
+    assert_eq!(admitted.raw_resources, raw);
+    assert_eq!(admitted.resource_requirements, requirements);
+    assert_eq!(admitted.ports.len(), 1);
+    assert_eq!(admitted.ports[0].start, 0x3f8);
+    assert_eq!(admitted.ports[0].length, 8);
+    assert_eq!(admitted.raw_interrupt.level, 4);
+    assert_eq!(admitted.raw_interrupt.flags, nt_cm_resources::CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE);
 }
 
 #[test]

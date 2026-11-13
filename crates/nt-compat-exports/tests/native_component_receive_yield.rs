@@ -304,9 +304,19 @@ fn receive_continuation_is_distinct_from_provider_and_lpc_waits() {
     );
     let mut payload_types = Audit::default();
     payload_types.visit_item_struct(payload.unwrap());
+    assert!(
+        payload_types.types.iter().any(|name| name == "SuspendedPumpSnapshot"),
+        "receive continuation must own the suspended pump snapshot"
+    );
+    let snapshot = pending.items.iter().find_map(|item| match item {
+        Item::Struct(item) if item.ident == "SuspendedPumpSnapshot" => Some(item),
+        _ => None,
+    });
+    let mut snapshot_types = Audit::default();
+    snapshot_types.visit_item_struct(snapshot.expect("focused pump snapshot owner"));
     for required in ["PumpResult", "Win32kClientContext"] {
         assert!(
-            payload_types.types.iter().any(|name| name == required),
+            snapshot_types.types.iter().any(|name| name == required),
             "receive continuation must retain original pump/accounting and client: {required}"
         );
     }
@@ -476,7 +486,9 @@ fn receive_resume_consumes_settlement_before_parent_restore_and_never_replays_re
         "single-use permit stays in the actual Parent before outer-boundary delivery"
     );
     let restore_parent = audit(function(&nested, "restore"));
-    call_position(&restore_parent, "matches_scope");
+    call_position(&restore_parent, "restore_or_retain");
+    let restore_stages = audit(function(&nested, "restore_stages"));
+    call_position(&restore_stages, "matches_scope");
     let executor = syn::parse_file(RESUME).unwrap();
     let execute = audit(function(&executor, "run_receive"));
     assert!(

@@ -7,7 +7,8 @@
 //! later `MapGlobalUserHeap` calls `MmMapViewOfSection(SectionObject, Process, &UserBase, ...)` to
 //! project the *same* backing into each connecting process. For the heap to be coherent the two
 //! mappings must resolve to the same memory, so a section object must remember the base it was
-//! mapped at and hand it back on every subsequent map.
+//! mapped at and hand it back on every subsequent map. Object pointer references and mapped views
+//! have separate counts; the descriptor retires only after both reach zero.
 //!
 //! This would normally be a runtime registry, but the win32k host needs section metadata that can be
 //! allocated before the hosted image starts, so the section object *carries its own state*: the
@@ -34,8 +35,12 @@ pub mod section_object {
     pub const MAP_COUNT: usize = 0x18;
     /// `PVOID Next` — host-owned intrusive link used by the import layer to resolve unmap-by-base.
     pub const NEXT: usize = 0x20;
+    /// Object pointer references, independent of mapped view references.
+    pub const REFERENCES: usize = 0x28;
+    /// Exact provider-pool allocation generation recorded at registration.
+    pub const GENERATION: usize = 0x30;
     /// Total descriptor size the caller must allocate.
-    pub const SIZE_OF: usize = 0x28;
+    pub const SIZE_OF: usize = 0x38;
 }
 
 /// Descriptor magic ("MmSeSeCt" truncated) — a live section descriptor created by [`init_section`].
@@ -61,6 +66,65 @@ pub unsafe fn init_section(desc: *mut u8, size: u64) {
     core::ptr::write_unaligned(desc.add(o::MAGIC) as *mut u64, SECTION_MAGIC);
     core::ptr::write_unaligned(desc.add(o::MAP_COUNT) as *mut u64, 0);
     core::ptr::write_unaligned(desc.add(o::NEXT) as *mut u64, 0);
+    core::ptr::write_unaligned(desc.add(o::REFERENCES) as *mut u64, 1);
+    core::ptr::write_unaligned(desc.add(o::GENERATION) as *mut u64, 0);
+}
+
+/// Bind the descriptor to its exact native allocation before publishing it in the host list.
+///
+/// # Safety
+/// `desc` must be an initialized, unpublished section descriptor.
+pub unsafe fn bind_section_allocation_generation(desc: *mut u8, generation: u64) -> bool {
+    if generation == 0 || !is_section(desc) || section_allocation_generation(desc) != 0 {
+        return false;
+    }
+    core::ptr::write_unaligned(desc.add(section_object::GENERATION) as *mut u64, generation);
+    true
+}
+
+/// Native allocation generation recorded at publication.
+///
+/// # Safety
+/// `desc` must be a live section descriptor.
+pub unsafe fn section_allocation_generation(desc: *const u8) -> u64 {
+    core::ptr::read_unaligned(desc.add(section_object::GENERATION) as *const u64)
+}
+
+/// Number of live object pointer references. The creating MmCreateSection owns the first one.
+///
+/// # Safety
+/// `desc` must be a registered, live section descriptor.
+pub unsafe fn section_reference_count(desc: *const u8) -> u64 {
+    core::ptr::read_unaligned(desc.add(section_object::REFERENCES) as *const u64)
+}
+
+/// Retain an object pointer; a descriptor whose last pointer was released cannot be resurrected.
+///
+/// # Safety
+/// `desc` must be a registered, live section descriptor.
+pub unsafe fn retain_section(desc: *mut u8) -> Option<u64> {
+    let count = section_reference_count(desc);
+    let next = count.checked_add(1).filter(|_| count != 0)?;
+    core::ptr::write_unaligned(desc.add(section_object::REFERENCES) as *mut u64, next);
+    Some(next)
+}
+
+/// Release one object pointer, rejecting underflow. Mapped views keep their own lifetime.
+///
+/// # Safety
+/// `desc` must be a registered, live section descriptor.
+pub unsafe fn release_section(desc: *mut u8) -> Option<u64> {
+    let next = section_reference_count(desc).checked_sub(1)?;
+    core::ptr::write_unaligned(desc.add(section_object::REFERENCES) as *mut u64, next);
+    Some(next)
+}
+
+/// The descriptor may be unlinked and freed only after both independent lifetimes end.
+///
+/// # Safety
+/// `desc` must be a registered, live section descriptor.
+pub unsafe fn section_may_retire(desc: *const u8) -> bool {
+    section_reference_count(desc) == 0 && section_map_count(desc) == 0
 }
 
 /// `true` if `desc` is a live section descriptor created by [`init_section`].
@@ -304,6 +368,51 @@ mod tests {
             assert!(!is_section(buf.as_ptr())); // zeroed, no magic
             init_section(buf.as_mut_ptr(), 0x1000);
             assert!(is_section(buf.as_ptr()));
+        }
+    }
+
+    #[test]
+    fn object_references_are_independent_of_mapped_views() {
+        let mut buf = [0u8; o::SIZE_OF];
+        let desc = buf.as_mut_ptr();
+        unsafe {
+            init_section(desc, 0x2000);
+            assert_eq!(section_reference_count(desc), 1); // MmCreateSection owns one pointer.
+            assert_eq!(retain_section(desc), Some(2));
+            assert_eq!(map_section(desc, |_| 0x20_000), 0x20_000);
+            assert_eq!(release_section(desc), Some(1));
+            assert_eq!(release_section(desc), Some(0));
+            // The descriptor is still needed to unmap its outstanding view.
+            assert!(!section_may_retire(desc));
+            assert_eq!(retain_section(desc), None); // A dead pointer cannot be resurrected.
+            assert_eq!(release_section(desc), None); // Underflow is rejected.
+            assert!(unmap_section(desc, 0x20_000, |_| true));
+            assert!(section_may_retire(desc));
+        }
+    }
+
+    #[test]
+    fn final_unmapped_pointer_reference_retires_section() {
+        let mut buf = [0u8; o::SIZE_OF];
+        let desc = buf.as_mut_ptr();
+        unsafe {
+            init_section(desc, 0x1000);
+            assert!(!section_may_retire(desc));
+            assert_eq!(release_section(desc), Some(0));
+            assert!(section_may_retire(desc));
+        }
+    }
+
+    #[test]
+    fn publication_binds_one_exact_allocation_generation() {
+        let mut buf = [0u8; o::SIZE_OF];
+        let desc = buf.as_mut_ptr();
+        unsafe {
+            init_section(desc, 0x1000);
+            assert!(!bind_section_allocation_generation(desc, 0));
+            assert!(bind_section_allocation_generation(desc, 17));
+            assert_eq!(section_allocation_generation(desc), 17);
+            assert!(!bind_section_allocation_generation(desc, 18));
         }
     }
 }

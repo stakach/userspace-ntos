@@ -341,7 +341,7 @@ impl SynchronousFileWaitTable {
             .checked_add(u64::try_from(reserved).ok()?.checked_add(1)?)?;
         if self.identity == 0 {
             self.identity = LAST_TABLE
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
                     last.checked_add(1)
                 })
                 .ok()?

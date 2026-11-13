@@ -4,6 +4,7 @@ const MEMORY_PROCESS: nt_memory_manager::MemoryLifetime =
         generation: nt_memory_manager::ProcessGeneration::Hosted(1),
     });
 use super::*;
+use alloc::vec::Vec;
 use nt_memory_manager::{
     ClientFrameRegistry, GenericSectionBacking, PendingSectionFrames, SectionRetirementIo,
 };
@@ -14,6 +15,7 @@ struct Storage {
     pinned: [u64; 2],
     bytes: [u32; 128],
     slots: [u64; 3],
+    membership: [u64; 2],
     count: u64,
     total: u64,
 }
@@ -26,6 +28,7 @@ impl Storage {
             pinned: [0; 2],
             bytes,
             slots: [65, 70, 0],
+            membership: [1 << 1, 0],
             count: 1,
             total: 4096,
         }
@@ -38,6 +41,7 @@ impl Storage {
             pinned: &self.pinned,
             retype_bytes: &self.bytes,
             free_slots: &self.slots,
+            free_membership: &self.membership,
             free_slot_count: self.count,
             live_bytes: self.total,
         }
@@ -122,11 +126,58 @@ fn contradictory_root_slot_publication_and_accounting_are_not_repaired() {
     storage.rejects(70, FrameRecycleError::AccountingUnderflow);
     storage.total = 4096;
     storage.count = 2;
+    storage.membership[0] |= 1 << 6;
     storage.rejects(70, FrameRecycleError::EmptySlotPublished);
     for count in [4, u64::MAX] {
         storage.count = count;
         storage.rejects(70, FrameRecycleError::CorruptSlotCount);
     }
+}
+
+#[test]
+fn frame_owner_validation_inspects_bounded_free_slots() {
+    let storage = Storage::new();
+    let slots: Vec<u64> = (200..32_968).collect();
+    assert_eq!(slots.len(), 32_768);
+    let mut duplicate_slots = slots.clone();
+    duplicate_slots[32_767] = 70;
+    let mut duplicate_membership = storage.membership;
+    duplicate_membership[0] |= 1 << 6;
+    let mut view = storage.view();
+    view.free_slots = &slots;
+    view.free_slot_count = slots.len() as u64;
+
+    FREE_SLOT_INSPECTIONS.with(|inspections| inspections.set(0));
+    assert_eq!(view.validate_owner(70), Ok(()));
+    let inspected = FREE_SLOT_INSPECTIONS.with(|inspections| inspections.get());
+    assert!(
+        inspected < 64,
+        "absent frame inspected {inspected} free slots"
+    );
+
+    view.free_slots = &duplicate_slots;
+    view.free_membership = &duplicate_membership;
+    FREE_SLOT_INSPECTIONS.with(|inspections| inspections.set(0));
+    assert_eq!(
+        view.validate_owner(70),
+        Err(FrameRecycleError::EmptySlotPublished)
+    );
+    let inspected = FREE_SLOT_INSPECTIONS.with(|inspections| inspections.get());
+    assert!(
+        inspected < 64,
+        "tail duplicate inspected {inspected} free slots"
+    );
+
+    view.free_slot_count = slots.len() as u64 + 1;
+    FREE_SLOT_INSPECTIONS.with(|inspections| inspections.set(0));
+    assert_eq!(
+        view.validate_owner(70),
+        Err(FrameRecycleError::CorruptSlotCount)
+    );
+    assert_eq!(
+        FREE_SLOT_INSPECTIONS.with(|inspections| inspections.get()),
+        0
+    );
 }
 
 #[test]

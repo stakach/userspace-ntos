@@ -6,7 +6,10 @@
 
 use super::*;
 use nt_io_manager::kernel_irp_builder::{
-    plan_synchronous_fsd_request, KernelBuiltIrpPlan, MdlAccess,
+    plan_device_io_control_request, plan_disk_metadata_read, plan_disk_metadata_write,
+    plan_synchronous_fsd_request,
+    plan_wmi_reginfo_request,
+    KernelBuiltIrpPlan, MdlAccess,
 };
 
 /// Children remain unpublished until `publish`. Dropping an incomplete build
@@ -118,7 +121,7 @@ impl Drop for UnpublishedRequest {
     }
 }
 
-unsafe fn device_contract(device: u64) -> Option<(u8, u32)> {
+pub(super) unsafe fn device_contract(device: u64) -> Option<(u8, u32)> {
     let capacity = component_pool_allocation_capacity(device)?;
     if capacity < WDM_X64_DEVICE_OBJECT_SIZE as u64
         || read_unaligned(device as *const i16) != WDM_X64_IO_TYPE_DEVICE
@@ -179,36 +182,130 @@ pub(super) extern "win64" fn build(
         ) else {
             return 0;
         };
-        let Some(mut request) = UnpublishedRequest::allocate(plan.stack_count) else {
-            return 0;
-        };
-
-        if plan.system_buffer_len != 0 {
-            if !request.allocate_system_buffer(plan.system_buffer_len) {
-                return 0;
-            }
-            if plan.system_buffer_input_len != 0 {
-                core::ptr::copy_nonoverlapping(
-                    plan.system_buffer_input as *const u8,
-                    request.system_buffer as *mut u8,
-                    plan.system_buffer_input_len as usize,
-                );
-            }
-        }
-        if let Some(mdl) = plan.mdl {
-            if !request.allocate_mdl(mdl.buffer, mdl.length, mdl.access) {
-                return 0;
-            }
-        }
-
-        let stack = request.irp + plan.next_stack_offset as u64;
-        let stack_bytes = core::slice::from_raw_parts_mut(
-            stack as *mut u8,
-            WDM_X64_IO_STACK_LOCATION_SIZE,
-        );
-        if write_wdm_io_stack_location(stack_bytes, plan.stack).is_err() {
-            return 0;
-        }
-        request.publish(plan, event, iosb)
+        materialize_fsd_plan(plan, event, iosb)
     }
+}
+
+/// Build a sector read for disk identity/partition inspection. The distinct
+/// planner marks the next stack with `SL_OVERRIDE_VERIFY_VOLUME` before the
+/// source IRP is published or dispatched.
+pub(super) unsafe fn build_disk_metadata_read(
+    device: u64,
+    buffer: u64,
+    length: u32,
+    byte_offset: u64,
+    event: u64,
+    iosb: u64,
+) -> u64 {
+    if device == 0 || buffer == 0 || length == 0 || event == 0 || iosb == 0 {
+        return 0;
+    }
+    let Some((stack_count, device_flags)) = device_contract(device) else { return 0; };
+    let Ok(plan) = plan_disk_metadata_read(
+        stack_count, device_flags, device, buffer, length, byte_offset,
+    ) else { return 0; };
+    materialize_fsd_plan(plan, event, iosb)
+}
+
+/// Build one retained sector write for a checked partition-table mutation.
+/// `materialize_fsd_plan` captures buffered input or pins direct input before
+/// source registration, and the caller keeps its buffer until terminal IOSB.
+pub(super) unsafe fn build_disk_metadata_write(
+    device: u64,
+    buffer: u64,
+    length: u32,
+    byte_offset: u64,
+    event: u64,
+    iosb: u64,
+) -> u64 {
+    if device == 0 || event == 0 || iosb == 0 { return 0; }
+    let Some((stack_count, device_flags)) = device_contract(device) else { return 0; };
+    let Ok(plan) = plan_disk_metadata_write(
+        stack_count, device_flags, device, buffer, length, byte_offset,
+    ) else { return 0; };
+    materialize_fsd_plan(plan, event, iosb)
+}
+
+unsafe fn materialize_fsd_plan(plan: KernelBuiltIrpPlan, event: u64, iosb: u64) -> u64 {
+    let Some(mut request) = UnpublishedRequest::allocate(plan.stack_count) else { return 0; };
+    if plan.system_buffer_len != 0 {
+        if !request.allocate_system_buffer(plan.system_buffer_len) { return 0; }
+        if plan.system_buffer_input_len != 0 {
+            core::ptr::copy_nonoverlapping(
+                plan.system_buffer_input as *const u8,
+                request.system_buffer as *mut u8,
+                plan.system_buffer_input_len as usize,
+            );
+        }
+    }
+    if let Some(mdl) = plan.mdl {
+        if !request.allocate_mdl(mdl.buffer, mdl.length, mdl.access) { return 0; }
+    }
+    let stack = request.irp + plan.next_stack_offset as u64;
+    let stack_bytes = core::slice::from_raw_parts_mut(
+        stack as *mut u8, WDM_X64_IO_STACK_LOCATION_SIZE,
+    );
+    if write_wdm_io_stack_location(stack_bytes, plan.stack).is_err() { return 0; }
+    request.publish(plan, event, iosb)
+}
+
+/// Build a driver-local device-control IRP with the same source-ledger publication
+/// as the synchronous FSD builder. The caller owns the event and IOSB until terminal.
+pub(super) unsafe fn build_control(
+    code: u32,
+    device: u64,
+    output: u64,
+    output_length: u32,
+    event: u64,
+    iosb: u64,
+) -> u64 {
+    if device == 0 || output == 0 || output_length == 0 || event == 0 || iosb == 0 {
+        return 0;
+    }
+    let Some((stack_count, _)) = device_contract(device) else { return 0; };
+    let Ok(plan) = plan_device_io_control_request(
+        code, false, stack_count, device, 0, 0, output, output_length,
+    ) else { return 0; };
+    let Some(mut request) = UnpublishedRequest::allocate(plan.stack_count) else { return 0; };
+    if plan.system_buffer_len != 0 && !request.allocate_system_buffer(plan.system_buffer_len) {
+        return 0;
+    }
+    if let Some(mdl) = plan.mdl {
+        if !request.allocate_mdl(mdl.buffer, mdl.length, mdl.access) { return 0; }
+    }
+    let stack = request.irp + plan.next_stack_offset as u64;
+    let stack_bytes = core::slice::from_raw_parts_mut(
+        stack as *mut u8, WDM_X64_IO_STACK_LOCATION_SIZE,
+    );
+    if write_wdm_io_stack_location(stack_bytes, plan.stack).is_err() { return 0; }
+    request.publish(plan, event, iosb)
+}
+
+/// Materialize a REGINFO packet and publish its IRP/output-buffer graph to the
+/// source ledger before any driver can observe it. Dispatch, terminal waiting,
+/// parsing and publication are separate steps owned by the WMI broker.
+pub(super) unsafe fn build_wmi_reginfo(
+    device: u64,
+    capacity: u32,
+    event: u64,
+    iosb: u64,
+) -> u64 {
+    if event == 0 || iosb == 0 { return 0; }
+    let Some((stack_count, _)) = device_contract(device) else { return 0; };
+    let Ok(mut plan) = plan_wmi_reginfo_request(stack_count, device, capacity) else { return 0; };
+    let Some(mut request) = UnpublishedRequest::allocate(plan.stack_count) else { return 0; };
+    if !request.allocate_system_buffer(capacity) { return 0; }
+    plan.stack.parameters = WdmIoStackParameters::Wmi {
+        provider_id: device,
+        data_path: 0,
+        buffer_size: capacity,
+        buffer: request.system_buffer,
+    };
+    let stack = request.irp + plan.next_stack_offset as u64;
+    let stack_bytes = core::slice::from_raw_parts_mut(
+        stack as *mut u8,
+        WDM_X64_IO_STACK_LOCATION_SIZE,
+    );
+    if write_wdm_io_stack_location(stack_bytes, plan.stack).is_err() { return 0; }
+    request.publish(plan, event, iosb)
 }

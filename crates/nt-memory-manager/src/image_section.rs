@@ -169,7 +169,7 @@ impl ImageSectionTable {
             .ok_or(ImageSectionError::InsufficientResources)?;
         if self.owner == 0 {
             self.owner = NEXT_OWNER
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                     next.checked_add(1)
                 })
                 .map_err(|_| ImageSectionError::InsufficientResources)?;

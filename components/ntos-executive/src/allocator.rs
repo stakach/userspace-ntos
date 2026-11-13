@@ -18,8 +18,15 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[path = "allocator_oom_budget.rs"]
 mod oom_budget;
+#[path = "allocator_free_list.rs"]
+mod free_list;
+use free_list::align_up;
+#[path = "allocator_walk_observation.rs"]
+mod walk_observation;
+use walk_observation::WalkCounter;
+pub use walk_observation::WalkSample;
 
-/// The component-local heap VA. The root reserves the 64 MiB band ending at the original scratch
+/// The component-local heap VA. The root reserves an 88 MiB band before the scratch
 /// base; its lower 32 MiB is mapped initially and later durable pages are committed on demand.
 /// This band is above the executive image and worker mirrors. Isolated components have separate
 /// VSpaces and retain their declared heap profiles at the same VA.
@@ -27,7 +34,7 @@ pub const HEAP_BASE: usize = 0x0000_0100_1e00_0000;
 /// Maximum VA reservation in 4 KiB frames, including the root transient lane. Physical pages
 /// beyond the initial root commitment are retyped and mapped only when allocations need them.
 /// Spawned services map a separately declared subset, ordinarily [`DEFAULT_SERVICE_HEAP_FRAMES`].
-pub const HEAP_FRAMES: u64 = 16384;
+pub const HEAP_FRAMES: u64 = 22528;
 /// Frames committed before the root executive starts serving requests. Further durable pages are
 /// mapped only as allocations require them; isolated services still use their declared profiles.
 pub const EXECUTIVE_INITIAL_HEAP_FRAMES: u64 = 8192;
@@ -76,6 +83,20 @@ const _: () = assert!(DRIVER_OBJECT_EXTENSIONS_STATE + size_of::<usize>() <= DAT
 const WORD: usize = size_of::<usize>();
 const ALLOC_GRANULE: usize = align_of::<usize>();
 const FREE_NODE_SIZE: usize = WORD * 2; // { size, next } stored inside the freed block
+
+static ALLOC_WALK: WalkCounter = WalkCounter::new();
+static INSERT_WALK: WalkCounter = WalkCounter::new();
+static GROW_WALK: WalkCounter = WalkCounter::new();
+
+/// Approximate cumulative root-only walk counts; concurrent lanes may advance between loads.
+pub fn walk_samples() -> [WalkSample; 3] {
+    let root_heap = transient_heap_size() != 0;
+    [
+        ALLOC_WALK.sample(root_heap),
+        INSERT_WALK.sample(root_heap),
+        GROW_WALK.sample(root_heap),
+    ]
+}
 
 pub(crate) fn dcerpc_trace_state_anchor() -> &'static AtomicUsize {
     unsafe { &*(DCERPC_TRACE_STATE as *const AtomicUsize) }
@@ -347,11 +368,6 @@ fn report_oom(size: usize, align: usize, cur: usize, start: usize, requested_end
     crate::debug_put_char(b'\n');
 }
 
-fn align_up(value: usize, align: usize) -> Option<usize> {
-    debug_assert!(align.is_power_of_two());
-    Some(value.checked_add(align - 1)? & !(align - 1))
-}
-
 fn block_size(size: usize) -> Option<usize> {
     align_up(size.max(FREE_NODE_SIZE), ALLOC_GRANULE)
 }
@@ -563,12 +579,12 @@ unsafe fn validate_free_list(operation: &'static [u8], owner_start: usize, owner
         let Some(end) = node.checked_add(size) else {
             allocator_corruption(operation, owner_start, owner_size, node, size, next);
         };
-        if node < previous_end
+        if (guard != 0 && node <= previous_end)
             || size < FREE_NODE_SIZE
             || size % ALLOC_GRANULE != 0
             || end > top
             || (next != 0
-                && (next <= node || next < end || next >= top || next % ALLOC_GRANULE != 0))
+                && (next <= end || next >= top || next % ALLOC_GRANULE != 0))
         {
             allocator_corruption(operation, owner_start, owner_size, node, size, next);
         }
@@ -579,154 +595,62 @@ unsafe fn validate_free_list(operation: &'static [u8], owner_start: usize, owner
 }
 
 unsafe fn insert_free_block(start: usize, size: usize) {
-    let allocated_end = DATA + unsafe { read_word(CTR) };
-    if size < FREE_NODE_SIZE
-        || start < DATA
-        || start
-            .checked_add(size)
-            .is_none_or(|end| end > allocated_end)
-    {
-        allocator_corruption(b"insert", start, size, start, size, 0);
-    }
-
-    let mut prev = 0usize;
-    let mut prev_link = FREE_HEAD;
-    let mut cur = unsafe { read_word(FREE_HEAD) };
-    while cur != 0 && cur < start {
-        prev = cur;
-        prev_link = cur + WORD;
-        cur = unsafe { free_node_next(cur) };
-    }
-    if cur == start {
-        return;
-    }
-    let end = start + size;
-    if (prev != 0
-        && prev
-            .checked_add(unsafe { free_node_size(prev) })
-            .is_none_or(|prev_end| prev_end > start))
-        || (cur != 0 && end > cur)
-    {
-        allocator_corruption(b"insert-overlap", start, size, cur, 0, 0);
-    }
-
-    unsafe {
-        set_free_node(start, size, cur);
-        write_word(prev_link, start);
-    }
-
-    let block = start;
-    let mut block_size = size;
-    if cur != 0 && block.checked_add(block_size) == Some(cur) {
-        let merged_size = block_size.saturating_add(unsafe { free_node_size(cur) });
-        let merged_next = unsafe { free_node_next(cur) };
-        unsafe { set_free_node(block, merged_size, merged_next) };
-        block_size = merged_size;
-    }
-
-    if prev != 0 {
-        let prev_size = unsafe { free_node_size(prev) };
-        if prev.checked_add(prev_size) == Some(block) {
-            let merged_size = prev_size.saturating_add(block_size);
-            let merged_next = unsafe { free_node_next(block) };
-            unsafe { set_free_node(prev, merged_size, merged_next) };
-        }
-    }
-}
-
-unsafe fn release_top_free_blocks() {
-    loop {
-        let top = DATA + unsafe { read_word(CTR) };
-        let mut prev_link = FREE_HEAD;
-        let mut cur = unsafe { read_word(FREE_HEAD) };
-        let mut released = false;
-        while cur != 0 {
-            let size = unsafe { free_node_size(cur) };
-            let next = unsafe { free_node_next(cur) };
-            if cur.checked_add(size) == Some(top) {
-                unsafe {
-                    write_word(prev_link, next);
-                    write_word(CTR, cur - DATA);
-                }
-                released = true;
-                break;
-            }
-            prev_link = cur + WORD;
-            cur = next;
-        }
-        if !released {
-            break;
-        }
+    let list = free_list::FreeList {
+        data: DATA,
+        counter: CTR,
+        head: FREE_HEAD,
+    };
+    match unsafe { list.insert(start, size) } {
+        Ok(visits) => INSERT_WALK.record(transient_heap_size() != 0, visits),
+        Err(corruption) => allocator_corruption(
+            corruption.operation,
+            start,
+            size,
+            corruption.node,
+            corruption.size,
+            corruption.next,
+        ),
     }
 }
 
 unsafe fn alloc_from_free_list(layout: Layout, needed: usize) -> *mut u8 {
-    let align = layout.align().max(ALLOC_GRANULE);
-    let mut prev_link = FREE_HEAD;
-    let mut cur = unsafe { read_word(FREE_HEAD) };
-    while cur != 0 {
-        let size = unsafe { free_node_size(cur) };
-        let next = unsafe { free_node_next(cur) };
-        let mut start = match align_up(cur, align) {
-            Some(start) => start,
-            None => return null_mut(),
-        };
-        let mut prefix = start - cur;
-        if prefix != 0 && prefix < FREE_NODE_SIZE {
-            start = match align_up(cur + FREE_NODE_SIZE, align) {
-                Some(start) => start,
-                None => return null_mut(),
-            };
-            prefix = start - cur;
-        }
-        if prefix
-            .checked_add(needed)
-            .is_some_and(|total| total <= size)
-        {
-            unsafe { write_word(prev_link, next) };
-            if prefix >= FREE_NODE_SIZE {
-                unsafe { insert_free_block(cur, prefix) };
+    let list = free_list::FreeList {
+        data: DATA,
+        counter: CTR,
+        head: FREE_HEAD,
+    };
+    match unsafe { list.take_fit(layout.align(), needed) } {
+        Ok(taken) => {
+            let root_heap = transient_heap_size() != 0;
+            if let Some(visits) = taken.prefix_reinsert_visits {
+                INSERT_WALK.record(root_heap, visits);
             }
-            let suffix_start = start + needed;
-            let suffix = cur + size - suffix_start;
-            if suffix >= FREE_NODE_SIZE {
-                unsafe { insert_free_block(suffix_start, suffix) };
+            if let Some(visits) = taken.suffix_reinsert_visits {
+                INSERT_WALK.record(root_heap, visits);
             }
-            return start as *mut u8;
+            ALLOC_WALK.record(root_heap, taken.inspected);
+            taken.address.map_or(null_mut(), |address| address as *mut u8)
         }
-        prev_link = cur + WORD;
-        cur = next;
+        Err(error) => allocator_corruption(
+            error.corruption.operation,
+            error.owner_start,
+            error.owner_size,
+            error.corruption.node,
+            error.corruption.size,
+            error.corruption.next,
+        ),
     }
-    null_mut()
 }
 
 unsafe fn grow_in_place_from_adjacent_free(start: usize, old_size: usize, new_size: usize) -> bool {
-    let adjacent = match start.checked_add(old_size) {
-        Some(adjacent) => adjacent,
-        None => return false,
+    let list = free_list::FreeList {
+        data: DATA,
+        counter: CTR,
+        head: FREE_HEAD,
     };
-    let need = new_size - old_size;
-    let mut prev_link = FREE_HEAD;
-    let mut cur = unsafe { read_word(FREE_HEAD) };
-    while cur != 0 {
-        let size = unsafe { free_node_size(cur) };
-        let next = unsafe { free_node_next(cur) };
-        if cur == adjacent && size >= need {
-            if size - need >= FREE_NODE_SIZE {
-                let new_free = cur + need;
-                unsafe {
-                    set_free_node(new_free, size - need, next);
-                    write_word(prev_link, new_free);
-                }
-            } else {
-                unsafe { write_word(prev_link, next) };
-            }
-            return true;
-        }
-        prev_link = cur + WORD;
-        cur = next;
-    }
-    false
+    let result = unsafe { list.grow_adjacent(start, old_size, new_size) };
+    GROW_WALK.record(transient_heap_size() != 0, result.inspected);
+    result.grown
 }
 
 impl Bump {
@@ -743,7 +667,6 @@ impl Bump {
         };
         unsafe {
             insert_free_block(start, size);
-            release_top_free_blocks();
         };
     }
 
@@ -882,7 +805,6 @@ unsafe impl GlobalAlloc for Bump {
             if tail >= FREE_NODE_SIZE {
                 unsafe {
                     insert_free_block(start + new_block_size, tail);
-                    release_top_free_blocks();
                 }
             }
             return ptr;

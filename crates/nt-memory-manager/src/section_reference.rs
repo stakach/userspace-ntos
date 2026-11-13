@@ -31,7 +31,7 @@ impl GenericSectionTable {
         let generation = self.reference_generation.checked_add(1)?;
         self.references.try_reserve(1).ok()?;
         let authority = if self.reference_authority == 0 {
-            NEXT_AUTHORITY.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            NEXT_AUTHORITY.try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             }).ok()?
         } else {

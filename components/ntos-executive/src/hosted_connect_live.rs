@@ -40,6 +40,10 @@ struct Work {
 }
 
 static mut WORK: Vec<Option<Box<Work>>> = Vec::new();
+/// A claimed boxed row is never removed while its source is unsettled. If that invariant is
+/// broken by a future retirement path, retain the already-run child receipt for diagnosis.
+static mut ORPHANED_CONNECT_PUMP_STEPS:
+    Vec<(PortConnectPumpSelector, crate::service_sec_image::NestedChildStep)> = Vec::new();
 
 fn trace_connect_live(stage: u64, source_irp: u64, first: u64, second: u64) {
     static TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -61,6 +65,24 @@ fn trace_connect_gate(stage: u64, source_irp: u64, detail: u64) {
     static TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
     if TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 12 {
         trace_connect_live(stage, source_irp, detail, 0);
+    }
+}
+
+// Capped caller and return markers for the first live CONNECT provider entry.
+// Stages: 0 wrapper entry, 1 dispatch entry, 2 dispatch return, 3 observe return,
+// 4 loop continue, 5 wrapper return, 6 loop end. caller: 0 root, 1 nested.
+fn trace_connect_redrive(stage: u64, nested: bool, source_irp: u64) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 40 { return; }
+    print_str(b"[hosted-connect-redrive] stage/caller/irp=");
+    print_u64(stage); print_str(b"/");
+    print_u64(u64::from(nested)); print_str(b"/");
+    print_hex64(source_irp); print_str(b"\n");
+}
+
+fn trace_connect_redrive_if_pending(stage: u64, nested: bool) {
+    if let Some(work) = rows().iter().flatten().find(|work| work.source.origin().pending()) {
+        trace_connect_redrive(stage, nested, work.source.source_irp_address());
     }
 }
 
@@ -233,6 +255,7 @@ unsafe fn submit(
             return Some((INVALID, false));
         }
     };
+    super::mark_connect_source_completion_probe(source_irp);
     if source.payload().forward.target != target {
         abort_capture(source);
         return Some((INVALID, false));
@@ -428,6 +451,245 @@ pub(super) unsafe fn service(
 }
 
 pub(super) unsafe fn redrive() {
+    trace_connect_redrive_if_pending(0, false);
+    redrive_inner(RedriveMode::General);
+    trace_connect_redrive_if_pending(5, false);
+}
+
+/// An exclusive AddDevice turn can import an already-entered CONNECT completion while
+/// retaining its parent Reply. It must not dispatch a new port provider or queue worker.
+pub(super) unsafe fn redrive_entered_completions() {
+    redrive_inner(RedriveMode::EnteredCompletion);
+}
+
+#[must_use = "run one outer child and deposit its sealed step in the claimed Work row"]
+#[derive(Clone, Copy)]
+pub(crate) struct PortConnectPumpSelector {
+    row_index: usize,
+    reverse_owner_id: u64,
+    source_irp: u64,
+    irp_id: nt_io_manager::IrpId,
+    key: nt_io_manager::detached_file_irp::ExternalFileIrpPumpKey,
+}
+
+/// Claim one exact source before the outer root loop runs a child. Work rows are boxed and
+/// never removed while their source/port ownership remains unsettled.
+pub(super) fn claim_suspended_port_connect_pump() -> Option<PortConnectPumpSelector> {
+    if unsafe { !(*core::ptr::addr_of!(ORPHANED_CONNECT_PUMP_STEPS)).is_empty() }
+        || unsafe { &mut *core::ptr::addr_of_mut!(ORPHANED_CONNECT_PUMP_STEPS) }
+            .try_reserve(1).is_err()
+    {
+        return None;
+    }
+    rows().iter_mut().enumerate().find_map(|(row_index, slot)| {
+        let work = slot.as_deref_mut()?;
+        if work.blocked || work.port_acknowledged || !work.provider_entered
+            || !work.source.source_pin_owned()
+        {
+            return None;
+        }
+        let (irp_id, key) = work.port.claim_suspended_pump_step()?;
+        Some(PortConnectPumpSelector {
+            row_index,
+            reverse_owner_id: work.reverse_owner_id,
+            source_irp: work.source.source_irp_address(),
+            irp_id,
+            key,
+        })
+    })
+}
+
+/// The child receipt was deposited on a previous root turn, but an inner Hook File pump
+/// deferred this parent. Select it again without running or admitting another child.
+pub(super) fn recorded_suspended_connect_pump() -> Option<PortConnectPumpSelector> {
+    if unsafe { !(*core::ptr::addr_of!(ORPHANED_CONNECT_PUMP_STEPS)).is_empty() } {
+        return None;
+    }
+    rows().iter().enumerate().find_map(|(row_index, slot)| {
+        let work = slot.as_deref()?;
+        if work.blocked || work.port_acknowledged || !work.source.source_pin_owned() {
+            return None;
+        }
+        let (irp_id, key) = work.port.recorded_pump_selector()?;
+        Some(PortConnectPumpSelector {
+            row_index,
+            reverse_owner_id: work.reverse_owner_id,
+            source_irp: work.source.source_irp_address(),
+            irp_id,
+            key,
+        })
+    })
+}
+
+/// Root must not enter unrelated providers or admit another ingress while any CONNECT parent
+/// still owns a parked physical pump, including a failed handoff or quarantined child receipt.
+pub(super) fn unsettled_suspended_connect_pump() -> bool {
+    if unsafe { !(*core::ptr::addr_of!(ORPHANED_CONNECT_PUMP_STEPS)).is_empty() } {
+        return true;
+    }
+    rows().iter().flatten().any(|work| matches!(work.port.phase(),
+        hosted_input_connect_dispatch::PortConnectPhase::PumpSuspended(_, _)
+        | hosted_input_connect_dispatch::PortConnectPhase::PumpStepClaimed(_, _)
+        | hosted_input_connect_dispatch::PortConnectPhase::PumpRestoreRetry(_, _)
+        | hosted_input_connect_dispatch::PortConnectPhase::PumpBlocked))
+}
+
+pub(crate) enum PortConnectPumpProgress {
+    NoWork,
+    Returned,
+    Yielded,
+    Retained,
+    Blocked,
+}
+
+/// Retry a physical restore that already owns its earlier child receipt. This does not select
+/// or run another child, and it never reissues the original provider entry.
+pub(super) unsafe fn redrive_retryable_connect_pump() -> PortConnectPumpProgress {
+    for work in rows().iter_mut().flatten() {
+        if work.blocked || work.port.restore_retryable_selector().is_none() {
+            continue;
+        }
+        let phase = work.port.resume_pump_after_child();
+        let observed = observe_port_dispatch_result(work, Ok(phase));
+        if work.blocked { return PortConnectPumpProgress::Blocked; }
+        return match phase {
+            hosted_input_connect_dispatch::PortConnectPhase::PumpSuspended(_, _) =>
+                PortConnectPumpProgress::Yielded,
+            hosted_input_connect_dispatch::PortConnectPhase::PumpRestoreRetry(_, _) =>
+                PortConnectPumpProgress::Retained,
+            hosted_input_connect_dispatch::PortConnectPhase::PumpBlocked =>
+                PortConnectPumpProgress::Blocked,
+            _ if observed => PortConnectPumpProgress::Returned,
+            _ => PortConnectPumpProgress::Retained,
+        };
+    }
+    PortConnectPumpProgress::NoWork
+}
+
+/// Deposit the one-use child certificate before any operation that may return to root. A
+/// missing or changed Work row leaves the receipt in the orphan quarantine, never on the stack.
+pub(super) unsafe fn record_suspended_connect_pump_child_step(
+    selector: PortConnectPumpSelector,
+    step: crate::service_sec_image::NestedChildStep,
+) -> PortConnectPumpProgress {
+    // The selected row may have been touched by the child. Own the already-run certificate
+    // with its selector before inspecting that row; a mismatch quarantines this pair, not a
+    // different Work that might now occupy the same numeric slot.
+    let orphaned = &mut *core::ptr::addr_of_mut!(ORPHANED_CONNECT_PUMP_STEPS);
+    orphaned.push((selector, step));
+    let selector = &orphaned.last().expect("just retained CONNECT child step").0;
+    let Some(work) = rows().get_mut(selector.row_index).and_then(Option::as_deref_mut) else {
+        return PortConnectPumpProgress::Blocked;
+    };
+    if work.reverse_owner_id != selector.reverse_owner_id
+        || work.source.source_irp_address() != selector.source_irp
+        || work.port.phase() != hosted_input_connect_dispatch::PortConnectPhase::PumpStepClaimed(
+            selector.irp_id, selector.key,
+        )
+    {
+        return PortConnectPumpProgress::Blocked;
+    }
+    let (_, step) = orphaned.pop().expect("validated CONNECT child step missing");
+    work.port.retain_child_step(step);
+    PortConnectPumpProgress::Retained
+}
+
+/// Resume only after the exact Work row already owns the sealed child receipt. This may be
+/// delayed while an inner Hook File child finishes without exposing an unowned CONNECT step.
+pub(super) unsafe fn redrive_recorded_connect_pump(
+    selector: PortConnectPumpSelector,
+) -> PortConnectPumpProgress {
+    let Some(work) = rows().get_mut(selector.row_index).and_then(Option::as_deref_mut) else {
+        return PortConnectPumpProgress::Blocked;
+    };
+    if work.reverse_owner_id != selector.reverse_owner_id
+        || work.source.source_irp_address() != selector.source_irp
+        || work.port.phase() != hosted_input_connect_dispatch::PortConnectPhase::PumpStepClaimed(
+            selector.irp_id, selector.key,
+        )
+    {
+        return PortConnectPumpProgress::Blocked;
+    }
+    let phase = work.port.resume_pump_after_child();
+    let observed = observe_port_dispatch_result(work, Ok(phase));
+    if work.blocked { return PortConnectPumpProgress::Blocked; }
+    match phase {
+        hosted_input_connect_dispatch::PortConnectPhase::PumpSuspended(_, _) =>
+            PortConnectPumpProgress::Yielded,
+        hosted_input_connect_dispatch::PortConnectPhase::PumpStepClaimed(_, _)
+        | hosted_input_connect_dispatch::PortConnectPhase::PumpRestoreRetry(_, _) =>
+            PortConnectPumpProgress::Retained,
+        hosted_input_connect_dispatch::PortConnectPhase::PumpBlocked =>
+            PortConnectPumpProgress::Blocked,
+        _ if observed => PortConnectPumpProgress::Returned,
+        _ => PortConnectPumpProgress::Retained,
+    }
+}
+
+unsafe fn observe_port_dispatch_result(
+    work: &mut Work,
+    phase: Result<hosted_input_connect_dispatch::PortConnectPhase, nt_status::NtStatus>,
+) -> bool {
+    if matches!(phase, Ok(hosted_input_connect_dispatch::PortConnectPhase::PumpSuspended(_, _)
+        | hosted_input_connect_dispatch::PortConnectPhase::PumpStepClaimed(_, _)
+        | hosted_input_connect_dispatch::PortConnectPhase::PumpRestoreRetry(_, _))) {
+        return false;
+    }
+    if matches!(phase, Ok(hosted_input_connect_dispatch::PortConnectPhase::PumpBlocked)) {
+        work.blocked = true;
+        return false;
+    }
+    let (phase_kind, phase_detail) = match phase {
+        Ok(hosted_input_connect_dispatch::PortConnectPhase::AwaitingCompletion(irp)) => (1, irp.0),
+        Ok(hosted_input_connect_dispatch::PortConnectPhase::Terminal(status)) => (2, status.raw() as u32 as u64),
+        Ok(hosted_input_connect_dispatch::PortConnectPhase::Rejected(status)) => (3, status.raw() as u32 as u64),
+        Err(status) => (4, status.raw() as u32 as u64),
+        _ => (0, 0),
+    };
+    trace_connect_live(8, work.source.source_irp_address(), phase_kind, phase_detail);
+    match phase {
+        Ok(hosted_input_connect_dispatch::PortConnectPhase::AwaitingCompletion(_)) => {
+            let observed = work.source.observe_dispatch(ConnectDispatchReturn::Pending);
+            trace_connect_live(9, work.source.source_irp_address(),
+                u64::from(observed.is_ok()), u64::from(work.source.origin_mut().armed()));
+        }
+        Ok(hosted_input_connect_dispatch::PortConnectPhase::Terminal(status)) => {
+            if matches!(work.sequence.phase(), HookForwardPhase::Terminal(_, _)) {
+                if let Some(forward) = work.source.forward_mut() {
+                    if work.sequence.observe_connect_terminal(io_manager_mut(), forward, status).is_ok() {
+                        work.source.set_terminal_after_hook(status);
+                    }
+                }
+            } else if matches!(work.sequence.phase(), HookForwardPhase::AwaitingHook)
+                && status != nt_status::NtStatus::SUCCESS
+            {
+                let _ = work.source.observe_dispatch(ConnectDispatchReturn::Terminal(status));
+            }
+        }
+        Ok(hosted_input_connect_dispatch::PortConnectPhase::Rejected(status)) | Err(status) => {
+            let _ = work.source.observe_dispatch(ConnectDispatchReturn::Terminal(status));
+        }
+        _ => {}
+    }
+    let replied = work.source.origin_mut().reply_dispatch(
+        HostedForwardDispatchReply::Pending, false);
+    trace_connect_live(10, work.source.source_irp_address(),
+        u64::from(replied), u64::from(work.blocked));
+    if !replied {
+        work.blocked = true;
+    }
+    true
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RedriveMode {
+    General,
+    NestedReady,
+    EnteredCompletion,
+}
+
+unsafe fn redrive_inner(mode: RedriveMode) -> bool {
+    let mut advanced = false;
     let count = rows().len();
     for index in 0..count {
         // A parked i8042 dispatch can synchronously reenter the executive for HOOK. The boxed
@@ -437,7 +699,14 @@ pub(super) unsafe fn redrive() {
             Some(work) => work as *mut Work,
             None => continue,
         };
-        if (*work_ptr).port_acknowledged || (*work_ptr).blocked {
+        if (*work_ptr).port_acknowledged || (*work_ptr).blocked
+            || (mode == RedriveMode::NestedReady && !(*work_ptr).nested_ready())
+            || (mode == RedriveMode::EnteredCompletion
+                && (!(*work_ptr).provider_entered
+                    || !(*work_ptr).source.origin_mut().armed()
+                    || !matches!((*work_ptr).port.phase(),
+                        hosted_input_connect_dispatch::PortConnectPhase::AwaitingCompletion(_)
+                        | hosted_input_connect_dispatch::PortConnectPhase::Terminal(_)))) {
             continue;
         }
         static REDRIVE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -460,14 +729,27 @@ pub(super) unsafe fn redrive() {
                 hosted_input_connect_dispatch::PortConnectPhase::AwaitingCompletion(irp) => irp,
                 _ => unreachable!(),
             };
-            let _ = drain_hosted_connect_io_work_item(
-                (*work_ptr).port_instance,
-                (*work_ptr).port_domain,
-                (*work_ptr).port_storage_instance,
-                (*work_ptr).port_storage_domain,
-                (*work_ptr).source.payload().forward.target.device_id(),
-                pending_irp,
-            );
+            if mode != RedriveMode::EnteredCompletion
+                && io_manager_mut().completed_irp(pending_irp).is_none()
+            {
+                let queue_progress = drain_hosted_connect_io_work_item(
+                    (*work_ptr).port_instance,
+                    (*work_ptr).port_domain,
+                    (*work_ptr).port_storage_instance,
+                    (*work_ptr).port_storage_domain,
+                    (*work_ptr).source.payload().forward.target.device_id(),
+                    pending_irp,
+                );
+                trace_connect_live(11, (*work_ptr).source.source_irp_address(),
+                    u64::from(matches!(queue_progress, Ok(HostedWorkQueueDrainProgress::Suspended))),
+                    u64::from(queue_progress.is_err()));
+                if matches!(queue_progress, Ok(HostedWorkQueueDrainProgress::Drained(count)) if count != 0) {
+                    advanced = true;
+                }
+                if matches!(queue_progress, Ok(HostedWorkQueueDrainProgress::Suspended)) {
+                    return advanced;
+                }
+            }
         }
         if !(*work_ptr).provider_entered {
             let work = &mut *work_ptr;
@@ -516,51 +798,25 @@ pub(super) unsafe fn redrive() {
                 continue;
             }
             work.provider_entered = true;
+            advanced = true;
             trace_connect_live(7, work.source.source_irp_address(), work.reverse_owner_id, 0);
+            trace_connect_redrive(1, mode == RedriveMode::NestedReady,
+                work.source.source_irp_address());
             let phase = {
                 let port = &mut (*work_ptr).port;
                 let permit = &(*work_ptr).permit;
                 let caller = (*work_ptr).caller;
                 port.dispatch(permit, caller)
             };
+            trace_connect_redrive(2, mode == RedriveMode::NestedReady,
+                (*work_ptr).source.source_irp_address());
             let work = &mut *work_ptr;
-            let (phase_kind, phase_detail) = match phase {
-                Ok(hosted_input_connect_dispatch::PortConnectPhase::AwaitingCompletion(irp)) => (1, irp.0),
-                Ok(hosted_input_connect_dispatch::PortConnectPhase::Terminal(status)) => (2, status.raw() as u32 as u64),
-                Ok(hosted_input_connect_dispatch::PortConnectPhase::Rejected(status)) => (3, status.raw() as u32 as u64),
-                Err(status) => (4, status.raw() as u32 as u64),
-                _ => (0, 0),
-            };
-            trace_connect_live(8, work.source.source_irp_address(), phase_kind, phase_detail);
-            match phase {
-                Ok(hosted_input_connect_dispatch::PortConnectPhase::AwaitingCompletion(_)) => {
-                    let _ = work.source.observe_dispatch(ConnectDispatchReturn::Pending);
-                }
-                Ok(hosted_input_connect_dispatch::PortConnectPhase::Terminal(status)) => {
-                    if matches!(work.sequence.phase(), HookForwardPhase::Terminal(_, _)) {
-                        if let Some(forward) = work.source.forward_mut() {
-                            if work.sequence.observe_connect_terminal(io_manager_mut(), forward, status).is_ok() {
-                                work.source.set_terminal_after_hook(status);
-                            }
-                        }
-                    } else if matches!(work.sequence.phase(), HookForwardPhase::AwaitingHook)
-                        && status != nt_status::NtStatus::SUCCESS
-                    {
-                        // A known failed port dispatch before its queued HOOK has no HOOK
-                        // completion to wait for. Preserve the provider's actual failure.
-                        let _ = work.source.observe_dispatch(ConnectDispatchReturn::Terminal(status));
-                    }
-                }
-                Ok(hosted_input_connect_dispatch::PortConnectPhase::Rejected(status)) | Err(status) => {
-                    let _ = work.source.observe_dispatch(ConnectDispatchReturn::Terminal(status));
-                }
-                _ => {}
-            }
-            if !work.source.origin_mut().reply_dispatch(HostedForwardDispatchReply::Pending, false) {
-                work.blocked = true;
-                // The Reply may already have reached the source. Keep the published
-                // projection and thunk pinned until its exact arm Call reconciles the wake.
-            }
+            let _ = observe_port_dispatch_result(work, phase);
+            if work.blocked { return false; }
+            trace_connect_redrive(3, mode == RedriveMode::NestedReady,
+                work.source.source_irp_address());
+            trace_connect_redrive(4, mode == RedriveMode::NestedReady,
+                work.source.source_irp_address());
             continue;
         }
         let work = &mut *work_ptr;
@@ -568,7 +824,9 @@ pub(super) unsafe fn redrive() {
             continue;
         }
         if work.source.terminal_status().is_none() {
+            let phase_before = work.port.phase();
             let Ok(Some(status)) = work.port.poll_terminal() else { continue; };
+            advanced |= work.port.phase() != phase_before;
             trace_connect_live(9, work.source.source_irp_address(), status.raw() as u32 as u64,
                 u64::from(matches!(work.sequence.phase(), HookForwardPhase::Terminal(_, _))));
             if !matches!(work.sequence.phase(), HookForwardPhase::Terminal(_, _)) {
@@ -579,44 +837,125 @@ pub(super) unsafe fn redrive() {
                 continue;
             }
             work.source.set_terminal_after_hook(status);
+            advanced = true;
         }
         if !work.source_acknowledged {
+            let source_before = work.source.terminal_progress();
             work.source_acknowledged = work.source.complete_terminal();
+            if work.source.origin().preparation_uncertain() {
+                work.blocked = true;
+                return false;
+            }
+            advanced |= work.source.terminal_progress() != source_before;
             trace_connect_live(10, work.source.source_irp_address(), u64::from(work.source_acknowledged), 0);
         }
         if work.source_acknowledged {
-            work.port_acknowledged = match work.port.phase() {
+            // A nested ACK can finish while this caller is parked in the provider ACK.
+            // Preserve the completed ownership transition across the older retry.
+            work.port_acknowledged |= match work.port.phase() {
                 hosted_input_connect_dispatch::PortConnectPhase::Prepared
                 | hosted_input_connect_dispatch::PortConnectPhase::Rejected(_) => true,
                 _ => work.port.acknowledge_after_source_completion(&work.source).is_ok(),
             };
+            advanced |= work.port_acknowledged;
             // Published aliases and the callback thunk remain installed for subsequent input.
         }
     }
+    trace_connect_redrive_if_pending(6, mode == RedriveMode::NestedReady);
+    advanced
 }
 
 pub(super) fn nested_work_ready() -> bool {
-    rows()
-        .iter()
-        .flatten()
-        .any(|work| !work.blocked && !work.port_acknowledged)
+    rows().iter().flatten().any(|work| work.nested_ready())
+}
+
+/// Read-only witness that the CONNECT source Reply has been issued as Pending.
+pub(super) fn pending_reply_published() -> bool {
+    rows().iter().flatten().any(|work| work.source.origin().pending())
+}
+
+/// Read-only phase of the first live CONNECT row for the AddDevice root probe.
+pub(super) fn root_probe_phase() -> u64 {
+    rows().iter().flatten().find(|work| work.provider_entered)
+        .map_or(0, |work| match work.port.phase() {
+            hosted_input_connect_dispatch::PortConnectPhase::Prepared => 1,
+            hosted_input_connect_dispatch::PortConnectPhase::Entered => 2,
+            hosted_input_connect_dispatch::PortConnectPhase::Rejected(_) => 3,
+            hosted_input_connect_dispatch::PortConnectPhase::PumpSuspended(_, _) => 4,
+            hosted_input_connect_dispatch::PortConnectPhase::PumpStepClaimed(_, _) => 5,
+            hosted_input_connect_dispatch::PortConnectPhase::PumpRestoreRetry(_, _) => 6,
+            hosted_input_connect_dispatch::PortConnectPhase::PumpBlocked => 7,
+            hosted_input_connect_dispatch::PortConnectPhase::AwaitingCompletion(_) => 8,
+            hosted_input_connect_dispatch::PortConnectPhase::Terminal(_) => 9,
+            hosted_input_connect_dispatch::PortConnectPhase::Acknowledged => 10,
+        })
+}
+
+/// Pending Reply, source arm, and exact provider entry for the retained CONNECT row.
+pub(super) fn root_probe_origin_bits() -> u64 {
+    rows().iter().flatten().find(|work| work.provider_entered).map_or(0, |work| {
+        u64::from(work.source.origin().pending())
+            | (u64::from(work.source.origin().armed()) << 1)
+            | (u64::from(work.source_acknowledged) << 2)
+    })
 }
 
 pub(super) unsafe fn redrive_nested_ready() -> bool {
-    let progress = || {
-        rows().iter().flatten().fold(0usize, |total, work| {
-            total
-                + usize::from(work.provider_entered)
-                + usize::from(work.source_acknowledged)
-                + usize::from(work.port_acknowledged)
-        })
-    };
-    let before = progress();
-    redrive();
-    progress() != before
+    trace_connect_redrive_if_pending(0, true);
+    let advanced = redrive_inner(RedriveMode::NestedReady);
+    trace_connect_redrive_if_pending(5, true);
+    advanced
 }
 
 impl Work {
+    fn entered_nested_step_ready(&self) -> bool {
+        if !self.source.origin().armed() { return false; }
+        if self.source.terminal_status().is_some() {
+            return unsafe { self.source.terminal_step_ready() }
+                || (self.source_acknowledged && !self.port_acknowledged);
+        }
+        match self.port.phase() {
+            hosted_input_connect_dispatch::PortConnectPhase::AwaitingCompletion(irp) => {
+                unsafe {
+                    if io_manager_mut().completed_irp(irp).is_some() {
+                        return true;
+                    }
+                    if hosted_work_queue_owner::unsettled_queued_callback()
+                        || hosted_work_queue_owner::pending(self.port_storage_instance)
+                    { return false; }
+                    hosted_connect_io_work_candidate(
+                                self.port_instance, self.port_domain,
+                                self.port_storage_instance, self.port_storage_domain,
+                                self.source.payload().forward.target.device_id(), irp,
+                            ).ok().flatten().is_some()
+                }
+            }
+            hosted_input_connect_dispatch::PortConnectPhase::Terminal(_) =>
+                matches!(self.sequence.phase(), HookForwardPhase::Terminal(_, _)),
+            _ => false,
+        }
+    }
+
+    fn nested_ready(&self) -> bool {
+        // A parked provider parent cannot be its own child. Its source Reply is still held,
+        // and redriving this Work before native receive resumes makes no progress.
+        if matches!(self.port.phase(),
+            hosted_input_connect_dispatch::PortConnectPhase::PumpSuspended(_, _)
+            | hosted_input_connect_dispatch::PortConnectPhase::PumpStepClaimed(_, _)
+            | hosted_input_connect_dispatch::PortConnectPhase::PumpRestoreRetry(_, _)
+            | hosted_input_connect_dispatch::PortConnectPhase::PumpBlocked)
+        {
+            return false;
+        }
+        let active = !self.blocked && !self.port_acknowledged;
+        let source_admissible = active && !self.provider_entered
+            && unsafe { self.source.nested_preparation_ready() };
+        nt_io_manager::source_completion_preparation::nested_connect_ready(
+            active, self.provider_entered, source_admissible,
+            self.provider_entered && self.entered_nested_step_ready(),
+        )
+    }
+
     fn port_thunk(&self) -> hosted_class_callback_thunk::PublishedClassServiceThunk {
         self.port.thunk()
     }

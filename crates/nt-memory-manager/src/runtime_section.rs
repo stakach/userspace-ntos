@@ -237,6 +237,20 @@ pub struct ProviderSectionView {
     pub section_offset: u64,
 }
 
+/// Exact process projection of one provider Section view. This is distinct from a native
+/// `NtMapViewOfSection` VAD: win32k's `MmMapViewOfSection` aliases a kernel Section into a GUI
+/// client through the provider capability bank, whose caps retire with that process generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderClientSectionAlias {
+    pub generation: u64,
+    pub source: ProviderSectionView,
+    pub pi: usize,
+    pub process: crate::ProcessIdentity,
+    pub base: u64,
+    pub size: u64,
+}
+
+
 impl ProviderSectionView {
     fn contains(self, page: u64) -> bool {
         page >= self.base && self.base.checked_add(self.size).is_some_and(|end| page < end)
@@ -343,6 +357,7 @@ pub struct GenericSectionTable {
     control_areas: Vec<ControlArea>,
     views: Vec<GenericSectionView>,
     provider_views: Vec<ProviderSectionView>,
+    provider_client_aliases: Vec<ProviderClientSectionAlias>,
     references: Vec<SectionReference>,
     reference_authority: u64,
     reference_generation: u64,
@@ -351,6 +366,7 @@ pub struct GenericSectionTable {
     section_generation: u64,
     view_generation: u64,
     provider_view_generation: u64,
+    provider_client_alias_generation: u64,
     section_growths: u64,
     section_allocation_failures: u64,
     view_growths: u64,
@@ -368,6 +384,7 @@ impl GenericSectionTable {
             control_areas: Vec::new(),
             views: Vec::new(),
             provider_views: Vec::new(),
+            provider_client_aliases: Vec::new(),
             references: Vec::new(),
             reference_authority: 0,
             reference_generation: 0,
@@ -376,6 +393,7 @@ impl GenericSectionTable {
             section_generation: 0,
             view_generation: 0,
             provider_view_generation: 0,
+            provider_client_alias_generation: 0,
             section_growths: 0,
             section_allocation_failures: 0,
             view_growths: 0,
@@ -406,6 +424,7 @@ impl GenericSectionTable {
             .iter()
             .any(|section| section.backing.is_live())
             || !self.provider_views.is_empty()
+            || !self.provider_client_aliases.is_empty()
             || !self.references.is_empty()
             || self.pages.iter().any(|page| page.live)
         {
@@ -415,6 +434,7 @@ impl GenericSectionTable {
         self.control_areas.clear();
         self.views.clear();
         self.provider_views.clear();
+        self.provider_client_aliases.clear();
         self.pages.clear();
         self.section_growths = 0;
         self.section_allocation_failures = 0;
@@ -589,6 +609,18 @@ impl GenericSectionTable {
         Some(index)
     }
 
+    /// A kernel Section object has no process handle. Its lifetime is held by exact object
+    /// references and views, so no hosted process index is assigned at creation.
+    pub fn create_kernel(
+        &mut self,
+        size: u64,
+        protection: u32,
+        allocation_attributes: u32,
+        backing: GenericSectionBacking,
+    ) -> Option<usize> {
+        self.create(usize::MAX, 0, size, protection, allocation_attributes, backing)
+    }
+
     pub fn bind_handle(&mut self, index: usize, handle: u64) -> bool {
         if handle == 0 {
             return false;
@@ -617,6 +649,7 @@ impl GenericSectionTable {
             }
         }
         self.provider_views.retain(|view| view.section.index != index);
+        self.provider_client_aliases.retain(|alias| alias.source.section.index != index);
         // Keep source frames and backing until the mechanism acknowledges their release.
     }
 
@@ -625,6 +658,7 @@ impl GenericSectionTable {
             .iter()
             .any(|view| view.live && view.section_index == index)
             || self.provider_views.iter().any(|view| view.section.index == index)
+            || self.provider_client_aliases.iter().any(|alias| alias.source.section.index == index)
     }
 
     fn clear_section_if_unreferenced(&mut self, index: usize) {
@@ -741,7 +775,9 @@ impl GenericSectionTable {
 
     /// An unmap must name the exact view incarnation, not just a reusable address.
     pub fn unmap_provider_view_exact(&mut self, view: ProviderSectionView) -> Option<ProviderSectionView> {
-        if !view.owner.is_valid() || view.generation == 0 { return None; }
+        if !view.owner.is_valid() || view.generation == 0
+            || self.provider_client_aliases.iter().any(|alias| alias.source == view)
+        { return None; }
         let index = self.provider_views.iter().position(|candidate| {
             *candidate == view
                 && self.section_identity(candidate.section.index) == Some(candidate.section)
@@ -749,6 +785,73 @@ impl GenericSectionTable {
         let view = self.provider_views.remove(index);
         self.clear_section_if_unreferenced(view.section.index);
         Some(view)
+    }
+
+    /// Publish a process alias of a live provider view of the same canonical Section pages.
+    /// The provider view is the physical source authority; a stale address or provider generation
+    /// cannot authorize mapping a replacement Section into a client. The returned incarnation is
+    /// the exact lease that must be removed before the canonical backing can retire.
+    pub fn map_client_alias_of_provider_view(
+        &mut self,
+        source: ProviderSectionView,
+        pi: usize,
+        process: crate::ProcessIdentity,
+        base: u64,
+        size: u64,
+    ) -> Option<ProviderClientSectionAlias> {
+        let end = base.checked_add(size)?;
+        if !process.is_valid() || source.generation == 0 || base == 0
+            || (base | size) & 0xfff != 0 || size == 0 || end <= base
+            || size > source.size
+            || self.section_identity(source.section.index) != Some(source.section)
+            || !self.provider_views.contains(&source)
+            || self.provider_client_aliases.iter().any(|alias| alias.pi == pi
+                && base < alias.base.saturating_add(alias.size) && alias.base < end)
+        {
+            return None;
+        }
+        let generation = self.provider_client_alias_generation.checked_add(1)?;
+        self.provider_client_aliases.try_reserve(1).ok()?;
+        let alias = ProviderClientSectionAlias { generation, source, pi, process, base, size };
+        self.provider_client_aliases.push(alias);
+        self.provider_client_alias_generation = generation;
+        Some(alias)
+    }
+
+    pub fn provider_client_alias_for_process(
+        &self,
+        pi: usize,
+        process: crate::ProcessIdentity,
+    ) -> Option<ProviderClientSectionAlias> {
+        self.provider_client_aliases.iter().copied()
+            .find(|alias| alias.pi == pi && alias.process == process)
+    }
+
+    /// Resolve the Section alias named by an architectural client pointer, such as the PEB's
+    /// `GdiSharedHandleTable`. Multiple anonymous Sections may be mapped in the same process;
+    /// neither their allocation order nor their sizes identify the one named by that field.
+    pub fn provider_client_alias_at(
+        &self,
+        pi: usize,
+        process: crate::ProcessIdentity,
+        base: u64,
+    ) -> Option<ProviderClientSectionAlias> {
+        self.provider_client_aliases.iter().copied().find(|alias| {
+            alias.pi == pi && alias.process == process && alias.base == base
+                && self.section_identity(alias.source.section.index) == Some(alias.source.section)
+        })
+    }
+
+    /// Retire only the exact alias incarnation; a recycled VA or process slot is insufficient.
+    pub fn unmap_provider_client_alias_exact(
+        &mut self,
+        alias: ProviderClientSectionAlias,
+    ) -> Option<ProviderClientSectionAlias> {
+        let index = self.provider_client_aliases.iter().position(|candidate| *candidate == alias
+            && self.section_identity(candidate.source.section.index) == Some(candidate.source.section))?;
+        let alias = self.provider_client_aliases.remove(index);
+        self.clear_section_if_unreferenced(alias.source.section.index);
+        Some(alias)
     }
 
     pub fn map_view_with_lifetime(
@@ -1055,6 +1158,92 @@ mod tests {
         assert_eq!(table.next_retirement().unwrap().identity(), section);
         assert_eq!(table.stats().live_provider_views, 0);
     }
+
+    #[test]
+    fn anonymous_provider_section_projects_exact_client_alias_until_both_views_retire() {
+        let mut table = GenericSectionTable::new();
+        let index = table.create(2, 0, 0x30_0000, crate::PAGE_READWRITE,
+            SECTION_ATTR_SEC_COMMIT, GenericSectionBacking::anonymous()).unwrap();
+        let section = table.section_identity(index).unwrap();
+        let provider = provider(7, 11);
+        let server = table.map_provider_view(provider, section, 0x10000, 0x30_0000, 0).unwrap();
+        let process = crate::ProcessIdentity {
+            pid: 20,
+            generation: crate::ProcessGeneration::Hosted(3),
+        };
+        let client = table.map_client_alias_of_provider_view(
+            server, 2, process, 0x9800_0000, 0x30_0000,
+        ).expect("client projection must retain the same canonical Section");
+        assert_eq!(client.source.section, section);
+        assert_eq!(client.process, process);
+        assert!(table.release_handle(index));
+        assert_eq!(table.unmap_provider_view_exact(server), None,
+            "the canonical server view must stay live while its client alias exists");
+        assert_eq!(table.section_identity(index), Some(section),
+            "client alias must keep the canonical frames live");
+        assert_eq!(table.provider_client_alias_for_process(2, process), Some(client));
+        assert_eq!(table.unmap_provider_client_alias_exact(client), Some(client));
+        assert_eq!(table.unmap_provider_view_exact(server), Some(server));
+        assert_eq!(table.section_identity(index), None);
+        assert_eq!(table.next_retirement().unwrap().identity(), section);
+    }
+
+    #[test]
+    fn stale_or_foreign_provider_view_cannot_authorize_client_alias() {
+        let mut table = GenericSectionTable::new();
+        let index = table.create(2, 0, 0x3000, crate::PAGE_READWRITE,
+            SECTION_ATTR_SEC_COMMIT, GenericSectionBacking::anonymous()).unwrap();
+        let section = table.section_identity(index).unwrap();
+        let owner = provider(7, 11);
+        let server = table.map_provider_view(owner, section, 0x10000, 0x3000, 0).unwrap();
+        let process = crate::ProcessIdentity {
+            pid: 20,
+            generation: crate::ProcessGeneration::Hosted(3),
+        };
+        assert!(table.map_client_alias_of_provider_view(
+            ProviderSectionView { owner: provider(7, 12), ..server },
+            2, process, 0x9800_0000, 0x3000,
+        ).is_none());
+        assert_eq!(table.unmap_provider_view_exact(server), Some(server));
+        assert!(table.map_client_alias_of_provider_view(
+            server, 2, process, 0x9800_0000, 0x3000,
+        ).is_none());
+    }
+
+    #[test]
+    fn peb_named_alias_identifies_one_exact_section_without_an_extent_equality_rule() {
+        let mut table = GenericSectionTable::new();
+        let process = crate::ProcessIdentity {
+            pid: 20,
+            generation: crate::ProcessGeneration::Hosted(3),
+        };
+        let replacement_process = crate::ProcessIdentity {
+            pid: 20,
+            generation: crate::ProcessGeneration::Hosted(4),
+        };
+        let owner = provider(7, 11);
+        let ordinary = table.create(2, 0, 0x3000, crate::PAGE_READWRITE,
+            SECTION_ATTR_SEC_COMMIT, GenericSectionBacking::anonymous()).unwrap();
+        let gdi = table.create(2, 0, 0x18_2c28, crate::PAGE_READWRITE,
+            SECTION_ATTR_SEC_COMMIT, GenericSectionBacking::anonymous()).unwrap();
+        let ordinary_view = table.map_provider_view(owner,
+            table.section_identity(ordinary).unwrap(), 0x10000, 0x3000, 0).unwrap();
+        let gdi_view = table.map_provider_view(owner,
+            table.section_identity(gdi).unwrap(), 0x20000, 0x18_3000, 0).unwrap();
+        let ordinary_alias = table.map_client_alias_of_provider_view(
+            ordinary_view, 2, process, 0x9800_0000, 0x3000).unwrap();
+        let gdi_alias = table.map_client_alias_of_provider_view(
+            gdi_view, 2, process, 0x9900_0000, 0x18_3000).unwrap();
+
+        // PEB->GdiSharedHandleTable names the second alias. Neither registration order nor
+        // equality with the ABI's minimum table prefix is Section identity.
+        assert_eq!(table.provider_client_alias_at(2, process, gdi_alias.base), Some(gdi_alias));
+        assert_eq!(table.provider_client_alias_at(2, process, ordinary_alias.base), Some(ordinary_alias));
+        assert_eq!(table.provider_client_alias_at(2, process, gdi_alias.base + 0x1000), None);
+        assert_eq!(table.provider_client_alias_at(2, replacement_process, gdi_alias.base), None);
+        assert!(gdi_alias.size > 0x18_0000);
+    }
+
 
     #[test]
     fn section_pointer_retains_backing_after_handle_close_until_exact_release() {

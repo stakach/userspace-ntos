@@ -339,6 +339,7 @@ mod tests {
                 removable: false,
                 eject_supported: false,
                 surprise_removal_ok: false,
+                raw_device_ok: false,
                 address: 1,
             },
             PropertyBlobState::KnownNone,

@@ -5,6 +5,7 @@
 //! - `ntdll-dll-verify [path-to-dll]` (defaults to `.tmp/nt-ntdll.dll`)
 //! - `ntdll-dll-verify --wine-manifest [path-to-ntdll.spec]`
 //! - `ntdll-dll-verify --wine-report [path-to-dll]`
+//! - `ntdll-dll-verify --compare-exports <reference-dll> <built-dll>` (TSV evidence and import gate)
 //!
 //! If our own loader can read it — headers, export directory, relocations — then the executive can
 //! load it in-boot. Exits non-zero on any failure so the build script / CI can gate on it.
@@ -16,6 +17,7 @@ use nt_pe_loader::PeFile;
 use nt_syscall_abi::{NT_SYSCALLS, ZW_ALIASES};
 
 mod native_stub;
+mod export_compare;
 mod wine_spec;
 
 // IMAGE_FILE_CHARACTERISTICS.IMAGE_FILE_DLL
@@ -23,9 +25,37 @@ const IMAGE_FILE_DLL: u16 = 0x2000;
 // PE32+ optional-header magic.
 const PE32PLUS_MAGIC: u16 = 0x020b;
 
+fn coff_timestamp(bytes: &[u8], nt_offset: usize) -> Option<u32> {
+    let start = nt_offset.checked_add(8)?;
+    let end = start.checked_add(4)?;
+    let field: [u8; 4] = bytes.get(start..end)?.try_into().ok()?;
+    Some(u32::from_le_bytes(field))
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let first = args.next();
+    if first.as_deref() == Some("--compare-exports") {
+        let Some(reference) = args.next() else {
+            eprintln!("!! --compare-exports requires a reference DLL and a built DLL");
+            return ExitCode::FAILURE;
+        };
+        let Some(built) = args.next() else {
+            eprintln!("!! --compare-exports requires a built DLL");
+            return ExitCode::FAILURE;
+        };
+        if let Some(extra) = args.next() {
+            eprintln!("!! unexpected argument {extra:?}");
+            return ExitCode::FAILURE;
+        }
+        return match export_compare::compare_exports(Path::new(&reference), Path::new(&built)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("!! {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if matches!(first.as_deref(), Some("--wine-manifest" | "--wine-report")) {
         let mode = first.as_deref().unwrap();
         let path = args.next().unwrap_or_else(|| match mode {
@@ -96,6 +126,10 @@ fn main() -> ExitCode {
             "IMAGE_FILE_DLL set (characteristics {:#06x})",
             h.characteristics
         ),
+    );
+    check(
+        coff_timestamp(&bytes, h.nt_offset) == Some(0),
+        "reproducible PE COFF timestamp is zero",
     );
     println!(
         "       image_base={:#x} size_of_image={:#x} entry_rva={:#x} subsystem={}",
@@ -218,6 +252,19 @@ fn main() -> ExitCode {
         };
         let argc = nt_syscall_abi::exact_argc_of(syscall.name)
             .expect("every canonical syscall has an exact argument count");
+        if matches!(syscall.name, "NtInitializeNlsFiles" | "NtGetNlsSectionPtr") {
+            // These named Nt exports map installed NLS files inside ntdll. They retain the
+            // shared ABI name/arity but must never enter the native service table. Check the
+            // emitted PE, not just the Rust source.
+            check(
+                !image
+                    .bytes
+                    .get(export.rva as usize..)
+                    .is_some_and(|body| native_stub::matches(body, syscall.ssn, argc)),
+                &format!("{} native export is a user-mode file mapping", syscall.name),
+            );
+            continue;
+        }
         if !image
             .bytes
             .get(export.rva as usize..)

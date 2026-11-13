@@ -1,0 +1,12 @@
+# LiberNT source revision 8e478a22a1e8f8a22bab17131f3184a7b4548c3d
+# installed acpi.sys sha256 63ab15ce8bbf18407fd44af711275a1dca66dad56c1f5d82a42f640a27e6cbef
+# PE RVAs 0xb560 and 0xb581: mov rcx,[rax+0xb0]; mov r8d,0xc
+loader_configuration_root_offset=0xb0
+adapter_class=3
+multifunction_adapter=12
+# Pinned acpi.h ACPI_BIOS_MULTI_NODE: RsdpAddress, RsdtAddress, Count, E820Entry.
+# PE RVA 0xb654 reads the root paddr from [node+8].
+acpi_bios_multi_node_header_bytes=24
+rsdt_address_offset=8
+e820_count_offset=16
+e820_entries_offset=24

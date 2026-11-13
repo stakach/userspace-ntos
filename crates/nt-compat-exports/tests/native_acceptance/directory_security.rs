@@ -4,25 +4,42 @@ use syn::visit::Visit;
 fn boot_directory_policy_reads_the_composed_core_hive_transport() {
     let file = syn::parse_file(include_str!(
         "../../../../components/ntos-executive/src/exec_directory_security.rs"
-    )).unwrap();
-    let capture = file.items.iter().find_map(|item| match item {
-        syn::Item::Fn(item) if item.sig.ident == "capture_boot_protection_mode" => Some(item),
-        _ => None,
-    }).expect("native bootstrap captures the composed SYSTEM policy");
+    ))
+    .unwrap();
+    let capture = file
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(item) if item.sig.ident == "capture_boot_protection_mode" => Some(item),
+            _ => None,
+        })
+        .expect("native bootstrap captures the composed SYSTEM policy");
     #[derive(Default)]
-    struct Decoder { core: bool, regf: bool }
+    struct Decoder {
+        core: bool,
+        regf: bool,
+    }
     impl<'ast> Visit<'ast> for Decoder {
         fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
-            self.core |= path.path.segments.last().is_some_and(|part|
-                part.ident == "boot_object_protection_mode_from_image");
-            self.regf |= path.path.segments.iter().any(|part| part.ident == "RegfHive");
+            self.core |= path
+                .path
+                .segments
+                .last()
+                .is_some_and(|part| part.ident == "boot_object_protection_mode_from_image");
+            self.regf |= path
+                .path
+                .segments
+                .iter()
+                .any(|part| part.ident == "RegfHive");
             syn::visit::visit_expr_path(self, path);
         }
     }
     let mut decoder = Decoder::default();
     decoder.visit_block(&capture.block);
-    assert!(decoder.core && !decoder.regf,
-        "the owned composed SYSTEM is a core hive image, not the installed REGF source");
+    assert!(
+        decoder.core && !decoder.regf,
+        "the owned composed SYSTEM is a core hive image, not the installed REGF source"
+    );
 }
 
 #[test]
@@ -191,7 +208,7 @@ impl<'ast> Visit<'ast> for Calls {
 fn native_directory_admission_checks_actual_subject_and_descriptor_before_effects() {
     let file = source();
     let mut calls = Calls::default();
-    calls.visit_block(&method(&file, "stage_native_directory_object_open").block);
+    calls.visit_block(&method(&file, "reserve_native_directory_object_open").block);
     let security = calls
         .0
         .iter()
@@ -199,43 +216,58 @@ fn native_directory_admission_checks_actual_subject_and_descriptor_before_effect
         .expect(
             "native directory admission needs retained subject, exact parent and owned descriptor",
         );
-    for effect in [
-        "reserve_native_object_directory_handle",
-        "commit_directory_object_security",
-        "bind",
-    ] {
-        let effect = calls.0.iter().position(|name| name == effect).unwrap();
-        assert!(
-            security < effect,
-            "security admission precedes namespace/handle effects"
-        );
-    }
+    let reservation = calls
+        .0
+        .iter()
+        .position(|name| name == "reserve_directory_object_open_from_security")
+        .expect("only admitted security may enter the handle/canonical reservation helper");
+    assert!(
+        security < reservation,
+        "security admission precedes namespace/handle effects"
+    );
+    let mut effects = Calls::default();
+    effects.visit_block(&method(&file, "reserve_directory_object_open_from_security").block);
+    assert!(effects
+        .0
+        .iter()
+        .any(|name| name == "reserve_native_object_directory_handle"));
+    assert!(effects.0.iter().any(|name| name == "reserve"));
 }
 
 #[test]
-fn native_directory_handle_is_committed_before_checked_copyout_without_late_abort() {
+fn native_directory_handle_is_published_only_after_checked_copyout() {
     let file = syn::parse_file(include_str!(
-        "../../../../components/ntos-executive/src/exec_named_directories.rs"
+        "../../../../components/ntos-executive/src/native_directory_open_work.rs"
     ))
     .unwrap();
-    let method = method(&file, "nt_named_directory_service");
     let mut calls = Calls::default();
-    calls.visit_block(&method.block);
-    let publish = calls.0.iter().position(|name| name == "publish").unwrap();
+    calls.visit_block(
+        &file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(function) if function.sig.ident == "step" => Some(&function.block),
+                _ => None,
+            })
+            .expect("retained native open owns copyout and publication"),
+    );
     let copy = calls
         .0
         .iter()
         .position(|name| name == "process_memory_write_checked")
         .expect("directory final handle copy preserves exact fault status");
+    let publish = calls
+        .0
+        .iter()
+        .position(|name| name == "publish_directory_local")
+        .expect("visible PM publication follows successful checked output");
+    assert!(copy < publish);
     assert!(
-        publish < copy,
-        "ObInsert/Open commits the handle before final caller copy"
-    );
-    assert!(
-        !calls.0[copy..]
+        calls
+            .0
             .iter()
-            .any(|name| name == "abort_staged_directory_object_open"),
-        "late copy faults cannot withdraw an already committed directory handle"
+            .any(|name| name == "rollback_unpublished_directory_open"),
+        "failed copyout must retain canonical rollback ownership"
     );
 }
 
@@ -322,25 +354,20 @@ fn directory_entrypoints_own_durable_scope_across_retained_handle_effects() {
     let file = source();
     for (name, effects) in [
         (
-            "stage_native_directory_object_open",
+            "reserve_native_directory_object_open",
             &[
-                "reserve_native_object_directory_handle",
-                "commit_directory_object_security",
-                "bind",
+                "prepare_directory_object_security",
+                "reserve_directory_object_open_from_security",
             ][..],
         ),
         (
             "reserve_provider_directory_object",
-            &["reserve_native_object_directory_handle"][..],
-        ),
-        (
-            "publish_provider_directory_object",
             &[
-                "commit_directory_object_security",
-                "publish",
-                "record_process_handle_insert",
+                "prepare_directory_object_security",
+                "reserve_directory_object_open_from_security",
             ][..],
         ),
+        ("canonical_publish_directory_object", &["publish"][..]),
     ] {
         let body = &method(&file, name).block;
         let guard = body.stmts.iter().position(|statement| {
@@ -457,15 +484,23 @@ fn directory_attribute_admission_precedes_capture_and_normalizes_both_handle_bou
         }
     }
     for name in [
-        "stage_native_directory_object_open",
+        "reserve_native_directory_object_open",
         "reserve_provider_directory_object",
     ] {
+        // Both entrypoints must pass admitted security to the one reservation helper;
+        // the helper, rather than either caller, consumes normalized PM attributes.
         let mut normalized = NormalizedAttributes::default();
-        normalized.visit_block(&method(&file, name).block);
+        normalized.visit_block(&method(&file, "reserve_directory_object_open_from_security").block);
         assert!(
             normalized.0,
-            "{name} must reserve PM handles with admitted normalized attributes"
+            "{name} must reach PM reservation through admitted normalized attributes"
         );
+        let mut calls = Calls::default();
+        calls.visit_block(&method(&file, name).block);
+        assert!(calls
+            .0
+            .iter()
+            .any(|call| call == "reserve_directory_object_open_from_security"));
     }
 }
 
@@ -503,11 +538,56 @@ fn directory_body_retirement_converges_at_service_cleanup_after_exact_owner_fenc
             _ => None,
         })
         .unwrap();
+    let mut finalizer_calls = Calls::default();
+    finalizer_calls.visit_block(&finalize.block);
+    let redrive = finalizer_calls
+        .0
+        .iter()
+        .position(|name| name == "redrive_service_loop_global_work")
+        .expect("outer finalization must enter retained-owner redrive");
+    let checkpoint = finalizer_calls
+        .0
+        .iter()
+        .position(|name| name == "checkpoint_service_loop_volume")
+        .expect("outer finalization must reach the volume checkpoint");
+    assert!(
+        redrive < checkpoint,
+        "global owner redrive must precede the volume checkpoint"
+    );
+    let global_work = service
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == "redrive_service_loop_global_work" => {
+                Some(function)
+            }
+            _ => None,
+        })
+        .unwrap();
     let mut calls = Calls::default();
-    calls.visit_block(&finalize.block);
-    assert_eq!(
-        calls.0.first().map(String::as_str),
-        Some("sweep_directory_security_bodies")
+    calls.visit_block(&global_work.block);
+    let sweep = calls
+        .0
+        .iter()
+        .position(|name| name == "sweep_directory_security_bodies")
+        .expect("service cleanup must converge retired directory bodies");
+    for drain in ["redrive", "redrive_effects", "redrive_detached"] {
+        assert!(
+            calls
+                .0
+                .iter()
+                .position(|name| name == drain)
+                .is_some_and(|position| position < sweep),
+            "directory completion must settle before security-body retirement"
+        );
+    }
+    assert!(
+        calls
+            .0
+            .iter()
+            .position(|name| name == "fold_system_wal_if_dirty")
+            .is_some_and(|position| sweep < position),
+        "directory retirement must run before WAL early returns"
     );
 }
 
@@ -524,16 +604,14 @@ fn provider_directory_reservation_retains_same_security_admission_through_public
     let reservation = calls
         .0
         .iter()
-        .position(|name| name == "reserve_native_object_directory_handle")
+        .position(|name| name == "reserve_directory_object_open_from_security")
         .unwrap();
     assert!(security < reservation);
     let reservation = file
         .items
         .iter()
         .find_map(|item| match item {
-            syn::Item::Struct(item) if item.ident == "ReservedProviderDirectoryObject" => {
-                Some(item)
-            }
+            syn::Item::Struct(item) if item.ident == "ReservedDirectoryObjectOpen" => Some(item),
             _ => None,
         })
         .unwrap();
@@ -545,7 +623,7 @@ fn provider_directory_reservation_retains_same_security_admission_through_public
         "the admitted subject and descriptor remain owned while provider output is in flight"
     );
     let mut calls = Calls::default();
-    calls.visit_block(&method(&file, "publish_provider_directory_object").block);
+    calls.visit_block(&method(&file, "commit_directory_local").block);
     let security = calls
         .0
         .iter()
@@ -553,4 +631,66 @@ fn provider_directory_reservation_retains_same_security_admission_through_public
         .expect("publication revalidates the retained exact directory admission");
     let bind = calls.0.iter().position(|name| name == "bind").unwrap();
     assert!(security < bind);
+    let mut publication = Calls::default();
+    publication.visit_block(&method(&file, "publish_provider_directory_object").block);
+    assert!(publication
+        .0
+        .iter()
+        .any(|name| name == "finish_provider_directory_local"));
+    let mut finish = Calls::default();
+    finish.visit_block(&method(&file, "finish_provider_directory_local").block);
+    assert!(finish.0.iter().any(|name| name == "commit_directory_local"));
+}
+
+#[test]
+fn retained_directory_queues_allocate_in_durable_scope() {
+    let directory = source();
+    let handler = syn::parse_file(include_str!(
+        "../../../../components/ntos-executive/src/exec_handler.rs"
+    )).unwrap();
+    let open = syn::parse_file(include_str!(
+        "../../../../components/ntos-executive/src/native_directory_open_work.rs"
+    )).unwrap();
+    let effect = syn::parse_file(include_str!(
+        "../../../../components/ntos-executive/src/native_directory_effect_work.rs"
+    )).unwrap();
+    for (owner, name) in [
+        (&directory, "commit_directory_local"),
+        (&handler, "retain_external_handle_reference"),
+    ] {
+        let mut calls = Calls::default();
+        calls.visit_block(&method(owner, name).block);
+        let durable = calls.0.iter().position(|call| call == "enter_durable");
+        let reserve = calls.0.iter().position(|call| call == "reserve");
+        assert!(matches!((durable, reserve), (Some(d), Some(r)) if d < r),
+            "{name} must enter durable scope before reserving cleanup capacity");
+    }
+    for (owner, name) in [(&open, "park"), (&effect, "park")] {
+        let function = owner.items.iter().find_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == name => Some(function),
+            _ => None,
+        }).unwrap();
+        let mut calls = Calls::default();
+        calls.visit_block(&function.block);
+        let durable = calls.0.iter().position(|call| call == "enter_durable");
+        let reserve = calls.0.iter().position(|call| call == "try_reserve");
+        assert!(matches!((durable, reserve), (Some(d), Some(r)) if d < r),
+            "{name} must enter durable scope before growing its retained Reply queue");
+    }
+}
+
+#[test]
+fn canonical_directory_transport_retains_owned_requests_in_durable_scope() {
+    let port = syn::parse_file(include_str!(
+        "../../../../components/ntos-executive/src/canonical_directory_port.rs"
+    )).unwrap();
+    for name in ["create", "open", "poll_create", "make_temporary",
+        "make_permanent", "close", "poll_effect"] {
+        let mut calls = Calls::default();
+        calls.visit_block(&method(&port, name).block);
+        let durable = calls.0.iter().position(|call| call == "enter_durable");
+        let client = calls.0.iter().position(|call| call == "client");
+        assert!(matches!((durable, client), (Some(d), Some(c)) if d < c),
+            "{name} must enter durable scope before ObjectClient can retain request or CQE bytes");
+    }
 }

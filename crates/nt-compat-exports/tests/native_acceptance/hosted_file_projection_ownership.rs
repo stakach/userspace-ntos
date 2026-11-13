@@ -224,7 +224,10 @@ fn detached_file_pending_and_uncertain_paths_keep_projection_ownership() {
     };
     let entry = evidence(&function(&file, "dispatch").unwrap().block);
     assert!(has(&entry.calls, "dispatch_with_port_connect"));
-    arms.visit_block(&function(&file, "dispatch_with_port_connect").unwrap().block);
+    let dispatch = evidence(&function(&file, "dispatch_with_port_connect").unwrap().block);
+    assert!(has(&dispatch.calls, "settle_returned_dispatch"),
+        "the entered invocation must pass its real return to the common settlement owner");
+    arms.visit_block(&function(&file, "settle_returned_dispatch").unwrap().block);
     assert_eq!(arms.retained, 2);
     assert!(
         !arms.invalid,
@@ -253,6 +256,28 @@ fn source_irp_rpc_cannot_reborrow_manager_for_projection_ownership() {
             "borrowed PnP/lifecycle pump forbids {forbidden} here"
         );
     }
+    assert!(has(&rpc.calls, "with_live_verify_device_registration"),
+        "hard-error writes must use the exact published physical registration under its retirement lock");
+}
+
+#[test]
+fn canonical_device_retirement_invalidates_the_source_registration_catalog() {
+    let catalog = include_str!("../../../../components/ntos-executive/src/hosted_device_allocations.rs");
+    assert!(catalog.contains("io.retire_hosted_device_pointer(registration)?;"));
+    assert!(catalog.contains("row.canonical_live = false;"));
+    assert!(catalog.contains("return if row.canonical_live { Ok(()) } else"),
+        "a retired registration cannot be republished as an idempotent no-op");
+    for source in [
+        include_str!("../../../../components/ntos-executive/src/driver_launch.rs"),
+        include_str!("../../../../components/ntos-executive/src/hosted_add_device_rollback.rs"),
+        include_str!("../../../../components/ntos-executive/src/hosted_upper_filter_projection.rs"),
+        include_str!("../../../../components/ntos-executive/src/hosted_dxg_registration.rs"),
+        include_str!("../../../../components/ntos-executive/src/hosted_consumer_device_objects.rs"),
+        include_str!("../../../../components/ntos-executive/src/hosted_reverse_class_projection.rs"),
+    ] {
+        assert!(!source.contains(".retire_hosted_device_pointer("),
+            "canonical pointer retirement must invalidate the source catalog atomically");
+    }
 }
 
 #[test]
@@ -261,14 +286,19 @@ fn detached_file_removal_follows_canonical_terminal_and_real_backend_ack() {
     let entry = evidence(&function(&file, "dispatch").unwrap().block);
     assert!(has(&entry.calls, "dispatch_with_port_connect"));
     let dispatch = evidence(&function(&file, "dispatch_with_port_connect").unwrap().block);
-    let terminal = dispatch
+    assert!(has(&dispatch.calls, "settle_returned_dispatch"));
+    let settled = evidence(&function(&file, "settle_returned_dispatch").unwrap().block);
+    let terminal = settled
         .calls
         .iter()
         .position(|call| call == "retire_external_file_irp_terminal")
         .unwrap();
-    assert!(dispatch.calls[terminal..]
+    assert!(settled.calls[terminal..]
         .iter()
         .any(|call| call == "accepts_external_file_irp_receipt"));
+    assert!(settled.calls[terminal..]
+        .iter().any(|call| call == "remove"),
+        "canonical synchronous terminal must release only after receipt acceptance");
     let entry = evidence(&function(&file, "acknowledge").unwrap().block);
     assert!(has(&entry.calls, "acknowledge_with_buffers"));
     let ack = evidence(&function(&file, "acknowledge_with_buffers").unwrap().block);
@@ -277,7 +307,10 @@ fn detached_file_removal_follows_canonical_terminal_and_real_backend_ack() {
         .iter()
         .position(|call| call == "finish_external_file_irp_completion")
         .unwrap();
-    let remove = ack.calls.iter().position(|call| call == "remove").unwrap();
+    // Synchronous and no-backend terminals retire in earlier branches. Check the
+    // removal belonging to the entered backend ACK, after its own completion.
+    let remove = ack.calls.iter().enumerate().skip(retire + 1)
+        .find_map(|(index, call)| (call == "remove").then_some(index)).unwrap();
     assert!(retire < remove);
     assert!(has(&ack.calls[retire..remove], "backend_acknowledged"));
     assert!(

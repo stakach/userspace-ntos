@@ -30,6 +30,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          submodules: true
       # Public compile-time inputs; no proprietary Windows binaries or microkernel are needed.
       - name: Fetch pinned ReactOS source inputs
         uses: actions/checkout@v4
@@ -49,9 +50,13 @@ jobs:
         run: |
           mkdir -p rust-micro/.tmp/reactos/reactos/inf
           cp references/reactos/win32ss/drivers/miniport/bochs/bochsmp.inf rust-micro/.tmp/reactos/reactos/inf/bochsmp.inf
+      - name: Executive layout static rule
+        run: scripts/check_executive_layout_statics.sh
       - uses: dtolnay/rust-toolchain@stable
       - name: Workspace unit, integration and doc specs
         run: cargo test --workspace --locked --no-fail-fast 2>&1 | tee crate-specs.log
+      - name: Microkernel userspace ABI specs
+        run: cargo test --manifest-path rust-micro/crates/sel4-rt/Cargo.toml --lib 2>&1 | tee sel4-rt-specs.log
       - name: ntdll native-transport specs
         run: cargo test -p nt-ntdll --features native_transport --locked 2>&1 | tee native-transport-specs.log
       - name: Native acceptance log verifier specs
@@ -73,6 +78,7 @@ jobs:
           name: crate-spec-logs
           path: |
             crate-specs.log
+            sel4-rt-specs.log
             native-transport-specs.log
             file-log-specs.log
             font-log-specs.log

@@ -8,6 +8,10 @@
 
 extern crate alloc;
 
+pub mod pci_dma_handoff;
+pub mod native_storage_handoff;
+pub mod native_route_publication;
+pub mod native_cutover_admission;
 pub mod resource_mapping;
 
 use alloc::vec::Vec;
@@ -466,7 +470,7 @@ impl<D, O> ContextRegistry<D, O> {
     pub fn acquire_active(&mut self) -> Result<ContextLease, AcquireError> {
         if self.authority == 0 {
             self.authority = NEXT_REGISTRY_AUTHORITY
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     value.checked_add(1)
                 })
                 .map_err(|_| AcquireError::IdExhausted)?;

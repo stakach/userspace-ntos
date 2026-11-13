@@ -190,8 +190,11 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
                 object.typed(),
                 Some(
                     ProviderWaitObjectType::Event
+                        | ProviderWaitObjectType::Semaphore
                         | ProviderWaitObjectType::Timer
                         | ProviderWaitObjectType::File
+                        | ProviderWaitObjectType::Thread
+                        | ProviderWaitObjectType::Mutant
                 )
             )
         }) {
@@ -1351,20 +1354,40 @@ mod tests {
             arbiter.admit(&mut backend, &base, owner(99), 5, now(0, 0)),
             Err(ProviderDispatcherWaitError::OwnerMismatch)
         );
-        let semaphore = ProviderWaitObject::new(ProviderWaitObjectType::Semaphore, 1, 1);
+        let process = ProviderWaitObject::new(ProviderWaitObjectType::Process, 1, 1);
         let unsupported = request(
             identity,
             13,
             ProviderWaitType::Any,
             ProviderWaitTimeoutKind::Infinite,
             0,
-            &[semaphore],
+            &[process],
         );
         assert_eq!(
             arbiter.admit(&mut backend, &unsupported, identity, 5, now(0, 0)),
             Err(ProviderDispatcherWaitError::UnsupportedObjectType)
         );
         assert_eq!(backend.lease_count(), 0);
+    }
+
+    #[test]
+    fn semaphore_wait_admits_and_consumes_one_ready_count() {
+        let identity = owner(44);
+        let semaphore = ProviderWaitObject::new(ProviderWaitObjectType::Semaphore, 3, 7);
+        let mut backend = Backend::default();
+        backend.insert(identity, semaphore, false, true);
+        let arbiter = ProviderDispatcherWaitArbiter::new();
+        let wait = request(
+            identity,
+            87,
+            ProviderWaitType::Any,
+            ProviderWaitTimeoutKind::Poll,
+            0,
+            &[semaphore],
+        );
+        assert_eq!(arbiter.poll(&mut backend, &wait, identity), Ok(STATUS_WAIT_0));
+        assert_eq!(backend.lease_count(), 0);
+        assert!(!backend.events[&(semaphore.object_id, semaphore.object_generation)].signaled);
     }
 
     #[test]

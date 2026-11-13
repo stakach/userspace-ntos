@@ -8,6 +8,76 @@ fn fresh() -> (ProcessManager, ProcessId, ThreadId) {
 }
 
 #[test]
+fn abandoned_unstarted_process_waits_for_its_final_external_handle() {
+    let mut pm = ProcessManager::new();
+    let creator = pm.create_process("creator.exe", None, None);
+    let child = pm.create_process("child.exe", Some(creator), None);
+    let main = pm.create_thread(child, 0, 0, false).unwrap();
+    assert!(pm.publish_process_kernel_object(child, 0x3000));
+    assert!(pm.publish_thread_kernel_object(main, 0x4000));
+    let first = pm.insert_handle(creator, HandleObject::Process(child), 0).unwrap();
+    let last = pm.insert_handle(creator, HandleObject::Process(child), 0).unwrap();
+
+    assert!(!pm.should_terminate_unstarted_process(child),
+        "a visible creator handle still owns initial-thread admission");
+    pm.close_handle(creator, first).unwrap();
+    assert!(!pm.should_terminate_unstarted_process(child),
+        "closing one of several handles cannot abandon the child");
+    pm.close_handle(creator, last).unwrap();
+    assert_eq!(pm.retain_kernel_object_pointer(0x3000), Ok(1));
+    assert!(!pm.should_terminate_unstarted_process(child),
+        "a native process-pointer owner can still admit the initial thread");
+    assert_eq!(pm.release_kernel_object_pointer(0x3000), Ok(0));
+    assert_eq!(pm.retain_kernel_object_pointer(0x4000), Ok(1));
+    assert!(!pm.should_terminate_unstarted_process(child),
+        "a native main-thread pointer also keeps creation authority alive");
+    assert_eq!(pm.release_kernel_object_pointer(0x4000), Ok(0));
+    assert!(pm.should_terminate_unstarted_process(child),
+        "the last close must make a never-started process eligible for normal retirement");
+    pm.terminate_process(child, STATUS_INVALID_PARAMETER).unwrap();
+    assert!(pm.is_process_signaled(child));
+    assert!(!pm.should_terminate_unstarted_process(child),
+        "a signaled process must not be terminated again");
+}
+
+#[test]
+fn final_close_receipt_waits_for_pointer_owner_before_retirement() {
+    let mut pm = ProcessManager::new();
+    let creator = pm.create_process("creator.exe", None, None);
+    let child = pm.create_process("child.exe", Some(creator), None);
+    let main = pm.create_thread(child, 0, 0, false).unwrap();
+    assert!(pm.publish_process_kernel_object(child, 0x7000));
+    assert!(pm.publish_thread_kernel_object(main, 0x8000));
+    let handle = pm.insert_handle(creator, HandleObject::Process(child), 0).unwrap();
+    assert_eq!(pm.retain_kernel_object_pointer(0x7000), Ok(1));
+    pm.close_handle(creator, handle).unwrap();
+    assert!(pm.request_unstarted_process_abandonment(child),
+        "the real final close must be recorded despite a temporary native pointer owner");
+    assert!(!pm.unstarted_process_abandonment_pending(child));
+    assert_eq!(pm.release_kernel_object_pointer(0x7000), Ok(0));
+    assert!(pm.unstarted_process_abandonment_pending(child),
+        "the retained close receipt becomes eligible after the pointer owner releases");
+}
+
+#[test]
+fn pending_or_committed_initial_thread_prevents_abandoned_process_cleanup() {
+    let (mut pm, child, main) = fresh();
+    assert!(pm.publish_process_kernel_object(child, 0x5000));
+    assert!(pm.publish_thread_kernel_object(main, 0x6000));
+    assert!(pm.should_terminate_unstarted_process(child));
+    let plan = pm.prepare_initial_thread_creation(child).unwrap().unwrap();
+    assert!(!pm.should_terminate_unstarted_process(child),
+        "a retained native creation attempt owns the process even without handles");
+    pm.cancel_initial_thread_creation(&plan).unwrap();
+    assert!(pm.should_terminate_unstarted_process(child),
+        "proven no-effect cancellation restores abandonment eligibility");
+    let plan = pm.prepare_initial_thread_creation(child).unwrap().unwrap();
+    pm.commit_initial_thread_creation(&plan).unwrap();
+    assert!(!pm.should_terminate_unstarted_process(child),
+        "a committed main thread remains the execution owner after handles close");
+}
+
+#[test]
 fn fresh_main_reserves_then_commits_exact_creation_once() {
     let (mut pm, pid, tid) = fresh();
     let lifetime = pm.thread_lifetime(tid).unwrap();

@@ -2,11 +2,42 @@
 
 use super::*;
 
+/// Backstop for work queued after the root's last queue scan but before Receive. Only the
+/// ordinary root Receive arms it; a due timer consumes it, so active service turns do not poll.
+const QUEUED_WORK_RECEIVE_POLL_INTERVAL_100NS: u64 = 2_500_000;
+static QUEUED_WORK_RECEIVE_POLL_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+pub(super) fn arm_queued_work_receive_poll(now_100ns: u64) {
+    let deadline = now_100ns
+        .saturating_add(QUEUED_WORK_RECEIVE_POLL_INTERVAL_100NS)
+        .min(u64::MAX - 1);
+    let _ = QUEUED_WORK_RECEIVE_POLL_DEADLINE.compare_exchange(
+        u64::MAX, deadline, Ordering::AcqRel, Ordering::Acquire,
+    );
+}
+
+fn queued_work_receive_poll_deadline() -> Option<u64> {
+    let deadline = QUEUED_WORK_RECEIVE_POLL_DEADLINE.load(Ordering::Acquire);
+    (deadline != u64::MAX).then_some(deadline)
+}
+
+pub(super) fn queued_work_receive_poll_wake_due(now_100ns: u64) -> u64 {
+    let Some(deadline) = queued_work_receive_poll_deadline() else { return 0 };
+    if now_100ns < deadline { return 0; }
+    u64::from(QUEUED_WORK_RECEIVE_POLL_DEADLINE.compare_exchange(
+        deadline, u64::MAX, Ordering::AcqRel, Ordering::Acquire,
+    ).is_ok())
+}
+
 pub(super) struct OwnerDeadlines {
     pub dispatcher: nt_user_host::dispatcher_deadlines::DispatcherDeadlines,
     pub user_timer: Option<u64>,
     pub job_time: Option<u64>,
     pub component_resume: Option<u64>,
+    pub root_add_device: Option<u64>,
+    pub root_queued_callback: Option<u64>,
+    pub primary_alias: Option<u64>,
+    pub hosted_spawn_abort: Option<u64>,
 }
 
 /// Retry owners may reconcile retained demand at this snapshot. No notification acknowledgment,
@@ -32,6 +63,7 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
             DELAY_TIMER_SOURCE_IO_COMPLETION,
         ),
         (owner.user_timer, DELAY_TIMER_SOURCE_USER_TIMER),
+        (thread_alert::next_deadline(now), DELAY_TIMER_SOURCE_THREAD_ALERT),
         (
             service_sec_image::provider_wait_next_deadline(now),
             DELAY_TIMER_SOURCE_PROVIDER_WAIT,
@@ -47,6 +79,22 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
         (
             driver_launch::hosted_driver_wait_next_deadline(now),
             DELAY_TIMER_SOURCE_HOSTED_DRIVER,
+        ),
+        (
+            driver_launch::hosted_driver_dynamic_delete::next_deadline(),
+            DELAY_TIMER_SOURCE_HOSTED_DYNAMIC_DELETE,
+        ),
+        (
+            driver_launch::hosted_provider_export_lane::next_deadline(),
+            DELAY_TIMER_SOURCE_HOSTED_PROVIDER_STARTUP_RESTORE,
+        ),
+        (
+            spawn_hosts::shared_ingress::owner::runtime::nested::next_abort_deadline(),
+            DELAY_TIMER_SOURCE_NESTED_ACQUIRE_ABORT,
+        ),
+        (
+            win32k_glue::win32k_startup_restore_next_deadline(),
+            DELAY_TIMER_SOURCE_WIN32K_STARTUP_RESTORE,
         ),
         (
             driver_launch::hosted_acpi_pci_route_recovery_next_deadline(now.monotonic_100ns),
@@ -65,21 +113,39 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
             registry_mutation_work::next_deadline(),
             DELAY_TIMER_SOURCE_REGISTRY_MUTATION,
         ),
+        (section_metadata_work::next_deadline(), DELAY_TIMER_SOURCE_SECTION_METADATA),
+        (process_image_snapshot_work::next_deadline(),
+            DELAY_TIMER_SOURCE_PROCESS_IMAGE_SNAPSHOT),
+        (section_pagein_work::next_deadline(), DELAY_TIMER_SOURCE_SECTION_PAGEIN),
+        (provider_section_map_work::next_deadline(), DELAY_TIMER_SOURCE_PROVIDER_SECTION_MAP),
+        (native_image_pagein_work::next_deadline(), DELAY_TIMER_SOURCE_NATIVE_IMAGE_PAGEIN),
+        (vm_lock_pagein_work::next_deadline(), DELAY_TIMER_SOURCE_VM_LOCK_PAGEIN),
+        (vm_copy_work::next_deadline(), DELAY_TIMER_SOURCE_VM_COPY),
+        (native_directory_open_work::next_deadline(), DELAY_TIMER_SOURCE_NATIVE_DIRECTORY_OPEN),
+        (native_file_target_open_work::next_deadline(),
+            DELAY_TIMER_SOURCE_NATIVE_FILE_TARGET_OPEN),
+        (native_directory_effect_work::next_deadline(),
+            DELAY_TIMER_SOURCE_NATIVE_DIRECTORY_EFFECT),
+        (provider_section_broker::next_deadline(), DELAY_TIMER_SOURCE_PROVIDER_SECTION),
+        (gdi_routed_image_work::next_deadline(), DELAY_TIMER_SOURCE_GDI_ROUTED_IMAGE),
         (
-            match (
-                section_metadata_work::next_deadline(),
-                provider_section_broker::next_deadline(),
-            ) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            },
-            DELAY_TIMER_SOURCE_SECTION_METADATA,
+            provider_directory_broker::next_deadline(),
+            DELAY_TIMER_SOURCE_PROVIDER_DIRECTORY,
         ),
         (
             driver_launch::hosted_file_retry_deadline(now.monotonic_100ns),
             DELAY_TIMER_SOURCE_HOSTED_FILE_RETRY,
         ),
+        (
+            driver_launch::mounted_native_block_next_deadline(now.monotonic_100ns),
+            DELAY_TIMER_SOURCE_MOUNTED_NATIVE_BLOCK,
+        ),
         (owner.component_resume, DELAY_TIMER_SOURCE_COMPONENT_RESUME),
+        (owner.root_add_device, DELAY_TIMER_SOURCE_ROOT_ADD_DEVICE_RETRY),
+        (owner.root_queued_callback, DELAY_TIMER_SOURCE_ROOT_QUEUED_CALLBACK_RETRY),
+        (queued_work_receive_poll_deadline(), DELAY_TIMER_SOURCE_QUEUED_WORK_RECEIVE_POLL),
+        (owner.primary_alias, DELAY_TIMER_SOURCE_PRIMARY_ALIAS_RETRY),
+        (owner.hosted_spawn_abort, DELAY_TIMER_SOURCE_HOSTED_SPAWN_ABORT),
         (
             service_sec_image::system_wal_fold_next_deadline(),
             DELAY_TIMER_SOURCE_SYSTEM_WAL_FOLD,
@@ -88,6 +154,10 @@ pub(super) unsafe fn next(now: nt_time::TimeSnapshot, owner: OwnerDeadlines) -> 
         (
             driver_launch::hosted_dpc_next_deadline(now.monotonic_100ns),
             DELAY_TIMER_SOURCE_HOSTED_DPC,
+        ),
+        (
+            driver_launch::hosted_irq_retry_next_deadline(),
+            DELAY_TIMER_SOURCE_HOSTED_IRQ_RETRY,
         ),
     ])
 }

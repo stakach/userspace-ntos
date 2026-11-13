@@ -24,6 +24,9 @@ const FILE_ID: u64 = (1u64 << 40) | 401;
 struct Backing {
     live: bool,
     file_ready: bool,
+    thread_ready: bool,
+    thread_leases: usize,
+    thread_releases: usize,
     file_leases: usize,
     file_releases: usize,
     acquired: usize,
@@ -68,6 +71,25 @@ impl ProviderEventBacking for Backing {
         assert_eq!(lease, 401);
         assert!(self.file_releases < self.file_leases);
         self.file_releases += 1;
+    }
+
+    fn acquire_thread_wait(&mut self, owner: ProviderWaitOwner, object: ProviderWaitObject) -> Result<u64, u32> {
+        if owner != self::owner() || object != ProviderWaitObject::new(ProviderWaitObjectType::Thread, 88, 7) {
+            return Err(INVALID_PARAMETER);
+        }
+        self.thread_leases += 1;
+        Ok(88)
+    }
+
+    fn thread_wait_is_ready(&self, lease: u64) -> bool {
+        assert_eq!(lease, 88);
+        self.thread_ready
+    }
+
+    fn release_thread_wait(&mut self, lease: u64) {
+        assert_eq!(lease, 88);
+        assert!(self.thread_releases < self.thread_leases);
+        self.thread_releases += 1;
     }
 
     fn lease_acquired(&mut self) {
@@ -366,6 +388,25 @@ fn selector_scope_reuses_lease_and_retires_backing_only_after_last_release() {
         Err(EventObjectError::StaleObject)
     );
     assert_eq!(objects.backing.released, 2);
+}
+
+#[test]
+fn hosted_thread_wait_rejects_recycled_identity_and_keeps_signal_after_selection() {
+    let mut state = DispatcherState::new(1, 1);
+    let access = ProviderDispatcherAccess::hosted(owner(), 42).unwrap();
+    let mut objects = backend(&mut state, Some(access));
+    let thread = ProviderWaitObject::new(ProviderWaitObjectType::Thread, 88, 7);
+    let recycled = ProviderWaitObject::new(ProviderWaitObjectType::Thread, 88, 6);
+    assert_eq!(objects.acquire_dispatcher_wait(owner(), recycled), Err(INVALID_PARAMETER));
+    let lease = objects.acquire_dispatcher_wait(owner(), thread).unwrap();
+    assert!(!objects.dispatcher_is_ready(lease));
+    objects.backing.thread_ready = true;
+    assert!(objects.dispatcher_is_ready(lease));
+    objects.consume_ready_dispatcher(lease);
+    assert!(objects.dispatcher_is_ready(lease));
+    objects.release_dispatcher_wait(lease);
+    assert_eq!((objects.backing.thread_leases, objects.backing.thread_releases), (1, 1));
+    assert_eq!((objects.backing.acquired, objects.backing.released), (1, 1));
 }
 
 #[test]

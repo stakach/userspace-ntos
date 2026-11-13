@@ -2594,6 +2594,82 @@ fn security_descriptor_bytes_set_merges_selected_components() {
 }
 
 #[test]
+fn setting_directory_label_replaces_only_mandatory_label_and_requested_dacl() {
+    fn with_sacl(mut descriptor: Vec<u8>, sacl: &[u8]) -> Vec<u8> {
+        let offset = push_aligned(&mut descriptor, sacl);
+        let control = u16::from_le_bytes([descriptor[2], descriptor[3]]) | 0x0010;
+        descriptor[2..4].copy_from_slice(&control.to_le_bytes());
+        descriptor[12..16].copy_from_slice(&offset.to_le_bytes());
+        descriptor
+    }
+
+    let owner = native_sid(5, &[18]);
+    let group = native_sid(5, &[32, 544]);
+    let old_dacl = acl_with_aces(&[access_ace(0, FILE_READ, &group)]);
+    let new_dacl = acl_with_aces(&[access_ace(0, FILE_WRITE, &group)]);
+    let audit = access_ace(2, FILE_READ, &owner);
+    let old_label = access_ace(0x11, 1, &native_sid(16, &[0x2000]));
+    let new_label = access_ace(0x11, 1, &native_sid(16, &[0x1000]));
+    let current = with_sacl(
+        self_relative_sd(&owner, &group, Some(&old_dacl)),
+        &acl_with_aces(&[audit.clone(), old_label]),
+    );
+    let modification = with_sacl(
+        self_relative_sd(&owner, &group, Some(&new_dacl)),
+        &acl_with_aces(&[new_label.clone()]),
+    );
+
+    let updated = set_security_descriptor_bytes(
+        &current,
+        DACL_SECURITY_INFORMATION | 0x10, // LABEL_SECURITY_INFORMATION
+        &modification,
+    )
+    .expect("DACL and mandatory label are separately selectable");
+
+    assert_eq!(sd_owner(&updated), Some(owner.as_slice()));
+    assert_eq!(sd_group(&updated), Some(group.as_slice()));
+    assert_eq!(sd_dacl(&updated), Some(new_dacl.as_slice()));
+    let sacl_offset = u32::from_le_bytes(updated[12..16].try_into().unwrap()) as usize;
+    let sacl_len = u16::from_le_bytes([updated[sacl_offset + 2], updated[sacl_offset + 3]]) as usize;
+    let sacl = &updated[sacl_offset..sacl_offset + sacl_len];
+    assert_eq!(sacl, acl_with_aces(&[audit, new_label.clone()]).as_slice());
+
+    let queried = query_security_descriptor_bytes(&updated, LABEL_SECURITY_INFORMATION)
+        .expect("label query selects only mandatory ACEs");
+    let label_offset = u32::from_le_bytes(queried[12..16].try_into().unwrap()) as usize;
+    let label_len = u16::from_le_bytes([queried[label_offset + 2], queried[label_offset + 3]]) as usize;
+    assert_eq!(
+        &queried[label_offset..label_offset + label_len],
+        acl_with_aces(&[new_label.clone()]).as_slice()
+    );
+
+    for invalid_labels in [
+        acl_with_aces(&[new_label.clone(), new_label.clone()]),
+        acl_with_aces(&[access_ace(0x11, 8, &native_sid(16, &[0x1000]))]),
+        acl_with_aces(&[access_ace(0x11, 1, &native_sid(5, &[18]))]),
+    ] {
+        let invalid = with_sacl(
+            self_relative_sd(&owner, &group, Some(&new_dacl)),
+            &invalid_labels,
+        );
+        assert_eq!(
+            set_security_descriptor_bytes(&current, LABEL_SECURITY_INFORMATION, &invalid),
+            Err(STATUS_INVALID_ACL),
+        );
+    }
+    let mut invalid_flags = new_label;
+    invalid_flags[1] = 0x40; // audit-success flag is not valid for a mandatory label
+    let invalid = with_sacl(
+        self_relative_sd(&owner, &group, Some(&new_dacl)),
+        &acl_with_aces(&[invalid_flags]),
+    );
+    assert_eq!(
+        set_security_descriptor_bytes(&current, LABEL_SECURITY_INFORMATION, &invalid),
+        Err(STATUS_INVALID_ACL),
+    );
+}
+
+#[test]
 fn capture_security_descriptor_reports_native_statuses() {
     let mut client = MockClient::default();
     client.map(

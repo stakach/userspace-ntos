@@ -5,6 +5,66 @@ extern crate alloc;
 #[allow(dead_code)]
 mod file_image_section {
     pub struct LocalImageFile;
+    impl LocalImageFile {
+        pub fn read_exact(
+            &self,
+            _: &crate::ExecNtHandler,
+            _: nt_memory_manager::GenericSectionBacking,
+            _: u64,
+            _: &mut [u8],
+        ) -> Result<(), u32> {
+            Err(nt_fs::STATUS_INVALID_HANDLE)
+        }
+    }
+}
+
+struct ExecNtHandler;
+
+mod hosted_routed_image_capture {
+    use nt_memory_manager::image_section::ImageAreaId;
+    use nt_memory_manager::RoutedSectionLease;
+    use std::sync::Mutex;
+
+    static ROUTES: Mutex<Vec<(RoutedSectionLease, ImageAreaId)>> = Mutex::new(Vec::new());
+
+    pub fn bind(lease: RoutedSectionLease, area: ImageAreaId) {
+        ROUTES.lock().unwrap().push((lease, area));
+    }
+
+    pub fn release(lease: RoutedSectionLease, area: ImageAreaId) {
+        let mut routes = ROUTES.lock().unwrap();
+        let index = routes.iter().position(|route| *route == (lease, area)).unwrap();
+        routes.swap_remove(index);
+    }
+
+    pub unsafe fn route(
+        lease: RoutedSectionLease,
+        area: ImageAreaId,
+    ) -> Option<(u64, u64, u64, u32)> {
+        ROUTES
+            .lock()
+            .unwrap()
+            .contains(&(lease, area))
+            .then_some((lease.value(), 1, lease.value(), nt_fs::FILE_READ_DATA))
+    }
+}
+
+mod routed_section_io {
+    pub fn read_retained(
+        file_id: u64,
+        device_id: u64,
+        file_context: u64,
+        offset: u64,
+        output: &mut [u8],
+    ) -> (u32, usize) {
+        if device_id != 1 || file_context != file_id {
+            return (nt_fs::STATUS_INVALID_HANDLE, 0);
+        }
+        for (index, byte) in output.iter_mut().enumerate() {
+            *byte = (file_id.wrapping_add(offset).wrapping_add(index as u64) & 0xff) as u8;
+        }
+        (0, output.len())
+    }
 }
 
 mod native_image_residency {
@@ -18,9 +78,14 @@ mod native_image_residency {
 #[path = "../../../components/ntos-executive/src/native_image_sections.rs"]
 mod native_image_sections;
 
+#[allow(dead_code)]
+#[path = "../../../components/ntos-executive/src/native_image_source_io.rs"]
+mod native_image_source_io;
+
 use native_image_sections::{NativeImageContents, NativeImageError, NativeImageSource, NativeImageStore};
 use nt_memory_manager::image_section::{ImageAreaId, ImageFlushError, ImageSectionPurge};
 use nt_memory_manager::{GenericSectionBacking, SectionFileIdentity, SectionMountIds};
+use nt_memory_manager::RoutedSectionLease;
 
 fn files() -> [SectionFileIdentity; 3] {
     let mut mounts = SectionMountIds::new();
@@ -64,7 +129,9 @@ fn image_bytes() -> Vec<u8> {
 fn snapshot(source: &NativeImageSource) -> &[u8] {
     match &source.contents {
         NativeImageContents::Snapshot(bytes) => bytes,
-        NativeImageContents::RetainedDisk => panic!("host fixture owns an explicit snapshot"),
+        NativeImageContents::RetainedDisk | NativeImageContents::RetainedRouted => {
+            panic!("host fixture owns an explicit snapshot")
+        }
     }
 }
 
@@ -81,6 +148,7 @@ fn publish(
         contents: NativeImageContents::Snapshot(bytes),
         local_file: None,
         image_path: Some(b"exact-opened-path".to_vec()),
+        registered_file: None,
         observation_target: None,
     });
     let id = store.publish(&mut reservation, &mut source).unwrap();
@@ -107,6 +175,7 @@ fn retained_disk_source_needs_its_file_pin_not_a_complete_payload_vec() {
         contents: NativeImageContents::RetainedDisk,
         local_file: None,
         image_path: Some(b"exact-opened-path".to_vec()),
+        registered_file: None,
         observation_target: None,
     });
     assert_eq!(store.publish(&mut reservation, &mut source), Err(NativeImageError::InvalidSource));
@@ -221,4 +290,74 @@ fn held_existing_reservation_blocks_purge_until_exact_abort_once() {
     assert!(next.needs_source());
     assert!(store.cached_source_for_reservation(&next, FILE_EXTENT).is_err());
     store.abort(&mut next).unwrap();
+}
+
+#[test]
+fn permanent_immutable_routed_images_keep_file_owners_without_heap_sized_snapshots() {
+    const IMAGE_COUNT: usize = 10;
+    const IMAGE_EXTENT: u64 = 8 * 1024 * 1024;
+    assert!(IMAGE_COUNT as u64 * IMAGE_EXTENT > 64 * 1024 * 1024);
+
+    let mount = SectionMountIds::new().allocate().unwrap();
+    let mut store = NativeImageStore::new();
+    let mut ids = Vec::new();
+    let mut file_ids = Vec::new();
+    let mut areas = Vec::new();
+    for index in 0..IMAGE_COUNT {
+        let file = SectionFileIdentity {
+            mount,
+            file_id: index as u64 + 1,
+        };
+        let lease = RoutedSectionLease::new(index as u64 + 1).unwrap();
+        let mut reservation = store.reserve(file).unwrap();
+        let mut source = Some(NativeImageSource {
+            backing: GenericSectionBacking::routed(lease, file, IMAGE_EXTENT),
+            layout: nt_pe_loader::PeLayout::parse(&image_bytes()).unwrap(),
+            contents: NativeImageContents::RetainedRouted,
+            local_file: None,
+            image_path: None,
+            registered_file: None,
+            observation_target: None,
+        });
+        let id = store.publish(&mut reservation, &mut source).unwrap();
+        assert!(source.is_none());
+        let area = store.area(id).unwrap();
+        hosted_routed_image_capture::bind(lease, area);
+        store.make_permanent(id).unwrap();
+        store.close_handle_group(id).unwrap();
+        let retained = store.source(id).unwrap();
+        assert!(retained.has_readable_image());
+        assert_eq!(retained.backing.routed_lease, Some(lease));
+        assert!(matches!(retained.contents, NativeImageContents::RetainedRouted));
+        let mut page_tail = [0u8; 17];
+        retained
+            .read_exact(&ExecNtHandler, area, IMAGE_EXTENT - 17, &mut page_tail)
+            .unwrap();
+        assert!(page_tail.iter().enumerate().all(|(byte, value)| {
+            *value == ((index as u64 + 1 + IMAGE_EXTENT - 17 + byte as u64) & 0xff) as u8
+        }));
+        ids.push(id);
+        file_ids.push(file);
+        areas.push(area);
+    }
+
+    // A permanent namespace reference keeps each exact File owner until withdrawal and purge.
+    let mut purge = Purge(0);
+    for file in &file_ids {
+        assert!(store.flush_for_write(*file, &mut purge).is_err());
+    }
+    assert_eq!(purge.0, 0);
+    for ((id, file), area) in ids.into_iter().zip(file_ids).zip(areas) {
+        store.withdraw_permanent(id).unwrap();
+        let retired = store.flush_for_write(file, &mut purge).unwrap().unwrap();
+        assert!(matches!(retired.contents, NativeImageContents::RetainedRouted));
+        assert_eq!(retired.backing.file, Some(file));
+        let lease = retired.backing.routed_lease.unwrap();
+        hosted_routed_image_capture::release(lease, area);
+        assert_eq!(
+            retired.read_exact(&ExecNtHandler, area, 0, &mut [0u8; 1]),
+            Err(nt_fs::STATUS_INVALID_HANDLE)
+        );
+    }
+    assert_eq!(purge.0, IMAGE_COUNT);
 }

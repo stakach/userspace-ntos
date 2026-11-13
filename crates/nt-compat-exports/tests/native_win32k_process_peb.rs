@@ -79,6 +79,24 @@ fn selection_and_resume_have_no_teb_peb_capture_or_compatibility_initializer() {
 }
 
 #[test]
+fn thread_callout_reads_the_published_process_peb() {
+    let file = source("win32k_subsystem.rs");
+    let seed = effects(&body(&file, "seed_win32k_callout_teb"));
+    assert!(seed.identifiers.iter().any(|name| name == "EPROCESS_PEB"),
+        "thread callout must use the canonical published EPROCESS.Peb");
+    assert!(seed.calls.iter().any(|name| name == "process_ctx_eprocess"),
+        "read EPROCESS only after selecting the exact process context");
+    assert!(!seed.identifiers.iter().any(|name| name == "process_params"),
+        "a private zeroed parameter block loses the client's DesktopInfo");
+    assert!(!seed.identifiers.iter().any(|name| name == "PEB_PROCESS_PARAMETERS_OFF"),
+        "the client PEB owns the real process-parameter pointer");
+    let resume = effects(&body(&file, "restore_current_context_for_user_callback_resume_inner"));
+    assert!(position(&resume, "seed_win32k_callout_teb")
+        > position(&resume, "active_win32k_callout_phase"),
+        "resume must verify the retained callout before dereferencing EPROCESS");
+}
+
+#[test]
 fn gui_context_records_cannot_construct_private_ps_object_substitutes() {
     let file = source("win32k_subsystem.rs");
     let mut all = Effects::default();
@@ -151,9 +169,10 @@ fn root_maps_exact_published_ps_objects_before_gui_request_publication() {
     assert!(position(&dispatch, "win32k_client_context_is_admitted")
         < position(&dispatch, "grant_win32k_client_ps_bodies"));
     assert!(position(&dispatch, "grant_win32k_client_ps_bodies")
-        < position(&dispatch, "clear_published_win32k_context"));
-    assert!(position(&dispatch, "grant_win32k_client_ps_bodies")
-        < position(&dispatch, "write_volatile"));
+        < position(&dispatch, "publish_initial_win32k_request"));
+    let publication = effects(&body(&file, "publish_initial_win32k_request"));
+    assert!(position(&publication, "clear_published_win32k_context")
+        < position(&publication, "write_volatile"));
     let backing = effects(&body(&source("ps_object_backing.rs"), "grant_published_body"));
     for required in ["thread_lifetime", "process_kernel_object", "thread_kernel_object"] {
         assert!(position(&backing, required) < position(&backing, "map_published_row"));

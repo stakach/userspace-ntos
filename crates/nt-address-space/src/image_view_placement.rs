@@ -1,7 +1,7 @@
 //! NT5 x64 image view placement values, independent of PE bytes and native mapping effects.
 
 use crate::{ALLOCATION_GRANULARITY, PAGE_SIZE, STATUS_CONFLICTING_ADDRESSES,
-    STATUS_INVALID_PARAMETER_4};
+    STATUS_INVALID_PARAMETER, STATUS_INVALID_PARAMETER_4};
 
 const IMAGE_NOT_AT_BASE: u32 = 0x4000_0003;
 
@@ -24,10 +24,43 @@ pub struct ImageViewPlacement {
     pub status: u32,
 }
 
-fn zero_bits_count(raw: u64) -> Result<u32, u32> {
+/// Decode the x64 NtMapViewOfSection ZeroBits argument shared by image and data views.
+/// Values below 32 are counts; values at or above 32 are address masks.
+pub fn x64_map_view_zero_bits_count(raw: u64) -> Result<u32, u32> {
     let count = if raw >= 32 { raw.leading_zeros() }
         else if raw != 0 { raw as u32 + 32 } else { 0 };
     if count > 53 { Err(STATUS_INVALID_PARAMETER_4) } else { Ok(count) }
+}
+
+/// `SECTION_INHERIT` is a 32-bit enum. The x64 syscall register's upper bits do not belong to
+/// the argument and must not decide whether ViewShare or ViewUnmap is valid.
+pub fn validate_x64_map_view_inherit_disposition(raw: u64) -> Result<(), u32> {
+    if matches!(raw as u32, 1 | 2) {
+        Ok(())
+    } else {
+        Err(STATUS_INVALID_PARAMETER)
+    }
+}
+
+#[cfg(test)]
+mod inherit_tests {
+    use super::*;
+
+    #[test]
+    fn map_inherit_decodes_only_the_ulong_argument() {
+        for disposition in [1, 2] {
+            assert_eq!(
+                validate_x64_map_view_inherit_disposition(0xdead_beef_0000_0000 | disposition),
+                Ok(())
+            );
+        }
+        for disposition in [0, 3] {
+            assert_eq!(
+                validate_x64_map_view_inherit_disposition(0xdead_beef_0000_0000 | disposition),
+                Err(STATUS_INVALID_PARAMETER)
+            );
+        }
+    }
 }
 
 /// `available` is an already serialized target VAD conflict query, not a physical capability or
@@ -36,7 +69,7 @@ pub fn plan_image_view_placement(
     request: ImageViewPlacementRequest,
     mut available: impl FnMut(u64, u64) -> bool,
 ) -> Result<ImageViewPlacement, u32> {
-    let zero_bits = zero_bits_count(request.zero_bits)?;
+    let zero_bits = x64_map_view_zero_bits_count(request.zero_bits)?;
     let size = request.image_size.checked_add(PAGE_SIZE - 1)
         .map(|size| size & !(PAGE_SIZE - 1)).filter(|size| *size != 0)
         .ok_or(STATUS_CONFLICTING_ADDRESSES)?;

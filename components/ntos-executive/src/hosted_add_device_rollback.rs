@@ -45,6 +45,7 @@ struct Owner {
     provider_registry_shared: Option<u64>,
     power_prepared: bool,
     dispatch_context_held: bool,
+    bank_ticket: Option<SuspendedActiveHostedIrpTransfer>,
 }
 
 static mut OWNERS: Vec<Owner> = Vec::new();
@@ -54,6 +55,18 @@ static mut NEXT_OWNER: u64 = 1;
 pub(super) struct Reservation(u64);
 
 pub(super) struct CreatedReservation(u64);
+
+/// A failed AddDevice's exact rollback row remains owned until its deferred native cleanup is
+/// terminal. The id is monotonic and is never reused; absence after abort began proves that
+/// `advance_inner` removed this row after its last projection and bank effect.
+#[must_use = "retain until this exact rollback is retired or blocked"]
+pub(super) struct AbortReceipt(Reservation);
+
+pub(super) enum AbortProgress {
+    Retired,
+    Retiring(AbortReceipt),
+    Blocked(AbortReceipt),
+}
 
 #[derive(Default)]
 pub(crate) struct Stats {
@@ -165,9 +178,26 @@ pub(super) unsafe fn reserve(
         provider_registry_shared: None,
         power_prepared: false,
         dispatch_context_held: false,
+        bank_ticket: None,
     });
     core::ptr::addr_of_mut!(NEXT_OWNER).write(next);
     Ok(Reservation(id))
+}
+
+/// Transfer the one atomic primary/provider page claim to the rollback owner before either
+/// projection or AddDevice enters native code. Deferred drain keeps the same exact ticket.
+pub(super) unsafe fn attach_bank_ticket(
+    reservation: &Reservation,
+    bank_ticket: SuspendedActiveHostedIrpTransfer,
+) -> Result<(), SuspendedActiveHostedIrpTransfer> {
+    let Some(row) = owners().iter_mut().find(|row| row.id == reservation.0) else {
+        return Err(bank_ticket);
+    };
+    if row.phase != Phase::Preparing || row.bank_ticket.is_some() {
+        return Err(bank_ticket);
+    }
+    row.bank_ticket = Some(bank_ticket);
+    Ok(())
 }
 
 pub(super) unsafe fn record_registry(
@@ -218,6 +248,68 @@ pub(super) unsafe fn begin_dispatch(reservation: &Reservation) {
     row.channel = Some(channel);
     row.phase = Phase::Dispatching;
     row.dispatch_context_held = true;
+}
+
+/// The provider's nested reverse callback may refer only to the PDO owned by
+/// the currently entered AddDevice attempt. This observation retains its exact
+/// registration generation; callers must keep their own alias owner afterward.
+pub(super) unsafe fn active_pdo_registration(
+    provider_instance: usize,
+    domain: HostedDomainIdentity,
+    address: u64,
+) -> Option<nt_io_manager::HostedDevicePointerRegistration> {
+    let row = owners().iter().find(|row| {
+        row.phase == Phase::Dispatching && row.dispatch_context_held
+            && row.instance == provider_instance && row.domain == domain
+            && row.pdo == address
+    })?;
+    let registration = row.pdo_registration?;
+    (registration.domain() == domain
+        && registration.address() == address
+        && registration.device_id().raw() == row.pdo_id
+        && io_manager_mut().hosted_device_pointer_registration(domain, address)
+            == Some(registration))
+        .then_some(registration)
+}
+
+/// Validate DxgKrnl's AddDevice out cell against an FDO created by this same
+/// retained attempt. The FDO publication keeps its allocation live while the
+/// provider is parked in the nested callback.
+pub(super) unsafe fn active_created_output(
+    provider_instance: usize,
+    domain: HostedDomainIdentity,
+    pdo: nt_io_manager::HostedDevicePointerRegistration,
+    address: u64,
+) -> Option<(u64, nt_io_manager::source_irp_auxiliary::SourcePoolAllocationIdentity,
+    nt_io_manager::HostedDevicePointerRegistration)> {
+    if active_pdo_registration(provider_instance, domain, pdo.address()) != Some(pdo) {
+        return None;
+    }
+    let inst = instance(provider_instance)?;
+    let row = owners().iter().find(|row| {
+        row.phase == Phase::Dispatching && row.instance == provider_instance
+            && row.domain == domain && row.pdo_registration == Some(pdo)
+    })?;
+    for created in &row.created {
+        let registration = created.registration;
+        if created.pointer_retired || created.destroyed || created.projection_retired
+            || io_manager_mut().hosted_device_pointer_registration(
+                domain, registration.address()) != Some(registration)
+        {
+            continue;
+        }
+        let Ok(allocation) = hosted_device_allocations::capture_allocation(
+            inst, registration.address()) else { continue; };
+        let Some(offset) = address.checked_sub(registration.address()) else { continue; };
+        if offset < WDM_X64_DEVICE_OBJECT_SIZE as u64
+            || offset.checked_add(8).is_none_or(|end| end > allocation.capacity)
+        {
+            continue;
+        }
+        let exec = component_pool_to_exec_va(inst.exec_pool_va, address, 8)?;
+        return Some((exec, allocation, registration));
+    }
+    None
 }
 
 pub(super) unsafe fn admit_mutation(
@@ -440,6 +532,30 @@ pub(super) unsafe fn commit(reservation: Reservation) {
     owners().swap_remove(index);
 }
 
+/// Finalize a typed AddDevice only when its exact shared-page claim can be retired. A refusal
+/// leaves the committed projection owner and the bank ticket together for a no-replay retry.
+pub(super) unsafe fn commit_banked(
+    reservation: Reservation,
+) -> Result<(), Reservation> {
+    let Some(index) = owners().iter().position(|owner| owner.id == reservation.0) else {
+        return Err(reservation);
+    };
+    if owners()[index].phase != Phase::Preparing || owners()[index].created_reserved != 0 {
+        return Err(reservation);
+    }
+    if let Some(ticket) = owners()[index].bank_ticket.take() {
+        match crate::driver_launch::hosted_add_device_continuation::retire_add_device_bank(ticket) {
+            Ok(()) => {}
+            Err((_, ticket)) => {
+                owners()[index].bank_ticket = Some(ticket);
+                return Err(reservation);
+            }
+        }
+    }
+    owners().swap_remove(index);
+    Ok(())
+}
+
 pub(super) unsafe fn block(reservation: Reservation, status: nt_status::NtStatus) {
     block_id(reservation.0, status);
 }
@@ -453,6 +569,43 @@ unsafe fn block_id(id: u64, status: nt_status::NtStatus) {
 pub(super) unsafe fn abort(reservation: Reservation) {
     owner(reservation.0).phase = Phase::Retiring;
     let _ = advance(reservation.0);
+}
+
+/// Start rollback once, retaining the exact row selector when cleanup must continue later.
+/// A blocked row keeps its physical bank and cannot authorize parent-stack teardown.
+pub(super) unsafe fn abort_owned(reservation: Reservation) -> AbortProgress {
+    let id = reservation.0;
+    let Some(row) = owners().iter_mut().find(|row| row.id == id) else {
+        return AbortProgress::Blocked(AbortReceipt(reservation));
+    };
+    if !matches!(row.phase, Phase::Preparing | Phase::Dispatching) {
+        return AbortProgress::Blocked(AbortReceipt(reservation));
+    }
+    row.phase = Phase::Retiring;
+    let _ = advance(id);
+    observe_abort(AbortReceipt(reservation))
+}
+
+/// Retry only a still-retiring row. Global rollback drain may have completed this exact id in
+/// the meantime; an absent row is terminal because no other path can reuse its reservation.
+pub(super) unsafe fn retry_abort_owned(receipt: AbortReceipt) -> AbortProgress {
+    let id = receipt.0.0;
+    let Some(row) = owners().iter().find(|row| row.id == id) else {
+        return AbortProgress::Retired;
+    };
+    if row.phase != Phase::Retiring {
+        return AbortProgress::Blocked(receipt);
+    }
+    let _ = advance(id);
+    observe_abort(receipt)
+}
+
+unsafe fn observe_abort(receipt: AbortReceipt) -> AbortProgress {
+    match owners().iter().find(|row| row.id == receipt.0.0).map(|row| row.phase) {
+        None => AbortProgress::Retired,
+        Some(Phase::Retiring) => AbortProgress::Retiring(receipt),
+        Some(_) => AbortProgress::Blocked(receipt),
+    }
 }
 
 unsafe fn advance(id: u64) -> Result<(), nt_status::NtStatus> {
@@ -529,7 +682,7 @@ unsafe fn advance_inner(id: u64) -> Result<(), nt_status::NtStatus> {
             return Err(nt_status::NtStatus::DEVICE_BUSY);
         }
         if !device.pointer_retired {
-            io_manager_mut().retire_hosted_device_pointer(device.registration)?;
+            hosted_device_allocations::retire_canonical_pointer(io_manager_mut(), device.registration)?;
             owner(id).created[index].pointer_retired = true;
         }
         if !device.destroyed {
@@ -549,7 +702,7 @@ unsafe fn advance_inner(id: u64) -> Result<(), nt_status::NtStatus> {
     }
     if let Some(registration) = owner(id).pdo_registration {
         if owner(id).pdo_created && !owner(id).pdo_canonical_retired {
-            io_manager_mut().retire_hosted_device_pointer(registration)?;
+            hosted_device_allocations::retire_canonical_pointer(io_manager_mut(), registration)?;
             owner(id).pdo_canonical_retired = true;
         }
     }
@@ -632,12 +785,25 @@ unsafe fn advance_inner(id: u64) -> Result<(), nt_status::NtStatus> {
     };
     if power_prepared {
         crate::power_manager::unregister_device(pdo_id);
+        owner(id).power_prepared = false;
     }
     if shared != 0 {
         clear_shared_registry_identity_at(shared);
+        owner(id).registry_shared = 0;
     }
     if let Some(shared) = provider_shared {
         clear_shared_registry_identity_at(shared);
+        owner(id).provider_registry_shared = None;
+    }
+    let ticket = owner(id).bank_ticket.take();
+    if let Some(ticket) = ticket {
+        match crate::driver_launch::hosted_add_device_continuation::retire_add_device_bank(ticket) {
+            Ok(()) => {}
+            Err((status, ticket)) => {
+                owner(id).bank_ticket = Some(ticket);
+                return Err(status);
+            }
+        }
     }
     if registry_identity != INVALID_HOSTED_REGISTRY_IDENTITY_ID {
         release_hosted_registry_identity(registry_identity);

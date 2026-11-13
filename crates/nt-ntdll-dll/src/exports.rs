@@ -70,23 +70,13 @@ const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005;
 const STATUS_DATATYPE_MISALIGNMENT: NtStatus = 0x8000_0002;
 const STATUS_SXS_SECTION_NOT_FOUND: NtStatus = 0xC015_0001;
 const STATUS_SXS_KEY_NOT_FOUND: NtStatus = 0xC015_0008;
-#[cfg(not(target_arch = "x86_64"))]
-const DBG_TRUE: NtStatus = 1;
-#[cfg(not(target_arch = "x86_64"))]
-const DEBUG_FILTER_COMPONENTS: usize = 256;
 const TEB_DBGSS_RESERVED1_OFFSET: u64 = 0x16A8;
 const TEB_EXCEPTION_CODE_OFFSET: u64 = 0x2C0;
 const KUSER_SHARED_DATA_VA: usize = 0x7FFE_0000;
-const KUSER_PROCESSOR_FEATURES_OFFSET: usize = 0x274;
-const KUSER_PROCESSOR_FEATURES_LEN: u32 = 64;
 
 #[cfg(not(target_arch = "x86_64"))]
-static DEBUG_FILTERS: [AtomicU32; DEBUG_FILTER_COMPONENTS] =
-    [const { AtomicU32::new(0) }; DEBUG_FILTER_COMPONENTS];
-#[cfg(not(target_arch = "x86_64"))]
-static DEBUG_FILTER_DEFAULT_MASK: AtomicU32 = AtomicU32::new(0);
-#[cfg(not(target_arch = "x86_64"))]
-static DEBUG_FILTER_WIN2000_MASK: AtomicU32 = AtomicU32::new(1);
+static HOST_DEBUG_FILTER_PAGE: nt_ntdll_layout::debug_filter::DebugFilterPage =
+    nt_ntdll_layout::debug_filter::DebugFilterPage::new();
 static RTL_UNHANDLED_EXCEPTION_FILTER: AtomicU64 = AtomicU64::new(0);
 static RTL_DLL_SHUTDOWN_IN_PROGRESS: AtomicU64 = AtomicU64::new(0);
 static RTL_PROCESS_COOKIE: nt_ntdll::rtl::encode::ProcessCookieCache =
@@ -238,17 +228,6 @@ static mut NLS_ANSI_DEFAULT_CHAR: u8 = b'?';
 static mut NLS_OEM_DEFAULT_CHAR: u8 = b'?';
 #[cfg(target_arch = "x86_64")]
 static mut NLS_UNICODE_DEFAULT_CHAR: u16 = b'?' as u16;
-
-#[cfg(not(target_arch = "x86_64"))]
-fn debug_filter_mask(component: u32) -> &'static AtomicU32 {
-    if component == u32::MAX {
-        &DEBUG_FILTER_WIN2000_MASK
-    } else if (component as usize) < DEBUG_FILTER_COMPONENTS {
-        &DEBUG_FILTERS[component as usize]
-    } else {
-        &DEBUG_FILTER_DEFAULT_MASK
-    }
-}
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn current_teb() -> u64 {
@@ -571,39 +550,21 @@ unsafe fn rtl_unicode_to_mb_n_dbcs(
         if to_mb.is_null() {
             return (STATUS_INVALID_PARAMETER, 0);
         }
-        let mut written = 0usize;
-        let mut consumed = 0usize;
-        let units = bytes_in_unicode as usize / 2;
-        let capacity = mb_size as usize;
-        while consumed < units && written < capacity {
-            let mut unit = core::ptr::read(unicode_str.add(consumed));
-            if upcase {
-                unit = nls_upcase_unit(unit);
-            }
-            let mb = if unit < 0x80 {
-                unit
-            } else {
-                core::ptr::read_unaligned(to_mb.add(unit as usize))
-            };
-            let high = (mb >> 8) as u8;
-            let low = (mb & 0xFF) as u8;
-            if high != 0 {
-                if capacity - written < 2 {
-                    break;
-                }
-                core::ptr::write(mb_str.add(written), high);
-                core::ptr::write(mb_str.add(written + 1), low);
-                written += 2;
-            } else {
-                core::ptr::write(mb_str.add(written), low);
-                written += 1;
-            }
-            consumed += 1;
-        }
+        let source = if bytes_in_unicode == 0 { &[] } else {
+            core::slice::from_raw_parts(unicode_str, bytes_in_unicode as usize / 2)
+        };
+        let output = if mb_size == 0 { &mut [] } else {
+            core::slice::from_raw_parts_mut(mb_str, mb_size as usize)
+        };
+        let table = core::slice::from_raw_parts(to_mb, 0x1_0000);
+        let Some(progress) = nt_nls::unicode_to_multibyte_dbcs_mapped_into(
+            source, table, output,
+            |unit| if upcase { nls_upcase_unit(unit) } else { unit },
+        ) else { return (STATUS_INVALID_PARAMETER, 0); };
         if !bytes_out.is_null() {
-            core::ptr::write(bytes_out, written as u32);
+            core::ptr::write(bytes_out, progress.bytes_written as u32);
         }
-        (STATUS_SUCCESS, consumed)
+        (STATUS_SUCCESS, progress.units_consumed)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -635,20 +596,12 @@ unsafe fn rtl_multibyte_to_unicode_size_dbcs(
         if lead_info.is_null() {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let mut src = 0usize;
-        let mut units = 0usize;
-        let len = byte_len as usize;
-        while src < len {
-            let byte = core::ptr::read(bytes.add(src));
-            src += 1;
-            if byte >= 0x80 && core::ptr::read_unaligned(lead_info.add(byte as usize)) != 0 {
-                if src < len {
-                    src += 1;
-                }
-            }
-            units += 1;
-        }
-        Ok((units * 2) as u32)
+        let source = if byte_len == 0 { &[] } else {
+            core::slice::from_raw_parts(bytes, byte_len as usize)
+        };
+        let leads = core::slice::from_raw_parts(lead_info, 256);
+        nt_nls::multibyte_to_unicode_size(source, Some(leads))
+            .ok_or(STATUS_INVALID_PARAMETER)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -673,20 +626,13 @@ unsafe fn rtl_unicode_to_multibyte_size_dbcs(
         if to_mb.is_null() {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let mut bytes = 0u32;
-        for i in 0..(bytes_in_unicode as usize / 2) {
-            let mut unit = core::ptr::read(unicode_str.add(i));
-            if upcase {
-                unit = nls_upcase_unit(unit);
-            }
-            let mb = if unit < 0x80 {
-                unit
-            } else {
-                core::ptr::read_unaligned(to_mb.add(unit as usize))
-            };
-            bytes = bytes.saturating_add(if (mb >> 8) != 0 { 2 } else { 1 });
-        }
-        Ok(bytes)
+        let source = if bytes_in_unicode == 0 { &[] } else {
+            core::slice::from_raw_parts(unicode_str, bytes_in_unicode as usize / 2)
+        };
+        let table = core::slice::from_raw_parts(to_mb, 0x1_0000);
+        nt_nls::unicode_to_multibyte_dbcs_size(source, table,
+            |unit| if upcase { nls_upcase_unit(unit) } else { unit })
+            .ok_or(STATUS_INVALID_PARAMETER)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -5544,7 +5490,7 @@ unsafe fn dbg_emit_variadic(format: *const u8, args: VaList<'_>) -> NtStatus {
 }
 
 fn dbg_print_filter_allows(component: u32, level: u32) -> bool {
-    if component == u32::MAX || level == nt_ntdll::dbg::level::ERROR {
+    if component == u32::MAX {
         return true;
     }
 
@@ -5875,9 +5821,9 @@ pub unsafe extern "system" fn md5_final(context: *mut nt_ntdll::crypto::Md5Conte
 /// `dst`/`src` valid for `n` bytes, non-overlapping.
 #[linkage = "weak"]
 #[export_name = "memcpy"]
-pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memcpy(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
     // SAFETY: caller contract (valid, non-overlapping, n bytes).
-    unsafe { core::ptr::copy_nonoverlapping(src, dst, n) };
+    unsafe { core::ptr::copy_nonoverlapping(src.cast::<u8>(), dst.cast::<u8>(), n) };
     dst
 }
 
@@ -5887,16 +5833,17 @@ pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut 
 /// `dst` valid for `n` bytes.
 #[linkage = "weak"]
 #[export_name = "memset"]
-pub unsafe extern "C" fn memset(dst: *mut u8, c: i32, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memset(dst: *mut c_void, c: i32, n: usize) -> *mut c_void {
     // SAFETY: caller contract (valid for n bytes).
-    unsafe { core::ptr::write_bytes(dst, c as u8, n) };
+    unsafe { core::ptr::write_bytes(dst.cast::<u8>(), c as u8, n) };
     dst
 }
 
-/// `wcslen(const wchar_t*) -> size_t`.
+/// `wcslen(const wchar_t*) -> size_t`. Weak (compiler-builtins-mem also provides it).
 ///
 /// # Safety
 /// `s` a NUL-terminated UTF-16 string.
+#[linkage = "weak"]
 #[export_name = "wcslen"]
 pub unsafe extern "C" fn wcslen(s: *const u16) -> usize {
     // SAFETY: caller contract.
@@ -6138,7 +6085,7 @@ fn printf_result(result: Result<usize, ()>) -> i32 {
     }
 }
 
-unsafe fn format_narrow_va(
+pub(crate) unsafe fn format_narrow_va(
     buffer: *mut u8,
     capacity: usize,
     format: *const u8,
@@ -6165,7 +6112,7 @@ unsafe fn format_narrow_va(
     printf_result(result)
 }
 
-unsafe fn format_wide_va(
+pub(crate) unsafe fn format_wide_va(
     buffer: *mut u16,
     capacity: usize,
     format: *const u16,
@@ -6207,6 +6154,17 @@ pub unsafe extern "C" fn snprintf(buf: *mut u8, count: usize, format: *const u8,
 /// NT5 non-conforming `swprintf(wchar_t*, const wchar_t*, ...)`.
 #[export_name = "swprintf"]
 pub unsafe extern "C" fn swprintf(buf: *mut u16, format: *const u16, args: ...) -> i32 {
+    unsafe { format_wide_va(buf, i32::MAX as usize, format, args) }
+}
+
+/// The legacy CRT spelling used by LiberNT's `smss.exe`. Like `swprintf`, this
+/// takes no destination size and returns the number of UTF-16 units written.
+#[export_name = "_swprintf"]
+pub unsafe extern "C" fn underscore_swprintf(
+    buf: *mut u16,
+    format: *const u16,
+    args: ...,
+) -> i32 {
     unsafe { format_wide_va(buf, i32::MAX as usize, format, args) }
 }
 
@@ -6423,6 +6381,7 @@ pub unsafe extern "system" fn rtl_create_heap(
     #[cfg(target_arch = "x86_64")]
     {
         const HEAP_NO_SERIALIZE: u32 = 0x1;
+        const HEAP_GROWABLE: u32 = 0x2;
         if flags & HEAP_NO_SERIALIZE != 0 && !lock.is_null() {
             return core::ptr::null_mut();
         }
@@ -6491,7 +6450,15 @@ pub unsafe extern "system" fn rtl_create_heap(
             }
             return core::ptr::null_mut();
         };
-        match crate::install_private_heap(heap, flags & HEAP_NO_SERIALIZE == 0, lock as u64) {
+        // A zero reserve is the growable default used by HeapCreate(0, 0, 0). An explicit
+        // HEAP_GROWABLE flag also permits owned peers beside a caller-supplied primary arena.
+        let growable = flags & HEAP_GROWABLE != 0 || (base.is_null() && reserve == 0);
+        match crate::install_private_heap(
+            heap,
+            flags & HEAP_NO_SERIALIZE == 0,
+            lock as u64,
+            growable,
+        ) {
             Ok(handle) => handle as *mut c_void,
             Err(heap) => {
                 let backing = heap.destroy();
@@ -6571,9 +6538,9 @@ pub unsafe extern "system" fn rtl_set_unhandled_exception_filter(filter: *mut c_
 /// `dst`/`src` valid for `n` bytes.
 #[linkage = "weak"]
 #[export_name = "memmove"]
-pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memmove(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
     // SAFETY: caller contract; copy is overlap-safe (memmove).
-    unsafe { core::ptr::copy(src, dst, n) };
+    unsafe { core::ptr::copy(src.cast::<u8>(), dst.cast::<u8>(), n) };
     dst
 }
 
@@ -8140,12 +8107,12 @@ pub unsafe extern "system" fn ldr_unload_dll(base_address: *mut c_void) -> NtSta
 /// Both valid for `n` bytes.
 #[linkage = "weak"]
 #[export_name = "memcmp"]
-pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+pub unsafe extern "C" fn memcmp(a: *const c_void, b: *const c_void, n: usize) -> i32 {
     // SAFETY: caller contract.
     let (sa, sb) = unsafe {
         (
-            core::slice::from_raw_parts(a, n),
-            core::slice::from_raw_parts(b, n),
+            core::slice::from_raw_parts(a.cast::<u8>(), n),
+            core::slice::from_raw_parts(b.cast::<u8>(), n),
         )
     };
     match nt_ntdll::crt::memcmp(sa, sb, n) {
@@ -8219,9 +8186,9 @@ pub unsafe extern "C" fn memicmp(a: *const u8, b: *const u8, n: usize) -> i32 {
 /// `s` a NUL-terminated byte string.
 #[linkage = "weak"]
 #[export_name = "strlen"]
-pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
+pub unsafe extern "C" fn strlen(s: *const core::ffi::c_char) -> usize {
     // SAFETY: caller contract.
-    unsafe { strlen_raw(s) }
+    unsafe { strlen_raw(s.cast::<u8>()) }
 }
 
 /// `strcmp(const char*, const char*) -> int`.
@@ -13615,11 +13582,11 @@ unsafe fn read_file_handle_bounded(
             if requested == 0 {
                 return Err(too_large_status);
             }
-            let old_length = contents.len();
-            contents
-                .try_reserve_exact(requested)
-                .map_err(|_| STATUS_NO_MEMORY)?;
-            contents.resize(old_length + requested, 0);
+            let old_length = nt_ntdll::rtl::activation::prepare_bounded_read_chunk(
+                &mut contents,
+                requested,
+            )
+            .map_err(|_| STATUS_NO_MEMORY)?;
             iosb = [0; 2];
             let byte_offset = i64::try_from(old_length).map_err(|_| STATUS_NO_MEMORY)?;
             let status = unsafe {
@@ -13694,6 +13661,61 @@ unsafe fn read_associated_manifest_file(nt_path: &[u16]) -> Result<Vec<u8>, NtSt
     };
     let _ = unsafe { boot_nt_close(handle) };
     result
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn read_activation_pe_manifest(
+    handle: u64,
+    resource_name: &nt_ntdll::rtl::pe_manifest::ManifestResourceName,
+    language: u16,
+) -> Result<Vec<u8>, NtStatus> {
+    let mut iosb = [0u64; 2];
+    let mut info = [0u8; 24]; // FILE_STANDARD_INFORMATION
+    let status = unsafe {
+        nt_ntdll::trap_stubs::nt_query_information_file(
+            handle,
+            &mut iosb as *mut [u64; 2] as u64,
+            info.as_mut_ptr() as u64,
+            info.len() as u64,
+            5, // FileStandardInformation
+        ) as NtStatus
+    };
+    if status != STATUS_SUCCESS {
+        return Err(status);
+    }
+    let file_size = u64::from_le_bytes(info[8..16].try_into().unwrap());
+    if file_size > nt_ntdll::rtl::activation::MAX_ACTIVATION_PE_BYTES as u64 {
+        return Err(STATUS_INVALID_IMAGE_FORMAT);
+    }
+    nt_ntdll::rtl::pe_manifest::extract_manifest_resource_from_reader(
+        file_size,
+        |offset, output| {
+            let byte_offset = i64::try_from(offset).map_err(|_| STATUS_INVALID_IMAGE_FORMAT)?;
+            let mut read_iosb = [0u64; 2];
+            let status = unsafe {
+                boot_nt_read_file(
+                    handle,
+                    &mut read_iosb,
+                    output.as_mut_ptr().cast(),
+                    output.len() as u32,
+                    &byte_offset,
+                )
+            };
+            if status == nt_ntdll::rtl::activation::STATUS_END_OF_FILE {
+                return Ok(0);
+            }
+            if status != STATUS_SUCCESS {
+                return Err(status);
+            }
+            let transferred = usize::try_from(read_iosb[1]).unwrap_or(usize::MAX);
+            if transferred > output.len() {
+                return Err(STATUS_RESOURCE_DATA_NOT_FOUND);
+            }
+            Ok(transferred)
+        },
+        resource_name,
+        language,
+    )
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -14493,21 +14515,15 @@ pub unsafe extern "system" fn rtl_create_activation_context(
                     Ok(handle) => handle,
                     Err(status) => return status,
                 };
-                let pe_contents = read_file_handle_bounded(
-                    pe_handle,
-                    nt_ntdll::rtl::activation::MAX_ACTIVATION_PE_BYTES,
-                    STATUS_INVALID_IMAGE_FORMAT,
-                );
-                let _ = boot_nt_close(pe_handle);
-                let primary = pe_contents.and_then(|contents| {
-                    let (resource_name, _) = resource_name?;
-                    let bytes = nt_ntdll::rtl::pe_manifest::extract_manifest_resource(
-                        &contents,
+                let primary = match resource_name {
+                    Ok((resource_name, _)) => read_activation_pe_manifest(
+                        pe_handle,
                         &resource_name,
                         descriptor.language_id,
-                    )?;
-                    copy_activation_manifest_bytes(bytes)
-                });
+                    ),
+                    Err(status) => Err(status),
+                };
+                let _ = boot_nt_close(pe_handle);
                 match primary {
                     Ok(manifest) => (
                         manifest,
@@ -22813,13 +22829,20 @@ pub unsafe extern "system" fn rtl_verify_version_info(
     rtl::status::verify_version_info(&have, &want, type_mask, condition_mask)
 }
 
-/// `RtlGetCurrentProcessorNumber() -> ULONG` — always CPU 0 (single-CPU boot).
+/// `RtlGetCurrentProcessorNumber() -> ULONG` forwards the current caller placement.
 ///
 /// # Safety
 /// Reads no memory.
 #[export_name = "RtlGetCurrentProcessorNumber"]
 pub unsafe extern "system" fn rtl_get_current_processor_number() -> u32 {
-    0
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { nt_ntdll::trap_stubs::nt_get_current_processor_number() as u32 }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        u32::MAX
+    }
 }
 
 /// `RtlGetCurrentProcessorNumberEx(PPROCESSOR_NUMBER)`.
@@ -22828,11 +22851,16 @@ pub unsafe extern "system" fn rtl_get_current_processor_number() -> u32 {
 /// `processor_number` may be null or point to a writable 4-byte `PROCESSOR_NUMBER`.
 #[export_name = "RtlGetCurrentProcessorNumberEx"]
 pub unsafe extern "system" fn rtl_get_current_processor_number_ex(processor_number: *mut c_void) {
-    if processor_number.is_null() {
-        return;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = unsafe {
+            nt_ntdll::trap_stubs::nt_get_current_processor_number_ex(processor_number as u64)
+        };
     }
-    // PROCESSOR_NUMBER = { USHORT Group; UCHAR Number; UCHAR Reserved }. Single-CPU boot => 0/0.
-    unsafe { core::ptr::write_unaligned(processor_number as *mut u32, 0) };
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = processor_number;
+    }
 }
 
 /// `RtlIsProcessorFeaturePresent(ULONG) -> BOOLEAN`.
@@ -22841,16 +22869,12 @@ pub unsafe extern "system" fn rtl_get_current_processor_number_ex(processor_numb
 /// Reads the mapped `KUSER_SHARED_DATA.ProcessorFeatures` byte array on target.
 #[export_name = "RtlIsProcessorFeaturePresent"]
 pub unsafe extern "system" fn rtl_is_processor_feature_present(processor_feature: u32) -> u8 {
-    if processor_feature >= KUSER_PROCESSOR_FEATURES_LEN {
-        return 0;
-    }
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        let byte = core::ptr::read_volatile(
-            (KUSER_SHARED_DATA_VA + KUSER_PROCESSOR_FEATURES_OFFSET + processor_feature as usize)
-                as *const u8,
-        );
-        u8::from(byte != 0)
+        u8::from(nt_ntdll_layout::kuser::mapped_processor_feature_present(
+            KUSER_SHARED_DATA_VA as *const u8,
+            processor_feature,
+        ))
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -23485,20 +23509,45 @@ pub unsafe extern "system" fn rtl_restore_context(
     }
 }
 
-/// `RtlExitUserThread(NTSTATUS Status)` — terminate the current thread. Route to the NtTerminateThread
-/// stub with the current-thread pseudo-handle (-2).
+/// `RtlExitUserThread(NTSTATUS Status)` — notify the process loader when this is the
+/// last thread, otherwise detach the thread and terminate it.
 ///
 /// # Safety
 /// Does not return.
 #[export_name = "RtlExitUserThread"]
 pub unsafe extern "system" fn rtl_exit_user_thread(status: NtStatus) {
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: forwards to NtTerminateThread(NtCurrentThread=-2, status); does not return.
+    // SAFETY: the current-thread query and terminal native calls use valid current
+    // process/thread pseudo-handles. Neither terminal call returns on success.
     unsafe {
-        let _ = ldr_shutdown_thread();
-        (*(current_teb() as *mut Teb)).free_stack_on_termination = 1;
-        nt_ntdll::trap_stubs::nt_terminate_thread((-2isize) as u64, status as u64) as NtStatus;
-        // Should not return; if it does, spin at a breakpoint.
+        const THREAD_AM_I_LAST_THREAD: u64 = 12;
+        let mut last_thread = 0u32;
+        nt_ntdll::user_exit::exit_user_thread(
+            status,
+            || {
+                let query_status = nt_ntdll::trap_stubs::nt_query_information_thread(
+                    (-2isize) as u64,
+                    THREAD_AM_I_LAST_THREAD,
+                    &mut last_thread as *mut u32 as u64,
+                    core::mem::size_of::<u32>() as u64,
+                    0,
+                ) as NtStatus;
+                if (query_status as i32) < 0 {
+                    Err(query_status)
+                } else {
+                    Ok(last_thread != 0)
+                }
+            },
+            |status| rtl_exit_user_process(status),
+            || {
+                let _ = ldr_shutdown_thread();
+            },
+            |status| {
+                (*(current_teb() as *mut Teb)).free_stack_on_termination = 1;
+                let _ = nt_ntdll::trap_stubs::nt_terminate_thread((-2isize) as u64, status as u64);
+            },
+        );
+        // A successful terminal service call never returns.
         core::arch::asm!("int3");
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -23509,8 +23558,8 @@ pub unsafe extern "system" fn rtl_exit_user_thread(status: NtStatus) {
 
 /// `RtlExitUserProcess(NTSTATUS Status) -> VOID`.
 ///
-/// Run process loader shutdown notifications, then terminate the current process through the native
-/// process service. This function does not return on success.
+/// Stop peer threads, run process loader shutdown notifications, then terminate
+/// the current process. This function does not return on success.
 ///
 /// # Safety
 /// Terminates the calling process.
@@ -23518,8 +23567,18 @@ pub unsafe extern "system" fn rtl_exit_user_thread(status: NtStatus) {
 pub unsafe extern "system" fn rtl_exit_user_process(status: NtStatus) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        let _ = ldr_shutdown_process();
-        nt_ntdll::trap_stubs::nt_terminate_process((-1isize) as u64, status as u64) as NtStatus;
+        nt_ntdll::user_exit::exit_user_process(
+            status,
+            |status| {
+                let _ = nt_ntdll::trap_stubs::nt_terminate_process(0, status as u64);
+            },
+            || {
+                let _ = ldr_shutdown_process();
+            },
+            |status| {
+                let _ = nt_ntdll::trap_stubs::nt_terminate_process((-1isize) as u64, status as u64);
+            },
+        );
         core::arch::asm!("int3");
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -24662,9 +24721,24 @@ zw_alias!(
     nt_access_check_by_type
 );
 zw_alias!(
+    zw_access_check_by_type_and_audit_alarm,
+    "ZwAccessCheckByTypeAndAuditAlarm",
+    nt_access_check_by_type_and_audit_alarm
+);
+zw_alias!(
     zw_access_check_by_type_result_list,
     "ZwAccessCheckByTypeResultList",
     nt_access_check_by_type_result_list
+);
+zw_alias!(
+    zw_access_check_by_type_result_list_and_audit_alarm,
+    "ZwAccessCheckByTypeResultListAndAuditAlarm",
+    nt_access_check_by_type_result_list_and_audit_alarm
+);
+zw_alias!(
+    zw_access_check_by_type_result_list_and_audit_alarm_by_handle,
+    "ZwAccessCheckByTypeResultListAndAuditAlarmByHandle",
+    nt_access_check_by_type_result_list_and_audit_alarm_by_handle
 );
 zw_alias!(zw_add_atom, "ZwAddAtom", nt_add_atom);
 zw_alias!(
@@ -25192,6 +25266,7 @@ zw_alias!(
     nt_remove_process_debug
 );
 zw_alias!(zw_replace_key, "ZwReplaceKey", nt_replace_key);
+zw_alias!(zw_rename_key, "ZwRenameKey", nt_rename_key);
 zw_alias!(zw_reply_port, "ZwReplyPort", nt_reply_port);
 zw_alias!(
     zw_reply_wait_receive_port,
@@ -25328,6 +25403,7 @@ zw_alias!(
     nt_set_thread_execution_state
 );
 zw_alias!(zw_set_timer, "ZwSetTimer", nt_set_timer);
+zw_alias!(zw_set_timer_resolution, "ZwSetTimerResolution", nt_set_timer_resolution);
 zw_alias!(zw_set_uuid_seed, "ZwSetUuidSeed", nt_set_uuid_seed);
 zw_alias!(zw_set_value_key, "ZwSetValueKey", nt_set_value_key);
 zw_alias!(
@@ -25359,6 +25435,7 @@ zw_alias!(
     nt_terminate_thread
 );
 zw_alias!(zw_test_alert, "ZwTestAlert", nt_test_alert);
+zw_alias!(zw_trace_event, "ZwTraceEvent", nt_trace_event);
 zw_alias!(zw_unload_driver, "ZwUnloadDriver", nt_unload_driver);
 zw_alias!(zw_unload_key, "ZwUnloadKey", nt_unload_key);
 zw_alias!(zw_unload_key2, "ZwUnloadKey2", nt_unload_key2);
@@ -25411,6 +25488,211 @@ zw_alias!(
     "ZwCreateKeyedEvent",
     nt_create_keyed_event
 );
+zw_alias!(
+    zw_alpc_accept_connect_port,
+    "ZwAlpcAcceptConnectPort",
+    nt_alpc_accept_connect_port
+);
+zw_alias!(zw_alpc_connect_port, "ZwAlpcConnectPort", nt_alpc_connect_port);
+zw_alias!(zw_alpc_create_port, "ZwAlpcCreatePort", nt_alpc_create_port);
+zw_alias!(
+    zw_alpc_send_wait_receive_port,
+    "ZwAlpcSendWaitReceivePort",
+    nt_alpc_send_wait_receive_port
+);
+zw_alias!(zw_cancel_io_file_ex, "ZwCancelIoFileEx", nt_cancel_io_file_ex);
+zw_alias!(zw_compare_objects, "ZwCompareObjects", nt_compare_objects);
+zw_alias!(zw_create_low_box_token, "ZwCreateLowBoxToken", nt_create_low_box_token);
+zw_alias!(zw_create_private_namespace, "ZwCreatePrivateNamespace", nt_create_private_namespace);
+zw_alias!(zw_create_user_process, "ZwCreateUserProcess", nt_create_user_process);
+zw_alias!(zw_delete_private_namespace, "ZwDeletePrivateNamespace", nt_delete_private_namespace);
+zw_alias!(zw_get_nls_section_ptr, "ZwGetNlsSectionPtr", nt_get_nls_section_ptr);
+zw_alias!(zw_open_private_namespace, "ZwOpenPrivateNamespace", nt_open_private_namespace);
+zw_alias!(zw_query_system_information_ex, "ZwQuerySystemInformationEx", nt_query_system_information_ex);
+zw_alias!(zw_remove_io_completion_ex, "ZwRemoveIoCompletionEx", nt_remove_io_completion_ex);
+zw_alias!(zw_set_information_virtual_memory, "ZwSetInformationVirtualMemory", nt_set_information_virtual_memory);
+zw_alias!(zw_trace_control, "ZwTraceControl", nt_trace_control);
+
+zw_alias!(zw_acquire_cmf_view_ownership, "ZwAcquireCMFViewOwnership", nt_acquire_cmf_view_ownership);
+zw_alias!(zw_add_boot_entry, "ZwAddBootEntry", nt_add_boot_entry);
+zw_alias!(zw_add_driver_entry, "ZwAddDriverEntry", nt_add_driver_entry);
+zw_alias!(zw_alert_multiple_thread_by_thread_id, "ZwAlertMultipleThreadByThreadId", nt_alert_multiple_thread_by_thread_id);
+zw_alias!(zw_alert_resume_thread, "ZwAlertResumeThread", nt_alert_resume_thread);
+zw_alias!(zw_alert_thread, "ZwAlertThread", nt_alert_thread);
+zw_alias!(zw_alert_thread_by_thread_id, "ZwAlertThreadByThreadId", nt_alert_thread_by_thread_id);
+zw_alias!(zw_allocate_reserve_object, "ZwAllocateReserveObject", nt_allocate_reserve_object);
+zw_alias!(zw_allocate_uuids, "ZwAllocateUuids", nt_allocate_uuids);
+zw_alias!(zw_allocate_virtual_memory_ex, "ZwAllocateVirtualMemoryEx", nt_allocate_virtual_memory_ex);
+zw_alias!(zw_alpc_cancel_message, "ZwAlpcCancelMessage", nt_alpc_cancel_message);
+zw_alias!(zw_alpc_connect_port_ex, "ZwAlpcConnectPortEx", nt_alpc_connect_port_ex);
+zw_alias!(zw_alpc_create_port_section, "ZwAlpcCreatePortSection", nt_alpc_create_port_section);
+zw_alias!(zw_alpc_create_resource_reserve, "ZwAlpcCreateResourceReserve", nt_alpc_create_resource_reserve);
+zw_alias!(zw_alpc_create_section_view, "ZwAlpcCreateSectionView", nt_alpc_create_section_view);
+zw_alias!(zw_alpc_create_security_context, "ZwAlpcCreateSecurityContext", nt_alpc_create_security_context);
+zw_alias!(zw_alpc_delete_port_section, "ZwAlpcDeletePortSection", nt_alpc_delete_port_section);
+zw_alias!(zw_alpc_delete_resource_reserve, "ZwAlpcDeleteResourceReserve", nt_alpc_delete_resource_reserve);
+zw_alias!(zw_alpc_delete_section_view, "ZwAlpcDeleteSectionView", nt_alpc_delete_section_view);
+zw_alias!(zw_alpc_delete_security_context, "ZwAlpcDeleteSecurityContext", nt_alpc_delete_security_context);
+zw_alias!(zw_alpc_disconnect_port, "ZwAlpcDisconnectPort", nt_alpc_disconnect_port);
+zw_alias!(zw_alpc_impersonate_client_container_of_port, "ZwAlpcImpersonateClientContainerOfPort", nt_alpc_impersonate_client_container_of_port);
+zw_alias!(zw_alpc_impersonate_client_of_port, "ZwAlpcImpersonateClientOfPort", nt_alpc_impersonate_client_of_port);
+zw_alias!(zw_alpc_open_sender_process, "ZwAlpcOpenSenderProcess", nt_alpc_open_sender_process);
+zw_alias!(zw_alpc_open_sender_thread, "ZwAlpcOpenSenderThread", nt_alpc_open_sender_thread);
+zw_alias!(zw_alpc_query_information, "ZwAlpcQueryInformation", nt_alpc_query_information);
+zw_alias!(zw_alpc_query_information_message, "ZwAlpcQueryInformationMessage", nt_alpc_query_information_message);
+zw_alias!(zw_alpc_revoke_security_context, "ZwAlpcRevokeSecurityContext", nt_alpc_revoke_security_context);
+zw_alias!(zw_alpc_set_information, "ZwAlpcSetInformation", nt_alpc_set_information);
+zw_alias!(zw_are_mapped_files_the_same, "ZwAreMappedFilesTheSame", nt_are_mapped_files_the_same);
+zw_alias!(zw_associate_wait_completion_packet, "ZwAssociateWaitCompletionPacket", nt_associate_wait_completion_packet);
+zw_alias!(zw_cancel_synchronous_io_file, "ZwCancelSynchronousIoFile", nt_cancel_synchronous_io_file);
+zw_alias!(zw_cancel_wait_completion_packet, "ZwCancelWaitCompletionPacket", nt_cancel_wait_completion_packet);
+zw_alias!(zw_commit_complete, "ZwCommitComplete", nt_commit_complete);
+zw_alias!(zw_commit_enlistment, "ZwCommitEnlistment", nt_commit_enlistment);
+zw_alias!(zw_commit_transaction, "ZwCommitTransaction", nt_commit_transaction);
+zw_alias!(zw_compact_keys, "ZwCompactKeys", nt_compact_keys);
+zw_alias!(zw_compare_tokens, "ZwCompareTokens", nt_compare_tokens);
+zw_alias!(zw_compress_key, "ZwCompressKey", nt_compress_key);
+zw_alias!(zw_continue_ex, "ZwContinueEx", nt_continue_ex);
+zw_alias!(zw_convert_between_auxiliary_counter_and_performance_counter, "ZwConvertBetweenAuxiliaryCounterAndPerformanceCounter", nt_convert_between_auxiliary_counter_and_performance_counter);
+zw_alias!(zw_create_enlistment, "ZwCreateEnlistment", nt_create_enlistment);
+zw_alias!(zw_create_event_pair, "ZwCreateEventPair", nt_create_event_pair);
+zw_alias!(zw_create_key_transacted, "ZwCreateKeyTransacted", nt_create_key_transacted);
+zw_alias!(zw_create_profile, "ZwCreateProfile", nt_create_profile);
+zw_alias!(zw_create_resource_manager, "ZwCreateResourceManager", nt_create_resource_manager);
+zw_alias!(zw_create_section_ex, "ZwCreateSectionEx", nt_create_section_ex);
+zw_alias!(zw_create_thread_ex, "ZwCreateThreadEx", nt_create_thread_ex);
+zw_alias!(zw_create_transaction, "ZwCreateTransaction", nt_create_transaction);
+zw_alias!(zw_create_transaction_manager, "ZwCreateTransactionManager", nt_create_transaction_manager);
+zw_alias!(zw_create_wait_completion_packet, "ZwCreateWaitCompletionPacket", nt_create_wait_completion_packet);
+zw_alias!(zw_create_waitable_port, "ZwCreateWaitablePort", nt_create_waitable_port);
+zw_alias!(zw_create_wnf_state_name, "ZwCreateWnfStateName", nt_create_wnf_state_name);
+zw_alias!(zw_create_worker_factory, "ZwCreateWorkerFactory", nt_create_worker_factory);
+zw_alias!(zw_delete_boot_entry, "ZwDeleteBootEntry", nt_delete_boot_entry);
+zw_alias!(zw_delete_driver_entry, "ZwDeleteDriverEntry", nt_delete_driver_entry);
+zw_alias!(zw_delete_file, "ZwDeleteFile", nt_delete_file);
+zw_alias!(zw_delete_wnf_state_data, "ZwDeleteWnfStateData", nt_delete_wnf_state_data);
+zw_alias!(zw_delete_wnf_state_name, "ZwDeleteWnfStateName", nt_delete_wnf_state_name);
+zw_alias!(zw_enumerate_boot_entries, "ZwEnumerateBootEntries", nt_enumerate_boot_entries);
+zw_alias!(zw_enumerate_driver_entries, "ZwEnumerateDriverEntries", nt_enumerate_driver_entries);
+zw_alias!(zw_enumerate_system_environment_values_ex, "ZwEnumerateSystemEnvironmentValuesEx", nt_enumerate_system_environment_values_ex);
+zw_alias!(zw_enumerate_transaction_object, "ZwEnumerateTransactionObject", nt_enumerate_transaction_object);
+zw_alias!(zw_extend_section, "ZwExtendSection", nt_extend_section);
+zw_alias!(zw_flush_buffers_file_ex, "ZwFlushBuffersFileEx", nt_flush_buffers_file_ex);
+zw_alias!(zw_flush_install_ui_language, "ZwFlushInstallUILanguage", nt_flush_install_ui_language);
+zw_alias!(zw_flush_process_write_buffers, "ZwFlushProcessWriteBuffers", nt_flush_process_write_buffers);
+zw_alias!(zw_flush_write_buffer, "ZwFlushWriteBuffer", nt_flush_write_buffer);
+zw_alias!(zw_freeze_registry, "ZwFreezeRegistry", nt_freeze_registry);
+zw_alias!(zw_freeze_transactions, "ZwFreezeTransactions", nt_freeze_transactions);
+zw_alias!(zw_get_current_processor_number, "ZwGetCurrentProcessorNumber", nt_get_current_processor_number);
+zw_alias!(zw_get_current_processor_number_ex, "ZwGetCurrentProcessorNumberEx", nt_get_current_processor_number_ex);
+zw_alias!(zw_get_mui_registry_info, "ZwGetMUIRegistryInfo", nt_get_mui_registry_info);
+zw_alias!(zw_get_next_process, "ZwGetNextProcess", nt_get_next_process);
+zw_alias!(zw_get_next_thread, "ZwGetNextThread", nt_get_next_thread);
+zw_alias!(zw_get_notification_resource_manager, "ZwGetNotificationResourceManager", nt_get_notification_resource_manager);
+zw_alias!(zw_initialize_nls_files, "ZwInitializeNlsFiles", nt_initialize_nls_files);
+zw_alias!(zw_is_ui_language_comitted, "ZwIsUILanguageComitted", nt_is_ui_language_comitted);
+zw_alias!(zw_lock_product_activation_keys, "ZwLockProductActivationKeys", nt_lock_product_activation_keys);
+zw_alias!(zw_lock_registry_key, "ZwLockRegistryKey", nt_lock_registry_key);
+zw_alias!(zw_map_cmf_module, "ZwMapCMFModule", nt_map_cmf_module);
+zw_alias!(zw_map_view_of_section_ex, "ZwMapViewOfSectionEx", nt_map_view_of_section_ex);
+zw_alias!(zw_modify_boot_entry, "ZwModifyBootEntry", nt_modify_boot_entry);
+zw_alias!(zw_modify_driver_entry, "ZwModifyDriverEntry", nt_modify_driver_entry);
+zw_alias!(zw_notify_change_directory_file_ex, "ZwNotifyChangeDirectoryFileEx", nt_notify_change_directory_file_ex);
+zw_alias!(zw_notify_change_multiple_keys, "ZwNotifyChangeMultipleKeys", nt_notify_change_multiple_keys);
+zw_alias!(zw_open_enlistment, "ZwOpenEnlistment", nt_open_enlistment);
+zw_alias!(zw_open_key_ex, "ZwOpenKeyEx", nt_open_key_ex);
+zw_alias!(zw_open_key_transacted, "ZwOpenKeyTransacted", nt_open_key_transacted);
+zw_alias!(zw_open_key_transacted_ex, "ZwOpenKeyTransactedEx", nt_open_key_transacted_ex);
+zw_alias!(zw_open_keyed_event, "ZwOpenKeyedEvent", nt_open_keyed_event);
+zw_alias!(zw_open_resource_manager, "ZwOpenResourceManager", nt_open_resource_manager);
+zw_alias!(zw_open_session, "ZwOpenSession", nt_open_session);
+zw_alias!(zw_open_transaction, "ZwOpenTransaction", nt_open_transaction);
+zw_alias!(zw_open_transaction_manager, "ZwOpenTransactionManager", nt_open_transaction_manager);
+zw_alias!(zw_pre_prepare_complete, "ZwPrePrepareComplete", nt_pre_prepare_complete);
+zw_alias!(zw_pre_prepare_enlistment, "ZwPrePrepareEnlistment", nt_pre_prepare_enlistment);
+zw_alias!(zw_prepare_complete, "ZwPrepareComplete", nt_prepare_complete);
+zw_alias!(zw_prepare_enlistment, "ZwPrepareEnlistment", nt_prepare_enlistment);
+zw_alias!(zw_propagation_complete, "ZwPropagationComplete", nt_propagation_complete);
+zw_alias!(zw_propagation_failed, "ZwPropagationFailed", nt_propagation_failed);
+zw_alias!(zw_query_boot_entry_order, "ZwQueryBootEntryOrder", nt_query_boot_entry_order);
+zw_alias!(zw_query_boot_options, "ZwQueryBootOptions", nt_query_boot_options);
+zw_alias!(zw_query_directory_file_ex, "ZwQueryDirectoryFileEx", nt_query_directory_file_ex);
+zw_alias!(zw_query_driver_entry_order, "ZwQueryDriverEntryOrder", nt_query_driver_entry_order);
+zw_alias!(zw_query_information_by_name, "ZwQueryInformationByName", nt_query_information_by_name);
+zw_alias!(zw_query_information_enlistment, "ZwQueryInformationEnlistment", nt_query_information_enlistment);
+zw_alias!(zw_query_information_port, "ZwQueryInformationPort", nt_query_information_port);
+zw_alias!(zw_query_information_resource_manager, "ZwQueryInformationResourceManager", nt_query_information_resource_manager);
+zw_alias!(zw_query_information_transaction, "ZwQueryInformationTransaction", nt_query_information_transaction);
+zw_alias!(zw_query_information_transaction_manager, "ZwQueryInformationTransactionManager", nt_query_information_transaction_manager);
+zw_alias!(zw_query_information_worker_factory, "ZwQueryInformationWorkerFactory", nt_query_information_worker_factory);
+zw_alias!(zw_query_interval_profile, "ZwQueryIntervalProfile", nt_query_interval_profile);
+zw_alias!(zw_query_license_value, "ZwQueryLicenseValue", nt_query_license_value);
+zw_alias!(zw_query_multiple_value_key, "ZwQueryMultipleValueKey", nt_query_multiple_value_key);
+zw_alias!(zw_query_open_sub_keys, "ZwQueryOpenSubKeys", nt_query_open_sub_keys);
+zw_alias!(zw_query_open_sub_keys_ex, "ZwQueryOpenSubKeysEx", nt_query_open_sub_keys_ex);
+zw_alias!(zw_query_port_information_process, "ZwQueryPortInformationProcess", nt_query_port_information_process);
+zw_alias!(zw_query_system_environment_value, "ZwQuerySystemEnvironmentValue", nt_query_system_environment_value);
+zw_alias!(zw_query_timer_resolution, "ZwQueryTimerResolution", nt_query_timer_resolution);
+zw_alias!(zw_query_wnf_state_data, "ZwQueryWnfStateData", nt_query_wnf_state_data);
+zw_alias!(zw_query_wnf_state_name_information, "ZwQueryWnfStateNameInformation", nt_query_wnf_state_name_information);
+zw_alias!(zw_queue_apc_thread_ex, "ZwQueueApcThreadEx", nt_queue_apc_thread_ex);
+zw_alias!(zw_queue_apc_thread_ex2, "ZwQueueApcThreadEx2", nt_queue_apc_thread_ex2);
+zw_alias!(zw_read_only_enlistment, "ZwReadOnlyEnlistment", nt_read_only_enlistment);
+zw_alias!(zw_read_request_data, "ZwReadRequestData", nt_read_request_data);
+zw_alias!(zw_recover_enlistment, "ZwRecoverEnlistment", nt_recover_enlistment);
+zw_alias!(zw_recover_resource_manager, "ZwRecoverResourceManager", nt_recover_resource_manager);
+zw_alias!(zw_recover_transaction_manager, "ZwRecoverTransactionManager", nt_recover_transaction_manager);
+zw_alias!(zw_register_protocol_address_information, "ZwRegisterProtocolAddressInformation", nt_register_protocol_address_information);
+zw_alias!(zw_release_cmf_view_ownership, "ZwReleaseCMFViewOwnership", nt_release_cmf_view_ownership);
+zw_alias!(zw_release_worker_factory_worker, "ZwReleaseWorkerFactoryWorker", nt_release_worker_factory_worker);
+zw_alias!(zw_rename_transaction_manager, "ZwRenameTransactionManager", nt_rename_transaction_manager);
+zw_alias!(zw_replace_partition_unit, "ZwReplacePartitionUnit", nt_replace_partition_unit);
+zw_alias!(zw_reply_wait_receive_port_ex, "ZwReplyWaitReceivePortEx", nt_reply_wait_receive_port_ex);
+zw_alias!(zw_reply_wait_reply_port, "ZwReplyWaitReplyPort", nt_reply_wait_reply_port);
+zw_alias!(zw_request_port, "ZwRequestPort", nt_request_port);
+zw_alias!(zw_rollback_complete, "ZwRollbackComplete", nt_rollback_complete);
+zw_alias!(zw_rollback_enlistment, "ZwRollbackEnlistment", nt_rollback_enlistment);
+zw_alias!(zw_rollback_transaction, "ZwRollbackTransaction", nt_rollback_transaction);
+zw_alias!(zw_rollforward_transaction_manager, "ZwRollforwardTransactionManager", nt_rollforward_transaction_manager);
+zw_alias!(zw_save_merged_keys, "ZwSaveMergedKeys", nt_save_merged_keys);
+zw_alias!(zw_set_boot_entry_order, "ZwSetBootEntryOrder", nt_set_boot_entry_order);
+zw_alias!(zw_set_boot_options, "ZwSetBootOptions", nt_set_boot_options);
+zw_alias!(zw_set_driver_entry_order, "ZwSetDriverEntryOrder", nt_set_driver_entry_order);
+zw_alias!(zw_set_event_boost_priority, "ZwSetEventBoostPriority", nt_set_event_boost_priority);
+zw_alias!(zw_set_high_event_pair, "ZwSetHighEventPair", nt_set_high_event_pair);
+zw_alias!(zw_set_high_wait_low_event_pair, "ZwSetHighWaitLowEventPair", nt_set_high_wait_low_event_pair);
+zw_alias!(zw_set_information_enlistment, "ZwSetInformationEnlistment", nt_set_information_enlistment);
+zw_alias!(zw_set_information_key, "ZwSetInformationKey", nt_set_information_key);
+zw_alias!(zw_set_information_resource_manager, "ZwSetInformationResourceManager", nt_set_information_resource_manager);
+zw_alias!(zw_set_information_transaction, "ZwSetInformationTransaction", nt_set_information_transaction);
+zw_alias!(zw_set_information_transaction_manager, "ZwSetInformationTransactionManager", nt_set_information_transaction_manager);
+zw_alias!(zw_set_information_worker_factory, "ZwSetInformationWorkerFactory", nt_set_information_worker_factory);
+zw_alias!(zw_set_interval_profile, "ZwSetIntervalProfile", nt_set_interval_profile);
+zw_alias!(zw_set_io_completion_ex, "ZwSetIoCompletionEx", nt_set_io_completion_ex);
+zw_alias!(zw_set_ldt_entries, "ZwSetLdtEntries", nt_set_ldt_entries);
+zw_alias!(zw_set_low_event_pair, "ZwSetLowEventPair", nt_set_low_event_pair);
+zw_alias!(zw_set_low_wait_high_event_pair, "ZwSetLowWaitHighEventPair", nt_set_low_wait_high_event_pair);
+zw_alias!(zw_set_system_environment_value, "ZwSetSystemEnvironmentValue", nt_set_system_environment_value);
+zw_alias!(zw_shutdown_worker_factory, "ZwShutdownWorkerFactory", nt_shutdown_worker_factory);
+zw_alias!(zw_single_phase_reject, "ZwSinglePhaseReject", nt_single_phase_reject);
+zw_alias!(zw_start_profile, "ZwStartProfile", nt_start_profile);
+zw_alias!(zw_stop_profile, "ZwStopProfile", nt_stop_profile);
+zw_alias!(zw_subscribe_wnf_state_change, "ZwSubscribeWnfStateChange", nt_subscribe_wnf_state_change);
+zw_alias!(zw_system_debug_control, "ZwSystemDebugControl", nt_system_debug_control);
+zw_alias!(zw_thaw_registry, "ZwThawRegistry", nt_thaw_registry);
+zw_alias!(zw_thaw_transactions, "ZwThawTransactions", nt_thaw_transactions);
+zw_alias!(zw_translate_file_path, "ZwTranslateFilePath", nt_translate_file_path);
+zw_alias!(zw_unmap_view_of_section_ex, "ZwUnmapViewOfSectionEx", nt_unmap_view_of_section_ex);
+zw_alias!(zw_unsubscribe_wnf_state_change, "ZwUnsubscribeWnfStateChange", nt_unsubscribe_wnf_state_change);
+zw_alias!(zw_update_wnf_state_data, "ZwUpdateWnfStateData", nt_update_wnf_state_data);
+zw_alias!(zw_vdm_control, "ZwVdmControl", nt_vdm_control);
+zw_alias!(zw_wait_for_alert_by_thread_id, "ZwWaitForAlertByThreadId", nt_wait_for_alert_by_thread_id);
+zw_alias!(zw_wait_for_multiple_objects32, "ZwWaitForMultipleObjects32", nt_wait_for_multiple_objects32);
+zw_alias!(zw_wait_for_work_via_worker_factory, "ZwWaitForWorkViaWorkerFactory", nt_wait_for_work_via_worker_factory);
+zw_alias!(zw_wait_high_event_pair, "ZwWaitHighEventPair", nt_wait_high_event_pair);
+zw_alias!(zw_wait_low_event_pair, "ZwWaitLowEventPair", nt_wait_low_event_pair);
+zw_alias!(zw_worker_factory_worker_ready, "ZwWorkerFactoryWorkerReady", nt_worker_factory_worker_ready);
+zw_alias!(zw_write_request_data, "ZwWriteRequestData", nt_write_request_data);
 
 // =================================================================================================
 // BATCH 4 — Rtl* string / convert family the Win32 stack imports.
@@ -27960,9 +28242,7 @@ pub unsafe extern "system" fn rtl_reset_rtl_translations(nls_table: *const c_voi
 
 #[cfg(not(target_arch = "x86_64"))]
 fn debug_filter_enabled(component: u32, level: u32) -> bool {
-    let win2000 = DEBUG_FILTER_WIN2000_MASK.load(Ordering::Relaxed);
-    let component_mask = debug_filter_mask(component).load(Ordering::Relaxed);
-    nt_ntdll::dbg::debug_filter_state(win2000, component_mask, level)
+    HOST_DEBUG_FILTER_PAGE.query(component, level).unwrap_or(false)
 }
 
 /// `DbgPrintEx(ULONG ComponentId, ULONG Level, PCSTR Format, ...) -> ULONG`. Applies the native
@@ -27994,27 +28274,31 @@ pub unsafe extern "C" fn dbg_print_return_control_c(format: *const u8, args: ...
 
 /// `DbgQueryDebugFilterState(ULONG ComponentId, ULONG Level) -> NTSTATUS/BOOLEAN`.
 ///
-/// ReactOS forwards this to `NtQueryDebugFilterState`, whose successful query returns
-/// `(NTSTATUS)TRUE` or `(NTSTATUS)FALSE`. On target this calls the generated Nt stub and lets the
-/// executive's debug-filter service decide.
+/// ReactOS returns `(NTSTATUS)TRUE` or `(NTSTATUS)FALSE`. The native guest reads
+/// the root-owned mask page installed before its initial thread starts. A bad
+/// page version falls back to the canonical `NtQueryDebugFilterState` service.
 ///
 /// # Safety
-/// Pure scalar ABI.
+/// Native process startup must install the read-only filter page before this
+/// export can execute; the scalar arguments themselves need no probing.
 #[export_name = "DbgQueryDebugFilterState"]
 pub unsafe extern "system" fn dbg_query_debug_filter_state(component: u32, level: u32) -> NtStatus {
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: forwards to the generated NtQueryDebugFilterState native stub.
-        return unsafe {
-            nt_ntdll::trap_stubs::nt_query_debug_filter_state(component as u64, level as u64) as NtStatus
+        // SAFETY: process startup maps this page read-only before ntdll executes.
+        let page = unsafe {
+            &*(nt_ntdll_layout::debug_filter::HOSTED_USER_VA
+                as *const nt_ntdll_layout::debug_filter::DebugFilterPage)
         };
+        if let Some(enabled) = page.query(component, level) {
+            return u32::from(enabled);
+        }
+        // SAFETY: an incompatible page requires the executive's canonical decision.
+        return unsafe { nt_ntdll::trap_stubs::nt_query_debug_filter_state(
+            component as u64, level as u64) as NtStatus };
     }
     #[cfg(not(target_arch = "x86_64"))]
-    if debug_filter_enabled(component, level) {
-        DBG_TRUE
-    } else {
-        STATUS_SUCCESS
-    }
+    { u32::from(debug_filter_enabled(component, level)) }
 }
 
 /// `DbgSetDebugFilterState(ULONG ComponentId, ULONG Level, BOOLEAN State) -> NTSTATUS`.
@@ -28036,14 +28320,10 @@ pub unsafe extern "system" fn dbg_set_debug_filter_state(
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let mask = nt_ntdll::dbg::debug_filter_level_mask(level);
-        let cell = debug_filter_mask(component);
-        if state != 0 {
-            cell.fetch_or(mask, Ordering::Relaxed);
-        } else {
-            cell.fetch_and(!mask, Ordering::Relaxed);
+        match HOST_DEBUG_FILTER_PAGE.set(component, level, state as u8 != 0, true) {
+            Ok(()) => STATUS_SUCCESS,
+            Err(_) => STATUS_UNSUCCESSFUL,
         }
-        STATUS_SUCCESS
     }
 }
 
@@ -28563,9 +28843,9 @@ pub unsafe extern "system" fn csr_get_process_id() -> *mut c_void {
 
 /// `CsrClientConnectToServer(PCWSTR ObjectDirectory, ULONG ServerId, PVOID ConnectionInfo,
 /// PULONG ConnectionInfoSize, PBOOLEAN ServerToServerCall) -> NTSTATUS`. Port of ReactOS
-/// `CsrpConnectToServer` (`subsystems/csr/csrlib/connect.c`): on target it issues the 9-arg
-/// `NtSecureConnectPort(\Windows\ApiPort)` (serviced by the generic LPC dispatcher) and
-/// copies the returned CSR section data into the PEB (`ReadOnlyStaticServerData` etc.), so kernel32's
+/// `CsrpConnectToServer` (`subsystems/csr/csrlib/connect.c`): on target it issues
+/// `NtAlpcConnectPort(\Windows\ApiPort)` with LiberNT's framed connect info and
+/// copies the accepted CSR section data into the PEB (`ReadOnlyStaticServerData` etc.), so kernel32's
 /// `DllMain` proceeds past `InitCommandLines()`. On the host (no syscalls) returns
 /// STATUS_NOT_IMPLEMENTED — never a fabricated connection.
 ///
@@ -28581,7 +28861,7 @@ pub unsafe extern "system" fn csr_client_connect_to_server(
 ) -> NtStatus {
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: on-target hosted-process; issues NtSecureConnectPort + fills the PEB CSR fields.
+        // SAFETY: on-target hosted-process; issues NtAlpcConnectPort + fills the PEB CSR fields.
         unsafe {
             crate::on_target::csr_client_connect_to_server(
                 object_directory,
@@ -28609,8 +28889,9 @@ pub unsafe extern "system" fn csr_client_connect_to_server(
 /// ApiNumber, ULONG RequestLength) -> NTSTATUS`.
 ///
 /// This is the real ntdll client-side half: fill the PORT_MESSAGE/CSR headers, translate an optional
-/// capture buffer to the CSR server view, issue `NtRequestWaitReplyPort(CsrApiPort, &Header,
-/// &Header)`, then translate captured pointers back and return `ApiMessage->Status`.
+/// capture buffer to the CSR server view, issue a synchronous
+/// `NtAlpcSendWaitReceivePort` with an in-place reply, then translate captured pointers back and
+/// return `ApiMessage->Status`.
 ///
 /// # Safety
 /// `request` a valid `CSR_API_MESSAGE*`; `capture` null or a valid capture buffer.
@@ -28647,8 +28928,8 @@ pub unsafe extern "system" fn csr_client_call_server(
             }
         }
 
-        // SAFETY: request is both the LPC request and reply buffer.
-        let transport_status = unsafe { crate::on_target::csr_request_wait_reply(request as u64) };
+        // SAFETY: request is both the ALPC request and reply buffer.
+        let transport_status = unsafe { crate::on_target::csr_alpc_sync_call(request as u64) };
 
         if !capture.is_null() {
             // SAFETY: restores the same raw capture buffer converted above.
@@ -28688,7 +28969,7 @@ pub unsafe extern "system" fn csr_client_call_server(
 }
 
 /// `CsrAllocateCaptureBuffer(ULONG ArgumentCount, ULONG BufferSize) -> PCSR_CAPTURE_BUFFER`.
-/// Allocates the real ReactOS CSR_CAPTURE_BUFFER layout from the process heap.
+/// Allocates the CSR_CAPTURE_BUFFER in the accepted shared CSR port view.
 ///
 /// # Safety
 /// Reads no memory.
@@ -28703,16 +28984,16 @@ pub unsafe extern "system" fn csr_allocate_capture_buffer(
     };
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: process heap allocation; zero-initialize the public buffer layout.
-        let p = unsafe { crate::process_heap_alloc(size) };
+        let heap = unsafe { crate::on_target::csr_port_heap() };
+        if heap == 0 { return core::ptr::null_mut(); }
+        let p = unsafe { rtl_allocate_heap(heap as *mut c_void, 0x8, size) };
         if p.is_null() {
             return core::ptr::null_mut();
         }
         unsafe {
-            core::ptr::write_bytes(p, 0, size);
-            nt_ntdll::csr::init_raw_capture_buffer(p, size, argument_count);
+            nt_ntdll::csr::init_raw_capture_buffer(p as *mut u8, size, argument_count);
         }
-        p as *mut c_void
+        p
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -28730,9 +29011,9 @@ pub unsafe extern "system" fn csr_free_capture_buffer(capture_buffer: *mut c_voi
         return;
     }
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: buffer was allocated from the process heap by CsrAllocateCaptureBuffer.
     unsafe {
-        crate::process_heap_free(capture_buffer as *mut u8);
+        let heap = crate::on_target::csr_port_heap();
+        if heap != 0 { let _ = rtl_free_heap(heap as *mut c_void, 0, capture_buffer); }
     }
 }
 
@@ -28820,17 +29101,17 @@ pub unsafe extern "system" fn csr_capture_message_multi_unicode_strings_in_place
         };
         #[cfg(target_arch = "x86_64")]
         {
-            // SAFETY: process heap allocation; zero-initialize before CSR header setup.
-            let allocated = unsafe { crate::process_heap_alloc(total_size) };
+            let heap = unsafe { crate::on_target::csr_port_heap() };
+            if heap == 0 { return STATUS_NO_MEMORY; }
+            let allocated = unsafe { rtl_allocate_heap(heap as *mut c_void, 0x8, total_size) };
             if allocated.is_null() {
                 return STATUS_NO_MEMORY;
             }
             unsafe {
-                core::ptr::write_bytes(allocated, 0, total_size);
-                nt_ntdll::csr::init_raw_capture_buffer(allocated, total_size, strings_count);
-                *capture_buffer = allocated as *mut c_void;
+                nt_ntdll::csr::init_raw_capture_buffer(allocated as *mut u8, total_size, strings_count);
+                *capture_buffer = allocated;
             }
-            capture = allocated;
+            capture = allocated as *mut u8;
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -29614,416 +29895,420 @@ pub unsafe extern "C" fn export_anchor() {
     // Each `... as usize` is a runtime address-of that references the symbol, forcing retention.
     #[cfg(target_arch = "x86_64")]
     let anchors_seh: &[usize] = &[
-        crate::seh::rtl_walk_frame_chain as usize,
-        crate::seh::rtl_get_callers_address as usize,
+        crate::seh::rtl_walk_frame_chain as *const () as usize,
+        crate::seh::rtl_get_callers_address as *const () as usize,
     ];
     #[cfg(target_arch = "x86_64")]
     core::hint::black_box(anchors_seh);
     let anchors: &[usize] = &[
-        rtl_init_unicode_string as usize,
-        rtl_init_ansi_string as usize,
-        rtl_upcase_unicode_char as usize,
-        rtl_downcase_unicode_char as usize,
-        rtl_compare_unicode_string as usize,
-        rtl_equal_unicode_string as usize,
-        rtl_prefix_unicode_string as usize,
-        rtl_append_unicode_to_string as usize,
-        rtl_append_unicode_string_to_string as usize,
-        rtl_unicode_string_to_integer as usize,
-        rtl_allocate_heap as usize,
-        rtl_free_heap as usize,
-        rtl_create_tag_heap as usize,
-        rtl_free_unicode_string as usize,
-        rtl_create_unicode_string as usize,
-        rtl_ansi_string_to_unicode_string as usize,
-        rtl_unicode_string_to_ansi_string as usize,
-        rtl_initialize_critical_section as usize,
-        rtl_enter_critical_section as usize,
-        rtl_leave_critical_section as usize,
-        rtl_initialize_srw_lock as usize,
-        rtl_acquire_srw_lock_exclusive as usize,
-        rtl_acquire_srw_lock_shared as usize,
-        rtl_release_srw_lock_exclusive as usize,
-        rtl_release_srw_lock_shared as usize,
-        rtl_try_acquire_srw_lock_exclusive as usize,
-        rtl_try_acquire_srw_lock_shared as usize,
-        rtl_initialize_condition_variable as usize,
-        rtl_wake_condition_variable as usize,
-        rtl_wake_all_condition_variable as usize,
-        rtl_sleep_condition_variable_cs as usize,
-        rtl_sleep_condition_variable_srw as usize,
-        rtl_run_once_initialize as usize,
-        rtl_run_once_begin_initialize as usize,
-        rtl_run_once_complete as usize,
-        rtl_run_once_execute_once as usize,
-        rtl_get_critical_section_recursion_count as usize,
-        rtl_is_critical_section_locked as usize,
-        rtl_is_critical_section_locked_by_thread as usize,
-        rtl_length_sid as usize,
-        rtl_create_security_descriptor as usize,
-        rtl_set_dacl_security_descriptor as usize,
-        rtl_create_acl as usize,
-        rtl_get_ace as usize,
-        rtl_find_ace_by_type as usize,
-        rtl_add_access_allowed_ace as usize,
-        rtl_allocate_and_initialize_sid as usize,
-        rtl_adjust_privilege as usize,
-        rtl_normalize_process_params as usize,
-        rtl_denormalize_process_params as usize,
-        rtl_create_process_parameters as usize,
-        rtl_create_process_parameters_ex as usize,
-        rtl_destroy_process_parameters as usize,
-        rtl_create_environment as usize,
-        rtl_set_environment_variable as usize,
-        rtl_query_environment_variable_u as usize,
-        rtl_dos_path_name_to_nt_path_name_u as usize,
-        rtl_dos_path_name_to_nt_path_name_u_with_status as usize,
-        rtl_does_file_exists_u as usize,
-        rtl_dos_search_path_u as usize,
-        rtl_query_registry_values as usize,
-        rtl_check_registry_key as usize,
-        rtl_create_registry_key as usize,
-        rtl_delete_registry_value as usize,
-        rtl_write_registry_value as usize,
-        rtl_set_process_is_critical as usize,
-        rtl_set_thread_is_critical as usize,
-        rtl_create_boot_status_data_file as usize,
-        rtl_get_set_boot_status_data as usize,
-        rtl_lock_boot_status_data as usize,
-        rtl_unlock_boot_status_data as usize,
-        rtl_create_user_process as usize,
-        rtl_create_user_thread as usize,
-        rtl_create_user_stack as usize,
-        rtl_free_user_stack as usize,
-        rtl_assert as usize,
-        ldr_query_image_file_execution_options as usize,
-        ldr_query_image_file_execution_options_ex as usize,
-        ldr_verify_image_matches_checksum as usize,
-        ldr_verify_image_matches_checksum_ex as usize,
-        ldr_get_failure_data as usize,
-        ldr_process_initialization_complete as usize,
-        ldr_query_module_service_tags as usize,
-        ldr_set_mui_cache_type as usize,
-        ldr_initialize_thunk as usize,
-        dbg_print as usize,
-        dbg_break_point as usize,
-        dbg_user_break_point as usize,
-        rtl_application_verifier_stop as usize,
-        a_sha_init as usize,
-        a_sha_update as usize,
-        a_sha_final as usize,
-        md4_init as usize,
-        md4_update as usize,
-        md4_final as usize,
-        md5_init as usize,
-        md5_update as usize,
-        md5_final as usize,
-        memcpy as usize,
-        memset as usize,
-        wcslen as usize,
-        wcstombs as usize,
-        mbstowcs as usize,
-        wcscpy as usize,
-        wcsstr as usize,
-        wcsicmp as usize,
-        wcsupr as usize,
-        stricmp as usize,
-        sprintf as usize,
-        snprintf as usize,
-        swprintf as usize,
-        vsprintf as usize,
-        vsnprintf as usize,
-        vsnwprintf as usize,
-        vscwprintf as usize,
-        c_specific_handler as usize,
+        rtl_init_unicode_string as *const () as usize,
+        rtl_init_ansi_string as *const () as usize,
+        rtl_upcase_unicode_char as *const () as usize,
+        rtl_downcase_unicode_char as *const () as usize,
+        rtl_compare_unicode_string as *const () as usize,
+        rtl_equal_unicode_string as *const () as usize,
+        rtl_prefix_unicode_string as *const () as usize,
+        rtl_append_unicode_to_string as *const () as usize,
+        rtl_append_unicode_string_to_string as *const () as usize,
+        rtl_unicode_string_to_integer as *const () as usize,
+        rtl_allocate_heap as *const () as usize,
+        rtl_free_heap as *const () as usize,
+        rtl_create_tag_heap as *const () as usize,
+        rtl_free_unicode_string as *const () as usize,
+        rtl_create_unicode_string as *const () as usize,
+        rtl_ansi_string_to_unicode_string as *const () as usize,
+        rtl_unicode_string_to_ansi_string as *const () as usize,
+        rtl_initialize_critical_section as *const () as usize,
+        rtl_enter_critical_section as *const () as usize,
+        rtl_leave_critical_section as *const () as usize,
+        rtl_initialize_srw_lock as *const () as usize,
+        rtl_acquire_srw_lock_exclusive as *const () as usize,
+        rtl_acquire_srw_lock_shared as *const () as usize,
+        rtl_release_srw_lock_exclusive as *const () as usize,
+        rtl_release_srw_lock_shared as *const () as usize,
+        rtl_try_acquire_srw_lock_exclusive as *const () as usize,
+        rtl_try_acquire_srw_lock_shared as *const () as usize,
+        rtl_initialize_condition_variable as *const () as usize,
+        rtl_wake_condition_variable as *const () as usize,
+        rtl_wake_all_condition_variable as *const () as usize,
+        rtl_sleep_condition_variable_cs as *const () as usize,
+        rtl_sleep_condition_variable_srw as *const () as usize,
+        rtl_run_once_initialize as *const () as usize,
+        rtl_run_once_begin_initialize as *const () as usize,
+        rtl_run_once_complete as *const () as usize,
+        rtl_run_once_execute_once as *const () as usize,
+        rtl_get_critical_section_recursion_count as *const () as usize,
+        rtl_is_critical_section_locked as *const () as usize,
+        rtl_is_critical_section_locked_by_thread as *const () as usize,
+        rtl_length_sid as *const () as usize,
+        rtl_create_security_descriptor as *const () as usize,
+        rtl_set_dacl_security_descriptor as *const () as usize,
+        rtl_create_acl as *const () as usize,
+        rtl_get_ace as *const () as usize,
+        rtl_find_ace_by_type as *const () as usize,
+        rtl_add_access_allowed_ace as *const () as usize,
+        rtl_allocate_and_initialize_sid as *const () as usize,
+        rtl_adjust_privilege as *const () as usize,
+        rtl_normalize_process_params as *const () as usize,
+        rtl_denormalize_process_params as *const () as usize,
+        rtl_create_process_parameters as *const () as usize,
+        rtl_create_process_parameters_ex as *const () as usize,
+        rtl_destroy_process_parameters as *const () as usize,
+        rtl_create_environment as *const () as usize,
+        rtl_set_environment_variable as *const () as usize,
+        rtl_query_environment_variable_u as *const () as usize,
+        rtl_dos_path_name_to_nt_path_name_u as *const () as usize,
+        rtl_dos_path_name_to_nt_path_name_u_with_status as *const () as usize,
+        rtl_does_file_exists_u as *const () as usize,
+        rtl_dos_search_path_u as *const () as usize,
+        rtl_query_registry_values as *const () as usize,
+        rtl_check_registry_key as *const () as usize,
+        rtl_create_registry_key as *const () as usize,
+        rtl_delete_registry_value as *const () as usize,
+        rtl_write_registry_value as *const () as usize,
+        rtl_set_process_is_critical as *const () as usize,
+        rtl_set_thread_is_critical as *const () as usize,
+        rtl_create_boot_status_data_file as *const () as usize,
+        rtl_get_set_boot_status_data as *const () as usize,
+        rtl_lock_boot_status_data as *const () as usize,
+        rtl_unlock_boot_status_data as *const () as usize,
+        rtl_create_user_process as *const () as usize,
+        rtl_create_user_thread as *const () as usize,
+        rtl_create_user_stack as *const () as usize,
+        rtl_free_user_stack as *const () as usize,
+        rtl_assert as *const () as usize,
+        ldr_query_image_file_execution_options as *const () as usize,
+        ldr_query_image_file_execution_options_ex as *const () as usize,
+        ldr_verify_image_matches_checksum as *const () as usize,
+        ldr_verify_image_matches_checksum_ex as *const () as usize,
+        ldr_get_failure_data as *const () as usize,
+        ldr_process_initialization_complete as *const () as usize,
+        ldr_query_module_service_tags as *const () as usize,
+        ldr_set_mui_cache_type as *const () as usize,
+        ldr_initialize_thunk as *const () as usize,
+        dbg_print as *const () as usize,
+        dbg_break_point as *const () as usize,
+        dbg_user_break_point as *const () as usize,
+        rtl_application_verifier_stop as *const () as usize,
+        a_sha_init as *const () as usize,
+        a_sha_update as *const () as usize,
+        a_sha_final as *const () as usize,
+        md4_init as *const () as usize,
+        md4_update as *const () as usize,
+        md4_final as *const () as usize,
+        md5_init as *const () as usize,
+        md5_update as *const () as usize,
+        md5_final as *const () as usize,
+        memcpy as *const () as usize,
+        memset as *const () as usize,
+        wcslen as *const () as usize,
+        wcstombs as *const () as usize,
+        mbstowcs as *const () as usize,
+        wcscpy as *const () as usize,
+        wcsstr as *const () as usize,
+        wcsicmp as *const () as usize,
+        wcsupr as *const () as usize,
+        stricmp as *const () as usize,
+        sprintf as *const () as usize,
+        snprintf as *const () as usize,
+        swprintf as *const () as usize,
+        underscore_swprintf as *const () as usize,
+        vsprintf as *const () as usize,
+        vsnprintf as *const () as usize,
+        vsnwprintf as *const () as usize,
+        vscwprintf as *const () as usize,
+        c_specific_handler as *const () as usize,
         // BATCH 2 — csrsrv's 12 ntdll imports.
-        rtl_free_sid as usize,
-        rtl_get_dacl_security_descriptor as usize,
-        rtl_char_to_integer as usize,
-        rtl_create_heap as usize,
-        rtl_unhandled_exception_filter as usize,
+        rtl_free_sid as *const () as usize,
+        rtl_get_dacl_security_descriptor as *const () as usize,
+        rtl_char_to_integer as *const () as usize,
+        rtl_create_heap as *const () as usize,
+        rtl_unhandled_exception_filter as *const () as usize,
         rtl_unhandled_exception_filter2 as *const () as usize,
-        rtl_set_unhandled_exception_filter as usize,
-        memmove as usize,
-        rtl_copy_memory as usize,
-        strchr as usize,
-        strncpy as usize,
-        ldr_find_entry_for_address as usize,
-        ldr_query_process_module_information as usize,
-        ldr_load_dll as usize,
-        ldr_get_dll_handle as usize,
-        ldr_get_procedure_address as usize,
-        ldr_get_procedure_address_ex as usize,
-        ldr_unload_dll as usize,
+        rtl_set_unhandled_exception_filter as *const () as usize,
+        memmove as *const () as usize,
+        rtl_copy_memory as *const () as usize,
+        strchr as *const () as usize,
+        strncpy as *const () as usize,
+        ldr_find_entry_for_address as *const () as usize,
+        ldr_query_process_module_information as *const () as usize,
+        ldr_load_dll as *const () as usize,
+        ldr_get_dll_handle as *const () as usize,
+        ldr_get_procedure_address as *const () as usize,
+        ldr_get_procedure_address_ex as *const () as usize,
+        ldr_unload_dll as *const () as usize,
         // BATCH 2 ckpt 2 — basesrv's 11 ntdll imports.
-        rtl_copy_luid as usize,
-        rtl_copy_luid_and_attributes_array as usize,
-        rtl_equal_luid as usize,
-        rtl_run_decode_unicode_string as usize,
-        rtl_run_encode_unicode_string as usize,
-        rtl_init_string as usize,
-        rtl_delete_critical_section as usize,
-        rtl_initialize_critical_section_and_spin_count as usize,
-        rtl_initialize_critical_section_ex as usize,
-        rtl_reallocate_heap as usize,
-        rtl_expand_environment_strings_u as usize,
-        rtl_open_current_user as usize,
-        rtl_format_current_user_key_path as usize,
-        snwprintf as usize,
-        wcsncpy as usize,
-        wcscat as usize,
-        wcsnicmp as usize,
+        rtl_copy_luid as *const () as usize,
+        rtl_copy_luid_and_attributes_array as *const () as usize,
+        rtl_equal_luid as *const () as usize,
+        rtl_run_decode_unicode_string as *const () as usize,
+        rtl_run_encode_unicode_string as *const () as usize,
+        rtl_init_string as *const () as usize,
+        rtl_delete_critical_section as *const () as usize,
+        rtl_initialize_critical_section_and_spin_count as *const () as usize,
+        rtl_initialize_critical_section_ex as *const () as usize,
+        rtl_reallocate_heap as *const () as usize,
+        rtl_expand_environment_strings_u as *const () as usize,
+        rtl_open_current_user as *const () as usize,
+        rtl_format_current_user_key_path as *const () as usize,
+        snwprintf as *const () as usize,
+        wcsncpy as *const () as usize,
+        wcscat as *const () as usize,
+        wcsnicmp as *const () as usize,
         // BATCH 3 — the Win32 last-error pair (kernel32!GetLastError/SetLastError forward here).
-        rtl_get_last_win32_error as usize,
-        rtl_set_last_win32_error as usize,
+        rtl_get_last_win32_error as *const () as usize,
+        rtl_set_last_win32_error as *const () as usize,
         // BATCH 3 ckpt 2 — kernel32 early-init PEB-lock + global-flags + status-to-dos.
-        rtl_acquire_peb_lock as usize,
-        rtl_try_acquire_peb_lock as usize,
-        rtl_release_peb_lock as usize,
-        rtl_fls_alloc as usize,
-        rtl_fls_free as usize,
-        rtl_fls_get_value as usize,
-        rtl_fls_set_value as usize,
-        rtl_process_fls_data as usize,
-        rtl_get_current_peb as usize,
-        nt_current_teb as usize,
-        rtl_dll_shutdown_in_progress as usize,
-        rtl_get_nt_global_flags as usize,
-        rtl_nt_status_to_dos_error as usize,
-        rtl_nt_status_to_dos_error_no_teb as usize,
+        rtl_acquire_peb_lock as *const () as usize,
+        rtl_try_acquire_peb_lock as *const () as usize,
+        rtl_release_peb_lock as *const () as usize,
+        rtl_fls_alloc as *const () as usize,
+        rtl_fls_free as *const () as usize,
+        rtl_fls_get_value as *const () as usize,
+        rtl_fls_set_value as *const () as usize,
+        rtl_process_fls_data as *const () as usize,
+        rtl_get_current_peb as *const () as usize,
+        nt_current_teb as *const () as usize,
+        rtl_dll_shutdown_in_progress as *const () as usize,
+        rtl_get_nt_global_flags as *const () as usize,
+        rtl_nt_status_to_dos_error as *const () as usize,
+        rtl_nt_status_to_dos_error_no_teb as *const () as usize,
         // BATCH 4 — CRT surface the Win32 stack imports from ntdll.
-        memcmp as usize,
-        memchr as usize,
-        memccpy as usize,
-        memicmp as usize,
-        strlen as usize,
-        strcmp as usize,
-        strcmpi as usize,
-        strncmp as usize,
-        strcpy as usize,
-        strcat as usize,
-        strncat as usize,
-        strrchr as usize,
-        strstr as usize,
-        strcspn as usize,
-        strspn as usize,
-        strpbrk as usize,
-        strnicmp as usize,
-        strlwr as usize,
-        strupr as usize,
-        splitpath as usize,
-        wcslwr as usize,
-        wcschr as usize,
-        wcsrchr as usize,
-        wcspbrk as usize,
-        wcscmp as usize,
-        wcsncmp as usize,
-        wcsncat as usize,
-        wcscspn as usize,
-        wcsspn as usize,
-        atoi as usize,
-        wtoi as usize,
-        atol as usize,
-        atoi64 as usize,
-        wtoi64 as usize,
-        wtol as usize,
-        strtol as usize,
-        strtoul as usize,
-        wcstol as usize,
-        wcstoul as usize,
-        wcstoui64 as usize,
-        itoa as usize,
-        ltoa as usize,
-        ultoa as usize,
-        i64toa as usize,
-        ui64toa as usize,
-        itow as usize,
-        ltow as usize,
-        i64tow as usize,
-        ui64tow as usize,
-        ultow as usize,
-        abs as usize,
-        labs as usize,
-        isascii as usize,
-        toascii as usize,
-        iscsym as usize,
-        iscsymf as usize,
-        underscore_tolower as usize,
-        underscore_toupper as usize,
-        tolower as usize,
-        toupper as usize,
-        towlower as usize,
-        towupper as usize,
-        isalpha as usize,
-        isalnum as usize,
-        isdigit as usize,
-        iscntrl as usize,
-        isgraph as usize,
-        isprint as usize,
-        ispunct as usize,
-        isspace as usize,
-        isupper as usize,
-        isxdigit as usize,
-        islower as usize,
-        iswalpha as usize,
-        iswdigit as usize,
-        iswlower as usize,
-        iswspace as usize,
-        iswxdigit as usize,
-        iswctype as usize,
-        sin as usize,
-        cos as usize,
-        fabs as usize,
-        floor as usize,
-        ceil as usize,
-        lfind as usize,
-        bsearch as usize,
-        qsort as usize,
-        local_unwind as usize,
-        ver_set_condition_mask as usize,
+        memcmp as *const () as usize,
+        memchr as *const () as usize,
+        memccpy as *const () as usize,
+        memicmp as *const () as usize,
+        strlen as *const () as usize,
+        strcmp as *const () as usize,
+        strcmpi as *const () as usize,
+        strncmp as *const () as usize,
+        strcpy as *const () as usize,
+        strcat as *const () as usize,
+        strncat as *const () as usize,
+        strrchr as *const () as usize,
+        strstr as *const () as usize,
+        strcspn as *const () as usize,
+        strspn as *const () as usize,
+        strpbrk as *const () as usize,
+        strnicmp as *const () as usize,
+        strlwr as *const () as usize,
+        strupr as *const () as usize,
+        splitpath as *const () as usize,
+        wcslwr as *const () as usize,
+        wcschr as *const () as usize,
+        wcsrchr as *const () as usize,
+        wcspbrk as *const () as usize,
+        wcscmp as *const () as usize,
+        wcsncmp as *const () as usize,
+        wcsncat as *const () as usize,
+        wcscspn as *const () as usize,
+        wcsspn as *const () as usize,
+        atoi as *const () as usize,
+        wtoi as *const () as usize,
+        atol as *const () as usize,
+        atoi64 as *const () as usize,
+        wtoi64 as *const () as usize,
+        wtol as *const () as usize,
+        strtol as *const () as usize,
+        strtoul as *const () as usize,
+        wcstol as *const () as usize,
+        wcstoul as *const () as usize,
+        wcstoui64 as *const () as usize,
+        itoa as *const () as usize,
+        ltoa as *const () as usize,
+        ultoa as *const () as usize,
+        i64toa as *const () as usize,
+        ui64toa as *const () as usize,
+        itow as *const () as usize,
+        ltow as *const () as usize,
+        i64tow as *const () as usize,
+        ui64tow as *const () as usize,
+        ultow as *const () as usize,
+        abs as *const () as usize,
+        labs as *const () as usize,
+        isascii as *const () as usize,
+        toascii as *const () as usize,
+        iscsym as *const () as usize,
+        iscsymf as *const () as usize,
+        underscore_tolower as *const () as usize,
+        underscore_toupper as *const () as usize,
+        tolower as *const () as usize,
+        toupper as *const () as usize,
+        towlower as *const () as usize,
+        towupper as *const () as usize,
+        isalpha as *const () as usize,
+        isalnum as *const () as usize,
+        isdigit as *const () as usize,
+        iscntrl as *const () as usize,
+        isgraph as *const () as usize,
+        isprint as *const () as usize,
+        ispunct as *const () as usize,
+        isspace as *const () as usize,
+        isupper as *const () as usize,
+        isxdigit as *const () as usize,
+        islower as *const () as usize,
+        iswalpha as *const () as usize,
+        iswdigit as *const () as usize,
+        iswlower as *const () as usize,
+        iswspace as *const () as usize,
+        iswxdigit as *const () as usize,
+        iswctype as *const () as usize,
+        sin as *const () as usize,
+        cos as *const () as usize,
+        fabs as *const () as usize,
+        floor as *const () as usize,
+        ceil as *const () as usize,
+        lfind as *const () as usize,
+        bsearch as *const () as usize,
+        qsort as *const () as usize,
+        local_unwind as *const () as usize,
+        ver_set_condition_mask as *const () as usize,
         // BATCH 4 — Dbg* / Csr* surface.
-        dbg_print_ex as usize,
-        dbg_print_return_control_c as usize,
-        dbg_query_debug_filter_state as usize,
-        dbg_set_debug_filter_state as usize,
-        vdbg_print_ex as usize,
-        vdbg_print_ex_with_prefix as usize,
-        dbg_prompt as usize,
-        ship_assert as usize,
-        ship_assert_msg_a as usize,
-        ship_assert_msg_w as usize,
-        ship_assert_get_buffer_info as usize,
-        wer_check_event_escalation as usize,
-        wer_report_sqm_event as usize,
-        wer_report_watson_event as usize,
-        win_sqm_start_session as usize,
-        win_sqm_end_session as usize,
-        win_sqm_is_opted_in as usize,
-        win_sqm_event_enabled as usize,
-        win_sqm_event_write as usize,
-        win_sqm_add_to_stream as usize,
-        win_sqm_set_string as usize,
-        misaligned_access as usize,
-        dbg_ui_connect_to_dbg as usize,
-        dbg_ui_continue as usize,
-        dbg_ui_convert_state_change_structure as usize,
-        dbg_ui_debug_active_process as usize,
-        dbg_ui_stop_debugging as usize,
-        dbg_ui_issue_remote_breakin as usize,
-        dbg_ui_wait_state_change as usize,
-        dbg_ui_remote_breakin as usize,
-        dbg_ui_get_thread_debug_object as usize,
-        dbg_ui_set_thread_debug_object as usize,
-        csr_get_process_id as usize,
-        csr_client_connect_to_server as usize,
-        csr_client_call_server as usize,
-        csr_allocate_capture_buffer as usize,
-        csr_free_capture_buffer as usize,
-        csr_capture_message_buffer as usize,
-        csr_capture_message_string as usize,
-        csr_capture_message_multi_unicode_strings_in_place as usize,
-        csr_allocate_message_pointer as usize,
-        csr_capture_timeout as usize,
-        csr_probe_for_read as usize,
-        csr_probe_for_write as usize,
-        csr_verify_region as usize,
-        csr_new_thread as usize,
-        csr_identify_alertable_thread as usize,
-        csr_set_priority_class as usize,
-        property_length_as_variant as usize,
-        rtl_convert_property_to_variant as usize,
-        rtl_convert_variant_to_property as usize,
-        rtl_set_unicode_callouts as usize,
-        alpc_adjust_completion_list_concurrency_count as usize,
-        alpc_free_completion_list_message as usize,
-        alpc_get_completion_list_last_message_information as usize,
-        alpc_get_completion_list_message_attributes as usize,
-        alpc_get_header_size as usize,
-        alpc_get_message_attribute as usize,
-        alpc_get_message_from_completion_list as usize,
-        alpc_get_outstanding_completion_list_message_count as usize,
-        alpc_initialize_message_attribute as usize,
-        alpc_max_allowed_message_length as usize,
-        alpc_register_completion_list as usize,
-        alpc_register_completion_list_worker_thread as usize,
-        alpc_unregister_completion_list as usize,
-        alpc_unregister_completion_list_worker_thread as usize,
+        dbg_print_ex as *const () as usize,
+        dbg_print_return_control_c as *const () as usize,
+        dbg_query_debug_filter_state as *const () as usize,
+        dbg_set_debug_filter_state as *const () as usize,
+        vdbg_print_ex as *const () as usize,
+        vdbg_print_ex_with_prefix as *const () as usize,
+        dbg_prompt as *const () as usize,
+        ship_assert as *const () as usize,
+        ship_assert_msg_a as *const () as usize,
+        ship_assert_msg_w as *const () as usize,
+        ship_assert_get_buffer_info as *const () as usize,
+        wer_check_event_escalation as *const () as usize,
+        wer_report_sqm_event as *const () as usize,
+        wer_report_watson_event as *const () as usize,
+        win_sqm_start_session as *const () as usize,
+        win_sqm_end_session as *const () as usize,
+        win_sqm_is_opted_in as *const () as usize,
+        win_sqm_event_enabled as *const () as usize,
+        win_sqm_event_write as *const () as usize,
+        win_sqm_add_to_stream as *const () as usize,
+        win_sqm_set_string as *const () as usize,
+        misaligned_access as *const () as usize,
+        dbg_ui_connect_to_dbg as *const () as usize,
+        dbg_ui_continue as *const () as usize,
+        dbg_ui_convert_state_change_structure as *const () as usize,
+        dbg_ui_debug_active_process as *const () as usize,
+        dbg_ui_stop_debugging as *const () as usize,
+        dbg_ui_issue_remote_breakin as *const () as usize,
+        dbg_ui_wait_state_change as *const () as usize,
+        dbg_ui_remote_breakin as *const () as usize,
+        dbg_ui_get_thread_debug_object as *const () as usize,
+        dbg_ui_set_thread_debug_object as *const () as usize,
+        csr_get_process_id as *const () as usize,
+        csr_client_connect_to_server as *const () as usize,
+        csr_client_call_server as *const () as usize,
+        csr_allocate_capture_buffer as *const () as usize,
+        csr_free_capture_buffer as *const () as usize,
+        csr_capture_message_buffer as *const () as usize,
+        csr_capture_message_string as *const () as usize,
+        csr_capture_message_multi_unicode_strings_in_place as *const () as usize,
+        csr_allocate_message_pointer as *const () as usize,
+        csr_capture_timeout as *const () as usize,
+        csr_probe_for_read as *const () as usize,
+        csr_probe_for_write as *const () as usize,
+        csr_verify_region as *const () as usize,
+        csr_new_thread as *const () as usize,
+        csr_identify_alertable_thread as *const () as usize,
+        csr_set_priority_class as *const () as usize,
+        property_length_as_variant as *const () as usize,
+        rtl_convert_property_to_variant as *const () as usize,
+        rtl_convert_variant_to_property as *const () as usize,
+        rtl_set_unicode_callouts as *const () as usize,
+        alpc_adjust_completion_list_concurrency_count as *const () as usize,
+        alpc_free_completion_list_message as *const () as usize,
+        alpc_get_completion_list_last_message_information as *const () as usize,
+        alpc_get_completion_list_message_attributes as *const () as usize,
+        alpc_get_header_size as *const () as usize,
+        alpc_get_message_attribute as *const () as usize,
+        alpc_get_message_from_completion_list as *const () as usize,
+        alpc_get_outstanding_completion_list_message_count as *const () as usize,
+        alpc_initialize_message_attribute as *const () as usize,
+        alpc_max_allowed_message_length as *const () as usize,
+        alpc_register_completion_list as *const () as usize,
+        alpc_register_completion_list_worker_thread as *const () as usize,
+        alpc_unregister_completion_list as *const () as usize,
+        alpc_unregister_completion_list_worker_thread as *const () as usize,
         core::ptr::addr_of!(NLS_ANSI_CODE_PAGE) as usize,
         core::ptr::addr_of!(NLS_MB_CODE_PAGE_TAG) as usize,
         core::ptr::addr_of!(NLS_MB_OEM_CODE_PAGE_TAG) as usize,
         // BATCH 4 — Rtl* string / convert family.
-        rtl_append_string_to_string as usize,
-        rtl_append_asciiz_to_string as usize,
-        rtl_copy_string as usize,
-        rtl_compare_string as usize,
-        rtl_equal_string as usize,
-        rtl_prefix_string as usize,
-        rtl_upper_char as usize,
-        rtl_upper_string as usize,
-        rtl_copy_unicode_string as usize,
-        rtl_compare_unicode_strings as usize,
-        rtl_hash_unicode_string as usize,
-        rtl_find_char_in_unicode_string as usize,
-        rtl_upcase_unicode_string as usize,
-        rtl_downcase_unicode_string as usize,
-        rtl_upcase_unicode_string_to_oem_string as usize,
-        rtl_upcase_unicode_string_to_ansi_string as usize,
-        rtl_upcase_unicode_string_to_counted_oem_string as usize,
-        rtl_duplicate_unicode_string as usize,
-        rtl_create_unicode_string_from_asciiz as usize,
-        rtl_free_ansi_string as usize,
-        rtl_free_oem_string as usize,
-        rtl_init_ansi_string_ex as usize,
-        rtl_init_unicode_string_ex as usize,
-        rtl_ansi_char_to_unicode_char as usize,
-        rtl_integer_to_unicode_string as usize,
-        rtl_int64_to_unicode_string as usize,
-        rtl_unicode_to_utf8_n as usize,
-        rtl_utf8_to_unicode_n as usize,
-        rtl_unicode_to_multi_byte_n as usize,
-        rtl_unicode_to_oem_n as usize,
-        rtl_upcase_unicode_to_multi_byte_n as usize,
-        rtl_upcase_unicode_to_oem_n as usize,
-        rtl_custom_cp_to_unicode_n as usize,
-        rtl_unicode_to_custom_cp_n as usize,
-        rtl_upcase_unicode_to_custom_cp_n as usize,
-        rtl_multi_byte_to_unicode_n as usize,
-        rtl_oem_to_unicode_n as usize,
-        rtl_console_multi_byte_to_unicode_n as usize,
-        rtl_multi_byte_to_unicode_size as usize,
-        rtl_unicode_to_multi_byte_size as usize,
-        rtlp_ensure_buffer_size as usize,
-        rtl_multi_append_unicode_string_buffer as usize,
-        rtl_append_path_element as usize,
-        rtl_oem_string_to_unicode_string as usize,
-        rtl_unicode_string_to_oem_string as usize,
-        rtl_unicode_string_to_counted_oem_string as usize,
-        rtl_equal_computer_name as usize,
-        rtl_equal_domain_name as usize,
-        rtl_dns_host_name_to_computer_name as usize,
-        rtl_is_text_unicode as usize,
-        rtlx_unicode_string_to_ansi_size as usize,
-        rtl_unicode_string_to_ansi_size as usize,
-        rtlx_unicode_string_to_oem_size as usize,
-        rtl_unicode_string_to_oem_size as usize,
-        rtlx_ansi_string_to_unicode_size as usize,
-        rtl_ansi_string_to_unicode_size as usize,
-        rtlx_oem_string_to_unicode_size as usize,
-        rtl_oem_string_to_unicode_size as usize,
-        rtl_init_code_page_table as usize,
-        rtl_init_nls_tables as usize,
-        rtl_reset_rtl_translations as usize,
+        rtl_append_string_to_string as *const () as usize,
+        rtl_append_asciiz_to_string as *const () as usize,
+        rtl_copy_string as *const () as usize,
+        rtl_compare_string as *const () as usize,
+        rtl_equal_string as *const () as usize,
+        rtl_prefix_string as *const () as usize,
+        rtl_upper_char as *const () as usize,
+        rtl_upper_string as *const () as usize,
+        rtl_copy_unicode_string as *const () as usize,
+        rtl_compare_unicode_strings as *const () as usize,
+        rtl_hash_unicode_string as *const () as usize,
+        rtl_find_char_in_unicode_string as *const () as usize,
+        rtl_upcase_unicode_string as *const () as usize,
+        rtl_downcase_unicode_string as *const () as usize,
+        rtl_upcase_unicode_string_to_oem_string as *const () as usize,
+        rtl_upcase_unicode_string_to_ansi_string as *const () as usize,
+        rtl_upcase_unicode_string_to_counted_oem_string as *const () as usize,
+        rtl_duplicate_unicode_string as *const () as usize,
+        rtl_create_unicode_string_from_asciiz as *const () as usize,
+        rtl_free_ansi_string as *const () as usize,
+        rtl_free_oem_string as *const () as usize,
+        rtl_init_ansi_string_ex as *const () as usize,
+        rtl_init_unicode_string_ex as *const () as usize,
+        rtl_ansi_char_to_unicode_char as *const () as usize,
+        rtl_integer_to_unicode_string as *const () as usize,
+        rtl_int64_to_unicode_string as *const () as usize,
+        rtl_unicode_to_utf8_n as *const () as usize,
+        rtl_utf8_to_unicode_n as *const () as usize,
+        rtl_unicode_to_multi_byte_n as *const () as usize,
+        rtl_unicode_to_oem_n as *const () as usize,
+        rtl_upcase_unicode_to_multi_byte_n as *const () as usize,
+        rtl_upcase_unicode_to_oem_n as *const () as usize,
+        rtl_custom_cp_to_unicode_n as *const () as usize,
+        rtl_unicode_to_custom_cp_n as *const () as usize,
+        rtl_upcase_unicode_to_custom_cp_n as *const () as usize,
+        rtl_multi_byte_to_unicode_n as *const () as usize,
+        rtl_oem_to_unicode_n as *const () as usize,
+        rtl_console_multi_byte_to_unicode_n as *const () as usize,
+        rtl_multi_byte_to_unicode_size as *const () as usize,
+        rtl_unicode_to_multi_byte_size as *const () as usize,
+        rtlp_ensure_buffer_size as *const () as usize,
+        rtl_multi_append_unicode_string_buffer as *const () as usize,
+        rtl_append_path_element as *const () as usize,
+        rtl_oem_string_to_unicode_string as *const () as usize,
+        rtl_unicode_string_to_oem_string as *const () as usize,
+        rtl_unicode_string_to_counted_oem_string as *const () as usize,
+        rtl_equal_computer_name as *const () as usize,
+        rtl_equal_domain_name as *const () as usize,
+        rtl_dns_host_name_to_computer_name as *const () as usize,
+        rtl_is_text_unicode as *const () as usize,
+        rtlx_unicode_string_to_ansi_size as *const () as usize,
+        rtl_unicode_string_to_ansi_size as *const () as usize,
+        rtlx_unicode_string_to_oem_size as *const () as usize,
+        rtl_unicode_string_to_oem_size as *const () as usize,
+        rtlx_ansi_string_to_unicode_size as *const () as usize,
+        rtl_ansi_string_to_unicode_size as *const () as usize,
+        rtlx_oem_string_to_unicode_size as *const () as usize,
+        rtl_oem_string_to_unicode_size as *const () as usize,
+        rtl_init_code_page_table as *const () as usize,
+        rtl_init_nls_tables as *const () as usize,
+        rtl_reset_rtl_translations as *const () as usize,
     ];
     #[cfg(target_arch = "x86_64")]
     let anchors3: &[usize] = &[
         ki_user_apc_dispatcher as *const () as usize,
-        ki_raise_user_exception_dispatcher as usize,
+        ki_raise_user_exception_dispatcher as *const () as usize,
         ki_user_callback_dispatcher as *const () as usize,
         zw_accept_connect_port as *const () as usize,
         zw_access_check as *const () as usize,
         zw_access_check_and_audit_alarm as *const () as usize,
         zw_access_check_by_type as *const () as usize,
+        zw_access_check_by_type_and_audit_alarm as *const () as usize,
         zw_access_check_by_type_result_list as *const () as usize,
+        zw_access_check_by_type_result_list_and_audit_alarm as *const () as usize,
+        zw_access_check_by_type_result_list_and_audit_alarm_by_handle as *const () as usize,
         zw_add_atom as *const () as usize,
         zw_adjust_groups_token as *const () as usize,
         zw_adjust_privileges_token as *const () as usize,
@@ -30238,476 +30523,671 @@ pub unsafe extern "C" fn export_anchor() {
         zw_write_virtual_memory as *const () as usize,
         zw_yield_execution as *const () as usize,
         zw_create_keyed_event as *const () as usize,
+        zw_rename_key as *const () as usize,
+        zw_set_timer_resolution as *const () as usize,
+        zw_trace_event as *const () as usize,
+        zw_cancel_io_file_ex as *const () as usize,
+        zw_compare_objects as *const () as usize,
+        zw_create_low_box_token as *const () as usize,
+        zw_create_private_namespace as *const () as usize,
+        zw_create_user_process as *const () as usize,
+        zw_delete_private_namespace as *const () as usize,
+        zw_get_nls_section_ptr as *const () as usize,
+        zw_open_private_namespace as *const () as usize,
+        zw_query_system_information_ex as *const () as usize,
+        zw_remove_io_completion_ex as *const () as usize,
+        zw_set_information_virtual_memory as *const () as usize,
+        zw_trace_control as *const () as usize,
+        zw_acquire_cmf_view_ownership as *const () as usize,
+        zw_add_boot_entry as *const () as usize,
+        zw_add_driver_entry as *const () as usize,
+        zw_alert_multiple_thread_by_thread_id as *const () as usize,
+        zw_alert_resume_thread as *const () as usize,
+        zw_alert_thread as *const () as usize,
+        zw_alert_thread_by_thread_id as *const () as usize,
+        zw_allocate_reserve_object as *const () as usize,
+        zw_allocate_uuids as *const () as usize,
+        zw_allocate_virtual_memory_ex as *const () as usize,
+        zw_alpc_cancel_message as *const () as usize,
+        zw_alpc_connect_port_ex as *const () as usize,
+        zw_alpc_create_port_section as *const () as usize,
+        zw_alpc_create_resource_reserve as *const () as usize,
+        zw_alpc_create_section_view as *const () as usize,
+        zw_alpc_create_security_context as *const () as usize,
+        zw_alpc_delete_port_section as *const () as usize,
+        zw_alpc_delete_resource_reserve as *const () as usize,
+        zw_alpc_delete_section_view as *const () as usize,
+        zw_alpc_delete_security_context as *const () as usize,
+        zw_alpc_disconnect_port as *const () as usize,
+        zw_alpc_impersonate_client_container_of_port as *const () as usize,
+        zw_alpc_impersonate_client_of_port as *const () as usize,
+        zw_alpc_open_sender_process as *const () as usize,
+        zw_alpc_open_sender_thread as *const () as usize,
+        zw_alpc_query_information as *const () as usize,
+        zw_alpc_query_information_message as *const () as usize,
+        zw_alpc_revoke_security_context as *const () as usize,
+        zw_alpc_set_information as *const () as usize,
+        zw_are_mapped_files_the_same as *const () as usize,
+        zw_associate_wait_completion_packet as *const () as usize,
+        zw_cancel_synchronous_io_file as *const () as usize,
+        zw_cancel_wait_completion_packet as *const () as usize,
+        zw_commit_complete as *const () as usize,
+        zw_commit_enlistment as *const () as usize,
+        zw_commit_transaction as *const () as usize,
+        zw_compact_keys as *const () as usize,
+        zw_compare_tokens as *const () as usize,
+        zw_compress_key as *const () as usize,
+        zw_continue_ex as *const () as usize,
+        zw_convert_between_auxiliary_counter_and_performance_counter as *const () as usize,
+        zw_create_enlistment as *const () as usize,
+        zw_create_event_pair as *const () as usize,
+        zw_create_key_transacted as *const () as usize,
+        zw_create_profile as *const () as usize,
+        zw_create_resource_manager as *const () as usize,
+        zw_create_section_ex as *const () as usize,
+        zw_create_thread_ex as *const () as usize,
+        zw_create_transaction as *const () as usize,
+        zw_create_transaction_manager as *const () as usize,
+        zw_create_wait_completion_packet as *const () as usize,
+        zw_create_waitable_port as *const () as usize,
+        zw_create_wnf_state_name as *const () as usize,
+        zw_create_worker_factory as *const () as usize,
+        zw_delete_boot_entry as *const () as usize,
+        zw_delete_driver_entry as *const () as usize,
+        zw_delete_file as *const () as usize,
+        zw_delete_wnf_state_data as *const () as usize,
+        zw_delete_wnf_state_name as *const () as usize,
+        zw_enumerate_boot_entries as *const () as usize,
+        zw_enumerate_driver_entries as *const () as usize,
+        zw_enumerate_system_environment_values_ex as *const () as usize,
+        zw_enumerate_transaction_object as *const () as usize,
+        zw_extend_section as *const () as usize,
+        zw_flush_buffers_file_ex as *const () as usize,
+        zw_flush_install_ui_language as *const () as usize,
+        zw_flush_process_write_buffers as *const () as usize,
+        zw_flush_write_buffer as *const () as usize,
+        zw_freeze_registry as *const () as usize,
+        zw_freeze_transactions as *const () as usize,
+        zw_get_current_processor_number as *const () as usize,
+        zw_get_current_processor_number_ex as *const () as usize,
+        zw_get_mui_registry_info as *const () as usize,
+        zw_get_next_process as *const () as usize,
+        zw_get_next_thread as *const () as usize,
+        zw_get_notification_resource_manager as *const () as usize,
+        zw_initialize_nls_files as *const () as usize,
+        zw_is_ui_language_comitted as *const () as usize,
+        zw_lock_product_activation_keys as *const () as usize,
+        zw_lock_registry_key as *const () as usize,
+        zw_map_cmf_module as *const () as usize,
+        zw_map_view_of_section_ex as *const () as usize,
+        zw_modify_boot_entry as *const () as usize,
+        zw_modify_driver_entry as *const () as usize,
+        zw_notify_change_directory_file_ex as *const () as usize,
+        zw_notify_change_multiple_keys as *const () as usize,
+        zw_open_enlistment as *const () as usize,
+        zw_open_key_ex as *const () as usize,
+        zw_open_key_transacted as *const () as usize,
+        zw_open_key_transacted_ex as *const () as usize,
+        zw_open_keyed_event as *const () as usize,
+        zw_open_resource_manager as *const () as usize,
+        zw_open_session as *const () as usize,
+        zw_open_transaction as *const () as usize,
+        zw_open_transaction_manager as *const () as usize,
+        zw_pre_prepare_complete as *const () as usize,
+        zw_pre_prepare_enlistment as *const () as usize,
+        zw_prepare_complete as *const () as usize,
+        zw_prepare_enlistment as *const () as usize,
+        zw_propagation_complete as *const () as usize,
+        zw_propagation_failed as *const () as usize,
+        zw_query_boot_entry_order as *const () as usize,
+        zw_query_boot_options as *const () as usize,
+        zw_query_directory_file_ex as *const () as usize,
+        zw_query_driver_entry_order as *const () as usize,
+        zw_query_information_by_name as *const () as usize,
+        zw_query_information_enlistment as *const () as usize,
+        zw_query_information_port as *const () as usize,
+        zw_query_information_resource_manager as *const () as usize,
+        zw_query_information_transaction as *const () as usize,
+        zw_query_information_transaction_manager as *const () as usize,
+        zw_query_information_worker_factory as *const () as usize,
+        zw_query_interval_profile as *const () as usize,
+        zw_query_license_value as *const () as usize,
+        zw_query_multiple_value_key as *const () as usize,
+        zw_query_open_sub_keys as *const () as usize,
+        zw_query_open_sub_keys_ex as *const () as usize,
+        zw_query_port_information_process as *const () as usize,
+        zw_query_system_environment_value as *const () as usize,
+        zw_query_timer_resolution as *const () as usize,
+        zw_query_wnf_state_data as *const () as usize,
+        zw_query_wnf_state_name_information as *const () as usize,
+        zw_queue_apc_thread_ex as *const () as usize,
+        zw_queue_apc_thread_ex2 as *const () as usize,
+        zw_read_only_enlistment as *const () as usize,
+        zw_read_request_data as *const () as usize,
+        zw_recover_enlistment as *const () as usize,
+        zw_recover_resource_manager as *const () as usize,
+        zw_recover_transaction_manager as *const () as usize,
+        zw_register_protocol_address_information as *const () as usize,
+        zw_release_cmf_view_ownership as *const () as usize,
+        zw_release_worker_factory_worker as *const () as usize,
+        zw_rename_transaction_manager as *const () as usize,
+        zw_replace_partition_unit as *const () as usize,
+        zw_reply_wait_receive_port_ex as *const () as usize,
+        zw_reply_wait_reply_port as *const () as usize,
+        zw_request_port as *const () as usize,
+        zw_rollback_complete as *const () as usize,
+        zw_rollback_enlistment as *const () as usize,
+        zw_rollback_transaction as *const () as usize,
+        zw_rollforward_transaction_manager as *const () as usize,
+        zw_save_merged_keys as *const () as usize,
+        zw_set_boot_entry_order as *const () as usize,
+        zw_set_boot_options as *const () as usize,
+        zw_set_driver_entry_order as *const () as usize,
+        zw_set_event_boost_priority as *const () as usize,
+        zw_set_high_event_pair as *const () as usize,
+        zw_set_high_wait_low_event_pair as *const () as usize,
+        zw_set_information_enlistment as *const () as usize,
+        zw_set_information_key as *const () as usize,
+        zw_set_information_resource_manager as *const () as usize,
+        zw_set_information_transaction as *const () as usize,
+        zw_set_information_transaction_manager as *const () as usize,
+        zw_set_information_worker_factory as *const () as usize,
+        zw_set_interval_profile as *const () as usize,
+        zw_set_io_completion_ex as *const () as usize,
+        zw_set_ldt_entries as *const () as usize,
+        zw_set_low_event_pair as *const () as usize,
+        zw_set_low_wait_high_event_pair as *const () as usize,
+        zw_set_system_environment_value as *const () as usize,
+        zw_shutdown_worker_factory as *const () as usize,
+        zw_single_phase_reject as *const () as usize,
+        zw_start_profile as *const () as usize,
+        zw_stop_profile as *const () as usize,
+        zw_subscribe_wnf_state_change as *const () as usize,
+        zw_system_debug_control as *const () as usize,
+        zw_thaw_registry as *const () as usize,
+        zw_thaw_transactions as *const () as usize,
+        zw_translate_file_path as *const () as usize,
+        zw_unmap_view_of_section_ex as *const () as usize,
+        zw_unsubscribe_wnf_state_change as *const () as usize,
+        zw_update_wnf_state_data as *const () as usize,
+        zw_vdm_control as *const () as usize,
+        zw_wait_for_alert_by_thread_id as *const () as usize,
+        zw_wait_for_multiple_objects32 as *const () as usize,
+        zw_wait_for_work_via_worker_factory as *const () as usize,
+        zw_wait_high_event_pair as *const () as usize,
+        zw_wait_low_event_pair as *const () as usize,
+        zw_worker_factory_worker_ready as *const () as usize,
+        zw_write_request_data as *const () as usize,
     ];
     #[cfg(target_arch = "x86_64")]
     core::hint::black_box(anchors3);
     // BATCH 4 — Rtl* heap family.
     let anchors_heap: &[usize] = &[
-        rtl_size_heap as usize,
-        rtl_validate_heap as usize,
-        rtl_destroy_heap as usize,
-        rtl_multiple_allocate_heap as usize,
-        rtl_multiple_free_heap as usize,
-        rtl_get_process_heap as usize,
-        rtl_get_process_heaps as usize,
-        rtl_lock_heap as usize,
-        rtl_unlock_heap as usize,
-        rtl_compact_heap as usize,
-        rtl_walk_heap as usize,
-        rtl_query_heap_information as usize,
-        rtl_set_heap_information as usize,
-        rtl_get_user_info_heap as usize,
-        rtl_set_user_value_heap as usize,
-        rtl_set_user_flags_heap as usize,
-        rtl_query_tag_heap as usize,
+        rtl_size_heap as *const () as usize,
+        rtl_validate_heap as *const () as usize,
+        rtl_destroy_heap as *const () as usize,
+        rtl_multiple_allocate_heap as *const () as usize,
+        rtl_multiple_free_heap as *const () as usize,
+        rtl_get_process_heap as *const () as usize,
+        rtl_get_process_heaps as *const () as usize,
+        rtl_lock_heap as *const () as usize,
+        rtl_unlock_heap as *const () as usize,
+        rtl_compact_heap as *const () as usize,
+        rtl_walk_heap as *const () as usize,
+        rtl_query_heap_information as *const () as usize,
+        rtl_set_heap_information as *const () as usize,
+        rtl_get_user_info_heap as *const () as usize,
+        rtl_set_user_value_heap as *const () as usize,
+        rtl_set_user_flags_heap as *const () as usize,
+        rtl_query_tag_heap as *const () as usize,
     ];
     core::hint::black_box(anchors_heap);
     // BATCH 4 — Etw* trace client.
     let anchors_etw: &[usize] = &[
-        etw_control_trace_a as usize,
-        etw_control_trace_w as usize,
-        etw_create_trace_instance_id as usize,
-        etw_deliver_data_block as usize,
-        etw_enable_trace as usize,
-        etw_enumerate_process_reg_guids as usize,
-        etw_enumerate_trace_guids as usize,
-        etw_event_activity_id_control as usize,
-        etw_event_enabled as usize,
-        etw_event_provider_enabled as usize,
-        etw_event_register as usize,
-        etw_event_set_information as usize,
-        etw_event_unregister as usize,
-        etw_event_write as usize,
+        etw_control_trace_a as *const () as usize,
+        etw_control_trace_w as *const () as usize,
+        etw_create_trace_instance_id as *const () as usize,
+        etw_deliver_data_block as *const () as usize,
+        etw_enable_trace as *const () as usize,
+        etw_enumerate_process_reg_guids as *const () as usize,
+        etw_enumerate_trace_guids as *const () as usize,
+        etw_event_activity_id_control as *const () as usize,
+        etw_event_enabled as *const () as usize,
+        etw_event_provider_enabled as *const () as usize,
+        etw_event_register as *const () as usize,
+        etw_event_set_information as *const () as usize,
+        etw_event_unregister as *const () as usize,
+        etw_event_write as *const () as usize,
         etw_event_write_ex as *const () as usize,
-        etw_event_write_end_scenario as usize,
-        etw_event_write_full as usize,
+        etw_event_write_end_scenario as *const () as usize,
+        etw_event_write_full as *const () as usize,
         etw_event_write_no_registration as *const () as usize,
-        etw_event_write_start_scenario as usize,
-        etw_event_write_string as usize,
-        etw_event_write_transfer as usize,
-        etw_flush_trace_a as usize,
-        etw_flush_trace_w as usize,
-        etw_get_trace_enable_flags as usize,
-        etw_get_trace_enable_level as usize,
-        etw_get_trace_logger_handle as usize,
-        etw_log_trace_event as usize,
-        etw_notification_register as usize,
-        etw_notification_registration_a as usize,
-        etw_notification_registration_w as usize,
-        etw_notification_unregister as usize,
-        etw_process_private_logger_request as usize,
-        etw_query_all_traces_a as usize,
-        etw_query_all_traces_w as usize,
-        etw_query_trace_a as usize,
-        etw_query_trace_w as usize,
-        etw_receive_notifications_a as usize,
-        etw_receive_notifications_w as usize,
-        etw_register as usize,
-        etw_register_security_provider as usize,
-        etw_register_trace_guids_a as usize,
-        etw_register_trace_guids_w as usize,
-        etw_reply_notification as usize,
-        etw_send_notification as usize,
-        etw_set_mark as usize,
-        etw_start_trace_a as usize,
-        etw_start_trace_w as usize,
-        etw_stop_trace_a as usize,
-        etw_stop_trace_w as usize,
-        etw_trace_event as usize,
-        etw_trace_event_instance as usize,
-        etw_trace_message as usize,
-        etw_trace_message_va as usize,
-        etw_unregister as usize,
-        etw_unregister_trace_guids as usize,
-        etw_update_trace_a as usize,
-        etw_update_trace_w as usize,
-        etw_write as usize,
-        etw_write_um_security_event as usize,
-        etwp_create_etw_thread as usize,
-        etwp_get_cpu_speed as usize,
-        etwp_get_trace_buffer as usize,
-        etwp_notification_thread as usize,
-        etwp_set_hw_config_function as usize,
+        etw_event_write_start_scenario as *const () as usize,
+        etw_event_write_string as *const () as usize,
+        etw_event_write_transfer as *const () as usize,
+        etw_flush_trace_a as *const () as usize,
+        etw_flush_trace_w as *const () as usize,
+        etw_get_trace_enable_flags as *const () as usize,
+        etw_get_trace_enable_level as *const () as usize,
+        etw_get_trace_logger_handle as *const () as usize,
+        etw_log_trace_event as *const () as usize,
+        etw_notification_register as *const () as usize,
+        etw_notification_registration_a as *const () as usize,
+        etw_notification_registration_w as *const () as usize,
+        etw_notification_unregister as *const () as usize,
+        etw_process_private_logger_request as *const () as usize,
+        etw_query_all_traces_a as *const () as usize,
+        etw_query_all_traces_w as *const () as usize,
+        etw_query_trace_a as *const () as usize,
+        etw_query_trace_w as *const () as usize,
+        etw_receive_notifications_a as *const () as usize,
+        etw_receive_notifications_w as *const () as usize,
+        etw_register as *const () as usize,
+        etw_register_security_provider as *const () as usize,
+        etw_register_trace_guids_a as *const () as usize,
+        etw_register_trace_guids_w as *const () as usize,
+        etw_reply_notification as *const () as usize,
+        etw_send_notification as *const () as usize,
+        etw_set_mark as *const () as usize,
+        etw_start_trace_a as *const () as usize,
+        etw_start_trace_w as *const () as usize,
+        etw_stop_trace_a as *const () as usize,
+        etw_stop_trace_w as *const () as usize,
+        etw_trace_event as *const () as usize,
+        etw_trace_event_instance as *const () as usize,
+        etw_trace_message as *const () as usize,
+        etw_trace_message_va as *const () as usize,
+        etw_unregister as *const () as usize,
+        etw_unregister_trace_guids as *const () as usize,
+        etw_update_trace_a as *const () as usize,
+        etw_update_trace_w as *const () as usize,
+        etw_write as *const () as usize,
+        etw_write_um_security_event as *const () as usize,
+        etwp_create_etw_thread as *const () as usize,
+        etwp_get_cpu_speed as *const () as usize,
+        etwp_get_trace_buffer as *const () as usize,
+        etwp_notification_thread as *const () as usize,
+        etwp_set_hw_config_function as *const () as usize,
     ];
     core::hint::black_box(anchors_etw);
     // BATCH 4 — Rtl* memory / bitmap / atom / encode / time / random / SList / misc.
     let anchors_misc1: &[usize] = &[
-        rtl_fill_memory as usize,
-        rtl_fill_memory_ulong as usize,
-        rtl_zero_memory as usize,
-        rtl_move_memory as usize,
-        rtl_compare_memory as usize,
-        rtl_compare_memory_ulong as usize,
-        rtl_copy_memory_non_temporal as usize,
-        rtl_copy_mapped_memory as usize,
-        rtl_init_memory_stream as usize,
-        rtl_init_out_of_process_memory_stream as usize,
-        rtl_final_release_out_of_process_memory_stream as usize,
-        rtl_query_interface_memory_stream as usize,
-        rtl_add_ref_memory_stream as usize,
-        rtl_release_memory_stream as usize,
-        rtl_read_memory_stream as usize,
-        rtl_read_out_of_process_memory_stream as usize,
-        rtl_seek_memory_stream as usize,
-        rtl_copy_memory_stream_to as usize,
-        rtl_copy_out_of_process_memory_stream_to as usize,
-        rtl_stat_memory_stream as usize,
-        rtl_write_memory_stream as usize,
-        rtl_set_memory_stream_size as usize,
-        rtl_commit_memory_stream as usize,
-        rtl_revert_memory_stream as usize,
-        rtl_lock_memory_stream_region as usize,
-        rtl_unlock_memory_stream_region as usize,
-        rtl_clone_memory_stream as usize,
-        rtl_initialize_bit_map as usize,
-        rtl_clear_all_bits as usize,
-        rtl_set_all_bits as usize,
-        rtl_test_bit as usize,
-        rtl_set_bits as usize,
-        rtl_clear_bits as usize,
-        rtl_are_bits_set as usize,
-        rtl_are_bits_clear as usize,
-        rtl_number_of_set_bits as usize,
-        rtl_number_of_clear_bits as usize,
-        rtl_find_clear_bits as usize,
-        rtl_find_set_bits as usize,
-        rtl_find_clear_bits_and_set as usize,
-        rtl_find_set_bits_and_clear as usize,
-        rtl_find_next_forward_run_clear as usize,
-        rtl_find_next_forward_run_set as usize,
-        rtl_find_first_run_clear as usize,
-        rtl_find_last_backward_run_clear as usize,
-        rtl_find_clear_runs as usize,
-        rtl_find_longest_run_clear as usize,
-        rtl_find_most_significant_bit as usize,
-        rtl_find_least_significant_bit as usize,
-        rtl_create_atom_table as usize,
-        rtl_get_integer_atom as usize,
-        rtl_add_atom_to_atom_table as usize,
-        rtl_lookup_atom_in_atom_table as usize,
-        rtl_delete_atom_from_atom_table as usize,
-        rtl_pin_atom_in_atom_table as usize,
-        rtl_empty_atom_table as usize,
-        rtl_destroy_atom_table as usize,
-        rtl_query_atom_in_atom_table as usize,
-        rtl_encode_pointer as usize,
-        rtl_decode_pointer as usize,
-        rtl_encode_system_pointer as usize,
-        rtl_decode_system_pointer as usize,
-        rtl_time_to_seconds_since_1970 as usize,
-        rtl_time_to_seconds_since_1980 as usize,
-        rtl_seconds_since_1970_to_time as usize,
-        rtl_seconds_since_1980_to_time as usize,
-        rtl_local_time_to_system_time as usize,
-        rtl_system_time_to_local_time as usize,
-        rtl_time_to_time_fields as usize,
-        rtl_time_fields_to_time as usize,
-        rtl_time_to_elapsed_time_fields as usize,
-        rtl_cutover_time_to_system_time as usize,
-        rtl_get_tick_count as usize,
-        nt_get_tick_count as usize,
-        rtl_uniform as usize,
-        rtl_random as usize,
-        rtl_random_ex as usize,
-        rtl_compute_crc32 as usize,
-        rtl_integer_to_char as usize,
-        rtl_large_integer_to_char as usize,
-        rtl_convert_long_to_large_integer as usize,
-        rtl_convert_ulong_to_large_integer as usize,
-        rtl_large_integer_add as usize,
-        rtl_large_integer_subtract as usize,
-        rtl_large_integer_divide as usize,
-        rtl_large_integer_negate as usize,
-        rtl_large_integer_shift_left as usize,
-        rtl_large_integer_shift_right as usize,
-        rtl_large_integer_arithmetic_shift as usize,
-        rtl_enlarged_integer_multiply as usize,
-        rtl_enlarged_unsigned_multiply as usize,
-        rtl_enlarged_unsigned_divide as usize,
-        rtl_extended_integer_multiply as usize,
-        rtl_extended_large_integer_divide as usize,
-        rtl_extended_magic_divide as usize,
-        rtl_ushort_byte_swap as usize,
-        rtl_ulong_byte_swap as usize,
-        rtl_ulonglong_byte_swap as usize,
-        rtl_number_of_set_bits_ulong_ptr as usize,
+        rtl_fill_memory as *const () as usize,
+        rtl_fill_memory_ulong as *const () as usize,
+        rtl_zero_memory as *const () as usize,
+        rtl_move_memory as *const () as usize,
+        rtl_compare_memory as *const () as usize,
+        rtl_compare_memory_ulong as *const () as usize,
+        rtl_copy_memory_non_temporal as *const () as usize,
+        rtl_copy_mapped_memory as *const () as usize,
+        rtl_init_memory_stream as *const () as usize,
+        rtl_init_out_of_process_memory_stream as *const () as usize,
+        rtl_final_release_out_of_process_memory_stream as *const () as usize,
+        rtl_query_interface_memory_stream as *const () as usize,
+        rtl_add_ref_memory_stream as *const () as usize,
+        rtl_release_memory_stream as *const () as usize,
+        rtl_read_memory_stream as *const () as usize,
+        rtl_read_out_of_process_memory_stream as *const () as usize,
+        rtl_seek_memory_stream as *const () as usize,
+        rtl_copy_memory_stream_to as *const () as usize,
+        rtl_copy_out_of_process_memory_stream_to as *const () as usize,
+        rtl_stat_memory_stream as *const () as usize,
+        rtl_write_memory_stream as *const () as usize,
+        rtl_set_memory_stream_size as *const () as usize,
+        rtl_commit_memory_stream as *const () as usize,
+        rtl_revert_memory_stream as *const () as usize,
+        rtl_lock_memory_stream_region as *const () as usize,
+        rtl_unlock_memory_stream_region as *const () as usize,
+        rtl_clone_memory_stream as *const () as usize,
+        rtl_initialize_bit_map as *const () as usize,
+        rtl_clear_all_bits as *const () as usize,
+        rtl_set_all_bits as *const () as usize,
+        rtl_test_bit as *const () as usize,
+        rtl_set_bits as *const () as usize,
+        rtl_clear_bits as *const () as usize,
+        rtl_are_bits_set as *const () as usize,
+        rtl_are_bits_clear as *const () as usize,
+        rtl_number_of_set_bits as *const () as usize,
+        rtl_number_of_clear_bits as *const () as usize,
+        rtl_find_clear_bits as *const () as usize,
+        rtl_find_set_bits as *const () as usize,
+        rtl_find_clear_bits_and_set as *const () as usize,
+        rtl_find_set_bits_and_clear as *const () as usize,
+        rtl_find_next_forward_run_clear as *const () as usize,
+        rtl_find_next_forward_run_set as *const () as usize,
+        rtl_find_first_run_clear as *const () as usize,
+        rtl_find_last_backward_run_clear as *const () as usize,
+        rtl_find_clear_runs as *const () as usize,
+        rtl_find_longest_run_clear as *const () as usize,
+        rtl_find_most_significant_bit as *const () as usize,
+        rtl_find_least_significant_bit as *const () as usize,
+        rtl_create_atom_table as *const () as usize,
+        rtl_get_integer_atom as *const () as usize,
+        rtl_add_atom_to_atom_table as *const () as usize,
+        rtl_lookup_atom_in_atom_table as *const () as usize,
+        rtl_delete_atom_from_atom_table as *const () as usize,
+        rtl_pin_atom_in_atom_table as *const () as usize,
+        rtl_empty_atom_table as *const () as usize,
+        rtl_destroy_atom_table as *const () as usize,
+        rtl_query_atom_in_atom_table as *const () as usize,
+        rtl_encode_pointer as *const () as usize,
+        rtl_decode_pointer as *const () as usize,
+        rtl_encode_system_pointer as *const () as usize,
+        rtl_decode_system_pointer as *const () as usize,
+        rtl_time_to_seconds_since_1970 as *const () as usize,
+        rtl_time_to_seconds_since_1980 as *const () as usize,
+        rtl_seconds_since_1970_to_time as *const () as usize,
+        rtl_seconds_since_1980_to_time as *const () as usize,
+        rtl_local_time_to_system_time as *const () as usize,
+        rtl_system_time_to_local_time as *const () as usize,
+        rtl_time_to_time_fields as *const () as usize,
+        rtl_time_fields_to_time as *const () as usize,
+        rtl_time_to_elapsed_time_fields as *const () as usize,
+        rtl_cutover_time_to_system_time as *const () as usize,
+        rtl_get_tick_count as *const () as usize,
+        nt_get_tick_count as *const () as usize,
+        rtl_uniform as *const () as usize,
+        rtl_random as *const () as usize,
+        rtl_random_ex as *const () as usize,
+        rtl_compute_crc32 as *const () as usize,
+        rtl_integer_to_char as *const () as usize,
+        rtl_large_integer_to_char as *const () as usize,
+        rtl_convert_long_to_large_integer as *const () as usize,
+        rtl_convert_ulong_to_large_integer as *const () as usize,
+        rtl_large_integer_add as *const () as usize,
+        rtl_large_integer_subtract as *const () as usize,
+        rtl_large_integer_divide as *const () as usize,
+        rtl_large_integer_negate as *const () as usize,
+        rtl_large_integer_shift_left as *const () as usize,
+        rtl_large_integer_shift_right as *const () as usize,
+        rtl_large_integer_arithmetic_shift as *const () as usize,
+        rtl_enlarged_integer_multiply as *const () as usize,
+        rtl_enlarged_unsigned_multiply as *const () as usize,
+        rtl_enlarged_unsigned_divide as *const () as usize,
+        rtl_extended_integer_multiply as *const () as usize,
+        rtl_extended_large_integer_divide as *const () as usize,
+        rtl_extended_magic_divide as *const () as usize,
+        rtl_ushort_byte_swap as *const () as usize,
+        rtl_ulong_byte_swap as *const () as usize,
+        rtl_ulonglong_byte_swap as *const () as usize,
+        rtl_number_of_set_bits_ulong_ptr as *const () as usize,
     ];
     core::hint::black_box(anchors_misc1);
     let anchors_misc2: &[usize] = &[
-        rtl_initialize_slist_head as usize,
-        rtl_first_entry_slist as usize,
-        rtl_interlocked_push_entry_slist as usize,
-        rtl_interlocked_push_list_slist as usize,
-        rtl_interlocked_push_list_slist_ex as usize,
-        rtl_interlocked_pop_entry_slist as usize,
-        rtl_interlocked_flush_slist as usize,
-        rtl_query_depth_slist as usize,
-        rtl_get_last_nt_status as usize,
-        rtl_restore_last_win32_error as usize,
-        rtl_set_last_win32_error_and_nt_status_from_nt_status as usize,
-        rtl_get_thread_error_mode as usize,
-        rtl_set_thread_error_mode as usize,
-        rtl_validate_process_heaps as usize,
-        rtl_get_nt_product_type as usize,
-        rtl_get_version as usize,
-        rtl_get_nt_version_numbers as usize,
-        rtl_get_product_info as usize,
-        rtl_get_system_preferred_ui_languages as usize,
-        rtl_get_thread_preferred_ui_languages as usize,
-        rtl_get_user_preferred_ui_languages as usize,
-        rtl_lcid_to_locale_name as usize,
-        rtl_locale_name_to_lcid as usize,
-        rtl_lcid_to_culture_name as usize,
-        rtl_culture_name_to_lcid as usize,
-        rtl_convert_lcid_to_string as usize,
-        rtl_verify_version_info as usize,
-        rtl_get_current_processor_number as usize,
-        rtl_get_current_processor_number_ex as usize,
-        rtl_is_processor_feature_present as usize,
-        rtl_get_native_system_information as usize,
-        rtl_add_vectored_exception_handler as usize,
-        rtl_remove_vectored_exception_handler as usize,
-        rtl_add_vectored_continue_handler as usize,
-        rtl_remove_vectored_continue_handler as usize,
-        rtl_add_function_table as usize,
-        rtl_delete_function_table as usize,
-        rtl_install_function_table_callback as usize,
-        rtl_get_function_table_list_head as usize,
-        rtl_lookup_function_entry as usize,
-        rtl_capture_context as usize,
-        rtl_raise_status as usize,
-        rtl_raise_exception as usize,
-        rtl_unwind as usize,
-        rtl_unwind_ex as usize,
-        rtl_virtual_unwind as usize,
-        rtl_restore_context as usize,
-        rtl_dispatch_exception as usize,
-        ki_user_exception_dispatcher as usize,
-        rtl_exit_user_thread as usize,
-        rtl_exit_user_process as usize,
-        rtl_free_user_thread_stack as usize,
-        rtl_compute_import_table_hash as usize,
-        rtl_flush_secure_memory_cache as usize,
-        rtl_set_critical_section_spin_count as usize,
-        rtl_try_enter_critical_section as usize,
+        rtl_initialize_slist_head as *const () as usize,
+        rtl_first_entry_slist as *const () as usize,
+        rtl_interlocked_push_entry_slist as *const () as usize,
+        rtl_interlocked_push_list_slist as *const () as usize,
+        rtl_interlocked_push_list_slist_ex as *const () as usize,
+        rtl_interlocked_pop_entry_slist as *const () as usize,
+        rtl_interlocked_flush_slist as *const () as usize,
+        rtl_query_depth_slist as *const () as usize,
+        rtl_get_last_nt_status as *const () as usize,
+        rtl_restore_last_win32_error as *const () as usize,
+        rtl_set_last_win32_error_and_nt_status_from_nt_status as *const () as usize,
+        rtl_get_thread_error_mode as *const () as usize,
+        rtl_set_thread_error_mode as *const () as usize,
+        rtl_validate_process_heaps as *const () as usize,
+        rtl_get_nt_product_type as *const () as usize,
+        rtl_get_version as *const () as usize,
+        rtl_get_nt_version_numbers as *const () as usize,
+        rtl_get_product_info as *const () as usize,
+        rtl_get_system_preferred_ui_languages as *const () as usize,
+        rtl_get_thread_preferred_ui_languages as *const () as usize,
+        rtl_get_user_preferred_ui_languages as *const () as usize,
+        rtl_lcid_to_locale_name as *const () as usize,
+        rtl_locale_name_to_lcid as *const () as usize,
+        rtl_lcid_to_culture_name as *const () as usize,
+        rtl_culture_name_to_lcid as *const () as usize,
+        rtl_convert_lcid_to_string as *const () as usize,
+        rtl_verify_version_info as *const () as usize,
+        rtl_get_current_processor_number as *const () as usize,
+        rtl_get_current_processor_number_ex as *const () as usize,
+        rtl_is_processor_feature_present as *const () as usize,
+        rtl_get_native_system_information as *const () as usize,
+        rtl_add_vectored_exception_handler as *const () as usize,
+        rtl_remove_vectored_exception_handler as *const () as usize,
+        rtl_add_vectored_continue_handler as *const () as usize,
+        rtl_remove_vectored_continue_handler as *const () as usize,
+        rtl_add_function_table as *const () as usize,
+        rtl_delete_function_table as *const () as usize,
+        rtl_install_function_table_callback as *const () as usize,
+        rtl_get_function_table_list_head as *const () as usize,
+        rtl_lookup_function_entry as *const () as usize,
+        rtl_capture_context as *const () as usize,
+        rtl_raise_status as *const () as usize,
+        rtl_raise_exception as *const () as usize,
+        rtl_unwind as *const () as usize,
+        rtl_unwind_ex as *const () as usize,
+        rtl_virtual_unwind as *const () as usize,
+        rtl_restore_context as *const () as usize,
+        rtl_dispatch_exception as *const () as usize,
+        ki_user_exception_dispatcher as *const () as usize,
+        rtl_exit_user_thread as *const () as usize,
+        rtl_exit_user_process as *const () as usize,
+        rtl_free_user_thread_stack as *const () as usize,
+        rtl_compute_import_table_hash as *const () as usize,
+        rtl_flush_secure_memory_cache as *const () as usize,
+        rtl_set_critical_section_spin_count as *const () as usize,
+        rtl_try_enter_critical_section as *const () as usize,
     ];
     core::hint::black_box(anchors_misc2);
     // BATCH 4 — SxS / path / guid / image / handle-table / resource / timer / debug.
     let anchors_sxs: &[usize] = &[
-        rtl_activate_activation_context as usize,
-        rtl_activate_activation_context_ex as usize,
-        rtl_activate_activation_context_unsafe_fast as usize,
-        rtl_deactivate_activation_context as usize,
-        rtl_deactivate_activation_context_unsafe_fast as usize,
-        rtl_create_activation_context as usize,
-        rtl_add_ref_activation_context as usize,
-        rtl_release_activation_context as usize,
-        rtl_zombify_activation_context as usize,
-        rtl_get_active_activation_context as usize,
-        rtl_find_activation_context_section_string as usize,
-        rtl_find_activation_context_section_guid as usize,
-        rtl_query_information_activation_context as usize,
-        rtl_allocate_activation_context_stack as usize,
-        rtl_free_activation_context_stack as usize,
-        rtl_free_thread_activation_context_stack as usize,
-        rtl_is_activation_context_active as usize,
-        rtl_query_information_active_activation_context as usize,
+        rtl_activate_activation_context as *const () as usize,
+        rtl_activate_activation_context_ex as *const () as usize,
+        rtl_activate_activation_context_unsafe_fast as *const () as usize,
+        rtl_deactivate_activation_context as *const () as usize,
+        rtl_deactivate_activation_context_unsafe_fast as *const () as usize,
+        rtl_create_activation_context as *const () as usize,
+        rtl_add_ref_activation_context as *const () as usize,
+        rtl_release_activation_context as *const () as usize,
+        rtl_zombify_activation_context as *const () as usize,
+        rtl_get_active_activation_context as *const () as usize,
+        rtl_find_activation_context_section_string as *const () as usize,
+        rtl_find_activation_context_section_guid as *const () as usize,
+        rtl_query_information_activation_context as *const () as usize,
+        rtl_allocate_activation_context_stack as *const () as usize,
+        rtl_free_activation_context_stack as *const () as usize,
+        rtl_free_thread_activation_context_stack as *const () as usize,
+        rtl_is_activation_context_active as *const () as usize,
+        rtl_query_information_active_activation_context as *const () as usize,
         rtl_query_activation_context_application_settings as *const () as usize,
-        rtl_is_thread_within_loader_callout as usize,
+        rtl_is_thread_within_loader_callout as *const () as usize,
     ];
     core::hint::black_box(anchors_sxs);
     let anchors_pathimg: &[usize] = &[
-        rtl_ipv4_address_to_string_a as usize,
-        rtl_ipv4_address_to_string_w as usize,
-        rtl_ipv4_address_to_string_ex_a as usize,
-        rtl_ipv4_address_to_string_ex_w as usize,
-        rtl_ipv6_address_to_string_a as usize,
-        rtl_ipv6_address_to_string_w as usize,
-        rtl_ipv6_address_to_string_ex_a as usize,
-        rtl_ipv6_address_to_string_ex_w as usize,
-        rtl_ipv4_string_to_address_a as usize,
-        rtl_ipv4_string_to_address_w as usize,
-        rtl_ipv4_string_to_address_ex_a as usize,
-        rtl_ipv4_string_to_address_ex_w as usize,
-        rtl_ipv6_string_to_address_a as usize,
-        rtl_ipv6_string_to_address_w as usize,
-        rtl_ipv6_string_to_address_ex_a as usize,
-        rtl_ipv6_string_to_address_ex_w as usize,
-        rtl_determine_dos_path_name_type_u as usize,
-        rtl_determine_dos_path_name_type_ustr as usize,
-        rtl_get_longest_nt_path_length as usize,
-        rtl_nt_path_name_to_dos_path_name as usize,
-        rtl_get_compression_work_space_size as usize,
-        rtl_compress_buffer as usize,
-        rtl_decompress_fragment as usize,
-        rtl_decompress_buffer as usize,
-        rtl_get_length_without_trailing_path_seperators as usize,
-        rtl_get_length_without_last_full_dos_or_nt_path_element as usize,
-        rtlp_apply_length_function as usize,
-        rtl_is_dos_device_name_u as usize,
-        rtl_is_dos_device_name_ustr as usize,
-        rtl_is_name_legal_dos_8dot3 as usize,
-        rtl_generate_8dot3_name as usize,
-        rtl_compute_privatized_dll_name_u as usize,
-        rtl_guid_from_string as usize,
-        rtl_string_from_guid as usize,
-        rtl_image_nt_header_ex as usize,
-        rtl_image_nt_header as usize,
-        rtl_image_directory_entry_to_data as usize,
-        rtl_image_rva_to_section as usize,
-        rtl_image_rva_to_va as usize,
-        rtl_address_in_section_table as usize,
-        rtl_pc_to_file_header as usize,
-        rtl_lookup_function_table as usize,
-        rtl_initialize_handle_table as usize,
-        rtl_destroy_handle_table as usize,
-        rtl_allocate_handle as usize,
-        rtl_free_handle as usize,
-        rtl_is_valid_handle as usize,
-        rtl_is_valid_index_handle as usize,
-        rtl_splay as usize,
-        rtl_delete as usize,
-        rtl_delete_no_splay as usize,
-        rtl_real_predecessor as usize,
-        rtl_real_successor as usize,
-        rtl_subtree_predecessor as usize,
-        rtl_subtree_successor as usize,
-        pfx_initialize as usize,
-        pfx_insert_prefix as usize,
-        pfx_remove_prefix as usize,
-        pfx_find_prefix as usize,
-        rtl_initialize_generic_table as usize,
-        rtl_insert_element_generic_table as usize,
-        rtl_insert_element_generic_table_full as usize,
-        rtl_is_generic_table_empty as usize,
-        rtl_number_generic_table_elements as usize,
-        rtl_lookup_element_generic_table as usize,
-        rtl_lookup_element_generic_table_full as usize,
-        rtl_delete_element_generic_table as usize,
-        rtl_enumerate_generic_table as usize,
-        rtl_enumerate_generic_table_without_splaying as usize,
-        rtl_get_element_generic_table as usize,
-        rtl_initialize_generic_table_avl as usize,
-        rtl_insert_element_generic_table_avl as usize,
-        rtl_insert_element_generic_table_full_avl as usize,
-        rtl_is_generic_table_empty_avl as usize,
-        rtl_number_generic_table_elements_avl as usize,
-        rtl_lookup_element_generic_table_avl as usize,
-        rtl_lookup_element_generic_table_full_avl as usize,
-        rtl_delete_element_generic_table_avl as usize,
-        rtl_enumerate_generic_table_avl as usize,
-        rtl_enumerate_generic_table_without_splaying_avl as usize,
-        rtl_lookup_first_matching_element_generic_table_avl as usize,
-        rtl_get_element_generic_table_avl as usize,
-        rtl_enumerate_generic_table_like_a_directory as usize,
-        rtl_initialize_resource as usize,
-        rtl_delete_resource as usize,
-        rtl_acquire_resource_shared as usize,
-        rtl_acquire_resource_exclusive as usize,
-        rtl_release_resource as usize,
-        rtl_convert_shared_to_exclusive as usize,
-        rtl_convert_exclusive_to_shared as usize,
-        rtl_dump_resource as usize,
+        rtl_ipv4_address_to_string_a as *const () as usize,
+        rtl_ipv4_address_to_string_w as *const () as usize,
+        rtl_ipv4_address_to_string_ex_a as *const () as usize,
+        rtl_ipv4_address_to_string_ex_w as *const () as usize,
+        rtl_ipv6_address_to_string_a as *const () as usize,
+        rtl_ipv6_address_to_string_w as *const () as usize,
+        rtl_ipv6_address_to_string_ex_a as *const () as usize,
+        rtl_ipv6_address_to_string_ex_w as *const () as usize,
+        rtl_ipv4_string_to_address_a as *const () as usize,
+        rtl_ipv4_string_to_address_w as *const () as usize,
+        rtl_ipv4_string_to_address_ex_a as *const () as usize,
+        rtl_ipv4_string_to_address_ex_w as *const () as usize,
+        rtl_ipv6_string_to_address_a as *const () as usize,
+        rtl_ipv6_string_to_address_w as *const () as usize,
+        rtl_ipv6_string_to_address_ex_a as *const () as usize,
+        rtl_ipv6_string_to_address_ex_w as *const () as usize,
+        rtl_determine_dos_path_name_type_u as *const () as usize,
+        rtl_determine_dos_path_name_type_ustr as *const () as usize,
+        rtl_get_longest_nt_path_length as *const () as usize,
+        rtl_nt_path_name_to_dos_path_name as *const () as usize,
+        rtl_get_compression_work_space_size as *const () as usize,
+        rtl_compress_buffer as *const () as usize,
+        rtl_decompress_fragment as *const () as usize,
+        rtl_decompress_buffer as *const () as usize,
+        rtl_get_length_without_trailing_path_seperators as *const () as usize,
+        rtl_get_length_without_last_full_dos_or_nt_path_element as *const () as usize,
+        rtlp_apply_length_function as *const () as usize,
+        rtl_is_dos_device_name_u as *const () as usize,
+        rtl_is_dos_device_name_ustr as *const () as usize,
+        rtl_is_name_legal_dos_8dot3 as *const () as usize,
+        rtl_generate_8dot3_name as *const () as usize,
+        rtl_compute_privatized_dll_name_u as *const () as usize,
+        rtl_guid_from_string as *const () as usize,
+        rtl_string_from_guid as *const () as usize,
+        rtl_image_nt_header_ex as *const () as usize,
+        rtl_image_nt_header as *const () as usize,
+        rtl_image_directory_entry_to_data as *const () as usize,
+        rtl_image_rva_to_section as *const () as usize,
+        rtl_image_rva_to_va as *const () as usize,
+        rtl_address_in_section_table as *const () as usize,
+        rtl_pc_to_file_header as *const () as usize,
+        rtl_lookup_function_table as *const () as usize,
+        rtl_initialize_handle_table as *const () as usize,
+        rtl_destroy_handle_table as *const () as usize,
+        rtl_allocate_handle as *const () as usize,
+        rtl_free_handle as *const () as usize,
+        rtl_is_valid_handle as *const () as usize,
+        rtl_is_valid_index_handle as *const () as usize,
+        rtl_splay as *const () as usize,
+        rtl_delete as *const () as usize,
+        rtl_delete_no_splay as *const () as usize,
+        rtl_real_predecessor as *const () as usize,
+        rtl_real_successor as *const () as usize,
+        rtl_subtree_predecessor as *const () as usize,
+        rtl_subtree_successor as *const () as usize,
+        pfx_initialize as *const () as usize,
+        pfx_insert_prefix as *const () as usize,
+        pfx_remove_prefix as *const () as usize,
+        pfx_find_prefix as *const () as usize,
+        rtl_initialize_generic_table as *const () as usize,
+        rtl_insert_element_generic_table as *const () as usize,
+        rtl_insert_element_generic_table_full as *const () as usize,
+        rtl_is_generic_table_empty as *const () as usize,
+        rtl_number_generic_table_elements as *const () as usize,
+        rtl_lookup_element_generic_table as *const () as usize,
+        rtl_lookup_element_generic_table_full as *const () as usize,
+        rtl_delete_element_generic_table as *const () as usize,
+        rtl_enumerate_generic_table as *const () as usize,
+        rtl_enumerate_generic_table_without_splaying as *const () as usize,
+        rtl_get_element_generic_table as *const () as usize,
+        rtl_initialize_generic_table_avl as *const () as usize,
+        rtl_insert_element_generic_table_avl as *const () as usize,
+        rtl_insert_element_generic_table_full_avl as *const () as usize,
+        rtl_is_generic_table_empty_avl as *const () as usize,
+        rtl_number_generic_table_elements_avl as *const () as usize,
+        rtl_lookup_element_generic_table_avl as *const () as usize,
+        rtl_lookup_element_generic_table_full_avl as *const () as usize,
+        rtl_delete_element_generic_table_avl as *const () as usize,
+        rtl_enumerate_generic_table_avl as *const () as usize,
+        rtl_enumerate_generic_table_without_splaying_avl as *const () as usize,
+        rtl_lookup_first_matching_element_generic_table_avl as *const () as usize,
+        rtl_get_element_generic_table_avl as *const () as usize,
+        rtl_enumerate_generic_table_like_a_directory as *const () as usize,
+        rtl_initialize_resource as *const () as usize,
+        rtl_delete_resource as *const () as usize,
+        rtl_acquire_resource_shared as *const () as usize,
+        rtl_acquire_resource_exclusive as *const () as usize,
+        rtl_release_resource as *const () as usize,
+        rtl_convert_shared_to_exclusive as *const () as usize,
+        rtl_convert_exclusive_to_shared as *const () as usize,
+        rtl_dump_resource as *const () as usize,
     ];
     core::hint::black_box(anchors_pathimg);
     let anchors_timer: &[usize] = &[
-        rtl_create_timer_queue as usize,
-        rtl_create_timer as usize,
-        rtl_set_timer as usize,
-        rtl_update_timer as usize,
-        rtl_delete_timer as usize,
-        rtl_cancel_timer as usize,
-        rtl_delete_timer_queue_ex as usize,
-        rtl_delete_timer_queue as usize,
-        rtl_queue_work_item as usize,
-        rtl_register_wait as usize,
-        rtl_deregister_wait as usize,
-        rtl_deregister_wait_ex as usize,
-        rtl_set_io_completion_callback as usize,
-        rtl_set_thread_pool_start_func as usize,
-        rtl_query_time_zone_information as usize,
-        rtl_set_time_zone_information as usize,
-        rtl_create_query_debug_buffer as usize,
-        rtl_destroy_query_debug_buffer as usize,
-        rtl_query_process_heap_information as usize,
-        rtl_query_process_debug_information as usize,
-        rtl_get_unload_event_trace as usize,
-        rtl_get_unload_event_trace_ex as usize,
-        rtl_trace_database_create as usize,
-        rtl_trace_database_add as usize,
-        rtl_trace_database_destroy as usize,
-        rtl_trace_database_enumerate as usize,
-        rtl_trace_database_find as usize,
-        rtl_trace_database_lock as usize,
-        rtl_trace_database_unlock as usize,
-        rtl_trace_database_validate as usize,
-        rtl_wow64_enable_fs_redirection as usize,
-        rtl_wow64_enable_fs_redirection_ex as usize,
+        rtl_create_timer_queue as *const () as usize,
+        rtl_create_timer as *const () as usize,
+        rtl_set_timer as *const () as usize,
+        rtl_update_timer as *const () as usize,
+        rtl_delete_timer as *const () as usize,
+        rtl_cancel_timer as *const () as usize,
+        rtl_delete_timer_queue_ex as *const () as usize,
+        rtl_delete_timer_queue as *const () as usize,
+        rtl_queue_work_item as *const () as usize,
+        rtl_register_wait as *const () as usize,
+        rtl_deregister_wait as *const () as usize,
+        rtl_deregister_wait_ex as *const () as usize,
+        rtl_set_io_completion_callback as *const () as usize,
+        rtl_set_thread_pool_start_func as *const () as usize,
+        rtl_query_time_zone_information as *const () as usize,
+        rtl_set_time_zone_information as *const () as usize,
+        rtl_create_query_debug_buffer as *const () as usize,
+        rtl_destroy_query_debug_buffer as *const () as usize,
+        rtl_query_process_heap_information as *const () as usize,
+        rtl_query_process_debug_information as *const () as usize,
+        rtl_get_unload_event_trace as *const () as usize,
+        rtl_get_unload_event_trace_ex as *const () as usize,
+        rtl_trace_database_create as *const () as usize,
+        rtl_trace_database_add as *const () as usize,
+        rtl_trace_database_destroy as *const () as usize,
+        rtl_trace_database_enumerate as *const () as usize,
+        rtl_trace_database_find as *const () as usize,
+        rtl_trace_database_lock as *const () as usize,
+        rtl_trace_database_unlock as *const () as usize,
+        rtl_trace_database_validate as *const () as usize,
+        rtl_wow64_enable_fs_redirection as *const () as usize,
+        rtl_wow64_enable_fs_redirection_ex as *const () as usize,
     ];
     core::hint::black_box(anchors_timer);
     // BATCH 4 — Ldr* resource/loader-lock/shutdown/enumerate + path/env/message stragglers.
     let anchors_ldr: &[usize] = &[
-        ldr_lock_loader_lock as usize,
-        ldr_unlock_loader_lock as usize,
-        ldr_init_shim_engine_dynamic as usize,
-        ldr_disable_thread_callouts_for_dll as usize,
-        ldr_add_ref_dll as usize,
-        ldr_process_relocation_block as usize,
-        ldr_alternate_resources_enabled as usize,
-        ldr_add_load_as_data_table as usize,
-        ldr_remove_load_as_data_table as usize,
-        ldr_get_file_name_from_load_as_data_table as usize,
-        ldr_register_dll_notification as usize,
-        ldr_unregister_dll_notification as usize,
-        ldr_get_dll_handle_ex as usize,
-        ldr_enumerate_loaded_modules as usize,
-        ldr_shutdown_process as usize,
-        ldr_shutdown_thread as usize,
-        ldr_set_dll_manifest_prober as usize,
-        ldr_set_app_compat_dll_redirection_callback as usize,
-        ldr_open_image_file_options_key as usize,
-        ldr_query_image_file_key_option as usize,
-        ldr_find_resource_u as usize,
-        ldr_find_resource_ex_u as usize,
-        ldr_find_resource_directory_u as usize,
-        ldr_res_find_resource as usize,
-        ldr_res_find_resource_directory as usize,
-        ldr_res_search_resource as usize,
-        ldrp_res_get_resource_directory as usize,
-        ldrp_res_get_rc_config as usize,
-        ldr_res_release as usize,
-        ldrp_res_get_mapping_size as usize,
-        ldr_enum_resources as usize,
-        ldr_access_resource as usize,
-        ldr_load_alternate_resource_module as usize,
-        ldr_load_alternate_resource_module_ex as usize,
-        ldr_unload_alternate_resource_module as usize,
-        ldr_unload_alternate_resource_module_ex as usize,
-        ldr_flush_alternate_resource_modules as usize,
+        ldr_lock_loader_lock as *const () as usize,
+        ldr_unlock_loader_lock as *const () as usize,
+        ldr_init_shim_engine_dynamic as *const () as usize,
+        ldr_disable_thread_callouts_for_dll as *const () as usize,
+        ldr_add_ref_dll as *const () as usize,
+        ldr_process_relocation_block as *const () as usize,
+        ldr_alternate_resources_enabled as *const () as usize,
+        ldr_add_load_as_data_table as *const () as usize,
+        ldr_remove_load_as_data_table as *const () as usize,
+        ldr_get_file_name_from_load_as_data_table as *const () as usize,
+        ldr_register_dll_notification as *const () as usize,
+        ldr_unregister_dll_notification as *const () as usize,
+        ldr_get_dll_handle_ex as *const () as usize,
+        ldr_enumerate_loaded_modules as *const () as usize,
+        ldr_shutdown_process as *const () as usize,
+        ldr_shutdown_thread as *const () as usize,
+        ldr_set_dll_manifest_prober as *const () as usize,
+        ldr_set_app_compat_dll_redirection_callback as *const () as usize,
+        ldr_open_image_file_options_key as *const () as usize,
+        ldr_query_image_file_key_option as *const () as usize,
+        ldr_find_resource_u as *const () as usize,
+        ldr_find_resource_ex_u as *const () as usize,
+        ldr_find_resource_directory_u as *const () as usize,
+        ldr_res_find_resource as *const () as usize,
+        ldr_res_find_resource_directory as *const () as usize,
+        ldr_res_search_resource as *const () as usize,
+        ldrp_res_get_resource_directory as *const () as usize,
+        ldrp_res_get_rc_config as *const () as usize,
+        ldr_res_release as *const () as usize,
+        ldrp_res_get_mapping_size as *const () as usize,
+        ldr_enum_resources as *const () as usize,
+        ldr_access_resource as *const () as usize,
+        ldr_load_alternate_resource_module as *const () as usize,
+        ldr_load_alternate_resource_module_ex as *const () as usize,
+        ldr_unload_alternate_resource_module as *const () as usize,
+        ldr_unload_alternate_resource_module_ex as *const () as usize,
+        ldr_flush_alternate_resource_modules as *const () as usize,
     ];
     core::hint::black_box(anchors_ldr);
     let anchors_pathenv: &[usize] = &[
-        rtl_destroy_environment as usize,
-        rtl_expand_environment_strings as usize,
-        rtl_query_environment_variable as usize,
-        rtl_set_current_environment as usize,
-        rtl_set_environment_strings as usize,
-        rtl_get_current_transaction as usize,
-        rtl_set_current_transaction as usize,
-        rtl_get_frame as usize,
-        rtl_push_frame as usize,
-        rtl_pop_frame as usize,
-        rtl_is_current_thread_attach_exempt as usize,
-        rtl_get_current_directory_u as usize,
-        rtl_set_current_directory_u as usize,
-        rtl_get_full_path_name_u as usize,
-        rtl_get_full_path_name_ustr_ex as usize,
-        rtl_dos_path_name_to_relative_nt_path_name_u as usize,
-        rtl_dos_path_name_to_relative_nt_path_name_u_with_status as usize,
-        rtl_release_relative_name as usize,
-        rtl_dos_search_path_ustr as usize,
+        rtl_destroy_environment as *const () as usize,
+        rtl_expand_environment_strings as *const () as usize,
+        rtl_query_environment_variable as *const () as usize,
+        rtl_set_current_environment as *const () as usize,
+        rtl_set_environment_strings as *const () as usize,
+        rtl_get_current_transaction as *const () as usize,
+        rtl_set_current_transaction as *const () as usize,
+        rtl_get_frame as *const () as usize,
+        rtl_push_frame as *const () as usize,
+        rtl_pop_frame as *const () as usize,
+        rtl_is_current_thread_attach_exempt as *const () as usize,
+        rtl_get_current_directory_u as *const () as usize,
+        rtl_set_current_directory_u as *const () as usize,
+        rtl_get_full_path_name_u as *const () as usize,
+        rtl_get_full_path_name_ustr_ex as *const () as usize,
+        rtl_dos_path_name_to_relative_nt_path_name_u as *const () as usize,
+        rtl_dos_path_name_to_relative_nt_path_name_u_with_status as *const () as usize,
+        rtl_release_relative_name as *const () as usize,
+        rtl_dos_search_path_ustr as *const () as usize,
         rtl_dos_apply_file_isolation_redirection_ustr as *const () as usize,
-        rtl_find_message as usize,
+        rtl_find_message as *const () as usize,
         rtl_format_message as *const () as usize,
         rtl_format_message_ex as *const () as usize,
     ];

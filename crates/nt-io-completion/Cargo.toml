@@ -9,3 +9,4 @@ path = "src/lib.rs"
 
 [dependencies]
 nt-time.workspace = true
+nt-types.workspace = true

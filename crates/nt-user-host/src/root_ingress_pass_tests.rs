@@ -1,0 +1,560 @@
+use super::*;
+use alloc::boxed::Box;
+use crate::process_identity::{ProcessGeneration, ProcessIdentity};
+use crate::thread_binding::ThreadBinding;
+use nt_component_suspension::{
+    peer_registry::PeerRegistry, ComponentIngress, ComponentSuspensionLanes, ExternalIngress,
+    IngressReceiveDisposition, IngressReceiver, IngressReplyObservation, IngressReplyPool,
+    LaneBinding, NestedExecutionScope, ReplyBindingObservation,
+};
+
+fn free(_: u64, _: u64) -> Result<ReplyBindingObservation, u8> {
+    Ok(ReplyBindingObservation::Free)
+}
+
+fn spare_free(_: u64) -> Result<ReplyBindingObservation, u8> {
+    Ok(ReplyBindingObservation::Free)
+}
+
+fn bound(_: u64, _: u64) -> Result<ReplyBindingObservation, u8> {
+    Ok(ReplyBindingObservation::BoundToTarget)
+}
+
+fn binding() -> ThreadBinding<u8> {
+    ThreadBinding {
+        pi: 7,
+        process: ProcessIdentity {
+            pid: 304,
+            generation: ProcessGeneration::Hosted(2),
+        },
+        tid: 312,
+        badge: 614,
+        role: 0,
+        tcb: 10,
+        reservations: None,
+    }
+}
+
+struct Child {
+    receiver: IngressReceiver<u64>,
+    call: Option<ExternalIngress<u64>>,
+}
+
+impl Child {
+    fn new(reply: u64) -> Self {
+        let lanes = ComponentSuspensionLanes::<(), (), ()>::new(1, 1);
+        let mut receiver = IngressReceiver::new(20, reply, 1).unwrap();
+        let mut pool = IngressReplyPool::new(20, 1).unwrap();
+        pool.insert(
+            ComponentIngress::new(20, reply + 1).unwrap(),
+            &receiver,
+            &lanes,
+            spare_free,
+        )
+        .ok()
+        .unwrap();
+        receiver.begin_receive(&lanes).unwrap();
+        receiver.capture(191).ok().unwrap();
+        receiver
+            .resolve(IngressReceiveDisposition::Call)
+            .ok()
+            .unwrap();
+        let call = pool
+            .retain_external(&mut receiver, &lanes, 10, spare_free, bound)
+            .unwrap();
+        Self {
+            receiver,
+            call: Some(call),
+        }
+    }
+
+    fn settle(&mut self) -> nt_component_suspension::ExternalSettlement {
+        self.call
+            .as_mut()
+            .unwrap()
+            .reply_owned(bound, |_| IngressReplyObservation::Acknowledged)
+            .unwrap();
+        self.receiver
+            .finish_external_with_settlement(&mut self.call, free)
+            .unwrap()
+            .2
+    }
+}
+
+fn new_parent() -> NestedExecutionScope {
+    new_parent_at(50)
+}
+
+fn new_parent_at(endpoint: u64) -> NestedExecutionScope {
+    let mut lanes = ComponentSuspensionLanes::<(), (), ()>::new(1, 1);
+    let mut peers = PeerRegistry::new(endpoint, 1);
+    let (_, mut registration) = lanes
+        .allocate_shared_staged(
+            &mut peers,
+            17,
+            1,
+            LaneBinding {
+                executor_id: 100,
+                receive_endpoint: endpoint,
+                reply_object: 200,
+            },
+        )
+        .unwrap();
+    let route = peers
+        .publish_lane(&mut registration, 17, 1, &lanes)
+        .unwrap();
+    let dispatch = lanes.begin_bootstrap_dispatch(route, &peers, free).unwrap();
+    let mut receiver = IngressReceiver::<u64>::new(endpoint, 60, 1).unwrap();
+    receiver
+        .suspend_for_nested_execution(route, dispatch, &mut lanes, &peers, free)
+        .unwrap()
+}
+
+#[test]
+fn undelivered_unwind_seals_exact_prepared_child_without_delivery() {
+    let child = Child::new(83);
+    let foreign = Child::new(93);
+    let call = child.call.as_ref().unwrap();
+    let mut pass = RootIngressPass::prepare(call, binding()).unwrap();
+    assert_eq!(
+        pass.begin_undelivered_unwind(binding(), foreign.call.as_ref().unwrap()).unwrap_err(),
+        PassError::WrongChild,
+    );
+    let mut foreign_binding = binding();
+    foreign_binding.tid += 1;
+    assert_eq!(pass.begin_undelivered_unwind(foreign_binding, call).unwrap_err(), PassError::WrongChild);
+    let token = pass.begin_undelivered_unwind(binding(), call).unwrap();
+    assert_eq!(token.child(), binding());
+    assert_eq!(token.admission_key(), call.admission_key());
+    let parent = new_parent();
+    assert_eq!(pass.bind_parent(&parent, parent.dispatch()).unwrap_err(), PassError::AlreadyBound);
+    assert!(pass.is_undelivered_unwind(&token));
+    assert_eq!(unsafe { pass.deliver(binding(), call) }.unwrap_err(), PassError::InvalidPhase);
+    assert_eq!(pass.begin_undelivered_unwind(binding(), call).unwrap_err(), PassError::Consumed);
+}
+
+#[test]
+fn selected_import_entry_seals_one_attempt_until_positive_delivery() {
+    let child = Child::new(113);
+    let parent = new_parent();
+    let call = child.call.as_ref().unwrap();
+    let mut pass = RootIngressPass::prepare(call, binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    let mut foreign_binding = binding();
+    foreign_binding.tid += 1;
+    assert_eq!(pass.begin_import(foreign_binding, call).unwrap_err(), PassError::WrongChild);
+    let _attempt = pass.begin_import(binding(), call).unwrap();
+    assert_eq!(pass.begin_import(binding(), call).unwrap_err(), PassError::Consumed);
+    assert_eq!(pass.begin_restore(&parent).unwrap_err(), PassError::Unsettled);
+    // A false/uncertain native callback leaves this phase sealed. Only a positive observation
+    // of that same attempt may make the child an ordinary delivered root event.
+    unsafe { pass.deliver(binding(), call) }.unwrap();
+    assert_eq!(pass.begin_import(binding(), call).unwrap_err(), PassError::Consumed);
+}
+
+#[test]
+fn exact_no_effect_import_refusal_reopens_only_its_own_attempt() {
+    let child = Child::new(114);
+    let foreign = Child::new(115);
+    let parent = new_parent();
+    let call = child.call.as_ref().unwrap();
+    let mut pass = RootIngressPass::prepare(call, binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    let attempt = pass.begin_import(binding(), call).unwrap();
+    let refusal = unsafe { attempt.after_no_effect_native_refusal() };
+    let (error, refusal) = pass.abort_import_before_effect(
+        binding(), foreign.call.as_ref().unwrap(), parent.identity(), refusal,
+    ).unwrap_err();
+    assert_eq!(error, PassError::WrongChild);
+    assert_eq!(pass.begin_import(binding(), call).unwrap_err(), PassError::Consumed);
+    let foreign_parent = new_parent_at(51);
+    let (error, refusal) = pass.abort_import_before_effect(
+        binding(), call, foreign_parent.identity(), refusal,
+    ).unwrap_err();
+    assert_eq!(error, PassError::WrongParent);
+    pass.abort_import_before_effect(binding(), call, parent.identity(), refusal).unwrap();
+    let later = pass.begin_import(binding(), call).unwrap();
+    assert_eq!(pass.begin_import(binding(), call).unwrap_err(), PassError::Consumed);
+    // A later uncertain native import has no certified refusal and cannot be replayed.
+    drop(later);
+    assert_eq!(pass.begin_import(binding(), call).unwrap_err(), PassError::Consumed);
+}
+
+#[test]
+fn acknowledged_child_checkpoints_exact_parent_once() {
+    let mut child = Child::new(30);
+    let mut foreign_child = Child::new(60);
+    let parent = new_parent();
+    let key = child.call.as_ref().unwrap().admission_key();
+    let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    assert_eq!(
+        unsafe { pass.deliver(binding(), foreign_child.call.as_ref().unwrap()) }
+            .unwrap_err(),
+        PassError::WrongChild,
+    );
+    let _attempt = pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }
+        .unwrap();
+    assert_eq!(
+        pass.begin_restore(&parent).unwrap_err(),
+        PassError::Unsettled
+    );
+    let foreign_settlement = foreign_child.settle();
+    let (error, returned) = pass
+        .acknowledge_settlement(binding(), foreign_settlement)
+        .unwrap_err();
+    assert_eq!(error, PassError::WrongChild);
+    assert_ne!(returned.admission_key(), key);
+    assert_eq!(
+        pass.begin_restore(&parent).unwrap_err(),
+        PassError::Unsettled
+    );
+    let settled = child.settle();
+    pass.acknowledge_settlement(binding(), settled).unwrap();
+    let permit = pass.begin_restore(&parent).unwrap();
+    assert_eq!(permit.parent(), parent.identity());
+    assert_eq!(permit.child(), binding());
+    assert_eq!(permit.admission_key(), key);
+    assert_eq!(permit.checkpoint().parent(), parent.identity());
+    assert_eq!(permit.checkpoint().child(), key);
+    assert!(permit.settlement().is_some());
+    // Native supplies the positive physical restore observation; the exact nonclone child
+    // settlement must survive the transfer into the resulting receipt.
+    let mut restored = unsafe { permit.acknowledge_restore() };
+    assert!(!restored.parked_child());
+    assert_eq!(restored.take_settlement().unwrap().admission_key(), key);
+    assert!(!restored.parked_child());
+    assert_eq!(
+        pass.begin_restore(&parent).unwrap_err(),
+        PassError::Consumed
+    );
+}
+
+#[test]
+fn rejected_exact_free_receipt_remains_available_for_pre_restore_checkpoint() {
+    let mut child = Child::new(72);
+    let parent = new_parent();
+    let call = child.call.as_ref().unwrap();
+    let key = call.admission_key();
+    let mut pass = RootIngressPass::prepare(call, binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    let _attempt = pass.begin_import(binding(), call).unwrap();
+    unsafe { pass.deliver(binding(), call) }.unwrap();
+    let mut wrong_binding = binding();
+    wrong_binding.tid += 1;
+    let (error, receipt) = pass.acknowledge_settlement(wrong_binding, child.settle()).unwrap_err();
+    assert_eq!(error, PassError::WrongChild);
+    assert_eq!(receipt.admission_key(), key);
+    assert_eq!(pass.begin_restore(&parent).unwrap_err(), PassError::Unsettled);
+    assert_eq!(pass.settlement_disposition(binding(), key).unwrap(),
+        (parent.identity(), RootIngressSettlementDisposition::Checkpoint));
+    pass.acknowledge_settlement(binding(), receipt).unwrap();
+    assert_eq!(pass.begin_restore(&parent).unwrap().admission_key(), key);
+}
+
+#[test]
+fn parked_child_restores_parent_but_keeps_its_reply_for_later_settlement() {
+    let mut child = Child::new(40);
+    let parent = new_parent();
+    let key = child.call.as_ref().unwrap().admission_key();
+    let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    let _attempt = pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }
+        .unwrap();
+    let attempt = pass.begin_park(binding(), child.call.as_ref().unwrap())
+        .unwrap();
+    assert_eq!(
+        pass.begin_restore(&parent).unwrap_err(),
+        PassError::Unsettled
+    );
+    let mut wrong = binding();
+    wrong.tcb += 1;
+    let committed = unsafe { attempt.after_positive_native_park() };
+    let (error, committed) = unsafe {
+        pass.acknowledge_park(wrong, child.call.as_ref().unwrap(), committed)
+    }.unwrap_err();
+    assert_eq!(error, PassError::WrongChild);
+    assert_eq!(
+        pass.begin_restore(&parent).unwrap_err(),
+        PassError::Unsettled
+    );
+    // Native calls acknowledge_park only after its RootReplyPark::commit succeeds.
+    unsafe { pass.acknowledge_park(binding(), child.call.as_ref().unwrap(), committed) }
+        .unwrap();
+    let permit = pass.begin_restore(&parent).unwrap();
+    assert_eq!(permit.parent(), parent.identity());
+    assert_eq!(permit.checkpoint().parent(), parent.identity());
+    assert_eq!(permit.checkpoint().child(), key);
+    assert!(permit.settlement().is_none());
+    assert_eq!(
+        pass.begin_restore(&parent).unwrap_err(),
+        PassError::Consumed
+    );
+    assert!(child.call.as_ref().unwrap().can_park());
+    let later = child.settle();
+    assert_eq!(later.admission_key(), key);
+}
+
+#[test]
+fn unknown_park_refuses_until_exact_later_settlement() {
+    let mut child = Child::new(50);
+    let parent = new_parent();
+    let foreign_parent = new_parent();
+    let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    let _attempt = pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }
+        .unwrap();
+    let _attempt = pass.begin_park(binding(), child.call.as_ref().unwrap())
+        .unwrap();
+    assert_eq!(
+        pass.begin_park(binding(), child.call.as_ref().unwrap())
+            .unwrap_err(),
+        PassError::InvalidPhase
+    );
+    assert_eq!(
+        pass.begin_restore(&parent).unwrap_err(),
+        PassError::Unsettled
+    );
+    assert_eq!(
+        pass.begin_restore(&foreign_parent).unwrap_err(),
+        PassError::WrongParent
+    );
+    assert!(child.call.as_ref().unwrap().can_park());
+    // A later positive child settlement reconciles uncertainty without replaying park.
+    pass.acknowledge_settlement(binding(), child.settle())
+        .unwrap();
+    assert_eq!(
+        pass.begin_restore(&foreign_parent).unwrap_err(),
+        PassError::WrongParent
+    );
+    assert_eq!(
+        pass.begin_restore(&parent).unwrap().parent(),
+        parent.identity()
+    );
+}
+
+#[test]
+fn park_entry_returns_a_move_only_attempt_instead_of_numeric_reply_authority() {
+    let child = Child::new(65);
+    let parent = new_parent();
+    let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    let _attempt = pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }.unwrap();
+    let attempt = pass.begin_park(binding(), child.call.as_ref().unwrap()).unwrap();
+    assert!(core::any::type_name_of_val(&attempt).contains("RootIngressParkAttempt"));
+}
+
+#[test]
+fn exact_pre_effect_refusal_reopens_only_its_own_park_attempt() {
+    let child = Child::new(75);
+    let foreign = Child::new(85);
+    let parent = new_parent();
+    let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    let _attempt = pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }.unwrap();
+    let attempt = pass.begin_park(binding(), child.call.as_ref().unwrap()).unwrap();
+    let no_effect = unsafe { attempt.after_no_effect_native_refusal() };
+    let (error, no_effect) = pass.abort_park_before_effect(
+        binding(), foreign.call.as_ref().unwrap(), no_effect,
+    ).unwrap_err();
+    assert_eq!(error, PassError::WrongChild);
+    assert_eq!(pass.begin_restore(&parent).unwrap_err(), PassError::Unsettled);
+    pass.abort_park_before_effect(binding(), child.call.as_ref().unwrap(), no_effect).unwrap();
+    let second = pass.begin_park(binding(), child.call.as_ref().unwrap()).unwrap();
+    assert_eq!(pass.begin_restore(&parent).unwrap_err(), PassError::Unsettled);
+    let positive = unsafe { second.after_positive_native_park() };
+    unsafe { pass.acknowledge_park(binding(), child.call.as_ref().unwrap(), positive) }.unwrap();
+    assert_eq!(pass.begin_restore(&parent).unwrap().parent(), parent.identity());
+}
+
+#[test]
+fn acknowledged_child_after_positive_park_upgrades_parent_checkpoint() {
+    let mut child = Child::new(105);
+    let parent = new_parent();
+    let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    let _attempt = pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }.unwrap();
+    let attempt = pass.begin_park(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe {
+        pass.acknowledge_park(
+            binding(), child.call.as_ref().unwrap(), attempt.after_positive_native_park(),
+        )
+    }.unwrap();
+    let settlement = child.settle();
+    pass.acknowledge_settlement(binding(), settlement).unwrap();
+    let permit = pass.begin_restore(&parent).unwrap();
+    assert!(permit.settlement().is_some());
+    assert!(!unsafe { permit.acknowledge_restore() }.parked_child());
+}
+
+#[test]
+fn settled_child_during_parent_restore_keeps_park_checkpoint_and_later_receipt_separate() {
+    let mut child = Child::new(115);
+    let parent = new_parent();
+    let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    let _attempt = pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }.unwrap();
+    let attempt = pass.begin_park(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe {
+        pass.acknowledge_park(
+            binding(), child.call.as_ref().unwrap(), attempt.after_positive_native_park(),
+        )
+    }.unwrap();
+    let permit = pass.begin_restore(&parent).unwrap();
+    assert_eq!(
+        pass.settlement_disposition(binding(), child.call.as_ref().unwrap().admission_key()),
+        Ok((parent.identity(), RootIngressSettlementDisposition::RetainForResult)),
+    );
+    let (error, later) = pass.acknowledge_settlement(binding(), child.settle()).unwrap_err();
+    assert_eq!(error, PassError::InvalidPhase);
+    assert_eq!(later.admission_key(), permit.admission_key());
+    assert!(unsafe { permit.acknowledge_restore() }.parked_child());
+}
+
+#[test]
+fn foreign_parent_refusal_cannot_reopen_a_held_child() {
+    let child = Child::new(95);
+    let parent = new_parent();
+    let foreign_parent = new_parent();
+    let mut pass = RootIngressPass::prepare(child.call.as_ref().unwrap(), binding()).unwrap();
+    pass.bind_parent(&parent, parent.dispatch()).unwrap();
+    let _attempt = pass.begin_import(binding(), child.call.as_ref().unwrap()).unwrap();
+    unsafe { pass.deliver(binding(), child.call.as_ref().unwrap()) }.unwrap();
+    let attempt = pass.begin_park(binding(), child.call.as_ref().unwrap()).unwrap();
+    let foreign = RootReplyParkNoEffect(RootIngressParkAttempt {
+        child: binding(), admission: child.call.as_ref().unwrap().admission_key(),
+        parent: foreign_parent.identity(), generation: attempt.generation,
+    });
+    let (error, foreign) = pass.abort_park_before_effect(
+        binding(), child.call.as_ref().unwrap(), foreign,
+    ).unwrap_err();
+    assert_eq!(error, PassError::WrongParent);
+    drop(foreign);
+    let no_effect = unsafe { attempt.after_no_effect_native_refusal() };
+    pass.abort_park_before_effect(binding(), child.call.as_ref().unwrap(), no_effect).unwrap();
+}
+
+#[test]
+fn root_ingress_handoff_keeps_exact_move_only_bundle_across_wrong_ticket_and_retry() {
+    use crate::root_ingress_handoff::{RootIngressHandoffKey, RootIngressHandoffTable};
+    let child = Child::new(127);
+    let parent = new_parent();
+    let key = RootIngressHandoffKey::new(
+        parent.identity(), child.call.as_ref().unwrap().admission_key(), 901,
+    ).unwrap();
+    let mut table = RootIngressHandoffTable::new();
+    let reservation = table.reserve().unwrap();
+    let ticket = table.retain(reservation, key, Box::new(17u64)).unwrap();
+    let mut foreign = RootIngressHandoffTable::new();
+    let foreign_reservation = foreign.reserve().unwrap();
+    let foreign_ticket = foreign.retain(foreign_reservation, key, Box::new(19u64)).unwrap();
+    assert!(table.take(foreign_ticket).is_none());
+    let bundle = table.take(ticket).unwrap();
+    assert!(table.take(ticket).is_none());
+    let bundle = table.restore(foreign_ticket, bundle).unwrap_err();
+    table.restore(ticket, bundle).unwrap();
+    assert_eq!(*table.take(ticket).unwrap(), 17);
+    assert_eq!(*foreign.take(foreign_ticket).unwrap(), 19);
+}
+
+#[test]
+fn root_ingress_handoff_refusal_returns_bundle_and_preserves_reserved_slot() {
+    use crate::root_ingress_handoff::{RootIngressHandoffKey, RootIngressHandoffTable};
+    let child = Child::new(137);
+    let parent = new_parent();
+    let key = RootIngressHandoffKey::new(
+        parent.identity(), child.call.as_ref().unwrap().admission_key(), 902,
+    ).unwrap();
+    let mut table = RootIngressHandoffTable::new();
+    let reservation = table.reserve().unwrap();
+    let mut foreign = RootIngressHandoffTable::<Box<u64>>::new();
+    let foreign_reservation = foreign.reserve().unwrap();
+    let (_, bundle) = table.retain(foreign_reservation, key, Box::new(23)).unwrap_err();
+    let ticket = table.retain(reservation, key, bundle).unwrap();
+    assert_eq!(*table.take(ticket).unwrap(), 23);
+
+    let stale = foreign_reservation;
+    assert!(foreign.cancel_reservation(stale));
+    let fresh = foreign.reserve().unwrap();
+    assert_ne!(stale, fresh);
+    let (_, bundle) = foreign.retain(stale, key, Box::new(29)).unwrap_err();
+    let fresh_ticket = foreign.retain(fresh, key, bundle).unwrap();
+    assert_eq!(*foreign.take(fresh_ticket).unwrap(), 29);
+}
+
+#[test]
+fn root_ingress_handoff_transition_retains_exact_owner_on_refusal_and_moves_once() {
+    use crate::root_ingress_handoff::{RootIngressHandoffKey, RootIngressHandoffTable};
+    #[derive(Debug)]
+    enum Stage { Unbound(Box<u64>), Bound }
+    let child = Child::new(139);
+    let parent = new_parent();
+    let key = RootIngressHandoffKey::new(
+        parent.identity(), child.call.as_ref().unwrap().admission_key(), 903,
+    ).unwrap();
+    let mut table = RootIngressHandoffTable::new();
+    let reservation = table.reserve().unwrap();
+    let ticket = table.retain(reservation, key, Stage::Unbound(Box::new(31u64))).unwrap();
+    let mut foreign = RootIngressHandoffTable::new();
+    let foreign_reservation = foreign.reserve().unwrap();
+    let foreign_ticket = foreign.retain(foreign_reservation, key, Stage::Unbound(Box::new(37u64))).unwrap();
+    assert!(table.transition_held(foreign_ticket, |_| Ok::<_, ((), _)>(Stage::Bound)).is_err());
+    let retained = table.take(ticket).unwrap();
+    assert!(table.transition_held(ticket, |_| Ok::<_, ((), _)>(Stage::Bound)).is_err());
+    table.restore(ticket, retained).unwrap();
+    assert!(matches!(table.get(ticket), Some(Stage::Unbound(value)) if **value == 31));
+    assert!(table.transition_held(ticket, |owner| Err::<_, _>(((), owner))).is_err());
+    assert!(matches!(table.get(ticket), Some(Stage::Unbound(value)) if **value == 31));
+    table.transition_held(ticket, |owner| {
+        assert!(matches!(owner, Stage::Unbound(value) if *value == 31));
+        Ok::<_, ((), _)>(Stage::Bound)
+    }).unwrap();
+    assert!(matches!(table.get(ticket), Some(Stage::Bound)));
+    assert!(table.transition_held(ticket, |owner| {
+        assert!(matches!(owner, Stage::Bound));
+        Err::<Stage, _>(((), owner))
+    }).is_err());
+    assert!(matches!(table.get(ticket), Some(Stage::Bound)));
+    assert!(matches!(foreign.get(foreign_ticket), Some(Stage::Unbound(value)) if **value == 37));
+}
+
+#[test]
+fn undelivered_restore_proof_survives_cancel_refusal_in_exact_handoff_row() {
+    use crate::root_ingress_handoff::{RootIngressHandoffKey, RootIngressHandoffTable};
+    #[derive(Debug)]
+    enum Stage { Unbound(Box<u64>), RestoredProof(Box<u64>), Cancelled }
+    let child = Child::new(141);
+    let parent = new_parent();
+    let key = RootIngressHandoffKey::new(
+        parent.identity(), child.call.as_ref().unwrap().admission_key(), 904,
+    ).unwrap();
+    let mut table = RootIngressHandoffTable::new();
+    let reservation = table.reserve().unwrap();
+    let ticket = table.retain(reservation, key, Stage::Unbound(Box::new(0x6a11))).unwrap();
+    table.transition_held(ticket, |stage| match stage {
+        Stage::Unbound(owner) => Ok::<_, ((), _)>(Stage::RestoredProof(owner)),
+        other => Err(((), other)),
+    }).unwrap();
+    let proof_address = match table.get(ticket).unwrap() {
+        Stage::RestoredProof(proof) => &**proof as *const u64,
+        _ => panic!("positive restore proof lost"),
+    };
+    assert!(table.transition_held(ticket, |stage| match stage {
+        Stage::RestoredProof(proof) => Err::<Stage, _>(((), Stage::RestoredProof(proof))),
+        other => Err(((), other)),
+    }).is_err());
+    assert!(matches!(table.get(ticket), Some(Stage::RestoredProof(proof))
+        if core::ptr::eq(&**proof, proof_address)));
+    table.transition_held(ticket, |stage| match stage {
+        Stage::RestoredProof(proof) if *proof == 0x6a11 => Ok::<_, ((), _)>(Stage::Cancelled),
+        other => Err(((), other)),
+    }).unwrap();
+    assert!(matches!(table.get(ticket), Some(Stage::Cancelled)));
+}

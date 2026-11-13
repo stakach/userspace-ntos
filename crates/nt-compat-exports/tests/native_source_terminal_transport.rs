@@ -182,10 +182,8 @@ fn prepare_success_is_durable_before_busy_ack_readback() {
     struct Success(bool);
     impl<'ast> Visit<'ast> for Success {
         fn visit_arm(&mut self, arm: &'ast syn::Arm) {
-            if let syn::Pat::TupleStruct(pattern) = &arm.pat {
-                if pattern.path.segments.last().is_some_and(|part| part.ident == "Returned")
-                    && matches!(pattern.elems.first(), Some(syn::Pat::Lit(value))
-                        if matches!(&value.lit, syn::Lit::Int(value) if matches!(value.base10_parse::<u32>(), Ok(0)))) {
+            if let syn::Pat::Path(pattern) = &arm.pat {
+                if pattern.path.segments.last().is_some_and(|part| part.ident == "ReturnedSuccessNeedsAck") {
                     let mut effects = Effects::default();
                     effects.visit_expr(&arm.body);
                     assert!(effects.paths.iter().any(|path| path == "ReadAck"));

@@ -4,7 +4,9 @@
 #[test]
 fn gp_port_decode_is_attempted_before_cached_channel_capability_admission() {
     let source = include_str!("../../../components/ntos-executive/src/spawn_hosts.rs");
-    let call = "pump_service_io_port_fault(ch, msg.m0, msg.m3)";
+    // Both pumps pass their currently retained Reply to the fault service.
+    // The sibling-grant behavior is exercised by native_source_io_port_fault_grant.
+    let call = "pump_service_io_port_fault(ch, ";
     let callsites: Vec<_> = source.match_indices(call).map(|(at, _)| at).collect();
     assert_eq!(callsites.len(), 2, "IRQ and ordinary pumps must both attempt I/O decode");
 

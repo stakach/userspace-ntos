@@ -46,6 +46,7 @@ struct ResidentPage {
 }
 static mut REVALIDATION: Option<ResidentMappingRevalidation<ResidentPage>> = None;
 static BORROWED: AtomicBool = AtomicBool::new(false);
+static SOURCE_UNCERTAIN_TRACE: AtomicU64 = AtomicU64::new(0);
 struct Borrow;
 impl Borrow {
     fn acquire() -> Result<Self, u32> {
@@ -80,6 +81,32 @@ struct SourceIo<'a> {
     handler: &'a ExecNtHandler,
     view: NativeImageViewDescriptor,
     revoke_acked: &'a mut bool,
+    acknowledged_page: Option<&'a [u8; 4096]>,
+}
+fn trace_source_uncertain(
+    handler: &ExecNtHandler,
+    view: NativeImageViewDescriptor,
+    key: SourceKey,
+    offset: Option<u64>,
+    status: u32,
+) {
+    let sequence = SOURCE_UNCERTAIN_TRACE.fetch_add(1, Ordering::Relaxed);
+    if sequence >= 16 && !sequence.is_power_of_two() {
+        return;
+    }
+    let mut record = nt_printf::record::RecordBuffer::<384>::new();
+    let _ = writeln!(
+        record,
+        "[native-image-source] uncertain area={:?} rva=0x{:x} view_pi={} base=0x{:x} section_offset=0x{:x} read_offset={:?} caller_pi={} tid={} badge={} ssn=0x{:x} status=0x{:x}",
+        key.area, key.rva, view.pi, view.base, view.section_offset, offset,
+        handler.pi, handler.current_tid, handler.current_badge,
+        handler.current_service_number, status,
+    );
+    sel4_rt::print_record(if record.overflowed() {
+        b"[native-image-source] uncertain trace truncated\n"
+    } else {
+        record.bytes()
+    });
 }
 impl ImageSourcePageIo<SourceKey> for SourceIo<'_> {
     fn acquire(&mut self, _: SourceKey) -> Result<InstallationCap, u32> {
@@ -94,14 +121,14 @@ impl ImageSourcePageIo<SourceKey> for SourceIo<'_> {
         if key.area != self.view.view.area() || !source.has_readable_image() {
             return InstallationEffect::Refused(INVALID);
         }
-        let plan = match source
-            .layout
-            .image_page_fill_plan(key.rva, source.backing.file_extent)
-        {
-            Ok(plan) => plan,
-            Err(_) => return InstallationEffect::Refused(INVALID),
-        };
+        let plan = if self.acknowledged_page.is_none() {
+            match source.layout.image_page_fill_plan(key.rva, source.backing.file_extent) {
+                Ok(plan) => Some(plan),
+                Err(_) => return InstallationEffect::Refused(INVALID),
+            }
+        } else { None };
         let mut wrote = false;
+        let mut read_offset = None;
         let result = unsafe {
             temporary_frame_alias::with_scratch_range(
                 frame.cap,
@@ -113,22 +140,32 @@ impl ImageSourcePageIo<SourceKey> for SourceIo<'_> {
                     // therefore retains this initializer owner rather than replaying it.
                     wrote = true;
                     let page = core::slice::from_raw_parts_mut(address as *mut u8, 4096);
-                    plan.read_into_page(page, |offset, output| {
-                        source.read_exact(self.handler, offset, output)?;
-                        Ok::<usize, u32>(output.len())
-                    })
-                    .map_err(|error| match error {
-                        nt_pe_loader::ImagePageReadError::Read(status) => status,
-                        nt_pe_loader::ImagePageReadError::ShortRead { .. } => 0xc000_0185,
-                        nt_pe_loader::ImagePageReadError::InvalidPageSize(_) => INVALID,
-                    })
+                    if let Some(acknowledged_page) = self.acknowledged_page {
+                        page.copy_from_slice(acknowledged_page);
+                        Ok(())
+                    } else {
+                        plan.as_ref().unwrap().read_into_page(page, |offset, output| {
+                            read_offset = Some(offset);
+                            source.read_exact(self.handler, key.area, offset, output)?;
+                            Ok::<usize, u32>(output.len())
+                        })
+                        .map_err(|error| match error {
+                            nt_pe_loader::ImagePageReadError::Read(status) => status,
+                            nt_pe_loader::ImagePageReadError::ShortRead { .. } => 0xc000_0185,
+                            nt_pe_loader::ImagePageReadError::InvalidPageSize(_) => INVALID,
+                        })
+                    }
                 },
             )
         };
         match result {
             Ok(Ok(())) => InstallationEffect::Acknowledged,
-            Ok(Err(status)) => InstallationEffect::Uncertain(status),
+            Ok(Err(status)) => {
+                trace_source_uncertain(self.handler, self.view, key, read_offset, status);
+                InstallationEffect::Uncertain(status)
+            }
             Err(status) if wrote || !temporary_frame_alias::backing_release_available() => {
+                trace_source_uncertain(self.handler, self.view, key, read_offset, status);
                 InstallationEffect::Uncertain(status)
             }
             Err(status) => InstallationEffect::Refused(status),
@@ -163,10 +200,53 @@ fn release_source(
     }
 }
 
+pub(crate) unsafe fn has_source_row(area: ImageAreaId, rva: u32) -> bool {
+    (&*core::ptr::addr_of!(SOURCES)).iter().any(|row|
+        row.owner.descriptor() == SourceKey { area, rva })
+}
+
+pub(crate) unsafe fn source_page_ready(area: ImageAreaId, rva: u32) -> bool {
+    (&*core::ptr::addr_of!(SOURCES)).iter().any(|row|
+        row.owner.descriptor() == SourceKey { area, rva }
+            && !row.retiring && !row.revoke_acked && row.owner.ready_frame().is_some())
+}
+
+pub(crate) unsafe fn source_page_state(
+    area: ImageAreaId, rva: u32,
+) -> Option<nt_memory_manager::image_source_page::ImageSourcePageState> {
+    (&*core::ptr::addr_of!(SOURCES)).iter()
+        .find(|row| row.owner.descriptor() == SourceKey { area, rva })
+        .map(|row| row.owner.state())
+}
+
+pub(crate) unsafe fn has_private_page(view: NativeImageViewDescriptor, page: u64) -> bool {
+    (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).get(view.pi as u64, page)
+        .is_some_and(|record| record.is_resident() && record.owns_frame
+            && record.lifetime == nt_memory_manager::MemoryLifetime::Process(view.process))
+}
+
+pub(crate) unsafe fn ensure_source_page_from_acknowledged_bytes(
+    handler: &ExecNtHandler,
+    view: NativeImageViewDescriptor,
+    rva: u32,
+    bytes: &[u8; 4096],
+) -> Result<u64, u32> {
+    ensure_source_page_inner(handler, view, rva, Some(bytes))
+}
+
 unsafe fn ensure_source_page(
     handler: &ExecNtHandler,
     view: NativeImageViewDescriptor,
     rva: u32,
+) -> Result<u64, u32> {
+    ensure_source_page_inner(handler, view, rva, None)
+}
+
+unsafe fn ensure_source_page_inner(
+    handler: &ExecNtHandler,
+    view: NativeImageViewDescriptor,
+    rva: u32,
+    acknowledged_page: Option<&[u8; 4096]>,
 ) -> Result<u64, u32> {
     let key = SourceKey {
         area: view.view.area(),
@@ -194,6 +274,7 @@ unsafe fn ensure_source_page(
         handler,
         view,
         revoke_acked: &mut row.revoke_acked,
+        acknowledged_page,
     }) {
         ImageSourcePageOutcome::Ready(frame) => Ok(frame.cap),
         ImageSourcePageOutcome::Failed(status) => {
@@ -209,9 +290,11 @@ unsafe fn ensure_source_page(
 
 struct ViewIo<'a> {
     handler: &'a ExecNtHandler,
+    stage: &'a mut &'static str,
 }
 impl BorrowedPageInstallationIo<ViewPage> for ViewIo<'_> {
     fn reserve(&mut self) -> Result<InstallationCap, u32> {
+        *self.stage = "shared-cap-reserve";
         try_alloc_slot()
             .map(|cap| InstallationCap { cap })
             .ok_or(RESOURCES)
@@ -221,9 +304,11 @@ impl BorrowedPageInstallationIo<ViewPage> for ViewIo<'_> {
         source: InstallationCap,
         destination: InstallationCap,
     ) -> InstallationEffect {
+        *self.stage = "shared-cap-copy";
         unsafe { effect(copy_cap_into_r(source.cap, destination.cap)) }
     }
     fn map(&mut self, target: ViewPage, destination: InstallationCap) -> InstallationEffect {
+        *self.stage = "shared-cap-map";
         if !current(self.handler, target.view, target.page) {
             return InstallationEffect::Refused(INVALID);
         }
@@ -237,6 +322,7 @@ impl BorrowedPageInstallationIo<ViewPage> for ViewIo<'_> {
         }
     }
     fn publish(&mut self, target: ViewPage, destination: InstallationCap) -> InstallationEffect {
+        *self.stage = "shared-cap-publish";
         if !current(self.handler, target.view, target.page) {
             return InstallationEffect::Refused(INVALID);
         }
@@ -255,12 +341,15 @@ impl BorrowedPageInstallationIo<ViewPage> for ViewIo<'_> {
         }
     }
     fn unmap(&mut self, cap: InstallationCap) -> InstallationEffect {
+        *self.stage = "shared-cap-unmap";
         unsafe { effect(page_unmap_r(cap.cap)) }
     }
     fn delete(&mut self, cap: InstallationCap) -> InstallationEffect {
+        *self.stage = "shared-cap-delete";
         unsafe { effect(cnode_delete_r(cap.cap)) }
     }
     fn recycle(&mut self, cap: InstallationCap) -> InstallationEffect {
+        *self.stage = "shared-cap-recycle";
         match unsafe { root_slot_recycle::publish_unretyped(cap.cap) } {
             Ok(()) => InstallationEffect::Acknowledged,
             Err(_) => InstallationEffect::Refused(INVALID),
@@ -272,10 +361,12 @@ unsafe fn install_view_page(
     handler: &mut ExecNtHandler,
     target: ViewPage,
     source: u64,
+    stage: &mut &'static str,
 ) -> Result<(), u32> {
     let pending = &mut *core::ptr::addr_of_mut!(INSTALL);
     if let Some(owner) = pending.as_mut() {
-        match owner.advance(&mut ViewIo { handler }) {
+        *stage = "shared-prior-install";
+        match owner.advance(&mut ViewIo { handler, stage }) {
             BorrowedPageInstallOutcome::Published | BorrowedPageInstallOutcome::Failed(_) => {
                 *pending = None
             }
@@ -284,6 +375,7 @@ unsafe fn install_view_page(
         }
     }
     let registry = &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY);
+    *stage = "shared-registry-admission";
     if !registry.memory_available(target.view.pi as u64, target.page, 4096) {
         return Err(RESOURCES);
     }
@@ -296,18 +388,22 @@ unsafe fn install_view_page(
             Err(INVALID)
         };
     }
+    *stage = "shared-working-set-admission";
     handler.ensure_process_working_set_admission(
         target.view.pi,
         target.page,
         target.view.scratch_base,
     )?;
+    *stage = "shared-memory-access";
     hosted_thread_memory_access(target.view.pi as u64, target.page, 4096)?;
+    *stage = "shared-page-table";
     ensure_process_user_page_table(handler, target.view.pi, target.page, target.view.pml4)?;
     *pending = BorrowedPageInstallation::new(target, InstallationCap { cap: source });
+    *stage = "shared-install-owner";
     let outcome = pending
         .as_mut()
         .ok_or(INVALID)?
-        .advance(&mut ViewIo { handler });
+        .advance(&mut ViewIo { handler, stage });
     match outcome {
         BorrowedPageInstallOutcome::Published => {
             *pending = None;
@@ -330,13 +426,43 @@ pub(crate) unsafe fn service_native_image_page_residency(
     observation: ImageFaultObservation,
 ) -> Result<(), u32> {
     let mut stage = "borrow";
-    let result = service_page_residency(handler, view, page, access, observation, &mut stage);
+    let admission = service_page_residency(handler, view, page, access, observation,
+        ImageCopyMode::Direct, &mut stage);
+    let result = admission.map(|_| ());
     if let Err(status) = result {
         if observation != ImageFaultObservation::CopyAccess {
             trace_image_fault_failure(handler, view, page, access, observation, stage, status);
         }
     }
     result
+}
+
+/// Copy admission may map a ready image page, but must hand an unready routed source to an
+/// owned page-in worker before any File READ. The decision and source state are checked under
+/// the same borrow as the page installation.
+pub(crate) unsafe fn admit_native_image_copy_page(
+    handler: &mut ExecNtHandler,
+    view: NativeImageViewDescriptor,
+    page: u64,
+    access: FaultAccess,
+) -> Result<bool, u32> {
+    let mut stage = "borrow";
+    service_page_residency(
+        handler, view, page, access, ImageFaultObservation::CopyAccess, ImageCopyMode::DeferRouted, &mut stage,
+    )
+    .map(|outcome| outcome == ImageCopyAdmission::NeedsRoutedPageIn)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ImageCopyAdmission {
+    Resident,
+    NeedsRoutedPageIn,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ImageCopyMode {
+    Direct,
+    DeferRouted,
 }
 
 unsafe fn ready_source_frame(view: NativeImageViewDescriptor, rva: u32) -> Result<u64, u32> {
@@ -541,8 +667,9 @@ unsafe fn service_page_residency(
     page: u64,
     access: FaultAccess,
     observation: ImageFaultObservation,
+    mode: ImageCopyMode,
     stage: &mut &'static str,
-) -> Result<(), u32> {
+) -> Result<ImageCopyAdmission, u32> {
     let _borrow = Borrow::acquire()?;
     *stage = "view-identity";
     if !current(handler, view, page) || page & 0xfff != 0 {
@@ -566,6 +693,11 @@ unsafe fn service_page_residency(
         .layout
         .image_page_fill_plan(rva, source.backing.file_extent)
         .map_err(|_| INVALID)?;
+    let routed_source = matches!(
+        source.contents,
+        crate::native_image_sections::NativeImageContents::RetainedRouted
+    );
+    let routed_source_readable = !routed_source || source.has_readable_image();
     *stage = "committed-mapping";
     let info = process_committed_mapping_basic_information(view.pi as u64, page)
         .ok_or(nt_address_space::STATUS_NOT_COMMITTED)?;
@@ -592,7 +724,8 @@ unsafe fn service_page_residency(
             && (record.owns_frame || !fault_plan.copy_on_write)
         {
             *stage = "resident-revalidation";
-            return revalidate_resident_image_page(handler, view, page, protection, rva, record);
+            return revalidate_resident_image_page(handler, view, page, protection, rva, record)
+                .map(|()| ImageCopyAdmission::Resident);
         }
         if record.owns_frame {
             // A private COW page already contains loader/application changes; never refill it.
@@ -609,9 +742,9 @@ unsafe fn service_page_residency(
                     nt_address_space::image_view_fault_plan(protection, false).map_protection,
                     fault_plan.map_protection,
                     view.pml4,
-                );
+                ).map(|()| ImageCopyAdmission::Resident);
             }
-            return Ok(());
+            return Ok(ImageCopyAdmission::Resident);
         }
         if observation == ImageFaultObservation::Protection && !fault_plan.copy_on_write {
             *stage = "resident-shared-fault";
@@ -622,9 +755,17 @@ unsafe fn service_page_residency(
     }
     *stage = "pagefile-restore";
     if handler.restore_process_pagefile_page(view.pi, page, view.pml4, view.scratch_base)? {
-        return Ok(());
+        return Ok(ImageCopyAdmission::Resident);
     }
     *stage = "source-page";
+    if mode == ImageCopyMode::DeferRouted && routed_source
+        && !source_page_ready(view.view.area(), rva)
+    {
+        if !routed_source_readable {
+            return Err(INVALID);
+        }
+        return Ok(ImageCopyAdmission::NeedsRoutedPageIn);
+    }
     let source_frame = ensure_source_page(handler, view, rva)?;
     if fault_plan.copy_on_write {
         let target = ViewPage {
@@ -657,7 +798,7 @@ unsafe fn service_page_residency(
         {
             *preparation = None;
         }
-        return result;
+        return result.map(|()| ImageCopyAdmission::Resident);
     }
     *stage = "shared-install";
     install_view_page(
@@ -668,7 +809,8 @@ unsafe fn service_page_residency(
             protection: fault_plan.map_protection,
         },
         source_frame,
-    )
+        stage,
+    ).map(|()| ImageCopyAdmission::Resident)
 }
 
 /// Invoked only by checked ImageSectionPurge after the authority's references have drained.
@@ -769,7 +911,11 @@ pub(crate) unsafe fn drain_view(
         if owner.abort_unentered(owner.descriptor()) {
             *pending = None;
         } else {
-            match owner.advance(&mut ViewIo { handler }) {
+            let mut stage = "shared-retirement";
+            match owner.advance(&mut ViewIo {
+                handler,
+                stage: &mut stage,
+            }) {
                 BorrowedPageInstallOutcome::Published | BorrowedPageInstallOutcome::Failed(_) => {
                     *pending = None
                 }

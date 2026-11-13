@@ -221,7 +221,7 @@ impl ResourceMappingTable {
             .ok_or(MappingError::IdExhausted)?;
         if self.authority == 0 {
             self.authority = NEXT_AUTHORITY
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     value.checked_add(1)
                 })
                 .map_err(|_| MappingError::IdExhausted)?;

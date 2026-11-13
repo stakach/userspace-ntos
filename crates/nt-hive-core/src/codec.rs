@@ -1159,6 +1159,17 @@ pub fn validate_first_hive_wal_append(
     sidecar: &[u8],
     candidate: &[u8],
 ) -> Result<u64, HiveLogReplayError> {
+    let previous = complete_hive_log_end_sequence(primary_sequence, sidecar)?;
+    complete_log_sequence_span_from(candidate, previous).map(|(_, last)| last)
+}
+
+/// Verify a complete sidecar against the primary image's sequence. Records already covered by
+/// that image are harmless; every advancing record must be contiguous. Unlike boot replay, a
+/// shutdown durability proof cannot silently discard a torn tail.
+pub fn complete_hive_log_end_sequence(
+    primary_sequence: u64,
+    sidecar: &[u8],
+) -> Result<u64, HiveLogReplayError> {
     let mut previous = primary_sequence;
     let mut reader = Reader::new(sidecar);
     while !reader.is_empty() {
@@ -1173,7 +1184,7 @@ pub fn validate_first_hive_wal_append(
             previous = record.sequence;
         }
     }
-    complete_log_sequence_span_from(candidate, previous).map(|(_, last)| last)
+    Ok(previous)
 }
 
 fn complete_log_sequence_span_inner(

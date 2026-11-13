@@ -237,6 +237,15 @@ impl<P: ObjectManagerPort> IoManager<P> {
         Ok(())
     }
 
+    /// Whether a prepared or entered CLEANUP/CLOSE still owns the exact File.
+    pub(crate) fn has_detached_file_lifecycle(&self, file_id: FileId) -> bool {
+        self.irps.iter().any(|(_, irp)| {
+            irp.file_id == Some(file_id)
+                && irp.detached_file_owner
+                && matches!(irp.origin_major, major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE)
+        })
+    }
+
     /// Reserve one exact lifecycle IRP. The caller must begin it before yielding
     /// control; preparation itself performs no external driver effect.
     pub fn prepare_file_lifecycle_owned(
@@ -265,14 +274,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             }
             _ => return Err(NtStatus::DELETE_PENDING),
         };
-        if self.irps.iter().any(|(_, irp)| {
-            irp.file_id == Some(file_id)
-                && irp.detached_file_owner
-                && matches!(
-                    irp.origin_major,
-                    major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE
-                )
-        }) {
+        if self.has_detached_file_lifecycle(file_id) {
             return Err(NtStatus::DELETE_PENDING);
         }
         let device_id = file.device_id;

@@ -72,6 +72,10 @@ impl NtThread {
             affinity_mask,
             priority: base_priority,
             base_priority,
+            quantum_reset: 0,
+            quantum: 0,
+            priority_decrement: 0,
+            saturation: 0,
             ideal_processor: 0,
             break_on_termination: false,
             disable_boost: false,
@@ -113,13 +117,14 @@ impl ProcessManager {
         }
         let affinity_mask = process.affinity_mask;
         let base_priority = process.base_priority;
+        let quantum_reset = process.quantum_reset;
         let tid = self.next_cid;
         let next = tid
             .checked_add(CLIENT_ID_GRANULARITY)
             .filter(|_| tid != 0 && tid % CLIENT_ID_GRANULARITY == 0)
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         let nonce = NEXT_NONCE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         let mut thread = NtThread::try_construct(
             tid,
@@ -131,6 +136,7 @@ impl ProcessManager {
             affinity_mask,
             base_priority,
         )?;
+        thread.quantum_reset = quantum_reset;
         self.threads
             .entries
             .try_reserve_exact(table_reserve)

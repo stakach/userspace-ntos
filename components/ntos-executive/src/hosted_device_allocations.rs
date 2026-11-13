@@ -5,14 +5,277 @@ use nt_io_manager::{
     HostedDevicePointerRegistration, ProjectionAllocationLedger, ProjectionAllocationOwner,
 };
 
+#[path = "hosted_dma_adapter_pair.rs"]
+mod dma_adapter_pair;
+#[path = "hosted_dma_private_graph.rs"]
+mod dma_private_graph;
+#[path = "hosted_dma_owned_sg_alias.rs"]
+pub(crate) mod dma_owned_sg_alias;
+pub(super) use dma_private_graph::Kind as DmaPrivateKind;
+pub(super) use dma_private_graph::DmaPrivateMappingId;
+use dma_private_graph::DmaPrivateMappingKind;
+#[path = "hosted_interrupt_projection.rs"]
+mod interrupt_projection;
+
+pub(super) unsafe fn provision_interrupt_projection(
+    inst: DriverInstance, binding: HostedDeviceBinding,
+) -> Result<(u64, u64), nt_status::NtStatus> {
+    interrupt_projection::provision(inst, binding)
+}
+
+pub(super) unsafe fn validate_interrupt_projection(
+    inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
+) -> Result<(), nt_status::NtStatus> {
+    interrupt_projection::validate(inst, binding, address)
+}
+
+pub(super) unsafe fn bind_interrupt_projection(
+    inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
+    interrupt_id: u64, grant_generation: u64,
+) -> Result<(), nt_status::NtStatus> {
+    interrupt_projection::bind(inst, binding, address, interrupt_id, grant_generation)
+}
+
+pub(super) unsafe fn mark_interrupt_projection_effect_started(
+    inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
+) -> Result<(), nt_status::NtStatus> {
+    interrupt_projection::mark_effect_started(inst, binding, address)
+}
+
+pub(super) fn admit_interrupt_projection_canonical_retirement(
+    inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
+    connection: (u64, u64),
+) -> Result<(), nt_status::NtStatus> {
+    interrupt_projection::admits_canonical_retirement(inst, binding, address, connection)
+}
+
+pub(super) unsafe fn interrupt_projection_connection_for_retirement(
+    inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
+) -> Result<Option<(u64, u64)>, nt_status::NtStatus> {
+    interrupt_projection::connection_for_retirement(inst, binding, address)
+}
+
+pub(super) fn mark_interrupt_projection_canonical_retired(
+    inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
+    connection: (u64, u64),
+) -> Result<(), nt_status::NtStatus> {
+    interrupt_projection::mark_canonical_retired(inst, binding, address, connection)
+}
+
+pub(super) unsafe fn retire_interrupt_projection_physical(
+    inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
+) -> Result<(), nt_status::NtStatus> {
+    interrupt_projection::retire_physical(inst, binding, address)
+}
+
+pub(super) unsafe fn cancel_prepared_interrupt_projection(
+    inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
+) -> Result<(), nt_status::NtStatus> {
+    interrupt_projection::cancel_prepared(inst, binding, address)
+}
+
+pub(super) unsafe fn cancel_interrupt_projection_after_proven_no_effect(
+    inst: DriverInstance, binding: HostedDeviceBinding, address: u64,
+) -> Result<(), nt_status::NtStatus> {
+    interrupt_projection::cancel_after_proven_no_effect(inst, binding, address)
+}
+
+pub(super) unsafe fn drain_interrupt_projection_tombstones(
+    inst: DriverInstance,
+) -> Result<(), nt_status::NtStatus> {
+    interrupt_projection::drain_tombstones(inst)
+}
+
+pub(super) unsafe fn provision_dma_adapter_pair(
+    inst: DriverInstance, lease_id: u64,
+) -> Result<(u64, u64), nt_status::NtStatus> {
+    dma_adapter_pair::provision_dma_adapter_pair(inst, lease_id)
+}
+
+pub(super) unsafe fn retire_dma_adapter_pair(
+    inst: DriverInstance, lease_id: u64, adapter_address: u64,
+    put: impl FnOnce() -> Result<(), nt_status::NtStatus>,
+) -> Result<(), nt_status::NtStatus> {
+    dma_adapter_pair::retire_dma_adapter_pair(inst, lease_id, adapter_address, put)
+}
+
+pub(super) fn has_dma_adapter_pair(lease_id: u64) -> bool {
+    let _catalog = lock();
+    dma_adapter_pair::has_lease(lease_id)
+}
+
+pub(super) unsafe fn drain_dma_adapter_tombstones(
+    inst: DriverInstance,
+) -> Result<(), nt_status::NtStatus> {
+    dma_adapter_pair::drain_dma_adapter_tombstones(inst)
+}
+
+pub(super) unsafe fn provision_dma_private_graph(
+    inst: DriverInstance, lease_id: u64, request_id: u64, kind: DmaPrivateKind,
+    borrowed_list: u64,
+) -> Result<(u64, u64, u64), nt_status::NtStatus> {
+    if kind == DmaPrivateKind::ScatterGatherOwned {
+        return dma_owned_sg_alias::provision(inst, lease_id, request_id);
+    }
+    dma_private_graph::provision(inst, lease_id, request_id, kind, borrowed_list)
+}
+
+pub(super) unsafe fn record_dma_private_mapping(
+    inst: DriverInstance, lease_id: u64, map: u64, logical: u64,
+    backing: u64, length: u64,
+    register: impl FnOnce() -> Result<u64, nt_status::NtStatus>,
+) -> Result<u64, nt_status::NtStatus> {
+    let record = if dma_owned_sg_alias::contains(map) {
+        dma_owned_sg_alias::record_mapping(inst, lease_id, map, logical, backing, length,
+            DmaPrivateMappingKind::Transfer,
+            || register().map(DmaPrivateMappingId::Transfer))
+    } else {
+        dma_private_graph::record_mapping(inst, lease_id, map, logical, backing, length,
+            DmaPrivateMappingKind::Transfer,
+            || register().map(DmaPrivateMappingId::Transfer))
+    }?;
+    match record {
+        DmaPrivateMappingId::Transfer(id) => Ok(id),
+        DmaPrivateMappingId::Coherent(_) => Err(nt_status::NtStatus::INVALID_HANDLE),
+    }
+}
+
+pub(super) unsafe fn record_dma_private_coherent_alias(
+    inst: DriverInstance, lease_id: u64, map: u64, logical: u64,
+    backing: u64, length: u64,
+    register: impl FnOnce() -> Result<nt_dma_manager::CoherentReservationAlias, nt_status::NtStatus>,
+) -> Result<nt_dma_manager::CoherentReservationAlias, nt_status::NtStatus> {
+    let record = if dma_owned_sg_alias::contains(map) {
+        dma_owned_sg_alias::record_mapping(inst, lease_id, map, logical, backing, length,
+            DmaPrivateMappingKind::Coherent,
+            || register().map(DmaPrivateMappingId::Coherent))
+    } else {
+        dma_private_graph::record_mapping(inst, lease_id, map, logical, backing, length,
+            DmaPrivateMappingKind::Coherent,
+            || register().map(DmaPrivateMappingId::Coherent))
+    }?;
+    match record {
+        DmaPrivateMappingId::Coherent(alias) => Ok(alias),
+        DmaPrivateMappingId::Transfer(_) => Err(nt_status::NtStatus::INVALID_HANDLE),
+    }
+}
+
+pub(super) unsafe fn dma_private_mapping_receipt(
+    inst: DriverInstance, map: u64, logical: u64, backing: u64, length: u64,
+) -> Option<(u64, u64)> {
+    let receipt = if dma_owned_sg_alias::contains(map) {
+        dma_owned_sg_alias::mapping_receipt(inst, map, logical, backing, length,
+            DmaPrivateMappingKind::Transfer)
+    } else {
+        dma_private_graph::mapping_receipt(inst, map, logical, backing, length,
+            DmaPrivateMappingKind::Transfer)
+    }?;
+    match receipt {
+        (lease, DmaPrivateMappingId::Transfer(id)) => Some((lease, id)),
+        (_, DmaPrivateMappingId::Coherent(_)) => None,
+    }
+}
+
+pub(super) unsafe fn dma_private_coherent_alias_receipt(
+    inst: DriverInstance, map: u64, logical: u64, backing: u64, length: u64,
+) -> Option<(u64, nt_dma_manager::CoherentReservationAlias)> {
+    let receipt = if dma_owned_sg_alias::contains(map) {
+        dma_owned_sg_alias::mapping_receipt(inst, map, logical, backing, length,
+            DmaPrivateMappingKind::Coherent)
+    } else {
+        dma_private_graph::mapping_receipt(inst, map, logical, backing, length,
+            DmaPrivateMappingKind::Coherent)
+    }?;
+    match receipt {
+        (lease, DmaPrivateMappingId::Coherent(alias)) => Some((lease, alias)),
+        (_, DmaPrivateMappingId::Transfer(_)) => None,
+    }
+}
+
+pub(super) unsafe fn retire_dma_private_graph(
+    inst: DriverInstance, lease_id: u64, address: u64, whole_graph: bool,
+    release: impl FnMut(u64) -> Result<(), nt_status::NtStatus>,
+) -> Result<(), nt_status::NtStatus> {
+    let mut release = release;
+    let retire = |id| match id {
+        DmaPrivateMappingId::Transfer(id) => release(id),
+        DmaPrivateMappingId::Coherent(_) => Err(nt_status::NtStatus::INVALID_HANDLE),
+    };
+    if dma_owned_sg_alias::contains(address) {
+        dma_owned_sg_alias::retire(inst, lease_id, address, whole_graph, retire)
+    } else {
+        dma_private_graph::retire(inst, lease_id, address, whole_graph, retire)
+    }
+}
+
+pub(super) unsafe fn retire_dma_private_graph_typed(
+    inst: DriverInstance, lease_id: u64, address: u64, whole_graph: bool,
+    release: impl FnMut(DmaPrivateMappingId) -> Result<(), nt_status::NtStatus>,
+) -> Result<(), nt_status::NtStatus> {
+    if dma_owned_sg_alias::contains(address) {
+        dma_owned_sg_alias::retire(inst, lease_id, address, whole_graph, release)
+    } else {
+        dma_private_graph::retire(inst, lease_id, address, whole_graph, release)
+    }
+}
+
+pub(super) unsafe fn dma_private_sg_members(
+    inst: DriverInstance, lease_id: u64, list: u64,
+) -> Result<(u64, u64), nt_status::NtStatus> {
+    if dma_owned_sg_alias::contains(list) {
+        dma_owned_sg_alias::sg_members(inst, lease_id, list)
+    } else {
+        dma_private_graph::sg_members(inst, lease_id, list)
+    }
+}
+
+pub(super) unsafe fn copy_dma_private_sg_list(
+    inst: DriverInstance, list: u64, destination: u64,
+) -> Result<(), nt_status::NtStatus> {
+    dma_owned_sg_alias::copy_list(inst, list, destination)
+}
+
+pub(super) unsafe fn retire_dma_private_lease(
+    inst: DriverInstance, lease_id: u64,
+    release: impl FnMut(u64) -> Result<(), nt_status::NtStatus>,
+) -> Result<(), nt_status::NtStatus> {
+    let mut release = release;
+    dma_owned_sg_alias::retire_lease(inst, lease_id, |id| match id {
+        DmaPrivateMappingId::Transfer(id) => release(id),
+        DmaPrivateMappingId::Coherent(_) => Err(nt_status::NtStatus::INVALID_HANDLE),
+    })?;
+    dma_private_graph::retire_lease(inst, lease_id, |id| match id {
+        DmaPrivateMappingId::Transfer(id) => release(id),
+        DmaPrivateMappingId::Coherent(_) => Err(nt_status::NtStatus::INVALID_HANDLE),
+    })
+}
+
+pub(super) unsafe fn retire_dma_private_lease_typed(
+    inst: DriverInstance, lease_id: u64,
+    release: impl FnMut(DmaPrivateMappingId) -> Result<(), nt_status::NtStatus>,
+) -> Result<(), nt_status::NtStatus> {
+    let mut release = release;
+    dma_owned_sg_alias::retire_lease(inst, lease_id, &mut release)?;
+    dma_private_graph::retire_lease(inst, lease_id, release)
+}
+
+pub(super) unsafe fn drain_dma_private_tombstones(
+    inst: DriverInstance,
+) -> Result<(), nt_status::NtStatus> {
+    dma_owned_sg_alias::drain(inst)?;
+    dma_private_graph::drain_tombstones(inst)
+}
+
 struct Row {
     instance: DriverInstance,
     domain: HostedDomainIdentity,
     allocation: SourcePoolAllocationIdentity,
     staged_driver_object: Option<u64>,
+    owned_vpb: Option<SourcePoolAllocationIdentity>,
     accepted: Option<HostedDevicePointerRegistration>,
     accepted_driver_object: Option<u64>,
     registration: Option<HostedDevicePointerRegistration>,
+    canonical_live: bool,
     owner: ProjectionAllocationOwner,
     retirement_pending: bool,
 }
@@ -30,6 +293,37 @@ struct TemporaryPinRow {
 }
 static mut TEMPORARY_PINS: Vec<TemporaryPinRow> = Vec::new();
 static mut NEXT_TEMPORARY_PIN_ID: u64 = 1;
+
+/// Long-lived framebuffer grants are separate from callback pins. Their owner is the video
+/// mapping transaction, and generic pool free remains excluded until the caller alias is gone.
+struct VideoPinRow {
+    id: u64,
+    instance: DriverInstance,
+    domain: HostedDomainIdentity,
+    allocation: SourcePoolAllocationIdentity,
+    uncertain: bool,
+}
+static mut VIDEO_PINS: Vec<VideoPinRow> = Vec::new();
+static mut NEXT_VIDEO_PIN_ID: u64 = 1;
+
+fn video_pins() -> &'static mut Vec<VideoPinRow> {
+    unsafe { &mut *core::ptr::addr_of_mut!(VIDEO_PINS) }
+}
+
+#[must_use = "retain through alias revocation and exact UNMAP ownership"]
+pub(super) struct VideoPoolPin {
+    id: u64,
+    instance: DriverInstance,
+    domain: HostedDomainIdentity,
+    allocation: SourcePoolAllocationIdentity,
+    held: bool,
+}
+
+impl VideoPoolPin {
+    pub(super) fn allocation(&self) -> SourcePoolAllocationIdentity { self.allocation }
+    pub(super) fn domain(&self) -> HostedDomainIdentity { self.domain }
+    pub(super) fn instance(&self) -> DriverInstance { self.instance }
+}
 
 fn temporary_pins() -> &'static mut Vec<TemporaryPinRow> {
     unsafe { &mut *core::ptr::addr_of_mut!(TEMPORARY_PINS) }
@@ -65,8 +359,20 @@ struct FileStorageRow {
     file_freed: bool,
 }
 static mut FILE_ROWS: Vec<FileStorageRow> = Vec::new();
+#[derive(Clone, Copy)]
+struct FileStorageAck {
+    instance: DriverInstance,
+    domain: HostedDomainIdentity,
+    file_id: u64,
+    file: SourcePoolAllocationIdentity,
+    name: SourcePoolAllocationIdentity,
+}
+static mut FILE_ACKS: Vec<FileStorageAck> = Vec::new();
 fn file_rows() -> &'static mut Vec<FileStorageRow> {
     unsafe { &mut *core::ptr::addr_of_mut!(FILE_ROWS) }
+}
+fn file_acks() -> &'static mut Vec<FileStorageAck> {
+    unsafe { &mut *core::ptr::addr_of_mut!(FILE_ACKS) }
 }
 fn contains_allocation(identity: SourcePoolAllocationIdentity, address: u64) -> bool {
     address >= identity.component_address
@@ -209,6 +515,66 @@ unsafe fn allocation_containing(
     Ok(exact)
 }
 
+pub(super) unsafe fn pin_video_pool_range(
+    inst: DriverInstance,
+    address: u64,
+    bytes: u64,
+) -> Result<VideoPoolPin, nt_status::NtStatus> {
+    let _durable = crate::allocator::enter_durable();
+    let _guard = lock();
+    let domain = validate_arena(inst)?;
+    let _pool = hosted_instance_pool_lock(inst.exec_pool_va)
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    let exact = allocation_containing(inst, address, bytes)?;
+    if exact.component_address & 0xfff != 0 || exact.capacity & 0xfff != 0
+        || ledger().protects_address(domain, exact.component_address)
+        || rows().iter().any(|row| same_pool(row.instance, inst)
+            && row.allocation.component_address == exact.component_address)
+        || file_rows().iter().any(|row| same_pool(row.instance, inst)
+            && protects_file_member(row, exact.component_address))
+        || temporary_pins().iter().any(|row| same_pool(row.instance, inst)
+            && contains_allocation(row.allocation, exact.component_address))
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    video_pins().try_reserve(1)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let id = NEXT_VIDEO_PIN_ID;
+    NEXT_VIDEO_PIN_ID = id.checked_add(1)
+        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    video_pins().push(VideoPinRow { id, instance: inst, domain, allocation: exact, uncertain: false });
+    Ok(VideoPoolPin { id, instance: inst, domain, allocation: exact, held: true })
+}
+
+pub(super) fn quarantine_video_pool_pin(pin: &VideoPoolPin) -> bool {
+    let _guard = lock();
+    let Some(row) = video_pins().iter_mut().find(|row| row.id == pin.id) else { return false; };
+    if !pin.held || !same_arena(row.instance, pin.instance)
+        || row.domain != pin.domain || row.allocation != pin.allocation { return false; }
+    row.uncertain = true;
+    true
+}
+
+pub(super) unsafe fn release_video_pool_pin(
+    pin: &mut VideoPoolPin,
+) -> Result<(), nt_status::NtStatus> {
+    let _guard = lock();
+    if !pin.held { return Err(nt_status::NtStatus::INVALID_HANDLE); }
+    let index = video_pins().iter().position(|row| row.id == pin.id
+        && same_arena(row.instance, pin.instance)
+        && row.domain == pin.domain && row.allocation == pin.allocation)
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if video_pins()[index].uncertain { return Err(nt_status::NtStatus::DEVICE_BUSY); }
+    let _pool = hosted_instance_pool_lock(pin.instance.exec_pool_va)
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    if allocation(pin.instance, pin.allocation.component_address)? != pin.allocation {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    video_pins().swap_remove(index);
+    pin.held = false;
+    Ok(())
+}
+
 /// Pin the exact live pool allocation containing a callback byte range before provider entry.
 /// The catalog lock is taken before the pool lock, matching all generic free admissions, so a
 /// successful capture cannot race the physical free. Multiple callbacks may pin one allocation;
@@ -225,6 +591,9 @@ pub(super) unsafe fn pin_temporary_pool_range(
         hosted_instance_pool_lock(inst.exec_pool_va).ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
     let exact = allocation_containing(inst, address, bytes)?;
     if ledger().protects_address(domain, exact.component_address)
+        || dma_adapter_pair::protects(inst, exact.component_address)
+        || dma_private_graph::protects(inst, exact.component_address)
+        || interrupt_projection::protects(inst, exact.component_address)
         || rows().iter().any(|row| {
             same_pool(row.instance, inst)
                 && row.allocation.component_address == exact.component_address
@@ -463,6 +832,38 @@ pub(super) unsafe fn retire_owned_temporary_pool_allocation(
     Ok(())
 }
 
+/// VideoPort transfers ownership of its monitor array to the successful IOCTL caller. The
+/// win32k bridge is that caller's proxy: its typed lease proves the exact provider generation,
+/// dependent free, and completion barrier before this physical free may be attempted.
+pub(super) unsafe fn retire_transferred_monitor_array(
+    pin: &mut TemporaryPoolPin,
+    ownership: &nt_io_manager::video_monitor_array_projection::MonitorArrayProjection,
+) -> Result<(), nt_status::NtStatus> {
+    use nt_io_manager::video_monitor_array_projection::MonitorArrayAllocation;
+    let source = MonitorArrayAllocation::new(pin.domain, pin.allocation)
+        .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    if ownership.source() != source || !ownership.provider_retirement_ready() {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    retire_owned_temporary_pool_allocation(pin)
+}
+
+/// A sealed, acknowledged source IOCTL may stop after capture but before any dependent pointer
+/// projection exists. Its successful VideoPort result still transferred ownership to the caller;
+/// the retained exact pin is the authority to retire that unpublished allocation once.
+pub(super) unsafe fn retire_unpublished_transferred_monitor_array(
+    pin: &mut TemporaryPoolPin,
+    source: nt_io_manager::video_monitor_array_projection::MonitorArrayAllocation,
+) -> Result<(), nt_status::NtStatus> {
+    use nt_io_manager::video_monitor_array_projection::MonitorArrayAllocation;
+    if MonitorArrayAllocation::new(pin.domain, pin.allocation)
+        .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)? != source
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    retire_owned_temporary_pool_allocation(pin)
+}
+
 /// The returned lock spans the subsequent generic free, preventing publication in between.
 pub(super) fn generic_free_admission(
     inst: DriverInstance,
@@ -471,15 +872,21 @@ pub(super) fn generic_free_admission(
     let guard = lock();
     let domain = validate_arena(inst)?;
     if ledger().protects_address(domain, address)
+        || dma_adapter_pair::protects(inst, address)
+        || dma_private_graph::protects(inst, address)
+        || interrupt_projection::protects(inst, address)
         || rows().iter().any(|row| {
             same_pool(row.instance, inst)
-                && address >= row.allocation.component_address
-                && address < row.allocation.component_address + row.allocation.capacity
+                && (contains_allocation(row.allocation, address)
+                    || row.owned_vpb.is_some_and(|vpb| contains_allocation(vpb, address)))
         })
         || file_rows()
             .iter()
             .any(|row| same_pool(row.instance, inst) && protects_file_member(row, address))
         || temporary_pins().iter().any(|row| {
+            same_pool(row.instance, inst) && contains_allocation(row.allocation, address)
+        })
+        || video_pins().iter().any(|row| {
             same_pool(row.instance, inst) && contains_allocation(row.allocation, address)
         })
     {
@@ -518,7 +925,13 @@ pub(super) unsafe fn protect_file_storage(
             return Err(nt_status::NtStatus::INVALID_PARAMETER);
         }
         let name = allocation(inst, name_address)?;
-        if file_rows().iter().any(|row| {
+        if dma_adapter_pair::protects(inst, address)
+            || dma_private_graph::protects(inst, address)
+            || interrupt_projection::protects(inst, address)
+            || dma_adapter_pair::protects(inst, name_address)
+            || dma_private_graph::protects(inst, name_address)
+            || interrupt_projection::protects(inst, name_address)
+            || file_rows().iter().any(|row| {
             (row.domain == domain || same_pool(row.instance, inst))
                 && (protects_file_member(row, address)
                     || protects_file_member(row, name_address))
@@ -551,7 +964,13 @@ pub(super) unsafe fn protect_file_storage(
             same_pool(row.instance, inst)
                 && (contains_allocation(row.allocation, address)
                     || name_address != 0 && contains_allocation(row.allocation, name_address))
-        }) || temporary_pins().iter().any(|row| {
+        }) || dma_adapter_pair::protects(inst, address)
+            || interrupt_projection::protects(inst, address)
+            || dma_private_graph::protects(inst, address)
+            || name_address != 0 && dma_adapter_pair::protects(inst, name_address)
+            || name_address != 0 && interrupt_projection::protects(inst, name_address)
+            || name_address != 0 && dma_private_graph::protects(inst, name_address)
+            || temporary_pins().iter().any(|row| {
             same_pool(row.instance, inst)
                 && (contains_allocation(row.allocation, address)
                     || name_address != 0 && contains_allocation(row.allocation, name_address))
@@ -657,7 +1076,60 @@ pub(super) unsafe fn retire_file_storage(
         }
         row.file_freed = true;
     }
+    // Keep the exact physical receipt until the component has observed this result. A lost
+    // op9 reply cannot be interpreted as permission to issue another physical free.
+    Ok(())
+}
+
+pub(super) fn file_storage_retirement_disposition(
+    inst: DriverInstance, file_id: u64, address: u64, file_generation: u64,
+) -> Result<u64, nt_status::NtStatus> {
+    let _guard = lock();
+    let domain = validate_arena(inst)?;
+    let row = file_rows().iter().find(|row| {
+        same_arena(row.instance, inst) && row.domain == domain
+            && row.file_id == file_id && row.file.component_address == address
+            && row.file.pool_generation == file_generation && row.canonical_unbound
+    }).ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    Ok(u64::from(row.name_freed) | (u64::from(row.file_freed) << 1))
+}
+
+pub(super) fn acknowledge_file_storage_retirement(
+    inst: DriverInstance, file_id: u64, address: u64, file_generation: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let _durable = crate::allocator::enter_durable();
+    let _guard = lock();
+    let domain = validate_arena(inst)?;
+    let Some(index) = file_rows().iter().position(|row| {
+        same_arena(row.instance, inst) && row.domain == domain
+            && row.file_id == file_id && row.file.component_address == address
+            && row.file.pool_generation == file_generation && row.canonical_unbound
+            && row.name_freed && row.file_freed
+    }) else {
+        return if file_acks().iter().any(|ack| {
+            same_arena(ack.instance, inst) && ack.domain == domain
+                && ack.file_id == file_id && ack.file.component_address == address
+                && ack.file.pool_generation == file_generation
+        }) { Ok(()) } else { Err(nt_status::NtStatus::INVALID_HANDLE) };
+    };
+    let row = &file_rows()[index];
+    file_acks().try_reserve(1).map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    file_acks().push(FileStorageAck {
+        instance: row.instance, domain: row.domain, file_id: row.file_id,
+        file: row.file, name: row.name,
+    });
     file_rows().swap_remove(index);
+    Ok(())
+}
+
+pub(super) fn drain_file_storage_acknowledgements(
+    inst: DriverInstance,
+) -> Result<(), nt_status::NtStatus> {
+    let _guard = lock();
+    if file_rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst)) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    file_acks().retain(|ack| !same_arena(ack.instance, inst));
     Ok(())
 }
 
@@ -681,6 +1153,11 @@ pub(super) unsafe fn protect_allocation_exact(
     let current = allocation(inst, address)?;
     if expected.is_some_and(|expected| expected != current) {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    if dma_adapter_pair::protects(inst, address)
+        || dma_private_graph::protects(inst, address)
+        || interrupt_projection::protects(inst, address) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     if rows().iter().any(|row| {
         (row.domain == domain || same_pool(row.instance, inst)) && !same_arena(row.instance, inst)
@@ -721,9 +1198,11 @@ pub(super) unsafe fn protect_allocation_exact(
         domain,
         allocation: current,
         staged_driver_object: None,
+        owned_vpb: None,
         accepted: None,
         accepted_driver_object: None,
         registration: None,
+        canonical_live: false,
         owner,
         retirement_pending: false,
     });
@@ -749,10 +1228,13 @@ pub(super) fn publish_registration(
         return Err(nt_status::NtStatus::INVALID_HANDLE);
     }
     if row.registration == Some(registration) {
-        return Ok(());
+        return if row.canonical_live { Ok(()) } else {
+            Err(nt_status::NtStatus::INVALID_HANDLE)
+        };
     }
     ledger().attach_registration(&row.owner, registration)?;
     row.registration = Some(registration);
+    row.canonical_live = true;
     Ok(())
 }
 
@@ -764,19 +1246,20 @@ pub(super) enum DeviceListOwner {
     Unlinked,
 }
 
-pub(super) unsafe fn stage_driver_object(
-    inst: DriverInstance, address: u64, list_owner: DeviceListOwner,
+pub(super) unsafe fn stage_device_projection(
+    inst: DriverInstance, address: u64, list_owner: DeviceListOwner, expected_device_type: u32,
 ) -> Result<(), nt_status::NtStatus> {
     let _guard = lock();
     let _pool = hosted_instance_pool_lock(inst.exec_pool_va)
         .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
     let current = allocation(inst, address)?;
-    let row = rows()
-        .iter_mut()
-        .find(|row| same_arena(row.instance, inst)
+    let row_index = rows()
+        .iter()
+        .position(|row| same_arena(row.instance, inst)
             && row.allocation.component_address == address)
         .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
-    if row.retirement_pending || row.accepted.is_some() || row.allocation != current
+    if rows()[row_index].retirement_pending || rows()[row_index].accepted.is_some()
+        || rows()[row_index].allocation != current
         || current.capacity < WDM_X64_DEVICE_OBJECT_SIZE as u64 {
         return Err(nt_status::NtStatus::INVALID_HANDLE);
     }
@@ -787,12 +1270,45 @@ pub(super) unsafe fn stage_driver_object(
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     let driver_object = read_unaligned(exec as *const u64);
     let next_device = read_unaligned((exec + 8) as *const u64);
+    let device_type = read_unaligned((exec + 0x40) as *const u32);
+    let vpb_address = read_unaligned((exec - 8 + 0x38) as *const u64);
+    if device_type != expected_device_type || vpb_address != 0 || rows()[row_index].owned_vpb.is_some() {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
     if (list_owner == DeviceListOwner::Linked && driver_object == 0)
         || (list_owner == DeviceListOwner::Unlinked
             && (driver_object != 0 || next_device != 0)) {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
-    row.staged_driver_object = Some(driver_object);
+    // The executive allocates the VPB while holding the authenticated provider pool lock.
+    // Provider-writable DEVICE_OBJECT.Vpb is a view, never free authority.
+    let owned_vpb = if nt_io_manager::device_type_needs_vpb(device_type) {
+        let vpb_address = hosted_instance_pool_alloc_unlocked(inst, nt_io_manager::WDM_X64_VPB_SIZE as u64)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        let vpb = match allocation(inst, vpb_address) {
+            Ok(vpb) => vpb,
+            Err(status) => {
+                assert!(hosted_instance_pool_free_unlocked(inst, vpb_address));
+                return Err(status);
+            }
+        };
+        if vpb.capacity < nt_io_manager::WDM_X64_VPB_SIZE as u64 {
+            assert!(hosted_instance_pool_free_unlocked(inst, vpb_address));
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        let vpb_exec = inst.exec_pool_va + (vpb_address - FSD_POOL_VADDR);
+        let bytes = core::slice::from_raw_parts_mut(vpb_exec as *mut u8, nt_io_manager::WDM_X64_VPB_SIZE);
+        if nt_io_manager::write_wdm_vpb(bytes, address).is_err() {
+            assert!(hosted_instance_pool_free_unlocked(inst, vpb_address));
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        Some(vpb)
+    } else { None };
+    rows()[row_index].staged_driver_object = Some(driver_object);
+    rows()[row_index].owned_vpb = owned_vpb;
+    if let Some(vpb) = owned_vpb {
+        write_unaligned((exec - 8 + 0x38) as *mut u64, vpb.component_address);
+    }
     Ok(())
 }
 
@@ -836,11 +1352,21 @@ pub(super) struct LocalRetirement {
 pub(super) struct RetirementPreflight {
     domain: HostedDomainIdentity,
     accepted_driver_object: Option<u64>,
+    owned_vpb: Option<SourcePoolAllocationIdentity>,
 }
 
 impl RetirementPreflight {
     pub(super) fn accepted_driver_object(&self) -> Option<u64> {
         self.accepted_driver_object
+    }
+    pub(super) unsafe fn owned_vpb_for_retirement(
+        &self, inst: DriverInstance,
+    ) -> Result<Option<SourcePoolAllocationIdentity>, nt_status::NtStatus> {
+        let Some(vpb) = self.owned_vpb else { return Ok(None); };
+        if allocation(inst, vpb.component_address)? != vpb {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        Ok(Some(vpb))
     }
     pub(super) unsafe fn related_allocation_exec(
         &self,
@@ -898,6 +1424,7 @@ pub(super) unsafe fn admit_retirement_checked<T>(
     let checked = check(&RetirementPreflight {
         domain,
         accepted_driver_object: rows()[index].accepted_driver_object,
+        owned_vpb: rows()[index].owned_vpb,
     })?;
     let row = &mut rows()[index];
     if row.registration.is_none() && registration.is_some() {
@@ -941,6 +1468,21 @@ pub(super) unsafe fn capture_allocation(
     let _pool =
         hosted_instance_pool_lock(inst.exec_pool_va).ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
     allocation(inst, address)
+}
+
+/// Resolve an interior output cell to its exact physical pool allocation.
+/// The caller retains the returned generation across a parked callback and
+/// rechecks it before copyout; owned Device projections remain free excluded
+/// by their registration, while other allocations need a temporary pin.
+pub(super) unsafe fn capture_range_allocation(
+    inst: DriverInstance,
+    address: u64,
+    bytes: u64,
+) -> Result<SourcePoolAllocationIdentity, nt_status::NtStatus> {
+    validate_arena(inst)?;
+    let _pool =
+        hosted_instance_pool_lock(inst.exec_pool_va).ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    allocation_containing(inst, address, bytes)
 }
 
 /// Free one row-owned graph member only when its original physical allocation is still live.
@@ -1030,8 +1572,104 @@ pub(super) fn registration(
     rows()
         .iter()
         .find(|row| same_arena(row.instance, inst) && row.allocation.component_address == address)
-        .map(|row| row.registration)
+        .map(|row| row.canonical_live.then_some(row.registration).flatten())
         .ok_or(nt_status::NtStatus::INVALID_HANDLE)
+}
+
+/// Retire the canonical anchor and invalidate the physical catalog as one serialized step.
+/// A source RPC holding the catalog lock can therefore never observe an already retired token.
+pub(super) fn retire_canonical_pointer(
+    io: &mut ExecutiveIoManager,
+    registration: HostedDevicePointerRegistration,
+) -> Result<(), nt_status::NtStatus> {
+    let _guard = lock();
+    io.retire_hosted_device_pointer(registration)?;
+    for row in rows().iter_mut() {
+        if row.registration == Some(registration) {
+            row.canonical_live = false;
+        }
+    }
+    Ok(())
+}
+
+/// The source owner is already locked. Acquire the allocation catalog before the pool, matching
+/// the physical retirement order, and hold both through the requestor ETHREAD write.
+pub(super) fn with_live_verify_device_registration<T>(
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    address: u64,
+    use_registration: impl FnOnce(Option<HostedDevicePointerRegistration>) -> T,
+) -> Result<T, nt_status::NtStatus> {
+    let _guard = lock();
+    let selected = if address == 0 { None } else {
+        let mut matches = rows().iter().filter(|row| {
+            row.registration.is_some_and(|registration| {
+                registration.domain() == domain && registration.address() == address
+            })
+        });
+        let row = matches.next().ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+        if matches.next().is_some() || !row.canonical_live || row.retirement_pending {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+        Some((row.instance, row.domain, row.allocation,
+            row.registration.expect("selected published registration")))
+    };
+    let physical_pool = selected.map_or(inst.exec_pool_va, |(owner, _, _, _)| owner.exec_pool_va);
+    let (first_pool, second_pool) = if inst.exec_pool_va <= physical_pool {
+        (inst.exec_pool_va, physical_pool)
+    } else {
+        (physical_pool, inst.exec_pool_va)
+    };
+    let _first = unsafe { hosted_instance_pool_lock(first_pool) }
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    let _second = if second_pool == first_pool { None } else {
+        Some(unsafe { hosted_instance_pool_lock(second_pool) }
+            .ok_or(nt_status::NtStatus::DEVICE_BUSY)?)
+    };
+    let registration = if let Some((owner, physical_domain, exact, registration)) = selected {
+        if unsafe { allocation(owner, address) }? != exact
+            || ledger().physical_allocation_for_registration(registration)
+                != Some((physical_domain, exact))
+        {
+            return Err(nt_status::NtStatus::INVALID_HANDLE);
+        }
+        Some(registration)
+    } else { None };
+    Ok(use_registration(registration))
+}
+
+/// Prove the physical allocation behind one already identified published Device projection.
+/// The registration may name a logical driver in another domain; the supplied instance is the
+/// physical pool owner. Callers must separately revalidate the registration in IoManager and
+/// the provider dependency before using this allocation as a dispatch route.
+pub(super) unsafe fn published_allocation_for_registration(
+    inst: DriverInstance,
+    registration: HostedDevicePointerRegistration,
+) -> Result<SourcePoolAllocationIdentity, nt_status::NtStatus> {
+    let _guard = lock();
+    let physical = validate_arena(inst)?;
+    let row = rows()
+        .iter()
+        .find(|row| {
+            same_arena(row.instance, inst)
+                && row.domain == physical
+                && row.allocation.component_address == registration.address()
+                && row.registration == Some(registration)
+        })
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    if row.retirement_pending {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    let exact = row.allocation;
+    if ledger().physical_allocation_for_registration(registration) != Some((physical, exact)) {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    let _pool = hosted_instance_pool_lock(inst.exec_pool_va)
+        .ok_or(nt_status::NtStatus::DEVICE_BUSY)?;
+    if allocation(inst, registration.address())? != exact {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
+    }
+    Ok(exact)
 }
 
 /// Cleanup provenance includes a canonical bind accepted before a later physical publication
@@ -1050,18 +1688,39 @@ pub(super) fn accepted_registration(
 
 pub(super) fn instance_quiesced(inst: DriverInstance) -> bool {
     let _guard = lock();
-    !file_rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
+    !dma_adapter_pair::owns_pool(inst)
+        && !dma_private_graph::owns_pool(inst)
+        && !dma_owned_sg_alias::has_arena(inst)
+        && !interrupt_projection::owns_pool(inst)
+        && !file_rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
         && !rows()
             .iter()
             .any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
         && !temporary_pins()
         .iter()
         .any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
+        && !video_pins()
+        .iter()
+        .any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
+}
+
+pub(super) fn instance_ready_to_drain_dma_tombstones(inst: DriverInstance) -> bool {
+    let _guard = lock();
+    !dma_adapter_pair::has_live_pair(inst)
+        && !dma_private_graph::has_live_graph(inst)
+        && !dma_owned_sg_alias::has_pending_effects(inst)
+        && !interrupt_projection::has_live(inst)
+        && !file_rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
+        && !rows().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
+        && !temporary_pins().iter().any(|row| same_arena(row.instance, inst) || same_pool(row.instance, inst))
 }
 
 pub(super) fn protects_allocation(inst: DriverInstance, address: u64) -> bool {
     let _guard = lock();
-    rows().iter().any(|row| {
+    dma_adapter_pair::protects(inst, address)
+        || dma_private_graph::protects(inst, address)
+        || interrupt_projection::protects(inst, address)
+        || rows().iter().any(|row| {
         (same_arena(row.instance, inst) || same_pool(row.instance, inst))
             && address >= row.allocation.component_address
             && address < row.allocation.component_address + row.allocation.capacity

@@ -289,6 +289,17 @@ pub fn bounded_read_disposition(
     }
 }
 
+/// Prepare the next writable chunk of a bounded file read.
+pub fn prepare_bounded_read_chunk(
+    contents: &mut Vec<u8>,
+    requested: usize,
+) -> Result<usize, alloc::collections::TryReserveError> {
+    let old_length = contents.len();
+    contents.try_reserve(requested)?;
+    contents.resize(old_length + requested, 0);
+    Ok(old_length)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DllRedirect {
     pub name: Vec<u16>,
@@ -952,6 +963,25 @@ mod tests {
             bounded_read_disposition(7, 2, crate::STATUS_SUCCESS, 2, 8, 0xdead_beef),
             Err(0xdead_beef)
         );
+    }
+
+    #[test]
+    fn bounded_read_buffer_grows_amortized_for_large_files() {
+        let mut contents = Vec::new();
+        let mut capacity_changes = 0;
+        let mut previous_capacity = 0;
+        for _ in 0..1024 {
+            let old_length = prepare_bounded_read_chunk(&mut contents, 0x4000).unwrap();
+            assert_eq!(old_length + 0x4000, contents.len());
+            contents[old_length..].fill(0xa5);
+            if contents.capacity() != previous_capacity {
+                capacity_changes += 1;
+                previous_capacity = contents.capacity();
+            }
+        }
+        assert_eq!(contents.len(), MAX_MANIFEST_BYTES);
+        assert!(contents.iter().all(|byte| *byte == 0xa5));
+        assert!(capacity_changes <= 32, "{capacity_changes} reallocations");
     }
 
     #[test]

@@ -8,6 +8,7 @@
 
 use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut, read_unaligned, write_unaligned};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use nt_io_manager::{
     write_wdm_device_object, write_wdm_driver_object, WdmDeviceObjectInit, WdmDriverObjectInit,
@@ -19,7 +20,6 @@ use nt_video_miniport::{VIDEO_DEVICE_MAP_KEY, VIDEO_DEVICE_MAP_MAX_OBJECT_VALUE}
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_NO_MEMORY: i32 = 0xC000_0017u32 as i32;
-const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
 const REG_SZ: u32 = 1;
 const REG_DWORD: u32 = 4;
 
@@ -201,6 +201,85 @@ static mut VIDEO_STATE: VideoBridgeState = VideoBridgeState::empty();
 static VIDEO_PUBLICATION_ACTIVE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+// The periodic census may run while a nested native CREATE or provider allocation is active.
+// Publish only atomic observation, with an even sequence denoting a coherent snapshot.
+static VIDEO_PUBLICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static VIDEO_PUBLICATION_ENTRIES: AtomicU64 = AtomicU64::new(0);
+static VIDEO_PUBLICATION_EXITS: AtomicU64 = AtomicU64::new(0);
+static VIDEO_PUBLICATION_DEVICE: AtomicU64 = AtomicU64::new(0);
+static VIDEO_PUBLICATION_OWNER: AtomicU64 = AtomicU64::new(0);
+static VIDEO_PUBLICATION_STAGE: AtomicU64 = AtomicU64::new(0);
+
+fn observe_video_publication(device_id: u64, owner_id: u64, stage: u64, entered: bool, exited: bool) {
+    VIDEO_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
+    VIDEO_PUBLICATION_DEVICE.store(device_id, Ordering::Relaxed);
+    VIDEO_PUBLICATION_OWNER.store(owner_id, Ordering::Relaxed);
+    VIDEO_PUBLICATION_STAGE.store(stage, Ordering::Relaxed);
+    if entered {
+        VIDEO_PUBLICATION_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    }
+    if exited {
+        VIDEO_PUBLICATION_EXITS.fetch_add(1, Ordering::Relaxed);
+    }
+    VIDEO_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::Release);
+}
+
+struct PublicationObservation {
+    device_id: u64,
+    owner_id: u64,
+}
+
+impl PublicationObservation {
+    fn enter(device_id: u64) -> Self {
+        observe_video_publication(device_id, 0, 1, true, false);
+        Self { device_id, owner_id: 0 }
+    }
+
+    fn stage(&self, stage: u64) {
+        observe_video_publication(self.device_id, self.owner_id, stage, false, false);
+    }
+
+    fn owner_reserved(&mut self, owner_id: u64) {
+        self.owner_id = owner_id;
+        self.stage(9);
+    }
+}
+
+impl Drop for PublicationObservation {
+    fn drop(&mut self) {
+        observe_video_publication(self.device_id, self.owner_id, 19, false, true);
+    }
+}
+
+pub(crate) fn print_hosted_video_publication_census() {
+    let sequence = VIDEO_PUBLICATION_SEQUENCE.load(Ordering::Acquire);
+    let entries = VIDEO_PUBLICATION_ENTRIES.load(Ordering::Relaxed);
+    if entries == 0 {
+        return;
+    }
+    let exits = VIDEO_PUBLICATION_EXITS.load(Ordering::Relaxed);
+    let device = VIDEO_PUBLICATION_DEVICE.load(Ordering::Relaxed);
+    let owner = VIDEO_PUBLICATION_OWNER.load(Ordering::Relaxed);
+    let stage = VIDEO_PUBLICATION_STAGE.load(Ordering::Relaxed);
+    let stable = sequence & 1 == 0
+        && VIDEO_PUBLICATION_SEQUENCE.load(Ordering::Acquire) == sequence;
+    crate::print_str(b"[video-publication-census] entries/exits/device/owner/stage=");
+    if stable {
+        crate::print_u64(entries);
+        crate::print_str(b"/");
+        crate::print_u64(exits);
+        crate::print_str(b"/");
+        crate::print_u64(device);
+        crate::print_str(b"/");
+        crate::print_u64(owner);
+        crate::print_str(b"/");
+        crate::print_u64(stage);
+    } else {
+        crate::print_str(b"unstable");
+    }
+    crate::print_str(b"\n");
+}
+
 struct PublicationGuard;
 
 impl PublicationGuard {
@@ -223,6 +302,10 @@ impl Drop for PublicationGuard {
     }
 }
 
+pub(crate) fn video_publication_active() -> bool {
+    VIDEO_PUBLICATION_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
+}
+
 pub(crate) unsafe fn video_file_owners_quiesced() -> bool {
     !VIDEO_PUBLICATION_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
         && !video_projection_owners::has_owners()
@@ -240,6 +323,7 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
         print_hosted_video_publish_failure(b"publication-busy", None);
         return false;
     };
+    let mut observation = PublicationObservation::enter(reg.device_id);
     let old_route = video_state_snapshot().route;
     if old_route.owner_id != 0
         && video_projection_owners::pointer_reference_count(old_route.owner_id) != Some(0)
@@ -251,10 +335,13 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
         print_hosted_video_publish_failure(b"route-info", None);
         return false;
     };
+    observation.stage(2); // before projected driver/device objects
     if !ensure_video_objects(reg.allocate_projection) {
         print_hosted_video_publish_failure(b"objects", None);
         return false;
     }
+    observation.stage(3); // after projected driver/device objects
+    observation.stage(4); // before device identity binding
     if let Err(status) = crate::driver_launch::win32k_device_consumer::bind_projection(
         (*addr_of!(VIDEO_STATE)).objects.device,
         nt_io_manager::DeviceId(route_info.device_id),
@@ -262,6 +349,8 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
         print_hosted_video_publish_failure(b"device-identity", Some(NtStatus(status)));
         return false;
     }
+    observation.stage(5); // after device identity binding
+    observation.stage(6); // before metadata allocation
     let Some(metadata) = video_registration_metadata_from_paths(
         route_info.object_number,
         route_info.driver_object_path.as_slice(),
@@ -272,6 +361,8 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
         print_hosted_video_publish_failure(b"metadata", None);
         return false;
     };
+    observation.stage(7); // after metadata allocation
+    observation.stage(8); // before File owner reservation
     let owner_id = match video_projection_owners::reserve() {
         Ok(owner) => owner,
         Err(status) => {
@@ -279,6 +370,8 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
             return false;
         }
     };
+    observation.owner_reserved(owner_id); // after File owner reservation
+    observation.stage(10); // before native IRP_MJ_CREATE
     let (file_handle, file_id, opened_device, file_object_id) =
         match open_video_device_route(metadata) {
             Ok(route) => route,
@@ -288,6 +381,7 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
                 return false;
             }
         };
+    observation.stage(11); // after native IRP_MJ_CREATE
     video_projection_owners::attach_open(owner_id, file_handle, file_id)
         .expect("reserved video File owner disappeared during open");
     if opened_device != route_info.device_id {
@@ -298,6 +392,7 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
         );
         return false;
     }
+    observation.stage(12); // before File projection preparation
     let file_projection = match video_projection_owners::prepare(
         owner_id,
         route_info.device_id,
@@ -311,11 +406,14 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
             return false;
         }
     };
+    observation.stage(13); // after File projection preparation
+    observation.stage(14); // before old route teardown
     if !teardown_video_io_route() {
         video_projection_owners::retire(owner_id);
         print_hosted_video_publish_failure(b"teardown", None);
         return false;
     }
+    observation.stage(15); // after old route teardown
     (*addr_of_mut!(VIDEO_STATE)).metadata = Some(metadata);
     commit_video_io_route(
         owner_id,
@@ -328,6 +426,7 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
         file_object_id,
         VideoRouteBackend::HostedIoManager,
     );
+    observation.stage(16); // before Configuration Manager DeviceMap writes
     if !publish_video_device_map(metadata) {
         let _ = teardown_video_io_route();
         (*addr_of_mut!(VIDEO_STATE)).metadata = None;
@@ -335,7 +434,9 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
         print_hosted_video_publish_failure(b"devicemap", None);
         return false;
     }
+    observation.stage(17); // after Configuration Manager DeviceMap writes
     (*addr_of_mut!(VIDEO_STATE)).ready = true;
+    observation.stage(18); // completed publication
     true
 }
 
@@ -593,26 +694,6 @@ unsafe fn teardown_video_io_route() -> bool {
     true
 }
 
-fn wstr_eq_ascii(name: &[u16], pat: &[u8]) -> bool {
-    if name.len() != pat.len() {
-        return false;
-    }
-    let low = |c: u16| -> u16 {
-        if (b'A' as u16..=b'Z' as u16).contains(&c) {
-            c + 32
-        } else {
-            c
-        }
-    };
-    for (c, expected) in name.iter().zip(pat) {
-        let c = low(*c);
-        if c != low(*expected as u16) {
-            return false;
-        }
-    }
-    true
-}
-
 fn utf16le_nul_from_ascii(bytes: &[u8]) -> Option<Vec<u8>> {
     let need = bytes.len().checked_mul(2)?.checked_add(2)?;
     let mut data = Vec::new();
@@ -663,32 +744,6 @@ unsafe fn publish_video_device_map(metadata: VideoRegistrationMetadata) -> bool 
         .is_ok()
 }
 
-/// Resolve and retain the video File entirely in the executive's owning VSpace.
-pub(crate) unsafe fn video_get_device_object_pointer(
-    name: &[u16],
-    desired_access: u32,
-) -> Result<(u64, u64), i32> {
-    if !projected_video_route_ready() || name.is_empty() {
-        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
-    }
-    let state = video_state_snapshot();
-    let Some(metadata) = state.metadata else {
-        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
-    };
-    if !wstr_eq_ascii(name, metadata.device_path()) {
-        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
-    }
-    let objects = state.objects;
-    if !objects.ready() {
-        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
-    }
-    retain_video_file_projection(
-        state.route.file_projection,
-        nt_types::AccessMask::from_bits_retain(desired_access),
-    )?;
-    Ok((state.route.file_projection, objects.device))
-}
-
 /// Resolve the current attachment top through the File's exact consumer projection.
 pub(crate) unsafe fn video_related_device_object(
     domain: nt_io_manager::HostedDomainIdentity,
@@ -707,28 +762,6 @@ pub(crate) unsafe fn video_related_device_object(
 pub(crate) unsafe fn video_file_projection_contains(object: u64) -> bool {
     let state = video_state_snapshot();
     state.ready && object != 0 && object == state.route.file_projection
-}
-
-pub(crate) unsafe fn retain_video_file_projection(
-    object: u64,
-    desired_access: nt_types::AccessMask,
-) -> Result<u64, i32> {
-    let _operation = PublicationGuard::enter().ok_or(NtStatus::DEVICE_BUSY.raw())?;
-    if !projected_video_route_ready() || !video_file_projection_contains(object) {
-        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
-    }
-    let state = video_state_snapshot();
-    let (file, device, object_id) =
-        crate::driver_launch::lookup_io_handle_file(state.route.file_handle, desired_access)
-            .map_err(|status| status.raw())?;
-    if file != state.route.file_id
-        || device != state.route.device_id
-        || object_id != state.route.file_object_id
-    {
-        return Err(STATUS_INVALID_PARAMETER);
-    }
-    video_projection_owners::reference_by_handle(state.route.owner_id, object)
-        .map_err(|status| status.raw())
 }
 
 pub(crate) unsafe fn reference_video_file_pointer(

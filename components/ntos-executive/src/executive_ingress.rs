@@ -10,6 +10,8 @@ const ROOT_THREAD_CAP: u64 = 1;
 pub(crate) enum ReceiveOutcome {
     Message((u64, u64, u64, u64, u64, u64)),
     OuterBoundary(runtime::ReceiveSettlementBoundary),
+    /// The current Reply remains owned after a refused or uncertain release.
+    RetainedFailure,
 }
 
 impl ReceiveOutcome {
@@ -19,6 +21,9 @@ impl ReceiveOutcome {
             Self::Message(message) => message,
             Self::OuterBoundary(_) => {
                 panic!("receive continuation requires the outer service boundary")
+            }
+            Self::RetainedFailure => {
+                panic!("retained ingress requires the outer service boundary")
             }
         }
     }
@@ -34,6 +39,117 @@ unsafe fn materialize(message: ReceivedMessage) -> (u64, u64, u64, u64, u64, u64
     (message.badge(), message.info(), r0, r1, r2, r3)
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HostedReplyImport {
+    Imported,
+    RefusedNoEffect,
+    /// A cap reached the pool but exact rollback could not be established.
+    Retained,
+}
+
+/// Roll back only the exact cap inserted by this import. A failed clear is an owned effect,
+/// never evidence that the incoming Call may be retried with another Reply slot.
+unsafe fn rollback_hosted_reply_import(
+    new_index: usize,
+    reply: u64,
+    old_main: u64,
+) -> HostedReplyImport {
+    if REPLY_MAIN_SLOT.load(Ordering::Relaxed) != old_main {
+        return HostedReplyImport::Retained;
+    }
+    let pool = wait_reply_pool_mut();
+    let Some(new_identity) = pool.at(new_index) else {
+        return HostedReplyImport::Retained;
+    };
+    if new_identity.cap() != reply {
+        return HostedReplyImport::Retained;
+    }
+    let old_identity = if old_main == 0 {
+        None
+    } else {
+        let Some(identity) = pool.find_cap(old_main) else {
+            return HostedReplyImport::Retained;
+        };
+        Some(identity)
+    };
+    match pool.clear(new_identity, old_identity) {
+        Ok(()) => HostedReplyImport::RefusedNoEffect,
+        Err(_) => HostedReplyImport::Retained,
+    }
+}
+
+/// Install the Reply before the hosted row is marked delivered. The caller retains its full
+/// ReceivedMessage and CALLS row on either refusal; only exact rollback proves no pool effect.
+unsafe fn install_hosted_reply(reply: u64) -> HostedReplyImport {
+    let reply_cptr = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    if wait_reply_pool_find_cap(reply).is_some() {
+        return HostedReplyImport::RefusedNoEffect;
+    }
+    let old_index = if reply_cptr == 0 {
+        None
+    } else {
+        let Some(index) = wait_reply_pool_find_cap(reply_cptr) else {
+            return HostedReplyImport::RefusedNoEffect;
+        };
+        Some(index)
+    };
+    let _durable = crate::allocator::enter_durable();
+    let Some(new_index) = wait_reply_pool_insert_cap(reply, true) else {
+        return HostedReplyImport::RefusedNoEffect;
+    };
+    if REPLY_MAIN_SLOT.load(Ordering::Relaxed) != reply_cptr {
+        return rollback_hosted_reply_import(new_index, reply, reply_cptr);
+    }
+    if let Some(old_index) = old_index {
+        let pool = wait_reply_pool_mut();
+        let Some(new_identity) = pool.at(new_index) else {
+            return HostedReplyImport::Retained;
+        };
+        if new_identity.cap() != reply {
+            return HostedReplyImport::Retained;
+        }
+        let Some(old_identity) = pool.at(old_index) else {
+            return rollback_hosted_reply_import(new_index, reply, reply_cptr);
+        };
+        if pool.replace_main_after_free_observation(old_identity, new_identity).is_err() {
+            return rollback_hosted_reply_import(new_index, reply, reply_cptr);
+        }
+    }
+    REPLY_MAIN_SLOT.store(reply, Ordering::Relaxed);
+    HostedReplyImport::Imported
+}
+
+/// Selected ordinary child import. The native importer alone classifies a completed rollback
+/// as no effect; CALLS independently verifies its exact Reply and held parent before reopening
+/// the pure pass. This adapter remains dormant until the outer RootIngress route is admitted.
+pub(crate) enum SelectedRootImportResult {
+    Message((u64, u64, u64, u64, u64, u64)),
+    RefusedNoEffect,
+    Retained,
+}
+
+pub(crate) unsafe fn import_selected_root_child(
+    snapshot: runtime::PendingSnapshot,
+    admission: nt_component_suspension::ExternalAdmissionKey,
+    parent: nt_component_suspension::NestedExecutionIdentity,
+) -> SelectedRootImportResult {
+    let imported = runtime::take_selected_root_hosted_with(
+        snapshot, admission, parent, |reply, _message| match install_hosted_reply(reply) {
+            HostedReplyImport::Imported => runtime::SelectedRootImportOutcome::Imported,
+            HostedReplyImport::RefusedNoEffect =>
+                runtime::SelectedRootImportOutcome::RefusedNoEffect,
+            HostedReplyImport::Retained => runtime::SelectedRootImportOutcome::Retained,
+        },
+    );
+    match imported {
+        Ok((_reply, message)) => SelectedRootImportResult::Message(materialize(message)),
+        Err(runtime::SelectedRootImportFailure::RefusedNoEffect) =>
+            SelectedRootImportResult::RefusedNoEffect,
+        Err(runtime::SelectedRootImportFailure::Retained(_)) =>
+            SelectedRootImportResult::Retained,
+    }
+}
+
 /// This runs only at a root event boundary. Nested pumps enqueue hosted Calls without touching
 /// REPLY_MAIN_SLOT, which may still be the Reply of their outer blocked syscall.
 pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
@@ -42,60 +158,63 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
         REPLY_MAIN_SLOT.load(Ordering::Relaxed),
         "shared root receive must own the current hosted Reply"
     );
-    if let Some(boundary) = runtime::take_outer_boundary()
-        .expect("settled child retains its exact parent restoration permit")
-    {
-        return ReceiveOutcome::OuterBoundary(boundary);
+    match runtime::take_outer_boundary() {
+        Ok(Some(boundary)) => return ReceiveOutcome::OuterBoundary(boundary),
+        Ok(None) => {}
+        Err(_) => {
+            print_str(b"[ingress-receive-error] child settlement retained\n");
+            return ReceiveOutcome::RetainedFailure;
+        }
     }
     if reply_cptr != 0 {
         if runtime::owns_hosted_reply(reply_cptr) {
-            runtime::release_hosted_reply(reply_cptr).expect(
-                "root receive retains a hosted Call until acknowledged semantic completion",
-            );
+            if runtime::release_hosted_reply(reply_cptr).is_err() {
+                // A terminating caller may still own its physical Call even after the
+                // semantic dispatch has ended. Keep that Reply unavailable and offer a
+                // fresh slot to the next receive; never replay or replace its old Call.
+                if !crate::root_reply_park::quarantine_current_hosted_reply() {
+                    return ReceiveOutcome::RetainedFailure;
+                }
+            }
         } else {
-            assert_eq!(
-                crate::spawn_hosts::query_component_reply_binding(ROOT_THREAD_CAP, reply_cptr),
-                Ok(ReplyBindingObservation::Free),
-                "root receive cannot replace a held hosted Reply"
-            );
+            if crate::spawn_hosts::query_component_reply_binding(ROOT_THREAD_CAP, reply_cptr)
+                != Ok(ReplyBindingObservation::Free)
+            {
+                return ReceiveOutcome::RetainedFailure;
+            }
         }
     }
     loop {
-        if let Some(boundary) = runtime::take_outer_boundary()
-            .expect("settled child retains its exact parent restoration permit")
-        {
-            return ReceiveOutcome::OuterBoundary(boundary);
+        match runtime::take_outer_boundary() {
+            Ok(Some(boundary)) => return ReceiveOutcome::OuterBoundary(boundary),
+            Ok(None) => {}
+            Err(_) => {
+                print_str(b"[ingress-receive-error] child settlement retained\n");
+                return ReceiveOutcome::RetainedFailure;
+            }
         }
-        let delivered = runtime::take_hosted_with(|reply, _message| {
+        let mut import_outcome = HostedReplyImport::RefusedNoEffect;
+        let delivered = match runtime::take_hosted_with(|reply, _message| {
             if !runtime::receive_child_delivery_allowed(reply) {
                 return false;
             }
-            // The pre-delivery sweep may have recycled the previous acknowledged root Reply.
-            let reply_cptr = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-            if wait_reply_pool_find_cap(reply).is_some() {
-                return false;
+            import_outcome = install_hosted_reply(reply);
+            import_outcome == HostedReplyImport::Imported
+        }) {
+            Ok(delivered) => delivered,
+            Err(_) => {
+                if import_outcome == HostedReplyImport::Retained {
+                    print_str(b"[ingress-receive-error] Reply pool import retained\n");
+                }
+                // The hosted ingress row still owns the exact Call and Reply. Do not
+                // admit another receive until that owner can be reconciled.
+                print_str(b"[ingress-receive-error] hosted handoff retained\n");
+                return ReceiveOutcome::RetainedFailure;
             }
-            let old_index = if reply_cptr == 0 {
-                None
-            } else {
-                let Some(index) = wait_reply_pool_find_cap(reply_cptr) else {
-                    return false;
-                };
-                Some(index)
-            };
-            // Allocation and admission precede the ownership transfer. Failure leaves the full
-            // incoming Call in the ingress queue and the old root Reply unchanged.
-            let _durable = crate::allocator::enter_durable();
-            if wait_reply_pool_insert_cap(reply, true).is_none() {
-                return false;
-            }
-            REPLY_MAIN_SLOT.store(reply, Ordering::Relaxed);
-            if let Some(old_index) = old_index {
-                wait_reply_pool_mark_free(old_index);
-            }
-            true
-        })
-        .expect("hosted ingress handoff retained after refusal");
+        };
+        if import_outcome == HostedReplyImport::Retained {
+            return ReceiveOutcome::RetainedFailure;
+        }
         if let Some((_reply, message)) = delivered {
             return ReceiveOutcome::Message(materialize(message));
         }
@@ -105,16 +224,53 @@ pub(crate) unsafe fn receive(reply_cptr: u64) -> ReceiveOutcome {
         );
         // The snapshot journal owns the mounted volume through COMMIT and its terminal ACK.
         // Autonomous Calls stay retained and unadmitted while that ownership is live.
-        if !crate::writable_fs::registry_journal::owns_volume() {
+        if !crate::writable_fs::registry_journal::owns_volume()
+            && !crate::service_sec_image::root_add_device_exclusive_pending()
+            && !crate::service_sec_image::root_queued_callback_exclusive_pending()
+            && !crate::driver_launch::unsettled_queued_callback()
+        {
             if runtime::service_autonomous()
                 .expect("autonomous ingress remains retained on failure")
             {
                 continue;
             }
         }
-        match runtime::receive(IngressExecutionOwner::Idle, ROOT_THREAD_CAP, true)
-            .expect("unified executive ingress retained after receive failure")
-        {
+        runtime::trace_ifeo_root_receive();
+        let arrival = match runtime::receive(IngressExecutionOwner::Idle, ROOT_THREAD_CAP, true) {
+            Ok(arrival) => arrival,
+            Err(error) => {
+                print_str(b"[ingress-receive-error] root kind=");
+                let kind: &[u8] = match error {
+                    runtime::Error::Receive => b"receive\n",
+                    runtime::Error::Retain => b"retain\n",
+                    runtime::Error::UnknownPeer => b"unknown-peer\n",
+                    runtime::Error::Protocol => b"protocol\n",
+                    _ => b"other\n",
+                };
+                print_str(kind);
+                if let Some(running) = runtime::hold_snapshot().running {
+                    print_str(b"[ingress-receive-error] running lane/gen/route/kind=");
+                    print_u64(running.lane.index as u64);
+                    print_str(b"/");
+                    print_u64(running.lane.generation);
+                    print_str(b"/");
+                    print_u64(running.route.map_or(0, |route| route.badge()));
+                    print_str(b"/");
+                    let source_kind: &[u8] = match running.physical.map(|source| source.kind) {
+                        Some(runtime::PhysicalSourceKind::SystemThread { .. }) => b"system-thread\n",
+                        Some(runtime::PhysicalSourceKind::DispatchWorker { .. }) => b"dispatch-worker\n",
+                        Some(runtime::PhysicalSourceKind::Primary) => b"primary\n",
+                        _ => b"other\n",
+                    };
+                    print_str(source_kind);
+                }
+                // Receive/classification failed before a new Call was admitted to a handler.
+                // The receiver still owns any incomplete physical arrival; the outer loop
+                // must stop rather than replace it or make an uncertain effect again.
+                return ReceiveOutcome::RetainedFailure;
+            }
+        };
+        match arrival {
             runtime::Arrival::Notification(message) => {
                 return ReceiveOutcome::Message(materialize(message))
             }
@@ -133,9 +289,17 @@ pub(crate) unsafe fn reply_receive(
 ) -> ReceiveOutcome {
     // One-way acknowledged reply separates outgoing ownership from receive admission. The
     // unified receiver retains arrivals between these operations, including hosted reentry.
-    assert!(
-        client_reply_on(reply_cptr, info, r0, r1, r2, r3),
-        "uncertain hosted reply cannot be replayed or replaced"
-    );
+    if !client_reply_on(reply_cptr, info, r0, r1, r2, r3) {
+        // The retained hosted Call still owns its exact Reply after a refused or
+        // indeterminate send. Quarantine that pool slot before accepting another Call;
+        // never replay the old send. A non-hosted Reply has no such proved owner.
+        if runtime::owns_hosted_reply(reply_cptr)
+            && REPLY_MAIN_SLOT.load(Ordering::Relaxed) == reply_cptr
+            && crate::root_reply_park::quarantine_current_hosted_reply()
+        {
+            return receive(0);
+        }
+        return ReceiveOutcome::RetainedFailure;
+    }
     receive(REPLY_MAIN_SLOT.load(Ordering::Relaxed))
 }

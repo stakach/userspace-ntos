@@ -254,7 +254,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
             let completion = self.completed_irp_snapshot(id).ok_or(NtStatus::PENDING)?;
             // This owner only carries a status result. A nonzero Information value could be a
             // provider-owned output pointer and must be adopted by a different contract.
-            if filter_output.is_none() && completion.information != 0 {
+            let scalar_device_state = retained.owner.invocation.snapshot.minor
+                == nt_pnp_abi::IRP_MN_QUERY_PNP_DEVICE_STATE
+                && completion.status.is_success()
+                && completion.information & !(nt_pnp_abi::PNP_DEVICE_STATE_KNOWN_MASK as u64) == 0;
+            if filter_output.is_none() && completion.information != 0 && !scalar_device_state {
                 return Err(NtStatus::NOT_SUPPORTED);
             }
             if filter_output.is_some_and(|output| {

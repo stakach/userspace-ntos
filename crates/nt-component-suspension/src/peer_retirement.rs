@@ -3,6 +3,27 @@
 use super::*;
 use crate::peer_registry::PeerPhase;
 
+/// Stops fresh physical-source admission before attempting fallible peer retirement.
+/// A refused retirement remains retryable while the source stays fenced.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PeerAdmissionFence {
+    admission_fenced: bool,
+}
+
+impl PeerAdmissionFence {
+    pub const fn new() -> Self { Self { admission_fenced: false } }
+
+    pub const fn allows_admission(self) -> bool { !self.admission_fenced }
+
+    pub fn attempt_retirement<E>(
+        &mut self,
+        attempt: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.admission_fenced = true;
+        attempt()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PeerRetirementPhase {
     AdmissionStopped,

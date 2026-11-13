@@ -3,7 +3,8 @@ use super::*;
 use nt_user_host::process_identity::{ProcessGeneration, ProcessIdentity};
 use nt_user_host::provider_alias_bank::segment::{ProviderAliasSegment, ProviderAliasSegmentIo};
 use nt_user_host::provider_alias_bank::{
-    BankError, ChildCap, ProviderAliasBank, ProviderAliasIo, ProviderAliasRequest,
+    BankError, ChildCap, ProviderAliasBank, ProviderAliasDeleteError, ProviderAliasHandle, ProviderAliasIo,
+    ProviderAliasRequest,
 };
 
 const RADIX: u32 = 12;
@@ -93,15 +94,16 @@ impl ProviderAliasIo for Io {
         unsafe { root_slot_recycle::publish_unretyped(root) }
             .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
     }
-    fn delete_root(&mut self, root: u64) -> Result<(), u32> {
-        status(unsafe { cnode_delete_r(root) })
+    fn delete_root(&mut self, root: u64) -> Result<(), ProviderAliasDeleteError> {
+        status(unsafe { cnode_delete_r(root) }).map_err(ProviderAliasDeleteError::Indeterminate)
     }
-    fn delete_child(&mut self, child: ChildCap) -> Result<(), u32> {
+    fn delete_child(&mut self, child: ChildCap) -> Result<(), ProviderAliasDeleteError> {
         status(unsafe { cnode_delete_in_cnode_r(child.cnode, child.slot) })
+            .map_err(ProviderAliasDeleteError::Indeterminate)
     }
 }
 
-unsafe fn map_inner(request: ProviderAliasRequest) -> Result<(), BankError> {
+unsafe fn map_inner(request: ProviderAliasRequest) -> Result<ProviderAliasHandle, BankError> {
     let _borrow = Borrow::acquire()?;
     let _durable = allocator::enter_durable();
     let slot = &mut *core::ptr::addr_of_mut!(BANK);
@@ -111,13 +113,44 @@ unsafe fn map_inner(request: ProviderAliasRequest) -> Result<(), BankError> {
             usize::MAX / SEGMENT_SLOTS as usize,
         )?);
     }
-    slot.as_mut().unwrap().map(request, &mut Io).map(|_| ())
+    slot.as_mut().unwrap().map(request, &mut Io)
 }
 
 pub(super) unsafe fn map(request: ProviderAliasRequest) -> Result<(), BankError> {
+    map_with_handle(request).map(|_| ())
+}
+
+pub(super) unsafe fn map_with_handle(
+    request: ProviderAliasRequest,
+) -> Result<ProviderAliasHandle, BankError> {
     let result = map_inner(request);
     if let Err(error) = result {
         note_error(b"map", request.pi, request.process, error);
+    }
+    result
+}
+
+pub(super) fn handle_for_exact_request(
+    request: ProviderAliasRequest,
+) -> Option<ProviderAliasHandle> {
+    let _borrow = Borrow::acquire().ok()?;
+    unsafe { (&*core::ptr::addr_of!(BANK)).as_ref() }?
+        .snapshots().find(|snapshot| snapshot.request == request)
+        .map(|snapshot| snapshot.handle)
+}
+
+pub(super) unsafe fn release_page_exact(
+    request: ProviderAliasRequest,
+    handle: ProviderAliasHandle,
+) -> Result<(), BankError> {
+    let result = {
+        let _borrow = Borrow::acquire()?;
+        let _durable = allocator::enter_durable();
+        let bank = (&mut *core::ptr::addr_of_mut!(BANK)).as_mut().ok_or(BankError::StaleHandle)?;
+        bank.release_page_exact(request, handle, &mut Io)
+    };
+    if let Err(error) = result {
+        note_error(b"release-page", request.pi, request.process, error);
     }
     result
 }

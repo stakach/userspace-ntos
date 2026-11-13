@@ -6,9 +6,17 @@ fn process_terminal_receipt_requires_a_new_canonical_termination() {
         .join("../../components/ntos-executive/src/exec_handler.rs");
     let file = syn::parse_file(&std::fs::read_to_string(path).unwrap()).unwrap();
     #[derive(Default)]
-    struct Audit { under_transition: bool, receipt: usize, guarded: bool,
-        captured: bool, terminated_after_capture: bool }
+    struct Audit { under_transition: bool, under_unstarted: bool, receipt: usize,
+        ordinary_receipt: usize, unstarted_receipt: usize, guarded: bool,
+        captured: bool, terminated_after_capture: bool,
+        unstarted_eligible: bool, unstarted_terminated: bool, unstarted_guarded: bool }
     impl<'ast> Visit<'ast> for Audit {
+        fn visit_impl_item_fn(&mut self, method: &'ast syn::ImplItemFn) {
+            let previous = self.under_unstarted;
+            self.under_unstarted = method.sig.ident == "try_terminate_unstarted_process";
+            syn::visit::visit_impl_item_fn(self, method);
+            self.under_unstarted = previous;
+        }
         fn visit_local(&mut self, local: &'ast syn::Local) {
             if matches!(&local.pat, syn::Pat::Ident(name) if name.ident == "was_terminated") {
                 self.captured = local.init.as_ref().is_some_and(|init|
@@ -21,7 +29,14 @@ fn process_terminal_receipt_requires_a_new_canonical_termination() {
         }
         fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
             if call.method == "terminate_process_at" {
-                self.terminated_after_capture |= self.captured;
+                if self.under_unstarted {
+                    self.unstarted_terminated = true;
+                } else {
+                    self.terminated_after_capture |= self.captured;
+                }
+            }
+            if self.under_unstarted && call.method == "unstarted_process_abandonment_pending" {
+                self.unstarted_eligible = true;
             }
             syn::visit::visit_expr_method_call(self, call);
         }
@@ -39,17 +54,27 @@ fn process_terminal_receipt_requires_a_new_canonical_termination() {
             if matches!(&*call.func, Expr::Path(path)
                 if path.path.segments.last().unwrap().ident == "note_native_process_terminal") {
                 self.receipt += 1;
-                self.guarded &= self.under_transition;
+                if self.under_unstarted {
+                    self.unstarted_receipt += 1;
+                    self.unstarted_guarded &= self.unstarted_eligible && self.unstarted_terminated;
+                } else {
+                    self.ordinary_receipt += 1;
+                    self.guarded &= self.under_transition;
+                }
             }
             syn::visit::visit_expr_call(self, call);
         }
     }
-    let mut audit = Audit { guarded: true, ..Audit::default() };
+    let mut audit = Audit { guarded: true, unstarted_guarded: true, ..Audit::default() };
     for item in &file.items {
         if let Item::Impl(value) = item { audit.visit_item_impl(value); }
     }
-    assert_eq!(audit.receipt, 1);
+    assert_eq!(audit.receipt, 2);
+    assert_eq!(audit.ordinary_receipt, 1);
+    assert_eq!(audit.unstarted_receipt, 1);
     assert!(audit.captured && audit.terminated_after_capture,
         "capture canonical signaled/Terminated state before invoking idempotent termination");
     assert!(audit.guarded, "idempotent NtTerminateProcess must not emit another committed transition receipt");
+    assert!(audit.unstarted_guarded,
+        "unstarted retirement must prove abandonment and canonical termination before its receipt");
 }

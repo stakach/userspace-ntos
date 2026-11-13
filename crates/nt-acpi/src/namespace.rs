@@ -6,6 +6,9 @@ use alloc::vec::Vec;
 pub const IOCTL_ACPI_ENUM_CHILDREN: u32 = 0x0032_c020;
 pub const ACPI_ENUM_CHILDREN_INPUT_LEN: usize = 16;
 pub const ACPI_ENUM_CHILDREN_FILTER_INPUT_LEN: usize = 17;
+/// The released provider checks `sizeof(ACPI_ENUM_CHILDREN_OUTPUT_BUFFER)` before
+/// returning the variable-length output header. One inline child makes that 20 bytes.
+pub const ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN: usize = 20;
 
 const ENUM_INPUT_SIGNATURE: u32 = u32::from_be_bytes(*b"HieA");
 const ENUM_OUTPUT_SIGNATURE: u32 = u32::from_be_bytes(*b"GieA");
@@ -37,12 +40,30 @@ pub struct AcpiNamespacePath(String);
 
 impl AcpiNamespacePath {
     pub fn parse(path: &str) -> Result<Self, AcpiNamespaceError> {
-        validate_absolute_path(path.as_bytes())?;
+        if path == "\\" {
+            return Ok(Self(String::from("\\")));
+        }
+        let relative = path.strip_prefix('\\').ok_or(AcpiNamespaceError::InvalidPath)?;
+        validate_relative_path_segments(relative.as_bytes(), true)
+            .map_err(|_| AcpiNamespaceError::InvalidPath)?;
+        let segments = relative.split('.').count();
+        let capacity = segments
+            .checked_mul(5)
+            .ok_or(AcpiNamespaceError::LimitExceeded)?;
         let mut owned = String::new();
         owned
-            .try_reserve_exact(path.len())
+            .try_reserve_exact(capacity)
             .map_err(|_| AcpiNamespaceError::Allocation)?;
-        owned.push_str(path);
+        owned.push('\\');
+        for (index, segment) in relative.split('.').enumerate() {
+            if index != 0 {
+                owned.push('.');
+            }
+            owned.push_str(segment);
+            for _ in segment.len()..4 {
+                owned.push('_');
+            }
+        }
         Ok(Self(owned))
     }
 
@@ -162,31 +183,42 @@ pub fn namespace_children_required_len(
     Ok(required)
 }
 
-/// Choose the next output extent after `IOCTL_ACPI_ENUM_CHILDREN` reports buffer overflow.
-/// Providers that publish the standard required-length header get an exact retry. Providers that
-/// leave the METHOD_BUFFERED input header in place get one bounded maximum-sized retry; another
-/// opaque overflow at that maximum is rejected.
-pub fn namespace_children_overflow_retry_len(
+/// Select a bounded retry from the released provider's two distinct short-buffer statuses.
+/// A buffer below the 20-byte C-struct minimum gets that minimum once; overflow after
+/// the minimum returns 20 valid header bytes with the exact required length at offset 4.
+pub fn namespace_children_probe_retry_len(
+    status: u32,
+    information: u64,
     header: &[u8],
     current: usize,
     maximum: usize,
 ) -> Result<usize, AcpiNamespaceError> {
-    if header.len() != current
-        || current < ENUM_OUTPUT_HEADER_LEN
-        || maximum < ENUM_OUTPUT_HEADER_LEN
-        || current > maximum
+    if header.len() != current || current < ENUM_OUTPUT_HEADER_LEN
+        || maximum < ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN || current > maximum
     {
         return Err(AcpiNamespaceError::InvalidRequiredLength);
     }
-    if read_u32(header, 0)? == ENUM_OUTPUT_SIGNATURE {
-        let required = namespace_children_required_len(header, maximum)?;
-        return (required > current)
-            .then_some(required)
+    if status == 0xc000_0023 && information == 0 {
+        return (current < ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN)
+            .then_some(ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN)
             .ok_or(AcpiNamespaceError::InvalidRequiredLength);
     }
-    (current < maximum)
-        .then_some(maximum)
+    if status != 0x8000_0005
+        || information != ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN as u64
+        || current < ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN
+    {
+        return Err(AcpiNamespaceError::InvalidOutput);
+    }
+    let required = namespace_children_required_len(header, maximum)?;
+    (required > current)
+        .then_some(required)
         .ok_or(AcpiNamespaceError::InvalidRequiredLength)
+}
+
+/// An ACPI PDO without a namespace handle cannot enumerate children. The provider may report
+/// either an unsupported control or a missing root; both mean absence only with no output.
+pub fn namespace_children_absent(status: u32, information: u64) -> bool {
+    matches!(status, 0xc000_0010 | 0xc000_0034) && information == 0
 }
 
 /// Decode one exact successful `IOCTL_ACPI_ENUM_CHILDREN` result. The provider returns the queried
@@ -377,11 +409,19 @@ pub(crate) fn validate_absolute_path(path: &[u8]) -> Result<(), AcpiNamespaceErr
 }
 
 fn validate_relative_path(path: &[u8]) -> Result<(), AcpiNamespaceError> {
+    validate_relative_path_segments(path, false)
+}
+
+fn validate_relative_path_segments(
+    path: &[u8],
+    allow_trimmed: bool,
+) -> Result<(), AcpiNamespaceError> {
     if path.is_empty() {
         return Err(AcpiNamespaceError::InvalidReference);
     }
     for segment in path.split(|byte| *byte == b'.') {
-        if segment.len() != 4
+        if (!allow_trimmed && segment.len() != 4)
+            || (allow_trimmed && !(1..=4).contains(&segment.len()))
             || !matches!(segment[0], b'A'..=b'Z' | b'_')
             || !segment[1..]
                 .iter()
@@ -495,6 +535,14 @@ mod tests {
     }
 
     #[test]
+    fn namespace_output_restores_trimmed_name_seg_underscores() {
+        let payload = output(&[(1, "\\_SB.PCI0"), (0, "\\_SB.PCI0.SEJ")]);
+        let decoded = parse_namespace_children(&payload, 8).unwrap();
+        assert_eq!(decoded.self_path().as_str(), "\\_SB_.PCI0");
+        assert_eq!(decoded.children()[1].path.as_str(), "\\_SB_.PCI0.SEJ_");
+    }
+
+    #[test]
     fn filtered_paths_are_exact_canonical_and_unique_without_self_assumption() {
         let bytes = output(&[(0, "\\_SB_.PCI0._PRT"), (0, "\\_SB_.PCI0.BRG0._PRT")]);
         let matches = parse_namespace_matches(&bytes, 2).unwrap();
@@ -526,24 +574,39 @@ mod tests {
     }
 
     #[test]
-    fn opaque_overflow_gets_one_bounded_maximum_retry() {
+    fn undersized_acpi_namespace_probe_gets_one_bounded_retry() {
         let input_header = immediate_namespace_children_input();
         assert_eq!(
-            namespace_children_overflow_retry_len(&input_header[..8], 8, 4096),
-            Ok(4096)
+            namespace_children_probe_retry_len(0xc000_0023, 0, &input_header[..8], 8, 4096),
+            Ok(ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN)
         );
         assert_eq!(
-            namespace_children_overflow_retry_len(&input_header[..8], 8, 8),
+            namespace_children_probe_retry_len(0xc000_0023, 0, &input_header[..8], 4096, 4096),
             Err(AcpiNamespaceError::InvalidRequiredLength)
         );
+    }
 
-        let mut required_header = [0u8; 8];
-        required_header[..4].copy_from_slice(&ENUM_OUTPUT_SIGNATURE.to_le_bytes());
-        required_header[4..].copy_from_slice(&1234u32.to_le_bytes());
-        assert_eq!(
-            namespace_children_overflow_retry_len(&required_header, 8, 4096),
-            Ok(1234)
-        );
+    #[test]
+    fn pinned_libernt_namespace_probe_and_overflow_have_distinct_status_contracts() {
+        // Bus_PDO_EnumChildren requires sizeof(ACPI_ENUM_CHILDREN_OUTPUT_BUFFER)=20
+        // before writing a header. Its subsequent overflow reports Information=20,
+        // with required bytes in NumberOfChildren at header offset 4.
+        let input = immediate_namespace_children_input();
+        assert_eq!(namespace_children_probe_retry_len(0xc000_0023, 0, &input[..8], 8, 4096), Ok(20));
+        let mut output = [0u8; 20];
+        output[..4].copy_from_slice(&ENUM_OUTPUT_SIGNATURE.to_le_bytes());
+        output[4..8].copy_from_slice(&1234u32.to_le_bytes());
+        assert_eq!(namespace_children_probe_retry_len(0x8000_0005, 20, &output, 20, 4096), Ok(1234));
+        assert_eq!(namespace_children_probe_retry_len(0x8000_0005, 0, &output, 20, 4096), Err(AcpiNamespaceError::InvalidOutput));
+        assert_eq!(namespace_children_probe_retry_len(0xc000_0023, 0, &output, 20, 4096), Err(AcpiNamespaceError::InvalidRequiredLength));
+    }
+
+    #[test]
+    fn namespace_absence_requires_exact_status_and_no_output() {
+        assert!(namespace_children_absent(0xc000_0034, 0));
+        assert!(namespace_children_absent(0xc000_0010, 0));
+        assert!(!namespace_children_absent(0xc000_0034, 8));
+        assert!(!namespace_children_absent(0, 0));
     }
 
     #[test]

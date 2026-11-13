@@ -286,6 +286,16 @@ pub(crate) unsafe fn submit(
         Ok(decoded) => decoded,
         Err(status) => return SubmitResult::Ready((status as i32, 0, 0, 0)),
     };
+    // DriverEntry has the registered canonical table but no process paging context. Admit
+    // only its anonymous committed kernel Sections here; file metadata work needs the full
+    // service-loop context and must never be started during bootstrap.
+    if handler.loop_ctx.is_none()
+        && (op != OP_CREATE_OBJECT || request.file_handle != 0
+            || object_capture.is_some()
+            || request.allocation_attributes & nt_memory_manager::SECTION_ATTR_SEC_COMMIT == 0)
+    {
+        return SubmitResult::Ready((0xc000_00a3u32 as i32, 0, 0, 0));
+    }
     let source = if object_capture.is_some() || request.file_handle == 0 {
         None
     } else {
@@ -420,6 +430,140 @@ fn result_words(result: Result<(u64, u64), u32>) -> (i32, u64, u64, u64) {
         Ok((token, handle)) => (0, token, handle, 0),
         Err(status) => (status as i32, 0, 0, 0),
     }
+}
+
+/// DriverEntry precedes the hosted process handler. Only the captured initial System caller
+/// can create anonymous committed kernel Sections in this phase; publication still uses the
+/// ordinary exact owner/token ledger and the same canonical table adopted by the service loop.
+pub(crate) fn bootstrap_caller_admitted(caller: NativeHandleCaller) -> bool {
+    crate::ps_bootstrap::initial_system_projection().is_some_and(|projection| {
+        caller.effective_process() == projection.identity.process_id()
+            && caller.original_thread() == projection.identity.thread()
+            && caller.mode() == nt_types::AccessMode::KernelMode
+    })
+}
+
+pub(crate) unsafe fn submit_bootstrap(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    caller: NativeHandleCaller,
+    physical: PhysicalSource,
+    op: u64,
+    first: u64,
+    second: u64,
+    third: u64,
+) -> SubmitResult {
+    let _durable = crate::allocator::enter_durable();
+    if !bootstrap_caller_admitted(caller)
+        || crate::service_sec_image::bootstrap_section_table().is_err() {
+        return SubmitResult::Ready((STATUS_INVALID_HANDLE as i32, 0, 0, 0));
+    }
+    let result = match op {
+        OP_CREATE_OBJECT if third == 0 => {
+            use nt_io_manager::win32k_mm_section_wire as mm_wire;
+            (|| -> Result<(u64, u64), u32> {
+                if second != mm_wire::PACKET_BYTES as u64 {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                let (_, bytes) = crate::win32k_subsystem::capture_provider_pool_packet(
+                    first, mm_wire::PACKET_BYTES,
+                )?;
+                let packet = mm_wire::decode(&bytes).map_err(|_| STATUS_INVALID_PARAMETER)?;
+                let request = packet.base;
+                if packet.file_source() != mm_wire::SectionFileSource::Anonymous
+                    || request.object_attributes.is_some()
+                    || request.allocation_attributes != nt_memory_manager::SECTION_ATTR_SEC_COMMIT
+                { return Err(STATUS_NOT_SUPPORTED); }
+                nt_memory_manager::data_section::data_section_file_access(request.page_protection)?;
+                let size = request.maximum_size.filter(|size| *size != 0)
+                    .ok_or(STATUS_INVALID_PARAMETER)?;
+                if size > i64::MAX as u64 {
+                    return Err(nt_memory_manager::STATUS_SECTION_TOO_BIG);
+                }
+                let token = runtime::next_service_wait_token()
+                    .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+                let owner = Owner { route, dispatch, caller, token };
+                {
+                    let pending = &mut *core::ptr::addr_of_mut!(PENDING);
+                    pending.try_reserve(1).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+                    pending.push(Pending {
+                        owner, handle: 0, phase: Phase::Creating, metadata: None,
+                    });
+                }
+                let identity = {
+                    let sections = &mut *crate::service_sec_image::bootstrap_section_table()?;
+                    let Some(index) = sections.create_kernel(size, request.page_protection,
+                        request.allocation_attributes, nt_memory_manager::GenericSectionBacking::anonymous())
+                    else {
+                        let slot = position(owner, 0).expect("bootstrap create owner");
+                        (&mut *core::ptr::addr_of_mut!(PENDING)).swap_remove(slot);
+                        return Err(STATUS_INSUFFICIENT_RESOURCES);
+                    };
+                    sections.section_identity(index).expect("new kernel Section identity")
+                };
+                let address = match crate::provider_mm_section_objects::prepare_bootstrap(identity, physical) {
+                    Ok(address) => address,
+                    Err(status) => {
+                        let slot = position(owner, 0).expect("bootstrap create owner");
+                        (&mut *core::ptr::addr_of_mut!(PENDING)).swap_remove(slot);
+                        return Err(status);
+                    }
+                };
+                let slot = position(owner, 0).expect("bootstrap create owner retained");
+                let entry = &mut (&mut *core::ptr::addr_of_mut!(PENDING))[slot];
+                entry.handle = address;
+                entry.phase = Phase::Reserved(Publication::Object { address, physical });
+                Ok((token, address))
+            })()
+        }
+        OP_PUBLISH | OP_ABORT | OP_ACK if third == 0 && first != 0 && second != 0 => {
+            let owner = Owner { route, dispatch, caller, token: first };
+            (|| -> Result<(u64, u64), u32> {
+                let index = position(owner, second).ok_or(STATUS_INVALID_HANDLE)?;
+                let pending = &mut *core::ptr::addr_of_mut!(PENDING);
+                match op {
+                    OP_PUBLISH => {
+                        let (address, source) = match &pending[index].phase {
+                            Phase::Reserved(Publication::Object { address, physical }) =>
+                                (*address, *physical),
+                            _ => return Err(STATUS_INVALID_HANDLE),
+                        };
+                        if source != physical || address != second { return Err(STATUS_INVALID_HANDLE); }
+                        pending[index].phase = Phase::Publishing;
+                        match crate::provider_mm_section_objects::publish(address, physical) {
+                            Ok(()) => {
+                                pending[index].phase = Phase::PublishedUnacknowledged(
+                                    Publication::Object { address, physical });
+                                Ok((0, 0))
+                            }
+                            Err(status) => {
+                                pending[index].phase = Phase::EffectUncertain;
+                                Err(status)
+                            }
+                        }
+                    }
+                    OP_ABORT => {
+                        if !matches!(pending[index].phase, Phase::Reserved(Publication::Object { .. })) {
+                            return Err(STATUS_INVALID_HANDLE);
+                        }
+                        crate::provider_mm_section_objects::abort(core::ptr::null_mut(), second, physical)?;
+                        pending.swap_remove(index);
+                        Ok((0, 0))
+                    }
+                    OP_ACK => {
+                        if !matches!(pending[index].phase, Phase::PublishedUnacknowledged(_)) {
+                            return Err(STATUS_INVALID_HANDLE);
+                        }
+                        pending.swap_remove(index);
+                        Ok((0, 0))
+                    }
+                    _ => unreachable!(),
+                }
+            })()
+        }
+        _ => Err(STATUS_INVALID_PARAMETER),
+    };
+    SubmitResult::Ready(result_words(result))
 }
 
 enum MetadataStep {

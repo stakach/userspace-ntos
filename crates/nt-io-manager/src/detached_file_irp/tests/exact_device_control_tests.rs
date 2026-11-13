@@ -60,6 +60,199 @@ fn control_buffers() -> ExternalFileIrpBuffers {
 }
 
 #[test]
+fn fileless_partition_read_dispatches_at_exact_lower_device() {
+    let (mut f, lower, _, upper) = stack_fixture();
+    let request = ExternalFileIrpRequest {
+        device_id: lower,
+        file_id: None,
+        user_data: 0,
+        parameters: IoParameters::Read(ReadWriteParameters {
+            length: 512,
+            offset: 512,
+            ..Default::default()
+        }),
+        stack_flags: StackFlags::from_bits_retain(
+            crate::kernel_irp_builder::SL_OVERRIDE_VERIFY_VOLUME,
+        ),
+        ..read(&f)
+    };
+    let policy = ExternalFileIrpDispatchPolicy::ReadAtDevice;
+    let buffers = || ExternalFileIrpBuffers::new(vec![], vec![0; 512]);
+    let prepared = policy.prepare(&mut f.io, request, buffers()).unwrap();
+    assert_eq!(prepared.route().device_id(), lower);
+    assert_ne!(prepared.route().device_id(), upper);
+    assert_eq!(prepared.projection().file_id, None);
+    assert_eq!(prepared.projection().flags.bits(),
+        crate::kernel_irp_builder::SL_OVERRIDE_VERIFY_VOLUME);
+    assert_eq!(policy.output_capture(), ExternalFileIrpOutputCapture::Information);
+    let invocation = f.io.begin_prepared_external_file_irp(prepared).unwrap();
+    let owner = match f.io.finish_external_file_irp(
+        invocation.returned(ExternalFileIrpOutcome::Pending),
+    ).unwrap() {
+        ExternalFileIrpResult::Pending(owner) => owner,
+        other => panic!("expected pending exact-device READ, got {other:?}"),
+    };
+    publish_policy_completion(&mut f, &owner, NtStatus::SUCCESS, 512);
+    let completion = f.io.prepare_external_file_irp_completion_with_capture(
+        owner, policy.output_capture(),
+    ).unwrap();
+    assert_eq!(completion.capture_len(), 512);
+    let mut copy = f.io.begin_external_file_irp_copy(completion, 512).unwrap();
+    copy.staging_mut().fill(0x5a);
+    let completion = f.io.finish_external_file_irp_copy(
+        copy.returned(ExternalFileIrpCopyOutcome::Copied { bytes: 512 }),
+    ).unwrap();
+    let ack = f.io.begin_external_file_irp_acknowledgement(completion).unwrap();
+    let (receipt, returned_buffers) = f.io.finish_external_file_irp_completion(
+        ack.acknowledged(ExternalFileIrpAcknowledgement::Acknowledged),
+    ).unwrap();
+    assert!(f.io.accepts_external_file_irp_receipt(&receipt));
+    assert_eq!(receipt.completion().information, 512);
+    assert_eq!(returned_buffers.output(), &[0x5a; 512]);
+
+    let mut wrong_file = read(&f);
+    wrong_file.device_id = lower;
+    wrong_file.parameters = IoParameters::Read(ReadWriteParameters { length: 512, ..Default::default() });
+    assert_eq!(policy.prepare(&mut f.io, wrong_file, buffers()).err(), Some(NtStatus::INVALID_PARAMETER));
+
+    let mut wrong_device = read(&f);
+    wrong_device.file_id = None;
+    wrong_device.device_id = DeviceId::new(8, 9);
+    wrong_device.parameters = IoParameters::Read(ReadWriteParameters { length: 512, ..Default::default() });
+    assert_eq!(policy.prepare(&mut f.io, wrong_device, buffers()).err(), Some(NtStatus::INVALID_PARAMETER));
+
+    let mut wrong_major = read(&f);
+    wrong_major.file_id = None;
+    wrong_major.device_id = lower;
+    wrong_major.major = major::IRP_MJ_WRITE;
+    wrong_major.parameters = IoParameters::Read(ReadWriteParameters { length: 512, ..Default::default() });
+    assert_eq!(policy.prepare(&mut f.io, wrong_major, buffers()).err(), Some(NtStatus::INVALID_PARAMETER));
+
+    let mut wrong_length = read(&f);
+    wrong_length.file_id = None;
+    wrong_length.device_id = lower;
+    wrong_length.parameters = IoParameters::Read(ReadWriteParameters { length: 511, ..Default::default() });
+    assert_eq!(policy.prepare(&mut f.io, wrong_length, buffers()).err(), Some(NtStatus::INVALID_PARAMETER));
+}
+
+#[test]
+fn buffered_lower_control_retains_full_header_until_copy_and_ack() {
+    let (mut f, lower, _, _) = stack_fixture();
+    let policy = ExternalFileIrpDispatchPolicy::BufferedDeviceControlAtDevice;
+    let request = ExternalFileIrpRequest {
+        device_id: lower,
+        parameters: IoParameters::DeviceControl(crate::DeviceControlParameters {
+            ioctl_code: 0x002d_1400, // IOCTL_STORAGE_QUERY_PROPERTY, METHOD_BUFFERED
+            input_len: 12,
+            output_len: 8,
+        }),
+        ..request(&f, 0, false)
+    };
+    let query = vec![0u8; 12]; // StorageDeviceProperty / PropertyStandardQuery
+    let prepared = policy.prepare(&mut f.io, request, ExternalFileIrpBuffers::new(query.clone(), vec![0; 8])).unwrap();
+    assert_eq!(prepared.route().device_id(), lower);
+    assert_eq!(prepared.projection().file_id, None);
+    assert_eq!(policy.output_capture(), ExternalFileIrpOutputCapture::BufferedDeviceControlCapacity);
+    let invocation = f.io.begin_prepared_external_file_irp(prepared).unwrap();
+    let owner = match f.io.finish_external_file_irp(invocation.returned(ExternalFileIrpOutcome::Pending)).unwrap() {
+        ExternalFileIrpResult::Pending(owner) => owner,
+        other => panic!("expected pending lower control, got {other:?}"),
+    };
+    publish_policy_completion(&mut f, &owner, NtStatus::SUCCESS, 0);
+    let completion = f.io.prepare_external_file_irp_completion_with_capture(owner, policy.output_capture()).unwrap();
+    assert_eq!(completion.capture_len(), 8);
+    let completion = f.io.begin_external_file_irp_acknowledgement(completion).unwrap_err().into_owner();
+    let mut copy = f.io.begin_external_file_irp_copy(completion, 8).unwrap();
+    let header = [8u8, 0, 0, 0, 0x30, 0, 0, 0];
+    copy.staging_mut().copy_from_slice(&header);
+    let completion = f.io.finish_external_file_irp_copy(copy.returned(ExternalFileIrpCopyOutcome::Copied { bytes: 8 })).unwrap();
+    let ack = f.io.begin_external_file_irp_acknowledgement(completion).unwrap();
+    let (receipt, buffers) = f.io.finish_external_file_irp_completion(
+        ack.acknowledged(ExternalFileIrpAcknowledgement::Acknowledged),
+    ).unwrap();
+    assert!(f.io.accepts_external_file_irp_receipt(&receipt));
+    assert_eq!(receipt.completion().information, 0);
+    assert_eq!(buffers.input(), query);
+    assert_eq!(buffers.output(), header);
+}
+
+#[test]
+fn capacity_capture_policy_rejects_other_methods_and_mismatched_lengths() {
+    let mut f = fixture();
+    let policy = ExternalFileIrpDispatchPolicy::BufferedDeviceControlAtDevice;
+    for method in [1u32, 2, 3] {
+        let mut request = request(&f, method, false);
+        request.parameters = IoParameters::DeviceControl(crate::DeviceControlParameters {
+            ioctl_code: 0x002d_1400 | method,
+            input_len: 12,
+            output_len: 8,
+        });
+        assert_eq!(
+            policy.prepare(&mut f.io, request, ExternalFileIrpBuffers::new(vec![0; 12], vec![0; 8])).err(),
+            Some(NtStatus::INVALID_PARAMETER),
+        );
+    }
+    let mut wrong_length = request(&f, 0, false);
+    wrong_length.parameters = IoParameters::DeviceControl(crate::DeviceControlParameters {
+        ioctl_code: 0x002d_1400,
+        input_len: 12,
+        output_len: 8,
+    });
+    assert_eq!(
+        policy.prepare(&mut f.io, wrong_length, ExternalFileIrpBuffers::new(vec![0; 11], vec![0; 8])).err(),
+        Some(NtStatus::INVALID_PARAMETER),
+    );
+}
+
+#[test]
+fn scsi_srb_requires_pointer_free_exact_pdo_admission() {
+    use crate::scsi_srb_transport::{ScsiParameters, ScsiSrbRoute, WDM_X64_LEGACY_SRB_SIZE};
+    use crate::{HostedDomainId, HostedDomainIdentity};
+
+    let (mut f, _, _, _) = stack_fixture();
+    let route = ScsiSrbRoute {
+        pdo: f.device,
+        provider: HostedDomainIdentity {
+            domain_id: HostedDomainId::new(3, 2), cookie: 9,
+        },
+        relation_generation: 7,
+        provider_pdo: 0x9000,
+    };
+    let mut source = [0u8; WDM_X64_LEGACY_SRB_SIZE];
+    source[..2].copy_from_slice(&(WDM_X64_LEGACY_SRB_SIZE as u16).to_le_bytes());
+    source[0x0b] = 2;
+    source[0x10..0x14].copy_from_slice(&3u32.to_le_bytes());
+    source[0x18..0x20].copy_from_slice(&0x1111u64.to_le_bytes());
+    source[0x20..0x28].copy_from_slice(&0x2222u64.to_le_bytes());
+    let parameters = IoParameters::Scsi(
+        ScsiParameters::from_source(route, &source, 3, 2).unwrap(),
+    );
+    let mut ordinary = request(&f, 0, true);
+    ordinary.parameters = parameters.clone();
+    let buffers = || ExternalFileIrpBuffers::new(vec![1; 5], vec![0; 64 + 0x58 + 5]);
+    assert_eq!(f.io.prepare_external_file_irp_owned(ordinary, buffers()).err(),
+        Some(NtStatus::INVALID_PARAMETER));
+
+    let mut exact = request(&f, 0, true);
+    exact.parameters = parameters.clone();
+    let policy = ExternalFileIrpDispatchPolicy::ScsiAtDevice;
+    assert_eq!(policy.output_capture(), ExternalFileIrpOutputCapture::Scsi);
+    let prepared = policy.prepare(&mut f.io, exact, buffers()).unwrap();
+    assert_eq!(prepared.route().device_id(), f.device);
+    assert_eq!(prepared.projection().parameters, parameters);
+    assert_eq!(prepared.projection().major, major::IRP_MJ_INTERNAL_DEVICE_CONTROL);
+
+    let mut bad_route = route;
+    bad_route.pdo = DeviceId::new(8, 9);
+    let mut stale = request(&f, 0, true);
+    stale.parameters = IoParameters::Scsi(
+        ScsiParameters::from_source(bad_route, &source, 3, 2).unwrap(),
+    );
+    assert_eq!(f.io.prepare_external_scsi_irp_owned_at_device(stale, buffers()).err(),
+        Some(NtStatus::INVALID_PARAMETER));
+}
+
+#[test]
 fn method_neither_mutable_input_is_captured_before_ack_with_zero_output_length() {
     for len in [16usize, 40, 48] {
         let mut f = fixture();
@@ -360,9 +553,12 @@ fn explicit_policy_prepares_same_request_with_distinct_route_and_completion_capt
             ExternalFileIrpDispatchPolicy::File
             | ExternalFileIrpDispatchPolicy::FileDeviceControl => (upper_driver, upper),
             ExternalFileIrpDispatchPolicy::DeviceControlAtDevice
+            | ExternalFileIrpDispatchPolicy::BufferedDeviceControlAtDevice
             | ExternalFileIrpDispatchPolicy::MutableMethodNeitherInputAtDevice => {
                 (f.driver, f.device)
             }
+            ExternalFileIrpDispatchPolicy::ReadAtDevice
+            | ExternalFileIrpDispatchPolicy::ScsiAtDevice => unreachable!("read and SCSI are not in this policy list"),
         };
         assert_eq!(
             (owner.route().driver_id(), owner.route().device_id()),

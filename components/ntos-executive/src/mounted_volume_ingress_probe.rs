@@ -6,9 +6,51 @@ use nt_io_abi::major;
 use nt_io_manager::{CreateParameters, ReadWriteParameters};
 use nt_types::UnicodeString;
 
-pub(crate) unsafe fn run(device_id: u64) -> bool {
+unsafe fn query_fat32_attributes(
+    file: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
+) -> bool {
+    let mut volume = [0u8; 64];
+    match crate::driver_launch::dispatch_hosted_file_query_volume_information_irp_result_exact(
+        file,
+        caller,
+        nt_io_manager::QueryVolumeInformationParameters {
+            information_class: nt_fs::FILE_FS_ATTRIBUTE_INFORMATION,
+            length: volume.len() as u32,
+        },
+        &mut volume,
+    ) {
+        Ok((status, information, pending, _)) => status == 0
+            && pending.is_none()
+            && information == 22
+            && u32::from_le_bytes(volume[0..4].try_into().unwrap())
+                == (nt_fs::FILE_CASE_PRESERVED_NAMES | nt_fs::FILE_UNICODE_ON_DISK)
+            && u32::from_le_bytes(volume[4..8].try_into().unwrap()) == 255
+            && u32::from_le_bytes(volume[8..12].try_into().unwrap()) == 10
+            && volume[12..22] == [b'F', 0, b'A', 0, b'T', 0, b'3', 0, b'2', 0],
+        Err(_) => false,
+    }
+}
+
+unsafe fn retire_probe_file(file: u64, published: bool) -> bool {
+    let released = if published {
+        crate::driver_launch::release_hosted_file(file)
+    } else {
+        crate::driver_launch::abandon_unpublished_hosted_file(file)
+    }
+    .is_ok();
+    for _ in 0..4 {
+        crate::driver_launch::pump_registered_file_lifecycle();
+        if !crate::driver_launch::hosted_file_exists(file) {
+            break;
+        }
+    }
+    released && !crate::driver_launch::hosted_file_exists(file)
+}
+
+pub(crate) unsafe fn run(device_id: u64) -> (bool, bool) {
     let caller = crate::initial_system_driver_caller();
-    let name = UnicodeString::from_str("reactos\\Fonts\\arial.ttf");
+    let name = UnicodeString::from_str(crate::installed_layout::ARIAL_STR);
     let file = match crate::driver_launch::allocate_hosted_file(
         device_id,
         nt_types::AccessMask::GENERIC_READ.bits(),
@@ -17,9 +59,9 @@ pub(crate) unsafe fn run(device_id: u64) -> bool {
         name.as_units(),
     ) {
         Ok(file) => file,
-        Err(_) => return false,
+        Err(_) => return (false, false),
     };
-    let opened = (|| -> Result<bool, u32> {
+    let opened = (|| -> Result<(bool, bool), u32> {
         let mut input = Vec::new();
         input
             .try_reserve_exact(name.as_units().len() * 2)
@@ -41,7 +83,7 @@ pub(crate) unsafe fn run(device_id: u64) -> bool {
                 &input,
             )?;
         if status != 0 || pending.is_some() || context.is_none() {
-            return Ok(false);
+            return Ok((false, false));
         }
         let mut standard = [0u8; 24];
         let (status, information, pending, _) =
@@ -59,8 +101,9 @@ pub(crate) unsafe fn run(device_id: u64) -> bool {
             || pending.is_some()
             || u64::from_le_bytes(standard[8..16].try_into().unwrap()) < 4
         {
-            return Ok(false);
+            return Ok((false, false));
         }
+        let volume_attribute = query_fat32_attributes(file, caller);
         let mut signature = [0u8; 4];
         let (status, information, pending, _) =
             crate::driver_launch::dispatch_hosted_file_read_write_irp_result_exact(
@@ -75,25 +118,119 @@ pub(crate) unsafe fn run(device_id: u64) -> bool {
                 &[],
                 &mut signature,
             )?;
-        Ok(status == 0
+        Ok((status == 0
             && information == signature.len() as u64
             && pending.is_none()
-            && signature == [0, 1, 0, 0])
+            && signature == [0, 1, 0, 0],
+            volume_attribute))
     })()
-    .unwrap_or(false);
-    let released = crate::driver_launch::release_hosted_file(file).is_ok();
-    for _ in 0..4 {
-        crate::driver_launch::pump_registered_file_lifecycle();
-        if !crate::driver_launch::hosted_file_exists(file) {
-            break;
+    .unwrap_or((false, false));
+    let retired = retire_probe_file(file, true);
+    (opened.0 && retired, opened.1 && retired)
+}
+
+unsafe fn conflicting_volume_open(device_id: u64, caller: nt_process::native_handle::NativeHandleCaller) -> bool {
+    const FILE_GENERIC_READ: u32 = 0x0012_0089;
+    let file = match crate::driver_launch::allocate_hosted_file(
+        device_id, FILE_GENERIC_READ, 0, nt_fs::FILE_SYNCHRONOUS_IO_ALERT, &[],
+    ) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let denied = matches!(
+        crate::driver_launch::dispatch_hosted_file_create_irp_result_exact(
+            file,
+            major::IRP_MJ_CREATE,
+            caller,
+            CreateParameters {
+                opened_case_sensitive: true,
+                desired_access: nt_types::AccessMask::from_bits_retain(FILE_GENERIC_READ),
+                share_access: nt_io_manager::ShareAccess::empty(),
+                create_options: nt_io_manager::CreateOptions::from_bits_retain(
+                    nt_fs::FILE_SYNCHRONOUS_IO_ALERT,
+                ),
+                create_disposition: nt_fs::FILE_OPEN,
+                ..CreateParameters::default()
+            },
+            &[],
+        ),
+        Ok((status, 0, None, None)) if status as u32 == nt_fs::STATUS_SHARING_VIOLATION
+    );
+    let retired = retire_probe_file(file, false);
+    denied && retired
+}
+
+unsafe fn query_volume_dirty(
+    file: u64,
+    caller: nt_process::native_handle::NativeHandleCaller,
+    expected_dirty: bool,
+) -> bool {
+    let mut mask = [0xa5; 4];
+    matches!(
+        crate::driver_launch::dispatch_hosted_file_irp_result_exact(
+            file,
+            major::IRP_MJ_FILE_SYSTEM_CONTROL as u64,
+            nt_fs::FSCTL_IS_VOLUME_DIRTY as u64,
+            caller,
+            &[],
+            &mut mask,
+            0,
+        ),
+        Ok((0, 4, None, _))
+    ) && u32::from_le_bytes(mask) == u32::from(expected_dirty)
+}
+
+/// The empty FileName is a volume File; a single backslash is the root directory instead.
+/// Autochk opens the former without OBJ_CASE_INSENSITIVE before querying and controlling it.
+pub(crate) unsafe fn run_volume_open(device_id: u64, expected_dirty: bool) -> (bool, bool) {
+    const FILE_GENERIC_READ: u32 = 0x0012_0089;
+    let caller = crate::initial_system_driver_caller();
+    let file = match crate::driver_launch::allocate_hosted_file(
+        device_id,
+        FILE_GENERIC_READ,
+        (nt_io_manager::ShareAccess::READ | nt_io_manager::ShareAccess::WRITE).bits(),
+        nt_fs::FILE_SYNCHRONOUS_IO_ALERT,
+        &[],
+    ) {
+        Ok(file) => file,
+        Err(_) => return (false, false),
+    };
+    let mut published = false;
+    let tested = (|| -> Result<(bool, bool), u32> {
+        let (status, information, pending, context) =
+            crate::driver_launch::dispatch_hosted_file_create_irp_result_exact(
+                file,
+                major::IRP_MJ_CREATE,
+                caller,
+                CreateParameters {
+                    opened_case_sensitive: true,
+                    desired_access: nt_types::AccessMask::from_bits_retain(FILE_GENERIC_READ),
+                    share_access: nt_io_manager::ShareAccess::READ
+                        | nt_io_manager::ShareAccess::WRITE,
+                    create_options: nt_io_manager::CreateOptions::from_bits_retain(
+                        nt_fs::FILE_SYNCHRONOUS_IO_ALERT,
+                    ),
+                    create_disposition: nt_fs::FILE_OPEN,
+                    ..CreateParameters::default()
+                },
+                &[],
+            )?;
+        published = status == 0 && pending.is_none() && context.is_some();
+        if !published || information != nt_fs::FILE_OPENED as u64 {
+            return Ok((false, false));
         }
-    }
-    opened && released && !crate::driver_launch::hosted_file_exists(file)
+        let dirty = query_volume_dirty(file, caller, expected_dirty);
+        Ok((query_fat32_attributes(file, caller)
+            && conflicting_volume_open(device_id, caller), dirty))
+    })()
+    .unwrap_or((false, false));
+    let retired = retire_probe_file(file, published);
+    (tested.0 && retired, tested.1 && retired)
 }
 
 pub(crate) unsafe fn run_directory(device_id: u64) -> bool {
     let caller = crate::initial_system_driver_caller();
-    let name = UnicodeString::from_str("reactos\\Fonts");
+    let name = UnicodeString::from_str(crate::installed_layout::FONTS_STR);
     let access = nt_types::AccessMask::GENERIC_READ;
     let share = nt_io_manager::ShareAccess::READ;
     let options = nt_io_manager::CreateOptions::DIRECTORY_FILE;
@@ -317,7 +454,7 @@ pub(crate) unsafe fn run_overlay(device_id: u64) -> bool {
 }
 
 pub(crate) unsafe fn run_copy_up(device_id: u64) -> bool {
-    let relative = b"reactos\\system32\\version.dll";
+    let relative = crate::installed_layout::VERSION_DLL;
     if !matches!(
         crate::writable_fs::query_metadata_relative(relative),
         Ok(None)
@@ -325,7 +462,7 @@ pub(crate) unsafe fn run_copy_up(device_id: u64) -> bool {
         return false;
     }
     let caller = crate::initial_system_driver_caller();
-    let name = UnicodeString::from_str("reactos\\system32\\version.dll");
+    let name = UnicodeString::from_str(crate::installed_layout::VERSION_DLL_STR);
     let access = nt_types::AccessMask::GENERIC_READ
         | nt_types::AccessMask::GENERIC_WRITE
         | nt_types::AccessMask::DELETE;

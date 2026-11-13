@@ -80,6 +80,31 @@ struct ConnectOwner<C, R> {
     status: Option<u32>,
 }
 
+/// The parked Reply stays in its row across uncertain native effects. A different waiter may
+/// still be selected while this one awaits reconciliation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitEffectPhase {
+    Waiting,
+    ReplyEntered,
+    CancelEntered,
+    ReplyIndeterminate,
+    CancelIndeterminate,
+    ReconcileStopEntered,
+    ReconcileStopIndeterminate,
+}
+
+struct WaitEffectOwner<W> {
+    wait: W,
+    phase: WaitEffectPhase,
+    status: Option<u32>,
+}
+
+/// One exact parked waiter effect; neither a slot number nor a Reply capability is authority.
+pub struct WaitEffectTicket {
+    slot: usize,
+    generation: u64,
+}
+
 /// Exact, generation-bound completion admission. Its fields cannot be supplied by callers.
 pub struct ConnectCompletionTicket {
     slot: usize,
@@ -210,12 +235,83 @@ impl<T> GenerationTable<T> {
     }
 }
 
+impl<W> GenerationTable<WaitEffectOwner<W>> {
+    fn get_wait(&self, slot: usize) -> Option<&W> {
+        self.get(slot).map(|owner| &owner.wait)
+    }
+
+    fn next_waiting_after(&self, generation: u64) -> Option<(usize, u64, &W)> {
+        self.slots.iter().enumerate().filter_map(|(slot, entry)| match entry {
+            Slot::Occupied { generation: current, value }
+                if *current > generation && value.phase == WaitEffectPhase::Waiting =>
+                    Some((slot, *current, &value.wait)),
+            _ => None,
+        }).min_by_key(|(_, current, _)| *current)
+    }
+
+    fn begin_effect(&mut self, slot: usize, phase: WaitEffectPhase, status: Option<u32>)
+        -> Result<WaitEffectTicket, TableError>
+    {
+        let Some(Slot::Occupied { generation, value }) = self.slots.get_mut(slot) else {
+            return Err(TableError::InvalidRequest);
+        };
+        if value.phase != WaitEffectPhase::Waiting {
+            return Err(TableError::InvalidRequest);
+        }
+        value.phase = phase;
+        value.status = status;
+        Ok(WaitEffectTicket { slot, generation: *generation })
+    }
+
+    fn finish_effect(&mut self, ticket: WaitEffectTicket, phase: WaitEffectPhase,
+        acknowledged: bool) -> Option<W>
+    {
+        let Some(Slot::Occupied { generation, value }) = self.slots.get_mut(ticket.slot) else {
+            return None;
+        };
+        if *generation != ticket.generation || value.phase != phase {
+            return None;
+        }
+        if !acknowledged {
+            value.phase = match phase {
+                WaitEffectPhase::ReplyEntered => WaitEffectPhase::ReplyIndeterminate,
+                WaitEffectPhase::CancelEntered => WaitEffectPhase::CancelIndeterminate,
+                WaitEffectPhase::ReconcileStopEntered => WaitEffectPhase::ReconcileStopIndeterminate,
+                _ => return None,
+            };
+            return None;
+        }
+        self.take(ticket.slot).map(|owner| owner.wait)
+    }
+
+    /// A failed Reply can be settled by an independently proved physical Stop. Publish the
+    /// one-shot reconciliation before touching the broker or native caller; failed Stop is never
+    /// replayed, and an unrelated waiter remains selectable.
+    fn begin_reconcile_stop(&mut self, slot: usize) -> Result<WaitEffectTicket, TableError> {
+        let Some(Slot::Occupied { generation, value }) = self.slots.get_mut(slot) else {
+            return Err(TableError::InvalidRequest);
+        };
+        if value.phase != WaitEffectPhase::ReplyIndeterminate {
+            return Err(TableError::InvalidRequest);
+        }
+        value.phase = WaitEffectPhase::ReconcileStopEntered;
+        Ok(WaitEffectTicket { slot, generation: *generation })
+    }
+
+    fn take_waiting(&mut self, slot: usize) -> Option<W> {
+        if self.get(slot)?.phase != WaitEffectPhase::Waiting {
+            return None;
+        }
+        self.take(slot).map(|owner| owner.wait)
+    }
+}
+
 /// Growable, generation-exact ownership table for pending LPC receives.
 ///
 /// Allocation happens only in [`Self::reserve`], before the broker is allowed to commit the reply
 /// half of `NtReplyWaitReceivePort`. Publishing and completing a wait cannot allocate.
 pub struct ReceiveWaitTable<C> {
-    inner: GenerationTable<PendingReceive<C>>,
+    inner: GenerationTable<WaitEffectOwner<PendingReceive<C>>>,
 }
 
 impl<C> Default for ReceiveWaitTable<C> {
@@ -236,6 +332,9 @@ impl<C> ReceiveWaitTable<C> {
     }
 
     pub fn reset(&mut self) -> Result<(), TableError> {
+        if self.inner.occupied_slots().next().is_some() {
+            return Err(TableError::InvalidRequest);
+        }
         self.inner.reset()
     }
 
@@ -255,11 +354,13 @@ impl<C> ReceiveWaitTable<C> {
         if !value.request.is_valid() {
             return Err(TableError::InvalidRequest);
         }
-        self.inner.publish(reservation, value)
+        self.inner.publish(reservation, WaitEffectOwner {
+            wait: value, phase: WaitEffectPhase::Waiting, status: None,
+        })
     }
 
     pub fn get(&self, slot: usize) -> Option<&PendingReceive<C>> {
-        self.inner.get(slot)
+        self.inner.get_wait(slot)
     }
 
     pub fn occupied_slots(&self) -> impl Iterator<Item = usize> + '_ {
@@ -270,10 +371,45 @@ impl<C> ReceiveWaitTable<C> {
     /// after a low-numbered slot has been freed and reused by a newer waiter.
     pub fn next_occupied_after(&self, generation: u64) -> Option<(usize, u64, &PendingReceive<C>)> {
         self.inner.next_occupied_after(generation)
+            .map(|(slot, generation, owner)| (slot, generation, &owner.wait))
+    }
+
+    pub fn next_waiting_after(&self, generation: u64) -> Option<(usize, u64, &PendingReceive<C>)> {
+        self.inner.next_waiting_after(generation)
+    }
+
+    pub fn begin_reply(&mut self, slot: usize, status: u32) -> Result<WaitEffectTicket, TableError> {
+        self.inner.begin_effect(slot, WaitEffectPhase::ReplyEntered, Some(status))
+    }
+
+    pub fn finish_reply(&mut self, ticket: WaitEffectTicket, acknowledged: bool)
+        -> Option<PendingReceive<C>>
+    {
+        self.inner.finish_effect(ticket, WaitEffectPhase::ReplyEntered, acknowledged)
+    }
+
+    pub fn begin_cancel(&mut self, slot: usize) -> Result<WaitEffectTicket, TableError> {
+        self.inner.begin_effect(slot, WaitEffectPhase::CancelEntered, None)
+    }
+
+    pub fn finish_cancel(&mut self, ticket: WaitEffectTicket, acknowledged: bool)
+        -> Option<PendingReceive<C>>
+    {
+        self.inner.finish_effect(ticket, WaitEffectPhase::CancelEntered, acknowledged)
+    }
+
+    pub fn begin_reconcile_stop(&mut self, slot: usize) -> Result<WaitEffectTicket, TableError> {
+        self.inner.begin_reconcile_stop(slot)
+    }
+
+    pub fn finish_reconcile_stop(&mut self, ticket: WaitEffectTicket, acknowledged: bool)
+        -> Option<PendingReceive<C>>
+    {
+        self.inner.finish_effect(ticket, WaitEffectPhase::ReconcileStopEntered, acknowledged)
     }
 
     pub fn take(&mut self, slot: usize) -> Option<PendingReceive<C>> {
-        self.inner.take(slot)
+        self.inner.take_waiting(slot)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -470,7 +606,7 @@ impl<C> BrokerRequestWaitTable<C> {
 
 /// Growable, generation-exact ownership table for synchronous LPC request waiters.
 pub struct RequestWaitTable<C> {
-    inner: GenerationTable<PendingRequestWait<C>>,
+    inner: GenerationTable<WaitEffectOwner<PendingRequestWait<C>>>,
 }
 
 impl<C> Default for RequestWaitTable<C> {
@@ -491,6 +627,9 @@ impl<C> RequestWaitTable<C> {
     }
 
     pub fn reset(&mut self) -> Result<(), TableError> {
+        if self.inner.occupied_slots().next().is_some() {
+            return Err(TableError::InvalidRequest);
+        }
         self.inner.reset()
     }
 
@@ -512,19 +651,21 @@ impl<C> RequestWaitTable<C> {
         }
         if self.inner.occupied_slots().any(|slot| {
             self.inner.get(slot).is_some_and(|wait| {
-                wait.request.port_handle == value.request.port_handle
-                    && wait.request.client_process == value.request.client_process
-                    && wait.request.client_thread == value.request.client_thread
-                    && wait.request.message_id == value.request.message_id
+                wait.wait.request.port_handle == value.request.port_handle
+                    && wait.wait.request.client_process == value.request.client_process
+                    && wait.wait.request.client_thread == value.request.client_thread
+                    && wait.wait.request.message_id == value.request.message_id
             })
         }) {
             return Err(TableError::InvalidRequest);
         }
-        self.inner.publish(reservation, value)
+        self.inner.publish(reservation, WaitEffectOwner {
+            wait: value, phase: WaitEffectPhase::Waiting, status: None,
+        })
     }
 
     pub fn get(&self, slot: usize) -> Option<&PendingRequestWait<C>> {
-        self.inner.get(slot)
+        self.inner.get_wait(slot)
     }
 
     pub fn occupied_slots(&self) -> impl Iterator<Item = usize> + '_ {
@@ -536,10 +677,45 @@ impl<C> RequestWaitTable<C> {
         generation: u64,
     ) -> Option<(usize, u64, &PendingRequestWait<C>)> {
         self.inner.next_occupied_after(generation)
+            .map(|(slot, generation, owner)| (slot, generation, &owner.wait))
+    }
+
+    pub fn next_waiting_after(&self, generation: u64) -> Option<(usize, u64, &PendingRequestWait<C>)> {
+        self.inner.next_waiting_after(generation)
+    }
+
+    pub fn begin_reply(&mut self, slot: usize, status: u32) -> Result<WaitEffectTicket, TableError> {
+        self.inner.begin_effect(slot, WaitEffectPhase::ReplyEntered, Some(status))
+    }
+
+    pub fn finish_reply(&mut self, ticket: WaitEffectTicket, acknowledged: bool)
+        -> Option<PendingRequestWait<C>>
+    {
+        self.inner.finish_effect(ticket, WaitEffectPhase::ReplyEntered, acknowledged)
+    }
+
+    pub fn begin_cancel(&mut self, slot: usize) -> Result<WaitEffectTicket, TableError> {
+        self.inner.begin_effect(slot, WaitEffectPhase::CancelEntered, None)
+    }
+
+    pub fn finish_cancel(&mut self, ticket: WaitEffectTicket, acknowledged: bool)
+        -> Option<PendingRequestWait<C>>
+    {
+        self.inner.finish_effect(ticket, WaitEffectPhase::CancelEntered, acknowledged)
+    }
+
+    pub fn begin_reconcile_stop(&mut self, slot: usize) -> Result<WaitEffectTicket, TableError> {
+        self.inner.begin_reconcile_stop(slot)
+    }
+
+    pub fn finish_reconcile_stop(&mut self, ticket: WaitEffectTicket, acknowledged: bool)
+        -> Option<PendingRequestWait<C>>
+    {
+        self.inner.finish_effect(ticket, WaitEffectPhase::ReconcileStopEntered, acknowledged)
     }
 
     pub fn take(&mut self, slot: usize) -> Option<PendingRequestWait<C>> {
-        self.inner.take(slot)
+        self.inner.take_waiting(slot)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1124,5 +1300,82 @@ mod tests {
             Err(TableError::InvalidRequest)
         );
         table.cancel(invalid).unwrap();
+    }
+
+    #[test]
+    fn uncertain_receive_reply_keeps_exact_owner_and_unrelated_waiter_progress() {
+        let mut table = ReceiveWaitTable::new();
+        let first = table.reserve().unwrap();
+        table.publish(first, receive(7, 1)).unwrap();
+        let second = table.reserve().unwrap();
+        table.publish(second, receive(7, 2)).unwrap();
+        let ticket = table.begin_reply(0, 0).unwrap();
+        assert!(table.finish_reply(ticket, false).is_none());
+        assert_eq!(table.get(0).unwrap().continuation, 1);
+        assert!(table.take(0).is_none());
+        assert_eq!(table.next_waiting_after(0).unwrap().2.continuation, 2);
+        let ticket = table.begin_reply(1, 0).unwrap();
+        assert_eq!(table.finish_reply(ticket, true).unwrap().continuation, 2);
+        assert!(!table.is_empty());
+        assert_eq!(table.begin_cancel(0).err(), Some(TableError::InvalidRequest));
+    }
+
+    #[test]
+    fn uncertain_request_cancel_keeps_reply_and_blocks_slot_reuse() {
+        let mut table = RequestWaitTable::with_initial_reserve(1);
+        let reservation = table.reserve().unwrap();
+        table.publish(reservation, request_wait(7, 1)).unwrap();
+        let ticket = table.begin_cancel(0).unwrap();
+        assert!(table.finish_cancel(ticket, false).is_none());
+        assert!(table.take(0).is_none());
+        assert_eq!(table.get(0).unwrap().request.message_id, 7);
+        assert!(table.next_waiting_after(0).is_none());
+        let fresh = table.reserve().unwrap();
+        assert_ne!(fresh.slot, reservation.slot);
+        table.cancel(fresh).unwrap();
+        assert_eq!(table.reset(), Err(TableError::InvalidRequest));
+    }
+
+    #[test]
+    fn uncertain_receive_reply_can_settle_by_one_exact_stop() {
+        let mut table = ReceiveWaitTable::new();
+        let reservation = table.reserve().unwrap();
+        table.publish(reservation, receive(7, 1)).unwrap();
+        let reply = table.begin_reply(0, 0).unwrap();
+        assert!(table.finish_reply(reply, false).is_none());
+        assert_eq!(table.begin_cancel(0).err(), Some(TableError::InvalidRequest));
+        let stop = table.begin_reconcile_stop(0).unwrap();
+        assert!(table.begin_reconcile_stop(0).is_err());
+        assert_eq!(table.finish_reconcile_stop(stop, true).unwrap().continuation, 1);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn uncertain_stop_keeps_exact_request_reply_and_never_replays() {
+        let mut table = RequestWaitTable::new();
+        let reservation = table.reserve().unwrap();
+        table.publish(reservation, request_wait(7, 1)).unwrap();
+        let reply = table.begin_reply(0, 0).unwrap();
+        assert!(table.finish_reply(reply, false).is_none());
+        let stop = table.begin_reconcile_stop(0).unwrap();
+        assert!(table.finish_reconcile_stop(stop, false).is_none());
+        assert!(table.begin_reconcile_stop(0).is_err());
+        assert_eq!(table.get(0).unwrap().request.message_id, 7);
+        assert!(table.next_waiting_after(0).is_none());
+        assert_eq!(table.reset(), Err(TableError::InvalidRequest));
+    }
+
+    #[test]
+    fn acknowledged_request_cancel_releases_exact_owner_without_reviving_stale_ticket() {
+        let mut table = RequestWaitTable::with_initial_reserve(1);
+        let first = table.reserve().unwrap();
+        table.publish(first, request_wait(7, 1)).unwrap();
+        let ticket = table.begin_cancel(0).unwrap();
+        assert_eq!(table.finish_cancel(ticket, true).unwrap().request.message_id, 7);
+        assert!(table.is_empty());
+        let next = table.reserve().unwrap();
+        table.publish(next, request_wait(8, 2)).unwrap();
+        assert_ne!(first, next);
+        assert_eq!(table.get(0).unwrap().request.message_id, 8);
     }
 }

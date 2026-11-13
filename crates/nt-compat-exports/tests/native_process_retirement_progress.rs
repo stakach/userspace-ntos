@@ -104,19 +104,23 @@ fn process_retirement_progress_follows_exact_release_and_never_pending_attempts(
         })
         .unwrap();
     struct Phases {
-        found: bool,
+        execution_retired: bool,
+        object_retired: bool,
     }
     impl<'ast> Visit<'ast> for Phases {
         fn visit_arm(&mut self, arm: &'ast syn::Arm) {
             let mut events = Events::default();
             events.visit_expr(&arm.body);
-            if matches!(&arm.pat, syn::Pat::Path(path) if named(&path.path, "RetiringMechanism")) {
+            if matches!(&arm.pat, syn::Pat::Path(path) if named(&path.path, "RetiringExecution")) {
                 assert_eq!(
                     events.0,
-                    ["release_mechanism", "release_image", "note", "complete"],
-                    "only completed exact mechanism/image retirement may refresh progress"
+                    ["release_mechanism", "release_image"],
+                    "the exact execution slot must retire before the Ps object"
                 );
-                self.found = true;
+                self.execution_retired = true;
+            } else if matches!(&arm.pat, syn::Pat::Path(path) if named(&path.path, "Complete")) {
+                assert_eq!(events.0, ["note", "complete"]);
+                self.object_retired = true;
             } else {
                 assert!(
                     !events.0.contains(&"note"),
@@ -126,9 +130,9 @@ fn process_retirement_progress_follows_exact_release_and_never_pending_attempts(
             syn::visit::visit_arm(self, arm);
         }
     }
-    let mut phases = Phases { found: false };
+    let mut phases = Phases { execution_retired: false, object_retired: false };
     phases.visit_block(&function.block);
-    assert!(phases.found);
+    assert!(phases.execution_retired && phases.object_retired);
     let mut all = Events::default();
     all.visit_block(&function.block);
     assert_eq!(

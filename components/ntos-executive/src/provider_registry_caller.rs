@@ -44,6 +44,19 @@ impl Scope {
     }
 }
 
+/// A yielded File pump keeps its original route/dispatch requestor reference in OWNERS.
+/// Resume validates that exact row; it must not capture another caller or reinterpret a
+/// logical/kernel caller from the channel after the original stack has unwound.
+pub(crate) unsafe fn resolve_retained(
+    route: PeerRoute,
+    dispatch: LaneDispatchIdentity,
+    address_space: u64,
+) -> Result<NativeHandleCaller, u32> {
+    service_sec_image::with_provider_process_manager(|pm| {
+        (&mut *core::ptr::addr_of_mut!(OWNERS)).resolve(pm, route, dispatch, address_space)
+    })
+}
+
 /// Called only after canonical shared ingress has authenticated this job's final completion.
 pub(crate) unsafe fn retire_completed(route: PeerRoute, dispatch: LaneDispatchIdentity) {
     crate::driver_launch::driver_thread_projection::complete(route, dispatch)

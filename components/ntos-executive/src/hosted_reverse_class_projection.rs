@@ -503,6 +503,7 @@ pub(super) unsafe fn dispatch_configure(
     write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
 
     let channel = crate::spawn_hosts::PumpChannel {
+        initial_root_dispatch: None,
         fault_ep: inst.fault_ep,
         pml4: inst.pml4,
         physical_domain: Some(port_domain),
@@ -519,6 +520,7 @@ pub(super) unsafe fn dispatch_configure(
         initial: crate::spawn_hosts::InitialAction::ReplyRequest,
         tcb: inst.tcb,
         reply_cap: inst.reply_cap,
+        child_work_capable: false,
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
@@ -678,7 +680,7 @@ unsafe fn retire_acknowledged_aliases(id: u64) -> Result<(), nt_status::NtStatus
         };
         let registration = member.alias_registration.unwrap();
         let address = member.alias.unwrap();
-        if let Err(status) = io_manager_mut().retire_hosted_device_pointer(registration) {
+        if let Err(status) = hosted_device_allocations::retire_canonical_pointer(io_manager_mut(), registration) {
             owner(id).unwrap().retirement_blocked = true;
             return Err(status);
         }

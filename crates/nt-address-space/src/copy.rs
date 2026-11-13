@@ -8,6 +8,13 @@ use crate::{
 pub const STATUS_PARTIAL_COPY: u32 = 0x8000_000D;
 pub const STATUS_GUARD_PAGE_VIOLATION: u32 = 0x8000_0001;
 
+#[path = "copy_continuation.rs"]
+mod continuation;
+pub use continuation::VmCopyContinuation;
+#[path = "copy_count_probe.rs"]
+mod count_probe;
+pub use count_probe::VmCopyCountProbe;
+
 /// A status alone cannot distinguish rejected user access from unavailable backing or ownership.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryCopyFailure {

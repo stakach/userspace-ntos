@@ -1,5 +1,60 @@
-//! Cumulative component-pump diagnostics and dispatch-depth bookkeeping across receive slices.
-//! Copies are observational snapshots, never independent execution or endpoint authority.
+//! Component receive-boundary policy and cumulative dispatch-depth bookkeeping.
+//! Demand snapshots select a scheduling boundary without owning a Reply, DPC, or endpoint.
+
+use nt_component_suspension::{ComponentSuspensionLanes, LaneDispatchIdentity};
+
+/// Which typed receive boundary a resumed Win32k pump may yield through.
+/// The nested callback origin is retained with the pending dispatch across reparks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResumeYieldCaps {
+    pub hosted_receive: bool,
+    pub nested_service_wait: bool,
+}
+
+pub const fn resume_yield_caps(
+    nested_callback: bool,
+    has_logical_caller: bool,
+) -> ResumeYieldCaps {
+    ResumeYieldCaps {
+        hosted_receive: has_logical_caller && !nested_callback,
+        nested_service_wait: has_logical_caller && nested_callback,
+    }
+}
+
+/// A refused root receive has either a certified pre-native owner conflict or an
+/// uncertain native effect. Only the former may give the exact child another turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootReceiveRefusal {
+    IdleExecutionBusyBeforeNativeReceive,
+    NativeReceiveEffectUncertain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootReceiveDisposition {
+    ResumeRetainedDispatch,
+    RetainFailure,
+}
+
+/// Decide whether a yielded child still owns the precise running lane and Reply.
+/// This is a read-only policy; the native owner retains the continuation and does
+/// the next scheduler step. No Reply or receive is transferred here.
+pub fn root_receive_disposition_after_yield<C, R, T>(
+    lanes: &ComponentSuspensionLanes<C, R, T>,
+    dispatch: LaneDispatchIdentity,
+    physical_reply: u64,
+    refusal: RootReceiveRefusal,
+) -> RootReceiveDisposition {
+    if refusal == RootReceiveRefusal::IdleExecutionBusyBeforeNativeReceive
+        && lanes.running() == Some(dispatch.lane())
+        && lanes.active_dispatch_identity(dispatch.lane()) == Ok(Some(dispatch))
+        && lanes.binding(dispatch.lane()).ok().is_some_and(|binding|
+            binding.reply_object == physical_reply)
+    {
+        RootReceiveDisposition::ResumeRetainedDispatch
+    } else {
+        RootReceiveDisposition::RetainFailure
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PumpDepthDisposition {
@@ -7,6 +62,21 @@ pub enum PumpDepthDisposition {
     Retained,
     Suspended,
     Released,
+}
+
+/// Scheduler demand observed after an authenticated service Reply has been sent.
+/// This only selects the next receive boundary; Reply and DPC ownership stay with their
+/// existing canonical owners.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PostReplyReceiveDemand {
+    pub timer_checkpoint_ready: bool,
+    pub queued_dpc: bool,
+}
+
+impl PostReplyReceiveDemand {
+    pub const fn scheduler_yield(self) -> bool {
+        self.timer_checkpoint_ready || self.queued_dpc
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

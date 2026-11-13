@@ -1,0 +1,18 @@
+[package]
+name = "nt-alpc-native-later"
+description = "Owned native ALPC send, connect, and accept capture and reply lifetime contracts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nt-alpc-abi = { path = "../nt-alpc-abi" }
+bytemuck = { version = "1", default-features = false }
+
+[features]
+default = []
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

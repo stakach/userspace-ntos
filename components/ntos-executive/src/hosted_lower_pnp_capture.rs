@@ -152,33 +152,7 @@ impl CapturedLowerPnpStart {
 }
 
 fn source_stack_address(allocation: SourceIrpAllocation, irp: &Irp) -> Result<u64, CaptureError> {
-    if irp.type_ != WDM_X64_IO_TYPE_IRP as i16 || irp.size as u64 != allocation.bytes {
-        return Err(CaptureError::InvalidSourceIrp);
-    }
-    let location =
-        u8::try_from(irp.current_location).map_err(|_| CaptureError::InvalidSourceIrp)?;
-    if location < 2
-        || location > allocation.stack_count.saturating_add(1)
-        || irp.stack_count != allocation.stack_count as i8
-    {
-        return Err(CaptureError::InvalidSourceIrp);
-    }
-    let stack_base = allocation
-        .component_address
-        .checked_add(WDM_X64_IRP_SIZE as u64)
-        .ok_or(CaptureError::InvalidSourceIrp)?;
-    let current_stack = stack_base
-        .checked_add(
-            (location as u64 - 1)
-                .checked_mul(WDM_X64_IO_STACK_LOCATION_SIZE as u64)
-                .ok_or(CaptureError::InvalidSourceIrp)?,
-        )
-        .ok_or(CaptureError::InvalidSourceIrp)?;
-    if irp.current_stack_location.0 != current_stack {
-        return Err(CaptureError::InvalidSourceIrp);
-    }
-    current_stack
-        .checked_sub(WDM_X64_IO_STACK_LOCATION_SIZE as u64)
+    super::hosted_source_irp_stack::next_stack_address(allocation, irp)
         .ok_or(CaptureError::InvalidSourceIrp)
 }
 

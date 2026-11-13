@@ -62,6 +62,20 @@ pub(crate) fn active_owner(identity: Identity) -> FileIoBusyOwner {
     }
 }
 
+/// Observe the exact active Busy/reference owner before a selected File publication.
+#[allow(dead_code)]
+pub(crate) fn try_active_owner(identity: Identity) -> Result<FileIoBusyOwner, Error> {
+    unsafe { (&*core::ptr::addr_of!(OWNERS)).active_owner(identity) }
+}
+
+/// A published selected File row owns the Busy/reference before this active source is removed.
+#[allow(dead_code)]
+pub(crate) unsafe fn try_transfer_to_pending(identity: Identity) -> Result<(), Error> {
+    (&mut *core::ptr::addr_of_mut!(OWNERS))
+        .transfer_active(identity)
+        .map(|_| ())
+}
+
 /// The real pending IRP must already have been published with this same Busy/reference owner.
 pub(super) unsafe fn transfer_to_pending(identity: Identity) {
     (&mut *core::ptr::addr_of_mut!(OWNERS))

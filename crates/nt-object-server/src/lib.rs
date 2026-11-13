@@ -23,6 +23,7 @@ use nt_object_abi::{
     ObDereferenceObjectRequest, ObLookupPathRequest, ObOpenObjectRequest, ObQueryObjectInfo,
     ObReferenceFileHandleRequest,
     ObReferenceHandleRequest, ObReply, ObDirectoryHandleRequest, ObQueryDirectoryRequest,
+    ObCreateSessionNamespaceRequest, ObRetireSessionNamespaceRequest,
 };
 use nt_object_manager::{ClientKind, ComponentId, ObjectBody, ObjectManager, ObjectRef};
 use nt_status::NtStatus;
@@ -67,6 +68,11 @@ impl Server {
         self.om.register_client(kind, mode)
     }
 
+    /// The one root-owned SURT endpoint used by the executive to publish its admitted objects.
+    pub fn connect_executive(&mut self) -> ClientId {
+        self.connect(ClientKind::ExecutiveService, AccessMode::KernelMode)
+    }
+
     /// A client disconnected or faulted: close all its handles and retire its id.
     pub fn disconnect(&mut self, client: ClientId) -> Result<(), NtStatus> {
         self.references
@@ -102,6 +108,8 @@ impl Server {
             opcode::OB_OP_PING => Ok(ok()),
             opcode::OB_OP_OPEN_OBJECT => self.op_open(client, in_buf),
             opcode::OB_OP_CLOSE_HANDLE => self.op_close_handle(client, in_buf),
+            opcode::OB_OP_MAKE_TEMPORARY => self.op_make_temporary(client, in_buf),
+            opcode::OB_OP_MAKE_PERMANENT => self.op_make_permanent(client, in_buf),
             opcode::OB_OP_REFERENCE_HANDLE => self.op_reference_handle(client, in_buf),
             opcode::OB_OP_DEREFERENCE_OBJECT => self.op_dereference_object(client, in_buf),
             opcode::OB_OP_DELETE_OBJECT => self.op_delete_object(in_buf),
@@ -112,6 +120,8 @@ impl Server {
             opcode::OB_OP_CREATE_DIRECTORY => self.op_create_directory(in_buf),
             opcode::OB_OP_CREATE_DIRECTORY_HANDLE => self.op_directory_handle(client, in_buf, true),
             opcode::OB_OP_OPEN_DIRECTORY_HANDLE => self.op_directory_handle(client, in_buf, false),
+            opcode::OB_OP_CREATE_SESSION_NAMESPACE => self.op_create_session_namespace(client, in_buf, out_buf),
+            opcode::OB_OP_RETIRE_SESSION_NAMESPACE_EXACT => self.op_retire_session_namespace(client, in_buf),
             opcode::OB_OP_QUERY_DIRECTORY => self.op_query_directory(client, in_buf, out_buf),
             opcode::OB_OP_CREATE_SYMBOLIC_LINK => self.op_create_symlink(in_buf),
             opcode::OB_OP_QUERY_SYMBOLIC_LINK => self.op_query_symlink(in_buf, out_buf),
@@ -146,6 +156,33 @@ impl Server {
         let req: ObCloseHandleRequest = read_req(buf)?;
         self.om.close_handle(client, HandleValue(req.handle))?;
         Ok(ok())
+    }
+
+    fn op_make_temporary(&mut self, client: ClientId, buf: &[u8]) -> Result<ObReply, NtStatus> {
+        let object = self.directory_mutation_object(client, buf)?;
+        self.om.make_temporary(&object)?;
+        Ok(ok())
+    }
+
+    fn op_make_permanent(&mut self, client: ClientId, buf: &[u8]) -> Result<ObReply, NtStatus> {
+        let object = self.directory_mutation_object(client, buf)?;
+        // A directory's parent already owns its published name. Unlike a
+        // provider body, no separate backing-store reference is needed.
+        self.om.make_permanent(&object)?;
+        Ok(ok())
+    }
+
+    fn directory_mutation_object(&self, client: ClientId, buf: &[u8])
+        -> Result<ObjectRef, NtStatus>
+    {
+        let req: ObCloseHandleRequest = read_req(buf)?;
+        check_size::<ObCloseHandleRequest>(req.abi_size)?;
+        if req._reserved != 0 || req._reserved2 != 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let directory_type = self.om.directory_type().ok_or(NtStatus::INVALID_HANDLE)?;
+        self.om.reference_by_handle(client, HandleValue(req.handle),
+            Some(directory_type), AccessMask::DELETE)
     }
 
     fn op_reference_handle(&mut self, client: ClientId, buf: &[u8]) -> Result<ObReply, NtStatus> {
@@ -294,6 +331,45 @@ impl Server {
         }
     }
 
+    fn op_create_session_namespace(
+        &mut self,
+        client: ClientId,
+        buf: &[u8],
+        out_buf: &mut [u8],
+    ) -> Result<ObReply, NtStatus> {
+        if self.om.client_mode(client)? != AccessMode::KernelMode {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
+        let req: ObCreateSessionNamespaceRequest = read_req(buf)?;
+        check_size::<ObCreateSessionNamespaceRequest>(req.abi_size)?;
+        if req.reserved != 0 { return Err(NtStatus::INVALID_PARAMETER); }
+        let dst = out_buf.get_mut(..8).ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+        let (session, windows, bno) = self.om.create_session_namespace(req.session_id)?;
+        dst.copy_from_slice(&bno.0.to_le_bytes());
+        Ok(reply(NtStatus::SUCCESS, 8, session.0, windows.0))
+    }
+
+    fn op_retire_session_namespace(
+        &mut self,
+        client: ClientId,
+        buf: &[u8],
+    ) -> Result<ObReply, NtStatus> {
+        if self.om.client_mode(client)? != AccessMode::KernelMode {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
+        let req: ObRetireSessionNamespaceRequest = read_req(buf)?;
+        check_size::<ObRetireSessionNamespaceRequest>(req.abi_size)?;
+        if req.reserved != 0 || req.session_object_id == 0 || req.windows_object_id == 0
+            || req.base_named_objects_id == 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        self.om.retire_session_namespace_exact(
+            req.session_id, ObjectId(req.session_object_id), ObjectId(req.windows_object_id),
+            ObjectId(req.base_named_objects_id),
+        )?;
+        Ok(ok())
+    }
+
     fn op_query_directory(&mut self, client: ClientId, buf: &[u8], out: &mut [u8])
         -> Result<ObReply, NtStatus>
     {
@@ -389,13 +465,34 @@ impl Server {
 
     fn op_create_symlink(&mut self, buf: &[u8]) -> Result<ObReply, NtStatus> {
         let req: ObCreateSymbolicLinkRequest = read_req(buf)?;
+        check_size::<ObCreateSymbolicLinkRequest>(req.abi_size)?;
+        if u32::from(req.obj_attributes)
+            & !(ObjAttrFlags::PERMANENT | ObjAttrFlags::OPEN_IF | ObjAttrFlags::CASE_INSENSITIVE)
+                .bits()
+            != 0
+        {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         let link_path = read_path(buf, req.link_offset, req.link_len_bytes)?;
         let target = read_unicode(buf, req.target_offset, req.target_len_bytes)?;
         let (parent, leaf) = self.split_parent(&link_path)?;
         let permanent = permanent_of(req.obj_attributes);
-        let link = self
+        let link = match self
             .om
-            .create_symbolic_link_target(&parent, &leaf, target, permanent)?;
+            .create_symbolic_link_target(&parent, &leaf, target.clone(), permanent)
+        {
+            Ok(link) => link,
+            Err(NtStatus::OBJECT_NAME_COLLISION)
+                if u32::from(req.obj_attributes) & ObjAttrFlags::OPEN_IF.bits() != 0 =>
+            {
+                let existing = self.om.lookup_link(&link_path, case_of(req.obj_attributes))?;
+                if self.om.query_symbolic_link(&existing)? != target {
+                    return Err(NtStatus::OBJECT_NAME_COLLISION);
+                }
+                return Ok(reply(NtStatus::OBJECT_NAME_EXISTS, 0, existing.id().0, 0));
+            }
+            Err(status) => return Err(status),
+        };
         Ok(reply(NtStatus::SUCCESS, 0, link.id().0, 0))
     }
 

@@ -8,6 +8,7 @@
 use super::hosted_source_pool_memory::SourcePoolMemory;
 use super::*;
 use nt_io_manager::{
+    hook_canonical_irp::HookCanonicalIrp,
     hosted_forward_target::HostedForwardTarget,
     retained_connect_forward::{
         ConnectControl, ConnectPayloadIdentity, HookBufferSource, HookDeviceExtensionRange,
@@ -60,7 +61,7 @@ pub(super) struct HookWork {
     source_device_allocation: SourcePoolAllocationIdentity,
     class_target: HostedForwardTarget,
     payload: HookPayloadIdentity,
-    pending_irp: Option<IrpId>,
+    canonical_irp: HookCanonicalIrp,
     phase: Phase,
 }
 
@@ -244,7 +245,7 @@ impl HookWork {
                 source_device_allocation: source_alloc,
                 class_target,
                 payload,
-                pending_irp: None,
+                canonical_irp: HookCanonicalIrp::None,
                 phase: Phase::Captured,
             })
         })();
@@ -292,9 +293,18 @@ impl HookWork {
         if self.phase != Phase::Entered || irp_id.raw() == 0 {
             return Err(HookError::WrongPhase);
         }
-        self.pending_irp = Some(irp_id);
+        if !self.canonical_irp.record_pending(irp_id) {
+            return Err(HookError::WrongPhase);
+        }
         self.phase = Phase::Pending;
         Ok(())
+    }
+
+    /// The returned File owner has already retired this exact canonical IRP.
+    /// Source ACK must retain its other claims without attempting a second IRP ACK.
+    pub(super) fn record_returned_file_retirement(&mut self, irp_id: IrpId) -> bool {
+        matches!(self.phase, Phase::Terminal(_))
+            && self.canonical_irp.record_returned_retirement(irp_id)
     }
 
     /// Observe a real class terminal, including the mutable METHOD_NEITHER bytes. The original
@@ -309,7 +319,7 @@ impl HookWork {
         if !matches!(self.phase, Phase::Entered | Phase::Pending | Phase::SequenceTerminal(_))
             || status == nt_status::NtStatus::PENDING
             || updated.len() != self.payload.input_length as usize
-            || completed_irp != self.pending_irp
+            || !self.canonical_irp.matches_completion(completed_irp)
             || !self.validate_source()
         {
             return Err(HookError::WrongPhase);
@@ -437,11 +447,19 @@ impl HookWork {
         if !completed {
             return Err(HookError::WrongSource);
         }
-        if let Some(irp_id) = self.pending_irp {
-            if acknowledge_completed_irp_strict(irp_id.raw()).is_err() {
+        if let Some(irp_id) = self.canonical_irp.ack_target() {
+            pump_io_manager();
+            // A missing File row is not permission to fall back to the manager's raw
+            // backend ACK: it may have already accepted a prior, uncertain request.
+            if !hosted_file_owners::contains(irp_id)
+                || hosted_file_owners::acknowledge(irp_id).is_err()
+            {
                 return Err(HookError::WrongSource);
             }
-            self.pending_irp = None;
+            if !self.canonical_irp.record_strict_ack(irp_id) {
+                self.phase = Phase::Blocked;
+                return Err(HookError::WrongSource);
+            }
         }
         if !self.target_released {
             if self.class_target.release(io_manager_mut()).is_err() {

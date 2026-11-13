@@ -37,6 +37,17 @@ pub(crate) fn validate_external_parameter_layout(
     system_buffer_len: usize,
 ) -> Result<(), NtStatus> {
     match params {
+        IoParameters::Scsi(parameters) => {
+            let transfer = parameters.data_length
+                .checked_add(u32::from(parameters.sense_length))
+                .ok_or(NtStatus::INVALID_PARAMETER)?;
+            if major != nt_io_abi::major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                || input_len != transfer
+                || output_len != transfer.checked_add(64 + 0x58).ok_or(NtStatus::INVALID_PARAMETER)?
+                || system_buffer_len != input_len.max(output_len) as usize
+                || !stack_flags.is_empty()
+            { return Err(NtStatus::INVALID_PARAMETER); }
+        }
         IoParameters::Pnp(parameters) => {
             let expected_input = parameters.input_len();
             let expected_output = parameters.output_len();
@@ -274,6 +285,9 @@ pub enum ExternalDispatchResult {
         status: NtStatus,
         information: u64,
         file_context: Option<u64>,
+        /// The exact stack frame that completed the IRP, captured before inline retirement.
+        completion_driver_id: DriverId,
+        completion_device_id: DeviceId,
     },
     Pending {
         irp_id: IrpId,
@@ -938,6 +952,40 @@ impl<P> IoManager<P> {
         Ok(file.driver_context)
     }
 
+    /// Ask the exact live provider whether a captured File can be paged from immutable bytes.
+    /// The answer is tied to canonical File and device generations plus the CREATE-returned
+    /// context; a filter/changed stack or an unrecognised provider yields no attestation.
+    pub fn immutable_file_extent(
+        &self,
+        client: ClientId,
+        file_id: FileId,
+        device_id: DeviceId,
+        file_context: u64,
+    ) -> Result<Option<u64>, NtStatus> {
+        let file = self.file(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
+        if file.client_id != client
+            || file.device_id != device_id
+            || file.driver_context != Some(file_context)
+            || !file.state.is_open()
+        {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        if self.top_of_device_stack(device_id)? != device_id {
+            return Ok(None);
+        }
+        let device = self.device(device_id).ok_or(NtStatus::INVALID_HANDLE)?;
+        let driver = self.driver(device.driver_id).ok_or(NtStatus::INVALID_HANDLE)?;
+        let Some(backend) = driver
+            .dispatch
+            .get(nt_io_abi::major::IRP_MJ_READ)
+            .kernel_id()
+            .and_then(|id| self.backends.get(id.0 as usize))
+        else {
+            return Ok(None);
+        };
+        Ok(backend.immutable_file_extent(file_id, file_context))
+    }
+
     /// Build one IRP for `device_id`, route it through the owning driver's
     /// dispatch table, and return either its synchronous result or the canonical
     /// id retained for asynchronous completion.
@@ -1323,10 +1371,6 @@ impl<P> IoManager<P> {
         irp_id: IrpId,
         outcome: Result<DispatchOutcome, NtStatus>,
     ) -> ExternalDispatchResult {
-        let (major, file_id) = self
-            .irp(irp_id)
-            .map(|irp| (irp.origin_major, irp.file_id))
-            .unwrap_or((u8::MAX, None));
         if self
             .irp(irp_id)
             .map(|irp| irp.state != IrpState::Dispatched)
@@ -1334,6 +1378,12 @@ impl<P> IoManager<P> {
         {
             return ExternalDispatchResult::Pending { irp_id };
         }
+        let (major, file_id, completion_driver_id, completion_device_id) = self
+            .irp(irp_id)
+            .and_then(|irp| irp.current_stack().map(|stack| {
+                (irp.origin_major, irp.file_id, stack.driver_id, stack.device_id)
+            }))
+            .expect("dispatched external IRP has an exact completing stack frame");
         match outcome {
             Ok(DispatchOutcome::Completed {
                 status,
@@ -1357,6 +1407,8 @@ impl<P> IoManager<P> {
                     status,
                     information,
                     file_context,
+                    completion_driver_id,
+                    completion_device_id,
                 }
             }
             Ok(DispatchOutcome::Failed { status }) | Err(status) => {
@@ -1376,6 +1428,8 @@ impl<P> IoManager<P> {
                     status,
                     information: 0,
                     file_context: None,
+                    completion_driver_id,
+                    completion_device_id,
                 }
             }
             Ok(DispatchOutcome::Pending) => {

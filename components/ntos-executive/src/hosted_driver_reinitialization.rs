@@ -7,18 +7,31 @@ use nt_io_manager::driver_reinitialization::{
 };
 
 static mut QUEUE: DriverReinitializationQueue = DriverReinitializationQueue::new();
+static ORDINARY_DRAIN_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-fn queue() -> &'static mut DriverReinitializationQueue {
+struct OrdinaryDrainGuard;
+impl Drop for OrdinaryDrainGuard {
+    fn drop(&mut self) { ORDINARY_DRAIN_ACTIVE.store(false, Ordering::Release); }
+}
+
+pub(super) fn queue() -> &'static mut DriverReinitializationQueue {
     unsafe { &mut *core::ptr::addr_of_mut!(QUEUE) }
 }
 
 /// Component-side void import. The root records ownership before returning; malformed transport
 /// acknowledgements enter the existing provider fault path instead of permitting a replay.
 pub(super) extern "win64" fn register(driver_object: u64, routine: u64, context: u64) {
+    register_with_op(driver_object, routine, context,
+        HOSTED_DEVICE_OP_REGISTER_DRIVER_REINIT, 8);
+}
+
+pub(super) fn register_with_op(driver_object: u64, routine: u64, context: u64,
+    op: u64, flag: u32,
+) {
     let (info, raw, first, second, reserved) = unsafe {
         call_on4_raw(
             (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
-            HOSTED_DEVICE_OP_REGISTER_DRIVER_REINIT,
+            op,
             driver_object,
             routine,
             context,
@@ -30,12 +43,12 @@ pub(super) extern "win64" fn register(driver_object: u64, routine: u64, context:
     {
         unsafe { crate::provider_bugcheck::report(
             0xc4,
-            [FSD_SERVICE_DEVICE_LABEL, HOSTED_DEVICE_OP_REGISTER_DRIVER_REINIT, info, raw],
+            [FSD_SERVICE_DEVICE_LABEL, op, info, raw],
         ); }
     }
     unsafe {
         let flags = read_unaligned((driver_object + 4) as *const u32);
-        write_unaligned((driver_object + 4) as *mut u32, flags | 8);
+        write_unaligned((driver_object + 4) as *mut u32, flags | flag);
     }
 }
 
@@ -47,16 +60,35 @@ pub(super) fn service_register(
     context: u64,
     active_reply_cap: u64,
 ) -> i32 {
+    let identity = match validated_registration(ch, driver_object, routine, context,
+        active_reply_cap) {
+        Ok(identity) => identity,
+        Err(status) => return status,
+    };
+    match queue().register(identity) {
+        Ok(_) => STATUS_SUCCESS,
+        Err(DriverReinitializationError::Exhausted) => STATUS_INSUFFICIENT_RESOURCES,
+        Err(_) => STATUS_INVALID_PARAMETER,
+    }
+}
+
+pub(super) fn validated_registration(
+    ch: &crate::spawn_hosts::PumpChannel,
+    driver_object: u64,
+    routine: u64,
+    context: u64,
+    active_reply_cap: u64,
+) -> Result<DriverReinitializationIdentity, i32> {
     let Some((instance_index, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
-        return STATUS_ACCESS_DENIED;
+        return Err(STATUS_ACCESS_DENIED);
     };
     let Some(domain) = instance_domain_identity(inst) else {
-        return STATUS_ACCESS_DENIED;
+        return Err(STATUS_ACCESS_DENIED);
     };
     let Some(image_end) = inst.image_frames.checked_mul(0x1000)
         .and_then(|bytes| FSD_CODE_VA.checked_add(bytes))
     else {
-        return STATUS_INVALID_PARAMETER;
+        return Err(STATUS_INVALID_PARAMETER);
     };
     if inst.driver_id == 0 || driver_object == 0 || routine < FSD_CODE_VA
         || routine >= image_end || inst.exec_shared_va != ch.shared_va
@@ -64,7 +96,7 @@ pub(super) fn service_register(
         || instance(instance_index).is_none()
         || unsafe { read_volatile((ch.shared_va + SH_DRVOBJ) as *const u64) } != driver_object
     {
-        return STATUS_ACCESS_DENIED;
+        return Err(STATUS_ACCESS_DENIED);
     }
     let valid_driver = unsafe {
         hosted_pool_allocation_exec_range(inst.exec_pool_va, driver_object)
@@ -76,7 +108,7 @@ pub(super) fn service_register(
             })
     };
     if !valid_driver {
-        return STATUS_INVALID_PARAMETER;
+        return Err(STATUS_INVALID_PARAMETER);
     }
     let identity = DriverReinitializationIdentity {
         driver_id: inst.driver_id,
@@ -86,16 +118,16 @@ pub(super) fn service_register(
         routine,
         context,
     };
-    match queue().register(identity) {
-        Ok(_) => STATUS_SUCCESS,
-        Err(DriverReinitializationError::Exhausted) => STATUS_INSUFFICIENT_RESOURCES,
-        Err(_) => STATUS_INVALID_PARAMETER,
-    }
+    Ok(identity)
 }
 
 /// Component-side reinit dispatch. The local driver extension owns Count and Flags, and the
 /// guarded callback boundary contains faults before the root can acknowledge the queue ticket.
 pub(super) unsafe fn component_dispatch() -> (i32, u64) {
+    component_dispatch_with_flag(8)
+}
+
+pub(super) unsafe fn component_dispatch_with_flag(flag: u32) -> (i32, u64) {
     let driver_object = read_volatile((FSD_SHARED_VADDR + SH_DRVOBJ) as *const u64);
     let routine = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
     let context = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
@@ -112,7 +144,7 @@ pub(super) unsafe fn component_dispatch() -> (i32, u64) {
     };
     write_unaligned((extension + 0x10) as *mut u32, count);
     let flags = read_unaligned((driver_object + 4) as *const u32);
-    write_unaligned((driver_object + 4) as *mut u32, flags & !8);
+    write_unaligned((driver_object + 4) as *mut u32, flags & !flag);
     let jb = &mut *core::ptr::addr_of_mut!(BUGCHECK_JB);
     jb[0] = 0;
     jb[1] = 0;
@@ -161,6 +193,49 @@ pub(super) unsafe fn run_pending_for_instance(
         }
         queue().acknowledge(ticket).map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     }
+}
+
+/// A boot callback can register an ordinary callback after DriverEntry's one-time drain. Claim
+/// those rows only after the boot callback has acknowledged its exact terminal and Count.
+pub(super) unsafe fn run_pending_ordinary_callbacks() -> Result<usize, nt_status::NtStatus> {
+    if hosted_boot_driver_reinitialization::boot_drain_active()
+        || ORDINARY_DRAIN_ACTIVE.swap(true, Ordering::AcqRel)
+    { return Ok(0); }
+    let _guard = OrdinaryDrainGuard;
+    let mut completed = 0usize;
+    while let Some(ticket) = queue().begin_next_ready(|identity| {
+        instance_by_driver_id(identity.driver_id).is_some_and(|(_, inst)| {
+            inst.driver_object == identity.driver_object
+                && instance_domain_identity(inst).is_some_and(|domain| {
+                    domain.domain_id.raw() == identity.domain_id
+                        && domain.cookie == identity.domain_cookie
+                })
+        })
+    }) {
+        let (index, inst) = instance_by_driver_id(ticket.identity.driver_id)
+            .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+        let domain = instance_domain_identity(inst).ok_or(nt_status::NtStatus::ACCESS_DENIED)?;
+        if domain.domain_id.raw() != ticket.identity.domain_id
+            || domain.cookie != ticket.identity.domain_cookie
+            || inst.driver_object != ticket.identity.driver_object
+        { return Err(nt_status::NtStatus::ACCESS_DENIED); }
+        let count = dispatch_device_projection_control_for_instance(
+            index,
+            ticket.identity.driver_object,
+            FSD_DISPATCH_DRIVER_REINIT,
+            ticket.identity.routine,
+            ticket.identity.context,
+            false,
+            None,
+            crate::initial_system_driver_caller(),
+        )?;
+        if count != u64::from(ticket.count) {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        queue().acknowledge(ticket).map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        completed += 1;
+    }
+    Ok(completed)
 }
 
 pub(super) fn instance_quiesced(inst: DriverInstance) -> bool {

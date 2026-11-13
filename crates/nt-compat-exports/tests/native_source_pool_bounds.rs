@@ -4,10 +4,11 @@
 use std::process::Command;
 
 fn function_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-    let start = source.find(start).expect("actual native function start");
-    let length = source[start..].find(end).expect("next native function");
-    let function = &source[start..start + length];
-    syn::parse_str::<syn::ItemFn>(function).expect("extract a complete unchanged native function");
+    let offset = source.find(start).expect("actual native function start");
+    let length = source[offset..].find(end).expect("next native function");
+    let function = &source[offset..offset + length];
+    syn::parse_str::<syn::ItemFn>(function)
+        .unwrap_or_else(|error| panic!("extract a complete unchanged native function {start}: {error}"));
     function
 }
 
@@ -27,7 +28,7 @@ fn actual_native_source_pool_bounds_and_fallback_behavior() {
         function_between(
             ledger,
             "unsafe fn pool_range_identity_unlocked(",
-            "\nunsafe fn exact_pool_identity_unlocked(",
+            "\npub(super) unsafe fn exact_pool_identity_unlocked(",
         ),
         function_between(
             ledger,
@@ -51,6 +52,11 @@ fn actual_native_source_pool_bounds_and_fallback_behavior() {
         ),
         functions_between(
             driver,
+            "struct PoolFreeListPosition {",
+            "\nfn component_pool_end()",
+        ),
+        functions_between(
+            driver,
             "fn component_pool_end()",
             "\nunsafe fn hosted_pool_allocation_exec_va(",
         ),
@@ -59,7 +65,7 @@ fn actual_native_source_pool_bounds_and_fallback_behavior() {
             "unsafe fn hosted_pool_allocation_exec_va(",
             "\nfn component_pool_to_exec_va(",
         ),
-        function_between(
+        functions_between(
             driver,
             "unsafe fn hosted_instance_pool_alloc(",
             "\nunsafe fn hosted_instance_pool_free_unlocked(",
@@ -151,7 +157,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const POOL_FREE_LIST_MAX:u64 = 1024;
-static FSD_POOL_LIST_CYCLES:AtomicU64 = AtomicU64::new(0);
+static FSD_POOL_LIST_FAILURES:AtomicU64 = AtomicU64::new(0);
 static FSD_POOL_INVALID_FREES:AtomicU64 = AtomicU64::new(0);
 static FSD_POOL_DOUBLE_FREES:AtomicU64 = AtomicU64::new(0);
 static mut POOL_CALLS:u64 = 0;
@@ -330,6 +336,112 @@ fn cyclic_exec_free_list_cannot_admit_another_free() {
 }
 
 #[test]
+fn executive_free_inserts_in_address_order_and_reuse_preserves_links() {
+    let first = FSD_POOL_VADDR + POOL_DATA_OFF + 16;
+    let second = first + 0x20;
+    let third = second + 0x20;
+    let view = instance().exec_pool_va + POOL_DATA_OFF;
+    reset(POOL_DATA_OFF + 0x60, 16, 7, false);
+    MEMORY.with(|memory| {
+        let mut memory = memory.borrow_mut();
+        memory.words.insert(view + 0x20, 16);
+        memory.words.insert(view + 0x28, 7);
+        memory.words.insert(view + 0x40, 16);
+        memory.words.insert(view + 0x48, 0);
+        memory.words.insert(instance().exec_pool_va + 8, first);
+        memory.words.insert(view + 8, third);
+    });
+    assert!(unsafe { hosted_instance_pool_free_unlocked(instance(), second) });
+    MEMORY.with(|memory| {
+        let memory = memory.borrow();
+        assert_eq!(memory.words[&(instance().exec_pool_va + 8)], first);
+        assert_eq!(memory.words[&(view + 8)], second);
+        assert_eq!(memory.words[&(view + 0x28)], third);
+    });
+    assert_eq!(unsafe { hosted_instance_pool_allocation_is_free_unlocked(instance(), second) }, Some(true));
+    MEMORY.with(|memory| memory.borrow_mut().writes.clear());
+    assert!(!unsafe { hosted_instance_pool_free_unlocked(instance(), second) });
+    assert!(MEMORY.with(|memory| memory.borrow().writes.is_empty()),
+        "a duplicate free must leave the sorted links unchanged");
+
+    assert_eq!(unsafe { hosted_instance_pool_alloc(instance(), 16) }, Some(first));
+    MEMORY.with(|memory| {
+        let memory = memory.borrow();
+        assert_eq!(memory.words[&(instance().exec_pool_va + 8)], second);
+        assert_eq!(memory.words[&(view + 8)], 7,
+            "reused allocation must carry its new generation instead of a free link");
+    });
+}
+
+#[test]
+fn small_reuse_splits_a_freed_irp_block_without_losing_its_tail() {
+    let first = FSD_POOL_VADDR + POOL_DATA_OFF + 16;
+    let used = POOL_DATA_OFF + 16 + 280;
+    reset(used, 280, 7, true);
+    MEMORY.with(|memory| {
+        memory.borrow_mut().words.insert(instance().exec_pool_va + POOL_DATA_OFF + 8, 0);
+    });
+
+    assert_eq!(unsafe { hosted_instance_pool_alloc(instance(), 56) }, Some(first));
+    assert_eq!(unsafe { hosted_pool_allocation_exec_range(instance().exec_pool_va, first) },
+        Some((instance().exec_pool_va + POOL_DATA_OFF + 16, 64)),
+        "a 56-byte private graph member must not quarantine the whole 280-byte IRP block");
+    let tail = first + 64 + 16;
+    assert_eq!(unsafe { hosted_instance_pool_allocation_is_free_unlocked(instance(), tail) }, Some(true));
+    assert_eq!(unsafe { hosted_pool_allocation_exec_range(instance().exec_pool_va, tail) },
+        Some((instance().exec_pool_va + POOL_DATA_OFF + 96, 200)));
+    assert_eq!(unsafe { hosted_instance_pool_alloc(instance(), 32) }, Some(tail));
+    assert_eq!(unsafe { hosted_pool_used(instance().exec_pool_va) }, used,
+        "recycling must not consume another bump span");
+}
+
+#[test]
+fn small_reuse_of_a_page_aligned_block_preserves_a_page_aligned_large_tail() {
+    let first = FSD_POOL_VADDR + POOL_DATA_OFF + 16;
+    let aligned = FSD_POOL_VADDR + 0x2000;
+    let used = 0x2000 + 0x20000;
+    reset(used, 0xfe0, 7, false);
+    MEMORY.with(|memory| {
+        let mut memory = memory.borrow_mut();
+        memory.words.insert(instance().exec_pool_va + 8, aligned);
+        memory.words.insert(instance().exec_pool_va + 0x1ff0, 0x20000);
+        memory.words.insert(instance().exec_pool_va + 0x1ff8, 0);
+    });
+    assert_eq!(first + 0xfe0 + 16, aligned);
+
+    assert_eq!(unsafe { hosted_instance_pool_alloc(instance(), 56) }, Some(aligned));
+    let large_tail = aligned + 0x1000;
+    assert_eq!(unsafe { hosted_instance_pool_allocation_is_free_unlocked(instance(), large_tail) }, Some(true));
+    assert_eq!(unsafe { hosted_pool_allocation_exec_range(instance().exec_pool_va, large_tail) },
+        Some((instance().exec_pool_va + 0x3000, 0x1f000)));
+    assert_eq!(unsafe { hosted_pool_used(instance().exec_pool_va) }, used);
+}
+
+#[test]
+fn first_fit_cannot_unlink_before_a_corrupt_tail_is_validated() {
+    let first = FSD_POOL_VADDR + POOL_DATA_OFF + 16;
+    let third = first + 0x40;
+    let view = instance().exec_pool_va + POOL_DATA_OFF;
+    reset(POOL_DATA_OFF + 0x60, 16, 7, false);
+    MEMORY.with(|memory| {
+        let mut memory = memory.borrow_mut();
+        memory.words.insert(view + 0x20, 16);
+        memory.words.insert(view + 0x28, 7);
+        memory.words.insert(view + 0x40, 16);
+        memory.words.insert(view + 0x48, third);
+        memory.words.insert(instance().exec_pool_va + 8, first);
+        memory.words.insert(view + 8, third);
+    });
+    assert_eq!(unsafe { hosted_instance_pool_alloc(instance(), 16) }, None);
+    MEMORY.with(|memory| {
+        let memory = memory.borrow();
+        assert!(memory.writes.is_empty(), "a fitting head cannot be unlinked before tail proof");
+        assert_eq!(memory.words[&(instance().exec_pool_va + 8)], first);
+        assert_eq!(memory.words[&(view + 8)], third);
+    });
+}
+
+#[test]
 fn oversized_component_bump_cursor_cannot_allocate_or_write() {
     let oversized = FSD_POOL_FRAMES * 0x1000 + 0x20;
     reset(oversized, 0x80, 7, false);
@@ -469,6 +581,29 @@ fn recycled_pool_generation_invalidates_captured_identity() {
     assert!(!unsafe { memory_identity_matches_unlocked(3, instance(), captured) },
         "the same address and capacity cannot stand in for the captured generation");
     assert_eq!(MEMORY.with(|memory| memory.borrow().translations), 0);
+}
+
+#[test]
+fn buffered_control_system_buffer_keeps_exact_interior_pool_generation_and_extent() {
+    reset(POOL_DATA_OFF + 16 + 0x80, 0x80, 7, false);
+    let interior = FSD_POOL_VADDR + POOL_DATA_OFF + 16 + 4;
+    let captured = unsafe { pool_range_identity_unlocked(instance(), interior, 12) }
+        .expect("live interior SystemBuffer with max(input, output) extent");
+    assert_eq!(captured.component_address, interior - 4);
+    assert_eq!(captured.capacity, 0x80);
+    assert_eq!(captured.pool_generation, 7);
+    assert_eq!(unsafe { pool_range_identity_unlocked(instance(), interior, 12) }, Some(captured));
+
+    MEMORY.with(|memory| {
+        memory.borrow_mut().words.insert(instance().exec_pool_va + POOL_DATA_OFF + 8, 8);
+    });
+    assert_ne!(unsafe { pool_range_identity_unlocked(instance(), interior, 12) }, Some(captured),
+        "reused allocation cannot receive source completion bytes");
+
+    reset(POOL_DATA_OFF + 16 + 0x20, 0x20, 7, false);
+    let near_end = FSD_POOL_VADDR + POOL_DATA_OFF + 16 + 0x1c;
+    assert_eq!(unsafe { pool_range_identity_unlocked(instance(), near_end, 8) }, None,
+        "declared output cannot extend across the allocation boundary");
 }
 
 #[test]

@@ -223,7 +223,7 @@ pub(crate) unsafe fn service(
 
 struct Win32kPropertyClient;
 
-fn component_ipc_buffer() -> Option<u64> {
+pub(crate) fn component_ipc_buffer() -> Option<u64> {
     let rsp: u64;
     unsafe {
         core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, nomem, preserves_flags));

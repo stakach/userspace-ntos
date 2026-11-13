@@ -77,20 +77,16 @@ unsafe fn classify_hosted_acpi_pci_namespace_filter_result(
     information: u64,
     payload: &[u8],
 ) -> HostedAcpiPciNamespaceDisposition {
-    if status.raw() as u32 == STATUS_BUFFER_OVERFLOW {
-        return match (information == 0)
-            .then(|| {
-                nt_acpi::namespace_children_overflow_retry_len(
-                    payload,
-                    output_len,
-                    HOSTED_ACPI_NAMESPACE_MAX_BYTES,
-                )
-                .ok()
-            })
-            .flatten()
-        {
-            Some(required) => HostedAcpiPciNamespaceDisposition::RetryExact(required),
-            None => HostedAcpiPciNamespaceDisposition::Barrier(
+    if matches!(status.raw() as u32, STATUS_BUFFER_OVERFLOW | 0xc000_0023) {
+        return match nt_acpi::namespace_children_probe_retry_len(
+            status.raw() as u32,
+            information,
+            payload,
+            output_len,
+            HOSTED_ACPI_NAMESPACE_MAX_BYTES,
+        ) {
+            Ok(required) => HostedAcpiPciNamespaceDisposition::RetryExact(required),
+            Err(_) => HostedAcpiPciNamespaceDisposition::Barrier(
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST,
             ),
         };
@@ -477,14 +473,14 @@ fn classify_hosted_acpi_pci_address_method_result(
     if !status.is_success() {
         return HostedAcpiPciAddressMethodDisposition::Barrier(status);
     }
-    if information != HOSTED_ACPI_EVAL_INTEGER_LEN as u64
-        || payload.len() != HOSTED_ACPI_EVAL_INTEGER_LEN
+    if information != nt_acpi::ACPI_EVAL_EXTENDED_INTEGER_LEN as u64
+        || payload.len() != nt_acpi::ACPI_EVAL_EXTENDED_INTEGER_LEN
     {
         return HostedAcpiPciAddressMethodDisposition::Barrier(
             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         );
     }
-    match nt_acpi::parse_integer_evaluation(payload) {
+    match nt_acpi::parse_extended_integer_evaluation(payload) {
         Ok(value) => HostedAcpiPciAddressMethodDisposition::Value(value),
         Err(_) => HostedAcpiPciAddressMethodDisposition::Barrier(
             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
@@ -585,7 +581,7 @@ unsafe fn dispatch_hosted_acpi_pci_address_method(
             return true;
         }
     };
-    let mut output = [0u8; HOSTED_ACPI_EVAL_INTEGER_LEN];
+    let mut output = [0u8; nt_acpi::ACPI_EVAL_EXTENDED_INTEGER_LEN];
     let result = match io_manager_mut().buffered_device_control_exact_device_payload(
         ClientId(IO_MANAGER_COMPONENT_ID),
         pdo_device_id,
@@ -621,7 +617,7 @@ unsafe fn dispatch_hosted_acpi_pci_address_method(
                         if parameters.ioctl_code == nt_acpi::IOCTL_ACPI_EVAL_METHOD_EX
                             && parameters.input_len as usize
                                 == nt_acpi::ACPI_EVAL_INPUT_BUFFER_EX_LEN
-                            && parameters.output_len as usize == HOSTED_ACPI_EVAL_INTEGER_LEN
+                            && parameters.output_len as usize == nt_acpi::ACPI_EVAL_EXTENDED_INTEGER_LEN
                 )
                 .then_some((irp.origin_driver_id, current.driver_id, current.device_id))
             });
@@ -720,7 +716,7 @@ unsafe fn complete_hosted_acpi_pci_scope_source(child_index: usize) -> bool {
     for (query, adr) in plan.addresses.into_iter().zip(values) {
         addresses.push(nt_pnp::AcpiPciAddressScopeFact {
             path: query.scope,
-            adr: adr as u64,
+            adr,
             routing_table: query.routing_table,
         });
     }
@@ -814,21 +810,40 @@ unsafe fn stage_hosted_acpi_pci_scope_sources() -> bool {
     if link_candidates.try_reserve_exact(candidate_count).is_err() {
         return false;
     }
+    let mut stale_child_identity = false;
     if source_count != 0 {
         let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
             .as_ref()
             .unwrap();
-        for properties in &query.child_properties {
+        for (child_index, properties) in query.child_properties.iter().enumerate() {
             if let HostedAcpiNamespaceState::Present(namespace) = &properties.acpi_namespace {
+                let Some((device_id, domain, pdo_object)) =
+                    hosted_relation_child_identity(child_index)
+                else {
+                    stale_child_identity = true;
+                    break;
+                };
                 let Ok(path) = namespace.self_path().try_clone() else {
                     return false;
                 };
                 link_candidates.push(nt_pnp::AcpiPciLinkCandidateFact {
                     relation_owner,
+                    endpoint: nt_pnp::AcpiPciProviderEndpoint {
+                        device_id: device_id.raw(),
+                        hosted_domain_id: domain.domain_id.raw(),
+                        hosted_domain_cookie: domain.cookie,
+                        pdo_object,
+                    },
                     path,
                 });
             }
         }
+    }
+    if stale_child_identity {
+        set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+        return true;
     }
     let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
         .as_mut()

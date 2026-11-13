@@ -152,7 +152,7 @@ fn receipt_has_no_allocation_user_reads_authority_resolution_or_policy_filters()
     for bound in ["RECEIPT_LIMIT", "PATH_BYTE_LIMIT", "VALUE_UNIT_LIMIT"] {
         assert!(effects.paths.iter().any(|name| name == bound));
     }
-    assert!(effects.calls.iter().any(|name| name == "fetch_update"));
+    assert!(effects.calls.iter().any(|name| name == "try_update"));
 }
 
 static OUTPUT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());

@@ -39,15 +39,31 @@ fn image_process_bridge_retains_exact_source_without_path_reopen_or_leaf_cache()
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../components/ntos-executive/src/exec_image_process_create.rs");
     let file = syn::parse_file(&std::fs::read_to_string(path).expect("focused native image process bridge module")).unwrap();
-    let mut calls = Calls::default();
-    calls.visit_block(&method(&file, "reserve_native_image_process").block);
+    let mut admission = Calls::default();
+    admission.visit_block(&method(&file, "reserve_native_image_process").block);
     for required in ["lookup_native_section_handle", "source", "reference_view",
-        "register_exact_loaded", "reserve_spawn_from_native_section"] {
-        assert!(calls.0.iter().any(|name| name == required), "retain {required} boundary");
+        "reserve_native_image_process_with_bytes"] {
+        assert!(admission.0.iter().any(|name| name == required), "retain {required} boundary");
+    }
+    let mut publication = Calls::default();
+    publication.visit_block(&method(&file, "reserve_native_image_process_with_bytes").block);
+    for required in ["source_for_view", "register_exact_loaded", "reserve_spawn_from_native_section"] {
+        assert!(publication.0.iter().any(|name| name == required), "retain {required} boundary");
+    }
+    let routed = syn::parse_file(include_str!("../../../../components/ntos-executive/src/process_image_snapshot_work.rs")).unwrap();
+    let mut read = Calls::default();
+    let advance_read = routed.items.iter().find_map(|item| match item {
+        syn::Item::Fn(value) if value.sig.ident == "advance_read" => Some(value),
+        _ => None,
+    }).expect("retained routed process image reader");
+    read.visit_block(&advance_read.block);
+    for required in ["completed_irp_exact", "acknowledge_completed_irp_strict", "acknowledge"] {
+        assert!(read.0.iter().any(|name| name == required), "retain {required} before publication");
     }
     for forbidden in ["mint_handle", "admit_dynamic_hosted_exe", "load_file_to_pool",
         "load_hosted_executable_from_volume_path", "pe_and_pool_by_leaf", "get_latest_by_leaf"] {
-        assert!(!calls.0.iter().any(|name| name == forbidden), "no filename-derived source authority via {forbidden}");
+        assert!(!admission.0.iter().chain(&publication.0).any(|name| name == forbidden),
+            "no filename-derived source authority via {forbidden}");
     }
 }
 
@@ -65,7 +81,7 @@ fn generic_image_bridge_checks_preferred_layout_before_publication() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../components/ntos-executive/src/exec_image_process_create.rs");
     let file = syn::parse_file(&std::fs::read_to_string(path).unwrap()).unwrap();
-    let body = &method(&file, "reserve_native_image_process").block;
+    let body = &method(&file, "reserve_native_image_process_with_bytes").block;
     let mut calls = Calls::default();
     calls.visit_block(body);
     let checked = calls.0.iter().position(|name| name == "checked")
@@ -73,7 +89,8 @@ fn generic_image_bridge_checks_preferred_layout_before_publication() {
     let admitted = calls.0.iter().position(|name| name == "validate_hosted_main_image_layout")
         .expect("constructor-owned mapping conflicts must be rejected before publication");
     assert!(checked < admitted);
-    for publication in ["reference_view", "admit_dynamic_executable_observed", "register_exact_loaded"] {
+    for publication in ["admit_dynamic_executable_observed", "register_exact_loaded",
+        "reserve_spawn_from_native_section"] {
         let index = calls.0.iter().position(|name| name == publication).unwrap();
         assert!(admitted < index, "reject invalid preferred placement before {publication}");
     }

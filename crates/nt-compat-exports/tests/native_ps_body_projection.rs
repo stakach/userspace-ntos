@@ -173,12 +173,29 @@ mod win32k_subsystem {
     pub const W32_PS_OP_RELEASE_POINTER: u64 = 7;
     pub const W32_PS_OP_YIELD_EXECUTION: u64 = 8;
     pub const W32_PS_OP_QUERY_OBJECT_KIND: u64 = 9;
+    pub const W32_PS_OP_QUERY_WOW64_PROCESS: u64 = 12;
+    pub const W32_PS_OP_QUERY_PROCESS_JOB: u64 = 13;
+    pub const W32_PS_OP_QUERY_JOB_UI_RESTRICTIONS: u64 = 14;
+    pub const W32_PS_OP_QUERY_MITIGATION_FLAGS: u64 = 15;
+    pub const W32_PS_OP_QUERY_PROCESS_PEB: u64 = 16;
+    pub const W32_PS_OP_QUERY_PROCESS_PEB32: u64 = 17;
+    pub const W32_PS_OP_QUERY_PROCESS_SEQUENCE: u64 = 18;
+    pub const W32_PS_OP_QUERY_PROCESS_PRIORITY_CLASS: u64 = 19;
+    pub const W32_PS_OP_SET_PROCESS_PRIORITY_CLASS: u64 = 20;
+    pub const W32_PS_OP_QUERY_PROCESS_SESSION_ID_EX: u64 = 21;
 }
 mod sel4_rt {
     pub fn yield_now() {}
 }
 #[path = "../../../components/ntos-executive/src/provider_ps.rs"]
 mod provider_ps;
+
+fn refuse_job_materialization(
+    _: &mut nt_process::ProcessManager,
+    _: nt_process::job::JobId,
+) -> Result<u64, u32> {
+    Err(nt_process::STATUS_INVALID_HANDLE)
+}
 
 fn fixture() -> (nt_process::ProcessManager, u32, u32, u32) {
     let mut pm = nt_process::ProcessManager::new();
@@ -208,6 +225,114 @@ fn thread_references(pm: &nt_process::ProcessManager, tid: u32) -> u32 {
 }
 
 #[test]
+fn process_sequence_broker_uses_exact_published_eprocess_identity() {
+    let (mut pm, _, pid, _) = fixture();
+    let sequence = pm.process_sequence_for_kernel_process_object(0x3000).unwrap();
+    let query = |pm: &mut nt_process::ProcessManager, body, value| {
+        provider_ps::dispatch(
+            pm,
+            win32k_subsystem::W32_PS_OP_QUERY_PROCESS_SEQUENCE,
+            body,
+            value,
+            refuse_job_materialization,
+            |_, _| panic!("scalar sequence query cannot project a body"),
+        )
+    };
+    assert_eq!(query(&mut pm, 0x3000, 0), (0, sequence, 0, 0));
+    assert_eq!(
+        query(&mut pm, u64::from(pid), 0),
+        (nt_process::STATUS_INVALID_HANDLE as i32, 0, 0, 0)
+    );
+    assert_eq!(
+        query(&mut pm, 0x3000, 1),
+        (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0)
+    );
+}
+
+#[test]
+fn process_session_id_ex_broker_preserves_unattached_and_attached_zero_provenance() {
+    let (mut pm, _, pid, _) = fixture();
+    let query = |pm: &mut nt_process::ProcessManager, body, value| {
+        provider_ps::dispatch(
+            pm,
+            win32k_subsystem::W32_PS_OP_QUERY_PROCESS_SESSION_ID_EX,
+            body,
+            value,
+            refuse_job_materialization,
+            |_, _| panic!("scalar session query cannot project a body"),
+        )
+    };
+    assert_eq!(query(&mut pm, 0x3000, 0), (0, u64::from(u32::MAX), 0, 0));
+    pm.attach_process_session(pid, 0).unwrap();
+    assert_eq!(query(&mut pm, 0x3000, 0), (0, 0, 0, 0));
+    assert_eq!(
+        query(&mut pm, u64::from(pid), 0),
+        (nt_process::STATUS_INVALID_HANDLE as i32, 0, 0, 0)
+    );
+    assert_eq!(
+        query(&mut pm, 0x3000, 1),
+        (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0)
+    );
+}
+
+#[test]
+fn process_priority_class_broker_uses_exact_body_and_preserves_scheduler_state() {
+    let (mut pm, _, pid, _) = fixture();
+    let base_priority = pm.process(pid).unwrap().base_priority();
+    let dispatch = |pm: &mut nt_process::ProcessManager, op, body, value| {
+        provider_ps::dispatch(
+            pm,
+            op,
+            body,
+            value,
+            refuse_job_materialization,
+            |_, _| panic!("priority class scalar broker cannot project a body"),
+        )
+    };
+    let query = win32k_subsystem::W32_PS_OP_QUERY_PROCESS_PRIORITY_CLASS;
+    let set = win32k_subsystem::W32_PS_OP_SET_PROCESS_PRIORITY_CLASS;
+    assert_eq!(
+        dispatch(&mut pm, query, 0x3000, 0),
+        (0, u64::from(nt_process::PROCESS_PRIORITY_CLASS_NORMAL), 0, 0)
+    );
+    assert_eq!(
+        dispatch(
+            &mut pm,
+            set,
+            0x3000,
+            u64::from(nt_process::PROCESS_PRIORITY_CLASS_HIGH),
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(
+        dispatch(&mut pm, query, 0x3000, 0),
+        (0, u64::from(nt_process::PROCESS_PRIORITY_CLASS_HIGH), 0, 0)
+    );
+    assert_eq!(pm.process(pid).unwrap().base_priority(), base_priority);
+    assert!(!pm.process(pid).unwrap().foreground());
+    assert_eq!(
+        dispatch(&mut pm, query, u64::from(pid), 0),
+        (nt_process::STATUS_INVALID_HANDLE as i32, 0, 0, 0)
+    );
+    assert_eq!(
+        dispatch(&mut pm, set, u64::from(pid), 2),
+        (nt_process::STATUS_INVALID_HANDLE as i32, 0, 0, 0)
+    );
+    assert_eq!(
+        dispatch(&mut pm, set, 0x3000, 256),
+        (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0)
+    );
+    assert_eq!(
+        dispatch(&mut pm, query, 0x3000, 1),
+        (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0)
+    );
+    assert_eq!(
+        dispatch(&mut pm, query, 0x3000, 0),
+        (0, u64::from(nt_process::PROCESS_PRIORITY_CLASS_HIGH), 0, 0)
+    );
+}
+
+#[test]
 fn canonical_object_kind_does_not_depend_on_gui_conversion_or_change_references() {
     let (mut pm, _, pid, tid) = fixture();
     let before = (process_references(&pm, pid), thread_references(&pm, tid));
@@ -217,6 +342,7 @@ fn canonical_object_kind_does_not_depend_on_gui_conversion_or_change_references(
             win32k_subsystem::W32_PS_OP_QUERY_OBJECT_KIND,
             body,
             0,
+            refuse_job_materialization,
             |_, _| panic!("read-only classification cannot grant or retain backing"),
         );
         assert_eq!(result, (0, kind, 0, 0));
@@ -276,6 +402,7 @@ fn actual_cross_thread_lookup_acknowledges_exact_body_with_acquired_reference() 
         win32k_subsystem::W32_PS_OP_LOOKUP_THREAD,
         u64::from(other_tid),
         0,
+        refuse_job_materialization,
         |pm, body| {
             observed = Some(body);
             assert_eq!(thread_references(pm, other_tid), before + 1);
@@ -296,6 +423,7 @@ fn actual_process_lookup_acknowledges_projection_before_publication() {
         win32k_subsystem::W32_PS_OP_LOOKUP_PROCESS,
         u64::from(pid),
         0,
+        refuse_job_materialization,
         |pm, body| {
             observed = Some(body);
             assert_eq!(process_references(pm, pid), before + 1);
@@ -328,10 +456,17 @@ fn actual_lookup_projection_rejection_restores_counts_and_publishes_no_pointer()
                 0x4000,
             )
         };
-        let result = provider_ps::dispatch(&mut pm, op, object, 0, |_, body| {
-            assert_eq!(body, expected);
-            Err(0xc000009au32)
-        });
+        let result = provider_ps::dispatch(
+            &mut pm,
+            op,
+            object,
+            0,
+            refuse_job_materialization,
+            |_, body| {
+                assert_eq!(body, expected);
+                Err(0xc000009au32)
+            },
+        );
         assert_eq!(result, (0xc000009au32 as i32, 0, 0, 0));
         let after = if process {
             process_references(&pm, pid)
@@ -351,6 +486,7 @@ fn actual_pointer_retain_projects_and_failed_projection_releases_only_new_refere
         win32k_subsystem::W32_PS_OP_RETAIN_POINTER,
         0x4000,
         0,
+        refuse_job_materialization,
         |_, body| {
             assert_eq!(body, 0x4000);
             Ok(())
@@ -362,6 +498,7 @@ fn actual_pointer_retain_projects_and_failed_projection_releases_only_new_refere
         win32k_subsystem::W32_PS_OP_RETAIN_POINTER,
         0x4000,
         0,
+        refuse_job_materialization,
         |_, body| {
             assert_eq!(body, 0x4000);
             Err(0xc000000du32)
@@ -379,6 +516,7 @@ fn invalid_lookup_does_not_invoke_projection() {
         win32k_subsystem::W32_PS_OP_LOOKUP_THREAD,
         u64::MAX,
         0,
+        refuse_job_materialization,
         |_, _| panic!("invalid lookup cannot authorize projection"),
     );
     assert_ne!(result.0, 0);

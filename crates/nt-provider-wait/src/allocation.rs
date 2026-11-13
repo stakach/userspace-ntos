@@ -90,6 +90,8 @@ struct ProviderAllocationRecord {
     retiring: bool,
     base: u64,
     capacity: u64,
+    /// Stable record slot of the immediate live enclosing allocation.
+    parent: Option<usize>,
 }
 
 impl ProviderAllocationRecord {
@@ -103,6 +105,7 @@ impl ProviderAllocationRecord {
         retiring: false,
         base: 0,
         capacity: 0,
+        parent: None,
     };
 
     fn snapshot(self, slot: usize) -> Result<ProviderAllocationSnapshot, ProviderAllocationError> {
@@ -135,8 +138,12 @@ impl ProviderAllocationRecord {
 pub struct ProviderAllocationCatalog {
     catalog_id: u64,
     records: records::Records,
+    /// Live record slots sorted by base. Records themselves never relocate.
+    live_by_base: Vec<usize>,
     pins: Vec<ProviderAllocationPinRecord>,
     next_pin_id: u64,
+    #[cfg(test)]
+    containing_inspections: core::cell::Cell<usize>,
 }
 
 /// Allocation-free ownership census. Slots are the historical simultaneous-record high-water;
@@ -154,8 +161,11 @@ impl ProviderAllocationCatalog {
         Self {
             catalog_id: 0,
             records: records::Records::new(),
+            live_by_base: Vec::new(),
             pins: Vec::new(),
             next_pin_id: 1,
+            #[cfg(test)]
+            containing_inspections: core::cell::Cell::new(0),
         }
     }
 
@@ -206,18 +216,22 @@ impl ProviderAllocationCatalog {
             .checked_add(capacity)
             .filter(|_| base != 0 && capacity != 0)
             .ok_or(ProviderAllocationError::InvalidRange)?;
-        if self.records.iter().any(|record| {
+        let mut parent: Option<usize> = None;
+        for (slot, record) in self.records.iter().enumerate() {
             if !record.live || base >= record.end() || record.base >= end {
-                return false;
+                continue;
             }
             if record.retiring || record.arena == arena {
-                return true;
+                return Err(ProviderAllocationError::AddressInUse);
             }
             let new_contains_existing = base < record.base && end >= record.end();
             let existing_contains_new = record.base < base && record.end() >= end;
-            !new_contains_existing && !existing_contains_new
-        }) {
-            return Err(ProviderAllocationError::AddressInUse);
+            if !new_contains_existing && !existing_contains_new {
+                return Err(ProviderAllocationError::AddressInUse);
+            }
+            if existing_contains_new && parent.map_or(true, |current| record.capacity < self.records[current].capacity) {
+                parent = Some(slot);
+            }
         }
 
         let reusable_slot = self
@@ -225,14 +239,25 @@ impl ProviderAllocationCatalog {
             .iter()
             .position(|record| !record.live && record.arena == arena && record.base == base)
             .or_else(|| self.records.iter().position(|record| !record.live));
+        let generation = reusable_slot.map_or(Ok(1), |slot| {
+            self.records[slot].generation.checked_add(1)
+                .ok_or(ProviderAllocationError::IdentityExhausted)
+        })?;
+        let next_slot = reusable_slot.unwrap_or(self.records.len());
+        u64::try_from(next_slot).ok().and_then(|slot| slot.checked_add(1))
+            .ok_or(ProviderAllocationError::IdentityExhausted)?;
+        // All fallible index growth precedes record and parent-link mutation.
+        self.live_by_base.try_reserve(1).map_err(|_| ProviderAllocationError::NoCapacity)?;
         let slot = match reusable_slot {
             Some(slot) => slot,
             None => self.records.try_append().map_err(|_| ProviderAllocationError::NoCapacity)?,
         };
-        let generation = self.records[slot]
-            .generation
-            .checked_add(1)
-            .ok_or(ProviderAllocationError::IdentityExhausted)?;
+        for &child in &self.live_by_base {
+            let record = self.records[child];
+            if record.parent == parent && record.base > base && record.end() <= end {
+                self.records[child].parent = Some(slot);
+            }
+        }
         self.records[slot] = ProviderAllocationRecord {
             arena,
             generation,
@@ -240,7 +265,10 @@ impl ProviderAllocationCatalog {
             retiring: false,
             base,
             capacity,
+            parent,
         };
+        let position = self.live_by_base.partition_point(|&live| self.records[live].base < base);
+        self.live_by_base.insert(position, slot);
         self.records[slot].snapshot(slot)
     }
 
@@ -270,12 +298,12 @@ impl ProviderAllocationCatalog {
         arena: ProviderArenaIdentity,
         base: u64,
     ) -> Result<ProviderAllocationSnapshot, ProviderAllocationError> {
-        let (slot, record) = self
-            .records
-            .iter()
-            .enumerate()
-            .find(|(_, record)| record.live && record.arena == arena && record.base == base)
-            .ok_or(ProviderAllocationError::NotFound)?;
+        let position = self.live_by_base.partition_point(|&slot| self.records[slot].base < base);
+        let slot = *self.live_by_base.get(position).ok_or(ProviderAllocationError::NotFound)?;
+        let record = &self.records[slot];
+        if record.base != base || record.arena != arena {
+            return Err(ProviderAllocationError::NotFound);
+        }
         record.snapshot(slot)
     }
 
@@ -302,23 +330,23 @@ impl ProviderAllocationCatalog {
             .checked_add(required)
             .filter(|_| address != 0 && required != 0)
             .ok_or(ProviderAllocationError::InvalidRange)?;
-        let mut owner: Option<(usize, ProviderAllocationRecord)> = None;
-        for (slot, record) in self.records.iter().copied().enumerate() {
-            if !record.live || address < record.base || address >= record.end() {
-                continue;
+        let position = self.live_by_base.partition_point(|&slot| {
+            #[cfg(test)]
+            self.containing_inspections.set(self.containing_inspections.get() + 1);
+            self.records[slot].base <= address
+        });
+        let mut candidate = position.checked_sub(1)
+            .map(|position| self.live_by_base[position])
+            .ok_or(ProviderAllocationError::NotFound)?;
+        let (slot, record) = loop {
+            #[cfg(test)]
+            self.containing_inspections.set(self.containing_inspections.get() + 1);
+            let record = self.records[candidate];
+            if address < record.end() {
+                break (candidate, record);
             }
-            match owner {
-                None => owner = Some((slot, record)),
-                Some((_, current)) if record.capacity < current.capacity => {
-                    owner = Some((slot, record));
-                }
-                Some((_, current)) if record.capacity == current.capacity => {
-                    return Err(ProviderAllocationError::AmbiguousOwner);
-                }
-                Some(_) => {}
-            }
-        }
-        let (slot, record) = owner.ok_or(ProviderAllocationError::NotFound)?;
+            candidate = record.parent.ok_or(ProviderAllocationError::NotFound)?;
+        };
         if end > record.end() {
             return Err(ProviderAllocationError::InvalidRange);
         }
@@ -392,6 +420,9 @@ impl ProviderAllocationCatalog {
     ) -> Result<ProviderAllocationSnapshot, ProviderAllocationError> {
         let snapshot = self.validate_retirement(identity)?;
         let slot = self.slot(identity)?;
+        let position = self.live_by_base.partition_point(|&live| self.records[live].base < snapshot.base);
+        debug_assert_eq!(self.live_by_base.get(position), Some(&slot));
+        self.live_by_base.remove(position);
         self.records[slot].live = false;
         Ok(snapshot)
     }
@@ -512,6 +543,42 @@ mod tests {
 
     fn arena(id: u64) -> ProviderArenaIdentity {
         ProviderArenaIdentity { id, generation: 1 }
+    }
+
+    #[test]
+    fn containment_lookup_bounds_work_across_many_nested_siblings_and_gaps() {
+        let mut catalog = ProviderAllocationCatalog::new();
+        let outer = catalog.register(arena(1), 0x1000, 0x10_00000).unwrap();
+        let mut last = None;
+        for index in 0..2_048u64 {
+            last = Some(catalog.register(arena(2), 0x2000 + index * 0x1000, 0x100).unwrap());
+        }
+        let last = last.unwrap();
+        catalog.containing_inspections.set(0);
+        assert_eq!(catalog.containing(last.base + 8, 8).unwrap(), last);
+        assert!(catalog.containing_inspections.get() < 64, "child lookup inspected {} records", catalog.containing_inspections.get());
+        catalog.containing_inspections.set(0);
+        assert_eq!(catalog.containing(last.base + 0x200, 8).unwrap(), outer);
+        assert!(catalog.containing_inspections.get() < 64, "gap lookup inspected {} records", catalog.containing_inspections.get());
+    }
+
+    #[test]
+    fn later_enclosing_allocations_reparent_live_children_without_reusing_stale_links() {
+        let mut catalog = ProviderAllocationCatalog::new();
+        let child = catalog.register(arena(3), 0x3000, 0x100).unwrap();
+        let parent = catalog.register(arena(2), 0x2800, 0x1000).unwrap();
+        let outer = catalog.register(arena(1), 0x1000, 0x4000).unwrap();
+        assert_eq!(catalog.containing(0x3008, 8), Ok(child));
+        assert_eq!(catalog.containing(0x3200, 8), Ok(parent));
+        assert_eq!(catalog.containing(0x3900, 8), Ok(outer));
+        catalog.retire(child.identity).unwrap();
+        let reused = catalog.register(arena(3), 0x7000, 0x100).unwrap();
+        assert_eq!(reused.identity.allocation_id, child.identity.allocation_id);
+        assert_eq!(catalog.containing(0x3008, 8), Ok(parent));
+        catalog.retire(parent.identity).unwrap();
+        assert_eq!(catalog.containing(0x3008, 8), Ok(outer));
+        assert_eq!(catalog.containing(0x7008, 8), Ok(reused));
+        assert_eq!(catalog.snapshot(child.identity), Err(ProviderAllocationError::StaleIdentity));
     }
 
     #[test]

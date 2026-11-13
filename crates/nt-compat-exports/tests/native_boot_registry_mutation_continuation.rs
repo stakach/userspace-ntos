@@ -11,6 +11,56 @@ fn source(name: &str) -> String {
 }
 
 #[test]
+fn hosted_system_create_keeps_its_reply_through_acknowledged_writer_busy() {
+    // The CM protocol test `real_server_busy_retry_keeps_caller_until_previous_writer_releases`
+    // exercises BUSY -> ACK -> fresh request identity. This checks that the native owner uses
+    // that contract before its terminal-failure path can reply to a first-boot caller.
+    let owner = source("registry_mutation_work.rs");
+    let advance = owner.find("unsafe fn advance(").expect("native mutation advancement");
+    let begin = owner[advance..].find("        Phase::Begin(attempt) => {")
+        .expect("retained BEGIN phase") + advance;
+    let prepare = owner[begin..].find("        Phase::Prepare(").expect("next phase") + begin;
+    let branch = &owner[begin..prepare];
+    let acknowledged = branch.find("if attempt.is_acknowledged()").expect("exact ACK gate");
+    let retry = branch.find("attempts.retry_acknowledged_busy(attempt)")
+        .expect("acknowledged BUSY must retry the same retained hosted owner");
+    let terminal = branch.find("attempts.take_failure(attempt)")
+        .expect("terminal no-effect failure path");
+    assert!(acknowledged < retry && retry < terminal,
+        "BUSY retry must precede terminal reply only after CM acknowledged the outcome");
+    assert!(branch[acknowledged..retry].contains("Caller::Hosted")
+        && branch[acknowledged..retry].contains("DEVICE_BUSY"),
+        "only the hosted BUSY outcome may retry under this native caller policy");
+}
+
+#[test]
+fn hosted_revision_retry_revalidates_retained_key_before_rebasing() {
+    // Executable CM tests cover stale durable generations and replaced mounts; this
+    // integration check binds their authority contract to the native hosted caller.
+    let owner = source("registry_mutation_work.rs");
+    let advance = owner.find("unsafe fn advance(").expect("native mutation advancement");
+    let begin = owner[advance..].find("        Phase::Begin(attempt) => {")
+        .expect("retained BEGIN phase") + advance;
+    let prepare = owner[begin..].find("        Phase::Prepare(").expect("next phase") + begin;
+    let branch = &owner[begin..prepare];
+    let validate = branch.find("retry::revalidate_hosted_revision(caller, mount, generation)?")
+        .expect("retained hosted target validation");
+    let rebase = branch.find("attempts.retry_acknowledged_revision(attempt, mount, generation)")
+        .expect("revision rebase");
+    assert!(branch[..validate].contains("mount != attempt.mount()") && validate < rebase,
+        "the retained mount and target must be checked before changing BEGIN generation");
+    let authority = source("registry_mutation_retry.rs");
+    let target = authority.find("registry_key_targets::system(key).ok_or(INVALID_KEY)?")
+        .expect("retained PM KeyRef target");
+    let durable = authority.find("query_leased_system_hive_key_at_durable_mount")
+        .expect("durable same-mount CM key query");
+    let path = authority.find("canon_path(&information.path) != nt_hive_core::canon_path(physical_path)")
+        .expect("original physical path comparison");
+    assert!(target < durable && durable < path && authority[path..].contains("Err(INVALID_KEY)"),
+        "a stale target or changed physical path must refuse replay");
+}
+
+#[test]
 fn bootstrap_cm_owner_retains_preparation_storage_and_exact_commit_receipt() {
     let owner = source("boot_registry_mutation_work.rs");
     for contract in [
@@ -64,10 +114,18 @@ fn bootstrap_ack_barriers_keep_acpi_before_driver_plan_and_setup_in_order() {
 #[test]
 fn acpi_boot_receive_refusal_retains_one_owner_and_blocks_driver_selection() {
     let acpi = source("acpi_platform.rs");
+    let policy_start = acpi.find("unsafe fn acpi_root_registry_policy(")
+        .expect("ACPI root policy selection");
     let start = acpi.find("pub(crate) unsafe fn publish_acpi_root_devnode_from_registry_policy(")
         .expect("ACPI root publication");
+    let policy = &acpi[policy_start..start];
+    assert!(policy.contains("config_manager_query_critical_device_binding("),
+        "the existing critical-device lookup must remain a registry policy input");
+    assert!(policy.contains("config_manager_query_driver_database_binding(ACPI_ROOT_COMPATIBLE_ID)"),
+        "the mounted DriverDatabase must supply policy when the critical key is absent");
     let acpi = &acpi[start..];
-    let decision = acpi.find("config_manager_query_critical_device_binding(").unwrap();
+    let decision = acpi.find("acpi_root_registry_policy(expected_generation)?")
+        .expect("one selected ACPI root policy before mutation");
     let gate = acpi.find("publish_boot_system_mutation(")
         .expect("ACPI boot must install retained CM work");
     assert!(decision < gate, "policy is captured once before retained work");

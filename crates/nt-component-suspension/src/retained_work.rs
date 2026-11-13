@@ -229,7 +229,7 @@ impl<M> RetainedWork<M> {
             .position(|slot| matches!(slot, Slot::Vacant))
             .ok_or(RetainedWorkError::NoCapacity)?;
         let identity = counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 if next == 0 {
                     None
                 } else {

@@ -9,6 +9,8 @@
 
 extern crate alloc;
 
+pub mod pofx;
+
 use alloc::vec::Vec;
 
 pub use nt_power_types::{

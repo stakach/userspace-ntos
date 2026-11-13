@@ -19,6 +19,7 @@ use super::exception::RuntimeFunction;
 
 const RF_UNSORTED: u32 = 1;
 const RF_CALLBACK: u32 = 2;
+const RF_GROWABLE: u32 = 4;
 
 /// `LIST_ENTRY`, exposed by `RtlGetFunctionTableListHead`.
 #[repr(C)]
@@ -52,6 +53,7 @@ pub type RuntimeFunctionCallback =
 struct OwnedDynamicFunctionTable {
     public: DynamicFunctionTable,
     allocation_size: usize,
+    max_count: u32,
 }
 
 struct RegistryState {
@@ -172,6 +174,95 @@ impl DynamicFunctionTables {
             return false;
         };
         self.insert_tail(node);
+        true
+    }
+
+    /// Register a caller-owned table whose visible row count may grow without changing its range.
+    /// The returned opaque handle is the registry allocation, never the caller's row pointer.
+    ///
+    /// # Safety
+    /// `function_table` must remain readable for each count subsequently published by `grow`.
+    pub unsafe fn add_growable(
+        self: Pin<&Self>,
+        function_table: *mut RuntimeFunction,
+        entry_count: u32,
+        maximum_count: u32,
+        base_address: u64,
+        maximum_address: u64,
+    ) -> Option<*mut c_void> {
+        if entry_count > maximum_count
+            || base_address >= maximum_address
+            || (maximum_count != 0 && function_table.is_null())
+        {
+            return None;
+        }
+        let node = unsafe {
+            allocate_node(
+                function_table,
+                entry_count,
+                base_address,
+                maximum_address,
+                base_address,
+                None,
+                ptr::null_mut(),
+                RF_GROWABLE,
+                &[],
+            )
+        }?;
+        unsafe { (*node).max_count = maximum_count };
+        self.insert_tail(node);
+        Some(node.cast())
+    }
+
+    /// Publish a larger prefix, bounded by the original maximum count.
+    pub fn grow(self: Pin<&Self>, handle: *mut c_void, count: u32) -> bool {
+        let this = self.get_ref();
+        let _guard = this.lock();
+        unsafe {
+            let (_, head) = this.state_and_head();
+            let mut link = (*head).flink;
+            while link != head {
+                let node = link.cast::<OwnedDynamicFunctionTable>();
+                if node.cast::<c_void>() == handle && (*node).public.table_type == RF_GROWABLE {
+                    if count >= (*node).public.entry_count && count <= (*node).max_count {
+                        (*node).public.entry_count = count;
+                        return true;
+                    }
+                    return false;
+                }
+                link = (*link).flink;
+            }
+        }
+        false
+    }
+
+    /// Remove one growable registration by its exact opaque handle.
+    pub fn delete_growable(self: Pin<&Self>, handle: *mut c_void) -> bool {
+        let this = self.get_ref();
+        let guard = this.lock();
+        let removed = unsafe {
+            let (_, head) = this.state_and_head();
+            let mut link = (*head).flink;
+            let mut found = ptr::null_mut();
+            while link != head {
+                let node = link.cast::<OwnedDynamicFunctionTable>();
+                if node.cast::<c_void>() == handle && (*node).public.table_type == RF_GROWABLE {
+                    let previous = (*link).blink;
+                    let next = (*link).flink;
+                    (*previous).flink = next;
+                    (*next).blink = previous;
+                    found = node;
+                    break;
+                }
+                link = (*link).flink;
+            }
+            found
+        };
+        drop(guard);
+        if removed.is_null() {
+            return false;
+        }
+        unsafe { free_node(removed) };
         true
     }
 
@@ -420,6 +511,7 @@ unsafe fn allocate_node(
                     entry_count,
                 },
                 allocation_size,
+                max_count: 0,
             },
         )
     };
@@ -693,6 +785,58 @@ mod tests {
         assert_eq!(
             unsafe { tables.as_ref().lookup(0x7020, ptr::null_mut()) },
             ptr::addr_of_mut!(row)
+        );
+    }
+
+    #[test]
+    fn growable_table_publishes_only_current_rows_and_deletes_by_handle() {
+        let tables = registry();
+        let mut rows = [
+            RuntimeFunction {
+                begin: 0x10,
+                end: 0x20,
+                unwind_info: 0x30,
+            },
+            RuntimeFunction {
+                begin: 0x30,
+                end: 0x40,
+                unwind_info: 0x50,
+            },
+        ];
+        let handle = unsafe {
+            tables
+                .as_ref()
+                .add_growable(rows.as_mut_ptr(), 1, 2, 0x8000, 0x8100)
+        }
+        .expect("growable registration");
+        assert_eq!(
+            unsafe { tables.as_ref().lookup(0x8010, ptr::null_mut()) },
+            rows.as_mut_ptr()
+        );
+        assert!(unsafe { tables.as_ref().lookup(0x8030, ptr::null_mut()) }.is_null());
+        assert!(!tables.as_ref().grow(handle, 3));
+        assert!(tables.as_ref().grow(handle, 2));
+        assert_eq!(
+            unsafe { tables.as_ref().lookup(0x8030, ptr::null_mut()) },
+            unsafe { rows.as_mut_ptr().add(1) }
+        );
+        assert!(tables.as_ref().delete_growable(handle));
+        assert!(unsafe { tables.as_ref().lookup(0x8010, ptr::null_mut()) }.is_null());
+        assert!(!tables.as_ref().delete_growable(handle));
+    }
+
+    #[test]
+    fn growable_rejects_invalid_count_without_publishing() {
+        let tables = registry();
+        let mut row = RuntimeFunction {
+            begin: 0,
+            end: 8,
+            unwind_info: 0,
+        };
+        assert!(unsafe { tables.as_ref().add_growable(&mut row, 2, 1, 0x9000, 0x9100) }.is_none());
+        assert_eq!(
+            unsafe { tables.as_ref().list_head().as_ref().unwrap().flink },
+            tables.as_ref().list_head()
         );
     }
 }

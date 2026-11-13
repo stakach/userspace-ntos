@@ -34,7 +34,7 @@ impl ReceiptBudget {
     }
 
     pub(crate) fn claim(&self, now: Option<u64>) -> Option<BudgetReceipt> {
-        let previous = self.state.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+        let previous = self.state.try_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
             next_claim(state, now).map(|(next, _)| next)
         }).ok()?;
         next_claim(previous, now).map(|(_, receipt)| receipt)

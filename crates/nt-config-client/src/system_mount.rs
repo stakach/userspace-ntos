@@ -1,6 +1,9 @@
 //! Checked observations of CM's mounted SYSTEM incarnation, not exclusive mount ownership.
 
-use super::{Backend, ConfigClient, STATUS_INVALID_PARAMETER, STATUS_SUCCESS};
+use super::{
+    Backend, ConfigClient, LeasedHiveKeyInformation, SystemHiveKeyLease, STATUS_DEVICE_BUSY,
+    STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
+};
 use core::num::NonZeroU64;
 use nt_config_abi::{hive_mount, opcode, CmSystemHiveMountRequest, CM_ABI_VERSION};
 
@@ -44,6 +47,26 @@ impl SystemHiveMountState {
 }
 
 impl<B: Backend> ConfigClient<B> {
+    /// Revalidate a retained key for a revision retry only after the caller's durable
+    /// generation has caught up with CM. A newer CM observation is not proof that
+    /// the writer which published it has completed its durable commit.
+    pub fn query_leased_system_hive_key_at_durable_mount(
+        &mut self,
+        lease: SystemHiveKeyLease,
+        mount: SystemHiveMount,
+        durable_generation: u64,
+    ) -> Result<LeasedHiveKeyInformation, i32> {
+        if durable_generation == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let information = self.query_leased_system_hive_key_information(lease)?;
+        if information.mount_generation != durable_generation {
+            return Err(STATUS_DEVICE_BUSY);
+        }
+        self.validate_system_hive_mount(mount, durable_generation)?;
+        Ok(information)
+    }
+
     /// Discover the mount currently serving exactly the caller's semantic generation.
     /// Never use discovery to silently replace a previously retained mount identity.
     pub fn query_system_hive_mount(

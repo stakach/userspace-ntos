@@ -14,7 +14,18 @@ pub struct ThreadProjection {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase { Running, Held, ReleaseEntered }
+enum Phase { Running, HoldReserved(u64), Held, ReleaseEntered }
+
+/// Move-only claim that the exact projection row has storage before entering a native hold.
+/// The owner must settle it through acknowledged hold or a certified no-effect refusal.
+#[derive(Debug)]
+#[must_use = "retain the projection reservation across the native hold result"]
+pub struct ProjectionHoldReservation<R, D> {
+    route: R,
+    dispatch: D,
+    index: usize,
+    issuance: u64,
+}
 
 struct Entry<R, D> {
     route: R,
@@ -27,10 +38,13 @@ struct Entry<R, D> {
 
 /// Native callers authenticate routes and hold physical execution before changing projections.
 /// No scope exit retires these entries: parked or uncertain work retains both body references.
-pub struct ProjectionOwners<R, D> { entries: Vec<Entry<R, D>> }
+pub struct ProjectionOwners<R, D> {
+    entries: Vec<Entry<R, D>>,
+    next_hold_issuance: u64,
+}
 
 impl<R: Copy + Eq, D: Copy + Eq> ProjectionOwners<R, D> {
-    pub const fn new() -> Self { Self { entries: Vec::new() } }
+    pub const fn new() -> Self { Self { entries: Vec::new(), next_hold_issuance: 0 } }
 
     pub fn contains(&self, route: R) -> bool {
         self.entries.iter().any(|entry| entry.route == route)
@@ -95,14 +109,49 @@ impl<R: Copy + Eq, D: Copy + Eq> ProjectionOwners<R, D> {
         Ok(())
     }
 
-    pub fn hold(&mut self, route: R, dispatch: D) -> Result<bool, u32> {
-        let Some(entry) = self.entries.iter_mut().find(|entry| entry.route == route
+    /// Claim the exact row before native execution hold. This transition allocates nothing and
+    /// prevents completion, restore, and a second hold until the native result settles it.
+    pub fn prepare_hold(&mut self, route: R, dispatch: D)
+        -> Result<Option<ProjectionHoldReservation<R, D>>, u32> {
+        let Some(index) = self.entries.iter().position(|entry| entry.route == route
             && entry.dispatch == Some(dispatch)) else {
-            return if self.contains(route) { Err(STATUS_INVALID_HANDLE) } else { Ok(false) };
+            return if self.contains(route) { Err(STATUS_INVALID_HANDLE) } else { Ok(None) };
         };
-        if entry.dispatch != Some(dispatch) || entry.phase != Phase::Running { return Err(STATUS_INVALID_HANDLE); }
+        if self.entries[index].phase != Phase::Running { return Err(STATUS_INVALID_HANDLE); }
+        let issuance = self.next_hold_issuance.checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        self.next_hold_issuance = issuance;
+        self.entries[index].phase = Phase::HoldReserved(issuance);
+        Ok(Some(ProjectionHoldReservation { route, dispatch, index, issuance }))
+    }
+
+    /// The physical hold has taken effect. The exact live reservation has an infallible,
+    /// allocation-free publication path; an invalidated lease is returned to its owner.
+    pub fn acknowledge_hold(&mut self, reservation: ProjectionHoldReservation<R, D>)
+        -> Result<(), (u32, ProjectionHoldReservation<R, D>)> {
+        let Some(entry) = self.entries.get_mut(reservation.index) else {
+            return Err((STATUS_INVALID_HANDLE, reservation));
+        };
+        if entry.route != reservation.route || entry.dispatch != Some(reservation.dispatch)
+            || entry.phase != Phase::HoldReserved(reservation.issuance) {
+            return Err((STATUS_INVALID_HANDLE, reservation));
+        }
         entry.phase = Phase::Held;
-        Ok(true)
+        Ok(())
+    }
+
+    /// Only a certified no-effect native result may return this row to Running.
+    pub fn cancel_hold_no_effects(&mut self, reservation: ProjectionHoldReservation<R, D>)
+        -> Result<(), (u32, ProjectionHoldReservation<R, D>)> {
+        let Some(entry) = self.entries.get_mut(reservation.index) else {
+            return Err((STATUS_INVALID_HANDLE, reservation));
+        };
+        if entry.route != reservation.route || entry.dispatch != Some(reservation.dispatch)
+            || entry.phase != Phase::HoldReserved(reservation.issuance) {
+            return Err((STATUS_INVALID_HANDLE, reservation));
+        }
+        entry.phase = Phase::Running;
+        Ok(())
     }
 
     /// The physical hold is still owned. A failed release must not replay this transition.

@@ -16,7 +16,7 @@ static NEXT_STORAGE_NONCE: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn next_storage_nonce() -> u64 {
     NEXT_STORAGE_NONCE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
         .expect("SYSTEM mutation storage nonce exhausted")
 }
 

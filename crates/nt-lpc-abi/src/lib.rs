@@ -76,6 +76,9 @@ pub mod opcode {
     pub const LPC_OP_RELEASE_PORT_OBJECT_WITH_LIFETIME: u16 = 0x2218;
     pub const LPC_OP_CLOSE_PROCESS_PORTS: u16 = 0x2219;
     pub const LPC_OP_RETAINED_REQUEST_PORT_OUTCOME: u16 = 0x221a;
+    /// Executive-owned listener accepts one exact queued client as one broker effect.
+    pub const LPC_OP_KERNEL_ACCEPT_CONNECT: u16 = 0x221b;
+    pub const LPC_OP_KERNEL_CONNECT_NAMED: u16 = 0x221c;
 }
 
 /// True if `op` is an LPC opcode.
@@ -294,6 +297,62 @@ pub fn port_message_total_length(header: [u8; 4]) -> Option<usize> {
     Some(total_length)
 }
 
+/// The supported kernel LPC form is a synchronous retained-port request with one bounded reply.
+/// The native adapter checks the referenced port body separately before using this shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelSyncError {
+    UnsupportedFlags,
+    UnsupportedTimeout,
+    InvalidMessage,
+    InvalidReply,
+    BufferTooSmall,
+}
+
+pub fn kernel_sync_send_length(
+    flags: u32,
+    message: &[u8],
+    receive_capacity: usize,
+    timeout_present: bool,
+) -> Result<usize, KernelSyncError> {
+    if flags != 0x0002_0000 {
+        return Err(KernelSyncError::UnsupportedFlags);
+    }
+    if timeout_present {
+        return Err(KernelSyncError::UnsupportedTimeout);
+    }
+    if receive_capacity < PORT_MESSAGE_HEADER_LEN {
+        return Err(KernelSyncError::BufferTooSmall);
+    }
+    let header: [u8; 4] = message
+        .get(..4)
+        .and_then(|header| header.try_into().ok())
+        .ok_or(KernelSyncError::InvalidMessage)?;
+    let length = port_message_total_length(header).ok_or(KernelSyncError::InvalidMessage)?;
+    (message.len() == length)
+        .then_some(length)
+        .ok_or(KernelSyncError::InvalidMessage)
+}
+
+pub fn kernel_sync_reply_length(
+    message: &[u8],
+    receive_capacity: usize,
+) -> Result<usize, KernelSyncError> {
+    let header: [u8; 4] = message
+        .get(..4)
+        .and_then(|header| header.try_into().ok())
+        .ok_or(KernelSyncError::InvalidReply)?;
+    let length = port_message_total_length(header).ok_or(KernelSyncError::InvalidReply)?;
+    if message.len() != length
+        || message.get(4..6) != Some(&msg_type::LPC_REPLY.to_le_bytes()[..])
+    {
+        return Err(KernelSyncError::InvalidReply);
+    }
+    if length > receive_capacity {
+        return Err(KernelSyncError::BufferTooSmall);
+    }
+    Ok(length)
+}
+
 /// Validate a native connection-request message supplied to `NtAcceptConnectPort` and return the
 /// broker connection identity plus the exact server-authored connection-information bytes. The
 /// payload excludes any alignment padding between `DataLength` and `TotalLength`.
@@ -354,6 +413,32 @@ pub struct LpcCreatePortRequest {
     pub server_process: u64,
     /// Kernel-supplied creator `CLIENT_ID.UniqueThread`.
     pub server_thread: u64,
+}
+
+/// Atomic kernel-listener receive, accept, and complete. The caller holds the
+/// original client connect Reply while the broker commits this exact effect.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LpcKernelAcceptConnectRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub _reserved2: u32,
+    pub listen_port: u64,
+    pub connection_id: u64,
+    pub client_process: u64,
+    pub client_thread: u64,
+}
+
+/// Kernel-owned reverse connection, resolving the live listen object atomically.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LpcKernelConnectNamedRequest {
+    pub abi_size: u16,
+    pub _reserved: u16,
+    pub name_offset: u32,
+    pub name_len_bytes: u32,
+    pub _reserved2: u32,
+    pub server_process: u64,
 }
 
 /// `LPC_OP_CONNECT_PORT` — connect to a named port; carries the connection-info blob.
@@ -667,6 +752,7 @@ pub struct LpcReply {
 const _: () = {
     use core::mem::{align_of, size_of};
     assert!(size_of::<LpcCreatePortRequest>() == 40);
+    assert!(size_of::<LpcKernelAcceptConnectRequest>() == 40);
     assert!(size_of::<LpcConnectPortRequest>() == 48);
     assert!(size_of::<LpcConnectionRequestMetadata>() == 32);
     assert!(size_of::<LpcDataMessageMetadata>() == 40);
@@ -715,6 +801,28 @@ mod tests {
         assert_eq!(port_message_total_length([5, 0, 44, 0]), None);
         assert_eq!(port_message_total_length([0, 0, 39, 0]), None);
         assert_eq!(port_message_total_length([0, 0, 1, 2]), None);
+    }
+
+    #[test]
+    fn kernel_sync_send_wait_receive_validates_request_and_reply_capacity() {
+        let mut request = [0u8; PORT_MESSAGE_HEADER_LEN];
+        request[2..4].copy_from_slice(&(PORT_MESSAGE_HEADER_LEN as u16).to_le_bytes());
+        assert_eq!(kernel_sync_send_length(0x20000, &request, 0x178, false), Ok(request.len()));
+        assert_eq!(kernel_sync_send_length(0, &request, 0x178, false), Err(KernelSyncError::UnsupportedFlags));
+        assert_eq!(kernel_sync_send_length(0x20000, &request, 8, false), Err(KernelSyncError::BufferTooSmall));
+        assert_eq!(kernel_sync_send_length(0x20000, &request, 0x178, true), Err(KernelSyncError::UnsupportedTimeout));
+        request[2..4].copy_from_slice(&0x201u16.to_le_bytes());
+        assert_eq!(kernel_sync_send_length(0x20000, &request, 0x178, false), Err(KernelSyncError::InvalidMessage));
+
+        let mut reply = [0u8; PORT_MESSAGE_HEADER_LEN + 8];
+        let reply_len = reply.len() as u16;
+        reply[0..2].copy_from_slice(&8u16.to_le_bytes());
+        reply[2..4].copy_from_slice(&reply_len.to_le_bytes());
+        reply[4..6].copy_from_slice(&msg_type::LPC_REPLY.to_le_bytes());
+        assert_eq!(kernel_sync_reply_length(&reply, 0x178), Ok(reply.len()));
+        assert_eq!(kernel_sync_reply_length(&reply, PORT_MESSAGE_HEADER_LEN), Err(KernelSyncError::BufferTooSmall));
+        reply[4..6].copy_from_slice(&msg_type::LPC_DATAGRAM.to_le_bytes());
+        assert_eq!(kernel_sync_reply_length(&reply, 0x178), Err(KernelSyncError::InvalidReply));
     }
 
     #[test]

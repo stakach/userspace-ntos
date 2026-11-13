@@ -73,16 +73,6 @@ fn hex_nibble(n: u8) -> u8 {
     }
 }
 
-#[inline]
-fn from_hex(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
 fn push_hex_u32(out: &mut Vec<u16>, v: u32, digits: usize) {
     for i in (0..digits).rev() {
         let nib = ((v >> (i * 4)) & 0xF) as u8;
@@ -113,45 +103,7 @@ pub fn guid_to_string(g: &Guid) -> Vec<u16> {
 
 /// `RtlGUIDFromString`: parse the exact native `{8-4-4-4-12}` syntax.
 pub fn guid_from_string(s: &[u16]) -> Option<Guid> {
-    if s.len() != 38
-        || s[0] != b'{' as u16
-        || s[9] != b'-' as u16
-        || s[14] != b'-' as u16
-        || s[19] != b'-' as u16
-        || s[24] != b'-' as u16
-        || s[37] != b'}' as u16
-    {
-        return None;
-    }
-    let mut nibbles = [0u8; 32];
-    let mut count = 0usize;
-    for (index, &unit) in s.iter().enumerate() {
-        if matches!(index, 0 | 9 | 14 | 19 | 24 | 37) {
-            continue;
-        }
-        if unit > 0x7f || count == nibbles.len() {
-            return None;
-        }
-        nibbles[count] = from_hex(unit as u8)?;
-        count += 1;
-    }
-    let byte = |i: usize| (nibbles[i * 2] << 4) | nibbles[i * 2 + 1];
-    let data1 = ((byte(0) as u32) << 24)
-        | ((byte(1) as u32) << 16)
-        | ((byte(2) as u32) << 8)
-        | byte(3) as u32;
-    let data2 = ((byte(4) as u16) << 8) | byte(5) as u16;
-    let data3 = ((byte(6) as u16) << 8) | byte(7) as u16;
-    let mut data4 = [0u8; 8];
-    for (i, slot) in data4.iter_mut().enumerate() {
-        *slot = byte(8 + i);
-    }
-    Some(Guid {
-        data1,
-        data2,
-        data3,
-        data4,
-    })
+    nt_compat_exports::rtl::guid::guid_from_string(s).map(Guid::from_windows_bytes)
 }
 
 #[cfg(test)]

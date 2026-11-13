@@ -363,6 +363,20 @@ fn sequential_window_is_bounded_by_section_and_eof() {
 }
 
 #[test]
+fn eight_page_window_copies_through_one_page_scratch_without_overflow() {
+    let plan = plan_data_section_read_window(0, 8 * DATA_PAGE_SIZE as u64,
+        8 * DATA_PAGE_SIZE as u64, 8).unwrap();
+    assert_eq!(plan.length(), 8 * DATA_PAGE_SIZE);
+    for page in 0..8 {
+        assert_eq!(plan.next_copy_len(page * DATA_PAGE_SIZE, DATA_PAGE_SIZE),
+            Some(DATA_PAGE_SIZE));
+    }
+    assert_eq!(plan.next_copy_len(plan.length() - 17, DATA_PAGE_SIZE), Some(17));
+    assert_eq!(plan.next_copy_len(plan.length(), DATA_PAGE_SIZE), None);
+    assert_eq!(plan.next_copy_len(0, 0), None);
+}
+
+#[test]
 fn read_errors_and_short_or_oversized_success_never_form_a_valid_page() {
     for (status, short, expected) in [
         (0, -1, STATUS_IO_DEVICE_ERROR),

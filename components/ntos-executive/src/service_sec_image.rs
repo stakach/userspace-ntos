@@ -12,8 +12,15 @@ use hosted_quiesce::dump_all_hosted_thread_quiesce;
 
 #[path = "component_continuation.rs"]
 mod component_continuation;
-use component_continuation::{HostedNativeContinuation, PendingComponentDispatch};
+use component_continuation::{HostedContinuationDestination, HostedNativeContinuation,
+    PendingComponentDispatch, PendingNestedTerminalDispatch};
 pub(crate) use component_continuation::{ComponentNativeContinuation, ComponentSuspensionCompletion};
+#[path = "root_maintenance_owner.rs"]
+pub(crate) mod root_maintenance_owner;
+#[path = "root_ingress_owner.rs"]
+pub(crate) mod root_ingress_owner;
+#[path = "nested_restore_owner.rs"]
+pub(crate) mod nested_restore_owner;
 
 #[path = "bootstrap_wait_selftest.rs"]
 pub(crate) mod bootstrap_wait_selftest;
@@ -44,6 +51,20 @@ mod pending_file_busy;
 mod pending_file_delivery;
 #[path = "file_dispatch_handoff.rs"]
 mod file_dispatch_handoff;
+#[path = "mounted_create_owner_trace.rs"]
+pub(crate) mod mounted_create_owner_trace;
+#[path = "mounted_read_owner_trace.rs"]
+pub(crate) mod mounted_read_owner_trace;
+#[path = "pending_pipe_read_trace.rs"]
+pub(crate) mod pending_pipe_read_trace;
+#[path = "mounted_read_lifetime_trace.rs"]
+pub(crate) mod mounted_read_lifetime_trace;
+#[path = "mounted_installer_file_trace.rs"]
+pub(crate) mod mounted_installer_file_trace;
+#[path = "native_process_time_census.rs"]
+pub(crate) mod native_process_time_census;
+#[path = "installer_child_span_census.rs"]
+pub(crate) mod installer_child_span_census;
 #[path = "inline_file_retirement.rs"]
 pub(crate) mod inline_file_retirement;
 #[path = "hosted_gui_client_info.rs"]
@@ -51,13 +72,148 @@ mod hosted_gui_client_info;
 #[path = "provider_file_objects.rs"]
 mod provider_file_objects;
 pub(crate) use provider_file_objects::service_win32k_file_object_request;
+#[path = "process_information_native.rs"]
+mod process_information_native;
+pub(crate) use process_information_native::service_win32k_process_query_request;
 
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
+const PRIMARY_ALIAS_RETRY_DELAY_100NS: u64 = 10_000_000;
+static PRIMARY_ALIAS_RETRY_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+static PRIMARY_ALIAS_RETRY_WAKE_PENDING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn primary_alias_retry_deadline() -> Option<u64> {
+    let deadline = PRIMARY_ALIAS_RETRY_DEADLINE.load(Ordering::Acquire);
+    (deadline != u64::MAX).then_some(deadline)
+}
+
+/// The timer owner only records demand. The service loop owns the exact TCB and
+/// process generation and is the only place that may retry the native effect.
+pub(crate) fn primary_alias_retry_wake_due(now: u64) -> u64 {
+    let Some(deadline) = primary_alias_retry_deadline() else { return 0 };
+    if now < deadline { return 0; }
+    if PRIMARY_ALIAS_RETRY_DEADLINE.compare_exchange(
+        deadline, u64::MAX, Ordering::AcqRel, Ordering::Acquire,
+    ).is_err() { return 0; }
+    PRIMARY_ALIAS_RETRY_WAKE_PENDING.store(true, Ordering::Release);
+    1
+}
+
+#[cfg(not(feature = "mup-provider-kernel-only"))]
+unsafe fn attempt_primary_alias_activation(
+    handler: &mut ExecNtHandler,
+    activation: &mut nt_hosted_runtime::PrimaryAliasActivation,
+) {
+    let owner = activation.owner();
+    if !activation.ready(owner) { return; }
+    if handler.hosted_process_generation(owner.process_index) != Some(owner.process_generation) {
+        activation.fail_uncertain(owner);
+        print_str(b"[debug-filter] primary owner changed before alias installation\n");
+        return;
+    }
+    match hosted_debug_filter_process::install_hosted_user_alias(handler, owner.process_index) {
+        Ok(()) => {
+            let resume_error = handler.start_configured_initial_thread(owner.process_index, owner.tcb);
+            if resume_error == nt_user_callback::STATUS_PENDING as u32
+                && crate::exec_handler::initial_thread_creation::configured_retry_no_effect(
+                    handler, owner.process_index, owner.tcb,
+                ) {
+                // A pre-entry Win32k shared-page refusal retained the exact configured plan.
+                // The existing timer wakes this same owner after other page work can settle.
+                let deadline = activation.fail_definitive(
+                    owner, monotonic_time_100ns(), PRIMARY_ALIAS_RETRY_DELAY_100NS,
+                ).expect("configured initial retry owns exact alias activation");
+                PRIMARY_ALIAS_RETRY_DEADLINE.store(deadline, Ordering::Release);
+                let _ = rearm_registered_delay_timer();
+                return;
+            }
+            if resume_error != 0 {
+                // Initial-thread creation can have entered native effects. Do not
+                // replay it from a timer merely because it returned an error.
+                activation.fail_uncertain(owner);
+                print_str(b"[thread-life] primary resume after alias installation failed pi=");
+                print_u64(owner.process_index as u64);
+                print_str(b" error=");
+                print_u64(u64::from(resume_error));
+                print_str(b"\n");
+                return;
+            }
+            activation.start(owner);
+            if let Some(tid) = handler.pm_main_tid_for_pi(owner.process_index) {
+                handler.observe_desktop_thread_activation(u64::from(tid));
+            }
+        }
+        Err(error) if error.retained_uncertain => {
+            activation.fail_uncertain(owner);
+            print_str(b"[debug-filter] primary alias retained uncertain pi=");
+            print_u64(owner.process_index as u64);
+            print_str(b" status=0x");
+            print_hex(error.status);
+            print_str(b"\n");
+        }
+        Err(error) => {
+            let now = monotonic_time_100ns();
+            let deadline = activation.fail_definitive(
+                owner, now, PRIMARY_ALIAS_RETRY_DELAY_100NS,
+            ).expect("ready exact primary alias owner");
+            PRIMARY_ALIAS_RETRY_DEADLINE.store(deadline, Ordering::Release);
+            let rearm = rearm_registered_delay_timer();
+            print_str(b"[debug-filter] primary alias retry pi=");
+            print_u64(owner.process_index as u64);
+            print_str(b" status=0x");
+            print_hex(error.status);
+            print_str(b" timer=");
+            print_u64(rearm.owner_available() as u64);
+            print_str(b"\n");
+        }
+    }
+}
+
+#[cfg(not(feature = "mup-provider-kernel-only"))]
+unsafe fn service_primary_alias_retry(
+    handler: &mut ExecNtHandler,
+    activation: &mut nt_hosted_runtime::PrimaryAliasActivation,
+) {
+    if !PRIMARY_ALIAS_RETRY_WAKE_PENDING.swap(false, Ordering::AcqRel) { return; }
+    let owner = activation.owner();
+    if !activation.wake_due(owner, monotonic_time_100ns()) { return; }
+    attempt_primary_alias_activation(handler, activation);
+}
 static FILE_IO_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
 static PIPE_TRANSCEIVE_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut FILE_IO_COPY_WORK: [u8; 4096] = [0; 4096];
 static CALLBACK_MESSAGE_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_MESSAGE_TRACE: AtomicU64 = AtomicU64::new(0);
+static CSRSS_RESUME_REPLIES: AtomicU64 = AtomicU64::new(0);
+static CSRSS_POST_RESUME_TCB: AtomicU64 = AtomicU64::new(0);
+
+/// Bounded boot diagnostic: sample the CSRSS main thread after its SB worker resume reply.
+pub(crate) fn trace_csrss_post_resume_census(census: u64) {
+    if census > 5 {
+        return;
+    }
+    let tcb = CSRSS_POST_RESUME_TCB.load(Ordering::Relaxed);
+    if tcb == 0 {
+        return;
+    }
+    let mut regs = [0u64; 20];
+    let valid = unsafe { crate::win32k_glue::tcb_read_regs20_checked(tcb, &mut regs) };
+    print_str(b"[csrss-post-resume] census=");
+    print_u64(census);
+    print_str(b" tcb=0x");
+    print_hex_u64(tcb);
+    print_str(b" registers-valid=");
+    print_u64(valid as u64);
+    if valid {
+        print_str(b" rip=0x");
+        print_hex_u64(regs[0]);
+        print_str(b" rsp=0x");
+        print_hex_u64(regs[1]);
+        print_str(b" rax=0x");
+        print_hex_u64(regs[3]);
+    }
+    print_str(b"\n");
+    unsafe { crate::win32k_glue::trace_hosted_tcb_debug_state(b"csrss-post-resume", tcb, 0) };
+}
 
 pub(crate) fn synchronous_file_retry_stats() -> (nt_io_manager::SynchronousFileRetryStats, u64, u64, u64) {
     let stats = unsafe { (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).retry_stats() };
@@ -160,6 +316,102 @@ static DEF_SET_TEXT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static SET_CURSOR_ICON_DATA_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static STRETCH_DIBITS_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static FIND_CURSOR_ICON_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
+static CURSOR_LOOKUP_OWNER_TRACE: AtomicU64 = AtomicU64::new(0);
+static CURSOR_LOOKUP_LAST_INCOMPLETE_DISPATCH: AtomicU64 = AtomicU64::new(0);
+static CURSOR_LOOKUP_LAST_INCOMPLETE_LANE_INDEX: AtomicU64 = AtomicU64::new(0);
+static CURSOR_LOOKUP_LAST_INCOMPLETE_LANE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn cursor_lookup_last_incomplete() -> Option<(u64, nt_component_suspension::LaneHandle)> {
+    let dispatch = CURSOR_LOOKUP_LAST_INCOMPLETE_DISPATCH.load(Ordering::Relaxed);
+    (dispatch != 0).then_some((dispatch, nt_component_suspension::LaneHandle {
+        index: CURSOR_LOOKUP_LAST_INCOMPLETE_LANE_INDEX.load(Ordering::Relaxed) as u32,
+        generation: CURSOR_LOOKUP_LAST_INCOMPLETE_LANE_GENERATION.load(Ordering::Relaxed),
+    }))
+}
+
+/// Log copied pump flags before its completion moves into an exact pending owner.
+/// This may run at an isolated provider boundary, so it never reads CALLS.
+pub(crate) fn trace_cursor_lookup_pump(
+    client: win32k_glue::Win32kClientContext,
+    ssn: u64,
+    dispatch_id: u64,
+    lane: nt_component_suspension::LaneHandle,
+    flags: u16,
+) {
+    if ssn != 0x103d
+        || CURSOR_LOOKUP_OWNER_TRACE.fetch_add(1, Ordering::Relaxed) >= 4096
+    {
+        return;
+    }
+    use core::fmt::Write;
+    let mut record = nt_printf::record::RecordBuffer::<384>::new();
+    let _ = writeln!(record,
+        "[cursor-lookup-pump] pi/pid/gen/tid/tcb={}/{}/{}/{}/{} dispatch={} lane={:?} flags=0x{:03x} bits=complete/callback/provider/lpc/receive/root/service/maintenance/nested/quarantine",
+        client.pi, client.pid, client.generation, client.tid, client.tcb,
+        dispatch_id, lane, flags);
+    sel4_rt::print_record(record.bytes());
+}
+
+/// Bounded root-side trace of one original Call across GUI staging and provider entry.
+/// Neither the copied key nor the numeric Reply authorizes a settlement.
+pub(crate) unsafe fn trace_cursor_lookup_owner(
+    stage: &str,
+    client: win32k_glue::Win32kClientContext,
+    ssn: u64,
+    dispatch_id: u64,
+    lane: Option<nt_component_suspension::LaneHandle>,
+    entered: bool,
+    not_completed: bool,
+    callback_suspended: bool,
+) {
+    if ssn != 0x103d {
+        return;
+    }
+    if stage == "provider-return" && not_completed {
+        if let Some(lane) = lane {
+            CURSOR_LOOKUP_LAST_INCOMPLETE_LANE_INDEX.store(u64::from(lane.index), Ordering::Relaxed);
+            CURSOR_LOOKUP_LAST_INCOMPLETE_LANE_GENERATION.store(lane.generation, Ordering::Relaxed);
+        }
+        CURSOR_LOOKUP_LAST_INCOMPLETE_DISPATCH.store(dispatch_id, Ordering::Relaxed);
+    }
+    if CURSOR_LOOKUP_OWNER_TRACE.fetch_add(1, Ordering::Relaxed) >= 4096 {
+        return;
+    }
+    use core::fmt::Write;
+    let key = crate::spawn_hosts::shared_ingress::owner::runtime::observed_win32k_call_for_client(
+        client, ssn,
+    );
+    let mut record = nt_printf::record::RecordBuffer::<512>::new();
+    let _ = writeln!(record,
+        "[cursor-lookup-owner] stage={} pi/pid/gen/tid/badge/tcb={}/{}/{}/{}/{}/{} original-tcb/seq/reply={:?} dispatch={} lane={:?} entered={} not-completed={} callback-suspended={}",
+        stage, client.pi, client.pid, client.generation, client.tid, client.badge, client.tcb,
+        key, dispatch_id, lane, u8::from(entered), u8::from(not_completed),
+        u8::from(callback_suspended));
+    sel4_rt::print_record(record.bytes());
+}
+
+/// The provider entry boundary may be nested: log copied dispatch metadata only.
+/// CALLS is root owned and must never be scanned from the isolated provider pump.
+pub(crate) fn trace_cursor_lookup_lane(
+    stage: &str,
+    client: win32k_glue::Win32kClientContext,
+    ssn: u64,
+    dispatch_id: u64,
+    lane: nt_component_suspension::LaneHandle,
+) {
+    if ssn != 0x103d
+        || CURSOR_LOOKUP_OWNER_TRACE.fetch_add(1, Ordering::Relaxed) >= 4096
+    {
+        return;
+    }
+    use core::fmt::Write;
+    let mut record = nt_printf::record::RecordBuffer::<512>::new();
+    let _ = writeln!(record,
+        "[cursor-lookup-owner] stage={} pi/pid/gen/tid/badge/tcb={}/{}/{}/{}/{}/{} dispatch={} lane={:?} original-key=root-only",
+        stage, client.pi, client.pid, client.generation, client.tid, client.badge, client.tcb,
+        dispatch_id, lane);
+    sel4_rt::print_record(record.bytes());
+}
 static SESSION_CURSOR_SERVE_TRACE: AtomicU64 = AtomicU64::new(0);
 static EXT_TEXT_OUT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
 static PAINTSTRUCT_MARSHAL_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -180,6 +432,8 @@ static mut SERVICE_EXE_IMAGE_CATALOG_WORK: nt_exe_image::OwnedHostedImageCatalog
 static mut SERVICE_HOSTED_LOADED_IMAGES_WORK: HostedLoadedImageTable =
     HostedLoadedImageTable::new();
 static mut SERVICE_GENERIC_SECTIONS_WORK: GenericSectionTable = GenericSectionTable::new();
+static SERVICE_GENERIC_SECTIONS_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static BOOTSTRAP_SECTION_OWNER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static mut SERVICE_DELAY_QUEUE_WORK: Option<nt_delay_execution::Queue> = None;
 static SERVICE_DELAY_DRAIN_HANDLER: AtomicU64 = AtomicU64::new(0);
 static SERVICE_DELAY_DRAIN_QUEUE: AtomicU64 = AtomicU64::new(0);
@@ -188,6 +442,58 @@ static SERVICE_DELAY_DRAIN_QUEUE: AtomicU64 = AtomicU64::new(0);
 struct ComponentCallbackTransfer {
     token: u64,
     context: win32k_glue::StagedUserCallbackContext,
+}
+
+/// A running callback's nested syscall transfers only its active external token. The staged
+/// context belongs to a *completed* NtCallbackReturn and is never inferred from that token.
+#[derive(Clone, Copy)]
+enum NestedWaitTransfer {
+    None,
+    CallbackReturn(ComponentCallbackTransfer),
+    InCallback { lane: nt_component_suspension::LaneHandle, token: u64 },
+}
+
+impl NestedWaitTransfer {
+    fn from_completed(transfer: Option<ComponentCallbackTransfer>) -> Self {
+        transfer.map(Self::CallbackReturn).unwrap_or(Self::None)
+    }
+
+    fn token(self) -> Option<u64> {
+        match self {
+            Self::None => None,
+            Self::CallbackReturn(transfer) => Some(transfer.token),
+            Self::InCallback { token, .. } => Some(token),
+        }
+    }
+
+    fn context(self) -> Option<win32k_glue::StagedUserCallbackContext> {
+        match self {
+            Self::CallbackReturn(transfer) => Some(transfer.context),
+            Self::None | Self::InCallback { .. } => None,
+        }
+    }
+
+    unsafe fn admits(self, client: win32k_glue::Win32kClientContext,
+        lane: nt_component_suspension::LaneHandle) -> bool
+    {
+        match self {
+            Self::None => true,
+            Self::CallbackReturn(transfer) => transfer.token != 0,
+            Self::InCallback { lane: captured, token } => captured == lane
+                && win32k_glue::in_callback_nested_wait_token_is_current(
+                    client, captured, token,
+                )
+                && (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+                    .external_top(lane).ok().flatten() == Some(token),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RetainedWaitAdmission {
+    Accepted,
+    RefusedNoEffect,
+    Indeterminate,
 }
 
 const COMPONENT_SUSPENSION_MAX_DEPTH: usize = 64;
@@ -204,6 +510,152 @@ pub(crate) static mut COMPONENT_SUSPENSIONS: ComponentLanes = nt_component_suspe
     COMPONENT_EXECUTION_LANE_CAPACITY,
     COMPONENT_SUSPENSION_MAX_DEPTH,
 );
+
+/// Copy the exact lane's retained frames before writing a one-time stall trace. These numeric
+/// observations cannot select, complete, or recycle any continuation or physical Reply.
+pub(crate) unsafe fn trace_stale_suspension_frames(lane_index: u64, lane_generation: u64) {
+    const CAP: usize = 16;
+    let mut rows = [[0u64; 19]; CAP];
+    let mut mutant_objects: [Option<(nt_provider_wait::ProviderDomainIdentity, nt_provider_wait::ProviderWaitObject)>; CAP] = [None; CAP];
+    let mut count = 0usize;
+    let mut overflow = 0u64;
+    {
+        let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
+        let arbiter = &*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER);
+        for (lane, frame) in lanes.frames() {
+            if lane.index as u64 != lane_index || lane.generation != lane_generation {
+                continue;
+            }
+            if count == CAP { overflow += 1; continue; }
+            let client = frame.owner.hosted_client();
+            let phase = match &frame.phase {
+                nt_component_suspension::SuspensionPhase::Waiting => 1,
+                nt_component_suspension::SuspensionPhase::Selected { .. } => 2,
+                nt_component_suspension::SuspensionPhase::Resuming { .. } => 3,
+                nt_component_suspension::SuspensionPhase::ResumingChildParked { .. } => 9,
+                nt_component_suspension::SuspensionPhase::ResumingChildQuarantined { .. } => 10,
+                nt_component_suspension::SuspensionPhase::Cancelled { .. } => 4,
+                nt_component_suspension::SuspensionPhase::MaintenanceWaiting { .. } => 5,
+                nt_component_suspension::SuspensionPhase::MaintenanceReady { .. } => 6,
+                nt_component_suspension::SuspensionPhase::MaintenanceResuming { .. } => 7,
+                nt_component_suspension::SuspensionPhase::NestedTerminal => 8,
+            };
+            let no_wait_details = [0u64; 7];
+            let (pending_kind, wait_id, pending_dispatch, pending_ssn, admitted, wait_details) =
+                match frame.continuation.hosted().map(|hosted| &hosted.pending) {
+                    Some(component_continuation::PendingComponentDispatch::Provider(pending)) => {
+                        let first = (pending.request.header.object_count != 0)
+                            .then(|| pending.request.objects.first()).flatten();
+                        if let Some(object) = first.filter(|object| object.object_type == nt_provider_wait::ProviderWaitObjectType::Mutant as u32) {
+                            mutant_objects[count] = Some((nt_provider_wait::ProviderDomainIdentity {
+                                domain: pending.request.header.provider_domain,
+                                generation: pending.request.header.provider_generation,
+                            }, *object));
+                        }
+                        (1, pending.request.header.wait_id, pending.dispatch.dispatch_id,
+                            pending.dispatch.ssn, arbiter.contains(pending.request.header.wait_id) as u64,
+                            [pending.request.header.wait_type as u64,
+                                pending.request.header.timeout_kind as u64,
+                                pending.request.header.timeout_100ns as u64,
+                                pending.request.header.object_count as u64,
+                                first.map_or(0, |object| object.object_type as u64),
+                                first.map_or(0, |object| object.object_id),
+                                first.map_or(0, |object| object.object_generation)])
+                    },
+                    Some(component_continuation::PendingComponentDispatch::Lpc(pending)) =>
+                        (2, 0, pending.dispatch.dispatch_id, pending.dispatch.ssn, 0, no_wait_details),
+                    Some(component_continuation::PendingComponentDispatch::Receive(pending)) =>
+                        (3, 0, pending.snapshot.dispatch.dispatch_id, pending.snapshot.dispatch.ssn, 0, no_wait_details),
+                    Some(component_continuation::PendingComponentDispatch::ServiceWait(pending)) =>
+                        (4, 0, pending.snapshot.dispatch.dispatch_id, pending.snapshot.dispatch.ssn, 0, no_wait_details),
+                    Some(component_continuation::PendingComponentDispatch::RootMaintenance(pending)) =>
+                        (5, 0, pending.snapshot.dispatch.dispatch_id, pending.snapshot.dispatch.ssn, 0, no_wait_details),
+                    Some(component_continuation::PendingComponentDispatch::NestedRestore(_)) =>
+                        (6, 0, 0, 0, 0, no_wait_details),
+                    None => (7, 0, 0, 0, 0, no_wait_details),
+                };
+            rows[count][..12].copy_from_slice(&[
+                frame.key.kind as u64, frame.key.id, frame.admission_sequence, phase,
+                frame.owner.dispatch_id, client.map_or(0, |row| row.client_pi as u64),
+                client.map_or(0, |row| row.client_tid), pending_kind, wait_id,
+                pending_dispatch, pending_ssn, admitted,
+            ]);
+            rows[count][12..].copy_from_slice(&wait_details);
+            count += 1;
+        }
+    }
+    for (index, row) in rows[..count].iter().enumerate() {
+        print_str(b"[pump-stale-suspension] kind/id/admission/phase/owner-dispatch/pi/tid/pending-kind/wait-id/pending-dispatch/ssn/arbiter/wait-type/timeout-kind/timeout-raw-100ns/object-count/first-type/first-id/first-generation=");
+        print_u64(row[0]);
+        for value in &row[1..] { print_str(b"/"); print_u64(*value); }
+        print_str(b"\n");
+        if let Some((provider, object)) = mutant_objects[index] {
+            print_str(b"[pump-stale-mutant] provider-domain/generation/object-id/generation/flags/wait-id=");
+            print_u64(provider.domain); print_str(b"/"); print_u64(provider.generation);
+            print_str(b"/"); print_u64(object.object_id);
+            print_str(b"/"); print_u64(object.object_generation);
+            print_str(b"/"); print_u64(object.flags as u64);
+            print_str(b"/"); print_u64(row[8]);
+            if let Some(snapshot) = crate::provider_dispatcher_backend::snapshot_sync_for_stale_trace(provider, object) {
+                print_str(b" canonical-generation/local-id/body/signal-state/wait-leases/storage-offset=");
+                print_u64(snapshot.canonical.map_or(0, |canonical| canonical.object_generation));
+                print_str(b"/"); print_u64(snapshot.id.raw());
+                print_str(b"/"); print_hex_u64(snapshot.body);
+                print_str(b"/");
+                if snapshot.signal_state < 0 { print_str(b"-"); }
+                print_u64(snapshot.signal_state.unsigned_abs() as u64);
+                print_str(b"/"); print_u64(snapshot.wait_leases as u64);
+                print_str(b"/"); print_u64(snapshot.storage.offset);
+                match snapshot.storage.backing {
+                    nt_provider_wait::ProviderEventBacking::Static { instance_generation } => {
+                        print_str(b" storage=static/"); print_u64(instance_generation);
+                    }
+                    nt_provider_wait::ProviderEventBacking::Allocation { arena_id, arena_generation, allocation_id, allocation_generation } => {
+                        print_str(b" storage=allocation/"); print_u64(arena_id);
+                        print_str(b"/"); print_u64(arena_generation);
+                        print_str(b"/"); print_u64(allocation_id);
+                        print_str(b"/"); print_u64(allocation_generation);
+                    }
+                    nt_provider_wait::ProviderEventBacking::Stack { lane_id, lane_generation, dispatch_id, activation_generation } => {
+                        print_str(b" storage=stack/"); print_u64(lane_id);
+                        print_str(b"/"); print_u64(lane_generation);
+                        print_str(b"/"); print_u64(dispatch_id);
+                        print_str(b"/"); print_u64(activation_generation);
+                    }
+                }
+                match snapshot.mutant_owner {
+                    Some(nt_component_suspension::SuspensionCaller::Hosted(holder)) => {
+                        print_str(b" holder=hosted/"); print_u64(holder.client_pi as u64);
+                        print_str(b"/"); print_u64(holder.client_generation);
+                        print_str(b"/"); print_u64(holder.client_tid);
+                        print_str(b"/"); print_u64(holder.client_badge);
+                    }
+                    Some(nt_component_suspension::SuspensionCaller::Kernel { lane }) => {
+                        print_str(b" holder=kernel/"); print_u64(lane.index as u64);
+                        print_str(b"/"); print_u64(lane.generation);
+                    }
+                    None => print_str(b" holder=none"),
+                }
+            } else {
+                print_str(b" snapshot=absent");
+            }
+            print_str(b"\n");
+        }
+    }
+    if overflow != 0 {
+        print_str(b"[pump-stale-suspension] overflow=");
+        print_u64(overflow);
+        print_str(b"\n");
+    }
+}
+
+// Advances only after the independent outer worker has returned. A parked native syscall
+// captures this epoch; timer notification alone cannot authorize its resume.
+static ROOT_MAINTENANCE_PASS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn root_maintenance_pass() -> u64 {
+    ROOT_MAINTENANCE_PASS.load(Ordering::Acquire)
+}
 
 /// Identify a startup completion's protocol shape without changing its retained owner.
 pub(crate) unsafe fn component_execution_lane_is_starting(
@@ -277,6 +729,10 @@ pub(crate) unsafe fn component_execution_lane_can_grow() -> bool {
 
 pub(crate) unsafe fn component_execution_is_busy() -> bool {
     (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).execution_busy()
+}
+
+pub(crate) unsafe fn component_shared_publication_is_busy() -> bool {
+    (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).fresh_dispatch_busy()
 }
 
 pub(crate) unsafe fn component_has_retained_terminal() -> bool {
@@ -455,6 +911,7 @@ pub(crate) fn provider_wait_runtime_stats() -> ProviderWaitRuntimeStats {
                             matches!(hosted.pending, PendingComponentDispatch::Provider(_))
                         }
                         ComponentNativeContinuation::Kernel(_) => true,
+                        ComponentNativeContinuation::RootIngress(_) => false,
                     }
                 })
                 .count(),
@@ -511,10 +968,6 @@ const WIN32K_BUILD_HWND_LIST_STAGE_BYTES: usize = 0x1000;
 const WIN32K_BUILD_HWND_LIST_COUNT_OFFSET: u64 = 0x0ff0;
 const WIN32K_BUILD_HWND_LIST_MAX_HANDLES: u64 = WIN32K_BUILD_HWND_LIST_COUNT_OFFSET / 8;
 const WIN32K_CREATE_BITMAP_STAGE_BYTES: usize = 0x4000;
-const WIN32K_STRETCH_DIBITS_STAGE_BYTES: usize =
-    (win32k_subsystem::WIN32K_BULK_ARG_FRAMES as usize) * 0x1000;
-const WIN32K_EXT_TEXT_OUT_STAGE_BYTES: usize =
-    (win32k_subsystem::WIN32K_BULK_ARG_FRAMES as usize) * 0x1000;
 const WIN32K_TEXT_METRICS_STAGE_BYTES: usize = 68;
 const WIN32K_TEXT_EXTENT_STAGE_BYTES: usize = 0x4000;
 const WIN32K_CHAR_WIDTH_STAGE_BYTES: usize = 0x4000;
@@ -558,6 +1011,7 @@ const CREATE_DIBITMAP_FAIL_BITS_OVERFLOW: u64 = 4;
 const CREATE_DIBITMAP_FAIL_BMI_OVERFLOW: u64 = 5;
 const CREATE_DIBITMAP_FAIL_BITS_COPY: u64 = 6;
 const CREATE_DIBITMAP_FAIL_BMI_COPY: u64 = 7;
+const CREATE_DIBITMAP_FAIL_STAGE_RESOURCE: u64 = 8;
 const CREATE_DIB_SECTION_FAIL_MISSING_SP: u64 = 1;
 const CREATE_DIB_SECTION_FAIL_STACK_TAIL: u64 = 2;
 const CREATE_DIB_SECTION_FAIL_LAYOUT: u64 = 3;
@@ -868,6 +1322,7 @@ pub(crate) unsafe fn lpc_receive_wait_cancel_reservation(
 unsafe fn lpc_receive_wait_park(
     pending: PendingLpcReceivePark,
     pi: u32,
+    process: nt_user_host::process_identity::ProcessIdentity,
     badge: u64,
     tid: u64,
 ) -> bool {
@@ -887,6 +1342,7 @@ unsafe fn lpc_receive_wait_park(
     }
     let continuation = LpcReceiveContinuation {
         pi,
+        process,
         badge,
         tid,
         memory: pending.memory,
@@ -994,6 +1450,7 @@ unsafe fn lpc_connect_wait_park(
 unsafe fn lpc_request_wait_park(
     pending: PendingLpcRequestPark,
     pi: u32,
+    process: nt_user_host::process_identity::ProcessIdentity,
     badge: u64,
     tid: u64,
 ) -> bool {
@@ -1009,6 +1466,7 @@ unsafe fn lpc_request_wait_park(
     }
     let continuation = LpcRequestContinuation {
         pi,
+        process,
         badge,
         tid,
         memory: pending.memory,
@@ -1126,8 +1584,9 @@ pub(crate) unsafe fn service_provider_wait_poll(
     channel: &spawn_hosts::PumpChannel,
     envelope: nt_user_host::provider_kernel_activation::KernelProviderServiceEnvelope,
 ) -> bool {
-    let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
-        as *mut nt_provider_wait::ProviderWaitSharedPage;
+    let Some(page) = win32k_glue::provider_wait_page_for_channel(channel) else {
+        return false;
+    };
     let request = core::ptr::read_volatile(core::ptr::addr_of!((*page).request));
     if request.header.timeout_kind != nt_provider_wait::ProviderWaitTimeoutKind::Poll as u32
     {
@@ -1202,6 +1661,8 @@ fn component_expected_owner(
         PendingComponentDispatch::Lpc(pending) => lpc_wait_expected_owner(pending),
         PendingComponentDispatch::Receive(pending) => Some(pending.yielded.owner),
         PendingComponentDispatch::ServiceWait(pending) => service_wait_expected_owner(pending),
+        PendingComponentDispatch::RootMaintenance(pending) => Some(pending.yielded.owner),
+        PendingComponentDispatch::NestedRestore(pending) => Some(pending.ticket.key().owner()),
     }
 }
 
@@ -1214,13 +1675,13 @@ fn service_wait_expected_owner(
         provider_generation: identity.generation,
         caller: nt_component_suspension::SuspensionCaller::Hosted(
             nt_component_suspension::SuspensionHostedClient {
-                client_pi: pending.client.pi,
-                client_generation: pending.client.generation,
-                client_tid: pending.client.tid,
-                client_badge: pending.client.badge,
+                client_pi: pending.snapshot.client.pi,
+                client_generation: pending.snapshot.client.generation,
+                client_tid: pending.snapshot.client.tid,
+                client_badge: pending.snapshot.client.badge,
             },
         ),
-        dispatch_id: pending.dispatch.dispatch_id,
+        dispatch_id: pending.snapshot.dispatch.dispatch_id,
     };
     owner.is_valid().then_some(owner)
 }
@@ -1244,6 +1705,14 @@ fn component_suspension_key(
         }
         PendingComponentDispatch::ServiceWait(pending) => {
             nt_component_suspension::SuspensionKey::service_wait(pending.yielded.token)
+        }
+        PendingComponentDispatch::RootMaintenance(pending) => {
+            nt_component_suspension::SuspensionKey::root_maintenance(pending.yielded.dispatch.epoch())
+        }
+        PendingComponentDispatch::NestedRestore(pending) => {
+            nt_component_suspension::SuspensionKey::nested_restore(
+                pending.ticket.key().scope().sequence(),
+            )
         }
     }
 }
@@ -1284,6 +1753,9 @@ unsafe fn lpc_wait_begin_after_stack_admission(
                 // syscall. Publish the same progress signal so the common drain wakes a parked LPC
                 // server receiver before the executive blocks again.
                 nt_handler.lpc_endpoint_progress = true;
+                let alpc_reply_committed =
+                    crate::native_alpc_send_receive_work::redrive_after_lpc_publish(nt_handler);
+                nt_handler.lpc_reply_published |= alpc_reply_committed;
                 return true;
             }
             if let Some(client) = lpc_client() {
@@ -1392,7 +1864,9 @@ unsafe fn lpc_component_reply_commit_drain(
 enum ComponentPumpCompletion {
     Completed(win32k_glue::CompletedWin32kDispatch),
     Reparked(PendingComponentDispatch),
+    CaptureRefused(PendingComponentDispatch, spawn_hosts::PumpResult, spawn_hosts::PumpChannel),
     UserCallbackSuspended,
+    FailedRetained(PendingComponentDispatch, i32),
     Failed(i32),
 }
 
@@ -1509,31 +1983,70 @@ unsafe fn provider_wait_admit_retained(
     pending: win32k_glue::PendingProviderWaitDispatch,
     reply_cap: u64,
     callback_transfer: Option<ComponentCallbackTransfer>,
-) -> bool {
+    destination: HostedContinuationDestination,
+) -> RetainedWaitAdmission {
+    provider_wait_admit_with_transfer(
+        nt_handler, pending, reply_cap,
+        NestedWaitTransfer::from_completed(callback_transfer), destination,
+    )
+}
+
+unsafe fn provider_wait_admit_with_transfer(
+    nt_handler: &mut ExecNtHandler,
+    pending: win32k_glue::PendingProviderWaitDispatch,
+    reply_cap: u64,
+    transfer: NestedWaitTransfer,
+    destination: HostedContinuationDestination,
+) -> RetainedWaitAdmission {
+    let lane = pending.dispatch.lane;
+    if !transfer.admits(pending.client, lane) {
+        return RetainedWaitAdmission::RefusedNoEffect;
+    }
+    let initial_target = matches!(destination, HostedContinuationDestination::InitialThread(_));
+    if initial_target {
+        print_str(b"[initial-provider-wait] stage=request pi/tid/wait/type/timeout-kind/timeout/count=");
+        print_u64(pending.client.pi as u64);
+        print_str(b"/"); print_u64(pending.client.tid);
+        print_str(b"/"); print_u64(pending.request.header.wait_id);
+        print_str(b"/"); print_u64(pending.request.header.wait_type as u64);
+        print_str(b"/"); print_u64(pending.request.header.timeout_kind as u64);
+        print_str(b"/"); print_hex_u64(pending.request.header.timeout_100ns as u64);
+        print_str(b"/"); print_u64(pending.request.header.object_count as u64);
+        print_str(b"\n");
+        for object in pending.request.objects.iter()
+            .take(pending.request.header.object_count as usize)
+        {
+            print_str(b"[initial-provider-wait] object type/id/generation=");
+            print_u64(object.object_type as u64);
+            print_str(b"/"); print_u64(object.object_id);
+            print_str(b"/"); print_u64(object.object_generation);
+            print_str(b"\n");
+        }
+    }
     let Ok(return_target) = HostedReturnTarget::new(
-        reply_cap, callback_transfer.map(|transfer| transfer.context),
+        reply_cap, transfer.context(),
     ) else {
-        return false;
+        return RetainedWaitAdmission::RefusedNoEffect;
     };
     let Some(owner) = provider_wait_expected_owner(pending) else {
-        return false;
+        return RetainedWaitAdmission::RefusedNoEffect;
     };
     let wait_id = pending.request.header.wait_id;
     let sequence = next_dispatcher_wait_sequence();
     let continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
         pending: PendingComponentDispatch::Provider(pending),
         return_target,
+        destination,
     });
-    let lane = pending.dispatch.lane;
     let Ok(binding) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).binding(lane) else {
-        return false;
+        return RetainedWaitAdmission::RefusedNoEffect;
     };
     let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-    let admitted = if let Some(transfer) = callback_transfer {
+    let admitted = if let Some(token) = transfer.token() {
         lanes.transfer_external_to_suspension_running(
             lane,
             binding.reply_object,
-            transfer.token,
+            token,
             provider_wait_key(wait_id),
             sequence,
             owner,
@@ -1550,7 +2063,7 @@ unsafe fn provider_wait_admit_retained(
         )
     };
     if admitted.is_err() {
-        return false;
+        return RetainedWaitAdmission::RefusedNoEffect;
     }
     PROVIDER_WAIT_DISPATCH_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
     COMPONENT_WAIT_DISPATCH_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
@@ -1562,6 +2075,7 @@ unsafe fn provider_wait_admit_retained(
         nt_time_snapshot(),
     ) {
         Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::Parked { .. }) => {
+            if initial_target { print_str(b"[initial-provider-wait] stage=parked\n"); }
             PROVIDER_WAIT_PARKED_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
             trace_provider_wait_admission(
                 b"park",
@@ -1571,6 +2085,7 @@ unsafe fn provider_wait_admit_retained(
             );
         }
         Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::Satisfied { wait_id, status }) => {
+            if initial_target { print_str(b"[initial-provider-wait] stage=satisfied\n"); }
             trace_provider_wait_admission(
                 b"ready",
                 wait_id,
@@ -1588,6 +2103,7 @@ unsafe fn provider_wait_admit_retained(
             }
         }
         Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::TimedOut { wait_id }) => {
+            if initial_target { print_str(b"[initial-provider-wait] stage=timeout\n"); }
             trace_provider_wait_admission(
                 b"timeout",
                 wait_id,
@@ -1605,6 +2121,7 @@ unsafe fn provider_wait_admit_retained(
             }
         }
         Err(error) => {
+            if initial_target { print_str(b"[initial-provider-wait] stage=rejected\n"); }
             let status = provider_wait_status_for_error(error);
             trace_provider_wait_admission(
                 b"reject",
@@ -1623,55 +2140,71 @@ unsafe fn provider_wait_admit_retained(
             }
         }
     }
-    true
+    RetainedWaitAdmission::Accepted
 }
 
 unsafe fn provider_wait_admit_current(
     nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingProviderWaitDispatch,
     callback_transfer: Option<ComponentCallbackTransfer>,
-) -> bool {
+    destination: HostedContinuationDestination,
+) -> RetainedWaitAdmission {
     let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
-        return false;
+        return RetainedWaitAdmission::RefusedNoEffect;
     };
     if active_reply == 0 {
-        return false;
+        return RetainedWaitAdmission::RefusedNoEffect;
     }
-    if !provider_wait_admit_retained(
+    let admitted = provider_wait_admit_retained(
         nt_handler,
         pending,
         active_reply,
         callback_transfer,
-    ) {
-        return false;
+        destination,
+    );
+    if admitted != RetainedWaitAdmission::Accepted {
+        return admitted;
     }
     reply_park.commit();
-    true
+    RetainedWaitAdmission::Accepted
 }
 
 unsafe fn receive_admit_retained(
     pending: win32k_glue::PendingReceiveDispatch,
     reply_cap: u64,
     callback_transfer: Option<ComponentCallbackTransfer>,
+    destination: HostedContinuationDestination,
 ) -> bool {
+    receive_admit_with_transfer(
+        pending, reply_cap, NestedWaitTransfer::from_completed(callback_transfer), destination,
+    ) == RetainedWaitAdmission::Accepted
+}
+
+unsafe fn receive_admit_with_transfer(
+    pending: win32k_glue::PendingReceiveDispatch,
+    reply_cap: u64,
+    transfer: NestedWaitTransfer,
+    destination: HostedContinuationDestination,
+) -> RetainedWaitAdmission {
     if pending.yielded.replaces.is_some()
-        || pending.callback_token != callback_transfer.map(|transfer| transfer.token)
-    { return false; }
+        || pending.snapshot.callback_token != transfer.token()
+        || !transfer.admits(pending.snapshot.client, pending.snapshot.dispatch.lane)
+    { return RetainedWaitAdmission::RefusedNoEffect; }
     let Ok(return_target) = HostedReturnTarget::new(
-        reply_cap, callback_transfer.map(|transfer| transfer.context),
-    ) else { return false; };
+        reply_cap, transfer.context(),
+    ) else { return RetainedWaitAdmission::RefusedNoEffect; };
     let key = nt_component_suspension::SuspensionKey::receive(pending.yielded.child.admission_sequence());
     let sequence = next_dispatcher_wait_sequence();
     let continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
-        pending: PendingComponentDispatch::Receive(pending), return_target,
+        pending: PendingComponentDispatch::Receive(pending), return_target, destination,
     });
     let admitted = crate::spawn_hosts::shared_ingress::owner::runtime::with_bound_receive_scope(
         pending.yielded.parent, |scope| {
             let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-            let admitted = if let Some(transfer) = callback_transfer {
+            let admitted = if let Some(token) = transfer.token() {
                 lanes.transfer_callback_to_receive_owned(
-                    scope, transfer.token, key, sequence, pending.yielded.owner,
+                    scope, token, key, sequence, pending.yielded.owner,
                     pending.yielded.child, continuation,
                 )
             } else {
@@ -1684,13 +2217,17 @@ unsafe fn receive_admit_retained(
                 .map_err(|_| crate::spawn_hosts::shared_ingress::owner::runtime::Error::Protocol)
         },
     );
-    admitted.is_ok()
+    if admitted.is_ok() { RetainedWaitAdmission::Accepted }
+    else { RetainedWaitAdmission::RefusedNoEffect }
 }
 
-unsafe fn receive_admit_current(pending: win32k_glue::PendingReceiveDispatch) -> bool {
+unsafe fn receive_admit_current(
+    pending: win32k_glue::PendingReceiveDispatch,
+    destination: HostedContinuationDestination,
+) -> bool {
     let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else { return false; };
-    if pending.callback_token.is_some()
-        || !receive_admit_retained(pending, REPLY_MAIN_SLOT.load(Ordering::Relaxed), None)
+    if pending.snapshot.callback_token.is_some()
+        || !receive_admit_retained(pending, REPLY_MAIN_SLOT.load(Ordering::Relaxed), None, destination)
     {
         return false;
     }
@@ -1702,44 +2239,104 @@ unsafe fn service_wait_admit_retained(
     pending: win32k_glue::PendingServiceWaitDispatch,
     reply_cap: u64,
     callback_transfer: Option<ComponentCallbackTransfer>,
+    destination: HostedContinuationDestination,
 ) -> bool {
-    if pending.callback_token != callback_transfer.map(|transfer| transfer.token) {
-        return false;
+    service_wait_admit_with_transfer(
+        pending, reply_cap, NestedWaitTransfer::from_completed(callback_transfer), destination,
+    ) == RetainedWaitAdmission::Accepted
+}
+
+unsafe fn service_wait_admit_with_transfer(
+    pending: win32k_glue::PendingServiceWaitDispatch,
+    reply_cap: u64,
+    transfer: NestedWaitTransfer,
+    destination: HostedContinuationDestination,
+) -> RetainedWaitAdmission {
+    let lane = pending.snapshot.dispatch.lane;
+    let origin_valid = match transfer {
+        NestedWaitTransfer::InCallback { lane: captured, token } => captured == lane
+            && win32k_glue::in_callback_nested_wait_token_is_current(
+                pending.snapshot.client, captured, token,
+            ),
+        _ => transfer.admits(pending.snapshot.client, lane),
+    };
+    if pending.snapshot.callback_token != transfer.token() {
+        trace_win32k_handoff_refusal(b"service-wait-callback-token");
+        return RetainedWaitAdmission::RefusedNoEffect;
+    }
+    if !origin_valid {
+        trace_win32k_handoff_refusal(b"service-wait-callback-origin");
+        return RetainedWaitAdmission::RefusedNoEffect;
     }
     let Ok(return_target) = HostedReturnTarget::new(
-        reply_cap, callback_transfer.map(|transfer| transfer.context),
-    ) else { return false; };
-    let Some(owner) = service_wait_expected_owner(pending) else { return false; };
+        reply_cap, transfer.context(),
+    ) else {
+        trace_win32k_handoff_refusal(b"service-wait-return-target");
+        return RetainedWaitAdmission::RefusedNoEffect;
+    };
+    let Some(owner) = service_wait_expected_owner(pending) else {
+        trace_win32k_handoff_refusal(b"service-wait-expected-owner");
+        return RetainedWaitAdmission::RefusedNoEffect;
+    };
     let yielded = pending.yielded;
     let key = nt_component_suspension::SuspensionKey::service_wait(yielded.token);
     let sequence = next_dispatcher_wait_sequence();
     let continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
-        pending: PendingComponentDispatch::ServiceWait(pending), return_target,
+        pending: PendingComponentDispatch::ServiceWait(pending), return_target, destination,
     });
     let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-    let admitted = if let Some(transfer) = callback_transfer {
-        lanes.transfer_callback_to_service_wait_external_owned(
-            yielded.route.identity().lane, yielded.reply, yielded.dispatch,
-            transfer.token, yielded.token, key, sequence, owner, continuation,
-        )
-    } else {
-        lanes.admit_service_wait_external_owned(
+    let admitted = match transfer {
+        NestedWaitTransfer::InCallback { token, .. } =>
+            lanes.admit_in_callback_service_wait_external_owned(
+                yielded.route.identity().lane, yielded.reply, yielded.dispatch,
+                token, yielded.token, key, sequence, owner, continuation,
+            ),
+        NestedWaitTransfer::CallbackReturn(completed) =>
+            lanes.transfer_callback_to_service_wait_external_owned(
+                yielded.route.identity().lane, yielded.reply, yielded.dispatch,
+                completed.token, yielded.token, key, sequence, owner, continuation,
+            ),
+        NestedWaitTransfer::None => lanes.admit_service_wait_external_owned(
             yielded.route.identity().lane, yielded.reply, yielded.dispatch,
             yielded.token, key, sequence, owner, continuation,
-        )
+        ),
     };
-    admitted.is_ok()
+    if admitted.is_ok() { RetainedWaitAdmission::Accepted }
+    else {
+        trace_win32k_handoff_refusal(b"service-wait-lane-admission");
+        RetainedWaitAdmission::RefusedNoEffect
+    }
 }
 
-unsafe fn service_wait_admit_current(pending: win32k_glue::PendingServiceWaitDispatch) -> bool {
-    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else { return false; };
-    if pending.callback_token.is_some()
-        || !service_wait_admit_retained(pending, REPLY_MAIN_SLOT.load(Ordering::Relaxed), None)
-    {
-        return false;
+unsafe fn service_wait_admit_current(
+    pending: win32k_glue::PendingServiceWaitDispatch,
+    destination: HostedContinuationDestination,
+) -> RetainedWaitAdmission {
+    let root_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let reply_park = if pending.snapshot.callback_token.is_some() {
+        root_reply_park::RootReplyPark::prepare_exact_hosted(root_reply)
+    } else {
+        root_reply_park::RootReplyPark::prepare()
+    };
+    let Some(reply_park) = reply_park else {
+        trace_win32k_handoff_refusal(b"service-wait-root-park-prepare");
+        return RetainedWaitAdmission::RefusedNoEffect;
+    };
+    let transfer = match pending.snapshot.callback_token {
+        Some(token) => NestedWaitTransfer::InCallback {
+            lane: pending.snapshot.dispatch.lane, token,
+        },
+        None => NestedWaitTransfer::None,
+    };
+    let admitted = service_wait_admit_with_transfer(
+        pending, root_reply, transfer, destination,
+    );
+    if admitted != RetainedWaitAdmission::Accepted { return admitted; }
+    if reply_park.try_commit().is_err() {
+        trace_win32k_handoff_refusal(b"service-wait-root-park-commit");
+        RetainedWaitAdmission::Indeterminate
     }
-    reply_park.commit();
-    true
+    else { RetainedWaitAdmission::Accepted }
 }
 
 unsafe fn lpc_wait_admit_retained(
@@ -1747,37 +2344,61 @@ unsafe fn lpc_wait_admit_retained(
     pending: win32k_glue::PendingLpcWaitDispatch,
     reply_cap: u64,
     callback_transfer: Option<ComponentCallbackTransfer>,
-) -> bool {
+    destination: HostedContinuationDestination,
+) -> RetainedWaitAdmission {
+    lpc_wait_admit_with_transfer(
+        nt_handler, pending, reply_cap,
+        NestedWaitTransfer::from_completed(callback_transfer), destination,
+    )
+}
+
+unsafe fn lpc_wait_admit_with_transfer(
+    nt_handler: &mut ExecNtHandler,
+    pending: win32k_glue::PendingLpcWaitDispatch,
+    reply_cap: u64,
+    transfer: NestedWaitTransfer,
+    destination: HostedContinuationDestination,
+) -> RetainedWaitAdmission {
+    let lane = pending.dispatch.lane;
+    if !transfer.admits(pending.client, lane) {
+        return RetainedWaitAdmission::RefusedNoEffect;
+    }
     let Ok(reservation) = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).reserve() else {
-        return false;
+        return RetainedWaitAdmission::RefusedNoEffect;
+    };
+    let cancel = || {
+        if (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation).is_ok() {
+            RetainedWaitAdmission::RefusedNoEffect
+        } else {
+            // A changed reservation may already belong to another effect owner. The caller
+            // must retain and quarantine its original result, not reinsert it for replay.
+            RetainedWaitAdmission::Indeterminate
+        }
     };
     let Ok(return_target) = HostedReturnTarget::new(
-        reply_cap, callback_transfer.map(|transfer| transfer.context),
+        reply_cap, transfer.context(),
     ) else {
-        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
-        return false;
+        return cancel();
     };
     let Some(owner) = lpc_wait_expected_owner(pending) else {
-        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
-        return false;
+        return cancel();
     };
     let key = nt_component_suspension::SuspensionKey::lpc_request(pending.request.generation);
     let sequence = next_dispatcher_wait_sequence();
     let continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
         pending: PendingComponentDispatch::Lpc(pending),
         return_target,
+        destination,
     });
-    let lane = pending.dispatch.lane;
     let Ok(binding) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).binding(lane) else {
-        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
-        return false;
+        return cancel();
     };
     let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-    let admitted = if let Some(transfer) = callback_transfer {
+    let admitted = if let Some(token) = transfer.token() {
         lanes.transfer_external_to_suspension_running(
             lane,
             binding.reply_object,
-            transfer.token,
+            token,
             key,
             sequence,
             owner,
@@ -1794,36 +2415,482 @@ unsafe fn lpc_wait_admit_retained(
         )
     };
     if admitted.is_err() {
-        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
-        return false;
+        return cancel();
     }
     COMPONENT_WAIT_DISPATCH_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
     let _ = lpc_wait_begin_after_stack_admission(nt_handler, pending, key, reservation);
-    true
+    RetainedWaitAdmission::Accepted
 }
 
 unsafe fn lpc_wait_admit_current(
     nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingLpcWaitDispatch,
     callback_transfer: Option<ComponentCallbackTransfer>,
-) -> bool {
+    destination: HostedContinuationDestination,
+) -> RetainedWaitAdmission {
     let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
-        return false;
+        return RetainedWaitAdmission::RefusedNoEffect;
     };
     if active_reply == 0 {
-        return false;
+        return RetainedWaitAdmission::RefusedNoEffect;
     }
-    if !lpc_wait_admit_retained(
+    let admitted = lpc_wait_admit_retained(
         nt_handler,
         pending,
         active_reply,
         callback_transfer,
-    ) {
-        return false;
+        destination,
+    );
+    if admitted != RetainedWaitAdmission::Accepted {
+        return admitted;
     }
-    reply_park.commit();
+    if reply_park.try_commit().is_err() { RetainedWaitAdmission::Indeterminate }
+    else { RetainedWaitAdmission::Accepted }
+}
+
+struct PendingWin32kHandoff {
+    callback_suspended: bool,
+    admitted_dispatch_id: u64,
+    parked: bool,
+    maintenance_ticket: Option<root_maintenance_owner::RootMaintenanceTicket>,
+    retained_failure: bool,
+}
+
+fn trace_win32k_handoff_refusal(stage: &[u8]) {
+    print_str(b"[win32k-handoff-refusal] stage=");
+    print_str(stage);
+    print_str(b"\n");
+}
+
+/// The physical nested parent already owns its Reply. Retain the independent root Call before
+/// rotating the root Reply; no ordinary syscall result can be delivered from this handoff.
+unsafe fn admit_pending_nested_restore_dispatch(
+    destination: HostedContinuationDestination,
+) -> Result<u64, ()> {
+    let root_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    if root_reply == 0 {
+        trace_win32k_handoff_refusal(b"nested-restore-root-reply");
+        return Err(());
+    }
+    let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
+        trace_win32k_handoff_refusal(b"nested-restore-reply-park-prepare");
+        return Err(());
+    };
+    let Some(reservation) = nested_restore_owner::reserve_capacity() else {
+        trace_win32k_handoff_refusal(b"nested-restore-capacity");
+        return Err(());
+    };
+    let Some(pending) = win32k_glue::take_pending_nested_restore_dispatch() else {
+        trace_win32k_handoff_refusal(b"nested-restore-pending-absent");
+        return Err(());
+    };
+    trace_cursor_lookup_owner("handoff-kind:nested-restore", pending.snapshot.client,
+        pending.snapshot.dispatch.ssn, pending.snapshot.dispatch.dispatch_id,
+        Some(pending.snapshot.dispatch.lane), true, true, false);
+    let dispatch_id = pending.snapshot.dispatch.dispatch_id;
+    let ticket = match nested_restore_owner::retain(
+        reservation, pending, root_reply, destination, false,
+    ) {
+        Ok(ticket) => ticket,
+        Err(pending) => {
+            let _ = win32k_glue::restore_pending_nested_restore_dispatch(pending);
+            trace_win32k_handoff_refusal(b"nested-restore-retain");
+            return Err(());
+        }
+    };
+    if nested_restore_owner::park_root(ticket, reply_park).is_err()
+        && !nested_restore_owner::retry_unparked_root(ticket)
+    {
+        // The retained frame still owns the original root Reply and physical parent. A refusal
+        // cannot become a synthetic provider result or let the root receive reuse this Reply.
+        trace_win32k_handoff_refusal(b"nested-restore-park-root");
+        return Err(());
+    }
+    Ok(dispatch_id)
+}
+
+/// One authoritative transfer from a returned native pump to the retained execution owner.
+/// Direct Win32k syscalls and early Ps process-create callouts use the same wait ordering.
+/// Transfer an already parked initial-thread Reply when its later Win32k entry genuinely
+/// suspends. A no-effect admission refusal restores the copied pending snapshot for redrive;
+/// an uncertain transfer keeps the exact Reply fenced with its initial owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetainedInitialCalloutHandoff {
+    Accepted,
+    RetryNoEffect,
+    Retained,
+}
+
+/// A retained initial syscall can run inside an active redirected callback. Its wait inherits
+/// that exact lane token; it must not invent the staged context of a completed NtCallbackReturn.
+fn retained_initial_callback_transfer(
+    lane: nt_component_suspension::LaneHandle,
+    token: Option<u64>,
+) -> Option<NestedWaitTransfer> {
+    use nt_user_host::process_create_callout::InitialCallbackTransfer;
+    match nt_user_host::process_create_callout::initial_callback_transfer(lane, token)? {
+        InitialCallbackTransfer::Root => Some(NestedWaitTransfer::None),
+        InitialCallbackTransfer::InCallback { lane, token } =>
+            Some(NestedWaitTransfer::InCallback { lane, token }),
+    }
+}
+
+pub(crate) unsafe fn admit_retained_initial_win32k_dispatch(
+    handler: &mut ExecNtHandler,
+    origin: nt_user_host::process_create_callout::InitialThreadReplyOrigin<HostedThreadRole>,
+    reply_cap: u64,
+) -> RetainedInitialCalloutHandoff {
+    use RetainedInitialCalloutHandoff::*;
+    if reply_cap == 0 { return Retained; }
+    if win32k_glue::pending_nested_restore_dispatch_is_some()
+        || win32k_glue::pending_root_ingress_dispatch_is_some()
+        || win32k_glue::pending_root_maintenance_dispatch_is_some()
+    { return RetryNoEffect; }
+    let destination = HostedContinuationDestination::InitialThread(origin);
+    if let Some(pending) = win32k_glue::take_pending_receive_dispatch() {
+        let Some(transfer) = retained_initial_callback_transfer(
+            pending.snapshot.dispatch.lane, pending.snapshot.callback_token,
+        ) else {
+            return if win32k_glue::restore_pending_receive_dispatch(pending) {
+                RetryNoEffect
+            } else { Retained };
+        };
+        return match receive_admit_with_transfer(
+            pending, reply_cap, transfer, destination,
+        ) {
+            RetainedWaitAdmission::Accepted => Accepted,
+            RetainedWaitAdmission::RefusedNoEffect => {
+                if win32k_glue::restore_pending_receive_dispatch(pending) { RetryNoEffect }
+                else { Retained }
+            }
+            RetainedWaitAdmission::Indeterminate => Retained,
+        };
+    }
+    if let Some(pending) = win32k_glue::take_pending_service_wait_dispatch() {
+        let Some(transfer) = retained_initial_callback_transfer(
+            pending.snapshot.dispatch.lane, pending.snapshot.callback_token,
+        ) else {
+            return if win32k_glue::restore_pending_service_wait_dispatch(pending) {
+                RetryNoEffect
+            } else { Retained };
+        };
+        return match service_wait_admit_with_transfer(
+            pending, reply_cap, transfer, destination,
+        ) {
+            RetainedWaitAdmission::Accepted => Accepted,
+            RetainedWaitAdmission::RefusedNoEffect => {
+                if win32k_glue::restore_pending_service_wait_dispatch(pending) { RetryNoEffect }
+                else { Retained }
+            }
+            RetainedWaitAdmission::Indeterminate => Retained,
+        };
+    }
+    if let Some(pending) = win32k_glue::take_pending_provider_wait_dispatch() {
+        let token = if pending.nested_user_callback {
+            let Some(token) = win32k_glue::pending_callback_token_on_lane(
+                pending.client, pending.dispatch.lane,
+            ) else {
+                return if win32k_glue::restore_pending_provider_wait_dispatch(pending) {
+                    RetryNoEffect
+                } else { Retained };
+            };
+            Some(token)
+        } else { None };
+        let Some(transfer) = retained_initial_callback_transfer(pending.dispatch.lane, token)
+        else {
+            return if win32k_glue::restore_pending_provider_wait_dispatch(pending) {
+                RetryNoEffect
+            } else { Retained };
+        };
+        return match provider_wait_admit_with_transfer(
+            handler, pending, reply_cap, transfer, destination,
+        ) {
+            RetainedWaitAdmission::Accepted => Accepted,
+            RetainedWaitAdmission::RefusedNoEffect => {
+                if win32k_glue::restore_pending_provider_wait_dispatch(pending) { RetryNoEffect }
+                else { Retained }
+            }
+            RetainedWaitAdmission::Indeterminate => Retained,
+        };
+    }
+    if let Some(pending) = win32k_glue::take_pending_lpc_wait_dispatch() {
+        let token = if pending.nested_user_callback {
+            let Some(token) = win32k_glue::pending_callback_token_on_lane(
+                pending.client, pending.dispatch.lane,
+            ) else {
+                return if win32k_glue::restore_pending_lpc_wait_dispatch(pending) {
+                    RetryNoEffect
+                } else { Retained };
+            };
+            Some(token)
+        } else { None };
+        let Some(transfer) = retained_initial_callback_transfer(pending.dispatch.lane, token)
+        else {
+            return if win32k_glue::restore_pending_lpc_wait_dispatch(pending) {
+                RetryNoEffect
+            } else { Retained };
+        };
+        return match lpc_wait_admit_with_transfer(
+            handler, pending, reply_cap, transfer, destination,
+        ) {
+            RetainedWaitAdmission::Accepted => Accepted,
+            RetainedWaitAdmission::RefusedNoEffect => {
+                if win32k_glue::restore_pending_lpc_wait_dispatch(pending) { RetryNoEffect }
+                else { Retained }
+            }
+            RetainedWaitAdmission::Indeterminate => Retained,
+        };
+    }
+    Retained
+}
+
+/// A returned physical reply effect is never replayed when its receipt is uncertain.
+pub(crate) unsafe fn reply_retained_initial_creation(reply_cap: u64, status: u32) -> bool {
+    if !reply_parked_syscall(reply_cap, u64::from(status)) { return false; }
+    release_reply_pool_cap(reply_cap);
     true
+}
+
+unsafe fn admit_pending_win32k_dispatch(
+    handler: &mut ExecNtHandler,
+    destination: HostedContinuationDestination,
+) -> PendingWin32kHandoff {
+    let callback_suspended = win32k_glue::take_user_callback_pump_suspended();
+    let mut admitted_dispatch_id = 0;
+    let mut parked = false;
+    let mut maintenance_ticket = None;
+    let mut retained_failure = false;
+    if win32k_glue::pending_nested_restore_dispatch_is_some() {
+        if callback_suspended {
+            trace_win32k_handoff_refusal(b"nested-restore-callback-suspended");
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        }
+        match admit_pending_nested_restore_dispatch(destination) {
+            Ok(dispatch_id) => {
+                admitted_dispatch_id = dispatch_id;
+                parked = true;
+            }
+            Err(()) => retained_failure = true,
+        }
+        return PendingWin32kHandoff {
+            callback_suspended, admitted_dispatch_id, parked,
+            maintenance_ticket, retained_failure,
+        };
+    }
+    if win32k_glue::pending_root_ingress_dispatch_is_some() {
+        if let Some((client, dispatch)) = win32k_glue::pending_root_ingress_dispatch_identity() {
+            trace_cursor_lookup_owner("handoff-kind:root-ingress-refused", client,
+                dispatch.ssn, dispatch.dispatch_id, Some(dispatch.lane), true, true, false);
+        }
+        // The distinct owner is retained in the Win32k pending slot, CALLS and PARENTS. This
+        // dormant path must not import the child or rotate either Reply until the serialized
+        // route preflight and undelivered-parent unwind are implemented together.
+        trace_win32k_handoff_refusal(b"root-ingress-unimplemented");
+        return PendingWin32kHandoff {
+            callback_suspended, admitted_dispatch_id, parked,
+            maintenance_ticket, retained_failure: true,
+        };
+    }
+    if win32k_glue::pending_root_maintenance_dispatch_is_some() {
+        // Initial-thread callouts cannot transfer this ordinary hosted syscall checkpoint.
+        // Leave the pending snapshot in its global cell on every pre-effect refusal.
+        if destination != HostedContinuationDestination::Win32k || callback_suspended {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        }
+        let root_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+        if root_reply == 0 {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        }
+        let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        };
+        let Some(reservation) = root_maintenance_owner::reserve_capacity() else {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        };
+        let Some(pending) = win32k_glue::take_pending_root_maintenance_dispatch() else {
+            root_maintenance_owner::cancel_reservation(reservation);
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        };
+        trace_cursor_lookup_owner("handoff-kind:maintenance", pending.snapshot.client,
+            pending.snapshot.dispatch.ssn, pending.snapshot.dispatch.dispatch_id,
+            Some(pending.snapshot.dispatch.lane), true, true, false);
+        // The reservation makes this memory-only transfer allocation free. A defensive refusal
+        // returns the snapshot to its pending cell before any physical effect can enter.
+        let ticket = match root_maintenance_owner::retain(reservation, pending, root_reply) {
+            Ok(ticket) => ticket,
+            Err(pending) => {
+                let _ = win32k_glue::restore_pending_root_maintenance_dispatch(pending);
+                root_maintenance_owner::cancel_reservation(reservation);
+                return PendingWin32kHandoff {
+                    callback_suspended, admitted_dispatch_id, parked,
+                    maintenance_ticket, retained_failure: true,
+                };
+            }
+        };
+        maintenance_ticket = Some(ticket);
+        admitted_dispatch_id = pending.snapshot.dispatch.dispatch_id;
+        let yielded = pending.yielded;
+        let lane = yielded.dispatch.lane();
+        let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
+        let exact = root_reply != 0
+            && pending.snapshot.callback_token.is_none()
+            && pending.snapshot.pump.reply_cap == yielded.reply
+            && pending.snapshot.dispatch.lane == lane
+            && pending.snapshot.dispatch.dispatch_id == yielded.owner.dispatch_id
+            && yielded.route.identity().lane == lane
+            && lanes.is_dispatch_identity_active(yielded.dispatch)
+            && lanes.phase(lane) == Ok(nt_component_suspension::LanePhase::Running)
+            && lanes.binding(lane).is_ok_and(|binding| {
+                binding.reply_object == yielded.reply
+                    && binding.executor_id == pending.snapshot.channel.tcb
+                    && binding.receive_endpoint == pending.snapshot.channel.fault_ep
+            })
+            && crate::spawn_hosts::shared_ingress::owner::runtime::dispatch(yielded.route)
+                .is_ok_and(|dispatch| dispatch == yielded.dispatch)
+            && crate::spawn_hosts::shared_ingress::owner::runtime::current_reply(yielded.route)
+                .is_ok_and(|reply| reply == yielded.reply)
+            && crate::spawn_hosts::shared_ingress::owner::runtime::channel_route(&pending.snapshot.channel)
+                .is_ok_and(|route| route == Some(yielded.route))
+            && win32k_glue::win32k_client_context_is_admitted(pending.snapshot.client)
+            && crate::current_win32k_provider_domain().is_some_and(|provider| {
+                provider.domain == yielded.owner.provider_domain
+                    && provider.generation == yielded.owner.provider_generation
+            });
+        if !exact {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        }
+        let Ok(return_target) = HostedReturnTarget::new(root_reply, None) else {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        };
+        let continuation = ComponentNativeContinuation::Hosted(HostedNativeContinuation {
+            pending: PendingComponentDispatch::RootMaintenance(pending),
+            return_target,
+            destination,
+        });
+        if !root_maintenance_owner::store_continuation(ticket, continuation) {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        }
+        let acquired = root_maintenance_owner::with_physical(ticket, |physical| physical.acquire())
+            .is_some_and(|result| result.is_ok());
+        if !acquired {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        }
+        let key = nt_component_suspension::SuspensionKey::root_maintenance(yielded.dispatch.epoch());
+        let sequence = next_dispatcher_wait_sequence();
+        let Some(continuation) = root_maintenance_owner::take_continuation(ticket) else {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        };
+        let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+        if let Err((_, continuation)) = lanes.admit_root_maintenance_owned(
+            lane, yielded.reply, yielded.dispatch, key, sequence, yielded.owner,
+            yielded.captured_pass, continuation,
+        ) {
+            let _ = root_maintenance_owner::restore_continuation(ticket, continuation);
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        }
+        if !root_maintenance_owner::mark_admitted(ticket, key) {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        }
+        if reply_park.try_commit().is_err() {
+            return PendingWin32kHandoff {
+                callback_suspended, admitted_dispatch_id, parked,
+                maintenance_ticket, retained_failure: true,
+            };
+        }
+        parked = true;
+        return PendingWin32kHandoff {
+            callback_suspended, admitted_dispatch_id, parked,
+            maintenance_ticket, retained_failure,
+        };
+    }
+    if let Some(pending) = win32k_glue::take_pending_receive_dispatch() {
+        trace_cursor_lookup_owner("handoff-kind:receive", pending.snapshot.client,
+            pending.snapshot.dispatch.ssn, pending.snapshot.dispatch.dispatch_id,
+            Some(pending.snapshot.dispatch.lane), true, true, false);
+        admitted_dispatch_id = pending.snapshot.dispatch.dispatch_id;
+        parked = receive_admit_current(pending, destination);
+        assert!(parked, "Receive retains parked parent and original client Reply");
+    } else if let Some(pending) = win32k_glue::take_pending_service_wait_dispatch() {
+        trace_cursor_lookup_owner("handoff-kind:service-wait", pending.snapshot.client,
+            pending.snapshot.dispatch.ssn, pending.snapshot.dispatch.dispatch_id,
+            Some(pending.snapshot.dispatch.lane), true, true, false);
+        admitted_dispatch_id = pending.snapshot.dispatch.dispatch_id;
+        match service_wait_admit_current(pending, destination) {
+            RetainedWaitAdmission::Accepted => parked = true,
+            RetainedWaitAdmission::RefusedNoEffect => {
+                let restored = win32k_glue::restore_pending_service_wait_dispatch(pending);
+                trace_win32k_handoff_refusal(if restored {
+                    b"service-wait-refused-restored"
+                } else { b"service-wait-refused-restore-failed" });
+                retained_failure = true;
+            }
+            RetainedWaitAdmission::Indeterminate => {
+                trace_win32k_handoff_refusal(b"service-wait-indeterminate");
+                retained_failure = true;
+            }
+        }
+    } else if let Some(pending) = win32k_glue::take_pending_provider_wait_dispatch() {
+        trace_cursor_lookup_owner("handoff-kind:provider-wait", pending.client,
+            pending.dispatch.ssn, pending.dispatch.dispatch_id,
+            Some(pending.dispatch.lane), true, true, false);
+        admitted_dispatch_id = pending.dispatch.dispatch_id;
+        parked = provider_wait_admit_current(handler, pending, None, destination)
+            == RetainedWaitAdmission::Accepted;
+        assert!(parked, "provider wait could not reserve its native continuation");
+    } else if let Some(pending) = win32k_glue::take_pending_lpc_wait_dispatch() {
+        trace_cursor_lookup_owner("handoff-kind:lpc-wait", pending.client,
+            pending.dispatch.ssn, pending.dispatch.dispatch_id,
+            Some(pending.dispatch.lane), true, true, false);
+        admitted_dispatch_id = pending.dispatch.dispatch_id;
+        parked = lpc_wait_admit_current(handler, pending, None, destination)
+            == RetainedWaitAdmission::Accepted;
+        assert!(parked, "LPC wait could not reserve its native continuation");
+    }
+    assert!(!callback_suspended || !parked, "callback and provider wait cannot share one native yield");
+    PendingWin32kHandoff {
+        callback_suspended, admitted_dispatch_id, parked,
+        maintenance_ticket, retained_failure,
+    }
 }
 
 unsafe fn component_suspension_cancel_scope(
@@ -1851,7 +2918,10 @@ unsafe fn component_suspension_cancel_scope(
             .clone();
         let external_cancelled = match wait_key.kind {
             nt_component_suspension::SuspensionKind::Receive
-            | nt_component_suspension::SuspensionKind::ServiceWait => return false,
+            | nt_component_suspension::SuspensionKind::RootIngress
+            | nt_component_suspension::SuspensionKind::ServiceWait
+            | nt_component_suspension::SuspensionKind::RootMaintenance
+            | nt_component_suspension::SuspensionKind::NestedRestore => return false,
             nt_component_suspension::SuspensionKind::ProviderWait => {
                 (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER))
                     .cancel(nt_handler, wait_key.id, 0xC000_0120u32 as i32)
@@ -1901,6 +2971,14 @@ pub(crate) unsafe fn provider_wait_cancel_client_thread(
     if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).total_suspensions() == 0 {
         return true;
     }
+    let source = (&*nt_handler.thread_runtime.table).entries.iter()
+        .filter_map(|slot| slot.owner())
+        .find(|runtime| runtime.binding().tid == tid)
+        .map(|runtime| runtime.binding());
+    let Some(source) = source else { return false; };
+    if !component_return::prepare_abandoned_initial_source_replies(
+        component_return::InitialSourceScope::Thread(source),
+    ) { return false; }
     let Some(provider) = crate::current_win32k_provider_domain() else {
         return false;
     };
@@ -1933,6 +3011,14 @@ pub(crate) unsafe fn provider_wait_cancel_client_process(
     if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).total_suspensions() == 0 {
         return true;
     }
+    let Some(process) = nt_handler.capture_process_identity(process_index as usize) else {
+        return false;
+    };
+    if !component_return::prepare_abandoned_initial_source_replies(
+        component_return::InitialSourceScope::Process {
+            pi: process_index as usize, process,
+        },
+    ) { return false; }
     let Some(provider) = crate::current_win32k_provider_domain() else {
         return false;
     };
@@ -1974,6 +3060,21 @@ pub(crate) unsafe fn client_has_vm_continuations(pi: u32) -> bool {
             .is_some_and(|wait| wait.continuation.pi == pi))
         || requests.occupied_slots().any(|slot| requests.get(slot)
             .is_some_and(|wait| wait.continuation.pi == pi))
+}
+
+/// A process layout cannot retire while a Receive or Request wait still owns its exact Reply.
+/// Indeterminate send/cancel phases remain visible in the same occupied rows.
+pub(crate) unsafe fn lpc_wait_dependents_quiescent_exact(
+    pi: usize,
+    process: nt_user_host::process_identity::ProcessIdentity,
+) -> bool {
+    let receives = &*core::ptr::addr_of!(LPC_RECEIVE_WAITS);
+    let requests = &*core::ptr::addr_of!(LPC_REQUEST_WAITS);
+    !receives.occupied_slots().any(|slot| receives.get(slot).is_some_and(|wait| {
+        wait.continuation.pi as usize == pi && wait.continuation.process == process
+    })) && !requests.occupied_slots().any(|slot| requests.get(slot).is_some_and(|wait| {
+        wait.continuation.pi as usize == pi && wait.continuation.process == process
+    }))
 }
 
 fn component_suspension_owns_hosted_dispatch(dispatch_id: u64) -> bool {
@@ -2094,6 +3195,15 @@ unsafe fn process_completed_user_callback_outer_dispatch(
     completion_faults: usize,
     completion_scratch_base: u64,
 ) -> bool {
+    if let Some(context) = dispatch.dispatch_context {
+        let requester_generation = nt_handler.hosted_process_generation(completion_pi).unwrap_or(0);
+        if !win32k_bulk_mapping::complete_dispatch(
+            context, completion_pi as u32, requester_generation,
+            dispatch.dispatch_return, dispatch.status,
+        ) {
+            return false;
+        }
+    }
     if let Some(claim) = dispatch.paint_output {
         if !copy_completed_paint_output(
             nt_handler,
@@ -2358,7 +3468,7 @@ unsafe fn drain_deferred_user_callback_returns(
         if let Some(completion) = completion {
             let completion_pi = deferred.pi as usize;
             effects_ok = completion_pi < MAX_PI;
-            if effects_ok {
+            if effects_ok && !matches!(completion, win32k_glue::CompletedUserCallback::CaptureRefused { .. }) {
                 effects_ok = sync_completed_user_callback_win32k_context(
                     nt_handler,
                     completion_pi,
@@ -2366,6 +3476,15 @@ unsafe fn drain_deferred_user_callback_returns(
                 );
             }
             match completion {
+                win32k_glue::CompletedUserCallback::CaptureRefused {
+                    lane, callback_token, provider_reply_cap,
+                } => {
+                    let _ = provider_reply_cap; // The exact provider Reply, including zero, is retained as evidence.
+                    assert!(win32k_glue::retain_callback_outer_reply(
+                        lane, callback_token, deferred.reply_cap,
+                    ), "refused callback lost its two exact Reply owners");
+                    retained_reply = true;
+                }
                 win32k_glue::CompletedUserCallback::Completed { outer_dispatch, callback_context } => {
                     staged_context = Some(callback_context);
                     if let Some(dispatch) = outer_dispatch {
@@ -2419,7 +3538,8 @@ unsafe fn drain_deferred_user_callback_returns(
                             token: callback_token,
                             context: callback_context,
                         }),
-                    ));
+                        HostedContinuationDestination::Win32k,
+                    ) == RetainedWaitAdmission::Accepted);
                     retained_reply = true;
                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                 }
@@ -2436,7 +3556,8 @@ unsafe fn drain_deferred_user_callback_returns(
                             token: callback_token,
                             context: callback_context,
                         }),
-                    ));
+                        HostedContinuationDestination::Win32k,
+                    ) == RetainedWaitAdmission::Accepted);
                     retained_reply = true;
                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                 }
@@ -2452,6 +3573,7 @@ unsafe fn drain_deferred_user_callback_returns(
                             token: callback_token,
                             context: callback_context,
                         }),
+                        HostedContinuationDestination::Win32k,
                     ));
                     retained_reply = true;
                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
@@ -2468,6 +3590,7 @@ unsafe fn drain_deferred_user_callback_returns(
                             token: callback_token,
                             context: callback_context,
                         }),
+                        HostedContinuationDestination::Win32k,
                     ));
                     retained_reply = true;
                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
@@ -2936,11 +4059,52 @@ unsafe fn reset_service_hosted_loaded_images_work() -> &'static mut HostedLoaded
 
 #[inline(never)]
 unsafe fn reset_service_generic_sections_work() -> *mut GenericSectionTable {
+    if SERVICE_GENERIC_SECTIONS_INITIALIZED.load(Ordering::Acquire) {
+        // DriverEntry already populated this very table with canonical kernel Sections.
+        // Preserve their identities and frames through the Ps/service handoff.
+        return core::ptr::addr_of_mut!(SERVICE_GENERIC_SECTIONS_WORK);
+    }
+    SERVICE_GENERIC_SECTIONS_INITIALIZED.store(false, Ordering::Release);
     let slot = core::ptr::addr_of_mut!(SERVICE_GENERIC_SECTIONS_WORK);
     if !(*slot).reset() {
         panic!("generic section table allocation failed");
     }
+    SERVICE_GENERIC_SECTIONS_INITIALIZED.store(true, Ordering::Release);
     slot
+}
+
+pub(crate) unsafe fn initialize_bootstrap_generic_sections_work() {
+    let _durable = allocator::enter_durable();
+    assert!(!SERVICE_GENERIC_SECTIONS_INITIALIZED.load(Ordering::Acquire));
+    let _ = reset_service_generic_sections_work();
+    BOOTSTRAP_SECTION_OWNER_ACTIVE.store(true, Ordering::Release);
+}
+
+/// DriverEntry's authenticated kernel Section lane uses the same table later adopted by the
+/// service loop, but has no ExecNtHandler or process paging context.
+pub(crate) fn bootstrap_section_table() -> Result<*mut GenericSectionTable, u32> {
+    if !BOOTSTRAP_SECTION_OWNER_ACTIVE.load(Ordering::Acquire)
+        || SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) != 0
+        || !SERVICE_GENERIC_SECTIONS_INITIALIZED.load(Ordering::Acquire)
+    { return Err(0xc000_00a3); }
+    Ok(core::ptr::addr_of_mut!(SERVICE_GENERIC_SECTIONS_WORK))
+}
+
+/// The initialized canonical Section table is owned by the registered service handler even
+/// while DriverEntry runs outside a per-process loop context. A stale handler or an unrelated
+/// loop context cannot borrow it.
+pub(crate) unsafe fn registered_section_table_for_handler(
+    handler: *const ExecNtHandler,
+) -> Result<*mut GenericSectionTable, u32> {
+    let live = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire);
+    if handler.is_null() || live == 0 || live != handler as u64
+        || !SERVICE_GENERIC_SECTIONS_INITIALIZED.load(Ordering::Acquire)
+    { return Err(0xc000_00a3); }
+    let table = core::ptr::addr_of_mut!(SERVICE_GENERIC_SECTIONS_WORK);
+    if (*handler).loop_ctx.is_some_and(|ctx| ctx.generic_sections != table) {
+        return Err(nt_process::STATUS_INVALID_HANDLE);
+    }
+    Ok(table)
 }
 
 pub(crate) fn service_generic_section_stats() -> GenericSectionTableStats {
@@ -2995,20 +4159,152 @@ fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
     let status = finalize_service_loop_work(nt_handler);
     // Include readiness created by any late post-action, on success and failure paths alike.
     unsafe { component_resume::reconcile(nt_handler) };
+    if unsafe { driver_launch::hosted_scsi_receive_boundary_probe_due() } {
+        let _message = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
+        unsafe { driver_launch::trace_hosted_scsi_receive_boundary() };
+    }
+    unsafe { rearm_requested_mounted_native_timer(nt_handler) };
     status
 }
 
-const SYSTEM_WAL_FOLD_INTERVAL_100NS: u64 = 5 * 10_000_000;
-static SYSTEM_WAL_LAST_FOLD_100NS: AtomicU64 = AtomicU64::new(0);
+fn report_service_finalize_failure(stage: &[u8], status: u32) -> u32 {
+    print_str(b"[service-finalize] stage=");
+    print_str(stage);
+    print_str(b" status=0x");
+    print_hex(status);
+    print_str(b"\n");
+    status
+}
+
+const SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS: u64 = 5 * 10_000_000;
+static SYSTEM_WAL_FIRST_DIRTY_100NS: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_WAL_USED_SECTORS: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_WAL_CAPACITY_SECTORS: AtomicU64 = AtomicU64::new(0);
+// A timer scan records demand without entering CM or native snapshot I/O while its delivery
+// gate and dispatcher borrows are live. The next safe service boundary owns the attempt.
+static SYSTEM_WAL_FOLD_DUE: AtomicBool = AtomicBool::new(false);
+// DUE keeps the retry deadline armed; READY grants one receive-boundary attempt.
+static SYSTEM_WAL_FOLD_READY: AtomicBool = AtomicBool::new(false);
+static SYSTEM_WAL_FOLD_RUNNING: AtomicBool = AtomicBool::new(false);
+static SYSTEM_WAL_FOLD_RETRY_100NS: AtomicU64 = AtomicU64::new(0);
+
+fn retire_system_wal_fold_demand() {
+    SYSTEM_WAL_FOLD_READY.store(false, Ordering::Release);
+    SYSTEM_WAL_FOLD_DUE.store(false, Ordering::Release);
+    SYSTEM_WAL_FOLD_RETRY_100NS.store(0, Ordering::Release);
+}
+
+/// Called only after the exact WAL continuation and both anchored snapshot headers are
+/// installed. All durable volume WAL users share this publication boundary.
+pub(crate) fn note_durable_system_wal_mutation(used_sectors: u64, capacity_sectors: u64) {
+    let now = monotonic_time_100ns().max(1);
+    let _ = SYSTEM_WAL_FIRST_DIRTY_100NS.compare_exchange(
+        0, now, Ordering::AcqRel, Ordering::Acquire,
+    );
+    SYSTEM_WAL_USED_SECTORS.store(used_sectors, Ordering::Release);
+    SYSTEM_WAL_CAPACITY_SECTORS.store(capacity_sectors, Ordering::Release);
+    let first_dirty = SYSTEM_WAL_FIRST_DIRTY_100NS.load(Ordering::Acquire);
+    if crate::wal_fold_cadence::background_fold_due(
+        first_dirty, now, used_sectors, capacity_sectors,
+    ) {
+        if !SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire) {
+            SYSTEM_WAL_FOLD_RETRY_100NS.store(
+                now.saturating_add(SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS), Ordering::Release,
+            );
+            if SYSTEM_WAL_FOLD_DUE.compare_exchange(
+                false, true, Ordering::AcqRel, Ordering::Acquire,
+            ).is_ok() {
+                SYSTEM_WAL_FOLD_READY.store(true, Ordering::Release);
+            }
+        }
+    }
+    unsafe { rearm_registered_active_delay_timer() };
+}
+
+pub(crate) fn note_system_wal_fold_complete() {
+    SYSTEM_WAL_FIRST_DIRTY_100NS.store(0, Ordering::Release);
+    SYSTEM_WAL_USED_SECTORS.store(0, Ordering::Release);
+    SYSTEM_WAL_CAPACITY_SECTORS.store(0, Ordering::Release);
+    // An explicit or asynchronously completed fold bypasses maybe_fold_system_wal's success
+    // branch. Its exact paired snapshot and CM ACK retire the pending timer demand as well.
+    retire_system_wal_fold_demand();
+}
 
 pub(crate) fn system_wal_fold_next_deadline() -> Option<u64> {
+    if SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire) {
+        return Some(SYSTEM_WAL_FOLD_RETRY_100NS.load(Ordering::Acquire));
+    }
     if !unsafe { crate::writable_fs::writable_fs_mounted() }
         || crate::writable_fs::legacy_snapshot_writes_allowed()
     {
         return None;
     }
-    let last = SYSTEM_WAL_LAST_FOLD_100NS.load(Ordering::Relaxed);
-    (last != 0).then(|| last.saturating_add(SYSTEM_WAL_FOLD_INTERVAL_100NS))
+    crate::wal_fold_cadence::next_background_fold_deadline(
+        match SYSTEM_WAL_FIRST_DIRTY_100NS.load(Ordering::Acquire) {
+            0 => None,
+            at => Some(at),
+        },
+    )
+}
+
+/// Read-only receive-boundary diagnostic. Fields are sampled independently; the
+/// timer selector remains the sole authority for choosing a wake deadline.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SystemWalFoldObservation {
+    pub(crate) next_deadline: Option<u64>,
+    pub(crate) due: bool,
+    pub(crate) ready: bool,
+    pub(crate) running: bool,
+    pub(crate) retry_100ns: u64,
+    pub(crate) first_dirty_100ns: u64,
+}
+
+pub(crate) fn system_wal_fold_observation() -> SystemWalFoldObservation {
+    SystemWalFoldObservation {
+        next_deadline: system_wal_fold_next_deadline(),
+        due: SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire),
+        ready: SYSTEM_WAL_FOLD_READY.load(Ordering::Acquire),
+        running: SYSTEM_WAL_FOLD_RUNNING.load(Ordering::Acquire),
+        retry_100ns: SYSTEM_WAL_FOLD_RETRY_100NS.load(Ordering::Acquire),
+        first_dirty_100ns: SYSTEM_WAL_FIRST_DIRTY_100NS.load(Ordering::Acquire),
+    }
+}
+
+pub(crate) fn record_due_system_wal_fold(now_100ns: u64) -> u64 {
+    if !system_wal_fold_next_deadline().is_some_and(|deadline| deadline <= now_100ns) {
+        return 0;
+    }
+    // If CM is still busy, keep a fixed future retry rather than minimum-arming the same
+    // overdue shot. The WAL remains durable; this is only the background image fold.
+    SYSTEM_WAL_FOLD_RETRY_100NS.store(
+        now_100ns.saturating_add(SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS), Ordering::Release,
+    );
+    SYSTEM_WAL_FOLD_DUE.store(true, Ordering::Release);
+    SYSTEM_WAL_FOLD_READY.store(true, Ordering::Release);
+    1
+}
+
+pub(crate) fn system_wal_fold_work_pending() -> bool {
+    SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire)
+        && SYSTEM_WAL_FOLD_READY.load(Ordering::Acquire)
+        && !SYSTEM_WAL_FOLD_RUNNING.load(Ordering::Acquire)
+        && crate::config_manager_channel_idle()
+}
+
+/// Enter the same physical fold contract as the outer finalizer, but only after the nested
+/// receiver has parked its exact parent. A busy native fold retains its owner and async work.
+pub(crate) fn service_due_system_wal_fold() -> Result<bool, u32> {
+    if !system_wal_fold_work_pending() {
+        return Ok(false);
+    }
+    if SYSTEM_WAL_FOLD_RUNNING.swap(true, Ordering::AcqRel) {
+        return Ok(false);
+    }
+    SYSTEM_WAL_FOLD_READY.store(false, Ordering::Release);
+    let result = maybe_fold_system_wal();
+    SYSTEM_WAL_FOLD_RUNNING.store(false, Ordering::Release);
+    result?;
+    Ok(!SYSTEM_WAL_FOLD_DUE.load(Ordering::Acquire))
 }
 
 /// Coalesce CM-owned SYSTEM mutations independently of ordinary file snapshot dirtiness.
@@ -3018,22 +4314,35 @@ fn maybe_fold_system_wal() -> Result<(), u32> {
     if !unsafe { crate::writable_fs::writable_fs_mounted() }
         || crate::writable_fs::legacy_snapshot_writes_allowed()
     {
+        retire_system_wal_fold_demand();
         return Ok(());
     }
-    let now = monotonic_time_100ns();
-    let last = SYSTEM_WAL_LAST_FOLD_100NS.load(Ordering::Relaxed);
-    if last == 0 {
-        SYSTEM_WAL_LAST_FOLD_100NS.store(now, Ordering::Relaxed);
-        unsafe { rearm_registered_active_delay_timer() };
+    let first_dirty = SYSTEM_WAL_FIRST_DIRTY_100NS.load(Ordering::Acquire);
+    if first_dirty == 0 {
+        // No epoch exists to fold. Retire stale timer demand without publishing a fold ACK.
+        retire_system_wal_fold_demand();
         return Ok(());
     }
-    if now.saturating_sub(last) < SYSTEM_WAL_FOLD_INTERVAL_100NS {
+    let Some(now) = crate::wal_fold_cadence::background_fold_due_time_if_owned(
+        Some(first_dirty),
+        SYSTEM_WAL_USED_SECTORS.load(Ordering::Acquire),
+        SYSTEM_WAL_CAPACITY_SECTORS.load(Ordering::Acquire),
+        monotonic_time_100ns,
+    ) else {
         return Ok(());
-    }
+    };
     let _transient = allocator::enter_transient();
     let _alloc_ctx = allocator::enter_context(allocator::ALLOC_CTX_WRITABLE_SNAPSHOT);
     let result = unsafe { crate::writable_fs::fold_system_wal_if_dirty() };
-    SYSTEM_WAL_LAST_FOLD_100NS.store(now, Ordering::Relaxed);
+    if result.is_ok() {
+        SYSTEM_WAL_FOLD_DUE.store(false, Ordering::Release);
+        SYSTEM_WAL_FOLD_RETRY_100NS.store(0, Ordering::Release);
+    } else if !crate::writable_fs::system_wal_fold_blocked() {
+        SYSTEM_WAL_FOLD_RETRY_100NS.store(
+            now.saturating_add(SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS), Ordering::Release,
+        );
+        SYSTEM_WAL_FOLD_DUE.store(true, Ordering::Release);
+    }
     unsafe { rearm_registered_active_delay_timer() };
     match result {
         Ok(_) => Ok(()),
@@ -3044,8 +4353,45 @@ fn maybe_fold_system_wal() -> Result<(), u32> {
 }
 
 fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
+    if let Some(status) = redrive_service_loop_global_work(nt_handler) {
+        return status;
+    }
+    checkpoint_service_loop_volume(nt_handler)
+}
+
+/// Advance retained service owners before attempting a mounted-volume checkpoint.
+/// A pending fold ACK, journal volume owner, or section-retirement error can defer it.
+fn redrive_service_loop_global_work(nt_handler: &mut ExecNtHandler) -> Option<u32> {
+    // A native directory caller owns its original Reply until the exact Object Manager
+    // request and local handle publication settle. Redrive before WAL early returns.
+    {
+        let _message = unsafe { crate::ipc_message::SavedMessageBuffer::capture() };
+        unsafe { crate::native_directory_open_work::redrive(nt_handler) };
+        unsafe { crate::native_file_target_open_work::redrive(nt_handler) };
+        unsafe { crate::native_directory_effect_work::redrive_effects(nt_handler) };
+        unsafe { crate::native_directory_effect_work::redrive_detached(nt_handler) };
+    }
     nt_handler.sweep_directory_security_bodies();
     nt_handler.sweep_data_section_security();
+    // A hosted import can consume its last object reference while its primary Call still owns
+    // the Reply. The dynamic delete drain waits for that primary's exact ready receipt, then
+    // invokes DeleteProcedure on a separate PASSIVE worker.
+    unsafe { driver_launch::hosted_driver_dynamic_delete::drain(); }
+    unsafe { driver_launch::hosted_provider_export_lane::drain(); }
+    unsafe { spawn_hosts::shared_ingress::owner::runtime::nested::drain_abort(); }
+    unsafe { win32k_glue::drain_win32k_startup_restores(); }
+    if unsafe { driver_launch::hosted_driver_dynamic_delete::next_deadline() }.is_some() {
+        unsafe { rearm_registered_active_delay_timer_with_handler(nt_handler) };
+    }
+    if unsafe { driver_launch::hosted_provider_export_lane::next_deadline() }.is_some() {
+        unsafe { rearm_registered_active_delay_timer_with_handler(nt_handler) };
+    }
+    if spawn_hosts::shared_ingress::owner::runtime::nested::next_abort_deadline().is_some() {
+        unsafe { rearm_registered_active_delay_timer_with_handler(nt_handler) };
+    }
+    if unsafe { win32k_glue::win32k_startup_restore_next_deadline() }.is_some() {
+        unsafe { rearm_registered_active_delay_timer_with_handler(nt_handler) };
+    }
     // A completed physical fold can be waiting only for its exact CM ACK. It still owns the
     // reserve, so redrive that receipt before any ordinary snapshot tries to acquire it.
     if crate::writable_fs::system_wal_fold_ack_pending() {
@@ -3053,15 +4399,19 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
             // The completed fold is durable, but the CM ACK result is uncertain. Keep its
             // physical reserve and token, and let the next timer wake retry this exact ACK.
             // An ordinary checkpoint cannot acquire the reserve until that proof arrives.
-            SYSTEM_WAL_LAST_FOLD_100NS.store(monotonic_time_100ns(), Ordering::Relaxed);
+            SYSTEM_WAL_FOLD_RETRY_100NS.store(
+                monotonic_time_100ns().saturating_add(SYSTEM_WAL_FOLD_RETRY_INTERVAL_100NS),
+                Ordering::Release,
+            );
+            SYSTEM_WAL_FOLD_DUE.store(true, Ordering::Release);
             unsafe { rearm_registered_active_delay_timer() };
-            return nt_fs::STATUS_SUCCESS;
+            return Some(nt_fs::STATUS_SUCCESS);
         }
     }
     // The journal owns the mounted volume, including all dirty state, until its terminal proof.
     // Leave maintenance flags untouched; an unavailable volume is neither clean nor absent.
     if crate::writable_fs::registry_journal::owns_volume() {
-        return nt_fs::STATUS_SUCCESS;
+        return Some(nt_fs::STATUS_SUCCESS);
     }
     unsafe { kernel_provider_activation::publish_runtime_waits(nt_handler) };
     unsafe { inline_file_retirement::redrive(nt_handler) };
@@ -3096,10 +4446,32 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
         if let Err(status) = unsafe {
             service_drain_section_retirement_for_handler(&mut *ctx.generic_sections, nt_handler)
         } {
-            return status;
+            return Some(report_service_finalize_failure(b"section-retirement", status));
         }
     }
     unsafe { crate::writable_fs::redrive_file_cleanup_work() };
+    None
+}
+
+/// Claim dirty state and publish the mounted-volume checkpoint at the original service boundary.
+fn checkpoint_service_loop_volume(nt_handler: &mut ExecNtHandler) -> u32 {
+    let checkpoint_status = match publish_required_dirty_volume(nt_handler) {
+        Ok(status) => status,
+        Err(status) => return status,
+    };
+    if checkpoint_status == nt_fs::STATUS_SUCCESS {
+        if let Err(status) = fold_background_system_wal(nt_handler) {
+            return status;
+        }
+    }
+    if checkpoint_status != nt_fs::STATUS_SUCCESS {
+        return report_service_finalize_failure(b"volume-checkpoint", checkpoint_status);
+    }
+    checkpoint_status
+}
+
+/// Preserve dirty-state and commit requirements until the volume snapshot is durable.
+fn publish_required_dirty_volume(nt_handler: &mut ExecNtHandler) -> Result<u32, u32> {
     let writable_fs_mount_dirty = crate::writable_fs::take_mount_dirty();
     let writable_fs_runtime_dirty = crate::writable_fs::take_runtime_dirty();
     let writable_fs_touched =
@@ -3111,7 +4483,7 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
         if crate::writable_fs::snapshot_restore_seen() {
             if let Err(status) = nt_handler.refresh_boot_hive_checkpoints_from_writable_config() {
                 nt_handler.writable_fs_dirty = true;
-                return status;
+                return Err(report_service_finalize_failure(b"hive-refresh", status));
             }
         }
         if nt_handler.writable_fs_commit_required {
@@ -3141,46 +4513,95 @@ fn finalize_service_loop_work(nt_handler: &mut ExecNtHandler) -> u32 {
         nt_handler.writable_fs_dirty = true;
         nt_handler.writable_fs_commit_required = true;
     }
-    if checkpoint_status == nt_fs::STATUS_SUCCESS {
-        if let Err(status) = maybe_fold_system_wal() {
-            nt_handler.writable_fs_dirty = true;
-            nt_handler.writable_fs_commit_required = true;
-            return status;
-        }
+    Ok(checkpoint_status)
+}
+
+/// Background WAL folding follows a successful required checkpoint. Its current failure remains
+/// a service-boundary refusal and retains both dirty retry signals.
+fn fold_background_system_wal(nt_handler: &mut ExecNtHandler) -> Result<(), u32> {
+    if let Err(status) = maybe_fold_system_wal() {
+        nt_handler.writable_fs_dirty = true;
+        nt_handler.writable_fs_commit_required = true;
+        return Err(report_service_finalize_failure(b"system-wal-fold", status));
     }
-    checkpoint_status
+    Ok(())
+}
+
+/// The native lookup owner has already parked its original Reply. Publish a pending canonical
+/// CREATE with that saved capability, or cancel its unused File reservation after inline work.
+pub(crate) unsafe fn finish_preparked_file_target_dispatch(
+    handler: &mut ExecNtHandler,
+    status: u32,
+    reply: u64,
+    native_call_transport: bool,
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+) -> bool {
+    if let Some(pending) = handler.pending_file_io_transfer.as_mut() {
+        assert_eq!(status, nt_status::NtStatus::PENDING.raw() as u32);
+        assert_ne!(reply, 0);
+        assert_eq!(pending.reply_cap, 0);
+        pending.reply_cap = reply;
+        pending.reply_required = true;
+        pending.native_call_transport = native_call_transport;
+    }
+    let handoff = file_dispatch_handoff::before_post_action(
+        handler, ExecPostAction::None, native_call_transport, resume_ip, sp, flags,
+    );
+    if handoff.inline_retirement_needs_redrive() {
+        inline_file_retirement::redrive(handler);
+    }
+    file_dispatch_handoff::finish_after_inline_retirement(handler, handoff).is_some()
 }
 
 fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
-    let dynamic_status = nt_handler.checkpoint_dirty_dynamic_mutable_hives();
+    let legacy = crate::writable_fs::legacy_snapshot_writes_allowed();
+    let dynamic_status = if legacy {
+        nt_handler.checkpoint_dirty_dynamic_mutable_hives()
+    } else {
+        nt_fs::STATUS_SUCCESS
+    };
     if dynamic_status != nt_fs::STATUS_SUCCESS {
         return dynamic_status;
     }
     if !unsafe { crate::writable_fs::writable_fs_mounted() } {
-        return nt_fs::STATUS_SUCCESS;
-    }
-    if !crate::writable_fs::legacy_snapshot_writes_allowed() {
-        let fold = unsafe { crate::writable_fs::fold_system_wal_if_dirty() };
-        if let Err(status) = fold {
-            return status;
-        }
+        return if legacy {
+            nt_fs::STATUS_SUCCESS
+        } else {
+            nt_handler.verify_clean_dynamic_hives_at_quiesce()
+        };
     }
     let dirty_cells = nt_handler.boot_mutable_hive_dirty_cells();
     let pending_journal_records = nt_handler.mutable_hive_journal_pending_records;
-    if dirty_cells == 0 && pending_journal_records == 0
+    if legacy && dirty_cells == 0 && pending_journal_records == 0
         && !nt_handler.writable_fs_commit_required
     {
         return nt_fs::STATUS_SUCCESS;
     }
-    print_str(b"[cm-flush] quiesce boot hive checkpoint dirty-cells=");
+    if legacy {
+        print_str(b"[cm-flush] quiesce boot hive checkpoint dirty-cells=");
+    } else {
+        print_str(b"[cm-flush] quiesce v2 boot hive WAL proof dirty-cells=");
+    }
     print_u64(dirty_cells as u64);
     print_str(b"\n");
-    let status = nt_handler.checkpoint_dirty_boot_mutable_hives_preserving_headroom();
+    let status = if legacy {
+        nt_handler.checkpoint_dirty_boot_mutable_hives_preserving_headroom()
+    } else {
+        nt_handler.verify_durable_v2_mutable_hives()
+    };
     if status != nt_fs::STATUS_SUCCESS {
         print_str(b"[cm-flush] quiesce boot hive checkpoint failed status=0x");
         print_hex(status);
         print_str(b"\n");
         return status;
+    }
+    if !legacy {
+        // The exact paired WAL and a clean snapshot were proven under the physical reserve.
+        // Folding a WAL or launching a native checkpoint here would require replies from the
+        // receive loop that has already terminated.
+        return nt_fs::STATUS_SUCCESS;
     }
     if pending_journal_records != 0 {
         print_str(b"[cm-flush] quiesce mutable hive journal snapshot records=");
@@ -3988,6 +5409,7 @@ unsafe fn register_service_delay_drain_context(
     handler: &mut ExecNtHandler,
     queue: &mut nt_delay_execution::Queue,
 ) {
+    BOOTSTRAP_SECTION_OWNER_ACTIVE.store(false, Ordering::Release);
     SERVICE_DELAY_DRAIN_HANDLER.store(handler as *mut ExecNtHandler as u64, Ordering::Release);
     SERVICE_DELAY_DRAIN_QUEUE.store(
         queue as *mut nt_delay_execution::Queue as u64,
@@ -4080,21 +5502,138 @@ pub(crate) unsafe fn rearm_registered_delay_timer() -> nt_kernel_exec::TimerRear
 
 /// Scheduler completion may rearm the live owner, but cannot initialize a bootstrap timer.
 pub(crate) unsafe fn rearm_registered_active_delay_timer() {
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *const ExecNtHandler;
+    if !handler.is_null() {
+        rearm_registered_active_delay_timer_with_handler(&*handler);
+    }
+}
+
+/// Rearm from a native owner that already borrows the live handler. The broker must release
+/// its mutable state before deadline selection reads that same state.
+pub(crate) unsafe fn rearm_registered_active_delay_timer_with_handler(handler: &ExecNtHandler) {
     if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0
         || DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire) != DELAY_TIMER_IRQ_ACTIVE
     {
         return;
     }
-    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *const ExecNtHandler;
     let queue = SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) as *const nt_delay_execution::Queue;
-    if !handler.is_null() && !queue.is_null() {
-        delay_timer_rearm(&*queue, &*handler);
+    if !queue.is_null() {
+        delay_timer_rearm(&*queue, handler);
     }
+}
+
+/// Backend dispatch only publishes a request. The live handler is read at an outer boundary,
+/// after backend and mounted queue borrows have been released.
+static MOUNTED_NATIVE_TIMER_REARM_DEMAND: nt_kernel_exec::TimerRearmDemand =
+    nt_kernel_exec::TimerRearmDemand::new();
+
+pub(crate) fn request_mounted_native_timer_rearm() {
+    let now = monotonic_time_100ns();
+    crate::driver_launch::publish_mounted_native_block_wake(now);
+    request_mounted_native_timer_rearm_after_service();
+}
+
+pub(crate) fn request_mounted_native_timer_rearm_after_service() {
+    MOUNTED_NATIVE_TIMER_REARM_DEMAND.publish();
+}
+
+unsafe fn rearm_requested_mounted_native_timer(handler: &ExecNtHandler) {
+    if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) == 0
+        || DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire) != DELAY_TIMER_IRQ_ACTIVE
+        || SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) == 0
+    {
+        return;
+    }
+    let Some(attempt) = MOUNTED_NATIVE_TIMER_REARM_DEMAND
+        .begin(crate::mounted_volume::mounted_sector_claimable()) else { return };
+    let queue = SERVICE_DELAY_DRAIN_QUEUE.load(Ordering::Acquire) as *const nt_delay_execution::Queue;
+    let outcome = delay_timer_rearm(&*queue, handler);
+    let _ = attempt.finish(outcome);
+}
+
+/// Resolve the active process handle table for a win32k Event handle operation.
+/// KeStackAttachProcess changes this table without changing the original IPC caller.
+fn resolve_win32k_event_handle_pi(
+    handler: &ExecNtHandler,
+    channel: &spawn_hosts::PumpChannel,
+    original_pi: usize,
+) -> Result<usize, u32> {
+    let invalid = nt_process::STATUS_INVALID_HANDLE;
+    let logical = channel.logical_caller.ok_or(invalid)?;
+    if !handler.validate_provider_logical_caller(logical)
+        || logical.pi() != original_pi
+        || logical.pi() as u64 != channel.client_pi
+        || logical.process().generation !=
+            nt_user_host::process_identity::ProcessGeneration::Hosted(channel.client_generation)
+    {
+        return Err(invalid);
+    }
+    let active = unsafe { crate::win32k_glue::current_query_process(logical, channel.pml4) }
+        .ok_or(invalid)?;
+    if handler.pm_pid_for_pi(active.pi) != Some(active.process.pid)
+        || handler.hosted_process_generation(active.pi)
+            != match active.process.generation {
+                nt_user_host::process_identity::ProcessGeneration::Hosted(generation) => Some(generation),
+                _ => None,
+            }
+    {
+        return Err(invalid);
+    }
+    Ok(active.pi)
 }
 
 /// Route kernel Event requests through their retained activation; hosted requests use the live handler.
 /// The nested component pump is serialized with native dispatch, so no second handler pointer or
 /// lock domain is introduced. GUI redrive remains deferred until the outer dispatch can resume.
+pub(crate) fn service_win32k_projected_event_set(
+    handler: &mut ExecNtHandler,
+    body: u64,
+) -> (i32, u64, u64, u64) {
+    match handler.provider_set_event(body) {
+        Ok((previous, _id, index, _kind)) => {
+            if !previous {
+                let _ = unsafe { crate::wait_wake_event_set(index, handler) };
+                let current = handler
+                    .provider_read_event(body)
+                    .expect("newly signalled provider Event lost its canonical identity");
+                (0, u64::from(previous), u64::from(current), 0)
+            } else {
+                (0, 1, 1, 0)
+            }
+        }
+        Err(status) => (status as i32, 0, 0, 0),
+    }
+}
+
+pub(crate) fn service_win32k_projected_event_dereference(
+    handler: &mut ExecNtHandler,
+    body: u64,
+) -> (i32, u64, u64, u64) {
+    handler
+        .provider_dereference_event(body)
+        .map(|count| (0, count as u64, 0, 0))
+        .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+}
+
+pub(crate) fn service_win32k_projected_event_reclaim(
+    handler: &mut ExecNtHandler,
+    op: u64,
+    first: u64,
+    second: u64,
+) -> (i32, u64, u64, u64) {
+    match op {
+        crate::win32k_subsystem::W32_EVENT_OP_DRAIN_RECLAIM => handler
+            .pending_event_provider_reclaim()
+            .map(|(id, body)| (0, id, body, 0))
+            .unwrap_or((0, 0, 0, 0)),
+        crate::win32k_subsystem::W32_EVENT_OP_ACK_RECLAIM => handler
+            .complete_event_provider_reclaim(first, second)
+            .map(|()| (0, 0, 0, 0))
+            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
+        _ => (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0),
+    }
+}
+
 pub(crate) unsafe fn service_win32k_event_request(
     channel: &spawn_hosts::PumpChannel,
     reply_cap: u64,
@@ -4107,6 +5646,10 @@ pub(crate) unsafe fn service_win32k_event_request(
 ) -> (i32, u64, u64, u64) {
     const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
     const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
+    if op == crate::win32k_subsystem::W32_EVENT_OP_CREATE_NAMED {
+        return service_win32k_named_event_request(channel, reply_cap, badge, message_info,
+            arg1, arg2, arg3);
+    }
     if channel.kernel_caller.is_some() {
         return kernel_provider_activation::service_event(
             channel,
@@ -4130,6 +5673,13 @@ pub(crate) unsafe fn service_win32k_event_request(
     let handler = &mut *handler_ptr;
     let provider_scoped = matches!(
         op,
+        crate::win32k_subsystem::W32_SYNC_OP_PUBLISH
+            | crate::win32k_subsystem::W32_SYNC_OP_RELEASE_SEMAPHORE
+            | crate::win32k_subsystem::W32_SYNC_OP_RELEASE_MUTANT
+            | crate::win32k_subsystem::W32_SYNC_OP_RETIRE
+            | crate::win32k_subsystem::W32_SYNC_OP_ACK_RETIREMENT
+            | crate::win32k_subsystem::W32_SYNC_OP_QUERY
+            |
         crate::win32k_subsystem::W32_EVENT_OP_PUBLISH_LOCAL
             | crate::win32k_subsystem::W32_EVENT_OP_RETIRE_LOCAL
             | crate::win32k_subsystem::W32_EVENT_OP_ACK_LOCAL_RETIREMENT
@@ -4160,12 +5710,51 @@ pub(crate) unsafe fn service_win32k_event_request(
         pi
     };
     match op {
+        crate::win32k_subsystem::W32_SYNC_OP_PUBLISH
+        | crate::win32k_subsystem::W32_SYNC_OP_RELEASE_SEMAPHORE
+        | crate::win32k_subsystem::W32_SYNC_OP_RELEASE_MUTANT
+        | crate::win32k_subsystem::W32_SYNC_OP_RETIRE
+        | crate::win32k_subsystem::W32_SYNC_OP_ACK_RETIREMENT
+        | crate::win32k_subsystem::W32_SYNC_OP_QUERY => {
+            let Some(provider) = crate::current_win32k_provider_domain() else {
+                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+            };
+            let owner = if op == crate::win32k_subsystem::W32_SYNC_OP_RELEASE_MUTANT {
+                let Some(caller) = channel.logical_caller else {
+                    return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+                };
+                if !handler.validate_provider_logical_caller(caller)
+                    || caller.pi() as u64 != channel.client_pi
+                    || caller.process().generation !=
+                        nt_user_host::process_identity::ProcessGeneration::Hosted(channel.client_generation)
+                {
+                    return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+                }
+                Some(nt_provider_wait::ProviderWaitOwner {
+                    provider_domain: provider.domain,
+                    provider_generation: provider.generation,
+                    dispatch_id: 1,
+                    caller: nt_component_suspension::SuspensionCaller::Hosted(
+                        nt_component_suspension::SuspensionHostedClient {
+                            client_pi: caller.pi() as u32,
+                            client_generation: channel.client_generation,
+                            client_tid: u64::from(caller.thread().thread_id()),
+                            client_badge: caller.badge(),
+                        },
+                    ),
+                })
+            } else {
+                None
+            };
+            service_win32k_provider_sync_request(provider, owner, op, arg1, arg2, arg3)
+        }
         crate::win32k_subsystem::W32_EVENT_OP_CREATE => handler
             .provider_create_event(pi, arg1 as u32, arg2 as u32, arg3 != 0)
             .map(|handle| (0, handle, 0, 0))
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
-        crate::win32k_subsystem::W32_EVENT_OP_REFERENCE => handler
-            .provider_reference_event(pi, arg1, arg3 as u32, arg2)
+        crate::win32k_subsystem::W32_EVENT_OP_REFERENCE =>
+            resolve_win32k_event_handle_pi(handler, channel, pi)
+            .and_then(|active_pi| handler.provider_reference_event(active_pi, arg1, arg3 as u32, arg2))
             .map(|(body, id, metadata, granted_access)| {
                 (
                     0,
@@ -4175,40 +5764,22 @@ pub(crate) unsafe fn service_win32k_event_request(
                 )
             })
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
-        crate::win32k_subsystem::W32_EVENT_OP_CLOSE => handler
-            .provider_close_event(pi, arg1)
+        crate::win32k_subsystem::W32_EVENT_OP_CLOSE =>
+            resolve_win32k_event_handle_pi(handler, channel, pi)
+            .and_then(|active_pi| handler.provider_close_event(active_pi, arg1))
             .map(|()| (0, 0, 0, 0))
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
-        crate::win32k_subsystem::W32_EVENT_OP_DEREFERENCE => handler
-            .provider_dereference_event(arg1)
-            .map(|count| (0, count as u64, 0, 0))
-            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
-        crate::win32k_subsystem::W32_EVENT_OP_DRAIN_RECLAIM => handler
-            .pending_event_provider_reclaim()
-            .map(|(id, body)| (0, id, body, 0))
-            .unwrap_or((0, 0, 0, 0)),
-        crate::win32k_subsystem::W32_EVENT_OP_ACK_RECLAIM => handler
-            .complete_event_provider_reclaim(arg1, arg2)
-            .map(|()| (0, 0, 0, 0))
-            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
+        crate::win32k_subsystem::W32_EVENT_OP_DEREFERENCE =>
+            service_win32k_projected_event_dereference(handler, arg1),
+        crate::win32k_subsystem::W32_EVENT_OP_DRAIN_RECLAIM
+        | crate::win32k_subsystem::W32_EVENT_OP_ACK_RECLAIM =>
+            service_win32k_projected_event_reclaim(handler, op, arg1, arg2),
         crate::win32k_subsystem::W32_EVENT_OP_RETAIN_POINTER => handler
             .provider_retain_event_pointer(arg1)
             .map(|count| (0, count as u64, 0, 0))
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
-        crate::win32k_subsystem::W32_EVENT_OP_SET => match handler.provider_set_event(arg1) {
-            Ok((previous, _id, index, _kind)) => {
-                if !previous {
-                    let _ = crate::wait_wake_event_set(index, handler);
-                    let current = handler
-                        .provider_read_event(arg1)
-                        .expect("newly signalled provider Event lost its canonical identity");
-                    (0, u64::from(previous), u64::from(current), 0)
-                } else {
-                    (0, 1, 1, 0)
-                }
-            }
-            Err(status) => (status as i32, 0, 0, 0),
-        },
+        crate::win32k_subsystem::W32_EVENT_OP_SET =>
+            service_win32k_projected_event_set(handler, arg1),
         crate::win32k_subsystem::W32_EVENT_OP_RESET => handler
             .provider_reset_event(arg1)
             .map(|previous| (0, u64::from(previous), 0, 0))
@@ -4343,6 +5914,139 @@ pub(crate) unsafe fn service_win32k_event_request(
     }
 }
 
+/// Capture the inline named-Event frame under the exact physical provider job before any
+/// namespace or handle effect. The attached process is the target handle table.
+unsafe fn service_win32k_named_event_request(
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
+    name_len: u64,
+    sd_len: u64,
+    reserved: u64,
+) -> (i32, u64, u64, u64) {
+    let invalid = nt_process::STATUS_INVALID_HANDLE;
+    if reserved != 0 || channel.kernel_caller.is_some() {
+        return (nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0);
+    }
+    let (route, dispatch, caller) = match authenticate_win32k_service_request(
+        channel, reply_cap, badge, mi,
+        (crate::win32k_subsystem::W32_EVENT_LABEL << 12) | 4,
+    ) {
+        Ok(owner) => owner,
+        Err(status) => return (status as i32, 0, 0, 0),
+    };
+    let Some(logical) = channel.logical_caller else { return (invalid as i32, 0, 0, 0) };
+    let Some(target) = crate::win32k_glue::current_query_process(logical, channel.pml4)
+    else { return (invalid as i32, 0, 0, 0) };
+    let capture = match crate::win32k_subsystem::named_event::read_owned(
+        (route, dispatch, caller), name_len, sd_len,
+    ) {
+        Ok(capture) => capture,
+        Err(status) => return (status as i32, 0, 0, 0),
+    };
+    let handler = match registry_live_handler() {
+        Ok(handler) => handler,
+        Err(status) => return (status as i32, 0, 0, 0),
+    };
+    if handler.pm_pid_for_pi(target.pi) != Some(target.process.pid)
+        || handler.hosted_process_generation(target.pi)
+            != match target.process.generation {
+                nt_user_host::process_identity::ProcessGeneration::Hosted(generation) => Some(generation),
+                _ => None,
+            }
+    {
+        return (invalid as i32, 0, 0, 0);
+    }
+    handler.provider_create_named_event(target.pi, caller, &capture)
+        .map(|(status, handle)| (status as i32, handle, 0, 0))
+        .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+}
+
+/// Authenticate at the entry adapter, then mutate one exact root-owned sync identity.
+/// Release triggers the existing canonical waiter selector after the mutation is visible.
+pub(crate) unsafe fn service_win32k_provider_sync_request(
+    provider: nt_provider_wait::ProviderDomainIdentity,
+    owner: Option<nt_provider_wait::ProviderWaitOwner>,
+    op: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+) -> (i32, u64, u64, u64) {
+    use crate::win32k_subsystem::*;
+    const INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+    let result: Result<(u64, u64, u64), u32> = match op {
+        W32_SYNC_OP_PUBLISH => {
+            let kind = match arg2 >> 32 {
+                1 => nt_provider_wait::ProviderSyncKind::Semaphore {
+                    initial_count: arg2 as u32 as i32,
+                    limit: arg3 as u32 as i32,
+                },
+                2 if arg2 as u32 == 0 && arg3 == 0 => nt_provider_wait::ProviderSyncKind::Mutant,
+                _ => return (INVALID_PARAMETER, 0, 0, 0),
+            };
+            crate::provider_dispatcher_backend::publish_sync(provider, arg1, kind)
+                .map(|canonical| (canonical.object_id, canonical.object_generation, 0))
+        }
+        W32_SYNC_OP_RELEASE_SEMAPHORE if arg3 == 0 =>
+            crate::provider_dispatcher_backend::release_sync_semaphore(provider, arg1, arg2 as u32 as i32)
+                .map(|previous| (previous as u32 as u64, 0, 0)),
+        W32_SYNC_OP_RELEASE_MUTANT if arg2 == 0 && arg3 == 0 =>
+            owner.ok_or(INVALID_PARAMETER as u32).and_then(|owner|
+                crate::provider_dispatcher_backend::release_sync_mutant(provider, arg1, owner))
+                .map(|previous| (previous as u32 as u64, 0, 0)),
+        W32_SYNC_OP_RETIRE if arg2 == 0 && arg3 == 0 =>
+            crate::provider_dispatcher_backend::begin_retire_sync(provider, arg1)
+                .map(|retirement| (retirement.canonical.object_id,
+                    retirement.canonical.object_generation,
+                    retirement.canonical.object_type as u64)),
+        W32_SYNC_OP_ACK_RETIREMENT => {
+            let kind = match arg3 >> 32 {
+                2 => nt_provider_wait::ProviderWaitObjectType::Semaphore,
+                7 => nt_provider_wait::ProviderWaitObjectType::Mutant,
+                _ => return (INVALID_PARAMETER, 0, 0, 0),
+            };
+            let canonical = nt_provider_wait::ProviderWaitObject::new(kind, arg2, arg3 as u32 as u64);
+            crate::provider_dispatcher_backend::ack_retire_sync(provider, arg1, canonical)
+                .map(|()| (0, 0, 0))
+        }
+        W32_SYNC_OP_QUERY => {
+            let kind = match arg3 >> 32 {
+                2 => nt_provider_wait::ProviderWaitObjectType::Semaphore,
+                7 => nt_provider_wait::ProviderWaitObjectType::Mutant,
+                _ => return (INVALID_PARAMETER, 0, 0, 0),
+            };
+            let canonical = nt_provider_wait::ProviderWaitObject::new(kind, arg2, arg3 as u32 as u64);
+            crate::provider_dispatcher_backend::snapshot_sync(provider, arg1, canonical)
+                .and_then(|snapshot| match snapshot.mutant_owner {
+                    None => Ok((snapshot.signal_state as u32 as u64, 0, 0)),
+                    Some(nt_component_suspension::SuspensionCaller::Hosted(client)) =>
+                        Ok((snapshot.signal_state as u32 as u64, client.client_tid, client.client_generation)),
+                    Some(nt_component_suspension::SuspensionCaller::Kernel { .. }) =>
+                        Err(INVALID_PARAMETER as u32),
+                })
+        }
+        _ => Err(INVALID_PARAMETER as u32),
+    };
+    match result {
+        Ok((out1, out2, out3)) => {
+            if matches!(op, W32_SYNC_OP_RELEASE_SEMAPHORE | W32_SYNC_OP_RELEASE_MUTANT) {
+                let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+                if let Some(handler) = handler.as_mut() {
+                    let mut objects = handler.dispatcher_objects(None);
+                    let _ = provider_wait_select_ready(&mut objects);
+                } else {
+                    let _ = dispatcher_bootstrap::with_provider_objects(|mut objects| {
+                        provider_wait_select_ready(&mut objects)
+                    });
+                }
+            }
+            (0, out1, out2, out3)
+        }
+        Err(status) => (status as i32, 0, 0, 0),
+    }
+}
+
 pub(crate) unsafe fn service_win32k_provider_timer_request(
     provider: nt_provider_wait::ProviderDomainIdentity,
     op: u64,
@@ -4412,19 +6116,20 @@ pub(crate) unsafe fn service_win32k_gdi_image_request(
     packet: u64,
     length: u64,
     spare: [u64; 2],
-) -> (i32, u64) {
+) -> crate::gdi_routed_image_work::SubmitResult {
+    use crate::gdi_routed_image_work::SubmitResult;
     let rejected = |stage: &[u8], status: u32| {
         print_str(b"[gdi-image-ingress] rejected stage="); print_str(stage);
         print_str(b" status=0x"); print_hex(status);
         print_str(b" tcb=0x"); print_hex_u64(channel.tcb);
         print_str(b" packet=0x"); print_hex_u64(packet);
         print_str(b" length="); print_u64(length); print_str(b"\n");
-        (status as i32, 0)
+        SubmitResult::Ready((status as i32, 0))
     };
     if spare != [0; 2] {
         return rejected(b"spare", nt_process::STATUS_INVALID_PARAMETER);
     }
-    let (route, dispatch, _) = match authenticate_win32k_service_request(
+    let (route, dispatch, caller) = match authenticate_win32k_service_request(
         channel, reply_cap, badge, mi,
         (crate::win32k_subsystem::W32_GDI_LOAD_LABEL << 12) | 4,
     ) {
@@ -4457,7 +6162,19 @@ pub(crate) unsafe fn service_win32k_gdi_image_request(
     print_str(b"[gdi-image-ingress] admitted tcb=0x"); print_hex_u64(channel.tcb);
     print_str(b" packet=0x"); print_hex_u64(packet);
     print_str(b" length="); print_u64(length); print_str(b"\n");
-    crate::driver_launch::service_win32k_gdi_image_request(packet, length, source)
+    match crate::fs_loader::exec_fs_mount_identity().and_then(
+        crate::fs_loader::exec_block_route_kind,
+    ) {
+        Some(nt_fs::BlockSourceKind::Boot) => SubmitResult::Ready(
+            crate::driver_launch::service_win32k_gdi_image_request(packet, length, source),
+        ),
+        Some(nt_fs::BlockSourceKind::Native | nt_fs::BlockSourceKind::Draining) => {
+            crate::gdi_routed_image_work::submit_routed_gdi_image(
+                route, dispatch, reply_cap, caller, source, packet, length,
+            )
+        }
+        None => rejected(b"mount-route", nt_fs::STATUS_DEVICE_NOT_READY),
+    }
 }
 
 /// Directory-object requests carry only inline IPC words; all authority is reconstructed here.
@@ -4470,18 +6187,20 @@ pub(crate) unsafe fn service_win32k_directory_request(
     m1: u64,
     m2: u64,
     m3: u64,
-) -> (i32, u64, u64, u64) {
+) -> crate::provider_directory_broker::SubmitResult {
+    use crate::provider_directory_broker::SubmitResult;
     let (route, dispatch, caller) = match authenticate_win32k_service_request(
         channel, reply_cap, badge, mi, (crate::win32k_subsystem::W32_DIRECTORY_LABEL << 12) | 4,
     ) {
         Ok(owner) => owner,
-        Err(status) => return (status as i32, 0, 0, 0),
+        Err(status) => return SubmitResult::Ready((status as i32, 0, 0, 0)),
     };
     let pointer = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     if pointer.is_null() {
-        return (0xC000_00A3u32 as i32, 0, 0, 0);
+        return SubmitResult::Ready((0xC000_00A3u32 as i32, 0, 0, 0));
     }
-    crate::provider_directory_broker::dispatch(&mut *pointer, route, dispatch, caller, op, m1, m2, m3)
+    crate::provider_directory_broker::dispatch(
+        &mut *pointer, route, dispatch, caller, reply_cap, op, m1, m2, m3)
 }
 
 /// Create-only Section broker. The provider's packet is data, never caller authority.
@@ -4497,7 +6216,7 @@ pub(crate) unsafe fn service_win32k_section_create_request(
 ) -> crate::provider_section_broker::SubmitResult {
     use crate::provider_section_broker::SubmitResult;
     use nt_io_manager::win32k_mm_section_wire as mm_wire;
-    if matches!(op, mm_wire::OP_DEREFERENCE | mm_wire::OP_UNMAP) {
+    if matches!(op, mm_wire::OP_DEREFERENCE | mm_wire::OP_UNMAP | mm_wire::OP_UNMAP_CLIENT) {
         return crate::provider_section_cleanup::service_win32k_section_cleanup_request(
             channel, reply_cap, badge, mi, op, first, second, third,
         );
@@ -4520,12 +6239,46 @@ pub(crate) unsafe fn service_win32k_section_create_request(
         }
     };
     let handler = match registry_live_handler() {
-        Ok(handler) if handler.loop_ctx.is_some() => handler,
-        _ => return SubmitResult::Ready((0xC000_00A3u32 as i32, 0, 0, 0)),
+        Ok(handler) if registered_section_table_for_handler(handler).is_ok() => handler,
+        Ok(_) => return SubmitResult::Ready((0xC000_00A3u32 as i32, 0, 0, 0)),
+        Err(_) => {
+            if bootstrap_section_table().is_err() || op == mm_wire::OP_MAP_CLIENT
+                || !crate::provider_section_broker::bootstrap_caller_admitted(caller)
+            {
+                return SubmitResult::Ready((0xC000_00A3u32 as i32, 0, 0, 0));
+            }
+            let physical = match crate::provider_service_ingress::physical_win32k_provider(
+                channel, route, dispatch,
+            ) {
+                Ok(physical) => physical,
+                Err(status) => return SubmitResult::Ready((status as i32, 0, 0, 0)),
+            };
+            if matches!(op, mm_wire::OP_REFERENCE | mm_wire::OP_MAP) {
+                if third != 0 || (op == mm_wire::OP_REFERENCE && second != 0) {
+                    return SubmitResult::Ready((nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0));
+                }
+                let result = match op {
+                    mm_wire::OP_REFERENCE => crate::provider_mm_section_objects::reference(
+                        core::ptr::null_mut(), first, physical).map(|count| (count, 0)),
+                    mm_wire::OP_MAP => crate::provider_mm_section_objects::map(
+                        core::ptr::null_mut(), first, physical, second, caller),
+                    _ => unreachable!(),
+                };
+                return SubmitResult::Ready(match result {
+                    Ok((first, second)) => (0, first, second, 0),
+                    Err(status) => (status as i32, 0, 0, 0),
+                });
+            }
+            return crate::provider_section_broker::submit_bootstrap(
+                route, dispatch, caller, physical, op, first, second, third,
+            );
+        }
     };
-    if matches!(op, mm_wire::OP_REFERENCE | mm_wire::OP_MAP)
+    if matches!(op, mm_wire::OP_REFERENCE | mm_wire::OP_MAP | mm_wire::OP_MAP_CLIENT)
     {
-        if third != 0 || (op != mm_wire::OP_MAP && second != 0) {
+        if (op != mm_wire::OP_MAP_CLIENT && third != 0)
+            || (op == mm_wire::OP_REFERENCE && second != 0)
+        {
             return SubmitResult::Ready((nt_process::STATUS_INVALID_PARAMETER as i32, 0, 0, 0));
         }
         let physical = match spawn_hosts::shared_ingress::owner::runtime::physical_source(route) {
@@ -4538,10 +6291,15 @@ pub(crate) unsafe fn service_win32k_section_create_request(
             }
         };
         let handler = handler as *mut ExecNtHandler;
+        if op == mm_wire::OP_MAP {
+            return crate::provider_section_map_work::submit(
+                &mut *handler, channel, route, dispatch, caller, physical, first, second);
+        }
         let result = match op {
             mm_wire::OP_REFERENCE => crate::provider_mm_section_objects::reference(handler, first, physical)
                 .map(|count| (count, 0)),
-            mm_wire::OP_MAP => crate::provider_mm_section_objects::map(handler, first, physical, second, caller),
+            mm_wire::OP_MAP_CLIENT => crate::provider_mm_section_objects::map_client(
+                handler, first, physical, second, third >> 8, (third & 0xff) as u32),
             _ => unreachable!(),
         };
         return SubmitResult::Ready(match result {
@@ -5105,6 +6863,38 @@ pub(crate) unsafe fn service_win32k_ps_request(
     if logical_caller.is_some() && channel.kernel_caller.is_some() {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
     }
+    if matches!(
+        op,
+        win32k_subsystem::W32_PS_OP_SET_OBJECT_HANDLE_FLAGS
+            | win32k_subsystem::W32_PS_OP_QUERY_OBJECT_HANDLE_FLAGS
+    ) {
+        if (op == win32k_subsystem::W32_PS_OP_SET_OBJECT_HANDLE_FLAGS
+            && value > u16::MAX as u64)
+            || (op == win32k_subsystem::W32_PS_OP_QUERY_OBJECT_HANDLE_FLAGS && value != 0)
+        {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        if let Err(status) = provider_ps_projection::authenticated_target(channel) {
+            return (status as i32, 0, 0, 0);
+        }
+        let caller = match provider_registry_caller::resolve(channel) {
+            Ok(caller) => caller,
+            Err(status) => return (status as i32, 0, 0, 0),
+        };
+        if op == win32k_subsystem::W32_PS_OP_QUERY_OBJECT_HANDLE_FLAGS {
+            return match with_provider_process_manager(|pm| {
+                pm.query_native_object_handle_flag_information(caller, object)
+            }) {
+                Ok(encoded) => (0, u16::from_le_bytes(encoded) as u64, 0, 0),
+                Err(status) => (status as i32, 0, 0, 0),
+            };
+        }
+        let encoded = (value as u16).to_le_bytes();
+        let result = with_provider_process_manager(|pm| {
+            pm.set_native_object_handle_flag_information(caller, object, &encoded)
+        });
+        return (result.err().unwrap_or(0) as i32, 0, 0, 0);
+    }
     if let Some(caller) = channel.kernel_caller {
         return kernel_provider_activation::service_ps(channel, caller, op, object, value);
     }
@@ -5131,9 +6921,50 @@ pub(crate) unsafe fn service_win32k_ps_request(
     {
         return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
     }
-    provider_ps::dispatch(&mut handler.pm, op, object, value, |pm, body| {
-        provider_ps_projection::grant(target, pm, body)
-    })
+    if native_thread_priority::is_priority_effect_op(op) {
+        return native_thread_priority::dispatch(handler, op, object, value);
+    }
+    if op == win32k_subsystem::W32_PS_OP_WAIT_THREAD_IDENTITY {
+        if value != 0 { return (STATUS_INVALID_PARAMETER, 0, 0, 0); }
+        return match provider_ps_wait::acquire(&mut handler.pm, target, object, client_pi, client_generation) {
+            Ok((tid, generation, token)) => (0, tid, generation, token),
+            Err(status) => (status as i32, 0, 0, 0),
+        };
+    }
+    if op == win32k_subsystem::W32_PS_OP_RELEASE_THREAD_WAIT {
+        if value != 0 { return (STATUS_INVALID_PARAMETER, 0, 0, 0); }
+        return match provider_ps_wait::release(&mut handler.pm, target, object) {
+            Ok(()) => (0, 0, 0, 0),
+            Err(status) => (status as i32, 0, 0, 0),
+        };
+    }
+    provider_ps::dispatch(
+        &mut handler.pm,
+        op,
+        object,
+        value,
+        |pm, job| unsafe { crate::exec_handler::native_job_bodies::ensure(pm, job) },
+        |pm, body| provider_ps_projection::grant(target, pm, body),
+    )
+}
+
+/// Execute a hosted driver's checked thread-priority request against the same retained
+/// PM/native TCB owner as win32k. The caller was authenticated by the driver ingress service.
+pub(crate) unsafe fn service_hosted_driver_thread_priority(
+    thread: u64,
+    priority: i32,
+) -> (i32, u64) {
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    if handler.is_null() {
+        return (0xC000_00A3u32 as i32, 0);
+    }
+    let (status, previous, _, _) = native_thread_priority::dispatch(
+        &mut *handler,
+        win32k_subsystem::W32_PS_OP_SET_THREAD_PRIORITY,
+        thread,
+        priority as u32 as u64,
+    );
+    (status, previous)
 }
 
 /// Serialized memory-only ownership operation, across the bootstrap-to-live Ps store transfer.
@@ -5224,35 +7055,76 @@ pub(crate) unsafe fn service_win32k_mm_secure_request(
 
 /// Service a bounded win32k global-atom request against the executive-lifetime native atom table.
 pub(crate) unsafe fn service_win32k_atom_request(
-    client_pi: u64,
-    client_generation: u64,
+    channel: &spawn_hosts::PumpChannel,
+    reply_cap: u64,
+    badge: u64,
+    mi: u64,
     operation: u64,
     value: u64,
 ) -> (i32, u64) {
     const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
     const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 
+    let (route, dispatch) = match crate::provider_service_ingress::authenticate(
+        channel, reply_cap, badge, mi,
+        (crate::win32k_subsystem::W32_ATOM_LABEL << 12) | 2,
+    ) {
+        Ok(owner) => owner,
+        Err(status) => return (status as i32, 0),
+    };
+    if let Err(status) = crate::provider_service_ingress::physical_win32k_provider(
+        channel, route, dispatch,
+    ) {
+        return (status as i32, 0);
+    }
     let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     if handler_ptr.is_null() {
-        return (STATUS_DEVICE_NOT_READY, 0);
+        // Before the runtime handler exists, only the exact root-issued kernel activation may
+        // mutate the bootstrap owner. A hosted or absent caller needs live generation checks.
+        if channel.kernel_caller.is_none() || channel.logical_caller.is_some() {
+            return (STATUS_DEVICE_NOT_READY, 0);
+        }
     }
-    let handler = &mut *handler_ptr;
-    let Ok(pi) = usize::try_from(client_pi) else {
-        return (STATUS_DEVICE_NOT_READY, 0);
+    if channel.kernel_caller.is_none() {
+        let handler = &mut *handler_ptr;
+        let Some(caller) = channel.logical_caller else {
+            return (STATUS_DEVICE_NOT_READY, 0);
+        };
+        if caller.pi() as u64 != channel.client_pi
+            || caller.process().generation
+                != nt_user_host::process_identity::ProcessGeneration::Hosted(
+                    channel.client_generation,
+                )
+            || !crate::win32k_glue::registry_logical_caller_is_current(channel)
+            || !handler.validate_provider_logical_caller(caller)
+        {
+            return (STATUS_DEVICE_NOT_READY, 0);
+        }
+        let Ok(pi) = usize::try_from(channel.client_pi) else {
+            return (STATUS_DEVICE_NOT_READY, 0);
+        };
+        if channel.client_generation == 0
+            || handler.pm_pid_for_pi(pi).is_none()
+            || handler.hosted_process_generation(pi) != Some(channel.client_generation)
+        {
+            return (STATUS_DEVICE_NOT_READY, 0);
+        }
+    }
+
+    let mut add_atom = |integer, name| {
+        if handler_ptr.is_null() {
+            crate::atom_bootstrap::add_kernel_atom(integer, name)
+        } else {
+            (&mut *handler_ptr).add_kernel_global_atom(integer, name)
+        }
     };
-    if client_generation == 0
-        || handler.pm_pid_for_pi(pi).is_none()
-        || handler.hosted_process_generation(pi) != Some(client_generation)
-    {
-        return (STATUS_DEVICE_NOT_READY, 0);
-    }
 
     let result = match operation {
         crate::win32k_subsystem::W32_ATOM_OP_ADD_INTEGER => {
             if value > u16::MAX as u64 {
                 return (STATUS_INVALID_PARAMETER, 0);
             }
-            handler.add_kernel_global_atom(Some(value as u16), &[])
+            add_atom(Some(value as u16), &[])
         }
         crate::win32k_subsystem::W32_ATOM_OP_ADD_NAME => {
             let Ok(byte_length) = usize::try_from(value) else {
@@ -5267,7 +7139,7 @@ pub(crate) unsafe fn service_win32k_atom_request(
                     as *const u16,
                 byte_length / 2,
             );
-            handler.add_kernel_global_atom(None, name)
+            add_atom(None, name)
         }
         _ => return (STATUS_INVALID_PARAMETER, 0),
     };
@@ -5317,56 +7189,212 @@ pub(crate) unsafe fn drain_nested_pump_timer_delivery() -> bool {
     true
 }
 
+/// A nested receive may ACK a one-shot while the root still owns the current
+/// hosted Reply. Settle that deferred tick in place before using the Reply for
+/// a new receive; the caller must not replay its current message or response.
+unsafe fn prepare_service_receive(
+    queue: &mut nt_delay_execution::Queue,
+    handler: &mut ExecNtHandler,
+) -> bool {
+    loop {
+        match component_resume::prepare_receive(handler) {
+            component_resume::ReceivePreparation::Ready =>
+                return delay_timer_arm_queued_work_receive_poll(queue, handler),
+            component_resume::ReceivePreparation::PendingDelivery => {
+                let ticks = DELAY_TIMER_TICKS_PENDING.swap(0, Ordering::AcqRel);
+                if ticks == 0 { continue; }
+                PUMP_TIMER_TICKS_DRAINED.fetch_add(ticks, Ordering::Relaxed);
+                delay_timer_interrupt(queue, handler);
+            }
+        }
+    }
+}
+
 /// CONNECT and HOOK own their source Replies and provider projections directly. Their nested
 /// redrive does not borrow the File handler used by the other hosted work runners.
 unsafe fn redrive_nested_hosted_input_work() -> bool {
-    let start = crate::driver_launch::nested_hosted_start_fdo_ready()
-        && crate::driver_launch::redrive_nested_hosted_start_fdo();
-    let connect = crate::driver_launch::nested_hosted_connect_forward_ready()
-        && crate::driver_launch::redrive_nested_hosted_connect_forward();
-    let hook = crate::driver_launch::nested_hosted_hook_forward_ready()
-        && crate::driver_launch::redrive_nested_hosted_hook_forward();
-    start || connect || hook
+    if crate::driver_launch::nested_hosted_start_fdo_ready()
+        && crate::driver_launch::redrive_nested_hosted_start_fdo() { return true; }
+    if crate::driver_launch::nested_hosted_connect_forward_ready()
+        && crate::driver_launch::redrive_nested_hosted_connect_forward() { return true; }
+    crate::driver_launch::nested_hosted_hook_forward_ready()
+        && crate::driver_launch::redrive_nested_hosted_hook_forward()
 }
 
-/// Run locally ready retained work while the exact parent invocation is parked. The File
-/// handler is required only by runners that actually borrow it across their local step.
+/// Admit a nested pump only when a local runner can advance. Keep this gate beside the
+/// runners; a later runner is rechecked after earlier work changes its readiness.
+pub(crate) unsafe fn nested_hosted_file_work_ready() -> bool {
+    let input = crate::driver_launch::nested_hosted_start_fdo_ready()
+        || crate::driver_launch::nested_hosted_connect_forward_ready()
+        || crate::driver_launch::nested_hosted_hook_forward_ready();
+    if SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) == 0 {
+        return input;
+    }
+    input
+        || crate::spawn_hosts::shared_ingress::owner::runtime::nested::source_ioctl_parent_ready()
+        || crate::driver_launch::nested_hosted_driver_create_ready()
+        || crate::driver_launch::nested_hosted_query_path_ready()
+        || crate::driver_launch::nested_hosted_internal_control_ready()
+        || crate::driver_launch::nested_hosted_buffered_control_ready()
+        || crate::driver_launch::nested_hosted_write_ready()
+        || crate::driver_launch::nested_hosted_read_ready()
+        || crate::driver_launch::nested_hosted_flush_ready()
+        || crate::driver_launch::nested_hosted_query_information_ready()
+        || crate::driver_launch::nested_hosted_lower_pnp_ready()
+        || crate::driver_launch::nested_hosted_lower_file_ready()
+        || crate::driver_launch::nested_hosted_kernel_file_read_query_ready()
+        || crate::driver_launch::nested_hosted_win32k_async_read_ready()
+        || crate::driver_launch::nested_hosted_file_lifecycle_work_ready()
+        || crate::hosted_routed_file_close_work::nested_work_ready()
+        || crate::driver_launch::nested_win32k_source_work_ready()
+        || crate::provider_section_broker::nested_work_ready()
+        || crate::provider_directory_broker::nested_work_ready()
+}
+
+// Read-only readiness census for an indeterminate nested child under a Pending CONNECT.
+// Bits 0..2: StartFdo, CONNECT, HOOK; 3..19 follow the remaining runners in
+// redrive_nested_hosted_file_work, from create through directory broker.
+unsafe fn nested_child_ready_bits() -> u64 {
+    macro_rules! bit { ($index:expr, $ready:expr) => { u64::from($ready) << $index }; }
+    let input = bit!(0, crate::driver_launch::nested_hosted_start_fdo_ready())
+        | bit!(1, crate::driver_launch::nested_hosted_connect_forward_ready())
+        | bit!(2, crate::driver_launch::nested_hosted_hook_forward_ready());
+    if SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) == 0 { return input; }
+    input | bit!(3, crate::driver_launch::nested_hosted_driver_create_ready())
+        | bit!(4, crate::driver_launch::nested_hosted_query_path_ready())
+        | bit!(5, crate::driver_launch::nested_hosted_internal_control_ready())
+        | bit!(6, crate::driver_launch::nested_hosted_buffered_control_ready())
+        | bit!(7, crate::driver_launch::nested_hosted_write_ready())
+        | bit!(8, crate::driver_launch::nested_hosted_read_ready())
+        | bit!(9, crate::driver_launch::nested_hosted_flush_ready())
+        | bit!(10, crate::driver_launch::nested_hosted_query_information_ready())
+        | bit!(11, crate::driver_launch::nested_hosted_lower_pnp_ready())
+        | bit!(12, crate::driver_launch::nested_hosted_lower_file_ready())
+        | bit!(13, crate::driver_launch::nested_hosted_kernel_file_read_query_ready())
+        | bit!(14, crate::driver_launch::nested_hosted_win32k_async_read_ready())
+        | bit!(15, crate::driver_launch::nested_hosted_file_lifecycle_work_ready())
+        | bit!(16, crate::hosted_routed_file_close_work::nested_work_ready())
+        | bit!(17, crate::driver_launch::nested_win32k_source_work_ready())
+        | bit!(18, crate::provider_section_broker::nested_work_ready())
+        | bit!(19, crate::provider_directory_broker::nested_work_ready())
+}
+
+unsafe fn trace_nested_child_selection(stage: u64, detail: u64) {
+    static COUNT: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    if !crate::driver_launch::hosted_connect_pending_reply_published()
+        || COUNT.fetch_add(1, Ordering::Relaxed) >= 18 { return; }
+    print_str(b"[connect-nested-child] stage/detail=");
+    print_u64(stage); print_str(b"/"); print_hex_u64(detail); print_str(b"\n");
+}
+
+unsafe fn trace_nested_child_readiness(stage: u64) {
+    if crate::driver_launch::hosted_connect_pending_reply_published() {
+        trace_nested_child_selection(stage, nested_child_ready_bits());
+    }
+}
+
+/// Evidence for one outer-loop child pass under a retained physical parent. A ready runner
+/// that reports no progress may have made an uncertain native effect, so it cannot authorize
+/// parent restoration. The no-ready case checks only owner readiness and enters no runner.
+enum NestedChildStepOutcome {
+    NoReady,
+    Progressed,
+    Indeterminate,
+}
+
+/// A one-use observation from the outer runner. Only this module can issue it after checking
+/// readiness and, when ready, running one selected child. A copyable boolean is not authority
+/// to resume a physically parked parent.
+#[must_use = "retain until the exact child-work parent is restored or quarantined"]
+pub(crate) struct NestedChildStep {
+    outcome: NestedChildStepOutcome,
+}
+
+pub(crate) enum NestedChildStepDecision {
+    RestoreParent,
+    Quarantine,
+}
+
+impl NestedChildStep {
+    pub(crate) fn ran_child(&self) -> bool {
+        !matches!(self.outcome, NestedChildStepOutcome::NoReady)
+    }
+
+    pub(crate) fn into_decision(self) -> NestedChildStepDecision {
+        match self.outcome {
+            NestedChildStepOutcome::NoReady | NestedChildStepOutcome::Progressed =>
+                NestedChildStepDecision::RestoreParent,
+            NestedChildStepOutcome::Indeterminate => NestedChildStepDecision::Quarantine,
+        }
+    }
+}
+
+pub(crate) unsafe fn drive_one_nested_file_child_step() -> NestedChildStep {
+    let ready = nested_hosted_file_work_ready();
+    trace_nested_child_readiness(0);
+    if !ready {
+        return NestedChildStep { outcome: NestedChildStepOutcome::NoReady };
+    }
+    let progressed = redrive_nested_hosted_file_work();
+    trace_nested_child_selection(1, u64::from(progressed));
+    trace_nested_child_readiness(2);
+    if progressed {
+        NestedChildStep { outcome: NestedChildStepOutcome::Progressed }
+    } else {
+        NestedChildStep { outcome: NestedChildStepOutcome::Indeterminate }
+    }
+}
+
+/// Run one locally ready retained child while the exact parent invocation is parked. A caller
+/// can repeat the pass when more work is ready. Each runner checks and claims its retained
+/// request before making a native effect.
 pub(crate) unsafe fn redrive_nested_hosted_file_work() -> bool {
     let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     if handler.is_null() { return redrive_nested_hosted_input_work(); }
-    // Check each owner just before entering its runner. The runner can reserve a large Work
-    // frame even when it finds no ready row, and this sweep also runs inside nested pumps.
-    let create = crate::driver_launch::nested_hosted_driver_create_ready()
-        && crate::driver_launch::redrive_nested_hosted_driver_create(handler);
-    let query = crate::driver_launch::nested_hosted_query_path_ready()
-        && crate::driver_launch::redrive_nested_hosted_query_path(handler);
-    let write = crate::driver_launch::nested_hosted_write_ready()
-        && crate::driver_launch::redrive_nested_hosted_write(handler);
-    let read = crate::driver_launch::nested_hosted_read_ready()
-        && crate::driver_launch::redrive_nested_hosted_read(handler);
-    let flush = crate::driver_launch::nested_hosted_flush_ready()
-        && crate::driver_launch::redrive_nested_hosted_flush(handler);
-    let query_information = crate::driver_launch::nested_hosted_query_information_ready()
-        && crate::driver_launch::redrive_nested_hosted_query_information(handler);
-    let lower_pnp = crate::driver_launch::nested_hosted_lower_pnp_ready()
-        && crate::driver_launch::redrive_nested_hosted_lower_pnp(handler);
-    let lower_file = crate::driver_launch::nested_hosted_lower_file_ready()
-        && crate::driver_launch::redrive_nested_hosted_lower_file(handler);
-    let input = redrive_nested_hosted_input_work();
-    let kernel_file_query = crate::driver_launch::nested_hosted_kernel_file_read_query_ready()
-        && crate::driver_launch::redrive_nested_hosted_kernel_file_read_query(handler);
-    let win32k_async_read = crate::driver_launch::nested_hosted_win32k_async_read_ready()
-        && crate::driver_launch::redrive_nested_hosted_win32k_async_read(handler);
-    let lifecycle = crate::driver_launch::nested_hosted_file_lifecycle_work_ready()
-        && crate::driver_launch::redrive_nested_hosted_file_lifecycle_work();
-    let close = crate::hosted_routed_file_close_work::nested_work_ready()
-        && crate::hosted_routed_file_close_work::redrive_nested_ready(handler);
-    let source = crate::driver_launch::nested_win32k_source_work_ready()
-        && crate::driver_launch::redrive_nested_win32k_source_work(handler);
-    let section = crate::provider_section_broker::nested_work_ready()
-        && crate::provider_section_broker::redrive_nested_ready(handler);
+    // Check each owner immediately before entry. A runner may reserve a large Work frame even
+    // when its row is not ready, so never enter a later runner after one has progressed.
+    if crate::driver_launch::nested_hosted_driver_create_ready()
+        && crate::driver_launch::redrive_nested_hosted_driver_create(handler) { return true; }
+    if crate::driver_launch::nested_hosted_query_path_ready()
+        && crate::driver_launch::redrive_nested_hosted_query_path(handler) { return true; }
+    if crate::driver_launch::nested_hosted_internal_control_ready()
+        && crate::driver_launch::redrive_nested_hosted_internal_control(handler) { return true; }
+    if crate::driver_launch::nested_hosted_buffered_control_ready()
+        && crate::driver_launch::redrive_nested_hosted_buffered_control(handler) { return true; }
+    if crate::driver_launch::nested_hosted_write_ready()
+        && crate::driver_launch::redrive_nested_hosted_write(handler) { return true; }
+    if crate::driver_launch::nested_hosted_read_ready()
+        && crate::driver_launch::redrive_nested_hosted_read(handler) { return true; }
+    if crate::driver_launch::nested_hosted_flush_ready()
+        && crate::driver_launch::redrive_nested_hosted_flush(handler) { return true; }
+    if crate::driver_launch::nested_hosted_query_information_ready()
+        && crate::driver_launch::redrive_nested_hosted_query_information(handler) { return true; }
+    if crate::driver_launch::nested_hosted_lower_pnp_ready()
+        && crate::driver_launch::redrive_nested_hosted_lower_pnp(handler) { return true; }
+    if crate::driver_launch::nested_hosted_lower_file_ready()
+        && crate::driver_launch::redrive_nested_hosted_lower_file(handler) { return true; }
+    if redrive_nested_hosted_input_work() { return true; }
+    if crate::driver_launch::nested_hosted_kernel_file_read_query_ready()
+        && crate::driver_launch::redrive_nested_hosted_kernel_file_read_query(handler) { return true; }
+    if crate::driver_launch::nested_hosted_win32k_async_read_ready()
+        && crate::driver_launch::redrive_nested_hosted_win32k_async_read(handler) { return true; }
+    if crate::driver_launch::nested_hosted_file_lifecycle_work_ready()
+        && crate::driver_launch::redrive_nested_hosted_file_lifecycle_work() { return true; }
+    if crate::hosted_routed_file_close_work::nested_work_ready()
+        && crate::hosted_routed_file_close_work::redrive_nested_ready(handler) { return true; }
+    if crate::spawn_hosts::shared_ingress::owner::runtime::nested::drain_source_ioctl_parent(handler) {
+        return true;
+    }
+    if !crate::spawn_hosts::shared_ingress::owner::runtime::nested::source_ioctl_parent_retained()
+        && crate::driver_launch::nested_win32k_source_work_ready()
+        && crate::driver_launch::redrive_nested_win32k_source_work(handler) { return true; }
+    if crate::provider_section_broker::nested_work_ready()
+        && crate::provider_section_broker::redrive_nested_ready(handler) { return true; }
+    if crate::provider_directory_broker::nested_work_ready()
+        && crate::provider_directory_broker::redrive_nested_ready(handler) { return true; }
     crate::provider_mm_section_objects::redrive(handler);
-    create || query || write || read || flush || query_information || lower_pnp || lower_file || input || kernel_file_query || win32k_async_read || lifecycle || close || source || section
+    false
 }
 
 pub(crate) unsafe fn watchdog_defer_if_hosted_work_can_run(site: &[u8]) -> bool {
@@ -5411,6 +7439,10 @@ unsafe fn load_hosted_bootstrap_image(
     index: usize,
     spec: HostedBootstrapLoadSpec,
 ) {
+    let backing = crate::fs_loader::exec_fs()
+        .and_then(|fs| crate::fs_loader::fat_open_path_metadata(&fs, spec.disk_path))
+        .filter(|entry| !entry.metadata.is_directory)
+        .and_then(|entry| crate::fs_loader::exec_fs_file_identity(entry.metadata.file_id));
     print_str(b"[sec-init] bootstrap-image item=");
     print_u64(index as u64);
     print_str(b" pi=");
@@ -5441,6 +7473,15 @@ unsafe fn load_hosted_bootstrap_image(
     print_str(b"\n");
     register_loaded_hosted_image(catalog, spec.image, loaded)
         .expect("hosted bootstrap image metadata must register once when loaded");
+    if loaded {
+        let target = nt_exe_image::SpawnTarget::from_image(spec.image);
+        catalog.bind_registered_backing(
+            target,
+            backing.expect("loaded bootstrap image retains its exact mounted File identity"),
+        ).expect("bootstrap image File identity must bind its registered generation once");
+        catalog.bind_registered_launch_policy(target, spec.allowed_creator)
+            .expect("bootstrap creator policy must bind after its exact mounted File");
+    }
     print_str(b"[sec-init] bootstrap-image item=");
     print_u64(index as u64);
     print_str(b" loaded-table-begin\n");
@@ -5709,6 +7750,33 @@ unsafe fn sync_win32k_context_to_process_manager(
     true
 }
 
+/// Consume the exact provider process-create publication before the initial loader can run.
+/// The PM mirror then owns W32PROCESS and will issue the real process-exit callout before
+/// provider object finalization. A missing or mismatched publication is an indeterminate
+/// post-callout state; callers must retain the process and never invoke create again.
+pub(crate) unsafe fn import_early_win32k_process_context(
+    nt_handler: &mut ExecNtHandler,
+    pi: usize,
+    process: nt_types::ProcessIdentity,
+    tid: u64,
+) -> Option<u64> {
+    if nt_handler.capture_process_identity(pi) != Some(process) { return None; }
+    let pid = process.pid;
+    let tid32 = nt_process::ThreadId::try_from(tid).ok()?;
+    let published = win32k_glue::published_win32k_context();
+    if published.pid != u64::from(pid) || published.tid != tid
+        || published.eprocess == 0 || published.ethread == 0
+        || published.eprocess != nt_handler.pm.process_kernel_object(pid).unwrap_or(0)
+        || published.ethread != nt_handler.pm.thread_kernel_object(tid32).unwrap_or(0)
+        || published.w32process == 0 || published.w32thread != 0
+    { return None; }
+    if !sync_win32k_context_to_process_manager(nt_handler, pi, u64::from(pid), tid)
+        || nt_handler.capture_process_identity(pi) != Some(process)
+        || nt_handler.pm.process_win32(pid) != Some(published.w32process)
+    { return None; }
+    Some(published.w32process)
+}
+
 unsafe fn dispatch_win32k_for_client(
     nt_handler: &mut ExecNtHandler,
     ssn: u64,
@@ -5720,7 +7788,7 @@ unsafe fn dispatch_win32k_for_client(
     stack_args: &[u64],
     client: win32k_glue::Win32kClientContext,
 ) -> (u64, bool) {
-    let result =
+    let win32k_glue::Win32kDispatchOutcome::Known { value, completed } =
         win32k_glue::win32k_dispatch_wide(ssn, a0, a1, a2, a3, caller_sp, stack_args, client);
     if sync_win32k_context_to_process_manager(
         nt_handler,
@@ -5728,7 +7796,7 @@ unsafe fn dispatch_win32k_for_client(
         client.pid,
         client.tid,
     ) {
-        result
+        (value, completed)
     } else {
         (0xC000_00A3u32 as u64, false)
     }
@@ -5736,6 +7804,7 @@ unsafe fn dispatch_win32k_for_client(
 
 unsafe fn dispatch_win32k_for_client_with_completion_args(
     nt_handler: &mut ExecNtHandler,
+    dispatch_id: u64,
     ssn: u64,
     a0: u64,
     a1: u64,
@@ -5748,8 +7817,11 @@ unsafe fn dispatch_win32k_for_client_with_completion_args(
     paint_output: Option<nt_user_callback::PaintOutputClaim>,
     client: win32k_glue::Win32kClientContext,
     dispatch_return: &mut Option<nt_user_callback::DispatchReturn>,
+    dispatch_entered: &mut bool,
+    dispatch_context: &mut Option<nt_user_callback::DispatchContext>,
 ) -> (u64, bool) {
     let result = win32k_glue::win32k_dispatch_wide_with_return_receipt(
+        dispatch_id,
         ssn,
         a0,
         a1,
@@ -5761,15 +7833,18 @@ unsafe fn dispatch_win32k_for_client_with_completion_args(
         output_stage,
         paint_output,
         client,
+        dispatch_entered,
+        dispatch_context,
     );
-    *dispatch_return = result.2;
+    *dispatch_return = result.dispatch_return;
+    let win32k_glue::Win32kDispatchOutcome::Known { value, completed } = result.outcome;
     if sync_win32k_context_to_process_manager(
         nt_handler,
         client.pi as usize,
         client.pid,
         client.tid,
     ) {
-        (result.0, result.1)
+        (value, completed)
     } else {
         (0xC000_00A3u32 as u64, false)
     }
@@ -5851,7 +7926,7 @@ unsafe fn post_winlogon_second_sas_after_welcome_drain(
     print_str(b"[wl-main] posting simulated Ctrl-Alt-Del through real NtUserPostMessage hwnd=0x");
     print_hex(hwnd as u32);
     print_str(b"\n");
-    let post = win32k_glue::win32k_dispatch_wide(
+    let win32k_glue::Win32kDispatchOutcome::Known { value: post_value, completed: post_completed } = win32k_glue::win32k_dispatch_wide(
         0x100e,
         hwnd,
         nt_user_callback::WLX_WM_SAS as u64,
@@ -5881,9 +7956,9 @@ unsafe fn post_winlogon_second_sas_after_welcome_drain(
         },
     );
     print_str(b"[wl-main] NtUserPostMessage(WLX_WM_SAS) -> ret=0x");
-    print_hex(post.0 as u32);
+    print_hex(post_value as u32);
     print_str(b"\n");
-    if post.1 && post.0 != 0 {
+    if post_completed && post_value != 0 {
         WINLOGON_SAS2_INJECTED.store(1, Ordering::Relaxed);
         true
     } else {
@@ -6599,6 +8674,37 @@ unsafe fn hosted_exe_spawn_for<'a>(
     })
 }
 
+/// Complete one already reserved image spawn before the syscall's original Reply is sent.
+/// Both immediate and retained process-image paths use this same physical publication.
+pub(crate) enum HostedExeSpawnError {
+    Unentered(u32),
+    Entered(u32),
+    EnteredAbortable(u32),
+}
+
+pub(crate) unsafe fn publish_reserved_hosted_exe(
+    request: nt_exe_image::SpawnRequest,
+    catalog: &nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
+    loaded_images: *mut HostedLoadedImageTable,
+    ntdll: (u64, &nt_pe_loader::PeFile),
+    fault_ep: u64,
+    procs: &mut [ProcExec],
+    nt_handler: &mut ExecNtHandler,
+    exe_images: &mut nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP>,
+) -> Result<(u64, bool), HostedExeSpawnError> {
+    let Some(spec) = hosted_exe_spawn_for(request, catalog, loaded_images) else {
+        return Err(HostedExeSpawnError::Unentered(nt_process::STATUS_INVALID_PARAMETER));
+    };
+    if spec.spawned.load(Ordering::Relaxed) != 0 {
+        return Err(HostedExeSpawnError::Unentered(nt_process::STATUS_INVALID_PARAMETER));
+    }
+    let is_csrss = spec.image.role == nt_exe_image::HostedProcessRole::Win32Subsystem;
+    let handle = spawn_requested_hosted_exe(
+        request, spec, ntdll, fault_ep, procs, nt_handler, exe_images,
+    )?;
+    Ok((handle, is_csrss))
+}
+
 unsafe fn spawn_requested_hosted_exe(
     request: nt_exe_image::SpawnRequest,
     spec: HostedExeSpawn<'_>,
@@ -6607,40 +8713,52 @@ unsafe fn spawn_requested_hosted_exe(
     procs: &mut [ProcExec],
     nt_handler: &mut ExecNtHandler,
     exe_images: &mut nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP>,
-) -> Result<u64, u32> {
+) -> Result<u64, HostedExeSpawnError> {
     let pi = spec.image.pi;
     let child_pid = nt_handler
         .pm_pid_for_pi(pi)
-        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        .ok_or(HostedExeSpawnError::Unentered(nt_process::STATUS_INVALID_HANDLE))?;
     let child_tid = nt_handler
         .pm_main_tid_for_pi(pi)
-        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        .ok_or(HostedExeSpawnError::Unentered(nt_process::STATUS_INVALID_HANDLE))?;
     let creator_pid = nt_handler
         .pm_pid_for_pi(request.creator_pi)
-        .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        .ok_or(HostedExeSpawnError::Unentered(nt_process::STATUS_INVALID_HANDLE))?;
+    let initial_priority = native_thread_priority::initial_priority(&nt_handler.pm, u64::from(child_tid))
+        .map_err(HostedExeSpawnError::Unentered)?;
+    let identity = nt_handler.capture_process_identity(pi)
+        .ok_or(HostedExeSpawnError::Unentered(nt_process::STATUS_INVALID_HANDLE))?;
+    let fault_badge = mint_badged(fault_ep, spec.image.top_badge)
+        .map_err(HostedExeSpawnError::Unentered)?;
     let child_spawn = spawn_hosted_sec_image_for_image(
         spec.image,
-        nt_memory_manager::MemoryLifetime::Process(
-            nt_handler.capture_process_identity(pi)
-                .ok_or(nt_process::STATUS_INVALID_HANDLE)?,
-        ),
+        nt_memory_manager::MemoryLifetime::Process(identity),
         spec.pe,
         spec.layout,
-        mint_badged(fault_ep, spec.image.top_badge)?,
+        fault_badge,
         Some(ntdll),
         true,
         false,
         0,
         child_pid as u64,
         child_tid as u64,
-    );
+        initial_priority,
+    ).map_err(|_| HostedExeSpawnError::Unentered(nt_process::STATUS_INVALID_HANDLE))?;
     procs[pi].pid = child_pid as u64;
     procs[pi].pml4 = child_spawn.pml4;
-    nt_handler.publish_hosted_process_vspace(pi, child_spawn.vspace_caps)?;
+    nt_handler.publish_hosted_process_vspace(pi, child_spawn.vspace_caps)
+        .map_err(HostedExeSpawnError::Entered)?;
     if !nt_handler.pm.set_peb_base(child_pid, SMSS_PEB_VA) {
-        return Err(nt_process::STATUS_INVALID_HANDLE);
+        return Err(HostedExeSpawnError::Entered(nt_process::STATUS_INVALID_HANDLE));
     }
-    nt_handler.register_main_thread_spawn(pi, child_spawn)?;
+    nt_handler.register_main_thread_spawn(pi, child_spawn)
+        .map_err(HostedExeSpawnError::Entered)?;
+    hosted_debug_filter_process::install_hosted_user_alias(nt_handler, pi)
+        .map_err(|error| if error.retained_uncertain {
+            HostedExeSpawnError::Entered(error.status)
+        } else {
+            HostedExeSpawnError::EnteredAbortable(error.status)
+        })?;
     procs[pi].img_base = spec.layout.base();
     procs[pi].img_end = spec.layout.end();
     procs[pi].scratch_base = spec.runtime.scratch_base;
@@ -6653,18 +8771,16 @@ unsafe fn spawn_requested_hosted_exe(
     ) {
         Ok(handle) => handle as u64,
         Err(status) => {
-            let _ = exe_images.rollback_spawn(request);
-            return Err(status);
+            return Err(HostedExeSpawnError::Entered(status));
         }
     };
 
     if !nt_handler.publish_created_process(request.process_handle_out, process_handle, SMSS_PEB_VA)
     {
-        let _ = exe_images.rollback_spawn(request);
-        return Err(0xC000_0005);
+        return Err(HostedExeSpawnError::Entered(0xC000_0005));
     }
     if exe_images.publish(request, process_handle).is_err() {
-        return Err(0xC000_000D);
+        return Err(HostedExeSpawnError::Entered(0xC000_000D));
     }
     spec.spawned.store(1, Ordering::Relaxed);
 
@@ -8163,6 +10279,7 @@ unsafe fn stage_optional_cursor_string_arg(
 /// same ownership boundary because the original pointers are process-private client VAs.
 unsafe fn stage_cursor_icon_data_args(
     pi: u64,
+    process_generation: u64,
     hcursor: u64,
     module_descriptor: u64,
     resource_descriptor: u64,
@@ -8170,7 +10287,7 @@ unsafe fn stage_cursor_icon_data_args(
     filled_pages: &[u64],
     nfilled: usize,
     scratch_base: u64,
-) -> Option<(u64, u64, u64)> {
+) -> Option<(u64, u64, u64, win32k_bulk_mapping::BulkStage)> {
     let staged_module = stage_optional_cursor_string_arg(
         pi,
         module_descriptor,
@@ -8214,11 +10331,6 @@ unsafe fn stage_cursor_icon_data_args(
             .try_into()
             .unwrap(),
     );
-    let base = win32k_subsystem::WIN32K_BULK_ARG_VADDR;
-    let cap = WIN32K_STRETCH_DIBITS_STAGE_BYTES as u64;
-    core::ptr::write_bytes(base as *mut u8, 0, WIN32K_STRETCH_DIBITS_STAGE_BYTES);
-    core::ptr::copy_nonoverlapping(data.as_ptr(), base as *mut u8, data.len());
-
     let trace = SET_CURSOR_ICON_DATA_MARSHAL_TRACE.fetch_add(1, Ordering::Relaxed);
     if trace < 96 {
         print_str(b"[w32marshal] NtUserSetCursorIconData pi=");
@@ -8236,6 +10348,10 @@ unsafe fn stage_cursor_icon_data_args(
     }
 
     if flags & CURSORF_ACON == 0 {
+        let layout = nt_hosted_runtime::Win32kBulkLayout::flat(CURSORDATA_BYTES as u64)?;
+        let stage = win32k_bulk_mapping::reserve(pi as u32, process_generation, layout)?;
+        let base = stage.base();
+        core::ptr::copy_nonoverlapping(data.as_ptr(), base as *mut u8, data.len());
         core::ptr::write_unaligned((base + CURSORDATA_ASPCUR_OFF as u64) as *mut u64, 0);
         core::ptr::write_unaligned((base + CURSORDATA_AICUR_OFF as u64) as *mut u64, 0);
         core::ptr::write_unaligned((base + CURSORDATA_AJIFRATE_OFF as u64) as *mut u64, 0);
@@ -8244,7 +10360,7 @@ unsafe fn stage_cursor_icon_data_args(
             print_hex_u64(base);
             print_str(b" standard\n");
         }
-        return Some((staged_module, staged_resource, base));
+        return Some((staged_module, staged_resource, base, stage));
     }
 
     if cpcur == 0 || cicur == 0 || cpcur > CURSORDATA_ACON_LIMIT || cicur > CURSORDATA_ACON_LIMIT {
@@ -8286,20 +10402,33 @@ unsafe fn stage_cursor_icon_data_args(
     let aicur_bytes = (cicur as u64).checked_mul(4)?;
     let ajif_rate_bytes = (cicur as u64).checked_mul(4)?;
 
-    let staged_aspcur = base + offset;
+    let aspcur_offset = offset;
     offset = align_up_u64(offset.checked_add(aspcur_bytes)?, 8)?;
-    let staged_aicur = base + offset;
+    let aicur_offset = offset;
     offset = align_up_u64(offset.checked_add(aicur_bytes)?, 4)?;
-    let staged_ajif_rate = base + offset;
+    let ajif_rate_offset = offset;
     offset = align_up_u64(offset.checked_add(ajif_rate_bytes)?, 4)?;
-    if offset > cap {
+    let Some(layout) = nt_hosted_runtime::Win32kBulkLayout::flat(offset) else {
         if trace < 96 {
-            print_str(b" cap-fail bytes=");
+            print_str(b" layout-fail bytes=");
             print_u64(offset);
             print_str(b"\n");
         }
         return None;
-    }
+    };
+    let Some(stage) = win32k_bulk_mapping::reserve(pi as u32, process_generation, layout) else {
+        if trace < 96 {
+            print_str(b" stage-fail bytes=");
+            print_u64(offset);
+            print_str(b"\n");
+        }
+        return None;
+    };
+    let base = stage.base();
+    let staged_aspcur = base + aspcur_offset;
+    let staged_aicur = base + aicur_offset;
+    let staged_ajif_rate = base + ajif_rate_offset;
+    core::ptr::copy_nonoverlapping(data.as_ptr(), base as *mut u8, data.len());
 
     if !img_spawn::client_copyin_mapped(
         pi,
@@ -8325,6 +10454,10 @@ unsafe fn stage_cursor_icon_data_args(
             print_str(b" ajif=0x");
             print_hex_u64(ajif_rate_client);
             print_str(b"\n");
+        }
+        if !win32k_bulk_mapping::settle(stage, false, false) {
+            print_str(b"[win32k-bulk] cursor staging cancellation failed\n");
+            park();
         }
         return None;
     }
@@ -8356,7 +10489,7 @@ unsafe fn stage_cursor_icon_data_args(
         print_str(b"\n");
     }
 
-    Some((staged_module, staged_resource, base))
+    Some((staged_module, staged_resource, base, stage))
 }
 
 unsafe fn capture_builtin_class_key(
@@ -8393,6 +10526,8 @@ pub(crate) unsafe fn service_sec_image(
     scratch_base: u64,
     ntdll: (u64, &nt_pe_loader::PeFile),
     driver_starts: DriverStartBootstrap,
+    boot_system_pnp_plan: &InlineDriverLaunchPlan,
+    demand_pnp_plan: &InlineDriverLaunchPlan,
 ) -> (
     u64,
     u64,
@@ -8427,6 +10562,10 @@ pub(crate) unsafe fn service_sec_image(
     let mut stop: u64;
     let mut ntfaults: u64;
     let mut stop_ssn = 0u64;
+    // A single terminal receipt identifies which safety gate ended the serialized loop.
+    // The source location is recorded at the branch, before any quiesce checkpoint can fail.
+    let mut service_loop_exit_site = 0u32;
+    let mut service_loop_exit_reason: &'static [u8] = b"unrecorded";
     let mut iters = 0u64;
     let mut dbgsvc = 0u64;
     // page VA filled at each fault index → its persistent executive scratch is
@@ -8457,6 +10596,17 @@ pub(crate) unsafe fn service_sec_image(
     let generic_sections = reset_service_generic_sections_work();
     register_loaded_hosted_image(exe_image_catalog, primary_image, !pe.bytes().is_empty())
         .expect("primary hosted image metadata must register once");
+    let primary_backing = crate::fs_loader::exec_fs()
+        .and_then(|fs| crate::fs_loader::fat_open_path_metadata(&fs, crate::installed_layout::SMSS))
+        .filter(|entry| !entry.metadata.is_directory)
+        .and_then(|entry| crate::fs_loader::exec_fs_file_identity(entry.metadata.file_id))
+        .expect("primary SMSS image requires its exact mounted File identity");
+    let primary_target = nt_exe_image::SpawnTarget::from_image(primary_image);
+    exe_image_catalog.bind_registered_backing(primary_target, primary_backing)
+        .expect("primary SMSS File identity must bind once");
+    exe_image_catalog.bind_registered_launch_policy(
+        primary_target, nt_exe_image::HostedProcessRole::NativeSession,
+    ).expect("primary SMSS execution policy must bind once");
     let primary_pi = primary_image.pi;
     if let Some(runtime) = hosted_process_runtime_for_pi(primary_pi) {
         if let Some(spawned) = runtime.spawned {
@@ -8502,14 +10652,29 @@ pub(crate) unsafe fn service_sec_image(
         );
     }
     print_str(b"[sec-init] bootstrap-image-load end\n");
+    // Seeded Ps objects precede image loading. Admit each exact process only after its attached
+    // executable has passed PE parsing; win32k Ps WOW64 queries must never infer x64 from a name.
+    for pi in 0..HOSTED_PROCESS_MANAGER_SEED_COUNT {
+        let image = exe_image_catalog
+            .get_by_pi(pi)
+            .expect("seeded Ps process retains its hosted image identity");
+        let (validated_pe, _) = unsafe { hosted_loaded_images.pe_and_pool_for_image(image) }
+            .expect("seeded Ps process needs its exact parsed executable");
+        let cid = ps_bootstrap::hosted_main_client_id(pi)
+            .expect("seeded Ps process retains its exact main client ID");
+        unsafe { ps_bootstrap::with_process_manager(|pm| {
+            pm.admit_validated_process_image(cid.unique_process, validated_pe)
+        }) }
+        .expect("seeded Ps process architecture admission failed");
+    }
     // Retain the existing bootstrap DLL registry and its parsed pool-backed images for legacy
     // bootstrap consumers. Ordinary File opens do not populate this store: canonical SEC_IMAGE
     // admission captures the opened File, and image residency reads that retained source.
     const DLL_PINS: [(&[u8], &[u8]); DLL_PIN_COUNT] = [
-        (b"csrsrv", b"reactos\\system32\\csrsrv.dll"),
-        (b"kernel32_vista", b"reactos\\system32\\kernel32_vista.dll"),
-        (b"advapi32_vista", b"reactos\\system32\\advapi32_vista.dll"),
-        (b"ntdll_vista", b"reactos\\system32\\ntdll_vista.dll"),
+        (b"csrsrv", crate::installed_layout::CSRSRV),
+        (b"kernel32_vista", crate::installed_layout::KERNEL32_VISTA),
+        (b"advapi32_vista", crate::installed_layout::ADVAPI32_VISTA),
+        (b"ntdll_vista", crate::installed_layout::NTDLL_VISTA),
     ];
     // Bootstrap parsed-PE storage lives for the whole service loop.
     let dll_pe_store = reset_service_dll_pe_store_work();
@@ -8556,11 +10721,16 @@ pub(crate) unsafe fn service_sec_image(
     print_str(b"[sec-init] handler-ready\n");
     nt_handler.register_main_thread_spawn(primary_pi, primary_spawn)
         .expect("primary runtime publication must precede first execution");
+    nt_handler.seed_bootstrap_execution_role(primary_pi, primary_backing)
+        .expect("primary execution root requires exact mounted File and live Ps identity");
     // Bootstrap and runtime retain one queue at the same address; registration cannot clear it.
+    // Keep only the stable owner address across nested driver dispatch. Direct queue loans below
+    // end at each call site; queue-taking helpers must return before the next nested rearm.
     let delay_queue = (&mut *core::ptr::addr_of_mut!(SERVICE_DELAY_QUEUE_WORK))
         .as_mut()
-        .expect("delay wait queue must be initialized before providers");
-    register_service_delay_drain_context(&mut nt_handler, delay_queue);
+        .expect("delay wait queue must be initialized before providers") as *mut nt_delay_execution::Queue;
+    nt_handler.global_atoms = Some(crate::atom_bootstrap::take());
+    register_service_delay_drain_context(&mut nt_handler, &mut *delay_queue);
     // Bootstrap may already have armed the PIT. Reconcile the transferred deadlines
     // with the runtime owner before receiving; failed handoff must not strand work.
     let timer_handoff = rearm_registered_delay_timer();
@@ -8578,6 +10748,10 @@ pub(crate) unsafe fn service_sec_image(
         );
     }
     KUSER_CLOCK_INIT_OK.store(true, Ordering::Release);
+    launch_live_pnp_plans(
+        nt_handler as *mut ExecNtHandler,
+        &[boot_system_pnp_plan, demand_pnp_plan],
+    );
     // Per-hosted-process state, indexed by fault badge (0 = smss, 1 = csrss). The SINGLE service
     // loop multiplexes both: each thread faults through a fault-EP cap minted with its badge, so the
     // recv badge selects whose VSpace / image / scratch / fault-bookkeeping to use. Slot 1 (csrss)
@@ -8661,42 +10835,43 @@ pub(crate) unsafe fn service_sec_image(
     }
     nt_handler.capture_desktop_launch_contract();
     #[cfg(not(feature = "mup-provider-kernel-only"))]
-    {
-        let resume_error = nt_handler.start_configured_initial_thread(primary_pi, main_tcb);
-        if resume_error != 0 {
-            print_str(b"[thread-life] primary resume after service init failed pi=");
-            print_u64(primary_pi as u64);
-            print_str(b" tcb=0x");
-            print_hex((main_tcb >> 32) as u32);
-            print_hex(main_tcb as u32);
-            print_str(b" error=");
-            print_u64(u64::from(resume_error));
-            print_str(b"\n");
-            panic!("primary hosted process resume failed");
-        }
-        if let Some(tid) = nt_handler.pm_main_tid_for_pi(primary_pi) {
-            nt_handler.observe_desktop_thread_activation(u64::from(tid));
-        }
-    }
+    let mut primary_alias_activation = {
+        let primary_alias_owner = nt_hosted_runtime::PrimaryAliasOwner {
+            process_index: primary_pi,
+            process_generation: nt_handler.hosted_process_generation(primary_pi)
+                .expect("primary process retains its generation"),
+            tcb: main_tcb,
+        };
+        let mut activation = nt_hosted_runtime::PrimaryAliasActivation::new(
+            primary_alias_owner,
+        ).expect("primary process retains its TCB and generation");
+        PRIMARY_ALIAS_RETRY_DEADLINE.store(u64::MAX, Ordering::Release);
+        PRIMARY_ALIAS_RETRY_WAKE_PENDING.store(false, Ordering::Release);
+        attempt_primary_alias_activation(&mut nt_handler, &mut activation);
+        activation
+    };
     #[cfg(feature = "mup-provider-kernel-only")]
     print_str(b"[mup-provider-gate] SMSS remains suspended during native driver proof\n");
     // Every blocking ingress rechecks retained work, including early fault/refusal branches.
     // This barrier only programs wake demand; provider execution stays at the outer loop top.
     macro_rules! component_recv {
         ($($arg:expr),* $(,)?) => {{
-            component_resume::prepare_receive(&mut nt_handler);
+            assert!(prepare_service_receive(&mut *delay_queue, &mut nt_handler),
+                "initial root receive lost its physical timer owner");
             recv_full_r12($($arg),*)
         }};
     }
     macro_rules! component_reply_recv {
         ($($arg:expr),* $(,)?) => {{
-            component_resume::prepare_receive(&mut nt_handler);
+            assert!(prepare_service_receive(&mut *delay_queue, &mut nt_handler),
+                "initial root reply receive lost its physical timer owner");
             reply_recv_badge($($arg),*)
         }};
     }
     macro_rules! component_client_reply_recv {
         ($($arg:expr),* $(,)?) => {{
-            component_resume::prepare_receive(&mut nt_handler);
+            assert!(prepare_service_receive(&mut *delay_queue, &mut nt_handler),
+                "initial root client reply receive lost its physical timer owner");
             client_reply_recv_badge($($arg),*)
         }};
     }
@@ -8730,6 +10905,12 @@ pub(crate) unsafe fn service_sec_image(
     // reply cap. A process contributes to this mask only when every live hosted thread with a real TCB
     // is parked, so ordinary worker churn no longer clears or sets process liveness as a side effect.
     let mut wait_parked: u64 = 0;
+    macro_rules! record_service_loop_exit {
+        ($reason:expr) => {{
+            service_loop_exit_site = line!();
+            service_loop_exit_reason = $reason;
+        }};
+    }
     // park_and_log!(label, ip, cr2): the generalized UNRECOVERABLE-fault handler. Logs once per
     // top-level process (`[parked] pi=.. badge=.. fault=.. ip=.. cr2=..`), marks its crash bit,
     // flushes this pi's fault bookkeeping, then QUIESCE-checks (if every live top-level process is
@@ -8804,9 +10985,18 @@ pub(crate) unsafe fn service_sec_image(
                     b"all-live-parked",
                 )
                 && !defer_quiesce_for_active_user_callbacks(b"all-live-parked")
+                && !crate::mounted_volume::mounted_create_outstanding()
+                && !crate::mounted_volume::mounted_read_outstanding()
+                && !crate::mounted_volume::mounted_directory_outstanding()
+                && !driver_launch::mounted_native_physical_irp_pending()
+                && !crate::native_directory_open_work::occupied()
+                && !crate::native_file_target_open_work::occupied()
+                && !crate::native_directory_effect_work::has_outstanding(&nt_handler)
+                && !crate::provider_directory_broker::has_outstanding()
             {
                 print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
                 stop = $ip as u64;
+                record_service_loop_exit!(b"crash-all-live-parked");
                 break;
             }
             let _ = finalize_service_loop_state(&mut nt_handler);
@@ -8935,16 +11125,38 @@ pub(crate) unsafe fn service_sec_image(
                     b"all-live-waiting",
                 )
                 && !defer_quiesce_for_active_user_callbacks(b"all-live-waiting")
+                && !driver_launch::native_disk_proof_hardware_irp_pending()
+                && !driver_launch::active_relation_wal_retained()
+                && root_maintenance_owner::next_ready_ticket().is_none()
+                && !crate::mounted_volume::mounted_create_outstanding()
+                && !crate::mounted_volume::mounted_read_outstanding()
+                && !crate::mounted_volume::mounted_directory_outstanding()
+                && !driver_launch::mounted_native_physical_irp_pending()
                 && crate::registry_mutation_work::next_deadline().is_none()
+                && crate::mutable_hive_mutation_work::next_deadline().is_none()
                 && crate::section_metadata_work::next_deadline().is_none()
+                && crate::process_image_snapshot_work::next_deadline().is_none()
                 && crate::section_pagein_work::next_deadline().is_none()
+                && crate::provider_section_map_work::next_deadline().is_none()
+                && crate::native_image_pagein_work::next_deadline().is_none()
+                && crate::vm_lock_pagein_work::next_deadline().is_none()
+                && crate::vm_copy_work::next_deadline().is_none()
                 && crate::provider_section_broker::next_deadline().is_none()
+                && !crate::gdi_routed_image_work::has_outstanding()
+                && !crate::native_directory_open_work::occupied()
+                && !crate::native_file_target_open_work::occupied()
+                && !crate::native_directory_effect_work::has_outstanding(&nt_handler)
+                && !crate::provider_directory_broker::has_outstanding()
+                && crate::provider_directory_broker::next_deadline().is_none()
             {
+                unsafe { driver_launch::print_hosted_pnp_enumeration_evidence(); }
+                driver_launch::print_mounted_native_block_quiesce_snapshot();
                 print_str(
                     b"[quiesce] every live process parked/waiting (no signaler left) -> run gate\n",
                 );
                 stop = $ip as u64;
                 let _ = $pi;
+                record_service_loop_exit!(b"wait-all-live-parked");
                 break;
             }
         }};
@@ -8975,6 +11187,8 @@ pub(crate) unsafe fn service_sec_image(
     // wall-clock went. Successive dumps turn a runaway into a measurable RATE. The clock is a
     // STATIC because the win32k dispatch arm's nested pump ticks it too (see `w32_census_enter`).
     CENSUS_LAST_DUMP.store(last_progress_t, Ordering::Relaxed);
+    let mut root_add_device_turn: Option<RootAddDeviceTurn> = None;
+    let mut root_queued_callback_turn: Vec<RootQueuedCallbackTurn> = Vec::new();
     let memory_context = ExecLoopCtx {
         owner_pi: primary_pi,
         owner_pid: nt_handler.capture_process_identity(primary_pi)
@@ -9005,6 +11219,15 @@ pub(crate) unsafe fn service_sec_image(
     receive_vspace::install(nt_handler.hosted_vspace_observer());
     let mut receive_boundary = None;
     'service_loop: loop {
+        let queued_callback_fences_providers = root_queued_callback_exclusive_pending()
+            || crate::driver_launch::unsettled_queued_callback();
+        #[cfg(not(feature = "mup-provider-kernel-only"))]
+        if !queued_callback_fences_providers {
+            service_primary_alias_retry(&mut nt_handler, &mut primary_alias_activation);
+        }
+        if !queued_callback_fences_providers {
+            hosted_spawn_uncertainty::redrive(&mut *delay_queue, &mut nt_handler);
+        }
         macro_rules! component_receive_outcome {
             ($outcome:expr) => {{
                 match $outcome {
@@ -9013,14 +11236,47 @@ pub(crate) unsafe fn service_sec_image(
                         receive_boundary = Some(boundary);
                         continue 'service_loop;
                     }
+                    crate::executive_ingress::ReceiveOutcome::RetainedFailure => {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"ingress-retained");
+                        break 'service_loop;
+                    }
                 }
             }};
         }
         macro_rules! component_recv {
             ($ep:expr, $reply:expr) => {{
                 assert!(crate::executive_ingress::handles($ep));
-                if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
-                    component_resume::prepare_receive(&mut nt_handler);
+                if root_add_device_exclusive_pending() {
+                    if !prepare_parked_add_device_receive(&mut root_add_device_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-receive");
+                        break 'service_loop;
+                    }
+                } else if root_queued_callback_exclusive_pending() {
+                    if !prepare_parked_queued_callback_receive(&mut root_queued_callback_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-callback-receive");
+                        break 'service_loop;
+                    }
+                    if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+                        && !transfer_selected_queued_callback_ingress(&mut root_queued_callback_turn)
+                    {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-callback-child-transfer");
+                        break 'service_loop;
+                    }
+                } else if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+                    if !prepare_service_receive(&mut *delay_queue, &mut nt_handler) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-work-receive-poll");
+                        break 'service_loop;
+                    }
                 }
                 component_receive_outcome!(crate::executive_ingress::receive($reply))
             }};
@@ -9028,8 +11284,35 @@ pub(crate) unsafe fn service_sec_image(
         macro_rules! component_client_reply_recv {
             ($ep:expr, $reply:expr, $len:expr, $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {{
                 assert!(crate::executive_ingress::handles($ep));
-                if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
-                    component_resume::prepare_receive(&mut nt_handler);
+                if root_add_device_exclusive_pending() {
+                    if !prepare_parked_add_device_receive(&mut root_add_device_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-reply-receive");
+                        break 'service_loop;
+                    }
+                } else if root_queued_callback_exclusive_pending() {
+                    if !prepare_parked_queued_callback_receive(&mut root_queued_callback_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-callback-reply-receive");
+                        break 'service_loop;
+                    }
+                    if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+                        && !transfer_selected_queued_callback_ingress(&mut root_queued_callback_turn)
+                    {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-callback-child-transfer");
+                        break 'service_loop;
+                    }
+                } else if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+                    if !prepare_service_receive(&mut *delay_queue, &mut nt_handler) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-work-reply-poll");
+                        break 'service_loop;
+                    }
                 }
                 component_receive_outcome!(crate::executive_ingress::reply_receive(
                     $reply, $len, $r0, $r1, $r2, $r3))
@@ -9041,6 +11324,96 @@ pub(crate) unsafe fn service_sec_image(
                     $len, $r0, $r1, $r2, $r3)
             }};
         }
+        // A retained queued callback is an independent root parent. Its exact queue selector
+        // and Reply remain owned while this root receives a child-producing notification.
+        macro_rules! park_queued_callback_root_receive {
+            ($root_event_consumed:ident $(, $retry_label:lifetime)?) => {{
+                let permit = match ParkedRootQueuedCallbackPermit::retained() {
+                    Some(permit) => permit,
+                    None => {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-callback-owner");
+                        break 'service_loop;
+                    }
+                };
+                if !ensure_queued_callback_root_turn(&mut root_queued_callback_turn, &permit) {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"queued-callback-owner-changed");
+                    break 'service_loop;
+                }
+                ROOT_QUEUED_CALLBACK_EXCLUSIVE.store(true, Ordering::Release);
+                if !$root_event_consumed {
+                    if badge_has_delay_timer(badge) || hosted_irq_lines_from_badge(badge) != 0 {
+                        let turn = root_queued_callback_turn.last_mut()
+                            .expect("queued callback turn");
+                        if service_parked_queued_callback_notification(badge).is_err() {
+                            stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                            stop_ssn = 0;
+                            record_service_loop_exit!(b"queued-callback-notification");
+                            break 'service_loop;
+                        }
+                        let arrival = if badge_has_delay_timer(badge) {
+                            nt_driver_start::RootArrival::Timer { now: monotonic_time_100ns() }
+                        } else { nt_driver_start::RootArrival::Irq };
+                        if turn.observe_arrival(permit.0, arrival).is_err() {
+                            stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                            stop_ssn = 0;
+                            record_service_loop_exit!(b"queued-callback-arrival");
+                            break 'service_loop;
+                        }
+                    } else {
+                        let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                        let selected_child = crate::spawn_hosts::shared_ingress::owner::runtime::
+                            receive_child_pending()
+                            && hosted_ingress_binding(badge).is_some_and(|binding|
+                                crate::spawn_hosts::shared_ingress::owner::runtime::
+                                    receive_child_is_current(binding, reply));
+                        let retained = if selected_child {
+                            crate::spawn_hosts::shared_ingress::owner::runtime::
+                                defer_hosted_delivery_for_queued_callback(reply, badge, &permit)
+                                .is_ok()
+                        } else {
+                            retain_parked_queued_callback_ingress(
+                                &mut root_queued_callback_turn, &permit, reply, badge)
+                        };
+                        if !retained {
+                            stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                            stop_ssn = 0;
+                            record_service_loop_exit!(b"queued-callback-ingress-defer");
+                            break 'service_loop;
+                        }
+                    }
+                    $root_event_consumed = true;
+                }
+                $(
+                    // This retry remains inside the same root-event settlement loop. The
+                    // consumed marker must survive until a different ingress is received.
+                    if let Some(crate::driver_launch::QueuedCallbackRootAction::RetryRestore(selector)) =
+                        crate::driver_launch::queued_callback_root_action()
+                    {
+                        if selector == permit.0 {
+                            let (dispatch, reply) = selector.dispatch_reply();
+                            if crate::spawn_hosts::shared_ingress::owner::runtime::
+                                root_idle_receive_after_child_yield(dispatch, reply)
+                            {
+                                continue $retry_label;
+                            }
+                        }
+                    }
+                )?
+                if !prepare_parked_queued_callback_receive(&mut root_queued_callback_turn) {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"queued-callback-receive-prepare");
+                    break 'service_loop;
+                }
+                let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                (badge, mi, m0, m1, m2, m3) = received;
+                continue 'service_loop;
+            }};
+        }
         // This endpoint admits hosted faults/native Calls, not asynchronous Send traffic. A
         // rejected caller's uniquely owned Reply must be cancelled before the next receive.
         macro_rules! reject_hosted_ingress {
@@ -9050,7 +11423,21 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b" label=");
                 print_u64(mi >> 12);
                 print_str(b"\n");
-                assert!(drop_current_hosted_reply(), "cannot cancel rejected hosted ingress");
+                if !drop_current_hosted_reply()
+                    && !crate::root_reply_park::quarantine_current_hosted_reply()
+                {
+                    // Stop is uncertain. Keep the original Reply and its Call owned; another
+                    // receive would reuse that Reply and could complete the wrong caller.
+                    print_str(b"[service-loop] rejected ingress Reply retained badge=");
+                    print_u64(badge);
+                    print_str(b" reply=");
+                    print_u64(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    print_str(b"\n");
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"rejected-reply-retained");
+                    break 'service_loop;
+                }
                 let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                 badge = received.0;
                 mi = received.1;
@@ -9070,11 +11457,47 @@ pub(crate) unsafe fn service_sec_image(
             }
             if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
                 component_resume::run_outer(core::ptr::from_mut(&mut *nt_handler));
-                component_resume::prepare_receive(&mut nt_handler);
+                if root_add_device_exclusive_pending() {
+                    if !prepare_parked_add_device_receive(&mut root_add_device_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"restored-add-device-receive");
+                        break 'service_loop;
+                    }
+                } else if root_queued_callback_exclusive_pending() {
+                    if !prepare_parked_queued_callback_receive(&mut root_queued_callback_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"restored-queued-callback-receive");
+                        break 'service_loop;
+                    }
+                    if !transfer_selected_queued_callback_ingress(&mut root_queued_callback_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"restored-queued-callback-child-transfer");
+                        break 'service_loop;
+                    }
+                } else {
+                    if !prepare_service_receive(&mut *delay_queue, &mut nt_handler) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"restored-queued-work-poll");
+                        break 'service_loop;
+                    }
+                }
             }
             let received = crate::executive_ingress::receive(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
-            let crate::executive_ingress::ReceiveOutcome::Message(received) = received else {
-                panic!("completed Receive cannot issue another settlement boundary");
+            let received = match received {
+                crate::executive_ingress::ReceiveOutcome::Message(received) => received,
+                crate::executive_ingress::ReceiveOutcome::RetainedFailure => {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"restored-ingress-retained");
+                    break 'service_loop;
+                }
+                crate::executive_ingress::ReceiveOutcome::OuterBoundary(_) => {
+                    panic!("completed Receive cannot issue another settlement boundary")
+                }
             };
             (badge, mi, m0, m1, m2, m3) = received;
         }
@@ -9090,6 +11513,431 @@ pub(crate) unsafe fn service_sec_image(
         // change its attachment. Its ordinary fault handler still performs fresh admission.
         let ingress;
         if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+        // The batch cursor owns an entered AddDevice Reply. Run only its selected child,
+        // settle any inner CONNECT, then resume that same batch before general redrives.
+        // The sealed child step is deposited before any subsequent batch borrow.
+        let mut root_event_consumed = false;
+        if root_queued_callback_exclusive_pending()
+            && (badge_has_delay_timer(badge) || hosted_irq_lines_from_badge(badge) != 0)
+        {
+            let Some(turn) = root_queued_callback_turn.last_mut() else {
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                record_service_loop_exit!(b"queued-callback-missing-turn");
+                break 'service_loop;
+            };
+            if service_parked_queued_callback_notification(badge).is_err() {
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                record_service_loop_exit!(b"queued-callback-notification");
+                break 'service_loop;
+            }
+            let arrival = if badge_has_delay_timer(badge) {
+                nt_driver_start::RootArrival::Timer { now: monotonic_time_100ns() }
+            } else { nt_driver_start::RootArrival::Irq };
+            if turn.observe_arrival(turn.owner(), arrival).is_err() {
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                record_service_loop_exit!(b"queued-callback-arrival");
+                break 'service_loop;
+            }
+            root_event_consumed = true;
+        } else if root_queued_callback_exclusive_pending() {
+            // Keep original ingress order: a newer Call Y cannot overtake an older deferred
+            // Call X if this callback happens to settle while Y is the current delivery.
+            let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            let selected_child = crate::spawn_hosts::shared_ingress::owner::runtime::
+                receive_child_pending()
+                && hosted_ingress_binding(badge).is_some_and(|binding|
+                    crate::spawn_hosts::shared_ingress::owner::runtime::
+                        receive_child_is_current(binding, reply));
+            if !selected_child {
+                let Some(permit) = ParkedRootQueuedCallbackPermit::retained() else {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"queued-callback-ingress-owner");
+                    break 'service_loop;
+                };
+                if !retain_parked_queued_callback_ingress(
+                    &mut root_queued_callback_turn, &permit, reply, badge)
+                {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"queued-callback-ingress-defer");
+                    break 'service_loop;
+                }
+                root_event_consumed = true;
+            }
+        }
+        if let Some(turn) = root_add_device_turn.as_mut() {
+            if badge_has_delay_timer(badge) || hosted_irq_lines_from_badge(badge) != 0 {
+                if let Err(status) = service_parked_add_device_notification(badge) {
+                    stop = status.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"add-device-notification");
+                    break 'service_loop;
+                }
+                let arrival = if badge_has_delay_timer(badge) {
+                    nt_driver_start::RootArrival::Timer { now: monotonic_time_100ns() }
+                } else {
+                    nt_driver_start::RootArrival::Irq
+                };
+                let _ = turn.observe_arrival(turn.owner(), arrival);
+                root_event_consumed = true;
+            }
+        }
+        'queued_callback_settlement: loop {
+            // A callback reached by the preceding AddDevice child owns a nested physical
+            // Reply. Settle it before running another AddDevice child or resuming the batch.
+            // Passive work may enter a provider and retain a physical callback Reply. Only
+            // this root boundary can hand that owner to the callback settlement below.
+            if root_add_device_turn.is_none()
+                && root_queued_callback_turn.is_empty()
+                && !root_queued_callback_exclusive_pending()
+            {
+                let queued_admission = {
+                    let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                    crate::driver_launch::drain_hosted_queued_callbacks_at_root()
+                };
+                if let Err(status) = queued_admission {
+                    stop = status as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"queued-callback-admission");
+                    break 'service_loop;
+                }
+            }
+            let callback_settlement = {
+                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                settle_queued_callbacks()
+            };
+            match callback_settlement {
+                ConnectPumpSettlement::Settled => {
+                    if !settle_parked_queued_callback_turn(&mut root_queued_callback_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-callback-settle");
+                        break 'service_loop;
+                    }
+                }
+                ConnectPumpSettlement::AwaitingLocalChild => {
+                    if root_add_device_turn.is_none() {
+                        park_queued_callback_root_receive!(root_event_consumed, 'queued_callback_settlement);
+                    }
+                    if !prepare_parked_add_device_receive(&mut root_add_device_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-child-receive");
+                        break 'service_loop;
+                    }
+                    let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    (badge, mi, m0, m1, m2, m3) = received;
+                    continue 'service_loop;
+                }
+                ConnectPumpSettlement::RetryableRestore => {
+                    park_queued_callback_root_receive!(root_event_consumed, 'queued_callback_settlement);
+                }
+                ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"add-device-connect-retained");
+                    break 'service_loop;
+                }
+            }
+            let selected = {
+                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                match run_one_pending_add_device_child_step(nt_handler as *mut _) {
+                    Ok(selected) => selected,
+                    Err(()) => {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-child-step");
+                        break 'service_loop;
+                    }
+                }
+            };
+            let Some((reservation, ran_child)) = selected else {
+                if let Some(turn) = root_add_device_turn.take() {
+                    let owner = turn.owner();
+                    if !root_add_device_owner_exact_present(&nt_handler, owner)
+                        || root_add_device_still_parked(&nt_handler, turn.owner())
+                    {
+                        root_add_device_turn = Some(turn);
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-owner-changed");
+                        break 'service_loop;
+                    }
+                    if turn.retained_ingress(owner).ok().flatten().is_some_and(|ticket|
+                        !crate::spawn_hosts::shared_ingress::owner::runtime::deferred_parked_ingress_is_exact(ticket))
+                    {
+                        root_add_device_turn = Some(turn);
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-ingress-changed");
+                        break 'service_loop;
+                    }
+                    let retained = match turn.settle(owner) {
+                        Ok(retained) => retained,
+                        Err(turn) => {
+                            root_add_device_turn = Some(turn);
+                            stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                            stop_ssn = 0;
+                            record_service_loop_exit!(b"add-device-settle");
+                            break 'service_loop;
+                        }
+                    };
+                    ROOT_ADD_DEVICE_RETRY_DEADLINE.store(u64::MAX, Ordering::Release);
+                    ROOT_ADD_DEVICE_EXCLUSIVE.store(false, Ordering::Release);
+                    root_event_consumed |= retained.is_some();
+                    break;
+                }
+                // Ordinary redrives may reach Ready, but only this flat root phase may
+                // enter AddDevice. Admit one exact row and recheck it before other work.
+                let Some(ready) = ready_flat_root_add_device(&nt_handler) else { break };
+                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                redrive_flat_root_add_device_selected(&mut nt_handler, ready);
+                if root_add_device_still_parked(&nt_handler, ready) {
+                    root_add_device_turn = Some(nt_driver_start::AddDeviceRootTurn::new(ready));
+                    ROOT_ADD_DEVICE_EXCLUSIVE.store(true, Ordering::Release);
+                    continue;
+                }
+                break;
+            };
+            if root_add_device_turn.is_none() {
+                root_add_device_turn = Some(nt_driver_start::AddDeviceRootTurn::new(reservation));
+                ROOT_ADD_DEVICE_EXCLUSIVE.store(true, Ordering::Release);
+            }
+            if root_add_device_turn.as_ref().is_none_or(|turn| turn.owner() != reservation) {
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                record_service_loop_exit!(b"add-device-reservation-changed");
+                break 'service_loop;
+            }
+            let mut awaiting_connect_child = false;
+            let still_parked = {
+                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                match settle_queued_callbacks() {
+                    ConnectPumpSettlement::Settled => {}
+                    ConnectPumpSettlement::AwaitingLocalChild => {
+                        awaiting_connect_child = true;
+                    }
+                    ConnectPumpSettlement::RetryableRestore => {
+                        park_queued_callback_root_receive!(root_event_consumed, 'queued_callback_settlement);
+                    }
+                    ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-connect-retained");
+                        break 'service_loop;
+                    }
+                }
+                match if awaiting_connect_child {
+                    ConnectPumpSettlement::AwaitingLocalChild
+                } else {
+                    // The selected AddDevice may be waiting for a detached CONNECT whose
+                    // provider has just completed. Import that exact completion before
+                    // resuming the parent; this exclusive root path skips ordinary redrives.
+                    crate::driver_launch::redrive_entered_hosted_connect_completions();
+                    settle_suspended_connect_pumps()
+                } {
+                    ConnectPumpSettlement::Settled => {
+                        redrive_flat_root_add_device_selected(&mut nt_handler, reservation);
+                        root_add_device_still_parked(&nt_handler, reservation)
+                    }
+                    ConnectPumpSettlement::AwaitingLocalChild => {
+                        // The exact CONNECT pump has its sealed empty child observation.
+                        // Keep both parents and their Replies parked until the root retry shot.
+                        awaiting_connect_child = true;
+                        true
+                    }
+                    ConnectPumpSettlement::RetryableRestore => {
+                        park_queued_callback_root_receive!(root_event_consumed, 'queued_callback_settlement);
+                    }
+                    ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-connect-retained");
+                        break 'service_loop;
+                    }
+                }
+            };
+            trace_connect_add_device_boundary(3, u64::from(still_parked)
+                | (u64::from(awaiting_connect_child) << 1)
+                | (u64::from(ran_child) << 2));
+            trace_connect_add_device_boundary(5,
+                root_add_device_probe_bits(&nt_handler, reservation));
+            trace_connect_add_device_boundary(6,
+                crate::driver_launch::hosted_connect_root_probe_origin_bits());
+            if !still_parked {
+                if root_add_device_turn.as_ref().and_then(|turn|
+                    turn.retained_ingress(reservation).ok().flatten())
+                    .is_some_and(|ticket|
+                        !crate::spawn_hosts::shared_ingress::owner::runtime::deferred_parked_ingress_is_exact(ticket))
+                {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"add-device-ingress-changed");
+                    break 'service_loop;
+                }
+                let turn = root_add_device_turn.take().expect("exact AddDevice turn");
+                let retained = match turn.settle(reservation) {
+                    Ok(retained) => retained,
+                    Err(turn) => {
+                        root_add_device_turn = Some(turn);
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-settle");
+                        break 'service_loop;
+                    }
+                };
+                ROOT_ADD_DEVICE_RETRY_DEADLINE.store(u64::MAX, Ordering::Release);
+                ROOT_ADD_DEVICE_EXCLUSIVE.store(false, Ordering::Release);
+                break;
+            }
+            if !awaiting_connect_child && !ran_child
+                && !root_add_device_retry_without_new_child(&nt_handler, reservation)
+                && !root_add_device_needs_child_step(&nt_handler, reservation)
+            {
+                // The exact parent has an indeterminate or quarantined outcome. Its Reply
+                // and banks remain held, and no unrelated provider can enter after this.
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                record_service_loop_exit!(b"add-device-parent-retained");
+                break 'service_loop;
+            }
+            if ran_child && !awaiting_connect_child { continue }
+            let turn = root_add_device_turn.as_mut().expect("parked AddDevice turn");
+            if !root_event_consumed && badge_has_delay_timer(badge)
+                || !root_event_consumed && hosted_irq_lines_from_badge(badge) != 0
+            {
+                if let Err(status) = service_parked_add_device_notification(badge) {
+                    stop = status.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"add-device-notification");
+                    break 'service_loop;
+                }
+                let arrival = if badge_has_delay_timer(badge) {
+                    nt_driver_start::RootArrival::Timer { now: monotonic_time_100ns() }
+                } else {
+                    nt_driver_start::RootArrival::Irq
+                };
+                let _ = turn.observe_arrival(reservation, arrival);
+                root_event_consumed = true;
+                continue;
+            }
+            if !root_event_consumed && badge != DELAY_TIMER_BADGE
+                && hosted_irq_lines_from_badge(badge) == 0
+            {
+                let Some(permit) = ParkedRootAddDevicePermit::for_exact(&nt_handler, reservation)
+                else {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"add-device-permit");
+                    break 'service_loop;
+                };
+                let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let ticket = match crate::spawn_hosts::shared_ingress::owner::runtime::
+                    defer_hosted_delivery_for_add_device(reply, badge, &permit)
+                {
+                    Ok(ticket) => ticket,
+                    Err(_) => {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"add-device-ingress-defer");
+                        break 'service_loop;
+                    }
+                };
+                if turn.retain_ingress(reservation, ticket).is_err() {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"add-device-ingress-retain");
+                    break 'service_loop;
+                }
+                root_event_consumed = true;
+            }
+            let prepared = prepare_parked_add_device_receive(&mut root_add_device_turn);
+            trace_connect_add_device_boundary(4, u64::from(prepared));
+            if !prepared {
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                record_service_loop_exit!(b"add-device-receive-prepare");
+                break 'service_loop;
+            }
+            let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+            (badge, mi, m0, m1, m2, m3) = received;
+            continue 'service_loop;
+        }
+        // A nested provider can select a Receive child after the early guard was sampled.
+        // Import that exact child before any ordinary provider redrive in this event.
+        if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
+            if root_event_consumed && !root_add_device_exclusive_pending()
+                && !root_queued_callback_exclusive_pending()
+                && !delay_timer_rearm(&*delay_queue, &nt_handler).owner_available()
+            {
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                record_service_loop_exit!(b"receive-child-timer-owner");
+                break 'service_loop;
+            }
+            if badge_has_delay_timer(badge) || hosted_irq_lines_from_badge(badge) != 0 {
+                if !root_event_consumed {
+                    let notification = if root_queued_callback_exclusive_pending() {
+                        service_parked_queued_callback_notification(badge)
+                    } else {
+                        service_parked_add_device_notification(badge)
+                    };
+                    if let Err(status) = notification {
+                        stop = status.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"receive-child-notification");
+                        break 'service_loop;
+                    }
+                }
+            } else if !root_event_consumed {
+                let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let selected_callback_child = root_queued_callback_exclusive_pending()
+                    && hosted_ingress_binding(badge).is_some_and(|binding|
+                        crate::spawn_hosts::shared_ingress::owner::runtime::
+                            receive_child_is_current(binding, reply));
+                if selected_callback_child {
+                    let Some(permit) = ParkedRootQueuedCallbackPermit::retained() else {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-callback-child-owner");
+                        break 'service_loop;
+                    };
+                    if crate::spawn_hosts::shared_ingress::owner::runtime::
+                        defer_hosted_delivery_for_queued_callback(reply, badge, &permit).is_err()
+                    {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-callback-child-defer");
+                        break 'service_loop;
+                    }
+                } else {
+                    crate::spawn_hosts::shared_ingress::owner::runtime::defer_hosted_delivery(
+                        reply, badge,
+                    ).expect("selected Receive child retains the unexecuted current Call");
+                }
+            }
+            let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+            (badge, mi, m0, m1, m2, m3) = received;
+            continue 'service_loop;
+        }
+        if root_event_consumed {
+            // The parked ACK-only timer deliberately retained unrelated due owners. The
+            // AddDevice bank has now settled, so restore their ordinary shared one-shot before
+            // waiting for the next real ingress. A failed arm cannot be treated as an idle wait.
+            if !delay_timer_rearm(&*delay_queue, &nt_handler).owner_available() {
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                record_service_loop_exit!(b"timer-rearm");
+                break 'service_loop;
+            }
+            let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+            (badge, mi, m0, m1, m2, m3) = received;
+            continue 'service_loop;
+        }
         // Bound notifications do not bind the offered Reply and use a separate badge namespace.
         crate::provider_bugcheck::stop_if_pending();
         // Retry outside registry/runtime borrows, including when the next ingress is excluded.
@@ -9104,21 +11952,112 @@ pub(crate) unsafe fn service_sec_image(
         // CM retries run only between hosted events, never inside a timer callback or nested pump.
         crate::cm_key_ownership::retry_cleanup(monotonic_time_100ns());
         crate::cm_snapshot_ownership::retry_cleanup(monotonic_time_100ns());
+        let alpc_reply_committed;
         {
             let _message = crate::ipc_message::SavedMessageBuffer::capture();
-            crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
-            crate::section_metadata_work::redrive(&mut nt_handler, delay_queue);
+            crate::native_alpc_create_work::redrive(&mut nt_handler);
+            crate::native_alpc_close_work::redrive(&mut nt_handler);
+            crate::native_alpc_connect_accept_work::redrive(&mut nt_handler);
+            crate::native_srm_command_work::redrive(&mut nt_handler);
+            alpc_reply_committed =
+                crate::native_alpc_send_receive_work::redrive(&mut nt_handler);
+            crate::registry_mutation_work::redrive(&mut nt_handler, &mut *delay_queue);
+            crate::mutable_hive_mutation_work::redrive(&mut nt_handler, &mut *delay_queue);
+            crate::section_metadata_work::redrive(&mut nt_handler, &mut *delay_queue);
+            crate::process_image_snapshot_work::redrive(&mut nt_handler, &mut *delay_queue,
+                ntdll, fault_ep, procs, exe_images, &*exe_image_catalog,
+                hosted_loaded_images_ptr);
             crate::section_pagein_work::redrive(&mut nt_handler);
+            crate::provider_section_map_work::redrive(&mut nt_handler);
+            crate::native_image_pagein_work::redrive(&mut nt_handler, &nt_dispatcher);
+            crate::vm_lock_pagein_work::redrive(&mut nt_handler);
+            crate::vm_copy_work::redrive(&mut nt_handler);
             crate::provider_section_broker::redrive(nt_handler as *mut _);
+            crate::gdi_routed_image_work::redrive(&mut nt_handler);
+            crate::provider_directory_broker::redrive(nt_handler as *mut _);
             crate::provider_mm_section_objects::redrive(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_driver_io_create_file(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_query_path_forward(nt_handler as *mut _);
+            crate::driver_launch::redrive_hosted_internal_control_forward(nt_handler as *mut _);
+            crate::driver_launch::redrive_hosted_buffered_control_forward(nt_handler as *mut _);
+            crate::driver_launch::redrive_hosted_scsi_forward(nt_handler as *mut _);
+            // Observe the retained source immediately after its first provider poll. Later
+            // redrives can enter another provider before finalize_service_loop_state runs.
+            if crate::driver_launch::hosted_scsi_receive_boundary_probe_due() {
+                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                crate::driver_launch::trace_hosted_scsi_receive_boundary();
+            }
             crate::driver_launch::redrive_hosted_write_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_read_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_flush_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_query_information_forward(nt_handler as *mut _);
+            trace_connect_root_checkpoint(0, None);
             crate::driver_launch::redrive_hosted_connect_forward();
+            trace_connect_root_checkpoint(1, None);
+            // A port CONNECT may have yielded while its provider parent remained physically
+            // parked. Its File frames have ended here. Run one selected child per flat pass,
+            // then resume only that exact retained pump before another provider can enter.
+            let connect_settlement = settle_suspended_connect_pumps();
+            trace_connect_root_checkpoint(2, Some(&connect_settlement));
+            if !matches!(connect_settlement, ConnectPumpSettlement::Settled) {
+                // A nonretryable restore or a claimed, orphaned, or blocked port parent still
+                // owns its Reply. No later provider may enter while that physical owner is held.
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                record_service_loop_exit!(b"connect-pump-unsettled");
+                break 'service_loop;
+            }
+            // A work-queue callback can outlive its invoking provider frame. Reconcile
+            // its exact Reply before a fresh Hook source may enter native code.
+            let queue_settlement = settle_queued_callbacks();
+            trace_connect_root_checkpoint(3, Some(&queue_settlement));
+            match queue_settlement {
+                ConnectPumpSettlement::Settled => {
+                    if !settle_parked_queued_callback_turn(&mut root_queued_callback_turn) {
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = 0;
+                        record_service_loop_exit!(b"queued-callback-settle");
+                        break 'service_loop;
+                    }
+                }
+                ConnectPumpSettlement::AwaitingLocalChild => {
+                    park_queued_callback_root_receive!(root_event_consumed);
+                }
+                ConnectPumpSettlement::RetryableRestore => {
+                    park_queued_callback_root_receive!(root_event_consumed);
+                }
+                ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"queued-callback-unsettled");
+                    break 'service_loop;
+                }
+            }
+            trace_connect_root_checkpoint(4, None);
             crate::driver_launch::redrive_hosted_hook_forward();
+            trace_connect_root_checkpoint(5, None);
+            if crate::driver_launch::hook_redrive_exit_probe() {
+                trace_hook_root_boundary(0);
+                crate::driver_launch::clear_hook_redrive_exit_probe();
+            }
+            if crate::driver_launch::hosted_hook_port_waiting() {
+                trace_hook_root_boundary(1);
+            }
+            let hook_pump_settlement = {
+                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                if crate::driver_launch::hosted_hook_port_waiting() {
+                    trace_hook_root_boundary(2);
+                }
+                settle_suspended_file_pumps()
+            };
+            if !matches!(hook_pump_settlement, ConnectPumpSettlement::Settled) {
+                // The exact Hook File owner still holds a physical Reply. Do not enter the
+                // next unrelated provider or publish a synthetic Hook completion.
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                record_service_loop_exit!(b"file-pump-unsettled");
+                break 'service_loop;
+            }
             crate::driver_launch::redrive_hosted_lower_pnp_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_hosted_lower_file_forward(nt_handler as *mut _);
             crate::driver_launch::redrive_accepted_pdo_provider_retirement();
@@ -9130,10 +12069,16 @@ pub(crate) unsafe fn service_sec_image(
             crate::driver_launch::win32k_file_owners::redrive();
             crate::provider_file_wait::redrive(&mut nt_handler);
             crate::current_apc::redrive(&mut nt_handler);
-            crate::current_apc::redrive_terminated_runtimes(&mut nt_handler, delay_queue);
+            crate::current_apc::redrive_terminated_runtimes(&mut nt_handler, &mut *delay_queue);
             crate::object_wait_reply::redrive(&mut nt_handler);
-            crate::object_wait_reply::redrive_terminated_runtimes(&mut nt_handler, delay_queue);
+            crate::object_wait_reply::redrive_terminated_runtimes(&mut nt_handler, &mut *delay_queue);
             inline_file_retirement::redrive(&mut nt_handler);
+            // A provider may clear the shared publication fence in this pass. Retry the
+            // exact parked first-thread Reply after settlement, before receiving again.
+            crate::exec_handler::initial_thread_creation::redrive_retry_no_effect(&mut nt_handler);
+        }
+        if alpc_reply_committed.is_some() {
+            let _ = lpc_component_reply_commit_drain(&mut nt_handler);
         }
         if crate::writable_fs::registry_journal::owns_volume()
             && badge != DELAY_TIMER_BADGE
@@ -9151,6 +12096,22 @@ pub(crate) unsafe fn service_sec_image(
             m3 = received.5;
             continue;
         }
+        if badge != DELAY_TIMER_BADGE
+            && hosted_irq_lines_from_badge(badge) == 0
+            && !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+            && crate::spawn_hosts::shared_ingress::owner::runtime::is_win32k_native_call(mi, m0)
+            && component_shared_publication_is_busy()
+        {
+            // Maintenance above may have selected a returned Receive owner after this Call was
+            // imported. Move the still-unexecuted original Call and Reply back to its ingress
+            // row before fault-frame or win32k shared-page staging can overwrite either owner.
+            crate::spawn_hosts::shared_ingress::owner::runtime::defer_hosted_delivery(
+                REPLY_MAIN_SLOT.load(Ordering::Relaxed), badge,
+            ).expect("busy win32k Call retains its original physical ingress owner");
+            let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+            (badge, mi, m0, m1, m2, m3) = received;
+            continue 'service_loop;
+        }
         ingress = if badge == DELAY_TIMER_BADGE || hosted_irq_lines_from_badge(badge) != 0 {
             None
         } else {
@@ -9166,9 +12127,28 @@ pub(crate) unsafe fn service_sec_image(
         // pumps only latch these bits; the root loop is the sole dispatcher and therefore the sole
         // owner of ISR ordering and handler acknowledgement.
         let current_irq_lines = driver_launch::latch_hosted_irq_badge(badge);
-        let _ = driver_launch::drain_pending_hosted_irqs();
+        let serviced_irq_lines = driver_launch::drain_pending_hosted_irqs();
+        if current_irq_lines != 0 || serviced_irq_lines != 0 {
+            // A hosted SCSI terminal can arrive during the IRQ/DPC drain, after the
+            // ordinary source poll. Service its retained owner even when a deferred
+            // IRQ is drained on a later timer or ordinary ingress badge.
+            let _message = crate::ipc_message::SavedMessageBuffer::capture();
+            let _ = driver_launch::redrive_irq_ready_hosted_scsi(nt_handler as *mut _);
+        }
         if current_irq_lines != 0 {
-            if badge_has_delay_timer(badge) {
+            let has_delay_timer = badge_has_delay_timer(badge);
+            if !has_delay_timer {
+                // IRQ-owned DPCs can publish the exact native IRP terminal. Observe and
+                // ACK it before sleeping; otherwise each sector waits for a timer wakeup.
+                if driver_launch::mounted_native_physical_irp_pending() {
+                    if service_mounted_native_blocks_and_redrive_backends() != 0 {
+                        let _ = driver_launch::pump_hosted_io_completions();
+                        let _ = pending_file_io_redrive_all(&mut nt_handler);
+                        let _ = file_cleanup_redrive_all(&mut nt_handler);
+                    }
+                }
+            }
+            if has_delay_timer {
                 badge = DELAY_TIMER_BADGE;
             } else {
                 let irq_durable_status = finalize_service_loop_state(&mut nt_handler);
@@ -9177,6 +12157,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(irq_durable_status);
                     print_str(b"\n");
                     stop = irq_durable_status as u64;
+                    record_service_loop_exit!(b"irq-checkpoint");
                     break;
                 }
                 let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
@@ -9211,7 +12192,7 @@ pub(crate) unsafe fn service_sec_image(
             let drained = if badge == DELAY_TIMER_BADGE {
                 0
             } else {
-                delay_timer_drain_overdue_without_badge(delay_queue, &mut nt_handler)
+                delay_timer_drain_overdue_without_badge(&mut *delay_queue, &mut nt_handler)
             };
             crate::LOOP_DRAIN_TICKS.fetch_add(
                 crate::disk_census_ticks().wrapping_sub(started),
@@ -9233,6 +12214,7 @@ pub(crate) unsafe fn service_sec_image(
                 } else if crate::watchdog_confirm_trip() {
                     print_str(b"[deadman] confirmed -> QUIESCE; run the gate\n");
                     stop = m1;
+                    record_service_loop_exit!(b"overdue-watchdog");
                     break;
                 }
             }
@@ -9258,6 +12240,11 @@ pub(crate) unsafe fn service_sec_image(
                     Ordering::Relaxed,
                 );
                 census_tick_static(now);
+                native_process_time_census::sample_after_census(&nt_handler);
+                installer_child_span_census::maybe_sample_gap(&nt_handler, now);
+                installer_child_span_census::print_census(&nt_handler);
+                if CENSUS_LAST_DUMP.load(Ordering::Relaxed) == now {
+                }
             }
             if ep != last_progress_epoch {
                 last_progress_epoch = ep;
@@ -9272,6 +12259,11 @@ pub(crate) unsafe fn service_sec_image(
                 if deferral.is_some() && stall_deferrals.grant(ep, deferral.unwrap()) {
                     let snapshot = deferral.unwrap();
                     trace_progress_stall_deferral(snapshot, &nt_handler, crash_parked, wait_parked);
+                    last_progress_t = now;
+                } else if nt_handler.grant_installer_inf_progress(ep, now, STALL_BUDGET_100NS) {
+                    print_str(b"[quiesce] deferring installer INF traversal grant=");
+                    print_u64(nt_handler.installer_inf_grants() as u64);
+                    print_str(b"/2\n");
                     last_progress_t = now;
                 } else {
                     dump_lsa_readiness_quiesce(
@@ -9300,6 +12292,7 @@ pub(crate) unsafe fn service_sec_image(
                     );
                     print_str(b"[quiesce] no boot milestone for ~180s wall-clock -> run gate\n");
                     stop = m1;
+                    record_service_loop_exit!(b"boot-milestone-stall");
                     break;
                 }
             }
@@ -9334,6 +12327,7 @@ pub(crate) unsafe fn service_sec_image(
                 );
                 print_str(b"[deadman] nested receive confirmed watchdog -> run gate\n");
                 stop = m1;
+                record_service_loop_exit!(b"nested-receive-watchdog");
                 break;
             }
         }
@@ -9353,7 +12347,7 @@ pub(crate) unsafe fn service_sec_image(
                 || WINLOGON_DIALOG_FB_VERIFIED.load(Ordering::Relaxed) != 0
                 || WINLOGON_LOGON_TOKEN_QUERIES.load(Ordering::Relaxed) != 0)
         {
-            crate::watchdog_arm(delay_queue, &nt_handler);
+            crate::watchdog_arm(&mut *delay_queue, &nt_handler);
         }
         // ★ DRAIN timer ticks a COMPONENT PUMP absorbed. The HPET notification is bound to the root
         // TCB, so it can cancel ANY blocking recv the executive makes — including `pump_recv`'s,
@@ -9364,20 +12358,22 @@ pub(crate) unsafe fn service_sec_image(
         let pump_ticks = DELAY_TIMER_TICKS_PENDING.swap(0, Ordering::Relaxed);
         if pump_ticks != 0 {
             PUMP_TIMER_TICKS_DRAINED.fetch_add(pump_ticks, Ordering::Relaxed);
-            delay_timer_interrupt(delay_queue, &mut nt_handler);
+            delay_timer_interrupt(&mut *delay_queue, &mut nt_handler);
+            #[cfg(not(feature = "mup-provider-kernel-only"))]
+            service_primary_alias_retry(&mut nt_handler, &mut primary_alias_activation);
             let _ = pump_hosted_io_and_redrive_driver_starts(
                 driver_launch::drain_hosted_driver_dpcs(),
                 &mut nt_handler,
             );
         }
         if badge == DELAY_TIMER_BADGE {
-            if delay_queue.len() != 0 && delay_queue.has_badge_other_than(badge) {
+            if (&*delay_queue).len() != 0 && (&*delay_queue).has_badge_other_than(badge) {
                 let progress = DELAY_OTHER_BADGE_PROGRESS.fetch_add(1, Ordering::Relaxed);
                 if progress < 8 {
                     print_str(
                         b"[delay] timer badge progressed while client waiter parked: queued=",
                     );
-                    print_u64(delay_queue.len() as u64);
+                    print_u64((&*delay_queue).len() as u64);
                     print_str(b"\n");
                 }
             }
@@ -9389,7 +12385,9 @@ pub(crate) unsafe fn service_sec_image(
                 print_hex_u64(m0);
                 print_str(b"\n");
             }
-            delay_timer_interrupt(delay_queue, &mut nt_handler);
+            delay_timer_interrupt(&mut *delay_queue, &mut nt_handler);
+            #[cfg(not(feature = "mup-provider-kernel-only"))]
+            service_primary_alias_retry(&mut nt_handler, &mut primary_alias_activation);
             let _ = pump_hosted_io_and_redrive_driver_starts(
                 driver_launch::drain_hosted_driver_dpcs(),
                 &mut nt_handler,
@@ -9405,6 +12403,7 @@ pub(crate) unsafe fn service_sec_image(
                 } else if crate::watchdog_confirm_trip() {
                     print_str(b"[deadman] confirmed -> QUIESCE; run the gate\n");
                     stop = m1;
+                    record_service_loop_exit!(b"timer-watchdog");
                     break;
                 }
             }
@@ -9416,6 +12415,7 @@ pub(crate) unsafe fn service_sec_image(
                 print_hex(timer_durable_status);
                 print_str(b"\n");
                 stop = timer_durable_status as u64;
+                record_service_loop_exit!(b"timer-checkpoint");
                 break;
             }
             let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
@@ -9427,13 +12427,13 @@ pub(crate) unsafe fn service_sec_image(
             m3 = received.5;
             continue;
         }
-        if delay_queue.len() != 0 && delay_queue.has_badge_other_than(badge) {
+        if (&*delay_queue).len() != 0 && (&*delay_queue).has_badge_other_than(badge) {
             let progress = DELAY_OTHER_BADGE_PROGRESS.fetch_add(1, Ordering::Relaxed);
             if progress < 8 {
                 print_str(b"[delay] unrelated badge progressed while waiter parked: badge=");
                 print_u64(badge);
                 print_str(b" queued=");
-                print_u64(delay_queue.len() as u64);
+                print_u64((&*delay_queue).len() as u64);
                 print_str(b"\n");
             }
         }
@@ -9446,6 +12446,7 @@ pub(crate) unsafe fn service_sec_image(
             print_hex(durability_status);
             print_str(b"\n");
             stop = durability_status as u64;
+            record_service_loop_exit!(b"durability-publication");
             break;
         }
         // This delivery still owns its Reply and captured message. An outer resume can select
@@ -9481,6 +12482,35 @@ pub(crate) unsafe fn service_sec_image(
             (Some(admitted), Ok(current)) if admitted.binding() == current.binding() => current,
             _ => reject_hosted_ingress!(),
         };
+        // This is only a copied latency observation. The admitted runtime and
+        // canonical thread lifetime must still agree before matching a prior Reply.
+        if let Some(caller) = nt_handler.capture_provider_logical_caller(
+            event_runtime.pi, event_runtime.tid, badge, event_runtime.tcb,
+        ).filter(|caller| caller.process() == event_runtime.process) {
+            let process_generation = match caller.process().generation {
+                nt_user_host::process_identity::ProcessGeneration::Hosted(value)
+                | nt_user_host::process_identity::ProcessGeneration::Temporary(value) => value,
+            };
+            crate::ingress_observation::authenticated_thread_ingress(
+                nt_hosted_runtime::WaitLatencyThreadIdentity {
+                    process_index: caller.pi() as u64,
+                    process_generation,
+                    thread_id: u64::from(caller.thread().thread_id()),
+                    thread_generation: caller.thread().generation(),
+                    tcb: caller.tcb(),
+                },
+                monotonic_time_100ns(),
+            );
+        }
+        // An ETHREAD can outlive its image/runtime attachment during exact process retirement.
+        // Refuse that Call before selecting any scratch or mirror address from the old PI.
+        let event_layout = match event_runtime.process.generation {
+            nt_user_host::process_identity::ProcessGeneration::Hosted(generation) =>
+                hosted_process_runtime_for_exact(event_runtime.pi, generation),
+            nt_user_host::process_identity::ProcessGeneration::Temporary(_) =>
+                hosted_process_runtime_for_pi(event_runtime.pi),
+        };
+        let Some(event_layout) = event_layout else { reject_hosted_ingress!() };
         if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
             let observed = crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_observation(
                 event_runtime.binding(), REPLY_MAIN_SLOT.load(Ordering::Relaxed),
@@ -9508,6 +12538,15 @@ pub(crate) unsafe fn service_sec_image(
             );
             // No attachment, process scratch, provider, timer or legacy fault policy runs here.
             // The canonical root pager revalidated the captured resident frame or stack guard.
+            if root_queued_callback_exclusive_pending()
+                && crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
+                && !transfer_selected_queued_callback_ingress(&mut root_queued_callback_turn)
+            {
+                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                stop_ssn = 0;
+                record_service_loop_exit!(b"queued-callback-child-transfer");
+                break 'service_loop;
+            }
             let outcome = crate::executive_ingress::reply_receive(
                 REPLY_MAIN_SLOT.load(Ordering::Relaxed), 0, 0, 0, 0, 0,
             );
@@ -9515,6 +12554,12 @@ pub(crate) unsafe fn service_sec_image(
                 crate::executive_ingress::ReceiveOutcome::OuterBoundary(boundary) => {
                     receive_boundary = Some(boundary);
                     continue 'service_loop;
+                }
+                crate::executive_ingress::ReceiveOutcome::RetainedFailure => {
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = 0;
+                    record_service_loop_exit!(b"receive-child-ack-retained");
+                    break 'service_loop;
                 }
                 crate::executive_ingress::ReceiveOutcome::Message(_) => panic!("Receive ACK requires exact settlement boundary"),
             }
@@ -9610,7 +12655,7 @@ pub(crate) unsafe fn service_sec_image(
         }
         if is_tp_worker && !is_scm_worker && !is_lsa_worker {
             let n = GENERIC_TP_WORKER_FAULT_TRACE.fetch_add(1, Ordering::Relaxed);
-            if n < 64 {
+            if DEBUG_TRACE && n < 64 {
                 print_str(b"[tp-worker-event] #");
                 print_u64(n);
                 print_str(b" badge=");
@@ -9745,11 +12790,11 @@ pub(crate) unsafe fn service_sec_image(
                     _ => WINLOGON_WORKER_STACK_MIRROR_VA,
                 }
             } else {
-                hosted_main_stack_mirror_for_pi(pi)
+                event_layout.stack_mirror_va
             },
             Ordering::Relaxed,
         );
-        ACTIVE_HEAP_MIRROR.store(hosted_heap_mirror_for_pi(pi), Ordering::Relaxed);
+        ACTIVE_HEAP_MIRROR.store(event_layout.heap_mirror_va, Ordering::Relaxed);
         let pml4 = procs[pi].pml4;
         let scratch_base = procs[pi].scratch_base;
         ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
@@ -10040,6 +13085,7 @@ pub(crate) unsafe fn service_sec_image(
                 {
                     print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
                     stop = fip;
+                    record_service_loop_exit!(b"winlogon-post-logon-fault");
                     break;
                 }
                 let (nb, nmi, nm0, nm1, nm2, nm3) =
@@ -10226,6 +13272,9 @@ pub(crate) unsafe fn service_sec_image(
         if (mi >> 12) == 6 {
             let addr = m1;
             let page = addr & !0xFFFu64;
+            installer_child_span_census::note_fault(&nt_handler, pi,
+                nt_handler.current_tid, badge, REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                m0, addr, m3);
             if hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE).is_err() {
                 // This is a valid caller making an invalid memory access, not stale ingress.
                 // Debugger delivery retains the fault Reply; containment must cancel it otherwise.
@@ -10490,6 +13539,7 @@ pub(crate) unsafe fn service_sec_image(
                     {
                         print_str(b"[wl-worker] terminal wall while winlogon main waits for this worker -> run gate\n");
                         stop = m0;
+                        record_service_loop_exit!(b"winlogon-worker-terminal");
                         break;
                     }
                     procs[pi].faults = faults;
@@ -10561,6 +13611,7 @@ pub(crate) unsafe fn service_sec_image(
                     pfilled[pi] = *filled_pages;
                     print_str(b"[wl-main] winlogon crashed at its post-OpenSCManager GUI/login frontier (LSA signalled, SCM servers idle) -> QUIESCE; run gate\n");
                     stop = m0;
+                    record_service_loop_exit!(b"winlogon-main-crash");
                     break;
                 }
                 // Unrecoverable NULL/low deref on a top-level process thread — a crash. Park+log
@@ -10839,6 +13890,30 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(status);
                     print_str(b"\n");
                     park_and_log!(pi, b"private-page", m0, addr);
+                }
+            }
+            match crate::native_image_pagein_work::submit(
+                &mut nt_handler, pi, page, vm_fault_access_from_x86_error(m3),
+                nt_address_space::ImageFaultObservation::from_x86_error(m3),
+            ) {
+                Ok(true) => {
+                    crate::native_image_pagein_work::redrive(&mut nt_handler, &nt_dispatcher);
+                    let _ = finalize_service_loop_state(&mut nt_handler);
+                    let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                    badge = received.0;
+                    mi = received.1;
+                    m0 = received.2;
+                    m1 = received.3;
+                    m2 = received.4;
+                    m3 = received.5;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(status) => {
+                    print_str(b"[native-image] deferred fault admission failed status=0x");
+                    print_hex(status);
+                    print_str(b"\n");
+                    park_and_log!(pi, b"native-image-pagein-admission", m0, addr);
                 }
             }
             match nt_handler.service_native_image_page_residency(
@@ -11126,9 +14201,21 @@ pub(crate) unsafe fn service_sec_image(
                             b"lsass-post-signal-fault",
                         )
                         && !defer_quiesce_for_active_user_callbacks(b"lsass-post-signal-fault")
+                        && !driver_launch::native_disk_proof_hardware_irp_pending()
+                        && !driver_launch::active_relation_wal_retained()
+                        && !crate::mounted_volume::mounted_create_outstanding()
+                        && !crate::mounted_volume::mounted_read_outstanding()
+                        && !crate::mounted_volume::mounted_directory_outstanding()
+                        && !driver_launch::mounted_native_physical_irp_pending()
+                        && !crate::native_directory_open_work::occupied()
+                        && !crate::native_file_target_open_work::occupied()
+                        && !crate::native_directory_effect_work::has_outstanding(&nt_handler)
+                        && !crate::provider_directory_broker::has_outstanding()
                     {
+                        driver_launch::print_mounted_native_block_quiesce_snapshot();
                         print_str(b"[quiesce] every live process parked/waiting (no signaler left) -> run gate\n");
                         stop = addr;
+                        record_service_loop_exit!(b"fault-all-live-waiting");
                         break;
                     }
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
@@ -11208,6 +14295,7 @@ pub(crate) unsafe fn service_sec_image(
                     {
                         print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
                         stop = m0;
+                        record_service_loop_exit!(b"winlogon-post-logon-syscall");
                         break;
                     }
                     let _ = finalize_service_loop_state(&mut nt_handler);
@@ -11522,6 +14610,9 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     _ => 0,
                 };
+                if trace_process_role == Some(nt_exe_image::HostedProcessRole::Win32Subsystem) {
+                    crate::csrss_thread_probe::record_syscall(ssn);
+                }
             }
             if is_lsa_worker {
                 LSA_WORKER_SYSCALLS.fetch_add(1, Ordering::Relaxed);
@@ -11609,6 +14700,11 @@ pub(crate) unsafe fn service_sec_image(
                     flags,
                 )
             };
+            // Released LiberNT compatibility DLLs can issue raw syscall numbers that differ
+            // from the source-built ntdll's private table. Resolve the observed external ABI
+            // before admission and dispatch, after preserving the original fault/reply frame.
+            let raw_external_ssn = m0;
+            m0 = nt_syscall_abi::normalize_external_raw_ssn(m0, native_call_transport);
             let current_tid = nt_handler
                 .hosted_thread_tid_for_badge(badge)
                 .unwrap_or_else(|| {
@@ -11619,6 +14715,11 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                     0
                 });
+            if current_tid == event_runtime.tid {
+                crate::registry_mutation_work::trace_next_hosted_syscall(
+                    event_runtime.binding(), raw_external_ssn, m0,
+                );
+            }
             if {
                 let waiters = &*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS);
                 waiters.has_retry_delivery_for_thread(current_tid)
@@ -11629,6 +14730,8 @@ pub(crate) unsafe fn service_sec_image(
                     || crate::pending_file_apc::owns_thread(current_tid)
                     || crate::current_apc::owns_thread(current_tid)
                     || crate::section_metadata_work::has_thread(current_tid)
+                    || crate::process_image_snapshot_work::has_thread(current_tid)
+                    || crate::hosted_spawn_uncertainty::has_thread(current_tid)
             }
             {
                 // An uncertain earlier retry is not a fresh File acquisition. Reject only this
@@ -11801,7 +14904,16 @@ pub(crate) unsafe fn service_sec_image(
                         continue;
                     }
                     win32k_glue::UserCallbackReturnReadiness::Ready => {
-                        if let Some(completion) = win32k_glue::complete_controlled_user_callback(
+                        let Some(callback_reply_reservation) =
+                            root_reply_park::RootReplyReservation::before_native()
+                        else {
+                            let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            reply_parked_syscall(reply_main, nt_process::STATUS_INSUFFICIENT_RESOURCES as u64);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, reply_main);
+                            badge = nb; mi = nmi; m0 = nm0; m1 = nm1; m2 = nm2; m3 = nm3;
+                            continue;
+                        };
+                        let callback_completion = win32k_glue::complete_controlled_user_callback(
                             pi as u32,
                             badge,
                             current_tid,
@@ -11811,7 +14923,36 @@ pub(crate) unsafe fn service_sec_image(
                             resume_ip,
                             sp,
                             flags,
-                        ) {
+                        );
+                        if let Some(completion) = callback_completion {
+                            if let win32k_glue::CompletedUserCallback::CaptureRefused {
+                                lane, callback_token, provider_reply_cap,
+                            } = completion {
+                                let _ = provider_reply_cap; // The provider owner records an uncertain zero Reply.
+                                assert!(win32k_glue::retain_callback_outer_reply(
+                                    lane, callback_token, REPLY_MAIN_SLOT.load(Ordering::Relaxed),
+                                ), "refused callback lost its two exact Reply owners");
+                                assert!(callback_reply_reservation.commit(),
+                                    "reserved callback Reply replacement lost its exact lease");
+                                procs[pi].faults = faults;
+                                procs[pi].first = first;
+                                procs[pi].ntfaults = ntfaults;
+                                pfilled[pi] = *filled_pages;
+                                let _ = finalize_service_loop_state(&mut nt_handler);
+                                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                                let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                                badge = nb;
+                                mi = nmi;
+                                m0 = nm0;
+                                m1 = nm1;
+                                m2 = nm2;
+                                m3 = nm3;
+                                continue;
+                            }
+                        }
+                        assert!(callback_reply_reservation.cancel_no_effects(),
+                            "ordinary callback return lost its unused Reply reservation");
+                        if let Some(completion) = callback_completion {
                             if !sync_completed_user_callback_win32k_context(
                                 &mut nt_handler,
                                 pi,
@@ -11823,6 +14964,9 @@ pub(crate) unsafe fn service_sec_image(
                                 panic!("failed callback context publication retains its bound Reply");
                             }
                             let staged_context = match completion {
+                                win32k_glue::CompletedUserCallback::CaptureRefused { .. } => {
+                                    unreachable!("refused callback returns before context classification")
+                                }
                                 win32k_glue::CompletedUserCallback::Completed {
                                     outer_dispatch,
                                     callback_context,
@@ -11868,7 +15012,8 @@ pub(crate) unsafe fn service_sec_image(
                                             token: callback_token,
                                             context: callback_context,
                                         }),
-                                    ));
+                                        HostedContinuationDestination::Win32k,
+                                    ) == RetainedWaitAdmission::Accepted);
                                     procs[pi].faults = faults;
                                     procs[pi].first = first;
                                     procs[pi].ntfaults = ntfaults;
@@ -11902,7 +15047,8 @@ pub(crate) unsafe fn service_sec_image(
                                             token: callback_token,
                                             context: callback_context,
                                         }),
-                                    ));
+                                        HostedContinuationDestination::Win32k,
+                                    ) == RetainedWaitAdmission::Accepted);
                                     procs[pi].faults = faults;
                                     procs[pi].first = first;
                                     procs[pi].ntfaults = ntfaults;
@@ -11928,7 +15074,7 @@ pub(crate) unsafe fn service_sec_image(
                                     callback_token,
                                     callback_context,
                                 } => {
-                                    let dispatch_id = pending.dispatch.dispatch_id;
+                                    let dispatch_id = pending.snapshot.dispatch.dispatch_id;
                                     let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
                                         panic!("callback Receive must retain its original Reply");
                                     };
@@ -11939,6 +15085,7 @@ pub(crate) unsafe fn service_sec_image(
                                             token: callback_token,
                                             context: callback_context,
                                         }),
+                                        HostedContinuationDestination::Win32k,
                                     ));
                                     reply_park.commit();
                                     procs[pi].faults = faults;
@@ -11966,7 +15113,7 @@ pub(crate) unsafe fn service_sec_image(
                                     callback_token,
                                     callback_context,
                                 } => {
-                                    let dispatch_id = pending.dispatch.dispatch_id;
+                                    let dispatch_id = pending.snapshot.dispatch.dispatch_id;
                                     let Some(reply_park) = root_reply_park::RootReplyPark::prepare() else {
                                         panic!("callback service wait must retain its original Reply");
                                     };
@@ -11977,6 +15124,7 @@ pub(crate) unsafe fn service_sec_image(
                                             token: callback_token,
                                             context: callback_context,
                                         }),
+                                        HostedContinuationDestination::Win32k,
                                     ));
                                     reply_park.commit();
                                     procs[pi].faults = faults;
@@ -12070,6 +15218,33 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                 }
             }
+            let trace_lsa_logon = native_call_transport
+                && LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) != 0
+                && nt_handler.current_tid == LSA_LOGON_SERVER_TID.load(Ordering::Relaxed)
+                && nt_handler.hosted_process_role(pi)
+                    == Some(nt_exe_image::HostedProcessRole::LocalSecurityAuthority);
+            let lsa_logon_trace_seq = if trace_lsa_logon {
+                let n = LSA_LOGON_SSN_TRACE.fetch_add(1, Ordering::Relaxed);
+                LSA_LOGON_LAST_SSN.store(m0, Ordering::Relaxed);
+                LSA_LOGON_LAST_STATUS.store(u64::MAX, Ordering::Relaxed);
+                LSA_LOGON_LAST_TCB.store(event_runtime.tcb, Ordering::Relaxed);
+                if n < 128 {
+                    print_str(b"[lsa-logon-ssn] enter #");
+                    print_u64(n);
+                    print_str(b" tid=");
+                    print_u64(nt_handler.current_tid);
+                    print_str(b" ssn=");
+                    print_u64(m0);
+                    print_str(b" arg1=0x");
+                    print_hex_u64(get_recv_mr(9));
+                    print_str(b" arg2=0x");
+                    print_hex_u64(m3);
+                    print_str(b"\n");
+                }
+                Some(n)
+            } else {
+                None
+            };
             let mut handled = true;
             // Set by an accepted interactive milestone that parks the caller instead of replying.
             let mut wl_milestone_park = false;
@@ -12081,6 +15256,7 @@ pub(crate) unsafe fn service_sec_image(
             // is nothing left to steer. See the reply tail at the bottom of the syscall arm.)
             let mut redirected_user_callback = false;
             let mut component_suspension_park_request = false;
+            let mut component_root_maintenance_ticket = None;
             let mut component_suspension_admitted_dispatch_id = 0;
             let mut current_apc_handoff = None;
             let mut redirected_context_continue = false;
@@ -12101,6 +15277,7 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_keyed_release_wait_key: u64 = u64::MAX;
             let mut park_keyed_release_wait_deadline = nt_delay_execution::Deadline::Infinite;
             let mut park_delay_deadline: Option<nt_delay_execution::Deadline> = None;
+            let mut park_thread_alert_deadline: Option<nt_delay_execution::Deadline> = None;
             let mut park_io_completion_port: i64 = -1;
             let mut park_io_completion_key_out: u64 = 0;
             let mut park_io_completion_apc_out: u64 = 0;
@@ -12108,6 +15285,15 @@ pub(crate) unsafe fn service_sec_image(
             let mut park_io_completion_deadline = nt_delay_execution::Deadline::Infinite;
             let mut published_file_io: Option<file_dispatch_handoff::PublishedFileIo> = None;
             let mut transfer_pending_driver_start: Option<PendingDriverStartTransfer> = None;
+            let mut transfer_native_directory_open: Option<
+                crate::native_directory_open_work::PendingNativeDirectoryOpen,
+            > = None;
+            let mut transfer_native_file_target: Option<
+                crate::native_file_target_open_work::PendingNativeFileTargetOpen,
+            > = None;
+            let mut transfer_native_directory_effect: Option<
+                crate::native_directory_effect_work::PendingNativeDirectoryEffect,
+            > = None;
             let mut transfer_pending_pnp_operation: Option<PendingPnpOperationTransfer> = None;
             let mut transfer_file_irp_drain: Option<(
                 nt_io_manager::PendingFileIrpDrain,
@@ -12173,18 +15359,24 @@ pub(crate) unsafe fn service_sec_image(
             // dispatcher -> real handler; otherwise fall through to the broker match. The x64 native
             // ABI passes args in r10(=rcx),rdx,r8,r9 then the stack; here we forward the register
             // args (sized to the service's max) — pointer/stack args come with the copyin layer.
-            if let Some(entry) = nt_dispatcher.table().lookup(m0 as u32) {
+            let table_entry = nt_dispatcher.table().lookup(m0 as u32);
+            if let Some(route) = nt_syscall_abi::NativeIngressRoute::select(
+                m0, native_call_transport, table_entry.is_some()) {
                 let origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
                 // x64 native syscall args: arg1=R10 (the stub's `mov r10,rcx`; RCX itself is the
                 // syscall return address), arg2=RDX, arg3=R8, arg4=R9, then arg5+ on the caller's
                 // stack at [rsp+0x28], [rsp+0x30], … RDX rides in m3; R8/R9/R10 + the stack come
                 // from the IPC buffer / stack mirror.
-                let mut argv = [0u64; 16];
+                let mut argv = [0u64; nt_syscall_abi::MAX_STUB_ARGS as usize];
                 argv[0] = get_recv_mr(9); // R10
                 argv[1] = m3; // RDX
                 argv[2] = get_recv_mr(7); // R8
                 argv[3] = get_recv_mr(8); // R9
-                let n = (entry.max_args as usize).min(16);
+                let n = match route {
+                    nt_syscall_abi::NativeIngressRoute::Alpc(service) => service.argument_count(),
+                    nt_syscall_abi::NativeIngressRoute::Table => table_entry
+                        .expect("table route lost registered service").max_args as usize,
+                }.min(argv.len());
                 let mut stack_args_valid = true;
                 let retained_arguments = nt_handler.active_synchronous_file_retry.as_ref()
                     .and_then(|ingress| ingress.waiter().transfer_parameters)
@@ -12242,6 +15434,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.system_time_change = None;
                 nt_handler.out_writes_n = 0;
                 nt_handler.exe_spawn_request = None;
+                nt_handler.exe_spawn_new_process = false;
                 nt_handler.thread_spawn_request = None;
                 nt_handler.wait_park_event = -1;
                 nt_handler.wait_alertable = false;
@@ -12255,12 +15448,12 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.delay_requested = false;
                 nt_handler.delay_interval_100ns = 0;
                 nt_handler.delay_alertable = false;
+                nt_handler.thread_alert_wait = None;
                 nt_handler.io_completion_park_port = -1;
                 nt_handler.io_completion_key_out = 0;
                 nt_handler.io_completion_apc_out = 0;
                 nt_handler.io_completion_iosb_out = 0;
                 nt_handler.io_completion_timeout = PendingWaitTimeout::none();
-                nt_handler.io_completion_wake = None;
                 nt_handler.io_signal_event = -1;
                 assert!(
                     nt_handler.pending_file_io_reservation.is_none(),
@@ -12268,6 +15461,12 @@ pub(crate) unsafe fn service_sec_image(
                 );
                 assert!(nt_handler.pending_file_io_transfer.is_none(),
                     "previous syscall retained an accepted File transfer");
+                assert!(nt_handler.pending_native_directory_open_transfer.is_none(),
+                    "previous syscall retained a native directory Reply transfer");
+                assert!(nt_handler.pending_native_file_target_transfer.is_none(),
+                    "previous syscall retained a native file target Reply transfer");
+                assert!(nt_handler.pending_native_directory_effect_transfer.is_none(),
+                    "previous syscall retained a native directory effect Reply transfer");
                 nt_handler.pending_file_io_wait = false;
                 assert!(
                     nt_handler.pending_driver_start_transfer.is_none(),
@@ -12304,13 +15503,82 @@ pub(crate) unsafe fn service_sec_image(
                     panic!("previous syscall leaked an LPC request continuation reservation");
                 }
                 let _ = lpc_connect_completion_drain(&mut nt_handler);
-                // ALPC last-mile item (a): NtAlpc* SSNs are registered in the dispatcher via this
-                // recognizer. DORMANT — `ALPC_HOST_PRESENT` is never set at boot (no ALPC binary
-                // yet), and the Win7 ALPC SSNs collide with the live ReactOS SSN space, so it can
-                // never fire for the 3 live ReactOS processes → byte-identical boot. When active it
-                // routes a real ALPC process's NtAlpc* syscall to the unified port-service ALPC
-                // adapter (skipping the native ReactOS dispatch).
-                if !stack_args_valid {
+                let lock_preflight = if stack_args_valid && m0 == SSN_NT_LOCK_VM {
+                    crate::vm_lock_pagein_work::submit(&mut nt_handler,
+                        &argv[..4], resume_ip, sp, flags, native_call_transport)
+                        .map(|()| true)
+                } else { Ok(false) };
+                let vm_copy_preflight = if stack_args_valid
+                    && matches!(m0, SSN_NT_READ_VM | SSN_NT_WRITE_VM)
+                {
+                    crate::vm_copy_work::submit(&mut nt_handler, &argv[..5],
+                        m0 == SSN_NT_READ_VM, resume_ip, sp, flags,
+                        native_call_transport).map(|()| true)
+                } else { Ok(false) };
+                let copy_preflight = if stack_args_valid
+                    && matches!(m0, SSN_NT_QUERY_SYSTEM_INFO | SSN_NT_QUERY_DEFAULT_LOCALE)
+                {
+                    crate::native_image_pagein_work::submit_syscall_copy(
+                        &mut nt_handler, pi, m0 as u32,
+                        [argv[0], argv[1], argv[2], argv[3]],
+                        origin, resume_ip, sp, flags, native_call_transport,
+                    )
+                } else { Ok(false) };
+                if matches!(lock_preflight, Ok(true)) {
+                    thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                    {
+                        let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                        crate::vm_lock_pagein_work::redrive(&mut nt_handler);
+                    }
+                    let _ = finalize_service_loop_state(&mut nt_handler);
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                    badge = nb;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
+                    continue;
+                } else if matches!(vm_copy_preflight, Ok(true)) {
+                    thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                    {
+                        let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                        crate::vm_copy_work::redrive(&mut nt_handler);
+                    }
+                    let _ = finalize_service_loop_state(&mut nt_handler);
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                    badge = nb;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
+                    continue;
+                } else if matches!(copy_preflight, Ok(true)) {
+                    thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                    {
+                        let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                        crate::native_image_pagein_work::redrive(&mut nt_handler, &nt_dispatcher);
+                    }
+                    let _ = finalize_service_loop_state(&mut nt_handler);
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                    badge = nb;
+                    mi = nmi;
+                    m0 = nm0;
+                    m1 = nm1;
+                    m2 = nm2;
+                    m3 = nm3;
+                    continue;
+                } else if let Err(status) = lock_preflight {
+                    result = status as u64;
+                } else if let Err(status) = vm_copy_preflight {
+                    result = status as u64;
+                } else if let Err(status) = copy_preflight {
+                    result = status as u64;
+                } else if !stack_args_valid {
                     if m0 as u32 == SSN_NT_QUERY_KEY as u32 {
                         let arguments = [argv[0], argv[1], argv[2], argv[3], argv[4]];
                         crate::registry_query_diagnostics::reject(
@@ -12322,25 +15590,309 @@ pub(crate) unsafe fn service_sec_image(
                     .is_some_and(|ingress| !ingress.matches_handle(argv[0]))
                 {
                     result = nt_fs::STATUS_INVALID_PARAMETER as u64;
-                } else if let Some(st) = try_route_alpc_ssn(m0, &[], &mut [0u8; 8]) {
-                    result = st;
+                } else if nt_syscall_abi::NativeAlpcService::from_call(m0, native_call_transport)
+                    == Some(nt_syscall_abi::NativeAlpcService::CreatePort)
+                {
                     handled = true;
+                    static ALPC_CREATE_INGRESS_TRACE: AtomicU64 = AtomicU64::new(0);
+                    if ALPC_CREATE_INGRESS_TRACE.fetch_add(1, Ordering::Relaxed) < 8 {
+                        print_str(b"[native-alpc-create-ingress] badge=");
+                        print_u64(badge);
+                        print_str(b" output=0x");
+                        print_hex_u64(argv[0]);
+                        print_str(b" object_attributes=0x");
+                        print_hex_u64(argv[1]);
+                        print_str(b" port_attributes=0x");
+                        print_hex_u64(argv[2]);
+                        print_str(b"\n");
+                    }
+                    match crate::native_alpc_create_work::begin(&mut nt_handler,
+                        [argv[0], argv[1], argv[2]]) {
+                        Err(status) => result = status as u64,
+                        Ok(()) => {
+                            thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                            {
+                                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                                crate::native_alpc_create_work::redrive(&mut nt_handler);
+                            }
+                            let _ = finalize_service_loop_state(&mut nt_handler);
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                    }
+                } else if nt_syscall_abi::NativeAlpcService::from_call(m0, native_call_transport)
+                    == Some(nt_syscall_abi::NativeAlpcService::ConnectPort)
+                {
+                    handled = true;
+                    print_str(b"[native-alpc-connect-ingress] badge=");
+                    print_u64(badge);
+                    print_str(b" tcb=0x");
+                    print_hex_u64(event_runtime.tcb);
+                    print_str(b" flags=0x");
+                    print_hex_u64(argv[4]);
+                    print_str(b"\n");
+                    match crate::native_alpc_connect_accept_work::begin_connect(&mut nt_handler,
+                        [argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6],
+                            argv[7], argv[8], argv[9], argv[10]]) {
+                        Err(status) => {
+                            print_str(b"[native-alpc-connect-begin] rejected status=0x");
+                            print_hex_u64(status as u64);
+                            print_str(b"\n");
+                            result = status as u64;
+                        }
+                        Ok(()) => {
+                            print_str(b"[native-alpc-connect-begin] retained\n");
+                            thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                            {
+                                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                                crate::native_alpc_connect_accept_work::redrive(&mut nt_handler);
+                            }
+                            print_str(b"[native-alpc-connect-begin] redrove\n");
+                            let _ = finalize_service_loop_state(&mut nt_handler);
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                    }
+                } else if nt_syscall_abi::NativeAlpcService::from_call(m0, native_call_transport)
+                    == Some(nt_syscall_abi::NativeAlpcService::AcceptConnectPort)
+                {
+                    handled = true;
+                    match crate::native_alpc_connect_accept_work::begin_accept(&mut nt_handler,
+                        [argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6],
+                            argv[7], argv[8]]) {
+                        Err(status) => result = status as u64,
+                        Ok(()) => {
+                            thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                            {
+                                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                                crate::native_alpc_connect_accept_work::redrive(&mut nt_handler);
+                            }
+                            let _ = finalize_service_loop_state(&mut nt_handler);
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                    }
+                } else if nt_syscall_abi::NativeAlpcService::from_call(m0, native_call_transport)
+                    == Some(nt_syscall_abi::NativeAlpcService::SendWaitReceivePort)
+                {
+                    handled = true;
+                    let ingress = crate::native_alpc_send_receive_work::begin(&mut nt_handler,
+                        [argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]]);
+                    static ALPC_SEND_INGRESS_TRACE: AtomicU64 = AtomicU64::new(0);
+                    let trace = ALPC_SEND_INGRESS_TRACE.fetch_add(1, Ordering::Relaxed);
+                    if trace < 16 {
+                        let mut return_bytes = [0u8; 8];
+                        let return_readable = nt_handler.xas_read(sp, &mut return_bytes);
+                        print_str(b"[native-alpc-send-ingress] #");
+                        print_u64(trace);
+                        print_str(b" badge=");
+                        print_u64(badge);
+                        print_str(b" port=0x");
+                        print_hex_u64(argv[0]);
+                        print_str(b" raw-mr2=0x");
+                        print_hex_u64(native_ingress_request
+                            .and_then(|request| request.word(2)).unwrap_or(0));
+                        print_str(b" caller=0x");
+                        print_hex_u64(if return_readable { u64::from_le_bytes(return_bytes) }
+                            else { 0 });
+                        print_str(b" flags=0x");
+                        print_hex_u64(argv[1]);
+                        print_str(b" send=0x");
+                        print_hex_u64(argv[2]);
+                        print_str(b" receive=0x");
+                        print_hex_u64(argv[4]);
+                        print_str(b" size=0x");
+                        print_hex_u64(argv[5]);
+                        print_str(b" timeout=0x");
+                        print_hex_u64(argv[7]);
+                        print_str(b" status=0x");
+                        print_hex_u64(ingress.as_ref().err().copied().unwrap_or(0x103) as u64);
+                        print_str(b"\n");
+                    }
+                    match ingress {
+                        Err(status) => result = status as u64,
+                        Ok(()) => {
+                            thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                            let alpc_reply_committed = {
+                                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                                crate::native_alpc_send_receive_work::redrive(&mut nt_handler)
+                            };
+                            if alpc_reply_committed.is_some() {
+                                let _ = lpc_component_reply_commit_drain(&mut nt_handler);
+                            }
+                            let _ = finalize_service_loop_state(&mut nt_handler);
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                    }
+                } else if native_call_transport && m0 as u32 == SSN_NT_CLOSE as u32
+                    && crate::native_alpc_close_work::recognizes(&nt_handler, argv[0])
+                {
+                    handled = true;
+                    match crate::native_alpc_close_work::begin(&mut nt_handler, argv[0]) {
+                        Err(status) => result = status as u64,
+                        Ok(()) => {
+                            thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
+                            {
+                                let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                                crate::native_alpc_close_work::redrive(&mut nt_handler);
+                            }
+                            let _ = finalize_service_loop_state(&mut nt_handler);
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                    }
                 } else {
                     crate::probe_reset();
+                    let dispatch_generation = nt_handler.hosted_process_generation(pi);
+                    let installer_span = installer_child_span_census::begin(
+                        &nt_handler, pi, current_tid, badge, m0 as u32);
                     let dispatch_started = crate::disk_census_ticks();
                     let res =
                         nt_dispatcher.dispatch(m0 as u32, &argv[..n], &origin, &mut nt_handler);
                     current_apc_handoff = nt_handler.current_apc_handoff.take();
-                    crate::record_native_dispatch_ticks(
-                        m0,
-                        crate::disk_census_ticks().wrapping_sub(dispatch_started),
+                    let elapsed_ticks = crate::disk_census_ticks().wrapping_sub(dispatch_started);
+                    crate::record_native_dispatch_ticks(m0, elapsed_ticks);
+                    native_process_time_census::record_dispatch(
+                        pi, dispatch_generation,
+                        table_entry.map(|entry| entry.service), res.status,
+                        elapsed_ticks,
                     );
+                    installer_child_span_census::returned(
+                        &nt_handler, installer_span, badge, m0 as u32, res.status);
                     result = res.status as u64;
+                    if m0 == SSN_NT_CREATE_THREAD {
+                        let caller = nt_handler.thread_runtime.executable_by_tid(current_tid)
+                            .filter(|runtime| runtime.pi == pi && runtime.badge == badge)
+                            .map(|runtime| runtime.binding());
+                        if caller.is_some_and(|caller| unsafe {
+                            crate::exec_handler::initial_thread_creation::take_retry_transferred(caller)
+                        }) {
+                            assert_eq!(res.status, nt_user_callback::STATUS_PENDING as u32);
+                            assert_eq!(nt_handler.out_writes_n, 0,
+                                "retained no-effect process callout has no caller copyout");
+                            mark_wait_parked!(pi, resume_ip);
+                            crate::exec_handler::initial_thread_creation::redrive_retry_no_effect(
+                                &mut nt_handler,
+                            );
+                            let _ = finalize_service_loop_state(&mut nt_handler);
+                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                            let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                            badge = nb;
+                            mi = nmi;
+                            m0 = nm0;
+                            m1 = nm1;
+                            m2 = nm2;
+                            m3 = nm3;
+                            continue;
+                        }
+                        let suspended_target = caller.and_then(|caller| {
+                            crate::exec_handler::initial_thread_creation::suspended_for_caller(
+                                &nt_handler, caller,
+                            )
+                        });
+                        if res.status == nt_user_callback::STATUS_PENDING as u32 {
+                            print_str(b"[initial-create-handoff] caller/target/pi/tid/badge=");
+                            print_u64(caller.is_some() as u64);
+                            print_str(b"/");
+                            print_u64(suspended_target.is_some() as u64);
+                            print_str(b"/");
+                            print_u64(pi as u64);
+                            print_str(b"/");
+                            print_u64(current_tid);
+                            print_str(b"/");
+                            print_u64(badge);
+                            print_str(b"\n");
+                            assert!(suspended_target.is_some(),
+                                "pending initial creation must retain its exact caller Reply");
+                        }
+                        if let Some(target) = suspended_target {
+                            assert_eq!(res.status, nt_user_callback::STATUS_PENDING as u32);
+                            assert_eq!(nt_handler.out_writes_n, 0,
+                                "suspended initial creation cannot publish output before provider return");
+                            let handoff = admit_pending_win32k_dispatch(
+                                &mut nt_handler,
+                                HostedContinuationDestination::InitialThread(
+                                    nt_user_host::process_create_callout::InitialThreadReplyOrigin::new(
+                                        caller.expect("suspended initial creation has exact caller"), target,
+                                    ).expect("foreign initial Reply requires distinct valid owners"),
+                                ),
+                            );
+                            if handoff.retained_failure {
+                                // The pending win32k snapshot and original Reply remain owned.
+                                // Never turn this refusal into a process-creation reply.
+                                procs[pi].faults = faults;
+                                procs[pi].first = first;
+                                procs[pi].ntfaults = ntfaults;
+                                pfilled[pi] = *filled_pages;
+                                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                                stop_ssn = m0;
+                                record_service_loop_exit!(b"win32k-initial-dispatch-retained");
+                                break 'service_loop;
+                            }
+                            assert!(handoff.parked || handoff.callback_suspended,
+                                "suspended process callout lost its native yield owner");
+                            assert!(!handoff.callback_suspended,
+                                "initial process callout user callback requires retained source Reply transfer");
+                            component_suspension_admitted_dispatch_id = handoff.admitted_dispatch_id;
+                            component_suspension_park_request = handoff.parked;
+                            redirected_user_callback = handoff.parked;
+                        }
+                    }
                     if crate::registry_mutation_work::take_transferred() {
                         // The durable mutation owner already captured and rotated this Reply.
                         // STATUS_PENDING is internal state, never the syscall's terminal reply.
                         mark_wait_parked!(pi, resume_ip);
-                        crate::registry_mutation_work::redrive(&mut nt_handler, delay_queue);
+                        crate::registry_mutation_work::redrive(&mut nt_handler, &mut *delay_queue);
+                        let _ = finalize_service_loop_state(&mut nt_handler);
+                        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                        let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                        badge = nb;
+                        mi = nmi;
+                        m0 = nm0;
+                        m1 = nm1;
+                        m2 = nm2;
+                        m3 = nm3;
+                        continue;
+                    }
+                    if crate::mutable_hive_mutation_work::take_transferred() {
+                        mark_wait_parked!(pi, resume_ip);
+                        crate::mutable_hive_mutation_work::redrive(&mut nt_handler, &mut *delay_queue);
                         let _ = finalize_service_loop_state(&mut nt_handler);
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
@@ -12354,7 +15906,23 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     if crate::section_metadata_work::take_transferred() {
                         mark_wait_parked!(pi, resume_ip);
-                        crate::section_metadata_work::redrive(&mut nt_handler, delay_queue);
+                        crate::section_metadata_work::redrive(&mut nt_handler, &mut *delay_queue);
+                        let _ = finalize_service_loop_state(&mut nt_handler);
+                        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                        let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                        badge = nb;
+                        mi = nmi;
+                        m0 = nm0;
+                        m1 = nm1;
+                        m2 = nm2;
+                        m3 = nm3;
+                        continue;
+                    }
+                    if crate::process_image_snapshot_work::take_transferred() {
+                        mark_wait_parked!(pi, resume_ip);
+                        crate::process_image_snapshot_work::redrive(&mut nt_handler,
+                            &mut *delay_queue, ntdll, fault_ep, procs, exe_images,
+                            &*exe_image_catalog, hosted_loaded_images_ptr);
                         let _ = finalize_service_loop_state(&mut nt_handler);
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
@@ -12472,6 +16040,7 @@ pub(crate) unsafe fn service_sec_image(
                             let apc_interrupted =
                                 reconcile_user_apc_file_wait(&mut nt_handler, waiter_tid);
                             if !apc_interrupted {
+                                trace_smss_file_busy_wait(waiter);
                                 trace_indefinite_wait_park(
                                     &nt_handler, badge, live_top_badges(&nt_handler),
                                     crash_parked, wait_parked,
@@ -12487,8 +16056,14 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 }
-                published_file_io = file_dispatch_handoff::before_post_action(
+                let handoff = file_dispatch_handoff::before_post_action(
                     &mut nt_handler, post_action, native_call_transport, resume_ip, sp, flags,
+                );
+                if handoff.inline_retirement_needs_redrive() {
+                    inline_file_retirement::redrive(&mut nt_handler);
+                }
+                published_file_io = file_dispatch_handoff::finish_after_inline_retirement(
+                    &mut nt_handler, handoff,
                 );
                 let post_action_process = match post_action {
                     ExecPostAction::TerminateProcess { process_index, .. } => Some(process_index),
@@ -12498,7 +16073,7 @@ pub(crate) unsafe fn service_sec_image(
                     job_terminations,
                     pi as u8,
                     post_action_process,
-                    delay_queue,
+                    &mut *delay_queue,
                     &mut nt_handler,
                 );
                 match post_action {
@@ -12563,7 +16138,7 @@ pub(crate) unsafe fn service_sec_image(
                         let reply_dropped = !apc_owned_terminating_reply
                             && drop_current_hosted_reply();
                         let mechanism_deleted =
-                            terminate_hosted_thread_mechanism(tid, delay_queue, &mut nt_handler);
+                            terminate_hosted_thread_mechanism(tid, &mut *delay_queue, &mut nt_handler);
                         if reply_dropped && mechanism_deleted {
                             PM_TERMINATE_THREAD_NO_REPLY.fetch_add(1, Ordering::Relaxed);
                         }
@@ -12571,6 +16146,8 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(tid);
                         print_str(b" reply-dropped=");
                         print_u64(reply_dropped as u64);
+                        print_str(b" apc-owned=");
+                        print_u64(apc_owned_terminating_reply as u64);
                         print_str(b" mechanism-deleted=");
                         print_u64(mechanism_deleted as u64);
                         print_str(b" -> recv without reply\n");
@@ -12598,7 +16175,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     ExecPostAction::TerminateRemoteThread { tid } => {
                         let _ =
-                            terminate_hosted_thread_mechanism(tid, delay_queue, &mut nt_handler);
+                            terminate_hosted_thread_mechanism(tid, &mut *delay_queue, &mut nt_handler);
                     }
                     ExecPostAction::TerminateProcess {
                         process_index,
@@ -12619,16 +16196,26 @@ pub(crate) unsafe fn service_sec_image(
                         } else {
                             false
                         };
+                        if let Some(pid) = nt_handler.pm_pid_for_pi(process_index as usize) {
+                            if nt_handler.pm.is_process_signaled(pid) {
+                                if let Some(status) = nt_handler.pm.process(pid)
+                                    .and_then(|process| process.exit_status) {
+                                    let _ = nt_handler.observe_install_pipe_child_terminal(
+                                        process_index as usize, status,
+                                    );
+                                }
+                            }
+                        }
                         let reclaimed = terminate_hosted_process_mechanisms(
                             process_index,
                             preserve_tid,
-                            delay_queue,
+                            &mut *delay_queue,
                             &mut nt_handler,
                         );
                         let current_deleted = if drop_reply && current_tid != 0 {
                             terminate_hosted_thread_mechanism(
                                 current_tid,
-                                delay_queue,
+                                &mut *delay_queue,
                                 &mut nt_handler,
                             )
                         } else {
@@ -12656,6 +16243,8 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(drop_reply as u64);
                         print_str(b" reply-dropped=");
                         print_u64(reply_dropped as u64);
+                        print_str(b" apc-owned=");
+                        print_u64(apc_owned_terminating_reply as u64);
                         print_str(b" reclaimed=");
                         print_u64(reclaimed as u64);
                         print_str(b" current-deleted=");
@@ -12699,6 +16288,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(reply_dropped as u64);
                         print_str(b" -> fatal stop\n");
                         stop = code as u64;
+                        record_service_loop_exit!(b"fatal-stop");
                         break;
                     }
                     ExecPostAction::None => {}
@@ -12820,6 +16410,8 @@ pub(crate) unsafe fn service_sec_image(
                         park_delay_deadline = Some(deadline);
                     }
                 }
+                park_thread_alert_deadline = nt_handler.thread_alert_wait.take();
+                thread_alert::redrive(&mut nt_handler);
                 if nt_handler.io_completion_park_port >= 0 {
                     park_io_completion_port = nt_handler.io_completion_park_port;
                     park_io_completion_key_out = nt_handler.io_completion_key_out;
@@ -12827,15 +16419,16 @@ pub(crate) unsafe fn service_sec_image(
                     park_io_completion_iosb_out = nt_handler.io_completion_iosb_out;
                     park_io_completion_deadline = nt_handler.io_completion_timeout.deadline();
                 }
-                if nt_handler.io_completion_wake.is_some() {
-                    let _ = unsafe { io_completion_deliver(&mut nt_handler) };
-                }
+                let _ = unsafe { io_completion_deliver(&mut nt_handler) };
                 if nt_handler.io_signal_event >= 0 {
                     let _ = wait_wake_dispatcher_set(&mut nt_handler);
                 }
                 if let Some(transfer) = nt_handler.pending_driver_start_transfer.take() {
                     transfer_pending_driver_start = Some(transfer);
                 }
+                transfer_native_directory_open = nt_handler.pending_native_directory_open_transfer.take();
+                transfer_native_file_target = nt_handler.pending_native_file_target_transfer.take();
+                transfer_native_directory_effect = nt_handler.pending_native_directory_effect_transfer.take();
                 if let Some(transfer) = nt_handler.pending_pnp_operation_transfer.take() {
                     transfer_pending_pnp_operation = Some(transfer);
                 }
@@ -12858,11 +16451,11 @@ pub(crate) unsafe fn service_sec_image(
                         &nt_handler.time_zone_information,
                         nt_system_time_100ns(),
                     );
-                    let _ = delay_timer_rearm_and_drain_overdue(delay_queue, &mut nt_handler);
+                    let _ = delay_timer_rearm_and_drain_overdue(&mut *delay_queue, &mut nt_handler);
                 } else if nt_handler.user_timer_rearm_requested
                     || nt_handler.job_time_rearm_requested
                 {
-                    delay_timer_rearm(delay_queue, &nt_handler);
+                    delay_timer_rearm(&*delay_queue, &nt_handler);
                 }
                 park_lpc_receive = nt_handler.lpc_receive_park.take();
                 park_lpc_connect = nt_handler.lpc_connect_park.take();
@@ -12870,61 +16463,44 @@ pub(crate) unsafe fn service_sec_image(
                 if nt_handler.dbgk_block_request {
                     park_dbgk_reporter = true;
                 }
-                let _ = driver_launch::pump_hosted_file_lifecycle();
-                let hosted_io_progress = pump_hosted_io_and_redrive_driver_starts(
-                    driver_launch::drain_hosted_driver_dpcs(),
-                    &mut nt_handler,
-                );
-                if hosted_io_progress != 0
-                    || FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
-                {
-                    let _ = pending_file_io_redrive_all(&mut nt_handler);
-                    let _ = file_cleanup_redrive_all(&mut nt_handler);
-                    let _ = driver_launch::pump_hosted_file_lifecycle();
-                }
-                if nt_handler.pipe_endpoint_progress || hosted_io_progress != 0 {
-                    let _ = pending_file_io_redrive_all(&mut nt_handler);
-                }
-                // Cancellation drains are ordered after the original IRP owners. A waiter becomes
-                // runnable only once generic/LISTEN publication has ACKed and removed every exact
-                // manager IRP for its File and requestor thread.
-                let _ = file_irp_drain_redrive_all(&mut nt_handler);
-                if nt_handler.lpc_endpoint_progress {
-                    let _ = lpc_endpoint_redrive_all(&mut nt_handler);
-                }
-                let _ = lpc_connect_completion_drain(&mut nt_handler);
+                redrive_global_post_syscall_work(&mut nt_handler);
                 // The hosted-exe lane reserved a spawn after validating the owner-local file ->
                 // section -> process transition in `exe_images`. The remaining per-image policy is
                 // the address-space descriptor; handle publication and ProcessManager wiring are
                 // common for csrss/winlogon and later Win32 children.
                 if let Some(request) = nt_handler.exe_spawn_request {
-                    if let Some(spec) =
-                        hosted_exe_spawn_for(request, &*exe_image_catalog, hosted_loaded_images_ptr)
-                    {
-                        if spec.spawned.load(Ordering::Relaxed) == 0 {
-                            let is_csrss_spawn =
-                                spec.image.role == nt_exe_image::HostedProcessRole::Win32Subsystem;
-                            match spawn_requested_hosted_exe(
-                                request,
-                                spec,
-                                ntdll,
-                                fault_ep,
-                                procs,
-                                &mut nt_handler,
-                                exe_images,
-                            ) {
-                                Ok(process_handle) if is_csrss_spawn => {
-                                    csrss_process_handle = process_handle;
-                                }
-                                Ok(_) => {}
-                                Err(status) => {
-                                    result = u64::from(status);
-                                }
+                    let new_process = nt_handler.exe_spawn_new_process;
+                    match hosted_spawn_uncertainty::prepare(&mut nt_handler, request) {
+                        Ok(prepared) => match publish_reserved_hosted_exe(request,
+                            &*exe_image_catalog, hosted_loaded_images_ptr, ntdll, fault_ep,
+                            procs, &mut nt_handler, exe_images)
+                        {
+                            Ok((process_handle, is_csrss)) => {
+                                hosted_spawn_uncertainty::release_unentered(&mut nt_handler, prepared);
+                                if is_csrss { csrss_process_handle = process_handle; }
                             }
+                            Err(HostedExeSpawnError::Unentered(status)) => {
+                                hosted_spawn_uncertainty::release_unentered(&mut nt_handler, prepared);
+                                assert!(nt_handler.abort_unentered_hosted_exe(
+                                    request, new_process),
+                                    "unentered hosted spawn lost its exact reservation");
+                                result = u64::from(status);
+                            }
+                            Err(HostedExeSpawnError::Entered(status)) => {
+                                hosted_spawn_uncertainty::retain_entered(prepared, status);
+                            }
+                            Err(HostedExeSpawnError::EnteredAbortable(status)) => {
+                                hosted_spawn_uncertainty::retain_definite(
+                                    &nt_handler, prepared, status,
+                                );
+                            }
+                        },
+                        Err(status) => {
+                            assert!(nt_handler.abort_unentered_hosted_exe(
+                                request, new_process),
+                                "preflighted hosted spawn lost its exact reservation");
+                            result = u64::from(status);
                         }
-                    } else {
-                        let _ = exe_images.rollback_spawn(request);
-                        result = u64::from(nt_process::STATUS_INVALID_PARAMETER);
                     }
                 }
             } else if m0 >= win32k_subsystem::WIN32K_SERVICE_BASE
@@ -13033,7 +16609,9 @@ pub(crate) unsafe fn service_sec_image(
                     // that stands in for Ctrl-Alt-Del), then let this GetMessage run — the queue is
                     // non-empty, so it returns instead of blocking win32k. When there is nothing
                     // left to type the blocking GetMessage is parked as before.
-                    let peb_mirror = hosted_peb_mirror_for_pi(pi);
+                    let Some(peb_mirror) = hosted_peb_mirror_for_pi(pi) else {
+                        reject_hosted_ingress!()
+                    };
                     let client_teb = nt_handler
                         .pm
                         .thread_teb(current_tid as nt_process::ThreadId)
@@ -13095,6 +16673,11 @@ pub(crate) unsafe fn service_sec_image(
                             6 => EXPLORER_SSN_HIST[bucket].fetch_add(1, Ordering::Relaxed),
                             _ => 0,
                         };
+                        if nt_handler.hosted_process_observation_role(pi)
+                            == Some(nt_exe_image::HostedProcessRole::Win32Subsystem)
+                        {
+                            crate::csrss_thread_probe::record_syscall(m0);
+                        }
                         // …and the WALL-CLOCK, which is the whole point: this arm runs a nested
                         // pump, so the main loop's badge census cannot see any of the time spent
                         // here. It also ticks the periodic dump, so a non-quiescing boot reports.
@@ -13153,6 +16736,40 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(a2 as u32);
                     print_str(b"\n");
                 }
+                let Some(dispatch_peb_mirror) = hosted_peb_mirror_for_pi(pi) else {
+                    reject_hosted_ingress!()
+                };
+                let dispatch_client_teb = nt_handler
+                    .pm
+                    .thread_teb(current_tid as nt_process::ThreadId)
+                    .filter(|teb| *teb != 0)
+                    .unwrap_or(SMSS_TEB_VA);
+                let dispatch_client = win32k_client_context_for_thread(
+                    &nt_handler,
+                    pi,
+                    badge,
+                    current_tid,
+                    hosted_thread_tcb_or_zero(&nt_handler, current_tid),
+                    nt_handler.hosted_thread_role(current_tid),
+                    dispatch_client_teb,
+                    dispatch_peb_mirror,
+                    scratch_base,
+                );
+                trace_cursor_lookup_owner(
+                    "preentry", dispatch_client, m0, 0, None, false, false, false,
+                );
+                'root_gui_dispatch: {
+                let Some(dispatch_id) = win32k_glue::next_win32k_dispatch_id() else {
+                    // No shared ARG or provider state belongs to this call yet. Preserve its
+                    // bound Reply and let the ordinary syscall tail return the failure.
+                    result = nt_process::STATUS_INSUFFICIENT_RESOURCES as u64;
+                    handled = true;
+                    wl_milestone_park = false;
+                    break 'root_gui_dispatch;
+                };
+                trace_cursor_lookup_owner(
+                    "dispatch-id", dispatch_client, m0, dispatch_id, None, false, false, false,
+                );
                 // CROSS-AS ARG MARSHALING. NtUserProcessConnect(handle, USERCONNECT* buf, size): the
                 // buffer is a client user pointer (usually its stack) NOT mapped in win32k's VSpace.
                 // Passing it raw makes win32k's handler fault/spin on an address win32k_dispatch can't
@@ -13335,6 +16952,7 @@ pub(crate) unsafe fn service_sec_image(
                 let mut create_dibitmap_probe_aux0 = 0u64;
                 let mut create_dibitmap_probe_aux1 = 0u64;
                 let mut create_dibitmap_probe_aux2 = 0u64;
+                let mut bulk_stage = None;
                 let mut stretch_dibits_stack_args = [0u64; 12];
                 let mut stretch_dibits_stack_arg_count = 0usize;
                 let mut stretch_dibits_probe_failed = false;
@@ -13804,53 +17422,49 @@ pub(crate) unsafe fn service_sec_image(
                             let fl = create_dib_section_stack_args[2] as u32 as u64;
                             let color_space = create_dib_section_stack_args[3];
                             let client_bits_out = create_dib_section_stack_args[4];
-                            let base = win32k_subsystem::WIN32K_BULK_ARG_VADDR;
-                            let cap = WIN32K_STRETCH_DIBITS_STAGE_BYTES as u64;
-                            let mut layout_ok = a3 != 0 && cj_header >= 12 && cj_header <= cap;
+                            let arena_cap = win32k_subsystem::WIN32K_BULK_ARENA_BYTES;
+                            let mut layout_ok = a3 != 0 && cj_header >= 12 && cj_header <= arena_cap;
                             if !layout_ok {
                                 create_dib_section_probe_failure = CREATE_DIB_SECTION_FAIL_LAYOUT;
                                 create_dib_section_probe_aux0 = a3;
                                 create_dib_section_probe_aux1 = cj_header;
-                                create_dib_section_probe_aux2 = cap;
+                                create_dib_section_probe_aux2 = arena_cap;
                             }
-                            let staged_bmi = base;
+                            let mut header_capture = alloc::vec::Vec::new();
                             let mut staged_bmi_bytes = cj_header;
                             if layout_ok {
-                                core::ptr::write_bytes(
-                                    base as *mut u8,
-                                    0,
-                                    WIN32K_STRETCH_DIBITS_STAGE_BYTES,
-                                );
-                                prefill_client_copyin_dll_range_pages(
-                                    pi as u64,
-                                    a3,
-                                    cj_header as usize,
-                                    scratch_base,
-                                    &reg,
-                                    dll_pe_store.as_slice(),
-                                );
-                                let header_out = core::slice::from_raw_parts_mut(
-                                    staged_bmi as *mut u8,
-                                    cj_header as usize,
-                                );
-                                if !img_spawn::client_copyin_mapped(
-                                    pi as u64,
-                                    a3,
-                                    header_out,
-                                    scratch_base,
+                                if header_capture.try_reserve_exact(cj_header as usize).is_err() {
+                                    layout_ok = false;
+                                    create_dib_section_probe_failure = CREATE_DIB_SECTION_FAIL_LAYOUT;
+                                    create_dib_section_probe_aux0 = a3;
+                                    create_dib_section_probe_aux1 = cj_header;
+                                    create_dib_section_probe_aux2 = arena_cap;
+                                } else {
+                                    header_capture.resize(cj_header as usize, 0);
+                                    prefill_client_copyin_dll_range_pages(
+                                        pi as u64,
+                                        a3,
+                                        cj_header as usize,
+                                        scratch_base,
+                                        &reg,
+                                        dll_pe_store.as_slice(),
+                                    );
+                                }
+                                if layout_ok && !img_spawn::client_copyin_mapped(
+                                    pi as u64, a3, &mut header_capture, scratch_base,
                                 ) {
                                     layout_ok = false;
                                     create_dib_section_probe_failure =
                                         CREATE_DIB_SECTION_FAIL_BMI_COPY;
                                     create_dib_section_probe_aux0 = a3;
                                     create_dib_section_probe_aux1 = cj_header;
-                                } else {
+                                } else if layout_ok {
                                     match nt_kernel_exec::gdi_bitmap::bitmap_info_size(
-                                        &*header_out,
+                                        &header_capture,
                                         i_usage as u32,
                                     ) {
                                         Some(bytes)
-                                            if bytes as u64 >= 12 && bytes as u64 <= cap =>
+                                            if bytes as u64 >= 12 && bytes as u64 <= arena_cap =>
                                         {
                                             staged_bmi_bytes = bytes as u64;
                                         }
@@ -13865,25 +17479,43 @@ pub(crate) unsafe fn service_sec_image(
                                     }
                                 }
                             }
-                            let staged_bits_out = if layout_ok && client_bits_out != 0 {
-                                match align_up_u64(staged_bmi_bytes, 8) {
-                                    Some(offset) if offset + 8 <= cap => base + offset,
-                                    _ => {
-                                        layout_ok = false;
-                                        create_dib_section_probe_failure =
-                                            CREATE_DIB_SECTION_FAIL_LAYOUT;
-                                        create_dib_section_probe_aux0 = staged_bmi_bytes;
-                                        create_dib_section_probe_aux1 = 8;
-                                        create_dib_section_probe_aux2 = cap;
-                                        0
-                                    }
-                                }
+                            // The fixed header capture can be longer than the computed color
+                            // table span. Keep both the declared header and any extra table bytes.
+                            let staged_info_extent = staged_bmi_bytes.max(cj_header);
+                            let bits_offset = align_up_u64(staged_info_extent, 8);
+                            let total_bytes = bits_offset.and_then(|offset| offset.checked_add(
+                                if client_bits_out != 0 { 8 } else { 0 }
+                            ));
+                            let stage = if layout_ok {
+                                total_bytes
+                                    .and_then(nt_hosted_runtime::Win32kBulkLayout::flat)
+                                    .and_then(|layout| win32k_bulk_mapping::reserve(
+                                        pi as u32,
+                                        nt_handler.hosted_process_generation(pi).unwrap_or(0),
+                                        layout,
+                                    ))
                             } else {
-                                0
+                                None
                             };
+                            if layout_ok && stage.is_none() {
+                                layout_ok = false;
+                                create_dib_section_probe_failure = CREATE_DIB_SECTION_FAIL_LAYOUT;
+                                create_dib_section_probe_aux0 = staged_bmi_bytes;
+                                create_dib_section_probe_aux1 = if client_bits_out != 0 { 8 } else { 0 };
+                                create_dib_section_probe_aux2 = arena_cap;
+                            }
+                            let base = stage.map_or(0, |stage| stage.base());
+                            let staged_bmi = base;
+                            let staged_bits_out = if layout_ok && client_bits_out != 0 {
+                                base + bits_offset.expect("checked DIBSection bits offset")
+                            } else { 0 };
+                            bulk_stage = stage;
                             if !layout_ok {
                                 create_dib_section_probe_failed = true;
                             } else {
+                                core::ptr::copy_nonoverlapping(
+                                    header_capture.as_ptr(), staged_bmi as *mut u8, header_capture.len(),
+                                );
                                 let bmi_copied = if staged_bmi_bytes <= cj_header {
                                     true
                                 } else {
@@ -13990,14 +17622,38 @@ pub(crate) unsafe fn service_sec_image(
                             let fl = create_dibitmap_stack_args[5] as u32 as u64;
                             let wants_init_bits =
                                 pj_init != 0 && ((a3 as u32) & (CBM_INIT as u32)) != 0;
-                            let base = win32k_subsystem::WIN32K_BULK_ARG_VADDR;
-                            let cap = WIN32K_STRETCH_DIBITS_STAGE_BYTES as u64;
+                            let input_valid = (pbmi == 0 || cj_max_info >= 12)
+                                && (!wants_init_bits || cj_max_bits != 0);
+                            let stage_needed = pbmi != 0 || wants_init_bits;
+                            let bits_bytes = if wants_init_bits { cj_max_bits } else { 0 };
+                            let layout = if pbmi != 0 {
+                                nt_hosted_runtime::Win32kBulkLayout::dib(bits_bytes, cj_max_info)
+                            } else {
+                                nt_hosted_runtime::Win32kBulkLayout::flat(bits_bytes)
+                            };
+                            let stage = if input_valid && stage_needed {
+                                layout.and_then(|layout| win32k_bulk_mapping::reserve(
+                                    pi as u32,
+                                    nt_handler.hosted_process_generation(pi).unwrap_or(0),
+                                    layout,
+                                ))
+                            } else {
+                                None
+                            };
+                            let base = stage.map_or(0, |stage| stage.base());
+                            let cap = stage.map_or(0, |stage| stage.capacity());
+                            bulk_stage = stage;
                             let mut offset = 0u64;
-                            let mut layout_ok = (pbmi == 0
-                                || (cj_max_info >= 12 && cj_max_info <= cap))
-                                && (!wants_init_bits || (cj_max_bits != 0 && cj_max_bits <= cap));
+                            let mut layout_ok = input_valid
+                                && (!stage_needed || stage.is_some())
+                                && (pbmi == 0 || cj_max_info <= cap)
+                                && (!wants_init_bits || cj_max_bits <= cap);
                             if !layout_ok {
-                                create_dibitmap_probe_failure = CREATE_DIBITMAP_FAIL_LAYOUT;
+                                create_dibitmap_probe_failure = if input_valid && stage_needed {
+                                    CREATE_DIBITMAP_FAIL_STAGE_RESOURCE
+                                } else {
+                                    CREATE_DIBITMAP_FAIL_LAYOUT
+                                };
                                 create_dibitmap_probe_aux0 = pbmi;
                                 create_dibitmap_probe_aux1 = cj_max_info;
                                 create_dibitmap_probe_aux2 = cj_max_bits;
@@ -14045,11 +17701,6 @@ pub(crate) unsafe fn service_sec_image(
                             if !layout_ok {
                                 create_dibitmap_probe_failed = true;
                             } else {
-                                core::ptr::write_bytes(
-                                    base as *mut u8,
-                                    0,
-                                    WIN32K_STRETCH_DIBITS_STAGE_BYTES,
-                                );
                                 let copied_bits = if !wants_init_bits {
                                     true
                                 } else {
@@ -14192,13 +17843,24 @@ pub(crate) unsafe fn service_sec_image(
                             let dw_rop = stretch_dibits_stack_args[8] as u32 as u64;
                             let cj_max_info = stretch_dibits_stack_args[9] as u32 as u64;
                             let cj_max_bits = stretch_dibits_stack_args[10] as u32 as u64;
-                            let base = win32k_subsystem::WIN32K_BULK_ARG_VADDR;
-                            let cap = WIN32K_STRETCH_DIBITS_STAGE_BYTES as u64;
+                            let bits_reserved = if pj_init == 0 { 0 } else { cj_max_bits.max(8) };
+                            let input_valid = pbmi != 0 && cj_max_info >= 12
+                                && cj_max_bits <= win32k_subsystem::WIN32K_BULK_ARENA_BYTES;
+                            let stage = if input_valid {
+                                nt_hosted_runtime::Win32kBulkLayout::dib(bits_reserved, cj_max_info)
+                                    .and_then(|layout| win32k_bulk_mapping::reserve(
+                                        pi as u32,
+                                        nt_handler.hosted_process_generation(pi).unwrap_or(0),
+                                        layout,
+                                    ))
+                            } else {
+                                None
+                            };
+                            let base = stage.map_or(0, |stage| stage.base());
+                            let cap = stage.map_or(0, |stage| stage.capacity());
+                            bulk_stage = stage;
                             let mut offset = 0u64;
-                            let mut layout_ok = pbmi != 0
-                                && cj_max_info >= 12
-                                && cj_max_info <= cap
-                                && cj_max_bits <= cap;
+                            let mut layout_ok = input_valid && stage.is_some() && cj_max_info <= cap;
                             if !layout_ok {
                                 stretch_dibits_probe_failure = STRETCH_DIBITS_FAIL_LAYOUT;
                                 stretch_dibits_probe_aux0 = pbmi;
@@ -14207,7 +17869,6 @@ pub(crate) unsafe fn service_sec_image(
                             }
                             let staged_bits = if layout_ok && pj_init != 0 {
                                 let out = base + offset;
-                                let bits_reserved = if cj_max_bits == 0 { 8 } else { cj_max_bits };
                                 match offset
                                     .checked_add(bits_reserved)
                                     .and_then(|next| align_up_u64(next, 8))
@@ -14249,11 +17910,6 @@ pub(crate) unsafe fn service_sec_image(
                             if !layout_ok {
                                 stretch_dibits_probe_failed = true;
                             } else {
-                                core::ptr::write_bytes(
-                                    base as *mut u8,
-                                    0,
-                                    WIN32K_STRETCH_DIBITS_STAGE_BYTES,
-                                );
                                 let copied_bits = if pj_init == 0 || cj_max_bits == 0 {
                                     true
                                 } else {
@@ -14398,13 +18054,11 @@ pub(crate) unsafe fn service_sec_image(
                             } else if let (Some(string_bytes), Some(dx_bytes)) =
                                 (string_bytes, dx_bytes)
                             {
-                                let base = win32k_subsystem::WIN32K_BULK_ARG_VADDR;
-                                let cap = WIN32K_EXT_TEXT_OUT_STAGE_BYTES as u64;
                                 let mut offset = 0u64;
                                 let mut layout_ok = true;
-                                let staged_rect = if unsafe_rect != 0 {
-                                    let out = base + offset;
-                                    match align_up_u64(offset + 16, 8) {
+                                let rect_offset = if unsafe_rect != 0 {
+                                    let out = offset;
+                                    match offset.checked_add(16).and_then(|next| align_up_u64(next, 8)) {
                                         Some(next) => offset = next,
                                         None => layout_ok = false,
                                     }
@@ -14412,9 +18066,9 @@ pub(crate) unsafe fn service_sec_image(
                                 } else {
                                     0
                                 };
-                                let staged_dx = if layout_ok && dx_bytes != 0 {
-                                    let out = base + offset;
-                                    match align_up_u64(offset + dx_bytes, 8) {
+                                let dx_offset = if layout_ok && dx_bytes != 0 {
+                                    let out = offset;
+                                    match offset.checked_add(dx_bytes).and_then(|next| align_up_u64(next, 8)) {
                                         Some(next) => offset = next,
                                         None => layout_ok = false,
                                     }
@@ -14422,9 +18076,9 @@ pub(crate) unsafe fn service_sec_image(
                                 } else {
                                     0
                                 };
-                                let staged_string = if layout_ok && string_bytes != 0 {
-                                    let out = base + offset;
-                                    match align_up_u64(offset + string_bytes, 8) {
+                                let string_offset = if layout_ok && string_bytes != 0 {
+                                    let out = offset;
+                                    match offset.checked_add(string_bytes).and_then(|next| align_up_u64(next, 8)) {
                                         Some(next) => offset = next,
                                         None => layout_ok = false,
                                     }
@@ -14432,12 +18086,24 @@ pub(crate) unsafe fn service_sec_image(
                                 } else {
                                     0
                                 };
-                                if !layout_ok || offset > cap {
+                                let stage = if layout_ok && offset != 0 {
+                                    nt_hosted_runtime::Win32kBulkLayout::flat(offset)
+                                        .and_then(|layout| win32k_bulk_mapping::reserve(
+                                            pi as u32,
+                                            nt_handler.hosted_process_generation(pi).unwrap_or(0),
+                                            layout,
+                                        ))
+                                } else {
+                                    None
+                                };
+                                let base = stage.map_or(0, |stage| stage.base());
+                                bulk_stage = stage;
+                                let staged_rect = if unsafe_rect != 0 { base + rect_offset } else { 0 };
+                                let staged_dx = if dx_bytes != 0 { base + dx_offset } else { 0 };
+                                let staged_string = if string_bytes != 0 { base + string_offset } else { 0 };
+                                if !layout_ok || (offset != 0 && stage.is_none()) {
                                     ext_text_out_probe_failed = true;
                                 } else {
-                                    if offset != 0 {
-                                        core::ptr::write_bytes(base as *mut u8, 0, offset as usize);
-                                    }
                                     let rect_ok = unsafe_rect == 0 || {
                                         prefill_client_copyin_dll_range_pages(
                                             pi as u64,
@@ -15586,6 +19252,7 @@ pub(crate) unsafe fn service_sec_image(
                     // pointers that later fault during WM_PAINT icon drawing.
                     match stage_cursor_icon_data_args(
                         pi as u64,
+                        nt_handler.hosted_process_generation(pi).unwrap_or(0),
                         d_a0,
                         d_a1,
                         d_a2,
@@ -15594,10 +19261,11 @@ pub(crate) unsafe fn service_sec_image(
                         faults as usize,
                         scratch_base,
                     ) {
-                        Some((module, resource, data)) => {
+                        Some((module, resource, data, stage)) => {
                             d_a1 = module;
                             d_a2 = resource;
                             d_a3 = data;
+                            bulk_stage = Some(stage);
                         }
                         None => {
                             set_cursor_icon_data_probe_failed = true;
@@ -15866,23 +19534,6 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 }
-                let dispatch_peb_mirror = hosted_peb_mirror_for_pi(pi);
-                let dispatch_client_teb = nt_handler
-                    .pm
-                    .thread_teb(current_tid as nt_process::ThreadId)
-                    .filter(|teb| *teb != 0)
-                    .unwrap_or(SMSS_TEB_VA);
-                let dispatch_client = win32k_client_context_for_thread(
-                    &nt_handler,
-                    pi,
-                    badge,
-                    current_tid,
-                    hosted_thread_tcb_or_zero(&nt_handler, current_tid),
-                    nt_handler.hosted_thread_role(current_tid),
-                    dispatch_client_teb,
-                    dispatch_peb_mirror,
-                    scratch_base,
-                );
                 let session_cursor_hit = if m0 == 0x103d {
                     cursor_identity_key
                         .as_ref()
@@ -15940,6 +19591,9 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"\n");
                     }
                 }
+                let mut dispatch_return = None;
+                let mut dispatch_entered = false;
+                let mut dispatch_context = None;
                 let (mut st, mut ok): (u64, bool) = if wl_milestone_park {
                     // The bootstrap milestone owner handles this intentional park below.
                     (0, false)
@@ -16435,9 +20089,12 @@ pub(crate) unsafe fn service_sec_image(
                         } else {
                             m0
                         };
-                    let mut dispatch_return = None;
+                    trace_cursor_lookup_owner(
+                        "pre-dispatch", client, m0, dispatch_id, None, false, false, false,
+                    );
                     let mut r = dispatch_win32k_for_client_with_completion_args(
                         &mut nt_handler,
+                        dispatch_id,
                         dispatch_ssn,
                         d_a0,
                         d_a1,
@@ -16450,6 +20107,13 @@ pub(crate) unsafe fn service_sec_image(
                         paint_output_claim,
                         client,
                         &mut dispatch_return,
+                        &mut dispatch_entered,
+                        &mut dispatch_context,
+                    );
+                    trace_cursor_lookup_owner(
+                        "provider-return", client, m0, dispatch_id,
+                        dispatch_context.map(|context| context.lane),
+                        dispatch_entered, !r.1, false,
                     );
                     let inline_batch_records = win32k_glue::completed_gdi_batch_records(
                         dispatch_return, r.0, r.1,
@@ -16909,46 +20573,54 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     r
                 };
-                let callback_suspended = win32k_glue::take_user_callback_pump_suspended();
-                if let Some(pending) = win32k_glue::take_pending_receive_dispatch() {
-                    component_suspension_admitted_dispatch_id = pending.dispatch.dispatch_id;
-                    component_suspension_park_request = receive_admit_current(pending);
-                    assert!(component_suspension_park_request, "Receive retains parked parent and original client Reply");
-                    redirected_user_callback = true;
-                } else if let Some(pending) = win32k_glue::take_pending_service_wait_dispatch() {
-                    component_suspension_admitted_dispatch_id = pending.dispatch.dispatch_id;
-                    component_suspension_park_request = service_wait_admit_current(pending);
-                    assert!(component_suspension_park_request,
-                        "service wait retains exact external token and original client Reply");
-                    redirected_user_callback = true;
-                } else if let Some(pending) = win32k_glue::take_pending_provider_wait_dispatch() {
-                    component_suspension_admitted_dispatch_id = pending.dispatch.dispatch_id;
-                    component_suspension_park_request = provider_wait_admit_current(
-                        &mut nt_handler,
-                        pending,
-                        None,
-                    );
-                    assert!(
-                        component_suspension_park_request,
-                        "provider wait could not reserve its native continuation"
-                    );
-                    // Reuse the existing post-dispatch suppression gates. The provider wait owns
-                    // the native reply now; this is not a user callback and is intercepted before
-                    // the common reply tail.
-                    redirected_user_callback = true;
-                } else if let Some(pending) = win32k_glue::take_pending_lpc_wait_dispatch() {
-                    component_suspension_admitted_dispatch_id = pending.dispatch.dispatch_id;
-                    component_suspension_park_request = lpc_wait_admit_current(
-                        &mut nt_handler,
-                        pending,
-                        None,
-                    );
-                    assert!(
-                        component_suspension_park_request,
-                        "LPC wait could not reserve its native continuation"
-                    );
-                    redirected_user_callback = true;
+                let handoff = admit_pending_win32k_dispatch(
+                    &mut nt_handler, HostedContinuationDestination::Win32k,
+                );
+                if handoff.retained_failure {
+                    // A yielded pump has already transferred its pending snapshot. Preserve
+                    // both Replies and the durable owner; ordinary syscall output is forbidden.
+                    procs[pi].faults = faults;
+                    procs[pi].first = first;
+                    procs[pi].ntfaults = ntfaults;
+                    pfilled[pi] = *filled_pages;
+                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    stop_ssn = m0;
+                    record_service_loop_exit!(b"win32k-dispatch-retained");
+                    break 'service_loop;
                 }
+                let callback_suspended = handoff.callback_suspended;
+                trace_cursor_lookup_owner(
+                    "handoff", dispatch_client, m0, dispatch_id,
+                    dispatch_context.map(|context| context.lane),
+                    dispatch_entered, handoff.parked || callback_suspended,
+                    callback_suspended,
+                );
+                component_suspension_admitted_dispatch_id = handoff.admitted_dispatch_id;
+                component_suspension_park_request = handoff.parked;
+                component_root_maintenance_ticket = handoff.maintenance_ticket;
+                if let Some(stage) = bulk_stage.take() {
+                    let suspended = callback_suspended || handoff.parked;
+                    let bound = if suspended {
+                        dispatch_entered
+                            && dispatch_context.is_some_and(|context| {
+                                (handoff.admitted_dispatch_id == 0
+                                    || handoff.admitted_dispatch_id == context.dispatch_id)
+                                    && win32k_bulk_mapping::retain(
+                                        stage, context, pi as u32,
+                                        nt_handler.hosted_process_generation(pi).unwrap_or(0),
+                                    )
+                            })
+                    } else {
+                        let provider_completed = dispatch_entered
+                            && dispatch_return.and_then(|receipt| receipt.handler_value()).is_some();
+                        win32k_bulk_mapping::settle(stage, dispatch_entered, provider_completed)
+                    };
+                    if !bound {
+                        print_str(b"[win32k-bulk] exact DIB lease settlement failed\n");
+                        park();
+                    }
+                }
+                if handoff.parked { redirected_user_callback = true; }
                 let direct_provider_output_len = if ok
                     && !callback_suspended
                     && !component_suspension_park_request
@@ -17041,7 +20713,9 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 }
                 if callback_suspended {
-                    let peb_mirror = hosted_peb_mirror_for_pi(pi);
+                    let Some(peb_mirror) = hosted_peb_mirror_for_pi(pi) else {
+                        reject_hosted_ingress!()
+                    };
                     let client_teb = nt_handler
                         .pm
                         .thread_teb(current_tid as nt_process::ThreadId)
@@ -17299,9 +20973,9 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(st as u32);
                     print_str(b"\n");
                 }
-                // ★ CLIENT-GDI HANDLE-TABLE ALIAS. GUI clients whose PEB+0xf8 was seeded before
-                // gdi32's GdiProcessSetup must have the live win32k USER heap prefix and user-attribute
-                // area projected before client-side GdiValidateHandle runs. Winlogon needs this for the
+                // ★ CLIENT-GDI HANDLE-TABLE ALIAS. The early win32k process-create callout maps
+                // the canonical Section and writes PEB+0xf8 before gdi32's GdiProcessSetup. The
+                // user-attribute area also precedes client-side GdiValidateHandle. Winlogon needs this for the
                 // msgina dialog DC/font setup; later interactive shell clients use the same cataloged
                 // role path instead of fixed pi checks.
                 if uses_client_gdi {
@@ -17354,10 +21028,24 @@ pub(crate) unsafe fn service_sec_image(
                     handled = false; // dispatch wall — stop with the SSN recorded
                     result = 0xC0000001;
                 }
+                }
             } else {
                 // SSNs absent from the registered native table are complete dispatcher decisions:
                 // the NT syscall layer rejects them instead of treating them as missing kernel code.
                 result = nt_syscall::STATUS_INVALID_SYSTEM_SERVICE as u64;
+            }
+            if hosted_spawn_uncertainty::take_transferred() {
+                mark_wait_parked!(pi, resume_ip);
+                let _ = finalize_service_loop_state(&mut nt_handler);
+                let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                badge = nb;
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                m2 = nm2;
+                m3 = nm3;
+                continue;
             }
             if !handled {
                 // ★ BATCH 43 — winlogon SAS-window MILESTONE park (recv-next-without-reply). winlogon has
@@ -17398,6 +21086,7 @@ pub(crate) unsafe fn service_sec_image(
                     {
                         print_str(b"[quiesce] winlogon reached its win32k SAS-window milestone + steady state -> run gate\n");
                         stop = m0;
+                        record_service_loop_exit!(b"winlogon-sas-milestone");
                         break;
                     } else if userinit_shell_pending {
                         print_str(b"[quiesce] winlogon milestone parked; deferring gate until userinit attempts its shell image\n");
@@ -17462,6 +21151,7 @@ pub(crate) unsafe fn service_sec_image(
                     {
                         print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
                         stop = m0;
+                        record_service_loop_exit!(b"all-live-waiting");
                         break;
                     }
                     let _ = finalize_service_loop_state(&mut nt_handler);
@@ -17534,6 +21224,7 @@ pub(crate) unsafe fn service_sec_image(
                     {
                         print_str(b"[wl-worker] parked before signalling the waiting winlogon main thread -> run gate\n");
                         stop = m0;
+                        record_service_loop_exit!(b"winlogon-worker-parked");
                         break;
                     }
                     procs[pi].faults = faults;
@@ -17591,6 +21282,73 @@ pub(crate) unsafe fn service_sec_image(
                     // filesystem finalizer while the physical GUI parent is held.
                     nt_handler.loop_ctx = nt_handler.loop_ctx.map(|ctx| ctx.checkpoint_live());
                 }
+                if let Some(maintenance_ticket) = component_root_maintenance_ticket {
+                    if receive_child_pending {
+                        // A prepared Receive child has physical priority over independent work.
+                        // Keep this checkpoint and both Replies retained for diagnosis.
+                        print_str(b"[root-maintenance] pending Receive child; checkpoint retained\n");
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = m0;
+                        record_service_loop_exit!(b"root-maintenance-receive-child");
+                        break 'service_loop;
+                    }
+                    // The ordinary syscall has yielded with both Replies retained. Run this
+                    // independent worker only after all event-local state is checkpointed.
+                    let worker_attempted = {
+                        let _message = crate::ipc_message::SavedMessageBuffer::capture();
+                        crate::process_image_snapshot_work::redrive(
+                            &mut nt_handler, &mut *delay_queue, ntdll, fault_ep, procs,
+                            exe_images, &*exe_image_catalog, hosted_loaded_images_ptr,
+                        )
+                    };
+                    if !worker_attempted {
+                        print_str(b"[root-maintenance] image worker did not enter; checkpoint retained\n");
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = m0;
+                        record_service_loop_exit!(b"root-maintenance-worker");
+                        break 'service_loop;
+                    }
+                    let Some(observed_pass) = ROOT_MAINTENANCE_PASS.try_update(
+                        Ordering::AcqRel, Ordering::Acquire, |old| old.checked_add(1),
+                    ).ok().and_then(|old| old.checked_add(1)) else {
+                        print_str(b"[root-maintenance] outer pass epoch exhausted\n");
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = m0;
+                        record_service_loop_exit!(b"root-maintenance-epoch");
+                        break 'service_loop;
+                    };
+                    let Some(key) = root_maintenance_owner::key(maintenance_ticket) else {
+                        print_str(b"[root-maintenance] exact owner missing before pass grant\n");
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = m0;
+                        record_service_loop_exit!(b"root-maintenance-owner");
+                        break 'service_loop;
+                    };
+                    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+                    if lanes.mark_root_maintenance_pass(
+                        maintenance_ticket.dispatch.lane(), maintenance_ticket.reply,
+                        maintenance_ticket.dispatch, key, maintenance_ticket.owner,
+                        observed_pass,
+                    ).is_err() {
+                        print_str(b"[root-maintenance] exact pass grant refused\n");
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = m0;
+                        record_service_loop_exit!(b"root-maintenance-pass");
+                        break 'service_loop;
+                    }
+                    if matches!(
+                        component_resume::run_root_maintenance(
+                            core::ptr::from_mut(nt_handler), maintenance_ticket,
+                        ),
+                        component_resume::RootMaintenanceResumeOutcome::RetainedFailure,
+                    ) {
+                        print_str(b"[root-maintenance] exact resume retained after refusal\n");
+                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        stop_ssn = m0;
+                        record_service_loop_exit!(b"root-maintenance-resume");
+                        break 'service_loop;
+                    }
+                }
                 if !receive_child_pending {
                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                 }
@@ -17645,6 +21403,7 @@ pub(crate) unsafe fn service_sec_image(
                     {
                         print_str(b"[quiesce] active callback bad-resume park reached steady state -> run gate\n");
                         stop = resume_ip;
+                        record_service_loop_exit!(b"callback-bad-resume");
                         break;
                     }
                     let _ = finalize_service_loop_state(&mut nt_handler);
@@ -17675,6 +21434,7 @@ pub(crate) unsafe fn service_sec_image(
                     && lpc_receive_wait_park(
                         pending,
                         pi as u32,
+                        event_runtime.process,
                         badge,
                         nt_handler.current_tid,
                     )
@@ -17764,6 +21524,7 @@ pub(crate) unsafe fn service_sec_image(
                     && lpc_request_wait_park(
                         pending,
                         pi as u32,
+                        event_runtime.process,
                         badge,
                         nt_handler.current_tid,
                     )
@@ -17816,7 +21577,7 @@ pub(crate) unsafe fn service_sec_image(
                     park_io_completion_iosb_out,
                     park_io_completion_deadline,
                 ) {
-                    delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
+                    delay_timer_rearm_after_park(&mut *delay_queue, &mut nt_handler, timed);
                     print_str(b"[io-completion] pi=");
                     print_u64(pi as u64);
                     print_str(b" port=");
@@ -17852,7 +21613,7 @@ pub(crate) unsafe fn service_sec_image(
                 let delay_tid = nt_handler.current_tid;
                 if delay_park(
                     &mut nt_handler,
-                    delay_queue,
+                    &mut *delay_queue,
                     deadline,
                     reply_main,
                     delay_tid,
@@ -17872,6 +21633,27 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b"[delay] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
                 result = 0xC000_009A;
             }
+            if let Some(deadline) = park_thread_alert_deadline {
+                let timed = deadline != nt_delay_execution::Deadline::Infinite;
+                if timed && !delay_timer_init() {
+                    result = nt_fs::STATUS_INSUFFICIENT_RESOURCES as u64;
+                } else if thread_alert::park(&mut nt_handler, deadline, reply_main) {
+                    delay_timer_rearm_after_park(&mut *delay_queue, &mut nt_handler, timed);
+                    thread_alert::redrive(&mut nt_handler);
+                    let _ = finalize_service_loop_state(&mut nt_handler);
+                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                    let received = component_recv!(fault_ep, new_reply);
+                    badge = received.0;
+                    mi = received.1;
+                    m0 = received.2;
+                    m1 = received.3;
+                    m2 = received.4;
+                    m3 = received.5;
+                    continue;
+                } else {
+                    result = nt_fs::STATUS_INSUFFICIENT_RESOURCES as u64;
+                }
+            }
             // Keyed-event release park (`NtReleaseKeyedEvent`): if no wait side is already parked,
             // the release side waits for a future `NtWaitForKeyedEvent` on the same key.
             if park_keyed_release_wait_key != u64::MAX && reply_main != 0 {
@@ -17884,7 +21666,7 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.current_tid,
                     park_keyed_release_wait_deadline,
                 ) {
-                    delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
+                    delay_timer_rearm_after_park(&mut *delay_queue, &mut nt_handler, timed);
                     print_str(b"[keyed] NtReleaseKeyedEvent key=0x");
                     print_hex_u64(park_keyed_release_wait_key);
                     print_str(b" -> PARK releaser\n");
@@ -17926,7 +21708,7 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.current_tid,
                     park_keyed_wait_deadline,
                 ) {
-                    delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
+                    delay_timer_rearm_after_park(&mut *delay_queue, &mut nt_handler, timed);
                     print_str(b"[keyed] NtWaitForKeyedEvent key=0x");
                     print_hex_u64(park_keyed_wait_key);
                     print_str(b" -> PARK caller\n");
@@ -18002,7 +21784,7 @@ pub(crate) unsafe fn service_sec_image(
                 ) {
                     let current_tid = nt_handler.current_tid;
                     let wait_still_parked = wait_recheck_after_park(&mut nt_handler, current_tid);
-                    delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
+                    delay_timer_rearm_after_park(&mut *delay_queue, &mut nt_handler, timed);
                     if winlogon_worker_can_signal && wait_still_parked {
                         WINLOGON_MAIN_EVENT_WAIT_PARKED.store(1, Ordering::Relaxed);
                         print_str(b"[wl-main] parked on worker-ready event; runnable worker remains a signaler\n");
@@ -18049,16 +21831,18 @@ pub(crate) unsafe fn service_sec_image(
                 ) {
                     let current_tid = nt_handler.current_tid;
                     let wait_still_parked = wait_recheck_after_park(&mut nt_handler, current_tid);
-                    delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
-                    print_str(b"[wait] pi=");
-                    print_u64(pi as u64);
-                    print_str(b" NtWaitForMultipleObjects(");
-                    print_u64(park_wait_set_n as u64);
-                    print_str(if park_wait_set_all {
-                        b" objects, WaitAll) UNSIGNALLED -> PARK caller\n"
-                    } else {
-                        b" objects, WaitAny) UNSIGNALLED -> PARK caller\n"
-                    });
+                    delay_timer_rearm_after_park(&mut *delay_queue, &mut nt_handler, timed);
+                    if DEBUG_TRACE {
+                        print_str(b"[wait] pi=");
+                        print_u64(pi as u64);
+                        print_str(b" NtWaitForMultipleObjects(");
+                        print_u64(park_wait_set_n as u64);
+                        print_str(if park_wait_set_all {
+                            b" objects, WaitAll) UNSIGNALLED -> PARK caller\n"
+                        } else {
+                            b" objects, WaitAny) UNSIGNALLED -> PARK caller\n"
+                        });
+                    }
                     if !timed && wait_still_parked {
                         trace_indefinite_wait_park(
                             &nt_handler,
@@ -18150,6 +21934,60 @@ pub(crate) unsafe fn service_sec_image(
                 m3 = nm3;
                 continue;
             }
+            if let Some(transfer) = transfer_native_file_target.take() {
+                match unsafe { crate::native_file_target_open_work::park(&mut nt_handler, transfer) } {
+                    Ok(()) => {
+                        mark_wait_parked!(pi, resume_ip);
+                        let _ = finalize_service_loop_state(&mut nt_handler);
+                        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                        let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                        badge = nb;
+                        mi = nmi;
+                        m0 = nm0;
+                        m1 = nm1;
+                        m2 = nm2;
+                        m3 = nm3;
+                        continue;
+                    }
+                    Err(status) => result = status as u64,
+                }
+            }
+            if let Some(transfer) = transfer_native_directory_open.take() {
+                match unsafe { crate::native_directory_open_work::park(&mut nt_handler, transfer) } {
+                    Ok(()) => {
+                        mark_wait_parked!(pi, resume_ip);
+                        let _ = finalize_service_loop_state(&mut nt_handler);
+                        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                        let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                        badge = nb;
+                        mi = nmi;
+                        m0 = nm0;
+                        m1 = nm1;
+                        m2 = nm2;
+                        m3 = nm3;
+                        continue;
+                    }
+                    Err(status) => result = status as u64,
+                }
+            }
+            if let Some(transfer) = transfer_native_directory_effect.take() {
+                match unsafe { crate::native_directory_effect_work::park(&mut nt_handler, transfer) } {
+                    Ok(()) => {
+                        mark_wait_parked!(pi, resume_ip);
+                        let _ = finalize_service_loop_state(&mut nt_handler);
+                        let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                        let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
+                        badge = nb;
+                        mi = nmi;
+                        m0 = nm0;
+                        m1 = nm1;
+                        m2 = nm2;
+                        m3 = nm3;
+                        continue;
+                    }
+                    Err(status) => result = status as u64,
+                }
+            }
             // File ownership and reply attachment were committed before post-actions. Only
             // scheduling remains here; completion may already have retired the published owner.
             if let Some(published) = published_file_io.take() {
@@ -18158,6 +21996,7 @@ pub(crate) unsafe fn service_sec_image(
                     let _ = reconcile_user_apc_file_wait(&mut nt_handler, published.tid);
                 }
                 if published.still_waiting() {
+                    published.trace_parked_mounted_create();
                     trace_indefinite_wait_park(
                         &nt_handler,
                         badge,
@@ -18355,6 +22194,37 @@ pub(crate) unsafe fn service_sec_image(
             // restart without IPC register fanout. NtContinue already bypassed this tail.
             let len = 1;
             let r0 = result;
+            if let Some(n) = lsa_logon_trace_seq {
+                LSA_LOGON_LAST_STATUS.store(r0, Ordering::Relaxed);
+                if n < 128 {
+                    print_str(b"[lsa-logon-ssn] return #");
+                    print_u64(n);
+                    print_str(b" tid=");
+                    print_u64(nt_handler.current_tid);
+                    print_str(b" ssn=");
+                    print_u64(m0);
+                    print_str(b" status=0x");
+                    print_hex_u64(r0);
+                    print_str(b" reply=0x");
+                    print_hex_u64(reply_main);
+                    print_str(b"\n");
+                }
+            }
+            let trace_csrss_resume_reply = native_call_transport && badge == 29 && m0 == 214;
+            if trace_csrss_resume_reply {
+                if CSRSS_RESUME_REPLIES.fetch_add(1, Ordering::Relaxed) == 1 {
+                    CSRSS_POST_RESUME_TCB.store(event_runtime.tcb, Ordering::Relaxed);
+                }
+                print_str(b"[csrss-resume-reply] handoff badge=");
+                print_u64(badge);
+                print_str(b" tcb=0x");
+                print_hex_u64(event_runtime.tcb);
+                print_str(b" reply=0x");
+                print_hex_u64(reply_main);
+                print_str(b" status=0x");
+                print_hex_u64(r0);
+                print_str(b"\n");
+            }
             let ((nb, nmi, nm0, nm1, nm2, nm3), native_reply_delivered) = if redirected_user_control {
                 let restarted = win32k_glue::restart_staged_user_callback_context(
                     win32k_glue::StagedUserCallbackContext::installed(event_runtime.tcb),
@@ -18389,6 +22259,17 @@ pub(crate) unsafe fn service_sec_image(
                     (received, delivered)
                 }
             };
+            if trace_csrss_resume_reply {
+                print_str(b"[csrss-resume-reply] received badge=");
+                print_u64(nb);
+                print_str(b" delivered=");
+                print_u64(native_reply_delivered as u64);
+                print_str(b" label=0x");
+                print_hex_u64(nmi);
+                print_str(b" m0=0x");
+                print_hex_u64(nm0);
+                print_str(b"\n");
+            }
             if let Some(status) = native_load_reply_status {
                 // The checked reply path consumed the bound Reply object before returning. The
                 // combined path reserves one impossible receive badge to report a send-half failure
@@ -18432,7 +22313,119 @@ pub(crate) unsafe fn service_sec_image(
         print_str(b"[mup-provider-gate] terminal service-loop failure\n");
         park();
     }
+    // One terminal receipt, before checkpointing can obscure the branch that ended the
+    // serialized loop. Every field below is an observation; no owner or dirty bit is consumed.
+    let ingress_hold = unsafe {
+        crate::spawn_hosts::shared_ingress::owner::runtime::hold_snapshot()
+    };
+    let (callback_depth, continuation_depth) = win32k_glue::user_callback_stack_depths();
+    print_str(b"[service-loop-exit] reason=");
+    print_str(service_loop_exit_reason);
+    print_str(b" site=");
+    print_u64(service_loop_exit_site as u64);
+    print_str(b" stop=");
+    print_hex_u64(stop);
+    print_str(b" stop-ssn=");
+    print_u64(stop_ssn);
+    print_str(b" badge/label/m0/reply=");
+    print_u64(badge);
+    print_str(b"/");
+    print_u64(mi >> 12);
+    print_str(b"/");
+    print_hex_u64(m0);
+    print_str(b"/");
+    print_u64(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+    print_str(b" child-pending=");
+    print_u64(u64::from(crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()));
+    print_str(b" add-device-owner=");
+    match root_add_device_turn.as_ref().map(|turn| turn.owner()) {
+        Some(RootAddDeviceOwner::DriverStart(owner)) => {
+            print_str(b"driver-start/");
+            print_u64(owner.slot() as u64);
+        }
+        Some(RootAddDeviceOwner::PnpRebalance(owner)) => {
+            print_str(b"pnp-rebalance/");
+            print_u64(owner.slot() as u64);
+        }
+        None => print_str(b"none"),
+    }
+    print_str(b" callbacks/continuations/dispatch/suspended=");
+    print_u64(callback_depth as u64);
+    print_str(b"/");
+    print_u64(continuation_depth as u64);
+    print_str(b"/");
+    print_u64(spawn_hosts::dispatch_depth());
+    print_str(b"/");
+    print_u64(spawn_hosts::SUSPENDED_COMPONENT_OUTSTANDING.load(Ordering::Relaxed));
+    print_str(b" snapshot-dirty=");
+    print_u64(u64::from(crate::writable_fs::snapshot_dirty_for_diagnostics()));
+    print_str(b" live/crash/wait=");
+    print_hex_u64(live_top_badges(&nt_handler));
+    print_str(b"/");
+    print_hex_u64(crash_parked);
+    print_str(b"/");
+    print_hex_u64(wait_parked);
+    print_str(b"\n");
+    if let Some(running) = ingress_hold.running {
+        print_str(b"[service-loop-exit-owner] running lane/gen/epoch/route/executor/reply/tcb=");
+        print_u64(running.lane.index as u64);
+        print_str(b"/");
+        print_u64(running.lane.generation);
+        print_str(b"/");
+        print_u64(running.dispatch.map_or(0, |dispatch| dispatch.epoch()));
+        print_str(b"/");
+        print_u64(running.route.map_or(0, |route| route.badge()));
+        print_str(b"/");
+        print_u64(running.binding.map_or(0, |binding| binding.executor_id));
+        print_str(b"/");
+        print_u64(running.binding.map_or(0, |binding| binding.reply_object));
+        print_str(b"/");
+        print_u64(running.physical.map_or(0, |source| source.tcb));
+        print_str(b" quarantined=");
+        print_u64(u64::from(running.quarantined.unwrap_or(false)));
+        print_str(b"\n");
+    }
+    if let Some(oldest) = ingress_hold.oldest {
+        print_str(b"[service-loop-exit-owner] oldest pi/pid/generation/tid/badge/reply/executor/admission=");
+        print_u64(oldest.binding.pi as u64);
+        print_str(b"/");
+        print_u64(oldest.binding.process.pid as u64);
+        print_str(b"/");
+        match oldest.binding.process.generation {
+            nt_types::ProcessGeneration::Hosted(generation) => {
+                print_str(b"hosted:");
+                print_u64(generation);
+            }
+            nt_types::ProcessGeneration::Temporary(generation) => {
+                print_str(b"temporary:");
+                print_u64(generation);
+            }
+        }
+        print_str(b"/");
+        print_u64(oldest.binding.tid);
+        print_str(b"/");
+        print_u64(oldest.binding.badge);
+        print_str(b"/");
+        print_u64(oldest.reply);
+        print_str(b"/");
+        print_u64(oldest.executor);
+        print_str(b"/");
+        print_u64(oldest.admission_sequence);
+        print_str(b"\n");
+    }
     nt_handler.loop_ctx = nt_handler.loop_ctx.map(|ctx| ctx.checkpoint_live());
+    // Attribute a busy snapshot reserve before the terminal durability proof attempts to
+    // acquire it. These owners are inspected once, after the serialized service loop exits.
+    unsafe {
+        crate::writable_fs::snapshot_storage::print_quiesce_header_owner();
+        crate::writable_fs::print_quiesce_snapshot_owners();
+        crate::registry_mutation_work::print_quiesce_owners();
+        print_str(b"[quiesce-hive-journal] boot=");
+        print_u64(u64::from(crate::writable_fs::hive_wal::has_retained_boot_hive_journal()));
+        print_str(b" native=");
+        print_u64(u64::from(crate::writable_fs::hive_wal::has_retained_native_hive_journal()));
+        print_str(b"\n");
+    }
     let quiesce_cm_status = checkpoint_boot_hives_at_quiesce(&mut nt_handler);
     if quiesce_cm_status != nt_fs::STATUS_SUCCESS {
         print_str(b"[cm-flush] shutdown hive durability refused status=0x");
@@ -20356,7 +24349,7 @@ pub(crate) unsafe fn service_sec_image(
 
         // The hosted receive loop is finished and has no delay waiter outstanding. Disable timer 0
         // and unbind its notification so a stale HPET signal cannot intercept later self-test recvs.
-        delay_timer_shutdown(delay_queue, &nt_handler);
+        delay_timer_shutdown(&mut *delay_queue, &nt_handler);
         clear_service_delay_drain_context();
 
         // === Dbgk TARGET-SIDE BLOCKING SELF-TEST (POST-LOOP) — the keystone deferred item ==========
@@ -21376,10 +25369,10 @@ pub(crate) unsafe fn service_sec_image(
                     let private_reply = if debugger_runtime_registered
                         && REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0
                     {
-                        wait_reply_pool_find_free().map(|(index, cap)| {
-                            wait_reply_pool_mark_used(index);
+                        wait_reply_pool_find_free().and_then(|(index, cap)| {
+                            if !wait_reply_pool_mark_used(index) { return None; }
                             REPLY_MAIN_SLOT.store(cap, Ordering::Relaxed);
-                            cap
+                            Some(cap)
                         })
                     } else {
                         None
@@ -21471,8 +25464,11 @@ pub(crate) unsafe fn service_sec_image(
                         let replacement = REPLY_MAIN_SLOT.swap(0, Ordering::Relaxed);
                         let index = wait_reply_pool_find_cap(replacement)
                             .expect("debugger proof lost its private Reply replacement");
-                        assert!(wait_reply_pool_ref()[index].used);
-                        wait_reply_pool_mark_free(index);
+                        let identity = wait_reply_pool_ref().at(index)
+                            .expect("debugger proof lost its private Reply identity");
+                        assert_eq!(wait_reply_pool_ref().state(identity),
+                            Ok(nt_component_suspension::RootReplySlotState::Used));
+                        assert!(wait_reply_pool_mark_free(index));
                     }
                     (
                         nt_handler.current_tid,
@@ -21526,7 +25522,7 @@ pub(crate) unsafe fn service_sec_image(
                         crate::object_wait_reply::redrive(&mut nt_handler);
                         crate::object_wait_reply::redrive_terminated_runtimes(
                             &mut nt_handler,
-                            delay_queue,
+                            &mut *delay_queue,
                         );
                         debugger_resources_settled = !object_waiter_contains_tid(u64::from(tid));
                         if debugger_runtime_registered
@@ -21620,7 +25616,12 @@ pub(crate) unsafe fn service_sec_image(
         // handler produced — differing only in the two transport switches a target with no ntdll
         // mapped requires (direct entry instead of `LdrInitializeThunk`, hosted-syscalls instead of
         // the native Call) and a private endpoint, so the post-loop test can service it itself.
-        {
+        if nt_handler.pm.has_process_exit_notify_registrations() {
+            // This synthetic target has no ordinary provider create lifecycle. Do not inject its
+            // exit into live providers from a post-loop diagnostic.
+            print_str(b"[ntos-exec] dbgk remote-breakin selftest skipped: provider exit callbacks live\n");
+            DBGK_BREAKIN_SELFTEST.store(0, Ordering::Relaxed);
+        } else {
             use nt_process::dbgk;
             const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
             const PROCESS_CREATE_THREAD: u32 = 0x0002;
@@ -22440,6 +26441,7 @@ pub(crate) unsafe fn service_sec_image(
                 "debugger fixture detaches before retiring target Ps bodies");
             nt_handler.pm.terminate_process(target, nt_process::STATUS_SUCCESS)
                 .expect("debugger fixture terminates its throwaway target");
+            crate::process_terminal_receipt::drain_hosted_process_exit_notifications(&mut nt_handler);
             let retirement = nt_handler.pm.withdraw_process_object_if_unreferenced(target)
                 .expect("debugger fixture releases every target object reference");
             let backing = ps_object_backing::retire_withdrawn(
@@ -23194,7 +27196,13 @@ unsafe fn dump_hosted_thread_quiesce(
     }
     print_str(b"\n");
 
-    let (stack_base, stack_size, stack_mirror, _, _) = mirror_ctx_for(badge, pi);
+    let Some((stack_base, stack_size, stack_mirror, _, _)) =
+        mirror_ctx_for(nt_handler, badge, pi, tid)
+    else {
+        print_quiesce_tag(label, b"-runtime-retired");
+        print_str(b"\n");
+        return;
+    };
     let mirror_stack_end = stack_base.checked_add(stack_size);
     let hosted_stack_range = nt_handler.hosted_thread_user_stack_for_badge(badge, pi);
     let rsp_has_qword =
@@ -23724,6 +27732,12 @@ unsafe fn spawn_requested_tp_worker(
     print_u64(badge);
     print_str(b" tid=");
     print_u64(tid);
+    if pi == 0 {
+        print_str(b" start_rcx=0x");
+        print_hex_u64(start.rcx);
+        print_str(b" start_rdx=0x");
+        print_hex_u64(start.rdx);
+    }
     print_str(b" tcb=0x");
     print_hex(tcb as u32);
     if let Some(kind) = role.rpc_worker_kind() {
@@ -23827,7 +27841,16 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
 /// heap mirror, and its demand scratch window. This is the same selection the main service
 /// loop makes. Parked-I/O delivery temporarily switches to the parked thread's context.
 #[inline]
-fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64) {
+fn mirror_ctx_for(
+    handler: &ExecNtHandler, badge: u64, pi: usize, tid: u64,
+) -> Option<(u64, u64, u64, u64, u64)> {
+    let process = handler.capture_thread_process_identity(pi, tid)?;
+    let runtime = match process.generation {
+        nt_user_host::process_identity::ProcessGeneration::Hosted(generation) =>
+            hosted_process_runtime_for_exact(pi, generation)?,
+        nt_user_host::process_identity::ProcessGeneration::Temporary(_) =>
+            hosted_process_runtime_for_pi(pi)?,
+    };
     let (stack_base, stack_frames) =
         crate::hosted_thread_runtime::hosted_thread_fixed_stack_geometry(pi, badge);
     let stack_mirror =
@@ -23845,19 +27868,17 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64) {
                 WINLOGON_WORKER_BADGE => WINLOGON_WORKER_STACK_MIRROR_VA,
                 _ => {
                     // A top-level process MAIN thread — keyed by pi like the loop's default arm.
-                    hosted_main_stack_mirror_for_pi(pi)
+                    runtime.stack_mirror_va
                 }
             }
         };
-    let heap_mirror = hosted_heap_mirror_for_pi(pi);
-    let scratch_base = hosted_scratch_base_for_pi(pi);
-    (
+    Some((
         stack_base,
         stack_frames * 0x1000,
         stack_mirror,
-        heap_mirror,
-        scratch_base,
-    )
+        runtime.heap_mirror_va,
+        runtime.scratch_base,
+    ))
 }
 
 pub(crate) unsafe fn with_section_metadata_context<R>(
@@ -23872,8 +27893,27 @@ pub(crate) unsafe fn with_section_metadata_context<R>(
     service_number: u32,
     run: impl FnOnce(&mut ExecNtHandler) -> R,
 ) -> Option<R> {
+    with_pagein_caller_target_context(handler, pi, pi, tid, badge, resume_ip, sp,
+        flags, native_call_transport, service_number, run)
+}
+
+/// A foreign VM-lock page-in uses the caller's stack and thread authority while mapping
+/// the independently captured target process. Never infer the caller from the target PI.
+pub(crate) unsafe fn with_pagein_caller_target_context<R>(
+    handler: &mut ExecNtHandler,
+    caller_pi: usize,
+    target_pi: usize,
+    tid: u64,
+    badge: u64,
+    resume_ip: u64,
+    sp: u64,
+    flags: u64,
+    native_call_transport: bool,
+    service_number: u32,
+    run: impl FnOnce(&mut ExecNtHandler) -> R,
+) -> Option<R> {
     let saved_ctx = handler.loop_ctx;
-    let ctx = saved_ctx?.for_process(pi)?;
+    let ctx = saved_ctx?.for_process(target_pi)?;
     let saved_mirrors = (
         ACTIVE_STACK_BASE.load(Ordering::Relaxed),
         ACTIVE_STACK_SIZE.load(Ordering::Relaxed),
@@ -23887,16 +27927,16 @@ pub(crate) unsafe fn with_section_metadata_context<R>(
         handler.current_resume_ip, handler.current_sp, handler.current_flags,
         handler.current_native_call_transport, handler.current_service_number,
     );
-    let (stack_base, stack_size, stack_mirror, heap_mirror, scratch_base) =
-        mirror_ctx_for(badge, pi);
+    let (stack_base, stack_size, stack_mirror, heap_mirror, _scratch_base) =
+        mirror_ctx_for(handler, badge, caller_pi, tid)?;
     ACTIVE_STACK_BASE.store(stack_base, Ordering::Relaxed);
     ACTIVE_STACK_SIZE.store(stack_size, Ordering::Relaxed);
     ACTIVE_STACK_MIRROR.store(stack_mirror, Ordering::Relaxed);
     ACTIVE_HEAP_MIRROR.store(heap_mirror, Ordering::Relaxed);
-    ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
-    ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+    ACTIVE_CLIENT_PI.store(caller_pi as u64, Ordering::Relaxed);
+    ACTIVE_SCRATCH_BASE.store(ctx.scratch_base, Ordering::Relaxed);
     handler.loop_ctx = Some(ctx);
-    handler.pi = pi;
+    handler.pi = caller_pi;
     handler.current_tid = tid;
     handler.current_badge = badge;
     handler.current_resume_ip = resume_ip;
@@ -23940,7 +27980,7 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
 
     let mut generation = 0u64;
     while let Some((slot, current_generation, wait)) = (&*core::ptr::addr_of!(LPC_RECEIVE_WAITS))
-        .next_occupied_after(generation)
+        .next_waiting_after(generation)
         .map(|(slot, generation, wait)| (slot, generation, *wait))
     {
         generation = current_generation;
@@ -23958,10 +27998,11 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
 
         let continuation = wait.continuation;
         let pi = continuation.pi as usize;
-        let status = if pi >= MAX_PI {
-            nt_status::NtStatus::UNSUCCESSFUL.raw() as u32
-        } else {
-            let (sb, ss, smv, hmv, scratch_base) = mirror_ctx_for(continuation.badge, pi);
+        let mirror = (pi < MAX_PI
+            && nt_handler.capture_thread_process_identity(pi, continuation.tid)
+                == Some(continuation.process)).then(||
+            mirror_ctx_for(nt_handler, continuation.badge, pi, continuation.tid)).flatten();
+        let status = if let Some((sb, ss, smv, hmv, scratch_base)) = mirror {
             ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
             ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
@@ -23981,30 +28022,35 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                     .unwrap_or_else(|status| status),
                 Err(status) => status,
             }
+        } else {
+            nt_status::NtStatus::INVALID_HANDLE.raw() as u32
         };
-        let Some(completed) = (&mut *core::ptr::addr_of_mut!(LPC_RECEIVE_WAITS)).take(slot) else {
+        let Ok(ticket) = (&mut *core::ptr::addr_of_mut!(LPC_RECEIVE_WAITS))
+            .begin_reply(slot, status) else {
             continue;
         };
         let replied = reply_parked_syscall(
-            completed.continuation.reply_cap,
+            wait.continuation.reply_cap,
             status as u64,
         );
-        release_reply_pool_cap(completed.continuation.reply_cap);
-        thread_wait_state_clear_badge_ready(nt_handler, completed.continuation.badge);
-        if replied {
+        let completed = (&mut *core::ptr::addr_of_mut!(LPC_RECEIVE_WAITS))
+            .finish_reply(ticket, replied);
+        if let Some(completed) = completed {
+            release_reply_pool_cap(completed.continuation.reply_cap);
+            thread_wait_state_clear_badge_ready(nt_handler, completed.continuation.badge);
             LPC_RECEIVE_WAIT_WOKEN.fetch_add(1, Ordering::Relaxed);
             woken += 1;
         } else {
             LPC_RECEIVE_WAIT_FAILURES.fetch_add(1, Ordering::Relaxed);
         }
         print_str(b"[lpc-recv] WAKE pi=");
-        print_u64(completed.continuation.pi as u64);
+        print_u64(wait.continuation.pi as u64);
         print_str(b" badge=");
-        print_u64(completed.continuation.badge);
+        print_u64(wait.continuation.badge);
         print_str(b" tid=");
-        print_u64(completed.continuation.tid);
+        print_u64(wait.continuation.tid);
         print_str(b" port=0x");
-        print_hex_u64(completed.request.port_handle);
+        print_hex_u64(wait.request.port_handle);
         print_str(b" status=0x");
         print_hex(status);
         print_str(b" replied=");
@@ -24054,7 +28100,7 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
 
     let mut generation = 0u64;
     while let Some((slot, current_generation, wait)) = (&*core::ptr::addr_of!(LPC_REQUEST_WAITS))
-        .next_occupied_after(generation)
+        .next_waiting_after(generation)
         .map(|(slot, generation, wait)| (slot, generation, *wait))
     {
         generation = current_generation;
@@ -24098,10 +28144,11 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                     )
                 })
             });
-        let status = if pi >= MAX_PI {
-            nt_status::NtStatus::UNSUCCESSFUL.raw() as u32
-        } else {
-            let (sb, ss, smv, hmv, scratch_base) = mirror_ctx_for(continuation.badge, pi);
+        let mirror = (pi < MAX_PI
+            && nt_handler.capture_thread_process_identity(pi, continuation.tid)
+                == Some(continuation.process)).then(||
+            mirror_ctx_for(nt_handler, continuation.badge, pi, continuation.tid)).flatten();
+        let status = if let Some((sb, ss, smv, hmv, scratch_base)) = mirror {
             ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
             ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
@@ -24124,21 +28171,26 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 ),
                 Err(status) => status,
             }
+        } else {
+            nt_status::NtStatus::INVALID_HANDLE.raw() as u32
         };
         let completed_csr_api_request = status == nt_syscall::STATUS_SUCCESS
             && pi < MAX_PI
             && nt_handler.lpc_connection_is(wait.request.port_handle, pi, b"\\windows\\apiport");
 
-        let Some(completed) = (&mut *core::ptr::addr_of_mut!(LPC_REQUEST_WAITS)).take(slot) else {
+        let Ok(ticket) = (&mut *core::ptr::addr_of_mut!(LPC_REQUEST_WAITS))
+            .begin_reply(slot, status) else {
             continue;
         };
         let replied = reply_parked_syscall(
-            completed.continuation.reply_cap,
+            wait.continuation.reply_cap,
             status as u64,
         );
-        release_reply_pool_cap(completed.continuation.reply_cap);
-        thread_wait_state_clear_badge_ready(nt_handler, completed.continuation.badge);
-        if replied {
+        let completed = (&mut *core::ptr::addr_of_mut!(LPC_REQUEST_WAITS))
+            .finish_reply(ticket, replied);
+        if let Some(completed) = completed {
+            release_reply_pool_cap(completed.continuation.reply_cap);
+            thread_wait_state_clear_badge_ready(nt_handler, completed.continuation.badge);
             LPC_REQUEST_WAIT_WOKEN.fetch_add(1, Ordering::Relaxed);
             if completed_csr_api_request {
                 CSR_API_REAL_REPLIES.fetch_add(1, Ordering::Relaxed);
@@ -24164,13 +28216,13 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             LPC_REQUEST_WAIT_FAILURES.fetch_add(1, Ordering::Relaxed);
         }
         print_str(b"[lpc-request-wait] WAKE pi=");
-        print_u64(completed.continuation.pi as u64);
+        print_u64(wait.continuation.pi as u64);
         print_str(b" badge=");
-        print_u64(completed.continuation.badge);
+        print_u64(wait.continuation.badge);
         print_str(b" tid=");
-        print_u64(completed.continuation.tid);
+        print_u64(wait.continuation.tid);
         print_str(b" msgid=");
-        print_u64(completed.request.message_id as u64);
+        print_u64(wait.request.message_id as u64);
         print_str(b" status=0x");
         print_hex(status);
         print_str(b" replied=");
@@ -24265,10 +28317,9 @@ unsafe fn lpc_connect_wait_complete(
             .is_some_and(|port| lpc_name_is(&port.name, b"\\Windows\\ApiPort"));
     let completed_lsa_auth_connect = completion.status == nt_syscall::STATUS_SUCCESS
         && lpc_name_is(connection_name, b"\\LsaAuthenticationPort");
-    let status = if pi >= MAX_PI {
-        nt_status::NtStatus::UNSUCCESSFUL.raw() as u32
-    } else {
-        let (sb, ss, smv, hmv, scratch_base) = mirror_ctx_for(continuation.badge, pi);
+    let mirror = (pi < MAX_PI).then(||
+        mirror_ctx_for(nt_handler, continuation.badge, pi, continuation.tid)).flatten();
+    let status = if let Some((sb, ss, smv, hmv, scratch_base)) = mirror {
         ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
         ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
         ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
@@ -24288,6 +28339,8 @@ unsafe fn lpc_connect_wait_complete(
             connection_name,
             &completion,
         )
+    } else {
+        nt_status::NtStatus::INVALID_HANDLE.raw() as u32
     };
 
     ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
@@ -24379,15 +28432,31 @@ pub(crate) unsafe fn lpc_receive_wait_abandon_thread(
         if wait.continuation.tid != tid {
             continue;
         }
-        let removed = table.take(slot).unwrap();
-        let cap = removed.continuation.reply_cap;
-        let cancelled = cancel_parked_reply_transport(cap);
-        if cancelled {
-            release_reply_pool_cap(cap);
-        }
+        let cap = wait.continuation.reply_cap;
+        let (ticket, reconcile_stop) = match table.begin_cancel(slot) {
+            Ok(ticket) => (ticket, false),
+            Err(_) if spawn_hosts::shared_ingress::owner::runtime::owns_hosted_reply(cap) => {
+                let Ok(ticket) = table.begin_reconcile_stop(slot) else { continue; };
+                (ticket, true)
+            }
+            Err(_) => continue,
+        };
+        let stopped = !reconcile_stop
+            || spawn_hosts::shared_ingress::owner::runtime::stop_and_cancel_hosted(cap).is_ok();
+        let cancelled = stopped && cancel_parked_reply_transport(cap);
+        let removed = if reconcile_stop {
+            table.finish_reconcile_stop(ticket, cancelled)
+        } else {
+            table.finish_cancel(ticket, cancelled)
+        };
+        let Some(removed) = removed else { continue; };
+        release_reply_pool_cap(removed.continuation.reply_cap);
         abandoned += 1;
     }
-    if abandoned != 0 {
+    let still_owned = (0..table.slot_count()).any(|slot| {
+        table.get(slot).is_some_and(|wait| wait.continuation.tid == tid)
+    });
+    if abandoned != 0 && !still_owned {
         thread_wait_state_clear_tid(nt_handler, tid);
     }
     abandoned
@@ -24445,23 +28514,41 @@ pub(crate) unsafe fn lpc_request_wait_abandon_thread(
         if wait.continuation.tid != tid {
             continue;
         }
-        let removed = table.take(slot).unwrap();
-        if let Some(client) = lpc_client() {
-            let _ = client.cancel_request(
-                removed.request.port_handle,
-                removed.request.client_process,
-                removed.request.client_thread,
-                removed.request.message_id,
-            );
-        }
-        let cap = removed.continuation.reply_cap;
-        let cancelled = cancel_parked_reply_transport(cap);
-        if cancelled {
-            release_reply_pool_cap(cap);
-        }
+        let cap = wait.continuation.reply_cap;
+        let (ticket, reconcile_stop) = match table.begin_cancel(slot) {
+            Ok(ticket) => (ticket, false),
+            Err(_) if spawn_hosts::shared_ingress::owner::runtime::owns_hosted_reply(cap) => {
+                let Ok(ticket) = table.begin_reconcile_stop(slot) else { continue; };
+                (ticket, true)
+            }
+            Err(_) => continue,
+        };
+        let broker_settled = lpc_client().is_some_and(|client| {
+            client.cancel_request(
+                wait.request.port_handle,
+                wait.request.client_process,
+                wait.request.client_thread,
+                wait.request.message_id,
+            ).is_ok()
+        });
+        let stopped = broker_settled && (!reconcile_stop
+            || spawn_hosts::shared_ingress::owner::runtime::stop_and_cancel_hosted(cap).is_ok());
+        let cancelled = stopped && cancel_parked_reply_transport(cap);
+        let removed = if reconcile_stop {
+            table.finish_reconcile_stop(ticket, cancelled)
+        } else {
+            table.finish_cancel(ticket, cancelled)
+        };
+        let Some(removed) = removed else {
+            continue;
+        };
+        release_reply_pool_cap(removed.continuation.reply_cap);
         abandoned += 1;
     }
-    if abandoned != 0 {
+    let still_owned = (0..table.slot_count()).any(|slot| {
+        table.get(slot).is_some_and(|wait| wait.continuation.tid == tid)
+    });
+    if abandoned != 0 && !still_owned {
         thread_wait_state_clear_tid(nt_handler, tid);
     }
     abandoned
@@ -24485,9 +28572,16 @@ unsafe fn io_completion_park(
     if nt_handler.io_completion_ports.retain(port_id).is_err() {
         return false;
     }
+    let Some(process) = nt_handler.capture_thread_process_identity(
+        nt_handler.pi, nt_handler.current_tid,
+    ) else {
+        nt_handler.release_io_completion_reference(port_id);
+        return false;
+    };
     let mut waiter = nt_io_completion::CompletionWaiter::default();
     waiter.port_id = port_id;
     waiter.process_index = nt_handler.pi as u8;
+    waiter.process = Some(process);
     waiter.reply_cap = stolen;
     waiter.thread_id = nt_handler.current_tid;
     waiter.badge = nt_handler.current_badge;
@@ -24507,8 +28601,25 @@ unsafe fn io_completion_park(
 }
 
 unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
-    let Some((waiter, packet)) = nt_handler.io_completion_wake.take() else {
-        return false;
+    let _ = io_completion_redrive_returned_packets(nt_handler);
+    let mut delivered_any = false;
+    let mut cursor = 0;
+    while let Some((slot, waiter, packet)) =
+        (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_wake_from(cursor)
+    {
+    cursor = slot + 1;
+    if nt_handler.capture_thread_process_identity(
+        waiter.process_index as usize,
+        waiter.thread_id,
+    ) != waiter.process {
+        continue;
+    }
+    // A retired process cannot accept copyout. The row still owns its packet, Reply and port.
+    let Some((stack_base, stack_size, stack_mirror, heap_mirror, scratch_base)) =
+        mirror_ctx_for(nt_handler, waiter.badge, waiter.process_index as usize,
+            waiter.thread_id)
+    else {
+        continue;
     };
     let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
     let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
@@ -24519,8 +28630,6 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
     let saved_pi = nt_handler.pi;
     let saved_ctx = nt_handler.loop_ctx;
 
-    let (stack_base, stack_size, stack_mirror, heap_mirror, scratch_base) =
-        mirror_ctx_for(waiter.badge, waiter.process_index as usize);
     ACTIVE_STACK_BASE.store(stack_base, Ordering::Relaxed);
     ACTIVE_STACK_SIZE.store(stack_size, Ordering::Relaxed);
     ACTIVE_STACK_MIRROR.store(stack_mirror, Ordering::Relaxed);
@@ -24561,16 +28670,28 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
     nt_handler.pi = saved_pi;
     nt_handler.loop_ctx = saved_ctx;
 
+    if !(&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS))
+        .begin_wake_reply_exact(waiter)
+    {
+        continue;
+    }
     let delivered = reply_parked_syscall(
         waiter.reply_cap,
         if copied { 0 } else { 0xC000_0005 },
     );
-    assert!(delivered, "IO completion retains uncertain Reply completion");
+    if !delivered {
+        // The transport may have completed despite an uncertain receipt. Never replay it.
+        continue;
+    }
+    let Some(waiter) = (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS))
+        .finish_exact(waiter, delivered) else { continue; };
     release_reply_pool_cap(waiter.reply_cap);
     thread_wait_state_clear_badge_ready(nt_handler, waiter.badge);
     nt_handler.release_io_completion_reference(waiter.port_id);
     IO_COMPLETION_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
-    true
+    delivered_any = true;
+    }
+    delivered_any
 }
 
 
@@ -24672,8 +28793,9 @@ unsafe fn file_cleanup_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 )
             });
         if !cleanup_complete {
-            driver_launch::release_hosted_file(file_id)
-                .expect("active File cleanup lost its canonical manager owner");
+            // start_file_cleanup transferred the final-handle owner once. The
+            // manager and retained lifecycle row own every pending retry;
+            // observing a nonterminal File does not grant another release.
             continue;
         }
         let continuation =
@@ -24702,6 +28824,29 @@ unsafe fn file_cleanup_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         completed += 1;
     }
     completed
+}
+
+/// Read only the exact parked continuation; the caller never takes its Reply.
+pub(crate) fn file_cleanup_receive_owner_snapshot() -> Option<[u64; 6]> {
+    let table = unsafe { &*core::ptr::addr_of!(PENDING_FILE_CLEANUP_WAITS) };
+    let pending = table.parked().next()?;
+    Some([
+        pending.file_id, u64::from(pending.pi), pending.tid,
+        pending.badge, pending.reply_cap, table.parked().count() as u64,
+    ])
+}
+
+pub(crate) fn trace_file_cleanup_receive_owner_rows() {
+    let table = unsafe { &*core::ptr::addr_of!(PENDING_FILE_CLEANUP_WAITS) };
+    for pending in table.parked().take(4) {
+        print_str(b"[retained-receive-cleanup] file/pi/tid/badge/reply=");
+        for (index, value) in [pending.file_id, u64::from(pending.pi), pending.tid,
+            pending.badge, pending.reply_cap].into_iter().enumerate() {
+            if index != 0 { print_str(b"/"); }
+            print_u64(value);
+        }
+        print_str(b"\n");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -24737,6 +28882,7 @@ unsafe fn pending_driver_start_transfer(
             reservation,
             bootstrap_predecessors: alloc::vec::Vec::new(),
             owner,
+            observed_wait_stage: None,
         })
         .expect("reserved driver START continuation rejected its exact batch");
     reply_park.commit();
@@ -24764,7 +28910,7 @@ unsafe fn pending_pnp_operation_transfer(
     });
     nt_handler
         .pending_pnp_operations
-        .publish(reservation, PendingPnpOperation { operation, reply })
+        .publish(reservation, PendingPnpOperation { operation, reservation, reply })
         .expect("reserved PnP continuation rejected its exact operation");
     reply_park.commit();
 }
@@ -24795,6 +28941,16 @@ pub(crate) unsafe fn complete_registry_mutation_reply(
     }
     let _ = (handler, badge);
     true
+}
+
+pub(crate) unsafe fn complete_mutable_hive_mutation_reply(
+    _handler: &mut ExecNtHandler,
+    tid: u64,
+    reply: u64,
+    status: u32,
+) -> bool {
+    assert!(crate::mutable_hive_mutation_work::has_thread(tid));
+    reply_parked_syscall(reply, status as u64)
 }
 
 fn record_pending_start_result(
@@ -24849,15 +29005,932 @@ fn record_pending_start_reply(
     }
 }
 
+fn trace_pending_driver_start_wait(
+    slot: usize,
+    pending: &mut PendingDriverStart,
+    stage: hosted_pnp_start::HostedPnpWaitStage,
+) {
+    if pending.observed_wait_stage == Some(stage) {
+        return;
+    }
+    pending.observed_wait_stage = Some(stage);
+    print_str(b"[pnp-start-wait] slot=");
+    print_u64(slot as u64);
+    print_str(b" service=");
+    print_str(pending.batch.service_name().as_bytes());
+    print_str(b" stage=");
+    print_str(stage.label());
+    print_str(b"\n");
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RootAddDeviceOwner {
+    DriverStart(nt_driver_start::PendingOperationReservation),
+    PnpRebalance(nt_driver_start::PendingOperationReservation),
+}
+type RootAddDeviceTurn = nt_driver_start::AddDeviceRootTurn<
+    RootAddDeviceOwner,
+    crate::spawn_hosts::shared_ingress::owner::runtime::DeferredParkedIngress,
+>;
+type RootQueuedCallbackTurn = nt_component_suspension::RootChildTurn<
+    crate::driver_launch::QueuedCallbackSelector,
+    Vec<crate::spawn_hosts::shared_ingress::owner::runtime::DeferredParkedIngress>,
+>;
+
+/// This is a wake request only. The exact batch reservation remains the sole parent authority.
+/// `u64::MAX` denotes no armed retry; the PIT remains one-shot and idle without retained work.
+static ROOT_ADD_DEVICE_RETRY_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+static ROOT_ADD_DEVICE_EXCLUSIVE: AtomicBool = AtomicBool::new(false);
+
+/// A root-owned callback is physically retained while its selected local child is absent.
+/// The retry is only a wake request; neither the timer nor another Call may replace that owner.
+static ROOT_QUEUED_CALLBACK_EXCLUSIVE: AtomicBool = AtomicBool::new(false);
+static ROOT_QUEUED_CALLBACK_RETRY_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+static ROOT_QUEUED_CALLBACK_FAILURE_TRACE: AtomicU64 = AtomicU64::new(0);
+static ROOT_QUEUED_CALLBACK_REFRESH_TRACE: AtomicU64 = AtomicU64::new(0);
+
+/// A queue claim owns its root turn across every Reply its resumed parent refreshes. Follow
+/// only the exact selector that claim's own row yields now; the turn keeps its deferred
+/// ingress tickets, retry deadline, and single retirement watch. The bounded receipt records
+/// each copied identity pair so a boot shows the transition that used to end the root loop.
+unsafe fn refresh_queued_callback_turn_witness(turn: &mut RootQueuedCallbackTurn) -> bool {
+    let retired = turn.owner();
+    let Some(current) = crate::driver_launch::queued_callback_refreshed_selector(retired) else {
+        return true;
+    };
+    if turn.advance_owner(retired, current).is_err() { return false; }
+    if ROOT_QUEUED_CALLBACK_REFRESH_TRACE.fetch_add(1, Ordering::Relaxed) < 16 {
+        use core::fmt::Write;
+        let mut record = nt_printf::record::RecordBuffer::<768>::new();
+        let _ = writeln!(record,
+            "[queued-callback-root-refresh] retired={:?} current={:?} watch={}",
+            retired.diagnostic_identity(), current.diagnostic_identity(),
+            u8::from(crate::driver_launch::queued_callback_root_watch_present(current)));
+        sel4_rt::print_record(record.bytes());
+    }
+    true
+}
+
+/// Failure-only root receipt. Selector snapshots are copied identities, never ACK authority.
+unsafe fn trace_queued_callback_root_failure(
+    stage: &str,
+    current: &[RootQueuedCallbackTurn],
+    permit: Option<&ParkedRootQueuedCallbackPermit>,
+) {
+    if ROOT_QUEUED_CALLBACK_FAILURE_TRACE.fetch_add(1, Ordering::Relaxed) >= 64 { return; }
+    use core::fmt::Write;
+    use crate::driver_launch::QueuedCallbackRootAction as Action;
+    let action = crate::driver_launch::queued_callback_root_action().map(|action| match action {
+        Action::NeedsChild(selector) => ("needs-child", selector.diagnostic_identity()),
+        Action::ResumeRecordedStep(selector) => ("resume-step", selector.diagnostic_identity()),
+        Action::RetryRestore(selector) => ("retry-restore", selector.diagnostic_identity()),
+        Action::RetryTerminalAck(selector) => ("retry-ack", selector.diagnostic_identity()),
+    });
+    let top = current.last().map(|turn| turn.owner());
+    let mut record = nt_printf::record::RecordBuffer::<1536>::new();
+    let _ = writeln!(record,
+        "[queued-callback-root-failure] stage={} depth={} permit={:?} permit-floor/watch={:?}/{:?} top={:?} top-retired={:?} selected={:?} unsettled={}",
+        stage, current.len(), permit.map(|permit| permit.0.diagnostic_identity()),
+        permit.map(|permit| crate::driver_launch::queued_callback_file_floor(permit.0).is_some()),
+        permit.map(|permit| crate::driver_launch::queued_callback_root_watch_present(permit.0)),
+        top.map(|selector| selector.diagnostic_identity()),
+        top.map(|selector| crate::driver_launch::queued_callback_root_retired(selector)),
+        action, u8::from(crate::driver_launch::unsettled_queued_callback()));
+    sel4_rt::print_record(record.bytes());
+}
+
+pub(crate) fn root_queued_callback_exclusive_pending() -> bool {
+    ROOT_QUEUED_CALLBACK_EXCLUSIVE.load(Ordering::Acquire)
+}
+
+pub(crate) fn root_queued_callback_retry_deadline() -> Option<u64> {
+    let deadline = ROOT_QUEUED_CALLBACK_RETRY_DEADLINE.load(Ordering::Acquire);
+    (deadline != u64::MAX).then_some(deadline)
+}
+
+pub(crate) fn root_queued_callback_retry_wake_due(now: u64) -> u64 {
+    let Some(deadline) = root_queued_callback_retry_deadline() else { return 0 };
+    if now < deadline { return 0 }
+    u64::from(ROOT_QUEUED_CALLBACK_RETRY_DEADLINE.compare_exchange(
+        deadline, u64::MAX, Ordering::AcqRel, Ordering::Acquire,
+    ).is_ok())
+}
+
+pub(crate) fn root_add_device_exclusive_pending() -> bool {
+    ROOT_ADD_DEVICE_EXCLUSIVE.load(Ordering::Acquire)
+}
+
+pub(crate) fn root_add_device_retry_deadline() -> Option<u64> {
+    let deadline = ROOT_ADD_DEVICE_RETRY_DEADLINE.load(Ordering::Acquire);
+    (deadline != u64::MAX).then_some(deadline)
+}
+
+pub(crate) fn root_add_device_retry_wake_due(now: u64) -> u64 {
+    let Some(deadline) = root_add_device_retry_deadline() else { return 0 };
+    if now < deadline { return 0 }
+    u64::from(ROOT_ADD_DEVICE_RETRY_DEADLINE.compare_exchange(
+        deadline, u64::MAX, Ordering::AcqRel, Ordering::Acquire,
+    ).is_ok())
+}
+
+/// The parked parent owns an explicit PIT one-shot. General timer reconciliation may select an
+/// unrelated overdue source whose callback writes this retained bank, so only the exact retry
+/// shot is programmed until the parent has settled. Nested pump ticks are already ACKed there.
+unsafe fn prepare_parked_add_device_receive(
+    current: &mut Option<RootAddDeviceTurn>,
+) -> bool {
+    let Some(turn) = current.as_mut() else { return false };
+    let owner = turn.owner();
+    let pending = DELAY_TIMER_TICKS_PENDING.swap(0, Ordering::AcqRel);
+    if pending != 0 {
+        PUMP_TIMER_TICKS_DRAINED.fetch_add(pending, Ordering::Relaxed);
+        let now = monotonic_time_100ns();
+        let _ = root_add_device_retry_wake_due(now);
+        if turn.observe_arrival(owner, nt_driver_start::RootArrival::Timer { now }).is_err() {
+            return false;
+        }
+    }
+    let now = monotonic_time_100ns();
+    let deadline = match turn.retry_deadline(owner) {
+        Ok(Some(deadline)) if deadline > now => deadline,
+        Ok(_) => match turn.arm_retry(turn.owner(), now, 1_000_000) {
+            Ok(deadline) => deadline,
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+    ROOT_ADD_DEVICE_RETRY_DEADLINE.store(deadline, Ordering::Release);
+    delay_timer_program(deadline, DELAY_TIMER_SOURCE_ROOT_ADD_DEVICE_RETRY)
+}
+
+/// The queued callback's physical parent owns the root until its selected child or restore
+/// completes. A short one-shot wakes the root without dispatching unrelated timer providers.
+unsafe fn prepare_parked_queued_callback_receive(
+    current: &mut Vec<RootQueuedCallbackTurn>,
+) -> bool {
+    let Some(turn) = current.last_mut() else { return false };
+    if !refresh_queued_callback_turn_witness(turn) { return false; }
+    let owner = turn.owner();
+    use crate::driver_launch::QueuedCallbackRootAction as Action;
+    if !matches!(crate::driver_launch::queued_callback_root_action(),
+        Some(Action::NeedsChild(selector) | Action::RetryRestore(selector))
+            if selector == owner)
+    { return false; }
+    let pending = DELAY_TIMER_TICKS_PENDING.swap(0, Ordering::AcqRel);
+    if pending != 0 {
+        PUMP_TIMER_TICKS_DRAINED.fetch_add(pending, Ordering::Relaxed);
+        let now = monotonic_time_100ns();
+        let _ = root_queued_callback_retry_wake_due(now);
+        if turn.observe_arrival(owner, nt_driver_start::RootArrival::Timer { now }).is_err() {
+            return false;
+        }
+    }
+    let now = monotonic_time_100ns();
+    let deadline = match turn.retry_deadline(owner) {
+        Ok(Some(deadline)) if deadline > now => deadline,
+        Ok(_) => match turn.arm_retry(owner, now, 1_000_000) {
+            Ok(deadline) => deadline,
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+    ROOT_QUEUED_CALLBACK_RETRY_DEADLINE.store(deadline, Ordering::Release);
+    delay_timer_program(deadline, DELAY_TIMER_SOURCE_ROOT_QUEUED_CALLBACK_RETRY)
+}
+
+unsafe fn service_parked_queued_callback_notification(
+    badge: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let _ = driver_launch::latch_hosted_irq_badge(badge);
+    let _ = driver_launch::drain_pending_hosted_irqs();
+    if badge_has_delay_timer(badge) {
+        ack_parked_queued_callback_retry_timer()?;
+    }
+    Ok(())
+}
+
+unsafe fn service_parked_add_device_notification(
+    badge: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let _ = driver_launch::latch_hosted_irq_badge(badge);
+    let _ = driver_launch::drain_pending_hosted_irqs();
+    if badge_has_delay_timer(badge) {
+        ack_parked_add_device_retry_timer()?;
+    }
+    Ok(())
+}
+
+pub(crate) struct ParkedRootAddDevicePermit(());
+
+impl ParkedRootAddDevicePermit {
+    fn for_exact(handler: &ExecNtHandler, owner: RootAddDeviceOwner) -> Option<Self> {
+        root_add_device_still_parked(handler, owner).then_some(Self(()))
+    }
+
+}
+
+/// Proof that the newest physical queue callback still needs a local child or a certified
+/// no-effects restore retry. The selector includes queue generation and physical Reply identity;
+/// it is reselected at every park because the Reply can be refreshed within one generation.
+pub(crate) struct ParkedRootQueuedCallbackPermit(crate::driver_launch::QueuedCallbackSelector);
+
+impl ParkedRootQueuedCallbackPermit {
+    unsafe fn retained() -> Option<Self> {
+        use crate::driver_launch::QueuedCallbackRootAction as Action;
+        let selector = match crate::driver_launch::queued_callback_root_action()? {
+            Action::NeedsChild(selector) | Action::ResumeRecordedStep(selector)
+            | Action::RetryRestore(selector) | Action::RetryTerminalAck(selector) => selector,
+        };
+        crate::driver_launch::queued_callback_file_floor(selector)?;
+        Some(Self(selector))
+    }
+
+    pub(crate) unsafe fn is_exact(&self) -> bool {
+        use crate::driver_launch::QueuedCallbackRootAction as Action;
+        matches!(crate::driver_launch::queued_callback_root_action(),
+            Some(Action::NeedsChild(selector) | Action::ResumeRecordedStep(selector)
+                | Action::RetryRestore(selector) | Action::RetryTerminalAck(selector))
+                if selector == self.0)
+            && crate::driver_launch::queued_callback_file_floor(self.0).is_some()
+    }
+}
+
+/// Synchronize the retained parent stack to the newest exact queue action before any current
+/// Call is returned to ingress. The same queue claim continues its turn under a refreshed
+/// Reply; a newer callback must get its own root turn and ACK witness.
+unsafe fn ensure_queued_callback_root_turn(
+    current: &mut Vec<RootQueuedCallbackTurn>,
+    permit: &ParkedRootQueuedCallbackPermit,
+) -> bool {
+    if !permit.is_exact() {
+        trace_queued_callback_root_failure("permit-inexact", current, Some(permit));
+        return false;
+    }
+    if !settle_parked_queued_callback_turn(current) {
+        trace_queued_callback_root_failure("prior-turn-settlement", current, Some(permit));
+        return false;
+    }
+    if current.last_mut().is_some_and(|turn| !refresh_queued_callback_turn_witness(turn)) {
+        trace_queued_callback_root_failure("witness-refresh", current, Some(permit));
+        return false;
+    }
+    if current.last().is_some_and(|turn| turn.owner() == permit.0) { return true; }
+    if current.last().is_some_and(|turn|
+        !crate::driver_launch::queued_callback_newer_root_child(turn.owner(), permit.0))
+    {
+        trace_queued_callback_root_failure("not-newer-child", current, Some(permit));
+        return false;
+    }
+    if current.try_reserve(1).is_err() {
+        trace_queued_callback_root_failure("reserve", current, Some(permit));
+        return false;
+    }
+    let mut turn = RootQueuedCallbackTurn::new(permit.0);
+    if turn.retain_ingress(permit.0, Vec::new()).is_err() {
+        trace_queued_callback_root_failure("retain-ingress", current, Some(permit));
+        return false;
+    }
+    if !crate::driver_launch::watch_queued_callback_root_retirement(permit.0) {
+        trace_queued_callback_root_failure("watch-retirement", current, Some(permit));
+        return false;
+    }
+    current.push(turn);
+    ROOT_QUEUED_CALLBACK_EXCLUSIVE.store(true, Ordering::Release);
+    true
+}
+
+/// Reserve before touching the physical ingress row. Every deferred Call stays owned by CALLS;
+/// the root turn retains an exact ticket so no later Call can overtake it at release.
+unsafe fn retain_parked_queued_callback_ingress(
+    current: &mut Vec<RootQueuedCallbackTurn>,
+    permit: &ParkedRootQueuedCallbackPermit,
+    reply: u64,
+    badge: u64,
+) -> bool {
+    if !ensure_queued_callback_root_turn(current, permit) { return false; }
+    let Some(turn) = current.last_mut() else { return false };
+    if turn.owner() != permit.0 { return false; }
+    let owner = turn.owner();
+    if turn.observe_arrival(owner, nt_driver_start::RootArrival::RetainedCall).is_err() {
+        return false;
+    }
+    let Ok(Some(tickets)) = turn.retained_ingress_mut(owner) else { return false };
+    if tickets.try_reserve(1).is_err() { return false; }
+    let Ok(ticket) = crate::spawn_hosts::shared_ingress::owner::runtime::
+        defer_hosted_delivery_for_queued_callback(reply, badge, permit)
+    else { return false };
+    tickets.push(ticket);
+    true
+}
+
+unsafe fn transfer_selected_queued_callback_ingress(
+    current: &mut Vec<RootQueuedCallbackTurn>,
+) -> bool {
+    for turn in current.iter_mut() {
+        let owner = turn.owner();
+        let Ok(Some(tickets)) = turn.retained_ingress_mut(owner) else { return false };
+        tickets.retain(|ticket| unsafe {
+            !crate::spawn_hosts::shared_ingress::owner::runtime::
+                deferred_queued_ingress_selected(ticket)
+        });
+    }
+    true
+}
+
+unsafe fn settle_parked_queued_callback_turn(
+    current: &mut Vec<RootQueuedCallbackTurn>,
+) -> bool {
+    while let Some(turn) = current.last() {
+        let owner = turn.owner();
+        if !crate::driver_launch::queued_callback_root_retired(owner) { break; }
+        let tickets = match turn.retained_ingress(owner) {
+            Ok(Some(tickets)) => tickets,
+            _ => {
+                trace_queued_callback_root_failure("retired-ingress-missing", current, None);
+                return false;
+            }
+        };
+        if tickets.iter().any(|ticket|
+            !crate::spawn_hosts::shared_ingress::owner::runtime::
+                deferred_parked_ingress_is_exact(ticket))
+        {
+            trace_queued_callback_root_failure("retired-ticket-inexact", current, None);
+            return false;
+        }
+        let turn = current.pop().expect("watched callback turn");
+        if !crate::driver_launch::consume_queued_callback_root_retirement(owner) {
+            current.push(turn);
+            trace_queued_callback_root_failure("consume-retirement", current, None);
+            return false;
+        }
+        if let Err(turn) = turn.settle(owner) {
+            current.push(turn);
+            trace_queued_callback_root_failure("settle-turn", current, None);
+            return false;
+        }
+    }
+    if !crate::driver_launch::unsettled_queued_callback() {
+        if !current.is_empty() {
+            trace_queued_callback_root_failure("orphaned-turn", current, None);
+            return false;
+        }
+        ROOT_QUEUED_CALLBACK_RETRY_DEADLINE.store(u64::MAX, Ordering::Release);
+        ROOT_QUEUED_CALLBACK_EXCLUSIVE.store(false, Ordering::Release);
+    }
+    true
+}
+
+fn ready_flat_root_add_device(handler: &ExecNtHandler) -> Option<RootAddDeviceOwner> {
+    let starts = &handler.pending_driver_starts;
+    for slot in handler.pending_driver_starts.occupied_slots() {
+        let pending = starts.get(slot)?;
+        // A Ready boot batch can still be ordered behind an earlier enumerator. The
+        // selected root pass must not repeatedly choose that row ahead of an eligible
+        // sibling or rebalance restart. General redrive handles an uncertain predecessor.
+        if pending.bootstrap_predecessors.iter().any(|predecessor| {
+            starts.get_exact(*predecessor).is_some_and(|older| {
+                matches!(&older.owner, PendingDriverStartOwner::Boot { .. })
+            })
+        }) {
+            continue;
+        }
+        if pending.batch.ready_for_flat_root_add_device() {
+            return Some(RootAddDeviceOwner::DriverStart(pending.reservation));
+        }
+    }
+    for slot in handler.pending_pnp_operations.occupied_slots() {
+        let pending = handler.pending_pnp_operations.get(slot)?;
+        if let OwnedPendingPnpOperation::Rebalance(batch) = &pending.operation {
+            if batch.ready_for_flat_root_add_device() {
+                return Some(RootAddDeviceOwner::PnpRebalance(pending.reservation));
+            }
+        }
+    }
+    None
+}
+
+fn root_add_device_still_parked(handler: &ExecNtHandler, owner: RootAddDeviceOwner) -> bool {
+    match owner {
+        RootAddDeviceOwner::DriverStart(reservation) => handler.pending_driver_starts
+            .get_exact(reservation).is_some_and(|pending|
+                pending.batch.wait_stage() == hosted_pnp_start::HostedPnpWaitStage::AddDevice),
+        RootAddDeviceOwner::PnpRebalance(reservation) => handler.pending_pnp_operations
+            .get_exact(reservation).is_some_and(|pending| match &pending.operation {
+                OwnedPendingPnpOperation::Rebalance(batch) => batch.add_device_wait_stage(),
+                OwnedPendingPnpOperation::Removal(_) => false,
+            }),
+    }
+}
+
+fn root_add_device_owner_exact_present(
+    handler: &ExecNtHandler,
+    owner: RootAddDeviceOwner,
+) -> bool {
+    match owner {
+        RootAddDeviceOwner::DriverStart(reservation) =>
+            handler.pending_driver_starts.get_exact(reservation).is_some(),
+        RootAddDeviceOwner::PnpRebalance(reservation) =>
+            handler.pending_pnp_operations.get_exact(reservation).is_some(),
+    }
+}
+
+fn root_add_device_retry_without_new_child(
+    handler: &ExecNtHandler, owner: RootAddDeviceOwner,
+) -> bool {
+    match owner {
+        RootAddDeviceOwner::DriverStart(reservation) => handler.pending_driver_starts
+            .get_exact(reservation).is_some_and(|pending|
+                pending.batch.retry_add_device_without_new_child()),
+        RootAddDeviceOwner::PnpRebalance(reservation) => handler.pending_pnp_operations
+            .get_exact(reservation).is_some_and(|pending| match &pending.operation {
+                OwnedPendingPnpOperation::Rebalance(batch) =>
+                    batch.retry_add_device_without_new_child(),
+                OwnedPendingPnpOperation::Removal(_) => false,
+            }),
+    }
+}
+
+fn root_add_device_probe_bits(handler: &ExecNtHandler, owner: RootAddDeviceOwner) -> u64 {
+    match owner {
+        RootAddDeviceOwner::DriverStart(reservation) => handler.pending_driver_starts
+            .get_exact(reservation).map_or(0, |pending|
+                pending.batch.root_add_device_probe_bits()),
+        RootAddDeviceOwner::PnpRebalance(reservation) => handler.pending_pnp_operations
+            .get_exact(reservation).map_or(0, |pending| match &pending.operation {
+                OwnedPendingPnpOperation::Rebalance(batch) => batch.root_add_device_probe_bits(),
+                OwnedPendingPnpOperation::Removal(_) => 0,
+            }),
+    }
+}
+
+fn root_add_device_needs_child_step(
+    handler: &ExecNtHandler, owner: RootAddDeviceOwner,
+) -> bool {
+    match owner {
+        RootAddDeviceOwner::DriverStart(reservation) => handler.pending_driver_starts
+            .get_exact(reservation).is_some_and(|pending|
+                pending.batch.needs_add_device_child_step()),
+        RootAddDeviceOwner::PnpRebalance(reservation) => handler.pending_pnp_operations
+            .get_exact(reservation).is_some_and(|pending| match &pending.operation {
+                OwnedPendingPnpOperation::Rebalance(batch) =>
+                    batch.needs_add_device_child_step(),
+                OwnedPendingPnpOperation::Removal(_) => false,
+            }),
+    }
+}
+
+unsafe fn redrive_flat_root_add_device_selected(
+    handler: &mut ExecNtHandler, owner: RootAddDeviceOwner,
+) -> u64 {
+    match owner {
+        RootAddDeviceOwner::DriverStart(reservation) =>
+            pending_driver_start_redrive_flat_root_selected(handler, reservation),
+        RootAddDeviceOwner::PnpRebalance(reservation) =>
+            pending_pnp_operation_redrive_flat_root_selected(handler, reservation),
+    }
+}
+
+/// Run at most one certified nested File step for an exact retained AddDevice batch. Its
+/// Ready cursor cannot retire during this step: redrive waits until the receipt is deposited.
+unsafe fn run_one_pending_add_device_child_step(
+    handler: *mut ExecNtHandler,
+) -> Result<Option<(RootAddDeviceOwner, bool)>, ()> {
+    let selected = {
+        let table = &(*handler).pending_driver_starts;
+        table.occupied_slots().find_map(|slot| {
+            let pending = table.get(slot)?;
+            (pending.batch.wait_stage() == hosted_pnp_start::HostedPnpWaitStage::AddDevice)
+                .then_some((slot, pending.reservation,
+                    pending.batch.needs_add_device_child_step()))
+        })
+    };
+    if let Some((slot, reservation, needs_child)) = selected {
+        let owner = RootAddDeviceOwner::DriverStart(reservation);
+        if !needs_child { return Ok(Some((owner, false))) }
+        let step = drive_one_nested_file_child_step();
+        let ran_child = step.ran_child();
+        let pending = (*handler).pending_driver_starts.get_mut(slot)
+            .filter(|pending| pending.reservation == reservation)
+            .expect("selected AddDevice batch cannot retire before its child receipt is deposited");
+        return match pending.batch.record_add_device_child_step(step) {
+            Ok(crate::hosted_pnp_start::AddDeviceStepDeposit::Recorded) =>
+                Ok(Some((owner, ran_child))),
+            Ok(crate::hosted_pnp_start::AddDeviceStepDeposit::Quarantined) => Err(()),
+            Err(_) => unreachable!("exact AddDevice batch refused its selected child receipt"),
+        };
+    }
+    let selected = {
+        let table = &(*handler).pending_pnp_operations;
+        table.occupied_slots().find_map(|slot| {
+            let pending = table.get(slot)?;
+            let OwnedPendingPnpOperation::Rebalance(batch) = &pending.operation else {
+                return None;
+            };
+            batch.add_device_wait_stage().then_some((slot, pending.reservation,
+                batch.needs_add_device_child_step()))
+        })
+    };
+    let Some((slot, reservation, needs_child)) = selected else { return Ok(None) };
+    let owner = RootAddDeviceOwner::PnpRebalance(reservation);
+    if !needs_child { return Ok(Some((owner, false))) }
+    let step = drive_one_nested_file_child_step();
+    let ran_child = step.ran_child();
+    let pending = (*handler).pending_pnp_operations.get_mut(slot)
+        .filter(|pending| pending.reservation == reservation)
+        .expect("selected rebalance AddDevice cannot retire before its child receipt is deposited");
+    let OwnedPendingPnpOperation::Rebalance(batch) = &mut pending.operation else {
+        unreachable!("exact rebalance AddDevice changed operation kind");
+    };
+    match batch.record_add_device_child_step(step) {
+        Ok(crate::hosted_pnp_start::AddDeviceStepDeposit::Recorded) =>
+            Ok(Some((owner, ran_child))),
+        Ok(crate::hosted_pnp_start::AddDeviceStepDeposit::Quarantined) => Err(()),
+        Err(_) => unreachable!("exact rebalance AddDevice refused its selected child receipt"),
+    }
+}
+
+/// Settle every inner CONNECT owner before an AddDevice parent or unrelated provider resumes.
+/// Each selected child has one sealed observation. An empty local pass is retryable only after
+/// the exact selector and its observation are deposited back in the CONNECT owner.
+enum ConnectPumpSettlement {
+    Settled,
+    AwaitingLocalChild,
+    /// A retryable physical restore or scheduler yield still owns its original Reply.
+    RetryableRestore,
+    Retained,
+    Blocked,
+}
+
+/// Capped root checkpoint around CONNECT, queue, and Hook settlement. This reads only
+/// owner readiness; no provider or shared-ring operation is issued by the probe.
+/// Stages: 0 CONNECT redrive entry, 1 CONNECT redrive returned,
+/// 2 CONNECT settled, 3 queue settled,
+/// 4 Hook redrive entry, 5 Hook redrive returned. Settlement: 0 none,
+/// 1 settled, 2 awaiting child, 3 retained, 4 blocked.
+unsafe fn trace_connect_root_checkpoint(
+    stage: u64, settlement: Option<&ConnectPumpSettlement>,
+) {
+    static ARMED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    static COUNT: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    if !ARMED.load(core::sync::atomic::Ordering::Relaxed) {
+        let connect_owner = crate::driver_launch::hosted_connect_pending_reply_published();
+        if !connect_owner { return; }
+        ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+    if COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 128 { return; }
+    let settlement = match settlement {
+        None => 0,
+        Some(ConnectPumpSettlement::Settled) => 1,
+        Some(ConnectPumpSettlement::AwaitingLocalChild) => 2,
+        Some(ConnectPumpSettlement::RetryableRestore) => 5,
+        Some(ConnectPumpSettlement::Retained) => 3,
+        Some(ConnectPumpSettlement::Blocked) => 4,
+    };
+    print_str(b"[connect-root-checkpoint] stage/settlement/hook-ready/queue-held/file-held=");
+    print_u64(stage); print_str(b"/");
+    print_u64(settlement); print_str(b"/");
+    print_u64(u64::from(crate::driver_launch::nested_hosted_hook_forward_ready()));
+    print_str(b"/");
+    print_u64(u64::from(crate::driver_launch::unsettled_queued_callback()));
+    print_str(b"/");
+    print_u64(u64::from(crate::driver_launch::generic_file_pump_unsettled()));
+    print_str(b"\n");
+}
+
+// Stages: 1 recorded pump result (0 no work, 1 returned, 2 yielded,
+// 3 retained, 4 blocked), 2 settlement (1 settled, 2 awaiting, 3 retained,
+// 4 blocked), 3 AddDevice still-parked/awaiting-child/ran-child bits,
+// 4 parked receive prepared, 5 native AddDevice continuation bits, 6 CONNECT
+// origin bits. Phase comes from the live CONNECT owner.
+unsafe fn trace_connect_add_device_boundary(stage: u64, detail: u64) {
+    static COUNT: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    if !crate::driver_launch::hosted_connect_pending_reply_published() { return; }
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 32 { return; }
+    print_str(b"[connect-add-device] stage/detail/phase/unsettled=");
+    print_u64(stage); print_str(b"/"); print_u64(detail); print_str(b"/");
+    print_u64(crate::driver_launch::hosted_connect_root_probe_phase()); print_str(b"/");
+    print_u64(u64::from(crate::driver_launch::unsettled_suspended_connect_pump()));
+    print_str(b"\n");
+}
+
+unsafe fn trace_connect_pump_progress(progress: &crate::driver_launch::PortConnectPumpProgress) {
+    use crate::driver_launch::PortConnectPumpProgress as Progress;
+    let code = match progress {
+        Progress::NoWork => 0, Progress::Returned => 1, Progress::Yielded => 2,
+        Progress::Retained => 3, Progress::Blocked => 4,
+    };
+    trace_connect_add_device_boundary(1, code);
+}
+
+unsafe fn settle_suspended_connect_pumps() -> ConnectPumpSettlement {
+    let result = settle_suspended_connect_pumps_inner();
+    let code = match &result {
+        ConnectPumpSettlement::Settled => 1,
+        ConnectPumpSettlement::AwaitingLocalChild => 2,
+        ConnectPumpSettlement::RetryableRestore => 5,
+        ConnectPumpSettlement::Retained => 3,
+        ConnectPumpSettlement::Blocked => 4,
+    };
+    trace_connect_add_device_boundary(2, code);
+    result
+}
+
+unsafe fn settle_suspended_connect_pumps_inner() -> ConnectPumpSettlement {
+    use crate::driver_launch::PortConnectPumpProgress as Progress;
+    crate::driver_launch::trace_port_connect_root_probe(80, 0);
+    loop {
+        // A CONNECT child can enter a queued callback before its File/Hook source
+        // publishes. That callback's physical Reply must settle first.
+        match settle_queued_callbacks() {
+            ConnectPumpSettlement::Settled => {}
+            other => return other,
+        }
+        if let Some(selector) = crate::driver_launch::recorded_suspended_connect_pump() {
+            match settle_suspended_file_pumps() {
+                ConnectPumpSettlement::Settled => {}
+                other => return other,
+            }
+            let progress = crate::driver_launch::redrive_recorded_connect_pump(selector);
+            trace_connect_pump_progress(&progress);
+            match progress {
+                Progress::Blocked => return ConnectPumpSettlement::Blocked,
+                Progress::Retained => return ConnectPumpSettlement::Retained,
+                Progress::NoWork | Progress::Returned | Progress::Yielded => continue,
+            }
+        }
+        match crate::driver_launch::redrive_retryable_connect_pump() {
+            Progress::Blocked => return ConnectPumpSettlement::Blocked,
+            Progress::Retained => return ConnectPumpSettlement::Retained,
+            Progress::NoWork | Progress::Returned | Progress::Yielded => {}
+        }
+        let Some(selector) = crate::driver_launch::claim_suspended_port_connect_pump()
+        else { break };
+        crate::driver_launch::trace_port_connect_root_probe(81, 1);
+        let step = drive_one_nested_file_child_step();
+        let ran_child = step.ran_child();
+        crate::driver_launch::trace_port_connect_root_probe(82, u64::from(ran_child));
+        // The child receipt is move-only. The CONNECT Work must own it before any
+        // inner Hook settlement can yield or refuse a root turn.
+        match crate::driver_launch::record_suspended_connect_pump_child_step(selector, step) {
+            Progress::Retained => {}
+            Progress::Blocked => return ConnectPumpSettlement::Blocked,
+            _ => return ConnectPumpSettlement::Retained,
+        }
+        // A reverse Hook can itself yield a nested File pump. Its exact invocation and
+        // mutable Type3 input belong to that Hook owner, so settle it at the flat root
+        // before restoring this CONNECT parent's physical Reply.
+        let inner_settlement = settle_suspended_file_pumps();
+        crate::driver_launch::trace_port_connect_root_probe(83, match inner_settlement {
+            ConnectPumpSettlement::Settled => 0,
+            ConnectPumpSettlement::AwaitingLocalChild => 1,
+            ConnectPumpSettlement::RetryableRestore => 4,
+            ConnectPumpSettlement::Retained => 2,
+            ConnectPumpSettlement::Blocked => 3,
+        });
+        match inner_settlement {
+            ConnectPumpSettlement::Settled => {}
+            ConnectPumpSettlement::AwaitingLocalChild =>
+                return ConnectPumpSettlement::AwaitingLocalChild,
+            ConnectPumpSettlement::RetryableRestore =>
+                return ConnectPumpSettlement::RetryableRestore,
+            ConnectPumpSettlement::Retained => return ConnectPumpSettlement::Retained,
+            ConnectPumpSettlement::Blocked => return ConnectPumpSettlement::Blocked,
+        }
+        let progress = crate::driver_launch::redrive_recorded_connect_pump(selector);
+        trace_connect_pump_progress(&progress);
+        match progress {
+            Progress::Blocked => return ConnectPumpSettlement::Blocked,
+            Progress::Retained => return ConnectPumpSettlement::Retained,
+            Progress::Yielded if !ran_child => return ConnectPumpSettlement::AwaitingLocalChild,
+            Progress::NoWork | Progress::Returned | Progress::Yielded => {}
+        }
+    }
+    if crate::driver_launch::unsettled_suspended_connect_pump() {
+        ConnectPumpSettlement::Retained
+    } else {
+        ConnectPumpSettlement::Settled
+    }
+}
+
+/// Run every nested Hook File child after its caller's stack has unwound. A claimed parent
+/// retains its one-use child observation while a newer Hook pump settles; retry resumes only
+/// that recorded parent and never redispatches its original IRP.
+fn trace_hook_root_boundary(stage: u64) {
+    static COUNT: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    if COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 64 { return; }
+    print_str(b"[hook-root-boundary] stage=");
+    print_u64(stage);
+    print_str(b"\n");
+}
+
+unsafe fn settle_suspended_file_pumps() -> ConnectPumpSettlement {
+    // A queued callback may be the child of a File pump. Its receipt must settle before
+    // the older File parent resumes. Recheck the newest exact queue row after every File
+    // transition because that transition can itself create another callback.
+    for _ in 0..512 {
+        match settle_queued_callback_turn() {
+            FilePumpTurn::Progressed => continue,
+            FilePumpTurn::AwaitingLocalChild =>
+                return ConnectPumpSettlement::AwaitingLocalChild,
+            FilePumpTurn::RetryableRestore =>
+                return ConnectPumpSettlement::RetryableRestore,
+            FilePumpTurn::Retained => return ConnectPumpSettlement::Retained,
+            FilePumpTurn::Blocked => return ConnectPumpSettlement::Blocked,
+            FilePumpTurn::Settled => {}
+        }
+        match settle_one_generic_file_pump_after(0) {
+            FilePumpTurn::Progressed => continue,
+            FilePumpTurn::AwaitingLocalChild =>
+                return ConnectPumpSettlement::AwaitingLocalChild,
+            FilePumpTurn::RetryableRestore =>
+                return ConnectPumpSettlement::RetryableRestore,
+            FilePumpTurn::Retained => return ConnectPumpSettlement::Retained,
+            FilePumpTurn::Blocked => return ConnectPumpSettlement::Blocked,
+            FilePumpTurn::Settled => return if crate::driver_launch::hook_source_unsettled() {
+                ConnectPumpSettlement::Retained
+            } else {
+                ConnectPumpSettlement::Settled
+            },
+        }
+    }
+    // Every owner and one-use receipt remains in its durable row; no provider is replayed
+    // after this per-turn progress bound.
+    ConnectPumpSettlement::Retained
+}
+
+enum FilePumpTurn {
+    Progressed,
+    Settled,
+    AwaitingLocalChild,
+    /// The selected callback is durable and may retry after a root timer/IRQ receive.
+    RetryableRestore,
+    Retained,
+    Blocked,
+}
+
+/// Settle only one queued callback transition. Its File floor is captured before native
+/// callback entry, so an older File parent stays parked until this callback completes.
+unsafe fn settle_queued_callback_turn() -> FilePumpTurn {
+    use crate::driver_launch::{QueuedCallbackProgress as Progress,
+        QueuedCallbackRootAction as Action};
+    let Some(action) = crate::driver_launch::queued_callback_root_action() else {
+        return if crate::driver_launch::unsettled_queued_callback() {
+            FilePumpTurn::Retained
+        } else {
+            FilePumpTurn::Settled
+        };
+    };
+    let selector = match action {
+        Action::NeedsChild(selector) => {
+            let step = drive_one_nested_file_child_step();
+            return match crate::driver_launch::record_queued_callback_child_step(selector, step) {
+                Progress::RecordedStep => FilePumpTurn::Progressed,
+                Progress::AwaitingLocalChild => FilePumpTurn::AwaitingLocalChild,
+                Progress::Blocked => FilePumpTurn::Blocked,
+                _ => FilePumpTurn::Retained,
+            };
+        }
+        Action::ResumeRecordedStep(selector) | Action::RetryRestore(selector)
+        | Action::RetryTerminalAck(selector) => selector,
+    };
+    let Some(floor) = crate::driver_launch::queued_callback_file_floor(selector) else {
+        return FilePumpTurn::Retained;
+    };
+    match settle_one_generic_file_pump_after(floor) {
+        FilePumpTurn::Progressed => return FilePumpTurn::Progressed,
+        FilePumpTurn::Settled => {}
+        other => return other,
+    }
+    // The File transition may have created a newer callback. Only the same exact row may
+    // resume; a different selected row must first settle in physical LIFO order.
+    if crate::driver_launch::queued_callback_root_action() != Some(action) {
+        return FilePumpTurn::Progressed;
+    }
+    match crate::driver_launch::resume_queued_callback_after_file_settlement(selector) {
+        Progress::Completed | Progress::TerminalFailure(_) | Progress::NeedsChild =>
+            FilePumpTurn::Progressed,
+        Progress::RecordedStep | Progress::InnerFilePending => FilePumpTurn::Retained,
+        Progress::AwaitingLocalChild => FilePumpTurn::AwaitingLocalChild,
+        Progress::PendingRestore => FilePumpTurn::RetryableRestore,
+        Progress::PendingTerminalAck => FilePumpTurn::Retained,
+        Progress::Blocked => FilePumpTurn::Blocked,
+    }
+}
+
+/// A queue-only pass is used before ordinary CONNECT/Hook redrives. It does not inspect an
+/// unrelated Hook source that can only finish after its own parent has resumed.
+unsafe fn settle_queued_callbacks() -> ConnectPumpSettlement {
+    for _ in 0..512 {
+        match settle_queued_callback_turn() {
+            FilePumpTurn::Progressed => continue,
+            FilePumpTurn::Settled => return ConnectPumpSettlement::Settled,
+            FilePumpTurn::AwaitingLocalChild =>
+                return ConnectPumpSettlement::AwaitingLocalChild,
+            FilePumpTurn::RetryableRestore => return ConnectPumpSettlement::RetryableRestore,
+            FilePumpTurn::Retained => return ConnectPumpSettlement::Retained,
+            FilePumpTurn::Blocked => return ConnectPumpSettlement::Blocked,
+        }
+    }
+    ConnectPumpSettlement::Retained
+}
+
+/// Advance one generic File owner, then return to the queue selector before any other
+/// File parent can resume. A selected child receipt is deposited before this function
+/// returns, including when the child creates another queued callback.
+unsafe fn settle_one_generic_file_pump_after(floor: u64) -> FilePumpTurn {
+    use crate::driver_launch::GenericFilePumpDrive as Progress;
+    {
+        static COUNT: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        let returned = crate::driver_launch::returned_hook_pump_ready();
+        let generic = crate::driver_launch::generic_file_pump_unsettled();
+        let source = crate::driver_launch::hook_source_unsettled();
+        if crate::driver_launch::hosted_hook_port_waiting()
+            && COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 256
+        {
+            print_str(b"[hook-root-settle] returned/generic/source=");
+            print_u64(u64::from(returned)); print_str(b"/");
+            print_u64(u64::from(generic)); print_str(b"/");
+            print_u64(u64::from(source)); print_str(b"\n");
+        }
+    }
+    // A queued callback's floor excludes its older File/Hook parent. Source rows keep
+    // their exact File owner ID even after the File row retires.
+    if crate::driver_launch::returned_hook_pump_ready_after(floor) {
+        return if crate::driver_launch::redrive_returned_hook_pump_after(floor) {
+            FilePumpTurn::Progressed
+        } else {
+            FilePumpTurn::Retained
+        };
+    }
+    let (progress, deposited) = if let Some(selector) =
+        crate::driver_launch::claim_suspended_generic_file_pump_after(floor)
+    {
+        let step = drive_one_nested_file_child_step();
+        (crate::driver_launch::record_suspended_generic_file_pump_child_step(selector, step), true)
+    } else if let Some(selector) =
+        crate::driver_launch::recorded_suspended_generic_file_pump_after(floor)
+    {
+        (crate::driver_launch::redrive_recorded_generic_file_pump(selector), false)
+    } else {
+        (crate::driver_launch::redrive_retryable_generic_file_pump_after(floor), false)
+    };
+    match progress {
+        Progress::NoWork if crate::driver_launch::generic_file_pump_unsettled_after(floor)
+            || crate::driver_launch::hook_source_unsettled_after(floor) =>
+            FilePumpTurn::Retained,
+        Progress::NoWork => FilePumpTurn::Settled,
+        Progress::Returned | Progress::Pending | Progress::Yielded => FilePumpTurn::Progressed,
+        // A successful deposit returns Retained while the sealed receipt is held by the
+        // row. It is progress, not a restore refusal.
+        Progress::Retained if deposited => FilePumpTurn::Progressed,
+        Progress::Retained => FilePumpTurn::Retained,
+        Progress::AwaitingLocalChild => FilePumpTurn::AwaitingLocalChild,
+        Progress::Blocked => FilePumpTurn::Blocked,
+    }
+}
+
 unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
+    pending_driver_start_redrive_selected(nt_handler, None, false)
+}
+
+unsafe fn pending_driver_start_redrive_flat_root_selected(
+    nt_handler: &mut ExecNtHandler,
+    reservation: nt_driver_start::PendingOperationReservation,
+) -> u64 {
+    pending_driver_start_redrive_selected(nt_handler, Some(reservation), true)
+}
+
+/// The root can settle only a selected parked AddDevice batch before any unrelated start row.
+/// Ordinary completion redrive uses the same terminal publication logic with no selector.
+unsafe fn pending_driver_start_redrive_selected(
+    nt_handler: &mut ExecNtHandler,
+    selected: Option<nt_driver_start::PendingOperationReservation>,
+    flat_root_add_device_permit: bool,
+) -> u64 {
     let mut completed = 0u64;
     for slot in 0..nt_handler.pending_driver_starts.slot_count() {
+        if selected.is_some_and(|reservation| nt_handler.pending_driver_starts
+            .get(slot).is_none_or(|pending| pending.reservation != reservation))
+        {
+            continue;
+        }
         let bootstrap_barrier = {
             let table = &nt_handler.pending_driver_starts;
             let Some(pending) = table.get(slot) else {
                 continue;
             };
-            if !matches!(&pending.owner, PendingDriverStartOwner::Boot { .. }) {
+            if selected.is_some()
+                && pending.batch.wait_stage() == hosted_pnp_start::HostedPnpWaitStage::AddDevice
+            {
+                // This exact AddDevice has already entered native code. A predecessor may
+                // affect later START policy, but cannot revoke its physical Reply owner.
+                0u8
+            } else if !matches!(&pending.owner, PendingDriverStartOwner::Boot { .. }) {
                 0u8
             } else if pending.bootstrap_predecessors.iter().any(|predecessor| {
                 table.get_exact(*predecessor).is_some_and(|older| {
@@ -24883,6 +29956,13 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
             }
         };
         if bootstrap_barrier == 1 {
+            if let Some(pending) = nt_handler.pending_driver_starts.get_mut(slot) {
+                trace_pending_driver_start_wait(
+                    slot,
+                    pending,
+                    hosted_pnp_start::HostedPnpWaitStage::BootstrapPredecessor,
+                );
+            }
             continue;
         }
         let progress = {
@@ -24894,11 +29974,20 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
                     nt_status::NtStatus::INVALID_DEVICE_REQUEST,
                 )
             } else {
-                pending.batch.drive_after_completion_pump()
+                if flat_root_add_device_permit {
+                    pending.batch.drive_flat_root_add_device()
+                } else {
+                    pending.batch.drive_after_completion_pump()
+                }
             }
         };
         match progress {
-            OwnedHostedPnpStartProgress::AwaitingCompletion => {}
+            OwnedHostedPnpStartProgress::AwaitingCompletion => {
+                if let Some(pending) = nt_handler.pending_driver_starts.get_mut(slot) {
+                    let stage = pending.batch.wait_stage();
+                    trace_pending_driver_start_wait(slot, pending, stage);
+                }
+            }
             OwnedHostedPnpStartProgress::Complete(result) => {
                 let status = match result {
                     Ok(_) => nt_status::NtStatus::SUCCESS.raw() as u32,
@@ -25026,13 +30115,53 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
 }
 
 unsafe fn pending_pnp_operation_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
+    pending_pnp_operation_redrive_selected(nt_handler, None, false)
+}
+
+unsafe fn pending_pnp_operation_redrive_flat_root_selected(
+    nt_handler: &mut ExecNtHandler,
+    reservation: nt_driver_start::PendingOperationReservation,
+) -> u64 {
+    pending_pnp_operation_redrive_selected(nt_handler, Some(reservation), true)
+}
+
+unsafe fn pending_pnp_operation_redrive_selected(
+    nt_handler: &mut ExecNtHandler,
+    selected: Option<nt_driver_start::PendingOperationReservation>,
+    flat_root_add_device_permit: bool,
+) -> u64 {
     let mut completed = 0u64;
     for slot in 0..nt_handler.pending_pnp_operations.slot_count() {
+        if selected.is_some_and(|reservation| nt_handler.pending_pnp_operations
+            .get(slot).is_none_or(|pending| pending.reservation != reservation))
+        {
+            continue;
+        }
         let progress = {
             let Some(pending) = nt_handler.pending_pnp_operations.get_mut(slot) else {
                 continue;
             };
-            pending.operation.drive_after_completion_pump()
+            if flat_root_add_device_permit {
+                match &mut pending.operation {
+                    OwnedPendingPnpOperation::Rebalance(batch) =>
+                        match batch.drive_flat_root_add_device() {
+                            OwnedHostedPnpRebalanceProgress::AwaitingCompletion =>
+                                OwnedPendingPnpOperationProgress::AwaitingCompletion,
+                            OwnedHostedPnpRebalanceProgress::Complete(result) =>
+                                OwnedPendingPnpOperationProgress::Complete(match result {
+                                    Ok(_) => nt_status::NtStatus::SUCCESS.raw() as u32,
+                                    Err(failure) => failure.status.raw() as u32,
+                                }),
+                            OwnedHostedPnpRebalanceProgress::OwnershipLost(failure) =>
+                                OwnedPendingPnpOperationProgress::OwnershipLost(
+                                    failure.status.raw() as u32),
+                        },
+                    OwnedPendingPnpOperation::Removal(_) =>
+                        unreachable!("flat root AddDevice selected removal"),
+                }
+            } else {
+                pending.operation.drive_after_completion_pump()
+            }
         };
         match progress {
             OwnedPendingPnpOperationProgress::AwaitingCompletion => {}
@@ -25081,14 +30210,20 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
         return 0;
     };
     let mut progress = 0u64;
-    let mut first_deferred = None;
     for _ in 0..8 {
         // A terminal bus START can queue its initial relations during the redrive above or
         // during an earlier iteration. Admit no sibling START before that query dispatches.
         if driver_launch::hosted_bus_relation_pending() {
             break;
         }
-        let claim = match driver_launch::claim_hosted_critical_child_start(mount.identity_token()) {
+        let claim = match driver_launch::claim_hosted_critical_child_start_ready(
+            mount.identity_token(),
+            |key, instance| !nt_handler.pending_driver_starts.occupied_slots().any(|slot| {
+                nt_handler.pending_driver_starts.get(slot).is_some_and(|pending| {
+                    pending.batch.owns_current_bus_child(instance, key.child().pdo_object_id())
+                })
+            }),
+        ) {
             Ok(Some(claim)) => claim,
             Ok(None) => break,
             Err(nt_pnp_manager::CriticalChildStartError::StalePublication) => {
@@ -25097,12 +30232,6 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
             }
             Err(_) => break,
         };
-        // A deferred owner moves to the tail. Stop after one pass over the current queue
-        // rather than reclaiming the same pending batch repeatedly in this pump.
-        if first_deferred == Some(claim.key()) {
-            driver_launch::defer_hosted_critical_child_start(claim);
-            break;
-        }
         let instance = driver_launch::hosted_critical_child_instance_id(claim)
             .expect("critical child claim lost its instance identity");
         print_str(b"[pnp-critical-start] instance=");
@@ -25129,23 +30258,6 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
                 continue;
             }
             nt_pnp_manager::ExistingDeviceStartDisposition::RequiresAction => {}
-        }
-        if nt_handler.pending_driver_starts.occupied_slots().any(|slot| {
-            nt_handler
-                .pending_driver_starts
-                .get(slot)
-                .is_some_and(|pending| {
-                    pending.batch.owns_current_bus_child(
-                        instance,
-                        claim.key().child().pdo_object_id(),
-                    )
-                })
-        }) {
-            driver_launch::defer_hosted_critical_child_start(claim);
-            if first_deferred.is_none() {
-                first_deferred = Some(claim.key());
-            }
-            continue;
         }
         progress += 1;
         let spec = match live_config_existing_device_launch_spec(instance, SERVICE_DEMAND_START) {
@@ -25231,6 +30343,7 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
                         reservation,
                         bootstrap_predecessors: alloc::vec::Vec::new(),
                         owner: PendingDriverStartOwner::CriticalChild { claim: Some(claim) },
+                        observed_wait_stage: None,
                     },
                 ).expect("pending critical START rejected its pre-reserved continuation");
             }
@@ -25243,12 +30356,49 @@ unsafe fn start_committed_critical_children(nt_handler: &mut ExecNtHandler) -> u
                         reservation,
                         bootstrap_predecessors: alloc::vec::Vec::new(),
                         owner: PendingDriverStartOwner::CriticalChild { claim: None },
+                        observed_wait_stage: None,
                     },
                 ).expect("uncertain critical START lost its retained continuation");
             }
         }
     }
     progress
+}
+
+/// An exact native settlement may resolve a mounted backend after its first service pass.
+/// Admit one follow-up backend pass while all queue and provider borrows are released.
+fn service_mounted_native_blocks_and_redrive_backends() -> u64 {
+    let native_blocks = driver_launch::service_mounted_native_blocks() as u64;
+    if native_blocks == 0 { return 0; }
+    native_blocks.saturating_add(driver_launch::service_pending_file_backends() as u64)
+}
+
+/// Advance hosted I/O, driver, File, and LPC owners after the current syscall.
+/// Keep the original ordering and retry-flag claim.
+unsafe fn redrive_global_post_syscall_work(nt_handler: &mut ExecNtHandler) {
+    let _ = driver_launch::pump_hosted_file_lifecycle();
+    let hosted_io_progress = pump_hosted_io_and_redrive_driver_starts(
+        driver_launch::drain_hosted_driver_dpcs(),
+        nt_handler,
+    );
+    if hosted_io_progress != 0
+        || FILE_IO_DELIVERY_RETRY_PENDING.swap(false, Ordering::AcqRel)
+    {
+        let _ = pending_file_io_redrive_all(nt_handler);
+        let _ = file_cleanup_redrive_all(nt_handler);
+        let _ = driver_launch::pump_hosted_file_lifecycle();
+    }
+    if nt_handler.pipe_endpoint_progress || hosted_io_progress != 0 {
+        let _ = pending_file_io_redrive_all(nt_handler);
+    }
+    // Cancellation drains are ordered after the original IRP owners. A waiter becomes
+    // runnable only once generic/LISTEN publication has ACKed and removed every exact
+    // manager IRP for its File and requestor thread.
+    let _ = file_irp_drain_redrive_all(nt_handler);
+    if nt_handler.lpc_endpoint_progress {
+        let _ = lpc_endpoint_redrive_all(nt_handler);
+    }
+    let _ = lpc_connect_completion_drain(nt_handler);
 }
 
 // Callers execute DPCs before borrowing the handler and pass only the completed work count.
@@ -25258,20 +30408,43 @@ unsafe fn pump_hosted_io_and_redrive_driver_starts(
 ) -> u64 {
     let retired = driver_launch::drain_hosted_file_retirements();
     let video_retired = crate::video_device::drain_video_file_retirements();
+    let serviced = driver_launch::service_pending_file_backends() as u64;
+    let native_blocks = service_mounted_native_blocks_and_redrive_backends();
     let pumped = driver_launch::pump_hosted_io_completions() as u64;
     if crate::config_manager_take_device_action_wake() {
         nt_handler.pnp_signal_pending_action();
     }
-    let progress = activated
+    let mut progress = activated
         .saturating_add(retired)
         .saturating_add(video_retired)
+        .saturating_add(serviced)
+        .saturating_add(native_blocks)
         .saturating_add(pumped)
         .saturating_add(pending_driver_start_redrive_all(nt_handler))
         .saturating_add(start_committed_critical_children(nt_handler))
         .saturating_add(pending_pnp_operation_redrive_all(nt_handler));
+    // Deferred bus relations can load another boot-start driver after the initial plan loop.
+    // Dispatch boot callbacks only at a turn with no relation or START admission in flight;
+    // keep the boot phase open so a later exact registration is still owned and dispatched.
+    if !hosted_pnp_start::hosted_start_batch_drive_active()
+        && !driver_launch::hosted_bus_relation_pending()
+        && !driver_launch::hosted_critical_child_start_pending()
+        && nt_handler.pending_driver_starts.occupied_slots().next().is_none()
+        && nt_handler.pending_pnp_operations.occupied_slots().next().is_none()
+    {
+        progress = progress.saturating_add(
+            driver_launch::run_pending_boot_callbacks()
+                .expect("boot driver reinitialization lost its exact callback terminal") as u64,
+        );
+        progress = progress.saturating_add(
+            driver_launch::run_pending_ordinary_callbacks()
+                .expect("driver reinitialization lost its exact callback terminal") as u64,
+        );
+    }
     if progress != 0 {
         FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
     }
+    rearm_requested_mounted_native_timer(nt_handler);
     progress
 }
 
@@ -25480,10 +30653,29 @@ unsafe fn pending_file_io_transfer(
         panic!("pre-dispatch pending File reservation rejected its exact IRP");
     }
 
-    pending.native_call_transport = native_call_transport;
+    // A preparked Reply belongs to the original native caller, not the timer or ingress
+    // event that happens to redrive its File CREATE.
+    if pending.reply_cap == 0 {
+        pending.native_call_transport = native_call_transport;
+    }
     if !wait_for_completion {
+        assert_eq!(pending.reply_cap, 0, "nonwaiting File transfer retained a parked Reply");
         let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
         return commit_or_panic(table, reservation, pending, false);
+    }
+    if pending.reply_cap != 0 {
+        // The original caller already owns this saved Reply. A redriven CREATE must transfer
+        // that exact capability to its reserved File owner, leaving the current ingress Reply
+        // untouched. Validation also rejects an alias of the active main slot.
+        parked_reply::validate_saved(pending.reply_cap)
+            .expect("pending File transfer lost its preparked Reply");
+        assert!(pending.reply_required);
+        pending.resume_ip = resume_ip;
+        pending.resume_sp = sp;
+        pending.resume_flags = flags;
+        let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
+        commit_or_panic(table, reservation, pending, true);
+        return;
     }
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     assert_ne!(
@@ -25575,6 +30767,140 @@ unsafe fn pending_file_native_caller(
     handler.pm.capture_native_handle_caller(caller.thread(), nt_types::AccessMode::KernelMode)
 }
 
+static NEXT_FILE_MODE_INPUT_PAGE_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// A routed page worker returns only to the exact FileMode input owner which admitted it.
+/// The original Reply and File Busy remain in that row until normal terminal delivery.
+pub(crate) unsafe fn file_mode_input_page_completed(
+    identity: nt_io_manager::PendingFileIoIdentity, irp_id: u64, token: u64,
+    pi: usize, page: u64, status: u32,
+) -> bool {
+    let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
+    let exact = table.get_exact(identity).is_some_and(|pending| {
+        pending.irp_id == irp_id && pending.pi as usize == pi
+            && matches!(pending.operation,
+                nt_io_manager::PendingFileIoOperation::OwnedModeInputCapture(input)
+                if input.pending_token == token && input.pending_page == page)
+    });
+    if !exact || table.complete_mode_input_page_exact(identity, irp_id, page, token, status).is_none() {
+        return false;
+    }
+    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+    true
+}
+
+/// Return true only after input capture becomes terminal or mode precommit. The row was parked
+/// before this function can run; no routed source work is submitted by the native syscall entry.
+unsafe fn redrive_file_mode_input(
+    handler: &mut ExecNtHandler,
+    identity: nt_io_manager::PendingFileIoIdentity,
+    pending: nt_io_manager::PendingFileIo,
+) -> bool {
+    use nt_io_manager::PendingFileIoOperation::OwnedModeInputCapture;
+    let OwnedModeInputCapture(input) = pending.operation else { return true; };
+    macro_rules! table { () => { &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO) }; }
+    if input.pending_token != 0 { return false; }
+    if pending.consumer_abandoned || pending.reply_cap == 0 {
+        return table!().fail_mode_input_exact(identity, pending.irp_id, nt_fs::STATUS_CANCELLED).is_some();
+    }
+    let pi = pending.pi as usize;
+    let current = handler.capture_thread_process_identity(pi, pending.tid);
+    let caller_live = crate::pending_file_caller::caller(identity, pending)
+        .is_some_and(|caller| handler.validate_provider_logical_caller(caller));
+    if current.is_none() || !caller_live {
+        return table!().fail_mode_input_exact(identity, pending.irp_id, nt_fs::STATUS_INVALID_HANDLE).is_some();
+    }
+    let step = with_pagein_caller_target_context(
+        handler, pi, pi, pending.tid, pending.badge,
+        pending.resume_ip, pending.resume_sp, pending.resume_flags,
+        pending.native_call_transport, 0,
+        |handler| {
+            if !input.signal_reset {
+                let result = match pending.route {
+                    nt_io_manager::PendingFileRoute::Hosted(file_id) =>
+                        handler.file_completion.set_signaled(file_id, false),
+                    nt_io_manager::PendingFileRoute::Local(
+                        nt_io_manager::LocalFileObject::Overlay(file_object)) =>
+                        crate::writable_fs::set_file_signaled(file_object, false),
+                    _ => Err(nt_fs::STATUS_INVALID_HANDLE),
+                };
+                match result {
+                    Ok(()) => {
+                        if table!().mark_mode_input_signal_reset_exact(identity, pending.irp_id).is_none() {
+                            return false;
+                        }
+                        FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                        return false;
+                    }
+                    Err(status) => return table!().fail_mode_input_exact(identity, pending.irp_id, status).is_some(),
+                }
+            }
+            let Some(end) = input.input_va.checked_add(input.length as u64) else {
+                return table!().fail_mode_input_exact(identity, pending.irp_id,
+                    nt_address_space::STATUS_ACCESS_VIOLATION).is_some();
+            };
+            if input.next_page >= end {
+                let captured = handler.capture_file_mode_resident_input(input.input_va, input.length);
+                return match captured {
+                    Ok(requested_mode) => table!().finish_mode_input_capture_exact(
+                        identity, pending.irp_id, requested_mode).is_some(),
+                    Err(status) => table!().fail_mode_input_exact(identity, pending.irp_id, status).is_some(),
+                };
+            }
+            let page = input.next_page;
+            match handler.copy_page_admission(pi, page, nt_address_space::FaultAccess::Read) {
+                Ok(exec_handler::CopyPageAdmission::Resident) => {
+                    if table!().complete_mode_input_page_exact(identity, pending.irp_id, page, 0, 0).is_none() {
+                        return false;
+                    }
+                    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                    false
+                }
+                Err(status) => table!().fail_mode_input_exact(identity, pending.irp_id, status).is_some(),
+                Ok(exec_handler::CopyPageAdmission::NeedsRoutedPageIn) => {
+                    let Some(token) = NEXT_FILE_MODE_INPUT_PAGE_TOKEN.try_update(
+                        Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1)
+                    ).ok().filter(|token| *token != 0) else {
+                        return table!().fail_mode_input_exact(identity, pending.irp_id,
+                            nt_fs::STATUS_INSUFFICIENT_RESOURCES).is_some();
+                    };
+                    if table!().begin_mode_input_page_exact(identity, pending.irp_id, page, token).is_none() {
+                        return false;
+                    }
+                    let info = handler.query_memory_basic_information(pi, page);
+                    let result = match info.map(|info| info.type_) {
+                        Ok(nt_address_space::MEM_MAPPED) =>
+                            crate::section_pagein_work::submit_for_file_mode_input(
+                                handler, pi, page, pending.reply_cap, identity, pending.irp_id, token)
+                                .map(Some),
+                        Ok(nt_address_space::MEM_IMAGE) =>
+                            crate::native_image_pagein_work::submit_for_file_mode_input(
+                                handler, pi, page, pending.reply_cap, identity, pending.irp_id, token),
+                        Ok(_) => Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES),
+                        Err(status) => Err(status),
+                    };
+                    match result {
+                        Ok(Some(_)) => false,
+                        Ok(None) => {
+                            if table!().abort_unentered_mode_input_page_exact(identity, pending.irp_id, page, token).is_some() {
+                                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                            }
+                            false
+                        }
+                        Err(status) => {
+                            if table!().abort_unentered_mode_input_page_exact(identity, pending.irp_id, page, token).is_none() {
+                                return false;
+                            }
+                            table!().fail_mode_input_exact(identity, pending.irp_id, status).is_some()
+                        }
+                    }
+                }
+            }
+        });
+    step.unwrap_or_else(|| table!().fail_mode_input_exact(identity, pending.irp_id,
+        nt_fs::STATUS_INVALID_HANDLE).is_some())
+}
+
 /// Publish terminal results for general pending File IRPs in NT completion order. The backend
 /// completion remains retained until every required surface and synchronous reply is visible.
 unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
@@ -25652,6 +30978,17 @@ unsafe fn pending_file_io_redrive_pass(
             .get_exact(identity).filter(|live| live.irp_id == pending.irp_id)
         else { continue; };
         pending = live;
+        if matches!(pending.operation,
+            nt_io_manager::PendingFileIoOperation::OwnedModeInputCapture(_))
+        {
+            if !redrive_file_mode_input(nt_handler, identity, pending) {
+                continue;
+            }
+            let Some(live) = (&*core::ptr::addr_of!(PENDING_FILE_IO))
+                .get_exact(identity).filter(|live| live.irp_id == pending.irp_id)
+            else { continue; };
+            pending = live;
+        }
         if let nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(operation) = pending.operation {
             // The original input, File reference, Busy and Reply already belong to this row.
             // Preparation is no-effect on Busy; never re-enter the syscall or read user input.
@@ -25690,6 +31027,10 @@ unsafe fn pending_file_io_redrive_pass(
                 .get(id)
                 .and_then(|transaction| transaction.terminal_result())
         });
+        let attribute_inline_terminal = match pending.operation {
+            nt_io_manager::PendingFileIoOperation::AttributeQuery(operation) => operation.inline_terminal,
+            _ => None,
+        };
         // Once local output is committed, the I/O owner retains the terminal result even after
         // the FSD acknowledges its bytes. Later surface/reference retries must not re-query it.
         let local_terminal = if let Some(terminal) = pending.owned_terminal_result() {
@@ -25728,12 +31069,16 @@ unsafe fn pending_file_io_redrive_pass(
         {
             continue;
         }
-        if completed.is_none() && transaction_terminal.is_none() && local_terminal.is_none() {
+        if completed.is_none() && transaction_terminal.is_none()
+            && attribute_inline_terminal.is_none() && local_terminal.is_none() {
             if !pending.is_local() && driver_launch::completed_irp_copy_requires_retry(pending.irp_id) {
                 FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
             }
             continue;
         }
+        let is_pipe_transceive = !pending.is_local()
+            && pending.major == nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL
+            && pending.control_code == crate::exec_handler::FSCTL_PIPE_TRANSCEIVE;
         if let Some(completed) = completed {
             if !(&*core::ptr::addr_of!(PENDING_FILE_IO)).matches_completion_exact(
                 slot,
@@ -25744,10 +31089,34 @@ unsafe fn pending_file_io_redrive_pass(
             ) {
                 panic!("pending File completion identity mismatch");
             }
+            if pending.major == nt_io_abi::major::IRP_MJ_WRITE {
+                if let Some(file_id) = hosted_file_id {
+                    let _ = nt_handler.complete_install_pipe_write(
+                        pending.pi as usize, file_id, pending.irp_id,
+                        completed.status, completed.information,
+                    );
+                    nt_handler.complete_rpc_op6_client_write(
+                        pending.pi as usize, file_id, pending.irp_id,
+                        completed.status, completed.information,
+                    );
+                }
+            } else if is_pipe_transceive {
+                if let Some(file_id) = hosted_file_id {
+                    nt_handler.complete_rpc_op6_client_write(
+                        pending.pi as usize, file_id, pending.irp_id,
+                        completed.status, completed.information,
+                    );
+                }
+            }
+            pending_pipe_read_trace::terminal_observed(identity, pending.irp_id, completed.status);
+            mounted_read_lifetime_trace::terminal_observed(identity, pending.irp_id,
+                completed.status, completed.information);
+            mounted_installer_file_trace::terminal(identity, pending.irp_id, completed.status);
+            if pending.major == nt_io_abi::major::IRP_MJ_CREATE {
+                mounted_create_owner_trace::terminal_exact(identity, pending.irp_id,
+                    completed.file_id, completed.status);
+            }
         }
-        let is_pipe_transceive = !pending.is_local()
-            && pending.major == nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL
-            && pending.control_code == crate::exec_handler::FSCTL_PIPE_TRANSCEIVE;
         let is_pipe_listen = !pending.is_local()
             && pending.major == nt_io_abi::major::IRP_MJ_FILE_SYSTEM_CONTROL
             && pending.control_code == crate::exec_handler::FSCTL_PIPE_LISTEN;
@@ -25767,8 +31136,13 @@ unsafe fn pending_file_io_redrive_pass(
             .get_exact(identity).filter(|live| live.irp_id == pending.irp_id)
         else { continue; };
         pending = live;
-        let (sb, ss, smv, hmv, scratch_base) =
-            mirror_ctx_for(pending.badge, pending.pi as usize);
+        let Some((sb, ss, smv, hmv, scratch_base)) =
+            mirror_ctx_for(nt_handler, pending.badge, pending.pi as usize, pending.tid)
+        else {
+            // Terminal provider output and the parked Reply remain owned by this exact row.
+            // Do not acknowledge or publish either into a retired caller's address space.
+            continue;
+        };
         ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
         ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
         ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
@@ -25787,15 +31161,95 @@ unsafe fn pending_file_io_redrive_pass(
         let mut delivery_state = pending.delivery_state;
         let mut terminal_status = transaction_terminal
             .map(|result| result.0)
+            .or_else(|| attribute_inline_terminal.map(|result| result.0))
             .or_else(|| local_terminal.map(|result| result.0))
             .or_else(|| completed.map(|completion| completion.status))
             .expect("pending File owner has no terminal status");
         let mut terminal_information = transaction_terminal
             .map(|result| result.1)
+            .or_else(|| attribute_inline_terminal.map(|result| result.1))
             .or_else(|| local_terminal.map(|result| result.1))
             .or_else(|| completed.map(|completion| completion.information))
             .expect("pending File owner has no terminal information");
+        if let Some(file_id) = hosted_file_id {
+            if matches!(pending.major, nt_io_abi::major::IRP_MJ_READ | nt_io_abi::major::IRP_MJ_WRITE) {
+                let fs_context = driver_launch::hosted_file_route(file_id)
+                    .map_or(0, |(_, context)| context);
+                crate::exec_handler::trace_setup_scm_pipe_transition(
+                    b"terminal-seen", pending.pi as usize, pending.badge, pending.tid,
+                    None, file_id, fs_context, pending.irp_id, pending.major,
+                    terminal_status, terminal_information, pending.delivery_state,
+                    pending.reply_required,
+                );
+            }
+        }
         let mut backend_ack_required = completed.is_some();
+        if let nt_io_manager::PendingFileIoOperation::AttributeQuery(operation) = pending.operation {
+            if pending.major == nt_io_abi::major::IRP_MJ_CREATE {
+                let create = completed.expect("attribute CREATE lost its exact completion");
+                if driver_launch::acknowledge_completed_irp(pending.irp_id).is_err() {
+                    FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                    restore_file_io_mirrors!();
+                    continue;
+                }
+                let file_id = hosted_file_id.expect("attribute CREATE lost its File");
+                if (create.status as i32) < 0 {
+                    (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                        .complete_attribute_query_inline_owner_exact(identity, pending.irp_id,
+                            create.status, 0)
+                        .expect("attribute CREATE terminal lost owner");
+                } else {
+                    let mut output = [0u8; 56];
+                    let length = if operation.information_class == nt_fs::FILE_BASIC_INFORMATION {
+                        40usize
+                    } else { 56usize };
+                    let query = pending_file_native_caller(nt_handler, identity, pending)
+                        .and_then(|caller| driver_launch::dispatch_hosted_file_irp_result_exact(
+                            file_id, nt_io_abi::major::IRP_MJ_QUERY_INFORMATION as u64,
+                            operation.information_class as u64, caller, &[],
+                            &mut output[..length], 0));
+                    match query {
+                        Ok((status, _, Some(irp_id), _)) if status == nt_status::NtStatus::PENDING.raw() => {
+                            (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                                .retarget_attribute_query_owner_exact(identity, pending.irp_id,
+                                    irp_id.raw())
+                                .expect("attribute query lost CREATE owner");
+                            crate::exec_handler::smss_attribute_probe_trace::trace_smss_attribute_retarget(
+                                pending.pi, pending.tid, file_id, pending.irp_id, irp_id.raw(),
+                            );
+                        }
+                        result => {
+                            let (status, information) = match result {
+                                Ok((status, information, None, _)) if status >= 0 => {
+                                    if information != length as u64 {
+                                        (nt_fs::STATUS_DATA_ERROR, 0)
+                                    } else if nt_handler.xas_try_write_buf(pending.output_va,
+                                        &output[..length]) {
+                                        (status as u32, information)
+                                    } else { (0xC000_0005, 0) }
+                                }
+                                Ok((status, _, _, _)) => (status as u32, 0),
+                                Err(status) => (status, 0),
+                            };
+                            (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
+                                .complete_attribute_query_inline_owner_exact(identity, pending.irp_id,
+                                    status, information)
+                                .expect("inline attribute query lost CREATE owner");
+                        }
+                    }
+                }
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_file_io_mirrors!();
+                continue;
+            }
+            if pending.major == nt_io_abi::major::IRP_MJ_QUERY_INFORMATION
+                && (terminal_status as i32) >= 0
+                && terminal_information != u64::from(pending.output_len)
+            {
+                terminal_status = nt_fs::STATUS_DATA_ERROR;
+                terminal_information = 0;
+            }
+        }
         if pending.major == nt_io_abi::major::IRP_MJ_QUERY_INFORMATION {
             if let Some(transaction_id) = set_file_name_id {
                 let phase = (&*core::ptr::addr_of!(PENDING_SET_FILE_NAMES))
@@ -26133,6 +31587,17 @@ unsafe fn pending_file_io_redrive_pass(
                         publication.handle,
                     )
                     .expect("pending CREATE result could not be committed");
+                if (publication.status as i32) >= 0 && publication.handle != 0 {
+                    match pending.major {
+                        nt_io_abi::major::IRP_MJ_CREATE_NAMED_PIPE => {
+                            let _ = nt_handler.observe_install_pipe_server(pending.pi as usize, file_id);
+                        }
+                        nt_io_abi::major::IRP_MJ_CREATE => {
+                            let _ = nt_handler.observe_install_pipe_child(pending.pi as usize, file_id);
+                        }
+                        _ => {}
+                    }
+                }
                 if publication.wake_server_fid != 0 {
                     nt_handler.pipe_endpoint_progress = true;
                 }
@@ -26220,6 +31685,7 @@ unsafe fn pending_file_io_redrive_pass(
                 }
                 if let Some(file_id) = hosted_file_id.filter(|_| pending.major == nt_io_abi::major::IRP_MJ_READ || is_pipe_transceive) {
                     nt_handler.observe_completed_npfs_read(
+                        pending.pi as usize,
                         file_id,
                         pending.badge,
                         terminal_status,
@@ -26370,9 +31836,7 @@ unsafe fn pending_file_io_redrive_pass(
                 restore_file_io_mirrors!();
                 continue;
             }
-            if nt_handler.io_completion_wake.is_some() {
-                let _ = io_completion_deliver(nt_handler);
-            }
+            let _ = io_completion_deliver(nt_handler);
             delivery_state = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                 .mark_delivery_exact(
                     slot,
@@ -26425,6 +31889,15 @@ unsafe fn pending_file_io_redrive_pass(
             (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                 .mark_reply_published_exact(slot, pending.irp_id)
                 .expect("pending File reply publication owner disappeared");
+            if pending.major == nt_io_abi::major::IRP_MJ_CREATE {
+                if let Some(file) = hosted_file_id {
+                    mounted_create_owner_trace::reply_exact(identity, pending.irp_id,
+                        file, terminal_status);
+                }
+            }
+            pending_pipe_read_trace::reply_delivered(identity, pending.irp_id);
+            mounted_read_lifetime_trace::reply_delivered(identity, pending.irp_id);
+            mounted_installer_file_trace::reply(identity, pending.irp_id);
             release_reply_pool_cap(cap);
             thread_wait_state_clear_badge_ready(nt_handler, pending.badge);
         }
@@ -26452,6 +31925,14 @@ unsafe fn pending_file_io_redrive_pass(
             delivery_state = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IO))
                 .mark_backend_acked_exact(slot, pending.irp_id)
                 .expect("ACKed pending File owner disappeared");
+            mounted_read_lifetime_trace::backend_acked(identity, pending.irp_id);
+            mounted_installer_file_trace::ack(identity, pending.irp_id);
+            if pending.major == nt_io_abi::major::IRP_MJ_CREATE {
+                if let Some(file) = hosted_file_id {
+                    mounted_create_owner_trace::ack_exact(identity, pending.irp_id,
+                        file, terminal_status);
+                }
+            }
         }
         if (pending.is_local()
             || matches!(pending.operation, nt_io_manager::PendingFileIoOperation::OwnedInline(_)))
@@ -26485,13 +31966,41 @@ unsafe fn pending_file_io_redrive_pass(
                 .expect("released owned File reference lost its pending owner");
         }
         assert!(
-            !matches!(pending.operation, nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(_)),
+            !pending.operation.is_owned_mode_uncommitted(),
             "nonterminal mode preparation cannot retire its retained File owner",
         );
+        if matches!(pending.operation, nt_io_manager::PendingFileIoOperation::AttributeQuery(_)) {
+            if driver_launch::abandon_unpublished_hosted_file(
+                hosted_file_id.expect("attribute query lost its File route")
+            ).is_err() {
+                FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
+                restore_file_io_mirrors!();
+                continue;
+            }
+            crate::exec_handler::smss_attribute_probe_trace::trace_smss_attribute_terminal(
+                pending.pi, pending.tid, hosted_file_id, pending.irp_id,
+                terminal_status, pending.owned_syscall_status().unwrap_or(terminal_status),
+            );
+        }
         let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
         let finished = table
             .finish_owner_exact(identity, pending.irp_id)
             .expect("completed pending File owner did not retire");
+        pending_pipe_read_trace::retired(identity, pending.irp_id);
+        mounted_read_lifetime_trace::retired(identity, pending.irp_id);
+        mounted_installer_file_trace::retired(identity, pending.irp_id);
+        if let Some(file_id) = finished.route.hosted_file_id() {
+            if matches!(finished.major, nt_io_abi::major::IRP_MJ_READ | nt_io_abi::major::IRP_MJ_WRITE) {
+                let fs_context = driver_launch::hosted_file_route(file_id)
+                    .map_or(0, |(_, context)| context);
+                crate::exec_handler::trace_setup_scm_pipe_transition(
+                    b"owner-retired", finished.pi as usize, finished.badge, finished.tid,
+                    None, file_id, fs_context, finished.irp_id, finished.major,
+                    terminal_status, terminal_information, finished.delivery_state,
+                    finished.reply_required,
+                );
+            }
+        }
         crate::pending_file_caller::retire(identity);
         if let Some(event) = finished.transfer_event {
             assert!(finished.event_obj_idx == u64::MAX || finished.event_obj_idx == event.native_identity);
@@ -26525,12 +32034,14 @@ unsafe fn pending_file_io_redrive_pass(
                 }
                 nt_handler.release_file_reference(finished.route.hosted_file_id().expect("provider rename lost its File route"));
             }
+            nt_io_manager::PendingFileIoOperation::AttributeQuery(_) => {}
             nt_io_manager::PendingFileIoOperation::LocalByteLock(_)
             | nt_io_manager::PendingFileIoOperation::LocalDirectoryNotify(_)
             | nt_io_manager::PendingFileIoOperation::OwnedInline(_)
             | nt_io_manager::PendingFileIoOperation::LocalBuffered(_)
             | nt_io_manager::PendingFileIoOperation::LocalFlush(_) => {}
-            nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(_) => {
+            nt_io_manager::PendingFileIoOperation::OwnedModeInputCapture(_)
+            | nt_io_manager::PendingFileIoOperation::OwnedModePrecommit(_) => {
                 unreachable!("finished File owner retained nonterminal mode preparation")
             }
         }
@@ -26591,9 +32102,18 @@ unsafe fn file_irp_drain_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         if !driver_launch::file_thread_io_drain_state(pending.file_id, pending.tid).is_drained() {
             continue;
         }
+        if nt_handler.capture_thread_process_identity(pending.pi as usize, pending.tid)
+            != pending.process
+        {
+            continue;
+        }
 
-        let (sb, ss, smv, hmv, scratch_base) =
-            mirror_ctx_for(pending.badge, pending.pi as usize);
+        let Some((sb, ss, smv, hmv, scratch_base)) =
+            mirror_ctx_for(nt_handler, pending.badge, pending.pi as usize, pending.tid)
+        else {
+            // The drain row still owns the File reference and any unpublished Reply.
+            continue;
+        };
         ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
         ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
         ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
@@ -26612,20 +32132,26 @@ unsafe fn file_irp_drain_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 .expect("File IRP drain IOSB owner disappeared");
         }
         if delivery_state & nt_io_manager::FILE_IRP_DRAIN_REPLY_PUBLISHED == 0 {
-            let cap = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
-                .claim_reply_cap_exact(slot, pending.file_id, pending.tid)
-                .expect("File IRP drain reply owner disappeared")
-                .expect("File IRP drain reply claimed without publication");
-            let _ = reply_parked_syscall(cap, 0);
-            release_reply_pool_cap(cap);
+            let Some(cap) = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
+                .begin_reply_exact(slot, pending.file_id, pending.tid)
+            else {
+                // An entered Reply has an uncertain effect and must never be replayed.
+                continue;
+            };
+            let replied = reply_parked_syscall(cap, 0);
+            if !replied {
+                // Keep the exact Reply and File owners until delivery can be reconciled.
+                continue;
+            }
             thread_wait_state_clear_badge_ready(nt_handler, pending.badge);
             (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
-                .mark_reply_published_exact(slot, pending.file_id, pending.tid)
+                .finish_reply_exact(slot, pending.file_id, pending.tid, true)
                 .expect("File IRP drain reply publication owner disappeared");
         }
         let finished = (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
             .finish_exact(slot, pending.file_id, pending.tid)
             .expect("completed File IRP drain owner did not retire");
+        release_reply_pool_cap(finished.reply_cap);
         nt_handler.release_file_reference(finished.file_id);
         resumed += 1;
     }
@@ -26638,6 +32164,13 @@ unsafe fn file_irp_drain_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     nt_handler.pi = saved_pi;
     nt_handler.loop_ctx = saved_ctx;
     resumed
+}
+
+pub(crate) unsafe fn file_irp_drain_dependents_quiescent_exact(
+    pi: u32,
+    process: nt_user_host::process_identity::ProcessIdentity,
+) -> bool {
+    !(&*core::ptr::addr_of!(PENDING_FILE_IRP_DRAINS)).has_process_exact(pi, process)
 }
 
 unsafe fn ensure_client_copyin_dll_page(
@@ -26969,11 +32502,29 @@ fn print_wait_snapshot_thread(thread: HostedThreadQuiesceRecord) {
     });
 }
 
+fn trace_smss_file_busy_wait(waiter: nt_io_manager::SynchronousFileWaiter) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if waiter.pi != 0 || N.fetch_add(1, Ordering::Relaxed) >= 24 { return; }
+    print_str(b"[smss-file-busy] ssn=");
+    print_u64(waiter.service_number as u64);
+    print_str(b" handle=0x");
+    print_hex_u64(waiter.handle as u64);
+    print_str(b" tid=");
+    print_u64(waiter.tid);
+    print_str(b" file=0x");
+    match waiter.route {
+        nt_io_manager::FileIoWaitRoute::Hosted { file_id, .. } => print_hex_u64(file_id),
+        nt_io_manager::FileIoWaitRoute::LocalOverlay { file_object } => print_hex_u64(file_object),
+    }
+    print_str(b"\n");
+}
+
 /// A DEADLINE-LESS wait park is the one park that can wedge the boot: the parked thread can only be
 /// woken by another RUNNABLE thread, and if none is left the loop's next `recv` blocks forever —
 /// past even the wall-clock stall watchdog, which lives at the loop top and therefore never runs.
 /// Trace each indefinite park with the masks read by the quiesce test. The wait owner mask is derived
 /// from live per-thread parked state, not from the current thread's role.
+#[track_caller]
 fn trace_indefinite_wait_park(
     nt_handler: &ExecNtHandler,
     badge: u64,
@@ -26985,7 +32536,15 @@ fn trace_indefinite_wait_park(
     if N.fetch_add(1, Ordering::Relaxed) >= 320 {
         return;
     }
-    print_str(b"[wait-park] badge=");
+    print_str(b"[wait-park] site=");
+    print_u64(core::panic::Location::caller().line() as u64);
+    print_str(b" pi=");
+    print_u64(nt_handler.pi as u64);
+    print_str(b" tid=");
+    print_u64(nt_handler.current_tid);
+    print_str(b" ssn=");
+    print_u64(nt_handler.current_service_number as u64);
+    print_str(b" badge=");
     print_u64(badge);
     print_str(b" owner=");
     match owner_top_badge_for(nt_handler, badge) {

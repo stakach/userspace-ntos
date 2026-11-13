@@ -1,6 +1,6 @@
 use super::*;
 use crate::process_identity::ProcessGeneration;
-use crate::provider_alias_bank::{ChildCap, ProviderAliasRequest, RootAliasSnapshot};
+use crate::provider_alias_bank::{ChildCap, ProviderAliasDeleteError, ProviderAliasRequest, RootAliasSnapshot};
 use crate::thread_rollback::{new_rollback_id, ThreadRollbackIdentity};
 use alloc::vec;
 
@@ -57,11 +57,11 @@ impl ProviderAliasIo for Io {
     fn recycle_empty_root(&mut self, root: u64) -> Result<(), u32> {
         self.call(Call::Recycle(root))
     }
-    fn delete_root(&mut self, root: u64) -> Result<(), u32> {
-        self.call(Call::Root(root))
+    fn delete_root(&mut self, root: u64) -> Result<(), ProviderAliasDeleteError> {
+        self.call(Call::Root(root)).map_err(ProviderAliasDeleteError::NoEffect)
     }
-    fn delete_child(&mut self, child: ChildCap) -> Result<(), u32> {
-        self.call(Call::Child(child))
+    fn delete_child(&mut self, child: ChildCap) -> Result<(), ProviderAliasDeleteError> {
+        self.call(Call::Child(child)).map_err(ProviderAliasDeleteError::NoEffect)
     }
 }
 

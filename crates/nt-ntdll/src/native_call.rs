@@ -135,6 +135,7 @@ mod tests {
             req::ARG4 as u64 + 1
         );
         assert_eq!(nt_syscall_abi::native_syscall_request_len(14), 16);
+        assert_eq!(nt_syscall_abi::native_syscall_request_len(17), 19);
     }
 
     #[test]

@@ -27,17 +27,14 @@ fn classify_hosted_acpi_pci_crs_filter_result(
     HostedAcpiPciCrsFilterDisposition,
     Option<nt_acpi::AcpiNamespaceMatches>,
 ) {
-    if status.raw() as u32 == STATUS_BUFFER_OVERFLOW {
-        let required = (information == 0)
-            .then(|| {
-                nt_acpi::namespace_children_overflow_retry_len(
-                    payload,
-                    output_len,
-                    HOSTED_ACPI_NAMESPACE_MAX_BYTES,
-                )
-                .ok()
-            })
-            .flatten();
+    if matches!(status.raw() as u32, STATUS_BUFFER_OVERFLOW | 0xc000_0023) {
+        let required = nt_acpi::namespace_children_probe_retry_len(
+            status.raw() as u32,
+            information,
+            payload,
+            output_len,
+            HOSTED_ACPI_NAMESPACE_MAX_BYTES,
+        ).ok();
         return (
             required
                 .map_or(
@@ -136,7 +133,7 @@ unsafe fn apply_hosted_acpi_pci_crs_filter_disposition(
                 } else {
                     HostedAcpiPciRoutePhase::DispatchCrsFilter {
                         endpoint_index: endpoint_index + 1,
-                        output_len: HOSTED_ACPI_NAMESPACE_HEADER_LEN,
+                        output_len: nt_acpi::ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN,
                     }
                 }
             }
@@ -152,7 +149,7 @@ unsafe fn dispatch_hosted_acpi_pci_crs_filter(
     endpoint_index: usize,
     output_len: usize,
 ) -> bool {
-    if !(HOSTED_ACPI_NAMESPACE_HEADER_LEN..=HOSTED_ACPI_NAMESPACE_MAX_BYTES)
+    if !(nt_acpi::ACPI_ENUM_CHILDREN_OUTPUT_MIN_LEN..=HOSTED_ACPI_NAMESPACE_MAX_BYTES)
         .contains(&output_len)
     {
         let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))

@@ -13,6 +13,30 @@ fn pending() -> PendingFileIo {
 }
 
 #[test]
+fn refused_transfer_keeps_exact_reservation_and_busy_for_one_later_commit() {
+    let mut table = PendingFileIoTable::new();
+    let first = table.reserve().unwrap();
+    let second = table.reserve().unwrap();
+    table.park_reserved(first, pending()).unwrap();
+    let duplicate = PendingFileIo {
+        route: PendingFileRoute::Hosted(21),
+        busy: Some(test_busy(21, 13)),
+        ..pending()
+    };
+    assert_eq!(
+        table.park_reserved(second, duplicate),
+        Err(PendingFileIoParkError::DuplicateIrp)
+    );
+    assert_eq!(table.get_exact(second.identity()), None);
+    assert!(table.local_operation_id(second).is_some());
+    let unique = PendingFileIo { irp_id: 22, ..duplicate };
+    assert_eq!(table.park_reserved(second, unique), Ok(second.identity().slot()));
+    let committed = table.get_exact(second.identity()).unwrap();
+    assert_eq!(committed.irp_id, 22);
+    assert_eq!(committed.busy.unwrap().owner(), unique.busy.unwrap().owner());
+}
+
+#[test]
 fn foreign_table_reservation_cannot_commit_cancel_or_access_local_storage() {
     let mut first = PendingFileIoTable::new();
     let mut second = PendingFileIoTable::new();

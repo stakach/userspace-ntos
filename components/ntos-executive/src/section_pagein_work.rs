@@ -13,11 +13,27 @@ use nt_memory_manager::data_section::{
 use nt_memory_manager::pending_section_pagein::{
     PendingSectionPageReadId, PendingSectionPageReads,
 };
+use nt_memory_manager::local_pagein_drive::{
+    classify_drive_step, DriveBoundary, DriveDecision, LocalDriveBudget,
+};
 use nt_memory_manager::CompletedFileQuery;
 use nt_user_host::provider_logical_caller::ProviderLogicalCaller;
 
 const RETRY_DELAY: u64 = 1_000_000;
+const LOCAL_FAULT_STEPS: usize = 16;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xc000_009a;
+
+#[derive(Clone, Copy)]
+enum Purpose {
+    Fault,
+    VmLock { token: u64, caller_pi: usize },
+    VmCopy { token: u64, caller_pi: usize },
+    RoutedFileModeInput {
+        identity: nt_io_manager::PendingFileIoIdentity,
+        irp_id: u64,
+        token: u64,
+    },
+}
 
 enum Phase {
     QueryDispatch,
@@ -38,7 +54,24 @@ enum Phase {
     Indeterminate,
 }
 
+fn local_progress_offset(phase: &Phase) -> usize {
+    match phase {
+        Phase::QueryCopying(_, offset) | Phase::Copying(_, offset) => *offset,
+        _ => 0,
+    }
+}
+
+fn drive_boundary(phase: &Phase) -> DriveBoundary {
+    match phase {
+        Phase::QueryPending(_) | Phase::Pending(_) => DriveBoundary::External,
+        Phase::ReplyEntered | Phase::ReplySent => DriveBoundary::ReplyEntered,
+        Phase::Indeterminate => DriveBoundary::Uncertain,
+        _ => DriveBoundary::Local,
+    }
+}
+
 struct Work {
+    purpose: Purpose,
     pi: usize,
     tid: u64,
     badge: u64,
@@ -62,6 +95,8 @@ struct Work {
     failure: Option<u32>,
     failure_logged: bool,
     phase: Phase,
+    // Cumulative age in this phase; Copying offset progress does not reset it.
+    phase_entered_at_100ns: u64,
     cancel_requested: bool,
 }
 
@@ -70,7 +105,10 @@ static mut READS: PendingSectionPageReads<(), u64> = PendingSectionPageReads::ne
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static EXECUTING_TID: AtomicU64 = AtomicU64::new(0);
 static EXECUTING_PI: AtomicU64 = AtomicU64::new(u64::MAX);
+static EXECUTING_CALLER_PI: AtomicU64 = AtomicU64::new(u64::MAX);
 static EXECUTING_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
+static mut EXECUTING_PROBE: Option<(nt_hosted_runtime::SpanOwner, u64,
+    crate::installer_child_span_census::PageInProbe)> = None;
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) unsafe fn submit(
@@ -79,6 +117,44 @@ pub(crate) unsafe fn submit(
     page: u64,
     access: nt_address_space::FaultAccess,
 ) -> Result<(), u32> {
+    submit_owned(handler, pi, page, access, Purpose::Fault,
+        REPLY_MAIN_SLOT.load(Ordering::Relaxed)).map(|_| ())
+}
+
+/// The VM-lock coordinator already owns and parked the original syscall Reply.
+/// This worker owns only the exact target page and its routed IRPs.
+pub(crate) unsafe fn submit_for_vm_lock(
+    handler: &mut ExecNtHandler, caller_pi: usize, target_pi: usize,
+    page: u64, access: nt_address_space::FaultAccess, reply: u64, token: u64,
+) -> Result<crate::routed_pagein_source::RoutedPageInSource, u32> {
+    submit_owned(handler, target_pi, page, access,
+        Purpose::VmLock { token, caller_pi }, reply)
+}
+
+/// The VM-copy coordinator already parked the original syscall Reply. This row owns only the
+/// target Section page and its routed provider effects until terminal copy and strict ACK.
+pub(crate) unsafe fn submit_for_vm_copy(
+    handler: &mut ExecNtHandler, caller_pi: usize, target_pi: usize,
+    page: u64, access: nt_address_space::FaultAccess, reply: u64, token: u64,
+) -> Result<crate::routed_pagein_source::RoutedPageInSource, u32> {
+    submit_owned(handler, target_pi, page, access,
+        Purpose::VmCopy { token, caller_pi }, reply)
+}
+
+/// The pending File row already owns the original Reply. This worker owns only the exact
+/// routed input page until its provider read is acknowledged or definitively cancelled.
+pub(crate) unsafe fn submit_for_file_mode_input(
+    handler: &mut ExecNtHandler, pi: usize, page: u64, reply: u64,
+    identity: nt_io_manager::PendingFileIoIdentity, irp_id: u64, token: u64,
+) -> Result<crate::routed_pagein_source::RoutedPageInSource, u32> {
+    submit_owned(handler, pi, page, nt_address_space::FaultAccess::Read,
+        Purpose::RoutedFileModeInput { identity, irp_id, token }, reply)
+}
+
+unsafe fn submit_owned(
+    handler: &mut ExecNtHandler, pi: usize, page: u64,
+    access: nt_address_space::FaultAccess, purpose: Purpose, reply: u64,
+) -> Result<crate::routed_pagein_source::RoutedPageInSource, u32> {
     let _durable = allocator::enter_durable();
     let ctx = handler.loop_ctx.ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
     let table = &*ctx.generic_sections;
@@ -103,6 +179,11 @@ pub(crate) unsafe fn submit(
     let process = handler
         .capture_process_identity(pi)
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    let nt_user_host::process_identity::ProcessGeneration::Hosted(generation) =
+        process.generation else { return Err(nt_fs::STATUS_INVALID_HANDLE); };
+    if hosted_process_runtime_for_exact(pi, generation).is_none() {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
     if view.lifetime != nt_memory_manager::MemoryLifetime::Process(process) {
         return Err(nt_fs::STATUS_INVALID_HANDLE);
     }
@@ -121,8 +202,13 @@ pub(crate) unsafe fn submit(
     let tcb = handler
         .hosted_thread_tcb(tid)
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    let caller_pi = match purpose {
+        Purpose::Fault => pi,
+        Purpose::VmLock { caller_pi, .. } | Purpose::VmCopy { caller_pi, .. } => caller_pi,
+        Purpose::RoutedFileModeInput { .. } => pi,
+    };
     let logical = handler
-        .capture_provider_logical_caller(pi, tid, handler.current_badge, tcb)
+        .capture_provider_logical_caller(caller_pi, tid, handler.current_badge, tcb)
         .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
     let capture = driver_launch::hosted_file_capture::capture_owned(
         route.file_id,
@@ -141,12 +227,12 @@ pub(crate) unsafe fn submit(
     if index.is_none() && rows.try_reserve(1).is_err() {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
-    let Some(park) = root_reply_park::RootReplyPark::prepare() else {
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
-    };
-    let reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let park = if matches!(purpose, Purpose::Fault) {
+        Some(root_reply_park::RootReplyPark::prepare()
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?)
+    } else { None };
     let work = Work {
-        pi,
+        purpose, pi,
         tid,
         badge: handler.current_badge,
         reply,
@@ -167,6 +253,7 @@ pub(crate) unsafe fn submit(
         query_status: 0,
         query_information: 0,
         phase: Phase::QueryDispatch,
+        phase_entered_at_100ns: monotonic_time_100ns(),
         cancel_requested: false,
         failure: None,
         failure_logged: false,
@@ -175,9 +262,9 @@ pub(crate) unsafe fn submit(
         Some(index) => rows[index] = Some(work),
         None => rows.push(Some(work)),
     }
-    park.commit();
+    if let Some(park) = park { park.commit(); }
     NEXT.store(monotonic_time_100ns(), Ordering::Release);
-    Ok(())
+    Ok(crate::routed_pagein_source::RoutedPageInSource::Mapped { section, view, lease })
 }
 
 pub(crate) fn has_thread(tid: u64) -> bool {
@@ -191,13 +278,15 @@ pub(crate) fn has_thread(tid: u64) -> bool {
 }
 
 pub(crate) fn has_process(pi: usize, preserve_tid: Option<u64>) -> bool {
-    (EXECUTING_PI.load(Ordering::Acquire) == pi as u64
+    ((EXECUTING_PI.load(Ordering::Acquire) == pi as u64
+        || EXECUTING_CALLER_PI.load(Ordering::Acquire) == pi as u64)
         && preserve_tid != Some(EXECUTING_TID.load(Ordering::Acquire)))
         || unsafe {
             (&*core::ptr::addr_of!(WORK))
                 .iter()
                 .flatten()
-                .any(|work| work.pi == pi && preserve_tid != Some(work.tid))
+                .any(|work| (work.pi == pi || work.logical.pi() == pi)
+                    && preserve_tid != Some(work.tid))
         }
 }
 
@@ -211,9 +300,72 @@ pub(crate) fn wake_due(now: u64) -> u64 {
     u64::from(next_deadline().is_some_and(|deadline| now >= deadline))
 }
 
+fn diagnostic_probe(work: &Work, executing: bool) -> Option<(
+    nt_hosted_runtime::SpanOwner, u64, crate::installer_child_span_census::PageInProbe,
+)> {
+    if !matches!(work.purpose, Purpose::Fault) { return None; }
+    let nt_user_host::process_identity::ProcessGeneration::Hosted(process_generation) =
+        work.process.generation else { return None; };
+    let phase = match &work.phase {
+        Phase::QueryDispatch => 1, Phase::QueryPending(_) => 2,
+        Phase::QueryCopying(_, _) => 3, Phase::QueryAckPending(_) => 4,
+        Phase::PlanRead => 5, Phase::Dispatch => 6, Phase::Pending(_) => 7,
+        Phase::Copying(_, _) => 8, Phase::AckPending(_) => 9,
+        Phase::Publish(_) => 10, Phase::ReadyReply => 11,
+        Phase::ReplyEntered => 12, Phase::ReplySent => 13,
+        Phase::Cancel => 14, Phase::Cancelled => 15, Phase::Indeterminate => 16,
+    };
+    let irp_id = match &work.phase {
+        Phase::QueryPending(id) | Phase::QueryCopying(id, _)
+        | Phase::QueryAckPending(id) | Phase::Pending(id)
+        | Phase::Copying(id, _) | Phase::AckPending(id) => Some(id.raw()),
+        _ => None,
+    };
+    Some((nt_hosted_runtime::SpanOwner {
+        process_index: work.pi, process_generation,
+        thread_id: work.tid, thread_generation: work.logical.thread().generation(),
+    }, work.badge, crate::installer_child_span_census::PageInProbe {
+        source: crate::installer_child_span_census::PageInSource::Data(work.section),
+        phase, phase_entered_at_100ns: work.phase_entered_at_100ns,
+        irp_id, irp_entered_at_100ns: irp_id.map(|_| work.phase_entered_at_100ns),
+        read_subphase: 0, page: work.page, reply: work.reply, executing,
+    }))
+}
+
+/// Value-only observation; no provider pump, Reply operation or page-table access.
+pub(crate) fn diagnostic_snapshot(owner: nt_hosted_runtime::SpanOwner, badge: u64,
+    page: u64, reply: u64) -> Option<crate::installer_child_span_census::PageInProbe> {
+    let mut found = None;
+    unsafe {
+        if let Some((row_owner, row_badge, probe)) =
+            *core::ptr::addr_of!(EXECUTING_PROBE) {
+            if row_owner == owner && row_badge == badge && probe.page == page
+                && probe.reply == reply { found = Some(probe); }
+        }
+        for work in (&*core::ptr::addr_of!(WORK)).iter().flatten() {
+            let Some((row_owner, row_badge, probe)) = diagnostic_probe(work, false) else {
+                continue;
+            };
+            if row_owner == owner && row_badge == badge && probe.page == page
+                && probe.reply == reply {
+                if found.is_some() { return None; }
+                found = Some(probe);
+            }
+        }
+    }
+    found
+}
+
+fn exact_hosted_scratch(work: &Work) -> Option<u64> {
+    let nt_user_host::process_identity::ProcessGeneration::Hosted(generation) =
+        work.process.generation else { return None; };
+    hosted_process_runtime_for_exact(work.pi, generation).map(|runtime| runtime.scratch_base)
+}
+
 fn valid(handler: &ExecNtHandler, work: &Work) -> bool {
     if handler.capture_process_identity(work.pi) != Some(work.process)
         || !handler.validate_provider_logical_caller(work.logical)
+        || exact_hosted_scratch(work).is_none()
     {
         return false;
     }
@@ -241,6 +393,9 @@ fn valid(handler: &ExecNtHandler, work: &Work) -> bool {
 }
 
 unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
+    if exact_hosted_scratch(work).is_none() && work.failure.is_none() {
+        work.failure = Some(nt_fs::STATUS_INVALID_HANDLE);
+    }
     let cancelled = spawn_hosts::shared_ingress::owner::runtime::hosted_reply_cancelled(work.reply)
         || handler
             .pm
@@ -545,14 +700,17 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
         }
         Phase::Copying(irp, offset) => {
             let (irp, offset) = (*irp, *offset);
-            let remaining = work.plan.unwrap().length() - offset;
             let mut bytes = [0u8; DATA_PAGE_SIZE];
+            let Some(copy_len) = work.plan.unwrap().next_copy_len(offset, bytes.len()) else {
+                work.phase = Phase::Indeterminate;
+                return false;
+            };
             let copied = match driver_launch::copy_completed_irp_output_exact(
                 irp.raw(),
                 offset as u64,
-                &mut bytes[..remaining],
+                &mut bytes[..copy_len],
             ) {
-                Ok(copied) if copied != 0 && copied <= remaining => copied,
+                Ok(copied) if copied != 0 && copied <= copy_len => copied,
                 Ok(_) => {
                     assert!((&mut *core::ptr::addr_of_mut!(READS)).fail_copy(
                         work.read_id.unwrap(),
@@ -620,6 +778,11 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                 work.phase = Phase::Cancel;
                 return false;
             }
+            let Some(scratch) = exact_hosted_scratch(work) else {
+                work.failure = Some(nt_fs::STATUS_INVALID_HANDLE);
+                work.phase = Phase::Cancel;
+                return false;
+            };
             let Phase::Publish(bytes) = &work.phase else {
                 unreachable!()
             };
@@ -631,7 +794,7 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                     work.section,
                     work.page_index + index as u64,
                     page,
-                    hosted_scratch_base_for_pi(work.pi),
+                    scratch,
                 ).is_err() {
                     if index == 0 {
                         work.phase = Phase::Cancel;
@@ -648,6 +811,11 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                 work.phase = Phase::Cancel;
                 return false;
             }
+            let Some(scratch) = exact_hosted_scratch(work) else {
+                work.failure = Some(nt_fs::STATUS_INVALID_HANDLE);
+                work.phase = Phase::Cancel;
+                return false;
+            };
             let ctx = handler.loop_ctx.unwrap();
             match service_generic_section_fault(
                 handler,
@@ -655,7 +823,7 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                 work.pi,
                 work.page,
                 ctx.pml4,
-                hosted_scratch_base_for_pi(work.pi),
+                scratch,
                 work.access,
                 false,
                 true,
@@ -666,6 +834,27 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
                     work.phase = Phase::Cancel;
                     return false;
                 }
+            }
+            if matches!(work.purpose, Purpose::VmLock { .. } | Purpose::VmCopy { .. }
+                | Purpose::RoutedFileModeInput { .. }) {
+                let source = crate::routed_pagein_source::RoutedPageInSource::Mapped {
+                    section: work.section, view: work.view, lease: work.lease,
+                };
+                let completed = match work.purpose {
+                    Purpose::VmLock { token, .. } => crate::vm_lock_pagein_work::page_completed(
+                        token, work.pi, work.page, source, 0),
+                    Purpose::VmCopy { token, .. } => crate::vm_copy_work::page_completed(
+                        token, work.pi, work.page, source, 0),
+                    Purpose::RoutedFileModeInput { identity, irp_id, token } =>
+                        crate::service_sec_image::file_mode_input_page_completed(
+                            identity, irp_id, token, work.pi, work.page, 0),
+                    Purpose::Fault => unreachable!(),
+                };
+                if completed {
+                    return true;
+                }
+                work.phase = Phase::Indeterminate;
+                return false;
             }
             if parked_reply::validate_saved(work.reply).is_err() {
                 return false;
@@ -696,6 +885,28 @@ unsafe fn advance(handler: &mut ExecNtHandler, work: &mut Work) -> bool {
             true
         }
         Phase::Cancel => {
+            if matches!(work.purpose, Purpose::VmLock { .. } | Purpose::VmCopy { .. }
+                | Purpose::RoutedFileModeInput { .. }) {
+                let source = crate::routed_pagein_source::RoutedPageInSource::Mapped {
+                    section: work.section, view: work.view, lease: work.lease,
+                };
+                let status = work.failure.unwrap_or(nt_address_space::STATUS_ACCESS_VIOLATION);
+                let completed = match work.purpose {
+                    Purpose::VmLock { token, .. } => crate::vm_lock_pagein_work::page_completed(
+                        token, work.pi, work.page, source, status),
+                    Purpose::VmCopy { token, .. } => crate::vm_copy_work::page_completed(
+                        token, work.pi, work.page, source, status),
+                    Purpose::RoutedFileModeInput { identity, irp_id, token } =>
+                        crate::service_sec_image::file_mode_input_page_completed(
+                            identity, irp_id, token, work.pi, work.page, status),
+                    Purpose::Fault => unreachable!(),
+                };
+                if completed {
+                    return true;
+                }
+                work.phase = Phase::Indeterminate;
+                return false;
+            }
             if let Some(status) = work.failure.filter(|_| !work.failure_logged) {
                 print_str(b"[section] routed page-in failed pi=");
                 print_u64(work.pi as u64);
@@ -740,6 +951,7 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
     }
     let _durable = allocator::enter_durable();
     let count = (&*core::ptr::addr_of!(WORK)).len();
+    let mut immediate_followup = false;
     for index in 0..count {
         let Some(mut work) = (&mut *core::ptr::addr_of_mut!(WORK))[index].take() else {
             continue;
@@ -747,8 +959,18 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
         EXECUTING_INDEX.store(index as u64, Ordering::Release);
         EXECUTING_TID.store(work.tid, Ordering::Release);
         EXECUTING_PI.store(work.pi as u64, Ordering::Release);
-        let done = service_sec_image::with_section_metadata_context(
+        *core::ptr::addr_of_mut!(EXECUTING_PROBE) = diagnostic_probe(&work, true);
+        let phase_before = core::mem::discriminant(&work.phase);
+        let is_fault = matches!(work.purpose, Purpose::Fault);
+        let caller_pi = match work.purpose {
+            Purpose::Fault => work.pi,
+            Purpose::VmLock { caller_pi, .. } | Purpose::VmCopy { caller_pi, .. } => caller_pi,
+            Purpose::RoutedFileModeInput { .. } => work.pi,
+        };
+        EXECUTING_CALLER_PI.store(caller_pi as u64, Ordering::Release);
+        let decision = service_sec_image::with_pagein_caller_target_context(
             handler,
+            caller_pi,
             work.pi,
             work.tid,
             work.badge,
@@ -757,7 +979,26 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
             0,
             false,
             0,
-            |handler| advance(handler, &mut work),
+            |handler| {
+                if !is_fault {
+                    return if advance(handler, &mut work) {
+                        DriveDecision::Complete
+                    } else { DriveDecision::RetryLater };
+                }
+                LocalDriveBudget::new(LOCAL_FAULT_STEPS).drive_while_local(|| {
+                    // A nested provider pump can inspect this row while it is out of WORK.
+                    *core::ptr::addr_of_mut!(EXECUTING_PROBE) = diagnostic_probe(&work, true);
+                    let before = core::mem::discriminant(&work.phase);
+                    let offset_before = local_progress_offset(&work.phase);
+                    let done = advance(handler, &mut work);
+                    let after = core::mem::discriminant(&work.phase);
+                    if after != before {
+                        work.phase_entered_at_100ns = monotonic_time_100ns();
+                    }
+                    classify_drive_step(done, drive_boundary(&work.phase),
+                        after != before || local_progress_offset(&work.phase) != offset_before)
+                })
+            },
         )
         .unwrap_or_else(|| {
             let stopped =
@@ -773,9 +1014,9 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
                             process.state == nt_process::ProcessState::Terminated
                         });
             if !stopped {
-                return false;
+                return DriveDecision::RetryLater;
             }
-            match &work.phase {
+            let done = match &work.phase {
                 Phase::QueryDispatch | Phase::PlanRead => {
                     work.phase = Phase::Cancel;
                     false
@@ -800,18 +1041,26 @@ pub(crate) unsafe fn redrive(handler: &mut ExecNtHandler) {
                 | Phase::ReplyEntered
                 | Phase::ReplySent
                 | Phase::Indeterminate => advance(handler, &mut work),
-            }
+            };
+            if done { DriveDecision::Complete } else { DriveDecision::RetryLater }
         });
+        if core::mem::discriminant(&work.phase) != phase_before {
+            work.phase_entered_at_100ns = monotonic_time_100ns();
+        }
+        if decision == DriveDecision::RetryNow { immediate_followup = true; }
+        let done = decision == DriveDecision::Complete;
         if !done {
             (&mut *core::ptr::addr_of_mut!(WORK))[index] = Some(work);
         }
+        *core::ptr::addr_of_mut!(EXECUTING_PROBE) = None;
         EXECUTING_TID.store(0, Ordering::Release);
         EXECUTING_PI.store(u64::MAX, Ordering::Release);
+        EXECUTING_CALLER_PI.store(u64::MAX, Ordering::Release);
         EXECUTING_INDEX.store(u64::MAX, Ordering::Release);
     }
-    NEXT.store(
-        monotonic_time_100ns().saturating_add(RETRY_DELAY),
-        Ordering::Release,
-    );
+    let now = monotonic_time_100ns();
+    NEXT.store(if immediate_followup { now } else {
+        now.saturating_add(RETRY_DELAY)
+    }, Ordering::Release);
     ACTIVE.store(false, Ordering::Release);
 }

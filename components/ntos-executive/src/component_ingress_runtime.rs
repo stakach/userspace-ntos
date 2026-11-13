@@ -1,9 +1,11 @@
 //! Serialized native ownership transactions for the shared component endpoint.
 
 use super::*;
+use crate::print_str;
 use crate::service_sec_image::{ComponentLanes, COMPONENT_SUSPENSIONS};
 use nt_component_suspension::{
-    IngressReplyObservation, LaneDispatchIdentity, PeerRetirementEffect,
+    IngressReplyObservation, LaneDispatchIdentity, PeerAdmissionFence, PeerInstallationPhase,
+    PeerRetirementEffect,
 };
 
 #[path = "component_ingress_sources.rs"]
@@ -14,9 +16,13 @@ pub(crate) use sources::{PhysicalDomain, PhysicalSource, PhysicalSourceKind};
 #[path = "component_ingress_nested.rs"]
 pub(crate) mod nested;
 
+#[path = "component_ingress_physical_hold.rs"]
+pub(crate) mod physical_hold;
+
 #[path = "component_ingress_services.rs"]
 mod services;
 pub(crate) use services::{
+    hosted_forward_wait_probe,
     acknowledge_hosted_forward_source_continuation, acknowledge_retained_service_cancellation,
     cancel_parked_service, finish_autonomous,
     next_service_wait_token, park_retained_service, park_service, reconcile_retained_service_reply,
@@ -28,7 +34,8 @@ pub(crate) use services::{
     retained_service_reply_not_entered, retained_service_resume_next_deadline,
     retire_stopped_acknowledged_retained_service, wake_file_create_service,
     wake_query_path_rejected_service, wake_query_path_service, wake_hosted_forward_service, wake_registry_service,
-    wake_section_create_service, wake_service,
+    wake_directory_service, wake_section_create_service, wake_section_map_service,
+    wake_gdi_image_service, wake_service,
 };
 
 #[path = "component_ingress_retirement.rs"]
@@ -39,15 +46,35 @@ pub(crate) use retirement::retire;
 mod hosted;
 pub(crate) use hosted::{
     can_park_hosted_reply, cancel_hosted, cancel_hosted_caller, defer_hosted_delivery,
+    defer_hosted_delivery_for_add_device, defer_hosted_delivery_for_queued_callback,
+    deferred_parked_ingress_is_exact,
+    deferred_queued_ingress_selected,
+    DeferredParkedIngress,
+    is_win32k_native_call,
+    parkable_hosted_reply_binding,
     finish_acknowledged_hosted_reply, hosted_can_resume, hosted_cancellation_proven,
     hosted_reply_cancelled, owns_hosted_reply, release_hosted_reply, reply_hosted, restart_hosted,
     stop_and_cancel_hosted, stop_hosted_caller, take_hosted_with,
+    take_selected_root_hosted_with, reconcile_root_ingress_import_no_effect,
+    reconcile_root_ingress_settlement_before_restore,
     bind_receive_settlement, prepare_receive_settlement, take_outer_boundary,
-    ReceiveSettlementBoundary, ReceiveChildObservation,
+    bind_root_ingress_pass, prepare_root_ingress_pass,
+    begin_undelivered_root_unwind, cancel_restored_undelivered_root_pass,
+    prepared_root_ingress_snapshot, selected_root_read_request,
+    SelectedRootReadRequestOutcome, with_bound_root_ingress_scope,
+    cancel_unbound_root_ingress_pass,
+    root_ingress_parent_blocks_provider_resume,
+    accept_root_ingress_parent_restored,
+    prepared_root_ingress_child_is_current,
+    ReceiveSettlementBoundary, ReceiveChildObservation, SelectedRootImportOutcome,
+    SelectedRootImportFailure,
     receive_child_pending, receive_child_is_current, receive_child_observation,
     receive_child_delivery_allowed, with_bound_receive_scope,
 };
 pub(crate) use hosted::PendingSnapshot;
+pub(crate) use hosted::delivery_gate_snapshot;
+pub(crate) use hosted::observed_win32k_call_for_client;
+pub(crate) use hosted::{trace_ifeo_open_miss, trace_ifeo_miss_census, trace_ifeo_root_receive};
 
 const RETAINED_CALL_CAPACITY: usize = 256;
 const PEER_CAPACITY: usize = 256;
@@ -75,6 +102,7 @@ struct NativePeer {
     physical: PhysicalSource,
     verify: unsafe fn(PhysicalSource) -> bool,
     route: Option<PeerRoute>,
+    admission_fence: PeerAdmissionFence,
     quarantined: bool,
     bootstrap: bool,
 }
@@ -112,10 +140,22 @@ pub(crate) unsafe fn hold_snapshot() -> HoldSnapshot {
             dispatch: lanes.active_dispatch_identity(lane).ok().flatten(),
             route,
             physical: peer.map(|peer| peer.physical),
-            quarantined: peer.map(|peer| peer.quarantined),
+            quarantined: peer.map(|peer| peer.quarantined || !peer.admission_fence.allows_admission()),
         }
     });
     HoldSnapshot { running, oldest: hosted::oldest_pending_snapshot() }
+}
+
+/// A queued child's scheduler yield retains the exact running dispatch and Reply.
+/// The root may give that child another turn without entering an Idle receive.
+pub(crate) unsafe fn root_idle_receive_after_child_yield(
+    dispatch: LaneDispatchIdentity,
+    reply: u64,
+) -> bool {
+    nt_user_host::component_pump::root_receive_disposition_after_yield(
+        &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS), dispatch, reply,
+        nt_user_host::component_pump::RootReceiveRefusal::IdleExecutionBusyBeforeNativeReceive,
+    ) == nt_user_host::component_pump::RootReceiveDisposition::ResumeRetainedDispatch
 }
 
 unsafe fn lanes() -> &'static mut ComponentLanes {
@@ -134,7 +174,7 @@ unsafe fn resolve(route: PeerRoute, allow_retiring: bool) -> Option<u64> {
     if record.source.domain() != route.identity().domain
         || record.source.generation() != route.identity().domain_generation
         || record.physical.tcb != route.identity().executor
-        || (!allow_retiring && record.quarantined)
+        || (!allow_retiring && (record.quarantined || !record.admission_fence.allows_admission()))
     {
         return None;
     }
@@ -259,6 +299,7 @@ pub(crate) unsafe fn register(
         physical,
         verify,
         route: None,
+        admission_fence: PeerAdmissionFence::new(),
         quarantined: false,
         bootstrap: false,
     });
@@ -573,6 +614,44 @@ pub(crate) enum Arrival {
     Call { route: PeerRoute, reply: u64 },
 }
 
+fn log_receive_error_kind(error: &super::super::ReceiveError) {
+    use nt_component_suspension::ReceiveProbeError;
+    use super::super::ReceiveError;
+    let kind: &[u8] = match error {
+        ReceiveError::Probe(ReceiveProbeError::ReplyNotFree) => b"reply-not-free\n",
+        ReceiveError::Probe(ReceiveProbeError::UnknownCaller) => b"unknown-caller\n",
+        ReceiveError::Probe(ReceiveProbeError::BindingMismatch) => b"binding-mismatch\n",
+        ReceiveError::Probe(ReceiveProbeError::Query(_)) => b"probe-query\n",
+        ReceiveError::Ownership(nt_component_suspension::ReservedReceiveError::InvalidPhase) => b"ownership-invalid-phase\n",
+        ReceiveError::Ownership(nt_component_suspension::ReservedReceiveError::WrongIngress) => b"ownership-wrong-ingress\n",
+        ReceiveError::Ownership(nt_component_suspension::ReservedReceiveError::Store(error)) => {
+            print_str(b"ownership-store-");
+            let detail: &[u8] = match error {
+                nt_component_suspension::RetainedWorkError::NoCapacity => b"no-capacity\n",
+                nt_component_suspension::RetainedWorkError::ReplyInUse => b"reply-in-use\n",
+                _ => b"other\n",
+            };
+            return print_str(detail);
+        }
+        ReceiveError::Ownership(nt_component_suspension::ReservedReceiveError::Ingress(error)) => {
+            print_str(b"ownership-ingress-");
+            let detail: &[u8] = match error {
+                nt_component_suspension::IngressError::ReplyInUse => b"reply-in-use\n",
+                nt_component_suspension::IngressError::ExecutionBusy => b"execution-busy\n",
+                nt_component_suspension::IngressError::ExecutionOwnerMismatch => b"owner-mismatch\n",
+                nt_component_suspension::IngressError::NotReady => b"not-ready\n",
+                _ => b"other\n",
+            };
+            return print_str(detail);
+        }
+        ReceiveError::Ownership(_) => b"ownership-other\n",
+        ReceiveError::Capture(_, _, _) => b"capture\n",
+        ReceiveError::Retain(_) => b"retain\n",
+        _ => b"other\n",
+    };
+    print_str(kind);
+}
+
 /// Capture, classify and retain before returning to a handler. No borrowed owner crosses a
 /// semantic handler, and an unrelated arrival remains owned for its own physical worker.
 pub(crate) unsafe fn receive(
@@ -580,39 +659,125 @@ pub(crate) unsafe fn receive(
     probe_tcb: u64,
     blocking: bool,
 ) -> Result<Arrival, Error> {
-    hosted::recycle_completed()?;
+    // `recycle_completed` borrows this same ingress owner and lane table. Inspect the journal
+    // without retaining a reference, then finish recycling before taking either mutable borrow.
+    // Recheck the journal below: a nested effect during recycling may have published an arrival.
+    let fresh_before_recycle = (&*core::ptr::addr_of!(SHARED_INGRESS)).pending_receive.is_none();
+    if fresh_before_recycle {
+        hosted::recycle_completed()?;
+    }
     let owner = owner();
     let lanes = lanes();
-    owner
-        .receive(lanes, execution, probe_tcb, blocking)
-        .map_err(|_| Error::Receive)?;
-    let peers = owner.peers.as_ref().expect("ready peers");
-    let routes = peers;
-    let mut resolver = |badge| {
-        if nt_component_suspension::badge::valid_hosted_badge(badge) {
-            crate::service_sec_image::hosted_ingress_binding(badge).map(|binding| binding.tcb)
-        } else {
-            let route = routes
-                .resolve(badge)
-                .or_else(|| routes.resolve_retiring(badge))?;
-            resolve(route, true)
+    if let Some(pending) = owner.pending_receive.as_ref() {
+        let receiver = owner.receiver.as_ref().ok_or(Error::Initialization)?;
+        if pending.execution != execution
+            || pending.probe_tcb != probe_tcb
+            || pending.reply != receiver.reply()
+            || receiver.recovery_for_owner(lanes, execution).is_err()
+            || !pending.classify_retry_allowed
+        {
+            print_str(b"[ingress-receive-error] stage=recovery kind=owner-or-phase\n");
+            return Err(Error::Receive);
+        }
+        if let Some(message) = owner.pending_receive.as_mut().and_then(|row| row.returned_message.take()) {
+            match owner.receiver.as_mut().ok_or(Error::Initialization)?.capture(message) {
+                Ok(()) => {}
+                Err((error, message)) => {
+                    let pending = owner.pending_receive.as_mut().expect("retained capture owner");
+                    pending.returned_message = Some(message);
+                    pending.classify_retry_allowed = false;
+                    print_str(b"[ingress-receive-error] stage=recapture kind=");
+                    log_receive_error_kind(&super::super::ReceiveError::Ownership(error));
+                    return Err(Error::Receive);
+                }
+            }
+        }
+    } else {
+        let reply = owner.receiver.as_ref().ok_or(Error::Initialization)?.reply();
+        match owner.receive(lanes, execution, probe_tcb, blocking) {
+            Ok(sequence) => {
+                owner.pending_receive = Some(PendingNativeReceive {
+                    execution, probe_tcb, reply, sequence,
+                    returned_message: None, classify_retry_allowed: true,
+                });
+            }
+            Err(super::super::ReceiveError::Capture(error, message, sequence)) => {
+                owner.pending_receive = Some(PendingNativeReceive {
+                    execution, probe_tcb, reply, sequence,
+                    returned_message: Some(message), classify_retry_allowed: true,
+                });
+                print_str(b"[ingress-receive-error] stage=capture kind=");
+                log_receive_error_kind(&super::super::ReceiveError::Ownership(error));
+                return Err(Error::Receive);
+            }
+            Err(error) => {
+                print_str(b"[ingress-receive-error] stage=receive kind=");
+                log_receive_error_kind(&error);
+                return Err(Error::Receive);
+            }
+        }
+    }
+    // One read-only retry may resolve a transient kernel Reply query. Both classifications use
+    // the same captured receiver and original physical Reply; no second native receive occurs.
+    let notification = loop {
+        let routes = owner.peers.as_ref().expect("ready peers");
+        let result = super::super::classify(
+            owner.receiver.as_mut().expect("ready receiver"),
+            probe_tcb,
+            |badge| {
+                if nt_component_suspension::badge::valid_hosted_badge(badge) {
+                    crate::service_sec_image::hosted_ingress_binding(badge).map(|binding| binding.tcb)
+                } else {
+                    let route = routes.resolve(badge)
+                        .or_else(|| routes.resolve_retiring(badge))?;
+                    resolve(route, true)
+                }
+            },
+        );
+        match result {
+            Ok(notification) => break notification,
+            Err(super::super::ReceiveError::Probe(
+                nt_component_suspension::ReceiveProbeError::Query(_)
+            )) if owner.pending_receive.as_ref().is_some_and(|row| row.classify_retry_allowed) => {
+                let receiver = owner.receiver.as_ref().expect("ready receiver");
+                let pending = owner.pending_receive.as_mut().expect("captured receive owner");
+                pending.classify_retry_allowed = false;
+                if receiver.recovery_for_owner(lanes, execution).is_err()
+                    || receiver.reply() != pending.reply
+                {
+                    print_str(b"[ingress-receive-error] stage=classify kind=owner-mismatch\n");
+                    return Err(Error::Receive);
+                }
+                print_str(b"[ingress-receive-error] stage=classify kind=query-retry\n");
+            }
+            Err(error) => {
+                owner.pending_receive.as_mut().expect("captured receive owner")
+                    .classify_retry_allowed = false;
+                print_str(b"[ingress-receive-error] stage=classify kind=");
+                log_receive_error_kind(&error);
+                return Err(Error::Receive);
+            }
         }
     };
-    // Classification needs a mutable receiver but not a mutable registry.
-    let notification = super::super::classify(
-        owner.receiver.as_mut().expect("ready receiver"),
-        probe_tcb,
-        &mut resolver,
-    )
-    .map_err(|_| Error::Receive)?;
+    let reason = match notification.as_ref() {
+        Some(message) if crate::badge_has_delay_timer(message.badge()) =>
+            nt_hosted_runtime::SharedReceiveReturn::Timer,
+        Some(_) => nt_hosted_runtime::SharedReceiveReturn::OtherNotification,
+        None => nt_hosted_runtime::SharedReceiveReturn::Call,
+    };
+    super::super::classify_receive_census(
+        owner.pending_receive.as_ref().expect("captured receive owner").sequence, reason);
     if let Some(message) = notification {
+        owner.pending_receive = None;
         return Ok(Arrival::Notification(message));
     }
+    owner.pending_receive.as_mut().expect("held receive owner").classify_retry_allowed = false;
     let receiver = owner.receiver.as_ref().expect("ready receiver");
     let badge = receiver.message().expect("classified Call").badge();
     let reply = receiver.reply();
     if nt_component_suspension::badge::valid_hosted_badge(badge) {
         hosted::retain(owner, lanes, badge, probe_tcb)?;
+        owner.pending_receive = None;
         return Ok(Arrival::Hosted);
     }
     let route = owner
@@ -631,6 +796,7 @@ pub(crate) unsafe fn receive(
     owner
         .retain(lanes, probe_tcb, |route| resolve(route, true))
         .map_err(|_| Error::Retain)?;
+    owner.pending_receive = None;
     Ok(Arrival::Call { route, reply })
 }
 
@@ -754,6 +920,67 @@ pub(crate) unsafe fn admission_readiness(route: PeerRoute) -> Result<AdmissionRe
     })
 }
 
+/// A diagnostic observation, never authority to reuse or complete a Reply. The caller samples
+/// this only at a serialized ingress boundary; each failure remains distinct from a binding.
+#[repr(u64)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ActiveReplyObservation {
+    RouteMismatch = 1,
+    LocalStateUnavailable = 2,
+    ReplyMismatch = 3,
+    QueryFailed = 4,
+    Free = 5,
+    Offered = 6,
+    BoundToTarget = 7,
+    BoundElsewhere = 8,
+    MissingReply = 9,
+}
+
+pub(crate) unsafe fn observe_active_reply(
+    route: PeerRoute,
+    route_domain: u64,
+    route_generation: u64,
+    lane_index: u64,
+    lane_generation: u64,
+    tcb: u64,
+    reply: u64,
+) -> ActiveReplyObservation {
+    let identity = route.identity();
+    if identity.domain != route_domain
+        || identity.domain_generation != route_generation
+        || identity.lane.index as u64 != lane_index
+        || identity.lane.generation != lane_generation
+        || identity.executor != tcb
+        || tcb == 0
+    {
+        return ActiveReplyObservation::RouteMismatch;
+    }
+    if reply == 0 {
+        return ActiveReplyObservation::MissingReply;
+    }
+    // Finish every ingress/lanes borrow before the kernel query. Readiness resolves the
+    // retained physical source and exact generation; neither a badge nor a copied Reply does.
+    match admission_readiness(route) {
+        Ok(_) => {}
+        Err(Error::PhysicalIdentity) => return ActiveReplyObservation::RouteMismatch,
+        Err(_) => return ActiveReplyObservation::LocalStateUnavailable,
+    }
+    match current_reply(route) {
+        Ok(current) if current == reply => {}
+        Ok(_) => return ActiveReplyObservation::ReplyMismatch,
+        Err(Error::PhysicalIdentity) => return ActiveReplyObservation::RouteMismatch,
+        Err(_) => return ActiveReplyObservation::LocalStateUnavailable,
+    }
+    let _saved = crate::ipc_message::SavedMessageBuffer::capture();
+    match crate::spawn_hosts::query_component_reply_binding(tcb, reply) {
+        Ok(nt_component_suspension::ReplyBindingObservation::Free) => ActiveReplyObservation::Free,
+        Ok(nt_component_suspension::ReplyBindingObservation::Offered) => ActiveReplyObservation::Offered,
+        Ok(nt_component_suspension::ReplyBindingObservation::BoundToTarget) => ActiveReplyObservation::BoundToTarget,
+        Ok(nt_component_suspension::ReplyBindingObservation::BoundElsewhere) => ActiveReplyObservation::BoundElsewhere,
+        Err(_) => ActiveReplyObservation::QueryFailed,
+    }
+}
+
 /// Resolve a transport snapshot through its retained physical source, not its numeric badge.
 pub(crate) unsafe fn channel_route(
     channel: &crate::spawn_hosts::PumpChannel,
@@ -862,6 +1089,19 @@ pub(crate) unsafe fn next_message(
         .map(|(reply, message)| (reply, message.clone())))
 }
 
+/// Copy only the pending Reply and label for a read-only boot census.
+pub(crate) unsafe fn pending_route_snapshot(route: PeerRoute) -> Result<Option<(u64, u64)>, Error> {
+    if resolve(route, false).is_none() {
+        return Err(Error::PhysicalIdentity);
+    }
+    Ok(owner()
+        .receiver
+        .as_ref()
+        .ok_or(Error::Initialization)?
+        .next_unadmitted(route)
+        .map(|(reply, message)| (reply, message.info())))
+}
+
 pub(crate) unsafe fn stored_current_message(route: PeerRoute) -> Result<ReceivedMessage, Error> {
     let reply = current_reply(route)?;
     owner()
@@ -875,7 +1115,8 @@ pub(crate) unsafe fn stored_current_message(route: PeerRoute) -> Result<Received
 
 pub(crate) unsafe fn next_autonomous() -> Result<Option<PeerRoute>, Error> {
     for row in &*core::ptr::addr_of!(NATIVE_PEERS) {
-        if row.quarantined || !matches!(row.physical.kind, PhysicalSourceKind::SystemThread { .. })
+        if row.quarantined || !row.admission_fence.allows_admission()
+            || !matches!(row.physical.kind, PhysicalSourceKind::SystemThread { .. })
         {
             continue;
         }
@@ -887,6 +1128,28 @@ pub(crate) unsafe fn next_autonomous() -> Result<Option<PeerRoute>, Error> {
         }
     }
     Ok(None)
+}
+
+/// Read-only route census at the autonomous selection boundary. It never admits or consumes a
+/// Call; the subsequent `next_autonomous` still makes the scheduling decision.
+pub(crate) unsafe fn trace_autonomous_candidates() {
+    for row in &*core::ptr::addr_of!(NATIVE_PEERS) {
+        if !matches!(row.physical.kind, PhysicalSourceKind::SystemThread { .. }) {
+            continue;
+        }
+        crate::print_str(b"[autonomous-candidate] route=");
+        crate::print_u64(row.route.map_or(0, |route| route.badge()));
+        crate::print_str(b" quarantined=");
+        crate::print_u64(u64::from(row.quarantined));
+        crate::print_str(b" pending=");
+        let pending = row.route.and_then(|route| next_message(route).ok().flatten());
+        crate::print_u64(u64::from(pending.is_some()));
+        if let Some((_, message)) = pending {
+            crate::print_str(b" label=");
+            crate::print_u64(message.info() >> 12);
+        }
+        crate::print_str(b"\n");
+    }
 }
 
 pub(crate) unsafe fn receive_owner(route: PeerRoute) -> Result<IngressExecutionOwner, Error> {
@@ -1039,12 +1302,13 @@ pub(crate) unsafe fn continue_after_subcall(
     dispatch: LaneDispatchIdentity,
     reply: u64,
     label: u64,
-) -> Result<(), Error> {
+) -> Result<u64, Error> {
     if self::dispatch(route)? != dispatch || current_reply(route)? != reply {
         return Err(Error::Admission);
     }
     let incoming = completion_reply(route, label)?;
-    adopt(route, incoming)
+    adopt(route, incoming)?;
+    Ok(incoming)
 }
 
 pub(crate) unsafe fn complete_protocol(
@@ -1117,26 +1381,39 @@ pub(crate) unsafe fn quarantine(route: PeerRoute) -> Result<(), Error> {
     if (&*core::ptr::addr_of!(NATIVE_PEERS))[index].quarantined {
         return Err(Error::Retirement);
     }
+    let row = &mut (&mut *core::ptr::addr_of_mut!(NATIVE_PEERS))[index];
+    let source = row.source;
+    let verify = row.verify;
+    row.admission_fence.attempt_retirement(|| {
+        let owner = owner();
+        let installation = owner
+            .installations
+            .iter_mut()
+            .find(|row| row.route() == route)
+            .ok_or(Error::UnknownPeer)?;
+        if !matches!(installation.phase(), PeerInstallationPhase::Retiring(_)) {
+            installation
+                .begin_retirement(
+                    owner.peers.as_mut().expect("ready peers"),
+                    route.identity().domain,
+                    route.identity().domain_generation,
+                    lanes(),
+                )
+                .map_err(|error| retirement::failure("begin-peer", error))?;
+        }
+        (&mut *core::ptr::addr_of_mut!(SOURCES))
+            .begin_retirement(source, |physical| verify(physical))
+            .map_err(|error| retirement::failure("begin-source", error))?;
+        Ok(())
+    })?;
+    row.quarantined = true;
     let owner = owner();
-    let lanes = lanes();
     let installation = owner
         .installations
         .iter_mut()
         .find(|row| row.route() == route)
         .ok_or(Error::UnknownPeer)?;
-    installation
-        .begin_retirement(
-            owner.peers.as_mut().expect("ready peers"),
-            route.identity().domain,
-            route.identity().domain_generation,
-            lanes,
-        )
-        .map_err(|error| retirement::failure("begin-peer", error))?;
-    let row = &mut (&mut *core::ptr::addr_of_mut!(NATIVE_PEERS))[index];
-    (&mut *core::ptr::addr_of_mut!(SOURCES))
-        .begin_retirement(row.source, |physical| (row.verify)(physical))
-        .map_err(|error| retirement::failure("begin-source", error))?;
-    row.quarantined = true;
+    let lanes = lanes();
     let _saved = crate::ipc_message::SavedMessageBuffer::capture();
     installation
         .retire_effect(

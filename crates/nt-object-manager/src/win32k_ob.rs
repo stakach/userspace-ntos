@@ -311,6 +311,8 @@ pub fn object_type_matches(kind: ObKind, expected_type_ptr: u64) -> bool {
 
 /// DESKTOP body field offsets (`references/reactos/win32ss/user/ntuser/desktop.h` `struct _DESKTOP`).
 pub mod desktop {
+    /// `DESKTOP.dwSessionId`; the parent `WINSTATION_OBJECT.dwSessionId` is also its first field.
+    pub const SESSION_ID: usize = 0;
     /// `PDESKTOPINFO pDeskInfo` — the desktop-info block hung off the DESKTOP body.
     pub const P_DESK_INFO: usize = 0x08;
     /// `LIST_ENTRY PtiList` — the desktop's thread-info list head (desktop.h). Offset from the
@@ -361,6 +363,8 @@ pub const OB_SECURITY_DESCRIPTOR_MAX: usize = 1024;
 struct ObjectEntry {
     kind: ObKind,
     body: u64,
+    /// ObjectHandleFlagInformation belongs to the handle, not the shared object body.
+    handle_flags: [u8; 2],
     pointer_count: u32,
     handle_count: u32,
     security_len: usize,
@@ -390,6 +394,7 @@ impl ObjectEntry {
         Self {
             kind,
             body,
+            handle_flags: [0, 0],
             // A published USER object starts with one handle. ObInsertObject consumes the creator
             // reference while establishing that handle, so the initial pointer and handle counts
             // are both one.
@@ -474,6 +479,13 @@ impl ObjectEntry {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct AliasEntry {
+    kind: ObKind,
+    body: u64,
+    handle_flags: [u8; 2],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct NamedDesktopEntry {
     root_body: u64,
     leaf_len: u8,
@@ -522,7 +534,7 @@ pub struct ObHandleTable {
     winsta_handle: u64,
     winsta_body: u64,
     /// USER-object aliases minted for `NtDuplicateObject`, indexed by a high-range external handle.
-    aliases: [Option<(ObKind, u64)>; OB_ALIASES_LEN],
+    aliases: [Option<AliasEntry>; OB_ALIASES_LEN],
     /// Named DESKTOP objects under WINDOWSTATION directories. Real Ob lookup uses the root directory
     /// handle and leaf name; this compact table preserves that semantic without allocating.
     named_desktops: [Option<NamedDesktopEntry>; OB_NAMED_DESKTOPS_LEN],
@@ -672,13 +684,18 @@ impl ObHandleTable {
         if !canonical.transfer_pointer_to_handle() {
             return None;
         }
-        self.aliases[index] = Some((kind, body));
+        self.aliases[index] = Some(AliasEntry {
+            kind,
+            body,
+            handle_flags: [0, 0],
+        });
         Some(OB_ALIAS_HANDLE_BASE + (index as u64) * 4)
     }
 
     /// Create a distinct alias for an existing win32k object.
     pub fn duplicate(&mut self, handle: u64) -> Option<u64> {
         let (kind, body) = self.lookup(handle)?;
+        let handle_flags = self.handle_flags(handle)?;
         let index = self.aliases.iter().position(Option::is_none)?;
         let canonical = self
             .slots
@@ -688,7 +705,11 @@ impl ObHandleTable {
         if !canonical.open_handle() {
             return None;
         }
-        self.aliases[index] = Some((kind, body));
+        self.aliases[index] = Some(AliasEntry {
+            kind,
+            body,
+            handle_flags,
+        });
         Some(OB_ALIAS_HANDLE_BASE + (index as u64) * 4)
     }
 
@@ -698,9 +719,17 @@ impl ObHandleTable {
         let Some(index) = Self::alias_index(handle) else {
             return false;
         };
-        let Some((kind, body)) = self.aliases.get(index).copied().flatten() else {
+        let Some(AliasEntry {
+            kind,
+            body,
+            handle_flags,
+        }) = self.aliases.get(index).copied().flatten()
+        else {
             return false;
         };
+        if handle_flags[1] != 0 {
+            return false;
+        }
         let Some(canonical) = self
             .slots
             .iter_mut()
@@ -720,7 +749,7 @@ impl ObHandleTable {
     /// handle. Only values in the exact canonical or alias ranges can resolve.
     pub fn lookup(&self, handle: u64) -> Option<(ObKind, u64)> {
         if let Some(index) = Self::alias_index(handle) {
-            return self.aliases[index];
+            return self.aliases[index].map(|entry| (entry.kind, entry.body));
         }
         let index = Self::canonical_index(handle)?;
         self.slots
@@ -728,6 +757,40 @@ impl ObHandleTable {
             .copied()
             .flatten()
             .map(ObjectEntry::pair)
+    }
+
+    /// Query exact live USER handle flags (Inherit, ProtectFromClose). Aliases each own flags.
+    pub fn handle_flags(&self, handle: u64) -> Option<[u8; 2]> {
+        if let Some(index) = Self::alias_index(handle) {
+            return self.aliases[index].map(|entry| entry.handle_flags);
+        }
+        let index = Self::canonical_index(handle)?;
+        Some(self.slots.get(index)?.as_ref()?.handle_flags)
+    }
+
+    /// `OBJECT_HANDLE_INFORMATION.HandleAttributes` for one exact live USER handle.
+    pub fn handle_attributes(&self, handle: u64) -> Option<u32> {
+        let [inherit, protect_from_close] = self.handle_flags(handle)?;
+        Some(u32::from(inherit != 0) * 2 | u32::from(protect_from_close != 0))
+    }
+
+    /// Set the two ObjectHandleFlagInformation bytes for the exact live USER handle.
+    pub fn set_handle_flags(&mut self, handle: u64, flags: [u8; 2]) -> bool {
+        if let Some(index) = Self::alias_index(handle) {
+            let Some(entry) = self.aliases[index].as_mut() else {
+                return false;
+            };
+            entry.handle_flags = flags;
+            return true;
+        }
+        let Some(index) = Self::canonical_index(handle) else {
+            return false;
+        };
+        let Some(entry) = self.slots[index].as_mut() else {
+            return false;
+        };
+        entry.handle_flags = flags;
+        true
     }
 
     /// Resolve a handle to its body, or 0 if it is not a registered win32k object handle.
@@ -749,6 +812,16 @@ impl ObHandleTable {
         match self.unique_body_location(body)? {
             BodyLocation::Published(index) => Some(self.slots[index].as_ref()?.kind),
             BodyLocation::Pending(index) => Some(self.pending[index].as_ref()?.entry.kind),
+        }
+    }
+
+    /// `ObGetObjectType` for a canonical USER object body. Unknown, retired, ambiguous, and
+    /// unrecognized `Other` bodies have no provable type identity and must not return a pointer.
+    pub fn object_type_addr_by_body(&self, body: u64) -> Option<u64> {
+        match self.kind_by_body(body)? {
+            ObKind::Desktop => Some(crate::object_type::desktop_object_type_addr()),
+            ObKind::WindowStation => Some(crate::object_type::window_station_object_type_addr()),
+            ObKind::Other => None,
         }
     }
 
@@ -853,7 +926,7 @@ impl ObHandleTable {
 
     fn canonical_slot_index(&self, handle: u64) -> Option<usize> {
         if let Some(index) = Self::alias_index(handle) {
-            let (kind, body) = self.aliases[index]?;
+            let AliasEntry { kind, body, .. } = self.aliases[index]?;
             return self
                 .slots
                 .iter()
@@ -1127,6 +1200,29 @@ pub unsafe fn init_desktop_body(desktop_body: *mut u8, desktop_info: u64) {
     }
 }
 
+/// Bind a newly allocated desktop to its creator's session only when its exact parent station
+/// belongs to that same session. The native desktop parse callback makes this assignment before
+/// publishing the object; our hosted parse adapter must do likewise.
+///
+/// # Safety
+/// Both pointers must refer to live, readable bodies of the indicated types. `desktop_body`
+/// must be writable and must not yet be published.
+pub unsafe fn bind_desktop_session(
+    desktop_body: *mut u8,
+    parent_station_body: *const u8,
+    current_session_id: u32,
+) -> bool {
+    if desktop_body.is_null() || parent_station_body.is_null() {
+        return false;
+    }
+    let parent_session_id = core::ptr::read_unaligned(parent_station_body as *const u32);
+    if parent_session_id != current_session_id {
+        return false;
+    }
+    core::ptr::write_unaligned(desktop_body.add(desktop::SESSION_ID) as *mut u32, current_session_id);
+    true
+}
+
 /// Insert a THREADINFO into a DESKTOP's `PtiList`, matching `InsertTailList` in
 /// `IntSetThreadDesktop`. Returns `false` when the desktop list head was not initialized or the
 /// thread entry is already linked elsewhere.
@@ -1262,6 +1358,34 @@ mod tests {
     }
 
     #[test]
+    fn object_type_lookup_uses_exact_live_body_and_refuses_unknown_kind() {
+        use crate::object_type::{desktop_object_type_addr, window_station_object_type_addr};
+        let mut table = ObHandleTable::new();
+        let desktop = 0xD00D_0000;
+        let station = 0x5700_0000;
+        let other = 0xBEEF_0000;
+        table.register(ObKind::Desktop, desktop);
+        table.register(ObKind::WindowStation, station);
+        table.register(ObKind::Other, other);
+
+        assert_eq!(table.object_type_addr_by_body(desktop), Some(desktop_object_type_addr()));
+        assert_eq!(table.object_type_addr_by_body(station), Some(window_station_object_type_addr()));
+        assert_eq!(table.object_type_addr_by_body(other), None);
+        assert_eq!(table.object_type_addr_by_body(0xDEAD_0000), None);
+        assert_eq!(table.object_type_addr_by_body(0), None);
+
+        let provisional = 0xCAFE_0000;
+        assert!(table.latch_pending(ObKind::Desktop, provisional));
+        assert_eq!(table.object_type_addr_by_body(provisional), Some(desktop_object_type_addr()));
+        assert_eq!(
+            table.release_pending_by_body(provisional),
+            Some(PendingObjectRelease::Final(ObKind::Desktop))
+        );
+        assert_eq!(table.object_type_addr_by_body(provisional), None);
+        assert_eq!(table.object_type_addr_by_body(station), Some(window_station_object_type_addr()));
+    }
+
+    #[test]
     fn handles_are_disjoint_and_unique_with_clear_tag_bits() {
         let mut t = ObHandleTable::new();
         let a = t.register(ObKind::Desktop, 0x1000);
@@ -1334,6 +1458,53 @@ mod tests {
         assert_eq!(t.lookup(original), Some((ObKind::Desktop, 0xD00D_0000)));
         assert!(!t.close(duplicate));
         assert_eq!(t.duplicate(original), Some(duplicate));
+    }
+
+    #[test]
+    fn user_handle_flags_follow_exact_live_handle_not_shared_object_body() {
+        let mut t = ObHandleTable::new();
+        let station = t.register(ObKind::WindowStation, 0x5700_0000);
+        let desktop = t.register(ObKind::Desktop, 0xD00D_0000);
+        let alias = t.duplicate(station).unwrap();
+
+        assert_eq!(t.handle_flags(station), Some([0, 0]));
+        assert_eq!(t.handle_flags(alias), Some([0, 0]));
+        assert!(t.set_handle_flags(station, [1, 0]));
+        assert_eq!(t.handle_flags(station), Some([1, 0]));
+        assert_eq!(t.handle_flags(alias), Some([0, 0]));
+        assert_eq!(t.handle_flags(desktop), Some([0, 0]));
+
+        let inherited = t.duplicate(station).unwrap();
+        assert_eq!(t.handle_flags(inherited), Some([1, 0]));
+        assert!(t.set_handle_flags(alias, [0, 1]));
+        assert_eq!(t.handle_flags(alias), Some([0, 1]));
+        assert_eq!(t.handle_flags(station), Some([1, 0]));
+        assert!(!t.close(alias));
+        assert!(t.set_handle_flags(alias, [0, 0]));
+        assert!(!t.set_handle_flags(OB_HANDLE_BASE + 4 * 31, [1, 1]));
+        assert_eq!(t.handle_flags(OB_ALIAS_HANDLE_BASE + 4 * 31), None);
+
+        assert!(t.close(inherited));
+        assert_eq!(t.handle_flags(inherited), None);
+        assert!(!t.set_handle_flags(inherited, [1, 0]));
+        assert!(t.close(alias));
+        assert_eq!(t.handle_flags(alias), None);
+    }
+
+    #[test]
+    fn user_reference_handle_attributes_project_exact_handle_flags() {
+        let mut table = ObHandleTable::new();
+        let desktop = table.register(ObKind::Desktop, 0xD00D_0000);
+        let alias = table.duplicate(desktop).unwrap();
+
+        assert_eq!(table.handle_attributes(desktop), Some(0));
+        assert_eq!(table.handle_attributes(alias), Some(0));
+        assert!(table.set_handle_flags(desktop, [1, 0]));
+        assert!(table.set_handle_flags(alias, [0, 1]));
+        assert_eq!(table.handle_attributes(desktop), Some(0x2)); // OBJ_INHERIT
+        assert_eq!(table.handle_attributes(alias), Some(0x1)); // OBJ_PROTECT_CLOSE
+        assert_eq!(table.handle_attributes(OB_ALIAS_HANDLE_BASE + 4 * 31), None);
+        assert_eq!(table.handle_attributes(0), None);
     }
 
     #[test]
@@ -1784,6 +1955,24 @@ mod tests {
             let p =
                 core::ptr::read_unaligned(body.as_ptr().add(desktop::P_DESK_INFO) as *const u64);
             assert_eq!(p, 0xDEC0_0000);
+        }
+    }
+
+    #[test]
+    fn desktop_session_uses_current_process_only_for_its_exact_parent_station() {
+        let mut desktop = [0u8; DESKTOP_BODY_SIZE as usize];
+        let mut station = [0u8; 0x100];
+        station[..4].copy_from_slice(&1u32.to_le_bytes());
+        unsafe {
+            assert!(!bind_desktop_session(
+                desktop.as_mut_ptr(), station.as_ptr(), 0,
+            ));
+            assert_eq!(u32::from_le_bytes(desktop[..4].try_into().unwrap()), 0,
+                "a foreign session must not publish or mutate the desktop");
+            assert!(bind_desktop_session(
+                desktop.as_mut_ptr(), station.as_ptr(), 1,
+            ));
+            assert_eq!(u32::from_le_bytes(desktop[..4].try_into().unwrap()), 1);
         }
     }
 

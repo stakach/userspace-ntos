@@ -8,12 +8,19 @@
 #![no_std]
 
 pub mod caller_aperture;
+pub mod caller_pool_map;
+pub mod dirty_rect;
+#[cfg(test)]
+mod caller_pool_map_tests;
 pub mod caller_memory;
 mod child_ids;
 pub mod mode_evidence;
 pub mod video_children;
 mod control;
-pub use control::{classify_start_io_status, VideoControlCompletion, VideoControlProtocolError};
+pub use control::{
+    classify_start_io_status, video_port_control_owner, VideoControlCompletion,
+    VideoControlProtocolError, VideoPortControlOwner,
+};
 mod lifecycle;
 mod pnp;
 pub use child_ids::{write_monitor_child_id, MonitorChildIdError, MonitorChildIdResult};
@@ -47,6 +54,7 @@ pub const IOCTL_VIDEO_QUERY_CURRENT_MODE: u32 = 0x0023_0408;
 pub const IOCTL_VIDEO_SET_CURRENT_MODE: u32 = 0x0023_040C;
 pub const IOCTL_VIDEO_MAP_VIDEO_MEMORY: u32 = 0x0023_0458;
 pub const IOCTL_VIDEO_INIT_WIN32K_CALLBACKS: u32 = 0x0023_001C;
+pub const IOCTL_VIDEO_ENUM_MONITOR_PDO: u32 = 0x0023_0018;
 pub const IOCTL_VIDEO_UNMAP_VIDEO_MEMORY: u32 = 0x0023_045C;
 
 pub const VIDEO_NUM_MODES_SIZE: usize = 8;
@@ -711,7 +719,9 @@ impl<A: VideoMiniportAdapter> VideoPort<A> {
             IOCTL_VIDEO_INIT_WIN32K_CALLBACKS => {
                 write_win32k_callbacks(input, output, self.video_device_object)
             }
-            IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => Err(VideoMiniportError::UnsupportedIoctl),
+            IOCTL_VIDEO_ENUM_MONITOR_PDO | IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => {
+                Err(VideoMiniportError::UnsupportedIoctl)
+            }
             _ => self.adapter.dispatch_io_control(ioctl, input, output),
         }
     }
@@ -743,7 +753,9 @@ impl<A: VideoMiniportAdapter> VideoPort<A> {
                     self.video_device_object,
                 )
             }
-            IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => Err(VideoMiniportError::UnsupportedIoctl),
+            IOCTL_VIDEO_ENUM_MONITOR_PDO | IOCTL_VIDEO_UNMAP_VIDEO_MEMORY => {
+                Err(VideoMiniportError::UnsupportedIoctl)
+            }
             _ => self.adapter.dispatch_buffered_io_control(
                 ioctl,
                 system_buffer,

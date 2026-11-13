@@ -1,11 +1,11 @@
 //! Selected logical-thread execution state, retained on the provider continuation stack.
 
 use super::*;
-use nt_kernel_abi::ps_reactos_x64::{self as abi, ThreadPreviousMode};
+use nt_kernel_abi::ps_hosted_x64::{self as abi, ThreadPreviousMode};
 
 unsafe fn selected_body() -> u64 {
     let body = current_ethread();
-    let tid = WIN32K_CURRENT_THREAD_ID.load(Ordering::Relaxed);
+    let tid = current_lane_ids().thread_id.load(Ordering::Relaxed);
     if body == 0
         || tid == 0
         || read_volatile(body as *const u8) != 6

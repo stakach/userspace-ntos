@@ -197,6 +197,35 @@ pub(crate) unsafe fn create_initial_thread(
     }
 }
 
+/// Redrive only the retained local completion. The physical Start invocation was already
+/// recorded by the suspension owner; this path cannot issue another resume_initial IPC.
+pub(crate) unsafe fn resolve_initial_thread_start(
+    handler: &mut ExecNtHandler,
+    lifetime: nt_process::ThreadLifetime,
+    binding: nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+) -> InitialThreadStartOutcome {
+    let result = finish_control(handler, binding, lifetime, None);
+    match result {
+        Ok(_) => InitialThreadStartOutcome::Committed,
+        Err(status) => {
+            let settled_rejection = entry(handler, u64::from(lifetime.thread_id()))
+                .filter(|runtime| runtime.binding() == binding)
+                .and_then(|runtime| {
+                    let slot = runtime.suspension.owner.try_borrow().ok()?;
+                    Some(slot.as_ref()?.validate_unstarted_idle(
+                        &handler.pm, binding, lifetime,
+                    ).is_ok())
+                })
+                .unwrap_or(false);
+            if settled_rejection {
+                InitialThreadStartOutcome::RefusedNoEffects(status)
+            } else {
+                InitialThreadStartOutcome::Retained(status)
+            }
+        }
+    }
+}
+
 /// Called only after retirement has acknowledged deletion of this runtime's TCB.
 pub(crate) unsafe fn tcb_deleted(handler: &ExecNtHandler, tid: u64, tcb: u64) -> bool {
     let Some(runtime) = entry(handler, tid).filter(|runtime| runtime.tcb == tcb) else {

@@ -153,7 +153,7 @@ impl GuiExitOwner {
             return Err(GuiExitError::InvalidContext);
         }
         let id = counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 if value == 0 {
                     None
                 } else {

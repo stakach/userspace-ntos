@@ -64,6 +64,10 @@ pub(super) fn pipe_rw(
     before: Option<PipeCcbView>,
     after: Option<PipeCcbView>,
 ) {
+    static TRACE_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    if !crate::DEBUG_TRACE && !crate::bounded_trace_sample(&TRACE_COUNT, 8) {
+        return;
+    }
     let mut record = RecordBuffer::<2048>::new();
     let _ = write!(&mut record,
         "[fsd-pipe-rw] major={major} fid=0x{:08x} end={} fsctx=0x{:08x} len={length} status=0x{status:08x} info={info}",

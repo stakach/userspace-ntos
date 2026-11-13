@@ -359,7 +359,7 @@ pub(super) extern "win64" fn iof_call_driver(device: u64, irp: u64) -> i32 {
             Ok(source) => source,
             Err(status) => return status,
         };
-        let nonce = match NEXT_FSD_NONCE.fetch_update(
+        let nonce = match NEXT_FSD_NONCE.try_update(
             Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1),
         ) {
             Ok(nonce) if nonce != 0 => nonce,

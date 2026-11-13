@@ -59,7 +59,15 @@ fn register_with_list_owner(
     }
     unsafe { hosted_device_allocations::protect_allocation(inst, address) }.map_err(|status|
         ProjectionPublicationError { status, retained: hosted_device_allocations::protects_allocation(inst, address), accepted: None, cleanup_unbound: !existing })?;
-    unsafe { hosted_device_allocations::stage_driver_object(inst, address, list_owner) }.map_err(|status|
+    // Bus-created unlinked PDO projections deliberately use FILE_DEVICE_UNKNOWN even when
+    // their canonical Device record has a more specific class. IoCreateDevice's linked FDO
+    // must still match the caller-supplied type captured by the canonical operation.
+    let device_type = if list_owner == hosted_device_allocations::DeviceListOwner::Linked {
+        io_manager_mut().device(device)
+            .ok_or(ProjectionPublicationError { status: nt_status::NtStatus::INVALID_HANDLE,
+                retained: true, accepted: None, cleanup_unbound: !existing })?.device_type.0
+    } else { nt_io_manager::DeviceType::UNKNOWN.0 };
+    unsafe { hosted_device_allocations::stage_device_projection(inst, address, list_owner, device_type) }.map_err(|status|
         ProjectionPublicationError { status, retained: true, accepted: None, cleanup_unbound: !existing })?;
     let registration = io_manager_mut().bind_hosted_device_pointer(domain, address, device)
         .map_err(|status| ProjectionPublicationError { status, retained: true, accepted: None, cleanup_unbound: !existing })?;

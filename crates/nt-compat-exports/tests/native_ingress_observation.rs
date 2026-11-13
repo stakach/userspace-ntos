@@ -115,17 +115,31 @@ fn pump_heartbeat_observes_only_after_runtime_receive_releases_its_borrow() {
     struct BoundaryAudit(usize);
     impl<'ast> Visit<'ast> for BoundaryAudit {
         fn visit_block(&mut self, block: &'ast syn::Block) {
-            for pair in block.stmts.windows(2) {
-                let syn::Stmt::Local(local) = &pair[0] else { continue; };
+            for (index, statement) in block.stmts.iter().enumerate() {
+                let syn::Stmt::Local(local) = statement else { continue; };
                 let syn::Pat::Ident(binding) = &local.pat else { continue; };
                 let Some(init) = &local.init else { continue; };
                 let syn::Expr::Call(call) = init.expr.as_ref() else { continue; };
                 if !matches!(&*call.func, syn::Expr::Path(path)
                     if path.path.segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>()
                         == ["runtime", "receive"]) { continue; }
-                let syn::Stmt::Expr(syn::Expr::Match(expression), _) = &pair[1] else { continue; };
+                let Some((distance, syn::Stmt::Expr(syn::Expr::Match(expression), _))) =
+                    block.stmts[index + 1..].iter().take(3).enumerate().find(|(_, statement)| {
+                        matches!(statement, syn::Stmt::Expr(syn::Expr::Match(_), _))
+                    }) else { continue; };
                 if !matches!(&*expression.expr, syn::Expr::Path(path)
                     if path.path.get_ident() == Some(&binding.ident)) { continue; }
+                // Aggregate timing may sit between the released Receive borrow and its arrival
+                // match, but it must not enter another owner, transport, or semantic handler.
+                let mut between = ObservationAudit::default();
+                for statement in &block.stmts[index + 1..index + 1 + distance] {
+                    between.visit_stmt(statement);
+                }
+                assert!(between.calls.iter().all(|call| matches!(call.as_str(),
+                    "disk_census_ticks" | "badge_has_delay_timer")));
+                assert!(between.methods.iter().all(|method| matches!(method.as_str(),
+                    "fetch_add" | "wrapping_sub" | "badge")));
+                assert!(!between.mutable_reference);
                 for arm in &expression.arms {
                     let syn::Pat::TupleStruct(ok) = &arm.pat else { continue; };
                     let Some(syn::Pat::TupleStruct(arrival)) = ok.elems.first() else { continue; };

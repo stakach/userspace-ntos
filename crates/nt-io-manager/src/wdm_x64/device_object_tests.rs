@@ -62,23 +62,25 @@ fn allocation_planner_keeps_logical_size_separate_from_aligned_kernel_storage() 
 }
 
 #[test]
-fn unrepresentable_logical_size_is_rejected_without_mutating_storage() {
-    let maximum = u16::MAX as u32 - WDM_X64_DEVICE_OBJECT_SIZE as u32;
-    for driver_size in [maximum + 1, u32::MAX] {
-        assert_eq!(
-            WdmDeviceObjectAllocationLayout::plan(driver_size),
-            Err(WdmLayoutError::InvalidField)
-        );
-        let mut bytes = alloc::vec![0xcc; 0x10100];
-        let original = bytes.clone();
-        let mut initialization = init(DEVICE_ADDRESS, 0x0b);
-        initialization.driver_extension_size = driver_size;
-        assert_eq!(
-            write_wdm_device_object(&mut bytes, initialization),
-            Err(WdmLayoutError::InvalidField)
-        );
-        assert_eq!(bytes, original);
-    }
+fn large_driver_extension_preserves_allocation_and_truncates_size_field() {
+    // LiberNT dxgkrnl's AddDevice passes sizeof(DXGKRNL_ADAPTER) = 0x17128.
+    // ReactOS IoCreateDevice allocates the full ULONG extent and assigns
+    // DEVICE_OBJECT.Size = sizeof(DEVICE_OBJECT) + (USHORT)DeviceExtensionSize.
+    let driver_size = 0x17128;
+    let layout = WdmDeviceObjectAllocationLayout::plan(driver_size).unwrap();
+    let logical = WDM_X64_DEVICE_OBJECT_SIZE + driver_size as usize;
+    let kernel = (logical + 15) & !15;
+    assert_eq!(layout.size_field(), logical as u16);
+    assert_eq!(layout.kernel_extension_offset(), kernel);
+    assert_eq!(layout.allocation_size(), kernel + WDM_X64_DEVICE_OBJECT_EXTENSION_SIZE);
+    let mut bytes = alloc::vec![0xcc; layout.allocation_size()];
+    let mut initialization = init(DEVICE_ADDRESS, 0x0b);
+    initialization.driver_extension_size = driver_size;
+    write_wdm_device_object(&mut bytes, initialization).unwrap();
+    assert_eq!(u16::from_le_bytes(bytes[2..4].try_into().unwrap()), logical as u16);
+    assert_eq!(u64_at(&bytes, 0x40), DEVICE_ADDRESS + WDM_X64_DEVICE_OBJECT_SIZE as u64);
+    assert_eq!(u64_at(&bytes, 0x138), DEVICE_ADDRESS + kernel as u64);
+    assert!(bytes[WDM_X64_DEVICE_OBJECT_SIZE..kernel].iter().all(|byte| *byte == 0));
 }
 
 #[test]

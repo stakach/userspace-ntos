@@ -4,7 +4,7 @@ use super::{SnapshotBlockDevice, SnapshotBlockStoreError, SnapshotPayloadSink};
 use alloc::vec::Vec;
 use nt_config_store::codec::Crc32c;
 
-pub(super) const WRITE_BATCH_SECTORS: usize = 4;
+pub(super) const WRITE_BATCH_SECTORS: usize = 32;
 
 /// Bounded whole-sector payload staging for snapshot commits.
 pub struct PayloadSectorWriter<'a, D: SnapshotBlockDevice> {

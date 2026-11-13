@@ -75,7 +75,7 @@ impl ProcessManager {
             .try_reserve(reserve)
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         let nonce = NEXT_REGISTRATION
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;

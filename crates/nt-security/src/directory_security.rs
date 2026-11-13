@@ -42,7 +42,7 @@ pub fn authorize_directory_open(
     desired_access: u32,
     mode: ProcessorMode,
 ) -> Result<AccessCheckResult, u32> {
-    crate::object_security::authorize(
+    crate::object_security::authorize_directory(
         subject,
         descriptor,
         desired_access,

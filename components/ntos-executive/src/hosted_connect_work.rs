@@ -90,6 +90,21 @@ impl RetainedConnectWork {
         &mut self.origin
     }
 
+    pub(super) fn origin(&self) -> &hosted_forward_origin::HostedForwardOrigin {
+        &self.origin
+    }
+
+    pub(super) unsafe fn nested_preparation_ready(&self) -> bool {
+        let Ok(command) = self.completion_command() else { return false };
+        use nt_io_manager::source_irp_ledger::SourceIrpOwner;
+        let instance = match command.allocation.owner {
+            SourceIrpOwner::HostedDriver(index) | SourceIrpOwner::HostedCaller(index) => index,
+            SourceIrpOwner::Win32k => return false,
+        };
+        self.origin.terminal_ready(command)
+            && hosted_source_completion_lane::preparation_ready(instance, command)
+    }
+
     pub(super) fn forward(&self) -> Option<&nt_io_manager::retained_connect_forward::RetainedConnectForward> {
         self.source.forward_ref()
     }
@@ -150,6 +165,25 @@ impl RetainedConnectWork {
 
     pub(super) fn terminal_status(&self) -> Option<nt_status::NtStatus> {
         self.terminal_status
+    }
+
+    /// A nested parent may select this source only when its exact completion lane can
+    /// advance. An entered provider or a terminal status alone is not a child step.
+    pub(super) unsafe fn terminal_step_ready(&self) -> bool {
+        let Ok(command) = self.source.completion_command(self.origin.token) else {
+            return false;
+        };
+        self.terminal_status.is_some() && self.origin.terminal_ready(command)
+    }
+
+    /// Read-only monotonic completion witness, including partial source publication.
+    /// A retained completion can advance and still return false while its unwinder waits.
+    pub(super) fn terminal_progress(&self) -> (
+        bool, bool, bool, bool,
+        nt_io_manager::hosted_forward_progress::HostedForwardOriginProgress,
+    ) {
+        (self.published, self.terminal_consumed, self.source_retired,
+            self.completion_acknowledged, self.origin.progress())
     }
 
     /// An exact source continuation and its origin receipt have both completed. A provider

@@ -439,6 +439,32 @@ fn system_hive_overlay_rebases_selected_subtree_and_preserves_base_selection() {
 }
 
 #[test]
+fn system_hive_overlay_keeps_persisted_sequence_as_clean_baseline() {
+    let mut base = Hive::new(HiveKind::System);
+    let select = base.create_key("Select");
+    base.set_dword(select, "Current", 1);
+    let service = base.create_key(r"ControlSet001\Services\Persistent");
+    base.finish_clean_import();
+    assert!(base.set_dword(service, "Durable", 1));
+    assert_eq!(base.sequence, 1);
+
+    let mut generated = Hive::new(HiveKind::System);
+    let select = generated.create_key("Select");
+    generated.set_dword(select, "Current", 1);
+    let generated_service = generated.create_key(r"ControlSet001\Services\Generated");
+    generated.set_dword(generated_service, "Start", 1);
+    generated.finish_clean_import();
+
+    let mut composed = compose_system_hive_overlay(&base, &generated).unwrap();
+    assert_eq!(composed.sequence, 1);
+    assert_eq!(composed.dirty_count(), 0);
+    let generated_service = composed.open_key(r"ControlSet001\Services\Generated").unwrap();
+    assert!(composed.set_dword(generated_service, "Runtime", 2));
+    assert_eq!(composed.sequence, 2);
+    assert!(composed.dirty_count() > 0);
+}
+
+#[test]
 fn hive_delete_key_removes_only_leaf_keys() {
     let mut h = Hive::new(HiveKind::Software);
     let parent = h.create_key(r"Classes\CLSID");

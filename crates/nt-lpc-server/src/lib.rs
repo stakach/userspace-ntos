@@ -37,7 +37,9 @@ use bytemuck::Pod;
 use nt_lpc_abi::{
     connection_state, handle_endpoint, opcode, LpcAcceptConnectRequest, LpcClosePortRequest,
     LpcCompleteConnectRequest, LpcConnectPortRequest, LpcConnectionRequestMetadata,
-    LpcCreatePortRequest, LpcDataMessageMetadata, LpcMessageRequest, LpcQueryHandleRequest,
+    LpcCreatePortRequest, LpcDataMessageMetadata, LpcKernelAcceptConnectRequest,
+    LpcKernelConnectNamedRequest,
+    LpcMessageRequest, LpcQueryHandleRequest,
     LpcQueryHandleResponse, LpcQueryRequestRequest, LpcQueryRequestResponse, LpcReceiveRequest,
     LpcReply, LpcRequestIdentityRequest, LPC_ACCEPT_RESPONSE_INFO, LPC_QUERY_HANDLE_NAME_MAX_UNITS,
 };
@@ -140,6 +142,8 @@ impl Server {
             opcode::LPC_OP_CONNECT_PORT => self.op_connect_port(in_buf),
             opcode::LPC_OP_ACCEPT_CONNECT => self.op_accept_connect(in_buf),
             opcode::LPC_OP_COMPLETE_CONNECT => self.op_complete_connect(in_buf, out_buf),
+            opcode::LPC_OP_KERNEL_ACCEPT_CONNECT => self.op_kernel_accept_connect(in_buf),
+            opcode::LPC_OP_KERNEL_CONNECT_NAMED => self.op_kernel_connect_named(in_buf),
             opcode::LPC_OP_REPLY_WAIT_RECEIVE | opcode::LPC_OP_LISTEN_PORT => {
                 self.op_receive(in_buf, out_buf)
             }
@@ -208,6 +212,68 @@ impl Server {
             },
         )?;
         Ok(reply(NtStatus::SUCCESS, 0, handle, 0))
+    }
+
+    fn op_kernel_accept_connect(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
+        let req: LpcKernelAcceptConnectRequest = read_req(buf)?;
+        if buf.len() != size_of::<LpcKernelAcceptConnectRequest>()
+            || req.abi_size as usize != buf.len()
+            || req._reserved != 0 || req._reserved2 != 0
+            || req.listen_port == 0 || req.connection_id == 0
+            || req.client_process == 0 || req.client_thread == 0
+        { return Err(NtStatus::INVALID_PARAMETER); }
+        let listen = self.core.handle_info(req.listen_port)
+            .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        if listen.endpoint != PortHandleEndpoint::ListenPort
+            || listen.server_id.process != 0
+        { return Err(NtStatus::ACCESS_DENIED); }
+        if self.core.connection_client_id(req.connection_id) != Some(ClientId {
+            process: req.client_process, thread: req.client_thread,
+        }) { return Err(NtStatus::ACCESS_DENIED); }
+        if self.core.connection_state(req.connection_id) != Some(ConnState::Pending) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        if self.core.peek_pending_connection(req.listen_port)
+            .map(|(id, _)| id) != Some(req.connection_id)
+        { return Ok(reply(NtStatus::PENDING, 0, 0, 0)); }
+        match self.core.receive(req.listen_port)? {
+            ReceiveOutcome::ConnectionRequest { connection_id, .. }
+                if connection_id == req.connection_id => {},
+            _ => return Err(NtStatus::INVALID_PARAMETER),
+        }
+        let server_handle = self.core.accept(req.connection_id, true, 0)?;
+        let (client_handle, completed_id) = self.core.complete(req.connection_id)?;
+        if completed_id != req.connection_id { return Err(NtStatus::INVALID_PARAMETER); }
+        Ok(reply(NtStatus::SUCCESS, 0, client_handle, server_handle))
+    }
+
+    fn op_kernel_connect_named(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
+        let req: LpcKernelConnectNamedRequest = read_req(buf)?;
+        if req.abi_size as usize != size_of::<LpcKernelConnectNamedRequest>()
+            || req._reserved != 0 || req._reserved2 != 0
+            || req.name_offset as usize != size_of::<LpcKernelConnectNamedRequest>()
+            || req.name_len_bytes == 0
+            || buf.len() != req.name_offset as usize + req.name_len_bytes as usize
+            || req.server_process == 0
+        { return Err(NtStatus::INVALID_PARAMETER); }
+        let name = read_name(buf, req.name_offset, req.name_len_bytes)?;
+        let handle = self.core.named_listen_port_handle(&name)
+            .ok_or(NtStatus::OBJECT_NAME_NOT_FOUND)?;
+        let listen = self.core.handle_info(handle)
+            .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        if listen.endpoint != PortHandleEndpoint::ListenPort
+            || listen.server_id.process != req.server_process
+        { return Err(NtStatus::ACCESS_DENIED); }
+        let api = listen.api;
+        match self.core.connect_with_client_id_and_security(&name, api, 0, &[],
+            ClientId::default(), ConnectionSecurity {
+                impersonation_level: 2, dynamic_tracking: true, effective_only: true,
+            })? {
+            ConnectOutcome::Pending { connection_id } =>
+                Ok(reply(NtStatus::PENDING, 0, 0, connection_id)),
+            ConnectOutcome::Completed { client_handle, connection_id } =>
+                Ok(reply(NtStatus::SUCCESS, 0, client_handle, connection_id)),
+        }
     }
 
     fn op_connect_port(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
@@ -2506,5 +2572,60 @@ mod tests {
         let received = c.reply_wait_receive(first_server).unwrap();
         assert_eq!(received.connection_id, second_connection);
         assert_eq!(received.msg_type, msg_type::LPC_CONNECTION_REQUEST);
+    }
+
+    #[test]
+    fn kernel_listener_accepts_exact_pending_alpc_client_atomically() {
+        use nt_port_core::{ClientId, ConnectOutcome, PortApi};
+        let mut server = Server::new();
+        server.set_accept_policy(AcceptPolicy::Manual);
+        let name: Vec<u16> = "\\KernelCommand".encode_utf16().collect();
+        let listen = server.core_mut().create_port_with_owner(&name, PortApi::Lpc,
+            ClientId::default());
+        let client = ClientId { process: 17, thread: 23 };
+        let ConnectOutcome::Pending { connection_id } = server.core_mut()
+            .connect_with_client_id(&name, PortApi::Alpc, 0, b"", client).unwrap()
+        else { panic!("manual accept required"); };
+        let mut request = [0u8; 40];
+        request[..2].copy_from_slice(&40u16.to_le_bytes());
+        request[8..16].copy_from_slice(&listen.to_le_bytes());
+        request[16..24].copy_from_slice(&connection_id.to_le_bytes());
+        request[24..32].copy_from_slice(&client.process.to_le_bytes());
+        request[32..40].copy_from_slice(&client.thread.to_le_bytes());
+        request[24..32].copy_from_slice(&99u64.to_le_bytes());
+        assert_eq!(server.dispatch(0x221b, &request, &mut []).status,
+            NtStatus::ACCESS_DENIED.0);
+        request[24..32].copy_from_slice(&client.process.to_le_bytes());
+        let accepted = server.dispatch(0x221b, &request, &mut []);
+        assert_eq!(accepted.status, NtStatus::SUCCESS.0);
+        assert_ne!(accepted.detail0, 0, "client comm handle");
+        assert_ne!(accepted.detail1, 0, "server comm handle");
+        assert_eq!(server.core_mut().connection_state(connection_id), Some(ConnState::Connected));
+        assert_eq!(server.dispatch(0x221b, &request, &mut []).status,
+            NtStatus::INVALID_PARAMETER.0, "completion cannot replay");
+    }
+
+    #[test]
+    fn kernel_reverse_connect_resolves_live_alpc_listen_and_server_identity() {
+        use nt_port_core::{ClientId, PortApi};
+        let mut server = Server::new();
+        server.set_accept_policy(AcceptPolicy::Manual);
+        let name: Vec<u16> = "\\SeLsaCommandPort".encode_utf16().collect();
+        let owner = ClientId { process: 108, thread: 112 };
+        server.core_mut().create_port_with_owner(&name, PortApi::Alpc, owner);
+        let mut request = Vec::from([0u8; 24]);
+        for unit in &name { request.extend_from_slice(&unit.to_le_bytes()); }
+        request[..2].copy_from_slice(&24u16.to_le_bytes());
+        request[4..8].copy_from_slice(&24u32.to_le_bytes());
+        request[8..12].copy_from_slice(&((name.len() * 2) as u32).to_le_bytes());
+        request[16..24].copy_from_slice(&109u64.to_le_bytes());
+        assert_eq!(server.dispatch(0x221c, &request, &mut []).status,
+            NtStatus::ACCESS_DENIED.0);
+        request[16..24].copy_from_slice(&owner.process.to_le_bytes());
+        let connected = server.dispatch(0x221c, &request, &mut []);
+        assert_eq!(connected.status, NtStatus::PENDING.0);
+        assert_ne!(connected.detail1, 0);
+        assert_eq!(server.core_mut().connection_client_id(connected.detail1),
+            Some(ClientId::default()));
     }
 }

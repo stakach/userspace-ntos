@@ -21,6 +21,7 @@ struct Facts {
     calls: Vec<String>,
     methods: Vec<String>,
     paths: Vec<String>,
+    fields: Vec<String>,
 }
 
 impl<'ast> Visit<'ast> for Facts {
@@ -40,6 +41,22 @@ impl<'ast> Visit<'ast> for Facts {
         self.paths
             .extend(path.path.segments.iter().map(|part| part.ident.to_string()));
         syn::visit::visit_expr_path(self, path);
+    }
+    fn visit_expr_struct(&mut self, expression: &'ast syn::ExprStruct) {
+        self.paths.extend(
+            expression
+                .path
+                .segments
+                .iter()
+                .map(|part| part.ident.to_string()),
+        );
+        syn::visit::visit_expr_struct(self, expression);
+    }
+    fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
+        if let syn::Member::Named(name) = &field.member {
+            self.fields.push(name.to_string());
+        }
+        syn::visit::visit_expr_field(self, field);
     }
 }
 
@@ -236,9 +253,27 @@ fn caller_op7_and_op8_keep_separate_close_and_physical_acknowledgement() {
     let source = syn::parse_file(LEDGER).unwrap();
     struct CallerRetirement {
         found: bool,
+        receipt_ack_found: bool,
     }
     impl<'ast> Visit<'ast> for CallerRetirement {
         fn visit_expr_if(&mut self, branch: &'ast syn::ExprIf) {
+            if matches!(&*branch.cond, syn::Expr::Binary(binary)
+                if matches!(binary.op, syn::BinOp::Eq(_))
+                && matches!(&*binary.left, syn::Expr::Path(path) if path.path.is_ident("op"))
+                && matches!(&*binary.right, syn::Expr::Lit(literal)
+                    if matches!(&literal.lit, syn::Lit::Int(integer)
+                        if matches!(integer.base10_parse::<u64>(), Ok(13)))))
+            {
+                let ack = facts(&branch.then_branch);
+                if contains(&ack.methods, "swap_remove") {
+                    assert!(contains(&ack.fields, "terminal_finished"));
+                    assert!(contains(&ack.calls, "caller_acks"));
+                    assert!(contains(&ack.paths, "CallerTerminalAck"));
+                    assert!(contains(&ack.methods, "try_reserve"));
+                    assert!(contains(&ack.methods, "push"));
+                    self.receipt_ack_found = true;
+                }
+            }
             if matches!(&*branch.cond, syn::Expr::Binary(binary)
                 if matches!(binary.op, syn::BinOp::Eq(_))
                 && matches!(&*binary.left, syn::Expr::Path(path) if path.path.is_ident("op"))
@@ -262,7 +297,8 @@ fn caller_op7_and_op8_keep_separate_close_and_physical_acknowledgement() {
                     "exact_pool_identity_unlocked"
                 ));
                 assert!(contains(&finish.methods, "finish_hosted_caller_retirement"));
-                assert!(contains(&finish.methods, "swap_remove"));
+                assert!(contains(&finish.fields, "terminal_finished"));
+                assert!(!contains(&finish.methods, "swap_remove"));
                 assert!(!contains(
                     &begin.calls,
                     "hosted_instance_pool_free_unlocked"
@@ -276,11 +312,18 @@ fn caller_op7_and_op8_keep_separate_close_and_physical_acknowledgement() {
             syn::visit::visit_expr_if(self, branch);
         }
     }
-    let mut caller = CallerRetirement { found: false };
+    let mut caller = CallerRetirement {
+        found: false,
+        receipt_ack_found: false,
+    };
     caller.visit_block(function(&source, "service"));
     assert!(
         caller.found,
         "retain canonical caller retirement/acknowledgement protocol"
+    );
+    assert!(
+        caller.receipt_ack_found,
+        "keep the finished caller projection until exact receipt acknowledgement"
     );
 }
 

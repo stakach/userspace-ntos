@@ -72,3 +72,18 @@ fn hosted_backend_projects_explicit_transfer_buffers_before_legacy_combined_stor
     assert!(!calls.functions.iter().any(|name| name == "projection_buffer_extents"),
         "explicit extents must not be clipped to SystemBuffer capacity");
 }
+
+#[test]
+fn owned_scsi_dispatch_encodes_canonical_transfer_before_hosted_wire_validation() {
+    let source = syn::parse_file(include_str!(
+        "../../../components/ntos-executive/src/hosted_file_dispatch.rs"
+    )).unwrap();
+    let invoke = source.items.iter().find_map(|item| match item {
+        Item::Fn(function) if function.sig.ident == "invoke" => Some(function),
+        _ => None,
+    }).expect("owned hosted dispatch entry");
+    let mut calls = Calls::default();
+    calls.visit_item_fn(invoke);
+    assert!(calls.functions.iter().any(|name| name == "encode_scsi_dispatch_input"),
+        "owned SCSI transfer must use the canonical packed wire encoder before provider validation");
+}

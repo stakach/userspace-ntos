@@ -9,6 +9,10 @@ pub(crate) fn dispatch(
     op: u64,
     object: u64,
     value: u64,
+    mut materialize_job: impl FnMut(
+        &mut nt_process::ProcessManager,
+        nt_process::job::JobId,
+    ) -> Result<u64, u32>,
     mut project: impl FnMut(&nt_process::ProcessManager, u64) -> Result<(), u32>,
 ) -> (i32, u64, u64, u64) {
     use win32k_subsystem::*;
@@ -46,9 +50,37 @@ pub(crate) fn dispatch(
             };
             Ok((kind, 0, 0))
         }
-        W32_PS_OP_SET_THREAD_PRIORITY => pm
-            .set_kernel_thread_priority(object, value as u32 as i32)
-            .map(|previous| (u64::from(previous as u32), 0, 0)),
+        W32_PS_OP_QUERY_WOW64_PROCESS if value == 0 => pm
+            .wow64_pointer_for_kernel_process_object(object)
+            .map(|pointer| (pointer, 0, 0)),
+        W32_PS_OP_QUERY_MITIGATION_FLAGS => u32::try_from(value)
+            .map_err(|_| INVALID_PARAMETER)
+            .and_then(|selector| {
+                pm.process_mitigation_policy_flags_by_kernel_object(object, selector)
+            })
+            .map(|flags| (u64::from(flags), 0, 0)),
+        W32_PS_OP_QUERY_PROCESS_PEB if value == 0 => pm
+            .peb_for_kernel_process_object(object)
+            .map(|peb| (peb, 0, 0)),
+        W32_PS_OP_QUERY_PROCESS_PEB32 if value == 0 => pm
+            .peb32_for_kernel_process_object(object)
+            .map(|peb32| (peb32, 0, 0)),
+        W32_PS_OP_QUERY_PROCESS_SEQUENCE if value == 0 => pm
+            .process_sequence_for_kernel_process_object(object)
+            .map(|sequence| (sequence, 0, 0)),
+        W32_PS_OP_QUERY_PROCESS_PRIORITY_CLASS if value == 0 => pm
+            .priority_class_for_kernel_process_object(object)
+            .map(|priority_class| (u64::from(priority_class), 0, 0)),
+        W32_PS_OP_QUERY_PROCESS_SESSION_ID_EX if value == 0 => pm
+            .kernel_process_session_id_ex(object)
+            .map(|session_id| (u64::from(session_id), 0, 0))
+            .ok_or(INVALID_HANDLE),
+        W32_PS_OP_SET_PROCESS_PRIORITY_CLASS => u8::try_from(value)
+            .map_err(|_| INVALID_PARAMETER)
+            .and_then(|priority_class| {
+                pm.set_priority_class_for_kernel_process_object(object, priority_class)
+            })
+            .map(|()| (0, 0, 0)),
         W32_PS_OP_LOOKUP_PROCESS => nt_process::ProcessId::try_from(object)
             .map_err(|_| INVALID_PARAMETER)
             .and_then(|pid| pm.lookup_kernel_process_by_id(pid))
@@ -77,6 +109,18 @@ pub(crate) fn dispatch(
                 sel4_rt::yield_now();
                 Ok((0, 0, 0))
             }),
+        W32_PS_OP_QUERY_PROCESS_JOB if value == 0 => pm
+            .pid_for_kernel_process_object(object)
+            .ok_or(INVALID_HANDLE)
+            .and_then(|pid| match pm.process_job(pid) {
+                Some(job) => materialize_job(pm, job).map(|body| (body, 0, 0)),
+                None => Ok((0, 0, 0)),
+            }),
+        W32_PS_OP_QUERY_JOB_UI_RESTRICTIONS if value == 0 => pm
+            .job_for_kernel_object(object)
+            .ok_or(INVALID_HANDLE)
+            .and_then(|job| pm.job_ui_restrictions(job))
+            .map(|restrictions| (u64::from(restrictions), 0, 0)),
         _ => Err(INVALID_PARAMETER),
     };
     match result {

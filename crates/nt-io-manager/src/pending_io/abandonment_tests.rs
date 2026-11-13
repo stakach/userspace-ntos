@@ -50,12 +50,14 @@ fn exact_abandonment_preserves_busy_and_never_touches_peer_of_same_thread() {
     let peer = table.park(transfer(14)).unwrap();
     let original = table.get(slot).unwrap();
     let other = table.get(peer).unwrap();
+    assert!(original.needs_consumer_context());
     assert_eq!(table.abandon_transfer_exact(slot, 99), None);
     assert_eq!(table.abandon_transfer_exact(usize::MAX, 12), None);
     assert_eq!(table.abandon_transfer_exact(slot, 12), Some(original));
     assert_eq!(table.get(peer), Some(other));
     let live = table.get(slot).unwrap();
     assert!(live.consumer_abandoned);
+    assert!(!live.needs_consumer_context());
     assert_eq!(live.busy, original.busy);
     assert_eq!(live.irp_id, original.irp_id);
     assert_eq!(live.route, original.route);

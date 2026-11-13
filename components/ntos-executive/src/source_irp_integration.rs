@@ -162,7 +162,7 @@ unsafe fn run(device: DeviceId, source_leaf: &str, export_name: &str, handler: *
     let baseline = crate::driver_launch::source_observability::probe_snapshot();
     for mode in 0..2usize {
         let mut entered = false;
-        let (value, completed) = win32k_dispatch_kernel_job_observed(
+        let Win32kDispatchOutcome::Known { value, completed } = win32k_dispatch_kernel_job_observed(
             win32k_subsystem::WIN32K_REQUEST_SOURCE_IRP_PROBE,
             [entry, registration.address(), mode as u64, 0], &mut entered,
         );
