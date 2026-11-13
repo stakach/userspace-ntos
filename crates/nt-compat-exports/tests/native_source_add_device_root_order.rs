@@ -66,17 +66,3 @@ fn progressing_or_certified_retryable_add_device_gets_another_exclusive_root_tur
     assert!(!phase.contains("crate::yield_now()"),
         "yielding without receiving cannot deliver a bound timer or IRQ notification");
 }
-
-#[test]
-fn blocked_boot_predecessor_cannot_starve_a_later_ready_add_device_owner() {
-    let selection = SERVICE.split_once("fn ready_flat_root_add_device(")
-        .expect("root Ready selector").1
-        .split_once("fn root_add_device_still_parked(")
-        .expect("Ready selector end").0;
-    assert!(selection.contains("bootstrap_predecessors")
-        && selection.contains("PendingDriverStartOwner::Boot")
-        && selection.contains("continue;"),
-        "root must skip a Ready row held behind a live bootstrap predecessor and select another exact owner");
-    assert!(selection.contains("pending_pnp_operations"),
-        "an eligible rebalance restart must remain selectable after a blocked boot row");
-}

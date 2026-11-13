@@ -655,9 +655,14 @@ impl OwnedHostedPnpStartBatch {
         self.drive_inner(false, true)
     }
 
-    pub(crate) fn ready_for_flat_root_add_device(&self) -> bool {
-        self.wait_stage() == HostedPnpWaitStage::DevnodeAdmission
-            && self.coordinator.phase() == nt_driver_start::BatchPhase::Ready
+    /// What this batch offers the flat root AddDevice phase.
+    pub(crate) fn flat_root_add_device_readiness(&self) -> nt_driver_start::AddDeviceReadiness {
+        if self.wait_stage() != HostedPnpWaitStage::DevnodeAdmission
+            || self.coordinator.phase() != nt_driver_start::BatchPhase::Ready
+        {
+            return nt_driver_start::AddDeviceReadiness::NotReady;
+        }
+        nt_driver_start::AddDeviceReadiness::Ready
     }
 
     unsafe fn schedule_initial_bus_relations(
@@ -1371,9 +1376,11 @@ impl OwnedHostedPnpRebalance {
         self.drive_inner(false, true)
     }
 
-    pub(crate) fn ready_for_flat_root_add_device(&self) -> bool {
-        self.stage == HostedPnpRebalanceStage::Restart
-            && self.restart.ready_for_flat_root_add_device()
+    pub(crate) fn flat_root_add_device_readiness(&self) -> nt_driver_start::AddDeviceReadiness {
+        if self.stage != HostedPnpRebalanceStage::Restart {
+            return nt_driver_start::AddDeviceReadiness::NotReady;
+        }
+        self.restart.flat_root_add_device_readiness()
     }
 
     pub(crate) fn add_device_wait_stage(&self) -> bool {

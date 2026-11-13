@@ -4,7 +4,11 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+mod add_device_selection;
 pub mod preload_catalog;
+pub use add_device_selection::{
+    select_add_device_row, AddDeviceReadiness, AddDeviceSelection, AwaitingBusPdo,
+};
 pub use nt_component_suspension::{
     RootChildTurn as AddDeviceRootTurn, RootChildArrival as RootArrival,
     RootChildTurnAction as RootTurnAction, RootChildTurnError as RootTurnError,

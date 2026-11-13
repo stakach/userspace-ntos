@@ -11693,7 +11693,8 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 // Ordinary redrives may reach Ready, but only this flat root phase may
                 // enter AddDevice. Admit one exact row and recheck it before other work.
-                let Some(ready) = ready_flat_root_add_device(&nt_handler) else { break };
+                let nt_driver_start::AddDeviceSelection::Selected { owner: ready, .. } =
+                    ready_flat_root_add_device(&nt_handler) else { break };
                 let _message = crate::ipc_message::SavedMessageBuffer::capture();
                 redrive_flat_root_add_device_selected(&mut nt_handler, ready);
                 if root_add_device_still_parked(&nt_handler, ready) {
@@ -29226,33 +29227,37 @@ unsafe fn settle_parked_queued_callback_turn(
     true
 }
 
-fn ready_flat_root_add_device(handler: &ExecNtHandler) -> Option<RootAddDeviceOwner> {
+fn ready_flat_root_add_device(
+    handler: &ExecNtHandler,
+) -> nt_driver_start::AddDeviceSelection<RootAddDeviceOwner> {
+    use nt_driver_start::AddDeviceReadiness;
     let starts = &handler.pending_driver_starts;
-    for slot in handler.pending_driver_starts.occupied_slots() {
-        let pending = starts.get(slot)?;
+    let driver_starts = starts.occupied_slots().filter_map(|slot| starts.get(slot)).map(|pending| {
         // A Ready boot batch can still be ordered behind an earlier enumerator. The
         // selected root pass must not repeatedly choose that row ahead of an eligible
         // sibling or rebalance restart. General redrive handles an uncertain predecessor.
-        if pending.bootstrap_predecessors.iter().any(|predecessor| {
+        let behind_predecessor = pending.bootstrap_predecessors.iter().any(|predecessor| {
             starts.get_exact(*predecessor).is_some_and(|older| {
                 matches!(&older.owner, PendingDriverStartOwner::Boot { .. })
             })
-        }) {
-            continue;
-        }
-        if pending.batch.ready_for_flat_root_add_device() {
-            return Some(RootAddDeviceOwner::DriverStart(pending.reservation));
-        }
-    }
-    for slot in handler.pending_pnp_operations.occupied_slots() {
-        let pending = handler.pending_pnp_operations.get(slot)?;
-        if let OwnedPendingPnpOperation::Rebalance(batch) = &pending.operation {
-            if batch.ready_for_flat_root_add_device() {
-                return Some(RootAddDeviceOwner::PnpRebalance(pending.reservation));
-            }
-        }
-    }
-    None
+        });
+        let readiness = if behind_predecessor {
+            AddDeviceReadiness::NotReady
+        } else {
+            pending.batch.flat_root_add_device_readiness()
+        };
+        (RootAddDeviceOwner::DriverStart(pending.reservation), readiness)
+    });
+    let operations = &handler.pending_pnp_operations;
+    let rebalances = operations.occupied_slots().filter_map(|slot| operations.get(slot))
+        .filter_map(|pending| match &pending.operation {
+            OwnedPendingPnpOperation::Rebalance(batch) => Some((
+                RootAddDeviceOwner::PnpRebalance(pending.reservation),
+                batch.flat_root_add_device_readiness(),
+            )),
+            OwnedPendingPnpOperation::Removal(_) => None,
+        });
+    nt_driver_start::select_add_device_row(driver_starts.chain(rebalances))
 }
 
 fn root_add_device_still_parked(handler: &ExecNtHandler, owner: RootAddDeviceOwner) -> bool {
