@@ -372,8 +372,7 @@ const _: () = assert!(SMSS_TRAMP_VA + 0x1000 <= HOSTED_CLIENT_ENV_BASE + 0x20_00
 pub const SMSS_STACK_MIRROR_VA: u64 = 0x0000_0100_1068_0000;
 /// The 2nd hosted process (csrss) needs its OWN executive stack mirror: its syscall out-params
 /// (e.g. NtAllocateVirtualMemory's base for RtlCreateHeap) must be written to ITS stack, not smss's.
-/// Adjacent to smss's mirror, in the same FILEBUF page table. ACTIVE_STACK_MIRROR selects between
-/// them by the current fault badge.
+/// Adjacent to smss's mirror, in the same FILEBUF page table.
 pub const CSRSS_STACK_MIRROR_VA: u64 = 0x0000_0100_1069_0000;
 /// Dedicated private-memory arena. It occupies the empty tail of the hosted image page directory,
 /// clear of the fixed NLS/CSR/stack mappings below it. Leaf page tables are installed on demand.
@@ -386,7 +385,7 @@ pub const SMSS_HEAP_MIRROR_VA: u64 = 0x0000_0100_1090_0000;
 pub const SMSS_HEAP_MIRROR_WINDOW: u64 = 0x0020_0000; // 2 MiB (one PT) of early heap
 /// csrss's own heap mirror — its loader builds DLL search paths ("…\csrsrv.dll") on its heap, which
 /// the executive must read from CSRSS's heap, not smss's. 2 MiB at 0x200_0000 (past the fill-scratch
-/// region 0x100-0x200, its own PT). ACTIVE_HEAP_MIRROR selects by the current badge.
+/// region 0x100-0x200, its own PT).
 pub const CSRSS_HEAP_MIRROR_VA: u64 = 0x0000_0100_1200_0000;
 /// winlogon's per-process executive mirrors (3rd hosted process). Stack mirror sits beside the
 /// smss/csrss/SM mirrors in the FILEBUF PT (0x1068/0x1069/0x106A used → 0x106B free). Heap
@@ -461,7 +460,7 @@ pub const WL_LISTENER_TRAMP_VA: u64 = HOSTED_THREAD_TRAMP_VA; // target VSpace
 /// the target VSpace. FILEBUF PT, clear of every other env-scratch VA.
 pub const WL_LISTENER_ENV_SCRATCH_VA: u64 = 0x0000_0100_1072_0000;
 /// The fault-EP badge for winlogon's rpcrt4 server WORKER thread — the main loop maps it to (pi 2,
-/// worker), switching ACTIVE_STACK_MIRROR to the worker's OWN mirror. Same N-threads multiplex as the
+/// worker), whose stack has its OWN mirror. Same N-threads multiplex as the
 /// SVC/LSASS listeners; this makes winlogon's RPC server WORKER actually RUN (its wait array →
 /// NtWaitForMultipleObjects parks; the main thread's signal_state_changed wakes it → it SetEvents
 /// server_ready_event → the main thread's WaitForSingleObject(server_ready_event) wakes).
@@ -500,8 +499,8 @@ pub const SVC_LISTENER_ENV_SCRATCH_VA: u64 = 0x0000_0100_1073_0000;
 /// Executive-side stack mirror for services' listener (so its syscall out-params / arg reads route to
 /// its OWN stack, not services' main-thread stack). Distinct 8-page window.
 pub const SVC_LISTENER_STACK_MIRROR_VA: u64 = 0x0000_0100_1360_0000;
-/// The fault-EP badge for services' RPC listener thread — the main loop maps it to (pi 3, listener),
-/// switching ACTIVE_STACK_MIRROR to the listener's mirror. The N-threads-per-process sub-selection.
+/// The fault-EP badge for services' RPC listener thread — the main loop maps it to (pi 3, listener).
+/// The N-threads-per-process sub-selection.
 pub const SVC_LISTENER_BADGE: u64 = 7;
 // --- lsass' LSA server thread(s) (StartAuthenticationPort / LsapRmServerThread, created by lsass'
 // LsapInitDatabase via NtCreateThread). Runs in lsass' OWN pml4 (pi 4) at the SAME target VSpace VAs
@@ -518,8 +517,8 @@ pub const LSASS_LISTENER_ENV_SCRATCH_VA: u64 = 0x0000_0100_1079_0000;
 /// Executive-side stack mirror for lsass' listener (its syscall out-params / arg reads route to its OWN
 /// stack, not lsass' main-thread stack). Distinct 8-page window (past SVC_LISTENER's 0x1360).
 pub const LSASS_LISTENER_STACK_MIRROR_VA: u64 = 0x0000_0100_1368_0000;
-/// The fault-EP badge for lsass' LSA server thread — the main loop maps it to (pi 4, listener),
-/// switching ACTIVE_STACK_MIRROR to the listener's mirror. The N-threads-per-process sub-selection.
+/// The fault-EP badge for lsass' LSA server thread — the main loop maps it to (pi 4, listener).
+/// The N-threads-per-process sub-selection.
 pub const LSASS_LISTENER_BADGE: u64 = 9;
 // --- lsass' SECOND LSA server thread (LsapRmServerThread — lsass creates TWO server threads in
 // LsapInitDatabase: StartAuthenticationPort then LsapRmServerThread). It runs in lsass' pml4 (pi 4) too,
@@ -2172,18 +2171,11 @@ const HPET_MAIN_COUNTER: u64 = 0xF0;
 // remains the monotonic clocksource only; none of its globally routed interrupt pins are claimed.
 const PIT_CHANNEL0_PORT: u16 = 0x40;
 const PIT_COMMAND_PORT: u16 = 0x43;
-/// The executive stack-mirror base for the process whose fault/syscall is currently being serviced.
-/// The 2-process service loop sets this at the top of each iteration (smss vs csrss) so the shared
-/// smss_stack_read/write helpers read+write the RIGHT process's stack.
-static ACTIVE_STACK_MIRROR: AtomicU64 = AtomicU64::new(SMSS_STACK_MIRROR_VA);
-static ACTIVE_STACK_BASE: AtomicU64 = AtomicU64::new(STACK_BASE);
-static ACTIVE_STACK_SIZE: AtomicU64 = AtomicU64::new(STACK_FRAMES * 0x1000);
-/// Process identity and scratch window used when a user range falls outside the fixed mirrors.
+/// Process index and demand scratch window of the process whose fault or syscall is being
+/// serviced. The service loop sets both at the top of each iteration; redrives that complete
+/// another thread's parked work switch to that thread's process and restore afterwards.
 static ACTIVE_CLIENT_PI: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SCRATCH_BASE: AtomicU64 = AtomicU64::new(SMSS_SCRATCH_BASE);
-/// Executive heap-mirror base for the process currently being serviced, so the copyin path reads
-/// heap-resident syscall args (the loader's built-up DLL search paths) from the RIGHT process's heap.
-static ACTIVE_HEAP_MIRROR: AtomicU64 = AtomicU64::new(SMSS_HEAP_MIRROR_VA);
 
 // Registry syscalls use the REAL ntdll SSN numbers (Windows 7 SP1 x64) + the real
 // `NativeService` classification via `NativeServiceTable`; a real isolated ntdll

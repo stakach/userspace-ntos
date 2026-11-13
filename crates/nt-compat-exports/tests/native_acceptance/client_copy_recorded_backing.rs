@@ -69,8 +69,7 @@ fn critical_section_diagnostics_use_recorded_backing_not_computed_stack_mirror()
                 }
                 let mut paths = Paths(Vec::new());
                 paths.visit_block(&expression.then_branch);
-                assert!(!paths.0.iter().any(|name| matches!(name.as_str(),
-                    "ACTIVE_STACK_BASE" | "ACTIVE_STACK_SIZE" | "ACTIVE_STACK_MIRROR" | "read_volatile")),
+                assert!(!paths.0.iter().any(|name| name == "read_volatile"),
                     "diagnostics must not fault the executive through inferred stack mirrors");
                 assert!(paths.0.iter().any(|name| name == "read_fault_stack_word"),
                     "diagnostic reads use the shared retained backing boundary");
