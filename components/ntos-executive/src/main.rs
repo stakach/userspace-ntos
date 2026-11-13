@@ -2171,11 +2171,6 @@ const HPET_MAIN_COUNTER: u64 = 0xF0;
 // remains the monotonic clocksource only; none of its globally routed interrupt pins are claimed.
 const PIT_CHANNEL0_PORT: u16 = 0x40;
 const PIT_COMMAND_PORT: u16 = 0x43;
-/// Process index and demand scratch window of the process whose fault or syscall is being
-/// serviced. The service loop sets both at the top of each iteration; redrives that complete
-/// another thread's parked work switch to that thread's process and restore afterwards.
-static ACTIVE_CLIENT_PI: AtomicU64 = AtomicU64::new(0);
-static ACTIVE_SCRATCH_BASE: AtomicU64 = AtomicU64::new(SMSS_SCRATCH_BASE);
 
 // Registry syscalls use the REAL ntdll SSN numbers (Windows 7 SP1 x64) + the real
 // `NativeService` classification via `NativeServiceTable`; a real isolated ntdll

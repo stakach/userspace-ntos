@@ -226,7 +226,7 @@ impl Retirements {
                 crate::ps_object_backing::retire_withdrawn(
                     pm,
                     owner,
-                    crate::ACTIVE_SCRATCH_BASE.load(core::sync::atomic::Ordering::Relaxed),
+                    crate::executor::local().scratch_base.load(core::sync::atomic::Ordering::Relaxed),
                 )?
             });
         }

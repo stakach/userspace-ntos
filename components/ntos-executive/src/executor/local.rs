@@ -9,10 +9,9 @@
 //! through the TCB's gs base and read back here. Resolve [`local`] at each use. The reference
 //! belongs to the calling executor and must not be stored in shared state.
 //!
-//! The block is an ordinary zero-initialised image static, with the same mapping as the statics
-//! it replaces: writable in the root executive and visible read-only, as root's values, to
-//! spawned components that share the image. State a spawned component must write does not
-//! belong here.
+//! The block is an ordinary image static, with the same mapping as the statics it replaces:
+//! writable in the root executive and visible read-only, as root's values, to spawned components
+//! that share the image. State a spawned component must write does not belong here.
 
 use core::ops::Deref;
 use core::sync::atomic::AtomicU64;
@@ -35,6 +34,14 @@ pub(crate) struct ExecutorLocal {
     /// Live `ComponentSchedulerScope` guards on this executor's stack. Nonzero means the
     /// executor is inside a retained component invocation.
     pub(crate) scheduler_depth: AtomicU64,
+    /// Index of the hosted process whose event this executor is serving. Client copy-in and
+    /// copy-out resolve user addresses against this process. The service loop sets it, with
+    /// [`Self::scratch_base`], at the top of each iteration. A redrive that completes another
+    /// thread's parked work switches both to that thread's process and restores them afterwards.
+    pub(crate) client_pi: AtomicU64,
+    /// Base of that process's demand scratch window: the executive VA range where its frames are
+    /// aliased for a copy. It always belongs to the process named by [`Self::client_pi`].
+    pub(crate) scratch_base: AtomicU64,
 }
 
 impl ExecutorLocal {
@@ -43,6 +50,9 @@ impl ExecutorLocal {
             ipc_buffer: AtomicU64::new(0),
             reply_main_slot: AtomicU64::new(0),
             scheduler_depth: AtomicU64::new(0),
+            // Before the first event is admitted, boot work addresses the first hosted process.
+            client_pi: AtomicU64::new(0),
+            scratch_base: AtomicU64::new(crate::SMSS_SCRATCH_BASE),
         }
     }
 }

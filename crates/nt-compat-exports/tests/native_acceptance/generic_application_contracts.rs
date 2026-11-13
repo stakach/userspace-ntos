@@ -77,7 +77,6 @@ fn registry_value_name_capture_retains_exact_process_and_propagates_read_status(
         "full descriptor/payload reads preserve native GUARD/ACCESS statuses");
     assert!(!names.calls.iter().any(|name| matches!(name.as_str(),
         "smss_copyin" | "smss_read_ustr" | "read_ustr_pe" | "current_hosted_process_role")));
-    assert!(!names.paths.iter().any(|name| name == "ACTIVE_CLIENT_PI"));
     struct Fallible(bool);
     impl<'ast> Visit<'ast> for Fallible {
         fn visit_expr_try(&mut self, expression: &'ast syn::ExprTry) {

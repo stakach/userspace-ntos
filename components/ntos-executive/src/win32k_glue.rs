@@ -2140,7 +2140,7 @@ unsafe fn grant_win32k_client_ps_bodies(
                 lifetime,
                 body,
                 provider,
-                crate::ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+                crate::executor::local().scratch_base.load(Ordering::Relaxed),
             )?;
             effect = SharedPageReservationEffect::Applied;
         }

@@ -25,7 +25,7 @@ pub(super) unsafe fn project(
                 driver_ps_pool_alias::grant(inst, address, bytes)?;
             } else {
                 crate::ps_object_backing::grant_published_body(
-                    pm, thread, body, target, crate::ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+                    pm, thread, body, target, crate::executor::local().scratch_base.load(Ordering::Relaxed),
                 )?;
             }
         }
@@ -41,6 +41,6 @@ pub(super) unsafe fn retire(inst: DriverInstance) -> Result<(), u32> {
     let domain = instance_domain_identity(inst).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
     let target = crate::ps_object_provider::ProviderRoot::hosted(domain, inst.pml4)?;
     crate::ps_object_backing::retire_provider(
-        target, crate::ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+        target, crate::executor::local().scratch_base.load(Ordering::Relaxed),
     )
 }

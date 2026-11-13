@@ -9075,7 +9075,7 @@ impl ExecNtHandler {
         self.pm.publish_initial_thread_runtime(
             lifetime, mapped.entry, teb, mapped.create_time_100ns,
         )?;
-        let scratch = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+        let scratch = crate::executor::local().scratch_base.load(Ordering::Relaxed);
         let process_body = unsafe {
             crate::ps_object_backing::prepare_process(&self.pm, process.pid, scratch)?
         };
@@ -14985,7 +14985,7 @@ impl ExecNtHandler {
         assert!(self.thread_runtime.validate_spawn(&prepared, &spawn),
             "first run requires the exact completed construction and protected reservation");
         let tcb = spawn.tcb();
-        let scratch = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+        let scratch = crate::executor::local().scratch_base.load(Ordering::Relaxed);
         let old_lifetime = publication.activation.expected_lifetime();
         let prepared_body = if self.pm.thread_kernel_object(tid).is_none() {
             crate::ps_object_backing::prepare_thread(&self.pm, old_lifetime, scratch).map(Some)

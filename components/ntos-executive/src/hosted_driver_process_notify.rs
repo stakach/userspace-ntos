@@ -267,7 +267,7 @@ pub(crate) unsafe fn dispatch_exit_notification(
             driver_ps_pool_alias::grant(inst, body, nt_kernel_abi::ps_hosted_x64::EPROCESS_BODY_BYTES)
         } else {
             crate::ps_object_backing::grant_referenced_body(
-                pm, body, target, crate::ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+                pm, body, target, crate::executor::local().scratch_base.load(Ordering::Relaxed),
             )
         };
         if let Err(status) = mapped {

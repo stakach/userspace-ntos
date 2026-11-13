@@ -97,7 +97,7 @@ pub(super) unsafe fn initialize_actor(id: usize, entry: u64, argument: u64) -> R
     owner(id).thread = Some(lifetime);
     crate::service_sec_image::with_provider_process_manager(|pm| {
         crate::ps_object_backing::prepare_thread(
-            pm, lifetime, crate::ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+            pm, lifetime, crate::executor::local().scratch_base.load(Ordering::Relaxed),
         )?;
         crate::ps_object_backing::publish_system_worker(pm, lifetime)?;
         let caller = pm.capture_native_handle_caller(lifetime, nt_types::AccessMode::KernelMode)?;

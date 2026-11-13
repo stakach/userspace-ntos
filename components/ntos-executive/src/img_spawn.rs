@@ -1750,26 +1750,26 @@ pub(crate) unsafe fn smss_stack_read(stack_va: u64) -> u64 {
 /// Image pages use their current recorded frame, not an inferred fixed mirror address.
 pub(crate) unsafe fn smss_copyin(va: u64, dst: &mut [u8]) -> bool {
     if crate::temporary_frame_alias::drain().is_err()
-        || hosted_thread_memory_access(ACTIVE_CLIENT_PI.load(Ordering::Relaxed), va, dst.len() as u64).is_err() {
+        || hosted_thread_memory_access(crate::executor::local().client_pi.load(Ordering::Relaxed), va, dst.len() as u64).is_err() {
         return false;
     }
     recorded_frame_copyin(
-        ACTIVE_CLIENT_PI.load(Ordering::Relaxed),
+        crate::executor::local().client_pi.load(Ordering::Relaxed),
         None,
         va,
         dst,
-        ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+        crate::executor::local().scratch_base.load(Ordering::Relaxed),
     )
 }
 /// Copy `src.len()` bytes OUT to a SEC_IMAGE process VA (the executive's copyout).
 /// Image pages use their current recorded frame, not an inferred fixed mirror address.
 pub(crate) unsafe fn smss_copyout(va: u64, src: &[u8]) -> bool {
-    let pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
+    let pi = crate::executor::local().client_pi.load(Ordering::Relaxed);
     if crate::temporary_frame_alias::drain().is_err()
         || hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
         return false;
     }
-    recorded_frame_copyout(pi, va, src, ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed))
+    recorded_frame_copyout(pi, va, src, crate::executor::local().scratch_base.load(Ordering::Relaxed))
 }
 
 unsafe fn with_recorded_frame_alias(

@@ -177,7 +177,7 @@ pub(crate) fn service(
                             pm,
                             body,
                             target,
-                            crate::ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+                            crate::executor::local().scratch_base.load(Ordering::Relaxed),
                         )
                     };
                     if let Err(status) = projected {

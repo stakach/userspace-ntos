@@ -12763,8 +12763,8 @@ pub(crate) unsafe fn service_sec_image(
         }
         let pml4 = procs[pi].pml4;
         let scratch_base = procs[pi].scratch_base;
-        ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
-        ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+        crate::executor::local().client_pi.store(pi as u64, Ordering::Relaxed);
+        crate::executor::local().scratch_base.store(scratch_base, Ordering::Relaxed);
         let img_end = procs[pi].img_end;
         let img_base = procs[pi].img_base;
         let event_image_target = nt_exe_image::SpawnTarget::from_image(
@@ -23003,14 +23003,14 @@ pub(crate) unsafe fn service_sec_image(
             // Handler-owned temporary slots let the specs exercise pid -> pi routing without
             // publishing throwaway processes as hosted launch topology.
 
-            let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
-            let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+            let saved_client_pi = crate::executor::local().client_pi.load(Ordering::Relaxed);
+            let saved_scratch_base = crate::executor::local().scratch_base.load(Ordering::Relaxed);
             let saved_pi = nt_handler.pi;
             let saved_tid = nt_handler.current_tid;
             // Retain the process memory owner so syscall outputs use normal write admission.
             let saved_ctx = nt_handler.loop_ctx;
-            ACTIVE_CLIENT_PI.store(0, Ordering::Relaxed);
-            ACTIVE_SCRATCH_BASE.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
+            crate::executor::local().client_pi.store(0, Ordering::Relaxed);
+            crate::executor::local().scratch_base.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
             nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(0));
             nt_handler.pi = 0;
 
@@ -23403,8 +23403,8 @@ pub(crate) unsafe fn service_sec_image(
                 }
             }
 
-            ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
-            ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+            crate::executor::local().client_pi.store(saved_client_pi, Ordering::Relaxed);
+            crate::executor::local().scratch_base.store(saved_scratch_base, Ordering::Relaxed);
             nt_handler.pi = saved_pi;
             nt_handler.current_tid = saved_tid;
             nt_handler.loop_ctx = saved_ctx;
@@ -23438,13 +23438,13 @@ pub(crate) unsafe fn service_sec_image(
             // Temporary slots for the throwaway debuggees are claimed from identities with no live
             // process/thread mechanism, VSpace, worker reservation, or registered client frames.
 
-            let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
-            let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+            let saved_client_pi = crate::executor::local().client_pi.load(Ordering::Relaxed);
+            let saved_scratch_base = crate::executor::local().scratch_base.load(Ordering::Relaxed);
             let saved_pi = nt_handler.pi;
             let saved_tid = nt_handler.current_tid;
             let saved_ctx = nt_handler.loop_ctx;
-            ACTIVE_CLIENT_PI.store(0, Ordering::Relaxed);
-            ACTIVE_SCRATCH_BASE.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
+            crate::executor::local().client_pi.store(0, Ordering::Relaxed);
+            crate::executor::local().scratch_base.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
             nt_handler.pi = 0;
 
             let mut ex_ok = 0u64;
@@ -23831,8 +23831,8 @@ pub(crate) unsafe fn service_sec_image(
                 }
             }
 
-            ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
-            ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+            crate::executor::local().client_pi.store(saved_client_pi, Ordering::Relaxed);
+            crate::executor::local().scratch_base.store(saved_scratch_base, Ordering::Relaxed);
             nt_handler.pi = saved_pi;
             nt_handler.current_tid = saved_tid;
             nt_handler.loop_ctx = saved_ctx;
@@ -23874,13 +23874,13 @@ pub(crate) unsafe fn service_sec_image(
             const NAME_POINTER: u64 = SMSS_TEB_VA + 0x28; // NtTib.ArbitraryUserPointer
             const DBG_INFO: (u32, u32) = (0x0000_1234, 0x0000_0056);
 
-            let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
-            let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+            let saved_client_pi = crate::executor::local().client_pi.load(Ordering::Relaxed);
+            let saved_scratch_base = crate::executor::local().scratch_base.load(Ordering::Relaxed);
             let saved_pi = nt_handler.pi;
             let saved_tid = nt_handler.current_tid;
             let saved_ctx = nt_handler.loop_ctx;
-            ACTIVE_CLIENT_PI.store(0, Ordering::Relaxed);
-            ACTIVE_SCRATCH_BASE.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
+            crate::executor::local().client_pi.store(0, Ordering::Relaxed);
+            crate::executor::local().scratch_base.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
             nt_handler.pi = 0;
 
             let mut md_ok = 0u64;
@@ -24267,8 +24267,8 @@ pub(crate) unsafe fn service_sec_image(
                 }
             }
 
-            ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
-            ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+            crate::executor::local().client_pi.store(saved_client_pi, Ordering::Relaxed);
+            crate::executor::local().scratch_base.store(saved_scratch_base, Ordering::Relaxed);
             nt_handler.pi = saved_pi;
             nt_handler.current_tid = saved_tid;
             nt_handler.loop_ctx = saved_ctx;
@@ -24324,13 +24324,13 @@ pub(crate) unsafe fn service_sec_image(
             let marker_win_t = SMSS_SCRATCH_BASE + 3012 * 0x1000;
             let marker_win_d = SMSS_SCRATCH_BASE + 3013 * 0x1000;
 
-            let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
-            let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+            let saved_client_pi = crate::executor::local().client_pi.load(Ordering::Relaxed);
+            let saved_scratch_base = crate::executor::local().scratch_base.load(Ordering::Relaxed);
             let saved_pi = nt_handler.pi;
             let saved_tid = nt_handler.current_tid;
             let saved_ctx = nt_handler.loop_ctx;
-            ACTIVE_CLIENT_PI.store(0, Ordering::Relaxed);
-            ACTIVE_SCRATCH_BASE.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
+            crate::executor::local().client_pi.store(0, Ordering::Relaxed);
+            crate::executor::local().scratch_base.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
             nt_handler.pi = 0;
 
             let mut bk_ok = 0u64;
@@ -25503,8 +25503,8 @@ pub(crate) unsafe fn service_sec_image(
             print_u64(DBGK_REPORTERS_RELEASED.load(Ordering::Relaxed));
             print_str(b"\n");
 
-            ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
-            ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+            crate::executor::local().client_pi.store(saved_client_pi, Ordering::Relaxed);
+            crate::executor::local().scratch_base.store(saved_scratch_base, Ordering::Relaxed);
             nt_handler.pi = saved_pi;
             nt_handler.current_tid = saved_tid;
             nt_handler.loop_ctx = saved_ctx;
@@ -25569,13 +25569,13 @@ pub(crate) unsafe fn service_sec_image(
             let mark_win = SMSS_SCRATCH_BASE + 3021 * 0x1000;
             let peb_win = SMSS_SCRATCH_BASE + 3022 * 0x1000;
 
-            let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
-            let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+            let saved_client_pi = crate::executor::local().client_pi.load(Ordering::Relaxed);
+            let saved_scratch_base = crate::executor::local().scratch_base.load(Ordering::Relaxed);
             let saved_pi = nt_handler.pi;
             let saved_tid = nt_handler.current_tid;
             let saved_ctx = nt_handler.loop_ctx;
-            ACTIVE_CLIENT_PI.store(0, Ordering::Relaxed);
-            ACTIVE_SCRATCH_BASE.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
+            crate::executor::local().client_pi.store(0, Ordering::Relaxed);
+            crate::executor::local().scratch_base.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
             nt_handler.pi = 0;
 
             let mut br_ok = 0u64;
@@ -25753,7 +25753,7 @@ pub(crate) unsafe fn service_sec_image(
             let target_backing = if peb_registered && target_main != 0
                 && nt_handler.pm.set_peb_base(target, SMSS_PEB_VA)
             {
-                let scratch = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+                let scratch = crate::executor::local().scratch_base.load(Ordering::Relaxed);
                 let lifetime = nt_handler.pm.thread_lifetime(target_main)
                     .expect("debugger target main thread has an exact lifetime");
                 match ps_object_backing::prepare_process(&nt_handler.pm, target, scratch) {
@@ -26357,7 +26357,7 @@ pub(crate) unsafe fn service_sec_image(
             let backing = ps_object_backing::retire_withdrawn(
                 &nt_handler.pm,
                 &retirement,
-                ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+                crate::executor::local().scratch_base.load(Ordering::Relaxed),
             ).expect("debugger fixture retires its canonical Ps bodies");
             let _deletion = nt_handler.pm.finish_process_object_retirement(retirement)
                 .expect("debugger fixture finishes canonical Ps retirement");
@@ -26366,8 +26366,8 @@ pub(crate) unsafe fn service_sec_image(
             }
             nt_handler.remote_thread_request = None;
 
-            ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
-            ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+            crate::executor::local().client_pi.store(saved_client_pi, Ordering::Relaxed);
+            crate::executor::local().scratch_base.store(saved_scratch_base, Ordering::Relaxed);
             nt_handler.pi = saved_pi;
             nt_handler.current_tid = saved_tid;
             nt_handler.loop_ctx = saved_ctx;
@@ -27821,8 +27821,8 @@ pub(crate) unsafe fn with_pagein_caller_target_context<R>(
     let saved_ctx = handler.loop_ctx;
     let ctx = saved_ctx?.for_process(target_pi)?;
     let saved_client = (
-        ACTIVE_CLIENT_PI.load(Ordering::Relaxed),
-        ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+        crate::executor::local().client_pi.load(Ordering::Relaxed),
+        crate::executor::local().scratch_base.load(Ordering::Relaxed),
     );
     let saved_caller = (
         handler.pi, handler.current_tid, handler.current_badge,
@@ -27831,8 +27831,8 @@ pub(crate) unsafe fn with_pagein_caller_target_context<R>(
     );
     // The caller's exact thread must still have a live memory context.
     mirror_ctx_for(handler, badge, caller_pi, tid)?;
-    ACTIVE_CLIENT_PI.store(caller_pi as u64, Ordering::Relaxed);
-    ACTIVE_SCRATCH_BASE.store(ctx.scratch_base, Ordering::Relaxed);
+    crate::executor::local().client_pi.store(caller_pi as u64, Ordering::Relaxed);
+    crate::executor::local().scratch_base.store(ctx.scratch_base, Ordering::Relaxed);
     handler.loop_ctx = Some(ctx);
     handler.pi = caller_pi;
     handler.current_tid = tid;
@@ -27843,8 +27843,8 @@ pub(crate) unsafe fn with_pagein_caller_target_context<R>(
     handler.current_native_call_transport = native_call_transport;
     handler.current_service_number = service_number;
     let result = run(handler);
-    ACTIVE_CLIENT_PI.store(saved_client.0, Ordering::Relaxed);
-    ACTIVE_SCRATCH_BASE.store(saved_client.1, Ordering::Relaxed);
+    crate::executor::local().client_pi.store(saved_client.0, Ordering::Relaxed);
+    crate::executor::local().scratch_base.store(saved_client.1, Ordering::Relaxed);
     handler.pi = saved_caller.0;
     handler.current_tid = saved_caller.1;
     handler.current_badge = saved_caller.2;
@@ -27858,8 +27858,8 @@ pub(crate) unsafe fn with_pagein_caller_target_context<R>(
 }
 
 unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
-    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
-    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+    let saved_client_pi = crate::executor::local().client_pi.load(Ordering::Relaxed);
+    let saved_scratch_base = crate::executor::local().scratch_base.load(Ordering::Relaxed);
     let saved_w32_client_pi = W32_CLIENT_PI.load(Ordering::Relaxed);
     let saved_pi = nt_handler.pi;
     let saved_tid = nt_handler.current_tid;
@@ -27893,8 +27893,8 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 == Some(continuation.process)).then(||
             mirror_ctx_for(nt_handler, continuation.badge, pi, continuation.tid)).flatten();
         let status = if let Some((_, _, _, _, scratch_base)) = mirror {
-            ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
-            ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+            crate::executor::local().client_pi.store(pi as u64, Ordering::Relaxed);
+            crate::executor::local().scratch_base.store(scratch_base, Ordering::Relaxed);
             W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
             nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(pi));
             nt_handler.pi = pi;
@@ -27944,8 +27944,8 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         print_str(b"\n");
     }
 
-    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
-    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+    crate::executor::local().client_pi.store(saved_client_pi, Ordering::Relaxed);
+    crate::executor::local().scratch_base.store(saved_scratch_base, Ordering::Relaxed);
     W32_CLIENT_PI.store(saved_w32_client_pi, Ordering::Relaxed);
     nt_handler.pi = saved_pi;
     nt_handler.current_tid = saved_tid;
@@ -27966,8 +27966,8 @@ pub(crate) unsafe fn lpc_endpoint_redrive_all(nt_handler: &mut ExecNtHandler) ->
 }
 
 unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
-    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
-    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+    let saved_client_pi = crate::executor::local().client_pi.load(Ordering::Relaxed);
+    let saved_scratch_base = crate::executor::local().scratch_base.load(Ordering::Relaxed);
     let saved_w32_client_pi = W32_CLIENT_PI.load(Ordering::Relaxed);
     let saved_pi = nt_handler.pi;
     let saved_tid = nt_handler.current_tid;
@@ -28027,8 +28027,8 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 == Some(continuation.process)).then(||
             mirror_ctx_for(nt_handler, continuation.badge, pi, continuation.tid)).flatten();
         let status = if let Some((_, _, _, _, scratch_base)) = mirror {
-            ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
-            ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+            crate::executor::local().client_pi.store(pi as u64, Ordering::Relaxed);
+            crate::executor::local().scratch_base.store(scratch_base, Ordering::Relaxed);
             W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
             nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(pi));
             nt_handler.pi = pi;
@@ -28104,8 +28104,8 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         print_str(b"\n");
     }
 
-    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
-    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+    crate::executor::local().client_pi.store(saved_client_pi, Ordering::Relaxed);
+    crate::executor::local().scratch_base.store(saved_scratch_base, Ordering::Relaxed);
     W32_CLIENT_PI.store(saved_w32_client_pi, Ordering::Relaxed);
     nt_handler.pi = saved_pi;
     nt_handler.current_tid = saved_tid;
@@ -28161,8 +28161,8 @@ unsafe fn lpc_connect_wait_complete(
     let completion = (&*core::ptr::addr_of!(LPC_CONNECT_WAITS)).completion(&ticket)
         .expect("exact completion admission retains terminal data").view();
 
-    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
-    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+    let saved_client_pi = crate::executor::local().client_pi.load(Ordering::Relaxed);
+    let saved_scratch_base = crate::executor::local().scratch_base.load(Ordering::Relaxed);
     let saved_w32_client_pi = W32_CLIENT_PI.load(Ordering::Relaxed);
     let saved_pi = nt_handler.pi;
     let saved_tid = nt_handler.current_tid;
@@ -28186,8 +28186,8 @@ unsafe fn lpc_connect_wait_complete(
     let mirror = (pi < MAX_PI).then(||
         mirror_ctx_for(nt_handler, continuation.badge, pi, continuation.tid)).flatten();
     let status = if let Some((_, _, _, _, scratch_base)) = mirror {
-        ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
-        ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+        crate::executor::local().client_pi.store(pi as u64, Ordering::Relaxed);
+        crate::executor::local().scratch_base.store(scratch_base, Ordering::Relaxed);
         W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
         nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(pi));
         nt_handler.pi = pi;
@@ -28205,8 +28205,8 @@ unsafe fn lpc_connect_wait_complete(
         nt_status::NtStatus::INVALID_HANDLE.raw() as u32
     };
 
-    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
-    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+    crate::executor::local().client_pi.store(saved_client_pi, Ordering::Relaxed);
+    crate::executor::local().scratch_base.store(saved_scratch_base, Ordering::Relaxed);
     W32_CLIENT_PI.store(saved_w32_client_pi, Ordering::Relaxed);
     nt_handler.pi = saved_pi;
     nt_handler.current_tid = saved_tid;
@@ -28479,13 +28479,13 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
     else {
         continue;
     };
-    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
-    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+    let saved_client_pi = crate::executor::local().client_pi.load(Ordering::Relaxed);
+    let saved_scratch_base = crate::executor::local().scratch_base.load(Ordering::Relaxed);
     let saved_pi = nt_handler.pi;
     let saved_ctx = nt_handler.loop_ctx;
 
-    ACTIVE_CLIENT_PI.store(waiter.process_index as u64, Ordering::Relaxed);
-    ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+    crate::executor::local().client_pi.store(waiter.process_index as u64, Ordering::Relaxed);
+    crate::executor::local().scratch_base.store(scratch_base, Ordering::Relaxed);
     nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(waiter.process_index as usize));
     nt_handler.pi = waiter.process_index as usize;
 
@@ -28511,8 +28511,8 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
         packet,
     );
 
-    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
-    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+    crate::executor::local().client_pi.store(saved_client_pi, Ordering::Relaxed);
+    crate::executor::local().scratch_base.store(saved_scratch_base, Ordering::Relaxed);
     nt_handler.pi = saved_pi;
     nt_handler.loop_ctx = saved_ctx;
 
@@ -30770,8 +30770,8 @@ unsafe fn pending_file_io_redrive_pass(
         crate::pending_file_apc::redrive(nt_handler);
         nt_handler.publish_local_byte_lock_completions();
     }
-    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
-    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+    let saved_client_pi = crate::executor::local().client_pi.load(Ordering::Relaxed);
+    let saved_scratch_base = crate::executor::local().scratch_base.load(Ordering::Relaxed);
     let saved_pi = nt_handler.pi;
     let saved_tid = nt_handler.current_tid;
     let saved_badge = nt_handler.current_badge;
@@ -30782,8 +30782,8 @@ unsafe fn pending_file_io_redrive_pass(
     let saved_ctx = nt_handler.loop_ctx;
     macro_rules! restore_file_io_mirrors {
         () => {{
-            ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
-            ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+            crate::executor::local().client_pi.store(saved_client_pi, Ordering::Relaxed);
+            crate::executor::local().scratch_base.store(saved_scratch_base, Ordering::Relaxed);
             nt_handler.pi = saved_pi;
             nt_handler.current_tid = saved_tid;
             nt_handler.current_badge = saved_badge;
@@ -30981,8 +30981,8 @@ unsafe fn pending_file_io_redrive_pass(
             // Do not acknowledge or publish either into a retired caller's address space.
             continue;
         };
-        ACTIVE_CLIENT_PI.store(pending.pi as u64, Ordering::Relaxed);
-        ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+        crate::executor::local().client_pi.store(pending.pi as u64, Ordering::Relaxed);
+        crate::executor::local().scratch_base.store(scratch_base, Ordering::Relaxed);
         nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(pending.pi as usize));
         nt_handler.pi = pending.pi as usize;
         nt_handler.current_tid = pending.tid;
@@ -31919,8 +31919,8 @@ unsafe fn file_irp_drain_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     if (&*core::ptr::addr_of!(PENDING_FILE_IRP_DRAINS)).is_empty() {
         return 0;
     }
-    let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
-    let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
+    let saved_client_pi = crate::executor::local().client_pi.load(Ordering::Relaxed);
+    let saved_scratch_base = crate::executor::local().scratch_base.load(Ordering::Relaxed);
     let saved_pi = nt_handler.pi;
     let saved_ctx = nt_handler.loop_ctx;
     let mut resumed = 0u64;
@@ -31944,8 +31944,8 @@ unsafe fn file_irp_drain_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             // The drain row still owns the File reference and any unpublished Reply.
             continue;
         };
-        ACTIVE_CLIENT_PI.store(pending.pi as u64, Ordering::Relaxed);
-        ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+        crate::executor::local().client_pi.store(pending.pi as u64, Ordering::Relaxed);
+        crate::executor::local().scratch_base.store(scratch_base, Ordering::Relaxed);
         nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(pending.pi as usize));
         nt_handler.pi = pending.pi as usize;
 
@@ -31981,8 +31981,8 @@ unsafe fn file_irp_drain_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         nt_handler.release_file_reference(finished.file_id);
         resumed += 1;
     }
-    ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
-    ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
+    crate::executor::local().client_pi.store(saved_client_pi, Ordering::Relaxed);
+    crate::executor::local().scratch_base.store(saved_scratch_base, Ordering::Relaxed);
     nt_handler.pi = saved_pi;
     nt_handler.loop_ctx = saved_ctx;
     resumed

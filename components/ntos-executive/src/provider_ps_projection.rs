@@ -45,6 +45,6 @@ pub(crate) unsafe fn grant(
         pm,
         body,
         target,
-        ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
+        crate::executor::local().scratch_base.load(Ordering::Relaxed),
     )
 }
