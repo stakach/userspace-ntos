@@ -2417,6 +2417,14 @@ pub(super) fn service(
     }
 }
 
+/// Rows and heap bytes of the caller terminal ACK receipts for the periodic census. `None`
+/// while another lane holds the ledger: a census must never wait on an ownership lock.
+pub(super) fn caller_terminal_ack_census() -> Option<(usize, usize)> {
+    LOCK.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).ok()?;
+    let _guard = Guard;
+    Some((caller_acks().len(), caller_acks().retained_bytes()))
+}
+
 pub(super) fn drain_caller_terminal_acks(instance_index: usize) -> Result<(), nt_status::NtStatus> {
     let _guard = lock();
     if caller_projections().iter().any(|row|

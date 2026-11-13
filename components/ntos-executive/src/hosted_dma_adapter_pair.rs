@@ -167,6 +167,11 @@ pub(super) unsafe fn retire_dma_adapter_pair(
     Ok(())
 }
 
+/// Rows and heap bytes; the caller holds the catalog lock.
+pub(super) fn tombstone_census() -> (usize, usize) {
+    (tombstones().len(), tombstones().capacity() * core::mem::size_of::<Tombstone>())
+}
+
 /// The raw adapter pointer cannot be reused until this driver generation has stopped every
 /// callback. Drain only at instance teardown, after its lanes have quiesced.
 pub(super) unsafe fn drain_dma_adapter_tombstones(

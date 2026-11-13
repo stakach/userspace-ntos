@@ -58859,6 +58859,23 @@ pub(crate) fn hosted_irq_delivery_census() -> (u64, u64, u64, u64, u64) {
     )
 }
 
+/// Rows and heap bytes of the driver-host tables that keep one record per completed operation
+/// until instance teardown: caller IRP terminal ACKs, File storage ACKs, DMA private-graph
+/// tombstones and DMA adapter tombstones. A table whose owner is busy reports `None`.
+pub(crate) fn hosted_retained_record_census() -> [Option<(usize, usize)>; 4] {
+    let [file_acks, dma_private, dma_adapter] =
+        match hosted_device_allocations::retained_record_census() {
+            Some(rows) => rows.map(Some),
+            None => [None; 3],
+        };
+    [
+        hosted_source_irp_ledger::caller_terminal_ack_census(),
+        file_acks,
+        dma_private,
+        dma_adapter,
+    ]
+}
+
 pub(crate) fn hosted_irq_work_pending() -> bool {
     HOSTED_IRQ_PENDING_EVENTS.load(Ordering::Acquire) != 0
 }

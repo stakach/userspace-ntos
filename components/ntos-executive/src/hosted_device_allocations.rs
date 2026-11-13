@@ -1122,6 +1122,19 @@ pub(super) fn acknowledge_file_storage_retirement(
     Ok(())
 }
 
+/// Rows and heap bytes of the tables here that keep one record per completed operation
+/// until instance teardown: File storage ACKs, DMA private-graph tombstones and DMA adapter
+/// tombstones. `None` while another lane holds the catalog.
+pub(super) fn retained_record_census() -> Option<[(usize, usize); 3]> {
+    LOCK.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).ok()?;
+    let _guard = Guard;
+    Some([
+        (file_acks().len(), file_acks().capacity() * core::mem::size_of::<FileStorageAck>()),
+        dma_private_graph::tombstone_census(),
+        dma_adapter_pair::tombstone_census(),
+    ])
+}
+
 pub(super) fn drain_file_storage_acknowledgements(
     inst: DriverInstance,
 ) -> Result<(), nt_status::NtStatus> {

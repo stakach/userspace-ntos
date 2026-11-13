@@ -454,6 +454,13 @@ struct Cancellation {
 }
 static mut CANCELLATIONS: Vec<Cancellation> = Vec::new();
 
+/// Rows and heap bytes of the cancellation receipts, which are never removed.
+pub(crate) fn hosted_cancellation_census() -> (usize, usize) {
+    // Root-only table; this reads its length and capacity between root operations.
+    let cancellations = unsafe { &*core::ptr::addr_of!(CANCELLATIONS) };
+    (cancellations.len(), cancellations.capacity() * core::mem::size_of::<Cancellation>())
+}
+
 pub(crate) unsafe fn hosted_cancellation_proven(badge: u64, reply: u64) -> bool {
     let Some(binding) = crate::service_sec_image::hosted_ingress_binding(badge) else {
         return false;

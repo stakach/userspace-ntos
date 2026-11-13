@@ -6989,6 +6989,34 @@ pub(crate) static CENSUS_LAST_DUMP: AtomicU64 = AtomicU64::new(0);
 /// when a dump is due; a dump raised from a nested pump prints the previous sample.
 static OBJ_NS_CENSUS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
+/// Rows and held heap bytes of the tables that keep one record per completed operation and
+/// drop it only at teardown, or never: caller IRP terminal ACKs, File storage ACKs, hosted
+/// ingress cancellations, DMA private-graph tombstones and DMA adapter tombstones. Sampled like
+/// the object namespace; a flat row count here is what a bounded table looks like.
+static RETAINED_RECORD_CENSUS: [[AtomicU64; 2]; 5] =
+    [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 5];
+const RETAINED_RECORD_NAMES: [&[u8]; 5] =
+    [b"caller-ack", b"file-ack", b"cancel", b"dma-private", b"dma-adapter"];
+
+/// Refresh the retained-record sample if the next [`census_tick_static`] will dump. A table
+/// whose owner is busy keeps its previous sample.
+pub(crate) fn sample_retained_record_census(now: u64) {
+    if now.wrapping_sub(CENSUS_LAST_DUMP.load(Ordering::Relaxed)) < CENSUS_PERIOD_100NS {
+        return;
+    }
+    let [caller_acks, file_acks, dma_private, dma_adapter] =
+        driver_launch::hosted_retained_record_census();
+    let cancellations =
+        spawn_hosts::shared_ingress::owner::runtime::hosted_cancellation_census();
+    let samples = [caller_acks, file_acks, Some(cancellations), dma_private, dma_adapter];
+    for (sample, value) in RETAINED_RECORD_CENSUS.iter().zip(samples) {
+        if let Some((rows, bytes)) = value {
+            sample[0].store(rows as u64, Ordering::Relaxed);
+            sample[1].store(bytes as u64, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Refresh the object namespace sample if the next [`census_tick_static`] will dump.
 pub(crate) fn sample_object_namespace_census(namespace: &ObjectNamespace, now: u64) {
     if now.wrapping_sub(CENSUS_LAST_DUMP.load(Ordering::Relaxed)) < CENSUS_PERIOD_100NS {
@@ -7275,6 +7303,17 @@ fn print_periodic_census_heartbeat(n: u64, now: u64) {
     for (index, sample) in OBJ_NS_CENSUS.iter().enumerate() {
         if index != 0 { print_str(b"/"); }
         print_u64(sample.load(Ordering::Relaxed));
+    }
+    print_str(b" retained-rows/bytes=");
+    for (index, (name, sample)) in
+        RETAINED_RECORD_NAMES.iter().zip(RETAINED_RECORD_CENSUS.iter()).enumerate()
+    {
+        if index != 0 { print_str(b","); }
+        print_str(name);
+        print_str(b":");
+        print_u64(sample[0].load(Ordering::Relaxed));
+        print_str(b"/");
+        print_u64(sample[1].load(Ordering::Relaxed));
     }
     print_str(b" timer=");
     print_u64(TIMER_TICKS_SEEN.load(Ordering::Relaxed));

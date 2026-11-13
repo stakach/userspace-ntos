@@ -161,3 +161,51 @@ fn earlier_refusal_does_not_suppress_later_frontiers_within_explicit_bound() {
     assert_eq!(budget::next_oom_emission(emitted), None);
     assert_eq!(budget::next_oom_emission(usize::MAX), None);
 }
+
+#[test]
+fn large_allocation_reports_ignore_small_allocations() {
+    assert_eq!(budget::next_large_emission(0, 0), None);
+    assert_eq!(
+        budget::next_large_emission(0, budget::LARGE_ALLOCATION_BYTES - 1),
+        None
+    );
+    assert!(budget::next_large_emission(0, budget::LARGE_ALLOCATION_BYTES).is_some());
+}
+
+#[test]
+fn a_repeated_buffer_size_cannot_hide_a_growing_table() {
+    // Hosted reads take a zeroed buffer of the caller's length again and again.
+    let mut state = 0;
+    let mut reported = 0;
+    for _ in 0..10_000 {
+        if let Some(next) = budget::next_large_emission(state, 1024 * 1024) {
+            state = next;
+            reported += 1;
+        }
+    }
+    assert_eq!(reported, budget::LARGE_EMISSIONS_PER_CLASS);
+    // The doublings of the caller-acknowledgement table in run 43421769067.
+    for doubling in [3_145_728, 6_291_456, 12_582_912] {
+        state = budget::next_large_emission(state, doubling)
+            .unwrap_or_else(|| panic!("{doubling} was not reported"));
+    }
+}
+
+#[test]
+fn large_allocation_reports_are_bounded_for_any_sizes() {
+    let mut state = 0;
+    let mut reported = 0;
+    for shift in 0..usize::BITS {
+        for _ in 0..64 {
+            for size in [1usize << shift, (1usize << shift) | 1, usize::MAX >> (usize::BITS - 1 - shift)] {
+                if let Some(next) = budget::next_large_emission(state, size) {
+                    state = next;
+                    reported += 1;
+                }
+            }
+        }
+    }
+    assert!(budget::next_large_emission(state, usize::MAX).is_none());
+    assert!(reported <= budget::LARGE_EMISSIONS_PER_CLASS * (usize::BITS as usize / 4));
+    assert!(reported >= budget::LARGE_EMISSIONS_PER_CLASS * 16);
+}

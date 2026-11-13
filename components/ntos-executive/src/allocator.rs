@@ -69,8 +69,10 @@ const OOM_REPORTED: usize = HEAP_BASE + 64;
 const OOM_CONTEXT: usize = HEAP_BASE + 72;
 const OOM_SCOPE_PTR: usize = HEAP_BASE + 80;
 const OOM_SCOPE_LEN: usize = HEAP_BASE + 88;
-// HEAP_BASE + 96..120 is reserved. It held the root transient lane's mark, depth and high-water
-// words, which now live in the executor-local block (`executor::TransientLane`).
+const LARGE_REPORTED: usize = HEAP_BASE + 96; // `[alloc-large]` counts per size class
+// HEAP_BASE + 104..120 is reserved. With the word above it held the root transient lane's mark,
+// depth and high-water words, which now live in the executor-local block
+// (`executor::TransientLane`).
 const ALLOC_LOCK: usize = HEAP_BASE + 120; // shared across lanes mapping the same heap frames
 const ROOT_COMMITTED_BYTES: usize = HEAP_BASE + 128; // root-only durable pages mapped from Untyped
 const DCERPC_TRACE_STATE: usize = HEAP_BASE + 136; // component-local tracing state pointer
@@ -80,7 +82,8 @@ const ALLOC_HELD: usize = 1;
 const ALLOC_POISONED: usize = 2;
 const DATA: usize = HEAP_BASE + 152; // allocations start past allocator/local metadata
 const _: () = assert!(COMPONENT_HEAP_LIMIT_BYTES + size_of::<usize>() <= OOM_REPORTED);
-const _: () = assert!(OOM_SCOPE_LEN + size_of::<usize>() <= ALLOC_LOCK);
+const _: () = assert!(OOM_SCOPE_LEN + size_of::<usize>() <= LARGE_REPORTED);
+const _: () = assert!(LARGE_REPORTED + size_of::<usize>() <= ALLOC_LOCK);
 const _: () = assert!(ALLOC_LOCK + size_of::<usize>() <= DATA);
 const _: () = assert!(ROOT_COMMITTED_BYTES + size_of::<usize>() <= DATA);
 const _: () = assert!(DCERPC_TRACE_STATE + size_of::<usize>() <= DATA);
@@ -361,6 +364,31 @@ fn report_oom(size: usize, align: usize, cur: usize, start: usize, requested_end
         debug_bytes(b" scope=");
         // SAFETY: scopes are static byte strings installed through `enter_scope`.
         debug_bytes(unsafe { core::slice::from_raw_parts(scope_ptr as *const u8, scope_len) });
+    }
+    crate::debug_put_char(b'\n');
+}
+
+/// Name a large durable allocation and the scope that made it. A table that grows without
+/// bound shows up here as a run of doublings long before it exhausts the heap.
+fn report_large(size: usize) {
+    if size < oom_budget::LARGE_ALLOCATION_BYTES {
+        return;
+    }
+    let Some(state) = oom_budget::next_large_emission(unsafe { read_word(LARGE_REPORTED) }, size)
+    else {
+        return;
+    };
+    unsafe { write_word(LARGE_REPORTED, state) };
+    debug_bytes(b"[alloc-large] size=");
+    debug_usize(size);
+    debug_bytes(b" scope=");
+    let scope_ptr = unsafe { read_word(OOM_SCOPE_PTR) };
+    let scope_len = unsafe { read_word(OOM_SCOPE_LEN) };
+    if scope_ptr != 0 && scope_len != 0 {
+        // SAFETY: scopes are static byte strings installed through `enter_scope`.
+        debug_bytes(unsafe { core::slice::from_raw_parts(scope_ptr as *const u8, scope_len) });
+    } else {
+        debug_bytes(b"none");
     }
     crate::debug_put_char(b'\n');
 }
@@ -769,7 +797,11 @@ unsafe impl GlobalAlloc for Bump {
         if routes_transient() {
             unsafe { self.alloc_transient(layout) }
         } else {
-            unsafe { self.alloc_durable(layout) }
+            let allocated = unsafe { self.alloc_durable(layout) };
+            if !allocated.is_null() {
+                report_large(layout.size());
+            }
+            allocated
         }
     }
 
@@ -780,6 +812,19 @@ unsafe impl GlobalAlloc for Bump {
 
     unsafe fn realloc(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
         let _guard = HeapLockGuard::acquire();
+        let resized = unsafe { self.realloc_locked(ptr, old_layout, new_size) };
+        if !resized.is_null()
+            && !is_transient_pointer(resized as usize)
+            && (ptr.is_null() || new_size > old_layout.size())
+        {
+            report_large(new_size);
+        }
+        resized
+    }
+}
+
+impl Bump {
+    unsafe fn realloc_locked(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
         if ptr.is_null() {
             let Ok(layout) = Layout::from_size_align(new_size, old_layout.align()) else {
                 return null_mut();

@@ -394,6 +394,11 @@ pub(super) unsafe fn retire_lease(
     Ok(())
 }
 
+/// Rows and heap bytes; the caller holds the catalog lock.
+pub(super) fn tombstone_census() -> (usize, usize) {
+    (tombstones().len(), tombstones().capacity() * core::mem::size_of::<Tombstone>())
+}
+
 pub(super) unsafe fn drain_tombstones(inst: DriverInstance)
     -> Result<(), nt_status::NtStatus>
 {
