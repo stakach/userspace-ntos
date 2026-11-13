@@ -14,7 +14,7 @@
 //! that share the image. State a spawned component must write does not belong here.
 
 use core::ops::Deref;
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicU64, AtomicUsize};
 
 /// Fields are atomics so the block is `Sync` without `unsafe`. Exactly one executor runs at a
 /// time, and each call site keeps the ordering it used before the state moved here.
@@ -42,6 +42,26 @@ pub(crate) struct ExecutorLocal {
     /// Base of that process's demand scratch window: the executive VA range where its frames are
     /// aliased for a copy. It always belongs to the process named by [`Self::client_pi`].
     pub(crate) scratch_base: AtomicU64,
+    /// This executor's rewindable allocation lane.
+    pub(crate) transient: TransientLane,
+}
+
+/// An executor's rewindable allocation lane: the arena the allocator routes to while a
+/// `TransientAllocScope` guard is live on that executor's stack.
+///
+/// Scopes rewind the mark in LIFO order, which holds only for the guards of one stack, so the
+/// mark and the scope depth belong to the executor and not to the heap. Only the root executive
+/// has a lane; the allocator checks that before it reads this state. There is one executor
+/// today, so its lane spans the whole transient reservation at the top of the root heap. Each
+/// further executor needs its own range of that reservation, recorded here beside the mark.
+pub(crate) struct TransientLane {
+    /// Bytes consumed downward from the top of the lane: the rewind mark.
+    pub(crate) used: AtomicUsize,
+    /// Live transient scopes on this executor's stack. Zero routes allocations to the durable
+    /// heap, which is also how a durable scope suspends an outer transient one.
+    pub(crate) depth: AtomicUsize,
+    /// Peak of [`Self::used`], reported by the heap census.
+    pub(crate) high_water: AtomicUsize,
 }
 
 impl ExecutorLocal {
@@ -53,6 +73,11 @@ impl ExecutorLocal {
             // Before the first event is admitted, boot work addresses the first hosted process.
             client_pi: AtomicU64::new(0),
             scratch_base: AtomicU64::new(crate::SMSS_SCRATCH_BASE),
+            transient: TransientLane {
+                used: AtomicUsize::new(0),
+                depth: AtomicUsize::new(0),
+                high_water: AtomicUsize::new(0),
+            },
         }
     }
 }

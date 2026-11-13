@@ -10,11 +10,18 @@
 //! Spawned components publish their allocation limit before their first allocation. An eager
 //! heap maps that entire limit; a reserved heap commits missing pages through the authenticated
 //! root pager. The initial executive retains its separate root commitment protocol.
+//!
+//! The one piece of allocator state outside the heap is the root executive's transient lane (its
+//! rewind mark, scope depth and high-water mark). It exists only in root, where the image is
+//! writable, and belongs to the executor whose stack holds the scope guards, so it lives in the
+//! executor-local block.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem::{align_of, size_of};
 use core::ptr::{copy_nonoverlapping, null_mut, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::executor::TransientLane;
 
 #[path = "allocator_oom_budget.rs"]
 mod oom_budget;
@@ -62,9 +69,8 @@ const OOM_REPORTED: usize = HEAP_BASE + 64;
 const OOM_CONTEXT: usize = HEAP_BASE + 72;
 const OOM_SCOPE_PTR: usize = HEAP_BASE + 80;
 const OOM_SCOPE_LEN: usize = HEAP_BASE + 88;
-const TRANSIENT_CTR: usize = HEAP_BASE + 96; // bytes consumed downward from the mapped heap end
-const TRANSIENT_DEPTH: usize = HEAP_BASE + 104; // nested transient allocation scopes
-const TRANSIENT_HIGH_WATER: usize = HEAP_BASE + 112; // peak transient bytes consumed
+// HEAP_BASE + 96..120 is reserved. It held the root transient lane's mark, depth and high-water
+// words, which now live in the executor-local block (`executor::TransientLane`).
 const ALLOC_LOCK: usize = HEAP_BASE + 120; // shared across lanes mapping the same heap frames
 const ROOT_COMMITTED_BYTES: usize = HEAP_BASE + 128; // root-only durable pages mapped from Untyped
 const DCERPC_TRACE_STATE: usize = HEAP_BASE + 136; // component-local tracing state pointer
@@ -74,8 +80,7 @@ const ALLOC_HELD: usize = 1;
 const ALLOC_POISONED: usize = 2;
 const DATA: usize = HEAP_BASE + 152; // allocations start past allocator/local metadata
 const _: () = assert!(COMPONENT_HEAP_LIMIT_BYTES + size_of::<usize>() <= OOM_REPORTED);
-const _: () = assert!(OOM_SCOPE_LEN + size_of::<usize>() <= TRANSIENT_CTR);
-const _: () = assert!(TRANSIENT_HIGH_WATER + size_of::<usize>() <= DATA);
+const _: () = assert!(OOM_SCOPE_LEN + size_of::<usize>() <= ALLOC_LOCK);
 const _: () = assert!(ALLOC_LOCK + size_of::<usize>() <= DATA);
 const _: () = assert!(ROOT_COMMITTED_BYTES + size_of::<usize>() <= DATA);
 const _: () = assert!(DCERPC_TRACE_STATE + size_of::<usize>() <= DATA);
@@ -159,7 +164,8 @@ pub struct AllocScope {
 ///
 /// The guard is deliberately not exposed as a mark/reset pair: nested scopes rewind in LIFO order,
 /// and values allocated while it is live must be dropped before the guard. Durable objects must not
-/// be created inside this scope. Scope routing is root-executive single-lane state; shared win32k
+/// be created inside this scope. Scope routing and the rewind mark are the calling executor's
+/// [`TransientLane`]: the guard must be dropped on the executor that created it. Shared win32k
 /// lanes have no transient arena and must not use it as thread-local storage.
 pub struct TransientAllocScope {
     previous_mark: usize,
@@ -193,21 +199,17 @@ impl Drop for TransientAllocScope {
         if !self.active {
             return;
         }
-        debug_assert_eq!(
-            unsafe { read_word(TRANSIENT_DEPTH) },
-            self.previous_depth + 1
-        );
-        unsafe {
-            write_word(TRANSIENT_CTR, self.previous_mark);
-            write_word(TRANSIENT_DEPTH, self.previous_depth);
-        }
+        let lane = root_transient_lane();
+        debug_assert_eq!(lane.depth.load(Ordering::Relaxed), self.previous_depth + 1);
+        lane.used.store(self.previous_mark, Ordering::Relaxed);
+        lane.depth.store(self.previous_depth, Ordering::Relaxed);
     }
 }
 
 impl Drop for DurableAllocScope {
     fn drop(&mut self) {
         if self.active {
-            unsafe { write_word(TRANSIENT_DEPTH, self.previous_transient_depth) };
+            root_transient_lane().depth.store(self.previous_transient_depth, Ordering::Relaxed);
         }
     }
 }
@@ -234,24 +236,20 @@ pub fn enter_scope(scope: &'static [u8]) -> AllocScope {
 /// Route allocations to the root executive's transient lane until the returned guard is dropped.
 /// Spawned services have no transient lane and continue using their declared durable heap.
 pub fn enter_transient() -> TransientAllocScope {
-    let active = transient_heap_size() != 0;
-    let previous_mark = if active {
-        unsafe { read_word(TRANSIENT_CTR) }
-    } else {
-        0
+    let Some(lane) = transient_lane() else {
+        return TransientAllocScope {
+            previous_mark: 0,
+            previous_depth: 0,
+            active: false,
+        };
     };
-    let previous_depth = if active {
-        unsafe { read_word(TRANSIENT_DEPTH) }
-    } else {
-        0
-    };
-    if active {
-        unsafe { write_word(TRANSIENT_DEPTH, previous_depth + 1) };
-    }
+    let previous_mark = lane.used.load(Ordering::Relaxed);
+    let previous_depth = lane.depth.load(Ordering::Relaxed);
+    lane.depth.store(previous_depth + 1, Ordering::Relaxed);
     TransientAllocScope {
         previous_mark,
         previous_depth,
-        active,
+        active: true,
     }
 }
 
@@ -260,18 +258,17 @@ pub fn enter_transient() -> TransientAllocScope {
 /// This is for publication operations, such as minting a handle after transient name lookup. The
 /// returned guard must not outlive the surrounding transient guard.
 pub fn enter_durable() -> DurableAllocScope {
-    let active = transient_heap_size() != 0;
-    let previous_transient_depth = if active {
-        unsafe { read_word(TRANSIENT_DEPTH) }
-    } else {
-        0
+    let Some(lane) = transient_lane() else {
+        return DurableAllocScope {
+            previous_transient_depth: 0,
+            active: false,
+        };
     };
-    if active {
-        unsafe { write_word(TRANSIENT_DEPTH, 0) };
-    }
+    let previous_transient_depth = lane.depth.load(Ordering::Relaxed);
+    lane.depth.store(0, Ordering::Relaxed);
     DurableAllocScope {
         previous_transient_depth,
-        active,
+        active: true,
     }
 }
 
@@ -476,6 +473,26 @@ fn transient_heap_size() -> usize {
     } else {
         0
     }
+}
+
+/// The calling executor's transient lane. Only the root executive has one: a spawned component
+/// sees the executor-local block read-only, so every caller first establishes, through
+/// [`transient_heap_size`] or a pointer inside the transient reservation, that this is root.
+#[inline]
+fn root_transient_lane() -> &'static TransientLane {
+    &crate::executor::local().transient
+}
+
+/// The calling executor's transient lane, or `None` in a spawned component.
+#[inline]
+fn transient_lane() -> Option<&'static TransientLane> {
+    (transient_heap_size() != 0).then(root_transient_lane)
+}
+
+/// Whether the calling executor has a live transient scope that routes new allocations.
+#[inline]
+fn routes_transient() -> bool {
+    transient_lane().is_some_and(|lane| lane.depth.load(Ordering::Relaxed) != 0)
 }
 
 #[inline]
@@ -716,7 +733,8 @@ impl Bump {
         let Some(size) = block_size(layout.size()) else {
             return null_mut();
         };
-        let used = unsafe { read_word(TRANSIENT_CTR) };
+        let lane = root_transient_lane();
+        let used = lane.used.load(Ordering::Relaxed);
         let top = heap_limit_end().saturating_sub(used);
         let Some(unrounded) = top.checked_sub(size) else {
             report_oom(layout.size(), layout.align(), used, 0, usize::MAX);
@@ -734,11 +752,9 @@ impl Bump {
             return null_mut();
         }
         let consumed = heap_limit_end() - start;
-        unsafe {
-            write_word(TRANSIENT_CTR, consumed);
-            if consumed > read_word(TRANSIENT_HIGH_WATER) {
-                write_word(TRANSIENT_HIGH_WATER, consumed);
-            }
+        lane.used.store(consumed, Ordering::Relaxed);
+        if consumed > lane.high_water.load(Ordering::Relaxed) {
+            lane.high_water.store(consumed, Ordering::Relaxed);
         }
         start as *mut u8
     }
@@ -750,7 +766,7 @@ impl Bump {
 unsafe impl GlobalAlloc for Bump {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let _guard = HeapLockGuard::acquire();
-        if transient_heap_size() != 0 && unsafe { read_word(TRANSIENT_DEPTH) } != 0 {
+        if routes_transient() {
             unsafe { self.alloc_transient(layout) }
         } else {
             unsafe { self.alloc_durable(layout) }
@@ -768,7 +784,7 @@ unsafe impl GlobalAlloc for Bump {
             let Ok(layout) = Layout::from_size_align(new_size, old_layout.align()) else {
                 return null_mut();
             };
-            return if transient_heap_size() != 0 && unsafe { read_word(TRANSIENT_DEPTH) } != 0 {
+            return if routes_transient() {
                 unsafe { self.alloc_transient(layout) }
             } else {
                 unsafe { self.alloc_durable(layout) }
@@ -900,6 +916,7 @@ pub fn usage() -> HeapUsage {
         node = unsafe { free_node_next(node) };
         guard += 1;
     }
+    let lane = transient_lane();
     HeapUsage {
         bump,
         allocated: bump.saturating_sub(free_bytes),
@@ -907,8 +924,8 @@ pub fn usage() -> HeapUsage {
         largest_reusable: top_reusable.max(largest_free),
         top_reusable,
         durable_capacity: durable_heap_capacity(),
-        transient_used: unsafe { read_word(TRANSIENT_CTR) },
-        transient_high_water: unsafe { read_word(TRANSIENT_HIGH_WATER) },
+        transient_used: lane.map_or(0, |lane| lane.used.load(Ordering::Relaxed)),
+        transient_high_water: lane.map_or(0, |lane| lane.high_water.load(Ordering::Relaxed)),
         transient_capacity: transient_heap_size(),
     }
 }
