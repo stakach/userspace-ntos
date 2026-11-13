@@ -11,7 +11,7 @@ const INVALID_PARAMETER: u32 = 0xC000_000D;
 const INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 
 pub(crate) struct LocalEventState<'a> {
-    obj_ns: &'a mut Vec<ObjEntry>,
+    obj_ns: &'a mut ObjectNamespace,
     anon_event_seq: &'a mut u32,
     events: &'a mut EventStore,
     event_objects: &'a mut EventObjectRegistry,
@@ -19,7 +19,7 @@ pub(crate) struct LocalEventState<'a> {
 
 impl<'a> LocalEventState<'a> {
     pub(crate) fn new(
-        obj_ns: &'a mut Vec<ObjEntry>,
+        obj_ns: &'a mut ObjectNamespace,
         anon_event_seq: &'a mut u32,
         events: &'a mut EventStore,
         event_objects: &'a mut EventObjectRegistry,
@@ -69,10 +69,9 @@ impl<'a> LocalEventState<'a> {
         {
             Ok(id) => id,
             Err(_) => {
-                // Publication has not escaped; only this newly appended namespace entry exists.
-                assert_eq!(index + 1, self.obj_ns.len());
+                // Publication has not escaped; only this newly created namespace entry exists.
                 assert!(self.events.remove_existing(index as u64));
-                self.obj_ns.pop();
+                assert!(self.obj_ns.discard_unpublished(index));
                 return Err(INSUFFICIENT_RESOURCES);
             }
         };
@@ -259,7 +258,7 @@ pub(crate) fn finalize_local_backing(
 
 /// Anonymous namespace entries are append-only; their index is the native dispatcher identity.
 pub(crate) fn create_anonymous_event(
-    obj_ns: &mut Vec<ObjEntry>,
+    obj_ns: &mut ObjectNamespace,
     anon_event_seq: &mut u32,
     events: &mut EventStore,
     auto_reset: bool,
@@ -274,8 +273,7 @@ pub(crate) fn create_anonymous_event(
         ((n >> 8) & 0xff) as u8,
         ((n >> 16) & 0xff) as u8,
     ];
-    let index = ObjEntry::push_kind(
-        obj_ns,
+    let index = obj_ns.push_kind(
         &name,
         OBJ_PARENT_ANONYMOUS,
         OBJ_KIND_EVENT,
@@ -291,7 +289,7 @@ pub(crate) fn create_anonymous_event(
         },
         initial_state,
     ) {
-        obj_ns.pop();
+        obj_ns.discard_unpublished(index);
         return None;
     }
     Some(index)

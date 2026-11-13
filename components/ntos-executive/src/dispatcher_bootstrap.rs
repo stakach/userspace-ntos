@@ -3,7 +3,7 @@
 use super::*;
 
 pub(crate) struct DispatcherBootstrapSeed {
-    pub obj_ns: Vec<ObjEntry>,
+    pub obj_ns: ObjectNamespace,
     pub anon_event_seq: u32,
     pub dispatcher: nt_user_host::dispatcher_state::DispatcherState,
 }
@@ -196,7 +196,7 @@ pub(crate) unsafe fn take() -> DispatcherBootstrapSeed {
 
 /// Bootstrap-only namespace access. The closure must not call into another component.
 pub(crate) unsafe fn with_object_namespace<R>(
-    operation: impl FnOnce(&mut Vec<ObjEntry>) -> R,
+    operation: impl FnOnce(&mut ObjectNamespace) -> R,
 ) -> Result<R, u32> {
     (&mut *core::ptr::addr_of_mut!(BOOTSTRAP))
         .with_mut(|seed| operation(&mut seed.obj_ns))

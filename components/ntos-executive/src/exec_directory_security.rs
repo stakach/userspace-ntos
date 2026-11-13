@@ -470,8 +470,8 @@ impl ExecNtHandler {
             .map_err(|_| 0xC000_009Au32)?;
         self.obj_ns.try_reserve(1).map_err(|_| 0xC000_009Au32)?;
         let descriptor = admission.descriptor.take().ok_or(0xC000_0008u32)?;
-        let Some(index) = ObjEntry::push_dir(
-            &mut self.obj_ns, &admission.leaf, admission.parent, admission.permanent,
+        let Some(index) = self.obj_ns.push_dir(
+            &admission.leaf, admission.parent, admission.permanent,
         ) else {
             admission.descriptor = Some(descriptor);
             return Err(0xC000_009A);

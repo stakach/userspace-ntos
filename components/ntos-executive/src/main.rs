@@ -123,6 +123,7 @@ mod boot_registry_mutation_work;
 mod object_wait;
 mod thread_alert;
 use object_wait::*;
+use ob::{ObjEntry, ObjectNamespace};
 mod object_wait_apc;
 mod object_wait_reply;
 mod dispatcher_signal;
@@ -137,6 +138,7 @@ mod current_apc;
 mod user_apc;
 mod ipc_message;
 mod executor;
+mod ob;
 mod executive_ingress;
 mod executive_va;
 mod fs_loader;
@@ -23470,145 +23472,6 @@ const OBJ_KIND_DELETED: u8 = 0xff;
 const OBJ_NAME_CAP: usize = 128;
 const OBJ_PARENT_ROOT: usize = usize::MAX;
 const OBJ_PARENT_ANONYMOUS: usize = usize::MAX - 1;
-static OBJ_NS_GROWTHS: AtomicU64 = AtomicU64::new(0);
-static NEXT_OBJ_NS_IDENTITY: AtomicU64 = AtomicU64::new(1);
-
-fn mark_object_namespace_growth(old_capacity: usize, new_capacity: usize, len: usize) {
-    let n = OBJ_NS_GROWTHS.fetch_add(1, Ordering::Relaxed);
-    if n < 8 {
-        print_str(b"[obj-ns] grew capacity ");
-        print_u64(old_capacity as u64);
-        print_str(b" -> ");
-        print_u64(new_capacity as u64);
-        print_str(b" len=");
-        print_u64(len as u64);
-        print_str(b"\n");
-    }
-}
-
-/// One node in the executive's minimal object-manager namespace. Inline, `Copy`, no nested heap
-/// allocation. Its backing `Vec` remains live through ordinary ownership and may grow beyond the
-/// boot reserve. NT object leaf names are allowed to be long enough for BaseNamedObjects mutexes
-/// such as userenv's per-profile mutex; `target` is link-only data; `payload` carries backing object
-/// identity for kinds whose state lives outside the namespace, such as LPC listen port handles and
-/// I/O completion ports. `permanent` mirrors `OBJ_PERMANENT`; non-permanent named objects are
-/// unlinked when their final body reference goes away.
-#[derive(Clone, Copy)]
-struct ObjEntry {
-    identity: u64,
-    name: [u8; OBJ_NAME_CAP], // stored ASCII leaf; directory objects retain caller spelling
-    name_len: u8,
-    parent: usize, // index of the parent directory; OBJ_PARENT_ROOT = the root itself
-    kind: u8,
-    permanent: bool,
-    /// References held by published native wait records after the caller's handle capture.
-    wait_references: u32,
-    target: [u8; OBJ_NAME_CAP], // symbolic-link target (kind == 1)
-    target_len: u8,
-    payload: u64,
-}
-impl ObjEntry {
-    fn push_zeroed(entries: &mut alloc::vec::Vec<Self>) -> Option<usize> {
-        let identity = NEXT_OBJ_NS_IDENTITY
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
-            .ok()?;
-        if entries.len() == entries.capacity() {
-            let old_capacity = entries.capacity();
-            entries.try_reserve(64).ok()?;
-            let new_capacity = entries.capacity();
-            if new_capacity > old_capacity {
-                mark_object_namespace_growth(old_capacity, new_capacity, entries.len());
-            }
-        }
-        let index = entries.len();
-        entries.push(Self {
-            identity,
-            name: [0; OBJ_NAME_CAP],
-            name_len: 0,
-            parent: 0,
-            kind: OBJ_KIND_DELETED,
-            permanent: false,
-            wait_references: 0,
-            target: [0; OBJ_NAME_CAP],
-            target_len: 0,
-            payload: 0,
-        });
-        Some(index)
-    }
-
-    fn push_kind(
-        entries: &mut alloc::vec::Vec<Self>,
-        name: &[u8],
-        parent: usize,
-        kind: u8,
-        target: &[u8],
-        permanent: bool,
-    ) -> Option<usize> {
-        let index = Self::push_zeroed(entries)?;
-        let entry = &mut entries[index];
-        entry.parent = parent;
-        entry.kind = kind;
-        entry.permanent = permanent;
-        let n = name.len().min(OBJ_NAME_CAP);
-        entry.name[..n].copy_from_slice(&name[..n]);
-        entry.name_len = n as u8;
-        if kind == OBJ_KIND_SYMBOLIC_LINK {
-            let n = target.len().min(OBJ_NAME_CAP);
-            entry.target[..n].copy_from_slice(&target[..n]);
-            entry.target_len = n as u8;
-        }
-        Some(index)
-    }
-
-    fn push_dir(
-        entries: &mut alloc::vec::Vec<Self>,
-        name: &[u8],
-        parent: usize,
-        permanent: bool,
-    ) -> Option<usize> {
-        Self::push_kind(entries, name, parent, OBJ_KIND_DIRECTORY, &[], permanent)
-    }
-
-    fn push_symlink(
-        entries: &mut alloc::vec::Vec<Self>,
-        name: &[u8],
-        parent: usize,
-        target: &[u8],
-        permanent: bool,
-    ) -> Option<usize> {
-        Self::push_kind(
-            entries,
-            name,
-            parent,
-            OBJ_KIND_SYMBOLIC_LINK,
-            target,
-            permanent,
-        )
-    }
-
-    fn is_live(&self) -> bool {
-        self.kind != OBJ_KIND_DELETED
-    }
-    fn name(&self) -> &[u8] {
-        &self.name[..self.name_len as usize]
-    }
-    fn target(&self) -> &[u8] {
-        &self.target[..self.target_len as usize]
-    }
-
-    fn unlink(&mut self) {
-        self.name = [0; OBJ_NAME_CAP];
-        self.name_len = 0;
-        self.parent = OBJ_PARENT_ANONYMOUS;
-        self.kind = OBJ_KIND_DELETED;
-        self.permanent = false;
-        self.wait_references = 0;
-        self.target = [0; OBJ_NAME_CAP];
-        self.target_len = 0;
-        self.payload = 0;
-    }
-}
-
 /// Paging locals owned by the current event until its checkpoint.
 #[derive(Clone, Copy)]
 struct LiveProcessPaging {
@@ -24072,7 +23935,7 @@ struct ExecNtHandler {
     secured_virtual_memory: nt_address_space::SecuredVirtualMemoryTable,
     /// The minimal object-manager namespace (index 0 = root `\`). Entries are inline and the owned
     /// vector grows beyond its boot reserve when required.
-    obj_ns: alloc::vec::Vec<ObjEntry>,
+    obj_ns: ObjectNamespace,
     directory_security: alloc::vec::Vec<exec_handler::directory_security::DirectorySecurityRecord>,
     /// Exact Object Manager backing for each native directory generation and its open leases.
     canonical_directories: nt_user_host::canonical_directory_backing::CanonicalDirectoryBackings<

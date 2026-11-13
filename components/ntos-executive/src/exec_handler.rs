@@ -3503,9 +3503,9 @@ fn persistent_clock_error_status(error: nt_persistent_clock::ClockError) -> u32 
 }
 
 #[inline(never)]
-pub(super) fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
-    let mut v = alloc::vec::Vec::with_capacity(192);
-    ObjEntry::push_dir(&mut v, b"", OBJ_PARENT_ROOT, true).expect("object namespace root"); // 0 = root "\"
+pub(super) fn build_initial_object_namespace() -> ObjectNamespace {
+    let mut v = ObjectNamespace::with_capacity(192);
+    v.push_dir(b"", OBJ_PARENT_ROOT, true).expect("object namespace root"); // 0 = root "\"
     for d in [
         b"??".as_slice(),
         b"Device",
@@ -3515,13 +3515,13 @@ pub(super) fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
         b"FileSystem",
         b"Security",
     ] {
-        ObjEntry::push_dir(&mut v, d, 0, true).expect("initial object directory");
+        v.push_dir(d, 0, true).expect("initial object directory");
     }
-    let windows = ObjEntry::push_dir(&mut v, b"Windows", 0, true)
+    let windows = v.push_dir(b"Windows", 0, true)
         .expect("initial Windows directory");
-    ObjEntry::push_dir(&mut v, b"WindowStations", windows, true)
+    v.push_dir(b"WindowStations", windows, true)
         .expect("initial WindowStations directory");
-    ObjEntry::push_symlink(&mut v, b"DosDevices", 0, b"\\??", true)
+    v.push_symlink(b"DosDevices", 0, b"\\??", true)
         .expect("initial DosDevices alias");
     v
 }
@@ -25114,41 +25114,39 @@ impl ExecNtHandler {
                 let _ = self.request_event_object_delete(id, b"new-event-rollback", true);
             }
         }
-        if index + 1 == self.obj_ns.len() {
-            self.obj_ns.pop();
+        if self.obj_ns.discard_unpublished(index) {
             self.events.remove_existing(index as u64);
         }
     }
 
     fn rollback_new_timer(&mut self, index: usize) {
-        if index + 1 == self.obj_ns.len() {
-            self.obj_ns.pop();
+        if self.obj_ns.discard_unpublished(index) {
             self.events.remove_existing(index as u64);
             self.user_timer_remove(index as u64);
         }
     }
 
     fn rollback_new_semaphore(&mut self, index: usize) {
-        if index + 1 == self.obj_ns.len() {
-            self.obj_ns.pop();
+        if self.obj_ns.discard_unpublished(index) {
             self.semaphores.remove(index as u64);
         }
     }
 
     fn rollback_new_mutant(&mut self, index: usize) {
-        if index + 1 == self.obj_ns.len() {
-            self.obj_ns.pop();
+        if self.obj_ns.discard_unpublished(index) {
             self.mutants.remove(index as u64);
         }
     }
 
     fn rollback_new_namespace_object(&mut self, index: usize) {
-        if index + 1 == self.obj_ns.len() {
-            let identity = self.obj_ns[index].identity;
-            let parent = self.obj_ns[index].parent;
-            let parent_identity = self.obj_ns.get(parent).map(|entry| entry.identity);
+        let Some(entry) = self.obj_ns.get(index) else {
+            return;
+        };
+        let identity = entry.identity;
+        let parent = entry.parent;
+        let parent_identity = self.obj_ns.get(parent).map(|entry| entry.identity);
+        if self.obj_ns.discard_unpublished(index) {
             self.directory_security.retain(|record| record.identity() != identity);
-            self.obj_ns.pop();
             if let Some(identity) = parent_identity {
                 self.retire_directory_security_body(parent, identity);
             }
@@ -31709,7 +31707,7 @@ impl ExecNtHandler {
         if let Some(i) = self.obj_child(parent, leaf) {
             return Some(i);
         }
-        ObjEntry::push_kind(&mut self.obj_ns, leaf, parent, kind, target, permanent)
+        self.obj_ns.push_kind(leaf, parent, kind, target, permanent)
     }
 
     pub(crate) fn lpc_port_handle_by_ascii(&self, path: &[u8]) -> Option<u64> {
@@ -31802,8 +31800,7 @@ impl ExecNtHandler {
             ((n >> 8) & 0xff) as u8,
             ((n >> 16) & 0xff) as u8,
         ];
-        let index = ObjEntry::push_kind(
-            &mut self.obj_ns,
+        let index = self.obj_ns.push_kind(
             &name,
             OBJ_PARENT_ANONYMOUS,
             OBJ_KIND_TIMER,
@@ -31819,11 +31816,11 @@ impl ExecNtHandler {
             },
             false,
         ) {
-            self.obj_ns.pop();
+            self.obj_ns.discard_unpublished(index);
             return None;
         }
         if self.user_timer_ensure(index as u64).is_err() {
-            self.obj_ns.pop();
+            self.obj_ns.discard_unpublished(index);
             self.events.remove_existing(index as u64);
             return None;
         }
@@ -32008,8 +32005,7 @@ impl ExecNtHandler {
             ((n >> 8) & 0xff) as u8,
             ((n >> 16) & 0xff) as u8,
         ];
-        let index = ObjEntry::push_kind(
-            &mut self.obj_ns,
+        let index = self.obj_ns.push_kind(
             &name,
             OBJ_PARENT_ANONYMOUS,
             OBJ_KIND_SEMAPHORE,
@@ -32021,7 +32017,7 @@ impl ExecNtHandler {
             .initialize(index as u64, initial, maximum)
             .is_err()
         {
-            self.obj_ns.pop();
+            self.obj_ns.discard_unpublished(index);
             return None;
         }
         Some(index)
@@ -32036,8 +32032,7 @@ impl ExecNtHandler {
             ((n >> 8) & 0xff) as u8,
             ((n >> 16) & 0xff) as u8,
         ];
-        let index = ObjEntry::push_kind(
-            &mut self.obj_ns,
+        let index = self.obj_ns.push_kind(
             &name,
             OBJ_PARENT_ANONYMOUS,
             OBJ_KIND_MUTANT,
@@ -40396,8 +40391,7 @@ impl ExecNtHandler {
                         Ok(id) => id,
                         Err(status) => return status,
                     };
-                    let Some(index) = ObjEntry::push_kind(
-                        &mut this.obj_ns,
+                    let Some(index) = this.obj_ns.push_kind(
                         &[],
                         OBJ_PARENT_ANONYMOUS,
                         OBJ_KIND_IO_COMPLETION,

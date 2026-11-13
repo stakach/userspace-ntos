@@ -143,8 +143,7 @@ pub(crate) unsafe fn publish(
             for (index, alias) in aliases.iter().enumerate() {
                 let folded_leaf: alloc::vec::Vec<u8> =
                     leaf(alias).iter().map(u8::to_ascii_lowercase).collect();
-                let slot = ObjEntry::push_symlink(
-                    entries,
+                let slot = entries.push_symlink(
                     &folded_leaf,
                     parents[index],
                     alias.target.as_bytes(),
