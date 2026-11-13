@@ -296,7 +296,6 @@ dependencies = [
  "nt-config-manager",
  "nt-hive-core",
  "nt-security",
- "nt-status",
 ]
 
 [[package]]
@@ -324,9 +323,6 @@ version = "0.1.0"
 [[package]]
 name = "nt-dma-manager"
 version = "0.1.0"
-dependencies = [
- "nt-mdl",
-]
 
 [[package]]
 name = "nt-driver-abi"
