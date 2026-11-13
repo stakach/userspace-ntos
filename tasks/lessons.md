@@ -833,3 +833,12 @@ diagnosis-free failure.
 - VideoPort allocates a monitor array even when its child list is empty, but creates no per-array reference row for that case. Free the exact empty allocation without a provider reference ACK. For populated arrays, transfer each canonical caller reference first, free the source allocation, then ACK the provider's counted references.
 - Classify transferred ownership from the exact completing FDO, not a driver-wide initialized flag. A driver may serve more than one device with different roles; bind the ACK choice to the same canonical device identity that produced the array.
 - Parse caller-visible monitor entries once at admission. After publication, the caller may change those entries; exact free and retirement must validate the immutable recorded metadata offset and physical allocation generation rather than rescan mutable PDO bytes.
+
+## Hoist A Macro-Heavy Loop Body Without Changing It
+- A `macro_rules!` body resolves locals at its definition site and other macros at its use site. Before a loop-local becomes a field or a rebinding, move every macro that names it below the new binding, or it silently keeps the old one.
+- Before moving an owned local into a state struct, search for raw pointers to it (`&mut x as *mut _` stored in a context). Borrow it from the frame that owns it instead; the same applies to the struct itself once a context records an address inside it.
+- A hoisted call borrows the whole state, while inline code holds per-field rebindings. Hoist from the end of the body backwards, so no inline code runs after a call.
+- Decide which `break` and `continue` target the outer loop with a nesting classifier, check it against an independent inventory, and let the compiler find the misses: moved code has no enclosing loop. Only an inner-loop exit wrongly turned into `return` is silent.
+- A value a macro argument read late (the Reply slot after a prepare step) must stay late in the function form; pass it as a closure. Check that every other argument is a plain read before evaluating it eagerly.
+- Rename a common local (`result`, `badge`) with a scope-aware pass and remove the old binding from scope, so a missed use fails to compile and a stale copy cannot be read after the loop.
+- An RAII guard declared in a hoisted section must be returned to the caller that owns the turn, or it drops when the section returns.
