@@ -448,7 +448,7 @@ impl NativeSharedIngress {
             |reply| {
                 // Binding queries use the same IPC bank. Materialize extended words only after
                 // all ownership probes, immediately before the one-shot retained Reply effect.
-                let base = crate::IPC_BUFFER.load(core::sync::atomic::Ordering::Relaxed) as *mut u64;
+                let base = crate::executor::local().ipc_buffer.load(core::sync::atomic::Ordering::Relaxed) as *mut u64;
                 for (index, word) in words.iter().enumerate().skip(4) {
                     core::ptr::write_volatile(base.add(index + 1), *word);
                 }

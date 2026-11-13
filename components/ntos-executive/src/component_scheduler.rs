@@ -2,7 +2,6 @@
 
 use super::*;
 
-static DEPTH: AtomicU64 = AtomicU64::new(0);
 static YIELDS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
@@ -45,7 +44,7 @@ fn trace_worker_startup_pump(
 }
 
 pub(super) fn is_active() -> bool {
-    DEPTH.load(Ordering::Acquire) != 0
+    crate::executor::local().scheduler_depth.load(Ordering::Acquire) != 0
 }
 
 /// The retained physical route owns this TCB cap. A failed request means the worker is no
@@ -63,7 +62,7 @@ pub(crate) struct ComponentSchedulerScope {
 impl ComponentSchedulerScope {
     pub(crate) fn enter() -> Self {
         Self {
-            depth: DEPTH.fetch_add(1, Ordering::AcqRel) + 1,
+            depth: crate::executor::local().scheduler_depth.fetch_add(1, Ordering::AcqRel) + 1,
         }
     }
 
@@ -129,7 +128,7 @@ impl ComponentSchedulerScope {
 
 impl Drop for ComponentSchedulerScope {
     fn drop(&mut self) {
-        let previous = DEPTH.fetch_sub(1, Ordering::AcqRel);
+        let previous = crate::executor::local().scheduler_depth.fetch_sub(1, Ordering::AcqRel);
         assert_eq!(
             previous, self.depth,
             "component scheduler scope order violated"

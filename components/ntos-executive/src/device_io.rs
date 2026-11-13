@@ -534,7 +534,7 @@ pub(crate) unsafe fn storage_probe(
 /// toward `io_address`. Returns the invocation error label (0 = success). The first call
 /// for a device installs the context root (and lazily enables VT-d translation).
 pub(crate) unsafe fn iopt_map(iopt_cap: u64, io_space_cap: u64, io_address: u64) -> u64 {
-    let ipc = IPC_BUFFER.load(Ordering::Relaxed);
+    let ipc = crate::executor::local().ipc_buffer.load(Ordering::Relaxed);
     core::ptr::write_volatile((ipc + 122 * 8) as *mut u64, io_space_cap); // extraCaps[0] = IOSpace
     let msginfo = (LBL_X86_IO_PAGE_TABLE_MAP << 12) | (1 << 9) | (1 << 7) | 1;
     let reply: u64;
@@ -562,7 +562,7 @@ pub(crate) unsafe fn map_io(
     rights: u64,
     io_address: u64,
 ) -> u64 {
-    let ipc = IPC_BUFFER.load(Ordering::Relaxed);
+    let ipc = crate::executor::local().ipc_buffer.load(Ordering::Relaxed);
     core::ptr::write_volatile((ipc + 122 * 8) as *mut u64, io_space_cap); // extraCaps[0] = IOSpace
     let msginfo = (LBL_X86_PAGE_MAP_IO << 12) | (1 << 9) | (1 << 7) | 2;
     let reply: u64;
@@ -587,7 +587,7 @@ pub(crate) unsafe fn map_io(
 ///
 /// ABI: mr0=first, mr1=last, mr2=dest_index, mr3=dest_depth, extra cap = dest CNode.
 pub(crate) unsafe fn issue_ioport_cap(dest_slot: u64, first: u16, last: u16) -> u64 {
-    let ipc = IPC_BUFFER.load(Ordering::Relaxed);
+    let ipc = crate::executor::local().ipc_buffer.load(Ordering::Relaxed);
     core::ptr::write_volatile((ipc + 122 * 8) as *mut u64, CAP_INIT_THREAD_CNODE);
     let msginfo = (LBL_IOPORT_CONTROL_ISSUE << 12) | (1 << 9) | (1 << 7) | 4;
     let reply: u64;

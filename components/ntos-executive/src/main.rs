@@ -136,6 +136,7 @@ mod pending_file_apc;
 mod current_apc;
 mod user_apc;
 mod ipc_message;
+mod executor;
 mod executive_ingress;
 mod executive_va;
 mod fs_loader;
@@ -2171,8 +2172,6 @@ const HPET_MAIN_COUNTER: u64 = 0xF0;
 // remains the monotonic clocksource only; none of its globally routed interrupt pins are claimed.
 const PIT_CHANNEL0_PORT: u16 = 0x40;
 const PIT_COMMAND_PORT: u16 = 0x43;
-/// The executive's own IPC buffer VA (from BootInfo) — stages reply message registers 4+.
-static IPC_BUFFER: AtomicU64 = AtomicU64::new(0);
 /// The executive stack-mirror base for the process whose fault/syscall is currently being serviced.
 /// The 2-process service loop sets this at the top of each iteration (smss vs csrss) so the shared
 /// smss_stack_read/write helpers read+write the RIGHT process's stack.
@@ -2283,7 +2282,8 @@ static SYSTEM_PROCESSOR_TOPOLOGY_READY: AtomicBool = AtomicBool::new(false);
 /// (recv-with-r12 + Send-on-reply-cap / decode_reply) resumes exactly that caller regardless of
 /// `reply_to`. REPLY_MAIN identifies the currently delivered hosted Call; shared ingress owns
 /// component Replies and rotates them independently. Zero means no hosted Call is delivered.
-static REPLY_MAIN_SLOT: AtomicU64 = AtomicU64::new(0);
+/// The slot is executor-local state; this is its old-path name for callers not yet ported.
+pub(crate) use executor::REPLY_MAIN_SLOT;
 static REPLY_TRANSPORT_PROBE_SLOT: AtomicU64 = AtomicU64::new(0);
 
 /// ═══ Checkpoint B: real reply-cap parking for NtWaitForSingleObject on unsignaled events ═══
@@ -13282,7 +13282,7 @@ unsafe fn cnode_move_root_to_cnode_r(dest_cnode: u64, dest_index: u64, src_root_
 }
 
 unsafe fn cnode_move_cnode_to_root_r(dest_root_slot: u64, src_cnode: u64, src_index: u64) -> u64 {
-    let ipc = IPC_BUFFER.load(Ordering::Relaxed);
+    let ipc = executor::local().ipc_buffer.load(Ordering::Relaxed);
     core::ptr::write_volatile((ipc + 122 * 8) as *mut u64, src_cnode);
     let msginfo = (LBL_CNODE_MOVE << 12) | (1 << 9) | (1 << 7) | 4;
     let reply: u64;
@@ -19659,11 +19659,11 @@ unsafe fn wait_wake_due(handler: &mut ExecNtHandler, now: nt_time::TimeSnapshot)
 }
 
 unsafe fn set_reply_mr(i: usize, v: u64) {
-    let base = IPC_BUFFER.load(Ordering::Relaxed);
+    let base = executor::local().ipc_buffer.load(Ordering::Relaxed);
     core::ptr::write_volatile((base + 8 + (i as u64) * 8) as *mut u64, v);
 }
 pub(crate) unsafe fn get_recv_mr(i: usize) -> u64 {
-    let base = IPC_BUFFER.load(Ordering::Relaxed);
+    let base = executor::local().ipc_buffer.load(Ordering::Relaxed);
     core::ptr::read_volatile((base + 8 + (i as u64) * 8) as *const u64)
 }
 /// Stage a value into the executive's IPC-buffer RECEIVE MR slot `i` (ntdll_plan Step 6.A). Used to
@@ -19672,7 +19672,7 @@ pub(crate) unsafe fn get_recv_mr(i: usize) -> u64 {
 /// register slots via `get_recv_mr`), so the native transport reuses that arm's full servicing body
 /// unchanged. Same address math as `set_reply_mr`/`get_recv_mr` (MR `i` at byte `8 + i*8`).
 pub(crate) unsafe fn set_recv_mr(i: usize, v: u64) {
-    let base = IPC_BUFFER.load(Ordering::Relaxed);
+    let base = executor::local().ipc_buffer.load(Ordering::Relaxed);
     core::ptr::write_volatile((base + 8 + (i as u64) * 8) as *mut u64, v);
 }
 
@@ -19689,7 +19689,7 @@ unsafe fn ioapic_issue_irq_handler_r(
     level: u64,
     polarity: u64,
 ) -> u64 {
-    let ipc = IPC_BUFFER.load(Ordering::Relaxed);
+    let ipc = executor::local().ipc_buffer.load(Ordering::Relaxed);
     core::ptr::write_volatile((ipc + 5 * 8) as *mut u64, level); // mr4 = level (0=edge, 1=level)
     core::ptr::write_volatile((ipc + 6 * 8) as *mut u64, polarity); // mr5 = polarity (1=active-low)
     core::ptr::write_volatile((ipc + 7 * 8) as *mut u64, vector); // mr6 = vector (irq table index)
@@ -29415,7 +29415,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     NEXT_SLOT.store(bi.empty.start, Ordering::Relaxed);
     ROOT_CSPACE_START.store(bi.empty.start, Ordering::Relaxed);
     ROOT_CSPACE_END.store(bi.empty.end, Ordering::Relaxed);
-    IPC_BUFFER.store(bi.ipc_buffer as u64, Ordering::Relaxed);
+    executor::local().ipc_buffer.store(bi.ipc_buffer as u64, Ordering::Relaxed);
     let img = bi.user_image_frames;
     IMAGE_FRAMES_START.store(img.start, Ordering::Relaxed);
     let image_frame_count = bi.user_image_elf_frame_count;
