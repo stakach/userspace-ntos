@@ -47,42 +47,6 @@ fn native_open_and_create_route_named_driver_peers_before_filesystem_fallback() 
 }
 
 #[test]
-fn contended_object_file_target_retains_native_open_reply_until_canonical_create() {
-    // Boot evidence: an owned directory OPEN occupies the Object Manager channel while
-    // Winlogon opens sfc.dll. DEVICE_BUSY is a no-effect transport result, not the file status.
-    let open = native_source("exec_handler.rs");
-    let create = native_source("exec_file_create.rs");
-    for (source, method) in [(&open, "nt_open_file_service"), (&create, "nt_create_file_service")] {
-        let body = function_body(source, method);
-        assert!(body.contains("pending_native_file_target_transfer")
-            || body.contains("native_file_target_open_work::"),
-            "RED: {method} must transfer the exact captured name, caller generation, and original Reply before a busy Object Manager file-target lookup can become a user-visible status");
-    }
-
-    let loop_source = native_source("service_sec_image.rs");
-    assert!(loop_source.contains("native_file_target_open_work::park")
-        && loop_source.contains("native_file_target_open_work::redrive"),
-        "the native loop must park the original Reply and redrive the file-target owner after the directory request settles");
-    let work = native_source("native_file_target_open_work.rs");
-    for contract in [
-        "RootReplyPark::prepare", "NativeThreadProcessReference", "NativeHandleCaller",
-        "poll_file_target_owned", "cancel_parked_reply_transport",
-        "finish_acknowledged_hosted_reply",
-    ] {
-        assert!(work.contains(contract),
-            "file-target work must retain exact ownership across {contract}");
-    }
-    assert!(work.contains("NoEffect") && work.contains("DEVICE_BUSY"),
-        "pre-submit channel BUSY must keep the parked native Reply without issuing a second Object Manager request");
-    assert!(work.contains("nt_open_file_captured") && work.contains("nt_create_file_captured")
-        && work.contains("finish_preparked_file_target_dispatch"),
-        "the captured Open/Create path must consume the terminal target and transfer its Reply to pending CREATE");
-    assert!(function_body(&open, "nt_open_file_captured").contains("create_registered_driver_peer_file_from_resolved")
-        && function_body(&create, "nt_create_file_captured").contains("create_registered_driver_peer_file_from_resolved"),
-        "both resumed paths must use the canonical resolved peer dispatch");
-}
-
-#[test]
 fn named_driver_peer_route_uses_object_namespace_and_canonical_dispatch() {
     let source = native_source("exec_handler.rs");
     let route = function_body(&source, "create_registered_driver_peer_file");

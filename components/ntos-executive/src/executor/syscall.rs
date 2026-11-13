@@ -2,6 +2,16 @@
 
 use super::*;
 
+/// What the syscall prelude establishes for the routes and the tail: the caller's resume
+/// coordinates, the selected table entry and the trace state of this call.
+pub(super) struct Syscall {
+    pub(super) native_call_transport: bool,
+    pub(super) resume_ip: u64,
+    pub(super) sp: u64,
+    pub(super) flags: u64,
+    pub(super) lsa_logon_trace_seq: Option<u64>,
+}
+
 /// What one syscall decides: its result, whether the NT or win32k route handled it, and the
 /// park or transfer it asks the reply-or-park tail to perform. These were the mutable locals
 /// the syscall prelude declared and the tail consumed.
