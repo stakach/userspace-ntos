@@ -48,7 +48,11 @@ struct Clock {
     held: u64,
     latest: u64,
     reference_read_ns: u64,
+    /// Where in its read the reference latches, in 1/1024ths; `None` moves it on every read.
+    latch_position: Option<u64>,
+    latch_sequence: u64,
     stall_next_reference_ns: u64,
+    glitch_next_reference_100ns: u64,
     last_observation: Option<TscObservation>,
 }
 
@@ -65,7 +69,10 @@ impl Clock {
             held: 0,
             latest: 0,
             reference_read_ns: REFERENCE_READ_NS,
+            latch_position: Some(256),
+            latch_sequence: 0x9e37_79b9_7f4a_7c15,
             stall_next_reference_ns: 0,
+            glitch_next_reference_100ns: 0,
             last_observation: None,
         }
     }
@@ -78,9 +85,17 @@ impl Clock {
             TscRead::Fast(time) => (time, Source::Fast),
             TscRead::NeedsReference => {
                 self.machine.advance(core::mem::take(&mut self.stall_next_reference_ns));
-                let latch_ns = self.reference_read_ns / 4;
+                let position = self.latch_position.unwrap_or_else(|| {
+                    // Anywhere in the read, both ends included.
+                    self.latch_sequence = self.latch_sequence
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    (self.latch_sequence >> 33) % 1025
+                });
+                let latch_ns = self.reference_read_ns * position / 1024;
                 self.machine.advance(latch_ns);
-                let reference_100ns = self.machine.reference_100ns();
+                let reference_100ns = self.machine.reference_100ns()
+                    + core::mem::take(&mut self.glitch_next_reference_100ns);
                 self.machine.advance(self.reference_read_ns - latch_ns);
                 let sample = ReferenceSample {
                     tsc_before, reference_100ns, tsc_after: self.machine.tsc,
@@ -426,7 +441,7 @@ fn a_sustained_clean_run_forgives_earlier_excursions() {
 }
 
 #[test]
-fn a_counter_or_reference_that_goes_backwards_fails_the_counter_for_the_boot() {
+fn a_counter_that_goes_backwards_fails_for_the_boot() {
     let clock = Clock::disciplined();
     let tsc = clock.machine.tsc;
     let reference = clock.machine.reference_100ns();
@@ -444,13 +459,86 @@ fn a_counter_or_reference_that_goes_backwards_fails_the_counter_for_the_boot() {
     assert_eq!(behind_anchor.observe(sample(before, reference + 1, before + 10), clock.ordinal),
         TscObservation::Failed(TscClockError::CounterRegressed));
 
-    let mut reference_back = clock.tsc;
-    assert_eq!(
-        reference_back.observe(sample(tsc + 10, reference - 20_000_000, tsc + 20), clock.ordinal),
-        TscObservation::Failed(TscClockError::ReferenceRegressed));
-    assert_eq!(reference_back.read(tsc + 30, clock.ordinal + 1), TscRead::NeedsReference);
-    assert_eq!(reference_back.observe(sample(tsc + 30, reference + 1, tsc + 40), clock.ordinal),
-        TscObservation::Failed(TscClockError::ReferenceRegressed), "a failure is final");
+    assert_eq!(behind_anchor.observe(sample(tsc + 10, reference + 2, tsc + 20), clock.ordinal),
+        TscObservation::Failed(TscClockError::CounterRegressed), "a failure is final");
+    assert_eq!(behind_anchor.read(tsc + 30, clock.ordinal + 1), TscRead::NeedsReference);
+}
+
+#[test]
+fn a_reference_glitch_is_an_excursion_and_not_the_end_of_the_counter() {
+    // One reference reading 42.9 s ahead: a 64-bit HPET counter read split into two 32-bit
+    // reads around a carry. The counter is not at fault, and the reference then appears to go
+    // backwards from the anchor the glitch left behind.
+    let mut clock = Clock::disciplined();
+    clock.machine.advance(CHECK_INTERVAL_100NS * 100 + 1_000);
+    clock.glitch_next_reference_100ns = 429_496_729;
+    clock.now();
+    assert!(matches!(clock.last_observation, Some(TscObservation::Excursion { .. })));
+    clock.machine.advance(50_000);
+    clock.now();
+    assert!(matches!(clock.last_observation, Some(TscObservation::Excursion { .. })),
+        "{:?}", clock.last_observation);
+    assert_eq!((clock.tsc.phase(), clock.tsc.excursions()), (TscPhase::Measuring, 2));
+
+    let windows = u64::from(CLEAN_WINDOWS_TO_ADMIT);
+    let mut recovered_after = 0;
+    while clock.tsc.phase() != TscPhase::Disciplined {
+        assert!(recovered_after < 10 * NS_PER_SECOND, "never re-admitted");
+        clock.machine.advance(50_000);
+        clock.now();
+        recovered_after += 50_000;
+    }
+    assert!(recovered_after < (windows + 1) * window_ns());
+    assert_eq!(clock.tsc.excursions(), 2);
+}
+
+#[test]
+fn a_counter_that_stalls_while_being_measured_is_readmitted_once_it_counts_again() {
+    let mut clock = Clock::disciplined();
+    clock.machine.tsc_hz = 0;
+    clock.run_while_disciplined(50_000, CHECK_READS * 500);
+    // The stall ends late in a rate window, which then measures a small fraction of the rate.
+    clock.run(297 * NS_PER_SECOND / 100, 50_000, 0);
+    clock.machine.tsc_hz = TRUE_HZ;
+    let uncertain = clock.tsc.uncertain_samples();
+    clock.run(NS_PER_SECOND / 10, 50_000, 0);
+    assert!(clock.tsc.frequency_hz() < TRUE_HZ / 20,
+        "the scenario must measure a window that spans the end of the stall");
+
+    clock.run(4 * NS_PER_SECOND, 50_000, PLACEMENT_BOUND_100NS);
+    assert_eq!(clock.tsc.uncertain_samples(), uncertain,
+        "a wrong rate estimate must not make honest reference reads look delayed");
+    assert_eq!(clock.tsc.phase(), TscPhase::Disciplined);
+    assert!(ppm_apart(clock.tsc.frequency_hz(), TRUE_HZ) <= 20);
+}
+
+#[test]
+fn a_reference_latch_anywhere_in_its_read_is_never_a_rate_error() {
+    // Fast readers force checks every 1,024 reads, where almost nothing but the placement
+    // uncertainty of the two samples is allowed; slow readers check every interval.
+    let mut clock = Clock::seeded(TRUE_HZ + TRUE_HZ / 1_000_000 * 300);
+    clock.latch_position = None;
+    clock.run_until_disciplined(50_000);
+    let bound = REFERENCE_READ_NS / 100 + 10;
+    for step_ns in [50_000, 500, 3_000_000, 50_000] {
+        clock.run(3 * NS_PER_SECOND, step_ns, bound);
+    }
+    assert!(clock.tsc.anchors() > 5_000, "{}", clock.tsc.anchors());
+    assert_eq!((clock.tsc.phase(), clock.tsc.excursions()), (TscPhase::Disciplined, 0));
+}
+
+#[test]
+fn the_first_read_after_a_long_idle_is_a_reference_reading_and_not_an_excursion() {
+    let mut clock = Clock::disciplined();
+    // The counter is 300 ppm from the estimate and nobody reads the clock for a minute: the
+    // projection is 18 ms off by then, which is this counter's rate and not a discontinuity.
+    clock.machine.tsc_hz = TRUE_HZ + TRUE_HZ / 1_000_000 * 300;
+    clock.machine.advance(60 * NS_PER_SECOND);
+    let reading = clock.checked_now(0);
+    assert_eq!(reading.source, Source::Reference);
+    assert!(matches!(clock.last_observation, Some(TscObservation::Anchored { .. })));
+    assert_eq!(clock.tsc.excursions(), 0);
+    clock.run(NS_PER_SECOND, 50_000, PLACEMENT_BOUND_100NS + 31);
 }
 
 #[test]

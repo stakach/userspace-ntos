@@ -1,8 +1,8 @@
-//! Pure conversion for an admitted, PIT-calibrated invariant TSC clock.
+//! Pure conversion from an invariant TSC reading to time, from one reference point.
 //!
-//! The native adapter owns CPUID admission, the live HPET reference, atomic monotonic
-//! publication, and the fallback decision. This type neither reads a clock nor claims a
-//! native effect. Refusals require the adapter to sample its real HPET clock.
+//! `DisciplinedTsc` decides which reference point and frequency to convert with, and whether
+//! a conversion may be served at all. This type neither reads a clock nor claims a native
+//! effect.
 
 const HUNDRED_NS_PER_SECOND: u128 = 10_000_000;
 
@@ -11,22 +11,14 @@ pub enum TscClockError {
     NotInvariant,
     Uncalibrated,
     CounterRegressed,
-    TimeRegressed,
     TimeOverflow,
-    ReferenceRegressed,
     /// The counter kept leaving the rate tolerance of the reference clock.
     Unstable,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TscDrift {
-    Within(u64),
-    Exceeded(u64),
-}
-
-/// One checked relation between a TSC counter and a real HPET-derived monotonic epoch.
-/// A frequency alone is insufficient; the native adapter must establish both readings at
-/// one bounded calibration point and separately verify invariant-TSC capability.
+/// One checked relation between a TSC counter and a real reference-clock reading. A
+/// frequency alone is insufficient: both readings come from one bracketed reference sample,
+/// and invariant-TSC capability is verified separately.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CalibratedTscEpoch {
     frequency_hz: u64,
@@ -64,43 +56,5 @@ impl CalibratedTscEpoch {
             / u128::from(self.frequency_hz);
         let total = u128::from(self.epoch_time_100ns) + elapsed;
         u64::try_from(total).map_err(|_| TscClockError::TimeOverflow)
-    }
-
-    /// Verify caller-retained monotonic evidence before accepting another fast reading.
-    /// The native adapter must retain/publish the prior sample atomically across readers.
-    pub fn time_100ns_after(
-        self,
-        tsc_now: u64,
-        prior_tsc: u64,
-        prior_time_100ns: u64,
-    ) -> Result<u64, TscClockError> {
-        if tsc_now < prior_tsc {
-            return Err(TscClockError::CounterRegressed);
-        }
-        let time = self.time_100ns(tsc_now)?;
-        if time < prior_time_100ns {
-            return Err(TscClockError::TimeRegressed);
-        }
-        Ok(time)
-    }
-
-    /// Compare the fast projection with an independent real HPET sample. An exceeded bound
-    /// is a verdict for the native adapter to disable TSC and use HPET, not a new timestamp.
-    pub fn drift_100ns(
-        self,
-        tsc_now: u64,
-        hpet_now_100ns: u64,
-        tolerance_100ns: u64,
-    ) -> Result<TscDrift, TscClockError> {
-        if hpet_now_100ns < self.epoch_time_100ns {
-            return Err(TscClockError::ReferenceRegressed);
-        }
-        let projected = self.time_100ns(tsc_now)?;
-        let error = projected.abs_diff(hpet_now_100ns);
-        Ok(if error <= tolerance_100ns {
-            TscDrift::Within(error)
-        } else {
-            TscDrift::Exceeded(error)
-        })
     }
 }

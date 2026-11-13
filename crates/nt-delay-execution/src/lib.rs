@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 pub use nt_time::{Deadline, TimeSnapshot};
 
 mod calibrated_tsc;
-pub use calibrated_tsc::{CalibratedTscEpoch, TscClockError, TscDrift};
+pub use calibrated_tsc::{CalibratedTscEpoch, TscClockError};
 
 #[cfg(test)]
 mod calibrated_tsc_tests;

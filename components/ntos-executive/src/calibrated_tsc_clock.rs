@@ -1,57 +1,76 @@
-//! A guarded TSC projection of the real HPET monotonic clock.
+//! The TSC fast path of the real HPET monotonic clock.
 //!
-//! CPUID and the rootserver's PIT calibration admit the fast path. HPET remains
-//! the reference and fallback. The atomics publish one monotonic time across
-//! readers; a refused projection never becomes an accepted clock reading.
+//! CPUID and the kernel's PIT calibration admit the counter for measurement only.
+//! `nt_delay_execution::DisciplinedTsc` then measures it against HPET, serves
+//! projections between bounded reference checks, and withdraws them when the
+//! counter leaves its rate tolerance. HPET stays the reference and the fallback:
+//! every reading that is not a checked projection is a real HPET reading, and one
+//! publication rule keeps time monotonic across both sources and all readers.
 
 use core::arch::{asm, x86_64::__cpuid};
+use core::cell::UnsafeCell;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use nt_delay_execution::{CalibratedTscEpoch, TscClockError, TscDrift};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use nt_delay_execution::{
+    DisciplinedTsc, MonotonicTime, ReferenceSample, TscClockError, TscObservation, TscPhase,
+    TscRead,
+};
 
 const UNINITIALIZED: u8 = 0;
 const INITIALIZING: u8 = 1;
-const READY: u8 = 2;
+const ADMITTED: u8 = 2;
 const NO_INVARIANT_TSC: u8 = 3;
 const NO_CALIBRATION: u8 = 4;
-const UNCERTAIN_EPOCH: u8 = 5;
-const COUNTER_REGRESSED: u8 = 6;
-const TIME_REGRESSED: u8 = 7;
-const TIME_OVERFLOW: u8 = 8;
-const REFERENCE_REGRESSED: u8 = 9;
-const DRIFT_EXCEEDED: u8 = 10;
+const FAILED: u8 = 5;
 
-// Check at least once per 1024 reads, and before the fast projection moves a
-// millisecond beyond the last independent HPET reading. A sudden TSC jump is
-// checked before publication, even if the call-count interval has not elapsed.
-const CHECK_MASK: u64 = 1024 - 1;
-const MAX_UNCHECKED_100NS: u64 = 10_000;
-const DRIFT_TOLERANCE_100NS: u64 = 10_000;
-
-static STATE: AtomicU8 = AtomicU8::new(UNINITIALIZED);
-static FREQUENCY_HZ: AtomicU64 = AtomicU64::new(0);
-static EPOCH_TSC: AtomicU64 = AtomicU64::new(0);
-static EPOCH_TIME_100NS: AtomicU64 = AtomicU64::new(0);
-static LAST_TSC: AtomicU64 = AtomicU64::new(0);
-static LAST_FAST_TIME_100NS: AtomicU64 = AtomicU64::new(0);
+static ADMISSION: AtomicU8 = AtomicU8::new(UNINITIALIZED);
+static CLOCK: ExclusiveClock = ExclusiveClock::new();
+static PUBLISHED: MonotonicTime = MonotonicTime::new();
 static LAST_HPET_TIME_100NS: AtomicU64 = AtomicU64::new(0);
-static PUBLISHED_TIME_100NS: AtomicU64 = AtomicU64::new(0);
 static ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static FAST_READS: AtomicU64 = AtomicU64::new(0);
 static HPET_READS: AtomicU64 = AtomicU64::new(0);
-static DRIFT_CHECKS: AtomicU64 = AtomicU64::new(0);
-static MAX_DRIFT_100NS: AtomicU64 = AtomicU64::new(0);
-static EPOCH_BRACKET_CYCLES: AtomicU64 = AtomicU64::new(0);
+static CONTENDED: AtomicU64 = AtomicU64::new(0);
 static FALLBACK_RECONCILIATIONS: AtomicU64 = AtomicU64::new(0);
 static FAST_BEHIND_PUBLISHED: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TscAdmission {
-    Ready,
-    NoInvariantTsc,
-    NoCalibration,
-    UncertainEpoch,
-    AlreadyInitialized,
+/// The discipline, owned by whichever reader holds the flag. A reader never waits
+/// for it: executive threads share a CPU, so a preempted holder could not release
+/// it while another reader spun. A reader that finds it held reads HPET instead.
+struct ExclusiveClock {
+    held: AtomicBool,
+    tsc: UnsafeCell<Option<DisciplinedTsc>>,
+}
+
+// SAFETY: `tsc` is reached only through a `ClockHold`, and `held` admits one at a time.
+unsafe impl Sync for ExclusiveClock {}
+
+struct ClockHold<'a>(&'a ExclusiveClock);
+
+impl ExclusiveClock {
+    const fn new() -> Self {
+        Self { held: AtomicBool::new(false), tsc: UnsafeCell::new(None) }
+    }
+
+    fn try_hold(&self) -> Option<ClockHold<'_>> {
+        self.held
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| ClockHold(self))
+    }
+}
+
+impl ClockHold<'_> {
+    fn tsc(&mut self) -> &mut Option<DisciplinedTsc> {
+        // SAFETY: this hold is the only one, and the borrow cannot outlive it.
+        unsafe { &mut *self.0.tsc.get() }
+    }
+}
+
+impl Drop for ClockHold<'_> {
+    fn drop(&mut self) {
+        self.0.held.store(false, Ordering::Release);
+    }
 }
 
 #[inline]
@@ -80,202 +99,122 @@ fn invariant_tsc() -> bool {
     }
 }
 
-/// Establish a real HPET epoch before publishing fast clock availability.
-/// The rootserver calls this once after its HPET epoch is ready. A preempted
-/// calibration bracket wider than 1 ms refuses TSC for this boot.
-pub(crate) fn try_initialize(
-    frequency_hz: u64,
-    hpet_now: impl FnOnce() -> u64,
-) -> TscAdmission {
-    if STATE.compare_exchange(
+/// Admit an invariant, calibrated counter for measurement against HPET. The
+/// rootserver calls this once, after its HPET epoch is ready. No reading is
+/// served from the counter until the discipline has measured its rate.
+pub(crate) fn admit(seed_frequency_hz: u64) {
+    if ADMISSION.compare_exchange(
         UNINITIALIZED, INITIALIZING, Ordering::AcqRel, Ordering::Acquire,
     ).is_err() {
-        return TscAdmission::AlreadyInitialized;
+        return;
     }
-    if frequency_hz == 0 {
-        STATE.store(NO_CALIBRATION, Ordering::Release);
-        return TscAdmission::NoCalibration;
-    }
-    if !invariant_tsc() {
-        STATE.store(NO_INVARIANT_TSC, Ordering::Release);
-        return TscAdmission::NoInvariantTsc;
-    }
-    let before = ordered_tsc();
-    let reference = hpet_now();
-    let after = ordered_tsc();
-    let Some(span) = after.checked_sub(before) else {
-        STATE.store(UNCERTAIN_EPOCH, Ordering::Release);
-        return TscAdmission::UncertainEpoch;
+    let admission = match DisciplinedTsc::admit(invariant_tsc(), seed_frequency_hz) {
+        Ok(tsc) => match CLOCK.try_hold() {
+            Some(mut clock) => {
+                *clock.tsc() = Some(tsc);
+                ADMITTED
+            }
+            // Nothing holds the clock before it is admitted.
+            None => UNINITIALIZED,
+        },
+        Err(TscClockError::Uncalibrated) => NO_CALIBRATION,
+        Err(_) => NO_INVARIANT_TSC,
     };
-    if span > frequency_hz / 1_000 {
-        STATE.store(UNCERTAIN_EPOCH, Ordering::Release);
-        return TscAdmission::UncertainEpoch;
-    }
-    let Some(epoch_tsc) = before.checked_add(span / 2) else {
-        STATE.store(UNCERTAIN_EPOCH, Ordering::Release);
-        return TscAdmission::UncertainEpoch;
-    };
-    if CalibratedTscEpoch::admit(true, frequency_hz, epoch_tsc, reference).is_err() {
-        STATE.store(UNCERTAIN_EPOCH, Ordering::Release);
-        return TscAdmission::UncertainEpoch;
-    }
-    FREQUENCY_HZ.store(frequency_hz, Ordering::Relaxed);
-    EPOCH_BRACKET_CYCLES.store(span, Ordering::Relaxed);
-    EPOCH_TSC.store(epoch_tsc, Ordering::Relaxed);
-    EPOCH_TIME_100NS.store(reference, Ordering::Relaxed);
-    LAST_TSC.store(epoch_tsc, Ordering::Relaxed);
-    LAST_FAST_TIME_100NS.store(reference, Ordering::Relaxed);
-    // A concurrent HPET fallback during INITIALIZING may already have published
-    // a later value. Admission must never move either observable clock backward.
-    LAST_HPET_TIME_100NS.fetch_max(reference, Ordering::AcqRel);
-    PUBLISHED_TIME_100NS.fetch_max(reference, Ordering::AcqRel);
-    STATE.store(READY, Ordering::Release);
-    TscAdmission::Ready
+    ADMISSION.store(admission, Ordering::Release);
 }
 
-fn disable(reason: u8) {
-    let _ = STATE.compare_exchange(READY, reason, Ordering::AcqRel, Ordering::Acquire);
-}
-
-fn disable_for(error: TscClockError) {
-    let reason = match error {
-        TscClockError::CounterRegressed => COUNTER_REGRESSED,
-        TscClockError::TimeRegressed => TIME_REGRESSED,
-        TscClockError::TimeOverflow => TIME_OVERFLOW,
-        TscClockError::ReferenceRegressed => REFERENCE_REGRESSED,
-        TscClockError::NotInvariant => NO_INVARIANT_TSC,
-        TscClockError::Uncalibrated => NO_CALIBRATION,
-        TscClockError::Unstable => DRIFT_EXCEEDED,
-    };
-    disable(reason);
-}
-
-/// Publish a real HPET reading. If it is briefly behind a previously returned
-/// fast reading, retain that last accepted time until HPET catches up. This is
-/// a counted fallback reconciliation, not a successful TSC projection.
+/// Publish a real HPET reading. If it is behind a reading already returned, that
+/// reading is returned again until HPET catches up, and the hold is counted.
 fn publish_hpet(real: u64) -> u64 {
     HPET_READS.fetch_add(1, Ordering::Relaxed);
     LAST_HPET_TIME_100NS.fetch_max(real, Ordering::AcqRel);
-    let prior = PUBLISHED_TIME_100NS.fetch_max(real, Ordering::AcqRel);
-    if prior > real {
+    let published = PUBLISHED.publish(real);
+    if published.held {
         FALLBACK_RECONCILIATIONS.fetch_add(1, Ordering::Relaxed);
-        prior
-    } else {
-        real
     }
+    published.time_100ns
 }
 
-fn fallback(hpet_sample: Option<u64>, hpet_now: &mut impl FnMut() -> u64) -> u64 {
-    publish_hpet(hpet_sample.unwrap_or_else(hpet_now))
-}
-
-/// Read the checked TSC projection. The HPET callback is called only for one
-/// bounded reference check or a fallback; one invocation never repeats the
-/// same HPET read. A disabled clock stays disabled for this boot.
+/// Read the monotonic clock. The HPET callback runs at most once: for a reference
+/// check, which is bracketed by counter readings, or whenever the counter is not
+/// serving. A projection never becomes a reading without the discipline's consent.
 #[inline]
-pub(crate) fn now_or_hpet(mut hpet_now: impl FnMut() -> u64) -> u64 {
-    if STATE.load(Ordering::Acquire) != READY {
-        return fallback(None, &mut hpet_now);
+pub(crate) fn now_or_hpet(hpet_now: impl FnOnce() -> u64) -> u64 {
+    if ADMISSION.load(Ordering::Acquire) != ADMITTED {
+        return publish_hpet(hpet_now());
     }
     let ordinal = ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-    let epoch = match CalibratedTscEpoch::admit(
-        true,
-        FREQUENCY_HZ.load(Ordering::Relaxed),
-        EPOCH_TSC.load(Ordering::Relaxed),
-        EPOCH_TIME_100NS.load(Ordering::Relaxed),
-    ) {
-        Ok(epoch) => epoch,
-        Err(error) => {
-            disable_for(error);
-            return fallback(None, &mut hpet_now);
-        }
+    let Some(mut clock) = CLOCK.try_hold() else {
+        CONTENDED.fetch_add(1, Ordering::Relaxed);
+        return publish_hpet(hpet_now());
     };
-    let tsc = ordered_tsc();
-    let time = match epoch.time_100ns_after(
-        tsc,
-        LAST_TSC.load(Ordering::Acquire),
-        LAST_FAST_TIME_100NS.load(Ordering::Acquire),
-    ) {
-        Ok(time) => time,
-        Err(error) => {
-            disable_for(error);
-            return fallback(None, &mut hpet_now);
-        }
+    let Some(tsc) = clock.tsc() else {
+        return publish_hpet(hpet_now());
     };
-
-    let mut reference = None;
-    if ordinal & CHECK_MASK == 0
-        || time.saturating_sub(LAST_HPET_TIME_100NS.load(Ordering::Acquire))
-            > MAX_UNCHECKED_100NS
-    {
-        let real = hpet_now();
-        reference = Some(real);
-        DRIFT_CHECKS.fetch_add(1, Ordering::Relaxed);
-        match epoch.drift_100ns(tsc, real, DRIFT_TOLERANCE_100NS) {
-            Ok(TscDrift::Within(error)) => {
-                MAX_DRIFT_100NS.fetch_max(error, Ordering::Relaxed);
-                LAST_HPET_TIME_100NS.fetch_max(real, Ordering::AcqRel);
-            }
-            Ok(TscDrift::Exceeded(error)) => {
-                MAX_DRIFT_100NS.fetch_max(error, Ordering::Relaxed);
-                disable(DRIFT_EXCEEDED);
-                return fallback(reference, &mut hpet_now);
-            }
-            Err(error) => {
-                disable_for(error);
-                return fallback(reference, &mut hpet_now);
-            }
+    let tsc_before = ordered_tsc();
+    if let TscRead::Fast(time) = tsc.read(tsc_before, ordinal) {
+        drop(clock);
+        FAST_READS.fetch_add(1, Ordering::Relaxed);
+        let published = PUBLISHED.publish(time);
+        if published.held {
+            FAST_BEHIND_PUBLISHED.fetch_add(1, Ordering::Relaxed);
         }
+        return published.time_100ns;
     }
-
-    if LAST_TSC.fetch_max(tsc, Ordering::AcqRel) > tsc {
-        disable(COUNTER_REGRESSED);
-        return fallback(reference, &mut hpet_now);
+    let reference_100ns = hpet_now();
+    let sample = ReferenceSample { tsc_before, reference_100ns, tsc_after: ordered_tsc() };
+    if let TscObservation::Failed(_) = tsc.observe(sample, ordinal) {
+        ADMISSION.store(FAILED, Ordering::Release);
     }
-    if LAST_FAST_TIME_100NS.fetch_max(time, Ordering::AcqRel) > time {
-        disable(TIME_REGRESSED);
-        return fallback(reference, &mut hpet_now);
-    }
-    if STATE.load(Ordering::Acquire) != READY {
-        return fallback(reference, &mut hpet_now);
-    }
-    let prior = PUBLISHED_TIME_100NS.fetch_max(time, Ordering::AcqRel);
-    if prior > time {
-        FAST_BEHIND_PUBLISHED.fetch_add(1, Ordering::Relaxed);
-        return fallback(reference, &mut hpet_now);
-    }
-    FAST_READS.fetch_add(1, Ordering::Relaxed);
-    time
+    drop(clock);
+    publish_hpet(reference_100ns)
 }
 
 pub(crate) fn append_census(record: &mut nt_printf::record::RecordBuffer<4096>) {
-    let state = match STATE.load(Ordering::Acquire) {
-        UNINITIALIZED => "uninitialized",
-        INITIALIZING => "initializing",
-        READY => "ready",
-        NO_INVARIANT_TSC => "no-invariant-tsc",
-        NO_CALIBRATION => "no-calibration",
-        UNCERTAIN_EPOCH => "uncertain-epoch",
-        COUNTER_REGRESSED => "counter-regressed",
-        TIME_REGRESSED => "time-regressed",
-        TIME_OVERFLOW => "time-overflow",
-        REFERENCE_REGRESSED => "reference-regressed",
-        DRIFT_EXCEEDED => "drift-exceeded",
-        _ => "invalid-state",
+    // The clock is held only once it is admitted, so a census cannot be in `admit`'s way.
+    let admission = ADMISSION.load(Ordering::Acquire);
+    let tsc = if matches!(admission, ADMITTED | FAILED) {
+        CLOCK.try_hold().and_then(|mut clock| *clock.tsc())
+    } else {
+        None
     };
+    let state = match (admission, tsc.map(|tsc| tsc.phase())) {
+        (UNINITIALIZED, _) => "uninitialized",
+        (INITIALIZING, _) => "initializing",
+        (NO_INVARIANT_TSC, _) => "no-invariant-tsc",
+        (NO_CALIBRATION, _) => "no-calibration",
+        // Another reader holds the discipline, so its fields below read as zero.
+        (_, None) => "held",
+        (_, Some(TscPhase::Measuring)) => "measuring",
+        (_, Some(TscPhase::Disciplined)) => "ready",
+        (_, Some(TscPhase::Failed(error))) => match error {
+            TscClockError::NotInvariant => "no-invariant-tsc",
+            TscClockError::Uncalibrated => "no-calibration",
+            TscClockError::CounterRegressed => "counter-regressed",
+            TscClockError::TimeOverflow => "time-overflow",
+            TscClockError::Unstable => "unstable",
+        },
+    };
+    let discipline = |field: fn(&DisciplinedTsc) -> u64| tsc.as_ref().map_or(0, field);
     let _ = writeln!(
         record,
-        "[tsc-clock] state={} attempts={} fast={} hpet={} checks={} max-drift-100ns={} epoch-bracket-cycles={} fast-behind={} reconciled={} last-hpet={} published={}",
+        "[tsc-clock] state={} attempts={} fast={} hpet={} anchors={} excursions={} uncertain={} contended={} hz={} seed-hz={} rate-ppm={} max-rate-ppm={} max-offset-100ns={} fast-behind={} reconciled={} last-hpet={} published={}",
         state,
         ATTEMPTS.load(Ordering::Relaxed),
         FAST_READS.load(Ordering::Relaxed),
         HPET_READS.load(Ordering::Relaxed),
-        DRIFT_CHECKS.load(Ordering::Relaxed),
-        MAX_DRIFT_100NS.load(Ordering::Relaxed),
-        EPOCH_BRACKET_CYCLES.load(Ordering::Relaxed),
+        discipline(DisciplinedTsc::anchors),
+        discipline(DisciplinedTsc::excursions),
+        discipline(DisciplinedTsc::uncertain_samples),
+        CONTENDED.load(Ordering::Relaxed),
+        discipline(DisciplinedTsc::frequency_hz),
+        discipline(DisciplinedTsc::seed_frequency_hz),
+        discipline(DisciplinedTsc::last_rate_error_ppm),
+        discipline(DisciplinedTsc::max_rate_error_ppm),
+        discipline(DisciplinedTsc::max_offset_100ns),
         FAST_BEHIND_PUBLISHED.load(Ordering::Relaxed),
         FALLBACK_RECONCILIATIONS.load(Ordering::Relaxed),
         LAST_HPET_TIME_100NS.load(Ordering::Acquire),
-        PUBLISHED_TIME_100NS.load(Ordering::Acquire),
+        PUBLISHED.latest(),
     );
 }

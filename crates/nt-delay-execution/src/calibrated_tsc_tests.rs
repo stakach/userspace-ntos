@@ -1,4 +1,4 @@
-use super::{CalibratedTscEpoch, TscClockError, TscDrift};
+use super::{CalibratedTscEpoch, TscClockError};
 
 #[test]
 fn tsc_requires_invariant_capability_and_calibrated_frequency() {
@@ -29,21 +29,4 @@ fn tsc_conversion_refuses_overflow_instead_of_saturating() {
     assert_eq!(epoch.time_100ns(16), Err(TscClockError::TimeOverflow));
     let wide = CalibratedTscEpoch::admit(true, 1, 0, 0).unwrap();
     assert_eq!(wide.time_100ns(u64::MAX), Err(TscClockError::TimeOverflow));
-}
-
-#[test]
-fn tsc_regression_and_prior_time_disagreement_refuse_fast_clock() {
-    let epoch = CalibratedTscEpoch::admit(true, 10_000_000, 10, 1_000).unwrap();
-    assert_eq!(epoch.time_100ns_after(20, 21, 1_010), Err(TscClockError::CounterRegressed));
-    assert_eq!(epoch.time_100ns_after(21, 20, 1_012), Err(TscClockError::TimeRegressed));
-    assert_eq!(epoch.time_100ns_after(21, 20, 1_010), Ok(1_011));
-}
-
-#[test]
-fn drift_check_marks_fast_clock_unusable_without_inventing_reference_time() {
-    let epoch = CalibratedTscEpoch::admit(true, 10_000_000, 10, 1_000).unwrap();
-    assert_eq!(epoch.drift_100ns(110, 1_105, 5), Ok(TscDrift::Within(5)));
-    assert_eq!(epoch.drift_100ns(110, 1_106, 5), Ok(TscDrift::Exceeded(6)));
-    assert_eq!(epoch.drift_100ns(110, 1_094, 5), Ok(TscDrift::Exceeded(6)));
-    assert_eq!(epoch.drift_100ns(110, 999, 5), Err(TscClockError::ReferenceRegressed));
 }

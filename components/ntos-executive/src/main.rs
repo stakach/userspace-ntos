@@ -16786,14 +16786,7 @@ unsafe fn initialize_hpet_monotonic_epoch(period_fs: u64) {
     let offset = nt_delay_execution::counter_epoch_offset(fallback_now, counter_now);
     HPET_MONOTONIC_OFFSET_100NS.store(offset, Ordering::Relaxed);
     HPET_MONOTONIC_READY.store(true, Ordering::Release);
-    let _ = calibrated_tsc_clock::try_initialize(
-        PLATFORM_TSC_FREQUENCY_HZ.load(Ordering::Acquire),
-        || unsafe {
-            nt_delay_execution::epoch_time_from_counter(
-                hpet_counter_time_100ns(period_fs), offset,
-            )
-        },
-    );
+    calibrated_tsc_clock::admit(PLATFORM_TSC_FREQUENCY_HZ.load(Ordering::Acquire));
     print_str(b"[hpet-clock] monotonic epoch fallback=");
     print_u64(fallback_now);
     print_str(b" counter=");

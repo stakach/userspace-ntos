@@ -29,7 +29,7 @@ pub const RATE_TOLERANCE_PPM: u64 = 500;
 pub const RATE_WINDOW_100NS: u64 = 10_000_000;
 /// Consecutive rate windows that must agree before the fast path is served.
 pub const CLEAN_WINDOWS_TO_ADMIT: u32 = 2;
-/// More excursions than this without a sustained clean run mark the counter unreliable.
+/// More excursions than this without a sustained clean run fail the counter for the boot.
 pub const MAX_EXCURSIONS: u32 = 8;
 /// Consecutive clean windows while disciplined after which earlier excursions are forgiven.
 pub const FORGIVENESS_WINDOWS: u32 = 64;
@@ -70,7 +70,8 @@ pub enum TscObservation {
     /// The projection now starts at this sample. `offset_100ns` is how far the previous
     /// projection was from it.
     Anchored { offset_100ns: u64 },
-    /// The counter left the rate tolerance. The fast path is withdrawn until it is re-measured.
+    /// The counter and the reference disagree by more than the rate tolerance allows, or the
+    /// reference went backwards. The fast path is withdrawn until the counter is re-measured.
     Excursion { offset_100ns: u64, allowed_100ns: u64 },
     Failed(TscClockError),
 }
@@ -108,7 +109,7 @@ pub struct DisciplinedTsc {
 }
 
 impl DisciplinedTsc {
-    /// Start measuring. The seed only sizes the first brackets and is the rate the first
+    /// Start measuring. The seed only sizes the reference brackets and is the rate the first
     /// window is compared with; the fast path waits for the measured rate.
     pub const fn admit(invariant_tsc: bool, seed_frequency_hz: u64) -> Result<Self, TscClockError> {
         if !invariant_tsc {
@@ -148,7 +149,8 @@ impl DisciplinedTsc {
     pub const fn last_rate_error_ppm(&self) -> u64 { self.last_rate_error_ppm }
     /// The largest such difference, not counting the first window's distance from the seed.
     pub const fn max_rate_error_ppm(&self) -> u64 { self.max_rate_error_ppm }
-    /// The furthest a projection has been from a reference sample it was checked against.
+    /// The furthest a projection has been from a reference sample it was checked against, or
+    /// the reference behind its own earlier reading.
     pub const fn max_offset_100ns(&self) -> u64 { self.max_offset_100ns }
 
     /// One fast reading, or a request for a reference sample. Never changes the discipline.
@@ -174,28 +176,32 @@ impl DisciplinedTsc {
         let Some(bracket) = sample.tsc_after.checked_sub(sample.tsc_before) else {
             return self.fail(TscClockError::CounterRegressed);
         };
-        if let Some(anchor) = self.anchor {
-            if sample.tsc_before < anchor.tsc {
-                return self.fail(TscClockError::CounterRegressed);
-            }
-            if sample.reference_100ns < anchor.time_100ns {
-                return self.fail(TscClockError::ReferenceRegressed);
-            }
+        if self.anchor.is_some_and(|anchor| sample.tsc_before < anchor.tsc) {
+            return self.fail(TscClockError::CounterRegressed);
         }
-        let bracket_100ns = ceil_div(
-            u128::from(bracket) * HUNDRED_NS_PER_SECOND, u128::from(self.frequency_hz));
+        // The seed sizes every bracket. The estimate is wrong after a window that spanned a
+        // discontinuity, and brackets sized by it would then turn every sample away.
+        let bracket_100ns = (u128::from(bracket) * HUNDRED_NS_PER_SECOND)
+            .div_ceil(u128::from(self.seed_frequency_hz));
         if bracket_100ns > u128::from(MAX_BRACKET_100NS) {
             self.uncertain_samples += 1;
             return TscObservation::Uncertain;
         }
+        let bracket_100ns = bracket_100ns as u64;
         let mark = Mark {
             tsc: sample.tsc_before + bracket / 2,
             time_100ns: sample.reference_100ns,
-            // Bounded by the bracket check above; one more for the projection's rounding.
-            uncertainty_100ns: bracket_100ns as u64 / 2 + 1,
+            // Half the bracket; a 64th of it more, for a seed up to 3% above the real rate;
+            // and one for the projection's rounding.
+            uncertainty_100ns: bracket_100ns / 2 + bracket_100ns / 64 + 1,
             ordinal,
         };
         match (self.phase, self.anchor) {
+            // The reference is behind an earlier reading of itself. Whichever reading was
+            // wrong, the counter was not: withdraw, and measure again from this one.
+            (_, Some(anchor)) if mark.time_100ns < anchor.time_100ns => {
+                self.excursion(mark, anchor.time_100ns - mark.time_100ns, 0)
+            }
             (TscPhase::Disciplined, Some(anchor)) => self.check(anchor, mark),
             _ => {
                 self.anchor = Some(mark);
@@ -222,7 +228,7 @@ impl DisciplinedTsc {
         let offset_100ns = projected.abs_diff(mark.time_100ns);
         let elapsed = u128::from(mark.time_100ns - anchor.time_100ns);
         let allowed = u128::from(anchor.uncertainty_100ns + mark.uncertainty_100ns)
-            + ceil_div(elapsed * u128::from(RATE_TOLERANCE_PPM), PPM);
+            + (elapsed * u128::from(RATE_TOLERANCE_PPM)).div_ceil(PPM);
         self.max_offset_100ns = self.max_offset_100ns.max(offset_100ns);
         if u128::from(offset_100ns) > allowed {
             return self.excursion(mark, offset_100ns, allowed.min(u128::from(u64::MAX)) as u64);
@@ -239,6 +245,7 @@ impl DisciplinedTsc {
     fn excursion(&mut self, mark: Mark, offset_100ns: u64, allowed_100ns: u64) -> TscObservation {
         self.excursions += 1;
         self.strikes += 1;
+        self.max_offset_100ns = self.max_offset_100ns.max(offset_100ns);
         if self.strikes > MAX_EXCURSIONS {
             return self.fail(TscClockError::Unstable);
         }
@@ -274,8 +281,8 @@ impl DisciplinedTsc {
         };
         let error_ppm = u128::from(measured.abs_diff(self.frequency_hz)) * PPM
             / u128::from(self.frequency_hz);
-        let placement_ppm = ceil_div(
-            u128::from(start.uncertainty_100ns + mark.uncertainty_100ns) * PPM, u128::from(span));
+        let placement_ppm = (u128::from(start.uncertainty_100ns + mark.uncertainty_100ns) * PPM)
+            .div_ceil(u128::from(span));
         self.clean_windows = if error_ppm <= u128::from(RATE_TOLERANCE_PPM) + placement_ppm {
             self.clean_windows.saturating_add(1)
         } else {
@@ -293,10 +300,6 @@ impl DisciplinedTsc {
 
 const HUNDRED_NS_PER_SECOND: u128 = 10_000_000;
 const PPM: u128 = 1_000_000;
-
-fn ceil_div(numerator: u128, denominator: u128) -> u128 {
-    numerator.div_ceil(denominator)
-}
 
 /// What a caller is given for one clock reading.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
