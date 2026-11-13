@@ -5388,11 +5388,17 @@ unsafe fn retire_existing_provider_local_event(body: u64) -> bool {
     retire_provider_local_event(retirement)
 }
 
+const STATUS_INVALID_PARAMETER_U32: u32 = 0xC000_000D;
+const STATUS_INTERNAL_ERROR_U32: u32 = 0xC000_00E5;
+
+/// Publish the KEVENT at `event` as a provider-local Event. A refusal by the executive is
+/// returned as its NT status; a local catalog or protocol inconsistency is
+/// STATUS_INTERNAL_ERROR, and storage this provider does not own is STATUS_INVALID_PARAMETER.
 unsafe fn initialize_provider_local_event(
     event: u64,
     kind: nt_provider_wait::ProviderEventKind,
     initial_state: bool,
-) -> bool {
+) -> Result<(), u32> {
     let initialization = PROVIDER_LOCAL_EVENT_INITIALIZATIONS.fetch_add(1, Ordering::Relaxed) + 1;
     if initialization <= 16 {
         let local_catalog_present = {
@@ -5416,7 +5422,7 @@ unsafe fn initialize_provider_local_event(
         print_str(b"\n");
     }
     if !retire_existing_provider_local_event(event) {
-        return false;
+        return Err(STATUS_INTERNAL_ERROR_U32);
     }
     let event_bytes = nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64;
     let allocation_admission = with_provider_allocations(|allocations| {
@@ -5507,7 +5513,7 @@ unsafe fn initialize_provider_local_event(
         print_str(b" stack-activation=");
         print_u64(u64::from(active_provider_stack_event_activation().is_some()));
         print_str(b"\n");
-        return false;
+        return Err(STATUS_INVALID_PARAMETER_U32);
     };
     let event_type = u64::from(matches!(
         kind,
@@ -5535,7 +5541,7 @@ unsafe fn initialize_provider_local_event(
         if !rollback_provider_local_event_publication(id, status == 0) {
             print_str(b"[win32k-event] canonical publication rollback incomplete\n");
         }
-        return false;
+        return Err(if status != 0 { status as u32 } else { STATUS_INTERNAL_ERROR_U32 });
     }
     let canonical = nt_provider_wait::ProviderWaitObject::new(
         nt_provider_wait::ProviderWaitObjectType::Event,
@@ -5574,7 +5580,7 @@ unsafe fn initialize_provider_local_event(
         if !rollback_provider_local_event_publication(id, true) {
             print_str(b"[win32k-event] canonical bind rollback incomplete\n");
         }
-        return false;
+        return Err(STATUS_INTERNAL_ERROR_U32);
     }
     if initialization <= 16 {
         print_str(b"[win32k-event] published #");
@@ -5588,7 +5594,7 @@ unsafe fn initialize_provider_local_event(
         print_u64(object_generation);
         print_str(b"\n");
     }
-    true
+    Ok(())
 }
 
 unsafe fn provider_local_event_signal_lease_or_park(
@@ -5634,8 +5640,14 @@ unsafe fn provider_local_event_call(event: u64, op: u64) -> (u64, u64) {
     let lease = provider_local_event_signal_lease_or_park(event);
     let (status, out1, out2, sequence) = win32k_event_broker_call(op, lease.id.raw(), 0, 0);
     if status != 0 {
-        print_str(b"[win32k-event] canonical local Event operation failed\n");
-        park();
+        print_str(b"[win32k-event] canonical local Event operation failed status=0x");
+        print_hex(status as u32);
+        print_str(b"\n");
+        // The Ke*Event exports have no failure result.
+        crate::provider_bugcheck::raise_unhandled_status(
+            status as u32,
+            provider_local_event_call as usize as u64,
+        );
     }
     let signaled = match op {
         W32_EVENT_OP_SET_LOCAL => out2 != 0,
@@ -5671,12 +5683,20 @@ extern "win64" fn s_ke_initialize_event(event: u64, event_type: u64, initial_sta
     } else {
         nt_provider_wait::ProviderEventKind::Notification
     };
-    if !unsafe { initialize_provider_local_event(event, kind, initial_state != 0) } {
-        print_str(b"[win32k-event] KeInitializeEvent storage classification failed body=0x");
+    if let Err(status) = unsafe { initialize_provider_local_event(event, kind, initial_state != 0) } {
+        print_str(b"[win32k-event] KeInitializeEvent failed status=0x");
+        print_hex(status);
+        print_str(b" body=0x");
         print_hex((event >> 32) as u32);
         print_hex(event as u32);
         print_str(b"\n");
-        park();
+        // KeInitializeEvent has no failure result, so the request cannot be failed.
+        unsafe {
+            crate::provider_bugcheck::raise_unhandled_status(
+                status,
+                s_ke_initialize_event as usize as u64,
+            )
+        }
     }
 }
 
@@ -5767,12 +5787,14 @@ unsafe fn retire_provider_local_timers_for_backing(
     true
 }
 
+/// Publish the KTIMER at `timer` as a provider-local Timer. Failures are reported as for
+/// [`initialize_provider_local_event`].
 unsafe fn initialize_provider_local_timer(
     timer: u64,
     kind: nt_provider_wait::ProviderTimerKind,
-) -> bool {
+) -> Result<(), u32> {
     if !retire_existing_provider_local_timer(timer) {
-        return false;
+        return Err(STATUS_INTERNAL_ERROR_U32);
     }
     const KTIMER_BYTES: u64 = 0x40;
     let id = {
@@ -5822,7 +5844,7 @@ unsafe fn initialize_provider_local_timer(
             })
     };
     let Some(id) = id else {
-        return false;
+        return Err(STATUS_INVALID_PARAMETER_U32);
     };
     let timer_type = u64::from(matches!(
         kind,
@@ -5839,7 +5861,7 @@ unsafe fn initialize_provider_local_timer(
         let _ = provider_local_timers_mut()
             .expect("local Timer catalog disappeared")
             .rollback_unpublished(id);
-        return false;
+        return Err(if status != 0 { status as u32 } else { STATUS_INTERNAL_ERROR_U32 });
     }
     let canonical = nt_provider_wait::ProviderWaitObject::new(
         nt_provider_wait::ProviderWaitObjectType::Timer,
@@ -5884,9 +5906,9 @@ unsafe fn initialize_provider_local_timer(
         let _ = provider_local_timers_mut()
             .expect("local Timer catalog disappeared")
             .rollback_unpublished(id);
-        return false;
+        return Err(STATUS_INTERNAL_ERROR_U32);
     }
-    true
+    Ok(())
 }
 
 extern "win64" fn s_ke_initialize_timer_ex(timer: u64, timer_type: u32) {
@@ -5898,9 +5920,17 @@ extern "win64" fn s_ke_initialize_timer_ex(timer: u64, timer_type: u32) {
     } else {
         nt_provider_wait::ProviderTimerKind::Synchronization
     };
-    if !unsafe { initialize_provider_local_timer(timer, kind) } {
-        print_str(b"[win32k-timer] KeInitializeTimer storage publication failed\n");
-        park();
+    if let Err(status) = unsafe { initialize_provider_local_timer(timer, kind) } {
+        print_str(b"[win32k-timer] KeInitializeTimer failed status=0x");
+        print_hex(status);
+        print_str(b"\n");
+        // KeInitializeTimerEx has no failure result, so the request cannot be failed.
+        unsafe {
+            crate::provider_bugcheck::raise_unhandled_status(
+                status,
+                s_ke_initialize_timer_ex as usize as u64,
+            )
+        }
     }
 }
 
@@ -5969,8 +5999,16 @@ extern "win64" fn s_ke_set_timer(timer: u64, due_time: i64, dpc: u64) -> u8 {
         )
     };
     if status != 0 {
-        print_str(b"[win32k-timer] KeSetTimer broker failure\n");
-        park();
+        print_str(b"[win32k-timer] KeSetTimer broker failure status=0x");
+        print_hex(status as u32);
+        print_str(b"\n");
+        // KeSetTimer has no failure result.
+        unsafe {
+            crate::provider_bugcheck::raise_unhandled_status(
+                status as u32,
+                s_ke_set_timer as usize as u64,
+            )
+        }
     }
     unsafe { write_unaligned((timer + 4) as *mut i32, 0) };
     unsafe { release_provider_local_timer_operation(lease) };
@@ -5983,8 +6021,16 @@ extern "win64" fn s_ke_cancel_timer(timer: u64) -> u8 {
         win32k_event_broker_call(W32_TIMER_OP_CANCEL_LOCAL, lease.id.raw(), 0, 0)
     };
     if status != 0 {
-        print_str(b"[win32k-timer] KeCancelTimer broker failure\n");
-        park();
+        print_str(b"[win32k-timer] KeCancelTimer broker failure status=0x");
+        print_hex(status as u32);
+        print_str(b"\n");
+        // KeCancelTimer has no failure result.
+        unsafe {
+            crate::provider_bugcheck::raise_unhandled_status(
+                status as u32,
+                s_ke_cancel_timer as usize as u64,
+            )
+        }
     }
     unsafe { release_provider_local_timer_operation(lease) };
     active as u8
@@ -5996,8 +6042,16 @@ extern "win64" fn s_ke_read_state_timer(timer: u64) -> i32 {
         win32k_event_broker_call(W32_TIMER_OP_READ_LOCAL, lease.id.raw(), 0, 0)
     };
     if status != 0 {
-        print_str(b"[win32k-timer] KeReadStateTimer broker failure\n");
-        park();
+        print_str(b"[win32k-timer] KeReadStateTimer broker failure status=0x");
+        print_hex(status as u32);
+        print_str(b"\n");
+        // KeReadStateTimer has no failure result.
+        unsafe {
+            crate::provider_bugcheck::raise_unhandled_status(
+                status as u32,
+                s_ke_read_state_timer as usize as u64,
+            )
+        }
     }
     unsafe { release_provider_local_timer_operation(lease) };
     signaled as i32
@@ -6011,13 +6065,14 @@ extern "win64" fn s_po_request_shutdown_event(event_out: *mut u64) -> i32 {
     if event == 0 {
         let allocated = unsafe { pool_alloc(nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64) };
         if allocated == 0
-            || !unsafe {
+            || unsafe {
                 initialize_provider_local_event(
                     allocated,
                     nt_provider_wait::ProviderEventKind::Notification,
                     false,
                 )
             }
+            .is_err()
         {
             return STATUS_NO_MEMORY;
         }

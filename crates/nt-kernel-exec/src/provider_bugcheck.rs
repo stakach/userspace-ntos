@@ -3,6 +3,16 @@
 pub const BUGCHECK_LABEL: u64 = 0x7ec;
 pub const BUGCHECK_MESSAGE_INFO: u64 = (BUGCHECK_LABEL << 12) | 5;
 
+/// A status raised in kernel mode found no handler.
+pub const KMODE_EXCEPTION_NOT_HANDLED: u32 = 0x1E;
+
+/// The terminal report for a kernel export that has no failure result and was refused with
+/// `status`. NT raises such a status (`ExRaiseStatus`); with no handler in kernel mode the
+/// system stops with the status and the raising address, and no exception operands.
+pub const fn unhandled_status(status: u32, raised_at: u64) -> (u32, [u64; 4]) {
+    (KMODE_EXCEPTION_NOT_HANDLED, [status as u64, raised_at, 0, 0])
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProviderChannel {
     pub endpoint: u64,
@@ -98,6 +108,27 @@ mod tests {
             reply_object: 13,
             expected_badge: 0,
         }
+    }
+
+    #[test]
+    fn a_refused_export_without_a_failure_result_reports_the_unhandled_status() {
+        // KeInitializeEvent returns nothing. When the executive refuses the object with
+        // STATUS_INSUFFICIENT_RESOURCES the provider stops as NT does for a status raised in
+        // kernel mode with no handler: the status and the raising address, no other operands.
+        let (code, parameters) = unhandled_status(0xC000_009A, 0xFFFF_F800_0012_3450);
+        assert_eq!(code, KMODE_EXCEPTION_NOT_HANDLED);
+        assert_eq!(code, 0x1E);
+        assert_eq!(parameters, [0xC000_009A, 0xFFFF_F800_0012_3450, 0, 0]);
+
+        let report = FatalReport::decode(
+            channel(),
+            0,
+            BUGCHECK_MESSAGE_INFO,
+            [u64::from(code), parameters[0], parameters[1], parameters[2], parameters[3]],
+        )
+        .unwrap();
+        assert_eq!(report.code(), KMODE_EXCEPTION_NOT_HANDLED);
+        assert_eq!(report.parameters()[0], 0xC000_009A, "the refusal's NT status survives");
     }
 
     #[test]

@@ -33,6 +33,14 @@ pub(crate) unsafe fn report(code: u32, parameters: [u64; 4]) -> ! {
     core::arch::asm!("ud2", options(noreturn));
 }
 
+/// End the provider when an export that has no failure result is refused with `status`.
+/// `raised_at` is the export. The worker stops in its unreplied report; it never spins.
+pub(crate) unsafe fn raise_unhandled_status(status: u32, raised_at: u64) -> ! {
+    let (code, parameters) =
+        nt_kernel_exec::provider_bugcheck::unhandled_status(status, raised_at);
+    report(code, parameters)
+}
+
 pub(crate) unsafe fn accept(
     channel: &spawn_hosts::PumpChannel,
     reply_object: u64,
