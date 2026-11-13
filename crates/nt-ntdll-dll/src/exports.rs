@@ -5821,9 +5821,9 @@ pub unsafe extern "system" fn md5_final(context: *mut nt_ntdll::crypto::Md5Conte
 /// `dst`/`src` valid for `n` bytes, non-overlapping.
 #[linkage = "weak"]
 #[export_name = "memcpy"]
-pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memcpy(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
     // SAFETY: caller contract (valid, non-overlapping, n bytes).
-    unsafe { core::ptr::copy_nonoverlapping(src, dst, n) };
+    unsafe { core::ptr::copy_nonoverlapping(src.cast::<u8>(), dst.cast::<u8>(), n) };
     dst
 }
 
@@ -5833,16 +5833,17 @@ pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut 
 /// `dst` valid for `n` bytes.
 #[linkage = "weak"]
 #[export_name = "memset"]
-pub unsafe extern "C" fn memset(dst: *mut u8, c: i32, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memset(dst: *mut c_void, c: i32, n: usize) -> *mut c_void {
     // SAFETY: caller contract (valid for n bytes).
-    unsafe { core::ptr::write_bytes(dst, c as u8, n) };
+    unsafe { core::ptr::write_bytes(dst.cast::<u8>(), c as u8, n) };
     dst
 }
 
-/// `wcslen(const wchar_t*) -> size_t`.
+/// `wcslen(const wchar_t*) -> size_t`. Weak (compiler-builtins-mem also provides it).
 ///
 /// # Safety
 /// `s` a NUL-terminated UTF-16 string.
+#[linkage = "weak"]
 #[export_name = "wcslen"]
 pub unsafe extern "C" fn wcslen(s: *const u16) -> usize {
     // SAFETY: caller contract.
@@ -6537,9 +6538,9 @@ pub unsafe extern "system" fn rtl_set_unhandled_exception_filter(filter: *mut c_
 /// `dst`/`src` valid for `n` bytes.
 #[linkage = "weak"]
 #[export_name = "memmove"]
-pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memmove(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
     // SAFETY: caller contract; copy is overlap-safe (memmove).
-    unsafe { core::ptr::copy(src, dst, n) };
+    unsafe { core::ptr::copy(src.cast::<u8>(), dst.cast::<u8>(), n) };
     dst
 }
 
@@ -8106,12 +8107,12 @@ pub unsafe extern "system" fn ldr_unload_dll(base_address: *mut c_void) -> NtSta
 /// Both valid for `n` bytes.
 #[linkage = "weak"]
 #[export_name = "memcmp"]
-pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+pub unsafe extern "C" fn memcmp(a: *const c_void, b: *const c_void, n: usize) -> i32 {
     // SAFETY: caller contract.
     let (sa, sb) = unsafe {
         (
-            core::slice::from_raw_parts(a, n),
-            core::slice::from_raw_parts(b, n),
+            core::slice::from_raw_parts(a.cast::<u8>(), n),
+            core::slice::from_raw_parts(b.cast::<u8>(), n),
         )
     };
     match nt_ntdll::crt::memcmp(sa, sb, n) {
@@ -8185,9 +8186,9 @@ pub unsafe extern "C" fn memicmp(a: *const u8, b: *const u8, n: usize) -> i32 {
 /// `s` a NUL-terminated byte string.
 #[linkage = "weak"]
 #[export_name = "strlen"]
-pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
+pub unsafe extern "C" fn strlen(s: *const core::ffi::c_char) -> usize {
     // SAFETY: caller contract.
-    unsafe { strlen_raw(s) }
+    unsafe { strlen_raw(s.cast::<u8>()) }
 }
 
 /// `strcmp(const char*, const char*) -> int`.

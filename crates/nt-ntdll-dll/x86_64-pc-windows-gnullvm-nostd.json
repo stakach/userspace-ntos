@@ -1,7 +1,6 @@
 {
   "abi": "llvm",
   "abi-return-struct-as-int": true,
-  "allows-weak-linkage": false,
   "arch": "x86_64",
   "binary-format": "coff",
   "cpu": "x86-64",
