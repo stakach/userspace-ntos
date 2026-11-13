@@ -108,16 +108,11 @@ jobs:
           for tool in bsdtar 7zz qemu-system-x86_64 clang cc python3 mcopy mdir mmd mkfs.fat; do
             command -v "$tool"
           done
-      - name: Install native target-spec compatible nightly
+      - name: Install the current nightly for the native build
         run: |
-          # The custom NT target specs were verified with this nightly. The build
-          # scripts invoke +nightly, so link that name to the pinned toolchain.
-          rustup toolchain install nightly-2026-04-30 --profile minimal --component rust-src --target x86_64-pc-windows-gnullvm
-          # rustup reserves the channel name `nightly` for managed toolchains, so
-          # expose the verified dated installation at that conventional path.
-          pinned_sysroot="$(rustc +nightly-2026-04-30 --print sysroot)"
-          test ! -e "$HOME/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu"
-          ln -s "$pinned_sysroot" "$HOME/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu"
+          # The build scripts invoke +nightly and track the current nightly. The host
+          # tools keep the runner's default stable toolchain.
+          rustup toolchain install nightly --profile minimal --component rust-src --target x86_64-pc-windows-gnullvm
           rustc +nightly --version
       - name: Stage hive-generator INF input
         run: |
