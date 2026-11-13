@@ -966,6 +966,23 @@ pub(crate) unsafe fn wake_header_recheck_waiter(recheck_id: u64) {
     }
 }
 
+/// A completed mutation has released the CM writer lease. Ready each row whose latest refusal
+/// was BEGIN's busy answer, which is what it waits for; `RETRY_DELAY` remains the bound for a
+/// lease held outside this table.
+unsafe fn wake_writer_waiters() {
+    let busy = nt_status::NtStatus::DEVICE_BUSY.raw() as u32;
+    let mut now = None;
+    nt_config_client::mutation_retry_schedule::ready_writer_waiters(
+        (&*core::ptr::addr_of!(WORK)).len(),
+        |index| (&*core::ptr::addr_of!(WORK))[index].as_ref().is_some_and(|work|
+            matches!(&work.phase, Phase::Begin(_))
+                && work.last_refusal == Some((phase_name(&work.phase), busy))),
+        |index| if let Some(work) = (&mut *core::ptr::addr_of_mut!(WORK))[index].as_mut() {
+            work.retry_at = *now.get_or_insert_with(|| monotonic_time_100ns());
+        },
+    );
+}
+
 pub(crate) fn redrive_active() -> bool {
     ACTIVE.load(Ordering::Acquire)
 }
@@ -1440,6 +1457,7 @@ unsafe fn redrive_inner(mut context: HostedContext<'_>) -> bool {
         }
         if completed {
             PENDING.fetch_sub(1, Ordering::Release);
+            wake_writer_waiters();
         } else {
             work.retry_at = if failed {
                 monotonic_time_100ns().saturating_add(RETRY_DELAY)

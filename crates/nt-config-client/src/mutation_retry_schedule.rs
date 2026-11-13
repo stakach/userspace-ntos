@@ -37,6 +37,26 @@ pub fn header_recheck_waiter(
     (0..count).find(|&index| recheck_id(index) == Some(settled))
 }
 
+/// Ready every row that BEGIN refused because another mutation held the writer lease.
+///
+/// A mutation that completes has released that lease, which is what those rows wait for.
+/// `ready` receives each such row; the count is returned. The retry delay stays as the bound
+/// for a lease held outside this table. Rows waiting for anything else are left alone.
+pub fn ready_writer_waiters(
+    count: usize,
+    mut waits_for_writer: impl FnMut(usize) -> bool,
+    mut ready: impl FnMut(usize),
+) -> usize {
+    let mut woken = 0;
+    for index in 0..count {
+        if waits_for_writer(index) {
+            ready(index);
+            woken += 1;
+        }
+    }
+    woken
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,6 +76,29 @@ mod tests {
         assert_eq!(select_ready_index(2, 1, 120, |index| deadlines[index]), Some(0));
         assert_eq!(earliest_retry_deadline(2, |index| deadlines[index]), Some(120));
         assert_eq!(deadlines[1], Some(150 + RETRY_DELAY), "an unrelated row keeps its deadline");
+    }
+
+    #[test]
+    fn released_writer_lease_readies_its_waiter_ahead_of_the_next_mutation() {
+        // Slot 0 just completed and its caller already submitted the next mutation there.
+        // Slot 1 was refused by BEGIN while slot 0 held the lease; slot 2 is on a timed retry.
+        let waits_for_writer = [false, true, false];
+        let mut deadlines = [Some(0), Some(100 + RETRY_DELAY), Some(100 + RETRY_DELAY)];
+        let woken = ready_writer_waiters(3, |index| waits_for_writer[index],
+            |index| deadlines[index] = Some(130));
+        assert_eq!(woken, 1);
+        assert_eq!(deadlines, [Some(0), Some(130), Some(100 + RETRY_DELAY)]);
+        // The cursor follows the completed slot, so the waiter runs before slot 0's new row.
+        assert_eq!(select_ready_index(3, 1, 130, |index| deadlines[index]), Some(1),
+            "the row that waited for the lease must not lose it again to the same caller");
+    }
+
+    #[test]
+    fn no_writer_waiter_means_no_wake() {
+        let mut readied = 0;
+        assert_eq!(ready_writer_waiters(3, |_| false, |_| readied += 1), 0);
+        assert_eq!(ready_writer_waiters(0, |_| true, |_| readied += 1), 0);
+        assert_eq!(readied, 0);
     }
 
     #[test]
