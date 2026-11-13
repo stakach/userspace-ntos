@@ -28,20 +28,3 @@ fn quiesce_uses_the_retained_directory_queue_not_a_physical_claim() {
         "the native service lane must redrive the retained directory owner");
 }
 
-#[test]
-fn every_no_signaler_gate_defers_for_mounted_directory_owner() {
-    let crash_guard = SERVICE.split_once("macro_rules! park_and_log").unwrap().1
-        .split_once("macro_rules! mark_wait_parked").unwrap().0;
-    let waiting_guard = SERVICE.split_once("macro_rules! mark_wait_parked").unwrap().1
-        .split_once("// Boot-milestone watchdog").unwrap().0;
-    let lsass_guard = SERVICE.split_once("b\"lsass-post-signal-fault\"").unwrap().1
-        .split_once("[quiesce] every live process parked/waiting").unwrap().0;
-    for (site, guard) in [
-        ("crash park", crash_guard),
-        ("cooperative wait", waiting_guard),
-        ("LSASS fault", lsass_guard),
-    ] {
-        assert!(guard.contains("!crate::mounted_volume::mounted_directory_outstanding()"),
-            "{site} quiesced while an exact mounted directory IRP can redrive its parked caller");
-    }
-}

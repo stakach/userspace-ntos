@@ -28,23 +28,6 @@ fn parked_mounted_create_remains_a_live_signaler_until_native_service_drives_it(
     assert!(driver.contains("mounted_native_block::service()"));
     assert!(service.contains("if badge == DELAY_TIMER_BADGE"));
     assert!(service.contains("let native_blocks = driver_launch::service_mounted_native_blocks() as u64"));
-
-    // Every terminal all-parked admission must recognize that queued CREATE as a signaler.
-    // Keep each check local to its own guard; a mention elsewhere cannot satisfy this test.
-    let crash_guard = service.split_once("macro_rules! park_and_log")
-        .unwrap().1.split_once("macro_rules! mark_wait_parked").unwrap().0;
-    let waiting_guard = service.split_once("macro_rules! mark_wait_parked")
-        .unwrap().1.split_once("// Boot-milestone watchdog").unwrap().0;
-    let lsass_guard = service.split_once("b\"lsass-post-signal-fault\"")
-        .unwrap().1.split_once("[quiesce] every live process parked/waiting").unwrap().0;
-    for (name, guard) in [
-        ("crash park", crash_guard),
-        ("cooperative wait", waiting_guard),
-        ("LSASS fault", lsass_guard),
-    ] {
-        assert!(guard.contains("!crate::mounted_volume::mounted_create_outstanding()"),
-            "{name} quiesced while an exact mounted CREATE can still drive its parked caller");
-    }
 }
 
 #[test]

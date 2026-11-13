@@ -6,6 +6,9 @@ use crate::fault_stack_diagnostics::read_fault_stack_word;
 use crate::*;
 use nt_user_host::hosted_return_target::HostedReturnTarget;
 
+#[path = "executor/loop_state.rs"]
+mod loop_state;
+use loop_state::{LoopExit, LoopState, Parks};
 #[path = "hosted_quiesce.rs"]
 mod hosted_quiesce;
 use hosted_quiesce::dump_all_hosted_thread_quiesce;
@@ -10549,7 +10552,6 @@ pub(crate) unsafe fn service_sec_image(
     let img_end = primary_layout.end();
     let nt_base = ntdll.0;
     let nt_end = nt_base + image_extent(ntdll.1);
-    let mut faults: u64;
     // Per-process demand-fault backstop (see the use sites). BATCH-22: raised from 2000 now that the
     // persistent scratch VA is decoupled from this count (bounded ≤256 slots) — it's a frame-budget /
     // runaway guard only, sized to let lsass's full LSA-init DLL tree page in within the frame pool.
@@ -10558,16 +10560,6 @@ pub(crate) unsafe fn service_sec_image(
     // (now 64 MiB = 16384 slots, see map_demand_scratch_pts). (A) EAGER IMAGE-MAP front-loads a
     // process's whole DLL tree, so raised 6000→15000 (headroom under 16384) to let lsass's full
     // LSA-init tree page in eagerly without hitting the cap. Runaway/frame-pool guard only.
-    let mut first: u64;
-    let mut stop: u64;
-    let mut ntfaults: u64;
-    let mut stop_ssn = 0u64;
-    // A single terminal receipt identifies which safety gate ended the serialized loop.
-    // The source location is recorded at the branch, before any quiesce checkpoint can fail.
-    let mut service_loop_exit_site = 0u32;
-    let mut service_loop_exit_reason: &'static [u8] = b"unrecorded";
-    let mut iters = 0u64;
-    let mut dbgsvc = 0u64;
     // page VA filled at each fault index → its persistent executive scratch is
     // scratch_base + index*0x1000. Lets a syscall handler copy OUT to any already-mapped image
     // page (e.g. an ntdll .data global), not just the stack (which has its own mirror).
@@ -10896,20 +10888,73 @@ pub(crate) unsafe fn service_sec_image(
     // (break → gate) only when no live top-level process can make forward progress — every live one
     // is crash-parked (so `recv` would block forever). Cooperative parks (wait/delay/listener) are a
     // DIFFERENT, wakeable state and are left as-is; only a real crash sets a `crash_parked` bit.
-    let mut crash_parked: u64 = 0;
+    let crash_parked: u64 = 0;
     service_watchdog_record_crash_parked(crash_parked);
-    // Which THREAD badges have already logged a `[parked]` fault line (see `park_and_log!`).
-    let mut crash_logged: u64 = 0;
-    // Cooperative-wait owner mask, derived from THREAD_WAIT_PARKED. Each deadline-less park records
-    // the actual hosted thread badge; completion paths clear that badge when they resume the stolen
-    // reply cap. A process contributes to this mask only when every live hosted thread with a real TCB
-    // is parked, so ordinary worker churn no longer clears or sets process liveness as a side effect.
-    let mut wait_parked: u64 = 0;
+    // Boot-milestone watchdog state is wall-clock based (iteration counts are useless here:
+    // each win32k dispatch is a whole-component TCG round-trip taking SECONDS, so the loop does only
+    // ~1-2 iterations/sec and an iter-count stall never trips within the boot budget). `last_progress_t`
+    // is the monotonic time (100ns units) at the last epoch bump (a new image/page publication,
+    // finite credential/dialog or shell milestone, or committed registry mutation). An expired
+    // milestone window requests bounded stall validation, not proof of a deadlock. Evaluate it
+    // only without an owned client ingress: every accepted Call must reach dispatch and its
+    // exact reply/park boundary before validation may stop the service loop.
+    // TCG device setup can spend more than 45 seconds between finite publication
+    // milestones. Keep this diagnostic window finite while the installer frontier
+    // is investigated; the outer boot harness bounds the whole run to one hour.
+    const STALL_BUDGET_100NS: u64 = 180 * 10_000_000;
+    let progress_epoch = boot_progress_epoch;
+    let mut last_progress_epoch = progress_epoch();
+    let mut last_progress_t = monotonic_time_100ns();
+    let mut stall_deferrals =
+        nt_hosted_runtime::ProgressDeferralBudget::new(last_progress_epoch, 2);
+    // FORWARD-PROGRESS CENSUS (see `print_progress_census`): attribute the wall-clock between two
+    // consecutive loop tops to the badge that was serviced in between, and count the iterations.
+    let mut census_prev_t = last_progress_t;
+    let mut census_prev_badge = usize::MAX;
+    // …and dump that census every `CENSUS_PERIOD_100NS`, so a boot that never quiesces (killed by
+    // the harness at RUNEXIT=124, before the gate/final census ever runs) STILL says where its
+    // wall-clock went. Successive dumps turn a runaway into a measurable RATE. The clock is a
+    // STATIC because the win32k dispatch arm's nested pump ticks it too (see `w32_census_enter`).
+    CENSUS_LAST_DUMP.store(last_progress_t, Ordering::Relaxed);
+    let mut root_add_device_turn: Option<RootAddDeviceTurn> = None;
+    let mut add_device_selection_evidence = nt_driver_start::AddDeviceSelectionEvidence::new(64);
+    let mut root_queued_callback_turn: Vec<RootQueuedCallbackTurn> = Vec::new();
+    let memory_context = ExecLoopCtx {
+        owner_pi: primary_pi,
+        owner_pid: nt_handler.capture_process_identity(primary_pi)
+            .expect("primary process retains its mechanism identity").pid,
+        owner_generation: primary_image.generation,
+        live_paging: None,
+        pml4,
+        procs,
+        pfilled,
+        reg: &mut reg as *mut nt_dll_registry::Registry,
+        hosted_loaded_images: hosted_loaded_images_ptr,
+        exe_images: exe_images as *mut nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP>,
+        exe_image_catalog: exe_image_catalog
+            as *mut nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
+        filled_pages: &mut pfilled[primary_pi] as *mut [u64; 512],
+        faults: &mut procs[primary_pi].faults as *mut u64,
+        scratch_base,
+        ntdll_pe: ntdll.1 as *const nt_pe_loader::PeFile as *const ()
+            as *const nt_pe_loader::PeFile<'static>,
+        img_end,
+        img_base,
+        nt_base,
+        nt_end,
+        dll_pe_store: dll_pe_store as *mut DllPeStore,
+        generic_sections,
+    };
+    nt_handler.loop_ctx = Some(memory_context);
+    receive_vspace::install(nt_handler.hosted_vspace_observer());
+    let mut receive_boundary = None;
+    let mut lp = LoopState {
+        exit: LoopExit::new(),
+        parks: Parks { crash_parked, crash_logged: 0, wait_parked: 0 },
+    };
+    'service_loop: loop {
     macro_rules! record_service_loop_exit {
-        ($reason:expr) => {{
-            service_loop_exit_site = line!();
-            service_loop_exit_reason = $reason;
-        }};
+        ($reason:expr) => { lp.exit.record($reason) };
     }
     // park_and_log!(label, ip, cr2): the generalized UNRECOVERABLE-fault handler. Logs once per
     // top-level process (`[parked] pi=.. badge=.. fault=.. ip=.. cr2=..`), marks its crash bit,
@@ -10930,10 +10975,10 @@ pub(crate) unsafe fn service_sec_image(
             // all. Measured in batch 59: winlogon's worker parked on an empty GetMessage, then its
             // main thread faulted post-profile-copy and printed NOTHING.
             let __log_bit = 1u64 << (badge & 63);
-            let __already = (crash_logged & __log_bit) != 0;
-            crash_logged |= __log_bit;
-            crash_parked |= __bit;
-            service_watchdog_record_crash_parked(crash_parked);
+            let __already = (lp.parks.crash_logged & __log_bit) != 0;
+            lp.parks.crash_logged |= __log_bit;
+            lp.parks.crash_parked |= __bit;
+            service_watchdog_record_crash_parked(lp.parks.crash_parked);
             if !__already {
                 print_str(b"[parked] pi=");
                 print_u64(__pi as u64);
@@ -10949,9 +10994,9 @@ pub(crate) unsafe fn service_sec_image(
                 print_hex($cr2 as u32);
                 print_str(b" -> PARK process (unrecoverable); loop continues\n");
             }
-            procs[__pi].faults = faults;
-            procs[__pi].first = first;
-            procs[__pi].ntfaults = ntfaults;
+            procs[__pi].faults = lp.exit.faults;
+            procs[__pi].first = lp.exit.first;
+            procs[__pi].ntfaults = lp.exit.ntfaults;
             pfilled[__pi] = *filled_pages;
             // ★ DEAD-CLIENT CALLBACK UNWIND. If this process died while it was running a win32k
             // user-mode callback, win32k's dispatch is SUSPENDED inside `KeUserModeCallback` waiting
@@ -10964,7 +11009,7 @@ pub(crate) unsafe fn service_sec_image(
             drain_deferred_user_callback_returns(
                 &mut nt_handler,
                 __pi,
-                faults as usize,
+                lp.exit.faults as usize,
                 procs,
                 pfilled,
                 filled_pages,
@@ -10976,12 +11021,12 @@ pub(crate) unsafe fn service_sec_image(
             // frontier (LSA already signalled → services/lsass are just idle RPC servers with no live
             // client left) is terminal for the boot by the same rule the null-deref arm already
             // applies — generalized here so it holds for ANY unrecoverable winlogon fault.
-            if ((live_top_badges(&nt_handler) & !(crash_parked | wait_parked)) == 0
+            if ((live_top_badges(&nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
                 || (__pi == 2 && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0))
                 && !pre_user_shell_frontier_pending(
                     &nt_handler,
-                    crash_parked,
-                    wait_parked,
+                    lp.parks.crash_parked,
+                    lp.parks.wait_parked,
                     b"all-live-parked",
                 )
                 && !defer_quiesce_for_active_user_callbacks(b"all-live-parked")
@@ -10995,7 +11040,7 @@ pub(crate) unsafe fn service_sec_image(
                 && !crate::provider_directory_broker::has_outstanding()
             {
                 print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
-                stop = $ip as u64;
+                lp.exit.stop = $ip as u64;
                 record_service_loop_exit!(b"crash-all-live-parked");
                 break;
             }
@@ -11083,9 +11128,9 @@ pub(crate) unsafe fn service_sec_image(
                 print_hex((($ip as u64) >> 32) as u32);
                 print_hex($ip as u32);
                 print_str(b"\n");
-                procs[$pi].faults = faults;
-                procs[$pi].first = first;
-                procs[$pi].ntfaults = ntfaults;
+                procs[$pi].faults = lp.exit.faults;
+                procs[$pi].first = lp.exit.first;
+                procs[$pi].ntfaults = lp.exit.ntfaults;
                 pfilled[$pi] = *filled_pages;
                 mark_wait_parked!($pi, $ip);
                 let _ = finalize_service_loop_state(&mut nt_handler);
@@ -11107,21 +11152,21 @@ pub(crate) unsafe fn service_sec_image(
     macro_rules! mark_wait_parked {
         ($pi:expr, $ip:expr) => {{
             thread_wait_state_park_badge_waiting(&mut nt_handler, badge);
-            wait_parked = wait_parked_owner_mask(&nt_handler);
+            lp.parks.wait_parked = wait_parked_owner_mask(&nt_handler);
             trace_wait_owner_mask_after_mark(
                 &nt_handler,
                 $pi,
                 badge,
                 live_top_badges(&nt_handler),
-                crash_parked,
-                wait_parked,
+                lp.parks.crash_parked,
+                lp.parks.wait_parked,
             );
             if !cfg!(feature = "mup-provider-kernel-only")
-                && (live_top_badges(&nt_handler) & !(crash_parked | wait_parked)) == 0
+                && (live_top_badges(&nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
                 && !pre_user_shell_frontier_pending(
                     &nt_handler,
-                    crash_parked,
-                    wait_parked,
+                    lp.parks.crash_parked,
+                    lp.parks.wait_parked,
                     b"all-live-waiting",
                 )
                 && !defer_quiesce_for_active_user_callbacks(b"all-live-waiting")
@@ -11154,72 +11199,13 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(
                     b"[quiesce] every live process parked/waiting (no signaler left) -> run gate\n",
                 );
-                stop = $ip as u64;
+                lp.exit.stop = $ip as u64;
                 let _ = $pi;
                 record_service_loop_exit!(b"wait-all-live-parked");
                 break;
             }
         }};
     }
-    // Boot-milestone watchdog state is wall-clock based (iteration counts are useless here:
-    // each win32k dispatch is a whole-component TCG round-trip taking SECONDS, so the loop does only
-    // ~1-2 iterations/sec and an iter-count stall never trips within the boot budget). `last_progress_t`
-    // is the monotonic time (100ns units) at the last epoch bump (a new image/page publication,
-    // finite credential/dialog or shell milestone, or committed registry mutation). An expired
-    // milestone window requests bounded stall validation, not proof of a deadlock. Evaluate it
-    // only without an owned client ingress: every accepted Call must reach dispatch and its
-    // exact reply/park boundary before validation may stop the service loop.
-    // TCG device setup can spend more than 45 seconds between finite publication
-    // milestones. Keep this diagnostic window finite while the installer frontier
-    // is investigated; the outer boot harness bounds the whole run to one hour.
-    const STALL_BUDGET_100NS: u64 = 180 * 10_000_000;
-    let progress_epoch = boot_progress_epoch;
-    let mut last_progress_epoch = progress_epoch();
-    let mut last_progress_t = monotonic_time_100ns();
-    let mut stall_deferrals =
-        nt_hosted_runtime::ProgressDeferralBudget::new(last_progress_epoch, 2);
-    // FORWARD-PROGRESS CENSUS (see `print_progress_census`): attribute the wall-clock between two
-    // consecutive loop tops to the badge that was serviced in between, and count the iterations.
-    let mut census_prev_t = last_progress_t;
-    let mut census_prev_badge = usize::MAX;
-    // …and dump that census every `CENSUS_PERIOD_100NS`, so a boot that never quiesces (killed by
-    // the harness at RUNEXIT=124, before the gate/final census ever runs) STILL says where its
-    // wall-clock went. Successive dumps turn a runaway into a measurable RATE. The clock is a
-    // STATIC because the win32k dispatch arm's nested pump ticks it too (see `w32_census_enter`).
-    CENSUS_LAST_DUMP.store(last_progress_t, Ordering::Relaxed);
-    let mut root_add_device_turn: Option<RootAddDeviceTurn> = None;
-    let mut add_device_selection_evidence = nt_driver_start::AddDeviceSelectionEvidence::new(64);
-    let mut root_queued_callback_turn: Vec<RootQueuedCallbackTurn> = Vec::new();
-    let memory_context = ExecLoopCtx {
-        owner_pi: primary_pi,
-        owner_pid: nt_handler.capture_process_identity(primary_pi)
-            .expect("primary process retains its mechanism identity").pid,
-        owner_generation: primary_image.generation,
-        live_paging: None,
-        pml4,
-        procs,
-        pfilled,
-        reg: &mut reg as *mut nt_dll_registry::Registry,
-        hosted_loaded_images: hosted_loaded_images_ptr,
-        exe_images: exe_images as *mut nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP>,
-        exe_image_catalog: exe_image_catalog
-            as *mut nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
-        filled_pages: &mut pfilled[primary_pi] as *mut [u64; 512],
-        faults: &mut procs[primary_pi].faults as *mut u64,
-        scratch_base,
-        ntdll_pe: ntdll.1 as *const nt_pe_loader::PeFile as *const ()
-            as *const nt_pe_loader::PeFile<'static>,
-        img_end,
-        img_base,
-        nt_base,
-        nt_end,
-        dll_pe_store: dll_pe_store as *mut DllPeStore,
-        generic_sections,
-    };
-    nt_handler.loop_ctx = Some(memory_context);
-    receive_vspace::install(nt_handler.hosted_vspace_observer());
-    let mut receive_boundary = None;
-    'service_loop: loop {
         let queued_callback_fences_providers = root_queued_callback_exclusive_pending()
             || crate::driver_launch::unsettled_queued_callback();
         #[cfg(not(feature = "mup-provider-kernel-only"))]
@@ -11238,8 +11224,8 @@ pub(crate) unsafe fn service_sec_image(
                         continue 'service_loop;
                     }
                     crate::executive_ingress::ReceiveOutcome::RetainedFailure => {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"ingress-retained");
                         break 'service_loop;
                     }
@@ -11251,30 +11237,30 @@ pub(crate) unsafe fn service_sec_image(
                 assert!(crate::executive_ingress::handles($ep));
                 if root_add_device_exclusive_pending() {
                     if !prepare_parked_add_device_receive(&mut root_add_device_turn) {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"add-device-receive");
                         break 'service_loop;
                     }
                 } else if root_queued_callback_exclusive_pending() {
                     if !prepare_parked_queued_callback_receive(&mut root_queued_callback_turn) {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"queued-callback-receive");
                         break 'service_loop;
                     }
                     if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
                         && !transfer_selected_queued_callback_ingress(&mut root_queued_callback_turn)
                     {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"queued-callback-child-transfer");
                         break 'service_loop;
                     }
                 } else if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
                     if !prepare_service_receive(&mut *delay_queue, &mut nt_handler) {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"queued-work-receive-poll");
                         break 'service_loop;
                     }
@@ -11287,30 +11273,30 @@ pub(crate) unsafe fn service_sec_image(
                 assert!(crate::executive_ingress::handles($ep));
                 if root_add_device_exclusive_pending() {
                     if !prepare_parked_add_device_receive(&mut root_add_device_turn) {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"add-device-reply-receive");
                         break 'service_loop;
                     }
                 } else if root_queued_callback_exclusive_pending() {
                     if !prepare_parked_queued_callback_receive(&mut root_queued_callback_turn) {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"queued-callback-reply-receive");
                         break 'service_loop;
                     }
                     if crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
                         && !transfer_selected_queued_callback_ingress(&mut root_queued_callback_turn)
                     {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"queued-callback-child-transfer");
                         break 'service_loop;
                     }
                 } else if !crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending() {
                     if !prepare_service_receive(&mut *delay_queue, &mut nt_handler) {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"queued-work-reply-poll");
                         break 'service_loop;
                     }
@@ -11332,15 +11318,15 @@ pub(crate) unsafe fn service_sec_image(
                 let permit = match ParkedRootQueuedCallbackPermit::retained() {
                     Some(permit) => permit,
                     None => {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"queued-callback-owner");
                         break 'service_loop;
                     }
                 };
                 if !ensure_queued_callback_root_turn(&mut root_queued_callback_turn, &permit) {
-                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    stop_ssn = 0;
+                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    lp.exit.stop_ssn = 0;
                     record_service_loop_exit!(b"queued-callback-owner-changed");
                     break 'service_loop;
                 }
@@ -11350,8 +11336,8 @@ pub(crate) unsafe fn service_sec_image(
                         let turn = root_queued_callback_turn.last_mut()
                             .expect("queued callback turn");
                         if service_parked_queued_callback_notification(badge).is_err() {
-                            stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                            stop_ssn = 0;
+                            lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                            lp.exit.stop_ssn = 0;
                             record_service_loop_exit!(b"queued-callback-notification");
                             break 'service_loop;
                         }
@@ -11359,8 +11345,8 @@ pub(crate) unsafe fn service_sec_image(
                             nt_driver_start::RootArrival::Timer { now: monotonic_time_100ns() }
                         } else { nt_driver_start::RootArrival::Irq };
                         if turn.observe_arrival(permit.0, arrival).is_err() {
-                            stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                            stop_ssn = 0;
+                            lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                            lp.exit.stop_ssn = 0;
                             record_service_loop_exit!(b"queued-callback-arrival");
                             break 'service_loop;
                         }
@@ -11380,8 +11366,8 @@ pub(crate) unsafe fn service_sec_image(
                                 &mut root_queued_callback_turn, &permit, reply, badge)
                         };
                         if !retained {
-                            stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                            stop_ssn = 0;
+                            lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                            lp.exit.stop_ssn = 0;
                             record_service_loop_exit!(b"queued-callback-ingress-defer");
                             break 'service_loop;
                         }
@@ -11405,8 +11391,8 @@ pub(crate) unsafe fn service_sec_image(
                     }
                 )?
                 if !prepare_parked_queued_callback_receive(&mut root_queued_callback_turn) {
-                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    stop_ssn = 0;
+                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    lp.exit.stop_ssn = 0;
                     record_service_loop_exit!(b"queued-callback-receive-prepare");
                     break 'service_loop;
                 }
@@ -11434,8 +11420,8 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" reply=");
                     print_u64(REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     print_str(b"\n");
-                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    stop_ssn = 0;
+                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    lp.exit.stop_ssn = 0;
                     record_service_loop_exit!(b"rejected-reply-retained");
                     break 'service_loop;
                 }
@@ -11460,28 +11446,28 @@ pub(crate) unsafe fn service_sec_image(
                 component_resume::run_outer(core::ptr::from_mut(&mut *nt_handler));
                 if root_add_device_exclusive_pending() {
                     if !prepare_parked_add_device_receive(&mut root_add_device_turn) {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"restored-add-device-receive");
                         break 'service_loop;
                     }
                 } else if root_queued_callback_exclusive_pending() {
                     if !prepare_parked_queued_callback_receive(&mut root_queued_callback_turn) {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"restored-queued-callback-receive");
                         break 'service_loop;
                     }
                     if !transfer_selected_queued_callback_ingress(&mut root_queued_callback_turn) {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"restored-queued-callback-child-transfer");
                         break 'service_loop;
                     }
                 } else {
                     if !prepare_service_receive(&mut *delay_queue, &mut nt_handler) {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"restored-queued-work-poll");
                         break 'service_loop;
                     }
@@ -11491,8 +11477,8 @@ pub(crate) unsafe fn service_sec_image(
             let received = match received {
                 crate::executive_ingress::ReceiveOutcome::Message(received) => received,
                 crate::executive_ingress::ReceiveOutcome::RetainedFailure => {
-                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    stop_ssn = 0;
+                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    lp.exit.stop_ssn = 0;
                     record_service_loop_exit!(b"restored-ingress-retained");
                     break 'service_loop;
                 }
@@ -11522,14 +11508,14 @@ pub(crate) unsafe fn service_sec_image(
             && (badge_has_delay_timer(badge) || hosted_irq_lines_from_badge(badge) != 0)
         {
             let Some(turn) = root_queued_callback_turn.last_mut() else {
-                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                stop_ssn = 0;
+                lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                lp.exit.stop_ssn = 0;
                 record_service_loop_exit!(b"queued-callback-missing-turn");
                 break 'service_loop;
             };
             if service_parked_queued_callback_notification(badge).is_err() {
-                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                stop_ssn = 0;
+                lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                lp.exit.stop_ssn = 0;
                 record_service_loop_exit!(b"queued-callback-notification");
                 break 'service_loop;
             }
@@ -11537,8 +11523,8 @@ pub(crate) unsafe fn service_sec_image(
                 nt_driver_start::RootArrival::Timer { now: monotonic_time_100ns() }
             } else { nt_driver_start::RootArrival::Irq };
             if turn.observe_arrival(turn.owner(), arrival).is_err() {
-                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                stop_ssn = 0;
+                lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                lp.exit.stop_ssn = 0;
                 record_service_loop_exit!(b"queued-callback-arrival");
                 break 'service_loop;
             }
@@ -11554,16 +11540,16 @@ pub(crate) unsafe fn service_sec_image(
                         receive_child_is_current(binding, reply));
             if !selected_child {
                 let Some(permit) = ParkedRootQueuedCallbackPermit::retained() else {
-                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    stop_ssn = 0;
+                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    lp.exit.stop_ssn = 0;
                     record_service_loop_exit!(b"queued-callback-ingress-owner");
                     break 'service_loop;
                 };
                 if !retain_parked_queued_callback_ingress(
                     &mut root_queued_callback_turn, &permit, reply, badge)
                 {
-                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    stop_ssn = 0;
+                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    lp.exit.stop_ssn = 0;
                     record_service_loop_exit!(b"queued-callback-ingress-defer");
                     break 'service_loop;
                 }
@@ -11573,8 +11559,8 @@ pub(crate) unsafe fn service_sec_image(
         if let Some(turn) = root_add_device_turn.as_mut() {
             if badge_has_delay_timer(badge) || hosted_irq_lines_from_badge(badge) != 0 {
                 if let Err(status) = service_parked_add_device_notification(badge) {
-                    stop = status.raw() as u32 as u64;
-                    stop_ssn = 0;
+                    lp.exit.stop = status.raw() as u32 as u64;
+                    lp.exit.stop_ssn = 0;
                     record_service_loop_exit!(b"add-device-notification");
                     break 'service_loop;
                 }
@@ -11601,8 +11587,8 @@ pub(crate) unsafe fn service_sec_image(
                     crate::driver_launch::drain_hosted_queued_callbacks_at_root()
                 };
                 if let Err(status) = queued_admission {
-                    stop = status as u32 as u64;
-                    stop_ssn = 0;
+                    lp.exit.stop = status as u32 as u64;
+                    lp.exit.stop_ssn = 0;
                     record_service_loop_exit!(b"queued-callback-admission");
                     break 'service_loop;
                 }
@@ -11614,8 +11600,8 @@ pub(crate) unsafe fn service_sec_image(
             match callback_settlement {
                 ConnectPumpSettlement::Settled => {
                     if !settle_parked_queued_callback_turn(&mut root_queued_callback_turn) {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"queued-callback-settle");
                         break 'service_loop;
                     }
@@ -11625,8 +11611,8 @@ pub(crate) unsafe fn service_sec_image(
                         park_queued_callback_root_receive!(root_event_consumed, 'queued_callback_settlement);
                     }
                     if !prepare_parked_add_device_receive(&mut root_add_device_turn) {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"add-device-child-receive");
                         break 'service_loop;
                     }
@@ -11638,8 +11624,8 @@ pub(crate) unsafe fn service_sec_image(
                     park_queued_callback_root_receive!(root_event_consumed, 'queued_callback_settlement);
                 }
                 ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
-                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    stop_ssn = 0;
+                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    lp.exit.stop_ssn = 0;
                     record_service_loop_exit!(b"add-device-connect-retained");
                     break 'service_loop;
                 }
@@ -11649,8 +11635,8 @@ pub(crate) unsafe fn service_sec_image(
                 match run_one_pending_add_device_child_step(nt_handler as *mut _) {
                     Ok(selected) => selected,
                     Err(()) => {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"add-device-child-step");
                         break 'service_loop;
                     }
@@ -11663,8 +11649,8 @@ pub(crate) unsafe fn service_sec_image(
                         || root_add_device_still_parked(&nt_handler, turn.owner())
                     {
                         root_add_device_turn = Some(turn);
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"add-device-owner-changed");
                         break 'service_loop;
                     }
@@ -11672,8 +11658,8 @@ pub(crate) unsafe fn service_sec_image(
                         !crate::spawn_hosts::shared_ingress::owner::runtime::deferred_parked_ingress_is_exact(ticket))
                     {
                         root_add_device_turn = Some(turn);
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"add-device-ingress-changed");
                         break 'service_loop;
                     }
@@ -11681,8 +11667,8 @@ pub(crate) unsafe fn service_sec_image(
                         Ok(retained) => retained,
                         Err(turn) => {
                             root_add_device_turn = Some(turn);
-                            stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                            stop_ssn = 0;
+                            lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                            lp.exit.stop_ssn = 0;
                             record_service_loop_exit!(b"add-device-settle");
                             break 'service_loop;
                         }
@@ -11716,8 +11702,8 @@ pub(crate) unsafe fn service_sec_image(
                 ROOT_ADD_DEVICE_EXCLUSIVE.store(true, Ordering::Release);
             }
             if root_add_device_turn.as_ref().is_none_or(|turn| turn.owner() != reservation) {
-                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                stop_ssn = 0;
+                lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                lp.exit.stop_ssn = 0;
                 record_service_loop_exit!(b"add-device-reservation-changed");
                 break 'service_loop;
             }
@@ -11733,8 +11719,8 @@ pub(crate) unsafe fn service_sec_image(
                         park_queued_callback_root_receive!(root_event_consumed, 'queued_callback_settlement);
                     }
                     ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"add-device-connect-retained");
                         break 'service_loop;
                     }
@@ -11762,8 +11748,8 @@ pub(crate) unsafe fn service_sec_image(
                         park_queued_callback_root_receive!(root_event_consumed, 'queued_callback_settlement);
                     }
                     ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"add-device-connect-retained");
                         break 'service_loop;
                     }
@@ -11782,8 +11768,8 @@ pub(crate) unsafe fn service_sec_image(
                     .is_some_and(|ticket|
                         !crate::spawn_hosts::shared_ingress::owner::runtime::deferred_parked_ingress_is_exact(ticket))
                 {
-                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    stop_ssn = 0;
+                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    lp.exit.stop_ssn = 0;
                     record_service_loop_exit!(b"add-device-ingress-changed");
                     break 'service_loop;
                 }
@@ -11792,8 +11778,8 @@ pub(crate) unsafe fn service_sec_image(
                     Ok(retained) => retained,
                     Err(turn) => {
                         root_add_device_turn = Some(turn);
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"add-device-settle");
                         break 'service_loop;
                     }
@@ -11808,8 +11794,8 @@ pub(crate) unsafe fn service_sec_image(
             {
                 // The exact parent has an indeterminate or quarantined outcome. Its Reply
                 // and banks remain held, and no unrelated provider can enter after this.
-                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                stop_ssn = 0;
+                lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                lp.exit.stop_ssn = 0;
                 record_service_loop_exit!(b"add-device-parent-retained");
                 break 'service_loop;
             }
@@ -11819,8 +11805,8 @@ pub(crate) unsafe fn service_sec_image(
                 || !root_event_consumed && hosted_irq_lines_from_badge(badge) != 0
             {
                 if let Err(status) = service_parked_add_device_notification(badge) {
-                    stop = status.raw() as u32 as u64;
-                    stop_ssn = 0;
+                    lp.exit.stop = status.raw() as u32 as u64;
+                    lp.exit.stop_ssn = 0;
                     record_service_loop_exit!(b"add-device-notification");
                     break 'service_loop;
                 }
@@ -11838,8 +11824,8 @@ pub(crate) unsafe fn service_sec_image(
             {
                 let Some(permit) = ParkedRootAddDevicePermit::for_exact(&nt_handler, reservation)
                 else {
-                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    stop_ssn = 0;
+                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    lp.exit.stop_ssn = 0;
                     record_service_loop_exit!(b"add-device-permit");
                     break 'service_loop;
                 };
@@ -11849,15 +11835,15 @@ pub(crate) unsafe fn service_sec_image(
                 {
                     Ok(ticket) => ticket,
                     Err(_) => {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"add-device-ingress-defer");
                         break 'service_loop;
                     }
                 };
                 if turn.retain_ingress(reservation, ticket).is_err() {
-                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    stop_ssn = 0;
+                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    lp.exit.stop_ssn = 0;
                     record_service_loop_exit!(b"add-device-ingress-retain");
                     break 'service_loop;
                 }
@@ -11866,8 +11852,8 @@ pub(crate) unsafe fn service_sec_image(
             let prepared = prepare_parked_add_device_receive(&mut root_add_device_turn);
             trace_connect_add_device_boundary(4, u64::from(prepared));
             if !prepared {
-                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                stop_ssn = 0;
+                lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                lp.exit.stop_ssn = 0;
                 record_service_loop_exit!(b"add-device-receive-prepare");
                 break 'service_loop;
             }
@@ -11882,8 +11868,8 @@ pub(crate) unsafe fn service_sec_image(
                 && !root_queued_callback_exclusive_pending()
                 && !delay_timer_rearm(&*delay_queue, &nt_handler).owner_available()
             {
-                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                stop_ssn = 0;
+                lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                lp.exit.stop_ssn = 0;
                 record_service_loop_exit!(b"receive-child-timer-owner");
                 break 'service_loop;
             }
@@ -11895,8 +11881,8 @@ pub(crate) unsafe fn service_sec_image(
                         service_parked_add_device_notification(badge)
                     };
                     if let Err(status) = notification {
-                        stop = status.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = status.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"receive-child-notification");
                         break 'service_loop;
                     }
@@ -11909,16 +11895,16 @@ pub(crate) unsafe fn service_sec_image(
                             receive_child_is_current(binding, reply));
                 if selected_callback_child {
                     let Some(permit) = ParkedRootQueuedCallbackPermit::retained() else {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"queued-callback-child-owner");
                         break 'service_loop;
                     };
                     if crate::spawn_hosts::shared_ingress::owner::runtime::
                         defer_hosted_delivery_for_queued_callback(reply, badge, &permit).is_err()
                     {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"queued-callback-child-defer");
                         break 'service_loop;
                     }
@@ -11937,8 +11923,8 @@ pub(crate) unsafe fn service_sec_image(
             // AddDevice bank has now settled, so restore their ordinary shared one-shot before
             // waiting for the next real ingress. A failed arm cannot be treated as an idle wait.
             if !delay_timer_rearm(&*delay_queue, &nt_handler).owner_available() {
-                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                stop_ssn = 0;
+                lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                lp.exit.stop_ssn = 0;
                 record_service_loop_exit!(b"timer-rearm");
                 break 'service_loop;
             }
@@ -12010,8 +11996,8 @@ pub(crate) unsafe fn service_sec_image(
             if !matches!(connect_settlement, ConnectPumpSettlement::Settled) {
                 // A nonretryable restore or a claimed, orphaned, or blocked port parent still
                 // owns its Reply. No later provider may enter while that physical owner is held.
-                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                stop_ssn = 0;
+                lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                lp.exit.stop_ssn = 0;
                 record_service_loop_exit!(b"connect-pump-unsettled");
                 break 'service_loop;
             }
@@ -12022,8 +12008,8 @@ pub(crate) unsafe fn service_sec_image(
             match queue_settlement {
                 ConnectPumpSettlement::Settled => {
                     if !settle_parked_queued_callback_turn(&mut root_queued_callback_turn) {
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = 0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = 0;
                         record_service_loop_exit!(b"queued-callback-settle");
                         break 'service_loop;
                     }
@@ -12035,8 +12021,8 @@ pub(crate) unsafe fn service_sec_image(
                     park_queued_callback_root_receive!(root_event_consumed);
                 }
                 ConnectPumpSettlement::Retained | ConnectPumpSettlement::Blocked => {
-                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    stop_ssn = 0;
+                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    lp.exit.stop_ssn = 0;
                     record_service_loop_exit!(b"queued-callback-unsettled");
                     break 'service_loop;
                 }
@@ -12061,8 +12047,8 @@ pub(crate) unsafe fn service_sec_image(
             if !matches!(hook_pump_settlement, ConnectPumpSettlement::Settled) {
                 // The exact Hook File owner still holds a physical Reply. Do not enter the
                 // next unrelated provider or publish a synthetic Hook completion.
-                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                stop_ssn = 0;
+                lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                lp.exit.stop_ssn = 0;
                 record_service_loop_exit!(b"file-pump-unsettled");
                 break 'service_loop;
             }
@@ -12164,7 +12150,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"[service-loop] IRQ checkpoint failure=0x");
                     print_hex(irq_durable_status);
                     print_str(b"\n");
-                    stop = irq_durable_status as u64;
+                    lp.exit.stop = irq_durable_status as u64;
                     record_service_loop_exit!(b"irq-checkpoint");
                     break;
                 }
@@ -12218,10 +12204,10 @@ pub(crate) unsafe fn service_sec_image(
             // shell frontier; counting the wake itself can keep boot alive forever on timeout churn.
             if ingress.is_none() && crate::WATCHDOG_TRIPPED.load(Ordering::Relaxed) != 0 {
                 if watchdog_defer_if_hosted_work_can_run(b"overdue-timer") {
-                    wait_parked = wait_parked_owner_mask(&nt_handler);
+                    lp.parks.wait_parked = wait_parked_owner_mask(&nt_handler);
                 } else if crate::watchdog_confirm_trip() {
                     print_str(b"[deadman] confirmed -> QUIESCE; run the gate\n");
-                    stop = m1;
+                    lp.exit.stop = m1;
                     record_service_loop_exit!(b"overdue-watchdog");
                     break;
                 }
@@ -12263,10 +12249,10 @@ pub(crate) unsafe fn service_sec_image(
                 && now.wrapping_sub(last_progress_t) >= STALL_BUDGET_100NS
             {
                 let deferral =
-                    progress_stall_deferral_snapshot(&nt_handler, crash_parked, wait_parked);
+                    progress_stall_deferral_snapshot(&nt_handler, lp.parks.crash_parked, lp.parks.wait_parked);
                 if deferral.is_some() && stall_deferrals.grant(ep, deferral.unwrap()) {
                     let snapshot = deferral.unwrap();
-                    trace_progress_stall_deferral(snapshot, &nt_handler, crash_parked, wait_parked);
+                    trace_progress_stall_deferral(snapshot, &nt_handler, lp.parks.crash_parked, lp.parks.wait_parked);
                     last_progress_t = now;
                 } else if nt_handler.grant_installer_inf_progress(ep, now, STALL_BUDGET_100NS) {
                     print_str(b"[quiesce] deferring installer INF traversal grant=");
@@ -12299,7 +12285,7 @@ pub(crate) unsafe fn service_sec_image(
                         pfilled,
                     );
                     print_str(b"[quiesce] no boot milestone for ~180s wall-clock -> run gate\n");
-                    stop = m1;
+                    lp.exit.stop = m1;
                     record_service_loop_exit!(b"boot-milestone-stall");
                     break;
                 }
@@ -12307,7 +12293,7 @@ pub(crate) unsafe fn service_sec_image(
         }
         if ingress.is_none() && crate::WATCHDOG_TRIPPED.load(Ordering::Relaxed) != 0 {
             if watchdog_defer_if_hosted_work_can_run(b"service-loop-top") {
-                wait_parked = wait_parked_owner_mask(&nt_handler);
+                lp.parks.wait_parked = wait_parked_owner_mask(&nt_handler);
             } else if crate::watchdog_confirm_trip() {
                 dump_lsa_readiness_quiesce(
                     &nt_handler,
@@ -12334,7 +12320,7 @@ pub(crate) unsafe fn service_sec_image(
                     pfilled,
                 );
                 print_str(b"[deadman] nested receive confirmed watchdog -> run gate\n");
-                stop = m1;
+                lp.exit.stop = m1;
                 record_service_loop_exit!(b"nested-receive-watchdog");
                 break;
             }
@@ -12407,10 +12393,10 @@ pub(crate) unsafe fn service_sec_image(
             // again.
             if crate::WATCHDOG_TRIPPED.load(Ordering::Relaxed) != 0 {
                 if watchdog_defer_if_hosted_work_can_run(b"timer-badge") {
-                    wait_parked = wait_parked_owner_mask(&nt_handler);
+                    lp.parks.wait_parked = wait_parked_owner_mask(&nt_handler);
                 } else if crate::watchdog_confirm_trip() {
                     print_str(b"[deadman] confirmed -> QUIESCE; run the gate\n");
-                    stop = m1;
+                    lp.exit.stop = m1;
                     record_service_loop_exit!(b"timer-watchdog");
                     break;
                 }
@@ -12422,7 +12408,7 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b"[service-loop] timer checkpoint failure=0x");
                 print_hex(timer_durable_status);
                 print_str(b"\n");
-                stop = timer_durable_status as u64;
+                lp.exit.stop = timer_durable_status as u64;
                 record_service_loop_exit!(b"timer-checkpoint");
                 break;
             }
@@ -12453,7 +12439,7 @@ pub(crate) unsafe fn service_sec_image(
             print_str(b"[service-loop] durability publication failed status=0x");
             print_hex(durability_status);
             print_str(b"\n");
-            stop = durability_status as u64;
+            lp.exit.stop = durability_status as u64;
             record_service_loop_exit!(b"durability-publication");
             break;
         }
@@ -12534,7 +12520,7 @@ pub(crate) unsafe fn service_sec_image(
             )
             .expect("changed or uncertain Receive fault retains child Call and parent");
             thread_wait_state_clear_badge_running(&mut nt_handler, badge);
-            wait_parked = wait_parked_owner_mask(&nt_handler);
+            lp.parks.wait_parked = wait_parked_owner_mask(&nt_handler);
             if procs[event_runtime.pi].faults == 0 { procs[event_runtime.pi].first = m1; }
             procs[event_runtime.pi].faults += 1;
             note_boot_progress(BootProgress::PageMappingPublished);
@@ -12550,8 +12536,8 @@ pub(crate) unsafe fn service_sec_image(
                 && crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending()
                 && !transfer_selected_queued_callback_ingress(&mut root_queued_callback_turn)
             {
-                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                stop_ssn = 0;
+                lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                lp.exit.stop_ssn = 0;
                 record_service_loop_exit!(b"queued-callback-child-transfer");
                 break 'service_loop;
             }
@@ -12564,15 +12550,15 @@ pub(crate) unsafe fn service_sec_image(
                     continue 'service_loop;
                 }
                 crate::executive_ingress::ReceiveOutcome::RetainedFailure => {
-                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    stop_ssn = 0;
+                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    lp.exit.stop_ssn = 0;
                     record_service_loop_exit!(b"receive-child-ack-retained");
                     break 'service_loop;
                 }
                 crate::executive_ingress::ReceiveOutcome::Message(_) => panic!("Receive ACK requires exact settlement boundary"),
             }
         }
-        iters += 1;
+        lp.exit.iters += 1;
         // `iters` is diagnostic only. A real NT kernel does not stop a runnable hosted process set at a
         // historical boot-frontier count; quiesce is driven by wait/crash/stall predicates above.
         // Select the hosted process this fault/syscall came from (0 = smss, CSRSS_BADGE = csrss) and
@@ -12710,7 +12696,7 @@ pub(crate) unsafe fn service_sec_image(
         // This thread is producing an event, so it is runnable even if the owning process still has
         // other parked threads. The owner mask is derived from all live hosted threads below.
         thread_wait_state_clear_badge_running(&mut nt_handler, badge);
-        wait_parked = wait_parked_owner_mask(&nt_handler);
+        lp.parks.wait_parked = wait_parked_owner_mask(&nt_handler);
         if hosted_main_badge_has_role(
             &nt_handler,
             badge,
@@ -12790,9 +12776,9 @@ pub(crate) unsafe fn service_sec_image(
             unsafe { hosted_loaded_images.pe_by_pi(pi) }
                 .expect("faulting hosted process must have a registered loaded executable PE")
         };
-        faults = procs[pi].faults;
-        first = procs[pi].first;
-        ntfaults = procs[pi].ntfaults;
+        lp.exit.faults = procs[pi].faults;
+        lp.exit.first = procs[pi].first;
+        lp.exit.ntfaults = procs[pi].ntfaults;
         *filled_pages = pfilled[pi];
         let memory_generation = exe_image_catalog.get_by_pi(pi)
             .expect("event process retains its executable identity").generation;
@@ -12808,11 +12794,11 @@ pub(crate) unsafe fn service_sec_image(
                 pml4,
                 generation: memory_generation,
                 filled_pages: filled_pages as *mut [u64; 512],
-                faults: &mut faults as *mut u64,
+                faults: &mut lp.exit.faults as *mut u64,
             }),
             pml4,
             filled_pages: filled_pages as *mut [u64; 512],
-            faults: &mut faults as *mut u64,
+            faults: &mut lp.exit.faults as *mut u64,
             scratch_base,
             img_end,
             img_base,
@@ -12831,9 +12817,9 @@ pub(crate) unsafe fn service_sec_image(
                 if fip >= nb && fip < nb + image_extent(npe) {
                     if pe_byte_at_rva(npe, (fip - nb) as u32) == Some(0xCD) {
                         // Skip `int 0x2d; int3` (3 bytes) — the no-op DebugService.
-                        procs[pi].faults = faults;
-                        procs[pi].first = first;
-                        procs[pi].ntfaults = ntfaults;
+                        procs[pi].faults = lp.exit.faults;
+                        procs[pi].first = lp.exit.first;
+                        procs[pi].ntfaults = lp.exit.ntfaults;
                         pfilled[pi] = *filled_pages;
                         let (nb, nmi, nm0, nm1, nm2, nm3) =
                             component_reply_recv!(fault_ep, 3, fip + 3, m1, m2, 0);
@@ -12844,7 +12830,7 @@ pub(crate) unsafe fn service_sec_image(
                         m2 = nm2;
                         m3 = nm3;
                         skipped = true;
-                        dbgsvc += 1;
+                        lp.exit.dbgsvc += 1;
                     }
                 }
             }
@@ -13039,26 +13025,26 @@ pub(crate) unsafe fn service_sec_image(
                 print_hex((fip >> 32) as u32);
                 print_hex(fip as u32);
                 print_str(b" -> terminal thread containment (no callback frame; other threads continue)\n");
-                crash_parked |= owner_bit_for_badge(&nt_handler, badge);
-                service_watchdog_record_crash_parked(crash_parked);
-                procs[pi].faults = faults;
-                procs[pi].first = first;
-                procs[pi].ntfaults = ntfaults;
+                lp.parks.crash_parked |= owner_bit_for_badge(&nt_handler, badge);
+                service_watchdog_record_crash_parked(lp.parks.crash_parked);
+                procs[pi].faults = lp.exit.faults;
+                procs[pi].first = lp.exit.first;
+                procs[pi].ntfaults = lp.exit.ntfaults;
                 pfilled[pi] = *filled_pages;
                 WINLOGON_POST_LOGON_MILESTONE_PARK.store(fip, Ordering::Relaxed);
                 WINLOGON_POST_LOGON_MILESTONE_CR2.store(fip, Ordering::Relaxed);
-                if ((live_top_badges(&nt_handler) & !(crash_parked | wait_parked)) == 0
+                if ((live_top_badges(&nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
                     || LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0)
                     && !pre_user_shell_frontier_pending(
                         &nt_handler,
-                        crash_parked,
-                        wait_parked,
+                        lp.parks.crash_parked,
+                        lp.parks.wait_parked,
                         b"winlogon-post-logon-fault",
                     )
                     && !defer_quiesce_for_active_user_callbacks(b"winlogon-post-logon-fault")
                 {
                     print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
-                    stop = fip;
+                    lp.exit.stop = fip;
                     record_service_loop_exit!(b"winlogon-post-logon-fault");
                     break;
                 }
@@ -13271,8 +13257,8 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 park_and_log!(pi, b"pending-memory", m0, addr);
             }
-            if faults == 0 {
-                first = addr;
+            if lp.exit.faults == 0 {
+                lp.exit.first = addr;
             }
             if pi == 2
                 && (m3 & 0x7) == 0x7
@@ -13455,9 +13441,9 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" addr=0x");
                     print_hex(addr as u32);
                     print_str(b" -> terminal worker containment; other threads continue\n");
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
                     mark_wait_parked!(pi, m0);
                     let _ = finalize_service_loop_state(&mut nt_handler);
@@ -13506,19 +13492,19 @@ pub(crate) unsafe fn service_sec_image(
                         && WINLOGON_MAIN_EVENT_WAIT_PARKED.load(Ordering::Relaxed) != 0
                         && !pre_user_shell_frontier_pending(
                             &nt_handler,
-                            crash_parked,
-                            wait_parked,
+                            lp.parks.crash_parked,
+                            lp.parks.wait_parked,
                             b"winlogon-worker-terminal",
                         )
                     {
                         print_str(b"[wl-worker] terminal wall while winlogon main waits for this worker -> run gate\n");
-                        stop = m0;
+                        lp.exit.stop = m0;
                         record_service_loop_exit!(b"winlogon-worker-terminal");
                         break;
                     }
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
                     // Recv the next event WITHOUT replying to the listener (it stays blocked).
                     let _ = finalize_service_loop_state(&mut nt_handler);
@@ -13570,21 +13556,21 @@ pub(crate) unsafe fn service_sec_image(
                     && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0
                     && !pre_user_shell_frontier_pending(
                         &nt_handler,
-                        crash_parked,
-                        wait_parked,
+                        lp.parks.crash_parked,
+                        lp.parks.wait_parked,
                         b"winlogon-frontier-crash",
                     )
                     && !defer_quiesce_for_active_user_callbacks(b"winlogon-frontier-crash")
                 {
-                    crash_parked |= owner_bit_for_badge(&nt_handler, badge);
-                    service_watchdog_record_crash_parked(crash_parked);
+                    lp.parks.crash_parked |= owner_bit_for_badge(&nt_handler, badge);
+                    service_watchdog_record_crash_parked(lp.parks.crash_parked);
                     let _ = win32k_glue::unwind_dead_client_user_callbacks(pi as u32);
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
                     print_str(b"[wl-main] winlogon crashed at its post-OpenSCManager GUI/login frontier (LSA signalled, SCM servers idle) -> QUIESCE; run gate\n");
-                    stop = m0;
+                    lp.exit.stop = m0;
                     record_service_loop_exit!(b"winlogon-main-crash");
                     break;
                 }
@@ -13636,9 +13622,9 @@ pub(crate) unsafe fn service_sec_image(
                             print_hex((allocation_base >> 32) as u32);
                             print_hex(allocation_base as u32);
                             print_str(b"\n");
-                            procs[pi].faults = faults;
-                            procs[pi].first = first;
-                            procs[pi].ntfaults = ntfaults;
+                            procs[pi].faults = lp.exit.faults;
+                            procs[pi].first = lp.exit.first;
+                            procs[pi].ntfaults = lp.exit.ntfaults;
                             pfilled[pi] = *filled_pages;
                             let _ = finalize_service_loop_state(&mut nt_handler);
                             let (nb, nmi, nm0, nm1, nm2, nm3) =
@@ -13676,10 +13662,10 @@ pub(crate) unsafe fn service_sec_image(
             ) {
                 Ok(Some(nt_thread_start::stack_vad::StackVadOutcome::Grown)) => {
                     note_boot_progress(BootProgress::PageMappingPublished);
-                    faults += 1;
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    lp.exit.faults += 1;
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
                     let (nb, nmi, nm0, nm1, nm2, nm3) =
                         component_reply_recv!(fault_ep, 0, 0, 0, 0, 0);
@@ -13764,10 +13750,10 @@ pub(crate) unsafe fn service_sec_image(
                             print_hex((allocation_base >> 32) as u32);
                             print_hex(allocation_base as u32);
                             print_str(b"\n");
-                            faults += 1;
-                            procs[pi].faults = faults;
-                            procs[pi].first = first;
-                            procs[pi].ntfaults = ntfaults;
+                            lp.exit.faults += 1;
+                            procs[pi].faults = lp.exit.faults;
+                            procs[pi].first = lp.exit.first;
+                            procs[pi].ntfaults = lp.exit.ntfaults;
                             pfilled[pi] = *filled_pages;
                             let _ = finalize_service_loop_state(&mut nt_handler);
                             let (nb, nmi, nm0, nm1, nm2, nm3) =
@@ -13809,10 +13795,10 @@ pub(crate) unsafe fn service_sec_image(
             ) {
                 Ok(true) => {
                     note_boot_progress(BootProgress::PageMappingPublished);
-                    faults += 1;
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    lp.exit.faults += 1;
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
                     let (nb, nmi, nm0, nm1, nm2, nm3) = component_reply_recv!(fault_ep, 0, 0, 0, 0, 0);
                     badge = nb;
@@ -13844,10 +13830,10 @@ pub(crate) unsafe fn service_sec_image(
             ) {
                 Ok(Some(())) => {
                     note_boot_progress(BootProgress::PageMappingPublished);
-                    faults += 1;
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    lp.exit.faults += 1;
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
                     let (nb, nmi, nm0, nm1, nm2, nm3) = component_reply_recv!(fault_ep, 0, 0, 0, 0, 0);
                     badge = nb;
@@ -13895,10 +13881,10 @@ pub(crate) unsafe fn service_sec_image(
             ) {
                 Ok(Some(())) => {
                     note_boot_progress(BootProgress::PageMappingPublished);
-                    faults += 1;
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    lp.exit.faults += 1;
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
                     let (nb, nmi, nm0, nm1, nm2, nm3) = component_reply_recv!(fault_ep, 0, 0, 0, 0, 0);
                     badge = nb;
@@ -13930,9 +13916,9 @@ pub(crate) unsafe fn service_sec_image(
             ) {
                 Ok(GenericSectionFaultResult::Mapped) => {
                     note_boot_progress(BootProgress::PageMappingPublished);
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
                     let (nb, nmi, nm0, nm1, nm2, nm3) = component_reply_recv!(fault_ep, 0, 0, 0, 0, 0);
                     badge = nb;
@@ -13990,7 +13976,7 @@ pub(crate) unsafe fn service_sec_image(
                 let tpe = if base == img_base {
                     pe
                 } else if nt_base != 0 && base == nt_base {
-                    ntfaults += 1;
+                    lp.exit.ntfaults += 1;
                     ntdll.1
                 } else if let Some((i, _)) = if pi >= 1 {
                     reg.dll_for_page(pi, base)
@@ -14160,18 +14146,18 @@ pub(crate) unsafe fn service_sec_image(
                     assert!(drop_current_hosted_reply(), "terminal service fault must retire its Call");
                     print_str(b"[fault] lsass main unrecoverable fault POST-LSA-signal -> terminal thread containment\n");
                     // Terminal for lsass main — count toward quiesce (lsass has done its signalling job).
-                    crash_parked |= owner_bit_for_badge(&nt_handler, badge);
-                    service_watchdog_record_crash_parked(crash_parked);
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    lp.parks.crash_parked |= owner_bit_for_badge(&nt_handler, badge);
+                    service_watchdog_record_crash_parked(lp.parks.crash_parked);
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
                     if !cfg!(feature = "mup-provider-kernel-only")
-                        && (live_top_badges(&nt_handler) & !(crash_parked | wait_parked)) == 0
+                        && (live_top_badges(&nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
                         && !pre_user_shell_frontier_pending(
                             &nt_handler,
-                            crash_parked,
-                            wait_parked,
+                            lp.parks.crash_parked,
+                            lp.parks.wait_parked,
                             b"lsass-post-signal-fault",
                         )
                         && !defer_quiesce_for_active_user_callbacks(b"lsass-post-signal-fault")
@@ -14188,7 +14174,7 @@ pub(crate) unsafe fn service_sec_image(
                     {
                         driver_launch::print_mounted_native_block_quiesce_snapshot();
                         print_str(b"[quiesce] every live process parked/waiting (no signaler left) -> run gate\n");
-                        stop = addr;
+                        lp.exit.stop = addr;
                         record_service_loop_exit!(b"fault-all-live-waiting");
                         break;
                     }
@@ -14245,11 +14231,11 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(
                         b" -> terminal thread containment (no callback frame; other threads continue)\n",
                     );
-                    crash_parked |= owner_bit_for_badge(&nt_handler, badge);
-                    service_watchdog_record_crash_parked(crash_parked);
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    lp.parks.crash_parked |= owner_bit_for_badge(&nt_handler, badge);
+                    service_watchdog_record_crash_parked(lp.parks.crash_parked);
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
                     WINLOGON_POST_LOGON_MILESTONE_PARK.store(m0, Ordering::Relaxed);
                     WINLOGON_POST_LOGON_MILESTONE_CR2.store(addr, Ordering::Relaxed);
@@ -14257,18 +14243,18 @@ pub(crate) unsafe fn service_sec_image(
                     // server has signalled, services/lsass are idle RPC servers with no live client
                     // left, so a parked winlogon leaves NO runnable signaler and the next `recv`
                     // would block forever (measured: RUNEXIT=124 without this clause).
-                    if ((live_top_badges(&nt_handler) & !(crash_parked | wait_parked)) == 0
+                    if ((live_top_badges(&nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
                         || LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0)
                         && !pre_user_shell_frontier_pending(
                             &nt_handler,
-                            crash_parked,
-                            wait_parked,
+                            lp.parks.crash_parked,
+                            lp.parks.wait_parked,
                             b"winlogon-post-logon-syscall",
                         )
                         && !defer_quiesce_for_active_user_callbacks(b"winlogon-post-logon-syscall")
                     {
                         print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
-                        stop = m0;
+                        lp.exit.stop = m0;
                         record_service_loop_exit!(b"winlogon-post-logon-syscall");
                         break;
                     }
@@ -14292,7 +14278,7 @@ pub(crate) unsafe fn service_sec_image(
             // scratch bounded to ≤256 slots regardless of this count) this is now purely a
             // frame-budget / runaway guard, not a scratch limit — raised so lsass's full LSA-init DLL
             // tree (lsasrv/samsrv/msv1_0 + deps, thousands of pages) fits.
-            if faults >= SEC_IMAGE_FAULT_CAP {
+            if lp.exit.faults >= SEC_IMAGE_FAULT_CAP {
                 // This process exhausted its per-process demand-fault budget (runaway / frame-pool
                 // guard) — treat as unrecoverable for THIS process: park+log, let the others proceed.
                 park_and_log!(pi, b"fault-cap", m0, addr);
@@ -14334,7 +14320,7 @@ pub(crate) unsafe fn service_sec_image(
                 image_fault_access,
                 true,
                 filled_pages,
-                &mut faults,
+                &mut lp.exit.faults,
             ) {
                 print_str(b"[vmf-image] residency failed pi=");
                 print_u64(pi as u64);
@@ -14349,7 +14335,7 @@ pub(crate) unsafe fn service_sec_image(
                 fault_page_serviced = false;
             }
             for bi in 1..batch_pages {
-                if allocation_failed || faults >= SEC_IMAGE_FAULT_CAP {
+                if allocation_failed || lp.exit.faults >= SEC_IMAGE_FAULT_CAP {
                     break;
                 }
                 let bpage = batch_start + bi * 0x1000;
@@ -14404,7 +14390,7 @@ pub(crate) unsafe fn service_sec_image(
                     nt_address_space::FaultAccess::Lock,
                     false,
                     filled_pages,
-                    &mut faults,
+                    &mut lp.exit.faults,
                 )
                 .is_err()
                 {
@@ -14424,9 +14410,9 @@ pub(crate) unsafe fn service_sec_image(
             if fault_page_serviced {
                 note_boot_progress(BootProgress::PageMappingPublished);
             }
-            procs[pi].faults = faults;
-            procs[pi].first = first;
-            procs[pi].ntfaults = ntfaults;
+            procs[pi].faults = lp.exit.faults;
+            procs[pi].first = lp.exit.first;
+            procs[pi].ntfaults = lp.exit.ntfaults;
             pfilled[pi] = *filled_pages;
             let (nb, nmi, nm0, nm1, nm2, nm3) = component_reply_recv!(fault_ep, 0, 0, 0, 0, 0);
             badge = nb;
@@ -14849,9 +14835,9 @@ pub(crate) unsafe fn service_sec_image(
                             get_recv_mr(7),
                             parked_syscall_reply,
                         ) {
-                            procs[pi].faults = faults;
-                            procs[pi].first = first;
-                            procs[pi].ntfaults = ntfaults;
+                            procs[pi].faults = lp.exit.faults;
+                            procs[pi].first = lp.exit.first;
+                            procs[pi].ntfaults = lp.exit.ntfaults;
                             pfilled[pi] = *filled_pages;
                             let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                             let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
@@ -14908,9 +14894,9 @@ pub(crate) unsafe fn service_sec_image(
                                 ), "refused callback lost its two exact Reply owners");
                                 assert!(callback_reply_reservation.commit(),
                                     "reserved callback Reply replacement lost its exact lease");
-                                procs[pi].faults = faults;
-                                procs[pi].first = first;
-                                procs[pi].ntfaults = ntfaults;
+                                procs[pi].faults = lp.exit.faults;
+                                procs[pi].first = lp.exit.first;
+                                procs[pi].ntfaults = lp.exit.ntfaults;
                                 pfilled[pi] = *filled_pages;
                                 let _ = finalize_service_loop_state(&mut nt_handler);
                                 let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -14955,7 +14941,7 @@ pub(crate) unsafe fn service_sec_image(
                                             current_tid,
                                             dispatch,
                                             filled_pages,
-                                            faults as usize,
+                                            lp.exit.faults as usize,
                                             scratch_base,
                                         ) {
                                             park_and_log!(
@@ -14988,9 +14974,9 @@ pub(crate) unsafe fn service_sec_image(
                                         }),
                                         HostedContinuationDestination::Win32k,
                                     ) == RetainedWaitAdmission::Accepted);
-                                    procs[pi].faults = faults;
-                                    procs[pi].first = first;
-                                    procs[pi].ntfaults = ntfaults;
+                                    procs[pi].faults = lp.exit.faults;
+                                    procs[pi].first = lp.exit.first;
+                                    procs[pi].ntfaults = lp.exit.ntfaults;
                                     pfilled[pi] = *filled_pages;
                                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                                     if component_suspension_owns_hosted_dispatch(dispatch_id) {
@@ -15023,9 +15009,9 @@ pub(crate) unsafe fn service_sec_image(
                                         }),
                                         HostedContinuationDestination::Win32k,
                                     ) == RetainedWaitAdmission::Accepted);
-                                    procs[pi].faults = faults;
-                                    procs[pi].first = first;
-                                    procs[pi].ntfaults = ntfaults;
+                                    procs[pi].faults = lp.exit.faults;
+                                    procs[pi].first = lp.exit.first;
+                                    procs[pi].ntfaults = lp.exit.ntfaults;
                                     pfilled[pi] = *filled_pages;
                                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                                     if component_suspension_owns_hosted_dispatch(dispatch_id) {
@@ -15062,9 +15048,9 @@ pub(crate) unsafe fn service_sec_image(
                                         HostedContinuationDestination::Win32k,
                                     ));
                                     reply_park.commit();
-                                    procs[pi].faults = faults;
-                                    procs[pi].first = first;
-                                    procs[pi].ntfaults = ntfaults;
+                                    procs[pi].faults = lp.exit.faults;
+                                    procs[pi].first = lp.exit.first;
+                                    procs[pi].ntfaults = lp.exit.ntfaults;
                                     pfilled[pi] = *filled_pages;
                                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                                     if component_suspension_owns_hosted_dispatch(dispatch_id) {
@@ -15101,9 +15087,9 @@ pub(crate) unsafe fn service_sec_image(
                                         HostedContinuationDestination::Win32k,
                                     ));
                                     reply_park.commit();
-                                    procs[pi].faults = faults;
-                                    procs[pi].first = first;
-                                    procs[pi].ntfaults = ntfaults;
+                                    procs[pi].faults = lp.exit.faults;
+                                    procs[pi].first = lp.exit.first;
+                                    procs[pi].ntfaults = lp.exit.ntfaults;
                                     pfilled[pi] = *filled_pages;
                                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                                     if component_suspension_owns_hosted_dispatch(dispatch_id) {
@@ -15125,14 +15111,14 @@ pub(crate) unsafe fn service_sec_image(
                             drain_deferred_user_callback_returns(
                                 &mut nt_handler,
                                 pi,
-                                faults as usize,
+                                lp.exit.faults as usize,
                                 procs,
                                 pfilled,
                                 filled_pages,
                             );
-                            procs[pi].faults = faults;
-                            procs[pi].first = first;
-                            procs[pi].ntfaults = ntfaults;
+                            procs[pi].faults = lp.exit.faults;
+                            procs[pi].first = lp.exit.first;
+                            procs[pi].ntfaults = lp.exit.ntfaults;
                             pfilled[pi] = *filled_pages;
                             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                             let restarted = win32k_glue::restart_staged_user_callback_context(
@@ -15830,12 +15816,12 @@ pub(crate) unsafe fn service_sec_image(
                             if handoff.retained_failure {
                                 // The pending win32k snapshot and original Reply remain owned.
                                 // Never turn this refusal into a process-creation reply.
-                                procs[pi].faults = faults;
-                                procs[pi].first = first;
-                                procs[pi].ntfaults = ntfaults;
+                                procs[pi].faults = lp.exit.faults;
+                                procs[pi].first = lp.exit.first;
+                                procs[pi].ntfaults = lp.exit.ntfaults;
                                 pfilled[pi] = *filled_pages;
-                                stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                                stop_ssn = m0;
+                                lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                                lp.exit.stop_ssn = m0;
                                 record_service_loop_exit!(b"win32k-initial-dispatch-retained");
                                 break 'service_loop;
                             }
@@ -16017,7 +16003,7 @@ pub(crate) unsafe fn service_sec_image(
                                 trace_smss_file_busy_wait(waiter);
                                 trace_indefinite_wait_park(
                                     &nt_handler, badge, live_top_badges(&nt_handler),
-                                    crash_parked, wait_parked,
+                                    lp.parks.crash_parked, lp.parks.wait_parked,
                                 );
                                 mark_wait_parked!(pi, resume_ip);
                             }
@@ -16073,9 +16059,9 @@ pub(crate) unsafe fn service_sec_image(
                             print_str(b" rsp=0x");
                             print_hex_u64(context.registers[nt_user_callback::USER_CONTEXT_RSP]);
                             print_str(b" -> recv without reply\n");
-                            procs[pi].faults = faults;
-                            procs[pi].first = first;
-                            procs[pi].ntfaults = ntfaults;
+                            procs[pi].faults = lp.exit.faults;
+                            procs[pi].first = lp.exit.first;
+                            procs[pi].ntfaults = lp.exit.ntfaults;
                             pfilled[pi] = *filled_pages;
                             let _ = finalize_service_loop_state(&mut nt_handler);
                             let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -16125,9 +16111,9 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" mechanism-deleted=");
                         print_u64(mechanism_deleted as u64);
                         print_str(b" -> recv without reply\n");
-                        procs[pi].faults = faults;
-                        procs[pi].first = first;
-                        procs[pi].ntfaults = ntfaults;
+                        procs[pi].faults = lp.exit.faults;
+                        procs[pi].first = lp.exit.first;
+                        procs[pi].ntfaults = lp.exit.ntfaults;
                         pfilled[pi] = *filled_pages;
                         let _ = finalize_service_loop_state(&mut nt_handler);
                         let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -16261,7 +16247,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" reply-dropped=");
                         print_u64(reply_dropped as u64);
                         print_str(b" -> fatal stop\n");
-                        stop = code as u64;
+                        lp.exit.stop = code as u64;
                         record_service_loop_exit!(b"fatal-stop");
                         break;
                     }
@@ -16987,7 +16973,7 @@ pub(crate) unsafe fn service_sec_image(
                         d_a1,
                         d_a2,
                         filled_pages,
-                        faults as usize,
+                        lp.exit.faults as usize,
                         scratch_base,
                     ) {
                         Some((module, resource, params)) => {
@@ -17021,11 +17007,11 @@ pub(crate) unsafe fn service_sec_image(
                     let captured = register_class_process.and_then(|process| {
                         let name = try_capture_client_string_arg_for(
                             pi as u64, process, d_a1, false, false,
-                            filled_pages, faults as usize, scratch_base,
+                            filled_pages, lp.exit.faults as usize, scratch_base,
                         )?;
                         let version = try_capture_client_string_arg_for(
                             pi as u64, process, d_a2, false, false,
-                            filled_pages, faults as usize, scratch_base,
+                            filled_pages, lp.exit.faults as usize, scratch_base,
                         )?;
                         let addresses = nt_kernel_exec::user_class::register_class_tail_addresses(sp)?;
                         let tail = addresses.map(|va| {
@@ -17057,7 +17043,7 @@ pub(crate) unsafe fn service_sec_image(
                             false,
                             false,
                             filled_pages,
-                            faults as usize,
+                            lp.exit.faults as usize,
                             scratch_base,
                         )
                     });
@@ -18967,7 +18953,7 @@ pub(crate) unsafe fn service_sec_image(
                         d_a0,
                         false,
                         filled_pages,
-                        faults as usize,
+                        lp.exit.faults as usize,
                         scratch_base,
                     );
                     d_a2 = capture_client_string_arg(
@@ -18975,7 +18961,7 @@ pub(crate) unsafe fn service_sec_image(
                         d_a2,
                         false,
                         filled_pages,
-                        faults as usize,
+                        lp.exit.faults as usize,
                         scratch_base,
                     );
                     d_a1 = capture_client_devmodew_arg(
@@ -19121,7 +19107,7 @@ pub(crate) unsafe fn service_sec_image(
                         d_a1,
                         true,
                         filled_pages,
-                        faults as usize,
+                        lp.exit.faults as usize,
                         scratch_base,
                     );
                     d_a2 = capture_client_string_arg(
@@ -19129,7 +19115,7 @@ pub(crate) unsafe fn service_sec_image(
                         d_a2,
                         true,
                         filled_pages,
-                        faults as usize,
+                        lp.exit.faults as usize,
                         scratch_base,
                     );
                     d_a3 = capture_client_string_arg(
@@ -19137,7 +19123,7 @@ pub(crate) unsafe fn service_sec_image(
                         d_a3,
                         true,
                         filled_pages,
-                        faults as usize,
+                        lp.exit.faults as usize,
                         scratch_base,
                     );
                     if explorer_gui_client
@@ -19156,7 +19142,7 @@ pub(crate) unsafe fn service_sec_image(
                             );
                             try_capture_client_string_arg_for(
                                 pi as u64, process, d_a1, true, true,
-                                filled_pages, faults as usize, scratch_base,
+                                filled_pages, lp.exit.faults as usize, scratch_base,
                             )
                         });
                         match capture {
@@ -19196,7 +19182,7 @@ pub(crate) unsafe fn service_sec_image(
                         let captured = nt_handler.capture_process_identity(pi).and_then(|process| {
                             try_capture_client_string_arg_for(
                                 pi as u64, process, d_a2, false, false,
-                                filled_pages, faults as usize, scratch_base,
+                                filled_pages, lp.exit.faults as usize, scratch_base,
                             )
                         });
                         if let Some(capture) =
@@ -19232,7 +19218,7 @@ pub(crate) unsafe fn service_sec_image(
                         d_a2,
                         d_a3,
                         filled_pages,
-                        faults as usize,
+                        lp.exit.faults as usize,
                         scratch_base,
                     ) {
                         Some((module, resource, data, stage)) => {
@@ -19250,7 +19236,7 @@ pub(crate) unsafe fn service_sec_image(
                     if let Some(graph) = register_class_process.and_then(|process| {
                         capture_register_class_graph(
                             pi as u64, process, a0, a3,
-                            filled_pages, faults as usize, scratch_base,
+                            filled_pages, lp.exit.faults as usize, scratch_base,
                         )
                     }) {
                         d_a0 = graph.wnd;
@@ -19267,7 +19253,7 @@ pub(crate) unsafe fn service_sec_image(
                         a1,
                         a2,
                         filled_pages,
-                        faults as usize,
+                        lp.exit.faults as usize,
                         scratch_base,
                     )
                 } else if m0 == 0x10a8 {
@@ -19277,7 +19263,7 @@ pub(crate) unsafe fn service_sec_image(
                         a2,
                         a3,
                         filled_pages,
-                        faults as usize,
+                        lp.exit.faults as usize,
                         scratch_base,
                     )
                 } else {
@@ -19363,7 +19349,7 @@ pub(crate) unsafe fn service_sec_image(
                                 a2,
                                 a3,
                                 filled_pages,
-                                faults as usize,
+                                lp.exit.faults as usize,
                                 scratch_base,
                             )
                         })
@@ -20553,12 +20539,12 @@ pub(crate) unsafe fn service_sec_image(
                 if handoff.retained_failure {
                     // A yielded pump has already transferred its pending snapshot. Preserve
                     // both Replies and the durable owner; ordinary syscall output is forbidden.
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
-                    stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                    stop_ssn = m0;
+                    lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                    lp.exit.stop_ssn = m0;
                     record_service_loop_exit!(b"win32k-dispatch-retained");
                     break 'service_loop;
                 }
@@ -21032,23 +21018,23 @@ pub(crate) unsafe fn service_sec_image(
                     // No typed GUI wait or provider continuation accepted this request. Keep the
                     // frontier explicit: contain this thread rather than orphan its held Call.
                     assert!(drop_current_hosted_reply(), "unhandled GUI frontier must retire its Call");
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
-                    crash_parked |= owner_bit_for_badge(&nt_handler, badge);
-                    service_watchdog_record_crash_parked(crash_parked);
+                    lp.parks.crash_parked |= owner_bit_for_badge(&nt_handler, badge);
+                    service_watchdog_record_crash_parked(lp.parks.crash_parked);
                     let userinit_shell_pending =
-                        userinit_shell_frontier_pending(&nt_handler, crash_parked, wait_parked);
+                        userinit_shell_frontier_pending(&nt_handler, lp.parks.crash_parked, lp.parks.wait_parked);
                     let explorer_chrome_pending = interactive_shell_chrome_frontier_pending(
                         &nt_handler,
-                        crash_parked,
-                        wait_parked,
+                        lp.parks.crash_parked,
+                        lp.parks.wait_parked,
                     );
                     let pre_user_shell_pending = pre_user_shell_frontier_pending(
                         &nt_handler,
-                        crash_parked,
-                        wait_parked,
+                        lp.parks.crash_parked,
+                        lp.parks.wait_parked,
                         b"winlogon-milestone",
                     );
                     if !pre_user_shell_pending
@@ -21059,7 +21045,7 @@ pub(crate) unsafe fn service_sec_image(
                         && !defer_quiesce_for_active_user_callbacks(b"winlogon-milestone")
                     {
                         print_str(b"[quiesce] winlogon reached its win32k SAS-window milestone + steady state -> run gate\n");
-                        stop = m0;
+                        lp.exit.stop = m0;
                         record_service_loop_exit!(b"winlogon-sas-milestone");
                         break;
                     } else if userinit_shell_pending {
@@ -21101,30 +21087,30 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(
                         b" -> terminal thread containment (no callback frame; other threads continue)\n",
                     );
-                    crash_parked |= owner_bit_for_badge(&nt_handler, badge);
-                    service_watchdog_record_crash_parked(crash_parked);
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    lp.parks.crash_parked |= owner_bit_for_badge(&nt_handler, badge);
+                    service_watchdog_record_crash_parked(lp.parks.crash_parked);
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
                     WINLOGON_POST_LOGON_MILESTONE_PARK.store(m0, Ordering::Relaxed);
                     WINLOGON_POST_LOGON_MILESTONE_CR2.store(m0, Ordering::Relaxed);
-                    if ((live_top_badges(&nt_handler) & !(crash_parked | wait_parked)) == 0
+                    if ((live_top_badges(&nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
                         || LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0)
                         && !pre_user_shell_frontier_pending(
                             &nt_handler,
-                            crash_parked,
-                            wait_parked,
+                            lp.parks.crash_parked,
+                            lp.parks.wait_parked,
                             b"winlogon-post-logon-callback",
                         )
                         && !interactive_shell_chrome_frontier_pending(
                             &nt_handler,
-                            crash_parked,
-                            wait_parked,
+                            lp.parks.crash_parked,
+                            lp.parks.wait_parked,
                         )
                     {
                         print_str(b"[quiesce] all live processes parked/waiting -> run gate\n");
-                        stop = m0;
+                        lp.exit.stop = m0;
                         record_service_loop_exit!(b"all-live-waiting");
                         break;
                     }
@@ -21146,9 +21132,9 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" SSN=");
                     print_u64(m0);
                     print_str(b" -> terminal worker containment; other threads continue\n");
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
                     mark_wait_parked!(pi, m0);
                     let _ = finalize_service_loop_state(&mut nt_handler);
@@ -21197,13 +21183,13 @@ pub(crate) unsafe fn service_sec_image(
                     if is_wl_worker && WINLOGON_MAIN_EVENT_WAIT_PARKED.load(Ordering::Relaxed) != 0
                     {
                         print_str(b"[wl-worker] parked before signalling the waiting winlogon main thread -> run gate\n");
-                        stop = m0;
+                        lp.exit.stop = m0;
                         record_service_loop_exit!(b"winlogon-worker-parked");
                         break;
                     }
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
                     mark_wait_parked!(pi, m0);
                     let _ = finalize_service_loop_state(&mut nt_handler);
@@ -21241,14 +21227,14 @@ pub(crate) unsafe fn service_sec_image(
                 // An Nt* syscall we don't service yet AND can't safely fake a result for — the process
                 // can't make progress. Record the SSN for the report line, then park+log this process
                 // (unrecoverable for it) and let the shared loop keep servicing the others.
-                stop_ssn = m0;
+                lp.exit.stop_ssn = m0;
                 park_and_log!(pi, b"unhandled-syscall", m0, m0);
             }
             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
             if component_suspension_park_request {
-                procs[pi].faults = faults;
-                procs[pi].first = first;
-                procs[pi].ntfaults = ntfaults;
+                procs[pi].faults = lp.exit.faults;
+                procs[pi].first = lp.exit.first;
+                procs[pi].ntfaults = lp.exit.ntfaults;
                 pfilled[pi] = *filled_pages;
                 let receive_child_pending = crate::spawn_hosts::shared_ingress::owner::runtime::receive_child_pending();
                 if receive_child_pending {
@@ -21261,8 +21247,8 @@ pub(crate) unsafe fn service_sec_image(
                         // A prepared Receive child has physical priority over independent work.
                         // Keep this checkpoint and both Replies retained for diagnosis.
                         print_str(b"[root-maintenance] pending Receive child; checkpoint retained\n");
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = m0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = m0;
                         record_service_loop_exit!(b"root-maintenance-receive-child");
                         break 'service_loop;
                     }
@@ -21277,8 +21263,8 @@ pub(crate) unsafe fn service_sec_image(
                     };
                     if !worker_attempted {
                         print_str(b"[root-maintenance] image worker did not enter; checkpoint retained\n");
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = m0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = m0;
                         record_service_loop_exit!(b"root-maintenance-worker");
                         break 'service_loop;
                     }
@@ -21286,15 +21272,15 @@ pub(crate) unsafe fn service_sec_image(
                         Ordering::AcqRel, Ordering::Acquire, |old| old.checked_add(1),
                     ).ok().and_then(|old| old.checked_add(1)) else {
                         print_str(b"[root-maintenance] outer pass epoch exhausted\n");
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = m0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = m0;
                         record_service_loop_exit!(b"root-maintenance-epoch");
                         break 'service_loop;
                     };
                     let Some(key) = root_maintenance_owner::key(maintenance_ticket) else {
                         print_str(b"[root-maintenance] exact owner missing before pass grant\n");
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = m0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = m0;
                         record_service_loop_exit!(b"root-maintenance-owner");
                         break 'service_loop;
                     };
@@ -21305,8 +21291,8 @@ pub(crate) unsafe fn service_sec_image(
                         observed_pass,
                     ).is_err() {
                         print_str(b"[root-maintenance] exact pass grant refused\n");
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = m0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = m0;
                         record_service_loop_exit!(b"root-maintenance-pass");
                         break 'service_loop;
                     }
@@ -21317,8 +21303,8 @@ pub(crate) unsafe fn service_sec_image(
                         component_resume::RootMaintenanceResumeOutcome::RetainedFailure,
                     ) {
                         print_str(b"[root-maintenance] exact resume retained after refusal\n");
-                        stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
-                        stop_ssn = m0;
+                        lp.exit.stop = nt_status::NtStatus::DEVICE_BUSY.raw() as u32 as u64;
+                        lp.exit.stop_ssn = m0;
                         record_service_loop_exit!(b"root-maintenance-resume");
                         break 'service_loop;
                     }
@@ -21342,20 +21328,20 @@ pub(crate) unsafe fn service_sec_image(
             }
             if active_callback_bad_resume && reply_main != 0 {
                 if drop_current_hosted_reply() {
-                    crash_parked |= owner_bit_for_badge(&nt_handler, badge);
-                    service_watchdog_record_crash_parked(crash_parked);
+                    lp.parks.crash_parked |= owner_bit_for_badge(&nt_handler, badge);
+                    service_watchdog_record_crash_parked(lp.parks.crash_parked);
                     let _ = win32k_glue::unwind_dead_client_user_callbacks(pi as u32);
                     drain_deferred_user_callback_returns(
                         &mut nt_handler,
                         pi,
-                        faults as usize,
+                        lp.exit.faults as usize,
                         procs,
                         pfilled,
                         filled_pages,
                     );
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
                     print_str(
                         b"[user-callback] active callback syscall had no executable resume-ip=0x",
@@ -21364,19 +21350,19 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" ssn=0x");
                     print_hex_u64(m0);
                     print_str(b" -> DROP reply and park client\n");
-                    if ((live_top_badges(&nt_handler) & !(crash_parked | wait_parked)) == 0
+                    if ((live_top_badges(&nt_handler) & !(lp.parks.crash_parked | lp.parks.wait_parked)) == 0
                         || (pi == 2
                             && LSA_RPC_SERVER_ACTIVE_SIGNALLED.load(Ordering::Relaxed) != 0))
                         && !pre_user_shell_frontier_pending(
                             &nt_handler,
-                            crash_parked,
-                            wait_parked,
+                            lp.parks.crash_parked,
+                            lp.parks.wait_parked,
                             b"bad-callback-resume",
                         )
                         && !defer_quiesce_for_active_user_callbacks(b"bad-callback-resume")
                     {
                         print_str(b"[quiesce] active callback bad-resume park reached steady state -> run gate\n");
-                        stop = resume_ip;
+                        lp.exit.stop = resume_ip;
                         record_service_loop_exit!(b"callback-bad-resume");
                         break;
                     }
@@ -21398,9 +21384,9 @@ pub(crate) unsafe fn service_sec_image(
             set_reply_mr(15, resume_ip);
             set_reply_mr(16, sp);
             set_reply_mr(17, flags);
-            procs[pi].faults = faults;
-            procs[pi].first = first;
-            procs[pi].ntfaults = ntfaults;
+            procs[pi].faults = lp.exit.faults;
+            procs[pi].first = lp.exit.first;
+            procs[pi].ntfaults = lp.exit.ntfaults;
             pfilled[pi] = *filled_pages;
             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
             if let Some(pending) = park_lpc_receive.take() {
@@ -21413,9 +21399,9 @@ pub(crate) unsafe fn service_sec_image(
                         nt_handler.current_tid,
                     )
                 {
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
                     let server_tid = nt_handler.current_tid;
                     if nt_handler.lpc_reply_published {
@@ -21431,12 +21417,12 @@ pub(crate) unsafe fn service_sec_image(
                             &nt_handler,
                             badge,
                             live_top_badges(&nt_handler),
-                            crash_parked,
-                            wait_parked,
+                            lp.parks.crash_parked,
+                            lp.parks.wait_parked,
                         );
                         mark_wait_parked!(pi, resume_ip);
                     } else {
-                        wait_parked = wait_parked_owner_mask(&nt_handler);
+                        lp.parks.wait_parked = wait_parked_owner_mask(&nt_handler);
                     }
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let received = component_recv!(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
@@ -21461,16 +21447,16 @@ pub(crate) unsafe fn service_sec_image(
                         nt_handler.current_tid,
                     )
                 {
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
                     trace_indefinite_wait_park(
                         &nt_handler,
                         badge,
                         live_top_badges(&nt_handler),
-                        crash_parked,
-                        wait_parked,
+                        lp.parks.crash_parked,
+                        lp.parks.wait_parked,
                     );
                     mark_wait_parked!(pi, resume_ip);
                     let _ = finalize_service_loop_state(&mut nt_handler);
@@ -21503,16 +21489,16 @@ pub(crate) unsafe fn service_sec_image(
                         nt_handler.current_tid,
                     )
                 {
-                    procs[pi].faults = faults;
-                    procs[pi].first = first;
-                    procs[pi].ntfaults = ntfaults;
+                    procs[pi].faults = lp.exit.faults;
+                    procs[pi].first = lp.exit.first;
+                    procs[pi].ntfaults = lp.exit.ntfaults;
                     pfilled[pi] = *filled_pages;
                     trace_indefinite_wait_park(
                         &nt_handler,
                         badge,
                         live_top_badges(&nt_handler),
-                        crash_parked,
-                        wait_parked,
+                        lp.parks.crash_parked,
+                        lp.parks.wait_parked,
                     );
                     mark_wait_parked!(pi, resume_ip);
                     let _ = finalize_service_loop_state(&mut nt_handler);
@@ -21562,8 +21548,8 @@ pub(crate) unsafe fn service_sec_image(
                             &nt_handler,
                             badge,
                             live_top_badges(&nt_handler),
-                            crash_parked,
-                            wait_parked,
+                            lp.parks.crash_parked,
+                            lp.parks.wait_parked,
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
@@ -21649,8 +21635,8 @@ pub(crate) unsafe fn service_sec_image(
                             &nt_handler,
                             badge,
                             live_top_badges(&nt_handler),
-                            crash_parked,
-                            wait_parked,
+                            lp.parks.crash_parked,
+                            lp.parks.wait_parked,
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
@@ -21691,8 +21677,8 @@ pub(crate) unsafe fn service_sec_image(
                             &nt_handler,
                             badge,
                             live_top_badges(&nt_handler),
-                            crash_parked,
-                            wait_parked,
+                            lp.parks.crash_parked,
+                            lp.parks.wait_parked,
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
@@ -21768,8 +21754,8 @@ pub(crate) unsafe fn service_sec_image(
                             &nt_handler,
                             badge,
                             live_top_badges(&nt_handler),
-                            crash_parked,
-                            wait_parked,
+                            lp.parks.crash_parked,
+                            lp.parks.wait_parked,
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
@@ -21822,8 +21808,8 @@ pub(crate) unsafe fn service_sec_image(
                             &nt_handler,
                             badge,
                             live_top_badges(&nt_handler),
-                            crash_parked,
-                            wait_parked,
+                            lp.parks.crash_parked,
+                            lp.parks.wait_parked,
                         );
                         mark_wait_parked!(pi, resume_ip);
                     }
@@ -21864,8 +21850,8 @@ pub(crate) unsafe fn service_sec_image(
                     &nt_handler,
                     badge,
                     live_top_badges(&nt_handler),
-                    crash_parked,
-                    wait_parked,
+                    lp.parks.crash_parked,
+                    lp.parks.wait_parked,
                 );
                 mark_wait_parked!(pi, resume_ip);
                 let _ = pump_hosted_io_and_redrive_driver_starts(
@@ -21889,8 +21875,8 @@ pub(crate) unsafe fn service_sec_image(
                     &nt_handler,
                     badge,
                     live_top_badges(&nt_handler),
-                    crash_parked,
-                    wait_parked,
+                    lp.parks.crash_parked,
+                    lp.parks.wait_parked,
                 );
                 mark_wait_parked!(pi, resume_ip);
                 let _ = pump_hosted_io_and_redrive_driver_starts(
@@ -21975,8 +21961,8 @@ pub(crate) unsafe fn service_sec_image(
                         &nt_handler,
                         badge,
                         live_top_badges(&nt_handler),
-                        crash_parked,
-                        wait_parked,
+                        lp.parks.crash_parked,
+                        lp.parks.wait_parked,
                     );
                     mark_wait_parked!(pi, resume_ip);
                 }
@@ -22003,8 +21989,8 @@ pub(crate) unsafe fn service_sec_image(
                         &nt_handler,
                         badge,
                         live_top_badges(&nt_handler),
-                        crash_parked,
-                        wait_parked,
+                        lp.parks.crash_parked,
+                        lp.parks.wait_parked,
                     );
                     mark_wait_parked!(pi, resume_ip);
                     // The manager may have reached terminal CLOSE between the pre-reply pump and
@@ -22029,8 +22015,8 @@ pub(crate) unsafe fn service_sec_image(
                     &nt_handler,
                     badge,
                     live_top_badges(&nt_handler),
-                    crash_parked,
-                    wait_parked,
+                    lp.parks.crash_parked,
+                    lp.parks.wait_parked,
                 );
                 mark_wait_parked!(pi, resume_ip);
                 // Cancellation can complete inside the handler's manager pump. Redrive every
@@ -22287,6 +22273,10 @@ pub(crate) unsafe fn service_sec_image(
         print_str(b"[mup-provider-gate] terminal service-loop failure\n");
         park();
     }
+    let LoopState {
+        exit: LoopExit { stop, stop_ssn, service_loop_exit_site, service_loop_exit_reason, iters, dbgsvc, .. },
+        parks: Parks { crash_parked, wait_parked, .. },
+    } = lp;
     // One terminal receipt, before checkpointing can obscure the branch that ended the
     // serialized loop. Every field below is an observation; no owner or dirty bit is consumed.
     let ingress_hold = unsafe {
