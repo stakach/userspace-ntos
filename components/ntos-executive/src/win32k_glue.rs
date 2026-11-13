@@ -46,6 +46,7 @@ pub(crate) use pending_dispatch::{
     TakenRootIngressDispatch,
     take_pending_root_ingress_dispatch, restore_pending_root_ingress_dispatch,
     PendingServiceWaitDispatch, ServiceWaitYield, take_pending_service_wait_dispatch,
+    KernelJobPublication, park_kernel_job_publication, restore_kernel_job_publication,
     restore_pending_service_wait_dispatch,
     PendingRootMaintenanceDispatch, RootMaintenanceYield, take_pending_root_maintenance_dispatch,
     pending_root_maintenance_dispatch_is_some,
@@ -7587,7 +7588,7 @@ pub(crate) unsafe fn win32k_dispatch_ps_provider_command(
         let result = KernelJobResult::new();
         let native = crate::initial_system_driver_caller();
         let mut entered = false;
-        let mut execute = |mut channel: crate::spawn_hosts::PumpChannel, lane| {
+        let mut execute = |mut channel: crate::spawn_hosts::PumpChannel, lane, publication| {
             // The client fields describe the attached Ps target. The retained kernel
             // activation, not that terminating client's Reply, owns execution and waits.
             channel.logical_caller = None;
@@ -7595,7 +7596,7 @@ pub(crate) unsafe fn win32k_dispatch_ps_provider_command(
             let caller = capture_ps_retirement_job(
                 &channel, lane, native, &result, client,
             )?;
-            run_kernel_job(caller, &result)
+            run_kernel_job(caller, &result, publication)
         };
         let Some(dispatch_id) = next_win32k_dispatch_id() else {
             return (0xC000_009Au64, false).into();
@@ -7744,12 +7745,12 @@ unsafe fn win32k_dispatch_kernel_job_observed(
     let native = crate::initial_system_driver_caller();
     let mut client = executive_win32k_client();
     client.pi = 0;
-    let mut execute = |mut channel: crate::spawn_hosts::PumpChannel, lane| {
+    let mut execute = |mut channel: crate::spawn_hosts::PumpChannel, lane, publication| {
         channel.client_pi = 0;
         channel.client_generation = 0;
         channel.caps.provider_wait = true;
         let caller = capture_kernel_job(&channel, lane, native, &result)?;
-        run_kernel_job(caller, &result)
+        run_kernel_job(caller, &result, publication)
     };
     let Some(dispatch_id) = next_win32k_dispatch_id() else {
         return (0xC000_009Au64, false).into();
@@ -7930,6 +7931,7 @@ unsafe fn win32k_dispatch_wide_observed_inner(
     entered: Option<&mut bool>,
     kernel_job: Option<&mut dyn FnMut(
         crate::spawn_hosts::PumpChannel, nt_component_suspension::LaneHandle,
+        KernelJobPublication,
     ) -> Result<(u64, bool), u32>>,
     dispatch_return_out: Option<&mut Option<nt_user_callback::DispatchReturn>>,
     mut suspended_out: Option<&mut bool>,
@@ -8139,7 +8141,11 @@ unsafe fn win32k_dispatch_wide_observed_inner(
         *entered = true;
     }
     if let Some(execute) = kernel_job {
-        let result = execute(ch, lane);
+        // The job may lend this publication to its own inline source terminal and take it
+        // back before continuing; every return leaves the displaced publication current.
+        let result = execute(ch, lane, KernelJobPublication {
+            dispatch, client, previous: previous_dispatch,
+        });
         core::ptr::write(
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), previous_dispatch,
         );

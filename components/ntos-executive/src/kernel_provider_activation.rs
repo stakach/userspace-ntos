@@ -13,6 +13,9 @@ mod bootstrap;
 mod event;
 #[path = "kernel_provider_resume.rs"]
 pub(super) mod resume;
+#[path = "kernel_provider_source_work.rs"]
+mod source_work;
+pub(crate) use source_work::source_work_yield;
 #[path = "kernel_provider_terminal.rs"]
 mod terminal;
 #[path = "kernel_provider_wait_work.rs"]
@@ -78,38 +81,102 @@ pub(crate) unsafe fn capture_kernel_job(
     })
 }
 
-/// Run the issued request once. Runtime readiness owns every selected resume thereafter.
-/// A physical wall is returned as incomplete, leaving both the activation and caller roots held.
+/// Run the issued request once. Runtime readiness owns every selected resume thereafter, and
+/// this runner owns a stop on the job's own inline source terminal: it lends the publication,
+/// drives that terminal, and continues the same receive half once. A stop that cannot be
+/// resumed is returned as incomplete, leaving both the activation and caller roots held.
 pub(crate) unsafe fn run_kernel_job(
     caller: KernelProviderCaller,
     result: &KernelJobResult,
+    publication: win32k_glue::KernelJobPublication,
 ) -> Result<(u64, bool), u32> {
-    let outcome = run_issued_kernel_job(caller)?;
+    use nt_user_host::provider_kernel_pump::KernelSourceTerminal;
+    use nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome as Stop;
+    let outcome = run_issued_kernel_job(caller).map_err(|status| {
+        source_work::trace_stop(caller, b"entry", status);
+        status
+    })?;
     if let Some(receipt) = outcome.receipt {
         deliver_driver_entry_completion(receipt)?;
     }
     if let Some(status) = result.returned() { return Ok((u64::from(status), true)); }
-    if !matches!(outcome.stop,
-        nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome::WaitCaptured(_))
-    {
+    if !matches!(outcome.stop, Stop::WaitCaptured(_) | Stop::SourceWorkYielded) {
+        source_work::trace_stop(caller, b"initial-stop", nt_process::STATUS_UNSUCCESSFUL);
         return Ok((u64::from(nt_process::STATUS_UNSUCCESSFUL), false));
     }
     let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
-    if handler.is_null() { return Err(nt_status::NtStatus::DEVICE_NOT_READY.raw() as u32); }
+    if handler.is_null() {
+        source_work::trace_stop(caller, b"no-handler", nt_status::NtStatus::DEVICE_NOT_READY.raw() as u32);
+        return Err(nt_status::NtStatus::DEVICE_NOT_READY.raw() as u32);
+    }
     let _message = crate::ipc_message::SavedMessageBuffer::capture();
     use spawn_hosts::shared_ingress::owner::runtime as ingress;
+    // Present only while this job has lent its publication to its own source terminal. The
+    // page is copied before any other owner below can publish over it.
+    let mut parked = match outcome.stop {
+        Stop::SourceWorkYielded => match source_work::park(caller, publication) {
+            Ok(owner) => Some(owner),
+            Err(status) => {
+                source_work::trace_stop(caller, b"park-refused", status);
+                return Ok((u64::from(nt_process::STATUS_UNSUCCESSFUL), false));
+            }
+        },
+        _ => None,
+    };
+    let mut parked_passes = 0u64;
     loop {
         // Every call below ends its handler/activation borrow before entering a native provider.
         component_resume::run_outer(handler);
         redrive_ready_completions();
         if let Some(status) = result.returned() { return Ok((u64::from(status), true)); }
-        let stop = (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller)?.stopped_outcome()?;
-        if matches!(stop,
-            nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome::Walled
-            | nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome::CallbackSuspended
-            | nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome::LpcWaitSuspended)
-        {
+        let stop = (&*core::ptr::addr_of!(ACTIVATIONS)).recipient(caller)?.stopped_outcome()
+            .map_err(|status| {
+                source_work::trace_stop(caller, b"unobserved-stop", status);
+                status
+            })?;
+        if matches!(stop, Stop::Walled | Stop::CallbackSuspended | Stop::LpcWaitSuspended) {
+            source_work::trace_stop(caller, b"stop", nt_process::STATUS_UNSUCCESSFUL);
             return Ok((u64::from(nt_process::STATUS_UNSUCCESSFUL), false));
+        }
+        if matches!(stop, Stop::SourceWorkYielded) {
+            // Only this runner parks the stop it observed; any other source-work stop has no
+            // lent publication and keeps the existing incomplete outcome.
+            let Some(owner) = parked.take() else {
+                source_work::trace_stop(caller, b"unparked-source-work", nt_process::STATUS_UNSUCCESSFUL);
+                return Ok((u64::from(nt_process::STATUS_UNSUCCESSFUL), false));
+            };
+            match owner.terminal() {
+                KernelSourceTerminal::Acknowledged => {
+                    parked_passes = 0;
+                    let resumed = source_work::resume(caller, owner, publication)
+                        .map_err(|status| {
+                            source_work::trace_stop(caller, b"resume", status);
+                            status
+                        })?;
+                    if matches!(resumed.stop, Stop::SourceWorkYielded) {
+                        match source_work::park(caller, publication) {
+                            Ok(owner) => parked = Some(owner),
+                            Err(status) => {
+                                source_work::trace_stop(caller, b"park-refused", status);
+                                return Ok((u64::from(nt_process::STATUS_UNSUCCESSFUL), false));
+                            }
+                        }
+                    }
+                    if let Some(receipt) = resumed.receipt {
+                        deliver_driver_entry_completion(receipt)?;
+                    }
+                    continue;
+                }
+                KernelSourceTerminal::Indeterminate => {
+                    source_work::trace_stop(caller, b"terminal-indeterminate", nt_process::STATUS_UNSUCCESSFUL);
+                    return Ok((u64::from(nt_process::STATUS_UNSUCCESSFUL), false));
+                }
+                KernelSourceTerminal::Unacknowledged => {
+                    parked_passes += 1;
+                    owner.trace_waiting(caller, parked_passes);
+                    parked = Some(owner);
+                }
+            }
         }
         if redrive_nested_hosted_file_work() { continue; }
         {
@@ -140,6 +207,7 @@ pub(crate) unsafe fn run_kernel_job(
                 }
                 // Another delivery owns the gate. Keep the activation and
                 // original caller held; a receive here could sleep forever.
+                source_work::trace_stop(caller, b"pending-delivery", nt_process::STATUS_PENDING);
                 return Ok((u64::from(nt_process::STATUS_PENDING), false));
             }
         }
@@ -468,7 +536,17 @@ unsafe fn run_issued_kernel_job(
             caller, attempt, channel, Some(result), None, status,
         ));
     }
-    let result = receive_driver_entry_yields(&scope, caller, None, result)?;
+    finish_entered_kernel_job(&scope, caller, result)
+}
+
+/// Shared tail of every initial-origin entry: service scheduler yields, then classify the
+/// observed stop and, for a real return, record its completion from retained evidence.
+unsafe fn finish_entered_kernel_job(
+    scope: &driver_launch::ComponentSchedulerScope,
+    caller: KernelProviderCaller,
+    result: spawn_hosts::PumpResult,
+) -> Result<KernelJobOutcome, u32> {
+    let result = receive_driver_entry_yields(scope, caller, None, result)?;
     use nt_user_host::provider_kernel_wait::KernelProviderStoppedOutcome;
     let stop = (&*core::ptr::addr_of!(ACTIVATIONS))
         .recipient(caller)?

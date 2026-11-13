@@ -620,6 +620,46 @@ pub(crate) unsafe fn select_and_restore_shared_resume_snapshot(
     (selected, restored)
 }
 
+/// The dispatcher's singleton publication for one entered kernel job. `previous` is the
+/// publication this job displaced at entry; the job may lend the page only when that is empty.
+#[derive(Clone, Copy)]
+pub(crate) struct KernelJobPublication {
+    pub dispatch: nt_user_callback::DispatchContext,
+    pub client: Win32kClientContext,
+    pub previous: nt_user_callback::DispatchContext,
+}
+
+/// Lend the singleton page while this job's own service Call is parked on a source terminal.
+/// The exact full page is copied first; a refusal changes neither the page nor the dispatch.
+pub(crate) unsafe fn park_kernel_job_publication(
+    job: KernelJobPublication,
+) -> Option<SharedResumeSnapshot> {
+    let current = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    if job.dispatch.dispatch_id == 0 || current != job.dispatch || job.previous.dispatch_id != 0 {
+        return None;
+    }
+    let page = try_capture_exact_shared_resume_snapshot(job.dispatch, job.client)?;
+    core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), job.previous);
+    Some(page)
+}
+
+/// Return the lent page to its parked job before that job's receive half continues.
+pub(crate) unsafe fn restore_kernel_job_publication(
+    job: KernelJobPublication,
+    page: SharedResumeSnapshot,
+) -> bool {
+    if core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH)) != job.previous
+        || !matches!(
+            restore_shared_resume_snapshot_effect(page, job.dispatch, job.client),
+            SharedResumeRestoreEffect::Applied(_)
+        )
+    {
+        return false;
+    }
+    core::ptr::write(core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH), job.dispatch);
+    true
+}
+
 pub(crate) unsafe fn take_pending_receive_dispatch() -> Option<PendingReceiveDispatch> {
     core::ptr::replace(core::ptr::addr_of_mut!(RECEIVE_PENDING_DISPATCH), None)
 }

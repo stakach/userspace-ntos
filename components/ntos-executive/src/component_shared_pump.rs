@@ -861,6 +861,15 @@ pub(super) unsafe fn receive(
                 Ok(None) => {}
                 Err(_) => panic!("service-wait yield lost its exact physical ownership"),
             }
+            // A kernel job has no hosted Reply to leave at the root, so it cannot take the
+            // yield above. Its own retained activation owns the same stop when the parked
+            // service is an inline source terminal that must re-enter this provider.
+            if let Some(yielded) =
+                crate::service_sec_image::kernel_provider_activation::source_work_yield(ch)
+            {
+                trace_ps_create_receive(ch, b"kernel-source-work-yield", Some(route));
+                return PumpMessage::hosted_service_wait_yield(yielded);
+            }
             match crate::win32k_glue::prepare_root_maintenance_yield(ch) {
                 Ok(Some(yielded)) => {
                     trace_ps_create_receive(ch, b"root-maintenance-yield", Some(route));

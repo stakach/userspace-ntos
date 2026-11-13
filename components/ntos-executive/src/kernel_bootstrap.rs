@@ -305,6 +305,41 @@ impl KernelJobRecipient {
         Ok((channel, attempt, previous))
     }
 
+    /// An execution entered by a selected wait returns through that frame's terminal owner.
+    pub(super) fn resumed_from_wait(&self) -> bool {
+        self.wait.resumed_from_wait()
+    }
+
+    /// Claim the one receive continuation of a stop on this job's own inline source terminal.
+    /// Refusal by the terminal state leaves the observed stop and its pump result unchanged.
+    pub(super) unsafe fn begin_receive_after_source_work(
+        &mut self,
+        caller: KernelProviderCaller,
+        terminal: nt_user_host::provider_kernel_pump::KernelSourceTerminal,
+    ) -> Result<
+        (
+            spawn_hosts::PumpChannel,
+            KernelProviderPumpAttempt,
+            spawn_hosts::PumpResult,
+        ),
+        u32,
+    > {
+        let previous = self
+            .observation
+            .filter(|pump| pump.service_wait_yield.is_some())
+            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        let channel = self.execution_channel(caller)?;
+        self.reserve_capture_refusal(caller, &channel)?;
+        let attempt = match self.wait.begin_receive_after_source_work(terminal) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                self.refusal = KernelCaptureRefusalSlot::Available;
+                return Err(pump_error(error));
+            }
+        };
+        Ok((channel, attempt, previous))
+    }
+
     pub(super) fn observe(
         &mut self,
         attempt: &mut KernelProviderPumpAttempt,

@@ -254,6 +254,28 @@ unsafe fn optimize(lock: &LockLease, mut old: u64) {
     }
 }
 
+static WAIT_TRACES: AtomicU64 = AtomicU64::new(0);
+
+/// Bounded evidence of which lane blocks on which push lock. The first sixteen waits are
+/// reported, then only power-of-two samples, so an early burst cannot hide a later stall.
+unsafe fn trace_wait(address: u64, word: u64) {
+    let sample = WAIT_TRACES.fetch_add(1, Ordering::Relaxed) + 1;
+    if sample > 16 && !sample.is_power_of_two() {
+        return;
+    }
+    let image_rva = address.checked_sub(WIN32K_CODE_VA).filter(|rva| *rva < 1 << 28).unwrap_or(0);
+    let ids = current_lane_ids();
+    print_str(b"[win32k-pushlock-wait] sample/lock/image-rva/word/ethread/pi/tid=");
+    for value in [
+        sample, address, image_rva, word, current_ethread(),
+        ids.client_pi.load(Ordering::Relaxed), ids.thread_id.load(Ordering::Relaxed),
+    ] {
+        print_str(b"/");
+        print_hex_u64(value);
+    }
+    print_str(b"\n");
+}
+
 unsafe fn acquire(address: u64, shared: bool) {
     let lock = LockLease::capture(address);
     let mut node = 0;
@@ -309,6 +331,7 @@ unsafe fn acquire(address: u64, shared: bool) {
                             optimize(&lock, plan.new);
                         }
                         if waiter(node).flags.fetch_and(!2, Ordering::AcqRel) & 2 != 0 {
+                            trace_wait(address, lock.atomic().load(Ordering::Acquire));
                             let status = s_ke_wait_for_single_object(node, 28, 0, 0, 0);
                             if status != 0 {
                                 crate::provider_bugcheck::report(

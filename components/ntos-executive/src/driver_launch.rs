@@ -67806,6 +67806,15 @@ pub(crate) unsafe fn redrive_nested_win32k_source_work(handler: *mut ExecNtHandl
     ioctl || pnp || fsd
 }
 
+pub(crate) unsafe fn win32k_source_ioctl_inline_terminal(
+    route: nt_component_suspension::peer_registry::PeerRoute,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+) -> Option<nt_user_host::provider_kernel_pump::KernelSourceTerminal> {
+    hosted_kernel_win32k_source_ioctl::inline_terminal_state(route, dispatch, reply, token)
+}
+
 pub(crate) unsafe fn select_nested_win32k_source_ioctl_terminal(
     route: nt_component_suspension::peer_registry::PeerRoute,
     dispatch: nt_component_suspension::LaneDispatchIdentity,

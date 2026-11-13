@@ -2724,6 +2724,30 @@ pub(crate) unsafe fn component_pump_continue_service_wait(
     component_pump_continue_receive_half(ch, previous, false, false, false)
 }
 
+/// Continue only the receive half of a kernel job whose own service Call was parked on an
+/// inline source terminal. Its retained activation has already claimed this one entry after
+/// that terminal's acknowledgement; neither the request nor the service Reply is sent again.
+pub(crate) unsafe fn component_pump_continue_kernel_source_work(
+    ch: &PumpChannel,
+    previous: &PumpResult,
+) -> Result<PumpResult, u32> {
+    let current = previous.service_wait_yield.is_some_and(|wait| {
+        use shared_ingress::owner::runtime;
+        previous.reply_cap == wait.reply
+            && ch.reply_cap == wait.reply
+            && wait.route.identity().lane == wait.dispatch.lane()
+            && runtime::channel_route(ch).ok().flatten() == Some(wait.route)
+            && runtime::dispatch(wait.route).ok() == Some(wait.dispatch)
+            && runtime::current_reply(wait.route).ok() == Some(wait.reply)
+    });
+    if !previous.is_service_wait_yield() || ch.kernel_caller.is_none()
+        || ch.caps.kind != ReqKind::Syscall || !current
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    component_pump_continue_receive_half(ch, previous, false, false, false)
+}
+
 /// Continue only the receive half of the exact maintenance-parked syscall. The root owns its
 /// original Reply and physical hold until its typed lane and shared snapshot are restored.
 pub(crate) unsafe fn component_pump_continue_root_maintenance(

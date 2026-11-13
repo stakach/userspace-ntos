@@ -1423,6 +1423,25 @@ impl Work {
     }
 }
 
+/// Read-only progress of the exact retained inline terminal. `None` means this identity has
+/// no inline terminal to wait for: the Work is unentered, Pending, discarding, or retired.
+pub(crate) unsafe fn inline_terminal_state(
+    route: Route,
+    dispatch: nt_component_suspension::LaneDispatchIdentity,
+    reply: u64,
+    token: u64,
+) -> Option<nt_user_host::provider_kernel_pump::KernelSourceTerminal> {
+    use nt_user_host::provider_kernel_pump::KernelSourceTerminal as Terminal;
+    let work = (&*core::ptr::addr_of!(WORK)).iter().flatten().find(|work| {
+        work.route == route && work.dispatch == dispatch
+            && work.reply == reply && work.token == token
+    })?;
+    if work.pending || work.discarding { return None; }
+    if work.indeterminate { return Some(Terminal::Indeterminate); }
+    if work.terminal_acknowledged { return Some(Terminal::Acknowledged); }
+    work.terminal.is_some().then_some(Terminal::Unacknowledged)
+}
+
 /// Select the exact retained inline terminal before lending the parent's shared page. The
 /// selection owns Work identity, not a Vec index that can be recycled while the parent parks.
 pub(crate) unsafe fn next_nested_terminal_selection(
