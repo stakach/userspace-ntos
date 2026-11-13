@@ -13269,28 +13269,16 @@ static ROOT_ADD_DEVICE_EXCLUSIVE: AtomicBool = AtomicBool::new(false);
 static ROOT_QUEUED_CALLBACK_EXCLUSIVE: AtomicBool = AtomicBool::new(false);
 static ROOT_QUEUED_CALLBACK_RETRY_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
 static ROOT_QUEUED_CALLBACK_FAILURE_TRACE: AtomicU64 = AtomicU64::new(0);
-static ROOT_QUEUED_CALLBACK_REFRESH_TRACE: AtomicU64 = AtomicU64::new(0);
 
 /// A queue claim owns its root turn across every Reply its resumed parent refreshes. Follow
 /// only the exact selector that claim's own row yields now; the turn keeps its deferred
-/// ingress tickets, retry deadline, and single retirement watch. The bounded receipt records
-/// each copied identity pair so a boot shows the transition that used to end the root loop.
+/// ingress tickets, retry deadline, and single retirement watch.
 unsafe fn refresh_queued_callback_turn_witness(turn: &mut RootQueuedCallbackTurn) -> bool {
     let retired = turn.owner();
     let Some(current) = crate::driver_launch::queued_callback_refreshed_selector(retired) else {
         return true;
     };
-    if turn.advance_owner(retired, current).is_err() { return false; }
-    if ROOT_QUEUED_CALLBACK_REFRESH_TRACE.fetch_add(1, Ordering::Relaxed) < 16 {
-        use core::fmt::Write;
-        let mut record = nt_printf::record::RecordBuffer::<768>::new();
-        let _ = writeln!(record,
-            "[queued-callback-root-refresh] retired={:?} current={:?} watch={}",
-            retired.diagnostic_identity(), current.diagnostic_identity(),
-            u8::from(crate::driver_launch::queued_callback_root_watch_present(current)));
-        sel4_rt::print_record(record.bytes());
-    }
-    true
+    turn.advance_owner(retired, current).is_ok()
 }
 
 /// Failure-only root receipt. Selector snapshots are copied identities, never ACK authority.

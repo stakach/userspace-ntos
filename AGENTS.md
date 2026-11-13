@@ -54,15 +54,16 @@ Keep source code files focused and logically structured. Group by component and 
 2. **Verify Plan**: Check in before starting implementation
 3. **Track Progress**: Maintain the issue checklist, native dependencies and status/ownership comments as you go.
 4. **Explain Changes**: High-level summary against each commit
-5. **Document Results**: Add review section to the pull request
+5. **Document Results**: Add a review comment to the issue with what was verified and what remains unproven
 6. **Capture Lessons**: Update `tasks/lessons.md` after corrections
 
-GitHub issues and their comments are the work items. Milestones describe delivery goals; Pull requests hold detailed plans, implementation and verification.
+GitHub issues and their comments are the work items and hold plans, status and verification evidence. Milestones describe delivery goals.
+
+Until the kernel is functional, work directly on `main`: no pull requests and no feature branches. Verify before pushing (focused crate tests and the native build), since CI runs only after the push; if a push breaks CI on `main`, fix forward immediately.
 
 Do not maintain Markdown TODOs, roadmaps, or progress ledgers. Historical plans are archived evidence only; technical design/reference documentation and reusable engineering lessons may remain in the repository.
 
-Github CI should run the crate tests.
-Once crate tests pass, merge the pull request.
+Github CI should run the crate tests on every push to `main`.
 
 ## Core Principles
 
@@ -113,5 +114,4 @@ Treat as constraints. Violate slogans when judgment says so.
 
 - Commit verified increments and remove obsolete machinery when its replacement is integrated.
 - Preserve independent edits and inspect diffs before committing. Push submodule commits before parent commits that reference them; never claim a clean tree without checking.
-- no force pushing, keep commit history in pull requests
-- squash merge pull requests once they are ready
+- no force pushing; push fast-forward only and rebase onto `main` when it has moved
