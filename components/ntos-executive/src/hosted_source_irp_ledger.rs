@@ -2017,6 +2017,14 @@ pub(super) fn service(
             if caller_projections().try_reserve(1).is_err() {
                 return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
             }
+            {
+                // Make room for the terminal ACK receipt while a refusal still fails only
+                // this request; op 13 then records it without allocating.
+                let _durable = crate::allocator::enter_durable();
+                if caller_acks().reserve(allocation.owner, node).is_err() {
+                    return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
+                }
+            }
             let ticket = match ledger().register(allocation) {
                 Ok(ticket) => ticket,
                 Err(SourceIrpLedgerError::Exhausted) => {
@@ -2103,7 +2111,8 @@ pub(super) fn service(
                     && row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)
                     && row.allocation.domain == domain
             }) else {
-                // Only an exact consumed ticket authenticates a duplicate metadata ACK.
+                // Only the exact ticket last consumed on one of this instance's pending
+                // nodes authenticates a duplicate metadata ACK.
                 return if op == 13 && stack_count == 0 && caller_acks()
                     .authenticates(SourceIrpOwner::HostedCaller(instance_index), ticket)
                 {
@@ -2118,7 +2127,7 @@ pub(super) fn service(
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
                 let _durable = crate::allocator::enter_durable();
-                if caller_acks().consume(row.allocation.owner, ticket).is_err() {
+                if caller_acks().consume(row.allocation.owner, row.node, ticket).is_err() {
                     return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
                 }
                 caller_projections().swap_remove(index);

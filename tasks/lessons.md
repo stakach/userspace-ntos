@@ -847,3 +847,9 @@ diagnosis-free failure.
 - Before an index that names an object may be reused, enumerate every place the bare index is stored or carried, starting from each function that turns a handle into the index, not from the reference counters that already exist. A holder nobody counts (a pending I/O row's completion Event index) turns a stuck delivery into a signal on an unrelated object.
 - A reuse delay is a margin, never the argument. For each path state why it holds with a delay of zero: a lease, a counted reference, or an identity re-check after any call that can run other work (user-memory copies included).
 - Ask for the independent review before pushing a lifetime change, and wait for it; do not report a safety argument that only its author has read.
+
+## Bound A Receipt By The Window In Which It Can Be Presented
+- A table that authenticates a repeated acknowledgement must not keep one record per completed operation until teardown. Find who can send the repeat and what that sender must do before it can move on, then key the receipt by the thing it reuses (the provider's pending node), so the table is bounded by concurrency and not by throughput.
+- Do not key the receipt by instance or by thread without checking who else can acknowledge in between. Other provider threads and callbacks nested in the first acknowledgement can complete any number of other operations before the repeat arrives.
+- Reserve the receipt where the operation is admitted. An allocation refused there fails one request; refused at the acknowledgement it leaves a provider that has already freed its memory with nothing to do but bugcheck.
+- A failing allocation's `scope=` names the syscall that was running, not the owner of the memory. Match the size to a doubling series and a workload counter before choosing a fix.
