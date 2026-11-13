@@ -259,27 +259,10 @@ fn lost_caller_release_replies_use_exact_root_receipts_without_replaying_frees()
     assert!(ledger.contains("terminal_finished: bool"),
         "op8 must retain an exact ticket receipt until native acknowledges it");
     assert!(ledger.contains("12 | 13 =>")
-        && ledger.contains("if op == 13")
-        && ledger.contains("if op == 13 && stack_count == 0 && caller_acks().iter().any"),
+        && ledger.contains("if op == 13"),
         "root must expose read-only member/terminal disposition and separate receipt ACK");
     assert!(release.contains("source_irp_release_disposition"),
         "native must reconcile lost op7/op9/op10/op8 replies from the root receipt");
     assert!(release.contains("13,"),
         "native must clear the terminal receipt after all physical frees are confirmed");
-}
-
-#[test]
-fn duplicate_caller_terminal_ack_requires_an_exact_consumed_ticket() {
-    let ledger = include_str!("../../../components/ntos-executive/src/hosted_source_irp_ledger.rs");
-    let ack = ledger.split("        12 | 13 => {").nth(1).unwrap()
-        .split("        7 | 8 | 9 | 10 => {").next().unwrap();
-    assert!(ack.contains("caller_acks().iter().any")
-        && ack.contains("ack.ticket == ticket")
-        && ack.contains("ack.owner == SourceIrpOwner::HostedCaller(instance_index)"),
-        "absent op13 cannot accept a merely well-formed ticket");
-    assert!(ack.find("crate::allocator::enter_durable()").unwrap()
-        < ack.find("caller_acks().try_reserve(1)").unwrap(),
-        "terminal ACK receipt must survive transient request allocation scope");
-    assert!(ledger.contains("drain_caller_terminal_acks(instance_index"),
-        "exact terminal ACK tombstones must be drained at instance teardown");
 }

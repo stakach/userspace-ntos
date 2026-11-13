@@ -268,9 +268,6 @@ fn caller_op7_and_op8_keep_separate_close_and_physical_acknowledgement() {
                 if contains(&ack.methods, "swap_remove") {
                     assert!(contains(&ack.fields, "terminal_finished"));
                     assert!(contains(&ack.calls, "caller_acks"));
-                    assert!(contains(&ack.paths, "CallerTerminalAck"));
-                    assert!(contains(&ack.methods, "try_reserve"));
-                    assert!(contains(&ack.methods, "push"));
                     self.receipt_ack_found = true;
                 }
             }

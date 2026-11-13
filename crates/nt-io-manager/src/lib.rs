@@ -111,6 +111,7 @@ pub mod retained_file_lifecycle_forward;
 pub mod class_service_callback;
 pub mod reverse_class_alias_projection;
 pub mod source_irp_ledger;
+pub mod source_irp_caller_ack;
 pub mod hard_error_verify_device;
 pub mod verify_device_retirement;
 pub mod source_irp_auxiliary;

@@ -17,6 +17,7 @@ use nt_io_manager::source_irp_auxiliary_buffer::{
     classify_source_auxiliary_buffer, matches_captured_buffered_control,
     CapturedBufferedControlOutput, SourceAuxiliaryBufferKind, SourceAuxiliaryBufferRequest,
 };
+use nt_io_manager::source_irp_caller_ack::CallerTerminalAcks;
 use nt_io_manager::source_irp_ledger::{
     SourceIrpAllocation, SourceIrpForwardIdentity, SourceIrpLedger, SourceIrpLedgerError,
     SourceIrpUseTicket,
@@ -35,17 +36,11 @@ static IOREUSE_REFUSAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static IOREUSE_SCSI_SUCCESS_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static SCSI_AFTER_CALLBACK_REFUSAL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static mut CALLER_PROJECTIONS: Option<Vec<CallerProjection>> = None;
-static mut CALLER_ACKS: Option<Vec<CallerTerminalAck>> = None;
+static mut CALLER_ACKS: CallerTerminalAcks = CallerTerminalAcks::new();
 
-#[derive(Clone, Copy)]
-struct CallerTerminalAck {
-    ticket: SourceIrpTicket,
-    owner: SourceIrpOwner,
-}
-
-fn caller_acks() -> &'static mut Vec<CallerTerminalAck> {
-    let slot = unsafe { &mut *core::ptr::addr_of_mut!(CALLER_ACKS) };
-    slot.get_or_insert_with(Vec::new)
+fn caller_acks() -> &'static mut CallerTerminalAcks {
+    // Serialized by the source-IRP ownership lock alongside the caller projections.
+    unsafe { &mut *core::ptr::addr_of_mut!(CALLER_ACKS) }
 }
 
 struct CallerProjection {
@@ -2109,9 +2104,9 @@ pub(super) fn service(
                     && row.allocation.domain == domain
             }) else {
                 // Only an exact consumed ticket authenticates a duplicate metadata ACK.
-                return if op == 13 && stack_count == 0 && caller_acks().iter().any(|ack|
-                    ack.ticket == ticket
-                        && ack.owner == SourceIrpOwner::HostedCaller(instance_index)) {
+                return if op == 13 && stack_count == 0 && caller_acks()
+                    .authenticates(SourceIrpOwner::HostedCaller(instance_index), ticket)
+                {
                     (STATUS_SUCCESS, 0, 0)
                 } else {
                     (STATUS_INVALID_HANDLE, 0, 0)
@@ -2123,10 +2118,9 @@ pub(super) fn service(
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
                 let _durable = crate::allocator::enter_durable();
-                if caller_acks().try_reserve(1).is_err() {
+                if caller_acks().consume(row.allocation.owner, ticket).is_err() {
                     return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
                 }
-                caller_acks().push(CallerTerminalAck { ticket, owner: row.allocation.owner });
                 caller_projections().swap_remove(index);
                 return (STATUS_SUCCESS, 0, 0);
             }
@@ -2420,7 +2414,7 @@ pub(super) fn drain_caller_terminal_acks(instance_index: usize) -> Result<(), nt
         row.allocation.owner == SourceIrpOwner::HostedCaller(instance_index)) {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
-    caller_acks().retain(|ack| ack.owner != SourceIrpOwner::HostedCaller(instance_index));
+    caller_acks().drain_owner(SourceIrpOwner::HostedCaller(instance_index));
     Ok(())
 }
 
