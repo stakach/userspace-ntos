@@ -150,9 +150,12 @@ unsafe fn finish_stopped_wait(
             return Ok(DriverEntryWaitOutcome::WaitCaptured(next));
         }
         KernelProviderStoppedOutcome::Returned(status) => status,
+        // A wait-resumed job never yields source work: its return belongs to this frame's
+        // terminal owner, so the pump preflight leaves that stop to the existing path.
         KernelProviderStoppedOutcome::Walled
         | KernelProviderStoppedOutcome::CallbackSuspended
-        | KernelProviderStoppedOutcome::LpcWaitSuspended => {
+        | KernelProviderStoppedOutcome::LpcWaitSuspended
+        | KernelProviderStoppedOutcome::SourceWorkYielded => {
             return Ok(DriverEntryWaitOutcome::Stopped(result));
         }
     };

@@ -49,6 +49,7 @@ fn observed(reply_cap: u64, mask: u8) -> KernelProviderPumpProgress {
                 provider_wait_suspended: mask & 4 != 0,
                 lpc_wait_suspended: mask & 8 != 0,
                 scheduler_yielded: mask & 16 != 0,
+                source_work_yielded: false,
             },
             if mask == 1 { Some(0) } else { None },
         )
@@ -163,6 +164,7 @@ fn shared_interim_handoff_preserves_caller_but_rejects_old_transport_observation
         provider_wait_suspended: true,
         lpc_wait_suspended: false,
         scheduler_yielded: false,
+        source_work_yielded: false,
     };
     activations
         .recipient_mut(caller)
@@ -255,6 +257,7 @@ fn shared_interim_handoff_preserves_caller_but_rejects_old_transport_observation
         reply_cap: 41,
         provider_wait_suspended: false,
         scheduler_yielded: true,
+        source_work_yielded: false,
         ..wait_facts
     };
     activations
@@ -332,6 +335,7 @@ fn shared_interim_handoff_preserves_caller_but_rejects_old_transport_observation
         provider_wait_suspended: true,
         lpc_wait_suspended: false,
         scheduler_yielded: false,
+        source_work_yielded: false,
     };
     progress
         .observe_current(

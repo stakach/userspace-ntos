@@ -3,7 +3,7 @@
 use crate::provider_kernel_activation::{KernelProviderCaller, KernelProviderWaitCapture};
 use crate::provider_kernel_pump::{
     KernelProviderPumpAttempt, KernelProviderPumpDisposition, KernelProviderPumpFacts,
-    KernelProviderPumpProgress, PumpProgressError,
+    KernelProviderPumpProgress, KernelSourceTerminal, PumpProgressError,
 };
 use nt_component_suspension::{SuspensionResume, TerminalIdentity};
 use nt_process::STATUS_INVALID_PARAMETER;
@@ -26,6 +26,9 @@ pub enum KernelProviderStoppedOutcome {
     Walled,
     CallbackSuspended,
     LpcWaitSuspended,
+    /// The job's own service Call is parked on an inline source terminal. The root owns the
+    /// stopped receive half and may continue it once after that terminal is acknowledged.
+    SourceWorkYielded,
 }
 
 /// The native recipient retains this state alongside its physical channel and pump result.
@@ -93,6 +96,7 @@ impl KernelProviderWaitState {
             Some(Pump::Walled) => Ok(Stop::Walled),
             Some(Pump::CallbackSuspended) => Ok(Stop::CallbackSuspended),
             Some(Pump::LpcWaitSuspended) => Ok(Stop::LpcWaitSuspended),
+            Some(Pump::SourceWorkYielded) => Ok(Stop::SourceWorkYielded),
             _ => Err(STATUS_INVALID_PARAMETER),
         }
     }
@@ -105,6 +109,20 @@ impl KernelProviderWaitState {
         &mut self,
     ) -> Result<KernelProviderPumpAttempt, PumpProgressError> {
         self.progress.begin_receive_after_yield()
+    }
+
+    /// See [`KernelProviderPumpProgress::begin_receive_after_source_work`].
+    pub fn begin_receive_after_source_work(
+        &mut self,
+        terminal: KernelSourceTerminal,
+    ) -> Result<KernelProviderPumpAttempt, PumpProgressError> {
+        self.progress.begin_receive_after_source_work(terminal)
+    }
+
+    /// This execution was entered by a selected provider-wait resume. Its return belongs to
+    /// that frame's terminal owner, not to the initial entry's completion path.
+    pub fn resumed_from_wait(&self) -> bool {
+        self.active_resume.is_some()
     }
 
     pub fn observe(

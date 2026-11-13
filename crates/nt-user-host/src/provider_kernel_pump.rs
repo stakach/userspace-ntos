@@ -16,6 +16,9 @@ pub struct KernelProviderPumpFacts {
     pub provider_wait_suspended: bool,
     pub lpc_wait_suspended: bool,
     pub scheduler_yielded: bool,
+    /// The provider's own service Call is parked on an inline source terminal that must
+    /// re-enter this provider. The root retains the stopped receive half; it is not a wall.
+    pub source_work_yielded: bool,
 }
 
 impl KernelProviderPumpFacts {
@@ -29,6 +32,7 @@ impl KernelProviderPumpFacts {
             && !self.provider_wait_suspended
             && !self.lpc_wait_suspended
             && !self.scheduler_yielded
+            && !self.source_work_yielded
     }
 
     fn classify(
@@ -41,7 +45,8 @@ impl KernelProviderPumpFacts {
             + self.callback_suspended as u8
             + self.provider_wait_suspended as u8
             + self.lpc_wait_suspended as u8
-            + self.scheduler_yielded as u8;
+            + self.scheduler_yielded as u8
+            + self.source_work_yielded as u8;
         if self.reply_cap != expected_cap || outcomes > 1 {
             return Invalid;
         }
@@ -59,6 +64,8 @@ impl KernelProviderPumpFacts {
             LpcWaitSuspended
         } else if self.scheduler_yielded {
             SchedulerYielded
+        } else if self.source_work_yielded {
+            SourceWorkYielded
         } else {
             Walled
         }
@@ -72,6 +79,9 @@ pub enum KernelProviderPumpDisposition {
     ProviderWaitSuspended,
     LpcWaitSuspended,
     SchedulerYielded,
+    /// Stopped in its own retained service Call while an inline source terminal is driven.
+    /// Only `begin_receive_after_source_work` may continue this exact receive half.
+    SourceWorkYielded,
     Walled,
     /// Malformed observation. Ownership remains retained; no automatic replay is permitted.
     Invalid,
@@ -83,6 +93,17 @@ pub enum PumpProgressError {
     NotReady,
     IdentityExhausted,
     WrongAttempt,
+    /// The retained source terminal can never be acknowledged. The stop stays owned.
+    SourceTerminalIndeterminate,
+}
+
+/// What the retained inline source terminal of a yielded activation has reached. The native
+/// source Work is the only authority for this value; a Reply acknowledgement is not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelSourceTerminal {
+    Unacknowledged,
+    Acknowledged,
+    Indeterminate,
 }
 
 /// The exact suspended pump entry, not authority to resume its activation.
@@ -176,6 +197,34 @@ impl KernelProviderPumpProgress {
             return Err(PumpProgressError::NotReady);
         }
         self.begin_entry(self.progress, &NEXT_ATTEMPT)
+    }
+
+    /// Continue the receive half of a job stopped on its own inline source terminal. The
+    /// terminal must be acknowledged first; an unacknowledged or indeterminate terminal leaves
+    /// the observed stop unchanged. One acknowledged terminal grants exactly one entry, and the
+    /// provider's request is never transmitted again.
+    pub fn begin_receive_after_source_work(
+        &mut self,
+        terminal: KernelSourceTerminal,
+    ) -> Result<KernelProviderPumpAttempt, PumpProgressError> {
+        self.begin_receive_after_source_work_with_counter(terminal, &NEXT_ATTEMPT)
+    }
+
+    fn begin_receive_after_source_work_with_counter(
+        &mut self,
+        terminal: KernelSourceTerminal,
+        counter: &AtomicU64,
+    ) -> Result<KernelProviderPumpAttempt, PumpProgressError> {
+        if self.disposition() != Some(KernelProviderPumpDisposition::SourceWorkYielded) {
+            return Err(PumpProgressError::NotReady);
+        }
+        match terminal {
+            KernelSourceTerminal::Unacknowledged => Err(PumpProgressError::NotReady),
+            KernelSourceTerminal::Indeterminate => {
+                Err(PumpProgressError::SourceTerminalIndeterminate)
+            }
+            KernelSourceTerminal::Acknowledged => self.begin_entry(self.progress, counter),
+        }
     }
 
     fn begin_entry(

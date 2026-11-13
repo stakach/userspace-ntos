@@ -15,6 +15,7 @@ fn facts(mask: u8) -> KernelProviderPumpFacts {
         provider_wait_suspended: mask & 4 != 0,
         lpc_wait_suspended: mask & 8 != 0,
         scheduler_yielded: mask & 16 != 0,
+        source_work_yielded: mask & 32 != 0,
     }
 }
 
@@ -589,4 +590,215 @@ fn stale_prepared_reservation_cannot_commit_after_repark() {
     progress.observe(&mut attempt, facts(4), None).unwrap();
     let current = progress.provider_wait_observation(CAP).unwrap();
     progress.commit_provider_wait_resume(current, &stale);
+}
+
+fn source_work_progress() -> (KernelProviderPumpProgress, KernelProviderPumpAttempt) {
+    let mut progress = KernelProviderPumpProgress::new(CAP).unwrap();
+    let mut first = progress.begin_initial().unwrap();
+    assert_eq!(
+        progress.observe(&mut first, facts(32), None),
+        Ok(KernelProviderPumpDisposition::SourceWorkYielded)
+    );
+    (progress, first)
+}
+
+/// Issue #379: a job stopped on its own inline source terminal is an owned stop, not a wall.
+#[test]
+fn inline_source_work_stop_is_owned_and_distinct_from_a_wall() {
+    assert_eq!(
+        observe_once(facts(32), None),
+        KernelProviderPumpDisposition::SourceWorkYielded
+    );
+    assert_eq!(observe_once(facts(0), None), KernelProviderPumpDisposition::Walled);
+    assert!(!facts(32).is_return(CAP));
+    // A source yield never carries a return status and never combines with another stop.
+    assert_eq!(
+        observe_once(facts(32), Some(0)),
+        KernelProviderPumpDisposition::Invalid
+    );
+    for other in [1, 2, 4, 8, 16] {
+        assert_eq!(
+            observe_once(facts(32 | other), (other == 1).then_some(0)),
+            KernelProviderPumpDisposition::Invalid,
+            "other={other}"
+        );
+    }
+}
+
+#[test]
+fn source_work_receive_waits_for_the_acknowledged_terminal_then_enters_exactly_once() {
+    let (mut progress, mut previous) = source_work_progress();
+    let observed = progress.progress;
+    // The terminal has not been acknowledged: the stop stays owned and unchanged.
+    for _ in 0..2 {
+        assert_eq!(
+            progress
+                .begin_receive_after_source_work(KernelSourceTerminal::Unacknowledged)
+                .unwrap_err(),
+            PumpProgressError::NotReady
+        );
+        assert_eq!(progress.progress, observed);
+    }
+    let mut receive = progress
+        .begin_receive_after_source_work(KernelSourceTerminal::Acknowledged)
+        .unwrap();
+    assert!(matches!(progress.progress, Progress::Invoking(_)));
+    assert_eq!(progress.disposition(), None);
+    // Exactly once: neither the acknowledged terminal nor any other entry reopens it.
+    assert_eq!(
+        progress
+            .begin_receive_after_source_work(KernelSourceTerminal::Acknowledged)
+            .unwrap_err(),
+        PumpProgressError::NotReady
+    );
+    assert_eq!(progress.begin_initial().unwrap_err(), PumpProgressError::NotReady);
+    assert_eq!(
+        progress.begin_receive_after_yield().unwrap_err(),
+        PumpProgressError::NotReady
+    );
+    assert_eq!(
+        progress.observe(&mut previous, facts(1), Some(0)),
+        Err(PumpProgressError::WrongAttempt)
+    );
+    assert_eq!(
+        progress.observe(&mut receive, facts(1), Some(0x1234)),
+        Ok(KernelProviderPumpDisposition::Returned(0x1234))
+    );
+}
+
+#[test]
+fn returned_source_work_resume_is_never_replayed() {
+    let (mut progress, _) = source_work_progress();
+    let mut receive = progress
+        .begin_receive_after_source_work(KernelSourceTerminal::Acknowledged)
+        .unwrap();
+    progress.observe(&mut receive, facts(1), Some(0)).unwrap();
+    let returned = progress.progress;
+    for terminal in [
+        KernelSourceTerminal::Unacknowledged,
+        KernelSourceTerminal::Acknowledged,
+        KernelSourceTerminal::Indeterminate,
+    ] {
+        assert!(progress.begin_receive_after_source_work(terminal).is_err());
+        assert_eq!(progress.progress, returned);
+    }
+    assert_eq!(
+        progress.disposition(),
+        Some(KernelProviderPumpDisposition::Returned(0))
+    );
+    assert_eq!(
+        progress.observe(&mut receive, facts(1), Some(0)),
+        Err(PumpProgressError::WrongAttempt)
+    );
+}
+
+#[test]
+fn dropped_source_work_receive_ticket_does_not_restore_the_yield() {
+    let (mut progress, _) = source_work_progress();
+    let receive = progress
+        .begin_receive_after_source_work(KernelSourceTerminal::Acknowledged)
+        .unwrap();
+    let entered = progress.progress;
+    drop(receive);
+    assert_eq!(progress.progress, entered);
+    assert_eq!(
+        progress
+            .begin_receive_after_source_work(KernelSourceTerminal::Acknowledged)
+            .unwrap_err(),
+        PumpProgressError::NotReady
+    );
+}
+
+#[test]
+fn consecutive_source_work_stops_each_require_their_own_acknowledged_terminal() {
+    let (mut progress, _) = source_work_progress();
+    let mut receive = progress
+        .begin_receive_after_source_work(KernelSourceTerminal::Acknowledged)
+        .unwrap();
+    assert_eq!(
+        progress.observe(&mut receive, facts(32), None),
+        Ok(KernelProviderPumpDisposition::SourceWorkYielded)
+    );
+    assert_eq!(
+        progress
+            .begin_receive_after_source_work(KernelSourceTerminal::Unacknowledged)
+            .unwrap_err(),
+        PumpProgressError::NotReady
+    );
+    let mut second = progress
+        .begin_receive_after_source_work(KernelSourceTerminal::Acknowledged)
+        .unwrap();
+    assert_ne!(second.nonce, receive.nonce);
+    assert_eq!(
+        progress.observe(&mut second, facts(1), Some(0)),
+        Ok(KernelProviderPumpDisposition::Returned(0))
+    );
+}
+
+#[test]
+fn a_wall_and_every_other_stop_refuse_the_source_work_receive() {
+    for mask in [0u8, 1, 2, 4, 8, 16] {
+        let mut progress = KernelProviderPumpProgress::new(CAP).unwrap();
+        // Unentered.
+        assert_eq!(
+            progress
+                .begin_receive_after_source_work(KernelSourceTerminal::Acknowledged)
+                .unwrap_err(),
+            PumpProgressError::NotReady
+        );
+        let mut attempt = progress.begin_initial().unwrap();
+        // Entered but unobserved.
+        assert_eq!(
+            progress
+                .begin_receive_after_source_work(KernelSourceTerminal::Acknowledged)
+                .unwrap_err(),
+            PumpProgressError::NotReady
+        );
+        progress
+            .observe(&mut attempt, facts(mask), (mask == 1).then_some(0))
+            .unwrap();
+        let observed = progress.progress;
+        assert_eq!(
+            progress
+                .begin_receive_after_source_work(KernelSourceTerminal::Acknowledged)
+                .unwrap_err(),
+            PumpProgressError::NotReady,
+            "mask={mask}"
+        );
+        assert_eq!(progress.progress, observed, "mask={mask}");
+    }
+}
+
+#[test]
+fn an_indeterminate_source_terminal_retains_the_stop_and_never_enters() {
+    let (mut progress, _) = source_work_progress();
+    let observed = progress.progress;
+    assert_eq!(
+        progress
+            .begin_receive_after_source_work(KernelSourceTerminal::Indeterminate)
+            .unwrap_err(),
+        PumpProgressError::SourceTerminalIndeterminate
+    );
+    assert_eq!(progress.progress, observed);
+    assert_eq!(
+        progress.disposition(),
+        Some(KernelProviderPumpDisposition::SourceWorkYielded)
+    );
+}
+
+#[test]
+fn source_work_receive_identity_exhaustion_preserves_the_owned_stop() {
+    let (mut progress, _) = source_work_progress();
+    let observed = progress.progress;
+    let counter = AtomicU64::new(u64::MAX);
+    assert_eq!(
+        progress
+            .begin_receive_after_source_work_with_counter(
+                KernelSourceTerminal::Acknowledged,
+                &counter,
+            )
+            .unwrap_err(),
+        PumpProgressError::IdentityExhausted
+    );
+    assert_eq!(progress.progress, observed);
 }

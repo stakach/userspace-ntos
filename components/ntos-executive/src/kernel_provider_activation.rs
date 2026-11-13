@@ -849,6 +849,7 @@ unsafe fn observe_driver_entry_pump(
         provider_wait_suspended: result.provider_wait_suspended(),
         lpc_wait_suspended: result.lpc_wait_suspended,
         scheduler_yielded: result.scheduler_yielded,
+        source_work_yielded: result.service_wait_yield.is_some(),
     };
     let status = facts.is_return(current.reply_cap).then(|| {
         let offset = (&*core::ptr::addr_of!(ACTIVATIONS))

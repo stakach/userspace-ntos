@@ -59,6 +59,7 @@ fn facts(reply_cap: u64, completed: bool) -> KernelProviderPumpFacts {
         provider_wait_suspended: !completed,
         lpc_wait_suspended: false,
         scheduler_yielded: false,
+        source_work_yielded: false,
     }
 }
 
