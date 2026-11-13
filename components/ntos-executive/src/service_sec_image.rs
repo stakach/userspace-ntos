@@ -13,6 +13,9 @@ use loop_state::{Diag, Images, Ingress, LoopExit, LoopState, Message, Parks, Pro
 mod loop_receive;
 #[path = "executor/flow.rs"]
 mod loop_flow;
+#[path = "executor/syscall.rs"]
+mod loop_syscall;
+use loop_syscall::SyscallOutcome;
 use loop_flow::QueuedCallbackPark;
 use core::ops::ControlFlow;
 #[path = "hosted_quiesce.rs"]
@@ -14820,7 +14823,6 @@ pub(crate) unsafe fn service_sec_image(
                     win32k_glue::UserCallbackReturnReadiness::Missing => {}
                 }
             }
-            let mut result: u64;
             // DIAG (credential frontier): once the injected VK_RETURN has been delivered, trace
             // winlogon's NATIVE (non-win32k) syscalls — that is the WM_COMMAND(IDOK) ->
             // LogonDialogProc -> DoLogon -> DoLoginTasks -> ConnectToLsa/LsaLogonUser tail.
@@ -14886,73 +14888,7 @@ pub(crate) unsafe fn service_sec_image(
             } else {
                 None
             };
-            let mut handled = true;
-            // Set by an accepted interactive milestone that parks the caller instead of replying.
-            let mut wl_milestone_park = false;
-            // A blocking GetMessage park must not end the boot; the service loop keeps running.
-            // (Phase 3: the `routed_win32k` / `routed_lpc` / `routed_csr` flags that used to live
-            // here are GONE. They existed solely to steer this syscall's reply away from the legacy
-            // `reply_to` — which a nested win32k / SM-loop / CSR-thread fault had clobbered — and
-            // onto the caller's bound `REPLY_MAIN`. Every reply takes the bound object now, so there
-            // is nothing left to steer. See the reply tail at the bottom of the syscall arm.)
-            let mut redirected_user_callback = false;
-            let mut component_suspension_park_request = false;
-            let mut component_root_maintenance_ticket = None;
-            let mut component_suspension_admitted_dispatch_id = 0;
-            let mut current_apc_handoff = None;
-            let mut redirected_context_continue = false;
-            let mut active_callback_bad_resume = false;
-            // Checkpoint B: -1 = no wait-park; >=0 = NtWaitForSingleObject asked to park this caller on
-            // the encoded WaitObject in nt_handler.wait_park_event after dispatch.
-            let mut park_wait_event: i64 = -1;
-            // Array-wait park: the typed dispatcher/process/thread/File set + WaitAll flag.
-            // count 0 = no array-park. Consumed next to park_wait_event in the reply block.
-            let park_wait_set = &mut *core::ptr::addr_of_mut!(PARK_WAIT_SET_WORK);
-            let park_wait_indices = &mut *core::ptr::addr_of_mut!(PARK_WAIT_INDEX_WORK);
-            let mut park_wait_set_n: usize = 0;
-            let mut park_wait_set_all = false;
-            let mut park_wait_alertable = false;
-            let mut park_wait_deadline = nt_delay_execution::Deadline::Infinite;
-            let mut park_keyed_wait_key: u64 = u64::MAX;
-            let mut park_keyed_wait_deadline = nt_delay_execution::Deadline::Infinite;
-            let mut park_keyed_release_wait_key: u64 = u64::MAX;
-            let mut park_keyed_release_wait_deadline = nt_delay_execution::Deadline::Infinite;
-            let mut park_delay_deadline: Option<nt_delay_execution::Deadline> = None;
-            let mut park_thread_alert_deadline: Option<nt_delay_execution::Deadline> = None;
-            let mut park_io_completion_port: i64 = -1;
-            let mut park_io_completion_key_out: u64 = 0;
-            let mut park_io_completion_apc_out: u64 = 0;
-            let mut park_io_completion_iosb_out: u64 = 0;
-            let mut park_io_completion_deadline = nt_delay_execution::Deadline::Infinite;
-            let mut published_file_io: Option<file_dispatch_handoff::PublishedFileIo> = None;
-            let mut transfer_pending_driver_start: Option<PendingDriverStartTransfer> = None;
-            let mut transfer_native_directory_open: Option<
-                crate::native_directory_open_work::PendingNativeDirectoryOpen,
-            > = None;
-            let mut transfer_native_file_target: Option<
-                crate::native_file_target_open_work::PendingNativeFileTargetOpen,
-            > = None;
-            let mut transfer_native_directory_effect: Option<
-                crate::native_directory_effect_work::PendingNativeDirectoryEffect,
-            > = None;
-            let mut transfer_pending_pnp_operation: Option<PendingPnpOperationTransfer> = None;
-            let mut transfer_file_irp_drain: Option<(
-                nt_io_manager::PendingFileIrpDrain,
-                nt_io_manager::PendingFileIrpDrainReservation,
-            )> = None;
-            let mut transfer_file_cleanup_wait: Option<(
-                nt_io_manager::PendingFileCleanupWait,
-                nt_io_manager::PendingFileCleanupWaitReservation,
-            )> = None;
-            let mut synchronous_file_wait_parked = false;
-            let mut park_lpc_receive: Option<PendingLpcReceivePark> = None;
-            let mut park_lpc_connect: Option<PendingLpcConnectPark> = None;
-            let mut park_lpc_request: Option<PendingLpcRequestPark> = None;
-            // ★ Dbgk TARGET-SIDE BLOCK request (syscall flavour) latched out of the handler:
-            // a debug event was posted from THIS syscall arm and NT blocks the reporting thread on
-            // the debugger's continue. Consumed at the reply site (the reply-cap steal needs
-            // resume_ip/sp/flags, known only there). Always false with no debugger attached.
-            let mut park_dbgk_reporter = false;
+            let mut sc = SyscallOutcome::new();
             // Every syscall path, including the still hand-wired ladder below, resolves process-local
             // handles through ExecNtHandler. Refresh caller identity before choosing table vs ladder;
             // doing this only inside table dispatch left a runtime worker using whichever process ran
@@ -15214,11 +15150,11 @@ pub(crate) unsafe fn service_sec_image(
                     lp.msg.m3 = nm3;
                     continue;
                 } else if let Err(status) = lock_preflight {
-                    result = status as u64;
+                    sc.result = status as u64;
                 } else if let Err(status) = vm_copy_preflight {
-                    result = status as u64;
+                    sc.result = status as u64;
                 } else if let Err(status) = copy_preflight {
-                    result = status as u64;
+                    sc.result = status as u64;
                 } else if !stack_args_valid {
                     if lp.msg.m0 as u32 == SSN_NT_QUERY_KEY as u32 {
                         let arguments = [argv[0], argv[1], argv[2], argv[3], argv[4]];
@@ -15226,15 +15162,15 @@ pub(crate) unsafe fn service_sec_image(
                             &nt_handler, b"argument-capture", &arguments, 0xC000_0005, None,
                         );
                     }
-                    result = 0xC000_0005;
+                    sc.result = 0xC000_0005;
                 } else if nt_handler.active_synchronous_file_retry.as_ref()
                     .is_some_and(|ingress| !ingress.matches_handle(argv[0]))
                 {
-                    result = nt_fs::STATUS_INVALID_PARAMETER as u64;
+                    sc.result = nt_fs::STATUS_INVALID_PARAMETER as u64;
                 } else if nt_syscall_abi::NativeAlpcService::from_call(lp.msg.m0, native_call_transport)
                     == Some(nt_syscall_abi::NativeAlpcService::CreatePort)
                 {
-                    handled = true;
+                    sc.handled = true;
                     if lp.diag.alpc_create_ingress_trace.fetch_add(1, Ordering::Relaxed) < 8 {
                         print_str(b"[native-alpc-create-ingress] badge=");
                         print_u64(lp.msg.badge);
@@ -15248,7 +15184,7 @@ pub(crate) unsafe fn service_sec_image(
                     }
                     match crate::native_alpc_create_work::begin(&mut nt_handler,
                         [argv[0], argv[1], argv[2]]) {
-                        Err(status) => result = status as u64,
+                        Err(status) => sc.result = status as u64,
                         Ok(()) => {
                             thread_wait_state_park_badge_waiting(&mut nt_handler, lp.msg.badge);
                             {
@@ -15270,7 +15206,7 @@ pub(crate) unsafe fn service_sec_image(
                 } else if nt_syscall_abi::NativeAlpcService::from_call(lp.msg.m0, native_call_transport)
                     == Some(nt_syscall_abi::NativeAlpcService::ConnectPort)
                 {
-                    handled = true;
+                    sc.handled = true;
                     print_str(b"[native-alpc-connect-ingress] badge=");
                     print_u64(lp.msg.badge);
                     print_str(b" tcb=0x");
@@ -15285,7 +15221,7 @@ pub(crate) unsafe fn service_sec_image(
                             print_str(b"[native-alpc-connect-begin] rejected status=0x");
                             print_hex_u64(status as u64);
                             print_str(b"\n");
-                            result = status as u64;
+                            sc.result = status as u64;
                         }
                         Ok(()) => {
                             print_str(b"[native-alpc-connect-begin] retained\n");
@@ -15310,11 +15246,11 @@ pub(crate) unsafe fn service_sec_image(
                 } else if nt_syscall_abi::NativeAlpcService::from_call(lp.msg.m0, native_call_transport)
                     == Some(nt_syscall_abi::NativeAlpcService::AcceptConnectPort)
                 {
-                    handled = true;
+                    sc.handled = true;
                     match crate::native_alpc_connect_accept_work::begin_accept(&mut nt_handler,
                         [argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6],
                             argv[7], argv[8]]) {
-                        Err(status) => result = status as u64,
+                        Err(status) => sc.result = status as u64,
                         Ok(()) => {
                             thread_wait_state_park_badge_waiting(&mut nt_handler, lp.msg.badge);
                             {
@@ -15336,7 +15272,7 @@ pub(crate) unsafe fn service_sec_image(
                 } else if nt_syscall_abi::NativeAlpcService::from_call(lp.msg.m0, native_call_transport)
                     == Some(nt_syscall_abi::NativeAlpcService::SendWaitReceivePort)
                 {
-                    handled = true;
+                    sc.handled = true;
                     let ingress = crate::native_alpc_send_receive_work::begin(&mut nt_handler,
                         [argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]]);
                     let trace = lp.diag.alpc_send_ingress_trace.fetch_add(1, Ordering::Relaxed);
@@ -15370,7 +15306,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"\n");
                     }
                     match ingress {
-                        Err(status) => result = status as u64,
+                        Err(status) => sc.result = status as u64,
                         Ok(()) => {
                             thread_wait_state_park_badge_waiting(&mut nt_handler, lp.msg.badge);
                             let alpc_reply_committed = {
@@ -15395,9 +15331,9 @@ pub(crate) unsafe fn service_sec_image(
                 } else if native_call_transport && lp.msg.m0 as u32 == SSN_NT_CLOSE as u32
                     && crate::native_alpc_close_work::recognizes(&nt_handler, argv[0])
                 {
-                    handled = true;
+                    sc.handled = true;
                     match crate::native_alpc_close_work::begin(&mut nt_handler, argv[0]) {
-                        Err(status) => result = status as u64,
+                        Err(status) => sc.result = status as u64,
                         Ok(()) => {
                             thread_wait_state_park_badge_waiting(&mut nt_handler, lp.msg.badge);
                             {
@@ -15424,7 +15360,7 @@ pub(crate) unsafe fn service_sec_image(
                     let dispatch_started = crate::disk_census_ticks();
                     let res =
                         nt_dispatcher.dispatch(lp.msg.m0 as u32, &argv[..n], &origin, &mut nt_handler);
-                    current_apc_handoff = nt_handler.current_apc_handoff.take();
+                    sc.current_apc_handoff = nt_handler.current_apc_handoff.take();
                     let elapsed_ticks = crate::disk_census_ticks().wrapping_sub(dispatch_started);
                     crate::record_native_dispatch_ticks(lp.msg.m0, elapsed_ticks);
                     native_process_time_census::record_dispatch(
@@ -15434,7 +15370,7 @@ pub(crate) unsafe fn service_sec_image(
                     );
                     installer_child_span_census::returned(
                         &nt_handler, installer_span, lp.msg.badge, lp.msg.m0 as u32, res.status);
-                    result = res.status as u64;
+                    sc.result = res.status as u64;
                     if lp.msg.m0 == SSN_NT_CREATE_THREAD {
                         let caller = nt_handler.thread_runtime.executable_by_tid(current_tid)
                             .filter(|runtime| runtime.pi == pi && runtime.badge == lp.msg.badge)
@@ -15508,9 +15444,9 @@ pub(crate) unsafe fn service_sec_image(
                                 "suspended process callout lost its native yield owner");
                             assert!(!handoff.callback_suspended,
                                 "initial process callout user callback requires retained source Reply transfer");
-                            component_suspension_admitted_dispatch_id = handoff.admitted_dispatch_id;
-                            component_suspension_park_request = handoff.parked;
-                            redirected_user_callback = handoff.parked;
+                            sc.component_suspension_admitted_dispatch_id = handoff.admitted_dispatch_id;
+                            sc.component_suspension_park_request = handoff.parked;
+                            sc.redirected_user_callback = handoff.parked;
                         }
                     }
                     if crate::registry_mutation_work::take_transferred() {
@@ -15591,7 +15527,7 @@ pub(crate) unsafe fn service_sec_image(
                             print_str(b" retlen=0x");
                             print_hex_u64(argv[4]);
                             print_str(b" status=0x");
-                            print_hex(result as u32);
+                            print_hex(sc.result as u32);
                             if (argv[1] == 12 || argv[1] == 36) && argv[2] != 0 {
                                 let mut value_bytes = [0u8; 4];
                                 if client_copyin_mapped(
@@ -15614,10 +15550,10 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                     if nt_handler.context_continue_redirected {
-                        redirected_context_continue = true;
+                        sc.redirected_context_continue = true;
                     }
                     if nt_handler.stop {
-                        handled = false; // handler couldn't service → stop with the SSN recorded
+                        sc.handled = false; // handler couldn't service → stop with the SSN recorded
                     }
                 }
                 // A successful self-termination is a control-flow action, not a status-returning
@@ -15637,7 +15573,7 @@ pub(crate) unsafe fn service_sec_image(
                         drop_reply: true,
                     };
                 }
-                let apc_owned_terminating_reply = current_apc_handoff.is_some()
+                let apc_owned_terminating_reply = sc.current_apc_handoff.is_some()
                     && matches!(post_action,
                         ExecPostAction::TerminateCurrentThread { .. }
                         | ExecPostAction::TerminateProcess { drop_reply: true, .. }
@@ -15645,12 +15581,12 @@ pub(crate) unsafe fn service_sec_image(
                 if apc_owned_terminating_reply {
                     crate::current_apc::cancel_tail(
                         &mut nt_handler,
-                        current_apc_handoff.take().expect("terminating APC handoff missing"),
+                        sc.current_apc_handoff.take().expect("terminating APC handoff missing"),
                     );
                 }
                 if let Some(mut ingress) = nt_handler.active_synchronous_file_retry.take() {
                     let identity = (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
-                        .reject_ingress(&mut ingress, result as u32)
+                        .reject_ingress(&mut ingress, sc.result as u32)
                         .expect("unconsumed File ingress lost its exact claim");
                     FILE_IO_DELIVERY_RETRY_PENDING.store(true, Ordering::Release);
                     synchronous_file_cancellation::drive(&mut nt_handler, identity);
@@ -15674,7 +15610,7 @@ pub(crate) unsafe fn service_sec_image(
                             waiter.reply_mrs = syscall_reply_context.regs;
                         }
                         if synchronous_file_wait_park(waiter, reservation) {
-                            synchronous_file_wait_parked = true;
+                            sc.synchronous_file_wait_parked = true;
                             let waiter_tid = nt_handler.current_tid;
                             let apc_interrupted =
                                 reconcile_user_apc_file_wait(&mut nt_handler, waiter_tid);
@@ -15691,7 +15627,7 @@ pub(crate) unsafe fn service_sec_image(
                             synchronous_file_cancellation::cancel_unpublished(
                                 &mut nt_handler, reservation, waiter,
                             );
-                            result = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES as u64;
+                            sc.result = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES as u64;
                         }
                     }
                 }
@@ -15701,7 +15637,7 @@ pub(crate) unsafe fn service_sec_image(
                 if handoff.inline_retirement_needs_redrive() {
                     inline_file_retirement::redrive(&mut nt_handler);
                 }
-                published_file_io = file_dispatch_handoff::finish_after_inline_retirement(
+                sc.published_file_io = file_dispatch_handoff::finish_after_inline_retirement(
                     &mut nt_handler, handoff,
                 );
                 let post_action_process = match post_action {
@@ -15758,9 +15694,9 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b" write=");
                         print_u64(applied.unwrap_err());
                         print_str(b"\n");
-                        redirected_context_continue = false;
+                        sc.redirected_context_continue = false;
                         nt_handler.context_continue_redirected = false;
-                        result = 0xC000_0001;
+                        sc.result = 0xC000_0001;
                     }
                     ExecPostAction::TerminateCurrentThread { tid } => {
                         assert_eq!(tcb_suspend_r(event_runtime.tcb), 0,
@@ -15934,7 +15870,7 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 let durable_status = finalize_service_loop_state(&mut nt_handler);
                 if durable_status != nt_fs::STATUS_SUCCESS {
-                    result = durable_status as u64;
+                    sc.result = durable_status as u64;
                 }
                 // PROFILE FRONTIER (batch 58): once winlogon has resolved the profiles root, trace
                 // every NATIVE syscall of its that FAILS, with the SSN and the NTSTATUS. `userenv`
@@ -15942,12 +15878,12 @@ pub(crate) unsafe fn service_sec_image(
                 // the same DOS error, so the frontier is unmeasurable without this.
                 if pi == 2
                     && lp.msg.m0 < 0x1000
-                    && result != 0
+                    && sc.result != 0
                     // STATUS_NO_MORE_FILES ends every legitimate `FindNextFileW` loop and
                     // STATUS_INVALID_INFO_CLASS is a probe kernel32 makes and ignores; both flood
                     // the window without being frontier information.
-                    && result != 0x8000_0006
-                    && result != 0xC000_0003
+                    && sc.result != 0x8000_0006
+                    && sc.result != 0xC000_0003
                     && crate::writable_fs::PROFILE_USER_DIR_CREATED.load(Ordering::Relaxed) != 0
                     // A SECOND budget opens once the user hive is loaded: the profile-copy phase
                     // exhausts the first one long before winlogon's remaining `HandleLogon` steps
@@ -15963,7 +15899,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b" stack5=");
                     print_u64(smss_stack_read(get_recv_mr(16) + 0x28));
                     print_str(b" -> status=0x");
-                    print_hex(result as u32);
+                    print_hex(sc.result as u32);
                     print_str(b"\n");
                 }
                 // Bump-heap pressure tripwire. Ownership-based frees can reuse lower addresses, but
@@ -15986,14 +15922,14 @@ pub(crate) unsafe fn service_sec_image(
                     if let Err(status) =
                         spawn_requested_local_thread(&mut nt_handler, request, &*procs, fault_ep)
                     {
-                        result = u64::from(status);
+                        sc.result = u64::from(status);
                     }
                 }
                 if let Some(request) = nt_handler.remote_thread_request.take() {
                     if let Err(status) =
                         spawn_requested_remote_thread(&mut nt_handler, request, fault_ep)
                     {
-                        result = u64::from(status);
+                        sc.result = u64::from(status);
                     }
                 }
                 // Drain queued out-param writes (group B2): csrss out-ptrs may be arbitrary VAs that
@@ -16002,7 +15938,7 @@ pub(crate) unsafe fn service_sec_image(
                 for k in 0..nt_handler.out_writes_n {
                     let (ptr, val) = nt_handler.out_writes[k];
                     if !nt_handler.xas_write_u64(ptr, val) {
-                        result = 0xC000_0005;
+                        sc.result = 0xC000_0005;
                         print_str(b"[copyout] failed pi=");
                         print_u64(pi as u64);
                         print_str(b" ptr=0x");
@@ -16015,27 +15951,27 @@ pub(crate) unsafe fn service_sec_image(
                 // caller. Latch it for the reply site (the actual reply-cap steal happens there where
                 // resume_ip/sp/flags are known).
                 if nt_handler.wait_park_event >= 0 {
-                    park_wait_event = nt_handler.wait_park_event;
-                    park_wait_alertable = nt_handler.wait_alertable;
-                    park_wait_deadline = nt_handler.wait_timeout.deadline();
+                    sc.park_wait_event = nt_handler.wait_park_event;
+                    sc.park_wait_alertable = nt_handler.wait_alertable;
+                    sc.park_wait_deadline = nt_handler.wait_timeout.deadline();
                 }
                 if nt_handler.wait_park_count > 0 {
-                    park_wait_set_n = nt_handler.wait_park_count;
-                    park_wait_set_all = nt_handler.wait_park_all;
-                    park_wait_alertable = nt_handler.wait_alertable;
-                    park_wait_deadline = nt_handler.wait_timeout.deadline();
-                    park_wait_set[..park_wait_set_n]
-                        .copy_from_slice(&nt_handler.wait_park_objects[..park_wait_set_n]);
-                    park_wait_indices[..park_wait_set_n]
-                        .copy_from_slice(&nt_handler.wait_park_result_indices[..park_wait_set_n]);
+                    sc.park_wait_set_n = nt_handler.wait_park_count;
+                    sc.park_wait_set_all = nt_handler.wait_park_all;
+                    sc.park_wait_alertable = nt_handler.wait_alertable;
+                    sc.park_wait_deadline = nt_handler.wait_timeout.deadline();
+                    sc.park_wait_set[..sc.park_wait_set_n]
+                        .copy_from_slice(&nt_handler.wait_park_objects[..sc.park_wait_set_n]);
+                    sc.park_wait_indices[..sc.park_wait_set_n]
+                        .copy_from_slice(&nt_handler.wait_park_result_indices[..sc.park_wait_set_n]);
                 }
                 if nt_handler.keyed_wait_key != u64::MAX {
-                    park_keyed_wait_key = nt_handler.keyed_wait_key;
-                    park_keyed_wait_deadline = nt_handler.keyed_wait_timeout.deadline();
+                    sc.park_keyed_wait_key = nt_handler.keyed_wait_key;
+                    sc.park_keyed_wait_deadline = nt_handler.keyed_wait_timeout.deadline();
                 }
                 if nt_handler.keyed_release_wait_key != u64::MAX {
-                    park_keyed_release_wait_key = nt_handler.keyed_release_wait_key;
-                    park_keyed_release_wait_deadline =
+                    sc.park_keyed_release_wait_key = nt_handler.keyed_release_wait_key;
+                    sc.park_keyed_release_wait_deadline =
                         nt_handler.keyed_release_wait_timeout.deadline();
                 }
                 if nt_handler.delay_requested {
@@ -16046,33 +15982,33 @@ pub(crate) unsafe fn service_sec_image(
                         now.system_time_100ns,
                     );
                     if !deadline.is_due(now) {
-                        park_delay_deadline = Some(deadline);
+                        sc.park_delay_deadline = Some(deadline);
                     }
                 }
-                park_thread_alert_deadline = nt_handler.thread_alert_wait.take();
+                sc.park_thread_alert_deadline = nt_handler.thread_alert_wait.take();
                 thread_alert::redrive(&mut nt_handler);
                 if nt_handler.io_completion_park_port >= 0 {
-                    park_io_completion_port = nt_handler.io_completion_park_port;
-                    park_io_completion_key_out = nt_handler.io_completion_key_out;
-                    park_io_completion_apc_out = nt_handler.io_completion_apc_out;
-                    park_io_completion_iosb_out = nt_handler.io_completion_iosb_out;
-                    park_io_completion_deadline = nt_handler.io_completion_timeout.deadline();
+                    sc.park_io_completion_port = nt_handler.io_completion_park_port;
+                    sc.park_io_completion_key_out = nt_handler.io_completion_key_out;
+                    sc.park_io_completion_apc_out = nt_handler.io_completion_apc_out;
+                    sc.park_io_completion_iosb_out = nt_handler.io_completion_iosb_out;
+                    sc.park_io_completion_deadline = nt_handler.io_completion_timeout.deadline();
                 }
                 let _ = unsafe { io_completion_deliver(&mut nt_handler) };
                 if nt_handler.io_signal_event >= 0 {
                     let _ = wait_wake_dispatcher_set(&mut nt_handler);
                 }
                 if let Some(transfer) = nt_handler.pending_driver_start_transfer.take() {
-                    transfer_pending_driver_start = Some(transfer);
+                    sc.transfer_pending_driver_start = Some(transfer);
                 }
-                transfer_native_directory_open = nt_handler.pending_native_directory_open_transfer.take();
-                transfer_native_file_target = nt_handler.pending_native_file_target_transfer.take();
-                transfer_native_directory_effect = nt_handler.pending_native_directory_effect_transfer.take();
+                sc.transfer_native_directory_open = nt_handler.pending_native_directory_open_transfer.take();
+                sc.transfer_native_file_target = nt_handler.pending_native_file_target_transfer.take();
+                sc.transfer_native_directory_effect = nt_handler.pending_native_directory_effect_transfer.take();
                 if let Some(transfer) = nt_handler.pending_pnp_operation_transfer.take() {
-                    transfer_pending_pnp_operation = Some(transfer);
+                    sc.transfer_pending_pnp_operation = Some(transfer);
                 }
                 if let Some((pending, reservation)) = nt_handler.pending_file_irp_drain.take() {
-                    transfer_file_irp_drain = Some((pending, reservation));
+                    sc.transfer_file_irp_drain = Some((pending, reservation));
                 }
                 if let Some((file_id, reservation)) = nt_handler.pending_file_cleanup_wait.take() {
                     let pending = nt_io_manager::PendingFileCleanupWait {
@@ -16082,7 +16018,7 @@ pub(crate) unsafe fn service_sec_image(
                         badge: lp.msg.badge,
                         ..nt_io_manager::PendingFileCleanupWait::default()
                     };
-                    transfer_file_cleanup_wait = Some((pending, reservation));
+                    sc.transfer_file_cleanup_wait = Some((pending, reservation));
                 }
                 if nt_handler.system_time_change.take().is_some() {
                     publish_kuser_clocks();
@@ -16096,11 +16032,11 @@ pub(crate) unsafe fn service_sec_image(
                 {
                     delay_timer_rearm(&*delay_queue, &nt_handler);
                 }
-                park_lpc_receive = nt_handler.lpc_receive_park.take();
-                park_lpc_connect = nt_handler.lpc_connect_park.take();
-                park_lpc_request = nt_handler.lpc_request_park.take();
+                sc.park_lpc_receive = nt_handler.lpc_receive_park.take();
+                sc.park_lpc_connect = nt_handler.lpc_connect_park.take();
+                sc.park_lpc_request = nt_handler.lpc_request_park.take();
                 if nt_handler.dbgk_block_request {
-                    park_dbgk_reporter = true;
+                    sc.park_dbgk_reporter = true;
                 }
                 redrive_global_post_syscall_work(&mut nt_handler);
                 // The hosted-exe lane reserved a spawn after validating the owner-local file ->
@@ -16123,7 +16059,7 @@ pub(crate) unsafe fn service_sec_image(
                                 assert!(nt_handler.abort_unentered_hosted_exe(
                                     request, new_process),
                                     "unentered hosted spawn lost its exact reservation");
-                                result = u64::from(status);
+                                sc.result = u64::from(status);
                             }
                             Err(HostedExeSpawnError::Entered(status)) => {
                                 hosted_spawn_uncertainty::retain_entered(prepared, status);
@@ -16138,7 +16074,7 @@ pub(crate) unsafe fn service_sec_image(
                             assert!(nt_handler.abort_unentered_hosted_exe(
                                 request, new_process),
                                 "preflighted hosted spawn lost its exact reservation");
-                            result = u64::from(status);
+                            sc.result = u64::from(status);
                         }
                     }
                 }
@@ -16235,8 +16171,8 @@ pub(crate) unsafe fn service_sec_image(
                         WINLOGON_DIALOG_MODAL_ERRORS.fetch_add(1, Ordering::Relaxed);
                     }
                     print_str(b"[dialog-pump] correlated IDD_LOGON was destroyed; parking modal GetMessage\n");
-                    handled = false;
-                    wl_milestone_park = true;
+                    sc.handled = false;
+                    sc.wl_milestone_park = true;
                 } else if winlogon_gui_client
                     && lp.msg.m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
                     && WINLOGON_DIALOG_MODAL_DRAINED.load(Ordering::Relaxed) != 0
@@ -16270,8 +16206,8 @@ pub(crate) unsafe fn service_sec_image(
                         ));
                     if !route {
                         print_str(b"[dialog-pump] real IDD_LOGON queue drained; parking its blocking GetMessage\n");
-                        handled = false;
-                        wl_milestone_park = true;
+                        sc.handled = false;
+                        sc.wl_milestone_park = true;
                     }
                 } else if winlogon_gui_client
                     && lp.msg.m0 == nt_user_callback::NTUSER_GET_MESSAGE_SSN
@@ -16401,9 +16337,9 @@ pub(crate) unsafe fn service_sec_image(
                 let Some(dispatch_id) = win32k_glue::next_win32k_dispatch_id() else {
                     // No shared ARG or provider state belongs to this call yet. Preserve its
                     // bound Reply and let the ordinary syscall tail return the failure.
-                    result = nt_process::STATUS_INSUFFICIENT_RESOURCES as u64;
-                    handled = true;
-                    wl_milestone_park = false;
+                    sc.result = nt_process::STATUS_INSUFFICIENT_RESOURCES as u64;
+                    sc.handled = true;
+                    sc.wl_milestone_park = false;
                     break 'root_gui_dispatch;
                 };
                 trace_cursor_lookup_owner(
@@ -19233,7 +19169,7 @@ pub(crate) unsafe fn service_sec_image(
                 let mut dispatch_return = None;
                 let mut dispatch_entered = false;
                 let mut dispatch_context = None;
-                let (mut st, mut ok): (u64, bool) = if wl_milestone_park {
+                let (mut st, mut ok): (u64, bool) = if sc.wl_milestone_park {
                     // The bootstrap milestone owner handles this intentional park below.
                     (0, false)
                 } else if message_output_stage_failed {
@@ -20234,9 +20170,9 @@ pub(crate) unsafe fn service_sec_image(
                     dispatch_entered, handoff.parked || callback_suspended,
                     callback_suspended,
                 );
-                component_suspension_admitted_dispatch_id = handoff.admitted_dispatch_id;
-                component_suspension_park_request = handoff.parked;
-                component_root_maintenance_ticket = handoff.maintenance_ticket;
+                sc.component_suspension_admitted_dispatch_id = handoff.admitted_dispatch_id;
+                sc.component_suspension_park_request = handoff.parked;
+                sc.component_root_maintenance_ticket = handoff.maintenance_ticket;
                 if let Some(stage) = bulk_stage.take() {
                     let suspended = callback_suspended || handoff.parked;
                     let bound = if suspended {
@@ -20259,10 +20195,10 @@ pub(crate) unsafe fn service_sec_image(
                         park();
                     }
                 }
-                if handoff.parked { redirected_user_callback = true; }
+                if handoff.parked { sc.redirected_user_callback = true; }
                 let direct_provider_output_len = if ok
                     && !callback_suspended
-                    && !component_suspension_park_request
+                    && !sc.component_suspension_park_request
                     && msg_returns_to_client
                     && message_output_stage.is_some()
                 {
@@ -20323,7 +20259,7 @@ pub(crate) unsafe fn service_sec_image(
                 // continuation returns; the completed-dispatch hook samples that final MSG.
                 if dialog_modal_dispatch
                     && !callback_suspended
-                    && !component_suspension_park_request
+                    && !sc.component_suspension_park_request
                     && lp.msg.m0 != nt_user_callback::NTUSER_DISPATCH_MESSAGE_SSN
                 {
                     let staged_msg = msg_returns_to_client && message_output_stage.is_some();
@@ -20347,8 +20283,8 @@ pub(crate) unsafe fn service_sec_image(
                         0
                     };
                     if !winlogon_dialog_modal_observe(lp.msg.m0, st, hwnd, message) {
-                        handled = false;
-                        wl_milestone_park = true;
+                        sc.handled = false;
+                        sc.wl_milestone_park = true;
                     }
                 }
                 if callback_suspended {
@@ -20360,7 +20296,7 @@ pub(crate) unsafe fn service_sec_image(
                         .thread_teb(current_tid as nt_process::ThreadId)
                         .filter(|teb| *teb != 0)
                         .unwrap_or(SMSS_TEB_VA);
-                    redirected_user_callback = win32k_glue::begin_controlled_user_callback_redirect(
+                    sc.redirected_user_callback = win32k_glue::begin_controlled_user_callback_redirect(
                         win32k_client_context_for_thread(
                             &nt_handler,
                             pi,
@@ -20373,7 +20309,7 @@ pub(crate) unsafe fn service_sec_image(
                             scratch_base,
                         ),
                     );
-                    if !redirected_user_callback {
+                    if !sc.redirected_user_callback {
                         print_str(b"[win32k-callback-redirect-cancel] phase=before ssn=");
                         print_hex_u64(lp.msg.m0);
                         print_str(b" pi=");
@@ -20396,14 +20332,14 @@ pub(crate) unsafe fn service_sec_image(
                         st = resumed.0 as u32 as u64;
                         ok = resumed.1;
                     }
-                } else if !component_suspension_park_request && ok {
+                } else if !sc.component_suspension_park_request && ok {
                     if !win32k_glue::validate_active_callback_syscall_resume(dispatch_client) {
-                        active_callback_bad_resume = true;
+                        sc.active_callback_bad_resume = true;
                         st = 0xC000_0005;
                         ok = false;
                     }
                 }
-                if ok && !redirected_user_callback && msg_returns_to_client {
+                if ok && !sc.redirected_user_callback && msg_returns_to_client {
                     if direct_provider_output_len as usize == WIN32K_MSG_BYTES {
                         let output =
                             core::slice::from_raw_parts(d_a0 as *const u8, WIN32K_MSG_BYTES);
@@ -20425,7 +20361,7 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 }
-                if msg_syscall && ok && !redirected_user_callback {
+                if msg_syscall && ok && !sc.redirected_user_callback {
                     let n = GUI_MESSAGE_DIAG_N.fetch_add(1, Ordering::Relaxed);
                     if n < 128 || n.is_power_of_two() {
                         let mut msg = [0u8; WIN32K_MSG_BYTES];
@@ -20480,7 +20416,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"\n");
                     }
                 }
-                if !callback_suspended && !component_suspension_park_request {
+                if !callback_suspended && !sc.component_suspension_park_request {
                     if let Some(stage) = message_output_stage {
                         let _ = win32k_glue::release_win32k_message_stage(stage);
                     }
@@ -20488,7 +20424,7 @@ pub(crate) unsafe fn service_sec_image(
                         let _ = win32k_glue::release_win32k_paint_stage(stage);
                     }
                 }
-                if ok && !redirected_user_callback {
+                if ok && !sc.redirected_user_callback {
                     if let Some(capture) = get_class_info_capture {
                         if st != 0 {
                             if !copy_back_get_class_info(
@@ -20526,7 +20462,7 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 }
-                if ok && !redirected_user_callback && userinit_gui_client {
+                if ok && !sc.redirected_user_callback && userinit_gui_client {
                     if lp.msg.m0 == 0x103d && st != 0 {
                         nt_handler.record_userinit_global_cursor_hit(st as u32);
                     }
@@ -20540,14 +20476,14 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 }
-                if ok && !redirected_user_callback && lp.msg.m0 == 0x10b4 && st != 0 && !svc_noninteractive
+                if ok && !sc.redirected_user_callback && lp.msg.m0 == 0x10b4 && st != 0 && !svc_noninteractive
                 {
                     if let Some(name) = registered_class_atom_name.as_ref() {
                         nt_handler.observe_class_atom_name(st as u16, name.as_slice());
                     }
                 }
                 if ok
-                    && !redirected_user_callback
+                    && !sc.redirected_user_callback
                     && lp.msg.m0 == 0x10d4
                     && st != 0
                     && !svc_noninteractive
@@ -20559,7 +20495,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_hex(st as u32);
                     print_str(b"\n");
                 }
-                if winlogon_gui_client && ok && !redirected_user_callback {
+                if winlogon_gui_client && ok && !sc.redirected_user_callback {
                     if lp.msg.m0 == 0x10a8 && st != 0 {
                         if let Some(key) = cursor_identity_key.as_ref() {
                             nt_handler.observe_global_cursor_identity(key, a0 as u32);
@@ -20573,7 +20509,7 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 }
-                if has_buf && ok && st == 0 && !redirected_user_callback {
+                if has_buf && ok && st == 0 && !sc.redirected_user_callback {
                     let userconnect = core::slice::from_raw_parts_mut(
                         win32k_subsystem::WIN32K_ARG_VADDR as *mut u8,
                         blen as usize,
@@ -20596,8 +20532,8 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 // Use the request's sampling decision for the matching status line. Real provider
                 // walls still print, but an intentional wait-park is not a failed dispatch.
-                if !redirected_user_callback
-                    && !wl_milestone_park
+                if !sc.redirected_user_callback
+                    && !sc.wl_milestone_park
                     && (!ok || w32_log)
                 {
                     print_str(b"[win32k-svc] ");
@@ -20631,10 +20567,10 @@ pub(crate) unsafe fn service_sec_image(
                         );
                     }
                 }
-                if redirected_user_callback {
-                    result = nt_user_callback::STATUS_PENDING as u32 as u64;
+                if sc.redirected_user_callback {
+                    sc.result = nt_user_callback::STATUS_PENDING as u32 as u64;
                 } else if ok {
-                    result = st; // pointer-width NtUser/NtGdi return value back to the caller
+                    sc.result = st; // pointer-width NtUser/NtGdi return value back to the caller
                     if winlogon_gui_client && lp.msg.m0 == 0x1077 && st != 0 {
                         observe_winlogon_completed_dispatch(
                             win32k_glue::CompletedWin32kDispatch::new(lp.msg.m0, [a0, a1, a2, a3], sp, st),
@@ -20664,14 +20600,14 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"[wl-main] winlogon registered logon-notify window (0x127c) = SAS window ready -> advancing to post-SAS setup\n");
                     }
                 } else {
-                    handled = false; // dispatch wall — stop with the SSN recorded
-                    result = 0xC0000001;
+                    sc.handled = false; // dispatch wall — stop with the SSN recorded
+                    sc.result = 0xC0000001;
                 }
                 }
             } else {
                 // SSNs absent from the registered native table are complete dispatcher decisions:
                 // the NT syscall layer rejects them instead of treating them as missing kernel code.
-                result = nt_syscall::STATUS_INVALID_SYSTEM_SERVICE as u64;
+                sc.result = nt_syscall::STATUS_INVALID_SYSTEM_SERVICE as u64;
             }
             if hosted_spawn_uncertainty::take_transferred() {
                 mark_wait_parked!(pi, resume_ip);
@@ -20686,14 +20622,14 @@ pub(crate) unsafe fn service_sec_image(
                 lp.msg.m3 = nm3;
                 continue;
             }
-            if !handled {
+            if !sc.handled {
                 // ★ BATCH 43 — winlogon SAS-window MILESTONE park (recv-next-without-reply). winlogon has
                 // CROSSED its win32k class-call-proc wall and created its SAS window; its further
                 // window-show→paint flow exceeds the 620s TCG budget. Park it here (its TCB stays blocked
                 // at the proven-advanced state) and QUIESCE to the gate — provided the boot is otherwise at
                 // steady state (winlogon crossed msgina + LSA signalled). This is the win32k analogue of the
                 // listener milestone parks below.
-                if wl_milestone_park {
+                if sc.wl_milestone_park {
                     // No typed GUI wait or provider continuation accepted this request. Keep the
                     // frontier explicit: contain this thread rather than orphan its held Call.
                     assert!(drop_current_hosted_reply(), "unhandled GUI frontier must retire its Call");
@@ -20910,7 +20846,7 @@ pub(crate) unsafe fn service_sec_image(
                 park_and_log!(pi, b"unhandled-syscall", lp.msg.m0, lp.msg.m0);
             }
             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-            if component_suspension_park_request {
+            if sc.component_suspension_park_request {
                 procs[pi].faults = lp.exit.faults;
                 procs[pi].first = lp.exit.first;
                 procs[pi].ntfaults = lp.exit.ntfaults;
@@ -20921,7 +20857,7 @@ pub(crate) unsafe fn service_sec_image(
                     // filesystem finalizer while the physical GUI parent is held.
                     nt_handler.loop_ctx = nt_handler.loop_ctx.map(|ctx| ctx.checkpoint_live());
                 }
-                if let Some(maintenance_ticket) = component_root_maintenance_ticket {
+                if let Some(maintenance_ticket) = sc.component_root_maintenance_ticket {
                     if receive_child_pending {
                         // A prepared Receive child has physical priority over independent work.
                         // Keep this checkpoint and both Replies retained for diagnosis.
@@ -20991,7 +20927,7 @@ pub(crate) unsafe fn service_sec_image(
                 if !receive_child_pending {
                     let _ = component_resume::drain_hosted_ready(core::ptr::from_mut(nt_handler));
                 }
-                if component_suspension_owns_hosted_dispatch(component_suspension_admitted_dispatch_id)
+                if component_suspension_owns_hosted_dispatch(sc.component_suspension_admitted_dispatch_id)
                 {
                     mark_wait_parked!(pi, resume_ip);
                 }
@@ -21005,7 +20941,7 @@ pub(crate) unsafe fn service_sec_image(
                 lp.msg.m3 = received.5;
                 continue;
             }
-            if active_callback_bad_resume && reply_main != 0 {
+            if sc.active_callback_bad_resume && reply_main != 0 {
                 if drop_current_hosted_reply() {
                     lp.parks.crash_parked |= owner_bit_for_badge(&nt_handler, lp.msg.badge);
                     service_watchdog_record_crash_parked(lp.parks.crash_parked);
@@ -21058,7 +20994,7 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(
                     b"[user-callback] active callback bad resume could not drop reply -> STATUS_ACCESS_VIOLATION\n",
                 );
-                result = 0xC000_0005;
+                sc.result = 0xC000_0005;
             }
             set_reply_mr(15, resume_ip);
             set_reply_mr(16, sp);
@@ -21068,7 +21004,7 @@ pub(crate) unsafe fn service_sec_image(
             procs[pi].ntfaults = lp.exit.ntfaults;
             pfilled[pi] = *filled_pages;
             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-            if let Some(pending) = park_lpc_receive.take() {
+            if let Some(pending) = sc.park_lpc_receive.take() {
                 if reply_main != 0
                     && lpc_receive_wait_park(
                         pending,
@@ -21115,9 +21051,9 @@ pub(crate) unsafe fn service_sec_image(
                 }
                 lpc_receive_wait_cancel_reservation(pending.reservation);
                 print_str(b"[lpc-recv] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
-                result = 0xC000_009A;
+                sc.result = 0xC000_009A;
             }
-            if let Some(pending) = park_lpc_connect.take() {
+            if let Some(pending) = sc.park_lpc_connect.take() {
                 if reply_main != 0
                     && lpc_connect_wait_park(
                         pending,
@@ -21156,9 +21092,9 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(
                     b"[lpc-connect-wait] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n",
                 );
-                result = 0xC000_009A;
+                sc.result = 0xC000_009A;
             }
-            if let Some(pending) = park_lpc_request.take() {
+            if let Some(pending) = sc.park_lpc_request.take() {
                 if reply_main != 0
                     && lpc_request_wait_park(
                         pending,
@@ -21202,25 +21138,25 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(
                     b"[lpc-request-wait] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n",
                 );
-                result = 0xC000_009A;
+                sc.result = 0xC000_009A;
             }
-            if park_io_completion_port >= 0 && reply_main != 0 {
-                let timed = park_io_completion_deadline != nt_delay_execution::Deadline::Infinite;
+            if sc.park_io_completion_port >= 0 && reply_main != 0 {
+                let timed = sc.park_io_completion_deadline != nt_delay_execution::Deadline::Infinite;
                 if timed && !delay_timer_init() {
-                    result = 0xC000_009A;
+                    sc.result = 0xC000_009A;
                 } else if io_completion_park(
                     &mut nt_handler,
-                    park_io_completion_port as u32,
-                    park_io_completion_key_out,
-                    park_io_completion_apc_out,
-                    park_io_completion_iosb_out,
-                    park_io_completion_deadline,
+                    sc.park_io_completion_port as u32,
+                    sc.park_io_completion_key_out,
+                    sc.park_io_completion_apc_out,
+                    sc.park_io_completion_iosb_out,
+                    sc.park_io_completion_deadline,
                 ) {
                     delay_timer_rearm_after_park(&mut *delay_queue, &mut nt_handler, timed);
                     print_str(b"[io-completion] pi=");
                     print_u64(pi as u64);
                     print_str(b" port=");
-                    print_u64(park_io_completion_port as u64);
+                    print_u64(sc.park_io_completion_port as u64);
                     print_str(b" -> PARK remover\n");
                     if !timed {
                         trace_indefinite_wait_park(
@@ -21245,10 +21181,10 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(
                         b"[io-completion] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n",
                     );
-                    result = 0xC000_009A;
+                    sc.result = 0xC000_009A;
                 }
             }
-            if let Some(deadline) = park_delay_deadline {
+            if let Some(deadline) = sc.park_delay_deadline {
                 let delay_tid = nt_handler.current_tid;
                 if delay_park(
                     &mut nt_handler,
@@ -21270,12 +21206,12 @@ pub(crate) unsafe fn service_sec_image(
                     continue;
                 }
                 print_str(b"[delay] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
-                result = 0xC000_009A;
+                sc.result = 0xC000_009A;
             }
-            if let Some(deadline) = park_thread_alert_deadline {
+            if let Some(deadline) = sc.park_thread_alert_deadline {
                 let timed = deadline != nt_delay_execution::Deadline::Infinite;
                 if timed && !delay_timer_init() {
-                    result = nt_fs::STATUS_INSUFFICIENT_RESOURCES as u64;
+                    sc.result = nt_fs::STATUS_INSUFFICIENT_RESOURCES as u64;
                 } else if thread_alert::park(&mut nt_handler, deadline, reply_main) {
                     delay_timer_rearm_after_park(&mut *delay_queue, &mut nt_handler, timed);
                     thread_alert::redrive(&mut nt_handler);
@@ -21290,24 +21226,24 @@ pub(crate) unsafe fn service_sec_image(
                     lp.msg.m3 = received.5;
                     continue;
                 } else {
-                    result = nt_fs::STATUS_INSUFFICIENT_RESOURCES as u64;
+                    sc.result = nt_fs::STATUS_INSUFFICIENT_RESOURCES as u64;
                 }
             }
             // Keyed-event release park (`NtReleaseKeyedEvent`): if no wait side is already parked,
             // the release side waits for a future `NtWaitForKeyedEvent` on the same key.
-            if park_keyed_release_wait_key != u64::MAX && reply_main != 0 {
+            if sc.park_keyed_release_wait_key != u64::MAX && reply_main != 0 {
                 let timed =
-                    park_keyed_release_wait_deadline != nt_delay_execution::Deadline::Infinite;
+                    sc.park_keyed_release_wait_deadline != nt_delay_execution::Deadline::Infinite;
                 if timed && !delay_timer_init() {
-                    result = 0xC000_009A;
+                    sc.result = 0xC000_009A;
                 } else if keyed_release_wait_park(
-                    park_keyed_release_wait_key,
+                    sc.park_keyed_release_wait_key,
                     nt_handler.current_tid,
-                    park_keyed_release_wait_deadline,
+                    sc.park_keyed_release_wait_deadline,
                 ) {
                     delay_timer_rearm_after_park(&mut *delay_queue, &mut nt_handler, timed);
                     print_str(b"[keyed] NtReleaseKeyedEvent key=0x");
-                    print_hex_u64(park_keyed_release_wait_key);
+                    print_hex_u64(sc.park_keyed_release_wait_key);
                     print_str(b" -> PARK releaser\n");
                     if !timed {
                         trace_indefinite_wait_park(
@@ -21333,23 +21269,23 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(
                         b"[keyed] release park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n",
                     );
-                    result = 0xC000_009A;
+                    sc.result = 0xC000_009A;
                 }
             }
             // Keyed-event wait park (`NtWaitForKeyedEvent`): used by ReactOS condition variables and
             // run-once state. The matching `NtReleaseKeyedEvent` wakes via keyed_wait_wake_one.
-            if park_keyed_wait_key != u64::MAX && reply_main != 0 {
-                let timed = park_keyed_wait_deadline != nt_delay_execution::Deadline::Infinite;
+            if sc.park_keyed_wait_key != u64::MAX && reply_main != 0 {
+                let timed = sc.park_keyed_wait_deadline != nt_delay_execution::Deadline::Infinite;
                 if timed && !delay_timer_init() {
-                    result = 0xC000_009A;
+                    sc.result = 0xC000_009A;
                 } else if keyed_wait_park(
-                    park_keyed_wait_key,
+                    sc.park_keyed_wait_key,
                     nt_handler.current_tid,
-                    park_keyed_wait_deadline,
+                    sc.park_keyed_wait_deadline,
                 ) {
                     delay_timer_rearm_after_park(&mut *delay_queue, &mut nt_handler, timed);
                     print_str(b"[keyed] NtWaitForKeyedEvent key=0x");
-                    print_hex_u64(park_keyed_wait_key);
+                    print_hex_u64(sc.park_keyed_wait_key);
                     print_str(b" -> PARK caller\n");
                     if !timed {
                         trace_indefinite_wait_park(
@@ -21373,7 +21309,7 @@ pub(crate) unsafe fn service_sec_image(
                     continue;
                 } else {
                     print_str(b"[keyed] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
-                    result = 0xC000_009A;
+                    sc.result = 0xC000_009A;
                 }
             }
             // Checkpoint B: PARK this caller on an unsignaled event (steal its reply cap into the waiter
@@ -21385,7 +21321,7 @@ pub(crate) unsafe fn service_sec_image(
             // `WL_WORKER_FAULTS > 0` shortcut treated any serviced worker syscall as a terminal park
             // and stopped immediately after RegisterClassExWOW, before the runnable worker's next
             // timeslice. Park the main thread normally and keep servicing the worker instead.
-            let winlogon_worker_can_signal = park_wait_event >= 0
+            let winlogon_worker_can_signal = sc.park_wait_event >= 0
                 && hosted_pi_has_role(
                     &nt_handler,
                     pi,
@@ -21401,25 +21337,25 @@ pub(crate) unsafe fn service_sec_image(
                     .is_some()
                 && WINLOGON_SAS_MILESTONE.load(Ordering::Relaxed) == 0;
             let park_wait_tid = nt_handler.current_tid;
-            if park_wait_event >= 0 && reply_main != 0 {
-                let timed = park_wait_deadline != nt_delay_execution::Deadline::Infinite;
-                let park_object = match WaitObject::from_raw(park_wait_event as u64) {
+            if sc.park_wait_event >= 0 && reply_main != 0 {
+                let timed = sc.park_wait_deadline != nt_delay_execution::Deadline::Infinite;
+                let park_object = match WaitObject::from_raw(sc.park_wait_event as u64) {
                     Some(object) => object,
                     None => {
-                        result = 0xC000_0008;
+                        sc.result = 0xC000_0008;
                         WaitObject::FREE
                     }
                 };
                 if park_object == WaitObject::FREE {
                     // Invalid handoff; return STATUS_INVALID_HANDLE through the normal reply path.
                 } else if timed && !delay_timer_init() {
-                    result = 0xC000_009A;
+                    sc.result = 0xC000_009A;
                 } else if wait_park(
                     &mut nt_handler,
                     park_object,
-                    park_wait_alertable,
+                    sc.park_wait_alertable,
                     park_wait_tid,
-                    park_wait_deadline,
+                    sc.park_wait_deadline,
                 ) {
                     let current_tid = nt_handler.current_tid;
                     let wait_still_parked = wait_recheck_after_park(&mut nt_handler, current_tid);
@@ -21450,23 +21386,23 @@ pub(crate) unsafe fn service_sec_image(
                     continue;
                 } else {
                     print_str(b"[wait] park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
-                    result = 0xC000_009A;
+                    sc.result = 0xC000_009A;
                 }
             }
             // Array-wait park: retain the exact typed set and park the reply capability. Any matching
             // owner transition wakes it through the shared dispatcher path with WAIT_0+index.
-            if park_wait_set_n > 0 && reply_main != 0 {
-                let timed = park_wait_deadline != nt_delay_execution::Deadline::Infinite;
+            if sc.park_wait_set_n > 0 && reply_main != 0 {
+                let timed = sc.park_wait_deadline != nt_delay_execution::Deadline::Infinite;
                 if timed && !delay_timer_init() {
-                    result = 0xC000_009A;
+                    sc.result = 0xC000_009A;
                 } else if wait_park_multi(
                     &mut nt_handler,
-                    &park_wait_set[..park_wait_set_n],
-                    &park_wait_indices[..park_wait_set_n],
-                    park_wait_set_all,
-                    park_wait_alertable,
+                    &sc.park_wait_set[..sc.park_wait_set_n],
+                    &sc.park_wait_indices[..sc.park_wait_set_n],
+                    sc.park_wait_set_all,
+                    sc.park_wait_alertable,
                     park_wait_tid,
-                    park_wait_deadline,
+                    sc.park_wait_deadline,
                 ) {
                     let current_tid = nt_handler.current_tid;
                     let wait_still_parked = wait_recheck_after_park(&mut nt_handler, current_tid);
@@ -21475,8 +21411,8 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"[wait] pi=");
                         print_u64(pi as u64);
                         print_str(b" NtWaitForMultipleObjects(");
-                        print_u64(park_wait_set_n as u64);
-                        print_str(if park_wait_set_all {
+                        print_u64(sc.park_wait_set_n as u64);
+                        print_str(if sc.park_wait_set_all {
                             b" objects, WaitAll) UNSIGNALLED -> PARK caller\n"
                         } else {
                             b" objects, WaitAny) UNSIGNALLED -> PARK caller\n"
@@ -21504,12 +21440,12 @@ pub(crate) unsafe fn service_sec_image(
                     continue;
                 } else {
                     print_str(b"[wait] array park unavailable -> STATUS_INSUFFICIENT_RESOURCES\n");
-                    result = 0xC000_009A;
+                    sc.result = 0xC000_009A;
                 }
             }
             // A contended synchronous File has referenced its canonical route but has not created
             // an IRP. Transfer the live syscall reply into the FIFO acquisition owner.
-            if synchronous_file_wait_parked {
+            if sc.synchronous_file_wait_parked {
                 let _ = finalize_service_loop_state(&mut nt_handler);
                 let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                 let (nb, nmi, nm0, nm1, nm2, nm3) = component_recv!(fault_ep, new_reply);
@@ -21523,7 +21459,7 @@ pub(crate) unsafe fn service_sec_image(
             }
             // A pending StartDevice syscall transfers its reply independently of the notification
             // stream. Publication precedes Reply-object rotation.
-            if let Some(transfer) = transfer_pending_driver_start.take() {
+            if let Some(transfer) = sc.transfer_pending_driver_start.take() {
                 pending_driver_start_transfer(&mut nt_handler, transfer);
                 trace_indefinite_wait_park(
                     &nt_handler,
@@ -21548,7 +21484,7 @@ pub(crate) unsafe fn service_sec_image(
                 lp.msg.m3 = nm3;
                 continue;
             }
-            if let Some(transfer) = transfer_pending_pnp_operation.take() {
+            if let Some(transfer) = sc.transfer_pending_pnp_operation.take() {
                 pending_pnp_operation_transfer(&mut nt_handler, transfer);
                 trace_indefinite_wait_park(
                     &nt_handler,
@@ -21573,7 +21509,7 @@ pub(crate) unsafe fn service_sec_image(
                 lp.msg.m3 = nm3;
                 continue;
             }
-            if let Some(transfer) = transfer_native_file_target.take() {
+            if let Some(transfer) = sc.transfer_native_file_target.take() {
                 match unsafe { crate::native_file_target_open_work::park(&mut nt_handler, transfer) } {
                     Ok(()) => {
                         mark_wait_parked!(pi, resume_ip);
@@ -21588,10 +21524,10 @@ pub(crate) unsafe fn service_sec_image(
                         lp.msg.m3 = nm3;
                         continue;
                     }
-                    Err(status) => result = status as u64,
+                    Err(status) => sc.result = status as u64,
                 }
             }
-            if let Some(transfer) = transfer_native_directory_open.take() {
+            if let Some(transfer) = sc.transfer_native_directory_open.take() {
                 match unsafe { crate::native_directory_open_work::park(&mut nt_handler, transfer) } {
                     Ok(()) => {
                         mark_wait_parked!(pi, resume_ip);
@@ -21606,10 +21542,10 @@ pub(crate) unsafe fn service_sec_image(
                         lp.msg.m3 = nm3;
                         continue;
                     }
-                    Err(status) => result = status as u64,
+                    Err(status) => sc.result = status as u64,
                 }
             }
-            if let Some(transfer) = transfer_native_directory_effect.take() {
+            if let Some(transfer) = sc.transfer_native_directory_effect.take() {
                 match unsafe { crate::native_directory_effect_work::park(&mut nt_handler, transfer) } {
                     Ok(()) => {
                         mark_wait_parked!(pi, resume_ip);
@@ -21624,12 +21560,12 @@ pub(crate) unsafe fn service_sec_image(
                         lp.msg.m3 = nm3;
                         continue;
                     }
-                    Err(status) => result = status as u64,
+                    Err(status) => sc.result = status as u64,
                 }
             }
             // File ownership and reply attachment were committed before post-actions. Only
             // scheduling remains here; completion may already have retired the published owner.
-            if let Some(published) = published_file_io.take() {
+            if let Some(published) = sc.published_file_io.take() {
                 let wait_for_completion = published.wait_for_completion;
                 if published.still_waiting() {
                     let _ = reconcile_user_apc_file_wait(&mut nt_handler, published.tid);
@@ -21662,7 +21598,7 @@ pub(crate) unsafe fn service_sec_image(
                     continue;
                 }
             }
-            if let Some((pending, reservation)) = transfer_file_cleanup_wait.take() {
+            if let Some((pending, reservation)) = sc.transfer_file_cleanup_wait.take() {
                 if file_cleanup_wait_transfer(&mut nt_handler, pending, reservation) {
                     trace_indefinite_wait_park(
                         &nt_handler,
@@ -21688,7 +21624,7 @@ pub(crate) unsafe fn service_sec_image(
                     continue;
                 }
             }
-            if let Some((pending, reservation)) = transfer_file_irp_drain.take() {
+            if let Some((pending, reservation)) = sc.transfer_file_irp_drain.take() {
                 file_irp_drain_transfer(pending, reservation);
                 trace_indefinite_wait_park(
                     &nt_handler,
@@ -21726,7 +21662,7 @@ pub(crate) unsafe fn service_sec_image(
             // The block rides on the `DEBUG_EVENT`; a debug-object teardown / the post-loop drain
             // releases it, so it can never wedge the boot. `park_dbgk_reporter` is false on every
             // boot today (nothing attaches a debugger), so this whole block is skipped.
-            if park_dbgk_reporter && reply_main != 0 {
+            if sc.park_dbgk_reporter && reply_main != 0 {
                 if nt_handler.dbgk_block_reporter(
                     pi,
                     nt_handler.current_tid,
@@ -21736,7 +21672,7 @@ pub(crate) unsafe fn service_sec_image(
                     resume_ip,
                     sp,
                     flags,
-                    result,
+                    sc.result,
                 ) {
                     print_str(b"[dbgk] reporter BLOCKED on continue (syscall) pi=");
                     print_u64(pi as u64);
@@ -21785,9 +21721,9 @@ pub(crate) unsafe fn service_sec_image(
             crate::teb_tail_watch(pi, 3, lp.msg.m0, lp.msg.badge);
             let tail_durable_status = finalize_service_loop_state(&mut nt_handler);
             if tail_durable_status != nt_fs::STATUS_SUCCESS {
-                result = tail_durable_status as u64;
+                sc.result = tail_durable_status as u64;
             }
-            if let Some(identity) = current_apc_handoff.take() {
+            if let Some(identity) = sc.current_apc_handoff.take() {
                 crate::current_apc::release_tail(&mut nt_handler, identity);
                 crate::current_apc::redrive(&mut nt_handler);
                 let _ = finalize_service_loop_state(&mut nt_handler);
@@ -21802,17 +21738,17 @@ pub(crate) unsafe fn service_sec_image(
                 continue;
             }
             let redirected_user_control =
-                redirected_user_callback || redirected_context_continue;
+                sc.redirected_user_callback || sc.redirected_context_continue;
             let native_load_reply_status =
                 (native_call_transport && lp.msg.m0 == SSN_NT_LOAD_DRIVER && !redirected_user_control)
-                    .then_some(result as u32);
+                    .then_some(sc.result as u32);
             let live_action_reply = (native_call_transport
                 && lp.msg.m0 == SSN_NT_PLUG_PLAY_CONTROL
                 && !redirected_user_control)
                 .then(|| {
                     nt_handler
                         .pnp_take_live_action_reply_tail()
-                        .map(|identity| (identity, result as u32))
+                        .map(|identity| (identity, sc.result as u32))
                 })
                 .flatten();
             let start_device_reply = (native_call_transport
@@ -21821,7 +21757,7 @@ pub(crate) unsafe fn service_sec_image(
                 .then(|| {
                     nt_handler
                         .pnp_take_start_device_reply_tail()
-                        .map(|identity| (identity, result as u32))
+                        .map(|identity| (identity, sc.result as u32))
                 })
                 .flatten();
             let inspect_component_lpc_after_reply =
@@ -21832,7 +21768,7 @@ pub(crate) unsafe fn service_sec_image(
             // A committed callback redirect already owns the full canonical context and must
             // restart without IPC register fanout. NtContinue already bypassed this tail.
             let len = 1;
-            let r0 = result;
+            let r0 = sc.result;
             if let Some(n) = lsa_logon_trace_seq {
                 LSA_LOGON_LAST_STATUS.store(r0, Ordering::Relaxed);
                 if n < 128 {
